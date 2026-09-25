@@ -221,6 +221,7 @@ If your command is slow, expensive, rate-limited, or should keep using a previou
 | `thinkingLevelMap` | No | omitted | Maps Prime Agent thinking levels to provider values and marks unsupported levels (see below) |
 | `input` | No | `["text"]` | Input types: `["text"]` or `["text", "image"]` |
 | `contextWindow` | No | `128000` | Context window size in tokens |
+| `usageWindowTokens` | No | — | Optional rate-quota heuristic in the provider's token caliber. Clamps the compaction trigger and the summarization budget to `min(contextWindow, measured input limit, usageWindowTokens)`. Must be > 0 and <= the model's effective `contextWindow` (128000 default). Setting it below the window makes compaction fire proportionally earlier — an optional tuning knob for gateways whose per-time-window token quota (e.g. 200k tokens/10s) sits far below the advertised window; it is a rate-quota heuristic, not a per-request limit. A value <= `compaction.reserveTokens` (default 16384) silently stands threshold compaction down. |
 | `maxTokens` | No | `16384` | Maximum output tokens |
 | `cost` | No | all zeros | `{"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}` (per million tokens). Omit it entirely for zeros; when you write it, all four subkeys are required (`modelOverrides` accepts a partial cost). |
 | `compat` | No | provider `compat` | Provider compatibility overrides. Merged with provider-level `compat` when both are set. |
@@ -331,7 +332,7 @@ Use `modelOverrides` to customize specific built-in models without replacing the
 }
 ```
 
-`modelOverrides` supports these fields per model: `name`, `reasoning`, `input`, `cost` (partial), `contextWindow`, `maxTokens`, `headers`, `compat`.
+`modelOverrides` supports these fields per model: `name`, `reasoning`, `input`, `cost` (partial), `contextWindow`, `maxTokens`, `usageWindowTokens`, `headers`, `compat`.
 
 Behavior notes:
 - `modelOverrides` are applied to built-in provider models.

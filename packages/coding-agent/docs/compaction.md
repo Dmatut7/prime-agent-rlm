@@ -38,7 +38,7 @@ contextTokens > min(triggerBase * triggerRatio, triggerBase - reserveTokens)
 
 The lower of the two ceilings wins:
 
-- `triggerBase` — the catalog `contextWindow` clamped to the provider's measured input limit ([`model-input-limits.ts`](../src/core/model-input-limits.ts)).
+- `triggerBase` — the catalog `contextWindow` clamped to the provider's measured input limit ([`model-input-limits.ts`](../src/core/model-input-limits.ts)) and to the model's optional `usageWindowTokens` rate-quota heuristic ([models.json field](./models.md#model-configuration)), whichever is lower. `usageWindowTokens` is an operator-declared tuning knob for gateways whose per-time-window token budget sits far below the advertised window - it approximates a rate quota, not a per-request wall, and setting it makes compaction fire proportionally earlier (200,000 on a 1M window moves the threshold from 700k to 140k with the default 0.7 ratio).
 - `triggerRatio` — the share of `triggerBase` at which the trigger fires: `compaction.triggerRatio`, default `0.8`, clamped to `[0.5, 0.95]`.
 - `triggerBase - reserveTokens` — the retained slice plus the response reserve has to fit, or compaction re-fires every turn. `reserveTokens` is 16384 by default (configurable in `~/.prime/agent/settings.json` or `<project-dir>/.prime/agent/settings.json`).
 
@@ -55,7 +55,7 @@ Two token calibers exist ([`compaction.ts`](../src/core/compaction/compaction.ts
 - `estimateTokens` prices every character at chars/4. It survives only on the summarization request path: `budgetSummarizationInput` trims the request in it and `summarizationInflation` converts that allowance with the provider's own anchor. Pricing that text by density as well would apply the correction twice, which is why the two calibers are still not one.
 The trigger's `contextTokens` is anchored on the newest readable assistant usage - the provider's own count, which needs no correction - with the messages after it priced by content density.
 
-When the configured `reserveTokens` consumes the whole `triggerBase`, no sustainable threshold exists: any retained context, including a fresh summary, would sit above it again immediately and retrigger every turn. Threshold compaction then stands down; overflow recovery remains the backstop.
+When the configured `reserveTokens` consumes the whole `triggerBase`, no sustainable threshold exists: any retained context, including a fresh summary, would sit above it again immediately and retrigger every turn. Threshold compaction then stands down; overflow recovery remains the backstop. A `usageWindowTokens` value at or below `reserveTokens` (e.g. a one-digit typo - 20000 meant as 200000) lands in exactly this zone and logs one session warning, so check the field's magnitude when threshold compaction seems to have gone quiet.
 
 You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary — for example `/compact focus on the auth refactor, remember the exact migration command`. The instructions are passed to the summarization prompt with high priority, persisted on the `CompactionEntry`, and shown on the `[compaction]` message in the TUI.
 
