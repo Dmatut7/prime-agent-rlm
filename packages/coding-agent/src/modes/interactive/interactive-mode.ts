@@ -7750,7 +7750,9 @@ export class InteractiveMode {
 		}
 		// Leaving the panel by any non-panel key drops its focus too, so the list
 		// returns to its compact top-N form instead of staying in scroll mode.
-		this.subagentSummaryLine.focused = false;
+		// (Defensive for the partial-mode harness stubs that call this method with a
+		// fake `this` that has no panel; the focus drop is best-effort there.)
+		if (this.subagentSummaryLine) this.subagentSummaryLine.focused = false;
 		this.focusEditor();
 		this.editor.handleInput(data);
 	}
