@@ -299,6 +299,38 @@ describe("fact extraction: error signatures", () => {
 		expect(errors).toHaveLength(1);
 		expect(errors[0].weight).toBe(2);
 	});
+
+	it("keys a decision the same way the extraction and the merge do, case aside", () => {
+		// One key derivation, not two. extractDecisions used to lowercase while
+		// mergeFactLedger re-keyed on the raw value, so a decision retyped with
+		// different capitalisation in a later generation became a second record:
+		// one authoritative anchor in two slots, with its mention weight split.
+		expect(factKey("decision", "We Decided to use Redis for cache.")).toBe(
+			factKey("decision", "we decided to use redis for cache."),
+		);
+		expect(factKey("decision", "结论是   先回滚")).toBe(factKey("decision", "结论是 先回滚"));
+		const found = extractFacts([assistantMessage("We Decided to use Redis for cache.")]);
+		const decisions = [...found.values()].filter((record) => record.kind === "decision");
+		expect(decisions).toHaveLength(1);
+
+		const first = buildFactLedger({
+			messages: [assistantMessage("We Decided to use Redis for cache.")],
+			generation: 1,
+		});
+		const second = buildFactLedger({
+			messages: [assistantMessage("we decided to use redis for cache.")],
+			generation: 2,
+			previous: first,
+		});
+		const carried = second.records.filter((record) => record.kind === "decision");
+		expect(carried).toHaveLength(1);
+		// The retyped sentence folds into the record that already carried it, so the
+		// weight accumulates instead of being split, and the first spelling survives.
+		expect(carried[0].value).toBe("We Decided to use Redis for cache.");
+		expect(carried[0].weight).toBe(6);
+		expect(carried[0].firstGeneration).toBe(1);
+		expect(carried[0].lastGeneration).toBe(2);
+	});
 });
 
 describe("fact extraction: issue references", () => {

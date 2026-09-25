@@ -170,10 +170,18 @@ export function emptyFactLedger(generation: number): FactLedger {
  * Derivable from the stored value, so a ledger recovered from details and one
  * recovered from the rendered block key identically. Errors collapse across the
  * numbers embedded in them ("at position 1871" vs "at position 2000" are one
- * recurring failure, not two facts) and numbers collapse across identifier case.
+ * recurring failure, not two facts); numbers and decisions collapse across case
+ * (and decisions across whitespace runs too), because both are prose that the same
+ * author can retype slightly differently in a later generation.
  */
 export function factKey(kind: FactKind, value: string): string {
 	if (kind === "error") return value.replace(/\d+/g, "N");
+	// A decision is prose, so the same statement can be re-typed with different
+	// capitalisation in a later generation ("We decided" / "we decided"). Keying on
+	// the raw value gave them two slots: one authoritative anchor occupying two
+	// appendix lines and its mention weight split in half, which is exactly what
+	// decides whether it survives pruning. Case and whitespace are not meaning here.
+	if (kind === "decision") return value.toLowerCase().replace(/\s+/g, " ").trim();
 	if (kind === "number") return value.toLowerCase();
 	return value;
 }
@@ -514,7 +522,7 @@ function extractDecisions(text: string, out: RawFact[], enabled: boolean): void 
 		const sentence = raw.trim().replace(/\s+/g, " ");
 		if (sentence.length < DECISION_MIN_CHARS || sentence.length > MAX_VALUE_CHARS.decision) continue;
 		if (!DECISION_MARKERS.some((pattern) => pattern.test(sentence))) continue;
-		out.push({ kind: "decision", value: sentence, key: sentence.toLowerCase() });
+		out.push({ kind: "decision", value: sentence, key: factKey("decision", sentence) });
 	}
 }
 
