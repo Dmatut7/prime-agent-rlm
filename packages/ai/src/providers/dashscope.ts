@@ -869,6 +869,13 @@ export const streamDashScope: StreamFunction<"dashscope", DashScopeOptions> = (
 				}
 			}
 
+			// A tool call whose id never arrived still needs a pairable id before
+			// the block is finalized (07 marks the streamed id optional).
+			for (const block of blocks) {
+				if (block.type === "toolCall" && !block.id) {
+					claimToolCallId(block, block.sourceId);
+				}
+			}
 			for (const block of blocks) {
 				finishBlock(block);
 			}
