@@ -210,18 +210,55 @@ export interface SubagentPanelRow {
 	elapsedMs?: number;
 	/** What the child is doing or how it ended, in plain words. */
 	activity?: string;
+	/**
+	 * Epoch ms of the child's last tracked activity (the snapshot's own
+	 * `lastActivityAt`). The row order is recency within a status group, so the
+	 * newest work sits at the top; absent timestamps keep their source order.
+	 */
+	lastActivityAt?: number;
 }
 
 /** Rows shown at once; the rest scroll into view as the selection moves. */
 export const SUBAGENT_PANEL_MAX_ROWS = 4;
 
-const ROW_STATE_ORDER: Record<SubagentPanelRowState, number> = {
+/**
+ * The panel's row order (PM 2026-09-25: 最新工作流要提前 — the newest work first).
+ *
+ * Three groups, in this order: busy children (running, and a stalled one still
+ * holds an in-flight turn), then idle, then the settled ones (done and failed
+ * alike). A finished child therefore never sits above a live one any more - it
+ * used to outrank a running row - and inside a group the most recent activity
+ * wins. `stalled` keeps the top of the busy group: a wedged child is the one
+ * fact a reader must not have to scroll for.
+ */
+const ROW_STATE_GROUP: Record<SubagentPanelRowState, number> = {
 	stalled: 0,
-	failed: 1,
-	running: 2,
-	idle: 3,
-	done: 4,
+	running: 0,
+	idle: 1,
+	done: 2,
+	failed: 2,
 };
+
+/**
+ * Total order over panel rows: status group, then last activity newest first.
+ * Ties inside a group fall back to the state's own rank (a stalled child above a
+ * running one, a failure above a plain completion) so two rows sharing a
+ * timestamp - or carrying none, as a client predating `lastActivityAt` - still
+ * order deterministically instead of by whichever arrived first.
+ */
+export function compareSubagentPanelRows(a: SubagentPanelRow, b: SubagentPanelRow): number {
+	const groupDiff = ROW_STATE_GROUP[a.state] - ROW_STATE_GROUP[b.state];
+	if (groupDiff !== 0) return groupDiff;
+	const activityDiff = (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0);
+	if (activityDiff !== 0) return activityDiff;
+	if (a.state !== b.state) {
+		if (a.state === "stalled") return -1;
+		if (b.state === "stalled") return 1;
+		if (a.state === "failed") return -1;
+		if (b.state === "failed") return 1;
+	}
+	return 0;
+}
 
 function firstLine(text: string | undefined): string | undefined {
 	const line = text
@@ -273,11 +310,12 @@ export function buildSubagentPanelRows(
 		const row: SubagentPanelRow = { id: child.id, name: child.sessionName ?? child.label, state };
 		if (child.activeSessionId) row.activeSessionId = child.activeSessionId;
 		if (child.durationMs !== undefined) row.elapsedMs = child.durationMs;
+		if (child.lastActivityAt !== undefined) row.lastActivityAt = child.lastActivityAt;
 		const activity = rowActivity(child, state);
 		if (activity) row.activity = activity;
 		return row;
 	});
-	return rows.sort((a, b) => ROW_STATE_ORDER[a.state] - ROW_STATE_ORDER[b.state]);
+	return rows.sort(compareSubagentPanelRows);
 }
 
 /** The session a stall marker names: the text before its first `: `. */

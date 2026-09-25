@@ -1466,16 +1466,41 @@ describe("subagent panel rows (design board 06)", () => {
 			],
 			undefined,
 		);
+		// Newest work first: busy children (stalled, then running), then idle, then
+		// the settled ones. A finished child no longer outranks a live one.
 		expect(built.map((row) => [row.name, row.state])).toEqual([
 			["stuck", "stalled"],
-			["broken", "failed"],
 			["review", "running"],
+			["broken", "failed"],
 			["lint", "done"],
 		]);
 		expect(built[0]?.activity).toBe("95s 没有动静 · 在跑 ipython");
-		expect(built[1]?.activity).toBe("boom");
-		expect(built[2]?.activity).toBe("执行 ipython");
+		expect(built[1]?.activity).toBe("执行 ipython");
+		expect(built[2]?.activity).toBe("boom");
 		expect(built[3]?.activity).toBe("无问题");
+	});
+
+	it("orders rows by recency inside a status group, newest first", () => {
+		const built = buildSubagentPanelRows(
+			[
+				child("old-run", "running", { sessionName: "old", lastActivityAt: 1_000 }),
+				child("new-run", "running", { sessionName: "new", lastActivityAt: 5_000 }),
+				child("mid-run", "running", { sessionName: "mid", lastActivityAt: 3_000 }),
+				child("old-done", "done", { sessionName: "done-old", lastActivityAt: 2_000 }),
+				child("new-done", "done", { sessionName: "done-new", lastActivityAt: 9_000 }),
+				child("old-err", "error", { sessionName: "err-old", lastActivityAt: 4_000 }),
+			],
+			undefined,
+		);
+		expect(built.map((row) => row.name)).toEqual(["new", "mid", "old", "done-new", "err-old", "done-old"]);
+	});
+
+	it("keeps source order for rows without a timestamp", () => {
+		const built = buildSubagentPanelRows(
+			[child("a", "done", { sessionName: "a" }), child("b", "done", { sessionName: "b" })],
+			undefined,
+		);
+		expect(built.map((row) => row.name)).toEqual(["a", "b"]);
 	});
 
 	it("formats elapsed time as m:ss and h:mm:ss", () => {

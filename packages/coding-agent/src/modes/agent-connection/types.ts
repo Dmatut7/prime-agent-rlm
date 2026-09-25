@@ -673,6 +673,13 @@ export interface AgentConnectionRlmChildAgentSnapshot {
 	label: string;
 	status: AgentConnectionRlmChildAgentStatus;
 	durationMs?: number;
+	/**
+	 * Epoch ms of the child's last tracked activity, as the session stamps it
+	 * (`RlmChildAgentSnapshot.lastActivityAt`). The panel orders rows by recency
+	 * within a status group, so a client that predates this field falls back to
+	 * source order (`compareSubagentPanelRows`).
+	 */
+	lastActivityAt?: number;
 	answerPreview?: string;
 	repliedSinceTask?: boolean;
 	toolUseCount?: number;
