@@ -574,7 +574,7 @@ describe("fact ledger budget", () => {
 		expect(FACT_APPENDIX_BUDGET_MINIMUM * 4).toBeGreaterThan(APPENDIX_HEADER_CHARS);
 		expect(FACT_APPENDIX_TOKEN_BUDGET).toBe(4000);
 		expect(FACT_APPENDIX_BUDGET_FLOOR).toBe(2500);
-		expect(FACT_KINDS).toEqual(["sha", "path", "number", "error", "issue"]);
+		expect(FACT_KINDS).toEqual(["sha", "path", "number", "error", "issue", "decision"]);
 	});
 
 	it("trims to the global ranking when even the protected minimum does not fit", () => {

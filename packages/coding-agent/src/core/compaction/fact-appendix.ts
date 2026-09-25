@@ -25,9 +25,9 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { estimateTextTokensByContent } from "./content-density.js";
 import { checkMachineBlockSelfCount, findMachineBlock, renderMachineBlock } from "./machine-blocks.js";
 
-export type FactKind = "sha" | "path" | "number" | "error" | "issue";
+export type FactKind = "sha" | "path" | "number" | "error" | "issue" | "decision";
 
-export const FACT_KINDS: readonly FactKind[] = ["sha", "path", "number", "error", "issue"];
+export const FACT_KINDS: readonly FactKind[] = ["sha", "path", "number", "error", "issue", "decision"];
 
 export interface FactRecord {
 	kind: FactKind;
@@ -74,6 +74,7 @@ export const FACT_KIND_LIMITS: Readonly<Record<FactKind, number>> = {
 	number: 200,
 	error: 100,
 	issue: 120,
+	decision: 60,
 };
 
 /** Records every kind keeps before the remaining budget is ranked across kinds. */
@@ -83,7 +84,7 @@ export const FACT_KIND_MINIMUM = 4;
 const KIND_RENDER_ORDER: readonly FactKind[] = ["error", "sha", "path", "number", "issue"];
 
 /** Tie-break priority across kinds when two facts have the same weight: most load-bearing first. */
-const KIND_PRIORITY: readonly FactKind[] = ["sha", "error", "path", "issue", "number"];
+const KIND_PRIORITY: readonly FactKind[] = ["sha", "decision", "error", "path", "issue", "number"];
 
 /** Boost for facts mentioned in the generation being written, so fresh anchors outrank stale ones. */
 const RECENCY_BOOST = 2;
@@ -94,6 +95,7 @@ const MAX_VALUE_CHARS: Readonly<Record<FactKind, number>> = {
 	number: 80,
 	error: 200,
 	issue: 16,
+	decision: 300,
 };
 
 /** Longest verbatim snippet kept alongside a number: enough to disambiguate, not a copy of the line. */
@@ -112,7 +114,7 @@ const SOURCE_WEIGHTS = {
 } as const;
 
 const APPENDIX_HEADER =
-	"Machine-extracted from the transcript by regex, no model involved: error signatures, commit SHAs, paths, threshold numbers, issue refs. n = weight of distinct messages mentioning the value, g = first-last generation carrying it, c = verbatim snippet. Authoritative: quote exactly, never restate or correct.";
+	"Machine-extracted from the transcript by regex, no model involved: error signatures, commit SHAs, paths, threshold numbers, issue refs, and stated decisions/conclusions. n = weight of distinct messages mentioning the value, g = first-last generation carrying it, c = verbatim snippet. Authoritative: quote exactly, never restate or correct.";
 
 /**
  * Budget derivation shares and bounds.
@@ -470,7 +472,53 @@ function extractIssues(text: string, out: RawFact[]): void {
 }
 
 /** Every fact kind in one text blob, in extraction order. */
-export function extractFactsFromText(text: string, options?: { prose?: boolean }): RawFact[] {
+/**
+ * Sentence-level markers that make an authored sentence a stated decision or a
+ * conclusion rather than narration.
+ *
+ * Deliberately narrow. The appendix is declared authoritative ("quote exactly, never
+ * restate or correct"), so one false positive injects a wrong instruction into every
+ * later generation - a cost that outweighs the recall gained by loosening these to
+ * bare connectives like 因为 or "because".
+ */
+const DECISION_MARKERS: readonly RegExp[] = [
+	/结论(?:是|为|[:：])/,
+	/(?:已|就|才)?(?:决定|拍板|敲定|定为|定下来)/,
+	/(?:根因|根本原因|真正的原因|真正原因是)/,
+	/(?:采用|选用|改用|换成|改为|改成|放弃|不采用|不选|不用了)/,
+	/(?:默认(?:用|走|取|按)|一律|统一用|优先用|以后都)/,
+	/(?:唯一(?:解法|办法|出路)|判据是|验收标准是)/,
+	/\b(?:we (?:decided|chose|choose|settled)|the fix is|root cause is|decision:)/i,
+];
+
+/** Shortest decision sentence worth carrying; below this the value is a fragment, not a statement. */
+const DECISION_MIN_CHARS = 10;
+
+/** Sentence terminators that end a decision statement without cutting into it. */
+const DECISION_SENTENCE_SPLIT = /(?<=[。！？!?；;])|\n+/;
+
+/**
+ * Verbatim decision and conclusion sentences from authored prose.
+ *
+ * What this closes: the appendices carried hard facts and the user's own words
+ * verbatim, but an agent's stated decision ("root cause is X", "we settle on Y") lived
+ * only in the model-written summary - so a compaction or a model switch handed the next
+ * model a paraphrase of a decision instead of the decision itself. Only authored prose
+ * is scanned (see extractFacts), and the value is the sentence as written: whitespace
+ * normalised, never reworded, because the block instructs every later generation to
+ * quote it exactly.
+ */
+function extractDecisions(text: string, out: RawFact[], enabled: boolean): void {
+	if (!enabled || !text) return;
+	for (const raw of text.split(DECISION_SENTENCE_SPLIT)) {
+		const sentence = raw.trim().replace(/\s+/g, " ");
+		if (sentence.length < DECISION_MIN_CHARS || sentence.length > MAX_VALUE_CHARS.decision) continue;
+		if (!DECISION_MARKERS.some((pattern) => pattern.test(sentence))) continue;
+		out.push({ kind: "decision", value: sentence, key: sentence.toLowerCase() });
+	}
+}
+
+export function extractFactsFromText(text: string, options?: { prose?: boolean; decisions?: boolean }): RawFact[] {
 	const out: RawFact[] = [];
 	if (!text) return out;
 	// extractShas and extractErrors walk the same line decomposition, so the lines are
@@ -483,6 +531,7 @@ export function extractFactsFromText(text: string, options?: { prose?: boolean }
 	extractNumbers(text, out);
 	extractErrors(lines, out);
 	extractIssues(text, out);
+	extractDecisions(text, out, options?.decisions ?? false);
 	return out;
 }
 
@@ -565,7 +614,11 @@ export function extractFacts(messages: readonly AgentMessage[]): Map<string, Fac
 		const perMessage = new Map<string, { fact: RawFact; weight: number }>();
 		for (const source of factSources(message)) {
 			const prose = source.weight >= PROSE_SOURCE_WEIGHT;
-			for (const fact of extractFactsFromText(source.text, { prose })) {
+			// Decisions are scanned from the assistant's own prose only. User words
+			// already ride verbatim in <user-requests>, so re-extracting them here would
+			// double-book the same sentence into two authoritative blocks.
+			const decisions = message.role === "assistant" && prose;
+			for (const fact of extractFactsFromText(source.text, { prose, decisions })) {
 				const key = `${fact.kind}:${fact.key}`;
 				const existing = perMessage.get(key);
 				if (existing) {

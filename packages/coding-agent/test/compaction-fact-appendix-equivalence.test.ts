@@ -42,6 +42,7 @@ const MAX_VALUE_CHARS_REFERENCE: Readonly<Record<FactKind, number>> = {
 	number: 80,
 	error: 200,
 	issue: 16,
+	decision: 300,
 };
 
 /** Longest verbatim snippet kept alongside a number: enough to disambiguate, not a copy of the line. */
