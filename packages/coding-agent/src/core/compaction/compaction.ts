@@ -361,10 +361,11 @@ export interface CompactionWindowLimits {
 	provider?: string;
 	modelId?: string;
 	/**
-	 * Config-declared serving-window cap for a single request (models.json
-	 * `usageWindowTokens`), in the provider's own token caliber. Optional:
-	 * absent means the catalog window (clamped to the measured input limit) is
-	 * the whole cap. See Model.usageWindowTokens.
+	 * Config-declared rate-quota heuristic (models.json `usageWindowTokens`), in
+	 * the provider's own token caliber. Optional: absent means the catalog window
+	 * (clamped to the measured input limit) is the whole cap. It approximates the
+	 * gateway's per-time-window token budget, not a hard per-request wall. See
+	 * Model.usageWindowTokens.
 	 */
 	usageWindowTokens?: number;
 }
@@ -372,7 +373,7 @@ export interface CompactionWindowLimits {
 /**
  * The token count the compaction trigger is a ratio of: the declared window
  * clamped to the provider's measured input limit and to a config-declared
- * serving-window cap (`usageWindowTokens`), whichever is lower.
+ * rate-quota heuristic (`usageWindowTokens`), whichever is lower.
  */
 export function compactionTriggerBaseTokens(contextWindow: number, limits?: CompactionWindowLimits): number {
 	return effectiveInputLimitTokens(contextWindow, limits?.provider, limits?.modelId, limits?.usageWindowTokens);

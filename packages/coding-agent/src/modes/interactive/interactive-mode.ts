@@ -373,7 +373,7 @@ const MODEL_CATALOG_REFRESH_TTL_MS = 60_000;
 
 /**
  * Compaction window limits for a model: identity for the measured-input-limit
- * table plus the model's config-declared serving-window cap (models.json
+ * table plus the model's config-declared rate-quota heuristic (models.json
  * `usageWindowTokens`), so the footer's threshold readout matches the
  * session-side trigger exactly.
  */

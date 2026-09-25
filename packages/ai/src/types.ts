@@ -523,18 +523,27 @@ export interface Model<TApi extends Api> {
 	contextWindow: number;
 	maxTokens: number;
 	/**
-	 * Serving-window cap for a single request, in the provider's own token caliber.
-	 * Optional: absent means the declared contextWindow is the effective cap.
+	 * Optional rate-quota heuristic for the model, in the provider's own token
+	 * caliber. Absent means no heuristic: the declared contextWindow stays the cap.
 	 *
-	 * For gateways whose accepted input sits below the advertised contextWindow -
-	 * a token-per-time-window quota (e.g. 200k tokens / 10s) is the live example:
-	 * the whole single-request input is charged to one window, so a request
-	 * larger than the quota is throttled even though the model's contextWindow
-	 * is far larger. Setting this field clamps the compaction trigger (and the
-	 * summarization budget) to it, so threshold compaction fires before the
-	 * gateway's wall instead of after. It is a config-declared operator knob,
-	 * NOT a measured limit - the measured table in model-input-limits.ts is the
-	 * evidence-backed source for provider-side input rejections.
+	 * Use this for gateways whose per-time-window token budget (e.g. a 200k
+	 * tokens/10s quota) sits far below the model's advertised contextWindow, and
+	 * whose 429s arrive after the window's budget has been burned down by
+	 * preceding requests. This is a heuristic, not a hard per-request wall:
+	 * observed gateways accept single requests far larger than the quota
+	 * (560,938-token inputs succeed on a 1M-window model with a 200k/10s quota,
+	 * and single "input too long" rejections were not observed), and 429
+	 * rejections have zero usage and cluster after large preceding prompts -
+	 * the shape of a rate limit, not a per-request ceiling. Setting this field
+	 * clamps the compaction trigger (and the summarization budget) to it, so
+	 * threshold compaction keeps request sizes under the per-window budget.
+	 *
+	 * The trade-off is real: on a 1M-window model with triggerRatio 0.7, a
+	 * 200,000 cap moves the trigger from 700,000 to 140,000 (~5x more
+	 * compactions, each discarding history and spending a summarization
+	 * request). Treat it as an optional tuning knob, not a default fix; the
+	 * evidence-backed source for per-request input rejections stays the
+	 * measured table in model-input-limits.ts.
 	 */
 	usageWindowTokens?: number;
 	/** Flagship model surfaced above non-featured models of the same provider in pickers. */

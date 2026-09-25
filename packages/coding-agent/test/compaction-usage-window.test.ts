@@ -22,12 +22,18 @@ import { initTheme } from "../src/modes/interactive/theme/theme.js";
 /**
  * W1 (context-pressure-guard): the compaction trigger must be a ratio of
  * min(contextWindow, usageWindowTokens), where usageWindowTokens is the new
- * optional models.json field declaring the serving gateway's per-request
- * window. The matrix below reproduces the production shape that motivated the
- * guard: a model whose catalog window is 1M but whose serving gateway accepts
- * far less per request (the live example: a 200k-tokens/10s quota window - the
- * whole single-request input is charged to one window, so a 581k-token request
- * is 2.9x the quota). Absent field => fall back to the declared window.
+ * optional models.json field declaring a rate-quota heuristic. The matrix
+ * below reproduces the production shape that motivated the knob: a model
+ * whose catalog window is 1M whose gateway's per-time-window token budget
+ * (the live example: 200k tokens/10s, per the provider's models/limits
+ * endpoint) sits far below it. That budget is a rate quota, not a
+ * per-request wall: the same gateway accepted a 560,938-token single request
+ * on the same day, and its 429s arrive with zero usage after large preceding
+ * prompts - the shape of a window's budget being burned down, not a single
+ * oversized request being rejected. Setting the field is therefore an
+ * optional tuning knob (it moves the trigger from 700k to 140k on this
+ * model, ~5x more compactions), not a default fix. Absent field => fall back
+ * to the declared window.
  */
 
 // The live settings.json value as of 2026-09-25 (reserveTokens 16384, triggerRatio 0.7).
@@ -38,10 +44,13 @@ const SETTINGS: CompactionSettings = {
 	triggerRatio: 0.7,
 };
 
-const CONTEXT_581K = 581_435; // tokensBefore of the 2026-09-25 19:17 compaction, session 01a0d360.
+// tokensBefore of the one compaction in session 01a0d360 (2026-09-25 19:18:05).
+// 581,435 is a different number: the 19:17:10 assistant message's usage.totalTokens.
+const CONTEXT_581K = 581_244;
 
 // deepseek-v4-pro as declared in ~/.prime/agent/models.json: contextWindow 1,000,000.
-// Serving gateway (Bailian limits): 200k tokens per 10s window => usageWindowTokens 200000.
+// Gateway rate quota (provider models/limits endpoint): 200k tokens per 10s window
+// => usageWindowTokens 200000 as the rate-quota heuristic.
 const PRO_LIMITS: CompactionWindowLimits = {
 	provider: "aliyun-maas",
 	modelId: "deepseek-v4-pro",
@@ -49,8 +58,8 @@ const PRO_LIMITS: CompactionWindowLimits = {
 };
 
 // qwen3.8-max as declared: contextWindow 1,000,000, no usageWindowTokens field
-// (the 500k/6s throughput figure is a rate quota, not a per-request serving
-// window; the operator leaves it unset rather than guessing).
+// (its 500k/6s figure is a rate quota like the above; the operator leaves it
+// unset rather than paying the ~5x compaction-frequency cost of guessing).
 const QWEN_LIMITS: CompactionWindowLimits = { provider: "aliyun-maas", modelId: "qwen3.8-max" };
 
 describe("W1 threshold matrix: pro@581k triggers / qwen@581k does not / no-field fallback", () => {
@@ -131,8 +140,9 @@ describe("W1 summarization budget: the same serving-window cap clamps the compac
 				modelId: "deepseek-v4-pro",
 				usageWindowTokens: cap,
 			});
-		expect(withCap(undefined).inputLimit).toBe(withCap(undefined).inputLimit);
+		// No cap, no measured entry for aliyun-maas/deepseek-v4-pro: 1,000,000.
 		expect(withCap(undefined).inputLimit).toBe(1_000_000);
+		expect(withCap(undefined).inputLimit).toBe(withCap(2_000_000).inputLimit);
 	});
 });
 
@@ -141,10 +151,9 @@ describe("W1 models.json: usageWindowTokens parses, overrides, and validates", (
 	// models.json and a sibling temp auth.json, so the real ~/.prime/agent/models.json
 	// and the Prime CLI config (~/.prime/config.json, only consulted when
 	// usePrimeCliConfig is on, which an explicit auth path turns off) are never read.
-	// The predecessor agent chased a phantom "vitest vs tsx module instance" split
-	// here: in this repo both run against the same workspace sources (vitest.config.ts
-	// aliases @earendil-works/pi-ai to packages/ai/src), so no vi.resetModules /
-	// dynamic import is needed. Both paths were verified green 2026-09-25.
+	// No vi.resetModules / dynamic import is needed: vitest.config.ts aliases the
+	// workspace packages (e.g. @earendil-works/pi-ai) to their src, so the test
+	// and any tsx-based probe run against the same sources.
 
 	const MODELS_JSON = {
 		providers: {

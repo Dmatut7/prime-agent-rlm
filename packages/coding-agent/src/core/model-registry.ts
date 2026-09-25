@@ -168,7 +168,7 @@ const ModelDefinitionSchema = Type.Object({
 	),
 	contextWindow: Type.Optional(Type.Number()),
 	maxTokens: Type.Optional(Type.Number()),
-	/** Optional serving-window cap for a single request; absent = contextWindow. See Model.usageWindowTokens. */
+	/** Optional rate-quota heuristic in the provider's token caliber; absent = contextWindow. See Model.usageWindowTokens. */
 	usageWindowTokens: Type.Optional(Type.Number()),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
@@ -189,7 +189,7 @@ const ModelOverrideSchema = Type.Object({
 	),
 	contextWindow: Type.Optional(Type.Number()),
 	maxTokens: Type.Optional(Type.Number()),
-	/** Optional serving-window cap for a single request; absent = contextWindow. See Model.usageWindowTokens. */
+	/** Optional rate-quota heuristic in the provider's token caliber; absent = contextWindow. See Model.usageWindowTokens. */
 	usageWindowTokens: Type.Optional(Type.Number()),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
@@ -417,7 +417,9 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	if (override.input !== undefined) result.input = override.input as ("text" | "image")[];
 	if (override.contextWindow !== undefined) result.contextWindow = override.contextWindow;
 	if (override.maxTokens !== undefined) result.maxTokens = override.maxTokens;
-	// undefined explicitly clears an inherited serving-window cap; a value sets it.
+	// A value sets (or tightens) the serving-window cap. There is no way to clear
+	// an inherited one from models.json: undefined leaves the model's own value
+	// in place, so an override can only tighten, never remove.
 	if (override.usageWindowTokens !== undefined) result.usageWindowTokens = override.usageWindowTokens;
 
 	if (override.cost) {
@@ -938,7 +940,7 @@ export class ModelRegistry {
 					modelDef.usageWindowTokens > modelDef.contextWindow
 				)
 					throw new Error(
-						`Provider ${providerName}, model ${modelDef.id}: usageWindowTokens (${modelDef.usageWindowTokens}) exceeds contextWindow (${modelDef.contextWindow}) - the serving cap can only tighten the window`,
+						`Provider ${providerName}, model ${modelDef.id}: usageWindowTokens (${modelDef.usageWindowTokens}) exceeds contextWindow (${modelDef.contextWindow}) - the rate-quota heuristic can only tighten the window`,
 					);
 				if (modelDef.maxTokens !== undefined && modelDef.maxTokens <= 0)
 					throw new Error(`Provider ${providerName}, model ${modelDef.id}: invalid maxTokens`);
@@ -2098,7 +2100,7 @@ export interface ProviderConfigInput {
 		cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 		contextWindow: number;
 		maxTokens: number;
-		/** Optional serving-window cap for a single request; absent = contextWindow. */
+		/** Optional rate-quota heuristic in the provider's token caliber; absent = contextWindow. */
 		usageWindowTokens?: number;
 		headers?: Record<string, string>;
 		compat?: Model<Api>["compat"];

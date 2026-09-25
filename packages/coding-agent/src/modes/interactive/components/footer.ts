@@ -53,7 +53,7 @@ export interface FooterTelemetrySnapshot {
 	 */
 	compactionThresholdTokens?: number;
 	/**
-	 * Config-declared serving-window cap (models.json `usageWindowTokens`) that
+	 * Config-declared rate-quota heuristic (models.json `usageWindowTokens`) that
 	 * sits below the declared contextWindow. When set and positive the footer
 	 * appends one hint so the compressed threshold is not misread as a bug
 	 * ("why compact at 140k on a 1M window?").

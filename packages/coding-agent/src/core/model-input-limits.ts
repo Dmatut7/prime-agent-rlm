@@ -59,8 +59,13 @@ export function measuredInputLimit(provider: string | undefined, model: string |
 /**
  * The input token count a provider will actually accept for a model.
  *
- * A measured limit always wins over the declaration; an unknown or non-positive
- * window yields 0, which callers treat as "unknown" rather than "unlimited".
+ * Three inputs, one minimum: the declared contextWindow, the provider's
+ * measured input limit, and a config-declared serving-window cap
+ * (`usageWindowTokens`). The lowest wins - the cap can tighten below the
+ * measured limit, and a measured limit can tighten below the cap. An unknown
+ * or non-positive declared window yields 0, which callers treat as "unknown"
+ * rather than "unlimited"; an absent or non-positive cap is ignored (the
+ * declared window stays the cap) rather than treated as a zero window.
  */
 export function effectiveInputLimitTokens(
 	contextWindow: number | undefined,
@@ -69,7 +74,7 @@ export function effectiveInputLimitTokens(
 	usageWindowTokens?: number,
 ): number {
 	const declared = contextWindow && contextWindow > 0 ? contextWindow : 0;
-	// A config-declared serving-window cap can only tighten the declared window
+	// A config-declared rate-quota heuristic can only tighten the declared window
 	// (a value above it is a registry validation error, but the clamp here also
 	// guards hand-built Model objects that bypass validation). Absent or
 	// non-positive means "no declared cap" - fall back to the declared window,

@@ -152,10 +152,10 @@ export function computeSummarizationInputBudget(options: {
 	provider?: string;
 	modelId?: string;
 	/**
-	 * Config-declared serving-window cap for a single request (models.json
-	 * `usageWindowTokens`). Clamps the input limit the same way the measured
-	 * table does: a summarization request larger than the gateway's serving
-	 * window is rejected exactly like an oversized ordinary request.
+	 * Config-declared rate-quota heuristic (models.json `usageWindowTokens`).
+	 * Clamps the input limit the same way the measured table does, so the
+	 * summarization request stays inside the same (possibly capped) budget the
+	 * trigger uses - both call sites must share one input-limit caliber.
 	 */
 	usageWindowTokens?: number;
 	inflation?: number;
