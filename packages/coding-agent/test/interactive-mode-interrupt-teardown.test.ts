@@ -370,3 +370,53 @@ describe("teardownSessionUi handoff placeholder", () => {
 		expect(frames).toEqual(["stop:"]);
 	});
 });
+
+describe("subagent panel fold on the parent turn boundary (R1-P1)", () => {
+	it("re-applies the panel rows when agent_end stamps the turn boundary", () => {
+		// The silent path the pure-function tests cannot reach: nothing else re-runs the
+		// fold once a child has settled (child updates stop arriving), so agent_end must
+		// recompute the rows itself or "the turn ended" only bites on the 30-minute timer.
+		const now = Date.now();
+		const child = {
+			id: "settled-child",
+			label: "settled-child",
+			status: "done",
+			sessionDir: "/tmp/settled-child",
+			lastActivityAt: now - 1000,
+		};
+		const fake = modeFake({
+			connectionState: {
+				isStreaming: true,
+				activeToolNames: [],
+				messageCount: 1,
+				sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+			},
+			subagentSnapshots: new Map([[child.id, child]]),
+			rlmNodeId: undefined,
+			subagentHistoryExpanded: false,
+			subagentParentTurnEndedAt: undefined,
+			subagentFoldTimer: undefined,
+			subagentSummaryLine: {
+				setSubagentRows: vi.fn(),
+				setSubagentFoldedCount: vi.fn(),
+				invalidate: vi.fn(),
+			},
+		});
+		const line = fake.subagentSummaryLine as {
+			setSubagentRows: ReturnType<typeof vi.fn>;
+			setSubagentFoldedCount: ReturnType<typeof vi.fn>;
+		};
+
+		(fake as { updateConnectionStateFromEvent: (e: { type: string }) => void }).updateConnectionStateFromEvent({
+			type: "agent_end",
+		});
+
+		expect(fake.subagentParentTurnEndedAt).toBeTypeOf("number");
+		// The settled child's activity predates the boundary, so the fold hides it and the
+		// header count carries it - proving the event path recomputed the rows.
+		expect(line.setSubagentRows).toHaveBeenCalled();
+		expect(line.setSubagentFoldedCount).toHaveBeenCalledWith(1);
+		const rowsArg = line.setSubagentRows.mock.calls.at(-1)?.[0] as unknown[];
+		expect(rowsArg).toEqual([]);
+	});
+});

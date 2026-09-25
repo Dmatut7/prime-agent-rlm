@@ -1529,11 +1529,12 @@ describe("subagent panel rows (design board 06)", () => {
 			undefined,
 		);
 		const selection = selectSubagentPanelRows(rows, { now });
-		// Idle rows settle by the same clock but never fold: only 收口 is retention-bound.
 		// Both lists keep panel order (newest activity first), so the failure at 31
 		// minutes ago outranks the completion at 33 - the fold never reorders anything.
-		expect(selection.rows.map((row) => row.name)).toEqual(["run", "idle", "fresh-done"]);
-		expect(selection.folded.map((row) => row.name)).toEqual(["old-err", "old-done"]);
+		// A failed row never folds (P5): a broken child is the one fact the reader must
+		// not have to scroll for, so it stays on the list past the retention window.
+		expect(selection.rows.map((row) => row.name)).toEqual(["run", "idle", "fresh-done", "old-err"]);
+		expect(selection.folded.map((row) => row.name)).toEqual(["old-done"]);
 	});
 
 	it("folds settled rows at the parent's turn boundary, whatever their age", () => {
@@ -1575,7 +1576,7 @@ describe("subagent panel rows (design board 06)", () => {
 		expect(selection.folded.map((row) => row.name)).toEqual(["aged"]);
 	});
 
-	it("folds at the retention edge and never folds a busy, idle or stalled row", () => {
+	it("folds at the retention edge; a resident finished child folds, a busy or stalled one never does", () => {
 		const now = 10_000_000;
 		const atEdge = SUBAGENT_PANEL_SETTLED_RETENTION_MS;
 		const settled = (id: string, lastActivityAt: number) =>
@@ -1586,8 +1587,9 @@ describe("subagent panel rows (design board 06)", () => {
 		expect(isSubagentPanelRowFolded(settled("at-edge", now - atEdge), { now })).toBe(true);
 		expect(isSubagentPanelRowFolded(settled("just-under", now - atEdge + 1), { now })).toBe(false);
 
-		// Not settled, not foldable - however long they have been quiet. A resident
-		// done child reads as idle on the roster, and a stall is a wedged turn.
+		// A resident done child reads as idle on the roster but is finished work, so the
+		// retention clock folds it (P4: 已经结束的工作流要及时删除). A busy row and a stall
+		// are live work and never fold, however long they have been quiet.
 		const ancient = now - 12 * 60 * 60_000;
 		const busy = buildSubagentPanelRows(
 			[
@@ -1603,18 +1605,16 @@ describe("subagent panel rows (design board 06)", () => {
 			undefined,
 		);
 		expect(busy.map((row) => row.state)).toEqual(["stalled", "running", "idle"]);
-		expect(selectSubagentPanelRows(busy, { now }).rows.map((row) => row.name)).toEqual([
-			"stalled",
-			"running",
-			"idle",
-		]);
+		expect(selectSubagentPanelRows(busy, { now }).rows.map((row) => row.name)).toEqual(["stalled", "running"]);
+		expect(selectSubagentPanelRows(busy, { now }).folded.map((row) => row.name)).toEqual(["idle"]);
 
 		const failed = buildSubagentPanelRows(
 			[child("boom", "error", { sessionName: "boom", error: "boom", lastActivityAt: ancient })],
 			undefined,
 		)[0]!;
 		expect(isSettledSubagentPanelRow(failed)).toBe(true);
-		expect(isSubagentPanelRowFolded(failed, { now })).toBe(true);
+		// P5: a failure is settled but never auto-folded - it stays visible.
+		expect(isSubagentPanelRowFolded(failed, { now })).toBe(false);
 	});
 
 	it("keeps panel order through the fold: partition, not reorder", () => {
@@ -1656,14 +1656,10 @@ describe("subagent panel rows (design board 06)", () => {
 		const selection = selectSubagentPanelRows(built, { now });
 		// Folding drops the two settled rows that aged out and leaves the rest
 		// exactly where the sort put them - the fold is a filter over panel order.
-		expect(selection.rows.map((row) => row.name)).toEqual([
-			"live-new",
-			"stuck",
-			"live-old",
-			"idle-done",
-			"done-fresh",
-		]);
-		expect(selection.folded.map((row) => row.name)).toEqual(["err-old", "done-old"]);
+		// idle-done is finished work that aged out (P4) so it folds; err-old is a failure
+		// and never folds (P5), so it stays on the list in settled-group order.
+		expect(selection.rows.map((row) => row.name)).toEqual(["live-new", "stuck", "live-old", "done-fresh", "err-old"]);
+		expect(selection.folded.map((row) => row.name)).toEqual(["idle-done", "done-old"]);
 		expect([...selection.rows, ...selection.folded].map((row) => row.name).sort()).toEqual(
 			built.map((row) => row.name).sort(),
 		);
