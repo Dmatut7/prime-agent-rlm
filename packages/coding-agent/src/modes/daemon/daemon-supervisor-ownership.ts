@@ -105,7 +105,7 @@ interface AcquireDaemonSupervisorOwnershipOptions {
 	registryDir?: string;
 }
 
-class DaemonSupervisorAlreadyRunningError extends Error {
+export class DaemonSupervisorAlreadyRunningError extends Error {
 	readonly code = "daemon_supervisor_already_running" as const;
 
 	constructor(readonly owner: DaemonSupervisorOwnerRecord) {

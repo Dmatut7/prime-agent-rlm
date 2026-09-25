@@ -103,6 +103,21 @@ export async function acquireDaemonSocketPathLease(socketPath: string): Promise<
 	return lease;
 }
 
+/**
+ * Typed "another daemon owns this socket" failure from socket preparation.
+ * Same message as before (log greppers keep working); carries the path so a
+ * supervisor-mode launcher can downgrade to standby without parsing text.
+ */
+export class DaemonSocketInUseError extends Error {
+	readonly socketPath: string;
+
+	constructor(socketPath: string) {
+		super(`Daemon socket already in use: ${socketPath}`);
+		this.name = "DaemonSocketInUseError";
+		this.socketPath = socketPath;
+	}
+}
+
 export async function prepareDaemonSocketPath(socketPath: string, lease?: DaemonSocketPathLease): Promise<void> {
 	ensureDefaultDaemonSocketDir(socketPath);
 
@@ -119,7 +134,7 @@ export async function prepareDaemonSocketPath(socketPath: string, lease?: Daemon
 		return;
 	}
 	if (await canConnectToUnixSocket(socketPath)) {
-		throw new Error(`Daemon socket already in use: ${socketPath}`);
+		throw new DaemonSocketInUseError(socketPath);
 	}
 	const ownedLease = await acquireDaemonSocketPathLease(socketPath);
 	try {
@@ -149,7 +164,7 @@ async function prepareUnixDaemonSocketPath(socketPath: string, lease?: DaemonSoc
 
 	const staleIdentity: DaemonSocketIdentity = { dev: stat.dev, ino: stat.ino };
 	if (await canConnectToUnixSocket(socketPath)) {
-		throw new Error(`Daemon socket already in use: ${socketPath}`);
+		throw new DaemonSocketInUseError(socketPath);
 	}
 	const deadline = Date.now() + DAEMON_SOCKET_RELEASE_GRACE_MS;
 	while (Date.now() < deadline) {
@@ -170,7 +185,7 @@ async function prepareUnixDaemonSocketPath(socketPath: string, lease?: DaemonSoc
 			throw new Error(`Daemon socket changed ownership while waiting for cleanup: ${socketPath}`);
 		}
 		if (await canConnectToUnixSocket(socketPath)) {
-			throw new Error(`Daemon socket already in use: ${socketPath}`);
+			throw new DaemonSocketInUseError(socketPath);
 		}
 	}
 
