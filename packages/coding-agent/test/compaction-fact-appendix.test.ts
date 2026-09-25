@@ -323,6 +323,219 @@ describe("fact extraction: issue references", () => {
 	});
 });
 
+describe("fact extraction: stated decisions", () => {
+	const STATED = "我们决定采用 PostgreSQL 作为主数据库，理由是事务一致性和现成运维。";
+
+	it("keeps a decision or conclusion sentence from assistant prose", () => {
+		expect(valuesOf([assistantMessage(`调研完了。${STATED}`)], "decision")).toContain(STATED);
+		expect(valuesOf([assistantMessage("结论是先回滚到上一个 tag。")], "decision")).toHaveLength(1);
+		expect(valuesOf([assistantMessage("Root cause is the unseeded kernel venv.")], "decision")).toHaveLength(1);
+		expect(valuesOf([assistantMessage("We decided to keep the retry loop.")], "decision")).toHaveLength(1);
+	});
+
+	it("leaves narration that merely connects with 因为 or because alone", () => {
+		// The block is declared authoritative, so a false positive injects a wrong
+		// instruction into every later generation. Bare connectives are too loose.
+		expect(valuesOf([assistantMessage("测试挂了因为网络不通。")], "decision")).toHaveLength(0);
+		expect(valuesOf([assistantMessage("It failed because the port was busy.")], "decision")).toHaveLength(0);
+	});
+
+	it("does not take a decision out of the user's own words", () => {
+		// User words already ride verbatim in <user-requests>; re-extracting them here
+		// would book the same sentence into two authoritative blocks.
+		expect(valuesOf([userMessage(STATED)], "decision")).toHaveLength(0);
+		expect(valuesOf([assistantMessage(STATED)], "decision")).toHaveLength(1);
+	});
+
+	it("does not take a decision out of tool output, a tool call or thinking", () => {
+		expect(valuesOf([toolResultMessage(STATED)], "decision")).toHaveLength(0);
+		expect(valuesOf([assistantToolCall("write", { text: STATED })], "decision")).toHaveLength(0);
+		expect(valuesOf([assistantMessage("narration", STATED)], "decision")).toHaveLength(0);
+	});
+
+	it("leaves a summary role out of the decision sources", () => {
+		// The appendix's own output from an earlier generation is not new evidence.
+		expect(extractFacts([compactionSummaryMessage(STATED)]).size).toBe(0);
+	});
+
+	it("drops a fragment too short to be a statement", () => {
+		expect(valuesOf([assistantMessage("已决定。")], "decision")).toHaveLength(0);
+	});
+
+	it("keys a decision the same way the extraction and the merge do, case aside", () => {
+		// One key derivation, not two. extractDecisions used to lowercase while
+		// mergeFactLedger re-keyed on the raw value, so a decision retyped with
+		// different capitalisation in a later generation became a second record:
+		// one authoritative anchor in two slots, with its mention weight split.
+		expect(factKey("decision", "We Decided to use Redis for cache.")).toBe(
+			factKey("decision", "we decided to use redis for cache."),
+		);
+		expect(factKey("decision", "结论是   先回滚")).toBe(factKey("decision", "结论是 先回滚"));
+
+		const first = buildFactLedger({
+			messages: [assistantMessage("We Decided to use Redis for cache.")],
+			generation: 1,
+		});
+		const second = buildFactLedger({
+			messages: [assistantMessage("we decided to use redis for cache.")],
+			generation: 2,
+			previous: first,
+		});
+		const carried = second.records.filter((record) => record.kind === "decision");
+		expect(carried).toHaveLength(1);
+		// The retyped sentence folds into the record that already carried it, so the
+		// weight accumulates instead of being split, and the first spelling survives.
+		expect(carried[0].value).toBe("We Decided to use Redis for cache.");
+		expect(carried[0].weight).toBe(6);
+		expect(carried[0].firstGeneration).toBe(1);
+		expect(carried[0].lastGeneration).toBe(2);
+	});
+
+	it("clips an over-long decision instead of dropping it silently", () => {
+		// MAX_VALUE_CHARS.decision is 300; the statement below is past it. Dropping the
+		// whole sentence was the previous behaviour and left no trace: 0 records and an
+		// empty `elided`, because that counter counts what pruning dropped from a
+		// ledger, not what extraction refused. The longest decisions are the ones
+		// carrying the most reasoning, so a character cap must not be the one that
+		// decides whether a verdict survives.
+		const verdict = "我们决定采用方案 B";
+		const rationale = "理由是一致性可控";
+		const long = `${verdict}${"细节说明".repeat(120)}${rationale}。`;
+		expect(long.length).toBeGreaterThan(300);
+
+		const decisions = [...extractFacts([assistantMessage(long)]).values()].filter(
+			(record) => record.kind === "decision",
+		);
+		expect(decisions).toHaveLength(1);
+		const value = decisions[0].value;
+		// The verdict and the trailing rationale both survive, the clip is bounded, and
+		// the value says in its own text that it is clipped: the block is authoritative,
+		// so a reader quoting it must not believe it is quoting the whole statement.
+		expect(value.startsWith(verdict)).toBe(true);
+		expect(value.endsWith(`${rationale}。`)).toBe(true);
+		expect(value).toContain("characters elided");
+		expect(value.length).toBeLessThan(long.length);
+		expect(value.length).toBeLessThanOrEqual(300 + "[…99999 characters elided…]".length);
+	});
+
+	it("clips deterministically and folds two clips of one statement into one anchor", () => {
+		const long = `我们决定采用方案 B${"细节说明".repeat(120)}理由是一致性可控。`;
+		const found = extractFacts([assistantMessage(long), assistantMessage(long.toUpperCase())]);
+		const decisions = [...found.values()].filter((record) => record.kind === "decision");
+		// Same statement, different case, one anchor with both mentions counted.
+		expect(decisions).toHaveLength(1);
+		expect(decisions[0].weight).toBe(6);
+	});
+
+	it("never renders a decision past the block's own value cap", () => {
+		const ledger = buildFactLedger({
+			messages: [assistantMessage(`我们决定采用方案 B${"细节说明".repeat(200)}理由是一致性可控。`)],
+			generation: 1,
+		});
+		const rendered = renderFactAppendix(ledger);
+		const parsed = parseFactAppendix(rendered);
+		expect(parsed?.records).toHaveLength(1);
+		// Round trip is byte-exact through JSON even for a clipped CJK value.
+		expect(parsed?.records[0]).toEqual(ledger.records[0]);
+		expect(ledger.records[0].value.length).toBeLessThan("细节说明".repeat(200).length);
+	});
+
+	it("renders decisions first, so the block leads with what the continuation must not undo", () => {
+		const ledger = buildFactLedger({
+			messages: [
+				assistantMessage(
+					`结论是先回滚到上一个 tag。Error: build failed at step 4. Reverted commit ${HEAD_SHA} in /tmp/ma_audit/x.md.`,
+				),
+			],
+			generation: 1,
+		});
+		const kinds = ledger.records.map((record) => record.kind);
+		expect(kinds[0]).toBe("decision");
+		expect(kinds).toContain("error");
+		expect(kinds).toContain("sha");
+	});
+
+	it("carries a decision through generations with no new evidence", () => {
+		const first = buildFactLedger({ messages: [assistantMessage(STATED)], generation: 1 });
+		const decisionsOf = (ledger: FactLedger) => ledger.records.filter((record) => record.kind === "decision");
+		expect(decisionsOf(first)).toHaveLength(1);
+		let carried = first;
+		for (let generation = 2; generation <= 6; generation++) {
+			carried = buildFactLedger({ messages: [], generation, previous: carried });
+			expect(decisionsOf(carried), `generation ${generation}`).toHaveLength(1);
+			expect(decisionsOf(carried)[0].value, `generation ${generation}`).toBe(STATED);
+			expect(decisionsOf(carried)[0].firstGeneration).toBe(1);
+		}
+		// And through the rendered-block fallback, for an entry whose details are gone.
+		const reparsed = parseFactAppendix(renderFactAppendix(carried));
+		expect(decisionsOf(reparsed ?? emptyFactLedger(6))).toHaveLength(1);
+		expect(decisionsOf(reparsed ?? emptyFactLedger(6))[0].value).toBe(STATED);
+	});
+
+	it("keeps a decision when the budget binds, against the kinds that crowd it out", () => {
+		// A transcript full of paths and numbers must not wipe out the decisions: every
+		// kind keeps a protected minimum, and FACT_KIND_PRIORITY ranks decision second.
+		const noise: AgentMessage[] = [];
+		for (let index = 0; index < 400; index++) {
+			noise.push(assistantMessage(`read /tmp/ma_audit/deep/path/number-${index}.ts at line ${index + 1}`));
+		}
+		const ledger = buildFactLedger({
+			messages: [assistantMessage(STATED), ...noise],
+			generation: 1,
+			tokenBudget: FACT_APPENDIX_BUDGET_MINIMUM,
+		});
+		const decisions = ledger.records.filter((record) => record.kind === "decision");
+		expect(decisions).toHaveLength(1);
+		expect(decisions[0].value).toBe(STATED);
+	});
+
+	it("extracts no decision from a transcript that states none, and renders nothing extra", () => {
+		const ledger = buildFactLedger({
+			messages: [assistantMessage("Reading the file now."), userMessage("ok")],
+			generation: 1,
+		});
+		expect(ledger.records.filter((record) => record.kind === "decision")).toHaveLength(0);
+		expect(ledger.elided.decision ?? 0).toBe(0);
+		expect(renderFactAppendix(emptyFactLedger(1))).toBe("");
+	});
+
+	it("splits two English decisions in one paragraph instead of clipping a merged value (R1 follow-up 1)", () => {
+		// `.` used to be missing from the sentence split, so a two-decision paragraph became
+		// one value that the 200-char clip then cut in half - the middle statement was lost.
+		// Two marker-bearing statements: before the fix the missing `.` merge made this one
+		// value, and the 200-char clip then cut the second statement out of it.
+		const prose = "We decided to use Redis for the queue. We chose to drop the retry loop.";
+		const values = valuesOf([assistantMessage(prose)], "decision");
+		expect(values).toHaveLength(2);
+		expect(values).toContain("We decided to use Redis for the queue.");
+		expect(values).toContain("We chose to drop the retry loop.");
+	});
+
+	it("does not split a decimal or a version string into a sentence (R1 follow-up 1 guard)", () => {
+		const values = valuesOf([assistantMessage("We decided to pin v1.2 and keep 0.5 as the timeout.")], "decision");
+		expect(values).toHaveLength(1);
+		expect(values[0]).toContain("v1.2");
+		expect(values[0]).toContain("0.5");
+	});
+
+	it("keeps negated and still-open sentences out of the authoritative block (R1 follow-up 2)", () => {
+		const samples = [
+			"我还没决定用哪个数据库，先继续调研。",
+			"是否决定采用方案 B 还要看测试结果。",
+			"这个 bug 的根因还没查出来。",
+			"root cause is still unknown. the fix is not yet clear.",
+			"We have not decided yet which cache to use.",
+		];
+		for (const sample of samples) {
+			expect(valuesOf([assistantMessage(sample)], "decision"), sample).toHaveLength(0);
+		}
+		// A real decision that merely mentions an unknown is still a decision.
+		expect(
+			valuesOf([assistantMessage("We decided to use Redis because the cache size is unknown.")], "decision"),
+		).toHaveLength(1);
+	});
+});
+
 describe("fact weighting", () => {
 	it("counts a message once however often the value repeats inside it", () => {
 		const spam = `path /tmp/ma_audit/out/a.json ${"/tmp/ma_audit/out/a.json\n".repeat(50)}`;
@@ -574,7 +787,7 @@ describe("fact ledger budget", () => {
 		expect(FACT_APPENDIX_BUDGET_MINIMUM * 4).toBeGreaterThan(APPENDIX_HEADER_CHARS);
 		expect(FACT_APPENDIX_TOKEN_BUDGET).toBe(4000);
 		expect(FACT_APPENDIX_BUDGET_FLOOR).toBe(2500);
-		expect(FACT_KINDS).toEqual(["sha", "path", "number", "error", "issue"]);
+		expect(FACT_KINDS).toEqual(["sha", "path", "number", "error", "issue", "decision"]);
 	});
 
 	it("trims to the global ranking when even the protected minimum does not fit", () => {

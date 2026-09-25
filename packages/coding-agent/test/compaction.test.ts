@@ -201,6 +201,22 @@ describe("buildSummarizationPrompt", () => {
 		expect(update).toContain("existing summary provided in <previous-summary> tags");
 		expect(update).toContain("<user-instructions>");
 	});
+
+	it("names every kind the fact appendix can hold", () => {
+		const prompt = buildSummarizationPrompt();
+		// The inventory has to match what the renderer actually puts in the block. The
+		// ledger grew a `decision` kind while this note still listed five, so the
+		// summarizer was told the appendix holds no decisions and kept retelling them in
+		// `## Key Decisions` prose - the restatement, and the second unreliable copy,
+		// that this note exists to prevent. The block's own header and the prompt's
+		// inventory now name the same kinds.
+		expect(prompt).toContain("stated decisions or conclusions");
+		expect(prompt).toContain("issue references and stated decisions or conclusions");
+		expect(prompt).toContain("## Key Decisions");
+		// The note still carries the rule the sections have to obey.
+		expect(prompt).toContain("Machine-generated blocks are appended after your summary");
+		expect(prompt).toContain("carry what the block cannot");
+	});
 });
 
 describe("Token calculation", () => {

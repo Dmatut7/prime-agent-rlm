@@ -496,4 +496,106 @@ describe("compaction summary carries machine-generated blocks", () => {
 		const preparation = prepareCompaction(continued, settings(), 200000);
 		expect(preparation?.generation).toBe(8);
 	});
+
+	it("carries a stated decision into the compacted summary, and into the next generation's ledger", async () => {
+		const DECISION = "结论是回滚到 4871d9223bac88ac6da9796f4b0c4d33b7566178 之前，理由是主分支已经带了那次修复。";
+		const entries = [
+			messageEntry(userMessage("先查一下这次回归的根因")),
+			messageEntry(assistantMessage(`查清了。${DECISION}`)),
+			messageEntry(userMessage("next task")),
+			messageEntry(assistantMessage(TAIL_FILLER)),
+		];
+		const preparation = prepareCompaction(entries, settings(), 200000);
+		expect(preparation).toBeDefined();
+
+		// The decision is authored assistant prose, so the ledger takes it and the
+		// block carries it into the context the continuation actually reads.
+		const result = await compact(preparation!, createModel(), "test-key");
+		const decisions = (parseFactAppendix(result.summary)?.records ?? []).filter(
+			(record) => record.kind === "decision",
+		);
+		expect(decisions.map((record) => record.value)).toContain(DECISION);
+		expect(decisions[0].firstGeneration).toBe(1);
+		expect((result.details as CompactionDetails).facts?.records.some((r) => r.value === DECISION)).toBe(true);
+
+		// Nothing carries it in the summarizer's own narrative - it returns one line -
+		// so a second generation can only keep it through the ledger.
+		completeSimpleMock.mockClear();
+		const continued: SessionEntry[] = [
+			...entries,
+			compactionEntry(result.summary, result.firstKeptEntryId, result.details as CompactionDetails),
+			messageEntry(userMessage("a later task")),
+			messageEntry(assistantMessage(`y${"y".repeat(11000)}`)),
+			messageEntry(userMessage("and one more")),
+			messageEntry(assistantMessage(`z${"z".repeat(11000)}`)),
+		];
+		const next = prepareCompaction(continued, settings(), 200000);
+		expect(next?.previousFacts?.records.some((record) => record.value === DECISION)).toBe(true);
+		const second = await compact(next!, createModel(), "test-key");
+		const carried = (parseFactAppendix(second.summary)?.records ?? []).filter((record) => record.kind === "decision");
+		expect(carried.map((record) => record.value)).toContain(DECISION);
+		expect(carried).toHaveLength(1);
+		// `g` stamps when a value was mentioned, not when it was carried: the slice of
+		// generation 2 no longer holds the message that stated it, so the anchor keeps
+		// its generation-1 mention and rides along instead of looking freshly restated.
+		expect(carried[0].firstGeneration).toBe(1);
+		expect(carried[0].lastGeneration).toBe(1);
+	});
+
+	it("keeps a decision through five generations of destructive summarization", async () => {
+		const DECISION = "我们决定采用 PostgreSQL 作为主数据库，理由是事务一致性和现成运维。";
+		const entries: SessionEntry[] = [
+			messageEntry(userMessage("选一个数据库")),
+			messageEntry(assistantMessage(`调研完了。${DECISION}`)),
+		];
+		let summary = "";
+		for (let generation = 1; generation <= 5; generation++) {
+			entries.push(messageEntry(userMessage(`task for generation ${generation}`)));
+			entries.push(messageEntry(assistantMessage(`${"filler".repeat(2400)} generation ${generation}`)));
+			// The summarizer keeps nothing: only the deterministic block can carry it.
+			completeSimpleMock.mockImplementation(async () => ({
+				role: "assistant",
+				content: [{ type: "text", text: "## Goal\nnothing worth repeating" }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				usage: createUsage(),
+				stopReason: "stop",
+				timestamp: Date.now(),
+			}));
+			const preparation = prepareCompaction(entries, settings(), 200000);
+			expect(preparation, `generation ${generation} prepared`).toBeDefined();
+			const result = await compact(preparation!, createModel(), "test-key");
+			summary = result.summary;
+			entries.push(compactionEntry(summary, result.firstKeptEntryId, result.details as CompactionDetails));
+
+			const decisions = (parseFactAppendix(summary)?.records ?? []).filter((record) => record.kind === "decision");
+			expect(
+				decisions.map((record) => record.value),
+				`decision at generation ${generation}`,
+			).toContain(DECISION);
+			// One anchor, one slot: the narrative never restates it and the ledger never
+			// books a second copy of it.
+			expect(decisions, `decision count at generation ${generation}`).toHaveLength(1);
+			// Carried, not re-mentioned: `g` stays at the generation that stated it, so
+			// the block tells a reader the anchor is old rather than freshly restated.
+			expect(decisions[0].firstGeneration).toBe(1);
+			expect(decisions[0].lastGeneration).toBe(1);
+			expect(decisions[0].value).toBe(DECISION);
+		}
+	});
+
+	it("adds no decision record, and no empty block, when the slice states none", async () => {
+		const entries = [
+			messageEntry(userMessage("just reading")),
+			messageEntry(assistantMessage("Reading the file now.")),
+			messageEntry(userMessage("next task")),
+			messageEntry(assistantMessage(TAIL_FILLER)),
+		];
+		const preparation = prepareCompaction(entries, settings(), 200000);
+		const result = await compact(preparation!, createModel(), "test-key");
+		const records = parseFactAppendix(result.summary)?.records ?? [];
+		expect(records.filter((record) => record.kind === "decision")).toHaveLength(0);
+		expect((result.details as CompactionDetails).facts?.records.filter((r) => r.kind === "decision")).toHaveLength(0);
+	});
 });

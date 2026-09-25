@@ -25,9 +25,9 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { estimateTextTokensByContent } from "./content-density.js";
 import { checkMachineBlockSelfCount, findMachineBlock, renderMachineBlock } from "./machine-blocks.js";
 
-export type FactKind = "sha" | "path" | "number" | "error" | "issue";
+export type FactKind = "sha" | "path" | "number" | "error" | "issue" | "decision";
 
-export const FACT_KINDS: readonly FactKind[] = ["sha", "path", "number", "error", "issue"];
+export const FACT_KINDS: readonly FactKind[] = ["sha", "path", "number", "error", "issue", "decision"];
 
 export interface FactRecord {
 	kind: FactKind;
@@ -74,16 +74,24 @@ export const FACT_KIND_LIMITS: Readonly<Record<FactKind, number>> = {
 	number: 200,
 	error: 100,
 	issue: 120,
+	decision: 60,
 };
 
 /** Records every kind keeps before the remaining budget is ranked across kinds. */
 export const FACT_KIND_MINIMUM = 4;
 
-/** Order the kinds render in: what a continuation needs first. */
-const KIND_RENDER_ORDER: readonly FactKind[] = ["error", "sha", "path", "number", "issue"];
+/**
+ * Order the kinds render in: what a continuation needs first, grouped by kind.
+ *
+ * `decision` is listed explicitly rather than left to `indexOf` returning -1. It did
+ * sort first that way, so this declares the existing behaviour instead of changing
+ * it - but an unlisted kind is an accident of the comparator, and the next kind
+ * somebody adds would land in the same undeclared slot.
+ */
+const KIND_RENDER_ORDER: readonly FactKind[] = ["decision", "error", "sha", "path", "number", "issue"];
 
 /** Tie-break priority across kinds when two facts have the same weight: most load-bearing first. */
-const KIND_PRIORITY: readonly FactKind[] = ["sha", "error", "path", "issue", "number"];
+const KIND_PRIORITY: readonly FactKind[] = ["sha", "decision", "error", "path", "issue", "number"];
 
 /** Boost for facts mentioned in the generation being written, so fresh anchors outrank stale ones. */
 const RECENCY_BOOST = 2;
@@ -94,6 +102,7 @@ const MAX_VALUE_CHARS: Readonly<Record<FactKind, number>> = {
 	number: 80,
 	error: 200,
 	issue: 16,
+	decision: 300,
 };
 
 /** Longest verbatim snippet kept alongside a number: enough to disambiguate, not a copy of the line. */
@@ -112,7 +121,7 @@ const SOURCE_WEIGHTS = {
 } as const;
 
 const APPENDIX_HEADER =
-	"Machine-extracted from the transcript by regex, no model involved: error signatures, commit SHAs, paths, threshold numbers, issue refs. n = weight of distinct messages mentioning the value, g = first-last generation carrying it, c = verbatim snippet. Authoritative: quote exactly, never restate or correct.";
+	"Machine-extracted from the transcript by regex, no model involved: error signatures, commit SHAs, paths, threshold numbers, issue refs, and stated decisions/conclusions. n = weight of distinct messages mentioning the value, g = first-last generation carrying it, c = verbatim snippet. Authoritative: quote exactly, never restate or correct.";
 
 /**
  * Budget derivation shares and bounds.
@@ -168,10 +177,18 @@ export function emptyFactLedger(generation: number): FactLedger {
  * Derivable from the stored value, so a ledger recovered from details and one
  * recovered from the rendered block key identically. Errors collapse across the
  * numbers embedded in them ("at position 1871" vs "at position 2000" are one
- * recurring failure, not two facts) and numbers collapse across identifier case.
+ * recurring failure, not two facts); numbers and decisions collapse across case
+ * (and decisions across whitespace runs too), because both are prose that the same
+ * author can retype slightly differently in a later generation.
  */
 export function factKey(kind: FactKind, value: string): string {
 	if (kind === "error") return value.replace(/\d+/g, "N");
+	// A decision is prose, so the same statement can be re-typed with different
+	// capitalisation in a later generation ("We decided" / "we decided"). Keying on
+	// the raw value gave them two slots: one authoritative anchor occupying two
+	// appendix lines and its mention weight split in half, which is exactly what
+	// decides whether it survives pruning. Case and whitespace are not meaning here.
+	if (kind === "decision") return value.toLowerCase().replace(/\s+/g, " ").trim();
 	if (kind === "number") return value.toLowerCase();
 	return value;
 }
@@ -470,7 +487,115 @@ function extractIssues(text: string, out: RawFact[]): void {
 }
 
 /** Every fact kind in one text blob, in extraction order. */
-export function extractFactsFromText(text: string, options?: { prose?: boolean }): RawFact[] {
+/**
+ * Sentence-level markers that make an authored sentence a stated decision or a
+ * conclusion rather than narration.
+ *
+ * Deliberately narrow. The appendix is declared authoritative ("quote exactly, never
+ * restate or correct"), so one false positive injects a wrong instruction into every
+ * later generation - a cost that outweighs the recall gained by loosening these to
+ * bare connectives like 因为 or "because".
+ */
+const DECISION_MARKERS: readonly RegExp[] = [
+	/结论(?:是|为|[:：])/,
+	/(?:已|就|才)?(?:决定|拍板|敲定|定为|定下来)/,
+	/(?:根因|根本原因|真正的原因|真正原因是)/,
+	/(?:采用|选用|改用|换成|改为|改成|放弃|不采用|不选|不用了)/,
+	/(?:默认(?:用|走|取|按)|一律|统一用|优先用|以后都)/,
+	/(?:唯一(?:解法|办法|出路)|判据是|验收标准是)/,
+	/\b(?:we (?:decided|chose|choose|settled)|the fix is|root cause is|decision:)/i,
+];
+
+/**
+ * Negated or still-open phrasing that makes a marker hit a non-decision.
+ *
+ * A marker sentence is quoted verbatim and treated as authoritative downstream ("quote
+ * exactly, never restate or correct"), so "we have not decided yet which cache to use"
+ * landing in the block hands the continuation an instruction the author never gave - the
+ * highest-frequency false-positive shape (R1 follow-up). Matched against the sentence, not
+ * the marker span, so a real decision that merely mentions an unknown still counts.
+ */
+const DECISION_NEGATION_MARKERS: readonly RegExp[] = [
+	/(?:还没|尚未|仍未|没有|未曾)(?:决定|定|确定|查|找到|想好)/,
+	/(?:是否|要不要|该不该)(?:决定|采用|选|用)/,
+	/(?:再看|再看看|待定|存疑|不确定)/,
+	/\b(?:not yet|still (?:unknown|unclear|open)|undecided|tbd|unclear|have not decided|haven't decided)\b/i,
+];
+
+/** Shortest decision sentence worth carrying; below this the value is a fragment, not a statement. */
+const DECISION_MIN_CHARS = 10;
+
+/** How much of a clipped decision stays at the front: the statement itself ("we decided X"). */
+const DECISION_CLIP_HEAD_CHARS = 200;
+/** How much stays at the end: the rationale a long sentence usually trails with ("...because Y"). */
+const DECISION_CLIP_TAIL_CHARS = 70;
+
+/**
+ * Sentence terminators that end a decision statement without cutting into it.
+ *
+ * English `.` is included with a guard rather than bare: the repo's assistant prose is
+ * mostly English, and a paragraph holding two decisions used to merge into one value that
+ * the 200-char clip then cut in half (R1 follow-up). The guard keeps decimals and version
+ * strings (`0.5`, `v1.2`) intact: a `.` only ends a sentence when whitespace follows it.
+ */
+const DECISION_SENTENCE_SPLIT = /(?<=[。！？!?；;])|(?<=\.)\s+|\n+/;
+
+/**
+ * Clip an over-long decision sentence instead of dropping it.
+ *
+ * The block declares itself authoritative ("quote exactly"), so a clipped value has
+ * to say in its own text that it is clipped: a reader that quotes it verbatim is
+ * quoting the head and the tail of a statement, not the statement. Dropping the whole
+ * sentence was the previous behaviour and was silent - records stayed 0 and `elided`
+ * stayed empty, because the elided counter counts what pruning dropped from a ledger,
+ * not what extraction refused. A long decision is the one carrying the most reasoning
+ * ("...理由是..."), so losing it entirely to a character cap is the worst available
+ * outcome. Head plus tail keeps the statement and its trailing rationale.
+ */
+function clipDecision(sentence: string, maxChars: number): string {
+	if (sentence.length <= maxChars) return sentence;
+	const marker = (dropped: number) => `[…${dropped} characters elided…]`;
+	const widest = marker(sentence.length).length;
+	const tail = Math.min(DECISION_CLIP_TAIL_CHARS, Math.floor((maxChars - widest) / 3));
+	const head = Math.min(DECISION_CLIP_HEAD_CHARS, maxChars - widest - tail);
+	if (head + tail <= 0) return `${sentence.slice(0, maxChars - 1)}…`;
+	const dropped = sentence.length - head - tail;
+	if (dropped <= 0) return sentence;
+	return `${sentence.slice(0, head)}${marker(dropped)}${sentence.slice(sentence.length - tail)}`;
+}
+
+/**
+ * Verbatim decision and conclusion sentences from authored prose.
+ *
+ * What this closes: the appendices carried hard facts and the user's own words
+ * verbatim, but an agent's stated decision ("root cause is X", "we settle on Y") lived
+ * only in the model-written summary - so a compaction or a model switch handed the next
+ * model a paraphrase of a decision instead of the decision itself. Only authored prose
+ * is scanned (see extractFacts), and the value is the sentence as written: whitespace
+ * normalised, never reworded, because the block instructs every later generation to
+ * quote it exactly. A sentence past the value cap is clipped head-and-tail with the
+ * elision stated inside the value, not dropped - see clipDecision.
+ */
+function extractDecisions(text: string, out: RawFact[], enabled: boolean): void {
+	if (!enabled || !text) return;
+	for (const raw of text.split(DECISION_SENTENCE_SPLIT)) {
+		const sentence = raw.trim().replace(/\s+/g, " ");
+		if (sentence.length < DECISION_MIN_CHARS) continue;
+		if (!DECISION_MARKERS.some((pattern) => pattern.test(sentence))) continue;
+		// A marker hit inside a negated or still-open sentence is not a decision.
+		if (DECISION_NEGATION_MARKERS.some((pattern) => pattern.test(sentence))) continue;
+		// The marker is matched on the full sentence and the value is clipped
+		// afterwards: a long statement whose verdict sits past the cap still counts,
+		// and the clip is what the block carries. The key follows the clipped value,
+		// exactly as the error extractor keys the line it clipped - two statements
+		// whose head and tail agree are one anchor, so the block cannot render the
+		// same line twice and split its weight across two slots.
+		const clipped = clipDecision(sentence, MAX_VALUE_CHARS.decision);
+		out.push({ kind: "decision", value: clipped, key: factKey("decision", clipped) });
+	}
+}
+
+export function extractFactsFromText(text: string, options?: { prose?: boolean; decisions?: boolean }): RawFact[] {
 	const out: RawFact[] = [];
 	if (!text) return out;
 	// extractShas and extractErrors walk the same line decomposition, so the lines are
@@ -483,6 +608,7 @@ export function extractFactsFromText(text: string, options?: { prose?: boolean }
 	extractNumbers(text, out);
 	extractErrors(lines, out);
 	extractIssues(text, out);
+	extractDecisions(text, out, options?.decisions ?? false);
 	return out;
 }
 
@@ -565,7 +691,11 @@ export function extractFacts(messages: readonly AgentMessage[]): Map<string, Fac
 		const perMessage = new Map<string, { fact: RawFact; weight: number }>();
 		for (const source of factSources(message)) {
 			const prose = source.weight >= PROSE_SOURCE_WEIGHT;
-			for (const fact of extractFactsFromText(source.text, { prose })) {
+			// Decisions are scanned from the assistant's own prose only. User words
+			// already ride verbatim in <user-requests>, so re-extracting them here would
+			// double-book the same sentence into two authoritative blocks.
+			const decisions = message.role === "assistant" && prose;
+			for (const fact of extractFactsFromText(source.text, { prose, decisions })) {
 				const key = `${fact.kind}:${fact.key}`;
 				const existing = perMessage.get(key);
 				if (existing) {
