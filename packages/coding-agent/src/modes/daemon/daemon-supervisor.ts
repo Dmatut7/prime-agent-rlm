@@ -2454,7 +2454,7 @@ export class DaemonSupervisor {
 	 * rootSessionId, and the roster covers a name the cached summary has not
 	 * refreshed yet (rename).
 	 */
-	private syncLiveThreadsSnapshot(reason: string): void {
+	private syncLiveThreadsSnapshot(reason: string, force = false): void {
 		const threads: LiveThreadSnapshotEntry[] = [];
 		for (const worker of this.workers.values()) {
 			// Resident sessions only: a client-owned worker dies with its client and
@@ -2479,7 +2479,10 @@ export class DaemonSupervisor {
 			const write = writeLiveThreadsSnapshotIfChanged(
 				this.liveThreadsSnapshotPath,
 				threads,
-				this.liveThreadsSignature,
+				// A forced write refreshes writtenAt even for an unchanged set: the boot
+				// restore trusts the snapshot only while writtenAt is fresh, so a resident
+				// set idle for days must not age out of its own shutdown record.
+				force ? undefined : this.liveThreadsSignature,
 			);
 			if (write.changed) {
 				this.liveThreadsSignature = write.signature;
@@ -10342,7 +10345,7 @@ export class DaemonSupervisor {
 		// Record the resident set one last time while every worker is still alive: a
 		// graceful restart must revive exactly these threads, and from here on the
 		// worker map empties as the stops land.
-		this.syncLiveThreadsSnapshot("shutdown");
+		this.syncLiveThreadsSnapshot("shutdown", true);
 		// P1-7c/B10: answer every pending delivery before the workers go, so a
 		// sender still waiting learns the message was not delivered instead of
 		// watching the daemon leave with it.
