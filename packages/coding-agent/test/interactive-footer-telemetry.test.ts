@@ -111,6 +111,80 @@ describe("footer telemetry watermark (U6)", () => {
 		expect(footerLine(footer)).not.toContain("实际:kimi-k3 ·");
 	});
 
+	it("names the routed image model on the real event path: a turn that serves on another model without any fallback notice", () => {
+		// Real-event-path check (r3): upstream repaints the footer's model readout
+		// only on PROVIDER_FALLBACK_NOTICE / auto_retry events (refreshServingModel,
+		// interactive-mode.ts:6467/6783/6839 at c9fddc0404). A routed image turn
+		// (agent-session _imageRouteForTurns) serves on settings.imageModel for that
+		// one turn and emits no notice and no retry: the connection model stays the
+		// configured one, and only the assistant message's own model field knows who
+		// is answering. Drive handleEvent with exactly that event and read the footer
+		// snapshot it produces.
+		const mode = {
+			isInitialized: true,
+			ui: { requestRender: vi.fn() },
+			footer: { invalidate: vi.fn() },
+			editor: { getText: () => "" },
+			uiServices: { settingsManager: { getFooterTelemetry: () => "on" } },
+			connectionState: {
+				model: { provider: "bailian", id: "glm-5.3-prime", reasoning: true, input: [] },
+				thinkingLevel: "high",
+				messageCount: 3,
+				isStreaming: false,
+				sessionActions: {},
+			},
+			connectionModelCatalog: [] as { provider: string; id: string; input?: string[] }[],
+			modelRegistry: { find: () => undefined },
+			activityTracker: { handleEvent: vi.fn(), getStatus: () => ({ tokens: 0 }) },
+			stallActionBar: undefined,
+			lastServingModelId: "glm-5.3-prime",
+			// The cap rebuild needs a real chat container; this fake only checks the
+			// telemetry path, so pin the in-flight flag to skip it.
+			chatCapRebuildInFlight: true,
+			showStatus: vi.fn(),
+			prepareFeatureHintRun: vi.fn(),
+			updateWorkingLoaderMessage: vi.fn(),
+			updateConnectionStateFromEvent: vi.fn(),
+			ensureCurrentTurnSummary: vi.fn(),
+			startAssistantStreamingMessage: vi.fn(),
+			clearShortcutGuide: vi.fn(),
+			renderRecap: vi.fn(),
+			agentRunFileChanges: new Map(),
+		} as unknown as Record<string, unknown>;
+		Object.setPrototypeOf(mode, InteractiveMode.prototype);
+
+		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as unknown as (
+			this: unknown,
+			event: unknown,
+		) => Promise<void>;
+		// A routed image turn: the assistant message names the image model, no notice.
+		void handleEvent.call(mode, {
+			type: "message_start",
+			message: { role: "assistant", provider: "bailian", model: "kimi-k3", content: [] },
+		});
+
+		// The notice-free route never repainted the connection model (that is
+		// refreshServingModel's job on notice/retry events), so the two still differ.
+		expect((mode.connectionState as { model?: { id?: string } } | undefined)?.model?.id).toBe("glm-5.3-prime");
+		expect((mode as unknown as { lastServingModelId: string | undefined }).lastServingModelId).toBe("kimi-k3");
+
+		const source = (
+			Reflect.get(InteractiveMode.prototype, "getFooterTelemetrySource") as unknown as () => {
+				snapshot?: FooterTelemetrySnapshot;
+			}
+		).call(mode);
+		expect(source.snapshot?.modelName).toBe("glm-5.3-prime");
+		expect(source.snapshot?.servingModelName).toBe("kimi-k3");
+
+		// And the rendered footer line calls it out where upstream's repaint has no
+		// trigger: 实际:kimi-k3 while the left readout still names the session model.
+		const footer = new FooterComponent(provider);
+		footer.setTelemetrySource(() => ({ mode: "on", snapshot: source.snapshot }));
+		const line = footerLine(footer);
+		expect(line).toContain("glm-5.3-prime");
+		expect(line).toContain("实际:kimi-k3");
+	});
+
 	it("noteServingModel refreshes the footer only when the serving model changes", () => {
 		const invalidate = vi.fn();
 		const mode = {
