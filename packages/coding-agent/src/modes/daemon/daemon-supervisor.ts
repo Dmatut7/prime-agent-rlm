@@ -2461,10 +2461,12 @@ export class DaemonSupervisor {
 			// is not tmux-restorable.
 			if (worker.descriptor.ownerClientId !== undefined) continue;
 			const summary = worker.summaries.get(worker.descriptor.rootActiveSessionId);
-			const rootId = worker.descriptor.rootSessionId ?? summary?.sessionId;
-			if (!rootId) continue;
 			const rosterSummary = this.roster().byActiveSessionId(worker.descriptor.rootActiveSessionId)?.summary;
 			const merged = summary ?? rosterSummary;
+			// Symmetric fallback: the durable descriptor id wins, then whichever summary
+			// survived - the same merged record that supplies name and cwd below.
+			const rootId = worker.descriptor.rootSessionId ?? merged?.sessionId;
+			if (!rootId) continue;
 			// A draft root never sent a message; an archived root was retired on purpose.
 			if (merged?.lifecycle === "draft" || merged?.lifecycle === "archived") continue;
 			const name = rosterSummary?.sessionName ?? summary?.sessionName;
