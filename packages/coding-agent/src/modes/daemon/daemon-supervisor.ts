@@ -2617,7 +2617,8 @@ export class DaemonSupervisor {
 			this.liveThreadsSnapshotSkippedWrites++;
 			this.logDegraded(
 				"live-threads-snapshot-gate",
-				`Skipped live threads snapshot write (${reason}): not the socket owner (${gate.reason})`,
+				`Skipped live threads snapshot write (${reason}): not the socket owner (${gate.reason})` +
+					`; ${this.liveThreadsSnapshotSkippedWrites} write${this.liveThreadsSnapshotSkippedWrites === 1 ? "" : "s"} skipped so far`,
 			);
 			return;
 		}

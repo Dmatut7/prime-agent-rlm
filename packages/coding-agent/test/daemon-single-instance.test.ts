@@ -6,22 +6,20 @@ import { join } from "node:path";
 import lockfile from "proper-lockfile";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-	DaemonSocketPathLease,
-	acquireDaemonSocketPathLease,
-	DaemonSocketInUseError,
-	defaultDaemonSocketPath,
-	prepareDaemonSocketPath,
-} from "../src/modes/daemon/daemon-socket.js";
-import {
-	DaemonSupervisorAlreadyRunningError,
-} from "../src/modes/daemon/daemon-supervisor-ownership.js";
-import {
+	type DaemonStandbyOwner,
 	isDaemonSingleInstanceConflict,
 	judgeDaemonSocketOccupancy,
 	runDaemonStandby,
-	type DaemonStandbyOwner,
 } from "../src/modes/daemon/daemon-single-instance.js";
-import { DaemonAgentDirAlreadyRunningError } from "../src/modes/daemon/daemon-supervisor-ownership.js";
+import {
+	acquireDaemonSocketPathLease,
+	DaemonSocketInUseError,
+	prepareDaemonSocketPath,
+} from "../src/modes/daemon/daemon-socket.js";
+import {
+	DaemonAgentDirAlreadyRunningError,
+	DaemonSupervisorAlreadyRunningError,
+} from "../src/modes/daemon/daemon-supervisor-ownership.js";
 
 const cleanup: string[] = [];
 
@@ -51,7 +49,7 @@ describe("judgeDaemonSocketOccupancy (no-response determination)", () => {
 		const socketPath = join(dir, "daemon.sock");
 		// A server that accepts but never sends hello: a booting daemon must
 		// still count as present (never race a live daemon into a duplicate).
-		const server = createServer((socket) => {
+		const server = createServer(() => {
 			// hold the socket open, send nothing
 		});
 		await new Promise<void>((resolve) => server.listen(socketPath, resolve));
@@ -130,7 +128,9 @@ describe("isDaemonSingleInstanceConflict (downgrade classification)", () => {
 			phase: "owner" as const,
 			createdAt: new Date().toISOString(),
 		};
-		expect(isDaemonSingleInstanceConflict(new DaemonAgentDirAlreadyRunningError(summary, "/tmp/w2-agent"))).toBe(true);
+		expect(isDaemonSingleInstanceConflict(new DaemonAgentDirAlreadyRunningError(summary, "/tmp/w2-agent"))).toBe(
+			true,
+		);
 	});
 
 	it("propagates ordinary failures", () => {

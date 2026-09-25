@@ -15,6 +15,7 @@ import { join } from "node:path";
 import lockfile from "proper-lockfile";
 import { afterEach, describe, expect, it } from "vitest";
 import { getProcessStartId } from "../src/core/session-lease.js";
+import { legacyDaemonSocketDir } from "../src/modes/daemon/daemon-socket.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	acquireDaemonShutdownAdmission,
@@ -24,7 +25,6 @@ import {
 	persistDaemonStartupFenceFromOwner,
 	waitForDaemonStartupFence,
 } from "../src/modes/daemon/daemon-supervisor-ownership.js";
-import { legacyDaemonSocketDir } from "../src/modes/daemon/daemon-socket.js";
 
 type Ownership = Awaited<ReturnType<typeof acquireDaemonSupervisorOwnership>>;
 

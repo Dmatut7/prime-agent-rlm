@@ -41,8 +41,8 @@ describe("defaultDaemonSocketPath", () => {
 
 		// The vitest run pins the directory so no test binds the developer's real
 		// one; unset it to pin the shipped default.
-		const previous = process.env["PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR"];
-		delete process.env["PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR"];
+		const previous = process.env.PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR;
+		delete process.env.PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR;
 		try {
 			const socketPath = defaultDaemonSocketPath();
 			const home = homedir();
@@ -56,7 +56,7 @@ describe("defaultDaemonSocketPath", () => {
 			expect(dirname(socketPath)).not.toBe(join(tmpdir(), "prime-agent-501"));
 		} finally {
 			if (previous !== undefined) {
-				process.env["PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR"] = previous;
+				process.env.PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR = previous;
 			}
 		}
 	});
@@ -65,15 +65,15 @@ describe("defaultDaemonSocketPath", () => {
 		if (process.platform === "win32") {
 			return;
 		}
-		const previous = process.env["PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR"];
-		process.env["PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR"] = "/tmp/w2-override-dir";
+		const previous = process.env.PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR;
+		process.env.PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR = "/tmp/w2-override-dir";
 		try {
 			expect(defaultDaemonSocketPath()).toBe("/tmp/w2-override-dir/daemon.sock");
 		} finally {
 			if (previous === undefined) {
-				delete process.env["PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR"];
+				delete process.env.PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR;
 			} else {
-				process.env["PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR"] = previous;
+				process.env.PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR = previous;
 			}
 		}
 	});

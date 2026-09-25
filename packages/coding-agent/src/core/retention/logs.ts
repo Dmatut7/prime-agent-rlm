@@ -9,8 +9,8 @@ import { createHash } from "node:crypto";
 import type { Stats } from "node:fs";
 import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { basename, join } from "node:path";
-import { normalizeSocketPath } from "../../utils/daemon-socket-path.js";
 import { defaultDaemonSocketDir } from "../../modes/daemon/daemon-socket.js";
+import { normalizeSocketPath } from "../../utils/daemon-socket-path.js";
 import { type ReclaimRequest, reclaimWithinBudget, statSignature } from "./delete.js";
 import type {
 	RetentionClassContext,

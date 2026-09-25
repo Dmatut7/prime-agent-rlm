@@ -195,8 +195,7 @@ export async function runDaemonStandby(options: DaemonStandbyOptions): Promise<v
 		}
 		const ownerRecord = records.find(
 			(record) =>
-				(record.socketPath !== undefined &&
-					normalizeSocketPath(record.socketPath) === target) ||
+				(record.socketPath !== undefined && normalizeSocketPath(record.socketPath) === target) ||
 				(options.owner?.pid !== undefined && record.pid === options.owner.pid),
 		);
 		const watchedPid = ownerRecord?.pid ?? options.owner?.pid;
@@ -208,7 +207,9 @@ export async function runDaemonStandby(options: DaemonStandbyOptions): Promise<v
 		if (await isSocketListening(target)) {
 			continue;
 		}
-		log(`Daemon owner for ${target} is gone; exiting so the service manager relaunches this process to bind the socket.`);
+		log(
+			`Daemon owner for ${target} is gone; exiting so the service manager relaunches this process to bind the socket.`,
+		);
 		(options.onOwnerGone ?? (() => process.exit(1)))();
 		return;
 	}
