@@ -347,6 +347,9 @@ export async function generateBranchSummary(
 	// A branch summary is one request as well, so it gets the same budget: the
 	// provider counts the system prompt and the <conversation> frame against the
 	// same input limit, and a catalog can declare more window than it accepts.
+	// The model's config-declared usageWindowTokens cap applies here too, so both
+	// budget call sites share one input-limit caliber (R1-M1: a cap of 200k on a
+	// 1M declared window must not leave the branch path budgeting against 1M).
 	const frameText = summarizationFrameText({ style: "turn-prefix", instructions, maxElidedMessages: 0 });
 	const budgetFor = (inflation: number) =>
 		computeSummarizationInputBudget({
@@ -356,6 +359,7 @@ export async function generateBranchSummary(
 			wrapperText: frameText,
 			provider: model.provider,
 			modelId: model.id,
+			usageWindowTokens: model.usageWindowTokens,
 			inflation,
 		});
 	let budget = budgetFor(SUMMARIZATION_INFLATION_FLOOR);

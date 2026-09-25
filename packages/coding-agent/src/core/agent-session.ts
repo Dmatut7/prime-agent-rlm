@@ -13582,10 +13582,16 @@ export class AgentSession {
 		// resulting entry still attaches to the branch it summarized.
 		const compactionLeafId = this.sessionManager.getLeafId();
 
-		const preparation = prepareCompaction(pathEntries, settings, model.contextWindow, {
-			provider: model.provider,
-			modelId: model.id,
-		});
+		// Same limits shape as the trigger and the compact.run precheck, so the
+		// capKeepRecentTokens clamp below sees the same (possibly capped) base the
+		// threshold uses: an uncapped keepRecent above a capped threshold is the
+		// "re-fire every turn" mode that function's doc warns about (R1-M2).
+		const preparation = prepareCompaction(
+			pathEntries,
+			settings,
+			model.contextWindow,
+			this._compactionWindowLimits() ?? { provider: model.provider, modelId: model.id },
+		);
 		if (!preparation) {
 			const lastEntry = pathEntries[pathEntries.length - 1];
 			if (lastEntry?.type === "compaction") {
@@ -15147,8 +15153,10 @@ export class AgentSession {
 
 	/**
 	 * Model identity for the compaction trigger: the declared window clamped to the
-	 * provider's measured input limit, so a catalog entry that over-declares (1048576
-	 * declared, 1000000 accepted) cannot push the trigger past the wall.
+	 * provider's measured input limit and to the model's config-declared
+	 * serving-window cap (`usageWindowTokens`), whichever is lower - so a catalog
+	 * entry that over-declares (1048576 declared, 1000000 accepted) or a
+	 * rate-quota heuristic set below both cannot push the trigger past the wall.
 	 */
 	private _compactionWindowLimits(): CompactionWindowLimits | undefined {
 		return this.model
