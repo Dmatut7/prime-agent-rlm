@@ -209,6 +209,11 @@ import {
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
+import {
+	LIVE_THREADS_SNAPSHOT_FILE_NAME,
+	type LiveThreadSnapshotEntry,
+	writeLiveThreadsSnapshotIfChanged,
+} from "./live-threads-snapshot.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import {
 	PENDING_DELIVERY_CAPACITY_RETRY_AFTER_MS,
@@ -1397,6 +1402,10 @@ export class DaemonSupervisor {
 	private readonly supervisorConfigPath: string;
 	private readonly defaultSessionConfig: AgentSessionRuntimeConfig;
 	private readonly snapshotCacheRoot: string;
+	/** Resident-root-sessions snapshot the boot-time tmux restore reads instead of the hand-maintained threads.list. */
+	private readonly liveThreadsSnapshotPath: string;
+	/** Signature of the last snapshot write this process performed; undefined forces the next write. */
+	private liveThreadsSignature?: string;
 	private commandJournal!: CommandRecoveryJournal;
 	private readonly streamReconstructor = new CompactAssistantStreamReconstructor();
 	private readonly compactCatchupInProgress = new Set<string>();
@@ -1470,6 +1479,7 @@ export class DaemonSupervisor {
 			this.loadPersistedSupervisorConfig(),
 		);
 		this.snapshotCacheRoot = join(this.descriptorDir, "snapshot-cache", this.generation);
+		this.liveThreadsSnapshotPath = join(agentDir, LIVE_THREADS_SNAPSHOT_FILE_NAME);
 		this.catalog = new DaemonCatalogClient((message) => this.log(message));
 		this.settingsManager = SettingsManager.create(process.cwd(), this.defaultSessionConfig.agentDir ?? agentDir);
 		this.catchupRetryPolicy = options.catchupRetryPolicy ?? DEFAULT_CLIENT_CATCHUP_RETRY_POLICY;
@@ -2431,6 +2441,54 @@ export class DaemonSupervisor {
 		// Durable write: the descriptor is what a later supervisor adopts from, so a
 		// torn one costs the whole tree its registration (see writeJsonAtomically).
 		writeJsonAtomically(worker.descriptorPath, durableDaemonWorkerDescriptor(worker.descriptor));
+	}
+
+	/**
+	 * Mirror the resident root sessions into <agentDir>/live-threads.json so a
+	 * reboot revives exactly the threads that were alive (pa-threads-restore.sh
+	 * prefers this file over the hand-maintained threads.list while writtenAt is
+	 * fresh). Abnormal exits (SIGKILL, power loss) run no shutdown hook, so the
+	 * snapshot is persisted on every resident-set change: the last change before
+	 * death is already on disk. The source is the supervisor's own worker map -
+	 * roots with no summary yet (adoption in flight) still carry their durable
+	 * rootSessionId, and the roster covers a name the cached summary has not
+	 * refreshed yet (rename).
+	 */
+	private syncLiveThreadsSnapshot(reason: string): void {
+		const threads: LiveThreadSnapshotEntry[] = [];
+		for (const worker of this.workers.values()) {
+			// Resident sessions only: a client-owned worker dies with its client and
+			// is not tmux-restorable.
+			if (worker.descriptor.ownerClientId !== undefined) continue;
+			const summary = worker.summaries.get(worker.descriptor.rootActiveSessionId);
+			const rootId = worker.descriptor.rootSessionId ?? summary?.sessionId;
+			if (!rootId) continue;
+			const rosterSummary = this.roster().byActiveSessionId(worker.descriptor.rootActiveSessionId)?.summary;
+			const merged = summary ?? rosterSummary;
+			// A draft root never sent a message; an archived root was retired on purpose.
+			if (merged?.lifecycle === "draft" || merged?.lifecycle === "archived") continue;
+			const name = rosterSummary?.sessionName ?? summary?.sessionName;
+			const cwd = summary?.cwd ?? rosterSummary?.cwd;
+			threads.push({
+				id: rootId,
+				...(cwd ? { cwd } : {}),
+				...(name ? { name } : {}),
+			});
+		}
+		try {
+			const write = writeLiveThreadsSnapshotIfChanged(
+				this.liveThreadsSnapshotPath,
+				threads,
+				this.liveThreadsSignature,
+			);
+			if (write.changed) {
+				this.liveThreadsSignature = write.signature;
+				this.log(`Live threads snapshot now holds ${threads.length} resident session(s) (${reason})`);
+			}
+		} catch (error) {
+			// A missing snapshot only degrades the boot restore back to threads.list.
+			this.log(`Could not write live threads snapshot (${reason}): ${String(error)}`);
+		}
 	}
 
 	/**
@@ -10018,6 +10076,9 @@ export class DaemonSupervisor {
 		// here: drop the shared snapshot so the next catalog read (or the recompute armed
 		// below) rescans instead of serving pre-mutation rows.
 		this.invalidatePassiveScheduledJobs();
+		// Same choke point mirrors the resident set to live-threads.json, so the last
+		// residency change before an abnormal death is already on disk for the reboot.
+		this.syncLiveThreadsSnapshot("roster-change");
 		this.scheduleScheduledSessionWakeRecompute();
 		for (const client of this.clients) {
 			this.write(client, { type: "heartbeats_changed" });
@@ -10233,6 +10294,10 @@ export class DaemonSupervisor {
 			process.exit(exitCode);
 		}
 		this.shuttingDown = true;
+		// Record the resident set one last time while every worker is still alive: a
+		// graceful restart must revive exactly these threads, and from here on the
+		// worker map empties as the stops land.
+		this.syncLiveThreadsSnapshot("shutdown");
 		// P1-7c/B10: answer every pending delivery before the workers go, so a
 		// sender still waiting learns the message was not delivered instead of
 		// watching the daemon leave with it.
