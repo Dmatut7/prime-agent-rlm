@@ -2573,6 +2573,8 @@ export class AgentSession {
 	 * Retry once the branch grows by a few entries or the model changes.
 	 */
 	private _thresholdCompactionCooldown: { branchEntryCount: number; modelKey: string } | undefined;
+	/** One-shot guard for the R1-M5 no-threshold warning; see _checkCompaction. */
+	private _warnedNoThresholdCompaction = false;
 	private _pendingRequestedCompaction: { customInstructions?: string } | undefined;
 	private _pendingRequestedRefine: { instructions?: string; global?: boolean } | undefined;
 
@@ -15263,6 +15265,20 @@ export class AgentSession {
 		const contextTokens = this._getThresholdContextTokens(assistantMessage, compactionTimestamp);
 		if (contextTokens === undefined) return false;
 		const sessionWindow = this._sessionContextWindow();
+		// R1-M5: reserveTokens consuming the whole capped base stands threshold
+		// compaction down silently - say so once, because a usageWindowTokens typo
+		// (20000 meant as 200000) lands exactly in this no-threshold zone.
+		if (settings.enabled && this.model?.usageWindowTokens !== undefined) {
+			const thresholdNow = compactionThresholdTokens(sessionWindow, settings, this._compactionWindowLimits());
+			if (thresholdNow <= 0 && !this._warnedNoThresholdCompaction) {
+				this._warnedNoThresholdCompaction = true;
+				sessionLog.warn("threshold compaction stands down: reserveTokens consumes the whole capped trigger base", {
+					sessionId: this.sessionId,
+					usageWindowTokens: this.model.usageWindowTokens,
+					reserveTokens: settings.reserveTokens,
+				});
+			}
+		}
 		if (shouldCompact(contextTokens, sessionWindow, settings, this._compactionWindowLimits())) {
 			if (this._isThresholdCompactionCoolingDown(sessionWindow)) return false;
 			if (queueAutonomousContinuation && this._queueGoalContinuationForThresholdCompaction(assistantMessage)) {

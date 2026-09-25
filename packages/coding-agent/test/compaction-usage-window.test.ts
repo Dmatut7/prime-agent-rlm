@@ -8,14 +8,17 @@ import { AuthStorage } from "../src/core/auth-storage.js";
 import {
 	type CompactionSettings,
 	type CompactionWindowLimits,
+	capKeepRecentTokens,
 	compactionThresholdTokens,
 	compactionTriggerBaseTokens,
+	prepareCompaction,
 	shouldCompact,
 } from "../src/core/compaction/compaction.js";
 import { computeSummarizationInputBudget } from "../src/core/compaction/summarization-budget.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { effectiveInputLimitTokens } from "../src/core/model-input-limits.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
+import type { SessionEntry } from "../src/core/session-manager.js";
 import { FooterComponent, type FooterTelemetrySnapshot } from "../src/modes/interactive/components/footer.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -146,6 +149,97 @@ describe("W1 summarization budget: the same serving-window cap clamps the compac
 	});
 });
 
+describe("W1 keepRecent and boundary: the cap reaches prepareCompaction (R1-M2/M5)", () => {
+	// The production shape of the M2 bug: keepRecentTokens 150,000 on a capped
+	// model whose threshold is 140,000 - an uncapped keepRecent above the
+	// threshold is the "re-fire every turn" mode capKeepRecentTokens exists to
+	// prevent, and _performCompaction used to hand it uncapped limits.
+	const CAPPED: CompactionWindowLimits = {
+		provider: "aliyun-maas",
+		modelId: "deepseek-v4-pro",
+		usageWindowTokens: 200_000,
+	};
+	const settings: CompactionSettings = {
+		enabled: true,
+		reserveTokens: 16_384,
+		keepRecentTokens: 150_000,
+		triggerRatio: 0.7,
+	};
+
+	it("capKeepRecentTokens clamps the retained slice under the capped threshold", () => {
+		// threshold = min(0.7*200000, 200000-16384) = 140000; keepRecent 150000 -> 140000.
+		expect(capKeepRecentTokens(settings, 1_000_000, CAPPED)).toBe(140_000);
+		expect(capKeepRecentTokens(settings, 1_000_000, CAPPED)).toBe(
+			compactionThresholdTokens(1_000_000, settings, CAPPED),
+		);
+		// Without the cap the same settings keep 150000 (threshold 700000 wins).
+		expect(capKeepRecentTokens(settings, 1_000_000, { provider: "aliyun-maas", modelId: "deepseek-v4-pro" })).toBe(
+			150_000,
+		);
+	});
+
+	it("prepareCompaction cuts deeper when the cap pulls keepRecent under the threshold", () => {
+		const entries: SessionEntry[] = [];
+		let lastId: string | null = null;
+		let counter = 0;
+		const pushEntry = (message: Record<string, unknown>) => {
+			const id = `w1-entry-${counter++}`;
+			entries.push({
+				type: "message",
+				id,
+				parentId: lastId,
+				timestamp: new Date().toISOString(),
+				message,
+			} as unknown as SessionEntry);
+			lastId = id;
+		};
+		for (let i = 0; i < 40; i++) {
+			pushEntry({
+				role: "user",
+				content: `user ${i} ${"y".repeat(20_000)}`,
+				timestamp: Date.now(),
+			});
+			pushEntry({
+				role: "assistant",
+				content: [{ type: "text", text: `assistant ${i} ${"a".repeat(400)}` }],
+				usage: {
+					input: 100,
+					output: 50,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 150,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+				api: "openai-completions",
+				provider: "aliyun-maas",
+				model: "deepseek-v4-pro",
+			});
+		}
+		const capped = prepareCompaction(entries, settings, 1_000_000, CAPPED);
+		const uncapped = prepareCompaction(entries, settings, 1_000_000, undefined);
+		expect(capped).toBeDefined();
+		expect(uncapped).toBeDefined();
+		// The capped cut point must sit strictly deeper (earlier) in the branch.
+		const indexOf = (id: string | undefined) => entries.findIndex((entry) => entry.id === id);
+		expect(indexOf(capped!.firstKeptEntryId)).toBeGreaterThan(indexOf(uncapped!.firstKeptEntryId));
+	});
+
+	it("a cap at or below reserveTokens stands threshold compaction down (documented M5 boundary)", () => {
+		// cap 16384 == reserve: base - reserve = 0, and 0.7 * 16384 < reserve too.
+		const atReserve = { ...CAPPED, usageWindowTokens: 16_384 };
+		expect(compactionThresholdTokens(1_000_000, settings, atReserve)).toBe(0);
+		expect(shouldCompact(50_000, 1_000_000, settings, atReserve)).toBe(false);
+		expect(capKeepRecentTokens(settings, 1_000_000, atReserve)).toBe(0);
+		// A one-digit typo (20000 meant as 200000) does not zero the threshold but
+		// degenerates it to 3616 - the reserve eats the whole capped base. That
+		// zone is documented in docs/compaction.md as "stands down".
+		const typo = { ...CAPPED, usageWindowTokens: 20_000 };
+		expect(compactionThresholdTokens(1_000_000, settings, typo)).toBe(3_616);
+	});
+});
+
 describe("W1 models.json: usageWindowTokens parses, overrides, and validates", () => {
 	// Hermetic by construction (same pattern as model-registry.test.ts): a temp
 	// models.json and a sibling temp auth.json, so the real ~/.prime/agent/models.json
@@ -218,6 +312,55 @@ describe("W1 models.json: usageWindowTokens parses, overrides, and validates", (
 			const model = registry.getAll().find((m) => m.id === "claude-sonnet-4-5");
 			expect(model?.usageWindowTokens).toBe(100_000);
 			expect(model?.contextWindow).toBeGreaterThan(100_000);
+		} finally {
+			cleanup(dir);
+		}
+	});
+
+	it("an invalid override value is rejected too (R1-M4: the override path validates like the definition path)", () => {
+		// Non-positive override value.
+		const zero = {
+			providers: {
+				anthropic: { modelOverrides: { "claude-sonnet-4-5": { usageWindowTokens: 0 } } },
+			},
+		};
+		const { registry: zeroRegistry, dir: zeroDir } = registryWith(zero);
+		try {
+			expect(zeroRegistry.getError() ?? "").toContain("invalid usageWindowTokens");
+		} finally {
+			cleanup(zeroDir);
+		}
+
+		// A value above the built-in model's declared window would widen, not tighten.
+		const wide = {
+			providers: {
+				anthropic: { modelOverrides: { "claude-sonnet-4-5": { usageWindowTokens: 5_000_000 } } },
+			},
+		};
+		const { registry: wideRegistry, dir: wideDir } = registryWith(wide);
+		try {
+			expect(wideRegistry.getError() ?? "").toContain("exceeds contextWindow");
+		} finally {
+			cleanup(wideDir);
+		}
+	});
+
+	it("a definition with only usageWindowTokens above the 128000 default is rejected, not silently clamped away (R1-M4)", () => {
+		// No contextWindow: parseModels defaults it to 128000, so a 500000 cap is
+		// min-clamped to nothing at runtime - it must be a validation error instead.
+		const silent = {
+			providers: {
+				"custom-proxy": {
+					baseUrl: "https://example.invalid/v1",
+					apiKey: "test-key",
+					api: "openai-completions",
+					models: [{ id: "m2", name: "M2", usageWindowTokens: 500_000 }],
+				},
+			},
+		};
+		const { registry, dir } = registryWith(silent);
+		try {
+			expect(registry.getError() ?? "").toContain("exceeds contextWindow (128000)");
 		} finally {
 			cleanup(dir);
 		}

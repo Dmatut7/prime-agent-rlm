@@ -934,16 +934,39 @@ export class ModelRegistry {
 					throw new Error(
 						`Provider ${providerName}, model ${modelDef.id}: invalid usageWindowTokens (must be > 0 or absent)`,
 					);
+				// Compare against the effective window, not only a declared one: a model
+				// that omits contextWindow gets the 128000 default in parseModels, and a
+				// cap above that default is silently min-clamped away at runtime - a typo
+				// then looks configured but does nothing (R1-M4).
 				if (
 					modelDef.usageWindowTokens !== undefined &&
-					modelDef.contextWindow !== undefined &&
-					modelDef.usageWindowTokens > modelDef.contextWindow
+					modelDef.usageWindowTokens > (modelDef.contextWindow ?? 128000)
 				)
 					throw new Error(
-						`Provider ${providerName}, model ${modelDef.id}: usageWindowTokens (${modelDef.usageWindowTokens}) exceeds contextWindow (${modelDef.contextWindow}) - the rate-quota heuristic can only tighten the window`,
+						`Provider ${providerName}, model ${modelDef.id}: usageWindowTokens (${modelDef.usageWindowTokens}) exceeds contextWindow (${modelDef.contextWindow ?? 128000}) - the rate-quota heuristic can only tighten the window`,
 					);
 				if (modelDef.maxTokens !== undefined && modelDef.maxTokens <= 0)
 					throw new Error(`Provider ${providerName}, model ${modelDef.id}: invalid maxTokens`);
+			}
+
+			// The same contract on the override path (R1-M4): a value above the target
+			// model's window would widen instead of tighten, and a non-positive one is a
+			// typo. Built-in models can only be capped through modelOverrides, so this
+			// is the only check that path ever gets; a definition and an override on the
+			// same id are validated against the same numbers.
+			for (const [modelId, modelOverride] of Object.entries(providerConfig.modelOverrides ?? {})) {
+				if (modelOverride.usageWindowTokens === undefined) continue;
+				const declaredContextWindow =
+					models.find((model) => model.id === modelId)?.contextWindow ??
+					getModels(providerName as KnownProvider).find((model) => model.id === modelId)?.contextWindow;
+				if (modelOverride.usageWindowTokens <= 0)
+					throw new Error(
+						`Provider ${providerName}, model ${modelId}: invalid usageWindowTokens (must be > 0 or absent)`,
+					);
+				if (declaredContextWindow !== undefined && modelOverride.usageWindowTokens > declaredContextWindow)
+					throw new Error(
+						`Provider ${providerName}, model ${modelId}: usageWindowTokens (${modelOverride.usageWindowTokens}) exceeds contextWindow (${declaredContextWindow}) - the rate-quota heuristic can only tighten the window`,
+					);
 			}
 		}
 	}
