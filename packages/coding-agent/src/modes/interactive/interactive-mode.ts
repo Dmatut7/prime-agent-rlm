@@ -1567,9 +1567,6 @@ export class InteractiveMode {
 		};
 		this.subagentSummaryLine.onChatAction = (data) => this.handleSubagentSummaryChatAction(data);
 		this.subagentSummaryLine.onRowActivate = (row) => this.showSubagentDetail(row.id);
-		// The panel's entry route lives as long as this mode's TUI does; each mode
-		// builds its own TUI, so the listener needs no separate teardown.
-		this.ui.addInputListener(this.subagentPanelInputRoute);
 		this.footerDataProvider = new FooterDataProvider(this.uiServices.getInitialCwd());
 		this.footer = new FooterComponent(this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.settingsManager.getCompactionEnabled());
@@ -7286,6 +7283,10 @@ export class InteractiveMode {
 
 	private focusSubagentSummary(): boolean {
 		if (!this.subagentSummaryLine.isSelectable() || this.getTrayOverrideLabel()) return false;
+		// UI focus alone left the panel rendering its unfocused top-N window, so the
+		// arrow keys moved an invisible selection and every child past the first rows
+		// stayed unreachable. Engaging the scroll window is what makes ↓ actually browse.
+		this.subagentSummaryLine.focused = true;
 		this.ui.setFocus(this.subagentSummaryLine);
 		this.ui.requestRender();
 		return true;
@@ -7362,25 +7363,6 @@ export class InteractiveMode {
 		this.focusEditor();
 		this.editor.handleInput(data);
 	}
-
-	/**
-	 * The subagent panel's way in: down-arrow on an empty prompt focuses it, matching
-	 * the header's `↓ 选择` hint. The panel's own handleInput then scrolls its rows and
-	 * opens the selected child; Esc (onCancel) returns to the editor. Without this
-	 * route the panel's focus - and with it the every-child-reachable scrolling the
-	 * render path already implements - was unreachable, so only the first rows were
-	 * ever visible or clickable.
-	 */
-	private readonly subagentPanelInputRoute = (data: string): { consume?: boolean } | undefined => {
-		if (this.subagentSummaryLine.focused) return undefined;
-		if (!this.subagentSummaryLine.isSelectable()) return undefined;
-		if (this.editor.getText().length > 0) return undefined;
-		if (!this.keybindings.matches(data, "tui.select.down")) return undefined;
-		this.subagentSummaryLine.focused = true;
-		this.ui.setFocus(this.subagentSummaryLine);
-		this.ui.requestRender();
-		return { consume: true };
-	};
 
 	private getTrayOverrideLabel(): string | undefined {
 		if (this.isCtrlCExitHintVisible()) {
