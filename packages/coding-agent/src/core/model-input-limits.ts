@@ -66,10 +66,19 @@ export function effectiveInputLimitTokens(
 	contextWindow: number | undefined,
 	provider?: string,
 	model?: string,
+	usageWindowTokens?: number,
 ): number {
 	const declared = contextWindow && contextWindow > 0 ? contextWindow : 0;
+	// A config-declared serving-window cap can only tighten the declared window
+	// (a value above it is a registry validation error, but the clamp here also
+	// guards hand-built Model objects that bypass validation). Absent or
+	// non-positive means "no declared cap" - fall back to the declared window,
+	// never to 0, so an unset field cannot silently disable budgeting.
+	const declaredCap =
+		usageWindowTokens && usageWindowTokens > 0 ? Math.min(declared || usageWindowTokens, usageWindowTokens) : 0;
 	const measured = measuredInputLimit(provider, model);
-	if (measured === undefined) return declared;
+	if (measured === undefined) return declaredCap > 0 ? declaredCap : declared;
+	if (declaredCap > 0) return Math.min(declaredCap, measured);
 	if (declared <= 0) return measured;
 	return Math.min(declared, measured);
 }

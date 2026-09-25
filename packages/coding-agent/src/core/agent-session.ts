@@ -15151,7 +15151,13 @@ export class AgentSession {
 	 * declared, 1000000 accepted) cannot push the trigger past the wall.
 	 */
 	private _compactionWindowLimits(): CompactionWindowLimits | undefined {
-		return this.model ? { provider: this.model.provider, modelId: this.model.id } : undefined;
+		return this.model
+			? {
+					provider: this.model.provider,
+					modelId: this.model.id,
+					usageWindowTokens: this.model.usageWindowTokens,
+				}
+			: undefined;
 	}
 
 	private async _checkCompaction(

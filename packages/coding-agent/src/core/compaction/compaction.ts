@@ -360,14 +360,22 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 export interface CompactionWindowLimits {
 	provider?: string;
 	modelId?: string;
+	/**
+	 * Config-declared serving-window cap for a single request (models.json
+	 * `usageWindowTokens`), in the provider's own token caliber. Optional:
+	 * absent means the catalog window (clamped to the measured input limit) is
+	 * the whole cap. See Model.usageWindowTokens.
+	 */
+	usageWindowTokens?: number;
 }
 
 /**
  * The token count the compaction trigger is a ratio of: the declared window
- * clamped to the provider's measured input limit.
+ * clamped to the provider's measured input limit and to a config-declared
+ * serving-window cap (`usageWindowTokens`), whichever is lower.
  */
 export function compactionTriggerBaseTokens(contextWindow: number, limits?: CompactionWindowLimits): number {
-	return effectiveInputLimitTokens(contextWindow, limits?.provider, limits?.modelId);
+	return effectiveInputLimitTokens(contextWindow, limits?.provider, limits?.modelId, limits?.usageWindowTokens);
 }
 
 /**
@@ -1581,6 +1589,7 @@ async function completeSummarizationRequest(options: SummarizationCallOptions): 
 		wrapperText,
 		provider: model.provider,
 		modelId: model.id,
+		usageWindowTokens: model.usageWindowTokens,
 		inflation,
 		announcedInputLimit: options.inputLimit,
 	});

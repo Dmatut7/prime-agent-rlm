@@ -151,13 +151,25 @@ export function computeSummarizationInputBudget(options: {
 	wrapperText: string;
 	provider?: string;
 	modelId?: string;
+	/**
+	 * Config-declared serving-window cap for a single request (models.json
+	 * `usageWindowTokens`). Clamps the input limit the same way the measured
+	 * table does: a summarization request larger than the gateway's serving
+	 * window is rejected exactly like an oversized ordinary request.
+	 */
+	usageWindowTokens?: number;
 	inflation?: number;
 	safetyMargin?: number;
 	/** Input cap the provider announced in a rejection; see announcedInputLimit. */
 	announcedInputLimit?: number;
 }): SummarizationInputBudget {
 	const declaredContextWindow = options.contextWindow && options.contextWindow > 0 ? options.contextWindow : 0;
-	const catalogLimit = effectiveInputLimitTokens(declaredContextWindow, options.provider, options.modelId);
+	const catalogLimit = effectiveInputLimitTokens(
+		declaredContextWindow,
+		options.provider,
+		options.modelId,
+		options.usageWindowTokens,
+	);
 	const announced = options.announcedInputLimit;
 	const inputLimit =
 		announced !== undefined && announced >= MIN_CREDIBLE_ANNOUNCED_LIMIT

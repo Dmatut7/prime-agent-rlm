@@ -168,6 +168,8 @@ const ModelDefinitionSchema = Type.Object({
 	),
 	contextWindow: Type.Optional(Type.Number()),
 	maxTokens: Type.Optional(Type.Number()),
+	/** Optional serving-window cap for a single request; absent = contextWindow. See Model.usageWindowTokens. */
+	usageWindowTokens: Type.Optional(Type.Number()),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
 });
@@ -187,6 +189,8 @@ const ModelOverrideSchema = Type.Object({
 	),
 	contextWindow: Type.Optional(Type.Number()),
 	maxTokens: Type.Optional(Type.Number()),
+	/** Optional serving-window cap for a single request; absent = contextWindow. See Model.usageWindowTokens. */
+	usageWindowTokens: Type.Optional(Type.Number()),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
 });
@@ -413,6 +417,8 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	if (override.input !== undefined) result.input = override.input as ("text" | "image")[];
 	if (override.contextWindow !== undefined) result.contextWindow = override.contextWindow;
 	if (override.maxTokens !== undefined) result.maxTokens = override.maxTokens;
+	// undefined explicitly clears an inherited serving-window cap; a value sets it.
+	if (override.usageWindowTokens !== undefined) result.usageWindowTokens = override.usageWindowTokens;
 
 	if (override.cost) {
 		result.cost = {
@@ -922,6 +928,18 @@ export class ModelRegistry {
 				if (!modelDef.id) throw new Error(`Provider ${providerName}: model missing "id"`);
 				if (modelDef.contextWindow !== undefined && modelDef.contextWindow <= 0)
 					throw new Error(`Provider ${providerName}, model ${modelDef.id}: invalid contextWindow`);
+				if (modelDef.usageWindowTokens !== undefined && modelDef.usageWindowTokens <= 0)
+					throw new Error(
+						`Provider ${providerName}, model ${modelDef.id}: invalid usageWindowTokens (must be > 0 or absent)`,
+					);
+				if (
+					modelDef.usageWindowTokens !== undefined &&
+					modelDef.contextWindow !== undefined &&
+					modelDef.usageWindowTokens > modelDef.contextWindow
+				)
+					throw new Error(
+						`Provider ${providerName}, model ${modelDef.id}: usageWindowTokens (${modelDef.usageWindowTokens}) exceeds contextWindow (${modelDef.contextWindow}) - the serving cap can only tighten the window`,
+					);
 				if (modelDef.maxTokens !== undefined && modelDef.maxTokens <= 0)
 					throw new Error(`Provider ${providerName}, model ${modelDef.id}: invalid maxTokens`);
 			}
@@ -972,6 +990,7 @@ export class ModelRegistry {
 					cost: modelDef.cost ?? defaultCost,
 					contextWindow: modelDef.contextWindow ?? 128000,
 					maxTokens: modelDef.maxTokens ?? 16384,
+					usageWindowTokens: modelDef.usageWindowTokens,
 					headers: undefined,
 					compat,
 				} as Model<Api>);
@@ -2032,6 +2051,7 @@ export class ModelRegistry {
 					cost: modelDef.cost,
 					contextWindow: modelDef.contextWindow,
 					maxTokens: modelDef.maxTokens,
+					usageWindowTokens: modelDef.usageWindowTokens,
 					headers: undefined,
 					compat: modelDef.compat,
 				} as Model<Api>);
@@ -2078,6 +2098,8 @@ export interface ProviderConfigInput {
 		cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 		contextWindow: number;
 		maxTokens: number;
+		/** Optional serving-window cap for a single request; absent = contextWindow. */
+		usageWindowTokens?: number;
 		headers?: Record<string, string>;
 		compat?: Model<Api>["compat"];
 	}>;

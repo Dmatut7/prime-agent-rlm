@@ -522,6 +522,21 @@ export interface Model<TApi extends Api> {
 	};
 	contextWindow: number;
 	maxTokens: number;
+	/**
+	 * Serving-window cap for a single request, in the provider's own token caliber.
+	 * Optional: absent means the declared contextWindow is the effective cap.
+	 *
+	 * For gateways whose accepted input sits below the advertised contextWindow -
+	 * a token-per-time-window quota (e.g. 200k tokens / 10s) is the live example:
+	 * the whole single-request input is charged to one window, so a request
+	 * larger than the quota is throttled even though the model's contextWindow
+	 * is far larger. Setting this field clamps the compaction trigger (and the
+	 * summarization budget) to it, so threshold compaction fires before the
+	 * gateway's wall instead of after. It is a config-declared operator knob,
+	 * NOT a measured limit - the measured table in model-input-limits.ts is the
+	 * evidence-backed source for provider-side input rejections.
+	 */
+	usageWindowTokens?: number;
 	/** Flagship model surfaced above non-featured models of the same provider in pickers. */
 	featured?: boolean;
 	headers?: Record<string, string>;
