@@ -50,6 +50,15 @@ export interface FooterTelemetrySnapshot {
 	 * configured id during a fallback episode quietly lies about who answers.
 	 */
 	servingModelName?: string;
+	/**
+	 * The effort the serving model actually runs at, after its own
+	 * thinkingLevelMap. The session level is shared across models, but each
+	 * model maps it differently - qwen3.8-max turns "high" into "xhigh" while
+	 * deepseek-v4-pro keeps "high" - so during a fallback the same setting can
+	 * mean a much heavier tier. Naming the served model without its effort left
+	 * the slowdown invisible.
+	 */
+	servingThinkingLevel?: string;
 	contextTokens?: number | null;
 	contextWindow?: number;
 	/**
@@ -208,7 +217,12 @@ export class FooterComponent implements Component {
 		}
 		const modelText = snapshot.thinkingLevel ? `${modelName} · ${snapshot.thinkingLevel}` : modelName;
 		const serving = snapshot.servingModelName;
-		const servingNote = serving && serving !== modelName ? theme.fg("warning", ` 实际:${serving}`) : "";
+		// During a fallback the same session level means a different tier per model
+		// (qwen3.8-max turns "high" into "xhigh" while deepseek-v4-pro keeps it), so
+		// the served model's name alone hides why the reply suddenly got slower.
+		const servingEffort = snapshot.servingThinkingLevel;
+		const servingLabel = serving ? `${serving}${servingEffort ? ` · ${servingEffort}` : ""}` : undefined;
+		const servingNote = servingLabel && serving !== modelName ? theme.fg("warning", ` 实际:${servingLabel}`) : "";
 		const model = ` ${theme.fg("muted", modelText)}${servingNote}`;
 		const location = this.locationSource?.();
 		const locationText = location

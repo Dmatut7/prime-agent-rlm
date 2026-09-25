@@ -6,6 +6,7 @@ import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import {
 	type Api,
 	type AssistantMessage,
+	clampThinkingLevel,
 	type ImageContent,
 	type Message,
 	type Model,
@@ -1641,9 +1642,15 @@ export class InteractiveMode {
 		this.subagentSummaryLine.setOpenable(this.options.returnToAgentsView === true);
 		this.subagentSummaryLine.onOpen = (row) => void this.openScopedAgentsView(row?.activeSessionId, row);
 		this.subagentSummaryLine.onStopAll = () => void this.requestStopAllSubagents();
-		this.subagentSummaryLine.onCancel = () => this.focusEditor();
+		this.subagentSummaryLine.onCancel = () => {
+			this.subagentSummaryLine.focused = false;
+			this.focusEditor();
+		};
 		this.subagentSummaryLine.onChatAction = (data) => this.handleSubagentSummaryChatAction(data);
 		this.subagentSummaryLine.onRowActivate = (row) => this.showSubagentDetail(row.id);
+		// The panel's entry route lives as long as this mode's TUI does; each mode
+		// builds its own TUI, so the listener needs no separate teardown.
+		this.ui.addInputListener(this.subagentPanelInputRoute);
 		this.footerDataProvider = new FooterDataProvider(this.uiServices.getInitialCwd());
 		this.footer = new FooterComponent(this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.settingsManager.getCompactionEnabled());
@@ -3273,12 +3280,36 @@ export class InteractiveMode {
 		const snapshot: FooterTelemetrySnapshot = {
 			modelName: model?.id,
 			servingModelName: this.lastServingModelId,
+			servingThinkingLevel: this.servingThinkingLevel(thinkingLevel),
 			thinkingLevel,
 			contextTokens: usage?.tokens ?? undefined,
 			contextWindow: usage?.contextWindow,
 			compactionThresholdTokens: thresholdTokens,
 		};
 		return { mode, snapshot };
+	}
+
+	/**
+	 * The effort the served model actually runs at, after its own thinkingLevelMap.
+	 *
+	 * The session level is one value shared by every model, but each model maps it
+	 * differently - qwen3.8-max turns "high" into "xhigh" while deepseek-v4-pro keeps
+	 * "high" - so during a fallback the footer must resolve the level against the
+	 * model that answered, not the configured one. Undefined when the served model is
+	 * the configured one (the left-hand readout already covers that case) or when the
+	 * catalog has not loaded the model yet.
+	 */
+	private servingThinkingLevel(level: ThinkingLevel | undefined): string | undefined {
+		const servingId = this.lastServingModelId;
+		if (!servingId || level === undefined || servingId === this.getCurrentModelId()) {
+			return undefined;
+		}
+		const served = this.connectionModelCatalog.find((candidate) => candidate.id === servingId);
+		if (!served) {
+			return undefined;
+		}
+		const clamped = clampThinkingLevel(served, level);
+		return served.thinkingLevelMap?.[clamped] ?? clamped;
 	}
 
 	/** The footer must never show a model that is not answering: remember who served each assistant message. */
@@ -7586,9 +7617,31 @@ export class InteractiveMode {
 			this.toggleThinkingBlockVisibility(true);
 			return;
 		}
+		// Leaving the panel by any non-panel key drops its focus too, so the list
+		// returns to its compact top-N form instead of staying in scroll mode.
+		this.subagentSummaryLine.focused = false;
 		this.focusEditor();
 		this.editor.handleInput(data);
 	}
+
+	/**
+	 * The subagent panel's way in: down-arrow on an empty prompt focuses it, matching
+	 * the header's `↓ 选择` hint. The panel's own handleInput then scrolls its rows and
+	 * opens the selected child; Esc (onCancel) returns to the editor. Without this
+	 * route the panel's focus - and with it the every-child-reachable scrolling the
+	 * render path already implements - was unreachable, so only the first rows were
+	 * ever visible or clickable.
+	 */
+	private readonly subagentPanelInputRoute = (data: string): { consume?: boolean } | undefined => {
+		if (this.subagentSummaryLine.focused) return undefined;
+		if (!this.subagentSummaryLine.isSelectable()) return undefined;
+		if (this.editor.getText().length > 0) return undefined;
+		if (!this.keybindings.matches(data, "tui.select.down")) return undefined;
+		this.subagentSummaryLine.focused = true;
+		this.ui.setFocus(this.subagentSummaryLine);
+		this.ui.requestRender();
+		return { consume: true };
+	};
 
 	private getTrayOverrideLabel(): string | undefined {
 		if (this.isCtrlCExitHintVisible()) {
