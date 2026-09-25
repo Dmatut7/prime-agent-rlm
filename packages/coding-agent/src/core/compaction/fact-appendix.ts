@@ -535,7 +535,7 @@ function clipDecision(sentence: string, maxChars: number): string {
 	const widest = marker(sentence.length).length;
 	const tail = Math.min(DECISION_CLIP_TAIL_CHARS, Math.floor((maxChars - widest) / 3));
 	const head = Math.min(DECISION_CLIP_HEAD_CHARS, maxChars - widest - tail);
-	if (head + tail <= 0) return sentence.slice(0, maxChars - 1) + "…";
+	if (head + tail <= 0) return `${sentence.slice(0, maxChars - 1)}…`;
 	const dropped = sentence.length - head - tail;
 	if (dropped <= 0) return sentence;
 	return `${sentence.slice(0, head)}${marker(dropped)}${sentence.slice(sentence.length - tail)}`;

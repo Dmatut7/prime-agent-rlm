@@ -570,7 +570,10 @@ describe("compaction summary carries machine-generated blocks", () => {
 			entries.push(compactionEntry(summary, result.firstKeptEntryId, result.details as CompactionDetails));
 
 			const decisions = (parseFactAppendix(summary)?.records ?? []).filter((record) => record.kind === "decision");
-			expect(decisions.map((record) => record.value), `decision at generation ${generation}`).toContain(DECISION);
+			expect(
+				decisions.map((record) => record.value),
+				`decision at generation ${generation}`,
+			).toContain(DECISION);
 			// One anchor, one slot: the narrative never restates it and the ledger never
 			// books a second copy of it.
 			expect(decisions, `decision count at generation ${generation}`).toHaveLength(1);

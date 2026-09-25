@@ -299,7 +299,6 @@ describe("fact extraction: error signatures", () => {
 		expect(errors).toHaveLength(1);
 		expect(errors[0].weight).toBe(2);
 	});
-
 });
 
 describe("fact extraction: issue references", () => {
