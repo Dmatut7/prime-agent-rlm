@@ -608,6 +608,32 @@ describe("SubagentSummaryLine", () => {
 		expect(rendered[1]).not.toContain("›");
 		expect(rendered[2]).toContain("›");
 	});
+
+	it("scrolls every child into view while focused, not just the first four", () => {
+		const line = new SubagentSummaryLine();
+		const rows = Array.from({ length: 7 }, (_, i) => ({
+			id: `child-${i}`,
+			name: `child-${i}`,
+			state: "running" as const,
+		}));
+		line.setSubagentCounts({ total: 7, running: 7, idle: 0, inactive: 0 });
+		line.setSubagentRows(rows);
+		line.focused = true;
+
+		const shown = () => line.render(100).map(stripAnsi).join("\n");
+		expect(shown()).toContain("child-0");
+		expect(shown()).not.toContain("child-6");
+		// Focused, the fold line promises more rows below instead of hiding them.
+		expect(shown()).toContain("下面还有");
+
+		// Six downs walk the selection to the last child and the window follows it.
+		for (let i = 0; i < 6; i += 1) line.handleInput("\x1b[B");
+		expect(shown()).toContain("child-6");
+		expect(shown()).not.toContain("child-0");
+
+		for (let i = 0; i < 6; i += 1) line.handleInput("\x1b[A");
+		expect(shown()).toContain("child-0");
+	});
 });
 
 function usage(input: number, output: number, cost: number): Usage {

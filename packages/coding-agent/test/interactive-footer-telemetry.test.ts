@@ -92,6 +92,25 @@ describe("footer telemetry watermark (U6)", () => {
 		expect(footerLine(footer)).not.toContain("实际:");
 	});
 
+	it("names the served model's own effort, not the session level", () => {
+		const footer = new FooterComponent(provider);
+		const telemetry = makeSource();
+		footer.setTelemetrySource(telemetry.source);
+
+		// One session level, a different tier per model: the served model's effort is
+		// what explains a fallback that suddenly thinks longer (qwen3.8-max sends
+		// "xhigh" where deepseek-v4-pro would send "high").
+		telemetry.set({ ...SNAPSHOT, servingModelName: "qwen3.8-max", servingThinkingLevel: "xhigh" });
+		const line = footerLine(footer);
+		expect(line).toContain("bailian/glm-5.3-prime · max");
+		expect(line).toContain("实际:qwen3.8-max · xhigh");
+
+		// A served model with no resolved effort keeps the name-only line.
+		telemetry.set({ ...SNAPSHOT, servingModelName: "kimi-k3" });
+		expect(footerLine(footer)).toContain("实际:kimi-k3");
+		expect(footerLine(footer)).not.toContain("实际:kimi-k3 ·");
+	});
+
 	it("noteServingModel refreshes the footer only when the serving model changes", () => {
 		const invalidate = vi.fn();
 		const mode = {
