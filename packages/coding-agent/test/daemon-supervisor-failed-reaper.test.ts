@@ -1,6 +1,6 @@
 import { chmodSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { getProcessStartId } from "../src/core/session-lease.js";
 import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
 import { getProcessStartIdAsync, isProcessIdentityConfirmedDead } from "../src/modes/daemon/daemon-supervisor.js";
