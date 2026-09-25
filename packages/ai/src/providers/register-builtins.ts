@@ -13,6 +13,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import type { BedrockOptions } from "./amazon-bedrock.js";
 import type { AnthropicOptions } from "./anthropic.js";
 import type { AzureOpenAIResponsesOptions } from "./azure-openai-responses.js";
+import type { DashScopeOptions } from "./dashscope.js";
 import type { GoogleOptions } from "./google.js";
 import type { GoogleVertexOptions } from "./google-vertex.js";
 import type { MistralOptions } from "./mistral.js";
@@ -41,6 +42,11 @@ interface AnthropicProviderModule {
 interface AzureOpenAIResponsesProviderModule {
 	streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses", AzureOpenAIResponsesOptions>;
 	streamSimpleAzureOpenAIResponses: StreamFunction<"azure-openai-responses", SimpleStreamOptions>;
+}
+
+interface DashScopeProviderModule {
+	streamDashScope: StreamFunction<"dashscope", DashScopeOptions>;
+	streamSimpleDashScope: StreamFunction<"dashscope", SimpleStreamOptions>;
 }
 
 interface GoogleProviderModule {
@@ -93,6 +99,9 @@ let anthropicProviderModulePromise:
 	| undefined;
 let azureOpenAIResponsesProviderModulePromise:
 	| Promise<LazyProviderModule<"azure-openai-responses", AzureOpenAIResponsesOptions, SimpleStreamOptions>>
+	| undefined;
+let dashScopeProviderModulePromise:
+	| Promise<LazyProviderModule<"dashscope", DashScopeOptions, SimpleStreamOptions>>
 	| undefined;
 let googleProviderModulePromise:
 	| Promise<LazyProviderModule<"google-generative-ai", GoogleOptions, SimpleStreamOptions>>
@@ -226,6 +235,19 @@ function loadAzureOpenAIResponsesProviderModule(): Promise<
 	return azureOpenAIResponsesProviderModulePromise;
 }
 
+function loadDashScopeProviderModule(): Promise<
+	LazyProviderModule<"dashscope", DashScopeOptions, SimpleStreamOptions>
+> {
+	dashScopeProviderModulePromise ||= import("./dashscope.js").then((module) => {
+		const provider = module as DashScopeProviderModule;
+		return {
+			stream: provider.streamDashScope,
+			streamSimple: provider.streamSimpleDashScope,
+		};
+	});
+	return dashScopeProviderModulePromise;
+}
+
 function loadGoogleProviderModule(): Promise<
 	LazyProviderModule<"google-generative-ai", GoogleOptions, SimpleStreamOptions>
 > {
@@ -324,6 +346,8 @@ export const streamAnthropic = createLazyStream(loadAnthropicProviderModule);
 export const streamSimpleAnthropic = createLazySimpleStream(loadAnthropicProviderModule);
 export const streamAzureOpenAIResponses = createLazyStream(loadAzureOpenAIResponsesProviderModule);
 export const streamSimpleAzureOpenAIResponses = createLazySimpleStream(loadAzureOpenAIResponsesProviderModule);
+export const streamDashScope = createLazyStream(loadDashScopeProviderModule);
+export const streamSimpleDashScope = createLazySimpleStream(loadDashScopeProviderModule);
 export const streamGoogle = createLazyStream(loadGoogleProviderModule);
 export const streamSimpleGoogle = createLazySimpleStream(loadGoogleProviderModule);
 export const streamGoogleVertex = createLazyStream(loadGoogleVertexProviderModule);
@@ -392,6 +416,12 @@ export function registerBuiltInApiProviders(): void {
 		api: "bedrock-converse-stream",
 		stream: streamBedrockLazy,
 		streamSimple: streamSimpleBedrockLazy,
+	});
+
+	registerApiProvider({
+		api: "dashscope",
+		stream: streamDashScope,
+		streamSimple: streamSimpleDashScope,
 	});
 }
 

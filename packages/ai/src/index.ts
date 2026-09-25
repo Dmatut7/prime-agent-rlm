@@ -9,6 +9,7 @@ export * from "./prime-inference-model-catalog.js";
 export type { BedrockOptions, BedrockThinkingDisplay } from "./providers/amazon-bedrock.js";
 export type { AnthropicEffort, AnthropicOptions, AnthropicThinkingDisplay } from "./providers/anthropic.js";
 export type { AzureOpenAIResponsesOptions } from "./providers/azure-openai-responses.js";
+export type { DashScopeOptions } from "./providers/dashscope.js";
 export * from "./providers/faux.js";
 export type { GoogleOptions } from "./providers/google.js";
 export type { GoogleThinkingLevel } from "./providers/google-shared.js";
