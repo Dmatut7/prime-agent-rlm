@@ -53,6 +53,22 @@ describe("live-threads snapshot", () => {
 		expect(readLiveThreadsSnapshot(file)?.threads.map((entry) => entry.id)).toEqual(["a", "b"]);
 	});
 
+	it("a forced write (previousSignature undefined) refreshes writtenAt even for an unchanged set", () => {
+		// Ported from PR#32 990ca1504: shutdown passes `force`, which reaches
+		// writeLiveThreadsSnapshotIfChanged as an undefined previousSignature. A
+		// resident set idle for days must not age out of its own shutdown record
+		// (the boot restore trusts the snapshot only while writtenAt is fresh).
+		const early = new Date("2026-09-25T07:00:00.000Z");
+		const first = writeLiveThreadsSnapshotIfChanged(file, [{ id: "a", cwd: "/tmp/x" }], undefined, early);
+		expect(first.changed).toBe(true);
+
+		const late = new Date("2026-09-25T09:00:00.000Z");
+		const forced = writeLiveThreadsSnapshotIfChanged(file, [{ id: "a", cwd: "/tmp/x" }], undefined, late);
+		expect(forced.changed).toBe(true);
+		expect(forced.signature).toBe(first.signature);
+		expect(readLiveThreadsSnapshot(file)?.writtenAt).toBe(late.toISOString());
+	});
+
 	it("read tolerates a missing or corrupt file instead of throwing", () => {
 		expect(readLiveThreadsSnapshot(join(dir, "nope.json"))).toBeUndefined();
 		writeFileSync(file, "{ not json");
