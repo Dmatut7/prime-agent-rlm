@@ -1,0 +1,1 @@
+- Changed the notice a parent gets when a subagent finishes without replying to carry the subagent's whole final answer (up to 4,000 characters, head and tail beyond that) instead of a 160-character preview, so the parent stops re-dispatching work that is already done.

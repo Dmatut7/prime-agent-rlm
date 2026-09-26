@@ -1405,7 +1405,7 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
-	it("injects exactly one notice with a preview when a child completes without replying", async () => {
+	it("injects exactly one notice with the child's last text when a child completes without replying", async () => {
 		const root = createSession();
 
 		const spawned = await root.runRlmChild("silent child", { name: "silent-worker" });
@@ -1420,7 +1420,7 @@ describe("AgentSession rlm recursion", () => {
 				),
 				details: {
 					kind: "completed_without_reply",
-					lastAssistantTextPreview: "child answer: silent child",
+					lastAssistantText: "child answer: silent child",
 				},
 			});
 		});

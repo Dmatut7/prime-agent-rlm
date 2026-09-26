@@ -367,13 +367,42 @@ export type RlmChildTerminalNoticeDetails =
 			/** Reports a follow-up turn the parent started, not the child's spawn task. */
 			followUp?: true;
 			/**
-			 * The child's last assistant text, quoted from its own transcript. Not a
-			 * message it sent: a child that wrote its answer instead of calling
-			 * `agent_message.send` produces a preview that reads exactly like the reply
-			 * the parent never got, so the notice text has to say where this came from.
+			 * The child's last assistant text, quoted from its own transcript and bounded
+			 * by {@link boundRlmChildLastText}. Not a message it sent: a child that wrote
+			 * its answer instead of calling `agent_message.send` produces text that reads
+			 * exactly like the reply the parent never got, so the notice has to say where
+			 * this came from.
 			 */
-			lastAssistantTextPreview?: string;
+			lastAssistantText?: string;
 	  };
+
+/**
+ * Longest child answer a no-reply notice carries whole. The notice used to carry a
+ * 160-character preview, which cut off nearly every answer (the median runs about a
+ * thousand characters), and a parent with a cut-off answer re-dispatched work that was
+ * already done. Observed final answers stay under 4k, so this keeps almost all of them.
+ */
+export const RLM_CHILD_LAST_TEXT_MAX_CHARS = 4000;
+
+/** The child's final text for a no-reply notice: whole when it fits, else its head and tail. */
+export function boundRlmChildLastText(text: string, maxChars = RLM_CHILD_LAST_TEXT_MAX_CHARS): string {
+	const trimmed = text.trim();
+	const chars = Array.from(trimmed);
+	if (chars.length <= maxChars) return trimmed;
+	const headChars = Math.floor(maxChars * 0.75);
+	const tailChars = maxChars - headChars;
+	const omitted = chars.length - headChars - tailChars;
+	const head = chars.slice(0, headChars).join("").trimEnd();
+	const tail = chars.slice(-tailChars).join("").trimStart();
+	return `${head}\n\n[... ${omitted} characters omitted; the full text is in the child's transcript ...]\n\n${tail}`;
+}
+
+const CHILD_LAST_TEXT_CLOSE = /<\/child-last-text>/gi;
+
+function quoteRlmChildLastText(text: string): string {
+	// A closing tag inside the quote would end the block early and let the rest read as notice text.
+	return `<child-last-text>\n${text.replace(CHILD_LAST_TEXT_CLOSE, "</ child-last-text>")}\n</child-last-text>`;
+}
 
 export interface AsyncBashCompletionDetails {
 	pid: number;
@@ -888,13 +917,13 @@ export function createRlmChildTerminalNoticeMessage(
 			? `RLM child ${childName} (${details.childId}) was cancelled${details.reason ? `: ${details.reason}` : ""}`
 			: details.followUp
 				? `RLM child ${childName} (${details.childId}) finished the turn your follow-up message started without sending a reply, so no answer to it is on its way${
-						details.lastAssistantTextPreview
-							? `. Its last assistant text (written to its own transcript, never sent to you): ${details.lastAssistantTextPreview}. If that answers your follow-up, use it; otherwise ask again or read its transcript, since waiting longer will not bring a reply`
+						details.lastAssistantText
+							? `. Its last assistant text is quoted below; it was written to its own transcript and never sent to you. If it answers your follow-up, use it; otherwise ask again or read its transcript, since waiting longer will not bring a reply.\n\n${quoteRlmChildLastText(details.lastAssistantText)}`
 							: ". Ask again or read its transcript: waiting longer will not bring a reply"
 					}`
 				: `RLM child ${childName} (${details.childId}) completed without sending a reply${
-						details.lastAssistantTextPreview
-							? `. Its last assistant text (written to its own transcript, never sent to you): ${details.lastAssistantTextPreview}. If that text answers the task, use it; if it is cut off or unclear, read the child's files or transcript before re-dispatching, since the work is usually already done`
+						details.lastAssistantText
+							? `. Its last assistant text is quoted below; it was written to its own transcript and never sent to you. If it answers the task, use it; if it is cut off or unclear, read the child's files or transcript before re-dispatching, since the work is usually already done.\n\n${quoteRlmChildLastText(details.lastAssistantText)}`
 							: ". Read the child's files or transcript before re-dispatching: finishing without a reply usually means the work is done and only the report is missing"
 					}`;
 	return {
