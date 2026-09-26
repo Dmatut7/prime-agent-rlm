@@ -466,6 +466,8 @@ export class TUI extends Container {
 		preFocus: Component | null;
 		hidden: boolean;
 		focusOrder: number;
+		/** Set by unfocus(); cleared when focus returns to the overlay. */
+		focusReleased: boolean;
 	}[] = [];
 
 	constructor(terminal: Terminal, showHardwareCursor?: boolean) {
@@ -514,6 +516,14 @@ export class TUI extends Container {
 
 		this.focusedComponent = component;
 
+		// Focus returning to an overlay re-arms the modal focus guard for it: a
+		// deliberate unfocus() only lasts until something focuses the overlay again.
+		if (component) {
+			for (const entry of this.overlayStack) {
+				if (entry.component === component) entry.focusReleased = false;
+			}
+		}
+
 		// Set focused flag on new component
 		if (isFocusable(component)) {
 			component.focused = true;
@@ -531,6 +541,9 @@ export class TUI extends Container {
 			preFocus: this.focusedComponent,
 			hidden: false,
 			focusOrder: ++this.focusOrderCounter,
+			/** Set by unfocus(): the host deliberately let the keyboard go; the
+			 * modal focus guard must not undo that until focus returns. */
+			focusReleased: false,
 		};
 		this.overlayStack.push(entry);
 		// Only focus if overlay is actually visible
@@ -589,6 +602,7 @@ export class TUI extends Container {
 			},
 			unfocus: () => {
 				if (this.focusedComponent !== component) return;
+				entry.focusReleased = true;
 				const topVisible = this.getTopmostVisibleOverlay();
 				this.setFocus(topVisible && topVisible !== entry ? topVisible.component : entry.preFocus);
 				this.syncFullscreenMouseTracking();
@@ -1018,7 +1032,26 @@ export class TUI extends Container {
 		}, delay);
 	}
 
+	/**
+	 * A visible capturing overlay owns the keyboard. Paths that hand focus back to the
+	 * editor (a selector or dialog closing, a tool prompt timing out) do not know a menu
+	 * is open, and after one of them every key goes to the hidden editor while the menu
+	 * looks dead. This runs before the input listeners, which read the focused component
+	 * to stand aside for dialogs. Whatever took the focus becomes the overlay's return
+	 * target, so a prompt that opened under the menu gets the keyboard once the menu
+	 * closes. An overlay released with unfocus() stays released.
+	 */
+	private reclaimModalFocus(): void {
+		if (this.isFullscreenOverlayFocused()) return;
+		const modal = this.getTopmostVisibleOverlay();
+		if (!modal || modal.focusReleased) return;
+		if (this.focusedComponent) modal.preFocus = this.focusedComponent;
+		this.setFocus(modal.component);
+		this.syncFullscreenMouseTracking();
+	}
+
 	private handleInput(data: string): void {
+		this.reclaimModalFocus();
 		if (this.inputListeners.size > 0) {
 			let current = data;
 			for (const listener of this.inputListeners) {

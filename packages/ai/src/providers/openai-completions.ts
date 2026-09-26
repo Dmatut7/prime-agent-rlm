@@ -43,6 +43,7 @@ import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js"
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { createRetryCapFetch } from "./retry-cap.js";
 import { buildBaseOptions } from "./simple-options.js";
+import { scrubStrayReasoningTags } from "./stray-reasoning-tags.js";
 import { transformMessages } from "./transform-messages.js";
 
 const log = getLogger("ai.provider");
@@ -698,6 +699,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 
 			encodeAccumulatedReasoningDetails();
 			finalizeStreamedToolCalls();
+			// Before the end events, so text_end carries the scrubbed text to every listener.
+			scrubStrayReasoningTags(blocks);
 			for (const block of blocks) {
 				finishBlock(block);
 			}
@@ -728,6 +731,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			// An interrupted call is still persisted, so it gets the same id/name
 			// cleanup as a completed one.
 			finalizeStreamedToolCalls();
+			scrubStrayReasoningTags(output.content);
 			// Mid-stream parses are throttled; run the authoritative final parse on
 			// in-flight tool arguments before the scratch buffers are stripped.
 			finalizeThrottledStreamingJson(output.content);

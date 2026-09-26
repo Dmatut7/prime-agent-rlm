@@ -1,0 +1,1 @@
+- Fixed bare `</think>` lines showing up in replies between tool calls on OpenAI-compatible endpoints; reasoning that a provider streams inline between tags keeps its tags ([#41](https://github.com/Dmatut7/prime-agent-rlm/pull/41) by [@Lansyue](https://github.com/Lansyue)).
