@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import lockfile from "proper-lockfile";
 import { describe, expect, it } from "vitest";
@@ -10,6 +10,7 @@ import {
 	DaemonSocketPathLease,
 	defaultDaemonSocketPath,
 	getDaemonSocketIdentity,
+	legacyDefaultDaemonSocketPath,
 	normalizeSocketPath,
 	prepareDaemonSocketPath,
 } from "../src/modes/daemon/daemon-socket.js";
@@ -33,16 +34,58 @@ describe("defaultDaemonSocketPath", () => {
 		expect(socketPath).toContain("prime-agent-S-");
 	});
 
-	it("uses a per-user Unix socket directory", () => {
+	it("uses a stable Unix socket directory outside $TMPDIR, overridable for tests", () => {
+		if (process.platform === "win32") {
+			return;
+		}
+
+		// The vitest run pins the directory so no test binds the developer's real
+		// one; unset it to pin the shipped default.
+		const previous = process.env.PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR;
+		delete process.env.PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR;
+		try {
+			const socketPath = defaultDaemonSocketPath();
+			const home = homedir();
+			if (home && home !== "/") {
+				// launchd shells, manual shells and TMPDIR-injecting tools each
+				// resolve a different $TMPDIR root, which split supervisor
+				// generations across sockets; the default must not depend on it.
+				expect(dirname(socketPath)).toBe(join(home, ".prime", "daemon"));
+			}
+			expect(basename(socketPath)).toBe("daemon.sock");
+			expect(dirname(socketPath)).not.toBe(join(tmpdir(), "prime-agent-501"));
+		} finally {
+			if (previous !== undefined) {
+				process.env.PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR = previous;
+			}
+		}
+	});
+
+	it("honors the internal socket-dir override (test isolation)", () => {
+		if (process.platform === "win32") {
+			return;
+		}
+		const previous = process.env.PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR;
+		process.env.PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR = "/tmp/w2-override-dir";
+		try {
+			expect(defaultDaemonSocketPath()).toBe("/tmp/w2-override-dir/daemon.sock");
+		} finally {
+			if (previous === undefined) {
+				delete process.env.PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR;
+			} else {
+				process.env.PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR = previous;
+			}
+		}
+	});
+
+	it("still exposes the legacy $TMPDIR socket path for discovery", () => {
 		if (process.platform === "win32") {
 			return;
 		}
 
 		const suffix = typeof process.getuid === "function" ? String(process.getuid()) : "user";
-		const socketPath = defaultDaemonSocketPath();
-
-		expect(dirname(socketPath)).toBe(join(tmpdir(), `prime-agent-${suffix}`));
-		expect(basename(socketPath)).toBe("daemon.sock");
+		expect(dirname(legacyDefaultDaemonSocketPath())).toBe(join(tmpdir(), `prime-agent-${suffix}`));
+		expect(basename(legacyDefaultDaemonSocketPath())).toBe("daemon.sock");
 	});
 
 	it("checks a live daemon before acquiring the socket path lock", async () => {

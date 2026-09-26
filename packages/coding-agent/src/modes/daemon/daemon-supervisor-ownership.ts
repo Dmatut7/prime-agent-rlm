@@ -6,7 +6,7 @@ import { getLogger } from "@earendil-works/pi-ai";
 import lockfile from "proper-lockfile";
 import { getProcessStartId } from "../../core/session-lease.js";
 import { writeFileAtomicSync } from "../../utils/atomic-file.js";
-import { defaultDaemonSocketDir, normalizeSocketPath } from "./daemon-socket.js";
+import { legacyDaemonSocketDir, normalizeSocketPath } from "./daemon-socket.js";
 
 const DAEMON_SUPERVISOR_REGISTRY_DIR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
 
@@ -105,7 +105,7 @@ interface AcquireDaemonSupervisorOwnershipOptions {
 	registryDir?: string;
 }
 
-class DaemonSupervisorAlreadyRunningError extends Error {
+export class DaemonSupervisorAlreadyRunningError extends Error {
 	readonly code = "daemon_supervisor_already_running" as const;
 
 	constructor(readonly owner: DaemonSupervisorOwnerRecord) {
@@ -376,10 +376,14 @@ function defaultDaemonSupervisorRegistryDir(environment: NodeJS.ProcessEnv = pro
  * from before the ~/.prime move may still be running; gated off whenever the
  * registry is overridden. Remove after one release.
  */
-function legacyDaemonSupervisorRegistryDir(environment: NodeJS.ProcessEnv = process.env): string | undefined {
-	return environment[DAEMON_SUPERVISOR_REGISTRY_DIR_ENV]
-		? undefined
-		: resolve(defaultDaemonSocketDir(), "supervisor-owners");
+export function legacyDaemonSupervisorRegistryDir(environment: NodeJS.ProcessEnv = process.env): string | undefined {
+	if (environment[DAEMON_SUPERVISOR_REGISTRY_DIR_ENV]) {
+		return undefined;
+	}
+	// The legacy registry lived next to the legacy (pre-stable) default socket in
+	// `$TMPDIR`; pin it there explicitly so the stable-path move cannot redirect
+	// this read-only fallback into the new socket directory.
+	return resolve(legacyDaemonSocketDir(), "supervisor-owners");
 }
 
 /**

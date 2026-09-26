@@ -154,6 +154,13 @@ import {
 	summaryWithoutStreamingMessage,
 } from "./daemon-session-list.js";
 import {
+	type DaemonStandbyOwner,
+	isDaemonSingleInstanceConflict,
+	judgeDaemonSocketOccupancy,
+	probeDaemonSocketOccupantIdentity,
+	runDaemonStandby,
+} from "./daemon-single-instance.js";
+import {
 	acquireDaemonSocketPathLease,
 	cleanupDaemonSocketPath,
 	type DaemonSocketIdentity,
@@ -162,12 +169,15 @@ import {
 	defaultDaemonSocketDir,
 	defaultDaemonSocketPath,
 	getDaemonSocketIdentity,
+	legacyDefaultDaemonSocketPath,
 	normalizeSocketPath,
 	prepareDaemonSocketPath,
 	restrictDaemonSocketPath,
 } from "./daemon-socket.js";
 import {
 	acquireDaemonSupervisorOwnership,
+	DaemonAgentDirAlreadyRunningError,
+	DaemonSupervisorAlreadyRunningError,
 	isDaemonShutdownAdmissionActive,
 	waitForDaemonStartupFence,
 	writeJsonAtomically,
@@ -209,6 +219,12 @@ import {
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
+import {
+	LIVE_THREADS_SNAPSHOT_FILE_NAME,
+	type LiveThreadSnapshotEntry,
+	liveThreadsSnapshotWriteGate,
+	writeLiveThreadsSnapshotIfChanged,
+} from "./live-threads-snapshot.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import {
 	PENDING_DELIVERY_CAPACITY_RETRY_AFTER_MS,
@@ -1181,6 +1197,91 @@ function defaultWorkerDescriptorDir(agentDir: string, socketPath: string): strin
 	return join(agentDir, "daemon-workers", descriptorKey(socketPath));
 }
 
+export type LegacyDescriptorDirMigration = {
+	migrated: boolean;
+	legacyDir: string;
+	descriptorDir: string;
+	reason:
+		| "not-default-socket"
+		| "no-legacy-dir"
+		| "target-not-empty"
+		| "already-migrated"
+		| "renamed"
+		| "custom-descriptor-dir"
+		| "rename-failed";
+	/** For "rename-failed": the failing rename's errno code, when present. */
+	renameErrorCode?: string;
+};
+
+/**
+ * Migrate the worker descriptor dir keyed on the legacy (pre-stable) default
+ * socket path to the dir keyed on the new stable path, so the first
+ * stable-path supervisor still adopts its predecessor's worker descriptors
+ * instead of starting from an empty roster (the 2-vs-4 fragmentation shape).
+ *
+ * Safe by construction: runs after ownership acquisition (a second starter for
+ * the same agent dir is already rejected), only when the supervisor binds the
+ * *default* socket (an explicit --daemon-socket keeps its own descriptor dir
+ * forever), only when the target dir is absent or empty, and the rename itself
+ * is atomic. Failure is best-effort: logged and skipped, never fatal.
+ */
+export function migrateLegacyWorkerDescriptorDirOnDisk(options: {
+	agentDir: string;
+	socketPath: string;
+	/**
+	 * The caller's actual descriptor dir (supervisor: options.descriptorDir).
+	 * When it differs from the computed default, the caller pinned its own
+	 * layout and the migration would rename the legacy tree into a dir the
+	 * caller never reads.
+	 */
+	descriptorDir?: string;
+	rename?: (from: string, to: string) => void;
+	readEntries?: (dir: string) => string[];
+}): LegacyDescriptorDirMigration | undefined {
+	if (process.platform === "win32") {
+		return undefined;
+	}
+	const normalized = normalizeSocketPath(options.socketPath);
+	const stableDefault = normalizeSocketPath(defaultDaemonSocketPath());
+	if (normalized !== stableDefault) {
+		return { migrated: false, legacyDir: "", descriptorDir: "", reason: "not-default-socket" };
+	}
+	const descriptorDir = defaultWorkerDescriptorDir(options.agentDir, normalized);
+	if (options.descriptorDir !== undefined && options.descriptorDir !== descriptorDir) {
+		return { migrated: false, legacyDir: "", descriptorDir, reason: "custom-descriptor-dir" };
+	}
+	const legacyDir = defaultWorkerDescriptorDir(options.agentDir, legacyDefaultDaemonSocketPath());
+	if (legacyDir === descriptorDir) {
+		return { migrated: false, legacyDir, descriptorDir, reason: "already-migrated" };
+	}
+	const readEntries = options.readEntries ?? ((dir: string) => readdirSync(dir));
+	try {
+		readEntries(legacyDir);
+	} catch {
+		return { migrated: false, legacyDir, descriptorDir, reason: "no-legacy-dir" };
+	}
+	try {
+		const existing = readEntries(descriptorDir);
+		if (existing.length > 0) {
+			return { migrated: false, legacyDir, descriptorDir, reason: "target-not-empty" };
+		}
+	} catch {
+		// Absent target dir is the expected migration case.
+	}
+	try {
+		(options.rename ?? ((from: string, to: string) => renameSync(from, to)))(legacyDir, descriptorDir);
+	} catch (error) {
+		// Best-effort: a failed rename leaves adoption degraded but startup sound.
+		// N7: a failed rename is its own reason (with the errno when the OS gives
+		// one) so the caller can log it; it was previously indistinguishable from
+		// "the legacy dir never existed", which silently swallowed EACCES/EXDEV.
+		const renameErrorCode = (error as { code?: unknown })?.code;
+		const renameCode = typeof renameErrorCode === "string" ? renameErrorCode : undefined;
+		return { migrated: false, legacyDir, descriptorDir, reason: "rename-failed", renameErrorCode: renameCode };
+	}
+	return { migrated: true, legacyDir, descriptorDir, reason: "renamed" };
+}
+
 export function idleEvictionSweepIntervalMs(idleEvictionMinutes: IdleEvictionMinutes): number {
 	if (idleEvictionMinutes === "off") return IDLE_EVICTION_MAX_SWEEP_INTERVAL_MS;
 	return Math.max(
@@ -1338,11 +1439,104 @@ function normalizeCapabilities(
 	return normalized;
 }
 
+/**
+ * W2 single-instance takeover protocol for supervisor mode:
+ *
+ * 1. Probe the socket first (cheap, 3 x 250ms). Another daemon listening
+ *    means we downgrade to standby *before* entering the 15s socket-lease
+ *    wait — the old failure path ("Lock file is already being held" throw →
+ *    exit 1 → service-manager relaunch → same collision, forever) was the
+ *    launchd idle-retry spin.
+ * 2. Otherwise start normally; a startup failure that is a single-instance
+ *    conflict (socket in use / supervisor already running / agent dir owned /
+ *    the socket-path lease held by a live process that has not bound yet —
+ *    proper-lockfile ELOCKED on this socket path) downgrades to standby
+ *    instead of propagating. The standby process never binds, never writes
+ *    the roster snapshot, and exits for relaunch once the owner is gone, so
+ *    the service manager's next attempt binds.
+ * 3. Any other failure propagates unchanged.
+ */
 export async function runDaemonSupervisorMode(options: DaemonSupervisorOptions): Promise<never> {
 	const socketPath = normalizeSocketPath(options.socketPath ?? defaultDaemonSocketPath());
+	const occupancy = await judgeDaemonSocketOccupancy(socketPath);
+	if (occupancy.kind === "listening") {
+		// N2 (R1): "someone accepts" is not yet "our daemon". A foreign listener
+		// would otherwise hold the real supervisor in standby forever with no
+		// owner record to wait on. Confirm identity with a bounded hello ladder
+		// before downgrading: a real daemon sends daemon_hello shortly after it
+		// starts accepting (hello is gated on supervisor readiness, not worker
+		// adoption), so a listener that accepts but never greets within the
+		// whole ladder is treated as unrecognized and fails loudly (the pre-W2
+		// behavior) instead of a silent, permanent standby.
+		const unrecognized = await waitForRecognizedDaemonOccupant(socketPath);
+		if (unrecognized) {
+			throw new Error(
+				`Daemon socket ${socketPath} is occupied by a listener that is not a recognizable Prime Agent daemon; refusing to stand by for an unknown occupant. Free the socket path and relaunch.`,
+			);
+		}
+		await runDaemonStandby({ socketPath });
+		return new Promise(() => {});
+	}
 	const supervisor = new DaemonSupervisor(socketPath, options);
-	await supervisor.start();
+	try {
+		await supervisor.start();
+	} catch (error) {
+		if (!isDaemonSingleInstanceConflict(error)) {
+			throw error;
+		}
+		const owner = daemonStandbyOwnerFromError(error);
+		await runDaemonStandby({ socketPath, owner });
+		return new Promise(() => {});
+	}
 	return new Promise(() => {});
+}
+
+/**
+ * N2 (R1): bounded identity ladder for an accepting socket occupant. Returns
+ * true when the occupant is still unrecognizable after every rung (accepts
+ * connections but never speaks a daemon hello): such a listener is not a
+ * Prime Agent daemon this process should stand by for. A daemon in startup
+ * greets within the first rungs, so the ladder is short on the healthy path.
+ */
+async function waitForRecognizedDaemonOccupant(
+	socketPath: string,
+	options: { attempts?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<boolean> {
+	const attempts = options.attempts ?? 3;
+	const intervalMs = options.intervalMs ?? 1000;
+	const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+	for (let attempt = 1; attempt <= attempts; attempt++) {
+		const occupant = await probeDaemonSocketOccupantIdentity(socketPath);
+		if (occupant.kind === "daemon") {
+			return false;
+		}
+		if (occupant.kind === "unrecognized") {
+			return true;
+		}
+		// "booting": accepted but no hello yet — retry before concluding.
+		if (attempt < attempts) {
+			await sleep(intervalMs);
+		}
+	}
+	return true;
+}
+
+function daemonStandbyOwnerFromError(error: unknown): DaemonStandbyOwner | undefined {
+	if (error instanceof DaemonSupervisorAlreadyRunningError) {
+		return {
+			socketPath: normalizeSocketPath(error.owner.socketPath),
+			pid: error.owner.pid,
+			generation: error.owner.generation,
+		};
+	}
+	if (error instanceof DaemonAgentDirAlreadyRunningError) {
+		return {
+			socketPath: normalizeSocketPath(error.owner.socketPath),
+			pid: error.owner.pid,
+			generation: error.owner.generation,
+		};
+	}
+	return undefined;
 }
 
 export class DaemonSupervisor {
@@ -1397,6 +1591,10 @@ export class DaemonSupervisor {
 	private readonly supervisorConfigPath: string;
 	private readonly defaultSessionConfig: AgentSessionRuntimeConfig;
 	private readonly snapshotCacheRoot: string;
+	/** Resident-root-sessions snapshot the boot-time tmux restore reads instead of the hand-maintained threads.list. */
+	private readonly liveThreadsSnapshotPath: string;
+	/** Signature of the last snapshot write this process performed; undefined forces the next write. */
+	private liveThreadsSignature?: string;
 	private commandJournal!: CommandRecoveryJournal;
 	private readonly streamReconstructor = new CompactAssistantStreamReconstructor();
 	private readonly compactCatchupInProgress = new Set<string>();
@@ -1434,6 +1632,13 @@ export class DaemonSupervisor {
 	private readonly adoptionRetryDelaysMs: readonly number[];
 	/** Workers still being adopted; published as daemon_hello.adopting so a partial startup is visible. */
 	private adoptionPendingCount = 0;
+	/**
+	 * Roster-snapshot writes skipped by the W2 single-writer gate (not the socket
+	 * owner, or the lease was compromised). Counted so a degraded supervisor that
+	 * keeps skipping is visible in telemetry instead of silently never refreshing
+	 * the boot roster.
+	 */
+	private liveThreadsSnapshotSkippedWrites = 0;
 	/** The workers the startup count was opened for, so a runtime re-adoption cannot skew it. */
 	private readonly adoptionCountedWorkers = new Set<ResidentWorker>();
 	private readonly adoptionRetryTimers = new Map<ResidentWorker, NodeJS.Timeout>();
@@ -1470,6 +1675,7 @@ export class DaemonSupervisor {
 			this.loadPersistedSupervisorConfig(),
 		);
 		this.snapshotCacheRoot = join(this.descriptorDir, "snapshot-cache", this.generation);
+		this.liveThreadsSnapshotPath = join(agentDir, LIVE_THREADS_SNAPSHOT_FILE_NAME);
 		this.catalog = new DaemonCatalogClient((message) => this.log(message));
 		this.settingsManager = SettingsManager.create(process.cwd(), this.defaultSessionConfig.agentDir ?? agentDir);
 		this.catchupRetryPolicy = options.catchupRetryPolicy ?? DEFAULT_CLIENT_CATCHUP_RETRY_POLICY;
@@ -1504,6 +1710,7 @@ export class DaemonSupervisor {
 			});
 			this.assertSocketLeaseHeld();
 			await prepareDaemonSocketPath(this.socketPath, this.socketLease);
+			this.migrateLegacyWorkerDescriptorDir();
 
 			mkdirSync(this.descriptorDir, { recursive: true, mode: 0o700 });
 			chmodSync(this.descriptorDir, 0o700);
@@ -1631,6 +1838,43 @@ export class DaemonSupervisor {
 	}
 
 	/** Degraded lines are throttled per cause so a stuck disk cannot drown the log. */
+	/**
+	 * W2: one-shot legacy descriptor dir migration on the default socket. See
+	 * {@link migrateLegacyWorkerDescriptorDirOnDisk}; failures are logged and
+	 * non-fatal (adoption degrades to the current generation only).
+	 */
+	private migrateLegacyWorkerDescriptorDir(): void {
+		const agentDir = this.defaultSessionConfig.agentDir;
+		if (!agentDir || process.platform === "win32") {
+			return;
+		}
+		try {
+			const result = migrateLegacyWorkerDescriptorDirOnDisk({
+				agentDir,
+				socketPath: this.socketPath,
+				descriptorDir: this.descriptorDir,
+			});
+			if (result?.reason === "renamed") {
+				this.log(
+					`Migrated legacy worker descriptor dir for the stable socket path: ${result.legacyDir} -> ${result.descriptorDir}`,
+				);
+			}
+			if (result?.reason === "rename-failed") {
+				// N7: the rename failing (EACCES/EXDEV/ENOSPC...) must not be silent -
+				// adoption is degraded to the current generation and the operator
+				// needs the errno to tell "disk full" from "crossed devices".
+				this.logDegraded(
+					"legacy-descriptor-dir-rename-failed",
+					`Legacy worker descriptor dir rename failed (${result.renameErrorCode ?? "unknown errno"}): ${result.legacyDir} -> ${result.descriptorDir}; adoption falls back to the current generation`,
+				);
+			}
+		} catch (error) {
+			this.log(
+				`Legacy worker descriptor dir migration failed (continuing with current generation): ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
 	private logDegraded(cause: string, message: string): void {
 		const now = Date.now();
 		const state = this.degradedLogState.get(cause);
@@ -2431,6 +2675,77 @@ export class DaemonSupervisor {
 		// Durable write: the descriptor is what a later supervisor adopts from, so a
 		// torn one costs the whole tree its registration (see writeJsonAtomically).
 		writeJsonAtomically(worker.descriptorPath, durableDaemonWorkerDescriptor(worker.descriptor));
+	}
+
+	/**
+	 * Mirror the resident root sessions into <agentDir>/live-threads.json so a
+	 * reboot revives exactly the threads that were alive (pa-threads-restore.sh
+	 * prefers this file over the hand-maintained threads.list while writtenAt is
+	 * fresh). Abnormal exits (SIGKILL, power loss) run no shutdown hook, so the
+	 * snapshot is persisted on every resident-set change: the last change before
+	 * death is already on disk. The source is the supervisor's own worker map -
+	 * roots with no summary yet (adoption in flight) still carry their durable
+	 * rootSessionId, and the roster covers a name the cached summary has not
+	 * refreshed yet (rename).
+	 */
+	private syncLiveThreadsSnapshot(reason: string, force = false): void {
+		// W2: exactly one writer for the whole-machine roster snapshot — the
+		// supervisor that owns the daemon socket. A downgraded (standby) process
+		// never reaches this method (it never constructs a supervisor), and a
+		// compromised lease stops writing before the next owner can start.
+		const gate = liveThreadsSnapshotWriteGate({
+			ownsSocketPath: this.ownsSocketPath,
+			leaseCompromised: this.socketLeaseCompromise !== undefined,
+			startupComplete: this.startupComplete,
+		});
+		if (!gate.allowed) {
+			this.liveThreadsSnapshotSkippedWrites++;
+			this.logDegraded(
+				"live-threads-snapshot-gate",
+				`Skipped live threads snapshot write (${reason}): not the socket owner (${gate.reason})` +
+					`; ${this.liveThreadsSnapshotSkippedWrites} write${this.liveThreadsSnapshotSkippedWrites === 1 ? "" : "s"} skipped so far`,
+			);
+			return;
+		}
+		const threads: LiveThreadSnapshotEntry[] = [];
+		for (const worker of this.workers.values()) {
+			// Resident sessions only: a client-owned worker dies with its client and
+			// is not tmux-restorable.
+			if (worker.descriptor.ownerClientId !== undefined) continue;
+			const summary = worker.summaries.get(worker.descriptor.rootActiveSessionId);
+			const rosterSummary = this.roster().byActiveSessionId(worker.descriptor.rootActiveSessionId)?.summary;
+			const merged = summary ?? rosterSummary;
+			// Symmetric fallback: the durable descriptor id wins, then whichever summary
+			// survived - the same merged record that supplies name and cwd below.
+			const rootId = worker.descriptor.rootSessionId ?? merged?.sessionId;
+			if (!rootId) continue;
+			// A draft root never sent a message; an archived root was retired on purpose.
+			if (merged?.lifecycle === "draft" || merged?.lifecycle === "archived") continue;
+			const name = rosterSummary?.sessionName ?? summary?.sessionName;
+			const cwd = summary?.cwd ?? rosterSummary?.cwd;
+			threads.push({
+				id: rootId,
+				...(cwd ? { cwd } : {}),
+				...(name ? { name } : {}),
+			});
+		}
+		try {
+			const write = writeLiveThreadsSnapshotIfChanged(
+				this.liveThreadsSnapshotPath,
+				threads,
+				// A forced write refreshes writtenAt even for an unchanged set: the boot
+				// restore trusts the snapshot only while writtenAt is fresh, so a resident
+				// set idle for days must not age out of its own shutdown record.
+				force ? undefined : this.liveThreadsSignature,
+			);
+			if (write.changed) {
+				this.liveThreadsSignature = write.signature;
+				this.log(`Live threads snapshot now holds ${threads.length} resident session(s) (${reason})`);
+			}
+		} catch (error) {
+			// A missing snapshot only degrades the boot restore back to threads.list.
+			this.log(`Could not write live threads snapshot (${reason}): ${String(error)}`);
+		}
 	}
 
 	/**
@@ -10018,6 +10333,9 @@ export class DaemonSupervisor {
 		// here: drop the shared snapshot so the next catalog read (or the recompute armed
 		// below) rescans instead of serving pre-mutation rows.
 		this.invalidatePassiveScheduledJobs();
+		// Same choke point mirrors the resident set to live-threads.json, so the last
+		// residency change before an abnormal death is already on disk for the reboot.
+		this.syncLiveThreadsSnapshot("roster-change");
 		this.scheduleScheduledSessionWakeRecompute();
 		for (const client of this.clients) {
 			this.write(client, { type: "heartbeats_changed" });
@@ -10233,6 +10551,10 @@ export class DaemonSupervisor {
 			process.exit(exitCode);
 		}
 		this.shuttingDown = true;
+		// Record the resident set one last time while every worker is still alive: a
+		// graceful restart must revive exactly these threads, and from here on the
+		// worker map empties as the stops land.
+		this.syncLiveThreadsSnapshot("shutdown", true);
 		// P1-7c/B10: answer every pending delivery before the workers go, so a
 		// sender still waiting learns the message was not delivered instead of
 		// watching the daemon leave with it.

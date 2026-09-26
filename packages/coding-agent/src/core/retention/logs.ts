@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import type { Stats } from "node:fs";
 import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { basename, join } from "node:path";
+import { defaultDaemonSocketDir } from "../../modes/daemon/daemon-socket.js";
 import { normalizeSocketPath } from "../../utils/daemon-socket-path.js";
 import { type ReclaimRequest, reclaimWithinBudget, statSignature } from "./delete.js";
 import type {
@@ -111,6 +112,10 @@ export function collectActiveSocketKeys(tmpDir: string, agentDir?: string): Map<
 	const directories = [
 		tmpDir,
 		join(tmpDir, `prime-agent-${currentUidSuffix()}`),
+		// The stable default socket dir (`~/.prime/daemon`): since the stable-path
+		// move the live socket and its workers live here, and their logs must be
+		// discovered the same way. Hash keys keep working for both generations.
+		defaultDaemonSocketDir(),
 		// A daemon started with `--socket <path>` keeps its socket where the operator
 		// put it. The default agent dir and one level under it cover the layouts this
 		// repo creates; a socket outside both roots stays invisible here, which is the

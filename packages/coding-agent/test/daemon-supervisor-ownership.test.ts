@@ -15,11 +15,13 @@ import { join } from "node:path";
 import lockfile from "proper-lockfile";
 import { afterEach, describe, expect, it } from "vitest";
 import { getProcessStartId } from "../src/core/session-lease.js";
+import { legacyDaemonSocketDir } from "../src/modes/daemon/daemon-socket.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	acquireDaemonShutdownAdmission,
 	acquireDaemonSupervisorOwnership,
 	assertDaemonSupervisorOwnerCurrent,
+	legacyDaemonSupervisorRegistryDir,
 	persistDaemonStartupFenceFromOwner,
 	waitForDaemonStartupFence,
 } from "../src/modes/daemon/daemon-supervisor-ownership.js";
@@ -123,6 +125,19 @@ function plantOwner(
 }
 
 describe("daemon supervisor ownership registry reclamation", () => {
+	it("pins the legacy registry fallback to the pre-stable $TMPDIR socket dir", () => {
+		if (process.platform === "win32") {
+			return;
+		}
+		// The vitest env pins the registry override, so the fallback must be
+		// inspected with a clean environment. The stable-path move must not
+		// redirect this read-only fallback into the new socket directory:
+		// pre-move daemons registered next to their legacy socket.
+		expect(legacyDaemonSupervisorRegistryDir({} as NodeJS.ProcessEnv)).toBe(
+			join(legacyDaemonSocketDir(), "supervisor-owners"),
+		);
+	});
+
 	it("reclaims a dead owner that never conflicted and keeps a live one", async () => {
 		const paths = createPaths();
 		// A valid record to copy the shape from; released, so it does not conflict.
