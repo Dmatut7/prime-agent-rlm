@@ -360,6 +360,50 @@ describe("provider fallback chain (unattended self-recovery)", () => {
 		expect(served).toEqual(["faux-1", "faux-qwen"]);
 	});
 
+	it("pins the session to an explicitly selected model: quota pressure stays put", async () => {
+		const harness = await harnessWith();
+		const served: string[] = [];
+		const step = perModel(
+			{
+				"faux-1": [quotaFailure(), quotaFailure(), quotaFailure(), quotaFailure()],
+				"faux-kimi": [fauxAssistantMessage("kimi must not serve")],
+				"faux-qwen": [fauxAssistantMessage("qwen must not serve")],
+			},
+			served,
+		);
+		harness.setResponses([step, step, step, step]);
+		const pinned = harness.getModel("faux-1");
+		expect(pinned).toBeDefined();
+		await harness.session.setModel(pinned!);
+		await harness.session.prompt("do the work");
+		expect(served.every((id) => id === "faux-1")).toBe(true);
+		expect(harness.session.model?.id).toBe("faux-1");
+	});
+
+	it("re-pins on the next explicit choice: a pinned session can still be moved by hand", async () => {
+		const harness = await harnessWith();
+		const served: string[] = [];
+		const step = perModel(
+			{
+				"faux-1": [quotaFailure(), fauxAssistantMessage("back on one")],
+				"faux-kimi": [fauxAssistantMessage("kimi answer")],
+				"faux-qwen": [quotaFailure(), quotaFailure(), quotaFailure()],
+			},
+			served,
+		);
+		harness.setResponses([step, step, step, step, step]);
+		// Unpinned start: quota moves the session along the chain as before.
+		await harness.session.prompt("one");
+		expect(served).toEqual(["faux-1", "faux-kimi"]);
+		// The owner picks qwen by hand: that pins qwen.
+		const qwen = harness.getModel("faux-qwen");
+		expect(qwen).toBeDefined();
+		await harness.session.setModel(qwen!);
+		await harness.session.prompt("two");
+		expect(served.slice(2).every((id) => id === "faux-qwen")).toBe(true);
+		expect(harness.session.model?.id).toBe("faux-qwen");
+	});
+
 	it("gives explicit user model choices precedence over a running fallback", async () => {
 		const harness = await harnessWith();
 		const served: string[] = [];
