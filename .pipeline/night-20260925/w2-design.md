@@ -84,6 +84,17 @@ supervisor start() 在 mkdir(descriptorDir) 前：若 socketPath 为新默认路
 - 并发绑定：N 个并发 acquire ⇒ 恰一个 bind；其余得到 downgrade/占用（进程级 fixture 太重，用 socket+租约级并发测试）。
 - 无响应判定：文件在、connect 拒绝 ⇒ unresponsive；accept 但不发 hello ⇒ 仍算 listening（防误拆 booting daemon，钉住语义）。
 
+## 5b. 部署/迁移口径（N3，R1 处置时补写）
+
+一次启用本 PR 的动作序列（照做即可，不依赖任何工具自动收口）：
+
+1. **先停旧 daemon，用 force**：`prime-agent shutdown --force`（不是裸 `shutdown`）。裸 shutdown 只停 worker；`--force` 连 supervisor 一起停，socket 文件与 socket-path 租约才会释放。
+2. **本机必须重启（reboot）一次**：已加载的 launchd job 仍持旧 plist/`pa-daemon-start.sh`，里面硬编码旧 SOCKDIR（`$TMPDIR/prime-agent-<uid>`）。不重启则 launchd 仍按旧路径拉起旧二进制行为——S3 的"手动 daemon 与 launchd 打架"现场就是这么来的。重启后 launchd 重新加载新 plist；无 plist 的环境（纯手动）只需保证旧进程已退出。
+3. 首次以新路径启动时：supervisor 自动做 legacy 描述符目录迁移（D3），worker 描述符世代 2→3 无感衔接；迁移失败会打 `legacy-descriptor-dir-rename-failed` 降级日志（N7），adoption 退回当前代，不阻塞启动。
+4. 验证：`ls ~/.prime/daemon/daemon.sock` 存在且 `prime-agent daemon status`（或 clients-view）应答；`~/.prime/agent/live-threads.json` 的 writtenAt 随 resident 变化刷新，shutdown 时强制刷新（PR#32 990ca1504 语义）。
+
+已知遗留（不阻塞合并）：环外脚本 `pa-daemon-start.sh` 的 watch 模式仍是旧洞的创可贴，需要另行下线（不在本 PR 范围）。
+
 ## 6. 交付物
 
 commits（每小步一 commit，--no-verify，只 add 自己的文件）：
