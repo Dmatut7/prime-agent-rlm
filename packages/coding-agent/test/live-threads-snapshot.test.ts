@@ -79,32 +79,37 @@ describe("live-threads snapshot", () => {
 });
 
 describe("liveThreadsSnapshotWriteGate (W2 single writer)", () => {
-	it("lets the socket owner write the whole-machine roster", () => {
-		expect(liveThreadsSnapshotWriteGate({ ownsSocketPath: true, leaseCompromised: false })).toEqual({
-			allowed: true,
-			reason: "owner",
-		});
+	it("lets the started socket owner write the whole-machine roster", () => {
+		expect(
+			liveThreadsSnapshotWriteGate({ ownsSocketPath: true, leaseCompromised: false, startupComplete: true }),
+		).toEqual({ allowed: true, reason: "owner" });
 	});
 
 	it("blocks a supervisor that does not own the socket path", () => {
 		// A standby/downgraded supervisor is a client, not the owner; two writers
 		// is how the roster fragment (2 threads vs 4 real sessions) reaches boot restore.
-		expect(liveThreadsSnapshotWriteGate({ ownsSocketPath: false, leaseCompromised: false })).toEqual({
-			allowed: false,
-			reason: "does-not-own-socket",
-		});
+		expect(
+			liveThreadsSnapshotWriteGate({ ownsSocketPath: false, leaseCompromised: false, startupComplete: true }),
+		).toEqual({ allowed: false, reason: "does-not-own-socket" });
 	});
 
 	it("blocks a compromised lease even while it still owns the path", () => {
 		// The lease compromise is the louder fact: the path is about to belong to
 		// another holder, so writing one more roster would overwrite the new owner's.
-		expect(liveThreadsSnapshotWriteGate({ ownsSocketPath: true, leaseCompromised: true })).toEqual({
-			allowed: false,
-			reason: "lease-compromised",
-		});
-		expect(liveThreadsSnapshotWriteGate({ ownsSocketPath: false, leaseCompromised: true })).toEqual({
-			allowed: false,
-			reason: "lease-compromised",
-		});
+		expect(
+			liveThreadsSnapshotWriteGate({ ownsSocketPath: true, leaseCompromised: true, startupComplete: true }),
+		).toEqual({ allowed: false, reason: "lease-compromised" });
+		expect(
+			liveThreadsSnapshotWriteGate({ ownsSocketPath: false, leaseCompromised: true, startupComplete: false }),
+		).toEqual({ allowed: false, reason: "lease-compromised" });
+	});
+
+	it("blocks a mid-startup supervisor even though it owns the socket (D4)", () => {
+		// The booting supervisor owns the socket before its worker map is filled
+		// in; a mid-startup write would record the partial roster (2 threads vs
+		// 4 real sessions) over whatever the previous owner last wrote.
+		expect(
+			liveThreadsSnapshotWriteGate({ ownsSocketPath: true, leaseCompromised: false, startupComplete: false }),
+		).toEqual({ allowed: false, reason: "startup-incomplete" });
 	});
 });

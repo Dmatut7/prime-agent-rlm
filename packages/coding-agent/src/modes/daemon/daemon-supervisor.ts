@@ -2659,6 +2659,7 @@ export class DaemonSupervisor {
 		const gate = liveThreadsSnapshotWriteGate({
 			ownsSocketPath: this.ownsSocketPath,
 			leaseCompromised: this.socketLeaseCompromise !== undefined,
+			startupComplete: this.startupComplete,
 		});
 		if (!gate.allowed) {
 			this.liveThreadsSnapshotSkippedWrites++;

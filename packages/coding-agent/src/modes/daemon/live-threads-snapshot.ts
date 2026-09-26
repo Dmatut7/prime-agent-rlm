@@ -126,12 +126,25 @@ export function liveThreadsSnapshotWriteGate(state: {
 	ownsSocketPath: boolean;
 	/** The socket lease was compromised (another holder took the path over). */
 	leaseCompromised: boolean;
-}): { allowed: boolean; reason: "owner" | "does-not-own-socket" | "lease-compromised" } {
+	/**
+	 * Startup (adoption scan, ownership acquire, ready fence) finished. A
+	 * booting supervisor's worker map is still filling in, so a mid-startup
+	 * write records a partial roster even though it already owns the socket —
+	 * D4 keeps the gate closed until startup completes.
+	 */
+	startupComplete: boolean;
+}): {
+	allowed: boolean;
+	reason: "owner" | "does-not-own-socket" | "lease-compromised" | "startup-incomplete";
+} {
 	if (state.leaseCompromised) {
 		return { allowed: false, reason: "lease-compromised" };
 	}
 	if (!state.ownsSocketPath) {
 		return { allowed: false, reason: "does-not-own-socket" };
+	}
+	if (!state.startupComplete) {
+		return { allowed: false, reason: "startup-incomplete" };
 	}
 	return { allowed: true, reason: "owner" };
 }
