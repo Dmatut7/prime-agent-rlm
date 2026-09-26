@@ -273,6 +273,7 @@ import {
 	ASYNC_BASH_COMPLETION_PREVIEW_LABEL,
 	type AsyncBashCompletionDetails,
 	type BashExecutionMessage,
+	boundRlmChildLastText,
 	type CompactionOutcome,
 	type CompactionOutcomeReason,
 	type CustomMessage,
@@ -18015,7 +18016,7 @@ export class AgentSession {
 				kind: "completed_without_reply",
 				childId,
 				sessionName,
-				lastAssistantTextPreview: lastAssistantText ? compactRlmText(lastAssistantText) : undefined,
+				lastAssistantText: lastAssistantText ? boundRlmChildLastText(lastAssistantText) : undefined,
 				followUp: true,
 			});
 		}
@@ -18210,7 +18211,7 @@ export class AgentSession {
 				kind: "completed_without_reply",
 				childId: run.id,
 				sessionName,
-				lastAssistantTextPreview: lastAssistantText ? compactRlmText(lastAssistantText) : undefined,
+				lastAssistantText: lastAssistantText ? boundRlmChildLastText(lastAssistantText) : undefined,
 			}),
 		);
 		// The parent gets the child's last answer without waiting for a reply that never came.
