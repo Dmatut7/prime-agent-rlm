@@ -9,7 +9,7 @@
 |---|---|---|
 | `npx tsgo --noEmit` | 0 错 | **0 错**（收尾复跑，HEAD=收尾 commit） |
 | `npx biome check`（12 个本分支触碰 .ts） | — | **clean（0 error / 0 warning）**（收尾复跑） |
-| daemon 测试 | 49/49（派工书基线） | **78/78 全绿**：daemon-single-instance 19 + daemon-socket 12 + ownership 12 + real-process standby 3 + live-threads 8 + descriptor-migration 5 + agent-dir-identity/stop-convergence/mode-supervisor-probe 19 |
+| daemon 测试 | 49/49（派工书基线） | **78/78 全绿**（跑法：`cd packages/coding-agent && npx vitest run <files>`——根目录跑会吃到 `node_modules/@earendil-works/pi-ai` 过期 dist，读数不可信；本表读数均以包目录跑法复核过）：daemon-single-instance 19 + daemon-socket 12 + ownership 12 + real-process standby 3 + live-threads 8 + descriptor-migration 5 + agent-dir-identity/stop-convergence/mode-supervisor-probe 19 |
 
 ## 处置表
 
