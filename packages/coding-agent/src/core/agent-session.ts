@@ -2632,6 +2632,15 @@ export class AgentSession {
 		  }
 		| undefined = undefined;
 	/**
+	 * The model the owner explicitly selected (model selector, /model, or a
+	 * connection set_model RPC). While set, automatic recovery - the backup
+	 * model and the fallback chain - must not move the session off it: an
+	 * explicit choice is an instruction, and quota pressure is not a reason to
+	 * overrule it. The next explicit selection re-pins to the new model, so a
+	 * pinned session can always be moved by hand.
+	 */
+	private _userPinnedModel: Model<any> | undefined = undefined;
+	/**
 	 * Set while the session runs on a fallback-chain model. Unlike the backup
 	 * model it stays after a success; the primary is probed again once
 	 * PROVIDER_FALLBACK_RETURN_AFTER_MS has passed.
@@ -12839,6 +12848,9 @@ export class AgentSession {
 
 		// An explicit pick ends any automatic fallback: never switch the user back.
 		this._fallback = undefined;
+		// ...and pins the session: automatic recovery may not move it again until
+		// the owner picks another model by hand.
+		this._userPinnedModel = model;
 		const previousModel = this.model;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		const serviceTier = this._getServiceTierForModelSwitch();
@@ -20120,6 +20132,7 @@ export class AgentSession {
 	 * images to a model that would silently downgrade them to placeholders.
 	 */
 	private _resolveBackupModel(): Model<any> | undefined {
+		if (this._userPinnedModel) return undefined;
 		const reference = this.settingsManager.getProviderBackupModel();
 		if (!reference) return undefined;
 		const backupModel = findExactModelReferenceMatch(reference, this._modelRegistry.getAvailable());
@@ -20203,6 +20216,7 @@ export class AgentSession {
 	 * provider's other models.
 	 */
 	private _resolveNextFallbackModel(options: { otherProviderThan?: string } = {}): Model<any> | undefined {
+		if (this._userPinnedModel) return undefined;
 		const references = this.settingsManager.getProviderFallbackModels();
 		if (references.length === 0) return undefined;
 		const key = (model: Model<any>) => `${model.provider}/${model.id}`;
