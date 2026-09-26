@@ -60,7 +60,7 @@
 - 测试：注入抛 `{code: "EXDEV"}` 的 rename ⇒ reason/renameErrorCode 断言 + legacy 目录仍在。
 
 ### N3【中】部署/迁移口径含 reboot 需求未落文档 ✅ 已写 @（本 commit）
-- `w2-design.md` 新增「5b. 部署/迁移口径」：① `prime-agent shutdown --force`（裸 shutdown 不够）② 本机需 reboot 一次（已加载 launchd job 持旧 plist/pa-daemon-start.sh 硬编码旧 SOCKDIR）③ 首启自动 legacy 描述符迁移、失败降级不阻塞 ④ 验证清单。PR body 编辑因 gh 凭据失效暂无法执行（fork 推送后留父会话处置，见 N12 备注）。
+- `w2-design.md` 新增「5b. 部署/迁移口径」：① `prime-agent shutdown --force`（裸 shutdown 不够）② 本机需 reboot 一次（已加载 launchd job 持旧 plist/pa-daemon-start.sh 硬编码旧 SOCKDIR）③ 首启自动 legacy 描述符迁移、失败降级不阻塞 ④ 验证清单。PR body 已编辑成功（`gh pr edit 37 --body-file pr-body.md`，含 disposition/部署口径摘要，落盘于同目录 pr-body.md）。
 
 ### N9【低】分支底 32a9a5adc 与 PR#32 重复提交 — ✅ 信息项（不处置）
 - cherry-pick 语义下重复是预期形状（w2 派工书第 1 步明示「cherry-pick 9ff31b4ed，原作者署名保留」）；集成时 git 自会按 patch-id 去重或由父会话 rebase 收口。不改动。
@@ -73,5 +73,5 @@
 
 - **可合并判定：通过（自评）**。必修项 N1/N2/N4/N5/N6/N7/N11 全部代码级修复 + 测试；N3/N8/N9/N12 文档/入库/信息项处置完毕；父会话追加的 PR#32 两条 port（08edd3289）逐字保留原注释并落测试。
 - 修复过程中真抓到并修掉一个自引 bug（N4 用例暴露：默认 openClient 未 connect()）——审查要求的真实进程用例确实有防御价值。
-- 未做且已留痕：PR body 编辑（gh 凭据失效）、`pa-daemon-start.sh` watch 模式下线（范围外）。
+- 未做且已留痕：`pa-daemon-start.sh` watch 模式下线（范围外）。PR body 已编辑成功（gh 凭据实测有效）。
 - commit 顺序（12 个）：…b8dcd604d → 2653263a3(N11) → 03c5cdb0c(N1) → a2ff789ee(N2) → 961e798e1(N4) → 08edd3289(PR#32×2) → 0d25f49b1(N5) → 86f62f2ae(N6+N7) → 本收尾 commit（N3/N8/N12 文档+处置表）。
