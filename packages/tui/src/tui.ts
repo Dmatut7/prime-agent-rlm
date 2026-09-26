@@ -466,6 +466,8 @@ export class TUI extends Container {
 		preFocus: Component | null;
 		hidden: boolean;
 		focusOrder: number;
+		/** Set by unfocus(); cleared when focus returns to the overlay. */
+		focusReleased: boolean;
 	}[] = [];
 
 	constructor(terminal: Terminal, showHardwareCursor?: boolean) {
@@ -514,6 +516,14 @@ export class TUI extends Container {
 
 		this.focusedComponent = component;
 
+		// Focus returning to an overlay re-arms the modal focus guard for it: a
+		// deliberate unfocus() only lasts until something focuses the overlay again.
+		if (component) {
+			for (const entry of this.overlayStack) {
+				if (entry.component === component) entry.focusReleased = false;
+			}
+		}
+
 		// Set focused flag on new component
 		if (isFocusable(component)) {
 			component.focused = true;
@@ -531,6 +541,9 @@ export class TUI extends Container {
 			preFocus: this.focusedComponent,
 			hidden: false,
 			focusOrder: ++this.focusOrderCounter,
+			/** Set by unfocus(): the host deliberately let the keyboard go; the
+			 * modal focus guard must not undo that until focus returns. */
+			focusReleased: false,
 		};
 		this.overlayStack.push(entry);
 		// Only focus if overlay is actually visible
@@ -589,6 +602,7 @@ export class TUI extends Container {
 			},
 			unfocus: () => {
 				if (this.focusedComponent !== component) return;
+				entry.focusReleased = true;
 				const topVisible = this.getTopmostVisibleOverlay();
 				this.setFocus(topVisible && topVisible !== entry ? topVisible.component : entry.preFocus);
 				this.syncFullscreenMouseTracking();
@@ -1054,6 +1068,28 @@ export class TUI extends Container {
 		if (!keyRelease && getKeybindings().matches(data, "tui.debug.dump") && this.onDebug) {
 			this.onDebug();
 			return;
+		}
+
+		// Modal overlay focus guard: a capturing overlay that is on screen owns the
+		// keyboard and the mouse for as long as it is visible. Streaming repaints and
+		// event-driven refreshes can restore focus to the prompt editor while a modal
+		// menu (model selector, configuration menu) is open; with focus on the editor
+		// every Enter goes to the prompt and the menu looks dead, and fullscreen mouse
+		// clicks land on the viewport instead of the menu's click regions. Re-assert
+		// the topmost capturing overlay before dispatch so stolen focus can never eat
+		// a modal's input. Non-capturing overlays (the editor autocomplete) are
+		// skipped by design: they must leave focus where the user is typing.
+		if (!this.isFullscreenOverlayFocused()) {
+			for (let i = this.overlayStack.length - 1; i >= 0; i--) {
+				const entry = this.overlayStack[i];
+				if (entry.options?.nonCapturing || entry.focusReleased || !this.isOverlayVisible(entry)) {
+					continue;
+				}
+				if (this.focusedComponent !== entry.component) {
+					this.setFocus(entry.component);
+				}
+				break;
+			}
 		}
 
 		if (this.fullscreen && this.handleFullscreenInput(data)) {
