@@ -1032,7 +1032,26 @@ export class TUI extends Container {
 		}, delay);
 	}
 
+	/**
+	 * A visible capturing overlay owns the keyboard. Paths that hand focus back to the
+	 * editor (a selector or dialog closing, a tool prompt timing out) do not know a menu
+	 * is open, and after one of them every key goes to the hidden editor while the menu
+	 * looks dead. This runs before the input listeners, which read the focused component
+	 * to stand aside for dialogs. Whatever took the focus becomes the overlay's return
+	 * target, so a prompt that opened under the menu gets the keyboard once the menu
+	 * closes. An overlay released with unfocus() stays released.
+	 */
+	private reclaimModalFocus(): void {
+		if (this.isFullscreenOverlayFocused()) return;
+		const modal = this.getTopmostVisibleOverlay();
+		if (!modal || modal.focusReleased) return;
+		if (this.focusedComponent) modal.preFocus = this.focusedComponent;
+		this.setFocus(modal.component);
+		this.syncFullscreenMouseTracking();
+	}
+
 	private handleInput(data: string): void {
+		this.reclaimModalFocus();
 		if (this.inputListeners.size > 0) {
 			let current = data;
 			for (const listener of this.inputListeners) {
@@ -1068,28 +1087,6 @@ export class TUI extends Container {
 		if (!keyRelease && getKeybindings().matches(data, "tui.debug.dump") && this.onDebug) {
 			this.onDebug();
 			return;
-		}
-
-		// Modal overlay focus guard: a capturing overlay that is on screen owns the
-		// keyboard and the mouse for as long as it is visible. Streaming repaints and
-		// event-driven refreshes can restore focus to the prompt editor while a modal
-		// menu (model selector, configuration menu) is open; with focus on the editor
-		// every Enter goes to the prompt and the menu looks dead, and fullscreen mouse
-		// clicks land on the viewport instead of the menu's click regions. Re-assert
-		// the topmost capturing overlay before dispatch so stolen focus can never eat
-		// a modal's input. Non-capturing overlays (the editor autocomplete) are
-		// skipped by design: they must leave focus where the user is typing.
-		if (!this.isFullscreenOverlayFocused()) {
-			for (let i = this.overlayStack.length - 1; i >= 0; i--) {
-				const entry = this.overlayStack[i];
-				if (entry.options?.nonCapturing || entry.focusReleased || !this.isOverlayVisible(entry)) {
-					continue;
-				}
-				if (this.focusedComponent !== entry.component) {
-					this.setFocus(entry.component);
-				}
-				break;
-			}
 		}
 
 		if (this.fullscreen && this.handleFullscreenInput(data)) {

@@ -109,6 +109,89 @@ describe("TUI modal overlay focus guard", () => {
 		}
 	});
 
+	it("hands the keyboard to whatever took it once the modal closes", async () => {
+		const terminal = new VirtualTerminal(80, 24);
+		const tui = new TUI(terminal);
+		const editor = new RecordingComponent(["EDITOR"]);
+		const prompt = new RecordingComponent(["PROMPT"]);
+		const overlay = new RecordingComponent(["OVERLAY"]);
+		tui.addChild(new EmptyContent());
+		tui.setFocus(editor);
+		tui.start();
+		try {
+			const handle = tui.showOverlay(overlay);
+			await renderAndFlush(tui, terminal);
+			// A tool prompt opens in place of the editor while the menu is still up.
+			tui.setFocus(prompt);
+			terminal.sendInput("x");
+			await renderAndFlush(tui, terminal);
+			assert.deepStrictEqual(overlay.inputs, ["x"]);
+			assert.deepStrictEqual(prompt.inputs, []);
+
+			handle.hide();
+			terminal.sendInput("y");
+			await renderAndFlush(tui, terminal);
+			assert.deepStrictEqual(prompt.inputs, ["y"]);
+			assert.deepStrictEqual(editor.inputs, []);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("lets input listeners see the modal as focused after focus theft", async () => {
+		const terminal = new VirtualTerminal(80, 24);
+		const tui = new TUI(terminal);
+		const editor = new RecordingComponent(["EDITOR"]);
+		const overlay = new RecordingComponent(["OVERLAY"]);
+		const seen: Array<Component | null> = [];
+		tui.addChild(new EmptyContent());
+		tui.setFocus(editor);
+		tui.addInputListener(() => {
+			seen.push(tui.getFocusedComponent());
+			return undefined;
+		});
+		tui.start();
+		try {
+			tui.showOverlay(overlay);
+			await renderAndFlush(tui, terminal);
+			tui.setFocus(editor);
+			// Listeners that act only while the editor has the keyboard (the stall bar takes
+			// Esc as "interrupt") must stand aside: this Esc is meant for the menu.
+			terminal.sendInput("\x1b");
+			await renderAndFlush(tui, terminal);
+			assert.deepStrictEqual(seen, [overlay]);
+			assert.deepStrictEqual(overlay.inputs, ["\x1b"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("respects an overlay that released the keyboard with unfocus()", async () => {
+		const terminal = new VirtualTerminal(80, 24);
+		const tui = new TUI(terminal);
+		const editor = new RecordingComponent(["EDITOR"]);
+		const overlay = new RecordingComponent(["OVERLAY"]);
+		tui.addChild(new EmptyContent());
+		tui.setFocus(editor);
+		tui.start();
+		try {
+			const handle = tui.showOverlay(overlay);
+			await renderAndFlush(tui, terminal);
+			handle.unfocus();
+			terminal.sendInput("a");
+			await renderAndFlush(tui, terminal);
+			assert.deepStrictEqual(editor.inputs, ["a"]);
+			assert.deepStrictEqual(overlay.inputs, []);
+
+			handle.focus();
+			terminal.sendInput("b");
+			await renderAndFlush(tui, terminal);
+			assert.deepStrictEqual(overlay.inputs, ["b"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("does not touch focus when no overlay is visible", async () => {
 		const terminal = new VirtualTerminal(80, 24);
 		const tui = new TUI(terminal);
