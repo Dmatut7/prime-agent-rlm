@@ -525,4 +525,48 @@ describe("stop target identity and convergence", () => {
 			entriesOf(report, "leftRunning").length;
 		expect(report.discovered).toBe(buckets);
 	}, 60_000);
+
+	it("sees an adopted worker whose socket still lives in the legacy $TMPDIR directory (R1 follow-up 2)", async () => {
+		// R1 review follow-up: after the stable-socket-dir move, a worker adopted from
+		// the old generation keeps its socket where it was born (a `prime-agent-<uid>`
+		// dir under $TMPDIR), while `scanSocketDir()` only reads the new stable dir.
+		// The stop plan must still see that worker, or an adopted worker becomes
+		// unstoppable. daemon-ps.ts builds worker targets from the descriptor's own
+		// socketPath ("whatever directory that socket ended up in"), so pin that with a
+		// live listener in a legacy-named directory and an orphans-only machine sweep
+		// (which never signals live targets): the worker has to be discovered, not
+		// invisible.
+		const socketDirectory = join(root, "sockets");
+		mkdirSync(socketDirectory, { recursive: true });
+		mkdirSync(defaultDaemonSocketDir(), { recursive: true });
+		const legacyDirectory = join(root, "prime-agent-501");
+		mkdirSync(legacyDirectory, { recursive: true });
+
+		const keptSocket = join(socketDirectory, "kept.sock");
+		const _kept = spawnSelfCleaningListener(keptSocket);
+		await waitForSocketFile(keptSocket);
+		const legacyWorkerSocket = join(legacyDirectory, "worker-12f042ee5718-aaaabbbbcccc.sock");
+		const legacyWorker = spawnSelfCleaningListener(legacyWorkerSocket);
+		await waitForSocketFile(legacyWorkerSocket);
+		writeWorkerDescriptor(
+			process.env[ENV_AGENT_DIR]!,
+			"r19-legacy-worker",
+			legacyWorker.pid!,
+			legacyWorkerSocket,
+			keptSocket,
+		);
+
+		const report = await runShutdown({ scope: { kind: "machine" }, orphansOnly: true });
+
+		const seen = [
+			...entriesOf(report, "stopped"),
+			...entriesOf(report, "skipped"),
+			...entriesOf(report, "leftRunning"),
+			...entriesOf(report, "failed"),
+		].find((entry) => entry.socketPath === normalizeSocketPath(legacyWorkerSocket));
+		expect(seen, JSON.stringify(report)).toBeDefined();
+		expect(seen?.pid).toBe(legacyWorker.pid);
+		// An orphans-only sweep must not have signalled the live worker.
+		expect(alive(legacyWorker.pid)).toBe(true);
+	}, 60_000);
 });
