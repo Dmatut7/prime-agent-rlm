@@ -1201,7 +1201,16 @@ export type LegacyDescriptorDirMigration = {
 	migrated: boolean;
 	legacyDir: string;
 	descriptorDir: string;
-	reason: "not-default-socket" | "no-legacy-dir" | "target-not-empty" | "already-migrated" | "renamed";
+	reason:
+		| "not-default-socket"
+		| "no-legacy-dir"
+		| "target-not-empty"
+		| "already-migrated"
+		| "renamed"
+		| "custom-descriptor-dir"
+		| "rename-failed";
+	/** For "rename-failed": the failing rename's errno code, when present. */
+	renameErrorCode?: string;
 };
 
 /**
@@ -1219,6 +1228,13 @@ export type LegacyDescriptorDirMigration = {
 export function migrateLegacyWorkerDescriptorDirOnDisk(options: {
 	agentDir: string;
 	socketPath: string;
+	/**
+	 * The caller's actual descriptor dir (supervisor: options.descriptorDir).
+	 * When it differs from the computed default, the caller pinned its own
+	 * layout and the migration would rename the legacy tree into a dir the
+	 * caller never reads.
+	 */
+	descriptorDir?: string;
 	rename?: (from: string, to: string) => void;
 	readEntries?: (dir: string) => string[];
 }): LegacyDescriptorDirMigration | undefined {
@@ -1231,6 +1247,9 @@ export function migrateLegacyWorkerDescriptorDirOnDisk(options: {
 		return { migrated: false, legacyDir: "", descriptorDir: "", reason: "not-default-socket" };
 	}
 	const descriptorDir = defaultWorkerDescriptorDir(options.agentDir, normalized);
+	if (options.descriptorDir !== undefined && options.descriptorDir !== descriptorDir) {
+		return { migrated: false, legacyDir: "", descriptorDir, reason: "custom-descriptor-dir" };
+	}
 	const legacyDir = defaultWorkerDescriptorDir(options.agentDir, legacyDefaultDaemonSocketPath());
 	if (legacyDir === descriptorDir) {
 		return { migrated: false, legacyDir, descriptorDir, reason: "already-migrated" };
@@ -1251,9 +1270,14 @@ export function migrateLegacyWorkerDescriptorDirOnDisk(options: {
 	}
 	try {
 		(options.rename ?? ((from: string, to: string) => renameSync(from, to)))(legacyDir, descriptorDir);
-	} catch {
+	} catch (error) {
 		// Best-effort: a failed rename leaves adoption degraded but startup sound.
-		return { migrated: false, legacyDir, descriptorDir, reason: "no-legacy-dir" };
+		// N7: a failed rename is its own reason (with the errno when the OS gives
+		// one) so the caller can log it; it was previously indistinguishable from
+		// "the legacy dir never existed", which silently swallowed EACCES/EXDEV.
+		const renameErrorCode = (error as { code?: unknown })?.code;
+		const renameCode = typeof renameErrorCode === "string" ? renameErrorCode : undefined;
+		return { migrated: false, legacyDir, descriptorDir, reason: "rename-failed", renameErrorCode: renameCode };
 	}
 	return { migrated: true, legacyDir, descriptorDir, reason: "renamed" };
 }
@@ -1825,10 +1849,23 @@ export class DaemonSupervisor {
 			return;
 		}
 		try {
-			const result = migrateLegacyWorkerDescriptorDirOnDisk({ agentDir, socketPath: this.socketPath });
+			const result = migrateLegacyWorkerDescriptorDirOnDisk({
+				agentDir,
+				socketPath: this.socketPath,
+				descriptorDir: this.descriptorDir,
+			});
 			if (result?.reason === "renamed") {
 				this.log(
 					`Migrated legacy worker descriptor dir for the stable socket path: ${result.legacyDir} -> ${result.descriptorDir}`,
+				);
+			}
+			if (result?.reason === "rename-failed") {
+				// N7: the rename failing (EACCES/EXDEV/ENOSPC...) must not be silent -
+				// adoption is degraded to the current generation and the operator
+				// needs the errno to tell "disk full" from "crossed devices".
+				this.logDegraded(
+					"legacy-descriptor-dir-rename-failed",
+					`Legacy worker descriptor dir rename failed (${result.renameErrorCode ?? "unknown errno"}): ${result.legacyDir} -> ${result.descriptorDir}; adoption falls back to the current generation`,
 				);
 			}
 		} catch (error) {
