@@ -213,6 +213,11 @@ describe("openai-completions enable_thinking guard", () => {
 					} else {
 						expectNoEnableThinking(params);
 					}
+					if (format === "zai" && request.name === "effort") {
+						expect(params.reasoning_effort, `${format} ${off} ${request.name}`).toBe("low");
+					} else if (format === "zai" || format === "qwen") {
+						expect("reasoning_effort" in params, `${format} ${off} ${request.name}`).toBe(false);
+					}
 				}
 			}
 		}
@@ -235,8 +240,8 @@ describe("openai-completions enable_thinking guard", () => {
 		await completeSimple(thinkingModel("zai", null), context, { apiKey: "test", reasoning: "off" });
 		const params = captured();
 		expect(params.enable_thinking).toBe(true);
-		// Known limitation, not part of this fix: zai never sends reasoning_effort.
-		expect("reasoning_effort" in params).toBe(false);
+		// The clamped tier (minimal) reaches the wire through the level map.
+		expect(params.reasoning_effort).toBe("low");
 	});
 
 	// #11 - the exact call shape refinement/auto-refine/branch/status use.
@@ -261,5 +266,61 @@ describe("openai-completions enable_thinking guard", () => {
 		expectNoEnableThinking(params);
 		expect(params.max_tokens).toBe(32_000);
 		expect(params.model).toBe(model.id);
+	});
+});
+
+/** glm-5.3 on bailian: thinking cannot be turned off, depth is reasoning_effort low/high/max. */
+function glm53(): Model<"openai-completions"> {
+	const model = thinkingModel("zai", null);
+	model.thinkingLevelMap = {
+		off: null,
+		minimal: "low",
+		low: "low",
+		medium: "high",
+		high: "high",
+		xhigh: "max",
+		max: "max",
+	};
+	return model;
+}
+
+describe("openai-completions zai reasoning_effort", () => {
+	beforeEach(() => {
+		mockState.lastParams = undefined;
+	});
+
+	// Without the effort field every configured level reached the endpoint as the same
+	// request and thought at its default depth (max).
+	it("sends each configured level through the level map", async () => {
+		const expected = { minimal: "low", low: "low", medium: "high", high: "high", xhigh: "max", max: "max" } as const;
+		const levels = Object.keys(expected) as Array<keyof typeof expected>;
+		expect(levels.length).toBeGreaterThan(0);
+		for (const level of levels) {
+			mockState.lastParams = undefined;
+			await completeSimple(glm53(), context, { apiKey: "test", reasoning: level });
+			const params = captured();
+			expect(params.enable_thinking, level).toBe(true);
+			expect(params.reasoning_effort, level).toBe(expected[level]);
+		}
+	});
+
+	it("keeps api.z.ai, which does not declare the field, on the toggle alone", async () => {
+		const model = glm53();
+		model.provider = "zai";
+		model.baseUrl = "https://api.z.ai/api/paas/v4";
+		model.compat = { thinkingFormat: "zai" };
+		mockState.lastParams = undefined;
+		await completeSimple(model, context, { apiKey: "test", reasoning: "high" });
+		const params = captured();
+		expect(params.enable_thinking).toBe(true);
+		expect("reasoning_effort" in params).toBe(false);
+	});
+
+	it("leaves the qwen format on the toggle alone", async () => {
+		mockState.lastParams = undefined;
+		await completeSimple(thinkingModel("qwen", null), context, { apiKey: "test", reasoning: "high" });
+		const params = captured();
+		expect(params.enable_thinking).toBe(true);
+		expect("reasoning_effort" in params).toBe(false);
 	});
 });

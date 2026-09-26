@@ -923,13 +923,20 @@ function buildParams(
 	// thinking on, so the parameter has to be omitted instead. Priority: an explicit level or
 	// reasoningEnabled === true turns thinking on; otherwise a model that can disable thinking
 	// gets the off signal (unchanged behaviour) and a model that cannot gets no parameter at all.
-	// Known limitation, deliberately out of scope: zai/qwen never send reasoning_effort because
-	// the generic else-if below is short-circuited, so the level itself is lost on the wire.
+	// Known limitation: the qwen format never sends reasoning_effort, so the level itself is lost
+	// on the wire there.
 	const wantThinking = options?.reasoningEffort !== undefined || options?.reasoningEnabled === true;
 	const canSendThinkingToggle = !modelCannotDisableThinking(model);
 	if (compat.thinkingFormat === "zai" && model.reasoning) {
 		if (wantThinking || canSendThinkingToggle) {
 			(params as any).enable_thinking = wantThinking;
+		}
+		// The toggle alone leaves the depth at the endpoint default (max for glm-5.3 on bailian),
+		// so every configured level thought the same. Only a model that declares the parameter
+		// gets it; api.z.ai is detected with supportsReasoningEffort false.
+		if (options?.reasoningEffort && compat.supportsReasoningEffort) {
+			(params as any).reasoning_effort =
+				model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort;
 		}
 	} else if (compat.thinkingFormat === "qwen" && model.reasoning) {
 		if (wantThinking || canSendThinkingToggle) {
