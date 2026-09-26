@@ -1,21 +1,29 @@
 import { describe, expect, it } from "vitest";
-import { pruneStrayReasoningTags, stripStrayReasoningTags } from "../src/providers/stray-reasoning-tags.js";
+import { scrubStrayReasoningTags, stripStrayReasoningTags } from "../src/providers/stray-reasoning-tags.js";
 
 describe("stripStrayReasoningTags", () => {
-	it("removes a block that is only a leaked closing tag", () => {
-		expect(stripStrayReasoningTags("\n</think>\n\n").trim()).toBe("");
+	it("empties a text that is only a leaked closing tag", () => {
+		expect(stripStrayReasoningTags("\n</think>\n\n")).toBe("");
+		expect(stripStrayReasoningTags("</think>")).toBe("");
 	});
 
-	it("removes the think variant too", () => {
-		expect(stripStrayReasoningTags("\n</think>\n").trim()).toBe("");
-	});
-
-	it("drops a lone tag line but keeps the prose around it", () => {
+	it("drops a lone closing-tag line and keeps the prose around it", () => {
 		expect(stripStrayReasoningTags("answer one\n</think>\nanswer two")).toBe("answer one\nanswer two");
 	});
 
-	it("removes a leaked open/close pair spanning lines", () => {
-		expect(stripStrayReasoningTags("<think>\n</think>\nreal").trim()).toBe("real");
+	it("keeps the answer in front of a trailing leaked tag", () => {
+		expect(stripStrayReasoningTags("两路都在跑，你不用动。\n</think>\n\n")).toBe("两路都在跑，你不用动。\n\n");
+	});
+
+	it("drops an empty open/close pair", () => {
+		expect(stripStrayReasoningTags("<think>\n</think>\nreal")).toBe("real");
+	});
+
+	it("keeps the delimiters of reasoning streamed inline", () => {
+		const inline = "<think>\nplan the fix first\n</think>\n\nThe fix is to retry.";
+		expect(stripStrayReasoningTags(inline)).toBe(inline);
+		const unterminated = "<think>\nstill working it out";
+		expect(stripStrayReasoningTags(unterminated)).toBe(unterminated);
 	});
 
 	it("keeps a tag embedded in prose", () => {
@@ -29,22 +37,22 @@ describe("stripStrayReasoningTags", () => {
 	});
 });
 
-describe("pruneStrayReasoningTags", () => {
-	it("drops vacated text blocks and keeps the rest in order", () => {
+describe("scrubStrayReasoningTags", () => {
+	it("blanks a tag-only block in place so later blocks keep their index", () => {
 		const blocks: Array<{ type: string; text?: string }> = [
-			{ type: "thinking", thinking: "kept" } as unknown as { type: string; text?: string },
+			{ type: "thinking" },
+			{ type: "toolCall" },
 			{ type: "text", text: "\n</think>\n\n" },
 			{ type: "toolCall" },
-			{ type: "text", text: "real answer" },
 		];
-		pruneStrayReasoningTags(blocks);
-		expect(blocks.map((b) => b.type)).toEqual(["thinking", "toolCall", "text"]);
-		expect(blocks[2].text).toBe("real answer");
+		scrubStrayReasoningTags(blocks);
+		expect(blocks.map((block) => block.type)).toEqual(["thinking", "toolCall", "text", "toolCall"]);
+		expect(blocks[2].text).toBe("");
 	});
 
-	it("cleans a tag line inside a surviving block", () => {
+	it("cleans a tag line inside a block that has other text", () => {
 		const blocks = [{ type: "text", text: "head\n</think>\ntail" }];
-		pruneStrayReasoningTags(blocks);
+		scrubStrayReasoningTags(blocks);
 		expect(blocks[0].text).toBe("head\ntail");
 	});
 });

@@ -1,48 +1,41 @@
 /**
- * Stray reasoning-tag scrubbing for providers whose models leak thinking
- * markup into the content stream.
+ * Qwen and GLM models on the bailian compatible endpoint sometimes emit the reasoning
+ * closing tag as ordinary content between tool calls, and it shows up as a bare
+ * `</think>` line in the chat. The tag carries nothing the thinking block does not
+ * already hold, so lines holding only a reasoning tag are dropped at stream end.
  *
- * Qwen-family models with thinking enabled occasionally emit the reasoning
- * closing tag (`</think>` / `</think>`) as ordinary content between tool
- * calls; the tag then renders as a bare line in the transcript (observed
- * 2026-09-26, qwen3.8-max over the DashScope native protocol: 28 text blocks
- * consisting of nothing else). The tag carries no information the thinking
- * block does not already hold, so it is dropped at stream finalization.
- *
- * Only tag occurrences that sit alone on their line are removed: a tag
- * embedded in prose or in a quoted snippet survives, and a text block that
- * consisted of nothing but leaked tags is dropped entirely.
+ * A text block that carries reasoning after an opening tag is left alone: some
+ * providers stream their thinking inline as `<think>...</think>`, and without the
+ * tags that reasoning would read as part of the answer.
  */
 
-/** A reasoning open/close tag occupying its own line (or the whole text). */
-const STRAY_REASONING_TAG_LINE = /(^|\n)[ \t]*<\/?(?:think|think)>[ \t]*(?:\r?\n|$)/g;
+/** An opening tag followed by reasoning, i.e. thinking streamed inline in the content. */
+const INLINE_REASONING = /<think>\s*(?!<\/think>)\S/;
 
-/** Remove lone-line reasoning tags; idempotent and stable under repetition. */
+function isReasoningTagLine(line: string): boolean {
+	const trimmed = line.trim();
+	return trimmed === "</think>" || trimmed === "<think>";
+}
+
+/** Drop lines that hold nothing but a reasoning tag; a text left with only whitespace becomes "". */
 export function stripStrayReasoningTags(text: string): string {
-	let cleaned = text;
-	for (let pass = 0; pass < 4; pass++) {
-		const next = cleaned.replace(STRAY_REASONING_TAG_LINE, "$1");
-		if (next === cleaned) return next;
-		cleaned = next;
-	}
-	return cleaned;
+	if (!text.includes("think>") || INLINE_REASONING.test(text)) return text;
+	const lines = text.split("\n");
+	const kept = lines.filter((line) => !isReasoningTagLine(line));
+	if (kept.length === lines.length) return text;
+	const cleaned = kept.join("\n");
+	return cleaned.trim() === "" ? "" : cleaned;
 }
 
 /**
- * Scrub leaked reasoning tags from a finalized block list, dropping text
- * blocks that consisted of nothing else. Iterated backwards so splicing a
- * vacated block keeps the indices of the blocks still to visit valid.
+ * Scrub text blocks in place. A block emptied this way stays in the list as "": its
+ * start and delta events already went out with its content index, so removing it
+ * would shift the index of every later block's end event. Empty text blocks are
+ * skipped when rendering and when replaying history.
  */
-export function pruneStrayReasoningTags(blocks: Array<{ type: string; text?: string }>): void {
-	for (let i = blocks.length - 1; i >= 0; i--) {
-		const block = blocks[i];
+export function scrubStrayReasoningTags(blocks: ReadonlyArray<{ type: string; text?: string }>): void {
+	for (const block of blocks) {
 		if (block.type !== "text" || typeof block.text !== "string") continue;
-		const cleaned = stripStrayReasoningTags(block.text);
-		if (cleaned === block.text) continue;
-		if (cleaned.trim() === "") {
-			blocks.splice(i, 1);
-			continue;
-		}
-		block.text = cleaned;
+		block.text = stripStrayReasoningTags(block.text);
 	}
 }
