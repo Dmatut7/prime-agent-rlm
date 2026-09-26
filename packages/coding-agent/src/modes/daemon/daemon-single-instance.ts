@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { createConnection } from "node:net";
+import { DaemonClient } from "./daemon-client.js";
 import { DaemonSocketInUseError, isDaemonSocketListening, normalizeSocketPath } from "./daemon-socket.js";
 import {
 	DaemonAgentDirAlreadyRunningError,
@@ -121,6 +122,94 @@ export function isDaemonSingleInstanceConflict(error: unknown, socketPath?: stri
 	// The `file` check keeps an ELOCKED from an unrelated lock from being
 	// misread as this socket's conflict.
 	return isSocketPathLeaseHeld(error, socketPath);
+}
+
+/**
+ * N2 (R1): an accepting listener is only presumed "our daemon" once it speaks
+ * the daemon hello. A foreign process (or a wedged half-dead worker) that
+ * merely accepts on the socket path would otherwise park the real supervisor
+ * in standby forever, with no owner record to wait on and no startup failure
+ * line — quieter than the loud failure this path replaced. Returns:
+ * - "daemon" — a recognizable daemon_hello arrived within the budget;
+ * - "booting" — the connection was accepted but no hello yet (a real daemon
+ *   accepts before startup completes; keep the conservative "alive" reading);
+ * - "unrecognized" — connected, but a hello timeout/parse says this is not a
+ *   Prime Agent daemon.
+ * Tests inject `openClient` so no real daemon is needed.
+ */
+export type DaemonSocketOccupant =
+	| { kind: "daemon" }
+	| { kind: "booting" }
+	| { kind: "unrecognized" }
+	| { kind: "absent" };
+
+export interface DaemonOccupantHelloWaiter {
+	waitForHello: (timeoutMs: number) => Promise<unknown>;
+	close: () => void;
+}
+
+export async function probeDaemonSocketOccupantIdentity(
+	socketPath: string,
+	options: {
+		helloTimeoutMs?: number;
+		connectTimeoutMs?: number;
+		/** Test seam: opens and connects a hello-waiter, or rejects when connect fails. */
+		openClient?: (socketPath: string, connectTimeoutMs: number) => Promise<DaemonOccupantHelloWaiter>;
+	} = {},
+): Promise<DaemonSocketOccupant> {
+	const helloTimeoutMs = options.helloTimeoutMs ?? 2000;
+	const connectTimeoutMs = options.connectTimeoutMs ?? 500;
+	const openClient =
+		options.openClient ??
+		(async (path: string, timeoutMs: number) => {
+			const client = new DaemonClient(path);
+			await client.connect(timeoutMs);
+			return {
+				waitForHello: (waitMs: number) => client.waitForHello(waitMs),
+				close: () => client.close(),
+			};
+		});
+	let client: DaemonOccupantHelloWaiter | undefined;
+	try {
+		client = await openClient(socketPath, connectTimeoutMs);
+		const hello = await client.waitForHello(helloTimeoutMs);
+		if (isDaemonHello(hello)) {
+			return { kind: "daemon" };
+		}
+		return { kind: "unrecognized" };
+	} catch (error) {
+		// A connect that never lands is "absent" (the occupancy probe already
+		// said listening; the listener may have just closed). A hello that times
+		// out is a connected listener that did not greet: unrecognized unless the
+		// message says the peer accepted but is still starting (the supervisor
+		// accepts connections before startup completes — that "booting" reading
+		// is what keeps this from racing a real daemon into a duplicate).
+		const message = error instanceof Error ? error.message : String(error);
+		if (/Timed out .* connecting/.test(message)) {
+			return { kind: "absent" };
+		}
+		if (/not connected/.test(message)) {
+			return { kind: "absent" };
+		}
+		if (/Timed out .* handshake/.test(message)) {
+			return { kind: "booting" };
+		}
+		return { kind: "unrecognized" };
+	} finally {
+		client?.close();
+	}
+}
+
+function isDaemonHello(value: unknown): value is { type: "daemon_hello"; protocol: { version: number } } {
+	if (typeof value !== "object" || value === null) {
+		return false;
+	}
+	const candidate = value as { type?: unknown; protocol?: unknown };
+	if (candidate.type !== "daemon_hello") {
+		return false;
+	}
+	const protocol = candidate.protocol as { version?: unknown } | undefined;
+	return typeof protocol?.version === "number";
 }
 
 function isSocketPathLeaseHeld(error: unknown, socketPath?: string): boolean {

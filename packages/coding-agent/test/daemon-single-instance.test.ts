@@ -9,6 +9,7 @@ import {
 	type DaemonStandbyOwner,
 	isDaemonSingleInstanceConflict,
 	judgeDaemonSocketOccupancy,
+	probeDaemonSocketOccupantIdentity,
 	runDaemonStandby,
 } from "../src/modes/daemon/daemon-single-instance.js";
 import {
@@ -336,5 +337,68 @@ describe("runDaemonStandby (downgrade to client watcher)", () => {
 			onOwnerGone: () => gone.push("gone"),
 		});
 		expect(gone).toEqual(["gone"]);
+	});
+});
+
+describe("probeDaemonSocketOccupantIdentity (N2 occupant identity check)", () => {
+	it("recognizes a daemon hello", async () => {
+		const occupant = await probeDaemonSocketOccupantIdentity("/tmp/w2.sock", {
+			helloTimeoutMs: 10,
+			openClient: async () => ({
+				waitForHello: () => Promise.resolve({ type: "daemon_hello", protocol: { version: 1 } }),
+				close: () => {},
+			}),
+		});
+		expect(occupant).toEqual({ kind: "daemon" });
+	});
+
+	it("treats a connect that never lands as absent", async () => {
+		const occupant = await probeDaemonSocketOccupantIdentity("/tmp/w2.sock", {
+			helloTimeoutMs: 10,
+			openClient: () =>
+				Promise.reject(
+					new Error("Timed out after 500ms connecting to the Prime Agent daemon. Socket: /tmp/w2.sock."),
+				),
+		});
+		expect(occupant).toEqual({ kind: "absent" });
+	});
+
+	it("treats a hello timeout as booting (accepted, not yet greeting)", async () => {
+		const occupant = await probeDaemonSocketOccupantIdentity("/tmp/w2.sock", {
+			helloTimeoutMs: 10,
+			openClient: async () => ({
+				waitForHello: () =>
+					Promise.reject(
+						new Error("Timed out after 10ms waiting for the Prime Agent daemon handshake. Socket: /tmp/w2.sock."),
+					),
+				close: () => {},
+			}),
+		});
+		expect(occupant).toEqual({ kind: "booting" });
+	});
+
+	it("treats a connect timeout as absent, not unrecognized", async () => {
+		const occupant = await probeDaemonSocketOccupantIdentity("/tmp/w2.sock", {
+			helloTimeoutMs: 10,
+			openClient: async () => ({
+				waitForHello: () =>
+					Promise.reject(
+						new Error("Timed out after 500ms connecting to the Prime Agent daemon. Socket: /tmp/w2.sock."),
+					),
+				close: () => {},
+			}),
+		});
+		expect(occupant).toEqual({ kind: "absent" });
+	});
+
+	it("treats garbage on the wire as unrecognized", async () => {
+		const occupant = await probeDaemonSocketOccupantIdentity("/tmp/w2.sock", {
+			helloTimeoutMs: 10,
+			openClient: async () => ({
+				waitForHello: () => Promise.resolve({ type: "not_a_hello" }),
+				close: () => {},
+			}),
+		});
+		expect(occupant).toEqual({ kind: "unrecognized" });
 	});
 });

@@ -157,6 +157,7 @@ import {
 	type DaemonStandbyOwner,
 	isDaemonSingleInstanceConflict,
 	judgeDaemonSocketOccupancy,
+	probeDaemonSocketOccupantIdentity,
 	runDaemonStandby,
 } from "./daemon-single-instance.js";
 import {
@@ -1435,6 +1436,20 @@ export async function runDaemonSupervisorMode(options: DaemonSupervisorOptions):
 	const socketPath = normalizeSocketPath(options.socketPath ?? defaultDaemonSocketPath());
 	const occupancy = await judgeDaemonSocketOccupancy(socketPath);
 	if (occupancy.kind === "listening") {
+		// N2 (R1): "someone accepts" is not yet "our daemon". A foreign listener
+		// would otherwise hold the real supervisor in standby forever with no
+		// owner record to wait on. Confirm identity with a bounded hello ladder
+		// before downgrading: a real daemon sends daemon_hello shortly after it
+		// starts accepting (hello is gated on supervisor readiness, not worker
+		// adoption), so a listener that accepts but never greets within the
+		// whole ladder is treated as unrecognized and fails loudly (the pre-W2
+		// behavior) instead of a silent, permanent standby.
+		const unrecognized = await waitForRecognizedDaemonOccupant(socketPath);
+		if (unrecognized) {
+			throw new Error(
+				`Daemon socket ${socketPath} is occupied by a listener that is not a recognizable Prime Agent daemon; refusing to stand by for an unknown occupant. Free the socket path and relaunch.`,
+			);
+		}
 		await runDaemonStandby({ socketPath });
 		return new Promise(() => {});
 	}
@@ -1450,6 +1465,36 @@ export async function runDaemonSupervisorMode(options: DaemonSupervisorOptions):
 		return new Promise(() => {});
 	}
 	return new Promise(() => {});
+}
+
+/**
+ * N2 (R1): bounded identity ladder for an accepting socket occupant. Returns
+ * true when the occupant is still unrecognizable after every rung (accepts
+ * connections but never speaks a daemon hello): such a listener is not a
+ * Prime Agent daemon this process should stand by for. A daemon in startup
+ * greets within the first rungs, so the ladder is short on the healthy path.
+ */
+async function waitForRecognizedDaemonOccupant(
+	socketPath: string,
+	options: { attempts?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<boolean> {
+	const attempts = options.attempts ?? 3;
+	const intervalMs = options.intervalMs ?? 1000;
+	const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+	for (let attempt = 1; attempt <= attempts; attempt++) {
+		const occupant = await probeDaemonSocketOccupantIdentity(socketPath);
+		if (occupant.kind === "daemon") {
+			return false;
+		}
+		if (occupant.kind === "unrecognized") {
+			return true;
+		}
+		// "booting": accepted but no hello yet — retry before concluding.
+		if (attempt < attempts) {
+			await sleep(intervalMs);
+		}
+	}
+	return true;
 }
 
 function daemonStandbyOwnerFromError(error: unknown): DaemonStandbyOwner | undefined {
