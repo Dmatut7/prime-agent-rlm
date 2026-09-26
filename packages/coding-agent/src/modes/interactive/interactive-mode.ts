@@ -82,7 +82,7 @@ import {
 	uploadAllAgentTraces,
 } from "../../core/agent-traces.js";
 import { isNoModelsAvailableMessage } from "../../core/auth-guidance.js";
-import { compactionThresholdTokens } from "../../core/compaction/compaction.js";
+import { type CompactionWindowLimits, compactionThresholdTokens } from "../../core/compaction/compaction.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
 import {
 	type AgentCronJob,
@@ -370,6 +370,16 @@ interface PendingToolCallRenderInput {
 const HEARTBEAT_LEGACY_PROMPT_MIN_TOLERANCE_MS = 15_000;
 const HEARTBEAT_LEGACY_PROMPT_MAX_TOLERANCE_MS = 120_000;
 const MODEL_CATALOG_REFRESH_TTL_MS = 60_000;
+
+/**
+ * Compaction window limits for a model: identity for the measured-input-limit
+ * table plus the model's config-declared rate-quota heuristic (models.json
+ * `usageWindowTokens`), so the footer's threshold readout matches the
+ * session-side trigger exactly.
+ */
+function compactionLimitsForModel(model: Model<any>): CompactionWindowLimits {
+	return { provider: model.provider, modelId: model.id, usageWindowTokens: model.usageWindowTokens };
+}
 /**
  * Frozen into the session's last frame when the terminal is handed back to the agents
  * view (F5). That view rebuilds its catalogs before it paints anything, so without this
@@ -3262,7 +3272,7 @@ export class InteractiveMode {
 				? compactionThresholdTokens(
 						windowTokens,
 						compactionSettings,
-						model ? { provider: model.provider, modelId: model.id } : undefined,
+						model ? compactionLimitsForModel(model) : undefined,
 					)
 				: 0;
 		const snapshot: FooterTelemetrySnapshot = {
@@ -3271,6 +3281,7 @@ export class InteractiveMode {
 			contextTokens: usage?.tokens ?? undefined,
 			contextWindow: usage?.contextWindow,
 			compactionThresholdTokens: thresholdTokens,
+			usageWindowTokens: model?.usageWindowTokens,
 		};
 		return { mode, snapshot };
 	}

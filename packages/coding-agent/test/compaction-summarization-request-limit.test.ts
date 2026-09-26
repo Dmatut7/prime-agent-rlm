@@ -464,6 +464,30 @@ describe("summarization request stays inside the provider's real input limit", (
 		expect(recorded[0].tokens).toBeLessThanOrEqual(HARD_INPUT_LIMIT);
 	});
 
+	it("clamps a branch summary to the model's usageWindowTokens rate-quota heuristic", async () => {
+		// R1-M1: generateBranchSummary's budget must pass the model's
+		// usageWindowTokens, like the compaction path does. With a 12_000 cap on a
+		// 20_000 declared window, the provider below rejects anything above the cap
+		// minus the reserve; the budget used to be computed against the full 20_000
+		// and the request failed wholesale (the branch path has no input-length retry).
+		const cap = 12_000;
+		const { recorded } = createLimitProvider({ hardInputLimit: cap - RESERVE_TOKENS, perMessageTokens: 4 });
+		const model = createModel({ contextWindow: CONTEXT_WINDOW });
+		model.usageWindowTokens = cap;
+
+		const result = await generateBranchSummary(branchEntries(40, false), {
+			model,
+			apiKey: "test-key",
+			signal: new AbortController().signal,
+			reserveTokens: RESERVE_TOKENS,
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.summary).toContain("Summarized");
+		expect(recorded).toHaveLength(1);
+		expect(recorded[0].tokens).toBeLessThanOrEqual(cap - RESERVE_TOKENS);
+	});
+
 	it("keeps a branch summary inside the limit when the provider counts denser than chars/4", async () => {
 		const { recorded } = createLimitProvider({
 			hardInputLimit: HARD_INPUT_LIMIT,

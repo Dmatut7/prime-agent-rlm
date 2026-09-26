@@ -168,6 +168,8 @@ const ModelDefinitionSchema = Type.Object({
 	),
 	contextWindow: Type.Optional(Type.Number()),
 	maxTokens: Type.Optional(Type.Number()),
+	/** Optional rate-quota heuristic in the provider's token caliber; absent = contextWindow. See Model.usageWindowTokens. */
+	usageWindowTokens: Type.Optional(Type.Number()),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
 });
@@ -187,6 +189,8 @@ const ModelOverrideSchema = Type.Object({
 	),
 	contextWindow: Type.Optional(Type.Number()),
 	maxTokens: Type.Optional(Type.Number()),
+	/** Optional rate-quota heuristic in the provider's token caliber; absent = contextWindow. See Model.usageWindowTokens. */
+	usageWindowTokens: Type.Optional(Type.Number()),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
 });
@@ -413,6 +417,10 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	if (override.input !== undefined) result.input = override.input as ("text" | "image")[];
 	if (override.contextWindow !== undefined) result.contextWindow = override.contextWindow;
 	if (override.maxTokens !== undefined) result.maxTokens = override.maxTokens;
+	// A value sets (or tightens) the serving-window cap. There is no way to clear
+	// an inherited one from models.json: undefined leaves the model's own value
+	// in place, so an override can only tighten, never remove.
+	if (override.usageWindowTokens !== undefined) result.usageWindowTokens = override.usageWindowTokens;
 
 	if (override.cost) {
 		result.cost = {
@@ -922,8 +930,43 @@ export class ModelRegistry {
 				if (!modelDef.id) throw new Error(`Provider ${providerName}: model missing "id"`);
 				if (modelDef.contextWindow !== undefined && modelDef.contextWindow <= 0)
 					throw new Error(`Provider ${providerName}, model ${modelDef.id}: invalid contextWindow`);
+				if (modelDef.usageWindowTokens !== undefined && modelDef.usageWindowTokens <= 0)
+					throw new Error(
+						`Provider ${providerName}, model ${modelDef.id}: invalid usageWindowTokens (must be > 0 or absent)`,
+					);
+				// Compare against the effective window, not only a declared one: a model
+				// that omits contextWindow gets the 128000 default in parseModels, and a
+				// cap above that default is silently min-clamped away at runtime - a typo
+				// then looks configured but does nothing (R1-M4).
+				if (
+					modelDef.usageWindowTokens !== undefined &&
+					modelDef.usageWindowTokens > (modelDef.contextWindow ?? 128000)
+				)
+					throw new Error(
+						`Provider ${providerName}, model ${modelDef.id}: usageWindowTokens (${modelDef.usageWindowTokens}) exceeds contextWindow (${modelDef.contextWindow ?? 128000}) - the rate-quota heuristic can only tighten the window`,
+					);
 				if (modelDef.maxTokens !== undefined && modelDef.maxTokens <= 0)
 					throw new Error(`Provider ${providerName}, model ${modelDef.id}: invalid maxTokens`);
+			}
+
+			// The same contract on the override path (R1-M4): a value above the target
+			// model's window would widen instead of tighten, and a non-positive one is a
+			// typo. Built-in models can only be capped through modelOverrides, so this
+			// is the only check that path ever gets; a definition and an override on the
+			// same id are validated against the same numbers.
+			for (const [modelId, modelOverride] of Object.entries(providerConfig.modelOverrides ?? {})) {
+				if (modelOverride.usageWindowTokens === undefined) continue;
+				const declaredContextWindow =
+					models.find((model) => model.id === modelId)?.contextWindow ??
+					getModels(providerName as KnownProvider).find((model) => model.id === modelId)?.contextWindow;
+				if (modelOverride.usageWindowTokens <= 0)
+					throw new Error(
+						`Provider ${providerName}, model ${modelId}: invalid usageWindowTokens (must be > 0 or absent)`,
+					);
+				if (declaredContextWindow !== undefined && modelOverride.usageWindowTokens > declaredContextWindow)
+					throw new Error(
+						`Provider ${providerName}, model ${modelId}: usageWindowTokens (${modelOverride.usageWindowTokens}) exceeds contextWindow (${declaredContextWindow}) - the rate-quota heuristic can only tighten the window`,
+					);
 			}
 		}
 	}
@@ -972,6 +1015,7 @@ export class ModelRegistry {
 					cost: modelDef.cost ?? defaultCost,
 					contextWindow: modelDef.contextWindow ?? 128000,
 					maxTokens: modelDef.maxTokens ?? 16384,
+					usageWindowTokens: modelDef.usageWindowTokens,
 					headers: undefined,
 					compat,
 				} as Model<Api>);
@@ -2032,6 +2076,7 @@ export class ModelRegistry {
 					cost: modelDef.cost,
 					contextWindow: modelDef.contextWindow,
 					maxTokens: modelDef.maxTokens,
+					usageWindowTokens: modelDef.usageWindowTokens,
 					headers: undefined,
 					compat: modelDef.compat,
 				} as Model<Api>);
@@ -2078,6 +2123,8 @@ export interface ProviderConfigInput {
 		cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 		contextWindow: number;
 		maxTokens: number;
+		/** Optional rate-quota heuristic in the provider's token caliber; absent = contextWindow. */
+		usageWindowTokens?: number;
 		headers?: Record<string, string>;
 		compat?: Model<Api>["compat"];
 	}>;

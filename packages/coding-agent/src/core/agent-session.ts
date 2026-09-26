@@ -303,6 +303,7 @@ import {
 	type RlmChildFailureDetails,
 	THINKING_LEVEL_CLAMPED_CUSTOM_TYPE,
 } from "./messages.js";
+import { effectiveInputLimitTokens } from "./model-input-limits.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { findExactModelReferenceMatch } from "./model-resolver.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV, readActiveOrphanProcesses } from "./orphan-process-journal.js";
@@ -2573,6 +2574,8 @@ export class AgentSession {
 	 * Retry once the branch grows by a few entries or the model changes.
 	 */
 	private _thresholdCompactionCooldown: { branchEntryCount: number; modelKey: string } | undefined;
+	/** One-shot guard for the R1-M5 no-threshold warning; see _checkCompaction. */
+	private _warnedNoThresholdCompaction = false;
 	private _pendingRequestedCompaction: { customInstructions?: string } | undefined;
 	private _pendingRequestedRefine: { instructions?: string; global?: boolean } | undefined;
 
@@ -4267,7 +4270,17 @@ export class AgentSession {
 		if (!route || route.handedBack || !serving || !route.anchor || !messages.includes(route.anchor)) {
 			return messages;
 		}
-		const trimmed = trimContextForImageModel(messages, route.anchor, serving.contextWindow);
+		// Trim against the image model's effective input limit (measured table,
+		// declared window, rate-quota heuristic), not its declared window alone:
+		// a routed model with a cap must fit the routed request under that cap too
+		// (R1-M7).
+		const servingInputLimit = effectiveInputLimitTokens(
+			serving.contextWindow,
+			serving.provider,
+			serving.id,
+			serving.usageWindowTokens,
+		);
+		const trimmed = trimContextForImageModel(messages, route.anchor, servingInputLimit || serving.contextWindow);
 		const brief = trimmed ? `${IMAGE_ROUTE_BRIEF}\n${IMAGE_ROUTE_TRIMMED_NOTE}` : IMAGE_ROUTE_BRIEF;
 		return withRequestNote(trimmed ?? messages, brief);
 	}
@@ -5664,10 +5677,18 @@ export class AgentSession {
 		switch (type) {
 			case "compact.status": {
 				const usage = this.getContextUsage();
+				// The cap and the threshold it produces are part of the answer: a
+				// subagent reading "13%" must be able to see that its capped
+				// threshold fires at 14% (R1-M7).
+				const compactionSettings = this.settingsManager.getCompactionSettings();
 				return {
 					tokens: usage?.tokens ?? null,
 					context_window: usage?.contextWindow ?? null,
 					percent: usage?.percent ?? null,
+					usage_window_tokens: this.model?.usageWindowTokens ?? null,
+					compaction_threshold_tokens: usage?.contextWindow
+						? compactionThresholdTokens(usage.contextWindow, compactionSettings, this._compactionWindowLimits())
+						: null,
 					scheduled: this._pendingRequestedCompaction !== undefined,
 				};
 			}
@@ -13582,10 +13603,16 @@ export class AgentSession {
 		// resulting entry still attaches to the branch it summarized.
 		const compactionLeafId = this.sessionManager.getLeafId();
 
-		const preparation = prepareCompaction(pathEntries, settings, model.contextWindow, {
-			provider: model.provider,
-			modelId: model.id,
-		});
+		// Same limits shape as the trigger and the compact.run precheck, so the
+		// capKeepRecentTokens clamp below sees the same (possibly capped) base the
+		// threshold uses: an uncapped keepRecent above a capped threshold is the
+		// "re-fire every turn" mode that function's doc warns about (R1-M2).
+		const preparation = prepareCompaction(
+			pathEntries,
+			settings,
+			model.contextWindow,
+			this._compactionWindowLimits() ?? { provider: model.provider, modelId: model.id },
+		);
 		if (!preparation) {
 			const lastEntry = pathEntries[pathEntries.length - 1];
 			if (lastEntry?.type === "compaction") {
@@ -15147,11 +15174,19 @@ export class AgentSession {
 
 	/**
 	 * Model identity for the compaction trigger: the declared window clamped to the
-	 * provider's measured input limit, so a catalog entry that over-declares (1048576
-	 * declared, 1000000 accepted) cannot push the trigger past the wall.
+	 * provider's measured input limit and to the model's config-declared
+	 * serving-window cap (`usageWindowTokens`), whichever is lower - so a catalog
+	 * entry that over-declares (1048576 declared, 1000000 accepted) or a
+	 * rate-quota heuristic set below both cannot push the trigger past the wall.
 	 */
 	private _compactionWindowLimits(): CompactionWindowLimits | undefined {
-		return this.model ? { provider: this.model.provider, modelId: this.model.id } : undefined;
+		return this.model
+			? {
+					provider: this.model.provider,
+					modelId: this.model.id,
+					usageWindowTokens: this.model.usageWindowTokens,
+				}
+			: undefined;
 	}
 
 	private async _checkCompaction(
@@ -15249,6 +15284,20 @@ export class AgentSession {
 		const contextTokens = this._getThresholdContextTokens(assistantMessage, compactionTimestamp);
 		if (contextTokens === undefined) return false;
 		const sessionWindow = this._sessionContextWindow();
+		// R1-M5: reserveTokens consuming the whole capped base stands threshold
+		// compaction down silently - say so once, because a usageWindowTokens typo
+		// (20000 meant as 200000) lands exactly in this no-threshold zone.
+		if (settings.enabled && this.model?.usageWindowTokens !== undefined) {
+			const thresholdNow = compactionThresholdTokens(sessionWindow, settings, this._compactionWindowLimits());
+			if (thresholdNow <= 0 && !this._warnedNoThresholdCompaction) {
+				this._warnedNoThresholdCompaction = true;
+				sessionLog.warn("threshold compaction stands down: reserveTokens consumes the whole capped trigger base", {
+					sessionId: this.sessionId,
+					usageWindowTokens: this.model.usageWindowTokens,
+					reserveTokens: settings.reserveTokens,
+				});
+			}
+		}
 		if (shouldCompact(contextTokens, sessionWindow, settings, this._compactionWindowLimits())) {
 			if (this._isThresholdCompactionCoolingDown(sessionWindow)) return false;
 			if (queueAutonomousContinuation && this._queueGoalContinuationForThresholdCompaction(assistantMessage)) {
@@ -20237,7 +20286,17 @@ export class AgentSession {
 			}
 			if (options.otherProviderThan !== undefined && candidate.provider === options.otherProviderThan) continue;
 			if (needsImages && !candidate.input.includes("image")) continue;
-			if (candidate.contextWindow > 0 && contextTokens > candidate.contextWindow * 0.9) continue;
+			// Compare against the candidate's effective input limit, not its
+			// declared window: a 1M-declared candidate with a 200k rate-quota
+			// heuristic would otherwise be picked at 900k context and hit its
+			// wall immediately (R1-M7).
+			const candidateInputLimit = effectiveInputLimitTokens(
+				candidate.contextWindow,
+				candidate.provider,
+				candidate.id,
+				candidate.usageWindowTokens,
+			);
+			if (candidateInputLimit > 0 && contextTokens > candidateInputLimit * 0.9) continue;
 			return candidate;
 		}
 		return undefined;

@@ -52,6 +52,13 @@ export interface FooterTelemetrySnapshot {
 	 * (评审③ - the bar never reports a threshold that does not exist).
 	 */
 	compactionThresholdTokens?: number;
+	/**
+	 * Config-declared rate-quota heuristic (models.json `usageWindowTokens`) that
+	 * sits below the declared contextWindow. When set and positive the footer
+	 * appends one hint so the compressed threshold is not misread as a bug
+	 * ("why compact at 140k on a 1M window?").
+	 */
+	usageWindowTokens?: number;
 }
 
 /**
@@ -211,8 +218,11 @@ export class FooterComponent implements Component {
 		const knownContext = tokens !== undefined && tokens !== null && windowTokens > 0;
 		const threshold = snapshot.compactionThresholdTokens ?? 0;
 		const imminent = knownContext && threshold > 0 && tokens >= threshold;
+		const usageCap = snapshot.usageWindowTokens ?? 0;
+		const usageHint =
+			usageCap > 0 && windowTokens > 0 && usageCap < windowTokens ? ` · 窗限${formatTokens(usageCap)}` : "";
 		const figuresText = knownContext
-			? `${formatContextTokens(tokens, windowTokens)} · ${Math.round((tokens / windowTokens) * 100)}%${imminent ? " · 即将压缩" : ""}`
+			? `${formatContextTokens(tokens, windowTokens)} · ${Math.round((tokens / windowTokens) * 100)}%${imminent ? " · 即将压缩" : ""}${usageHint}`
 			: "";
 		const figures = figuresText ? theme.fg(imminent ? "warning" : "muted", `${figuresText} `) : "";
 		const bar =
