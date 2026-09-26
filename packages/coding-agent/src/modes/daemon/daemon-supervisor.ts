@@ -1423,10 +1423,12 @@ function normalizeCapabilities(
  *    exit 1 → service-manager relaunch → same collision, forever) was the
  *    launchd idle-retry spin.
  * 2. Otherwise start normally; a startup failure that is a single-instance
- *    conflict (socket in use / supervisor already running / agent dir owned)
- *    downgrades to standby instead of propagating. The standby process never
- *    binds, never writes the roster snapshot, and exits for relaunch once
- *    the owner is gone, so the service manager's next attempt binds.
+ *    conflict (socket in use / supervisor already running / agent dir owned /
+ *    the socket-path lease held by a live process that has not bound yet —
+ *    proper-lockfile ELOCKED on this socket path) downgrades to standby
+ *    instead of propagating. The standby process never binds, never writes
+ *    the roster snapshot, and exits for relaunch once the owner is gone, so
+ *    the service manager's next attempt binds.
  * 3. Any other failure propagates unchanged.
  */
 export async function runDaemonSupervisorMode(options: DaemonSupervisorOptions): Promise<never> {

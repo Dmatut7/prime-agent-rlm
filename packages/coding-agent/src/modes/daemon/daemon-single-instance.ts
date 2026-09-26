@@ -103,12 +103,38 @@ export async function judgeDaemonSocketOccupancy(
  * instance" (a supervisor-mode process should downgrade to standby) versus
  * everything else (real failures: propagate).
  */
-export function isDaemonSingleInstanceConflict(error: unknown): boolean {
-	return (
+export function isDaemonSingleInstanceConflict(error: unknown, socketPath?: string): boolean {
+	if (
 		error instanceof DaemonSocketInUseError ||
 		error instanceof DaemonSupervisorAlreadyRunningError ||
 		error instanceof DaemonAgentDirAlreadyRunningError
-	);
+	) {
+		return true;
+	}
+	// N1 (R1): a live lease holder that has not bound yet. proper-lockfile's
+	// ELOCKED ("Lock file is already being held") means another process holds
+	// the socket-path lease right now — the pre-bind half of the same
+	// single-instance collision the listening branch already handles. Left
+	// unclassified it propagated as an uncaught exception and the service
+	// manager (launchd KeepAlive + ThrottleInterval) relaunch into the same
+	// collision every interval: exactly the idle-retry spin this PR removes.
+	// The `file` check keeps an ELOCKED from an unrelated lock from being
+	// misread as this socket's conflict.
+	return isSocketPathLeaseHeld(error, socketPath);
+}
+
+function isSocketPathLeaseHeld(error: unknown, socketPath?: string): boolean {
+	if (typeof error !== "object" || error === null) {
+		return false;
+	}
+	const candidate = error as { code?: unknown; file?: unknown };
+	if (candidate.code !== "ELOCKED" || typeof candidate.file !== "string") {
+		return false;
+	}
+	if (socketPath === undefined) {
+		return true;
+	}
+	return normalizeSocketPath(candidate.file) === normalizeSocketPath(socketPath);
 }
 
 export interface DaemonStandbyOwner {

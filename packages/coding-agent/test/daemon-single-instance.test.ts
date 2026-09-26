@@ -137,6 +137,23 @@ describe("isDaemonSingleInstanceConflict (downgrade classification)", () => {
 		expect(isDaemonSingleInstanceConflict(new Error("disk on fire"))).toBe(false);
 		expect(isDaemonSingleInstanceConflict(undefined)).toBe(false);
 	});
+
+	it("classifies a held socket-path lease (ELOCKED on the same socket) as a conflict (N1)", () => {
+		const error = Object.assign(new Error("Lock file is already being held"), {
+			code: "ELOCKED",
+			file: "/tmp/w2.sock",
+		});
+		expect(isDaemonSingleInstanceConflict(error, "/tmp/w2.sock")).toBe(true);
+		// No socket path context: still a lease conflict (the caller could not
+		// narrow it, and ELOCKED from this code path only comes from our lease).
+		expect(isDaemonSingleInstanceConflict(error)).toBe(true);
+		// An ELOCKED naming a different file is somebody else's lock: propagate.
+		expect(isDaemonSingleInstanceConflict(error, "/tmp/other.sock")).toBe(false);
+		// Errors without the ELOCKED code never match, even with a file field.
+		expect(
+			isDaemonSingleInstanceConflict(Object.assign(new Error("nope"), { code: "ENOENT", file: "/tmp/w2.sock" })),
+		).toBe(false);
+	});
 });
 
 describe("stale socket takeover (atomic takeover of an unresponsive socket)", () => {
