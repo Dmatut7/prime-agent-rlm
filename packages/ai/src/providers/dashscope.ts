@@ -24,6 +24,7 @@ import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { recordStreamFailure, StreamFailureError } from "../utils/stream-failure.js";
 import { buildBaseOptions } from "./simple-options.js";
+import { pruneStrayReasoningTags } from "./stray-reasoning-tags.js";
 import { transformMessages } from "./transform-messages.js";
 
 /**
@@ -907,6 +908,10 @@ export const streamDashScope: StreamFunction<"dashscope", DashScopeOptions> = (
 					claimToolCallId(block, block.sourceId);
 				}
 			}
+			// Qwen-family models leak lone reasoning closing tags into content
+			// (observed 2026-09-26: text blocks of nothing but "\n</think>\n\n");
+			// drop them before the blocks are finalized into the message.
+			pruneStrayReasoningTags(blocks);
 			for (const block of blocks) {
 				finishBlock(block);
 			}
@@ -939,6 +944,7 @@ export const streamDashScope: StreamFunction<"dashscope", DashScopeOptions> = (
 				delete (block as { streamIndex?: number }).streamIndex;
 				delete (block as { sourceId?: string }).sourceId;
 			}
+			pruneStrayReasoningTags(output.content);
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
 			recordStreamFailure(model, output, error);

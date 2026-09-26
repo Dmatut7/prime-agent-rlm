@@ -351,6 +351,45 @@ const usage = {
 	prompt_tokens_details: { cached_tokens: 0 },
 };
 
+describe("streamDashScope stray reasoning tag scrubbing", () => {
+	it("drops a content frame that is only a leaked thinking close tag (PM 2026-09-26)", async () => {
+		stubFetch(
+			sseResponse([
+				{
+					output: {
+						choices: [{ message: { role: "assistant", reasoning_content: "planning" } }],
+					},
+				},
+				{ output: { choices: [{ message: { role: "assistant", content: "\n</think>\n\n" } }] } },
+				{ output: { choices: [{ finish_reason: "stop", message: { role: "assistant", content: "" } }] } },
+			]),
+		);
+		const message = await streamDashScope(
+			dsModel("qwen3.8-max"),
+			{ messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+			{ apiKey: "sk-test" },
+		).result();
+		expect(message.stopReason).toBe("stop");
+		expect(message.content.filter((b) => b.type === "text")).toEqual([]);
+		expect(JSON.stringify(message.content)).not.toContain("</think>");
+	});
+
+	it("removes a lone tag line but keeps the prose around it", async () => {
+		stubFetch(
+			sseResponse([
+				{ output: { choices: [{ message: { role: "assistant", content: "head\n</think>\ntail" } }] } },
+				{ output: { choices: [{ finish_reason: "stop", message: { role: "assistant", content: "" } }] } },
+			]),
+		);
+		const message = await streamDashScope(
+			dsModel("qwen3.8-max"),
+			{ messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+			{ apiKey: "sk-test" },
+		).result();
+		expect(message.content).toEqual([{ type: "text", text: "head\ntail" }]);
+	});
+});
+
 describe("streamDashScope wire behaviour", () => {
 	it("sends the documented headers and body, and parses the text-endpoint stream (07 流式 curl)", async () => {
 		// incremental_output=true frames: content is a delta per chunk.
@@ -559,7 +598,7 @@ describe("streamDashScope wire behaviour", () => {
 		expect(message.errorMessage).toContain("spot the problem");
 	});
 
-	it("treats the string finish_reason \"null\" on intermediate frames as unfinished, not as an error", async () => {
+	it('treats the string finish_reason "null" on intermediate frames as unfinished, not as an error', async () => {
 		// Regression: Bailian native SSE emits `"finish_reason":"null"` in every frame
 		// before the last one. A truthiness check mapped that string into the error
 		// branch, so 1118 of 1118 recorded native-path responses carried
@@ -571,16 +610,17 @@ describe("streamDashScope wire behaviour", () => {
 				{
 					output: {
 						choices: [
-							{ finish_reason: "null", message: { role: "assistant", content: [], reasoning_content: "想一下" } },
+							{
+								finish_reason: "null",
+								message: { role: "assistant", content: [], reasoning_content: "想一下" },
+							},
 						],
 					},
 					usage: { input_tokens: 35, output_tokens: 1, total_tokens: 36 },
 				},
 				{
 					output: {
-						choices: [
-							{ finish_reason: "null", message: { role: "assistant", content: [{ text: "好" }] } },
-						],
+						choices: [{ finish_reason: "null", message: { role: "assistant", content: [{ text: "好" }] } }],
 					},
 					usage: { input_tokens: 35, output_tokens: 49, total_tokens: 84 },
 				},
@@ -593,7 +633,7 @@ describe("streamDashScope wire behaviour", () => {
 
 		const message = await streamDashScope(
 			dsModel("deepseek-v4.1-flash"),
-			{ messages: [{ role: "user", content: "说\"好\"一个字", timestamp: 1 }] },
+			{ messages: [{ role: "user", content: '说"好"一个字', timestamp: 1 }] },
 			{ apiKey: "sk-test" },
 		).result();
 
