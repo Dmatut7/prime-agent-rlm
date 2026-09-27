@@ -1,3 +1,4 @@
+import { CLAUDE_CODE_MODELS } from "./claude-code-models.js";
 import { MODELS } from "./models.generated.js";
 import type { Api, KnownProvider, Model, ModelThinkingLevel, Usage } from "./types.js";
 
@@ -10,6 +11,8 @@ for (const [provider, models] of Object.entries(MODELS)) {
 	}
 	modelRegistry.set(provider, providerModels);
 }
+
+modelRegistry.set("claude-code", new Map(CLAUDE_CODE_MODELS.map((model) => [model.id, model as Model<Api>])));
 
 type ModelApi<
 	TProvider extends KnownProvider,

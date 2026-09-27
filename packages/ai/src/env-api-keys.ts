@@ -89,6 +89,46 @@ function hasVertexAdcCredentials(): boolean {
 	return cachedVertexAdcCredentialsExists;
 }
 
+/**
+ * node:fs, node:os and node:path for a check that must answer before the dynamic
+ * imports above settle: model availability is decided in the first tick of startup.
+ */
+function syncNodeModules(): { existsSync: typeof existsSync; homedir: typeof homedir; join: typeof join } | undefined {
+	if (_existsSync && _homedir && _join) return { existsSync: _existsSync, homedir: _homedir, join: _join };
+	if (typeof process === "undefined" || typeof process.getBuiltinModule !== "function") return undefined;
+	const fs = process.getBuiltinModule("node:fs");
+	const os = process.getBuiltinModule("node:os");
+	const path = process.getBuiltinModule("node:path");
+	return { existsSync: fs.existsSync, homedir: os.homedir, join: path.join };
+}
+
+/**
+ * Locate the Claude Code CLI. A daemon started outside a login shell can miss the
+ * native installer's `~/.local/bin` on PATH, so the usual install locations are
+ * checked after PATH.
+ */
+export function findClaudeCodeExecutable(): string | undefined {
+	const node = syncNodeModules();
+	if (!node) return undefined;
+	const isWindows = process.platform === "win32";
+	// The native installer ships claude.exe; a claude.cmd shim cannot be spawned without a shell.
+	const names = isWindows ? ["claude.exe"] : ["claude"];
+	const pathValue = process.env.PATH || getProcEnv("PATH") || "";
+	const home = node.homedir();
+	const dirs = [
+		...pathValue.split(isWindows ? ";" : ":").filter((dir) => dir.length > 0),
+		node.join(home, ".local", "bin"),
+		node.join(home, ".claude", "local"),
+	];
+	for (const dir of dirs) {
+		for (const name of names) {
+			const candidate = node.join(dir, name);
+			if (node.existsSync(candidate)) return candidate;
+		}
+	}
+	return undefined;
+}
+
 function getApiKeyEnvVars(provider: string): readonly string[] | undefined {
 	if (provider === "github-copilot") {
 		return ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
@@ -177,6 +217,11 @@ export function getEnvApiKey(provider: string): string | undefined {
 		if (hasCredentials && hasProject && hasLocation) {
 			return "<authenticated>";
 		}
+	}
+
+	// Claude Code signs in with its own `claude` login; an installed CLI is the credential.
+	if (provider === "claude-code") {
+		return findClaudeCodeExecutable() ? "<authenticated>" : undefined;
 	}
 
 	if (provider === "amazon-bedrock") {

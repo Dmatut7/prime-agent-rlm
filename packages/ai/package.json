@@ -18,6 +18,10 @@
 			"types": "./dist/providers/azure-openai-responses.d.ts",
 			"import": "./dist/providers/azure-openai-responses.js"
 		},
+		"./claude-code": {
+			"types": "./dist/providers/claude-code.d.ts",
+			"import": "./dist/providers/claude-code.js"
+		},
 		"./google": {
 			"types": "./dist/providers/google.d.ts",
 			"import": "./dist/providers/google.js"

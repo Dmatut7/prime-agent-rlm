@@ -29,7 +29,25 @@ Use `/logout` to clear credentials. Tokens are stored in `~/.prime/agent/auth.js
 
 ### Claude Pro/Max
 
-Anthropic subscription auth is active for Claude Pro/Max accounts. Third-party harness usage draws from [extra usage](https://claude.ai/settings/usage) and is billed per token, not against Claude plan limits.
+Anthropic subscription auth is active for Claude Pro/Max accounts. Third-party harness usage draws from [extra usage](https://claude.ai/settings/usage) and is billed per token, not against Claude plan limits. To use the plan's own limits instead, use the Claude Code provider below.
+
+### Claude Code (Claude subscription)
+
+The `claude-code` provider runs Claude through the Claude Code CLI installed on the same machine, so usage draws from your Claude plan the way Claude Code's own usage does. It needs no `/login` in Prime Agent: install Claude Code, run `claude` once to sign in with your subscription, then pick a model with `/model`:
+
+| Model | Resolves to | Context |
+|---|---|---|
+| `claude-code/opus` | Claude Code's `opus` alias (newest Opus) | 1M |
+| `claude-code/sonnet` | Claude Code's `sonnet` alias | 1M |
+| `claude-code/fable` | Claude Code's `fable` alias | 1M |
+| `claude-code/haiku` | Claude Code's `haiku` alias | 200K |
+
+Claude Code only serves as the model: its own tools, memory, `CLAUDE.md` loading and compaction are switched off, and the session's tools are handed to it over a loopback MCP server, so tools, memory, subagents and compaction behave exactly as with any other provider. The thinking level maps to Claude Code's `--effort`.
+
+- The CLI is looked up on `PATH`, then in `~/.local/bin` and `~/.claude/local`.
+- Inherited `ANTHROPIC_*` and `CLAUDE_CODE_*` variables are not passed to the CLI, so an API key set for something else cannot move billing off the plan. `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) is kept.
+- Keep extra usage turned off at [claude.ai/settings/usage](https://claude.ai/settings/usage). If Claude Code reports that a request is billed to extra usage anyway, the request is stopped and fails as a quota error, so `providerFallbackModels` can take over. A used-up plan fails as a rate limit with the reset time Claude Code announced.
+- After a finished turn the CLI process stays up for 20 minutes for the session's next message, which keeps Claude's prompt cache warm. Each waiting process uses about 250 MB of memory.
 
 ### GitHub Copilot
 

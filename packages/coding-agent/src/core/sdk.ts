@@ -307,6 +307,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const providerRetryOptions = providerRetryStreamOptions(providerRetry);
 			return streamSimple(model, context, {
 				...options,
+				cwd,
 				apiKey: auth.apiKey,
 				timeoutMs: options?.timeoutMs ?? providerRetrySettings.timeoutMs,
 				// The session path is module-wrapped (the auto-retry loop below this streamFn
