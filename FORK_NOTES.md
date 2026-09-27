@@ -1,3 +1,8 @@
+## 2026-09-28 Claude Code 接入省额度：修并行工具误报、子代理消息不再重建
+
+- 老板反映接 Claude 后周额度掉得快。查本机会话：2 小时 223 步里，16 步各重写十几万 token 缓存，占全部缓存写入的 92%，都是「按记录重建 Claude Code 进程」造成的。起因三个：Claude 一条回复并行调多个工具时，Claude Code 逐个领结果，后到的领取被误判成「对不上的工具调用」而报错重建（5 次，同时打断干活）；子代理在工具执行中途回消息时整段重建（8 次）；隔 20 分钟以上再发消息时进程已关（3 次）。
+- 现在：并行工具的逐个领取能认出；中途到的消息（子代理回信、插话）直接交给正在跑的 Claude Code，作为「工作中收到的新消息」出现在工具结果之后，不重建；一轮结束后进程等待从 20 分钟延长到 60 分钟（与 Anthropic 缓存的 1 小时一致）。三处各有测试，去掉修复即失败（并行那条能复现线上原样报错）；真实 Claude 验证并行调用加中途消息一次完成。
+
 ## 2026-09-27 用 Claude 会员额度跑 prime-agent（Claude Code 接入）
 
 - 老板开了 Claude 会员，不接受按量付费；`/login` 里的「Claude Pro/Max」在第三方工具里走额外用量、按 token 扣钱。新增服务商 `claude-code`：prime-agent 在后台驱动本机装好的官方 Claude Code（`claude -p`，流式输入输出），用它的会员登录，算套餐额度。`/model` 里选 `claude-code/claude-opus-5-5`（Opus 5.5）、`claude-sonnet-5`、`claude-fable-5-1`、`claude-haiku-4-5`，菜单里直接显示版本，不用另外登录；思考等级用 `/effort` 调。记忆、Python 工具、子代理、压缩全部照旧：Claude Code 只当模型用，它自己的工具、记忆、CLAUDE.md、自动压缩都关掉，prime-agent 的工具通过本机 MCP 服务交给它，每次工具调用仍由 prime-agent 执行。

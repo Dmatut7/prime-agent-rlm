@@ -218,6 +218,8 @@ for (const key of ["ANTHROPIC_API_KEY", "CLAUDE_CODE_ENTRYPOINT", "DISABLE_AUTO_
 let buffer = "";
 let turns = 0;
 let queue = Promise.resolve();
+let running = false;
+const steers = [];
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
 	buffer += chunk;
@@ -227,9 +229,16 @@ process.stdin.on("data", (chunk) => {
 		buffer = buffer.slice(newline + 1);
 		if (line.trim().length === 0) continue;
 		const prompt = JSON.parse(line);
+		if (running) {
+			// A message written while a turn runs is a mid-turn message, as in Claude Code.
+			steers.push(prompt.message.content.map((block) => block.text).join(""));
+			log({ steer: steers[steers.length - 1] });
+			continue;
+		}
+		running = true;
 		const turn = ++turns;
 		log({ pid: process.pid, turn, args, env, transcriptEntries, prompt: prompt.message.content, systemPrompt });
-		queue = queue.then(() => run(turn)).catch((error) => { log({ error: String(error) }); process.exit(1); });
+		queue = queue.then(() => run(turn)).then(() => { running = false; }).catch((error) => { log({ error: String(error) }); process.exit(1); });
 	}
 });
 process.stdin.on("end", () => process.exit(0));
@@ -305,6 +314,24 @@ async function run(turn) {
 		const text = await callTool(serverUrl, "toolu_fallback", "print(6*7)");
 		message("msg_after_fallback", [{ type: "text", text: "done: " + text }], "end_turn");
 		emit({ type: "result", subtype: "success", is_error: false, result: "done: " + text });
+		return;
+	}
+	if (scenario === "two-tools") {
+		message("msg_two_" + turn, [{ type: "tool_use", id: "toolu_a", name: "mcp__prime__ipython", input: { code: "a" } }, { type: "tool_use", id: "toolu_b", name: "mcp__prime__ipython", input: { code: "b" } }], "tool_use");
+		// Claude Code claims one result at a time: the second call only after the first answered.
+		const a = await callTool(serverUrl, "toolu_a", "a");
+		const b = await callTool(serverUrl, "toolu_b", "b");
+		// The model takes a while before the next message starts.
+		await new Promise((resolve) => setTimeout(resolve, 800));
+		message("msg_two_done_" + turn, [{ type: "text", text: "done: " + a + " " + b }], "end_turn");
+		emit({ type: "result", subtype: "success", is_error: false, result: "done" });
+		return;
+	}
+	if (scenario === "steer") {
+		message("msg_steer_" + turn, [{ type: "tool_use", id: "toolu_s", name: "mcp__prime__ipython", input: { code: "s" } }], "tool_use");
+		const result = await callTool(serverUrl, "toolu_s", "s");
+		message("msg_steer_done_" + turn, [{ type: "text", text: "done: " + result + " | heard: " + steers.join(",") }], "end_turn");
+		emit({ type: "result", subtype: "success", is_error: false, result: "done" });
 		return;
 	}
 	if (scenario === "wander") {
@@ -584,6 +611,52 @@ describe("claude-code provider against a fake CLI", () => {
 		context.messages.push(aborted, { role: "user", content: "again", timestamp: 1 });
 		const next = await streamSimple(model, context, { sessionId: "session-abort", cwd }).result();
 		expect(next.content).toEqual([{ type: "text", text: "plain answer 1" }]);
+	});
+
+	it("keeps the step going when the CLI claims the results of a multi-call message one at a time", async () => {
+		rmSync(logPath, { force: true });
+		setEnv("FAKE_CLAUDE_SCENARIO", "two-tools");
+		const context: Context = {
+			systemPrompt: "s",
+			messages: [{ role: "user", content: "two", timestamp: 0 }],
+			tools: [ipythonTool],
+		};
+
+		const first = await streamSimple(model, context, { sessionId: "session-two", cwd }).result();
+		expect(first.content.filter((block) => block.type === "toolCall").map((block) => block.id)).toEqual([
+			"toolu_a",
+			"toolu_b",
+		]);
+		context.messages.push(first, toolResult("toolu_a", "A"), toolResult("toolu_b", "B"));
+		const second = await streamSimple(model, context, { sessionId: "session-two", cwd }).result();
+
+		expect(second.stopReason).toBe("stop");
+		expect(second.content).toEqual([{ type: "text", text: "done: A B" }]);
+		expect(
+			new Set((readLog() as unknown as FakeRun[]).filter((run) => "pid" in run).map((run) => run.pid)).size,
+		).toBe(1);
+	});
+
+	it("hands a message that arrived while tools ran to the running CLI instead of rebuilding it", async () => {
+		rmSync(logPath, { force: true });
+		setEnv("FAKE_CLAUDE_SCENARIO", "steer");
+		const context: Context = {
+			systemPrompt: "s",
+			messages: [{ role: "user", content: "go", timestamp: 0 }],
+			tools: [ipythonTool],
+		};
+
+		const first = await streamSimple(model, context, { sessionId: "session-steer", cwd }).result();
+		context.messages.push(first, toolResult("toolu_s", "S"), {
+			role: "user",
+			content: [{ type: "text", text: "child says hi" }],
+			timestamp: 2,
+		});
+		const second = await streamSimple(model, context, { sessionId: "session-steer", cwd }).result();
+
+		expect(second.content).toEqual([{ type: "text", text: "done: S | heard: child says hi" }]);
+		const runs = (readLog() as unknown as FakeRun[]).filter((run) => "pid" in run);
+		expect(runs).toHaveLength(1);
 	});
 
 	it("records the answer the CLI settled on when it retried a dropped stream", async () => {
