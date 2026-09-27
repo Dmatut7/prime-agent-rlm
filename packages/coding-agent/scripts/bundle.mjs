@@ -36,6 +36,7 @@ const result = await build({
 		cli: join(packageDir, "dist", "cli.js"),
 		// The Node-only lazy loader uses a variable import that esbuild cannot discover.
 		"amazon-bedrock": join(packageDir, "dist", "node", "amazon-bedrock.js"),
+		"claude-code": join(packageDir, "dist", "node", "claude-code.js"),
 	},
 	outdir,
 	bundle: true,
@@ -60,12 +61,15 @@ const result = await build({
 	logLevel: "warning",
 });
 
-const bedrockOutput = Object.entries(result.metafile.outputs).find(
-	([path]) => resolve(path) === join(outdir, "amazon-bedrock.js"),
-)?.[1];
-for (const name of ["streamBedrock", "streamSimpleBedrock"]) {
-	if (!bedrockOutput?.exports.includes(name)) {
-		throw new Error(`Bedrock bundle is missing the ${name} export`);
+for (const [file, names] of [
+	["amazon-bedrock.js", ["streamBedrock", "streamSimpleBedrock"]],
+	["claude-code.js", ["streamClaudeCode", "streamSimpleClaudeCode"]],
+]) {
+	const output = Object.entries(result.metafile.outputs).find(([path]) => resolve(path) === join(outdir, file))?.[1];
+	for (const name of names) {
+		if (!output?.exports.includes(name)) {
+			throw new Error(`${file} bundle is missing the ${name} export`);
+		}
 	}
 }
 
