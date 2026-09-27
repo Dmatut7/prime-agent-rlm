@@ -17,7 +17,8 @@ export type KnownApi =
 	| "anthropic-messages"
 	| "bedrock-converse-stream"
 	| "google-generative-ai"
-	| "google-vertex";
+	| "google-vertex"
+	| "dashscope";
 
 export type Api = KnownApi | (string & {});
 
@@ -525,8 +526,8 @@ export interface Model<TApi extends Api> {
 	/** Flagship model surfaced above non-featured models of the same provider in pickers. */
 	featured?: boolean;
 	headers?: Record<string, string>;
-	/** Compatibility overrides for OpenAI-compatible APIs. If not set, auto-detected from baseUrl. */
-	compat?: TApi extends "openai-completions"
+	/** Compatibility overrides. On OpenAI-compatible APIs auto-detected from baseUrl when unset; on the DashScope native API only the explicit flags apply (preserveThinking, reasoningCountsTowardMaxTokens, requiresReasoningContentOnAssistantMessages). */
+	compat?: TApi extends "openai-completions" | "dashscope"
 		? OpenAICompletionsCompat
 		: TApi extends "openai-responses"
 			? OpenAIResponsesCompat

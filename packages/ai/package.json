@@ -18,6 +18,10 @@
 			"types": "./dist/providers/azure-openai-responses.d.ts",
 			"import": "./dist/providers/azure-openai-responses.js"
 		},
+		"./dashscope": {
+			"types": "./dist/providers/dashscope.d.ts",
+			"import": "./dist/providers/dashscope.js"
+		},
 		"./google": {
 			"types": "./dist/providers/google.d.ts",
 			"import": "./dist/providers/google.js"
