@@ -537,6 +537,19 @@ class ClaudeCodeSession {
 		}
 	}
 
+	/**
+	 * The CLI has read the transcript and the system prompt once it reports `init`.
+	 * Removing them right away means a host that is killed leaves nothing behind in the
+	 * user's own Claude Code history.
+	 */
+	private removeLaunchFiles(): void {
+		for (const path of [this.transcriptPath, this.tempDir]) {
+			if (path) rmSync(path, { recursive: true, force: true });
+		}
+		this.transcriptPath = undefined;
+		this.tempDir = undefined;
+	}
+
 	/** Ends the session. A turn still streaming ends with an error rather than hanging. */
 	dispose(): void {
 		if (this.state === "closed") return;
@@ -551,9 +564,7 @@ class ClaudeCodeSession {
 			child.stdin.end();
 			child.kill("SIGTERM");
 		}
-		for (const path of [this.transcriptPath, this.tempDir]) {
-			if (path) rmSync(path, { recursive: true, force: true });
-		}
+		this.removeLaunchFiles();
 		if (sessions.get(this.key) === this) sessions.delete(this.key);
 	}
 
@@ -714,7 +725,10 @@ class ClaudeCodeSession {
 				this.onResult(event);
 				return;
 			case "system":
-				if (event.subtype === "init") this.checkToolServerConnected(event);
+				if (event.subtype === "init") {
+					this.checkToolServerConnected(event);
+					this.removeLaunchFiles();
+				}
 				return;
 			case "control_request":
 				// Every tool the session serves is pre-approved; nothing else may ask the host.

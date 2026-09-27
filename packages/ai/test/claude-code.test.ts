@@ -211,6 +211,7 @@ if (resume) {
 	const dir = path.join(process.env.CLAUDE_CONFIG_DIR, "projects", fs.realpathSync(process.cwd()).replace(/[^a-zA-Z0-9]/g, "-"));
 	transcriptEntries = fs.readFileSync(path.join(dir, resume + ".jsonl"), "utf8").trim().split("\n").length;
 }
+const systemPrompt = fs.readFileSync(argValue("--system-prompt-file"), "utf8");
 const env = {};
 for (const key of ["ANTHROPIC_API_KEY", "CLAUDE_CODE_ENTRYPOINT", "DISABLE_AUTO_COMPACT", "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT", "MAX_MCP_OUTPUT_TOKENS"]) env[key] = process.env[key];
 
@@ -227,7 +228,7 @@ process.stdin.on("data", (chunk) => {
 		if (line.trim().length === 0) continue;
 		const prompt = JSON.parse(line);
 		const turn = ++turns;
-		log({ pid: process.pid, turn, args, env, transcriptEntries, prompt: prompt.message.content, systemPrompt: fs.readFileSync(argValue("--system-prompt-file"), "utf8") });
+		log({ pid: process.pid, turn, args, env, transcriptEntries, prompt: prompt.message.content, systemPrompt });
 		queue = queue.then(() => run(turn)).catch((error) => { log({ error: String(error) }); process.exit(1); });
 	}
 });
@@ -445,7 +446,7 @@ describe("claude-code provider against a fake CLI", () => {
 		expect(readLog()).toContainEqual({ toolResult: "42" });
 	});
 
-	it("starts the next turn from a transcript of the session's messages and removes it afterwards", async () => {
+	it("starts the next turn from a transcript of the session's messages and removes it once read", async () => {
 		rmSync(logPath, { force: true });
 		setEnv("FAKE_CLAUDE_SCENARIO", "text");
 		const context: Context = {
@@ -476,14 +477,11 @@ describe("claude-code provider against a fake CLI", () => {
 		const [run] = readLog() as unknown as FakeRun[];
 		expect(run.transcriptEntries).toBe(4);
 		expect(run.prompt).toEqual([{ type: "text", text: "thanks" }]);
-		// A different session's request evicts nothing, so this one ends it explicitly: the
-		// transcript lives exactly as long as the CLI that resumed it.
+		// Read once the CLI reports init: gone before the turn even ends.
 		const projectDir = join(root, "claude-config", "projects", cwd.replace(/[^a-zA-Z0-9]/g, "-"));
 		const resumeId = run.args[run.args.indexOf("--resume") + 1];
-		expect(existsSync(join(projectDir, `${resumeId}.jsonl`))).toBe(true);
-		context.messages = context.messages.slice(2);
-		await streamSimple(model, context, { sessionId: "session-history", cwd }).result();
 		expect(existsSync(join(projectDir, `${resumeId}.jsonl`))).toBe(false);
+		expect(existsSync(run.args[run.args.indexOf("--system-prompt-file") + 1])).toBe(false);
 	});
 
 	it("keeps the CLI for the session's next message and replaces it once the history is rewritten", async () => {
