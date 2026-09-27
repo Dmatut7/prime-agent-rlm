@@ -76,7 +76,7 @@ function toolResult(id: string, text: string): ToolResultMessage {
 }
 
 describe("claude-code transcript conversion", () => {
-	const model = claudeCodeModel("opus");
+	const model = claudeCodeModel("claude-opus-5-5");
 
 	it("sends the last user message as the prompt and writes everything before it as history", () => {
 		const messages: Message[] = [
@@ -348,7 +348,7 @@ function processIsAlive(pid: number): boolean {
 }
 
 describe("claude-code provider against a fake CLI", () => {
-	const model = claudeCodeModel("opus");
+	const model = claudeCodeModel("claude-opus-5-5");
 	let root: string;
 	let cwd: string;
 	let logPath: string;
@@ -536,7 +536,7 @@ describe("claude-code provider against a fake CLI", () => {
 			const { getModel } = await import(${JSON.stringify(new URL("../src/models.ts", import.meta.url).href)});
 			const { streamSimple } = await import(${JSON.stringify(new URL("../src/stream.ts", import.meta.url).href)});
 			await new Promise((resolve) => setTimeout(resolve, 100));
-			const reply = await streamSimple(getModel("claude-code", "opus"), {
+			const reply = await streamSimple(getModel("claude-code", "claude-opus-5-5"), {
 				systemPrompt: "s",
 				messages: [{ role: "user", content: "hi", timestamp: 0 }],
 			}, { sessionId: "one-shot", cwd: ${JSON.stringify(cwd)} }).result();
