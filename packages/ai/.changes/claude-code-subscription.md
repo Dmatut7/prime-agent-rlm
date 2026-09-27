@@ -1,0 +1,1 @@
+- Added the `claude-code` provider, which runs Claude models through the locally installed Claude Code CLI so usage draws from the Claude subscription instead of per-token billing.

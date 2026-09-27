@@ -3,6 +3,7 @@ export const BUILT_IN_PROVIDER_DISPLAY_NAMES: Record<string, string> = {
 	"amazon-bedrock": "Amazon Bedrock",
 	"azure-openai-responses": "Azure OpenAI Responses",
 	cerebras: "Cerebras",
+	"claude-code": "Claude Code (Claude subscription)",
 	"cloudflare-ai-gateway": "Cloudflare AI Gateway",
 	"cloudflare-workers-ai": "Cloudflare Workers AI",
 	deepseek: "DeepSeek",

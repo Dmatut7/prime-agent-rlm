@@ -68,6 +68,7 @@ Unified LLM API with automatic model discovery, provider configuration, token an
 - **OpenAI Codex** (ChatGPT Plus/Pro subscription, requires OAuth, see below)
 - **DeepSeek**
 - **Anthropic**
+- **Claude Code** (Claude subscription through the locally installed `claude` CLI, see below; Node.js only)
 - **Google**
 - **Vertex AI** (Gemini via Vertex AI)
 - **Mistral**
@@ -1119,6 +1120,12 @@ In Prime Agent, run `/login` and select the **xAI subscription** entry. Open the
 All bundled xAI tool-capable language models can use subscription authentication through the Responses API. Each model keeps its own reasoning and input capabilities; only verified reasoning-effort controls are sent. Account eligibility, available models, and usage limits are controlled by xAI; signing in does not guarantee access or unlimited usage.
 
 SDK callers can use `loginXai(callbacks)` and `getOAuthApiKey("xai", credentials)` from `prime-agent-ai/oauth`. Persist refreshed credentials securely. When the effective credential is an xAI subscription, pass `getXaiSubscriptionModel(getModel("xai", "grok-4.5"))` to `stream` or `complete` with the resolved access token. The helper accepts configured xAI model descriptors and returns `undefined` for other providers. Do not apply this projection to API keys: the generated API-key models remain unchanged. Subscription requests use `https://api.x.ai/v1`.
+
+### Claude Code (Claude subscription)
+
+Provider `claude-code` (API `claude-code`) runs Claude through the Claude Code CLI installed on the machine, so usage draws from the Claude plan. There is no token to pass: `getEnvApiKey("claude-code")` reports `<authenticated>` when the CLI is found on `PATH`, `~/.local/bin` or `~/.claude/local`, and the CLI uses its own `claude` login. The models are Claude Code's aliases (`opus`, `sonnet`, `fable`, `haiku`), so each always resolves to the newest model of its family.
+
+Claude Code runs as the model only. Its built-in tools are disabled; `context.tools` are served to it over a loopback MCP server and every tool call comes back to the caller as a normal `toolCall`, so the caller executes tools as with any other provider. Pass `sessionId` and `cwd` in the stream options: requests of one session that only append tool results, or a next user message, continue the same CLI process (and its prompt cache); anything else starts a new process from a transcript written from `context.messages`. A request the CLI reports as billed to extra usage is stopped with a `quota` failure; a used-up plan fails as `rate_limit` with the reset time as `retryAfterMs`.
 
 ### Vertex AI
 

@@ -13,6 +13,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import type { BedrockOptions } from "./amazon-bedrock.js";
 import type { AnthropicOptions } from "./anthropic.js";
 import type { AzureOpenAIResponsesOptions } from "./azure-openai-responses.js";
+import type { ClaudeCodeOptions } from "./claude-code.js";
 import type { GoogleOptions } from "./google.js";
 import type { GoogleVertexOptions } from "./google-vertex.js";
 import type { MistralOptions } from "./mistral.js";
@@ -41,6 +42,11 @@ interface AnthropicProviderModule {
 interface AzureOpenAIResponsesProviderModule {
 	streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses", AzureOpenAIResponsesOptions>;
 	streamSimpleAzureOpenAIResponses: StreamFunction<"azure-openai-responses", SimpleStreamOptions>;
+}
+
+interface ClaudeCodeProviderModule {
+	streamClaudeCode: StreamFunction<"claude-code", ClaudeCodeOptions>;
+	streamSimpleClaudeCode: StreamFunction<"claude-code", SimpleStreamOptions>;
 }
 
 interface GoogleProviderModule {
@@ -93,6 +99,9 @@ let anthropicProviderModulePromise:
 	| undefined;
 let azureOpenAIResponsesProviderModulePromise:
 	| Promise<LazyProviderModule<"azure-openai-responses", AzureOpenAIResponsesOptions, SimpleStreamOptions>>
+	| undefined;
+let claudeCodeProviderModulePromise:
+	| Promise<LazyProviderModule<"claude-code", ClaudeCodeOptions, SimpleStreamOptions>>
 	| undefined;
 let googleProviderModulePromise:
 	| Promise<LazyProviderModule<"google-generative-ai", GoogleOptions, SimpleStreamOptions>>
@@ -226,6 +235,19 @@ function loadAzureOpenAIResponsesProviderModule(): Promise<
 	return azureOpenAIResponsesProviderModulePromise;
 }
 
+function loadClaudeCodeProviderModule(): Promise<
+	LazyProviderModule<"claude-code", ClaudeCodeOptions, SimpleStreamOptions>
+> {
+	claudeCodeProviderModulePromise ||= importNodeOnlyProvider("./claude-code.js").then((module) => {
+		const provider = module as ClaudeCodeProviderModule;
+		return {
+			stream: provider.streamClaudeCode,
+			streamSimple: provider.streamSimpleClaudeCode,
+		};
+	});
+	return claudeCodeProviderModulePromise;
+}
+
 function loadGoogleProviderModule(): Promise<
 	LazyProviderModule<"google-generative-ai", GoogleOptions, SimpleStreamOptions>
 > {
@@ -324,6 +346,8 @@ export const streamAnthropic = createLazyStream(loadAnthropicProviderModule);
 export const streamSimpleAnthropic = createLazySimpleStream(loadAnthropicProviderModule);
 export const streamAzureOpenAIResponses = createLazyStream(loadAzureOpenAIResponsesProviderModule);
 export const streamSimpleAzureOpenAIResponses = createLazySimpleStream(loadAzureOpenAIResponsesProviderModule);
+export const streamClaudeCode = createLazyStream(loadClaudeCodeProviderModule);
+export const streamSimpleClaudeCode = createLazySimpleStream(loadClaudeCodeProviderModule);
 export const streamGoogle = createLazyStream(loadGoogleProviderModule);
 export const streamSimpleGoogle = createLazySimpleStream(loadGoogleProviderModule);
 export const streamGoogleVertex = createLazyStream(loadGoogleVertexProviderModule);
@@ -386,6 +410,12 @@ export function registerBuiltInApiProviders(): void {
 		api: "google-vertex",
 		stream: streamGoogleVertex,
 		streamSimple: streamSimpleGoogleVertex,
+	});
+
+	registerApiProvider({
+		api: "claude-code",
+		stream: streamClaudeCode,
+		streamSimple: streamSimpleClaudeCode,
 	});
 
 	registerApiProvider({

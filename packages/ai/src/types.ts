@@ -17,7 +17,8 @@ export type KnownApi =
 	| "anthropic-messages"
 	| "bedrock-converse-stream"
 	| "google-generative-ai"
-	| "google-vertex";
+	| "google-vertex"
+	| "claude-code";
 
 export type Api = KnownApi | (string & {});
 
@@ -102,6 +103,12 @@ export interface StreamOptions {
 	 * session-aware features. Ignored by providers that don't support it.
 	 */
 	sessionId?: string;
+	/**
+	 * Working directory of the session. Providers that run a local agent process
+	 * (Claude Code) start it here, so the model's view of the environment matches the
+	 * session's. HTTP providers ignore it.
+	 */
+	cwd?: string;
 	/**
 	 * Optional callback for inspecting or replacing provider payloads before sending.
 	 * Return undefined to keep the payload unchanged.
