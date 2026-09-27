@@ -54,11 +54,13 @@ import { buildBaseOptions } from "./simple-options.js";
  * A CLI process follows one session for as long as the session only appends to what
  * the process has seen. A tool call ends the current assistant message; the process
  * then waits, holding the MCP request open, until the next request carries the tool
- * results. After a finished turn it waits for the next user message, so the CLI's own
- * view of the conversation, and with it the prompt cache, carries over. Any other
- * request (a compaction, a branch switch, a message injected mid-turn, a restart)
- * starts a new process from a transcript written from the session's messages, which
- * stay the single source of truth for the conversation.
+ * results (and any messages that arrived while the tools ran, which the CLI takes as
+ * mid-turn messages). After a finished turn it waits for the next user message, so the
+ * CLI's own view of the conversation, and with it the prompt cache, carries over. A
+ * rebuilt process has to write the whole history to the cache again, so rebuilds are
+ * kept to requests the process cannot follow (a compaction, a branch switch, a
+ * restart): those start a new process from a transcript written from the session's
+ * messages, which stay the single source of truth for the conversation.
  *
  * The streamed events are a live preview. What a turn records is what the CLI itself
  * committed (its `assistant` frames, one per finished content block): the CLI retries
@@ -81,8 +83,14 @@ const AWAITING_TOOLS_TTL_MS = 3 * 60 * 60 * 1000;
  * value is the warm prompt cache, which the CLI keeps for an hour; each idle process
  * costs about 250 MB of memory.
  */
-const FINISHED_TURN_TTL_MS = 20 * 60 * 1000;
+const FINISHED_TURN_TTL_MS = 60 * 60 * 1000;
 const SWEEP_INTERVAL_MS = 60 * 1000;
+/**
+ * Messages the session adds while tools run (a subagent's reply, a steering message)
+ * are written to the CLI before the tool results are released, so they reach the CLI
+ * before it sends the next request and not as a turn of their own after it.
+ */
+const STEERING_LEAD_MS = 100;
 const MAX_LIVE_SESSIONS = 16;
 const STDERR_TAIL_CHARS = 4000;
 /**
@@ -359,6 +367,8 @@ class ClaudeCodeSession {
 	/** Preview blocks of the open message, keyed by the API's block index. */
 	private blockIndexes = new Map<number, StreamBlock>();
 	private unstreamedToolCallTimer?: ReturnType<typeof setTimeout>;
+	/** Calls of the message whose results the current stream resumed from. */
+	private resumedCallIds = new Set<string>();
 	private rateLimitResetMs?: number;
 
 	/**
@@ -393,9 +403,10 @@ class ClaudeCodeSession {
 
 	/**
 	 * Whether the request only appends what this process is waiting for: the results of
-	 * exactly the calls it made, or, after a finished turn, the next user message(s). The
-	 * assistant message it produced must sit where it left it, which is what shows the
-	 * session did not rewrite the history in between.
+	 * exactly the calls it made (optionally followed by user messages that arrived while
+	 * the tools ran), or, after a finished turn, the next user message(s). The assistant
+	 * message it produced must sit where it left it, which is what shows the session did
+	 * not rewrite the history in between.
 	 */
 	canContinue(context: Context): boolean {
 		const awaiting = this.awaiting;
@@ -408,12 +419,13 @@ class ClaudeCodeSession {
 		if (this.state === "idle") {
 			return appended.length > 0 && appended.every((message) => message.role === "user");
 		}
-		if (this.state !== "awaitingTools" || appended.length !== awaiting.calls.length) return false;
+		if (this.state !== "awaitingTools") return false;
+		const results = appended.slice(0, awaiting.calls.length);
 		const pending = new Set(awaiting.calls.map((call) => call.id));
-		for (const message of appended) {
+		for (const message of results) {
 			if (message.role !== "toolResult" || !pending.delete(message.toolCallId)) return false;
 		}
-		return pending.size === 0;
+		return pending.size === 0 && appended.slice(results.length).every((message) => message.role === "user");
 	}
 
 	continueTurn(context: Context, stream: AssistantMessageEventStream, options?: ClaudeCodeOptions): void {
@@ -427,15 +439,30 @@ class ClaudeCodeSession {
 		this.beginStream(stream, context, options);
 		if (this.state !== "streaming") return;
 		if (resumingTools) {
-			for (const message of appended) {
-				if (message.role === "toolResult") this.toolServer?.deliver(message.toolCallId, toolResultForCli(message));
+			// The CLI claims the results of a multi-call message one call at a time, so calls
+			// of that message still arrive after streaming has resumed.
+			this.resumedCallIds = new Set(awaiting.calls.map((call) => call.id));
+			const results = appended.filter((message): message is ToolResultMessage => message.role === "toolResult");
+			const steering = appended.slice(results.length);
+			const deliver = () => {
+				for (const message of results) this.toolServer?.deliver(message.toolCallId, toolResultForCli(message));
+			};
+			if (steering.length === 0) {
+				deliver();
+				return;
 			}
+			this.writePrompt(this.promptContent(steering));
+			setTimeout(deliver, STEERING_LEAD_MS);
 			return;
 		}
-		const content = toClaudeCodeMessages(appended, this.model).flatMap((message) =>
+		this.writePrompt(this.promptContent(appended));
+	}
+
+	private promptContent(messages: Context["messages"]): ContentBlockParam[] {
+		const content = toClaudeCodeMessages(messages, this.model).flatMap((message) =>
 			typeof message.content === "string" ? [{ type: "text" as const, text: message.content }] : message.content,
 		);
-		this.writePrompt(content.length > 0 ? content : [{ type: "text", text: "(empty message)" }]);
+		return content.length > 0 ? content : [{ type: "text", text: "(empty message)" }];
 	}
 
 	async start(context: Context, stream: AssistantMessageEventStream, options?: ClaudeCodeOptions): Promise<void> {
@@ -667,6 +694,7 @@ class ClaudeCodeSession {
 			timestamp: Date.now(),
 		};
 		this.apiMessages = [];
+		this.resumedCallIds = new Set();
 		this.openMessage = undefined;
 		this.blockIndexes.clear();
 		stream.push({ type: "start", partial: this.output });
@@ -994,7 +1022,9 @@ class ClaudeCodeSession {
 			if (!this.awaiting?.calls.some((call) => call.id === toolUseId)) this.dispose();
 			return;
 		}
-		// Streaming: a call for a block the stream is showing is ended by its message_stop.
+		// Streaming: a late claim of a call whose result was just delivered is expected, and a
+		// call for a block the stream is showing is ended by its message_stop.
+		if (this.resumedCallIds.has(toolUseId)) return;
 		const open = this.openMessage;
 		if (open?.streamed.some((block) => block.type === "toolCall" && block.id === toolUseId)) return;
 		this.scheduleUnstreamedToolCallFinish();
