@@ -1288,6 +1288,32 @@ function parseBooleanEnvSwitch(value: string | undefined): boolean | undefined {
 	}
 }
 
+/** Words that read as "off" in an on/off setting; the kernel's change-tracking switch takes the same ones. */
+const BOOLEAN_SETTING_OFF_WORDS = ["false", "no", "off", "0"];
+
+/**
+ * Read an on/off setting from a file a person may have edited by hand. A JSON
+ * string such as "false" is truthy, so `?? default` alone leaves a switch written
+ * that way on. Anything but a real boolean is still read (an off word or 0 means
+ * off, any other string or number means on, any other type means `fallback`) and
+ * comes back `wellFormed: false` so the caller can say how it was read.
+ */
+function readBooleanSetting(raw: unknown, fallback: boolean): { value: boolean; wellFormed: boolean } {
+	if (raw === undefined) {
+		return { value: fallback, wellFormed: true };
+	}
+	if (typeof raw === "boolean") {
+		return { value: raw, wellFormed: true };
+	}
+	if (typeof raw === "string") {
+		return { value: !BOOLEAN_SETTING_OFF_WORDS.includes(raw.trim().toLowerCase()), wellFormed: false };
+	}
+	if (typeof raw === "number") {
+		return { value: raw !== 0, wellFormed: false };
+	}
+	return { value: fallback, wellFormed: false };
+}
+
 export type SettingsScope = "global" | "project";
 
 export interface SettingsStorage {
@@ -1586,6 +1612,8 @@ export class SettingsManager {
 		manager.reportUnknownSettingsKeys("project", manager.projectSettings);
 		manager.reportSpendPriceOverrideProblems("global", manager.globalSettings);
 		manager.reportSpendPriceOverrideProblems("project", manager.projectSettings);
+		manager.reportNonBooleanSwitches("global", manager.globalSettings);
+		manager.reportNonBooleanSwitches("project", manager.projectSettings);
 		manager.captureSettingsStamps();
 		return manager;
 	}
@@ -1797,6 +1825,8 @@ export class SettingsManager {
 		this.reportUnknownSettingsKeys("project", this.projectSettings);
 		this.reportSpendPriceOverrideProblems("global", this.globalSettings);
 		this.reportSpendPriceOverrideProblems("project", this.projectSettings);
+		this.reportNonBooleanSwitches("global", this.globalSettings);
+		this.reportNonBooleanSwitches("project", this.projectSettings);
 		this.captureSettingsStamps();
 	}
 
@@ -2071,6 +2101,25 @@ export class SettingsManager {
 		}
 	}
 
+	/**
+	 * Report an on/off setting written as something other than true or false. It is
+	 * still honoured (see `readBooleanSetting`), but the person who wrote "false"
+	 * in quotes should be told how it was read. Reported at load, not at read, so
+	 * the warning reaches the startup drain.
+	 */
+	private reportNonBooleanSwitches(scope: SettingsScope, settings: Settings): void {
+		const raw = settings.changeTracking?.enabled;
+		const read = readBooleanSetting(raw, true);
+		if (read.wellFormed) {
+			return;
+		}
+		this.recordWarning(
+			scope,
+			`non-boolean:changeTracking.enabled=${JSON.stringify(raw)}`,
+			`changeTracking.enabled is ${JSON.stringify(raw)} (${scope} settings), not true or false: it is read as ${read.value ? "on" : "off"}. Write it as true or false.`,
+		);
+	}
+
 	/** Report every key this version does not recognize (CD-3). */
 	private reportUnknownSettingsKeys(scope: SettingsScope, settings: Settings): void {
 		for (const key of collectUnknownSettingsKeys(settings as Record<string, unknown>)) {
@@ -2142,6 +2191,7 @@ export class SettingsManager {
 			// A write that carries unknown keys back to disk keeps them visible.
 			this.reportUnknownSettingsKeys(scope, mergedSettings);
 			this.reportSpendPriceOverrideProblems(scope, mergedSettings);
+			this.reportNonBooleanSwitches(scope, mergedSettings);
 
 			return JSON.stringify(mergedSettings, null, 2);
 		});
@@ -3262,7 +3312,7 @@ export class SettingsManager {
 	}
 
 	getChangeTrackingEnabled(): boolean {
-		return this.settings.changeTracking?.enabled ?? true;
+		return readBooleanSetting(this.settings.changeTracking?.enabled, true).value;
 	}
 
 	setBlockImages(blocked: boolean): void {
