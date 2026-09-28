@@ -52,6 +52,10 @@ import type { ConfigurationMenuComponent } from "../src/modes/interactive/compon
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.js";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
+import {
+	resetBudgetTruncatableTracking,
+	toolOutputFull,
+} from "../src/modes/interactive/components/tool-output-budget.js";
 import { TurnActivityState, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { formatSplashCwd, InteractiveMode, truncatePathMiddle } from "../src/modes/interactive/interactive-mode.js";
 import { PastedImageFiles } from "../src/modes/interactive/pasted-image-files.js";
@@ -4860,6 +4864,7 @@ describe("InteractiveMode.setToolsExpanded", () => {
 				requestRenderPreservingViewport: vi.fn(),
 				isFullscreen: vi.fn().mockReturnValue(false),
 				isFullscreenReviewing: vi.fn().mockReturnValue(false),
+				terminal: { columns: 100 },
 			},
 		};
 		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
@@ -5198,6 +5203,59 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		withBare.toggleToolOutputExpansion();
 		expect(withBare.showToast).toHaveBeenCalledWith("这一轮没有可以展开的步骤");
 		expect(bare.processBlockExpanded).toBe(false);
+
+		// Alt+O: the GLOBAL key used to only check that a turn answers to
+		// setExpanded, not whether it has anything in it - a bare box always
+		// has the method, so it silently flipped the lane. It must see the
+		// same empty box and say so instead.
+		withBare.toggleToolOutputExpansion(true);
+		expect(withBare.showToast).toHaveBeenCalledTimes(2);
+		expect(withBare.showToast).toHaveBeenLastCalledWith("还没有可以展开的步骤");
+		expect(withBare.toolOutputExpanded).toBe(false);
+
+		// Alt+T: the GLOBAL key used to only recognize a legacy
+		// AssistantMessageComponent's own thinking trace, never a box's - so
+		// it always refused a quiet turn's real thinking. A box that does
+		// have a thinking row must open it instead of toasting.
+		const thinkingState = new TurnActivityState(1_000);
+		thinkingState.timeline.noteMessage(assistantThinking("global-alt-t"), true);
+		thinkingState.markTurnEnded(1_500);
+		const thinkingSummary = new TurnSummaryComponent(thinkingState);
+		thinkingSummary.setQuiet(true);
+		const withThinking = createExpansionFakeThis([thinkingSummary]);
+		withThinking.uiServices = { settingsManager: { getProcessMode: () => "quiet" as const } };
+		withThinking.showToast = vi.fn();
+		withThinking.toggleThinkingBlockVisibility(true);
+		expect(withThinking.showToast).not.toHaveBeenCalled();
+		expect(withThinking.thinkingExpanded).toBe(true);
+
+		// Alt+Shift+O: nothing anywhere was ever reported as held back by the
+		// output budget, so lifting it would show nothing new.
+		resetBudgetTruncatableTracking();
+		empty.toggleToolOutputFull();
+		expect(empty.showToast).toHaveBeenLastCalledWith("没有被省略的输出");
+		expect(toolOutputFull()).toBe(false);
+
+		// Ctrl+P / Alt+P: an empty conversation has no agent messages either.
+		empty.toggleAgentMessageExpansion();
+		expect(empty.showToast).toHaveBeenLastCalledWith("还没有代理消息可以展开");
+		expect(empty.agentMessagesExpanded).toBe(false);
+
+		// Alt+A: no subagent to focus - it used to decline the key and drop it
+		// silently instead of saying why.
+		empty.subagentSummaryLine = { isSelectable: () => false };
+		empty.focusSubagentSummaryFromKey();
+		expect(empty.showToast).toHaveBeenLastCalledWith("现在没有子代理可以查看");
+
+		// Alt+Up on an empty conversation: there is nothing to walk.
+		empty.startBlockNavigation(-1);
+		expect(empty.showToast).toHaveBeenLastCalledWith("还没有可以查看的内容");
+		expect(empty.blockNavigation).toBeUndefined();
+
+		// Ctrl+Alt+Up/Down with no queued message selected.
+		empty.queueSelection = { selected: undefined };
+		empty.moveQueueSelection(-1);
+		expect(empty.showToast).toHaveBeenLastCalledWith("没有选中的排队消息");
 	});
 
 	test("quiet Ctrl+O opens and closes the latest box as a whole (T6)", () => {

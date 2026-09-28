@@ -304,7 +304,12 @@ import {
 	ToolExecutionComponent,
 	type ToolExecutionDefinition,
 } from "./components/tool-execution.js";
-import { setQuietConversationBudget, setToolOutputFull, toolOutputFull } from "./components/tool-output-budget.js";
+import {
+	anyBudgetTruncatable,
+	setQuietConversationBudget,
+	setToolOutputFull,
+	toolOutputFull,
+} from "./components/tool-output-budget.js";
 import { TopBar } from "./components/top-bar.js";
 import { TreeSelectorComponent } from "./components/tree-selector.js";
 import {
@@ -733,6 +738,41 @@ function windowCutTurn(messages: readonly AgentMessage[], shown: readonly AgentM
 		hiddenSteps,
 	};
 }
+
+/** Whether a turn has any process rows to open: a box needs its own rows; legacy always has a process block. */
+function turnHasProcess(summary: TurnSummaryComponent): boolean {
+	const state = summary.state;
+	return !state.boxMode || state.boxView().rows.length > 0;
+}
+
+/** Whether a turn has any agent-to-agent messages to open (received or sent, box or legacy). */
+function turnHasAgentMessages(summary: TurnSummaryComponent): boolean {
+	const state = summary.state;
+	return !state.boxMode || state.commMessageCount > 0;
+}
+
+/**
+ * Whether anything in the chat has content for one expansion lane: a box turn
+ * asks its own predicate (real content, not just the method's presence); any
+ * other component (the legacy per-message chat) falls back to its own check,
+ * exactly as before this box-aware version existed.
+ */
+function chatHasTurnLane(
+	children: readonly Component[],
+	hasLane: (summary: TurnSummaryComponent) => boolean,
+	hasLegacyLane: (child: Component) => boolean,
+): boolean {
+	return children.some((child) => (child instanceof TurnSummaryComponent ? hasLane(child) : hasLegacyLane(child)));
+}
+
+const hasSetExpandedLane = (child: Component): boolean =>
+	!(child instanceof UserMessageComponent) &&
+	typeof (child as unknown as LaneExpandableComponent).setExpanded === "function";
+
+const hasThinkingTraceLane = (child: Component): boolean =>
+	child instanceof AssistantMessageComponent && child.hasThinkingTrace();
+
+const hasAnyMessageLane = (child: Component): boolean => !(child instanceof UserMessageComponent);
 
 function mergeSubagentSnapshot(
 	previous: AgentConnectionRlmChildAgentSnapshot,
@@ -5148,7 +5188,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.edits.expand", () => this.toggleEditDiffExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
 		this.defaultEditor.onAction("app.thinking.toggleAll", () => this.toggleThinkingBlockVisibility(true));
-		this.defaultEditor.onAction("app.subagents.focus", () => this.focusSubagentSummary());
+		this.defaultEditor.onAction("app.subagents.focus", () => this.focusSubagentSummaryFromKey());
 		this.defaultEditor.onAction("app.subagents.stopAll", () => void this.requestStopAllSubagents());
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
 			void this.showHeartbeatManager();
@@ -7611,6 +7651,12 @@ export class InteractiveMode {
 		return true;
 	}
 
+	/** Alt+A: same as focusSubagentSummary(), but says why when there is nothing to focus. */
+	private focusSubagentSummaryFromKey(): void {
+		if (this.focusSubagentSummary()) return;
+		this.showToast("现在没有子代理可以查看");
+	}
+
 	/**
 	 * Enter on the subagent panel: straight into the selected child when it has a
 	 * daemon session to attach to, else this session's children list.
@@ -9516,7 +9562,10 @@ export class InteractiveMode {
 		}
 		const blocks = this.navigableBlocks();
 		const start = this.blockNearestView(blocks);
-		if (!start) return;
+		if (!start) {
+			this.showToast("还没有可以查看的内容");
+			return;
+		}
 		const navigator: BlockNavigator = new BlockNavigator({
 			move: (step) => this.moveBlockFocus(step),
 			toggle: () => this.toggleFocusedBlock(),
@@ -9836,7 +9885,11 @@ export class InteractiveMode {
 	}
 
 	private moveQueueSelection(direction: -1 | 1): void {
-		if (this.pendingQueueEdit || !this.queueSelection.selected) return;
+		if (this.pendingQueueEdit) return;
+		if (!this.queueSelection.selected) {
+			this.showToast("没有选中的排队消息");
+			return;
+		}
 		const sessionGeneration = this.sessionEventGeneration;
 		void this.enqueueQueueMutation(async () => {
 			if (sessionGeneration !== this.sessionEventGeneration) return;
@@ -10302,7 +10355,7 @@ export class InteractiveMode {
 				return;
 			}
 		}
-		if (!chatHasLane(this.chatContainer.children, "setExpanded")) {
+		if (!chatHasTurnLane(this.chatContainer.children, turnHasProcess, hasSetExpandedLane)) {
 			this.showToast("还没有可以展开的步骤");
 			return;
 		}
@@ -10426,6 +10479,10 @@ export class InteractiveMode {
 	 * keeps the viewport anchored exactly like the ctrl+o toggle.
 	 */
 	private toggleToolOutputFull(): void {
+		if (!anyBudgetTruncatable()) {
+			this.showToast("没有被省略的输出");
+			return;
+		}
 		if (!setToolOutputFull(!toolOutputFull())) {
 			return;
 		}
@@ -10435,7 +10492,10 @@ export class InteractiveMode {
 
 	private toggleAgentMessageExpansion(global = false): void {
 		// U6: Ctrl+P keeps its own lane - agent message rows only. The plain key
-		// acts on the latest turn; Alt+P acts globally (K3 ②).
+		// acts on the latest turn; Alt+P acts globally (K3 ②). A turn's own lane
+		// stays free to open even with nothing in it yet (lanes are independent,
+		// not mutually exclusive); only the conversation-wide fallback below
+		// (no turn at all, or nothing anywhere for Alt+P) says why nothing moved.
 		if (!global) {
 			const summary = this.latestTurnSummary();
 			if (summary) {
@@ -10450,6 +10510,10 @@ export class InteractiveMode {
 				this.applyTurnExpansion(summary);
 				return;
 			}
+		}
+		if (!chatHasTurnLane(this.chatContainer.children, turnHasAgentMessages, hasAnyMessageLane)) {
+			this.showToast("还没有代理消息可以展开");
+			return;
 		}
 		this.agentMessagesExpanded = !this.agentMessagesExpanded;
 		this.syncAllTurnLanes(this.agentMessagesExpanded, "agentMessages");
@@ -10553,11 +10617,7 @@ export class InteractiveMode {
 				return;
 			}
 		}
-		if (
-			!this.chatContainer.children.some(
-				(child) => child instanceof AssistantMessageComponent && child.hasThinkingTrace(),
-			)
-		) {
+		if (!chatHasTurnLane(this.chatContainer.children, turnHasThinking, hasThinkingTraceLane)) {
 			this.showToast("还没有思考内容可以展开");
 			return;
 		}

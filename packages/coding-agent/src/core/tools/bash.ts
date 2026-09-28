@@ -15,7 +15,9 @@ import {
 	expandedOutputSkippedDetail,
 	expandedOutputWindow,
 	quietConversationBudget,
+	reportBudgetTruncatable,
 	toolOutputFull,
+	wouldBudgetTruncate,
 } from "../../modes/interactive/components/tool-output-budget.js";
 import type { VisualTruncateResult } from "../../modes/interactive/components/visual-truncate.js";
 import { theme, themeToken } from "../../modes/interactive/theme/theme.js";
@@ -796,8 +798,10 @@ function collapsedPreviewHint(skipped: number): string {
  * and wrapped exactly like the unbounded view did, plus - when the budget held
  * something back - the line that says how much and how to see all of it.
  */
-function bashExpandedLines(output: string, width: number, showExpandHint: boolean): string[] {
-	const window = expandedOutputWindow(output.split("\n"));
+function bashExpandedLines(output: string, width: number, showExpandHint: boolean, truncationId: object): string[] {
+	const lines = output.split("\n");
+	reportBudgetTruncatable(truncationId, wouldBudgetTruncate(lines));
+	const window = expandedOutputWindow(lines);
 	const styledOutput = window.lines.map((line) => theme.fg("toolOutput", line)).join("\n");
 	const body = new Text(`\n${styledOutput}`, 0, 0).render(width);
 	if (!window.truncated) {
@@ -860,7 +864,7 @@ function rebuildBashResultRenderComponent(
 					if (cached) {
 						return cached;
 					}
-					const lines = bashExpandedLines(output, width, showExpandHint);
+					const lines = bashExpandedLines(output, width, showExpandHint, state);
 					state.cachedExpandedOutput = output;
 					state.cachedExpandedWidth = width;
 					state.cachedExpandedTheme = themeToken();

@@ -106,7 +106,20 @@ describe("fullscreen click regions", () => {
 					terminal.sendInput("\x1b[<64;5;5M");
 					await terminal.waitForRender();
 				}
+				// The click at y=8 only lands on the region because the three
+				// ticks actually moved the viewport: anchor the post-scroll
+				// frame itself, not just the click outcome it produces - a
+				// region projection that used the pre-scroll offset instead
+				// would still leave y=8 unmatched (calls stays empty) and this
+				// line would catch that even though the assertion below could not.
+				assert.ok(terminal.getViewport()[4]?.startsWith("row 12"));
 				await click(8, 5);
+				// A projection still using the pre-scroll offset would map the
+				// region one row higher, so y=5 (not y=8) would land the hit -
+				// same final `calls` value as the real remap, just from the
+				// other click. Checking after each click separately, not only
+				// the combined total, is what tells the two worlds apart.
+				assert.deepStrictEqual(calls, []);
 				await click(8, 8);
 			},
 		);

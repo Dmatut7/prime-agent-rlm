@@ -164,7 +164,8 @@ Use `tab` to cycle forward and `shift+tab` to cycle backward through Providers, 
 | Keybinding id | Default | Description |
 |--------|---------|-------------|
 | `app.tools.expand` | `ctrl+o` | Collapse or expand tool output |
-| `app.tools.expandFull` | `alt+o` | Show tool output in full, ignoring the expanded render budget |
+| `app.tools.expandAll` | `alt+o` | Collapse or expand tool output in every turn, not just the latest |
+| `app.tools.expandFull` | `alt+shift+o` | Show tool output in full, ignoring the expanded render budget |
 | `app.messages.expand` | `ctrl+p` | Collapse or expand agent-to-agent messages |
 | `app.edits.expand` | `ctrl+j` | Collapse or expand edit diffs |
 | `app.turn.focus` | `alt+j`, `ctrl+j` | Walk the latest turn's box: arrows move, PageUp/PageDown scroll it, Enter opens a row, Escape leaves. Outside the quiet conversation (`ui.processMode: "legacy"`) both keys open or close the edit diffs instead, like `app.edits.expand`. Terminals without extended keys (tmux without `extended-keys`) send `ctrl+j` as a newline, so there `alt+j` is the key that reaches the app |
