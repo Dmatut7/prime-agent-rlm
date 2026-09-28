@@ -148,6 +148,17 @@ describe("a turn that did say something keeps its wording", () => {
 		expect(header).toContain("✓ 直接回答了");
 	});
 
+	it("counts a text reply followed by an empty reply of the same turn as an answer too", () => {
+		const header = headerOf(
+			finishedBox([
+				assistant(T0 + 1_000, [{ type: "text", text: "先答一句。" }], "stop"),
+				assistant(T0 + 2_000, [], "length"),
+			]),
+		);
+		expect(header).toContain("✓ 直接回答了");
+		expect(header).not.toContain("这轮没有输出");
+	});
+
 	it("keeps counting a thought that has text as a thought", () => {
 		const header = headerOf(
 			finishedBox([assistant(T0 + 1_000, [{ type: "thinking", thinking: "先想一想。再想一想。" }], "length")]),

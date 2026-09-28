@@ -95,14 +95,14 @@ describe("a replayed turn that ended on an interrupt or an error keeps its own c
 	it("reads four seconds for a turn the owner interrupted, not the hours since its messages", () => {
 		const header = replayedHeader(cutOff("aborted"));
 		expect(header).toContain("已停止");
-		expect(header).toContain("4秒");
+		expect(header).toMatch(/(?<!\d)4秒/);
 		expect(header).not.toMatch(/小时/);
 	});
 
 	it("reads four seconds for a turn that ended on a model error too", () => {
 		const header = replayedHeader(cutOff("error", "model gave up"));
 		expect(header).toContain("✗");
-		expect(header).toContain("4秒");
+		expect(header).toMatch(/(?<!\d)4秒/);
 		expect(header).not.toMatch(/小时/);
 	});
 });
