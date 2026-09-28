@@ -182,7 +182,7 @@ _SECRET_SHAPES: tuple[tuple[tuple[str, ...], bool, re.Pattern[str]], ...] = tupl
     (markers, lower, re.compile(pattern))
     for markers, lower, pattern in (
         (("PRIVATE KEY",), False, r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"),
-        (("sk-",), False, r"(?<![A-Za-z0-9])sk-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_-]{20,}"),
+        (("sk-",), False, r"(?<![A-Za-z0-9])sk-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_.-]{20,}"),
         (("k_live_", "k_test_"), False, r"(?<![A-Za-z0-9])[rs]k_(?:live|test)_[A-Za-z0-9]{16,}"),
         (("AKIA", "ASIA"), False, r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])"),
         (("ghp_", "gho_", "ghu_", "ghs_", "ghr_"), False, r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{30,}"),
