@@ -1,0 +1,1 @@
+- Fixed `matchesKey` and `parseKey` missing Alt+Shift+letter when a terminal without extended keys (tmux by default) sends it as ESC plus the uppercase letter; a lone Alt+Shift+O or Alt+Shift+P reaches the app after the input buffer's 10 ms flush.
