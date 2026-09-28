@@ -134,6 +134,141 @@ _SKIP_FILE_NAMES = frozenset({".DS_Store"})
 _SED_TEMP = re.compile(r"\.![0-9]+!.")
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
 
+# Secrets are withheld from records: the host saves them with the session, so a diff or memory text
+# holding a credential would put it on disk. A withheld record keeps its path, kind and line counts.
+SENSITIVE = "sensitive"
+# Files that hold credentials by convention: their diffs are never kept, whatever they contain.
+_SENSITIVE_FILE_NAMES = frozenset(
+    {
+        ".env",
+        ".netrc",
+        "_netrc",
+        ".npmrc",
+        ".pypirc",
+        ".pgpass",
+        ".htpasswd",
+        ".git-credentials",
+        ".dockercfg",
+        ".boto",
+        ".s3cfg",
+        "credentials",
+    }
+)
+_SENSITIVE_PREFIXES = (".env.", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519")
+_SENSITIVE_SUFFIXES = (
+    ".env",
+    ".pem",
+    ".key",
+    ".p8",
+    ".p12",
+    ".pfx",
+    ".ppk",
+    ".keystore",
+    ".jks",
+    ".kdbx",
+    ".tfvars",
+    ".tfstate",
+)
+# Every file under these directories (ssh keys, gpg keyrings, cloud and registry logins).
+_SENSITIVE_DIR_NAMES = frozenset({".ssh", ".gnupg", ".aws", ".kube", ".docker"})
+# `secrets.yaml`, `db-credentials.json`: a name about secrets on a config or data file, not on source code.
+_SENSITIVE_CONFIG = re.compile(
+    r"(?:secret|credential)[^/]*\.(?:json|ya?ml|toml|ini|cfg|conf|env|properties|txt|xml|plist)$|^[^.]*(?:secret|credential)[^.]*$",
+    re.IGNORECASE,
+)
+# Credential shapes that are distinctive on their own. Each runs only when one of its literal markers
+# occurs (a plain substring test), so a diff without any marker costs a few substring scans.
+_SECRET_SHAPES: tuple[tuple[tuple[str, ...], bool, re.Pattern[str]], ...] = tuple(
+    (markers, lower, re.compile(pattern))
+    for markers, lower, pattern in (
+        (("PRIVATE KEY",), False, r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"),
+        (("sk-",), False, r"(?<![A-Za-z0-9])sk-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_-]{20,}"),
+        (("k_live_", "k_test_"), False, r"(?<![A-Za-z0-9])[rs]k_(?:live|test)_[A-Za-z0-9]{16,}"),
+        (("AKIA", "ASIA"), False, r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])"),
+        (("ghp_", "gho_", "ghu_", "ghs_", "ghr_"), False, r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{30,}"),
+        (("github_pat_",), False, r"github_pat_[A-Za-z0-9_]{20,}"),
+        (("xox",), False, r"(?<![A-Za-z0-9])xox[abprs]-[A-Za-z0-9-]{10,}"),
+        (("glpat-",), False, r"(?<![A-Za-z0-9])glpat-[A-Za-z0-9_-]{20,}"),
+        (("AIza",), False, r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}"),
+        (("hf_",), False, r"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{30,}"),
+        (("npm_",), False, r"(?<![A-Za-z0-9])npm_[A-Za-z0-9]{36}"),
+        (("pypi-AgE",), False, r"pypi-AgE[A-Za-z0-9_-]{20,}"),
+        (("eyJ",), False, r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+        (("bearer",), True, r"\bbearer\s+[a-z0-9._~+/=-]{20,}"),
+        (("://",), True, r"\b[a-z][a-z0-9+.-]*://[^\s:/@\"']+:[^\s:/@\"']{6,}@"),
+    )
+)
+# `name = value` assignments whose name ends in one of these words (matched on the lower-cased text).
+_SECRET_NAMES = (
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "credential",
+    "api_key",
+    "api-key",
+    "apikey",
+    "access_key",
+    "access-key",
+    "private_key",
+    "private-key",
+)
+# What may follow the name: `secret_key`, `credentials`, a closing quote, then `=` or `:` (not `==`)
+# and a quoted or bare value.
+_SECRET_ASSIGNMENT_TAIL = re.compile(
+    r"(?:[_-]?key)?s?[\"']?\s*(?<![=!<>])[:=](?!=)\s*(?:([\"'])([^\"'\s]{8,})\1|([^\s\"'#,;.(){}\[\]<>]{8,}))"
+)
+_SECRET_PLACEHOLDER = re.compile(
+    r"(?i)^(?:x+|\*+|\.+|changeme|change_me|placeholder|example\w*|dummy\w*|redacted|none|null|true|false|"
+    r"your[_-]?\w*|replace[_-]?me\w*|\$\{?\w+\}?|%\(\w+\)s|\{\{.*\}\})$"
+)
+_IDENTIFIER_LIKE = re.compile(r"^[A-Za-z_-]+$")
+
+
+def _sensitive_path(path: str | None) -> bool:
+    """Whether a file's name or folder marks it as a credential store."""
+    if not path:
+        return False
+    directory, name = os.path.split(path)
+    lower = name.lower()
+    if lower in _SENSITIVE_FILE_NAMES or lower.startswith(_SENSITIVE_PREFIXES) or lower.endswith(_SENSITIVE_SUFFIXES):
+        return True
+    if _SENSITIVE_CONFIG.search(lower):
+        return True
+    return any(part.lower() in _SENSITIVE_DIR_NAMES for part in directory.split(os.sep))
+
+
+def _looks_secret(text: str | None) -> bool:
+    """Whether a text holds a likely credential. Callers bound the text; an error counts as a secret."""
+    if not text:
+        return False
+    try:
+        lower = text.lower()
+        for markers, use_lower, pattern in _SECRET_SHAPES:
+            haystack = lower if use_lower else text
+            if any(marker in haystack for marker in markers) and pattern.search(haystack):
+                return True
+        for name in _SECRET_NAMES:
+            start = lower.find(name)
+            while start >= 0:
+                match = _SECRET_ASSIGNMENT_TAIL.match(lower, start + len(name))
+                if match:
+                    value = match.group(2) or match.group(3) or ""
+                    if not (_SECRET_PLACEHOLDER.match(value) or value.isdigit() or _IDENTIFIER_LIKE.match(value)):
+                        return True
+                start = lower.find(name, start + 1)
+        return False
+    except Exception:  # noqa: BLE001 - withholding is the safe answer
+        return True
+
+
+def _withhold_memory_texts(record: dict[str, Any], withheld: bool = False) -> None:
+    """Drop both texts of a memory record when either holds a likely credential (or `withheld` says so)."""
+    if withheld or _looks_secret(record.get("before")) or _looks_secret(record.get("after")):
+        record.pop("before", None)
+        record.pop("after", None)
+        record["textOmitted"] = SENSITIVE
+
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 
 _Sender = Callable[[str, dict[str, Any]], None]
@@ -719,6 +854,9 @@ class _Tracker:
         harness.add(os.path.join(self.agent_dir, "harness", HARNESS_STATE_FILE_NAME))
         journal = (os.environ.get("PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL") or "").strip()
         roots = {os.path.realpath(prefix) for prefix in (sys.prefix, sys.base_prefix, sys.exec_prefix) if prefix}
+        if session_dir:
+            # The session's own storage (subagent folders, artifacts) is not project work, wherever it sits.
+            roots.add(os.path.realpath(session_dir))
         harness_files = frozenset(harness)
         skip_files = frozenset({os.path.realpath(journal)} if journal else ())
         # An environment inside the project is skipped by its directory name instead.
@@ -1588,6 +1726,8 @@ class _Tracker:
 
     def apply_shell_changes(self, cell: _Cell, changes: list[tuple[str, _Content]]) -> None:
         for path, baseline in changes:
+            if path in self.harness_files:
+                continue  # the harness's own saves report themselves as memory records
             with self.lock:
                 rec = cell.files.get(path)
                 if rec is not None:
@@ -1799,7 +1939,11 @@ class _Tracker:
         if diff_lines is not None:
             text, truncated = _cap_diff(diff_lines)
             room = MAX_DIFF_CHARS_PER_CELL - (cell.diff_chars - rec.diff_chars)
-            if len(text) > room:
+            if _sensitive_path(rec.path) or _sensitive_path(rec.old_path) or _looks_secret(text):
+                omitted = SENSITIVE
+                cell.diff_chars -= rec.diff_chars
+                rec.diff_chars = 0
+            elif len(text) > room:
                 omitted = "budget"
             else:
                 cell.diff_chars += len(text) - rec.diff_chars
@@ -1885,6 +2029,7 @@ class _Tracker:
             text = _decode_text(after) if after is not None else None
             if text is not None:
                 memory["after"] = _clip(text, MAX_MEMORY_TEXT)
+        _withhold_memory_texts(memory, change.get("diffOmitted") == SENSITIVE)
         memory["at"] = _now_ms()
         self.send(cell.id, {MEMORY_CHANGE_MIME: memory})
 
@@ -2014,6 +2159,8 @@ class _Tracker:
                     else:
                         record.pop("previousTitle", None)
             if not retract:
+                # Once withheld in a cell, an entry stays withheld: its earlier text held the secret.
+                _withhold_memory_texts(record, prior is not None and prior.get("textOmitted") == SENSITIVE)
                 cell.memory[key] = record
         if retract:
             self.send(cell.id, {MEMORY_CHANGE_MIME: {"kind": key[0], "scope": key[1], "id": key[2], "retracted": True}})

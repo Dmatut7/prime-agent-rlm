@@ -521,7 +521,7 @@ old one is reclaimed only after its references drop to zero.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `changeTracking.enabled` | boolean | `true` | Report what each Python cell changed and did - files it created, edited, renamed or deleted (with diffs), harness memory, skill and note edits, and the commands, reads, searches and subagent spawns it ran - so the UI can show them. Display-only: the model's context is identical either way. Off, the kernel installs no file wrappers and runs no extra `git status`. Read when a kernel starts; use `/reload` to apply a change to a running session |
+| `changeTracking.enabled` | boolean | `true` | Report what each Python cell changed and did - files it created, edited, renamed or deleted (with diffs), harness memory, skill and note edits, and the commands, reads, searches and subagent spawns it ran - so the UI can show them. Display-only for the model: its context is identical either way. The records are still saved with the session (session files, attach snapshots, `/export`), so the kernel withholds secrets: a credential file (`.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `.netrc`, `.npmrc`, `credentials*`, files under `.ssh`/`.aws`, and similar) keeps only its path and line counts, and so does any file or memory entry whose text holds a likely credential (private key blocks, API tokens, `password=`-style assignments). Off, the kernel installs no file wrappers and runs no extra `git status`. Read when a kernel starts; use `/reload` to apply a change to a running session |
 
 ```json
 {

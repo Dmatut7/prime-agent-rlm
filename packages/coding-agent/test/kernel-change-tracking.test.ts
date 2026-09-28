@@ -120,6 +120,40 @@ describe("change-tracking display payloads", () => {
 		expect(parseActivityDisplay({ ...command, background: "yes", commit: "not-a-sha" })).toEqual(command);
 	});
 
+	it("keeps the withheld-secret markers through to a cell's result fields, and never a withheld text", () => {
+		const envChange: KernelFileChange = {
+			path: "/repo/.env",
+			relPath: ".env",
+			kind: "modified",
+			scope: "project",
+			added: 1,
+			removed: 1,
+			diffOmitted: "sensitive",
+			source: "shell",
+			at: 1_700_000_000_003,
+		};
+		const withheldMemory: KernelMemoryChange = {
+			op: "created",
+			kind: "memory",
+			scope: "session",
+			id: "creds",
+			title: "creds",
+			textOmitted: "sensitive",
+			at: 1_700_000_000_004,
+		};
+		expect(parseFileChangeDisplay(envChange)).toEqual(envChange);
+		expect(parseMemoryChangeDisplay(withheldMemory)).toEqual(withheldMemory);
+		// A record that claims to be withheld keeps no text, whatever else it carries.
+		expect(parseFileChangeDisplay({ ...envChange, diff: "+KEY=sk-leak" })).toEqual(envChange);
+		expect(parseMemoryChangeDisplay({ ...withheldMemory, after: "token=sk-leak" })).toEqual(withheldMemory);
+		const effects = new KernelEffectsAccumulator();
+		effects.apply({ [FILE_CHANGE_DISPLAY_MIME]: envChange });
+		effects.apply({ [MEMORY_CHANGE_DISPLAY_MIME]: withheldMemory });
+		const fields = effects.resultFields();
+		expect(fields.fileChanges?.map((change) => change.diffOmitted)).toEqual(["sensitive"]);
+		expect(fields.memoryChanges?.map((change) => change.textOmitted)).toEqual(["sensitive"]);
+	});
+
 	it("ignores malformed records instead of throwing", () => {
 		for (const bad of [
 			null,
