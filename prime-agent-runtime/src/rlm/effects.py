@@ -2146,8 +2146,8 @@ class _Tracker:
                     del self.pending_completions[0]
                     self.lost_completions += 1
                 return
-            target = cell.id
-        self.send_activity(target, record)
+            # Sent under the lock: the cell cannot finish between being chosen here and the record going out.
+            self.send_activity(cell.id, record)
 
     def memory_change(self, record: dict[str, Any]) -> None:
         cell = self.cell
