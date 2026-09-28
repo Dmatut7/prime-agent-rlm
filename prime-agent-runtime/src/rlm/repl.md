@@ -241,7 +241,7 @@ case nothing below is installed at all. Implemented in `rlm/effects.py`.
 |---|---|
 | `application/vnd.prime-agent.file-change+json` | one file effect: `path`, `relPath?`, `kind` (`created`/`modified`/`deleted`/`renamed`), `oldPath?`, `scope` (`project`/`scratch`/`memory`), `added`, `removed`, `diff?`, `diffTruncated?`, `diffOmitted?` (`too_large`/`no_baseline`/`budget`), `binary?`, `source` (`python`/`shell`/`edit`), `at` |
 | `application/vnd.prime-agent.memory-change+json` | one harness entry or rules-file change: `op`, `kind` (`memory`/`skill`/`subagent`/`prompt_note`/`rules_file`), `scope` (`session`/`global`/`project`), `id`, `title`, `previousTitle?`, `before?`, `after?`, `at` |
-| `application/vnd.prime-agent.activity+json` | one step: `id`, `kind` (`command`/`read`/`search`/`fetch`/`subagent`), `label`, `status` (`running`/`ok`/`error`), `detail?`, `startedAt`, `endedAt?` |
+| `application/vnd.prime-agent.activity+json` | one step: `id`, `kind` (`command`/`read`/`search`/`fetch`/`subagent`), `label`, `status` (`running`/`ok`/`error`), `detail?`, `startedAt`, `endedAt?`, `background?`, `commit?` |
 | `application/vnd.prime-agent.change-tracking+json` | at most one per cell: `{"incomplete": reason}` when the lists above are partial |
 
 Every record is complete on its own; the host keeps the latest one per file
@@ -270,6 +270,30 @@ deleted in the same cell.
   default 500); past it, tracking stops for that cell and says so in the
   `change-tracking` record. Diffs are capped at 400 lines / 64 KiB per file and
   256 KiB per cell; memory texts at 4000 characters.
+- No git work ever runs on the cell's own thread. A before-state snapshot runs
+  on a worker: at the cell's start (while `bash()` handles from earlier cells
+  are alive) nothing waits for it at all, and a process the cell starts waits
+  for it at most for the remaining budget. A snapshot or the end-of-cell
+  comparison that does not finish in time is abandoned and the cell's
+  `change-tracking` record names the cause; changes made by commands are then
+  not listed rather than guessed. Live mid-cell comparisons (after a `bash()`
+  command ends) run at most once a second on the tracker's own thread and a
+  separate 1 s allowance, so a loop of many commands keeps the cell's budget for
+  the final comparison.
+- The host keeps at most the most recent 100 steps per cell (oldest finished
+  ones dropped first, counted in `activitiesDropped`).
+- A `bash()` command still running when its cell ends gets one last record in
+  that cell: `status: "running"`, `background: true`, `detail` `转到后台继续跑`,
+  `endedAt` = the cell's end, so a replayed cell shows it as handed off rather
+  than as still spinning. Its outcome is reported later with the same `id`,
+  `background: true` and `status` `ok`/`error`, in whichever cell is running
+  when it ends, or first thing in the next cell that starts.
+- A command that succeeds and whose output carries git's commit line
+  (`[main 1a2b3c4] subject`, also from cherry-pick and revert) adds `commit`
+  with that id to its final record; `detail` stays the last output line.
+- Once a cell has reported any file (or memory) change, the host sends that
+  list explicitly even when retractions have emptied it (`fileChanges: []`), so
+  a change undone within the cell does not stay on screen.
 - `bash()` commands, `rlm.run()` spawns, harness writes and the web skills
   report their own steps (`rlm.effects.step`, `rlm.effects.reported`); plain
   reads inside the working directory are reported once per file per cell.

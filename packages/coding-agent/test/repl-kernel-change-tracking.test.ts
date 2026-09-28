@@ -2,14 +2,24 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ExtensionContext } from "../src/core/extensions/types.js";
 import {
 	CHANGE_TRACKING_ENV_VAR,
 	type ExecuteResult,
+	type KernelActivity,
 	type KernelCellEffects,
+	type KernelClient,
+	MAX_ACTIVITIES_PER_CELL,
 	ReplKernelManager,
 } from "../src/core/kernel/index.js";
-import { assembleIpythonToolResult } from "../src/core/tools/ipython.js";
+import {
+	assembleIpythonToolResult,
+	createIpythonToolDefinition,
+	type IpythonKernelProvisioner,
+	type IpythonToolDetails,
+	LIVE_ACTIVITIES_FULL_EVERY_MS,
+} from "../src/core/tools/ipython.js";
 import { resolveKernelPython } from "./kernel-python.js";
 
 // Resolved the way the product resolves a kernel interpreter (see kernel-python.ts).
@@ -136,6 +146,101 @@ describe.skipIf(!canRunKernel)("change tracking through the real kernel", () => 
 		expect(finishedAt - (firstLive?.at ?? finishedAt)).toBeGreaterThan(500);
 	}, 60_000);
 
+	function toolOver(manager: ReplKernelManager, root: string) {
+		const provisioner = {
+			ensure: vi.fn(async () => manager as KernelClient),
+			kill: vi.fn(async () => {}),
+		} as unknown as IpythonKernelProvisioner;
+		return createIpythonToolDefinition(root, { provisioner });
+	}
+
+	it("clears a change that was undone within the cell, live and in the final details", async () => {
+		const { root, state } = project();
+		const manager = kernel(root, state, "1");
+		const tool = toolOver(manager, root);
+		const partials: IpythonToolDetails[] = [];
+		const result = await tool.execute(
+			"call-undo",
+			{
+				code: [
+					"import rlm, time",
+					"open('a.txt', 'w').write('changed\\n')",
+					"rlm.harness.create_memory('Scratch', 'temporary', id='scratch')",
+					"time.sleep(0.8)",
+					"open('a.txt', 'w').write('one\\ntwo\\nthree\\n')",
+					"rlm.harness.delete_memory('scratch')",
+					"time.sleep(0.5)",
+				].join("\n"),
+			},
+			undefined,
+			(partial) => partials.push((partial as { details: IpythonToolDetails }).details),
+			{} as ExtensionContext,
+		);
+		expect(result.details.status).toBe("ok");
+		// The viewer saw the change live, then an explicit empty list replacing it.
+		const shown = partials.findIndex((details) => (details.fileChanges?.length ?? 0) === 1);
+		expect(shown).toBeGreaterThanOrEqual(0);
+		const cleared = partials.findIndex((details, index) => index > shown && details.fileChanges?.length === 0);
+		expect(cleared).toBeGreaterThan(shown);
+		expect(partials.some((details) => (details.memoryChanges?.length ?? 0) === 1)).toBe(true);
+		expect(partials.some((details) => details.memoryChanges?.length === 0)).toBe(true);
+		expect(result.details.fileChanges).toEqual([]);
+		expect(result.details.memoryChanges).toEqual([]);
+	}, 60_000);
+
+	it("reports a command its cell left running as moved to the background, and its end in a later cell", async () => {
+		const { root, state } = project();
+		const manager = kernel(root, state, "1");
+		const first = await manager.execute("import rlm\nh = rlm.bash('sleep 0.6; echo finished')\nh.pid");
+		const left = first.activities?.find((activity) => activity.kind === "command");
+		expect(left).toMatchObject({ status: "running", background: true });
+		expect(left?.endedAt).toBeGreaterThanOrEqual(left?.startedAt ?? Number.POSITIVE_INFINITY);
+		const second = await manager.execute("import time\ntime.sleep(1.2)");
+		const ended = second.activities?.find((activity) => activity.id === left?.id);
+		expect(ended).toMatchObject({ status: "ok", background: true, detail: "finished" });
+	}, 60_000);
+
+	it("keeps a cell of many commands bounded, in its result and in its live updates", async () => {
+		const { root, state } = project();
+		const manager = kernel(root, state, "1");
+		const provisioner = {
+			ensure: vi.fn(async () => manager as KernelClient),
+			kill: vi.fn(async () => {}),
+		} as unknown as IpythonKernelProvisioner;
+		const tool = createIpythonToolDefinition(root, { provisioner });
+		const commands = 150;
+		const partials: IpythonToolDetails[] = [];
+		const started = Date.now();
+		const result = await tool.execute(
+			"call-many",
+			{ code: `import rlm\nbash = rlm.bash\nfor i in range(${commands}):\n    await bash('true')\nprint('done')` },
+			undefined,
+			(partial) => partials.push((partial as { details: IpythonToolDetails }).details),
+			{} as ExtensionContext,
+		);
+		const elapsed = Date.now() - started;
+		expect(result.details.status).toBe("ok");
+		const final = result.details.activities ?? [];
+		expect(final).toHaveLength(MAX_ACTIVITIES_PER_CELL);
+		expect(result.details.activitiesDropped).toBe(commands - MAX_ACTIVITIES_PER_CELL);
+		expect(final.every((activity) => activity.kind === "command" && activity.status === "ok")).toBe(true);
+
+		expect(partials.length).toBeGreaterThan(0);
+		// A viewer merging the partials by id ends up with every step the final result kept.
+		const merged = new Map<string, KernelActivity>();
+		let sentEntries = 0;
+		for (const details of partials) {
+			expect(details.activities?.length ?? 0).toBeLessThanOrEqual(MAX_ACTIVITIES_PER_CELL);
+			for (const activity of details.activities ?? []) merged.set(activity.id, activity);
+			sentEntries += details.activities?.length ?? 0;
+		}
+		for (const activity of final) expect(merged.has(activity.id)).toBe(true);
+		// Each step is resent only when it changes (start, output, end), plus a full list every few seconds;
+		// resending the whole list on every 200 ms update would cost far more than this.
+		const fullRefreshes = 1 + Math.floor(elapsed / LIVE_ACTIVITIES_FULL_EVERY_MS);
+		expect(sentEntries).toBeLessThanOrEqual(3 * commands + MAX_ACTIVITIES_PER_CELL * fullRefreshes);
+	}, 90_000);
+
 	it("gives the model byte-identical content with tracking on and off", async () => {
 		const cells = [
 			E2E_CELL,
@@ -158,6 +263,7 @@ describe.skipIf(!canRunKernel)("change tracking through the real kernel", () => 
 			expect(offResult.activities).toBeUndefined();
 			const plain = assembleIpythonToolResult(offResult, { kernelRestarted: false });
 			const tracked = assembleIpythonToolResult(onResult, { kernelRestarted: false });
+			expect(plain.content.some((block) => block.type === "text" && block.text.length > 0)).toBe(true);
 			expect(JSON.stringify(tracked.content)).toBe(JSON.stringify(plain.content));
 			expect(tracked.isError).toBe(plain.isError);
 		}
