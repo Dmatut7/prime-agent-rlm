@@ -330,5 +330,65 @@ class PassphrasePipelineTests(te.TrackerCase):
         self.assertEqual(_anywhere(cell, "horse battery"), [])
 
 
+class AssignmentFormsTests(unittest.TestCase):
+    """FIX-4: `password: str = "..."` (an annotated assignment) and `password := "..."` (Go, walrus) are
+    assignments too; `==`, `!=` and the like still are not."""
+
+    def test_annotated_and_walrus_assignments_are_withheld(self):
+        assignments = [
+            'password: str = "hunter2passw0rd"',
+            'password := "s3cretWalrusPass"',
+            'DB_PASSWORD: str = "hunter2passw0rd"',
+            "token: Optional[str] = 'abcdefgh12345678'",
+            'secret_key: typing.Final[str] = "hunter2passw0rd"',
+            'const password: string = "hunter2passw0rd";',
+            'def connect(host, password: str = "hunter2passw0rd"):',
+            "api_key:= 'abcdefgh12345678'",
+            'password: str = "correct horse battery staple"',
+        ]
+        self.assertGreater(len(assignments), 0)
+        for text in assignments:
+            with self.subTest(text=text):
+                self.assertTrue(effects._looks_secret(text))
+
+    def test_comparisons_placeholders_and_bare_annotations_stay_clean(self):
+        ordinary = [
+            'x == "12345678"',
+            'password == "abcdefgh1234"',
+            'password != "abcdefgh1234"',
+            'if password >= "abcdefgh1234":',
+            'password <= "abcdefgh1234"',
+            "password: Optional[str] = None",
+            "password: str",
+            'password: str = ""',
+            'password: str = "changeme"',
+            "password: str = os.environ['PASSWORD']",
+            "token: str = tokenizer(text)",
+            "max_tokens: int = 4096",
+        ]
+        self.assertGreater(len(ordinary), 0)
+        for text in ordinary:
+            with self.subTest(text=text):
+                self.assertFalse(effects._looks_secret(text))
+
+    def test_the_plain_forms_are_judged_as_before(self):
+        withheld = ['password = "hunter2passw"', 'password="hunter2passw"', "password: hunter2passw", '"password": "hunter22"']
+        self.assertGreater(len(withheld), 0)
+        for text in withheld:
+            with self.subTest(text=text):
+                self.assertTrue(effects._looks_secret(text))
+
+
+@unittest.skipUnless(te.HAS_GIT, "git is needed for the work-tree comparison")
+class AssignmentFormsPipelineTests(te.TrackerCase):
+    def test_an_annotated_password_written_to_a_source_file_keeps_its_counts_but_no_diff(self):
+        cell = self.kernel.run("open('settings.py', 'w').write('password: str = \"hunter2passw0rd\"\\n')")
+        record = cell.by_rel()["settings.py"]
+        self.assertEqual((record["kind"], record["added"]), ("created", 1))
+        self.assertEqual(record["diffOmitted"], effects.SENSITIVE)
+        self.assertNotIn("diff", record)
+        self.assertEqual(_anywhere(cell, "hunter2passw0rd"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -215,10 +215,11 @@ _SECRET_NAMES = (
 )
 # A passphrase in quotes: two to five short words of letters and digits, a space apart.
 _PASSPHRASE = r"[a-z0-9]{2,12}(?: [a-z0-9]{2,12}){1,4}"
-# What may follow the name: `secret_key`, `credentials`, a closing quote, then `=` or `:` (not `==`)
-# and a value: one quoted token, quoted words, or a bare token.
+# What may follow the name: `secret_key`, `credentials`, a closing quote, then `=` or `:` (not `==`), an
+# annotation before the `=` (`: str =`) or `:=`, and a value: one quoted token, quoted words, or a bare token.
 _SECRET_ASSIGNMENT_TAIL = re.compile(
-    r"(?:[_-]?key)?s?[\"']?\s*(?<![=!<>])[:=](?!=)\s*"
+    r"(?:[_-]?key)?s?[\"']?\s*"
+    r"(?<![=!<>])(?::\s*[\w\[\].\"']+\s*=(?!=)|:=|[:=](?!=))\s*"
     r"(?:(?P<quote>[\"'])(?:(?P<token>[^\"'\s]{8,})|(?P<words>" + _PASSPHRASE + r"))(?P=quote)"
     r"|(?P<bare>[^\s\"'#,;.(){}\[\]<>]{8,}))"
 )
