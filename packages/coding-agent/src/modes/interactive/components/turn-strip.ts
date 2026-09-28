@@ -1,6 +1,6 @@
 import { type ClickRegion, type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { type ThemeColor, theme } from "../theme/theme.js";
-import { cleanMemoryTitle } from "./feed-data.js";
+import { cleanMemoryTitle, symlinkVerb } from "./feed-data.js";
 import { slideCount } from "./motion.js";
 import { changeDetail, changeTotals, memoryDetail, omittedDiffText, type TimelineFacts } from "./timeline-rows.js";
 import { BOX_FOCUS_MARKER, boxOuterWidth, fitBoxLines } from "./turn-box.js";
@@ -283,16 +283,19 @@ export class TurnStripComponent implements Component {
 				renamed: "改名 ",
 			};
 			const color: ThemeColor = change.kind === "deleted" ? "diffRemovedText" : "runCardWarn";
-			const path = change.kind === "renamed" && change.oldPath ? `${change.oldPath} → ${change.path}` : change.path;
+			const renamed = change.kind === "renamed" && change.oldPath;
+			const path = renamed ? `${change.oldPath} → ${change.path}` : change.path;
+			// The link itself changed, not its target's text: no diff, so no `+0 −0`.
 			const omitted = omittedDiffText(change.omitted);
-			// Counts the kernel could not know read as the reason, never as `+0 −0`.
-			const figures =
-				omitted && change.added === 0 && change.removed === 0
+			const figures = change.symlink
+				? ""
+				: omitted && change.added === 0 && change.removed === 0
 					? theme.fg("dim", omitted)
 					: counts(change.added, change.removed);
+			const lead = change.symlink && !renamed ? `${symlinkVerb(change.kind)} ` : verb[change.kind];
 			return {
 				key: `file:${change.key}`,
-				lead: `${theme.fg(color, change.kind === "deleted" ? "✗" : "✎")} ${theme.fg("dim", verb[change.kind])}`,
+				lead: `${theme.fg(color, change.kind === "deleted" ? "✗" : "✎")} ${theme.fg("dim", lead)}`,
 				name: path,
 				nameColor: "activityText",
 				isPath: true,
