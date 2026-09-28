@@ -1,0 +1,1 @@
+- Fixed the box of a finished turn that produced no text and no steps saying "直接回答了"; it now says "（这轮没有输出）".
