@@ -480,6 +480,19 @@ class ScanCostTests(unittest.TestCase):
         self.assertLess(time.perf_counter() - started, 1.0)
         self.assertLessEqual(len(step.label), effects.MAX_LABEL)
 
+    def test_a_key_behind_a_long_stretch_of_blanks_is_still_found(self):
+        # The label shows the text with its blanks collapsed, so a key that sits far down the raw text
+        # (a pasted script, an indented heredoc) can still be on screen.
+        key = "sk-" + "ws-H." + "BLANKS" + "q" * 24
+        stretches = {
+            "newlines": "echo start" + "\n" * 1300 + "curl -H 'x-api-key: " + key + "'",
+            "spaces": "echo start" + " " * 1300 + "curl -H 'x-api-key: " + key + "'",
+            "heredoc": "cat <<EOF\n" + ("" + " " * 150 + "\n") * 8 + "  curl -H 'x-api-key: " + key + "'\nEOF",
+        }
+        for name, text in stretches.items():
+            with self.subTest(name):
+                self.assertEqual(effects.Step("command", text).label, "command")
+
     def test_a_key_far_past_the_cut_does_not_matter_but_one_straddling_it_does(self):
         key = "sk-" + "ws-H." + "STRADDLE" + "y" * 24
         far = effects.Step("command", "echo " + "z" * 5_000 + " " + key).label

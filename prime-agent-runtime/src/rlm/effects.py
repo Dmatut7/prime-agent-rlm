@@ -2503,20 +2503,22 @@ class untracked:  # noqa: N801 - used as a context manager, reads like a functio
             self._token = None
 
 
-# A label shows MAX_LABEL characters. The scan reads that much and a margin past the cut, so a key the cut
-# splits is still whole to it; the rest of a long task text (megabytes, for a subagent) never shows.
+# A label shows MAX_LABEL characters of the text with its blanks collapsed. The scan reads that much and a
+# margin past the cut, so a key the cut splits is still whole to it; the rest of a long task text (megabytes,
+# for a subagent) never shows.
 _LABEL_SCAN_CHARS = MAX_LABEL + 1024
 
 
 def _safe_label(text: str, kind: str) -> str:
     """`text` one-lined and capped for a step's label, or `kind` when it looks like it holds a credential.
 
-    The text is scanned before it is cut: a key cut at the cap can fall under a rule's length
-    floor while its first characters still show. A command line or a task text is display text like a
-    diff or a detail, and the record is saved with the session.
+    The text is scanned before it is cut, and as it will be shown (blanks collapsed): a key cut at the
+    cap can fall under a rule's length floor while its first characters still show, and a key behind a
+    long stretch of blanks (an indented script) still lands inside the label. A command line or a task
+    text is display text like a diff or a detail, and the record is saved with the session.
     """
-    label = _one_line(text, MAX_LABEL)
-    return kind if _looks_secret(text[:_LABEL_SCAN_CHARS]) else label
+    collapsed = " ".join(text.split())
+    return kind if _looks_secret(collapsed[:_LABEL_SCAN_CHARS]) else _clip(collapsed, MAX_LABEL)
 
 
 class Step:
