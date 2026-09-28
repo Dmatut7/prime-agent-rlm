@@ -748,8 +748,7 @@ function turnHasProcess(summary: TurnSummaryComponent): boolean {
 
 /** Whether a turn has any agent-to-agent messages to open (received or sent, box or legacy). */
 function turnHasAgentMessages(summary: TurnSummaryComponent): boolean {
-	const state = summary.state;
-	return !state.boxMode || state.commMessageCount > 0;
+	return summary.state.commMessageCount > 0;
 }
 
 /**
@@ -773,7 +772,7 @@ const hasSetExpandedLane = (child: Component): boolean =>
 const hasThinkingTraceLane = (child: Component): boolean =>
 	child instanceof AssistantMessageComponent && child.hasThinkingTrace();
 
-const hasAnyMessageLane = (child: Component): boolean => !(child instanceof UserMessageComponent);
+const hasAgentMessageLane = (child: Component): boolean => child instanceof AgentMessageComponent;
 
 function mergeSubagentSnapshot(
 	previous: AgentConnectionRlmChildAgentSnapshot,
@@ -10512,7 +10511,7 @@ export class InteractiveMode {
 				return;
 			}
 		}
-		if (!chatHasTurnLane(this.chatContainer.children, turnHasAgentMessages, hasAnyMessageLane)) {
+		if (!chatHasTurnLane(this.chatContainer.children, turnHasAgentMessages, hasAgentMessageLane)) {
 			this.showToast("还没有代理消息可以展开");
 			return;
 		}
