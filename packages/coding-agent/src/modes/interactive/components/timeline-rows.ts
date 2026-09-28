@@ -10,6 +10,7 @@ import {
 	commitIdFromStep,
 	localizeResultDetail,
 	type StepFeedData,
+	symlinkVerb,
 } from "./feed-data.js";
 import { stepAction, turnStepLabel } from "./step-label.js";
 import {
@@ -298,10 +299,13 @@ export function omittedDiffText(reason: ChangeEntry["omitted"]): string | undefi
 
 /**
  * Lines added and removed over the changes whose counts the kernel knew;
- * undefined when it knew none (every diff was left out), so nothing says `+0`.
+ * undefined when it knew none (every diff was left out, or every change was
+ * to a link itself), so nothing says `+0`.
  */
 export function changeTotals(changes: readonly ChangeEntry[]): { added: number; removed: number } | undefined {
-	const known = changes.filter((change) => !(change.omitted && change.added === 0 && change.removed === 0));
+	const known = changes.filter(
+		(change) => !change.symlink && !(change.omitted && change.added === 0 && change.removed === 0),
+	);
 	if (known.length === 0) return undefined;
 	return {
 		added: known.reduce((sum, change) => sum + change.added, 0),
@@ -312,6 +316,7 @@ export function changeTotals(changes: readonly ChangeEntry[]): { added: number; 
 /** Change entries as the diff lines an opened edit row shows. */
 export function changeDetail(change: ChangeEntry): (width: number) => string[] {
 	return (width) => {
+		if (change.symlink) return [theme.fg("dim", "链接文件，没有文字改动可看")];
 		if (change.binary) return [theme.fg("dim", "二进制文件，没有文字改动可看")];
 		const omitted = omittedDiffText(change.omitted);
 		if (omitted && change.rows.length === 0) return [theme.fg("dim", omitted)];
@@ -331,17 +336,25 @@ function changeRow(key: string, change: ChangeEntry, status: BoxRowStatus): BoxR
 	const meta: MetaPart[] = [];
 	if (scratch) meta.push({ text: "临时 ", color: "dim" });
 	if (change.scope === "memory") meta.push({ text: "规则文件 ", color: "dim" });
-	const omitted = omittedDiffText(change.omitted);
-	// Counts the kernel could not know read as the reason, never as `+0 −0`.
-	if (omitted && change.added === 0 && change.removed === 0) meta.push({ text: omitted, color: "dim" });
-	else meta.push(...countsMeta(change.added, change.removed));
+	// The link itself changed, not its target's text: no diff, so no `+0 −0`.
+	if (!change.symlink) {
+		const omitted = omittedDiffText(change.omitted);
+		// Counts the kernel could not know read as the reason, never as `+0 −0`.
+		if (omitted && change.added === 0 && change.removed === 0) meta.push({ text: omitted, color: "dim" });
+		else meta.push(...countsMeta(change.added, change.removed));
+	}
+	const text = renamed
+		? `${change.oldPath} → ${change.path}`
+		: change.symlink
+			? `${symlinkVerb(change.kind)} ${change.path}`
+			: change.path;
 	return {
 		key,
 		kind: "edit",
 		status,
 		glyph: change.kind === "deleted" ? "✗" : "✎",
 		glyphColor: change.kind === "deleted" ? "diffRemovedText" : "runCardWarn",
-		text: renamed ? `${change.oldPath} → ${change.path}` : change.path,
+		text,
 		textColor: scratch ? "muted" : "activityText",
 		meta,
 		detail: changeDetail(change),

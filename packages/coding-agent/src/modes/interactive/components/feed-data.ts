@@ -141,6 +141,7 @@ function readFileChange(value: unknown): KernelFileChange | undefined {
 	if (diff !== undefined) change.diff = diff;
 	if (value.diffTruncated === true) change.diffTruncated = true;
 	if (value.binary === true) change.binary = true;
+	if (value.symlink === true) change.symlink = true;
 	const omitted = stringField(value, "diffOmitted");
 	if (omitted === "too_large" || omitted === "no_baseline" || omitted === "budget" || omitted === "sensitive") {
 		change.diffOmitted = omitted;
@@ -361,8 +362,21 @@ export interface ChangeEntry {
 	omitted?: KernelFileChange["diffOmitted"];
 	/** How the kernel saw the change (Python code, a shell command, the edit skill). */
 	source?: KernelFileChange["source"];
+	/** True when the change is to the link itself: no line counts or diff apply. */
+	symlink?: boolean;
 	/** When the change was first seen (ordering). */
 	firstAt: number;
+}
+
+/**
+ * The verb a link row reads as, by kind: the link itself changed, not its
+ * target's text, so `changeRow`/`editItems` show this instead of a diff or a
+ * line count. A rename keeps the plain `oldPath → path` row instead of this.
+ */
+export function symlinkVerb(kind: ChangeEntry["kind"]): string {
+	if (kind === "deleted") return "删掉链接";
+	if (kind === "modified") return "改了链接";
+	return "新建链接";
 }
 
 function displayPath(change: { path: string; relPath?: string }, cwd: string): string {
@@ -394,6 +408,7 @@ function addEntry(entries: Map<string, ChangeEntry>, entry: ChangeEntry): void {
 	existing.binary ||= entry.binary;
 	existing.omitted ??= entry.omitted;
 	existing.source ??= entry.source;
+	if (entry.symlink) existing.symlink = true;
 	if (entry.oldPath) existing.oldPath ??= entry.oldPath;
 }
 
@@ -437,6 +452,7 @@ export function aggregateChanges(
 					binary: change.binary === true,
 					...(change.diffOmitted ? { omitted: change.diffOmitted } : {}),
 					source: change.source,
+					...(change.symlink ? { symlink: true } : {}),
 					firstAt: change.at || order,
 				});
 			}
