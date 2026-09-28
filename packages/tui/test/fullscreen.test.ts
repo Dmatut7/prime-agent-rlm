@@ -29,6 +29,10 @@ class ReleaseAwareInputComponent extends InputComponent {
 	wantsKeyRelease = true;
 }
 
+class PagingInputComponent extends InputComponent {
+	wantsPageKeys = true;
+}
+
 class SelectionOverlay extends TestComponent {
 	private selected = 0;
 
@@ -1247,6 +1251,28 @@ describe("TUI fullscreen mode", () => {
 		await terminal.waitForRender();
 
 		assert.deepStrictEqual(input.inputs, [PAGE_UP]);
+
+		tui.stop();
+	});
+
+	it("gives the page keys to a focused component that pages its own content", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(30));
+		const list = new PagingInputComponent();
+		tui.setFocus(list);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.getViewport()[0], "Line 22");
+
+		terminal.sendInput(PAGE_UP);
+		await terminal.waitForRender();
+
+		assert.deepStrictEqual(list.inputs, [PAGE_UP]);
+		assert.strictEqual(terminal.getViewport()[0], "Line 22", "the transcript does not move");
+
+		tui.setFocus(new InputComponent());
+		terminal.sendInput(PAGE_UP);
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.getViewport()[0], "Line 15", "without it PageUp pages the transcript");
 
 		tui.stop();
 	});
