@@ -277,6 +277,26 @@ export interface KernelMemoryChange {
 	at: number;
 }
 
+/** MIME tag the kernel emits a {@link KernelActivity} under when a step inside a cell starts, updates, or ends. */
+export const ACTIVITY_DISPLAY_MIME = "application/vnd.prime-agent.activity+json";
+
+/**
+ * One observable step inside a cell (a `bash()` command, a file read, a search, a fetch, a subagent spawn),
+ * reported by the kernel as it happens so the live feed shows real work instead of a guess from the cell text.
+ * Updates for the same step share `id`; the latest record wins. Display-only.
+ */
+export interface KernelActivity {
+	id: string;
+	kind: "command" | "read" | "search" | "fetch" | "subagent";
+	/** Short target in plain words: the command line, the file name, the search pattern. */
+	label: string;
+	status: "running" | "ok" | "error";
+	/** Result summary when done (`54 passed`, `exit 1`, `3 matches`), or the latest output line while running. */
+	detail?: string;
+	startedAt: number;
+	endedAt?: number;
+}
+
 /** One file edit, captured from a {@link DIFF_DISPLAY_MIME} display payload. */
 export interface KernelDiffDisplay {
 	path: string;

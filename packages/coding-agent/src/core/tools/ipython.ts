@@ -11,6 +11,7 @@ import type { KernelBootstrapProgressHandler } from "../kernel/bootstrap.js";
 import {
 	type ExecuteResult,
 	type HostRequestHandlers,
+	type KernelActivity,
 	type KernelAttachment,
 	KernelBusyAfterInterruptError,
 	type KernelClient,
@@ -525,6 +526,8 @@ export interface IpythonToolDetails {
 	fileChanges?: KernelFileChange[];
 	/** Harness memory, skill, note, and rules-file changes made by the cell. Display-only, like `fileChanges`. */
 	memoryChanges?: KernelMemoryChange[];
+	/** Steps the kernel observed inside the cell, one entry per step id with its latest state. Display-only. */
+	activities?: KernelActivity[];
 	/** Media attachments loaded into context (e.g. by the attach-image skill). */
 	attachments?: KernelAttachment[];
 	/** Agent messages sent from this cell. */
