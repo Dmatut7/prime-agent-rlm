@@ -2304,6 +2304,13 @@ export class InteractiveMode {
 		if (modelsJsonError) {
 			this.showError(`models.json 有错：${modelsJsonError}`);
 		}
+		// The startup diagnostics name a broken settings.json on stderr, which the TUI
+		// covers; without this line every setting quietly falls back to its default.
+		for (const { scope, error, path } of this.uiServicesOrUndefined?.settingsManager?.getLoadErrors?.() ?? []) {
+			this.showError(
+				`settings.json 有错：${path ?? (scope === "global" ? "全局" : "项目")}：${error.message}（这份文件里的设置这次都没有生效）`,
+			);
+		}
 
 		const startupPrompts: InteractiveInitialPrompt[] = [
 			...(initialMessage ? [{ text: initialMessage, images: initialImages }] : []),

@@ -1340,6 +1340,12 @@ export interface SettingsError {
 	error: Error;
 }
 
+/** A settings scope that loaded empty because its file could not be parsed or read. */
+export interface SettingsLoadError extends SettingsError {
+	/** The file that failed, when the storage backend has one. */
+	path: string | undefined;
+}
+
 /**
  * A non-fatal settings problem the user should see (an unknown key, a conflict
  * between the environment and the file). Kept apart from `SettingsError` because
@@ -2287,6 +2293,32 @@ export class SettingsManager {
 		const drained = this.warnings.filter((entry) => entry.scope === scope);
 		this.warnings = this.warnings.filter((entry) => entry.scope !== scope);
 		return drained;
+	}
+
+	/**
+	 * Why a settings scope is loaded empty, for as long as it is: the file could not
+	 * be parsed or read, so none of its settings apply and the consent gates read the
+	 * scope as withdrawn (SEC-7). `drainErrors` hands each failure to whoever asks
+	 * first, and the startup path prints it to stderr, under the screen the TUI is
+	 * about to take; the chat asks here instead, where nothing is consumed.
+	 */
+	getLoadErrors(): SettingsLoadError[] {
+		const failures: SettingsLoadError[] = [];
+		if (this.globalSettingsLoadError) {
+			failures.push({
+				scope: "global",
+				error: this.globalSettingsLoadError,
+				path: this.storage.settingsFilePath?.("global"),
+			});
+		}
+		if (this.projectSettingsLoadError) {
+			failures.push({
+				scope: "project",
+				error: this.projectSettingsLoadError,
+				path: this.storage.settingsFilePath?.("project"),
+			});
+		}
+		return failures;
 	}
 
 	getOnboardingShown(): boolean {
