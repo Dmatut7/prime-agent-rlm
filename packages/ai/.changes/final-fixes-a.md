@@ -1,0 +1,1 @@
+- Fixed log and error-body redaction missing `sk-` keys that contain a dot (such as the bailian `sk-ws-H.…` key).
