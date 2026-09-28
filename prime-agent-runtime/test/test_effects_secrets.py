@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -164,6 +165,98 @@ class PublicScanTests(unittest.TestCase):
         self.assertTrue(effects.is_sensitive_path("/home/u/.ssh/config"))
         self.assertFalse(effects.is_sensitive_path("/work/app/secret_manager.py"))
         self.assertFalse(effects.is_sensitive_path(None))
+
+
+def _activity_records(cell: te.Cell, kind: str) -> list[dict]:
+    """Every activity record of one kind, in the order the host would apply them (all versions of each step)."""
+    return [record for record in cell.payloads(te.ACTIVITY) if record["kind"] == kind]
+
+
+@unittest.skipUnless(te.HAS_GIT, "git is needed for the work-tree comparison")
+class ActivityLabelTests(te.TrackerCase):
+    """FIX-6: a step's label is the command line the model typed. The record is saved with the session, so a
+    label holding a credential shows the step's kind instead, like a detail that holds one is left out.
+    The whole label is scanned before it is cut to the label length."""
+
+    def test_a_command_with_an_inline_key_is_labelled_by_its_kind_in_every_record(self):
+        cell = self.kernel.run(f"await bash(\"true 'Authorization: Bearer {_OLD_KEY}'\")")
+        records = _activity_records(cell, "command")
+        self.assertGreater(len(records), 0)
+        self.assertEqual({record["label"] for record in records}, {"command"})
+        self.assertEqual(_anywhere(cell, _OLD_KEY), [])
+
+    def test_a_key_that_straddles_the_label_cut_is_found_before_the_cut(self):
+        # The command line reaches the label length in the middle of the key: cut first, and what is
+        # left of the key is under the scan's length floor while its first characters still show.
+        command = "true " + "x" * 130 + " Bearer " + _OLD_KEY
+        self.assertGreater(len(command), effects.MAX_LABEL)
+        cell = self.kernel.run(f"await bash({command!r})")
+        records = _activity_records(cell, "command")
+        self.assertEqual({record["label"] for record in records}, {"command"})
+        self.assertEqual(_anywhere(cell, _OLD_KEY[:10]), [])
+
+    def test_ordinary_commands_keep_their_label(self):
+        commands = [
+            "echo npm install --save-dev typescript",
+            "echo git log --oneline -20",
+            "echo max_tokens=4096 password_hint=none",
+            "echo " + "word " * 60,
+        ]
+        self.assertGreater(len(commands), 0)
+        for command in commands:
+            with self.subTest(command=command):
+                cell = self.kernel.run(f"await bash({command!r})")
+                labels = {record["label"] for record in _activity_records(cell, "command")}
+                self.assertEqual(labels, {effects._one_line(command, effects.MAX_LABEL)})
+
+    def test_a_background_command_is_labelled_by_its_kind_when_it_is_left_running_and_when_it_ends(self):
+        first = self.kernel.run(f"h = bash(\"sleep 0.4; true 'Authorization: Bearer {_OLD_KEY}'\")\nh.pid")
+        time.sleep(1.2)  # the model thinking: the command ends while no cell runs
+        second = self.kernel.run("x = 1")
+        records = _activity_records(first, "command") + _activity_records(second, "command")
+        self.assertTrue(any(record.get("background") and record["status"] == "ok" for record in records), records)
+        self.assertEqual({record["label"] for record in records}, {"command"})
+        self.assertEqual(_anywhere(first, _OLD_KEY) + _anywhere(second, _OLD_KEY), [])
+
+
+def _spawn_reply(name: str) -> dict:
+    return {"rlm.run": {"rlm_child_id": "c1", "name": name, "session_dir": "/tmp/child", "model": "prov/model-x"}}
+
+
+@unittest.skipUnless(te.HAS_GIT, "git is needed for the work-tree comparison")
+class SubagentLabelTests(te.TrackerCase):
+    """The task text of a subagent spawn is a label too: the step's label while the child is admitted."""
+
+    def host_replies(self) -> dict:
+        return _spawn_reply("researcher")
+
+    def test_a_task_text_with_a_key_is_labelled_by_the_kind_until_the_child_has_a_name(self):
+        cell = self.kernel.run(f"handle = await rlm.run('call the api with Bearer {_OLD_KEY} and report')\nhandle.name")
+        records = _activity_records(cell, "subagent")
+        self.assertEqual(records[0]["status"], "running")
+        self.assertEqual(records[0]["label"], "subagent")
+        self.assertEqual(records[-1]["label"], "researcher")
+        self.assertEqual(_anywhere(cell, _OLD_KEY), [])
+
+    def test_an_ordinary_task_text_is_the_label_as_before(self):
+        cell = self.kernel.run("handle = await rlm.run('look into the flaky test')\nhandle.name")
+        records = _activity_records(cell, "subagent")
+        self.assertEqual((records[0]["label"], records[-1]["label"]), ("look into the flaky test", "researcher"))
+
+
+@unittest.skipUnless(te.HAS_GIT, "git is needed for the work-tree comparison")
+class SubagentSecretNameTests(te.TrackerCase):
+    """The label a step ends with (the child's name) goes through the same scan as the one it starts with."""
+
+    def host_replies(self) -> dict:
+        return _spawn_reply("creds-" + _OLD_KEY)
+
+    def test_a_final_label_that_looks_like_a_key_is_replaced_by_the_kind(self):
+        cell = self.kernel.run("handle = await rlm.run('look into the flaky test')\n1")
+        records = _activity_records(cell, "subagent")
+        self.assertEqual(records[0]["label"], "look into the flaky test")
+        self.assertEqual(records[-1]["label"], "subagent")
+        self.assertEqual(_anywhere(cell, _OLD_KEY), [])
 
 
 if __name__ == "__main__":

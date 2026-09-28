@@ -2457,6 +2457,17 @@ class untracked:  # noqa: N801 - used as a context manager, reads like a functio
             self._token = None
 
 
+def _safe_label(text: str, kind: str) -> str:
+    """`text` one-lined and capped for a step's label, or `kind` when it looks like it holds a credential.
+
+    The whole text is scanned before it is cut: a key cut at the cap can fall under a rule's length
+    floor while its first characters still show. A command line or a task text is display text like a
+    diff or a detail, and the record is saved with the session.
+    """
+    label = _one_line(text, MAX_LABEL)
+    return kind if _looks_secret(text) else label
+
+
 class Step:
     """One step reported to the host: running from creation until `finish()` or the end of a `with` block.
 
@@ -2466,7 +2477,7 @@ class Step:
     def __init__(self, kind: str, label: str) -> None:
         self.kind = kind
         self.id = f"{kind}-{next(_ids)}"
-        self.label = _one_line(label, MAX_LABEL) or kind
+        self.label = _safe_label(label, kind) or kind
         self.started_at = _now_ms()
         self.done = False
         tracker = _tracker
@@ -2503,7 +2514,7 @@ class Step:
             return
         self.done = True
         if label:
-            self.label = _one_line(label, MAX_LABEL)
+            self.label = _safe_label(label, self.kind)
         fields: dict[str, Any] = {"status": "ok" if status == "ok" else "error", "endedAt": _now_ms()}
         if detail:
             safe = _safe_detail(detail, MAX_DETAIL)
