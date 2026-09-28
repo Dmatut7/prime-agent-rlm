@@ -1,0 +1,1 @@
+- Fixed change tracking for Python cells that run many commands or work in a slow git repository: a cell keeps its latest 100 steps (with a count of earlier ones), live updates send only what changed, and a slow `git status` can no longer hold up a cell for longer than the tracking budget.

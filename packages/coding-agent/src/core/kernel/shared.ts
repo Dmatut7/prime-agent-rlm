@@ -325,6 +325,8 @@ export interface KernelCellEffects {
 	fileChanges: KernelFileChange[];
 	memoryChanges: KernelMemoryChange[];
 	activities: KernelActivity[];
+	/** Earlier steps left out of `activities` to keep it bounded; absent when none were. */
+	activitiesDropped?: number;
 	/** Why the lists above are partial for this cell; absent when they are complete. */
 	changeTrackingIncomplete?: string;
 }
@@ -374,8 +376,10 @@ export interface ExecuteResult {
 	fileChanges?: KernelFileChange[];
 	/** Harness memory and rules-file changes, latest record per entry. Display-only. */
 	memoryChanges?: KernelMemoryChange[];
-	/** Steps observed inside the cell, latest record per id. Display-only. */
+	/** Steps observed inside the cell, latest record per id, at most the most recent 100. Display-only. */
 	activities?: KernelActivity[];
+	/** Earlier steps left out of `activities`. Display-only. */
+	activitiesDropped?: number;
 	/** Why the change lists are partial for this cell. Display-only. */
 	changeTrackingIncomplete?: string;
 	/** Output that arrived without this cell's id (user threads, other cells' leftovers, raw fd writes). */
