@@ -74,10 +74,14 @@ class Kernel:
         self.proc.stdin.write(json.dumps(request) + "\n")
         self.proc.stdin.flush()
 
-    def run(self, code: str) -> "Cell":
+    def run(self, code: str, interrupt_after: float | None = None) -> "Cell":
         self._counter += 1
         rid = f"cell-{self._counter}"
         self._send({"type": "execute", "id": rid, "code": code})
+        if interrupt_after is not None:
+            timer = threading.Timer(interrupt_after, lambda: self._send({"type": "interrupt", "id": rid}))
+            timer.daemon = True
+            timer.start()
         events: list[dict] = []
         while True:
             event = self._event()
@@ -183,7 +187,7 @@ class TrackerCase(unittest.TestCase):
             "PRIME_AGENT_CODING_AGENT_DIR": self.agent_dir,
             "RLM_HARNESS_STATE_DIR": os.path.join(self.tmp, "harness-local"),
             "RLM_GLOBAL_HARNESS_STATE_DIR": os.path.join(self.tmp, "harness-global"),
-            **self.extra_env,
+            **self.kernel_env(),
         }
         self.kernel = Kernel(self.root, env, host_replies=self.host_replies())
         self.addCleanup(self.kernel.close)
@@ -191,6 +195,9 @@ class TrackerCase(unittest.TestCase):
 
     def host_replies(self) -> dict:
         return {}
+
+    def kernel_env(self) -> dict[str, str]:
+        return dict(self.extra_env)
 
     def path(self, rel: str) -> str:
         return os.path.join(self.root, rel)
@@ -220,6 +227,8 @@ class PythonWriteTests(TrackerCase):
         self.assertIn("-two\n+TWO\n", record["diff"])
         self.assertIn("+four\n", record["diff"])
         self.assertEqual(record["path"], self.path("a.txt"))
+        # Well within the budget: nothing claims the list is partial.
+        self.assertEqual(cell.payloads(STATUS), [])
 
     def test_pathlib_writes_and_touch_are_seen(self):
         cell = self.kernel.run(
@@ -545,19 +554,219 @@ class NoGitTests(TrackerCase):
         self.assertEqual(cell.files(), {})
 
 
+# Every function _install_wrappers replaces; each wrapper carries `__wrapped__` (functools.wraps).
+_WRAP_PROBE = (
+    "import builtins, io, os, shutil, subprocess\n"
+    "_points = {'builtins.open': builtins.open, 'io.open': io.open, 'os.open': os.open, 'os.remove': os.remove,\n"
+    "    'os.unlink': os.unlink, 'os.truncate': os.truncate, 'os.rename': os.rename, 'os.replace': os.replace,\n"
+    "    'shutil.rmtree': shutil.rmtree, 'subprocess.Popen.__init__': subprocess.Popen.__init__,\n"
+    "    'os.system': os.system, 'os.posix_spawn': getattr(os, 'posix_spawn', None),\n"
+    "    'os.posix_spawnp': getattr(os, 'posix_spawnp', None)}\n"
+    "sorted(name for name, fn in _points.items() if fn is not None and hasattr(fn, '__wrapped__'))"
+)
+_WRAPPED_POINTS = sorted(
+    [
+        "builtins.open",
+        "io.open",
+        "os.open",
+        "os.remove",
+        "os.unlink",
+        "os.truncate",
+        "os.rename",
+        "os.replace",
+        "shutil.rmtree",
+        "subprocess.Popen.__init__",
+        "os.system",
+        *(["os.posix_spawn"] if hasattr(os, "posix_spawn") else []),
+        *(["os.posix_spawnp"] if hasattr(os, "posix_spawnp") else []),
+    ]
+)
+
+
+class WrapPointTests(TrackerCase):
+    def test_tracking_wraps_every_write_and_spawn_point(self):
+        cell = self.kernel.run(_WRAP_PROBE)
+        result = next(e for e in cell.events if e.get("event") == "result")
+        self.assertEqual(result["text"], repr(_WRAPPED_POINTS))
+
+
 class DisabledTests(TrackerCase):
     extra_env = {"PRIME_AGENT_CHANGE_TRACKING": "0"}
 
     def test_disabled_tracking_installs_nothing_and_sends_nothing(self):
         cell = self.kernel.run(
-            "import io, os, builtins, subprocess\n"
             "open('a.txt', 'w').write('x\\n')\nawait bash('echo y > y.txt')\n"
             "rlm.harness.create_memory('M', 'm', id='m')\n"
-            "(type(builtins.open).__name__, type(os.rename).__name__, subprocess.Popen.__init__.__module__)"
         )
+        self.assertEqual(cell.status, "ok")
         self.assertEqual([e for e in cell.events if e.get("event") == "display"], [])
-        result = next(e for e in cell.events if e.get("event") == "result")
-        self.assertEqual(result["text"], "('builtin_function_or_method', 'builtin_function_or_method', 'subprocess')")
+        # The positive control is WrapPointTests: the same probe lists every point there.
+        probe = self.kernel.run(_WRAP_PROBE)
+        result = next(e for e in probe.events if e.get("event") == "result")
+        self.assertEqual(result["text"], "[]")
+
+
+@unittest.skipUnless(HAS_GIT, "git is needed for the work-tree comparison")
+class BackgroundCommandTests(TrackerCase):
+    def _command(self, cell: Cell) -> dict:
+        commands = [record for record in cell.activities().values() if record["kind"] == "command"]
+        self.assertEqual(len(commands), 1, commands)
+        return commands[0]
+
+    def test_a_command_left_running_is_marked_background_and_its_end_reported_later(self):
+        first = self.kernel.run("h = bash('sleep 0.8; echo finished')\nh.pid")
+        left = self._command(first)
+        self.assertEqual(left["status"], "running")
+        self.assertTrue(left["background"])
+        self.assertEqual(left["detail"], effects.BACKGROUND_DETAIL)
+        self.assertGreaterEqual(left["endedAt"], left["startedAt"])
+        second = self.kernel.run("import time\ntime.sleep(1.5)")
+        done = second.activities()[left["id"]]
+        self.assertEqual(done["status"], "ok")
+        self.assertTrue(done["background"])
+        self.assertEqual(done["detail"], "finished")
+        self.assertEqual(done["startedAt"], left["startedAt"])
+        self.assertGreater(done["endedAt"], left["endedAt"])
+
+    def test_a_background_end_between_cells_is_reported_at_the_next_cell_start(self):
+        first = self.kernel.run("h = bash('sleep 0.2; exit 3')\nh.pid")
+        left = self._command(first)
+        time.sleep(0.8)
+        second = self.kernel.run("x = 1")
+        displays = [e for e in second.events if e.get("event") == "display"]
+        self.assertTrue(displays)
+        first_record = displays[0]["data"][ACTIVITY]
+        self.assertEqual(first_record["id"], left["id"])
+        self.assertEqual(first_record["status"], "error")
+        self.assertTrue(first_record["background"])
+        self.assertTrue(first_record["detail"].startswith("exit 3"))
+
+    def test_an_awaited_command_is_never_marked_background(self):
+        cell = self.kernel.run("await bash('echo hi')")
+        record = self._command(cell)
+        self.assertEqual(record["status"], "ok")
+        self.assertNotIn("background", record)
+        self.assertFalse(any(r.get("background") for r in cell.payloads(ACTIVITY)))
+
+    def test_a_successful_git_commit_carries_its_commit_id(self):
+        cell = self.kernel.run(
+            "await bash(\"git -c user.email=t@example.com -c user.name=t commit --allow-empty -m 'tracked commit'\")"
+        )
+        record = self._command(cell)
+        head = _git(self.root, "rev-parse", "HEAD").strip()
+        self.assertEqual(record["status"], "ok")
+        self.assertGreaterEqual(len(record["commit"]), 7)
+        self.assertTrue(head.startswith(record["commit"]), (head, record["commit"]))
+        failed = self.kernel.run("await bash('git commit -m nothing-staged')")
+        self.assertEqual(self._command(failed)["status"], "error")
+        self.assertNotIn("commit", self._command(failed))
+
+    def test_commit_id_parsing(self):
+        output = "hook output\n[main (root-commit) 1a2b3c4] first\n 1 file changed\n[main 9f8e7d6] second\n"
+        self.assertEqual(effects._commit_id("git commit -m x", 0, output), "9f8e7d6")
+        self.assertIsNone(effects._commit_id("git commit -m x", 1, output))
+        self.assertIsNone(effects._commit_id("echo '[main 1a2b3c4] x'", 0, "[main 1a2b3c4] x\n"))
+        self.assertEqual(effects._commit_id("git cherry-pick abc", 0, "[detached HEAD 0123abc] pick\n"), "0123abc")
+
+
+@unittest.skipUnless(HAS_GIT, "git is needed for the work-tree comparison")
+class ManyCommandsTests(TrackerCase):
+    def test_a_loop_of_commands_keeps_the_final_comparison_intact(self):
+        cell = self.kernel.run(
+            "for i in range(150):\n    await bash('true')\nawait bash('echo done > last.txt')\n"
+        )
+        self.assertEqual(cell.status, "ok")
+        commands = [record for record in cell.activities().values() if record["kind"] == "command"]
+        self.assertEqual(len(commands), 151)
+        self.assertTrue(all(record["status"] == "ok" for record in commands))
+        # Live mid-cell comparisons are rate-limited and run on the tracker's own budget, so the
+        # cell's budget is still there for the final comparison: a real diff, nothing partial.
+        self.assertEqual(cell.payloads(STATUS), [])
+        record = cell.by_rel()["last.txt"]
+        self.assertEqual(record["source"], "shell")
+        self.assertIn("+done\n", record["diff"])
+
+
+# A `git` that sleeps on `status` while a marker file exists and is the real git otherwise.
+_SLOW_GIT = """#!/bin/sh
+case " $* " in
+  *" status "*) if [ -f "$SLOW_GIT_MARKER" ]; then exec sleep 5; fi ;;
+esac
+exec "{real}" "$@"
+"""
+
+
+@unittest.skipUnless(HAS_GIT and os.name == "posix", "needs git and a POSIX shell")
+class SlowGitTests(TrackerCase):
+    """A slow `git status` (a huge repository, a cold disk) may cost a cell at most its budget."""
+
+    def kernel_env(self) -> dict[str, str]:
+        fake_bin = os.path.join(self.tmp, "fake-bin")
+        os.makedirs(fake_bin)
+        fake = os.path.join(fake_bin, "git")
+        with open(fake, "w") as handle:
+            handle.write(_SLOW_GIT.format(real=shutil.which("git")))
+        os.chmod(fake, 0o755)
+        # The first run of a freshly written executable can take ~0.4 s on macOS while the system
+        # vets it; pay that here, or the fixture itself looks like a slow git to the budget.
+        subprocess.run([fake, "--version"], check=True, capture_output=True, timeout=30)
+        self.marker = os.path.join(self.tmp, "slow-git")
+        return {"PATH": fake_bin + os.pathsep + os.environ.get("PATH", ""), "SLOW_GIT_MARKER": self.marker}
+
+    def slow(self, on: bool) -> None:
+        if on:
+            open(self.marker, "w").close()
+        elif os.path.exists(self.marker):
+            os.remove(self.marker)
+
+    def timed(self, code: str) -> tuple[Cell, float, float]:
+        sent = time.time()
+        cell = self.kernel.run(code)
+        return cell, sent, time.time() - sent
+
+    def test_cell_start_never_waits_for_the_snapshot_of_earlier_commands(self):
+        self.kernel.run("h = bash('sleep 4')\nh.pid")
+        self.slow(True)
+        try:
+            cell, sent, elapsed = self.timed("import time\nprint(time.time())")
+        finally:
+            self.slow(False)
+        body_started = float(cell.stdout().split()[0])
+        self.assertLess(body_started - sent, 0.25)
+        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + 0.7)
+        self.assertIn("snapshot", cell.payloads(STATUS)[0]["incomplete"])
+        self.kernel.run("h.kill()")
+
+    def test_a_command_waits_at_most_the_budget_for_its_snapshot(self):
+        self.slow(True)
+        try:
+            cell, _, elapsed = self.timed("r = await bash('echo x > y.txt')\nprint(r.exit_code)")
+        finally:
+            self.slow(False)
+        self.assertEqual(cell.stdout().strip(), "0")
+        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + 1.0)
+        self.assertIn("snapshot", cell.payloads(STATUS)[0]["incomplete"])
+        # Without a trustworthy before-state the command's edit is not guessed at.
+        self.assertNotIn("y.txt", cell.by_rel())
+        self.assertTrue(os.path.exists(self.path("y.txt")))
+
+    def test_an_interrupt_while_collecting_changes_interrupts_the_cell(self):
+        cell = self.kernel.run(f"await bash('touch {self.marker}')", interrupt_after=0.25)
+        self.slow(False)
+        self.assertEqual(cell.status, "error")
+        self.assertEqual(cell.error()["ename"], "KeyboardInterrupt")
+        self.assertIn("interrupted while collecting changes", cell.payloads(STATUS)[0]["incomplete"])
+
+    def test_a_slow_final_comparison_is_given_up_within_the_budget(self):
+        cell, _, elapsed = self.timed(
+            f"await bash('touch {self.marker} && echo z > z.txt')\nopen('p.txt', 'w').write('p')"
+        )
+        self.slow(False)
+        self.assertEqual(cell.status, "ok")
+        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + 1.0)
+        self.assertIn("comparing", cell.payloads(STATUS)[0]["incomplete"])
+        # Python's own writes do not depend on git and are still listed.
+        self.assertEqual(cell.by_rel()["p.txt"]["kind"], "created")
 
 
 class BudgetTests(TrackerCase):

@@ -523,12 +523,22 @@ export interface IpythonToolDetails {
 	backgroundOutput?: string;
 	/** Diffs streamed from file edits, rendered by the cell view. */
 	diffs?: KernelDiffDisplay[];
-	/** Every file effect of the cell, in observation order. Display-only: never sent to the model or read by compaction. */
+	/**
+	 * Every file effect of the cell, in observation order. Absent when the cell reported none; `[]`
+	 * when everything it reported was retracted (a file restored to how it started), which replaces
+	 * any earlier list. Display-only: never sent to the model or read by compaction.
+	 */
 	fileChanges?: KernelFileChange[];
-	/** Harness memory, skill, note, and rules-file changes made by the cell. Display-only, like `fileChanges`. */
+	/** Harness memory, skill, note, and rules-file changes made by the cell. Absent / `[]` like `fileChanges`. Display-only. */
 	memoryChanges?: KernelMemoryChange[];
-	/** Steps the kernel observed inside the cell, one entry per step id with its latest state. Display-only. */
+	/**
+	 * Steps the kernel observed inside the cell, one entry per step id with its latest state, at most
+	 * the most recent 100. A live (partial) update carries only the steps that changed since the
+	 * previous one (and all of them every few seconds): merge by id. Display-only.
+	 */
 	activities?: KernelActivity[];
+	/** Earlier steps left out of `activities` to keep it bounded ("… N earlier steps"). Display-only. */
+	activitiesDropped?: number;
 	/** Why `fileChanges` / `memoryChanges` / `activities` are partial for this cell. Display-only. */
 	changeTrackingIncomplete?: string;
 	/** Media attachments loaded into context (e.g. by the attach-image skill). */
@@ -1023,9 +1033,12 @@ export function imageBlocksFromAttachments(attachments: readonly KernelAttachmen
 /** Minimum gap between two live change updates of one cell; the last one is never dropped. */
 export const LIVE_EFFECTS_UPDATE_INTERVAL_MS = 200;
 
+/** How often a live update resends every kept step, so a viewer that attached mid-cell catches up. */
+export const LIVE_ACTIVITIES_FULL_EVERY_MS = 5000;
+
 type IpythonEffectsDetails = Pick<
 	IpythonToolDetails,
-	"fileChanges" | "memoryChanges" | "activities" | "changeTrackingIncomplete"
+	"fileChanges" | "memoryChanges" | "activities" | "activitiesDropped" | "changeTrackingIncomplete"
 >;
 
 function fileChangeWithoutDiff(change: KernelFileChange): KernelFileChange {
@@ -1038,22 +1051,60 @@ function memoryChangeWithoutTexts(change: KernelMemoryChange): KernelMemoryChang
 	return rest;
 }
 
+/** Whether a list differs from the one last sent; nothing sent yet counts as an empty list. */
+function changedList<T>(sent: readonly T[] | undefined, current: readonly T[]): boolean {
+	if (sent === undefined) return current.length > 0;
+	return sent.length !== current.length || sent.some((record, index) => record !== current[index]);
+}
+
 /**
- * The change-tracking fields of a live (partial) update. Counts, labels and steps only: the diffs and
- * memory texts arrive once, with the final result, instead of being resent on every update.
+ * The change-tracking fields of one cell's live (partial) updates, kept small because they are
+ * resent every 200 ms across the daemon link:
+ * - file and memory lists go out only when they changed, whole (a viewer replaces them) and without
+ *   diffs or memory texts, which arrive once, with the final result;
+ * - steps go out only when new or changed since the previous update (a viewer merges them by id),
+ *   plus every kept step each {@link LIVE_ACTIVITIES_FULL_EVERY_MS}, so a viewer that attached
+ *   mid-cell catches up;
+ * - the dropped-step count rides along whenever it is non-zero.
+ * Relies on the accumulator handing out the same record object until that record changes.
  */
-export function livePartialEffectsDetails(effects: KernelCellEffects | undefined): IpythonEffectsDetails {
-	if (!effects) return {};
-	return {
-		...(effects.fileChanges.length > 0 ? { fileChanges: effects.fileChanges.map(fileChangeWithoutDiff) } : {}),
-		...(effects.memoryChanges.length > 0
-			? { memoryChanges: effects.memoryChanges.map(memoryChangeWithoutTexts) }
-			: {}),
-		...(effects.activities.length > 0 ? { activities: effects.activities } : {}),
-		...(effects.changeTrackingIncomplete !== undefined
-			? { changeTrackingIncomplete: effects.changeTrackingIncomplete }
-			: {}),
-	};
+export class LiveEffectsPartials {
+	private readonly sentActivities = new Map<string, KernelActivity>();
+	private sentFiles: readonly KernelFileChange[] | undefined;
+	private sentMemory: readonly KernelMemoryChange[] | undefined;
+	private lastFullAt = Number.NEGATIVE_INFINITY;
+
+	constructor(private readonly now: () => number = Date.now) {}
+
+	details(effects: KernelCellEffects | undefined): IpythonEffectsDetails {
+		if (!effects) return {};
+		const details: IpythonEffectsDetails = {};
+		if (changedList(this.sentFiles, effects.fileChanges)) {
+			details.fileChanges = effects.fileChanges.map(fileChangeWithoutDiff);
+			this.sentFiles = effects.fileChanges;
+		}
+		if (changedList(this.sentMemory, effects.memoryChanges)) {
+			details.memoryChanges = effects.memoryChanges.map(memoryChangeWithoutTexts);
+			this.sentMemory = effects.memoryChanges;
+		}
+		const now = this.now();
+		const full = now - this.lastFullAt >= LIVE_ACTIVITIES_FULL_EVERY_MS;
+		const steps = full
+			? effects.activities
+			: effects.activities.filter((activity) => this.sentActivities.get(activity.id) !== activity);
+		if (full) this.lastFullAt = now;
+		if (steps.length > 0) details.activities = steps;
+		const kept = new Set(effects.activities.map((activity) => activity.id));
+		for (const id of this.sentActivities.keys()) {
+			if (!kept.has(id)) this.sentActivities.delete(id);
+		}
+		for (const activity of steps) this.sentActivities.set(activity.id, activity);
+		if (effects.activitiesDropped !== undefined) details.activitiesDropped = effects.activitiesDropped;
+		if (effects.changeTrackingIncomplete !== undefined) {
+			details.changeTrackingIncomplete = effects.changeTrackingIncomplete;
+		}
+		return details;
+	}
 }
 
 function finalEffectsDetails(r: ExecuteResult): IpythonEffectsDetails {
@@ -1061,6 +1112,7 @@ function finalEffectsDetails(r: ExecuteResult): IpythonEffectsDetails {
 		...(r.fileChanges ? { fileChanges: r.fileChanges } : {}),
 		...(r.memoryChanges ? { memoryChanges: r.memoryChanges } : {}),
 		...(r.activities ? { activities: r.activities } : {}),
+		...(r.activitiesDropped !== undefined ? { activitiesDropped: r.activitiesDropped } : {}),
 		...(r.changeTrackingIncomplete !== undefined ? { changeTrackingIncomplete: r.changeTrackingIncomplete } : {}),
 	};
 }
@@ -1181,16 +1233,18 @@ export function createIpythonToolDefinition(
 				});
 			};
 
-			// Live change records ride the existing partial-update path. Every partial carries the
-			// cumulative lists, so a stream chunk and a change update never erase each other.
+			// Live change records ride the existing partial-update path. A partial carries only what
+			// changed since the previous one (see LiveEffectsPartials), and a field it leaves out keeps
+			// what earlier partials said, so a stream chunk and a change update never erase each other.
 			let liveEffects: KernelCellEffects | undefined;
+			const livePartials = new LiveEffectsPartials();
 			let lastPartialContent: TextContent[] = [];
 			let effectsTimer: ReturnType<typeof setTimeout> | undefined;
 			let lastEffectsUpdateAt = 0;
 			const pushPartial = () => {
 				onUpdate?.({
 					content: lastPartialContent,
-					details: { status: "ok", ...livePartialEffectsDetails(liveEffects) },
+					details: { status: "ok", ...livePartials.details(liveEffects) },
 				});
 			};
 			const flushEffects = () => {

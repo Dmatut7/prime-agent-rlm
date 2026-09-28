@@ -28,6 +28,7 @@ const MEMORY_KINDS = new Set<KernelMemoryChange["kind"]>(["memory", "skill", "su
 const MEMORY_SCOPES = new Set<KernelMemoryChange["scope"]>(["session", "global", "project"]);
 const ACTIVITY_KINDS = new Set<KernelActivity["kind"]>(["command", "read", "search", "fetch", "subagent"]);
 const ACTIVITY_STATUSES = new Set<KernelActivity["status"]>(["running", "ok", "error"]);
+const COMMIT_ID = /^[0-9a-f]{7,40}$/;
 
 function member<T extends string>(set: ReadonlySet<T>, value: unknown): value is T {
 	return typeof value === "string" && set.has(value as T);
@@ -125,6 +126,7 @@ export function parseActivityDisplay(payload: unknown): KernelActivity | undefin
 	if (startedAt === undefined) return undefined;
 	const detail = optionalString(payload.detail);
 	const endedAt = count(payload.endedAt);
+	const commit = typeof payload.commit === "string" && COMMIT_ID.test(payload.commit) ? payload.commit : undefined;
 	return {
 		id: payload.id,
 		kind: payload.kind,
@@ -133,6 +135,8 @@ export function parseActivityDisplay(payload: unknown): KernelActivity | undefin
 		...(detail !== undefined ? { detail } : {}),
 		startedAt,
 		...(endedAt !== undefined ? { endedAt } : {}),
+		...(payload.background === true ? { background: true } : {}),
+		...(commit !== undefined ? { commit } : {}),
 	};
 }
 
@@ -144,15 +148,34 @@ export function parseChangeTrackingStatus(payload: unknown): string | undefined 
 }
 
 /**
+ * Most steps one cell keeps. A cell looping over hundreds of `bash()` calls would otherwise grow the
+ * list (and every result and live update carrying it) without bound; past the cap the oldest
+ * finished steps go first and are counted in `activitiesDropped`.
+ */
+export const MAX_ACTIVITIES_PER_CELL = 100;
+
+/** Dropped step ids remembered, so a late update of one is not re-added as a new step. */
+const MAX_REMEMBERED_DROPPED_IDS = 4096;
+
+/**
  * Collects one cell's change-tracking records from its display payloads. Every kernel record is
  * complete on its own, so the latest record per file path, memory entry and step id wins, and a
- * retraction removes its entry. Display-only: the result feeds the UI and nothing else.
+ * retraction removes its entry. Steps are capped at {@link MAX_ACTIVITIES_PER_CELL}. Display-only:
+ * the result feeds the UI and nothing else.
  */
 export class KernelEffectsAccumulator {
 	private readonly files = new Map<string, KernelFileChange>();
 	private readonly memory = new Map<string, KernelMemoryChange>();
 	private readonly activities = new Map<string, KernelActivity>();
+	private readonly droppedIds = new Set<string>();
+	private dropped = 0;
 	private incomplete: string | undefined;
+	// Once a list has held something, an empty list is a fact (everything was retracted), not an
+	// absence: it must reach the viewer explicitly, or the last non-empty list stays on screen.
+	private filesReported = false;
+	private memoryReported = false;
+
+	constructor(private readonly maxActivities: number = MAX_ACTIVITIES_PER_CELL) {}
 
 	/** Apply the tracking records in one display payload; true when anything changed. */
 	apply(data: Record<string, unknown>): boolean {
@@ -163,6 +186,7 @@ export class KernelEffectsAccumulator {
 				changed = this.files.delete(record.key) || changed;
 			} else if (record) {
 				this.files.set(record.path, record);
+				this.filesReported = true;
 				changed = true;
 			}
 		}
@@ -172,12 +196,16 @@ export class KernelEffectsAccumulator {
 				changed = this.memory.delete(record.key) || changed;
 			} else if (record) {
 				this.memory.set(memoryKey(record.kind, record.scope, record.id ?? record.title), record);
+				this.memoryReported = true;
 				changed = true;
 			}
 		}
 		if (ACTIVITY_DISPLAY_MIME in data) {
 			const record = parseActivityDisplay(data[ACTIVITY_DISPLAY_MIME]);
-			if (record) {
+			if (record && !this.droppedIds.has(record.id)) {
+				if (!this.activities.has(record.id) && this.activities.size >= this.maxActivities) {
+					this.dropOldestActivity();
+				}
 				this.activities.set(record.id, record);
 				changed = true;
 			}
@@ -192,22 +220,47 @@ export class KernelEffectsAccumulator {
 		return changed;
 	}
 
+	/** The oldest finished step, or the oldest step when every kept one is still running. */
+	private dropOldestActivity(): void {
+		let victim: string | undefined;
+		for (const [id, activity] of this.activities) {
+			if (activity.status !== "running") {
+				victim = id;
+				break;
+			}
+			victim ??= id;
+		}
+		if (victim === undefined) return;
+		this.activities.delete(victim);
+		this.dropped++;
+		this.droppedIds.add(victim);
+		if (this.droppedIds.size > MAX_REMEMBERED_DROPPED_IDS) {
+			const oldest = this.droppedIds.values().next().value;
+			if (oldest !== undefined) this.droppedIds.delete(oldest);
+		}
+	}
+
 	/** Fresh arrays in observation order; safe to hand to a callback that keeps them. */
 	snapshot(): KernelCellEffects {
 		return {
 			fileChanges: [...this.files.values()],
 			memoryChanges: [...this.memory.values()],
 			activities: [...this.activities.values()],
+			...(this.dropped > 0 ? { activitiesDropped: this.dropped } : {}),
 			...(this.incomplete !== undefined ? { changeTrackingIncomplete: this.incomplete } : {}),
 		};
 	}
 
-	/** The ExecuteResult fields, each omitted when empty. */
+	/**
+	 * The ExecuteResult fields. A list is omitted only when it never held anything; one emptied by
+	 * retractions is sent as `[]`.
+	 */
 	resultFields(): Partial<KernelCellEffects> {
 		return {
-			...(this.files.size > 0 ? { fileChanges: [...this.files.values()] } : {}),
-			...(this.memory.size > 0 ? { memoryChanges: [...this.memory.values()] } : {}),
+			...(this.filesReported ? { fileChanges: [...this.files.values()] } : {}),
+			...(this.memoryReported ? { memoryChanges: [...this.memory.values()] } : {}),
 			...(this.activities.size > 0 ? { activities: [...this.activities.values()] } : {}),
+			...(this.dropped > 0 ? { activitiesDropped: this.dropped } : {}),
 			...(this.incomplete !== undefined ? { changeTrackingIncomplete: this.incomplete } : {}),
 		};
 	}

@@ -24,6 +24,7 @@ import {
 	KernelEffectsAccumulator,
 	type KernelFileChange,
 	type KernelMemoryChange,
+	MAX_ACTIVITIES_PER_CELL,
 	MEMORY_CHANGE_DISPLAY_MIME,
 	parseActivityDisplay,
 	parseFileChangeDisplay,
@@ -35,8 +36,9 @@ import {
 	createIpythonToolDefinition,
 	type IpythonKernelProvisioner,
 	type IpythonToolDetails,
+	LIVE_ACTIVITIES_FULL_EVERY_MS,
 	LIVE_EFFECTS_UPDATE_INTERVAL_MS,
-	livePartialEffectsDetails,
+	LiveEffectsPartials,
 } from "../src/core/tools/ipython.js";
 
 const fileChange: KernelFileChange = {
@@ -96,6 +98,16 @@ describe("change-tracking display payloads", () => {
 			key: "memory\u0000session\u0000tmp",
 		});
 		expect(parseActivityDisplay(command)).toEqual(command);
+		const background: KernelActivity = {
+			...command,
+			status: "ok",
+			endedAt: 1_700_000_009_000,
+			background: true,
+			commit: "1a2b3c4",
+		};
+		expect(parseActivityDisplay(background)).toEqual(background);
+		// Only a real flag and a real commit id survive.
+		expect(parseActivityDisplay({ ...command, background: "yes", commit: "not-a-sha" })).toEqual(command);
 	});
 
 	it("ignores malformed records instead of throwing", () => {
@@ -150,20 +162,104 @@ describe("change-tracking display payloads", () => {
 		expect(new KernelEffectsAccumulator().resultFields()).toEqual({});
 	});
 
-	it("trims live partials to counts and labels; the final result keeps the diffs and texts", () => {
-		const live = livePartialEffectsDetails({
-			fileChanges: [fileChange],
-			memoryChanges: [memoryChange],
-			activities: [command],
+	it("sends a list emptied by retractions explicitly, and leaves out a list that never held anything", () => {
+		const effects = new KernelEffectsAccumulator();
+		expect(effects.resultFields()).toEqual({});
+		effects.apply({ [FILE_CHANGE_DISPLAY_MIME]: fileChange });
+		effects.apply({ [MEMORY_CHANGE_DISPLAY_MIME]: { ...memoryChange, op: "created" } });
+		effects.apply({ [FILE_CHANGE_DISPLAY_MIME]: { path: fileChange.path, retracted: true } });
+		effects.apply({
+			[MEMORY_CHANGE_DISPLAY_MIME]: { kind: "memory", scope: "session", id: memoryChange.id, retracted: true },
 		});
+		expect(effects.resultFields()).toEqual({ fileChanges: [], memoryChanges: [] });
+		const details = assembleIpythonToolResult(cellResult({ ...effects.resultFields() }), {
+			kernelRestarted: false,
+		}).details;
+		expect(details.fileChanges).toEqual([]);
+		expect(details.memoryChanges).toEqual([]);
+	});
+
+	it("keeps at most the most recent steps, dropping finished ones first and counting them", () => {
+		const effects = new KernelEffectsAccumulator();
+		const step = (index: number, status: KernelActivity["status"]): KernelActivity => ({
+			id: `command-${index}`,
+			kind: "command",
+			label: `step ${index}`,
+			status,
+			startedAt: 1_700_000_000_000 + index,
+		});
+		// Two long-running steps first: a running step outlives finished ones.
+		for (const index of [0, 1]) effects.apply({ [ACTIVITY_DISPLAY_MIME]: step(index, "running") });
+		const total = 250;
+		for (let index = 2; index < total; index++) {
+			effects.apply({ [ACTIVITY_DISPLAY_MIME]: step(index, "running") });
+			effects.apply({ [ACTIVITY_DISPLAY_MIME]: step(index, "ok") });
+		}
+		const snapshot = effects.snapshot();
+		expect(snapshot.activities).toHaveLength(MAX_ACTIVITIES_PER_CELL);
+		expect(snapshot.activitiesDropped).toBe(total - MAX_ACTIVITIES_PER_CELL);
+		expect(snapshot.activities.slice(0, 2).map((activity) => activity.id)).toEqual(["command-0", "command-1"]);
+		expect(snapshot.activities.at(-1)?.id).toBe(`command-${total - 1}`);
+		// A late update of a dropped step does not come back as a new step.
+		expect(effects.apply({ [ACTIVITY_DISPLAY_MIME]: { ...step(5, "error"), detail: "exit 1" } })).toBe(false);
+		expect(effects.snapshot().activities).toHaveLength(MAX_ACTIVITIES_PER_CELL);
+		// The long-running steps still finish in place.
+		expect(effects.apply({ [ACTIVITY_DISPLAY_MIME]: step(0, "ok") })).toBe(true);
+		expect(effects.snapshot().activities[0]).toMatchObject({ id: "command-0", status: "ok" });
+		expect(effects.resultFields().activitiesDropped).toBe(total - MAX_ACTIVITIES_PER_CELL);
+	});
+});
+
+describe("live change partials", () => {
+	const snapshotOf = (overrides: Partial<KernelCellEffects>): KernelCellEffects => ({
+		fileChanges: [],
+		memoryChanges: [],
+		activities: [],
+		...overrides,
+	});
+
+	it("trims file and memory lists and sends them only when they changed", () => {
+		let now = 0;
+		const partials = new LiveEffectsPartials(() => now);
+		expect(partials.details(snapshotOf({}))).toEqual({});
+		const files = [fileChange];
+		const memory = [memoryChange];
+		const first = partials.details(snapshotOf({ fileChanges: files, memoryChanges: memory }));
 		const { diff: _diff, ...withoutDiff } = fileChange;
-		expect(live.fileChanges).toEqual([withoutDiff]);
-		expect(live.fileChanges?.[0]).not.toHaveProperty("diff");
-		expect(live.memoryChanges?.[0]).not.toHaveProperty("before");
-		expect(live.memoryChanges?.[0]).not.toHaveProperty("after");
-		expect(live.memoryChanges?.[0]?.previousTitle).toBe("Deploy steps");
-		expect(live.activities).toEqual([command]);
-		expect(livePartialEffectsDetails(undefined)).toEqual({});
+		expect(first.fileChanges).toEqual([withoutDiff]);
+		expect(first.memoryChanges?.[0]).not.toHaveProperty("before");
+		expect(first.memoryChanges?.[0]).not.toHaveProperty("after");
+		expect(first.memoryChanges?.[0]?.previousTitle).toBe("Deploy steps");
+		now += 200;
+		// The same records again: nothing to resend.
+		expect(partials.details(snapshotOf({ fileChanges: [...files], memoryChanges: [...memory] }))).toEqual({});
+		now += 200;
+		const retracted = partials.details(snapshotOf({ fileChanges: [], memoryChanges: [...memory] }));
+		expect(retracted).toEqual({ fileChanges: [] });
+		expect(partials.details(undefined)).toEqual({});
+	});
+
+	it("sends only new or changed steps, every kept step periodically, and the dropped count", () => {
+		let now = 0;
+		const partials = new LiveEffectsPartials(() => now);
+		const a = { ...command, id: "a" };
+		const b = { ...command, id: "b" };
+		expect(partials.details(snapshotOf({ activities: [a, b] })).activities).toEqual([a, b]);
+		now += 200;
+		expect(partials.details(snapshotOf({ activities: [a, b] }))).toEqual({});
+		now += 200;
+		const bDone: KernelActivity = { ...b, status: "ok", detail: "done" };
+		const c = { ...command, id: "c" };
+		expect(partials.details(snapshotOf({ activities: [a, bDone, c], activitiesDropped: 3 }))).toEqual({
+			activities: [bDone, c],
+			activitiesDropped: 3,
+		});
+		now += LIVE_ACTIVITIES_FULL_EVERY_MS;
+		expect(partials.details(snapshotOf({ activities: [a, bDone, c], activitiesDropped: 3 })).activities).toEqual([
+			a,
+			bDone,
+			c,
+		]);
 	});
 });
 
@@ -184,6 +280,7 @@ describe("change tracking never reaches the model", () => {
 			const tracked = { ...withEffects, status, error: base.error };
 			const plain = assembleIpythonToolResult(base, { kernelRestarted: false });
 			const rich = assembleIpythonToolResult(tracked, { kernelRestarted: false });
+			expect(textOf(plain.content).length).toBeGreaterThan(0);
 			expect(JSON.stringify(rich.content)).toBe(JSON.stringify(plain.content));
 			expect(rich.isError).toBe(plain.isError);
 		}
@@ -290,6 +387,27 @@ describe("ipython tool live change updates", () => {
 		});
 		const plain = await plainTool.execute("call-2", { code: "work()" }, undefined, undefined, {} as ExtensionContext);
 		expect(JSON.stringify(result.content)).toBe(JSON.stringify(plain.content));
+	});
+
+	it("coalesces a burst of ten records into at most two updates", async () => {
+		const execute = vi.fn(async (_code: string, opts?: ExecuteOptions) => {
+			for (let step = 0; step < 10; step++) opts?.onEffects?.(effectsAt(step));
+			await sleep(LIVE_EFFECTS_UPDATE_INTERVAL_MS + 100);
+			return cellResult();
+		});
+		const updates: IpythonToolDetails[] = [];
+		const tool = createIpythonToolDefinition("/tmp", { provisioner: fakeProvisioner(execute) });
+		await tool.execute(
+			"call-burst",
+			{ code: "x" },
+			undefined,
+			(partial) => updates.push((partial as { details: IpythonToolDetails }).details),
+			{} as ExtensionContext,
+		);
+		// Without the throttle this would be ten updates; with it, the first record and one trailing one.
+		expect(updates.length).toBeGreaterThanOrEqual(1);
+		expect(updates.length).toBeLessThanOrEqual(2);
+		expect(updates.at(-1)?.activities?.[0]?.detail).toBe("line 9");
 	});
 
 	it("sends no change update after the tool has returned", async () => {
