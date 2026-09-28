@@ -68,6 +68,8 @@ export function getToolFileChanges(
 			return [...changes.values()];
 		}
 		for (const display of (result.details as IpythonToolDetails | undefined)?.diffs ?? []) {
+			// A withheld edit has neither texts nor counts to add up.
+			if (display.omitted) continue;
 			const { diff } = generateDiffString(display.oldStr, display.newStr, 4, display.startLine ?? 1);
 			mergeFileChange(changes, { path: display.path, ...countChangedLines(diff) }, cwd);
 		}
@@ -121,16 +123,22 @@ export function formatFileChangePath(path: string, cwd: string): string {
  * One `    ╰─ <path> +N -M` row, truncated to width; the path renders relative
  * to cwd where possible. U6 removed the per-row expand hint (the global tail
  * line owns the keys). A link change has no line counts: the row reads as a
- * link instead of `+0 -0`.
+ * link instead of `+0 -0`. `omitted` is the reason text of an edit whose diff
+ * was not kept: it stands in for counts nobody knows, or follows those known.
  */
 export function formatFileChangeSummaryLine(
 	rawPath: string,
 	cwd: string | undefined,
-	change: Pick<FileChangeSummary, "added" | "removed" | "symlink">,
+	change: Pick<FileChangeSummary, "added" | "removed" | "symlink"> & { omitted?: string },
 	width: number,
 ): string {
 	const prefix = theme.fg("dim", FILE_CHANGE_SUMMARY_PREFIX);
-	const suffix = change.symlink ? "" : `${theme.fg("dim", " ")}${formatChangeCounts(change)}`;
+	const parts: string[] = [];
+	if (!change.symlink && !(change.omitted && change.added === 0 && change.removed === 0)) {
+		parts.push(formatChangeCounts(change));
+	}
+	if (change.omitted) parts.push(theme.fg("dim", change.omitted));
+	const suffix = parts.length > 0 ? `${theme.fg("dim", " ")}${parts.join(theme.fg("dim", " · "))}` : "";
 	const safeWidth = Math.max(1, width);
 	const available = Math.max(1, safeWidth - visibleWidth(prefix) - visibleWidth(suffix));
 	const displayPath = cwd === undefined ? rawPath : formatFileChangePath(rawPath, cwd);
