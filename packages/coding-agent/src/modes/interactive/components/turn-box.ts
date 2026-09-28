@@ -53,6 +53,11 @@ export function boxOuterWidth(width: number): number {
 	return Math.max(BOX_MIN_OUTER, Math.min(Math.floor(width) - 1, BOX_MAX_WIDTH));
 }
 
+/** The click area of one framed line: the frame and its margin, never past the terminal's last column. */
+export function boxRegionWidth(outer: number, width: number): number {
+	return Math.min(outer + 1, Math.max(1, Math.floor(width)));
+}
+
 /**
  * The lines cut to `width` columns. A frame narrower than {@link BOX_MIN_OUTER}
  * cannot be drawn whole, and a line wider than the terminal breaks the screen.
@@ -279,6 +284,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 	const ui = timeline.ui;
 	const outer = boxOuterWidth(input.width);
 	const inner = outer - 4;
+	const regionWidth = boxRegionWidth(outer, input.width);
 	const borderColor: ThemeColor = ui.focused ? "activityAccent" : input.live ? "boxBorderLive" : "boxBorder";
 	const border = (text: string) => theme.fg(borderColor, text);
 	const regions: ClickRegion[] = [];
@@ -428,7 +434,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 	regions.push({
 		line: headerLine,
 		col: 0,
-		width: outer + 1,
+		width: regionWidth,
 		height: 1,
 		revealBelow: input.open ? 0 : Math.min(body.length, input.maxBodyRows) + 1,
 		onClick: () => input.onToggleBox(),
@@ -441,7 +447,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 			regions.push({
 				line: lines.length - 1,
 				col: 0,
-				width: outer + 1,
+				width: regionWidth,
 				height: 1,
 				onClick: () => {
 					if (timeline.ui.scrollBody(-Math.max(1, timeline.ui.lastVisible - 1))) input.onChange();
@@ -460,7 +466,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		regions.push({
 			line: lines.length - 1,
 			col: 0,
-			width: outer + 1,
+			width: regionWidth,
 			height: 1,
 			onClick: () => {
 				timeline.ui.followNewest();
@@ -486,7 +492,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		regions.push({
 			line: bodyTop + index,
 			col: 0,
-			width: outer + 1,
+			width: regionWidth,
 			height: 1,
 			...(detail && key && line.head
 				? {
