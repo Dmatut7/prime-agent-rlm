@@ -390,5 +390,52 @@ class AssignmentFormsPipelineTests(te.TrackerCase):
         self.assertEqual(_anywhere(cell, "hunter2passw0rd"), [])
 
 
+class EmptyUserUrlTests(unittest.TestCase):
+    """FIX-5: `redis://:password@host` (no user name, the redis default) holds a password like any other URL."""
+
+    def test_a_url_with_a_password_and_no_user_is_withheld(self):
+        urls = [
+            "redis://:passw0rd@host:6379",
+            'DB = "redis://:MyStr0ngPass@localhost:6379/0"',
+            "REDIS_URL=redis://:s3cr3tpass@cache.internal:6379/0",
+            "amqp://:guestpass@rabbit:5672/",
+        ]
+        self.assertGreater(len(urls), 0)
+        for text in urls:
+            with self.subTest(text=text):
+                self.assertTrue(effects._looks_secret(text))
+
+    def test_urls_without_a_password_stay_clean_and_user_and_password_urls_are_judged_as_before(self):
+        clean = [
+            "https://example.com/a",
+            "redis://localhost:6379/0",
+            "redis://:6379",
+            "http://:8080/path",
+            "mongodb://host:27017/db",
+            "redis://:short@host",
+            "git@github.com:org/repo.git",
+            "https://example.com:8080/a@b",
+        ]
+        withheld = ["db = postgres://admin:pa55word@db.internal:5432/app", "https://user:hunter2hunter2@example.com/x"]
+        self.assertGreater(len(clean) + len(withheld), 0)
+        for text in clean:
+            with self.subTest(text=text):
+                self.assertFalse(effects._looks_secret(text))
+        for text in withheld:
+            with self.subTest(text=text):
+                self.assertTrue(effects._looks_secret(text))
+
+
+@unittest.skipUnless(te.HAS_GIT, "git is needed for the work-tree comparison")
+class EmptyUserUrlPipelineTests(te.TrackerCase):
+    def test_a_redis_url_written_to_an_ordinary_file_keeps_its_counts_but_no_diff(self):
+        cell = self.kernel.run("open('cache.txt', 'w').write('DB = \"redis://:MyStr0ngPass@localhost:6379/0\"\\n')")
+        record = cell.by_rel()["cache.txt"]
+        self.assertEqual((record["kind"], record["added"]), ("created", 1))
+        self.assertEqual(record["diffOmitted"], effects.SENSITIVE)
+        self.assertNotIn("diff", record)
+        self.assertEqual(_anywhere(cell, "MyStr0ngPass"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

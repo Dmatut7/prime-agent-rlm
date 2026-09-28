@@ -195,7 +195,7 @@ _SECRET_SHAPES: tuple[tuple[tuple[str, ...], bool, re.Pattern[str]], ...] = tupl
         (("pypi-AgE",), False, r"pypi-AgE[A-Za-z0-9_-]{20,}"),
         (("eyJ",), False, r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
         (("bearer",), True, r"\bbearer\s+[a-z0-9._~+/=-]{20,}"),
-        (("://",), True, r"\b[a-z][a-z0-9+.-]*://[^\s:/@\"']+:[^\s:/@\"']{6,}@"),
+        (("://",), True, r"\b[a-z][a-z0-9+.-]*://[^\s:/@\"']*:[^\s:/@\"']{6,}@"),
     )
 )
 # `name = value` assignments whose name ends in one of these words (matched on the lower-cased text).
