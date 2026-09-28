@@ -300,8 +300,11 @@ deleted in the same cell.
   later edits of that entry in the same cell stay withheld. An activity's
   `detail` (a command's latest or final output line, for example from `cat
   .env` or `echo $API_KEY`) gets the same scan; a `detail` that looks like a
-  credential is left out of the record rather than sent. The scan runs only
-  over the capped text and treats its own failure as a secret. It cannot tell a
+  credential is left out of the record rather than sent. A step's `label` (the
+  command line or task text) is scanned too, before it is cut to its length
+  limit; one that looks like a credential reads as the step's kind (`command`,
+  for example). The scan runs only over the capped text and treats its own
+  failure as a secret. It cannot tell a
   real credential from a value shaped like one, so ordinary code is withheld
   too: a test fixture such as `API_KEY = "test-1234567890abcdef"` or a
   JWT-shaped sample token on any line of a file's diff (changed lines and their
