@@ -20,9 +20,9 @@ Observation paths:
 - A bounded before/after comparison catches what child processes did (``sed -i``,
   formatters, ``git checkout``). Inside a git work tree it compares ``git status``
   snapshots plus stat and content caches; elsewhere it compares a bounded mtime
-  scan. It runs only for a cell that starts a process, or while ``bash()`` handles
-  from earlier cells are still alive, because nothing else can change a file
-  behind Python's back.
+  scan. It runs only for a cell that starts a process, while ``bash()`` handles
+  from earlier cells are still alive, or when such a handle ends between cells,
+  because nothing else can change a file behind Python's back.
 - ``bash()``, ``rlm.run()``, harness writes and the web skills report their own
   steps through the helpers at the bottom of this module.
 
@@ -93,9 +93,8 @@ SNAPSHOT_CONTENT_BYTES = 4 << 20
 CONTENT_CACHE_BYTES = 8 << 20
 CONTENT_CACHE_ENTRIES = 512
 COMMAND_UPDATE_INTERVAL_S = 0.5
-# The detail of a command still running when its cell ends ("moved to the background, still running").
-BACKGROUND_DETAIL = "转到后台继续跑"
-# Completions of background commands held while no cell is running, sent at the next cell's start.
+# Completions of background commands held while no cell is running, sent at the next cell's start;
+# past it the oldest are dropped and that cell says how many were lost.
 MAX_PENDING_COMPLETIONS = 64
 _PATH_CACHE_LIMIT = 4096
 
@@ -131,7 +130,144 @@ _SKIP_DIR_NAMES = frozenset(
 _BUILD_DIR_NAMES = frozenset({"dist", "build", "out", "target", "coverage", ".output"})
 _SKIP_SUFFIXES = (".pyc", ".pyo", ".swp", ".swx")
 _SKIP_FILE_NAMES = frozenset({".DS_Store"})
+# BSD `sed -i` (macOS) writes the new content to `.!<pid>!<name>` and renames it over the file.
+_SED_TEMP = re.compile(r"\.![0-9]+!.")
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+
+# Secrets are withheld from records: the host saves them with the session, so a diff or memory text
+# holding a credential would put it on disk. A withheld record keeps its path, kind and line counts.
+SENSITIVE = "sensitive"
+# Files that hold credentials by convention: their diffs are never kept, whatever they contain.
+_SENSITIVE_FILE_NAMES = frozenset(
+    {
+        ".env",
+        ".netrc",
+        "_netrc",
+        ".npmrc",
+        ".pypirc",
+        ".pgpass",
+        ".htpasswd",
+        ".git-credentials",
+        ".dockercfg",
+        ".boto",
+        ".s3cfg",
+        "credentials",
+    }
+)
+_SENSITIVE_PREFIXES = (".env.", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519")
+_SENSITIVE_SUFFIXES = (
+    ".env",
+    ".pem",
+    ".key",
+    ".p8",
+    ".p12",
+    ".pfx",
+    ".ppk",
+    ".keystore",
+    ".jks",
+    ".kdbx",
+    ".tfvars",
+    ".tfstate",
+)
+# Every file under these directories (ssh keys, gpg keyrings, cloud and registry logins).
+_SENSITIVE_DIR_NAMES = frozenset({".ssh", ".gnupg", ".aws", ".kube", ".docker"})
+# `secrets.yaml`, `db-credentials.json`: a name about secrets on a config or data file, not on source code.
+_SENSITIVE_CONFIG = re.compile(
+    r"(?:secret|credential)[^/]*\.(?:json|ya?ml|toml|ini|cfg|conf|env|properties|txt|xml|plist)$|^[^.]*(?:secret|credential)[^.]*$",
+    re.IGNORECASE,
+)
+# Credential shapes that are distinctive on their own. Each runs only when one of its literal markers
+# occurs (a plain substring test), so a diff without any marker costs a few substring scans.
+_SECRET_SHAPES: tuple[tuple[tuple[str, ...], bool, re.Pattern[str]], ...] = tuple(
+    (markers, lower, re.compile(pattern))
+    for markers, lower, pattern in (
+        (("PRIVATE KEY",), False, r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"),
+        (("sk-",), False, r"(?<![A-Za-z0-9])sk-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_-]{20,}"),
+        (("k_live_", "k_test_"), False, r"(?<![A-Za-z0-9])[rs]k_(?:live|test)_[A-Za-z0-9]{16,}"),
+        (("AKIA", "ASIA"), False, r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])"),
+        (("ghp_", "gho_", "ghu_", "ghs_", "ghr_"), False, r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{30,}"),
+        (("github_pat_",), False, r"github_pat_[A-Za-z0-9_]{20,}"),
+        (("xox",), False, r"(?<![A-Za-z0-9])xox[abprs]-[A-Za-z0-9-]{10,}"),
+        (("glpat-",), False, r"(?<![A-Za-z0-9])glpat-[A-Za-z0-9_-]{20,}"),
+        (("AIza",), False, r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}"),
+        (("hf_",), False, r"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{30,}"),
+        (("npm_",), False, r"(?<![A-Za-z0-9])npm_[A-Za-z0-9]{36}"),
+        (("pypi-AgE",), False, r"pypi-AgE[A-Za-z0-9_-]{20,}"),
+        (("eyJ",), False, r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+        (("bearer",), True, r"\bbearer\s+[a-z0-9._~+/=-]{20,}"),
+        (("://",), True, r"\b[a-z][a-z0-9+.-]*://[^\s:/@\"']+:[^\s:/@\"']{6,}@"),
+    )
+)
+# `name = value` assignments whose name ends in one of these words (matched on the lower-cased text).
+_SECRET_NAMES = (
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "credential",
+    "api_key",
+    "api-key",
+    "apikey",
+    "access_key",
+    "access-key",
+    "private_key",
+    "private-key",
+)
+# What may follow the name: `secret_key`, `credentials`, a closing quote, then `=` or `:` (not `==`)
+# and a quoted or bare value.
+_SECRET_ASSIGNMENT_TAIL = re.compile(
+    r"(?:[_-]?key)?s?[\"']?\s*(?<![=!<>])[:=](?!=)\s*(?:([\"'])([^\"'\s]{8,})\1|([^\s\"'#,;.(){}\[\]<>]{8,}))"
+)
+_SECRET_PLACEHOLDER = re.compile(
+    r"(?i)^(?:x+|\*+|\.+|changeme|change_me|placeholder|example\w*|dummy\w*|redacted|none|null|true|false|"
+    r"your[_-]?\w*|replace[_-]?me\w*|\$\{?\w+\}?|%\(\w+\)s|\{\{.*\}\})$"
+)
+_IDENTIFIER_LIKE = re.compile(r"^[A-Za-z_-]+$")
+
+
+def _sensitive_path(path: str | None) -> bool:
+    """Whether a file's name or folder marks it as a credential store."""
+    if not path:
+        return False
+    directory, name = os.path.split(path)
+    lower = name.lower()
+    if lower in _SENSITIVE_FILE_NAMES or lower.startswith(_SENSITIVE_PREFIXES) or lower.endswith(_SENSITIVE_SUFFIXES):
+        return True
+    if _SENSITIVE_CONFIG.search(lower):
+        return True
+    return any(part.lower() in _SENSITIVE_DIR_NAMES for part in directory.split(os.sep))
+
+
+def _looks_secret(text: str | None) -> bool:
+    """Whether a text holds a likely credential. Callers bound the text; an error counts as a secret."""
+    if not text:
+        return False
+    try:
+        lower = text.lower()
+        for markers, use_lower, pattern in _SECRET_SHAPES:
+            haystack = lower if use_lower else text
+            if any(marker in haystack for marker in markers) and pattern.search(haystack):
+                return True
+        for name in _SECRET_NAMES:
+            start = lower.find(name)
+            while start >= 0:
+                match = _SECRET_ASSIGNMENT_TAIL.match(lower, start + len(name))
+                if match:
+                    value = match.group(2) or match.group(3) or ""
+                    if not (_SECRET_PLACEHOLDER.match(value) or value.isdigit() or _IDENTIFIER_LIKE.match(value)):
+                        return True
+                start = lower.find(name, start + 1)
+        return False
+    except Exception:  # noqa: BLE001 - withholding is the safe answer
+        return True
+
+
+def _withhold_memory_texts(record: dict[str, Any], withheld: bool = False) -> None:
+    """Drop both texts of a memory record when either holds a likely credential (or `withheld` says so)."""
+    if withheld or _looks_secret(record.get("before")) or _looks_secret(record.get("after")):
+        record.pop("before", None)
+        record.pop("after", None)
+        record["textOmitted"] = SENSITIVE
 
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 
@@ -162,6 +298,17 @@ def _one_line(text: str, limit: int) -> str:
     return _clip(" ".join(text.split()), limit)
 
 
+def _safe_detail(text: str, limit: int) -> str | None:
+    """`text` one-lined and capped, or None when it looks like it holds a credential.
+
+    A command's last output line (``echo $API_KEY``, ``cat .env``) is display text like a diff or
+    memory text, so it gets the same scan before it ever reaches an activity record.
+    """
+    if _looks_secret(text):
+        return None
+    return _one_line(text, limit)
+
+
 def _under(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
@@ -172,6 +319,23 @@ def _stat_sig(path: str) -> tuple[int, int] | None:
         info = os.stat(path)
     except (OSError, ValueError):
         return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    return (info.st_size, info.st_mtime_ns)
+
+
+# The size slot of a symlink's own signature: a link is compared as itself, never as its target.
+_LINK_SIZE = -1
+
+
+def _entry_sig(path: str) -> tuple[int, int] | None:
+    """`_stat_sig` of the path itself: a symlink gives (`_LINK_SIZE`, its own mtime_ns)."""
+    try:
+        info = os.lstat(path)
+    except (OSError, ValueError):
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        return (_LINK_SIZE, info.st_mtime_ns)
     if not stat.S_ISREG(info.st_mode):
         return None
     return (info.st_size, info.st_mtime_ns)
@@ -209,6 +373,7 @@ class _Content:
         self, state: str, data: bytes | None = None, sig: tuple[int, int] | None = None, why: str | None = None
     ) -> None:
         # state: "absent" | "bytes" | "large" (exists, too big to keep) | "unknown" (exists, not captured)
+        # | "link" (a symlink; `data` is its target)
         self.state = state
         self.data = data
         self.sig = sig
@@ -223,6 +388,14 @@ _ABSENT = _Content("absent")
 _UNKNOWN = _Content("unknown", why="no_baseline")
 # A path the before-commit does not contain (see _Tracker.blobs).
 _MISSING = b"\0missing"
+
+
+def _link_content(path: str, sig: tuple[int, int]) -> _Content:
+    try:
+        target = os.fsencode(os.readlink(path))
+    except (OSError, ValueError):
+        target = None
+    return _Content("link", target, sig)
 
 
 class _ContentCache:
@@ -314,6 +487,17 @@ class _RepoState:
         self.stats = stats
 
 
+class _After:
+    """The state a command comparison ended on: git states per work tree and the mtime scan."""
+
+    __slots__ = ("repos", "scan", "roots")
+
+    def __init__(self) -> None:
+        self.repos: dict[str, _RepoState] = {}
+        self.scan: tuple[str, dict[str, tuple[int, int]]] | None = None
+        self.roots: set[str] = set()
+
+
 class _Cell:
     def __init__(self, cell_id: str, budget_s: float) -> None:
         self.id = cell_id
@@ -381,9 +565,16 @@ _SNAPSHOT_LATE = (
     "the git snapshot before a command did not finish within the tracking budget, "
     "so changes made by commands in this cell are not listed"
 )
+_IGNORE_UNKNOWN = (
+    "git did not say in time which files it ignores, so files it ignores may be listed"
+)
 _COMPARE_LATE = (
     "comparing the files commands changed took longer than the tracking budget, "
     "so changes made by commands in this cell are not listed"
+)
+_GAP_LATE = (
+    "comparing the files a background command changed after its cell ended took longer than "
+    "the tracking budget, so those changes are not listed"
 )
 
 
@@ -631,6 +822,15 @@ class _Tracker:
         self.skip_roots: tuple[str, ...] = ()
         self.cwd_git_root: str | None = None
         self.pending_completions: list[dict[str, Any]] = []
+        self.lost_completions = 0
+        # Where the last cell's command comparison ended, kept while it left commands running: a
+        # command that ends before the next cell starts is compared against it (see `_gap_check`).
+        self.carried: _After | None = None
+        # What those between-cell comparisons found, for the next cell: path -> baseline.
+        self.pending_changes: dict[str, _Content] = {}
+        self.pending_note: str | None = None
+        self._gap_running = False
+        self._gap_again = False
         # Resolved once, off every cell's path: a slow or hung git must not stall a write wrapper.
         self._cwd_git_resolved = threading.Event()
         self._refresh_paths()
@@ -665,6 +865,9 @@ class _Tracker:
         harness.add(os.path.join(self.agent_dir, "harness", HARNESS_STATE_FILE_NAME))
         journal = (os.environ.get("PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL") or "").strip()
         roots = {os.path.realpath(prefix) for prefix in (sys.prefix, sys.base_prefix, sys.exec_prefix) if prefix}
+        if session_dir:
+            # The session's own storage (subagent folders, artifacts) is not project work, wherever it sits.
+            roots.add(os.path.realpath(session_dir))
         harness_files = frozenset(harness)
         skip_files = frozenset({os.path.realpath(journal)} if journal else ())
         # An environment inside the project is skipped by its directory name instead.
@@ -675,7 +878,9 @@ class _Tracker:
             self.skip_roots = skip_roots
             self._info_cache.clear()
 
-    def resolve(self, raw: Any) -> str | None:
+    def resolve(self, raw: Any, follow: bool = False) -> str | None:
+        """The absolute path with its directories resolved. `follow` (a write through the path, not
+        a removal of it): a symlink resolves to its target when the target is a place tracking reports."""
         if isinstance(raw, int):
             return None
         try:
@@ -694,7 +899,17 @@ class _Tracker:
             if len(self._dir_cache) > _PATH_CACHE_LIMIT:
                 self._dir_cache.clear()
             self._dir_cache[directory] = real_dir
-        return os.path.join(real_dir, name)
+        path = os.path.join(real_dir, name)
+        if follow:
+            try:
+                is_link = stat.S_ISLNK(os.lstat(path).st_mode)
+            except (OSError, ValueError):
+                is_link = False
+            if is_link:
+                target = os.path.realpath(path)
+                if target != path and self.classify(target) is not None:
+                    return target
+        return path
 
     def _cwd_git_state(self) -> bool | None:
         """Whether the session cwd is in a git work tree; None while the one-time lookup still runs."""
@@ -728,7 +943,7 @@ class _Tracker:
 
     def _classify_uncached(self, path: str) -> _PathInfo | None:
         directory, name = os.path.split(path)
-        if name in _SKIP_FILE_NAMES or name.endswith(_SKIP_SUFFIXES):
+        if name in _SKIP_FILE_NAMES or name.endswith(_SKIP_SUFFIXES) or _SED_TEMP.match(name):
             return None
         if any(part in _SKIP_DIR_NAMES for part in directory.split(os.sep)):
             return None
@@ -814,9 +1029,9 @@ class _Tracker:
         for index, path in enumerate(entries):
             if index % 64 == 63 and _left(deadline) <= 0:
                 raise _OutOfTime()
-            sig = _stat_sig(path)
+            sig = _entry_sig(path)
             stats[path] = sig
-            if not fill_cache or sig is None or sig[0] > SNAPSHOT_CONTENT_FILE_BYTES:
+            if not fill_cache or sig is None or not 0 <= sig[0] <= SNAPSHOT_CONTENT_FILE_BYTES:
                 continue
             if self.cache.get(path, sig) is not None:
                 continue
@@ -831,20 +1046,30 @@ class _Tracker:
                 self.cache.put(path, sig, data)
         return _RepoState(root, oid, entries, stats)
 
-    def filter_ignored(self, recs: list[_FileRec], deadline: float) -> None:
-        """Mark records for files the repository ignores; one `git check-ignore` per batch."""
-        if not self._cwd_git_state() or self.cwd_git_root is None:
-            return
+    def filter_ignored(self, recs: list[_FileRec], deadline: float) -> bool:
+        """Mark records for files the repository ignores; one `git check-ignore` per batch.
+
+        False when git gave no answer (too slow, failed, or the work tree is not resolved yet):
+        the unanswered records stay unmarked and nothing is cached, so the next call asks again.
+        Shell-sourced records never need asking: `git status` already leaves ignored files out.
+        """
+        asked = [rec for rec in recs if rec.source != "shell"]
+        if not asked:
+            return True
+        in_git = self._cwd_git_state()
+        if in_git is None:
+            return False
         root = self.cwd_git_root
-        pending = [
-            rec.path
-            for rec in recs
-            if rec.source != "shell" and _under(rec.path, root) and rec.path not in self._ignore_cache
-        ]
+        if not in_git or root is None:
+            return True
+        answered = True
+        pending = list(
+            dict.fromkeys(rec.path for rec in asked if _under(rec.path, root) and rec.path not in self._ignore_cache)
+        )
         if pending:
             payload = b"\0".join(os.fsencode(path) for path in pending) + b"\0"
             try:
-                proc = subprocess.run(
+                proc: subprocess.CompletedProcess[bytes] | None = subprocess.run(
                     ["git", "-C", root, "check-ignore", "-z", "--stdin"],
                     input=payload,
                     stdout=subprocess.PIPE,
@@ -852,21 +1077,21 @@ class _Tracker:
                     timeout=max(0.05, min(GIT_TIMEOUT_S, _left(deadline))),
                     env=_git_env(),
                 )
-                # Exit 1 means "nothing ignored"; any other failure reports everything.
-                ignored = (
-                    {os.fsdecode(item) for item in proc.stdout.split(b"\0") if item}
-                    if proc.returncode in (0, 1)
-                    else set()
-                )
             except (OSError, ValueError, subprocess.SubprocessError):
-                ignored = set()
-            if len(self._ignore_cache) > _PATH_CACHE_LIMIT:
-                self._ignore_cache.clear()
-            for path in pending:
-                self._ignore_cache[path] = path in ignored
-        for rec in recs:
-            if rec.source != "shell" and self._ignore_cache.get(rec.path):
+                proc = None
+            # Exit 1 means "nothing ignored"; a timeout or any other exit is no answer at all.
+            if proc is not None and proc.returncode in (0, 1):
+                ignored = {os.fsdecode(item) for item in proc.stdout.split(b"\0") if item}
+                if len(self._ignore_cache) > _PATH_CACHE_LIMIT:
+                    self._ignore_cache.clear()
+                for path in pending:
+                    self._ignore_cache[path] = path in ignored
+            else:
+                answered = False
+        for rec in asked:
+            if self._ignore_cache.get(rec.path):
                 rec.ignored = True
+        return answered
 
     def blobs(self, root: str, specs: list[str], deadline: float) -> dict[str, bytes | None]:
         """Content of `<oid>:<path>` specs: bytes, `_MISSING` when the commit has no such file,
@@ -957,21 +1182,39 @@ class _Tracker:
         with self.lock:
             self.cell = cell
             completions, self.pending_completions = self.pending_completions, []
-        # Background commands that finished while no cell was running report here, first.
+            lost, self.lost_completions = self.lost_completions, 0
+            # From here on this cell's own snapshots cover commands still running.
+            self.carried = None
+            changes, self.pending_changes = self.pending_changes, {}
+            note, self.pending_note = self.pending_note, None
+        if lost:
+            cell.note_incomplete(
+                f"{lost} background commands ended while no cell was running and their results were lost"
+            )
+        if note:
+            cell.note_incomplete(note)
+        # Background commands that finished while no cell was running report here, first, and the
+        # files they changed after their cell ended with them.
         for record in completions:
             self.send_activity(cell.id, record)
-        live = 0
-        bash_module = sys.modules.get("rlm.bash")
-        if bash_module is not None:
-            try:
-                live = int(bash_module.live_handle_facts(None).get("handles", 0))
-            except Exception:  # noqa: BLE001
-                live = 0
-        if live > 0:
+        if changes:
+            self.apply_shell_changes(cell, list(changes.items()))
+            with self.lock:
+                self._wake_watcher()
+        if self._live_handles() > 0:
             # Commands from earlier cells may still be writing; compare from this cell's start. The
             # snapshot runs on a worker and the cell starts at once; a process the cell starts later
             # waits for it, bounded by the budget (see request_snapshot).
             self.request_snapshot(cell, os.getcwd(), wait=False)
+
+    def _live_handles(self) -> int:
+        bash_module = sys.modules.get("rlm.bash")
+        if bash_module is None:
+            return 0
+        try:
+            return int(bash_module.live_handle_facts(None).get("handles", 0))
+        except Exception:  # noqa: BLE001
+            return 0
 
     def discard_cell(self, cell_id: str) -> None:
         with self.lock:
@@ -1004,7 +1247,9 @@ class _Tracker:
                     for job in list(cell.snapshots):
                         self._await_snapshot(cell, job, deadline)
                     if cell.gave_up is None and (cell.repos or cell.scan is not None):
-                        self._final_shell_compare(cell, deadline)
+                        # Commands left running may still change files after this comparison.
+                        keep = bool(still_running) or self._live_handles() > 0
+                        self._final_shell_compare(cell, deadline, keep)
                     if cell.files and not self._cwd_git_resolved.is_set():
                         # Ignore rules and the build-output rule need it; normally it resolved long ago.
                         self._cwd_git_resolved.wait(max(0.0, _left(deadline)))
@@ -1025,7 +1270,11 @@ class _Tracker:
             with self.lock:
                 if self.cell is cell:
                     self.cell = None
+                ended_while_closing = bool(self.pending_completions)
             self.local.busy = False
+        if ended_while_closing:
+            # A command ended while this cell was finishing, maybe after its comparison.
+            self._request_gap_check()
         return interrupted
 
     def active(self) -> _Cell | None:
@@ -1037,16 +1286,18 @@ class _Tracker:
             return None
         return cell
 
-    def _final_shell_compare(self, cell: _Cell, deadline: float) -> None:
+    def _final_shell_compare(self, cell: _Cell, deadline: float, keep: bool = False) -> None:
         """The end-of-cell comparison, computed on a worker so a slow git cannot hold the event
-        loop past the budget; its result is applied here, on the cell's thread."""
+        loop past the budget; its result is applied here, on the cell's thread. `keep`: the state it
+        ends on is kept for commands that end before the next cell starts."""
         outcome: dict[str, Any] = {}
         done = threading.Event()
+        ended = _After() if keep else None
 
         def work() -> None:
             self.local.busy = True
             try:
-                outcome["changes"] = self.shell_changes(cell, deadline)
+                outcome["changes"] = self.shell_changes(cell, deadline, ended)
             except _OutOfTime:
                 outcome["late"] = True
             except Exception:  # noqa: BLE001
@@ -1064,6 +1315,10 @@ class _Tracker:
             cell.note_incomplete("internal error while comparing command changes")
         else:
             self.apply_shell_changes(cell, outcome["changes"])
+            if ended is not None:
+                ended.roots = set(cell.roots_seen)
+                with self.lock:
+                    self.carried = ended
 
     def guarded(self, cell: _Cell, work: Callable[[], Any]) -> Any:
         """Run tracker work on the calling thread with the budget charged and failures contained."""
@@ -1082,7 +1337,8 @@ class _Tracker:
     # ------------------------------------------------------------ file writes
 
     def on_write(self, cell: _Cell, raw: Any, deleting: bool = False) -> None:
-        path = self.resolve(raw)
+        # A removal acts on the link itself; any other write lands in the link's target.
+        path = self.resolve(raw, follow=not deleting)
         if path is None:
             return
         with self.lock:
@@ -1109,13 +1365,15 @@ class _Tracker:
             self._wake_watcher()
 
     def capture(self, cell: _Cell, path: str) -> _Content | None:
-        """The file's current state, taken before the write lands; None for non-regular files."""
+        """The file's current state, taken before the write lands; None for other non-regular files."""
         try:
-            info = os.stat(path)
+            info = os.lstat(path)
         except FileNotFoundError:
             return _ABSENT
         except (OSError, ValueError):
             return None
+        if stat.S_ISLNK(info.st_mode):
+            return _link_content(path, (_LINK_SIZE, info.st_mtime_ns))
         if not stat.S_ISREG(info.st_mode):
             return None
         sig = (info.st_size, info.st_mtime_ns)
@@ -1383,25 +1641,104 @@ class _Tracker:
     def request_shell_check(self) -> None:
         with self.lock:
             cell = self.cell
-            if cell is None or cell.closing or not (cell.repos or cell.scan is not None):
-                return
-            cell.shell_check_pending = True
-            self._wake_watcher()
+            between_cells = cell is None or cell.closing
+            if not between_cells:
+                if not (cell.repos or cell.scan is not None):
+                    return
+                cell.shell_check_pending = True
+                self._wake_watcher()
+        if between_cells:
+            self._request_gap_check()
 
-    def shell_changes(self, cell: _Cell, deadline: float) -> list[tuple[str, _Content]]:
+    def _request_gap_check(self) -> None:
+        with self.lock:
+            if self.carried is None:
+                return
+            if self._gap_running:
+                self._gap_again = True
+                return
+            self._gap_running = True
+        threading.Thread(target=self._gap_loop, daemon=True, name="rlm-change-gap").start()
+
+    def _gap_loop(self) -> None:
+        self.local.busy = True
+        while True:
+            with self.lock:
+                self._gap_again = False
+                carried = self.carried
+            if carried is not None:
+                try:
+                    self._gap_check(carried)
+                except Exception:  # noqa: BLE001 - a missed background change is never raised
+                    pass
+            with self.lock:
+                if not self._gap_again or self.carried is None:
+                    self._gap_running = False
+                    return
+
+    def _gap_check(self, carried: _After) -> None:
+        """A command ended while no cell was running: compare from where the last comparison ended,
+        on this worker and within one cell budget, and hand what changed to the next cell (or to the
+        one that started meanwhile), where the command's end is reported too."""
+        probe = _Cell("", self.budget_s)
+        probe.repos = dict(carried.repos)
+        probe.scan = carried.scan
+        ended = _After()
+        ended.roots = carried.roots
+        changes: list[tuple[str, _Content]] | None
+        try:
+            changes = self.shell_changes(probe, time.perf_counter() + self.budget_s, ended)
+        except _OutOfTime:
+            changes = None
+            probe.note_incomplete(_GAP_LATE)
+        with self.lock:
+            if self.carried is carried:
+                self.carried = ended if changes is not None else None
+            target = self.cell if self.cell is not None and not self.cell.closing else None
+        if target is not None:
+            with target.work_lock:
+                with self.lock:
+                    open_cell = self.cell is target and not target.closing
+                if open_cell:
+                    if probe.incomplete:
+                        target.note_incomplete(probe.incomplete)
+                    if changes:
+                        self.apply_shell_changes(target, changes)
+                        with self.lock:
+                            self._wake_watcher()
+                    return
+        with self.lock:
+            if probe.incomplete and self.pending_note is None:
+                self.pending_note = probe.incomplete
+            for path, baseline in changes or []:
+                if path in self.pending_changes:
+                    continue
+                if len(self.pending_changes) >= MAX_FILES_PER_CELL:
+                    self.pending_note = self.pending_note or (
+                        f"more than {MAX_FILES_PER_CELL} files changed; the rest are not listed"
+                    )
+                    break
+                self.pending_changes[path] = baseline
+
+    def shell_changes(
+        self, cell: _Cell, deadline: float, after: _After | None = None
+    ) -> list[tuple[str, _Content]]:
         """What changed since the before-snapshots, as (path, baseline) pairs; `_OutOfTime` past the deadline.
 
         Pure computation, safe on a worker thread: `apply_shell_changes` turns it into records.
+        `after`, when given, receives the states the comparison ended on.
         """
         changes: list[tuple[str, _Content]] = []
         for before in list(cell.repos.values()):
-            self._compare_repo(cell, before, deadline, changes)
+            self._compare_repo(cell, before, deadline, changes, after)
         if cell.scan is not None:
-            self._compare_scan(cell, cell.scan[0], cell.scan[1], deadline, changes)
+            self._compare_scan(cell, cell.scan[0], cell.scan[1], deadline, changes, after)
         return changes
 
     def apply_shell_changes(self, cell: _Cell, changes: list[tuple[str, _Content]]) -> None:
         for path, baseline in changes:
+            if path in self.harness_files:
+                continue  # the harness's own saves report themselves as memory records
             with self.lock:
                 rec = cell.files.get(path)
                 if rec is not None:
@@ -1413,12 +1750,19 @@ class _Tracker:
                 cell.files[path] = _FileRec(path, baseline, "shell")
 
     def _compare_repo(
-        self, cell: _Cell, before: _RepoState, deadline: float, changes: list[tuple[str, _Content]]
+        self,
+        cell: _Cell,
+        before: _RepoState,
+        deadline: float,
+        changes: list[tuple[str, _Content]],
+        ended: _After | None = None,
     ) -> None:
         after = self.repo_state(before.root, False, deadline)
         if after is None:
             cell.note_incomplete("git status failed; changes made by commands may be missing")
             return
+        if ended is not None:
+            ended.repos[before.root] = after
         candidates = set(before.entries) | set(after.entries)
         if before.oid is not None and after.oid is not None and before.oid != after.oid:
             out = _run_git(
@@ -1443,7 +1787,7 @@ class _Tracker:
                     continue
             if self.classify(path) is None:
                 continue
-            current = _stat_sig(path)
+            current = _entry_sig(path)
             if path in before.entries:
                 prior = before.stats.get(path)
                 if prior == current:
@@ -1457,7 +1801,9 @@ class _Tracker:
                 )
                 continue
             if after.entries.get(path) == "??":
-                pending.append((path, _ABSENT))
+                if current is not None:
+                    # A new file already gone again (a tool's temp file) is no creation.
+                    pending.append((path, _ABSENT))
                 continue
             if before.oid is None:
                 pending.append((path, _UNKNOWN))
@@ -1488,11 +1834,14 @@ class _Tracker:
         before: dict[str, tuple[int, int]],
         deadline: float,
         changes: list[tuple[str, _Content]],
+        ended: _After | None = None,
     ) -> None:
         after = self.scan(root, deadline)
         if after is None:
             cell.note_incomplete("the working directory is too large to scan for command changes")
             return
+        if ended is not None:
+            ended.scan = (root, after)
         for path in sorted(set(before) | set(after)):
             prior = before.get(path)
             if prior == after.get(path):
@@ -1503,7 +1852,8 @@ class _Tracker:
             if self.classify(path) is None:
                 continue
             if prior is None:
-                changes.append((path, _ABSENT))
+                if _stat_sig(path) is not None:
+                    changes.append((path, _ABSENT))
                 continue
             data = self.cache.get(path, prior)
             changes.append(
@@ -1522,6 +1872,8 @@ class _Tracker:
         final: _Content
         if sig is None:
             final = _ABSENT
+        elif sig[0] == _LINK_SIZE:
+            final = _link_content(rec.path, sig)
         elif cheap:
             final = _Content("unknown", None, sig, "budget")
         elif sig[0] > MAX_BASELINE_FILE_BYTES:
@@ -1541,8 +1893,9 @@ class _Tracker:
             kind = "renamed"
         else:
             kind = "modified"
+        link = base.state == "link" or final.state == "link"
         if kind == "modified":
-            if base.state == "bytes" and final.state == "bytes" and base.data == final.data:
+            if base.state == final.state and base.state in ("bytes", "link") and base.data == final.data:
                 return None
             if base.sig is not None and base.sig == final.sig and base.state != "bytes":
                 return None
@@ -1553,6 +1906,10 @@ class _Tracker:
         if kind == "renamed" and rec.old_path:
             change["oldPath"] = rec.old_path
         change["scope"] = info.scope
+        if link:
+            # The link itself changed; its target's lines are not this file's lines.
+            change.update({"added": 0, "removed": 0, "symlink": True, "source": rec.source, "at": _now_ms()})
+            return change
         added = removed = 0
         diff_lines: list[str] | None = None
         omitted: str | None = None
@@ -1593,7 +1950,11 @@ class _Tracker:
         if diff_lines is not None:
             text, truncated = _cap_diff(diff_lines)
             room = MAX_DIFF_CHARS_PER_CELL - (cell.diff_chars - rec.diff_chars)
-            if len(text) > room:
+            if _sensitive_path(rec.path) or _sensitive_path(rec.old_path) or _looks_secret(text):
+                omitted = SENSITIVE
+                cell.diff_chars -= rec.diff_chars
+                rec.diff_chars = 0
+            elif len(text) > room:
                 omitted = "budget"
             else:
                 cell.diff_chars += len(text) - rec.diff_chars
@@ -1613,7 +1974,7 @@ class _Tracker:
         info = self.classify(rec.path)
         if info is None or rec.ignored:
             return
-        sig = _stat_sig(rec.path)
+        sig = _entry_sig(rec.path)
         rec.dirty = False
         rec.published_sig = sig
         change = self.build(cell, rec, info, sig)
@@ -1643,16 +2004,14 @@ class _Tracker:
             recs = list(cell.files.values())
         if not recs:
             return
-        if cell.gave_up is None:
-            try:
-                self.filter_ignored(recs, deadline)
-            except _OutOfTime:
-                pass
+        if cell.gave_up is None and not self.filter_ignored(recs, deadline):
+            # Listing a file git ignores beats hiding a real change; the cell says why.
+            cell.note_incomplete(_IGNORE_UNKNOWN)
         for rec in recs:
             if cell.gave_up is None and _left(deadline) <= 0:
                 # Past the budget the remaining records are still sent, from a stat only (no diff).
                 cell.gave_up = f"time budget of {int(cell.budget_s * 1000)} ms used up"
-            if rec.dirty or rec.published_sig == "unset" or _stat_sig(rec.path) != rec.published_sig:
+            if rec.dirty or rec.published_sig == "unset" or _entry_sig(rec.path) != rec.published_sig:
                 self.publish(cell, rec)
         if final:
             for rec in recs:
@@ -1677,10 +2036,11 @@ class _Tracker:
             if text is not None:
                 memory["before"] = _clip(text, MAX_MEMORY_TEXT)
         if op != "deleted":
-            after = self.cache.get(rec.path, _stat_sig(rec.path))
+            after = self.cache.get(rec.path, _entry_sig(rec.path))
             text = _decode_text(after) if after is not None else None
             if text is not None:
                 memory["after"] = _clip(text, MAX_MEMORY_TEXT)
+        _withhold_memory_texts(memory, change.get("diffOmitted") == SENSITIVE)
         memory["at"] = _now_ms()
         self.send(cell.id, {MEMORY_CHANGE_MIME: memory})
 
@@ -1719,6 +2079,8 @@ class _Tracker:
                         or not (cell.shell_check_pending or any(rec.dirty for rec in cell.files.values()))
                     ):
                         self.wake.clear()
+                # Held across the wait, it would keep a finished cell's baselines alive until the next write.
+                cell = None
             except BaseException:  # noqa: BLE001 - interpreter teardown must not trace back
                 return
 
@@ -1743,17 +2105,13 @@ class _Tracker:
                 recs = [rec for rec in cell.files.values() if rec.dirty]
             ready: list[_FileRec] = []
             for rec in recs:
-                sig = _stat_sig(rec.path)
+                sig = _entry_sig(rec.path)
                 if rec.sig != "unset" and sig == rec.sig:
                     ready.append(rec)
                 else:
                     rec.sig = sig
-            if not ready:
-                return
-            try:
-                self.filter_ignored(ready, deadline)
-            except _OutOfTime:
-                return
+            if not ready or not self.filter_ignored(ready, deadline):
+                return  # unanswered ignore rules: they stay dirty and are asked again next tick
             for rec in ready:
                 if _left(deadline) <= 0:
                     return  # the rest stay dirty for the next tick
@@ -1774,8 +2132,10 @@ class _Tracker:
         with self.lock:
             cell = self.cell
             if cell is None or cell.closing:
-                if len(self.pending_completions) < MAX_PENDING_COMPLETIONS:
-                    self.pending_completions.append(record)
+                self.pending_completions.append(record)
+                if len(self.pending_completions) > MAX_PENDING_COMPLETIONS:
+                    del self.pending_completions[0]
+                    self.lost_completions += 1
                 return
             target = cell.id
         self.send_activity(target, record)
@@ -1810,6 +2170,8 @@ class _Tracker:
                     else:
                         record.pop("previousTitle", None)
             if not retract:
+                # Once withheld in a cell, an entry stays withheld: its earlier text held the secret.
+                _withhold_memory_texts(record, prior is not None and prior.get("textOmitted") == SENSITIVE)
                 cell.memory[key] = record
         if retract:
             self.send(cell.id, {MEMORY_CHANGE_MIME: {"kind": key[0], "scope": key[1], "id": key[2], "retracted": True}})
@@ -2113,7 +2475,11 @@ class Step:
 
     def update(self, detail: str) -> None:
         if not self.done:
-            self._send({"status": "running", "detail": _one_line(detail, MAX_DETAIL)})
+            fields: dict[str, Any] = {"status": "running"}
+            safe = _safe_detail(detail, MAX_DETAIL)
+            if safe:
+                fields["detail"] = safe
+            self._send(fields)
 
     def finish(
         self,
@@ -2129,7 +2495,9 @@ class Step:
             self.label = _one_line(label, MAX_LABEL)
         fields: dict[str, Any] = {"status": "ok" if status == "ok" else "error", "endedAt": _now_ms()}
         if detail:
-            fields["detail"] = _one_line(detail, MAX_DETAIL)
+            safe = _safe_detail(detail, MAX_DETAIL)
+            if safe:
+                fields["detail"] = safe
         if extra:
             fields.update(extra)
         self._send(fields)
@@ -2211,7 +2579,8 @@ def reported(
     return decorate
 
 
-_COMMIT_LINE = re.compile(r"^\[[^\]\n]*?\b([0-9a-f]{7,40})\]\s", re.M)
+# `[<branch> <sha>]`, `[<branch> (root-commit) <sha>]`, `[detached HEAD <sha>]`; branch names hold no spaces.
+_COMMIT_LINE = re.compile(r"^\[(?:detached HEAD|[^\s\[\]]+)(?: \(root-commit\))? ([0-9a-f]{7,40})\] ", re.M)
 _GIT_WORD = re.compile(r"\bgit\b")
 
 
@@ -2229,6 +2598,11 @@ class CommandStep:
     A command still running when its cell ends becomes a background step: the cell's last record for
     it says so (`background: true`, `endedAt` = the cell's end), and its eventual outcome is reported,
     with the same id, in whichever cell is running then (or at the next cell's start).
+
+    Every record of the step is sent under its lock, and `finish` leaves the cell's command set only
+    after its final record went out. So the cell's end (which moves each command still in the set to
+    the background under that lock) either waits for a final record already on its way or turns it
+    into a background completion: nothing of the step reaches its cell after the cell's `done`.
     """
 
     def __init__(self, command: str) -> None:
@@ -2252,9 +2626,18 @@ class CommandStep:
                 return
             self._background = True
             timer, self._timer = self._timer, None
+            self._step._send({"status": "running", "background": True, "endedAt": ended_at})
         if timer is not None:
             timer.cancel()
-        self._step._send({"status": "running", "background": True, "detail": BACKGROUND_DETAIL, "endedAt": ended_at})
+        # A dev server can run for hours: it must not keep its cell's snapshots and baselines alive.
+        self._leave_cell()
+
+    def _leave_cell(self) -> None:
+        tracker = _tracker
+        cell, self._cell = self._cell, None
+        if tracker is not None and cell is not None:
+            with tracker.lock:
+                cell.commands.discard(self)
 
     def output(self, chunk: bytes) -> None:
         try:
@@ -2270,8 +2653,7 @@ class CommandStep:
                         self._timer.start()
                     return
                 self._last_update = now
-                tail = self._tail
-            self._show(tail)
+                self._show()
         except Exception:  # noqa: BLE001 - reporting must never disturb the command's pump
             pass
 
@@ -2280,33 +2662,33 @@ class CommandStep:
             with self._lock:
                 self._timer = None
                 self._last_update = time.monotonic()
-                tail = self._tail
-            self._show(tail)
+                self._show()
         except Exception:  # noqa: BLE001
             pass
 
-    def _show(self, tail: bytes) -> None:
-        if self._background:
-            return  # its cell is over; only the outcome is reported, in a later cell
-        line = _last_line(tail.decode("utf-8", "replace"))
+    def _show(self) -> None:
+        """Send the newest output line; the caller holds the lock."""
+        if self._background or self._finished:
+            return  # a running update must never follow the outcome, or land in a later cell
+        line = _last_line(self._tail.decode("utf-8", "replace"))
         if line:
             self._step.update(line)
 
     def finish(self, exit_code: int, output: str) -> None:
         try:
+            status = "ok" if exit_code == 0 else "error"
+            detail = _command_summary(exit_code, output)
+            commit = _commit_id(self._command, exit_code, output)
+            tracker = _tracker
             with self._lock:
                 timer, self._timer = self._timer, None
                 self._finished = True
                 background = self._background
+                if not background:
+                    self._step.finish(status, detail, extra={"commit": commit} if commit else None)
             if timer is not None:
                 timer.cancel()
-            tracker = _tracker
-            if tracker is not None and self._cell is not None:
-                with tracker.lock:
-                    self._cell.commands.discard(self)
-            status = "ok" if exit_code == 0 else "error"
-            detail = _command_summary(exit_code, output)
-            commit = _commit_id(self._command, exit_code, output)
+            self._leave_cell()
             if background:
                 step = self._step
                 step.done = True
@@ -2320,13 +2702,13 @@ class CommandStep:
                     "background": True,
                 }
                 if detail:
-                    record["detail"] = _one_line(detail, MAX_DETAIL)
+                    safe = _safe_detail(detail, MAX_DETAIL)
+                    if safe:
+                        record["detail"] = safe
                 if commit:
                     record["commit"] = commit
                 if tracker is not None:
                     tracker.background_completion(record)
-            else:
-                self._step.finish(status, detail, extra={"commit": commit} if commit else None)
             if tracker is not None:
                 tracker.request_shell_check()
         except Exception:  # noqa: BLE001

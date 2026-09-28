@@ -266,12 +266,15 @@ export interface KernelFileChange {
 	diffTruncated?: boolean;
 	/**
 	 * Why a text file has no `diff`: `too_large` (over the kernel's size caps), `no_baseline` (the
-	 * content before the change was not captured), `budget` (the cell's tracking budget ran out).
+	 * content before the change was not captured), `budget` (the cell's tracking budget ran out),
+	 * `sensitive` (a credential file such as `.env` or a key, or a diff holding a likely secret; the
+	 * record is saved with the session, so the text is withheld and only the line counts stay).
 	 * With `no_baseline` or `budget` the line counts may be 0 because they were not knowable.
-	 * `sensitive`: the file or its diff looks like it holds a secret, so no text was kept.
 	 */
 	diffOmitted?: "too_large" | "no_baseline" | "budget" | "sensitive";
 	binary?: boolean;
+	/** True when the path is (or was) a symlink: the link itself changed, so there are no line counts or diff. */
+	symlink?: boolean;
 	/** How the change was observed. */
 	source: "python" | "shell" | "edit";
 	/** Epoch ms when the kernel observed the change. */
@@ -288,10 +291,10 @@ export interface KernelMemoryChange {
 	title: string;
 	/** Title before a rename. */
 	previousTitle?: string;
-	/** Content before and after, each capped by the kernel. */
+	/** Content before and after, each capped by the kernel; both absent when `textOmitted` is set. */
 	before?: string;
 	after?: string;
-	/** `sensitive`: the texts looked like they hold a secret, so neither was kept. */
+	/** `sensitive`: the content held a likely secret, so neither text was kept. */
 	textOmitted?: "sensitive";
 	/** Epoch ms when the kernel observed the change. */
 	at: number;

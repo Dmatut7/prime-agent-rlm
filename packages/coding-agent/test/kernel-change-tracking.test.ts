@@ -88,6 +88,16 @@ describe("change-tracking display payloads", () => {
 		expect(
 			parseFileChangeDisplay({ ...fileChange, diff: undefined, diffOmitted: "no_baseline", binary: false }),
 		).toEqual({ ...fileChange, diff: undefined, diffOmitted: "no_baseline" });
+		const link: KernelFileChange = {
+			...fileChange,
+			kind: "created",
+			added: 0,
+			removed: 0,
+			diff: undefined,
+			symlink: true,
+		};
+		expect(parseFileChangeDisplay(link)).toEqual(link);
+		expect(parseFileChangeDisplay({ ...link, symlink: "yes" })).toEqual({ ...link, symlink: undefined });
 		expect(parseFileChangeDisplay({ path: "/repo/x", retracted: true })).toEqual({
 			retracted: true,
 			key: "/repo/x",
@@ -108,6 +118,40 @@ describe("change-tracking display payloads", () => {
 		expect(parseActivityDisplay(background)).toEqual(background);
 		// Only a real flag and a real commit id survive.
 		expect(parseActivityDisplay({ ...command, background: "yes", commit: "not-a-sha" })).toEqual(command);
+	});
+
+	it("keeps the withheld-secret markers through to a cell's result fields, and never a withheld text", () => {
+		const envChange: KernelFileChange = {
+			path: "/repo/.env",
+			relPath: ".env",
+			kind: "modified",
+			scope: "project",
+			added: 1,
+			removed: 1,
+			diffOmitted: "sensitive",
+			source: "shell",
+			at: 1_700_000_000_003,
+		};
+		const withheldMemory: KernelMemoryChange = {
+			op: "created",
+			kind: "memory",
+			scope: "session",
+			id: "creds",
+			title: "creds",
+			textOmitted: "sensitive",
+			at: 1_700_000_000_004,
+		};
+		expect(parseFileChangeDisplay(envChange)).toEqual(envChange);
+		expect(parseMemoryChangeDisplay(withheldMemory)).toEqual(withheldMemory);
+		// A record that claims to be withheld keeps no text, whatever else it carries.
+		expect(parseFileChangeDisplay({ ...envChange, diff: "+KEY=sk-leak" })).toEqual(envChange);
+		expect(parseMemoryChangeDisplay({ ...withheldMemory, after: "token=sk-leak" })).toEqual(withheldMemory);
+		const effects = new KernelEffectsAccumulator();
+		effects.apply({ [FILE_CHANGE_DISPLAY_MIME]: envChange });
+		effects.apply({ [MEMORY_CHANGE_DISPLAY_MIME]: withheldMemory });
+		const fields = effects.resultFields();
+		expect(fields.fileChanges?.map((change) => change.diffOmitted)).toEqual(["sensitive"]);
+		expect(fields.memoryChanges?.map((change) => change.textOmitted)).toEqual(["sensitive"]);
 	});
 
 	it("ignores malformed records instead of throwing", () => {

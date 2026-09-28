@@ -553,6 +553,14 @@ class NoGitTests(TrackerCase):
         cell = self.kernel.run("import os\nos.makedirs('dist', exist_ok=True)\nopen('dist/x.js', 'w').write('x')\n")
         self.assertEqual(cell.files(), {})
 
+    def test_a_background_command_that_ends_between_cells_reports_its_files_in_the_next_cell(self):
+        first = self.kernel.run("h = bash('sleep 0.3; echo late > late.txt')\nh.pid")
+        self.assertNotIn("late.txt", first.by_rel())
+        time.sleep(1.2)  # the model thinking: the command ends while no cell runs
+        second = self.kernel.run("x = 1")
+        record = second.by_rel()["late.txt"]
+        self.assertEqual((record["kind"], record["source"], record["added"]), ("created", "shell", 1))
+
 
 # Every function _install_wrappers replaces; each wrapper carries `__wrapped__` (functools.wraps).
 _WRAP_PROBE = (
@@ -581,6 +589,145 @@ _WRAPPED_POINTS = sorted(
         *(["os.posix_spawnp"] if hasattr(os, "posix_spawnp") else []),
     ]
 )
+
+
+# Fake credentials, split so no complete one sits in this file.
+_OLD_KEY = "sk-" + "OLDFAKE" + "0" * 24
+_NEW_KEY = "sk-" + "NEWFAKE" + "0" * 24
+_AWS_KEY = "AKIA" + "FAKE" + "0" * 12
+_PEM = "-----BEGIN " + "RSA PRIVATE KEY-----\nMIIEfake\n-----END RSA PRIVATE KEY-----\n"
+
+
+def _anywhere(cell: Cell, *needles: str) -> list[str]:
+    """Which needles appear anywhere in a cell's protocol events (records, outputs, everything)."""
+    text = json.dumps(cell.events)
+    return [needle for needle in needles if needle in text]
+
+
+@unittest.skipUnless(HAS_GIT, "git is needed for the work-tree comparison")
+class SecretTests(TrackerCase):
+    """Records are saved with the session: credentials must not ride along in diffs or memory texts."""
+
+    def test_an_env_file_written_by_python_keeps_its_counts_but_no_diff(self):
+        cell = self.kernel.run(f"open('.env', 'w').write('OPENAI_API_KEY={_OLD_KEY}\\nAWS_KEY={_AWS_KEY}\\n')")
+        record = cell.by_rel()[".env"]
+        self.assertEqual((record["kind"], record["source"], record["added"], record["removed"]), ("created", "python", 2, 0))
+        self.assertEqual(record["diffOmitted"], effects.SENSITIVE)
+        self.assertNotIn("diff", record)
+        self.assertEqual(_anywhere(cell, _OLD_KEY, _AWS_KEY), [])
+
+    def test_a_tracked_env_file_rotated_by_bash_keeps_neither_value(self):
+        self.write(".env", f"OPENAI_API_KEY={_OLD_KEY}\n")
+        _git(self.root, "add", ".env")
+        _git(self.root, "commit", "-qm", "env")
+        cell = self.kernel.run("await bash(\"sed -i.bak 's/OLDFAKE/NEWFAKE/' .env && rm .env.bak\")")
+        record = cell.by_rel()[".env"]
+        self.assertEqual((record["kind"], record["source"], record["added"], record["removed"]), ("modified", "shell", 1, 1))
+        self.assertEqual(record["diffOmitted"], effects.SENSITIVE)
+        self.assertEqual(_anywhere(cell, _OLD_KEY, _NEW_KEY), [])
+
+    def test_a_secret_inside_an_ordinary_file_withholds_that_files_diff_only(self):
+        cell = self.kernel.run(
+            f"open('config.py', 'w').write('API_KEY = \"{_OLD_KEY}\"\\nDEBUG = True\\n')\n"
+            "open('settings.py', 'w').write('DB_PASSWORD = \"hunter2hunter2\"\\n')\n"
+            "open('a.txt', 'a').write('four\\n')\n"
+        )
+        files = cell.by_rel()
+        for rel, added in (("config.py", 2), ("settings.py", 1)):
+            self.assertEqual(files[rel]["diffOmitted"], effects.SENSITIVE, rel)
+            self.assertNotIn("diff", files[rel])
+            self.assertEqual(files[rel]["added"], added, rel)
+        self.assertIn("+four\n", files["a.txt"]["diff"])
+        self.assertEqual(_anywhere(cell, _OLD_KEY, "hunter2hunter2"), [])
+
+    def test_ordinary_code_about_secrets_keeps_its_diff(self):
+        code = (
+            "import os\\n"
+            "class SecretManager:\\n"
+            "    def load(self, request):\\n"
+            "        password = request.form[\\\"password\\\"]\\n"
+            "        token = tokenizer(text)\\n"
+            "        max_tokens = 4096\\n"
+            "        api_key = os.environ[\\\"API_KEY\\\"]\\n"
+            "        secret = None\\n"
+            "        return password == \\\"\\\" or token != secret\\n"
+        )
+        cell = self.kernel.run(f"open('secret_manager.py', 'w').write(\"{code}\")")
+        record = cell.by_rel()["secret_manager.py"]
+        self.assertNotIn("diffOmitted", record)
+        self.assertIn("+class SecretManager:\n", record["diff"])
+        self.assertEqual(record["added"], 9)
+
+    def test_a_memory_entry_holding_a_token_keeps_its_record_but_no_texts(self):
+        cell = self.kernel.run(
+            f"rlm.harness.create_memory('Deploy creds', 'token={_OLD_KEY}', id='creds')\n"
+            "rlm.harness.create_memory('Deploy steps', 'use make deploy', id='deploy')\n"
+        )
+        memory = cell.memory()
+        withheld = memory[("memory", "session", "creds")]
+        self.assertEqual((withheld["op"], withheld["title"], withheld["textOmitted"]), ("created", "Deploy creds", "sensitive"))
+        self.assertNotIn("after", withheld)
+        self.assertEqual(memory[("memory", "session", "deploy")]["after"], "use make deploy")
+        # A later edit in the same cell that drops the token still shows no text: the first one held it.
+        cell = self.kernel.run(
+            f"rlm.harness.update_memory('creds', 'Deploy creds', 'token={_NEW_KEY}')\n"
+            "rlm.harness.update_memory('creds', 'Deploy creds', 'ask ops for the token')\n"
+        )
+        updated = cell.memory()[("memory", "session", "creds")]
+        self.assertEqual((updated["op"], updated["textOmitted"]), ("updated", "sensitive"))
+        self.assertNotIn("before", updated)
+        self.assertNotIn("after", updated)
+        self.assertEqual(_anywhere(cell, _OLD_KEY, _NEW_KEY), [])
+
+    def test_a_write_through_a_link_to_a_secret_file_withholds_the_targets_diff(self):
+        # Coverage: a write through a symlink is filed under its real target (K3), so the target's
+        # own name still drives the sensitive-path check (T5); this confirms the two compose.
+        self.write(".env", f"OPENAI_API_KEY={_OLD_KEY}\n")
+        os.symlink(".env", self.path("link-to-env"))
+        _git(self.root, "add", ".env", "link-to-env")
+        _git(self.root, "commit", "-qm", "env+link")
+        cell = self.kernel.run(f"open('link-to-env', 'a').write('AWS_KEY={_AWS_KEY}\\n')")
+        files = cell.by_rel()
+        self.assertEqual(sorted(files), [".env"])
+        self.assertEqual(files[".env"]["diffOmitted"], effects.SENSITIVE)
+        self.assertNotIn("diff", files[".env"])
+        self.assertEqual(_anywhere(cell, _OLD_KEY, _AWS_KEY), [])
+
+
+class SecretNoGitTests(TrackerCase):
+    use_git = False
+
+    def test_private_key_files_outside_git_keep_no_diff(self):
+        cell = self.kernel.run(
+            f"open('server.pem', 'w').write({_PEM!r})\n"
+            f"open('backup-notes.txt', 'w').write('restore with\\n' + {_PEM!r})\n"
+            "await bash('mkdir -p keys && printf \"k\\\\n\" > keys/id_ed25519')\n"
+        )
+        files = cell.by_rel()
+        self.assertEqual(sorted(files), ["backup-notes.txt", "keys/id_ed25519", "server.pem"])
+        for rel, record in files.items():
+            self.assertEqual(record["kind"], "created", rel)
+            self.assertEqual(record["diffOmitted"], effects.SENSITIVE, rel)
+            self.assertGreater(record["added"], 0, rel)
+        self.assertEqual(_anywhere(cell, "MIIEfake"), [])
+
+
+@unittest.skipUnless(HAS_GIT, "git is needed for the work-tree comparison")
+class SessionStorageInProjectTests(TrackerCase):
+    """A session folder inside the working folder holds the agent's own files, not the cell's work."""
+
+    def kernel_env(self) -> dict[str, str]:
+        session = os.path.join(self.root, "agent-session")
+        return {"RLM_SESSION_DIR": session, "RLM_HARNESS_STATE_DIR": os.path.join(session, "harness")}
+
+    def test_the_session_folder_and_harness_saves_are_not_file_changes(self):
+        cell = self.kernel.run(
+            "await bash('mkdir -p agent-session/sub-1 && echo log > agent-session/sub-1/out.txt && echo x > work.txt')\n"
+            "rlm.harness.create_memory('A', 'a', id='a')\n"
+            "open('agent-session/notes.txt', 'w').write('n\\n')\n"
+        )
+        self.assertEqual(sorted(cell.by_rel()), ["work.txt"])
+        self.assertEqual(list(cell.memory()), [("memory", "session", "a")])
 
 
 class WrapPointTests(TrackerCase):
@@ -618,7 +765,8 @@ class BackgroundCommandTests(TrackerCase):
         left = self._command(first)
         self.assertEqual(left["status"], "running")
         self.assertTrue(left["background"])
-        self.assertEqual(left["detail"], effects.BACKGROUND_DETAIL)
+        # The host words the hand-off itself, from `background`; the runtime sends no screen text.
+        self.assertNotIn("detail", left)
         self.assertGreaterEqual(left["endedAt"], left["startedAt"])
         second = self.kernel.run("import time\ntime.sleep(1.5)")
         done = second.activities()[left["id"]]
@@ -640,6 +788,46 @@ class BackgroundCommandTests(TrackerCase):
         self.assertEqual(first_record["status"], "error")
         self.assertTrue(first_record["background"])
         self.assertTrue(first_record["detail"].startswith("exit 3"))
+
+    def test_a_command_left_running_does_not_keep_its_cell_alive(self):
+        # A dev server runs for hours; its cell's snapshots and file baselines must not live as long.
+        self.kernel.run("h = bash('sleep 5')\nh.pid")
+        cell = self.kernel.run("import gc\ngc.collect()\nsum(type(o).__name__ == '_Cell' for o in gc.get_objects())")
+        result = next(e for e in cell.events if e.get("event") == "result")
+        self.assertEqual(result["text"], "1")  # the running cell only
+        self.kernel.run("h.kill()")
+
+    def test_a_background_command_that_ends_between_cells_reports_its_files_in_the_next_cell(self):
+        first = self.kernel.run("h = bash('sleep 0.3; echo late > late.txt; echo more >> a.txt')\nh.pid")
+        self.assertEqual(first.files(), {})
+        time.sleep(1.2)  # the model thinking: the command ends while no cell runs
+        second = self.kernel.run("x = 1")
+        command = self._command(second)
+        self.assertEqual((command["status"], command["background"]), ("ok", True))
+        files = second.by_rel()
+        self.assertEqual(sorted(files), ["a.txt", "late.txt"])
+        self.assertEqual((files["late.txt"]["kind"], files["late.txt"]["source"]), ("created", "shell"))
+        self.assertIn("+late\n", files["late.txt"]["diff"])
+        self.assertEqual(files["a.txt"]["kind"], "modified")
+        self.assertIn("+more\n", files["a.txt"]["diff"])
+        # Reported once, in the cell that also reports the command's end.
+        third = self.kernel.run("x = 2")
+        self.assertEqual(third.files(), {})
+
+    def test_a_background_command_that_writes_a_secret_between_cells_keeps_no_diff(self):
+        # Coverage: a background command's changes are filed through the same build()/publish()
+        # pipeline as any other shell change (K3), so T5's sensitive-path check still applies.
+        first = self.kernel.run(f"h = bash('sleep 0.3; echo OPENAI_API_KEY={_OLD_KEY} > .env')\nh.pid")
+        self.assertEqual(first.files(), {})
+        time.sleep(1.2)  # the model thinking: the command ends while no cell runs
+        second = self.kernel.run("x = 1")
+        files = second.by_rel()
+        self.assertEqual(files[".env"]["kind"], "created")
+        self.assertEqual(files[".env"]["diffOmitted"], effects.SENSITIVE)
+        self.assertNotIn("diff", files[".env"])
+        # The key stays out of the file record itself; it may still show in the command's own
+        # label, since that is the source line the model wrote, not recorded output.
+        self.assertNotIn(_OLD_KEY, json.dumps(files[".env"]))
 
     def test_an_awaited_command_is_never_marked_background(self):
         cell = self.kernel.run("await bash('echo hi')")
@@ -667,6 +855,128 @@ class BackgroundCommandTests(TrackerCase):
         self.assertIsNone(effects._commit_id("git commit -m x", 1, output))
         self.assertIsNone(effects._commit_id("echo '[main 1a2b3c4] x'", 0, "[main 1a2b3c4] x\n"))
         self.assertEqual(effects._commit_id("git cherry-pick abc", 0, "[detached HEAD 0123abc] pick\n"), "0123abc")
+        self.assertEqual(effects._commit_id("git commit -m x", 0, "[feature/x 1a2b3c4] x\n"), "1a2b3c4")
+        # Bracketed hex that is not git's `[<branch> <sha>]` line.
+        self.assertIsNone(effects._commit_id("git log -1", 0, "[build/deadbeef1] x\n"))
+        self.assertIsNone(effects._commit_id("git log -1", 0, "[deadbeef123] x\n"))
+        self.assertIsNone(effects._commit_id("git log -1", 0, "[main] 1a2b3c4] x\n"))
+
+
+class CommandDetailSecretTests(TrackerCase):
+    """A command's activity `detail` (its latest/last output line) is display text like a diff or a
+    memory text: it must not carry a credential. `bash()`'s own return value is a separate object,
+    built and stored before the step's record is sent (see `bash.py`'s `_finalize`), so it is
+    untouched; each test below checks that directly.
+    """
+
+    def _command(self, cell: Cell) -> dict:
+        commands = [record for record in cell.activities().values() if record["kind"] == "command"]
+        self.assertEqual(len(commands), 1, commands)
+        return commands[0]
+
+    def test_a_finished_commands_detail_never_carries_a_leaked_key(self):
+        cell = self.kernel.run(f"r = await bash('echo {_OLD_KEY}')\nr.output")
+        record = self._command(cell)
+        self.assertEqual(record["status"], "ok")
+        self.assertNotIn("detail", record)
+        result = next(e for e in cell.events if e.get("event") == "result")
+        # Display-only: the model's own tool result still carries the command's real output.
+        self.assertIn(_OLD_KEY, result["text"])
+
+    def test_a_cat_of_an_env_files_last_line_is_withheld_from_detail(self):
+        self.write(".env", f"OPENAI_API_KEY={_OLD_KEY}\n")
+        cell = self.kernel.run("r = await bash('cat .env')\nr.output")
+        record = self._command(cell)
+        self.assertNotIn("detail", record)
+        result = next(e for e in cell.events if e.get("event") == "result")
+        self.assertIn(_OLD_KEY, result["text"])
+
+    def test_a_failing_commands_leaked_detail_is_withheld_too(self):
+        # A failing command's detail is "exit <code> · <last line>"; a leaked last line withholds
+        # the whole detail, same as a passing command's.
+        cell = self.kernel.run(f"r = await bash('echo {_OLD_KEY}; exit 3')\nr.output")
+        record = self._command(cell)
+        self.assertEqual(record["status"], "error")
+        self.assertNotIn("detail", record)
+        result = next(e for e in cell.events if e.get("event") == "result")
+        self.assertIn(_OLD_KEY, result["text"])
+
+    @unittest.skipUnless(HAS_GIT, "the background gap check needs a work tree")
+    def test_a_background_commands_finish_detail_never_carries_a_leaked_key(self):
+        first = self.kernel.run(f"h = bash('sleep 0.2; echo {_OLD_KEY}')\nh.pid")
+        time.sleep(0.8)  # the model thinking: the command ends while no cell runs
+        second = self.kernel.run("x = 1")
+        commands = [r for r in second.activities().values() if r["kind"] == "command"]
+        self.assertEqual(len(commands), 1, commands)
+        self.assertEqual((commands[0]["status"], commands[0]["background"]), ("ok", True))
+        # The key stays out of the recorded output; the command's own label (its source line,
+        # which the model wrote) is untouched, so it alone is not enough to prove the fix.
+        self.assertNotIn("detail", commands[0])
+
+
+@unittest.skipUnless(HAS_GIT and os.name == "posix", "needs git and a POSIX shell")
+class TempFileTests(TrackerCase):
+    def _all_paths(self, *cells: Cell) -> set[str]:
+        return {record.get("relPath") or record["path"] for cell in cells for record in cell.payloads(FILE)}
+
+    def test_a_sed_temp_file_left_at_the_cells_end_is_never_a_creation(self):
+        # BSD sed's in-place edit, slowed down: the new content sits in `.!<pid>!a.txt` as the cell
+        # ends and is renamed over a.txt while no cell runs.
+        first = self.kernel.run(
+            "await bash('printf \"one\\\\nTWO\\\\nthree\\\\n\" > .!4242!a.txt')\n"
+            "h = bash('sleep 0.3; mv .!4242!a.txt a.txt')\nh.pid"
+        )
+        time.sleep(1.2)
+        second = self.kernel.run("x = 1")
+        self.assertEqual(self._all_paths(first, second), {"a.txt"})
+        record = second.by_rel()["a.txt"]
+        self.assertEqual((record["kind"], record["source"]), ("modified", "shell"))
+        self.assertIn("-two\n+TWO\n", record["diff"])
+
+    @unittest.skipUnless(sys.platform == "darwin", "only BSD sed (macOS) edits through a .!<pid>!<name> file")
+    def test_an_unawaited_sed_on_a_large_file_reports_the_file_and_never_its_temp_copy(self):
+        self.write("big.txt", "".join(f"line {i:06d} padding padding padding padding padding\n" for i in range(400_000)))
+        _git(self.root, "add", "big.txt")
+        _git(self.root, "commit", "-qm", "big")
+        first = self.kernel.run("h = bash('sed -i \"\" \"s/line 050000/line 050000 SED/\" big.txt')\nh.pid")
+        time.sleep(2.0)
+        second = self.kernel.run("x = 1")
+        self.assertEqual(_git(self.root, "status", "--porcelain"), " M big.txt\n")
+        self.assertEqual(self._all_paths(first, second), {"big.txt"})
+        shown = {**first.by_rel(), **second.by_rel()}
+        self.assertEqual(shown["big.txt"]["kind"], "modified")
+
+
+@unittest.skipUnless(HAS_GIT and os.name == "posix", "needs git and symlinks")
+class SymlinkTests(TrackerCase):
+    def test_a_python_write_through_a_link_is_filed_under_the_real_file(self):
+        os.symlink("a.txt", self.path("link.txt"))
+        _git(self.root, "add", "link.txt")
+        _git(self.root, "commit", "-qm", "link")
+        cell = self.kernel.run("open('link.txt', 'a').write('via link\\n')\nopen('a.txt', 'a').write('direct\\n')")
+        files = cell.by_rel()
+        self.assertEqual(sorted(files), ["a.txt"])
+        self.assertEqual((files["a.txt"]["added"], files["a.txt"]["removed"]), (2, 0))
+        self.assertIn("+via link\n+direct\n", files["a.txt"]["diff"])
+
+    def test_a_new_link_is_a_link_without_its_targets_lines(self):
+        cell = self.kernel.run("await bash('ln -s a.txt blink.txt')")
+        record = cell.by_rel()["blink.txt"]
+        self.assertEqual(record["kind"], "created")
+        self.assertTrue(record["symlink"])
+        self.assertEqual((record["added"], record["removed"]), (0, 0))
+        self.assertNotIn("diff", record)
+        cell = self.kernel.run("import os\nos.remove('blink.txt')")
+        record = cell.by_rel()["blink.txt"]
+        self.assertEqual((record["kind"], record["removed"], record["symlink"]), ("deleted", 0, True))
+        self.assertTrue(os.path.exists(self.path("a.txt")))
+
+    def test_an_untracked_link_does_not_double_a_change_to_its_target(self):
+        os.symlink("a.txt", self.path("blink.txt"))
+        cell = self.kernel.run("await bash('echo q >> a.txt')")
+        files = cell.by_rel()
+        self.assertEqual(sorted(files), ["a.txt"])
+        self.assertEqual(files["a.txt"]["added"], 1)
 
 
 @unittest.skipUnless(HAS_GIT, "git is needed for the work-tree comparison")
@@ -694,6 +1004,34 @@ case " $* " in
 esac
 exec "{real}" "$@"
 """
+# A `git` whose `check-ignore` is slower than a watcher tick, and never answers while the marker exists.
+_SLOW_IGNORE_GIT = """#!/bin/sh
+case " $* " in
+  *" check-ignore "*) if [ -f "$SLOW_GIT_MARKER" ]; then exec sleep 5; fi; sleep 0.15 ;;
+esac
+exec "{real}" "$@"
+"""
+
+
+def _fake_git_env(tmp: str, script: str) -> dict[str, str]:
+    fake_bin = os.path.join(tmp, "fake-bin")
+    os.makedirs(fake_bin)
+    fake = os.path.join(fake_bin, "git")
+    with open(fake, "w") as handle:
+        handle.write(script.format(real=shutil.which("git")))
+    os.chmod(fake, 0o755)
+    # The first run of a freshly written executable can take ~0.4 s on macOS while the system
+    # vets it; pay that here, or the fixture itself looks like a slow git to the budget.
+    subprocess.run([fake, "--version"], check=True, capture_output=True, timeout=30)
+    return {
+        "PATH": fake_bin + os.pathsep + os.environ.get("PATH", ""),
+        "SLOW_GIT_MARKER": os.path.join(tmp, "slow-git"),
+    }
+
+
+# Past the budget, what a cell may cost on top: kernel round trip and scheduling. A tracker that
+# waited for git twice (or for git's own timeout) overshoots it.
+_BUDGET_SLACK_S = 0.35
 
 
 @unittest.skipUnless(HAS_GIT and os.name == "posix", "needs git and a POSIX shell")
@@ -701,17 +1039,9 @@ class SlowGitTests(TrackerCase):
     """A slow `git status` (a huge repository, a cold disk) may cost a cell at most its budget."""
 
     def kernel_env(self) -> dict[str, str]:
-        fake_bin = os.path.join(self.tmp, "fake-bin")
-        os.makedirs(fake_bin)
-        fake = os.path.join(fake_bin, "git")
-        with open(fake, "w") as handle:
-            handle.write(_SLOW_GIT.format(real=shutil.which("git")))
-        os.chmod(fake, 0o755)
-        # The first run of a freshly written executable can take ~0.4 s on macOS while the system
-        # vets it; pay that here, or the fixture itself looks like a slow git to the budget.
-        subprocess.run([fake, "--version"], check=True, capture_output=True, timeout=30)
-        self.marker = os.path.join(self.tmp, "slow-git")
-        return {"PATH": fake_bin + os.pathsep + os.environ.get("PATH", ""), "SLOW_GIT_MARKER": self.marker}
+        env = _fake_git_env(self.tmp, _SLOW_GIT)
+        self.marker = env["SLOW_GIT_MARKER"]
+        return env
 
     def slow(self, on: bool) -> None:
         if on:
@@ -737,6 +1067,23 @@ class SlowGitTests(TrackerCase):
         self.assertIn("snapshot", cell.payloads(STATUS)[0]["incomplete"])
         self.kernel.run("h.kill()")
 
+    def test_a_background_end_with_a_slow_git_never_holds_up_the_next_cell(self):
+        self.kernel.run("h = bash('sleep 0.2; echo late > late.txt')\nh.pid")
+        self.slow(True)
+        try:
+            time.sleep(0.6)  # the command has ended; its comparison is stuck on git
+            cell, sent, elapsed = self.timed("import time\nprint(time.time())")
+            time.sleep(0.5)
+            later = self.kernel.run("x = 1")
+        finally:
+            self.slow(False)
+        body_started = float(cell.stdout().split()[0])
+        self.assertLess(body_started - sent, 0.25)
+        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + _BUDGET_SLACK_S)
+        reasons = [status["incomplete"] for status in cell.payloads(STATUS) + later.payloads(STATUS)]
+        self.assertEqual(len(reasons), 1, reasons)
+        self.assertIn("background command", reasons[0])
+
     def test_a_command_waits_at_most_the_budget_for_its_snapshot(self):
         self.slow(True)
         try:
@@ -744,7 +1091,7 @@ class SlowGitTests(TrackerCase):
         finally:
             self.slow(False)
         self.assertEqual(cell.stdout().strip(), "0")
-        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + 1.0)
+        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + _BUDGET_SLACK_S)
         self.assertIn("snapshot", cell.payloads(STATUS)[0]["incomplete"])
         # Without a trustworthy before-state the command's edit is not guessed at.
         self.assertNotIn("y.txt", cell.by_rel())
@@ -763,10 +1110,129 @@ class SlowGitTests(TrackerCase):
         )
         self.slow(False)
         self.assertEqual(cell.status, "ok")
-        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + 1.0)
+        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + _BUDGET_SLACK_S)
         self.assertIn("comparing", cell.payloads(STATUS)[0]["incomplete"])
         # Python's own writes do not depend on git and are still listed.
         self.assertEqual(cell.by_rel()["p.txt"]["kind"], "created")
+
+
+@unittest.skipUnless(HAS_GIT and os.name == "posix", "needs git and a POSIX shell")
+class SlowIgnoreCheckTests(TrackerCase):
+    """`git check-ignore` slower than a watcher tick must not let an ignored file through."""
+
+    def kernel_env(self) -> dict[str, str]:
+        env = _fake_git_env(self.tmp, _SLOW_IGNORE_GIT)
+        self.marker = env["SLOW_GIT_MARKER"]
+        return env
+
+    def test_an_ignored_file_is_never_listed_when_the_ignore_check_is_slow(self):
+        cell = self.kernel.run(
+            "import time\nopen('ignored.txt', 'w').write('x')\nopen('seen.txt', 'w').write('y')\ntime.sleep(1.0)"
+        )
+        # Not even for a moment: no live record either.
+        self.assertEqual([r for r in cell.payloads(FILE) if r.get("relPath") == "ignored.txt"], [])
+        self.assertEqual(sorted(cell.by_rel()), ["seen.txt"])
+        self.assertEqual(cell.payloads(STATUS), [])
+
+    def test_an_ignore_check_that_never_answers_lists_the_file_and_says_so(self):
+        open(self.marker, "w").close()
+        started = time.time()
+        cell = self.kernel.run("open('ignored.txt', 'w').write('x')")
+        elapsed = time.time() - started
+        self.assertEqual(sorted(cell.by_rel()), ["ignored.txt"])
+        status = cell.payloads(STATUS)
+        self.assertEqual(len(status), 1, status)
+        self.assertIn("ignores", status[0]["incomplete"])
+        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + _BUDGET_SLACK_S)
+
+
+# Drives the tracker's public API in a fresh interpreter, recording every record it sends and
+# whether that record's cell had already ended (the kernel sends `done` right after end_cell).
+_DRIVER_PRELUDE = """
+import json, os, sys, threading, time
+from rlm import effects
+sent = []
+ended = set()
+slow = None
+def send(cell_id, data):
+    if slow is not None:
+        slow(data)
+    sent.append({"cell": cell_id, "afterDone": cell_id in ended, "data": data})
+"""
+
+
+def _drive_tracker(test: unittest.TestCase, body: str) -> list[dict]:
+    tmp = os.path.realpath(tempfile.mkdtemp(prefix="rlm-driver-"))
+    test.addCleanup(shutil.rmtree, tmp, True)
+    env = {k: v for k, v in os.environ.items() if not k.startswith(_LEAKED_PREFIXES)}
+    env["PYTHONPATH"] = SRC + os.pathsep + os.environ.get("PYTHONPATH", "")
+    env["PRIME_AGENT_CODING_AGENT_DIR"] = os.path.join(tmp, "agent")
+    script = _DRIVER_PRELUDE + body + "\nprint(json.dumps(sent))\n"
+    proc = subprocess.run(
+        [sys.executable, "-c", script], cwd=tmp, env=env, capture_output=True, text=True, timeout=60
+    )
+    test.assertEqual(proc.returncode, 0, proc.stderr)
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def _activities(sent: list[dict]) -> list[dict]:
+    return [{"cell": r["cell"], "afterDone": r["afterDone"], **r["data"][ACTIVITY]} for r in sent if ACTIVITY in r["data"]]
+
+
+class CommandHandOffTests(unittest.TestCase):
+    def test_a_command_ending_as_its_cell_ends_never_reports_after_the_cells_done(self):
+        sent = _drive_tracker(
+            self,
+            """
+def slow_final(data):
+    record = data.get(effects.ACTIVITY_MIME)
+    if record is not None and record["status"] != "running":
+        time.sleep(0.3)  # the command's final record is still on its way when the cell ends
+slow = slow_final
+assert effects.install(send, os.getcwd())
+effects.begin_cell("c1")
+command = effects.command_started("make")
+threading.Thread(target=command.finish, args=(0, "all done\\n")).start()
+time.sleep(0.05)
+effects.end_cell("c1")
+ended.add("c1")
+time.sleep(0.5)
+effects.begin_cell("c2")
+effects.end_cell("c2")
+ended.add("c2")
+""",
+        )
+        records = _activities(sent)
+        self.assertTrue(records)
+        # Whatever cell carries it, the outcome reaches the host before that cell's `done`.
+        self.assertEqual([r for r in records if r["afterDone"]], [])
+        self.assertEqual([r["status"] for r in records if r["status"] != "running"], ["ok"])
+
+    def test_background_completions_past_the_cap_keep_the_newest_and_say_some_were_lost(self):
+        extra = 6
+        sent = _drive_tracker(
+            self,
+            f"""
+assert effects.install(send, os.getcwd())
+effects.begin_cell("c1")
+commands = [effects.command_started(f"job {{i}}") for i in range(effects.MAX_PENDING_COMPLETIONS + {extra})]
+effects.end_cell("c1")
+ended.add("c1")
+for command in commands:
+    command.finish(0, "ok\\n")
+effects.begin_cell("c2")
+effects.end_cell("c2")
+ended.add("c2")
+""",
+        )
+        records = _activities(sent)
+        started = sorted({r["id"] for r in records if r["cell"] == "c1"}, key=lambda i: int(i.split("-")[1]))
+        self.assertEqual(len(started), effects.MAX_PENDING_COMPLETIONS + extra)
+        reported = [r["id"] for r in records if r["cell"] == "c2" and r["status"] == "ok"]
+        self.assertEqual(reported, started[extra:])
+        status = [r["data"][STATUS] for r in sent if r["cell"] == "c2" and STATUS in r["data"]]
+        self.assertEqual(len(status), 1, status)
+        self.assertIn(f"{extra} background commands", status[0]["incomplete"])
 
 
 class BudgetTests(TrackerCase):
@@ -924,6 +1390,54 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(effects._command_summary(0, "\x1b[32mdone\x1b[0m\n"), "done")
         self.assertIsNone(effects._command_summary(0, ""))
 
+
+    def test_sensitive_file_names(self):
+        sensitive = [
+            ".env", ".env.production", "prod.env", "server.pem", "tls.key", "cert.p12", "id_rsa", "id_ed25519.pub",
+            ".netrc", ".npmrc", ".pypirc", "credentials", "credentials.json", "secrets.yaml", "db-credentials.toml",
+            "client_secret", "release.keystore", "terraform.tfvars", "/home/u/.ssh/config", "/home/u/.aws/config",
+        ]
+        ordinary = ["secret_manager.py", "secrets_test.go", "token.ts", "keyboard.py", "README.md", "env.py", "a/b/c.txt"]
+        self.assertGreater(len(sensitive), 0)
+        for name in sensitive:
+            self.assertTrue(effects._sensitive_path(name), name)
+        for name in ordinary:
+            self.assertFalse(effects._sensitive_path(name), name)
+
+    def test_secret_scan_shapes_and_assignments(self):
+        secrets = [
+            "+" + "-----BEGIN " + "OPENSSH PRIVATE KEY-----",
+            "+key = sk-" + "ant-" + "a" * 30,
+            "+AWS=" + "ASIA" + "B" * 16,
+            "+t = 'ghp_" + "c" * 36 + "'",
+            "+github_pat_" + "d" * 30,
+            "+slack: xoxb-" + "1" * 12,
+            "+glpat-" + "e" * 20,
+            "+maps AIza" + "f" * 35,
+            "+jwt eyJ" + "a" * 12 + ".eyJ" + "b" * 12 + "." + "c" * 12,
+            '+  "password": "hunter22"',
+            "+DB_PASSWORD=s3cr3t-value",
+            "+client_secret: 'Zq8-long-value'",
+            "+url = postgres://admin:pa55word@db/prod",
+            "+Authorization: Bearer " + "g" * 24,
+        ]
+        ordinary = [
+            "+password = request.form['password']",
+            "+token = tokenizer(text)",
+            "+max_tokens = 4096",
+            "+api_key = os.environ['API_KEY']",
+            "+secret = None",
+            "+PASSWORD=changeme",
+            "+API_KEY=${API_KEY}",
+            "+token_type = 'access_token'",
+            "+if password == 'hunter22':",
+            "+task-abcdefghijklmnopqrstuvwxyz",
+        ]
+        self.assertGreater(len(secrets), 0)
+        for text in secrets:
+            self.assertTrue(effects._looks_secret(text), text)
+        for text in ordinary:
+            self.assertFalse(effects._looks_secret(text), text)
 
 if __name__ == "__main__":
     unittest.main()

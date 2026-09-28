@@ -1,0 +1,4 @@
+- Fixed change tracking missing the files a background command (`h = bash(...)` not awaited) changed when it finished between cells; they are now listed in the next cell, next to the command's result.
+- Fixed macOS `sed -i` showing its short-lived temp file (`.!1234!name`) as a new file while the edited file was never listed.
+- Fixed change tracking for symlinks: a write through a link is listed under the real file, a new or removed link is shown as a link without its target's line counts, and a link to a changed file no longer adds a second row.
+- Documented that change tracking does not list files a command writes outside the session's working folder.

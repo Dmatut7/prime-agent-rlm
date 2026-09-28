@@ -22,7 +22,12 @@ export interface KernelEffectRetraction {
 const FILE_KINDS = new Set<KernelFileChange["kind"]>(["created", "modified", "deleted", "renamed"]);
 const FILE_SCOPES = new Set<KernelFileChange["scope"]>(["project", "scratch", "memory"]);
 const FILE_SOURCES = new Set<KernelFileChange["source"]>(["python", "shell", "edit"]);
-const DIFF_OMITTED = new Set<NonNullable<KernelFileChange["diffOmitted"]>>(["too_large", "no_baseline", "budget"]);
+const DIFF_OMITTED = new Set<NonNullable<KernelFileChange["diffOmitted"]>>([
+	"too_large",
+	"no_baseline",
+	"budget",
+	"sensitive",
+]);
 const MEMORY_OPS = new Set<KernelMemoryChange["op"]>(["created", "updated", "deleted"]);
 const MEMORY_KINDS = new Set<KernelMemoryChange["kind"]>(["memory", "skill", "subagent", "prompt_note", "rules_file"]);
 const MEMORY_SCOPES = new Set<KernelMemoryChange["scope"]>(["session", "global", "project"]);
@@ -65,7 +70,7 @@ export function parseFileChangeDisplay(payload: unknown): KernelFileChange | Ker
 	}
 	const relPath = optionalString(payload.relPath);
 	const oldPath = optionalString(payload.oldPath);
-	const diff = optionalString(payload.diff);
+	const diff = payload.diffOmitted === "sensitive" ? undefined : optionalString(payload.diff);
 	return {
 		path: payload.path,
 		...(relPath !== undefined ? { relPath } : {}),
@@ -78,6 +83,7 @@ export function parseFileChangeDisplay(payload: unknown): KernelFileChange | Ker
 		...(payload.diffTruncated === true ? { diffTruncated: true } : {}),
 		...(member(DIFF_OMITTED, payload.diffOmitted) ? { diffOmitted: payload.diffOmitted } : {}),
 		...(payload.binary === true ? { binary: true } : {}),
+		...(payload.symlink === true ? { symlink: true } : {}),
 		source: payload.source,
 		at,
 	};
@@ -95,8 +101,9 @@ export function parseMemoryChangeDisplay(payload: unknown): KernelMemoryChange |
 	const at = count(payload.at);
 	if (!member(MEMORY_OPS, payload.op) || typeof payload.title !== "string" || at === undefined) return undefined;
 	const previousTitle = optionalString(payload.previousTitle);
-	const before = optionalString(payload.before);
-	const after = optionalString(payload.after);
+	const textOmitted = payload.textOmitted === "sensitive";
+	const before = textOmitted ? undefined : optionalString(payload.before);
+	const after = textOmitted ? undefined : optionalString(payload.after);
 	return {
 		op: payload.op,
 		kind: payload.kind,
@@ -106,6 +113,7 @@ export function parseMemoryChangeDisplay(payload: unknown): KernelMemoryChange |
 		...(previousTitle !== undefined ? { previousTitle } : {}),
 		...(before !== undefined ? { before } : {}),
 		...(after !== undefined ? { after } : {}),
+		...(textOmitted ? { textOmitted: "sensitive" as const } : {}),
 		at,
 	};
 }
