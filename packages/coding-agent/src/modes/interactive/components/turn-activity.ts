@@ -3,9 +3,11 @@ import { theme } from "../theme/theme.js";
 import { getSpinnerTick } from "../theme/working-icon.js";
 import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock } from "./block-focus.js";
 import type { FileChangeSummary } from "./edit-summary.js";
-import { ASSISTANT_GUTTER_WIDTH, assistantGutter, renderAssistantHeader, renderRunningCard } from "./running-card.js";
-import { turnStepsSummary } from "./step-label.js";
-import { TurnFootNote } from "./turn-footnote.js";
+import { takeMotionActive } from "./motion.js";
+import { renderAssistantHeader } from "./running-card.js";
+import { type BoxRow, buildTimelineRows, type RowStep, type TimelineFacts, timelineFacts } from "./timeline-rows.js";
+import { boxBodyRows, computeBoxHeader, renderTurnBox } from "./turn-box.js";
+import { TurnTimeline } from "./turn-timeline.js";
 
 export type TurnStepStatus = "queued" | "running" | "done" | "error";
 
@@ -46,10 +48,39 @@ export const PROCESS_FOLD_EDGE = 3;
  * its own body (the running preview stays watchable) and merges into the
  * line once it settles.
  */
+/** What a turn's box reads from its host: the working directory, the screen height, the box settings. */
+export interface TimelineHost {
+	cwd(): string;
+	/** Terminal rows; the box body's height follows it. */
+	viewportRows(): number;
+	/** `ui.timelineOpenWhileWorking`: a running turn's box starts open. */
+	openWhileWorking(): boolean;
+	/** `ui.timelineAutoFold`: a finished turn's box folds on its own unless the user opened or closed it. */
+	autoFold(): boolean;
+	/** `hideThinkingBlock`: thinking rows say how long, never what. */
+	hideThinking?(): boolean;
+	requestRender(): void;
+}
+
+const DEFAULT_TIMELINE_HOST: TimelineHost = {
+	cwd: () => process.cwd(),
+	viewportRows: () => 40,
+	openWhileWorking: () => true,
+	autoFold: () => true,
+	requestRender: () => {},
+};
+
 export class TurnActivityState {
 	readonly steps: TurnStep[] = [];
-	readonly startedAt: number;
+	/** The turn's box: everything it shows and the box's own UI state. */
+	readonly timeline = new TurnTimeline();
+	/** Quiet conversation: this turn renders as a box, and its tool rows live inside it. */
+	boxMode = false;
+	host: TimelineHost = DEFAULT_TIMELINE_HOST;
+	private startedAtMs: number;
 	private lastSettledAt: number | undefined;
+	/** The newest replayed assistant message's stamp: a replayed turn's clock runs to its last reply. */
+	private lastReplyAt: number | undefined;
 	private turnEndedAt: number | undefined;
 	private thinkingSegments = 0;
 	private liveThinkingSegments = 0;
@@ -68,20 +99,27 @@ export class TurnActivityState {
 		return this.thinkingExpanded;
 	}
 	get processBlockExpanded(): boolean {
-		return !this.collapsed;
+		return !this.isCollapsed;
 	}
 	get commsBlockExpanded(): boolean {
 		return this.agentMessagesExpanded;
 	}
 
 	constructor(startedAt = Date.now()) {
-		this.startedAt = startedAt;
+		this.startedAtMs = startedAt;
 		this.phaseSince = startedAt;
 		this.lastActivityAt = startedAt;
 	}
 
+	private liveFlag = false;
 	/** Set on the live run's turn: its clock ticks until agent_end stamps it. */
-	live = false;
+	get live(): boolean {
+		return this.liveFlag;
+	}
+	set live(value: boolean) {
+		this.liveFlag = value;
+		if (value) this.timeline.observedLive = true;
+	}
 
 	/** The model answering this turn (`glm-5.3-prime`), for the `◆ prime` header. */
 	modelId: string | undefined;
@@ -199,18 +237,151 @@ export class TurnActivityState {
 	}
 
 	get isCollapsed(): boolean {
-		return this.collapsed;
+		return this.boxMode ? !this.boxOpen : this.collapsed;
 	}
 
 	setCollapsed(collapsed: boolean): void {
+		if (this.boxMode) {
+			const ui = this.timeline.ui;
+			if (ui.userOpen === !collapsed && this.boxOpen === !collapsed) return;
+			const opening = collapsed === false && !this.boxOpen;
+			ui.userOpen = !collapsed;
+			ui.foldStartedAt = undefined;
+			if (opening) {
+				ui.openedAt = Date.now();
+				ui.followNewest();
+			}
+			ui.bump();
+			return;
+		}
 		if (this.collapsed === collapsed) {
 			return;
 		}
 		this.collapsed = collapsed;
 	}
 
+	/**
+	 * The box shows its live face: the turn runs, or it just ended and the
+	 * short settle before the finished presentation has not passed yet.
+	 */
+	get boxLive(): boolean {
+		return this.turnEndedAt === undefined || (this.timeline.observedLive && this.timeline.finishedAt === undefined);
+	}
+
+	/** Whether the box body shows: what the user chose, else the open/fold settings. */
+	get boxOpen(): boolean {
+		const ui = this.timeline.ui;
+		if (ui.userOpen !== undefined) return ui.userOpen;
+		if (this.boxLive) return this.host.openWhileWorking();
+		if (this.timeline.observedLive) return this.host.openWhileWorking() && !this.host.autoFold();
+		return false;
+	}
+
+	/**
+	 * Apply the finished presentation (the summary header, the fold). The body
+	 * folds up row by row when it was open only because of the settings.
+	 */
+	finishBox(now = Date.now()): void {
+		const timeline = this.timeline;
+		if (timeline.finishedAt !== undefined) return;
+		const wasOpen = this.boxOpen;
+		timeline.finishedAt = now;
+		if (wasOpen && !this.boxOpen) {
+			timeline.ui.foldStartedAt = now;
+			timeline.ui.foldFromRows = Math.max(1, timeline.ui.lastVisible);
+		}
+		timeline.ui.bump();
+	}
+
+	/** A retry or a compaction continues this turn after it ended: back to live. */
+	reopen(): void {
+		this.turnEndedAt = undefined;
+		this.timeline.finishedAt = undefined;
+		this.timeline.ui.foldStartedAt = undefined;
+		this.timeline.stopped = false;
+		this.timeline.errorEnded = false;
+		this.timeline.ui.bump();
+	}
+
+	/** The turn's steps by id, with the time each started running. */
+	rowSteps(): Map<string, RowStep> {
+		const steps = new Map<string, RowStep>();
+		for (const step of this.steps) {
+			const startedAt = this.stepStartedAt.get(step.toolCallId);
+			steps.set(step.toolCallId, {
+				toolCallId: step.toolCallId,
+				toolName: step.toolName,
+				args: step.args,
+				status: step.status,
+				...(startedAt !== undefined ? { startedAt } : {}),
+			});
+		}
+		return steps;
+	}
+
+	private viewCache: { key: string; rows: BoxRow[]; facts: TimelineFacts } | undefined;
+
+	/** The box rows and the turn's facts; memoized once the turn has finished. */
+	boxView(now = Date.now()): { rows: BoxRow[]; facts: TimelineFacts; live: boolean } {
+		const live = this.boxLive;
+		const cacheKey = [
+			this.timeline.ui.version,
+			this.steps.length,
+			this.steps.filter((step) => step.status === "done" || step.status === "error").length,
+			this.timeline.entries.length,
+			this.timeline.stopped,
+			this.timeline.errorEnded,
+		].join(":");
+		if (!live && this.viewCache?.key === cacheKey) {
+			return { rows: this.viewCache.rows, facts: this.viewCache.facts, live };
+		}
+		const ctx = {
+			now,
+			cwd: this.host.cwd(),
+			steps: this.rowSteps(),
+			live,
+			stopped: this.timeline.stopped,
+			hideThinking: this.host.hideThinking?.() ?? false,
+		};
+		const rows = buildTimelineRows(this.timeline, ctx);
+		const facts = timelineFacts(this.timeline, rows, ctx);
+		if (!live) this.viewCache = { key: cacheKey, rows, facts };
+		return { rows, facts, live };
+	}
+
+	get startedAt(): number {
+		return this.startedAtMs;
+	}
+
+	/** A replayed assistant message: the turn lasted at least until it began. */
+	noteReplyAt(timestamp: number): void {
+		if (Number.isFinite(timestamp) && timestamp > 0) this.lastReplyAt = Math.max(this.lastReplyAt ?? 0, timestamp);
+	}
+
 	addStep(step: TurnStep): void {
 		this.steps.push(step);
+	}
+
+	/**
+	 * A turn rebuilt after a compaction summarized its first part away keeps the
+	 * steps, clock and thinking count of the turn it continues (display only).
+	 */
+	adoptHistory(previous: TurnActivityState): void {
+		this.startedAtMs = Math.min(this.startedAtMs, previous.startedAt);
+		const known = new Set(this.steps.map((step) => step.toolCallId));
+		const earlier = previous.steps.filter((step) => !known.has(step.toolCallId));
+		this.steps.unshift(...earlier);
+		for (const step of earlier) {
+			const started = previous.stepStartedAt.get(step.toolCallId);
+			if (started !== undefined && !this.stepStartedAt.has(step.toolCallId)) {
+				this.stepStartedAt.set(step.toolCallId, started);
+			}
+		}
+		if (previous.lastSettledAt !== undefined) {
+			this.lastSettledAt = Math.max(this.lastSettledAt ?? 0, previous.lastSettledAt);
+		}
+		this.thinkingSegments = Math.max(this.thinkingSegments, previous.thinkingSegments);
+		this.modelId = this.modelId || previous.modelId;
 	}
 
 	/** Streaming tool calls grow their arguments; the step labels read the latest ones. */
@@ -359,7 +530,9 @@ export class TurnActivityState {
 			: this.live && this.turnEndedAt !== undefined
 				? this.turnEndedAt
 				: this.steps.length > 0
-					? (this.lastSettledAt ?? this.turnEndedAt ?? now)
+					? // A box's clock covers the whole turn up to its last reply, the answer included.
+						Math.max(this.lastSettledAt ?? 0, this.boxMode ? (this.lastReplyAt ?? 0) : 0) ||
+						(this.turnEndedAt ?? now)
 					: (this.turnEndedAt ?? now);
 		return Math.max(0, end - this.startedAt);
 	}
@@ -489,11 +662,13 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 	private cachedLaneKey?: string;
-	/** TUI v4: render the one-line footnote instead of the legacy two-line surface. */
+	/** Quiet conversation: render the turn as its box instead of the legacy two-line surface. */
 	private quiet = false;
-	private footnote?: TurnFootNote;
 	/** Told after a click flipped a lane, so the host applies it to the turn's rows. */
 	private onLanesChange?: () => void;
+	private boxRegions: ClickRegion[] = [];
+	private boxFocusOrder: string[] = [];
+	private boxCacheKey: string | undefined;
 
 	constructor(private readonly turnState: TurnActivityState) {}
 
@@ -506,54 +681,79 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		return this.turnState;
 	}
 
-	/** TUI v4 T12: forward the footnote's segment/caret click regions - the
-	 * quiet face renders the footnote lines at offset zero, so the regions
-	 * pass through unchanged. */
-	getClickRegions(): ReadonlyArray<ClickRegion> {
-		if (!this.quiet) {
-			return [];
-		}
-		// v3: the `◆ prime` header opens or closes the turn's process; the
-		// footnote's own regions sit one row down, after the gutter.
-		const header: ClickRegion = {
-			line: 0,
-			col: 0,
-			width: 9,
-			height: 1,
-			onClick: () => this.toggleAllBlocks(),
-		};
-		if (!this.turnState.isTurnEnded || !this.footnote) {
-			return [header];
-		}
-		return [
-			header,
-			...this.footnote.getClickRegions().map((region) => ({
-				...region,
-				line: region.line + 1,
-				col: region.col + ASSISTANT_GUTTER_WIDTH,
-			})),
-		];
+	/** Where the box reads its settings, the screen height and the working directory from. */
+	setTimelineHost(host: TimelineHost): void {
+		this.turnState.host = host;
+		this.invalidate();
 	}
 
-	/** Any block open -> all closed; all closed -> the process block open. */
-	private toggleAllBlocks(): void {
-		const anyOpen =
-			this.turnState.thinkingBlockExpanded ||
-			this.turnState.processBlockExpanded ||
-			this.turnState.commsBlockExpanded;
-		this.turnState.thinkingExpanded = false;
-		this.turnState.agentMessagesExpanded = false;
-		this.turnState.setCollapsed(anyOpen);
+	/** The box's click regions: the `◆ prime` line and the box header toggle the box, rows toggle themselves. */
+	getClickRegions(): ReadonlyArray<ClickRegion> {
+		return this.quiet ? this.boxRegions : [];
+	}
+
+	/** Keyboard targets of the box, top to bottom (`header`, then row keys). */
+	getFocusOrder(): readonly string[] {
+		return this.boxFocusOrder;
+	}
+
+	/** Open or close the whole box (a click on its header, Ctrl+O, Enter on its header). */
+	toggleBox(): void {
+		this.turnState.setCollapsed(this.turnState.boxOpen);
 		this.invalidate();
 		this.onLanesChange?.();
+		this.turnState.host.requestRender();
 	}
 
-	/** TUI v4: switch this turn head between the footnote and the legacy two lines. */
+	/** Enter on a focused target: the header toggles the box, a row opens or closes. */
+	activate(key: string): boolean {
+		if (key === "header") {
+			this.toggleBox();
+			return true;
+		}
+		const row = this.turnState.boxView().rows.find((candidate) => candidate.key === key);
+		if (!row?.detail) return false;
+		this.turnState.timeline.ui.toggleRow(key);
+		this.invalidate();
+		this.turnState.host.requestRender();
+		return true;
+	}
+
+	/** Ctrl+T in the quiet conversation: open every thinking row of this turn, or close them all. */
+	toggleThinkingRows(): void {
+		const ui = this.turnState.timeline.ui;
+		const thinking = this.turnState.boxView().rows.filter((row) => row.kind === "think" && row.detail);
+		this.setThinkingRows(
+			thinking.length > 0 ? thinking.some((row) => !ui.expanded.has(row.key)) : !this.turnState.thinkingExpanded,
+		);
+	}
+
+	/** Open every thinking row of this turn (and the box, to show them), or close them all. */
+	setThinkingRows(open: boolean): void {
+		const ui = this.turnState.timeline.ui;
+		const now = Date.now();
+		for (const row of this.turnState.boxView().rows) {
+			if (row.kind !== "think" || !row.detail) continue;
+			if (open) {
+				ui.expanded.add(row.key);
+				ui.expandedAt.set(row.key, now);
+			} else {
+				ui.expanded.delete(row.key);
+			}
+		}
+		this.turnState.thinkingExpanded = open;
+		if (open && !this.turnState.boxOpen) this.turnState.setCollapsed(false);
+		ui.bump();
+		this.invalidate();
+	}
+
+	/** TUI v4: switch this turn head between the box and the legacy two lines. */
 	setQuiet(quiet: boolean): void {
 		if (this.quiet === quiet) {
 			return;
 		}
 		this.quiet = quiet;
+		this.turnState.boxMode = quiet;
 		this.invalidate();
 	}
 
@@ -578,6 +778,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	invalidate(): void {
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		this.boxCacheKey = undefined;
 	}
 
 	render(width: number): string[] {
@@ -598,6 +799,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	}
 
 	private renderTurnHead(width: number): string[] {
+		if (this.quiet) return this.renderBox(Math.max(1, width));
 		// TUI v4: freeze only a fully settled turn - every step done AND the
 		// end stamp landed. Comms and thinking can still grow between the last
 		// settled step and the turn end, so `isSettled` alone would freeze the
@@ -617,7 +819,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 			return this.cachedLines;
 		}
 		const safeWidth = Math.max(1, width);
-		const lines = this.quiet ? this.renderFootNote(safeWidth) : this.renderLegacy(safeWidth);
+		const lines = this.renderLegacy(safeWidth);
 		if (settled) {
 			this.cachedWidth = width;
 			this.cachedLines = lines;
@@ -631,83 +833,70 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	}
 
 	/**
-	 * Quiet face: the process line - `▸ 思考 · 14 步 · 1m05s   运行 npm check`
-	 * - with the stats read live off the turn state (steps deduped by
-	 * toolCallId, thinking segments, the comm counter, the frozen duration),
-	 * plus one row per changed file while the process block is closed.
+	 * Quiet face: the `◆ prime  <model>` line, then the turn's box. The box
+	 * re-renders every frame while it is live or animating; a finished, still
+	 * box is cached until its UI state changes.
 	 */
-	private renderFootNote(safeWidth: number): string[] {
-		this.footnote ??= new TurnFootNote({
-			steps: 0,
-			thinkSegments: 0,
-			commMessages: 0,
-			durationMs: 0,
-			cols: safeWidth,
-			// TUI v4 T12: clicking a segment opens exactly that block (the
-			// three blocks stay independent); the caret flips all of them.
-			onSegmentClick: (segment) => {
-				if (segment === "think") {
-					this.turnState.thinkingExpanded = !this.turnState.thinkingExpanded;
-				} else if (segment === "steps") {
-					this.turnState.setCollapsed(this.turnState.processBlockExpanded);
-				} else {
-					this.turnState.agentMessagesExpanded = !this.turnState.agentMessagesExpanded;
-				}
-				this.invalidate();
-				this.onLanesChange?.();
-			},
-			onCaretClick: () => this.toggleAllBlocks(),
+	private renderBox(width: number): string[] {
+		const state = this.turnState;
+		const host = state.host;
+		const now = Date.now();
+		const viewportRows = host.viewportRows();
+		const ui = state.timeline.ui;
+		const cacheKey = `${width}:${viewportRows}:${ui.version}:${state.boxOpen}:${state.steps.length}`;
+		if (this.cachedLines && this.boxCacheKey === cacheKey) return this.cachedLines;
+		takeMotionActive();
+		const view = state.boxView(now);
+		const header = computeBoxHeader({
+			rows: view.rows,
+			facts: view.facts,
+			timeline: state.timeline,
+			live: view.live,
+			phase: state.currentPhase,
+			currentThinking: host.hideThinking?.() ? "" : state.currentThinking,
+			now,
 		});
-		const live = !this.turnState.isTurnEnded;
-		const header = renderAssistantHeader({
-			...(this.turnState.modelId ? { modelId: this.turnState.modelId } : {}),
-			durationMs: this.turnState.turnDurationMs(),
-			live,
+		const box = renderTurnBox({
+			timeline: state.timeline,
+			rows: view.rows,
+			header,
+			width,
+			now,
 			tick: getSpinnerTick(),
-			width: safeWidth,
+			live: view.live,
+			open: state.boxOpen,
+			maxBodyRows: boxBodyRows(viewportRows),
+			durationMs: state.turnDurationMs(now),
+			tokens: state.timeline.outputTokens(),
+			onToggleBox: () => this.toggleBox(),
+			onChange: () => {
+				this.invalidate();
+				host.requestRender();
+			},
 		});
-		// v3: a live turn is the running card under the header - what the AI is
-		// doing now; the step list stays one Ctrl+O away, exactly as before.
-		if (live) {
-			return [header, ...renderRunningCard(this.turnState, safeWidth, getSpinnerTick())];
+		const headerLine = renderAssistantHeader({
+			...(state.modelId ? { modelId: state.modelId } : {}),
+			durationMs: 0,
+			live: false,
+			plain: true,
+			tick: 0,
+			width,
+		});
+		this.boxFocusOrder = box.focusOrder;
+		this.boxRegions = [
+			{ line: 0, col: 0, width: Math.min(width, 9), height: 1, onClick: () => this.toggleBox() },
+			...box.regions.map((region) => ({ ...region, line: region.line + 1 })),
+		];
+		const lines = [headerLine, ...box.lines];
+		const animating = takeMotionActive();
+		if (!view.live && !animating) {
+			this.cachedLines = lines;
+			this.boxCacheKey = cacheKey;
+		} else {
+			this.cachedLines = undefined;
+			this.boxCacheKey = undefined;
 		}
-		const bodyWidth = Math.max(1, safeWidth - ASSISTANT_GUTTER_WIDTH);
-		const steps = new Set(this.turnState.steps.map((step) => step.toolCallId)).size;
-		const thinkSegments = this.turnState.totalThinkingSegments;
-		const commMessages = this.turnState.commMessageCount;
-		// R5-P2③: an all-zero turn still renders 思考 - the model is always
-		// reasoning, so a turn with no explicit thinking block counts as one
-		// thought. The footnote component stays a pure props renderer; this
-		// policy belongs to the wiring.
-		const effectiveThinkSegments = steps === 0 && commMessages === 0 && thinkSegments === 0 ? 1 : thinkSegments;
-		this.footnote.update({
-			steps,
-			thinkSegments: effectiveThinkSegments,
-			commMessages,
-			durationMs: this.turnState.turnDurationMs(),
-			cols: bodyWidth,
-			summary: turnStepsSummary(this.turnState.steps),
-			headerCarriesDuration: true,
-			thinkingMs: this.turnState.thinkingDurationMs(),
-			// The preview stands in for the trace; with the trace open (Ctrl+T) it would repeat it.
-			thinkingPreview:
-				this.turnState.processBlockExpanded && !this.turnState.thinkingBlockExpanded
-					? this.turnState.latestThinking
-					: undefined,
-			// An open process block shows every diff itself; the rows are the closed view's stand-in.
-			fileChanges: this.turnState.processBlockExpanded ? [] : this.turnState.fileChanges,
-			// P3-2: the caret glyph — ▸ while every detail block is collapsed,
-			// ▾ once any of the three blocks is open (the wiring owns the state).
-			caret:
-				this.turnState.thinkingBlockExpanded ||
-				this.turnState.processBlockExpanded ||
-				// The comms lane opens nothing in a turn without comms.
-				(this.turnState.commsBlockExpanded && commMessages > 0)
-					? "▾"
-					: "▸",
-		});
-		const gutter = assistantGutter();
-		return [header, ...this.footnote.render(bodyWidth).map((line) => `${gutter}${line}`)];
+		return lines;
 	}
 
 	/**

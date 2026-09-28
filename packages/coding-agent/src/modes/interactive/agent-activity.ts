@@ -1,5 +1,6 @@
 import { isAgentSessionMessage } from "../../core/agent-messages.js";
 import type { AgentConnectionSessionEvent } from "../agent-connection/index.js";
+import { estimateTokenUnits } from "./components/feed-data.js";
 
 export type AgentActivity = "waiting" | "thinking" | "writing" | "writing-code" | "executing";
 
@@ -17,13 +18,11 @@ export const AGENT_ACTIVITY_LABELS: Record<AgentActivity, string> = {
 	executing: "执行中",
 };
 
-const CHARS_PER_TOKEN_ESTIMATE = 4;
-
 export class AgentActivityTracker {
 	private activity: AgentActivity = "waiting";
 	private completedTokens = 0;
 	private streamingUsageTokens = 0;
-	private streamingChars = 0;
+	private streamingEstimate = 0;
 	private runningToolCount = 0;
 	// Providers like Anthropic only report usage at the start and end of a message, so the
 	// live count leans on the character estimate in between. Keeping the reported value
@@ -43,7 +42,7 @@ export class AgentActivityTracker {
 				} else if (event.message.role === "assistant") {
 					this.activity = "waiting";
 					this.streamingUsageTokens = 0;
-					this.streamingChars = 0;
+					this.streamingEstimate = 0;
 				}
 				break;
 
@@ -67,7 +66,7 @@ export class AgentActivityTracker {
 						break;
 				}
 				if ("delta" in streamEvent) {
-					this.streamingChars += streamEvent.delta.length;
+					this.streamingEstimate += estimateTokenUnits(streamEvent.delta);
 				}
 				this.streamingUsageTokens = event.message.usage.output;
 				break;
@@ -78,7 +77,7 @@ export class AgentActivityTracker {
 				this.completedTokens +=
 					event.message.usage.output > 0 ? event.message.usage.output : this.estimatedStreamingTokens();
 				this.streamingUsageTokens = 0;
-				this.streamingChars = 0;
+				this.streamingEstimate = 0;
 				this.activity = "waiting";
 				break;
 
@@ -116,13 +115,13 @@ export class AgentActivityTracker {
 		this.activity = "waiting";
 		this.completedTokens = 0;
 		this.streamingUsageTokens = 0;
-		this.streamingChars = 0;
+		this.streamingEstimate = 0;
 		this.runningToolCount = 0;
 		this.reportedTokens = 0;
 	}
 
 	private estimatedStreamingTokens(): number {
-		return Math.round(this.streamingChars / CHARS_PER_TOKEN_ESTIMATE);
+		return Math.round(this.streamingEstimate);
 	}
 }
 

@@ -352,7 +352,7 @@ describe("Enter on a focused block", () => {
 		expect(h.focusedText()).not.toContain("Enter");
 	});
 
-	it("runs quiet mode's three-step Ctrl+O cycle and the Esc close order", async () => {
+	it("opens and closes a quiet turn's box with Enter, recorded for the Esc close order", async () => {
 		const summary = turn(12);
 		const h = await createHarness([new UserMessageComponent("跑一下"), summary, assistant("完成")]);
 		await h.start();
@@ -360,15 +360,15 @@ describe("Enter on a focused block", () => {
 		expect(h.focusedText()).toContain("Enter 展开");
 		await h.press(ENTER);
 		expect(summary.state.processBlockExpanded).toBe(true);
-		expect(summary.state.processKeyStepsView).toBe(true);
-		expect(h.focusedText()).toContain("Enter 展开全部");
-		await h.press(ENTER);
-		expect(summary.state.processKeyStepsView).toBe(false);
-		expect(summary.state.processBlockExpanded).toBe(true);
 		expect(h.focusedText()).toContain("Enter 收起");
 		// The open was recorded: T8's Esc close order folds it.
 		expect(call(h.mode, "closeLastOpenedProcessBlock")).toBe(true);
 		expect(summary.state.processBlockExpanded).toBe(false);
+		await h.press(ENTER);
+		expect(summary.state.processBlockExpanded).toBe(true);
+		await h.press(ENTER);
+		expect(summary.state.processBlockExpanded).toBe(false);
+		expect(call(h.mode, "closeLastOpenedProcessBlock")).toBe(false);
 	});
 
 	it("opens an answer's Thinking only when it has a trace, with a rebound toggle key in the hint", async () => {
@@ -416,7 +416,7 @@ describe("copy and focus on failure rows", () => {
 });
 
 describe("clicking a turn head", () => {
-	it("applies the lanes to the turn's rows, and Ctrl+O afterwards agrees with the caret", async () => {
+	it("toggles the box, keeps the step cards to the box, and Ctrl+O afterwards agrees with the caret", async () => {
 		const summary = turn(2);
 		const row = new ToolRow();
 		const answer = assistant("完成", {}, "想了想");
@@ -427,20 +427,21 @@ describe("clicking a turn head", () => {
 		expect(header).toBeDefined();
 		header?.onClick({ row: 0, col: 0 });
 		expect(summary.state.processBlockExpanded).toBe(true);
-		expect(row.expanded).toBe(true);
+		// The box lists the steps itself: the separate step cards stay folded.
+		expect(row.expanded).toBe(false);
 		expect(plain(summary.render(80)).join("\n")).toContain("▾");
 
 		header?.onClick({ row: 0, col: 0 });
 		expect(summary.state.processBlockExpanded).toBe(false);
-		expect(row.expanded).toBe(false);
+		expect(plain(summary.render(80)).join("\n")).toContain("▸");
 		// Ctrl+O now opens (the caret says ▸), instead of doing nothing.
 		call(h.mode, "cycleTurnProcess", summary);
 		expect(summary.state.processBlockExpanded).toBe(true);
-		expect(row.expanded).toBe(true);
 		// The click-opened state was recorded for Esc too.
 		header?.onClick({ row: 0, col: 0 });
 		header?.onClick({ row: 0, col: 0 });
+		expect(summary.state.processBlockExpanded).toBe(true);
 		expect(call(h.mode, "closeLastOpenedProcessBlock")).toBe(true);
-		expect(row.expanded).toBe(false);
+		expect(summary.state.processBlockExpanded).toBe(false);
 	});
 });

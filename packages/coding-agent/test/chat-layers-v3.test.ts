@@ -221,7 +221,7 @@ describe("the ◆ prime header and the gutter", () => {
 		).toBe(" ◆ prime  glm-5.3-prime · ⠸ working 9m 28s");
 	});
 
-	it("puts the settled process line inside the AI block, on the gutter, in English", () => {
+	it("puts a settled turn's box under the header: a summary line, the clock and the tokens", () => {
 		const state = new TurnActivityState(T0);
 		state.modelId = "glm-5.3-prime";
 		state.addStep({ toolCallId: "a", toolName: "bash", args: { command: "npm test" }, status: "queued" });
@@ -231,25 +231,27 @@ describe("the ◆ prime header and the gutter", () => {
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
 		const lines = plain(summary.render(100));
-		expect(lines[0]).toBe(" ◆ prime  glm-5.3-prime · 4.0s");
-		expect(lines[1]).toMatch(/^ │ ▸ 1 step {3}运行 npm test$/);
-		// The footnote's click regions moved one row down and past the rail.
-		const regions = summary.getClickRegions();
+		expect(lines[0]).toBe(" ◆ prime  glm-5.3-prime");
+		expect(lines[1]?.startsWith(" ╭")).toBe(true);
+		expect(lines[2]).toMatch(/^ │ ▸ ✓ 跑了 1 条命令 +4秒 · ↓ 0 │$/);
+		expect(lines[3]?.startsWith(" ╰")).toBe(true);
+		// The `◆ prime` line and the box header both open the box.
+		const regions = summary.getClickRegions().filter((region) => !region.passive);
 		expect(regions[0]).toMatchObject({ line: 0, col: 0 });
-		expect(regions.slice(1).every((region) => region.line === 1 && region.col >= 2)).toBe(true);
+		expect(regions.some((region) => region.line === 2)).toBe(true);
 	});
 
-	it("renders the live turn as the header plus the running card", () => {
+	it("renders the live turn as the header plus a box that says what it is doing", () => {
 		const state = liveState();
 		state.notePhase("waiting", T0);
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
 		const lines = plain(summary.render(100));
-		expect(lines[0]).toMatch(/^ ◆ prime {2}glm-5\.3-prime · \S working /);
-		expect(lines[1]).toContain("正在等模型回复");
+		expect(lines[0]).toBe(" ◆ prime  glm-5.3-prime");
+		expect(lines[2]).toMatch(/^ │ ▾ \S 等待模型回应… /);
 	});
 
-	it("runs a quiet answer down the gutter rail", () => {
+	it("runs a quiet answer flush under its box, with no rail", () => {
 		const answer = new AssistantMessageComponent(
 			{
 				role: "assistant",
@@ -275,8 +277,8 @@ describe("the ◆ prime header and the gutter", () => {
 		);
 		const lines = plain(answer.render(80)).map((line) => line.replace(/\x1b\][^\x07]*\x07/g, ""));
 		expect(lines.length).toBeGreaterThan(1);
-		for (const line of lines) expect(line.startsWith(" │")).toBe(true);
-		expect(lines.some((line) => line.startsWith(" │ 两个文件加起来 746 行。"))).toBe(true);
+		for (const line of lines) expect(line.startsWith(" │")).toBe(false);
+		expect(lines.some((line) => line.startsWith(" 两个文件加起来 746 行。"))).toBe(true);
 	});
 });
 
@@ -380,7 +382,7 @@ describe("system notices", () => {
 		const component = new RefinementOutcomeMessageComponent(createRefinementOutcomeMessage(result));
 		const collapsed = plain(component.render(100)).filter((line) => line.trim());
 		expect(collapsed).toHaveLength(1);
-		expect(collapsed[0]).toContain("·  ✦ memory updated  百轮评估进度  ·  Ctrl+O diff  ·");
+		expect(collapsed[0]).toBe(" ✦ 记住了 1 条 · 百轮评估进度 · 本会话 ▸");
 		// The entry's title names it; the summary's shorthand stays out of the line.
 		expect(collapsed[0]).not.toContain("老板令");
 		// A slug-like title (seen live: `eval100_0924百轮评估场_运行状态_评估后删`) reads as words.

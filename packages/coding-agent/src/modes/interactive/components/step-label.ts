@@ -41,6 +41,8 @@ const PYTHON_VAR_IO_PATTERN =
 const PYTHON_PATH_ASSIGN_PATTERN =
 	/\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:pathlib\.)?Path\(\s*[rRfF]?["']([^"']+)["']\s*\)/g;
 const PYTHON_LIST_DIR_PATTERN = /\b(?:os\.listdir|os\.scandir|os\.walk|glob\.glob)\(\s*[rRfF]?["']([^"']*)["']/g;
+/** A glob pattern names what the cell looks for, not a directory: `查找 *.py`. */
+const GLOB_WILDCARD = /[*?[]/;
 /** `os.listdir()` and `os.listdir(os.getcwd())`: the current directory, no path literal. */
 const PYTHON_LIST_CWD_PATTERN = /\b(?:os\.listdir|os\.scandir|os\.walk)\(\s*(?:os\.getcwd\(\)|Path\.cwd\(\))?\s*\)/g;
 const PYTHON_PATH_LIST_PATTERN = /\bPath\(\s*[rRfF]?["']([^"']*)["']\s*\)\.(?:iterdir|glob|rglob)\(/g;
@@ -88,7 +90,10 @@ const PYTHON_TARGETED_CALLS: ReadonlyArray<[RegExp, (target: string | undefined)
 ];
 const PYTHON_MESSAGE_SEND_PATTERN = /\bagent_message\.send\(/g;
 const PYTHON_HANDLE_WAIT_PATTERN =
-	/(?:^|\n)\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?await\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:$|\n)|\b[A-Za-z_][A-Za-z0-9_]*\.(?:poll|tail|output)\(/g;
+	/(?:^|\n)\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?await\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:$|\n)|\b([A-Za-z_][A-Za-z0-9_]*)\.(?:poll|tail|output)\(/g;
+/** `h = bash('go test ./...')`: a handle a later cell waits on. */
+const PYTHON_BASH_HANDLE_PATTERN =
+	/(?:^|\n)\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*bash\(\s*[rRfF]?("""|'''|"|')([\s\S]*?)\2/g;
 const PYTHON_SLICE_PRINT_PATTERN = /\bprint\(\s*[A-Za-z_][A-Za-z0-9_.]*\s*\[[^\]]*:[^\]]*\]\s*\)/g;
 
 function looksLikePath(value: string): boolean {
@@ -220,7 +225,7 @@ interface PythonEffect {
  * What a python cell does, read off common idioms, in source order: shell
  * commands run through `bash()`, file reads and writes, directory listings.
  */
-function pythonEffects(code: string): string[] {
+function pythonEffects(code: string, context: StepLabelContext = {}): string[] {
 	const effects: PythonEffect[] = [];
 	const push = (index: number | undefined, label: string) => effects.push({ index: index ?? 0, label });
 	const stringVars = new Map<string, string>();
@@ -240,7 +245,13 @@ function pythonEffects(code: string): string[] {
 		if (command) push(match.index, describeShellCommand(command));
 	}
 	for (const match of code.matchAll(PYTHON_SUBPROCESS_LIST_PATTERN)) {
-		const words = [...(match[1] ?? "").matchAll(/["']([^"']*)["']/g)].map((word) => word[1] ?? "");
+		const list = match[1] ?? "";
+		const words = [...list.matchAll(/["']([^"']*)["']/g)].map((word) => word[1] ?? "");
+		// `[sys.executable, "-c", ...]`: the program is a variable, and a label
+		// starting at its first flag (`运行 -c from datetime…`) names nothing.
+		if (words.length > 0 && !/^\s*[rRbBfF]?["']/.test(list) && words[0]?.startsWith("-")) {
+			words.unshift(/python|executable/.test(list.split(",")[0] ?? "") ? "python" : "程序");
+		}
 		if (words.length > 0) push(match.index, describeShellCommand(words.join(" ")));
 	}
 	for (const match of code.matchAll(PYTHON_SUBPROCESS_STRING_PATTERN)) {
@@ -274,7 +285,7 @@ function pythonEffects(code: string): string[] {
 	PYTHON_BASH_CALL_PATTERN.lastIndex = 0;
 	if (!runsCommand) {
 		for (const match of code.matchAll(PYTHON_HANDLE_WAIT_PATTERN)) {
-			push(match.index, "等待命令结果");
+			push(match.index, handleWaitLabel(match[1] ?? match[2], context));
 			break;
 		}
 	}
@@ -305,7 +316,8 @@ function pythonEffects(code: string): string[] {
 	}
 	for (const pattern of [PYTHON_LIST_DIR_PATTERN, PYTHON_PATH_LIST_PATTERN]) {
 		for (const match of code.matchAll(pattern)) {
-			push(match.index, `列目录 ${dirTail(match[1] || ".")}`);
+			const target = match[1] || ".";
+			push(match.index, GLOB_WILDCARD.test(target) ? `查找 ${target}` : `列目录 ${dirTail(target)}`);
 		}
 	}
 	for (const match of code.matchAll(PYTHON_LIST_CWD_PATTERN)) {
@@ -358,9 +370,38 @@ export function isMalformedToolName(name: string): boolean {
 /** How a malformed call reads anywhere a step is named. */
 export const MALFORMED_TOOL_CALL_LABEL = "写错的工具调用";
 
-export function turnStepLabel(step: StepLabelInput): string {
+/** What a label can read beyond its own step: commands started under a handle in earlier cells. */
+export interface StepLabelContext {
+	/** Handle variable → the command its `bash()` call started. */
+	handleCommands?: ReadonlyMap<string, string>;
+}
+
+/**
+ * Waiting on a handle names the command it waits for: `等待 go test ./...`
+ * when an earlier cell started it, else the handle's own name.
+ */
+function handleWaitLabel(name: string | undefined, context: StepLabelContext): string {
+	const command = name ? context.handleCommands?.get(name) : undefined;
+	if (command) {
+		const firstLine = command.split("\n").find((line) => line.trim()) ?? command;
+		return `等待 ${shortenCommand(firstLine)}`;
+	}
+	return name ? `等待 ${name} 的结果` : "等待命令结果";
+}
+
+/** Every `name = bash('…')` handle a cell starts, as [name, command] pairs in source order. */
+export function collectBashHandleCommands(code: string): Array<[string, string]> {
+	const handles: Array<[string, string]> = [];
+	for (const match of code.matchAll(PYTHON_BASH_HANDLE_PATTERN)) {
+		const command = (match[3] ?? "").trim();
+		if (match[1] && command) handles.push([match[1], command]);
+	}
+	return handles;
+}
+
+export function turnStepLabel(step: StepLabelInput, context: StepLabelContext = {}): string {
 	if (isMalformedToolName(step.toolName)) return MALFORMED_TOOL_CALL_LABEL;
-	return withoutTemplateHoles(rawStepLabel(step));
+	return withoutTemplateHoles(rawStepLabel(step, context));
 }
 
 /** Builtins that wrap the value a reader cares about (`print(type(x).__name__)` looks at `x`). */
@@ -426,7 +467,7 @@ export function isFallbackPythonLabel(code: string): boolean {
 	return !/^(read|write|delete|mkdir|rename|replace|touch) (\S+)$/.test(preview.text);
 }
 
-function rawStepLabel(step: StepLabelInput): string {
+function rawStepLabel(step: StepLabelInput, context: StepLabelContext = {}): string {
 	if (step.toolName === "ipython") {
 		const code = argString(step.args, "code");
 		if (!code) {
@@ -437,7 +478,7 @@ function rawStepLabel(step: StepLabelInput): string {
 			return bashCell.body.trim() ? describeShellCommand(bashCell.body) : "运行命令";
 		}
 		const preview = previewIpythonCode(code);
-		const effects = pythonEffects(code);
+		const effects = pythonEffects(code, context);
 		if (effects.length > 0) {
 			return effects.slice(0, MAX_CELL_EFFECTS).join("，");
 		}
@@ -472,6 +513,38 @@ function rawStepLabel(step: StepLabelInput): string {
 		default:
 			return step.toolName;
 	}
+}
+
+/** A step as one feed row's words: `运行` + `npm test`, with any further effects kept aside. */
+export interface StepAction {
+	verb: string;
+	target: string;
+	/** The cell's other effects (`写入 a.md，读取 b.md`), when its label joined several. */
+	more?: string;
+	/** False when the label is only a stand-in and the target shows the cell's own telling line. */
+	recognized: boolean;
+}
+
+/**
+ * The words a feed row uses for a step when the kernel reported no activity
+ * for it. An unrecognised python cell shows its most telling code line (the
+ * preview redacts secrets), never a made-up verb like `设置 W`.
+ */
+export function stepAction(step: StepLabelInput, context: StepLabelContext = {}): StepAction {
+	if (step.toolName === "ipython") {
+		const code = argString(step.args, "code");
+		if (!code) return { verb: "准备", target: "Python", recognized: false };
+		if (isFallbackPythonLabel(code)) {
+			const preview = previewIpythonCode(code).text.trim();
+			return { verb: "运行", target: preview ? `Python · ${preview}` : "Python", recognized: false };
+		}
+	}
+	const label = turnStepLabel(step, context);
+	const [first = label, ...rest] = label.split("，");
+	const space = first.indexOf(" ");
+	const verb = space === -1 ? first : first.slice(0, space);
+	const target = space === -1 ? "" : first.slice(space + 1);
+	return { verb, target, ...(rest.length > 0 ? { more: rest.join("，") } : {}), recognized: true };
 }
 
 /** How a verb counts several distinct objects: `读取 3 个文件`, `运行 5 条命令`. */

@@ -108,6 +108,8 @@ export class FullscreenViewport {
 	private revealMarker: string | undefined;
 	/** Set by {@link setRevealMarker}; cleared once a frame has placed the marked row. */
 	private revealPending = false;
+	/** A click just changed the rows below the clicked transcript line; the next frame keeps that line put. */
+	private clickHold: { line: number; revealBelow: number } | undefined;
 	private prevFrame: string[] = [];
 	private prevWidth = 0;
 	private prevHeight = 0;
@@ -165,6 +167,21 @@ export class FullscreenViewport {
 		} else {
 			this.scrollTop = Math.max(0, Math.min(this.scrollTop, maxScroll));
 		}
+		const hold = this.clickHold;
+		if (hold) {
+			// The clicked row and everything above it are unchanged, so the same
+			// scroll offset keeps it on the same screen row. Only the rows the click
+			// opened below it may pull the window down, and never past the clicked row.
+			this.clickHold = undefined;
+			this.scrollTop = this.revealBelow(
+				this.scrollTop,
+				hold.line,
+				hold.line + hold.revealBelow,
+				windowHeight,
+				maxScroll,
+			);
+			this.following = this.scrollTop >= maxScroll;
+		}
 		const marker = this.revealMarker;
 		if (marker) {
 			const row = transcript.findIndex((line) => line.includes(marker));
@@ -198,6 +215,40 @@ export class FullscreenViewport {
 			window.push("");
 		}
 		return [...headerLines, ...window, ...dockLines];
+	}
+
+	/**
+	 * The scroll offset that shows `endLine` without moving `anchorLine` above the
+	 * window's top row: the anchor wins when the block is taller than the window.
+	 */
+	private revealBelow(
+		scrollTop: number,
+		anchorLine: number,
+		endLine: number,
+		windowHeight: number,
+		maxScroll: number,
+	): number {
+		let top = scrollTop;
+		if (endLine >= top + windowHeight) {
+			top = Math.min(endLine - windowHeight + 1, anchorLine);
+		}
+		if (anchorLine < top) top = anchorLine;
+		return Math.max(0, Math.min(top, maxScroll));
+	}
+
+	/**
+	 * A click on screen row `screenRow` is about to change what renders below
+	 * it: freeze the window where it is (following pauses) so the clicked row
+	 * stays under the pointer, and let the next frame scroll just far enough to
+	 * show `revealBelow` new rows. Clicks outside the transcript window change
+	 * nothing here.
+	 */
+	holdForClick(screenRow: number, revealBelow = 0): void {
+		const line = this.transcriptLineForScreenRow(screenRow, false);
+		if (line === null) return;
+		this.scrollTop = this.following ? this.lastMaxScroll : this.scrollTop;
+		this.following = false;
+		this.clickHold = { line, revealBelow: Math.max(0, revealBelow) };
 	}
 
 	/**
@@ -284,6 +335,19 @@ export class FullscreenViewport {
 	clickTargetAt(screenRow: number, screenCol: number): FrameClickTarget | null {
 		if (screenRow < 0 || screenCol < 0) return null;
 		for (const target of this.frameClickTargets) {
+			if (target.region.passive) continue;
+			if (target.row === screenRow && screenCol >= target.col && screenCol < target.col + target.width) {
+				return target;
+			}
+		}
+		return null;
+	}
+
+	/** The region under a screen position that scrolls its own content with the wheel, or null. */
+	wheelTargetAt(screenRow: number, screenCol: number): FrameClickTarget | null {
+		if (screenRow < 0 || screenCol < 0) return null;
+		for (const target of this.frameClickTargets) {
+			if (!target.region.onWheel) continue;
 			if (target.row === screenRow && screenCol >= target.col && screenCol < target.col + target.width) {
 				return target;
 			}

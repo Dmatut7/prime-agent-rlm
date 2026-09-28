@@ -112,6 +112,20 @@ const ThemeJsonSchema = Type.Object({
 		runCardWarnBg: Type.Optional(ColorValueSchema),
 		chipBg: Type.Optional(ColorValueSchema),
 		toastBg: Type.Optional(ColorValueSchema),
+		// Live activity feed and change/memory cards (optional; fall back to the core colors above)
+		activityText: Type.Optional(ColorValueSchema),
+		activityAccent: Type.Optional(ColorValueSchema),
+		memoryAccent: Type.Optional(ColorValueSchema),
+		churnBar: Type.Optional(ColorValueSchema),
+		diffAddedText: Type.Optional(ColorValueSchema),
+		diffRemovedText: Type.Optional(ColorValueSchema),
+		diffAddedLineBg: Type.Optional(ColorValueSchema),
+		diffRemovedLineBg: Type.Optional(ColorValueSchema),
+		rowFlashBg: Type.Optional(ColorValueSchema),
+		rowFlashFadeBg: Type.Optional(ColorValueSchema),
+		cardFocusBg: Type.Optional(ColorValueSchema),
+		boxBorder: Type.Optional(ColorValueSchema),
+		boxBorderLive: Type.Optional(ColorValueSchema),
 	}),
 	export: Type.Optional(
 		Type.Object({
@@ -192,7 +206,15 @@ export type ThemeColor =
 	| "runCardWarn"
 	| "systemNotice"
 	| "chipText"
-	| "toastText";
+	| "toastText"
+	| "activityText"
+	| "activityAccent"
+	| "memoryAccent"
+	| "churnBar"
+	| "diffAddedText"
+	| "diffRemovedText"
+	| "boxBorder"
+	| "boxBorderLive";
 
 export type ThemeBg =
 	| "selectedBg"
@@ -208,7 +230,12 @@ export type ThemeBg =
 	| "runCardBg"
 	| "runCardWarnBg"
 	| "chipBg"
-	| "toastBg";
+	| "toastBg"
+	| "diffAddedLineBg"
+	| "diffRemovedLineBg"
+	| "rowFlashBg"
+	| "rowFlashFadeBg"
+	| "cardFocusBg";
 
 type ColorMode = "truecolor" | "256color";
 
@@ -802,6 +829,19 @@ const CONVERSATION_LAYER_FALLBACKS: Record<string, string> = {
 	runCardWarnBg: "customMessageBg",
 	chipBg: "selectedBg",
 	toastBg: "toolSuccessBg",
+	activityText: "text",
+	activityAccent: "assistantLabel",
+	memoryAccent: "accent",
+	churnBar: "assistantGutter",
+	diffAddedText: "toolDiffAdded",
+	diffRemovedText: "toolDiffRemoved",
+	diffAddedLineBg: "toolDiffAddedBg",
+	diffRemovedLineBg: "toolDiffRemovedBg",
+	rowFlashBg: "selectedBg",
+	rowFlashFadeBg: "customMessageBg",
+	cardFocusBg: "selectedBg",
+	boxBorder: "borderMuted",
+	boxBorderLive: "borderMuted",
 };
 
 function createTheme(themeJson: ThemeJson, mode?: ColorMode, sourcePath?: string): Theme {
@@ -824,6 +864,11 @@ function createTheme(themeJson: ThemeJson, mode?: ColorMode, sourcePath?: string
 		"runCardWarnBg",
 		"chipBg",
 		"toastBg",
+		"diffAddedLineBg",
+		"diffRemovedLineBg",
+		"rowFlashBg",
+		"rowFlashFadeBg",
+		"cardFocusBg",
 	]);
 	// A theme written before the conversation layers existed still renders them:
 	// each missing layer color borrows the closest core color.

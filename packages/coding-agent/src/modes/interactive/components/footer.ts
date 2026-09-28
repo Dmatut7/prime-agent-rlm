@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import stripAnsi from "strip-ansi";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.js";
 import { theme } from "../theme/theme.js";
 
@@ -52,6 +53,83 @@ export interface FooterTelemetrySnapshot {
 	 * (评审③ - the bar never reports a threshold that does not exist).
 	 */
 	compactionThresholdTokens?: number;
+}
+
+/**
+ * The quiet conversation's status bar, one line under the prompt:
+ * `glm-5.3-prime · 思考 中   上下文 ━━━───── 33%   ◇ 2 个子代理在跑      ⠹ 工作中 · 1分26秒 · ↓ 7.1k tokens · Esc 停止`.
+ */
+export interface StatusBarState {
+	model: string;
+	/** Thinking level in plain words (`中`), when the model reasons. */
+	level?: string;
+	/** Context use; `warn` turns the meter amber. */
+	context?: { percent: number; warn: boolean };
+	/** Where the session runs; the first thing to go on a narrow screen. */
+	location?: string;
+	/** Subagents running right now. */
+	subagents: number;
+	/** The right side, styled, from the fullest form to the shortest. */
+	right: string[];
+}
+
+const CONTEXT_METER_CELLS = 8;
+
+function contextMeter(percent: number, warn: boolean, withBar: boolean): string {
+	const clamped = Math.max(0, Math.min(100, percent));
+	const filled = Math.max(clamped > 0 ? 1 : 0, Math.round((clamped / 100) * CONTEXT_METER_CELLS));
+	const color = warn ? "warning" : "accent";
+	const bar = withBar
+		? ` ${theme.fg(color, "━".repeat(filled))}${theme.fg("dim", "─".repeat(CONTEXT_METER_CELLS - filled))}`
+		: "";
+	return `${theme.fg("dim", "上下文")}${bar} ${theme.fg(warn ? "warning" : "muted", `${Math.round(clamped)}%`)}`;
+}
+
+/** Lay the status bar out in `width` columns, dropping the least useful groups first. */
+/** Width of a line whose numbers keep growing, with each number counted as at least three digits wide. */
+function steadyWidth(text: string): number {
+	let extra = 0;
+	// Colour codes carry digits of their own; only the visible text counts.
+	for (const match of stripAnsi(text).matchAll(/\d+(?:\.\d+)?/g)) extra += Math.max(0, 3 - match[0].length);
+	return visibleWidth(text) + extra;
+}
+
+export function renderStatusBar(state: StatusBarState, width: number, badge?: string): string {
+	const safeWidth = Math.max(1, width);
+	const model = ` ${theme.fg("muted", state.level ? `${state.model} · 思考 ${state.level}` : state.model)}`;
+	const chip = state.subagents > 0 ? theme.fg("activityAccent", `◇ ${state.subagents} 个子代理在跑`) : "";
+	const location = state.location ? theme.fg("dim", state.location) : "";
+	const badgeText = badge ? theme.fg("warning", badge) : "";
+	const meterBar = state.context ? contextMeter(state.context.percent, state.context.warn, true) : "";
+	const meterShort = state.context ? contextMeter(state.context.percent, state.context.warn, false) : "";
+	const join = (...groups: string[]) => groups.filter(Boolean).join(GROUP_GAP);
+	const rights = state.right.length > 0 ? state.right : [""];
+	const right = (index: number) => rights[Math.min(index, rights.length - 1)] ?? "";
+	// Most useful first: the model, what the run is doing, the context, the
+	// subagents; the location and the longer wordings go first when it is tight.
+	const candidates: Array<[string, string]> = [
+		[join(model, meterBar, chip, badgeText, location), right(0)],
+		[join(model, meterBar, chip, badgeText), right(0)],
+		[join(model, meterBar, chip, badgeText), right(1)],
+		[join(model, meterShort, chip, badgeText), right(1)],
+		[join(model, meterShort, chip, badgeText), right(2)],
+		[join(model, meterShort, chip, badgeText), right(3)],
+		[join(model, meterShort, badgeText), right(3)],
+		[join(model, chip), right(3)],
+		[model, right(3)],
+		[model, right(rights.length - 1)],
+		[model, ""],
+	];
+	for (const [left, rightText] of candidates) {
+		const gap = rightText ? 2 : 0;
+		// Counters are measured as if they had at least three digits, so the
+		// layout does not change every time a clock or a count gains a digit.
+		if (visibleWidth(left) + gap + steadyWidth(rightText) + 1 <= safeWidth) {
+			const pad = Math.max(gap, safeWidth - visibleWidth(left) - visibleWidth(rightText) - 1);
+			return `${left}${" ".repeat(pad)}${rightText}${rightText ? " " : ""}`;
+		}
+	}
+	return truncateToWidth(model, safeWidth, "…");
 }
 
 /**
@@ -132,6 +210,7 @@ export class FooterComponent implements Component {
 	private telemetrySource: (() => FooterTelemetrySource) | undefined;
 	private locationSource: (() => FooterLocation | undefined) | undefined;
 	private activitySource: (() => string | undefined) | undefined;
+	private statusBarSource: (() => StatusBarState | undefined) | undefined;
 	private toolErrorCount = 0;
 
 	constructor(private footerData: ReadonlyFooterDataProvider) {
@@ -172,6 +251,14 @@ export class FooterComponent implements Component {
 	/** The live activity (`◈ 运行中 12s`) shown right-aligned before the context figures while a turn runs. */
 	setActivitySource(source: () => string | undefined): void {
 		this.activitySource = source;
+	}
+
+	/**
+	 * The quiet conversation's status bar. While the source returns a state,
+	 * it replaces the watermark line.
+	 */
+	setStatusBarSource(source: (() => StatusBarState | undefined) | undefined): void {
+		this.statusBarSource = source;
 	}
 
 	/** U2: trailing consecutive tool errors; the badge renders from TOOL_ERROR_WARN_THRESHOLD. */
@@ -262,6 +349,14 @@ export class FooterComponent implements Component {
 		const safeWidth = Math.max(1, width);
 		const toolErrorBadge =
 			this.toolErrorCount >= TOOL_ERROR_WARN_THRESHOLD ? `⚠ 工具错误×${this.toolErrorCount}` : undefined;
+		const statusBar = this.statusBarSource?.();
+		if (statusBar) {
+			const lines = [renderStatusBar(statusBar, safeWidth, toolErrorBadge)];
+			if (this.speedEnabled && this.speedText) {
+				lines.push(theme.fg("dim", truncateToWidth(` ${this.speedText}`, safeWidth, "")));
+			}
+			return lines;
+		}
 		// F1 (DS2 review): one width ledger. The badge rides the watermark line,
 		// so the watermark's own ladder runs against the width the badge leaves
 		// - segments still drop whole, never a truncated "5" that reads as a

@@ -200,11 +200,20 @@ export function renderAssistantHeader(options: {
 	live: boolean;
 	tick: number;
 	width: number;
+	/** Model only: the turn's box below carries the clock. */
+	plain?: boolean;
 }): string {
 	// Column 1, the margin every chat row keeps: some terminals clip column 0.
 	const parts = [` ${theme.bold(theme.fg("assistantLabel", "◆ prime"))}`];
 	const facts: string[] = [];
 	if (options.modelId) facts.push(theme.fg("dim", options.modelId));
+	if (options.plain) {
+		return truncateToWidth(
+			facts.length > 0 ? `${parts.join("")}  ${facts.join("")}` : parts.join(""),
+			options.width,
+			"…",
+		);
+	}
 	if (options.live) {
 		facts.push(
 			`${theme.fg("runCardBar", spinnerFrame(options.tick))} ${theme.fg("muted", `working ${turnRunningClockText(options.durationMs)}`)}`,

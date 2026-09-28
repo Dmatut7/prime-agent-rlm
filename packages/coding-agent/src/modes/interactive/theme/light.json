@@ -93,7 +93,20 @@
 		"runCardBg": "#f1eefb",
 		"runCardWarnBg": "#fbf1df",
 		"chipBg": "#e3ddfb",
-		"toastBg": "#ddf3e8"
+		"toastBg": "#ddf3e8",
+		"activityText": "#1f1f24",
+		"activityAccent": "#1e8a74",
+		"memoryAccent": "#6e5bd1",
+		"churnBar": "#9fcfc4",
+		"diffAddedText": "#1a7f37",
+		"diffRemovedText": "#b42318",
+		"diffAddedLineBg": "#e6f6ea",
+		"diffRemovedLineBg": "#fdecec",
+		"rowFlashBg": "#cdeee6",
+		"rowFlashFadeBg": "#e8f6f2",
+		"cardFocusBg": "#e2f2ee",
+		"boxBorder": "#d4d4dc",
+		"boxBorderLive": "#b4b4c2"
 	},
 	"export": {
 		"pageBg": "#f8f8f8",

@@ -366,6 +366,58 @@
 				"toastBg": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Background of the footer transient notice chip (optional)"
+				},
+				"activityText": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Primary text of the live activity feed and change cards (optional)"
+				},
+				"activityAccent": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Accent of the live activity feed: spinner, focus caret, card focus (optional)"
+				},
+				"memoryAccent": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Memory card and memory rows (optional)"
+				},
+				"churnBar": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Churn bar next to changed files in the change card (optional)"
+				},
+				"diffAddedText": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Added lines in inline diffs (optional)"
+				},
+				"diffRemovedText": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Removed lines in inline diffs (optional)"
+				},
+				"diffAddedLineBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Tint behind added lines in inline diffs (optional)"
+				},
+				"diffRemovedLineBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Tint behind removed lines in inline diffs (optional)"
+				},
+				"rowFlashBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "First step of the highlight a new feed row enters with (optional)"
+				},
+				"rowFlashFadeBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Second, fainter step of the new-row highlight (optional)"
+				},
+				"cardFocusBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Background of the focused row in a change or memory card (optional)"
+				},
+				"boxBorder": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Border of a turn's timeline box (optional)"
+				},
+				"boxBorderLive": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Border of the timeline box while the turn runs (optional)"
 				}
 			},
 			"additionalProperties": false

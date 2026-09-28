@@ -69,6 +69,10 @@ function renderAll(container: Container, width = 120): string {
 	return container.children.flatMap((child) => child.render(width)).join("\n");
 }
 
+function stripAnsi(text: string): string {
+	return text.replace(/\u001b\[[0-9;]*m/g, "");
+}
+
 function normalizeRenderedOutput(container: Container, width = 220): string {
 	return renderAll(container, width)
 		.replace(/\u001b\[[0-9;]*m/g, "")
@@ -225,7 +229,7 @@ type RenderSessionContextHarness = {
 	getCachedToolDefinition: () => undefined;
 	getCurrentCwd: () => string;
 	getRetryAttempt: () => number;
-	ui: { requestRender: () => void };
+	ui: { requestRender: () => void; isFullscreen: () => boolean; requestRenderPreservingViewport: () => void };
 	addMessageToChat: (message: AgentMessage, options?: { populateHistory?: boolean }) => void;
 	connectionState?: AgentConnectionState;
 };
@@ -273,7 +277,7 @@ function createRenderSessionContextHarness(overrides: Partial<RenderSessionConte
 		getCachedToolDefinition: () => undefined,
 		getCurrentCwd: () => process.cwd(),
 		getRetryAttempt: () => 0,
-		ui: { requestRender: vi.fn() },
+		ui: { requestRender: vi.fn(), isFullscreen: () => false, requestRenderPreservingViewport: vi.fn() },
 		addMessageToChat,
 		...overrides,
 	};
@@ -356,10 +360,11 @@ describe("InteractiveMode.renderSessionContext", () => {
 			.render(120)
 			.join("\n")
 			.replace(/\u001b\[[0-9;]*m/g, "");
-		expect(line).toContain("│ ▸ 2 steps");
-		// 1000 (first assistant) -> 2000 (abort stamp): 1 second, a fixed value,
-		// on the `◆ prime` header.
-		expect(line).toContain("◆ prime  test-model · 1.0s");
+		// The folded box says the run was stopped and keeps the work done so far.
+		expect(line).toContain("◆ prime  test-model");
+		expect(line).toMatch(/▸ ■ 已停止 · 做到第 2 步/);
+		// 1000 (first assistant) -> 2000 (abort stamp): 1 second, a fixed value.
+		expect(line).toMatch(/1秒 · ↓ \d+ │/);
 		// Frozen: repeated renders reuse the settled cache.
 		const first = summary!.render(120);
 		expect(summary!.render(120)).toBe(first);
@@ -385,10 +390,13 @@ describe("InteractiveMode.renderSessionContext", () => {
 			.render(120)
 			.join("\n")
 			.replace(/\u001b\[[0-9;]*m/g, "");
-		// Still running: the header says working and the running card counts the step.
+		// Still running: the box stays open and waits for the model's next reply,
+		// with the finished step as a settled row.
 		// Column 1: the header keeps the one-column margin every chat row keeps.
-		expect(line).toMatch(/^ ◆ prime .* working /);
-		expect(line).toContain("step 1");
+		expect(line).toMatch(/^ ◆ prime {2}test-model\n/);
+		expect(line).toContain("▾");
+		expect(line).toContain("等待模型回应");
+		expect(line).toMatch(/✓ 运行命令/);
 	});
 
 	test("a rebuild keeps an opened turn open (resync mid-run must not fold Ctrl+O)", async () => {
@@ -407,8 +415,14 @@ describe("InteractiveMode.renderSessionContext", () => {
 				| undefined;
 		const before = findSummary();
 		expect(before).toBeDefined();
-		before!.setExpanded(true);
-		before!.state.thinkingExpanded = true;
+		// The live box starts open; the user opens the step row, then closes the box.
+		expect(before!.state.boxOpen).toBe(true);
+		before!.render(120);
+		const rowKey = before!.getFocusOrder().find((key) => key !== "header");
+		expect(rowKey).toBeDefined();
+		expect(before!.activate(rowKey!)).toBe(true);
+		before!.toggleBox();
+		expect(before!.state.boxOpen).toBe(false);
 
 		await renderMessages(harness, [...messages, { ...toolCallMessage("tool-2", "bash"), timestamp: 2_000 }], {
 			clearChat: true,
@@ -416,8 +430,10 @@ describe("InteractiveMode.renderSessionContext", () => {
 		const after = findSummary();
 		expect(after).toBeDefined();
 		expect(after).not.toBe(before);
-		expect(after!.state.processBlockExpanded).toBe(true);
-		expect(after!.state.thinkingBlockExpanded).toBe(true);
+		// The user's choices ride over the rebuild: still closed, row still open.
+		expect(after!.state.boxOpen).toBe(false);
+		expect(after!.state.processBlockExpanded).toBe(false);
+		expect(after!.state.timeline.ui.expanded.has(rowKey!)).toBe(true);
 		const tools = chatContainer.children.filter((component) => component instanceof ToolExecutionComponent);
 		expect(tools.length).toBe(2);
 	});
@@ -509,7 +525,9 @@ describe("InteractiveMode.renderSessionContext", () => {
 				preloadToolDefinitions: vi.fn(async () => {}),
 				settingsManager: {
 					getShowImages: () => true,
-					getProcessMode: () => "quiet" as const,
+					// The legacy face draws the tool's own output inline (a quiet
+					// turn keeps it inside the box row).
+					getProcessMode: () => "legacy" as const,
 				},
 				getCachedToolDefinition: () => undefined,
 				getCurrentCwd: () => process.cwd(),
@@ -552,7 +570,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 
 		expect(addMessageToChat).toHaveBeenCalledTimes(400);
 		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({ content: "message 5" });
-		expect(renderAll(chatContainer)).toContain("Showing latest 400 of 405 messages for faster open.");
+		expect(renderAll(chatContainer)).toContain("为了打开得快，只显示最近 400 条消息（共 405 条）");
 	});
 
 	test("keeps equal-timestamp legacy messages after the compaction summary", async () => {
@@ -662,7 +680,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 
 		expect(addMessageToChat).toHaveBeenCalledTimes(399);
 		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({ content: "message 0" });
-		expect(renderAll(chatContainer)).toContain("Showing latest 399 of 401 messages for faster open.");
+		expect(renderAll(chatContainer)).toContain("为了打开得快，只显示最近 399 条消息（共 401 条）");
 	});
 
 	test("omits a trailing orphaned tool result without dropping the recent tail", async () => {
@@ -679,7 +697,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({ role: "assistant" });
 		expect(addMessageToChat.mock.calls[1]?.[0]).toMatchObject({ content: "message 1" });
 		expect(addMessageToChat.mock.calls.at(-1)?.[0]).toMatchObject({ content: "message 398" });
-		expect(renderAll(chatContainer)).toContain("Showing latest 400 of 401 messages for faster open.");
+		expect(renderAll(chatContainer)).toContain("为了打开得快，只显示最近 400 条消息（共 401 条）");
 	});
 
 	test("keeps a bounded tool-call context when the recent tail contains only tool results", async () => {
@@ -699,7 +717,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 		expect(addMessageToChat).toHaveBeenCalledOnce();
 		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({ role: "assistant" });
 		expect(harness.preloadToolDefinitions).toHaveBeenCalledWith(Array(399).fill("custom_tool"));
-		expect(renderAll(chatContainer)).toContain("Showing latest 400 of 401 messages for faster open.");
+		expect(renderAll(chatContainer)).toContain("为了打开得快，只显示最近 400 条消息（共 401 条）");
 	});
 });
 
@@ -4963,14 +4981,22 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(rendered).toContain("thinking for rebuild");
 	});
 
-	test("quiet turns: Ctrl+T/O/P stack the three blocks independently (T5)", () => {
-		// A quiet turn (footnote face) built through the replay builder; the
-		// three keys must each flip their own block and never close another.
+	test("quiet turns: Ctrl+T/O/P act on the latest box without closing each other (T5)", () => {
+		// A quiet turn (box face) built through the replay builder: Ctrl+O opens
+		// and closes the box, Ctrl+T opens its thinking rows (opening the box to
+		// show them), Ctrl+P keeps its own comms lane.
 		const chatContainer = new Container();
 		const built = buildConversationComponents(
 			[
 				{ role: "user", content: "stack the blocks", timestamp: 900 },
-				assistantThinking("stack"),
+				{
+					...assistantThinking("stack"),
+					content: [
+						{ type: "thinking", thinking: "First read the failing log. Then decide which check to rerun." },
+						{ type: "text", text: "answer for stack" },
+					],
+					timestamp: 950,
+				},
 				{
 					...toolCallMessage("stack-1", "bash"),
 					timestamp: 1_000,
@@ -5005,32 +5031,41 @@ describe("InteractiveMode.setToolsExpanded", () => {
 
 		const fakeThis = createExpansionFakeThis(chatContainer.children);
 		fakeThis.showStatus = vi.fn();
+		const thinkingRows = () => summary!.state.boxView().rows.filter((row) => row.kind === "think" && row.detail);
+		expect(thinkingRows().length).toBeGreaterThan(0);
+		const thinkingOpen = () => thinkingRows().every((row) => summary!.state.timeline.ui.expanded.has(row.key));
 
-		// Ctrl+T opens the thinking block only.
+		// Ctrl+T opens the thinking rows, and the box so they show.
 		fakeThis.toggleThinkingBlockVisibility();
 		expect(summary!.state.thinkingBlockExpanded).toBe(true);
-		expect(summary!.state.processBlockExpanded).toBe(false);
+		expect(thinkingOpen()).toBe(true);
+		expect(summary!.state.processBlockExpanded).toBe(true);
 		expect(summary!.state.commsBlockExpanded).toBe(false);
 
-		// Ctrl+O opens the process block on top; thinking stays open.
-		fakeThis.toggleToolOutputExpansion();
-		expect(summary!.state.processBlockExpanded).toBe(true);
-		expect(summary!.state.thinkingBlockExpanded).toBe(true);
-
-		// Ctrl+P opens the comms block on top of both.
+		// Ctrl+P opens the comms lane on top.
 		fakeThis.toggleAgentMessageExpansion();
 		expect(summary!.state.commsBlockExpanded).toBe(true);
 		expect(summary!.state.processBlockExpanded).toBe(true);
-		expect(summary!.state.thinkingBlockExpanded).toBe(true);
 
-		// Closing one block leaves the other two open (不互斥).
+		// Ctrl+O closes the box; the opened rows and the comms lane stay as they
+		// were for the next time the box opens (不互斥).
 		fakeThis.toggleToolOutputExpansion();
 		expect(summary!.state.processBlockExpanded).toBe(false);
-		expect(summary!.state.thinkingBlockExpanded).toBe(true);
+		expect(thinkingOpen()).toBe(true);
 		expect(summary!.state.commsBlockExpanded).toBe(true);
+		fakeThis.toggleToolOutputExpansion();
+		expect(summary!.state.processBlockExpanded).toBe(true);
+		expect(thinkingOpen()).toBe(true);
+
+		// The answer never repeats the thinking the box already shows.
+		const assistant = chatContainer.children.find((c) => c instanceof AssistantMessageComponent);
+		expect(assistant).toBeInstanceOf(AssistantMessageComponent);
+		expect(stripAnsi((assistant as AssistantMessageComponent).render(100).join("\n"))).not.toContain(
+			"decide which check",
+		);
 	});
 
-	test("quiet Esc folds the last-opened block first, backwards (T8)", () => {
+	test("quiet Esc folds the last-opened lane of a box first, backwards (T8)", () => {
 		const state = new TurnActivityState(1_000);
 		for (let i = 1; i <= 3; i++) {
 			state.addStep({ toolCallId: `t${i}`, toolName: "bash", args: {}, status: "done" });
@@ -5052,26 +5087,27 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		fakeThis.escapeRepeatAction = undefined;
 		fakeThis.sideQuestionEvent = undefined;
 
-		// Open thinking, then process, then comms - the open order records them.
-		fakeThis.toggleThinkingBlockVisibility();
+		// Open the box, then its thinking, then comms - the open order records them.
+		expect(state.processBlockExpanded).toBe(false);
 		fakeThis.toggleToolOutputExpansion();
+		fakeThis.toggleThinkingBlockVisibility();
 		fakeThis.toggleAgentMessageExpansion();
-		expect(state.thinkingBlockExpanded).toBe(true);
 		expect(state.processBlockExpanded).toBe(true);
+		expect(state.thinkingBlockExpanded).toBe(true);
 		expect(state.commsBlockExpanded).toBe(true);
 
-		// Esc closes the LAST-opened block (comms) first; the others stay.
+		// Esc closes the LAST-opened lane (comms) first; the others stay.
 		fakeThis.handleEscape();
 		expect(state.commsBlockExpanded).toBe(false);
+		expect(state.thinkingBlockExpanded).toBe(true);
 		expect(state.processBlockExpanded).toBe(true);
-		expect(state.thinkingBlockExpanded).toBe(true);
 
-		// Next Esc folds the process block, then the thinking block.
-		fakeThis.handleEscape();
-		expect(state.processBlockExpanded).toBe(false);
-		expect(state.thinkingBlockExpanded).toBe(true);
+		// Next Esc folds the thinking rows, then the box itself.
 		fakeThis.handleEscape();
 		expect(state.thinkingBlockExpanded).toBe(false);
+		expect(state.processBlockExpanded).toBe(true);
+		fakeThis.handleEscape();
+		expect(state.processBlockExpanded).toBe(false);
 
 		// Nothing left to fold: Esc falls through to the pre-v4 behavior.
 		expect(fakeThis.interruptOrClearInput).not.toHaveBeenCalled();
@@ -5116,7 +5152,7 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(fakeThis.interruptOrClearInput).toHaveBeenCalledOnce();
 	});
 
-	test("quiet Ctrl+O cycles closed → key steps → all steps (T6)", () => {
+	test("quiet Ctrl+O opens and closes the latest box as a whole (T6)", () => {
 		const state = new TurnActivityState(1_000);
 		for (let i = 1; i <= 14; i++) {
 			state.addStep({ toolCallId: `t${i}`, toolName: "bash", args: {}, status: "done" });
@@ -5130,17 +5166,16 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		fakeThis.uiServices = { settingsManager: { getProcessMode: () => "quiet" as const } };
 
 		expect(summary.state.isCollapsed).toBe(true);
-		// Closed → key steps: the >8 fold arms.
+		const bodyRows = () => stripAnsi(summary.render(120).join("\n")).split("\n").length;
+		const closedHeight = bodyRows();
 		fakeThis.toggleToolOutputExpansion();
 		expect(summary.state.processBlockExpanded).toBe(true);
-		expect(summary.state.processKeyStepsView).toBe(true);
-		// Key steps → all steps.
-		fakeThis.toggleToolOutputExpansion();
-		expect(summary.state.processKeyStepsView).toBe(false);
-		expect(summary.state.processBlockExpanded).toBe(true);
-		// All steps → closed.
+		// The body scrolls inside the box instead of listing all 14 steps.
+		expect(bodyRows()).toBeGreaterThan(closedHeight);
+		expect(bodyRows()).toBeLessThan(closedHeight + 14 + 2);
 		fakeThis.toggleToolOutputExpansion();
 		expect(summary.state.processBlockExpanded).toBe(false);
+		expect(bodyRows()).toBe(closedHeight);
 	});
 
 	test("legacy Ctrl+O stays binary (T6)", () => {

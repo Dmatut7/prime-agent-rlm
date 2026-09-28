@@ -32,7 +32,7 @@ export class CustomEditor extends Editor {
 	private readonly isArgumentCommand: (name: string) => boolean;
 	private readonly hintColor: (text: string) => string;
 	private readonly argTokenHighlighter = new ArgTokenHighlighter();
-	public actionHandlers: Map<AppKeybinding, () => void> = new Map();
+	public actionHandlers: Map<AppKeybinding, () => unknown> = new Map();
 
 	// Special handlers that can be dynamically replaced
 	public onEscape?: () => void;
@@ -145,9 +145,10 @@ export class CustomEditor extends Editor {
 	}
 
 	/**
-	 * Register a handler for an app action.
+	 * Register a handler for an app action. A handler that returns `false`
+	 * declines the key, and the next action bound to the same key gets it.
 	 */
-	onAction(action: AppKeybinding, handler: () => void): void {
+	onAction(action: AppKeybinding, handler: () => unknown): void {
 		this.actionHandlers.set(action, handler);
 	}
 
@@ -269,7 +270,7 @@ export class CustomEditor extends Editor {
 				if ((action === "app.clear" || action === "app.interrupt") && this.isShowingAutocomplete()) {
 					this.cancelAutocomplete();
 				}
-				handler();
+				if (handler() === false) continue;
 				return;
 			}
 		}

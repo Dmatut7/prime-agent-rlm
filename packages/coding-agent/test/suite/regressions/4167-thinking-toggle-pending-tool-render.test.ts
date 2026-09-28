@@ -2,13 +2,15 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage, Usage } from "@earendil-works/pi-ai";
 import { Container, Text, type TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
-import { beforeAll, describe, expect, test, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 import type {
 	AgentConnectionSessionContext,
 	AgentConnectionSessionEvent,
 } from "../../../src/modes/agent-connection/index.js";
 import { AgentActivityTracker } from "../../../src/modes/interactive/agent-activity.js";
+import { setMotionReduced } from "../../../src/modes/interactive/components/motion.js";
 import { ToolExecutionComponent } from "../../../src/modes/interactive/components/tool-execution.js";
+import { TurnSummaryComponent } from "../../../src/modes/interactive/components/turn-activity.js";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
 
@@ -83,7 +85,11 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 		},
 		chatContainer,
 		footer: { invalidate: vi.fn() },
-		ui: { requestRender: vi.fn() } as unknown as TUI,
+		ui: {
+			requestRender: vi.fn(),
+			isFullscreen: () => false,
+			requestRenderPreservingViewport: vi.fn(),
+		} as unknown as TUI,
 		settingsManager: {
 			getShowImages: () => false,
 			getProcessMode: () => "quiet",
@@ -151,19 +157,31 @@ function renderChat(container: Container): string {
 }
 
 function expandRenderedToolComponents(container: Container): void {
+	const boxes = container.children.filter((child) => child instanceof TurnSummaryComponent);
+	// The quiet conversation shows each step as a row in its turn's box: open
+	// the box and every row to assert the result the live event / replay delivered.
+	expect(boxes.length).toBeGreaterThan(0);
+	for (const box of boxes) {
+		if (!box.state.boxOpen) box.toggleBox();
+		box.render(120);
+		const rows = box.getFocusOrder().filter((key) => key !== "header");
+		expect(rows.length).toBeGreaterThan(0);
+		for (const key of rows) box.activate(key);
+	}
 	for (const child of container.children) {
-		if (child instanceof ToolExecutionComponent) {
-			// U4 (41a4bdf24): settled tool blocks hide behind the turn's aggregate
-			// line while collapsed; expand the row to assert the result the live
-			// event / replay delivered. Mirrors the id3 adaptation of the same lane.
-			child.setExpanded(true);
-		}
+		if (child instanceof ToolExecutionComponent) child.setExpanded(true);
 	}
 }
 
 describe("InteractiveMode.renderSessionContext", () => {
 	beforeAll(() => {
 		initTheme("dark");
+		// An opened row shows all its lines at once (no slide-in to wait for).
+		setMotionReduced(true);
+	});
+
+	afterAll(() => {
+		setMotionReduced(false);
 	});
 
 	test("keeps unresolved rendered tool calls registered for live completion events", async () => {

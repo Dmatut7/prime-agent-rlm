@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { turnStepLabel, turnStepsSummary } from "../src/modes/interactive/components/step-label.js";
+import {
+	collectBashHandleCommands,
+	turnStepLabel,
+	turnStepsSummary,
+} from "../src/modes/interactive/components/step-label.js";
 
 const cell = (code: string) => ({ toolName: "ipython", args: { code } });
 
@@ -222,7 +226,7 @@ describe("shell and helper labels (QA M3)", () => {
 	});
 
 	it("names kernel helper calls", () => {
-		expect(cell("r = await h")).toBe("等待命令结果");
+		expect(cell("r = await h")).toBe("等待 h 的结果");
 		expect(cell("print(tui[79900:81300])")).toBe("查看输出");
 		expect(cell("obs = await agent_observe.get_agent('tui-v5-reviewer')")).toBe("查看子代理 tui-v5-reviewer");
 		expect(cell("await agent_message.send('done', receiver_role='child', receiver_name='docs')")).toBe(
@@ -230,6 +234,24 @@ describe("shell and helper labels (QA M3)", () => {
 		);
 		expect(cell("await agent_message.send('hi', receiver_role='parent')")).toBe("发消息");
 		expect(cell("h = bash('npm run check')\nprint(h.tail(20))")).toBe("运行 npm run check");
+	});
+
+	it("names the command a handle wait is waiting for, from the cell that started it", () => {
+		const handles = new Map(collectBashHandleCommands("h = bash('go test ./modules/aichat/...')\nprint('started')"));
+		expect(handles.get("h")).toBe("go test ./modules/aichat/...");
+		expect(turnStepLabel({ toolName: "ipython", args: { code: "r = await h" } }, { handleCommands: handles })).toBe(
+			"等待 go test ./modules/aichat/...",
+		);
+		expect(
+			turnStepLabel({ toolName: "ipython", args: { code: "print(h.tail(5))" } }, { handleCommands: handles }),
+		).toBe("等待 go test ./modules/aichat/...");
+	});
+
+	it("reads a glob as a search and a python -c list as python", () => {
+		expect(cell("import glob\nfiles = glob.glob('*.py')")).toBe("查找 *.py");
+		expect(cell("subprocess.run([sys.executable, '-c', 'from datetime import date'])")).toBe(
+			"运行 python -c from datetime import date",
+		);
 	});
 
 	describe("round-3 labels", () => {

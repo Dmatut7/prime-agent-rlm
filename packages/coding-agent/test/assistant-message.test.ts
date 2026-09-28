@@ -380,7 +380,23 @@ describe("AssistantMessageComponent streaming identity", () => {
 		}
 	});
 
-	test("quiet turns indent opened thinking traces under the process line; the answer runs down the rail", () => {
+	test("a quiet turn leaves a model error to its box row, except a login hint", () => {
+		initTheme("dark");
+		const failed = {
+			...createAssistantMessage([]),
+			stopReason: "error" as const,
+			errorMessage: "503 upstream overloaded",
+		};
+		const render = (quiet: boolean) =>
+			new AssistantMessageComponent(failed, false, undefined, "Thinking", { quiet })
+				.render(80)
+				.map((line) => stripAnsi(line))
+				.join("\n");
+		expect(render(false)).toContain("Error: 503 upstream overloaded");
+		expect(render(true)).not.toContain("503 upstream overloaded");
+	});
+
+	test("quiet turns indent opened thinking traces; the answer keeps the one-column margin", () => {
 		initTheme("dark");
 		const message = createAssistantMessage([
 			{ type: "thinking" as const, thinking: "weighing options" },
@@ -392,7 +408,9 @@ describe("AssistantMessageComponent streaming identity", () => {
 		})
 			.render(80)
 			.map((line) => stripAnsi(line));
-		expect(lines.find((line) => line.includes("weighing options"))?.startsWith(" │   weighing")).toBe(true);
-		expect(lines.find((line) => line.includes("the answer"))?.startsWith(" │ the answer")).toBe(true);
+		expect(lines.find((line) => line.includes("weighing options"))?.startsWith("   weighing")).toBe(true);
+		expect(lines.find((line) => line.includes("the answer"))?.startsWith(" the answer")).toBe(true);
+		// The answer sits under the turn's box, with no rail beside it.
+		expect(lines.some((line) => line.includes("│"))).toBe(false);
 	});
 });
