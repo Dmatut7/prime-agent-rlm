@@ -13,7 +13,7 @@ import {
 import { sanitizeDisplayText } from "./diff-rows.js";
 import { cleanMemoryTitle } from "./feed-data.js";
 import { memoryDetail } from "./timeline-rows.js";
-import { BOX_MAX_WIDTH } from "./turn-box.js";
+import { boxOuterWidth, fitBoxLines } from "./turn-box.js";
 
 /**
  * What the refiner kept after a turn, as one violet line in plain words:
@@ -150,7 +150,7 @@ export class RefinementOutcomeMessageComponent implements Component, FocusableBl
 		});
 		if (!this.expanded) return lines;
 
-		const outer = Math.max(24, Math.min(safeWidth - 1, BOX_MAX_WIDTH));
+		const outer = boxOuterWidth(safeWidth);
 		const inner = outer - 4;
 		const border = (text: string) => theme.fg("boxBorder", text);
 		const boxLine = (content: string): string => {
@@ -194,7 +194,7 @@ export class RefinementOutcomeMessageComponent implements Component, FocusableBl
 			}
 		}
 		lines.push(` ${border(`╰${"─".repeat(outer - 2)}╯`)}`);
-		return lines;
+		return fitBoxLines(lines, safeWidth);
 	}
 }
 

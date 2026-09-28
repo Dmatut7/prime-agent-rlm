@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path";
+import { MAX_ACTIVITIES_PER_CELL } from "../../../core/kernel/effects.js";
 import type {
 	KernelActivity,
 	KernelDiffDisplay,
@@ -22,6 +23,8 @@ import { formatFileChangePath } from "./edit-summary.js";
  */
 export interface StepFeedData {
 	activities: KernelActivity[];
+	/** Earlier steps of the cell the kernel no longer lists (it keeps the most recent ones). */
+	activitiesDropped?: number;
 	/** Present once any result carried the kernel's file-change list: it then replaces `legacyDiffs`. */
 	fileChanges?: KernelFileChange[];
 	memoryChanges: KernelMemoryChange[];
@@ -96,6 +99,7 @@ function readActivity(value: unknown): KernelActivity | undefined {
 	}
 	const detail = stringField(value, "detail");
 	const endedAt = numberField(value, "endedAt");
+	const commit = stringField(value, "commit");
 	return {
 		id,
 		kind,
@@ -105,6 +109,7 @@ function readActivity(value: unknown): KernelActivity | undefined {
 		...(detail !== undefined ? { detail } : {}),
 		...(endedAt !== undefined ? { endedAt } : {}),
 		...(value.background === true ? { background: true as const } : {}),
+		...(commit !== undefined && /^[0-9a-f]{7,40}$/i.test(commit) ? { commit } : {}),
 	};
 }
 
@@ -137,7 +142,9 @@ function readFileChange(value: unknown): KernelFileChange | undefined {
 	if (value.diffTruncated === true) change.diffTruncated = true;
 	if (value.binary === true) change.binary = true;
 	const omitted = stringField(value, "diffOmitted");
-	if (omitted === "too_large" || omitted === "no_baseline" || omitted === "budget") change.diffOmitted = omitted;
+	if (omitted === "too_large" || omitted === "no_baseline" || omitted === "budget" || omitted === "sensitive") {
+		change.diffOmitted = omitted;
+	}
 	return change;
 }
 
@@ -167,6 +174,7 @@ function readMemoryChange(value: unknown): KernelMemoryChange | undefined {
 	if (previousTitle) change.previousTitle = previousTitle;
 	if (before !== undefined) change.before = before;
 	if (after !== undefined) change.after = after;
+	if (value.textOmitted === "sensitive") change.textOmitted = "sensitive";
 	return change;
 }
 
@@ -193,6 +201,31 @@ function mergeActivities(previous: readonly KernelActivity[], incoming: readonly
 	const byId = new Map(previous.map((activity) => [activity.id, activity] as const));
 	for (const activity of incoming) byId.set(activity.id, activity);
 	return [...byId.values()];
+}
+
+/**
+ * The steps the kernel still lists once it started dropping: its cap, the oldest finished steps
+ * going first, the way the kernel drops them.
+ */
+function keepNewest(activities: KernelActivity[]): KernelActivity[] {
+	let excess = activities.length - MAX_ACTIVITIES_PER_CELL;
+	if (excess <= 0) return activities;
+	const drop = new Set<KernelActivity>();
+	for (const activity of activities) {
+		if (excess <= 0) break;
+		if (activity.status !== "running") {
+			drop.add(activity);
+			excess--;
+		}
+	}
+	for (const activity of activities) {
+		if (excess <= 0) break;
+		if (!drop.has(activity)) {
+			drop.add(activity);
+			excess--;
+		}
+	}
+	return activities.filter((activity) => !drop.has(activity));
 }
 
 function lastMeaningfulLine(text: string): string | undefined {
@@ -227,7 +260,14 @@ export function mergeStepResult(
 	const next: StepFeedData = { ...previous };
 	const details = isRecord(result.details) ? result.details : {};
 	const activities = readList(details.activities, readActivity);
-	if (activities) next.activities = mergeActivities(previous.activities, activities);
+	const dropped = numberField(details, "activitiesDropped");
+	if (dropped !== undefined && dropped > 0) next.activitiesDropped = Math.floor(dropped);
+	// Live updates carry new and changed steps (merged by id); the final result lists every step
+	// the kernel kept, so it replaces what the live updates showed.
+	if (activities) {
+		next.activities = partial ? mergeActivities(previous.activities, activities) : activities;
+		if (partial && next.activitiesDropped !== undefined) next.activities = keepNewest(next.activities);
+	}
 	const fileChanges = readList(details.fileChanges, readFileChange);
 	if (fileChanges) next.fileChanges = fileChanges;
 	const memoryChanges = readList(details.memoryChanges, readMemoryChange);
@@ -293,6 +333,7 @@ const COMMIT_OUTPUT = /\[[^\]\s]+(?: \([^)]*\))? ([0-9a-f]{7,40})\]/;
 /** The short id of a commit the step made, when its output says so. */
 export function commitIdFromStep(data: StepFeedData, stepText: string): string | undefined {
 	for (const activity of data.activities) {
+		if (activity.commit && activity.status === "ok") return activity.commit.slice(0, 7);
 		if (activity.kind !== "command" || !/\bgit\s+commit\b/.test(activity.label)) continue;
 		const sha = /\b([0-9a-f]{7,40})\b/.exec(activity.detail ?? "")?.[1];
 		if (sha) return sha.slice(0, 7);

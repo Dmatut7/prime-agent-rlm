@@ -45,6 +45,23 @@ export const SLOW_STEP_MS = 60_000;
 /** Zero-width marker on the focused line, so the fullscreen viewport can scroll it into view. */
 export const BOX_FOCUS_MARKER = "\x1b_pi:box-focus\x07";
 
+/** Narrowest frame drawn whole: its borders, padding and no content. */
+const BOX_MIN_OUTER = 4;
+
+/** The frame's width for `width` columns (the line also has a one-column margin). */
+export function boxOuterWidth(width: number): number {
+	return Math.max(BOX_MIN_OUTER, Math.min(Math.floor(width) - 1, BOX_MAX_WIDTH));
+}
+
+/**
+ * The lines cut to `width` columns. A frame narrower than {@link BOX_MIN_OUTER}
+ * cannot be drawn whole, and a line wider than the terminal breaks the screen.
+ */
+export function fitBoxLines(lines: string[], width: number): string[] {
+	const room = Math.max(1, Math.floor(width));
+	return lines.map((line) => (visibleWidth(line) > room ? truncateToWidth(line, room, "") : line));
+}
+
 /** How tall the body may get for a terminal of `rows` rows. */
 export function boxBodyRows(terminalRows: number): number {
 	return Math.max(BOX_BODY_MIN_ROWS, Math.min(BOX_BODY_MAX_ROWS, Math.floor(terminalRows) - 12));
@@ -260,7 +277,7 @@ function thinkWindow(text: string, width: number): string[] {
 export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 	const { timeline, rows, now } = input;
 	const ui = timeline.ui;
-	const outer = Math.max(24, Math.min(input.width - 1, BOX_MAX_WIDTH));
+	const outer = boxOuterWidth(input.width);
 	const inner = outer - 4;
 	const borderColor: ThemeColor = ui.focused ? "activityAccent" : input.live ? "boxBorderLive" : "boxBorder";
 	const border = (text: string) => theme.fg(borderColor, text);
@@ -285,9 +302,10 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		return ` ${border("│")}${bg ? theme.bg(bg, padded) : padded}${border("│")}`;
 	};
 	const rule = (left: string, right: string, label = "", labelColor: ThemeColor = "dim"): string => {
-		const labelText = label ? ` ${label} ` : "";
-		const fill = Math.max(0, outer - 2 - visibleWidth(labelText) - (label ? 2 : 0));
-		return ` ${border(left)}${label ? `${border("──")}${theme.fg(labelColor, labelText)}` : ""}${border("─".repeat(fill))}${border(right)}`;
+		// A label that does not fit the rule is left out; the rule itself always fits.
+		const labelText = label && visibleWidth(label) + 4 <= outer - 2 ? ` ${label} ` : "";
+		const fill = Math.max(0, outer - 2 - visibleWidth(labelText) - (labelText ? 2 : 0));
+		return ` ${border(left)}${labelText ? `${border("──")}${theme.fg(labelColor, labelText)}` : ""}${border("─".repeat(fill))}${border(right)}`;
 	};
 
 	// Header: caret, status glyph, what is happening (or what happened), clock and tokens.
@@ -482,5 +500,5 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 			onWheel,
 		});
 	});
-	return { lines, regions, focusOrder };
+	return { lines: fitBoxLines(lines, input.width), regions, focusOrder };
 }
