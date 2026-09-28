@@ -618,7 +618,8 @@ class BackgroundCommandTests(TrackerCase):
         left = self._command(first)
         self.assertEqual(left["status"], "running")
         self.assertTrue(left["background"])
-        self.assertEqual(left["detail"], effects.BACKGROUND_DETAIL)
+        # The host words the hand-off itself, from `background`; the runtime sends no screen text.
+        self.assertNotIn("detail", left)
         self.assertGreaterEqual(left["endedAt"], left["startedAt"])
         second = self.kernel.run("import time\ntime.sleep(1.5)")
         done = second.activities()[left["id"]]
@@ -640,6 +641,14 @@ class BackgroundCommandTests(TrackerCase):
         self.assertEqual(first_record["status"], "error")
         self.assertTrue(first_record["background"])
         self.assertTrue(first_record["detail"].startswith("exit 3"))
+
+    def test_a_command_left_running_does_not_keep_its_cell_alive(self):
+        # A dev server runs for hours; its cell's snapshots and file baselines must not live as long.
+        self.kernel.run("h = bash('sleep 5')\nh.pid")
+        cell = self.kernel.run("import gc\ngc.collect()\nsum(type(o).__name__ == '_Cell' for o in gc.get_objects())")
+        result = next(e for e in cell.events if e.get("event") == "result")
+        self.assertEqual(result["text"], "1")  # the running cell only
+        self.kernel.run("h.kill()")
 
     def test_an_awaited_command_is_never_marked_background(self):
         cell = self.kernel.run("await bash('echo hi')")
@@ -667,6 +676,11 @@ class BackgroundCommandTests(TrackerCase):
         self.assertIsNone(effects._commit_id("git commit -m x", 1, output))
         self.assertIsNone(effects._commit_id("echo '[main 1a2b3c4] x'", 0, "[main 1a2b3c4] x\n"))
         self.assertEqual(effects._commit_id("git cherry-pick abc", 0, "[detached HEAD 0123abc] pick\n"), "0123abc")
+        self.assertEqual(effects._commit_id("git commit -m x", 0, "[feature/x 1a2b3c4] x\n"), "1a2b3c4")
+        # Bracketed hex that is not git's `[<branch> <sha>]` line.
+        self.assertIsNone(effects._commit_id("git log -1", 0, "[build/deadbeef1] x\n"))
+        self.assertIsNone(effects._commit_id("git log -1", 0, "[deadbeef123] x\n"))
+        self.assertIsNone(effects._commit_id("git log -1", 0, "[main] 1a2b3c4] x\n"))
 
 
 @unittest.skipUnless(HAS_GIT, "git is needed for the work-tree comparison")
@@ -694,6 +708,34 @@ case " $* " in
 esac
 exec "{real}" "$@"
 """
+# A `git` whose `check-ignore` is slower than a watcher tick, and never answers while the marker exists.
+_SLOW_IGNORE_GIT = """#!/bin/sh
+case " $* " in
+  *" check-ignore "*) if [ -f "$SLOW_GIT_MARKER" ]; then exec sleep 5; fi; sleep 0.15 ;;
+esac
+exec "{real}" "$@"
+"""
+
+
+def _fake_git_env(tmp: str, script: str) -> dict[str, str]:
+    fake_bin = os.path.join(tmp, "fake-bin")
+    os.makedirs(fake_bin)
+    fake = os.path.join(fake_bin, "git")
+    with open(fake, "w") as handle:
+        handle.write(script.format(real=shutil.which("git")))
+    os.chmod(fake, 0o755)
+    # The first run of a freshly written executable can take ~0.4 s on macOS while the system
+    # vets it; pay that here, or the fixture itself looks like a slow git to the budget.
+    subprocess.run([fake, "--version"], check=True, capture_output=True, timeout=30)
+    return {
+        "PATH": fake_bin + os.pathsep + os.environ.get("PATH", ""),
+        "SLOW_GIT_MARKER": os.path.join(tmp, "slow-git"),
+    }
+
+
+# Past the budget, what a cell may cost on top: kernel round trip and scheduling. A tracker that
+# waited for git twice (or for git's own timeout) overshoots it.
+_BUDGET_SLACK_S = 0.35
 
 
 @unittest.skipUnless(HAS_GIT and os.name == "posix", "needs git and a POSIX shell")
@@ -701,17 +743,9 @@ class SlowGitTests(TrackerCase):
     """A slow `git status` (a huge repository, a cold disk) may cost a cell at most its budget."""
 
     def kernel_env(self) -> dict[str, str]:
-        fake_bin = os.path.join(self.tmp, "fake-bin")
-        os.makedirs(fake_bin)
-        fake = os.path.join(fake_bin, "git")
-        with open(fake, "w") as handle:
-            handle.write(_SLOW_GIT.format(real=shutil.which("git")))
-        os.chmod(fake, 0o755)
-        # The first run of a freshly written executable can take ~0.4 s on macOS while the system
-        # vets it; pay that here, or the fixture itself looks like a slow git to the budget.
-        subprocess.run([fake, "--version"], check=True, capture_output=True, timeout=30)
-        self.marker = os.path.join(self.tmp, "slow-git")
-        return {"PATH": fake_bin + os.pathsep + os.environ.get("PATH", ""), "SLOW_GIT_MARKER": self.marker}
+        env = _fake_git_env(self.tmp, _SLOW_GIT)
+        self.marker = env["SLOW_GIT_MARKER"]
+        return env
 
     def slow(self, on: bool) -> None:
         if on:
@@ -744,7 +778,7 @@ class SlowGitTests(TrackerCase):
         finally:
             self.slow(False)
         self.assertEqual(cell.stdout().strip(), "0")
-        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + 1.0)
+        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + _BUDGET_SLACK_S)
         self.assertIn("snapshot", cell.payloads(STATUS)[0]["incomplete"])
         # Without a trustworthy before-state the command's edit is not guessed at.
         self.assertNotIn("y.txt", cell.by_rel())
@@ -763,10 +797,129 @@ class SlowGitTests(TrackerCase):
         )
         self.slow(False)
         self.assertEqual(cell.status, "ok")
-        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + 1.0)
+        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + _BUDGET_SLACK_S)
         self.assertIn("comparing", cell.payloads(STATUS)[0]["incomplete"])
         # Python's own writes do not depend on git and are still listed.
         self.assertEqual(cell.by_rel()["p.txt"]["kind"], "created")
+
+
+@unittest.skipUnless(HAS_GIT and os.name == "posix", "needs git and a POSIX shell")
+class SlowIgnoreCheckTests(TrackerCase):
+    """`git check-ignore` slower than a watcher tick must not let an ignored file through."""
+
+    def kernel_env(self) -> dict[str, str]:
+        env = _fake_git_env(self.tmp, _SLOW_IGNORE_GIT)
+        self.marker = env["SLOW_GIT_MARKER"]
+        return env
+
+    def test_an_ignored_file_is_never_listed_when_the_ignore_check_is_slow(self):
+        cell = self.kernel.run(
+            "import time\nopen('ignored.txt', 'w').write('x')\nopen('seen.txt', 'w').write('y')\ntime.sleep(1.0)"
+        )
+        # Not even for a moment: no live record either.
+        self.assertEqual([r for r in cell.payloads(FILE) if r.get("relPath") == "ignored.txt"], [])
+        self.assertEqual(sorted(cell.by_rel()), ["seen.txt"])
+        self.assertEqual(cell.payloads(STATUS), [])
+
+    def test_an_ignore_check_that_never_answers_lists_the_file_and_says_so(self):
+        open(self.marker, "w").close()
+        started = time.time()
+        cell = self.kernel.run("open('ignored.txt', 'w').write('x')")
+        elapsed = time.time() - started
+        self.assertEqual(sorted(cell.by_rel()), ["ignored.txt"])
+        status = cell.payloads(STATUS)
+        self.assertEqual(len(status), 1, status)
+        self.assertIn("ignores", status[0]["incomplete"])
+        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + _BUDGET_SLACK_S)
+
+
+# Drives the tracker's public API in a fresh interpreter, recording every record it sends and
+# whether that record's cell had already ended (the kernel sends `done` right after end_cell).
+_DRIVER_PRELUDE = """
+import json, os, sys, threading, time
+from rlm import effects
+sent = []
+ended = set()
+slow = None
+def send(cell_id, data):
+    if slow is not None:
+        slow(data)
+    sent.append({"cell": cell_id, "afterDone": cell_id in ended, "data": data})
+"""
+
+
+def _drive_tracker(test: unittest.TestCase, body: str) -> list[dict]:
+    tmp = os.path.realpath(tempfile.mkdtemp(prefix="rlm-driver-"))
+    test.addCleanup(shutil.rmtree, tmp, True)
+    env = {k: v for k, v in os.environ.items() if not k.startswith(_LEAKED_PREFIXES)}
+    env["PYTHONPATH"] = SRC + os.pathsep + os.environ.get("PYTHONPATH", "")
+    env["PRIME_AGENT_CODING_AGENT_DIR"] = os.path.join(tmp, "agent")
+    script = _DRIVER_PRELUDE + body + "\nprint(json.dumps(sent))\n"
+    proc = subprocess.run(
+        [sys.executable, "-c", script], cwd=tmp, env=env, capture_output=True, text=True, timeout=60
+    )
+    test.assertEqual(proc.returncode, 0, proc.stderr)
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def _activities(sent: list[dict]) -> list[dict]:
+    return [{"cell": r["cell"], "afterDone": r["afterDone"], **r["data"][ACTIVITY]} for r in sent if ACTIVITY in r["data"]]
+
+
+class CommandHandOffTests(unittest.TestCase):
+    def test_a_command_ending_as_its_cell_ends_never_reports_after_the_cells_done(self):
+        sent = _drive_tracker(
+            self,
+            """
+def slow_final(data):
+    record = data.get(effects.ACTIVITY_MIME)
+    if record is not None and record["status"] != "running":
+        time.sleep(0.3)  # the command's final record is still on its way when the cell ends
+slow = slow_final
+assert effects.install(send, os.getcwd())
+effects.begin_cell("c1")
+command = effects.command_started("make")
+threading.Thread(target=command.finish, args=(0, "all done\\n")).start()
+time.sleep(0.05)
+effects.end_cell("c1")
+ended.add("c1")
+time.sleep(0.5)
+effects.begin_cell("c2")
+effects.end_cell("c2")
+ended.add("c2")
+""",
+        )
+        records = _activities(sent)
+        self.assertTrue(records)
+        # Whatever cell carries it, the outcome reaches the host before that cell's `done`.
+        self.assertEqual([r for r in records if r["afterDone"]], [])
+        self.assertEqual([r["status"] for r in records if r["status"] != "running"], ["ok"])
+
+    def test_background_completions_past_the_cap_keep_the_newest_and_say_some_were_lost(self):
+        extra = 6
+        sent = _drive_tracker(
+            self,
+            f"""
+assert effects.install(send, os.getcwd())
+effects.begin_cell("c1")
+commands = [effects.command_started(f"job {{i}}") for i in range(effects.MAX_PENDING_COMPLETIONS + {extra})]
+effects.end_cell("c1")
+ended.add("c1")
+for command in commands:
+    command.finish(0, "ok\\n")
+effects.begin_cell("c2")
+effects.end_cell("c2")
+ended.add("c2")
+""",
+        )
+        records = _activities(sent)
+        started = sorted({r["id"] for r in records if r["cell"] == "c1"}, key=lambda i: int(i.split("-")[1]))
+        self.assertEqual(len(started), effects.MAX_PENDING_COMPLETIONS + extra)
+        reported = [r["id"] for r in records if r["cell"] == "c2" and r["status"] == "ok"]
+        self.assertEqual(reported, started[extra:])
+        status = [r["data"][STATUS] for r in sent if r["cell"] == "c2" and STATUS in r["data"]]
+        self.assertEqual(len(status), 1, status)
+        self.assertIn(f"{extra} background commands", status[0]["incomplete"])
 
 
 class BudgetTests(TrackerCase):

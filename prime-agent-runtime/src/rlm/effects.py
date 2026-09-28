@@ -93,9 +93,8 @@ SNAPSHOT_CONTENT_BYTES = 4 << 20
 CONTENT_CACHE_BYTES = 8 << 20
 CONTENT_CACHE_ENTRIES = 512
 COMMAND_UPDATE_INTERVAL_S = 0.5
-# The detail of a command still running when its cell ends ("moved to the background, still running").
-BACKGROUND_DETAIL = "转到后台继续跑"
-# Completions of background commands held while no cell is running, sent at the next cell's start.
+# Completions of background commands held while no cell is running, sent at the next cell's start;
+# past it the oldest are dropped and that cell says how many were lost.
 MAX_PENDING_COMPLETIONS = 64
 _PATH_CACHE_LIMIT = 4096
 
@@ -381,6 +380,9 @@ _SNAPSHOT_LATE = (
     "the git snapshot before a command did not finish within the tracking budget, "
     "so changes made by commands in this cell are not listed"
 )
+_IGNORE_UNKNOWN = (
+    "git did not say in time which files it ignores, so files it ignores may be listed"
+)
 _COMPARE_LATE = (
     "comparing the files commands changed took longer than the tracking budget, "
     "so changes made by commands in this cell are not listed"
@@ -631,6 +633,7 @@ class _Tracker:
         self.skip_roots: tuple[str, ...] = ()
         self.cwd_git_root: str | None = None
         self.pending_completions: list[dict[str, Any]] = []
+        self.lost_completions = 0
         # Resolved once, off every cell's path: a slow or hung git must not stall a write wrapper.
         self._cwd_git_resolved = threading.Event()
         self._refresh_paths()
@@ -831,20 +834,30 @@ class _Tracker:
                 self.cache.put(path, sig, data)
         return _RepoState(root, oid, entries, stats)
 
-    def filter_ignored(self, recs: list[_FileRec], deadline: float) -> None:
-        """Mark records for files the repository ignores; one `git check-ignore` per batch."""
-        if not self._cwd_git_state() or self.cwd_git_root is None:
-            return
+    def filter_ignored(self, recs: list[_FileRec], deadline: float) -> bool:
+        """Mark records for files the repository ignores; one `git check-ignore` per batch.
+
+        False when git gave no answer (too slow, failed, or the work tree is not resolved yet):
+        the unanswered records stay unmarked and nothing is cached, so the next call asks again.
+        Shell-sourced records never need asking: `git status` already leaves ignored files out.
+        """
+        asked = [rec for rec in recs if rec.source != "shell"]
+        if not asked:
+            return True
+        in_git = self._cwd_git_state()
+        if in_git is None:
+            return False
         root = self.cwd_git_root
-        pending = [
-            rec.path
-            for rec in recs
-            if rec.source != "shell" and _under(rec.path, root) and rec.path not in self._ignore_cache
-        ]
+        if not in_git or root is None:
+            return True
+        answered = True
+        pending = list(
+            dict.fromkeys(rec.path for rec in asked if _under(rec.path, root) and rec.path not in self._ignore_cache)
+        )
         if pending:
             payload = b"\0".join(os.fsencode(path) for path in pending) + b"\0"
             try:
-                proc = subprocess.run(
+                proc: subprocess.CompletedProcess[bytes] | None = subprocess.run(
                     ["git", "-C", root, "check-ignore", "-z", "--stdin"],
                     input=payload,
                     stdout=subprocess.PIPE,
@@ -852,21 +865,21 @@ class _Tracker:
                     timeout=max(0.05, min(GIT_TIMEOUT_S, _left(deadline))),
                     env=_git_env(),
                 )
-                # Exit 1 means "nothing ignored"; any other failure reports everything.
-                ignored = (
-                    {os.fsdecode(item) for item in proc.stdout.split(b"\0") if item}
-                    if proc.returncode in (0, 1)
-                    else set()
-                )
             except (OSError, ValueError, subprocess.SubprocessError):
-                ignored = set()
-            if len(self._ignore_cache) > _PATH_CACHE_LIMIT:
-                self._ignore_cache.clear()
-            for path in pending:
-                self._ignore_cache[path] = path in ignored
-        for rec in recs:
-            if rec.source != "shell" and self._ignore_cache.get(rec.path):
+                proc = None
+            # Exit 1 means "nothing ignored"; a timeout or any other exit is no answer at all.
+            if proc is not None and proc.returncode in (0, 1):
+                ignored = {os.fsdecode(item) for item in proc.stdout.split(b"\0") if item}
+                if len(self._ignore_cache) > _PATH_CACHE_LIMIT:
+                    self._ignore_cache.clear()
+                for path in pending:
+                    self._ignore_cache[path] = path in ignored
+            else:
+                answered = False
+        for rec in asked:
+            if self._ignore_cache.get(rec.path):
                 rec.ignored = True
+        return answered
 
     def blobs(self, root: str, specs: list[str], deadline: float) -> dict[str, bytes | None]:
         """Content of `<oid>:<path>` specs: bytes, `_MISSING` when the commit has no such file,
@@ -957,6 +970,11 @@ class _Tracker:
         with self.lock:
             self.cell = cell
             completions, self.pending_completions = self.pending_completions, []
+            lost, self.lost_completions = self.lost_completions, 0
+        if lost:
+            cell.note_incomplete(
+                f"{lost} background commands ended while no cell was running and their results were lost"
+            )
         # Background commands that finished while no cell was running report here, first.
         for record in completions:
             self.send_activity(cell.id, record)
@@ -1643,11 +1661,9 @@ class _Tracker:
             recs = list(cell.files.values())
         if not recs:
             return
-        if cell.gave_up is None:
-            try:
-                self.filter_ignored(recs, deadline)
-            except _OutOfTime:
-                pass
+        if cell.gave_up is None and not self.filter_ignored(recs, deadline):
+            # Listing a file git ignores beats hiding a real change; the cell says why.
+            cell.note_incomplete(_IGNORE_UNKNOWN)
         for rec in recs:
             if cell.gave_up is None and _left(deadline) <= 0:
                 # Past the budget the remaining records are still sent, from a stat only (no diff).
@@ -1719,6 +1735,8 @@ class _Tracker:
                         or not (cell.shell_check_pending or any(rec.dirty for rec in cell.files.values()))
                     ):
                         self.wake.clear()
+                # Held across the wait, it would keep a finished cell's baselines alive until the next write.
+                cell = None
             except BaseException:  # noqa: BLE001 - interpreter teardown must not trace back
                 return
 
@@ -1748,12 +1766,8 @@ class _Tracker:
                     ready.append(rec)
                 else:
                     rec.sig = sig
-            if not ready:
-                return
-            try:
-                self.filter_ignored(ready, deadline)
-            except _OutOfTime:
-                return
+            if not ready or not self.filter_ignored(ready, deadline):
+                return  # unanswered ignore rules: they stay dirty and are asked again next tick
             for rec in ready:
                 if _left(deadline) <= 0:
                     return  # the rest stay dirty for the next tick
@@ -1774,8 +1788,10 @@ class _Tracker:
         with self.lock:
             cell = self.cell
             if cell is None or cell.closing:
-                if len(self.pending_completions) < MAX_PENDING_COMPLETIONS:
-                    self.pending_completions.append(record)
+                self.pending_completions.append(record)
+                if len(self.pending_completions) > MAX_PENDING_COMPLETIONS:
+                    del self.pending_completions[0]
+                    self.lost_completions += 1
                 return
             target = cell.id
         self.send_activity(target, record)
@@ -2211,7 +2227,8 @@ def reported(
     return decorate
 
 
-_COMMIT_LINE = re.compile(r"^\[[^\]\n]*?\b([0-9a-f]{7,40})\]\s", re.M)
+# `[<branch> <sha>]`, `[<branch> (root-commit) <sha>]`, `[detached HEAD <sha>]`; branch names hold no spaces.
+_COMMIT_LINE = re.compile(r"^\[(?:detached HEAD|[^\s\[\]]+)(?: \(root-commit\))? ([0-9a-f]{7,40})\] ", re.M)
 _GIT_WORD = re.compile(r"\bgit\b")
 
 
@@ -2229,6 +2246,11 @@ class CommandStep:
     A command still running when its cell ends becomes a background step: the cell's last record for
     it says so (`background: true`, `endedAt` = the cell's end), and its eventual outcome is reported,
     with the same id, in whichever cell is running then (or at the next cell's start).
+
+    Every record of the step is sent under its lock, and `finish` leaves the cell's command set only
+    after its final record went out. So the cell's end (which moves each command still in the set to
+    the background under that lock) either waits for a final record already on its way or turns it
+    into a background completion: nothing of the step reaches its cell after the cell's `done`.
     """
 
     def __init__(self, command: str) -> None:
@@ -2252,9 +2274,18 @@ class CommandStep:
                 return
             self._background = True
             timer, self._timer = self._timer, None
+            self._step._send({"status": "running", "background": True, "endedAt": ended_at})
         if timer is not None:
             timer.cancel()
-        self._step._send({"status": "running", "background": True, "detail": BACKGROUND_DETAIL, "endedAt": ended_at})
+        # A dev server can run for hours: it must not keep its cell's snapshots and baselines alive.
+        self._leave_cell()
+
+    def _leave_cell(self) -> None:
+        tracker = _tracker
+        cell, self._cell = self._cell, None
+        if tracker is not None and cell is not None:
+            with tracker.lock:
+                cell.commands.discard(self)
 
     def output(self, chunk: bytes) -> None:
         try:
@@ -2270,8 +2301,7 @@ class CommandStep:
                         self._timer.start()
                     return
                 self._last_update = now
-                tail = self._tail
-            self._show(tail)
+                self._show()
         except Exception:  # noqa: BLE001 - reporting must never disturb the command's pump
             pass
 
@@ -2280,33 +2310,33 @@ class CommandStep:
             with self._lock:
                 self._timer = None
                 self._last_update = time.monotonic()
-                tail = self._tail
-            self._show(tail)
+                self._show()
         except Exception:  # noqa: BLE001
             pass
 
-    def _show(self, tail: bytes) -> None:
-        if self._background:
-            return  # its cell is over; only the outcome is reported, in a later cell
-        line = _last_line(tail.decode("utf-8", "replace"))
+    def _show(self) -> None:
+        """Send the newest output line; the caller holds the lock."""
+        if self._background or self._finished:
+            return  # a running update must never follow the outcome, or land in a later cell
+        line = _last_line(self._tail.decode("utf-8", "replace"))
         if line:
             self._step.update(line)
 
     def finish(self, exit_code: int, output: str) -> None:
         try:
+            status = "ok" if exit_code == 0 else "error"
+            detail = _command_summary(exit_code, output)
+            commit = _commit_id(self._command, exit_code, output)
+            tracker = _tracker
             with self._lock:
                 timer, self._timer = self._timer, None
                 self._finished = True
                 background = self._background
+                if not background:
+                    self._step.finish(status, detail, extra={"commit": commit} if commit else None)
             if timer is not None:
                 timer.cancel()
-            tracker = _tracker
-            if tracker is not None and self._cell is not None:
-                with tracker.lock:
-                    self._cell.commands.discard(self)
-            status = "ok" if exit_code == 0 else "error"
-            detail = _command_summary(exit_code, output)
-            commit = _commit_id(self._command, exit_code, output)
+            self._leave_cell()
             if background:
                 step = self._step
                 step.done = True
@@ -2325,8 +2355,6 @@ class CommandStep:
                     record["commit"] = commit
                 if tracker is not None:
                     tracker.background_completion(record)
-            else:
-                self._step.finish(status, detail, extra={"commit": commit} if commit else None)
             if tracker is not None:
                 tracker.request_shell_check()
         except Exception:  # noqa: BLE001
