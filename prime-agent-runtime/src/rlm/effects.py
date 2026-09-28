@@ -269,6 +269,17 @@ def _withhold_memory_texts(record: dict[str, Any], withheld: bool = False) -> No
         record.pop("after", None)
         record["textOmitted"] = SENSITIVE
 
+
+def looks_secret(text: str | None) -> bool:
+    """`_looks_secret` for skills that send display text of their own (the edit skill's diff payload)."""
+    return _looks_secret(text)
+
+
+def is_sensitive_path(path: str | None) -> bool:
+    """`_sensitive_path` for the same skills: the texts of a credential store are never sent."""
+    return _sensitive_path(path)
+
+
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 
 _Sender = Callable[[str, dict[str, Any]], None]
