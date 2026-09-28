@@ -71,7 +71,7 @@ function isCredentialRun(value: string): boolean {
 
 /** Known credential prefixes: the shapes a key keeps when nothing names it. */
 const CREDENTIAL_SHAPES =
-	/\b(?:sk-ant-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{16,}|sk_(?:live|test)_[A-Za-z0-9]{8,}|rk_[A-Za-z0-9]{8,}|pk_(?:live|test)_[A-Za-z0-9]{8,}|xai-[A-Za-z0-9_-]{8,}|gsk_[A-Za-z0-9_-]{8,}|hf_[A-Za-z0-9]{8,}|ghp_[A-Za-z0-9]{16,}|gho_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|glpat-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{20,}|ya29\.[A-Za-z0-9_-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{12,}|npm_[A-Za-z0-9]{16,}|pypi-[A-Za-z0-9_-]{16,}|(?:EAA|IGQV)[A-Za-z0-9_-]{20,})\b/g;
+	/\b(?:sk-ant-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_.-]{16,}|sk_(?:live|test)_[A-Za-z0-9]{8,}|rk_[A-Za-z0-9]{8,}|pk_(?:live|test)_[A-Za-z0-9]{8,}|xai-[A-Za-z0-9_-]{8,}|gsk_[A-Za-z0-9_-]{8,}|hf_[A-Za-z0-9]{8,}|ghp_[A-Za-z0-9]{16,}|gho_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|glpat-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{20,}|ya29\.[A-Za-z0-9_-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{12,}|npm_[A-Za-z0-9]{16,}|pypi-[A-Za-z0-9_-]{16,}|(?:EAA|IGQV)[A-Za-z0-9_-]{20,})\b/g;
 
 /** JWTs: three base64url segments, which is how an OAuth access token looks. */
 const JSON_WEB_TOKEN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;

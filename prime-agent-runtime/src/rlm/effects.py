@@ -182,7 +182,7 @@ _SECRET_SHAPES: tuple[tuple[tuple[str, ...], bool, re.Pattern[str]], ...] = tupl
     (markers, lower, re.compile(pattern))
     for markers, lower, pattern in (
         (("PRIVATE KEY",), False, r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"),
-        (("sk-",), False, r"(?<![A-Za-z0-9])sk-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_-]{20,}"),
+        (("sk-",), False, r"(?<![A-Za-z0-9])sk-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_.-]{20,}"),
         (("k_live_", "k_test_"), False, r"(?<![A-Za-z0-9])[rs]k_(?:live|test)_[A-Za-z0-9]{16,}"),
         (("AKIA", "ASIA"), False, r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])"),
         (("ghp_", "gho_", "ghu_", "ghs_", "ghr_"), False, r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{30,}"),
@@ -195,7 +195,7 @@ _SECRET_SHAPES: tuple[tuple[tuple[str, ...], bool, re.Pattern[str]], ...] = tupl
         (("pypi-AgE",), False, r"pypi-AgE[A-Za-z0-9_-]{20,}"),
         (("eyJ",), False, r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
         (("bearer",), True, r"\bbearer\s+[a-z0-9._~+/=-]{20,}"),
-        (("://",), True, r"\b[a-z][a-z0-9+.-]*://[^\s:/@\"']+:[^\s:/@\"']{6,}@"),
+        (("://",), True, r"\b[a-z][a-z0-9+.-]{0,31}://[^\s:/@\"']*:[^\s:/@\"']{6,}@"),
     )
 )
 # `name = value` assignments whose name ends in one of these words (matched on the lower-cased text).
@@ -213,16 +213,49 @@ _SECRET_NAMES = (
     "private_key",
     "private-key",
 )
-# What may follow the name: `secret_key`, `credentials`, a closing quote, then `=` or `:` (not `==`)
-# and a quoted or bare value.
+# A passphrase in quotes: two to five short words of letters and digits, a space apart.
+_PASSPHRASE = r"[a-z0-9]{2,12}(?: [a-z0-9]{2,12}){1,4}"
+# What may follow the name: `secret_key`, `credentials`, a closing quote, then `=` or `:` (not `==`), an
+# annotation before the `=` (`: str =`) or `:=`, and a value: one quoted token, quoted words, or a bare token.
 _SECRET_ASSIGNMENT_TAIL = re.compile(
-    r"(?:[_-]?key)?s?[\"']?\s*(?<![=!<>])[:=](?!=)\s*(?:([\"'])([^\"'\s]{8,})\1|([^\s\"'#,;.(){}\[\]<>]{8,}))"
+    r"(?:[_-]?key)?s?[\"']?\s*"
+    r"(?<![=!<>])(?::\s*[\w\[\].\"']+\s*=(?!=)|:=|[:=](?!=))\s*"
+    r"(?:(?P<quote>[\"'])(?:(?P<token>[^\"'\s]{8,})|(?P<words>" + _PASSPHRASE + r"))(?P=quote)"
+    r"|(?P<bare>[^\s\"'#,;.(){}\[\]<>]{8,}))"
 )
 _SECRET_PLACEHOLDER = re.compile(
     r"(?i)^(?:x+|\*+|\.+|changeme|change_me|placeholder|example\w*|dummy\w*|redacted|none|null|true|false|"
     r"your[_-]?\w*|replace[_-]?me\w*|\$\{?\w+\}?|%\(\w+\)s|\{\{.*\}\})$"
 )
 _IDENTIFIER_LIKE = re.compile(r"^[A-Za-z_-]+$")
+# Words that make a quoted run read as a sentence or a label, not as a passphrase: the small words of
+# speech, the vocabulary of credentials, and what a form or an error says about one.
+_PHRASE_WORDS = frozenset(
+    (
+        "a an the this that these those it its i me my we us our you your he she they them their "
+        "is are was were be been am do does did has have had will would can could should must may might shall "
+        "of in on at to for by with from into as or and but if then than so not no nor per via up out off "
+        "any some all each every what which who how when where why please "
+        "password passwd passphrase pass secret token key keys credential credentials api auth login user "
+        "enter confirm retype repeat reset forgot required invalid incorrect wrong missing expired empty unknown "
+        "denied failed error"
+    ).split()
+)
+
+
+def _passphrase_like(words: str) -> bool:
+    """Whether quoted words could be a passphrase.
+
+    Not when they are all digits, read as a sentence or a label (`_PHRASE_WORDS`), or hold a placeholder
+    (`Bearer xxxx`, `your value`).
+    """
+    parts = words.split(" ")
+    return (
+        len(words) >= 8
+        and not words.replace(" ", "").isdigit()
+        and _PHRASE_WORDS.isdisjoint(parts)
+        and not any(_SECRET_PLACEHOLDER.match(part) for part in parts)
+    )
 
 
 def _sensitive_path(path: str | None) -> bool:
@@ -253,8 +286,12 @@ def _looks_secret(text: str | None) -> bool:
             while start >= 0:
                 match = _SECRET_ASSIGNMENT_TAIL.match(lower, start + len(name))
                 if match:
-                    value = match.group(2) or match.group(3) or ""
-                    if not (_SECRET_PLACEHOLDER.match(value) or value.isdigit() or _IDENTIFIER_LIKE.match(value)):
+                    words = match.group("words")
+                    value = match.group("token") or match.group("bare") or ""
+                    if words is not None:
+                        if _passphrase_like(words):
+                            return True
+                    elif not (_SECRET_PLACEHOLDER.match(value) or value.isdigit() or _IDENTIFIER_LIKE.match(value)):
                         return True
                 start = lower.find(name, start + 1)
         return False
@@ -268,6 +305,17 @@ def _withhold_memory_texts(record: dict[str, Any], withheld: bool = False) -> No
         record.pop("before", None)
         record.pop("after", None)
         record["textOmitted"] = SENSITIVE
+
+
+def looks_secret(text: str | None) -> bool:
+    """`_looks_secret` for skills that send display text of their own (the edit skill's diff payload)."""
+    return _looks_secret(text)
+
+
+def is_sensitive_path(path: str | None) -> bool:
+    """`_sensitive_path` for the same skills: the texts of a credential store are never sent."""
+    return _sensitive_path(path)
+
 
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 
@@ -2455,6 +2503,22 @@ class untracked:  # noqa: N801 - used as a context manager, reads like a functio
             self._token = None
 
 
+# A label shows MAX_LABEL characters. The scan reads that much and a margin past the cut, so a key the cut
+# splits is still whole to it; the rest of a long task text (megabytes, for a subagent) never shows.
+_LABEL_SCAN_CHARS = MAX_LABEL + 1024
+
+
+def _safe_label(text: str, kind: str) -> str:
+    """`text` one-lined and capped for a step's label, or `kind` when it looks like it holds a credential.
+
+    The text is scanned before it is cut: a key cut at the cap can fall under a rule's length
+    floor while its first characters still show. A command line or a task text is display text like a
+    diff or a detail, and the record is saved with the session.
+    """
+    label = _one_line(text, MAX_LABEL)
+    return kind if _looks_secret(text[:_LABEL_SCAN_CHARS]) else label
+
+
 class Step:
     """One step reported to the host: running from creation until `finish()` or the end of a `with` block.
 
@@ -2464,7 +2528,7 @@ class Step:
     def __init__(self, kind: str, label: str) -> None:
         self.kind = kind
         self.id = f"{kind}-{next(_ids)}"
-        self.label = _one_line(label, MAX_LABEL) or kind
+        self.label = _safe_label(label, kind) or kind
         self.started_at = _now_ms()
         self.done = False
         tracker = _tracker
@@ -2501,7 +2565,7 @@ class Step:
             return
         self.done = True
         if label:
-            self.label = _one_line(label, MAX_LABEL)
+            self.label = _safe_label(label, self.kind)
         fields: dict[str, Any] = {"status": "ok" if status == "ok" else "error", "endedAt": _now_ms()}
         if detail:
             safe = _safe_detail(detail, MAX_DETAIL)

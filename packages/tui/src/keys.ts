@@ -1172,6 +1172,11 @@ export function matchesKey(data: string, keyId: KeyId): boolean {
 			if (data === `\x1b${key}`) return true;
 		}
 
+		if (modifier === MODIFIERS.alt + MODIFIERS.shift && !_kittyProtocolActive && isLetter) {
+			// Legacy: alt+shift+letter is ESC followed by the uppercase letter
+			if (data === `\x1b${key.toUpperCase()}`) return true;
+		}
+
 		if (modifier === MODIFIERS.ctrl) {
 			// Legacy: ctrl+key sends the control character
 			if (rawCtrl && data === rawCtrl) return true;
@@ -1306,6 +1311,10 @@ export function parseKey(data: string): string | undefined {
 		// Legacy alt+letter/digit (ESC followed by the key)
 		if ((code >= 97 && code <= 122) || (code >= 48 && code <= 57)) {
 			return `alt+${String.fromCharCode(code)}`;
+		}
+		// Legacy alt+shift+letter (ESC followed by the uppercase letter)
+		if (code >= 65 && code <= 90) {
+			return formatKeyNameWithModifiers(String.fromCharCode(code + 32), MODIFIERS.shift + MODIFIERS.alt);
 		}
 	}
 	if (data === "\x1b[A") return "up";

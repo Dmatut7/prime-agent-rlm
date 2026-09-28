@@ -397,6 +397,12 @@ export class ToolExecutionComponent extends Container implements FocusableBlock 
 		return false;
 	}
 
+	/** Whether this tool block shows a message the model sent to another agent from its cell. */
+	hasSentAgentMessages(): boolean {
+		const sent = this.result?.details?.sentAgentMessages;
+		return this.pendingSentAgentMessages.length > 0 || (Array.isArray(sent) && sent.length > 0);
+	}
+
 	setAgentMessagesExpanded(expanded: boolean): void {
 		if (this.agentMessagesExpanded === expanded) {
 			return;

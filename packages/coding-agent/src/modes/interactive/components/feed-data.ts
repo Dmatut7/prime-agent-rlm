@@ -182,9 +182,11 @@ function readMemoryChange(value: unknown): KernelMemoryChange | undefined {
 function readDiffDisplay(value: unknown): KernelDiffDisplay | undefined {
 	if (!isRecord(value)) return undefined;
 	const path = stringField(value, "path");
+	if (!path) return undefined;
+	if (value.omitted === "sensitive") return { path, omitted: "sensitive" };
 	const oldStr = stringField(value, "oldStr");
 	const newStr = stringField(value, "newStr");
-	if (!path || oldStr === undefined || newStr === undefined) return undefined;
+	if (oldStr === undefined || newStr === undefined) return undefined;
 	const startLine = numberField(value, "startLine");
 	return { path, oldStr, newStr, ...(startLine !== undefined ? { startLine } : {}) };
 }
@@ -459,8 +461,26 @@ export function aggregateChanges(
 			continue;
 		}
 		for (const diff of data.legacyDiffs) {
-			const rows = memoRows(diff, () => diffRowsFromEdit(diff.oldStr, diff.newStr, diff.startLine ?? 1));
 			const path = displayPath({ path: diff.path }, cwd);
+			if (diff.omitted) {
+				// The skill kept the texts out: the file changed, the counts are not knowable.
+				addEntry(entries, {
+					key: path,
+					path,
+					kind: "modified",
+					scope: isAbsolute(path) ? "scratch" : "project",
+					added: 0,
+					removed: 0,
+					rows: [],
+					truncated: false,
+					binary: false,
+					omitted: diff.omitted,
+					source: "edit",
+					firstAt: order,
+				});
+				continue;
+			}
+			const rows = memoRows(diff, () => diffRowsFromEdit(diff.oldStr, diff.newStr, diff.startLine ?? 1));
 			const counts = rows.reduce(
 				(sum, row) => ({
 					added: sum.added + (row.kind === "add" ? 1 : 0),

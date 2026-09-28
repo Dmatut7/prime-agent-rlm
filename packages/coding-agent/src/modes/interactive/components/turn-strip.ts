@@ -3,7 +3,7 @@ import { type ThemeColor, theme } from "../theme/theme.js";
 import { cleanMemoryTitle, symlinkVerb } from "./feed-data.js";
 import { slideCount } from "./motion.js";
 import { changeDetail, changeTotals, memoryDetail, omittedDiffText, type TimelineFacts } from "./timeline-rows.js";
-import { BOX_FOCUS_MARKER, boxOuterWidth, fitBoxLines } from "./turn-box.js";
+import { BOX_FOCUS_MARKER, boxOuterWidth, boxRegionWidth, fitBoxLines } from "./turn-box.js";
 import type { TurnTimeline } from "./turn-timeline.js";
 
 /**
@@ -219,6 +219,7 @@ export class TurnStripComponent implements Component {
 		const items = ui.stripOpen === "edits" ? this.editItems(facts) : this.memoryItems(facts);
 		const outer = boxOuterWidth(width);
 		const inner = outer - 4;
+		const regionWidth = boxRegionWidth(outer, width);
 		const border = (text: string) => theme.fg("boxBorder", text);
 		const boxLine = (content: string, bg?: "cardFocusBg"): string => {
 			const fitted = truncateToWidth(content, inner, "…", true);
@@ -250,7 +251,7 @@ export class TurnStripComponent implements Component {
 				this.regions.push({
 					line: lines.length - 1,
 					col: 0,
-					width: outer + 1,
+					width: regionWidth,
 					height: 1,
 					revealBelow: opened ? 0 : 10,
 					onClick: () => {
