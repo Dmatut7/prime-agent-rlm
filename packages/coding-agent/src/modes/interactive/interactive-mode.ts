@@ -307,6 +307,7 @@ import {
 } from "./components/tool-execution.js";
 import {
 	anyBudgetTruncatable,
+	resetBudgetTruncatableTracking,
 	setQuietConversationBudget,
 	setToolOutputFull,
 	toolOutputFull,
@@ -3743,6 +3744,7 @@ export class InteractiveMode {
 		this.endFeatureHintRun();
 		this.resetBlockNavigation();
 		this.chatContainer.clear();
+		resetBudgetTruncatableTracking();
 		this.shortcutGuideContainer.clear();
 		this.pendingMessagesContainer.clear();
 		this.queuedMessagesContainer.clear();
@@ -5720,6 +5722,7 @@ export class InteractiveMode {
 		this.clearSideQuestion({ abort: true });
 		this.resetBlockNavigation();
 		this.chatContainer.clear();
+		resetBudgetTruncatableTracking();
 		await this.renderInitialMessages();
 		if (result.editorText && !this.editor.getText().trim()) {
 			this.editor.setText(result.editorText);
@@ -8448,6 +8451,7 @@ export class InteractiveMode {
 		if (options.clearChat) {
 			this.resetBlockNavigation();
 			this.chatContainer.clear();
+			resetBudgetTruncatableTracking();
 		}
 
 		if (options.updateFooter) {
@@ -9317,6 +9321,8 @@ export class InteractiveMode {
 		this.stop({ preserveAltScreen: options.preserveAltScreen });
 		setMotionFrameRequester(undefined);
 		this.liveTurnFlowStore?.dispose();
+		// The chat is abandoned with this view; the next session's view starts from its own blocks.
+		resetBudgetTruncatableTracking();
 		stopThemeWatcher();
 	}
 
