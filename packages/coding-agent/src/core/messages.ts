@@ -511,7 +511,7 @@ export function createAutoContinueMessage(
 				].join("\n")
 			: [
 					`[auto-continue] Your last reply ended by announcing a next step (${JSON.stringify(details.excerpt ?? "")}) but the turn stopped before doing it. If the owner left this running, a stop here leaves the work half done until they come back.`,
-					"Judge what that sentence was. A step you meant to take: take it now. An offer after work that is actually finished: give the final result in a line and stop. A step that needs the owner's approval (irreversible, spending money, or sending anything outside this machine): do not take it, because a continue is not their consent; ask and stop. Blocked, or any other decision only the owner can make: say exactly what and stop.",
+					"Whether stopping is right depends on the task, not on that sentence: on whether the work the owner asked for is finished and you have seen proof of it. While the work is unfinished, the announced step is simply the next thing to do. Once it is finished and proven, the sentence was an offer, and the owner gains most from the final result stated plainly. Some steps are the owner's to authorize (irreversible, spending money, sending anything outside this machine), and an automatic continue is not their consent; for those, and for anything blocked or needing a decision only they can make, a useful stop says exactly what is needed.",
 					`This is an automatic continue (${details.ordinal} of at most 2 for this request).`,
 				].join("\n");
 	return {
@@ -923,8 +923,8 @@ export function createRlmChildTerminalNoticeMessage(
 					}`
 				: `RLM child ${childName} (${details.childId}) completed without sending a reply${
 						details.lastAssistantText
-							? `. Its last assistant text is quoted below; it was written to its own transcript and never sent to you. If it answers the task, use it; if it is cut off or unclear, read the child's files or transcript before re-dispatching, since the work is usually already done.\n\n${quoteRlmChildLastText(details.lastAssistantText)}`
-							: ". Read the child's files or transcript before re-dispatching: finishing without a reply usually means the work is done and only the report is missing"
+							? `. Its last assistant text is quoted below; it was written to its own transcript and never sent to you. That text is the child's own account of its work, and you are the one who vouches for it to the owner, so it becomes usable once it matches what the child produced: the files it names, the tests, the claims. When the work is partial, the child still holds the context, so a follow-up to it costs less than a fresh dispatch starting from zero.\n\n${quoteRlmChildLastText(details.lastAssistantText)}`
+							: ". Its files and transcript show what it actually did: a child that stops silently has often done the work and skipped only the report, and sometimes stopped halfway, and only its output tells which. A follow-up to the same child keeps its context; a fresh dispatch starts from zero"
 					}`;
 	return {
 		role: "custom",
