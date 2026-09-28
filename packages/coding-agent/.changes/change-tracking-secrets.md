@@ -1,0 +1,2 @@
+- Changed change tracking to keep secrets out of saved session records: credential files such as `.env` and private keys, and any diff or memory text holding a likely token or password, keep only their line counts.
+- Fixed the session's own storage folder and harness saves showing up as file changes when the session folder sits inside the working folder.

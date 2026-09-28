@@ -583,6 +583,131 @@ _WRAPPED_POINTS = sorted(
 )
 
 
+# Fake credentials, split so no complete one sits in this file.
+_OLD_KEY = "sk-" + "OLDFAKE" + "0" * 24
+_NEW_KEY = "sk-" + "NEWFAKE" + "0" * 24
+_AWS_KEY = "AKIA" + "FAKE" + "0" * 12
+_PEM = "-----BEGIN " + "RSA PRIVATE KEY-----\nMIIEfake\n-----END RSA PRIVATE KEY-----\n"
+
+
+def _anywhere(cell: Cell, *needles: str) -> list[str]:
+    """Which needles appear anywhere in a cell's protocol events (records, outputs, everything)."""
+    text = json.dumps(cell.events)
+    return [needle for needle in needles if needle in text]
+
+
+@unittest.skipUnless(HAS_GIT, "git is needed for the work-tree comparison")
+class SecretTests(TrackerCase):
+    """Records are saved with the session: credentials must not ride along in diffs or memory texts."""
+
+    def test_an_env_file_written_by_python_keeps_its_counts_but_no_diff(self):
+        cell = self.kernel.run(f"open('.env', 'w').write('OPENAI_API_KEY={_OLD_KEY}\\nAWS_KEY={_AWS_KEY}\\n')")
+        record = cell.by_rel()[".env"]
+        self.assertEqual((record["kind"], record["source"], record["added"], record["removed"]), ("created", "python", 2, 0))
+        self.assertEqual(record["diffOmitted"], effects.SENSITIVE)
+        self.assertNotIn("diff", record)
+        self.assertEqual(_anywhere(cell, _OLD_KEY, _AWS_KEY), [])
+
+    def test_a_tracked_env_file_rotated_by_bash_keeps_neither_value(self):
+        self.write(".env", f"OPENAI_API_KEY={_OLD_KEY}\n")
+        _git(self.root, "add", ".env")
+        _git(self.root, "commit", "-qm", "env")
+        cell = self.kernel.run("await bash(\"sed -i.bak 's/OLDFAKE/NEWFAKE/' .env && rm .env.bak\")")
+        record = cell.by_rel()[".env"]
+        self.assertEqual((record["kind"], record["source"], record["added"], record["removed"]), ("modified", "shell", 1, 1))
+        self.assertEqual(record["diffOmitted"], effects.SENSITIVE)
+        self.assertEqual(_anywhere(cell, _OLD_KEY, _NEW_KEY), [])
+
+    def test_a_secret_inside_an_ordinary_file_withholds_that_files_diff_only(self):
+        cell = self.kernel.run(
+            f"open('config.py', 'w').write('API_KEY = \"{_OLD_KEY}\"\\nDEBUG = True\\n')\n"
+            "open('settings.py', 'w').write('DB_PASSWORD = \"hunter2hunter2\"\\n')\n"
+            "open('a.txt', 'a').write('four\\n')\n"
+        )
+        files = cell.by_rel()
+        for rel, added in (("config.py", 2), ("settings.py", 1)):
+            self.assertEqual(files[rel]["diffOmitted"], effects.SENSITIVE, rel)
+            self.assertNotIn("diff", files[rel])
+            self.assertEqual(files[rel]["added"], added, rel)
+        self.assertIn("+four\n", files["a.txt"]["diff"])
+        self.assertEqual(_anywhere(cell, _OLD_KEY, "hunter2hunter2"), [])
+
+    def test_ordinary_code_about_secrets_keeps_its_diff(self):
+        code = (
+            "import os\\n"
+            "class SecretManager:\\n"
+            "    def load(self, request):\\n"
+            "        password = request.form[\\\"password\\\"]\\n"
+            "        token = tokenizer(text)\\n"
+            "        max_tokens = 4096\\n"
+            "        api_key = os.environ[\\\"API_KEY\\\"]\\n"
+            "        secret = None\\n"
+            "        return password == \\\"\\\" or token != secret\\n"
+        )
+        cell = self.kernel.run(f"open('secret_manager.py', 'w').write(\"{code}\")")
+        record = cell.by_rel()["secret_manager.py"]
+        self.assertNotIn("diffOmitted", record)
+        self.assertIn("+class SecretManager:\n", record["diff"])
+        self.assertEqual(record["added"], 9)
+
+    def test_a_memory_entry_holding_a_token_keeps_its_record_but_no_texts(self):
+        cell = self.kernel.run(
+            f"rlm.harness.create_memory('Deploy creds', 'token={_OLD_KEY}', id='creds')\n"
+            "rlm.harness.create_memory('Deploy steps', 'use make deploy', id='deploy')\n"
+        )
+        memory = cell.memory()
+        withheld = memory[("memory", "session", "creds")]
+        self.assertEqual((withheld["op"], withheld["title"], withheld["textOmitted"]), ("created", "Deploy creds", "sensitive"))
+        self.assertNotIn("after", withheld)
+        self.assertEqual(memory[("memory", "session", "deploy")]["after"], "use make deploy")
+        # A later edit in the same cell that drops the token still shows no text: the first one held it.
+        cell = self.kernel.run(
+            f"rlm.harness.update_memory('creds', 'Deploy creds', 'token={_NEW_KEY}')\n"
+            "rlm.harness.update_memory('creds', 'Deploy creds', 'ask ops for the token')\n"
+        )
+        updated = cell.memory()[("memory", "session", "creds")]
+        self.assertEqual((updated["op"], updated["textOmitted"]), ("updated", "sensitive"))
+        self.assertNotIn("before", updated)
+        self.assertNotIn("after", updated)
+        self.assertEqual(_anywhere(cell, _OLD_KEY, _NEW_KEY), [])
+
+
+class SecretNoGitTests(TrackerCase):
+    use_git = False
+
+    def test_private_key_files_outside_git_keep_no_diff(self):
+        cell = self.kernel.run(
+            f"open('server.pem', 'w').write({_PEM!r})\n"
+            f"open('backup-notes.txt', 'w').write('restore with\\n' + {_PEM!r})\n"
+            "await bash('mkdir -p keys && printf \"k\\\\n\" > keys/id_ed25519')\n"
+        )
+        files = cell.by_rel()
+        self.assertEqual(sorted(files), ["backup-notes.txt", "keys/id_ed25519", "server.pem"])
+        for rel, record in files.items():
+            self.assertEqual(record["kind"], "created", rel)
+            self.assertEqual(record["diffOmitted"], effects.SENSITIVE, rel)
+            self.assertGreater(record["added"], 0, rel)
+        self.assertEqual(_anywhere(cell, "MIIEfake"), [])
+
+
+@unittest.skipUnless(HAS_GIT, "git is needed for the work-tree comparison")
+class SessionStorageInProjectTests(TrackerCase):
+    """A session folder inside the working folder holds the agent's own files, not the cell's work."""
+
+    def kernel_env(self) -> dict[str, str]:
+        session = os.path.join(self.root, "agent-session")
+        return {"RLM_SESSION_DIR": session, "RLM_HARNESS_STATE_DIR": os.path.join(session, "harness")}
+
+    def test_the_session_folder_and_harness_saves_are_not_file_changes(self):
+        cell = self.kernel.run(
+            "await bash('mkdir -p agent-session/sub-1 && echo log > agent-session/sub-1/out.txt && echo x > work.txt')\n"
+            "rlm.harness.create_memory('A', 'a', id='a')\n"
+            "open('agent-session/notes.txt', 'w').write('n\\n')\n"
+        )
+        self.assertEqual(sorted(cell.by_rel()), ["work.txt"])
+        self.assertEqual(list(cell.memory()), [("memory", "session", "a")])
+
+
 class WrapPointTests(TrackerCase):
     def test_tracking_wraps_every_write_and_spawn_point(self):
         cell = self.kernel.run(_WRAP_PROBE)
@@ -924,6 +1049,54 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(effects._command_summary(0, "\x1b[32mdone\x1b[0m\n"), "done")
         self.assertIsNone(effects._command_summary(0, ""))
 
+
+    def test_sensitive_file_names(self):
+        sensitive = [
+            ".env", ".env.production", "prod.env", "server.pem", "tls.key", "cert.p12", "id_rsa", "id_ed25519.pub",
+            ".netrc", ".npmrc", ".pypirc", "credentials", "credentials.json", "secrets.yaml", "db-credentials.toml",
+            "client_secret", "release.keystore", "terraform.tfvars", "/home/u/.ssh/config", "/home/u/.aws/config",
+        ]
+        ordinary = ["secret_manager.py", "secrets_test.go", "token.ts", "keyboard.py", "README.md", "env.py", "a/b/c.txt"]
+        self.assertGreater(len(sensitive), 0)
+        for name in sensitive:
+            self.assertTrue(effects._sensitive_path(name), name)
+        for name in ordinary:
+            self.assertFalse(effects._sensitive_path(name), name)
+
+    def test_secret_scan_shapes_and_assignments(self):
+        secrets = [
+            "+" + "-----BEGIN " + "OPENSSH PRIVATE KEY-----",
+            "+key = sk-" + "ant-" + "a" * 30,
+            "+AWS=" + "ASIA" + "B" * 16,
+            "+t = 'ghp_" + "c" * 36 + "'",
+            "+github_pat_" + "d" * 30,
+            "+slack: xoxb-" + "1" * 12,
+            "+glpat-" + "e" * 20,
+            "+maps AIza" + "f" * 35,
+            "+jwt eyJ" + "a" * 12 + ".eyJ" + "b" * 12 + "." + "c" * 12,
+            '+  "password": "hunter22"',
+            "+DB_PASSWORD=s3cr3t-value",
+            "+client_secret: 'Zq8-long-value'",
+            "+url = postgres://admin:pa55word@db/prod",
+            "+Authorization: Bearer " + "g" * 24,
+        ]
+        ordinary = [
+            "+password = request.form['password']",
+            "+token = tokenizer(text)",
+            "+max_tokens = 4096",
+            "+api_key = os.environ['API_KEY']",
+            "+secret = None",
+            "+PASSWORD=changeme",
+            "+API_KEY=${API_KEY}",
+            "+token_type = 'access_token'",
+            "+if password == 'hunter22':",
+            "+task-abcdefghijklmnopqrstuvwxyz",
+        ]
+        self.assertGreater(len(secrets), 0)
+        for text in secrets:
+            self.assertTrue(effects._looks_secret(text), text)
+        for text in ordinary:
+            self.assertFalse(effects._looks_secret(text), text)
 
 if __name__ == "__main__":
     unittest.main()

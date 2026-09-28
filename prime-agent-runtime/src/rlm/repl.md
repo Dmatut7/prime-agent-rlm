@@ -239,8 +239,8 @@ case nothing below is installed at all. Implemented in `rlm/effects.py`.
 
 | MIME type | Payload |
 |---|---|
-| `application/vnd.prime-agent.file-change+json` | one file effect: `path`, `relPath?`, `kind` (`created`/`modified`/`deleted`/`renamed`), `oldPath?`, `scope` (`project`/`scratch`/`memory`), `added`, `removed`, `diff?`, `diffTruncated?`, `diffOmitted?` (`too_large`/`no_baseline`/`budget`), `binary?`, `source` (`python`/`shell`/`edit`), `at` |
-| `application/vnd.prime-agent.memory-change+json` | one harness entry or rules-file change: `op`, `kind` (`memory`/`skill`/`subagent`/`prompt_note`/`rules_file`), `scope` (`session`/`global`/`project`), `id`, `title`, `previousTitle?`, `before?`, `after?`, `at` |
+| `application/vnd.prime-agent.file-change+json` | one file effect: `path`, `relPath?`, `kind` (`created`/`modified`/`deleted`/`renamed`), `oldPath?`, `scope` (`project`/`scratch`/`memory`), `added`, `removed`, `diff?`, `diffTruncated?`, `diffOmitted?` (`too_large`/`no_baseline`/`budget`/`sensitive`), `binary?`, `source` (`python`/`shell`/`edit`), `at` |
+| `application/vnd.prime-agent.memory-change+json` | one harness entry or rules-file change: `op`, `kind` (`memory`/`skill`/`subagent`/`prompt_note`/`rules_file`), `scope` (`session`/`global`/`project`), `id`, `title`, `previousTitle?`, `before?`, `after?`, `textOmitted?` (`sensitive`), `at` |
 | `application/vnd.prime-agent.activity+json` | one step: `id`, `kind` (`command`/`read`/`search`/`fetch`/`subagent`), `label`, `status` (`running`/`ok`/`error`), `detail?`, `startedAt`, `endedAt?`, `background?`, `commit?` |
 | `application/vnd.prime-agent.change-tracking+json` | at most one per cell: `{"incomplete": reason}` when the lists above are partial |
 
@@ -270,6 +270,25 @@ deleted in the same cell.
   default 500); past it, tracking stops for that cell and says so in the
   `change-tracking` record. Diffs are capped at 400 lines / 64 KiB per file and
   256 KiB per cell; memory texts at 4000 characters.
+- The host saves these records with the session, so secrets are withheld. A
+  file whose name marks a credential store (`.env`, `.env.*`, `*.env`, `*.pem`,
+  `*.key`, `*.p8`/`*.p12`/`*.pfx`/`*.ppk`, `*.keystore`/`*.jks`, `*.tfvars`/
+  `*.tfstate`, `id_rsa*`/`id_ed25519*`/`id_ecdsa*`/`id_dsa*`, `.netrc`, `.npmrc`,
+  `.pypirc`, `.pgpass`, `.git-credentials`, `credentials`, a config or data
+  file named after secrets or credentials such as `secrets.yaml`, anything
+  under `.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`), and any other file whose
+  capped diff holds a likely credential (a private key block; `sk-`, `AKIA`/
+  `ASIA`, `ghp_`, `github_pat_`, `xox?-`, `glpat-`, `AIza`, `hf_`, `npm_`,
+  `pypi-` tokens; JWTs; bearer tokens; `user:pass@` URLs; `password`/`secret`/
+  `api_key`/`token`-style assignments whose value is not a placeholder, number
+  or plain identifier), keeps its record and line counts without `diff`, with
+  `diffOmitted: "sensitive"`. A memory record whose `before` or `after` holds a
+  likely credential drops both texts and carries `textOmitted: "sensitive"`;
+  later edits of that entry in the same cell stay withheld. The scan runs only
+  over the capped text and treats its own failure as a secret.
+- The session's own folder (`RLM_SESSION_DIR`: subagent folders, artifacts) is
+  never reported, and harness saves appear only as memory records, not as a
+  change of the harness state file, even when a command ran in the same cell.
 - No git work ever runs on the cell's own thread. A before-state snapshot runs
   on a worker: at the cell's start (while `bash()` handles from earlier cells
   are alive) nothing waits for it at all, and a process the cell starts waits
