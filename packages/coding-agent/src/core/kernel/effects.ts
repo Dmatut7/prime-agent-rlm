@@ -28,6 +28,7 @@ const MEMORY_KINDS = new Set<KernelMemoryChange["kind"]>(["memory", "skill", "su
 const MEMORY_SCOPES = new Set<KernelMemoryChange["scope"]>(["session", "global", "project"]);
 const ACTIVITY_KINDS = new Set<KernelActivity["kind"]>(["command", "read", "search", "fetch", "subagent"]);
 const ACTIVITY_STATUSES = new Set<KernelActivity["status"]>(["running", "ok", "error"]);
+const COMMIT_ID = /^[0-9a-f]{7,40}$/;
 
 function member<T extends string>(set: ReadonlySet<T>, value: unknown): value is T {
 	return typeof value === "string" && set.has(value as T);
@@ -125,6 +126,7 @@ export function parseActivityDisplay(payload: unknown): KernelActivity | undefin
 	if (startedAt === undefined) return undefined;
 	const detail = optionalString(payload.detail);
 	const endedAt = count(payload.endedAt);
+	const commit = typeof payload.commit === "string" && COMMIT_ID.test(payload.commit) ? payload.commit : undefined;
 	return {
 		id: payload.id,
 		kind: payload.kind,
@@ -133,6 +135,8 @@ export function parseActivityDisplay(payload: unknown): KernelActivity | undefin
 		...(detail !== undefined ? { detail } : {}),
 		startedAt,
 		...(endedAt !== undefined ? { endedAt } : {}),
+		...(payload.background === true ? { background: true } : {}),
+		...(commit !== undefined ? { commit } : {}),
 	};
 }
 
@@ -166,6 +170,10 @@ export class KernelEffectsAccumulator {
 	private readonly droppedIds = new Set<string>();
 	private dropped = 0;
 	private incomplete: string | undefined;
+	// Once a list has held something, an empty list is a fact (everything was retracted), not an
+	// absence: it must reach the viewer explicitly, or the last non-empty list stays on screen.
+	private filesReported = false;
+	private memoryReported = false;
 
 	constructor(private readonly maxActivities: number = MAX_ACTIVITIES_PER_CELL) {}
 
@@ -178,6 +186,7 @@ export class KernelEffectsAccumulator {
 				changed = this.files.delete(record.key) || changed;
 			} else if (record) {
 				this.files.set(record.path, record);
+				this.filesReported = true;
 				changed = true;
 			}
 		}
@@ -187,6 +196,7 @@ export class KernelEffectsAccumulator {
 				changed = this.memory.delete(record.key) || changed;
 			} else if (record) {
 				this.memory.set(memoryKey(record.kind, record.scope, record.id ?? record.title), record);
+				this.memoryReported = true;
 				changed = true;
 			}
 		}
@@ -241,11 +251,14 @@ export class KernelEffectsAccumulator {
 		};
 	}
 
-	/** The ExecuteResult fields, each omitted when empty. */
+	/**
+	 * The ExecuteResult fields. A list is omitted only when it never held anything; one emptied by
+	 * retractions is sent as `[]`.
+	 */
 	resultFields(): Partial<KernelCellEffects> {
 		return {
-			...(this.files.size > 0 ? { fileChanges: [...this.files.values()] } : {}),
-			...(this.memory.size > 0 ? { memoryChanges: [...this.memory.values()] } : {}),
+			...(this.filesReported ? { fileChanges: [...this.files.values()] } : {}),
+			...(this.memoryReported ? { memoryChanges: [...this.memory.values()] } : {}),
 			...(this.activities.size > 0 ? { activities: [...this.activities.values()] } : {}),
 			...(this.dropped > 0 ? { activitiesDropped: this.dropped } : {}),
 			...(this.incomplete !== undefined ? { changeTrackingIncomplete: this.incomplete } : {}),

@@ -523,9 +523,13 @@ export interface IpythonToolDetails {
 	backgroundOutput?: string;
 	/** Diffs streamed from file edits, rendered by the cell view. */
 	diffs?: KernelDiffDisplay[];
-	/** Every file effect of the cell, in observation order. Display-only: never sent to the model or read by compaction. */
+	/**
+	 * Every file effect of the cell, in observation order. Absent when the cell reported none; `[]`
+	 * when everything it reported was retracted (a file restored to how it started), which replaces
+	 * any earlier list. Display-only: never sent to the model or read by compaction.
+	 */
 	fileChanges?: KernelFileChange[];
-	/** Harness memory, skill, note, and rules-file changes made by the cell. Display-only, like `fileChanges`. */
+	/** Harness memory, skill, note, and rules-file changes made by the cell. Absent / `[]` like `fileChanges`. Display-only. */
 	memoryChanges?: KernelMemoryChange[];
 	/**
 	 * Steps the kernel observed inside the cell, one entry per step id with its latest state, at most

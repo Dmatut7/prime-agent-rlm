@@ -98,6 +98,16 @@ describe("change-tracking display payloads", () => {
 			key: "memory\u0000session\u0000tmp",
 		});
 		expect(parseActivityDisplay(command)).toEqual(command);
+		const background: KernelActivity = {
+			...command,
+			status: "ok",
+			endedAt: 1_700_000_009_000,
+			background: true,
+			commit: "1a2b3c4",
+		};
+		expect(parseActivityDisplay(background)).toEqual(background);
+		// Only a real flag and a real commit id survive.
+		expect(parseActivityDisplay({ ...command, background: "yes", commit: "not-a-sha" })).toEqual(command);
 	});
 
 	it("ignores malformed records instead of throwing", () => {
@@ -150,6 +160,23 @@ describe("change-tracking display payloads", () => {
 		effects.apply({ [FILE_CHANGE_DISPLAY_MIME]: { ...fileChange, path: "/repo/c.txt" } });
 		expect(snapshot.fileChanges).toHaveLength(1);
 		expect(new KernelEffectsAccumulator().resultFields()).toEqual({});
+	});
+
+	it("sends a list emptied by retractions explicitly, and leaves out a list that never held anything", () => {
+		const effects = new KernelEffectsAccumulator();
+		expect(effects.resultFields()).toEqual({});
+		effects.apply({ [FILE_CHANGE_DISPLAY_MIME]: fileChange });
+		effects.apply({ [MEMORY_CHANGE_DISPLAY_MIME]: { ...memoryChange, op: "created" } });
+		effects.apply({ [FILE_CHANGE_DISPLAY_MIME]: { path: fileChange.path, retracted: true } });
+		effects.apply({
+			[MEMORY_CHANGE_DISPLAY_MIME]: { kind: "memory", scope: "session", id: memoryChange.id, retracted: true },
+		});
+		expect(effects.resultFields()).toEqual({ fileChanges: [], memoryChanges: [] });
+		const details = assembleIpythonToolResult(cellResult({ ...effects.resultFields() }), {
+			kernelRestarted: false,
+		}).details;
+		expect(details.fileChanges).toEqual([]);
+		expect(details.memoryChanges).toEqual([]);
 	});
 
 	it("keeps at most the most recent steps, dropping finished ones first and counting them", () => {
@@ -253,6 +280,7 @@ describe("change tracking never reaches the model", () => {
 			const tracked = { ...withEffects, status, error: base.error };
 			const plain = assembleIpythonToolResult(base, { kernelRestarted: false });
 			const rich = assembleIpythonToolResult(tracked, { kernelRestarted: false });
+			expect(textOf(plain.content).length).toBeGreaterThan(0);
 			expect(JSON.stringify(rich.content)).toBe(JSON.stringify(plain.content));
 			expect(rich.isError).toBe(plain.isError);
 		}
@@ -359,6 +387,27 @@ describe("ipython tool live change updates", () => {
 		});
 		const plain = await plainTool.execute("call-2", { code: "work()" }, undefined, undefined, {} as ExtensionContext);
 		expect(JSON.stringify(result.content)).toBe(JSON.stringify(plain.content));
+	});
+
+	it("coalesces a burst of ten records into at most two updates", async () => {
+		const execute = vi.fn(async (_code: string, opts?: ExecuteOptions) => {
+			for (let step = 0; step < 10; step++) opts?.onEffects?.(effectsAt(step));
+			await sleep(LIVE_EFFECTS_UPDATE_INTERVAL_MS + 100);
+			return cellResult();
+		});
+		const updates: IpythonToolDetails[] = [];
+		const tool = createIpythonToolDefinition("/tmp", { provisioner: fakeProvisioner(execute) });
+		await tool.execute(
+			"call-burst",
+			{ code: "x" },
+			undefined,
+			(partial) => updates.push((partial as { details: IpythonToolDetails }).details),
+			{} as ExtensionContext,
+		);
+		// Without the throttle this would be ten updates; with it, the first record and one trailing one.
+		expect(updates.length).toBeGreaterThanOrEqual(1);
+		expect(updates.length).toBeLessThanOrEqual(2);
+		expect(updates.at(-1)?.activities?.[0]?.detail).toBe("line 9");
 	});
 
 	it("sends no change update after the tool has returned", async () => {

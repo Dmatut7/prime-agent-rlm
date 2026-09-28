@@ -146,6 +146,60 @@ describe.skipIf(!canRunKernel)("change tracking through the real kernel", () => 
 		expect(finishedAt - (firstLive?.at ?? finishedAt)).toBeGreaterThan(500);
 	}, 60_000);
 
+	function toolOver(manager: ReplKernelManager, root: string) {
+		const provisioner = {
+			ensure: vi.fn(async () => manager as KernelClient),
+			kill: vi.fn(async () => {}),
+		} as unknown as IpythonKernelProvisioner;
+		return createIpythonToolDefinition(root, { provisioner });
+	}
+
+	it("clears a change that was undone within the cell, live and in the final details", async () => {
+		const { root, state } = project();
+		const manager = kernel(root, state, "1");
+		const tool = toolOver(manager, root);
+		const partials: IpythonToolDetails[] = [];
+		const result = await tool.execute(
+			"call-undo",
+			{
+				code: [
+					"import rlm, time",
+					"open('a.txt', 'w').write('changed\\n')",
+					"rlm.harness.create_memory('Scratch', 'temporary', id='scratch')",
+					"time.sleep(0.8)",
+					"open('a.txt', 'w').write('one\\ntwo\\nthree\\n')",
+					"rlm.harness.delete_memory('scratch')",
+					"time.sleep(0.5)",
+				].join("\n"),
+			},
+			undefined,
+			(partial) => partials.push((partial as { details: IpythonToolDetails }).details),
+			{} as ExtensionContext,
+		);
+		expect(result.details.status).toBe("ok");
+		// The viewer saw the change live, then an explicit empty list replacing it.
+		const shown = partials.findIndex((details) => (details.fileChanges?.length ?? 0) === 1);
+		expect(shown).toBeGreaterThanOrEqual(0);
+		const cleared = partials.findIndex((details, index) => index > shown && details.fileChanges?.length === 0);
+		expect(cleared).toBeGreaterThan(shown);
+		expect(partials.some((details) => (details.memoryChanges?.length ?? 0) === 1)).toBe(true);
+		expect(partials.some((details) => details.memoryChanges?.length === 0)).toBe(true);
+		expect(result.details.fileChanges).toEqual([]);
+		expect(result.details.memoryChanges).toEqual([]);
+	}, 60_000);
+
+	it("reports a command its cell left running as moved to the background, and its end in a later cell", async () => {
+		const { root, state } = project();
+		const manager = kernel(root, state, "1");
+		const first = await manager.execute("import rlm\nh = rlm.bash('sleep 0.6; echo finished')\nh.pid");
+		const left = first.activities?.find((activity) => activity.kind === "command");
+		expect(left).toMatchObject({ status: "running", background: true });
+		expect(left?.endedAt).toBeGreaterThanOrEqual(left?.startedAt ?? Number.POSITIVE_INFINITY);
+		const second = await manager.execute("import time\ntime.sleep(1.2)");
+		const ended = second.activities?.find((activity) => activity.id === left?.id);
+		expect(ended).toMatchObject({ status: "ok", background: true, detail: "finished" });
+	}, 60_000);
+
 	it("keeps a cell of many commands bounded, in its result and in its live updates", async () => {
 		const { root, state } = project();
 		const manager = kernel(root, state, "1");
@@ -209,6 +263,7 @@ describe.skipIf(!canRunKernel)("change tracking through the real kernel", () => 
 			expect(offResult.activities).toBeUndefined();
 			const plain = assembleIpythonToolResult(offResult, { kernelRestarted: false });
 			const tracked = assembleIpythonToolResult(onResult, { kernelRestarted: false });
+			expect(plain.content.some((block) => block.type === "text" && block.text.length > 0)).toBe(true);
 			expect(JSON.stringify(tracked.content)).toBe(JSON.stringify(plain.content));
 			expect(tracked.isError).toBe(plain.isError);
 		}
