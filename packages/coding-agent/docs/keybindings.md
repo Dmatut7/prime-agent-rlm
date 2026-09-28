@@ -109,6 +109,7 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 | `app.modal.back` | `left` | Go back / close the current dialog |
 | `app.subagents.focus` | `alt+a` | Open child agents |
 | `app.subagents.stopAll` | `alt+x` | Stop every running subagent of this session (press again to confirm); also works in the agents view for the selected agent's family |
+| `app.stall.diagnostics` | `ctrl+y` | Show or close the stall diagnostics for the current turn. Active only while the stall action bar, or the diagnostics block it opened, is showing; otherwise `ctrl+y` keeps its editor meaning (`tui.editor.yank`) |
 
 ### Sessions
 
@@ -132,6 +133,7 @@ Used inside the agents view (opened by `/resume` or `app.session.resume`). The s
 | `app.agents.delete` | `ctrl+x` | Stop or delete selected agent (press again to confirm) |
 | `app.agents.program` | `ctrl+o` | Show the program that spawned subagents |
 | `app.agents.rename` | `ctrl+r` | Rename selected agent session |
+| `app.agents.expand` | `alt+right` | Expand or collapse selected agent subagents |
 
 ### Heartbeats
 
@@ -149,6 +151,7 @@ Used inside the agents view (opened by `/resume` or `app.session.resume`). The s
 | `app.model.cycleForward` | `alt+m` | Cycle to the next scoped model |
 | `app.model.cycleBackward` | `shift+alt+m` | Cycle to the previous scoped model |
 | `app.thinking.toggle` | `ctrl+t` | Collapse or expand thinking blocks |
+| `app.thinking.toggleAll` | `alt+t` | Expand thinking traces in every turn |
 
 ### Configuration Menu
 
@@ -163,10 +166,11 @@ Use `tab` to cycle forward and `shift+tab` to cycle backward through Providers, 
 
 | Keybinding id | Default | Description |
 |--------|---------|-------------|
-| `app.tools.expand` | `ctrl+o` | Collapse or expand tool output |
-| `app.tools.expandAll` | `alt+o` | Collapse or expand tool output in every turn, not just the latest |
+| `app.tools.expand` | `ctrl+o` | Expand the latest turn's process surface (tools, outputs, diffs) |
+| `app.tools.expandAll` | `alt+o` | Expand every turn's process surface, not just the latest |
 | `app.tools.expandFull` | `alt+shift+o` | Show tool output in full, ignoring the expanded render budget |
 | `app.messages.expand` | `ctrl+p` | Collapse or expand agent-to-agent messages |
+| `app.messages.expandAll` | `alt+p` | Expand agent messages in every turn |
 | `app.edits.expand` | `ctrl+j` | Collapse or expand edit diffs |
 | `app.turn.focus` | `alt+j`, `ctrl+j` | Walk the latest turn's box: arrows move, PageUp/PageDown scroll it, Enter opens a row, Escape leaves. Outside the quiet conversation (`ui.processMode: "legacy"`) both keys open or close the edit diffs instead, like `app.edits.expand`. Terminals without extended keys (tmux without `extended-keys`) send `ctrl+j` as a newline, so there `alt+j` is the key that reaches the app |
 | `app.message.followUp` | `alt+enter` | Queue follow-up message |
@@ -174,6 +178,18 @@ Use `tab` to cycle forward and `shift+tab` to cycle backward through Providers, 
 | `app.message.navigateNewer` | `alt+down` | Select the next newer pending message or restore the draft |
 | `app.message.moveEarlier` | `ctrl+alt+up` | Move the selected pending message one place earlier in its queue |
 | `app.message.moveLater` | `ctrl+alt+down` | Move the selected pending message one place later in its queue |
+
+### Block Navigation
+
+Walks the conversation blocks from the keyboard. `alt+up` and `alt+down` are shared with the pending-message browser: with queued messages they browse the queue, without any they walk the blocks (`alt+up` at the prompt starts it). The other keys act on the focused block.
+
+| Keybinding id | Default | Description |
+|--------|---------|-------------|
+| `app.blocks.prev` | `alt+up` | Focus the previous conversation block |
+| `app.blocks.next` | `alt+down` | Focus the next conversation block |
+| `app.blocks.toggle` | `enter`, `space` | Open or close the focused block |
+| `app.blocks.copy` | `y` | Copy the focused block |
+| `app.blocks.exit` | `escape` | Leave block navigation |
 
 ### Tree Navigation
 

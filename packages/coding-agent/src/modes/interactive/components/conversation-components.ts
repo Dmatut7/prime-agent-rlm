@@ -265,7 +265,7 @@ export function buildConversationComponents(
 						{ content: [{ type: "text", text: message.errorMessage || "已中断" }], isError: true },
 						false,
 					);
-					state.setStepStatus(content.id, "error");
+					state.setStepStatus(content.id, "error", Number(message.timestamp) || Date.now());
 				} else {
 					pendingTools.set(content.id, tool);
 				}
