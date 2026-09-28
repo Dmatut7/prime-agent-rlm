@@ -78,6 +78,7 @@ export function parseFileChangeDisplay(payload: unknown): KernelFileChange | Ker
 		...(payload.diffTruncated === true ? { diffTruncated: true } : {}),
 		...(member(DIFF_OMITTED, payload.diffOmitted) ? { diffOmitted: payload.diffOmitted } : {}),
 		...(payload.binary === true ? { binary: true } : {}),
+		...(payload.symlink === true ? { symlink: true } : {}),
 		source: payload.source,
 		at,
 	};

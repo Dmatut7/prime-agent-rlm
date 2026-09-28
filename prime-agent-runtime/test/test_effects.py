@@ -553,6 +553,14 @@ class NoGitTests(TrackerCase):
         cell = self.kernel.run("import os\nos.makedirs('dist', exist_ok=True)\nopen('dist/x.js', 'w').write('x')\n")
         self.assertEqual(cell.files(), {})
 
+    def test_a_background_command_that_ends_between_cells_reports_its_files_in_the_next_cell(self):
+        first = self.kernel.run("h = bash('sleep 0.3; echo late > late.txt')\nh.pid")
+        self.assertNotIn("late.txt", first.by_rel())
+        time.sleep(1.2)  # the model thinking: the command ends while no cell runs
+        second = self.kernel.run("x = 1")
+        record = second.by_rel()["late.txt"]
+        self.assertEqual((record["kind"], record["source"], record["added"]), ("created", "shell", 1))
+
 
 # Every function _install_wrappers replaces; each wrapper carries `__wrapped__` (functools.wraps).
 _WRAP_PROBE = (
@@ -650,6 +658,23 @@ class BackgroundCommandTests(TrackerCase):
         self.assertEqual(result["text"], "1")  # the running cell only
         self.kernel.run("h.kill()")
 
+    def test_a_background_command_that_ends_between_cells_reports_its_files_in_the_next_cell(self):
+        first = self.kernel.run("h = bash('sleep 0.3; echo late > late.txt; echo more >> a.txt')\nh.pid")
+        self.assertEqual(first.files(), {})
+        time.sleep(1.2)  # the model thinking: the command ends while no cell runs
+        second = self.kernel.run("x = 1")
+        command = self._command(second)
+        self.assertEqual((command["status"], command["background"]), ("ok", True))
+        files = second.by_rel()
+        self.assertEqual(sorted(files), ["a.txt", "late.txt"])
+        self.assertEqual((files["late.txt"]["kind"], files["late.txt"]["source"]), ("created", "shell"))
+        self.assertIn("+late\n", files["late.txt"]["diff"])
+        self.assertEqual(files["a.txt"]["kind"], "modified")
+        self.assertIn("+more\n", files["a.txt"]["diff"])
+        # Reported once, in the cell that also reports the command's end.
+        third = self.kernel.run("x = 2")
+        self.assertEqual(third.files(), {})
+
     def test_an_awaited_command_is_never_marked_background(self):
         cell = self.kernel.run("await bash('echo hi')")
         record = self._command(cell)
@@ -681,6 +706,71 @@ class BackgroundCommandTests(TrackerCase):
         self.assertIsNone(effects._commit_id("git log -1", 0, "[build/deadbeef1] x\n"))
         self.assertIsNone(effects._commit_id("git log -1", 0, "[deadbeef123] x\n"))
         self.assertIsNone(effects._commit_id("git log -1", 0, "[main] 1a2b3c4] x\n"))
+
+
+@unittest.skipUnless(HAS_GIT and os.name == "posix", "needs git and a POSIX shell")
+class TempFileTests(TrackerCase):
+    def _all_paths(self, *cells: Cell) -> set[str]:
+        return {record.get("relPath") or record["path"] for cell in cells for record in cell.payloads(FILE)}
+
+    def test_a_sed_temp_file_left_at_the_cells_end_is_never_a_creation(self):
+        # BSD sed's in-place edit, slowed down: the new content sits in `.!<pid>!a.txt` as the cell
+        # ends and is renamed over a.txt while no cell runs.
+        first = self.kernel.run(
+            "await bash('printf \"one\\\\nTWO\\\\nthree\\\\n\" > .!4242!a.txt')\n"
+            "h = bash('sleep 0.3; mv .!4242!a.txt a.txt')\nh.pid"
+        )
+        time.sleep(1.2)
+        second = self.kernel.run("x = 1")
+        self.assertEqual(self._all_paths(first, second), {"a.txt"})
+        record = second.by_rel()["a.txt"]
+        self.assertEqual((record["kind"], record["source"]), ("modified", "shell"))
+        self.assertIn("-two\n+TWO\n", record["diff"])
+
+    @unittest.skipUnless(sys.platform == "darwin", "only BSD sed (macOS) edits through a .!<pid>!<name> file")
+    def test_an_unawaited_sed_on_a_large_file_reports_the_file_and_never_its_temp_copy(self):
+        self.write("big.txt", "".join(f"line {i:06d} padding padding padding padding padding\n" for i in range(400_000)))
+        _git(self.root, "add", "big.txt")
+        _git(self.root, "commit", "-qm", "big")
+        first = self.kernel.run("h = bash('sed -i \"\" \"s/line 050000/line 050000 SED/\" big.txt')\nh.pid")
+        time.sleep(2.0)
+        second = self.kernel.run("x = 1")
+        self.assertEqual(_git(self.root, "status", "--porcelain"), " M big.txt\n")
+        self.assertEqual(self._all_paths(first, second), {"big.txt"})
+        shown = {**first.by_rel(), **second.by_rel()}
+        self.assertEqual(shown["big.txt"]["kind"], "modified")
+
+
+@unittest.skipUnless(HAS_GIT and os.name == "posix", "needs git and symlinks")
+class SymlinkTests(TrackerCase):
+    def test_a_python_write_through_a_link_is_filed_under_the_real_file(self):
+        os.symlink("a.txt", self.path("link.txt"))
+        _git(self.root, "add", "link.txt")
+        _git(self.root, "commit", "-qm", "link")
+        cell = self.kernel.run("open('link.txt', 'a').write('via link\\n')\nopen('a.txt', 'a').write('direct\\n')")
+        files = cell.by_rel()
+        self.assertEqual(sorted(files), ["a.txt"])
+        self.assertEqual((files["a.txt"]["added"], files["a.txt"]["removed"]), (2, 0))
+        self.assertIn("+via link\n+direct\n", files["a.txt"]["diff"])
+
+    def test_a_new_link_is_a_link_without_its_targets_lines(self):
+        cell = self.kernel.run("await bash('ln -s a.txt blink.txt')")
+        record = cell.by_rel()["blink.txt"]
+        self.assertEqual(record["kind"], "created")
+        self.assertTrue(record["symlink"])
+        self.assertEqual((record["added"], record["removed"]), (0, 0))
+        self.assertNotIn("diff", record)
+        cell = self.kernel.run("import os\nos.remove('blink.txt')")
+        record = cell.by_rel()["blink.txt"]
+        self.assertEqual((record["kind"], record["removed"], record["symlink"]), ("deleted", 0, True))
+        self.assertTrue(os.path.exists(self.path("a.txt")))
+
+    def test_an_untracked_link_does_not_double_a_change_to_its_target(self):
+        os.symlink("a.txt", self.path("blink.txt"))
+        cell = self.kernel.run("await bash('echo q >> a.txt')")
+        files = cell.by_rel()
+        self.assertEqual(sorted(files), ["a.txt"])
+        self.assertEqual(files["a.txt"]["added"], 1)
 
 
 @unittest.skipUnless(HAS_GIT, "git is needed for the work-tree comparison")
@@ -770,6 +860,23 @@ class SlowGitTests(TrackerCase):
         self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + 0.7)
         self.assertIn("snapshot", cell.payloads(STATUS)[0]["incomplete"])
         self.kernel.run("h.kill()")
+
+    def test_a_background_end_with_a_slow_git_never_holds_up_the_next_cell(self):
+        self.kernel.run("h = bash('sleep 0.2; echo late > late.txt')\nh.pid")
+        self.slow(True)
+        try:
+            time.sleep(0.6)  # the command has ended; its comparison is stuck on git
+            cell, sent, elapsed = self.timed("import time\nprint(time.time())")
+            time.sleep(0.5)
+            later = self.kernel.run("x = 1")
+        finally:
+            self.slow(False)
+        body_started = float(cell.stdout().split()[0])
+        self.assertLess(body_started - sent, 0.25)
+        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + _BUDGET_SLACK_S)
+        reasons = [status["incomplete"] for status in cell.payloads(STATUS) + later.payloads(STATUS)]
+        self.assertEqual(len(reasons), 1, reasons)
+        self.assertIn("background command", reasons[0])
 
     def test_a_command_waits_at_most_the_budget_for_its_snapshot(self):
         self.slow(True)

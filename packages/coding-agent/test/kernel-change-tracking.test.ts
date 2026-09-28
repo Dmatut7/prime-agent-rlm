@@ -88,6 +88,16 @@ describe("change-tracking display payloads", () => {
 		expect(
 			parseFileChangeDisplay({ ...fileChange, diff: undefined, diffOmitted: "no_baseline", binary: false }),
 		).toEqual({ ...fileChange, diff: undefined, diffOmitted: "no_baseline" });
+		const link: KernelFileChange = {
+			...fileChange,
+			kind: "created",
+			added: 0,
+			removed: 0,
+			diff: undefined,
+			symlink: true,
+		};
+		expect(parseFileChangeDisplay(link)).toEqual(link);
+		expect(parseFileChangeDisplay({ ...link, symlink: "yes" })).toEqual({ ...link, symlink: undefined });
 		expect(parseFileChangeDisplay({ path: "/repo/x", retracted: true })).toEqual({
 			retracted: true,
 			key: "/repo/x",

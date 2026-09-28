@@ -271,6 +271,8 @@ export interface KernelFileChange {
 	 */
 	diffOmitted?: "too_large" | "no_baseline" | "budget";
 	binary?: boolean;
+	/** True when the path is (or was) a symlink: the link itself changed, so there are no line counts or diff. */
+	symlink?: boolean;
 	/** How the change was observed. */
 	source: "python" | "shell" | "edit";
 	/** Epoch ms when the kernel observed the change. */

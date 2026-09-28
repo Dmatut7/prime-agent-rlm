@@ -531,6 +531,8 @@ old one is reclaimed only after its references drop to zero.
 }
 ```
 
+What it does not see: files that a command started from a cell (`bash()`, `subprocess`) writes outside the session's working folder (its git work tree, when it is in one), for example `cd /tmp/build && make` or `curl -o /tmp/data.json`. Commands are checked by comparing that folder before and after; watching the whole disk would cost every cell time. Files Python writes itself are listed wherever they are.
+
 ### Diagnostics
 
 | Setting | Type | Default | Description |

@@ -20,9 +20,9 @@ Observation paths:
 - A bounded before/after comparison catches what child processes did (``sed -i``,
   formatters, ``git checkout``). Inside a git work tree it compares ``git status``
   snapshots plus stat and content caches; elsewhere it compares a bounded mtime
-  scan. It runs only for a cell that starts a process, or while ``bash()`` handles
-  from earlier cells are still alive, because nothing else can change a file
-  behind Python's back.
+  scan. It runs only for a cell that starts a process, while ``bash()`` handles
+  from earlier cells are still alive, or when such a handle ends between cells,
+  because nothing else can change a file behind Python's back.
 - ``bash()``, ``rlm.run()``, harness writes and the web skills report their own
   steps through the helpers at the bottom of this module.
 
@@ -130,6 +130,8 @@ _SKIP_DIR_NAMES = frozenset(
 _BUILD_DIR_NAMES = frozenset({"dist", "build", "out", "target", "coverage", ".output"})
 _SKIP_SUFFIXES = (".pyc", ".pyo", ".swp", ".swx")
 _SKIP_FILE_NAMES = frozenset({".DS_Store"})
+# BSD `sed -i` (macOS) writes the new content to `.!<pid>!<name>` and renames it over the file.
+_SED_TEMP = re.compile(r"\.![0-9]+!.")
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
 
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
@@ -176,6 +178,23 @@ def _stat_sig(path: str) -> tuple[int, int] | None:
     return (info.st_size, info.st_mtime_ns)
 
 
+# The size slot of a symlink's own signature: a link is compared as itself, never as its target.
+_LINK_SIZE = -1
+
+
+def _entry_sig(path: str) -> tuple[int, int] | None:
+    """`_stat_sig` of the path itself: a symlink gives (`_LINK_SIZE`, its own mtime_ns)."""
+    try:
+        info = os.lstat(path)
+    except (OSError, ValueError):
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        return (_LINK_SIZE, info.st_mtime_ns)
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    return (info.st_size, info.st_mtime_ns)
+
+
 def _read_file(path: str, limit: int) -> bytes | None:
     """Whole content when it fits under `limit`, else None."""
     try:
@@ -208,6 +227,7 @@ class _Content:
         self, state: str, data: bytes | None = None, sig: tuple[int, int] | None = None, why: str | None = None
     ) -> None:
         # state: "absent" | "bytes" | "large" (exists, too big to keep) | "unknown" (exists, not captured)
+        # | "link" (a symlink; `data` is its target)
         self.state = state
         self.data = data
         self.sig = sig
@@ -222,6 +242,14 @@ _ABSENT = _Content("absent")
 _UNKNOWN = _Content("unknown", why="no_baseline")
 # A path the before-commit does not contain (see _Tracker.blobs).
 _MISSING = b"\0missing"
+
+
+def _link_content(path: str, sig: tuple[int, int]) -> _Content:
+    try:
+        target = os.fsencode(os.readlink(path))
+    except (OSError, ValueError):
+        target = None
+    return _Content("link", target, sig)
 
 
 class _ContentCache:
@@ -313,6 +341,17 @@ class _RepoState:
         self.stats = stats
 
 
+class _After:
+    """The state a command comparison ended on: git states per work tree and the mtime scan."""
+
+    __slots__ = ("repos", "scan", "roots")
+
+    def __init__(self) -> None:
+        self.repos: dict[str, _RepoState] = {}
+        self.scan: tuple[str, dict[str, tuple[int, int]]] | None = None
+        self.roots: set[str] = set()
+
+
 class _Cell:
     def __init__(self, cell_id: str, budget_s: float) -> None:
         self.id = cell_id
@@ -386,6 +425,10 @@ _IGNORE_UNKNOWN = (
 _COMPARE_LATE = (
     "comparing the files commands changed took longer than the tracking budget, "
     "so changes made by commands in this cell are not listed"
+)
+_GAP_LATE = (
+    "comparing the files a background command changed after its cell ended took longer than "
+    "the tracking budget, so those changes are not listed"
 )
 
 
@@ -634,6 +677,14 @@ class _Tracker:
         self.cwd_git_root: str | None = None
         self.pending_completions: list[dict[str, Any]] = []
         self.lost_completions = 0
+        # Where the last cell's command comparison ended, kept while it left commands running: a
+        # command that ends before the next cell starts is compared against it (see `_gap_check`).
+        self.carried: _After | None = None
+        # What those between-cell comparisons found, for the next cell: path -> baseline.
+        self.pending_changes: dict[str, _Content] = {}
+        self.pending_note: str | None = None
+        self._gap_running = False
+        self._gap_again = False
         # Resolved once, off every cell's path: a slow or hung git must not stall a write wrapper.
         self._cwd_git_resolved = threading.Event()
         self._refresh_paths()
@@ -678,7 +729,9 @@ class _Tracker:
             self.skip_roots = skip_roots
             self._info_cache.clear()
 
-    def resolve(self, raw: Any) -> str | None:
+    def resolve(self, raw: Any, follow: bool = False) -> str | None:
+        """The absolute path with its directories resolved. `follow` (a write through the path, not
+        a removal of it): a symlink resolves to its target when the target is a place tracking reports."""
         if isinstance(raw, int):
             return None
         try:
@@ -697,7 +750,17 @@ class _Tracker:
             if len(self._dir_cache) > _PATH_CACHE_LIMIT:
                 self._dir_cache.clear()
             self._dir_cache[directory] = real_dir
-        return os.path.join(real_dir, name)
+        path = os.path.join(real_dir, name)
+        if follow:
+            try:
+                is_link = stat.S_ISLNK(os.lstat(path).st_mode)
+            except (OSError, ValueError):
+                is_link = False
+            if is_link:
+                target = os.path.realpath(path)
+                if target != path and self.classify(target) is not None:
+                    return target
+        return path
 
     def _cwd_git_state(self) -> bool | None:
         """Whether the session cwd is in a git work tree; None while the one-time lookup still runs."""
@@ -731,7 +794,7 @@ class _Tracker:
 
     def _classify_uncached(self, path: str) -> _PathInfo | None:
         directory, name = os.path.split(path)
-        if name in _SKIP_FILE_NAMES or name.endswith(_SKIP_SUFFIXES):
+        if name in _SKIP_FILE_NAMES or name.endswith(_SKIP_SUFFIXES) or _SED_TEMP.match(name):
             return None
         if any(part in _SKIP_DIR_NAMES for part in directory.split(os.sep)):
             return None
@@ -817,9 +880,9 @@ class _Tracker:
         for index, path in enumerate(entries):
             if index % 64 == 63 and _left(deadline) <= 0:
                 raise _OutOfTime()
-            sig = _stat_sig(path)
+            sig = _entry_sig(path)
             stats[path] = sig
-            if not fill_cache or sig is None or sig[0] > SNAPSHOT_CONTENT_FILE_BYTES:
+            if not fill_cache or sig is None or not 0 <= sig[0] <= SNAPSHOT_CONTENT_FILE_BYTES:
                 continue
             if self.cache.get(path, sig) is not None:
                 continue
@@ -971,25 +1034,38 @@ class _Tracker:
             self.cell = cell
             completions, self.pending_completions = self.pending_completions, []
             lost, self.lost_completions = self.lost_completions, 0
+            # From here on this cell's own snapshots cover commands still running.
+            self.carried = None
+            changes, self.pending_changes = self.pending_changes, {}
+            note, self.pending_note = self.pending_note, None
         if lost:
             cell.note_incomplete(
                 f"{lost} background commands ended while no cell was running and their results were lost"
             )
-        # Background commands that finished while no cell was running report here, first.
+        if note:
+            cell.note_incomplete(note)
+        # Background commands that finished while no cell was running report here, first, and the
+        # files they changed after their cell ended with them.
         for record in completions:
             self.send_activity(cell.id, record)
-        live = 0
-        bash_module = sys.modules.get("rlm.bash")
-        if bash_module is not None:
-            try:
-                live = int(bash_module.live_handle_facts(None).get("handles", 0))
-            except Exception:  # noqa: BLE001
-                live = 0
-        if live > 0:
+        if changes:
+            self.apply_shell_changes(cell, list(changes.items()))
+            with self.lock:
+                self._wake_watcher()
+        if self._live_handles() > 0:
             # Commands from earlier cells may still be writing; compare from this cell's start. The
             # snapshot runs on a worker and the cell starts at once; a process the cell starts later
             # waits for it, bounded by the budget (see request_snapshot).
             self.request_snapshot(cell, os.getcwd(), wait=False)
+
+    def _live_handles(self) -> int:
+        bash_module = sys.modules.get("rlm.bash")
+        if bash_module is None:
+            return 0
+        try:
+            return int(bash_module.live_handle_facts(None).get("handles", 0))
+        except Exception:  # noqa: BLE001
+            return 0
 
     def discard_cell(self, cell_id: str) -> None:
         with self.lock:
@@ -1022,7 +1098,9 @@ class _Tracker:
                     for job in list(cell.snapshots):
                         self._await_snapshot(cell, job, deadline)
                     if cell.gave_up is None and (cell.repos or cell.scan is not None):
-                        self._final_shell_compare(cell, deadline)
+                        # Commands left running may still change files after this comparison.
+                        keep = bool(still_running) or self._live_handles() > 0
+                        self._final_shell_compare(cell, deadline, keep)
                     if cell.files and not self._cwd_git_resolved.is_set():
                         # Ignore rules and the build-output rule need it; normally it resolved long ago.
                         self._cwd_git_resolved.wait(max(0.0, _left(deadline)))
@@ -1043,7 +1121,11 @@ class _Tracker:
             with self.lock:
                 if self.cell is cell:
                     self.cell = None
+                ended_while_closing = bool(self.pending_completions)
             self.local.busy = False
+        if ended_while_closing:
+            # A command ended while this cell was finishing, maybe after its comparison.
+            self._request_gap_check()
         return interrupted
 
     def active(self) -> _Cell | None:
@@ -1055,16 +1137,18 @@ class _Tracker:
             return None
         return cell
 
-    def _final_shell_compare(self, cell: _Cell, deadline: float) -> None:
+    def _final_shell_compare(self, cell: _Cell, deadline: float, keep: bool = False) -> None:
         """The end-of-cell comparison, computed on a worker so a slow git cannot hold the event
-        loop past the budget; its result is applied here, on the cell's thread."""
+        loop past the budget; its result is applied here, on the cell's thread. `keep`: the state it
+        ends on is kept for commands that end before the next cell starts."""
         outcome: dict[str, Any] = {}
         done = threading.Event()
+        ended = _After() if keep else None
 
         def work() -> None:
             self.local.busy = True
             try:
-                outcome["changes"] = self.shell_changes(cell, deadline)
+                outcome["changes"] = self.shell_changes(cell, deadline, ended)
             except _OutOfTime:
                 outcome["late"] = True
             except Exception:  # noqa: BLE001
@@ -1082,6 +1166,10 @@ class _Tracker:
             cell.note_incomplete("internal error while comparing command changes")
         else:
             self.apply_shell_changes(cell, outcome["changes"])
+            if ended is not None:
+                ended.roots = set(cell.roots_seen)
+                with self.lock:
+                    self.carried = ended
 
     def guarded(self, cell: _Cell, work: Callable[[], Any]) -> Any:
         """Run tracker work on the calling thread with the budget charged and failures contained."""
@@ -1100,7 +1188,8 @@ class _Tracker:
     # ------------------------------------------------------------ file writes
 
     def on_write(self, cell: _Cell, raw: Any, deleting: bool = False) -> None:
-        path = self.resolve(raw)
+        # A removal acts on the link itself; any other write lands in the link's target.
+        path = self.resolve(raw, follow=not deleting)
         if path is None:
             return
         with self.lock:
@@ -1127,13 +1216,15 @@ class _Tracker:
             self._wake_watcher()
 
     def capture(self, cell: _Cell, path: str) -> _Content | None:
-        """The file's current state, taken before the write lands; None for non-regular files."""
+        """The file's current state, taken before the write lands; None for other non-regular files."""
         try:
-            info = os.stat(path)
+            info = os.lstat(path)
         except FileNotFoundError:
             return _ABSENT
         except (OSError, ValueError):
             return None
+        if stat.S_ISLNK(info.st_mode):
+            return _link_content(path, (_LINK_SIZE, info.st_mtime_ns))
         if not stat.S_ISREG(info.st_mode):
             return None
         sig = (info.st_size, info.st_mtime_ns)
@@ -1401,21 +1492,98 @@ class _Tracker:
     def request_shell_check(self) -> None:
         with self.lock:
             cell = self.cell
-            if cell is None or cell.closing or not (cell.repos or cell.scan is not None):
-                return
-            cell.shell_check_pending = True
-            self._wake_watcher()
+            between_cells = cell is None or cell.closing
+            if not between_cells:
+                if not (cell.repos or cell.scan is not None):
+                    return
+                cell.shell_check_pending = True
+                self._wake_watcher()
+        if between_cells:
+            self._request_gap_check()
 
-    def shell_changes(self, cell: _Cell, deadline: float) -> list[tuple[str, _Content]]:
+    def _request_gap_check(self) -> None:
+        with self.lock:
+            if self.carried is None:
+                return
+            if self._gap_running:
+                self._gap_again = True
+                return
+            self._gap_running = True
+        threading.Thread(target=self._gap_loop, daemon=True, name="rlm-change-gap").start()
+
+    def _gap_loop(self) -> None:
+        self.local.busy = True
+        while True:
+            with self.lock:
+                self._gap_again = False
+                carried = self.carried
+            if carried is not None:
+                try:
+                    self._gap_check(carried)
+                except Exception:  # noqa: BLE001 - a missed background change is never raised
+                    pass
+            with self.lock:
+                if not self._gap_again or self.carried is None:
+                    self._gap_running = False
+                    return
+
+    def _gap_check(self, carried: _After) -> None:
+        """A command ended while no cell was running: compare from where the last comparison ended,
+        on this worker and within one cell budget, and hand what changed to the next cell (or to the
+        one that started meanwhile), where the command's end is reported too."""
+        probe = _Cell("", self.budget_s)
+        probe.repos = dict(carried.repos)
+        probe.scan = carried.scan
+        ended = _After()
+        ended.roots = carried.roots
+        changes: list[tuple[str, _Content]] | None
+        try:
+            changes = self.shell_changes(probe, time.perf_counter() + self.budget_s, ended)
+        except _OutOfTime:
+            changes = None
+            probe.note_incomplete(_GAP_LATE)
+        with self.lock:
+            if self.carried is carried:
+                self.carried = ended if changes is not None else None
+            target = self.cell if self.cell is not None and not self.cell.closing else None
+        if target is not None:
+            with target.work_lock:
+                with self.lock:
+                    open_cell = self.cell is target and not target.closing
+                if open_cell:
+                    if probe.incomplete:
+                        target.note_incomplete(probe.incomplete)
+                    if changes:
+                        self.apply_shell_changes(target, changes)
+                        with self.lock:
+                            self._wake_watcher()
+                    return
+        with self.lock:
+            if probe.incomplete and self.pending_note is None:
+                self.pending_note = probe.incomplete
+            for path, baseline in changes or []:
+                if path in self.pending_changes:
+                    continue
+                if len(self.pending_changes) >= MAX_FILES_PER_CELL:
+                    self.pending_note = self.pending_note or (
+                        f"more than {MAX_FILES_PER_CELL} files changed; the rest are not listed"
+                    )
+                    break
+                self.pending_changes[path] = baseline
+
+    def shell_changes(
+        self, cell: _Cell, deadline: float, after: _After | None = None
+    ) -> list[tuple[str, _Content]]:
         """What changed since the before-snapshots, as (path, baseline) pairs; `_OutOfTime` past the deadline.
 
         Pure computation, safe on a worker thread: `apply_shell_changes` turns it into records.
+        `after`, when given, receives the states the comparison ended on.
         """
         changes: list[tuple[str, _Content]] = []
         for before in list(cell.repos.values()):
-            self._compare_repo(cell, before, deadline, changes)
+            self._compare_repo(cell, before, deadline, changes, after)
         if cell.scan is not None:
-            self._compare_scan(cell, cell.scan[0], cell.scan[1], deadline, changes)
+            self._compare_scan(cell, cell.scan[0], cell.scan[1], deadline, changes, after)
         return changes
 
     def apply_shell_changes(self, cell: _Cell, changes: list[tuple[str, _Content]]) -> None:
@@ -1431,12 +1599,19 @@ class _Tracker:
                 cell.files[path] = _FileRec(path, baseline, "shell")
 
     def _compare_repo(
-        self, cell: _Cell, before: _RepoState, deadline: float, changes: list[tuple[str, _Content]]
+        self,
+        cell: _Cell,
+        before: _RepoState,
+        deadline: float,
+        changes: list[tuple[str, _Content]],
+        ended: _After | None = None,
     ) -> None:
         after = self.repo_state(before.root, False, deadline)
         if after is None:
             cell.note_incomplete("git status failed; changes made by commands may be missing")
             return
+        if ended is not None:
+            ended.repos[before.root] = after
         candidates = set(before.entries) | set(after.entries)
         if before.oid is not None and after.oid is not None and before.oid != after.oid:
             out = _run_git(
@@ -1461,7 +1636,7 @@ class _Tracker:
                     continue
             if self.classify(path) is None:
                 continue
-            current = _stat_sig(path)
+            current = _entry_sig(path)
             if path in before.entries:
                 prior = before.stats.get(path)
                 if prior == current:
@@ -1475,7 +1650,9 @@ class _Tracker:
                 )
                 continue
             if after.entries.get(path) == "??":
-                pending.append((path, _ABSENT))
+                if current is not None:
+                    # A new file already gone again (a tool's temp file) is no creation.
+                    pending.append((path, _ABSENT))
                 continue
             if before.oid is None:
                 pending.append((path, _UNKNOWN))
@@ -1506,11 +1683,14 @@ class _Tracker:
         before: dict[str, tuple[int, int]],
         deadline: float,
         changes: list[tuple[str, _Content]],
+        ended: _After | None = None,
     ) -> None:
         after = self.scan(root, deadline)
         if after is None:
             cell.note_incomplete("the working directory is too large to scan for command changes")
             return
+        if ended is not None:
+            ended.scan = (root, after)
         for path in sorted(set(before) | set(after)):
             prior = before.get(path)
             if prior == after.get(path):
@@ -1521,7 +1701,8 @@ class _Tracker:
             if self.classify(path) is None:
                 continue
             if prior is None:
-                changes.append((path, _ABSENT))
+                if _stat_sig(path) is not None:
+                    changes.append((path, _ABSENT))
                 continue
             data = self.cache.get(path, prior)
             changes.append(
@@ -1540,6 +1721,8 @@ class _Tracker:
         final: _Content
         if sig is None:
             final = _ABSENT
+        elif sig[0] == _LINK_SIZE:
+            final = _link_content(rec.path, sig)
         elif cheap:
             final = _Content("unknown", None, sig, "budget")
         elif sig[0] > MAX_BASELINE_FILE_BYTES:
@@ -1559,8 +1742,9 @@ class _Tracker:
             kind = "renamed"
         else:
             kind = "modified"
+        link = base.state == "link" or final.state == "link"
         if kind == "modified":
-            if base.state == "bytes" and final.state == "bytes" and base.data == final.data:
+            if base.state == final.state and base.state in ("bytes", "link") and base.data == final.data:
                 return None
             if base.sig is not None and base.sig == final.sig and base.state != "bytes":
                 return None
@@ -1571,6 +1755,10 @@ class _Tracker:
         if kind == "renamed" and rec.old_path:
             change["oldPath"] = rec.old_path
         change["scope"] = info.scope
+        if link:
+            # The link itself changed; its target's lines are not this file's lines.
+            change.update({"added": 0, "removed": 0, "symlink": True, "source": rec.source, "at": _now_ms()})
+            return change
         added = removed = 0
         diff_lines: list[str] | None = None
         omitted: str | None = None
@@ -1631,7 +1819,7 @@ class _Tracker:
         info = self.classify(rec.path)
         if info is None or rec.ignored:
             return
-        sig = _stat_sig(rec.path)
+        sig = _entry_sig(rec.path)
         rec.dirty = False
         rec.published_sig = sig
         change = self.build(cell, rec, info, sig)
@@ -1668,7 +1856,7 @@ class _Tracker:
             if cell.gave_up is None and _left(deadline) <= 0:
                 # Past the budget the remaining records are still sent, from a stat only (no diff).
                 cell.gave_up = f"time budget of {int(cell.budget_s * 1000)} ms used up"
-            if rec.dirty or rec.published_sig == "unset" or _stat_sig(rec.path) != rec.published_sig:
+            if rec.dirty or rec.published_sig == "unset" or _entry_sig(rec.path) != rec.published_sig:
                 self.publish(cell, rec)
         if final:
             for rec in recs:
@@ -1693,7 +1881,7 @@ class _Tracker:
             if text is not None:
                 memory["before"] = _clip(text, MAX_MEMORY_TEXT)
         if op != "deleted":
-            after = self.cache.get(rec.path, _stat_sig(rec.path))
+            after = self.cache.get(rec.path, _entry_sig(rec.path))
             text = _decode_text(after) if after is not None else None
             if text is not None:
                 memory["after"] = _clip(text, MAX_MEMORY_TEXT)
@@ -1761,7 +1949,7 @@ class _Tracker:
                 recs = [rec for rec in cell.files.values() if rec.dirty]
             ready: list[_FileRec] = []
             for rec in recs:
-                sig = _stat_sig(rec.path)
+                sig = _entry_sig(rec.path)
                 if rec.sig != "unset" and sig == rec.sig:
                     ready.append(rec)
                 else:

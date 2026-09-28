@@ -239,7 +239,7 @@ case nothing below is installed at all. Implemented in `rlm/effects.py`.
 
 | MIME type | Payload |
 |---|---|
-| `application/vnd.prime-agent.file-change+json` | one file effect: `path`, `relPath?`, `kind` (`created`/`modified`/`deleted`/`renamed`), `oldPath?`, `scope` (`project`/`scratch`/`memory`), `added`, `removed`, `diff?`, `diffTruncated?`, `diffOmitted?` (`too_large`/`no_baseline`/`budget`), `binary?`, `source` (`python`/`shell`/`edit`), `at` |
+| `application/vnd.prime-agent.file-change+json` | one file effect: `path`, `relPath?`, `kind` (`created`/`modified`/`deleted`/`renamed`), `oldPath?`, `scope` (`project`/`scratch`/`memory`), `added`, `removed`, `diff?`, `diffTruncated?`, `diffOmitted?` (`too_large`/`no_baseline`/`budget`), `binary?`, `symlink?`, `source` (`python`/`shell`/`edit`), `at` |
 | `application/vnd.prime-agent.memory-change+json` | one harness entry or rules-file change: `op`, `kind` (`memory`/`skill`/`subagent`/`prompt_note`/`rules_file`), `scope` (`session`/`global`/`project`), `id`, `title`, `previousTitle?`, `before?`, `after?`, `at` |
 | `application/vnd.prime-agent.activity+json` | one step: `id`, `kind` (`command`/`read`/`search`/`fetch`/`subagent`), `label`, `status` (`running`/`ok`/`error`), `detail?`, `startedAt`, `endedAt?`, `background?`, `commit?` |
 | `application/vnd.prime-agent.change-tracking+json` | at most one per cell: `{"incomplete": reason}` when the lists above are partial |
@@ -263,6 +263,19 @@ deleted in the same cell.
   tree (a moved `HEAD` adds `git diff --name-only`), a bounded mtime scan
   outside one. Ignored files, `.git`, `node_modules`, virtualenvs and caches are
   never reported.
+- That comparison covers only the git work tree (outside git: the directory
+  itself) of the session's working directory and of the directory Python is in
+  when it starts the process. A command that writes anywhere else
+  (`cd /tmp/build && make`, `curl -o /tmp/x`) is not listed: watching the whole
+  filesystem would cost every cell time. Python's own writes are listed
+  wherever they go, since the wrappers see each path.
+- A new file that is already gone again when the comparison looks at it is no
+  creation, and BSD `sed -i`'s temp file (`.!<pid>!<name>`) is never reported;
+  the edited file itself is.
+- Symlinks: a write through a link is filed under the file it lands in (when
+  that is a place tracking reports); a link that was created, removed or
+  re-pointed is reported as itself with `symlink: true`, no line counts and no
+  diff; an untracked link to a changed file does not add a second row.
 - Records are sent as soon as a file's size and mtime hold still for one watch
   interval (0.15 s), and finally before the cell's `done`; that final
   collection is part of the interruptible finishing phase.
@@ -299,6 +312,14 @@ deleted in the same cell.
   before its `done` or handed off like this, never after `done`. At most 64
   outcomes wait for the next cell; past that the oldest are dropped and that
   cell's `change-tracking` record says how many were lost.
+- Files such a command changes after its cell ended are not lost. The cell that
+  leaves a command running keeps the state its final comparison ended on; when
+  the command ends while no cell runs, a worker compares against that state
+  right away (one cell budget, never on a cell's thread, never delaying a cell's
+  start) and the changes are listed in the next cell, next to the command's
+  outcome, or in the cell that started meanwhile. A comparison that runs out of
+  time says so in that cell's `change-tracking` record. A command still running
+  when the next cell starts is covered by that cell's own snapshot, as before.
 - A command that succeeds and whose output carries git's commit line
   (`[main 1a2b3c4] subject`, `[main (root-commit) 1a2b3c4]`,
   `[detached HEAD 1a2b3c4]`, also from cherry-pick and revert) adds `commit`
