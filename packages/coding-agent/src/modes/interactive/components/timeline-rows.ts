@@ -1,3 +1,4 @@
+import { ABORT_TRUNCATION_MARKER, TOOL_ABORT_FALLBACK_MESSAGE } from "@earendil-works/pi-agent-core";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { KernelActivity, KernelMemoryChange } from "../../../core/kernel/shared.js";
 import { type ThemeColor, theme } from "../theme/theme.js";
@@ -247,6 +248,13 @@ export function commandOutcome(text: string | undefined): { ok: boolean; result:
 
 function isInterrupt(error: string | undefined): boolean {
 	return error !== undefined && /^(KeyboardInterrupt|已中断|Request was aborted|Operation aborted)/.test(error);
+}
+
+/** What the agent loop leaves for a tool the turn's abort caught in flight (not a per-call deadline). */
+function isTurnAbortStub(error: string | undefined): boolean {
+	if (error === undefined) return false;
+	if (error.startsWith(ABORT_TRUNCATION_MARKER)) return true;
+	return error.startsWith(TOOL_ABORT_FALLBACK_MESSAGE) && !error.startsWith(`${TOOL_ABORT_FALLBACK_MESSAGE} by `);
 }
 
 /** A row the owner's stop cut short: faint, never an error, never counted as one. */
@@ -679,7 +687,10 @@ function stepRows(step: RowStep, timeline: TurnTimeline, ctx: RowBuildContext, o
 	const failed = step.status === "error" || (step.status === "done" && data.error !== undefined);
 	// The owner's stop cut the cell short: that is a stop, not an error.
 	const interrupted =
-		failed && (data.stopped === true || isInterrupt(data.error) || (ctx.stopped && data.error === undefined));
+		failed &&
+		(data.stopped === true ||
+			isInterrupt(data.error) ||
+			(ctx.stopped && (data.error === undefined || isTurnAbortStub(data.error))));
 	if (items.length === 0) {
 		if (interrupted) return fallbackRows({ ...step, status: "done" }, data, timeline, ctx, true).map(stoppedRow);
 		if (failed) return [errorRow(step, data, timeline)];
