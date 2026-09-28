@@ -74,7 +74,13 @@ export function anyBudgetTruncatable(): boolean {
 	return truncatableBlocks.size > 0;
 }
 
-/** Test-only: forgets every block's last truncation report. */
+/**
+ * Forgets every block's last truncation report. The set holds the reporting blocks
+ * themselves, so the chat calls this whenever it discards them (cleared for a new
+ * session, rebuilt from its messages, torn down): a block that left the chat would
+ * otherwise stay reachable, output text and all, and keep answering yes to
+ * `anyBudgetTruncatable`. Blocks built afterwards report on their first expanded render.
+ */
 export function resetBudgetTruncatableTracking(): void {
 	truncatableBlocks.clear();
 }

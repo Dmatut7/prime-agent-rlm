@@ -307,6 +307,7 @@ import {
 } from "./components/tool-execution.js";
 import {
 	anyBudgetTruncatable,
+	resetBudgetTruncatableTracking,
 	setQuietConversationBudget,
 	setToolOutputFull,
 	toolOutputFull,
@@ -748,8 +749,7 @@ function turnHasProcess(summary: TurnSummaryComponent): boolean {
 
 /** Whether a turn has any agent-to-agent messages to open (received or sent, box or legacy). */
 function turnHasAgentMessages(summary: TurnSummaryComponent): boolean {
-	const state = summary.state;
-	return !state.boxMode || state.commMessageCount > 0;
+	return summary.state.commMessageCount > 0;
 }
 
 /**
@@ -773,7 +773,8 @@ const hasSetExpandedLane = (child: Component): boolean =>
 const hasThinkingTraceLane = (child: Component): boolean =>
 	child instanceof AssistantMessageComponent && child.hasThinkingTrace();
 
-const hasAnyMessageLane = (child: Component): boolean => !(child instanceof UserMessageComponent);
+const hasAgentMessageLane = (child: Component): boolean =>
+	child instanceof AgentMessageComponent || (child instanceof ToolExecutionComponent && child.hasSentAgentMessages());
 
 function mergeSubagentSnapshot(
 	previous: AgentConnectionRlmChildAgentSnapshot,
@@ -2304,6 +2305,13 @@ export class InteractiveMode {
 		if (modelsJsonError) {
 			this.showError(`models.json 有错：${modelsJsonError}`);
 		}
+		// The startup diagnostics name a broken settings.json on stderr, which the TUI
+		// covers; without this line every setting quietly falls back to its default.
+		for (const { scope, error, path } of this.uiServicesOrUndefined?.settingsManager?.getLoadErrors?.() ?? []) {
+			this.showError(
+				`settings.json 有错：${path ?? (scope === "global" ? "全局" : "项目")}：${error.message}（这份文件里的设置这次都没有生效）`,
+			);
+		}
 
 		const startupPrompts: InteractiveInitialPrompt[] = [
 			...(initialMessage ? [{ text: initialMessage, images: initialImages }] : []),
@@ -3744,6 +3752,7 @@ export class InteractiveMode {
 		this.endFeatureHintRun();
 		this.resetBlockNavigation();
 		this.chatContainer.clear();
+		resetBudgetTruncatableTracking();
 		this.shortcutGuideContainer.clear();
 		this.pendingMessagesContainer.clear();
 		this.queuedMessagesContainer.clear();
@@ -5721,6 +5730,7 @@ export class InteractiveMode {
 		this.clearSideQuestion({ abort: true });
 		this.resetBlockNavigation();
 		this.chatContainer.clear();
+		resetBudgetTruncatableTracking();
 		await this.renderInitialMessages();
 		if (result.editorText && !this.editor.getText().trim()) {
 			this.editor.setText(result.editorText);
@@ -8449,6 +8459,7 @@ export class InteractiveMode {
 		if (options.clearChat) {
 			this.resetBlockNavigation();
 			this.chatContainer.clear();
+			resetBudgetTruncatableTracking();
 		}
 
 		if (options.updateFooter) {
@@ -9318,6 +9329,8 @@ export class InteractiveMode {
 		this.stop({ preserveAltScreen: options.preserveAltScreen });
 		setMotionFrameRequester(undefined);
 		this.liveTurnFlowStore?.dispose();
+		// The chat is abandoned with this view; the next session's view starts from its own blocks.
+		resetBudgetTruncatableTracking();
 		stopThemeWatcher();
 	}
 
@@ -10512,7 +10525,7 @@ export class InteractiveMode {
 				return;
 			}
 		}
-		if (!chatHasTurnLane(this.chatContainer.children, turnHasAgentMessages, hasAnyMessageLane)) {
+		if (!chatHasTurnLane(this.chatContainer.children, turnHasAgentMessages, hasAgentMessageLane)) {
 			this.showToast("还没有代理消息可以展开");
 			return;
 		}
