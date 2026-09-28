@@ -1176,7 +1176,7 @@ export function timelineFacts(timeline: TurnTimeline, rows: readonly BoxRow[], c
 		thinkCount: rows.filter((row) => row.kind === "think").length,
 		commandCount: rows.filter((row) => row.kind === "cmd").length,
 		readCount: rows.reduce((sum, row) => sum + (row.kind === "read" ? (row.files?.length ?? 1) : 0), 0),
-		stepCount: new Set(steps.map((step) => step.toolCallId)).size,
+		stepCount: new Set(steps.map((step) => step.toolCallId)).size + timeline.earlierSteps,
 		subagentCount: rows.filter((row) => row.kind === "subagent").length,
 		errorCount: rows.filter((row) => row.kind === "error").length,
 		projectChanges: changes.filter((change) => change.scope !== "scratch"),

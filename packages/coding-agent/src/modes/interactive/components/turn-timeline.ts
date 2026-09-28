@@ -241,6 +241,8 @@ export class TurnTimeline {
 	errorEnded = false;
 	/** When the finished presentation (fold, summary) was applied. */
 	finishedAt: number | undefined;
+	/** Steps of this turn the reopen window left out (its box says how many). */
+	earlierSteps = 0;
 	/** Commands the step's code waits on through a handle, resolved from earlier cells. */
 	readonly stepHandleContext = new Map<string, ReadonlyMap<string, string>>();
 	private seq = 0;
@@ -264,6 +266,23 @@ export class TurnTimeline {
 			this.entries.push({ seq: this.nextSeq(), kind: "message", key, message, ended });
 		}
 		if (ended) this.closeThinking(message, Date.now());
+	}
+
+	/**
+	 * Remove one entry: an attempt the session dropped before it ended (an
+	 * empty-turn retry starts over) was never kept, so its row and its tokens go.
+	 */
+	dropEntry(key: string): void {
+		const index = this.entries.findIndex((entry) => entry.key === key);
+		if (index < 0) return;
+		const [removed] = this.entries.splice(index, 1);
+		if (removed?.kind === "message") {
+			for (const timingKey of [...this.thinkingTiming.keys()]) {
+				if (timingKey.startsWith(`${key}:`)) this.thinkingTiming.delete(timingKey);
+			}
+			this.tokenPeak = 0;
+		}
+		this.ui.bump();
 	}
 
 	/** Live stream events time the thinking blocks and measure their tokens from usage. */
@@ -411,12 +430,13 @@ export class TurnTimeline {
 		this.ui.bump();
 	}
 
-	/** A notice about the turn's work, once per message it came from. */
-	addNotice(notice: TimelineNotice, at: number): void {
+	/** A notice about the turn's work, once per message it came from; returns its key. */
+	addNotice(notice: TimelineNotice, at: number): string {
 		const key = `notice:${at}`;
-		if (this.entries.some((entry) => entry.key === key)) return;
+		if (this.entries.some((entry) => entry.key === key)) return key;
 		this.entries.push({ seq: this.nextSeq(), kind: "notice", key, notice, at });
 		this.ui.bump();
+		return key;
 	}
 
 	/** Insert or update the row of one subagent this turn started. */
