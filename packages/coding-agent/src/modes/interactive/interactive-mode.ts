@@ -773,7 +773,8 @@ const hasSetExpandedLane = (child: Component): boolean =>
 const hasThinkingTraceLane = (child: Component): boolean =>
 	child instanceof AssistantMessageComponent && child.hasThinkingTrace();
 
-const hasAgentMessageLane = (child: Component): boolean => child instanceof AgentMessageComponent;
+const hasAgentMessageLane = (child: Component): boolean =>
+	child instanceof AgentMessageComponent || (child instanceof ToolExecutionComponent && child.hasSentAgentMessages());
 
 function mergeSubagentSnapshot(
 	previous: AgentConnectionRlmChildAgentSnapshot,

@@ -8,7 +8,8 @@ import { KeybindingsManager } from "../src/core/keybindings.js";
 import { AgentMessageComponent } from "../src/modes/interactive/components/agent-message.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import { CustomEditor } from "../src/modes/interactive/components/custom-editor.js";
-import { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
+import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
+import { TurnActivityState, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { getEditorTheme, initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -362,5 +363,68 @@ describe.each(["quiet", "legacy"] as const)("Alt+P in the %s face", (processMode
 
 		expect(rig.toasts).toEqual([]);
 		expect(summary.state.agentMessagesExpanded).toBe(true);
+	});
+});
+
+describe("Alt+P on the live legacy shape of a turn that sent a message from a cell (FIX-19)", () => {
+	// The live path never calls addCommMessage for a message the model sends from a cell: the turn
+	// head's count stays 0 and only the tool block's own result carries the sent message.
+	const SENT_BODY = `${"handing the log over ".repeat(8)}\nSECOND-LINE-MARKER of the body`;
+
+	function liveTurnWithSentMessage(): { rig: Rig; summary: TurnSummaryComponent } {
+		const rig = createRig("legacy");
+		const state = new TurnActivityState(1_000);
+		state.boxMode = false;
+		const summary = new TurnSummaryComponent(state);
+		rig.chat.addChild(summary);
+		const tool = new ToolExecutionComponent(
+			"ipython",
+			"cell-1",
+			{ code: "send_message('child', 'x')" },
+			{},
+			undefined,
+			{ requestRender: vi.fn(), isFullscreen: () => false } as unknown as TUI,
+			"/tmp",
+		);
+		tool.setTurnActivity(state);
+		state.addStep({ toolCallId: "cell-1", toolName: "ipython", args: {}, status: "running" });
+		tool.markExecutionStarted();
+		tool.updateResult(
+			{
+				content: [{ type: "text", text: "ok" }],
+				details: {
+					status: "ok",
+					durationMs: 5,
+					sentAgentMessages: [
+						{
+							id: "agentmsg_live_sent",
+							message: SENT_BODY,
+							deliveryStatus: "delivered",
+							receiverRole: "child",
+							target: { activeSessionId: "child-active", sessionId: "child-session" },
+						},
+					],
+				},
+				isError: false,
+			},
+			false,
+		);
+		state.setStepStatus("cell-1", "done", 1_200);
+		summary.setExpanded(true);
+		tool.setExpanded(true);
+		rig.chat.addChild(tool);
+		return { rig, summary };
+	}
+
+	it("opens the sent message instead of saying there is none", () => {
+		const { rig, summary } = liveTurnWithSentMessage();
+		expect(summary.state.commMessageCount).toBe(0);
+		expect(rig.rendered()).toContain("已发消息");
+		expect(rig.rendered()).not.toContain("SECOND-LINE-MARKER");
+
+		rig.press(ALT_P);
+
+		expect(rig.toasts).toEqual([]);
+		expect(rig.rendered()).toContain("SECOND-LINE-MARKER");
 	});
 });
