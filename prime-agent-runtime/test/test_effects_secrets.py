@@ -126,6 +126,31 @@ class EditSkillPayloadTests(te.TrackerCase):
         self.assertEqual(cell.by_rel()["settings.py"]["diffOmitted"], effects.SENSITIVE)
         self._model_sees(cell, "settings.py")
 
+    def test_a_value_only_edit_next_to_the_credentials_name_withholds_the_payload(self):
+        # The name sits on the same line but outside both texts; the file record sees it as context.
+        self.write("settings.py", 'DB_PASSWORD = "oldpassw0rd9"\nDEBUG = True\n')
+        cell = self._edit("settings.py", "oldpassw0rd9", "newpassw0rd9")
+        self.assertEqual([e[_DIFF_MIME] for e in _diff_events(cell)], [{"path": self.path("settings.py"), "omitted": effects.SENSITIVE}])
+        self.assertEqual(_anywhere(cell, "oldpassw0rd9", "newpassw0rd9"), [])
+        self.assertEqual(cell.by_rel()["settings.py"]["diffOmitted"], effects.SENSITIVE)
+        self._model_sees(cell, "settings.py")
+
+    def test_a_secret_that_only_one_side_of_the_edit_holds_withholds_the_payload(self):
+        self.write("added.py", "HOST = 1\nDEBUG = True\n")
+        added = self._edit("added.py", "HOST = 1", f'HOST = 1\nAPI_KEY = "{_NEW_KEY}"')
+        self.assertEqual([e[_DIFF_MIME] for e in _diff_events(added)], [{"path": self.path("added.py"), "omitted": effects.SENSITIVE}])
+        self.assertEqual(_anywhere(added, _NEW_KEY), [])
+        self.write("removed.py", f'API_KEY = "{_OLD_KEY}"\nDEBUG = True\n')
+        removed = self._edit("removed.py", f'API_KEY = "{_OLD_KEY}"\n', "")
+        self.assertEqual([e[_DIFF_MIME] for e in _diff_events(removed)], [{"path": self.path("removed.py"), "omitted": effects.SENSITIVE}])
+        self.assertEqual(_anywhere(removed, _OLD_KEY), [])
+
+    def test_a_name_two_lines_away_does_not_withhold_an_ordinary_edit(self):
+        # Context reaches three lines; a credential name further up must not swallow an unrelated edit.
+        self.write("far.py", 'DB_PASSWORD = "oldpassw0rd9"\na = 1\nb = 2\nc = 3\nd = 4\ne = 5\n')
+        cell = self._edit("far.py", "e = 5", "e = 6")
+        self.assertEqual(_diff_events(cell)[0][_DIFF_MIME]["new_str"], "e = 6")
+
     def test_an_ordinary_edit_sends_the_payload_it_always_sent(self):
         self.write("notes.txt", "alpha\nbeta\ngamma\n")
         cell = self._edit("notes.txt", "beta", "BETA")
@@ -439,3 +464,26 @@ class EmptyUserUrlPipelineTests(te.TrackerCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScanCostTests(unittest.TestCase):
+    """The scan runs on every step label and edit payload, so long text must stay cheap."""
+
+    def test_a_long_hyphenated_run_is_scanned_in_linear_time(self):
+        started = time.perf_counter()
+        effects.looks_secret("a-" * 50_000 + "://x")
+        self.assertLess(time.perf_counter() - started, 1.0)
+
+    def test_a_huge_step_label_costs_no_more_than_a_short_one(self):
+        started = time.perf_counter()
+        step = effects.Step("command", "x-" * 50_000 + "://x")
+        self.assertLess(time.perf_counter() - started, 1.0)
+        self.assertLessEqual(len(step.label), effects.MAX_LABEL)
+
+    def test_a_key_far_past_the_cut_does_not_matter_but_one_straddling_it_does(self):
+        key = "sk-" + "ws-H." + "STRADDLE" + "y" * 24
+        far = effects.Step("command", "echo " + "z" * 5_000 + " " + key).label
+        self.assertTrue(far.startswith("echo zzzz"))
+        self.assertNotIn("sk-", far)
+        straddling = "curl -H " + "z" * (effects.MAX_LABEL - 12) + " " + key
+        self.assertEqual(effects.Step("command", straddling).label, "command")

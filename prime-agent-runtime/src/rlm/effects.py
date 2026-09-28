@@ -195,7 +195,7 @@ _SECRET_SHAPES: tuple[tuple[tuple[str, ...], bool, re.Pattern[str]], ...] = tupl
         (("pypi-AgE",), False, r"pypi-AgE[A-Za-z0-9_-]{20,}"),
         (("eyJ",), False, r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
         (("bearer",), True, r"\bbearer\s+[a-z0-9._~+/=-]{20,}"),
-        (("://",), True, r"\b[a-z][a-z0-9+.-]*://[^\s:/@\"']*:[^\s:/@\"']{6,}@"),
+        (("://",), True, r"\b[a-z][a-z0-9+.-]{0,31}://[^\s:/@\"']*:[^\s:/@\"']{6,}@"),
     )
 )
 # `name = value` assignments whose name ends in one of these words (matched on the lower-cased text).
@@ -2494,15 +2494,20 @@ class untracked:  # noqa: N801 - used as a context manager, reads like a functio
             self._token = None
 
 
+# A label shows MAX_LABEL characters. The scan reads that much and a margin past the cut, so a key the cut
+# splits is still whole to it; the rest of a long task text (megabytes, for a subagent) never shows.
+_LABEL_SCAN_CHARS = MAX_LABEL + 1024
+
+
 def _safe_label(text: str, kind: str) -> str:
     """`text` one-lined and capped for a step's label, or `kind` when it looks like it holds a credential.
 
-    The whole text is scanned before it is cut: a key cut at the cap can fall under a rule's length
+    The text is scanned before it is cut: a key cut at the cap can fall under a rule's length
     floor while its first characters still show. A command line or a task text is display text like a
     diff or a detail, and the record is saved with the session.
     """
     label = _one_line(text, MAX_LABEL)
-    return kind if _looks_secret(text) else label
+    return kind if _looks_secret(text[:_LABEL_SCAN_CHARS]) else label
 
 
 class Step:
