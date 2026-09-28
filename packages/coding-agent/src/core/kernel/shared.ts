@@ -320,9 +320,9 @@ export interface KernelActivity {
 	endedAt?: number;
 	/**
 	 * A `bash()` command its cell left running. In that cell's record `status` stays `running`,
-	 * `endedAt` is the cell's end and `detail` says it moved to the background; its outcome later
-	 * arrives with the same id, `background: true` and `status` ok/error, in whichever cell is
-	 * running then (or the next one to start).
+	 * `background` is true and `endedAt` is the cell's end; its outcome later arrives with the
+	 * same id, `background: true` and `status` ok/error, in whichever cell is running then (or
+	 * the next one to start).
 	 */
 	background?: boolean;
 	/** Commit id a successful `git commit` (or cherry-pick, revert) command reported. */
