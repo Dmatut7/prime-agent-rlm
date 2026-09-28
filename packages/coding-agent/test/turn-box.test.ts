@@ -878,6 +878,19 @@ describe("the status bar", () => {
 		const shape = (line: string) => line.replace(/\d+/g, "#").replace(/\s+/g, " ");
 		expect(shape(bar(9, 20))).toBe(shape(bar(10, 20)));
 		expect(shape(bar(10, 99))).toBe(shape(bar(59, 155)));
+		// Colour codes carry digits too; they must not count against the room.
+		const colored = stripAnsi(
+			renderStatusBar(
+				{
+					model: "glm-5.3-prime",
+					context: { percent: 5, warn: false },
+					subagents: 0,
+					right: ["\u001b[38;2;121;211;191m⠸\u001b[39m 工作中 · 1秒 · ↓ 24 tokens · Esc 停止", "⠸ 工作中 · 1秒"],
+				},
+				120,
+			),
+		);
+		expect(colored).toContain("↓ 24 tokens · Esc 停止");
 	});
 
 	it("turns the context meter amber at 80%", () => {
@@ -922,6 +935,31 @@ describe("replay groups a transcript the way the live view does", () => {
 		const out = text(summary.render(120));
 		expect(out).toContain("› 你插话：先别动安卓的");
 		expect(out).toContain("go list -m -u all");
+	});
+
+	it("clocks a replayed box up to its last reply, not just its last step", () => {
+		const messages: AgentMessage[] = [
+			{ role: "user", content: "读配置", timestamp: 1_000 },
+			assistant(1_000, [{ type: "toolCall", id: "c1", name: "ipython", arguments: { code: "print(1)" } }]),
+			{
+				role: "toolResult",
+				toolCallId: "c1",
+				toolName: "ipython",
+				content: [{ type: "text", text: "1" }],
+				isError: false,
+				timestamp: 1_500,
+			} satisfies ToolResultMessage,
+			assistant(5_200, [{ type: "text", text: "按默认配置运行即可。" }], "stop"),
+		];
+		const components = buildConversationComponents(messages, {
+			ui: { requestRender: vi.fn() } as unknown as TUI,
+			cwd: "/work/app",
+			toolOptions: {},
+			getToolDefinition: () => undefined,
+			processMode: "quiet",
+		});
+		const summary = components.find((component) => component instanceof TurnSummaryComponent) as TurnSummaryComponent;
+		expect(text(summary.render(120))).toMatch(/4秒 · ↓/);
 	});
 
 	it("ends a turn the owner interrupted mid-step as stopped, and the next message starts a new turn", () => {

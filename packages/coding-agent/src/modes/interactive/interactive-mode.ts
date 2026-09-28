@@ -8530,6 +8530,7 @@ export class InteractiveMode {
 				replayTurnState.addThinkingSegments(countThinkingSegments(message));
 				replayTurnState.latestThinking = latestThinkingText(message) || replayTurnState.latestThinking;
 				replayTurnState.timeline.noteMessage(message, true);
+				replayTurnState.noteReplyAt(Number(message.timestamp));
 				lastReplayAssistant = message;
 				replayResultsArrived = false;
 				replayResultAborted = false;

@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import stripAnsi from "strip-ansi";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.js";
 import { theme } from "../theme/theme.js";
 
@@ -88,7 +89,8 @@ function contextMeter(percent: number, warn: boolean, withBar: boolean): string 
 /** Width of a line whose numbers keep growing, with each number counted as at least three digits wide. */
 function steadyWidth(text: string): number {
 	let extra = 0;
-	for (const match of text.matchAll(/\d+(?:\.\d+)?/g)) extra += Math.max(0, 3 - match[0].length);
+	// Colour codes carry digits of their own; only the visible text counts.
+	for (const match of stripAnsi(text).matchAll(/\d+(?:\.\d+)?/g)) extra += Math.max(0, 3 - match[0].length);
 	return visibleWidth(text) + extra;
 }
 

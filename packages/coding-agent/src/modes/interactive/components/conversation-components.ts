@@ -154,6 +154,7 @@ export function buildConversationComponents(
 			state.latestThinking = latestThinkingText(message) || state.latestThinking;
 			state.modelId = message.model || state.modelId;
 			state.timeline.noteMessage(message, true);
+			state.noteReplyAt(Number(message.timestamp));
 			lastAssistant = message;
 			resultsArrived = false;
 			resultAborted = false;

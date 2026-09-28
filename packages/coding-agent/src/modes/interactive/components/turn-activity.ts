@@ -79,6 +79,8 @@ export class TurnActivityState {
 	host: TimelineHost = DEFAULT_TIMELINE_HOST;
 	private startedAtMs: number;
 	private lastSettledAt: number | undefined;
+	/** The newest replayed assistant message's stamp: a replayed turn's clock runs to its last reply. */
+	private lastReplyAt: number | undefined;
 	private turnEndedAt: number | undefined;
 	private thinkingSegments = 0;
 	private liveThinkingSegments = 0;
@@ -351,6 +353,11 @@ export class TurnActivityState {
 		return this.startedAtMs;
 	}
 
+	/** A replayed assistant message: the turn lasted at least until it began. */
+	noteReplyAt(timestamp: number): void {
+		if (Number.isFinite(timestamp) && timestamp > 0) this.lastReplyAt = Math.max(this.lastReplyAt ?? 0, timestamp);
+	}
+
 	addStep(step: TurnStep): void {
 		this.steps.push(step);
 	}
@@ -523,7 +530,9 @@ export class TurnActivityState {
 			: this.live && this.turnEndedAt !== undefined
 				? this.turnEndedAt
 				: this.steps.length > 0
-					? (this.lastSettledAt ?? this.turnEndedAt ?? now)
+					? // A box's clock covers the whole turn up to its last reply, the answer included.
+						Math.max(this.lastSettledAt ?? 0, this.boxMode ? (this.lastReplyAt ?? 0) : 0) ||
+						(this.turnEndedAt ?? now)
 					: (this.turnEndedAt ?? now);
 		return Math.max(0, end - this.startedAt);
 	}
