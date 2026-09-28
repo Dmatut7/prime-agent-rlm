@@ -5,8 +5,16 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import httpx
+
+try:
+    from rlm.effects import reported as _reported
+except Exception:  # an older kernel runtime without step reporting
+
+    def _reported(*_args: Any, **_kwargs: Any) -> Any:
+        return lambda fn: fn
 
 
 def _env_int(name: str, default: int) -> int:
@@ -127,6 +135,13 @@ async def _fetch_serper(query: str, api_key: str, timeout: int = 45, num_results
     return _format_serper_results(data, query, num_results=num_results)
 
 
+def _search_outcome(output: str) -> tuple[str, str | None]:
+    if "\nError searching for " in output or output.startswith("Web search is not set up"):
+        return "error", output.strip().splitlines()[-1]
+    return "ok", None
+
+
+@_reported("search", lambda query, *_args, **_kwargs: query, _search_outcome)
 async def run(
     query: str,
     *,

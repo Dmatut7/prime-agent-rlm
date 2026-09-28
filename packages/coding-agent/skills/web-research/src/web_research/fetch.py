@@ -12,6 +12,13 @@ from urllib.parse import quote
 
 from . import _browser, _extract, _lines, _net
 
+try:
+    from rlm.effects import reported as _reported
+except Exception:  # an older kernel runtime without step reporting
+
+    def _reported(*_args: Any, **_kwargs: Any) -> Any:
+        return lambda fn: fn
+
 HTTP_TIMEOUT = 20.0
 BROWSER_NAV_TIMEOUT_MS = 30_000
 NETWORK_IDLE_MS = 8_000
@@ -339,6 +346,13 @@ def _classify_human(reasons: list[str], url: str = "") -> str:
     return "unreachable or empty: " + (reasons[-1] if reasons else "no tier returned content")
 
 
+def _fetch_outcome(result: FetchResult) -> tuple[str, str | None]:
+    if result.ok:
+        return "ok", f"{result.tier}, {len(result.content):,} chars"
+    return "error", result.reason or "not fetched"
+
+
+@_reported("fetch", lambda url, *_args, **_kwargs: url, _fetch_outcome)
 async def fetch(
     url: str,
     *,
