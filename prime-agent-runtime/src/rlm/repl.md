@@ -297,7 +297,10 @@ deleted in the same cell.
   or plain identifier), keeps its record and line counts without `diff`, with
   `diffOmitted: "sensitive"`. A memory record whose `before` or `after` holds a
   likely credential drops both texts and carries `textOmitted: "sensitive"`;
-  later edits of that entry in the same cell stay withheld. The scan runs only
+  later edits of that entry in the same cell stay withheld. An activity's
+  `detail` (a command's latest or final output line, for example from `cat
+  .env` or `echo $API_KEY`) gets the same scan; a `detail` that looks like a
+  credential is left out of the record rather than sent. The scan runs only
   over the capped text and treats its own failure as a secret.
 - The session's own folder (`RLM_SESSION_DIR`: subagent folders, artifacts) is
   never reported, and harness saves appear only as memory records, not as a

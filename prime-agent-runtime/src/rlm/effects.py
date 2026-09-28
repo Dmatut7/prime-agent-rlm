@@ -298,6 +298,17 @@ def _one_line(text: str, limit: int) -> str:
     return _clip(" ".join(text.split()), limit)
 
 
+def _safe_detail(text: str, limit: int) -> str | None:
+    """`text` one-lined and capped, or None when it looks like it holds a credential.
+
+    A command's last output line (``echo $API_KEY``, ``cat .env``) is display text like a diff or
+    memory text, so it gets the same scan before it ever reaches an activity record.
+    """
+    if _looks_secret(text):
+        return None
+    return _one_line(text, limit)
+
+
 def _under(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
@@ -2464,7 +2475,11 @@ class Step:
 
     def update(self, detail: str) -> None:
         if not self.done:
-            self._send({"status": "running", "detail": _one_line(detail, MAX_DETAIL)})
+            fields: dict[str, Any] = {"status": "running"}
+            safe = _safe_detail(detail, MAX_DETAIL)
+            if safe:
+                fields["detail"] = safe
+            self._send(fields)
 
     def finish(
         self,
@@ -2480,7 +2495,9 @@ class Step:
             self.label = _one_line(label, MAX_LABEL)
         fields: dict[str, Any] = {"status": "ok" if status == "ok" else "error", "endedAt": _now_ms()}
         if detail:
-            fields["detail"] = _one_line(detail, MAX_DETAIL)
+            safe = _safe_detail(detail, MAX_DETAIL)
+            if safe:
+                fields["detail"] = safe
         if extra:
             fields.update(extra)
         self._send(fields)
@@ -2685,7 +2702,9 @@ class CommandStep:
                     "background": True,
                 }
                 if detail:
-                    record["detail"] = _one_line(detail, MAX_DETAIL)
+                    safe = _safe_detail(detail, MAX_DETAIL)
+                    if safe:
+                        record["detail"] = safe
                 if commit:
                     record["commit"] = commit
                 if tracker is not None:

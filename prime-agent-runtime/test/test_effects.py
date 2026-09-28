@@ -679,6 +679,20 @@ class SecretTests(TrackerCase):
         self.assertNotIn("after", updated)
         self.assertEqual(_anywhere(cell, _OLD_KEY, _NEW_KEY), [])
 
+    def test_a_write_through_a_link_to_a_secret_file_withholds_the_targets_diff(self):
+        # Coverage: a write through a symlink is filed under its real target (K3), so the target's
+        # own name still drives the sensitive-path check (T5); this confirms the two compose.
+        self.write(".env", f"OPENAI_API_KEY={_OLD_KEY}\n")
+        os.symlink(".env", self.path("link-to-env"))
+        _git(self.root, "add", ".env", "link-to-env")
+        _git(self.root, "commit", "-qm", "env+link")
+        cell = self.kernel.run(f"open('link-to-env', 'a').write('AWS_KEY={_AWS_KEY}\\n')")
+        files = cell.by_rel()
+        self.assertEqual(sorted(files), [".env"])
+        self.assertEqual(files[".env"]["diffOmitted"], effects.SENSITIVE)
+        self.assertNotIn("diff", files[".env"])
+        self.assertEqual(_anywhere(cell, _OLD_KEY, _AWS_KEY), [])
+
 
 class SecretNoGitTests(TrackerCase):
     use_git = False
@@ -800,6 +814,21 @@ class BackgroundCommandTests(TrackerCase):
         third = self.kernel.run("x = 2")
         self.assertEqual(third.files(), {})
 
+    def test_a_background_command_that_writes_a_secret_between_cells_keeps_no_diff(self):
+        # Coverage: a background command's changes are filed through the same build()/publish()
+        # pipeline as any other shell change (K3), so T5's sensitive-path check still applies.
+        first = self.kernel.run(f"h = bash('sleep 0.3; echo OPENAI_API_KEY={_OLD_KEY} > .env')\nh.pid")
+        self.assertEqual(first.files(), {})
+        time.sleep(1.2)  # the model thinking: the command ends while no cell runs
+        second = self.kernel.run("x = 1")
+        files = second.by_rel()
+        self.assertEqual(files[".env"]["kind"], "created")
+        self.assertEqual(files[".env"]["diffOmitted"], effects.SENSITIVE)
+        self.assertNotIn("diff", files[".env"])
+        # The key stays out of the file record itself; it may still show in the command's own
+        # label, since that is the source line the model wrote, not recorded output.
+        self.assertNotIn(_OLD_KEY, json.dumps(files[".env"]))
+
     def test_an_awaited_command_is_never_marked_background(self):
         cell = self.kernel.run("await bash('echo hi')")
         record = self._command(cell)
@@ -831,6 +860,58 @@ class BackgroundCommandTests(TrackerCase):
         self.assertIsNone(effects._commit_id("git log -1", 0, "[build/deadbeef1] x\n"))
         self.assertIsNone(effects._commit_id("git log -1", 0, "[deadbeef123] x\n"))
         self.assertIsNone(effects._commit_id("git log -1", 0, "[main] 1a2b3c4] x\n"))
+
+
+class CommandDetailSecretTests(TrackerCase):
+    """A command's activity `detail` (its latest/last output line) is display text like a diff or a
+    memory text: it must not carry a credential. `bash()`'s own return value is a separate object,
+    built and stored before the step's record is sent (see `bash.py`'s `_finalize`), so it is
+    untouched; each test below checks that directly.
+    """
+
+    def _command(self, cell: Cell) -> dict:
+        commands = [record for record in cell.activities().values() if record["kind"] == "command"]
+        self.assertEqual(len(commands), 1, commands)
+        return commands[0]
+
+    def test_a_finished_commands_detail_never_carries_a_leaked_key(self):
+        cell = self.kernel.run(f"r = await bash('echo {_OLD_KEY}')\nr.output")
+        record = self._command(cell)
+        self.assertEqual(record["status"], "ok")
+        self.assertNotIn("detail", record)
+        result = next(e for e in cell.events if e.get("event") == "result")
+        # Display-only: the model's own tool result still carries the command's real output.
+        self.assertIn(_OLD_KEY, result["text"])
+
+    def test_a_cat_of_an_env_files_last_line_is_withheld_from_detail(self):
+        self.write(".env", f"OPENAI_API_KEY={_OLD_KEY}\n")
+        cell = self.kernel.run("r = await bash('cat .env')\nr.output")
+        record = self._command(cell)
+        self.assertNotIn("detail", record)
+        result = next(e for e in cell.events if e.get("event") == "result")
+        self.assertIn(_OLD_KEY, result["text"])
+
+    def test_a_failing_commands_leaked_detail_is_withheld_too(self):
+        # A failing command's detail is "exit <code> · <last line>"; a leaked last line withholds
+        # the whole detail, same as a passing command's.
+        cell = self.kernel.run(f"r = await bash('echo {_OLD_KEY}; exit 3')\nr.output")
+        record = self._command(cell)
+        self.assertEqual(record["status"], "error")
+        self.assertNotIn("detail", record)
+        result = next(e for e in cell.events if e.get("event") == "result")
+        self.assertIn(_OLD_KEY, result["text"])
+
+    @unittest.skipUnless(HAS_GIT, "the background gap check needs a work tree")
+    def test_a_background_commands_finish_detail_never_carries_a_leaked_key(self):
+        first = self.kernel.run(f"h = bash('sleep 0.2; echo {_OLD_KEY}')\nh.pid")
+        time.sleep(0.8)  # the model thinking: the command ends while no cell runs
+        second = self.kernel.run("x = 1")
+        commands = [r for r in second.activities().values() if r["kind"] == "command"]
+        self.assertEqual(len(commands), 1, commands)
+        self.assertEqual((commands[0]["status"], commands[0]["background"]), ("ok", True))
+        # The key stays out of the recorded output; the command's own label (its source line,
+        # which the model wrote) is untouched, so it alone is not enough to prove the fix.
+        self.assertNotIn("detail", commands[0])
 
 
 @unittest.skipUnless(HAS_GIT and os.name == "posix", "needs git and a POSIX shell")
