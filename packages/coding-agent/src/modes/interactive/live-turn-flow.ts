@@ -3,7 +3,13 @@ import type { Container } from "@earendil-works/pi-tui";
 import { startsAgentRun } from "../../core/agent-messages.js";
 import type { CustomMessage } from "../../core/messages.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
-import { countThinkingSegments, latestThinkingText } from "./components/conversation-components.js";
+import {
+	countThinkingSegments,
+	latestThinkingText,
+	NO_STEP_STOP,
+	type StepResultStop,
+	stepResultStop,
+} from "./components/conversation-components.js";
 import { formatFileChangePath, getToolFileChanges } from "./components/edit-summary.js";
 import { collectBashHandleCommands } from "./components/step-label.js";
 import { TurnActivityState, TurnSummaryComponent } from "./components/turn-activity.js";
@@ -13,6 +19,7 @@ import {
 	compactionMissText,
 	describeRetryReason,
 	isBoxNoticeMessage,
+	replyHasWork,
 } from "./components/turn-timeline.js";
 import { UserMessageComponent } from "./components/user-message.js";
 
@@ -87,6 +94,12 @@ export class LiveTurnFlow {
 	private runCutMidTask = false;
 	/** The owner interrupted the running turn (Escape): its box ends as stopped. */
 	private userStopped = false;
+	/** How the run's latest step result says it went on: a stop from another view leaves only its stub. */
+	private stepStop: StepResultStop = NO_STEP_STOP;
+	/** Turns whose run ended on a stop's stub: they finish as stopped if nothing carries them on. */
+	private readonly stubStopped = new WeakSet<TurnActivityState>();
+	/** The open reply already folded its turn's earlier answers into the box. */
+	private openReplyFolded = false;
 	/** The assistant message that started and has not ended yet, in the turn that shows it. */
 	private openMessage: { state: TurnActivityState; message: AssistantMessage } | undefined;
 	/** The box the lost connection finished early: what it said, undone when the session comes back. */
@@ -134,7 +147,10 @@ export class LiveTurnFlow {
 		this.starterSinceRunStart = false;
 		const state = this.host.currentState();
 		this.runCutMidTask =
-			this.host.quiet() && this.lastStop === "toolUse" && state?.boxMode === true && !state.timeline.stopped;
+			this.host.quiet() &&
+			(this.lastStop ?? this.replayedStop(state)) === "toolUse" &&
+			state?.boxMode === true &&
+			!state.timeline.stopped;
 		this.lastStop = undefined;
 		this.userStopped = false;
 		if (!this.host.quiet()) this.host.setCurrent(undefined);
@@ -174,7 +190,8 @@ export class LiveTurnFlow {
 		const quiet = this.host.quiet();
 		const state = this.host.currentState();
 		const summary = this.host.currentSummary();
-		const steered = this.lastStop === "toolUse" || this.runCutMidTask;
+		const lastStop = this.lastStop ?? (state?.isTurnEnded ? undefined : this.replayedStop(state));
+		const steered = lastStop === "toolUse" || this.runCutMidTask;
 		if (quiet && steered && state?.boxMode) {
 			// A run that stopped to take this message goes on in the same box.
 			if (state.isTurnEnded && summary) this.resumeTurn(summary);
@@ -187,8 +204,24 @@ export class LiveTurnFlow {
 		return "prompt";
 	}
 
+	/**
+	 * How the live turn's last reply ended, for a view that attached while a step
+	 * ran: it never saw that reply end, the replayed turn says it.
+	 */
+	private replayedStop(state: TurnActivityState | undefined): AssistantMessage["stopReason"] | undefined {
+		if (!state?.live) return undefined;
+		const entries = state.timeline.entries;
+		for (let index = entries.length - 1; index >= 0; index--) {
+			const entry = entries[index];
+			if (entry?.kind === "message") return entry.message.stopReason;
+		}
+		return undefined;
+	}
+
 	assistantStart(message: AssistantMessage): void {
 		this.runCutMidTask = false;
+		this.stepStop = NO_STEP_STOP;
+		this.openReplyFolded = false;
 		if (this.host.quiet()) {
 			// No prompt since the run started: this run continues a turn that
 			// already ended (a retry, the work after a compaction).
@@ -236,8 +269,10 @@ export class LiveTurnFlow {
 		for (const content of message.content) {
 			if (content.type === "toolCall") this.noteToolCall(content, false);
 		}
-		// A later reply of the same turn moves the earlier answer into the box.
-		if (kind === "text_start" || kind === "toolcall_start") {
+		// A later reply of the same turn moves the earlier answer into the box, once
+		// it has something to show (a text block starts empty; its words follow).
+		if (!this.openReplyFolded && replyHasWork(message)) {
+			this.openReplyFolded = true;
 			const summary = this.host.currentSummary();
 			if (summary?.state.boxMode) this.host.foldEarlierAnswers(summary);
 		}
@@ -333,6 +368,7 @@ export class LiveTurnFlow {
 	): void {
 		const state = owner ?? this.stepOwner(toolCallId);
 		if (!state) return;
+		this.stepStop = stepResultStop({ ...result, isError });
 		state.timeline.mergeStep(
 			toolCallId,
 			toolName,
@@ -352,7 +388,10 @@ export class LiveTurnFlow {
 		state?.markTurnEnded(Date.now());
 		// Interrupted by the owner mid-step: the box says it stopped.
 		if (this.userStopped && state?.boxMode) state.timeline.stopped = true;
+		// A stop from another view leaves only its stub: stopped, unless a message carries the turn on.
+		else if (this.stepStop.endsTurn && state?.boxMode) this.stubStopped.add(state);
 		this.userStopped = false;
+		this.stepStop = NO_STEP_STOP;
 		// The box shows its finished face after a short settle: a retry or a
 		// compaction's continuation may still carry the same turn on.
 		if (state?.boxMode) this.scheduleFinish(state);
@@ -712,6 +751,8 @@ export class LiveTurnFlow {
 			}
 		}
 		if (!state.isTurnEnded) state.markTurnEnded(Date.now());
+		if (this.stubStopped.has(state)) state.timeline.stopped = true;
+		this.stubStopped.delete(state);
 		state.finishBox();
 		this.lastFinishedState = state;
 		this.attachStrip(summary);
@@ -757,6 +798,7 @@ export class LiveTurnFlow {
 	private resumeTurn(summary: TurnSummaryComponent): TurnActivityState {
 		const state = summary.state;
 		this.cancelFinish(state);
+		this.stubStopped.delete(state);
 		if (state.isTurnEnded) state.reopen();
 		state.live = true;
 		const strip = this.strips.get(summary);

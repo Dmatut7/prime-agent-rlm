@@ -894,7 +894,7 @@ describe("the status bar", () => {
 			right,
 		};
 		const wide = stripAnsi(renderStatusBar(state, 160));
-		expect(wide).toContain("glm-5.3-prime · 思考 中");
+		expect(wide).toContain("glm-5.3-prime · 思考强度 中");
 		expect(wide).toContain("上下文 ━━━───── 33%");
 		expect(wide).toContain("◇ 2 个子代理在跑");
 		expect(wide).toContain("~/work/app · main");

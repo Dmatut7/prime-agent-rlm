@@ -271,6 +271,7 @@ import { setMotionFrameRequester, setMotionReduced } from "./components/motion.j
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
 import { styleArgumentTokens } from "./components/prompt-highlight.js";
+import { recapLineText } from "./components/recap-line.js";
 import {
 	MalformedRefinementOutcomeMessageComponent,
 	RefinementOutcomeMessageComponent,
@@ -4619,7 +4620,7 @@ export class InteractiveMode {
 	private renderRecap(): void {
 		if (!this.recapContainer) return;
 		this.recapContainer.clear();
-		const recap = this.sessionRecap?.trim();
+		const recap = recapLineText(this.sessionRecap, quietConversation(this));
 		// The quiet conversation's change strip under each answer already says it.
 		const showChanges = !this.isAgentStreaming() && this.agentRunFileChanges.size > 0 && !quietConversation(this);
 		if (showChanges) {
@@ -4628,7 +4629,7 @@ export class InteractiveMode {
 			);
 		}
 		if (recap) {
-			this.recapContainer.addChild(new TruncatedText(theme.fg("dim", `回顾：${recap}`), 1, 0));
+			this.recapContainer.addChild(new TruncatedText(theme.fg("dim", recap), 1, 0));
 		}
 		if ((recap || showChanges) && !this.featureHintComponent) {
 			this.recapContainer.addChild(new Spacer(1));
@@ -11535,7 +11536,7 @@ export class InteractiveMode {
 				this.patchConnectionState({ thinkingLevel: level });
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
-				this.showToast(`思考 ${THINKING_LEVEL_WORDS[level] ?? level}`);
+				this.showToast(`思考强度 ${THINKING_LEVEL_WORDS[level] ?? level}`);
 			})
 			.catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));

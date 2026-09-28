@@ -188,7 +188,7 @@ describe("InteractiveMode /effort", () => {
 			const context = makeContext({ agentConnection: { setThinkingLevel } });
 
 			interactiveModePrototype.handleEffortCommand.call(context, "high");
-			await vi.waitFor(() => expect(context.showToast).toHaveBeenCalledWith("思考 高"));
+			await vi.waitFor(() => expect(context.showToast).toHaveBeenCalledWith("思考强度 高"));
 
 			expect(setThinkingLevel).toHaveBeenCalledWith("high");
 			expect(context.patchConnectionState).toHaveBeenCalledWith({ thinkingLevel: "high" });

@@ -11,6 +11,7 @@ import { Type } from "typebox";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent } from "../src/core/agent-session.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
+import { RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE } from "../src/core/messages.js";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import {
 	buildConversationComponents,
@@ -89,6 +90,22 @@ const bashTool: AgentTool = {
 	},
 };
 
+/**
+ * An event as a view over the daemon receives it: a copy (the streaming message
+ * is mutated in place after its event), and a block's start carries the block
+ * empty, its text following in the deltas.
+ */
+function asOnTheWire(event: AgentSessionEvent): AgentSessionEvent {
+	const copy = structuredClone(event);
+	if (copy.type !== "message_update" || copy.message.role !== "assistant") return copy;
+	const started = copy.assistantMessageEvent;
+	const block = "contentIndex" in started ? copy.message.content[started.contentIndex] : undefined;
+	if (started.type === "text_start" && block?.type === "text") block.text = "";
+	if (started.type === "thinking_start" && block?.type === "thinking") block.thinking = "";
+	if (started.type === "toolcall_start" && block?.type === "toolCall") block.arguments = {};
+	return copy;
+}
+
 /** Everything a harness session emits, with the transcript and context size at each event. */
 function record(harness: Harness): Recorded[] {
 	const log: Recorded[] = [];
@@ -96,7 +113,7 @@ function record(harness: Harness): Recorded[] {
 		const tokens = harness.session.getContextUsage()?.tokens;
 		log.push({
 			kind: "event",
-			event,
+			event: asOnTheWire(event),
 			at: Date.now(),
 			messages: harness.session.messages.slice(),
 			...(typeof tokens === "number" ? { contextTokens: tokens } : {}),
@@ -246,6 +263,12 @@ class LiveScreen {
 		this.retryAttempt = 0;
 		this.compacting = false;
 		this.rebuild(transcriptAt(steps, steps.length));
+	}
+
+	/** A view opened while the run works: the chat is the transcript so far, and the run goes on. */
+	attach(messages: readonly AgentMessage[]): void {
+		this.streaming = true;
+		this.rebuild(messages);
 	}
 
 	/** Escape while the AI works. */
@@ -720,6 +743,79 @@ describe("a quiet turn that ends without a run ending it", () => {
 		expect(screen.screen()).toMatch(/▾ ✓ .*跑了 1 条命令/);
 		expect(screen.opened(twin!)).not.toContain("连接断了");
 		expect(vi.getTimerCount()).toBe(0);
+	});
+});
+
+describe("a quiet turn seen from a second view", () => {
+	it("ends as stopped when another view stopped it mid-command", async () => {
+		const harness = await session();
+		const steps = record(harness);
+		const slow = holdCommand("sleep 100");
+		harness.setResponses([bashCall("sleep 100")]);
+		const prompt = run(harness, "慢慢跑");
+		await slow.started;
+		// The stop comes from the other window: this view never saw its Escape.
+		await harness.session.abort();
+		await prompt;
+
+		const screen = startScreen(steps);
+		feed(screen, steps);
+		vi.advanceTimersByTime(SETTLE_MS);
+		expect(screen.boxes()).toHaveLength(1);
+		expect(screen.screen()).toContain("■ 已停止");
+		expect(screen.screen()).not.toContain("✓");
+		expect(screen.opened(screen.boxes()[0]!)).toContain("■ sleep 100 · 你停下了");
+	});
+
+	it("puts a message typed after it attached mid-command in the same box", async () => {
+		const harness = await session();
+		const steps = record(harness);
+		const tests = holdCommand("npm test");
+		harness.setResponses([bashCall("npm test"), reply("测试和 lint 都过了。")]);
+		const prompt = run(harness, "修一下测试");
+		await tests.started;
+		const attachedAt = steps.length;
+		await harness.session.steer("顺便看下 lint");
+		tests.finish();
+		await prompt;
+		await harness.session.waitForIdle();
+
+		const later = steps.slice(attachedAt);
+		const screen = startScreen(later);
+		screen.attach(transcriptAt(steps, attachedAt));
+		feed(screen, later);
+		vi.advanceTimersByTime(SETTLE_MS);
+		expect(screen.boxes()).toHaveLength(1);
+		expect(screen.prompts()).toBe(1);
+		expect(screen.opened(screen.boxes()[0]!)).toContain("› 你插话：顺便看下 lint");
+	});
+});
+
+describe("a quiet turn a notice carries on", () => {
+	it("keeps only the later answer under the box, the earlier one folded into it", async () => {
+		const harness = await session();
+		const steps = record(harness);
+		harness.setResponses([reply("子代理回来了：当前目录有 3 个文件。"), reply("收到它的结束通知，结论不变。")]);
+		await run(harness, "派个子代理数文件");
+		await harness.session.sendCustomMessage(
+			{
+				customType: RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
+				content: "child finished",
+				display: false,
+				details: { sessionName: "counter", kind: "completed_without_reply" },
+			},
+			{ triggerTurn: true },
+		);
+		await harness.session.waitForIdle();
+
+		const screen = startScreen(steps);
+		feed(screen, steps);
+		vi.advanceTimersByTime(SETTLE_MS);
+		expect(screen.boxes()).toHaveLength(1);
+		const shown = screen.screen();
+		expect(shown).toContain("收到它的结束通知，结论不变。");
+		expect(shown).not.toContain("子代理回来了");
+		expect(screen.opened(screen.boxes()[0]!)).toContain("· 子代理回来了：当前目录有 3 个文件");
 	});
 });
 

@@ -103,7 +103,7 @@ function steadyWidth(text: string): number {
 
 export function renderStatusBar(state: StatusBarState, width: number, badge?: string): string {
 	const safeWidth = Math.max(1, width);
-	const model = ` ${theme.fg("muted", state.level ? `${state.model} · 思考 ${state.level}` : state.model)}`;
+	const model = ` ${theme.fg("muted", state.level ? `${state.model} · 思考强度 ${state.level}` : state.model)}`;
 	const chip = state.subagents > 0 ? theme.fg("activityAccent", `◇ ${state.subagents} 个子代理在跑`) : "";
 	const location = state.location ? theme.fg("dim", state.location) : "";
 	const badgeText = badge ? theme.fg("warning", badge) : "";
