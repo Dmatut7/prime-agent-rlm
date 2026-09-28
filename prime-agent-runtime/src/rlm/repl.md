@@ -341,19 +341,20 @@ deleted in the same cell.
   before its `done` or handed off like this, never after `done`. At most 64
   outcomes wait for the next cell; past that the oldest are dropped and that
   cell's `change-tracking` record says how many were lost.
-- What such a command changes between its cell's end and the next cell's start
-  is listed only when the command ends in that gap. The cell that leaves a
-  command running keeps the state its final comparison ended on; when the
-  command ends while no cell runs, a worker compares against that state right
-  away (one cell budget, never on a cell's thread, never delaying a cell's
-  start) and the changes are listed in the next cell, next to the command's
-  outcome, or in the cell that started meanwhile. A comparison that runs out of
-  time says so in that cell's `change-tracking` record. A command still running
-  when the next cell starts is covered by that cell's own snapshot, which is
-  taken once that cell has started and becomes its starting state: what the
-  command wrote in the gap (and in the first moments of that cell, before the
-  snapshot ran) is listed in no cell, and the `change-tracking` record does not
-  say so. What it writes while that cell runs is listed there.
+- What a command left running changes between its cell's end and the next
+  cell's start can go unlisted: it is listed only if some background command
+  ends in that gap. The cell that leaves a command running keeps the state its
+  final comparison ended on; when a command ends while no cell runs, a worker
+  compares against that state right away (one cell budget, never on a cell's
+  thread, never delaying a cell's start), which covers every change since, and
+  the changes are listed in the next cell, next to the command's outcome, or in
+  the cell that started meanwhile. A comparison that runs out of time says so in
+  that cell's `change-tracking` record. When no command ends in the gap, a
+  command still running when the next cell starts is covered by that cell's own
+  snapshot, which is taken once that cell has started and becomes its starting
+  state: what the command wrote in the gap (and in the first moments of that
+  cell, before the snapshot ran) is listed in no cell, and the `change-tracking`
+  record does not say so. What it writes while that cell runs is listed there.
 - A command that succeeds and whose output carries git's commit line
   (`[main 1a2b3c4] subject`, `[main (root-commit) 1a2b3c4]`,
   `[detached HEAD 1a2b3c4]`, also from cherry-pick and revert) adds `commit`
