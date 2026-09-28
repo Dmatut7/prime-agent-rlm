@@ -19,6 +19,13 @@ import httpx
 
 from . import _net, _proc
 
+try:
+    from rlm.effects import reported as _reported
+except Exception:  # an older kernel runtime without step reporting
+
+    def _reported(*_args: Any, **_kwargs: Any) -> Any:
+        return lambda fn: fn
+
 SEARCH_TIMEOUT = 25.0
 CONTAINER = "prime-searxng"
 DEFAULT_URL = "http://127.0.0.1:18888"
@@ -196,6 +203,7 @@ def _normalize(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@_reported("search", lambda query, *_args, **_kwargs: query, lambda found: ("ok", f"{len(found)} results"))
 async def search(
     query: str,
     *,

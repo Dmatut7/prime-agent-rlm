@@ -252,12 +252,13 @@ import {
 	incomingInputFactsFromMessage,
 	inputClassOrigin,
 } from "./input-classification.js";
-import type {
-	HostRequestHandlers,
-	KernelDeathCause,
-	KernelLateHostReply,
-	KernelSentAgentMessage,
-	KernelUnexpectedExitFacts,
+import {
+	CHANGE_TRACKING_ENV_VAR,
+	type HostRequestHandlers,
+	type KernelDeathCause,
+	type KernelLateHostReply,
+	type KernelSentAgentMessage,
+	type KernelUnexpectedExitFacts,
 } from "./kernel/index.js";
 import {
 	compactionKernelStateLines,
@@ -16476,6 +16477,8 @@ export class AgentSession {
 			// an ancestor has already lowered the subtree cap only finds out by being refused.
 			RLM_MAX_DEPTH: String(this._effectiveRlmMaxDepth()),
 			RLM_GLOBAL_HARNESS_STATE_DIR: getGlobalHarnessStateDir(),
+			// Display-only change tracking for the UI; always set, so the kernel never guesses.
+			[CHANGE_TRACKING_ENV_VAR]: this.settingsManager.getChangeTrackingEnabled() ? "1" : "0",
 		};
 		const rlmSessionDir = this._ensureRlmSessionDir();
 		if (rlmSessionDir) {

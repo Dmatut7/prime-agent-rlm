@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from . import _winjob
+from . import effects
 from ._yaml_compat import register_plain_str
 
 # Boot-lean imports: asyncio, secrets, shutil, datetime, selectors, struct,
@@ -105,8 +106,13 @@ class _BoundedBuffer:
         self._tail_size = 0
         self._dropped = 0
         self._lock = threading.Lock()
+        # Display-only observer of the command's output (the live step feed); never alters the buffer.
+        self.on_write: Callable[[bytes], None] | None = None
 
     def write(self, chunk: bytes) -> None:
+        observer = self.on_write
+        if observer is not None and chunk:
+            observer(chunk)
         with self._lock:
             if len(self._head) < _HEAD_CAP:
                 take = _HEAD_CAP - len(self._head)
@@ -179,6 +185,7 @@ class BashHandle:
         self._result: BashResult | None = None
         self._callbacks: list[Callable[[], None]] = []
         self._callback_lock = threading.Lock()
+        self._step: effects.CommandStep | None = None
         # Serializes kill/reap so a pid fallback can never outlive the process handle.
         self._kill_lock = threading.Lock()
         self._started = time.monotonic()
@@ -287,6 +294,10 @@ class BashHandle:
             if not cast("_winjob.JobProcess", self._proc).resume():
                 self._abort_spawn()
                 raise RuntimeError("bash(): Windows job containment could not be established")
+        # The live step for the host's feed: started once the command really runs.
+        self._step = effects.command_started(command)
+        if self._step is not None:
+            self._buffer.on_write = self._step.output
         threading.Thread(target=self._pump, daemon=True).start()
         threading.Thread(target=self._report, daemon=True).start()
         threading.Thread(target=self._watch, daemon=True).start()
@@ -595,6 +606,10 @@ class BashHandle:
             self._done.set()
             callbacks = self._callbacks
             self._callbacks = []
+            result = self._result
+        step = self._step
+        if step is not None:
+            step.finish(result.exit_code, result.output)
         for callback in callbacks:
             callback()
 

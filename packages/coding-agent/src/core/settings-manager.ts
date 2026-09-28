@@ -789,6 +789,7 @@ export interface Settings {
 	subagentWake?: SubagentWakeSettings;
 	kernelBootstrap?: KernelBootstrapSettings;
 	kernelRestart?: KernelRestartSettings;
+	changeTracking?: ChangeTrackingSettings;
 	agentMessage?: AgentMessageSettings;
 	daemon?: DaemonSettings;
 	autoRefine?: AutoRefineSettings;
@@ -857,6 +858,15 @@ export interface Settings {
 }
 
 export interface AgentTracesSettings {
+	enabled?: boolean;
+}
+
+/**
+ * What a Python cell changed and did (files, harness memory, commands), reported by the kernel for
+ * the UI. Display-only: turning it off changes nothing the model sees.
+ */
+export interface ChangeTrackingSettings {
+	/** Default true. Read when a kernel starts, so a change applies from the next kernel (`/reload`). */
 	enabled?: boolean;
 }
 
@@ -1077,6 +1087,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	subagentWake: ["policy"],
 	kernelBootstrap: ["lockTimeoutMs"],
 	kernelRestart: ["maxUnexpectedRestarts", "windowMinutes", "revivalVouchMaxAgeSeconds"],
+	changeTracking: ["enabled"],
 	agentMessage: ["targetWaitSeconds"],
 	daemon: ["eventGapRecovery", "supervisorRejectionExitThreshold", "failedWorkerReapHours", "failedWorkerReapEnabled"],
 	autoRefine: ["enabled", "turnInterval", "compact", "cooldownMs"],
@@ -3205,6 +3216,10 @@ export class SettingsManager {
 
 	getRequestTiming(): boolean {
 		return this.settings.requestTiming ?? false;
+	}
+
+	getChangeTrackingEnabled(): boolean {
+		return this.settings.changeTracking?.enabled ?? true;
 	}
 
 	setBlockImages(blocked: boolean): void {

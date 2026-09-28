@@ -514,6 +514,20 @@ old one is reclaimed only after its references drop to zero.
 }
 ```
 
+### Change Tracking
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `changeTracking.enabled` | boolean | `true` | Report what each Python cell changed and did - files it created, edited, renamed or deleted (with diffs), harness memory, skill and note edits, and the commands, reads, searches and subagent spawns it ran - so the UI can show them. Display-only: the model's context is identical either way. Off, the kernel installs no file wrappers and runs no extra `git status`. Read when a kernel starts; use `/reload` to apply a change to a running session |
+
+```json
+{
+  "changeTracking": {
+    "enabled": false
+  }
+}
+```
+
 ### Diagnostics
 
 | Setting | Type | Default | Description |

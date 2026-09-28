@@ -201,6 +201,11 @@ export interface ExecuteOptions {
 	 */
 	killOnAbortTimeout?: boolean;
 	onStream?: (chunk: string, name: "stdout" | "stderr") => void;
+	/**
+	 * The cell's display-only effects so far (file changes, memory changes, activities), cumulative,
+	 * called whenever a new record arrives mid-cell. For the UI only: nothing here may reach the model.
+	 */
+	onEffects?: (effects: KernelCellEffects) => void;
 	onLateSentAgentMessage?: (message: KernelSentAgentMessage) => void;
 	/** Cap stdout / stderr / result at this many characters. Default 65536. */
 	maxOutputChars?: number;
@@ -226,6 +231,12 @@ export const AGENT_MESSAGE_DISPLAY_MIME = "application/vnd.prime-agent.agent-mes
  * attachment is never dropped here — only a non-skill emit can hit this.
  */
 export const MAX_ATTACHMENT_DATA_CHARS = 10_000_000;
+
+/**
+ * Kernel environment variable that turns change tracking (file, memory and step records) on ("1",
+ * the default) or off ("0"). Read once at kernel start; with "0" the runtime installs nothing.
+ */
+export const CHANGE_TRACKING_ENV_VAR = "PRIME_AGENT_CHANGE_TRACKING";
 
 /** MIME tag the kernel emits a {@link KernelFileChange} under when a cell creates, modifies, renames, or deletes a file. */
 export const FILE_CHANGE_DISPLAY_MIME = "application/vnd.prime-agent.file-change+json";
@@ -253,6 +264,12 @@ export interface KernelFileChange {
 	diff?: string;
 	/** True when `diff` was cut at the cap. */
 	diffTruncated?: boolean;
+	/**
+	 * Why a text file has no `diff`: `too_large` (over the kernel's size caps), `no_baseline` (the
+	 * content before the change was not captured), `budget` (the cell's tracking budget ran out).
+	 * With `no_baseline` or `budget` the line counts may be 0 because they were not knowable.
+	 */
+	diffOmitted?: "too_large" | "no_baseline" | "budget";
 	binary?: boolean;
 	/** How the change was observed. */
 	source: "python" | "shell" | "edit";
@@ -297,6 +314,21 @@ export interface KernelActivity {
 	endedAt?: number;
 }
 
+/**
+ * MIME tag of the kernel's one-per-cell note that its change lists are partial for that cell (the
+ * tracking budget ran out, git failed, too many files). Payload: `{ incomplete: string }`.
+ */
+export const CHANGE_TRACKING_STATUS_DISPLAY_MIME = "application/vnd.prime-agent.change-tracking+json";
+
+/** Everything a cell's change tracking reported so far, latest record per file, memory entry and step. */
+export interface KernelCellEffects {
+	fileChanges: KernelFileChange[];
+	memoryChanges: KernelMemoryChange[];
+	activities: KernelActivity[];
+	/** Why the lists above are partial for this cell; absent when they are complete. */
+	changeTrackingIncomplete?: string;
+}
+
 /** One file edit, captured from a {@link DIFF_DISPLAY_MIME} display payload. */
 export interface KernelDiffDisplay {
 	path: string;
@@ -338,6 +370,14 @@ export interface ExecuteResult {
 	attachments?: KernelAttachment[];
 	/** Agent messages sent from this cell, in order. */
 	sentAgentMessages?: KernelSentAgentMessage[];
+	/** File effects of the cell, latest record per path. Display-only. */
+	fileChanges?: KernelFileChange[];
+	/** Harness memory and rules-file changes, latest record per entry. Display-only. */
+	memoryChanges?: KernelMemoryChange[];
+	/** Steps observed inside the cell, latest record per id. Display-only. */
+	activities?: KernelActivity[];
+	/** Why the change lists are partial for this cell. Display-only. */
+	changeTrackingIncomplete?: string;
 	/** Output that arrived without this cell's id (user threads, other cells' leftovers, raw fd writes). */
 	backgroundOutput?: string;
 	status: "ok" | "error" | "aborted";

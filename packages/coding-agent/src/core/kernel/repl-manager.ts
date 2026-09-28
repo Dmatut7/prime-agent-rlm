@@ -43,6 +43,7 @@ import {
 	type KernelIntentionalExitOrigin,
 	type KernelUnexpectedExitFacts,
 } from "./death-cause.js";
+import { KernelEffectsAccumulator } from "./effects.js";
 import { KernelUnavailableError } from "./errors.js";
 import { formatKernelResetNotice } from "./reset-notice.js";
 import { KernelRestartLedger } from "./restart-ledger.js";
@@ -297,6 +298,8 @@ interface ActiveExecution {
 	diffs: KernelDiffDisplay[];
 	attachments: KernelAttachment[];
 	sentAgentMessages: KernelSentAgentMessage[];
+	/** Display-only change-tracking records (files, memory, steps); never merged into the cell's output. */
+	effects: KernelEffectsAccumulator;
 	/** Stream text without this execution's id: user threads, other cells' leftovers, raw fd writes. */
 	backgroundOutput: string;
 	backgroundOutputTruncated: boolean;
@@ -2106,6 +2109,13 @@ export class ReplKernelManager {
 			}
 			const sentAgentMessage = parseSentAgentMessage(data[AGENT_MESSAGE_DISPLAY_MIME]);
 			if (sentAgentMessage) execution.sentAgentMessages.push(sentAgentMessage);
+			if (execution.effects.apply(data)) {
+				const onEffects = execution.opts.onEffects;
+				if (onEffects) {
+					const snapshot = execution.effects.snapshot();
+					this.invokeHostCallback("onEffects", () => onEffects(snapshot));
+				}
+			}
 		} else if (type === "error") {
 			execution.error = {
 				ename: typeof event.ename === "string" ? event.ename : "Error",
@@ -2255,6 +2265,7 @@ export class ReplKernelManager {
 			diffs: [],
 			attachments: [],
 			sentAgentMessages: [],
+			effects: new KernelEffectsAccumulator(),
 			// An internal (host-synthesized) cell never reaches the model, so it must not drain
 			// the buffer the next real cell is supposed to see.
 			backgroundOutput: opts.internal ? "" : this.pendingBackgroundOutput,
@@ -2417,6 +2428,7 @@ export class ReplKernelManager {
 				diffs: execution.diffs.length > 0 ? execution.diffs : undefined,
 				attachments: execution.attachments.length > 0 ? execution.attachments : undefined,
 				sentAgentMessages: execution.sentAgentMessages.length > 0 ? execution.sentAgentMessages : undefined,
+				...execution.effects.resultFields(),
 				backgroundOutput: backgroundOutput.length > 0 ? backgroundOutput : undefined,
 				error: execution.error,
 				status,

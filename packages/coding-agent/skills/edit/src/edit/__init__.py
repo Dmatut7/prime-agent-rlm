@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
+from typing import Any
+
+try:
+    # Marks this skill's writes in the host's change list; display-only.
+    from rlm.effects import write_source as _write_source
+except Exception:  # an older kernel runtime without change tracking
+
+    def _write_source(_source: str) -> Any:
+        return contextlib.nullcontext()
 
 
 async def run(path: str, old_str: str, new_str: str) -> str:
@@ -39,7 +49,8 @@ async def run(path: str, old_str: str, new_str: str) -> str:
         )
     match_index = content.index(old_str)
     start_line = content.count("\n", 0, match_index) + 1
-    filepath.write_text(content.replace(old_str, new_str, 1), encoding="utf-8")
+    with _write_source("edit"):
+        filepath.write_text(content.replace(old_str, new_str, 1), encoding="utf-8")
     resolved_path = str(filepath.resolve())
     _emit_diff(resolved_path, old_str, new_str, start_line)
     return f"Edited {resolved_path}"

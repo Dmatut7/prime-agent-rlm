@@ -14,6 +14,7 @@ import {
 	type KernelActivity,
 	type KernelAttachment,
 	KernelBusyAfterInterruptError,
+	type KernelCellEffects,
 	type KernelClient,
 	type KernelDeathCause,
 	type KernelDiffDisplay,
@@ -528,6 +529,8 @@ export interface IpythonToolDetails {
 	memoryChanges?: KernelMemoryChange[];
 	/** Steps the kernel observed inside the cell, one entry per step id with its latest state. Display-only. */
 	activities?: KernelActivity[];
+	/** Why `fileChanges` / `memoryChanges` / `activities` are partial for this cell. Display-only. */
+	changeTrackingIncomplete?: string;
 	/** Media attachments loaded into context (e.g. by the attach-image skill). */
 	attachments?: KernelAttachment[];
 	/** Agent messages sent from this cell. */
@@ -961,6 +964,7 @@ async function executeWithBusyKernelChoice(
 	code: string,
 	signal: AbortSignal | undefined,
 	onStream: (chunk: string, name: "stdout" | "stderr") => void,
+	onEffects: ((effects: KernelCellEffects) => void) | undefined,
 	onWorkingMessage: (message?: string) => void,
 	onLateSentAgentMessage: ((toolCallId: string, message: KernelSentAgentMessage) => void) | undefined,
 	ctx: ExtensionContext | undefined,
@@ -978,6 +982,7 @@ async function executeWithBusyKernelChoice(
 				// caller gets from the wait/kill prompt below.
 				killOnAbortTimeout: !ctx?.hasUI,
 				onStream,
+				...(onEffects ? { onEffects } : {}),
 				onLateSentAgentMessage: onLateSentAgentMessage
 					? (message) => onLateSentAgentMessage(toolCallId, message)
 					: undefined,
@@ -1013,6 +1018,51 @@ export function imageBlocksFromAttachments(attachments: readonly KernelAttachmen
 	return attachments
 		.filter((a) => IMAGE_MIME_TYPES.has(a.mimeType))
 		.map((a) => ({ type: "image", data: a.data, mimeType: a.mimeType }));
+}
+
+/** Minimum gap between two live change updates of one cell; the last one is never dropped. */
+export const LIVE_EFFECTS_UPDATE_INTERVAL_MS = 200;
+
+type IpythonEffectsDetails = Pick<
+	IpythonToolDetails,
+	"fileChanges" | "memoryChanges" | "activities" | "changeTrackingIncomplete"
+>;
+
+function fileChangeWithoutDiff(change: KernelFileChange): KernelFileChange {
+	const { diff: _diff, ...rest } = change;
+	return rest;
+}
+
+function memoryChangeWithoutTexts(change: KernelMemoryChange): KernelMemoryChange {
+	const { before: _before, after: _after, ...rest } = change;
+	return rest;
+}
+
+/**
+ * The change-tracking fields of a live (partial) update. Counts, labels and steps only: the diffs and
+ * memory texts arrive once, with the final result, instead of being resent on every update.
+ */
+export function livePartialEffectsDetails(effects: KernelCellEffects | undefined): IpythonEffectsDetails {
+	if (!effects) return {};
+	return {
+		...(effects.fileChanges.length > 0 ? { fileChanges: effects.fileChanges.map(fileChangeWithoutDiff) } : {}),
+		...(effects.memoryChanges.length > 0
+			? { memoryChanges: effects.memoryChanges.map(memoryChangeWithoutTexts) }
+			: {}),
+		...(effects.activities.length > 0 ? { activities: effects.activities } : {}),
+		...(effects.changeTrackingIncomplete !== undefined
+			? { changeTrackingIncomplete: effects.changeTrackingIncomplete }
+			: {}),
+	};
+}
+
+function finalEffectsDetails(r: ExecuteResult): IpythonEffectsDetails {
+	return {
+		...(r.fileChanges ? { fileChanges: r.fileChanges } : {}),
+		...(r.memoryChanges ? { memoryChanges: r.memoryChanges } : {}),
+		...(r.activities ? { activities: r.activities } : {}),
+		...(r.changeTrackingIncomplete !== undefined ? { changeTrackingIncomplete: r.changeTrackingIncomplete } : {}),
+	};
 }
 
 /** Model-facing result of one executed cell. */
@@ -1090,6 +1140,9 @@ export function assembleIpythonToolResult(
 			diffs: r.diffs,
 			attachments: r.attachments,
 			sentAgentMessages: r.sentAgentMessages,
+			// Display-only: the text above is built from stdout/stderr/result alone, so these
+			// records never reach the model, and compaction reads none of them.
+			...finalEffectsDetails(r),
 			kernelRestarted: options.kernelRestarted,
 			...(options.resetNotice ? { kernelReset: true as const } : {}),
 			error: r.error,
@@ -1128,6 +1181,36 @@ export function createIpythonToolDefinition(
 				});
 			};
 
+			// Live change records ride the existing partial-update path. Every partial carries the
+			// cumulative lists, so a stream chunk and a change update never erase each other.
+			let liveEffects: KernelCellEffects | undefined;
+			let lastPartialContent: TextContent[] = [];
+			let effectsTimer: ReturnType<typeof setTimeout> | undefined;
+			let lastEffectsUpdateAt = 0;
+			const pushPartial = () => {
+				onUpdate?.({
+					content: lastPartialContent,
+					details: { status: "ok", ...livePartialEffectsDetails(liveEffects) },
+				});
+			};
+			const flushEffects = () => {
+				effectsTimer = undefined;
+				lastEffectsUpdateAt = Date.now();
+				pushPartial();
+			};
+			const onEffects = onUpdate
+				? (effects: KernelCellEffects) => {
+						liveEffects = effects;
+						if (effectsTimer) return;
+						const wait = LIVE_EFFECTS_UPDATE_INTERVAL_MS - (Date.now() - lastEffectsUpdateAt);
+						if (wait <= 0) {
+							flushEffects();
+						} else {
+							effectsTimer = setTimeout(flushEffects, wait);
+						}
+					}
+				: undefined;
+
 			try {
 				const {
 					result: r,
@@ -1140,11 +1223,10 @@ export function createIpythonToolDefinition(
 					params.code,
 					signal,
 					(chunk) => {
-						onUpdate?.({
-							content: [{ type: "text", text: chunk }],
-							details: { status: "ok" },
-						});
+						lastPartialContent = [{ type: "text", text: chunk }];
+						pushPartial();
 					},
+					onEffects,
 					setToolWorkingMessage,
 					options?.onLateSentAgentMessage,
 					ctx,
@@ -1157,6 +1239,7 @@ export function createIpythonToolDefinition(
 					abortCause: r.status === "aborted" ? options?.getAbortCause?.() : undefined,
 				});
 			} finally {
+				if (effectsTimer) clearTimeout(effectsTimer);
 				if (hasWorkingMessage) {
 					setToolWorkingMessage();
 				}
