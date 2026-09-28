@@ -301,14 +301,15 @@ deleted in the same cell.
   `detail` (a command's latest or final output line, for example from `cat
   .env` or `echo $API_KEY`) gets the same scan; a `detail` that looks like a
   credential is left out of the record rather than sent. A step's `label` (the
-  command line or task text) is scanned too, before it is cut to its length
-  limit; one that looks like a credential reads as the step's kind (`command`,
-  for example). The scan runs only over the capped text and treats its own
-  failure as a secret. It cannot tell a
-  real credential from a value shaped like one, so ordinary code is withheld
-  too: a test fixture such as `API_KEY = "test-1234567890abcdef"` or a
-  JWT-shaped sample token on any line of a file's diff (changed lines and their
-  context) leaves that file's record with line counts only and
+  command line or task text) is scanned too, as it will be shown (blanks
+  collapsed) and a little past the part that shows, so a key the length limit
+  would cut is still seen whole; a label that looks like a credential reads as
+  the step's kind (`command`, for example). The scan runs only over the capped
+  text and treats its own failure as a secret. It cannot tell a real
+  credential from a value shaped like one, so ordinary code is withheld too: a
+  test fixture such as `API_KEY = "test-1234567890abcdef"` or a JWT-shaped
+  sample token on any line of a file's diff (changed lines and their context)
+  leaves that file's record with line counts only and
   `diffOmitted: "sensitive"`. That is deliberate: a diff withheld by mistake
   costs a look at the file, a credential saved with the session cannot be
   recalled.
