@@ -80,12 +80,6 @@ export interface Component {
 	handleInput?(data: string): void;
 
 	/**
-	 * Optional wheel handler for a focused fullscreen overlay (-1 up, 1 down).
-	 * Returns true when the component scrolled and needs a new frame.
-	 */
-	handleWheel?(direction: -1 | 1): boolean;
-
-	/**
 	 * If true, component receives key release events (Kitty protocol).
 	 * Default is false - release events are filtered out.
 	 */
@@ -925,9 +919,9 @@ export class TUI extends Container {
 	 * string the row's component renders) in view; undefined stops tracking.
 	 * Inline mode has no viewport to move, so it is a no-op there.
 	 */
-	setFullscreenRevealMarker(marker: string | undefined, endMarker?: string): void {
+	setFullscreenRevealMarker(marker: string | undefined): void {
 		if (!this.fullscreen) return;
-		this.fullscreen.viewport.setRevealMarker(marker, endMarker);
+		this.fullscreen.viewport.setRevealMarker(marker);
 		this.requestRender();
 	}
 
@@ -1153,12 +1147,17 @@ export class TUI extends Container {
 			}
 			if (event && !overlayFocused) {
 				const viewport = fullscreen.viewport;
-				if (isWheelUp(event)) {
+				if (isWheelUp(event) || isWheelDown(event)) {
 					this.stopSelectionAutoScroll();
-					this.scrollBy(-TUI.WHEEL_SCROLL_LINES);
-				} else if (isWheelDown(event)) {
-					this.stopSelectionAutoScroll();
-					this.scrollBy(TUI.WHEEL_SCROLL_LINES);
+					const direction = isWheelUp(event) ? -1 : 1;
+					// A region with its own scrolling content (a box body) takes the
+					// wheel first; at its end the transcript scrolls as usual.
+					const target = viewport.wheelTargetAt(event.y - 1, event.x - 1);
+					if (target?.region.onWheel?.(direction)) {
+						this.requestRender();
+					} else {
+						this.scrollBy(direction * TUI.WHEEL_SCROLL_LINES);
+					}
 				} else if (event.button === MOUSE_BUTTON_LEFT && event.press && !event.motion) {
 					this.stopSelectionAutoScroll();
 					if (!viewport.beginSelection(event.y - 1, event.x - 1)) {
@@ -1189,10 +1188,7 @@ export class TUI extends Container {
 			} else if (event && overlayFocused) {
 				this.stopSelectionAutoScroll();
 				const viewport = fullscreen.viewport;
-				if (isWheelUp(event) || isWheelDown(event)) {
-					// A scrollable overlay (a pager) takes the wheel; others ignore it.
-					if (this.focusedComponent?.handleWheel?.(isWheelUp(event) ? -1 : 1)) this.requestRender();
-				} else if (event.button === MOUSE_BUTTON_LEFT && event.press && !event.motion) {
+				if (event.button === MOUSE_BUTTON_LEFT && event.press && !event.motion) {
 					if (!viewport.beginFrameSelection(event.y - 1, event.x - 1)) {
 						viewport.beginSelection(event.y - 1, event.x - 1);
 					}
@@ -1257,10 +1253,11 @@ export class TUI extends Container {
 		const pressed = this.fullscreenPressedClick;
 		if (!pressed) return;
 		if (row !== pressed.row || col < pressed.col || col >= pressed.col + pressed.width) return;
-		// Whatever the click opens or closes renders below the clicked row: keep
-		// that row under the pointer instead of letting follow mode pull it away.
-		if (!this.isFullscreenOverlayFocused()) {
-			this.fullscreen?.viewport.holdForClick(row, pressed.region.revealBelow ?? 0);
+		// What the click opens renders below the clicked row: keep that row under
+		// the pointer instead of letting follow mode pull it up by the new rows.
+		const revealBelow = pressed.region.revealBelow ?? 0;
+		if (revealBelow > 0 && !this.isFullscreenOverlayFocused()) {
+			this.fullscreen?.viewport.holdForClick(row, revealBelow);
 		}
 		pressed.region.onClick({ row: row - pressed.anchor, col: col - pressed.region.col });
 		this.requestRender();

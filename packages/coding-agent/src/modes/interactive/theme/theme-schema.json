@@ -410,6 +410,14 @@
 				"cardFocusBg": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Background of the focused row in a change or memory card (optional)"
+				},
+				"boxBorder": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Border of a turn's timeline box (optional)"
+				},
+				"boxBorderLive": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Border of the timeline box while the turn runs (optional)"
 				}
 			},
 			"additionalProperties": false

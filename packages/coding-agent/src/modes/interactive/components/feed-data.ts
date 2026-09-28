@@ -44,6 +44,25 @@ export function emptyStepFeedData(): StepFeedData {
 	return { activities: [], memoryChanges: [], legacyDiffs: [] };
 }
 
+const CJK_CHAR = /[　-〿぀-ヿ㐀-䶿一-鿿가-힯＀-￯]/g;
+
+/**
+ * Token estimate for text whose usage the provider has not reported (yet):
+ * one token per CJK character, one per four other characters. Fractional so
+ * that estimates summed over stream deltas equal the estimate of the whole;
+ * round for display. Every estimated figure on screen (thinking rows, the
+ * live counter between usage reports) comes from here.
+ */
+export function estimateTokenUnits(text: string): number {
+	if (!text) return 0;
+	const cjk = text.match(CJK_CHAR)?.length ?? 0;
+	return cjk + (text.length - cjk) / 4;
+}
+
+export function estimateTokens(text: string): number {
+	return Math.round(estimateTokenUnits(text));
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -327,6 +346,18 @@ function addEntry(entries: Map<string, ChangeEntry>, entry: ChangeEntry): void {
 	if (entry.oldPath) existing.oldPath ??= entry.oldPath;
 }
 
+/** Parsed diff rows per change record: a live box rebuilds its rows every frame, the records stay put. */
+const diffRowsMemo = new WeakMap<object, DiffRow[]>();
+
+function memoRows(record: object, parse: () => DiffRow[]): DiffRow[] {
+	let rows = diffRowsMemo.get(record);
+	if (!rows) {
+		rows = parse();
+		diffRowsMemo.set(record, rows);
+	}
+	return rows;
+}
+
 /**
  * Every file the given steps changed, one entry per path: the kernel's
  * file-change records when a step has them, else the edit skill's diffs and
@@ -341,7 +372,7 @@ export function aggregateChanges(
 		if (data.fileChanges !== undefined) {
 			for (const change of data.fileChanges) {
 				const path = displayPath(change, cwd);
-				const rows = change.diff ? parseUnifiedDiff(change.diff) : [];
+				const rows = change.diff ? memoRows(change, () => parseUnifiedDiff(change.diff ?? "")) : [];
 				const agent = recordAgentName(change);
 				addEntry(entries, {
 					key: change.path,
@@ -361,7 +392,7 @@ export function aggregateChanges(
 			continue;
 		}
 		for (const diff of data.legacyDiffs) {
-			const rows = diffRowsFromEdit(diff.oldStr, diff.newStr, diff.startLine ?? 1);
+			const rows = memoRows(diff, () => diffRowsFromEdit(diff.oldStr, diff.newStr, diff.startLine ?? 1));
 			const path = displayPath({ path: diff.path }, cwd);
 			const counts = rows.reduce(
 				(sum, row) => ({
@@ -384,7 +415,8 @@ export function aggregateChanges(
 			});
 		}
 		if (data.editDiff) {
-			const rows = parseNumberedDiff(data.editDiff.diff);
+			const editDiff = data.editDiff;
+			const rows = memoRows(editDiff, () => parseNumberedDiff(editDiff.diff));
 			const path = displayPath({ path: data.editDiff.path }, cwd);
 			const added = rows.filter((row) => row.kind === "add").length;
 			const removed = rows.filter((row) => row.kind === "del").length;

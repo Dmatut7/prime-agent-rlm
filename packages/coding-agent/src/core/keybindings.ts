@@ -29,6 +29,7 @@ export interface AppKeybindings {
 	"app.messages.expand": true;
 	"app.messages.expandAll": true;
 	"app.edits.expand": true;
+	"app.turn.focus": true;
 	"app.thinking.toggle": true;
 	"app.thinking.toggleAll": true;
 	"app.subagents.focus": true;
@@ -131,6 +132,14 @@ export const KEYBINDINGS = {
 	"app.messages.expandAll": {
 		defaultKeys: "alt+p",
 		description: "Expand agent messages in every turn",
+		defaultKeyScope: "editor",
+	},
+	// Both default to ctrl+j: in the quiet conversation the key walks the latest
+	// turn's box (↑↓ rows, Enter opens, Esc leaves); in the legacy face, where the
+	// box does not exist, the same key toggles the edit diffs.
+	"app.turn.focus": {
+		defaultKeys: "ctrl+j",
+		description: "Walk the latest turn's box: arrows move, Enter opens a row, Escape leaves",
 		defaultKeyScope: "editor",
 	},
 	"app.edits.expand": { defaultKeys: "ctrl+j", description: "Toggle edit diffs", defaultKeyScope: "editor" },

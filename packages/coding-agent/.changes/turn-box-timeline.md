@@ -1,0 +1,6 @@
+- Changed the quiet conversation to show each AI turn as one box under its `◆ prime` header: a live header says what is happening now, and the body lists the turn's thinking, commands, file reads, edits, memories, subagents, retries, compactions and interjections in order, each row opening to its full text, output or diff.
+- Added a change strip under each finished answer (`✎ 改了 2 个文件 +20 −7 ▸ · ✦ 记住了 1 条 ▸`) that opens the edited files' diffs and the memories' before and after.
+- Added a bottom status bar with the model, a context meter that turns amber at 80%, the running subagents and the run's state, time and output tokens.
+- Added `app.turn.focus` (default `ctrl+j` in the quiet conversation) to walk the latest box with the arrow keys, Enter to open a row and Escape to leave; the mouse wheel scrolls a box's body and a click toggles the box or a row.
+- Added the `ui.timelineOpenWhileWorking`, `ui.timelineAutoFold` and `ui.reduceMotion` settings, also in `/settings`.
+- Changed "waiting for a result" rows to name the command they wait for, and the recap line to read `回顾：`.

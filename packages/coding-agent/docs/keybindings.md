@@ -167,6 +167,7 @@ Use `tab` to cycle forward and `shift+tab` to cycle backward through Providers, 
 | `app.tools.expandFull` | `alt+o` | Show tool output in full, ignoring the expanded render budget |
 | `app.messages.expand` | `ctrl+p` | Collapse or expand agent-to-agent messages |
 | `app.edits.expand` | `ctrl+j` | Collapse or expand edit diffs |
+| `app.turn.focus` | `ctrl+j` | Walk the latest turn's box: arrows move, Enter opens a row, Escape leaves. Only in the quiet conversation; elsewhere the key keeps expanding edit diffs |
 | `app.message.followUp` | `alt+enter` | Queue follow-up message |
 | `app.message.navigateOlder` | `alt+up` | Select the next older pending message |
 | `app.message.navigateNewer` | `alt+down` | Select the next newer pending message or restore the draft |

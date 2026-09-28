@@ -29,5 +29,13 @@ export interface ClickRegion {
 	 * row off the top.
 	 */
 	revealBelow?: number;
+	/** Not a click target (clicks go on as if the region were absent); only its `onWheel` applies. */
+	passive?: boolean;
 	onClick: (position: ClickPosition) => void;
+	/**
+	 * Mouse wheel over the region in the fullscreen viewport (-1 up, 1 down).
+	 * Return true when the region scrolled its own content; false lets the
+	 * transcript scroll instead (it reached that end, or has nothing to scroll).
+	 */
+	onWheel?: (direction: -1 | 1) => boolean;
 }

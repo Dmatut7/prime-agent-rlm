@@ -1,0 +1,2 @@
+- Added `onWheel` and `passive` to click regions so a region can scroll its own content with the mouse wheel in the fullscreen viewport, handing the wheel back to the transcript at its ends.
+- Added `revealBelow` to click regions: a click that opens rows below itself keeps the clicked row under the pointer and scrolls only as far as needed to show them.

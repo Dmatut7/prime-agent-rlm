@@ -305,9 +305,9 @@ describe("InteractiveMode streaming events", () => {
 		});
 		await handleEvent.call(fakeThis, { type: "agent_end", messages: [] });
 		const recap = renderChat(fakeThis.recapContainer);
-		expect(recap).toContain("Recap: Updated files");
+		expect(recap).toContain("回顾：Updated files");
 		expect(recap).toContain("改动 1 个文件 · +1 −1");
-		expect(recap.indexOf("改动 1 个文件")).toBeLessThan(recap.indexOf("Recap:"));
+		expect(recap.indexOf("改动 1 个文件")).toBeLessThan(recap.indexOf("回顾："));
 		expect(renderChat(fakeThis.chatContainer)).not.toContain("file changed");
 
 		const unchanged = createFakeInteractiveModeThis();
@@ -350,7 +350,7 @@ describe("InteractiveMode streaming events", () => {
 
 		expect(fakeThis.agentRunFileChanges.size).toBe(0);
 		expect(renderChat(fakeThis.recapContainer)).not.toContain("file changed");
-		expect(renderChat(fakeThis.recapContainer)).toContain("Recap: Updated files");
+		expect(renderChat(fakeThis.recapContainer)).toContain("回顾：Updated files");
 	});
 
 	test("resolves input immediately after return to agents view was requested", async () => {

@@ -914,6 +914,12 @@ export interface UiSettings {
 	 * automatic block off; `/dutylog` still shows it on demand.
 	 */
 	dutyLogAfterMinutes?: number;
+	/** Quiet conversation: a running turn's box starts open (default true). */
+	timelineOpenWhileWorking?: boolean;
+	/** Quiet conversation: a finished turn's box folds on its own unless the user opened or closed it (default true). */
+	timelineAutoFold?: boolean;
+	/** Turn off row highlights, fades, slides and folds; the spinner keeps turning (default false). */
+	reduceMotion?: boolean;
 }
 
 /** Default away time before the duty log appears on its own. */
@@ -1139,7 +1145,14 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	showHardwareCursor: null,
 	markdown: ["codeBlockIndent", "mermaid"],
 	warnings: ["anthropicExtraUsage"],
-	ui: ["subagentSpendCell", "processMode", "dutyLogAfterMinutes"],
+	ui: [
+		"subagentSpendCell",
+		"processMode",
+		"dutyLogAfterMinutes",
+		"timelineOpenWhileWorking",
+		"timelineAutoFold",
+		"reduceMotion",
+	],
 	sessionDir: null,
 };
 
@@ -2414,6 +2427,36 @@ export class SettingsManager {
 	setProcessMode(mode: ProcessModeSetting): void {
 		this.globalSettings.ui = { ...this.globalSettings.ui, processMode: mode };
 		this.markModified("ui", "processMode");
+		this.save();
+	}
+
+	getTimelineOpenWhileWorking(): boolean {
+		return this.settings.ui?.timelineOpenWhileWorking !== false;
+	}
+
+	setTimelineOpenWhileWorking(open: boolean): void {
+		this.globalSettings.ui = { ...this.globalSettings.ui, timelineOpenWhileWorking: open };
+		this.markModified("ui", "timelineOpenWhileWorking");
+		this.save();
+	}
+
+	getTimelineAutoFold(): boolean {
+		return this.settings.ui?.timelineAutoFold !== false;
+	}
+
+	setTimelineAutoFold(fold: boolean): void {
+		this.globalSettings.ui = { ...this.globalSettings.ui, timelineAutoFold: fold };
+		this.markModified("ui", "timelineAutoFold");
+		this.save();
+	}
+
+	getReduceMotion(): boolean {
+		return this.settings.ui?.reduceMotion === true;
+	}
+
+	setReduceMotion(reduce: boolean): void {
+		this.globalSettings.ui = { ...this.globalSettings.ui, reduceMotion: reduce };
+		this.markModified("ui", "reduceMotion");
 		this.save();
 	}
 

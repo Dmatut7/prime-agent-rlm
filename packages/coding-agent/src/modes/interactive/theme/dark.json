@@ -105,7 +105,9 @@
 		"diffRemovedLineBg": "#2e1216",
 		"rowFlashBg": "#1f3d36",
 		"rowFlashFadeBg": "#142521",
-		"cardFocusBg": "#1a2a26"
+		"cardFocusBg": "#1a2a26",
+		"boxBorder": "#2b303a",
+		"boxBorderLive": "#3b4250"
 	},
 	"export": {
 		"pageBg": "#18181e",

@@ -194,3 +194,87 @@ describe("fullscreen click regions", () => {
 		assert.deepStrictEqual(calls, []);
 	});
 });
+
+describe("fullscreen wheel regions and click hold", () => {
+	it("lets a region take the wheel, scrolls the transcript when it declines, and never clicks a passive region", async () => {
+		let consume = true;
+		const directions: number[] = [];
+		const clicks: ClickPosition[] = [];
+		const rendered = numbered(20);
+		const scroller: Component & { getClickRegions(): ClickRegion[] } = {
+			render: () => rendered,
+			invalidate: () => {},
+			getClickRegions: () => [
+				{
+					line: 14,
+					col: 0,
+					width: 40,
+					height: 3,
+					passive: true,
+					onClick: (position) => clicks.push(position),
+					onWheel: (direction) => {
+						directions.push(direction);
+						return consume;
+					},
+				},
+			],
+		};
+		await withFullscreen(
+			() => ({ scroll: [scroller], dock: plain(["> prompt"]) }),
+			async ({ terminal, click }) => {
+				// The window shows rows 11-19; screen row 5 is transcript row 15, inside the region.
+				const before = terminal.getViewport();
+				terminal.sendInput("\x1b[<64;5;5M");
+				await terminal.waitForRender();
+				assert.deepStrictEqual(terminal.getViewport(), before, "the region scrolled itself");
+				consume = false;
+				terminal.sendInput("\x1b[<64;5;5M");
+				await terminal.waitForRender();
+				assert.ok(terminal.getViewport()[0]?.startsWith("row 10"), "the transcript scrolled instead");
+				await click(5, 5);
+			},
+		);
+		assert.deepStrictEqual(directions, [-1, -1]);
+		assert.deepStrictEqual(clicks, []);
+	});
+
+	it("keeps a clicked row under the pointer while what it opens renders below it", async () => {
+		for (const { revealBelow, opened, expectedRow } of [
+			// Room below: the clicked row stays on screen row 4.
+			{ revealBelow: 3, opened: 3, expectedRow: 4 },
+			// More than fits: the clicked row goes to the top, never past it.
+			{ revealBelow: 20, opened: 20, expectedRow: 0 },
+			// No hold: following the newest line pulls the clicked row up.
+			{ revealBelow: 0, opened: 3, expectedRow: 1 },
+		]) {
+			const rendered = numbered(20);
+			const opener: Component & { getClickRegions(): ClickRegion[] } = {
+				render: () => [...rendered],
+				invalidate: () => {},
+				getClickRegions: () => [
+					{
+						line: 15,
+						col: 0,
+						width: 40,
+						height: 1,
+						revealBelow,
+						onClick: () => {
+							rendered.splice(16, 0, ...numbered(opened, "open"));
+						},
+					},
+				],
+			};
+			await withFullscreen(
+				() => ({ scroll: [opener], dock: plain(["> prompt"]) }),
+				async ({ terminal, click }) => {
+					assert.ok(terminal.getViewport()[4]?.startsWith("row 15"));
+					await click(5, 5);
+					const screen = terminal.getViewport();
+					const clickedRow = screen.findIndex((line) => line.startsWith("row 15"));
+					assert.strictEqual(clickedRow, expectedRow, `revealBelow ${revealBelow}`);
+					assert.ok(screen[clickedRow + 1]?.startsWith("open 0"), "the opened rows follow the clicked row");
+				},
+			);
+		}
+	});
+});

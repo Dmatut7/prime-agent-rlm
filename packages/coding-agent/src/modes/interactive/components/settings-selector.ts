@@ -77,6 +77,9 @@ export interface SettingsConfig {
 	hideThinkingBlock: boolean;
 	mermaidRenderingMode: MermaidRenderingMode;
 	processMode: ProcessModeSetting;
+	timelineOpenWhileWorking: boolean;
+	timelineAutoFold: boolean;
+	reduceMotion: boolean;
 	treeFilterMode: "default" | "no-tools" | "user-only" | "labeled-only" | "all";
 	showHardwareCursor: boolean;
 	editorPaddingX: number;
@@ -105,6 +108,9 @@ export interface SettingsCallbacks {
 	onHideThinkingBlockChange: (hidden: boolean) => void;
 	onMermaidRenderingModeChange: (mode: MermaidRenderingMode) => void;
 	onProcessModeChange: (mode: ProcessModeSetting) => void;
+	onTimelineOpenWhileWorkingChange: (open: boolean) => void;
+	onTimelineAutoFoldChange: (fold: boolean) => void;
+	onReduceMotionChange: (reduce: boolean) => void;
 	onTreeFilterModeChange: (mode: "default" | "no-tools" | "user-only" | "labeled-only" | "all") => void;
 	onShowHardwareCursorChange: (enabled: boolean) => void;
 	onEditorPaddingXChange: (padding: number) => void;
@@ -284,9 +290,30 @@ export class SettingsSelectorComponent extends Container {
 			{
 				id: "process-mode",
 				label: "过程显示",
-				description: "安静：每轮收成一行过程；经典：显示完整过程",
+				description: "安静：每轮的步骤放进一个框里；经典：显示完整过程",
 				currentValue: config.processMode,
 				values: ["quiet", "legacy"],
+			},
+			{
+				id: "timeline-open",
+				label: "干活时框展开",
+				description: "AI 干活时，这一轮的框打开，一步一步看得见",
+				currentValue: config.timelineOpenWhileWorking ? "true" : "false",
+				values: ["true", "false"],
+			},
+			{
+				id: "timeline-fold",
+				label: "干完自动收起",
+				description: "这一轮做完后框收成一行总结；你自己点开或收起过的框不动",
+				currentValue: config.timelineAutoFold ? "true" : "false",
+				values: ["true", "false"],
+			},
+			{
+				id: "reduce-motion",
+				label: "减少动效",
+				description: "关掉新行高亮、淡入、展开和收起的动画，只保留转圈",
+				currentValue: config.reduceMotion ? "true" : "false",
+				values: ["true", "false"],
 			},
 			{
 				id: "quiet-startup",
@@ -523,6 +550,15 @@ export class SettingsSelectorComponent extends Container {
 						break;
 					case "process-mode":
 						callbacks.onProcessModeChange(newValue as ProcessModeSetting);
+						break;
+					case "timeline-open":
+						callbacks.onTimelineOpenWhileWorkingChange(newValue === "true");
+						break;
+					case "timeline-fold":
+						callbacks.onTimelineAutoFoldChange(newValue === "true");
+						break;
+					case "reduce-motion":
+						callbacks.onReduceMotionChange(newValue === "true");
 						break;
 					case "quiet-startup":
 						callbacks.onQuietStartupChange(newValue === "true");

@@ -108,7 +108,7 @@ describe("ENG-4533 recap layout", () => {
 
 		expect(previous).toHaveLength(2);
 		expect(updated).toHaveLength(2);
-		expect(stripAnsi(updated[0] ?? "")).toContain("Recap: Preparing the fix plan");
+		expect(stripAnsi(updated[0] ?? "")).toContain("回顾：Preparing the fix plan");
 	});
 
 	it("does not reserve blank space before the first recap", () => {
@@ -123,6 +123,6 @@ describe("ENG-4533 recap layout", () => {
 
 		expect(lines).toHaveLength(2);
 		expect(visibleWidth(lines[0] ?? "")).toBe(24);
-		expect(stripAnsi(lines[0] ?? "")).toContain("Recap:");
+		expect(stripAnsi(lines[0] ?? "")).toContain("回顾：");
 	});
 });

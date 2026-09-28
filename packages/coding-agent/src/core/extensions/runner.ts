@@ -81,6 +81,7 @@ const RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS = [
 	"app.messages.expand",
 	"app.messages.expandAll",
 	"app.edits.expand",
+	"app.turn.focus",
 	"app.thinking.toggle",
 	"app.thinking.toggleAll",
 	"app.subagents.focus",

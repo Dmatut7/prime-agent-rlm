@@ -12,7 +12,6 @@ import {
 	summarizeErrorDetails,
 } from "./collapsible-error.js";
 import type { MermaidMarkdownTransform } from "./mermaid.js";
-import { ASSISTANT_GUTTER_WIDTH, assistantGutter } from "./running-card.js";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
@@ -163,27 +162,9 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 	}
 
 	override render(width: number): string[] {
-		// v3: a quiet turn's answer runs down the AI gutter under its `◆ prime`
-		// header. The body keeps its own one-column padding, so the rail takes
-		// exactly one column.
-		const gutter = this.quiet && width > 8;
-		const body = this.renderMessage(gutter ? width - ASSISTANT_GUTTER_WIDTH : width);
-		const lines = gutter ? this.withGutter(body) : body;
+		// The answer reads flush under its turn's box, like any other text.
+		const lines = this.renderMessage(width);
 		return this.blockFocus && lines.length > 0 ? decorateFocusedBlock(lines, width, this.blockFocus) : lines;
-	}
-
-	private gutterSource?: string[];
-	private gutterLines?: string[];
-
-	/** Memoized against the body array's identity, like the OSC markers below. */
-	private withGutter(body: string[]): string[] {
-		if (this.gutterSource === body && this.gutterLines) {
-			return this.gutterLines;
-		}
-		const rail = assistantGutter();
-		this.gutterSource = body;
-		this.gutterLines = body.map((line) => `${rail}${line}`);
-		return this.gutterLines;
 	}
 
 	setBlockFocus(state: BlockFocusState | undefined): void {

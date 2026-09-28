@@ -61,7 +61,7 @@ describe("InteractiveMode compaction events", () => {
 
 		await handleEvent.call(fakeThis, { type: "compaction_start", reason: "threshold" });
 
-		expect(stripAnsi(statusContainer.render(80).join("\n"))).toContain("Auto-compacting");
+		expect(stripAnsi(statusContainer.render(80).join("\n"))).toContain("上下文快满了，正在自动整理…");
 		expect(fakeThis.ui.requestRender).toHaveBeenCalled();
 
 		await handleEvent.call(fakeThis, {
@@ -136,6 +136,6 @@ describe("InteractiveMode compaction events", () => {
 
 		(Reflect.get(InteractiveMode.prototype, "syncWorkingLoader") as (this: unknown) => void).call(fakeThis);
 
-		expect(stripAnsi(statusContainer.render(80).join("\n"))).toContain("Compacting context");
+		expect(stripAnsi(statusContainer.render(80).join("\n"))).toContain("正在整理上下文…");
 	});
 });

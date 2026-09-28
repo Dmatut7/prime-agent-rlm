@@ -124,6 +124,8 @@ const ThemeJsonSchema = Type.Object({
 		rowFlashBg: Type.Optional(ColorValueSchema),
 		rowFlashFadeBg: Type.Optional(ColorValueSchema),
 		cardFocusBg: Type.Optional(ColorValueSchema),
+		boxBorder: Type.Optional(ColorValueSchema),
+		boxBorderLive: Type.Optional(ColorValueSchema),
 	}),
 	export: Type.Optional(
 		Type.Object({
@@ -210,7 +212,9 @@ export type ThemeColor =
 	| "memoryAccent"
 	| "churnBar"
 	| "diffAddedText"
-	| "diffRemovedText";
+	| "diffRemovedText"
+	| "boxBorder"
+	| "boxBorderLive";
 
 export type ThemeBg =
 	| "selectedBg"
@@ -836,6 +840,8 @@ const CONVERSATION_LAYER_FALLBACKS: Record<string, string> = {
 	rowFlashBg: "selectedBg",
 	rowFlashFadeBg: "customMessageBg",
 	cardFocusBg: "selectedBg",
+	boxBorder: "borderMuted",
+	boxBorderLive: "borderMuted",
 };
 
 function createTheme(themeJson: ThemeJson, mode?: ColorMode, sourcePath?: string): Theme {

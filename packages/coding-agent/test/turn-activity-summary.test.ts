@@ -3,7 +3,6 @@ import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai"
 import type { TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import { AGENT_MESSAGE_SOURCE, createAgentSessionMessage } from "../src/core/agent-messages.js";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
@@ -387,187 +386,6 @@ describe("turn activity summary (U4)", () => {
 	});
 });
 
-describe("turn head footnote (TUI v4 quiet)", () => {
-	beforeAll(() => initTheme("dark"));
-
-	function renderQuiet(messages: readonly AgentMessage[]): string {
-		const components = buildConversationComponents(messages, {
-			ui,
-			cwd: "/tmp",
-			toolOptions: {},
-			getToolDefinition: () => undefined,
-			processMode: "quiet",
-		});
-		return components
-			.flatMap((component) => component.render(120))
-			.map(stripAnsi)
-			.join("\n");
-	}
-
-	it("collapses the turn head to one footnote line and drops the legacy pair", () => {
-		const messages: AgentMessage[] = [
-			{ role: "user", content: "run the checks", timestamp: 900 },
-			...toolHeavyTurn(),
-		];
-		const collapsed = renderQuiet(messages);
-		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
-
-		// The `◆ prime` header carries the model and the time; one process line
-		// sits under it on the gutter rail: caret, steps, plain-words summary.
-		// A bare `│` is the rail running through a blank row of the AI block.
-		const turn = turnLines(nonEmpty).filter((line) => line !== " │");
-		expect(turn[0]).toBe(" ◆ prime  test-model · 0.6s");
-		expect(turn[1]?.startsWith(" │ ▸ 6 steps   ")).toBe(true);
-		expect(turn[1]).toContain("编辑 3 个文件");
-		expect(turn[1]).toContain("运行 npm test");
-		expect(turn[1]).not.toMatch(/\[[OTP]\]/);
-		// The very next line is the final prose: no second mechanical line.
-		expect(turn[2]).toContain("All six checks passed");
-		expect(nonEmpty.filter((line) => line.includes("steps"))).toHaveLength(1);
-		// The legacy two-line surface is gone.
-		expect(collapsed).not.toContain("⚙");
-		expect(collapsed).not.toContain("Thinking ×");
-	});
-
-	it("renders a thinking-only quiet turn as 思考 with its duration, and a bare turn the same way", () => {
-		const messages: AgentMessage[] = [
-			{ role: "user", content: "just think", timestamp: 900 },
-			assistant(
-				[
-					{ type: "thinking", thinking: "First segment." },
-					{ type: "thinking", thinking: "Second segment." },
-					{ type: "text", text: "Concluded." },
-				],
-				1_000,
-			),
-			{ role: "user", content: "next", timestamp: 3_000 },
-			assistant([{ type: "text", text: "No thinking here." }], 3_500),
-		];
-		const collapsed = renderQuiet(messages);
-		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
-		// The thinking-only turn: Thinking under the header, no step count.
-		expect(turnLines(nonEmpty)[0]).toBe(" ◆ prime  test-model · 2.0s");
-		expect(turnLines(nonEmpty)[1]).toBe(" │ ▸ Thinking");
-		expect(collapsed).toContain("Concluded.");
-		// R5-P2③: the thinking-less turn renders 思考 too - the model is
-		// always reasoning, so every turn carries the process line.
-		const heads = collapsed.split("\n").filter((line) => line.startsWith(" │ ▸ Thinking"));
-		expect(heads).toHaveLength(2);
-		expect(collapsed).not.toContain("想了想");
-	});
-
-	it("renders 思考 for an all-zero turn (R5-P2③: every turn carries the footnote)", () => {
-		const state = new TurnActivityState(1_000);
-		state.markTurnEnded(1_500);
-		const summary = new TurnSummaryComponent(state);
-		summary.setQuiet(true);
-		// No steps, no thinking, no comms: still one 思考 line, not nothing.
-		const line = stripAnsi(summary.render(120).join("\n"));
-		expect(line).toBe(" ◆ prime  0.5s\n │ ▸ Thinking");
-	});
-
-	it("counts comms from received agent rows plus sent agent messages in tool details", () => {
-		const messages: AgentMessage[] = [
-			{ role: "user", content: "delegate and report", timestamp: 900 },
-			assistant(
-				[
-					{ type: "thinking", thinking: "One segment." },
-					{ type: "toolCall", id: "py-1", name: "ipython", arguments: { code: "send()" } },
-				],
-				1_000,
-			),
-			{
-				...toolResult("py-1", "ipython", "ok", 1_100),
-				details: {
-					sentAgentMessages: [
-						{
-							id: "agentmsg_sent_1",
-							message: "sent one",
-							deliveryStatus: "delivered",
-							target: { activeSessionId: "t1", sessionId: "t1" },
-						},
-						{
-							id: "agentmsg_sent_2",
-							message: "sent two",
-							deliveryStatus: "delivered",
-							target: { activeSessionId: "t1", sessionId: "t1" },
-						},
-					],
-				},
-			},
-			createAgentSessionMessage(
-				{
-					id: "agentmsg_recv_1",
-					source: AGENT_MESSAGE_SOURCE,
-					message: "received one",
-					target: { activeSessionId: "a1", sessionId: "a1" },
-				},
-				1_200,
-			),
-			assistant([{ type: "text", text: "Reported." }], 1_300),
-		];
-		const collapsed = renderQuiet(messages);
-		// 1 step, 1 thinking segment, 3 comms (2 sent + 1 received). A replay never
-		// measured the thinking time, so the 思考 segment stays out.
-		const head = collapsed.split("\n").find((line) => line.startsWith(" │ ▸ "));
-		expect(head?.startsWith(" │ ▸ 1 step · ")).toBe(true);
-		expect(head).toContain(" · 3 msgs");
-		expect(head).not.toContain("[P]");
-	});
-
-	it("counts steps deduped by toolCallId", () => {
-		const state = new TurnActivityState(1_000);
-		state.addStep({ toolCallId: "dup", toolName: "bash", args: {}, status: "done" });
-		state.addStep({ toolCallId: "dup", toolName: "bash", args: {}, status: "done" });
-		state.markTurnEnded(2_000);
-		const summary = new TurnSummaryComponent(state);
-		summary.setQuiet(true);
-		const line = stripAnsi(summary.render(120).join("\n"));
-		expect(line).toContain("1 step");
-		expect(line).not.toContain("2 steps");
-	});
-
-	it("addCommMessage feeds the footnote count", () => {
-		const state = new TurnActivityState(1_000);
-		state.addStep({ toolCallId: "t1", toolName: "bash", args: {}, status: "done" });
-		state.markTurnEnded(1_500);
-		const summary = new TurnSummaryComponent(state);
-		summary.setQuiet(true);
-		summary.addCommMessage();
-		summary.addCommMessage();
-		const line = stripAnsi(summary.render(120).join("\n"));
-		expect(line).toContain(" · 2 msgs");
-	});
-
-	it("setQuiet(false) restores the legacy two-line face", () => {
-		const state = new TurnActivityState(1_000);
-		state.addStep({ toolCallId: "t1", toolName: "bash", args: {}, status: "done" });
-		state.markTurnEnded(1_500);
-		const summary = new TurnSummaryComponent(state);
-		summary.setQuiet(true);
-		expect(stripAnsi(summary.render(120).join("\n"))).toMatch(/^ ◆ prime {2}\S+\n │ ▸ 1 step {3}/);
-		summary.setQuiet(false);
-		const legacy = stripAnsi(summary.render(120).join("\n"));
-		expect(legacy).toContain("⚙ 1 步");
-		expect(legacy).not.toContain("[O]");
-	});
-
-	it("freezes the settled footnote line: repeated renders reuse one array", () => {
-		const state = new TurnActivityState(1_000);
-		state.addStep({ toolCallId: "t1", toolName: "bash", args: {}, status: "done" });
-		// Live turn (no end stamp): every render recomputes - fresh arrays.
-		const summary = new TurnSummaryComponent(state);
-		summary.setQuiet(true);
-		const firstLive = summary.render(120);
-		const secondLive = summary.render(120);
-		expect(secondLive).not.toBe(firstLive);
-		// Settled + ended: the line freezes (O(this line) redraw contract).
-		state.markTurnEnded(2_000);
-		const firstSettled = summary.render(120);
-		expect(summary.render(120)).toBe(firstSettled);
-	});
-});
-
 describe("process block key-steps fold (TUI v4 T6)", () => {
 	beforeAll(() => initTheme("dark"));
 
@@ -673,22 +491,15 @@ describe("process block key-steps fold (TUI v4 T6)", () => {
 });
 
 describe("turn comm counter (TUI v4 T6)", () => {
-	beforeAll(() => initTheme("dark"));
-
-	it("lives on the turn state and feeds the quiet footnote", () => {
+	it("lives on the turn state; the summary facade routes into the same counter", () => {
 		const state = new TurnActivityState(1_000);
 		state.addStep({ toolCallId: "t1", toolName: "bash", args: {}, status: "done" });
 		state.markTurnEnded(1_500);
 		state.addCommMessage();
 		state.addCommMessage();
 		state.addCommMessage();
-
 		const summary = new TurnSummaryComponent(state);
-		summary.setQuiet(true);
-		// The component facade routes into the same counter.
 		summary.addCommMessage();
-		const line = stripAnsi(summary.render(120).join("\n"));
-		expect(line).toContain(" · 4 msgs");
 		expect(state.commMessageCount).toBe(4);
 	});
 });
@@ -704,34 +515,6 @@ describe("turn state for the process line", () => {
 		]);
 		state.addFileChanges([{ path: "src/a.ts", added: 1, removed: 3 }]);
 		expect(state.fileChanges).toEqual([{ path: "src/a.ts", added: 3, removed: 4 }]);
-	});
-
-	it("lists changed files while collapsed and hides them once the process block opens", () => {
-		const state = new TurnActivityState(1_000);
-		state.addStep({ toolCallId: "e1", toolName: "edit", args: { path: "src/a.ts" }, status: "running" });
-		state.setStepStatus("e1", "done", 1_400);
-		state.addFileChanges([{ path: "src/a.ts", added: 3, removed: 5 }]);
-		state.markTurnEnded(1_500);
-		const summary = new TurnSummaryComponent(state);
-		summary.setQuiet(true);
-		expect(summary.render(120).map((line) => stripAnsi(line))).toEqual([
-			" ◆ prime  0.4s",
-			" │ ▸ 1 step   编辑 a.ts",
-			" │   改动  src/a.ts  +3 −5",
-		]);
-		summary.setExpanded(true);
-		expect(summary.render(120).map((line) => stripAnsi(line))).toEqual([" ◆ prime  0.4s", " │ ▾ 1 step   编辑 a.ts"]);
-	});
-
-	it("relabels a step when its streaming arguments complete", () => {
-		const state = new TurnActivityState(1_000);
-		state.addStep({ toolCallId: "p1", toolName: "ipython", args: {}, status: "queued" });
-		state.updateStepArgs("p1", { code: "%%bash\nnpm run check" });
-		state.setStepStatus("p1", "done", 1_200);
-		state.markTurnEnded(1_300);
-		const summary = new TurnSummaryComponent(state);
-		summary.setQuiet(true);
-		expect(stripAnsi(summary.render(120)[1] ?? "")).toBe(" │ ▸ 1 step   运行 npm run check");
 	});
 
 	it("keeps the clock ticking while a step is unsettled and freezes it on the last settled step", () => {
@@ -785,72 +568,6 @@ describe("turn state for the process line", () => {
 		replay.addThinkingSegments(2);
 		replay.noteThinking(false, 5_000);
 		expect(replay.thinkingDurationMs(9_000)).toBeUndefined();
-	});
-
-	it("previews the latest thinking only while the process block is open", () => {
-		const state = new TurnActivityState(1_000);
-		state.addStep({ toolCallId: "t1", toolName: "bash", args: { command: "npm test" }, status: "done" });
-		state.markTurnEnded(2_000);
-		state.latestThinking = "Check both data sources before changing anything.";
-		const summary = new TurnSummaryComponent(state);
-		summary.setQuiet(true);
-		expect(summary.render(120).map(stripAnsi).join("\n")).not.toContain("Check both data sources");
-		summary.setExpanded(true);
-		const open = summary.render(120).map(stripAnsi);
-		expect(open[2]).toContain("Thinking  Check both data sources");
-	});
-
-	it("drops the Thinking preview while the full trace is open", () => {
-		const state = new TurnActivityState(1_000);
-		state.addStep({ toolCallId: "t1", toolName: "bash", args: { command: "ls" }, status: "done" });
-		state.addThinkingSegments(1);
-		state.latestThinking = "weighing the two options";
-		state.markTurnEnded(2_000);
-		const summary = new TurnSummaryComponent(state);
-		summary.setQuiet(true);
-		summary.setExpanded(true);
-		expect(summary.render(120).map(stripAnsi).join("\n")).toContain("weighing the two options");
-		state.thinkingExpanded = true;
-		summary.invalidate();
-		expect(summary.render(120).map(stripAnsi).join("\n")).not.toContain("weighing the two options");
-	});
-
-	it("refreshes a frozen turn's caret the moment any lane flips (QA H1)", () => {
-		const state = new TurnActivityState(1_000);
-		state.addStep({ toolCallId: "t1", toolName: "bash", args: { command: "ls" }, status: "done" });
-		state.addThinkingSegments(1);
-		state.markTurnEnded(2_000);
-		const summary = new TurnSummaryComponent(state);
-		summary.setQuiet(true);
-		const caret = () => stripAnsi(summary.render(120)[1] ?? "").slice(0, 5);
-		expect(caret()).toBe(" │ ▸ ");
-		state.thinkingExpanded = true;
-		expect(caret()).toBe(" │ ▾ ");
-		state.thinkingExpanded = false;
-		expect(caret()).toBe(" │ ▸ ");
-		// Ctrl+P opens nothing in a turn without comms, so the caret stays put.
-		state.agentMessagesExpanded = true;
-		expect(caret()).toBe(" │ ▸ ");
-		state.addCommMessage();
-		expect(caret()).toBe(" │ ▾ ");
-	});
-
-	it("shows the running card while the turn runs and the settled line once it ends (QA L2)", () => {
-		const state = new TurnActivityState(1_000);
-		state.addStep({ toolCallId: "t1", toolName: "bash", args: { command: "sleep 30" }, status: "running" });
-		const summary = new TurnSummaryComponent(state);
-		summary.setQuiet(true);
-		const running = summary.render(120).map(stripAnsi);
-		// The header says working; the card names the running step once, as an
-		// action, and the settled summary (nothing settled yet) stays out.
-		expect(running[0]).toContain("working");
-		expect(running[1]).toContain("正在运行 sleep 30");
-		expect(running[2]).toContain("step 1");
-		expect(running[2]).not.toContain("sleep 30");
-		state.setStepStatus("t1", "done", 1_500);
-		state.markTurnEnded(1_600);
-		summary.invalidate();
-		expect(stripAnsi(summary.render(120)[1] ?? "")).toContain("运行 sleep 30");
 	});
 
 	it("previews the turn's first thinking trace, following it while it streams", () => {

@@ -360,10 +360,19 @@ export class ToolExecutionComponent extends Container implements FocusableBlock 
 		this.turnActivity = state;
 	}
 
+	/** The turn this tool belongs to, when it is attached to one. */
+	get turnState(): TurnActivityState | undefined {
+		return this.turnActivity;
+	}
+
 	private isHiddenByTurnSummary(): boolean {
 		const state = this.turnActivity;
 		if (!state) {
 			return false;
+		}
+		// The quiet conversation shows every step as a row in the turn's box.
+		if (state.boxMode) {
+			return true;
 		}
 		// TUI v4 T6: the key-steps view folds middle settled steps behind the ⋯
 		// row regardless of the per-tool expanded flag - applyTurnExpansion maps

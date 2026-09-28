@@ -33,7 +33,7 @@ import {
 	type ToolExecutionDefinition,
 	type ToolExecutionOptions,
 } from "./tool-execution.js";
-import { TurnActivityState, type TurnStep, TurnSummaryComponent } from "./turn-activity.js";
+import { type TimelineHost, TurnActivityState, type TurnStep, TurnSummaryComponent } from "./turn-activity.js";
 import { UserMessageComponent } from "./user-message.js";
 
 export interface ConversationComponentsOptions {
@@ -51,6 +51,8 @@ export interface ConversationComponentsOptions {
 	isRecognizedSlashCommand?: (name: string) => boolean;
 	/** TUI v4: quiet folds intermediate narration behind the turn footnote; legacy keeps the old face. */
 	processMode?: ProcessModeSetting;
+	/** What the quiet turns' boxes read (settings, screen height, working directory). */
+	timelineHost?: TimelineHost;
 }
 
 export function isCompactAgentMessageNeighbor(component: Component | undefined): boolean {
@@ -99,15 +101,42 @@ export function buildConversationComponents(
 	const ensureTurn = (startedAt: number): TurnActivityState => {
 		if (!turnState) {
 			turnState = new TurnActivityState(startedAt);
+			if (options.timelineHost) turnState.host = options.timelineHost;
 		}
 		return turnState;
+	};
+	const quiet = options.processMode === "quiet";
+	let lastAssistant: AgentMessage | undefined;
+	// An interjection lands after the step's results came back; a user message
+	// straight after a tool call (an orphaned call) starts a turn.
+	let resultsArrived = false;
+	const closeTurn = (): void => {
+		if (!turnState || lastAssistant?.role !== "assistant") return;
+		turnState.timeline.stopped = lastAssistant.stopReason === "aborted";
+		turnState.timeline.errorEnded = lastAssistant.stopReason === "error";
 	};
 
 	for (const message of messages) {
 		if (message.role === "user") {
+			// Typed while the AI was between its steps: an interjection row in
+			// the quiet turn's box, not a new turn (the live view does the same).
+			if (
+				quiet &&
+				turnState &&
+				lastAssistant?.role === "assistant" &&
+				lastAssistant.stopReason === "toolUse" &&
+				resultsArrived
+			) {
+				turnState.timeline.addSteer(
+					readUserText(message.content).trim() || "[图片]",
+					Number(message.timestamp) || 0,
+				);
+				continue;
+			}
 			// A user prompt starts a new turn; the previous group is settled by
 			// then, so freeze its clock (thinking-only turns have no steps to
 			// settle) and reset the grouping from here on.
+			closeTurn();
 			turnState?.markTurnEnded(Number(message.timestamp) || Date.now());
 			turnState = undefined;
 			turnSummary = undefined;
@@ -121,6 +150,9 @@ export function buildConversationComponents(
 			state.addThinkingSegments(countThinkingSegments(message));
 			state.latestThinking = latestThinkingText(message) || state.latestThinking;
 			state.modelId = message.model || state.modelId;
+			state.timeline.noteMessage(message, true);
+			lastAssistant = message;
+			resultsArrived = false;
 			if (!turnSummary) {
 				turnSummary = new TurnSummaryComponent(state);
 				turnSummary.setExpanded(expanded);
@@ -188,18 +220,33 @@ export function buildConversationComponents(
 						],
 						isError: true,
 					});
+					state.timeline.mergeStep(
+						content.id,
+						content.name,
+						content.arguments,
+						{ content: [{ type: "text", text: message.errorMessage || "已中断" }], isError: true },
+						false,
+					);
 					state.setStepStatus(content.id, "error");
 				} else {
 					pendingTools.set(content.id, tool);
 				}
 			}
 		} else if (message.role === "toolResult") {
+			resultsArrived = true;
 			pendingTools.get(message.toolCallId)?.updateResult(message);
 			pendingTools.delete(message.toolCallId);
 			turnState?.setStepStatus(
 				message.toolCallId,
 				message.isError ? "error" : "done",
 				Number(message.timestamp) || Date.now(),
+			);
+			turnState?.timeline.mergeStep(
+				message.toolCallId,
+				message.toolName,
+				turnState.steps.find((step) => step.toolCallId === message.toolCallId)?.args,
+				message,
+				false,
 			);
 			// TUI v4: sent agent messages riding this tool result count as comms.
 			const details =
@@ -241,11 +288,12 @@ export function buildConversationComponents(
 			);
 		} else if (message.role === "custom" && message.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE) {
 			if (!message.display) continue;
-			const component = isRefinementOutcomeMessage(message)
-				? new RefinementOutcomeMessageComponent(message)
-				: new MalformedRefinementOutcomeMessageComponent();
-			component.setExpanded(expanded);
-			components.push(component);
+			// The memory line opens by its own click or Enter, never with the process lane.
+			components.push(
+				isRefinementOutcomeMessage(message)
+					? new RefinementOutcomeMessageComponent(message)
+					: new MalformedRefinementOutcomeMessageComponent(),
+			);
 		} else if (isAgentSessionMessage(message) && message.display) {
 			// TUI v4: a received agent-message row is one comm in this turn.
 			turnSummary?.addCommMessage();
@@ -281,6 +329,7 @@ export function buildConversationComponents(
 	}
 	// The last turn has no following user prompt; freeze its clock at the last
 	// message so a thinking-only line stops ticking.
+	closeTurn();
 	turnState?.markTurnEnded(Number(messages.at(-1)?.timestamp) || Date.now());
 	return components;
 }
