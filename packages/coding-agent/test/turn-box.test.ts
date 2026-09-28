@@ -1,4 +1,4 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { ABORT_TRUNCATION_MARKER, type AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai";
 import { type ClickRegion, setKeybindings, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
@@ -963,13 +963,20 @@ describe("replay groups a transcript the way the live view does", () => {
 	});
 
 	it("ends a turn the owner interrupted mid-step as stopped, and the next message starts a new turn", () => {
+		// The owner's stop: the agent loop keeps the cell's partial output and marks it cut short.
 		const result = (id: string, timestamp: number, status: "ok" | "aborted"): ToolResultMessage => ({
 			role: "toolResult",
 			toolCallId: id,
 			toolName: "ipython",
-			content: [{ type: "text", text: status === "ok" ? "done" : "<ipython_cell_aborted>" }],
+			content:
+				status === "ok"
+					? [{ type: "text", text: "done" }]
+					: [
+							{ type: "text", text: "<ipython_cell_aborted>" },
+							{ type: "text", text: ABORT_TRUNCATION_MARKER },
+						],
 			details: { status },
-			isError: false,
+			isError: status === "aborted",
 			timestamp,
 		});
 		const messages: AgentMessage[] = [

@@ -1,4 +1,4 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { ABORT_TRUNCATION_MARKER, type AgentMessage, TOOL_ABORT_FALLBACK_MESSAGE } from "@earendil-works/pi-agent-core";
 import type { Component, MarkdownTheme, TUI } from "@earendil-works/pi-tui";
 import { isAgentSessionMessage } from "../../../core/agent-messages.js";
 import {
@@ -78,6 +78,37 @@ function readUserText(content: string | Array<{ type: string; text?: string }>):
 		.join("");
 }
 
+/** How a step's result says its turn went on, for a replay that cannot see the owner's key press. */
+export interface StepResultStop {
+	/** The run ended there on a stop: a message after it starts the next turn. */
+	endsTurn: boolean;
+	/** With nothing after it, the turn ended as stopped (not as an error). */
+	stopped: boolean;
+}
+
+export const NO_STEP_STOP: StepResultStop = { endsTurn: false, stopped: false };
+
+/**
+ * The owner's stop leaves the agent loop's bare abort stub on the step it
+ * caught (a stop with a reason, such as the stall watchdog's, names it, and
+ * the live view does not count that as the owner's). A cell that reports
+ * `status: "aborted"` was cut off, and the turn may still go on after it.
+ */
+export function stepResultStop(message: { content?: unknown; details?: unknown; isError?: boolean }): StepResultStop {
+	const blocks = Array.isArray(message.content) ? (message.content as Array<{ type?: unknown; text?: unknown }>) : [];
+	const ownerStop =
+		message.isError === true &&
+		blocks.some(
+			(block) =>
+				block.type === "text" &&
+				(block.text === TOOL_ABORT_FALLBACK_MESSAGE || block.text === ABORT_TRUNCATION_MARKER),
+		);
+	const details = message.details;
+	const cut =
+		typeof details === "object" && details !== null && (details as { status?: unknown }).status === "aborted";
+	return { endsTurn: ownerStop, stopped: ownerStop || cut };
+}
+
 /** Build conversation components from a message list, matching tool results to their calls. */
 export function buildConversationComponents(
 	messages: readonly AgentMessage[],
@@ -112,11 +143,11 @@ export function buildConversationComponents(
 	// An interjection lands after the step's results came back; a user message
 	// straight after a tool call (an orphaned call) starts a turn.
 	let resultsArrived = false;
-	// A step cut off by an interrupt with nothing after it: the owner stopped the turn there.
-	let resultAborted = false;
+	// How the last step's result says the turn went on (the owner's stop ends it there).
+	let resultStop = NO_STEP_STOP;
 	const closeTurn = (): void => {
 		if (!turnState || lastAssistant?.role !== "assistant") return;
-		turnState.timeline.stopped = lastAssistant.stopReason === "aborted" || resultAborted;
+		turnState.timeline.stopped = lastAssistant.stopReason === "aborted" || resultStop.stopped;
 		turnState.timeline.errorEnded = lastAssistant.stopReason === "error";
 	};
 
@@ -130,7 +161,7 @@ export function buildConversationComponents(
 				lastAssistant?.role === "assistant" &&
 				lastAssistant.stopReason === "toolUse" &&
 				resultsArrived &&
-				!resultAborted
+				!resultStop.endsTurn
 			) {
 				turnState.timeline.addSteer(
 					readUserText(message.content).trim() || "[图片]",
@@ -159,7 +190,7 @@ export function buildConversationComponents(
 			state.noteReplyAt(Number(message.timestamp));
 			lastAssistant = message;
 			resultsArrived = false;
-			resultAborted = false;
+			resultStop = NO_STEP_STOP;
 			if (!turnSummary) {
 				turnSummary = new TurnSummaryComponent(state);
 				turnSummary.setExpanded(expanded);
@@ -241,10 +272,7 @@ export function buildConversationComponents(
 			}
 		} else if (message.role === "toolResult") {
 			resultsArrived = true;
-			resultAborted =
-				typeof message.details === "object" &&
-				message.details !== null &&
-				(message.details as { status?: unknown }).status === "aborted";
+			resultStop = stepResultStop(message);
 			pendingTools.get(message.toolCallId)?.updateResult(message);
 			pendingTools.delete(message.toolCallId);
 			turnState?.setStepStatus(

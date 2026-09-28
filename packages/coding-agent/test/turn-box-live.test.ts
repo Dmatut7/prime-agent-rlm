@@ -360,10 +360,14 @@ const SETTLE_MS = 450;
 
 const harnesses: Harness[] = [];
 
-async function session(options: { retry?: boolean; compaction?: boolean } = {}): Promise<Harness> {
+async function session(
+	options: { retry?: boolean; retryDelayMs?: number; compaction?: boolean } = {},
+): Promise<Harness> {
 	const harness = await createHarness({
 		tools: [bashTool],
-		...(options.retry ? { settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } } : {}),
+		...(options.retry
+			? { settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: options.retryDelayMs ?? 1 } } }
+			: {}),
 		...(options.compaction
 			? {
 					persistSession: true,
@@ -374,6 +378,17 @@ async function session(options: { retry?: boolean; compaction?: boolean } = {}):
 	});
 	harnesses.push(harness);
 	return harness;
+}
+
+/** Resolves when the session emits its next event of `type`. */
+function nextEvent(harness: Harness, type: AgentSessionEvent["type"]): Promise<void> {
+	return new Promise((resolve) => {
+		const off = harness.session.subscribe((event) => {
+			if (event.type !== type) return;
+			off();
+			resolve();
+		});
+	});
 }
 
 async function run(harness: Harness, prompt: string): Promise<void> {
@@ -577,6 +592,191 @@ describe("a quiet turn, live", () => {
 	});
 });
 
+describe("a quiet turn that ends without a run ending it", () => {
+	it("finishes as stopped when the owner cancels a retry while it counts down", async () => {
+		const harness = await session({ retry: true, retryDelayMs: 60_000 });
+		const steps = record(harness);
+		harness.setResponses([
+			bashCall("npm run build"),
+			reply("", { stopReason: "error", errorMessage: "503 upstream overloaded" }),
+			reply("构建好了。"),
+		]);
+		const waiting = nextEvent(harness, "auto_retry_start");
+		const prompt = run(harness, "跑一遍构建");
+		await waiting;
+		steps.push({ kind: "interrupt", at: Date.now() });
+		harness.session.abortRetry();
+		await prompt;
+		expect(harness.eventsOfType("auto_retry_end")).toHaveLength(1);
+
+		const screen = startScreen(steps);
+		feed(screen, steps);
+		vi.advanceTimersByTime(SETTLE_MS);
+		const box = screen.boxes()[0]!;
+		expect(screen.boxes()).toHaveLength(1);
+		expect(box.state.boxLive).toBe(false);
+		expect(screen.screen()).toContain("■ 已停止");
+		const opened = screen.opened(box);
+		expect(opened).toMatch(/↻ .*已停止/);
+		expect(opened).not.toContain("重试没成功");
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("finishes as failed when a retry gives up with no run after it", async () => {
+		const harness = await session({ retry: true });
+		const steps = record(harness);
+		harness.setResponses([
+			bashCall("npm run build"),
+			reply("", { stopReason: "error", errorMessage: "503 upstream overloaded" }),
+			reply("构建好了。"),
+		]);
+		await run(harness, "跑一遍构建");
+
+		const screen = startScreen(steps);
+		const retrying = indexAfter(steps, "auto_retry_start");
+		feed(screen, steps.slice(0, retrying));
+		// The retry never gets a run: it gives up on its own.
+		screen.apply({
+			kind: "event",
+			event: { type: "auto_retry_end", success: false, attempt: 1, finalError: "模型一直不可用" },
+			at: Date.now(),
+			messages: transcriptAt(steps, retrying),
+		});
+		vi.advanceTimersByTime(SETTLE_MS);
+		const box = screen.boxes()[0]!;
+		expect(box.state.boxLive).toBe(false);
+		expect(screen.screen()).toMatch(/▸ ✗ /);
+		expect(screen.opened(box)).toContain("重试没成功：模型一直不可用");
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("drops an attempt the session started over, with its thinking and tokens", async () => {
+		const start = Date.now();
+		const attempt = (at: number, content: AssistantMessage["content"], output: number): AssistantMessage => ({
+			...fauxAssistantMessage("", { timestamp: at }),
+			content,
+			usage: { ...fauxAssistantMessage("").usage, output, totalTokens: output },
+		});
+		const dropped = attempt(start + 1_000, [{ type: "thinking", thinking: "先翻一下昨天的日志。" }], 3_000);
+		const kept = attempt(start + 2_000, [{ type: "text", text: "日志没问题。" }], 20);
+		const events: AgentSessionEvent[] = [
+			{ type: "agent_start" },
+			{ type: "message_start", message: { role: "user", content: "看下日志", timestamp: start } },
+			{ type: "message_start", message: dropped },
+			{
+				type: "message_update",
+				message: dropped,
+				assistantMessageEvent: {
+					type: "thinking_delta",
+					contentIndex: 0,
+					delta: "先翻一下昨天的日志。",
+					partial: dropped,
+				},
+			},
+			// An empty-turn retry: a fresh attempt starts, the dropped one never ends.
+			{ type: "message_start", message: kept },
+			{
+				type: "message_update",
+				message: kept,
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "日志没问题。", partial: kept },
+			},
+			{ type: "message_end", message: kept },
+			{ type: "agent_end", messages: [kept] },
+		];
+		const steps: Recorded[] = events.map((event) => ({ kind: "event", event, at: start, messages: [] }));
+
+		const screen = startScreen(steps);
+		feed(screen, steps);
+		vi.advanceTimersByTime(SETTLE_MS);
+		const box = screen.boxes()[0]!;
+		expect(screen.screen()).toContain("日志没问题。");
+		const opened = screen.opened(box);
+		expect(opened).not.toContain("先翻一下昨天的日志");
+		expect(opened).not.toContain("想了");
+		expect(opened).not.toContain("3.0k");
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("takes back what a lost connection said once the session comes back", async () => {
+		const harness = await session();
+		const steps = record(harness);
+		await recordSimpleTurn(harness, "跑一下测试", "npm test", "测试都过了。");
+
+		const screen = startScreen(steps);
+		feed(screen, steps.slice(0, indexAfter(steps, "tool_execution_start")));
+		screen.flow.connectionLost();
+		const [box] = screen.boxes();
+		expect(box!.state.boxLive).toBe(false);
+		expect(screen.opened(box!)).toContain("和后台的连接断了");
+		// Reconnected: the chat is rebuilt from the session as it is now.
+		vi.setSystemTime(steps.at(-1)!.at);
+		screen.flow.connectionRestored();
+		screen.resync(steps);
+		vi.advanceTimersByTime(SETTLE_MS);
+		const [twin] = screen.boxes();
+		expect(screen.boxes()).toHaveLength(1);
+		expect(twin!.state.boxLive).toBe(false);
+		// Opened above, so it stays open.
+		expect(screen.screen()).toMatch(/▾ ✓ .*跑了 1 条命令/);
+		expect(screen.opened(twin!)).not.toContain("连接断了");
+		expect(vi.getTimerCount()).toBe(0);
+	});
+});
+
+describe("a quiet turn replayed from its transcript", () => {
+	it("shows a turn the owner stopped mid-command the way it looked live", async () => {
+		const harness = await session();
+		const steps = record(harness);
+		const slow = holdCommand("sleep 100");
+		harness.setResponses([bashCall("sleep 100")]);
+		const prompt = run(harness, "慢慢跑");
+		await slow.started;
+		steps.push({ kind: "interrupt", at: Date.now() });
+		await harness.session.abort();
+		await prompt;
+
+		const live = startScreen(steps);
+		feed(live, steps);
+		vi.advanceTimersByTime(SETTLE_MS);
+		// Reopened later: nothing carries over from a live box.
+		const cold = new LiveScreen();
+		cold.rebuild(transcriptAt(steps, steps.length));
+		for (const screen of [live, cold]) {
+			expect(screen.boxes()).toHaveLength(1);
+			expect(screen.screen()).toContain("■ 已停止");
+			const opened = screen.opened(screen.boxes()[0]!);
+			expect(opened).toContain("■ sleep 100 · 你停下了");
+			expect(opened).not.toMatch(/出错|✗/);
+		}
+	});
+
+	it("keeps a message typed during a cut-off step in the same box, as live", async () => {
+		const harness = await session();
+		const steps = record(harness);
+		const e2e = holdCommand("npm run e2e");
+		// The command hit its own time limit and was cut off; the turn goes on.
+		resultDetails.set("npm run e2e", { status: "aborted" });
+		harness.setResponses([bashCall("npm run e2e"), bashCall("npm run e2e -- --bail"), reply("e2e 过了。")]);
+		const prompt = run(harness, "跑一下 e2e");
+		await e2e.started;
+		await harness.session.steer("失败了就只跑出错的那个");
+		e2e.finish();
+		await prompt;
+		await harness.session.waitForIdle();
+
+		const live = startScreen(steps);
+		feed(live, steps);
+		vi.advanceTimersByTime(SETTLE_MS);
+		const cold = new LiveScreen();
+		cold.rebuild(transcriptAt(steps, steps.length));
+		for (const screen of [live, cold]) {
+			expect(screen.boxes()).toHaveLength(1);
+			expect(screen.prompts()).toBe(1);
+			expect(screen.opened(screen.boxes()[0]!)).toContain("› 你插话：失败了就只跑出错的那个");
+		}
+	});
+});
+
 describe("a quiet turn across a chat rebuild", () => {
 	it("carries a box waiting to retry over to its replayed twin, which finishes after the retry", async () => {
 		const harness = await session({ retry: true });
@@ -673,15 +873,14 @@ describe("a quiet turn across a chat rebuild", () => {
 		const harness = await session();
 		const steps = record(harness);
 		const e2e = holdCommand("npm run e2e");
-		// The command hit its own time limit and was cut off; the turn goes on.
-		resultDetails.set("npm run e2e", { status: "aborted" });
 		harness.setResponses([bashCall("npm run e2e"), bashCall("npm run e2e -- --bail"), reply("e2e 过了。")]);
 		const prompt = run(harness, "跑一下 e2e");
 		await e2e.started;
-		await harness.session.steer("失败了就只跑出错的那个");
-		e2e.finish();
+		// The session stops the run itself (no key press): live, the next message
+		// carries the same turn on, while the replay only sees the stop's stub.
+		await harness.session.abort();
 		await prompt;
-		await harness.session.waitForIdle();
+		await run(harness, "失败了就只跑出错的那个");
 
 		const screen = startScreen(steps);
 		feed(screen, steps);
@@ -690,8 +889,8 @@ describe("a quiet turn across a chat rebuild", () => {
 		vi.advanceTimersByTime(100);
 		screen.rebuild(transcriptAt(steps, steps.length));
 		const replayed = screen.boxes();
-		// Fixture integrity: the replay starts a turn at the message after the cut-off
-		// step, so the live box has two replayed twins settling at the same time.
+		// Fixture integrity: the replay starts a turn at the message after the
+		// stopped step, so the live box has two replayed twins settling at the same time.
 		expect(replayed.length).toBeGreaterThanOrEqual(2);
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(replayed.map((box) => box.state.boxLive)).toEqual(replayed.map(() => false));

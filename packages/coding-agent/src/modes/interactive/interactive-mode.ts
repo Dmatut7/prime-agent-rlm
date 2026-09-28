@@ -241,6 +241,8 @@ import {
 	foldEarlierAnswers,
 	isCompactAgentMessageNeighbor,
 	latestThinkingText,
+	NO_STEP_STOP,
+	stepResultStop,
 } from "./components/conversation-components.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
@@ -664,10 +666,72 @@ function turnHasThinking(summary: TurnSummaryComponent): boolean {
 	return state.totalThinkingSegments > 0;
 }
 
-/** A step result the kernel cut off mid-run (an interrupt or the stall watchdog). */
-function isAbortedStepResult(message: { details?: unknown }): boolean {
-	const details = message.details;
-	return typeof details === "object" && details !== null && (details as { status?: unknown }).status === "aborted";
+/** A long turn the reopen window starts inside: its prompt, its real start, and the steps left out. */
+interface WindowCutTurn {
+	prompt?: AgentMessage;
+	startedAt?: number;
+	hiddenSteps: number;
+}
+
+/**
+ * Whether the user message at `index` starts a turn in the replay (one typed
+ * between a step and the model's next reply is an interjection). A message
+ * before it that is itself an interjection leaves the grouping as it was, so
+ * the walk goes past user messages to the reply before them.
+ */
+function startsReplayTurn(messages: readonly AgentMessage[], index: number): boolean {
+	let lastResult: AgentMessage | undefined;
+	for (let cursor = index - 1; cursor >= 0; cursor--) {
+		const message = messages[cursor];
+		if (!message) continue;
+		if (message.role === "toolResult") {
+			lastResult ??= message;
+		} else if (message.role === "assistant") {
+			const results = lastResult?.role === "toolResult" ? lastResult : undefined;
+			return !(message.stopReason === "toolUse" && results && !stepResultStop(results).endsTurn);
+		}
+	}
+	return true;
+}
+
+/** The turn the reopen window cut into, when the window starts inside one. */
+function windowCutTurn(messages: readonly AgentMessage[], shown: readonly AgentMessage[]): WindowCutTurn | undefined {
+	const shownMessages = new Set(shown);
+	const first = messages.findIndex((message) => shownMessages.has(message));
+	if (first <= 0) return undefined;
+	const firstMessage = messages[first];
+	if (firstMessage?.role === "user" && startsReplayTurn(messages, first)) return undefined;
+	const insideTurn =
+		firstMessage?.role === "assistant" || firstMessage?.role === "toolResult" || firstMessage?.role === "user";
+	let start = 0;
+	for (let index = first - 1; index >= 0; index--) {
+		if (messages[index]?.role === "user" && startsReplayTurn(messages, index)) {
+			start = index;
+			break;
+		}
+	}
+	const shownCalls = new Set<string>();
+	for (const message of shown) {
+		if (message.role !== "assistant") continue;
+		for (const content of message.content) if (content.type === "toolCall") shownCalls.add(content.id);
+	}
+	let startedAt: number | undefined;
+	let hiddenSteps = 0;
+	for (let index = start; index < first; index++) {
+		const message = messages[index];
+		if (message?.role !== "assistant") continue;
+		startedAt ??= Number(message.timestamp) || undefined;
+		for (const content of message.content) {
+			if (content.type === "toolCall" && !shownCalls.has(content.id)) hiddenSteps++;
+		}
+	}
+	if (!insideTurn && startedAt === undefined) return undefined;
+	const prompt = messages[start];
+	return {
+		...(prompt?.role === "user" ? { prompt } : {}),
+		...(startedAt !== undefined ? { startedAt } : {}),
+		hiddenSteps,
+	};
 }
 
 function mergeSubagentSnapshot(
@@ -1500,6 +1564,8 @@ export class InteractiveMode {
 	private currentTurnState: TurnActivityState | undefined;
 	private currentTurnSummary: TurnSummaryComponent | undefined;
 	private liveTurnFlowStore: LiveTurnFlow | undefined;
+	/** The connection to the background session closed and has not come back. */
+	private connectionLost = false;
 	/** How live events become the quiet conversation's turn boxes (created on first use). */
 	private get turnFlow(): LiveTurnFlow {
 		this.liveTurnFlowStore ??= new LiveTurnFlow(this.createLiveTurnFlowHost());
@@ -2081,7 +2147,12 @@ export class InteractiveMode {
 
 		await this.rebindCurrentSession();
 
-		await this.renderInitialMessages();
+		// The first replay runs in the event queue: attaching to a running session,
+		// an event that arrives while the replay waits on its requests is handled
+		// after it, against the chat it built, instead of being lost halfway through.
+		const firstRender = this.sessionEventQueue.then(() => this.renderInitialMessages());
+		this.sessionEventQueue = firstRender.catch(() => {});
+		await firstRender;
 
 		onThemeChange(() => {
 			this.ui.invalidate();
@@ -3701,9 +3772,14 @@ export class InteractiveMode {
 		// Replacement events own the session-scoped command catalog. The daemon
 		// sends that event before its command response, but its handler may still
 		// be refreshing commands when the response resolves.
-		await this.sessionEventQueue;
-		this.resetCurrentSessionRenderState();
-		await this.renderInitialMessages();
+		// The replay itself runs in the queue: an event that arrives while it waits
+		// on its requests is handled after it, against the chat it built.
+		const run = Promise.resolve(this.sessionEventQueue).then(async () => {
+			this.resetCurrentSessionRenderState();
+			await this.renderInitialMessages();
+		});
+		this.sessionEventQueue = run.catch(() => {});
+		await run;
 		this.updatePendingMessagesDisplay();
 		this.syncWorkingLoader();
 	}
@@ -6158,6 +6234,8 @@ export class InteractiveMode {
 					const generation = this.sessionEventGeneration;
 					const run = this.sessionEventQueue.then(async () => {
 						if (generation !== this.sessionEventGeneration) return false;
+						this.connectionLost = false;
+						this.liveTurnFlowStore?.connectionRestored();
 						await this.refreshCommandCatalogForCurrentSession?.();
 						if (generation !== this.sessionEventGeneration) return false;
 						await this.renderResyncedSession(event.snapshot);
@@ -6175,6 +6253,7 @@ export class InteractiveMode {
 					await this.handleConnectionExtensionUiRequest(event.request);
 				} else if (event.type === "connection_status") {
 					if (event.status === "connected") {
+						this.connectionLost = false;
 						const banner = formatDaemonReconnectBanner(event.daemonVersion, VERSION);
 						this.showStatus(banner.message, banner.tone);
 					} else if (event.backgroundAttempt !== undefined) {
@@ -6192,13 +6271,36 @@ export class InteractiveMode {
 					await this.refreshHeartbeatCatalog();
 				} else if (event.type === "closed") {
 					if (!this.returnToParentAfterSubagentClosed(event.sessionClosedReason)) {
-						this.showError(event.error ?? "Agent connection closed");
+						this.noteConnectionClosed();
+						this.showError(
+							event.sessionClosedReason
+								? (event.error ?? "Agent connection closed")
+								: `和后台的连接断了${event.error ? `（${event.error}）` : ""}`,
+						);
 					}
 				}
 			} catch (error) {
 				this.showError(error instanceof Error ? error.message : String(error));
 			}
 		});
+	}
+
+	/**
+	 * The session's events stopped for good (the reconnect budget ran out, or the
+	 * session closed): nothing works any more, so the working face goes and the
+	 * live box finishes, saying the connection was lost.
+	 */
+	private noteConnectionClosed(): void {
+		this.connectionLost = true;
+		if (quietConversation(this)) this.turnFlow.connectionLost();
+		this.turnStartedAt = undefined;
+		this.patchConnectionState({ isStreaming: false, isCompacting: false, isBashRunning: false, retryAttempt: 0 });
+		this.retryCountdown?.dispose();
+		this.retryCountdown = undefined;
+		this.retryLoader?.stop();
+		this.retryLoader = undefined;
+		this.syncWorkingLoader();
+		this.ui.requestRender();
 	}
 
 	private async handleConnectionExtensionUiRequest(request: AgentConnectionExtensionUiRequest): Promise<void> {
@@ -7728,12 +7830,15 @@ export class InteractiveMode {
 			this.sessionOutputTokens !== undefined && this.sessionOutputTokens > 0
 				? theme.fg("dim", `本会话 ↓ ${formatBoxTokens(this.sessionOutputTokens)}`)
 				: "";
+		if (this.connectionLost) return withToast([`${theme.fg("error", "✗")} ${theme.fg("muted", "和后台的连接断了")}`]);
 		const last = this.liveTurnFlowStore?.lastFinished;
 		if (last) {
 			const stopped = last.timeline.stopped;
 			const head = stopped
 				? `${theme.fg("dim", "■")} ${theme.fg("muted", "已停止")}`
-				: `${theme.fg("diffAddedText", "✓")} ${theme.fg("muted", "完成")}`;
+				: last.timeline.errorEnded
+					? `${theme.fg("error", "✗")} ${theme.fg("muted", "出错")}`
+					: `${theme.fg("diffAddedText", "✓")} ${theme.fg("muted", "完成")}`;
 			const clock = theme.fg("muted", formatBoxDuration(last.turnDurationMs()));
 			const figure = theme.fg("muted", `↓ ${formatBoxTokens(last.timeline.outputTokens())}`);
 			const variants = [
@@ -8251,7 +8356,14 @@ export class InteractiveMode {
 		this.processBlockOpenOrder = [];
 		this.resetPendingToolState();
 		const transcriptMessages = this.orderMessagesForTranscript(sessionContext.messages);
-		const messagesToRender = options.limitTranscript ? initialRenderMessages(transcriptMessages) : transcriptMessages;
+		const windowed = options.limitTranscript ? initialRenderMessages(transcriptMessages) : transcriptMessages;
+		// A window that starts inside a long turn keeps the turn's prompt, its real
+		// start, and a row saying how many of its steps it left out.
+		let cutTurn =
+			windowed.length < transcriptMessages.length && this.settingsManager.getProcessMode() === "quiet"
+				? windowCutTurn(transcriptMessages, windowed)
+				: undefined;
+		const messagesToRender = cutTurn?.prompt ? [cutTurn.prompt, ...windowed] : windowed;
 		// A failure notice older than the render window was still received by this session.
 		for (const message of transcriptMessages) {
 			if (message.role === "custom") this.noteSubagentFailureSeen(message);
@@ -8321,11 +8433,11 @@ export class InteractiveMode {
 		// An interjection lands after the step's results came back; a user
 		// message straight after a tool call (an orphaned call) starts a turn.
 		let replayResultsArrived = false;
-		// A step cut off by an interrupt with nothing after it: the owner stopped the turn there.
-		let replayResultAborted = false;
+		// How the last step's result says the turn went on (the owner's stop ends it there).
+		let replayResultStop = NO_STEP_STOP;
 		const closeReplayTurn = (): void => {
 			if (!replayQuiet || !replayTurnState || !replayTurnSummary) return;
-			replayTurnState.timeline.stopped = lastReplayAssistant?.stopReason === "aborted" || replayResultAborted;
+			replayTurnState.timeline.stopped = lastReplayAssistant?.stopReason === "aborted" || replayResultStop.stopped;
 			replayTurnState.timeline.errorEnded = lastReplayAssistant?.stopReason === "error";
 			this.turnFlow.attachStrip(replayTurnSummary);
 		};
@@ -8339,7 +8451,7 @@ export class InteractiveMode {
 					replayTurnState &&
 					lastReplayAssistant?.stopReason === "toolUse" &&
 					replayResultsArrived &&
-					!replayResultAborted
+					!replayResultStop.endsTurn
 				) {
 					const text = this.getUserMessageText(message).trim() || "[图片]";
 					replayTurnState.timeline.addSteer(text, Number(message.timestamp) || Date.now());
@@ -8365,6 +8477,17 @@ export class InteractiveMode {
 					// TUI v4: quiet turns carry the one-line footnote at their head.
 					replayTurnSummary.setQuiet(replayQuiet);
 					this.chatContainer.addChild(replayTurnSummary);
+					if (cutTurn) {
+						if (cutTurn.startedAt !== undefined) replayTurnState.startedEarlier(cutTurn.startedAt);
+						if (cutTurn.hiddenSteps > 0) {
+							replayTurnState.timeline.earlierSteps = cutTurn.hiddenSteps;
+							replayTurnState.timeline.addNotice(
+								{ tone: "muted", text: `… 更早的 ${cutTurn.hiddenSteps} 步没列出` },
+								cutTurn.startedAt ?? 0,
+							);
+						}
+						cutTurn = undefined;
+					}
 				}
 				replayTurnState.modelId = message.model || replayTurnState.modelId;
 				replayTurnState.addThinkingSegments(countThinkingSegments(message));
@@ -8373,7 +8496,7 @@ export class InteractiveMode {
 				replayTurnState.noteReplyAt(Number(message.timestamp));
 				lastReplayAssistant = message;
 				replayResultsArrived = false;
-				replayResultAborted = false;
+				replayResultStop = NO_STEP_STOP;
 				this.addMessageToChat(message);
 				// Render tool call components
 				for (const content of message.content) {
@@ -8450,7 +8573,7 @@ export class InteractiveMode {
 				}
 			} else if (message.role === "toolResult") {
 				replayResultsArrived = true;
-				replayResultAborted = isAbortedStepResult(message);
+				replayResultStop = stepResultStop(message);
 				// Match tool results to pending tool components
 				const component = renderedPendingTools.get(message.toolCallId);
 				if (component) {
@@ -8833,6 +8956,8 @@ export class InteractiveMode {
 		// fails the thing it was stopping keeps running on screen, and the primary
 		// abort() reports its own failure to the user.
 		if (this.getRetryAttempt() > 0) {
+			// The owner's cancel: the box ends as stopped, not as failed.
+			if (quietConversation(this)) this.turnFlow.interrupt();
 			void this.agentConnection.abortRetry().catch(() => undefined);
 		}
 		if (this.isAgentCompacting()) {

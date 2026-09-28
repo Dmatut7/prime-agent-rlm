@@ -87,6 +87,10 @@ export class LiveTurnFlow {
 	private runCutMidTask = false;
 	/** The owner interrupted the running turn (Escape): its box ends as stopped. */
 	private userStopped = false;
+	/** The assistant message that started and has not ended yet, in the turn that shows it. */
+	private openMessage: { state: TurnActivityState; message: AssistantMessage } | undefined;
+	/** The box the lost connection finished early: what it said, undone when the session comes back. */
+	private lostBox: { state: TurnActivityState; noticeKey: string; steps: string[] } | undefined;
 	/** A run-starting message (a prompt) arrived since the last agent_start; otherwise the run continues a turn. */
 	private starterSinceRunStart = false;
 	/** A compaction row still waiting for the context size it ended with (the next reply's usage). */
@@ -197,7 +201,9 @@ export class LiveTurnFlow {
 			}
 		}
 		const state = this.ensureCurrent();
+		this.dropOpenMessage(message);
 		state.timeline.noteMessage(message, false);
+		this.openMessage = { state, message };
 		state.setLiveThinkingSegments(countThinkingSegments(message));
 		// The header names the model; until the first token arrives the box says it waits.
 		state.modelId = message.model || state.modelId;
@@ -254,6 +260,7 @@ export class LiveTurnFlow {
 
 	assistantEnd(message: AssistantMessage): void {
 		this.lastStop = message.stopReason;
+		this.openMessage = undefined;
 		const state = this.host.currentState();
 		if (state) {
 			// The landed message's thinking blocks settle into the turn count.
@@ -339,6 +346,7 @@ export class LiveTurnFlow {
 	}
 
 	agentEnd(): void {
+		this.openMessage = undefined;
 		const state = this.host.currentState();
 		// The run is over; a thinking-only turn's clock stops here.
 		state?.markTurnEnded(Date.now());
@@ -350,9 +358,61 @@ export class LiveTurnFlow {
 		if (state?.boxMode) this.scheduleFinish(state);
 	}
 
-	/** Escape while the run works. */
+	/** Escape while the run works or waits to retry. */
 	interrupt(): void {
 		this.userStopped = true;
+	}
+
+	/**
+	 * The connection to the background session is gone: no more events will
+	 * come for the live turn, so its box finishes now and says why. A reconnect
+	 * rebuilds the chat from the session as it is then.
+	 */
+	connectionLost(): void {
+		this.openMessage = undefined;
+		this.userStopped = false;
+		const state = this.host.currentState();
+		if (!state?.boxMode || state.timeline.finishedAt !== undefined) return;
+		const now = Date.now();
+		const timeline = state.timeline;
+		const cut: string[] = [];
+		for (const step of state.steps) {
+			if (step.status === "queued" || step.status === "running") {
+				cut.push(step.toolCallId);
+				timeline.mergeStep(
+					step.toolCallId,
+					step.toolName,
+					step.args,
+					{ content: [{ type: "text", text: "连接断了，没收到结果" }], isError: true },
+					false,
+				);
+				state.setStepStatus(step.toolCallId, "error", now);
+			}
+		}
+		timeline.endRetry("failed", "连接断了");
+		if (timeline.activeCompaction()) timeline.endCompaction(now, { failed: "连接断了" });
+		const noticeKey = timeline.addNotice({ tone: "error", text: "和后台的连接断了，这一轮后面的进展收不到" }, now);
+		this.lostBox = { state, noticeKey, steps: cut };
+		timeline.errorEnded = true;
+		if (!state.isTurnEnded) state.markTurnEnded(now);
+		this.finish(state, { force: true });
+	}
+
+	/**
+	 * The session is back and its chat is about to be rebuilt from what really
+	 * happened: the box the lost connection ended early goes back to waiting for
+	 * that rebuild (its replayed twin carries on, or finishes, from there).
+	 */
+	connectionRestored(): void {
+		const lost = this.lostBox;
+		this.lostBox = undefined;
+		if (!lost) return;
+		const timeline = lost.state.timeline;
+		timeline.dropEntry(lost.noticeKey);
+		for (const toolCallId of lost.steps) timeline.stepData.delete(toolCallId);
+		timeline.errorEnded = false;
+		timeline.finishedAt = undefined;
+		if (this.lastFinishedState === lost.state) this.lastFinishedState = undefined;
 	}
 
 	/** An automatic compaction is a row in the turn it interrupts; true when a box shows it. */
@@ -437,10 +497,20 @@ export class LiveTurnFlow {
 				}
 			}
 		}
+		const ownerStop = !event.success && this.userStopped;
+		if (!event.success) this.userStopped = false;
 		if (!state?.boxMode) return;
-		state.timeline.endRetry(event.success ? "ok" : "failed", event.finalError);
+		const timeline = state.timeline;
+		timeline.endRetry(
+			event.success ? "ok" : ownerStop ? "stopped" : "failed",
+			ownerStop ? undefined : event.finalError,
+		);
 		if (!event.success) {
-			state.timeline.errorEnded = true;
+			// The owner cancelled the wait: a stop, not an error.
+			if (ownerStop) timeline.stopped = true;
+			else timeline.errorEnded = true;
+			// A retry cancelled in its countdown (or one that never started) has no run to end the turn.
+			if (!state.isTurnEnded && !this.host.isStreaming()) state.markTurnEnded(Date.now());
 			if (state.isTurnEnded) this.scheduleFinish(state);
 		}
 	}
@@ -600,6 +670,8 @@ export class LiveTurnFlow {
 		this.lastStop = undefined;
 		this.runCutMidTask = false;
 		this.userStopped = false;
+		this.openMessage = undefined;
+		this.lostBox = undefined;
 		this.starterSinceRunStart = false;
 		this.compactionAwaitingAfter = undefined;
 		this.handleCommands.clear();
@@ -645,6 +717,25 @@ export class LiveTurnFlow {
 		this.attachStrip(summary);
 		this.host.liveChanged();
 		this.host.requestRender();
+	}
+
+	/**
+	 * A new attempt started while the previous one never ended: the session
+	 * dropped it (an empty-turn retry), so its row and never-run steps go.
+	 */
+	private dropOpenMessage(next: AssistantMessage): void {
+		const open = this.openMessage;
+		this.openMessage = undefined;
+		if (!open || open.message.timestamp === next.timestamp) return;
+		const key = `m:${open.message.timestamp}`;
+		const entry = open.state.timeline.entries.find((candidate) => candidate.key === key);
+		const latest = entry?.kind === "message" ? entry.message : open.message;
+		open.state.timeline.dropEntry(key);
+		const calls = new Set<string>();
+		for (const content of latest.content) {
+			if (content.type === "toolCall") calls.add(content.id);
+		}
+		if (calls.size > 0) open.state.dropQueuedSteps(calls);
 	}
 
 	/** A new prompt starts a new turn: the live one finishes now. */

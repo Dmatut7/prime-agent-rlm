@@ -365,6 +365,22 @@ export class TurnActivityState {
 		this.steps.push(step);
 	}
 
+	/** Steps a dropped attempt streamed and never ran. */
+	dropQueuedSteps(toolCallIds: ReadonlySet<string>): void {
+		for (let index = this.steps.length - 1; index >= 0; index--) {
+			const step = this.steps[index];
+			if (step && step.status === "queued" && toolCallIds.has(step.toolCallId)) this.steps.splice(index, 1);
+		}
+	}
+
+	/**
+	 * The turn began before its first message shown here (the reopen window
+	 * left its start out): the clock runs from the real start.
+	 */
+	startedEarlier(startedAt: number): void {
+		if (Number.isFinite(startedAt) && startedAt > 0) this.startedAtMs = Math.min(this.startedAtMs, startedAt);
+	}
+
 	/**
 	 * A turn rebuilt after a compaction summarized its first part away keeps the
 	 * steps, clock and thinking count of the turn it continues (display only).
