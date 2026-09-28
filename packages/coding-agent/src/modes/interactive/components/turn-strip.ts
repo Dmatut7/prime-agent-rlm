@@ -2,7 +2,7 @@ import { type ClickRegion, type Component, truncateToWidth, visibleWidth } from 
 import { type ThemeColor, theme } from "../theme/theme.js";
 import { cleanMemoryTitle } from "./feed-data.js";
 import { slideCount } from "./motion.js";
-import { changeDetail, memoryDetail, type TimelineFacts } from "./timeline-rows.js";
+import { changeDetail, changeTotals, memoryDetail, omittedDiffText, type TimelineFacts } from "./timeline-rows.js";
 import { BOX_FOCUS_MARKER, BOX_MAX_WIDTH } from "./turn-box.js";
 import type { TurnTimeline } from "./turn-timeline.js";
 
@@ -56,6 +56,15 @@ export class TurnStripComponent implements Component {
 		return this.order;
 	}
 
+	/** What Enter does on a focused strip target (`展开`, `收起`). */
+	enterLabel(key: string): string | undefined {
+		const ui = this.source.timeline.ui;
+		if (key === STRIP_EDITS) return ui.stripOpen === "edits" ? "收起" : "展开";
+		if (key === STRIP_MEMORIES) return ui.stripOpen === "memories" ? "收起" : "展开";
+		if (key.startsWith("strip:item:")) return ui.stripExpanded.has(key.slice("strip:item:".length)) ? "收起" : "展开";
+		return undefined;
+	}
+
 	/** Enter on a focused strip target. Returns false when the key is not one of this strip's. */
 	activate(key: string): boolean {
 		const ui = this.source.timeline.ui;
@@ -90,11 +99,11 @@ export class TurnStripComponent implements Component {
 		const lines: string[] = [];
 		const segments: Array<{ key: string; text: string }> = [];
 		if (facts.projectChanges.length > 0) {
-			const added = facts.projectChanges.reduce((sum, change) => sum + change.added, 0);
-			const removed = facts.projectChanges.reduce((sum, change) => sum + change.removed, 0);
+			const totals = changeTotals(facts.projectChanges);
+			const figures = totals ? ` ${counts(totals.added, totals.removed)}` : "";
 			segments.push({
 				key: STRIP_EDITS,
-				text: `${theme.fg("runCardWarn", "✎")} ${theme.fg("muted", `改了 ${facts.projectChanges.length} 个文件`)} ${counts(added, removed)} ${theme.fg("dim", ui.stripOpen === "edits" ? "▾" : "▸")}`,
+				text: `${theme.fg("runCardWarn", "✎")} ${theme.fg("muted", `改了 ${facts.projectChanges.length} 个文件`)}${figures} ${theme.fg("dim", ui.stripOpen === "edits" ? "▾" : "▸")}`,
 			});
 		}
 		if (facts.memories.length > 0) {
@@ -126,6 +135,7 @@ export class TurnStripComponent implements Component {
 			});
 		});
 		if (facts.commitId) line += theme.fg("dim", `  ·  已提交 ${facts.commitId}`);
+		if (facts.trackingIncomplete) line += theme.fg("dim", "  （有些改动没记全）");
 		lines.push(`${focusLine ? BOX_FOCUS_MARKER : ""}${truncateToWidth(line, width, "…")}`);
 
 		if (!ui.stripOpen) return lines;
@@ -190,11 +200,16 @@ export class TurnStripComponent implements Component {
 			};
 			const color: ThemeColor = change.kind === "deleted" ? "diffRemovedText" : "runCardWarn";
 			const path = change.kind === "renamed" && change.oldPath ? `${change.oldPath} → ${change.path}` : change.path;
-			const agent = change.agent ? `${theme.fg("chipText", change.agent)} ` : "";
+			const omitted = omittedDiffText(change.omitted);
+			// Counts the kernel could not know read as the reason, never as `+0 −0`.
+			const figures =
+				omitted && change.added === 0 && change.removed === 0
+					? theme.fg("dim", omitted)
+					: counts(change.added, change.removed);
 			return {
 				key: `file:${change.key}`,
 				head: `${theme.fg(color, change.kind === "deleted" ? "✗" : "✎")} ${theme.fg("dim", verb[change.kind])}${theme.fg("activityText", path)}`,
-				right: `${agent}${counts(change.added, change.removed)}`,
+				right: figures,
 				detail: changeDetail(change),
 			};
 		});

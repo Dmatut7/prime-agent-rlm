@@ -312,6 +312,8 @@ export interface KernelActivity {
 	detail?: string;
 	startedAt: number;
 	endedAt?: number;
+	/** The step went on running after its cell ended (a background `bash()` handle). */
+	background?: true;
 }
 
 /**

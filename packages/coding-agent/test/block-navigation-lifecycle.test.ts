@@ -378,14 +378,14 @@ describe("Enter on a focused block", () => {
 		const answer = assistant("结论", {}, "先想一想");
 		const h = await createHarness([new UserMessageComponent("查"), summary, answer]);
 		await h.start();
-		expect(h.focusedText()).toContain("T 展开 Thinking");
+		expect(h.focusedText()).toContain("T 展开思考");
 		await h.press(ENTER);
 		expect(summary.state.thinkingExpanded).toBe(false);
 		expect(h.navigating()).toBe(false);
 		await h.start();
 		await h.press("t");
 		expect(summary.state.thinkingExpanded).toBe(true);
-		expect(h.focusedText()).toContain("T 收起 Thinking");
+		expect(h.focusedText()).toContain("T 收起思考");
 	});
 });
 

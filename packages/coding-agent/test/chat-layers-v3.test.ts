@@ -413,7 +413,7 @@ describe("system notices", () => {
 		} as never);
 		const lines = plain(notice.render(60)).filter((line) => line.trim());
 		expect(lines).toHaveLength(1);
-		expect(lines[0]?.trim()).toBe("·  ◆ python kernel restored  ·");
+		expect(lines[0]?.trim()).toBe("·  ◆ Python 环境已恢复  ·");
 	});
 });
 

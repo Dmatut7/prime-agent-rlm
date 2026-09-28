@@ -1,0 +1,730 @@
+import type { AssistantMessage, AssistantMessageEvent } from "@earendil-works/pi-ai";
+import type { Container } from "@earendil-works/pi-tui";
+import { startsAgentRun } from "../../core/agent-messages.js";
+import type { CustomMessage } from "../../core/messages.js";
+import type { AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
+import { countThinkingSegments, latestThinkingText } from "./components/conversation-components.js";
+import { formatFileChangePath, getToolFileChanges } from "./components/edit-summary.js";
+import { collectBashHandleCommands } from "./components/step-label.js";
+import { TurnActivityState, TurnSummaryComponent } from "./components/turn-activity.js";
+import { TurnStripComponent } from "./components/turn-strip.js";
+import {
+	boxRecordFromMessage,
+	compactionMissText,
+	describeRetryReason,
+	isBoxNoticeMessage,
+} from "./components/turn-timeline.js";
+import { UserMessageComponent } from "./components/user-message.js";
+
+/**
+ * How live session events become the quiet conversation's turn boxes: one box
+ * per prompt, a message typed between steps as a row in it, a retry or a
+ * compaction continuing the same box, the settle before the finished face, and
+ * the change strip under the answer. Display only: nothing here reaches the model.
+ *
+ * The interactive mode owns the chat and the live turn slot; the flow reads and
+ * replaces them through its host.
+ */
+export interface LiveTurnFlowHost {
+	/** The chat the boxes live in. */
+	chat(): Container;
+	/** The quiet conversation (boxes) is on. */
+	quiet(): boolean;
+	isStreaming(): boolean;
+	/** The session still waits to retry (its retry counter is up). */
+	retryPending(): boolean;
+	/** The session is compacting right now. */
+	compacting(): boolean;
+	/** Context tokens right now, when known. */
+	contextTokens(): number | undefined;
+	cwd(): string;
+	/** The session's own node id: its direct children get subagent rows. */
+	rlmNodeId(): string | undefined;
+	/** A new turn head, wired for clicks and the settings. */
+	createSummary(state: TurnActivityState): TurnSummaryComponent;
+	/** When the live run's clock started, when known. */
+	runStartedAt(): number | undefined;
+	/** A new live turn starts with its process lane open (the legacy global Ctrl+O). */
+	startExpanded(): boolean;
+	currentState(): TurnActivityState | undefined;
+	currentSummary(): TurnSummaryComponent | undefined;
+	setCurrent(summary: TurnSummaryComponent | undefined): void;
+	/** Earlier answers of the turn fold into its box once a later reply starts. */
+	foldEarlierAnswers(summary: TurnSummaryComponent): void;
+	requestRender(): void;
+	/** Whether a live box exists changed (spinners and clocks need the pulse). */
+	liveChanged(): void;
+}
+
+/** Files a settled step changed land on its turn, so the collapsed process line can list them. */
+export function recordStepFileChanges(
+	state: TurnActivityState | undefined,
+	toolCallId: string,
+	result: { details?: unknown; isError: boolean },
+	cwd: string,
+): void {
+	const step = state?.steps.find((candidate) => candidate.toolCallId === toolCallId);
+	if (!state || !step) return;
+	state.addFileChanges(
+		getToolFileChanges(step.toolName, step.args, result, cwd).map((change) => ({
+			...change,
+			path: formatFileChangePath(change.path, cwd),
+		})),
+	);
+}
+
+const FINISH_SETTLE_MS = 400;
+
+export class LiveTurnFlow {
+	/** Each settling box has its own finish timer: a rebuild can settle several at once. */
+	private readonly finishTimers = new Map<TurnActivityState, ReturnType<typeof setTimeout>>();
+	/** How the live run's latest assistant message ended: a user message after a tool call is an interjection. */
+	private lastStop: AssistantMessage["stopReason"] | undefined;
+	/**
+	 * The previous run stopped right after a step to take a message typed meanwhile
+	 * (the queue's 做完手上这一步就看): that message is an interjection in the same box.
+	 */
+	private runCutMidTask = false;
+	/** The owner interrupted the running turn (Escape): its box ends as stopped. */
+	private userStopped = false;
+	/** A run-starting message (a prompt) arrived since the last agent_start; otherwise the run continues a turn. */
+	private starterSinceRunStart = false;
+	/** A compaction row still waiting for the context size it ended with (the next reply's usage). */
+	private compactionAwaitingAfter: string | undefined;
+	private lastFinishedState: TurnActivityState | undefined;
+	private readonly strips = new WeakMap<TurnSummaryComponent, TurnStripComponent>();
+	/** Handle variable → the command its `bash()` call started, across the session's cells. */
+	private readonly handleCommands = new Map<string, string>();
+
+	constructor(private readonly host: LiveTurnFlowHost) {}
+
+	/** The newest turn that finished in this view (the status bar's done/stopped face). */
+	get lastFinished(): TurnActivityState | undefined {
+		return this.lastFinishedState;
+	}
+
+	/** Whether a turn box is live right now (its spinners and clocks need frames). */
+	hasLiveBox(): boolean {
+		const state = this.host.currentState();
+		return state !== undefined && state.boxMode && state.boxLive;
+	}
+
+	/** The run's turn head, created once before its first block. */
+	ensureCurrent(): TurnActivityState {
+		const existing = this.host.currentSummary();
+		if (existing) return existing.state;
+		const state = new TurnActivityState(this.host.runStartedAt() ?? Date.now());
+		state.live = true;
+		const summary = this.host.createSummary(state);
+		summary.setExpanded(this.host.startExpanded());
+		summary.setQuiet(this.host.quiet());
+		this.host.setCurrent(summary);
+		this.host.chat().addChild(summary);
+		return state;
+	}
+
+	agentStart(): void {
+		// The quiet conversation groups by prompt: a run without a prompt of its
+		// own (a retry, a compaction's continuation) goes on in the same box,
+		// exactly as a replay of the transcript groups it.
+		this.starterSinceRunStart = false;
+		const state = this.host.currentState();
+		this.runCutMidTask =
+			this.host.quiet() && this.lastStop === "toolUse" && state?.boxMode === true && !state.timeline.stopped;
+		this.lastStop = undefined;
+		this.userStopped = false;
+		if (!this.host.quiet()) this.host.setCurrent(undefined);
+	}
+
+	/**
+	 * A custom message arrived. A run-starting one outside a tool loop (a
+	 * heartbeat, an agent message while idle) starts a new box; a notice the box
+	 * shows as a row goes there. True when the box took the message.
+	 */
+	customMessage(message: CustomMessage): boolean {
+		if (!this.host.quiet()) return false;
+		if (startsAgentRun(message) && this.lastStop !== "toolUse") {
+			this.starterSinceRunStart = true;
+			this.endLiveTurnForNewRun();
+			return false;
+		}
+		if (!isBoxNoticeMessage(message)) return false;
+		const turn = this.continuableTurn();
+		if (!turn?.state.boxMode) return false;
+		const record = boxRecordFromMessage(message);
+		if (!record) return false;
+		const timeline = turn.state.timeline;
+		const at = Number(message.timestamp) || Date.now();
+		if (record.kind === "notice") {
+			timeline.addNotice(record.notice, at);
+		} else if (timeline.latestCompaction()?.endedAt === undefined) {
+			// A skipped or failed compaction the live row has not settled yet.
+			timeline.addReplayCompaction(at, record.facts);
+		}
+		this.host.requestRender();
+		return true;
+	}
+
+	/** A user message arrived: an interjection in the running turn's box, or a new prompt. */
+	userMessage(text: string, timestamp: number): "interjection" | "prompt" {
+		const quiet = this.host.quiet();
+		const state = this.host.currentState();
+		const summary = this.host.currentSummary();
+		const steered = this.lastStop === "toolUse" || this.runCutMidTask;
+		if (quiet && steered && state?.boxMode) {
+			// A run that stopped to take this message goes on in the same box.
+			if (state.isTurnEnded && summary) this.resumeTurn(summary);
+			state.timeline.addSteer(text.trim() || "[图片]", timestamp || Date.now());
+			this.host.requestRender();
+			return "interjection";
+		}
+		this.starterSinceRunStart = true;
+		if (quiet) this.endLiveTurnForNewRun();
+		return "prompt";
+	}
+
+	assistantStart(message: AssistantMessage): void {
+		this.runCutMidTask = false;
+		if (this.host.quiet()) {
+			// No prompt since the run started: this run continues a turn that
+			// already ended (a retry, the work after a compaction).
+			const current = this.host.currentSummary();
+			if (current?.state.isTurnEnded) {
+				this.resumeTurn(current);
+			} else if (!current && !this.starterSinceRunStart) {
+				const turn = this.continuableTurn();
+				if (turn) this.resumeTurn(turn);
+			}
+		}
+		const state = this.ensureCurrent();
+		state.timeline.noteMessage(message, false);
+		state.setLiveThinkingSegments(countThinkingSegments(message));
+		// The header names the model; until the first token arrives the box says it waits.
+		state.modelId = message.model || state.modelId;
+		state.notePhase("waiting");
+	}
+
+	assistantUpdate(message: AssistantMessage, event: AssistantMessageEvent): void {
+		const state = this.host.currentState();
+		if (!state) return;
+		state.setLiveThinkingSegments(countThinkingSegments(message));
+		const kind = event.type;
+		if (kind === "thinking_start" || kind === "thinking_delta") {
+			state.noteThinking(true);
+			state.notePhase("thinking");
+		} else if (kind === "text_start" || kind === "text_delta") {
+			if (kind === "text_start") state.noteThinking(false);
+			state.notePhase("writing");
+		} else if (kind === "toolcall_start" || kind === "toolcall_delta") {
+			if (kind === "toolcall_start") state.noteThinking(false);
+			state.notePhase("waiting");
+		} else {
+			if (kind === "thinking_end") state.noteThinking(false);
+			state.noteActivity();
+		}
+		const thinking = latestThinkingText(message);
+		state.latestThinking = thinking || state.latestThinking;
+		state.currentThinking = thinking;
+		state.timeline.noteMessage(message, false);
+		state.timeline.noteStreamEvent(message, event);
+		for (const content of message.content) {
+			if (content.type === "toolCall") this.noteToolCall(content, false);
+		}
+		// A later reply of the same turn moves the earlier answer into the box.
+		if (kind === "text_start" || kind === "toolcall_start") {
+			const summary = this.host.currentSummary();
+			if (summary?.state.boxMode) this.host.foldEarlierAnswers(summary);
+		}
+	}
+
+	/** One tool call of the live message: a step of its turn (added once, its arguments kept current). */
+	noteToolCall(call: { id: string; name: string; arguments: unknown }, started: boolean): void {
+		const state = this.ensureCurrent();
+		if (state.steps.some((step) => step.toolCallId === call.id)) {
+			state.updateStepArgs(call.id, call.arguments);
+			return;
+		}
+		state.addStep({
+			toolCallId: call.id,
+			toolName: call.name,
+			args: call.arguments,
+			status: started ? "running" : "queued",
+		});
+	}
+
+	assistantEnd(message: AssistantMessage): void {
+		this.lastStop = message.stopReason;
+		const state = this.host.currentState();
+		if (state) {
+			// The landed message's thinking blocks settle into the turn count.
+			state.addThinkingSegments(countThinkingSegments(message));
+			state.setLiveThinkingSegments(0);
+			state.noteThinking(false);
+			state.notePhase("waiting");
+			const timeline = state.timeline;
+			timeline.noteMessage(message, true);
+			// The box says how the run ended: stopped by the owner, or on an error
+			// no retry recovers (a retry reopens the turn and clears this).
+			if (message.stopReason === "aborted") timeline.stopped = true;
+			if (message.stopReason === "error") timeline.errorEnded = true;
+			if (message.stopReason === "aborted" || message.stopReason === "error") {
+				// A message that dies mid-turn leaves its steps running forever; settle
+				// them as the replay does, and stamp the turn's clock.
+				const endedAt = Number(message.timestamp) || Date.now();
+				for (const step of state.steps) {
+					if (step.status === "queued" || step.status === "running") {
+						state.setStepStatus(step.toolCallId, "error", endedAt);
+					}
+				}
+				state.markTurnEnded(endedAt);
+			}
+		}
+		// The first reply after a compaction measures the context it left.
+		const awaiting = this.compactionAwaitingAfter;
+		const usage = message.usage;
+		const contextTokens = usage ? usage.input + usage.cacheRead + usage.cacheWrite + usage.output : 0;
+		if (awaiting && contextTokens > 0) {
+			this.compactionAwaitingAfter = undefined;
+			this.setCompactionAfter(awaiting, contextTokens);
+		}
+	}
+
+	toolStart(toolCallId: string, toolName: string, args: unknown): void {
+		// The start event carries the complete arguments; streaming may have left partial ones.
+		this.noteToolCall({ id: toolCallId, name: toolName, arguments: args }, true);
+		const state = this.host.currentState();
+		state?.updateStepArgs(toolCallId, args);
+		state?.markRunning(toolCallId);
+		if (this.host.quiet()) this.noteStepHandles(state, toolCallId, args);
+	}
+
+	/** Partial results carry the steps, files and memories so far: the box shows them as they happen. */
+	toolUpdate(
+		toolCallId: string,
+		toolName: string,
+		args: unknown,
+		partialResult: { details?: unknown; content?: unknown },
+		owner?: TurnActivityState,
+	): void {
+		this.host.currentState()?.noteActivity();
+		(owner ?? this.stepOwner(toolCallId))?.timeline.mergeStep(
+			toolCallId,
+			toolName,
+			args,
+			{ ...partialResult, isError: false },
+			true,
+		);
+	}
+
+	/** A step settled, in the turn that shows it (a step replayed from history belongs to its own turn). */
+	toolEnd(
+		toolCallId: string,
+		toolName: string,
+		result: { details?: unknown; content?: unknown },
+		isError: boolean,
+		owner?: TurnActivityState,
+	): void {
+		const state = owner ?? this.stepOwner(toolCallId);
+		if (!state) return;
+		state.timeline.mergeStep(
+			toolCallId,
+			toolName,
+			state.steps.find((step) => step.toolCallId === toolCallId)?.args,
+			{ ...result, isError },
+			false,
+		);
+		if (!state.steps.some((step) => step.toolCallId === toolCallId)) return;
+		state.setStepStatus(toolCallId, isError ? "error" : "done");
+		recordStepFileChanges(state, toolCallId, { details: result.details, isError }, this.host.cwd());
+	}
+
+	agentEnd(): void {
+		const state = this.host.currentState();
+		// The run is over; a thinking-only turn's clock stops here.
+		state?.markTurnEnded(Date.now());
+		// Interrupted by the owner mid-step: the box says it stopped.
+		if (this.userStopped && state?.boxMode) state.timeline.stopped = true;
+		this.userStopped = false;
+		// The box shows its finished face after a short settle: a retry or a
+		// compaction's continuation may still carry the same turn on.
+		if (state?.boxMode) this.scheduleFinish(state);
+	}
+
+	/** Escape while the run works. */
+	interrupt(): void {
+		this.userStopped = true;
+	}
+
+	/** An automatic compaction is a row in the turn it interrupts; true when a box shows it. */
+	compactionStart(reason: string): boolean {
+		if (!this.host.quiet() || reason === "manual") return false;
+		const turn = this.continuableTurn();
+		const tokens = this.host.contextTokens();
+		turn?.state.timeline.startCompaction(Date.now(), typeof tokens === "number" ? tokens : undefined);
+		return turn !== undefined;
+	}
+
+	/** Settle the compaction row a compaction_end belongs to; returns its key for the after-figure. */
+	compactionEnd(event: {
+		reason: string;
+		result?: { tokensBefore: number };
+		aborted: boolean;
+		errorMessage?: string;
+		errorSeverity?: "warning" | "error";
+	}): string | undefined {
+		if (!this.host.quiet() || event.reason === "manual") return undefined;
+		const children = this.host.chat().children;
+		for (let index = children.length - 1; index >= 0; index--) {
+			const child = children[index];
+			if (!(child instanceof TurnSummaryComponent)) continue;
+			const timeline = child.state.timeline;
+			const active = timeline.activeCompaction();
+			if (!active) continue;
+			const skipped = !event.aborted && !event.result && event.errorSeverity === "warning";
+			const failed = event.aborted ? "已取消" : event.result ? undefined : compactionMissText(event);
+			timeline.endCompaction(Date.now(), {
+				...(event.result ? { before: event.result.tokensBefore } : {}),
+				...(failed ? { failed } : {}),
+				...(skipped ? { skipped: true } : {}),
+			});
+			const state = child.state;
+			if (state.isTurnEnded && state.timeline.finishedAt === undefined) this.scheduleFinish(state);
+			this.host.requestRender();
+			return `compact:${active.startedAt}`;
+		}
+		return undefined;
+	}
+
+	/** After a compaction's rebuild, its row gets the context size it ended with (now, or from the next reply). */
+	compactionRebuilt(key: string | undefined): void {
+		if (!key) return;
+		const tokens = this.host.contextTokens();
+		if (typeof tokens === "number" && this.setCompactionAfter(key, tokens)) return;
+		this.compactionAwaitingAfter = key;
+	}
+
+	/** A retry carries the same turn on: its box reopens with a countdown row. True when a box shows it. */
+	retryStart(event: {
+		delayMs: number;
+		attempt: number;
+		errorMessage: string;
+		reason?: "usage" | "unavailable" | "backup";
+		backupModel?: string;
+	}): boolean {
+		if (!this.host.quiet()) return false;
+		const turn = this.continuableTurn();
+		if (!turn) return false;
+		const state = this.resumeTurn(turn);
+		state.timeline.startRetry({
+			startedAt: Date.now(),
+			delayMs: event.delayMs,
+			attempt: event.attempt,
+			reason: describeRetryReason(event),
+		});
+		return true;
+	}
+
+	retryEnd(event: { success: boolean; finalError?: string }): void {
+		// The live turn, else the box whose retry row still waits (a rebuild replaced the live one).
+		let state = this.host.currentState();
+		if (!state?.timeline.activeRetry()) {
+			const children = this.host.chat().children;
+			for (let index = children.length - 1; index >= 0; index--) {
+				const child = children[index];
+				if (child instanceof TurnSummaryComponent && child.state.timeline.activeRetry()) {
+					state = child.state;
+					break;
+				}
+			}
+		}
+		if (!state?.boxMode) return;
+		state.timeline.endRetry(event.success ? "ok" : "failed", event.finalError);
+		if (!event.success) {
+			state.timeline.errorEnded = true;
+			if (state.isTurnEnded) this.scheduleFinish(state);
+		}
+	}
+
+	/**
+	 * A direct child's snapshot becomes a row in the turn that started it: the
+	 * live turn for a child first seen now, else whichever turn already has it.
+	 */
+	subagentUpdate(child: AgentConnectionRlmChildAgentSnapshot): void {
+		if (!this.host.quiet() || child.parentId !== this.host.rlmNodeId() || child.status === "cancelled") return;
+		let timeline: TurnActivityState["timeline"] | undefined;
+		for (const component of this.host.chat().children) {
+			if (component instanceof TurnSummaryComponent && component.state.timeline.hasSubagent(child.id)) {
+				timeline = component.state.timeline;
+			}
+		}
+		const live = this.host.currentState();
+		if (!timeline && live?.boxMode && live.boxLive && (child.status === "running" || child.status === "queued")) {
+			timeline = live.timeline;
+		}
+		if (!timeline) return;
+		const firstLine = (text: string | undefined) =>
+			text
+				?.split("\n")
+				.map((line) => line.trim())
+				.find((line) => line.length > 0);
+		const running = child.status === "running" || child.status === "queued";
+		const activity = child.activity;
+		const line =
+			activity?.kind === "executing"
+				? activity.toolName
+					? `在执行 ${activity.toolName}`
+					: "在执行"
+				: activity?.kind === "writing"
+					? "在写回答"
+					: activity?.kind === "waiting"
+						? "在等模型"
+						: activity?.kind === "stalled"
+							? "没有动静"
+							: (firstLine(child.recap) ?? "刚派出去…");
+		timeline.upsertSubagent({
+			childId: child.id,
+			name: child.sessionName ?? child.label,
+			status: running ? "running" : child.status === "error" ? "failed" : "done",
+			line,
+			...(child.status === "error"
+				? { result: firstLine(child.error) ?? "出错" }
+				: firstLine(child.answerPreview)
+					? { result: firstLine(child.answerPreview) }
+					: {}),
+			...(child.answerPreview || child.recap ? { report: child.answerPreview ?? child.recap } : {}),
+		});
+		this.host.requestRender();
+	}
+
+	/** Remember the commands a step starts under a handle, and resolve the ones it waits on. */
+	noteStepHandles(state: TurnActivityState | undefined, toolCallId: string, args: unknown): void {
+		const code =
+			typeof (args as { code?: unknown } | undefined)?.code === "string" ? (args as { code: string }).code : "";
+		if (!code) return;
+		if (state) {
+			const referenced = new Map<string, string>();
+			for (const match of code.matchAll(
+				/\bawait\s+([A-Za-z_][A-Za-z0-9_]*)|\b([A-Za-z_][A-Za-z0-9_]*)\.(?:poll|tail|output)\(/g,
+			)) {
+				const name = match[1] ?? match[2];
+				const command = name ? this.handleCommands.get(name) : undefined;
+				if (name && command) referenced.set(name, command);
+			}
+			if (referenced.size > 0) state.timeline.stepHandleContext.set(toolCallId, referenced);
+		}
+		for (const [name, command] of collectBashHandleCommands(code)) this.handleCommands.set(name, command);
+	}
+
+	/** A replay starts over: the handles are re-learned from its cells. */
+	forgetHandles(): void {
+		this.handleCommands.clear();
+	}
+
+	/** The change strip of a turn, when it has one. */
+	stripFor(summary: TurnSummaryComponent): TurnStripComponent | undefined {
+		return this.strips.get(summary);
+	}
+
+	/** The strip goes at the chat's end, which is where the finished turn's answer is. */
+	attachStrip(summary: TurnSummaryComponent): void {
+		let strip = this.strips.get(summary);
+		if (!strip) {
+			const state = summary.state;
+			strip = new TurnStripComponent({
+				timeline: state.timeline,
+				facts: () => (state.boxLive ? undefined : state.boxView().facts),
+				requestRender: () => this.host.requestRender(),
+			});
+			this.strips.set(summary, strip);
+		}
+		const chat = this.host.chat();
+		chat.removeChild(strip);
+		chat.addChild(strip);
+	}
+
+	/** Every quiet turn's box in the chat, keyed by each of its messages, to carry over a rebuild. */
+	captureBoxes(): Map<string, TurnSummaryComponent> {
+		const boxes = new Map<string, TurnSummaryComponent>();
+		for (const child of this.host.chat().children) {
+			if (!(child instanceof TurnSummaryComponent)) continue;
+			for (const entry of child.state.timeline.entries) {
+				if (entry.kind === "message" && !boxes.has(entry.key)) boxes.set(entry.key, child);
+			}
+		}
+		return boxes;
+	}
+
+	/**
+	 * Carry each box's live-only facts and open rows over to its replayed twin
+	 * (the box that replays any of its messages). `keepHistory` (a rebuild after
+	 * a compaction) keeps the part the compaction summarized away.
+	 */
+	carryOver(boxes: Map<string, TurnSummaryComponent>, options: { keepHistory?: boolean } = {}): void {
+		if (boxes.size === 0) return;
+		const keepHistory = options.keepHistory === true;
+		for (const child of this.host.chat().children) {
+			if (!(child instanceof TurnSummaryComponent)) continue;
+			const carried = child.state.timeline.entries
+				.map((entry) => (entry.kind === "message" ? boxes.get(entry.key) : undefined))
+				.find((box) => box !== undefined);
+			if (!carried || carried === child) continue;
+			this.cancelFinish(carried.state);
+			carried.state.timeline.transferTo(child.state.timeline, { keepHistory });
+			if (keepHistory) child.state.adoptHistory(carried.state);
+			// A box that was still settling when the chat was rebuilt finishes here
+			// (the one a run still streams into waits for that run's end).
+			const timeline = child.state.timeline;
+			if (timeline.observedLive && timeline.finishedAt === undefined) this.scheduleFinish(child.state);
+		}
+	}
+
+	/**
+	 * The run ended: after a short settle (a retry or a compaction can still
+	 * continue the same turn) the box shows its finished face and the change
+	 * strip lands under the answer.
+	 */
+	scheduleFinish(state: TurnActivityState, delayMs = FINISH_SETTLE_MS): void {
+		this.cancelFinish(state);
+		const timer = setTimeout(() => {
+			this.finishTimers.delete(state);
+			this.finish(state);
+		}, delayMs);
+		timer.unref?.();
+		this.finishTimers.set(state, timer);
+	}
+
+	/** A new session: every box of the previous chat is gone. */
+	reset(): void {
+		this.dispose();
+		this.lastFinishedState = undefined;
+		this.lastStop = undefined;
+		this.runCutMidTask = false;
+		this.userStopped = false;
+		this.starterSinceRunStart = false;
+		this.compactionAwaitingAfter = undefined;
+		this.handleCommands.clear();
+	}
+
+	/** Teardown: no finish timer may fire into a stopped screen. */
+	dispose(): void {
+		for (const timer of this.finishTimers.values()) clearTimeout(timer);
+		this.finishTimers.clear();
+	}
+
+	private cancelFinish(state: TurnActivityState): void {
+		const timer = this.finishTimers.get(state);
+		if (timer) clearTimeout(timer);
+		this.finishTimers.delete(state);
+	}
+
+	private finish(state: TurnActivityState, options: { force?: boolean } = {}): void {
+		this.cancelFinish(state);
+		if (!state.boxMode || state.timeline.finishedAt !== undefined) return;
+		// A box a rebuild replaced (or the chat trimmed away) is gone: nothing to finish.
+		const summary = this.summaryForState(state);
+		if (!summary) return;
+		if (!options.force) {
+			// Reopened by a continuation: its own agent_end schedules the finish again.
+			if (!state.isTurnEnded) return;
+			const timeline = state.timeline;
+			// A retry or a compaction whose end this view missed (a rebuild, a reconnect) is over.
+			if (timeline.activeRetry() && !this.host.retryPending() && !this.host.isStreaming()) {
+				timeline.endRetry(timeline.errorEnded ? "failed" : "ok");
+			}
+			if (timeline.activeCompaction() && !this.host.compacting()) timeline.endCompaction(Date.now(), {});
+			const continuing = this.host.isStreaming() && this.host.currentState() === state;
+			if (continuing || timeline.activeRetry() || timeline.activeCompaction()) {
+				// A continuation is starting, a retry waits or a compaction runs: look again later.
+				this.scheduleFinish(state);
+				return;
+			}
+		}
+		if (!state.isTurnEnded) state.markTurnEnded(Date.now());
+		state.finishBox();
+		this.lastFinishedState = state;
+		this.attachStrip(summary);
+		this.host.liveChanged();
+		this.host.requestRender();
+	}
+
+	/** A new prompt starts a new turn: the live one finishes now. */
+	private endLiveTurnForNewRun(): void {
+		const state = this.host.currentState();
+		if (state?.boxMode) this.finish(state, { force: true });
+		// A box a rebuild left settling (it lost its place as the live turn) finishes too.
+		for (const child of this.host.chat().children) {
+			if (!(child instanceof TurnSummaryComponent)) continue;
+			const timeline = child.state.timeline;
+			if (child.state.boxMode && timeline.observedLive && timeline.finishedAt === undefined) {
+				this.finish(child.state, { force: true });
+			}
+		}
+		this.host.setCurrent(undefined);
+	}
+
+	/** Make `summary` the live turn again (a continuation after it ended). */
+	private resumeTurn(summary: TurnSummaryComponent): TurnActivityState {
+		const state = summary.state;
+		this.cancelFinish(state);
+		if (state.isTurnEnded) state.reopen();
+		state.live = true;
+		const strip = this.strips.get(summary);
+		if (strip) this.host.chat().removeChild(strip);
+		this.host.setCurrent(summary);
+		this.host.liveChanged();
+		return state;
+	}
+
+	/**
+	 * The turn a run without a prompt of its own continues (a retry, or the
+	 * continuation after a compaction): the live turn, else the newest turn in
+	 * the chat when no user message came after it.
+	 */
+	private continuableTurn(): TurnSummaryComponent | undefined {
+		const children = this.host.chat().children;
+		const current = this.host.currentSummary();
+		if (current && children.includes(current)) return current;
+		for (let index = children.length - 1; index >= 0; index--) {
+			const child = children[index];
+			if (child instanceof UserMessageComponent) return undefined;
+			if (child instanceof TurnSummaryComponent) return child;
+		}
+		return undefined;
+	}
+
+	/** The turn that shows a step: the live one when it has it, else the box in the chat that does. */
+	private stepOwner(toolCallId: string): TurnActivityState | undefined {
+		const current = this.host.currentState();
+		if (!current || current.steps.some((step) => step.toolCallId === toolCallId)) return current;
+		for (const child of this.host.chat().children) {
+			if (
+				child instanceof TurnSummaryComponent &&
+				child.state.steps.some((step) => step.toolCallId === toolCallId)
+			) {
+				return child.state;
+			}
+		}
+		return current;
+	}
+
+	private summaryForState(state: TurnActivityState): TurnSummaryComponent | undefined {
+		for (const child of this.host.chat().children) {
+			if (child instanceof TurnSummaryComponent && child.state === state) return child;
+		}
+		return undefined;
+	}
+
+	private setCompactionAfter(key: string, tokens: number): boolean {
+		for (const child of this.host.chat().children) {
+			if (!(child instanceof TurnSummaryComponent)) continue;
+			const entry = child.state.timeline.entries.find((candidate) => candidate.key === key);
+			if (entry?.kind === "compact") {
+				entry.compaction.after = tokens;
+				child.state.timeline.ui.bump();
+				this.host.requestRender();
+				return true;
+			}
+		}
+		return false;
+	}
+}

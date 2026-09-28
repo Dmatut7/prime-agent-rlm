@@ -36,6 +36,7 @@ import {
 	renderedCopyText,
 } from "./block-focus.js";
 import { SystemNoticeLine } from "./system-notice.js";
+import { boxRecordFromMessage } from "./turn-timeline.js";
 
 type InjectedPromptDetails =
 	| AutoContinueMessageDetails
@@ -183,31 +184,34 @@ export class InjectedPromptMessageComponent extends Container implements Focusab
 			case AUTO_CONTINUE_CUSTOM_TYPE: {
 				const details = this.message.details as AutoContinueMessageDetails | undefined;
 				if (details?.reason === "child_reply_missing") {
-					return { label: "↻ auto-continue", detail: "提醒把结果发给父代理" };
+					return { label: "↻ 自动继续", detail: "提醒把结果发给父代理" };
 				}
 				const detail = details?.excerpt ? `刚才说要「${collapseText(details.excerpt)}」` : "上一步没做完";
-				return { label: "↻ auto-continue", detail };
+				return { label: "↻ 自动继续", detail };
 			}
 			case HEARTBEAT_PROMPT_CUSTOM_TYPE: {
 				const details = this.message.details as HeartbeatPromptDetails | undefined;
-				return { label: "♥ heartbeat", detail: heartbeatPromptSchedule(details?.schedule) };
+				return { label: "♥ 定时任务", detail: heartbeatPromptSchedule(details?.schedule) };
 			}
 			case IPYTHON_STATE_RESTORED_CUSTOM_TYPE: {
 				const details = this.message.details as IpythonStateRestoredDetails | undefined;
 				return {
-					label: details?.restored === false ? "◆ new python kernel" : "◆ python kernel restored",
+					label: details?.restored === false ? "◆ 新开了 Python 环境" : "◆ Python 环境已恢复",
 					detail: "",
 				};
 			}
 			case RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE:
-				return { label: "◇ subagent still running", detail: "" };
+				return { label: "◇ 子代理还在跑", detail: "" };
 			case PYTHON_SKILLS_UNAVAILABLE_CUSTOM_TYPE: {
 				const details = this.message.details as PythonSkillsUnavailableDetails | undefined;
-				return { label: "⚠ python skills unavailable", detail: details?.skills?.join(", ") ?? "" };
+				return { label: "⚠ 部分 Python 技能不可用", detail: details?.skills?.join(", ") ?? "" };
 			}
 			case RLM_CHILD_FAILURE_CUSTOM_TYPE:
-			case RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE:
-				return rlmChildFailureLabel(this.message) ? undefined : { label: "◇ subagent status", detail: "" };
+			case RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE: {
+				if (rlmChildFailureLabel(this.message)) return undefined;
+				const record = boxRecordFromMessage(this.message);
+				return { label: `◇ ${record?.kind === "notice" ? record.notice.text : "子代理状态"}`, detail: "" };
+			}
 			default: {
 				const goal = this.message.details as GoalContextDetails | undefined;
 				return {
@@ -231,7 +235,7 @@ export class InjectedPromptMessageComponent extends Container implements Focusab
 		}
 		if (this.message.customType === IPYTHON_STATE_RESTORED_CUSTOM_TYPE) {
 			const details = this.message.details as IpythonStateRestoredDetails | undefined;
-			const label = details?.restored === false ? "new python kernel" : "python kernel restored";
+			const label = details?.restored === false ? "新开了 Python 环境" : "Python 环境已恢复";
 			return `${theme.fg("accent", "◆")} ${theme.fg("muted", label)}`;
 		}
 		if (this.message.customType === RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE) {
@@ -268,7 +272,7 @@ export class InjectedPromptMessageComponent extends Container implements Focusab
 		const details = this.message.details as HeartbeatPromptDetails | undefined;
 		const pulse = theme.fg("error", "♥");
 		const schedule = theme.fg("muted", heartbeatPromptSchedule(details?.schedule));
-		return `${pulse} ${theme.fg("muted", "heartbeat")}${theme.fg("dim", " · ")}${schedule}`;
+		return `${pulse} ${theme.fg("muted", "定时任务")}${theme.fg("dim", " · ")}${schedule}`;
 	}
 
 	private metaText(): string {

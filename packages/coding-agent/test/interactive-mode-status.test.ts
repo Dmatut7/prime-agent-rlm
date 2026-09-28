@@ -5067,6 +5067,7 @@ describe("InteractiveMode.setToolsExpanded", () => {
 
 	test("quiet Esc folds the last-opened lane of a box first, backwards (T8)", () => {
 		const state = new TurnActivityState(1_000);
+		state.timeline.noteMessage(assistantThinking("t8"), true);
 		for (let i = 1; i <= 3; i++) {
 			state.addStep({ toolCallId: `t${i}`, toolName: "bash", args: {}, status: "done" });
 		}
@@ -5117,6 +5118,7 @@ describe("InteractiveMode.setToolsExpanded", () => {
 
 	test("quiet Esc never hijacks a running turn or a non-empty editor (T8)", () => {
 		const state = new TurnActivityState(1_000);
+		state.timeline.noteMessage(assistantThinking("t8"), true);
 		state.addStep({ toolCallId: "t1", toolName: "bash", args: {}, status: "done" });
 		state.markTurnEnded(1_500);
 		const summary = new TurnSummaryComponent(state);
@@ -5150,6 +5152,52 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		fakeThis.handleEscape();
 		expect(state.thinkingBlockExpanded).toBe(true);
 		expect(fakeThis.interruptOrClearInput).toHaveBeenCalledOnce();
+	});
+
+	test("the new keys say why nothing happened when there is nothing to act on", () => {
+		// An empty chat: nothing to open, no thinking, no box to walk, no edit diffs.
+		const empty = createExpansionFakeThis([]);
+		empty.uiServices = { settingsManager: { getProcessMode: () => "quiet" as const } };
+		empty.showToast = vi.fn();
+		empty.toggleToolOutputExpansion();
+		empty.toggleThinkingBlockVisibility();
+		empty.focusLatestTurnBox();
+		empty.toggleEditDiffExpansion();
+		expect(empty.showToast.mock.calls.map((call: unknown[]) => call[0])).toEqual([
+			"还没有可以展开的步骤",
+			"还没有思考内容可以展开",
+			"还没有可以看的步骤",
+			"还没有可以展开的改动",
+		]);
+		expect(empty.toolOutputExpanded).toBe(false);
+		expect(empty.thinkingExpanded).toBe(false);
+		expect(empty.editDiffsExpanded).toBe(false);
+
+		// A box with steps but no thinking: Ctrl+T says so and opens nothing.
+		const state = new TurnActivityState(1_000);
+		state.addStep({ toolCallId: "t1", toolName: "bash", args: {}, status: "done" });
+		state.markTurnEnded(1_500);
+		const summary = new TurnSummaryComponent(state);
+		summary.setQuiet(true);
+		const withBox = createExpansionFakeThis([summary]);
+		withBox.uiServices = { settingsManager: { getProcessMode: () => "quiet" as const } };
+		withBox.showToast = vi.fn();
+		withBox.toggleThinkingBlockVisibility();
+		expect(withBox.showToast).toHaveBeenCalledWith("这一轮没有思考内容");
+		expect(state.thinkingBlockExpanded).toBe(false);
+		expect(state.processBlockExpanded).toBe(false);
+
+		// A box with nothing inside at all: Ctrl+O says so and leaves it closed.
+		const bare = new TurnActivityState(1_000);
+		bare.markTurnEnded(1_500);
+		const bareSummary = new TurnSummaryComponent(bare);
+		bareSummary.setQuiet(true);
+		const withBare = createExpansionFakeThis([bareSummary]);
+		withBare.uiServices = { settingsManager: { getProcessMode: () => "quiet" as const } };
+		withBare.showToast = vi.fn();
+		withBare.toggleToolOutputExpansion();
+		expect(withBare.showToast).toHaveBeenCalledWith("这一轮没有可以展开的步骤");
+		expect(bare.processBlockExpanded).toBe(false);
 	});
 
 	test("quiet Ctrl+O opens and closes the latest box as a whole (T6)", () => {
@@ -5268,12 +5316,12 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(fakeThis.thinkingExpanded).toBe(false);
 		expect(setThinkingExpanded).not.toHaveBeenCalled();
 		expect(fakeThis.showStatus).toHaveBeenCalledWith(
-			"Thinking 已被 hideThinkingBlock 设置隐藏：关闭该设置后 Ctrl+T 可展开",
+			"思考过程已被 hideThinkingBlock 设置隐藏：关闭该设置后 Ctrl+T 可展开",
 		);
 	});
 
 	test("Ctrl+T owns the thinking block: only the thinking lane flips", () => {
-		const assistantChild = new AssistantMessageComponent();
+		const assistantChild = new AssistantMessageComponent(assistantThinking("lane"));
 		const setThinkingExpanded = vi.spyOn(assistantChild, "setThinkingExpanded");
 		const child = { setExpanded: vi.fn(), setAgentMessagesExpanded: vi.fn(), setEditDiffsExpanded: vi.fn() };
 		const fakeThis = createExpansionFakeThis([child, assistantChild]);
@@ -5309,7 +5357,7 @@ describe("InteractiveMode.createExtensionUIContext setTheme", () => {
 		const fakeThis: any = {
 			session: { settingsManager },
 			settingsManager,
-			ui: { requestRender: vi.fn() },
+			ui: { requestRender: vi.fn(), invalidate: vi.fn() },
 		};
 
 		const uiContext = (InteractiveMode as any).prototype.createExtensionUIContext.call(fakeThis);
@@ -5319,6 +5367,8 @@ describe("InteractiveMode.createExtensionUIContext setTheme", () => {
 		expect(settingsManager.setTheme).toHaveBeenCalledWith("light");
 		expect(currentTheme).toBe("light");
 		expect(fakeThis.ui.requestRender).toHaveBeenCalledTimes(1);
+		// Cached lines (a finished turn's box) are redrawn in the new colors.
+		expect(fakeThis.ui.invalidate).toHaveBeenCalledTimes(1);
 	});
 
 	test("does not persist invalid theme names", () => {

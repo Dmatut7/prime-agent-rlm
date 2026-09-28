@@ -116,10 +116,10 @@ describe("ENG-4530 IPython state restore message", () => {
 		}
 
 		const component = new InjectedPromptMessageComponent(restoreMessage);
-		expect(render(component).trim()).toBe("·  ◆ python kernel restored  ·");
+		expect(render(component).trim()).toBe("·  ◆ Python 环境已恢复  ·");
 		expect(render(component)).not.toContain("alpha");
 		component.setExpanded(true);
-		expect(render(component)).toContain("◆ python kernel restored");
+		expect(render(component)).toContain("◆ Python 环境已恢复");
 		expect(render(component)).not.toContain("ipython_state_restored");
 		expect(render(component)).not.toContain("alpha");
 	});
@@ -170,7 +170,7 @@ describe("ENG-4530 IPython state restore message", () => {
 		};
 		const component = new InjectedPromptMessageComponent(message);
 
-		expect(render(component)).toContain("◆ new python kernel");
+		expect(render(component)).toContain("◆ 新开了 Python 环境");
 		component.setExpanded(true);
 		expect(render(component)).not.toContain("restore details");
 	});

@@ -35,6 +35,10 @@ export interface StepFeedData {
 	outputText?: string;
 	/** One-line reason once the step failed. */
 	error?: string;
+	/** The cell was cut short by an interrupt (the owner's stop, the stall watchdog). */
+	stopped?: boolean;
+	/** The kernel said its change lists for this cell are incomplete. */
+	trackingIncomplete?: boolean;
 	/** A few lines of the failure (traceback tail), for the expanded error row. */
 	errorDetail?: string[];
 	durationMs?: number;
@@ -100,6 +104,7 @@ function readActivity(value: unknown): KernelActivity | undefined {
 		startedAt: startedAt ?? 0,
 		...(detail !== undefined ? { detail } : {}),
 		...(endedAt !== undefined ? { endedAt } : {}),
+		...(value.background === true ? { background: true as const } : {}),
 	};
 }
 
@@ -131,6 +136,8 @@ function readFileChange(value: unknown): KernelFileChange | undefined {
 	if (diff !== undefined) change.diff = diff;
 	if (value.diffTruncated === true) change.diffTruncated = true;
 	if (value.binary === true) change.binary = true;
+	const omitted = stringField(value, "diffOmitted");
+	if (omitted === "too_large" || omitted === "no_baseline" || omitted === "budget") change.diffOmitted = omitted;
 	return change;
 }
 
@@ -181,12 +188,6 @@ function readList<T>(value: unknown, read: (entry: unknown) => T | undefined): T
 	});
 }
 
-/** The subagent a record came from, when the producer tagged it (display-only; optional in the contract). */
-export function recordAgentName(record: object): string | undefined {
-	const value = (record as Record<string, unknown>).agent ?? (record as Record<string, unknown>).agentName;
-	return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
 /** Merge activity records by id: first appearance keeps its place, the latest record wins. */
 function mergeActivities(previous: readonly KernelActivity[], incoming: readonly KernelActivity[]): KernelActivity[] {
 	const byId = new Map(previous.map((activity) => [activity.id, activity] as const));
@@ -233,6 +234,9 @@ export function mergeStepResult(
 	if (memoryChanges) next.memoryChanges = memoryChanges;
 	const diffs = readList(details.diffs, readDiffDisplay);
 	if (diffs) next.legacyDiffs = diffs;
+	if (typeof details.changeTrackingIncomplete === "string" && details.changeTrackingIncomplete.trim()) {
+		next.trackingIncomplete = true;
+	}
 	if (toolName === "edit" && !result.isError) {
 		const argRecord = isRecord(args) ? args : {};
 		const path = stringField(argRecord, "path") ?? stringField(argRecord, "file_path");
@@ -251,7 +255,10 @@ export function mergeStepResult(
 	if (output) next.outputText = output.slice(-OUTPUT_KEEP_CHARS);
 	const duration = numberField(details, "durationMs");
 	if (duration !== undefined) next.durationMs = duration;
-	if (result.isError || details.status === "error") {
+	const error = isRecord(details.error) ? details.error : undefined;
+	const ename = error ? stringField(error, "ename") : stringField(details, "errorEname");
+	next.stopped = details.status === "aborted" || ename === "KeyboardInterrupt" || isRecord(details.abortCause);
+	if (result.isError || details.status === "error" || details.status === "aborted") {
 		const failure = describeFailure(details, text);
 		next.error = failure.summary;
 		next.errorDetail = failure.detail;
@@ -309,8 +316,10 @@ export interface ChangeEntry {
 	/** The kernel cut the diff at its cap. */
 	truncated: boolean;
 	binary: boolean;
-	/** The subagent that made the change, when the record says so. */
-	agent?: string;
+	/** Why the kernel kept no diff (too large, no copy from before, out of budget). */
+	omitted?: KernelFileChange["diffOmitted"];
+	/** How the kernel saw the change (Python code, a shell command, the edit skill). */
+	source?: KernelFileChange["source"];
 	/** When the change was first seen (ordering). */
 	firstAt: number;
 }
@@ -342,7 +351,8 @@ function addEntry(entries: Map<string, ChangeEntry>, entry: ChangeEntry): void {
 	if (entry.rows.length > 0) existing.rows = [...existing.rows, ...entry.rows];
 	existing.truncated ||= entry.truncated;
 	existing.binary ||= entry.binary;
-	existing.agent ??= entry.agent;
+	existing.omitted ??= entry.omitted;
+	existing.source ??= entry.source;
 	if (entry.oldPath) existing.oldPath ??= entry.oldPath;
 }
 
@@ -373,7 +383,6 @@ export function aggregateChanges(
 			for (const change of data.fileChanges) {
 				const path = displayPath(change, cwd);
 				const rows = change.diff ? memoRows(change, () => parseUnifiedDiff(change.diff ?? "")) : [];
-				const agent = recordAgentName(change);
 				addEntry(entries, {
 					key: change.path,
 					path,
@@ -385,7 +394,8 @@ export function aggregateChanges(
 					rows,
 					truncated: change.diffTruncated === true,
 					binary: change.binary === true,
-					...(agent ? { agent } : {}),
+					...(change.diffOmitted ? { omitted: change.diffOmitted } : {}),
+					source: change.source,
 					firstAt: change.at || order,
 				});
 			}

@@ -321,9 +321,17 @@ export class TurnActivityState {
 
 	private viewCache: { key: string; rows: BoxRow[]; facts: TimelineFacts } | undefined;
 
+	/** The key of the last finished view (what a cached box was drawn from). */
+	boxViewKey(): string {
+		return this.viewCache?.key ?? "live";
+	}
+
 	/** The box rows and the turn's facts; memoized once the turn has finished. */
 	boxView(now = Date.now()): { rows: BoxRow[]; facts: TimelineFacts; live: boolean } {
 		const live = this.boxLive;
+		const cwd = this.host.cwd();
+		const hideThinking = this.host.hideThinking?.() ?? false;
+		// Every input the rows read: a change to any of them rebuilds a finished box.
 		const cacheKey = [
 			this.timeline.ui.version,
 			this.steps.length,
@@ -331,18 +339,13 @@ export class TurnActivityState {
 			this.timeline.entries.length,
 			this.timeline.stopped,
 			this.timeline.errorEnded,
+			cwd,
+			hideThinking,
 		].join(":");
 		if (!live && this.viewCache?.key === cacheKey) {
 			return { rows: this.viewCache.rows, facts: this.viewCache.facts, live };
 		}
-		const ctx = {
-			now,
-			cwd: this.host.cwd(),
-			steps: this.rowSteps(),
-			live,
-			stopped: this.timeline.stopped,
-			hideThinking: this.host.hideThinking?.() ?? false,
-		};
+		const ctx = { now, cwd, steps: this.rowSteps(), live, stopped: this.timeline.stopped, hideThinking };
 		const rows = buildTimelineRows(this.timeline, ctx);
 		const facts = timelineFacts(this.timeline, rows, ctx);
 		if (!live) this.viewCache = { key: cacheKey, rows, facts };
@@ -705,6 +708,15 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		this.turnState.host.requestRender();
 	}
 
+	/** What Enter does on a focused target (`展开`, `收起`), or undefined for a row with nothing to open. */
+	enterLabel(key: string): string | undefined {
+		const state = this.turnState;
+		if (key === "header") return state.boxOpen ? "收起" : "展开";
+		const row = state.boxView().rows.find((candidate) => candidate.key === key);
+		if (!row?.detail) return undefined;
+		return state.timeline.ui.expanded.has(key) ? "收起" : "展开";
+	}
+
 	/** Enter on a focused target: the header toggles the box, a row opens or closes. */
 	activate(key: string): boolean {
 		if (key === "header") {
@@ -843,10 +855,11 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		const now = Date.now();
 		const viewportRows = host.viewportRows();
 		const ui = state.timeline.ui;
-		const cacheKey = `${width}:${viewportRows}:${ui.version}:${state.boxOpen}:${state.steps.length}`;
+		// The finished box's view has its own key (steps, entries, how it ended, cwd, hideThinking).
+		const view = state.boxView(now);
+		const cacheKey = `${width}:${viewportRows}:${ui.version}:${state.boxOpen}:${state.boxViewKey()}`;
 		if (this.cachedLines && this.boxCacheKey === cacheKey) return this.cachedLines;
 		takeMotionActive();
-		const view = state.boxView(now);
 		const header = computeBoxHeader({
 			rows: view.rows,
 			facts: view.facts,

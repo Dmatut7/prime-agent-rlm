@@ -86,6 +86,12 @@ export interface Component {
 	wantsKeyRelease?: boolean;
 
 	/**
+	 * If true while focused, PageUp/PageDown reach this component instead of
+	 * paging the fullscreen transcript (a list that scrolls its own content).
+	 */
+	wantsPageKeys?: boolean;
+
+	/**
 	 * Invalidate any cached rendering state.
 	 * Called when theme changes or when component needs to re-render from scratch.
 	 */
@@ -1229,11 +1235,13 @@ export class TUI extends Container {
 		if (isKeyRelease(data)) return false;
 
 		const keybindings = getKeybindings();
-		if (keybindings.matches(data, "tui.viewport.pageUp")) {
+		// A focused component that pages its own content takes the page keys.
+		const pagesItself = this.focusedComponent?.wantsPageKeys === true;
+		if (!pagesItself && keybindings.matches(data, "tui.viewport.pageUp")) {
 			this.scrollBy(-fullscreen.viewport.pageSize());
 			return true;
 		}
-		if (keybindings.matches(data, "tui.viewport.pageDown")) {
+		if (!pagesItself && keybindings.matches(data, "tui.viewport.pageDown")) {
 			this.scrollBy(fullscreen.viewport.pageSize());
 			return true;
 		}

@@ -22,6 +22,8 @@ export interface TurnBoxNavigatorHandlers {
 export class TurnBoxNavigator implements Component, Focusable {
 	private hasFocus = false;
 	private active = true;
+	/** PageUp/PageDown scroll the walked box, not the fullscreen transcript. */
+	readonly wantsPageKeys = true;
 
 	constructor(private readonly handlers: TurnBoxNavigatorHandlers) {}
 
@@ -85,15 +87,15 @@ export class TurnBoxNavigator implements Component, Focusable {
 	}
 }
 
-/** The one-line hint shown on the prompt's rule while the box has the keyboard. */
-export function turnBoxFocusHints(): string[] {
+/** The walk's key hints on the prompt's rule; `enter` says what Enter does on the focused target (absent: it does nothing there). */
+export function turnBoxFocusHints(enter?: string): string[] {
 	const up = keyText("tui.select.up", { primaryOnly: true });
 	const down = keyText("tui.select.down", { primaryOnly: true });
 	const confirm = keyText("tui.select.confirm", { primaryOnly: true });
 	const cancel = keyText("tui.select.cancel", { primaryOnly: true });
 	return [
 		up && down ? `${up}${down} 选` : "",
-		confirm ? `${confirm} 展开/收起` : "",
+		confirm && enter ? `${confirm} ${enter}` : "",
 		cancel ? `${cancel} 退出` : "",
 	].filter((hint) => hint.length > 0);
 }

@@ -2,6 +2,7 @@ import { isAbsolute } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { KernelFileChange } from "../../../core/kernel/shared.js";
 import type { EditToolDetails } from "../../../core/tools/edit.js";
 import { generateDiffString } from "../../../core/tools/edit-diff.js";
 import type { IpythonToolDetails } from "../../../core/tools/ipython.js";
@@ -45,6 +46,23 @@ export function getToolFileChanges(
 ): FileChangeSummary[] {
 	const changes = new Map<string, FileChangeSummary>();
 	if (toolName === "ipython") {
+		const records = (result.details as { fileChanges?: unknown } | undefined)?.fileChanges;
+		if (Array.isArray(records)) {
+			// The kernel's own list of what the cell changed replaces the edit skill's diffs.
+			for (const record of records as Array<Partial<KernelFileChange>>) {
+				if (typeof record.path !== "string" || record.scope === "scratch") continue;
+				mergeFileChange(
+					changes,
+					{
+						path: record.relPath ?? record.path,
+						added: Math.max(0, Number(record.added) || 0),
+						removed: Math.max(0, Number(record.removed) || 0),
+					},
+					cwd,
+				);
+			}
+			return [...changes.values()];
+		}
 		for (const display of (result.details as IpythonToolDetails | undefined)?.diffs ?? []) {
 			const { diff } = generateDiffString(display.oldStr, display.newStr, 4, display.startLine ?? 1);
 			mergeFileChange(changes, { path: display.path, ...countChangedLines(diff) }, cwd);

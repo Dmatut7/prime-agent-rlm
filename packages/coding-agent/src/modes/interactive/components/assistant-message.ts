@@ -95,6 +95,8 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 	private precededByToolActivity: boolean;
 	/** TUI v4 quiet-conversation gate; see {@link AssistantMessageComponentOptions.quiet}. */
 	private quiet = false;
+	/** A later reply of the same turn took over: this answer's text lives on as a row in the box. */
+	private superseded = false;
 	private mermaidTransform?: MermaidMarkdownTransform;
 	private baseUrl?: string;
 	private isStreaming = false;
@@ -133,6 +135,18 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 		super.invalidate();
 		// Force a full rebuild so theme-dependent children are recreated.
 		this.lastSignature = undefined;
+		this.dirty = true;
+	}
+
+	/** The message this component shows. */
+	get message(): AssistantMessage | undefined {
+		return this.lastMessage;
+	}
+
+	/** Fold this answer's text away: a later reply of the same turn is the one under the box. */
+	setSuperseded(superseded: boolean): void {
+		if (this.superseded === superseded) return;
+		this.superseded = superseded;
 		this.dirty = true;
 	}
 
@@ -249,6 +263,7 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 			`thinkingExpanded:${this.thinkingExpanded}`,
 			// TUI v4: a quiet-mode flip must rebuild so the narration fold applies.
 			`quiet:${this.quiet}`,
+			`superseded:${this.superseded}`,
 			// In the signature so the streaming->final transition rebuilds (mermaid renders differently).
 			`streaming:${this.isStreaming}`,
 			`stop:${message.stopReason ?? ""}`,
@@ -306,7 +321,7 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 		// like the turn's final no-tool output. Error surfaces never fold.
 		const firstToolCallIndex = message.content.findIndex((c) => c?.type === "toolCall");
 		const foldsText = (index: number): boolean =>
-			this.quiet && firstToolCallIndex !== -1 && index < firstToolCallIndex;
+			this.superseded || (this.quiet && firstToolCallIndex !== -1 && index < firstToolCallIndex);
 		const hasFoldedText = message.content.some(
 			(c, index) => c?.type === "text" && c.text.trim().length > 0 && foldsText(index),
 		);

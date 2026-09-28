@@ -1,6 +1,23 @@
 import type { AssistantMessage, AssistantMessageEvent } from "@earendil-works/pi-ai";
+import {
+	COMPACTION_OUTCOME_CUSTOM_TYPE,
+	type CompactionOutcomeDetails,
+	type CustomMessage,
+	RLM_CHILD_FAILURE_CUSTOM_TYPE,
+	RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE,
+	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
+	type RlmChildFailureDetails,
+	type RlmChildStallNoticeDetails,
+	type RlmChildTerminalNoticeDetails,
+} from "../../../core/messages.js";
 import { sanitizeDisplayText } from "./diff-rows.js";
-import { emptyStepFeedData, estimateTokens, mergeStepResult, type StepFeedData } from "./feed-data.js";
+import {
+	emptyStepFeedData,
+	estimateTokens,
+	estimateTokenUnits,
+	mergeStepResult,
+	type StepFeedData,
+} from "./feed-data.js";
 
 /**
  * Everything one assistant turn's box shows, in the order it happened: the
@@ -29,7 +46,21 @@ export interface TimelineCompaction {
 	/** Context tokens before and after, when known. */
 	before?: number;
 	after?: number;
+	/** Why it did not happen (with `skipped`, why it waits for later). */
 	failed?: string;
+	/** Not a failure: the session chose to wait (the conversation is too short). */
+	skipped?: boolean;
+	/** Rebuilt from the transcript; a live row of the same turn is the richer record. */
+	fromReplay?: boolean;
+}
+
+/** A notice about the turn's work, said in plain words (a subagent that finished without replying). */
+export interface TimelineNotice {
+	tone: "muted" | "warn" | "error";
+	/** One line in plain words. */
+	text: string;
+	/** What opening the row shows (the child's own last words, the error). */
+	detail?: string;
 }
 
 export interface TimelineSubagent {
@@ -51,7 +82,8 @@ export type TimelineEntry =
 	| { seq: number; kind: "steer"; key: string; text: string; at: number }
 	| { seq: number; kind: "retry"; key: string; retry: TimelineRetry }
 	| { seq: number; kind: "compact"; key: string; compaction: TimelineCompaction }
-	| { seq: number; kind: "subagent"; key: string; sub: TimelineSubagent };
+	| { seq: number; kind: "subagent"; key: string; sub: TimelineSubagent }
+	| { seq: number; kind: "notice"; key: string; notice: TimelineNotice; at: number };
 
 /** Live timing of one thinking block; absent for a replayed turn. */
 export interface ThinkingTiming {
@@ -349,12 +381,41 @@ export class TurnTimeline {
 		return undefined;
 	}
 
-	endCompaction(endedAt: number, facts: { before?: number; failed?: string }): void {
+	endCompaction(endedAt: number, facts: { before?: number; failed?: string; skipped?: boolean }): void {
 		const compaction = this.activeCompaction();
 		if (!compaction) return;
 		compaction.endedAt = endedAt;
 		if (facts.before !== undefined) compaction.before = facts.before;
 		if (facts.failed) compaction.failed = facts.failed;
+		if (facts.skipped) compaction.skipped = true;
+		this.ui.bump();
+	}
+
+	/** A compaction the transcript records (its summary, or why it did not happen), settled. */
+	addReplayCompaction(at: number, facts: { before?: number; failed?: string; skipped?: boolean }): void {
+		const key = `compact:replay:${at}`;
+		if (this.entries.some((entry) => entry.key === key)) return;
+		this.entries.push({
+			seq: this.nextSeq(),
+			kind: "compact",
+			key,
+			compaction: {
+				startedAt: at,
+				endedAt: at,
+				fromReplay: true,
+				...(facts.before !== undefined ? { before: facts.before } : {}),
+				...(facts.failed ? { failed: facts.failed } : {}),
+				...(facts.skipped ? { skipped: true } : {}),
+			},
+		});
+		this.ui.bump();
+	}
+
+	/** A notice about the turn's work, once per message it came from. */
+	addNotice(notice: TimelineNotice, at: number): void {
+		const key = `notice:${at}`;
+		if (this.entries.some((entry) => entry.key === key)) return;
+		this.entries.push({ seq: this.nextSeq(), kind: "notice", key, notice, at });
 		this.ui.bump();
 	}
 
@@ -399,7 +460,12 @@ export class TurnTimeline {
 		for (const entry of this.entries) {
 			if (entry.kind !== "message") continue;
 			const reported = entry.message.usage?.output ?? 0;
-			const estimate = entry.ended && reported > 0 ? 0 : estimateMessageTokens(entry.message);
+			const estimate =
+				entry.ended && reported > 0
+					? 0
+					: entry.ended
+						? endedMessageTokens(entry.message)
+						: estimateMessageTokens(entry.message);
 			total += entry.ended ? (reported > 0 ? reported : estimate) : Math.max(reported, estimate);
 		}
 		this.tokenPeak = Math.max(this.tokenPeak, total);
@@ -446,6 +512,12 @@ export class TurnTimeline {
 		// copy, live-only ones (retries, compactions, subagents) carry over as they
 		// were, and anything only the replay knows goes after them.
 		const fresh = new Map(next.entries.map((entry) => [entry.key, entry] as const));
+		// The live compaction row is the richer record of the same event as its replayed copy.
+		if (this.entries.some((entry) => entry.kind === "compact" && !entry.compaction.fromReplay)) {
+			for (const [key, entry] of fresh) {
+				if (entry.kind === "compact" && entry.compaction.fromReplay) fresh.delete(key);
+			}
+		}
 		const merged: TimelineEntry[] = [];
 		for (const entry of this.entries) {
 			const replayed = fresh.get(entry.key);
@@ -482,21 +554,45 @@ export class TurnTimeline {
 	}
 }
 
+/** Token units of one tool call's arguments, read once per arguments object. */
+const argumentUnits = new WeakMap<object, number>();
+
+function toolArgumentUnits(args: unknown): number {
+	if (typeof args !== "object" || args === null) return 0;
+	let units = argumentUnits.get(args);
+	if (units === undefined) {
+		try {
+			units = estimateTokenUnits(JSON.stringify(args));
+		} catch {
+			// Unserializable streaming arguments count as nothing yet.
+			units = 0;
+		}
+		argumentUnits.set(args, units);
+	}
+	return units;
+}
+
+/** A finished message's estimate never changes: read once. */
+const endedEstimates = new WeakMap<AssistantMessage, number>();
+
 /** Estimate of what one message generated so far: thinking, text and tool-call arguments. */
 export function estimateMessageTokens(message: AssistantMessage): number {
-	let text = "";
+	let units = 0;
 	for (const block of message.content ?? []) {
-		if (block.type === "thinking") text += block.thinking ?? "";
-		else if (block.type === "text") text += block.text ?? "";
-		else if (block.type === "toolCall") {
-			try {
-				text += JSON.stringify(block.arguments ?? {});
-			} catch {
-				// Unserializable streaming arguments count as nothing yet.
-			}
-		}
+		if (block.type === "thinking") units += estimateTokenUnits(block.thinking ?? "");
+		else if (block.type === "text") units += estimateTokenUnits(block.text ?? "");
+		else if (block.type === "toolCall") units += toolArgumentUnits(block.arguments);
 	}
-	return estimateTokens(text);
+	return Math.round(units);
+}
+
+function endedMessageTokens(message: AssistantMessage): number {
+	let estimate = endedEstimates.get(message);
+	if (estimate === undefined) {
+		estimate = estimateMessageTokens(message);
+		endedEstimates.set(message, estimate);
+	}
+	return estimate;
 }
 
 /** `16秒`, `1分26秒`, `1小时02分`: the box's clock. */
@@ -535,4 +631,112 @@ export function describeRetryReason(event: {
 	if (/5\d\d|internal server|bad gateway/.test(text)) return "模型服务出错";
 	if (/econnreset|socket|network|fetch failed|connection/.test(text)) return "网络断了一下";
 	return "模型接口出错";
+}
+
+/** Why a compaction did not happen, in plain words for its row (a skip is not a failure). */
+export function compactionMissText(event: { errorMessage?: string; errorSeverity?: "warning" | "error" }): string {
+	const message = event.errorMessage ?? "";
+	if (/too short/i.test(message)) return "对话还太短，等它长一些再整理";
+	if (/already compacted/i.test(message)) return "刚整理过，不用再整理";
+	if (event.errorSeverity === "warning") return "这次先跳过，稍后再试";
+	return (
+		sanitizeDisplayText(message.replace(/^[A-Za-z -]*compaction[A-Za-z ]*:\s*/i, "")).split("\n")[0] || "没有结果"
+	);
+}
+
+function childFailureWhy(details: RlmChildFailureDetails | undefined): string {
+	const kind = details?.kind;
+	if (kind === "stall_killed") return "长时间没动静，被自动终止";
+	if (kind === "aborted") return "已中止";
+	return "出错";
+}
+
+/**
+ * What a session notice about the turn's work says as a box record: a subagent
+ * notice becomes a row in plain words, a compaction outcome a settled
+ * compaction row. Undefined for anything the box does not show.
+ */
+export function boxRecordFromMessage(
+	message: CustomMessage,
+):
+	| { kind: "notice"; notice: TimelineNotice }
+	| { kind: "compaction"; facts: { failed?: string; skipped?: boolean } }
+	| undefined {
+	if (message.customType === RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE) {
+		const details = message.details as RlmChildTerminalNoticeDetails | undefined;
+		const name = sanitizeDisplayText(details?.sessionName ?? "").trim() || "子代理";
+		if (details?.kind === "cancelled") {
+			const reason = details.reason ? `：${sanitizeDisplayText(details.reason).split("\n")[0]}` : "";
+			return { kind: "notice", notice: { tone: "muted", text: `子代理 ${name} 已取消${reason}` } };
+		}
+		const lastText = details?.kind === "completed_without_reply" ? details.lastAssistantText?.trim() : undefined;
+		const what = details?.followUp ? "做完了你追加的那步" : "做完了";
+		return {
+			kind: "notice",
+			notice: {
+				tone: "muted",
+				text: `子代理 ${name} ${what}，没发回消息`,
+				...(lastText ? { detail: `它最后写的：\n${lastText}` } : {}),
+			},
+		};
+	}
+	if (message.customType === RLM_CHILD_FAILURE_CUSTOM_TYPE) {
+		const details = message.details as RlmChildFailureDetails | undefined;
+		const name = sanitizeDisplayText(details?.sessionName ?? "").trim() || "子代理";
+		const error = details?.error?.trim();
+		return {
+			kind: "notice",
+			notice: {
+				tone: "error",
+				text: `子代理 ${name} 失败（${childFailureWhy(details)}）`,
+				...(error ? { detail: error } : {}),
+			},
+		};
+	}
+	if (message.customType === RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE) {
+		const details = message.details as RlmChildStallNoticeDetails | undefined;
+		const name = sanitizeDisplayText(details?.sessionName ?? "").trim() || "子代理";
+		const quiet = details?.silentMs ? `，已经 ${formatBoxDuration(details.silentMs)}没动静` : "，一阵没动静了";
+		return { kind: "notice", notice: { tone: "warn", text: `子代理 ${name} 还在跑${quiet}` } };
+	}
+	if (message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE) {
+		const details = message.details as CompactionOutcomeDetails | undefined;
+		const content = typeof message.content === "string" ? message.content : "";
+		if (details?.outcome === "cancelled") return { kind: "compaction", facts: { failed: "已取消" } };
+		const skipped = details?.outcome === "skipped";
+		return {
+			kind: "compaction",
+			facts: {
+				failed: compactionMissText({ errorMessage: content, errorSeverity: skipped ? "warning" : "error" }),
+				...(skipped ? { skipped: true } : {}),
+			},
+		};
+	}
+	return undefined;
+}
+
+/** Notices the box shows as its own rows instead of cards in the chat. */
+export function isBoxNoticeMessage(message: CustomMessage): boolean {
+	return (
+		message.customType === RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE ||
+		message.customType === RLM_CHILD_FAILURE_CUSTOM_TYPE ||
+		message.customType === RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE ||
+		message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE
+	);
+}
+
+/** Whether a reply is an answer (text and no steps) that a later reply of its turn can take over. */
+export function isPlainAnswer(message: AssistantMessage | undefined): boolean {
+	const content = message?.content ?? [];
+	return (
+		!content.some((block) => block.type === "toolCall") &&
+		content.some((block) => block.type === "text" && block.text.trim().length > 0)
+	);
+}
+
+/** Whether a reply did anything a reader sees (text or steps). */
+export function replyHasWork(message: AssistantMessage | undefined): boolean {
+	return (message?.content ?? []).some(
+		(block) => block.type === "toolCall" || (block.type === "text" && block.text.trim().length > 0),
+	);
 }

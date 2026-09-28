@@ -19,6 +19,7 @@ import {
 	CompactionOutcomeMessageComponent,
 	MalformedCompactionOutcomeMessageComponent,
 } from "./compaction-outcome-message.js";
+import { QuietCompactionNoticeComponent } from "./compaction-summary-message.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./injected-prompt-message.js";
 import { IPythonCellComponent } from "./ipython-cell.js";
 import {
@@ -34,6 +35,7 @@ import {
 	type ToolExecutionOptions,
 } from "./tool-execution.js";
 import { type TimelineHost, TurnActivityState, type TurnStep, TurnSummaryComponent } from "./turn-activity.js";
+import { boxRecordFromMessage, isBoxNoticeMessage, isPlainAnswer, replyHasWork } from "./turn-timeline.js";
 import { UserMessageComponent } from "./user-message.js";
 
 export interface ConversationComponentsOptions {
@@ -288,11 +290,24 @@ export function buildConversationComponents(
 			} else {
 				components.push(new UserMessageComponent("[Malformed session command message]", options.markdownTheme));
 			}
+		} else if (quiet && turnState && message.role === "custom" && isBoxNoticeMessage(message)) {
+			// The box says it as its own row (a subagent that finished, a compaction that waited).
+			const record = boxRecordFromMessage(message);
+			if (record?.kind === "notice") turnState.timeline.addNotice(record.notice, Number(message.timestamp) || 0);
+			if (record?.kind === "compaction") {
+				turnState.timeline.addReplayCompaction(Number(message.timestamp) || 0, record.facts);
+			}
+		} else if (quiet && message.role === "compactionSummary") {
+			if (turnState) {
+				turnState.timeline.addReplayCompaction(Number(message.timestamp) || 0, { before: message.tokensBefore });
+			} else {
+				components.push(new QuietCompactionNoticeComponent(message, options.markdownTheme));
+			}
 		} else if (message.role === "custom" && message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE) {
 			if (!message.display) continue;
 			components.push(
 				isCompactionOutcomeMessage(message)
-					? new CompactionOutcomeMessageComponent(message)
+					? new CompactionOutcomeMessageComponent(message, { quiet })
 					: new MalformedCompactionOutcomeMessageComponent(),
 			);
 		} else if (message.role === "custom" && message.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE) {
@@ -340,7 +355,37 @@ export function buildConversationComponents(
 	// message so a thinking-only line stops ticking.
 	closeTurn();
 	turnState?.markTurnEnded(Number(messages.at(-1)?.timestamp) || Date.now());
+	if (quiet) foldEarlierAnswers(components);
 	return components;
+}
+
+/**
+ * Within one box turn only the last reply's answer stays under the box: an
+ * earlier answer (the run was carried on by a notice, a retry or a compaction)
+ * folds into the box as a row. `only` limits the walk to one turn.
+ */
+export function foldEarlierAnswers(children: readonly Component[], only?: TurnSummaryComponent): void {
+	let span: AssistantMessageComponent[] | undefined;
+	const settle = (): void => {
+		const replies = span;
+		span = undefined;
+		if (!replies) return;
+		replies.forEach((component, index) => {
+			const later = replies.slice(index + 1).some((next) => replyHasWork(next.message));
+			if (later && isPlainAnswer(component.message)) component.setSuperseded(true);
+		});
+	};
+	for (const child of children) {
+		if (child instanceof TurnSummaryComponent) {
+			settle();
+			if (child.state.boxMode && (only === undefined || child === only)) span = [];
+		} else if (child instanceof UserMessageComponent) {
+			settle();
+		} else if (span && child instanceof AssistantMessageComponent) {
+			span.push(child);
+		}
+	}
+	settle();
 }
 
 /** The last non-empty thinking trace of one assistant message, or "". */
