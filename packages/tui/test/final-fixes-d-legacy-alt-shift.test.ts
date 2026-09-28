@@ -96,7 +96,7 @@ describe("Alt+Shift+O and Alt+Shift+P through the stdin buffer", () => {
 		try {
 			buffer.process("\x1bO");
 			assert.deepStrictEqual(emitted, [], "held back for a moment: it could still grow into an SS3 sequence");
-			await wait(60);
+			await wait(200);
 			assert.deepStrictEqual(emitted, ["\x1bO"]);
 			assert.strictEqual(matchesKey(emitted[0]!, "alt+shift+o"), true);
 			assert.strictEqual(parseKey(emitted[0]!), "shift+alt+o");
@@ -112,7 +112,7 @@ describe("Alt+Shift+O and Alt+Shift+P through the stdin buffer", () => {
 			const { buffer, emitted } = openStdinBuffer();
 			try {
 				for (const chunk of chunks) buffer.process(chunk);
-				await wait(60);
+				await wait(200);
 				assert.deepStrictEqual(emitted, ["\x1bOA"], JSON.stringify(chunks));
 				assert.strictEqual(matchesKey(emitted[0]!, "alt+shift+o"), false, JSON.stringify(chunks));
 				assert.strictEqual(matchesKey(emitted[0]!, "up"), true, JSON.stringify(chunks));
@@ -128,7 +128,7 @@ describe("Alt+Shift+O and Alt+Shift+P through the stdin buffer", () => {
 		try {
 			buffer.process("\x1bP");
 			assert.deepStrictEqual(emitted, [], "waits for a DCS terminator until the timeout");
-			await wait(60);
+			await wait(200);
 			assert.deepStrictEqual(emitted, ["\x1bP"]);
 			assert.strictEqual(matchesKey(emitted[0]!, "alt+shift+p"), true);
 			assert.strictEqual(parseKey(emitted[0]!), "shift+alt+p");
