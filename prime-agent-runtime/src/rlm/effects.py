@@ -1184,7 +1184,10 @@ class _Tracker:
         return found
 
     def scan(self, root: str, deadline: float) -> dict[str, tuple[int, int]] | None:
-        """(size, mtime_ns) per file under root, None past the file cap; `_OutOfTime` past the deadline."""
+        """(size, mtime_ns) per file under root, None past the file cap; `_OutOfTime` past the deadline.
+
+        A symlink is an entry of its own with `_entry_sig`'s signature; it is never walked into.
+        """
         found: dict[str, tuple[int, int]] = {}
         stack = [root]
         while stack:
@@ -1199,12 +1202,13 @@ class _Tracker:
                                 if entry.name not in _SKIP_DIR_NAMES and entry.name not in _BUILD_DIR_NAMES:
                                     stack.append(entry.path)
                                 continue
-                            if not entry.is_file(follow_symlinks=False):
+                            is_link = entry.is_symlink()
+                            if not is_link and not entry.is_file(follow_symlinks=False):
                                 continue
                             info = entry.stat(follow_symlinks=False)
                         except OSError:
                             continue
-                        found[entry.path] = (info.st_size, info.st_mtime_ns)
+                        found[entry.path] = (_LINK_SIZE if is_link else info.st_size, info.st_mtime_ns)
                         if len(found) > MAX_SCAN_FILES:
                             return None
             except OSError:
@@ -1676,6 +1680,8 @@ class _Tracker:
         for path, sig in sorted(found.items(), key=lambda item: item[1][1], reverse=True):
             if read_files >= SNAPSHOT_CONTENT_FILES or read_bytes >= SNAPSHOT_CONTENT_BYTES or _left(deadline) <= 0:
                 return
+            if sig[0] == _LINK_SIZE:
+                continue  # a link's content is its target's: reading through it can block on a pipe
             if sig[0] > SNAPSHOT_CONTENT_FILE_BYTES or read_bytes + sig[0] > SNAPSHOT_CONTENT_BYTES:
                 continue
             if self.cache.get(path, sig) is not None or self.classify(path) is None:
@@ -1900,8 +1906,11 @@ class _Tracker:
             if self.classify(path) is None:
                 continue
             if prior is None:
-                if _stat_sig(path) is not None:
+                if _entry_sig(path) is not None:
                     changes.append((path, _ABSENT))
+                continue
+            if prior[0] == _LINK_SIZE:
+                changes.append((path, _Content("link", None, prior)))
                 continue
             data = self.cache.get(path, prior)
             changes.append(
@@ -2185,8 +2194,8 @@ class _Tracker:
                     del self.pending_completions[0]
                     self.lost_completions += 1
                 return
-            target = cell.id
-        self.send_activity(target, record)
+            # Sent under the lock: the cell cannot finish between being chosen here and the record going out.
+            self.send_activity(cell.id, record)
 
     def memory_change(self, record: dict[str, Any]) -> None:
         cell = self.cell

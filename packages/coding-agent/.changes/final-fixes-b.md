@@ -1,0 +1,4 @@
+- Fixed change tracking not listing symlinks that a command creates, re-points or removes in a working folder that is not a git repository; they now show as links.
+- Fixed a background command's finished record occasionally being reported after the end of the cell it belonged to.
+- Documented that files a background command changes between two cells can go unlisted when it is still running as the next cell starts and no background command ends in between.
+- Documented that the secret scan can also withhold the diff of ordinary code, such as a test fixture that looks like a credential.
