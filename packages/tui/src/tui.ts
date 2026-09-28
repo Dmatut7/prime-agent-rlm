@@ -80,6 +80,12 @@ export interface Component {
 	handleInput?(data: string): void;
 
 	/**
+	 * Optional wheel handler for a focused fullscreen overlay (-1 up, 1 down).
+	 * Returns true when the component scrolled and needs a new frame.
+	 */
+	handleWheel?(direction: -1 | 1): boolean;
+
+	/**
 	 * If true, component receives key release events (Kitty protocol).
 	 * Default is false - release events are filtered out.
 	 */
@@ -919,9 +925,9 @@ export class TUI extends Container {
 	 * string the row's component renders) in view; undefined stops tracking.
 	 * Inline mode has no viewport to move, so it is a no-op there.
 	 */
-	setFullscreenRevealMarker(marker: string | undefined): void {
+	setFullscreenRevealMarker(marker: string | undefined, endMarker?: string): void {
 		if (!this.fullscreen) return;
-		this.fullscreen.viewport.setRevealMarker(marker);
+		this.fullscreen.viewport.setRevealMarker(marker, endMarker);
 		this.requestRender();
 	}
 
@@ -1183,7 +1189,10 @@ export class TUI extends Container {
 			} else if (event && overlayFocused) {
 				this.stopSelectionAutoScroll();
 				const viewport = fullscreen.viewport;
-				if (event.button === MOUSE_BUTTON_LEFT && event.press && !event.motion) {
+				if (isWheelUp(event) || isWheelDown(event)) {
+					// A scrollable overlay (a pager) takes the wheel; others ignore it.
+					if (this.focusedComponent?.handleWheel?.(isWheelUp(event) ? -1 : 1)) this.requestRender();
+				} else if (event.button === MOUSE_BUTTON_LEFT && event.press && !event.motion) {
 					if (!viewport.beginFrameSelection(event.y - 1, event.x - 1)) {
 						viewport.beginSelection(event.y - 1, event.x - 1);
 					}
@@ -1248,6 +1257,11 @@ export class TUI extends Container {
 		const pressed = this.fullscreenPressedClick;
 		if (!pressed) return;
 		if (row !== pressed.row || col < pressed.col || col >= pressed.col + pressed.width) return;
+		// Whatever the click opens or closes renders below the clicked row: keep
+		// that row under the pointer instead of letting follow mode pull it away.
+		if (!this.isFullscreenOverlayFocused()) {
+			this.fullscreen?.viewport.holdForClick(row, pressed.region.revealBelow ?? 0);
+		}
 		pressed.region.onClick({ row: row - pressed.anchor, col: col - pressed.region.col });
 		this.requestRender();
 	}

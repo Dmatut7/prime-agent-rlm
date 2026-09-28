@@ -22,5 +22,12 @@ export interface ClickRegion {
 	width: number;
 	/** Region height in rows. */
 	height: number;
+	/**
+	 * Rows a click on this region opens directly below it (an expandable row that
+	 * is collapsed now). The fullscreen viewport keeps the clicked row where it
+	 * was and scrolls just enough to show those rows, never pushing the clicked
+	 * row off the top.
+	 */
+	revealBelow?: number;
 	onClick: (position: ClickPosition) => void;
 }

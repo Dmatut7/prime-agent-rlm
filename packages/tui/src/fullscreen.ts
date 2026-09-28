@@ -106,8 +106,12 @@ export class FullscreenViewport {
 	private following = true;
 	/** A zero-width marker every frame strips; its row is scrolled into view once per request. */
 	private revealMarker: string | undefined;
+	/** Optional second marker: the last row of the block that starts at {@link revealMarker}. */
+	private revealEndMarker: string | undefined;
 	/** Set by {@link setRevealMarker}; cleared once a frame has placed the marked row. */
 	private revealPending = false;
+	/** A click just changed the rows below the clicked transcript line; the next frame keeps that line put. */
+	private clickHold: { line: number; revealBelow: number } | undefined;
 	private prevFrame: string[] = [];
 	private prevWidth = 0;
 	private prevHeight = 0;
@@ -165,8 +169,24 @@ export class FullscreenViewport {
 		} else {
 			this.scrollTop = Math.max(0, Math.min(this.scrollTop, maxScroll));
 		}
+		const hold = this.clickHold;
+		if (hold) {
+			// The clicked row and everything above it are unchanged, so the same
+			// scroll offset keeps it on the same screen row. Only the rows the click
+			// opened below it may pull the window down, and never past the clicked row.
+			this.clickHold = undefined;
+			this.scrollTop = this.revealBelow(
+				this.scrollTop,
+				hold.line,
+				hold.line + hold.revealBelow,
+				windowHeight,
+				maxScroll,
+			);
+			this.following = this.scrollTop >= maxScroll;
+		}
 		const marker = this.revealMarker;
 		if (marker) {
+			const endMarker = this.revealEndMarker;
 			const row = transcript.findIndex((line) => line.includes(marker));
 			// One scroll per request: afterwards wheel and page keys move the window
 			// freely instead of being pulled back to the marked row every frame.
@@ -175,10 +195,19 @@ export class FullscreenViewport {
 				if (row < this.scrollTop || row >= this.scrollTop + windowHeight) {
 					// Leave a little context above the revealed row.
 					this.scrollTop = Math.max(0, Math.min(row - 2, maxScroll));
-					this.following = this.scrollTop >= maxScroll;
 				}
+				const endRow = endMarker ? transcript.findIndex((line) => line.includes(endMarker)) : -1;
+				if (endRow > row) {
+					this.scrollTop = this.revealBelow(this.scrollTop, row, endRow, windowHeight, maxScroll);
+				}
+				this.following = this.scrollTop >= maxScroll;
 			}
-			transcript = transcript.map((line) => (line.includes(marker) ? line.split(marker).join("") : line));
+			const markers = endMarker ? [marker, endMarker] : [marker];
+			transcript = transcript.map((line) =>
+				markers.some((entry) => line.includes(entry))
+					? markers.reduce((text, entry) => text.split(entry).join(""), line)
+					: line,
+			);
 		}
 		this.lastMaxScroll = maxScroll;
 		this.lastWindowHeight = windowHeight;
@@ -198,6 +227,40 @@ export class FullscreenViewport {
 			window.push("");
 		}
 		return [...headerLines, ...window, ...dockLines];
+	}
+
+	/**
+	 * The scroll offset that shows `endLine` without moving `anchorLine` above the
+	 * window's top row: the anchor wins when the block is taller than the window.
+	 */
+	private revealBelow(
+		scrollTop: number,
+		anchorLine: number,
+		endLine: number,
+		windowHeight: number,
+		maxScroll: number,
+	): number {
+		let top = scrollTop;
+		if (endLine >= top + windowHeight) {
+			top = Math.min(endLine - windowHeight + 1, anchorLine);
+		}
+		if (anchorLine < top) top = anchorLine;
+		return Math.max(0, Math.min(top, maxScroll));
+	}
+
+	/**
+	 * A click on screen row `screenRow` is about to change what renders below
+	 * it: freeze the window where it is (following pauses) so the clicked row
+	 * stays under the pointer, and let the next frame scroll just far enough to
+	 * show `revealBelow` new rows. Clicks outside the transcript window change
+	 * nothing here.
+	 */
+	holdForClick(screenRow: number, revealBelow = 0): void {
+		const line = this.transcriptLineForScreenRow(screenRow, false);
+		if (line === null) return;
+		this.scrollTop = this.following ? this.lastMaxScroll : this.scrollTop;
+		this.following = false;
+		this.clickHold = { line, revealBelow: Math.max(0, revealBelow) };
 	}
 
 	/**
@@ -846,8 +909,9 @@ export class FullscreenViewport {
 	 * that has it; the marker stays stripped from every frame until cleared
 	 * with undefined. Call again to reveal the row once more.
 	 */
-	setRevealMarker(marker: string | undefined): void {
+	setRevealMarker(marker: string | undefined, endMarker?: string): void {
 		this.revealMarker = marker;
+		this.revealEndMarker = marker === undefined ? undefined : endMarker;
 		this.revealPending = marker !== undefined;
 	}
 
