@@ -183,7 +183,7 @@ class TrackerCase(unittest.TestCase):
             "PRIME_AGENT_CODING_AGENT_DIR": self.agent_dir,
             "RLM_HARNESS_STATE_DIR": os.path.join(self.tmp, "harness-local"),
             "RLM_GLOBAL_HARNESS_STATE_DIR": os.path.join(self.tmp, "harness-global"),
-            **self.extra_env,
+            **self.kernel_env(),
         }
         self.kernel = Kernel(self.root, env, host_replies=self.host_replies())
         self.addCleanup(self.kernel.close)
@@ -191,6 +191,9 @@ class TrackerCase(unittest.TestCase):
 
     def host_replies(self) -> dict:
         return {}
+
+    def kernel_env(self) -> dict[str, str]:
+        return dict(self.extra_env)
 
     def path(self, rel: str) -> str:
         return os.path.join(self.root, rel)
@@ -558,6 +561,96 @@ class DisabledTests(TrackerCase):
         self.assertEqual([e for e in cell.events if e.get("event") == "display"], [])
         result = next(e for e in cell.events if e.get("event") == "result")
         self.assertEqual(result["text"], "('builtin_function_or_method', 'builtin_function_or_method', 'subprocess')")
+
+
+@unittest.skipUnless(HAS_GIT, "git is needed for the work-tree comparison")
+class ManyCommandsTests(TrackerCase):
+    def test_a_loop_of_commands_keeps_the_final_comparison_intact(self):
+        cell = self.kernel.run(
+            "for i in range(150):\n    await bash('true')\nawait bash('echo done > last.txt')\n"
+        )
+        self.assertEqual(cell.status, "ok")
+        commands = [record for record in cell.activities().values() if record["kind"] == "command"]
+        self.assertEqual(len(commands), 151)
+        self.assertTrue(all(record["status"] == "ok" for record in commands))
+        # Live mid-cell comparisons are rate-limited and run on the tracker's own budget, so the
+        # cell's budget is still there for the final comparison: a real diff, nothing partial.
+        self.assertEqual(cell.payloads(STATUS), [])
+        record = cell.by_rel()["last.txt"]
+        self.assertEqual(record["source"], "shell")
+        self.assertIn("+done\n", record["diff"])
+
+
+# A `git` that sleeps on `status` while a marker file exists and is the real git otherwise.
+_SLOW_GIT = """#!/bin/sh
+case " $* " in
+  *" status "*) if [ -f "$SLOW_GIT_MARKER" ]; then exec sleep 5; fi ;;
+esac
+exec "{real}" "$@"
+"""
+
+
+@unittest.skipUnless(HAS_GIT and os.name == "posix", "needs git and a POSIX shell")
+class SlowGitTests(TrackerCase):
+    """A slow `git status` (a huge repository, a cold disk) may cost a cell at most its budget."""
+
+    def kernel_env(self) -> dict[str, str]:
+        fake_bin = os.path.join(self.tmp, "fake-bin")
+        os.makedirs(fake_bin)
+        fake = os.path.join(fake_bin, "git")
+        with open(fake, "w") as handle:
+            handle.write(_SLOW_GIT.format(real=shutil.which("git")))
+        os.chmod(fake, 0o755)
+        self.marker = os.path.join(self.tmp, "slow-git")
+        return {"PATH": fake_bin + os.pathsep + os.environ.get("PATH", ""), "SLOW_GIT_MARKER": self.marker}
+
+    def slow(self, on: bool) -> None:
+        if on:
+            open(self.marker, "w").close()
+        elif os.path.exists(self.marker):
+            os.remove(self.marker)
+
+    def timed(self, code: str) -> tuple[Cell, float, float]:
+        sent = time.time()
+        cell = self.kernel.run(code)
+        return cell, sent, time.time() - sent
+
+    def test_cell_start_never_waits_for_the_snapshot_of_earlier_commands(self):
+        self.kernel.run("h = bash('sleep 4')\nh.pid")
+        self.slow(True)
+        try:
+            cell, sent, elapsed = self.timed("import time\nprint(time.time())")
+        finally:
+            self.slow(False)
+        body_started = float(cell.stdout().split()[0])
+        self.assertLess(body_started - sent, 0.25)
+        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + 0.7)
+        self.assertIn("snapshot", cell.payloads(STATUS)[0]["incomplete"])
+        self.kernel.run("h.kill()")
+
+    def test_a_command_waits_at_most_the_budget_for_its_snapshot(self):
+        self.slow(True)
+        try:
+            cell, _, elapsed = self.timed("r = await bash('echo x > y.txt')\nprint(r.exit_code)")
+        finally:
+            self.slow(False)
+        self.assertEqual(cell.stdout().strip(), "0")
+        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + 1.0)
+        self.assertIn("snapshot", cell.payloads(STATUS)[0]["incomplete"])
+        # Without a trustworthy before-state the command's edit is not guessed at.
+        self.assertNotIn("y.txt", cell.by_rel())
+        self.assertTrue(os.path.exists(self.path("y.txt")))
+
+    def test_a_slow_final_comparison_is_given_up_within_the_budget(self):
+        cell, _, elapsed = self.timed(
+            f"await bash('touch {self.marker} && echo z > z.txt')\nopen('p.txt', 'w').write('p')"
+        )
+        self.slow(False)
+        self.assertEqual(cell.status, "ok")
+        self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + 1.0)
+        self.assertIn("comparing", cell.payloads(STATUS)[0]["incomplete"])
+        # Python's own writes do not depend on git and are still listed.
+        self.assertEqual(cell.by_rel()["p.txt"]["kind"], "created")
 
 
 class BudgetTests(TrackerCase):

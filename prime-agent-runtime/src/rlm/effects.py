@@ -60,6 +60,13 @@ BUDGET_ENV_VAR = "PRIME_AGENT_CHANGE_TRACKING_BUDGET_MS"
 
 # Tracker time a cell may cost (wrapper work, snapshots, diffs) before tracking gives up for it.
 DEFAULT_CELL_BUDGET_S = 0.5
+# Time the tracker's own threads (the watcher, before-state snapshots) may spend per cell before
+# live mid-cell comparisons stop. They never block the cell, so they do not count against its budget.
+BACKGROUND_BUDGET_S = 1.0
+# At most one mid-cell command comparison per interval; the final one at the cell's end always runs.
+LIVE_SHELL_CHECK_INTERVAL_S = 1.0
+# Longest a watcher tick may hold the cell's work lock while publishing live records.
+WATCH_TICK_BUDGET_S = 0.1
 # A file whose size and mtime held still across one interval is reported live.
 WATCH_INTERVAL_S = 0.15
 MAX_FILES_PER_CELL = 400
@@ -321,7 +328,11 @@ class _Cell:
         self.repos: dict[str, _RepoState] = {}
         self.scan: tuple[str, dict[str, tuple[int, int]]] | None = None
         self.roots_seen: set[str] = set()
+        self.snapshots: list[_SnapshotJob] = []
         self.shell_check_pending = False
+        self.last_shell_check = 0.0
+        # Tracker-thread time, see BACKGROUND_BUDGET_S.
+        self.background_spent = 0.0
 
     def remaining(self) -> float:
         return self.budget_s - self.spent
@@ -331,9 +342,47 @@ class _Cell:
         if self.spent > self.budget_s and self.gave_up is None:
             self.gave_up = f"time budget of {int(self.budget_s * 1000)} ms used up"
 
+    def charge_background(self, seconds: float) -> None:
+        self.background_spent += seconds
+
+    def background_left(self) -> bool:
+        return self.background_spent < BACKGROUND_BUDGET_S
+
     def note_incomplete(self, reason: str) -> None:
         if self.incomplete is None:
             self.incomplete = reason
+
+
+class _OutOfTime(Exception):
+    """A tracker step ran past its deadline; the caller records why its list is partial."""
+
+
+class _SnapshotJob:
+    """One before-state snapshot (git status or mtime scan of some roots) on a worker thread.
+
+    Its results land in the cell only if nobody gave up waiting for it: a snapshot that finishes
+    after the command it was meant to precede has started would describe the wrong moment.
+    """
+
+    def __init__(self, directories: list[str]) -> None:
+        self.directories = directories
+        self.done = threading.Event()
+        self.abandoned = False
+        self.committed = False
+
+
+_SNAPSHOT_LATE = (
+    "the git snapshot before a command did not finish within the tracking budget, "
+    "so changes made by commands in this cell are not listed"
+)
+_COMPARE_LATE = (
+    "comparing the files commands changed took longer than the tracking budget, "
+    "so changes made by commands in this cell are not listed"
+)
+
+
+def _left(deadline: float) -> float:
+    return deadline - time.perf_counter()
 
 
 def _git_env() -> dict[str, str]:
@@ -346,9 +395,12 @@ def _git_env() -> dict[str, str]:
 
 
 def _run_git(root: str, args: list[str], timeout: float, stdin: bytes | None = None) -> bytes | None:
-    """stdout of one git command, or None on any failure. Nothing reaches the kernel's own fds."""
+    """stdout of one git command, or None when it failed; `_OutOfTime` when it ran past `timeout`.
+
+    Nothing reaches the kernel's own fds.
+    """
     if timeout <= 0:
-        return None
+        raise _OutOfTime()
     try:
         proc = subprocess.run(
             ["git", "-C", root, *args],
@@ -359,6 +411,8 @@ def _run_git(root: str, args: list[str], timeout: float, stdin: bytes | None = N
             timeout=timeout,
             env=_git_env(),
         )
+    except subprocess.TimeoutExpired:
+        raise _OutOfTime() from None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0:
@@ -570,8 +624,19 @@ class _Tracker:
         self.skip_files: frozenset[str] = frozenset()
         self.skip_roots: tuple[str, ...] = ()
         self.cwd_git_root: str | None = None
-        self.cwd_git_known = False
+        # Resolved once, off every cell's path: a slow or hung git must not stall a write wrapper.
+        self._cwd_git_resolved = threading.Event()
         self._refresh_paths()
+        threading.Thread(target=self._resolve_cwd_git_root, daemon=True, name="rlm-change-git-root").start()
+
+    def _resolve_cwd_git_root(self) -> None:
+        self.local.busy = True
+        try:
+            self.cwd_git_root = self.git_root(self.cwd, GIT_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 - unknown stays "not a work tree"
+            self.cwd_git_root = None
+        finally:
+            self._cwd_git_resolved.set()
 
     # ------------------------------------------------------------------ paths
 
@@ -624,23 +689,37 @@ class _Tracker:
             self._dir_cache[directory] = real_dir
         return os.path.join(real_dir, name)
 
-    def _cwd_in_git(self) -> bool:
-        if not self.cwd_git_known:
-            self.cwd_git_known = True
-            self.cwd_git_root = self.git_root(self.cwd)
+    def _cwd_git_state(self) -> bool | None:
+        """Whether the session cwd is in a git work tree; None while the one-time lookup still runs."""
+        if not self._cwd_git_resolved.is_set():
+            return None
         return self.cwd_git_root is not None
 
     def classify(self, path: str) -> _PathInfo | None:
         cached = self._info_cache.get(path, False)
         if cached is not False:
             return cached  # type: ignore[return-value]
-        info = self._classify(path)
-        if len(self._info_cache) > _PATH_CACHE_LIMIT:
-            self._info_cache.clear()
-        self._info_cache[path] = info
+        info, cacheable = self._classify(path)
+        if cacheable:
+            if len(self._info_cache) > _PATH_CACHE_LIMIT:
+                self._info_cache.clear()
+            self._info_cache[path] = info
         return info
 
-    def _classify(self, path: str) -> _PathInfo | None:
+    def _classify(self, path: str) -> tuple[_PathInfo | None, bool]:
+        """The path's scope, and whether that answer may be cached."""
+        info = self._classify_uncached(path)
+        if info is not None and info.scope == "project" and info.rel is not None:
+            if any(part in _BUILD_DIR_NAMES for part in info.rel.split(os.sep)[:-1]):
+                in_git = self._cwd_git_state()
+                if in_git is None:
+                    # Unknown yet: report it (a work tree's ignore rules filter it later) and ask again next time.
+                    return info, False
+                if not in_git:
+                    return None, True
+        return info, True
+
+    def _classify_uncached(self, path: str) -> _PathInfo | None:
         directory, name = os.path.split(path)
         if name in _SKIP_FILE_NAMES or name.endswith(_SKIP_SUFFIXES):
             return None
@@ -658,8 +737,6 @@ class _Tracker:
             return None
         if _under(path, self.cwd):
             rel = os.path.relpath(path, self.cwd)
-            if not self._cwd_in_git() and any(part in _BUILD_DIR_NAMES for part in rel.split(os.sep)[:-1]):
-                return None
             if name in RULES_FILE_NAMES:
                 return _PathInfo("memory", rel, "project", rel)
             return _PathInfo("project", rel, None, rel)
@@ -685,7 +762,8 @@ class _Tracker:
 
     # -------------------------------------------------------------------- git
 
-    def git_root(self, directory: str) -> str | None:
+    def git_root(self, directory: str, timeout: float) -> str | None:
+        """The work tree holding `directory`, or None; `_OutOfTime` (never cached) when git is too slow."""
         if directory in self._git_roots:
             return self._git_roots[directory]
         root: str | None = None
@@ -694,7 +772,7 @@ class _Tracker:
 
             self._git_available = shutil.which("git") is not None
         if self._git_available:
-            out = _run_git(directory, ["rev-parse", "--show-toplevel"], GIT_TIMEOUT_S)
+            out = _run_git(directory, ["rev-parse", "--show-toplevel"], min(GIT_TIMEOUT_S, timeout))
             if out:
                 text = os.fsdecode(out.strip())
                 root = os.path.realpath(text) if text else None
@@ -703,7 +781,7 @@ class _Tracker:
         self._git_roots[directory] = root
         return root
 
-    def repo_state(self, cell: _Cell, root: str, fill_cache: bool) -> _RepoState | None:
+    def repo_state(self, root: str, fill_cache: bool, deadline: float) -> _RepoState | None:
         out = _run_git(
             root,
             [
@@ -715,7 +793,7 @@ class _Tracker:
                 "--no-renames",
                 "--ignore-submodules=all",
             ],
-            min(GIT_TIMEOUT_S, cell.remaining()),
+            min(GIT_TIMEOUT_S, _left(deadline)),
         )
         if out is None:
             return None
@@ -726,7 +804,9 @@ class _Tracker:
         stats: dict[str, tuple[int, int] | None] = {}
         read_files = 0
         read_bytes = 0
-        for path in entries:
+        for index, path in enumerate(entries):
+            if index % 64 == 63 and _left(deadline) <= 0:
+                raise _OutOfTime()
             sig = _stat_sig(path)
             stats[path] = sig
             if not fill_cache or sig is None or sig[0] > SNAPSHOT_CONTENT_FILE_BYTES:
@@ -744,9 +824,9 @@ class _Tracker:
                 self.cache.put(path, sig, data)
         return _RepoState(root, oid, entries, stats)
 
-    def filter_ignored(self, cell: _Cell, recs: list[_FileRec]) -> None:
+    def filter_ignored(self, recs: list[_FileRec], deadline: float) -> None:
         """Mark records for files the repository ignores; one `git check-ignore` per batch."""
-        if not self._cwd_in_git() or self.cwd_git_root is None:
+        if not self._cwd_git_state() or self.cwd_git_root is None:
             return
         root = self.cwd_git_root
         pending = [
@@ -762,7 +842,7 @@ class _Tracker:
                     input=payload,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
-                    timeout=max(0.05, min(GIT_TIMEOUT_S, cell.remaining())),
+                    timeout=max(0.05, min(GIT_TIMEOUT_S, _left(deadline))),
                     env=_git_env(),
                 )
                 # Exit 1 means "nothing ignored"; any other failure reports everything.
@@ -781,14 +861,14 @@ class _Tracker:
             if rec.source != "shell" and self._ignore_cache.get(rec.path):
                 rec.ignored = True
 
-    def blobs(self, cell: _Cell, root: str, specs: list[str]) -> dict[str, bytes | None]:
+    def blobs(self, root: str, specs: list[str], deadline: float) -> dict[str, bytes | None]:
         """Content of `<oid>:<path>` specs: bytes, `_MISSING` when the commit has no such file,
         None when it could not be fetched (oversized, git failed)."""
         found: dict[str, bytes | None] = {spec: None for spec in specs}
         if not specs:
             return found
         request = b"".join(os.fsencode(spec) + b"\n" for spec in specs)
-        checked = _run_git(root, ["cat-file", "--batch-check"], min(GIT_TIMEOUT_S, cell.remaining()), request)
+        checked = _run_git(root, ["cat-file", "--batch-check"], min(GIT_TIMEOUT_S, _left(deadline)), request)
         if checked is None:
             return found
         wanted: list[str] = []
@@ -806,7 +886,7 @@ class _Tracker:
         if not wanted:
             return found
         request = b"".join(os.fsencode(spec) + b"\n" for spec in wanted)
-        out = _run_git(root, ["cat-file", "--batch"], min(GIT_TIMEOUT_S, cell.remaining()), request)
+        out = _run_git(root, ["cat-file", "--batch"], min(GIT_TIMEOUT_S, _left(deadline)), request)
         if out is None:
             return found
         offset = 0
@@ -823,11 +903,13 @@ class _Tracker:
             offset += size + 1
         return found
 
-    def scan(self, root: str) -> dict[str, tuple[int, int]] | None:
-        """(size, mtime_ns) per file under root, None past the file cap."""
+    def scan(self, root: str, deadline: float) -> dict[str, tuple[int, int]] | None:
+        """(size, mtime_ns) per file under root, None past the file cap; `_OutOfTime` past the deadline."""
         found: dict[str, tuple[int, int]] = {}
         stack = [root]
         while stack:
+            if _left(deadline) <= 0:
+                raise _OutOfTime()
             current = stack.pop()
             try:
                 with os.scandir(current) as entries:
@@ -875,8 +957,10 @@ class _Tracker:
             except Exception:  # noqa: BLE001
                 live = 0
         if live > 0:
-            # Commands from earlier cells may still be writing; compare from this cell's start.
-            self.guarded(cell, lambda: self.snapshot_roots(cell, os.getcwd()))
+            # Commands from earlier cells may still be writing; compare from this cell's start. The
+            # snapshot runs on a worker and the cell starts at once; a process the cell starts later
+            # waits for it, bounded by the budget (see request_snapshot).
+            self.request_snapshot(cell, os.getcwd(), wait=False)
 
     def discard_cell(self, cell_id: str) -> None:
         with self.lock:
@@ -892,20 +976,29 @@ class _Tracker:
         interrupted = False
         self.local.busy = True
         started = time.perf_counter()
+        deadline = started + max(0.0, cell.remaining())
         try:
+            # Closing first: a watcher tick in progress stops at its next check instead of holding
+            # the work lock for a whole comparison.
+            with self.lock:
+                cell.closing = True
             with cell.work_lock:
-                with self.lock:
-                    cell.closing = True
                 try:
+                    for job in list(cell.snapshots):
+                        self._await_snapshot(cell, job, deadline)
                     if cell.gave_up is None and (cell.repos or cell.scan is not None):
-                        self.shell_compare(cell)
-                    self.publish_all(cell, final=True)
+                        self._final_shell_compare(cell, deadline)
+                    if cell.files and not self._cwd_git_resolved.is_set():
+                        # Ignore rules and the build-output rule need it; normally it resolved long ago.
+                        self._cwd_git_resolved.wait(max(0.0, _left(deadline)))
+                    self.publish_all(cell, final=True, deadline=deadline)
                 except KeyboardInterrupt:
                     interrupted = True
                     cell.note_incomplete("interrupted while collecting changes")
                 except Exception:  # noqa: BLE001 - tracking must never fail the cell
                     cell.note_incomplete("internal error while collecting changes")
-                reason = cell.gave_up or cell.incomplete
+                # The specific cause first (a slow git, too many files), then the budget it cost.
+                reason = "; ".join(part for part in (cell.incomplete, cell.gave_up) if part) or None
                 if reason is not None:
                     self.send(cell.id, {TRACKING_STATUS_MIME: {"incomplete": reason}})
         except KeyboardInterrupt:
@@ -926,6 +1019,34 @@ class _Tracker:
         if getattr(self.local, "busy", False) or _untracked.get():
             return None
         return cell
+
+    def _final_shell_compare(self, cell: _Cell, deadline: float) -> None:
+        """The end-of-cell comparison, computed on a worker so a slow git cannot hold the event
+        loop past the budget; its result is applied here, on the cell's thread."""
+        outcome: dict[str, Any] = {}
+        done = threading.Event()
+
+        def work() -> None:
+            self.local.busy = True
+            try:
+                outcome["changes"] = self.shell_changes(cell, deadline)
+            except _OutOfTime:
+                outcome["late"] = True
+            except Exception:  # noqa: BLE001
+                outcome["failed"] = True
+            finally:
+                done.set()
+
+        threading.Thread(target=work, daemon=True, name="rlm-change-compare").start()
+        if not done.wait(max(0.0, _left(deadline))):
+            cell.note_incomplete(_COMPARE_LATE)
+            return
+        if outcome.get("late"):
+            cell.note_incomplete(_COMPARE_LATE)
+        elif outcome.get("failed"):
+            cell.note_incomplete("internal error while comparing command changes")
+        else:
+            self.apply_shell_changes(cell, outcome["changes"])
 
     def guarded(self, cell: _Cell, work: Callable[[], Any]) -> Any:
         """Run tracker work on the calling thread with the budget charged and failures contained."""
@@ -1143,38 +1264,94 @@ class _Tracker:
 
     # ------------------------------------------------------------- shell side
 
-    def snapshot_roots(self, cell: _Cell, process_cwd: str) -> None:
-        """The before-state of every root a child process may touch, taken once per root per cell."""
-        for directory in (self.cwd, os.path.realpath(process_cwd)):
-            if directory in cell.roots_seen:
-                continue
-            if len(cell.roots_seen) >= MAX_ROOTS_PER_CELL:
-                return
-            cell.roots_seen.add(directory)
-            root = self.git_root(directory)
-            if root is not None:
-                if root in cell.repos:
-                    continue
-                state = self.repo_state(cell, root, fill_cache=True)
-                if state is None:
-                    cell.note_incomplete("git status failed; changes made by commands may be missing")
-                    continue
-                cell.repos[root] = state
-            elif directory == self.cwd and cell.scan is None:
-                found = self.scan(directory)
-                if found is None:
-                    cell.note_incomplete("the working directory is too large to scan for command changes")
-                    continue
-                cell.scan = (directory, found)
-                self._cache_recent(found)
+    def request_snapshot(self, cell: _Cell, process_cwd: str, wait: bool) -> None:
+        """Take the before-state of every root a new process may touch, once per root per cell.
 
-    def _cache_recent(self, found: dict[str, tuple[int, int]]) -> None:
+        The work always runs on a worker thread. `wait=True` (a process is about to start) blocks
+        until the snapshots covering it are taken, at most for the cell's remaining budget; past
+        that the snapshot is abandoned and the cell says its command changes are not listed, so a
+        slow git in a large repository costs at most the budget and never an unbounded stall.
+        """
+        with self.lock:
+            directories: list[str] = []
+            for directory in (self.cwd, os.path.realpath(process_cwd)):
+                if directory in cell.roots_seen or directory in directories:
+                    continue
+                if len(cell.roots_seen) + len(directories) >= MAX_ROOTS_PER_CELL:
+                    break
+                directories.append(directory)
+            cell.roots_seen.update(directories)
+            if directories:
+                job = _SnapshotJob(directories)
+                cell.snapshots.append(job)
+                threading.Thread(
+                    target=self._run_snapshot, args=(cell, job), daemon=True, name="rlm-change-snapshot"
+                ).start()
+            pending = [job for job in cell.snapshots if not job.done.is_set()]
+        if wait:
+            deadline = time.perf_counter() + max(0.0, cell.remaining())
+            for job in pending:
+                self._await_snapshot(cell, job, deadline)
+
+    def _await_snapshot(self, cell: _Cell, job: _SnapshotJob, deadline: float) -> None:
+        if job.done.wait(max(0.0, _left(deadline))):
+            return
+        with self.lock:
+            if job.committed:
+                return
+            job.abandoned = True
+        cell.note_incomplete(_SNAPSHOT_LATE)
+
+    def _run_snapshot(self, cell: _Cell, job: _SnapshotJob) -> None:
+        self.local.busy = True
+        started = time.perf_counter()
+        # A snapshot gets the cell's budget, like any other tracker step that stands in its way.
+        deadline = started + cell.budget_s
+        repos: dict[str, _RepoState] = {}
+        scan: tuple[str, dict[str, tuple[int, int]]] | None = None
+        notes: list[str] = []
+        try:
+            for directory in job.directories:
+                root = self.git_root(directory, _left(deadline))
+                if root is not None:
+                    if root in repos or root in cell.repos:
+                        continue
+                    state = self.repo_state(root, True, deadline)
+                    if state is None:
+                        notes.append("git status failed; changes made by commands may be missing")
+                        continue
+                    repos[root] = state
+                elif directory == self.cwd and cell.scan is None:
+                    found = self.scan(directory, deadline)
+                    if found is None:
+                        notes.append("the working directory is too large to scan for command changes")
+                        continue
+                    self._cache_recent(found, deadline)
+                    scan = (directory, found)
+        except _OutOfTime:
+            notes.append(_SNAPSHOT_LATE)
+        except Exception:  # noqa: BLE001
+            notes.append("internal error while taking the command snapshot")
+        finally:
+            with self.lock:
+                if not job.abandoned:
+                    job.committed = True
+                    for root, state in repos.items():
+                        cell.repos.setdefault(root, state)
+                    if scan is not None and cell.scan is None:
+                        cell.scan = scan
+                    for note in notes:
+                        cell.note_incomplete(note)
+            cell.charge_background(time.perf_counter() - started)
+            job.done.set()
+
+    def _cache_recent(self, found: dict[str, tuple[int, int]], deadline: float) -> None:
         """Without git there is no committed copy to diff against, so keep the most recently
         touched small files - the ones a command is most likely to edit next."""
         read_files = 0
         read_bytes = 0
         for path, sig in sorted(found.items(), key=lambda item: item[1][1], reverse=True):
-            if read_files >= SNAPSHOT_CONTENT_FILES or read_bytes >= SNAPSHOT_CONTENT_BYTES:
+            if read_files >= SNAPSHOT_CONTENT_FILES or read_bytes >= SNAPSHOT_CONTENT_BYTES or _left(deadline) <= 0:
                 return
             if sig[0] > SNAPSHOT_CONTENT_FILE_BYTES or read_bytes + sig[0] > SNAPSHOT_CONTENT_BYTES:
                 continue
@@ -1194,26 +1371,34 @@ class _Tracker:
             cell.shell_check_pending = True
             self._wake_watcher()
 
-    def shell_compare(self, cell: _Cell) -> None:
-        """Turn what changed since the before-snapshots into shell records."""
+    def shell_changes(self, cell: _Cell, deadline: float) -> list[tuple[str, _Content]]:
+        """What changed since the before-snapshots, as (path, baseline) pairs; `_OutOfTime` past the deadline.
+
+        Pure computation, safe on a worker thread: `apply_shell_changes` turns it into records.
+        """
+        changes: list[tuple[str, _Content]] = []
         for before in list(cell.repos.values()):
-            self._compare_repo(cell, before)
+            self._compare_repo(cell, before, deadline, changes)
         if cell.scan is not None:
-            self._compare_scan(cell, *cell.scan)
+            self._compare_scan(cell, cell.scan[0], cell.scan[1], deadline, changes)
+        return changes
 
-    def _add_shell_rec(self, cell: _Cell, path: str, baseline: _Content) -> None:
-        with self.lock:
-            rec = cell.files.get(path)
-            if rec is not None:
-                rec.dirty = True
-                return
-            if len(cell.files) >= MAX_FILES_PER_CELL:
-                cell.note_incomplete(f"more than {MAX_FILES_PER_CELL} files changed; the rest are not listed")
-                return
-            cell.files[path] = _FileRec(path, baseline, "shell")
+    def apply_shell_changes(self, cell: _Cell, changes: list[tuple[str, _Content]]) -> None:
+        for path, baseline in changes:
+            with self.lock:
+                rec = cell.files.get(path)
+                if rec is not None:
+                    rec.dirty = True
+                    continue
+                if len(cell.files) >= MAX_FILES_PER_CELL:
+                    cell.note_incomplete(f"more than {MAX_FILES_PER_CELL} files changed; the rest are not listed")
+                    return
+                cell.files[path] = _FileRec(path, baseline, "shell")
 
-    def _compare_repo(self, cell: _Cell, before: _RepoState) -> None:
-        after = self.repo_state(cell, before.root, fill_cache=False)
+    def _compare_repo(
+        self, cell: _Cell, before: _RepoState, deadline: float, changes: list[tuple[str, _Content]]
+    ) -> None:
+        after = self.repo_state(before.root, False, deadline)
         if after is None:
             cell.note_incomplete("git status failed; changes made by commands may be missing")
             return
@@ -1222,7 +1407,7 @@ class _Tracker:
             out = _run_git(
                 before.root,
                 ["diff", "--name-only", "-z", "--no-renames", before.oid, after.oid],
-                min(GIT_TIMEOUT_S, cell.remaining()),
+                min(GIT_TIMEOUT_S, _left(deadline)),
             )
             if out is None:
                 cell.note_incomplete("git diff failed; files changed by a branch switch may be missing")
@@ -1268,7 +1453,7 @@ class _Tracker:
             if len(need_blob) > MAX_GIT_BLOBS:
                 cell.note_incomplete("too many files changed by commands to diff them all")
             specs = [f"{before.oid}:{os.path.relpath(path, before.root)}" for path in wanted]
-            fetched = self.blobs(cell, before.root, specs)
+            fetched = self.blobs(before.root, specs, deadline)
             blobs = {path: fetched.get(spec) for path, spec in zip(wanted, specs)}
         for path, baseline in pending:
             if baseline is None:
@@ -1277,10 +1462,17 @@ class _Tracker:
                     baseline = _ABSENT
                 else:
                     baseline = _Content("bytes", data) if data is not None else _UNKNOWN
-            self._add_shell_rec(cell, path, baseline)
+            changes.append((path, baseline))
 
-    def _compare_scan(self, cell: _Cell, root: str, before: dict[str, tuple[int, int]]) -> None:
-        after = self.scan(root)
+    def _compare_scan(
+        self,
+        cell: _Cell,
+        root: str,
+        before: dict[str, tuple[int, int]],
+        deadline: float,
+        changes: list[tuple[str, _Content]],
+    ) -> None:
+        after = self.scan(root, deadline)
         if after is None:
             cell.note_incomplete("the working directory is too large to scan for command changes")
             return
@@ -1294,13 +1486,14 @@ class _Tracker:
             if self.classify(path) is None:
                 continue
             if prior is None:
-                self._add_shell_rec(cell, path, _ABSENT)
+                changes.append((path, _ABSENT))
                 continue
             data = self.cache.get(path, prior)
-            self._add_shell_rec(
-                cell,
-                path,
-                _Content("bytes", data, prior) if data is not None else _Content("unknown", None, prior, "no_baseline"),
+            changes.append(
+                (
+                    path,
+                    _Content("bytes", data, prior) if data is not None else _Content("unknown", None, prior, "no_baseline"),
+                )
             )
 
     # --------------------------------------------------------------- records
@@ -1428,14 +1621,20 @@ class _Tracker:
         self.send(cell.id, {FILE_CHANGE_MIME: change})
         rec.emitted_key = key
 
-    def publish_all(self, cell: _Cell, final: bool) -> None:
+    def publish_all(self, cell: _Cell, final: bool, deadline: float) -> None:
         with self.lock:
             recs = list(cell.files.values())
         if not recs:
             return
         if cell.gave_up is None:
-            self.filter_ignored(cell, recs)
+            try:
+                self.filter_ignored(recs, deadline)
+            except _OutOfTime:
+                pass
         for rec in recs:
+            if cell.gave_up is None and _left(deadline) <= 0:
+                # Past the budget the remaining records are still sent, from a stat only (no diff).
+                cell.gave_up = f"time budget of {int(cell.budget_s * 1000)} ms used up"
             if rec.dirty or rec.published_sig == "unset" or _stat_sig(rec.path) != rec.published_sig:
                 self.publish(cell, rec)
         if final:
@@ -1486,20 +1685,20 @@ class _Tracker:
                 if cell is None:
                     self.wake.clear()
                     continue
-                with cell.work_lock:
-                    if not cell.closing and cell.gave_up is None:
-                        started = time.perf_counter()
-                        try:
-                            self._tick(cell)
-                        except Exception:  # noqa: BLE001 - a live report is best effort
-                            pass
-                        finally:
-                            cell.charge(time.perf_counter() - started)
+                if not cell.closing and cell.gave_up is None and cell.background_left():
+                    started = time.perf_counter()
+                    try:
+                        self._tick(cell)
+                    except Exception:  # noqa: BLE001 - a live report is best effort
+                        pass
+                    finally:
+                        cell.charge_background(time.perf_counter() - started)
                 with self.lock:
                     if (
                         self.cell is not cell
                         or cell.closing
                         or cell.gave_up is not None
+                        or not cell.background_left()
                         or not (cell.shell_check_pending or any(rec.dirty for rec in cell.files.values()))
                     ):
                         self.wake.clear()
@@ -1507,26 +1706,44 @@ class _Tracker:
                 return
 
     def _tick(self, cell: _Cell) -> None:
-        if cell.shell_check_pending:
+        now = time.perf_counter()
+        changes: list[tuple[str, _Content]] | None = None
+        if cell.shell_check_pending and now - cell.last_shell_check >= LIVE_SHELL_CHECK_INTERVAL_S:
+            # Computed without the work lock: the cell's end must never wait for a live git status.
             cell.shell_check_pending = False
-            self.shell_compare(cell)
-        with self.lock:
-            recs = [rec for rec in cell.files.values() if rec.dirty]
-        ready: list[_FileRec] = []
-        for rec in recs:
-            sig = _stat_sig(rec.path)
-            if rec.sig != "unset" and sig == rec.sig:
-                ready.append(rec)
-            else:
-                rec.sig = sig
-        if not ready:
-            return
-        self.filter_ignored(cell, ready)
-        for rec in ready:
+            cell.last_shell_check = now
+            try:
+                changes = self.shell_changes(cell, now + cell.budget_s)
+            except _OutOfTime:
+                changes = None  # live only; the final comparison runs again at the cell's end
+        with cell.work_lock:
+            if cell.closing:
+                return
+            if changes:
+                self.apply_shell_changes(cell, changes)
+            deadline = time.perf_counter() + WATCH_TICK_BUDGET_S
             with self.lock:
-                if cell.closing or cell.files.get(rec.path) is not rec:
-                    continue
-            self.publish(cell, rec)
+                recs = [rec for rec in cell.files.values() if rec.dirty]
+            ready: list[_FileRec] = []
+            for rec in recs:
+                sig = _stat_sig(rec.path)
+                if rec.sig != "unset" and sig == rec.sig:
+                    ready.append(rec)
+                else:
+                    rec.sig = sig
+            if not ready:
+                return
+            try:
+                self.filter_ignored(ready, deadline)
+            except _OutOfTime:
+                return
+            for rec in ready:
+                if _left(deadline) <= 0:
+                    return  # the rest stay dirty for the next tick
+                with self.lock:
+                    if cell.closing or cell.files.get(rec.path) is not rec:
+                        continue
+                self.publish(cell, rec)
 
     # ------------------------------------------------------------ activities
 
@@ -1685,7 +1902,7 @@ def _spawn_hook() -> None:
         return
     cell = tracker.active()
     if cell is not None:
-        tracker.guarded(cell, lambda: tracker.snapshot_roots(cell, os.getcwd()))
+        tracker.guarded(cell, lambda: tracker.request_snapshot(cell, os.getcwd(), wait=True))
 
 
 def _make_spawn(real: Callable[..., Any]) -> Callable[..., Any]:
