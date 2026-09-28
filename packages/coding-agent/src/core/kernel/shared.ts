@@ -227,6 +227,56 @@ export const AGENT_MESSAGE_DISPLAY_MIME = "application/vnd.prime-agent.agent-mes
  */
 export const MAX_ATTACHMENT_DATA_CHARS = 10_000_000;
 
+/** MIME tag the kernel emits a {@link KernelFileChange} under when a cell creates, modifies, renames, or deletes a file. */
+export const FILE_CHANGE_DISPLAY_MIME = "application/vnd.prime-agent.file-change+json";
+
+/** MIME tag the kernel emits a {@link KernelMemoryChange} under when harness memory, skills, notes, or rules files change. */
+export const MEMORY_CHANGE_DISPLAY_MIME = "application/vnd.prime-agent.memory-change+json";
+
+/**
+ * One file effect of a cell, whatever wrote it (Python file APIs, a `bash()` child, the edit skill).
+ * Display-only: the TUI renders it, and nothing forwards it into model context or compaction.
+ */
+export interface KernelFileChange {
+	/** Absolute path after the change. */
+	path: string;
+	/** Path relative to the session cwd when the file is inside it. */
+	relPath?: string;
+	kind: "created" | "modified" | "deleted" | "renamed";
+	/** Previous absolute path, for renames. */
+	oldPath?: string;
+	/** `project`: inside the session cwd; `scratch`: temp or outside paths; `memory`: rules and notes files the harness reads. */
+	scope: "project" | "scratch" | "memory";
+	added: number;
+	removed: number;
+	/** Unified diff, capped by the kernel; absent for binary or oversized files. */
+	diff?: string;
+	/** True when `diff` was cut at the cap. */
+	diffTruncated?: boolean;
+	binary?: boolean;
+	/** How the change was observed. */
+	source: "python" | "shell" | "edit";
+	/** Epoch ms when the kernel observed the change. */
+	at: number;
+}
+
+/** One change to the continual harness layer or a rules file. Display-only, like {@link KernelFileChange}. */
+export interface KernelMemoryChange {
+	op: "created" | "updated" | "deleted";
+	kind: "memory" | "skill" | "subagent" | "prompt_note" | "rules_file";
+	/** `session`: local to this session; `global`: shared across sessions; `project`: a project rules file. */
+	scope: "session" | "global" | "project";
+	id?: string;
+	title: string;
+	/** Title before a rename. */
+	previousTitle?: string;
+	/** Content before and after, each capped by the kernel. */
+	before?: string;
+	after?: string;
+	/** Epoch ms when the kernel observed the change. */
+	at: number;
+}
+
 /** One file edit, captured from a {@link DIFF_DISPLAY_MIME} display payload. */
 export interface KernelDiffDisplay {
 	path: string;

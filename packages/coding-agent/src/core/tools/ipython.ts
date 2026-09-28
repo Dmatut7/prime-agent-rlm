@@ -16,7 +16,9 @@ import {
 	type KernelClient,
 	type KernelDeathCause,
 	type KernelDiffDisplay,
+	type KernelFileChange,
 	type KernelLateHostReply,
+	type KernelMemoryChange,
 	KernelRestartLedger,
 	type KernelRestartPolicy,
 	type KernelSentAgentMessage,
@@ -519,6 +521,10 @@ export interface IpythonToolDetails {
 	backgroundOutput?: string;
 	/** Diffs streamed from file edits, rendered by the cell view. */
 	diffs?: KernelDiffDisplay[];
+	/** Every file effect of the cell, in observation order. Display-only: never sent to the model or read by compaction. */
+	fileChanges?: KernelFileChange[];
+	/** Harness memory, skill, note, and rules-file changes made by the cell. Display-only, like `fileChanges`. */
+	memoryChanges?: KernelMemoryChange[];
 	/** Media attachments loaded into context (e.g. by the attach-image skill). */
 	attachments?: KernelAttachment[];
 	/** Agent messages sent from this cell. */
