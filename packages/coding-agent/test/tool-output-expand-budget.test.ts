@@ -19,6 +19,7 @@ import {
 	EXPANDED_TOOL_OUTPUT_MAX_CHARS,
 	EXPANDED_TOOL_OUTPUT_MAX_LINES,
 	expandedOutputWindow,
+	resetBudgetTruncatableTracking,
 	setToolOutputFull,
 	toolOutputFull,
 } from "../src/modes/interactive/components/tool-output-budget.js";
@@ -66,6 +67,7 @@ describe("expanded tool output budget", () => {
 
 	afterEach(() => {
 		setToolOutputFull(false);
+		resetBudgetTruncatableTracking();
 		vi.useRealTimers();
 		vi.restoreAllMocks();
 		initTheme("dark");
@@ -197,8 +199,14 @@ describe("expanded tool output budget", () => {
 	test("the full-output toggle flips the budget and asks for a frame without piling status rows", () => {
 		const { tui, requestRender } = createFakeTui();
 		const chatContainer = new Container();
-		chatContainer.addChild(bashComponent("toggle", bodyLines(420).join("\n"), tui));
+		const component = bashComponent("toggle", bodyLines(420).join("\n"), tui);
+		chatContainer.addChild(component);
+		// The budget only knows a block is over it once that block has rendered
+		// expanded at least once - exactly what ctrl+o does before this key runs.
+		component.setExpanded(true);
+		component.render(WIDTH);
 		const showStatus = vi.fn();
+		const showToast = vi.fn();
 		const proto = InteractiveMode.prototype as unknown as {
 			applyChatExpansion(this: any): void;
 			expansionStateFor(this: any, component: unknown): boolean;
@@ -213,6 +221,7 @@ describe("expanded tool output budget", () => {
 			builtInHeader: undefined,
 			ui: { isFullscreen: () => false, requestRender, requestRenderPreservingViewport: requestRender },
 			showStatus,
+			showToast,
 		};
 		mode.expansionStateFor = (component: unknown) => proto.expansionStateFor.call(mode, component);
 		mode.applyChatExpansion = () => proto.applyChatExpansion.call(mode);
@@ -225,5 +234,6 @@ describe("expanded tool output budget", () => {
 		proto.toggleToolOutputFull.call(mode);
 		expect(toolOutputFull()).toBe(false);
 		expect(showStatus).not.toHaveBeenCalled();
+		expect(showToast).not.toHaveBeenCalled();
 	});
 });

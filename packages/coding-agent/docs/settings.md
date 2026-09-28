@@ -86,6 +86,7 @@ These are the persisted defaults for the same limits as the `--autonomous-*` CLI
 | `editorPaddingX` | number | `0` | Horizontal padding for input editor (0-3) |
 | `autocompleteMaxVisible` | number | `5` | Max visible items in autocomplete dropdown (3-20) |
 | `showHardwareCursor` | boolean | `false` | Show terminal cursor. `PI_HARDWARE_CURSOR` (`1`/`true`/`yes`, `0`/`false`/`no`) overrides it, and a conflict between the two is reported as a warning |
+| `ui.processMode` | string | `"quiet"` | How a turn's steps and thinking render: `"quiet"` folds them into one box per turn (Ctrl+O opens/closes it, Ctrl+T its thinking). `"legacy"` shows each tool call, thought and edit as its own line in the chat, with no box. Any other value falls back to `"quiet"` |
 | `ui.timelineOpenWhileWorking` | boolean | `true` | Keep a turn's box open while the AI works, so each step shows as it happens. `false` keeps the box to its one-line header until you open it |
 | `ui.timelineAutoFold` | boolean | `true` | Fold a turn's box back to its summary line when the turn ends. A box you opened or closed yourself keeps your choice |
 | `ui.reduceMotion` | boolean | `false` | Turn off the box's fades, slides, folds and the waiting shimmer (spinners keep turning) |
