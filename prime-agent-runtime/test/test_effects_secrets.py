@@ -259,5 +259,76 @@ class SubagentSecretNameTests(te.TrackerCase):
         self.assertEqual(_anywhere(cell, _OLD_KEY), [])
 
 
+class PassphraseShapeTests(unittest.TestCase):
+    """FIX-3: a passphrase kept in quotes has spaces in it (`"correct horse battery staple"`), which no
+    value rule allowed. Two to five short words of letters and digits, next to a credential's name, are
+    now withheld unless they read as a sentence or a label."""
+
+    def test_a_quoted_passphrase_next_to_a_credentials_name_is_withheld(self):
+        passphrases = [
+            'password = "correct horse battery staple"',
+            'password: "two words here"',
+            "password = 'correct horse battery staple'",
+            'db_password = "purple monkey dishwasher"',
+            'client_secret: "abcd efgh ijkl mnop"',
+            '{"api_key": "alpha bravo charlie delta echo"}',
+        ]
+        self.assertGreater(len(passphrases), 0)
+        for text in passphrases:
+            with self.subTest(text=text):
+                self.assertTrue(effects._looks_secret(text))
+
+    def test_sentences_labels_and_names_that_are_not_credentials_stay_clean(self):
+        ordinary = [
+            'token = "a very long natural sentence that is not a secret"',
+            'api_key = "the value is set by the deploy pipeline"',
+            'password = "please use the staging credentials for now"',
+            'name = "John Smith"',
+            'title = "hello world"',
+            '"confirm_password": "Confirm password"',
+            '"password": "Enter your password"',
+            'token = "Invalid token"',
+            'api_key = "Missing API key"',
+            'secret = "not set yet"',
+            'password = "1234 5678"',
+            "password = 'Password used to generate key'",
+            "// token: 'Bearer xxxx'",
+            'password = "your value here"',
+            'secret = "Access denied"',
+        ]
+        self.assertGreater(len(ordinary), 0)
+        for text in ordinary:
+            with self.subTest(text=text):
+                self.assertFalse(effects._looks_secret(text))
+
+    def test_single_words_and_bare_values_are_judged_as_before(self):
+        withheld = ['password = "hunter22"', "password: hunter2passw", '"password": "hunter22"']
+        clean = ['password = "changeme"', "password: str", 'password = "use-token-here"', 'password == "abcdefgh1234"']
+        self.assertGreater(len(withheld) + len(clean), 0)
+        for text in withheld:
+            with self.subTest(text=text):
+                self.assertTrue(effects._looks_secret(text))
+        for text in clean:
+            with self.subTest(text=text):
+                self.assertFalse(effects._looks_secret(text))
+
+    def test_unquoted_words_and_long_phrases_are_not_covered(self):
+        # By design: the bare value stops at the first space, and a sixth word makes it prose.
+        for text in ["password: correct horse battery staple", 'password = "one two three four five six"']:
+            with self.subTest(text=text):
+                self.assertFalse(effects._looks_secret(text))
+
+
+@unittest.skipUnless(te.HAS_GIT, "git is needed for the work-tree comparison")
+class PassphrasePipelineTests(te.TrackerCase):
+    def test_a_passphrase_written_to_an_ordinary_file_keeps_its_counts_but_no_diff(self):
+        cell = self.kernel.run("open('notes.txt', 'w').write('password = \"correct horse battery staple\"\\n')")
+        record = cell.by_rel()["notes.txt"]
+        self.assertEqual((record["kind"], record["added"]), ("created", 1))
+        self.assertEqual(record["diffOmitted"], effects.SENSITIVE)
+        self.assertNotIn("diff", record)
+        self.assertEqual(_anywhere(cell, "horse battery"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

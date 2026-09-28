@@ -213,16 +213,48 @@ _SECRET_NAMES = (
     "private_key",
     "private-key",
 )
+# A passphrase in quotes: two to five short words of letters and digits, a space apart.
+_PASSPHRASE = r"[a-z0-9]{2,12}(?: [a-z0-9]{2,12}){1,4}"
 # What may follow the name: `secret_key`, `credentials`, a closing quote, then `=` or `:` (not `==`)
-# and a quoted or bare value.
+# and a value: one quoted token, quoted words, or a bare token.
 _SECRET_ASSIGNMENT_TAIL = re.compile(
-    r"(?:[_-]?key)?s?[\"']?\s*(?<![=!<>])[:=](?!=)\s*(?:([\"'])([^\"'\s]{8,})\1|([^\s\"'#,;.(){}\[\]<>]{8,}))"
+    r"(?:[_-]?key)?s?[\"']?\s*(?<![=!<>])[:=](?!=)\s*"
+    r"(?:(?P<quote>[\"'])(?:(?P<token>[^\"'\s]{8,})|(?P<words>" + _PASSPHRASE + r"))(?P=quote)"
+    r"|(?P<bare>[^\s\"'#,;.(){}\[\]<>]{8,}))"
 )
 _SECRET_PLACEHOLDER = re.compile(
     r"(?i)^(?:x+|\*+|\.+|changeme|change_me|placeholder|example\w*|dummy\w*|redacted|none|null|true|false|"
     r"your[_-]?\w*|replace[_-]?me\w*|\$\{?\w+\}?|%\(\w+\)s|\{\{.*\}\})$"
 )
 _IDENTIFIER_LIKE = re.compile(r"^[A-Za-z_-]+$")
+# Words that make a quoted run read as a sentence or a label, not as a passphrase: the small words of
+# speech, the vocabulary of credentials, and what a form or an error says about one.
+_PHRASE_WORDS = frozenset(
+    (
+        "a an the this that these those it its i me my we us our you your he she they them their "
+        "is are was were be been am do does did has have had will would can could should must may might shall "
+        "of in on at to for by with from into as or and but if then than so not no nor per via up out off "
+        "any some all each every what which who how when where why please "
+        "password passwd passphrase pass secret token key keys credential credentials api auth login user "
+        "enter confirm retype repeat reset forgot required invalid incorrect wrong missing expired empty unknown "
+        "denied failed error"
+    ).split()
+)
+
+
+def _passphrase_like(words: str) -> bool:
+    """Whether quoted words could be a passphrase.
+
+    Not when they are all digits, read as a sentence or a label (`_PHRASE_WORDS`), or hold a placeholder
+    (`Bearer xxxx`, `your value`).
+    """
+    parts = words.split(" ")
+    return (
+        len(words) >= 8
+        and not words.replace(" ", "").isdigit()
+        and _PHRASE_WORDS.isdisjoint(parts)
+        and not any(_SECRET_PLACEHOLDER.match(part) for part in parts)
+    )
 
 
 def _sensitive_path(path: str | None) -> bool:
@@ -253,8 +285,12 @@ def _looks_secret(text: str | None) -> bool:
             while start >= 0:
                 match = _SECRET_ASSIGNMENT_TAIL.match(lower, start + len(name))
                 if match:
-                    value = match.group(2) or match.group(3) or ""
-                    if not (_SECRET_PLACEHOLDER.match(value) or value.isdigit() or _IDENTIFIER_LIKE.match(value)):
+                    words = match.group("words")
+                    value = match.group("token") or match.group("bare") or ""
+                    if words is not None:
+                        if _passphrase_like(words):
+                            return True
+                    elif not (_SECRET_PLACEHOLDER.match(value) or value.isdigit() or _IDENTIFIER_LIKE.match(value)):
                         return True
                 start = lower.find(name, start + 1)
         return False
