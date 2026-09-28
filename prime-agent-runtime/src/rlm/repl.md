@@ -301,7 +301,14 @@ deleted in the same cell.
   `detail` (a command's latest or final output line, for example from `cat
   .env` or `echo $API_KEY`) gets the same scan; a `detail` that looks like a
   credential is left out of the record rather than sent. The scan runs only
-  over the capped text and treats its own failure as a secret.
+  over the capped text and treats its own failure as a secret. It cannot tell a
+  real credential from a value shaped like one, so ordinary code is withheld
+  too: a test fixture such as `API_KEY = "test-1234567890abcdef"` or a
+  JWT-shaped sample token on any line of a file's diff (changed lines and their
+  context) leaves that file's record with line counts only and
+  `diffOmitted: "sensitive"`. That is deliberate: a diff withheld by mistake
+  costs a look at the file, a credential saved with the session cannot be
+  recalled.
 - The session's own folder (`RLM_SESSION_DIR`: subagent folders, artifacts) is
   never reported, and harness saves appear only as memory records, not as a
   change of the harness state file, even when a command ran in the same cell.
