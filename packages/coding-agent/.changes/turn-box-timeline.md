@@ -4,3 +4,11 @@
 - Added `app.turn.focus` (default `alt+j`, also `ctrl+j` in terminals that tell it apart from a newline) to walk the latest box with the arrow keys, Enter to open a row and Escape to leave; the mouse wheel scrolls a box's body and a click toggles the box or a row.
 - Added the `ui.timelineOpenWhileWorking`, `ui.timelineAutoFold` and `ui.reduceMotion` settings, also in `/settings`.
 - Changed "waiting for a result" rows to name the command they wait for, and the recap line to read `回顾：`.
+- Added a short status message for a box's keys when there is nothing for them to act on (Ctrl+O/Alt+O, Ctrl+T/Alt+T, Alt+Shift+O, Ctrl+P/Alt+P, Alt+A, Alt+Up, Ctrl+Alt+Up/Down), instead of silently doing nothing; fixed Alt+O and Alt+T so they see a box's real steps and thinking instead of always treating it as empty.
+- Changed a box's walk (Alt+J) so Enter only offers to open a row that actually has more to show, and PageUp/PageDown scroll the box instead of the whole screen.
+- Changed legacy mode's Alt+J/Ctrl+J to toggle edit diffs, matching the quiet conversation's key.
+- Changed a command a box is still waiting on when its cell already ended to show as moved to the background instead of stuck running forever.
+- Added a stopped command's row shown faint instead of as an error, with a short result (`完成`, a test summary, or `退出码 N`) instead of its raw exit status.
+- Added a note to a turn's change summary when some of its file or memory changes could not be recorded in full.
+- Changed an earlier answer to fold once a later turn does real work, instead of staying fully expanded above it.
+- Added a "N 个已交回" count to a step that checked on subagents.

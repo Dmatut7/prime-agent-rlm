@@ -53,6 +53,54 @@ export function toolOutputFull(): boolean {
 	return fullToolOutput;
 }
 
+/** Blocks whose last render found more output than the budget allows (any mode). */
+const truncatableBlocks = new Set<object>();
+
+/**
+ * Record whether a rendered block currently holds more output than the
+ * (non-full) budget allows, computed independent of the current full-output
+ * mode - so `app.tools.expandFull` can tell when flipping it would reveal or
+ * hide nothing at all. A collapsed block never calls this; its last report
+ * (if any) simply goes stale, which only biases the key toward acting rather
+ * than staying silent.
+ */
+export function reportBudgetTruncatable(id: object, truncatable: boolean): void {
+	if (truncatable) truncatableBlocks.add(id);
+	else truncatableBlocks.delete(id);
+}
+
+/** Whether any rendered block last reported more output than the budget allows. */
+export function anyBudgetTruncatable(): boolean {
+	return truncatableBlocks.size > 0;
+}
+
+/** Test-only: forgets every block's last truncation report. */
+export function resetBudgetTruncatableTracking(): void {
+	truncatableBlocks.clear();
+}
+
+/**
+ * Whether this body has more lines or characters than the non-full budget
+ * allows, ignoring the current `toolOutputFull` mode - the same walk as
+ * `expandedOutputWindow` but without its full-mode short-circuit, so it
+ * answers "would the budget ever clip this" regardless of which way the key
+ * is about to flip.
+ */
+export function wouldBudgetTruncate(lines: string[]): boolean {
+	const maxLines = quietConversation ? QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES : EXPANDED_TOOL_OUTPUT_MAX_LINES;
+	let chars = 0;
+	for (let index = 0; index < lines.length; index++) {
+		const line = lines[index]!;
+		const charRoom = EXPANDED_TOOL_OUTPUT_MAX_CHARS - chars;
+		if (index < maxLines && line.length <= charRoom) {
+			chars += line.length;
+			continue;
+		}
+		return true;
+	}
+	return false;
+}
+
 /**
  * Switch the budget off or on. Returns true when the mode actually changed, so
  * callers only pay the invalidate-and-rerender they owe on a real change.

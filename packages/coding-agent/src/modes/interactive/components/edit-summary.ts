@@ -2,6 +2,7 @@ import { isAbsolute } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { KernelFileChange } from "../../../core/kernel/shared.js";
 import type { EditToolDetails } from "../../../core/tools/edit.js";
 import { generateDiffString } from "../../../core/tools/edit-diff.js";
 import type { IpythonToolDetails } from "../../../core/tools/ipython.js";
@@ -13,6 +14,8 @@ export interface FileChangeSummary {
 	path: string;
 	added: number;
 	removed: number;
+	/** True when the change is to the link itself: no line counts apply. */
+	symlink?: boolean;
 }
 
 export function countChangedLines(diff: string): { added: number; removed: number } {
@@ -26,12 +29,13 @@ export function countChangedLines(diff: string): { added: number; removed: numbe
 }
 
 function mergeFileChange(target: Map<string, FileChangeSummary>, change: FileChangeSummary, cwd: string): void {
-	if (change.added === 0 && change.removed === 0) return;
+	if (change.added === 0 && change.removed === 0 && !change.symlink) return;
 	const key = canonicalizePath(resolveToCwd(change.path, cwd));
 	const existing = target.get(key);
 	if (existing) {
 		existing.added += change.added;
 		existing.removed += change.removed;
+		if (change.symlink) existing.symlink = true;
 	} else {
 		target.set(key, { ...change });
 	}
@@ -45,6 +49,24 @@ export function getToolFileChanges(
 ): FileChangeSummary[] {
 	const changes = new Map<string, FileChangeSummary>();
 	if (toolName === "ipython") {
+		const records = (result.details as { fileChanges?: unknown } | undefined)?.fileChanges;
+		if (Array.isArray(records)) {
+			// The kernel's own list of what the cell changed replaces the edit skill's diffs.
+			for (const record of records as Array<Partial<KernelFileChange>>) {
+				if (typeof record.path !== "string" || record.scope === "scratch") continue;
+				mergeFileChange(
+					changes,
+					{
+						path: record.relPath ?? record.path,
+						added: Math.max(0, Number(record.added) || 0),
+						removed: Math.max(0, Number(record.removed) || 0),
+						...(record.symlink === true ? { symlink: true } : {}),
+					},
+					cwd,
+				);
+			}
+			return [...changes.values()];
+		}
 		for (const display of (result.details as IpythonToolDetails | undefined)?.diffs ?? []) {
 			const { diff } = generateDiffString(display.oldStr, display.newStr, 4, display.startLine ?? 1);
 			mergeFileChange(changes, { path: display.path, ...countChangedLines(diff) }, cwd);
@@ -98,21 +120,23 @@ export function formatFileChangePath(path: string, cwd: string): string {
 /**
  * One `    ╰─ <path> +N -M` row, truncated to width; the path renders relative
  * to cwd where possible. U6 removed the per-row expand hint (the global tail
- * line owns the keys).
+ * line owns the keys). A link change has no line counts: the row reads as a
+ * link instead of `+0 -0`.
  */
 export function formatFileChangeSummaryLine(
 	rawPath: string,
 	cwd: string | undefined,
-	change: Pick<FileChangeSummary, "added" | "removed">,
+	change: Pick<FileChangeSummary, "added" | "removed" | "symlink">,
 	width: number,
 ): string {
 	const prefix = theme.fg("dim", FILE_CHANGE_SUMMARY_PREFIX);
-	const counts = `${theme.fg("dim", " ")}${formatChangeCounts(change)}`;
+	const suffix = change.symlink ? "" : `${theme.fg("dim", " ")}${formatChangeCounts(change)}`;
 	const safeWidth = Math.max(1, width);
-	const available = Math.max(1, safeWidth - visibleWidth(prefix) - visibleWidth(counts));
+	const available = Math.max(1, safeWidth - visibleWidth(prefix) - visibleWidth(suffix));
 	const displayPath = cwd === undefined ? rawPath : formatFileChangePath(rawPath, cwd);
-	const path = truncateToWidth(displayPath, available, "…");
-	return truncateToWidth(`${prefix}${theme.fg("muted", path)}${counts}`, safeWidth, "");
+	const pathText = change.symlink ? `链接 ${displayPath}` : displayPath;
+	const path = truncateToWidth(pathText, available, "…");
+	return truncateToWidth(`${prefix}${theme.fg("muted", path)}${suffix}`, safeWidth, "");
 }
 
 export function formatTotalChangeSummary(changes: readonly FileChangeSummary[]): string {

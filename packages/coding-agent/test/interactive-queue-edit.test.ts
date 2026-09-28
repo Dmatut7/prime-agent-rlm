@@ -26,6 +26,7 @@ type Harness = {
 	pastedImages: Map<number, unknown>;
 	updatePendingMessagesDisplay: () => void;
 	showStatus: (message: string) => void;
+	showToast: (message: string) => void;
 	showError: (message: string) => void;
 	ui: { requestRender: () => void };
 	agentConnection: {
@@ -79,6 +80,7 @@ function createHarness(queue: { steering: string[]; followUp: string[] }, mutate
 		pastedImages: new Map(),
 		updatePendingMessagesDisplay: vi.fn(),
 		showStatus: vi.fn(),
+		showToast: vi.fn(),
 		showError: vi.fn(),
 		ui: { requestRender: vi.fn() },
 		agentConnection: {

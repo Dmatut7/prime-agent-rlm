@@ -399,9 +399,36 @@ export function collectBashHandleCommands(code: string): Array<[string, string]>
 	return handles;
 }
 
+/**
+ * Labels per step arguments: a box rebuilds its rows every live frame, and
+ * reading a cell's code (tens of KB) each frame would cost the whole screen.
+ * Keyed by the arguments object and checked against the code it holds, so an
+ * argument object rewritten in place is read again.
+ */
+const labelMemo = new WeakMap<object, { source: unknown; labels: Map<string, unknown> }>();
+
+function memoized<T>(step: StepLabelInput, context: StepLabelContext, kind: string, compute: () => T): T {
+	const args = step.args;
+	if (typeof args !== "object" || args === null) return compute();
+	const source = (args as { code?: unknown; command?: unknown }).code ?? (args as { command?: unknown }).command;
+	let entry = labelMemo.get(args);
+	if (!entry || entry.source !== source) {
+		entry = { source, labels: new Map() };
+		labelMemo.set(args, entry);
+	}
+	const handles = context.handleCommands
+		? [...context.handleCommands].map(([name, command]) => `${name}=${command}`)
+		: [];
+	const key = `${kind}|${step.toolName}|${handles.join("\u0000")}`;
+	if (entry.labels.has(key)) return entry.labels.get(key) as T;
+	const value = compute();
+	entry.labels.set(key, value);
+	return value;
+}
+
 export function turnStepLabel(step: StepLabelInput, context: StepLabelContext = {}): string {
 	if (isMalformedToolName(step.toolName)) return MALFORMED_TOOL_CALL_LABEL;
-	return withoutTemplateHoles(rawStepLabel(step, context));
+	return memoized(step, context, "label", () => withoutTemplateHoles(rawStepLabel(step, context)));
 }
 
 /** Builtins that wrap the value a reader cares about (`print(type(x).__name__)` looks at `x`). */
@@ -531,6 +558,10 @@ export interface StepAction {
  * preview redacts secrets), never a made-up verb like `设置 W`.
  */
 export function stepAction(step: StepLabelInput, context: StepLabelContext = {}): StepAction {
+	return memoized(step, context, "action", () => computeStepAction(step, context));
+}
+
+function computeStepAction(step: StepLabelInput, context: StepLabelContext): StepAction {
 	if (step.toolName === "ipython") {
 		const code = argString(step.args, "code");
 		if (!code) return { verb: "准备", target: "Python", recognized: false };

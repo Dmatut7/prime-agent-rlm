@@ -265,6 +265,10 @@ function isSessionWorking(state: ActiveSessionState): boolean {
 // Recap prefix for a turn that errored; the transcript's own error text follows
 // it so the persisted verdict reports the real last event, never invented work.
 const ERROR_RECAP_PREFIX = "Model request failed";
+/** Whether a recap is the verdict of a turn that errored (its text is the transcript's error). */
+export function isErrorRecap(recap: string): boolean {
+	return recap === ERROR_RECAP_PREFIX || recap.startsWith(`${ERROR_RECAP_PREFIX}: `);
+}
 // Generous; the agents view truncates recaps further for display.
 const ERROR_RECAP_MAX_CHARS = 160;
 

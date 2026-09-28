@@ -106,6 +106,34 @@ describe("edit summaries", () => {
 		expect([...changes.values()]).toEqual([{ path: "~/same.ts", added: 2, removed: 2 }]);
 	});
 
+	test("keeps a symlink-only kernel record instead of dropping it as a 0/0 change", () => {
+		expect(
+			getToolFileChanges(
+				"ipython",
+				{},
+				{
+					details: {
+						fileChanges: [
+							{
+								path: "/tmp/blink.txt",
+								relPath: "blink.txt",
+								kind: "created",
+								scope: "project",
+								added: 0,
+								removed: 0,
+								symlink: true,
+								source: "python",
+								at: 1,
+							},
+						],
+					},
+					isError: false,
+				},
+				"/tmp",
+			),
+		).toEqual([{ path: "blink.txt", added: 0, removed: 0, symlink: true }]);
+	});
+
 	test("coalesces canonical paths across a symlinked cwd", () => {
 		const root = mkdtempSync(join(tmpdir(), "edit-summary-symlink-"));
 		try {
@@ -151,5 +179,13 @@ describe("formatFileChangeSummaryLine", () => {
 		const second = formatFileChangeSummaryLine(path, undefined, change, width);
 		expect(stripAnsi(first)).toContain("…");
 		expect(pathPart(first)).toBe(pathPart(second));
+	});
+
+	test("reads a link row as a link, not a file with +0 -0", () => {
+		const line = formatFileChangeSummaryLine("blink.txt", undefined, { added: 0, removed: 0, symlink: true }, 60);
+		const plain = stripAnsi(line);
+		expect(plain).toContain("链接 blink.txt");
+		expect(plain).not.toContain("+0");
+		expect(plain).not.toContain("-0");
 	});
 });

@@ -1,4 +1,4 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { ABORT_TRUNCATION_MARKER, type AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai";
 import { type ClickRegion, setKeybindings, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
@@ -7,7 +7,7 @@ import { KeybindingsManager } from "../src/core/keybindings.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import { renderStatusBar } from "../src/modes/interactive/components/footer.js";
 import { rowEnterStage, setMotionReduced, TURN_FOLD_MS } from "../src/modes/interactive/components/motion.js";
-import { commandOutcome } from "../src/modes/interactive/components/timeline-rows.js";
+import { commandOutcome, type TimelineFacts } from "../src/modes/interactive/components/timeline-rows.js";
 import {
 	type TimelineHost,
 	TurnActivityState,
@@ -18,7 +18,8 @@ import { TurnBoxNavigator } from "../src/modes/interactive/components/turn-box-n
 import { STRIP_EDITS, STRIP_MEMORIES, TurnStripComponent } from "../src/modes/interactive/components/turn-strip.js";
 import { TurnTimeline } from "../src/modes/interactive/components/turn-timeline.js";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
+import { setWorkingPulseTick } from "../src/modes/interactive/theme/working-icon.js";
 
 const T0 = 1_700_000_000_000;
 
@@ -100,6 +101,7 @@ beforeAll(() => {
 
 afterEach(() => {
 	setMotionReduced(false);
+	setWorkingPulseTick(0);
 	vi.useRealTimers();
 });
 
@@ -433,6 +435,21 @@ describe("the box header", () => {
 		const header = () => turn.summary.render(120)[2] ?? "";
 		expect(stripAnsi(header())).toContain("等待模型回应…");
 		const shimmering = (header().match(/\x1b\[38;/g) ?? []).length;
+
+		// The shimmer is a moving band, not a static tint: the character
+		// carrying the brightest color must sit at a different position once
+		// the tick moves - a frozen band would leave this index unchanged.
+		const bandPrefix = theme.fg("activityText", "X").split("X")[0] ?? "";
+		setWorkingPulseTick(3);
+		turn.summary.invalidate();
+		const bandAt3 = header().indexOf(bandPrefix);
+		setWorkingPulseTick(6);
+		turn.summary.invalidate();
+		const bandAt6 = header().indexOf(bandPrefix);
+		expect(bandAt3).toBeGreaterThanOrEqual(0);
+		expect(bandAt6).toBeGreaterThanOrEqual(0);
+		expect(bandAt6).not.toBe(bandAt3);
+
 		setMotionReduced(true);
 		turn.summary.invalidate();
 		const calm = (header().match(/\x1b\[38;/g) ?? []).length;
@@ -697,7 +714,17 @@ describe("opening, folding and history", () => {
 			true,
 		);
 		turn.state.markTurnEnded(Date.now());
-		turn.summary.render(100);
+		// Open the box (but not its thinking rows) first: a closed box folds
+		// everything into "想了 N 次" and would never show the full text
+		// either way, so that state cannot prove the toggle reveals anything.
+		// With the box open, a settled thinking row must show only its first
+		// sentence - the rest must not already be on screen, or the toggle
+		// below would prove nothing about what it reveals.
+		turn.summary.toggleBox();
+		const before = text(turn.summary.render(100));
+		expect(before).toContain("思考了 一");
+		expect(before).not.toContain("更多的第一段");
+		expect(before).not.toContain("更多的第二段");
 		turn.summary.toggleThinkingRows();
 		const out = text(turn.summary.render(100));
 		expect(out).toContain("更多的第一段");
@@ -823,6 +850,29 @@ describe("the change strip", () => {
 		const turn = quietTurn();
 		const strip = new TurnStripComponent({ timeline: turn.timeline, facts: () => undefined, requestRender: vi.fn() });
 		expect(strip.render(120)).toEqual([]);
+
+		// "No facts yet" (above) and "facts exist but nothing changed" (here) are
+		// two different branches of the same guard - an all-empty fact object,
+		// not just an absent one, must also render nothing.
+		const emptyFacts: TimelineFacts = {
+			thinkCount: 0,
+			commandCount: 0,
+			readCount: 0,
+			stepCount: 0,
+			subagentCount: 0,
+			errorCount: 0,
+			projectChanges: [],
+			scratchChanges: [],
+			memories: [],
+			commitId: undefined,
+			trackingIncomplete: false,
+		};
+		const emptyStrip = new TurnStripComponent({
+			timeline: turn.timeline,
+			facts: () => emptyFacts,
+			requestRender: vi.fn(),
+		});
+		expect(emptyStrip.render(120)).toEqual([]);
 	});
 });
 
@@ -844,7 +894,7 @@ describe("the status bar", () => {
 			right,
 		};
 		const wide = stripAnsi(renderStatusBar(state, 160));
-		expect(wide).toContain("glm-5.3-prime · 思考 中");
+		expect(wide).toContain("glm-5.3-prime · 思考强度 中");
 		expect(wide).toContain("上下文 ━━━───── 33%");
 		expect(wide).toContain("◇ 2 个子代理在跑");
 		expect(wide).toContain("~/work/app · main");
@@ -963,13 +1013,20 @@ describe("replay groups a transcript the way the live view does", () => {
 	});
 
 	it("ends a turn the owner interrupted mid-step as stopped, and the next message starts a new turn", () => {
+		// The owner's stop: the agent loop keeps the cell's partial output and marks it cut short.
 		const result = (id: string, timestamp: number, status: "ok" | "aborted"): ToolResultMessage => ({
 			role: "toolResult",
 			toolCallId: id,
 			toolName: "ipython",
-			content: [{ type: "text", text: status === "ok" ? "done" : "<ipython_cell_aborted>" }],
+			content:
+				status === "ok"
+					? [{ type: "text", text: "done" }]
+					: [
+							{ type: "text", text: "<ipython_cell_aborted>" },
+							{ type: "text", text: ABORT_TRUNCATION_MARKER },
+						],
 			details: { status },
-			isError: false,
+			isError: status === "aborted",
 			timestamp,
 		});
 		const messages: AgentMessage[] = [

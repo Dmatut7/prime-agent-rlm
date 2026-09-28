@@ -188,7 +188,7 @@ describe("InteractiveMode /effort", () => {
 			const context = makeContext({ agentConnection: { setThinkingLevel } });
 
 			interactiveModePrototype.handleEffortCommand.call(context, "high");
-			await vi.waitFor(() => expect(context.showToast).toHaveBeenCalledWith("thinking high"));
+			await vi.waitFor(() => expect(context.showToast).toHaveBeenCalledWith("思考强度 高"));
 
 			expect(setThinkingLevel).toHaveBeenCalledWith("high");
 			expect(context.patchConnectionState).toHaveBeenCalledWith({ thinkingLevel: "high" });
@@ -442,7 +442,7 @@ describe("InteractiveMode /effort", () => {
 			const context = makeFastContext();
 
 			fastInteractiveModePrototype.handleFastCommand.call(context);
-			await vi.waitFor(() => expect(context.showToast).toHaveBeenCalledWith("fast on"));
+			await vi.waitFor(() => expect(context.showToast).toHaveBeenCalledWith("快速模式 开"));
 
 			expect(context.agentConnection.setServiceTier).toHaveBeenCalledWith("priority");
 			expect(context.patchConnectionState).toHaveBeenCalledWith({ serviceTier: "priority" });
@@ -454,7 +454,7 @@ describe("InteractiveMode /effort", () => {
 			context.connectionState = { sessionId: "session-1", serviceTier: "priority", thinkingLevel: "high" };
 
 			fastInteractiveModePrototype.handleFastCommand.call(context);
-			await vi.waitFor(() => expect(context.showToast).toHaveBeenCalledWith("fast off"));
+			await vi.waitFor(() => expect(context.showToast).toHaveBeenCalledWith("快速模式 关"));
 
 			expect(context.agentConnection.setServiceTier).toHaveBeenCalledWith("default");
 			expect(context.patchConnectionState).toHaveBeenCalledWith({ serviceTier: "default" });
@@ -481,7 +481,7 @@ describe("InteractiveMode /effort", () => {
 			);
 
 			fastInteractiveModePrototype.handleFastCommand.call(context);
-			await vi.waitFor(() => expect(context.showToast).toHaveBeenCalledWith("fast off"));
+			await vi.waitFor(() => expect(context.showToast).toHaveBeenCalledWith("快速模式 关"));
 
 			expect(context.agentConnection.setServiceTier).toHaveBeenCalledWith("priority");
 			expect(context.patchConnectionState).toHaveBeenCalledWith({ serviceTier: "default" });

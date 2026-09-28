@@ -2,7 +2,7 @@ import type { AutocompleteProvider, EditorTheme, OverlayHandle, TUI } from "@ear
 import { CURSOR_MARKER, setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
-import { CustomEditor } from "../src/modes/interactive/components/custom-editor.js";
+import { CustomEditor, DECLINE_KEY } from "../src/modes/interactive/components/custom-editor.js";
 
 const passthrough = (text: string) => text;
 
@@ -89,6 +89,25 @@ describe("CustomEditor", () => {
 
 		expect(toggleEditDiffs).not.toHaveBeenCalled();
 		expect(editor.getText()).toBe("a\nb");
+	});
+
+	it("gives a key to the next action only when a handler declines it explicitly", () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
+		const toggleEditDiffs = vi.fn();
+		const focusTurn = vi.fn((): typeof DECLINE_KEY | undefined => DECLINE_KEY);
+		editor.onAction("app.turn.focus", focusTurn);
+		editor.onAction("app.edits.expand", toggleEditDiffs);
+		// Nothing to walk: the box declines ctrl+j and the edit diffs take it.
+		editor.handleInput("\x1b[106;5u");
+		expect(focusTurn).toHaveBeenCalledOnce();
+		expect(toggleEditDiffs).toHaveBeenCalledOnce();
+
+		// A handler that answers false (nothing to focus) still consumes its key.
+		const focusSubagents = vi.fn(() => false);
+		editor.onAction("app.subagents.focus", focusSubagents);
+		editor.handleInput("\x1ba");
+		expect(focusSubagents).toHaveBeenCalledOnce();
+		expect(editor.getText()).toBe("");
 	});
 
 	it("still fires the edit-diff action for kitty CSI-u ctrl+j", () => {

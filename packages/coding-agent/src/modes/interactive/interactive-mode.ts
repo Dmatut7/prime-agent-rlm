@@ -230,13 +230,19 @@ import {
 	CompactionOutcomeMessageComponent,
 	MalformedCompactionOutcomeMessageComponent,
 } from "./components/compaction-outcome-message.js";
-import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
+import {
+	CompactionSummaryMessageComponent,
+	QuietCompactionNoticeComponent,
+} from "./components/compaction-summary-message.js";
 import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "./components/configuration-menu.js";
 import { formatContextTree } from "./components/context-tree-format.js";
 import {
 	countThinkingSegments,
+	foldEarlierAnswers,
 	isCompactAgentMessageNeighbor,
 	latestThinkingText,
+	NO_STEP_STOP,
+	stepResultStop,
 } from "./components/conversation-components.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
@@ -245,13 +251,7 @@ import { DaxnutsComponent } from "./components/daxnuts.js";
 import { DutyLogBlock } from "./components/duty-log-block.js";
 import { DynamicBorder } from "./components/dynamic-border.js";
 import { EarendilAnnouncementComponent } from "./components/earendil-announcement.js";
-import {
-	type FileChangeSummary,
-	formatFileChangePath,
-	formatTotalChangeSummary,
-	getToolFileChanges,
-	mergeTurnFileChanges,
-} from "./components/edit-summary.js";
+import { type FileChangeSummary, formatTotalChangeSummary, mergeTurnFileChanges } from "./components/edit-summary.js";
 import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
@@ -271,6 +271,7 @@ import { setMotionFrameRequester, setMotionReduced } from "./components/motion.j
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
 import { styleArgumentTokens } from "./components/prompt-highlight.js";
+import { recapLineText } from "./components/recap-line.js";
 import {
 	MalformedRefinementOutcomeMessageComponent,
 	RefinementOutcomeMessageComponent,
@@ -285,7 +286,6 @@ import {
 	styleSlashCommandText,
 } from "./components/slash-command-message.js";
 import { SlashCommandResultMessageComponent } from "./components/slash-command-result-message.js";
-import { collectBashHandleCommands } from "./components/step-label.js";
 import {
 	buildSubagentPanelRows,
 	classifySubagentSnapshotStatus,
@@ -305,7 +305,12 @@ import {
 	ToolExecutionComponent,
 	type ToolExecutionDefinition,
 } from "./components/tool-execution.js";
-import { setQuietConversationBudget, setToolOutputFull, toolOutputFull } from "./components/tool-output-budget.js";
+import {
+	anyBudgetTruncatable,
+	setQuietConversationBudget,
+	setToolOutputFull,
+	toolOutputFull,
+} from "./components/tool-output-budget.js";
 import { TopBar } from "./components/top-bar.js";
 import { TreeSelectorComponent } from "./components/tree-selector.js";
 import {
@@ -317,12 +322,11 @@ import {
 } from "./components/turn-activity.js";
 import { BOX_FOCUS_MARKER } from "./components/turn-box.js";
 import { TurnBoxNavigator, turnBoxFocusHints } from "./components/turn-box-navigator.js";
-import { TurnStripComponent } from "./components/turn-strip.js";
 import {
-	describeRetryReason,
+	boxRecordFromMessage,
 	formatBoxDuration,
 	formatBoxTokens,
-	type TurnTimeline,
+	isBoxNoticeMessage,
 } from "./components/turn-timeline.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
@@ -340,6 +344,7 @@ import type {
 	InteractiveModeLocalToolRendererDefinition,
 	InteractiveModeUiServices,
 } from "./interactive-mode-services.js";
+import { LiveTurnFlow, type LiveTurnFlowHost, recordStepFileChanges } from "./live-turn-flow.js";
 import {
 	isOnboardingModelReady,
 	type OnboardingStartupState,
@@ -645,19 +650,130 @@ export function formatSplashCwd(cwd: string): string {
 	return normalized;
 }
 
-/** Why a compaction did not happen, in plain words for its row (a skip is not a failure). */
-function compactionMissText(event: { errorMessage?: string; errorSeverity?: "warning" | "error" }): string {
-	const message = event.errorMessage ?? "";
-	if (/too short/i.test(message)) return "对话还太短，等它长一些再整理";
-	if (event.errorSeverity === "warning") return "这次先跳过，稍后再试";
-	return message.split("\n")[0] || "没有结果";
+/** A component that may answer to one of the toggle-key expansion lanes. */
+interface LaneExpandableComponent {
+	setExpanded?(expanded: boolean): void;
+	setEditDiffsExpanded?(expanded: boolean): void;
 }
 
-/** A step result the kernel cut off mid-run (an interrupt or the stall watchdog). */
-function isAbortedStepResult(message: { details?: unknown }): boolean {
-	const details = message.details;
-	return typeof details === "object" && details !== null && (details as { status?: unknown }).status === "aborted";
+/** Whether anything in the chat (besides the owner's own messages) answers to one expansion lane. */
+function chatHasLane(children: readonly Component[], lane: "setExpanded" | "setEditDiffsExpanded"): boolean {
+	return children.some(
+		(child) =>
+			!(child instanceof UserMessageComponent) &&
+			typeof (child as unknown as LaneExpandableComponent)[lane] === "function",
+	);
 }
+
+/** Whether a turn has any thinking to open: its box's thinking rows, or the thinking of its answers. */
+function turnHasThinking(summary: TurnSummaryComponent): boolean {
+	const state = summary.state;
+	if (state.boxMode) return state.boxView().rows.some((row) => row.kind === "think");
+	return state.totalThinkingSegments > 0;
+}
+
+/** A long turn the reopen window starts inside: its prompt, its real start, and the steps left out. */
+interface WindowCutTurn {
+	prompt?: AgentMessage;
+	startedAt?: number;
+	hiddenSteps: number;
+}
+
+/**
+ * Whether the user message at `index` starts a turn in the replay (one typed
+ * between a step and the model's next reply is an interjection). A message
+ * before it that is itself an interjection leaves the grouping as it was, so
+ * the walk goes past user messages to the reply before them.
+ */
+function startsReplayTurn(messages: readonly AgentMessage[], index: number): boolean {
+	let lastResult: AgentMessage | undefined;
+	for (let cursor = index - 1; cursor >= 0; cursor--) {
+		const message = messages[cursor];
+		if (!message) continue;
+		if (message.role === "toolResult") {
+			lastResult ??= message;
+		} else if (message.role === "assistant") {
+			const results = lastResult?.role === "toolResult" ? lastResult : undefined;
+			return !(message.stopReason === "toolUse" && results && !stepResultStop(results).endsTurn);
+		}
+	}
+	return true;
+}
+
+/** The turn the reopen window cut into, when the window starts inside one. */
+function windowCutTurn(messages: readonly AgentMessage[], shown: readonly AgentMessage[]): WindowCutTurn | undefined {
+	const shownMessages = new Set(shown);
+	const first = messages.findIndex((message) => shownMessages.has(message));
+	if (first <= 0) return undefined;
+	const firstMessage = messages[first];
+	if (firstMessage?.role === "user" && startsReplayTurn(messages, first)) return undefined;
+	const insideTurn =
+		firstMessage?.role === "assistant" || firstMessage?.role === "toolResult" || firstMessage?.role === "user";
+	let start = 0;
+	for (let index = first - 1; index >= 0; index--) {
+		if (messages[index]?.role === "user" && startsReplayTurn(messages, index)) {
+			start = index;
+			break;
+		}
+	}
+	const shownCalls = new Set<string>();
+	for (const message of shown) {
+		if (message.role !== "assistant") continue;
+		for (const content of message.content) if (content.type === "toolCall") shownCalls.add(content.id);
+	}
+	let startedAt: number | undefined;
+	let hiddenSteps = 0;
+	for (let index = start; index < first; index++) {
+		const message = messages[index];
+		if (message?.role !== "assistant") continue;
+		startedAt ??= Number(message.timestamp) || undefined;
+		for (const content of message.content) {
+			if (content.type === "toolCall" && !shownCalls.has(content.id)) hiddenSteps++;
+		}
+	}
+	if (!insideTurn && startedAt === undefined) return undefined;
+	const prompt = messages[start];
+	return {
+		...(prompt?.role === "user" ? { prompt } : {}),
+		...(startedAt !== undefined ? { startedAt } : {}),
+		hiddenSteps,
+	};
+}
+
+/** Whether a turn has any process rows to open: a box needs its own rows; legacy always has a process block. */
+function turnHasProcess(summary: TurnSummaryComponent): boolean {
+	const state = summary.state;
+	return !state.boxMode || state.boxView().rows.length > 0;
+}
+
+/** Whether a turn has any agent-to-agent messages to open (received or sent, box or legacy). */
+function turnHasAgentMessages(summary: TurnSummaryComponent): boolean {
+	const state = summary.state;
+	return !state.boxMode || state.commMessageCount > 0;
+}
+
+/**
+ * Whether anything in the chat has content for one expansion lane: a box turn
+ * asks its own predicate (real content, not just the method's presence); any
+ * other component (the legacy per-message chat) falls back to its own check,
+ * exactly as before this box-aware version existed.
+ */
+function chatHasTurnLane(
+	children: readonly Component[],
+	hasLane: (summary: TurnSummaryComponent) => boolean,
+	hasLegacyLane: (child: Component) => boolean,
+): boolean {
+	return children.some((child) => (child instanceof TurnSummaryComponent ? hasLane(child) : hasLegacyLane(child)));
+}
+
+const hasSetExpandedLane = (child: Component): boolean =>
+	!(child instanceof UserMessageComponent) &&
+	typeof (child as unknown as LaneExpandableComponent).setExpanded === "function";
+
+const hasThinkingTraceLane = (child: Component): boolean =>
+	child instanceof AssistantMessageComponent && child.hasThinkingTrace();
+
+const hasAnyMessageLane = (child: Component): boolean => !(child instanceof UserMessageComponent);
 
 function mergeSubagentSnapshot(
 	previous: AgentConnectionRlmChildAgentSnapshot,
@@ -791,6 +907,17 @@ interface OnboardingSplashHandle {
 	showProgress(message: string): void;
 	dismiss(): void;
 }
+
+/** Thinking levels in the words the status bar and its toasts use. */
+const THINKING_LEVEL_WORDS: Record<string, string> = {
+	off: "关",
+	minimal: "最低",
+	low: "低",
+	medium: "中",
+	high: "高",
+	xhigh: "很高",
+	max: "最高",
+};
 
 const THINKING_LEVEL_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	off: "No reasoning",
@@ -1477,35 +1604,14 @@ export class InteractiveMode {
 	// U4 turn aggregation for the live run: one aggregate line per agent turn.
 	private currentTurnState: TurnActivityState | undefined;
 	private currentTurnSummary: TurnSummaryComponent | undefined;
-	private bashHandleCommandsStore: Map<string, string> | undefined;
-	private turnStripsStore: WeakMap<TurnSummaryComponent, TurnStripComponent> | undefined;
-	/** Commands started under a handle (`h = bash('…')`), for labelling a later wait on the handle. */
-	private get bashHandleCommands(): Map<string, string> {
-		this.bashHandleCommandsStore ??= new Map();
-		return this.bashHandleCommandsStore;
+	private liveTurnFlowStore: LiveTurnFlow | undefined;
+	/** The connection to the background session closed and has not come back. */
+	private connectionLost = false;
+	/** How live events become the quiet conversation's turn boxes (created on first use). */
+	private get turnFlow(): LiveTurnFlow {
+		this.liveTurnFlowStore ??= new LiveTurnFlow(this.createLiveTurnFlowHost());
+		return this.liveTurnFlowStore;
 	}
-	/** The change strip under each finished quiet turn's answer. */
-	private get turnStrips(): WeakMap<TurnSummaryComponent, TurnStripComponent> {
-		this.turnStripsStore ??= new WeakMap();
-		return this.turnStripsStore;
-	}
-	/** The short settle after agent_end before a turn's box shows its finished face. */
-	private turnFinishTimer: ReturnType<typeof setTimeout> | undefined;
-	/** How the live run's latest assistant message ended: a user message after a tool call is an interjection. */
-	private lastLiveAssistantStop: AssistantMessage["stopReason"] | undefined;
-	/**
-	 * The previous run stopped right after a step to take a message typed meanwhile
-	 * (the queue's 做完手上这一步就看): that message is an interjection in the same box.
-	 */
-	private runCutMidTask = false;
-	/** The owner interrupted the running turn (Escape): its box ends as stopped. */
-	private userStoppedRun = false;
-	/** A compaction row still waiting for the context size it ended with (the next reply's usage). */
-	private compactionAwaitingAfter: string | undefined;
-	/** A run-starting message (a prompt) arrived since the last agent_start; otherwise the run continues a turn. */
-	private starterSinceRunStart = false;
-	/** The newest turn that finished in this view, for the status bar's done/stopped face. */
-	private lastFinishedTurn: TurnActivityState | undefined;
 	/** Output tokens of the whole session, from the session stats. */
 	private sessionOutputTokens: number | undefined;
 	/** The keyboard walking a turn's box (`app.turn.focus`). */
@@ -2014,7 +2120,7 @@ export class InteractiveMode {
 						rawKeyHint("/effort", "调推理强度"),
 						hint("app.model.select", "选模型"),
 						hint("app.tools.expand", "展开过程（工具调用、输出和改动）"),
-						hint("app.thinking.toggle", "展开 Thinking"),
+						hint("app.thinking.toggle", "展开思考"),
 						hint("app.messages.expand", "展开代理消息"),
 						hint("app.subagents.focus", "查看子代理"),
 						hint("app.editor.external", "外部编辑器"),
@@ -2082,7 +2188,12 @@ export class InteractiveMode {
 
 		await this.rebindCurrentSession();
 
-		await this.renderInitialMessages();
+		// The first replay runs in the event queue: attaching to a running session,
+		// an event that arrives while the replay waits on its requests is handled
+		// after it, against the chat it built, instead of being lost halfway through.
+		const firstRender = this.sessionEventQueue.then(() => this.renderInitialMessages());
+		this.sessionEventQueue = firstRender.catch(() => {});
+		await firstRender;
 
 		onThemeChange(() => {
 			this.ui.invalidate();
@@ -3354,7 +3465,8 @@ export class InteractiveMode {
 		const snapshot: FooterTelemetrySnapshot = {
 			modelName: model?.id,
 			thinkingLevel,
-			contextTokens: usage?.tokens ?? undefined,
+			// null (just compacted, not measured yet) stays null: the footer says so.
+			contextTokens: usage ? usage.tokens : undefined,
 			contextWindow: usage?.contextWindow,
 			compactionThresholdTokens: thresholdTokens,
 		};
@@ -3682,15 +3794,10 @@ export class InteractiveMode {
 		this.chatTranscriptTrimmed = false;
 		this.chatCapRebuildFloor = 0;
 		// The previous session's turns are gone with its chat.
-		if (this.turnFinishTimer) clearTimeout(this.turnFinishTimer);
-		this.turnFinishTimer = undefined;
+		this.liveTurnFlowStore?.reset();
 		this.currentTurnState = undefined;
 		this.currentTurnSummary = undefined;
-		this.lastFinishedTurn = undefined;
 		this.sessionOutputTokens = undefined;
-		this.lastLiveAssistantStop = undefined;
-		this.compactionAwaitingAfter = undefined;
-		this.bashHandleCommandsStore?.clear();
 		this.resetSubagentSummary();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
@@ -3707,9 +3814,14 @@ export class InteractiveMode {
 		// Replacement events own the session-scoped command catalog. The daemon
 		// sends that event before its command response, but its handler may still
 		// be refreshing commands when the response resolves.
-		await this.sessionEventQueue;
-		this.resetCurrentSessionRenderState();
-		await this.renderInitialMessages();
+		// The replay itself runs in the queue: an event that arrives while it waits
+		// on its requests is handled after it, against the chat it built.
+		const run = Promise.resolve(this.sessionEventQueue).then(async () => {
+			this.resetCurrentSessionRenderState();
+			await this.renderInitialMessages();
+		});
+		this.sessionEventQueue = run.catch(() => {});
+		await run;
 		this.updatePendingMessagesDisplay();
 		this.syncWorkingLoader();
 	}
@@ -3795,39 +3907,33 @@ export class InteractiveMode {
 		}
 	}
 
-	/** Files a settled step changed land on its turn, so the collapsed process line can list them. */
-	private recordTurnFileChanges(
-		state: TurnActivityState | undefined,
-		toolCallId: string,
-		result: { details?: unknown; isError: boolean },
-	): void {
-		const step = state?.steps.find((candidate) => candidate.toolCallId === toolCallId);
-		if (!state || !step) {
-			return;
-		}
-		const cwd = this.getCurrentCwd();
-		state.addFileChanges(
-			getToolFileChanges(step.toolName, step.args, result, cwd).map((change) => ({
-				...change,
-				path: formatFileChangePath(change.path, cwd),
-			})),
-		);
-	}
-
-	/** Create the run's turn-summary line once, before its first tool block. */
-	private ensureCurrentTurnSummary(): void {
-		if (this.currentTurnSummary) {
-			return;
-		}
-		const state = new TurnActivityState(this.workingStartedAt ?? Date.now());
-		state.live = true;
-		const summary = this.createTurnSummary(state);
-		summary.setExpanded(this.toolOutputExpanded);
-		// TUI v4: the live turn head renders the one-line footnote in quiet mode.
-		summary.setQuiet(this.settingsManager.getProcessMode() === "quiet");
-		this.currentTurnState = state;
-		this.currentTurnSummary = summary;
-		this.chatContainer.addChild(summary);
+	/** What the live turn flow reads from and changes in this screen. */
+	private createLiveTurnFlowHost(): LiveTurnFlowHost {
+		return {
+			chat: () => this.chatContainer,
+			quiet: () => quietConversation(this),
+			isStreaming: () => this.isAgentStreaming(),
+			retryPending: () => this.getRetryAttempt() > 0,
+			compacting: () => this.isAgentCompacting(),
+			contextTokens: () => {
+				const tokens = this.getConnectionContextUsage()?.tokens;
+				return typeof tokens === "number" ? tokens : undefined;
+			},
+			cwd: () => this.getCurrentCwd(),
+			rlmNodeId: () => this.rlmNodeId,
+			createSummary: (state) => this.createTurnSummary(state),
+			runStartedAt: () => this.workingStartedAt,
+			startExpanded: () => this.toolOutputExpanded,
+			currentState: () => this.currentTurnState,
+			currentSummary: () => this.currentTurnSummary,
+			setCurrent: (summary) => {
+				this.currentTurnSummary = summary;
+				this.currentTurnState = summary?.state;
+			},
+			foldEarlierAnswers: (summary) => foldEarlierAnswers(this.chatContainer.children, summary),
+			requestRender: () => this.ui.requestRender(),
+			liveChanged: () => this.updateWorkingPulse(),
+		};
 	}
 
 	private async getOrCreatePendingToolComponent(
@@ -3870,13 +3976,7 @@ export class InteractiveMode {
 				this.ui,
 				this.getCurrentCwd(),
 			);
-			this.ensureCurrentTurnSummary();
-			this.currentTurnState?.addStep({
-				toolCallId: latestToolCall.id,
-				toolName: latestToolCall.name,
-				args: latestToolCall.arguments,
-				status: this.startedToolCalls.has(latestToolCall.id) ? "running" : "queued",
-			});
+			this.turnFlow.noteToolCall(latestToolCall, this.startedToolCalls.has(latestToolCall.id));
 			component.setTurnActivity(this.currentTurnState);
 			// The live turn's own lanes (K3 ②), falling back to the globals.
 			component.setExpanded(this.currentTurnState ? !this.currentTurnState.isCollapsed : this.toolOutputExpanded);
@@ -4520,7 +4620,7 @@ export class InteractiveMode {
 	private renderRecap(): void {
 		if (!this.recapContainer) return;
 		this.recapContainer.clear();
-		const recap = this.sessionRecap?.trim();
+		const recap = recapLineText(this.sessionRecap, quietConversation(this));
 		// The quiet conversation's change strip under each answer already says it.
 		const showChanges = !this.isAgentStreaming() && this.agentRunFileChanges.size > 0 && !quietConversation(this);
 		if (showChanges) {
@@ -4529,7 +4629,7 @@ export class InteractiveMode {
 			);
 		}
 		if (recap) {
-			this.recapContainer.addChild(new TruncatedText(theme.fg("dim", `回顾：${recap}`), 1, 0));
+			this.recapContainer.addChild(new TruncatedText(theme.fg("dim", recap), 1, 0));
 		}
 		if ((recap || showChanges) && !this.featureHintComponent) {
 			this.recapContainer.addChild(new Spacer(1));
@@ -4680,8 +4780,10 @@ export class InteractiveMode {
 			getAllThemes: () => getAvailableThemesWithPaths(),
 			getTheme: (name) => getThemeByName(name),
 			setTheme: (themeOrName) => {
+				// Cached lines (a finished turn's box) carry the old colors: redraw them all.
 				if (themeOrName instanceof Theme) {
 					setThemeInstance(themeOrName);
+					this.ui.invalidate();
 					this.ui.requestRender();
 					return { success: true };
 				}
@@ -4690,6 +4792,7 @@ export class InteractiveMode {
 					if (this.settingsManager.getTheme() !== themeOrName) {
 						this.settingsManager.setTheme(themeOrName);
 					}
+					this.ui.invalidate();
 					this.ui.requestRender();
 				}
 				return result;
@@ -5078,13 +5181,15 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.tools.expandFull", () => this.toggleToolOutputFull());
 		this.defaultEditor.onAction("app.messages.expand", () => this.toggleAgentMessageExpansion());
 		this.defaultEditor.onAction("app.messages.expandAll", () => this.toggleAgentMessageExpansion(true));
-		// Registered before app.edits.expand: both default to the same key, and
-		// outside the quiet conversation this one declines it.
-		this.defaultEditor.onAction("app.turn.focus", () => this.focusLatestTurnBox());
+		// Both default to ctrl+j; the turn focus key comes first and, without
+		// boxes, opens the edit diffs itself, so both keys agree in every mode.
+		this.defaultEditor.onAction("app.turn.focus", () => {
+			this.focusLatestTurnBox();
+		});
 		this.defaultEditor.onAction("app.edits.expand", () => this.toggleEditDiffExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
 		this.defaultEditor.onAction("app.thinking.toggleAll", () => this.toggleThinkingBlockVisibility(true));
-		this.defaultEditor.onAction("app.subagents.focus", () => this.focusSubagentSummary());
+		this.defaultEditor.onAction("app.subagents.focus", () => this.focusSubagentSummaryFromKey());
 		this.defaultEditor.onAction("app.subagents.stopAll", () => void this.requestStopAllSubagents());
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
 			void this.showHeartbeatManager();
@@ -6171,6 +6276,8 @@ export class InteractiveMode {
 					const generation = this.sessionEventGeneration;
 					const run = this.sessionEventQueue.then(async () => {
 						if (generation !== this.sessionEventGeneration) return false;
+						this.connectionLost = false;
+						this.liveTurnFlowStore?.connectionRestored();
 						await this.refreshCommandCatalogForCurrentSession?.();
 						if (generation !== this.sessionEventGeneration) return false;
 						await this.renderResyncedSession(event.snapshot);
@@ -6188,6 +6295,7 @@ export class InteractiveMode {
 					await this.handleConnectionExtensionUiRequest(event.request);
 				} else if (event.type === "connection_status") {
 					if (event.status === "connected") {
+						this.connectionLost = false;
 						const banner = formatDaemonReconnectBanner(event.daemonVersion, VERSION);
 						this.showStatus(banner.message, banner.tone);
 					} else if (event.backgroundAttempt !== undefined) {
@@ -6205,13 +6313,36 @@ export class InteractiveMode {
 					await this.refreshHeartbeatCatalog();
 				} else if (event.type === "closed") {
 					if (!this.returnToParentAfterSubagentClosed(event.sessionClosedReason)) {
-						this.showError(event.error ?? "Agent connection closed");
+						this.noteConnectionClosed();
+						this.showError(
+							event.sessionClosedReason
+								? (event.error ?? "Agent connection closed")
+								: `和后台的连接断了${event.error ? `（${event.error}）` : ""}`,
+						);
 					}
 				}
 			} catch (error) {
 				this.showError(error instanceof Error ? error.message : String(error));
 			}
 		});
+	}
+
+	/**
+	 * The session's events stopped for good (the reconnect budget ran out, or the
+	 * session closed): nothing works any more, so the working face goes and the
+	 * live box finishes, saying the connection was lost.
+	 */
+	private noteConnectionClosed(): void {
+		this.connectionLost = true;
+		if (quietConversation(this)) this.turnFlow.connectionLost();
+		this.turnStartedAt = undefined;
+		this.patchConnectionState({ isStreaming: false, isCompacting: false, isBashRunning: false, retryAttempt: 0 });
+		this.retryCountdown?.dispose();
+		this.retryCountdown = undefined;
+		this.retryLoader?.stop();
+		this.retryLoader = undefined;
+		this.syncWorkingLoader();
+		this.ui.requestRender();
 	}
 
 	private async handleConnectionExtensionUiRequest(request: AgentConnectionExtensionUiRequest): Promise<void> {
@@ -6441,18 +6572,7 @@ export class InteractiveMode {
 				// The quiet conversation groups by prompt instead: a run without a
 				// prompt of its own (a retry, a compaction's continuation) goes on in
 				// the same box, exactly as a replay of the transcript groups it.
-				this.starterSinceRunStart = false;
-				this.runCutMidTask =
-					quietConversation(this) &&
-					this.lastLiveAssistantStop === "toolUse" &&
-					this.currentTurnState?.boxMode === true &&
-					!this.currentTurnState.timeline.stopped;
-				this.lastLiveAssistantStop = undefined;
-				this.userStoppedRun = false;
-				if (!quietConversation(this)) {
-					this.currentTurnState = undefined;
-					this.currentTurnSummary = undefined;
-				}
+				this.turnFlow.agentStart();
 				this.stopWorkingLoader();
 				if (this.workingVisible) {
 					this.startWorkingLoader();
@@ -6578,16 +6698,9 @@ export class InteractiveMode {
 					}
 				}
 				if (event.message.role === "custom") {
-					// A run-starting message outside a running tool loop (a heartbeat,
-					// an agent message while idle) starts a new turn box.
-					if (
-						quietConversation(this) &&
-						startsAgentRun(event.message) &&
-						this.lastLiveAssistantStop !== "toolUse"
-					) {
-						this.starterSinceRunStart = true;
-						this.endLiveTurnForNewRun();
-					}
+					// A run-starting message outside a running tool loop starts a new turn
+					// box; a notice the box shows as its own row goes there instead of the chat.
+					const inBox = this.turnFlow.customMessage(event.message);
 					if (isSessionSlashCommandMessage(event.message) && event.message.details.command.name === "refine") {
 						this.startRefineLoader();
 					}
@@ -6610,51 +6723,23 @@ export class InteractiveMode {
 					if (isAgentSessionMessage(event.message) && event.message.display) {
 						(this.currentTurnSummary ?? this.latestTurnSummary())?.addCommMessage();
 					}
-					this.addMessageToChat(event.message);
+					if (!inBox) this.addMessageToChat(event.message);
 					this.ui.requestRender();
 				} else if (event.message.role === "user") {
-					const quiet = quietConversation(this);
 					// Typed while the AI was mid-way through its steps: the interjection is
 					// a row in the running turn's box (`› 你插话：…`), not a new turn.
-					const steered = this.lastLiveAssistantStop === "toolUse" || this.runCutMidTask;
-					if (quiet && steered && this.currentTurnState?.boxMode) {
-						const state = this.currentTurnState;
-						// A run that stopped to take this message goes on in the same box.
-						if (state.isTurnEnded && this.currentTurnSummary) this.resumeTurn(this.currentTurnSummary);
-						const text = this.getUserMessageText(event.message).trim() || "[图片]";
-						state.timeline.addSteer(text, Number(event.message.timestamp) || Date.now());
+					const text = this.getUserMessageText(event.message);
+					if (this.turnFlow.userMessage(text, Number(event.message.timestamp)) === "interjection") {
 						this.ui.requestRender();
 						break;
 					}
-					this.starterSinceRunStart = true;
-					if (quiet) this.endLiveTurnForNewRun();
 					this.addMessageToChat(event.message);
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
 					this.noticeImageModelServing(event.message);
-					this.runCutMidTask = false;
-					if (quietConversation(this)) {
-						// No prompt since the run started: this run continues a turn that
-						// already ended (a retry, the work after a compaction).
-						const current = this.currentTurnSummary;
-						if (current?.state.isTurnEnded) {
-							this.resumeTurn(current);
-						} else if (!current && !this.starterSinceRunStart) {
-							const turn = this.continuableTurn();
-							if (turn) this.resumeTurn(turn);
-						}
-					}
-					// U6: the turn's aggregate line is created at the turn head,
-					// before the first streaming assistant component.
-					this.ensureCurrentTurnSummary();
-					this.currentTurnState?.timeline.noteMessage(event.message, false);
-					this.currentTurnState?.setLiveThinkingSegments(countThinkingSegments(event.message));
-					if (this.currentTurnState) {
-						// v3: the header names the model; until the first token arrives the
-						// card says it is waiting for the reply.
-						this.currentTurnState.modelId = event.message.model || this.currentTurnState.modelId;
-						this.currentTurnState.notePhase("waiting");
-					}
+					// The turn's head is created before the first streaming assistant
+					// component; a run without a prompt of its own continues its turn.
+					this.turnFlow.assistantStart(event.message);
 					this.startAssistantStreamingMessage(event.message);
 					this.ui.requestRender();
 				}
@@ -6664,30 +6749,7 @@ export class InteractiveMode {
 				if (event.message.role === "assistant") {
 					this.streamingMessage = event.message;
 					this.ensureAssistantStreamingComponent(event.message).updateContent(this.streamingMessage, true);
-					this.currentTurnState?.setLiveThinkingSegments(countThinkingSegments(event.message));
-					if (this.currentTurnState) {
-						const kind = event.assistantMessageEvent.type;
-						if (kind === "thinking_start" || kind === "thinking_delta") {
-							this.currentTurnState.noteThinking(true);
-						} else if (kind === "thinking_end" || kind === "text_start" || kind === "toolcall_start") {
-							this.currentTurnState.noteThinking(false);
-						}
-						// v3: the running card names the model's phase.
-						if (kind === "thinking_start" || kind === "thinking_delta") {
-							this.currentTurnState.notePhase("thinking");
-						} else if (kind === "text_start" || kind === "text_delta") {
-							this.currentTurnState.notePhase("writing");
-						} else if (kind === "toolcall_start" || kind === "toolcall_delta") {
-							this.currentTurnState.notePhase("waiting");
-						} else {
-							this.currentTurnState.noteActivity();
-						}
-						const thinking = latestThinkingText(event.message);
-						this.currentTurnState.latestThinking = thinking || this.currentTurnState.latestThinking;
-						this.currentTurnState.currentThinking = thinking;
-						this.currentTurnState.timeline.noteMessage(event.message, false);
-						this.currentTurnState.timeline.noteStreamEvent(event.message, event.assistantMessageEvent);
-					}
+					this.turnFlow.assistantUpdate(event.message, event.assistantMessageEvent);
 
 					for (const content of this.streamingMessage.content) {
 						if (content.type === "toolCall") {
@@ -6704,28 +6766,8 @@ export class InteractiveMode {
 					// Each landed assistant message grows the mother's own usage, i.e. the
 					// secondary "总" figure; throttled, so this stays cheap mid-turn.
 					this.scheduleSubagentSpendRefresh();
-					// U6: the landed message's thinking blocks settle into the turn count.
-					this.lastLiveAssistantStop = event.message.stopReason;
-					if (this.currentTurnState) {
-						this.currentTurnState.addThinkingSegments(countThinkingSegments(event.message));
-						this.currentTurnState.setLiveThinkingSegments(0);
-						this.currentTurnState.noteThinking(false);
-						this.currentTurnState.notePhase("waiting");
-						const timeline = this.currentTurnState.timeline;
-						timeline.noteMessage(event.message, true);
-						// The box says how the run ended: stopped by the owner, or on an error
-						// no retry recovers (a retry reopens the turn and clears this).
-						if (event.message.stopReason === "aborted") timeline.stopped = true;
-						if (event.message.stopReason === "error") timeline.errorEnded = true;
-					}
-					// The first reply after a compaction measures the context it left.
-					const awaiting = this.compactionAwaitingAfter;
-					const usage = event.message.usage;
-					const contextTokens = usage ? usage.input + usage.cacheRead + usage.cacheWrite + usage.output : 0;
-					if (awaiting && contextTokens > 0) {
-						this.compactionAwaitingAfter = undefined;
-						this.setCompactionAfter(awaiting, contextTokens);
-					}
+					// The landed message settles into its turn (and a dying one settles its steps).
+					this.turnFlow.assistantEnd(event.message);
 					this.streamingMessage = event.message;
 					let errorMessage: string | undefined;
 					if (this.streamingMessage.stopReason === "aborted") {
@@ -6744,25 +6786,14 @@ export class InteractiveMode {
 						if (!errorMessage) {
 							errorMessage = this.streamingMessage.errorMessage || "Error";
 						}
-						// P1-B (Qwen review): a message that dies mid-turn leaves its
-						// steps "running" forever in the live path (the replay marks
-						// them error from stopReason) - the ⚙ line never settles and
-						// the live tool rows stay unfolded. Mark every still-pending
-						// step error so the aggregate ends with ✗N, exactly like the
-						// replay face, and stamp the turn's clock.
-						const endedAt = Number(event.message.timestamp) || Date.now();
-						for (const step of this.currentTurnState?.steps ?? []) {
-							if (step.status === "queued" || step.status === "running") {
-								this.currentTurnState?.setStepStatus(step.toolCallId, "error", endedAt);
-							}
-						}
+						// P1-B (Qwen review): the dying message's steps settled as error in its
+						// turn (the flow did that); their live rows say so too.
 						for (const [, component] of this.pendingTools.entries()) {
 							component.updateResult({
 								content: [{ type: "text", text: errorMessage }],
 								isError: true,
 							});
 						}
-						this.currentTurnState?.markTurnEnded(endedAt);
 						this.resetPendingToolState();
 					} else {
 						// Args are now complete - trigger diff computation for edit tools
@@ -6781,6 +6812,8 @@ export class InteractiveMode {
 
 			case "tool_execution_start": {
 				this.startedToolCalls.add(event.toolCallId);
+				// The start event carries the complete arguments; streaming may have left partial ones.
+				this.turnFlow.toolStart(event.toolCallId, event.toolName, event.args);
 				let component = this.pendingTools.get(event.toolCallId);
 				if (!component) {
 					component = await this.getOrCreatePendingToolComponent({
@@ -6792,29 +6825,20 @@ export class InteractiveMode {
 				if (component) {
 					component.markExecutionStarted();
 				}
-				// The start event carries the complete arguments; streaming may have left partial ones.
-				this.currentTurnState?.updateStepArgs(event.toolCallId, event.args);
-				this.currentTurnState?.markRunning(event.toolCallId);
-				if (quietConversation(this)) {
-					this.noteStepHandles(this.currentTurnState, event.toolCallId, event.args);
-				}
 				this.ui.requestRender();
 				break;
 			}
 
 			case "tool_execution_update": {
-				// Fresh output: the running card's quiet clock restarts.
-				this.currentTurnState?.noteActivity();
 				const component = this.pendingTools.get(event.toolCallId);
-				// Partial results carry the steps, files and memories so far: the box
-				// shows them as they happen, in the turn that shows the step (a step
-				// replayed from history before it finished belongs to its own turn).
-				(component?.turnState ?? this.currentTurnState)?.timeline.mergeStep(
+				// Partial results carry the steps, files and memories so far, in the turn
+				// that shows the step (a step replayed from history belongs to its own turn).
+				this.turnFlow.toolUpdate(
 					event.toolCallId,
 					event.toolName,
 					event.args,
-					{ ...event.partialResult, isError: false },
-					true,
+					event.partialResult ?? {},
+					component?.turnState,
 				);
 				if (component) {
 					component.updateResult({ ...event.partialResult, isError: false }, true);
@@ -6825,23 +6849,17 @@ export class InteractiveMode {
 
 			case "tool_execution_end": {
 				const component = this.pendingTools.get(event.toolCallId);
-				const owner = component?.turnState ?? this.currentTurnState;
-				owner?.timeline.mergeStep(
+				this.turnFlow.toolEnd(
 					event.toolCallId,
 					event.toolName,
-					owner.steps.find((step) => step.toolCallId === event.toolCallId)?.args,
-					{ ...event.result, isError: event.isError },
-					false,
+					event.result ?? {},
+					event.isError,
+					component?.turnState,
 				);
 				if (component) {
 					component.updateResult({ ...event.result, isError: event.isError });
 					this.pendingTools.delete(event.toolCallId);
 					this.startedToolCalls.delete(event.toolCallId);
-					owner?.setStepStatus(event.toolCallId, event.isError ? "error" : "done");
-					this.recordTurnFileChanges(owner, event.toolCallId, {
-						details: event.result?.details,
-						isError: event.isError,
-					});
 				}
 				// U2: consecutive tool errors; a success resets the streak. Counted
 				// outside the component lookup: an unknown id still settled a tool.
@@ -6882,15 +6900,9 @@ export class InteractiveMode {
 					this.ui.terminal.setProgress(false);
 				}
 				this.turnStartedAt = undefined;
-				// The run is over; a thinking-only turn's clock stops here (a tool
-				// turn already froze on its last settled step).
-				this.currentTurnState?.markTurnEnded(Date.now());
-				// Interrupted by the owner mid-step: the box says it stopped.
-				if (this.userStoppedRun && this.currentTurnState?.boxMode) this.currentTurnState.timeline.stopped = true;
-				this.userStoppedRun = false;
-				// The box shows its finished face after a short settle: a retry or a
-				// compaction's continuation may still carry the same turn on.
-				if (this.currentTurnState?.boxMode) this.scheduleTurnFinish(this.currentTurnState);
+				// The run is over: the turn's clock stops, and its box settles into the
+				// finished face unless a retry or a compaction carries it on.
+				this.turnFlow.agentEnd();
 				// Drops the loader; background subagents are shown by the tree, not the loader.
 				this.syncWorkingLoader();
 				if (this.streamingComponent) {
@@ -6933,13 +6945,7 @@ export class InteractiveMode {
 
 			case "compaction_start": {
 				// An automatic compaction is a row in the turn it interrupts.
-				let compactionInBox = false;
-				if (quietConversation(this) && event.reason !== "manual") {
-					const turn = this.continuableTurn();
-					const tokens = this.getConnectionContextUsage()?.tokens;
-					turn?.state.timeline.startCompaction(Date.now(), typeof tokens === "number" ? tokens : undefined);
-					compactionInBox = turn !== undefined;
-				}
+				const compactionInBox = quietConversation(this) && this.turnFlow.compactionStart(event.reason);
 				this.startCompactionLoader(event.reason, event.customInstructions, compactionInBox);
 				// The queue header now reads "compacting context"; repaint it without
 				// touching statusContainer (the loader). Only queuedMessagesContainer changes.
@@ -6960,8 +6966,7 @@ export class InteractiveMode {
 				// Restore the working loader if streaming/subagents still warrant it.
 				this.syncWorkingLoader();
 				// Settle the turn's compaction row before a rebuild carries it over.
-				const compactionKey =
-					quietConversation(this) && event.reason !== "manual" ? this.endTimelineCompaction(event) : undefined;
+				const compactionKey = quietConversation(this) ? this.turnFlow.compactionEnd(event) : undefined;
 				if (event.aborted) {
 					if (event.reason === "manual") this.showError("已取消压缩");
 				} else if (event.result) {
@@ -6972,9 +6977,7 @@ export class InteractiveMode {
 						this.showError(`压缩完成，但对话没能刷新：${message}`);
 					}
 					await this.refreshConnectionContextUsage();
-					if (compactionKey && !this.noteCompactionResult(compactionKey)) {
-						this.compactionAwaitingAfter = compactionKey;
-					}
+					if (compactionKey) this.turnFlow.compactionRebuilt(compactionKey);
 					this.footer.invalidate();
 				} else if (event.errorMessage && event.reason === "manual") {
 					if (event.errorSeverity === "warning") this.showWarning(event.errorMessage);
@@ -6988,20 +6991,7 @@ export class InteractiveMode {
 
 			case "auto_retry_start": {
 				// A retry carries the same turn on: its box reopens with a countdown row.
-				let retryInBox = false;
-				if (quietConversation(this)) {
-					const turn = this.continuableTurn();
-					if (turn) {
-						const state = this.resumeTurn(turn);
-						state.timeline.startRetry({
-							startedAt: Date.now(),
-							delayMs: event.delayMs,
-							attempt: event.attempt,
-							reason: describeRetryReason(event),
-						});
-						retryInBox = true;
-					}
-				}
+				const retryInBox = quietConversation(this) && this.turnFlow.retryStart(event);
 				this.stopWorkingLoader();
 				this.statusContainer.clear();
 				this.retryCountdown?.dispose();
@@ -7048,14 +7038,7 @@ export class InteractiveMode {
 			}
 
 			case "auto_retry_end": {
-				const retryState = this.currentTurnState;
-				if (retryState?.boxMode) {
-					retryState.timeline.endRetry(event.success ? "ok" : "failed", event.finalError);
-					if (!event.success) {
-						retryState.timeline.errorEnded = true;
-						if (retryState.isTurnEnded) this.scheduleTurnFinish(retryState);
-					}
-				}
+				this.turnFlow.retryEnd(event);
 				if (this.retryCountdown) {
 					this.retryCountdown.dispose();
 					this.retryCountdown = undefined;
@@ -7092,7 +7075,7 @@ export class InteractiveMode {
 
 			case "rlm_child_update":
 				this.updateSubagentSummary(event.child);
-				if (quietConversation(this)) this.bindSubagentRow(event.child);
+				if (quietConversation(this)) this.turnFlow.subagentUpdate(event.child);
 				break;
 
 			case "goal_update":
@@ -7669,6 +7652,12 @@ export class InteractiveMode {
 		return true;
 	}
 
+	/** Alt+A: same as focusSubagentSummary(), but says why when there is nothing to focus. */
+	private focusSubagentSummaryFromKey(): void {
+		if (this.focusSubagentSummary()) return;
+		this.showToast("现在没有子代理可以查看");
+	}
+
 	/**
 	 * Enter on the subagent panel: straight into the selected child when it has a
 	 * daemon session to attach to, else this session's children list.
@@ -7837,22 +7826,17 @@ export class InteractiveMode {
 	private getStatusBarState(): StatusBarState | undefined {
 		const model = this.getCurrentModel();
 		if (!model) return undefined;
-		const levelWords: Record<string, string> = {
-			minimal: "最低",
-			low: "低",
-			medium: "中",
-			high: "高",
-			xhigh: "很高",
-			max: "最高",
-		};
 		const thinkingLevel = this.connectionState?.thinkingLevel;
-		const level = model.reasoning && thinkingLevel ? levelWords[thinkingLevel] : undefined;
+		const level = model.reasoning && thinkingLevel ? THINKING_LEVEL_WORDS[thinkingLevel] : undefined;
 		const usage = this.getConnectionContextUsage();
 		let context: StatusBarState["context"];
 		if (usage && usage.tokens !== null && usage.contextWindow > 0) {
 			const percent = (usage.tokens / usage.contextWindow) * 100;
 			const threshold = this.getFooterTelemetrySource().snapshot?.compactionThresholdTokens ?? 0;
 			context = { percent, warn: percent >= 80 || (threshold > 0 && usage.tokens >= threshold) };
+		} else if (usage && usage.tokens === null && usage.contextWindow > 0) {
+			// Just compacted: the size is measured again with the next reply.
+			context = { warn: false };
 		}
 		const branch = this.footerDataProvider.getGitBranch();
 		const location = [formatSplashCwd(this.getCurrentCwd()), branch ?? undefined].filter(Boolean).join(" · ");
@@ -7873,7 +7857,7 @@ export class InteractiveMode {
 			toast && toast.until > Date.now() ? `${theme.bg("toastBg", theme.fg("toastText", ` ${toast.text} `))} ` : "";
 		const dot = theme.fg("dim", " · ");
 		const state = this.currentTurnState;
-		const working = this.isAgentStreaming() || this.hasLiveTurnBox();
+		const working = this.isAgentStreaming() || this.turnFlow.hasLiveBox();
 		const withToast = (variants: string[]) => variants.map((variant) => `${toastChip}${variant}`);
 		if (working || this.isAgentCompacting()) {
 			const startedAt = this.workingStartedAt ?? this.turnStartedAt;
@@ -7897,12 +7881,15 @@ export class InteractiveMode {
 			this.sessionOutputTokens !== undefined && this.sessionOutputTokens > 0
 				? theme.fg("dim", `本会话 ↓ ${formatBoxTokens(this.sessionOutputTokens)}`)
 				: "";
-		const last = this.lastFinishedTurn;
+		if (this.connectionLost) return withToast([`${theme.fg("error", "✗")} ${theme.fg("muted", "和后台的连接断了")}`]);
+		const last = this.liveTurnFlowStore?.lastFinished;
 		if (last) {
 			const stopped = last.timeline.stopped;
 			const head = stopped
 				? `${theme.fg("dim", "■")} ${theme.fg("muted", "已停止")}`
-				: `${theme.fg("diffAddedText", "✓")} ${theme.fg("muted", "完成")}`;
+				: last.timeline.errorEnded
+					? `${theme.fg("error", "✗")} ${theme.fg("muted", "出错")}`
+					: `${theme.fg("diffAddedText", "✓")} ${theme.fg("muted", "完成")}`;
 			const clock = theme.fg("muted", formatBoxDuration(last.turnDurationMs()));
 			const figure = theme.fg("muted", `↓ ${formatBoxTokens(last.timeline.outputTokens())}`);
 			const variants = [
@@ -7926,7 +7913,7 @@ export class InteractiveMode {
 		const promptEmpty = (this.editor.getExpandedText?.() ?? this.editor.getText()).length === 0;
 		const agentsBack =
 			this.options.returnToAgentsView && promptEmpty ? hint("app.agents.back", "会话列表") : undefined;
-		if (this.boxFocus) return turnBoxFocusHints();
+		if (this.boxFocus) return turnBoxFocusHints(this.boxFocusEnterLabel());
 		if (quietConversation(this)) {
 			// The status bar says how to stop a run; the rule offers the box and the help.
 			const quietHints = this.isNewChat()
@@ -8154,7 +8141,7 @@ export class InteractiveMode {
 	private async copyFullscreenSelection(text: string): Promise<void> {
 		try {
 			await copyToClipboard(text);
-			this.showToast("✓ copied");
+			this.showToast("✓ 已复制");
 		} catch (error) {
 			this.showError(`复制失败：${error instanceof Error ? error.message : String(error)}`);
 		}
@@ -8198,7 +8185,9 @@ export class InteractiveMode {
 		) {
 			return new UserMessageComponent("[Malformed session command message]", this.getMarkdownThemeWithSettings());
 		}
-		if (isCompactionOutcomeMessage(message)) return new CompactionOutcomeMessageComponent(message);
+		if (isCompactionOutcomeMessage(message)) {
+			return new CompactionOutcomeMessageComponent(message, { quiet: quietConversation(this) });
+		}
 		if (message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE) {
 			return new MalformedCompactionOutcomeMessageComponent();
 		}
@@ -8261,6 +8250,13 @@ export class InteractiveMode {
 				break;
 			}
 			case "compactionSummary": {
+				// The quiet conversation says it in one faint line; the summary opens on a click.
+				if (quietConversation(this)) {
+					this.chatContainer.addChild(
+						new QuietCompactionNoticeComponent(message, this.getMarkdownThemeWithSettings()),
+					);
+					break;
+				}
 				this.chatContainer.addChild(new Spacer(1));
 				const component = new CompactionSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
 				component.setExpanded(this.toolOutputExpanded);
@@ -8403,15 +8399,22 @@ export class InteractiveMode {
 		const turnLanes = this.captureTurnLanes();
 		// The boxes' live-only facts (retries, compactions, subagents, thinking
 		// times) and their open rows carry over too, keyed by each of their messages.
-		const carriedBoxes = this.captureTurnBoxes();
-		this.bashHandleCommandsStore?.clear();
+		const carriedBoxes = this.turnFlow.captureBoxes();
+		this.turnFlow.forgetHandles();
 		const restoredSummaries: TurnSummaryComponent[] = [];
 		// T8: a rebuild re-creates every summary component; the open order
 		// cannot reference the dead ones.
 		this.processBlockOpenOrder = [];
 		this.resetPendingToolState();
 		const transcriptMessages = this.orderMessagesForTranscript(sessionContext.messages);
-		const messagesToRender = options.limitTranscript ? initialRenderMessages(transcriptMessages) : transcriptMessages;
+		const windowed = options.limitTranscript ? initialRenderMessages(transcriptMessages) : transcriptMessages;
+		// A window that starts inside a long turn keeps the turn's prompt, its real
+		// start, and a row saying how many of its steps it left out.
+		let cutTurn =
+			windowed.length < transcriptMessages.length && this.settingsManager.getProcessMode() === "quiet"
+				? windowCutTurn(transcriptMessages, windowed)
+				: undefined;
+		const messagesToRender = cutTurn?.prompt ? [cutTurn.prompt, ...windowed] : windowed;
 		// A failure notice older than the render window was still received by this session.
 		for (const message of transcriptMessages) {
 			if (message.role === "custom") this.noteSubagentFailureSeen(message);
@@ -8481,13 +8484,13 @@ export class InteractiveMode {
 		// An interjection lands after the step's results came back; a user
 		// message straight after a tool call (an orphaned call) starts a turn.
 		let replayResultsArrived = false;
-		// A step cut off by an interrupt with nothing after it: the owner stopped the turn there.
-		let replayResultAborted = false;
+		// How the last step's result says the turn went on (the owner's stop ends it there).
+		let replayResultStop = NO_STEP_STOP;
 		const closeReplayTurn = (): void => {
 			if (!replayQuiet || !replayTurnState || !replayTurnSummary) return;
-			replayTurnState.timeline.stopped = lastReplayAssistant?.stopReason === "aborted" || replayResultAborted;
+			replayTurnState.timeline.stopped = lastReplayAssistant?.stopReason === "aborted" || replayResultStop.stopped;
 			replayTurnState.timeline.errorEnded = lastReplayAssistant?.stopReason === "error";
-			this.attachTurnStrip(replayTurnSummary);
+			this.turnFlow.attachStrip(replayTurnSummary);
 		};
 
 		for (const message of messagesToRender) {
@@ -8499,7 +8502,7 @@ export class InteractiveMode {
 					replayTurnState &&
 					lastReplayAssistant?.stopReason === "toolUse" &&
 					replayResultsArrived &&
-					!replayResultAborted
+					!replayResultStop.endsTurn
 				) {
 					const text = this.getUserMessageText(message).trim() || "[图片]";
 					replayTurnState.timeline.addSteer(text, Number(message.timestamp) || Date.now());
@@ -8525,6 +8528,17 @@ export class InteractiveMode {
 					// TUI v4: quiet turns carry the one-line footnote at their head.
 					replayTurnSummary.setQuiet(replayQuiet);
 					this.chatContainer.addChild(replayTurnSummary);
+					if (cutTurn) {
+						if (cutTurn.startedAt !== undefined) replayTurnState.startedEarlier(cutTurn.startedAt);
+						if (cutTurn.hiddenSteps > 0) {
+							replayTurnState.timeline.earlierSteps = cutTurn.hiddenSteps;
+							replayTurnState.timeline.addNotice(
+								{ tone: "muted", text: `… 更早的 ${cutTurn.hiddenSteps} 步没列出` },
+								cutTurn.startedAt ?? 0,
+							);
+						}
+						cutTurn = undefined;
+					}
 				}
 				replayTurnState.modelId = message.model || replayTurnState.modelId;
 				replayTurnState.addThinkingSegments(countThinkingSegments(message));
@@ -8533,7 +8547,7 @@ export class InteractiveMode {
 				replayTurnState.noteReplyAt(Number(message.timestamp));
 				lastReplayAssistant = message;
 				replayResultsArrived = false;
-				replayResultAborted = false;
+				replayResultStop = NO_STEP_STOP;
 				this.addMessageToChat(message);
 				// Render tool call components
 				for (const content of message.content) {
@@ -8544,7 +8558,7 @@ export class InteractiveMode {
 							args: content.arguments,
 							status: "running",
 						} satisfies TurnStep);
-						if (replayQuiet) this.noteStepHandles(replayTurnState, content.id, content.arguments);
+						if (replayQuiet) this.turnFlow.noteStepHandles(replayTurnState, content.id, content.arguments);
 						const lanes = replayTurnState.steps.length === 1 ? turnLanes.get(content.id) : undefined;
 						if (lanes && replayTurnSummary) {
 							replayTurnState.setProcessKeySteps(lanes.keySteps);
@@ -8610,7 +8624,7 @@ export class InteractiveMode {
 				}
 			} else if (message.role === "toolResult") {
 				replayResultsArrived = true;
-				replayResultAborted = isAbortedStepResult(message);
+				replayResultStop = stepResultStop(message);
 				// Match tool results to pending tool components
 				const component = renderedPendingTools.get(message.toolCallId);
 				if (component) {
@@ -8629,7 +8643,7 @@ export class InteractiveMode {
 					message,
 					false,
 				);
-				this.recordTurnFileChanges(replayTurnState, message.toolCallId, message);
+				recordStepFileChanges(replayTurnState, message.toolCallId, message, this.getCurrentCwd());
 				// TUI v4: sent agent messages riding this tool result count as comms.
 				const details =
 					typeof message.details === "object" && message.details !== null
@@ -8648,6 +8662,17 @@ export class InteractiveMode {
 						replayTurnSummary?.addCommMessage();
 					}
 				}
+			} else if (replayQuiet && replayTurnState && message.role === "custom" && isBoxNoticeMessage(message)) {
+				// The box says it as its own row (a subagent that finished, a compaction that waited).
+				const record = boxRecordFromMessage(message);
+				const at = Number(message.timestamp) || 0;
+				if (record?.kind === "notice") replayTurnState.timeline.addNotice(record.notice, at);
+				if (record?.kind === "compaction") replayTurnState.timeline.addReplayCompaction(at, record.facts);
+			} else if (replayQuiet && replayTurnState && message.role === "compactionSummary") {
+				// Inside a turn the compaction is a row of its box.
+				replayTurnState.timeline.addReplayCompaction(Number(message.timestamp) || 0, {
+					before: message.tokensBefore,
+				});
 			} else {
 				// TUI v4: a received agent-message row is one comm in this turn.
 				if (isAgentSessionMessage(message) && message.display) {
@@ -8657,30 +8682,15 @@ export class InteractiveMode {
 				this.addMessageToChat(message, renderOptions);
 			}
 		}
+		// Within a box turn only the last reply's answer stays under the box.
+		if (replayQuiet) foldEarlierAnswers(this.chatContainer.children);
 
 		for (const [toolCallId, component] of renderedPendingTools) {
 			component.setIncludeImageDimensions(true);
 			this.pendingTools.set(toolCallId, component);
 		}
-		// Carry each box's live-only facts and open rows over to its replayed twin
-		// (the box that replays any of its messages).
-		if (carriedBoxes.size > 0) {
-			const keepHistory = options.keepCompactedHistory === true;
-			for (const child of this.chatContainer.children) {
-				if (!(child instanceof TurnSummaryComponent)) continue;
-				const carried = child.state.timeline.entries
-					.map((entry) => (entry.kind === "message" ? carriedBoxes.get(entry.key) : undefined))
-					.find((box) => box !== undefined);
-				if (!carried || carried === child) continue;
-				carried.state.timeline.transferTo(child.state.timeline, { keepHistory });
-				if (keepHistory) child.state.adoptHistory(carried.state);
-				// A box that was still settling when the chat was rebuilt finishes here.
-				const timeline = child.state.timeline;
-				if (timeline.observedLive && timeline.finishedAt === undefined && !this.isAgentStreaming()) {
-					this.scheduleTurnFinish(child.state);
-				}
-			}
-		}
+		// Carry each box's live-only facts and open rows over to its replayed twin.
+		this.turnFlow.carryOver(carriedBoxes, { keepHistory: options.keepCompactedHistory === true });
 		if (replayTurnState && (renderedPendingTools.size > 0 || this.isAgentStreaming())) {
 			// Attaching mid-run: live tool and thinking events keep feeding this
 			// turn's group, so the replayed state stays the live one - and stays
@@ -8997,6 +9007,8 @@ export class InteractiveMode {
 		// fails the thing it was stopping keeps running on screen, and the primary
 		// abort() reports its own failure to the user.
 		if (this.getRetryAttempt() > 0) {
+			// The owner's cancel: the box ends as stopped, not as failed.
+			if (quietConversation(this)) this.turnFlow.interrupt();
 			void this.agentConnection.abortRetry().catch(() => undefined);
 		}
 		if (this.isAgentCompacting()) {
@@ -9007,7 +9019,7 @@ export class InteractiveMode {
 			void this.agentConnection.abortBash().catch(() => undefined);
 		}
 		if (this.isAgentStreaming()) {
-			this.userStoppedRun = true;
+			if (quietConversation(this)) this.turnFlow.interrupt();
 			// Upstream #2426: the interrupt carries the queued steering messages out with it, so
 			// "stop - and here is what I meant instead" is one key press instead of an interrupt
 			// plus a resubmit. The queue is still preserved server-side, and a daemon too old for
@@ -9305,8 +9317,7 @@ export class InteractiveMode {
 		}
 		this.stop({ preserveAltScreen: options.preserveAltScreen });
 		setMotionFrameRequester(undefined);
-		if (this.turnFinishTimer) clearTimeout(this.turnFinishTimer);
-		this.turnFinishTimer = undefined;
+		this.liveTurnFlowStore?.dispose();
 		stopThemeWatcher();
 	}
 
@@ -9552,7 +9563,10 @@ export class InteractiveMode {
 		}
 		const blocks = this.navigableBlocks();
 		const start = this.blockNearestView(blocks);
-		if (!start) return;
+		if (!start) {
+			this.showToast("还没有可以查看的内容");
+			return;
+		}
 		const navigator: BlockNavigator = new BlockNavigator({
 			move: (step) => this.moveBlockFocus(step),
 			toggle: () => this.toggleFocusedBlock(),
@@ -9660,7 +9674,7 @@ export class InteractiveMode {
 		if (block instanceof AssistantMessageComponent) {
 			if (this.hideThinkingBlock || !block.hasThinkingTrace()) return undefined;
 			return {
-				label: summary.state.thinkingExpanded ? "收起 Thinking" : "展开 Thinking",
+				label: summary.state.thinkingExpanded ? "收起思考" : "展开思考",
 				run: () => this.toggleTurnThinking(summary),
 			};
 		}
@@ -9689,7 +9703,7 @@ export class InteractiveMode {
 		}
 		try {
 			await copyToClipboard(text);
-			this.showToast("✓ copied");
+			this.showToast("✓ 已复制");
 		} catch (error) {
 			this.showError(`复制失败：${error instanceof Error ? error.message : String(error)}`);
 		}
@@ -9726,7 +9740,11 @@ export class InteractiveMode {
 	 * quiet conversation, where the legacy binding on the same key applies.
 	 */
 	private focusLatestTurnBox(): boolean {
-		if (!quietConversation(this)) return false;
+		// Without boxes the key does what ctrl+j always did there: open or close the edit diffs.
+		if (!quietConversation(this)) {
+			this.toggleEditDiffExpansion();
+			return true;
+		}
 		if (this.boxFocus) {
 			this.endBoxFocus();
 			this.focusEditor();
@@ -9734,7 +9752,7 @@ export class InteractiveMode {
 		}
 		const summary = this.latestTurnSummary();
 		if (!summary?.state.boxMode) {
-			this.showStatus("还没有可看的步骤");
+			this.showToast("还没有可以看的步骤");
 			return true;
 		}
 		const navigator: TurnBoxNavigator = new TurnBoxNavigator({
@@ -9773,9 +9791,18 @@ export class InteractiveMode {
 
 	/** The focus targets of the walked turn: its box, then its change strip. */
 	private boxFocusOrder(summary: TurnSummaryComponent): string[] {
-		const strip = this.turnStrips.get(summary);
+		const strip = this.turnFlow.stripFor(summary);
 		const stripOrder = strip && this.chatContainer.children.includes(strip) ? strip.getFocusOrder() : [];
 		return [...summary.getFocusOrder(), ...stripOrder];
+	}
+
+	/** What Enter does on the walked box's focused target; undefined when it does nothing there. */
+	private boxFocusEnterLabel(): string | undefined {
+		const focus = this.boxFocus;
+		if (!focus) return undefined;
+		const key = focus.summary.state.timeline.ui.focusKey ?? "header";
+		if (key.startsWith("strip:")) return this.turnFlow.stripFor(focus.summary)?.enterLabel(key);
+		return focus.summary.enterLabel(key);
 	}
 
 	private moveBoxFocus(direction: -1 | 1): void {
@@ -9802,7 +9829,7 @@ export class InteractiveMode {
 		const focus = this.boxFocus;
 		if (!focus) return;
 		const key = focus.summary.state.timeline.ui.focusKey ?? "header";
-		const strip = this.turnStrips.get(focus.summary);
+		const strip = this.turnFlow.stripFor(focus.summary);
 		if (key.startsWith("strip:")) strip?.activate(key);
 		else focus.summary.activate(key);
 		focus.summary.invalidate();
@@ -9859,7 +9886,11 @@ export class InteractiveMode {
 	}
 
 	private moveQueueSelection(direction: -1 | 1): void {
-		if (this.pendingQueueEdit || !this.queueSelection.selected) return;
+		if (this.pendingQueueEdit) return;
+		if (!this.queueSelection.selected) {
+			this.showToast("没有选中的排队消息");
+			return;
+		}
 		const sessionGeneration = this.sessionEventGeneration;
 		void this.enqueueQueueMutation(async () => {
 			if (sessionGeneration !== this.sessionEventGeneration) return;
@@ -10316,10 +10347,18 @@ export class InteractiveMode {
 		// key acts on the latest turn; Alt+O acts globally (K3 ②).
 		if (!global) {
 			const summary = this.latestTurnSummary();
+			if (summary?.state.boxMode && summary.state.boxView().rows.length === 0) {
+				this.showToast("这一轮没有可以展开的步骤");
+				return;
+			}
 			if (summary) {
 				this.cycleTurnProcess(summary);
 				return;
 			}
+		}
+		if (!chatHasTurnLane(this.chatContainer.children, turnHasProcess, hasSetExpandedLane)) {
+			this.showToast("还没有可以展开的步骤");
+			return;
 		}
 		this.editDiffsExpanded = !this.toolOutputExpanded;
 		this.syncAllTurnLanes(!this.toolOutputExpanded, "tools");
@@ -10434,245 +10473,6 @@ export class InteractiveMode {
 	}
 
 	/** The turn summary rendering the given state, when it is in the chat. */
-	private summaryForState(state: TurnActivityState): TurnSummaryComponent | undefined {
-		for (const child of this.chatContainer.children) {
-			if (child instanceof TurnSummaryComponent && child.state === state) return child;
-		}
-		return undefined;
-	}
-
-	/**
-	 * The turn a run without a prompt of its own continues (a retry, or the
-	 * continuation after a compaction): the live turn, else the newest turn in
-	 * the chat when no user message came after it.
-	 */
-	private continuableTurn(): TurnSummaryComponent | undefined {
-		if (this.currentTurnSummary && this.chatContainer.children.includes(this.currentTurnSummary)) {
-			return this.currentTurnSummary;
-		}
-		const children = this.chatContainer.children;
-		for (let index = children.length - 1; index >= 0; index--) {
-			const child = children[index];
-			if (child instanceof UserMessageComponent) return undefined;
-			if (child instanceof TurnSummaryComponent) return child;
-		}
-		return undefined;
-	}
-
-	/** Make `summary` the live turn again (a continuation after it ended). */
-	private resumeTurn(summary: TurnSummaryComponent): TurnActivityState {
-		const state = summary.state;
-		if (this.turnFinishTimer) clearTimeout(this.turnFinishTimer);
-		this.turnFinishTimer = undefined;
-		if (state.isTurnEnded) state.reopen();
-		state.live = true;
-		this.detachTurnStrip(summary);
-		this.currentTurnState = state;
-		this.currentTurnSummary = summary;
-		this.updateWorkingPulse();
-		return state;
-	}
-
-	/** Remember the commands a step starts under a handle, and resolve the ones it waits on. */
-	private noteStepHandles(state: TurnActivityState | undefined, toolCallId: string, args: unknown): void {
-		const code =
-			typeof (args as { code?: unknown } | undefined)?.code === "string" ? (args as { code: string }).code : "";
-		if (!code) return;
-		if (state) {
-			const referenced = new Map<string, string>();
-			for (const match of code.matchAll(
-				/\bawait\s+([A-Za-z_][A-Za-z0-9_]*)|\b([A-Za-z_][A-Za-z0-9_]*)\.(?:poll|tail|output)\(/g,
-			)) {
-				const name = match[1] ?? match[2];
-				const command = name ? this.bashHandleCommands.get(name) : undefined;
-				if (name && command) referenced.set(name, command);
-			}
-			if (referenced.size > 0) state.timeline.stepHandleContext.set(toolCallId, referenced);
-		}
-		for (const [name, command] of collectBashHandleCommands(code)) this.bashHandleCommands.set(name, command);
-	}
-
-	/**
-	 * The run ended: after a short settle (a retry or a compaction can still
-	 * continue the same turn) the box shows its finished face and the change
-	 * strip lands under the answer.
-	 */
-	private scheduleTurnFinish(state: TurnActivityState, delayMs = 400): void {
-		if (this.turnFinishTimer) clearTimeout(this.turnFinishTimer);
-		this.turnFinishTimer = setTimeout(() => {
-			this.turnFinishTimer = undefined;
-			this.finishTurn(state);
-		}, delayMs);
-		this.turnFinishTimer.unref?.();
-	}
-
-	private finishTurn(state: TurnActivityState, options: { force?: boolean } = {}): void {
-		if (!state.boxMode || state.timeline.finishedAt !== undefined) return;
-		if (!options.force) {
-			if (!state.isTurnEnded || this.isAgentStreaming()) return;
-			if (state.timeline.activeRetry() || state.timeline.activeCompaction()) {
-				this.scheduleTurnFinish(state);
-				return;
-			}
-		}
-		if (!state.isTurnEnded) state.markTurnEnded(Date.now());
-		state.finishBox();
-		this.lastFinishedTurn = state;
-		const summary = this.summaryForState(state);
-		if (summary) this.attachTurnStrip(summary);
-		this.updateWorkingPulse();
-		this.ui.requestRender();
-	}
-
-	/** A new prompt starts a new turn: the live one finishes now. */
-	private endLiveTurnForNewRun(): void {
-		const state = this.currentTurnState;
-		if (state?.boxMode) {
-			if (this.turnFinishTimer) clearTimeout(this.turnFinishTimer);
-			this.turnFinishTimer = undefined;
-			this.finishTurn(state, { force: true });
-		}
-		this.currentTurnState = undefined;
-		this.currentTurnSummary = undefined;
-	}
-
-	/** The strip goes at the chat's end, which is where the finished turn's answer is. */
-	private attachTurnStrip(summary: TurnSummaryComponent): void {
-		let strip = this.turnStrips.get(summary);
-		if (!strip) {
-			const state = summary.state;
-			strip = new TurnStripComponent({
-				timeline: state.timeline,
-				facts: () => (state.boxLive ? undefined : state.boxView().facts),
-				requestRender: () => this.ui.requestRender(),
-			});
-			this.turnStrips.set(summary, strip);
-		}
-		this.chatContainer.removeChild(strip);
-		this.chatContainer.addChild(strip);
-	}
-
-	private detachTurnStrip(summary: TurnSummaryComponent): void {
-		const strip = this.turnStrips.get(summary);
-		if (strip) this.chatContainer.removeChild(strip);
-	}
-
-	/** Every quiet turn's box in the chat, keyed by each of its messages, to carry over a rebuild. */
-	private captureTurnBoxes(): Map<string, TurnSummaryComponent> {
-		const boxes = new Map<string, TurnSummaryComponent>();
-		for (const child of this.chatContainer.children) {
-			if (!(child instanceof TurnSummaryComponent)) continue;
-			for (const entry of child.state.timeline.entries) {
-				if (entry.kind === "message" && !boxes.has(entry.key)) boxes.set(entry.key, child);
-			}
-		}
-		return boxes;
-	}
-
-	/**
-	 * A direct child's snapshot becomes a row in the turn that started it: the
-	 * live turn for a child first seen now, else whichever turn already has it.
-	 */
-	private bindSubagentRow(child: AgentConnectionRlmChildAgentSnapshot): void {
-		if (!quietConversation(this) || child.parentId !== this.rlmNodeId || child.status === "cancelled") return;
-		let timeline: TurnTimeline | undefined;
-		for (const component of this.chatContainer.children) {
-			if (component instanceof TurnSummaryComponent && component.state.timeline.hasSubagent(child.id)) {
-				timeline = component.state.timeline;
-			}
-		}
-		const live = this.currentTurnState;
-		if (!timeline && live?.boxMode && live.boxLive && (child.status === "running" || child.status === "queued")) {
-			timeline = live.timeline;
-		}
-		if (!timeline) return;
-		const firstLine = (text: string | undefined) =>
-			text
-				?.split("\n")
-				.map((line) => line.trim())
-				.find((line) => line.length > 0);
-		const running = child.status === "running" || child.status === "queued";
-		const activity = child.activity;
-		const line =
-			activity?.kind === "executing"
-				? activity.toolName
-					? `在执行 ${activity.toolName}`
-					: "在执行"
-				: activity?.kind === "writing"
-					? "在写回答"
-					: activity?.kind === "waiting"
-						? "在等模型"
-						: activity?.kind === "stalled"
-							? "没有动静"
-							: (firstLine(child.recap) ?? "刚派出去…");
-		timeline.upsertSubagent({
-			childId: child.id,
-			name: child.sessionName ?? child.label,
-			status: running ? "running" : child.status === "error" ? "failed" : "done",
-			line,
-			...(child.status === "error"
-				? { result: firstLine(child.error) ?? "出错" }
-				: firstLine(child.answerPreview)
-					? { result: firstLine(child.answerPreview) }
-					: {}),
-			...(child.answerPreview || child.recap ? { report: child.answerPreview ?? child.recap } : {}),
-		});
-		this.ui.requestRender();
-	}
-
-	/** Settle the compaction row a compaction_end belongs to; returns its entry key for the after-figure. */
-	private endTimelineCompaction(event: {
-		result?: { tokensBefore: number };
-		aborted: boolean;
-		errorMessage?: string;
-		errorSeverity?: "warning" | "error";
-	}): string | undefined {
-		const children = this.chatContainer.children;
-		for (let index = children.length - 1; index >= 0; index--) {
-			const child = children[index];
-			if (!(child instanceof TurnSummaryComponent)) continue;
-			const timeline = child.state.timeline;
-			const active = timeline.activeCompaction();
-			if (!active) continue;
-			const failed = event.aborted ? "已取消" : event.result ? undefined : compactionMissText(event);
-			timeline.endCompaction(Date.now(), {
-				...(event.result ? { before: event.result.tokensBefore } : {}),
-				...(failed ? { failed } : {}),
-			});
-			const state = child.state;
-			if (state.isTurnEnded && state.timeline.finishedAt === undefined) this.scheduleTurnFinish(state);
-			this.ui.requestRender();
-			return `compact:${active.startedAt}`;
-		}
-		return undefined;
-	}
-
-	/** After a compaction's rebuild, its row gets the context size it ended with; false while unknown. */
-	private noteCompactionResult(key: string): boolean {
-		const tokens = this.getConnectionContextUsage()?.tokens;
-		return typeof tokens === "number" && this.setCompactionAfter(key, tokens);
-	}
-
-	private setCompactionAfter(key: string, tokens: number): boolean {
-		for (const child of this.chatContainer.children) {
-			if (!(child instanceof TurnSummaryComponent)) continue;
-			const entry = child.state.timeline.entries.find((candidate) => candidate.key === key);
-			if (entry?.kind === "compact") {
-				entry.compaction.after = tokens;
-				child.state.timeline.ui.bump();
-				this.ui.requestRender();
-				return true;
-			}
-		}
-		return false;
-	}
-
-	/** Whether a turn box is live right now (its spinners and clocks need frames). */
-	private hasLiveTurnBox(): boolean {
-		const state = this.currentTurnState;
-		return state !== undefined && state.boxMode && state.boxLive;
-	}
-
 	/**
 	 * Lift or restore the expanded-output render budget (tool-output-budget.ts).
 	 * Expanded blocks revalidate their cached lines against the budget mode when they
@@ -10680,6 +10480,10 @@ export class InteractiveMode {
 	 * keeps the viewport anchored exactly like the ctrl+o toggle.
 	 */
 	private toggleToolOutputFull(): void {
+		if (!anyBudgetTruncatable()) {
+			this.showToast("没有被省略的输出");
+			return;
+		}
 		if (!setToolOutputFull(!toolOutputFull())) {
 			return;
 		}
@@ -10689,7 +10493,10 @@ export class InteractiveMode {
 
 	private toggleAgentMessageExpansion(global = false): void {
 		// U6: Ctrl+P keeps its own lane - agent message rows only. The plain key
-		// acts on the latest turn; Alt+P acts globally (K3 ②).
+		// acts on the latest turn; Alt+P acts globally (K3 ②). A turn's own lane
+		// stays free to open even with nothing in it yet (lanes are independent,
+		// not mutually exclusive); only the conversation-wide fallback below
+		// (no turn at all, or nothing anywhere for Alt+P) says why nothing moved.
 		if (!global) {
 			const summary = this.latestTurnSummary();
 			if (summary) {
@@ -10705,12 +10512,20 @@ export class InteractiveMode {
 				return;
 			}
 		}
+		if (!chatHasTurnLane(this.chatContainer.children, turnHasAgentMessages, hasAnyMessageLane)) {
+			this.showToast("还没有代理消息可以展开");
+			return;
+		}
 		this.agentMessagesExpanded = !this.agentMessagesExpanded;
 		this.syncAllTurnLanes(this.agentMessagesExpanded, "agentMessages");
 		this.applyChatExpansion();
 	}
 
 	private toggleEditDiffExpansion(): void {
+		if (!chatHasLane(this.chatContainer.children, "setEditDiffsExpanded")) {
+			this.showToast("还没有可以展开的改动");
+			return;
+		}
 		this.editDiffsExpanded = !this.editDiffsExpanded;
 		this.applyChatExpansion();
 	}
@@ -10789,15 +10604,23 @@ export class InteractiveMode {
 		// on guides the user to it instead of silently doing nothing (K3 ④).
 		// The plain key acts on the latest turn; Alt+T acts globally (K3 ②).
 		if (this.hideThinkingBlock) {
-			this.showStatus("Thinking 已被 hideThinkingBlock 设置隐藏：关闭该设置后 Ctrl+T 可展开");
+			this.showStatus("思考过程已被 hideThinkingBlock 设置隐藏：关闭该设置后 Ctrl+T 可展开");
 			return;
 		}
 		if (!global) {
 			const summary = this.latestTurnSummary();
+			if (summary && !turnHasThinking(summary)) {
+				this.showToast("这一轮没有思考内容");
+				return;
+			}
 			if (summary) {
 				this.toggleTurnThinking(summary);
 				return;
 			}
+		}
+		if (!chatHasTurnLane(this.chatContainer.children, turnHasThinking, hasThinkingTraceLane)) {
+			this.showToast("还没有思考内容可以展开");
+			return;
 		}
 		this.thinkingExpanded = !this.thinkingExpanded;
 		this.syncAllTurnLanes(this.thinkingExpanded, "thinking");
@@ -11658,7 +11481,7 @@ export class InteractiveMode {
 				}
 				this.patchConnectionState({ serviceTier: state.serviceTier });
 				this.footer.invalidate();
-				this.showToast(`fast ${state.serviceTier === "priority" ? "on" : "off"}`);
+				this.showToast(`快速模式 ${state.serviceTier === "priority" ? "开" : "关"}`);
 			})
 			.catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));
@@ -11713,7 +11536,7 @@ export class InteractiveMode {
 				this.patchConnectionState({ thinkingLevel: level });
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
-				this.showToast(`thinking ${level}`);
+				this.showToast(`思考强度 ${THINKING_LEVEL_WORDS[level] ?? level}`);
 			})
 			.catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));
@@ -12945,7 +12768,7 @@ export class InteractiveMode {
 
 		try {
 			await copyToClipboard(text);
-			this.showToast("✓ copied");
+			this.showToast("✓ 已复制");
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
 		}
@@ -13725,7 +13548,7 @@ ${interrupt ? `| \`${interrupt}\` | 中断当前操作 |\n` : ""}${shortcutsKey 
 | \`${expandTools}\` | 展开 / 收起过程 |
 ${expandToolsFull ? `| \`${expandToolsFull}\` | 看全文（不限行数） |\n` : ""}| \`${expandMessages}\` | 展开 / 收起代理消息 |
 | \`${expandEdits}\` | 展开 / 收起改动详情 |
-| \`${toggleThinking}\` | 展开 / 收起 Thinking |
+| \`${toggleThinking}\` | 展开 / 收起思考 |
 | \`${focusSubagents}\` | 进入子代理面板 / 打开子代理列表 |
 | \`${manageHeartbeats}\` | 管理定时任务 |
 | \`${externalEditor}\` | 用外部编辑器写消息 |

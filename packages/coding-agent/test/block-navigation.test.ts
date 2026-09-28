@@ -115,6 +115,7 @@ describe("InteractiveMode block navigation", () => {
 			},
 			focusEditor: vi.fn(),
 			showStatus: vi.fn(),
+			showToast: vi.fn(),
 			showError: vi.fn(),
 		};
 		Object.setPrototypeOf(mode, InteractiveMode.prototype);
@@ -176,6 +177,7 @@ describe("InteractiveMode block navigation", () => {
 		const empty = createMode([]);
 		empty.startBlockNavigation(-1);
 		expect(empty.blockNavigation).toBeUndefined();
+		expect(empty.showToast).toHaveBeenCalledWith("还没有可以查看的内容");
 
 		const queued = createMode([new UserMessageComponent("hi")]);
 		queued.connectionState.sessionActions.followUps = ["later"];

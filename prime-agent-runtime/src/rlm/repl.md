@@ -239,9 +239,9 @@ case nothing below is installed at all. Implemented in `rlm/effects.py`.
 
 | MIME type | Payload |
 |---|---|
-| `application/vnd.prime-agent.file-change+json` | one file effect: `path`, `relPath?`, `kind` (`created`/`modified`/`deleted`/`renamed`), `oldPath?`, `scope` (`project`/`scratch`/`memory`), `added`, `removed`, `diff?`, `diffTruncated?`, `diffOmitted?` (`too_large`/`no_baseline`/`budget`), `binary?`, `source` (`python`/`shell`/`edit`), `at` |
-| `application/vnd.prime-agent.memory-change+json` | one harness entry or rules-file change: `op`, `kind` (`memory`/`skill`/`subagent`/`prompt_note`/`rules_file`), `scope` (`session`/`global`/`project`), `id`, `title`, `previousTitle?`, `before?`, `after?`, `at` |
-| `application/vnd.prime-agent.activity+json` | one step: `id`, `kind` (`command`/`read`/`search`/`fetch`/`subagent`), `label`, `status` (`running`/`ok`/`error`), `detail?`, `startedAt`, `endedAt?` |
+| `application/vnd.prime-agent.file-change+json` | one file effect: `path`, `relPath?`, `kind` (`created`/`modified`/`deleted`/`renamed`), `oldPath?`, `scope` (`project`/`scratch`/`memory`), `added`, `removed`, `diff?`, `diffTruncated?`, `diffOmitted?` (`too_large`/`no_baseline`/`budget`/`sensitive`), `binary?`, `symlink?`, `source` (`python`/`shell`/`edit`), `at` |
+| `application/vnd.prime-agent.memory-change+json` | one harness entry or rules-file change: `op`, `kind` (`memory`/`skill`/`subagent`/`prompt_note`/`rules_file`), `scope` (`session`/`global`/`project`), `id`, `title`, `previousTitle?`, `before?`, `after?`, `textOmitted?` (`sensitive`), `at` |
+| `application/vnd.prime-agent.activity+json` | one step: `id`, `kind` (`command`/`read`/`search`/`fetch`/`subagent`), `label`, `status` (`running`/`ok`/`error`), `detail?`, `startedAt`, `endedAt?`, `background?`, `commit?` |
 | `application/vnd.prime-agent.change-tracking+json` | at most one per cell: `{"incomplete": reason}` when the lists above are partial |
 
 Every record is complete on its own; the host keeps the latest one per file
@@ -263,6 +263,19 @@ deleted in the same cell.
   tree (a moved `HEAD` adds `git diff --name-only`), a bounded mtime scan
   outside one. Ignored files, `.git`, `node_modules`, virtualenvs and caches are
   never reported.
+- That comparison covers only the git work tree (outside git: the directory
+  itself) of the session's working directory and of the directory Python is in
+  when it starts the process. A command that writes anywhere else
+  (`cd /tmp/build && make`, `curl -o /tmp/x`) is not listed: watching the whole
+  filesystem would cost every cell time. Python's own writes are listed
+  wherever they go, since the wrappers see each path.
+- A new file that is already gone again when the comparison looks at it is no
+  creation, and BSD `sed -i`'s temp file (`.!<pid>!<name>`) is never reported;
+  the edited file itself is.
+- Symlinks: a write through a link is filed under the file it lands in (when
+  that is a place tracking reports); a link that was created, removed or
+  re-pointed is reported as itself with `symlink: true`, no line counts and no
+  diff; an untracked link to a changed file does not add a second row.
 - Records are sent as soon as a file's size and mtime hold still for one watch
   interval (0.15 s), and finally before the cell's `done`; that final
   collection is part of the interruptible finishing phase.
@@ -270,6 +283,72 @@ deleted in the same cell.
   default 500); past it, tracking stops for that cell and says so in the
   `change-tracking` record. Diffs are capped at 400 lines / 64 KiB per file and
   256 KiB per cell; memory texts at 4000 characters.
+- The host saves these records with the session, so secrets are withheld. A
+  file whose name marks a credential store (`.env`, `.env.*`, `*.env`, `*.pem`,
+  `*.key`, `*.p8`/`*.p12`/`*.pfx`/`*.ppk`, `*.keystore`/`*.jks`, `*.tfvars`/
+  `*.tfstate`, `id_rsa*`/`id_ed25519*`/`id_ecdsa*`/`id_dsa*`, `.netrc`, `.npmrc`,
+  `.pypirc`, `.pgpass`, `.git-credentials`, `credentials`, a config or data
+  file named after secrets or credentials such as `secrets.yaml`, anything
+  under `.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`), and any other file whose
+  capped diff holds a likely credential (a private key block; `sk-`, `AKIA`/
+  `ASIA`, `ghp_`, `github_pat_`, `xox?-`, `glpat-`, `AIza`, `hf_`, `npm_`,
+  `pypi-` tokens; JWTs; bearer tokens; `user:pass@` URLs; `password`/`secret`/
+  `api_key`/`token`-style assignments whose value is not a placeholder, number
+  or plain identifier), keeps its record and line counts without `diff`, with
+  `diffOmitted: "sensitive"`. A memory record whose `before` or `after` holds a
+  likely credential drops both texts and carries `textOmitted: "sensitive"`;
+  later edits of that entry in the same cell stay withheld. An activity's
+  `detail` (a command's latest or final output line, for example from `cat
+  .env` or `echo $API_KEY`) gets the same scan; a `detail` that looks like a
+  credential is left out of the record rather than sent. The scan runs only
+  over the capped text and treats its own failure as a secret.
+- The session's own folder (`RLM_SESSION_DIR`: subagent folders, artifacts) is
+  never reported, and harness saves appear only as memory records, not as a
+  change of the harness state file, even when a command ran in the same cell.
+- The before-state snapshots and the end-of-cell comparison (`git status`,
+  `git diff`, `git cat-file`, the mtime scan) never run on the cell's own
+  thread. A snapshot runs on a worker: at the cell's start (while `bash()`
+  handles from earlier cells are alive) nothing waits for it at all, and a
+  process the cell starts waits for it at most for the remaining budget. A
+  snapshot or the end-of-cell comparison that does not finish in time is
+  abandoned and the cell's `change-tracking` record names the cause; changes
+  made by commands are then not listed rather than guessed.
+- The one git call on the cell's own thread is the end-of-cell
+  `git check-ignore` for files Python wrote, killed when the remaining budget
+  runs out (at least 50 ms). Only answers git gave are cached. A live record
+  waits until git has answered for its file; when git gives no answer by the
+  cell's end, the files are listed and the `change-tracking` record says
+  ignore rules could not be checked. Live mid-cell comparisons (after a `bash()`
+  command ends) run at most once a second on the tracker's own thread and a
+  separate 1 s allowance, so a loop of many commands keeps the cell's budget for
+  the final comparison.
+- The host keeps at most the most recent 100 steps per cell (oldest finished
+  ones dropped first, counted in `activitiesDropped`).
+- A `bash()` command still running when its cell ends gets one last record in
+  that cell: `status: "running"`, `background: true`, `endedAt` = the cell's
+  end, no `detail` (the host words the hand-off), so a replayed cell shows it as
+  handed off rather than as still spinning. Its outcome is reported later with
+  the same `id`, `background: true` and `status` `ok`/`error`, in whichever
+  cell is running when it ends, or first thing in the next cell that starts. A
+  command that ends while its cell is finishing is either reported in that cell
+  before its `done` or handed off like this, never after `done`. At most 64
+  outcomes wait for the next cell; past that the oldest are dropped and that
+  cell's `change-tracking` record says how many were lost.
+- Files such a command changes after its cell ended are not lost. The cell that
+  leaves a command running keeps the state its final comparison ended on; when
+  the command ends while no cell runs, a worker compares against that state
+  right away (one cell budget, never on a cell's thread, never delaying a cell's
+  start) and the changes are listed in the next cell, next to the command's
+  outcome, or in the cell that started meanwhile. A comparison that runs out of
+  time says so in that cell's `change-tracking` record. A command still running
+  when the next cell starts is covered by that cell's own snapshot, as before.
+- A command that succeeds and whose output carries git's commit line
+  (`[main 1a2b3c4] subject`, `[main (root-commit) 1a2b3c4]`,
+  `[detached HEAD 1a2b3c4]`, also from cherry-pick and revert) adds `commit`
+  with that id to its final record; `detail` stays the last output line.
+- Once a cell has reported any file (or memory) change, the host sends that
+  list explicitly even when retractions have emptied it (`fileChanges: []`), so
+  a change undone within the cell does not stay on screen.
 - `bash()` commands, `rlm.run()` spawns, harness writes and the web skills
   report their own steps (`rlm.effects.step`, `rlm.effects.reported`); plain
   reads inside the working directory are reported once per file per cell.

@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path";
+import { MAX_ACTIVITIES_PER_CELL } from "../../../core/kernel/effects.js";
 import type {
 	KernelActivity,
 	KernelDiffDisplay,
@@ -22,6 +23,8 @@ import { formatFileChangePath } from "./edit-summary.js";
  */
 export interface StepFeedData {
 	activities: KernelActivity[];
+	/** Earlier steps of the cell the kernel no longer lists (it keeps the most recent ones). */
+	activitiesDropped?: number;
 	/** Present once any result carried the kernel's file-change list: it then replaces `legacyDiffs`. */
 	fileChanges?: KernelFileChange[];
 	memoryChanges: KernelMemoryChange[];
@@ -35,6 +38,10 @@ export interface StepFeedData {
 	outputText?: string;
 	/** One-line reason once the step failed. */
 	error?: string;
+	/** The cell was cut short by an interrupt (the owner's stop, the stall watchdog). */
+	stopped?: boolean;
+	/** The kernel said its change lists for this cell are incomplete. */
+	trackingIncomplete?: boolean;
 	/** A few lines of the failure (traceback tail), for the expanded error row. */
 	errorDetail?: string[];
 	durationMs?: number;
@@ -92,6 +99,7 @@ function readActivity(value: unknown): KernelActivity | undefined {
 	}
 	const detail = stringField(value, "detail");
 	const endedAt = numberField(value, "endedAt");
+	const commit = stringField(value, "commit");
 	return {
 		id,
 		kind,
@@ -100,6 +108,8 @@ function readActivity(value: unknown): KernelActivity | undefined {
 		startedAt: startedAt ?? 0,
 		...(detail !== undefined ? { detail } : {}),
 		...(endedAt !== undefined ? { endedAt } : {}),
+		...(value.background === true ? { background: true as const } : {}),
+		...(commit !== undefined && /^[0-9a-f]{7,40}$/i.test(commit) ? { commit } : {}),
 	};
 }
 
@@ -131,6 +141,11 @@ function readFileChange(value: unknown): KernelFileChange | undefined {
 	if (diff !== undefined) change.diff = diff;
 	if (value.diffTruncated === true) change.diffTruncated = true;
 	if (value.binary === true) change.binary = true;
+	if (value.symlink === true) change.symlink = true;
+	const omitted = stringField(value, "diffOmitted");
+	if (omitted === "too_large" || omitted === "no_baseline" || omitted === "budget" || omitted === "sensitive") {
+		change.diffOmitted = omitted;
+	}
 	return change;
 }
 
@@ -160,6 +175,7 @@ function readMemoryChange(value: unknown): KernelMemoryChange | undefined {
 	if (previousTitle) change.previousTitle = previousTitle;
 	if (before !== undefined) change.before = before;
 	if (after !== undefined) change.after = after;
+	if (value.textOmitted === "sensitive") change.textOmitted = "sensitive";
 	return change;
 }
 
@@ -181,17 +197,36 @@ function readList<T>(value: unknown, read: (entry: unknown) => T | undefined): T
 	});
 }
 
-/** The subagent a record came from, when the producer tagged it (display-only; optional in the contract). */
-export function recordAgentName(record: object): string | undefined {
-	const value = (record as Record<string, unknown>).agent ?? (record as Record<string, unknown>).agentName;
-	return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
 /** Merge activity records by id: first appearance keeps its place, the latest record wins. */
 function mergeActivities(previous: readonly KernelActivity[], incoming: readonly KernelActivity[]): KernelActivity[] {
 	const byId = new Map(previous.map((activity) => [activity.id, activity] as const));
 	for (const activity of incoming) byId.set(activity.id, activity);
 	return [...byId.values()];
+}
+
+/**
+ * The steps the kernel still lists once it started dropping: its cap, the oldest finished steps
+ * going first, the way the kernel drops them.
+ */
+function keepNewest(activities: KernelActivity[]): KernelActivity[] {
+	let excess = activities.length - MAX_ACTIVITIES_PER_CELL;
+	if (excess <= 0) return activities;
+	const drop = new Set<KernelActivity>();
+	for (const activity of activities) {
+		if (excess <= 0) break;
+		if (activity.status !== "running") {
+			drop.add(activity);
+			excess--;
+		}
+	}
+	for (const activity of activities) {
+		if (excess <= 0) break;
+		if (!drop.has(activity)) {
+			drop.add(activity);
+			excess--;
+		}
+	}
+	return activities.filter((activity) => !drop.has(activity));
 }
 
 function lastMeaningfulLine(text: string): string | undefined {
@@ -226,13 +261,23 @@ export function mergeStepResult(
 	const next: StepFeedData = { ...previous };
 	const details = isRecord(result.details) ? result.details : {};
 	const activities = readList(details.activities, readActivity);
-	if (activities) next.activities = mergeActivities(previous.activities, activities);
+	const dropped = numberField(details, "activitiesDropped");
+	if (dropped !== undefined && dropped > 0) next.activitiesDropped = Math.floor(dropped);
+	// Live updates carry new and changed steps (merged by id); the final result lists every step
+	// the kernel kept, so it replaces what the live updates showed.
+	if (activities) {
+		next.activities = partial ? mergeActivities(previous.activities, activities) : activities;
+		if (partial && next.activitiesDropped !== undefined) next.activities = keepNewest(next.activities);
+	}
 	const fileChanges = readList(details.fileChanges, readFileChange);
 	if (fileChanges) next.fileChanges = fileChanges;
 	const memoryChanges = readList(details.memoryChanges, readMemoryChange);
 	if (memoryChanges) next.memoryChanges = memoryChanges;
 	const diffs = readList(details.diffs, readDiffDisplay);
 	if (diffs) next.legacyDiffs = diffs;
+	if (typeof details.changeTrackingIncomplete === "string" && details.changeTrackingIncomplete.trim()) {
+		next.trackingIncomplete = true;
+	}
 	if (toolName === "edit" && !result.isError) {
 		const argRecord = isRecord(args) ? args : {};
 		const path = stringField(argRecord, "path") ?? stringField(argRecord, "file_path");
@@ -251,7 +296,10 @@ export function mergeStepResult(
 	if (output) next.outputText = output.slice(-OUTPUT_KEEP_CHARS);
 	const duration = numberField(details, "durationMs");
 	if (duration !== undefined) next.durationMs = duration;
-	if (result.isError || details.status === "error") {
+	const error = isRecord(details.error) ? details.error : undefined;
+	const ename = error ? stringField(error, "ename") : stringField(details, "errorEname");
+	next.stopped = details.status === "aborted" || ename === "KeyboardInterrupt" || isRecord(details.abortCause);
+	if (result.isError || details.status === "error" || details.status === "aborted") {
 		const failure = describeFailure(details, text);
 		next.error = failure.summary;
 		next.errorDetail = failure.detail;
@@ -286,6 +334,7 @@ const COMMIT_OUTPUT = /\[[^\]\s]+(?: \([^)]*\))? ([0-9a-f]{7,40})\]/;
 /** The short id of a commit the step made, when its output says so. */
 export function commitIdFromStep(data: StepFeedData, stepText: string): string | undefined {
 	for (const activity of data.activities) {
+		if (activity.commit && activity.status === "ok") return activity.commit.slice(0, 7);
 		if (activity.kind !== "command" || !/\bgit\s+commit\b/.test(activity.label)) continue;
 		const sha = /\b([0-9a-f]{7,40})\b/.exec(activity.detail ?? "")?.[1];
 		if (sha) return sha.slice(0, 7);
@@ -309,10 +358,25 @@ export interface ChangeEntry {
 	/** The kernel cut the diff at its cap. */
 	truncated: boolean;
 	binary: boolean;
-	/** The subagent that made the change, when the record says so. */
-	agent?: string;
+	/** Why the kernel kept no diff (too large, no copy from before, out of budget). */
+	omitted?: KernelFileChange["diffOmitted"];
+	/** How the kernel saw the change (Python code, a shell command, the edit skill). */
+	source?: KernelFileChange["source"];
+	/** True when the change is to the link itself: no line counts or diff apply. */
+	symlink?: boolean;
 	/** When the change was first seen (ordering). */
 	firstAt: number;
+}
+
+/**
+ * The verb a link row reads as, by kind: the link itself changed, not its
+ * target's text, so `changeRow`/`editItems` show this instead of a diff or a
+ * line count. A rename keeps the plain `oldPath → path` row instead of this.
+ */
+export function symlinkVerb(kind: ChangeEntry["kind"]): string {
+	if (kind === "deleted") return "删掉链接";
+	if (kind === "modified") return "改了链接";
+	return "新建链接";
 }
 
 function displayPath(change: { path: string; relPath?: string }, cwd: string): string {
@@ -342,7 +406,9 @@ function addEntry(entries: Map<string, ChangeEntry>, entry: ChangeEntry): void {
 	if (entry.rows.length > 0) existing.rows = [...existing.rows, ...entry.rows];
 	existing.truncated ||= entry.truncated;
 	existing.binary ||= entry.binary;
-	existing.agent ??= entry.agent;
+	existing.omitted ??= entry.omitted;
+	existing.source ??= entry.source;
+	if (entry.symlink) existing.symlink = true;
 	if (entry.oldPath) existing.oldPath ??= entry.oldPath;
 }
 
@@ -373,7 +439,6 @@ export function aggregateChanges(
 			for (const change of data.fileChanges) {
 				const path = displayPath(change, cwd);
 				const rows = change.diff ? memoRows(change, () => parseUnifiedDiff(change.diff ?? "")) : [];
-				const agent = recordAgentName(change);
 				addEntry(entries, {
 					key: change.path,
 					path,
@@ -385,7 +450,9 @@ export function aggregateChanges(
 					rows,
 					truncated: change.diffTruncated === true,
 					binary: change.binary === true,
-					...(agent ? { agent } : {}),
+					...(change.diffOmitted ? { omitted: change.diffOmitted } : {}),
+					source: change.source,
+					...(change.symlink ? { symlink: true } : {}),
 					firstAt: change.at || order,
 				});
 			}

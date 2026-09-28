@@ -1,0 +1,1 @@
+- Fixed a symlink change showing as a file with `+0 −0`; the turn box, the change strip and the legacy edit summary now read it as a link (e.g. "新建链接 blink.txt").

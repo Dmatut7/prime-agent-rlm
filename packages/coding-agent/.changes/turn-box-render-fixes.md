@@ -1,0 +1,7 @@
+- Fixed the turn box, the change strip and the memory note overflowing narrow terminals (24 columns or less), which crashed the non-fullscreen view.
+- Changed the change strip on narrow screens to drop whole parts instead of cutting a number, and to shorten file paths from the left so the file name stays visible.
+- Added a faint row saying how many earlier steps of a long cell are no longer listed.
+- Fixed a command that finished in the background showing twice; it now shows once, as finished (or failed with its exit code) in the background.
+- Added the short commit id to the result of a `git commit` step.
+- Added a note in place of the diff or memory text the kernel withheld because it looked like a secret; line counts still show.
+- Fixed the context meter disappearing after a compaction; it now says the context was just tidied until the next measurement.

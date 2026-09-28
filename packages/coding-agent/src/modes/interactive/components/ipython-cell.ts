@@ -17,7 +17,12 @@ import { renderDiffSeparator, renderRichDiff } from "./diff.js";
 import { countChangedLines, FILE_CHANGE_DIFF_INDENT, formatFileChangeSummaryLine } from "./edit-summary.js";
 import { keyText } from "./keybinding-hints.js";
 import { isFallbackPythonLabel, turnStepLabel } from "./step-label.js";
-import { QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES, quietConversationBudget, toolOutputFull } from "./tool-output-budget.js";
+import {
+	QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES,
+	quietConversationBudget,
+	reportBudgetTruncatable,
+	toolOutputFull,
+} from "./tool-output-budget.js";
 
 export interface IPythonCellContentBlock {
 	type: string;
@@ -578,6 +583,9 @@ export class IPythonCellComponent implements Component {
 				? splitTraceback(text, details.errorEname)
 				: undefined;
 		let outputStarted = false;
+		// Any call below reporting true wins: app.tools.expandFull says whether
+		// lifting or re-applying the budget would change anything this block shows.
+		let anyHeldBack = false;
 		let renderedTextOutput = false;
 
 		const diffs = details.diffs ?? [];
@@ -597,12 +605,12 @@ export class IPythonCellComponent implements Component {
 			if (details.stdout?.trim() && !isEditConfirmation(details.stdout, diffs)) {
 				startOutput();
 				renderedTextOutput = true;
-				this.renderOutputText(lines, width, normalizeErrorDetails(details.stdout), "out");
+				anyHeldBack ||= this.renderOutputText(lines, width, normalizeErrorDetails(details.stdout), "out");
 			}
 			if (details.stderr?.trim()) {
 				startOutput();
 				renderedTextOutput = true;
-				this.renderOutputText(lines, width, normalizeErrorDetails(details.stderr), "err");
+				anyHeldBack ||= this.renderOutputText(lines, width, normalizeErrorDetails(details.stderr), "err");
 			}
 			if (
 				details.result?.trim() &&
@@ -611,20 +619,20 @@ export class IPythonCellComponent implements Component {
 			) {
 				startOutput();
 				renderedTextOutput = true;
-				this.renderOutputText(lines, width, normalizeErrorDetails(details.result), "out");
+				anyHeldBack ||= this.renderOutputText(lines, width, normalizeErrorDetails(details.result), "out");
 			}
 		} else if (traceback) {
 			if (traceback.output) {
 				startOutput();
 				renderedTextOutput = true;
-				this.renderOutputText(lines, width, traceback.output, "out");
+				anyHeldBack ||= this.renderOutputText(lines, width, traceback.output, "out");
 			}
 		} else if (text.trim() && !isAgentMessageReceipt(text, sentMessages) && !this.isQuietInterrupt(details, text)) {
 			startOutput();
 			renderedTextOutput = true;
 			// The model-facing background marker reads in the UI's language here.
 			const shown = normalizeErrorDetails(text).replaceAll(BACKGROUND_OUTPUT_MARKER, "[后台输出（来源未知）]");
-			this.renderOutputText(lines, width, shown, this.state.isError ? "err" : "out");
+			anyHeldBack ||= this.renderOutputText(lines, width, shown, this.state.isError ? "err" : "out");
 		}
 
 		// Without structured fields the fallback content text above already contains the appended background block.
@@ -673,7 +681,7 @@ export class IPythonCellComponent implements Component {
 		if (backgroundOutput) {
 			startOutput();
 			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", "后台输出（来源未知）"), width);
-			this.renderOutputText(lines, width, normalizeErrorDetails(backgroundOutput), "err");
+			anyHeldBack ||= this.renderOutputText(lines, width, normalizeErrorDetails(backgroundOutput), "err");
 		}
 
 		if (imageCount > 0) {
@@ -682,6 +690,7 @@ export class IPythonCellComponent implements Component {
 			const text = canRenderImages ? `${imageCount} 张图片，见下方` : `${imageCount} 张图片（这个终端无法显示）`;
 			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", text), width);
 		}
+		reportBudgetTruncatable(this, anyHeldBack);
 	}
 
 	// Summary line per message; expanding shows the message text in a `╰─` gutter
@@ -771,15 +780,17 @@ export class IPythonCellComponent implements Component {
 		}
 	}
 
-	private renderOutputText(lines: string[], width: number, text: string, label: "out" | "err"): void {
+	/** Renders the text; returns whether the (non-full) budget has more than this to hold back. */
+	private renderOutputText(lines: string[], width: number, text: string, label: "out" | "err"): boolean {
 		const color = label === "err" ? "muted" : "toolOutput";
 		const all = text.split("\n");
 		// TUI v4 T7: quiet 模式 pins a per-step window (same dozen-line budget as
 		// the bash blocks); alt+shift+O lifts it. Without this the ipython lane
 		// floods the quiet face with full output.
+		const wouldClip = quietConversationBudget() && all.length > QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES;
 		let shown = all;
 		let heldBack = 0;
-		if (quietConversationBudget() && !toolOutputFull() && all.length > QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES) {
+		if (wouldClip && !toolOutputFull()) {
 			shown = all.slice(0, QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES);
 			heldBack = all.length - QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES;
 		}
@@ -800,6 +811,7 @@ export class IPythonCellComponent implements Component {
 				width,
 			);
 		}
+		return wouldClip;
 	}
 
 	private renderTraceback(lines: string[], width: number, traceback: string): void {

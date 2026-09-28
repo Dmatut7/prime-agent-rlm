@@ -266,11 +266,15 @@ export interface KernelFileChange {
 	diffTruncated?: boolean;
 	/**
 	 * Why a text file has no `diff`: `too_large` (over the kernel's size caps), `no_baseline` (the
-	 * content before the change was not captured), `budget` (the cell's tracking budget ran out).
+	 * content before the change was not captured), `budget` (the cell's tracking budget ran out),
+	 * `sensitive` (a credential file such as `.env` or a key, or a diff holding a likely secret; the
+	 * record is saved with the session, so the text is withheld and only the line counts stay).
 	 * With `no_baseline` or `budget` the line counts may be 0 because they were not knowable.
 	 */
-	diffOmitted?: "too_large" | "no_baseline" | "budget";
+	diffOmitted?: "too_large" | "no_baseline" | "budget" | "sensitive";
 	binary?: boolean;
+	/** True when the path is (or was) a symlink: the link itself changed, so there are no line counts or diff. */
+	symlink?: boolean;
 	/** How the change was observed. */
 	source: "python" | "shell" | "edit";
 	/** Epoch ms when the kernel observed the change. */
@@ -287,9 +291,11 @@ export interface KernelMemoryChange {
 	title: string;
 	/** Title before a rename. */
 	previousTitle?: string;
-	/** Content before and after, each capped by the kernel. */
+	/** Content before and after, each capped by the kernel; both absent when `textOmitted` is set. */
 	before?: string;
 	after?: string;
+	/** `sensitive`: the content held a likely secret, so neither text was kept. */
+	textOmitted?: "sensitive";
 	/** Epoch ms when the kernel observed the change. */
 	at: number;
 }
@@ -312,6 +318,15 @@ export interface KernelActivity {
 	detail?: string;
 	startedAt: number;
 	endedAt?: number;
+	/**
+	 * A `bash()` command its cell left running. In that cell's record `status` stays `running`,
+	 * `endedAt` is the cell's end and `detail` says it moved to the background; its outcome later
+	 * arrives with the same id, `background: true` and `status` ok/error, in whichever cell is
+	 * running then (or the next one to start).
+	 */
+	background?: boolean;
+	/** Commit id a successful `git commit` (or cherry-pick, revert) command reported. */
+	commit?: string;
 }
 
 /**
@@ -325,6 +340,8 @@ export interface KernelCellEffects {
 	fileChanges: KernelFileChange[];
 	memoryChanges: KernelMemoryChange[];
 	activities: KernelActivity[];
+	/** Earlier steps left out of `activities` to keep it bounded; absent when none were. */
+	activitiesDropped?: number;
 	/** Why the lists above are partial for this cell; absent when they are complete. */
 	changeTrackingIncomplete?: string;
 }
@@ -374,8 +391,10 @@ export interface ExecuteResult {
 	fileChanges?: KernelFileChange[];
 	/** Harness memory and rules-file changes, latest record per entry. Display-only. */
 	memoryChanges?: KernelMemoryChange[];
-	/** Steps observed inside the cell, latest record per id. Display-only. */
+	/** Steps observed inside the cell, latest record per id, at most the most recent 100. Display-only. */
 	activities?: KernelActivity[];
+	/** Earlier steps left out of `activities`. Display-only. */
+	activitiesDropped?: number;
 	/** Why the change lists are partial for this cell. Display-only. */
 	changeTrackingIncomplete?: string;
 	/** Output that arrived without this cell's id (user threads, other cells' leftovers, raw fd writes). */

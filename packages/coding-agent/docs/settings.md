@@ -86,6 +86,7 @@ These are the persisted defaults for the same limits as the `--autonomous-*` CLI
 | `editorPaddingX` | number | `0` | Horizontal padding for input editor (0-3) |
 | `autocompleteMaxVisible` | number | `5` | Max visible items in autocomplete dropdown (3-20) |
 | `showHardwareCursor` | boolean | `false` | Show terminal cursor. `PI_HARDWARE_CURSOR` (`1`/`true`/`yes`, `0`/`false`/`no`) overrides it, and a conflict between the two is reported as a warning |
+| `ui.processMode` | string | `"quiet"` | How a turn's steps and thinking render: `"quiet"` folds them into one box per turn (Ctrl+O opens/closes it, Ctrl+T its thinking). `"legacy"` shows each tool call, thought and edit as its own line in the chat, with no box. Any other value falls back to `"quiet"` |
 | `ui.timelineOpenWhileWorking` | boolean | `true` | Keep a turn's box open while the AI works, so each step shows as it happens. `false` keeps the box to its one-line header until you open it |
 | `ui.timelineAutoFold` | boolean | `true` | Fold a turn's box back to its summary line when the turn ends. A box you opened or closed yourself keeps your choice |
 | `ui.reduceMotion` | boolean | `false` | Turn off the box's fades, slides, folds and the waiting shimmer (spinners keep turning) |
@@ -521,7 +522,7 @@ old one is reclaimed only after its references drop to zero.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `changeTracking.enabled` | boolean | `true` | Report what each Python cell changed and did - files it created, edited, renamed or deleted (with diffs), harness memory, skill and note edits, and the commands, reads, searches and subagent spawns it ran - so the UI can show them. Display-only: the model's context is identical either way. Off, the kernel installs no file wrappers and runs no extra `git status`. Read when a kernel starts; use `/reload` to apply a change to a running session |
+| `changeTracking.enabled` | boolean | `true` | Report what each Python cell changed and did - files it created, edited, renamed or deleted (with diffs), harness memory, skill and note edits, and the commands, reads, searches and subagent spawns it ran - so the UI can show them. Display-only for the model: its context is identical either way. The records are still saved with the session (session files, attach snapshots, `/export`), so the kernel withholds secrets: a credential file (`.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `.netrc`, `.npmrc`, `credentials*`, files under `.ssh`/`.aws`, and similar) keeps only its path and line counts, and so does any file or memory entry whose text holds a likely credential (private key blocks, API tokens, `password=`-style assignments). Off, the kernel installs no file wrappers and runs no extra `git status`. Read when a kernel starts; use `/reload` to apply a change to a running session |
 
 ```json
 {
@@ -530,6 +531,8 @@ old one is reclaimed only after its references drop to zero.
   }
 }
 ```
+
+What it does not see: files that a command started from a cell (`bash()`, `subprocess`) writes outside the session's working folder (its git work tree, when it is in one), for example `cd /tmp/build && make` or `curl -o /tmp/data.json`. Commands are checked by comparing that folder before and after; watching the whole disk would cost every cell time. Files Python writes itself are listed wherever they are.
 
 ### Diagnostics
 

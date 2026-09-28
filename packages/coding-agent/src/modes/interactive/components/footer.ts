@@ -63,8 +63,11 @@ export interface StatusBarState {
 	model: string;
 	/** Thinking level in plain words (`中`), when the model reasons. */
 	level?: string;
-	/** Context use; `warn` turns the meter amber. */
-	context?: { percent: number; warn: boolean };
+	/**
+	 * Context use; `warn` turns the meter amber. No `percent`: the context was
+	 * just compacted and not measured again yet.
+	 */
+	context?: { percent?: number; warn: boolean };
 	/** Where the session runs; the first thing to go on a narrow screen. */
 	location?: string;
 	/** Subagents running right now. */
@@ -75,7 +78,11 @@ export interface StatusBarState {
 
 const CONTEXT_METER_CELLS = 8;
 
-function contextMeter(percent: number, warn: boolean, withBar: boolean): string {
+/** The context meter's words while the context was just compacted and is not measured yet. */
+export const CONTEXT_JUST_COMPACTED = "刚整理过";
+
+function contextMeter(percent: number | undefined, warn: boolean, withBar: boolean): string {
+	if (percent === undefined) return `${theme.fg("dim", "上下文")} ${theme.fg("muted", CONTEXT_JUST_COMPACTED)}`;
 	const clamped = Math.max(0, Math.min(100, percent));
 	const filled = Math.max(clamped > 0 ? 1 : 0, Math.round((clamped / 100) * CONTEXT_METER_CELLS));
 	const color = warn ? "warning" : "accent";
@@ -96,7 +103,7 @@ function steadyWidth(text: string): number {
 
 export function renderStatusBar(state: StatusBarState, width: number, badge?: string): string {
 	const safeWidth = Math.max(1, width);
-	const model = ` ${theme.fg("muted", state.level ? `${state.model} · 思考 ${state.level}` : state.model)}`;
+	const model = ` ${theme.fg("muted", state.level ? `${state.model} · 思考强度 ${state.level}` : state.model)}`;
 	const chip = state.subagents > 0 ? theme.fg("activityAccent", `◇ ${state.subagents} 个子代理在跑`) : "";
 	const location = state.location ? theme.fg("dim", state.location) : "";
 	const badgeText = badge ? theme.fg("warning", badge) : "";
@@ -301,7 +308,13 @@ export class FooterComponent implements Component {
 		const figuresText = knownContext
 			? `${formatContextTokens(tokens, windowTokens)} · ${Math.round((tokens / windowTokens) * 100)}%${imminent ? " · 即将压缩" : ""}`
 			: "";
-		const figures = figuresText ? theme.fg(imminent ? "warning" : "muted", `${figuresText} `) : "";
+		// Right after a compaction the size is unknown until the next reply: say so instead of nothing.
+		const compacted = tokens === null && windowTokens > 0;
+		const figures = figuresText
+			? theme.fg(imminent ? "warning" : "muted", `${figuresText} `)
+			: compacted
+				? theme.fg("muted", `上下文 ${CONTEXT_JUST_COMPACTED} `)
+				: "";
 		const bar =
 			knownContext && threshold > 0 && tokens >= threshold * WATERMARK_BAR_MIN_LEVEL
 				? `${watermarkBar(tokens, windowTokens, threshold, imminent)}  `

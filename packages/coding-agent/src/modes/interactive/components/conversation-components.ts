@@ -1,4 +1,4 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { ABORT_TRUNCATION_MARKER, type AgentMessage, TOOL_ABORT_FALLBACK_MESSAGE } from "@earendil-works/pi-agent-core";
 import type { Component, MarkdownTheme, TUI } from "@earendil-works/pi-tui";
 import { isAgentSessionMessage } from "../../../core/agent-messages.js";
 import {
@@ -19,6 +19,7 @@ import {
 	CompactionOutcomeMessageComponent,
 	MalformedCompactionOutcomeMessageComponent,
 } from "./compaction-outcome-message.js";
+import { QuietCompactionNoticeComponent } from "./compaction-summary-message.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./injected-prompt-message.js";
 import { IPythonCellComponent } from "./ipython-cell.js";
 import {
@@ -34,6 +35,7 @@ import {
 	type ToolExecutionOptions,
 } from "./tool-execution.js";
 import { type TimelineHost, TurnActivityState, type TurnStep, TurnSummaryComponent } from "./turn-activity.js";
+import { boxRecordFromMessage, isBoxNoticeMessage, isPlainAnswer, replyHasWork } from "./turn-timeline.js";
 import { UserMessageComponent } from "./user-message.js";
 
 export interface ConversationComponentsOptions {
@@ -76,6 +78,37 @@ function readUserText(content: string | Array<{ type: string; text?: string }>):
 		.join("");
 }
 
+/** How a step's result says its turn went on, for a replay that cannot see the owner's key press. */
+export interface StepResultStop {
+	/** The run ended there on a stop: a message after it starts the next turn. */
+	endsTurn: boolean;
+	/** With nothing after it, the turn ended as stopped (not as an error). */
+	stopped: boolean;
+}
+
+export const NO_STEP_STOP: StepResultStop = { endsTurn: false, stopped: false };
+
+/**
+ * The owner's stop leaves the agent loop's bare abort stub on the step it
+ * caught (a stop with a reason, such as the stall watchdog's, names it, and
+ * the live view does not count that as the owner's). A cell that reports
+ * `status: "aborted"` was cut off, and the turn may still go on after it.
+ */
+export function stepResultStop(message: { content?: unknown; details?: unknown; isError?: boolean }): StepResultStop {
+	const blocks = Array.isArray(message.content) ? (message.content as Array<{ type?: unknown; text?: unknown }>) : [];
+	const ownerStop =
+		message.isError === true &&
+		blocks.some(
+			(block) =>
+				block.type === "text" &&
+				(block.text === TOOL_ABORT_FALLBACK_MESSAGE || block.text === ABORT_TRUNCATION_MARKER),
+		);
+	const details = message.details;
+	const cut =
+		typeof details === "object" && details !== null && (details as { status?: unknown }).status === "aborted";
+	return { endsTurn: ownerStop, stopped: ownerStop || cut };
+}
+
 /** Build conversation components from a message list, matching tool results to their calls. */
 export function buildConversationComponents(
 	messages: readonly AgentMessage[],
@@ -110,11 +143,11 @@ export function buildConversationComponents(
 	// An interjection lands after the step's results came back; a user message
 	// straight after a tool call (an orphaned call) starts a turn.
 	let resultsArrived = false;
-	// A step cut off by an interrupt with nothing after it: the owner stopped the turn there.
-	let resultAborted = false;
+	// How the last step's result says the turn went on (the owner's stop ends it there).
+	let resultStop = NO_STEP_STOP;
 	const closeTurn = (): void => {
 		if (!turnState || lastAssistant?.role !== "assistant") return;
-		turnState.timeline.stopped = lastAssistant.stopReason === "aborted" || resultAborted;
+		turnState.timeline.stopped = lastAssistant.stopReason === "aborted" || resultStop.stopped;
 		turnState.timeline.errorEnded = lastAssistant.stopReason === "error";
 	};
 
@@ -128,7 +161,7 @@ export function buildConversationComponents(
 				lastAssistant?.role === "assistant" &&
 				lastAssistant.stopReason === "toolUse" &&
 				resultsArrived &&
-				!resultAborted
+				!resultStop.endsTurn
 			) {
 				turnState.timeline.addSteer(
 					readUserText(message.content).trim() || "[图片]",
@@ -157,7 +190,7 @@ export function buildConversationComponents(
 			state.noteReplyAt(Number(message.timestamp));
 			lastAssistant = message;
 			resultsArrived = false;
-			resultAborted = false;
+			resultStop = NO_STEP_STOP;
 			if (!turnSummary) {
 				turnSummary = new TurnSummaryComponent(state);
 				turnSummary.setExpanded(expanded);
@@ -239,10 +272,7 @@ export function buildConversationComponents(
 			}
 		} else if (message.role === "toolResult") {
 			resultsArrived = true;
-			resultAborted =
-				typeof message.details === "object" &&
-				message.details !== null &&
-				(message.details as { status?: unknown }).status === "aborted";
+			resultStop = stepResultStop(message);
 			pendingTools.get(message.toolCallId)?.updateResult(message);
 			pendingTools.delete(message.toolCallId);
 			turnState?.setStepStatus(
@@ -288,11 +318,24 @@ export function buildConversationComponents(
 			} else {
 				components.push(new UserMessageComponent("[Malformed session command message]", options.markdownTheme));
 			}
+		} else if (quiet && turnState && message.role === "custom" && isBoxNoticeMessage(message)) {
+			// The box says it as its own row (a subagent that finished, a compaction that waited).
+			const record = boxRecordFromMessage(message);
+			if (record?.kind === "notice") turnState.timeline.addNotice(record.notice, Number(message.timestamp) || 0);
+			if (record?.kind === "compaction") {
+				turnState.timeline.addReplayCompaction(Number(message.timestamp) || 0, record.facts);
+			}
+		} else if (quiet && message.role === "compactionSummary") {
+			if (turnState) {
+				turnState.timeline.addReplayCompaction(Number(message.timestamp) || 0, { before: message.tokensBefore });
+			} else {
+				components.push(new QuietCompactionNoticeComponent(message, options.markdownTheme));
+			}
 		} else if (message.role === "custom" && message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE) {
 			if (!message.display) continue;
 			components.push(
 				isCompactionOutcomeMessage(message)
-					? new CompactionOutcomeMessageComponent(message)
+					? new CompactionOutcomeMessageComponent(message, { quiet })
 					: new MalformedCompactionOutcomeMessageComponent(),
 			);
 		} else if (message.role === "custom" && message.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE) {
@@ -340,7 +383,37 @@ export function buildConversationComponents(
 	// message so a thinking-only line stops ticking.
 	closeTurn();
 	turnState?.markTurnEnded(Number(messages.at(-1)?.timestamp) || Date.now());
+	if (quiet) foldEarlierAnswers(components);
 	return components;
+}
+
+/**
+ * Within one box turn only the last reply's answer stays under the box: an
+ * earlier answer (the run was carried on by a notice, a retry or a compaction)
+ * folds into the box as a row. `only` limits the walk to one turn.
+ */
+export function foldEarlierAnswers(children: readonly Component[], only?: TurnSummaryComponent): void {
+	let span: AssistantMessageComponent[] | undefined;
+	const settle = (): void => {
+		const replies = span;
+		span = undefined;
+		if (!replies) return;
+		replies.forEach((component, index) => {
+			const later = replies.slice(index + 1).some((next) => replyHasWork(next.message));
+			if (later && isPlainAnswer(component.message)) component.setSuperseded(true);
+		});
+	};
+	for (const child of children) {
+		if (child instanceof TurnSummaryComponent) {
+			settle();
+			if (child.state.boxMode && (only === undefined || child === only)) span = [];
+		} else if (child instanceof UserMessageComponent) {
+			settle();
+		} else if (span && child instanceof AssistantMessageComponent) {
+			span.push(child);
+		}
+	}
+	settle();
 }
 
 /** The last non-empty thinking trace of one assistant message, or "". */

@@ -1,0 +1,1 @@
+- Fixed a command step's last-output-line detail being able to show a credential (for example `cat .env` or `echo $API_KEY`); a detail that looks like a secret is now left out of the record instead of shown.

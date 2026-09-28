@@ -23,6 +23,9 @@ export interface CustomEditorOptions extends EditorOptions {
 /**
  * Custom editor that handles app-level keybindings for coding-agent.
  */
+/** An action handler returns this to decline its key: the next action bound to the same key gets it. */
+export const DECLINE_KEY = Symbol("decline key");
+
 export class CustomEditor extends Editor {
 	private keybindings: KeybindingsManager;
 	private defaultPromptPrefix: string;
@@ -145,8 +148,9 @@ export class CustomEditor extends Editor {
 	}
 
 	/**
-	 * Register a handler for an app action. A handler that returns `false`
-	 * declines the key, and the next action bound to the same key gets it.
+	 * Register a handler for an app action. A handler that returns
+	 * {@link DECLINE_KEY} declines the key, and the next action bound to the
+	 * same key gets it; any other result (a boolean included) consumes it.
 	 */
 	onAction(action: AppKeybinding, handler: () => unknown): void {
 		this.actionHandlers.set(action, handler);
@@ -270,7 +274,7 @@ export class CustomEditor extends Editor {
 				if ((action === "app.clear" || action === "app.interrupt") && this.isShowingAutocomplete()) {
 					this.cancelAutocomplete();
 				}
-				if (handler() === false) continue;
+				if (handler() === DECLINE_KEY) continue;
 				return;
 			}
 		}

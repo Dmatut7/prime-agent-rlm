@@ -1,7 +1,9 @@
-import { Clickable, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
+import { Clickable, Container, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
 import type { CompactionSummaryMessage } from "../../../core/messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import { customMessageLabel, ExpandableCustomMessageBox } from "./expandable-custom-message.js";
+import { SystemNoticeLine } from "./system-notice.js";
+import { formatBoxTokens } from "./turn-timeline.js";
 
 /** Compaction summary card: full markdown summary when expanded. */
 export class CompactionSummaryMessageComponent extends ExpandableCustomMessageBox {
@@ -43,5 +45,44 @@ export class CompactionSummaryMessageComponent extends ExpandableCustomMessageBo
 				),
 			);
 		}
+	}
+}
+
+/**
+ * The quiet conversation's face of a compaction that happened before any turn
+ * on screen: one faint line in plain words, the summary once opened. (A
+ * compaction inside a turn is a row of that turn's box instead.)
+ */
+export class QuietCompactionNoticeComponent extends Container {
+	private expanded = false;
+
+	constructor(
+		private readonly message: CompactionSummaryMessage,
+		private readonly markdownTheme: MarkdownTheme = getMarkdownTheme(),
+	) {
+		super();
+		this.updateDisplay();
+	}
+
+	setExpanded(expanded: boolean): void {
+		if (this.expanded === expanded) return;
+		this.expanded = expanded;
+		this.updateDisplay();
+	}
+
+	private updateDisplay(): void {
+		this.clear();
+		const toggle = () => this.setExpanded(!this.expanded);
+		const before = `原来 ${formatBoxTokens(this.message.tokensBefore)} tokens，重要的结论都留着`;
+		this.addChild(new Spacer(1));
+		this.addChild(new Clickable(new SystemNoticeLine("⇣ 前面的对话整理过了", before), toggle));
+		if (!this.expanded) return;
+		const focus = this.message.customInstructions ? `**重点：** ${this.message.customInstructions}\n\n` : "";
+		this.addChild(new Spacer(1));
+		this.addChild(
+			new Markdown(focus + this.message.summary, 1, 0, this.markdownTheme, {
+				color: (text: string) => theme.fg("customMessageText", text),
+			}),
+		);
 	}
 }
