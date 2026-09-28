@@ -268,8 +268,9 @@ export interface KernelFileChange {
 	 * Why a text file has no `diff`: `too_large` (over the kernel's size caps), `no_baseline` (the
 	 * content before the change was not captured), `budget` (the cell's tracking budget ran out).
 	 * With `no_baseline` or `budget` the line counts may be 0 because they were not knowable.
+	 * `sensitive`: the file or its diff looks like it holds a secret, so no text was kept.
 	 */
-	diffOmitted?: "too_large" | "no_baseline" | "budget";
+	diffOmitted?: "too_large" | "no_baseline" | "budget" | "sensitive";
 	binary?: boolean;
 	/** How the change was observed. */
 	source: "python" | "shell" | "edit";
@@ -290,6 +291,8 @@ export interface KernelMemoryChange {
 	/** Content before and after, each capped by the kernel. */
 	before?: string;
 	after?: string;
+	/** `sensitive`: the texts looked like they hold a secret, so neither was kept. */
+	textOmitted?: "sensitive";
 	/** Epoch ms when the kernel observed the change. */
 	at: number;
 }

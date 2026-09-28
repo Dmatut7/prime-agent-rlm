@@ -97,8 +97,10 @@ export interface RowBuildContext {
 	stopped: boolean;
 	/** `hideThinkingBlock`: thinking rows keep their time and size, never their text. */
 	hideThinking?: boolean;
-	/** Activity id → the step whose record says it finished (a background command's later completion). */
-	settledActivities?: ReadonlyMap<string, string>;
+	/** Activity id → the finished record of a background command and the step it arrived with. */
+	settledActivities?: ReadonlyMap<string, { stepId: string; activity: KernelActivity }>;
+	/** Activity id → the first step that listed it still running (where a background command started). */
+	activityOrigins?: ReadonlyMap<string, string>;
 }
 
 /** Most lines an opened row shows; the rest is summarized in one line. */
@@ -274,11 +276,15 @@ function sourceText(source: ChangeEntry["source"]): string | undefined {
 	return undefined;
 }
 
+/** What stands in for a diff or a memory's texts the kernel did not keep because they looked secret. */
+const SENSITIVE_TEXT = "内容没存：看起来是密钥";
+
 /** Why a file's change has no diff to show, in plain words. */
 export function omittedDiffText(reason: ChangeEntry["omitted"]): string | undefined {
 	if (reason === "too_large") return "改动太大，没有显示";
 	if (reason === "no_baseline") return "没法对比改前内容";
 	if (reason === "budget") return "超出记录预算";
+	if (reason === "sensitive") return SENSITIVE_TEXT;
 	return undefined;
 }
 
@@ -354,6 +360,10 @@ export function memoryDetail(change: KernelMemoryChange): (width: number) => str
 				`${label("改名  ")}${theme.fg("muted", cleanMemoryTitle(change.previousTitle))}${label(" → ")}${theme.fg("activityText", cleanMemoryTitle(change.title))}`,
 			);
 		}
+		if (change.textOmitted === "sensitive") {
+			lines.push(label(SENSITIVE_TEXT));
+			return lines.map((line) => truncateToWidth(line, width, "…"));
+		}
 		const before = change.before?.trimEnd() ?? "";
 		const after = change.after?.trimEnd() ?? "";
 		const paint = (rows: DiffRow[]) => renderDiffRows(rows, { width, indent: 0 }).map((line) => line);
@@ -406,7 +416,9 @@ function memoryRow(key: string, change: KernelMemoryChange): BoxRow {
 		textColor: "memoryAccent",
 		meta,
 		// A live record carries no texts yet (they come with the step's end): nothing to open.
-		...(change.before !== undefined || change.after !== undefined || renamed ? { detail: memoryDetail(change) } : {}),
+		...(change.before !== undefined || change.after !== undefined || renamed || change.textOmitted
+			? { detail: memoryDetail(change) }
+			: {}),
 	};
 }
 
@@ -431,7 +443,11 @@ function activityRow(stepId: string, activity: KernelActivity, timeline: TurnTim
 					? []
 					: activity.status === "error"
 						? failMeta(commandResultText(activity.detail, false))
-						: okMeta(commandResultText(activity.detail, true)),
+						: okMeta(
+								activity.commit
+									? `提交 ${activity.commit.slice(0, 7)}`
+									: commandResultText(activity.detail, true),
+							),
 				...(tail ? { sub: timeline.steadyLine(`${key}:tail`, tail, ctx.now) } : {}),
 			};
 		}
@@ -640,6 +656,12 @@ interface TimedRows {
 
 const BACKGROUND_SUFFIX = " · 转到后台继续跑";
 
+/** A background command's outcome: it finished after its cell, said on its own row. */
+function finishedInBackground(row: BoxRow, activity: KernelActivity): BoxRow {
+	const { sub: _sub, ...rest } = row;
+	return { ...rest, text: `${row.text} · ${activity.status === "ok" ? "后台跑完了" : "后台出错了"}` };
+}
+
 /** A step that went on after its cell (or its turn) ended: said once, no spinner, no clock. */
 function backgroundRow(row: BoxRow): BoxRow {
 	const { startedAt: _startedAt, sub: _sub, ...rest } = row;
@@ -653,9 +675,21 @@ function stepRows(step: RowStep, timeline: TurnTimeline, ctx: RowBuildContext, o
 	const running = step.status === "running" || step.status === "queued";
 	for (const activity of [...data.activities].sort((a, b) => a.startedAt - b.startedAt)) {
 		const unfinished = activity.status === "running";
-		// Its completion arrived with a later step: that step shows the result.
-		const settledIn = ctx.settledActivities?.get(activity.id);
-		if (unfinished && settledIn !== undefined && settledIn !== step.toolCallId) continue;
+		const settled = ctx.settledActivities?.get(activity.id);
+		if (unfinished && settled !== undefined && settled.stepId !== step.toolCallId) {
+			// It finished in the background while a later step ran: its own row settles in place.
+			const row = activityRow(step.toolCallId, settled.activity, timeline, ctx);
+			items.push({ time: activity.startedAt, order: index++, rows: [finishedInBackground(row, settled.activity)] });
+			continue;
+		}
+		if (!unfinished && activity.background === true) {
+			// The step that started it already shows its outcome.
+			const origin = ctx.activityOrigins?.get(activity.id);
+			if (origin !== undefined && origin !== step.toolCallId) continue;
+			const row = activityRow(step.toolCallId, activity, timeline, ctx);
+			items.push({ time: activity.startedAt, order: index++, rows: [finishedInBackground(row, activity)] });
+			continue;
+		}
 		const row = activityRow(step.toolCallId, activity, timeline, ctx);
 		// Still running although the cell (or the turn) is over: it runs on in the background.
 		const background = unfinished && (activity.background === true || !running || !ctx.live);
@@ -687,6 +721,19 @@ function stepRows(step: RowStep, timeline: TurnTimeline, ctx: RowBuildContext, o
 	}
 	items.sort((a, b) => a.time - b.time || a.order - b.order);
 	const rows = items.flatMap((item) => item.rows);
+	if (data.activitiesDropped !== undefined && data.activitiesDropped > 0) {
+		// The kernel keeps a cell's most recent steps; say how many earlier ones it no longer lists.
+		rows.unshift({
+			key: `step:${step.toolCallId}:dropped`,
+			kind: "step",
+			status: "plain",
+			glyph: "…",
+			glyphColor: "dim",
+			text: `更早的 ${data.activitiesDropped} 步没列出`,
+			textColor: "dim",
+			meta: [],
+		});
+	}
 	// The last command of a cell carries the cell's output when opened.
 	const lastCommand = [...rows].reverse().find((row) => row.kind === "cmd");
 	if (lastCommand && !running && data.outputText?.trim()) {
@@ -979,13 +1026,18 @@ function mergeReads(rows: BoxRow[]): BoxRow[] {
 
 /** Every row of a turn, in order. */
 export function buildTimelineRows(timeline: TurnTimeline, baseCtx: RowBuildContext): BoxRow[] {
-	const settledActivities = new Map<string, string>();
+	const settledActivities = new Map<string, { stepId: string; activity: KernelActivity }>();
+	const activityOrigins = new Map<string, string>();
 	for (const step of baseCtx.steps.values()) {
 		for (const activity of timeline.stepData.get(step.toolCallId)?.activities ?? []) {
-			if (activity.status !== "running") settledActivities.set(activity.id, step.toolCallId);
+			if (activity.status === "running") {
+				if (!activityOrigins.has(activity.id)) activityOrigins.set(activity.id, step.toolCallId);
+			} else {
+				settledActivities.set(activity.id, { stepId: step.toolCallId, activity });
+			}
 		}
 	}
-	const ctx: RowBuildContext = { ...baseCtx, settledActivities };
+	const ctx: RowBuildContext = { ...baseCtx, settledActivities, activityOrigins };
 	const rows: BoxRow[] = [];
 	const snapshotNames = new Set(
 		timeline.entries.flatMap((entry) => (entry.kind === "subagent" ? [entry.sub.name] : [])),

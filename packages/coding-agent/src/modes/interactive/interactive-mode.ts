@@ -3353,7 +3353,8 @@ export class InteractiveMode {
 		const snapshot: FooterTelemetrySnapshot = {
 			modelName: model?.id,
 			thinkingLevel,
-			contextTokens: usage?.tokens ?? undefined,
+			// null (just compacted, not measured yet) stays null: the footer says so.
+			contextTokens: usage ? usage.tokens : undefined,
 			contextWindow: usage?.contextWindow,
 			compactionThresholdTokens: thresholdTokens,
 		};
@@ -7684,6 +7685,9 @@ export class InteractiveMode {
 			const percent = (usage.tokens / usage.contextWindow) * 100;
 			const threshold = this.getFooterTelemetrySource().snapshot?.compactionThresholdTokens ?? 0;
 			context = { percent, warn: percent >= 80 || (threshold > 0 && usage.tokens >= threshold) };
+		} else if (usage && usage.tokens === null && usage.contextWindow > 0) {
+			// Just compacted: the size is measured again with the next reply.
+			context = { warn: false };
 		}
 		const branch = this.footerDataProvider.getGitBranch();
 		const location = [formatSplashCwd(this.getCurrentCwd()), branch ?? undefined].filter(Boolean).join(" · ");
