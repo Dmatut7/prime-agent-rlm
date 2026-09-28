@@ -21,6 +21,7 @@ from pathlib import Path
 from collections.abc import Generator
 from typing import Any, Literal, Mapping, NamedTuple, Sequence
 
+from . import effects
 from ._yaml_compat import register_plain_str
 
 HarnessKind = Literal["prompt", "memory", "skill", "subagent"]
@@ -763,7 +764,10 @@ class HarnessState:
             },
             "refinements": [asdict(event) for event in self.refinements],
         }
-        _write_private_json_atomic(self._lexical_file_path or self.file_path, data)
+        # The entry-level memory record (see effects.memory_change) describes this write; a JSON
+        # diff of the whole state file next to it would say the same thing less clearly.
+        with effects.untracked():
+            _write_private_json_atomic(self._lexical_file_path or self.file_path, data)
         self._loaded_mtime = self._disk_mtime()
         return self
 
@@ -851,6 +855,8 @@ class HarnessState:
             source=source,
             existing=existing,
         )
+        previous_title = existing.title if existing else None
+        previous_content = existing.content if existing else None
         if existing:
             existing.title = title
             existing.content = content
@@ -885,6 +891,17 @@ class HarnessState:
             )
             self.entries[kind][entry_id] = entry
         self.save()
+        # Display-only: tells the host UI what changed; the model's view of the harness is unchanged.
+        effects.memory_change(
+            "updated" if existing else "created",
+            kind,
+            self.scope,
+            entry_id,
+            title,
+            previous_title=previous_title,
+            before=previous_content,
+            after=content,
+        )
         return entry
 
     def get(self, kind: HarnessKind, id: str, *, global_: bool = False, **kwargs: Any) -> HarnessEntry | None:
@@ -907,8 +924,9 @@ class HarnessState:
             raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
         if id not in self.entries[kind]:
             return False
-        del self.entries[kind][id]
+        removed = self.entries[kind].pop(id)
         self.save()
+        effects.memory_change("deleted", kind, self.scope, id, removed.title, before=removed.content)
         return True
 
     def list(self, kind: HarnessKind | None = None, *, global_: bool = False, **kwargs: Any) -> list[HarnessEntry]:

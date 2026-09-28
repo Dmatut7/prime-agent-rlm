@@ -230,6 +230,50 @@ running or queued, SIGINT and interrupt requests are ignored.
 `display` event. `emit(data)` takes one non-empty dict keyed by MIME type
 strings; the dict is forwarded verbatim as the event's `data`.
 
+## Change tracking
+
+A display-only report of what a cell changed and did, for the host UI. It rides
+the `display` channel (no new frame kind, no protocol version change) and is on
+unless the kernel environment sets `PRIME_AGENT_CHANGE_TRACKING=0`, in which
+case nothing below is installed at all. Implemented in `rlm/effects.py`.
+
+| MIME type | Payload |
+|---|---|
+| `application/vnd.prime-agent.file-change+json` | one file effect: `path`, `relPath?`, `kind` (`created`/`modified`/`deleted`/`renamed`), `oldPath?`, `scope` (`project`/`scratch`/`memory`), `added`, `removed`, `diff?`, `diffTruncated?`, `diffOmitted?` (`too_large`/`no_baseline`/`budget`), `binary?`, `source` (`python`/`shell`/`edit`), `at` |
+| `application/vnd.prime-agent.memory-change+json` | one harness entry or rules-file change: `op`, `kind` (`memory`/`skill`/`subagent`/`prompt_note`/`rules_file`), `scope` (`session`/`global`/`project`), `id`, `title`, `previousTitle?`, `before?`, `after?`, `at` |
+| `application/vnd.prime-agent.activity+json` | one step: `id`, `kind` (`command`/`read`/`search`/`fetch`/`subagent`), `label`, `status` (`running`/`ok`/`error`), `detail?`, `startedAt`, `endedAt?` |
+| `application/vnd.prime-agent.change-tracking+json` | at most one per cell: `{"incomplete": reason}` when the lists above are partial |
+
+Every record is complete on its own; the host keeps the latest one per file
+path, per memory entry (`kind`, `scope`, `id`) and per activity `id`. A record
+with `"retracted": true` (file: `path`; memory: `kind`, `scope`, `id`) withdraws
+an earlier one - a file that ended the cell as it started, an entry created and
+deleted in the same cell.
+
+- Python writes are seen by thin wrappers around `open`/`io.open`, `os.open`
+  with write flags, `os.rename`/`replace`/`remove`/`unlink`/`truncate` and
+  `shutil.rmtree`; pathlib, shutil's copies and moves and tempfile go through
+  them. The old content is captured when a file is opened for writing, so a
+  record diffs the cell's start against its end (several writes to one file
+  coalesce). No interpreter-wide hook is installed: code that touches no file
+  pays nothing.
+- Child processes (`bash()`, `subprocess`, `os.system`) are covered by a
+  before/after comparison taken around the first process a cell starts:
+  `git status --porcelain=v2` plus stat and content caches inside a git work
+  tree (a moved `HEAD` adds `git diff --name-only`), a bounded mtime scan
+  outside one. Ignored files, `.git`, `node_modules`, virtualenvs and caches are
+  never reported.
+- Records are sent as soon as a file's size and mtime hold still for one watch
+  interval (0.15 s), and finally before the cell's `done`; that final
+  collection is part of the interruptible finishing phase.
+- Each cell has a tracking time budget (`PRIME_AGENT_CHANGE_TRACKING_BUDGET_MS`,
+  default 500); past it, tracking stops for that cell and says so in the
+  `change-tracking` record. Diffs are capped at 400 lines / 64 KiB per file and
+  256 KiB per cell; memory texts at 4000 characters.
+- `bash()` commands, `rlm.run()` spawns, harness writes and the web skills
+  report their own steps (`rlm.effects.step`, `rlm.effects.reported`); plain
+  reads inside the working directory are reported once per file per cell.
+
 ## Host bridge
 
 `await rlm.repl.host_request(data)` ships a `host_request` event with a

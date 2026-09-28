@@ -28,6 +28,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from . import effects
 from .bash import (
     _forget_cell,
     _kill_cell_handles,
@@ -289,6 +290,17 @@ def emit(data: dict[str, Any]) -> None:
 def is_active() -> bool:
     """True when this process serves the repl protocol (not merely imported)."""
     return _protocol_fd >= 0
+
+
+def _send_effect(cell_id: str, data: dict[str, Any]) -> None:
+    """Ship one change-tracking record (see rlm.effects) as a display event of `cell_id`.
+
+    The payloads are built by the tracker from strings, ints and bools only, so the
+    strict-JSON and size checks `emit()` applies to arbitrary user payloads are not needed.
+    """
+    # Same-context causality as emit(): text printed before the record precedes it.
+    _stream_coalescer.flush()
+    _send({"event": "display", "id": cell_id, "data": data})
 
 
 async def host_request(data: dict[str, Any]) -> dict[str, Any]:
@@ -788,10 +800,16 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
     try:
         codes, has_trailing = _compile_cell(req["code"], filename)
         assert _loop is not None
+        # Display-only change tracking; a no-op when the host turned it off.
+        effects.begin_cell(cell_id)
         task = _loop.create_task(_run_codes(codes, ns))
         status, value, error = await _run_guarded(task, cell_id)
         result_text: str | None = None
         try:
+            # The cell's final change records precede its done frame. Collecting them is part of
+            # the interruptible finishing phase: an interrupt that lands there is the cell's own.
+            if effects.end_cell(cell_id) and status == "ok":
+                status, error = "error", _error_event(cell_id, KeyboardInterrupt())
             if _consume_handoff_interrupt() and status == "ok":
                 # SIGINT landed between the task's completion and the finishing
                 # phase: it targeted this request, so cancel its remaining work.
@@ -815,6 +833,8 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
             _send(error)
         _send({"event": "done", "id": cell_id, "status": status})
     finally:
+        # A cell that never reached end_cell (compile failure, a runtime fault) stops being tracked.
+        effects.discard_cell(cell_id)
         _current_cell.reset(token)
         _reset_current_cell(bash_token)
 
@@ -2163,6 +2183,9 @@ def main() -> None:
     import asyncio
     _loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_loop)
+    # After the ready frame, like the event loop: installing the file wrappers is not on the
+    # startup path the host waits for, and it finishes before the first request is served.
+    effects.install(_send_effect)
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     threading.Thread(target=_read_requests, args=(stdin_fd, queue), daemon=True).start()
 

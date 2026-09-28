@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import effects as _effects
 from .bash import BashHandle, BashResult, bash
 from .harness import HarnessEntry, HarnessScope, HarnessState, RefinementEvent, get_harness_state
 
@@ -163,8 +164,16 @@ async def run(prompt: str, **kwargs: Any) -> RLMSpawnHandle:
     """
     if not isinstance(prompt, str):
         raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
-    payload = await host_request("rlm.run", {"prompt": prompt, "kwargs": kwargs})
-    return _spawn_handle_from_payload(payload)
+    # Display-only step for the host's live feed: the task while admitting, the child's name once admitted.
+    step = _effects.step("subagent", prompt)
+    try:
+        payload = await host_request("rlm.run", {"prompt": prompt, "kwargs": kwargs})
+        handle = _spawn_handle_from_payload(payload)
+    except BaseException as exc:
+        step.finish("error", f"{type(exc).__name__}: {exc}")
+        raise
+    step.finish("ok", handle.model, label=handle.name)
+    return handle
 
 
 def _model_from_payload(payload: Any) -> RLMModel:
