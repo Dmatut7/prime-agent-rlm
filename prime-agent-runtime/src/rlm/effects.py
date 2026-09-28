@@ -93,6 +93,10 @@ SNAPSHOT_CONTENT_BYTES = 4 << 20
 CONTENT_CACHE_BYTES = 8 << 20
 CONTENT_CACHE_ENTRIES = 512
 COMMAND_UPDATE_INTERVAL_S = 0.5
+# The detail of a command still running when its cell ends ("moved to the background, still running").
+BACKGROUND_DETAIL = "转到后台继续跑"
+# Completions of background commands held while no cell is running, sent at the next cell's start.
+MAX_PENDING_COMPLETIONS = 64
 _PATH_CACHE_LIMIT = 4096
 
 RULES_FILE_NAMES = frozenset({"AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"})
@@ -329,6 +333,8 @@ class _Cell:
         self.scan: tuple[str, dict[str, tuple[int, int]]] | None = None
         self.roots_seen: set[str] = set()
         self.snapshots: list[_SnapshotJob] = []
+        # bash() steps started by this cell that have not finished yet.
+        self.commands: set[CommandStep] = set()
         self.shell_check_pending = False
         self.last_shell_check = 0.0
         # Tracker-thread time, see BACKGROUND_BUDGET_S.
@@ -624,6 +630,7 @@ class _Tracker:
         self.skip_files: frozenset[str] = frozenset()
         self.skip_roots: tuple[str, ...] = ()
         self.cwd_git_root: str | None = None
+        self.pending_completions: list[dict[str, Any]] = []
         # Resolved once, off every cell's path: a slow or hung git must not stall a write wrapper.
         self._cwd_git_resolved = threading.Event()
         self._refresh_paths()
@@ -949,6 +956,10 @@ class _Tracker:
         cell = _Cell(cell_id, self.budget_s)
         with self.lock:
             self.cell = cell
+            completions, self.pending_completions = self.pending_completions, []
+        # Background commands that finished while no cell was running report here, first.
+        for record in completions:
+            self.send_activity(cell.id, record)
         live = 0
         bash_module = sys.modules.get("rlm.bash")
         if bash_module is not None:
@@ -982,6 +993,12 @@ class _Tracker:
             # the work lock for a whole comparison.
             with self.lock:
                 cell.closing = True
+                still_running = list(cell.commands)
+            # A command the cell leaves running keeps going as a background handle: say so in this
+            # cell (its last word here), and report its end in whichever cell is running then.
+            ended_at = _now_ms()
+            for command in still_running:
+                command.move_to_background(ended_at)
             with cell.work_lock:
                 try:
                     for job in list(cell.snapshots):
@@ -1752,6 +1769,17 @@ class _Tracker:
             return
         self.send(cell_id, {ACTIVITY_MIME: activity})
 
+    def background_completion(self, record: dict[str, Any]) -> None:
+        """A background command ended: report it in the running cell, or hold it for the next one."""
+        with self.lock:
+            cell = self.cell
+            if cell is None or cell.closing:
+                if len(self.pending_completions) < MAX_PENDING_COMPLETIONS:
+                    self.pending_completions.append(record)
+                return
+            target = cell.id
+        self.send_activity(target, record)
+
     def memory_change(self, record: dict[str, Any]) -> None:
         cell = self.cell
         if cell is None:
@@ -2087,7 +2115,13 @@ class Step:
         if not self.done:
             self._send({"status": "running", "detail": _one_line(detail, MAX_DETAIL)})
 
-    def finish(self, status: str = "ok", detail: str | None = None, label: str | None = None) -> None:
+    def finish(
+        self,
+        status: str = "ok",
+        detail: str | None = None,
+        label: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
         if self.done:
             return
         self.done = True
@@ -2096,6 +2130,8 @@ class Step:
         fields: dict[str, Any] = {"status": "ok" if status == "ok" else "error", "endedAt": _now_ms()}
         if detail:
             fields["detail"] = _one_line(detail, MAX_DETAIL)
+        if extra:
+            fields.update(extra)
         self._send(fields)
 
     def __enter__(self) -> Step:
@@ -2175,15 +2211,50 @@ def reported(
     return decorate
 
 
+_COMMIT_LINE = re.compile(r"^\[[^\]\n]*?\b([0-9a-f]{7,40})\]\s", re.M)
+_GIT_WORD = re.compile(r"\bgit\b")
+
+
+def _commit_id(command: str, exit_code: int, output: str) -> str | None:
+    """The commit a successful git command reported (`[main 1a2b3c4] subject`), the last one if several."""
+    if exit_code != 0 or not _GIT_WORD.search(command):
+        return None
+    found = _COMMIT_LINE.findall(output)
+    return found[-1] if found else None
+
+
 class CommandStep:
-    """The live step of one bash() command: its latest output line (at most ~2/s), then the outcome."""
+    """The live step of one bash() command: its latest output line (at most ~2/s), then the outcome.
+
+    A command still running when its cell ends becomes a background step: the cell's last record for
+    it says so (`background: true`, `endedAt` = the cell's end), and its eventual outcome is reported,
+    with the same id, in whichever cell is running then (or at the next cell's start).
+    """
 
     def __init__(self, command: str) -> None:
         self._step = Step("command", command)
+        self._command = command
         self._last_update = 0.0
         self._tail = b""
         self._timer: threading.Timer | None = None
         self._lock = threading.Lock()
+        self._background = False
+        self._finished = False
+        tracker = _tracker
+        self._cell = tracker.cell if tracker is not None else None
+        if tracker is not None and self._cell is not None:
+            with tracker.lock:
+                self._cell.commands.add(self)
+
+    def move_to_background(self, ended_at: int) -> None:
+        with self._lock:
+            if self._finished or self._background:
+                return
+            self._background = True
+            timer, self._timer = self._timer, None
+        if timer is not None:
+            timer.cancel()
+        self._step._send({"status": "running", "background": True, "detail": BACKGROUND_DETAIL, "endedAt": ended_at})
 
     def output(self, chunk: bytes) -> None:
         try:
@@ -2215,6 +2286,8 @@ class CommandStep:
             pass
 
     def _show(self, tail: bytes) -> None:
+        if self._background:
+            return  # its cell is over; only the outcome is reported, in a later cell
         line = _last_line(tail.decode("utf-8", "replace"))
         if line:
             self._step.update(line)
@@ -2223,10 +2296,37 @@ class CommandStep:
         try:
             with self._lock:
                 timer, self._timer = self._timer, None
+                self._finished = True
+                background = self._background
             if timer is not None:
                 timer.cancel()
-            self._step.finish("ok" if exit_code == 0 else "error", _command_summary(exit_code, output))
             tracker = _tracker
+            if tracker is not None and self._cell is not None:
+                with tracker.lock:
+                    self._cell.commands.discard(self)
+            status = "ok" if exit_code == 0 else "error"
+            detail = _command_summary(exit_code, output)
+            commit = _commit_id(self._command, exit_code, output)
+            if background:
+                step = self._step
+                step.done = True
+                record: dict[str, Any] = {
+                    "id": step.id,
+                    "kind": step.kind,
+                    "label": step.label,
+                    "startedAt": step.started_at,
+                    "status": status,
+                    "endedAt": _now_ms(),
+                    "background": True,
+                }
+                if detail:
+                    record["detail"] = _one_line(detail, MAX_DETAIL)
+                if commit:
+                    record["commit"] = commit
+                if tracker is not None:
+                    tracker.background_completion(record)
+            else:
+                self._step.finish(status, detail, extra={"commit": commit} if commit else None)
             if tracker is not None:
                 tracker.request_shell_check()
         except Exception:  # noqa: BLE001
