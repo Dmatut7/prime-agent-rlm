@@ -380,6 +380,22 @@ describe("AssistantMessageComponent streaming identity", () => {
 		}
 	});
 
+	test("a quiet turn leaves a model error to its box row, except a login hint", () => {
+		initTheme("dark");
+		const failed = {
+			...createAssistantMessage([]),
+			stopReason: "error" as const,
+			errorMessage: "503 upstream overloaded",
+		};
+		const render = (quiet: boolean) =>
+			new AssistantMessageComponent(failed, false, undefined, "Thinking", { quiet })
+				.render(80)
+				.map((line) => stripAnsi(line))
+				.join("\n");
+		expect(render(false)).toContain("Error: 503 upstream overloaded");
+		expect(render(true)).not.toContain("503 upstream overloaded");
+	});
+
 	test("quiet turns indent opened thinking traces; the answer keeps the one-column margin", () => {
 		initTheme("dark");
 		const message = createAssistantMessage([

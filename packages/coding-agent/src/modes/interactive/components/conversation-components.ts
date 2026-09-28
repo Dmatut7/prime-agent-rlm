@@ -110,9 +110,11 @@ export function buildConversationComponents(
 	// An interjection lands after the step's results came back; a user message
 	// straight after a tool call (an orphaned call) starts a turn.
 	let resultsArrived = false;
+	// A step cut off by an interrupt with nothing after it: the owner stopped the turn there.
+	let resultAborted = false;
 	const closeTurn = (): void => {
 		if (!turnState || lastAssistant?.role !== "assistant") return;
-		turnState.timeline.stopped = lastAssistant.stopReason === "aborted";
+		turnState.timeline.stopped = lastAssistant.stopReason === "aborted" || resultAborted;
 		turnState.timeline.errorEnded = lastAssistant.stopReason === "error";
 	};
 
@@ -125,7 +127,8 @@ export function buildConversationComponents(
 				turnState &&
 				lastAssistant?.role === "assistant" &&
 				lastAssistant.stopReason === "toolUse" &&
-				resultsArrived
+				resultsArrived &&
+				!resultAborted
 			) {
 				turnState.timeline.addSteer(
 					readUserText(message.content).trim() || "[图片]",
@@ -153,6 +156,7 @@ export function buildConversationComponents(
 			state.timeline.noteMessage(message, true);
 			lastAssistant = message;
 			resultsArrived = false;
+			resultAborted = false;
 			if (!turnSummary) {
 				turnSummary = new TurnSummaryComponent(state);
 				turnSummary.setExpanded(expanded);
@@ -234,6 +238,10 @@ export function buildConversationComponents(
 			}
 		} else if (message.role === "toolResult") {
 			resultsArrived = true;
+			resultAborted =
+				typeof message.details === "object" &&
+				message.details !== null &&
+				(message.details as { status?: unknown }).status === "aborted";
 			pendingTools.get(message.toolCallId)?.updateResult(message);
 			pendingTools.delete(message.toolCallId);
 			turnState?.setStepStatus(

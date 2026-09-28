@@ -32,6 +32,9 @@ const EMPTY_USAGE: Usage = {
 
 type HandleEvent = (this: LiveMode, event: AgentConnectionSessionEvent) => Promise<void>;
 const handleEvent = (InteractiveMode.prototype as unknown as { handleEvent: HandleEvent }).handleEvent;
+/** Escape while the AI works: the interactive mode's own interrupt. */
+const interrupt = (InteractiveMode.prototype as unknown as { interruptOrClearInput(this: LiveMode): void })
+	.interruptOrClearInput;
 
 interface LiveMode {
 	chatContainer: Container;
@@ -99,6 +102,7 @@ function createLiveMode(): LiveMode {
 		showError: vi.fn(),
 		showStatus: vi.fn(),
 		clearShortcutGuide: vi.fn(),
+		agentConnection: { abortAndSendQueued: vi.fn(async () => ({})) },
 		addMessageToChat: (message: AgentMessage) => {
 			if (message.role === "user") {
 				const content = message.content;
@@ -275,5 +279,41 @@ describe("a quiet turn, live", () => {
 		const opened = screen(mode);
 		expect(opened).toContain("⇣ 整理完成：182k → 41k tokens");
 		expect(opened).toMatch(/↻/);
+	});
+	it("keeps a message taken at a step boundary in the same box, and a turn the owner stops ends stopped", async () => {
+		vi.useFakeTimers({ now: clock });
+		setMotionReduced(true);
+		const mode = createLiveMode();
+		mode.connectionState.isStreaming = true;
+		await handleEvent.call(mode, { type: "agent_start" } as AgentConnectionSessionEvent);
+		await userTurn(mode, "跑一下慢检查");
+		await bashStep(mode, "call-1", "npm run check-slow", "ok");
+		// The run stops after the step to take the queued message, then goes on with it.
+		await endRun(mode);
+		mode.connectionState.isStreaming = true;
+		await handleEvent.call(mode, { type: "agent_start" } as AgentConnectionSessionEvent);
+		await userTurn(mode, "顺便把 lint 也跑了");
+		await assistantMessage(
+			mode,
+			assistant(
+				[{ type: "toolCall", id: "call-2", name: "bash", arguments: { command: "npm run lint" } }],
+				"toolUse",
+			),
+		);
+		expect(boxes(mode)).toHaveLength(1);
+		expect(mode.chatContainer.children.filter((child) => child instanceof UserMessageComponent)).toHaveLength(1);
+		expect(screen(mode)).toContain("› 你插话：顺便把 lint 也跑了");
+
+		// Escape mid-step: the box ends stopped, and the next prompt is a new turn.
+		interrupt.call(mode);
+		await endRun(mode);
+		vi.advanceTimersByTime(450);
+		expect(screen(mode)).toContain("■ 已停止");
+		mode.connectionState.isStreaming = true;
+		await handleEvent.call(mode, { type: "agent_start" } as AgentConnectionSessionEvent);
+		await userTurn(mode, "算了，先看测试");
+		await assistantMessage(mode, assistant([{ type: "text", text: "好。" }], "stop"));
+		expect(boxes(mode)).toHaveLength(2);
+		expect(screen(mode)).not.toContain("你插话：算了");
 	});
 });

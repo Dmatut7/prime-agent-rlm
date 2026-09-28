@@ -7,6 +7,7 @@ import { KeybindingsManager } from "../src/core/keybindings.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import { renderStatusBar } from "../src/modes/interactive/components/footer.js";
 import { rowEnterStage, setMotionReduced, TURN_FOLD_MS } from "../src/modes/interactive/components/motion.js";
+import { commandOutcome } from "../src/modes/interactive/components/timeline-rows.js";
 import {
 	type TimelineHost,
 	TurnActivityState,
@@ -258,6 +259,65 @@ describe("timeline rows from the kernel's records", () => {
 });
 
 describe("timeline rows without kernel records (today's data)", () => {
+	it("reads a printed BashResult as the command's outcome, not its repr", () => {
+		expect(commandOutcome("BashResult(exit_code=0, output='..\\n2 passed in 0.01s\\n', duration=4.0)")).toEqual({
+			ok: true,
+			result: "2 通过",
+		});
+		expect(commandOutcome("BashResult(exit_code=1, output='boom\\n', duration=0.2)")).toEqual({
+			ok: false,
+			result: "退出码 1",
+		});
+		expect(
+			commandOutcome('BashResult(exit_code=1, output="it\'s\\n1 passed, 2 failed in 0.3s", duration=1.0)'),
+		).toEqual({
+			ok: false,
+			result: "1 通过 · 2 失败",
+		});
+		expect(commandOutcome("done\n")).toEqual({ ok: true, result: "done" });
+	});
+
+	it("says a cell still streaming in is being written, not running", () => {
+		const turn = quietTurn();
+		turn.timeline.noteMessage(
+			assistant(Date.now() - 1_000, [
+				{ type: "toolCall", id: "w1", name: "ipython", arguments: { code: "await ed" } },
+			]),
+			false,
+		);
+		turn.state.addStep({ toolCallId: "w1", toolName: "ipython", args: { code: "await ed" }, status: "queued" });
+		const out = text(turn.summary.render(120));
+		expect(out).toContain("正在写代码…");
+		expect(out).not.toContain("正在运行 Python");
+	});
+
+	it("shows a cell that raised as a red failure even when the tool reported success", () => {
+		const turn = quietTurn();
+		const code = "print(open('config.toml').read())";
+		addStep(turn, "e1", code);
+		turn.timeline.mergeStep(
+			"e1",
+			"ipython",
+			{ code },
+			{
+				content: [{ type: "text", text: "FileNotFoundError: [Errno 2] No such file or directory: 'config.toml'" }],
+				details: {
+					status: "error",
+					error: {
+						ename: "FileNotFoundError",
+						evalue: "[Errno 2] No such file or directory: 'config.toml'",
+						traceback: [],
+					},
+				},
+				isError: false,
+			},
+			false,
+		);
+		const out = text(turn.summary.render(120));
+		expect(out).toContain("✗ 读取 config.toml 出错：FileNotFoundError");
+		expect(out).not.toContain("✓ 读取 config.toml");
+	});
+
 	it("labels a cell by what it does, and never by a guess like 设置 W", () => {
 		const turn = quietTurn();
 		addStep(turn, "p1", "W = 12\nT = W * 3\nprint(T)");
@@ -529,6 +589,13 @@ describe("clicks, keys and what stays open", () => {
 		expect(calls).toEqual(["move -1", "move 1", "activate", "exit x", "exit "]);
 	});
 
+	it("binds the box walk to a key every terminal can send, not only to Ctrl+J", () => {
+		const keys = new KeybindingsManager();
+		// Alt+J arrives as ESC j everywhere; a plain Ctrl+J is a newline ("\n") without extended keys.
+		expect(keys.matches("\x1bj", "app.turn.focus")).toBe(true);
+		expect(keys.getKeys("app.turn.focus")[0]).toBe("alt+j");
+	});
+
 	it("carries open rows and live-only rows over a chat rebuild", () => {
 		const before = new TurnTimeline();
 		const message = assistant(1_000, [{ type: "thinking", thinking: "a. b." }], "stop");
@@ -542,6 +609,32 @@ describe("clicks, keys and what stays open", () => {
 		expect(after.entries.map((entry) => entry.kind)).toEqual(["message", "retry"]);
 		expect(after.ui.expanded.has("think:m:1000:0")).toBe(true);
 		expect(after.ui.userOpen).toBe(true);
+	});
+
+	it("keeps a turn whole when a compaction summarized its first part away", () => {
+		const first = assistant(1_000, [
+			{ type: "toolCall", id: "c1", name: "ipython", arguments: { code: "await bash('make check')" } },
+		]);
+		const second = assistant(3_000, [{ type: "text", text: "读完了。" }], "stop");
+		const before = quietTurn({ live: false, startedAt: 900 });
+		before.timeline.noteMessage(first, true);
+		before.state.addStep({ toolCallId: "c1", toolName: "ipython", args: first.content[0], status: "done" });
+		before.timeline.startCompaction(2_000, 166_000);
+		before.timeline.endCompaction(2_500, { before: 166_000 });
+		before.timeline.noteMessage(second, true);
+		// The rebuilt chat only replays what the compaction kept: the last message.
+		const kept = quietTurn({ live: false, startedAt: 3_000 });
+		kept.timeline.noteMessage(second, true);
+		const plainCopy = new TurnTimeline();
+		plainCopy.noteMessage(second, true);
+		before.timeline.transferTo(plainCopy);
+		expect(plainCopy.entries.map((entry) => entry.kind)).toEqual(["compact", "message"]);
+
+		before.timeline.transferTo(kept.timeline, { keepHistory: true });
+		kept.state.adoptHistory(before.state);
+		expect(kept.timeline.entries.map((entry) => entry.kind)).toEqual(["message", "compact", "message"]);
+		expect(kept.state.startedAt).toBe(900);
+		expect(kept.state.steps.map((step) => step.toolCallId)).toEqual(["c1"]);
 	});
 });
 
@@ -763,6 +856,30 @@ describe("the status bar", () => {
 		expect(narrow).not.toContain("~/work/app");
 	});
 
+	it("keeps its layout while the clock and the token count gain digits", () => {
+		const bar = (seconds: number, tokens: number) =>
+			stripAnsi(
+				renderStatusBar(
+					{
+						model: "glm-5.3-prime",
+						level: "中",
+						context: { percent: 5, warn: false },
+						subagents: 0,
+						right: [
+							`⠸ 工作中 · ${seconds}秒 · ↓ ${tokens} tokens · Esc 停止`,
+							`⠸ 工作中 · ${seconds}秒 · ↓ ${tokens} · Esc 停止`,
+							`⠸ 工作中 · ${seconds}秒 · ↓ ${tokens}`,
+							`⠸ 工作中 · ${seconds}秒`,
+						],
+					},
+					80,
+				),
+			);
+		const shape = (line: string) => line.replace(/\d+/g, "#").replace(/\s+/g, " ");
+		expect(shape(bar(9, 20))).toBe(shape(bar(10, 20)));
+		expect(shape(bar(10, 99))).toBe(shape(bar(59, 155)));
+	});
+
 	it("turns the context meter amber at 80%", () => {
 		const calm = renderStatusBar({ model: "m", context: { percent: 50, warn: false }, subagents: 0, right: [] }, 80);
 		const warn = renderStatusBar({ model: "m", context: { percent: 85, warn: true }, subagents: 0, right: [] }, 80);
@@ -805,5 +922,43 @@ describe("replay groups a transcript the way the live view does", () => {
 		const out = text(summary.render(120));
 		expect(out).toContain("› 你插话：先别动安卓的");
 		expect(out).toContain("go list -m -u all");
+	});
+
+	it("ends a turn the owner interrupted mid-step as stopped, and the next message starts a new turn", () => {
+		const result = (id: string, timestamp: number, status: "ok" | "aborted"): ToolResultMessage => ({
+			role: "toolResult",
+			toolCallId: id,
+			toolName: "ipython",
+			content: [{ type: "text", text: status === "ok" ? "done" : "<ipython_cell_aborted>" }],
+			details: { status },
+			isError: false,
+			timestamp,
+		});
+		const messages: AgentMessage[] = [
+			{ role: "user", content: "跑一下慢检查", timestamp: 1_000 },
+			assistant(1_100, [
+				{ type: "toolCall", id: "c1", name: "ipython", arguments: { code: "await bash('make check')" } },
+			]),
+			result("c1", 1_200, "ok"),
+			{ role: "user", content: "顺便把 lint 也跑了", timestamp: 1_300 },
+			assistant(1_400, [
+				{ type: "toolCall", id: "c2", name: "ipython", arguments: { code: "await bash('make lint')" } },
+			]),
+			result("c2", 1_500, "aborted"),
+			{ role: "user", content: "算了，先看测试", timestamp: 1_600 },
+		];
+		const components = buildConversationComponents(messages, {
+			ui: { requestRender: vi.fn() } as unknown as TUI,
+			cwd: "/work/app",
+			toolOptions: {},
+			getToolDefinition: () => undefined,
+			processMode: "quiet",
+		});
+		expect(components.filter((component) => component instanceof UserMessageComponent)).toHaveLength(2);
+		const summaries = components.filter((component) => component instanceof TurnSummaryComponent);
+		expect(summaries).toHaveLength(1);
+		const out = text((summaries[0] as TurnSummaryComponent).render(120));
+		expect(out).toContain("■ 已停止");
+		expect(out).not.toContain("算了，先看测试");
 	});
 });

@@ -77,7 +77,7 @@ export class TurnActivityState {
 	/** Quiet conversation: this turn renders as a box, and its tool rows live inside it. */
 	boxMode = false;
 	host: TimelineHost = DEFAULT_TIMELINE_HOST;
-	readonly startedAt: number;
+	private startedAtMs: number;
 	private lastSettledAt: number | undefined;
 	private turnEndedAt: number | undefined;
 	private thinkingSegments = 0;
@@ -104,7 +104,7 @@ export class TurnActivityState {
 	}
 
 	constructor(startedAt = Date.now()) {
-		this.startedAt = startedAt;
+		this.startedAtMs = startedAt;
 		this.phaseSince = startedAt;
 		this.lastActivityAt = startedAt;
 	}
@@ -347,8 +347,34 @@ export class TurnActivityState {
 		return { rows, facts, live };
 	}
 
+	get startedAt(): number {
+		return this.startedAtMs;
+	}
+
 	addStep(step: TurnStep): void {
 		this.steps.push(step);
+	}
+
+	/**
+	 * A turn rebuilt after a compaction summarized its first part away keeps the
+	 * steps, clock and thinking count of the turn it continues (display only).
+	 */
+	adoptHistory(previous: TurnActivityState): void {
+		this.startedAtMs = Math.min(this.startedAtMs, previous.startedAt);
+		const known = new Set(this.steps.map((step) => step.toolCallId));
+		const earlier = previous.steps.filter((step) => !known.has(step.toolCallId));
+		this.steps.unshift(...earlier);
+		for (const step of earlier) {
+			const started = previous.stepStartedAt.get(step.toolCallId);
+			if (started !== undefined && !this.stepStartedAt.has(step.toolCallId)) {
+				this.stepStartedAt.set(step.toolCallId, started);
+			}
+		}
+		if (previous.lastSettledAt !== undefined) {
+			this.lastSettledAt = Math.max(this.lastSettledAt ?? 0, previous.lastSettledAt);
+		}
+		this.thinkingSegments = Math.max(this.thinkingSegments, previous.thinkingSegments);
+		this.modelId = this.modelId || previous.modelId;
 	}
 
 	/** Streaming tool calls grow their arguments; the step labels read the latest ones. */

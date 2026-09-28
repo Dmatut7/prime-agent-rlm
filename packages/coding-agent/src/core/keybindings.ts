@@ -138,7 +138,8 @@ export const KEYBINDINGS = {
 	// turn's box (↑↓ rows, Enter opens, Esc leaves); in the legacy face, where the
 	// box does not exist, the same key toggles the edit diffs.
 	"app.turn.focus": {
-		defaultKeys: "ctrl+j",
+		// Alt+J first: a plain terminal (tmux without extended keys) sends Ctrl+J as a newline.
+		defaultKeys: ["alt+j", "ctrl+j"],
 		description: "Walk the latest turn's box: arrows move, Enter opens a row, Escape leaves",
 		defaultKeyScope: "editor",
 	},

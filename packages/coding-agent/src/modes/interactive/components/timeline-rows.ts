@@ -82,6 +82,8 @@ export interface RowStep {
 	args: unknown;
 	status: "queued" | "running" | "done" | "error";
 	startedAt?: number;
+	/** Its arguments are still streaming in: half-written code says nothing yet. */
+	streaming?: boolean;
 }
 
 export interface RowBuildContext {
@@ -167,6 +169,28 @@ function lastOutputLine(text: string | undefined): string | undefined {
 		.map((line) => line.trim())
 		.filter((line) => line.length > 0)
 		.at(-1);
+}
+
+/**
+ * What a finished command cell says about its command, without a kernel
+ * record: a printed `BashResult(exit_code=…, output='…')` gives the exit code
+ * and the command's own last line, else the cell's last output line.
+ */
+export function commandOutcome(text: string | undefined): { ok: boolean; result: string | undefined } {
+	const raw = text ?? "";
+	const repr = /BashResult\(exit_code=(-?\d+)(?:,\s*output=(['"])((?:\\.|(?!\2)[^\\])*)\2)?/.exec(raw);
+	if (!repr) {
+		const last = lastOutputLine(raw);
+		return { ok: true, result: last ? localizeResultDetail(last) : undefined };
+	}
+	const exitCode = Number(repr[1]);
+	const inner = (repr[3] ?? "").replace(/\\(n|t|'|"|\\)/g, (_match, escaped: string) =>
+		escaped === "n" ? "\n" : escaped === "t" ? "\t" : escaped,
+	);
+	const last = lastOutputLine(inner);
+	const result = last ? localizeResultDetail(last) : undefined;
+	if (exitCode === 0) return { ok: true, result };
+	return { ok: false, result: result && /通过|失败/.test(result) ? result : `退出码 ${exitCode}` };
 }
 
 function isInterrupt(error: string | undefined): boolean {
@@ -365,10 +389,25 @@ function fallbackRows(
 	ctx: RowBuildContext,
 	withPrimaryOutput: boolean,
 ): BoxRow[] {
+	const key = `step:${step.toolCallId}`;
+	// A cell still streaming in is being written, not run.
+	if (step.streaming && step.status === "queued" && step.toolName === "ipython") {
+		return [
+			{
+				key,
+				kind: "step",
+				status: "running",
+				glyph: "✓",
+				glyphColor: "diffAddedText",
+				text: "写代码…",
+				textColor: "muted",
+				meta: [],
+			},
+		];
+	}
 	const context = { handleCommands: timeline.stepHandleContext.get(step.toolCallId) };
 	const action = stepAction({ toolName: step.toolName, args: step.args }, context);
 	const running = step.status === "running" || step.status === "queued";
-	const key = `step:${step.toolCallId}`;
 	const startedAt = step.startedAt;
 	// A cell that only read files becomes one read row per file, so neighbouring reads merge.
 	if (!running && step.status !== "error" && action.recognized) {
@@ -394,17 +433,18 @@ function fallbackRows(
 	if (COMMAND_VERBS.has(action.verb) && action.recognized) {
 		const tail =
 			running && data.outputTail ? timeline.steadyLine(`${key}:tail`, data.outputTail, ctx.now) : undefined;
-		const last = lastOutputLine(output);
+		const outcome = commandOutcome(output);
+		const result = outcome.result ? truncateToWidth(outcome.result, 32, "…") : undefined;
 		return [
 			{
 				key,
 				kind: "cmd",
-				status: running ? "running" : "done",
+				status: running ? "running" : outcome.ok ? "done" : "failed",
 				glyph: "$",
 				glyphColor: "activityAccent",
 				text: action.verb === "等待" ? `等待 ${target}` : target,
 				textColor: "activityText",
-				meta: running ? [] : okMeta(last ? truncateToWidth(last, 32, "…") : undefined, data.durationMs),
+				meta: running ? [] : outcome.ok ? okMeta(result, data.durationMs) : failMeta(result),
 				...(startedAt !== undefined ? { startedAt } : {}),
 				...(tail ? { sub: tail } : {}),
 				...(outputDetail ? { detail: outputDetail } : {}),
@@ -526,8 +566,10 @@ function stepRows(step: RowStep, timeline: TurnTimeline, ctx: RowBuildContext, o
 		});
 	});
 	const running = step.status === "running" || step.status === "queued";
+	// A cell that raised is a failure even when the tool itself reported success.
+	const failed = step.status === "error" || (step.status === "done" && data.error !== undefined);
 	if (items.length === 0) {
-		if (step.status === "error") {
+		if (failed) {
 			return isInterrupt(data.error)
 				? fallbackRows({ ...step, status: "done" }, data, timeline, ctx, true).map(stoppedRow)
 				: [errorRow(step, data, timeline)];
@@ -558,10 +600,16 @@ function stepRows(step: RowStep, timeline: TurnTimeline, ctx: RowBuildContext, o
 				? { sub: timeline.steadyLine(`step:${step.toolCallId}:tail`, data.outputTail, ctx.now) }
 				: {}),
 		});
-	} else if (step.status === "error") {
+	} else if (failed) {
 		rows.push(isInterrupt(data.error) ? stoppedRow(errorRow(step, data, timeline)) : errorRow(step, data, timeline));
 	}
 	return rows;
+}
+
+/** Whether the full text says more than its one-line summary (a closing full stop does not count). */
+function saysMoreThan(text: string, summary: string): boolean {
+	const flat = sanitizeDisplayText(text.replace(/\s+/g, " ").trim()).replace(/[。！？!?；;.]+$/, "");
+	return flat !== summary;
 }
 
 function thinkRows(
@@ -617,7 +665,7 @@ function thinkRows(
 				text: summary,
 				textColor: "muted",
 				meta: [{ text: duration ? `${duration} · ${tokens}` : tokens, color: "dim" }],
-				...(text && summary !== text.replace(/\s+/g, " ").trim()
+				...(text && saysMoreThan(text, summary)
 					? { detail: (width: number) => wrapped(text, width, "thinkingText") }
 					: {}),
 			});
@@ -634,9 +682,7 @@ function thinkRows(
 				text: summary,
 				textColor: "muted",
 				meta: [],
-				...(summary !== text.replace(/\s+/g, " ").trim()
-					? { detail: (width: number) => wrapped(text, width, "muted") }
-					: {}),
+				...(saysMoreThan(text, summary) ? { detail: (width: number) => wrapped(text, width, "muted") } : {}),
 			});
 		}
 	});
@@ -829,12 +875,16 @@ export function buildTimelineRows(timeline: TurnTimeline, ctx: RowBuildContext):
 			}
 			if (block.type !== "toolCall") return;
 			seenSteps.add(block.id);
-			const step = ctx.steps.get(block.id) ?? {
-				toolCallId: block.id,
-				toolName: block.name,
-				args: block.arguments,
-				status: entry.ended ? ("done" as const) : ("queued" as const),
-			};
+			const known = ctx.steps.get(block.id);
+			const step: RowStep = known
+				? { ...known, ...(entry.ended ? {} : { streaming: true }) }
+				: {
+						toolCallId: block.id,
+						toolName: block.name,
+						args: block.arguments,
+						status: entry.ended ? "done" : "queued",
+						...(entry.ended ? {} : { streaming: true }),
+					};
 			for (const row of stepRows(step, timeline, ctx, order++)) {
 				// A subagent the session reported live already has its own row.
 				if (row.kind === "subagent" && snapshotNames.has(row.text.replace(/^子代理 /, ""))) continue;

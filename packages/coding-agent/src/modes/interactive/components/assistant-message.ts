@@ -312,6 +312,12 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 		);
 		const rendersThinking = (c: AssistantMessage["content"][number]) =>
 			c?.type === "thinking" && c.thinking.trim() && !this.hideThinkingBlock && this.thinkingExpanded;
+		// A quiet turn's box already shows a model error as its own red row (or the
+		// retry that recovered it); only a login recovery hint still needs the answer area.
+		const errorSurface =
+			message.stopReason === "error" &&
+			!hasToolCalls &&
+			(!this.quiet || formatInlineLoginRecoveryMessage(message.errorMessage || "") !== undefined);
 		const hasVisibleContent =
 			message.content.some(
 				(c, index) =>
@@ -322,7 +328,7 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 			// non-tool-call error); toolCall blocks render as separate
 			// components, not here.
 			message.stopReason === "aborted" ||
-			(message.stopReason === "error" && !hasToolCalls);
+			errorSurface;
 
 		if (hasVisibleContent) {
 			this.contentContainer.addChild(new Spacer(1));
@@ -403,7 +409,7 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 			this.contentContainer.addChild(
 				plainInterrupt ? new Text(theme.fg("dim", "已中断"), 1, 0) : this.createErrorComponent(reason),
 			);
-		} else if (!hasToolCalls && message.stopReason === "error") {
+		} else if (errorSurface) {
 			const errorMsg = message.errorMessage || "Unknown error";
 			if (bodyAboveError) this.contentContainer.addChild(new Spacer(1));
 			this.contentContainer.addChild(this.createErrorComponent(errorMsg, "Error"));

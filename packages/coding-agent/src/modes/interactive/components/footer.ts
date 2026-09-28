@@ -85,6 +85,13 @@ function contextMeter(percent: number, warn: boolean, withBar: boolean): string 
 }
 
 /** Lay the status bar out in `width` columns, dropping the least useful groups first. */
+/** Width of a line whose numbers keep growing, with each number counted as at least three digits wide. */
+function steadyWidth(text: string): number {
+	let extra = 0;
+	for (const match of text.matchAll(/\d+(?:\.\d+)?/g)) extra += Math.max(0, 3 - match[0].length);
+	return visibleWidth(text) + extra;
+}
+
 export function renderStatusBar(state: StatusBarState, width: number, badge?: string): string {
 	const safeWidth = Math.max(1, width);
 	const model = ` ${theme.fg("muted", state.level ? `${state.model} · 思考 ${state.level}` : state.model)}`;
@@ -113,7 +120,9 @@ export function renderStatusBar(state: StatusBarState, width: number, badge?: st
 	];
 	for (const [left, rightText] of candidates) {
 		const gap = rightText ? 2 : 0;
-		if (visibleWidth(left) + gap + visibleWidth(rightText) + 1 <= safeWidth) {
+		// Counters are measured as if they had at least three digits, so the
+		// layout does not change every time a clock or a count gains a digit.
+		if (visibleWidth(left) + gap + steadyWidth(rightText) + 1 <= safeWidth) {
 			const pad = Math.max(gap, safeWidth - visibleWidth(left) - visibleWidth(rightText) - 1);
 			return `${left}${" ".repeat(pad)}${rightText}${rightText ? " " : ""}`;
 		}

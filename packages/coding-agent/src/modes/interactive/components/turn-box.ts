@@ -110,9 +110,16 @@ export function computeBoxHeader(input: BoxHeaderInput): BoxHeader {
 	if (input.rows.some((row) => row.kind === "compact" && row.status === "running")) {
 		return live([part("上下文快满了，正在整理前面的内容")]);
 	}
+	const subagents = input.rows.filter((row) => row.kind === "subagent" && row.status === "running");
+	const subagentWait = (): BoxHeader =>
+		subagents.length === 1
+			? live([part(`在等子代理 ${subagents[0]?.text ?? ""} 交回结果`)])
+			: live([part(`在等 ${subagents.length} 个子代理交回结果`)]);
 	const running = [...input.rows]
 		.reverse()
 		.find((row) => row.status === "running" && row.kind !== "think" && row.kind !== "subagent");
+	// A cell that only checks on its subagents is waiting for them: say who.
+	if (running?.text.startsWith("查看子代理") && subagents.length > 0) return subagentWait();
 	if (running) {
 		switch (running.kind) {
 			case "cmd":
@@ -137,9 +144,7 @@ export function computeBoxHeader(input: BoxHeaderInput): BoxHeader {
 		return live(sentence ? [part("思考中 · "), part(sentence)] : [part("思考中…")]);
 	}
 	if (input.phase === "writing") return live([part("正在写回答")]);
-	const subagents = input.rows.filter((row) => row.kind === "subagent" && row.status === "running");
-	if (subagents.length === 1) return live([part(`在等子代理 ${subagents[0]?.text ?? ""} 交回结果`)]);
-	if (subagents.length > 1) return live([part(`在等 ${subagents.length} 个子代理交回结果`)]);
+	if (subagents.length > 0) return subagentWait();
 	return live([part("等待模型回应…", "dim")], { shimmer: true });
 }
 

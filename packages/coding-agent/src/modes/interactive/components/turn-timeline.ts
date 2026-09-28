@@ -436,8 +436,12 @@ export class TurnTimeline {
 		return state.text;
 	}
 
-	/** Carry live-only facts over to the timeline that replaces this one after a chat rebuild. */
-	transferTo(next: TurnTimeline): void {
+	/**
+	 * Carry live-only facts over to the timeline that replaces this one after a
+	 * chat rebuild. `keepHistory` (a rebuild after a compaction) also keeps the
+	 * entries the compaction summarized away, so the box still shows the whole turn.
+	 */
+	transferTo(next: TurnTimeline, options: { keepHistory?: boolean } = {}): void {
 		// Walk the old order: replayed entries (messages, steers) take their fresh
 		// copy, live-only ones (retries, compactions, subagents) carry over as they
 		// were, and anything only the replay knows goes after them.
@@ -448,7 +452,7 @@ export class TurnTimeline {
 			if (replayed) {
 				merged.push(replayed);
 				fresh.delete(entry.key);
-			} else if (entry.kind !== "message" && entry.kind !== "steer") {
+			} else if (options.keepHistory || (entry.kind !== "message" && entry.kind !== "steer")) {
 				merged.push(entry);
 			}
 		}
