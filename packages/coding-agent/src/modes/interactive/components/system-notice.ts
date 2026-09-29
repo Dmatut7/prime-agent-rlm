@@ -20,6 +20,7 @@ import {
 	shortAgentName,
 	type TimelineReturn,
 } from "./agent-message.js";
+import { styleInlineMarkdown } from "./inline-markdown.js";
 import { formatTimelineTime, TIMELINE_CONTENT_COL, timelineRow } from "./timeline-gutter.js";
 import { timelineShowAll } from "./timeline-lane.js";
 import { boxRecordFromMessage, type TimelineNotice } from "./turn-timeline.js";
@@ -110,11 +111,11 @@ export class TimelineNoticeRow implements Component {
 		if (open) {
 			const room = Math.max(1, safeWidth - TIMELINE_CONTENT_COL - 4);
 			const lines = (this.notice.detail ?? "").split("\n").flatMap((line) => {
-				const wrapped = wrapTextWithAnsi(line.trimEnd(), room);
+				const wrapped = wrapTextWithAnsi(styleInlineMarkdown(line.trimEnd(), "timelineSoft"), room);
 				return wrapped.length > 0 ? wrapped : [""];
 			});
 			for (const line of lines) {
-				const content = line ? `  ${theme.fg("timelineSoft", line)}` : "";
+				const content = line ? `  ${line}` : "";
 				rows.push(timelineRow({ main: "rail", lane: back.after }, content, "", safeWidth));
 			}
 		}

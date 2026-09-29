@@ -18,6 +18,7 @@ import {
 } from "./block-focus.js";
 import { sanitizeDisplayText } from "./diff-rows.js";
 import { shortMemoryTitle } from "./feed-data.js";
+import { styleInlineMarkdown } from "./inline-markdown.js";
 import { memoryBodyLines, memoryHeadLabel } from "./memory-detail.js";
 import { formatTimelineTime, TIMELINE_CONTENT_COL, type TimelineGutter, timelineRow } from "./timeline-gutter.js";
 import { timelineShowAll } from "./timeline-lane.js";
@@ -183,7 +184,9 @@ export class RefinementOutcomeMessageComponent implements Component, FocusableBl
 			.replace(/\s+/g, " ")
 			.trim();
 		if (why) {
-			for (const part of wrapTextWithAnsi(dim(why), room)) lines.push(row({ main: "rail" }, part));
+			for (const part of wrapTextWithAnsi(styleInlineMarkdown(why, "timelineTime"), room)) {
+				lines.push(row({ main: "rail" }, part));
+			}
 		}
 		edits.forEach((edit, index) => {
 			const change = refinementEditAsMemoryChange(edit, scope, this.message.timestamp);

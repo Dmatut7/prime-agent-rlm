@@ -1,0 +1,1 @@
+- Fixed subagent reports, notices and tidy-up notes showing raw `**`, backticks and link addresses; double-backtick code, links with parentheses and code inside bold now draw as words.

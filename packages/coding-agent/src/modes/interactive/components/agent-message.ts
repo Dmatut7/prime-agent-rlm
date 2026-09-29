@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-tui";
 import type { AgentSessionMessage } from "../../../core/agent-messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
+import { stripInlineMarkdown, styleInlineMarkdown } from "./inline-markdown.js";
 import { formatTimelineTime, TIMELINE_CONTENT_COL, type TimelineLane, timelineRow } from "./timeline-gutter.js";
 import { type LaneSnapshot, TimelineLaneTracker } from "./timeline-lane.js";
 
@@ -104,9 +105,12 @@ function firstSentence(text: string): string {
  */
 export function reportParts(message: string): { label?: string; conclusion: string } {
 	const lines = message
-		.replace(/\*\*|`/g, "")
 		.split("\n")
-		.map((line) => line.trim())
+		.map((line) =>
+			stripInlineMarkdown(line)
+				.replace(/\*\*|`/g, "")
+				.trim(),
+		)
 		.filter((line) => line.length > 0);
 	const first = lines[0] ?? "";
 	const labelMatch = LABEL_IN_FIRST_LINE.exec(first);
@@ -414,21 +418,21 @@ export class AgentMessageComponent extends Container {
 	private buildTimelineBody(width: number, lane: TimelineLane): string[] {
 		const indent = 2;
 		const room = Math.max(1, width - TIMELINE_CONTENT_COL - indent - 2);
+		let inFence = false;
 		return this.message.details.message
 			.replace(/\s+$/, "")
 			.split("\n")
 			.flatMap((line) => {
-				const wrapped = wrapTextWithAnsi(line.trimEnd(), room);
+				// What sits inside a code fence is code as written: its asterisks and backticks are not markup.
+				const fence = /^\s*(?:```|~~~)/.test(line);
+				if (fence) inFence = !inFence;
+				const words = line.trimEnd();
+				const text =
+					fence || inFence ? theme.fg("timelineSoft", words) : styleInlineMarkdown(words, "timelineSoft");
+				const wrapped = wrapTextWithAnsi(text, room);
 				return wrapped.length > 0 ? wrapped : [""];
 			})
-			.map((line) =>
-				timelineRow(
-					{ main: "rail", lane },
-					line ? `${" ".repeat(indent)}${theme.fg("timelineSoft", line)}` : "",
-					"",
-					width,
-				),
-			);
+			.map((line) => timelineRow({ main: "rail", lane }, line ? `${" ".repeat(indent)}${line}` : "", "", width));
 	}
 
 	setExpanded(expanded: boolean): void {
