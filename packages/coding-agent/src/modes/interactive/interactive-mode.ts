@@ -242,6 +242,7 @@ import {
 	isCompactAgentMessageNeighbor,
 	latestThinkingText,
 	NO_STEP_STOP,
+	resolveTurnHeaders,
 	stepResultStop,
 } from "./components/conversation-components.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
@@ -8497,6 +8498,8 @@ export class InteractiveMode {
 		let replayResultsArrived = false;
 		// How the last step's result says the turn went on (the owner's stop ends it there).
 		let replayResultStop = NO_STEP_STOP;
+		// The next turn's opener is a message the user sent, unless it is a stored heartbeat prompt.
+		let replayStartedByUser = true;
 		const closeReplayTurn = (): void => {
 			if (!replayQuiet || !replayTurnState || !replayTurnSummary) return;
 			replayTurnState.timeline.stopped = lastReplayAssistant?.stopReason === "aborted" || replayResultStop.stopped;
@@ -8527,6 +8530,7 @@ export class InteractiveMode {
 				replayTurnSummary = undefined;
 				lastReplayAssistant = undefined;
 				replaySentCommIds.clear();
+				replayStartedByUser = !this.createLegacyHeartbeatPromptMessage(message, this.getUserMessageText(message));
 			}
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
@@ -8534,6 +8538,7 @@ export class InteractiveMode {
 				// first assistant component, and counts this message's thinking.
 				if (!replayTurnState) {
 					replayTurnState = new TurnActivityState(Number(message.timestamp) || Date.now());
+					replayTurnState.startedByUser = replayStartedByUser;
 					replayTurnSummary = this.createTurnSummary(replayTurnState);
 					replayTurnSummary.setExpanded(this.toolOutputExpanded);
 					// TUI v4: quiet turns carry the one-line footnote at their head.
@@ -8693,8 +8698,12 @@ export class InteractiveMode {
 				this.addMessageToChat(message, renderOptions);
 			}
 		}
-		// Within a box turn only the last reply's answer stays under the box.
-		if (replayQuiet) foldEarlierAnswers(this.chatContainer.children);
+		// Within a box turn only the last reply's answer stays under the box, and a
+		// turn no user message opened draws no second title.
+		if (replayQuiet) {
+			foldEarlierAnswers(this.chatContainer.children);
+			resolveTurnHeaders(this.chatContainer.children);
+		}
 
 		for (const [toolCallId, component] of renderedPendingTools) {
 			component.setIncludeImageDimensions(true);

@@ -126,12 +126,18 @@ export function firstSentence(text: string): string {
 	return sanitizeDisplayText((match?.[1] ?? match?.[2] ?? flat).trim());
 }
 
+let boxIdCounter = 0;
+
 /**
  * The per-row UI state of a box: what is open, where its body is scrolled,
  * which rows are new (the enter highlight) or just finished (the flash). It
  * lives on the timeline, so it survives re-renders, resizes and chat rebuilds.
  */
 export class TimelineUiState {
+	/** Names this box among all boxes on screen (part of its blocks' hover keys). */
+	readonly id = `box${++boxIdCounter}`;
+	/** The row whose block the pointer is on, when one is. */
+	hoverKey: string | undefined;
 	/** The user opened or closed the box themselves: the automatic open/fold rules no longer apply. */
 	userOpen: boolean | undefined;
 	/** First body line shown when not following. */
@@ -142,8 +148,8 @@ export class TimelineUiState {
 	unseen = false;
 	/** Body line count at the last render (scrolling limits). */
 	lastBodyLines = 0;
-	/** Body lines at the last render without the lines the user opened, to notice new ones. */
-	lastContentLines = 0;
+	/** Rows at the last render, to notice new ones. */
+	lastRowCount = 0;
 	/** First body line and body height the last render showed (clicks and the wheel act on these). */
 	lastTop = 0;
 	lastVisible = 0;
@@ -216,6 +222,19 @@ export class TimelineUiState {
 		this.scrollTop = next;
 		this.follow = next >= maxTop;
 		if (this.follow) this.unseen = false;
+		this.bump();
+		return true;
+	}
+
+	/** The pointer entered or left a row's block; false when that changed nothing. */
+	setHover(key: string, hovered: boolean): boolean {
+		if (hovered) {
+			if (this.hoverKey === key) return false;
+			this.hoverKey = key;
+		} else {
+			if (this.hoverKey !== key) return false;
+			this.hoverKey = undefined;
+		}
 		this.bump();
 		return true;
 	}
