@@ -75,8 +75,6 @@ export interface StatusBarState {
 	 * just compacted and not measured again yet.
 	 */
 	context?: { percent?: number; warn: boolean };
-	/** Where the session runs; the first thing to go on a narrow screen. */
-	location?: string;
 	/** Subagents running right now; 0 hides the chip (the subagent strip already names every child). */
 	subagents: number;
 	/** The right side, styled, from the fullest form to the shortest. */
@@ -120,7 +118,6 @@ export function renderStatusBar(state: StatusBarState, width: number, badge?: st
 	const safeWidth = Math.max(1, width);
 	const model = ` ${theme.fg("timelineTime", state.level ? `${state.model} · 思考 ${state.level}` : state.model)}`;
 	const chip = state.subagents > 0 ? theme.fg("activityAccent", `◇ ${state.subagents} 个子代理在跑`) : "";
-	const location = state.location ? theme.fg("dim", state.location) : "";
 	const badgeText = badge ? theme.fg("warning", badge) : "";
 	const meterBar = state.context ? contextMeter(state.context.percent, state.context.warn, true) : "";
 	const meterShort = state.context ? contextMeter(state.context.percent, state.context.warn, false) : "";
@@ -131,10 +128,9 @@ export function renderStatusBar(state: StatusBarState, width: number, badge?: st
 	// The forms without the spend cell, indexed the way the ladder below counts them.
 	const plain = (index: number) => right(spendForms + index);
 	// Most useful first: the model, what the run is doing, the context, the
-	// subagents; the location goes first when it is tight, then the spend cell
-	// (a step at a time), then the longer wordings.
+	// subagents; the spend cell goes first when it is tight (a step at a
+	// time), then the longer wordings.
 	const candidates: Array<[string, string]> = [
-		[join(model, meterBar, chip, badgeText, location), right(0)],
 		[join(model, meterBar, chip, badgeText), right(0)],
 		...Array.from({ length: spendForms }, (_, step): [string, string] => [
 			join(model, meterBar, chip, badgeText),
@@ -224,8 +220,6 @@ export interface FinishedRunInput {
 	outcome: "done" | "stopped" | "error";
 	elapsedMs: number;
 	outputTokens: number;
-	/** Output tokens of the whole conversation, shown after a completed run. */
-	sessionTokens?: number;
 	/** The subagent spend cell's forms, fullest first, rendered with renderSubagentSpendCell(spend, "timelineTime"). */
 	spendCells: readonly string[];
 }
@@ -242,17 +236,7 @@ export function finishedRunForms(input: FinishedRunInput): string[] {
 	const paint = (text: string) =>
 		input.outcome === "error" ? `${theme.fg("error", "✗")}${dim(` ${text}`)}` : dim(text);
 	const base = `${word}${RUN_DOT}${formatDoneClock(input.elapsedMs)}${RUN_DOT}↓ ${formatBoxTokens(input.outputTokens)}`;
-	const session =
-		input.sessionTokens !== undefined && input.sessionTokens > 0 && input.outcome !== "stopped"
-			? `${RUN_DOT}本会话 ↓ ${formatBoxTokens(input.sessionTokens)}`
-			: "";
-	const fullest = `${base}${session}`;
-	return [
-		...input.spendCells.map((cell) => `${paint(`${fullest}${RUN_DOT}`)}${cell}`),
-		...(session ? [paint(fullest)] : []),
-		paint(base),
-		paint(word),
-	];
+	return [...input.spendCells.map((cell) => `${paint(`${base}${RUN_DOT}`)}${cell}`), paint(base), paint(word)];
 }
 
 /**

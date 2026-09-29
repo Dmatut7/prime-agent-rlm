@@ -153,28 +153,12 @@ describe("the status line while the AI works", () => {
 		expect(line).toContain(theme.fg("warning", "90%"));
 	});
 
-	it("puts the place and branch last, and drops them first on a narrow screen", () => {
-		const withPlace: StatusBarState = { ...state, location: "~/work/app · main" };
-		const wide = plain(bar(withPlace, 200));
-		expect(wide).toContain("上下文 ━━━━━━━━ 12%    ~/work/app · main");
-		expect(wide.indexOf("~/work/app")).toBeLessThan(wide.indexOf("⠹"));
-		const widths = Array.from({ length: 24 }, (_, index) => 200 - index * 6);
-		expect(widths.length).toBeGreaterThan(0);
-		let placeGone = false;
-		for (const width of widths) {
-			const text = plain(bar(withPlace, width));
-			expect(visibleWidth(text), `width ${width}`).toBeLessThanOrEqual(width);
-			if (!text.includes("~/work/app")) {
-				placeGone = true;
-				// The first width without the place still has the meter and the whole run state.
-				if (text.includes("Esc 停止") || text.includes("¥")) {
-					expect(text).toContain("上下文 ━━━━━━━━ 12%");
-				}
-			} else {
-				expect(placeGone, `place back at ${width}`).toBe(false);
-			}
+	it("carries no place or branch, whatever the width", () => {
+		const left = " glm-5.3-prime · 思考 最高    上下文 ━━━━━━━━ 12%";
+		const right = "⠹ 工作中 10分 · ↓ 180k · 子代理 ¥4.20 · 全部 ¥9.80 · Esc 停止  ";
+		for (const width of [160, 200, 300]) {
+			expect(plain(bar(state, width)), `width ${width}`).toBe(designRow(left, right, width));
 		}
-		expect(placeGone).toBe(true);
 	});
 
 	it("drops the spend whole before the clock or the tokens lose anything", () => {
@@ -254,21 +238,20 @@ describe("the status line when the run is done", () => {
 		expect(failed[0]).toContain(theme.fg("error", "✗"));
 	});
 
-	it("puts the spend after the tokens and the session total, and gives them up one at a time", () => {
+	it("puts the spend right after the tokens, with no session total, and gives it up first", () => {
 		const forms = finishedRunForms({
 			outcome: "done",
 			elapsedMs: 20 * MINUTE,
 			outputTokens: 286_000,
-			sessionTokens: 900_000,
 			spendCells: spendCells(),
 		}).map(plain);
 		expect(forms).toEqual([
-			"✓ 完成 · 20 分钟 · ↓ 286k · 本会话 ↓ 900k · 子代理 ¥4.20 · 全部 ¥9.80",
-			"✓ 完成 · 20 分钟 · ↓ 286k · 本会话 ↓ 900k · 子代理 ¥4.20",
-			"✓ 完成 · 20 分钟 · ↓ 286k · 本会话 ↓ 900k",
+			"✓ 完成 · 20 分钟 · ↓ 286k · 子代理 ¥4.20 · 全部 ¥9.80",
+			"✓ 完成 · 20 分钟 · ↓ 286k · 子代理 ¥4.20",
 			"✓ 完成 · 20 分钟 · ↓ 286k",
 			"✓ 完成",
 		]);
+		expect(forms.join("\n")).not.toContain("本会话");
 	});
 });
 

@@ -99,7 +99,6 @@ describe("the status line's layout with a spend cell", () => {
 		model: "glm-5.3-prime",
 		level: "中",
 		context: { percent: 33, warn: false },
-		location: "~/work/app · main",
 		subagents: 0,
 		right,
 		spendForms: forms.length,
@@ -109,7 +108,6 @@ describe("the status line's layout with a spend cell", () => {
 		const bar = plain(renderStatusBar(state, 240));
 		expect(bar).toContain("↓ 7.1k · 子代理 ¥4.56 · 全部 ¥5.10");
 		expect(bar.indexOf("子代理 ¥")).toBeLessThan(bar.indexOf("Esc 停止"));
-		expect(bar).toContain("~/work/app");
 	});
 
 	it("drops the spend before the model or the run's state lose anything, whole figures only", () => {
@@ -153,6 +151,8 @@ function statusHost(options: {
 	running: number;
 	working?: boolean;
 	connectionLost?: boolean;
+	/** A run that just ended, 20 minutes long with 286k output tokens. */
+	finished?: boolean;
 }) {
 	const host = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
 	Object.assign(host, {
@@ -173,7 +173,15 @@ function statusHost(options: {
 		sessionOutputTokens: undefined,
 		connectionLost: options.connectionLost ?? false,
 		// The turn flow is created on demand from the live store; a stand-in with no live box and no finished turn.
-		liveTurnFlowStore: { hasLiveBox: () => false, lastFinished: undefined },
+		liveTurnFlowStore: {
+			hasLiveBox: () => false,
+			lastFinished: options.finished
+				? {
+						timeline: { stopped: false, errorEnded: false, outputTokens: () => 286_000 },
+						turnDurationMs: () => 20 * 60_000,
+					}
+				: undefined,
+		},
 	});
 	const getState = Reflect.get(InteractiveMode.prototype, "getStatusBarState") as (
 		this: typeof host,
@@ -209,6 +217,18 @@ describe("the status line as the interactive mode drives it", () => {
 		expect(text).toContain("工作中");
 		expect(text).not.toContain("个子代理在跑");
 		expect(text).not.toContain("◇");
+	});
+
+	it("says nothing about the place, the branch or the session total, working or done", () => {
+		const working = statusHost({ strip: stripWith(twoRows), running: 2, working: true }).bar(160);
+		expect(working).toMatch(/^ glm-5\.3-prime {20,}\S 工作中 1分 · ↓ 7\.1k · Esc 停止 {2}$/u);
+		const done = statusHost({ strip: stripWith(twoRows), running: 0, finished: true }).bar(160);
+		expect(done).toMatch(/^ glm-5\.3-prime {20,}✓ 完成 · 20 分钟 · ↓ 286k {2}$/u);
+		for (const text of [working, done]) {
+			expect(visibleWidth(text)).toBe(160);
+			expect(text).not.toContain("/work/app");
+			expect(text).not.toContain("本会话");
+		}
 	});
 
 	it("keeps it when the strip has no blocks to show (the roster counts the family but no snapshot does)", () => {

@@ -328,7 +328,7 @@ import {
 } from "./components/turn-activity.js";
 import { BOX_FOCUS_MARKER } from "./components/turn-box.js";
 import { TurnBoxNavigator, turnBoxFocusHints } from "./components/turn-box-navigator.js";
-import { boxRecordFromMessage, formatBoxTokens, isBoxNoticeMessage } from "./components/turn-timeline.js";
+import { boxRecordFromMessage, isBoxNoticeMessage } from "./components/turn-timeline.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
 import { FeatureHintDeck } from "./feature-hints.js";
@@ -1613,8 +1613,6 @@ export class InteractiveMode {
 		this.liveTurnFlowStore ??= new LiveTurnFlow(this.createLiveTurnFlowHost());
 		return this.liveTurnFlowStore;
 	}
-	/** Output tokens of the whole session, from the session stats. */
-	private sessionOutputTokens: number | undefined;
 	/** The keyboard walking a turn's box (`app.turn.focus`). */
 	private boxFocus: { summary: TurnSummaryComponent; navigator: TurnBoxNavigator; resumeFollow: boolean } | undefined;
 	// U2: trailing consecutive errored tool results; a success resets it.
@@ -3493,7 +3491,6 @@ export class InteractiveMode {
 		this.contextUsageRefresh.lastSuccessGeneration = generation;
 		// Anything counted so far is now reflected in the snapshot; only later output is in-flight.
 		this.contextUsageTokenBaseline = this.activityTracker.getStatus().tokens;
-		this.sessionOutputTokens = stats.tokens?.output;
 		this.patchConnectionState({ contextUsage: stats.contextUsage });
 		// P2-D (Qwen review): the leading invalidation happened before the await
 		// - a frame that rendered while the RPC was in flight re-memoized the
@@ -3800,7 +3797,6 @@ export class InteractiveMode {
 		this.liveTurnFlowStore?.reset();
 		this.currentTurnState = undefined;
 		this.currentTurnSummary = undefined;
-		this.sessionOutputTokens = undefined;
 		this.resetSubagentSummary();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
@@ -7842,13 +7838,10 @@ export class InteractiveMode {
 			// Just compacted: the size is measured again with the next reply.
 			context = { warn: false };
 		}
-		const branch = this.footerDataProvider.getGitBranch();
-		const location = [formatSplashCwd(this.getCurrentCwd()), branch ?? undefined].filter(Boolean).join(" · ");
 		return {
 			model: model.id,
 			...(level ? { level } : {}),
 			...(context ? { context } : {}),
-			...(location ? { location } : {}),
 			// The strip under the prompt already shows a block per child.
 			subagents: this.subagentSummaryLine.hasChipRow() ? 0 : this.subagentCounts.running,
 			right: this.statusBarRight(),
@@ -7870,7 +7863,6 @@ export class InteractiveMode {
 		const toast = this.footerToast;
 		const toastChip =
 			toast && toast.until > Date.now() ? `${theme.bg("toastBg", theme.fg("toastText", ` ${toast.text} `))} ` : "";
-		const dot = theme.fg("dim", " · ");
 		const state = this.currentTurnState;
 		const working = this.isAgentStreaming() || this.turnFlow.hasLiveBox();
 		const layout = (forms: string[], spendBearing: string[] = []) =>
@@ -7890,10 +7882,6 @@ export class InteractiveMode {
 				}),
 			);
 		}
-		const session =
-			this.sessionOutputTokens !== undefined && this.sessionOutputTokens > 0
-				? theme.fg("dim", `本会话 ↓ ${formatBoxTokens(this.sessionOutputTokens)}`)
-				: "";
 		if (this.connectionLost) return layout([`${theme.fg("error", "✗")} ${theme.fg("muted", "和后台的连接断了")}`]);
 		const last = this.liveTurnFlowStore?.lastFinished;
 		if (last) {
@@ -7902,16 +7890,11 @@ export class InteractiveMode {
 					outcome: last.timeline.stopped ? "stopped" : last.timeline.errorEnded ? "error" : "done",
 					elapsedMs: last.turnDurationMs(),
 					outputTokens: last.timeline.outputTokens(),
-					...(this.sessionOutputTokens !== undefined ? { sessionTokens: this.sessionOutputTokens } : {}),
 					spendCells: this.statusBarSpendCell("timelineTime"),
 				}),
 			);
 		}
-		const quiet = session ? [`${session}${theme.fg("dim", " tokens")}`, session] : [""];
-		return layout(
-			quiet,
-			this.statusBarSpendCell().map((cell) => (session ? `${quiet[0]}${dot}${cell}` : cell)),
-		);
+		return layout([""], this.statusBarSpendCell("timelineTime"));
 	}
 
 	/** The keys that work right now, most useful first; the hint line drops them from the end. */

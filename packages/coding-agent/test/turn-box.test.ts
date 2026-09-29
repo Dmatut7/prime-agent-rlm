@@ -895,7 +895,6 @@ describe("the status bar", () => {
 			model: "glm-5.3-prime",
 			level: "中",
 			context: { percent: 33, warn: false },
-			location: "~/work/app · main",
 			subagents: 2,
 			right,
 		};
@@ -905,13 +904,11 @@ describe("the status bar", () => {
 		expect(wide).toContain("上下文 ━━━━━━━━ 33%");
 		expect(wideRaw).toContain(`${theme.fg("timelineUser", "━━━")}${theme.fg("timelineRail", "━━━━━")}`);
 		expect(wide).toContain("◇ 2 个子代理在跑");
-		expect(wide).toContain("~/work/app · main");
 		expect(wide).toContain("Esc 停止");
 		const narrow = stripAnsi(renderStatusBar(state, 80));
 		expect(visibleWidth(narrow)).toBeLessThanOrEqual(80);
 		expect(narrow).toContain("33%");
 		expect(narrow).toContain("工作中 · 1分26秒");
-		expect(narrow).not.toContain("~/work/app");
 	});
 
 	it("keeps its layout while the clock and the token count gain digits", () => {
