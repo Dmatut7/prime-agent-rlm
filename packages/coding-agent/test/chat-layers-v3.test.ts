@@ -232,13 +232,13 @@ describe("the ◆ prime header and the gutter", () => {
 		summary.setQuiet(true);
 		const lines = plain(summary.render(100));
 		expect(lines[0]).toBe(" ◆ prime  glm-5.3-prime");
-		expect(lines[1]?.startsWith(" ╭")).toBe(true);
-		expect(lines[2]).toMatch(/^ │ ▸ ✓ 跑了 1 条命令 +4秒 · ↓ 0 │$/);
-		expect(lines[3]?.startsWith(" ╰")).toBe(true);
+		// A settled box that keeps nothing on show is its header card alone: no frame.
+		expect(lines).toHaveLength(2);
+		expect(lines[1]).toMatch(/^ +✓ 完成 +跑了 1 条命令 +4秒 · ↓ 0 › *$/);
 		// The `◆ prime` line and the box header both open the box.
 		const regions = summary.getClickRegions().filter((region) => !region.passive);
 		expect(regions[0]).toMatchObject({ line: 0, col: 0 });
-		expect(regions.some((region) => region.line === 2)).toBe(true);
+		expect(regions.some((region) => region.line === 1)).toBe(true);
 	});
 
 	it("renders the live turn as the header plus a box that says what it is doing", () => {
@@ -248,7 +248,7 @@ describe("the ◆ prime header and the gutter", () => {
 		summary.setQuiet(true);
 		const lines = plain(summary.render(100));
 		expect(lines[0]).toBe(" ◆ prime  glm-5.3-prime");
-		expect(lines[2]).toMatch(/^ │ ▾ \S 等待模型回应… /);
+		expect(lines[2]).toMatch(/^ │ +\S 进行中 +等待模型回应… /);
 	});
 
 	it("runs a quiet answer flush under its box, with no rail", () => {

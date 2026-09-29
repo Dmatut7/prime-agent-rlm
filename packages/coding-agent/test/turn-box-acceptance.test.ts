@@ -19,6 +19,7 @@ import { turnBoxFocusHints } from "../src/modes/interactive/components/turn-box-
 import { STRIP_EDITS, TurnStripComponent } from "../src/modes/interactive/components/turn-strip.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { headerPlain } from "./grow-box-helpers.js";
 
 function usage(output: number): AssistantMessage["usage"] {
 	return {
@@ -114,7 +115,7 @@ function openBox(turn: Turn): string {
 
 const plain = (lines: readonly string[]) => lines.map((line) => stripAnsi(line).replace(/\x1b_[^\x07]*\x07/g, ""));
 const text = (lines: readonly string[]) => plain(lines).join("\n");
-const header = (turn: Turn) => plain(turn.summary.render(120))[2] ?? "";
+const header = (turn: Turn) => headerPlain(turn.summary.render(120));
 
 function replay(messages: AgentMessage[]): Component[] {
 	return buildConversationComponents(messages, {

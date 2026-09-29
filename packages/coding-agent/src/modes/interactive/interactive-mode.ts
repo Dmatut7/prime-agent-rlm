@@ -10487,6 +10487,8 @@ export class InteractiveMode {
 		return {
 			cwd: () => this.getCurrentCwd(),
 			viewportRows: () => this.ui?.terminal?.rows ?? 40,
+			// The fullscreen window scrolls a tall box; an inline screen redraws whole when a row above its bottom changes.
+			growBox: () => this.ui?.isFullscreen?.() ?? false,
 			openWhileWorking: () => settings()?.getTimelineOpenWhileWorking?.() ?? true,
 			autoFold: () => settings()?.getTimelineAutoFold?.() ?? true,
 			hideThinking: () => this.hideThinkingBlock === true,

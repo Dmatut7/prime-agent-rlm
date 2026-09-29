@@ -12,6 +12,7 @@ import {
 	TurnSummaryComponent,
 } from "../src/modes/interactive/components/turn-activity.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { headerPlain } from "./grow-box-helpers.js";
 
 const T0 = 1_700_000_000_000;
 
@@ -66,8 +67,8 @@ function finishedBox(replies: AssistantMessage[], options: { errorEnded?: boolea
 	return summary;
 }
 
-/** Line 0 is the `◆ prime` line and line 1 the box's top rule. */
-const headerOf = (summary: TurnSummaryComponent) => plain(summary.render(120))[2] ?? "";
+/** The box's header row: a finished box that keeps nothing on show is that row alone, under the `◆ prime` line. */
+const headerOf = (summary: TurnSummaryComponent) => headerPlain(summary.render(120));
 
 function replayedSummary(messages: AgentMessage[]): TurnSummaryComponent {
 	const components = buildConversationComponents(messages, {
@@ -94,7 +95,7 @@ afterEach(() => {
 describe("a turn that produced nothing says so instead of claiming an answer", () => {
 	it("says the turn had no output for a reply with no text, no step and no thought", () => {
 		const header = headerOf(finishedBox([assistant(T0 + 1_000, [], "length")]));
-		expect(header).toContain("✓ （这轮没有输出）");
+		expect(header).toMatch(/✓ 完成 +（这轮没有输出）/);
 		expect(header).not.toContain("直接回答了");
 	});
 
@@ -126,7 +127,7 @@ describe("a turn that did say something keeps its wording", () => {
 		const header = headerOf(
 			finishedBox([assistant(T0 + 1_000, [{ type: "text", text: "好的，已经改好了。" }], "stop")]),
 		);
-		expect(header).toContain("✓ 直接回答了");
+		expect(header).toMatch(/✓ 完成 +直接回答了/);
 		expect(header).not.toContain("这轮没有输出");
 	});
 
@@ -135,7 +136,7 @@ describe("a turn that did say something keeps its wording", () => {
 			{ role: "user", content: "在吗", timestamp: T0 },
 			assistant(T0 + 1_000, [{ type: "text", text: "在的。" }], "stop"),
 		]);
-		expect(headerOf(summary)).toContain("✓ 直接回答了");
+		expect(headerOf(summary)).toMatch(/✓ 完成 +直接回答了/);
 	});
 
 	it("counts an empty reply followed by a text reply of the same turn as an answer", () => {
@@ -145,7 +146,7 @@ describe("a turn that did say something keeps its wording", () => {
 				assistant(T0 + 2_000, [{ type: "text", text: "换个说法重答一遍。" }], "stop"),
 			]),
 		);
-		expect(header).toContain("✓ 直接回答了");
+		expect(header).toMatch(/✓ 完成 +直接回答了/);
 	});
 
 	it("counts a text reply followed by an empty reply of the same turn as an answer too", () => {
@@ -155,7 +156,7 @@ describe("a turn that did say something keeps its wording", () => {
 				assistant(T0 + 2_000, [], "length"),
 			]),
 		);
-		expect(header).toContain("✓ 直接回答了");
+		expect(header).toMatch(/✓ 完成 +直接回答了/);
 		expect(header).not.toContain("这轮没有输出");
 	});
 
@@ -171,7 +172,7 @@ describe("a turn that did say something keeps its wording", () => {
 	it("leaves a turn that ended on a model error to its error row", () => {
 		const summary = finishedBox([assistant(T0 + 1_000, [], "error", "接口超时")], { errorEnded: true });
 		const header = headerOf(summary);
-		expect(header).toContain("✗ 1 处出错");
+		expect(header).toMatch(/✗ 出错 +1 处出错/);
 		expect(header).not.toContain("这轮没有输出");
 		expect(header).not.toContain("直接回答了");
 		setMotionReduced(true);

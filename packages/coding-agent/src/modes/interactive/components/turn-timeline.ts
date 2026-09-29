@@ -138,6 +138,8 @@ export class TimelineUiState {
 	readonly id = `box${++boxIdCounter}`;
 	/** The row whose block the pointer is on, when one is. */
 	hoverKey: string | undefined;
+	/** The pointer is on the box header (or its pinned copy). */
+	headHover = false;
 	/** The user opened or closed the box themselves: the automatic open/fold rules no longer apply. */
 	userOpen: boolean | undefined;
 	/**
@@ -240,6 +242,14 @@ export class TimelineUiState {
 			if (this.hoverKey !== key) return false;
 			this.hoverKey = undefined;
 		}
+		this.bump();
+		return true;
+	}
+
+	/** The pointer entered or left the box header; false when that changed nothing. */
+	setHeadHover(hovered: boolean): boolean {
+		if (this.headHover === hovered) return false;
+		this.headHover = hovered;
 		this.bump();
 		return true;
 	}

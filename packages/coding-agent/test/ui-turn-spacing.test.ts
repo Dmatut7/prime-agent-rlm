@@ -25,9 +25,9 @@ afterEach(() => {
 });
 
 /**
- * The chat as a string of what each line is: T a `◆ prime` title, U a box's top
- * border, D its bottom border, M a handed-back message row, B a blank line, X other
- * text. A box's inside is left out.
+ * The chat as a string of what each line is: T a `◆ prime` title, C a folded box (its
+ * header card, one row), U an open box's top border, D its bottom border, M a
+ * handed-back message row, B a blank line, X other text. An open box's inside is left out.
  */
 function shape(chat: LiveChat): string {
 	const marks: string[] = [];
@@ -37,6 +37,7 @@ function shape(chat: LiveChat): string {
 		else if (line.includes("╭")) marks.push("U");
 		else if (line.includes("╰")) marks.push("D");
 		else if (line.includes("◇")) marks.push("M");
+		else if (/ \S (完成|出错|已停止|进行中) /.test(line)) marks.push("C");
 		else if (!line.includes("│")) marks.push("X");
 	}
 	return marks.join("");
@@ -60,14 +61,14 @@ describe("the groups of consecutive turns are one blank line apart", () => {
 		const marks = shape(threeGroups());
 		expect(marks).not.toContain("BB");
 		// A group is its message rows and its box: one blank line before it, none inside it.
-		expect(marks).toContain("BMUD");
-		expect(marks).toContain("BMMUD");
+		expect(marks).toContain("BMC");
+		expect(marks).toContain("BMMC");
 		expect(marks).not.toContain("MB");
-		expect(marks).not.toMatch(/D[UT]/);
+		expect(marks).not.toMatch(/C[CT]/);
 	});
 
 	it("draws the answer of the last box one blank line under it", () => {
-		expect(shape(threeGroups())).toMatch(/UDBX$/);
+		expect(shape(threeGroups())).toMatch(/CBX$/);
 	});
 
 	it("draws no title inside the woken groups but the first turn's", () => {
@@ -81,7 +82,7 @@ describe("the groups of consecutive turns are one blank line apart", () => {
 		chat.wake("m1", { model: "gpt-5.5" });
 		vi.advanceTimersByTime(1_000);
 		const marks = shape(chat);
-		expect(marks).toContain("BMTUD");
+		expect(marks).toContain("BMTC");
 		expect(marks).not.toContain("BB");
 	});
 
@@ -91,8 +92,8 @@ describe("the groups of consecutive turns are one blank line apart", () => {
 		chat.wakeUnseen("m1");
 		vi.advanceTimersByTime(1_000);
 		const marks = shape(chat);
-		expect(marks).toContain("DBUD");
-		expect(marks).not.toMatch(/DU/);
+		expect(marks).toContain("CBC");
+		expect(marks).not.toMatch(/CC/);
 		expect(marks).not.toContain("BB");
 	});
 
@@ -100,7 +101,7 @@ describe("the groups of consecutive turns are one blank line apart", () => {
 		const chat = new LiveChat();
 		chat.prompt("你好");
 		vi.advanceTimersByTime(1_000);
-		expect(shape(chat)).toMatch(/^X+BTUD$/);
+		expect(shape(chat)).toMatch(/^X+BTC$/);
 	});
 });
 
@@ -111,7 +112,7 @@ describe("a woken turn does not add a blank line to one that is already there", 
 		chat.wakeUnseen("m1");
 		vi.advanceTimersByTime(1_000);
 		const marks = shape(chat);
-		expect(marks).toContain("BUD");
+		expect(marks).toContain("BC");
 		expect(marks).not.toContain("BB");
 	});
 
@@ -120,7 +121,7 @@ describe("a woken turn does not add a blank line to one that is already there", 
 		chat.prompt("你好", { answer: "在的。" });
 		chat.wakeUnseen("m1");
 		vi.advanceTimersByTime(1_000);
-		expect(shape(chat)).toContain("XBUD");
+		expect(shape(chat)).toContain("XBC");
 	});
 
 	function wokenSummary() {

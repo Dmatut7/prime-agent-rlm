@@ -20,6 +20,7 @@ import { TurnTimeline } from "../src/modes/interactive/components/turn-timeline.
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 import { setWorkingPulseTick } from "../src/modes/interactive/theme/working-icon.js";
+import { headerPlain } from "./grow-box-helpers.js";
 
 const T0 = 1_700_000_000_000;
 
@@ -413,7 +414,7 @@ describe("events inside the box", () => {
 		turn.timeline.errorEnded = true;
 		turn.state.markTurnEnded(Date.now());
 		const closed = text(turn.summary.render(120));
-		expect(closed).toContain("▸ ✗");
+		expect(closed).toMatch(/✗ 出错 +做了 1 步 · 1 处出错/);
 		expect(closed).toContain("ModuleNotFoundError: No module named 'nope'");
 		expect(closed).toContain("1 处出错");
 	});
@@ -479,11 +480,11 @@ describe("the box header", () => {
 			status: "done",
 		});
 		turn.state.markTurnEnded(Date.now());
-		const header = plain(turn.summary.render(120))[2] ?? "";
-		expect(header).toMatch(/▸ ✓ 想了 1 次 · 跑了 1 条命令\s+\d+秒 · ↓ 1\.2k │/);
+		const header = headerPlain(turn.summary.render(120));
+		expect(header).toMatch(/✓ 完成 +想了 1 次 · 跑了 1 条命令\s+\d+秒 · ↓ 1\.2k ›/);
 		turn.timeline.stopped = true;
 		turn.timeline.ui.bump();
-		expect(plain(turn.summary.render(120))[2]).toContain("■ 已停止 · 做到第 1 步，做好的都留着");
+		expect(headerPlain(turn.summary.render(120))).toMatch(/■ 已停止 +做到第 1 步，做好的都留着/);
 	});
 });
 
@@ -553,11 +554,12 @@ describe("clicks, keys and what stays open", () => {
 		);
 		turn.state.addStep({ toolCallId: "c1", toolName: "ipython", args: { code: "print(1)" }, status: "done" });
 		turn.state.markTurnEnded(Date.now());
-		expect(plain(turn.summary.render(120))).toHaveLength(4);
-		regionAt(turn.summary, 2)?.onClick({ row: 0, col: 0 });
+		// Folded, the box is its header card alone under the `◆ prime` line.
+		expect(plain(turn.summary.render(120))).toHaveLength(2);
+		regionAt(turn.summary, 1)?.onClick({ row: 0, col: 0 });
 		setMotionReduced(true);
 		const open = plain(turn.summary.render(120));
-		expect(open[2]).toContain("▾ ✓");
+		expect(open[2]).toMatch(/✓ 完成 .*⌄/);
 		const thinkLine = open.findIndex((line) => line.includes("思考了"));
 		regionAt(turn.summary, thinkLine)?.onClick({ row: 0, col: 0 });
 		const expanded = text(turn.summary.render(120));
@@ -675,7 +677,7 @@ describe("opening, folding and history", () => {
 		expect(folding).toBeLessThan(open);
 		expect(folding).toBeGreaterThan(4);
 		vi.setSystemTime(T0 + TURN_FOLD_MS + 10);
-		expect(plain(turn.summary.render(100))).toHaveLength(4);
+		expect(plain(turn.summary.render(100))).toHaveLength(2);
 
 		const touched = quietTurn({ startedAt: T0 - 5_000 });
 		addStep(touched, "t", "await bash('echo t')", "done", T0 - 4_000);
@@ -693,18 +695,18 @@ describe("opening, folding and history", () => {
 		turn.summary.render(100);
 		turn.state.markTurnEnded(Date.now());
 		turn.state.finishBox();
-		expect(plain(turn.summary.render(100))).toHaveLength(4);
+		expect(plain(turn.summary.render(100))).toHaveLength(2);
 		expect(rowEnterStage(Date.now())).toBe("none");
 	});
 
 	it("starts closed while working when the setting says so, and history boxes start closed", () => {
 		const closedLive = quietTurn({ host: host({ openWhileWorking: () => false }) });
 		addStep(closedLive, "s", "await bash('echo s')", "running");
-		expect(plain(closedLive.summary.render(100))).toHaveLength(4);
+		expect(plain(closedLive.summary.render(100))).toHaveLength(2);
 		const history = quietTurn({ live: false });
 		addStep(history, "s", "await bash('echo s')");
 		history.state.markTurnEnded(Date.now());
-		expect(plain(history.summary.render(100))).toHaveLength(4);
+		expect(plain(history.summary.render(100))).toHaveLength(2);
 	});
 
 	it("Ctrl+T opens every thinking row of the turn", () => {

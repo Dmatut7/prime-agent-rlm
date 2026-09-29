@@ -206,3 +206,44 @@ describe("a replayed box", () => {
 		expect(plain(turn.summary.render(100)).join("\n")).not.toContain("npm test");
 	});
 });
+
+describe("the turn-end fold", () => {
+	it("folds a long body at once instead of row by row", () => {
+		vi.useFakeTimers({ now: T0 });
+		const turn = quietTurn({ host: host({ viewportRows: () => 200, growBox: () => true }) });
+		for (let index = 0; index < 40; index++) addCommand(turn, `c${index}`, `echo ${index}`);
+		const before = turn.summary.render(100).length;
+		expect(before).toBeGreaterThan(60);
+		turn.state.markTurnEnded();
+		turn.state.finishBox();
+		const after = turn.summary.render(100).length;
+		expect(after).toBeLessThan(5);
+	});
+
+	it("still folds a short body row by row", () => {
+		vi.useFakeTimers({ now: T0 });
+		const turn = quietTurn({ host: host({ viewportRows: () => 40 }) });
+		for (let index = 0; index < 3; index++) addCommand(turn, `c${index}`, `echo ${index}`);
+		const before = turn.summary.render(100).length;
+		turn.state.markTurnEnded();
+		turn.state.finishBox();
+		vi.advanceTimersByTime(150);
+		const during = turn.summary.render(100).length;
+		expect(during).toBeLessThan(before);
+		expect(during).toBeGreaterThan(3);
+		vi.advanceTimersByTime(1000);
+		const settled = turn.summary.render(100).length;
+		expect(settled).toBeLessThan(during);
+	});
+
+	it("never animates when motion is reduced", () => {
+		vi.useFakeTimers({ now: T0 });
+		setMotionReduced(true);
+		const turn = quietTurn({ host: host({ viewportRows: () => 40 }) });
+		for (let index = 0; index < 3; index++) addCommand(turn, `c${index}`, `echo ${index}`);
+		turn.summary.render(100);
+		turn.state.markTurnEnded();
+		turn.state.finishBox();
+		expect(turn.summary.render(100).length).toBeLessThan(5);
+	});
+});
