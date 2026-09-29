@@ -205,9 +205,12 @@ export class LiveTurnFlow {
 		const lastStop = this.lastStop ?? (state?.isTurnEnded ? undefined : this.replayedStop(state));
 		if (isWakeMessage(message) && lastStop !== "toolUse" && !this.runCutMidTask) {
 			this.starterSinceRunStart = true;
-			this.starterKind = "wake";
-			this.pendingCause ??= new WakeCause();
-			this.pendingCause.add(message);
+			// A prompt already opened this run: a report landing before the first answer does not take it over.
+			if (this.starterKind !== "user") {
+				this.starterKind = "wake";
+				this.pendingCause ??= new WakeCause();
+				this.pendingCause.add(message);
+			}
 			this.endLiveTurnForNewRun();
 			return false;
 		}
@@ -305,8 +308,10 @@ export class LiveTurnFlow {
 			}
 		}
 		const state = this.ensureCurrent();
+		// The same message starting again is the same row; any other start is a row of its own.
+		const restarted = this.openMessage?.message.timestamp === message.timestamp;
 		this.dropOpenMessage(message);
-		state.timeline.noteMessage(message, false);
+		state.timeline.noteMessage(message, false, !restarted);
 		this.openMessage = { state, message };
 		state.setLiveThinkingSegments(countThinkingSegments(message));
 		// The header names the model; until the first token arrives the box says it waits.
@@ -672,7 +677,7 @@ export class LiveTurnFlow {
 		timeline.upsertSubagent({
 			childId: child.id,
 			name: child.sessionName ?? child.label,
-			laneName: laneKey(child.sessionName, child.activeSessionId) || child.label,
+			laneName: laneKey(child.sessionName, child.activeSessionId),
 			...(child.sessionName ? { label: child.label } : {}),
 			status: running ? "running" : child.status === "error" ? "failed" : "done",
 			line,
@@ -886,7 +891,7 @@ export class LiveTurnFlow {
 		const open = this.openMessage;
 		this.openMessage = undefined;
 		if (!open || open.message.timestamp === next.timestamp) return;
-		const key = `m:${open.message.timestamp}`;
+		const key = open.state.timeline.messageKey(open.message.timestamp);
 		const entry = open.state.timeline.entries.find((candidate) => candidate.key === key);
 		const latest = entry?.kind === "message" ? entry.message : open.message;
 		open.state.timeline.dropEntry(key);

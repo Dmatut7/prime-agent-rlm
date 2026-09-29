@@ -71,7 +71,7 @@ export interface TimelineSubagent {
 	name: string;
 	/** The task it was given, in a few words (its short tag comes from this). */
 	label?: string;
-	/** The key it is on the subagent lane by (`laneKey`): the name a report from it is released under. */
+	/** The key it is on the subagent lane by (`laneKey`): the name a report from it is released under; empty: not on the lane. */
 	laneName?: string;
 	status: "running" | "done" | "failed";
 	/** What it is doing now, in plain words. */
@@ -336,9 +336,22 @@ export class TurnTimeline implements LaneOwner {
 		return this.seq;
 	}
 
-	/** Upsert one assistant message (streaming updates replace the stored reference). */
-	noteMessage(message: AssistantMessage, ended: boolean): void {
-		const key = `m:${message.timestamp}`;
+	/**
+	 * The key of the newest row noted for a message stamped `timestamp`; `fresh` is the key a message
+	 * starting now gets (two messages can share a millisecond, and the later one is its own row).
+	 */
+	messageKey(timestamp: number, fresh = false): string {
+		const base = `m:${timestamp}`;
+		const same = this.entries.filter(
+			(entry) => entry.kind === "message" && (entry.key === base || entry.key.startsWith(`${base}#`)),
+		).length;
+		const index = fresh ? same + 1 : Math.max(1, same);
+		return index === 1 ? base : `${base}#${index}`;
+	}
+
+	/** Upsert one assistant message (streaming updates replace the stored reference); `fresh` starts a new row. */
+	noteMessage(message: AssistantMessage, ended: boolean, fresh = false): void {
+		const key = this.messageKey(message.timestamp, fresh);
 		const existing = this.entries.find((entry) => entry.kind === "message" && entry.key === key);
 		if (existing && existing.kind === "message") {
 			existing.message = message;
@@ -368,7 +381,7 @@ export class TurnTimeline implements LaneOwner {
 
 	/** Live stream events time the thinking blocks and measure their tokens from usage. */
 	noteStreamEvent(message: AssistantMessage, event: AssistantMessageEvent, now = Date.now()): void {
-		const messageKey = `m:${message.timestamp}`;
+		const messageKey = this.messageKey(message.timestamp);
 		if (event.type === "thinking_start" || event.type === "thinking_delta") {
 			const key = `${messageKey}:${event.contentIndex}`;
 			if (!this.thinkingTiming.has(key)) {
@@ -391,7 +404,7 @@ export class TurnTimeline implements LaneOwner {
 	}
 
 	private closeThinking(message: AssistantMessage, now: number): void {
-		const prefix = `m:${message.timestamp}:`;
+		const prefix = `${this.messageKey(message.timestamp)}:`;
 		for (const [key, timing] of this.thinkingTiming) {
 			if (key.startsWith(prefix) && timing.endedAt === undefined) {
 				timing.endedAt = now;
@@ -554,16 +567,21 @@ export class TurnTimeline implements LaneOwner {
 		const lane = update.laneName ?? update.name;
 		// The same subagent may be told twice (its spawn record, then its snapshot): one entry.
 		const existing = this.entries.find(
-			(entry) => entry.kind === "subagent" && (entry.key === key || subagentLane(entry.sub) === lane),
+			(entry) =>
+				entry.kind === "subagent" && (entry.key === key || (lane !== "" && subagentLane(entry.sub) === lane)),
 		);
 		if (existing && existing.kind === "subagent") {
 			const wasRunning = existing.sub.status === "running";
+			const wasOffLane = !(existing.sub.laneName ?? existing.sub.name);
 			existing.sub = {
 				...existing.sub,
 				...update,
 				startedAt: existing.sub.startedAt,
 				...(wasRunning && update.status !== "running" ? { endedAt: now } : {}),
 			};
+			// A key that only shows up after the first sight puts the running subagent on the lane then.
+			const nowLane = existing.sub.laneName ?? existing.sub.name;
+			if (wasOffLane && nowLane && existing.sub.status === "running") this.laneTracker?.spawned([nowLane], this);
 		} else {
 			this.entries.push({
 				seq: this.nextSeq(),
@@ -571,7 +589,8 @@ export class TurnTimeline implements LaneOwner {
 				key,
 				sub: { ...update, startedAt: update.startedAt ?? now },
 			});
-			if (update.status === "running") this.laneTracker?.spawned([lane], this);
+			// A subagent with no key a report could release it by stays off the lane: it would never come back.
+			if (update.status === "running" && lane) this.laneTracker?.spawned([lane], this);
 		}
 		this.ui.bump();
 	}
