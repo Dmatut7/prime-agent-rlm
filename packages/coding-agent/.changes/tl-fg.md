@@ -1,0 +1,8 @@
+- Fixed a message you typed while the AI was working through a notice it did not need to act on, and the AI's answer to it, being hidden with that round; typing in a round now shows it.
+- Fixed a compaction that failed inside such a hidden round being hidden with it; a compaction you cancelled or that only waited stays out of sight.
+- Fixed a question ending in a hidden round leaving `完整过程 ▸` where the keyboard could not reach it; the closing row now sits under the last round that is drawn, and the keys reach it.
+- Fixed only the newest question having a closing row; every question now ends with `✓ 用了 … 完整过程 ▸`, live and after reopening, the time counted to that question's last round (no idle time, no late memory tidy) and the money only under the newest one.
+- Fixed a memory line that arrives after a question ending in a hidden round landing under the closing row.
+- Fixed a window opened on a running session (`--resume`, `attach`) not drawing the subagents that were still out when their dispatch was compacted away or lies before the window, so their reports did not close the dotted lane.
+- Fixed a rebuild that crossed into a new question counting the earlier question's returns among the new question's `都交回了`.
+- Fixed a compaction making the timeline forget which subagents had already reported, which brought their repeated notices back on screen.

@@ -8480,10 +8480,25 @@ export class InteractiveMode {
 		const replayQuiet = this.settingsManager.getProcessMode() === "quiet";
 		// A rebuild replays the question from its start: who is still out is learned again as it goes,
 		// and what the replay cannot see (a dispatch compacted away or outside the window) is taken back.
-		const laneBefore = this.turnFlow.captureLane();
+		// A view that has learned nothing of its own (a window just opened on a running session) takes
+		// the subagents the session says are running as out since the start of what it shows.
+		let windowStartAt = Number.POSITIVE_INFINITY;
+		for (const message of windowed) {
+			const at = Number(message.timestamp);
+			if (Number.isFinite(at) && at > 0) windowStartAt = Math.min(windowStartAt, at);
+		}
+		const laneBefore = this.turnFlow.seedLane(
+			this.turnFlow.captureLane(),
+			this.subagentSnapshots?.values() ?? [],
+			Number.isFinite(windowStartAt) ? windowStartAt : Date.now(),
+		);
 		this.turnFlow.subagentLane.reset();
 		// The reports the conversation received are learned again too, the ones the window left out first.
+		// A compaction folded some away for good: what this view learned before that stays known.
+		const compacted = transcriptMessages.some((message) => message.role === "compactionSummary");
+		const reportsBefore = compacted ? this.turnFlow.reports.snapshot() : [];
 		this.turnFlow.reports.clear();
+		this.turnFlow.reports.restore(reportsBefore);
 		for (const message of transcriptMessages.slice(0, transcriptMessages.length - windowed.length)) {
 			this.turnFlow.reports.note(message);
 		}
@@ -8551,6 +8566,12 @@ export class InteractiveMode {
 		let replayStartedByUser = true;
 		// The owner's prompt opened the turn about to start: a report landing before its first reply does not take it over.
 		let replayPromptOpened = false;
+		// The quiet timeline's round ends where its own last message landed, not when whatever came after it began.
+		let replayRoundEndedAt: number | undefined;
+		const noteReplayRoundAt = (message: AgentMessage): void => {
+			const at = Number(message.timestamp);
+			if (replayQuiet && Number.isFinite(at) && at > 0) replayRoundEndedAt = Math.max(replayRoundEndedAt ?? 0, at);
+		};
 		const closeReplayTurn = (): void => {
 			if (!replayQuiet || !replayTurnState || !replayTurnSummary) return;
 			replayTurnState.timeline.stopped = lastReplayAssistant?.stopReason === "aborted" || replayResultStop.stopped;
@@ -8579,7 +8600,7 @@ export class InteractiveMode {
 			if (replayQuiet && isWakeMessage(message) && !insideReplayRound() && !replayPromptOpened) {
 				replayCause ??= new WakeCause(this.turnFlow.reports);
 				replayCause.add(message);
-				replayTurnState?.markTurnEnded(Number(message.timestamp) || Date.now());
+				replayTurnState?.markTurnEnded(replayRoundEndedAt ?? (Number(message.timestamp) || Date.now()));
 				closeReplayTurn();
 				replayTurnState = undefined;
 				replayTurnSummary = undefined;
@@ -8594,11 +8615,12 @@ export class InteractiveMode {
 				if (replayTurnState && insideReplayToolLoop()) {
 					const text = this.getUserMessageText(message).trim() || "[图片]";
 					replayTurnState.timeline.addSteer(text, Number(message.timestamp) || Date.now());
+					noteReplayRoundAt(message);
 					continue;
 				}
 				// Freeze the previous turn's clock (thinking-only turns have no
 				// steps to settle) before the next turn starts.
-				replayTurnState?.markTurnEnded(Number(message.timestamp) || Date.now());
+				replayTurnState?.markTurnEnded(replayRoundEndedAt ?? (Number(message.timestamp) || Date.now()));
 				closeReplayTurn();
 				replayTurnState = undefined;
 				replayTurnSummary = undefined;
@@ -8621,6 +8643,7 @@ export class InteractiveMode {
 				// first assistant component, and counts this message's thinking.
 				if (!replayTurnState) {
 					replayTurnState = new TurnActivityState(Number(message.timestamp) || Date.now());
+					replayRoundEndedAt = undefined;
 					replayTurnState.startedByUser = replayStartedByUser;
 					replayPromptOpened = false;
 					if (replayCause) assignWakeCause(replayTurnState, replayCause);
@@ -8648,6 +8671,7 @@ export class InteractiveMode {
 				replayTurnState.latestThinking = latestThinkingText(message) || replayTurnState.latestThinking;
 				replayTurnState.timeline.noteMessage(message, true, true);
 				replayTurnState.noteReplyAt(Number(message.timestamp));
+				noteReplayRoundAt(message);
 				lastReplayAssistant = message;
 				replayResultsArrived = false;
 				replayResultStop = NO_STEP_STOP;
@@ -8728,6 +8752,7 @@ export class InteractiveMode {
 			} else if (message.role === "toolResult") {
 				replayResultsArrived = true;
 				replayResultStop = stepResultStop(message);
+				noteReplayRoundAt(message);
 				// Match tool results to pending tool components
 				const component = renderedPendingTools.get(message.toolCallId);
 				if (component) {
@@ -8821,7 +8846,9 @@ export class InteractiveMode {
 			replayTurnState.live = true;
 		} else {
 			// The last replayed turn has no following user prompt; freeze its clock.
-			replayTurnState?.markTurnEnded(Number(messagesToRender.at(-1)?.timestamp) || Date.now());
+			replayTurnState?.markTurnEnded(
+				replayRoundEndedAt ?? (Number(messagesToRender.at(-1)?.timestamp) || Date.now()),
+			);
 			closeReplayTurn();
 			// Nothing is live: a turn object from before this render is gone from the chat.
 			this.currentTurnState = undefined;

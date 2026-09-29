@@ -152,6 +152,14 @@ function hasTally(tally: ReturnTally): boolean {
 	return tally.failed > 0 || tally.silent > 0 || tally.cancelled > 0;
 }
 
+/** The newest moment a lane record knows of: a subagent going out or coming back. */
+function latestLaneActivity(lane: LaneSnapshot): number {
+	let latest = Number.NEGATIVE_INFINITY;
+	for (const span of lane.spans) latest = Math.max(latest, span.from, span.to ?? Number.NEGATIVE_INFINITY);
+	for (const [, at] of lane.returns) latest = Math.max(latest, at);
+	return latest;
+}
+
 /** What a lane knew at some moment: who was out, and how far the round that closes it had counted. */
 export interface SubagentLaneSnapshot {
 	lane: LaneSnapshot;
@@ -212,9 +220,14 @@ export class SubagentLane {
 		return { lane: this.tracker.snapshot(), back: this.back, tally: { ...this.tally } };
 	}
 
-	/** Take back what a rebuild's replay could not see of the question's lane (`since`: when that question began). */
+	/**
+	 * Take back what a rebuild's replay could not see of the question's lane (`since`: when that question
+	 * began). A snapshot whose latest moment is before `since` is an earlier question's: its counts of
+	 * who came back are not this question's, as its spans are not.
+	 */
 	restore(previous: SubagentLaneSnapshot, since?: number): void {
 		this.tracker.restore(previous.lane, since);
+		if (since !== undefined && latestLaneActivity(previous.lane) < since) return;
 		this.back = Math.max(this.back, previous.back);
 		this.tally = {
 			failed: Math.max(this.tally.failed, previous.tally.failed),
