@@ -19,7 +19,7 @@ import {
 	CompactionOutcomeMessageComponent,
 	MalformedCompactionOutcomeMessageComponent,
 } from "./compaction-outcome-message.js";
-import { QuietCompactionNoticeComponent } from "./compaction-summary-message.js";
+import { CompactionSummaryMessageComponent, QuietCompactionNoticeComponent } from "./compaction-summary-message.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./injected-prompt-message.js";
 import { IPythonCellComponent } from "./ipython-cell.js";
 import {
@@ -383,7 +383,10 @@ export function buildConversationComponents(
 	// message so a thinking-only line stops ticking.
 	closeTurn();
 	turnState?.markTurnEnded(Number(messages.at(-1)?.timestamp) || Date.now());
-	if (quiet) foldEarlierAnswers(components);
+	if (quiet) {
+		foldEarlierAnswers(components);
+		resolveTurnHeaders(components);
+	}
 	return components;
 }
 
@@ -414,6 +417,38 @@ export function foldEarlierAnswers(children: readonly Component[], only?: TurnSu
 		}
 	}
 	settle();
+}
+
+/** Where a turn's title starts over: a compaction between two turns. */
+function isTitleBoundary(child: Component): boolean {
+	return (
+		child instanceof QuietCompactionNoticeComponent ||
+		child instanceof CompactionSummaryMessageComponent ||
+		child instanceof CompactionOutcomeMessageComponent ||
+		child instanceof MalformedCompactionOutcomeMessageComponent
+	);
+}
+
+/**
+ * One title per question: a turn that no user message opened (a handed-back
+ * message woke it, a background command ended, the run went on by itself) and
+ * whose model is the one on the nearest title shown above it draws no
+ * `◆ prime  <model>` line of its own, its box hangs under what is above. The
+ * first turn, the first turn after a user message or a compaction, a turn a
+ * user message opened and a turn on another model keep their title.
+ */
+export function resolveTurnHeaders(children: readonly Component[]): void {
+	let shownModel: string | undefined;
+	for (const child of children) {
+		if (child instanceof TurnSummaryComponent) {
+			const model = child.state.modelId;
+			const show = child.state.startedByUser || shownModel === undefined || shownModel !== model;
+			child.setHeaderShown(show);
+			if (show) shownModel = model;
+		} else if (child instanceof UserMessageComponent || isTitleBoundary(child)) {
+			shownModel = undefined;
+		}
+	}
 }
 
 /** The last non-empty thinking trace of one assistant message, or "". */
