@@ -354,6 +354,26 @@ describe("opening a memory", () => {
 		expect(plain(component.render(100)).join("\n")).not.toContain("范围：");
 	});
 
+	it("explains a memory the kernel cut at its cap on a faint line under the text", () => {
+		setMotionReduced(true);
+		const { component } = strip(
+			facts({ memories: [{ key: "m1", change: memory({ after: `${"记".repeat(40)}${"记".repeat(3959)}…` }) }] }),
+		);
+		component.activate("strip:item:m1");
+		const rows = component.render(100);
+		const bar = rows.filter((row) => stripAnsi(row).includes("┃"));
+		const last = bar.at(-1) ?? "";
+		expect(stripAnsi(last).slice(16)).toBe("（只记录了前 4000 字，完整内容在记忆库里）");
+		expect(styleOf(last, "（只记录了前 4000 字，完整内容在记忆库里）")).toEqual({
+			fg: fgOf("timelineFaint"),
+			bold: false,
+		});
+		for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(100);
+		const short = strip(facts());
+		short.component.activate("strip:item:m1");
+		expect(plain(short.component.render(100)).join("\n")).not.toContain("只记录了前");
+	});
+
 	it("opens each of several memories on its own", () => {
 		setMotionReduced(true);
 		const { component } = strip(

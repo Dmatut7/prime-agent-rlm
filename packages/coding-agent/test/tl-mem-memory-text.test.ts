@@ -4,7 +4,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import type { KernelMemoryChange } from "../src/core/kernel/shared.js";
 import { cleanMemoryTitle, shortMemoryTitle } from "../src/modes/interactive/components/feed-data.js";
 import { memoryBodyLines, memoryHeadLabel } from "../src/modes/interactive/components/memory-detail.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 beforeAll(() => {
 	initTheme("dark");
@@ -116,6 +116,42 @@ describe("an opened memory shows its words in full", () => {
 		const secret = plain(memoryBodyLines(change({ op: "updated", textOmitted: "sensitive" }), 60)).join("\n");
 		expect(secret).toContain("内容没存：看起来是密钥");
 		expect(plain(memoryBodyLines(change({ op: "updated" }), 60)).join("\n")).toContain("没有记录到内容");
+	});
+
+	it("explains a text the kernel cut at its 4000-character cap instead of ending on a bare …", () => {
+		const note = "（只记录了前 4000 字，完整内容在记忆库里）";
+		const cutTexts = [`${"记".repeat(3999)}…`, `${"word ".repeat(800).slice(0, 3999)}…`, `${"😀".repeat(3999)}…`];
+		expect(cutTexts.map((text) => [...text].length)).toEqual([4000, 4000, 4000]);
+		const widths = [24, 80];
+		expect(widths.length).toBeGreaterThan(0);
+		for (const text of cutTexts) {
+			for (const width of widths) {
+				const lines = plain(memoryBodyLines(change({ after: text }), width));
+				// The note comes after all of the text, wrapped like it.
+				expect(squeeze(lines.join("")), `note at ${width}`).toBe(squeeze(`${text}${note}`));
+				for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+			}
+		}
+		const cut = memoryBodyLines(change({ after: cutTexts[0] }), 80);
+		expect(cut.at(-1)).toContain(theme.getFgAnsi("timelineFaint"));
+		expect(plain(memoryBodyLines(change({ op: "deleted", before: cutTexts[0] }), 80)).at(-1)).toBe(note);
+		expect(plain(memoryBodyLines(change({ op: "updated", before: "一", after: cutTexts[0] }), 80)).at(-1)).toBe(note);
+	});
+
+	it("says nothing of a cut for a text that is not at the cap", () => {
+		const samples = [
+			`${"记".repeat(3998)}…`,
+			`${"记".repeat(4000)}`,
+			`${"记".repeat(4001)}…`,
+			"短的记忆…",
+			`${"记".repeat(3999)}。`,
+		];
+		expect(samples.length).toBeGreaterThan(0);
+		for (const text of samples) {
+			expect(plain(memoryBodyLines(change({ after: text }), 80)).join("\n"), text.slice(-3)).not.toContain(
+				"只记录了前",
+			);
+		}
 	});
 
 	it("heads the row by what happened and what kind of thing it was", () => {

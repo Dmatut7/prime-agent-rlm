@@ -13,6 +13,15 @@ import { cleanMemoryTitle } from "./feed-data.js";
 
 const SENSITIVE_TEXT = "内容没存：看起来是密钥";
 
+/** The most characters the kernel keeps of one memory text; a longer one is cut to this many, ending in `…`. */
+const KERNEL_MEMORY_TEXT_CAP = 4000;
+const CUT_NOTE = `（只记录了前 ${KERNEL_MEMORY_TEXT_CAP} 字，完整内容在记忆库里）`;
+
+/** Whether the kernel cut this text at its cap (it is exactly the cap long and ends with the cut mark). */
+function cutByKernel(text: string | undefined): boolean {
+	return text !== undefined && text.endsWith("…") && [...text].length === KERNEL_MEMORY_TEXT_CAP;
+}
+
 /** The verb-plus-kind that heads a memory's timeline row (`记住了`, `改了记忆`, `删了技能`). */
 export function memoryHeadLabel(change: KernelMemoryChange): string {
 	const noun =
@@ -88,6 +97,9 @@ export function memoryBodyLines(change: KernelMemoryChange, width: number): stri
 		if (removed.length === 0 && added.length === 0) lines.push(label("内容没变"));
 	} else {
 		lines.push(label("没有记录到内容"));
+	}
+	if (cutByKernel(change.before) || cutByKernel(change.after)) {
+		lines.push(...wrapped(theme.fg("timelineFaint", CUT_NOTE), room));
 	}
 	return lines;
 }
