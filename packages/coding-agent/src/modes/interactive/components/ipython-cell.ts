@@ -17,6 +17,7 @@ import { renderDiffSeparator, renderRichDiff } from "./diff.js";
 import { countChangedLines, FILE_CHANGE_DIFF_INDENT, formatFileChangeSummaryLine } from "./edit-summary.js";
 import { keyText } from "./keybinding-hints.js";
 import { isFallbackPythonLabel, turnStepLabel } from "./step-label.js";
+import { omittedDiffText } from "./timeline-rows.js";
 import {
 	QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES,
 	quietConversationBudget,
@@ -48,12 +49,21 @@ export interface IPythonCellState {
 	cwd?: string;
 }
 
-interface DiffDisplay {
+interface DiffEditDisplay {
 	path: string;
 	oldStr: string;
 	newStr: string;
 	startLine?: number;
+	omitted?: undefined;
 }
+
+/** An edit whose texts the edit skill withheld (a credential store, or a text that looks like a secret). */
+interface DiffOmittedDisplay {
+	path: string;
+	omitted: "sensitive";
+}
+
+type DiffDisplay = DiffEditDisplay | DiffOmittedDisplay;
 
 interface SentAgentMessageDisplay {
 	id: string;
@@ -216,6 +226,9 @@ function readDiffDisplays(value: unknown): DiffDisplay[] | undefined {
 			return [];
 		}
 		const record = entry as Record<string, unknown>;
+		if (typeof record.path === "string" && record.omitted === "sensitive") {
+			return [{ path: record.path, omitted: "sensitive" }];
+		}
 		if (typeof record.path !== "string" || typeof record.oldStr !== "string" || typeof record.newStr !== "string") {
 			return [];
 		}
@@ -753,8 +766,15 @@ export class IPythonCellComponent implements Component {
 		const contentWidth = Math.max(1, width - indent.length);
 		let added = 0;
 		let removed = 0;
+		let withheld = false;
+		let shown = 0;
 		const rows: string[] = [];
-		edits.forEach((edit, index) => {
+		edits.forEach((edit) => {
+			if (edit.omitted) {
+				withheld = true;
+				return;
+			}
+			const index = shown++;
 			const { diff: diffText } = generateDiffString(edit.oldStr, edit.newStr, 4, edit.startLine ?? 1);
 			const counts = countChangedLines(diffText);
 			added += counts.added;
@@ -773,7 +793,10 @@ export class IPythonCellComponent implements Component {
 
 		// U6: no per-row expand hint - the global tail line owns the keys.
 		void showHint;
-		lines.push(formatFileChangeSummaryLine(path, this.state.cwd, { added, removed }, width));
+		const omitted = withheld ? omittedDiffText("sensitive") : undefined;
+		lines.push(
+			formatFileChangeSummaryLine(path, this.state.cwd, { added, removed, ...(omitted ? { omitted } : {}) }, width),
+		);
 
 		for (const row of rows) {
 			lines.push(row);

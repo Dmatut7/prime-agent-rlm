@@ -320,9 +320,9 @@ export interface KernelActivity {
 	endedAt?: number;
 	/**
 	 * A `bash()` command its cell left running. In that cell's record `status` stays `running`,
-	 * `endedAt` is the cell's end and `detail` says it moved to the background; its outcome later
-	 * arrives with the same id, `background: true` and `status` ok/error, in whichever cell is
-	 * running then (or the next one to start).
+	 * `background` is true and `endedAt` is the cell's end; its outcome later arrives with the
+	 * same id, `background: true` and `status` ok/error, in whichever cell is running then (or
+	 * the next one to start).
 	 */
 	background?: boolean;
 	/** Commit id a successful `git commit` (or cherry-pick, revert) command reported. */
@@ -347,13 +347,26 @@ export interface KernelCellEffects {
 }
 
 /** One file edit, captured from a {@link DIFF_DISPLAY_MIME} display payload. */
-export interface KernelDiffDisplay {
+export interface KernelDiffEdit {
 	path: string;
 	oldStr: string;
 	newStr: string;
 	/** 1-based line where `oldStr` begins in the file, for absolute line numbers. */
 	startLine?: number;
+	omitted?: undefined;
 }
+
+/**
+ * An edit the skill sent without its texts: the file is a credential store or a text looks like a
+ * secret, and the payload is saved with the session. Only the path is known, which is all
+ * compaction reads.
+ */
+export interface KernelDiffOmitted {
+	path: string;
+	omitted: "sensitive";
+}
+
+export type KernelDiffDisplay = KernelDiffEdit | KernelDiffOmitted;
 
 /** One media attachment, captured from an {@link ATTACHMENT_DISPLAY_MIME} display payload. */
 export interface KernelAttachment {
@@ -409,8 +422,15 @@ export function parseDiffDisplay(payload: unknown): KernelDiffDisplay | undefine
 	if (!isRecord(payload)) {
 		return undefined;
 	}
-	const { path, old_str: oldStr, new_str: newStr, start_line: startLine } = payload;
-	if (typeof path !== "string" || typeof oldStr !== "string" || typeof newStr !== "string") {
+	const { path, old_str: oldStr, new_str: newStr, start_line: startLine, omitted } = payload;
+	if (typeof path !== "string") {
+		return undefined;
+	}
+	// Whatever text rides next to the marker is dropped with it: a withheld edit never carries one on.
+	if (omitted === "sensitive") {
+		return { path, omitted };
+	}
+	if (typeof oldStr !== "string" || typeof newStr !== "string") {
 		return undefined;
 	}
 	return { path, oldStr, newStr, startLine: typeof startLine === "number" ? startLine : undefined };

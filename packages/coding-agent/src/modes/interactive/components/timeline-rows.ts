@@ -1159,6 +1159,8 @@ export interface TimelineFacts {
 	commitId?: string;
 	/** Some cell said its change lists are incomplete. */
 	trackingIncomplete: boolean;
+	/** No reply of the turn has text or a step: it produced nothing a reader sees. */
+	noOutput?: true;
 }
 
 export function timelineFacts(timeline: TurnTimeline, rows: readonly BoxRow[], ctx: RowBuildContext): TimelineFacts {
@@ -1185,6 +1187,7 @@ export function timelineFacts(timeline: TurnTimeline, rows: readonly BoxRow[], c
 			memories.push({ key: `mem:${step.toolCallId}:${change.id ?? index}`, change });
 		});
 	}
+	const hasOutput = timeline.entries.some((entry) => entry.kind === "message" && replyHasWork(entry.message));
 	return {
 		thinkCount: rows.filter((row) => row.kind === "think").length,
 		commandCount: rows.filter((row) => row.kind === "cmd").length,
@@ -1197,6 +1200,7 @@ export function timelineFacts(timeline: TurnTimeline, rows: readonly BoxRow[], c
 		memories,
 		...(commitId ? { commitId } : {}),
 		trackingIncomplete,
+		...(hasOutput ? {} : { noOutput: true as const }),
 	};
 }
 
@@ -1220,7 +1224,7 @@ export function summaryParts(facts: TimelineFacts): Array<{ text: string; color:
 	if (parts.length === 0 && facts.stepCount > 0)
 		parts.push([{ text: `做了 ${facts.stepCount} 步`, color: "activityText" }]);
 	if (facts.errorCount > 0) parts.push([{ text: `${facts.errorCount} 处出错`, color: "error" }]);
-	if (parts.length === 0) parts.push([{ text: "直接回答了", color: "muted" }]);
+	if (parts.length === 0) parts.push([{ text: facts.noOutput ? "（这轮没有输出）" : "直接回答了", color: "muted" }]);
 	if (facts.trackingIncomplete) parts.at(-1)?.push({ text: " （有些改动没记全）", color: "dim" });
 	return parts;
 }

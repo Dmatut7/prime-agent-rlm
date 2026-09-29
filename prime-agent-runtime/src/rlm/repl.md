@@ -300,8 +300,19 @@ deleted in the same cell.
   later edits of that entry in the same cell stay withheld. An activity's
   `detail` (a command's latest or final output line, for example from `cat
   .env` or `echo $API_KEY`) gets the same scan; a `detail` that looks like a
-  credential is left out of the record rather than sent. The scan runs only
-  over the capped text and treats its own failure as a secret.
+  credential is left out of the record rather than sent. A step's `label` (the
+  command line or task text) is scanned too, as it will be shown (blanks
+  collapsed) and a little past the part that shows, so a key the length limit
+  would cut is still seen whole; a label that looks like a credential reads as
+  the step's kind (`command`, for example). The scan runs only over the capped
+  text and treats its own failure as a secret. It cannot tell a real
+  credential from a value shaped like one, so ordinary code is withheld too: a
+  test fixture such as `API_KEY = "test-1234567890abcdef"` or a JWT-shaped
+  sample token on any line of a file's diff (changed lines and their context)
+  leaves that file's record with line counts only and
+  `diffOmitted: "sensitive"`. That is deliberate: a diff withheld by mistake
+  costs a look at the file, a credential saved with the session cannot be
+  recalled.
 - The session's own folder (`RLM_SESSION_DIR`: subagent folders, artifacts) is
   never reported, and harness saves appear only as memory records, not as a
   change of the harness state file, even when a command ran in the same cell.
@@ -334,14 +345,20 @@ deleted in the same cell.
   before its `done` or handed off like this, never after `done`. At most 64
   outcomes wait for the next cell; past that the oldest are dropped and that
   cell's `change-tracking` record says how many were lost.
-- Files such a command changes after its cell ended are not lost. The cell that
-  leaves a command running keeps the state its final comparison ended on; when
-  the command ends while no cell runs, a worker compares against that state
-  right away (one cell budget, never on a cell's thread, never delaying a cell's
-  start) and the changes are listed in the next cell, next to the command's
-  outcome, or in the cell that started meanwhile. A comparison that runs out of
-  time says so in that cell's `change-tracking` record. A command still running
-  when the next cell starts is covered by that cell's own snapshot, as before.
+- What a command left running changes between its cell's end and the next
+  cell's start can go unlisted: it is listed only if some background command
+  ends in that gap. The cell that leaves a command running keeps the state its
+  final comparison ended on; when a command ends while no cell runs, a worker
+  compares against that state right away (one cell budget, never on a cell's
+  thread, never delaying a cell's start), which covers every change since, and
+  the changes are listed in the next cell, next to the command's outcome, or in
+  the cell that started meanwhile. A comparison that runs out of time says so in
+  that cell's `change-tracking` record. When no command ends in the gap, a
+  command still running when the next cell starts is covered by that cell's own
+  snapshot, which is taken once that cell has started and becomes its starting
+  state: what the command wrote in the gap (and in the first moments of that
+  cell, before the snapshot ran) is listed in no cell, and the `change-tracking`
+  record does not say so. What it writes while that cell runs is listed there.
 - A command that succeeds and whose output carries git's commit line
   (`[main 1a2b3c4] subject`, `[main (root-commit) 1a2b3c4]`,
   `[detached HEAD 1a2b3c4]`, also from cherry-pick and revert) adds `commit`

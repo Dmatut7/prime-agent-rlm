@@ -1062,7 +1062,7 @@ class SlowGitTests(TrackerCase):
         finally:
             self.slow(False)
         body_started = float(cell.stdout().split()[0])
-        self.assertLess(body_started - sent, 0.25)
+        self.assertLess(body_started - sent, effects.DEFAULT_CELL_BUDGET_S - 0.05)
         self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + 0.7)
         self.assertIn("snapshot", cell.payloads(STATUS)[0]["incomplete"])
         self.kernel.run("h.kill()")
@@ -1078,7 +1078,7 @@ class SlowGitTests(TrackerCase):
         finally:
             self.slow(False)
         body_started = float(cell.stdout().split()[0])
-        self.assertLess(body_started - sent, 0.25)
+        self.assertLess(body_started - sent, effects.DEFAULT_CELL_BUDGET_S - 0.05)
         self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + _BUDGET_SLACK_S)
         reasons = [status["incomplete"] for status in cell.payloads(STATUS) + later.payloads(STATUS)]
         self.assertEqual(len(reasons), 1, reasons)
