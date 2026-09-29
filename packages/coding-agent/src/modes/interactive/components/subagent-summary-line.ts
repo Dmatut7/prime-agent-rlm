@@ -435,6 +435,16 @@ function rightMarkerText(hidden: number): string {
 	return `还有 ${hidden} 个 ›`;
 }
 
+/** The narrowest cut of `text` that still shows its first character (with the cut mark when more follows). */
+function minCutWidth(text: string): number {
+	const full = visibleWidth(text);
+	for (let width = 1; width < full; width++) {
+		const cut = truncateToWidth(text, width, "…");
+		if (cut !== "" && cut !== "…") return width;
+	}
+	return full;
+}
+
 /**
  * The subagent strip under the prompt: one row of small blocks, one per child,
  * ` ◇ review 运行中 `, in most-relevant-first order. When they do not all fit the
@@ -713,15 +723,21 @@ export class SubagentSummaryLine implements Component, Focusable {
 		this.windowStart = Math.max(0, Math.min(maxStart, this.windowStart));
 		const start = this.windowStart;
 		const count = this.fitCount(start, safeWidth);
-		const end = start + count;
 		this.layout = { width: safeWidth, start, count, maxStart };
 		const onWheel = (direction: -1 | 1): boolean => this.wheel(direction);
 		const regions: ClickRegion[] = [];
 		const room = (used: number): number => Math.max(1, safeWidth - used);
 
+		// A block always says at least the first character of its name: on a screen too narrow for that
+		// beside the `‹` marker the marker steps aside, and on one too narrow for it at all the block is left to the `›` marker.
+		const firstItem = items[start];
+		const minFirst = firstItem ? this.minChipWidth(firstItem) : 0;
 		let line = " ".repeat(Math.min(STRIP_INDENT, safeWidth));
 		let col = visibleWidth(line);
-		if (start > 0) {
+		const leftSpan = start > 0 ? visibleWidth(leftMarkerText(start)) + CHIP_GAP : 0;
+		const showLeft = start > 0 && safeWidth - col - leftSpan >= minFirst;
+		const end = safeWidth - col - (showLeft ? leftSpan : 0) >= minFirst ? start + count : start;
+		if (showLeft) {
 			const marker = leftMarkerText(start);
 			const markerWidth = visibleWidth(marker);
 			regions.push({
@@ -888,12 +904,14 @@ export class SubagentSummaryLine implements Component, Focusable {
 			);
 		let chip = build(nameMax, true);
 		if (chip.width > maxWidth) {
-			chip = build(Math.max(1, nameMax - (chip.width - maxWidth)), true);
-		}
-		if (chip.width > maxWidth) chip = build(Math.max(1, nameMax - (chip.width - maxWidth)), false);
-		if (chip.width > maxWidth) {
-			const text = truncateToWidth(theme.bg(bg, ` ${glyph} `), Math.max(1, maxWidth), "");
-			return { text, width: visibleWidth(text) };
+			// Name width first, down to its first character; the state word goes only when that is not enough.
+			const floor = minCutWidth(item.name);
+			const frame = visibleWidth(` ${orphan ? "⚠" : "◇"}  `);
+			const withState = maxWidth - frame - visibleWidth(` ${stateWord}`);
+			const bare = maxWidth - frame;
+			if (withState >= floor) chip = build(Math.min(nameMax, withState), true);
+			else if (bare >= floor) chip = build(Math.min(nameMax, bare), false);
+			else return { text: "", width: 0 };
 		}
 		return chip;
 	}
@@ -905,6 +923,13 @@ export class SubagentSummaryLine implements Component, Focusable {
 		if (this.counts.idle > 0) parts.push({ text: `空闲 ${this.counts.idle}`, color: "warning" });
 		if (this.counts.inactive > 0) parts.push({ text: `收口 ${this.counts.inactive}`, color: "dim" });
 		return parts;
+	}
+
+	/** The least a block can be cut to and still name its child. */
+	private minChipWidth(item: StripItem): number {
+		const glyph = item.kind === "orphan" ? "⚠" : "◇";
+		const label = item.kind === "counts" ? `子代理 ${this.counts.total}` : item.name;
+		return visibleWidth(` ${glyph}  `) + minCutWidth(label);
 	}
 
 	/** A block's width, from its plain text: the layout needs it without touching the theme. */
