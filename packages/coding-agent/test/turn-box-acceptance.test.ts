@@ -535,11 +535,13 @@ describe("opened change and memory rows", () => {
 		expect(minus).toBeGreaterThan(by);
 	});
 
-	it("F6: a memory row opens only when there is text to show", () => {
+	it("F6: a memory row with no text shows only the facts of its step when opened, not made-up texts", () => {
 		const bare = changeTurn({});
-		const before = openBox(bare);
-		expect(bare.summary.activate("mem:e1:0")).toBe(false);
-		expect(text(bare.summary.render(120))).toBe(before);
+		openBox(bare);
+		expect(bare.summary.activate("mem:e1:0")).toBe(true);
+		const facts = text(bare.summary.render(120));
+		expect(facts).toContain("结果");
+		expect(facts).not.toContain("新记的");
 
 		const withText = changeTurn({ after: "带上 context。" });
 		openBox(withText);
@@ -736,7 +738,7 @@ describe("keys", () => {
 		expect(cell.setEditDiffsExpanded).toHaveBeenLastCalledWith(true);
 	});
 
-	it("the walk's hint offers Enter only on a target Enter opens", () => {
+	it("the walk's hint says what Enter does on the focused target, and nothing before there is one", () => {
 		expect(turnBoxFocusHints().join(" ")).not.toContain("Enter");
 		const turn = quietTurn({ live: false });
 		addStep(turn, "c1", "await bash('npm test')");
@@ -761,7 +763,8 @@ describe("keys", () => {
 		mode.boxFocus = { summary: turn.summary, navigator: {}, resumeFollow: false };
 		turn.timeline.ui.focused = true;
 		turn.timeline.ui.focusKey = rowKey;
-		expect(mode.getTrayHints().join(" ")).not.toContain("Enter");
+		// Every block opens (one with no lines of its own opens to the facts of its step).
+		expect(mode.getTrayHints().join(" ")).toContain("Enter 展开");
 		turn.timeline.ui.focusKey = "header";
 		expect(mode.getTrayHints().join(" ")).toContain("Enter 收起");
 	});

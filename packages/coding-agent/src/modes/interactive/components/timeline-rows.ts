@@ -76,6 +76,12 @@ export interface BoxRow {
 	detail?: (width: number) => string[];
 	/** A note's whole text: when it fits in a few lines the box shows it as plain text instead of a block. */
 	fullText?: string;
+	/** When the row's step ended, if known (with `startedAt`, the opened row says how long it took). */
+	endedAt?: number;
+	/** What the opened row says about the step's output (`没有输出`). */
+	outputNote?: string;
+	/** `detail` was made from the row's own facts, so it has nothing more to say than the row itself. */
+	factsOnly?: true;
 	/** Stays visible when the box folds (failures). */
 	persistent?: boolean;
 	/** Files a merged read row covers. */
@@ -450,7 +456,11 @@ function activityRow(stepId: string, activity: KernelActivity, timeline: TurnTim
 	const label = sanitizeDisplayText(activity.label).replace(/\s+/g, " ").trim();
 	const result = activity.detail ? localizeResultDetail(activity.detail) : undefined;
 	const running = activity.status === "running";
-	const base = { key, startedAt: activity.startedAt || undefined };
+	const base = {
+		key,
+		startedAt: activity.startedAt || undefined,
+		...(activity.endedAt ? { endedAt: activity.endedAt } : {}),
+	};
 	switch (activity.kind) {
 		case "command": {
 			const tail = running && activity.detail ? sanitizeDisplayText(activity.detail).trim() : undefined;
@@ -579,6 +589,7 @@ function fallbackRows(
 				...(startedAt !== undefined ? { startedAt } : {}),
 				...(tail ? { sub: tail } : {}),
 				...(outputDetail ? { detail: outputDetail } : {}),
+				...(outputDetail || tail ? {} : { outputNote: running ? "还没有输出" : "没有输出" }),
 			},
 		];
 	}
@@ -643,6 +654,12 @@ function fallbackRows(
 			...(outputDetail ? { detail: outputDetail } : {}),
 		},
 	];
+}
+
+/** What an opened command with no output of its own says: it printed nothing (yet). */
+function withOutputNote(row: BoxRow): BoxRow {
+	if (row.kind !== "cmd" || row.sub) return row;
+	return { ...row, outputNote: row.status === "running" ? "还没有输出" : "没有输出" };
 }
 
 /** `2 个已交回`: the turn's subagents that finished, for a step that checked on them. */
@@ -716,7 +733,12 @@ function stepRows(step: RowStep, timeline: TurnTimeline, ctx: RowBuildContext, o
 		const row = activityRow(step.toolCallId, activity, timeline, ctx);
 		// Still running although the cell (or the turn) is over: it runs on in the background.
 		const background = unfinished && (activity.background === true || !running || !ctx.live);
-		items.push({ time: activity.startedAt, order: index++, rows: [background ? backgroundRow(row) : row] });
+		const printedNothing = !data.outputText?.trim() && !activity.detail?.trim();
+		items.push({
+			time: activity.startedAt,
+			order: index++,
+			rows: [background ? backgroundRow(row) : printedNothing ? withOutputNote(row) : row],
+		});
 	}
 	for (const change of aggregateChanges([{ data, toolName: step.toolName, order }], ctx.cwd)) {
 		items.push({
@@ -917,6 +939,7 @@ function eventRow(entry: TimelineEntry, ctx: RowBuildContext): BoxRow | undefine
 			return {
 				key: entry.key,
 				kind: "retry",
+				startedAt: retry.startedAt,
 				status:
 					retry.outcome === undefined && !ctx.stopped ? "running" : retry.outcome === "failed" ? "failed" : "done",
 				glyph: "↻",
@@ -952,6 +975,7 @@ function eventRow(entry: TimelineEntry, ctx: RowBuildContext): BoxRow | undefine
 				textColor: compaction.failed && !skipped ? "runCardWarn" : "muted",
 				meta: [],
 				startedAt: compaction.startedAt,
+				...(compaction.endedAt ? { endedAt: compaction.endedAt } : {}),
 			};
 		}
 		case "subagent": {
@@ -974,6 +998,7 @@ function eventRow(entry: TimelineEntry, ctx: RowBuildContext): BoxRow | undefine
 						? failMeta(sub.result)
 						: okMeta(sub.result ? truncateToWidth(sub.result, 36, "…") : undefined),
 				startedAt: sub.startedAt,
+				...(sub.endedAt ? { endedAt: sub.endedAt } : {}),
 				...(running && sub.line ? { sub: sub.line } : {}),
 				...(report?.trim() ? { detail: (width: number) => wrapped(report, width, "muted") } : {}),
 			};
@@ -990,6 +1015,7 @@ function eventRow(entry: TimelineEntry, ctx: RowBuildContext): BoxRow | undefine
 				text: notice.text,
 				textColor: color,
 				meta: [],
+				...(entry.at > 0 ? { startedAt: entry.at } : {}),
 				...(notice.tone === "error" ? { persistent: true } : {}),
 				...(notice.detail ? { detail: (width: number) => wrapped(notice.detail ?? "", width, "muted") } : {}),
 			};
@@ -1047,6 +1073,43 @@ function mergeReads(rows: BoxRow[]): BoxRow[] {
 		}
 		return { ...row, text: `读取 ${files[0] ?? row.text}` };
 	});
+}
+
+/** `14:13:22` in the reader's own time zone. */
+function clockText(ms: number): string {
+	return new Date(ms).toTimeString().slice(0, 8);
+}
+
+/**
+ * What a block with no lines of its own opens to: the step's whole text (the row
+ * cuts it), what its right side says, when it happened and how long it took, and
+ * whether the command printed anything. Only what the row already knows.
+ */
+function factsDetail(row: BoxRow, now: number): (width: number) => string[] {
+	const gap = row.text && row.keyword && !row.keyword.endsWith("：") ? " " : "";
+	const whole = sanitizeDisplayText(`${row.keyword ?? ""}${gap}${row.text}`)
+		.replace(/\s+/g, " ")
+		.trim();
+	const started = row.startedAt !== undefined && row.startedAt > 0 ? row.startedAt : undefined;
+	const took =
+		started === undefined
+			? undefined
+			: row.endedAt !== undefined && row.endedAt >= started
+				? `用了 ${row.endedAt - started < 1000 ? "不到 1秒" : formatBoxDuration(row.endedAt - started)}`
+				: row.status === "running"
+					? `已跑 ${formatBoxDuration(Math.max(0, now - started))}`
+					: undefined;
+	return (width) => {
+		const lines = whole ? wrapped(whole, width, "activityText") : [];
+		if (row.meta.length > 0) {
+			lines.push(`${theme.fg("dim", "结果  ")}${row.meta.map((part) => theme.fg(part.color, part.text)).join("")}`);
+		}
+		if (started !== undefined) {
+			lines.push(theme.fg("dim", `时间  ${clockText(started)}${took ? ` · ${took}` : ""}`));
+		}
+		if (row.outputNote) lines.push(theme.fg("dim", row.outputNote));
+		return lines.length > 0 ? lines : [theme.fg("dim", "没有更多内容")];
+	};
 }
 
 /**
@@ -1151,9 +1214,15 @@ export function buildTimelineRows(timeline: TurnTimeline, baseCtx: RowBuildConte
 	const merged = mergeReads(rows);
 	const settled = ctx.stopped ? merged.map((row) => (row.status === "running" ? stoppedRow(row) : row)) : merged;
 	// A mistake a turn that went fine corrected no longer hangs outside the folded box: its header says so.
-	return endedWell(timeline, ctx)
-		? settled.map((row) => (row.kind === "error" && row.persistent ? { ...row, persistent: false } : row))
-		: settled;
+	const recovered = endedWell(timeline, ctx);
+	// Every block opens: one with no lines of its own opens to the facts of its step. A note
+	// (its whole text is on the row) is not a block and stays as it is.
+	return settled.map((row) => {
+		const shown = recovered && row.kind === "error" && row.persistent ? { ...row, persistent: false } : row;
+		return shown.detail === undefined && shown.fullText === undefined
+			? { ...shown, detail: factsDetail(shown, ctx.now), factsOnly: true as const }
+			: shown;
+	});
 }
 
 /** The facts a finished box's header and the change strip say. */

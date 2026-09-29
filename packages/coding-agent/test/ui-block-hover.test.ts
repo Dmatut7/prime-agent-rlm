@@ -83,19 +83,16 @@ describe("a block tells the pointer layer who it is", () => {
 		expect(keyOf(other.turn, other.at)).not.toBe(first);
 	});
 
-	it("gives what hangs under a block, a note and a block with nothing to open no hover fields", () => {
+	it("gives what hangs under a block and a note no hover fields", () => {
 		setMotionReduced(true);
 		const turn = quietTurn();
 		addSay(turn, "趁等待，查一个风险点。", "s1");
-		addActivities(turn, "r1", [{ id: "a", kind: "read", label: "README.md", status: "ok", startedAt: 1 }]);
 		addCommand(turn, "c1", "git status", { output: "clean\nmore" });
 		turn.timeline.ui.toggleRow(CMD_KEY);
 		const lines = turn.summary.render(WIDTH);
 		const shown = plain(lines);
 		const passiveLines = [
 			lineIndexWith(lines, "趁等待"),
-			lineIndexWith(lines, "读取 README.md"),
-			lineIndexWith(lines, "读取 README.md") + 1,
 			shown.findIndex((line) => line.includes("▎") && line.includes("clean")),
 		];
 		expect(passiveLines.every((line) => line > 0)).toBe(true);
@@ -214,7 +211,7 @@ describe("the keyboard's selection looks like the pointer's", () => {
 		expect((lit[at] ?? "").includes(theme.fg("kindCommand", "▸"))).toBe(true);
 	});
 
-	it("lights a selected block that has nothing to open, without promising a click", () => {
+	it("lights a selected block that only has the facts of its step to open, with the same hint", () => {
 		setMotionReduced(true);
 		const turn = quietTurn();
 		addActivities(turn, "r1", [{ id: "a", kind: "read", label: "README.md", status: "ok", startedAt: 1 }]);
@@ -224,7 +221,7 @@ describe("the keyboard's selection looks like the pointer's", () => {
 		const lines = turn.summary.render(WIDTH);
 		const at = lineIndexWith(lines, "读取 README.md");
 		expect(hasBg(lines[at] ?? "", "kindReadHoverBg")).toBe(true);
-		expect(plain(lines)[at]).not.toContain("点开");
+		expect(plain(lines)[at]).toContain("点开 ▸");
 	});
 });
 

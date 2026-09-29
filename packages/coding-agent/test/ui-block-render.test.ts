@@ -257,16 +257,16 @@ describe("every step is a block in its kind's color", () => {
 		expect(hasBg(block, "kindCommandBg")).toBe(true);
 	});
 
-	it("still makes a block of a row with nothing to open, but a block that cannot be clicked", () => {
+	it("makes a block that can be clicked of a row with no lines of its own", () => {
 		setMotionReduced(true);
 		const turn = quietTurn();
 		addActivities(turn, "r1", [{ id: "a", kind: "read", label: "README.md", status: "ok", startedAt: 1 }]);
 		const lines = turn.summary.render(WIDTH);
 		const at = lineIndexWith(lines, "读取 README.md");
 		expect(hasBg(lines[at] ?? "", "kindReadBg")).toBe(true);
-		expect(plain(lines)[at]).not.toContain("▸");
-		expect(clickableOn(turn, at)).toBeUndefined();
-		expect(clickableOn(turn, at + 1)).toBeUndefined();
+		expect(plain(lines)[at]).toContain("▸");
+		expect(clickableOn(turn, at)).toBeDefined();
+		expect(clickableOn(turn, at + 1)).toBeDefined();
 	});
 });
 

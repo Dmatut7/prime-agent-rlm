@@ -775,7 +775,9 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	/** Ctrl+T in the quiet conversation: open every thinking row of this turn, or close them all. */
 	toggleThinkingRows(): void {
 		const ui = this.turnState.timeline.ui;
-		const thinking = this.turnState.boxView().rows.filter((row) => row.kind === "think" && row.detail);
+		const thinking = this.turnState
+			.boxView()
+			.rows.filter((row) => row.kind === "think" && row.detail && !row.factsOnly);
 		this.setThinkingRows(
 			thinking.length > 0 ? thinking.some((row) => !ui.expanded.has(row.key)) : !this.turnState.thinkingExpanded,
 		);
@@ -786,7 +788,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		const ui = this.turnState.timeline.ui;
 		const now = Date.now();
 		for (const row of this.turnState.boxView().rows) {
-			if (row.kind !== "think" || !row.detail) continue;
+			if (row.kind !== "think" || !row.detail || row.factsOnly) continue;
 			if (open) {
 				ui.expanded.add(row.key);
 				ui.expandedAt.set(row.key, now);
