@@ -38,12 +38,13 @@ function pinned(turn: QuietTurn) {
 const hint = (rows: readonly string[]): string => stripAnsi(rows[1] ?? "");
 
 describe("an open box offers its header to the window", () => {
-	it("says where the header row and the box's last row are in its own output", () => {
+	it("says where the box's first row (its top rule, just above the header row) and its last row are in its own output", () => {
 		const turn = openTurn(6);
 		const lines = turn.summary.render(WIDTH);
 		const header = pinned(turn);
-		expect(header.line).toBe(headerIndex(lines));
+		expect(header.line).toBe(headerIndex(lines) - 1);
 		expect(header.line).toBeGreaterThan(0);
+		expect(plain(lines)[header.line]).toMatch(/^ ╭─+╮$/);
 		expect(header.endLine).toBe(lines.length - 1);
 		expect(plain(lines)[header.endLine]).toMatch(/^ ╰─+╯$/);
 	});
@@ -54,7 +55,7 @@ describe("an open box offers its header to the window", () => {
 		turn.summary.setLeadingBlank(true);
 		const lines = turn.summary.render(WIDTH);
 		const header = pinned(turn);
-		expect(header.line).toBe(headerIndex(lines));
+		expect(header.line).toBe(headerIndex(lines) - 1);
 		expect(plain(lines)[0]).toBe("");
 		expect(header.endLine).toBe(lines.length - 1);
 	});
@@ -130,7 +131,8 @@ describe("what the pinned rows say", () => {
 	it("puts a faint hint under it, inside the frame, that says what is out of sight and that a click folds the box", () => {
 		const turn = openTurn(12);
 		turn.summary.render(WIDTH);
-		const rows = pinned(turn).render(7);
+		// The window's top is 7 rows under the header row, 8 under the top rule the pin counts from.
+		const rows = pinned(turn).render(8);
 		expect(hint(rows)).toMatch(/^ │ ↑ 前面还有 4 步，往上滚就能看到 · 点框头可收起 +│$/);
 		expect(visibleWidth(rows[1] ?? "")).toBe(WIDTH);
 	});
@@ -139,10 +141,11 @@ describe("what the pinned rows say", () => {
 		const turn = openTurn(10);
 		turn.summary.render(WIDTH);
 		const header = pinned(turn);
-		// A block is two lines and the first one starts two lines under the header: it counts once the
-		// window's top is past the header (or the pinned rows cover it).
-		const counts = [0, 1, 2, 3, 4, 9, 10, 40].map((past) => {
-			const match = /前面还有 (\d+) 步/.exec(hint(header.render(past)));
+		// A block is two lines and the first one starts two lines under the header row: it counts once the
+		// window's top is past the header (or the pinned rows cover it). The pin counts rows from the top
+		// rule, one above the header row.
+		const counts = [0, 1, 2, 3, 4, 9, 10, 40].map((below) => {
+			const match = /前面还有 (\d+) 步/.exec(hint(header.render(below + 1)));
 			return match ? Number(match[1]) : 0;
 		});
 		expect(counts).toEqual([0, 1, 1, 2, 2, 5, 5, 10]);
@@ -202,7 +205,7 @@ describe("a click on the pinned header", () => {
 		expect(region?.line).toBe(0);
 		expect(region?.height).toBe(1);
 		expect(region?.col).toBe(0);
-		const inPlace = turn.summary.getClickRegions().find((candidate) => candidate.line === header.line);
+		const inPlace = turn.summary.getClickRegions().find((candidate) => candidate.line === header.line + 1);
 		expect(inPlace?.hoverKey).toBeDefined();
 		expect(region?.hoverKey).toBe(inPlace?.hoverKey);
 	});
@@ -232,7 +235,7 @@ describe("steps the window has to see", () => {
 		for (let index = 0; index < 20; index++) addStep(turn, `s${index}`, `await bash('echo ${index}')`);
 		const lines = turn.summary.render(WIDTH);
 		const header = pinned(turn);
-		expect(header.line).toBe(headerIndex(lines));
+		expect(header.line).toBe(headerIndex(lines) - 1);
 		const shown = plain(lines).filter((line) => /\$ echo/.test(line)).length;
 		expect(shown).toBeLessThan(20);
 		expect(hint(header.render(400))).toContain(`前面还有 ${shown} 步`);

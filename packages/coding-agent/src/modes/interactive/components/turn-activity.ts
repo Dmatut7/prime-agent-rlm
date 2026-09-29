@@ -710,6 +710,7 @@ const PINNED_ROWS = 2;
 
 /** An open box's header as the last render drew it, in the component's own line numbers. */
 interface PinnedHeader {
+	/** The box's first row (its top rule): a folded box starts on this row, so a click that folds it from the pin lands there. */
 	line: number;
 	endLine: number;
 	headerText: string;
@@ -788,7 +789,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 				line: pinned.line,
 				endLine: pinned.endLine,
 				render: (scrolledPast) => {
-					// The pinned rows cover the two rows at the window's top: every block that starts above them is out of sight.
+					// The window's top row is `line + scrolledPast`; the pinned rows cover it and the row under it, so every block that starts above them is out of sight.
 					const covered = pinned.line + Math.max(0, scrolledPast) + PINNED_ROWS;
 					const hiddenSteps = pinned.blockLines.filter((line) => line < covered).length;
 					return [
@@ -1026,7 +1027,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		this.pinned =
 			state.boxOpen && headerRegion
 				? {
-						line: above.length + box.header.line,
+						line: above.length + box.header.line - (box.framed ? 1 : 0),
 						endLine: above.length + box.lines.length - 1,
 						headerText: box.header.text,
 						blockLines: box.blockHeads.map((line) => line + above.length),
