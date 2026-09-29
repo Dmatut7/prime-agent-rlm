@@ -17,6 +17,8 @@ import test_effects as te  # noqa: E402
 from rlm import effects  # noqa: E402
 
 _PASSWORD = "hunter2" + "passw0rd" + "ZQ"
+_SK_KEY = "sk-" + "ws-H." + "TITLEKEY" + "q" * 20
+_OLD_SK_KEY = "sk-" + "ws-H." + "OLDTITLE" + "r" * 20
 
 
 def _anywhere(cell: te.Cell, *needles: str) -> list[str]:
@@ -132,6 +134,96 @@ class MemoryScanBeforeCutTests(te.TrackerCase):
         self.assertNotIn("before", memory[0])
         self.assertNotIn("after", memory[0])
         self.assertEqual(_anywhere(cell, _PASSWORD[:10]), [])
+
+
+class MemoryTitleScanTests(te.TrackerCase):
+    """review2-2: the title and previous title of a memory record are display text saved with the session too."""
+
+    use_git = False
+
+    def _run_memory(self, code: str) -> te.Cell:
+        cell = self.kernel.run(code)
+        self.assertEqual(cell.status, "ok", cell.error())
+        return cell
+
+    def assert_accepted_title(self, record: dict) -> None:
+        self.assertIsInstance(record["title"], str)
+        self.assertTrue(record["title"], record)
+
+    def test_a_new_entry_with_a_key_in_its_title_shows_its_id_and_no_texts(self):
+        cell = self._run_memory(f"_ = rlm.harness.create_memory('deploy with {_SK_KEY}', 'body text', id='deploy-notes')")
+        record = cell.memory()[("memory", "session", "deploy-notes")]
+        self.assertEqual((record["op"], record["title"], record.get("textOmitted")), ("created", "deploy-notes", effects.SENSITIVE))
+        self.assertNotIn("before", record)
+        self.assertNotIn("after", record)
+        self.assert_accepted_title(record)
+        self.assertEqual(_anywhere(cell, _SK_KEY, _SK_KEY[:16], "body text"), [])
+
+    def test_a_rename_to_a_title_with_a_key_shows_the_id_and_no_texts(self):
+        self._run_memory("_ = rlm.harness.create_memory('Deploy steps', 'use make deploy', id='deploy-notes')")
+        cell = self._run_memory(f"_ = rlm.harness.update_memory('deploy-notes', 'deploy with {_SK_KEY}', 'use make ship')")
+        record = cell.memory()[("memory", "session", "deploy-notes")]
+        self.assertEqual((record["op"], record["title"], record.get("textOmitted")), ("updated", "deploy-notes", effects.SENSITIVE))
+        self.assertEqual(record["previousTitle"], "Deploy steps")
+        self.assertNotIn("before", record)
+        self.assertNotIn("after", record)
+        self.assert_accepted_title(record)
+        self.assertEqual(_anywhere(cell, _SK_KEY, _SK_KEY[:16], "use make"), [])
+
+    def test_a_rename_away_from_a_title_with_a_key_drops_the_previous_title_and_the_texts(self):
+        first = self._run_memory(f"_ = rlm.harness.create_memory('deploy with {_OLD_SK_KEY}', 'old body', id='deploy-notes')")
+        self.assertEqual(_anywhere(first, _OLD_SK_KEY, _OLD_SK_KEY[:16]), [])
+        cell = self._run_memory("_ = rlm.harness.update_memory('deploy-notes', 'Deploy steps', 'new body')")
+        record = cell.memory()[("memory", "session", "deploy-notes")]
+        self.assertEqual((record["op"], record["title"], record.get("textOmitted")), ("updated", "Deploy steps", effects.SENSITIVE))
+        self.assertNotIn("previousTitle", record)
+        self.assertNotIn("before", record)
+        self.assertNotIn("after", record)
+        self.assertEqual(_anywhere(cell, _OLD_SK_KEY, _OLD_SK_KEY[:16], "old body", "new body"), [])
+
+    def test_a_deleted_entry_with_a_key_in_its_title_is_withheld_too(self):
+        self._run_memory("_ = rlm.harness.create_memory('Notes', 'body text', id='deploy-notes')")
+        self._run_memory(f"_ = rlm.harness.update_memory('deploy-notes', 'deploy with {_SK_KEY}', 'body text')")
+        cell = self._run_memory("_ = rlm.harness.delete_memory('deploy-notes')")
+        record = cell.memory()[("memory", "session", "deploy-notes")]
+        self.assertEqual((record["op"], record["title"], record.get("textOmitted")), ("deleted", "deploy-notes", effects.SENSITIVE))
+        self.assertEqual(_anywhere(cell, _SK_KEY, _SK_KEY[:16]), [])
+
+    def test_an_id_that_looks_like_a_key_too_leaves_the_kind_as_the_title(self):
+        # The id is the entry's identity for the host and is not rewritten; only the title is display text.
+        cell = self._run_memory(
+            f"_ = rlm.harness.create_memory('deploy with {_SK_KEY}', 'body text', id='{_OLD_SK_KEY}')"
+        )
+        record = cell.memory()[("memory", "session", _OLD_SK_KEY)]
+        self.assertEqual((record["title"], record.get("textOmitted")), ("memory", effects.SENSITIVE))
+        self.assertNotIn("before", record)
+        self.assertNotIn("after", record)
+        self.assertEqual(_anywhere(cell, _SK_KEY, _SK_KEY[:16]), [])
+
+    def test_a_title_the_harness_turned_into_the_id_shows_the_kind(self):
+        # No id given: the harness derives one from the title (lower-cased, punctuation flattened), which
+        # holds the same characters, so it is no better a title than the title itself.
+        cell = self._run_memory(f"_ = rlm.harness.create_memory('deploy with {_SK_KEY}', 'body text')")
+        record = next(record for key, record in cell.memory().items() if key[0] == "memory")
+        self.assertEqual((record["title"], record.get("textOmitted")), ("memory", effects.SENSITIVE))
+        self.assertNotIn("before", record)
+        self.assertNotIn("after", record)
+        self.assertEqual(_anywhere(cell, _SK_KEY, _SK_KEY[:16], "body text"), [])
+
+    def test_a_prompt_note_title_is_scanned_like_a_memory_title(self):
+        cell = self._run_memory(f"_ = rlm.harness.create_prompt_note('tone {_SK_KEY}', 'be brief', id='note-1')")
+        record = cell.memory()[("prompt_note", "session", "note-1")]
+        self.assertEqual((record["title"], record.get("textOmitted")), ("note-1", effects.SENSITIVE))
+        self.assertEqual(_anywhere(cell, _SK_KEY, _SK_KEY[:16], "be brief"), [])
+
+    def test_ordinary_titles_texts_and_renames_are_sent_as_before(self):
+        self._run_memory("_ = rlm.harness.create_memory('Deploy steps', 'use make deploy', id='deploy-notes')")
+        cell = self._run_memory("_ = rlm.harness.update_memory('deploy-notes', 'Deploy steps v2', 'use make ship')")
+        record = cell.memory()[("memory", "session", "deploy-notes")]
+        self.assertEqual(record["title"], "Deploy steps v2")
+        self.assertEqual(record["previousTitle"], "Deploy steps")
+        self.assertEqual((record["before"], record["after"]), ("use make deploy", "use make ship"))
+        self.assertNotIn("textOmitted", record)
 
 
 if __name__ == "__main__":

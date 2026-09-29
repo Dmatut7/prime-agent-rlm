@@ -309,8 +309,26 @@ def _memory_text(text: str) -> tuple[str, bool]:
     return _clip(text, MAX_MEMORY_TEXT), _looks_secret(text[:_MEMORY_SCAN_CHARS])
 
 
+def _alnum(text: str) -> str:
+    return "".join(char for char in text.lower() if char.isalnum())
+
+
 def _withhold_memory_texts(record: dict[str, Any], withheld: bool = False) -> None:
-    """Drop both texts of a memory record when either holds a likely credential (or `withheld` says so)."""
+    """Drop both texts of a memory record when either holds a likely credential (or `withheld` says so).
+
+    A title that holds one counts the same and shows the entry's id instead (its kind when the id looks like
+    a credential too, or is the title's own slug, which the harness makes when no id is given); a previous
+    title that holds one is left out.
+    """
+    if _looks_secret(record.get("previousTitle")):
+        record.pop("previousTitle")
+        withheld = True
+    title = record.get("title")
+    if _looks_secret(title):
+        entry_id = record.get("id")
+        own_id = bool(entry_id) and not _looks_secret(entry_id) and not _alnum(title).startswith(_alnum(entry_id))
+        record["title"] = entry_id if own_id else record["kind"]
+        withheld = True
     if withheld or _looks_secret(record.get("before")) or _looks_secret(record.get("after")):
         record.pop("before", None)
         record.pop("after", None)
