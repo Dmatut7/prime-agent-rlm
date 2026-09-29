@@ -363,11 +363,10 @@ const PARTIAL_PASTE_MARKER_REGEX = /^\x1b(\[(2(0(1)?)?)?)?$/;
 /** A complete mouse report: SGR (`ESC [ < b ; x ; y M|m`) or legacy (`ESC [ M` and three bytes). */
 const MOUSE_REPORT_REGEX = /\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M[\s\S]{3}/g;
 
-/**
- * A mouse report cut off before its end. Bare `ESC` and `ESC [` are left out on
- * purpose: they are just as likely the start of the end marker, whose detection
- * reads the bytes already held as paste text.
- */
+/** The start of a mouse report that has not fully arrived, down to a bare `ESC`. */
+const MOUSE_REPORT_PREFIX_REGEX = /^\x1b(\[(<[\d;]*|M[\s\S]{0,2})?)?$/;
+
+/** Such a start once it can be told from the start of the end marker (`ESC [ <` or `ESC [ M` seen). */
 const PARTIAL_MOUSE_REPORT_REGEX = /^\x1b\[(<[\d;]*|M[\s\S]{0,2})$/;
 
 /**
@@ -394,8 +393,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private pastePending: string = "";
 	/** An end marker was seen; the paste closes once the stream goes quiet. */
 	private pasteTerminated: boolean = false;
-	/** Start of a mouse report that follows the end marker and has not fully arrived yet. */
-	private pasteMouseCarry: string = "";
+	/** Start of a mouse report at the end of what arrived behind the last end marker. */
+	private pasteMouseHold: string = "";
 	private pendingKittyPrintableCodepoint: number | undefined;
 
 	constructor(options: StdinBufferOptions = {}) {
@@ -512,7 +511,10 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	 * chunk is appended.
 	 */
 	private appendPasteChunk(chunk: string): void {
-		const wasTerminated = this.pasteTerminated;
+		if (chunk.length > 0) {
+			this.pasteChunks.push(chunk);
+			this.pasteBufferBytes += Buffer.byteLength(chunk, "utf8");
+		}
 
 		// The terminator can straddle chunk boundaries; `pastePending` is the
 		// trailing partial-marker prefix carried over from the previous append, so
@@ -528,19 +530,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		if (lastEnd !== -1) {
 			this.pasteTerminated = true;
 		}
-
-		// The one exception to "every byte is paste text": a mouse report behind the
-		// end marker. It is the pointer, not the clipboard, and it must neither end up
-		// in the text nor keep the paste open.
-		const text = this.pasteTerminated ? this.takeMouseReports(chunk, lastEnd) : chunk;
-		if (text.length > 0) {
-			this.pasteChunks.push(text);
-			this.pasteBufferBytes += Buffer.byteLength(text, "utf8");
-		} else if (wasTerminated) {
-			// Only mouse reports arrived: the stream is no less quiet than before.
-			this.pastePending = this.trailingPartialPasteMarker(window);
-			return;
-		}
+		const pointerOnly = this.pasteTerminated && this.holdsOnlyMouseReports(chunk, lastEnd);
 
 		if (this.pasteBufferBytes > this.pasteMaxBytes) {
 			// Over the part budget: emit what arrived as paste text and keep paste
@@ -553,42 +543,51 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 
 		this.pastePending = this.trailingPartialPasteMarker(window);
 
-		this.armPasteCloseTimer();
+		// A moving mouse must not keep a settled paste open: bytes that are only mouse
+		// reports (or the start of one) behind the last end marker say nothing about
+		// whether the paste is still flowing.
+		if (!pointerOnly) {
+			this.armPasteCloseTimer();
+		}
 	}
 
 	/**
-	 * Split the mouse reports that follow the last end marker out of `chunk` and emit
-	 * them as input; returns the rest, which stays paste text. A report cut off at the
-	 * chunk's end is held back until the next chunk completes it, and is dropped if the
-	 * paste closes first.
+	 * Whether this chunk added nothing behind the last end marker except mouse reports
+	 * and, at its end, the start of one. Nothing is split off here: which marker is the
+	 * terminator is only known once the paste closes, and a report ahead of it is paste
+	 * text (a clipboard can hold a marker and a forged click) - see `settlePaste`.
 	 */
-	private takeMouseReports(chunk: string, lastEnd: number): string {
-		// A marker inside this chunk moves the boundary: only bytes behind it qualify.
+	private holdsOnlyMouseReports(chunk: string, lastEnd: number): boolean {
+		// A marker inside this chunk moves the boundary: only bytes behind it count.
 		const boundary =
 			lastEnd === -1 ? 0 : Math.max(0, lastEnd + BRACKETED_PASTE_END.length - this.pastePending.length);
-		const head = boundary === 0 ? "" : this.pasteMouseCarry + chunk.slice(0, boundary);
-		const scan = boundary === 0 ? this.pasteMouseCarry + chunk : chunk.slice(boundary);
-		this.pasteMouseCarry = "";
+		const behind = (boundary === 0 ? this.pasteMouseHold : "") + chunk.slice(boundary);
+		const rest = behind.replace(MOUSE_REPORT_REGEX, "");
+		const escAt = rest.lastIndexOf(ESC);
+		const held = escAt !== -1 && MOUSE_REPORT_PREFIX_REGEX.test(rest.slice(escAt)) ? rest.slice(escAt) : "";
+		this.pasteMouseHold = held;
+		return boundary === 0 && rest.length === held.length;
+	}
 
+	/**
+	 * What follows the last end marker of a closed paste: complete mouse reports are
+	 * split out, a report cut off at the end is dropped, everything else is text.
+	 */
+	private splitMouseReports(behind: string): { text: string; reports: string[] } {
 		const reports: string[] = [];
-		let kept = "";
+		let text = "";
 		let consumed = 0;
-		for (const match of scan.matchAll(MOUSE_REPORT_REGEX)) {
-			kept += scan.slice(consumed, match.index);
+		for (const match of behind.matchAll(MOUSE_REPORT_REGEX)) {
+			text += behind.slice(consumed, match.index);
 			reports.push(match[0]);
 			consumed = match.index + match[0].length;
 		}
-		let rest = scan.slice(consumed);
+		let rest = behind.slice(consumed);
 		const escAt = rest.lastIndexOf(ESC);
 		if (escAt !== -1 && PARTIAL_MOUSE_REPORT_REGEX.test(rest.slice(escAt))) {
-			this.pasteMouseCarry = rest.slice(escAt);
 			rest = rest.slice(0, escAt);
 		}
-
-		for (const report of reports) {
-			this.emitDataSequence(report);
-		}
-		return head + kept + rest;
+		return { text: text + rest, reports };
 	}
 
 	/**
@@ -637,9 +636,11 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	/**
 	 * Close a paste whose byte stream has gone quiet after an end marker was seen.
 	 * The last complete marker is taken as the terminator (an earlier one is
-	 * content the clipboard contained), and everything received - later bytes
-	 * included - is emitted as paste text, so no byte of the paste can reach the
-	 * key parser. Bytes that arrive after this point are fresh input.
+	 * content the clipboard contained), and everything received before it is paste
+	 * text, so no byte of the paste can reach the key parser. What arrived behind the
+	 * terminator is not the clipboard's: the mouse reports in it go out as input after
+	 * the paste, the rest stays paste text. Bytes that arrive after this point are
+	 * fresh input.
 	 */
 	private settlePaste(): void {
 		this.pasteSettleTimer = null;
@@ -648,14 +649,22 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 		const content = this.joinPasteChunks();
 		const lastEnd = content.lastIndexOf(BRACKETED_PASTE_END);
-		const stripped =
-			lastEnd === -1 ? content : content.slice(0, lastEnd) + content.slice(lastEnd + BRACKETED_PASTE_END.length);
-		if (stripped.length === 0) {
+		let text = lastEnd === -1 ? content : content.slice(0, lastEnd);
+		let reports: string[] = [];
+		if (lastEnd !== -1) {
+			const behind = this.splitMouseReports(content.slice(lastEnd + BRACKETED_PASTE_END.length));
+			text += behind.text;
+			reports = behind.reports;
+		}
+		if (text.length === 0) {
 			// Nothing but the terminator: close the paste without an empty event.
 			this.discardPasteMode();
-			return;
+		} else {
+			this.emitPasteAndContinue(text);
 		}
-		this.emitPasteAndContinue(stripped);
+		for (const report of reports) {
+			this.emitDataSequence(report);
+		}
 	}
 
 	private trailingPartialPasteMarker(window: string): string {
@@ -678,7 +687,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.pasteBufferBytes = 0;
 		this.pastePending = "";
 		this.pasteTerminated = false;
-		this.pasteMouseCarry = "";
+		this.pasteMouseHold = "";
 	}
 
 	private finishPasteWithoutTerminator(): void {
