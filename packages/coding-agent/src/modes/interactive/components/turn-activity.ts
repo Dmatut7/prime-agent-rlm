@@ -697,6 +697,8 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	private boxCacheKey: string | undefined;
 	/** The `◆ prime  <model>` line above the box; a woken turn under the same title leaves it out. */
 	private headerShown = true;
+	/** A blank line above the turn: a woken turn nothing else separates from what is above it. */
+	private leadingBlank = false;
 
 	constructor(private readonly turnState: TurnActivityState) {}
 
@@ -713,6 +715,13 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	setHeaderShown(shown: boolean): void {
 		if (this.headerShown === shown) return;
 		this.headerShown = shown;
+		this.invalidate();
+	}
+
+	/** Whether a blank line separates this turn from what is above it. */
+	setLeadingBlank(blank: boolean): void {
+		if (this.leadingBlank === blank) return;
+		this.leadingBlank = blank;
 		this.invalidate();
 	}
 
@@ -889,7 +898,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		const ui = state.timeline.ui;
 		// The finished box's view has its own key (steps, entries, how it ended, cwd, hideThinking).
 		const view = state.boxView(now);
-		const cacheKey = `${width}:${viewportRows}:${ui.version}:${state.boxOpen}:${this.headerShown}:${state.boxViewKey()}`;
+		const cacheKey = `${width}:${viewportRows}:${ui.version}:${state.boxOpen}:${this.headerShown}:${this.leadingBlank}:${state.boxViewKey()}`;
 		if (this.cachedLines && this.boxCacheKey === cacheKey) return this.cachedLines;
 		takeMotionActive();
 		const header = computeBoxHeader({
@@ -920,24 +929,30 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 			},
 		});
 		this.boxFocusOrder = box.focusOrder;
-		let lines = box.lines;
+		const above: string[] = this.leadingBlank ? [""] : [];
+		const regions: ClickRegion[] = [];
 		if (this.headerShown) {
-			const headerLine = renderAssistantHeader({
-				...(state.modelId ? { modelId: state.modelId } : {}),
-				durationMs: 0,
-				live: false,
-				plain: true,
-				tick: 0,
-				width,
+			regions.push({
+				line: above.length,
+				col: 0,
+				width: Math.min(width, 9),
+				height: 1,
+				onClick: () => this.toggleBox(),
 			});
-			this.boxRegions = [
-				{ line: 0, col: 0, width: Math.min(width, 9), height: 1, onClick: () => this.toggleBox() },
-				...box.regions.map((region) => ({ ...region, line: region.line + 1 })),
-			];
-			lines = [headerLine, ...box.lines];
-		} else {
-			this.boxRegions = box.regions;
+			above.push(
+				renderAssistantHeader({
+					...(state.modelId ? { modelId: state.modelId } : {}),
+					durationMs: 0,
+					live: false,
+					plain: true,
+					tick: 0,
+					width,
+				}),
+			);
 		}
+		regions.push(...box.regions.map((region) => ({ ...region, line: region.line + above.length })));
+		this.boxRegions = regions;
+		const lines = [...above, ...box.lines];
 		const animating = takeMotionActive();
 		if (!view.live && !animating) {
 			this.cachedLines = lines;

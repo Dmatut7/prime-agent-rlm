@@ -1,26 +1,20 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
-import { Container, setKeybindings, type TUI } from "@earendil-works/pi-tui";
+import { setKeybindings, type TUI } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-	AGENT_MESSAGE_SOURCE,
-	type AgentSessionMessage,
-	createAgentSessionMessage,
-} from "../src/core/agent-messages.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { AgentMessageComponent } from "../src/modes/interactive/components/agent-message.js";
 import { QuietCompactionNoticeComponent } from "../src/modes/interactive/components/compaction-summary-message.js";
 import {
 	buildConversationComponents,
-	foldEarlierAnswers,
 	resolveTurnHeaders,
 } from "../src/modes/interactive/components/conversation-components.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
-import { type TimelineHost, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
+import { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
-import { LiveTurnFlow } from "../src/modes/interactive/live-turn-flow.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 import { assistant, plain, quietTurn, T0 } from "./ui-blocks-helpers.js";
+import { handedBack, LiveChat } from "./ui-live-chat.js";
 
 beforeAll(() => {
 	initTheme("prime");
@@ -39,7 +33,7 @@ afterEach(() => {
 const HEADER = "◆ prime";
 
 function shows(summary: TurnSummaryComponent): boolean {
-	return plain(summary.render(100))[0]?.includes(HEADER) ?? false;
+	return plain(summary.render(100)).some((line) => line.includes(HEADER));
 }
 
 function turn(model: string, startedByUser: boolean): TurnSummaryComponent {
@@ -47,20 +41,6 @@ function turn(model: string, startedByUser: boolean): TurnSummaryComponent {
 	made.state.modelId = model;
 	made.state.startedByUser = startedByUser;
 	return made.summary;
-}
-
-function handedBack(id: string, at = T0): AgentSessionMessage {
-	return createAgentSessionMessage(
-		{
-			id,
-			source: AGENT_MESSAGE_SOURCE,
-			message: "审查完毕",
-			from: { sessionName: "ff-review-d-keys", sessionId: "child-1", activeSessionId: "child-1-active" },
-			fromRelationship: "child",
-			target: { activeSessionId: "main-active", sessionId: "main" },
-		},
-		at,
-	);
 }
 
 const compactionNotice = () =>
@@ -115,7 +95,7 @@ describe("a woken turn under the same title draws no second title", () => {
 	it("leaves the box a working header row and click area when the title is gone", () => {
 		const first = turn("glm-5.3-prime", true);
 		const woken = turn("glm-5.3-prime", false);
-		resolveTurnHeaders([first, woken]);
+		resolveTurnHeaders([first, new AgentMessageComponent(handedBack("m5")), woken]);
 		const lines = plain(woken.render(100));
 		expect(lines[0]).toMatch(/^ ╭─+╮$/);
 		expect(lines[1]).toContain("│");
@@ -127,98 +107,20 @@ describe("a woken turn under the same title draws no second title", () => {
 		headerRow?.onClick({ row: 0, col: 0 });
 		expect(woken.state.boxOpen).toBe(!before);
 	});
+
+	it("moves the box's click areas down with the blank line a woken turn gets when no message row is above it", () => {
+		const first = turn("glm-5.3-prime", true);
+		const woken = turn("glm-5.3-prime", false);
+		resolveTurnHeaders([first, woken]);
+		const lines = plain(woken.render(100));
+		expect(lines[0]).toBe("");
+		expect(lines[1]).toMatch(/^ ╭─+╮$/);
+		const regions = woken.getClickRegions();
+		const headerRow = regions.find((region) => region.line === 2 && !region.passive);
+		expect(headerRow).toBeDefined();
+		expect(regions.some((region) => region.line < 2)).toBe(false);
+	});
 });
-
-/** The live path: a chat and the flow that feeds it, the way the interactive mode wires them. */
-class LiveChat {
-	readonly chat = new Container();
-	readonly flow: LiveTurnFlow;
-	private current: TurnSummaryComponent | undefined;
-	private streaming = false;
-	private clock = T0;
-
-	constructor() {
-		const timelineHost: TimelineHost = {
-			cwd: () => "/work/app",
-			viewportRows: () => 40,
-			openWhileWorking: () => true,
-			autoFold: () => true,
-			requestRender: () => {},
-		};
-		this.flow = new LiveTurnFlow({
-			chat: () => this.chat,
-			quiet: () => true,
-			isStreaming: () => this.streaming,
-			retryPending: () => false,
-			compacting: () => false,
-			contextTokens: () => undefined,
-			cwd: () => "/work/app",
-			rlmNodeId: () => undefined,
-			createSummary: (state) => {
-				const summary = new TurnSummaryComponent(state);
-				summary.setTimelineHost(timelineHost);
-				return summary;
-			},
-			runStartedAt: () => undefined,
-			startExpanded: () => false,
-			currentState: () => this.current?.state,
-			currentSummary: () => this.current,
-			setCurrent: (summary) => {
-				this.current = summary;
-			},
-			foldEarlierAnswers: (summary) => foldEarlierAnswers(this.chat.children, summary),
-			requestRender: () => {},
-			liveChanged: () => {},
-		});
-	}
-
-	private tick(): number {
-		this.clock += 1_000;
-		return this.clock;
-	}
-
-	private reply(model: string): void {
-		const message = assistant(this.tick(), [{ type: "text", text: "好的" }], "stop", model);
-		this.flow.assistantStart(message);
-		this.flow.assistantEnd(message);
-		this.flow.agentEnd();
-		this.streaming = false;
-	}
-
-	/** The user types a prompt and the AI answers on `model`. */
-	prompt(text: string, model = "glm-5.3-prime"): void {
-		this.streaming = true;
-		this.flow.agentStart();
-		if (this.flow.userMessage(text, this.tick()) === "prompt") {
-			this.chat.addChild(new UserMessageComponent(text));
-		}
-		this.reply(model);
-	}
-
-	/** A subagent hands a message back, which wakes the AI on `model`. */
-	wake(id: string, model = "glm-5.3-prime"): void {
-		this.streaming = true;
-		this.flow.agentStart();
-		const message = handedBack(id, this.tick());
-		if (!this.flow.customMessage(message)) this.chat.addChild(new AgentMessageComponent(message));
-		this.reply(model);
-	}
-
-	/** A run that no message started (an automatic continuation). */
-	continueOnItsOwn(model = "glm-5.3-prime"): void {
-		this.streaming = true;
-		this.flow.agentStart();
-		this.reply(model);
-	}
-
-	summaries(): TurnSummaryComponent[] {
-		return this.chat.children.filter((child): child is TurnSummaryComponent => child instanceof TurnSummaryComponent);
-	}
-
-	titles(): boolean[] {
-		return this.summaries().map(shows);
-	}
-}
 
 describe("the live view draws one title per question", () => {
 	beforeEach(() => {
@@ -232,7 +134,7 @@ describe("the live view draws one title per question", () => {
 		screen.wake("m1");
 		screen.wake("m2");
 		expect(screen.summaries()).toHaveLength(3);
-		expect(screen.titles()).toEqual([true, false, false]);
+		expect(screen.summaries().map(shows)).toEqual([true, false, false]);
 		screen.flow.dispose();
 	});
 
@@ -242,9 +144,9 @@ describe("the live view draws one title per question", () => {
 		screen.wake("m1");
 		screen.prompt("第二个问题");
 		screen.wake("m2");
-		screen.wake("m3", "gpt-5.5");
-		screen.wake("m4", "gpt-5.5");
-		expect(screen.titles()).toEqual([true, false, true, false, true, false]);
+		screen.wake("m3", { model: "gpt-5.5" });
+		screen.wake("m4", { model: "gpt-5.5" });
+		expect(screen.summaries().map(shows)).toEqual([true, false, true, false, true, false]);
 		screen.flow.dispose();
 	});
 
@@ -253,7 +155,7 @@ describe("the live view draws one title per question", () => {
 		screen.prompt("第一个问题");
 		screen.continueOnItsOwn();
 		expect(screen.summaries()).toHaveLength(1);
-		expect(screen.titles()).toEqual([true]);
+		expect(screen.summaries().map(shows)).toEqual([true]);
 		screen.flow.dispose();
 	});
 });
