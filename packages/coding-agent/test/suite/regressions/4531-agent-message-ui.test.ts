@@ -44,7 +44,7 @@ function createPayload(message: string): AgentSessionMessagePayload {
 }
 
 function stripAnsi(text: string): string {
-	return text.replace(/\u001b\[[0-9;]*m/g, "");
+	return text.replace(/\u001b\[[0-9;]*m|\u001b\]pi:content\u0007/g, "");
 }
 
 function render(component: AgentMessageComponent): string {

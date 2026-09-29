@@ -7,7 +7,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
 import { getSpinnerTick } from "../theme/working-icon.js";
-import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock } from "./block-focus.js";
+import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock, withoutGutter } from "./block-focus.js";
 import type { FileChangeSummary } from "./edit-summary.js";
 import type { TimelineLaneTracker } from "./timeline-lane.js";
 import {
@@ -947,7 +947,11 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	/** The process line and its rows as plain text. */
 	getBlockCopyText(): string {
 		return this.renderTurnHead(120)
-			.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd())
+			.map((line) =>
+				withoutGutter(line)
+					.replace(/\x1b\[[0-9;]*m/g, "")
+					.trimEnd(),
+			)
 			.filter((line) => line.trim().length > 0)
 			.join("\n");
 	}

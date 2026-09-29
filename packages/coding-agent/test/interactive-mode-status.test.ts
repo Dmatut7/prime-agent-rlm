@@ -75,7 +75,7 @@ function renderAll(container: Container, width = 120): string {
 }
 
 function stripAnsi(text: string): string {
-	return text.replace(/\u001b\[[0-9;]*m/g, "");
+	return text.replace(/\u001b\[[0-9;]*m|\u001b\]pi:content\u0007/g, "");
 }
 
 function normalizeRenderedOutput(container: Container, width = 220): string {

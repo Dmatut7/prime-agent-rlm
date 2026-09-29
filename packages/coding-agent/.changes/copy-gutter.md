@@ -1,0 +1,1 @@
+- Fixed copying from the conversation timeline: the time and the rail glyphs no longer come along, and the empty rows between paragraphs stay.

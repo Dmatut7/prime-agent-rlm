@@ -78,7 +78,7 @@ export {
 	parseSgrMouseEvent,
 } from "./mouse.js";
 export { VersionedRenderCache } from "./render-cache.js";
-export type { TableCellSelectionRegion } from "./selection-metadata.js";
+export { CONTENT_START_MARKER, type TableCellSelectionRegion } from "./selection-metadata.js";
 export { StdinBuffer, type StdinBufferEventMap, type StdinBufferOptions } from "./stdin-buffer.js";
 export { ProcessTerminal, type Terminal, type TerminalStopOptions } from "./terminal.js";
 export {

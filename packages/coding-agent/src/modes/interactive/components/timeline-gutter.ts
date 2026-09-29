@@ -1,4 +1,4 @@
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { CONTENT_START_MARKER, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { type ThemeColor, theme } from "../theme/theme.js";
 
 /**
@@ -73,7 +73,7 @@ export function formatTimelineTime(at: number): string {
 	return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
-/** The 16 styled columns in front of a timeline row's content. */
+/** The 16 styled columns in front of a timeline row's content, then a zero-width mark where the content starts so a drag-copy leaves the gutter out. */
 export function timelineGutter(gutter: TimelineGutter): string {
 	const time = gutter.time
 		? theme.fg("timelineTime", ` ${gutter.time.padEnd(5)}   `)
@@ -89,7 +89,7 @@ export function timelineGutter(gutter: TimelineGutter): string {
 	const lane = laneSpec.bold
 		? theme.bold(theme.fg(laneSpec.color, laneSpec.text))
 		: theme.fg(laneSpec.color, laneSpec.text);
-	return `${time}${main}${lane}   `;
+	return `${time}${main}${lane}   ${CONTENT_START_MARKER}`;
 }
 
 export interface TimelineRowOptions {

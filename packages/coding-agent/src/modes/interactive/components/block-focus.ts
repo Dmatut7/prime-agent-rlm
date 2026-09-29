@@ -1,4 +1,5 @@
 import {
+	CONTENT_START_MARKER,
 	type Component,
 	Container,
 	type Focusable,
@@ -226,9 +227,16 @@ export class FocusableTextBlock extends Text implements FocusableBlock {
 	}
 }
 
-/** Plain text of rendered rows: styling and markers stripped, blank rows dropped. */
+/** A rendered row from where its content starts: what a timeline row's time and rails leave out of a copy. */
+export function withoutGutter(line: string): string {
+	const at = line.indexOf(CONTENT_START_MARKER);
+	return at === -1 ? line : line.slice(at + CONTENT_START_MARKER.length);
+}
+
+/** Plain text of rendered rows: styling, markers and the timeline gutter stripped, blank rows dropped. */
 export function renderedCopyText(lines: readonly string[]): string {
 	return lines
+		.map(withoutGutter)
 		.map((line) =>
 			stripAnsi(line)
 				.replace(/\x1b_[^\x07]*\x07/g, "")

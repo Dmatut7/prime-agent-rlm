@@ -4,6 +4,14 @@ const TABLE_MARKER_PREFIX = "\x1b_pi:table:";
 const TABLE_START_MARKER = `${TABLE_MARKER_PREFIX}start\x07`;
 const TABLE_END_MARKER = `${TABLE_MARKER_PREFIX}end\x07`;
 
+/**
+ * Zero-width marker a row puts between its left gutter (time, rails) and its
+ * content. A drag-copy keeps only what follows it; the painted frame never shows it.
+ * An OSC rather than an APC like the table marks, so `strip-ansi` (which the
+ * components' own text helpers use) removes it whole.
+ */
+export const CONTENT_START_MARKER = "\x1b]pi:content\x07";
+
 export interface TableCellSelectionRegion {
 	line: number;
 	col: number;
@@ -181,4 +189,14 @@ export function extractTableCellSelectionRegions(
 	}
 
 	return { lines: cleanLines, regions };
+}
+
+/** Visible column where a row's content starts, or undefined when the row carries no marker. */
+export function contentStartColumn(line: string): number | undefined {
+	const at = line.indexOf(CONTENT_START_MARKER);
+	return at === -1 ? undefined : visibleWidth(line.slice(0, at));
+}
+
+export function stripContentStartMarkers(line: string): string {
+	return line.includes(CONTENT_START_MARKER) ? line.split(CONTENT_START_MARKER).join("") : line;
 }

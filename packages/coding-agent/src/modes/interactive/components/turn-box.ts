@@ -1,4 +1,10 @@
-import { type ClickRegion, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import {
+	type ClickRegion,
+	CONTENT_START_MARKER,
+	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 import { type ThemeColor, theme } from "../theme/theme.js";
 import { spinnerFrame } from "../theme/working-icon.js";
 import { shortAgentName } from "./agent-message.js";
@@ -164,7 +170,7 @@ const TIP_LABEL = "在跑  ";
 const RAIL_GAP_ROW = /^(?:\x1b\[[0-9;]*m| )*│(?:\x1b\[[0-9;]*m| |┆)*$/;
 
 function startsWithRailGap(line: string | undefined): boolean {
-	return line !== undefined && RAIL_GAP_ROW.test(line);
+	return line !== undefined && RAIL_GAP_ROW.test(line.split(CONTENT_START_MARKER).join(""));
 }
 
 /** The lines cut to `width` columns: a line wider than the terminal breaks the screen. */

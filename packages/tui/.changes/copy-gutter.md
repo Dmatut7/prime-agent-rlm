@@ -1,0 +1,1 @@
+- Fixed dragging to copy in the fullscreen view: a selection now copies only the words, without the time column or the timeline lines.

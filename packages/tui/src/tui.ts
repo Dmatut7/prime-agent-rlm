@@ -27,7 +27,7 @@ import {
 	parseMouseHover,
 	parseSgrMouseEvent,
 } from "./mouse.js";
-import type { TableCellSelectionRegion } from "./selection-metadata.js";
+import { stripContentStartMarkers, type TableCellSelectionRegion } from "./selection-metadata.js";
 import type { Terminal } from "./terminal.js";
 import { deleteKittyImage, getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.js";
 import {
@@ -1772,7 +1772,7 @@ export class TUI extends Container {
 				lines[i] = cached;
 				continue;
 			}
-			const normalized = normalizeTerminalOutput(line) + reset;
+			const normalized = normalizeTerminalOutput(stripContentStartMarkers(line)) + reset;
 			// Evict the oldest entry instead of clearing. A full clear drops
 			// the normalized identity of every unchanged line at once: the
 			// next frame re-runs the normalization regexes for the whole

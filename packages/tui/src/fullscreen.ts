@@ -6,7 +6,7 @@
  */
 
 import type { ClickRegion, StickyHeader } from "./click-regions.js";
-import type { TableCellSelectionRegion } from "./selection-metadata.js";
+import { contentStartColumn, type TableCellSelectionRegion } from "./selection-metadata.js";
 import { isImageLine } from "./terminal-image.js";
 import { sliceByColumn, stripAnsi, urlAtColumn, visibleWidth } from "./utils.js";
 
@@ -898,16 +898,27 @@ export class FullscreenViewport {
 		sel: { start: SelectionPoint; end: SelectionPoint },
 	): string | null {
 		const lines: string[] = [];
+		// Rows that are only a gutter: kept between paragraphs, dropped at the ends of the selection.
+		const gutterOnly = new Set<number>();
 		for (let lineIndex = sel.start.line; lineIndex <= sel.end.line; lineIndex++) {
 			const line = sourceLines[lineIndex] ?? "";
 			const span = this.selectionSpan(lineIndex, sel);
 			if (!span) continue;
 			const width = visibleWidth(line);
-			const from = Math.min(span.from, width);
+			const contentStart = contentStartColumn(line);
+			// A row that marks where its content starts copies only from there: the gutter is not text.
+			if (contentStart !== undefined && span.to <= contentStart) continue;
+			const from = Math.min(Math.max(span.from, contentStart ?? 0), width);
 			const to = Math.min(span.to, width);
-			lines.push(stripAnsi(sliceByColumn(line, from, Math.max(0, to - from))).trimEnd());
+			const text = stripAnsi(sliceByColumn(line, from, Math.max(0, to - from))).trimEnd();
+			if (contentStart !== undefined && text === "") gutterOnly.add(lines.length);
+			lines.push(text);
 		}
-		const text = lines.join("\n");
+		let first = 0;
+		while (first < lines.length && gutterOnly.has(first)) first++;
+		let last = lines.length;
+		while (last > first && gutterOnly.has(last - 1)) last--;
+		const text = lines.slice(first, last).join("\n");
 		return text.trim().length > 0 ? text : null;
 	}
 
