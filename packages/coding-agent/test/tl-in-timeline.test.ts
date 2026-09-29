@@ -236,6 +236,20 @@ describe("the timeline draws a turn as event lines (Tl2Done)", () => {
 		expect(steps[3]?.trimEnd().endsWith("全部 ›")).toBe(true);
 	});
 
+	it("paints an opened step's words and the `另外 N 步` words in the dim color, as the design does", () => {
+		const { turn } = designTurn();
+		turn.summary.render(WIDTH);
+		turn.summary.activate(turn.summary.getFocusOrder().filter((key) => key.startsWith("ev:"))[1] ?? "");
+		const raw = turn.summary.render(WIDTH);
+		const dim = theme.getFgAnsi("timelineTime");
+		const soft = theme.getFgAnsi("timelineSoft");
+		expect(dim).not.toBe(soft);
+		const step = raw.find((line) => line.includes("npx tsgo --noEmit")) ?? "";
+		expect(step).toContain(`${dim}npx tsgo --noEmit`);
+		const more = raw.find((line) => line.includes("另外 2 步")) ?? "";
+		expect(more).toContain(`${dim}另外 2 步`);
+	});
+
 	it("`全部 ›` lists every step", () => {
 		const { turn } = designTurn();
 		turn.summary.render(WIDTH);

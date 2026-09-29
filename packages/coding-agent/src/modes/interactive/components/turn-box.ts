@@ -483,7 +483,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 				const glyph = running ? spinnerFrame(input.tick) : step.glyph;
 				specs.push({
 					gutter: { main: "rail", lane },
-					content: `${" ".repeat(STEP_INDENT)}${theme.bold(theme.fg(glyphColor, glyph))}  ${theme.fg("timelineSoft", stepWords(step))}`,
+					content: `${" ".repeat(STEP_INDENT)}${theme.bold(theme.fg(glyphColor, glyph))}  ${theme.fg("timelineTime", stepWords(step))}`,
 					right: `${stepStatus(step, now)}  `,
 					key: step.key,
 					onClick: toggle(step.key),
@@ -502,7 +502,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 			if (hidden > 0) {
 				specs.push({
 					gutter: { main: "rail", lane },
-					content: `${" ".repeat(STEP_INDENT)}${theme.bold(theme.fg("timelineFaint", "⋯"))}  ${theme.fg("timelineSoft", `另外 ${hidden} 步`)}`,
+					content: `${" ".repeat(STEP_INDENT)}${theme.bold(theme.fg("timelineFaint", "⋯"))}  ${theme.fg("timelineTime", `另外 ${hidden} 步`)}`,
 					right: `${theme.fg("timelineFaint", "全部 ›")}  `,
 					key: `all:${event.key}`,
 					onClick: toggle(`all:${event.key}`),
