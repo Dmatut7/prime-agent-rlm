@@ -33,8 +33,6 @@ import { formatBoxDuration, formatBoxTokens, lastCompletedSentence, type TurnTim
  * ```
  */
 
-/** The box never grows wider than this: a long row reads badly across a wide screen. */
-export const BOX_MAX_WIDTH = 120;
 /** Body rows the box shows at most, and at least when the terminal is short. */
 export const BOX_BODY_MAX_ROWS = 14;
 export const BOX_BODY_MIN_ROWS = 4;
@@ -50,7 +48,7 @@ const BOX_MIN_OUTER = 4;
 
 /** The frame's width for `width` columns (the line also has a one-column margin). */
 export function boxOuterWidth(width: number): number {
-	return Math.max(BOX_MIN_OUTER, Math.min(Math.floor(width) - 1, BOX_MAX_WIDTH));
+	return Math.max(BOX_MIN_OUTER, Math.floor(width) - 1);
 }
 
 /** The click area of one framed line: the frame and its margin, never past the terminal's last column. */

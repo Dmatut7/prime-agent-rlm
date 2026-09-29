@@ -13,7 +13,7 @@ import {
 	TurnActivityState,
 	TurnSummaryComponent,
 } from "../src/modes/interactive/components/turn-activity.js";
-import { BOX_MAX_WIDTH, boxBodyRows } from "../src/modes/interactive/components/turn-box.js";
+import { boxBodyRows } from "../src/modes/interactive/components/turn-box.js";
 import { TurnBoxNavigator } from "../src/modes/interactive/components/turn-box-navigator.js";
 import { STRIP_EDITS, STRIP_MEMORIES, TurnStripComponent } from "../src/modes/interactive/components/turn-strip.js";
 import { TurnTimeline } from "../src/modes/interactive/components/turn-timeline.js";
@@ -741,7 +741,7 @@ describe("layout", () => {
 		turn.timeline.addSteer("先别动安卓的，只升级 Go。这句话很长很长很长很长很长很长很长很长很长", Date.now());
 		for (const width of [80, 60, 200]) {
 			const lines = turn.summary.render(width);
-			const outer = Math.max(24, Math.min(width - 1, BOX_MAX_WIDTH));
+			const outer = Math.max(24, width - 1);
 			for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 			for (const line of lines.slice(1)) expect(visibleWidth(line)).toBe(outer + 1);
 		}
