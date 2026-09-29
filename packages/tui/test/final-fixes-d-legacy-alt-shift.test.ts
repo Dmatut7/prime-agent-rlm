@@ -21,9 +21,11 @@ describe("legacy ESC + uppercase letter is Alt+Shift+letter", () => {
 	beforeEach(() => setKittyProtocolActive(false));
 	afterEach(() => setKittyProtocolActive(false));
 
-	it("matchesKey accepts it for every letter, in either modifier order", () => {
-		assert.strictEqual(LETTERS.length, 26);
-		for (const letter of LETTERS) {
+	it("matchesKey accepts it for every letter but b and f, in either modifier order", () => {
+		// ESC B and ESC F keep their readline meaning (alt+left, alt+right), see below.
+		const letters = LETTERS.filter((letter) => letter !== "b" && letter !== "f");
+		assert.strictEqual(letters.length, 24);
+		for (const letter of letters) {
 			const data = legacyAltShift(letter);
 			assert.strictEqual(matchesKey(data, `alt+shift+${letter}` as KeyId), true, `alt+shift+${letter}`);
 			assert.strictEqual(matchesKey(data, `shift+alt+${letter}` as KeyId), true, `shift+alt+${letter}`);

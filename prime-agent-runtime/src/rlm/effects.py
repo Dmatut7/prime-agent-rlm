@@ -215,11 +215,17 @@ _SECRET_NAMES = (
 )
 # A passphrase in quotes: two to five short words of letters and digits, a space apart.
 _PASSPHRASE = r"[a-z0-9]{2,12}(?: [a-z0-9]{2,12}){1,4}"
-# What may follow the name: `secret_key`, `credentials`, a closing quote, then `=` or `:` (not `==`), an
-# annotation before the `=` (`: str =`) or `:=`, and a value: one quoted token, quoted words, or a bare token.
+# A type between a name and its `=`: `str`, `Optional[str]`, `&'static str`, `Option<&str>`, `*const c_char` (a
+# word of name characters and the marks of references, pointers and generics; at most three, on the name's line).
+_TYPE_WORD = r"[\w\[\].\"'&*][\w\[\].\"'&*<>]*"
+# What may follow the name: `secret_key`, `credentials`, a closing quote, then `=` or `:` (not `==`), a type
+# before the `=` (`: str =`, Rust `: &str =`), `:=`, or Go's `var password string =` (a type and no colon), and a
+# value: one quoted token, quoted words, or a bare token.
 _SECRET_ASSIGNMENT_TAIL = re.compile(
-    r"(?:[_-]?key)?s?[\"']?\s*"
-    r"(?<![=!<>])(?::\s*[\w\[\].\"']+\s*=(?!=)|:=|[:=](?!=))\s*"
+    r"(?:[_-]?key)?s?[\"']?"
+    r"(?:\s*(?<![=!<>])(?::\s*" + _TYPE_WORD + r"(?:[ \t]+" + _TYPE_WORD + r"){0,2}[ \t]*=(?!=)|:=|[:=](?!=))"
+    r"|[ \t]+(?:\*|\[\d*\])*[a-z_][\w.]*[ \t]*=(?!=))"
+    r"\s*"
     r"(?:(?P<quote>[\"'])(?:(?P<token>[^\"'\s]{8,})|(?P<words>" + _PASSPHRASE + r"))(?P=quote)"
     r"|(?P<bare>[^\s\"'#,;.(){}\[\]<>]{8,}))"
 )
@@ -299,8 +305,36 @@ def _looks_secret(text: str | None) -> bool:
         return True
 
 
+# A memory text is scanned this far into the text it is cut from: the cut takes the closing quote off a
+# value that crosses it, and an unterminated quote matches no value rule.
+_MEMORY_SCAN_CHARS = MAX_MEMORY_TEXT + 1024
+
+
+def _memory_text(text: str) -> tuple[str, bool]:
+    """`text` cut to the length a memory record carries, and whether the uncut start of it looks like a credential."""
+    return _clip(text, MAX_MEMORY_TEXT), _looks_secret(text[:_MEMORY_SCAN_CHARS])
+
+
+def _alnum(text: str) -> str:
+    return "".join(char for char in text.lower() if char.isalnum())
+
+
 def _withhold_memory_texts(record: dict[str, Any], withheld: bool = False) -> None:
-    """Drop both texts of a memory record when either holds a likely credential (or `withheld` says so)."""
+    """Drop both texts of a memory record when either holds a likely credential (or `withheld` says so).
+
+    A title that holds one counts the same and shows the entry's id instead (its kind when the id looks like
+    a credential too, or is the title's own slug, which the harness makes when no id is given); a previous
+    title that holds one is left out.
+    """
+    if _looks_secret(record.get("previousTitle")):
+        record.pop("previousTitle")
+        withheld = True
+    title = record.get("title")
+    if _looks_secret(title):
+        entry_id = record.get("id")
+        own_id = bool(entry_id) and not _looks_secret(entry_id) and not _alnum(title).startswith(_alnum(entry_id))
+        record["title"] = entry_id if own_id else record["kind"]
+        withheld = True
     if withheld or _looks_secret(record.get("before")) or _looks_secret(record.get("after")):
         record.pop("before", None)
         record.pop("after", None)
@@ -1803,6 +1837,13 @@ class _Tracker:
                     return
                 cell.files[path] = _FileRec(path, baseline, "shell")
 
+    def _prior_content(self, path: str, prior: tuple[int, int]) -> _Content:
+        """What a file was before a command, from its old signature: a link, cached bytes, or unknown."""
+        if prior[0] == _LINK_SIZE:
+            return _Content("link", None, prior)
+        data = self.cache.get(path, prior)
+        return _Content("bytes", data, prior) if data is not None else _Content("unknown", None, prior, "no_baseline")
+
     def _compare_repo(
         self,
         cell: _Cell,
@@ -1849,10 +1890,7 @@ class _Tracker:
                 if prior is None:
                     pending.append((path, _ABSENT))
                     continue
-                data = self.cache.get(path, prior)
-                pending.append(
-                    (path, _Content("bytes", data, prior) if data is not None else _Content("unknown", None, prior, "no_baseline"))
-                )
+                pending.append((path, self._prior_content(path, prior)))
                 continue
             if after.entries.get(path) == "??":
                 if current is not None:
@@ -1909,16 +1947,7 @@ class _Tracker:
                 if _entry_sig(path) is not None:
                     changes.append((path, _ABSENT))
                 continue
-            if prior[0] == _LINK_SIZE:
-                changes.append((path, _Content("link", None, prior)))
-                continue
-            data = self.cache.get(path, prior)
-            changes.append(
-                (
-                    path,
-                    _Content("bytes", data, prior) if data is not None else _Content("unknown", None, prior, "no_baseline"),
-                )
-            )
+            changes.append((path, self._prior_content(path, prior)))
 
     # --------------------------------------------------------------- records
 
@@ -1950,12 +1979,15 @@ class _Tracker:
             kind = "renamed"
         else:
             kind = "modified"
-        link = base.state == "link" or final.state == "link"
+        # A link that is gone counts as a link; one replaced by a regular file is that file, all of it new.
+        link = final.state == "link" or (base.state == "link" and not final.exists)
         if kind == "modified":
             if base.state == final.state and base.state in ("bytes", "link") and base.data == final.data:
                 return None
             if base.sig is not None and base.sig == final.sig and base.state != "bytes":
                 return None
+        if base.state == "link" and not link:
+            base = _Content("bytes", b"", base.sig)
         change: dict[str, Any] = {"path": rec.path}
         if info.rel is not None:
             change["relPath"] = info.rel
@@ -2087,17 +2119,20 @@ class _Tracker:
             "id": rec.path,
             "title": info.display,
         }
+        secret = change.get("diffOmitted") == SENSITIVE
         before = rec.baseline.data if rec.baseline.state == "bytes" else None
         if before is not None and op != "created":
             text = _decode_text(before)
             if text is not None:
-                memory["before"] = _clip(text, MAX_MEMORY_TEXT)
+                memory["before"], hit = _memory_text(text)
+                secret = secret or hit
         if op != "deleted":
             after = self.cache.get(rec.path, _entry_sig(rec.path))
             text = _decode_text(after) if after is not None else None
             if text is not None:
-                memory["after"] = _clip(text, MAX_MEMORY_TEXT)
-        _withhold_memory_texts(memory, change.get("diffOmitted") == SENSITIVE)
+                memory["after"], hit = _memory_text(text)
+                secret = secret or hit
+        _withhold_memory_texts(memory, secret)
         memory["at"] = _now_ms()
         self.send(cell.id, {MEMORY_CHANGE_MIME: memory})
 
@@ -2197,7 +2232,7 @@ class _Tracker:
             # Sent under the lock: the cell cannot finish between being chosen here and the record going out.
             self.send_activity(cell.id, record)
 
-    def memory_change(self, record: dict[str, Any]) -> None:
+    def memory_change(self, record: dict[str, Any], withheld: bool = False) -> None:
         cell = self.cell
         if cell is None:
             return
@@ -2228,7 +2263,7 @@ class _Tracker:
                         record.pop("previousTitle", None)
             if not retract:
                 # Once withheld in a cell, an entry stays withheld: its earlier text held the secret.
-                _withhold_memory_texts(record, prior is not None and prior.get("textOmitted") == SENSITIVE)
+                _withhold_memory_texts(record, withheld or (prior is not None and prior.get("textOmitted") == SENSITIVE))
                 cell.memory[key] = record
         if retract:
             self.send(cell.id, {MEMORY_CHANGE_MIME: {"kind": key[0], "scope": key[1], "id": key[2], "retracted": True}})
@@ -2828,11 +2863,14 @@ def memory_change(
         }
         if previous_title is not None and previous_title != title:
             record["previousTitle"] = previous_title
+        secret = False
         if before is not None:
-            record["before"] = _clip(before, MAX_MEMORY_TEXT)
+            record["before"], hit = _memory_text(before)
+            secret = secret or hit
         if after is not None:
-            record["after"] = _clip(after, MAX_MEMORY_TEXT)
+            record["after"], hit = _memory_text(after)
+            secret = secret or hit
         record["at"] = _now_ms()
-        tracker.memory_change(record)
+        tracker.memory_change(record, secret)
     except Exception:  # noqa: BLE001
         pass
