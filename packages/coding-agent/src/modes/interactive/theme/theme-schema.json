@@ -418,6 +418,98 @@
 				"boxBorderLive": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Border of the timeline box while the turn runs (optional)"
+				},
+				"kindThink": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Glyph and accent of a thinking step in a turn's timeline (optional)"
+				},
+				"kindCommand": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Glyph and accent of a command step in a turn's timeline (optional)"
+				},
+				"kindRead": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Glyph and accent of a read or look-up step in a turn's timeline (optional)"
+				},
+				"kindSubagent": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Glyph and accent of a subagent step and its report in a turn's timeline (optional)"
+				},
+				"kindError": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Glyph and accent of a failed step in a turn's timeline (optional)"
+				},
+				"kindEdit": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Glyph and accent of a file change step in a turn's timeline (optional)"
+				},
+				"kindMemory": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Glyph and accent of a memory step in a turn's timeline (optional)"
+				},
+				"kindRecovered": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Glyph of a recovered mistake in a finished turn's summary (optional)"
+				},
+				"kindThinkBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Block background of a thinking step (optional)"
+				},
+				"kindThinkHoverBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Block background of a thinking step under the pointer or keyboard focus (optional)"
+				},
+				"kindCommandBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Block background of a command step (optional)"
+				},
+				"kindCommandHoverBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Block background of a command step under the pointer or keyboard focus (optional)"
+				},
+				"kindReadBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Block background of a read or look-up step (optional)"
+				},
+				"kindReadHoverBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Block background of a read or look-up step under the pointer or keyboard focus (optional)"
+				},
+				"kindSubagentBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Block background of a subagent step and its report (optional)"
+				},
+				"kindSubagentHoverBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Block background of a subagent step and its report under the pointer or keyboard focus (optional)"
+				},
+				"kindErrorBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Block background of a failed step (optional)"
+				},
+				"kindErrorHoverBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Block background of a failed step under the pointer or keyboard focus (optional)"
+				},
+				"kindEditBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Block background of a file change step (optional)"
+				},
+				"kindEditHoverBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Block background of a file change step under the pointer or keyboard focus (optional)"
+				},
+				"kindMemoryBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Block background of a memory step (optional)"
+				},
+				"kindMemoryHoverBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Block background of a memory step under the pointer or keyboard focus (optional)"
+				},
+				"kindPanelBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Background of an opened step's detail panel (optional)"
 				}
 			},
 			"additionalProperties": false

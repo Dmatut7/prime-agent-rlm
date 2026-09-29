@@ -126,6 +126,30 @@ const ThemeJsonSchema = Type.Object({
 		cardFocusBg: Type.Optional(ColorValueSchema),
 		boxBorder: Type.Optional(ColorValueSchema),
 		boxBorderLive: Type.Optional(ColorValueSchema),
+		// Per-kind timeline colors: a step block's glyph, its background and its background under the pointer
+		kindThink: Type.Optional(ColorValueSchema),
+		kindCommand: Type.Optional(ColorValueSchema),
+		kindRead: Type.Optional(ColorValueSchema),
+		kindSubagent: Type.Optional(ColorValueSchema),
+		kindError: Type.Optional(ColorValueSchema),
+		kindEdit: Type.Optional(ColorValueSchema),
+		kindMemory: Type.Optional(ColorValueSchema),
+		kindRecovered: Type.Optional(ColorValueSchema),
+		kindThinkBg: Type.Optional(ColorValueSchema),
+		kindThinkHoverBg: Type.Optional(ColorValueSchema),
+		kindCommandBg: Type.Optional(ColorValueSchema),
+		kindCommandHoverBg: Type.Optional(ColorValueSchema),
+		kindReadBg: Type.Optional(ColorValueSchema),
+		kindReadHoverBg: Type.Optional(ColorValueSchema),
+		kindSubagentBg: Type.Optional(ColorValueSchema),
+		kindSubagentHoverBg: Type.Optional(ColorValueSchema),
+		kindErrorBg: Type.Optional(ColorValueSchema),
+		kindErrorHoverBg: Type.Optional(ColorValueSchema),
+		kindEditBg: Type.Optional(ColorValueSchema),
+		kindEditHoverBg: Type.Optional(ColorValueSchema),
+		kindMemoryBg: Type.Optional(ColorValueSchema),
+		kindMemoryHoverBg: Type.Optional(ColorValueSchema),
+		kindPanelBg: Type.Optional(ColorValueSchema),
 	}),
 	export: Type.Optional(
 		Type.Object({
@@ -214,7 +238,15 @@ export type ThemeColor =
 	| "diffAddedText"
 	| "diffRemovedText"
 	| "boxBorder"
-	| "boxBorderLive";
+	| "boxBorderLive"
+	| "kindThink"
+	| "kindCommand"
+	| "kindRead"
+	| "kindSubagent"
+	| "kindError"
+	| "kindEdit"
+	| "kindMemory"
+	| "kindRecovered";
 
 export type ThemeBg =
 	| "selectedBg"
@@ -235,7 +267,22 @@ export type ThemeBg =
 	| "diffRemovedLineBg"
 	| "rowFlashBg"
 	| "rowFlashFadeBg"
-	| "cardFocusBg";
+	| "cardFocusBg"
+	| "kindThinkBg"
+	| "kindThinkHoverBg"
+	| "kindCommandBg"
+	| "kindCommandHoverBg"
+	| "kindReadBg"
+	| "kindReadHoverBg"
+	| "kindSubagentBg"
+	| "kindSubagentHoverBg"
+	| "kindErrorBg"
+	| "kindErrorHoverBg"
+	| "kindEditBg"
+	| "kindEditHoverBg"
+	| "kindMemoryBg"
+	| "kindMemoryHoverBg"
+	| "kindPanelBg";
 
 type ColorMode = "truecolor" | "256color";
 
@@ -842,6 +889,29 @@ const CONVERSATION_LAYER_FALLBACKS: Record<string, string> = {
 	cardFocusBg: "selectedBg",
 	boxBorder: "borderMuted",
 	boxBorderLive: "borderMuted",
+	kindThink: "memoryAccent",
+	kindCommand: "activityAccent",
+	kindRead: "accent",
+	kindSubagent: "warning",
+	kindError: "error",
+	kindEdit: "diffAddedText",
+	kindMemory: "memoryAccent",
+	kindRecovered: "warning",
+	kindThinkBg: "customMessageBg",
+	kindThinkHoverBg: "selectedBg",
+	kindCommandBg: "customMessageBg",
+	kindCommandHoverBg: "selectedBg",
+	kindReadBg: "customMessageBg",
+	kindReadHoverBg: "selectedBg",
+	kindSubagentBg: "customMessageBg",
+	kindSubagentHoverBg: "selectedBg",
+	kindErrorBg: "customMessageBg",
+	kindErrorHoverBg: "selectedBg",
+	kindEditBg: "customMessageBg",
+	kindEditHoverBg: "selectedBg",
+	kindMemoryBg: "customMessageBg",
+	kindMemoryHoverBg: "selectedBg",
+	kindPanelBg: "toolPanelBg",
 };
 
 function createTheme(themeJson: ThemeJson, mode?: ColorMode, sourcePath?: string): Theme {
@@ -869,6 +939,21 @@ function createTheme(themeJson: ThemeJson, mode?: ColorMode, sourcePath?: string
 		"rowFlashBg",
 		"rowFlashFadeBg",
 		"cardFocusBg",
+		"kindThinkBg",
+		"kindThinkHoverBg",
+		"kindCommandBg",
+		"kindCommandHoverBg",
+		"kindReadBg",
+		"kindReadHoverBg",
+		"kindSubagentBg",
+		"kindSubagentHoverBg",
+		"kindErrorBg",
+		"kindErrorHoverBg",
+		"kindEditBg",
+		"kindEditHoverBg",
+		"kindMemoryBg",
+		"kindMemoryHoverBg",
+		"kindPanelBg",
 	]);
 	// A theme written before the conversation layers existed still renders them:
 	// each missing layer color borrows the closest core color.
