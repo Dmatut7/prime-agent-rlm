@@ -19,7 +19,14 @@ import {
 } from "./fullscreen.js";
 import { getKeybindings } from "./keybindings.js";
 import { isKeyRelease } from "./keys.js";
-import { isMouseSequence, isWheelDown, isWheelUp, MOUSE_BUTTON_LEFT, parseSgrMouseEvent } from "./mouse.js";
+import {
+	isMouseHover,
+	isMouseSequence,
+	isWheelDown,
+	isWheelUp,
+	MOUSE_BUTTON_LEFT,
+	parseSgrMouseEvent,
+} from "./mouse.js";
 import type { TableCellSelectionRegion } from "./selection-metadata.js";
 import type { Terminal } from "./terminal.js";
 import { deleteKittyImage, getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.js";
@@ -432,6 +439,8 @@ export class TUI extends Container {
 	private fullscreenLeftMouseDragged = false;
 	private fullscreenPressedHyperlink: string | null = null;
 	private fullscreenPressedClick: FrameClickTarget | null = null;
+	// The region under the pointer, kept across frames by hoverKey (regions are rebuilt per render).
+	private fullscreenHover: { key: string; region: ClickRegion } | null = null;
 	private overlaySelectionRegions: FrameSelectionRegion[] = [];
 
 	// While set, doRender paints fixed frames via the viewport; the inline
@@ -684,10 +693,40 @@ export class TUI extends Container {
 			this.fullscreenPressedHyperlink = null;
 			this.fullscreenPressedClick = null;
 			this.fullscreen?.viewport.clearSelection();
+			this.clearFullscreenHover();
 		} else if (this.isFullscreenOverlayFocused()) {
 			this.stopSelectionAutoScroll();
+			this.clearFullscreenHover();
 		}
 		this.terminal.setMouseTracking(enabled);
+	}
+
+	/** Move the hover to the region under the pointer; regions without a hoverKey and onHover count as empty space. */
+	private updateFullscreenHover(target: FrameClickTarget | null): void {
+		const region = target?.region;
+		const key = region?.onHover ? region.hoverKey : undefined;
+		if (!region || key === undefined) {
+			this.clearFullscreenHover();
+			return;
+		}
+		const previous = this.fullscreenHover;
+		if (previous?.key === key) {
+			// Same region in a newer frame: adopt its callbacks, nothing to report or redraw.
+			previous.region = region;
+			return;
+		}
+		this.fullscreenHover = { key, region };
+		previous?.region.onHover?.(false);
+		region.onHover?.(true);
+		this.requestRender();
+	}
+
+	private clearFullscreenHover(): void {
+		const previous = this.fullscreenHover;
+		if (!previous) return;
+		this.fullscreenHover = null;
+		previous.region.onHover?.(false);
+		this.requestRender();
 	}
 
 	override invalidate(): void {
@@ -1153,7 +1192,9 @@ export class TUI extends Container {
 			}
 			if (event && !overlayFocused) {
 				const viewport = fullscreen.viewport;
-				if (isWheelUp(event) || isWheelDown(event)) {
+				if (isMouseHover(event)) {
+					this.updateFullscreenHover(viewport.clickTargetAt(event.y - 1, event.x - 1));
+				} else if (isWheelUp(event) || isWheelDown(event)) {
 					this.stopSelectionAutoScroll();
 					const direction = isWheelUp(event) ? -1 : 1;
 					// A region with its own scrolling content (a box body) takes the
@@ -1193,6 +1234,7 @@ export class TUI extends Container {
 				}
 			} else if (event && overlayFocused) {
 				this.stopSelectionAutoScroll();
+				this.clearFullscreenHover();
 				const viewport = fullscreen.viewport;
 				if (event.button === MOUSE_BUTTON_LEFT && event.press && !event.motion) {
 					if (!viewport.beginFrameSelection(event.y - 1, event.x - 1)) {

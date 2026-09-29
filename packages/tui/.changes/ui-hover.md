@@ -1,0 +1,1 @@
+- Added mouse hover in fullscreen mode: interface regions can now react when the pointer enters or leaves them, because the terminal reports plain mouse moves.
