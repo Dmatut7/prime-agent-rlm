@@ -270,10 +270,13 @@ function styled(parts: readonly MetaPart[]): string {
 	return parts.map((entry) => theme.fg(entry.color, entry.text)).join("");
 }
 
+/** Columns the left side keeps at least when a right side is drawn beside it. */
+const LEFT_MIN_ROOM = 6;
+
 /** `left` and `right` on one line of exactly `width` columns; the left side gives way. */
 function spread(left: string, right: string, width: number): string {
 	const rightWidth = visibleWidth(right);
-	if (!right || rightWidth + 6 > width) return truncateToWidth(left, width, "…", true);
+	if (!right || rightWidth + LEFT_MIN_ROOM > width) return truncateToWidth(left, width, "…", true);
 	const fitted = truncateToWidth(left, Math.max(1, width - rightWidth - 2), "…");
 	return `${fitted}${" ".repeat(Math.max(2, width - visibleWidth(fitted) - rightWidth))}${right}`;
 }
@@ -298,6 +301,17 @@ function gapLine(bg: ThemeBg, width: number): string {
 	const fill = "\x1b[48;";
 	if (!ansi.startsWith(fill)) return " ".repeat(width);
 	return `\x1b[38;${ansi.slice(fill.length)}${"▀".repeat(width)}\x1b[39m`;
+}
+
+/**
+ * A block's right side: the hint and the result, or the hint alone when both would
+ * leave the text too little room (the hint says what a click does, the result can
+ * wait); `spread` leaves out whatever still does not fit.
+ */
+function blockSide(hint: string, result: string, width: number): string {
+	if (!hint) return result;
+	const both = result ? `${hint}  ${result}` : hint;
+	return visibleWidth(both) + LEFT_MIN_ROOM > width ? hint : both;
 }
 
 function shimmerText(text: string, tick: number): string {
@@ -517,12 +531,12 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		const rowCaret = expandable ? theme.fg(opened || active ? accent : "activityText", opened ? "▾" : "▸") : " ";
 		// What a click would do, in the kind's color, ahead of the result.
 		const hint = expandable && active ? theme.fg(accent, opened ? "收起 ▴" : "点开 ▸") : "";
-		const result = rowRight(row, input);
-		const rowSide = hint && result ? `${hint}  ${result}` : hint || result;
+		const room = Math.max(0, inner - 1);
+		const rowSide = blockSide(hint, rowRight(row, input), room);
 		const left = ` ${rowCaret} ${rowGlyph(row, style, timeline, input)} ${rowWords(row, style)}`;
 		const blockBg = lit ? style.hoverBg : style.bg;
 		body.push({
-			text: `${focused ? BOX_FOCUS_MARKER : ""}${paintBg(blockBg, `${spread(left, rowSide, Math.max(0, inner - 1))} `, inner)}`,
+			text: `${focused ? BOX_FOCUS_MARKER : ""}${paintBg(blockBg, `${spread(left, rowSide, room)} `, inner)}`,
 			rowKey: row.key,
 			part: "head",
 		});
