@@ -177,7 +177,7 @@ export function subagentNoticeRow(message: CustomMessage, lane: SubagentLane): T
 	const stillOut = type === RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE || typeof name !== "string";
 	const back: TimelineReturn = stillOut
 		? { before: lane.tracker.lane, after: lane.tracker.lane }
-		: lane.comeBack(name);
+		: lane.comeBack(name, undefined, Number(message.timestamp) || undefined);
 	const id = (message.details as { childId?: unknown } | undefined)?.childId;
 	const silentMs = (message.details as { silentMs?: unknown } | undefined)?.silentMs;
 	const who = typeof name === "string" && name.trim() ? `子代理 ${name.trim()}` : "子代理";

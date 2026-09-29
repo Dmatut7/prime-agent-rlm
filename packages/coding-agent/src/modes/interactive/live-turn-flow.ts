@@ -635,7 +635,13 @@ export class LiveTurnFlow {
 		if (!this.host.quiet() || child.parentId !== this.host.rlmNodeId() || child.status === "cancelled") return;
 		let timeline: TurnActivityState["timeline"] | undefined;
 		for (const component of this.host.chat().children) {
-			if (component instanceof TurnSummaryComponent && component.state.timeline.hasSubagent(child.id)) {
+			if (
+				component instanceof TurnSummaryComponent &&
+				component.state.timeline.hasSubagent(
+					child.id,
+					laneKey(child.sessionName, child.activeSessionId) || child.label,
+				)
+			) {
 				timeline = component.state.timeline;
 			}
 		}

@@ -1,5 +1,10 @@
 import type { TimelineLane } from "./timeline-gutter.js";
 
+/** What dispatched a subagent, told when it comes back (the timeline that draws its dispatch row). */
+export interface LaneOwner {
+	subagentReturned(name: string, at: number): void;
+}
+
 /**
  * Which subagents of the current request are still out, so every timeline row
  * appended while they work draws the dotted lane (`┆`), the row that dispatches
@@ -11,10 +16,14 @@ import type { TimelineLane } from "./timeline-gutter.js";
  */
 export class TimelineLaneTracker {
 	private readonly out = new Set<string>();
+	private readonly owners = new Map<string, LaneOwner>();
 
-	/** Subagents dispatched; returns the lane for the dispatching row (`split`). */
-	spawned(names: readonly string[]): TimelineLane {
-		for (const name of names) this.out.add(name);
+	/** Subagents dispatched; returns the lane for the dispatching row (`split`). `owner` is told when one comes back. */
+	spawned(names: readonly string[], owner?: LaneOwner): TimelineLane {
+		for (const name of names) {
+			this.out.add(name);
+			if (owner) this.owners.set(name, owner);
+		}
 		return "split";
 	}
 
@@ -22,8 +31,10 @@ export class TimelineLaneTracker {
 	 * A subagent reported: `join` when it was out and the last one, `sub` while others are still
 	 * out. A name that was never out (or a late report after the lane emptied) joins nothing.
 	 */
-	reported(name: string): TimelineLane {
+	reported(name: string, at: number = Date.now()): TimelineLane {
 		const wasOut = this.out.delete(name);
+		if (wasOut) this.owners.get(name)?.subagentReturned(name, at);
+		this.owners.delete(name);
 		if (this.out.size > 0) return "sub";
 		return wasOut ? "join" : "off";
 	}
@@ -44,6 +55,7 @@ export class TimelineLaneTracker {
 
 	reset(): void {
 		this.out.clear();
+		this.owners.clear();
 	}
 }
 

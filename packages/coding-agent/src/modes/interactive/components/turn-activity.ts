@@ -741,7 +741,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		const running = this.turnState.timeline.entries.flatMap((entry) =>
 			entry.kind === "subagent" && entry.sub.status === "running" ? [entry.sub.laneName ?? entry.sub.name] : [],
 		);
-		if (tracker && running.length > 0) tracker.spawned(running);
+		if (tracker && running.length > 0) tracker.spawned(running, this.turnState.timeline);
 		this.invalidate();
 	}
 

@@ -250,7 +250,11 @@ export function createAgentMessageRow(
 	const tracker = options.lane.tracker;
 	const back =
 		message.details.fromRelationship === "child"
-			? options.lane.comeBack(message.details.from?.sessionName, message.details.from?.activeSessionId)
+			? options.lane.comeBack(
+					message.details.from?.sessionName,
+					message.details.from?.activeSessionId,
+					message.timestamp,
+				)
 			: { before: tracker.lane, after: tracker.lane };
 	return new AgentMessageComponent(message, options.markdownTheme, {
 		suppressLeadingSpace: options.previous instanceof AgentMessageComponent,

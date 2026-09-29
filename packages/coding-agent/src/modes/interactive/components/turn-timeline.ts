@@ -19,7 +19,7 @@ import {
 	type StepFeedData,
 } from "./feed-data.js";
 import type { TimelineLane } from "./timeline-gutter.js";
-import type { TimelineLaneTracker } from "./timeline-lane.js";
+import type { LaneOwner, TimelineLaneTracker } from "./timeline-lane.js";
 
 /**
  * Everything one assistant turn's box shows, in the order it happened: the
@@ -81,6 +81,11 @@ export interface TimelineSubagent {
 	report?: string;
 	startedAt: number;
 	endedAt?: number;
+}
+
+/** The key a subagent is on the lane by. */
+function subagentLane(sub: TimelineSubagent): string {
+	return sub.laneName ?? sub.name;
 }
 
 export type TimelineEntry =
@@ -304,7 +309,7 @@ export class TimelineUiState {
 	}
 }
 
-export class TurnTimeline {
+export class TurnTimeline implements LaneOwner {
 	readonly ui = new TimelineUiState();
 	readonly entries: TimelineEntry[] = [];
 	readonly stepData = new Map<string, StepFeedData>();
@@ -415,8 +420,36 @@ export class TurnTimeline {
 		partial: boolean,
 	): void {
 		const previous = this.stepData.get(toolCallId) ?? emptyStepFeedData();
-		this.stepData.set(toolCallId, mergeStepResult(previous, toolName, args, result, partial));
+		const merged = mergeStepResult(previous, toolName, args, result, partial);
+		this.stepData.set(toolCallId, merged);
+		this.noteSpawns(merged.activities);
 		this.ui.bump();
+	}
+
+	/**
+	 * A cell that started subagents (the kernel tracks each as a `subagent` record named after its
+	 * session) dispatched them, whichever way it did it: the timeline learns of the dispatch from the
+	 * record, once per subagent, when no snapshot has told it already.
+	 */
+	private noteSpawns(activities: ReadonlyArray<{ kind: string; label: string; startedAt: number }>): void {
+		for (const activity of activities) {
+			const name = activity.kind === "subagent" ? activity.label.trim() : "";
+			if (!name || this.entries.some((entry) => entry.kind === "subagent" && subagentLane(entry.sub) === name))
+				continue;
+			this.upsertSubagent(
+				{ childId: `spawn:${name}`, name, laneName: name, status: "running", startedAt: activity.startedAt },
+				activity.startedAt,
+			);
+		}
+	}
+
+	/** A subagent this turn dispatched came back (its report or notice reached the chat at `at`). */
+	subagentReturned(name: string, at: number): void {
+		for (const entry of this.entries) {
+			if (entry.kind !== "subagent" || subagentLane(entry.sub) !== name || entry.sub.status !== "running") continue;
+			entry.sub = { ...entry.sub, status: "done", endedAt: at };
+			this.ui.bump();
+		}
 	}
 
 	addSteer(text: string, at: number): void {
@@ -520,7 +553,11 @@ export class TurnTimeline {
 	/** Insert or update the row of one subagent this turn started. */
 	upsertSubagent(update: Omit<TimelineSubagent, "startedAt"> & { startedAt?: number }, now = Date.now()): void {
 		const key = `sub:${update.childId}`;
-		const existing = this.entries.find((entry) => entry.kind === "subagent" && entry.key === key);
+		const lane = update.laneName ?? update.name;
+		// The same subagent may be told twice (its spawn record, then its snapshot): one entry.
+		const existing = this.entries.find(
+			(entry) => entry.kind === "subagent" && (entry.key === key || subagentLane(entry.sub) === lane),
+		);
 		if (existing && existing.kind === "subagent") {
 			const wasRunning = existing.sub.status === "running";
 			existing.sub = {
@@ -536,13 +573,17 @@ export class TurnTimeline {
 				key,
 				sub: { ...update, startedAt: update.startedAt ?? now },
 			});
-			if (update.status === "running") this.laneTracker?.spawned([update.laneName ?? update.name]);
+			if (update.status === "running") this.laneTracker?.spawned([lane], this);
 		}
 		this.ui.bump();
 	}
 
-	hasSubagent(childId: string): boolean {
-		return this.entries.some((entry) => entry.kind === "subagent" && entry.key === `sub:${childId}`);
+	hasSubagent(childId: string, laneName?: string): boolean {
+		return this.entries.some(
+			(entry) =>
+				entry.kind === "subagent" &&
+				(entry.key === `sub:${childId}` || (laneName !== undefined && subagentLane(entry.sub) === laneName)),
+		);
 	}
 
 	messages(): AssistantMessage[] {
@@ -611,6 +652,13 @@ export class TurnTimeline {
 		// copy, live-only ones (retries, compactions, subagents) carry over as they
 		// were, and anything only the replay knows goes after them.
 		const fresh = new Map(next.entries.map((entry) => [entry.key, entry] as const));
+		// A subagent the live turn already knows is not dispatched a second time by its replayed twin.
+		const knownLanes = new Set(
+			this.entries.flatMap((entry) => (entry.kind === "subagent" ? [subagentLane(entry.sub)] : [])),
+		);
+		for (const [key, entry] of fresh) {
+			if (entry.kind === "subagent" && knownLanes.has(subagentLane(entry.sub))) fresh.delete(key);
+		}
 		// The live compaction row is the richer record of the same event as its replayed copy.
 		if (this.entries.some((entry) => entry.kind === "compact" && !entry.compaction.fromReplay)) {
 			for (const [key, entry] of fresh) {

@@ -145,11 +145,11 @@ export class SubagentLane {
 	private back = 0;
 
 	/** A subagent handed back a report, failed or finished without a word, named the way {@link laneKey} reads. */
-	comeBack(sessionName: string | undefined, fallback?: string): TimelineReturn {
+	comeBack(sessionName: string | undefined, fallback?: string, at?: number): TimelineReturn {
 		const name = laneKey(sessionName, fallback);
 		const wasOut = name !== "" && this.tracker.pending.includes(name);
 		const before = this.tracker.lane;
-		const result = wasOut ? this.tracker.reported(name) : this.tracker.lane;
+		const result = wasOut ? this.tracker.reported(name, at) : this.tracker.lane;
 		if (wasOut) this.back += 1;
 		const joined = wasOut && result === "join" ? this.back : undefined;
 		if (joined !== undefined) this.back = 0;
