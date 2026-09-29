@@ -16,7 +16,11 @@ import {
 	QuietTurnSummary,
 } from "../src/modes/interactive/components/conversation-components.js";
 import { subagentNoticeRow } from "../src/modes/interactive/components/system-notice.js";
-import { type TimelineHost, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
+import {
+	type TimelineHost,
+	TurnActivityState,
+	TurnSummaryComponent,
+} from "../src/modes/interactive/components/turn-activity.js";
 import { LiveTurnFlow } from "../src/modes/interactive/live-turn-flow.js";
 import { assistant, T0 } from "./ui-blocks-helpers.js";
 
@@ -42,6 +46,7 @@ export function handedBack(id: string, at = T0, name = "ff-review-d-keys"): Agen
 export class LiveChat {
 	readonly chat = new Container();
 	readonly flow: LiveTurnFlow;
+	private readonly timelineHost: TimelineHost;
 	private current: TurnSummaryComponent | undefined;
 	private streaming = false;
 	private clock = T0;
@@ -54,6 +59,7 @@ export class LiveChat {
 			autoFold: () => true,
 			requestRender: () => {},
 		};
+		this.timelineHost = timelineHost;
 		this.flow = new LiveTurnFlow({
 			chat: () => this.chat,
 			quiet: () => true,
@@ -169,6 +175,31 @@ export class LiveChat {
 		if (!this.flow.customMessage(message)) this.addMessageRow(message);
 		for (const other of options.also ?? []) this.addMessageRow(handedBack(other.id, this.tick(), other.name));
 		this.reply(options.model ?? "glm-5.3-prime", options.answer);
+	}
+
+	/**
+	 * A view that attaches while a step runs: the chat holds the replayed turn, live, whose last
+	 * reply is a tool call this view never saw end (no agent_start reaches it).
+	 */
+	attachMidRun(prompt: string): void {
+		this.chat.addChild(
+			createUserMessage(prompt, { quiet: true, lane: this.flow.subagentLane.tracker.lane, sentAt: this.clock }),
+		);
+		const state = new TurnActivityState(this.clock);
+		state.live = true;
+		state.modelId = "glm-5.3-prime";
+		const call = assistant(
+			this.tick(),
+			[{ type: "toolCall", id: `run${this.clock}`, name: "ipython", arguments: { code: "await bash('sleep 60')" } }],
+			"toolUse",
+		);
+		state.timeline.noteMessage(call, true);
+		const summary = new QuietTurnSummary(state);
+		summary.setTimelineHost(this.timelineHost);
+		summary.setQuiet(true);
+		this.chat.addChild(summary);
+		this.current = summary;
+		this.streaming = true;
 	}
 
 	/** The AI dispatches subagents: what a turn's dispatch row does to the lane. */

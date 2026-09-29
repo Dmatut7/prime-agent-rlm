@@ -196,7 +196,10 @@ export class LiveTurnFlow {
 	 */
 	customMessage(message: CustomMessage): boolean {
 		if (!this.host.quiet()) return false;
-		if (isWakeMessage(message) && this.lastStop !== "toolUse" && !this.runCutMidTask) {
+		// How the run's last reply ended, as a message typed in a step would read it (a view attached mid-run replays it).
+		const state = this.host.currentState();
+		const lastStop = this.lastStop ?? (state?.isTurnEnded ? undefined : this.replayedStop(state));
+		if (isWakeMessage(message) && lastStop !== "toolUse" && !this.runCutMidTask) {
 			this.starterSinceRunStart = true;
 			this.starterKind = "wake";
 			this.pendingCause ??= new WakeCause();

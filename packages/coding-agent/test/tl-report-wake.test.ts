@@ -137,6 +137,28 @@ describe("the answer a turn ends on is never taken over by the turn a message wa
 		chat.flow.dispose();
 	});
 
+	it("keeps a report that lands in the step a view attached to in that turn", () => {
+		const chat = new LiveChat();
+		chat.attachMidRun("跑一个很久的命令");
+		expect(chat.summaries()).toHaveLength(1);
+		// The view never saw the step's reply end; the replayed turn says it was a tool call.
+		expect(chat.flow.customMessage(handedBack("m1", T0 + 9_000, "review-grow-A-tui"))).toBe(false);
+		chat.flow.assistantStart(assistant(T0 + 10_000, [{ type: "text", text: "收到。" }], "stop"));
+		expect(chat.summaries()).toHaveLength(1);
+		chat.flow.dispose();
+	});
+
+	it("still starts a new turn for a report when the attached view's turn had ended", () => {
+		const chat = new LiveChat();
+		chat.prompt("你好", { answer: "在的。" });
+		vi.advanceTimersByTime(1_000);
+		chat.flow.agentStart();
+		chat.flow.customMessage(handedBack("m1", T0 + 9_000, "review-grow-A-tui"));
+		chat.flow.assistantStart(assistant(T0 + 10_000, [{ type: "text", text: "收到。" }], "stop"));
+		expect(chat.summaries()).toHaveLength(2);
+		chat.flow.dispose();
+	});
+
 	it("carries a run on in the same turn when the previous run stopped right after a step to take a message", () => {
 		const chat = new LiveChat();
 		chat.prompt("跑一个很久的命令");
