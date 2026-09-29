@@ -129,7 +129,7 @@ export function computeBoxHeader(input: BoxHeaderInput): BoxHeader {
 	if (!input.live) {
 		const summary: MetaPart[] = [];
 		summaryParts(facts).forEach((group, index) => {
-			if (index > 0) summary.push(part(" · ", "dim"));
+			if (index > 0) summary.push(part(" · ", "muted"));
 			summary.push(...group);
 		});
 		return timeline.errorEnded ? done("✗", "error", summary) : done("✓", "diffAddedText", summary);

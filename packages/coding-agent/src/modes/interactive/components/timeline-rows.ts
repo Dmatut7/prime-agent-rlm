@@ -1224,27 +1224,27 @@ export function timelineFacts(timeline: TurnTimeline, rows: readonly BoxRow[], c
 /** `想了 3 次 · 跑了 4 条命令 · 改了 1 个文件 +6 −2`, styled. */
 export function summaryParts(facts: TimelineFacts): Array<{ text: string; color: ThemeColor }[]> {
 	const parts: Array<{ text: string; color: ThemeColor }[]> = [];
-	if (facts.thinkCount > 0) parts.push([{ text: `想了 ${facts.thinkCount} 次`, color: "activityText" }]);
-	if (facts.commandCount > 0) parts.push([{ text: `跑了 ${facts.commandCount} 条命令`, color: "activityText" }]);
+	if (facts.thinkCount > 0) parts.push([{ text: `想了 ${facts.thinkCount} 次`, color: "kindThink" }]);
+	if (facts.commandCount > 0) parts.push([{ text: `跑了 ${facts.commandCount} 条命令`, color: "kindCommand" }]);
 	if (facts.readCount > 0 && facts.commandCount === 0) {
-		parts.push([{ text: `读了 ${facts.readCount} 个文件`, color: "activityText" }]);
+		parts.push([{ text: `读了 ${facts.readCount} 个文件`, color: "kindRead" }]);
 	}
 	if (facts.projectChanges.length > 0) {
 		const totals = changeTotals(facts.projectChanges);
 		parts.push([
-			{ text: `改了 ${facts.projectChanges.length} 个文件${totals ? " " : ""}`, color: "activityText" },
+			{ text: `改了 ${facts.projectChanges.length} 个文件${totals ? " " : ""}`, color: "kindEdit" },
 			...(totals ? countsMeta(totals.added, totals.removed) : []),
 		]);
 	}
-	if (facts.memories.length > 0) parts.push([{ text: `记住 ${facts.memories.length} 条`, color: "memoryAccent" }]);
-	if (facts.subagentCount > 0) parts.push([{ text: `派了 ${facts.subagentCount} 个子代理`, color: "activityText" }]);
+	if (facts.memories.length > 0) parts.push([{ text: `记住 ${facts.memories.length} 条`, color: "kindMemory" }]);
+	if (facts.subagentCount > 0) parts.push([{ text: `派了 ${facts.subagentCount} 个子代理`, color: "kindSubagent" }]);
 	if (parts.length === 0 && facts.stepCount > 0)
-		parts.push([{ text: `做了 ${facts.stepCount} 步`, color: "activityText" }]);
+		parts.push([{ text: `做了 ${facts.stepCount} 步`, color: "kindRead" }]);
 	if (facts.errorCount > 0) {
 		parts.push(
 			facts.errorsRecovered
 				? [{ text: `出错 ${facts.errorCount} 次，已改正`, color: "kindRecovered" }]
-				: [{ text: `${facts.errorCount} 处出错`, color: "error" }],
+				: [{ text: `${facts.errorCount} 处出错`, color: "kindError" }],
 		);
 	}
 	if (parts.length === 0) parts.push([{ text: facts.noOutput ? "（这轮没有输出）" : "直接回答了", color: "muted" }]);
