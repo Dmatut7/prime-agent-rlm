@@ -367,13 +367,51 @@ function thinkWindow(text: string, width: number): string[] {
 }
 
 /** A note's whole text wrapped to `width` columns, paragraph breaks kept. */
-function noteLines(fullText: string, width: number): string[] {
+function noteLines(cleanText: string, width: number): string[] {
 	const lines: string[] = [];
-	for (const paragraph of sanitizeDisplayText(fullText).split("\n")) {
-		const parts = wrapTextWithAnsi(paragraph, Math.max(8, width));
+	for (const paragraph of cleanText.split("\n")) {
+		const parts = wrapTextWithAnsi(paragraph, width);
 		lines.push(...(parts.length > 0 ? parts : [""]));
 	}
 	while (lines.length > 0 && lines.at(-1)?.trim() === "") lines.pop();
+	return lines;
+}
+
+/** What is known of one note: its words and width when it was measured, and its lines when they fit. */
+interface NoteMeasure {
+	text: string;
+	width: number;
+	lines: string[] | undefined;
+}
+
+const noteMeasures = new WeakMap<TurnTimeline["ui"], Map<string, NoteMeasure>>();
+
+function measureNote(fullText: string, width: number): string[] | undefined {
+	const room = Math.max(8, width);
+	const clean = sanitizeDisplayText(fullText);
+	// A wrapped line holds at most `room` columns and wrapping only drops blanks, so text with
+	// more visible columns than three lines hold needs more lines: no need to wrap it to know.
+	if (visibleWidth(clean.replace(/\s+/g, "")) > NOTE_MAX_LINES * room) return undefined;
+	const lines = noteLines(clean, room);
+	return lines.length > 0 && lines.length <= NOTE_MAX_LINES ? lines : undefined;
+}
+
+/**
+ * The lines of a note short enough to be plain text (at most {@link NOTE_MAX_LINES}),
+ * or undefined when it needs a block. The box is drawn many times a second and the
+ * words rarely change, so what was measured is kept for the row until its words or
+ * the width change.
+ */
+function shortNoteLines(ui: TurnTimeline["ui"], key: string, fullText: string, width: number): string[] | undefined {
+	let measures = noteMeasures.get(ui);
+	if (!measures) {
+		measures = new Map();
+		noteMeasures.set(ui, measures);
+	}
+	const known = measures.get(key);
+	if (known && known.width === width && known.text === fullText) return known.lines;
+	const lines = measureNote(fullText, width);
+	measures.set(key, { text: fullText, width, lines });
 	return lines;
 }
 
@@ -453,8 +491,8 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 	for (const row of rows) {
 		rowStart.set(row.key, body.length);
 		// A short note is plain text: not a block, so nothing to click or walk to.
-		const note = row.fullText !== undefined ? noteLines(row.fullText, hangWidth) : [];
-		if (note.length > 0 && note.length <= NOTE_MAX_LINES) {
+		const note = row.fullText !== undefined ? shortNoteLines(ui, row.key, row.fullText, hangWidth) : undefined;
+		if (note) {
 			for (const noteLine of note) {
 				body.push({
 					text: `${" ".repeat(TEXT_INDENT)}${theme.fg("muted", noteLine)}`,
