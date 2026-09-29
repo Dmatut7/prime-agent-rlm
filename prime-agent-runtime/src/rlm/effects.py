@@ -1837,6 +1837,13 @@ class _Tracker:
                     return
                 cell.files[path] = _FileRec(path, baseline, "shell")
 
+    def _prior_content(self, path: str, prior: tuple[int, int]) -> _Content:
+        """What a file was before a command, from its old signature: a link, cached bytes, or unknown."""
+        if prior[0] == _LINK_SIZE:
+            return _Content("link", None, prior)
+        data = self.cache.get(path, prior)
+        return _Content("bytes", data, prior) if data is not None else _Content("unknown", None, prior, "no_baseline")
+
     def _compare_repo(
         self,
         cell: _Cell,
@@ -1883,10 +1890,7 @@ class _Tracker:
                 if prior is None:
                     pending.append((path, _ABSENT))
                     continue
-                data = self.cache.get(path, prior)
-                pending.append(
-                    (path, _Content("bytes", data, prior) if data is not None else _Content("unknown", None, prior, "no_baseline"))
-                )
+                pending.append((path, self._prior_content(path, prior)))
                 continue
             if after.entries.get(path) == "??":
                 if current is not None:
@@ -1943,16 +1947,7 @@ class _Tracker:
                 if _entry_sig(path) is not None:
                     changes.append((path, _ABSENT))
                 continue
-            if prior[0] == _LINK_SIZE:
-                changes.append((path, _Content("link", None, prior)))
-                continue
-            data = self.cache.get(path, prior)
-            changes.append(
-                (
-                    path,
-                    _Content("bytes", data, prior) if data is not None else _Content("unknown", None, prior, "no_baseline"),
-                )
-            )
+            changes.append((path, self._prior_content(path, prior)))
 
     # --------------------------------------------------------------- records
 
@@ -1984,12 +1979,15 @@ class _Tracker:
             kind = "renamed"
         else:
             kind = "modified"
-        link = base.state == "link" or final.state == "link"
+        # A link that is gone counts as a link; one replaced by a regular file is that file, all of it new.
+        link = final.state == "link" or (base.state == "link" and not final.exists)
         if kind == "modified":
             if base.state == final.state and base.state in ("bytes", "link") and base.data == final.data:
                 return None
             if base.sig is not None and base.sig == final.sig and base.state != "bytes":
                 return None
+        if base.state == "link" and not link:
+            base = _Content("bytes", b"", base.sig)
         change: dict[str, Any] = {"path": rec.path}
         if info.rel is not None:
             change["relPath"] = info.rel

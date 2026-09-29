@@ -342,5 +342,78 @@ class AssignmentScanCostTests(unittest.TestCase):
                 self.assertLess(time.perf_counter() - started, 1.0)
 
 
+class _LinkReplacedByFile:
+    """review2-4: a symlink replaced by a regular file of the same name is a modified file, in a git work
+    tree and outside one alike: the file's lines show as new and nothing calls it a link."""
+
+    def replace_link_with_file(self) -> dict:
+        self.kernel.run("await bash('ln -s t alias')")
+        cell = self.kernel.run("await bash('rm alias; echo x > alias')")
+        self.assertEqual(sorted(cell.by_rel()), ["alias"])
+        return cell.by_rel()["alias"]
+
+    def test_the_replaced_link_is_a_plain_modified_file_with_its_lines_shown(self):
+        record = self.replace_link_with_file()
+        self.assertEqual(record["kind"], "modified")
+        self.assertEqual(record["source"], "shell")
+        self.assertNotIn("symlink", record)
+        self.assertEqual((record["added"], record["removed"]), (1, 0))
+        self.assertIn("+x\n", record["diff"])
+        self.assertNotIn("diffOmitted", record)
+
+    def test_the_replaced_link_by_an_empty_file_is_still_listed(self):
+        self.kernel.run("await bash('ln -s t alias')")
+        cell = self.kernel.run("await bash('rm alias; : > alias')")
+        record = cell.by_rel()["alias"]
+        self.assertEqual(record["kind"], "modified")
+        self.assertNotIn("symlink", record)
+        self.assertEqual((record["added"], record["removed"]), (0, 0))
+
+    def test_a_file_replaced_by_a_link_is_still_a_modified_link(self):
+        self.kernel.run("await bash('echo x > swap.txt')")
+        cell = self.kernel.run("await bash('rm swap.txt; ln -s t swap.txt')")
+        record = cell.by_rel()["swap.txt"]
+        self.assertEqual((record["kind"], record["source"]), ("modified", "shell"))
+        self.assertTrue(record.get("symlink"), record)
+        self.assertEqual((record["added"], record["removed"]), (0, 0))
+        self.assertNotIn("diff", record)
+
+    def test_a_removed_link_and_a_re_pointed_link_are_still_links(self):
+        self.kernel.run("await bash('ln -s t gone; ln -s t hop')")
+        cell = self.kernel.run("await bash('rm gone; ln -sfn u hop')")
+        files = cell.by_rel()
+        self.assertEqual(sorted(files), ["gone", "hop"])
+        self.assertEqual((files["gone"]["kind"], files["hop"]["kind"]), ("deleted", "modified"))
+        for record in files.values():
+            self.assertTrue(record.get("symlink"), record)
+            self.assertEqual((record["added"], record["removed"]), (0, 0))
+            self.assertNotIn("diff", record)
+
+
+@unittest.skipUnless(os.name == "posix", "needs symlinks")
+class NoGitLinkReplacedByFileTests(_LinkReplacedByFile, te.TrackerCase):
+    use_git = False
+
+
+@unittest.skipUnless(te.HAS_GIT and os.name == "posix", "needs git and symlinks")
+class GitLinkReplacedByFileTests(_LinkReplacedByFile, te.TrackerCase):
+    pass
+
+
+@unittest.skipUnless(te.HAS_GIT and os.name == "posix", "needs git and symlinks")
+class LinkReplacedInPythonTests(te.TrackerCase):
+    def test_a_link_removed_and_rewritten_from_python_is_a_plain_modified_file(self):
+        self.kernel.run("await bash('ln -s t alias')")
+        cell = self.kernel.run("import os\nos.remove('alias')\nopen('alias', 'w').write('x\\n')")
+        record = cell.by_rel()["alias"]
+        self.assertEqual((record["kind"], record["source"]), ("modified", "python"))
+        self.assertNotIn("symlink", record)
+        self.assertEqual((record["added"], record["removed"]), (1, 0))
+        self.assertIn("+x\n", record["diff"])
+
+
+
+
+
 if __name__ == "__main__":
     unittest.main()
