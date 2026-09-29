@@ -751,6 +751,11 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		this.invalidate();
 	}
 
+	/** Each row that landed inside the turn (the expansion keys reach them through here). */
+	forEachInlineRow(visit: (component: Component) => void): void {
+		for (const { component } of this.inlineRows) visit(component);
+	}
+
 	/**
 	 * The row that is drawn straight above a row landing at `at`, when nothing else of the turn sits
 	 * between them (two reports in a row share one blank line above).

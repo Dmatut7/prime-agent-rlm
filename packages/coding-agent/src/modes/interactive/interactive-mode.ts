@@ -10410,19 +10410,22 @@ export class InteractiveMode {
 		}
 		const state = summary.state;
 		summary.setExpanded(!state.isCollapsed);
+		const lanes = {
+			// A box shows its thinking as its own rows, never again in the answer.
+			thinking: !state.boxMode && state.thinkingExpanded,
+			// A box opens its own rows; the cards after it keep their own state.
+			tools: !state.boxMode && !state.isCollapsed,
+			agentMessages: state.agentMessagesExpanded,
+			editDiffs: !state.boxMode && !state.isCollapsed,
+		};
+		// The reports that landed inside the turn are its own rows, not children of the chat.
+		summary.forEachInlineRow((row) => applyExpansionLanes(row, lanes));
 		for (let i = start + 1; i < children.length; i++) {
 			const child = children[i];
 			if (child instanceof TurnSummaryComponent) {
 				break;
 			}
-			applyExpansionLanes(child, {
-				// A box shows its thinking as its own rows, never again in the answer.
-				thinking: !state.boxMode && state.thinkingExpanded,
-				// A box opens its own rows; the cards after it keep their own state.
-				tools: !state.boxMode && !state.isCollapsed,
-				agentMessages: state.agentMessagesExpanded,
-				editDiffs: !state.boxMode && !state.isCollapsed,
-			});
+			applyExpansionLanes(child, lanes);
 		}
 		return true;
 	}
@@ -10659,6 +10662,8 @@ export class InteractiveMode {
 					agentMessages: state.agentMessagesExpanded,
 					editDiffs: !state.boxMode && !state.isCollapsed,
 				};
+				const lanes = turnLanes;
+				child.forEachInlineRow((row) => applyExpansionLanes(row, lanes));
 				continue;
 			}
 			applyExpansionLanes(child, turnLanes ?? globalLanes);
