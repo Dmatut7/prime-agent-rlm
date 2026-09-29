@@ -451,27 +451,52 @@ describe("a subagent's notice on the timeline", () => {
 		expect(lane.tracker.pending).toEqual(["review-grow-D-hygiene"]);
 	});
 
-	it("keeps a stall warning out of sight and the subagent out", () => {
+	const stallNotice = (silentMs: number | undefined) => ({
+		role: "custom" as const,
+		customType: "rlm_child_stall_notice",
+		content: "silent",
+		display: true,
+		details: {
+			childId: "c",
+			sessionName: "review-grow-C-strip",
+			...(silentMs !== undefined ? { silentMs } : {}),
+			thresholdMs: 300_000,
+			inFlightTools: [],
+		},
+		timestamp: AT,
+	});
+
+	it("always shows a stall warning, in amber, without 完整过程, and keeps the subagent out", () => {
 		timelineShowAll.set(false);
 		const lane = new SubagentLane();
-		lane.tracker.spawned(["review-grow-C-strip"]);
-		const stall = {
-			role: "custom" as const,
-			customType: "rlm_child_stall_notice",
-			content: "silent",
-			display: true,
-			details: {
-				childId: "c",
-				sessionName: "review-grow-C-strip",
-				silentMs: 600_000,
-				thresholdMs: 300_000,
-				inFlightTools: [],
-			},
-			timestamp: AT,
-		};
-		const row = subagentNoticeRow(stall, lane);
-		expect(row?.render(W)).toEqual([]);
-		expect(lane.tracker.pending).toEqual(["review-grow-C-strip"]);
+		lane.tracker.spawned(["review-grow-C-strip", "review-grow-D-hygiene"]);
+		const row = subagentNoticeRow(stallNotice(600_000), lane);
+		const lines = plain(row?.render(W) ?? []).map((line) => line.trimEnd());
+		expect(lines).toEqual([" 18:54   ·  ┆   子代理 review-grow-C-strip 已经 10 分钟没动静"]);
+		expect(row?.render(W)[0]).toContain(theme.fg("timelineFix", "子代理 review-grow-C-strip 已经 10 分钟没动静"));
+		expect(row?.drawsNothing).toBe(false);
+		expect(lane.tracker.pending).toEqual(["review-grow-C-strip", "review-grow-D-hygiene"]);
+	});
+
+	it("words the silence in seconds, minutes and hours, and says so when it does not know how long", () => {
+		const said = (silentMs: number | undefined) =>
+			plain(subagentNoticeRow(stallNotice(silentMs), new SubagentLane())?.render(W) ?? [])[0]
+				?.trimEnd()
+				.slice(16);
+		expect(said(45_000)).toBe("子代理 review-grow-C-strip 已经 45 秒没动静");
+		expect(said(60_000)).toBe("子代理 review-grow-C-strip 已经 1 分钟没动静");
+		expect(said(3_600_000)).toBe("子代理 review-grow-C-strip 已经 1 小时没动静");
+		expect(said(5_400_000)).toBe("子代理 review-grow-C-strip 已经 1 小时 30 分钟没动静");
+		expect(said(undefined)).toBe("子代理 review-grow-C-strip 一阵没动静了");
+	});
+
+	it("keeps a silent finish and a cancel out of sight without 完整过程", () => {
+		timelineShowAll.set(false);
+		const cancelled = createRlmChildTerminalNoticeMessage(
+			{ kind: "cancelled", childId: "c", sessionName: "review-grow-C-strip", reason: "用户取消" },
+			AT,
+		);
+		expect(subagentNoticeRow(cancelled, new SubagentLane())?.render(W)).toEqual([]);
 	});
 
 	it("is undefined for any other message", () => {

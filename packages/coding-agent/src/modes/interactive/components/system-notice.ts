@@ -61,10 +61,11 @@ export class SystemNoticeLine implements Component {
 
 /**
  * A small thing that happened to a subagent (it finished without a word, was
- * cancelled, went quiet), as a row of the timeline. It stays out of sight until
- * the closing line's "完整过程 ▸" is on; a failure is shown, because the owner
- * needs it. When it is the last subagent out, the row that closes the lane
- * shows either way.
+ * cancelled, went quiet), as a row of the timeline. A silent finish and a cancel
+ * stay out of sight until the closing line's "完整过程 ▸" is on; a failure and a
+ * stall are shown, because the owner needs them (agents run unattended for
+ * days). When it is the last subagent out, the row that closes the lane shows
+ * either way.
  */
 export class TimelineNoticeRow implements Component {
 	private expanded = false;
@@ -152,6 +153,16 @@ export function isSubagentNoticeMessage(message: { role: string; customType?: st
 	);
 }
 
+/** How long a subagent has been silent, in words: `45 秒`, `10 分钟`, `1 小时 30 分钟`. */
+function silenceText(silentMs: number): string {
+	const seconds = Math.max(0, Math.floor(silentMs / 1000));
+	if (seconds < 60) return `${seconds} 秒`;
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) return `${minutes} 分钟`;
+	const hours = Math.floor(minutes / 60);
+	return minutes % 60 === 0 ? `${hours} 小时` : `${hours} 小时 ${minutes % 60} 分钟`;
+}
+
 /**
  * The timeline row for a subagent notice (its terminal, failure and stall
  * notices), releasing the subagent from the lane when the notice says it is no
@@ -168,8 +179,20 @@ export function subagentNoticeRow(message: CustomMessage, lane: SubagentLane): T
 		? { before: lane.tracker.lane, after: lane.tracker.lane }
 		: lane.comeBack(name.trim());
 	const id = (message.details as { childId?: unknown } | undefined)?.childId;
-	return new TimelineNoticeRow(record.notice, Number(message.timestamp) || Date.now(), {
-		shown: record.notice.tone === "error",
+	const silentMs = (message.details as { silentMs?: unknown } | undefined)?.silentMs;
+	const who = typeof name === "string" && name.trim() ? `子代理 ${name.trim()}` : "子代理";
+	const notice: TimelineNotice =
+		type === RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE
+			? {
+					tone: "warn",
+					text:
+						typeof silentMs === "number" && silentMs > 0
+							? `${who} 已经 ${silenceText(silentMs)}没动静`
+							: `${who} 一阵没动静了`,
+				}
+			: record.notice;
+	return new TimelineNoticeRow(notice, Number(message.timestamp) || Date.now(), {
+		shown: notice.tone !== "muted",
 		back,
 		hoverKey: `subagent-notice:${typeof id === "string" ? id : message.timestamp}`,
 	});
