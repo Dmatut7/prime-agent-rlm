@@ -226,13 +226,14 @@ export class TurnActivityState {
 
 	addFileChanges(changes: readonly FileChangeSummary[]): void {
 		for (const change of changes) {
-			if (change.added === 0 && change.removed === 0) {
+			if (change.added === 0 && change.removed === 0 && !change.omitted) {
 				continue;
 			}
 			const existing = this.changedFiles.get(change.path);
 			if (existing) {
 				existing.added += change.added;
 				existing.removed += change.removed;
+				if (change.omitted) existing.omitted = true;
 			} else {
 				this.changedFiles.set(change.path, { ...change });
 			}

@@ -8,6 +8,7 @@ import {
 import { theme } from "../theme/theme.js";
 import type { FileChangeSummary } from "./edit-summary.js";
 import { keyText } from "./keybinding-hints.js";
+import { omittedDiffText } from "./timeline-rows.js";
 
 /**
  * The per-turn process line: one line at the turn head that says what the
@@ -268,7 +269,15 @@ export class TurnFootNote implements Component {
 		const shown = changes.length > TURN_FOOT_NOTE_MAX_FILE_ROWS ? TURN_FOOT_NOTE_MAX_FILE_ROWS - 1 : changes.length;
 		for (const change of changes.slice(0, shown)) {
 			const prefix = `   ${theme.fg("dim", "改动")}  `;
-			const counts = `  ${theme.fg("toolDiffAdded", `+${change.added}`)} ${theme.fg("toolDiffRemoved", `−${change.removed}`)}`;
+			const withheld = change.omitted ? omittedDiffText("sensitive") : undefined;
+			const parts: string[] = [];
+			if (!(withheld && change.added === 0 && change.removed === 0)) {
+				parts.push(
+					`${theme.fg("toolDiffAdded", `+${change.added}`)} ${theme.fg("toolDiffRemoved", `−${change.removed}`)}`,
+				);
+			}
+			if (withheld) parts.push(theme.fg("dim", withheld));
+			const counts = `  ${parts.join(theme.fg("dim", " · "))}`;
 			const available = Math.max(1, cols - visibleWidth(prefix) - visibleWidth(counts));
 			const path = theme.fg("muted", shortenPath(change.path, available));
 			rows.push(truncateToWidth(`${prefix}${path}${counts}`, cols, ""));

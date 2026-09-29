@@ -16,6 +16,8 @@ export interface FileChangeSummary {
 	removed: number;
 	/** True when the change is to the link itself: no line counts apply. */
 	symlink?: boolean;
+	/** True when an edit of the file was withheld because its text looks secret: only the path is known. */
+	omitted?: true;
 }
 
 export function countChangedLines(diff: string): { added: number; removed: number } {
@@ -29,13 +31,14 @@ export function countChangedLines(diff: string): { added: number; removed: numbe
 }
 
 function mergeFileChange(target: Map<string, FileChangeSummary>, change: FileChangeSummary, cwd: string): void {
-	if (change.added === 0 && change.removed === 0 && !change.symlink) return;
+	if (change.added === 0 && change.removed === 0 && !change.symlink && !change.omitted) return;
 	const key = canonicalizePath(resolveToCwd(change.path, cwd));
 	const existing = target.get(key);
 	if (existing) {
 		existing.added += change.added;
 		existing.removed += change.removed;
 		if (change.symlink) existing.symlink = true;
+		if (change.omitted) existing.omitted = true;
 	} else {
 		target.set(key, { ...change });
 	}
@@ -68,8 +71,11 @@ export function getToolFileChanges(
 			return [...changes.values()];
 		}
 		for (const display of (result.details as IpythonToolDetails | undefined)?.diffs ?? []) {
-			// A withheld edit has neither texts nor counts to add up.
-			if (display.omitted) continue;
+			// A withheld edit has neither texts nor counts to add up: the file is listed, marked.
+			if (display.omitted) {
+				mergeFileChange(changes, { path: display.path, added: 0, removed: 0, omitted: true }, cwd);
+				continue;
+			}
 			const { diff } = generateDiffString(display.oldStr, display.newStr, 4, display.startLine ?? 1);
 			mergeFileChange(changes, { path: display.path, ...countChangedLines(diff) }, cwd);
 		}
@@ -153,5 +159,8 @@ export function formatTotalChangeSummary(changes: readonly FileChangeSummary[]):
 		{ added: 0, removed: 0 },
 	);
 	const files = `改动 ${changes.length} 个文件`;
+	const onlyWithheld =
+		changes.length > 0 && changes.every((change) => change.omitted && !change.added && !change.removed);
+	if (onlyWithheld) return theme.fg("muted", files);
 	return `${theme.fg("muted", files)}${theme.fg("dim", " · ")}${formatChangeCounts(totals)}`;
 }

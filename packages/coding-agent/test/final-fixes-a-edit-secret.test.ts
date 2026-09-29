@@ -163,17 +163,20 @@ describe("renderers show a withheld edit as the reason, not as a diff", () => {
 		expect(changeDetail(entry)(80).map((line) => stripAnsi(line))).toEqual([SENSITIVE_TEXT]);
 	});
 
-	it("the count summaries skip a withheld edit instead of failing on its missing texts", () => {
+	it("the count summaries list a withheld edit, marked and without counts, instead of failing on its missing texts", () => {
 		const changes = getToolFileChanges(
 			"ipython",
 			{},
 			{ details: { diffs: [withheld, { path: "b.ts", oldStr: "old", newStr: "new" }] }, isError: false },
 			"/work/app",
 		);
-		expect(changes).toEqual([{ path: "b.ts", added: 1, removed: 1 }]);
+		expect(changes).toEqual([
+			{ path: withheld.path, added: 0, removed: 0, omitted: true },
+			{ path: "b.ts", added: 1, removed: 1 },
+		]);
 		expect(
 			getToolFileChanges("ipython", {}, { details: { diffs: [withheld] }, isError: false }, "/work/app"),
-		).toEqual([]);
+		).toEqual([{ path: withheld.path, added: 0, removed: 0, omitted: true }]);
 	});
 });
 
