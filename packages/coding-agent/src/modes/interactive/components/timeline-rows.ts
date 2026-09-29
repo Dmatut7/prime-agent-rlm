@@ -86,6 +86,29 @@ export interface BoxRow {
 	persistent?: boolean;
 	/** Files a merged read row covers. */
 	files?: string[];
+	/** The event this row belongs to (its step list); absent for rows no event lists. */
+	groupKey?: string;
+}
+
+/** One line of the timeline: what the AI said it does or found, with its steps behind `N 步 ▸`. */
+export interface TimelineEvent {
+	key: string;
+	/** `say`: the AI's words (or a summary of its steps when it said none); `steer`: you cut in; `fail`: the turn ended on this error. */
+	kind: "say" | "steer" | "fail";
+	/** When it happened (ms); 0 when unknown. */
+	at: number;
+	/** The first paragraph, on one line. */
+	text: string;
+	/** The whole text the AI wrote; it says more than `text` when it has more paragraphs or is cut to the line. */
+	full?: string;
+	/** `full` says more than `text`: more paragraphs, or a text cut to its cap. */
+	more?: true;
+	/** The commands, thoughts and edits behind the line. */
+	steps: BoxRow[];
+	/** Subagents dispatched at this point, in order, each with the short tag of its task. */
+	spawned: Array<{ name: string; tag?: string; running: boolean }>;
+	/** `fail`: the failed row (its opened lines say why). */
+	row?: BoxRow;
 }
 
 export interface RowStep {
@@ -1030,7 +1053,13 @@ function mergeReads(rows: BoxRow[]): BoxRow[] {
 	const out: BoxRow[] = [];
 	for (const row of rows) {
 		const last = out.at(-1);
-		if (row.kind === "read" && row.status !== "failed" && last?.kind === "read" && last.status !== "failed") {
+		if (
+			row.kind === "read" &&
+			row.status !== "failed" &&
+			last?.kind === "read" &&
+			last.status !== "failed" &&
+			last.groupKey === row.groupKey
+		) {
 			const files = [...(last.files ?? [last.text]), ...(row.files ?? [row.text])];
 			const running = row.status === "running" || last.status === "running";
 			const current = row.status === "running" ? (row.files?.[0] ?? row.text) : undefined;
@@ -1128,8 +1157,75 @@ function endedWell(timeline: TurnTimeline, ctx: RowBuildContext): boolean {
 	return false;
 }
 
+/** What the timeline lists, in order, before the rows are grouped under their events. */
+type TimelineItem =
+	| {
+			type: "event";
+			key: string;
+			at: number;
+			lead: string[];
+			spawned: Array<{ name: string; tag?: string; running: boolean }>;
+	  }
+	| { type: "steer"; key: string; at: number; text: string }
+	| { type: "fail"; key: string; at: number };
+
+/** Whether an event's whole text says more than its line: more paragraphs, or a line cut short. */
+export function eventSaysMore(event: TimelineEvent): boolean {
+	return event.more === true;
+}
+
+/** Widest the short task tag beside a subagent's name may be. */
+export const TASK_TAG_MAX_WIDTH = 14;
+
+/** `钉住框头` from a task label like `A 钉住框头，看它有没有钉住`: the name is dropped, the first clause is kept. */
+export function subagentTaskTag(label: string, name: string): string | undefined {
+	let brief = label.replace(/\s+/g, " ").trim();
+	const own = name.trim().toLowerCase();
+	if (own && brief.toLowerCase().startsWith(own) && !/[\p{L}\p{N}]/u.test(brief.charAt(own.length))) {
+		brief = brief.slice(own.length).replace(/^[\s:：,，\-—]+/, "");
+	}
+	const clause = brief.split(/[。！？!?；;：:，,]|\.\s|\s[—-]{1,2}\s/)[0]?.trim();
+	return clause ? truncateToWidth(clause, TASK_TAG_MAX_WIDTH, "…") : undefined;
+}
+
+/** Most characters an event's line keeps: past any terminal's width, and cheap to cut and paint. */
+const EVENT_TEXT_MAX_CHARS = 400;
+
+/** The first paragraph of a text on one line, and whether the text has more than that. */
+function firstParagraph(text: string): { line: string; more: boolean } {
+	const boundary = /\n\s*\n/.exec(text);
+	const paragraph = boundary ? text.slice(0, boundary.index) : text;
+	const rest = boundary ? text.slice(boundary.index + boundary[0].length) : "";
+	const kept = paragraph.slice(0, EVENT_TEXT_MAX_CHARS * 2);
+	const line = sanitizeDisplayText(kept).replace(/\s+/g, " ").trim().slice(0, EVENT_TEXT_MAX_CHARS);
+	return { line, more: rest.trim().length > 0 || paragraph.length > kept.length || line.length < kept.trim().length };
+}
+
+/** What an event says when the AI said nothing: its steps in a few words. */
+function stepsSummary(steps: readonly BoxRow[], spawned: number): string {
+	const count = (kind: BoxRowKind) => steps.filter((row) => row.kind === kind).length;
+	const reads = steps.reduce((sum, row) => sum + (row.kind === "read" ? (row.files?.length ?? 1) : 0), 0);
+	const parts: string[] = [];
+	if (count("think") > 0) parts.push(`想了 ${count("think")} 次`);
+	if (count("cmd") > 0) parts.push(`跑了 ${count("cmd")} 条命令`);
+	if (reads > 0) parts.push(`读了 ${reads} 个文件`);
+	if (count("edit") > 0) parts.push(`改了 ${count("edit")} 个文件`);
+	if (count("memory") > 0) parts.push(`记住 ${count("memory")} 条`);
+	if (spawned > 0) parts.push(`派了 ${spawned} 个子代理`);
+	if (parts.length === 0) parts.push(`做了 ${steps.length} 步`);
+	return parts.join(" · ");
+}
+
 /** Every row of a turn, in order. */
 export function buildTimelineRows(timeline: TurnTimeline, baseCtx: RowBuildContext): BoxRow[] {
+	return buildTimelineView(timeline, baseCtx).rows;
+}
+
+/** Every row of a turn, and the events the timeline draws them under. */
+export function buildTimelineView(
+	timeline: TurnTimeline,
+	baseCtx: RowBuildContext,
+): { rows: BoxRow[]; events: TimelineEvent[] } {
 	const settledActivities = new Map<string, { stepId: string; activity: KernelActivity }>();
 	const activityOrigins = new Map<string, string>();
 	for (const step of baseCtx.steps.values()) {
@@ -1143,6 +1239,28 @@ export function buildTimelineRows(timeline: TurnTimeline, baseCtx: RowBuildConte
 	}
 	const ctx: RowBuildContext = { ...baseCtx, settledActivities, activityOrigins };
 	const rows: BoxRow[] = [];
+	const items: TimelineItem[] = [];
+	type EventItem = Extract<TimelineItem, { type: "event" }>;
+	let current: EventItem | undefined;
+	// A turn that went fine corrected its mistakes itself: only one that did not end well shows its failure as a line.
+	const recovered = endedWell(timeline, ctx);
+	const openEvent = (key: string, at: number, lead: string[] = []): EventItem => {
+		const item: EventItem = { type: "event", key, at, lead, spawned: [] };
+		items.push(item);
+		current = item;
+		return item;
+	};
+	const place = (row: BoxRow, entryKey: string, at: number): void => {
+		if (row.persistent && !recovered && !ctx.live) {
+			const key = `ev:${row.key}`;
+			items.push({ type: "fail", key, at });
+			current = undefined;
+			rows.push({ ...row, groupKey: key });
+			return;
+		}
+		const group = current ?? openEvent(`ev:${entryKey}:auto`, at);
+		rows.push({ ...row, groupKey: group.key });
+	};
 	const snapshotNames = new Set(
 		timeline.entries.flatMap((entry) => (entry.kind === "subagent" ? [entry.sub.name] : [])),
 	);
@@ -1163,20 +1281,51 @@ export function buildTimelineRows(timeline: TurnTimeline, baseCtx: RowBuildConte
 	timeline.entries.forEach((entry, entryIndex) => {
 		if (entry.kind !== "message") {
 			const row = eventRow(entry, ctx);
-			if (row) rows.push(row);
+			if (entry.kind === "subagent") {
+				if (row) rows.push(row);
+				const group = current ?? openEvent(`ev:${entry.key}:auto`, entry.sub.startedAt);
+				const tag = subagentTaskTag(entry.sub.label ?? "", entry.sub.name);
+				group.spawned.push({
+					name: entry.sub.name,
+					...(tag ? { tag } : {}),
+					running: entry.sub.status === "running" && !ctx.stopped,
+				});
+			} else if (entry.kind === "steer") {
+				const key = `ev:${entry.key}`;
+				items.push({ type: "steer", key, at: entry.at, text: entry.text });
+				current = undefined;
+				if (row) rows.push({ ...row, groupKey: key });
+			} else if (row) {
+				const at =
+					entry.kind === "retry"
+						? entry.retry.startedAt
+						: entry.kind === "compact"
+							? entry.compaction.startedAt
+							: entry.at;
+				place(row, entry.key, at);
+			}
 			return;
 		}
 		const content = entry.message.content ?? [];
+		const at = entry.message.timestamp ?? 0;
 		// An answer a later reply of the turn took over lives on as rows here.
 		const superseded = entry.ended && isPlainAnswer(entry.message) && laterWork[entryIndex] === true;
 		const thinking = thinkRows(timeline, entry, ctx, superseded);
+		// Words the AI wrote before its calls (or an answer taken over) are the line its steps hang under.
+		const said = thinking.filter((row) => row.kind === "say");
+		if (said.length > 0)
+			openEvent(
+				`ev:${entry.key}`,
+				at,
+				said.map((row) => row.fullText ?? row.text),
+			);
 		let thinkingIndex = 0;
 		content.forEach((block, index) => {
 			if (block.type === "thinking" || block.type === "text") {
 				const rowKeyPrefix = block.type === "thinking" ? "think:" : "say:";
 				const row = thinking[thinkingIndex];
 				if (row && row.key === `${rowKeyPrefix}${entry.key}:${index}`) {
-					rows.push(row);
+					place(row, entry.key, at);
 					thinkingIndex++;
 				}
 				return;
@@ -1196,41 +1345,85 @@ export function buildTimelineRows(timeline: TurnTimeline, baseCtx: RowBuildConte
 			for (const row of stepRows(step, timeline, ctx, order++)) {
 				// A subagent the session reported live already has its own row.
 				if (row.kind === "subagent" && snapshotNames.has(row.text.replace(/^子代理 /, ""))) continue;
-				rows.push(row);
+				place(row, entry.key, at);
 			}
 		});
 		const message = entry.message;
 		if (entry.ended && message.stopReason === "error" && message.errorMessage && lastRetryIndex < entryIndex) {
-			rows.push({
-				key: `err:${entry.key}`,
-				kind: "error",
-				status: "failed",
-				glyph: "✗",
-				glyphColor: "error",
-				text: `模型出错：${sanitizeDisplayText(message.errorMessage).split("\n")[0] ?? ""}`,
-				textColor: "error",
-				meta: [],
-				persistent: true,
-				detail: (width) => preformatted(message.errorMessage ?? "", width),
-			});
+			place(
+				{
+					key: `err:${entry.key}`,
+					kind: "error",
+					status: "failed",
+					glyph: "✗",
+					glyphColor: "error",
+					text: `模型出错：${sanitizeDisplayText(message.errorMessage).split("\n")[0] ?? ""}`,
+					textColor: "error",
+					meta: [],
+					persistent: true,
+					detail: (width) => preformatted(message.errorMessage ?? "", width),
+				},
+				entry.key,
+				at,
+			);
 		}
 	});
 	// A step whose message the timeline never saw still gets its rows, after the rest.
 	for (const step of ctx.steps.values()) {
-		if (!seenSteps.has(step.toolCallId)) rows.push(...stepRows(step, timeline, ctx, order++));
+		if (seenSteps.has(step.toolCallId)) continue;
+		for (const row of stepRows(step, timeline, ctx, order++))
+			place(row, `step:${step.toolCallId}`, step.startedAt ?? 0);
 	}
 	const merged = mergeReads(rows);
 	const settled = ctx.stopped ? merged.map((row) => (row.status === "running" ? stoppedRow(row) : row)) : merged;
-	// A mistake a turn that went fine corrected no longer hangs outside the folded box: its header says so.
-	const recovered = endedWell(timeline, ctx);
 	// Every block opens: one with no lines of its own opens to the facts of its step. A note
 	// (its whole text is on the row) is not a block and stays as it is.
-	return settled.map((row) => {
+	const finished = settled.map((row) => {
 		const shown = recovered && row.kind === "error" && row.persistent ? { ...row, persistent: false } : row;
 		return shown.detail === undefined && shown.fullText === undefined
 			? { ...shown, detail: factsDetail(shown, ctx.now), factsOnly: true as const }
 			: shown;
 	});
+	const stepsByGroup = new Map<string, BoxRow[]>();
+	for (const row of finished) {
+		if (row.groupKey === undefined || row.kind === "say") continue;
+		const list = stepsByGroup.get(row.groupKey) ?? [];
+		list.push(row);
+		stepsByGroup.set(row.groupKey, list);
+	}
+	const events = items.flatMap((item): TimelineEvent[] => {
+		if (item.type === "steer")
+			return [{ key: item.key, kind: "steer", at: item.at, text: item.text, steps: [], spawned: [] }];
+		if (item.type === "fail") {
+			const row = stepsByGroup.get(item.key)?.[0];
+			if (!row) return [];
+			const text = sanitizeDisplayText(`${row.keyword ?? ""}${row.text}`)
+				.replace(/\s+/g, " ")
+				.trim();
+			return [{ key: item.key, kind: "fail", at: item.at, text, steps: [], spawned: [], row }];
+		}
+		const steps = stepsByGroup.get(item.key) ?? [];
+		const lead = item.lead
+			.map((part) => part.trim())
+			.filter((part) => part.length > 0)
+			.join("\n\n");
+		if (!lead && steps.length === 0 && item.spawned.length === 0) return [];
+		const first = lead ? firstParagraph(lead) : undefined;
+		const text = first ? first.line : stepsSummary(steps, item.spawned.length);
+		return [
+			{
+				key: item.key,
+				kind: "say",
+				at: item.at,
+				text,
+				...(lead ? { full: lead } : {}),
+				...(first?.more ? { more: true as const } : {}),
+				steps,
+				spawned: item.spawned,
+			},
+		];
+	});
+	return { rows: finished, events };
 }
 
 /** The facts a finished box's header and the change strip say. */

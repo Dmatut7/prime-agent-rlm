@@ -19,6 +19,7 @@ import {
 } from "../src/modes/interactive/components/running-card.js";
 import { turnStepLabel } from "../src/modes/interactive/components/step-label.js";
 import { SystemNoticeLine } from "../src/modes/interactive/components/system-notice.js";
+import { formatTimelineTime } from "../src/modes/interactive/components/timeline-gutter.js";
 import { TurnActivityState, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import {
 	sentAtText,
@@ -221,7 +222,7 @@ describe("the ◆ prime header and the gutter", () => {
 		).toBe(" ◆ prime  glm-5.3-prime · ⠸ working 9m 28s");
 	});
 
-	it("puts a settled turn's box under the header: a summary line, the clock and the tokens", () => {
+	it("draws a settled turn as one event line with what it did and its step count, no title and no card", () => {
 		const state = new TurnActivityState(T0);
 		state.modelId = "glm-5.3-prime";
 		state.addStep({ toolCallId: "a", toolName: "bash", args: { command: "npm test" }, status: "queued" });
@@ -231,24 +232,33 @@ describe("the ◆ prime header and the gutter", () => {
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
 		const lines = plain(summary.render(100));
-		expect(lines[0]).toBe(" ◆ prime  glm-5.3-prime");
-		// A settled box that keeps nothing on show is its header card alone: no frame.
-		expect(lines).toHaveLength(2);
-		expect(lines[1]).toMatch(/^ +✓ 完成 +跑了 1 条命令 +4秒 · ↓ 0 › *$/);
-		// The `◆ prime` line and the box header both open the box.
+		// The `◆ prime` title line and the header card (pill, clock, tokens) are gone: the summary is the event line.
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatch(new RegExp(`^ ${formatTimelineTime(T0)} {3}◆ {6}跑了 1 条命令 +1 步 ▸ {2}$`));
+		expect(lines.join("\n")).not.toMatch(/◆ prime|✓ 完成|进行中|4秒|↓ 0/);
+		// The event line is the one target and opens the step behind it.
 		const regions = summary.getClickRegions().filter((region) => !region.passive);
-		expect(regions[0]).toMatchObject({ line: 0, col: 0 });
-		expect(regions.some((region) => region.line === 1)).toBe(true);
+		expect(regions).toHaveLength(1);
+		expect(regions[0]).toMatchObject({ line: 0, col: 0, width: 100 });
+		regions[0]?.onClick({ line: 0, col: 0 } as never);
+		const opened = plain(summary.render(100));
+		expect(opened).toHaveLength(2);
+		expect(opened[0]).toMatch(/1 步 ▴ {2}$/);
+		expect(opened[1]).toMatch(/^ {9}│ {11}\$ {2}npm test +✓ 完成 {4}$/);
+		expect(state.boxOpen).toBe(true);
 	});
 
-	it("renders the live turn as the header plus a box that says what it is doing", () => {
+	it("draws the live turn as the spinner line that says what it is doing, with nothing to open yet", () => {
 		const state = liveState();
 		state.notePhase("waiting", T0);
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
 		const lines = plain(summary.render(100));
-		expect(lines[0]).toBe(" ◆ prime  glm-5.3-prime");
-		expect(lines[2]).toMatch(/^ │ +\S 进行中 +等待模型回应… /);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatch(/^ \d\d:\d\d {3}[⠀-⣿] {6}等待模型回应… *$/);
+		expect(lines.join("\n")).not.toMatch(/◆ prime|进行中/);
+		expect(summary.getClickRegions()).toHaveLength(0);
+		expect(summary.getFocusOrder()).toHaveLength(0);
 	});
 
 	it("runs a quiet answer flush under its box, with no rail", () => {

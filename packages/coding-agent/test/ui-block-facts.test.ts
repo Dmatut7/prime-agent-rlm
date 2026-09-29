@@ -1,14 +1,13 @@
 import { type ClickRegion, setKeybindings } from "@earendil-works/pi-tui";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
-import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
+import { theme } from "../src/modes/interactive/theme/theme.js";
 import {
 	addActivities,
 	addCommand,
 	addSay,
 	addThought,
 	host,
-	lineIndexWith,
 	plain,
 	type QuietTurn,
 	quietTurn,
@@ -27,27 +26,24 @@ afterAll(() => {
 	restoreTheme();
 });
 
-afterEach(() => {
-	setMotionReduced(false);
-});
-
 const WIDTH = 60;
 const LONG_PATH = "packages/coding-agent/src/modes/interactive/components/very-long-directory-name/some-file.md";
 const LONG_COMMAND = "grep -rn --include=*.ts onAction packages/coding-agent/src/modes/interactive | wc -l";
 const LONG_QUERY = "how does the timeline decide which rows are persistent when the turn folds up";
+const LONG_NAME = "审查员·屏幕与设置与输出预算的只读审查车道";
 
-/** A step the box draws as a block that has no lines of its own to open. */
+/** A step the timeline draws as a line that has no lines of its own to open. */
 interface FactsCase {
 	name: string;
-	/** What the block's own row starts with (still readable at 60 columns). */
+	/** What the step's own line starts with (still readable at 60 columns). */
 	needle: string;
-	/** The whole text of the step: cut off in the row, whole in the opened panel. */
+	/** The whole text of the step: cut off in the line, whole in the opened lines. */
 	full: string;
-	/** What the right side of the row says, repeated in the panel. */
+	/** What the right side of the line says, repeated in the opened lines. */
 	result?: string;
-	/** The panel says when the step happened. */
+	/** The opened lines say when the step happened. */
 	timed: boolean;
-	/** The panel says the command printed nothing. */
+	/** The opened lines say the command printed nothing. */
 	noOutput?: boolean;
 	build: (turn: QuietTurn) => void;
 }
@@ -55,7 +51,7 @@ interface FactsCase {
 const CASES: FactsCase[] = [
 	{
 		name: "a general step",
-		needle: "✓ 搜索 how does",
+		needle: "✓  搜索 how does",
 		full: `搜索 ${LONG_QUERY}`,
 		result: "✓ 3 条",
 		timed: true,
@@ -74,7 +70,7 @@ const CASES: FactsCase[] = [
 	},
 	{
 		name: "a command that printed nothing",
-		needle: `$ ${LONG_COMMAND.slice(0, 20)}`,
+		needle: `$  ${LONG_COMMAND.slice(0, 20)}`,
 		full: LONG_COMMAND,
 		result: "✓ 完成",
 		timed: true,
@@ -94,44 +90,23 @@ const CASES: FactsCase[] = [
 	},
 	{
 		name: "a single file read",
-		needle: "✓ 读取 packages/coding-agent",
+		needle: "✓  读取 packages/coding-agent",
 		full: `读取 ${LONG_PATH}`,
 		timed: true,
 		build: (turn) =>
 			addActivities(turn, "r1", [{ id: "a", kind: "read", label: LONG_PATH, status: "ok", startedAt: T0 - 2_000 }]),
 	},
 	{
-		name: "a subagent that reported nothing",
-		needle: "◇ 子代理 审查员",
-		full: "子代理 审查员·屏幕与设置与输出预算的只读审查车道",
-		result: "✓ 好了",
-		timed: true,
-		build: (turn) =>
-			turn.timeline.upsertSubagent(
-				{
-					childId: "c9",
-					name: "审查员·屏幕与设置与输出预算的只读审查车道",
-					status: "done",
-					result: "好了",
-					startedAt: T0 - 5_000,
-				},
-				T0 - 1_000,
-			),
-	},
-	{
 		name: "a notice",
-		needle: "◇ 子代理 审查员",
-		full: "子代理 审查员·屏幕与设置与输出预算的只读审查车道 做完了，没发回消息",
+		needle: "◇  子代理 审查员",
+		full: `子代理 ${LONG_NAME} 做完了，没发回消息`,
 		timed: true,
 		build: (turn) =>
-			turn.timeline.addNotice(
-				{ tone: "muted", text: "子代理 审查员·屏幕与设置与输出预算的只读审查车道 做完了，没发回消息" },
-				T0 - 4_000,
-			),
+			turn.timeline.addNotice({ tone: "muted", text: `子代理 ${LONG_NAME} 做完了，没发回消息` }, T0 - 4_000),
 	},
 	{
 		name: "a retry",
-		needle: "↻ 模型接口超时",
+		needle: "↻  模型接口超时",
 		full: "模型接口超时，已自动重试",
 		timed: true,
 		build: (turn) => {
@@ -141,7 +116,7 @@ const CASES: FactsCase[] = [
 	},
 	{
 		name: "a compaction",
-		needle: "⇣ 整理完成",
+		needle: "⇣  整理完成",
 		full: "整理完成：182k → 41k tokens，重要的结论都留着",
 		timed: true,
 		build: (turn) => {
@@ -153,7 +128,7 @@ const CASES: FactsCase[] = [
 	},
 	{
 		name: "a memory without texts",
-		needle: "✦ 记住：go",
+		needle: "✦  记住：go",
 		full: "记住：go · http · 请求要带 · context",
 		result: "新记",
 		timed: false,
@@ -166,67 +141,109 @@ const CASES: FactsCase[] = [
 	},
 ];
 
+const hoverBg = () => theme.getBgAnsi("timelineHoverBg");
+
+function regionsOn(turn: QuietTurn, line: number): ClickRegion[] {
+	return turn.summary.getClickRegions().filter((region) => region.line === line);
+}
+
+/** The one click area of a line, or undefined. */
 function clickable(turn: QuietTurn, line: number): ClickRegion | undefined {
-	return turn.summary.getClickRegions().find((region) => region.line === line && !region.passive);
+	const regions = regionsOn(turn, line);
+	expect(regions.length).toBeLessThanOrEqual(1);
+	return regions[0];
+}
+
+/** Index of the first line after the first whose plain text contains `needle`, or -1. */
+function lineOf(lines: readonly string[], needle: string): number {
+	return plain(lines).findIndex((line, index) => index > 0 && line.includes(needle));
+}
+
+/** Opens every event that lists steps and draws the turn. */
+function openAll(turn: QuietTurn, width = WIDTH): string[] {
+	turn.summary.toggleBox();
+	return turn.summary.render(width);
 }
 
 const squeeze = (value: string) => value.replace(/\s+/g, "");
 
-/** The lines of the panel hanging under the block, without the frame and the bar. */
-function panelText(turn: QuietTurn, head: number): string {
-	const lines = plain(turn.summary.render(WIDTH));
-	const panel: string[] = [];
-	for (let index = head + 1; index < lines.length && /^ │ ▎/.test(lines[index] ?? ""); index++) {
-		panel.push((lines[index] ?? "").replace(/^ │ ▎|│$/g, ""));
+/** The lines an opened step lists under its own line (eight columns further in than its glyph). */
+function detailText(turn: QuietTurn, head: number, width = WIDTH): string {
+	const lines = plain(turn.summary.render(width));
+	const detail: string[] = [];
+	for (let index = head + 1; index < lines.length && /^ {9}│ {14}\S/.test(lines[index] ?? ""); index++) {
+		detail.push((lines[index] ?? "").replace(/^ {9}│ {14}/, ""));
 	}
-	return panel.join("\n");
+	return detail.join("\n");
 }
 
-describe("a block with nothing of its own to open opens to the facts of its step", () => {
-	it("covers every kind of block that has no lines of its own", () => {
+describe("a step with nothing of its own to open opens to the facts of its step", () => {
+	it("covers every kind of step that has no lines of its own", () => {
 		expect(CASES.length).toBeGreaterThan(0);
 		for (const testCase of CASES) {
-			setMotionReduced(true);
 			const turn = quietTurn({ host: host({ viewportRows: () => 60 }) });
 			testCase.build(turn);
-			const closed = turn.summary.render(WIDTH);
-			const at = lineIndexWith(closed, testCase.needle);
+			const closed = openAll(turn);
+			const at = lineOf(closed, testCase.needle);
 			expect(at, `${testCase.name} is drawn`).toBeGreaterThan(0);
-			// It looks and behaves like any block: a caret, a click area with hover fields, a hint under the pointer.
-			expect(plain(closed)[at], `${testCase.name} caret`).toContain("▸");
+			const stepKey = turn.summary.getFocusOrder().at(-1) ?? "";
+			expect(stepKey.startsWith("ev:"), `${testCase.name} is a step of its event`).toBe(false);
+			// It behaves like any step: a click area with hover fields, and nothing around it that clicks too.
 			const region = clickable(turn, at);
 			expect(region, `${testCase.name} click area`).toBeDefined();
 			expect(region?.hoverKey, `${testCase.name} hover key`).toBeTypeOf("string");
 			expect(region?.onHover, `${testCase.name} hover callback`).toBeTypeOf("function");
-			expect(clickable(turn, at + 1)?.hoverKey, `${testCase.name} separator hover key`).toBe(region?.hoverKey);
+			expect(clickable(turn, at + 1), `${testCase.name} row under it`).toBeUndefined();
+			expect(turn.summary.enterLabel(stepKey), `${testCase.name} enter label`).toBe("展开");
+			// Under the pointer the whole line takes the hover color and nothing in it moves.
 			region?.onHover?.(true);
-			expect(plain(turn.summary.render(WIDTH))[at], `${testCase.name} hint`).toContain("点开 ▸");
+			const lit = turn.summary.render(WIDTH);
+			expect(lit[at], `${testCase.name} hover color`).toContain(hoverBg());
+			expect(plain(lit)[at], `${testCase.name} hover keeps the words`).toBe(plain(closed)[at]);
 			region?.onHover?.(false);
+			expect(turn.summary.render(WIDTH)[at], `${testCase.name} hover leaves`).not.toContain(hoverBg());
 
-			// A click opens the panel with the step's whole text and its facts.
+			// A click opens the step's whole text and its facts under it.
 			region?.onClick({ row: 0, col: 0 });
-			const opened = plain(turn.summary.render(WIDTH));
-			expect(opened[at], `${testCase.name} opened caret`).toContain("▾");
-			const panel = panelText(turn, at);
-			expect(panel.length, `${testCase.name} panel`).toBeGreaterThan(0);
-			expect(squeeze(panel), `${testCase.name} whole text`).toContain(squeeze(testCase.full));
+			expect(turn.summary.enterLabel(stepKey), `${testCase.name} opened`).toBe("收起");
+			const detail = detailText(turn, at);
+			expect(detail.length, `${testCase.name} opened lines`).toBeGreaterThan(0);
+			expect(squeeze(detail), `${testCase.name} whole text`).toContain(squeeze(testCase.full));
 			if (testCase.result) {
-				expect(panel, `${testCase.name} result label`).toMatch(/结果/);
-				expect(squeeze(panel), `${testCase.name} result`).toContain(squeeze(testCase.result));
+				expect(detail, `${testCase.name} result label`).toMatch(/结果/);
+				expect(squeeze(detail), `${testCase.name} result`).toContain(squeeze(testCase.result));
 			}
-			if (testCase.timed) expect(panel, `${testCase.name} time`).toMatch(/时间\s+\d\d:\d\d:\d\d/);
-			else expect(panel, `${testCase.name} has no time`).not.toMatch(/\d\d:\d\d:\d\d/);
-			if (testCase.noOutput) expect(panel, `${testCase.name} no output`).toContain("没有输出");
-			else expect(panel, `${testCase.name} has output or none to say`).not.toContain("没有输出");
+			if (testCase.timed) expect(detail, `${testCase.name} time`).toMatch(/时间\s+\d\d:\d\d:\d\d/);
+			else expect(detail, `${testCase.name} has no time`).not.toMatch(/\d\d:\d\d:\d\d/);
+			if (testCase.noOutput) expect(detail, `${testCase.name} no output`).toContain("没有输出");
+			else expect(detail, `${testCase.name} has output or none to say`).not.toContain("没有输出");
 
 			// Clicking again closes it.
 			clickable(turn, at)?.onClick({ row: 0, col: 0 });
-			expect(plain(turn.summary.render(WIDTH))[at], `${testCase.name} closed again`).toContain("▸");
+			expect(turn.summary.enterLabel(stepKey), `${testCase.name} closed again`).toBe("展开");
+			expect(detailText(turn, at), `${testCase.name} closed lines`).toBe("");
 		}
 	});
 
+	it("draws a subagent that reported nothing on its dispatch line, with nothing behind it to open", () => {
+		const turn = quietTurn();
+		turn.timeline.upsertSubagent(
+			{ childId: "c9", name: LONG_NAME, status: "done", result: "好了", startedAt: T0 - 5_000 },
+			T0 - 1_000,
+		);
+		const lines = openAll(turn);
+		const shown = plain(lines);
+		const at = lineOf(lines, "◇  审查员");
+		expect(at).toBeGreaterThan(0);
+		expect(shown[at]?.startsWith("         ├")).toBe(true);
+		expect(shown[at]).toContain(`◇  ${LONG_NAME}`);
+		expect(regionsOn(turn, at)).toHaveLength(0);
+		expect(regionsOn(turn, at + 1)).toHaveLength(0);
+		expect(turn.summary.getFocusOrder()).toHaveLength(0);
+		expect(shown.join("\n")).not.toMatch(/结果|时间 /);
+	});
+
 	it("says how long a finished step took when it knows both ends", () => {
-		setMotionReduced(true);
 		const turn = quietTurn();
 		addActivities(turn, "s1", [
 			{
@@ -239,14 +256,13 @@ describe("a block with nothing of its own to open opens to the facts of its step
 				endedAt: T0 - 1_000,
 			},
 		]);
-		const lines = turn.summary.render(100);
-		const at = lineIndexWith(lines, "搜索 foo");
+		const lines = openAll(turn, 100);
+		const at = lineOf(lines, "搜索 foo");
 		clickable(turn, at)?.onClick({ row: 0, col: 0 });
-		expect(panelTextAt(turn, at, 100)).toMatch(/时间\s+\d\d:\d\d:\d\d · 用了 2秒/);
+		expect(detailText(turn, at, 100)).toMatch(/时间\s+\d\d:\d\d:\d\d · 用了 2秒/);
 	});
 
 	it("says 不到 1秒 for a step that took less than a second", () => {
-		setMotionReduced(true);
 		const turn = quietTurn();
 		addActivities(turn, "s1", [
 			{
@@ -259,25 +275,23 @@ describe("a block with nothing of its own to open opens to the facts of its step
 				endedAt: T0 - 2_400,
 			},
 		]);
-		const at = lineIndexWith(turn.summary.render(100), "搜索 foo");
+		const at = lineOf(openAll(turn, 100), "搜索 foo");
 		clickable(turn, at)?.onClick({ row: 0, col: 0 });
-		expect(panelTextAt(turn, at, 100)).toContain("用了 不到 1秒");
+		expect(detailText(turn, at, 100)).toContain("用了 不到 1秒");
 	});
 
 	it("leaves out what it does not know instead of guessing", () => {
-		setMotionReduced(true);
 		const turn = quietTurn();
 		addActivities(turn, "r1", [{ id: "a", kind: "read", label: "a.go", status: "ok", startedAt: 0 }]);
-		const lines = turn.summary.render(100);
-		const at = lineIndexWith(lines, "读取 a.go");
+		const lines = openAll(turn, 100);
+		const at = lineOf(lines, "读取 a.go");
 		clickable(turn, at)?.onClick({ row: 0, col: 0 });
-		const panel = panelTextAt(turn, at, 100);
-		expect(panel).toContain("读取 a.go");
-		expect(panel).not.toMatch(/时间|结果/);
+		const detail = detailText(turn, at, 100);
+		expect(detail).toContain("读取 a.go");
+		expect(detail).not.toMatch(/时间|结果/);
 	});
 
 	it("does not say a command printed nothing when the cell's output belongs to its last command", () => {
-		setMotionReduced(true);
 		const turn = quietTurn();
 		addActivities(
 			turn,
@@ -304,62 +318,63 @@ describe("a block with nothing of its own to open opens to the facts of its step
 			],
 			{ stdout: "all 54 passed" },
 		);
-		const lines = turn.summary.render(100);
-		const first = lineIndexWith(lines, "$ make lint");
+		const lines = openAll(turn, 100);
+		const first = lineOf(lines, "$  make lint");
+		expect(first).toBeGreaterThan(0);
 		clickable(turn, first)?.onClick({ row: 0, col: 0 });
-		expect(panelTextAt(turn, first, 100)).not.toContain("没有输出");
+		const detail = detailText(turn, first, 100);
+		expect(detail).toContain("make lint");
+		expect(detail).not.toContain("没有输出");
 	});
 
-	it("keeps a command's own output as its panel, without the made-up facts", () => {
-		setMotionReduced(true);
+	it("keeps a command's own output as its opened lines, without the made-up facts", () => {
 		const turn = quietTurn();
 		addCommand(turn, "c1", "git status", { output: "clean tree" });
-		const lines = turn.summary.render(100);
-		const at = lineIndexWith(lines, "$ git status");
+		const lines = openAll(turn, 100);
+		const at = lineOf(lines, "$  git status");
 		clickable(turn, at)?.onClick({ row: 0, col: 0 });
-		const panel = panelTextAt(turn, at, 100);
-		expect(panel).toContain("clean tree");
-		expect(panel).not.toContain("没有输出");
-		expect(panel).not.toMatch(/结果/);
+		const detail = detailText(turn, at, 100);
+		expect(detail).toContain("clean tree");
+		expect(detail).not.toContain("没有输出");
+		expect(detail).not.toMatch(/结果/);
 	});
 });
 
-function panelTextAt(turn: QuietTurn, head: number, width: number): string {
-	const lines = plain(turn.summary.render(width));
-	const panel: string[] = [];
-	for (let index = head + 1; index < lines.length && /^ │ ▎/.test(lines[index] ?? ""); index++) {
-		panel.push((lines[index] ?? "").replace(/^ │ ▎|│$/g, ""));
-	}
-	return panel.join("\n");
-}
-
-describe("what stays out of the block rule", () => {
-	it("still draws a short note and a short interjection as plain text nobody can click", () => {
-		setMotionReduced(true);
+describe("what stays out of the click and keyboard targets", () => {
+	it("keeps an interjection out of every target and a note's words a target only as their event", () => {
 		const turn = quietTurn();
 		addSay(turn, "趁等待，查一个风险点。", "s1");
 		turn.timeline.addSteer("先别动安卓的，只升级 Go", T0);
 		const lines = turn.summary.render(100);
-		for (const needle of ["趁等待，查一个风险点。", "你插话：先别动安卓的"]) {
-			const at = lineIndexWith(lines, needle);
-			expect(at, needle).toBeGreaterThan(0);
-			expect(plain(lines)[at], needle).not.toContain("▸");
-			expect(clickable(turn, at), needle).toBeUndefined();
-		}
-		expect(turn.summary.getFocusOrder().some((key) => key.startsWith("say:") || key.startsWith("steer:"))).toBe(
-			false,
-		);
+		const shown = plain(lines);
+		expect(shown[0]).toContain("趁等待，查一个风险点。");
+		const steer = shown.findIndex((line) => line.includes("你插话   先别动安卓的"));
+		expect(steer).toBeGreaterThan(0);
+		expect(shown[steer]).not.toContain("▸");
+		expect(regionsOn(turn, steer)).toHaveLength(0);
+		// The note's own line is the event: its one target opens the step behind it.
+		expect(regionsOn(turn, 0)).toHaveLength(1);
+		expect(regionsOn(turn, 0)[0]?.hoverKey).toContain(":ev:");
+		const order = turn.summary.getFocusOrder();
+		expect(order).toHaveLength(1);
+		expect(order.some((key) => key.startsWith("say:") || key.startsWith("steer:"))).toBe(false);
 	});
 
 	it("does not let Ctrl+T open the facts of a thought whose words are hidden", () => {
-		setMotionReduced(true);
 		const turn = quietTurn({ host: host({ hideThinking: () => true }) });
 		addThought(turn, "这段思考的文字不该露出来。再想一步。");
-		const lines = turn.summary.render(100);
-		const at = lineIndexWith(lines, "思考了");
+		turn.summary.render(100);
+		const eventKey = turn.summary.getFocusOrder()[0] ?? "";
+		expect(eventKey.startsWith("ev:")).toBe(true);
+		turn.summary.activate(eventKey);
+		const at = lineOf(turn.summary.render(100), "思考了");
 		expect(at).toBeGreaterThan(0);
+		turn.summary.activate(eventKey);
+		expect(turn.timeline.ui.expanded.size).toBe(0);
 		turn.summary.toggleThinkingRows();
 		expect(turn.timeline.ui.expanded.size).toBe(0);
+		turn.summary.activate(eventKey);
 		expect(plain(turn.summary.render(100)).join("\n")).not.toContain("这段思考的文字");
+		expect(turn.timeline.ui.expanded.size).toBe(1);
 	});
 });

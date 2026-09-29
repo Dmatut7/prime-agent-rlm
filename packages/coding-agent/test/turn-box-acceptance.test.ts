@@ -10,6 +10,7 @@ import { buildConversationComponents } from "../src/modes/interactive/components
 import { CustomEditor } from "../src/modes/interactive/components/custom-editor.js";
 import { getToolFileChanges } from "../src/modes/interactive/components/edit-summary.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
+import { formatTimelineTime } from "../src/modes/interactive/components/timeline-gutter.js";
 import {
 	type TimelineHost,
 	TurnActivityState,
@@ -18,8 +19,7 @@ import {
 import { turnBoxFocusHints } from "../src/modes/interactive/components/turn-box-navigator.js";
 import { STRIP_EDITS, TurnStripComponent } from "../src/modes/interactive/components/turn-strip.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
-import { headerPlain } from "./grow-box-helpers.js";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 function usage(output: number): AssistantMessage["usage"] {
 	return {
@@ -105,17 +105,48 @@ function finish(turn: Turn): void {
 	turn.state.finishBox(Date.now());
 }
 
-/** The finished box, opened by the owner. */
-function openBox(turn: Turn): string {
+/** The finished turn's lines with every event opened by the owner. */
+function openLines(turn: Turn): string[] {
 	setMotionReduced(true);
 	turn.summary.render(120);
 	turn.summary.toggleBox();
-	return text(turn.summary.render(120));
+	return plain(turn.summary.render(120));
+}
+
+function openBox(turn: Turn): string {
+	return openLines(turn).join("\n");
 }
 
 const plain = (lines: readonly string[]) => lines.map((line) => stripAnsi(line).replace(/\x1b_[^\x07]*\x07/g, ""));
 const text = (lines: readonly string[]) => plain(lines).join("\n");
-const header = (turn: Turn) => headerPlain(turn.summary.render(120));
+const HH_MM = (at: number) => formatTimelineTime(at);
+const WIDTH = 120;
+
+/** Columns a plain line takes (wide characters count two). */
+function widthOf(line: string): number {
+	let cols = 0;
+	for (const ch of line) cols += /[ᄀ-ᅟ⺀-鿿가-힣＀-｠]/.test(ch) ? 2 : 1;
+	return cols;
+}
+
+/** The column a string starts at in a plain line. */
+function cell(line: string, needle: string): number {
+	const at = line.indexOf(needle);
+	expect(at).toBeGreaterThanOrEqual(0);
+	return widthOf(line.slice(0, at));
+}
+
+/** A step line's start: the rail at column 9, then five columns of indent, so the glyph sits at column 21. */
+const STEP_PREFIX = `         │${" ".repeat(11)}`;
+/** Columns between a step's status and the right edge. */
+const STEP_RIGHT = " ".repeat(4);
+
+/** The one line that has `needle`. */
+function lineWith(lines: readonly string[], needle: string): string {
+	const found = lines.filter((line) => line.includes(needle));
+	expect(found).toHaveLength(1);
+	return found[0] ?? "";
+}
 
 function replay(messages: AgentMessage[]): Component[] {
 	return buildConversationComponents(messages, {
@@ -166,34 +197,41 @@ describe("s3: a turn carried on by a subagent notice", () => {
 		assistant(1_500, [{ type: "text", text: "审查员看完了，没发现问题。" }], "stop"),
 	];
 
-	it("keeps only the last answer under the box and folds the earlier one into it", () => {
+	it("keeps only the last answer under the timeline and draws the earlier one as an event line of it", () => {
 		setMotionReduced(true);
 		const components = replay(messages);
 		const summaries = components.filter((component) => component instanceof TurnSummaryComponent);
 		expect(summaries).toHaveLength(1);
-		const closed = renderAll(components);
-		expect(closed).toContain("审查员看完了，没发现问题。");
-		// The earlier answer is not a second answer under the box.
-		expect(closed).not.toContain("已经派审查员去看了");
-		(summaries[0] as TurnSummaryComponent).setExpanded(true);
-		const open = renderAll(components);
-		expect(open.match(/已经派审查员去看了/g)).toHaveLength(1);
+		const summary = summaries[0] as TurnSummaryComponent;
+		const underneath = renderAll(components.filter((component) => component !== summary));
+		// The last answer is the one answer under the timeline, never a line of it.
+		expect(underneath.match(/审查员看完了，没发现问题。/g)).toHaveLength(1);
+		expect(text(summary.render(120))).not.toContain("审查员看完了，没发现问题。");
+		// The earlier answer is not a second answer under the timeline: only its event line says it.
+		expect(underneath).not.toContain("已经派审查员去看了");
+		const earlier = lineWith(plain(summary.render(120)), "已经派审查员去看了");
+		expect(earlier.startsWith(` ${HH_MM(1_300)}   ◆`)).toBe(true);
+		expect(cell(earlier, "已经派审查员去看了")).toBe(16);
+		summary.setExpanded(true);
+		expect(renderAll(components).match(/已经派审查员去看了/g)).toHaveLength(1);
 	});
 
-	it("says what the subagent did as a row of the box, in Chinese", () => {
+	it("says what the subagent did as a step of its event, in Chinese", () => {
 		setMotionReduced(true);
 		const components = replay(messages);
 		const summary = components.find((component) => component instanceof TurnSummaryComponent) as TurnSummaryComponent;
 		summary.setExpanded(true);
 		const out = renderAll(components);
-		expect(text(summary.render(120))).toContain("子代理 审查员 做完了，没发回消息");
+		const step = lineWith(plain(summary.render(120)), "子代理 审查员 做完了，没发回消息");
+		expect(step.startsWith("         │")).toBe(true);
+		expect(cell(step, "子代理 审查员 做完了，没发回消息")).toBe(16 + 5 + 3);
 		expect(out).not.toContain("subagent status");
 		expect(out).not.toContain("RLM child");
 	});
 });
 
 describe("s5: a quiet compaction", () => {
-	it("is a row of the turn's box, not an English card", () => {
+	it("is a step of the turn's timeline, not an English card", () => {
 		setMotionReduced(true);
 		const messages: AgentMessage[] = [
 			{ role: "user", content: "把依赖都升级", timestamp: 1_000 },
@@ -213,9 +251,16 @@ describe("s5: a quiet compaction", () => {
 		const components = replay(messages);
 		const summary = components.find((component) => component instanceof TurnSummaryComponent) as TurnSummaryComponent;
 		summary.setExpanded(true);
-		const box = text(summary.render(120));
-		expect(box).toContain("暂不整理：对话还太短，等它长一些再整理");
-		expect(box).toContain("整理完成（原来 166k tokens），重要的结论都留着");
+		const lines = plain(summary.render(120));
+		for (const words of [
+			"暂不整理：对话还太短，等它长一些再整理",
+			"整理完成（原来 166k tokens），重要的结论都留着",
+		]) {
+			const step = lineWith(lines, words);
+			expect(step.startsWith(`${STEP_PREFIX}⇣  ${words}`)).toBe(true);
+		}
+		// Both compactions are steps of the turn's one event, the command's event.
+		expect(lines[0]?.trimEnd().endsWith("3 步 ▴")).toBe(true);
 		const out = renderAll(components);
 		for (const english of ["[compaction]", "Compacted from", "Auto-compaction skipped"]) {
 			expect(out).not.toContain(english);
@@ -233,7 +278,7 @@ describe("s5: a quiet compaction", () => {
 		expect(out).not.toContain("Compacted from");
 	});
 
-	it("shows a skipped compaction outside a box as one Chinese line", () => {
+	it("shows a skipped compaction outside a turn as one Chinese line", () => {
 		const message = createCompactionOutcomeMessage(
 			"Auto-compaction skipped: conversation is too short to compact",
 			{ reason: "threshold", outcome: "skipped" },
@@ -263,11 +308,15 @@ describe("s4: the owner's stop", () => {
 		);
 		turn.timeline.stopped = true;
 		finish(turn);
-		const out = openBox(turn);
+		const lines = openLines(turn);
+		const out = lines.join("\n");
 		expect(out).toContain("你停下了");
 		expect(out).not.toContain("KeyboardInterrupt");
 		expect(out).not.toContain("出错");
-		expect(header(turn)).not.toContain("处出错");
+		// The event line names the work, not failures, and nothing is drawn in the failure color.
+		expect(lines[0]).toMatch(/^ \d\d:\d\d {3}◆ {6}跑了 1 条命令/);
+		expect(lines[0]).not.toContain("处出错");
+		expect(turn.summary.render(120).join("\n")).not.toContain(theme.getFgAnsi("timelineMust"));
 	});
 
 	it("marks a command the stop cut short as stopped by the owner", () => {
@@ -290,9 +339,10 @@ describe("s4: the owner's stop", () => {
 		);
 		turn.timeline.stopped = true;
 		finish(turn);
-		const out = openBox(turn);
-		expect(out).toContain("make lint · 你停下了");
-		expect(out).not.toContain("出错");
+		const lines = openLines(turn);
+		const step = lineWith(lines, "make lint · 你停下了");
+		expect(step.startsWith(`${STEP_PREFIX}■  make lint · 你停下了`)).toBe(true);
+		expect(lines.join("\n")).not.toContain("出错");
 	});
 });
 
@@ -327,13 +377,19 @@ describe("the result column of a command", () => {
 	}
 
 	it("says done instead of dumping a line of the command's data", () => {
-		const out = openBox(commandTurn('{"name": "app", "version": "1.2.3", "private": true}'));
-		expect(out).toMatch(/\$ cat package\.json\s+✓ 完成\s+│/);
-		expect(out).not.toContain('"version"');
+		const lines = openLines(commandTurn('{"name": "app", "version": "1.2.3", "private": true}'));
+		const step = lineWith(lines, "cat package.json");
+		expect(step.startsWith(`${STEP_PREFIX}$  cat package.json`)).toBe(true);
+		expect(step.endsWith(`✓ 完成${STEP_RIGHT}`)).toBe(true);
+		expect(widthOf(step)).toBe(WIDTH);
+		expect(lines.join("\n")).not.toContain('"version"');
 	});
 
 	it("keeps a short status line as it is", () => {
-		expect(openBox(commandTurn("133 total"))).toMatch(/\$ cat package\.json\s+✓ 133 total\s+│/);
+		const step = lineWith(openLines(commandTurn("133 total")), "cat package.json");
+		expect(step.startsWith(`${STEP_PREFIX}$  cat package.json`)).toBe(true);
+		expect(step.endsWith(`✓ 133 total${STEP_RIGHT}`)).toBe(true);
+		expect(widthOf(step)).toBe(WIDTH);
 	});
 });
 
@@ -351,9 +407,11 @@ describe("a step that checked on the subagents", () => {
 		turn.timeline.upsertSubagent({ childId: "a", name: "审查员", status: "done", result: "发现 1 处问题" });
 		turn.timeline.upsertSubagent({ childId: "b", name: "测试员", status: "done", result: "测试全过" });
 		finish(turn);
-		const out = openBox(turn);
-		expect(out).toMatch(/查看子代理\s+✓ 2 个已交回\s+│/);
-		expect(out).not.toContain("4.2秒");
+		const lines = openLines(turn);
+		const step = lineWith(lines, "查看子代理");
+		expect(step.startsWith(`${STEP_PREFIX}✓  查看子代理`)).toBe(true);
+		expect(step.endsWith(`✓ 2 个已交回${STEP_RIGHT}`)).toBe(true);
+		expect(lines.join("\n")).not.toContain("4.2秒");
 	});
 });
 
@@ -395,19 +453,22 @@ describe("C-3: changes the kernel could not diff", () => {
 		return { turn, strip };
 	}
 
-	it("gives the reason on the row instead of +0 −0", () => {
+	it("gives the reason on the step line instead of +0 −0", () => {
 		const { turn } = omittedTurn();
-		const out = openBox(turn);
-		expect(out).toMatch(/✎ data\/big\.json\s+改动太大，没有显示\s+│/);
-		expect(out).not.toContain("+0");
+		const lines = openLines(turn);
+		const step = lineWith(lines, "data/big.json");
+		expect(step.startsWith(`${STEP_PREFIX}✎  data/big.json`)).toBe(true);
+		expect(step.endsWith(`改动太大，没有显示${STEP_RIGHT}`)).toBe(true);
+		expect(lines.join("\n")).not.toContain("+0");
 	});
 
-	it("never says +0 in the header or the strip, and says the tracking is incomplete", () => {
+	it("never says +0 on the event line or the strip, and the strip says the tracking is incomplete", () => {
 		const { turn, strip } = omittedTurn();
-		const head = header(turn);
-		expect(head).toContain("改了 1 个文件");
-		expect(head).toContain("（有些改动没记全）");
-		expect(head).not.toContain("+0");
+		const lines = plain(turn.summary.render(120));
+		expect(lines[0]).toMatch(/^ \d\d:\d\d {3}◆ {6}改了 1 个文件/);
+		expect(lines.join("\n")).not.toContain("+0");
+		// The timeline has no header line to carry the note; the strip below it does.
+		expect(lines.join("\n")).not.toContain("有些改动没记全");
 		const line = text(strip.render(120));
 		expect(line).toContain("改了 1 个文件 ▸");
 		expect(line).toContain("（有些改动没记全）");
@@ -445,12 +506,12 @@ describe("F2: a command left running in the background", () => {
 			false,
 		);
 		finish(turn);
-		const out = openBox(turn);
-		const row = out.split("\n").find((line) => line.includes("npm run dev")) ?? "";
-		expect(row).toContain("npm run dev · 转到后台继续跑");
+		const lines = openLines(turn);
+		const row = lineWith(lines, "npm run dev");
+		expect(row.startsWith(`${STEP_PREFIX}$  npm run dev · 转到后台继续跑`)).toBe(true);
 		expect(row).not.toMatch(/\d+秒|\d+分/);
-		expect(row).not.toMatch(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/);
-		expect(out).not.toContain("listening on :3000");
+		expect(row).not.toMatch(/[⠀-⣿]/);
+		expect(lines.join("\n")).not.toContain("listening on :3000");
 	});
 
 	it("hides the stale running row once a later step of the turn reports it finished", () => {
@@ -478,10 +539,13 @@ describe("F2: a command left running in the background", () => {
 			false,
 		);
 		finish(turn);
-		const out = openBox(turn);
-		expect(out).toMatch(/\$ npm run build\s+✓ built in 4s\s+│/);
-		expect(out).not.toContain("转到后台继续跑");
-		expect(out.split("\n").filter((line) => line.includes("npm run build") && !line.includes("✓"))).toEqual([]);
+		const lines = openLines(turn);
+		const settled = lines.filter((line) => line.startsWith(`${STEP_PREFIX}$  npm run build`));
+		expect(settled.length).toBeGreaterThan(0);
+		for (const row of settled) expect(row.endsWith(`✓ built in 4s 30秒${STEP_RIGHT}`)).toBe(true);
+		expect(lines.filter((line) => /^ {9}│ +\$ {2}npm run build {2,}✓/.test(line))).toHaveLength(1);
+		expect(lines.join("\n")).not.toContain("转到后台继续跑");
+		expect(lines.filter((line) => line.includes("npm run build") && !line.includes("✓"))).toEqual([]);
 	});
 });
 
@@ -592,7 +656,7 @@ describe("F8: the legacy edit totals", () => {
 	});
 });
 
-describe("M-2: a finished box redraws when what it reads changes", () => {
+describe("M-2: a finished turn redraws when what it reads changes", () => {
 	it("hides the thinking text once hideThinking turns on", () => {
 		setMotionReduced(true);
 		let hideThinking = false;
@@ -636,16 +700,16 @@ describe("M-2: a finished box redraws when what it reads changes", () => {
 			false,
 		);
 		finish(turn);
-		expect(openBox(turn)).toMatch(/✎ pkg\/a\.go/);
+		expect(lineWith(openLines(turn), "a.go").startsWith(`${STEP_PREFIX}✎  pkg/a.go`)).toBe(true);
 		cwd = "/work/app/pkg";
-		const moved = text(turn.summary.render(120));
-		expect(moved).toMatch(/✎ a\.go/);
-		expect(moved).not.toContain("pkg/a.go");
+		const moved = plain(turn.summary.render(120));
+		expect(lineWith(moved, "a.go").startsWith(`${STEP_PREFIX}✎  a.go`)).toBe(true);
+		expect(moved.join("\n")).not.toContain("pkg/a.go");
 	});
 });
 
 describe("M-3: a long live turn stays cheap to draw", () => {
-	it("draws a 200-step box with 20 KB cells in well under a second for ten frames", () => {
+	it("draws a 200-step turn with 20 KB cells in well under a second for ten frames", () => {
 		const turn = quietTurn();
 		const big = "x = 1\n".repeat(3_500);
 		const t0 = Date.now() - 600_000;
@@ -670,7 +734,12 @@ describe("M-3: a long live turn stays cheap to draw", () => {
 		}
 		turn.timeline.noteMessage(assistant(t0 + 300_000, [{ type: "thinking", thinking: "Now the last one." }]), false);
 		// The first frame reads every cell once.
-		expect(text(turn.summary.render(120))).toContain("Now the last one");
+		const first = plain(turn.summary.render(120));
+		// One event holds every step; the running turn ends on the spinner line with the newest thought.
+		expect(first[0]?.trimEnd().endsWith("401 步 ▸")).toBe(true);
+		const spin = lineWith(first, "Now the last one");
+		expect(spin).toMatch(/^ \d\d:\d\d {3}[⠀-⣿] {6}Now the last one/);
+		expect(spin.trimEnd().endsWith("第 401 步")).toBe(true);
 		const start = performance.now();
 		for (let frame = 0; frame < 10; frame++) turn.summary.render(120);
 		// Before the memo each frame re-read all 4 MB of code (~390 ms a frame).
@@ -758,14 +827,20 @@ describe("keys", () => {
 		);
 		finish(turn);
 		openBox(turn);
-		const rowKey = turn.summary.getFocusOrder().find((key) => key !== "header") ?? "";
+		const order = turn.summary.getFocusOrder();
+		const eventKey = order.find((key) => key.startsWith("ev:")) ?? "";
+		const rowKey = order.find((key) => !key.startsWith("ev:") && !key.startsWith("all:")) ?? "";
+		expect(eventKey).not.toBe("");
 		expect(rowKey).not.toBe("");
 		const mode = modeFake([turn.summary], "quiet");
 		mode.boxFocus = { summary: turn.summary, navigator: {}, resumeFollow: false };
 		turn.timeline.ui.focused = true;
 		turn.timeline.ui.focusKey = rowKey;
-		// Every block opens (one with no lines of its own opens to the facts of its step).
+		// Every step opens (one with no lines of its own opens to the facts of its step).
 		expect(mode.getTrayHints().join(" ")).toContain("Enter 展开");
+		// An open event closes; `header` stands for the first target, the event.
+		turn.timeline.ui.focusKey = eventKey;
+		expect(mode.getTrayHints().join(" ")).toContain("Enter 收起");
 		turn.timeline.ui.focusKey = "header";
 		expect(mode.getTrayHints().join(" ")).toContain("Enter 收起");
 	});

@@ -2,7 +2,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import type { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
-import { addCommand, assistant, host, plain, quietTurn, T0 } from "./ui-blocks-helpers.js";
+import { addCommand, assistant, host, plain, type QuietTurn, quietTurn, T0 } from "./ui-blocks-helpers.js";
 import { LiveChat } from "./ui-live-chat.js";
 
 /** Past the settle a finished box waits for (a retry or a compaction may still carry it on). */
@@ -50,14 +50,25 @@ function promptWithSteps(live: LiveChat, count: number): void {
 	live.flow.agentEnd();
 }
 
-/** The user closes a running box and opens it again: an opening of their own, made while it ran. */
-function reopenByHand(box: TurnSummaryComponent | undefined): void {
-	box?.toggleBox();
+/** The user opens a running turn's steps to read them: an opening of their own, made while it ran. */
+function openByHand(box: TurnSummaryComponent | undefined): void {
 	box?.toggleBox();
 }
 
+/** The steps a turn lists: a step line is `$  echo N`. */
 function bodyRows(lines: readonly string[]): number {
-	return plain(lines).filter((line) => line.includes("$ echo")).length;
+	return plain(lines).filter((line) => /\$ +echo/.test(line)).length;
+}
+
+/** Open the turn's first event and list every step under it (`全部 ›`). */
+function listAll(turn: QuietTurn): void {
+	turn.summary.render(100);
+	const event = turn.summary.getFocusOrder().find((key) => key.startsWith("ev:"));
+	if (!event) throw new Error("the turn has no event");
+	if (!turn.timeline.ui.expanded.has(event)) turn.summary.activate(event);
+	turn.summary.render(100);
+	const all = turn.summary.getFocusOrder().find((key) => key.startsWith("all:"));
+	if (all) turn.summary.activate(all);
 }
 
 describe("a box that finished folds on its own", () => {
@@ -77,16 +88,16 @@ describe("a box that finished folds on its own", () => {
 		expect(plain(turn.summary.render(100)).join("\n")).not.toContain("npm test");
 	});
 
-	it("folds a box the user closed and opened again while the turn ran", () => {
+	it("folds a box the user opened while the turn ran, once the turn is over", () => {
 		vi.useFakeTimers({ now: T0 });
-		setMotionReduced(true);
 		const live = new LiveChat();
 		live.flow.agentStart();
 		live.flow.userMessage("go", Date.now());
 		runSteps(live, 2);
 		const [box] = live.summaries();
-		reopenByHand(box);
+		openByHand(box);
 		expect(box?.state.boxOpen).toBe(true);
+		expect(bodyRows(box?.render(100) ?? [])).toBe(2);
 		live.flow.agentEnd();
 		vi.advanceTimersByTime(SETTLE_MS);
 
@@ -98,6 +109,10 @@ describe("a box that finished folds on its own", () => {
 	it("keeps a box the user closed while the turn ran closed", () => {
 		const turn = quietTurn();
 		addCommand(turn, "c1", "npm test");
+		// Nothing is open by default, while the turn runs or after.
+		expect(turn.state.boxOpen).toBe(false);
+		turn.summary.toggleBox();
+		expect(turn.state.boxOpen).toBe(true);
 		turn.summary.toggleBox();
 		expect(turn.state.boxOpen).toBe(false);
 		turn.state.markTurnEnded();
@@ -116,15 +131,24 @@ describe("a box that finished folds on its own", () => {
 		expect(plain(turn.summary.render(100)).join("\n")).toContain("npm test");
 	});
 
-	it("gives the setting that keeps finished boxes open its say when the user did nothing", () => {
-		const turn = quietTurn({ host: host({ autoFold: () => false }) });
-		addCommand(turn, "c1", "npm test");
-		turn.state.markTurnEnded();
-		turn.state.finishBox();
-		expect(turn.state.boxOpen).toBe(true);
+	it("ignores the setting that keeps finished boxes open: the box folds whatever the user did before it ended", () => {
+		const idle = quietTurn({ host: host({ autoFold: () => false }) });
+		addCommand(idle, "c1", "npm test");
+		idle.state.markTurnEnded();
+		idle.state.finishBox();
+		expect(idle.state.boxOpen).toBe(false);
+		expect(plain(idle.summary.render(100)).join("\n")).not.toContain("npm test");
+
+		const opened = quietTurn({ host: host({ autoFold: () => false }) });
+		addCommand(opened, "c1", "npm test");
+		opened.summary.toggleBox();
+		expect(opened.state.boxOpen).toBe(true);
+		opened.state.markTurnEnded();
+		opened.state.finishBox();
+		expect(opened.state.boxOpen).toBe(false);
 	});
 
-	it("keeps a box the user opened after it ended open through a retry that carries it on", () => {
+	it("keeps a box the user opened after it ended open through a retry that carries it on, and folds it when the turn ends again", () => {
 		const turn = quietTurn();
 		addCommand(turn, "c1", "npm test");
 		turn.state.markTurnEnded();
@@ -133,9 +157,10 @@ describe("a box that finished folds on its own", () => {
 		expect(turn.state.boxOpen).toBe(true);
 		turn.state.reopen();
 		expect(turn.state.boxOpen).toBe(true);
+		expect(plain(turn.summary.render(100)).join("\n")).toContain("npm test");
 		turn.state.markTurnEnded();
 		turn.state.finishBox();
-		expect(turn.state.boxOpen).toBe(true);
+		expect(turn.state.boxOpen).toBe(false);
 	});
 });
 
@@ -147,7 +172,7 @@ describe("a turn a subagent's report wakes right after it ended", () => {
 		vi.advanceTimersByTime(100);
 		const [first] = live.summaries();
 		// The user had opened the running box to read it.
-		reopenByHand(first);
+		openByHand(first);
 		expect(first?.state.boxOpen).toBe(true);
 
 		live.wake("report-1");
@@ -161,15 +186,14 @@ describe("a turn a subagent's report wakes right after it ended", () => {
 
 	it("folds each box before the one after it, three reports in a row, however they were opened", () => {
 		vi.useFakeTimers({ now: T0 });
-		setMotionReduced(true);
 		const live = new LiveChat();
 		promptWithSteps(live, 2);
-		reopenByHand(live.summaries()[0]);
+		openByHand(live.summaries()[0]);
 		vi.advanceTimersByTime(SETTLE_MS);
 		live.wake("report-1");
-		reopenByHand(live.summaries()[1]);
+		openByHand(live.summaries()[1]);
 		live.wake("report-2");
-		reopenByHand(live.summaries()[2]);
+		openByHand(live.summaries()[2]);
 		vi.advanceTimersByTime(SETTLE_MS);
 
 		const boxes = live.summaries();
@@ -181,7 +205,6 @@ describe("a turn a subagent's report wakes right after it ended", () => {
 
 	it("keeps an earlier box open that the user opened after it finished, while the next one runs", () => {
 		vi.useFakeTimers({ now: T0 });
-		setMotionReduced(true);
 		const live = new LiveChat();
 		promptWithSteps(live, 2);
 		vi.advanceTimersByTime(SETTLE_MS);
@@ -203,47 +226,52 @@ describe("a replayed box", () => {
 		addCommand(turn, "c1", "npm test");
 		turn.state.markTurnEnded();
 		expect(turn.state.boxOpen).toBe(false);
-		expect(plain(turn.summary.render(100)).join("\n")).not.toContain("npm test");
+		const shown = plain(turn.summary.render(100));
+		expect(shown).toHaveLength(1);
+		expect(shown[0]).toMatch(/跑了 1 条命令 +1 步 ▸ {2}$/);
+		expect(shown.join("\n")).not.toContain("npm test");
 	});
 });
 
 describe("the turn-end fold", () => {
-	it("folds a long body at once instead of row by row", () => {
+	it("folds a long body at once instead of line by line", () => {
 		vi.useFakeTimers({ now: T0 });
-		const turn = quietTurn({ host: host({ viewportRows: () => 200, growBox: () => true }) });
+		const turn = quietTurn({ host: host({ viewportRows: () => 200 }) });
 		for (let index = 0; index < 40; index++) addCommand(turn, `c${index}`, `echo ${index}`);
+		listAll(turn);
+		// The event line, forty steps, a blank rail line and the spinner line.
 		const before = turn.summary.render(100).length;
-		expect(before).toBeGreaterThan(60);
+		expect(before).toBe(43);
 		turn.state.markTurnEnded();
 		turn.state.finishBox();
-		const after = turn.summary.render(100).length;
-		expect(after).toBeLessThan(5);
+		expect(turn.summary.render(100)).toHaveLength(1);
 	});
 
-	it("still folds a short body row by row", () => {
+	it("folds a short body at once too, with no line-by-line animation in between", () => {
 		vi.useFakeTimers({ now: T0 });
 		const turn = quietTurn({ host: host({ viewportRows: () => 40 }) });
 		for (let index = 0; index < 3; index++) addCommand(turn, `c${index}`, `echo ${index}`);
-		const before = turn.summary.render(100).length;
+		listAll(turn);
+		// The event line, three steps, a blank rail line and the spinner line.
+		expect(turn.summary.render(100)).toHaveLength(6);
 		turn.state.markTurnEnded();
 		turn.state.finishBox();
+		expect(turn.summary.render(100)).toHaveLength(1);
 		vi.advanceTimersByTime(150);
-		const during = turn.summary.render(100).length;
-		expect(during).toBeLessThan(before);
-		expect(during).toBeGreaterThan(3);
+		expect(turn.summary.render(100)).toHaveLength(1);
 		vi.advanceTimersByTime(1000);
-		const settled = turn.summary.render(100).length;
-		expect(settled).toBeLessThan(during);
+		expect(turn.summary.render(100)).toHaveLength(1);
 	});
 
-	it("never animates when motion is reduced", () => {
+	it("folds at once when motion is reduced, as it does when it is not", () => {
 		vi.useFakeTimers({ now: T0 });
 		setMotionReduced(true);
 		const turn = quietTurn({ host: host({ viewportRows: () => 40 }) });
 		for (let index = 0; index < 3; index++) addCommand(turn, `c${index}`, `echo ${index}`);
-		turn.summary.render(100);
+		listAll(turn);
+		expect(turn.summary.render(100)).toHaveLength(6);
 		turn.state.markTurnEnded();
 		turn.state.finishBox();
-		expect(turn.summary.render(100).length).toBeLessThan(5);
+		expect(turn.summary.render(100)).toHaveLength(1);
 	});
 });

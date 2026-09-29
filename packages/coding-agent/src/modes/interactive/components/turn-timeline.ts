@@ -18,6 +18,8 @@ import {
 	mergeStepResult,
 	type StepFeedData,
 } from "./feed-data.js";
+import type { TimelineLane } from "./timeline-gutter.js";
+import type { TimelineLaneTracker } from "./timeline-lane.js";
 
 /**
  * Everything one assistant turn's box shows, in the order it happened: the
@@ -66,6 +68,8 @@ export interface TimelineNotice {
 export interface TimelineSubagent {
 	childId: string;
 	name: string;
+	/** The task it was given, in a few words (its short tag comes from this). */
+	label?: string;
 	status: "running" | "done" | "failed";
 	/** What it is doing now, in plain words. */
 	line?: string;
@@ -163,8 +167,11 @@ export class TimelineUiState {
 	/** Bring this row into the body's view on the next render (its opened lines too, when `revealDetail`). */
 	revealKey: string | undefined;
 	revealDetail = false;
+	/** Open rows and events (`ev:` keys), and events listing every step (`all:` keys). */
 	readonly expanded = new Set<string>();
 	readonly expandedAt = new Map<string, number>();
+	/** The subagent lane each line was drawn with when it first appeared: a later frame keeps it. */
+	readonly lanes = new Map<string, TimelineLane>();
 	readonly enteredAt = new Map<string, number>();
 	readonly settledAt = new Map<string, number>();
 	readonly rowStatus = new Map<string, string>();
@@ -254,6 +261,14 @@ export class TimelineUiState {
 		return true;
 	}
 
+	/** Fold every event's step list (the turn ended); what the user opened inside a step stays with its step. */
+	collapseEvents(): void {
+		for (const key of [...this.expanded]) {
+			if (key.startsWith("ev:") || key.startsWith("all:")) this.expanded.delete(key);
+		}
+		this.bump();
+	}
+
 	/** Back to following the newest line. */
 	followNewest(): void {
 		this.follow = true;
@@ -277,6 +292,8 @@ export class TurnTimeline {
 	finishedAt: number | undefined;
 	/** Steps of this turn the reopen window left out (its box says how many). */
 	earlierSteps = 0;
+	/** Told of every subagent this turn dispatches, as it is noted (not when it is drawn). */
+	laneTracker: TimelineLaneTracker | undefined;
 	/** Commands the step's code waits on through a handle, resolved from earlier cells. */
 	readonly stepHandleContext = new Map<string, ReadonlyMap<string, string>>();
 	private seq = 0;
@@ -492,6 +509,7 @@ export class TurnTimeline {
 				key,
 				sub: { ...update, startedAt: update.startedAt ?? now },
 			});
+			if (update.status === "running") this.laneTracker?.spawned([update.name]);
 		}
 		this.ui.bump();
 	}
@@ -603,6 +621,7 @@ export class TurnTimeline {
 		next.ui.primed = ui.primed;
 		next.ui.stripOpen = ui.stripOpen;
 		for (const key of ui.expanded) next.ui.expanded.add(key);
+		for (const [key, lane] of ui.lanes) next.ui.lanes.set(key, lane);
 		for (const key of ui.stripExpanded) next.ui.stripExpanded.add(key);
 		for (const [key, status] of ui.rowStatus) next.ui.rowStatus.set(key, status);
 		next.ui.bump();

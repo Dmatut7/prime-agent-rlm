@@ -10,7 +10,6 @@ import { TurnActivityState, TurnSummaryComponent } from "../src/modes/interactiv
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
-import { headerPlain } from "./grow-box-helpers.js";
 
 /**
  * Block navigation (Alt+Up) driven through a real TUI on a virtual terminal:
@@ -358,10 +357,8 @@ describe("Enter on a focused block", () => {
 		const h = await createHarness([new UserMessageComponent("跑一下"), summary, assistant("完成")]);
 		await h.start();
 		await h.press(ALT_UP);
-		expect(h.focusedText()).toContain("Enter 展开");
 		await h.press(ENTER);
 		expect(summary.state.processBlockExpanded).toBe(true);
-		expect(h.focusedText()).toContain("Enter 收起");
 		// The open was recorded: T8's Esc close order folds it.
 		expect(call(h.mode, "closeLastOpenedProcessBlock")).toBe(true);
 		expect(summary.state.processBlockExpanded).toBe(false);
@@ -370,6 +367,17 @@ describe("Enter on a focused block", () => {
 		await h.press(ENTER);
 		expect(summary.state.processBlockExpanded).toBe(false);
 		expect(call(h.mode, "closeLastOpenedProcessBlock")).toBe(false);
+	});
+
+	it("hints Enter 展开 on a folded quiet turn and Enter 收起 once Enter opened it", async () => {
+		const summary = turn(12);
+		const h = await createHarness([new UserMessageComponent("跑一下"), summary, assistant("完成")]);
+		await h.start();
+		await h.press(ALT_UP);
+		expect(h.focusedText()).toContain("Enter 展开");
+		await h.press(ENTER);
+		expect(summary.state.processBlockExpanded).toBe(true);
+		expect(h.focusedText()).toContain("Enter 收起");
 	});
 
 	it("opens an answer's Thinking only when it has a trace, with a rebound toggle key in the hint", async () => {
@@ -416,33 +424,51 @@ describe("copy and focus on failure rows", () => {
 	});
 });
 
-describe("clicking a turn head", () => {
-	it("toggles the box, keeps the step cards to the box, and Ctrl+O afterwards agrees with the caret", async () => {
+describe("clicking an event line", () => {
+	it("opens the event's steps, keeps the step cards folded, and Ctrl+O afterwards agrees with the arrow", async () => {
 		const summary = turn(2);
 		const row = new ToolRow();
 		const answer = assistant("完成", {}, "想了想");
 		const h = await createHarness([new UserMessageComponent("跑"), summary, row, answer]);
 		summary.setOnLanesChange(() => call(h.mode, "handleTurnLanesClicked", summary));
-		summary.render(80);
+		expect(plain(summary.render(80))[0]?.trimEnd().endsWith("2 步 ▸")).toBe(true);
 		const header = summary.getClickRegions()[0];
 		expect(header).toBeDefined();
+		expect(header?.line).toBe(0);
 		header?.onClick({ row: 0, col: 0 });
 		expect(summary.state.processBlockExpanded).toBe(true);
-		// The box lists the steps itself: the separate step cards stay folded.
+		// The timeline lists the steps itself: the separate step cards stay folded.
 		expect(row.expanded).toBe(false);
-		expect(headerPlain(summary.render(80))).toContain("⌄");
+		const opened = plain(summary.render(80));
+		expect(opened[0]?.trimEnd().endsWith("2 步 ▴")).toBe(true);
+		expect(opened.filter((line) => line.includes("列目录")).length).toBe(2);
 
 		header?.onClick({ row: 0, col: 0 });
 		expect(summary.state.processBlockExpanded).toBe(false);
-		expect(headerPlain(summary.render(80))).toContain("›");
-		// Ctrl+O now opens (the arrow says ›), instead of doing nothing.
+		const folded = plain(summary.render(80));
+		expect(folded[0]?.trimEnd().endsWith("2 步 ▸")).toBe(true);
+		expect(folded.filter((line) => line.includes("列目录")).length).toBe(0);
+		// Ctrl+O now opens (the arrow says ▸), instead of doing nothing.
 		call(h.mode, "cycleTurnProcess", summary);
 		expect(summary.state.processBlockExpanded).toBe(true);
-		// The click-opened state was recorded for Esc too.
+		expect(plain(summary.render(80))[0]?.trimEnd().endsWith("2 步 ▴")).toBe(true);
 		header?.onClick({ row: 0, col: 0 });
 		header?.onClick({ row: 0, col: 0 });
 		expect(summary.state.processBlockExpanded).toBe(true);
 		expect(call(h.mode, "closeLastOpenedProcessBlock")).toBe(true);
 		expect(summary.state.processBlockExpanded).toBe(false);
+		expect(plain(summary.render(80))[0]?.trimEnd().endsWith("2 步 ▸")).toBe(true);
+	});
+
+	it("records a click-opened event for the Esc close order, like Ctrl+O does", async () => {
+		const summary = turn(2);
+		const h = await createHarness([new UserMessageComponent("跑"), summary, assistant("完成")]);
+		summary.setOnLanesChange(() => call(h.mode, "handleTurnLanesClicked", summary));
+		summary.render(80);
+		summary.getClickRegions()[0]?.onClick({ row: 0, col: 0 });
+		expect(summary.state.processBlockExpanded).toBe(true);
+		expect(call(h.mode, "closeLastOpenedProcessBlock")).toBe(true);
+		expect(summary.state.processBlockExpanded).toBe(false);
+		expect(call(h.mode, "closeLastOpenedProcessBlock")).toBe(false);
 	});
 });

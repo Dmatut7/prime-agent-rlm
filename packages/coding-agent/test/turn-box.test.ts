@@ -1,26 +1,26 @@
 import { ABORT_TRUNCATION_MARKER, type AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai";
-import { type ClickRegion, setKeybindings, type TUI, visibleWidth } from "@earendil-works/pi-tui";
+import { setKeybindings, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import { renderStatusBar } from "../src/modes/interactive/components/footer.js";
 import { rowEnterStage, setMotionReduced, TURN_FOLD_MS } from "../src/modes/interactive/components/motion.js";
+import { formatTimelineTime } from "../src/modes/interactive/components/timeline-gutter.js";
 import { commandOutcome, type TimelineFacts } from "../src/modes/interactive/components/timeline-rows.js";
 import {
 	type TimelineHost,
 	TurnActivityState,
 	TurnSummaryComponent,
 } from "../src/modes/interactive/components/turn-activity.js";
-import { boxBodyRows } from "../src/modes/interactive/components/turn-box.js";
+import { BOX_FOCUS_MARKER } from "../src/modes/interactive/components/turn-box.js";
 import { TurnBoxNavigator } from "../src/modes/interactive/components/turn-box-navigator.js";
 import { STRIP_EDITS, STRIP_MEMORIES, TurnStripComponent } from "../src/modes/interactive/components/turn-strip.js";
-import { TurnTimeline } from "../src/modes/interactive/components/turn-timeline.js";
+import { formatBoxDuration, TurnTimeline } from "../src/modes/interactive/components/turn-timeline.js";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 import { setWorkingPulseTick } from "../src/modes/interactive/theme/working-icon.js";
-import { headerPlain } from "./grow-box-helpers.js";
 
 const T0 = 1_700_000_000_000;
 
@@ -64,7 +64,7 @@ function host(overrides: Partial<TimelineHost> = {}): TimelineHost {
 	};
 }
 
-/** A quiet turn with its box, the way the interactive mode builds one. */
+/** A quiet turn with its timeline, the way the interactive mode builds one. */
 function quietTurn(options: { live?: boolean; host?: TimelineHost; startedAt?: number } = {}) {
 	const state = new TurnActivityState(options.startedAt ?? Date.now() - 5_000);
 	if (options.live !== false) state.live = true;
@@ -95,6 +95,26 @@ function addStep(
 const plain = (lines: readonly string[]) => lines.map((line) => stripAnsi(line).replace(/\x1b_[^\x07]*\x07/g, ""));
 const text = (lines: readonly string[]) => plain(lines).join("\n");
 
+/** Open every event that lists steps (a click on each event line), and give the lines. */
+function openEvents(turn: { summary: TurnSummaryComponent }, width = 120): string[] {
+	turn.summary.render(width);
+	for (const key of turn.summary.getFocusOrder()) {
+		if (key.startsWith("ev:") && turn.summary.enterLabel(key) === "展开") turn.summary.activate(key);
+	}
+	return plain(turn.summary.render(width));
+}
+
+/** Click the line that has `needle` on it. */
+function click(summary: TurnSummaryComponent, needle: string, width = 120): void {
+	const index = plain(summary.render(width)).findIndex((line) => line.includes(needle));
+	const region = summary.getClickRegions().find((candidate) => candidate.line === index);
+	expect(region, needle).toBeDefined();
+	region?.onClick({ row: index, col: 0 });
+}
+
+/** The line the spinner is on: what the AI is at while the turn runs. */
+const spinnerLine = (lines: readonly string[]) => lines.find((line) => /^ \d\d:\d\d {3}[⠀-⣿]/.test(line)) ?? "";
+
 beforeAll(() => {
 	initTheme("prime");
 	setKeybindings(new KeybindingsManager());
@@ -106,8 +126,8 @@ afterEach(() => {
 	vi.useRealTimers();
 });
 
-describe("timeline rows from the kernel's records", () => {
-	it("shows a command as a $ row: spinner, own clock and latest output while running, the result once done", () => {
+describe("timeline steps from the kernel's records", () => {
+	it("shows a command as a $ step: spinner and own clock while running, the result once done", () => {
 		const turn = quietTurn();
 		addStep(turn, "c1", "r = await bash('go test ./...')", "running");
 		const startedAt = Date.now() - 3_000;
@@ -131,11 +151,10 @@ describe("timeline rows from the kernel's records", () => {
 			},
 			true,
 		);
-		const live = text(turn.summary.render(120));
-		expect(live).toContain("go test ./...");
-		expect(live).toContain("└ === RUN TestTimeoutRetry");
-		expect(live).toMatch(/go test \.\/\.\.\.\s+[23]秒\s+│/);
-		expect(live).toContain("正在运行 go test ./...");
+		const live = openEvents(turn);
+		expect(live.some((line) => /^ {9}│ {11}[⠀-⣿] {2}go test \.\/\.\.\. +[23]秒 {4}$/.test(line))).toBe(true);
+		expect(spinnerLine(live)).toContain("正在运行命令");
+		expect(live.some((line) => /^ {9}╎ {11}在跑 {2}go test \.\/\.\.\. +[23]秒 {4}$/.test(line))).toBe(true);
 
 		turn.timeline.mergeStep(
 			"c1",
@@ -160,12 +179,19 @@ describe("timeline rows from the kernel's records", () => {
 			false,
 		);
 		turn.state.setStepStatus("c1", "done");
-		const done = text(turn.summary.render(120));
-		expect(done).toMatch(/\$ go test \.\/\.\.\.\s+✗ 54 通过 · 2 失败\s+│/);
-		expect(done).not.toContain("└ === RUN");
+		const done = openEvents(turn);
+		expect(done.some((line) => /^ {9}│ {11}\$ {2}go test \.\/\.\.\. +✗ 54 通过 · 2 失败 3秒 {4}$/.test(line))).toBe(
+			true,
+		);
+		expect(done.join("\n")).not.toContain("=== RUN");
+		// The finished step opens to what the cell printed, not to the line it showed while running.
+		click(turn.summary, "go test ./...");
+		const opened = text(turn.summary.render(120));
+		expect(opened).toContain("--- FAIL: TestTimeoutRetry (2.00s)");
+		expect(opened).not.toContain("=== RUN");
 	});
 
-	it("reads consecutive file reads as one row that counts while it runs", () => {
+	it("reads consecutive file reads as one step that counts while it runs", () => {
 		const turn = quietTurn();
 		addStep(turn, "r1", "for p in files: print(open(p).read())", "running");
 		const at = Date.now() - 2_000;
@@ -191,7 +217,9 @@ describe("timeline rows from the kernel's records", () => {
 			},
 			true,
 		);
-		expect(text(turn.summary.render(120))).toContain("正在读取 b.go（第 3 个）");
+		const live = openEvents(turn);
+		expect(live.some((line) => /^ {9}│ {11}[⠀-⣿] {2}正在读取 b\.go（第 3 个）/.test(line))).toBe(true);
+		expect(live[0]).toContain("读了 3 个文件");
 		turn.timeline.mergeStep(
 			"r1",
 			"ipython",
@@ -204,12 +232,13 @@ describe("timeline rows from the kernel's records", () => {
 			false,
 		);
 		turn.state.setStepStatus("r1", "done");
-		const done = text(turn.summary.render(120));
-		expect(done).toContain("✓ 读取了 3 个文件");
-		expect(done.match(/读取/g)).toHaveLength(1);
+		const done = openEvents(turn);
+		const reads = done.filter((line) => line.includes("读取"));
+		expect(reads).toHaveLength(1);
+		expect(reads[0]?.trimEnd()).toBe("         │           ✓  读取了 3 个文件");
 	});
 
-	it("turns file and memory records into ✎ and ✦ rows with counts and clean titles", () => {
+	it("turns file and memory records into ✎ and ✦ steps with counts and clean titles", () => {
 		const turn = quietTurn();
 		addStep(turn, "e1", "edit(...)");
 		turn.timeline.mergeStep(
@@ -253,10 +282,11 @@ describe("timeline rows from the kernel's records", () => {
 			},
 			false,
 		);
-		const out = text(turn.summary.render(120));
-		expect(out).toMatch(/✎ modules\/aichat\/client\.go\s+\+12 −4\s+│/);
-		expect(out).toMatch(/✎ \/tmp\/probe\.py\s+临时 \+9\s+│/);
-		expect(out).toContain("✦ 记住：go · http · 请求要带 · context");
+		const lines = openEvents(turn);
+		expect(lines.some((line) => /^ {9}│ {11}✎ {2}modules\/aichat\/client\.go\s+\+12 −4 {4}$/.test(line))).toBe(true);
+		expect(lines.some((line) => /^ {9}│ {11}✎ {2}\/tmp\/probe\.py\s+临时 \+9 {4}$/.test(line))).toBe(true);
+		const out = lines.join("\n");
+		expect(out).toContain("✦  记住：go · http · 请求要带 · context");
 		expect(out).not.toContain("_2026");
 	});
 });
@@ -289,9 +319,10 @@ describe("timeline rows without kernel records (today's data)", () => {
 			false,
 		);
 		turn.state.addStep({ toolCallId: "w1", toolName: "ipython", args: { code: "await ed" }, status: "queued" });
-		const out = text(turn.summary.render(120));
-		expect(out).toContain("正在写代码…");
-		expect(out).not.toContain("正在运行 Python");
+		const lines = openEvents(turn);
+		expect(spinnerLine(lines)).toContain("正在写代码…");
+		expect(lines.some((line) => /^ {9}│ {11}[⠀-⣿] {2}写代码…/.test(line))).toBe(true);
+		expect(lines.join("\n")).not.toContain("正在运行 Python");
 	});
 
 	it("shows a cell that raised as a red failure even when the tool reported success", () => {
@@ -316,29 +347,35 @@ describe("timeline rows without kernel records (today's data)", () => {
 			},
 			false,
 		);
-		const out = text(turn.summary.render(120));
-		expect(out).toContain("✗ 读取 config.toml 出错：FileNotFoundError");
-		expect(out).not.toContain("✓ 读取 config.toml");
+		const lines = openEvents(turn);
+		const step = lines.find((line) => line.includes("读取 config.toml")) ?? "";
+		expect(step).toMatch(/^ {9}│ {11}✗ {2}读取 config\.toml 出错：FileNotFoundError.* 出错了 {4}$/);
+		expect(lines.join("\n")).not.toContain("✓  读取 config.toml");
+		const raw = turn.summary.render(120).find((line) => stripAnsi(line).includes("读取 config.toml")) ?? "";
+		expect(raw).toContain(theme.fg("timelineMust", "✗"));
+		expect(raw).toContain(theme.fg("timelineMust", "出错了"));
 	});
 
 	it("labels a cell by what it does, and never by a guess like 设置 W", () => {
 		const turn = quietTurn();
 		addStep(turn, "p1", "W = 12\nT = W * 3\nprint(T)");
-		const out = text(turn.summary.render(120));
+		const out = openEvents(turn).join("\n");
 		expect(out).not.toContain("设置 W");
-		expect(out).toContain("Python");
+		expect(out).toContain("✓  Python");
 	});
 
 	it("names the command a handle wait is waiting for", () => {
 		const turn = quietTurn();
 		addStep(turn, "w1", "r = await h", "running");
 		turn.timeline.stepHandleContext.set("w1", new Map([["h", "go test ./modules/aichat/..."]]));
-		const out = text(turn.summary.render(120));
-		expect(out).toContain("等待 go test ./modules/aichat/...");
-		expect(out).not.toContain("等待命令结果");
+		const lines = openEvents(turn);
+		const step = lines.find((line) => /^ {9}│ {11}[⠀-⣿] {2}/.test(line)) ?? "";
+		expect(step).toContain("等待 go test ./modules/aichat/...");
+		expect(lines.find((line) => line.includes("╎"))).toContain("在跑  等待 go test ./modules/aichat/...");
+		expect(lines.join("\n")).not.toContain("等待命令结果");
 	});
 
-	it("builds change rows from the edit skill's diffs and from the edit tool's own diff", () => {
+	it("builds change steps from the edit skill's diffs and from the edit tool's own diff", () => {
 		const turn = quietTurn();
 		addStep(turn, "d1", "edit('src/b.ts', 'a', 'b')");
 		turn.timeline.mergeStep(
@@ -360,33 +397,46 @@ describe("timeline rows without kernel records (today's data)", () => {
 			{ details: { diff: "-10 old line\n+10 new line\n+11 added line" } },
 			false,
 		);
-		const out = text(turn.summary.render(120));
-		expect(out).toMatch(/✎ src\/b\.ts\s+\+1 −1\s+│/);
-		expect(out).toMatch(/✎ src\/c\.ts\s+\+2 −1\s+│/);
+		const lines = openEvents(turn);
+		expect(lines.some((line) => /^ {9}│ {11}✎ {2}src\/b\.ts\s+\+1 −1 {4}$/.test(line))).toBe(true);
+		expect(lines.some((line) => /^ {9}│ {11}✎ {2}src\/c\.ts\s+\+2 −1 {4}$/.test(line))).toBe(true);
 	});
 });
 
-describe("events inside the box", () => {
-	it("shows interjections, retries, compaction and subagents as their own rows", () => {
+describe("events on the timeline", () => {
+	it("shows interjections, retries, compaction and subagents as their own lines and steps", () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(T0);
 		const turn = quietTurn({ startedAt: T0 - 10_000 });
 		turn.timeline.addSteer("先别动安卓的，只升级 Go", T0 - 9_000);
 		turn.timeline.startRetry({ startedAt: T0 - 500, delayMs: 3_000, attempt: 1, reason: "模型接口超时" });
-		expect(text(turn.summary.render(120))).toContain("↻ 模型接口超时，3 秒后重试");
-		expect(text(turn.summary.render(120))).toContain("你插话：先别动安卓的，只升级 Go");
+		const first = openEvents(turn);
+		// Your interjection is a line of its own; the retry is a step under an event.
+		expect(first.find((line) => line.includes("你插话"))?.trimEnd()).toBe(
+			` ${formatTimelineTime(T0 - 9_000)}   ●      你插话   先别动安卓的，只升级 Go`,
+		);
+		expect(first.some((line) => /^ {9}│ {11}[⠀-⣿] {2}模型接口超时，3 秒后重试/.test(line))).toBe(true);
+		expect(spinnerLine(first)).toContain("模型接口超时，3 秒后重试");
 		turn.timeline.endRetry("ok");
 		turn.timeline.startCompaction(T0, 182_000);
-		const compacting = text(turn.summary.render(120));
-		expect(compacting).toContain("↻ 模型接口超时，已自动重试");
-		expect(compacting).toContain("上下文快满了，正在整理前面的内容…");
+		const compacting = openEvents(turn);
+		expect(compacting.some((line) => line.trimEnd() === "         │           ↻  模型接口超时，已自动重试")).toBe(
+			true,
+		);
+		expect(compacting.some((line) => /^ {9}│ {11}[⠀-⣿] {2}上下文快满了，正在整理前面的内容…/.test(line))).toBe(true);
+		expect(spinnerLine(compacting)).toContain("上下文快满了，正在整理前面的内容");
 		turn.timeline.endCompaction(T0 + 2_000, { before: 182_000 });
 		turn.timeline.latestCompaction()!.after = 41_000;
 		turn.timeline.upsertSubagent({ childId: "c1", name: "审查员·Go", status: "running", line: "在读 client.go" });
-		const running = text(turn.summary.render(120));
-		expect(running).toContain("⇣ 整理完成：182k → 41k tokens，重要的结论都留着");
-		expect(running).toContain("子代理 审查员·Go");
-		expect(running).toContain("└ 在读 client.go");
+		const running = openEvents(turn);
+		expect(
+			running.some((line) => /^ {9}│ {11}⇣ {2}整理完成：182k → 41k tokens，重要的结论都留着 +2秒 {4}$/.test(line)),
+		).toBe(true);
+		// The dispatch is one line under its event, and the spinner line says who is being waited for.
+		const dispatch = running.find((line) => line.includes("◇")) ?? "";
+		expect(dispatch.trimEnd()).toBe("         ├      ◇  审查员·Go");
+		expect(running.find((line) => line.includes("◆"))).toContain("派了 1 个子代理");
+		expect(spinnerLine(running)).toContain("在等子代理 审查员·Go 交回结果");
 		turn.timeline.upsertSubagent({
 			childId: "c1",
 			name: "审查员·Go",
@@ -394,10 +444,13 @@ describe("events inside the box", () => {
 			result: "发现 1 处问题",
 			report: "aichat 超时不重试。",
 		});
-		expect(text(turn.summary.render(120))).toMatch(/◇ 子代理 审查员·Go\s+✓ 发现 1 处问题\s+│/);
+		const handedBack = openEvents(turn);
+		expect(handedBack.find((line) => line.includes("◇"))?.trimEnd()).toBe("         ├      ◇  审查员·Go");
+		expect(spinnerLine(handedBack)).toContain("等待模型回应…");
+		expect(spinnerLine(handedBack)).not.toContain("在等子代理");
 	});
 
-	it("keeps a failed step as a red row after the box folds", () => {
+	it("keeps a failed step as its own red event line once the turn ended on it", () => {
 		const turn = quietTurn({ live: false });
 		addStep(turn, "x1", "import nope", "error");
 		turn.timeline.mergeStep(
@@ -410,56 +463,68 @@ describe("events inside the box", () => {
 			},
 			false,
 		);
-		// The turn ended on the error: nothing corrected it, so the red row stays out when folded.
+		// The turn ended on the error: nothing corrected it, so the failure is a red line of its own, nothing opened.
 		turn.timeline.errorEnded = true;
 		turn.state.markTurnEnded(Date.now());
-		const closed = text(turn.summary.render(120));
-		expect(closed).toMatch(/✗ 出错 +做了 1 步 · 1 处出错/);
-		expect(closed).toContain("ModuleNotFoundError: No module named 'nope'");
-		expect(closed).toContain("1 处出错");
+		const raw = turn.summary.render(120);
+		const closed = plain(raw);
+		expect(closed).toHaveLength(1);
+		expect(closed[0]).toMatch(/^ \d\d:\d\d {3}◆ {6}Python 出错：ModuleNotFoundError: No module named 'nope' +▸ {2}$/);
+		expect(raw[0]).toContain(theme.getFgAnsi("timelineMust"));
+		// The tally the header card used to say (`1 处出错`) is carried by the turn's facts now.
+		expect(turn.state.boxView().facts.errorCount).toBe(1);
+		const key = turn.summary.getFocusOrder()[0] ?? "";
+		expect(turn.summary.enterLabel(key)).toBe("展开");
+		turn.summary.activate(key);
+		const opened = plain(turn.summary.render(120));
+		expect(opened[0]?.trimEnd().endsWith("▴")).toBe(true);
+		expect(opened).toHaveLength(2);
+		expect(opened[1]).toContain("ModuleNotFoundError: No module named 'nope'");
 	});
 });
 
-describe("the box header", () => {
-	it("says what happens now, and a thought moves the header only when a sentence completes", () => {
+describe("the spinner line", () => {
+	it("says what happens now, and a thought moves the line only when a sentence completes", () => {
 		const turn = quietTurn();
 		turn.state.notePhase("thinking");
 		turn.state.currentThinking = "先看测试为什么挂。再看最近的提交";
-		const header = () => plain(turn.summary.render(120))[2] ?? "";
-		expect(header()).toContain("思考中 · 先看测试为什么挂");
+		const line = () => spinnerLine(plain(turn.summary.render(120)));
+		expect(line()).toContain("思考中 · 先看测试为什么挂");
+		expect(line()).not.toContain("再看最近的提交");
 		turn.state.currentThinking = "先看测试为什么挂。再看最近的提交记录";
-		expect(header()).toContain("思考中 · 先看测试为什么挂");
+		expect(line()).toContain("思考中 · 先看测试为什么挂");
+		expect(line()).not.toContain("再看最近的提交");
 		turn.state.currentThinking = "先看测试为什么挂。再看最近的提交记录。";
-		expect(header()).toContain("思考中 · 再看最近的提交记录");
+		expect(line()).toContain("思考中 · 再看最近的提交记录");
+		expect(line()).not.toContain("先看测试为什么挂");
 	});
 
-	it("shimmers while waiting for the first token, and reduced motion shows it plain", () => {
-		const turn = quietTurn();
-		const header = () => turn.summary.render(120)[2] ?? "";
-		expect(stripAnsi(header())).toContain("等待模型回应…");
-		const shimmering = (header().match(/\x1b\[38;/g) ?? []).length;
-
-		// The shimmer is a moving band, not a static tint: the character
-		// carrying the brightest color must sit at a different position once
-		// the tick moves - a frozen band would leave this index unchanged.
-		const bandPrefix = theme.fg("activityText", "X").split("X")[0] ?? "";
-		setWorkingPulseTick(3);
-		turn.summary.invalidate();
-		const bandAt3 = header().indexOf(bandPrefix);
-		setWorkingPulseTick(6);
-		turn.summary.invalidate();
-		const bandAt6 = header().indexOf(bandPrefix);
-		expect(bandAt3).toBeGreaterThanOrEqual(0);
-		expect(bandAt6).toBeGreaterThanOrEqual(0);
-		expect(bandAt6).not.toBe(bandAt3);
-
+	it("waits for the first token on a plain spinner line: the spinner turns, the words do not shimmer", () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(T0);
+		const turn = quietTurn({ startedAt: T0 - 1_000 });
+		const raw = (tick: number) => {
+			setWorkingPulseTick(tick);
+			turn.summary.invalidate();
+			return turn.summary.render(120).find((line) => /[⠀-⣿]/.test(line)) ?? "";
+		};
+		expect(stripAnsi(raw(0))).toContain("等待模型回应…");
+		expect(stripAnsi(raw(0)).trimEnd()).toMatch(/^ \d\d:\d\d {3}⠋ {6}等待模型回应…$/);
+		// The spinner is what moves.
+		const glyph = (line: string) => /[⠀-⣿]/.exec(line)?.[0];
+		expect(new Set([0, 3, 6].map((tick) => glyph(raw(tick)))).size).toBe(3);
+		// The words are one steady color: with the spinner taken out, the line is the same at any tick.
+		const words = (tick: number) => raw(tick).replace(/[⠀-⣿]/u, "");
+		expect(words(3)).toBe(words(6));
+		expect(words(0)).toBe(words(3));
+		const colors = (line: string) => (line.match(/\x1b\[38;/g) ?? []).length;
+		const moving = colors(raw(3));
 		setMotionReduced(true);
-		turn.summary.invalidate();
-		const calm = (header().match(/\x1b\[38;/g) ?? []).length;
-		expect(shimmering).toBeGreaterThan(calm);
+		expect(words(3)).toBe(words(6));
+		expect(colors(raw(3))).toBe(moving);
 	});
 
-	it("summarizes a finished turn, and says a stopped one stopped", () => {
+	it("summarizes a finished turn on its event line, and a stopped turn stops drawing the spinner", () => {
 		const turn = quietTurn({ live: false });
 		turn.timeline.noteMessage(
 			assistant(
@@ -480,30 +545,50 @@ describe("the box header", () => {
 			status: "done",
 		});
 		turn.state.markTurnEnded(Date.now());
-		const header = headerPlain(turn.summary.render(120));
-		expect(header).toMatch(/✓ 完成 +想了 1 次 · 跑了 1 条命令\s+\d+秒 · ↓ 1\.2k ›/);
-		turn.timeline.stopped = true;
-		turn.timeline.ui.bump();
-		expect(headerPlain(turn.summary.render(120))).toMatch(/■ 已停止 +做到第 1 步，做好的都留着/);
+		const lines = plain(turn.summary.render(120));
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatch(/^ \d\d:\d\d {3}◆ {6}想了 1 次 · 跑了 1 条命令 +2 步 ▸ {2}$/);
+		// The clock and the tokens the header used to carry are what the status bar reads off the turn.
+		expect(turn.timeline.outputTokens()).toBe(1_200);
+		expect(turn.state.turnDurationMs()).toBeGreaterThan(0);
+
+		const stopping = quietTurn();
+		addStep(stopping, "s1", "await bash('sleep 100')", "running");
+		expect(spinnerLine(plain(stopping.summary.render(120)))).toContain("正在运行命令");
+		stopping.timeline.stopped = true;
+		stopping.timeline.ui.bump();
+		const stopped = plain(stopping.summary.render(120));
+		expect(stopped).toHaveLength(1);
+		expect(stopped.join("\n")).not.toMatch(/[⠀-⣿]|在跑|已停止/);
+		const steps = openEvents(stopping);
+		expect(steps.some((line) => line.trimEnd() === "         │           ■  sleep 100 · 你停下了")).toBe(true);
+		expect(steps.join("\n")).not.toMatch(/[⠀-⣿]|已停止/);
 	});
 });
 
-describe("the thinking window", () => {
-	it("is always three lines under the live thought, newest text at the bottom", () => {
+describe("the live thought", () => {
+	it("shows the newest thought on one spinner line, however long it grows", () => {
 		const turn = quietTurn();
 		const message = assistant(Date.now(), [{ type: "thinking", thinking: "短。" }]);
 		turn.timeline.noteMessage(message, false);
-		const windowLines = () => plain(turn.summary.render(80)).filter((line) => /^ │ ▎ {4}/.test(line));
-		expect(windowLines()).toHaveLength(3);
+		const short = plain(turn.summary.render(80));
+		// The event, one blank rail row, the spinner line carrying the thought, and the tip under it.
+		expect(short).toHaveLength(4);
+		expect(spinnerLine(short)).toMatch(/^ \d\d:\d\d {3}[⠀-⣿] {6}短 +第 1 步 {2}$/);
+		expect(short[3]?.trimEnd()).toBe("         ╎           思考中…");
 		const long = "这是很长的一段思考，".repeat(20);
 		turn.timeline.noteMessage({ ...message, content: [{ type: "thinking", thinking: long }] }, false);
-		const lines = windowLines();
-		expect(lines).toHaveLength(3);
-		expect(lines.at(-1)).toContain("这是很长的一段思考");
+		const lines = plain(turn.summary.render(80));
+		expect(lines).toHaveLength(4);
+		expect(lines.join("\n")).not.toContain("▎");
+		const grown = spinnerLine(lines);
+		expect(grown).toContain("这是很长的一段思考");
+		expect(grown).toContain("…");
+		expect(visibleWidth(grown)).toBe(80);
 	});
 });
 
-describe("scrolling inside the box", () => {
+describe("long turns", () => {
 	function busyTurn() {
 		const turn = quietTurn({ host: host({ viewportRows: () => 20 }) });
 		for (let index = 0; index < 20; index++) {
@@ -512,38 +597,47 @@ describe("scrolling inside the box", () => {
 		return turn;
 	}
 
-	it("keeps the body at its height cap and follows the newest row", () => {
+	it("keeps all its steps behind one event, with no height cap and no scroll marker", () => {
 		const turn = busyTurn();
-		const lines = plain(turn.summary.render(100));
-		const body = lines.filter((line) => line.startsWith(" │ ") && line !== lines[2]);
-		expect(body).toHaveLength(boxBodyRows(20));
-		// The newest block is the last two lines: the row and the separator under it.
-		expect(body.at(-2)).toContain("echo 19");
-		expect(body.at(-1)).toMatch(/^ │ ▀+ │$/);
-		expect(lines[3]).toContain("↑ 上面还有");
+		const closed = plain(turn.summary.render(100));
+		// The event, one blank rail row and the spinner line: twenty steps take no more room.
+		expect(closed).toHaveLength(3);
+		expect(closed[0]).toMatch(/跑了 20 条命令 +20 步 ▸ {2}$/);
+		const opened = openEvents(turn, 100);
+		expect(opened).toHaveLength(7);
+		expect(opened[4]).toContain("⋯  另外 17 步");
+		expect(opened[4]?.trimEnd().endsWith("全部 ›")).toBe(true);
+		// `全部 ›` lists every step: the turn grows taller than the 20-row screen instead of being cut or scrolled.
+		click(turn.summary, "全部 ›", 100);
+		const all = plain(turn.summary.render(100));
+		const steps = all.filter((line) => /\$ {2}echo \d+/.test(line));
+		expect(steps).toHaveLength(20);
+		expect(all.length).toBeGreaterThan(20);
+		expect(steps.at(-1)).toContain("echo 19");
+		for (const gone of ["↑ 上面还有", "↓ 有新内容", "▀"]) expect(all.join("\n")).not.toContain(gone);
 	});
 
-	it("scrolls with the wheel over the body and, scrolled up, says new rows arrived", () => {
+	it("takes no wheel, and a step that arrives later only raises the count", () => {
 		const turn = busyTurn();
 		turn.summary.render(100);
-		const wheel = turn.summary.getClickRegions().find((region) => region.onWheel && region.line > 4);
-		expect(wheel?.onWheel?.(-1)).toBe(true);
-		turn.summary.render(100);
+		const regions = turn.summary.getClickRegions();
+		expect(regions.length).toBeGreaterThan(0);
+		expect(regions.every((region) => region.onWheel === undefined)).toBe(true);
 		addStep(turn, "late", "await bash('echo late')", "done", Date.now() - 100);
 		const lines = plain(turn.summary.render(100));
-		expect(lines.at(-1)).toContain("↓ 有新内容");
-		const marker = turn.summary.getClickRegions().find((region) => region.line === lines.length - 1);
-		marker?.onClick({ row: 0, col: 0 });
-		expect(plain(turn.summary.render(100)).at(-1)).not.toContain("↓ 有新内容");
+		expect(lines).toHaveLength(3);
+		expect(lines[0]).toMatch(/跑了 21 条命令 +21 步 ▸ {2}$/);
+		expect(lines.join("\n")).not.toContain("↓ 有新内容");
+		openEvents(turn, 100);
+		click(turn.summary, "全部 ›", 100);
+		const steps = plain(turn.summary.render(100)).filter((line) => /\$ {2}echo \w+/.test(line));
+		expect(steps).toHaveLength(21);
+		expect(steps.at(-1)).toContain("echo late");
 	});
 });
 
 describe("clicks, keys and what stays open", () => {
-	function regionAt(summary: TurnSummaryComponent, line: number): ClickRegion | undefined {
-		return summary.getClickRegions().find((region) => region.line === line && !region.passive);
-	}
-
-	it("toggles the whole box from its header and one row from its own line; plain rows only take the wheel", () => {
+	it("opens an event from its own line and a step from its own line; no line takes the wheel", () => {
 		const turn = quietTurn({ live: false });
 		turn.timeline.noteMessage(
 			assistant(Date.now() - 4_000, [
@@ -554,25 +648,25 @@ describe("clicks, keys and what stays open", () => {
 		);
 		turn.state.addStep({ toolCallId: "c1", toolName: "ipython", args: { code: "print(1)" }, status: "done" });
 		turn.state.markTurnEnded(Date.now());
-		// Folded, the box is its header card alone under the `◆ prime` line.
-		expect(plain(turn.summary.render(120))).toHaveLength(2);
-		regionAt(turn.summary, 1)?.onClick({ row: 0, col: 0 });
+		// Folded, the turn is its event line alone.
+		expect(plain(turn.summary.render(120))).toHaveLength(1);
+		click(turn.summary, "想了 1 次");
 		setMotionReduced(true);
 		const open = plain(turn.summary.render(120));
-		expect(open[2]).toMatch(/✓ 完成 .*⌄/);
-		const thinkLine = open.findIndex((line) => line.includes("思考了"));
-		regionAt(turn.summary, thinkLine)?.onClick({ row: 0, col: 0 });
+		expect(open[0]?.trimEnd().endsWith("2 步 ▴")).toBe(true);
+		expect(open.join("\n")).not.toContain("第二句");
+		click(turn.summary, "思考了");
 		const expanded = text(turn.summary.render(120));
 		expect(expanded).toContain("第二句还有更多内容");
 		// Survives a resize and a plain re-render.
 		expect(text(turn.summary.render(80))).toContain("第二句还有更多内容");
-		expect(turn.timeline.ui.expanded.size).toBe(1);
-		const passive = turn.summary.getClickRegions().filter((region) => region.passive);
-		expect(passive.length).toBeGreaterThan(0);
-		expect(passive.every((region) => region.onWheel !== undefined)).toBe(true);
+		expect(turn.timeline.ui.expanded.size).toBe(2);
+		const regions = turn.summary.getClickRegions();
+		expect(regions.length).toBeGreaterThan(0);
+		expect(regions.every((region) => !region.passive && region.onWheel === undefined)).toBe(true);
 	});
 
-	it("walks header, rows and strip with the keyboard, and Enter opens what it is on", () => {
+	it("walks events and steps with the keyboard, and Enter opens what it is on", () => {
 		setMotionReduced(true);
 		const turn = quietTurn({ live: false });
 		turn.timeline.noteMessage(
@@ -581,18 +675,34 @@ describe("clicks, keys and what stays open", () => {
 		);
 		turn.state.markTurnEnded(Date.now());
 		turn.summary.render(120);
-		expect(turn.summary.getFocusOrder()).toEqual(["header"]);
+		const folded = turn.summary.getFocusOrder();
+		expect(folded).toHaveLength(1);
+		expect(folded[0]).toMatch(/^ev:/);
+		// `header` stands for the first target: the turn's first event.
+		expect(turn.summary.enterLabel("header")).toBe("展开");
 		turn.summary.activate("header");
 		turn.summary.render(120);
 		const order = turn.summary.getFocusOrder();
-		expect(order[0]).toBe("header");
+		expect(order[0]).toBe(folded[0]);
 		expect(order).toHaveLength(2);
-		turn.timeline.ui.focused = true;
-		turn.timeline.ui.focusKey = order[1];
+		expect(turn.summary.enterLabel("header")).toBe("收起");
+		// A focused line is painted whole and marked for the viewport (the walk sets the focus, then repaints).
+		const focusOn = (key: string) => {
+			turn.timeline.ui.focused = true;
+			turn.timeline.ui.focusKey = key;
+			turn.timeline.ui.bump();
+			turn.summary.invalidate();
+		};
+		focusOn("header");
+		const onEvent = turn.summary.render(120);
+		expect(onEvent[0]).toContain(BOX_FOCUS_MARKER);
+		expect(onEvent[0]).toContain(theme.getBgAnsi("timelineHoverBg"));
+		expect(onEvent.join("\n").split(BOX_FOCUS_MARKER)).toHaveLength(2);
+		focusOn(order[1] ?? "");
 		expect(turn.summary.activate(order[1] ?? "")).toBe(true);
 		const focused = turn.summary.render(120).join("\n");
 		expect(stripAnsi(focused)).toContain("还有第二句");
-		expect(focused).toContain("\x1b_pi:box-focus\x07");
+		expect(focused.split(BOX_FOCUS_MARKER)).toHaveLength(2);
 	});
 
 	it("maps the navigator keys, and any other key leaves with the key", () => {
@@ -662,22 +772,29 @@ describe("clicks, keys and what stays open", () => {
 });
 
 describe("opening, folding and history", () => {
-	it("folds the body row by row at turn end, and keeps open a box the user opened after that", () => {
+	it("folds every event at once at turn end, and keeps open one the user opened after that", () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(T0);
 		const turn = quietTurn({ startedAt: T0 - 5_000 });
 		for (let index = 0; index < 6; index++) {
 			addStep(turn, `s${index}`, `await bash('echo ${index}')`, "done", T0 - 4_000 + index);
 		}
+		// Nothing is open while working; the user opens the event.
+		const working = plain(turn.summary.render(100)).length;
+		turn.summary.toggleBox();
 		const open = plain(turn.summary.render(100)).length;
+		expect(open).toBeGreaterThan(working);
+		expect(turn.state.boxOpen).toBe(true);
 		turn.state.markTurnEnded(T0);
 		turn.state.finishBox(T0);
-		vi.setSystemTime(T0 + TURN_FOLD_MS / 2);
-		const folding = plain(turn.summary.render(100)).length;
-		expect(folding).toBeLessThan(open);
-		expect(folding).toBeGreaterThan(4);
-		vi.setSystemTime(T0 + TURN_FOLD_MS + 10);
-		expect(plain(turn.summary.render(100))).toHaveLength(2);
+		// No fold animation: the steps are gone on the very next frame and stay gone.
+		for (const later of [0, TURN_FOLD_MS / 2, TURN_FOLD_MS + 10]) {
+			vi.setSystemTime(T0 + later);
+			const folded = plain(turn.summary.render(100));
+			expect(folded).toHaveLength(1);
+			expect(folded[0]).toMatch(/跑了 6 条命令 +6 步 ▸ {2}$/);
+		}
+		expect(turn.state.boxOpen).toBe(false);
 
 		const touched = quietTurn({ startedAt: T0 - 5_000 });
 		addStep(touched, "t", "await bash('echo t')", "done", T0 - 4_000);
@@ -685,28 +802,47 @@ describe("opening, folding and history", () => {
 		touched.state.finishBox(T0);
 		vi.setSystemTime(T0 + TURN_FOLD_MS + 10);
 		touched.summary.toggleBox();
-		expect(plain(touched.summary.render(100)).length).toBeGreaterThan(4);
+		expect(touched.state.boxOpen).toBe(true);
+		expect(plain(touched.summary.render(100)).length).toBeGreaterThan(1);
 	});
 
-	it("folds at once with reduced motion, and never highlights new rows", () => {
+	it("folds at once, and never highlights new rows", () => {
 		setMotionReduced(true);
 		const turn = quietTurn();
 		addStep(turn, "s", "await bash('echo s')");
 		turn.summary.render(100);
+		turn.summary.toggleBox();
 		turn.state.markTurnEnded(Date.now());
 		turn.state.finishBox();
-		expect(plain(turn.summary.render(100))).toHaveLength(2);
+		expect(plain(turn.summary.render(100))).toHaveLength(1);
 		expect(rowEnterStage(Date.now())).toBe("none");
+		// With motion on, a row that just arrived is drawn like the rest: no highlight background anywhere.
+		setMotionReduced(false);
+		const live = quietTurn();
+		addStep(live, "a", "await bash('echo a')");
+		live.summary.toggleBox();
+		live.summary.render(100);
+		addStep(live, "b", "await bash('echo b')", "done", Date.now());
+		expect(live.summary.render(100).join("\n")).not.toContain("\x1b[48;");
 	});
 
-	it("starts closed while working when the setting says so, and history boxes start closed", () => {
-		const closedLive = quietTurn({ host: host({ openWhileWorking: () => false }) });
-		addStep(closedLive, "s", "await bash('echo s')", "running");
-		expect(plain(closedLive.summary.render(100))).toHaveLength(2);
+	it("starts closed while working whichever way the setting says, and history turns start closed", () => {
+		const settings = [true, false];
+		expect(settings.length).toBeGreaterThan(0);
+		for (const open of settings) {
+			const live = quietTurn({ host: host({ openWhileWorking: () => open }) });
+			addStep(live, "s", "await bash('echo s')", "running");
+			const lines = plain(live.summary.render(100));
+			expect(lines[0]?.trimEnd().endsWith("1 步 ▸"), `openWhileWorking ${open}`).toBe(true);
+			expect(lines.join("\n"), `openWhileWorking ${open}`).not.toMatch(/\$ {2}echo s/);
+			expect(live.state.boxOpen).toBe(false);
+		}
 		const history = quietTurn({ live: false });
 		addStep(history, "s", "await bash('echo s')");
 		history.state.markTurnEnded(Date.now());
-		expect(plain(history.summary.render(100))).toHaveLength(2);
+		const lines = plain(history.summary.render(100));
+		expect(lines).toHaveLength(1);
+		expect(lines[0]?.trimEnd().endsWith("1 步 ▸")).toBe(true);
 	});
 
 	it("Ctrl+T opens every thinking row of the turn", () => {
@@ -720,10 +856,10 @@ describe("opening, folding and history", () => {
 			true,
 		);
 		turn.state.markTurnEnded(Date.now());
-		// Open the box (but not its thinking rows) first: a closed box folds
+		// Open the events (but not their thinking steps) first: a closed event folds
 		// everything into "想了 N 次" and would never show the full text
 		// either way, so that state cannot prove the toggle reveals anything.
-		// With the box open, a settled thinking row must show only its first
+		// With the event open, a settled thinking step must show only its first
 		// sentence - the rest must not already be on screen, or the toggle
 		// below would prove nothing about what it reveals.
 		turn.summary.toggleBox();
@@ -739,17 +875,35 @@ describe("opening, folding and history", () => {
 });
 
 describe("layout", () => {
-	it("keeps every line inside 80 columns and lines up the CJK rows", () => {
+	it("keeps every line inside its width and lines up the CJK rows", () => {
 		const turn = quietTurn();
 		turn.state.notePhase("thinking");
 		turn.state.currentThinking = "这个测试上个月还是好的，大概率是最近的提交弄坏的。";
 		addStep(turn, "c1", "await bash('git log --stat -100 --format=%H 一个很长的中文参数说明')");
 		turn.timeline.addSteer("先别动安卓的，只升级 Go。这句话很长很长很长很长很长很长很长很长很长", Date.now());
-		for (const width of [80, 60, 200]) {
-			const lines = turn.summary.render(width);
-			const outer = Math.max(24, width - 1);
-			for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
-			for (const line of lines.slice(1)) expect(visibleWidth(line)).toBe(outer + 1);
+		const widths = [80, 60, 200];
+		expect(widths.length).toBeGreaterThan(0);
+		for (const open of [false, true]) {
+			if (open) turn.summary.toggleBox();
+			for (const width of widths) {
+				const lines = turn.summary.render(width);
+				expect(lines.length).toBeGreaterThan(0);
+				for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+				const shown = plain(lines);
+				// Lines with words on their right edge are as wide as the screen, and those words end two columns
+				// before the edge (four for a step's result), whatever the CJK text in front of them is.
+				const edged = [
+					{ name: "event", line: shown.find((line) => line.includes("◆")), trailing: 2 },
+					{ name: "spinner", line: spinnerLine(shown), trailing: 2 },
+					...(open ? [{ name: "step", line: shown.find((line) => line.includes("git log")), trailing: 4 }] : []),
+				];
+				expect(edged.length).toBeGreaterThan(0);
+				for (const { name, line, trailing } of edged) {
+					expect(line, `${name} at ${width}`).toBeDefined();
+					expect(visibleWidth(line ?? ""), `${name} at ${width}`).toBe(width);
+					expect((line ?? "").length - (line ?? "").trimEnd().length, `${name} at ${width}`).toBe(trailing);
+				}
+			}
 		}
 	});
 });
@@ -958,7 +1112,7 @@ describe("the status bar", () => {
 });
 
 describe("replay groups a transcript the way the live view does", () => {
-	it("keeps an interjection inside the turn's box instead of starting a new turn", () => {
+	it("keeps an interjection inside the turn's timeline instead of starting a new turn", () => {
 		const messages: AgentMessage[] = [
 			{ role: "user", content: "把依赖都升级", timestamp: 1_000 },
 			assistant(1_100, [
@@ -988,12 +1142,14 @@ describe("replay groups a transcript the way the live view does", () => {
 		const summary = summaries[0] as TurnSummaryComponent;
 		summary.setExpanded(true);
 		setMotionReduced(true);
-		const out = text(summary.render(120));
-		expect(out).toContain("你插话：先别动安卓的");
-		expect(out).toContain("go list -m -u all");
+		const lines = plain(summary.render(120));
+		expect(lines.find((line) => line.includes("你插话"))?.trimEnd()).toBe(
+			` ${formatTimelineTime(1_300)}   ●      你插话   先别动安卓的`,
+		);
+		expect(lines.some((line) => /^ {9}│ {11}\$ {2}go list -m -u all +✓ 14 个可升级 {4}$/.test(line))).toBe(true);
 	});
 
-	it("clocks a replayed box up to its last reply, not just its last step", () => {
+	it("clocks a replayed turn up to its last reply, not just its last step", () => {
 		const messages: AgentMessage[] = [
 			{ role: "user", content: "读配置", timestamp: 1_000 },
 			assistant(1_000, [{ type: "toolCall", id: "c1", name: "ipython", arguments: { code: "print(1)" } }]),
@@ -1015,7 +1171,10 @@ describe("replay groups a transcript the way the live view does", () => {
 			processMode: "quiet",
 		});
 		const summary = components.find((component) => component instanceof TurnSummaryComponent) as TurnSummaryComponent;
-		expect(text(summary.render(120))).toMatch(/4秒 · ↓/);
+		// The timeline draws no header clock: the turn's clock is what the status bar reads off it.
+		expect(summary.state.turnDurationMs()).toBe(4_200);
+		expect(formatBoxDuration(summary.state.turnDurationMs())).toBe("4秒");
+		expect(plain(summary.render(120))[0]).toMatch(/^ \d\d:\d\d {3}◆ {6}做了 1 步 +1 步 ▸ {2}$/);
 	});
 
 	it("ends a turn the owner interrupted mid-step as stopped, and the next message starts a new turn", () => {
@@ -1058,8 +1217,12 @@ describe("replay groups a transcript the way the live view does", () => {
 		expect(components.filter((component) => component instanceof UserMessageComponent)).toHaveLength(2);
 		const summaries = components.filter((component) => component instanceof TurnSummaryComponent);
 		expect(summaries).toHaveLength(1);
-		const out = text((summaries[0] as TurnSummaryComponent).render(120));
-		expect(out).toContain("■ 已停止");
-		expect(out).not.toContain("算了，先看测试");
+		const box = summaries[0] as TurnSummaryComponent;
+		const lines = openEvents({ summary: box }, 120);
+		// No pill says 已停止: the cut-off step reads as stopped, faint, and nothing is drawn as a failure.
+		expect(lines.some((line) => line.trimEnd() === "         │           ■  make lint · 你停下了")).toBe(true);
+		expect(lines.join("\n")).not.toContain("已停止");
+		expect(lines.join("\n")).not.toContain("算了，先看测试");
+		expect(box.render(120).join("\n")).not.toContain(theme.getFgAnsi("timelineMust"));
 	});
 });
