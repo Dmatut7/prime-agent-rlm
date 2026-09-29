@@ -101,6 +101,46 @@ describe("the subagent strip as the design draws it", () => {
 	});
 });
 
+describe("the order of the blocks", () => {
+	beforeAll(() => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+	});
+
+	const dispatched = [
+		snapshot({ id: "a", sessionName: "A", label: "钉住框头：检查滚动" }),
+		snapshot({ id: "b", sessionName: "B", label: "框的折叠：检查折叠", status: "done" }),
+		snapshot({ id: "c", sessionName: "C", label: "子代理小块：检查块" }),
+		snapshot({ id: "d", sessionName: "D", label: "测试和发版：跑测试" }),
+	];
+
+	it("follows the dispatch order A B C D with the delivered one in the middle, not the state order", () => {
+		const rows = buildSubagentPanelRows(dispatched, undefined);
+		// The list still ranks the delivered child last.
+		expect(rows.map((row) => row.name)).toEqual(["A", "C", "D", "B"]);
+		const line = stripAnsi(strip(rows).render(WIDTH)[0] ?? "");
+		expect(line).toMatch(
+			/^ {2}◇ A 钉住框头 回答中 {3}◇ B 框的折叠 ✓ 已交回 {3}◇ C 子代理小块 回答中 {3}◇ D 测试和发版 回答中 /,
+		);
+	});
+
+	it("keeps the blocks in dispatch order as a child changes state", () => {
+		const line = strip(buildSubagentPanelRows(dispatched, undefined));
+		const names = (text: string) => [...text.matchAll(/◇ ([A-D]) /g)].map((match) => match[1]);
+		expect(names(stripAnsi(line.render(WIDTH)[0] ?? ""))).toEqual(["A", "B", "C", "D"]);
+		const later = dispatched.map((child) => (child.id === "a" ? { ...child, status: "done" as const } : child));
+		line.setSubagentRows(buildSubagentPanelRows(later, undefined));
+		expect(names(stripAnsi(line.render(WIDTH)[0] ?? ""))).toEqual(["A", "B", "C", "D"]);
+	});
+
+	it("draws again when only a tag changes", () => {
+		const line = strip([{ id: "a", name: "A", tag: "钉住框头", state: "running", dispatchIndex: 0 }]);
+		expect(stripAnsi(line.render(WIDTH)[0] ?? "")).toContain("A 钉住框头 回答中");
+		line.setSubagentRows([{ id: "a", name: "A", tag: "新任务", state: "running", dispatchIndex: 0 }]);
+		expect(stripAnsi(line.render(WIDTH)[0] ?? "")).toContain("A 新任务 回答中");
+	});
+});
+
 describe("the task tag", () => {
 	beforeAll(() => {
 		initTheme("dark");

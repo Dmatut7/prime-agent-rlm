@@ -152,7 +152,7 @@ describe("the subagent strip", () => {
 		expect(visibleWidth(shown)).toBeGreaterThanOrEqual(12);
 	});
 
-	it("keeps the most-relevant-first order the panel rows come in", () => {
+	it("lays the blocks out in the order the children were dispatched, while the rows stay most-relevant-first", () => {
 		const child = (id: string, status: AgentConnectionRlmChildAgentSnapshot["status"], extra = {}) =>
 			({ id, label: id, status, sessionDir: `/tmp/${id}`, ...extra }) as AgentConnectionRlmChildAgentSnapshot;
 		const rows = buildSubagentPanelRows(
@@ -167,8 +167,10 @@ describe("the subagent strip", () => {
 			],
 			undefined,
 		);
+		// The list (the agents panel, the duty log) still ranks by state.
+		expect(rows.map((row) => row.id)).toEqual(["stall-1", "err-1", "run-1", "done-1"]);
 		const text = plain(strip(rows).render(160));
-		const order = ["stall-1", "err-1", "run-1", "done-1"].map((name) => text.indexOf(name));
+		const order = ["done-1", "run-1", "err-1", "stall-1"].map((name) => text.indexOf(name));
 		expect(order.every((at) => at >= 0)).toBe(true);
 		expect(order).toEqual([...order].sort((a, b) => a - b));
 	});

@@ -209,6 +209,8 @@ export interface SubagentPanelRow {
 	name: string;
 	/** A few words on the child's task, shown after its name when there is room. */
 	tag?: string;
+	/** Where the child came in the order it was dispatched; the strip's blocks follow it, the list is sorted by state. */
+	dispatchIndex?: number;
 	state: SubagentPanelRowState;
 	/** Run time so far, when the snapshot reports it. */
 	elapsedMs?: number;
@@ -270,7 +272,7 @@ export function buildSubagentPanelRows(
 	parentId: string | undefined,
 	seenFailureChildIds: ReadonlySet<string> = new Set(),
 ): SubagentPanelRow[] {
-	const rows = collectSubtreeSubagentSnapshots(children, parentId).map((child) => {
+	const rows = collectSubtreeSubagentSnapshots(children, parentId).map((child, dispatchIndex) => {
 		const roster = classifySubagentSnapshotStatus(child);
 		const state: SubagentPanelRowState = isStalledSubagentSnapshot(child)
 			? "stalled"
@@ -281,7 +283,7 @@ export function buildSubagentPanelRows(
 					: roster === "idle"
 						? "idle"
 						: "done";
-		const row: SubagentPanelRow = { id: child.id, name: child.sessionName ?? child.label, state };
+		const row: SubagentPanelRow = { id: child.id, name: child.sessionName ?? child.label, state, dispatchIndex };
 		// Without a session name the label is the name already; a tag would say it twice.
 		const tag = child.sessionName ? subagentTaskTag(child.label, child.sessionName) : undefined;
 		if (tag) row.tag = tag;
@@ -533,7 +535,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 		this.itemsDirty = true;
 	}
 
-	/** Per-child rows (see buildSubagentPanelRows), most relevant first: one block each. */
+	/** Per-child rows (see buildSubagentPanelRows): one block each, in the order the children were dispatched. */
 	setSubagentRows(rows: readonly SubagentPanelRow[]): void {
 		this.rows = rows;
 		this.itemsDirty = true;
@@ -619,7 +621,11 @@ export class SubagentSummaryLine implements Component, Focusable {
 			this.windowStart,
 			this.hoveredKey ?? "",
 			this.getItems()
-				.map((item) => [item.key, item.name, item.state ?? ""].join("\u0003"))
+				.map((item) =>
+					[item.key, item.name, item.tag ?? "", item.state ?? "", item.row?.acknowledged ? "1" : ""].join(
+						"\u0003",
+					),
+				)
 				.join("\u0000"),
 		].join("\u0001");
 	}
@@ -639,7 +645,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 				items.push({ key: `orphan:${name}`, kind: "orphan", name });
 			}
 			if (this.rows.length > 0) {
-				for (const row of this.rows) {
+				for (const row of this.dispatchOrder()) {
 					items.push({
 						key: `row:${row.id}`,
 						kind: "row",
@@ -665,6 +671,12 @@ export class SubagentSummaryLine implements Component, Focusable {
 		this.selectedIndex = kept !== -1 ? kept : Math.min(this.selectedIndex, Math.max(0, items.length - 1));
 		this.selectedKey = items[this.selectedIndex]?.key;
 		return items;
+	}
+
+	/** The rows in the order the children were dispatched (a stable sort), or as given when they carry no order. */
+	private dispatchOrder(): readonly SubagentPanelRow[] {
+		if (!this.rows.every((row) => row.dispatchIndex !== undefined)) return this.rows;
+		return [...this.rows].sort((a, b) => (a.dispatchIndex ?? 0) - (b.dispatchIndex ?? 0));
 	}
 
 	private open(item: StripItem | undefined): void {
