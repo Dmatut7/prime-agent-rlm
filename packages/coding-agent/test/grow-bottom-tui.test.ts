@@ -1,13 +1,14 @@
 import { Container, setKeybindings, Text, TUI, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import {
 	type SubagentPanelRow,
 	SubagentSummaryLine,
 } from "../src/modes/interactive/components/subagent-summary-line.js";
-import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
+import { theme } from "../src/modes/interactive/theme/theme.js";
+import { useTruecolorTheme } from "./ui-blocks-helpers.js";
 
 /**
  * The subagent strip in a real fullscreen TUI on a virtual terminal: the wheel
@@ -92,9 +93,14 @@ async function createScreen(options: { openable?: boolean } = {}): Promise<Scree
 }
 
 describe("the subagent strip in a fullscreen terminal", () => {
+	let restoreTheme: () => void;
 	beforeAll(() => {
-		initTheme("dark");
+		restoreTheme = useTruecolorTheme("dark");
 		setKeybindings(new KeybindingsManager());
+	});
+
+	afterAll(() => {
+		restoreTheme();
 	});
 
 	afterEach(() => {

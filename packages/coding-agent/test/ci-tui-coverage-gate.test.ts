@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
 /**
@@ -97,5 +98,53 @@ describe("the tui CI job is inside the coverage gate (QW-R1)", () => {
 		const result = spawnSync(process.execPath, [gatePath, "--self-test"], { encoding: "utf8" });
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain("0 mismatch(es)");
+	});
+});
+
+describe("the gate reads the junit shape node --test really writes", () => {
+	const workDir = mkdtempSync(join(tmpdir(), "tui-gate-shape-"));
+	afterAll(() => rmSync(workDir, { recursive: true, force: true }));
+
+	function gate(name: string, body: string[], summary: string[]) {
+		const report = join(workDir, name);
+		const comments = summary.map((line) => `\t<!-- ${line} -->`);
+		writeFileSync(
+			report,
+			['<?xml version="1.0" encoding="utf-8"?>', "<testsuites>", ...body, ...comments, "</testsuites>"].join("\n"),
+		);
+		return spawnSync(process.execPath, [gatePath, report, "--min-tests", "1", "--max-nothing-suites", "0"], {
+			encoding: "utf8",
+		});
+	}
+	const pass = (name: string) => `\t\t<testcase name="${name}" time="0.0001" classname="test"/>`;
+	const skipped = (name: string) =>
+		`\t\t<testcase name="${name}" time="0.0001" classname="test"><skipped type="skipped" message="true"/></testcase>`;
+	const suite = (name: string, ...inner: string[]) => [
+		`\t<testsuite name="${name}" tests="0">`,
+		...inner,
+		"\t</testsuite>",
+	];
+
+	it("counts a test that follows a nested describe", () => {
+		const body = [...suite("outer", pass("a"), ...suite("inner", pass("b")), pass("c"))];
+		const result = gate("nested.xml", body, ["tests 3", "skipped 0"]);
+		expect(result.stderr).not.toContain("disagree");
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("counted 3 tests");
+	});
+
+	it("does not count a skipped describe the runner leaves out of its own total", () => {
+		const body = suite("outer", pass("a"), pass("b"), skipped("a describe skipped by its options"));
+		const result = gate("skipped-describe.xml", body, ["tests 2", "skipped 0", "todo 0"]);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("counted 2 tests");
+	});
+
+	it("still goes red on a nested suite that ran nothing", () => {
+		const body = suite("outer", pass("a"), ...suite("inner", skipped("b"), skipped("c")));
+		const result = gate("nested-nothing.xml", body, ["tests 3", "skipped 2", "todo 0"]);
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("ran nothing");
+		expect(result.stderr).toContain("inner");
 	});
 });
