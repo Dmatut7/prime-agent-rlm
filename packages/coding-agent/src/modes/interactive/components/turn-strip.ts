@@ -263,8 +263,8 @@ export class TurnStripComponent implements Component {
 
 		const hasEditsRow = facts.projectChanges.length > 0 || facts.commitId !== undefined || facts.trackingIncomplete;
 		const hasSections = hasEditsRow || facts.memories.length > 0;
-		// The answer above ends with one blank row of its own; a memory sits two rows below it.
-		if (facts.memories.length > 0) gap();
+		// The answer above ends with one blank row of its own; a section sits two rows below it.
+		if (hasSections) gap();
 		if (hasEditsRow) this.editsSection(facts, safeWidth, push, stampOf, caretFor);
 
 		facts.memories.forEach(({ key, change }, index) => {

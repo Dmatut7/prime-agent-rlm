@@ -265,6 +265,21 @@ describe("blank rows around the strip", () => {
 		expect(alone[0]).toContain("╵");
 	});
 
+	it("gives a turn that changed files but kept no memory the same blank row above its ✎ row", () => {
+		const editsOnly = plain(strip(facts({ memories: [], projectChanges: [file()] })).component.render(100));
+		expect(editsOnly[0]).toBe(designRow(100, "", "│", ""));
+		expect(editsOnly[1]).toContain("✎ 改了 1 个文件");
+		expect(editsOnly.map((row) => (row.includes("✎") ? "edits" : row.includes("╵") ? "end" : "gap"))).toEqual([
+			"gap",
+			"edits",
+			"gap",
+			"end",
+		]);
+		const commitOnly = plain(strip(facts({ memories: [], commitId: "abc1234" })).component.render(100));
+		expect(commitOnly[0]).toBe(designRow(100, "", "│", ""));
+		expect(commitOnly[1]).toContain("已提交 abc1234");
+	});
+
 	it("puts a blank row between the file row and the memory rows, and one before the closing row", () => {
 		const rows = plain(strip(facts({ projectChanges: [file()] })).component.render(100));
 		const kinds = rows.map((row) =>
@@ -628,14 +643,14 @@ describe("the changed-files row", () => {
 			}),
 		);
 		const rows = plain(component.render(100));
-		expect(rows[0]).toBe(
+		expect(rows[1]).toBe(
 			designRow(100, formatTimelineTime(AT - 60_000), "·", "✎ 改了 2 个文件 +20 −7 · 已提交 abc1234", "▸"),
 		);
 		component.activate(STRIP_EDITS);
 		const list = plain(component.render(100));
-		expect(list[0]).toContain("▴");
-		expect(list[1]).toBe(designRow(100, "", "│", "  ✎ src/a.ts", "+12 −3  ▸"));
-		expect(list[2]).toBe(designRow(100, "", "│", "  ✎ b.go", "+8 −4  ▸"));
+		expect(list[1]).toContain("▴");
+		expect(list[2]).toBe(designRow(100, "", "│", "  ✎ src/a.ts", "+12 −3  ▸"));
+		expect(list[3]).toBe(designRow(100, "", "│", "  ✎ b.go", "+8 −4  ▸"));
 		component.activate("strip:item:file:/w/src/a.ts");
 		const diff = plain(component.render(100)).join("\n");
 		expect(diff).toContain("− old()");
@@ -645,9 +660,9 @@ describe("the changed-files row", () => {
 
 	it("says a commit or an incomplete record even when no project file changed", () => {
 		const commit = plain(strip(facts({ memories: [], commitId: "abc1234" })).component.render(100));
-		expect(commit[0]).toContain("已提交 abc1234");
+		expect(commit[1]).toContain("已提交 abc1234");
 		const lost = plain(strip(facts({ memories: [], trackingIncomplete: true })).component.render(100));
-		expect(lost[0]).toContain("（有些改动没记全）");
+		expect(lost[1]).toContain("（有些改动没记全）");
 	});
 
 	it("says how many temp files sit outside the project once opened", () => {
