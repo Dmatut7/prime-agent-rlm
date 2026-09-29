@@ -285,6 +285,71 @@ describe("opening a report", () => {
 	});
 });
 
+describe("a long report costs nothing per frame", () => {
+	/** A report whose text counts how often anything reads it. */
+	function counted(): { message: AgentSessionMessage; reads: () => number } {
+		const base = report("review-grow-B-box", okBody);
+		const text = `${okBody}\n\n${"很长的一段说明，".repeat(2_000)}`;
+		let reads = 0;
+		const details = {
+			...base.details,
+			get message(): string {
+				reads += 1;
+				return text;
+			},
+		};
+		return { message: { ...base, details }, reads: () => reads };
+	}
+
+	it("reads and wraps the report once for a collapsed row, however many frames are drawn", () => {
+		const { message, reads } = counted();
+		const component = new AgentMessageComponent(message, undefined, {
+			suppressLeadingSpace: true,
+			timeline: { before: "on", after: "on" },
+		});
+		component.render(W);
+		const afterFirst = reads();
+		for (let frame = 0; frame < 50; frame++) component.render(W);
+		expect(reads()).toBe(afterFirst);
+	});
+
+	it("wraps again for a new width or lane, and after an invalidation, but not for a hover or an open", () => {
+		const { message, reads } = counted();
+		const component = new AgentMessageComponent(message, undefined, {
+			suppressLeadingSpace: true,
+			timeline: { before: "on", after: "on" },
+		});
+		component.render(W);
+		const first = reads();
+		component.getClickRegions()[0]?.onHover?.(true);
+		component.render(W);
+		component.getClickRegions()[0]?.onClick({ row: 0, col: 0 });
+		const opened = component.render(W);
+		expect(reads()).toBe(first);
+		expect(opened.length).toBeGreaterThan(100);
+		component.render(60);
+		expect(reads()).toBeGreaterThan(first);
+		const afterWidth = reads();
+		component.render(60);
+		expect(reads()).toBe(afterWidth);
+		component.invalidate();
+		component.render(60);
+		expect(reads()).toBeGreaterThan(afterWidth);
+	});
+
+	it("still promises the rows a click opens from the cached body", () => {
+		const { message } = counted();
+		const component = new AgentMessageComponent(message, undefined, {
+			suppressLeadingSpace: true,
+			timeline: { before: "on", after: "on" },
+		});
+		component.render(W);
+		const promised = component.getClickRegions()[0]?.revealBelow ?? 0;
+		component.getClickRegions()[0]?.onClick({ row: 0, col: 0 });
+		expect(plain(component.render(W)).length - 1).toBe(promised);
+	});
+});
+
 describe("what a report says on its one row", () => {
 	it("takes the task from the brackets after the lane name and the conclusion after `结论：`", () => {
 		expect(reportParts(okBody)).toEqual({ label: "框的长高和折叠", conclusion: "没问题（7 条小建议）" });

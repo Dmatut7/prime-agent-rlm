@@ -214,6 +214,9 @@ export class AgentMessageComponent extends Container {
 	private readonly timeline: TimelineReturn | undefined;
 	private expanded = false;
 	private hovered = false;
+	/** What the row says and the whole report under it, kept until the width, the lane or the theme changes. */
+	private contentCache: string | undefined;
+	private bodyCache: { width: number; lane: TimelineLane; rows: string[] } | undefined;
 
 	constructor(
 		private readonly message: AgentSessionMessage,
@@ -260,10 +263,10 @@ export class AgentMessageComponent extends Container {
 			safeWidth,
 		);
 		rows.push(this.hovered ? hoverRow(head, safeWidth) : head);
-		const body = this.expanded ? this.timelineBody(safeWidth, timeline.after) : [];
-		rows.push(...body);
+		const body = this.timelineBody(safeWidth, timeline.after);
+		if (this.expanded) rows.push(...body);
 		if (timeline.joined !== undefined) rows.push(joinRow(timeline.joined, safeWidth));
-		const opens = this.timelineBody(safeWidth, timeline.after).length;
+		const opens = body.length;
 		this.clickRegions = [
 			{
 				line: headLine,
@@ -282,6 +285,11 @@ export class AgentMessageComponent extends Container {
 	}
 
 	private timelineContent(): string {
+		this.contentCache ??= this.buildTimelineContent();
+		return this.contentCache;
+	}
+
+	private buildTimelineContent(): string {
 		const name = shortAgentName(agentMessageSenderName(this.message.details.from));
 		const fromChild = this.message.details.fromRelationship === "child";
 		const who = theme.bold(theme.fg("timelineSub", `${name} ${fromChild ? "交回" : "发来"}`));
@@ -295,6 +303,14 @@ export class AgentMessageComponent extends Container {
 
 	/** The whole report under its row, in the lane the rest of the timeline is in. */
 	private timelineBody(width: number, lane: TimelineLane): string[] {
+		const cached = this.bodyCache;
+		if (cached && cached.width === width && cached.lane === lane) return cached.rows;
+		const rows = this.buildTimelineBody(width, lane);
+		this.bodyCache = { width, lane, rows };
+		return rows;
+	}
+
+	private buildTimelineBody(width: number, lane: TimelineLane): string[] {
 		const indent = 2;
 		const room = Math.max(1, width - TIMELINE_CONTENT_COL - indent - 2);
 		return this.message.details.message
@@ -324,10 +340,14 @@ export class AgentMessageComponent extends Container {
 
 	override invalidate(): void {
 		super.invalidate();
+		this.contentCache = undefined;
+		this.bodyCache = undefined;
 		this.updateDisplay();
 	}
 
 	private updateDisplay(): void {
+		// A timeline row draws itself; the legacy header is not built for it.
+		if (this.timeline) return;
 		this.content.clear();
 		this.header.setText(this.headerText());
 		this.content.addChild(this.header);
