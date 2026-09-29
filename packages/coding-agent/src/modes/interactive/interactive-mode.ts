@@ -1580,6 +1580,8 @@ export class InteractiveMode {
 
 	// One summary line below the editor, backed by the existing child-status stream.
 	private subagentSummaryLine: SubagentSummaryLine;
+	/** One blank row under the prompt: lifts the prompt off the strip and status line under it. */
+	private readonly promptLift = new Spacer(1);
 	private trayInfoLine: TrayInfoLine;
 	private subagentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
 	/** Children whose failure notice this chat has shown: the parent already knows. */
@@ -10254,9 +10256,9 @@ export class InteractiveMode {
 		];
 	}
 
-	/** The prompt and what hangs under it, top to bottom: hint line, prompt, subagent strip, status line. */
+	/** The prompt and what hangs under it, top to bottom: hint line, prompt, a blank row, subagent strip, status line. */
 	private getPromptDockComponents(): Component[] {
-		return [this.trayInfoLine, this.editorContainer, this.subagentSummaryLine, this.footerSlot];
+		return [this.trayInfoLine, this.editorContainer, this.promptLift, this.subagentSummaryLine, this.footerSlot];
 	}
 
 	/** Stack the prompt area in the main view and in the fullscreen dock, in the same order. */

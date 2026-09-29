@@ -343,6 +343,7 @@ describe("the prompt area's order", () => {
 		const parts = {
 			trayInfoLine: named("hint line"),
 			editorContainer: named("prompt"),
+			promptLift: named("blank row"),
 			subagentSummaryLine: named("subagent strip"),
 			footerSlot: named("status line"),
 			widgetContainerBelow: named("widgets below"),
@@ -355,17 +356,18 @@ describe("the prompt area's order", () => {
 		return { mode, parts, read };
 	}
 
-	it("stacks the fullscreen dock as hint line, prompt, subagent strip, status line", () => {
+	it("stacks the fullscreen dock as hint line, prompt, a blank row, subagent strip, status line", () => {
 		const { mode, parts } = stack();
 		const dock = Reflect.get(InteractiveMode.prototype, "getPromptDockComponents") as (
 			this: InteractiveMode,
 		) => Component[];
 		const order = dock.call(mode);
-		expect(order).toHaveLength(4);
+		expect(order).toHaveLength(5);
 		expect(order[0]).toBe(parts.trayInfoLine);
 		expect(order[1]).toBe(parts.editorContainer);
-		expect(order[2]).toBe(parts.subagentSummaryLine);
-		expect(order[3]).toBe(parts.footerSlot);
+		expect(order[2]).toBe(parts.promptLift);
+		expect(order[3]).toBe(parts.subagentSummaryLine);
+		expect(order[4]).toBe(parts.footerSlot);
 	});
 
 	it("builds the main view and the fullscreen dock in that same order", () => {
@@ -375,11 +377,12 @@ describe("the prompt area's order", () => {
 		expect(read(parts.mainContainer)).toEqual([
 			"hint line",
 			"prompt",
+			"blank row",
 			"subagent strip",
 			"status line",
 			"widgets below",
 		]);
-		expect(read(parts.promptDock)).toEqual(["hint line", "prompt", "subagent strip", "status line"]);
+		expect(read(parts.promptDock)).toEqual(["hint line", "prompt", "blank row", "subagent strip", "status line"]);
 		expect(read(parts.footerSlot)).toEqual(["footer"]);
 	});
 });
