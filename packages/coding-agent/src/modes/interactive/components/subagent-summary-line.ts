@@ -746,7 +746,8 @@ export class SubagentSummaryLine implements Component, Focusable {
 				col,
 				width: chip.width,
 				height: 1,
-				onClick: () => this.open(item),
+				// The frame may be cached from before the row changed: open what the block is now.
+				onClick: () => this.open(this.getItems().find((current) => current.key === item.key)),
 				onWheel,
 				// A block that cannot be opened has nothing to light up for.
 				...(this.openable
