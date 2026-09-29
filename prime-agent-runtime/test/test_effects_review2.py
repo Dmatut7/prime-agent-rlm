@@ -412,8 +412,5 @@ class LinkReplacedInPythonTests(te.TrackerCase):
         self.assertIn("+x\n", record["diff"])
 
 
-
-
-
 if __name__ == "__main__":
     unittest.main()
