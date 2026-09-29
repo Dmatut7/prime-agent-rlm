@@ -1,0 +1,1 @@
+- Fixed on/off settings written as text, for example `"false"` in quotes, being read as on everywhere except `changeTracking.enabled`: every on/off setting now reads `"false"`, `"off"`, `"no"`, `0` as off and warns that the value is not true or false; the agent-traces and telemetry consent settings and their project veto follow the same rule.

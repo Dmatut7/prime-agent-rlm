@@ -1031,7 +1031,11 @@ function applyProjectConsentVeto(merged: Record<string, unknown>, files: Setting
 	for (const [blockName, key] of PROJECT_CONSENT_VETO_KEYS) {
 		const vetoed = files.some((file) => {
 			const block = (file as Record<string, unknown>)[blockName];
-			return typeof block === "object" && block !== null && (block as Record<string, unknown>)[key] === false;
+			return (
+				typeof block === "object" &&
+				block !== null &&
+				!readBooleanSetting((block as Record<string, unknown>)[key], true).value
+			);
 		});
 		if (!vetoed) {
 			continue;
@@ -1295,24 +1299,92 @@ const BOOLEAN_SETTING_OFF_WORDS = ["false", "no", "off", "0"];
  * Read an on/off setting from a file a person may have edited by hand. A JSON
  * string such as "false" is truthy, so `?? default` alone leaves a switch written
  * that way on. Anything but a real boolean is still read (an off word or 0 means
- * off, any other string or number means on, any other type means `fallback`) and
- * comes back `wellFormed: false` so the caller can say how it was read.
+ * off, any other text or number means on) and comes back `wellFormed: false` so
+ * the caller can say how it was read. A blank string, null or any other type says
+ * nothing usable: the value is `fallback`, flagged `ignored`.
  */
-function readBooleanSetting(raw: unknown, fallback: boolean): { value: boolean; wellFormed: boolean } {
+function readBooleanSetting(
+	raw: unknown,
+	fallback: boolean,
+): { value: boolean; wellFormed: boolean; ignored: boolean } {
 	if (raw === undefined) {
-		return { value: fallback, wellFormed: true };
+		return { value: fallback, wellFormed: true, ignored: false };
 	}
 	if (typeof raw === "boolean") {
-		return { value: raw, wellFormed: true };
+		return { value: raw, wellFormed: true, ignored: false };
 	}
-	if (typeof raw === "string") {
-		return { value: !BOOLEAN_SETTING_OFF_WORDS.includes(raw.trim().toLowerCase()), wellFormed: false };
+	if (typeof raw === "string" && raw.trim() !== "") {
+		return {
+			value: !BOOLEAN_SETTING_OFF_WORDS.includes(raw.trim().toLowerCase()),
+			wellFormed: false,
+			ignored: false,
+		};
 	}
 	if (typeof raw === "number") {
-		return { value: raw !== 0, wellFormed: false };
+		return { value: raw !== 0, wellFormed: false, ignored: false };
 	}
-	return { value: fallback, wellFormed: false };
+	return { value: fallback, wellFormed: false, ignored: true };
 }
+
+/**
+ * Every on/off setting a person may write by hand, by the path the warning names.
+ * Each is read through `readBooleanSetting`, and the load-time scan names any of
+ * them that holds something other than true or false. The retention reclaim
+ * switches that delete files (`kernelSnapshotReclaimEnabled`, `venvReclaim`) stay
+ * out on purpose: they are strict opt-ins, and a value that is not exactly `true`
+ * must keep meaning "do not delete".
+ */
+const BOOLEAN_SWITCHES: ReadonlyArray<{ path: string; raw: (settings: Settings) => unknown }> = [
+	{ path: "compaction.enabled", raw: (s) => s.compaction?.enabled },
+	{ path: "compaction.agentCallable", raw: (s) => s.compaction?.agentCallable },
+	{ path: "compaction.priorityOverAgentMessages", raw: (s) => s.compaction?.priorityOverAgentMessages },
+	{ path: "branchSummary.skipPrompt", raw: (s) => s.branchSummary?.skipPrompt },
+	{ path: "retry.enabled", raw: (s) => s.retry?.enabled },
+	{ path: "retry.emptyTurn.recovery.enabled", raw: (s) => s.retry?.emptyTurn?.recovery?.enabled },
+	{ path: "retry.provider.waitForUsage.enabled", raw: (s) => s.retry?.provider?.waitForUsage?.enabled },
+	{
+		path: "retry.provider.waitForUsage.pauseUntilReset",
+		raw: (s) => s.retry?.provider?.waitForUsage?.pauseUntilReset,
+	},
+	{ path: "hideThinkingBlock", raw: (s) => s.hideThinkingBlock },
+	{ path: "quietStartup", raw: (s) => s.quietStartup },
+	{ path: "enableSkillCommands", raw: (s) => s.enableSkillCommands },
+	{ path: "enableBuiltinSkills", raw: (s) => s.enableBuiltinSkills },
+	{ path: "bundledSkills.websearch", raw: (s) => s.bundledSkills?.websearch },
+	{ path: "terminal.showImages", raw: (s) => s.terminal?.showImages },
+	{ path: "terminal.clearOnShrink", raw: (s) => s.terminal?.clearOnShrink },
+	{ path: "terminal.fullscreen", raw: (s) => s.terminal?.fullscreen },
+	{ path: "terminal.fullscreenMouse", raw: (s) => s.terminal?.fullscreenMouse },
+	{ path: "terminal.showTerminalProgress", raw: (s) => s.terminal?.showTerminalProgress },
+	{ path: "images.autoResize", raw: (s) => s.images?.autoResize },
+	{ path: "images.blockImages", raw: (s) => s.images?.blockImages },
+	{ path: "requestTiming", raw: (s) => s.requestTiming },
+	{ path: "showHardwareCursor", raw: (s) => s.showHardwareCursor },
+	{ path: "agentTraces.enabled", raw: (s) => s.agentTraces?.enabled },
+	{ path: "telemetry.enabled", raw: (s) => s.telemetry?.enabled },
+	{ path: "changeTracking.enabled", raw: (s) => s.changeTracking?.enabled },
+	{ path: "autoRefine.enabled", raw: (s) => s.autoRefine?.enabled },
+	{ path: "autoRefine.compact", raw: (s) => s.autoRefine?.compact },
+	{ path: "stallWatchdog.enabled", raw: (s) => s.stallWatchdog?.enabled },
+	{ path: "stallWatchdog.toolLivenessExemption", raw: (s) => s.stallWatchdog?.toolLivenessExemption },
+	{
+		path: "stallWatchdog.treatKernelCpuProgressAsActivity",
+		raw: (s) => s.stallWatchdog?.treatKernelCpuProgressAsActivity,
+	},
+	{ path: "stallWatchdog.rootRecovery.enabled", raw: (s) => s.stallWatchdog?.rootRecovery?.enabled },
+	{ path: "subagents.stallRecovery.enabled", raw: (s) => s.subagents?.stallRecovery?.enabled },
+	{ path: "daemon.failedWorkerReapEnabled", raw: (s) => s.daemon?.failedWorkerReapEnabled },
+	{ path: "selfRecovery.autoContinue", raw: (s) => s.selfRecovery?.autoContinue },
+	{ path: "selfRecovery.childReplyNudge", raw: (s) => s.selfRecovery?.childReplyNudge },
+	{ path: "tools.timeout.enabled", raw: (s) => s.tools?.timeout?.enabled },
+	{ path: "ui.timelineOpenWhileWorking", raw: (s) => s.ui?.timelineOpenWhileWorking },
+	{ path: "ui.timelineAutoFold", raw: (s) => s.ui?.timelineAutoFold },
+	{ path: "ui.reduceMotion", raw: (s) => s.ui?.reduceMotion },
+	{ path: "retention.enabled", raw: (s) => s.retention?.enabled },
+	{ path: "retention.dryRun", raw: (s) => s.retention?.dryRun },
+	{ path: "retention.sweepLockEnabled", raw: (s) => s.retention?.sweepLockEnabled },
+	{ path: "retention.ledgerCompactionEnabled", raw: (s) => s.retention?.ledgerCompactionEnabled },
+];
 
 export type SettingsScope = "global" | "project";
 
@@ -2111,19 +2183,25 @@ export class SettingsManager {
 	 * Report an on/off setting written as something other than true or false. It is
 	 * still honoured (see `readBooleanSetting`), but the person who wrote "false"
 	 * in quotes should be told how it was read. Reported at load, not at read, so
-	 * the warning reaches the startup drain.
+	 * the warning reaches the startup drain. The message describes the value in this
+	 * scope's settings only: the effective value comes from the merged scopes.
 	 */
 	private reportNonBooleanSwitches(scope: SettingsScope, settings: Settings): void {
-		const raw = settings.changeTracking?.enabled;
-		const read = readBooleanSetting(raw, true);
-		if (read.wellFormed) {
-			return;
+		for (const { path, raw: rawOf } of BOOLEAN_SWITCHES) {
+			const raw = rawOf(settings);
+			const read = readBooleanSetting(raw, true);
+			if (read.wellFormed) {
+				continue;
+			}
+			const reading = read.ignored
+				? "that value is ignored, so the default applies"
+				: `that value reads as ${read.value ? "on" : "off"}`;
+			this.recordWarning(
+				scope,
+				`non-boolean:${path}=${JSON.stringify(raw)}`,
+				`${path} in the ${scope} settings is ${JSON.stringify(raw)}, not true or false: ${reading}. Write it as true or false.`,
+			);
 		}
-		this.recordWarning(
-			scope,
-			`non-boolean:changeTracking.enabled=${JSON.stringify(raw)}`,
-			`changeTracking.enabled in the ${scope} settings is ${JSON.stringify(raw)}, not true or false: that value reads as ${read.value ? "on" : "off"}. Write it as true or false.`,
-		);
 	}
 
 	/** Report every key this version does not recognize (CD-3). */
@@ -2524,7 +2602,7 @@ export class SettingsManager {
 	}
 
 	getTimelineOpenWhileWorking(): boolean {
-		return this.settings.ui?.timelineOpenWhileWorking !== false;
+		return readBooleanSetting(this.settings.ui?.timelineOpenWhileWorking, true).value;
 	}
 
 	setTimelineOpenWhileWorking(open: boolean): void {
@@ -2534,7 +2612,7 @@ export class SettingsManager {
 	}
 
 	getTimelineAutoFold(): boolean {
-		return this.settings.ui?.timelineAutoFold !== false;
+		return readBooleanSetting(this.settings.ui?.timelineAutoFold, true).value;
 	}
 
 	setTimelineAutoFold(fold: boolean): void {
@@ -2544,7 +2622,7 @@ export class SettingsManager {
 	}
 
 	getReduceMotion(): boolean {
-		return this.settings.ui?.reduceMotion === true;
+		return readBooleanSetting(this.settings.ui?.reduceMotion, false).value;
 	}
 
 	setReduceMotion(reduce: boolean): void {
@@ -2579,7 +2657,7 @@ export class SettingsManager {
 	}
 
 	getCompactionEnabled(): boolean {
-		return this.settings.compaction?.enabled ?? true;
+		return readBooleanSetting(this.settings.compaction?.enabled, true).value;
 	}
 
 	setCompactionEnabled(enabled: boolean): void {
@@ -2603,9 +2681,11 @@ export class SettingsManager {
 	 */
 	getAgentTracesEnabled(): boolean {
 		const globalEnabled =
-			this.globalSettingsLoadError === null && (this.globalSettings.agentTraces?.enabled ?? false);
+			this.globalSettingsLoadError === null &&
+			readBooleanSetting(this.globalSettings.agentTraces?.enabled, false).value;
 		const projectEnabled =
-			this.projectSettingsLoadError === null && (this.projectSettings.agentTraces?.enabled ?? true);
+			this.projectSettingsLoadError === null &&
+			readBooleanSetting(this.projectSettings.agentTraces?.enabled, true).value;
 		const runtimeEnabled = this.runtimeOverrides.agentTraces?.enabled ?? true;
 		return globalEnabled && projectEnabled && runtimeEnabled;
 	}
@@ -2625,9 +2705,12 @@ export class SettingsManager {
 	 * status cannot be verified and telemetry stays off (SEC-7 fail-closed).
 	 */
 	getTelemetryEnabled(): boolean {
-		const globalEnabled = this.globalSettingsLoadError === null && (this.globalSettings.telemetry?.enabled ?? true);
+		const globalEnabled =
+			this.globalSettingsLoadError === null &&
+			readBooleanSetting(this.globalSettings.telemetry?.enabled, true).value;
 		const projectEnabled =
-			this.projectSettingsLoadError === null && (this.projectSettings.telemetry?.enabled ?? true);
+			this.projectSettingsLoadError === null &&
+			readBooleanSetting(this.projectSettings.telemetry?.enabled, true).value;
 		const runtimeEnabled = this.runtimeOverrides.telemetry?.enabled ?? true;
 		return globalEnabled && projectEnabled && runtimeEnabled;
 	}
@@ -2665,7 +2748,7 @@ export class SettingsManager {
 	}
 
 	getCompactionAgentCallable(): boolean {
-		return this.settings.compaction?.agentCallable ?? true;
+		return readBooleanSetting(this.settings.compaction?.agentCallable, true).value;
 	}
 
 	/**
@@ -2679,7 +2762,7 @@ export class SettingsManager {
 
 	/** Whether an incoming agent message queues behind a pending/in-flight compaction. */
 	getCompactionPriorityOverAgentMessages(): boolean {
-		return this.settings.compaction?.priorityOverAgentMessages ?? true;
+		return readBooleanSetting(this.settings.compaction?.priorityOverAgentMessages, true).value;
 	}
 
 	getCompactionSettings(): {
@@ -2700,12 +2783,12 @@ export class SettingsManager {
 		const turnInterval = this.settings.autoRefine?.turnInterval;
 		const cooldownMs = this.settings.autoRefine?.cooldownMs;
 		return {
-			enabled: this.settings.autoRefine?.enabled ?? true,
+			enabled: readBooleanSetting(this.settings.autoRefine?.enabled, true).value,
 			turnInterval: Math.max(
 				1,
 				typeof turnInterval === "number" && Number.isFinite(turnInterval) ? turnInterval : 25,
 			),
-			compact: this.settings.autoRefine?.compact ?? true,
+			compact: readBooleanSetting(this.settings.autoRefine?.compact, true).value,
 			cooldownMs: Math.max(
 				0,
 				typeof cooldownMs === "number" && Number.isFinite(cooldownMs) ? cooldownMs : 20 * 60_000,
@@ -2733,16 +2816,16 @@ export class SettingsManager {
 	getBranchSummarySettings(): { reserveTokens: number; skipPrompt: boolean } {
 		return {
 			reserveTokens: this.settings.branchSummary?.reserveTokens ?? 16384,
-			skipPrompt: this.settings.branchSummary?.skipPrompt ?? false,
+			skipPrompt: readBooleanSetting(this.settings.branchSummary?.skipPrompt, false).value,
 		};
 	}
 
 	getBranchSummarySkipPrompt(): boolean {
-		return this.settings.branchSummary?.skipPrompt ?? false;
+		return readBooleanSetting(this.settings.branchSummary?.skipPrompt, false).value;
 	}
 
 	getRetryEnabled(): boolean {
-		return this.settings.retry?.enabled ?? true;
+		return readBooleanSetting(this.settings.retry?.enabled, true).value;
 	}
 
 	setRetryEnabled(enabled: boolean): void {
@@ -2755,7 +2838,7 @@ export class SettingsManager {
 	}
 
 	getStallWatchdogSettings(): ResolvedStallWatchdogSettings {
-		const enabled = this.settings.stallWatchdog?.enabled ?? true;
+		const enabled = readBooleanSetting(this.settings.stallWatchdog?.enabled, true).value;
 		const warnAfterSeconds = this.settings.stallWatchdog?.warnAfterSeconds ?? DEFAULT_STALL_WARN_AFTER_SECONDS;
 		let abortAfterSeconds = this.settings.stallWatchdog?.abortAfterSeconds ?? DEFAULT_STALL_ABORT_AFTER_SECONDS;
 		// 0 means "warn-only" (no auto-abort). Any other value at or below the warn
@@ -2770,8 +2853,11 @@ export class SettingsManager {
 			enabled,
 			warnAfterSeconds,
 			abortAfterSeconds,
-			toolLivenessExemption: this.settings.stallWatchdog?.toolLivenessExemption ?? true,
-			treatKernelCpuProgressAsActivity: this.settings.stallWatchdog?.treatKernelCpuProgressAsActivity ?? false,
+			toolLivenessExemption: readBooleanSetting(this.settings.stallWatchdog?.toolLivenessExemption, true).value,
+			treatKernelCpuProgressAsActivity: readBooleanSetting(
+				this.settings.stallWatchdog?.treatKernelCpuProgressAsActivity,
+				false,
+			).value,
 		};
 	}
 
@@ -2779,7 +2865,7 @@ export class SettingsManager {
 	getSubagentStallRecoverySettings(): ResolvedSubagentStallRecoverySettings {
 		const settings = this.settings.subagents?.stallRecovery ?? {};
 		return {
-			enabled: settings.enabled ?? this.stallAutoAbortOptedIn(),
+			enabled: readBooleanSetting(settings.enabled, this.stallAutoAbortOptedIn()).value,
 			graceSeconds: nonNegativeFinite(settings.graceSeconds, DEFAULT_SUBAGENT_STALL_RECOVERY_GRACE_SECONDS),
 			maxPerSession: nonNegativeFinite(settings.maxPerSession, DEFAULT_STALL_RECOVERY_MAX_PER_SESSION),
 		};
@@ -2798,7 +2884,7 @@ export class SettingsManager {
 	getRootStallRecoverySettings(): RootStallRecoverySettingsResolved {
 		const settings = this.settings.stallWatchdog?.rootRecovery ?? {};
 		return {
-			enabled: settings.enabled ?? this.stallAutoAbortOptedIn(),
+			enabled: readBooleanSetting(settings.enabled, this.stallAutoAbortOptedIn()).value,
 			humanWindowSeconds: nonNegativeFinite(
 				settings.humanWindowSeconds,
 				DEFAULT_ROOT_STALL_RECOVERY_HUMAN_WINDOW_SECONDS,
@@ -2848,7 +2934,7 @@ export class SettingsManager {
 		const threshold = daemon?.supervisorRejectionExitThreshold;
 		const reapHours = daemon?.failedWorkerReapHours;
 		const reapingDisabled =
-			daemon?.failedWorkerReapEnabled === false ||
+			!readBooleanSetting(daemon?.failedWorkerReapEnabled, true).value ||
 			(typeof reapHours === "number" && Number.isFinite(reapHours) && reapHours <= 0);
 		return {
 			eventGapRecovery: daemon?.eventGapRecovery === "recover" ? "recover" : "log",
@@ -2889,8 +2975,8 @@ export class SettingsManager {
 	getSelfRecoverySettings(): { autoContinue: boolean; childReplyNudge: boolean } {
 		const settings = this.settings.selfRecovery;
 		return {
-			autoContinue: settings?.autoContinue !== false,
-			childReplyNudge: settings?.childReplyNudge === true,
+			autoContinue: readBooleanSetting(settings?.autoContinue, true).value,
+			childReplyNudge: readBooleanSetting(settings?.childReplyNudge, false).value,
 		};
 	}
 
@@ -2962,7 +3048,7 @@ export class SettingsManager {
 	 */
 	getEmptyTurnRecoverySettings(): { enabled: boolean; maxContinuations: number } {
 		const recovery = this.settings.retry?.emptyTurn?.recovery;
-		const enabled = this.getRetryEnabled() && (recovery?.enabled ?? true);
+		const enabled = this.getRetryEnabled() && readBooleanSetting(recovery?.enabled, true).value;
 		const maxContinuations = Math.max(0, Math.floor(recovery?.maxContinuations ?? 1));
 		return { enabled, maxContinuations };
 	}
@@ -2974,7 +3060,7 @@ export class SettingsManager {
 	 */
 	getToolTimeoutSettings(): { enabled: boolean; afterMs: number; perTool?: Record<string, number> } {
 		const timeout = this.settings.tools?.timeout;
-		const enabled = timeout?.enabled ?? true;
+		const enabled = readBooleanSetting(timeout?.enabled, true).value;
 		// Blind-1, medium: a non-numeric `afterMs` (e.g. "not-a-number" in
 		// settings.json) survives every `<= 0` gate (NaN comparisons are false) and
 		// lands in setTimeout(NaN) ~ 1ms - every tool call killed instantly, with
@@ -3018,12 +3104,12 @@ export class SettingsManager {
 		const bound = (value: number | undefined, fallback: number): number =>
 			typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : fallback;
 		return {
-			enabled: wait?.enabled ?? true,
+			enabled: readBooleanSetting(wait?.enabled, true).value,
 			baseDelayMs: bound(wait?.baseDelayMs, 1000),
 			maxDelayMs: bound(wait?.maxDelayMs, 300_000),
 			maxAttempts: bound(wait?.maxAttempts, 30),
 			maxWaitMs: bound(wait?.maxWaitMs, 900_000),
-			pauseUntilReset: wait?.pauseUntilReset ?? true,
+			pauseUntilReset: readBooleanSetting(wait?.pauseUntilReset, true).value,
 			// Very large parks are clamped to MAX_PROVIDER_PAUSE_MS instead of
 			// silently waiting weeks for a stale reset.
 			maxPauseMs: Math.min(bound(wait?.maxPauseMs, 86_400_000), MAX_PROVIDER_PAUSE_MS),
@@ -3066,7 +3152,7 @@ export class SettingsManager {
 	}
 
 	getHideThinkingBlock(): boolean {
-		return this.settings.hideThinkingBlock ?? false;
+		return readBooleanSetting(this.settings.hideThinkingBlock, false).value;
 	}
 
 	setHideThinkingBlock(hide: boolean): void {
@@ -3094,7 +3180,7 @@ export class SettingsManager {
 	}
 
 	getQuietStartup(): boolean {
-		return this.settings.quietStartup ?? false;
+		return readBooleanSetting(this.settings.quietStartup, false).value;
 	}
 
 	setQuietStartup(quiet: boolean): void {
@@ -3218,7 +3304,7 @@ export class SettingsManager {
 	}
 
 	getEnableSkillCommands(): boolean {
-		return this.settings.enableSkillCommands ?? true;
+		return readBooleanSetting(this.settings.enableSkillCommands, true).value;
 	}
 
 	setEnableSkillCommands(enabled: boolean): void {
@@ -3229,7 +3315,7 @@ export class SettingsManager {
 
 	getBundledSkills(): { websearch: boolean } {
 		return {
-			websearch: this.settings.bundledSkills?.websearch ?? true,
+			websearch: readBooleanSetting(this.settings.bundledSkills?.websearch, true).value,
 		};
 	}
 
@@ -3238,7 +3324,7 @@ export class SettingsManager {
 	}
 
 	getEnableBuiltinSkills(): boolean {
-		return this.settings.enableBuiltinSkills ?? true;
+		return readBooleanSetting(this.settings.enableBuiltinSkills, true).value;
 	}
 
 	setEnableBuiltinSkills(enabled: boolean): void {
@@ -3252,7 +3338,7 @@ export class SettingsManager {
 	}
 
 	getShowImages(): boolean {
-		return this.settings.terminal?.showImages ?? true;
+		return readBooleanSetting(this.settings.terminal?.showImages, true).value;
 	}
 
 	setShowImages(show: boolean): void {
@@ -3265,8 +3351,9 @@ export class SettingsManager {
 	}
 
 	getClearOnShrink(): boolean {
-		if (this.settings.terminal?.clearOnShrink !== undefined) {
-			return this.settings.terminal.clearOnShrink;
+		const clearOnShrink = this.settings.terminal?.clearOnShrink;
+		if (clearOnShrink !== undefined) {
+			return readBooleanSetting(clearOnShrink, false).value;
 		}
 		return process.env.PI_CLEAR_ON_SHRINK === "1";
 	}
@@ -3284,7 +3371,7 @@ export class SettingsManager {
 		if (process.env.PI_FULLSCREEN !== undefined) {
 			return process.env.PI_FULLSCREEN === "1";
 		}
-		return this.settings.terminal?.fullscreen ?? true;
+		return readBooleanSetting(this.settings.terminal?.fullscreen, true).value;
 	}
 
 	setFullscreen(enabled: boolean): void {
@@ -3297,7 +3384,7 @@ export class SettingsManager {
 	}
 
 	getFullscreenMouse(): boolean {
-		return this.settings.terminal?.fullscreenMouse ?? true;
+		return readBooleanSetting(this.settings.terminal?.fullscreenMouse, true).value;
 	}
 
 	setFullscreenMouse(enabled: boolean): void {
@@ -3310,7 +3397,7 @@ export class SettingsManager {
 	}
 
 	getShowTerminalProgress(): boolean {
-		return this.settings.terminal?.showTerminalProgress ?? false;
+		return readBooleanSetting(this.settings.terminal?.showTerminalProgress, false).value;
 	}
 
 	setShowTerminalProgress(enabled: boolean): void {
@@ -3323,7 +3410,7 @@ export class SettingsManager {
 	}
 
 	getImageAutoResize(): boolean {
-		return this.settings.images?.autoResize ?? true;
+		return readBooleanSetting(this.settings.images?.autoResize, true).value;
 	}
 
 	setImageAutoResize(enabled: boolean): void {
@@ -3336,11 +3423,11 @@ export class SettingsManager {
 	}
 
 	getBlockImages(): boolean {
-		return this.settings.images?.blockImages ?? false;
+		return readBooleanSetting(this.settings.images?.blockImages, false).value;
 	}
 
 	getRequestTiming(): boolean {
-		return this.settings.requestTiming ?? false;
+		return readBooleanSetting(this.settings.requestTiming, false).value;
 	}
 
 	getChangeTrackingEnabled(): boolean {
@@ -3416,7 +3503,8 @@ export class SettingsManager {
 	getShowHardwareCursor(): boolean {
 		const rawEnvValue = process.env[HARDWARE_CURSOR_ENV_VAR];
 		const envValue = parseBooleanEnvSwitch(rawEnvValue);
-		const fileValue = this.settings.showHardwareCursor;
+		const rawFileValue = this.settings.showHardwareCursor;
+		const fileValue = rawFileValue === undefined ? undefined : readBooleanSetting(rawFileValue, false).value;
 		if (envValue === undefined) {
 			return fileValue ?? false;
 		}
@@ -3639,8 +3727,8 @@ function normalizeRetentionCount(value: unknown, fallback: number): number {
  */
 export function resolveRetentionSettings(settings?: RetentionSettings): ResolvedRetentionSettings {
 	return {
-		enabled: settings?.enabled !== false,
-		dryRun: settings?.dryRun === true || process.env.PRIME_AGENT_RETENTION_DRYRUN === "1",
+		enabled: readBooleanSetting(settings?.enabled, true).value,
+		dryRun: readBooleanSetting(settings?.dryRun, false).value || process.env.PRIME_AGENT_RETENTION_DRYRUN === "1",
 		sweepIntervalMinutes: normalizeRetentionWindowDays(
 			settings?.sweepIntervalMinutes,
 			DEFAULT_RETENTION_SWEEP_INTERVAL_MINUTES,
@@ -3658,7 +3746,7 @@ export function resolveRetentionSettings(settings?: RetentionSettings): Resolved
 		cooldownMinutes: normalizeRetentionCap(settings?.cooldownMinutes, DEFAULT_RETENTION_COOLDOWN_MINUTES),
 		// On by default: the guard is the account-integrity fix, and it degrades to an
 		// unlocked sweep by itself whenever it cannot be taken (see retention/runner.ts).
-		sweepLockEnabled: settings?.sweepLockEnabled !== false,
+		sweepLockEnabled: readBooleanSetting(settings?.sweepLockEnabled, true).value,
 		emptyArtifactDirDays: normalizeRetentionWindowDays(
 			settings?.emptyArtifactDirDays,
 			DEFAULT_RETENTION_EMPTY_ARTIFACT_DIR_DAYS,
@@ -3690,10 +3778,11 @@ export function resolveRetentionSettings(settings?: RetentionSettings): Resolved
 			settings?.kernelSnapshotGenerations,
 			DEFAULT_RETENTION_KERNEL_SNAPSHOT_GENERATIONS,
 		),
+		// The two reclaim switches that delete files stay strict: only a real true turns them on (see BOOLEAN_SWITCHES).
 		kernelSnapshotReclaimEnabled: settings?.kernelSnapshotReclaimEnabled === true,
 		// Default on: the compaction rung is what keeps spawning and deletion
 		// alive on a ledger that outgrew its bounds (r41 ADC-2).
-		ledgerCompactionEnabled: settings?.ledgerCompactionEnabled !== false,
+		ledgerCompactionEnabled: readBooleanSetting(settings?.ledgerCompactionEnabled, true).value,
 		venvRetention: normalizeRetentionCount(settings?.venvRetention, RETIRED_VENV_RETENTION),
 		venvReclaim: settings?.venvReclaim === true,
 	};
