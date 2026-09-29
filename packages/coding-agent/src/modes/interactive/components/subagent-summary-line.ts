@@ -583,6 +583,11 @@ export class SubagentSummaryLine implements Component, Focusable {
 		return this.counts.total > 0 && this.rows.length > 0;
 	}
 
+	/** Whether the strip draws a row at all (a block for a child, or the family counts). */
+	hasBlocks(): boolean {
+		return this.getItems().length > 0;
+	}
+
 	getClickRegions(): ReadonlyArray<ClickRegion> {
 		return this.regions;
 	}

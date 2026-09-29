@@ -1812,6 +1812,8 @@ export class InteractiveMode {
 		// watermark (②), then the subagents line (③).
 		// The key hints ride the prompt's top rule; the tray line keeps status only.
 		this.defaultEditor.getBorderHints = () => this.getTrayHints();
+		// The design's foot: rule, prompt, then the subagent blocks (they take the bottom rule's row), then the status line.
+		this.defaultEditor.hideBottomRule = () => quietConversation(this) && this.subagentSummaryLine.hasBlocks();
 		this.trayInfoLine = new TrayInfoLine(
 			() => this.getTrayStatusLabel(),
 			() => [],

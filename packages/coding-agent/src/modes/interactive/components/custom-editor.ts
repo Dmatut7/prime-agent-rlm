@@ -50,6 +50,11 @@ export class CustomEditor extends Editor {
 	public getBorderHints?: () => readonly string[];
 	/** When set, the returned line is rendered inside the top of the editor box. */
 	public getHeaderLine?: () => string | undefined;
+	/**
+	 * While it returns true the box's bottom rule is left out because the row under the box takes its
+	 * place. A scroll indicator on that row ("↓ 还有 N 行") stays.
+	 */
+	public hideBottomRule?: () => boolean;
 	/** Handler for extension-registered shortcuts. Returns true if handled. */
 	public onExtensionShortcut?: (data: string) => boolean;
 
@@ -172,6 +177,7 @@ export class CustomEditor extends Editor {
 		const isArgumentCommandLine = commandMatch !== null && this.isArgumentCommand(commandMatch[2]!);
 		this.argTokenHighlighter.reset(this.getLines(), isArgumentCommandLine);
 		let lines = super.render(width);
+		if (this.hideBottomRule?.() === true) lines = this.withoutBottomRule(lines);
 		if (this.placeholder && this.getText().length === 0 && lines.length >= 2) {
 			lines = [lines[0]!, this.renderPlaceholderLine(width), ...lines.slice(2)];
 		}
@@ -186,6 +192,13 @@ export class CustomEditor extends Editor {
 			];
 		}
 		return lines;
+	}
+
+	private withoutBottomRule(lines: string[]): string[] {
+		const bottom = lines.at(-1);
+		// Only a plain rule goes: a scroll indicator or a filled surface row says something.
+		if (bottom === undefined || lines.length < 3 || this.backgroundColor !== undefined) return lines;
+		return /^─+$/.test(bottom.replace(/\x1b\[[0-9;]*m/g, "")) ? lines.slice(0, -1) : lines;
 	}
 
 	private embedBorderHints(lines: string[], width: number): string[] {
