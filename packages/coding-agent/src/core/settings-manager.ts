@@ -2122,7 +2122,7 @@ export class SettingsManager {
 		this.recordWarning(
 			scope,
 			`non-boolean:changeTracking.enabled=${JSON.stringify(raw)}`,
-			`changeTracking.enabled is ${JSON.stringify(raw)} (${scope} settings), not true or false: it is read as ${read.value ? "on" : "off"}. Write it as true or false.`,
+			`changeTracking.enabled in the ${scope} settings is ${JSON.stringify(raw)}, not true or false: that value reads as ${read.value ? "on" : "off"}. Write it as true or false.`,
 		);
 	}
 
