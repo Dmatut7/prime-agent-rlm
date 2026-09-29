@@ -58,8 +58,12 @@ export interface StickyHeader {
 	line: number;
 	/** Zero-based line of the last row the header belongs to (the end of its box). */
 	endLine: number;
-	/** Rows painted over the top of the transcript window while the header is pinned. */
-	lines: readonly string[];
-	/** Click regions of the pinned rows, in `lines` coordinates. */
+	/**
+	 * Rows painted over the top of the transcript window while the header is
+	 * pinned. `scrolledPast` counts this component's rows from `line` that sit
+	 * above the window's top edge, so the header can say what is out of sight.
+	 */
+	render(scrolledPast: number): readonly string[];
+	/** Click regions of the pinned rows, in the coordinates of `render`'s output. */
 	regions?: ReadonlyArray<ClickRegion>;
 }
