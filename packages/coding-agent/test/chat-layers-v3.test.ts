@@ -251,7 +251,7 @@ describe("the ◆ prime header and the gutter", () => {
 		expect(lines[2]).toMatch(/^ │ +\S 进行中 +等待模型回应… /);
 	});
 
-	it("runs a quiet answer flush under its box, with no rail", () => {
+	it("runs a quiet answer under its box as the timeline summary, its words on column 16", () => {
 		const answer = new AssistantMessageComponent(
 			{
 				role: "assistant",
@@ -278,7 +278,8 @@ describe("the ◆ prime header and the gutter", () => {
 		const lines = plain(answer.render(80)).map((line) => line.replace(/\x1b\][^\x07]*\x07/g, ""));
 		expect(lines.length).toBeGreaterThan(1);
 		for (const line of lines) expect(line.startsWith(" │")).toBe(false);
-		expect(lines.some((line) => line.startsWith(" 两个文件加起来 746 行。"))).toBe(true);
+		expect(lines.some((line) => /^ \d\d:\d\d {3}◆ {6}总结$/.test(line.trimEnd()))).toBe(true);
+		expect(lines.some((line) => line.trimEnd() === "         ┃      两个文件加起来 746 行。")).toBe(true);
 	});
 });
 

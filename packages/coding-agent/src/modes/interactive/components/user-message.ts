@@ -11,10 +11,15 @@ import { builtinSlashCommandTakesArgument, parseSlashCommand } from "../../../co
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock } from "./block-focus.js";
 import { PromptTokenMask } from "./prompt-highlight.js";
+import { formatTimelineTime, TIMELINE_CONTENT_COL, type TimelineLane, timelineGutter } from "./timeline-gutter.js";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
+
+function promptSource(text: string): string {
+	return text.replace(/\r\n?/g, "\n").replace(/\s+$/, "");
+}
 
 /**
  * The user's text exactly as typed: wrapped, never parsed as Markdown (a
@@ -27,11 +32,7 @@ class HighlightedText implements Component {
 	private cachedLines?: string[];
 
 	constructor(text: string, commandEnd = 0, includeBareSeparator = false) {
-		this.mask = new PromptTokenMask(
-			text.replace(/\r\n?/g, "\n").replace(/\s+$/, ""),
-			commandEnd,
-			includeBareSeparator,
-		);
+		this.mask = new PromptTokenMask(promptSource(text), commandEnd, includeBareSeparator);
 	}
 
 	render(width: number): string[] {
@@ -151,23 +152,137 @@ class UserBubble implements Component {
 	}
 }
 
+/** Below this width the timeline's 16 left columns leave too little for words; the bubble draws instead. */
+const TIMELINE_MIN_WIDTH = TIMELINE_CONTENT_COL + 8;
+/** `你` (2 columns) and three spaces: what the first row's text steps in by. */
+const TIMELINE_LABEL_WIDTH = 5;
+/** Main-line rows kept empty under the question. */
+const TIMELINE_GAP_ROWS = 2;
+
+/**
+ * The question as the timeline's first row: `HH:MM ● 你   <text>`, further
+ * lines on the main line with their text on column 16, then two empty
+ * main-line rows. The words are the user's as typed, never Markdown.
+ */
+class TimelineQuestion implements Component {
+	private readonly mask: PromptTokenMask;
+	private lane: TimelineLane;
+	private cachedWidth?: number;
+	private cachedTime?: string;
+	private cachedLines?: string[];
+
+	constructor(
+		text: string,
+		commandEnd: number,
+		includeBareSeparator: boolean,
+		private readonly sentAt: number | undefined,
+		lane: TimelineLane,
+		private readonly bubble: Component,
+	) {
+		this.mask = new PromptTokenMask(promptSource(text), commandEnd, includeBareSeparator);
+		this.lane = lane;
+	}
+
+	setLane(lane: TimelineLane): void {
+		if (this.lane === lane) return;
+		this.lane = lane;
+		this.invalidate();
+	}
+
+	render(width: number): string[] {
+		if (width < TIMELINE_MIN_WIDTH) return this.bubble.render(width);
+		const time =
+			this.sentAt !== undefined && Number.isFinite(this.sentAt) ? formatTimelineTime(this.sentAt) : undefined;
+		if (this.cachedLines && this.cachedWidth === width && this.cachedTime === time) return this.cachedLines;
+		const inner = width - TIMELINE_CONTENT_COL;
+		const head = timelineGutter({ time, main: "user", lane: this.lane });
+		const rail = timelineGutter({ main: "rail", lane: this.lane });
+		const label = `${theme.bold(theme.fg("timelineUser", "你"))}   `;
+		const lines: string[] = [];
+		this.mask.text.split("\n").forEach((raw, index) => {
+			const expanded = raw.replace(/\t/g, "   ");
+			const wrapped = index === 0 ? this.wrapFirstLine(expanded, inner) : wrapTextWithAnsi(expanded, inner);
+			wrapped.forEach((piece, pieceIndex) => {
+				const isLabelRow = index === 0 && pieceIndex === 0;
+				const body = this.mask.restoreLine(theme.fg("userMessageText", piece));
+				lines.push(isLabelRow ? head + label + body : rail + body);
+			});
+		});
+		for (let gap = 0; gap < TIMELINE_GAP_ROWS; gap++) lines.push(rail);
+		this.cachedWidth = width;
+		this.cachedTime = time;
+		this.cachedLines = lines;
+		return lines;
+	}
+
+	/**
+	 * The first line of the question: its opening piece wraps at the width the
+	 * label leaves, the rest at the full width. A long first word (a path, a
+	 * URL) breaks to fill the label's row instead of leaving it alone.
+	 */
+	private wrapFirstLine(text: string, inner: number): string[] {
+		const opening = wrapTextWithAnsi(text, inner - TIMELINE_LABEL_WIDTH);
+		const [head = ""] = opening;
+		if (!text.startsWith(head)) return opening;
+		const rest = text.slice(head.length).replace(/^ +/, "");
+		return rest ? [head, ...wrapTextWithAnsi(rest, inner)] : [head];
+	}
+
+	getSelectionRegions(): ReadonlyArray<TableCellSelectionRegion> {
+		return [];
+	}
+
+	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
+		this.bubble.invalidate?.();
+	}
+}
+
+export interface UserMessageComponentOptions {
+	/** Quiet conversation: the question is the timeline's first row instead of a tinted bubble. */
+	quiet?: boolean;
+	/** The subagent lane column of the rows a quiet question draws. */
+	lane?: TimelineLane;
+}
+
 export class UserMessageComponent extends Container implements FocusableBlock {
 	private decoratedSource?: string[];
 	private decoratedLines?: string[];
 	private blockFocus?: BlockFocusState;
+	private readonly timelineQuestion?: TimelineQuestion;
 
 	constructor(
 		private readonly text: string,
 		_markdownTheme: MarkdownTheme = getMarkdownTheme(),
 		isRecognizedSlashCommand: (name: string) => boolean = () => false,
 		sentAt?: number,
+		options: UserMessageComponentOptions = {},
 	) {
 		super();
 		const command = parseSlashCommand(text);
 		const commandEnd = command && isRecognizedSlashCommand(command.name) ? command.name.length + 1 : 0;
 		const includeBareSeparator =
 			command !== undefined && commandEnd > 0 && builtinSlashCommandTakesArgument(command.name);
-		this.addChild(new UserBubble(new HighlightedText(text, commandEnd, includeBareSeparator), sentAt));
+		const bubble = new UserBubble(new HighlightedText(text, commandEnd, includeBareSeparator), sentAt);
+		if (options.quiet) {
+			this.timelineQuestion = new TimelineQuestion(
+				text,
+				commandEnd,
+				includeBareSeparator,
+				sentAt,
+				options.lane ?? "off",
+				bubble,
+			);
+			this.addChild(this.timelineQuestion);
+		} else {
+			this.addChild(bubble);
+		}
+	}
+
+	/** The subagent lane the question's rows draw (a quiet question only). */
+	setLane(lane: TimelineLane): void {
+		this.timelineQuestion?.setLane(lane);
 	}
 
 	override render(width: number): string[] {
