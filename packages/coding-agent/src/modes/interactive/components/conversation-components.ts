@@ -446,6 +446,25 @@ function keepsItsOwnSpace(component: Component | undefined): boolean {
 	);
 }
 
+/** Width at which a component above is asked what it draws; only whether its last line is blank matters. */
+const BLANK_PROBE_WIDTH = 80;
+const TERMINAL_ESCAPES = /\x1b\[[0-9;?]*[A-Za-z]|\x1b[\]_][^\x07]*\x07/g;
+
+/**
+ * Whether the nearest component above `index` that draws anything ends in a blank
+ * line (a stopped reply does, its own spacer). A box above ends in its border, and
+ * with nothing above there is no line to keep apart from.
+ */
+function endsInBlankLine(children: readonly Component[], index: number): boolean {
+	for (let above = index - 1; above >= 0; above--) {
+		const component = children[above];
+		if (component instanceof TurnSummaryComponent) return false;
+		const last = component?.render(BLANK_PROBE_WIDTH).at(-1);
+		if (last !== undefined) return last.replace(TERMINAL_ESCAPES, "").trim() === "";
+	}
+	return true;
+}
+
 /**
  * One title per question: a turn that no user message opened (a handed-back
  * message woke it, a background command ended, the run went on by itself) and
@@ -454,17 +473,19 @@ function keepsItsOwnSpace(component: Component | undefined): boolean {
  * first turn, the first turn after a user message or a compaction, a turn a
  * user message opened and a turn on another model keep their title. Consecutive
  * groups stay one blank line apart: a woken turn whose message row is not right
- * above it gets that blank line itself.
+ * above it gets that blank line itself, unless what is above already ends in one.
  */
 export function resolveTurnHeaders(children: readonly Component[]): void {
 	let shownModel: string | undefined;
 	let previous: Component | undefined;
-	for (const child of children) {
+	for (const [index, child] of children.entries()) {
 		if (child instanceof TurnSummaryComponent) {
 			const model = child.state.modelId;
 			const show = child.state.startedByUser || shownModel === undefined || shownModel !== model;
 			child.setHeaderShown(show);
-			child.setLeadingBlank(!child.state.startedByUser && !keepsItsOwnSpace(previous));
+			child.setLeadingBlank(
+				!child.state.startedByUser && !keepsItsOwnSpace(previous) && !endsInBlankLine(children, index),
+			);
 			if (show) shownModel = model;
 		} else if (child instanceof UserMessageComponent || isTitleBoundary(child)) {
 			shownModel = undefined;

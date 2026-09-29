@@ -81,9 +81,20 @@ export class LiveChat {
 		return this.clock;
 	}
 
-	private reply(model: string, answer: string | undefined): void {
-		const content = answer ? [{ type: "text" as const, text: answer }] : [];
-		const message = assistant(this.tick(), content, "stop", model);
+	private reply(model: string, answer: string | undefined, cutMidStep = false): void {
+		const content = cutMidStep
+			? [
+					{
+						type: "toolCall" as const,
+						id: `cut${this.clock}`,
+						name: "ipython",
+						arguments: { code: "await bash('sleep 60')" },
+					},
+				]
+			: answer
+				? [{ type: "text" as const, text: answer }]
+				: [];
+		const message = assistant(this.tick(), content, cutMidStep ? "aborted" : "stop", model);
 		this.flow.assistantStart(message);
 		const component = new AssistantMessageComponent(undefined, false, undefined, "Thinking", { quiet: true });
 		this.chat.addChild(component);
@@ -102,15 +113,15 @@ export class LiveChat {
 		);
 	}
 
-	/** The user types a prompt and the AI answers on `model`. */
-	prompt(text: string, options: { model?: string; answer?: string } = {}): void {
+	/** The user types a prompt and the AI answers on `model` (or is stopped in the middle of a step). */
+	prompt(text: string, options: { model?: string; answer?: string; cutMidStep?: boolean } = {}): void {
 		this.streaming = true;
 		this.flow.agentStart();
 		if (this.flow.userMessage(text, this.tick()) === "prompt") {
 			if (this.chat.children.length > 0) this.chat.addChild(new Spacer(1));
 			this.chat.addChild(new UserMessageComponent(text));
 		}
-		this.reply(options.model ?? "glm-5.3-prime", options.answer);
+		this.reply(options.model ?? "glm-5.3-prime", options.answer, options.cutMidStep);
 	}
 
 	/**

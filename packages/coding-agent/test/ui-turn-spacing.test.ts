@@ -1,9 +1,11 @@
-import { setKeybindings } from "@earendil-works/pi-tui";
+import { Container, Spacer, setKeybindings } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
+import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
+import { resolveTurnHeaders } from "../src/modes/interactive/components/conversation-components.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
-import { plain, T0 } from "./ui-blocks-helpers.js";
+import { assistant, plain, quietTurn, T0 } from "./ui-blocks-helpers.js";
 import { LiveChat } from "./ui-live-chat.js";
 
 beforeAll(() => {
@@ -99,5 +101,72 @@ describe("the groups of consecutive turns are one blank line apart", () => {
 		chat.prompt("你好");
 		vi.advanceTimersByTime(1_000);
 		expect(shape(chat)).toMatch(/^X+BTUD$/);
+	});
+});
+
+describe("a woken turn does not add a blank line to one that is already there", () => {
+	it("leaves a single blank line between a stopped reply and the box of a wake-up that shows no message", () => {
+		const chat = new LiveChat();
+		chat.prompt("跑一个很久的命令", { cutMidStep: true });
+		chat.wakeUnseen("m1");
+		vi.advanceTimersByTime(1_000);
+		const marks = shape(chat);
+		expect(marks).toContain("BUD");
+		expect(marks).not.toContain("BB");
+	});
+
+	it("still adds the blank line under an answer that ends in text", () => {
+		const chat = new LiveChat();
+		chat.prompt("你好", { answer: "在的。" });
+		chat.wakeUnseen("m1");
+		vi.advanceTimersByTime(1_000);
+		expect(shape(chat)).toContain("XBUD");
+	});
+
+	function wokenSummary() {
+		const woken = quietTurn({ live: false });
+		woken.state.startedByUser = false;
+		return woken.summary;
+	}
+
+	function firstBox() {
+		const first = quietTurn({ live: false });
+		return first.summary;
+	}
+
+	it("counts an empty component between as nothing when it looks for what is above", () => {
+		const stopped = new AssistantMessageComponent(
+			assistant(
+				T0,
+				[{ type: "toolCall", id: "t1", name: "ipython", arguments: { code: "await bash('sleep 60')" } }],
+				"aborted",
+			),
+			false,
+			undefined,
+			"Thinking",
+			{ quiet: true },
+		);
+		const woken = wokenSummary();
+		resolveTurnHeaders([firstBox(), stopped, new Container(), woken]);
+		expect(plain(woken.render(100))[0]).toMatch(/^ ╭/);
+	});
+
+	it("adds the blank line when what is above ends in text, a spacer excepted", () => {
+		const answer = new AssistantMessageComponent(
+			assistant(T0, [{ type: "text", text: "在的。" }], "stop"),
+			false,
+			undefined,
+			"Thinking",
+			{
+				quiet: true,
+			},
+		);
+		const woken = wokenSummary();
+		resolveTurnHeaders([firstBox(), answer, new Container(), woken]);
+		expect(plain(woken.render(100))[0]).toBe("");
+
+		const spaced = wokenSummary();
+		resolveTurnHeaders([firstBox(), answer, new Spacer(1), spaced]);
+		expect(plain(spaced.render(100))[0]).toMatch(/^ ╭/);
 	});
 });
