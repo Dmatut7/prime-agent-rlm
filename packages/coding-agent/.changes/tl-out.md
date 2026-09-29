@@ -1,3 +1,0 @@
-- Changed the quiet conversation to draw your question as the first timeline row (`HH:MM ● 你   <question>`) instead of a tinted bubble; the block under it opens with two empty main-line rows (one for a turn a report woke).
-- Changed the AI's closing answer to draw as a timeline summary (`HH:MM ◆ 总结`, then the words behind a `┃` bar from column 16) instead of plain text under the box.
-- Fixed text that the AI says next to its tool calls showing up a second time as an answer in the quiet conversation.

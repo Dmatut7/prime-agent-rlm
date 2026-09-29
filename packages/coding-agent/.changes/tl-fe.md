@@ -1,3 +1,0 @@
-- Fixed the timeline folding away an event you had opened, or the one the keyboard was on, once a running turn added more events; it now stays, with its steps and its place in the focus order.
-- Fixed a step line on a narrow terminal losing its command and glyph to the time and result on its right: the right side shortens first, to `✓` or `✗`, and then goes.
-- Changed the light theme's faint timeline text (arrows, step counts, `全部 ›`, step times) to read at 3.5 to 1 on white and 3 to 1 on a hovered line.

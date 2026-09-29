@@ -1,5 +1,76 @@
 # Changelog
 
+## [0.11.17] - 2026-09-30
+
+- Fixed subagent blocks, error blocks and the timeline grays looking the same in 256-color terminals such as macOS Terminal.app: error blocks are red there and the hover row no longer hides the timeline line.
+- Changed a turn's process from a framed box to timeline lines: one line per thing the AI said it does or found (time, diamond, its words), with the commands, thoughts and edits behind `N 步 ▸` (first three steps and `全部 ›` when opened), a dispatch line for subagents, and a spinner line with the running command while the turn works.
+- Changed a failure the AI did not fix to its own red line, while a mistake it fixed stays inside its steps as `下一格改好了`.
+- Changed every `N 步` to fold by itself when the turn ends.
+- Changed the quiet conversation to draw your question as the first timeline row (`HH:MM ● 你   <question>`) instead of a tinted bubble; the block under it opens with two empty main-line rows (one for a turn a report woke).
+- Changed the AI's closing answer to draw as a timeline summary (`HH:MM ◆ 总结`, then the words behind a `┃` bar from column 16) instead of plain text under the box.
+- Fixed text that the AI says next to its tool calls showing up a second time as an answer in the quiet conversation.
+- Changed a subagent's report to one row on the timeline that says who came back, what it was about and its one-sentence conclusion (red for a must-fix, amber for a should-fix), opens to the whole report on a click, and is followed by a closing row once the last subagent is back.
+- Changed the notices that a subagent finished without a word or was cancelled to stay out of sight until "完整过程" is on, so they no longer sit in the turn's box; a subagent that failed or went quiet still shows as its own row.
+- Changed a run woken only by such notices that dispatched nothing, changed no files, saved no memory and ended without an unfixed error to draw nothing unless "完整过程" is on, however long its reply.
+- Fixed the answer a turn ended on being folded away when a subagent's notice woke the AI afterwards: the woken run now starts a turn of its own, live and when the session is reopened alike.
+- Changed the memory line at the end of a turn to a timeline row (`✦ 记住了 <title> ▸`) that opens with one click straight to what was remembered, wrapped to the screen and never cut, with no `+` in front of new memories.
+- Changed memory titles to read as words: an id standing in for a title loses its underscores and its dates, and a real title is left as written.
+- Changed the changed-files line to a timeline row (`✎ 改了 2 个文件 +20 −7 ▸`) that opens to the files and then a diff.
+- Added a closing line after a finished request (`✓ 用了 20 分钟 · 子代理 ¥4.20 · 全部 ¥9.80`, once, under the last round that answered it) with a `完整过程 ▸` switch for the rows the timeline hides.
+- Changed the background memory tidy to show only when `完整过程` is on, as one note (`回合后整理记忆：新记 1 条（本会话）`) that opens to the memories.
+- Changed the subagent blocks under the prompt to keep the order the children were sent out, show each child's short name (`review-grow-B-box` reads `B`) and its task after it (skipping "你是…" and "You are…" openings), say "回答中" in the AI's color and "✓ 已交回" in green, and put "↓ 选一个进去看" faint at the right edge.
+- Changed the status line to "思考 最高", an eight-cell context bar with the used share in the user color, a live-colored "⠹ 工作中 10分 · ↓ 180k · 子代理 ¥4.20 · 全部 ¥9.80 · Esc 停止" and a dim "✓ 完成 · 20 分钟 · ↓ 286k" once the run is done, without the session total or the place and branch.
+- Changed the prompt's rule to the timeline's rail color, the "›" mark to the soft color and the placeholder and key hints to the time color; while subagent blocks show, they take the row of the prompt's bottom rule.
+- Fixed the subagent spend on the status line losing the colors of its "未定价", "已改价" and "≈" marks.
+- Changed a subagent's report that arrives while the AI is still working to sit among the turn's lines by time, above the live spinner line and after the events before it, instead of below the whole turn.
+- Changed the dispatch line to show each subagent's task next to its short name, and to leave a task off when several subagents share the same words.
+- Changed an opened memory step to show the whole remembered text, wrapped to the screen.
+- Fixed the `N 步 ▸` label losing its arrow on a narrow terminal: the arrow stays and the words give way first.
+- Fixed a report from a subagent the AI never dispatched, or a second report from one that was already back, drawing a closing `├──╯` line with no opening `├──╮`.
+- Fixed raw markdown (table rows, code fences, headings) showing on the live spinner line.
+- Changed a long stretch of events to show the first, the last two and the ones that carry news, with the rest folded into one `⋯  中间还有 N 件事 ▸` row that opens in place.
+- Changed the AI's events and the live spinner sentence to show its inline markdown as words: code without backticks, bold words bold, a link as its text.
+- Fixed subagents started from a Python cell missing their dispatch line, dotted lane and closing `├──╯` line.
+- Fixed empty rows: an answer-only turn no longer draws four between the question and its summary.
+- Fixed a short answer disappearing from a question you asked when a subagent's report or notice landed between your question and the AI's first word.
+- Fixed a report that arrives while a command runs splitting the turn in two after a compaction, a reconnect or an attach, which left the command spinning forever with its output missing.
+- Fixed a failed or partly refused background memory tidy being hidden until `完整过程` was on; only a tidy that kept everything stays hidden.
+- Fixed two AI messages stamped in the same millisecond showing as one row, and a subagent with no name leaving the dotted lane on forever.
+- Fixed pressing Ctrl+T a second time leaving the thinking rows on screen: it now closes the events it opened and puts the turn back as it was.
+- Added `⋯ 共 N 步   ▴ 收起` under the steps once `全部 ›` has listed them all, so the list folds back with a click or Enter.
+- Fixed a timeline row with nothing on its right (a file read, a step with no result) giving up six columns of its words.
+- Fixed the status line, the second-Esc hint and the interrupt hint showing only the first of several keys bound to stop a run.
+- Changed the light theme's AI, live, subagent and fix colors on the timeline to read at 4.5 to 1 or better on white.
+- Fixed a subagent started from Python showing up twice on the timeline (once under its task text) and leaving the dotted lane on forever; only a child that really started is drawn, once, under its own name.
+- Fixed a subagent that failed to start being drawn on the dotted lane.
+- Fixed subagents that were still running dropping off the dotted lane, the waiting names and the closing row after a compaction or a window reopen of a long turn.
+- Fixed the dotted lane on a round a report woke depending on when the screen happened to be drawn; it now follows the clock, the same in the live view and after a replay.
+- Fixed the dispatch row showing a subagent's task tag live but not after the chat was rebuilt from the transcript.
+- Changed the row that closes the lane to say how the subagents came back (`四个都回来了（1 个失败）`) instead of counting a failed, silent or cancelled one as handed back.
+- Changed system lines about a subagent (failed, finished without a word, gone quiet) to name it as short as the dispatch and return rows do.
+- Added a step for a cell that only dispatches subagents, so its event opens to show it and the live step number counts it.
+- Fixed the AI's reply to a subagent notice being hidden whatever it said: only a cancel or a silent finish of a subagent whose report already came stays out of sight (from its first word to its last, never drawn and then taken away), while a failure, a stall warning and a silent finish of a subagent that never reported are drawn with the reply.
+- Fixed a report or notice that arrives after the AI's final answer, in the same run, being taken as part of your turn instead of starting its own.
+- Fixed Ctrl+O, Ctrl+T, Ctrl+P and Option+J acting on a turn that is left out of sight; they now act on the newest turn on screen.
+- Fixed a compaction that did not happen being folded into the steps; it is now a line of its own, and a compaction after the last answer no longer lands inside the step list of an event that had ended.
+- Fixed a model call that an automatic retry followed showing as `模型出错 … 下一格改好了` after reopening a session; it now reads `已自动重试` as it does live.
+- Fixed the memory tidy line landing under the closing row of a request while it was running and above it after reopening; the closing row is now always the last line.
+- Fixed Ctrl+T after Ctrl+O doing nothing on the third press: thoughts under a folded event now count as closed.
+- Fixed the timeline folding away an event you had opened, or the one the keyboard was on, once a running turn added more events; it now stays, with its steps and its place in the focus order.
+- Fixed a step line on a narrow terminal losing its command and glyph to the time and result on its right: the right side shortens first, to `✓` or `✗`, and then goes.
+- Changed the light theme's faint timeline text (arrows, step counts, `全部 ›`, step times) to read at 3.5 to 1 on white and 3 to 1 on a hovered line.
+- Fixed a message you typed while the AI was working through a notice it did not need to act on, and the AI's answer to it, being hidden with that round; typing in a round now shows it.
+- Fixed a compaction that failed inside such a hidden round being hidden with it; a compaction you cancelled or that only waited stays out of sight.
+- Fixed a question ending in a hidden round leaving `完整过程 ▸` where the keyboard could not reach it; the closing row now sits under the last round that is drawn, and the keys reach it.
+- Fixed only the newest question having a closing row; every question now ends with `✓ 用了 … 完整过程 ▸`, live and after reopening, the time counted to that question's last round (no idle time, no late memory tidy) and the money only under the newest one.
+- Fixed a memory line that arrives after a question ending in a hidden round landing under the closing row.
+- Fixed a window opened on a running session (`--resume`, `attach`) not drawing the subagents that were still out when their dispatch was compacted away or lies before the window, so their reports did not close the dotted lane.
+- Fixed a rebuild that crossed into a new question counting the earlier question's returns among the new question's `都交回了`.
+- Fixed a compaction making the timeline forget which subagents had already reported, which brought their repeated notices back on screen.
+- Fixed a compaction after the AI's last answer being drawn above that answer with an earlier-looking time; it now comes after the answer, above the closing row, in time order, live and after reopening.
+- Fixed a compaction you cancelled showing as a warning line of its own; it now folds into the steps of the event it interrupted, like a retry you stopped, while a compaction that really failed still gets its own line.
+- Fixed the `在跑` line under a running turn losing its command to the clock on a narrow screen; the clock now goes first, as on a step line.
+
 ## [0.11.16] - 2026-09-29
 
 - Changed the turn box in the fullscreen window to grow with its content, so a long turn shows every step and the page scrolls instead of the box; opening a step grows it in place.

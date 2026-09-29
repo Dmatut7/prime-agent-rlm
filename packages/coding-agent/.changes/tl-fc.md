@@ -1,8 +1,0 @@
-- Fixed a subagent started from Python showing up twice on the timeline (once under its task text) and leaving the dotted lane on forever; only a child that really started is drawn, once, under its own name.
-- Fixed a subagent that failed to start being drawn on the dotted lane.
-- Fixed subagents that were still running dropping off the dotted lane, the waiting names and the closing row after a compaction or a window reopen of a long turn.
-- Fixed the dotted lane on a round a report woke depending on when the screen happened to be drawn; it now follows the clock, the same in the live view and after a replay.
-- Fixed the dispatch row showing a subagent's task tag live but not after the chat was rebuilt from the transcript.
-- Changed the row that closes the lane to say how the subagents came back (`四个都回来了（1 个失败）`) instead of counting a failed, silent or cancelled one as handed back.
-- Changed system lines about a subagent (failed, finished without a word, gone quiet) to name it as short as the dispatch and return rows do.
-- Added a step for a cell that only dispatches subagents, so its event opens to show it and the live step number counts it.

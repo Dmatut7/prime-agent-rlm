@@ -1,3 +1,0 @@
-- Fixed a compaction after the AI's last answer being drawn above that answer with an earlier-looking time; it now comes after the answer, above the closing row, in time order, live and after reopening.
-- Fixed a compaction you cancelled showing as a warning line of its own; it now folds into the steps of the event it interrupted, like a retry you stopped, while a compaction that really failed still gets its own line.
-- Fixed the `在跑` line under a running turn losing its command to the clock on a narrow screen; the clock now goes first, as on a step line.
