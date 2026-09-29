@@ -1,2 +1,3 @@
 - Fixed a long memory entry showing the start of a quoted password that straddled the 4000-character cut.
 - Fixed a memory entry whose title holds a credential being saved with that title; the title now shows the entry id and the texts are withheld.
+- Fixed Rust and Go credential declarations (`let password: &str = "..."`, `var token string = "..."`) not being withheld from change records.

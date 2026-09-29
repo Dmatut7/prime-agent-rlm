@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -224,6 +225,121 @@ class MemoryTitleScanTests(te.TrackerCase):
         self.assertEqual(record["previousTitle"], "Deploy steps")
         self.assertEqual((record["before"], record["after"]), ("use make deploy", "use make ship"))
         self.assertNotIn("textOmitted", record)
+
+
+class AssignmentDeclarationFormsTests(unittest.TestCase):
+    """review2-3: Rust (`let password: &str = ...`) and Go (`var password string = ...`) declare a value
+    in ways the assignment rule did not read. Comparisons and bare annotations still are not assignments."""
+
+    def test_rust_and_go_declarations_are_withheld(self):
+        declarations = [
+            f'let password: &str = "{_PASSWORD}";',
+            f"let password: &'static str = \"{_PASSWORD}\";",
+            f'const TOKEN: &str = "{_PASSWORD}";',
+            f"static API_KEY: &'static str = \"{_PASSWORD}\";",
+            f'let secret: Option<&str> = "{_PASSWORD}";',
+            f'let mut password: &mut str = "{_PASSWORD}";',
+            f'var password string = "{_PASSWORD}"',
+            'var token string = "abcdefgh1234"',
+            f'var Password *string = "{_PASSWORD}"',
+            f'const Secret string = "{_PASSWORD}"',
+            f'var apiKey string = "{_PASSWORD}"',
+            'var password string = "correct horse battery staple"',
+        ]
+        self.assertGreater(len(declarations), 0)
+        for text in declarations:
+            with self.subTest(text=text):
+                self.assertTrue(effects.looks_secret(text))
+
+    def test_comparisons_placeholders_bare_annotations_and_prose_stay_clean(self):
+        ordinary = [
+            'x == "12345678"',
+            'password == "abcdefgh1234"',
+            'password != "abcdefgh1234"',
+            'if password >= "abcdefgh1234":',
+            'password <= "abcdefgh1234"',
+            "password: Optional[str] = None",
+            "password: str",
+            'password: str = ""',
+            "password field = required",
+            "token count = 12345678",
+            "let password: &str = &args[1];",
+            "let password: String = read_line();",
+            'let password: &str = "";',
+            'var password string = ""',
+            'var password string = "changeme"',
+            "var password string = os.Getenv(\"PASSWORD\")",
+            "var password string",
+            'password string == "abcdefgh1234"',
+            "let password: &str;",
+        ]
+        self.assertGreater(len(ordinary), 0)
+        for text in ordinary:
+            with self.subTest(text=text):
+                self.assertFalse(effects.looks_secret(text))
+
+    def test_the_earlier_forms_are_judged_as_before(self):
+        withheld = [
+            f'password: str = "{_PASSWORD}"',
+            f'password := "{_PASSWORD}"',
+            "token: Optional[str] = 'abcdefgh12345678'",
+            f'const password: string = "{_PASSWORD}";',
+            'password = "hunter22"',
+            "password: hunter2passw",
+        ]
+        self.assertGreater(len(withheld), 0)
+        for text in withheld:
+            with self.subTest(text=text):
+                self.assertTrue(effects.looks_secret(text))
+
+
+class DeclarationPipelineTests(te.TrackerCase):
+    use_git = False
+
+    def test_rust_and_go_declarations_written_to_source_files_keep_their_counts_but_no_diff(self):
+        sources = {
+            "main.rs": f'let password: &str = "{_PASSWORD}";',
+            "main.go": f'var password string = "{_PASSWORD}"',
+        }
+        code = "".join(f"open({name!r}, 'w').write({line + chr(10)!r})\n" for name, line in sources.items())
+        cell = self.kernel.run(code)
+        files = cell.by_rel()
+        self.assertEqual(sorted(files), sorted(sources))
+        for name in sources:
+            with self.subTest(name):
+                record = files[name]
+                self.assertEqual((record["kind"], record["added"]), ("created", 1))
+                self.assertEqual(record["diffOmitted"], effects.SENSITIVE)
+                self.assertNotIn("diff", record)
+        self.assertEqual(_anywhere(cell, _PASSWORD[:10]), [])
+
+
+class AssignmentScanCostTests(unittest.TestCase):
+    """The declaration arms must stay linear: the scan runs on every label, detail, diff and memory text."""
+
+    def test_pathological_runs_after_a_credentials_name_are_scanned_in_linear_time(self):
+        size = 50_000
+        texts = {
+            "spaces": "password " + " " * size,
+            "spaces then a word": "password" + " " * size + "x",
+            "words": "password " + "word " * (size // 5),
+            "one letter words": "password " + "a " * (size // 2),
+            "one long word": "password " + "a" * size,
+            "annotation words": "password: " + "a " * (size // 2),
+            "annotation long word": "password: " + "a" * size,
+            "annotation symbols": "password: " + "&'<*" * (size // 4),
+            "repeated names": "password " * (size // 9),
+            "repeated names with colons": "password: " * (size // 10),
+            "repeated names with words": "password string " * (size // 16),
+            "spaced colons": ("password:" + " " * 50) * (size // 59),
+            "tabs and newlines": "token" + "\t\n " * (size // 3),
+        }
+        self.assertGreater(len(texts), 0)
+        for name, text in texts.items():
+            with self.subTest(name):
+                started = time.perf_counter()
+                effects.looks_secret(text)
+                self.assertLess(time.perf_counter() - started, 1.0)
 
 
 if __name__ == "__main__":
