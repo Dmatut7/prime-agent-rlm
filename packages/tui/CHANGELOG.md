@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.11.16] - 2026-09-29
+
+- Added pinned headers to the fullscreen view: while the top of an open turn box has scrolled out of sight, its header stays at the top of the window, clicking it folds the box, and page keys and text selection leave the pinned rows alone.
+
 ## [0.11.15] - 2026-09-29
 
 - Fixed an open menu ignoring keys after a dialog or tool prompt handed focus back to the editor; whatever took the keyboard while the menu was open gets it back when the menu closes ([#40](https://github.com/Dmatut7/prime-agent-rlm/pull/40) by [@Lansyue](https://github.com/Lansyue)).

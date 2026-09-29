@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.16] - 2026-09-29
+
+- Changed the turn box in the fullscreen window to grow with its content, so a long turn shows every step and the page scrolls instead of the box; opening a step grows it in place.
+- Changed the box header to a painted card row with a status pill (`⠹ 进行中`, `✓ 完成`, `■ 已停止`, `✗ 出错`), a bold title and an arrow on the right that lights up under the pointer.
+- Changed a folded box with nothing to keep on show to a single header card without frame lines.
+- Fixed a box the user opened while it ran staying open under the next turn after the run ended; it now folds when the turn ends, unless `ui.timelineAutoFold` is off.
+- Added a pinned copy of an open box's header, with a hint of how many steps are out of sight above it, for the fullscreen window to keep at the top while the box scrolls past.
+- Changed the subagent area under the prompt to one row of small blocks, one per child, that opens the child on a click, pages sideways with the mouse wheel and the arrow keys, and shows a stalled descendant as a red block in the same row.
+- Changed the order under the prompt to input box, subagent blocks, then the status line, in both the normal and the fullscreen view.
+- Changed the status line to show the subagent spend (`子代理 ¥X · 全部 ¥Y`) in front of `Esc 停止`, trimming it step by step on a narrow screen after the location has gone, and to hide its own subagent count while the blocks are shown.
+- Added `app.subagents.prev` and `app.subagents.next` (default left and right) to move between the subagent blocks.
+
 ## [0.11.15] - 2026-09-29
 
 - Changed the notice a parent gets when a subagent finishes without replying to carry the subagent's whole final answer (up to 4,000 characters, head and tail beyond that) instead of a 160-character preview, so the parent stops re-dispatching work that is already done.
