@@ -36,6 +36,7 @@ export { TruncatedText } from "./components/truncated-text.js";
 export type { EditorComponent, EditorPasteSnapshot } from "./editor-component.js";
 export {
 	clippedFullscreenDockHeight,
+	FULLSCREEN_MAX_STICKY_ROWS,
 	FULLSCREEN_MIN_TRANSCRIPT_ROWS,
 	FullscreenViewport,
 	type ScrollInfo,
