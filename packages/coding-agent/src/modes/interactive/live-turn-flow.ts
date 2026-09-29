@@ -1,8 +1,8 @@
 import type { AssistantMessage, AssistantMessageEvent } from "@earendil-works/pi-ai";
-import type { Container } from "@earendil-works/pi-tui";
+import type { Component, Container } from "@earendil-works/pi-tui";
 import type { CustomMessage } from "../../core/messages.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
-import { laneKey, SubagentLane } from "./components/agent-message.js";
+import { AgentMessageComponent, laneKey, SubagentLane } from "./components/agent-message.js";
 import {
 	assignWakeCause,
 	countThinkingSegments,
@@ -18,7 +18,7 @@ import {
 } from "./components/conversation-components.js";
 import { formatFileChangePath, getToolFileChanges } from "./components/edit-summary.js";
 import { collectBashHandleCommands } from "./components/step-label.js";
-import { isSubagentNoticeMessage } from "./components/system-notice.js";
+import { isSubagentNoticeMessage, TimelineNoticeRow } from "./components/system-notice.js";
 import { TurnActivityState, TurnSummaryComponent } from "./components/turn-activity.js";
 import { TurnStripComponent } from "./components/turn-strip.js";
 import {
@@ -137,6 +137,8 @@ export class LiveTurnFlow {
 	readonly subagentLane = new SubagentLane();
 	/** What woke the run in progress; the turn it opens takes it. */
 	private pendingCause: WakeCause | undefined;
+	/** The message that just arrived joined the round that runs: its row sits inside that turn. */
+	private joinedRound = false;
 
 	constructor(private readonly host: LiveTurnFlowHost) {}
 
@@ -171,6 +173,7 @@ export class LiveTurnFlow {
 	}
 
 	agentStart(): void {
+		this.joinedRound = false;
 		// The quiet conversation groups by prompt: a run without a prompt of its
 		// own (a retry, a compaction's continuation) goes on in the same box,
 		// exactly as a replay of the transcript groups it.
@@ -195,6 +198,7 @@ export class LiveTurnFlow {
 	 * notice the box shows as a row goes there. True when the box took the message.
 	 */
 	customMessage(message: CustomMessage): boolean {
+		this.joinedRound = false;
 		if (!this.host.quiet()) return false;
 		// How the run's last reply ended, as a message typed in a step would read it (a view attached mid-run replays it).
 		const state = this.host.currentState();
@@ -208,7 +212,10 @@ export class LiveTurnFlow {
 			return false;
 		}
 		// Inside the tool loop the message joins the round that is running.
-		if (isWakeMessage(message)) noteWakeInRound(this.host.currentState(), message);
+		if (isWakeMessage(message)) {
+			noteWakeInRound(this.host.currentState(), message);
+			this.joinedRound = true;
+		}
 		// A subagent notice is a row of the timeline the chat draws, never one of the box's.
 		if (isSubagentNoticeMessage(message)) return false;
 		if (!isBoxNoticeMessage(message)) return false;
@@ -226,8 +233,26 @@ export class LiveTurnFlow {
 		return true;
 	}
 
+	/**
+	 * Where the row of a message just handed to {@link customMessage} goes. A report that joined the
+	 * round that runs is a row of that turn, drawn among its lines by time (so it never lands under
+	 * the turn's live tail); `into` names the turn a replay puts it in. False: the chat's end.
+	 */
+	placeRow(row: Component, at: number, into?: TurnSummaryComponent): boolean {
+		const joined = this.joinedRound;
+		this.joinedRound = false;
+		if (!(row instanceof AgentMessageComponent) && !(row instanceof TimelineNoticeRow)) return false;
+		const summary = into ?? (joined && this.host.quiet() ? this.host.currentSummary() : undefined);
+		if (!summary?.state.boxMode) return false;
+		const before = summary.inlineRowBefore(at);
+		if (before instanceof AgentMessageComponent && row instanceof AgentMessageComponent) row.joinPreviousRow();
+		summary.addInlineRow(row, at);
+		return true;
+	}
+
 	/** A user message arrived: an interjection in the running turn's box, or a new prompt. */
 	userMessage(text: string, timestamp: number): "interjection" | "prompt" {
+		this.joinedRound = false;
 		const quiet = this.host.quiet();
 		const state = this.host.currentState();
 		const summary = this.host.currentSummary();
@@ -264,6 +289,7 @@ export class LiveTurnFlow {
 	}
 
 	assistantStart(message: AssistantMessage): void {
+		this.joinedRound = false;
 		this.runCutMidTask = false;
 		this.stepStop = NO_STEP_STOP;
 		this.openReplyFolded = false;

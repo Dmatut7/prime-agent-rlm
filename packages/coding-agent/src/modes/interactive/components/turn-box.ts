@@ -261,6 +261,14 @@ export function computeLiveTail(input: LiveTailInput): LiveTail {
 	};
 }
 
+/** A row another part draws (a subagent's report) that sits among the turn's lines by its time. */
+export interface InlineRow {
+	/** When it landed (ms). */
+	at: number;
+	lines: string[];
+	regions: ReadonlyArray<ClickRegion>;
+}
+
 export interface BoxRenderInput {
 	timeline: TurnTimeline;
 	rows: readonly BoxRow[];
@@ -273,6 +281,8 @@ export interface BoxRenderInput {
 	revealRows: number;
 	/** Which subagents are out; absent: no lane is drawn. */
 	lanes?: TimelineLaneTracker;
+	/** Rows that landed inside the turn, each drawn before the first event that started after it. */
+	inline?: readonly InlineRow[];
 	/** A blank line first: a turn a message woke, nothing else separates it from what is above. */
 	leadingGap?: boolean;
 	/** The first line leaves its right side out: block navigation puts its key hint there. */
@@ -295,6 +305,8 @@ interface LineSpec {
 	gutter: TimelineGutter;
 	content: string;
 	right?: string;
+	/** Lines another part drew, taken as they are. */
+	raw?: InlineRow;
 	/** A line that can be pointed at, focused and clicked. */
 	key?: string;
 	onClick?: () => void;
@@ -429,6 +441,15 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 	const gap = (lane: TimelineLane): void => {
 		specs.push({ gutter: { main: "rail", lane }, content: "" });
 	};
+	const inline = [...(input.inline ?? [])].sort((a, b) => a.at - b.at);
+	let nextInline = 0;
+	/** The rows that landed before `before` (all of them for `Infinity`). */
+	const flushInline = (before: number): void => {
+		for (let row = inline[nextInline]; row && row.at < before; row = inline[nextInline]) {
+			nextInline += 1;
+			specs.push({ gutter: { main: "rail" }, content: "", raw: row });
+		}
+	};
 	const bodyWidth = Math.max(8, width - TIMELINE_CONTENT_COL - 2);
 	const detailWidth = Math.max(8, bodyWidth - STEP_INDENT - STEP_GLYPH_COLS);
 
@@ -436,6 +457,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		gap(tracker && startedOut && tracker.active ? "on" : "off");
 
 	input.events.forEach((event, index) => {
+		flushInline(event.at);
 		const lane = laneOfEvent(index);
 		const time = event.at > 0 ? formatTimelineTime(event.at) : undefined;
 		const detailRow = event.row;
@@ -537,10 +559,11 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		}
 	});
 
+	flushInline(Number.POSITIVE_INFINITY);
 	const tail = input.tail;
 	if (tail) {
 		const last = specs.at(-1);
-		if (last && !(last.gutter.main === "rail" && last.content === "")) gap(tracker?.lane ?? "off");
+		if (last && !(last.gutter.main === "rail" && last.content === "" && !last.raw)) gap(tracker?.lane ?? "off");
 		const lane = tracker?.lane ?? "off";
 		const stepNote = tail.stepCount > 0 ? theme.fg("timelineFaint", `第 ${tail.stepCount} 步`) : "";
 		specs.push({
@@ -591,9 +614,15 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		: undefined;
 	const lines: string[] = [];
 	const regions: ClickRegion[] = [];
-	const firstVisible = specs.findIndex((spec) => spec.content !== "");
-	specs.forEach((spec, line) => {
-		const right = input.dropFirstRight && line === firstVisible ? "" : (spec.right ?? "");
+	const firstVisible = specs.findIndex((spec) => spec.content !== "" || spec.raw !== undefined);
+	specs.forEach((spec, index) => {
+		const line = lines.length;
+		if (spec.raw) {
+			lines.push(...spec.raw.lines);
+			for (const region of spec.raw.regions) regions.push({ ...region, line: line + region.line });
+			return;
+		}
+		const right = input.dropFirstRight && index === firstVisible ? "" : (spec.right ?? "");
 		const text = timelineRow(spec.gutter, spec.content, right, width);
 		const key = spec.key;
 		const focused = key !== undefined && key === focusKey;

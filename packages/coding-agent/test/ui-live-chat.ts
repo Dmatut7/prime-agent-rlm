@@ -6,6 +6,7 @@ import {
 	createAgentSessionMessage,
 } from "../src/core/agent-messages.js";
 import { createRlmChildFailureMessage, createRlmChildTerminalNoticeMessage } from "../src/core/messages.js";
+import type { AgentConnectionRlmChildAgentSnapshot } from "../src/modes/agent-connection/types.js";
 import {
 	createAgentMessageRow,
 	createUserMessage,
@@ -22,15 +23,9 @@ import {
 	TurnSummaryComponent,
 } from "../src/modes/interactive/components/turn-activity.js";
 import { LiveTurnFlow, type RequestSpend } from "../src/modes/interactive/live-turn-flow.js";
-import type { AgentConnectionRlmChildAgentSnapshot } from "../src/modes/agent-connection/types.js";
 import { assistant, T0 } from "./ui-blocks-helpers.js";
 
-export function handedBack(
-	id: string,
-	at = T0,
-	name = "ff-review-d-keys",
-	text = "审查完毕",
-): AgentSessionMessage {
+export function handedBack(id: string, at = T0, name = "ff-review-d-keys", text = "审查完毕"): AgentSessionMessage {
 	return createAgentSessionMessage(
 		{
 			id,
@@ -146,13 +141,12 @@ export class LiveChat {
 	}
 
 	private addMessageRow(message: AgentSessionMessage): void {
-		this.chat.addChild(
-			createAgentMessageRow(message, {
-				quiet: true,
-				lane: this.flow.subagentLane,
-				previous: lastDrawnComponent(this.chat.children),
-			}),
-		);
+		const row = createAgentMessageRow(message, {
+			quiet: true,
+			lane: this.flow.subagentLane,
+			previous: lastDrawnComponent(this.chat.children),
+		});
+		if (!this.flow.placeRow(row, message.timestamp)) this.chat.addChild(row);
 	}
 
 	/** The user types a prompt and the AI answers on `model` (or is stopped in the middle of a step). */
@@ -235,7 +229,7 @@ export class LiveChat {
 				);
 		if (!this.flow.customMessage(notice)) {
 			const row = subagentNoticeRow(notice, this.flow.subagentLane);
-			if (row) this.chat.addChild(row);
+			if (row && !this.flow.placeRow(row, at)) this.chat.addChild(row);
 		}
 		this.reply(options.model ?? "glm-5.3-prime", options.answer, false, options.running !== true);
 	}
@@ -318,7 +312,13 @@ export class LiveChat {
 		component.updateContent(message, false);
 		this.streamed(message);
 		if (options.open) {
-			for (const call of calls) this.flow.toolStart(call.id, "ipython", { code: call.code });
+			for (const call of calls) {
+				this.flow.toolStart(call.id, "ipython", { code: call.code });
+				// The kernel's records so far (a running command already has its label).
+				if (call.details !== undefined) {
+					this.flow.toolUpdate(call.id, "ipython", { code: call.code }, { details: call.details });
+				}
+			}
 			return;
 		}
 		this.flow.assistantEnd(message);

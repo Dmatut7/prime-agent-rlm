@@ -8235,7 +8235,7 @@ export class InteractiveMode {
 
 	private addMessageToChat(
 		message: AgentMessage,
-		options?: { populateHistory?: boolean; round?: TurnActivityState },
+		options?: { populateHistory?: boolean; round?: TurnActivityState; inlineIn?: TurnSummaryComponent },
 	): void {
 		if (message.role === "assistant") this.lastAssistantStopReason = message.stopReason;
 		switch (message.role) {
@@ -8268,7 +8268,10 @@ export class InteractiveMode {
 					if (isSessionSlashCommandMessage(message) && this.chatContainer.children.length > 0) {
 						this.chatContainer.addChild(new Spacer(1));
 					}
-					this.chatContainer.addChild(component);
+					// A report that joined the running round is a row of that turn, not of the chat's end.
+					if (!this.turnFlow.placeRow(component, Number(message.timestamp) || Date.now(), options?.inlineIn)) {
+						this.chatContainer.addChild(component);
+					}
 				}
 				break;
 			}
@@ -8722,7 +8725,12 @@ export class InteractiveMode {
 				}
 			} else if (replayQuiet && isSubagentNoticeMessage(message)) {
 				// A subagent that ended, failed or went quiet: a row of the timeline, out of sight unless it failed.
-				this.addMessageToChat(message, renderOptions);
+				this.addMessageToChat(message, {
+					...renderOptions,
+					...(isWakeMessage(message) && insideReplayToolLoop() && replayTurnSummary
+						? { inlineIn: replayTurnSummary }
+						: {}),
+				});
 			} else if (replayQuiet && replayTurnState && message.role === "custom" && isBoxNoticeMessage(message)) {
 				// The box says it as its own row (a compaction that waited).
 				const record = boxRecordFromMessage(message);
@@ -8738,8 +8746,13 @@ export class InteractiveMode {
 				if (isAgentSessionMessage(message) && message.display) {
 					replayTurnSummary?.addCommMessage();
 				}
-				// All other messages use standard rendering
-				this.addMessageToChat(message, renderOptions);
+				// All other messages use standard rendering; a report inside the tool loop goes into its turn.
+				this.addMessageToChat(message, {
+					...renderOptions,
+					...(replayQuiet && isWakeMessage(message) && insideReplayToolLoop() && replayTurnSummary
+						? { inlineIn: replayTurnSummary }
+						: {}),
+				});
 			}
 		}
 		// Within a box turn only the last reply's answer stays under the box, and a

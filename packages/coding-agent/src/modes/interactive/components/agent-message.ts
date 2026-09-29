@@ -222,7 +222,7 @@ export interface AgentMessageOptions {
 export class AgentMessageComponent extends Container {
 	private readonly content = new Container();
 	private readonly header = new Text("", 1, 0);
-	private readonly suppressLeadingSpace: boolean;
+	private suppressLeadingSpace: boolean;
 	private readonly timeline: TimelineReturn | undefined;
 	private expanded = false;
 	private hovered = false;
@@ -348,6 +348,11 @@ export class AgentMessageComponent extends Container {
 		}
 		this.expanded = expanded;
 		this.updateDisplay();
+	}
+
+	/** The row drawn straight above this one is another report: the two share one blank row. */
+	joinPreviousRow(): void {
+		this.suppressLeadingSpace = true;
 	}
 
 	override invalidate(): void {

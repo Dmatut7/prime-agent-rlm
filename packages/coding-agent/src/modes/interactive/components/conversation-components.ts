@@ -585,14 +585,18 @@ export function buildConversationComponents(
 		} else if (isAgentSessionMessage(message) && message.display) {
 			// TUI v4: a received agent-message row is one comm in this turn.
 			turnSummary?.addCommMessage();
+			// A report that lands inside the running tool loop is a row of that turn, among its lines by time.
+			const round = quiet && isWakeMessage(message) && insideToolLoop() ? turnSummary : undefined;
+			const at = Number(message.timestamp) || 0;
 			const component = createAgentMessageRow(message, {
 				markdownTheme: options.markdownTheme,
 				quiet,
 				lane,
-				previous: lastDrawnComponent(components),
+				previous: round ? round.inlineRowBefore(at) : lastDrawnComponent(components),
 			});
 			component.setExpanded(agentMessagesExpanded);
-			components.push(component);
+			if (round) round.addInlineRow(component, at);
+			else components.push(component);
 		} else if (isInjectedPromptMessage(message) && message.display) {
 			const component = new InjectedPromptMessageComponent(message, options.markdownTheme);
 			component.setExpanded(expanded);

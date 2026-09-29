@@ -19,7 +19,7 @@ import {
 	type TimelineFacts,
 	timelineFacts,
 } from "./timeline-rows.js";
-import { computeBoxHeader, computeLiveTail, renderTurnBox } from "./turn-box.js";
+import { computeBoxHeader, computeLiveTail, type InlineRow, renderTurnBox } from "./turn-box.js";
 import { TurnTimeline } from "./turn-timeline.js";
 
 export type TurnStepStatus = "queued" | "running" | "done" | "error";
@@ -687,6 +687,15 @@ export class TurnActivityState {
 	}
 }
 
+/** A component that lists the click regions of the lines it drew. */
+interface HasClickRegions {
+	getClickRegions(): ReadonlyArray<ClickRegion>;
+}
+
+function hasClickRegions(component: Component): component is Component & HasClickRegions {
+	return "getClickRegions" in component && typeof component.getClickRegions === "function";
+}
+
 export class TurnSummaryComponent implements Component, FocusableBlock {
 	private blockFocus?: BlockFocusState;
 	private cachedWidth?: number;
@@ -703,6 +712,8 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	private leadingBlank = false;
 	/** Which subagents are out; absent: the turn draws no lane. */
 	private laneTracker: TimelineLaneTracker | undefined;
+	/** Rows that landed while the turn's run went on (a subagent's report), drawn among its lines by their time. */
+	private readonly inlineRows: Array<{ component: Component; at: number }> = [];
 
 	constructor(private readonly turnState: TurnActivityState) {}
 
@@ -732,6 +743,28 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		);
 		if (tracker && running.length > 0) tracker.spawned(running);
 		this.invalidate();
+	}
+
+	/** A row that landed inside the turn: it is drawn among the turn's lines, after the events that came before it. */
+	addInlineRow(component: Component, at: number): void {
+		this.inlineRows.push({ component, at });
+		this.invalidate();
+	}
+
+	/**
+	 * The row that is drawn straight above a row landing at `at`, when nothing else of the turn sits
+	 * between them (two reports in a row share one blank line above).
+	 */
+	inlineRowBefore(at: number): Component | undefined {
+		const last = this.inlineRows.at(-1);
+		if (!last) return undefined;
+		const later = this.turnState.timeline.entries.some(
+			(entry) =>
+				entry.kind === "message" &&
+				(entry.message.timestamp ?? 0) > last.at &&
+				(entry.message.timestamp ?? 0) <= at,
+		);
+		return later ? undefined : last.component;
 	}
 
 	/** Whether a blank line separates this turn from what is above it. */
@@ -968,6 +1001,10 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 						now,
 					})
 				: undefined;
+		const inline: InlineRow[] = this.inlineRows.map(({ component, at }) => {
+			const lines = component.render(width);
+			return { at, lines, regions: hasClickRegions(component) ? component.getClickRegions() : [] };
+		});
 		const box = renderTurnBox({
 			timeline: state.timeline,
 			rows: view.rows,
@@ -978,6 +1015,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 			tick: getSpinnerTick(),
 			revealRows: viewportRows,
 			...(tracker ? { lanes: tracker } : {}),
+			...(inline.length > 0 ? { inline } : {}),
 			leadingGap: this.leadingBlank,
 			dropFirstRight: this.blockFocus !== undefined,
 			onToggleEvent: () => this.onLanesChange?.(),
@@ -988,7 +1026,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		});
 		this.boxFocusOrder = box.focusOrder;
 		this.boxRegions = box.regions;
-		if (!view.live) {
+		if (!view.live && inline.length === 0) {
 			this.cachedLines = box.lines;
 			this.boxCacheKey = cacheKey;
 		} else {
