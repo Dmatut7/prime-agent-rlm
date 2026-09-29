@@ -854,6 +854,9 @@ function saysMoreThan(text: string, summary: string): boolean {
 	return flat !== summary;
 }
 
+/** A row shows one line: the sentence it summarizes is looked for in the first characters only. */
+const SUMMARY_INPUT_MAX_CHARS = 400;
+
 function thinkRows(
 	timeline: TurnTimeline,
 	entry: Extract<TimelineEntry, { kind: "message" }>,
@@ -896,7 +899,7 @@ function thinkRows(
 					? formatBoxDuration(Math.max(1000, timing.endedAt - timing.startedAt))
 					: undefined;
 			const tokens = formatBoxTokens(timeline.thinkingTokens(key, raw));
-			const summary = text ? firstSentence(text) : "";
+			const summary = text ? firstSentence(text.slice(0, SUMMARY_INPUT_MAX_CHARS)) : "";
 			rows.push({
 				key: rowKey,
 				kind: "think",
@@ -921,7 +924,7 @@ function thinkRows(
 				status: "plain",
 				glyph: "·",
 				glyphColor: "dim",
-				text: firstSentence(text),
+				text: firstSentence(text.slice(0, SUMMARY_INPUT_MAX_CHARS)),
 				textColor: "muted",
 				meta: [],
 				fullText: text,

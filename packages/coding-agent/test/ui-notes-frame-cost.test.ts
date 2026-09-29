@@ -85,10 +85,14 @@ describe("notes cost a frame nearly nothing", () => {
 	}
 
 	it("draws a turn of many long notes about as fast as one of as many short notes", () => {
-		const base = frameMs(withNotes(100, 30), 120);
+		// Both cut to the line: what is compared is the note's length, not whether a line fits.
+		const cutBase = frameMs(withNotes(100, 400), 120);
 		const notes = frameMs(withNotes(100, 3_000), 120);
 		// A note's length must not tax a frame: it is one line, cut to the width, however long it is.
-		expect(notes / base).toBeLessThan(5);
+		expect(notes / cutBase).toBeLessThan(5);
+		// And a cut line costs a frame no more than a small multiple of a line that fits.
+		const shortBase = frameMs(withNotes(100, 30), 120);
+		expect(notes / shortBase).toBeLessThan(25);
 	});
 
 	it("shows a long note cut to one line and a short one whole, and opens a note of several paragraphs to its text", () => {

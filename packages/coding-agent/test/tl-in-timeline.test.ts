@@ -782,3 +782,37 @@ describe("a failing step's status reads like the design's `4 个失败  38秒`",
 		expect(text.endsWith("10 通过 · 4 失败    ")).toBe(true);
 	});
 });
+
+describe("a row's one-line summary is looked for in the first 400 characters", () => {
+	it("cuts the summary of a very long note and of a very long thought there", () => {
+		const turn = quietTurn(false);
+		const note = "没有句号的一大段话".repeat(2_000);
+		turn.timeline.noteMessage(
+			assistant(T0, [
+				{ type: "thinking", thinking: note },
+				{ type: "text", text: note },
+				{ type: "toolCall", id: "c1", name: "ipython", arguments: { code: "r = await bash('git log')" } },
+			]),
+			true,
+		);
+		turn.state.addStep({
+			toolCallId: "c1",
+			toolName: "ipython",
+			args: { code: "r = await bash('git log')" },
+			status: "queued",
+		});
+		turn.state.setStepStatus("c1", "done", T0 + 1_000);
+		const rows = turn.state.boxView().rows;
+		const say = rows.find((row) => row.kind === "say");
+		const think = rows.find((row) => row.kind === "think");
+		expect(say?.text.length).toBeGreaterThan(0);
+		expect(say?.text.length).toBeLessThanOrEqual(400);
+		expect(think?.text.length).toBeGreaterThan(0);
+		expect(think?.text.length).toBeLessThanOrEqual(400);
+		// Nothing is lost: the whole words are still there to open.
+		expect(say?.fullText?.length).toBe(note.length);
+		const event = turn.state.boxView().events[0];
+		expect(event?.full?.length).toBe(note.length);
+		expect(event?.more).toBe(true);
+	});
+});
