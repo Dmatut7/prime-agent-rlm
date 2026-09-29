@@ -12,7 +12,14 @@ import {
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 } from "../../../core/messages.js";
 import { theme } from "../theme/theme.js";
-import { hoverRow, joinRow, type SubagentLane, type TimelineReturn } from "./agent-message.js";
+import {
+	hoverRow,
+	joinRow,
+	type ReturnKind,
+	type SubagentLane,
+	shortAgentName,
+	type TimelineReturn,
+} from "./agent-message.js";
 import { formatTimelineTime, TIMELINE_CONTENT_COL, timelineRow } from "./timeline-gutter.js";
 import { timelineShowAll } from "./timeline-lane.js";
 import { boxRecordFromMessage, type TimelineNotice } from "./turn-timeline.js";
@@ -81,7 +88,7 @@ export class TimelineNoticeRow implements Component {
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
 		const { back } = this.options;
-		const close = back.joined !== undefined ? [joinRow(back.joined, safeWidth)] : [];
+		const close = back.joined !== undefined ? [joinRow(back.joined, safeWidth, back.tally)] : [];
 		this.regions = [];
 		if (!this.options.shown && !timelineShowAll.value) return close;
 		const failed = this.notice.tone === "error";
@@ -163,6 +170,12 @@ function silenceText(silentMs: number): string {
 	return minutes % 60 === 0 ? `${hours} 小时` : `${hours} 小时 ${minutes % 60} 分钟`;
 }
 
+/** How the subagent a notice is about left the lane: it failed, was cancelled, or finished without a word. */
+function returnKind(message: CustomMessage): ReturnKind {
+	if (message.customType === RLM_CHILD_FAILURE_CUSTOM_TYPE) return "failed";
+	return (message.details as { kind?: unknown } | undefined)?.kind === "cancelled" ? "cancelled" : "silent";
+}
+
 /**
  * The timeline row for a subagent notice (its terminal, failure and stall
  * notices), releasing the subagent from the lane when the notice says it is no
@@ -177,10 +190,10 @@ export function subagentNoticeRow(message: CustomMessage, lane: SubagentLane): T
 	const stillOut = type === RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE || typeof name !== "string";
 	const back: TimelineReturn = stillOut
 		? { before: lane.tracker.lane, after: lane.tracker.lane }
-		: lane.comeBack(name, undefined, Number(message.timestamp) || undefined);
+		: lane.comeBack(name, undefined, Number(message.timestamp) || undefined, returnKind(message));
 	const id = (message.details as { childId?: unknown } | undefined)?.childId;
 	const silentMs = (message.details as { silentMs?: unknown } | undefined)?.silentMs;
-	const who = typeof name === "string" && name.trim() ? `子代理 ${name.trim()}` : "子代理";
+	const who = typeof name === "string" && name.trim() ? `子代理 ${shortAgentName(name.trim())}` : "子代理";
 	const notice: TimelineNotice =
 		type === RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE
 			? {

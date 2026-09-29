@@ -1,7 +1,9 @@
 import { ABORT_TRUNCATION_MARKER, TOOL_ABORT_FALLBACK_MESSAGE } from "@earendil-works/pi-agent-core";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { KernelActivity, KernelMemoryChange } from "../../../core/kernel/shared.js";
+import { previewIpythonCode } from "../../../core/tools/code-preview.js";
 import { type ThemeColor, theme } from "../theme/theme.js";
+import { shortAgentName } from "./agent-message.js";
 import { renderDiffRows, sanitizeDisplayText } from "./diff-rows.js";
 import {
 	aggregateChanges,
@@ -657,6 +659,50 @@ function handedBack(timeline: TurnTimeline): string | undefined {
 	return done > 0 ? `${done} 个已交回` : undefined;
 }
 
+/** The subagent a step row of the kernel's `subagent` record names. */
+function subagentRowName(row: BoxRow): string {
+	return row.text.replace(/^子代理 /, "");
+}
+
+/** The step a cell that only started subagents is: it names them and opens to the code line and what the cell printed. */
+function dispatchStepRow(step: RowStep, dispatched: readonly BoxRow[], output: string | undefined): BoxRow {
+	const names = dispatched.map((row) => shortAgentName(subagentRowName(row)));
+	const running = step.status === "running" || step.status === "queued";
+	const code = argumentCode(step.args);
+	return {
+		key: `step:${step.toolCallId}`,
+		kind: "step",
+		status: running ? "running" : "done",
+		glyph: "✓",
+		glyphColor: "diffAddedText",
+		text: `派出子代理 ${names.join("、")}`,
+		textColor: "activityText",
+		meta: running ? [] : okMeta(undefined),
+		...(step.startedAt !== undefined ? { startedAt: step.startedAt } : {}),
+		...(code || output?.trim()
+			? {
+					detail: (width: number) => [
+						...(code
+							? [
+									theme.fg(
+										"dim",
+										truncateToWidth(`代码  ${previewIpythonCode(code).text}`, Math.max(4, width), "…"),
+									),
+								]
+							: []),
+						...(output?.trim() ? preformatted(output, width) : []),
+					],
+				}
+			: {}),
+	};
+}
+
+/** The source of an ipython cell, when the step carries it. */
+function argumentCode(args: unknown): string | undefined {
+	const code = typeof args === "object" && args !== null ? (args as { code?: unknown }).code : undefined;
+	return typeof code === "string" && code.trim() ? code : undefined;
+}
+
 function errorRow(step: RowStep, data: StepFeedData, timeline: TurnTimeline): BoxRow {
 	const context = { handleCommands: timeline.stepHandleContext.get(step.toolCallId) };
 	const action = stepAction({ toolName: step.toolName, args: step.args }, context);
@@ -1227,6 +1273,7 @@ export function buildTimelineView(
 		const group = current ?? openEvent(`ev:${entryKey}:auto`, at);
 		rows.push({ ...row, groupKey: group.key });
 	};
+	const dispatchedNames = new Set<string>();
 	const snapshotNames = new Set(
 		timeline.entries.flatMap((entry) => (entry.kind === "subagent" ? [entry.sub.name] : [])),
 	);
@@ -1311,10 +1358,18 @@ export function buildTimelineView(
 						status: entry.ended ? "done" : "queued",
 						...(entry.ended ? {} : { streaming: true }),
 					};
-			for (const row of stepRows(step, timeline, ctx, order++)) {
-				// A subagent the session reported live already has its own row.
-				if (row.kind === "subagent" && snapshotNames.has(row.text.replace(/^子代理 /, ""))) continue;
-				place(row, entry.key, at);
+			const cellRows = stepRows(step, timeline, ctx, order++);
+			// A subagent the session reported live already has its own row.
+			const dispatched = cellRows.filter(
+				(row) => row.kind === "subagent" && snapshotNames.has(subagentRowName(row)),
+			);
+			for (const row of cellRows) if (!dispatched.includes(row)) place(row, entry.key, at);
+			// A cell that only dispatched subagents is still a step of its event; one that only mentions
+			// subagents an earlier cell dispatched has nothing of its own to list.
+			const fresh = dispatched.filter((row) => !dispatchedNames.has(subagentRowName(row)));
+			for (const row of dispatched) dispatchedNames.add(subagentRowName(row));
+			if (fresh.length > 0 && dispatched.length === cellRows.length) {
+				place(dispatchStepRow(step, fresh, timeline.stepData.get(step.toolCallId)?.outputText), entry.key, at);
 			}
 		});
 		const message = entry.message;

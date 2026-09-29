@@ -457,7 +457,7 @@ describe("a subagent's notice on the timeline", () => {
 		try {
 			const lines = plain(row?.render(W) ?? []).map((line) => line.trimEnd());
 			expect(lines).toHaveLength(1);
-			expect(lines[0]?.startsWith(" 18:54   ·      子代理 review-grow-C-strip 做完了，没发回消息")).toBe(true);
+			expect(lines[0]?.startsWith(" 18:54   ·      子代理 C 做完了，没发回消息")).toBe(true);
 			expect(lines[0]?.endsWith("▸")).toBe(true);
 			row?.getClickRegions()[0]?.onClick({ row: 0, col: 0 });
 			const opened = plain(row?.render(W) ?? []).map((line) => line.trimEnd());
@@ -473,7 +473,7 @@ describe("a subagent's notice on the timeline", () => {
 		const lane = new SubagentLane();
 		lane.tracker.spawned(["review-grow-C-strip"]);
 		const row = subagentNoticeRow(notice("review-grow-C-strip"), lane);
-		expect(plain(row?.render(W) ?? []).map((line) => line.trimEnd())).toEqual(["         ├──╯   交回了"]);
+		expect(plain(row?.render(W) ?? []).map((line) => line.trimEnd())).toEqual(["         ├──╯   做完了，没发回消息"]);
 		expect(lane.tracker.active).toBe(false);
 		expect(row?.drawsNothing).toBe(false);
 	});
@@ -489,8 +489,8 @@ describe("a subagent's notice on the timeline", () => {
 		const row = subagentNoticeRow(failure, lane);
 		const lines = plain(row?.render(W) ?? []).map((line) => line.trimEnd());
 		expect(lines).toHaveLength(1);
-		expect(lines[0]?.startsWith(" 18:54   │  ◇   子代理 review-grow-C-strip 失败（出错）")).toBe(true);
-		expect(row?.render(W)[0]).toContain(theme.fg("timelineMust", "子代理 review-grow-C-strip 失败（出错）"));
+		expect(lines[0]?.startsWith(" 18:54   │  ◇   子代理 C 失败（出错）")).toBe(true);
+		expect(row?.render(W)[0]).toContain(theme.fg("timelineMust", "子代理 C 失败（出错）"));
 		expect(lane.tracker.pending).toEqual(["review-grow-D-hygiene"]);
 	});
 
@@ -515,8 +515,8 @@ describe("a subagent's notice on the timeline", () => {
 		lane.tracker.spawned(["review-grow-C-strip", "review-grow-D-hygiene"]);
 		const row = subagentNoticeRow(stallNotice(600_000), lane);
 		const lines = plain(row?.render(W) ?? []).map((line) => line.trimEnd());
-		expect(lines).toEqual([" 18:54   ·  ┆   子代理 review-grow-C-strip 已经 10 分钟没动静"]);
-		expect(row?.render(W)[0]).toContain(theme.fg("timelineFix", "子代理 review-grow-C-strip 已经 10 分钟没动静"));
+		expect(lines).toEqual([" 18:54   ·  ┆   子代理 C 已经 10 分钟没动静"]);
+		expect(row?.render(W)[0]).toContain(theme.fg("timelineFix", "子代理 C 已经 10 分钟没动静"));
 		expect(row?.drawsNothing).toBe(false);
 		expect(lane.tracker.pending).toEqual(["review-grow-C-strip", "review-grow-D-hygiene"]);
 	});
@@ -526,11 +526,11 @@ describe("a subagent's notice on the timeline", () => {
 			plain(subagentNoticeRow(stallNotice(silentMs), new SubagentLane())?.render(W) ?? [])[0]
 				?.trimEnd()
 				.slice(16);
-		expect(said(45_000)).toBe("子代理 review-grow-C-strip 已经 45 秒没动静");
-		expect(said(60_000)).toBe("子代理 review-grow-C-strip 已经 1 分钟没动静");
-		expect(said(3_600_000)).toBe("子代理 review-grow-C-strip 已经 1 小时没动静");
-		expect(said(5_400_000)).toBe("子代理 review-grow-C-strip 已经 1 小时 30 分钟没动静");
-		expect(said(undefined)).toBe("子代理 review-grow-C-strip 一阵没动静了");
+		expect(said(45_000)).toBe("子代理 C 已经 45 秒没动静");
+		expect(said(60_000)).toBe("子代理 C 已经 1 分钟没动静");
+		expect(said(3_600_000)).toBe("子代理 C 已经 1 小时没动静");
+		expect(said(5_400_000)).toBe("子代理 C 已经 1 小时 30 分钟没动静");
+		expect(said(undefined)).toBe("子代理 C 一阵没动静了");
 	});
 
 	it("keeps a silent finish and a cancel out of sight without 完整过程", () => {

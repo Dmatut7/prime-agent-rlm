@@ -675,8 +675,8 @@ describe("a line's lane comes from where it sits relative to the dispatch", () =
 		if (options.handedBack) {
 			turn.timeline.upsertSubagent({ childId: "a", name: "A", status: "done" }, T0 + 4 * MINUTE);
 			turn.timeline.upsertSubagent({ childId: "b", name: "B", status: "done" }, T0 + 5 * MINUTE);
-			tracker.reported("A");
-			tracker.reported("B");
+			tracker.reported("A", T0 + 4 * MINUTE);
+			tracker.reported("B", T0 + 5 * MINUTE);
 		}
 		say(turn, T0 + 6 * MINUTE, "都回来了，收尾。", [{ id: "c4", command: "git status" }]);
 		turn.state.markTurnEnded(T0 + 7 * MINUTE);
@@ -708,27 +708,31 @@ describe("a line's lane comes from where it sits relative to the dispatch", () =
 		expect(laneOf(lines, "都回来了")).toBe(" ");
 	});
 
-	it("keeps a turn's lane the same when it is drawn again after the agents come back", () => {
+	it("keeps the lines drawn while the agents were out the same when they are drawn again after the agents come back", () => {
 		const { turn, tracker } = dispatchTurn({ handedBack: false });
 		const first = plain(turn.summary.render(WIDTH));
 		turn.timeline.upsertSubagent({ childId: "a", name: "A", status: "done" }, T0 + 4 * MINUTE);
 		turn.timeline.upsertSubagent({ childId: "b", name: "B", status: "done" }, T0 + 5 * MINUTE);
-		tracker.reported("A");
-		tracker.reported("B");
+		tracker.reported("A", T0 + 4 * MINUTE);
+		tracker.reported("B", T0 + 5 * MINUTE);
 		const second = plain(turn.summary.render(WIDTH));
-		expect(second).toEqual(first);
+		// Everything above the line that came after the hand-back is what it was; that line is off the lane now that its time is known.
+		const closing = first.findIndex((line) => line.includes("都回来了"));
+		expect(closing).toBeGreaterThan(0);
+		expect(second.slice(0, closing)).toEqual(first.slice(0, closing));
+		expect(laneOf(second, "都回来了")).toBe(" ");
 	});
 
 	it("starts a woken turn in the lane its tracker was in when the turn began", () => {
 		const tracker = new TimelineLaneTracker();
-		tracker.spawned(["Z"]);
+		tracker.spawned(["Z"], undefined, T0 - MINUTE);
 		const turn = quietTurn(false);
 		turn.summary.setLaneTracker(tracker);
 		say(turn, T0, "顺手看一下。", [{ id: "c1", command: "git log" }]);
 		turn.state.markTurnEnded(T0 + 5_000);
 		turn.state.finishBox(T0 + 5_000);
 		expect(laneOf(plain(turn.summary.render(WIDTH)), "顺手看一下")).toBe("┆");
-		tracker.reported("Z");
+		tracker.reported("Z", T0 + MINUTE);
 		expect(laneOf(plain(turn.summary.render(WIDTH)), "顺手看一下")).toBe("┆");
 	});
 });

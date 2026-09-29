@@ -1,4 +1,5 @@
 import type { AssistantMessage, AssistantMessageEvent } from "@earendil-works/pi-ai";
+import type { KernelActivity } from "../../../core/kernel/shared.js";
 import {
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CompactionOutcomeDetails,
@@ -10,6 +11,7 @@ import {
 	type RlmChildStallNoticeDetails,
 	type RlmChildTerminalNoticeDetails,
 } from "../../../core/messages.js";
+import { shortAgentName } from "./agent-message.js";
 import { sanitizeDisplayText } from "./diff-rows.js";
 import {
 	emptyStepFeedData,
@@ -20,7 +22,7 @@ import {
 } from "./feed-data.js";
 import { stripInlineMarkdown } from "./inline-markdown.js";
 import type { TimelineLane } from "./timeline-gutter.js";
-import type { LaneOwner, TimelineLaneTracker } from "./timeline-lane.js";
+import type { LaneOwner, LaneSpans, TimelineLaneTracker } from "./timeline-lane.js";
 
 /**
  * Everything one assistant turn's box shows, in the order it happened: the
@@ -200,8 +202,6 @@ export class TimelineUiState {
 	readonly expandedAt = new Map<string, number>();
 	/** The lane the turn started in (subagents of earlier turns still out), taken when the lane tracker was first given. */
 	startLane: TimelineLane | undefined;
-	/** Lines drawn in the lane: once on, a line stays on after the agents have come back. */
-	readonly lanes = new Map<string, TimelineLane>();
 	readonly enteredAt = new Map<string, number>();
 	readonly settledAt = new Map<string, number>();
 	readonly rowStatus = new Map<string, string>();
@@ -322,8 +322,11 @@ export class TurnTimeline implements LaneOwner {
 	finishedAt: number | undefined;
 	/** Steps of this turn the reopen window left out (its box says how many). */
 	earlierSteps = 0;
-	/** Told of every subagent this turn dispatches, as it is noted (not when it is drawn). */
-	laneTracker: TimelineLaneTracker | undefined;
+	/** Who was out when, in the question this turn belongs to: what its lines read the lane from. */
+	laneSpans: LaneSpans | undefined;
+	private tracker: TimelineLaneTracker | undefined;
+	/** The task each subagent record was started with, kept until the record names the child. */
+	private readonly spawnTasks = new Map<string, string>();
 	/** Commands the step's code waits on through a handle, resolved from earlier cells. */
 	readonly stepHandleContext = new Map<string, ReadonlyMap<string, string>>();
 	private seq = 0;
@@ -334,6 +337,16 @@ export class TurnTimeline implements LaneOwner {
 	private nextSeq(): number {
 		this.seq += 1;
 		return this.seq;
+	}
+
+	/** Told of every subagent this turn dispatches, as it is noted (not when it is drawn). */
+	get laneTracker(): TimelineLaneTracker | undefined {
+		return this.tracker;
+	}
+
+	set laneTracker(tracker: TimelineLaneTracker | undefined) {
+		this.tracker = tracker;
+		this.laneSpans = tracker?.spans;
 	}
 
 	/**
@@ -438,17 +451,33 @@ export class TurnTimeline implements LaneOwner {
 	}
 
 	/**
-	 * A cell that started subagents (the kernel tracks each as a `subagent` record named after its
-	 * session) dispatched them, whichever way it did it: the timeline learns of the dispatch from the
-	 * record, once per subagent, when no snapshot has told it already.
+	 * A cell that started subagents (the kernel tracks each as a `subagent` record) dispatched them,
+	 * whichever way it did it. A record first says `running` under the task's own words while the
+	 * child is admitted, then turns `ok` under its session name (or `error` when it never started):
+	 * only a settled record with a name is a subagent, dispatched once, when no snapshot has told
+	 * the timeline already. The task the record began with is kept as the child's task.
 	 */
-	private noteSpawns(activities: ReadonlyArray<{ kind: string; label: string; startedAt: number }>): void {
+	private noteSpawns(activities: readonly KernelActivity[]): void {
 		for (const activity of activities) {
-			const name = activity.kind === "subagent" ? activity.label.trim() : "";
-			if (!name || this.entries.some((entry) => entry.kind === "subagent" && subagentLane(entry.sub) === name))
+			if (activity.kind !== "subagent") continue;
+			if (activity.status === "running") {
+				this.spawnTasks.set(activity.id, activity.label);
 				continue;
+			}
+			const name = activity.status === "ok" ? activity.label.trim() : "";
+			if (!name || this.entries.some((entry) => entry.kind === "subagent" && subagentLane(entry.sub) === name)) {
+				continue;
+			}
+			const task = this.spawnTasks.get(activity.id)?.trim();
 			this.upsertSubagent(
-				{ childId: `spawn:${name}`, name, laneName: name, status: "running", startedAt: activity.startedAt },
+				{
+					childId: `spawn:${name}`,
+					name,
+					laneName: name,
+					...(task ? { label: task } : {}),
+					status: "running",
+					startedAt: activity.startedAt,
+				},
 				activity.startedAt,
 			);
 		}
@@ -461,6 +490,48 @@ export class TurnTimeline implements LaneOwner {
 			entry.sub = { ...entry.sub, status: "done", endedAt: at };
 			this.ui.bump();
 		}
+	}
+
+	spawnedAt(name: string): number | undefined {
+		for (const entry of this.entries) {
+			if (entry.kind === "subagent" && subagentLane(entry.sub) === name) return entry.sub.startedAt;
+		}
+		return undefined;
+	}
+
+	/**
+	 * A rebuild replaced the lane's record with what its replay learned: the subagents this timeline
+	 * still shows as out are out again, unless the replay saw them come back.
+	 */
+	reseedLane(): void {
+		const tracker = this.tracker;
+		// An earlier question's box keeps the lane it was drawn with: nobody of it is out any more.
+		if (!tracker || this.laneSpans !== tracker.spans) return;
+		for (const entry of this.entries) {
+			if (entry.kind !== "subagent" || entry.sub.status !== "running") continue;
+			const name = subagentLane(entry.sub);
+			if (!name) continue;
+			const back = tracker.spans.returnedAt(name);
+			if (back !== undefined && back > entry.sub.startedAt) {
+				entry.sub = { ...entry.sub, status: "done", endedAt: back };
+			} else {
+				tracker.spawned([name], this);
+			}
+		}
+		this.ui.bump();
+	}
+
+	/** The task each child was given, as the session recorded it, for the subagents this timeline knows only by name. */
+	noteTaskLabels(labels: ReadonlyMap<string, string>): void {
+		let changed = false;
+		for (const entry of this.entries) {
+			if (entry.kind !== "subagent" || entry.sub.label !== undefined) continue;
+			const label = labels.get(subagentLane(entry.sub));
+			if (!label) continue;
+			entry.sub = { ...entry.sub, label };
+			changed = true;
+		}
+		if (changed) this.ui.bump();
 	}
 
 	addSteer(text: string, at: number): void {
@@ -713,7 +784,6 @@ export class TurnTimeline implements LaneOwner {
 		next.ui.primed = ui.primed;
 		next.ui.stripOpen = ui.stripOpen;
 		for (const key of ui.expanded) next.ui.expanded.add(key);
-		for (const [key, lane] of ui.lanes) next.ui.lanes.set(key, lane);
 		next.ui.startLane = ui.startLane;
 		for (const key of ui.stripExpanded) next.ui.stripExpanded.add(key);
 		for (const [key, status] of ui.rowStatus) next.ui.rowStatus.set(key, status);
@@ -811,6 +881,12 @@ export function compactionMissText(event: { errorMessage?: string; errorSeverity
 	);
 }
 
+/** How a system line names a subagent: as short as its dispatch and return rows do. */
+function noticeName(sessionName: string | undefined): string {
+	const name = sanitizeDisplayText(sessionName ?? "").trim();
+	return name ? shortAgentName(name) : "子代理";
+}
+
 function childFailureWhy(details: RlmChildFailureDetails | undefined): string {
 	const kind = details?.kind;
 	if (kind === "stall_killed") return "长时间没动静，被自动终止";
@@ -831,7 +907,7 @@ export function boxRecordFromMessage(
 	| undefined {
 	if (message.customType === RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE) {
 		const details = message.details as RlmChildTerminalNoticeDetails | undefined;
-		const name = sanitizeDisplayText(details?.sessionName ?? "").trim() || "子代理";
+		const name = noticeName(details?.sessionName);
 		if (details?.kind === "cancelled") {
 			const reason = details.reason ? `：${sanitizeDisplayText(details.reason).split("\n")[0]}` : "";
 			return { kind: "notice", notice: { tone: "muted", text: `子代理 ${name} 已取消${reason}` } };
@@ -849,7 +925,7 @@ export function boxRecordFromMessage(
 	}
 	if (message.customType === RLM_CHILD_FAILURE_CUSTOM_TYPE) {
 		const details = message.details as RlmChildFailureDetails | undefined;
-		const name = sanitizeDisplayText(details?.sessionName ?? "").trim() || "子代理";
+		const name = noticeName(details?.sessionName);
 		const error = details?.error?.trim();
 		return {
 			kind: "notice",
@@ -862,7 +938,7 @@ export function boxRecordFromMessage(
 	}
 	if (message.customType === RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE) {
 		const details = message.details as RlmChildStallNoticeDetails | undefined;
-		const name = sanitizeDisplayText(details?.sessionName ?? "").trim() || "子代理";
+		const name = noticeName(details?.sessionName);
 		const quiet = details?.silentMs ? `，已经 ${formatBoxDuration(details.silentMs)}没动静` : "，一阵没动静了";
 		return { kind: "notice", notice: { tone: "warn", text: `子代理 ${name} 还在跑${quiet}` } };
 	}

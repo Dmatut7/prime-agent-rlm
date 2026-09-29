@@ -428,8 +428,10 @@ describe("the subagent lane while a request runs", () => {
 		chat.wakeByNotice("review-grow-A-tui", { answer: undefined });
 		expect(chat.flow.subagentLane.tracker.active).toBe(false);
 		const rows = plain(chat.lines()).map((line) => line.trimEnd());
-		expect(rows.some((line) => line.includes("子代理 review-grow-C-strip 失败（出错）"))).toBe(true);
-		expect(rows.filter((line) => line === "         ├──╯   两个都交回了")).toHaveLength(1);
+		expect(rows.some((line) => line.includes("子代理 C 失败（出错）"))).toBe(true);
+		expect(rows.filter((line) => line === "         ├──╯   两个都回来了（1 个失败，1 个没发回消息）")).toHaveLength(
+			1,
+		);
 		chat.flow.dispose();
 	});
 });

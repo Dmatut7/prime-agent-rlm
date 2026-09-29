@@ -190,7 +190,7 @@ describe("the mode's own replay of a conversation subagents woke", () => {
 		expect(text).not.toContain("RLM child");
 		timelineShowAll.set(true);
 		const all = plain(host.chatContainer.children.flatMap((child) => child.render(100))).join("\n");
-		expect(all).toContain("子代理 review-grow-C-strip 做完了，没发回消息");
+		expect(all).toContain("子代理 C 做完了，没发回消息");
 	});
 
 	it("puts a report that lands inside the tool loop in the turn it interrupts", async () => {

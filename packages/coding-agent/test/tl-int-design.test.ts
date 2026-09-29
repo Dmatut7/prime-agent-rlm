@@ -229,10 +229,11 @@ function finishedReview(): LiveChat {
 	vi.setSystemTime(at(19, 7));
 	chat.endRun();
 	vi.advanceTimersByTime(1000);
-	// The design shows the second event and the memory opened, the first event closed.
+	// The design shows the event of the AI's own checks and the memory opened, the first two events closed
+	// (the second one's only step is the dispatch cell).
 	const summary = chat.summaries()[0]!;
 	summary.render(W);
-	summary.activate(summary.getFocusOrder().filter((key) => key.startsWith("ev:"))[1] ?? "");
+	summary.activate(summary.getFocusOrder().filter((key) => key.startsWith("ev:"))[2] ?? "");
 	const strip = chat.flow.stripFor(summary)!;
 	strip.render(W);
 	strip.activate(strip.getFocusOrder().find((key) => key.startsWith("strip:item:mem")) ?? "");
@@ -256,7 +257,7 @@ function runningReview(): LiveChat {
 	vi.setSystemTime(at(18, 57, 12));
 	const summary = chat.summaries()[0]!;
 	summary.render(W);
-	summary.activate(summary.getFocusOrder().filter((key) => key.startsWith("ev:"))[1] ?? "");
+	summary.activate(summary.getFocusOrder().filter((key) => key.startsWith("ev:"))[2] ?? "");
 	return chat;
 }
 
@@ -286,7 +287,7 @@ const DONE_ROWS = [
 	gap("off"),
 	gap("off"),
 	drow("18:47", "◆", "off", "先看最近的提交，定下审查范围。", "2 步 ▸"),
-	drow("18:48", "◆", "off", "范围定了：16 个提交、96 个文件。派四个代理并行审查。"),
+	drow("18:48", "◆", "off", "范围定了：16 个提交、96 个文件。派四个代理并行审查。", "1 步 ▸"),
 	drow("", "├", "split", "◇  A 钉住框头   B 框的折叠   C 子代理小块   D 测试和发版"),
 	gap("on"),
 	drow("18:50", "◆", "on", "趁它们干活，我自己跑检查和测试。", "24 步 ▴"),
@@ -419,7 +420,7 @@ describe("Tl2Live: the review, one subagent back, the AI at its checks", () => {
 			gap("off"),
 			gap("off"),
 			drow("18:47", "◆", "off", "先看最近的提交，定下审查范围。", "2 步 ▸"),
-			drow("18:48", "◆", "off", "范围定了：16 个提交、96 个文件。派四个代理并行审查。"),
+			drow("18:48", "◆", "off", "范围定了：16 个提交、96 个文件。派四个代理并行审查。", "1 步 ▸"),
 			drow("", "├", "split", "◇  A 钉住框头   B 框的折叠   C 子代理小块   D 测试和发版"),
 			gap("on"),
 			// 11 commands, the running one and its thought
@@ -431,7 +432,7 @@ describe("Tl2Live: the review, one subagent back, the AI at its checks", () => {
 			gap("on"),
 			verdict("18:54", "B", "框的长高和折叠", "没问题（7 条小建议）"),
 			gap("on"),
-			drow("18:57", "⠹", "on", "正在查：那 4 个测试失败是不是颜色的问题", "第 15 步"),
+			drow("18:57", "⠹", "on", "正在查：那 4 个测试失败是不是颜色的问题", "第 16 步"),
 			drow("", "╎", "on", "     在跑  npx vitest --run test/grow-bottom-tui.test.ts", "12秒  "),
 			drow("", "╎", "on"),
 			drow("", " ", "on", "A、C、D 还在干活"),

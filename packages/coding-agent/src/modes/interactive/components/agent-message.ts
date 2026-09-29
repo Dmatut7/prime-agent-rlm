@@ -11,7 +11,7 @@ import {
 import type { AgentSessionMessage } from "../../../core/agent-messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import { formatTimelineTime, TIMELINE_CONTENT_COL, type TimelineLane, timelineRow } from "./timeline-gutter.js";
-import { TimelineLaneTracker } from "./timeline-lane.js";
+import { type LaneSnapshot, TimelineLaneTracker } from "./timeline-lane.js";
 
 function collapseText(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
@@ -136,6 +136,29 @@ export function laneKey(sessionName?: string, fallback?: string): string {
 	return sessionName?.trim() || fallback?.trim() || "";
 }
 
+/** How a subagent left the lane: it handed a report back, failed, finished without a word, or was cancelled. */
+export type ReturnKind = "report" | "failed" | "silent" | "cancelled";
+
+/** Of the subagents that came back in a round, how many did so without handing a report back. */
+export interface ReturnTally {
+	failed: number;
+	silent: number;
+	cancelled: number;
+}
+
+const NO_TALLY: ReturnTally = { failed: 0, silent: 0, cancelled: 0 };
+
+function hasTally(tally: ReturnTally): boolean {
+	return tally.failed > 0 || tally.silent > 0 || tally.cancelled > 0;
+}
+
+/** What a lane knew at some moment: who was out, and how far the round that closes it had counted. */
+export interface SubagentLaneSnapshot {
+	lane: LaneSnapshot;
+	back: number;
+	tally: ReturnTally;
+}
+
 /**
  * Which subagents of a question are still out, and how many came back in this
  * round: the tracker draws the lane, the count words the row that closes it.
@@ -143,23 +166,61 @@ export function laneKey(sessionName?: string, fallback?: string): string {
 export class SubagentLane {
 	readonly tracker = new TimelineLaneTracker();
 	private back = 0;
+	private tally: ReturnTally = { ...NO_TALLY };
 
-	/** A subagent handed back a report, failed or finished without a word, named the way {@link laneKey} reads. */
-	comeBack(sessionName: string | undefined, fallback?: string, at?: number): TimelineReturn {
+	/**
+	 * A subagent handed back a report, failed or finished without a word (`kind`), named the way
+	 * {@link laneKey} reads. A name that was not out has its return kept and joins nothing.
+	 */
+	comeBack(
+		sessionName: string | undefined,
+		fallback?: string,
+		at?: number,
+		kind: ReturnKind = "report",
+	): TimelineReturn {
 		const name = laneKey(sessionName, fallback);
 		const wasOut = name !== "" && this.tracker.pending.includes(name);
 		const before = this.tracker.lane;
+		if (name !== "" && !wasOut) this.tracker.noteReturned(name, at);
 		const result = wasOut ? this.tracker.reported(name, at) : this.tracker.lane;
-		if (wasOut) this.back += 1;
+		if (wasOut) {
+			this.back += 1;
+			if (kind !== "report") this.tally[kind] += 1;
+		}
 		const joined = wasOut && result === "join" ? this.back : undefined;
-		if (joined !== undefined) this.back = 0;
-		return { before, after: this.tracker.lane, ...(joined !== undefined ? { joined } : {}) };
+		const tally = joined !== undefined && hasTally(this.tally) ? { ...this.tally } : undefined;
+		if (joined !== undefined) {
+			this.back = 0;
+			this.tally = { ...NO_TALLY };
+		}
+		return {
+			before,
+			after: this.tracker.lane,
+			...(joined !== undefined ? { joined } : {}),
+			...(tally ? { tally } : {}),
+		};
 	}
 
 	/** A new question starts: nobody is out. */
 	reset(): void {
 		this.tracker.reset();
 		this.back = 0;
+		this.tally = { ...NO_TALLY };
+	}
+
+	snapshot(): SubagentLaneSnapshot {
+		return { lane: this.tracker.snapshot(), back: this.back, tally: { ...this.tally } };
+	}
+
+	/** Take back what a rebuild's replay could not see of the question's lane (`since`: when that question began). */
+	restore(previous: SubagentLaneSnapshot, since?: number): void {
+		this.tracker.restore(previous.lane, since);
+		this.back = Math.max(this.back, previous.back);
+		this.tally = {
+			failed: Math.max(this.tally.failed, previous.tally.failed),
+			silent: Math.max(this.tally.silent, previous.tally.silent),
+			cancelled: Math.max(this.tally.cancelled, previous.tally.cancelled),
+		};
 	}
 }
 
@@ -171,19 +232,34 @@ export interface TimelineReturn {
 	after: TimelineLane;
 	/** It was the last one out: how many came back, for the row that closes the lane. */
 	joined?: number;
+	/** With `joined`: how many of them did not hand a report back (absent when all did). */
+	tally?: ReturnTally;
 }
 
 const NUMERALS = ["", "一", "两", "三", "四", "五", "六", "七", "八", "九", "十"];
 
-/** `四个都交回了`, `交回了` for a lone subagent. */
-export function joinText(count: number): string {
-	if (count <= 1) return "交回了";
-	return `${NUMERALS[count] ?? String(count)}个都交回了`;
+/**
+ * `四个都交回了`, `交回了` for a lone subagent. When some did not hand a report back the row says so:
+ * `四个都回来了（1 个失败，1 个没发回消息）`, and a lone one says what it did (`失败了`).
+ */
+export function joinText(count: number, tally?: ReturnTally): string {
+	const parts: string[] = [];
+	if (tally && tally.failed > 0) parts.push(`${tally.failed} 个失败`);
+	if (tally && tally.silent > 0) parts.push(`${tally.silent} 个没发回消息`);
+	if (tally && tally.cancelled > 0) parts.push(`${tally.cancelled} 个已取消`);
+	if (count <= 1) {
+		if (tally && tally.failed > 0) return "失败了";
+		if (tally && tally.silent > 0) return "做完了，没发回消息";
+		if (tally && tally.cancelled > 0) return "已取消";
+		return "交回了";
+	}
+	const number = NUMERALS[count] ?? String(count);
+	return parts.length > 0 ? `${number}个都回来了（${parts.join("，")}）` : `${number}个都交回了`;
 }
 
 /** The row that closes the lane once the last subagent is back. */
-export function joinRow(count: number, width: number): string {
-	return timelineRow({ main: "join", lane: "join" }, theme.fg("timelineFaint", joinText(count)), "", width);
+export function joinRow(count: number, width: number, tally?: ReturnTally): string {
+	return timelineRow({ main: "join", lane: "join" }, theme.fg("timelineFaint", joinText(count, tally)), "", width);
 }
 
 /** Paint a whole row on the pointer's background. */
@@ -277,7 +353,7 @@ export class AgentMessageComponent extends Container {
 		rows.push(this.hovered ? hoverRow(head, safeWidth) : head);
 		const body = this.timelineBody(safeWidth, timeline.after);
 		if (this.expanded) rows.push(...body);
-		if (timeline.joined !== undefined) rows.push(joinRow(timeline.joined, safeWidth));
+		if (timeline.joined !== undefined) rows.push(joinRow(timeline.joined, safeWidth, timeline.tally));
 		const opens = body.length;
 		this.clickRegions = [
 			{
