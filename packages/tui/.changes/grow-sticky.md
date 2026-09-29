@@ -1,0 +1,1 @@
+- Added a pinned box header in the fullscreen view: when a box is taller than the screen, its header stays at the top of the window while you scroll through it, and clicking it collapses the box.

@@ -278,6 +278,7 @@ interface AggregatedLines {
 	lines: string[];
 	selectionRegions: TableCellSelectionRegion[];
 	clickRegions: ClickRegion[];
+	stickyHeaders: StickyHeader[];
 }
 
 /**
@@ -314,6 +315,7 @@ class LineAggregator {
 		const lines: string[] = [];
 		const selectionRegions: TableCellSelectionRegion[] = [];
 		const clickRegions: ClickRegion[] = [];
+		const stickyHeaders: StickyHeader[] = [];
 		for (const { component, lines: componentLines } of rendered) {
 			const lineOffset = lines.length;
 			for (const region of component.getSelectionRegions?.() ?? []) {
@@ -327,6 +329,14 @@ class LineAggregator {
 			for (const region of component.getClickRegions?.() ?? []) {
 				clickRegions.push({ ...region, line: region.line + lineOffset });
 			}
+			for (const header of component.getStickyHeaders?.() ?? []) {
+				stickyHeaders.push({
+					line: header.line + lineOffset,
+					endLine: header.endLine + lineOffset,
+					render: (scrolledPast) => header.render(scrolledPast),
+					regions: header.regions,
+				});
+			}
 			for (const line of componentLines) {
 				lines.push(line);
 			}
@@ -334,7 +344,7 @@ class LineAggregator {
 
 		this.width = width;
 		this.outputs = rendered.map((entry) => entry.lines);
-		this.aggregated = { lines, selectionRegions, clickRegions };
+		this.aggregated = { lines, selectionRegions, clickRegions, stickyHeaders };
 		return this.aggregated;
 	}
 }
@@ -347,11 +357,13 @@ export class Container implements Component {
 	private selectionRegions: TableCellSelectionRegion[] = [];
 	private readonly aggregator = new LineAggregator();
 	protected clickRegions: ClickRegion[] = [];
+	protected stickyHeaders: StickyHeader[] = [];
 
 	addChild(component: Component): void {
 		this.children.push(component);
 		this.selectionRegions = [];
 		this.clickRegions = [];
+		this.stickyHeaders = [];
 	}
 
 	removeChild(component: Component): void {
@@ -360,6 +372,7 @@ export class Container implements Component {
 			this.children.splice(index, 1);
 			this.selectionRegions = [];
 			this.clickRegions = [];
+			this.stickyHeaders = [];
 		}
 	}
 
@@ -367,6 +380,7 @@ export class Container implements Component {
 		this.children = [];
 		this.selectionRegions = [];
 		this.clickRegions = [];
+		this.stickyHeaders = [];
 	}
 
 	invalidate(): void {
@@ -378,9 +392,10 @@ export class Container implements Component {
 	}
 
 	render(width: number): string[] {
-		const { lines, selectionRegions, clickRegions } = this.aggregator.aggregate(this.children, width);
+		const { lines, selectionRegions, clickRegions, stickyHeaders } = this.aggregator.aggregate(this.children, width);
 		this.selectionRegions = selectionRegions;
 		this.clickRegions = clickRegions;
+		this.stickyHeaders = stickyHeaders;
 		return lines;
 	}
 
@@ -390,6 +405,10 @@ export class Container implements Component {
 
 	getClickRegions(): ReadonlyArray<ClickRegion> {
 		return this.clickRegions;
+	}
+
+	getStickyHeaders(): ReadonlyArray<StickyHeader> {
+		return this.stickyHeaders;
 	}
 }
 
@@ -1352,11 +1371,11 @@ export class TUI extends Container {
 		// A focused component that pages its own content takes the page keys.
 		const pagesItself = this.focusedComponent?.wantsPageKeys === true;
 		if (!pagesItself && keybindings.matches(data, "tui.viewport.pageUp")) {
-			this.scrollBy(-fullscreen.viewport.pageSize());
+			this.scrollBy(-fullscreen.viewport.pageSize(-1));
 			return true;
 		}
 		if (!pagesItself && keybindings.matches(data, "tui.viewport.pageDown")) {
-			this.scrollBy(fullscreen.viewport.pageSize());
+			this.scrollBy(fullscreen.viewport.pageSize(1));
 			return true;
 		}
 		if (keybindings.matches(data, "tui.viewport.top")) {
@@ -1378,8 +1397,11 @@ export class TUI extends Container {
 		// What the click opens renders below the clicked row: keep that row under
 		// the pointer instead of letting follow mode pull it up by the new rows.
 		const revealBelow = pressed.region.revealBelow ?? 0;
-		if (revealBelow > 0 && !this.isFullscreenOverlayFocused()) {
-			this.fullscreen?.viewport.holdForClick(row, revealBelow);
+		const viewport = this.fullscreen?.viewport;
+		if (viewport && !this.isFullscreenOverlayFocused()) {
+			// A pinned header's box may shrink or vanish under the window: keep the header row in view.
+			if (viewport.isPinnedRow(row)) viewport.holdForPinnedHeader();
+			else if (revealBelow > 0) viewport.holdForClick(row, revealBelow);
 		}
 		pressed.region.onClick({ row: row - pressed.anchor, col: col - pressed.region.col });
 		this.requestRender();
@@ -1933,6 +1955,7 @@ export class TUI extends Container {
 		let transcript: string[] = [];
 		let selectionRegions: TableCellSelectionRegion[] = [];
 		let transcriptClickRegions: ClickRegion[] = [];
+		let stickyHeaders: StickyHeader[] = [];
 		let dockClickRegions: ClickRegion[] = [];
 		let headerClickRegions: ClickRegion[] = [];
 		const dock = withFullscreenImageFallback(() => {
@@ -1942,6 +1965,7 @@ export class TUI extends Container {
 			transcript = aggregated.lines;
 			selectionRegions = aggregated.selectionRegions;
 			transcriptClickRegions = aggregated.clickRegions;
+			stickyHeaders = aggregated.stickyHeaders;
 			const dockLines = fullscreen.dock.render(width);
 			dockClickRegions = [...(fullscreen.dock.getClickRegions?.() ?? [])];
 			return dockLines;
@@ -1952,6 +1976,7 @@ export class TUI extends Container {
 			return headerLines;
 		});
 
+		fullscreen.viewport.setStickyHeaders(stickyHeaders, width);
 		let frame = fullscreen.viewport.composeFrame(transcript, dock, height, selectionRegions, header);
 		// Project component-space regions onto visible frame rows through the
 		// same header/window/dock layout composeFrame just established. Regions
@@ -1973,6 +1998,17 @@ export class TUI extends Container {
 		);
 		projectRegions(dockClickRegions, (line, height) => fullscreen.viewport.projectDockRegion(line, height));
 		fullscreen.viewport.setFrameClickRegions(frameClickEntries);
+		const pinned = fullscreen.viewport.pinnedRows();
+		if (pinned) {
+			// Painted over the transcript: clicks on those rows belong to the pinned header, not to what it hides.
+			for (let row = pinned.firstRow; row < pinned.firstRow + pinned.count; row++) {
+				fullscreen.viewport.subtractFrameClickCoverage(row, 0, width);
+			}
+			for (const region of pinned.regions) {
+				const rows = fullscreen.viewport.projectPinnedRegion(region.line, region.height);
+				if (rows) fullscreen.viewport.addFrameClickEntry({ region, ...rows });
+			}
+		}
 		this.overlaySelectionRegions.push(
 			...this.createDockSelectionRegions(
 				frame,
