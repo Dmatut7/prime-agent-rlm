@@ -7,6 +7,7 @@ import { buildConversationComponents } from "../src/modes/interactive/components
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { theme } from "../src/modes/interactive/theme/theme.js";
+import { headerPlain, headerRaw } from "./grow-box-helpers.js";
 import {
 	addClosingAnswer,
 	addCommand,
@@ -66,7 +67,7 @@ function finish(turn: QuietTurn): void {
 	turn.state.finishBox(Date.now());
 }
 
-const headerLine = (turn: QuietTurn) => plain(turn.summary.render(WIDTH))[2] ?? "";
+const headerLine = (turn: QuietTurn) => headerPlain(turn.summary.render(WIDTH));
 
 describe("a mistake the turn corrected itself", () => {
 	it("goes into the box header as `出错 N 次，已改正` in the recovered color, and leaves no red row hanging outside", () => {
@@ -75,7 +76,7 @@ describe("a mistake the turn corrected itself", () => {
 		const closed = turn.summary.render(WIDTH);
 		expect(headerLine(turn)).toContain("跑了 1 条命令 · 出错 1 次，已改正");
 		expect(headerLine(turn)).not.toContain("处出错");
-		expect(closed[2]).toContain(theme.fg("kindRecovered", "出错 1 次，已改正"));
+		expect(headerRaw(closed)).toContain(theme.fg("kindRecovered", "出错 1 次，已改正"));
 		expect(text(closed)).not.toContain(ERROR_TEXT);
 		expect(turn.summary.getFocusOrder()).toEqual(["header"]);
 	});
@@ -230,7 +231,7 @@ describe("a turn cut off after a failed step corrected nothing", () => {
 			assistant(T0 + 5_000, [{ type: "text", text: "改好了。" }], "stop"),
 		]);
 		const closed = summary.render(WIDTH);
-		expect(plain(closed)[2]).toContain("出错 1 次，已改正");
+		expect(headerPlain(closed)).toContain("出错 1 次，已改正");
 		expect(text(closed)).not.toContain("command failed exit 1");
 	});
 

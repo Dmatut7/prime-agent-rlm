@@ -1,13 +1,13 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai";
 import { setKeybindings, type TUI } from "@earendil-works/pi-tui";
-import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { headerPlain } from "./grow-box-helpers.js";
 
 const T0 = 1_700_000_000_000;
 
@@ -48,8 +48,6 @@ function toolResult(id: string, timestamp: number): ToolResultMessage {
 	};
 }
 
-const plain = (lines: readonly string[]) => lines.map((line) => stripAnsi(line).replace(/\x1b_[^\x07]*\x07/g, ""));
-
 /** The box header line of the one turn a replay of `messages` builds. */
 function replayedHeader(messages: AgentMessage[]): string {
 	const components = buildConversationComponents(messages, {
@@ -61,8 +59,7 @@ function replayedHeader(messages: AgentMessage[]): string {
 	});
 	const summaries = components.filter((component) => component instanceof TurnSummaryComponent);
 	expect(summaries).toHaveLength(1);
-	// Line 0 is the `◆ prime` line and line 1 the box's top rule.
-	return plain((summaries[0] as TurnSummaryComponent).render(120))[2] ?? "";
+	return headerPlain((summaries[0] as TurnSummaryComponent).render(120));
 }
 
 beforeAll(() => {

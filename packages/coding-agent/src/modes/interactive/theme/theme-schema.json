@@ -419,6 +419,50 @@
 					"$ref": "#/$defs/colorValue",
 					"description": "Border of the timeline box while the turn runs (optional)"
 				},
+				"boxHeadBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Background of a finished turn's box header row (optional)"
+				},
+				"boxHeadLiveBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Background of the box header row while the turn runs (optional)"
+				},
+				"boxHeadHoverBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Background of the box header row under the pointer or keyboard focus (optional)"
+				},
+				"boxPillLive": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Text of the running status pill in the box header (optional)"
+				},
+				"boxPillLiveBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Background of the running status pill in the box header (optional)"
+				},
+				"boxPillDone": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Text of the finished status pill in the box header (optional)"
+				},
+				"boxPillDoneBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Background of the finished status pill in the box header (optional)"
+				},
+				"boxPillStopped": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Text of the stopped status pill in the box header (optional)"
+				},
+				"boxPillStoppedBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Background of the stopped status pill in the box header (optional)"
+				},
+				"boxPillError": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Text of the failed status pill in the box header (optional)"
+				},
+				"boxPillErrorBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Background of the failed status pill in the box header (optional)"
+				},
 				"kindThink": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Glyph and accent of a thinking step in a turn's timeline (optional)"

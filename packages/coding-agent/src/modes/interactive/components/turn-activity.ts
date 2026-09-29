@@ -1,4 +1,10 @@
-import { type ClickRegion, type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	type ClickRegion,
+	type Component,
+	type StickyHeader,
+	truncateToWidth,
+	visibleWidth,
+} from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
 import { getSpinnerTick } from "../theme/working-icon.js";
 import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock } from "./block-focus.js";
@@ -6,7 +12,7 @@ import type { FileChangeSummary } from "./edit-summary.js";
 import { takeMotionActive } from "./motion.js";
 import { renderAssistantHeader } from "./running-card.js";
 import { type BoxRow, buildTimelineRows, type RowStep, type TimelineFacts, timelineFacts } from "./timeline-rows.js";
-import { boxBodyRows, computeBoxHeader, renderTurnBox } from "./turn-box.js";
+import { boxBodyRows, computeBoxHeader, ROW_MOTION_MAX_ROWS, renderStickyHint, renderTurnBox } from "./turn-box.js";
 import { TurnTimeline } from "./turn-timeline.js";
 
 export type TurnStepStatus = "queued" | "running" | "done" | "error";
@@ -51,8 +57,14 @@ export const PROCESS_FOLD_EDGE = 3;
 /** What a turn's box reads from its host: the working directory, the screen height, the box settings. */
 export interface TimelineHost {
 	cwd(): string;
-	/** Terminal rows; the box body's height follows it. */
+	/** Terminal rows; the inline box body's height follows it, and an opened row never reveals more than a screen. */
 	viewportRows(): number;
+	/**
+	 * The box may grow with its content (the fullscreen window scrolls the page). Absent or false: the
+	 * body keeps a fixed height and scrolls inside the frame, because an inline screen redraws whole
+	 * whenever a row above its bottom changes and a box taller than the screen would flicker.
+	 */
+	growBox?(): boolean;
 	/** `ui.timelineOpenWhileWorking`: a running turn's box starts open. */
 	openWhileWorking(): boolean;
 	/** `ui.timelineAutoFold`: a finished turn's box folds on its own unless the user opened or closed it. */
@@ -254,6 +266,7 @@ export class TurnActivityState {
 			if (ui.userOpen === !collapsed && this.boxOpen === !collapsed) return;
 			const opening = collapsed === false && !this.boxOpen;
 			ui.userOpen = !collapsed;
+			ui.userOpenWhileLive = this.boxLive;
 			ui.foldStartedAt = undefined;
 			if (opening) {
 				ui.openedAt = Date.now();
@@ -276,11 +289,16 @@ export class TurnActivityState {
 		return this.turnEndedAt === undefined || (this.timeline.observedLive && this.timeline.finishedAt === undefined);
 	}
 
-	/** Whether the box body shows: what the user chose, else the open/fold settings. */
+	/**
+	 * Whether the box body shows: what the user chose, else the open/fold settings. An opening the
+	 * user made while the turn still ran lapses when it ends, so a finished box folds unless they
+	 * open it again; a closing stays.
+	 */
 	get boxOpen(): boolean {
 		const ui = this.timeline.ui;
-		if (ui.userOpen !== undefined) return ui.userOpen;
-		if (this.boxLive) return this.host.openWhileWorking();
+		const live = this.boxLive;
+		if (ui.userOpen !== undefined && !(ui.userOpen && ui.userOpenWhileLive && !live)) return ui.userOpen;
+		if (live) return this.host.openWhileWorking();
 		if (this.timeline.observedLive) return this.host.openWhileWorking() && !this.host.autoFold();
 		return false;
 	}
@@ -294,7 +312,8 @@ export class TurnActivityState {
 		if (timeline.finishedAt !== undefined) return;
 		const wasOpen = this.boxOpen;
 		timeline.finishedAt = now;
-		if (wasOpen && !this.boxOpen) {
+		// A body of a few rows folds row by row; a page of them just closes.
+		if (wasOpen && !this.boxOpen && timeline.ui.lastVisible <= ROW_MOTION_MAX_ROWS) {
 			timeline.ui.foldStartedAt = now;
 			timeline.ui.foldFromRows = Math.max(1, timeline.ui.lastVisible);
 		}
@@ -684,6 +703,22 @@ export class TurnActivityState {
 	}
 }
 
+/** Rows a pinned header covers at the top of the window: the header card and its hint. */
+const PINNED_ROWS = 2;
+
+/** An open box's header as the last render drew it, in the component's own line numbers. */
+interface PinnedHeader {
+	line: number;
+	endLine: number;
+	headerText: string;
+	/** First line of each block the box shows. */
+	blockLines: number[];
+	width: number;
+	focused: boolean;
+	live: boolean;
+	regions: ClickRegion[];
+}
+
 export class TurnSummaryComponent implements Component, FocusableBlock {
 	private blockFocus?: BlockFocusState;
 	private cachedWidth?: number;
@@ -694,6 +729,8 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	/** Told after a click flipped a lane, so the host applies it to the turn's rows. */
 	private onLanesChange?: () => void;
 	private boxRegions: ClickRegion[] = [];
+	/** What the pinned copy of an open box's header repeats, taken from the last render. */
+	private pinned: PinnedHeader | undefined;
 	private boxFocusOrder: string[] = [];
 	private boxCacheKey: string | undefined;
 	/** The `◆ prime  <model>` line above the box; a woken turn under the same title leaves it out. */
@@ -735,6 +772,31 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	/** The box's click regions: the `◆ prime` line and the box header toggle the box, rows toggle themselves. */
 	getClickRegions(): ReadonlyArray<ClickRegion> {
 		return this.quiet ? this.boxRegions : [];
+	}
+
+	/**
+	 * The open box's header, for the fullscreen window to keep on screen while the box's rows scroll
+	 * under the top edge: the header card as it is drawn here, and under it what is out of sight.
+	 */
+	getStickyHeaders(): ReadonlyArray<StickyHeader> {
+		const pinned = this.pinned;
+		if (!this.quiet || !pinned) return [];
+		return [
+			{
+				line: pinned.line,
+				endLine: pinned.endLine,
+				render: (scrolledPast) => {
+					// The pinned rows cover the two rows at the window's top: every block that starts above them is out of sight.
+					const covered = pinned.line + Math.max(0, scrolledPast) + PINNED_ROWS;
+					const hiddenSteps = pinned.blockLines.filter((line) => line < covered).length;
+					return [
+						pinned.headerText,
+						renderStickyHint({ width: pinned.width, hiddenSteps, focused: pinned.focused, live: pinned.live }),
+					];
+				},
+				regions: pinned.regions,
+			},
+		];
 	}
 
 	/** Keyboard targets of the box, top to bottom (`header`, then row keys). */
@@ -901,7 +963,8 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		const ui = state.timeline.ui;
 		// The finished box's view has its own key (steps, entries, how it ended, cwd, hideThinking).
 		const view = state.boxView(now);
-		const cacheKey = `${width}:${viewportRows}:${ui.version}:${state.boxOpen}:${this.headerShown}:${this.leadingBlank}:${state.boxViewKey()}`;
+		const grow = host.growBox?.() ?? false;
+		const cacheKey = `${width}:${viewportRows}:${grow}:${ui.version}:${state.boxOpen}:${this.headerShown}:${this.leadingBlank}:${state.boxViewKey()}`;
 		if (this.cachedLines && this.boxCacheKey === cacheKey) return this.cachedLines;
 		takeMotionActive();
 		const header = computeBoxHeader({
@@ -922,7 +985,9 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 			tick: getSpinnerTick(),
 			live: view.live,
 			open: state.boxOpen,
+			grow,
 			maxBodyRows: boxBodyRows(viewportRows),
+			revealRows: viewportRows,
 			durationMs: state.turnDurationMs(now),
 			tokens: state.timeline.outputTokens(),
 			onToggleBox: () => this.toggleBox(),
@@ -955,6 +1020,20 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		}
 		regions.push(...box.regions.map((region) => ({ ...region, line: region.line + above.length })));
 		this.boxRegions = regions;
+		const headerRegion = box.regions[0];
+		this.pinned =
+			state.boxOpen && headerRegion
+				? {
+						line: above.length + box.header.line,
+						endLine: above.length + box.lines.length - 1,
+						headerText: box.header.text,
+						blockLines: box.blockHeads.map((line) => line + above.length),
+						width,
+						focused: ui.focused,
+						live: view.live,
+						regions: [{ ...headerRegion, line: 0, revealBelow: 0 }],
+					}
+				: undefined;
 		const lines = [...above, ...box.lines];
 		const animating = takeMotionActive();
 		if (!view.live && !animating) {

@@ -10,6 +10,7 @@ import { TurnActivityState, TurnSummaryComponent } from "../src/modes/interactiv
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { headerPlain } from "./grow-box-helpers.js";
 
 /**
  * Block navigation (Alt+Up) driven through a real TUI on a virtual terminal:
@@ -429,12 +430,12 @@ describe("clicking a turn head", () => {
 		expect(summary.state.processBlockExpanded).toBe(true);
 		// The box lists the steps itself: the separate step cards stay folded.
 		expect(row.expanded).toBe(false);
-		expect(plain(summary.render(80)).join("\n")).toContain("▾");
+		expect(headerPlain(summary.render(80))).toContain("⌄");
 
 		header?.onClick({ row: 0, col: 0 });
 		expect(summary.state.processBlockExpanded).toBe(false);
-		expect(plain(summary.render(80)).join("\n")).toContain("▸");
-		// Ctrl+O now opens (the caret says ▸), instead of doing nothing.
+		expect(headerPlain(summary.render(80))).toContain("›");
+		// Ctrl+O now opens (the arrow says ›), instead of doing nothing.
 		call(h.mode, "cycleTurnProcess", summary);
 		expect(summary.state.processBlockExpanded).toBe(true);
 		// The click-opened state was recorded for Esc too.
