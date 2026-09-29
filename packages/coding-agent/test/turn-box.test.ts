@@ -15,7 +15,7 @@ import {
 } from "../src/modes/interactive/components/turn-activity.js";
 import { boxBodyRows } from "../src/modes/interactive/components/turn-box.js";
 import { TurnBoxNavigator } from "../src/modes/interactive/components/turn-box-navigator.js";
-import { STRIP_EDITS, STRIP_MEMORIES, TurnStripComponent } from "../src/modes/interactive/components/turn-strip.js";
+import { STRIP_ALL, STRIP_EDITS, TurnStripComponent } from "../src/modes/interactive/components/turn-strip.js";
 import { TurnTimeline } from "../src/modes/interactive/components/turn-timeline.js";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
@@ -256,7 +256,7 @@ describe("timeline rows from the kernel's records", () => {
 		const out = text(turn.summary.render(120));
 		expect(out).toMatch(/✎ modules\/aichat\/client\.go\s+\+12 −4\s+│/);
 		expect(out).toMatch(/✎ \/tmp\/probe\.py\s+临时 \+9\s+│/);
-		expect(out).toContain("✦ 记住：go · http · 请求要带 · context");
+		expect(out).toContain("✦ 记住：go http 请求要带 context");
 		expect(out).not.toContain("_2026");
 	});
 });
@@ -824,12 +824,16 @@ describe("the change strip", () => {
 
 	it("counts the project's files, keeps temp files apart, and names the commit", () => {
 		const { strip } = finishedTurnWithChanges();
-		const line = text(strip.render(120));
-		expect(line).toBe(" ✎ 改了 1 个文件 +12 −4 ▸  ·  ✦ 记住了 1 条 ▸  ·  已提交 abc1234");
-		expect(strip.getFocusOrder()).toEqual([STRIP_EDITS, STRIP_MEMORIES]);
+		const rows = plain(strip.render(120));
+		expect(rows.find((row) => row.includes("✎"))).toMatch(
+			/^ \d\d:\d\d {3}· {6}✎ 改了 1 个文件 \+12 −4 · 已提交 abc1234 +▸ {2}$/,
+		);
+		const memoryKey = strip.getFocusOrder().find((entry) => entry.startsWith("strip:item:mem:")) ?? "";
+		expect(memoryKey).not.toBe("");
+		expect(strip.getFocusOrder()).toEqual([STRIP_EDITS, memoryKey, STRIP_ALL]);
 		strip.activate(STRIP_EDITS);
 		const list = text(strip.render(120));
-		expect(list).toContain("▸ ✎ a.go");
+		expect(list).toContain("✎ a.go");
 		expect(list).toContain("另有 1 个临时文件，不算项目改动");
 		strip.activate("strip:item:file:/work/app/a.go");
 		const diff = text(strip.render(120));
@@ -837,29 +841,28 @@ describe("the change strip", () => {
 		expect(diff).toContain("+ new()");
 	});
 
-	it("shows a memory's rename and only its changed lines", () => {
+	it("shows a memory's rename and only its changed lines, after one click", () => {
 		const { strip } = finishedTurnWithChanges();
 		strip.render(120);
-		strip.activate(STRIP_MEMORIES);
-		strip.render(120);
-		const key = strip.getFocusOrder().find((entry) => entry.startsWith("strip:item:")) ?? "";
+		const key = strip.getFocusOrder().find((entry) => entry.startsWith("strip:item:mem:")) ?? "";
+		expect(strip.getClickRegions().length).toBeGreaterThan(0);
 		strip.activate(key);
 		const out = text(strip.render(120));
-		expect(out).toContain("全局 · 改名");
+		expect(out).toContain("改了记忆   规则");
 		expect(out).toContain("改名  旧规则 → 规则");
 		expect(out).toContain("− 二");
 		expect(out).toContain("+ 三");
 		expect(out).not.toContain("一\n");
 	});
 
-	it("renders nothing for a turn that changed nothing, or one still running", () => {
+	it("draws only the closing row for a turn that changed nothing, and nothing for one still running", () => {
 		const turn = quietTurn();
 		const strip = new TurnStripComponent({ timeline: turn.timeline, facts: () => undefined, requestRender: vi.fn() });
 		expect(strip.render(120)).toEqual([]);
 
 		// "No facts yet" (above) and "facts exist but nothing changed" (here) are
 		// two different branches of the same guard - an all-empty fact object,
-		// not just an absent one, must also render nothing.
+		// not just an absent one, must leave only the closing row.
 		const emptyFacts: TimelineFacts = {
 			thinkCount: 0,
 			commandCount: 0,
@@ -878,7 +881,17 @@ describe("the change strip", () => {
 			facts: () => emptyFacts,
 			requestRender: vi.fn(),
 		});
-		expect(emptyStrip.render(120)).toEqual([]);
+		const rows = plain(emptyStrip.render(120));
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatch(/^ {9}╵ {6}✓ 完成 +完整过程 ▸ {2}$/);
+
+		const later = new TurnStripComponent({
+			timeline: turn.timeline,
+			facts: () => emptyFacts,
+			requestRender: vi.fn(),
+			endsRequest: () => false,
+		});
+		expect(later.render(120)).toEqual([]);
 	});
 });
 

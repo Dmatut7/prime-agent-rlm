@@ -27,12 +27,14 @@ afterEach(() => {
 /**
  * The chat as a string of what each line is: T a `◆ prime` title, C a folded box (its
  * header card, one row), U an open box's top border, D its bottom border, M a
- * handed-back message row, B a blank line, X other text. An open box's inside is left out.
+ * handed-back message row, E a finished turn's closing row, B a blank line, X other text.
+ * An open box's inside is left out.
  */
 function shape(chat: LiveChat): string {
 	const marks: string[] = [];
 	for (const line of plain(chat.lines())) {
 		if (line.trim() === "") marks.push("B");
+		else if (line.includes("╵")) marks.push("E");
 		else if (line.includes("◆ prime")) marks.push("T");
 		else if (line.includes("╭")) marks.push("U");
 		else if (line.includes("╰")) marks.push("D");
@@ -69,7 +71,6 @@ describe("the groups of consecutive turns are one blank line apart", () => {
 
 	it("draws the answer of the last box as the timeline summary: two main-line rows under it, the header, an empty bar row, the words", () => {
 		const chat = threeGroups();
-		expect(shape(chat)).toMatch(/CXXX$/);
 		const lines = plain(chat.lines()).map((line) => line.trimEnd());
 		const headers = lines.flatMap((line, index) => (/^ \d\d:\d\d {3}◆ {6}总结$/.test(line) ? [index] : []));
 		expect(headers.length).toBeGreaterThan(0);
@@ -103,7 +104,7 @@ describe("the groups of consecutive turns are one blank line apart", () => {
 		chat.wakeUnseen("m1");
 		vi.advanceTimersByTime(1_000);
 		const marks = shape(chat);
-		expect(marks).toContain("CBC");
+		expect(marks).toContain("CEBC");
 		expect(marks).not.toMatch(/CC/);
 		expect(marks).not.toContain("BB");
 	});
@@ -112,7 +113,7 @@ describe("the groups of consecutive turns are one blank line apart", () => {
 		const chat = new LiveChat();
 		chat.prompt("你好");
 		vi.advanceTimersByTime(1_000);
-		expect(shape(chat)).toMatch(/^X+BTC$/);
+		expect(shape(chat)).toMatch(/^X+BTCE$/);
 	});
 });
 
@@ -132,7 +133,7 @@ describe("a woken turn does not add a blank line to one that is already there", 
 		chat.prompt("你好", { answer: "在的。" });
 		chat.wakeUnseen("m1");
 		vi.advanceTimersByTime(1_000);
-		expect(shape(chat)).toContain("XBC");
+		expect(shape(chat)).toContain("XEBC");
 	});
 
 	function wokenSummary() {

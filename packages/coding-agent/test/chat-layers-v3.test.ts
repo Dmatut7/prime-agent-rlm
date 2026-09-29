@@ -19,6 +19,7 @@ import {
 } from "../src/modes/interactive/components/running-card.js";
 import { turnStepLabel } from "../src/modes/interactive/components/step-label.js";
 import { SystemNoticeLine } from "../src/modes/interactive/components/system-notice.js";
+import { timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
 import { TurnActivityState, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import {
 	sentAtText,
@@ -345,7 +346,7 @@ describe("system notices", () => {
 		expect(Math.abs(left - (60 - line.trim().length) / 2)).toBeLessThanOrEqual(1);
 	});
 
-	it("collapses a memory update to one line naming the entry, and expands to the diff", () => {
+	it("hides the background memory tidy by default; the full process shows it as one note that expands to the diff", () => {
 		const after: HarnessEntry = {
 			id: "eval-progress",
 			kind: "memory",
@@ -381,26 +382,32 @@ describe("system notices", () => {
 			scope: "local",
 		};
 		const component = new RefinementOutcomeMessageComponent(createRefinementOutcomeMessage(result));
-		const collapsed = plain(component.render(100)).filter((line) => line.trim());
-		expect(collapsed).toHaveLength(1);
-		expect(collapsed[0]).toBe(" ✦ 记住了 1 条 · 百轮评估进度 · 本会话 ▸");
-		// The entry's title names it; the summary's shorthand stays out of the line.
-		expect(collapsed[0]).not.toContain("老板令");
-		// A slug-like title (seen live: `eval100_0924百轮评估场_运行状态_评估后删`) reads as words.
-		const slug = structuredClone(result);
-		for (const edit of slug.appliedEdits) {
-			edit.title = "eval100_0924百轮评估场_运行状态_评估后删";
-			if (edit.after) edit.after.title = edit.title;
+		expect(component.render(100)).toEqual([]);
+		timelineShowAll.set(true);
+		try {
+			const collapsed = plain(component.render(100)).filter((line) => line.includes("回合后整理记忆"));
+			expect(collapsed).toHaveLength(1);
+			expect(collapsed[0]).toMatch(/^ \d\d:\d\d {3}· {6}回合后整理记忆：改了 1 条（本会话） +展开 ▸ {2}$/);
+			// The entry's title names it once opened; the summary's shorthand stays out of the row.
+			expect(collapsed[0]).not.toContain("老板令");
+			// A slug-like title (seen live: `eval100_0924百轮评估场_运行状态_评估后删`) reads as words.
+			const slug = structuredClone(result);
+			for (const edit of slug.appliedEdits) {
+				edit.title = "eval100_0924百轮评估场_运行状态_评估后删";
+				if (edit.after) edit.after.title = edit.title;
+			}
+			const slugComponent = new RefinementOutcomeMessageComponent(createRefinementOutcomeMessage(slug));
+			slugComponent.setExpanded(true);
+			const slugText = plain(slugComponent.render(120)).join("\n");
+			expect(slugText).toContain("eval100 0924百轮评估场 运行状态 评估后删");
+			expect(slugText).not.toContain("_");
+			component.setExpanded(true);
+			const expanded = plain(component.render(100)).join("\n");
+			expect(expanded).toContain("把协调记忆改写为");
+			expect(expanded).toContain("百轮评估进度");
+		} finally {
+			timelineShowAll.set(false);
 		}
-		const slugLine = plain(new RefinementOutcomeMessageComponent(createRefinementOutcomeMessage(slug)).render(120))
-			.filter((line) => line.trim())
-			.join("");
-		expect(slugLine).toContain("eval100 · 0924百轮评估场 · 运行状态 · 评估后删");
-		expect(slugLine).not.toContain("_");
-		component.setExpanded(true);
-		const expanded = plain(component.render(100)).join("\n");
-		expect(expanded).toContain("把协调记忆改写为");
-		expect(expanded).toContain("百轮评估进度");
 	});
 
 	it("collapses the kernel-restored notice to the centered line", () => {
