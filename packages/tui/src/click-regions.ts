@@ -38,4 +38,8 @@ export interface ClickRegion {
 	 * transcript scroll instead (it reached that end, or has nothing to scroll).
 	 */
 	onWheel?: (direction: -1 | 1) => boolean;
+	/** Stable identity of the region across frames; required for hover (regions are rebuilt every render). */
+	hoverKey?: string;
+	/** Called with true when the pointer enters this region and false when it leaves (fullscreen with mouse tracking only). */
+	onHover?: (hovered: boolean) => void;
 }
