@@ -234,7 +234,6 @@ type RenderSessionContextHarness = {
 	getCachedToolDefinition: () => undefined;
 	getCurrentCwd: () => string;
 	getRetryAttempt: () => number;
-	subagentSummaryLine: { getSubagentSpend: () => undefined };
 	ui: { requestRender: () => void; isFullscreen: () => boolean; requestRenderPreservingViewport: () => void };
 	addMessageToChat: (message: AgentMessage, options?: { populateHistory?: boolean }) => void;
 	connectionState?: AgentConnectionState;
@@ -283,7 +282,6 @@ function createRenderSessionContextHarness(overrides: Partial<RenderSessionConte
 		getCachedToolDefinition: () => undefined,
 		getCurrentCwd: () => process.cwd(),
 		getRetryAttempt: () => 0,
-		subagentSummaryLine: { getSubagentSpend: () => undefined },
 		ui: { requestRender: vi.fn(), isFullscreen: () => false, requestRenderPreservingViewport: vi.fn() },
 		addMessageToChat,
 		...overrides,
@@ -510,7 +508,6 @@ describe("InteractiveMode.renderSessionContext", () => {
 				getCachedToolDefinition: () => undefined,
 				getCurrentCwd: () => process.cwd(),
 				getRetryAttempt: () => 0,
-				subagentSummaryLine: { getSubagentSpend: () => undefined },
 				ui: { requestRender: vi.fn() },
 				addMessageToChat: vi.fn(() => {
 					chatContainer.addChild({ render: () => ["assistant"], invalidate: () => {} });
@@ -568,7 +565,6 @@ describe("InteractiveMode.renderSessionContext", () => {
 				getCachedToolDefinition: () => undefined,
 				getCurrentCwd: () => process.cwd(),
 				getRetryAttempt: () => 0,
-				subagentSummaryLine: { getSubagentSpend: () => undefined },
 				ui: { requestRender: vi.fn() },
 				addMessageToChat: vi.fn(() => {
 					chatContainer.addChild({ render: () => ["assistant"], invalidate: () => {} });

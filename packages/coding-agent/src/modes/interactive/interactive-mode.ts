@@ -3946,7 +3946,8 @@ export class InteractiveMode {
 			requestRender: () => this.ui.requestRender(),
 			liveChanged: () => this.updateWorkingPulse(),
 			subagentSpend: () => {
-				const spend = this.subagentSummaryLine.getSubagentSpend();
+				// A replay can draw the closing row before the status line exists.
+				const spend = this.subagentSummaryLine?.getSubagentSpend();
 				return spend ? { cost: spend.cost, parentCost: spend.parentCost, partial: spend.partial } : undefined;
 			},
 		};

@@ -81,7 +81,6 @@ function createHost(): Host {
 		getCurrentCwd: () => "/work/app",
 		updateEditorBorderColor: noop,
 		updateSubagentSummaryLine: noop,
-		subagentSummaryLine: { getSubagentSpend: () => undefined },
 		handleTurnLanesClicked: noop,
 		resetBlockNavigation: noop,
 		showError: noop,
