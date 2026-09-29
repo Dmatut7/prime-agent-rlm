@@ -183,7 +183,7 @@ const KIND_CASES: KindCase[] = [
 		glyph: "$",
 		glyphColor: "kindCommand",
 		rail: "│",
-		status: { text: "✗ 退出码 2", color: "timelineMust" },
+		status: { text: "退出码 2", color: "timelineMust" },
 		build: (turn) => addCommand(turn, "c1", "make build", { ok: false, detail: "exit code 2" }),
 	},
 	{

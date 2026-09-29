@@ -380,7 +380,8 @@ describe("the kernel's step records", () => {
 		);
 		const row = openEvents(turn).find((line) => line.includes("npm run build")) ?? "";
 		expect(row).toContain("$  npm run build · 后台出错了");
-		expect(row).toContain("✗ 退出码 2");
+		expect(row).toContain("退出码 2");
+		expect(row).not.toContain("✗ 退出码 2");
 	});
 
 	it("keys the background row off the kernel's flag while the cell is still being reported", () => {

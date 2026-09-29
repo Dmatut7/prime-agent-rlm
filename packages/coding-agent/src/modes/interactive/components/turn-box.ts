@@ -358,6 +358,14 @@ function stepStatus(row: BoxRow, now: number): string {
 		row.startedAt !== undefined && row.endedAt !== undefined && row.endedAt - row.startedAt >= 1000
 			? formatBoxDuration(row.endedAt - row.startedAt)
 			: undefined;
+	if (row.status === "failed") {
+		// `4 个失败  38秒`: the result and the time in one red, no mark.
+		const words = row.meta
+			.map((entry) => entry.text)
+			.join("")
+			.replace(/^✗\s*/, "");
+		return theme.fg("timelineMust", [words, took].filter((part) => part).join("  "));
+	}
 	const onlyDone = row.meta.length === 1 && row.meta[0]?.text === "✓ 完成";
 	const parts = onlyDone && took ? [{ text: "✓", color: row.meta[0]?.color ?? "diffAddedText" }] : row.meta;
 	const meta = parts.map((entry) => theme.fg(statusColor(entry), entry.text)).join("");

@@ -732,3 +732,53 @@ describe("a line's lane comes from where it sits relative to the dispatch", () =
 		expect(laneOf(plain(turn.summary.render(WIDTH)), "顺手看一下")).toBe("┆");
 	});
 });
+
+describe("a failing step's status reads like the design's `4 个失败  38秒`", () => {
+	function failingTurn(endedAfterMs: number) {
+		const turn = quietTurn(false);
+		say(turn, T0, "跑测试。", [{ id: "c1", command: "npx vitest --run" }]);
+		turn.timeline.mergeStep(
+			"c1",
+			"ipython",
+			{},
+			{
+				details: {
+					activities: [
+						{
+							id: "a",
+							kind: "command",
+							label: "npx vitest --run",
+							status: "error",
+							detail: "10 passed, 4 failed in 38s",
+							startedAt: T0,
+							endedAt: T0 + endedAfterMs,
+						},
+					],
+				},
+			},
+			false,
+		);
+		const final = assistant(T0 + MINUTE, [{ type: "text", text: "四个失败。" }], "stop");
+		turn.timeline.noteMessage(final, true);
+		turn.state.markTurnEnded(T0 + MINUTE);
+		turn.state.finishBox(T0 + MINUTE);
+		turn.summary.render(WIDTH);
+		turn.summary.activate(turn.summary.getFocusOrder()[0] ?? "");
+		return turn;
+	}
+
+	it("puts the result and the time in one red, two spaces apart, with no mark", () => {
+		const turn = failingTurn(38_000);
+		const raw = turn.summary.render(WIDTH).find((line) => line.includes("npx vitest --run")) ?? "";
+		const text = stripAnsi(raw);
+		expect(text.endsWith("10 通过 · 4 失败  38秒    ")).toBe(true);
+		expect(text).not.toContain("✗");
+		expect(raw).toContain(`${theme.getFgAnsi("timelineMust")}10 通过 · 4 失败  38秒`);
+	});
+
+	it("leaves the time out when the step took less than a second", () => {
+		const turn = failingTurn(400);
+		const text = plain(turn.summary.render(WIDTH)).find((line) => line.includes("npx vitest --run")) ?? "";
+		expect(text.endsWith("10 通过 · 4 失败    ")).toBe(true);
+	});
+});

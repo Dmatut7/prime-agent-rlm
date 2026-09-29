@@ -180,7 +180,7 @@ describe("timeline steps from the kernel's records", () => {
 		);
 		turn.state.setStepStatus("c1", "done");
 		const done = openEvents(turn);
-		expect(done.some((line) => /^ {9}│ {11}\$ {2}go test \.\/\.\.\. +✗ 54 通过 · 2 失败 3秒 {4}$/.test(line))).toBe(
+		expect(done.some((line) => /^ {9}│ {11}\$ {2}go test \.\/\.\.\. +54 通过 · 2 失败 {2}3秒 {4}$/.test(line))).toBe(
 			true,
 		);
 		expect(done.join("\n")).not.toContain("=== RUN");
