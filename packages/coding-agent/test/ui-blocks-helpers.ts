@@ -184,3 +184,8 @@ export function addSay(turn: QuietTurn, words: string, id: string, timestamp = D
 	turn.state.setStepStatus(id, "running", timestamp);
 	turn.state.setStepStatus(id, "done", timestamp + 500);
 }
+
+/** The AI's closing words after the steps: what a turn that ended well ends on. */
+export function addClosingAnswer(turn: QuietTurn, words = "好了。", stopReason: "stop" | "length" = "stop"): void {
+	turn.timeline.noteMessage(assistant(Date.now() - 300, [{ type: "text", text: words }], stopReason), true);
+}

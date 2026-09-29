@@ -5,6 +5,7 @@ import { setMotionReduced } from "../src/modes/interactive/components/motion.js"
 import { theme } from "../src/modes/interactive/theme/theme.js";
 import {
 	addActivities,
+	addClosingAnswer,
 	addCommand,
 	addStep,
 	addThought,
@@ -108,6 +109,7 @@ describe("the finished box header colors each count by kind", () => {
 		const recovered = quietTurn({ live: false });
 		mistake(recovered);
 		addCommand(recovered, "c1", "pip install nope");
+		addClosingAnswer(recovered);
 		const raw = finish(recovered);
 		expect(raw).toContain(theme.fg("kindRecovered", "出错 1 次，已改正"));
 		expect(raw).not.toContain(theme.fg("kindError", "出错"));

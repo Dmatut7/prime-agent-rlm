@@ -1114,10 +1114,18 @@ function factsDetail(row: BoxRow, now: number): (width: number) => string[] {
 
 /**
  * The turn is over and went fine: not running, not stopped by the owner, not
- * ended on an error. Whatever went wrong on the way it corrected itself.
+ * ended on an error, and the AI itself closed it with an answer (its last reply
+ * ended normally). Whatever went wrong on the way it corrected itself. A turn
+ * cut off after a step (an abort after a tool batch, a budget stop, a crash) or
+ * ended on a truncated reply corrected nothing.
  */
 function endedWell(timeline: TurnTimeline, ctx: RowBuildContext): boolean {
-	return !ctx.live && !ctx.stopped && !timeline.stopped && !timeline.errorEnded;
+	if (ctx.live || ctx.stopped || timeline.stopped || timeline.errorEnded) return false;
+	for (let index = timeline.entries.length - 1; index >= 0; index--) {
+		const entry = timeline.entries[index];
+		if (entry?.kind === "message") return entry.message.stopReason === "stop";
+	}
+	return false;
 }
 
 /** Every row of a turn, in order. */
