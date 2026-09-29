@@ -10,6 +10,7 @@ import { buildConversationComponents } from "../src/modes/interactive/components
 import { CustomEditor } from "../src/modes/interactive/components/custom-editor.js";
 import { getToolFileChanges } from "../src/modes/interactive/components/edit-summary.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
+import { timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
 import {
 	type TimelineHost,
 	TurnActivityState,
@@ -166,29 +167,30 @@ describe("s3: a turn carried on by a subagent notice", () => {
 		assistant(1_500, [{ type: "text", text: "审查员看完了，没发现问题。" }], "stop"),
 	];
 
-	it("keeps only the last answer under the box and folds the earlier one into it", () => {
+	it("starts the next turn at the notice and leaves the earlier answer under its own turn", () => {
 		setMotionReduced(true);
 		const components = replay(messages);
 		const summaries = components.filter((component) => component instanceof TurnSummaryComponent);
-		expect(summaries).toHaveLength(1);
+		expect(summaries).toHaveLength(2);
 		const closed = renderAll(components);
 		expect(closed).toContain("审查员看完了，没发现问题。");
-		// The earlier answer is not a second answer under the box.
-		expect(closed).not.toContain("已经派审查员去看了");
-		(summaries[0] as TurnSummaryComponent).setExpanded(true);
-		const open = renderAll(components);
-		expect(open.match(/已经派审查员去看了/g)).toHaveLength(1);
+		// The woken turn does not fold the answer the first turn ended on away.
+		expect(closed).toContain("已经派审查员去看了");
 	});
 
-	it("says what the subagent did as a row of the box, in Chinese", () => {
+	it("keeps what the subagent did out of sight until 完整过程 is on, then says it in Chinese", () => {
 		setMotionReduced(true);
 		const components = replay(messages);
-		const summary = components.find((component) => component instanceof TurnSummaryComponent) as TurnSummaryComponent;
-		summary.setExpanded(true);
-		const out = renderAll(components);
-		expect(text(summary.render(120))).toContain("子代理 审查员 做完了，没发回消息");
-		expect(out).not.toContain("subagent status");
-		expect(out).not.toContain("RLM child");
+		expect(renderAll(components)).not.toContain("做完了，没发回消息");
+		timelineShowAll.set(true);
+		try {
+			const out = renderAll(components);
+			expect(out).toContain("子代理 审查员 做完了，没发回消息");
+			expect(out).not.toContain("subagent status");
+			expect(out).not.toContain("RLM child");
+		} finally {
+			timelineShowAll.set(false);
+		}
 	});
 });
 

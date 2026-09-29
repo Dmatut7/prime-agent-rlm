@@ -792,7 +792,7 @@ describe("a quiet turn seen from a second view", () => {
 });
 
 describe("a quiet turn a notice carries on", () => {
-	it("keeps only the later answer under the box, the earlier one folded into it", async () => {
+	it("starts the next turn when the notice wakes the AI, and the earlier answer stays under its own box", async () => {
 		const harness = await session();
 		const steps = record(harness);
 		harness.setResponses([reply("子代理回来了：当前目录有 3 个文件。"), reply("收到它的结束通知，结论不变。")]);
@@ -811,11 +811,11 @@ describe("a quiet turn a notice carries on", () => {
 		const screen = startScreen(steps);
 		feed(screen, steps);
 		vi.advanceTimersByTime(SETTLE_MS);
-		expect(screen.boxes()).toHaveLength(1);
+		expect(screen.boxes()).toHaveLength(2);
 		const shown = screen.screen();
 		expect(shown).toContain("收到它的结束通知，结论不变。");
-		expect(shown).not.toContain("子代理回来了");
-		expect(screen.opened(screen.boxes()[0]!)).toContain("子代理回来了：当前目录有 3 个文件");
+		// The answer the first turn ended on is not folded away by the turn the notice woke.
+		expect(shown).toContain("子代理回来了：当前目录有 3 个文件");
 	});
 });
 

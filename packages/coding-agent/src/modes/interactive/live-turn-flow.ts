@@ -1,10 +1,12 @@
 import type { AssistantMessage, AssistantMessageEvent } from "@earendil-works/pi-ai";
 import type { Container } from "@earendil-works/pi-tui";
-import { startsAgentRun } from "../../core/agent-messages.js";
 import type { CustomMessage } from "../../core/messages.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
+import { SubagentLane } from "./components/agent-message.js";
 import {
 	countThinkingSegments,
+	giveLaneTracker,
+	isWakeMessage,
 	latestThinkingText,
 	NO_STEP_STOP,
 	resolveTurnHeaders,
@@ -13,6 +15,7 @@ import {
 } from "./components/conversation-components.js";
 import { formatFileChangePath, getToolFileChanges } from "./components/edit-summary.js";
 import { collectBashHandleCommands } from "./components/step-label.js";
+import { isSubagentNoticeMessage } from "./components/system-notice.js";
 import { TurnActivityState, TurnSummaryComponent } from "./components/turn-activity.js";
 import { TurnStripComponent } from "./components/turn-strip.js";
 import {
@@ -62,6 +65,18 @@ export interface LiveTurnFlowHost {
 	requestRender(): void;
 	/** Whether a live box exists changed (spinners and clocks need the pulse). */
 	liveChanged(): void;
+	/** What the session has spent, when it is known: the request's closing row words it. */
+	subagentSpend?(): RequestSpend | undefined;
+}
+
+/** The session's spend as the closing row of a request words it. */
+export interface RequestSpend {
+	/** Every subagent's own cost. */
+	cost: number;
+	/** The root's own cost; the total is `parentCost + cost`. */
+	parentCost: number;
+	/** A scan budget cut the count short: the figures are lower bounds. */
+	partial?: boolean;
 }
 
 /** Files a settled step changed land on its turn, so the collapsed process line can list them. */
@@ -115,6 +130,8 @@ export class LiveTurnFlow {
 	private readonly strips = new WeakMap<TurnSummaryComponent, TurnStripComponent>();
 	/** Handle variable → the command its `bash()` call started, across the session's cells. */
 	private readonly handleCommands = new Map<string, string>();
+	/** Which subagents of the current question are still out: the lane every timeline row is drawn in. */
+	readonly subagentLane = new SubagentLane();
 
 	constructor(private readonly host: LiveTurnFlowHost) {}
 
@@ -137,6 +154,7 @@ export class LiveTurnFlow {
 		state.live = true;
 		state.startedByUser = this.starterKind === "user";
 		const summary = this.host.createSummary(state);
+		giveLaneTracker(summary, this.subagentLane.tracker);
 		summary.setExpanded(this.host.startExpanded());
 		summary.setQuiet(this.host.quiet());
 		this.host.setCurrent(summary);
@@ -163,28 +181,29 @@ export class LiveTurnFlow {
 	}
 
 	/**
-	 * A custom message arrived. A run-starting one outside a tool loop (a
-	 * heartbeat, an agent message while idle) starts a new box; a notice the box
-	 * shows as a row goes there. True when the box took the message.
+	 * A custom message arrived. One that wakes the AI outside a tool loop (a
+	 * heartbeat, an agent message or a subagent notice while idle) starts a new
+	 * turn, so the answer the last turn ended on stays where it is; a compaction
+	 * notice the box shows as a row goes there. True when the box took the message.
 	 */
 	customMessage(message: CustomMessage): boolean {
 		if (!this.host.quiet()) return false;
-		if (startsAgentRun(message) && this.lastStop !== "toolUse") {
+		if (isWakeMessage(message) && this.lastStop !== "toolUse" && !this.runCutMidTask) {
 			this.starterSinceRunStart = true;
 			this.starterKind = "wake";
 			this.endLiveTurnForNewRun();
 			return false;
 		}
+		// A subagent notice is a row of the timeline the chat draws, never one of the box's.
+		if (isSubagentNoticeMessage(message)) return false;
 		if (!isBoxNoticeMessage(message)) return false;
 		const turn = this.continuableTurn();
 		if (!turn?.state.boxMode) return false;
 		const record = boxRecordFromMessage(message);
-		if (!record) return false;
+		if (record?.kind !== "compaction") return false;
 		const timeline = turn.state.timeline;
 		const at = Number(message.timestamp) || Date.now();
-		if (record.kind === "notice") {
-			timeline.addNotice(record.notice, at);
-		} else if (timeline.latestCompaction()?.endedAt === undefined) {
+		if (timeline.latestCompaction()?.endedAt === undefined) {
 			// A skipped or failed compaction the live row has not settled yet.
 			timeline.addReplayCompaction(at, record.facts);
 		}
@@ -209,6 +228,8 @@ export class LiveTurnFlow {
 		this.starterSinceRunStart = true;
 		this.starterKind = "user";
 		if (quiet) this.endLiveTurnForNewRun();
+		// A new question: nobody is out yet.
+		this.subagentLane.reset();
 		return "prompt";
 	}
 
@@ -648,17 +669,51 @@ export class LiveTurnFlow {
 	attachStrip(summary: TurnSummaryComponent): void {
 		let strip = this.strips.get(summary);
 		if (!strip) {
-			const state = summary.state;
-			strip = new TurnStripComponent({
-				timeline: state.timeline,
-				facts: () => (state.boxLive ? undefined : state.boxView().facts),
-				requestRender: () => this.host.requestRender(),
-			});
+			strip = new TurnStripComponent(this.stripSource(summary));
 			this.strips.set(summary, strip);
 		}
 		const chat = this.host.chat();
 		chat.removeChild(strip);
 		chat.addChild(strip);
+	}
+
+	/**
+	 * What a turn's strip reads: its facts, and for the request's closing row how
+	 * long the request took, what it cost, and whether this turn is the last round
+	 * that answered it (a round a later message wakes hands the row on).
+	 */
+	private stripSource(summary: TurnSummaryComponent) {
+		const state = summary.state;
+		return {
+			timeline: state.timeline,
+			facts: () => (state.boxLive ? undefined : state.boxView().facts),
+			requestRender: () => this.host.requestRender(),
+			elapsedMs: () => this.requestElapsedMs(summary),
+			spend: () => this.host.subagentSpend?.(),
+			endsRequest: () => this.lastTurn() === summary,
+		};
+	}
+
+	/** From the request's first round to the end of this one: a woken round counts its earlier rounds in. */
+	private requestElapsedMs(summary: TurnSummaryComponent): number {
+		const children = this.host.chat().children;
+		let first = summary;
+		for (let index = children.indexOf(summary) - 1; index >= 0; index--) {
+			const child = children[index];
+			if (child instanceof UserMessageComponent) break;
+			if (child instanceof TurnSummaryComponent) first = child;
+		}
+		const end = summary.state.startedAt + summary.state.turnDurationMs();
+		return Math.max(0, end - first.state.startedAt);
+	}
+
+	private lastTurn(): TurnSummaryComponent | undefined {
+		const children = this.host.chat().children;
+		for (let index = children.length - 1; index >= 0; index--) {
+			const child = children[index];
+			if (child instanceof TurnSummaryComponent) return child;
+		}
+		return undefined;
 	}
 
 	/** Every quiet turn's box in the chat, keyed by each of its messages, to carry over a rebuild. */
@@ -725,6 +780,7 @@ export class LiveTurnFlow {
 		this.starterKind = undefined;
 		this.compactionAwaitingAfter = undefined;
 		this.handleCommands.clear();
+		this.subagentLane.reset();
 	}
 
 	/** Teardown: no finish timer may fire into a stopped screen. */

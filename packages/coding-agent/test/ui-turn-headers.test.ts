@@ -172,7 +172,7 @@ function toolResult(id: string, at: number): ToolResultMessage {
 }
 
 describe("a replayed conversation draws one title per question", () => {
-	it("keeps the runs a handed-back message woke in the question's own box, under its one title", () => {
+	it("starts a turn of its own at a handed-back message, under no second title", () => {
 		const call = (id: string, at: number) =>
 			assistant(at, [{ type: "toolCall", id, name: "ipython", arguments: { code: "await bash('ls')" } }]);
 		const messages: AgentMessage[] = [
@@ -195,8 +195,9 @@ describe("a replayed conversation draws one title per question", () => {
 			processMode: "quiet",
 		});
 		const summaries = components.filter((component) => component instanceof TurnSummaryComponent);
-		expect(summaries).toHaveLength(2);
-		expect(summaries.map(shows)).toEqual([true, true]);
+		// The message that woke the AI after its answer starts the next turn: the answer stays under its own turn.
+		expect(summaries).toHaveLength(3);
+		expect(summaries.map(shows)).toEqual([true, false, true]);
 		const titles = components
 			.flatMap((component) => plain(component.render(100)))
 			.filter((line) => line.includes(HEADER));

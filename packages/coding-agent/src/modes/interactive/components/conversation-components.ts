@@ -1,6 +1,6 @@
 import { ABORT_TRUNCATION_MARKER, type AgentMessage, TOOL_ABORT_FALLBACK_MESSAGE } from "@earendil-works/pi-agent-core";
 import { type Component, type MarkdownTheme, Spacer, type TUI } from "@earendil-works/pi-tui";
-import { isAgentSessionMessage } from "../../../core/agent-messages.js";
+import { type AgentSessionMessage, isAgentSessionMessage, startsAgentRun } from "../../../core/agent-messages.js";
 import {
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	isCompactionOutcomeMessage,
@@ -12,7 +12,7 @@ import {
 	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
 } from "../../../core/messages.js";
 import type { ProcessModeSetting } from "../../../core/settings-manager.js";
-import { AGENT_MESSAGE_TURN_INSET, AgentMessageComponent } from "./agent-message.js";
+import { AgentMessageComponent, agentMessageSenderName, SubagentLane } from "./agent-message.js";
 import { AssistantMessageComponent } from "./assistant-message.js";
 import { BashExecutionComponent } from "./bash-execution.js";
 import {
@@ -29,6 +29,9 @@ import {
 } from "./refinement-outcome-message.js";
 import { SlashCommandMessageComponent } from "./slash-command-message.js";
 import { SlashCommandResultMessageComponent } from "./slash-command-result-message.js";
+import { isSubagentNoticeMessage, subagentNoticeRow, TimelineNoticeRow } from "./system-notice.js";
+import type { TimelineLane } from "./timeline-gutter.js";
+import type { TimelineLaneTracker } from "./timeline-lane.js";
 import {
 	selectLatestToolExpandHint,
 	ToolExecutionComponent,
@@ -56,6 +59,104 @@ export interface ConversationComponentsOptions {
 	processMode?: ProcessModeSetting;
 	/** What the quiet turns' boxes read (settings, screen height, working directory). */
 	timelineHost?: TimelineHost;
+}
+
+/** Parts of the timeline that other lines own take the subagent lane through these optional hooks. */
+interface AcceptsLaneTracker {
+	setLaneTracker(tracker: TimelineLaneTracker): void;
+}
+
+interface AcceptsLane {
+	setLane(lane: TimelineLane): void;
+}
+
+/** Hand the question's lane tracker to a turn head, when it takes one. */
+export function giveLaneTracker(component: Component, tracker: TimelineLaneTracker): void {
+	const hook = (component as Partial<AcceptsLaneTracker>).setLaneTracker;
+	if (typeof hook === "function") hook.call(component, tracker);
+}
+
+/** The question's constructor, with the fifth argument the timeline row needs (`quiet`, `lane`). */
+type UserMessageWithLane = new (
+	text: string,
+	markdownTheme?: MarkdownTheme,
+	isRecognizedSlashCommand?: (name: string) => boolean,
+	sentAt?: number,
+	options?: { quiet?: boolean; lane?: TimelineLane },
+) => UserMessageComponent;
+
+const QuestionRow: UserMessageWithLane = UserMessageComponent;
+
+/** The owner's question: the timeline's first row in the quiet conversation, a bubble otherwise. */
+export function createUserMessage(
+	text: string,
+	options: {
+		markdownTheme?: MarkdownTheme;
+		isRecognizedSlashCommand?: (name: string) => boolean;
+		sentAt?: number;
+		quiet: boolean;
+		lane: TimelineLane;
+	},
+): UserMessageComponent {
+	return new QuestionRow(text, options.markdownTheme, options.isRecognizedSlashCommand, options.sentAt, {
+		quiet: options.quiet,
+		lane: options.lane,
+	});
+}
+
+/** Hand the lane a row is appended in to a timeline component, when it takes one. */
+export function giveLane(component: Component, lane: TimelineLane): void {
+	const hook = (component as Partial<AcceptsLane>).setLane;
+	if (typeof hook === "function") hook.call(component, lane);
+}
+
+/**
+ * A message that wakes the AI when it is idle: a run-starting one (a subagent's
+ * report, a heartbeat, a finished background command) or a notice that a
+ * subagent it waits on ended, failed or went quiet.
+ */
+export function isWakeMessage(message: AgentMessage): boolean {
+	return message.role === "custom" && (startsAgentRun(message) || isSubagentNoticeMessage(message));
+}
+
+/** The nearest component above that draws something: a notice the timeline keeps out of sight does not count. */
+export function lastDrawnComponent(children: readonly Component[]): Component | undefined {
+	for (let index = children.length - 1; index >= 0; index--) {
+		const child = children[index];
+		if (child instanceof TimelineNoticeRow && child.drawsNothing) continue;
+		return child;
+	}
+	return undefined;
+}
+
+/**
+ * The row of a message another agent sent. In the quiet conversation it sits on
+ * the timeline: a subagent's report comes back out of the lane, and the row that
+ * closes the lane follows the last one. Otherwise it is the legacy row.
+ */
+export function createAgentMessageRow(
+	message: AgentSessionMessage,
+	options: {
+		markdownTheme?: MarkdownTheme;
+		quiet: boolean;
+		lane: SubagentLane;
+		previous: Component | undefined;
+	},
+): AgentMessageComponent {
+	if (!options.quiet) {
+		return new AgentMessageComponent(message, options.markdownTheme, {
+			suppressLeadingSpace: isCompactAgentMessageNeighbor(options.previous),
+		});
+	}
+	const tracker = options.lane.tracker;
+	const back =
+		message.details.fromRelationship === "child"
+			? options.lane.comeBack(agentMessageSenderName(message.details.from))
+			: { before: tracker.lane, after: tracker.lane };
+	return new AgentMessageComponent(message, options.markdownTheme, {
+		suppressLeadingSpace: options.previous instanceof AgentMessageComponent,
+		timeline: back,
+	});
 }
 
 export function isCompactAgentMessageNeighbor(component: Component | undefined): boolean {
@@ -131,10 +232,15 @@ export function buildConversationComponents(
 	// TUI v4: comms counted per turn (received agent-message rows + sent
 	// agent messages inside ipython tool details), deduped by message id.
 	const sentCommIds = new Set<string>();
+	// Which subagents of the current question are still out: the lane the rows are drawn in.
+	const lane = new SubagentLane();
+	// A turn a message woke (a subagent's report, a notice) is not the owner's own.
+	let nextStartedByUser = true;
 
 	const ensureTurn = (startedAt: number): TurnActivityState => {
 		if (!turnState) {
 			turnState = new TurnActivityState(startedAt);
+			turnState.startedByUser = nextStartedByUser;
 			if (options.timelineHost) turnState.host = options.timelineHost;
 		}
 		return turnState;
@@ -152,18 +258,30 @@ export function buildConversationComponents(
 		turnState.timeline.errorEnded = lastAssistant.stopReason === "error";
 	};
 
+	// The run goes on inside the tool loop: a message that lands right after a step's results is part of the same turn.
+	const insideToolLoop = (): boolean =>
+		turnState !== undefined &&
+		lastAssistant?.role === "assistant" &&
+		lastAssistant.stopReason === "toolUse" &&
+		resultsArrived &&
+		!resultStop.endsTurn;
+
 	for (const message of messages) {
+		// A message that wakes the AI after its turn ended starts the next turn: the answer the turn
+		// ended on stays its own, and the woken turn never folds it away (a live run does the same).
+		if (quiet && isWakeMessage(message) && !insideToolLoop()) {
+			closeTurn();
+			turnState?.markTurnEnded(Number(message.timestamp) || Date.now());
+			turnState = undefined;
+			turnSummary = undefined;
+			lastAssistant = undefined;
+			sentCommIds.clear();
+			nextStartedByUser = false;
+		}
 		if (message.role === "user") {
 			// Typed while the AI was between its steps: an interjection row in
 			// the quiet turn's box, not a new turn (the live view does the same).
-			if (
-				quiet &&
-				turnState &&
-				lastAssistant?.role === "assistant" &&
-				lastAssistant.stopReason === "toolUse" &&
-				resultsArrived &&
-				!resultStop.endsTurn
-			) {
+			if (quiet && turnState && insideToolLoop()) {
 				turnState.timeline.addSteer(
 					readUserText(message.content).trim() || "[图片]",
 					Number(message.timestamp) || 0,
@@ -178,6 +296,9 @@ export function buildConversationComponents(
 			turnState = undefined;
 			turnSummary = undefined;
 			sentCommIds.clear();
+			// A new question: nobody is out, and the turn is the owner's own.
+			lane.reset();
+			nextStartedByUser = true;
 		}
 		if (message.role === "assistant") {
 			// The turn summary is created at the turn head, before the first
@@ -197,26 +318,27 @@ export function buildConversationComponents(
 				turnSummary.setExpanded(expanded);
 				// TUI v4: quiet turns carry the one-line footnote at their head.
 				turnSummary.setQuiet(options.processMode === "quiet");
+				giveLaneTracker(turnSummary, lane.tracker);
 				components.push(turnSummary);
 			}
-			components.push(
-				new AssistantMessageComponent(
-					message,
-					options.hideThinkingBlock ?? false,
-					options.markdownTheme,
-					options.hiddenThinkingLabel ?? "Thinking",
-					{
-						cwd: options.cwd,
-						expanded,
-						thinkingExpanded,
-						precededByToolActivity:
-							components.at(-1) instanceof ToolExecutionComponent ||
-							components.at(-1) instanceof AgentMessageComponent,
-						// TUI v4: the same quiet gate covers the test builder path.
-						quiet: options.processMode === "quiet",
-					},
-				),
+			const answer = new AssistantMessageComponent(
+				message,
+				options.hideThinkingBlock ?? false,
+				options.markdownTheme,
+				options.hiddenThinkingLabel ?? "Thinking",
+				{
+					cwd: options.cwd,
+					expanded,
+					thinkingExpanded,
+					precededByToolActivity:
+						components.at(-1) instanceof ToolExecutionComponent ||
+						components.at(-1) instanceof AgentMessageComponent,
+					// TUI v4: the same quiet gate covers the test builder path.
+					quiet: options.processMode === "quiet",
+				},
 			);
+			giveLane(answer, lane.tracker.lane);
+			components.push(answer);
 			for (const content of message.content) {
 				if (content.type !== "toolCall") {
 					continue;
@@ -319,10 +441,13 @@ export function buildConversationComponents(
 			} else {
 				components.push(new UserMessageComponent("[Malformed session command message]", options.markdownTheme));
 			}
+		} else if (quiet && message.role === "custom" && isSubagentNoticeMessage(message)) {
+			// A subagent that ended, failed or went quiet: a row of the timeline, out of sight unless it failed.
+			const row = subagentNoticeRow(message, lane);
+			if (row) components.push(row);
 		} else if (quiet && turnState && message.role === "custom" && isBoxNoticeMessage(message)) {
-			// The box says it as its own row (a subagent that finished, a compaction that waited).
+			// The box says it as its own row (a compaction that waited).
 			const record = boxRecordFromMessage(message);
-			if (record?.kind === "notice") turnState.timeline.addNotice(record.notice, Number(message.timestamp) || 0);
 			if (record?.kind === "compaction") {
 				turnState.timeline.addReplayCompaction(Number(message.timestamp) || 0, record.facts);
 			}
@@ -350,10 +475,11 @@ export function buildConversationComponents(
 		} else if (isAgentSessionMessage(message) && message.display) {
 			// TUI v4: a received agent-message row is one comm in this turn.
 			turnSummary?.addCommMessage();
-			const component = new AgentMessageComponent(message, options.markdownTheme, {
-				suppressLeadingSpace: isCompactAgentMessageNeighbor(components.at(-1)),
-				// Inside a quiet turn the row lines up with the turn's steps.
-				inset: options.processMode === "quiet" && turnSummary ? AGENT_MESSAGE_TURN_INSET : 0,
+			const component = createAgentMessageRow(message, {
+				markdownTheme: options.markdownTheme,
+				quiet,
+				lane,
+				previous: lastDrawnComponent(components),
 			});
 			component.setExpanded(agentMessagesExpanded);
 			components.push(component);
@@ -369,12 +495,13 @@ export function buildConversationComponents(
 			const display = text || (hasContent ? "[image]" : "");
 			if (display) {
 				components.push(
-					new UserMessageComponent(
-						display,
-						options.markdownTheme,
-						options.isRecognizedSlashCommand,
-						Number(message.timestamp) || undefined,
-					),
+					createUserMessage(display, {
+						markdownTheme: options.markdownTheme,
+						isRecognizedSlashCommand: options.isRecognizedSlashCommand,
+						sentAt: Number(message.timestamp) || undefined,
+						quiet,
+						lane: lane.tracker.lane,
+					}),
 				);
 			}
 		}

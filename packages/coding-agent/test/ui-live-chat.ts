@@ -1,17 +1,21 @@
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { Container, Spacer } from "@earendil-works/pi-tui";
 import {
 	AGENT_MESSAGE_SOURCE,
 	type AgentSessionMessage,
 	createAgentSessionMessage,
 } from "../src/core/agent-messages.js";
-import { AGENT_MESSAGE_TURN_INSET, AgentMessageComponent } from "../src/modes/interactive/components/agent-message.js";
+import { createRlmChildFailureMessage, createRlmChildTerminalNoticeMessage } from "../src/core/messages.js";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import {
+	createAgentMessageRow,
+	createUserMessage,
 	foldEarlierAnswers,
-	isCompactAgentMessageNeighbor,
+	giveLane,
+	lastDrawnComponent,
 } from "../src/modes/interactive/components/conversation-components.js";
+import { subagentNoticeRow } from "../src/modes/interactive/components/system-notice.js";
 import { type TimelineHost, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
-import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
 import { LiveTurnFlow } from "../src/modes/interactive/live-turn-flow.js";
 import { assistant, T0 } from "./ui-blocks-helpers.js";
 
@@ -97,18 +101,35 @@ export class LiveChat {
 		const message = assistant(this.tick(), content, cutMidStep ? "aborted" : "stop", model);
 		this.flow.assistantStart(message);
 		const component = new AssistantMessageComponent(undefined, false, undefined, "Thinking", { quiet: true });
+		giveLane(component, this.flow.subagentLane.tracker.lane);
 		this.chat.addChild(component);
 		component.updateContent(message, false);
+		this.streamed(message);
 		this.flow.assistantEnd(message);
 		this.flow.agentEnd();
 		this.streaming = false;
 	}
 
+	/** The stream events a real message sends: the text lands, a later reply folds the earlier answers away. */
+	private streamed(message: AssistantMessage): void {
+		const index = message.content.findIndex((block) => block.type === "text");
+		const block = message.content[index];
+		if (block?.type === "text") {
+			this.flow.assistantUpdate(message, {
+				type: "text_end",
+				contentIndex: index,
+				content: block.text,
+				partial: message,
+			});
+		}
+	}
+
 	private addMessageRow(message: AgentSessionMessage): void {
 		this.chat.addChild(
-			new AgentMessageComponent(message, undefined, {
-				suppressLeadingSpace: isCompactAgentMessageNeighbor(this.chat.children.at(-1)),
-				inset: AGENT_MESSAGE_TURN_INSET,
+			createAgentMessageRow(message, {
+				quiet: true,
+				lane: this.flow.subagentLane,
+				previous: lastDrawnComponent(this.chat.children),
 			}),
 		);
 	}
@@ -119,7 +140,9 @@ export class LiveChat {
 		this.flow.agentStart();
 		if (this.flow.userMessage(text, this.tick()) === "prompt") {
 			if (this.chat.children.length > 0) this.chat.addChild(new Spacer(1));
-			this.chat.addChild(new UserMessageComponent(text));
+			this.chat.addChild(
+				createUserMessage(text, { quiet: true, lane: this.flow.subagentLane.tracker.lane, sentAt: this.clock }),
+			);
 		}
 		this.reply(options.model ?? "glm-5.3-prime", options.answer, options.cutMidStep);
 	}
@@ -137,6 +160,37 @@ export class LiveChat {
 		const message = handedBack(id, this.tick(), options.name);
 		if (!this.flow.customMessage(message)) this.addMessageRow(message);
 		for (const other of options.also ?? []) this.addMessageRow(handedBack(other.id, this.tick(), other.name));
+		this.reply(options.model ?? "glm-5.3-prime", options.answer);
+	}
+
+	/** The AI dispatches subagents: what a turn's dispatch row does to the lane. */
+	dispatch(...names: string[]): void {
+		this.flow.subagentLane.tracker.spawned(names);
+	}
+
+	/** A subagent's notice wakes the AI (it finished without a word, or it failed). */
+	wakeByNotice(
+		name: string,
+		options: { model?: string; answer?: string; failed?: boolean; lastText?: string } = {},
+	): void {
+		this.streaming = true;
+		this.flow.agentStart();
+		const at = this.tick();
+		const notice = options.failed
+			? createRlmChildFailureMessage({ childId: `${name}-id`, sessionName: name, error: "boom", kind: "error" }, at)
+			: createRlmChildTerminalNoticeMessage(
+					{
+						kind: "completed_without_reply",
+						childId: `${name}-id`,
+						sessionName: name,
+						...(options.lastText ? { lastAssistantText: options.lastText } : {}),
+					},
+					at,
+				);
+		if (!this.flow.customMessage(notice)) {
+			const row = subagentNoticeRow(notice, this.flow.subagentLane);
+			if (row) this.chat.addChild(row);
+		}
 		this.reply(options.model ?? "glm-5.3-prime", options.answer);
 	}
 

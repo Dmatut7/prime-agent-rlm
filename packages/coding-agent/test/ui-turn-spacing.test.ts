@@ -27,12 +27,13 @@ afterEach(() => {
 /**
  * The chat as a string of what each line is: T a `◆ prime` title, C a folded box (its
  * header card, one row), U an open box's top border, D its bottom border, M a
- * handed-back message row, B a blank line, X other text. An open box's inside is left out.
+ * handed-back message row, B a blank line (on the timeline, a row with only its main line),
+ * X other text. An open box's inside is left out.
  */
 function shape(chat: LiveChat): string {
 	const marks: string[] = [];
 	for (const line of plain(chat.lines())) {
-		if (line.trim() === "") marks.push("B");
+		if (line.trim() === "" || /^ {9}│[ ┆]*$/.test(line)) marks.push("B");
 		else if (line.includes("◆ prime")) marks.push("T");
 		else if (line.includes("╭")) marks.push("U");
 		else if (line.includes("╰")) marks.push("D");
