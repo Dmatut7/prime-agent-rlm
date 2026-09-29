@@ -2,6 +2,7 @@ import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
+import { latestShownTurn } from "../src/modes/interactive/components/conversation-components.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import { timelineRow } from "../src/modes/interactive/components/timeline-gutter.js";
 import { TimelineLaneTracker, timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
@@ -244,7 +245,10 @@ describe("完整过程 ▸ brings the hidden rows at once", () => {
 	}
 
 	function clickAll(chat: LiveChat): void {
-		const strip = chat.flow.stripFor(chat.summaries().at(-1)!);
+		// The closing row sits under the last round the timeline draws; the acknowledgement round is out of sight.
+		const shown = latestShownTurn(chat.chat.children);
+		expect(shown).toBeDefined();
+		const strip = shown ? chat.flow.stripFor(shown) : undefined;
 		expect(strip).toBeDefined();
 		strip?.render(120);
 		expect(strip?.getFocusOrder()).toContain(STRIP_ALL);

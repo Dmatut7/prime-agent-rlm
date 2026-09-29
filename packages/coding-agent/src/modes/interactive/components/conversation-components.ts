@@ -46,7 +46,13 @@ import {
 	type ToolExecutionOptions,
 } from "./tool-execution.js";
 import { type TimelineHost, TurnActivityState, type TurnStep, TurnSummaryComponent } from "./turn-activity.js";
-import { boxRecordFromMessage, isBoxNoticeMessage, isPlainAnswer, replyHasWork } from "./turn-timeline.js";
+import {
+	boxRecordFromMessage,
+	isBoxNoticeMessage,
+	isPlainAnswer,
+	replyHasWork,
+	type TimelineCompaction,
+} from "./turn-timeline.js";
 import { UserMessageComponent } from "./user-message.js";
 
 export interface ConversationComponentsOptions {
@@ -141,6 +147,15 @@ export class ReceivedReports {
 		return this.names.has(name);
 	}
 
+	/** Who has reported so far, for a rebuild whose replay no longer holds those reports. */
+	snapshot(): string[] {
+		return [...this.names];
+	}
+
+	restore(names: Iterable<string>): void {
+		for (const name of names) this.names.add(name);
+	}
+
 	clear(): void {
 		this.names.clear();
 	}
@@ -189,11 +204,23 @@ export function noteWakeInRound(state: TurnActivityState | undefined, message: A
 	if (state) wakeCauses.get(state)?.add(message);
 }
 
+/** What a compaction the owner cancelled says it was (a cancel is the owner's own doing, not news). */
+const COMPACTION_CANCELLED = "已取消";
+
+/** A compaction that failed for real: one the owner cancelled, or that the session chose to wait on, did not. */
+function compactionFailed(compaction: TimelineCompaction): boolean {
+	return compaction.failed !== undefined && compaction.skipped !== true && compaction.failed !== COMPACTION_CANCELLED;
+}
+
 /** Whether a round woken by bookkeeping did anything the owner would look for. */
 function roundHasNews(state: TurnActivityState): boolean {
 	const timeline = state.timeline;
 	if (timeline.stopped || timeline.errorEnded) return true;
-	if (timeline.entries.some((entry) => entry.kind === "subagent")) return true;
+	for (const entry of timeline.entries) {
+		// Something the owner typed in the round, or a compaction that broke in it, is theirs to see.
+		if (entry.kind === "subagent" || entry.kind === "steer") return true;
+		if (entry.kind === "compact" && compactionFailed(entry.compaction)) return true;
+	}
 	if (state.steps.length === 0 && timeline.entries.every((entry) => entry.kind === "message")) return false;
 	const facts = state.boxView().facts;
 	if (facts.subagentCount > 0 || facts.projectChanges.length > 0 || facts.scratchChanges.length > 0) return true;
@@ -205,9 +232,10 @@ function roundHasNews(state: TurnActivityState): boolean {
  * Whether a round is only the AI dealing with bookkeeping notices (a child that reported earlier
  * was cancelled or finished without a word): the owner did not start it, only such notices woke it,
  * and it did no work the owner would look for - it dispatched nothing, changed no files, saved no
- * memory and ended without an unfixed error or a stop. Whatever the reply says and however many
- * steps it took, such a round is not drawn unless "完整过程" is on. It is decided when the round is
- * woken and holds from its first word to its last; only news turns it into a drawn round, for good.
+ * memory, heard nothing from the owner, lost no compaction and ended without an unfixed error or a
+ * stop. Whatever the reply says and however many steps it took, such a round is not drawn unless
+ * "完整过程" is on. It is decided when the round is woken and holds from its first word to its last;
+ * only news turns it into a drawn round, for good.
  */
 export function isAckRound(state: TurnActivityState): boolean {
 	if (timelineShowAll.value || state.startedByUser || revealedRounds.has(state)) return false;
@@ -417,6 +445,7 @@ export function buildConversationComponents(
 	const ensureTurn = (startedAt: number): TurnActivityState => {
 		if (!turnState) {
 			turnState = new TurnActivityState(startedAt);
+			roundEndedAt = undefined;
 			turnState.startedByUser = nextStartedByUser;
 			promptOpened = false;
 			if (pendingCause) assignWakeCause(turnState, pendingCause);
@@ -426,6 +455,12 @@ export function buildConversationComponents(
 		return turnState;
 	};
 	const quiet = options.processMode === "quiet";
+	// The quiet timeline's round ends where its own last message landed, not when whatever came after it began.
+	let roundEndedAt: number | undefined;
+	const noteRoundAt = (message: AgentMessage): void => {
+		const at = Number(message.timestamp);
+		if (quiet && Number.isFinite(at) && at > 0) roundEndedAt = Math.max(roundEndedAt ?? 0, at);
+	};
 	let lastAssistant: AgentMessage | undefined;
 	// An interjection lands after the step's results came back; a user message
 	// straight after a tool call (an orphaned call) starts a turn.
@@ -457,7 +492,7 @@ export function buildConversationComponents(
 			pendingCause ??= new WakeCause(reports);
 			pendingCause.add(message);
 			closeTurn();
-			turnState?.markTurnEnded(Number(message.timestamp) || Date.now());
+			turnState?.markTurnEnded(roundEndedAt ?? (Number(message.timestamp) || Date.now()));
 			turnState = undefined;
 			turnSummary = undefined;
 			lastAssistant = undefined;
@@ -473,13 +508,14 @@ export function buildConversationComponents(
 					readUserText(message.content).trim() || "[图片]",
 					Number(message.timestamp) || 0,
 				);
+				noteRoundAt(message);
 				continue;
 			}
 			// A user prompt starts a new turn; the previous group is settled by
 			// then, so freeze its clock (thinking-only turns have no steps to
 			// settle) and reset the grouping from here on.
 			closeTurn();
-			turnState?.markTurnEnded(Number(message.timestamp) || Date.now());
+			turnState?.markTurnEnded(roundEndedAt ?? (Number(message.timestamp) || Date.now()));
 			turnState = undefined;
 			turnSummary = undefined;
 			sentCommIds.clear();
@@ -499,6 +535,7 @@ export function buildConversationComponents(
 			state.modelId = message.model || state.modelId;
 			state.timeline.noteMessage(message, true, true);
 			state.noteReplyAt(Number(message.timestamp));
+			noteRoundAt(message);
 			lastAssistant = message;
 			resultsArrived = false;
 			resultStop = NO_STEP_STOP;
@@ -586,6 +623,7 @@ export function buildConversationComponents(
 		} else if (message.role === "toolResult") {
 			resultsArrived = true;
 			resultStop = stepResultStop(message);
+			noteRoundAt(message);
 			pendingTools.get(message.toolCallId)?.updateResult(message);
 			pendingTools.delete(message.toolCallId);
 			turnState?.setStepStatus(
@@ -709,7 +747,7 @@ export function buildConversationComponents(
 	// The last turn has no following user prompt; freeze its clock at the last
 	// message so a thinking-only line stops ticking.
 	closeTurn();
-	turnState?.markTurnEnded(Number(messages.at(-1)?.timestamp) || Date.now());
+	turnState?.markTurnEnded(roundEndedAt ?? (Number(messages.at(-1)?.timestamp) || Date.now()));
 	if (quiet) {
 		foldEarlierAnswers(components);
 		resolveTurnHeaders(components);

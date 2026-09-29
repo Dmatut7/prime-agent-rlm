@@ -47,7 +47,7 @@ export interface StripSource {
 	elapsedMs?(): number | undefined;
 	/** The session's spend; without it the closing row names no money. */
 	spend?(): StripSpend | undefined;
-	/** False while a later turn of the same request will close it (this turn then draws no closing row). */
+	/** False while a later round of the same question is drawn (this turn then draws no closing row: the last one does). */
 	endsRequest?(): boolean;
 }
 
@@ -172,6 +172,11 @@ export class TurnStripComponent implements Component {
 		return this.order;
 	}
 
+	/** Whether this strip ends its question with the closing row right now (its turn finished, no later round of the question is drawn). */
+	drawsClosingRow(): boolean {
+		return this.source.facts() !== undefined && this.source.endsRequest?.() !== false;
+	}
+
 	/** What Enter does on a focused strip target (`展开`, `收起`). */
 	enterLabel(key: string): string | undefined {
 		const ui = this.source.timeline.ui;
@@ -293,8 +298,7 @@ export class TurnStripComponent implements Component {
 		});
 
 		if (hasSections) gap();
-		const closes = this.source.endsRequest?.() !== false;
-		if (closes) this.closingRow(safeWidth, push);
+		if (this.drawsClosingRow()) this.closingRow(safeWidth, push);
 		return lines;
 	}
 

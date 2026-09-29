@@ -7,6 +7,7 @@ import {
 	assignWakeCause,
 	countThinkingSegments,
 	giveLaneTracker,
+	isAckRound,
 	isWakeMessage,
 	latestThinkingText,
 	NO_STEP_STOP,
@@ -101,6 +102,9 @@ export function recordStepFileChanges(
 }
 
 const FINISH_SETTLE_MS = 400;
+
+/** Width at which a component is probed for whether it draws anything at all. */
+const BLANK_PROBE_WIDTH = 80;
 
 export class LiveTurnFlow {
 	/** Each settling box has its own finish timer: a rebuild can settle several at once. */
@@ -263,17 +267,21 @@ export class LiveTurnFlow {
 	/**
 	 * A row that reaches the chat after its request's last turn finished (a memory line the tidy-up
 	 * wrote): it goes above the closing row, so that stays the request's last line, as in a replay.
+	 * Rounds the timeline leaves out may follow that row; they draw nothing and do not count.
 	 */
 	addRowAboveClosingRow(row: Component): void {
 		const chat = this.host.chat();
-		const last = chat.children.at(-1);
-		if (last instanceof TurnStripComponent) {
-			chat.removeChild(last);
+		let index = chat.children.length - 1;
+		while (index >= 0 && chat.children[index]?.render(BLANK_PROBE_WIDTH).length === 0) index--;
+		const closing = chat.children[index];
+		if (!(closing instanceof TurnStripComponent) || !closing.drawsClosingRow()) {
 			chat.addChild(row);
-			chat.addChild(last);
 			return;
 		}
+		const tail = chat.children.slice(index);
+		for (const child of tail) chat.removeChild(child);
 		chat.addChild(row);
+		for (const child of tail) chat.addChild(child);
 	}
 
 	/** A user message arrived: an interjection in the running turn's box, or a new prompt. */
@@ -756,9 +764,9 @@ export class LiveTurnFlow {
 	}
 
 	/**
-	 * What a turn's strip reads: its facts, and for the request's closing row how
-	 * long the request took, what it cost, and whether this turn is the last round
-	 * that answered it (a round a later message wakes hands the row on).
+	 * What a turn's strip reads: its facts, and for the question's closing row how long the question
+	 * took, what it cost, and whether this turn is the last round of it that is drawn (a round a later
+	 * message wakes hands the row on; a round the timeline leaves out never holds it).
 	 */
 	private stripSource(summary: TurnSummaryComponent) {
 		const state = summary.state;
@@ -767,9 +775,32 @@ export class LiveTurnFlow {
 			facts: () => (state.boxLive ? undefined : state.boxView().facts),
 			requestRender: () => this.host.requestRender(),
 			elapsedMs: () => this.requestElapsedMs(summary),
-			spend: () => this.host.subagentSpend?.(),
-			endsRequest: () => this.lastTurn() === summary,
+			// The spend is the session's total so far: it says nothing about what an earlier question cost.
+			spend: () => (this.after(summary).laterQuestion ? undefined : this.host.subagentSpend?.()),
+			endsRequest: () => !isAckRound(state) && !this.after(summary).laterRound,
 		};
+	}
+
+	/**
+	 * What the chat holds after `summary`: whether a later round of its own question is drawn (the
+	 * question's closing row then belongs to that one), and whether a later question has rounds.
+	 */
+	private after(summary: TurnSummaryComponent): { laterRound: boolean; laterQuestion: boolean } {
+		const children = this.host.chat().children;
+		const start = children.indexOf(summary);
+		if (start < 0) return { laterRound: true, laterQuestion: true };
+		let asked = false;
+		let laterRound = false;
+		for (let index = start + 1; index < children.length; index++) {
+			const child = children[index];
+			if (child instanceof UserMessageComponent) {
+				asked = true;
+			} else if (child instanceof TurnSummaryComponent) {
+				if (asked) return { laterRound, laterQuestion: true };
+				if (!isAckRound(child.state)) laterRound = true;
+			}
+		}
+		return { laterRound, laterQuestion: false };
 	}
 
 	/** From the request's first round to the end of this one: a woken round counts its earlier rounds in. */
@@ -783,15 +814,6 @@ export class LiveTurnFlow {
 		}
 		const end = summary.state.startedAt + summary.state.turnDurationMs();
 		return Math.max(0, end - first.state.startedAt);
-	}
-
-	private lastTurn(): TurnSummaryComponent | undefined {
-		const children = this.host.chat().children;
-		for (let index = children.length - 1; index >= 0; index--) {
-			const child = children[index];
-			if (child instanceof TurnSummaryComponent) return child;
-		}
-		return undefined;
 	}
 
 	/** Every quiet turn's box in the chat, keyed by each of its messages, to carry over a rebuild. */
@@ -845,6 +867,28 @@ export class LiveTurnFlow {
 	restoreLane(snapshot: SubagentLaneSnapshot, since?: number): void {
 		this.subagentLane.restore(snapshot, since);
 		this.host.requestRender();
+	}
+
+	/**
+	 * A view that opens a session has learned nothing of who is out. When `known` holds nothing, the
+	 * direct children the session says still run are out since the start of the window `windowStart`
+	 * begins (their dispatch was compacted away or lies before it), so the lane draws them and their
+	 * reports close it.
+	 */
+	seedLane(
+		known: SubagentLaneSnapshot,
+		children: Iterable<AgentConnectionRlmChildAgentSnapshot>,
+		windowStart: number,
+	): SubagentLaneSnapshot {
+		if (known.lane.spans.length > 0) return known;
+		const spans: SubagentLaneSnapshot["lane"]["spans"] = [];
+		for (const child of children) {
+			if (child.parentId !== this.host.rlmNodeId()) continue;
+			if (child.status !== "running" && child.status !== "queued") continue;
+			const name = laneKey(child.sessionName, child.activeSessionId);
+			if (name && !spans.some((span) => span.name === name)) spans.push({ name, from: windowStart - 1 });
+		}
+		return spans.length === 0 ? known : { ...known, lane: { ...known.lane, spans } };
 	}
 
 	/**
