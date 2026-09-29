@@ -12,12 +12,12 @@ beforeAll(() => {
 });
 
 /**
- * Design board 06 (子代理并行): a rule header with the family count and spend,
- * then one row per child — state glyph, padded name, state word with elapsed
- * time, and what it is doing.
+ * Design board 06 (子代理并行), as the strip under the prompt: one row of
+ * blocks, one per child - a gold block with its name and its state in words.
+ * The header rule, the per-child list and the activity column are gone.
  */
 describe("subagent panel matches design board 06", () => {
-	it("renders the header rule and one row per child in state order", () => {
+	it("renders one row with a block per child in state order", () => {
 		const line = new SubagentSummaryLine();
 		line.setSubagentCounts({ total: 3, running: 2, idle: 0, inactive: 1 });
 		line.setSubagentRows([
@@ -29,11 +29,10 @@ describe("subagent panel matches design board 06", () => {
 			.render(100)
 			.map(strip)
 			.filter((row) => row.trim().length > 0);
-		expect(rows.length).toBe(4);
-		expect(rows[0]).toMatch(/^ 子代理 3 .*─/);
-		expect(rows[1]).toMatch(/^ {3}● review +运行 2:14 +读取 footer\.ts/);
-		expect(rows[2]).toMatch(/^ {3}● docs +运行 0:41 +编辑 FORK_NOTES\.md/);
-		expect(rows[3]).toMatch(/^ {3}✓ lint +完成 1:02 +无问题/);
+		expect(rows.length).toBe(1);
+		expect(rows[0]).toMatch(/^ {2}◇ review 运行中 {3}◇ docs 运行中 {3}◇ lint ✓ 已交回/);
+		expect(rows[0]).not.toContain("─");
+		expect(rows[0]).not.toContain("footer.ts");
 		for (const row of rows) expect(row.length).toBeLessThanOrEqual(100);
 	});
 });
