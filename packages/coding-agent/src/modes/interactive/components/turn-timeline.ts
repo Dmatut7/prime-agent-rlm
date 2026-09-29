@@ -140,6 +140,11 @@ export class TimelineUiState {
 	hoverKey: string | undefined;
 	/** The user opened or closed the box themselves: the automatic open/fold rules no longer apply. */
 	userOpen: boolean | undefined;
+	/**
+	 * The user chose while the turn was still running. An opening made then lapses
+	 * when the turn ends (the box folds); one made after it ended stays.
+	 */
+	userOpenWhileLive = false;
 	/** First body line shown when not following. */
 	scrollTop = 0;
 	/** The body keeps its newest line in view. */
@@ -582,6 +587,7 @@ export class TurnTimeline {
 		next.tokenPeak = Math.max(next.tokenPeak, this.tokenPeak);
 		const ui = this.ui;
 		next.ui.userOpen = ui.userOpen;
+		next.ui.userOpenWhileLive = ui.userOpenWhileLive;
 		next.ui.scrollTop = ui.scrollTop;
 		next.ui.follow = ui.follow;
 		next.ui.primed = ui.primed;

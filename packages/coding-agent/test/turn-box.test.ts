@@ -660,7 +660,7 @@ describe("clicks, keys and what stays open", () => {
 });
 
 describe("opening, folding and history", () => {
-	it("folds the body row by row at turn end unless the user touched the box", () => {
+	it("folds the body row by row at turn end, and keeps open a box the user opened after that", () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(T0);
 		const turn = quietTurn({ startedAt: T0 - 5_000 });
@@ -679,10 +679,10 @@ describe("opening, folding and history", () => {
 
 		const touched = quietTurn({ startedAt: T0 - 5_000 });
 		addStep(touched, "t", "await bash('echo t')", "done", T0 - 4_000);
-		touched.summary.toggleBox();
-		touched.summary.toggleBox();
 		touched.state.markTurnEnded(T0);
 		touched.state.finishBox(T0);
+		vi.setSystemTime(T0 + TURN_FOLD_MS + 10);
+		touched.summary.toggleBox();
 		expect(plain(touched.summary.render(100)).length).toBeGreaterThan(4);
 	});
 

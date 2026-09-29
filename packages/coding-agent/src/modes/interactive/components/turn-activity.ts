@@ -254,6 +254,7 @@ export class TurnActivityState {
 			if (ui.userOpen === !collapsed && this.boxOpen === !collapsed) return;
 			const opening = collapsed === false && !this.boxOpen;
 			ui.userOpen = !collapsed;
+			ui.userOpenWhileLive = this.boxLive;
 			ui.foldStartedAt = undefined;
 			if (opening) {
 				ui.openedAt = Date.now();
@@ -276,11 +277,16 @@ export class TurnActivityState {
 		return this.turnEndedAt === undefined || (this.timeline.observedLive && this.timeline.finishedAt === undefined);
 	}
 
-	/** Whether the box body shows: what the user chose, else the open/fold settings. */
+	/**
+	 * Whether the box body shows: what the user chose, else the open/fold settings. An opening the
+	 * user made while the turn still ran lapses when it ends, so a finished box folds unless they
+	 * open it again; a closing stays.
+	 */
 	get boxOpen(): boolean {
 		const ui = this.timeline.ui;
-		if (ui.userOpen !== undefined) return ui.userOpen;
-		if (this.boxLive) return this.host.openWhileWorking();
+		const live = this.boxLive;
+		if (ui.userOpen !== undefined && !(ui.userOpen && ui.userOpenWhileLive && !live)) return ui.userOpen;
+		if (live) return this.host.openWhileWorking();
 		if (this.timeline.observedLive) return this.host.openWhileWorking() && !this.host.autoFold();
 		return false;
 	}
