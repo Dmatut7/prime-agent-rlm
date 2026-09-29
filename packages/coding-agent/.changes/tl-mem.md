@@ -1,5 +1,5 @@
 - Changed the memory line at the end of a turn to a timeline row (`✦ 记住了 <title> ▸`) that opens with one click straight to what was remembered, wrapped to the screen and never cut, with no `+` in front of new memories.
 - Changed memory titles to read as words: an id standing in for a title loses its underscores and its dates, and a real title is left as written.
 - Changed the changed-files line to a timeline row (`✎ 改了 2 个文件 +20 −7 ▸`) that opens to the files and then a diff.
-- Added a closing line after every finished turn (`✓ 用了 20 分钟 · 子代理 ¥4.20 · 全部 ¥9.80`) with a `完整过程 ▸` switch for the rows the timeline hides.
+- Added a closing line after a finished request (`✓ 用了 20 分钟 · 子代理 ¥4.20 · 全部 ¥9.80`, once, under the last round that answered it) with a `完整过程 ▸` switch for the rows the timeline hides.
 - Changed the background memory tidy to show only when `完整过程` is on, as one note (`回合后整理记忆：新记 1 条（本会话）`) that opens to the memories.

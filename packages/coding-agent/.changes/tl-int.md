@@ -1,0 +1,6 @@
+- Changed a subagent's report that arrives while the AI is still working to sit among the turn's lines by time, above the live spinner line and after the events before it, instead of below the whole turn.
+- Changed the dispatch line to show each subagent's task next to its short name, and to leave a task off when several subagents share the same words.
+- Changed an opened memory step to show the whole remembered text, wrapped to the screen.
+- Fixed the `N 步 ▸` label losing its arrow on a narrow terminal: the arrow stays and the words give way first.
+- Fixed a report from a subagent the AI never dispatched, or a second report from one that was already back, drawing a closing `├──╯` line with no opening `├──╮`.
+- Fixed raw markdown (table rows, code fences, headings) showing on the live spinner line.
