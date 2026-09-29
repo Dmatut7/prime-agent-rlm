@@ -22,6 +22,7 @@ export const MOUSE_BUTTON_LEFT = 0;
 export const MOUSE_BUTTON_NONE = 3;
 
 const SGR_MOUSE_PATTERN = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
+const LEGACY_MOUSE_PATTERN = /^\x1b\[M([\s\S])([\s\S])([\s\S])$/;
 const MODIFIER_SHIFT = 4;
 const MODIFIER_ALT = 8;
 const MODIFIER_CTRL = 16;
@@ -50,6 +51,34 @@ export function parseSgrMouseEvent(sequence: string): MouseEvent | null {
 /** A pointer move with no button held: the only report ?1003 adds over ?1002. */
 export function isMouseHover(event: MouseEvent): boolean {
 	return event.press && event.motion && event.button === MOUSE_BUTTON_NONE;
+}
+
+// X10 coordinates are one byte, 32 + value. Stdin is decoded as UTF-8, which turns a
+// byte above 127 (column 96 and beyond) into U+FFFD; such a coordinate has no position.
+function legacyCoordinate(char: string): number {
+	const code = char.charCodeAt(0);
+	return code > 32 && code <= 255 ? code - 32 : 0;
+}
+
+/** The pointer move a report carries, in the SGR or the legacy `ESC [ M` encoding; null for anything else. */
+export function parseMouseHover(sequence: string): MouseEvent | null {
+	const sgr = parseSgrMouseEvent(sequence);
+	if (sgr) return isMouseHover(sgr) ? sgr : null;
+	const legacy = sequence.match(LEGACY_MOUSE_PATTERN);
+	if (!legacy) return null;
+	const raw = legacy[1]!.charCodeAt(0) - 32;
+	if (raw < 0) return null;
+	const event: MouseEvent = {
+		button: raw & ~(MODIFIER_SHIFT | MODIFIER_ALT | MODIFIER_CTRL | MOTION_BIT),
+		x: legacyCoordinate(legacy[2]!),
+		y: legacyCoordinate(legacy[3]!),
+		press: true,
+		motion: (raw & MOTION_BIT) !== 0,
+		shift: (raw & MODIFIER_SHIFT) !== 0,
+		alt: (raw & MODIFIER_ALT) !== 0,
+		ctrl: (raw & MODIFIER_CTRL) !== 0,
+	};
+	return isMouseHover(event) ? event : null;
 }
 
 export function isWheelUp(event: MouseEvent): boolean {

@@ -1,6 +1,6 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { isMouseHover, isMouseSequence, parseSgrMouseEvent } from "../src/mouse.js";
+import { isMouseHover, isMouseSequence, parseMouseHover, parseSgrMouseEvent } from "../src/mouse.js";
 import { StdinBuffer } from "../src/stdin-buffer.js";
 
 describe("hover mouse reports", () => {
@@ -55,5 +55,60 @@ describe("hover mouse reports", () => {
 		buffer.process("1M");
 		assert.deepStrictEqual(received, ["\x1b[<35;1;1M", "\x1b[<35;2;1M", "\x1b[<35;3;1M"]);
 		buffer.destroy();
+	});
+});
+
+describe("parseMouseHover", () => {
+	const legacy = (button: number, x: number, y: number) =>
+		`\x1b[M${String.fromCharCode(32 + button)}${String.fromCharCode(32 + x)}${String.fromCharCode(32 + y)}`;
+
+	it("reads a hover move in either encoding, with its position", () => {
+		const sgr = parseMouseHover("\x1b[<35;12;7M");
+		assert.strictEqual(sgr?.x, 12);
+		assert.strictEqual(sgr?.y, 7);
+		const old = parseMouseHover(legacy(35, 12, 7));
+		assert.strictEqual(old?.x, 12);
+		assert.strictEqual(old?.y, 7);
+		assert.strictEqual(old?.button, 3);
+		assert.strictEqual(old?.motion, true);
+	});
+
+	it("reads every modifier combination of a legacy hover move", () => {
+		const combos = [0, 4, 8, 12, 16, 20, 24, 28];
+		for (const modifiers of combos) {
+			const event = parseMouseHover(legacy(35 + modifiers, 5, 5));
+			assert.ok(event, `modifiers ${modifiers}`);
+			assert.strictEqual(event.shift, (modifiers & 4) !== 0);
+			assert.strictEqual(event.alt, (modifiers & 8) !== 0);
+			assert.strictEqual(event.ctrl, (modifiers & 16) !== 0);
+		}
+		assert.strictEqual(combos.length, 8);
+	});
+
+	it("returns null for everything that is not a plain pointer move", () => {
+		const others = [
+			legacy(0, 5, 5), // left press
+			legacy(3, 5, 5), // release (button 3 without the motion bit)
+			legacy(32, 5, 5), // left drag
+			legacy(34, 5, 5), // right drag
+			legacy(64, 5, 5), // wheel up
+			"\x1b[<32;5;5M",
+			"\x1b[<0;5;5M",
+			"\x1b[<35;5;5m",
+			"\x1b[A",
+			"a",
+			"\x1b[M",
+			"\x1b[MC#",
+		];
+		assert.ok(others.length > 0);
+		for (const sequence of others) {
+			assert.strictEqual(parseMouseHover(sequence), null, JSON.stringify(sequence));
+		}
+	});
+
+	it("still recognises a legacy move whose column byte the UTF-8 decoder mangled", () => {
+		const event = parseMouseHover(`\x1b[MC\ufffd#`);
+		assert.ok(event, "columns past 95 arrive as U+FFFD, the move itself is still a move");
+		assert.strictEqual(event.x, 0);
 	});
 });

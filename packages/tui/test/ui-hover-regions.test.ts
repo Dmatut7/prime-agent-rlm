@@ -393,3 +393,43 @@ describe("hover moves stay out of the input path", () => {
 		});
 	});
 });
+
+describe("legacy (non-SGR) hover moves", () => {
+	// X10 encoding: ESC [ M, then button, column, row, each as 32 + value.
+	const legacy = (button: number, x: number, y: number) =>
+		`\x1b[M${String.fromCharCode(32 + button)}${String.fromCharCode(32 + x)}${String.fromCharCode(32 + y)}`;
+	const legacyHover = (line: number) => legacy(35, 3, transcriptRow(line));
+
+	it("drives hover like an SGR move and never reaches listeners", async () => {
+		await withHover(TWO_REGIONS, async ({ tui, log, send }) => {
+			const received: string[] = [];
+			tui.addInputListener((data) => {
+				received.push(data);
+				return undefined;
+			});
+			await send(legacyHover(A), legacy(39, 3, transcriptRow(B)), legacy(35, BLANK_X, BLANK_Y));
+			assert.deepStrictEqual(log, ["A:true", "A:false", "B:true", "B:false"]);
+			assert.deepStrictEqual(received, []);
+
+			const press = legacy(0, 3, transcriptRow(A));
+			await send(press);
+			assert.deepStrictEqual(received, [press], "a legacy click is forwarded as before");
+		});
+	});
+
+	it("is swallowed in inline mode too", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui = new TUI(terminal);
+		const typed: string[] = [];
+		tui.addChild({ render: () => ["> "], invalidate: () => {}, handleInput: (data: string) => typed.push(data) });
+		tui.setFocus(tui.children[0]!);
+		tui.start();
+		try {
+			terminal.sendInput(legacyHover(A));
+			terminal.sendInput("x");
+			assert.deepStrictEqual(typed, ["x"]);
+		} finally {
+			tui.stop();
+		}
+	});
+});

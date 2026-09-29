@@ -20,11 +20,11 @@ import {
 import { getKeybindings } from "./keybindings.js";
 import { isKeyRelease } from "./keys.js";
 import {
-	isMouseHover,
 	isMouseSequence,
 	isWheelDown,
 	isWheelUp,
 	MOUSE_BUTTON_LEFT,
+	parseMouseHover,
 	parseSgrMouseEvent,
 } from "./mouse.js";
 import type { TableCellSelectionRegion } from "./selection-metadata.js";
@@ -1102,8 +1102,8 @@ export class TUI extends Container {
 	 */
 	private consumeHoverMove(data: string): boolean {
 		if (!isMouseSequence(data)) return false;
-		const event = parseSgrMouseEvent(data);
-		if (!event || !isMouseHover(event)) return false;
+		const event = parseMouseHover(data);
+		if (!event) return false;
 		const fullscreen = this.fullscreen;
 		if (!fullscreen || !this.terminal.mouseTrackingActive) return true;
 		const modal = this.getTopmostVisibleOverlay();
