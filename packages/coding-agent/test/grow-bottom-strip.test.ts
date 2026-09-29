@@ -145,7 +145,7 @@ describe("the subagent strip", () => {
 	});
 
 	it("cuts a long name to about 16 columns with an ellipsis", () => {
-		const name = "a-very-long-subagent-name-indeed";
+		const name = "very-long-subagent-name-indeed-yes";
 		const line = strip([row("a", "running", name)]);
 		const text = plain(line.render(120));
 		expect(text).not.toContain(name);

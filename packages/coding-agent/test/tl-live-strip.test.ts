@@ -58,6 +58,32 @@ describe("the subagent strip as the design draws it", () => {
 		expect(line).toBe(` ${blocks}${" ".repeat(WIDTH - 1 - visibleWidth(blocks) - visibleWidth(hint))}${hint}`);
 	});
 
+	it("names a child by the short name the return rows use, its task tag after it", () => {
+		const line = stripAnsi(
+			strip([
+				{ id: "a", name: "review-grow-A-tui", tag: "钉住框头", state: "running" },
+				{ id: "b", name: "ff-review-d-keys", state: "done" },
+				{ id: "c", name: "worker-1", tag: "跑测试", state: "running" },
+				{ id: "d", name: "a-b-lane", state: "running" },
+			]).render(WIDTH)[0] ?? "",
+		);
+		expect(line).toContain(" ◇ A 钉住框头 回答中 ");
+		expect(line).toContain(" ◇ D ✓ 已交回 ");
+		expect(line).toContain(" ◇ worker-1 跑测试 回答中 ");
+		expect(line).toContain(" ◇ a-b-lane 回答中 ");
+		for (const long of ["review-grow-A-tui", "ff-review-d-keys"]) expect(line).not.toContain(long);
+	});
+
+	it("shortens the name of a child built from a snapshot, and keeps the full one for opening it", () => {
+		const [row] = buildSubagentPanelRows(
+			[snapshot({ id: "x", sessionName: "review-grow-B-box", label: "框的折叠：长高和收起" })],
+			undefined,
+		);
+		expect(row?.name).toBe("review-grow-B-box");
+		const line = stripAnsi(strip(row ? [row] : []).render(WIDTH)[0] ?? "");
+		expect(line).toContain(" ◇ B 框的折叠 回答中 ");
+	});
+
 	it("colors the pieces: glyph in the subagent color, name in the text color, states by outcome, hint faint", () => {
 		const raw = strip(designRows).render(WIDTH)[0] ?? "";
 		expect(raw).toContain(theme.bold(theme.fg("timelineSub", "◇")));

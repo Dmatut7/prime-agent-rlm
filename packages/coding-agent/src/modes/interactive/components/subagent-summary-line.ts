@@ -15,6 +15,7 @@ import { classifySessionRosterStatus, type SessionSummary } from "../../daemon/d
 import { formatTokenCount } from "../agent-activity.js";
 import { formatSpendCost } from "../spend-format.js";
 import { type ThemeBg, type ThemeColor, theme } from "../theme/theme.js";
+import { shortAgentName } from "./agent-message.js";
 import { keyText } from "./keybinding-hints.js";
 
 /** Leading indent of the strip. */
@@ -672,7 +673,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 				const name = stallMarkerName(marker);
 				if (named.has(name) || seen.has(name)) continue;
 				seen.add(name);
-				items.push({ key: `orphan:${name}`, kind: "orphan", name });
+				items.push({ key: `orphan:${name}`, kind: "orphan", name: shortAgentName(name) });
 			}
 			if (this.rows.length > 0) {
 				for (const row of this.dispatchOrder()) {
@@ -680,7 +681,8 @@ export class SubagentSummaryLine implements Component, Focusable {
 						key: `row:${row.id}`,
 						kind: "row",
 						row,
-						name: row.name,
+						// The short name the timeline's return rows use: `review-grow-B-box` reads `B`.
+						name: shortAgentName(row.name),
 						...(row.tag ? { tag: row.tag } : {}),
 						state: row.state,
 					});
