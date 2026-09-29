@@ -18,7 +18,7 @@ import {
 	type TimelineRowOptions,
 	timelineRow,
 } from "./timeline-gutter.js";
-import type { TimelineLaneTracker } from "./timeline-lane.js";
+import { type TimelineLaneTracker, timelineShowAll } from "./timeline-lane.js";
 import {
 	type BoxRow,
 	type BoxRowKind,
@@ -60,6 +60,12 @@ export const EVENT_STEPS_SHOWN = 3;
 const EVENT_TAIL_SHOWN = 2;
 const EVENT_NEWS_SHOWN = 3;
 const EVENT_NEWS = /\*\*[^*\n]+\*\*|发现|实锤|出错|失败|问题|结论/;
+/** A negated finding (`没问题`, `没有发现问题`, `无失败`) is an all-clear, not news. */
+const NEGATED_NEWS = /(?:没有|没|无|未|不存在)(?:发现|出错|失败|问题)+/g;
+
+function isNews(text: string): boolean {
+	return EVENT_NEWS.test(text.replace(NEGATED_NEWS, " "));
+}
 
 const NO_KEYS: ReadonlySet<string> = new Set();
 
@@ -69,11 +75,13 @@ function foldKeyOf(event: TimelineEvent | undefined): string {
 }
 
 /**
- * The runs of events a long stretch folds into `⋯ 中间还有 N 件事`: a run is consecutive events
- * between two boundaries (the question, a dispatch, a return, an error line, a steer, the end),
- * and only a stretch of more than three is folded. A folded run is two events or more.
+ * The runs of events a long stretch folds into `⋯ 中间还有 N 件事`: a stretch is consecutive events
+ * between two boundaries (the question, a dispatch, a return, an error line, a steer, the end).
+ * Its first event, its last two and up to three that carry news stay, so a stretch of five or more
+ * has anything to fold, and a folded run is two events or more.
  * An event in `pinned` (one the user opened, or the one the keyboard is on) is never folded: it
- * splits the run around it, unless the run is unfolded already and every event of it shows.
+ * splits the run around it, and a piece left with a single event folds nothing (so pinning an event
+ * in a short run unfolds the run). Nothing is folded once the run is unfolded and every event of it shows.
  */
 export function foldedEventRuns(
 	events: readonly TimelineEvent[],
@@ -126,7 +134,7 @@ export function foldedEventRuns(
 		const news = new Set<number>();
 		const middle = cluster.slice(1, -EVENT_TAIL_SHOWN);
 		for (const index of middle) {
-			if (news.size < EVENT_NEWS_SHOWN && EVENT_NEWS.test(events[index]?.text ?? "")) news.add(index);
+			if (news.size < EVENT_NEWS_SHOWN && isNews(events[index]?.text ?? "")) news.add(index);
 		}
 		let run: number[] = [];
 		const settle = (): void => {
@@ -578,12 +586,15 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		for (let row = 0; row < (input.leadingRows ?? 0); row++) gap(laneAt(firstAt));
 	}
 
-	const folds = foldedEventRuns(
-		input.events,
-		inline.map((row) => row.at),
-		pinnedEventKeys(input.events, ui),
-		ui.expanded,
-	);
+	// `完整过程` shows everything the timeline keeps folded or out of sight.
+	const folds = timelineShowAll.value
+		? []
+		: foldedEventRuns(
+				input.events,
+				inline.map((row) => row.at),
+				pinnedEventKeys(input.events, ui),
+				ui.expanded,
+			);
 	const runStart = new Map<number, number>();
 	for (const run of folds) for (const index of run) runStart.set(index, run[0] ?? index);
 	input.events.forEach((event, index) => {

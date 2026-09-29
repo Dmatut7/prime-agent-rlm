@@ -1,0 +1,1 @@
+- Fixed the timeline folding lines like "没问题" as if they were problems, "完整过程" not opening the folded middle events, and two light-theme colors (the subagent lane and the done mark) that were hard to read on white.

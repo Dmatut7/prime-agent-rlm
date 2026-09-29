@@ -9,7 +9,7 @@ import { theme } from "../theme/theme.js";
 import { getSpinnerTick } from "../theme/working-icon.js";
 import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock, withoutGutter } from "./block-focus.js";
 import type { FileChangeSummary } from "./edit-summary.js";
-import type { TimelineLaneTracker } from "./timeline-lane.js";
+import { type TimelineLaneTracker, timelineShowAll } from "./timeline-lane.js";
 import {
 	type BoxRow,
 	buildTimelineView,
@@ -1003,7 +1003,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		const tracker = this.laneTracker;
 		// The finished view has its own key (steps, entries, how it ended, cwd, hideThinking).
 		const view = state.boxView(now);
-		const cacheKey = `${width}:${viewportRows}:${ui.version}:${this.leadingRows}:${this.blockFocus !== undefined}:${tracker?.pending.join("|") ?? ""}:${state.boxViewKey()}`;
+		const cacheKey = `${width}:${viewportRows}:${ui.version}:${timelineShowAll.value ? "all" : "std"}:${this.leadingRows}:${this.blockFocus !== undefined}:${tracker?.pending.join("|") ?? ""}:${state.boxViewKey()}`;
 		if (this.cachedLines && this.boxCacheKey === cacheKey) return this.cachedLines;
 		const hideThinking = host.hideThinking?.() ?? false;
 		const header = computeBoxHeader({

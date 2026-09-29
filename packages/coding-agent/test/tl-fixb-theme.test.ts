@@ -34,6 +34,8 @@ const TEXT_COLORS = [
 	"timelineLive",
 	"timelineSub",
 	"timelineFix",
+	"timelineLane",
+	"timelineOk",
 ] as const satisfies readonly ThemeColor[];
 
 describe("the light theme's timeline colors on white", () => {
@@ -46,6 +48,12 @@ describe("the light theme's timeline colors on white", () => {
 
 	it("draws a fix mark in the same orange as a subagent mark, as it is meant to", () => {
 		expect(rgbOf("timelineFix")).toEqual(rgbOf("timelineSub"));
+	});
+
+	it("keeps the lane's amber apart from the subagent's orange", () => {
+		const [lr, lg, lb] = rgbOf("timelineLane");
+		const [sr, sg, sb] = rgbOf("timelineSub");
+		expect(Math.hypot(lr - sr, lg - sg, lb - sb)).toBeGreaterThanOrEqual(50);
 	});
 
 	it("keeps the weakest layers weak: the rail and the faint text stay lighter than the time stamp", () => {
