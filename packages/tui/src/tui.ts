@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
-import type { ClickRegion } from "./click-regions.js";
+import type { ClickRegion, StickyHeader } from "./click-regions.js";
 import { withFullscreenImageFallback } from "./components/image.js";
 import {
 	type FrameClickEntry,
@@ -80,6 +80,12 @@ export interface Component {
 	 * render-output coordinates. Containers aggregate them with line offsets.
 	 */
 	getClickRegions?(): ReadonlyArray<ClickRegion>;
+
+	/**
+	 * Sticky headers produced by the last render() call, in the component's own
+	 * render-output coordinates. Only the fullscreen transcript window pins them.
+	 */
+	getStickyHeaders?(): ReadonlyArray<StickyHeader>;
 
 	/**
 	 * Optional handler for keyboard input when component has focus

@@ -5,7 +5,7 @@ export {
 	CombinedAutocompleteProvider,
 	type SlashCommand,
 } from "./autocomplete.js";
-export type { ClickPosition, ClickRegion } from "./click-regions.js";
+export type { ClickPosition, ClickRegion, StickyHeader } from "./click-regions.js";
 export { Box } from "./components/box.js";
 export { CancellableLoader } from "./components/cancellable-loader.js";
 export { Clickable } from "./components/clickable.js";
