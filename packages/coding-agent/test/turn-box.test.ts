@@ -13,7 +13,7 @@ import {
 	TurnActivityState,
 	TurnSummaryComponent,
 } from "../src/modes/interactive/components/turn-activity.js";
-import { BOX_MAX_WIDTH, boxBodyRows } from "../src/modes/interactive/components/turn-box.js";
+import { boxBodyRows } from "../src/modes/interactive/components/turn-box.js";
 import { TurnBoxNavigator } from "../src/modes/interactive/components/turn-box-navigator.js";
 import { STRIP_EDITS, STRIP_MEMORIES, TurnStripComponent } from "../src/modes/interactive/components/turn-strip.js";
 import { TurnTimeline } from "../src/modes/interactive/components/turn-timeline.js";
@@ -133,7 +133,7 @@ describe("timeline rows from the kernel's records", () => {
 		const live = text(turn.summary.render(120));
 		expect(live).toContain("go test ./...");
 		expect(live).toContain("└ === RUN TestTimeoutRetry");
-		expect(live).toMatch(/go test \.\/\.\.\.\s+[23]秒 │/);
+		expect(live).toMatch(/go test \.\/\.\.\.\s+[23]秒\s+│/);
 		expect(live).toContain("正在运行 go test ./...");
 
 		turn.timeline.mergeStep(
@@ -160,7 +160,7 @@ describe("timeline rows from the kernel's records", () => {
 		);
 		turn.state.setStepStatus("c1", "done");
 		const done = text(turn.summary.render(120));
-		expect(done).toMatch(/\$ go test \.\/\.\.\.\s+✗ 54 通过 · 2 失败 │/);
+		expect(done).toMatch(/\$ go test \.\/\.\.\.\s+✗ 54 通过 · 2 失败\s+│/);
 		expect(done).not.toContain("└ === RUN");
 	});
 
@@ -253,8 +253,8 @@ describe("timeline rows from the kernel's records", () => {
 			false,
 		);
 		const out = text(turn.summary.render(120));
-		expect(out).toMatch(/✎ modules\/aichat\/client\.go\s+\+12 −4 │/);
-		expect(out).toMatch(/✎ \/tmp\/probe\.py\s+临时 \+9 │/);
+		expect(out).toMatch(/✎ modules\/aichat\/client\.go\s+\+12 −4\s+│/);
+		expect(out).toMatch(/✎ \/tmp\/probe\.py\s+临时 \+9\s+│/);
 		expect(out).toContain("✦ 记住：go · http · 请求要带 · context");
 		expect(out).not.toContain("_2026");
 	});
@@ -360,8 +360,8 @@ describe("timeline rows without kernel records (today's data)", () => {
 			false,
 		);
 		const out = text(turn.summary.render(120));
-		expect(out).toMatch(/✎ src\/b\.ts\s+\+1 −1 │/);
-		expect(out).toMatch(/✎ src\/c\.ts\s+\+2 −1 │/);
+		expect(out).toMatch(/✎ src\/b\.ts\s+\+1 −1\s+│/);
+		expect(out).toMatch(/✎ src\/c\.ts\s+\+2 −1\s+│/);
 	});
 });
 
@@ -373,7 +373,7 @@ describe("events inside the box", () => {
 		turn.timeline.addSteer("先别动安卓的，只升级 Go", T0 - 9_000);
 		turn.timeline.startRetry({ startedAt: T0 - 500, delayMs: 3_000, attempt: 1, reason: "模型接口超时" });
 		expect(text(turn.summary.render(120))).toContain("↻ 模型接口超时，3 秒后重试");
-		expect(text(turn.summary.render(120))).toContain("› 你插话：先别动安卓的，只升级 Go");
+		expect(text(turn.summary.render(120))).toContain("你插话：先别动安卓的，只升级 Go");
 		turn.timeline.endRetry("ok");
 		turn.timeline.startCompaction(T0, 182_000);
 		const compacting = text(turn.summary.render(120));
@@ -393,7 +393,7 @@ describe("events inside the box", () => {
 			result: "发现 1 处问题",
 			report: "aichat 超时不重试。",
 		});
-		expect(text(turn.summary.render(120))).toMatch(/◇ 子代理 审查员·Go\s+✓ 发现 1 处问题 │/);
+		expect(text(turn.summary.render(120))).toMatch(/◇ 子代理 审查员·Go\s+✓ 发现 1 处问题\s+│/);
 	});
 
 	it("keeps a failed step as a red row after the box folds", () => {
@@ -409,9 +409,11 @@ describe("events inside the box", () => {
 			},
 			false,
 		);
+		// The turn ended on the error: nothing corrected it, so the red row stays out when folded.
+		turn.timeline.errorEnded = true;
 		turn.state.markTurnEnded(Date.now());
 		const closed = text(turn.summary.render(120));
-		expect(closed).toContain("▸ ✓");
+		expect(closed).toContain("▸ ✗");
 		expect(closed).toContain("ModuleNotFoundError: No module named 'nope'");
 		expect(closed).toContain("1 处出错");
 	});
@@ -490,7 +492,7 @@ describe("the thinking window", () => {
 		const turn = quietTurn();
 		const message = assistant(Date.now(), [{ type: "thinking", thinking: "短。" }]);
 		turn.timeline.noteMessage(message, false);
-		const windowLines = () => plain(turn.summary.render(80)).filter((line) => /^ │ {5}│ /.test(line));
+		const windowLines = () => plain(turn.summary.render(80)).filter((line) => /^ │ ▎ {4}/.test(line));
 		expect(windowLines()).toHaveLength(3);
 		const long = "这是很长的一段思考，".repeat(20);
 		turn.timeline.noteMessage({ ...message, content: [{ type: "thinking", thinking: long }] }, false);
@@ -514,7 +516,9 @@ describe("scrolling inside the box", () => {
 		const lines = plain(turn.summary.render(100));
 		const body = lines.filter((line) => line.startsWith(" │ ") && line !== lines[2]);
 		expect(body).toHaveLength(boxBodyRows(20));
-		expect(body.at(-1)).toContain("echo 19");
+		// The newest block is the last two lines: the row and the separator under it.
+		expect(body.at(-2)).toContain("echo 19");
+		expect(body.at(-1)).toMatch(/^ │ ▀+ │$/);
 		expect(lines[3]).toContain("↑ 上面还有");
 	});
 
@@ -741,7 +745,7 @@ describe("layout", () => {
 		turn.timeline.addSteer("先别动安卓的，只升级 Go。这句话很长很长很长很长很长很长很长很长很长", Date.now());
 		for (const width of [80, 60, 200]) {
 			const lines = turn.summary.render(width);
-			const outer = Math.max(24, Math.min(width - 1, BOX_MAX_WIDTH));
+			const outer = Math.max(24, width - 1);
 			for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 			for (const line of lines.slice(1)) expect(visibleWidth(line)).toBe(outer + 1);
 		}
@@ -983,7 +987,7 @@ describe("replay groups a transcript the way the live view does", () => {
 		summary.setExpanded(true);
 		setMotionReduced(true);
 		const out = text(summary.render(120));
-		expect(out).toContain("› 你插话：先别动安卓的");
+		expect(out).toContain("你插话：先别动安卓的");
 		expect(out).toContain("go list -m -u all");
 	});
 

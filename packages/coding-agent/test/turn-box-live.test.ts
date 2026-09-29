@@ -479,7 +479,7 @@ describe("a quiet turn, live", () => {
 		feed(screen, steps);
 		expect(screen.boxes()).toHaveLength(1);
 		expect(screen.prompts()).toBe(1);
-		expect(screen.screen()).toContain("› 你插话：顺便看下 lint");
+		expect(screen.screen()).toContain("你插话：顺便看下 lint");
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(vi.getTimerCount()).toBe(0);
 	});
@@ -787,7 +787,7 @@ describe("a quiet turn seen from a second view", () => {
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(screen.boxes()).toHaveLength(1);
 		expect(screen.prompts()).toBe(1);
-		expect(screen.opened(screen.boxes()[0]!)).toContain("› 你插话：顺便看下 lint");
+		expect(screen.opened(screen.boxes()[0]!)).toContain("你插话：顺便看下 lint");
 	});
 });
 
@@ -815,7 +815,7 @@ describe("a quiet turn a notice carries on", () => {
 		const shown = screen.screen();
 		expect(shown).toContain("收到它的结束通知，结论不变。");
 		expect(shown).not.toContain("子代理回来了");
-		expect(screen.opened(screen.boxes()[0]!)).toContain("· 子代理回来了：当前目录有 3 个文件");
+		expect(screen.opened(screen.boxes()[0]!)).toContain("子代理回来了：当前目录有 3 个文件");
 	});
 });
 
@@ -868,7 +868,7 @@ describe("a quiet turn replayed from its transcript", () => {
 		for (const screen of [live, cold]) {
 			expect(screen.boxes()).toHaveLength(1);
 			expect(screen.prompts()).toBe(1);
-			expect(screen.opened(screen.boxes()[0]!)).toContain("› 你插话：失败了就只跑出错的那个");
+			expect(screen.opened(screen.boxes()[0]!)).toContain("你插话：失败了就只跑出错的那个");
 		}
 	});
 });
@@ -981,7 +981,7 @@ describe("a quiet turn across a chat rebuild", () => {
 		const screen = startScreen(steps);
 		feed(screen, steps);
 		expect(screen.boxes()).toHaveLength(1);
-		expect(screen.screen()).toContain("› 你插话：失败了就只跑出错的那个");
+		expect(screen.screen()).toContain("你插话：失败了就只跑出错的那个");
 		vi.advanceTimersByTime(100);
 		screen.rebuild(transcriptAt(steps, steps.length));
 		const replayed = screen.boxes();

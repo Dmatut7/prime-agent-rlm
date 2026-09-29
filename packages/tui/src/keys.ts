@@ -1173,8 +1173,9 @@ export function matchesKey(data: string, keyId: KeyId): boolean {
 		}
 
 		if (modifier === MODIFIERS.alt + MODIFIERS.shift && !_kittyProtocolActive && isLetter) {
-			// Legacy: alt+shift+letter is ESC followed by the uppercase letter
-			if (data === `\x1b${key.toUpperCase()}`) return true;
+			// Legacy: alt+shift+letter is ESC followed by the uppercase letter. ESC B and ESC F are the
+			// readline word-movement keys (alt+left, alt+right, as parseKey reads them), so they are excluded.
+			if (key !== "b" && key !== "f" && data === `\x1b${key.toUpperCase()}`) return true;
 		}
 
 		if (modifier === MODIFIERS.ctrl) {

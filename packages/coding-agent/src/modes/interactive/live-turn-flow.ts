@@ -7,6 +7,7 @@ import {
 	countThinkingSegments,
 	latestThinkingText,
 	NO_STEP_STOP,
+	resolveTurnHeaders,
 	type StepResultStop,
 	stepResultStop,
 } from "./components/conversation-components.js";
@@ -106,6 +107,8 @@ export class LiveTurnFlow {
 	private lostBox: { state: TurnActivityState; noticeKey: string; steps: string[] } | undefined;
 	/** A run-starting message (a prompt) arrived since the last agent_start; otherwise the run continues a turn. */
 	private starterSinceRunStart = false;
+	/** Who opened the run in progress: the user's prompt, or a message that woke the agent (none: it went on by itself). */
+	private starterKind: "user" | "wake" | undefined;
 	/** A compaction row still waiting for the context size it ended with (the next reply's usage). */
 	private compactionAwaitingAfter: string | undefined;
 	private lastFinishedState: TurnActivityState | undefined;
@@ -132,11 +135,13 @@ export class LiveTurnFlow {
 		if (existing) return existing.state;
 		const state = new TurnActivityState(this.host.runStartedAt() ?? Date.now());
 		state.live = true;
+		state.startedByUser = this.starterKind === "user";
 		const summary = this.host.createSummary(state);
 		summary.setExpanded(this.host.startExpanded());
 		summary.setQuiet(this.host.quiet());
 		this.host.setCurrent(summary);
 		this.host.chat().addChild(summary);
+		resolveTurnHeaders(this.host.chat().children);
 		return state;
 	}
 
@@ -145,6 +150,7 @@ export class LiveTurnFlow {
 		// own (a retry, a compaction's continuation) goes on in the same box,
 		// exactly as a replay of the transcript groups it.
 		this.starterSinceRunStart = false;
+		this.starterKind = undefined;
 		const state = this.host.currentState();
 		this.runCutMidTask =
 			this.host.quiet() &&
@@ -165,6 +171,7 @@ export class LiveTurnFlow {
 		if (!this.host.quiet()) return false;
 		if (startsAgentRun(message) && this.lastStop !== "toolUse") {
 			this.starterSinceRunStart = true;
+			this.starterKind = "wake";
 			this.endLiveTurnForNewRun();
 			return false;
 		}
@@ -200,6 +207,7 @@ export class LiveTurnFlow {
 			return "interjection";
 		}
 		this.starterSinceRunStart = true;
+		this.starterKind = "user";
 		if (quiet) this.endLiveTurnForNewRun();
 		return "prompt";
 	}
@@ -241,6 +249,8 @@ export class LiveTurnFlow {
 		// The header names the model; until the first token arrives the box says it waits.
 		state.modelId = message.model || state.modelId;
 		state.notePhase("waiting");
+		// The title depends on the model, which is only known now.
+		resolveTurnHeaders(this.host.chat().children);
 	}
 
 	assistantUpdate(message: AssistantMessage, event: AssistantMessageEvent): void {
@@ -712,6 +722,7 @@ export class LiveTurnFlow {
 		this.openMessage = undefined;
 		this.lostBox = undefined;
 		this.starterSinceRunStart = false;
+		this.starterKind = undefined;
 		this.compactionAwaitingAfter = undefined;
 		this.handleCommands.clear();
 	}

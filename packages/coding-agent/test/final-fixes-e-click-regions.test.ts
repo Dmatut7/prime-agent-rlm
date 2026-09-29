@@ -10,7 +10,6 @@ import {
 	TurnActivityState,
 	TurnSummaryComponent,
 } from "../src/modes/interactive/components/turn-activity.js";
-import { BOX_MAX_WIDTH } from "../src/modes/interactive/components/turn-box.js";
 import { TurnStripComponent } from "../src/modes/interactive/components/turn-strip.js";
 import { TurnTimeline } from "../src/modes/interactive/components/turn-timeline.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
@@ -155,9 +154,8 @@ function openStrip(list: "edits" | "memories", width: number) {
 }
 
 const NARROW_TO_THIRTY = Array.from({ length: 30 }, (_, index) => index + 1);
-/** Below 5 columns the frame cannot be drawn whole; from 5 up it fills the line to `BOX_MAX_WIDTH + 1`. */
-const FRAME_WIDTHS = [1, 2, 3, 4, 5, 6, 30, 80, BOX_MAX_WIDTH, BOX_MAX_WIDTH + 1, BOX_MAX_WIDTH + 2, 200];
-const frameWidth = (width: number) => Math.min(width, BOX_MAX_WIDTH + 1);
+/** Below 5 columns the frame cannot be drawn whole; from 5 up it fills the whole line. */
+const FRAME_WIDTHS = [1, 2, 3, 4, 5, 6, 30, 80, 120, 121, 122, 200];
 
 beforeAll(() => {
 	initTheme("prime");
@@ -197,7 +195,7 @@ describe("the box's click areas stay on the screen", () => {
 			expect(framed.length, `framed areas at ${width}`).toBeGreaterThan(0);
 			for (const region of framed) {
 				expect(region.col, `column of line ${region.line} at ${width}`).toBe(0);
-				expect(region.width, `width of line ${region.line} at ${width}`).toBe(frameWidth(width));
+				expect(region.width, `width of line ${region.line} at ${width}`).toBe(width);
 			}
 		}
 	});
@@ -230,7 +228,7 @@ describe("the change strip's click areas stay on the screen", () => {
 				expect(items.length, `${list} item areas at ${width}`).toBeGreaterThan(0);
 				for (const region of items) {
 					expect(region.col).toBe(0);
-					expect(region.width, `${list} item width at ${width}`).toBe(frameWidth(width));
+					expect(region.width, `${list} item width at ${width}`).toBe(width);
 					expect(region.line, `${list} item line at ${width}`).toBeLessThan(lines.length);
 				}
 			}

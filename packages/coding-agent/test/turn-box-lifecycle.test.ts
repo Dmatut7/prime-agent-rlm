@@ -516,6 +516,6 @@ describe("reopening a session", () => {
 		);
 		expect(screen.boxes()).toHaveLength(1);
 		expect(screen.prompts()).toEqual(["跑一下 e2e"]);
-		expect(opened(screen.boxes()[0]!)).toContain("› 你插话：失败了就只跑出错的那个");
+		expect(opened(screen.boxes()[0]!)).toContain("你插话：失败了就只跑出错的那个");
 	});
 });

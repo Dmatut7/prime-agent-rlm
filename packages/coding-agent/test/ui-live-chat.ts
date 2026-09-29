@@ -1,0 +1,165 @@
+import { Container, Spacer } from "@earendil-works/pi-tui";
+import {
+	AGENT_MESSAGE_SOURCE,
+	type AgentSessionMessage,
+	createAgentSessionMessage,
+} from "../src/core/agent-messages.js";
+import { AGENT_MESSAGE_TURN_INSET, AgentMessageComponent } from "../src/modes/interactive/components/agent-message.js";
+import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
+import {
+	foldEarlierAnswers,
+	isCompactAgentMessageNeighbor,
+} from "../src/modes/interactive/components/conversation-components.js";
+import { type TimelineHost, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
+import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
+import { LiveTurnFlow } from "../src/modes/interactive/live-turn-flow.js";
+import { assistant, T0 } from "./ui-blocks-helpers.js";
+
+export function handedBack(id: string, at = T0, name = "ff-review-d-keys"): AgentSessionMessage {
+	return createAgentSessionMessage(
+		{
+			id,
+			source: AGENT_MESSAGE_SOURCE,
+			message: "审查完毕",
+			from: { sessionName: name, sessionId: `${id}-child`, activeSessionId: `${id}-child-active` },
+			fromRelationship: "child",
+			target: { activeSessionId: "main-active", sessionId: "main" },
+		},
+		at,
+	);
+}
+
+/**
+ * The live path: a chat and the flow that feeds it, filled the way the interactive
+ * mode fills its chat (a spacer before a prompt, a reply's component, a handed-back
+ * message's row with its own spacing rule).
+ */
+export class LiveChat {
+	readonly chat = new Container();
+	readonly flow: LiveTurnFlow;
+	private current: TurnSummaryComponent | undefined;
+	private streaming = false;
+	private clock = T0;
+
+	constructor() {
+		const timelineHost: TimelineHost = {
+			cwd: () => "/work/app",
+			viewportRows: () => 40,
+			openWhileWorking: () => true,
+			autoFold: () => true,
+			requestRender: () => {},
+		};
+		this.flow = new LiveTurnFlow({
+			chat: () => this.chat,
+			quiet: () => true,
+			isStreaming: () => this.streaming,
+			retryPending: () => false,
+			compacting: () => false,
+			contextTokens: () => undefined,
+			cwd: () => "/work/app",
+			rlmNodeId: () => undefined,
+			createSummary: (state) => {
+				const summary = new TurnSummaryComponent(state);
+				summary.setTimelineHost(timelineHost);
+				return summary;
+			},
+			runStartedAt: () => undefined,
+			startExpanded: () => false,
+			currentState: () => this.current?.state,
+			currentSummary: () => this.current,
+			setCurrent: (summary) => {
+				this.current = summary;
+			},
+			foldEarlierAnswers: (summary) => foldEarlierAnswers(this.chat.children, summary),
+			requestRender: () => {},
+			liveChanged: () => {},
+		});
+	}
+
+	private tick(): number {
+		this.clock += 1_000;
+		return this.clock;
+	}
+
+	private reply(model: string, answer: string | undefined, cutMidStep = false): void {
+		const content = cutMidStep
+			? [
+					{
+						type: "toolCall" as const,
+						id: `cut${this.clock}`,
+						name: "ipython",
+						arguments: { code: "await bash('sleep 60')" },
+					},
+				]
+			: answer
+				? [{ type: "text" as const, text: answer }]
+				: [];
+		const message = assistant(this.tick(), content, cutMidStep ? "aborted" : "stop", model);
+		this.flow.assistantStart(message);
+		const component = new AssistantMessageComponent(undefined, false, undefined, "Thinking", { quiet: true });
+		this.chat.addChild(component);
+		component.updateContent(message, false);
+		this.flow.assistantEnd(message);
+		this.flow.agentEnd();
+		this.streaming = false;
+	}
+
+	private addMessageRow(message: AgentSessionMessage): void {
+		this.chat.addChild(
+			new AgentMessageComponent(message, undefined, {
+				suppressLeadingSpace: isCompactAgentMessageNeighbor(this.chat.children.at(-1)),
+				inset: AGENT_MESSAGE_TURN_INSET,
+			}),
+		);
+	}
+
+	/** The user types a prompt and the AI answers on `model` (or is stopped in the middle of a step). */
+	prompt(text: string, options: { model?: string; answer?: string; cutMidStep?: boolean } = {}): void {
+		this.streaming = true;
+		this.flow.agentStart();
+		if (this.flow.userMessage(text, this.tick()) === "prompt") {
+			if (this.chat.children.length > 0) this.chat.addChild(new Spacer(1));
+			this.chat.addChild(new UserMessageComponent(text));
+		}
+		this.reply(options.model ?? "glm-5.3-prime", options.answer, options.cutMidStep);
+	}
+
+	/**
+	 * A subagent hands a message back, which wakes the AI on `model`; `also` are
+	 * messages that land right after it, before the AI starts answering.
+	 */
+	wake(
+		id: string,
+		options: { model?: string; answer?: string; name?: string; also?: Array<{ id: string; name: string }> } = {},
+	): void {
+		this.streaming = true;
+		this.flow.agentStart();
+		const message = handedBack(id, this.tick(), options.name);
+		if (!this.flow.customMessage(message)) this.addMessageRow(message);
+		for (const other of options.also ?? []) this.addMessageRow(handedBack(other.id, this.tick(), other.name));
+		this.reply(options.model ?? "glm-5.3-prime", options.answer);
+	}
+
+	/** A wake-up whose message the chat does not show. */
+	wakeUnseen(id: string, options: { model?: string; answer?: string } = {}): void {
+		this.streaming = true;
+		this.flow.agentStart();
+		this.flow.customMessage({ ...handedBack(id, this.tick()), display: false });
+		this.reply(options.model ?? "glm-5.3-prime", options.answer);
+	}
+
+	/** A run that no message started (an automatic continuation). */
+	continueOnItsOwn(model = "glm-5.3-prime"): void {
+		this.streaming = true;
+		this.flow.agentStart();
+		this.reply(model, undefined);
+	}
+
+	summaries(): TurnSummaryComponent[] {
+		return this.chat.children.filter((child): child is TurnSummaryComponent => child instanceof TurnSummaryComponent);
+	}
+
+	lines(width = 100): string[] {
+		return this.chat.children.flatMap((child) => child.render(width));
+	}
+}

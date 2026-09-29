@@ -1,5 +1,5 @@
 import { type ClickRegion, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { type ThemeColor, theme } from "../theme/theme.js";
+import { type ThemeBg, type ThemeColor, theme } from "../theme/theme.js";
 import { spinnerFrame } from "../theme/working-icon.js";
 import { sanitizeDisplayText } from "./diff-rows.js";
 import {
@@ -21,20 +21,27 @@ import { formatBoxDuration, formatBoxTokens, lastCompletedSentence, type TurnTim
  * body has a fixed maximum height and scrolls inside the frame; it follows
  * the newest line until the user scrolls up, then says `↓ 有新内容`.
  *
+ * Every step is a block: a row painted in its kind's color, indented one
+ * column inside the frame, with a row of `▀` under it that leaves a half-line
+ * gap before the next block (the separator belongs to the block's click area).
+ * What hangs under a block (an opened step, the live thought, a command's
+ * latest output) sits on the panel color behind a bar in the kind's color. A
+ * short note (what the AI said between steps) is plain text, not a block.
+ *
  * ```
  *  ╭──────────────────────────────────────────────────────────╮
  *  │ ▾ ⠹ 思考中 · 这个测试上个月还是好的           16秒 · ↓ 2.4k │
  *  ├──────────────────────────────────────────────────────────┤
- *  │ ▸ ∴ 思考了 4秒 用户要审查最近 100 次提交        4秒 · 1.1k │
- *  │ ▸ $ git log --stat -100               ✓ 100 次提交 · 312 │
- *  │   ∴ 思考中                                           1秒 │
- *  │     │ TestTimeoutRetry 失败了，报错说请求超时后没有重试。  │
+ *  │  ▸ ∴ 思考了 4秒 用户要审查最近 100 次提交      4秒 · 1.1k  │
+ *  │ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀ │
+ *  │  ▾ $ git log --stat -100              ✓ 100 次提交 · 312  │
+ *  │ ▎    commit 522f16718  test(tui): widen the timing…      │
+ *  │ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀ │
+ *  │      趁等待，查一下这个风险点。                           │
  *  ╰──────────────────────────────────────────────────────────╯
  * ```
  */
 
-/** The box never grows wider than this: a long row reads badly across a wide screen. */
-export const BOX_MAX_WIDTH = 120;
 /** Body rows the box shows at most, and at least when the terminal is short. */
 export const BOX_BODY_MAX_ROWS = 14;
 export const BOX_BODY_MIN_ROWS = 4;
@@ -50,7 +57,7 @@ const BOX_MIN_OUTER = 4;
 
 /** The frame's width for `width` columns (the line also has a one-column margin). */
 export function boxOuterWidth(width: number): number {
-	return Math.max(BOX_MIN_OUTER, Math.min(Math.floor(width) - 1, BOX_MAX_WIDTH));
+	return Math.max(BOX_MIN_OUTER, Math.floor(width) - 1);
 }
 
 /** The click area of one framed line: the frame and its margin, never past the terminal's last column. */
@@ -122,7 +129,7 @@ export function computeBoxHeader(input: BoxHeaderInput): BoxHeader {
 	if (!input.live) {
 		const summary: MetaPart[] = [];
 		summaryParts(facts).forEach((group, index) => {
-			if (index > 0) summary.push(part(" · ", "dim"));
+			if (index > 0) summary.push(part(" · ", "muted"));
 			summary.push(...group);
 		});
 		return timeline.errorEnded ? done("✗", "error", summary) : done("✓", "diffAddedText", summary);
@@ -197,27 +204,114 @@ export interface BoxRenderResult {
 	focusOrder: string[];
 }
 
+/** Column a block's text starts at; notes and what hangs under a block line up with it. */
+const TEXT_INDENT = 5;
+/** A note of at most this many wrapped lines is plain text; a longer one is a block. */
+export const NOTE_MAX_LINES = 3;
+
+interface BlockStyle {
+	/** The kind's foreground (glyph, bar, hint); a neutral block keeps its row's own glyph color. */
+	fg?: ThemeColor;
+	bg: ThemeBg;
+	hoverBg: ThemeBg;
+}
+
+const KIND_STYLES = {
+	think: { fg: "kindThink", bg: "kindThinkBg", hoverBg: "kindThinkHoverBg" },
+	cmd: { fg: "kindCommand", bg: "kindCommandBg", hoverBg: "kindCommandHoverBg" },
+	read: { fg: "kindRead", bg: "kindReadBg", hoverBg: "kindReadHoverBg" },
+	subagent: { fg: "kindSubagent", bg: "kindSubagentBg", hoverBg: "kindSubagentHoverBg" },
+	error: { fg: "kindError", bg: "kindErrorBg", hoverBg: "kindErrorHoverBg" },
+	edit: { fg: "kindEdit", bg: "kindEditBg", hoverBg: "kindEditHoverBg" },
+	memory: { fg: "kindMemory", bg: "kindMemoryBg", hoverBg: "kindMemoryHoverBg" },
+} satisfies Record<string, BlockStyle>;
+const NEUTRAL_STYLE: BlockStyle = { bg: "customMessageBg", hoverBg: "selectedBg" };
+const RETRY_STYLE: BlockStyle = { fg: "kindRecovered", bg: "customMessageBg", hoverBg: "selectedBg" };
+
+/** The color family of a row's block: by kind, red for a failure, neutral for what is not a step's work. */
+function blockStyle(row: BoxRow): BlockStyle {
+	if (row.status === "stopped") return NEUTRAL_STYLE;
+	if (row.status === "failed" || row.kind === "error") return KIND_STYLES.error;
+	switch (row.kind) {
+		case "think":
+			return KIND_STYLES.think;
+		case "cmd":
+			return KIND_STYLES.cmd;
+		case "read":
+			return KIND_STYLES.read;
+		case "edit":
+			return KIND_STYLES.edit;
+		case "memory":
+			return KIND_STYLES.memory;
+		case "subagent":
+			return KIND_STYLES.subagent;
+		case "step":
+			return row.status === "plain" ? NEUTRAL_STYLE : KIND_STYLES.read;
+		case "retry":
+			return RETRY_STYLE;
+		default:
+			return NEUTRAL_STYLE;
+	}
+}
+
+/** Which part of a block or note a body line is. */
+type LinePart = "head" | "gap" | "panel" | "note";
+
 interface BodyLine {
+	/** Styled content of exactly the inner width. */
 	text: string;
 	rowKey?: string;
-	/** The row's own line (not its sub, window or opened lines). */
-	head?: boolean;
+	part?: LinePart;
 	/** A line the user opened under a row: never counted as new content. */
 	detail?: boolean;
-	/** Background painted over the whole inner width. */
-	bg?: "rowFlashBg" | "rowFlashFadeBg" | "cardFocusBg" | "diffRemovedLineBg";
 }
 
 function styled(parts: readonly MetaPart[]): string {
 	return parts.map((entry) => theme.fg(entry.color, entry.text)).join("");
 }
 
+/** Columns the left side keeps at least when a right side is drawn beside it. */
+const LEFT_MIN_ROOM = 6;
+
 /** `left` and `right` on one line of exactly `width` columns; the left side gives way. */
 function spread(left: string, right: string, width: number): string {
 	const rightWidth = visibleWidth(right);
-	if (!right || rightWidth + 6 > width) return truncateToWidth(left, width, "…", true);
+	if (!right || rightWidth + LEFT_MIN_ROOM > width) return truncateToWidth(left, width, "…", true);
 	const fitted = truncateToWidth(left, Math.max(1, width - rightWidth - 2), "…");
 	return `${fitted}${" ".repeat(Math.max(2, width - visibleWidth(fitted) - rightWidth))}${right}`;
+}
+
+/** A color that resets the background (or everything) inside a painted line. */
+const BG_RESET = /\x1b\[(?:0|49)?m/g;
+
+/**
+ * `content` cut or padded to `width` columns and painted on `bg`. A color
+ * inside it that resets the background (a diff line's tint) does not end the
+ * paint: the background is put back right after it.
+ */
+function paintBg(bg: ThemeBg, content: string, width: number): string {
+	const fitted = truncateToWidth(content, width, "…", true);
+	const open = theme.getBgAnsi(bg);
+	return `${open}${fitted.replace(BG_RESET, (reset) => `${reset}${open}`)}\x1b[49m`;
+}
+
+/** A row of `▀` in a background's own color: the half-line gap under a block. */
+function gapLine(bg: ThemeBg, width: number): string {
+	const ansi = theme.getBgAnsi(bg);
+	const fill = "\x1b[48;";
+	if (!ansi.startsWith(fill)) return " ".repeat(width);
+	return `\x1b[38;${ansi.slice(fill.length)}${"▀".repeat(width)}\x1b[39m`;
+}
+
+/**
+ * A block's right side: the hint and the result, or the hint alone when both would
+ * leave the text too little room (the hint says what a click does, the result can
+ * wait); `spread` leaves out whatever still does not fit.
+ */
+function blockSide(hint: string, result: string, width: number): string {
+	if (!hint) return result;
+	const both = result ? `${hint}  ${result}` : hint;
+	return visibleWidth(both) + LEFT_MIN_ROOM > width ? hint : both;
 }
 
 function shimmerText(text: string, tick: number): string {
@@ -232,19 +326,21 @@ function shimmerText(text: string, tick: number): string {
 		.join("");
 }
 
-function rowGlyph(row: BoxRow, timeline: TurnTimeline, input: BoxRenderInput): string {
+function rowGlyph(row: BoxRow, style: BlockStyle, timeline: TurnTimeline, input: BoxRenderInput): string {
 	// A live thought keeps its ∴ and a retry its ↻: the keyword, the window and
 	// the countdown say they are going on.
 	if (row.status === "running" && row.kind !== "think" && row.kind !== "retry") {
 		const slow = row.startedAt !== undefined && input.now - row.startedAt >= SLOW_STEP_MS;
-		return theme.bold(theme.fg(slow ? "runCardWarn" : "activityAccent", spinnerFrame(input.tick, slow)));
+		return theme.bold(
+			theme.fg(slow ? "runCardWarn" : (style.fg ?? "activityAccent"), spinnerFrame(input.tick, slow)),
+		);
 	}
 	const settled = timeline.ui.settledAt.get(row.key);
 	if (withinMotion(settled, SETTLE_FLASH_MS, input.now)) {
 		const color = row.status === "failed" || row.kind === "error" ? "diffRemovedText" : "diffAddedText";
 		return theme.bold(theme.fg(color, row.glyph));
 	}
-	return theme.fg(row.glyphColor, row.glyph);
+	return style.fg ? theme.bold(theme.fg(style.fg, row.glyph)) : theme.fg(row.glyphColor, row.glyph);
 }
 
 function rowRight(row: BoxRow, input: BoxRenderInput): string {
@@ -255,12 +351,22 @@ function rowRight(row: BoxRow, input: BoxRenderInput): string {
 	return styled(row.meta);
 }
 
-function rowLeft(row: BoxRow, glyph: string, caret: string): string {
+/** The words of a block: a keyword and the text, brightened where the block's own tint carries the kind. */
+function rowWords(row: BoxRow, style: BlockStyle): string {
 	// A keyword ending in a full-width colon (`你插话：`) runs straight into its text.
 	const gap = row.text && !row.keyword?.endsWith("：") ? " " : "";
-	const keyword = row.keyword ? `${theme.fg(row.keywordColor ?? "dim", row.keyword)}${gap}` : "";
-	const text = row.text ? theme.fg(row.textColor, sanitizeDisplayText(row.text).replace(/\s+/g, " ")) : "";
-	return `${caret} ${glyph} ${keyword}${text}`;
+	const keywordColor: ThemeColor =
+		row.keywordColor === "activityAccent" && style.fg
+			? style.fg
+			: row.kind === "think" && row.keywordColor === "dim"
+				? "muted"
+				: (row.keywordColor ?? "dim");
+	const keyword = row.keyword ? `${theme.fg(keywordColor, row.keyword)}${gap}` : "";
+	const brighten = (row.kind === "think" || row.kind === "read") && row.textColor === "muted";
+	const text = row.text
+		? theme.fg(brighten ? "activityText" : row.textColor, sanitizeDisplayText(row.text).replace(/\s+/g, " "))
+		: "";
+	return `${keyword}${text}`;
 }
 
 /** The fixed three-line thinking window: the newest text at the bottom, the top line faded. */
@@ -272,6 +378,55 @@ function thinkWindow(text: string, width: number): string[] {
 	return shown.map((line, index) =>
 		index === 0 && wrappedLines.length >= THINK_WINDOW_LINES ? theme.fg("dim", line) : theme.fg("thinkingText", line),
 	);
+}
+
+/** A note's whole text wrapped to `width` columns, paragraph breaks kept. */
+function noteLines(cleanText: string, width: number): string[] {
+	const lines: string[] = [];
+	for (const paragraph of cleanText.split("\n")) {
+		const parts = wrapTextWithAnsi(paragraph, width);
+		lines.push(...(parts.length > 0 ? parts : [""]));
+	}
+	while (lines.length > 0 && lines.at(-1)?.trim() === "") lines.pop();
+	return lines;
+}
+
+/** What is known of one note: its words and width when it was measured, and its lines when they fit. */
+interface NoteMeasure {
+	text: string;
+	width: number;
+	lines: string[] | undefined;
+}
+
+const noteMeasures = new WeakMap<TurnTimeline["ui"], Map<string, NoteMeasure>>();
+
+function measureNote(fullText: string, width: number): string[] | undefined {
+	const room = Math.max(8, width);
+	const clean = sanitizeDisplayText(fullText);
+	// A wrapped line holds at most `room` columns and wrapping only drops blanks, so text with
+	// more visible columns than three lines hold needs more lines: no need to wrap it to know.
+	if (visibleWidth(clean.replace(/\s+/g, "")) > NOTE_MAX_LINES * room) return undefined;
+	const lines = noteLines(clean, room);
+	return lines.length > 0 && lines.length <= NOTE_MAX_LINES ? lines : undefined;
+}
+
+/**
+ * The lines of a note short enough to be plain text (at most {@link NOTE_MAX_LINES}),
+ * or undefined when it needs a block. The box is drawn many times a second and the
+ * words rarely change, so what was measured is kept for the row until its words or
+ * the width change.
+ */
+function shortNoteLines(ui: TurnTimeline["ui"], key: string, fullText: string, width: number): string[] | undefined {
+	let measures = noteMeasures.get(ui);
+	if (!measures) {
+		measures = new Map();
+		noteMeasures.set(ui, measures);
+	}
+	const known = measures.get(key);
+	if (known && known.width === width && known.text === fullText) return known.lines;
+	const lines = measureNote(fullText, width);
+	measures.set(key, { text: fullText, width, lines });
+	return lines;
 }
 
 /**
@@ -302,7 +457,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 	}
 	ui.primed = true;
 
-	const boxLine = (content: string, bg?: BodyLine["bg"]): string => {
+	const boxLine = (content: string, bg?: "cardFocusBg"): string => {
 		const fitted = truncateToWidth(content, inner, "…", true);
 		const padded = ` ${fitted}${" ".repeat(Math.max(0, inner - visibleWidth(fitted)))} `;
 		return ` ${border("│")}${bg ? theme.bg(bg, padded) : padded}${border("│")}`;
@@ -337,50 +492,74 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		`${headerFocused ? BOX_FOCUS_MARKER : ""}${boxLine(spread(`${caret} ${glyph} ${label}`, right, inner), headerFocused ? "cardFocusBg" : undefined)}`,
 	);
 
-	// Body lines: every row, the live lines under it, and what it opened.
+	// Body lines: every row, the lines that hang under it, and what it opened.
 	const body: BodyLine[] = [];
 	const rowStart = new Map<string, number>();
 	const rowEnd = new Map<string, number>();
-	const detailWidth = Math.max(8, inner - 6);
+	const hangWidth = Math.max(8, inner - 6);
+	const hang = (accent: ThemeColor, content: string, extra: Partial<BodyLine>): BodyLine => ({
+		text: paintBg("kindPanelBg", `${theme.fg(accent, "▎")}${" ".repeat(TEXT_INDENT - 1)}${content}`, inner),
+		part: "panel",
+		...extra,
+	});
 	for (const row of rows) {
 		rowStart.set(row.key, body.length);
+		// A short note is plain text: not a block, so nothing to click or walk to.
+		const note = row.fullText !== undefined ? shortNoteLines(ui, row.key, row.fullText, hangWidth) : undefined;
+		if (note) {
+			for (const noteLine of note) {
+				body.push({
+					text: `${" ".repeat(TEXT_INDENT)}${theme.fg("muted", noteLine)}`,
+					rowKey: row.key,
+					part: "note",
+				});
+			}
+			rowEnd.set(row.key, body.length - 1);
+			continue;
+		}
 		focusOrder.push(row.key);
+		const style = blockStyle(row);
 		const expandable = row.detail !== undefined;
 		const opened = expandable && ui.expanded.has(row.key);
-		const rowCaret = expandable ? theme.fg("dim", opened ? "▾" : "▸") : " ";
 		const focused = ui.focused && ui.focusKey === row.key;
+		const pointed = expandable && ui.hoverKey === row.key;
 		const stage = rowEnterStage(ui.enteredAt.get(row.key), now);
 		const errorFlash = row.kind === "error" && withinMotion(ui.settledAt.get(row.key), ERROR_FLASH_MS, now);
-		const bg: BodyLine["bg"] = focused
-			? "cardFocusBg"
-			: errorFlash && theme.colorMode === "truecolor"
-				? "diffRemovedLineBg"
-				: stage === "flash"
-					? "rowFlashBg"
-					: stage === "fade"
-						? "rowFlashFadeBg"
-						: undefined;
+		const active = pointed || focused;
+		const lit = opened || active || errorFlash || stage !== "none";
+		const accent: ThemeColor = style.fg ?? "activityText";
+		const rowCaret = expandable ? theme.fg(opened || active ? accent : "activityText", opened ? "▾" : "▸") : " ";
+		// What a click would do, in the kind's color, ahead of the result.
+		const hint = expandable && active ? theme.fg(accent, opened ? "收起 ▴" : "点开 ▸") : "";
+		const room = Math.max(0, inner - 1);
+		const rowSide = blockSide(hint, rowRight(row, input), room);
+		const left = ` ${rowCaret} ${rowGlyph(row, style, timeline, input)} ${rowWords(row, style)}`;
+		const blockBg = lit ? style.hoverBg : style.bg;
 		body.push({
-			text: `${focused ? BOX_FOCUS_MARKER : ""}${spread(rowLeft(row, rowGlyph(row, timeline, input), rowCaret), rowRight(row, input), inner)}`,
+			text: `${focused ? BOX_FOCUS_MARKER : ""}${paintBg(blockBg, `${spread(left, rowSide, room)} `, inner)}`,
 			rowKey: row.key,
-			head: true,
-			...(bg ? { bg } : {}),
+			part: "head",
 		});
+		let hanging = false;
 		if (row.sub) {
-			body.push({ text: `    ${theme.fg("dim", `└ ${row.sub}`)}`, rowKey: row.key });
+			hanging = true;
+			body.push(hang(accent, theme.fg("dim", `└ ${row.sub}`), { rowKey: row.key }));
 		}
 		if (row.window !== undefined) {
-			for (const windowLine of thinkWindow(row.window, detailWidth)) {
-				body.push({ text: `    ${theme.fg("assistantGutter", "│")} ${windowLine}`, rowKey: row.key });
+			hanging = true;
+			for (const windowLine of thinkWindow(row.window, hangWidth)) {
+				body.push(hang(accent, windowLine, { rowKey: row.key }));
 			}
 		}
 		if (opened && row.detail) {
-			const detail = row.detail(detailWidth);
+			const detail = row.detail(hangWidth);
 			const shown = slideCount(ui.expandedAt.get(row.key), detail.length, now);
 			for (const detailLine of detail.slice(0, shown)) {
-				body.push({ text: `    ${theme.fg("boxBorder", "│")} ${detailLine}`, rowKey: row.key, detail: true });
+				hanging = true;
+				body.push(hang(accent, detailLine, { rowKey: row.key, detail: true }));
 			}
 		}
+		body.push({ text: gapLine(hanging ? "kindPanelBg" : blockBg, inner), rowKey: row.key, part: "gap" });
 		rowEnd.set(row.key, body.length - 1);
 	}
 
@@ -396,10 +575,11 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		const total = body.length;
 		const visible = Math.min(total, input.maxBodyRows);
 		const maxTop = Math.max(0, total - visible);
-		// Only the turn's own new lines count as unseen, not what the user opened.
-		const content = body.reduce((count, line) => count + (line.detail ? 0 : 1), 0);
-		if (!ui.follow && content > ui.lastContentLines && ui.lastContentLines > 0) ui.unseen = true;
-		ui.lastContentLines = content;
+		// Only rows the turn added count as unseen: not what the user opened, and not
+		// the lines a row takes up, which a narrower terminal makes more of.
+		const content = rows.length;
+		if (!ui.follow && content > ui.lastRowCount && ui.lastRowCount > 0) ui.unseen = true;
+		ui.lastRowCount = content;
 		let top = ui.follow ? maxTop : Math.min(ui.scrollTop, maxTop);
 		const reveal = ui.revealKey;
 		if (reveal !== undefined && rowStart.has(reveal)) {
@@ -459,7 +639,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 				},
 			});
 		}
-		for (const line of visibleLines) lines.push(boxLine(line.text, line.bg));
+		for (const line of visibleLines) lines.push(boxLine(line.text));
 	}
 	lines.push(showUnseen ? rule("╰", "╯", "↓ 有新内容", "activityAccent") : rule("╰", "╯"));
 	if (showUnseen) {
@@ -475,7 +655,8 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		});
 	}
 
-	// Body regions: a click opens or closes the row under it; the wheel scrolls the body.
+	// Body regions: a click opens or closes the block under it (its separator row counts
+	// as the block); everything else only takes the wheel.
 	const onWheel = (direction: -1 | 1): boolean => {
 		if (!input.open) return false;
 		const moved = timeline.ui.scrollBody(direction);
@@ -485,21 +666,26 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 	// Opening a row grows the box only while the body is below its height cap;
 	// past it the body scrolls inside the frame and the page does not move.
 	const growRoom = input.open ? Math.max(0, input.maxBodyRows - visibleLines.length) : 0;
+	const rowByKey = new Map(rows.map((row) => [row.key, row] as const));
 	visibleLines.forEach((line, index) => {
-		const row = line.rowKey ? rows.find((candidate) => candidate.key === line.rowKey) : undefined;
-		const detail = row?.detail;
+		const row = line.rowKey ? rowByKey.get(line.rowKey) : undefined;
 		const key = row?.key;
+		const clickable = row?.detail !== undefined && key !== undefined && (line.part === "head" || line.part === "gap");
 		regions.push({
 			line: bodyTop + index,
 			col: 0,
 			width: regionWidth,
 			height: 1,
-			...(detail && key && line.head
+			...(clickable
 				? {
 						revealBelow: timeline.ui.expanded.has(key) ? 0 : Math.min(growRoom, 8),
 						onClick: () => {
 							timeline.ui.toggleRow(key, Date.now());
 							input.onChange();
+						},
+						hoverKey: `${timeline.ui.id}:${key}`,
+						onHover: (hovered: boolean) => {
+							if (timeline.ui.setHover(key, hovered)) input.onChange();
 						},
 					}
 				: { passive: true, onClick: () => {} }),

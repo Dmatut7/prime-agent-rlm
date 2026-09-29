@@ -1,0 +1,9 @@
+- Changed the turn box to fill the terminal's width instead of stopping at 120 columns.
+- Changed every step in the turn box into a block colored by its kind (thinking, command, read, file change, memory, subagent, error) with a small gap under it; an opened step, the live thought and a command's latest output hang under their block.
+- Changed every block to open on a click: a step with no lines of its own (a search, a command that printed nothing, a single file read, a notice) opens to its whole text, its result, when it happened and how long it took.
+- Changed a block to light up when the pointer is on it or the keyboard selects it, and to say `点开 ▸` (`收起 ▴` once open) ahead of its result.
+- Changed the AI's short notes between steps, and short interjections, to plain text that is not clickable; a long note stays a block that opens to the whole text.
+- Changed a question to show one `◆ prime` title even when subagents' handed-back messages wake the AI several times on the same model.
+- Changed a message a subagent hands back to read `◇ name 交回：…` (`发来：` from anyone else) instead of `◆ 收到消息 · 来自 …`.
+- Changed mistakes the AI corrected within a finished turn to appear as `出错 N 次，已改正` in the box header instead of a red row left outside the folded box.
+- Changed the finished box header's counts to be colored by kind.

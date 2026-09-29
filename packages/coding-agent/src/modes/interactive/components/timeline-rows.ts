@@ -74,6 +74,14 @@ export interface BoxRow {
 	window?: string;
 	/** Lines the row shows once opened; absent when it has nothing more to show. */
 	detail?: (width: number) => string[];
+	/** A note's whole text: when it fits in a few lines the box shows it as plain text instead of a block. */
+	fullText?: string;
+	/** When the row's step ended, if known (with `startedAt`, the opened row says how long it took). */
+	endedAt?: number;
+	/** What the opened row says about the step's output (`没有输出`). */
+	outputNote?: string;
+	/** `detail` was made from the row's own facts, so it has nothing more to say than the row itself. */
+	factsOnly?: true;
 	/** Stays visible when the box folds (failures). */
 	persistent?: boolean;
 	/** Files a merged read row covers. */
@@ -448,7 +456,11 @@ function activityRow(stepId: string, activity: KernelActivity, timeline: TurnTim
 	const label = sanitizeDisplayText(activity.label).replace(/\s+/g, " ").trim();
 	const result = activity.detail ? localizeResultDetail(activity.detail) : undefined;
 	const running = activity.status === "running";
-	const base = { key, startedAt: activity.startedAt || undefined };
+	const base = {
+		key,
+		startedAt: activity.startedAt || undefined,
+		...(activity.endedAt ? { endedAt: activity.endedAt } : {}),
+	};
 	switch (activity.kind) {
 		case "command": {
 			const tail = running && activity.detail ? sanitizeDisplayText(activity.detail).trim() : undefined;
@@ -577,6 +589,7 @@ function fallbackRows(
 				...(startedAt !== undefined ? { startedAt } : {}),
 				...(tail ? { sub: tail } : {}),
 				...(outputDetail ? { detail: outputDetail } : {}),
+				...(outputDetail || tail ? {} : { outputNote: running ? "还没有输出" : "没有输出" }),
 			},
 		];
 	}
@@ -641,6 +654,12 @@ function fallbackRows(
 			...(outputDetail ? { detail: outputDetail } : {}),
 		},
 	];
+}
+
+/** What an opened command with no output of its own says: it printed nothing (yet). */
+function withOutputNote(row: BoxRow): BoxRow {
+	if (row.kind !== "cmd" || row.sub) return row;
+	return { ...row, outputNote: row.status === "running" ? "还没有输出" : "没有输出" };
 }
 
 /** `2 个已交回`: the turn's subagents that finished, for a step that checked on them. */
@@ -714,7 +733,12 @@ function stepRows(step: RowStep, timeline: TurnTimeline, ctx: RowBuildContext, o
 		const row = activityRow(step.toolCallId, activity, timeline, ctx);
 		// Still running although the cell (or the turn) is over: it runs on in the background.
 		const background = unfinished && (activity.background === true || !running || !ctx.live);
-		items.push({ time: activity.startedAt, order: index++, rows: [background ? backgroundRow(row) : row] });
+		const printedNothing = !data.outputText?.trim() && !activity.detail?.trim();
+		items.push({
+			time: activity.startedAt,
+			order: index++,
+			rows: [background ? backgroundRow(row) : printedNothing ? withOutputNote(row) : row],
+		});
 	}
 	for (const change of aggregateChanges([{ data, toolName: step.toolName, order }], ctx.cwd)) {
 		items.push({
@@ -860,17 +884,17 @@ function thinkRows(
 		} else if (block.type === "text" && (superseded || (firstToolCall !== -1 && index < firstToolCall))) {
 			const text = (block.text ?? "").trim();
 			if (!text) return;
-			const summary = firstSentence(text);
 			rows.push({
 				key: `say:${entry.key}:${index}`,
 				kind: "say",
 				status: "plain",
 				glyph: "·",
 				glyphColor: "dim",
-				text: summary,
+				text: firstSentence(text),
 				textColor: "muted",
 				meta: [],
-				...(saysMoreThan(text, summary) ? { detail: (width: number) => wrapped(text, width, "muted") } : {}),
+				fullText: text,
+				detail: (width: number) => wrapped(text, width, "muted"),
 			});
 		}
 	});
@@ -884,8 +908,7 @@ function contextSize(tokens: number): string {
 
 function eventRow(entry: TimelineEntry, ctx: RowBuildContext): BoxRow | undefined {
 	switch (entry.kind) {
-		case "steer": {
-			const long = visibleWidth(entry.text) > 48;
+		case "steer":
 			return {
 				key: entry.key,
 				kind: "steer",
@@ -897,9 +920,9 @@ function eventRow(entry: TimelineEntry, ctx: RowBuildContext): BoxRow | undefine
 				text: entry.text,
 				textColor: "activityText",
 				meta: [],
-				...(long ? { detail: (width: number) => wrapped(entry.text, width, "activityText") } : {}),
+				fullText: `你插话：${entry.text}`,
+				detail: (width: number) => wrapped(entry.text, width, "activityText"),
 			};
-		}
 		case "retry": {
 			const retry = entry.retry;
 			const remaining = Math.max(0, Math.ceil((retry.startedAt + retry.delayMs - ctx.now) / 1000));
@@ -916,6 +939,7 @@ function eventRow(entry: TimelineEntry, ctx: RowBuildContext): BoxRow | undefine
 			return {
 				key: entry.key,
 				kind: "retry",
+				startedAt: retry.startedAt,
 				status:
 					retry.outcome === undefined && !ctx.stopped ? "running" : retry.outcome === "failed" ? "failed" : "done",
 				glyph: "↻",
@@ -951,6 +975,7 @@ function eventRow(entry: TimelineEntry, ctx: RowBuildContext): BoxRow | undefine
 				textColor: compaction.failed && !skipped ? "runCardWarn" : "muted",
 				meta: [],
 				startedAt: compaction.startedAt,
+				...(compaction.endedAt ? { endedAt: compaction.endedAt } : {}),
 			};
 		}
 		case "subagent": {
@@ -973,6 +998,7 @@ function eventRow(entry: TimelineEntry, ctx: RowBuildContext): BoxRow | undefine
 						? failMeta(sub.result)
 						: okMeta(sub.result ? truncateToWidth(sub.result, 36, "…") : undefined),
 				startedAt: sub.startedAt,
+				...(sub.endedAt ? { endedAt: sub.endedAt } : {}),
 				...(running && sub.line ? { sub: sub.line } : {}),
 				...(report?.trim() ? { detail: (width: number) => wrapped(report, width, "muted") } : {}),
 			};
@@ -989,6 +1015,7 @@ function eventRow(entry: TimelineEntry, ctx: RowBuildContext): BoxRow | undefine
 				text: notice.text,
 				textColor: color,
 				meta: [],
+				...(entry.at > 0 ? { startedAt: entry.at } : {}),
 				...(notice.tone === "error" ? { persistent: true } : {}),
 				...(notice.detail ? { detail: (width: number) => wrapped(notice.detail ?? "", width, "muted") } : {}),
 			};
@@ -1046,6 +1073,59 @@ function mergeReads(rows: BoxRow[]): BoxRow[] {
 		}
 		return { ...row, text: `读取 ${files[0] ?? row.text}` };
 	});
+}
+
+/** `14:13:22` in the reader's own time zone. */
+function clockText(ms: number): string {
+	return new Date(ms).toTimeString().slice(0, 8);
+}
+
+/**
+ * What a block with no lines of its own opens to: the step's whole text (the row
+ * cuts it), what its right side says, when it happened and how long it took, and
+ * whether the command printed anything. Only what the row already knows.
+ */
+function factsDetail(row: BoxRow, now: number): (width: number) => string[] {
+	const gap = row.text && row.keyword && !row.keyword.endsWith("：") ? " " : "";
+	const whole = sanitizeDisplayText(`${row.keyword ?? ""}${gap}${row.text}`)
+		.replace(/\s+/g, " ")
+		.trim();
+	const started = row.startedAt !== undefined && row.startedAt > 0 ? row.startedAt : undefined;
+	const took =
+		started === undefined
+			? undefined
+			: row.endedAt !== undefined && row.endedAt >= started
+				? `用了 ${row.endedAt - started < 1000 ? "不到 1秒" : formatBoxDuration(row.endedAt - started)}`
+				: row.status === "running"
+					? `已跑 ${formatBoxDuration(Math.max(0, now - started))}`
+					: undefined;
+	return (width) => {
+		const lines = whole ? wrapped(whole, width, "activityText") : [];
+		if (row.meta.length > 0) {
+			lines.push(`${theme.fg("dim", "结果  ")}${row.meta.map((part) => theme.fg(part.color, part.text)).join("")}`);
+		}
+		if (started !== undefined) {
+			lines.push(theme.fg("dim", `时间  ${clockText(started)}${took ? ` · ${took}` : ""}`));
+		}
+		if (row.outputNote) lines.push(theme.fg("dim", row.outputNote));
+		return lines.length > 0 ? lines : [theme.fg("dim", "没有更多内容")];
+	};
+}
+
+/**
+ * The turn is over and went fine: not running, not stopped by the owner, not
+ * ended on an error, and the AI itself closed it with an answer (its last reply
+ * ended normally). Whatever went wrong on the way it corrected itself. A turn
+ * cut off after a step (an abort after a tool batch, a budget stop, a crash) or
+ * ended on a truncated reply corrected nothing.
+ */
+function endedWell(timeline: TurnTimeline, ctx: RowBuildContext): boolean {
+	if (ctx.live || ctx.stopped || timeline.stopped || timeline.errorEnded) return false;
+	for (let index = timeline.entries.length - 1; index >= 0; index--) {
+		const entry = timeline.entries[index];
+		if (entry?.kind === "message") return entry.message.stopReason === "stop";
+	}
+	return false;
 }
 
 /** Every row of a turn, in order. */
@@ -1140,7 +1220,17 @@ export function buildTimelineRows(timeline: TurnTimeline, baseCtx: RowBuildConte
 		if (!seenSteps.has(step.toolCallId)) rows.push(...stepRows(step, timeline, ctx, order++));
 	}
 	const merged = mergeReads(rows);
-	return ctx.stopped ? merged.map((row) => (row.status === "running" ? stoppedRow(row) : row)) : merged;
+	const settled = ctx.stopped ? merged.map((row) => (row.status === "running" ? stoppedRow(row) : row)) : merged;
+	// A mistake a turn that went fine corrected no longer hangs outside the folded box: its header says so.
+	const recovered = endedWell(timeline, ctx);
+	// Every block opens: one with no lines of its own opens to the facts of its step. A note
+	// (its whole text is on the row) is not a block and stays as it is.
+	return settled.map((row) => {
+		const shown = recovered && row.kind === "error" && row.persistent ? { ...row, persistent: false } : row;
+		return shown.detail === undefined && shown.fullText === undefined
+			? { ...shown, detail: factsDetail(shown, ctx.now), factsOnly: true as const }
+			: shown;
+	});
 }
 
 /** The facts a finished box's header and the change strip say. */
@@ -1161,6 +1251,8 @@ export interface TimelineFacts {
 	trackingIncomplete: boolean;
 	/** No reply of the turn has text or a step: it produced nothing a reader sees. */
 	noOutput?: true;
+	/** The turn went fine, so its errors were mistakes it corrected itself. */
+	errorsRecovered?: true;
 }
 
 export function timelineFacts(timeline: TurnTimeline, rows: readonly BoxRow[], ctx: RowBuildContext): TimelineFacts {
@@ -1188,42 +1280,50 @@ export function timelineFacts(timeline: TurnTimeline, rows: readonly BoxRow[], c
 		});
 	}
 	const hasOutput = timeline.entries.some((entry) => entry.kind === "message" && replyHasWork(entry.message));
+	const errorCount = rows.filter((row) => row.kind === "error").length;
 	return {
 		thinkCount: rows.filter((row) => row.kind === "think").length,
 		commandCount: rows.filter((row) => row.kind === "cmd").length,
 		readCount: rows.reduce((sum, row) => sum + (row.kind === "read" ? (row.files?.length ?? 1) : 0), 0),
 		stepCount: new Set(steps.map((step) => step.toolCallId)).size + timeline.earlierSteps,
 		subagentCount: rows.filter((row) => row.kind === "subagent").length,
-		errorCount: rows.filter((row) => row.kind === "error").length,
+		errorCount,
 		projectChanges: changes.filter((change) => change.scope !== "scratch"),
 		scratchChanges: changes.filter((change) => change.scope === "scratch"),
 		memories,
 		...(commitId ? { commitId } : {}),
 		trackingIncomplete,
 		...(hasOutput ? {} : { noOutput: true as const }),
+		...(errorCount > 0 && endedWell(timeline, ctx) ? { errorsRecovered: true as const } : {}),
 	};
 }
 
 /** `想了 3 次 · 跑了 4 条命令 · 改了 1 个文件 +6 −2`, styled. */
 export function summaryParts(facts: TimelineFacts): Array<{ text: string; color: ThemeColor }[]> {
 	const parts: Array<{ text: string; color: ThemeColor }[]> = [];
-	if (facts.thinkCount > 0) parts.push([{ text: `想了 ${facts.thinkCount} 次`, color: "activityText" }]);
-	if (facts.commandCount > 0) parts.push([{ text: `跑了 ${facts.commandCount} 条命令`, color: "activityText" }]);
+	if (facts.thinkCount > 0) parts.push([{ text: `想了 ${facts.thinkCount} 次`, color: "kindThink" }]);
+	if (facts.commandCount > 0) parts.push([{ text: `跑了 ${facts.commandCount} 条命令`, color: "kindCommand" }]);
 	if (facts.readCount > 0 && facts.commandCount === 0) {
-		parts.push([{ text: `读了 ${facts.readCount} 个文件`, color: "activityText" }]);
+		parts.push([{ text: `读了 ${facts.readCount} 个文件`, color: "kindRead" }]);
 	}
 	if (facts.projectChanges.length > 0) {
 		const totals = changeTotals(facts.projectChanges);
 		parts.push([
-			{ text: `改了 ${facts.projectChanges.length} 个文件${totals ? " " : ""}`, color: "activityText" },
+			{ text: `改了 ${facts.projectChanges.length} 个文件${totals ? " " : ""}`, color: "kindEdit" },
 			...(totals ? countsMeta(totals.added, totals.removed) : []),
 		]);
 	}
-	if (facts.memories.length > 0) parts.push([{ text: `记住 ${facts.memories.length} 条`, color: "memoryAccent" }]);
-	if (facts.subagentCount > 0) parts.push([{ text: `派了 ${facts.subagentCount} 个子代理`, color: "activityText" }]);
+	if (facts.memories.length > 0) parts.push([{ text: `记住 ${facts.memories.length} 条`, color: "kindMemory" }]);
+	if (facts.subagentCount > 0) parts.push([{ text: `派了 ${facts.subagentCount} 个子代理`, color: "kindSubagent" }]);
 	if (parts.length === 0 && facts.stepCount > 0)
-		parts.push([{ text: `做了 ${facts.stepCount} 步`, color: "activityText" }]);
-	if (facts.errorCount > 0) parts.push([{ text: `${facts.errorCount} 处出错`, color: "error" }]);
+		parts.push([{ text: `做了 ${facts.stepCount} 步`, color: "kindRead" }]);
+	if (facts.errorCount > 0) {
+		parts.push(
+			facts.errorsRecovered
+				? [{ text: `出错 ${facts.errorCount} 次，已改正`, color: "kindRecovered" }]
+				: [{ text: `${facts.errorCount} 处出错`, color: "kindError" }],
+		);
+	}
 	if (parts.length === 0) parts.push([{ text: facts.noOutput ? "（这轮没有输出）" : "直接回答了", color: "muted" }]);
 	if (facts.trackingIncomplete) parts.at(-1)?.push({ text: " （有些改动没记全）", color: "dim" });
 	return parts;

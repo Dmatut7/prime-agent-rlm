@@ -1,1 +1,2 @@
 - Fixed the box of a finished turn that produced no text and no steps saying "直接回答了"; it now says "（这轮没有输出）".
+- Fixed the box and change strip click areas reaching past the screen edge in a terminal only 1 to 4 columns wide.

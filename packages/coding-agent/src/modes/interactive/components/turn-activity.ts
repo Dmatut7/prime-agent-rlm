@@ -124,6 +124,13 @@ export class TurnActivityState {
 	/** The model answering this turn (`glm-5.3-prime`), for the `◆ prime` header. */
 	modelId: string | undefined;
 
+	/**
+	 * A message the user sent opened this turn. False for a turn something else
+	 * woke (a subagent's handed-back message, a finished background command),
+	 * which draws no `◆ prime` line of its own under the same model's title.
+	 */
+	startedByUser = true;
+
 	private phase: TurnPhase = "waiting";
 	private phaseSince: number;
 	private lastActivityAt: number;
@@ -219,13 +226,14 @@ export class TurnActivityState {
 
 	addFileChanges(changes: readonly FileChangeSummary[]): void {
 		for (const change of changes) {
-			if (change.added === 0 && change.removed === 0) {
+			if (change.added === 0 && change.removed === 0 && !change.omitted) {
 				continue;
 			}
 			const existing = this.changedFiles.get(change.path);
 			if (existing) {
 				existing.added += change.added;
 				existing.removed += change.removed;
+				if (change.omitted) existing.omitted = true;
 			} else {
 				this.changedFiles.set(change.path, { ...change });
 			}
@@ -688,6 +696,10 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	private boxRegions: ClickRegion[] = [];
 	private boxFocusOrder: string[] = [];
 	private boxCacheKey: string | undefined;
+	/** The `◆ prime  <model>` line above the box; a woken turn under the same title leaves it out. */
+	private headerShown = true;
+	/** A blank line above the turn: a woken turn nothing else separates from what is above it. */
+	private leadingBlank = false;
 
 	constructor(private readonly turnState: TurnActivityState) {}
 
@@ -698,6 +710,20 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	/** The turn's state - the per-turn lanes (K3 ②) live on it. */
 	get state(): TurnActivityState {
 		return this.turnState;
+	}
+
+	/** Whether the box has its own `◆ prime  <model>` line above it. */
+	setHeaderShown(shown: boolean): void {
+		if (this.headerShown === shown) return;
+		this.headerShown = shown;
+		this.invalidate();
+	}
+
+	/** Whether a blank line separates this turn from what is above it. */
+	setLeadingBlank(blank: boolean): void {
+		if (this.leadingBlank === blank) return;
+		this.leadingBlank = blank;
+		this.invalidate();
 	}
 
 	/** Where the box reads its settings, the screen height and the working directory from. */
@@ -750,7 +776,9 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	/** Ctrl+T in the quiet conversation: open every thinking row of this turn, or close them all. */
 	toggleThinkingRows(): void {
 		const ui = this.turnState.timeline.ui;
-		const thinking = this.turnState.boxView().rows.filter((row) => row.kind === "think" && row.detail);
+		const thinking = this.turnState
+			.boxView()
+			.rows.filter((row) => row.kind === "think" && row.detail && !row.factsOnly);
 		this.setThinkingRows(
 			thinking.length > 0 ? thinking.some((row) => !ui.expanded.has(row.key)) : !this.turnState.thinkingExpanded,
 		);
@@ -761,7 +789,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		const ui = this.turnState.timeline.ui;
 		const now = Date.now();
 		for (const row of this.turnState.boxView().rows) {
-			if (row.kind !== "think" || !row.detail) continue;
+			if (row.kind !== "think" || !row.detail || row.factsOnly) continue;
 			if (open) {
 				ui.expanded.add(row.key);
 				ui.expandedAt.set(row.key, now);
@@ -873,7 +901,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		const ui = state.timeline.ui;
 		// The finished box's view has its own key (steps, entries, how it ended, cwd, hideThinking).
 		const view = state.boxView(now);
-		const cacheKey = `${width}:${viewportRows}:${ui.version}:${state.boxOpen}:${state.boxViewKey()}`;
+		const cacheKey = `${width}:${viewportRows}:${ui.version}:${state.boxOpen}:${this.headerShown}:${this.leadingBlank}:${state.boxViewKey()}`;
 		if (this.cachedLines && this.boxCacheKey === cacheKey) return this.cachedLines;
 		takeMotionActive();
 		const header = computeBoxHeader({
@@ -903,20 +931,31 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 				host.requestRender();
 			},
 		});
-		const headerLine = renderAssistantHeader({
-			...(state.modelId ? { modelId: state.modelId } : {}),
-			durationMs: 0,
-			live: false,
-			plain: true,
-			tick: 0,
-			width,
-		});
 		this.boxFocusOrder = box.focusOrder;
-		this.boxRegions = [
-			{ line: 0, col: 0, width: Math.min(width, 9), height: 1, onClick: () => this.toggleBox() },
-			...box.regions.map((region) => ({ ...region, line: region.line + 1 })),
-		];
-		const lines = [headerLine, ...box.lines];
+		const above: string[] = this.leadingBlank ? [""] : [];
+		const regions: ClickRegion[] = [];
+		if (this.headerShown) {
+			regions.push({
+				line: above.length,
+				col: 0,
+				width: Math.min(width, 9),
+				height: 1,
+				onClick: () => this.toggleBox(),
+			});
+			above.push(
+				renderAssistantHeader({
+					...(state.modelId ? { modelId: state.modelId } : {}),
+					durationMs: 0,
+					live: false,
+					plain: true,
+					tick: 0,
+					width,
+				}),
+			);
+		}
+		regions.push(...box.regions.map((region) => ({ ...region, line: region.line + above.length })));
+		this.boxRegions = regions;
+		const lines = [...above, ...box.lines];
 		const animating = takeMotionActive();
 		if (!view.live && !animating) {
 			this.cachedLines = lines;

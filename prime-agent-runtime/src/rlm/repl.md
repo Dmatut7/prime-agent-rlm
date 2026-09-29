@@ -263,19 +263,23 @@ deleted in the same cell.
   tree (a moved `HEAD` adds `git diff --name-only`), a bounded mtime scan
   outside one. Ignored files, `.git`, `node_modules`, virtualenvs and caches are
   never reported.
-- That comparison covers only the git work tree (outside git: the directory
-  itself) of the session's working directory and of the directory Python is in
-  when it starts the process. A command that writes anywhere else
-  (`cd /tmp/build && make`, `curl -o /tmp/x`) is not listed: watching the whole
-  filesystem would cost every cell time. Python's own writes are listed
-  wherever they go, since the wrappers see each path.
+- That comparison covers the git work tree of the session's working directory
+  (outside git: the working directory itself, by a bounded mtime scan) and the
+  git work tree of the directory Python is in when it starts the process, if
+  that lies in one. A directory that is neither inside the session's working
+  directory nor in a git work tree is not looked at. A command that writes
+  anywhere else (`cd /tmp/build && make`, `curl -o /tmp/x`) is not listed:
+  watching the whole filesystem would cost every cell time. Python's own writes
+  are listed wherever they go, since the wrappers see each path.
 - A new file that is already gone again when the comparison looks at it is no
   creation, and BSD `sed -i`'s temp file (`.!<pid>!<name>`) is never reported;
   the edited file itself is.
 - Symlinks: a write through a link is filed under the file it lands in (when
   that is a place tracking reports); a link that was created, removed or
   re-pointed is reported as itself with `symlink: true`, no line counts and no
-  diff; an untracked link to a changed file does not add a second row.
+  diff; a link replaced by a regular file of the same name is that file, a
+  modified one whose lines all show as added, with no `symlink`; an untracked
+  link to a changed file does not add a second row.
 - Records are sent as soon as a file's size and mtime hold still for one watch
   interval (0.15 s), and finally before the cell's `done`; that final
   collection is part of the interruptible finishing phase.
@@ -292,20 +296,29 @@ deleted in the same cell.
   under `.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`), and any other file whose
   capped diff holds a likely credential (a private key block; `sk-`, `AKIA`/
   `ASIA`, `ghp_`, `github_pat_`, `xox?-`, `glpat-`, `AIza`, `hf_`, `npm_`,
-  `pypi-` tokens; JWTs; bearer tokens; `user:pass@` URLs; `password`/`secret`/
-  `api_key`/`token`-style assignments whose value is not a placeholder, number
-  or plain identifier), keeps its record and line counts without `diff`, with
-  `diffOmitted: "sensitive"`. A memory record whose `before` or `after` holds a
-  likely credential drops both texts and carries `textOmitted: "sensitive"`;
-  later edits of that entry in the same cell stay withheld. An activity's
+  `pypi-` tokens; JWTs; bearer tokens; `user:pass@` URLs; assignments to a
+  `password`/`secret`/`api_key`/`token`-style name, typed or not (`password:
+  str = ...`, Rust `let password: &str = ...`, Go `var password string = ...`),
+  whose value is not a placeholder, number or plain identifier), keeps its
+  record and line counts without `diff`, with `diffOmitted: "sensitive"`. A
+  memory record whose `before` or `after` holds a likely credential drops both
+  texts and carries `textOmitted: "sensitive"`; later edits of that entry in
+  the same cell stay withheld. Memory texts are scanned before they are cut to
+  4000 characters (the uncut start, a little past the cut), so a quoted value
+  the cut splits is still seen whole. A `title` or `previousTitle` that looks
+  like a credential counts the same: the record loses its texts, its title
+  reads as the entry's `id` (its `kind` when the id looks like a credential
+  too, or is the slug the harness made from the title) and the previous title
+  is left out; the `id` itself is sent as it is. An activity's
   `detail` (a command's latest or final output line, for example from `cat
   .env` or `echo $API_KEY`) gets the same scan; a `detail` that looks like a
   credential is left out of the record rather than sent. A step's `label` (the
   command line or task text) is scanned too, as it will be shown (blanks
   collapsed) and a little past the part that shows, so a key the length limit
   would cut is still seen whole; a label that looks like a credential reads as
-  the step's kind (`command`, for example). The scan runs only over the capped
-  text and treats its own failure as a secret. It cannot tell a real
+  the step's kind (`command`, for example). The scan runs only over bounded
+  text (a capped diff; the start of a memory text or label, a little past what
+  shows) and treats its own failure as a secret. It cannot tell a real
   credential from a value shaped like one, so ordinary code is withheld too: a
   test fixture such as `API_KEY = "test-1234567890abcdef"` or a JWT-shaped
   sample token on any line of a file's diff (changed lines and their context)
