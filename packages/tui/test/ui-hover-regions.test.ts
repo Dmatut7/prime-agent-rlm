@@ -19,6 +19,9 @@ const BLANK_Y = transcriptRow(11);
 const BLANK_X = 30;
 
 class HoverTranscript implements Component {
+	/** Frames built so far; each hover callback remembers the frame whose region it came from. */
+	generation = 0;
+	readonly stamped: string[] = [];
 	private regions: ClickRegion[] = [];
 	constructor(
 		private readonly specs: RegionSpec[],
@@ -28,6 +31,7 @@ class HoverTranscript implements Component {
 
 	render(): string[] {
 		// Fresh region objects on every frame, like a component that rebuilds them each render.
+		const generation = ++this.generation;
 		this.regions = this.specs.map((spec) => ({
 			line: spec.line,
 			col: 0,
@@ -35,7 +39,13 @@ class HoverTranscript implements Component {
 			height: 1,
 			onClick: () => {},
 			hoverKey: spec.hoverKey,
-			onHover: spec.report === false ? undefined : (hovered) => this.log.push(`${spec.hoverKey}:${hovered}`),
+			onHover:
+				spec.report === false
+					? undefined
+					: (hovered) => {
+							this.log.push(`${spec.hoverKey}:${hovered}`);
+							this.stamped.push(`${spec.hoverKey}:${hovered}@${generation}`);
+						},
 		}));
 		return Array.from({ length: this.rows }, (_, index) => `row ${index}`);
 	}
@@ -184,17 +194,24 @@ describe("fullscreen hover", () => {
 			{ line: B, hoverKey: "no-callback", report: false },
 			{ line: 18, hoverKey: undefined },
 		];
-		await withHover(specs, async ({ log, send }) => {
+		await withHover(specs, async ({ log, send, frames }) => {
 			await send(at(A));
+			let before = frames();
 			await send(at(B));
 			assert.deepStrictEqual(
 				log,
 				["A:true", "A:false"],
 				"a region with a key but no callback is not a hover target",
 			);
+			assert.strictEqual(frames() - before, 1, "leaving A redraws once; the keyed-only region adds nothing");
 			await send(at(A));
+			before = frames();
 			await send(at(18));
 			assert.deepStrictEqual(log, ["A:true", "A:false", "A:true", "A:false"], "no key means no hover either");
+			assert.strictEqual(frames() - before, 1, "leaving A redraws once");
+			before = frames();
+			await send(at(B), at(18), at(B));
+			assert.strictEqual(frames() - before, 0, "moving over regions that do not take part never redraws");
 		});
 	});
 
@@ -485,6 +502,22 @@ describe("hover follows the content under a still pointer", () => {
 			tui.requestRender();
 			await settle();
 			assert.deepStrictEqual(log, ["A:true", "A:false", "C:true"], "after the release the pointer's cell decides");
+		});
+	});
+
+	it("uses the newest frame's region for the leave callback", async () => {
+		await withHover(TWO_REGIONS, async ({ tui, transcript, send, settle }) => {
+			const entered = transcript.generation;
+			await send(at(A));
+			for (let i = 0; i < 2; i++) {
+				tui.requestRender();
+				await settle();
+			}
+			await send(move(5, transcriptRow(A)));
+			const newest = transcript.generation;
+			assert.ok(newest > entered);
+			await send(move(BLANK_X, BLANK_Y));
+			assert.deepStrictEqual(transcript.stamped, [`A:true@${entered}`, `A:false@${newest}`]);
 		});
 	});
 });
