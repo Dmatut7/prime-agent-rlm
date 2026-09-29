@@ -6,18 +6,15 @@ import { FooterComponent, type StatusBarState } from "../src/modes/interactive/c
 import { SubagentSummaryLine } from "../src/modes/interactive/components/subagent-summary-line.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { modeMethod } from "./tl-fix-host.js";
 
 /**
  * The key that stops a run is named in full wherever the screen names it: when the
  * owner binds more than one key to it, every key is listed, since any of them works.
  */
 
-type Method<T> = (this: object) => T;
-
-function method<T>(name: string): Method<T> {
-	const found: unknown = Reflect.get(InteractiveMode.prototype, name);
-	if (typeof found !== "function") throw new Error(`InteractiveMode has no ${name}`);
-	return found as Method<T>;
+function method<T>(name: string): (this: object) => T {
+	return modeMethod<(this: object) => T>(name);
 }
 
 function modeWith(stubs: Record<string, unknown>): InteractiveMode {

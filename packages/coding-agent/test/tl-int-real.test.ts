@@ -166,9 +166,7 @@ describe("subagents started from a Python cell get their dispatch row and lane",
 		for (const row of rows.slice(0, split)) expect(row.slice(10, 13), row).toBe("   ");
 		for (const row of rows.slice(join + 1)) expect(row.slice(10, 13), row).toBe("   ");
 		const returns = rows.filter((row) => /│ {2}◇ {3}\S 交回/.test(row));
-		expect(returns.map((row) => row.slice(16, 20))).toEqual(
-			["B 交回", "A 交回", "D 交回", "C 交回"].map((r) => r.slice(0, 4)),
-		);
+		expect(returns.map((row) => /◇ {3}(\S) 交回/.exec(row)?.[1])).toEqual(["B", "A", "D", "C"]);
 	});
 
 	it("lights the events between the dispatch and the returns even though every subagent is back", () => {
@@ -205,10 +203,15 @@ describe("subagents started from a Python cell get their dispatch row and lane",
 			chat.report(report(name, at(19, index), "没问题"));
 		});
 		expect(chat.flow.subagentLane.tracker.active).toBe(false);
+		// Something drawn after the last return, so the rows below the join are there to be checked.
+		chat.say(at(19, 5), { words: "四个都交回了，我来汇总。" });
 		const done = plain(chat.lines(160));
 		expect(done.filter((row) => row.includes("├──╯"))).toHaveLength(1);
 		const join = done.findIndex((row) => row.includes("├──╯"));
-		for (const row of done.slice(join + 1)) expect(row.slice(10, 13), row).toBe("   ");
+		expect(join).toBeGreaterThan(-1);
+		const after = done.slice(join + 1);
+		expect(after.length).toBeGreaterThan(0);
+		for (const row of after) expect(row.slice(10, 13), row).toBe("   ");
 		chat.flow.dispose();
 	});
 

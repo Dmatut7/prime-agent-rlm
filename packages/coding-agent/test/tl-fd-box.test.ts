@@ -8,9 +8,9 @@ import { RefinementOutcomeMessageComponent } from "../src/modes/interactive/comp
 import { timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
 import { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { TurnStripComponent } from "../src/modes/interactive/components/turn-strip.js";
-import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 import { built, type ReplayHost, replay, screenLines, summariesOf } from "./tl-fd-helpers.js";
+import { addMessageToChat } from "./tl-fix-host.js";
 import { assistant, host, plain, quietTurn, T0 } from "./ui-blocks-helpers.js";
 import { LiveChat } from "./ui-live-chat.js";
 
@@ -291,8 +291,6 @@ describe("a model call that a retry followed", () => {
 });
 
 describe("a memory line that arrives after the turn finished", () => {
-	type AddProto = { addMessageToChat(this: ReplayHost, message: AgentMessage): void };
-	const addProto = InteractiveMode.prototype as unknown as AddProto;
 	const tidy = (at: number) =>
 		createRefinementFailureMessage({ refinementId: "r1", scope: "local", reason: "超时" }, true, at);
 	const TIDY = "回合后整理记忆：没写进去";
@@ -320,7 +318,7 @@ describe("a memory line that arrives after the turn finished", () => {
 
 		const live = await replay(asked);
 		vi.advanceTimersByTime(1_000);
-		addProto.addMessageToChat.call(live, tidy(T0 + 2_000));
+		addMessageToChat(live, tidy(T0 + 2_000));
 		expect(tail(live).slice(-2)).toEqual(["memory", "closing"]);
 
 		expect(screenLines(live.chatContainer.children).join("\n")).toContain(TIDY);
@@ -330,7 +328,7 @@ describe("a memory line that arrives after the turn finished", () => {
 	it("draws the closing row as the last line either way", async () => {
 		const reopened = await replay([...asked, tidy(T0 + 2_000)]);
 		const live = await replay(asked);
-		addProto.addMessageToChat.call(live, tidy(T0 + 2_000));
+		addMessageToChat(live, tidy(T0 + 2_000));
 		const last = (host: ReplayHost) =>
 			plain(host.chatContainer.children.flatMap((child) => child.render(100)))
 				.map((entry) => entry.trimEnd())

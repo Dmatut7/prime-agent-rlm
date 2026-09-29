@@ -195,7 +195,20 @@ describe("how long a replayed round lasted", () => {
 	it("is the same in the test builder and the mode's replay: to the round's own last message, not to what came after", async () => {
 		const messages: AgentMessage[] = [
 			{ role: "user", content: "问一句", timestamp: T0 + 1_000 },
-			assistant(T0 + 4_000, [{ type: "text", text: "答一句。" }], "stop"),
+			assistant(
+				T0 + 4_000,
+				[{ type: "toolCall", id: "c1", name: "ipython", arguments: { code: "await bash('ls')" } }],
+				"toolUse",
+			),
+			{
+				role: "toolResult",
+				toolCallId: "c1",
+				toolName: "ipython",
+				content: [{ type: "text", text: "ok" }],
+				isError: false,
+				timestamp: T0 + 5_000,
+			},
+			assistant(T0 + 9_000, [{ type: "text", text: "答一句。" }], "stop"),
 			{ role: "user", content: "再问一句", timestamp: T0 + 90_000 },
 			assistant(T0 + 91_000, [{ type: "text", text: "再答一句。" }], "stop"),
 			createRefinementFailureMessage({ refinementId: "r1", scope: "local", reason: "超时" }, true, T0 + 200_000),
@@ -210,7 +223,7 @@ describe("how long a replayed round lasted", () => {
 			expect(
 				rounds.map((round) => round.state.turnDurationMs()),
 				where,
-			).toEqual([0, 0]);
+			).toEqual([5_000, 0]);
 		}
 	});
 });
@@ -330,7 +343,8 @@ describe("a question whose last round is left out", () => {
 				owner?.render(W).some((line) => line.includes("完整过程")),
 				where,
 			).toBe(true);
-			expect(left?.render(W) ?? [], where).toEqual([]);
+			expect(left, where).toBeDefined();
+			expect(left?.render(W), where).toEqual([]);
 		}
 		chat.flow.dispose();
 	});

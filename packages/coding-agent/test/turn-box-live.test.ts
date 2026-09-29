@@ -394,6 +394,7 @@ function plainLines(box: TurnSummaryComponent): string[] {
 	// The turn's own lines: the empty rows it opens with (two under a question, one for a woken turn) are left off.
 	let first = 0;
 	while (/^ {9}│ *$/.test(lines[first] ?? "")) first += 1;
+	expect(first, "the empty rows a turn opens with").toBeLessThanOrEqual(2);
 	return lines.slice(first);
 }
 

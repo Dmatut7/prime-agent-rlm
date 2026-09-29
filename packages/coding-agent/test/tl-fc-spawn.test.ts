@@ -227,9 +227,12 @@ describe("a subagent started from Python is one subagent, dispatched once its ch
 		const liveRows = plain(live.lines(W));
 		const replayRows = replayed(transcript(failed, { returned: false }));
 		for (const rows of [liveRows, replayRows]) {
+			expect(rows.length).toBeGreaterThan(0);
 			expect(dispatchRows(rows)).toEqual([]);
 			expect(rows.join("\n")).not.toContain("钉住框头：检查框头");
-			for (const lane of laneColumn(rows)) expect(lane).toBe("   ");
+			const lanes = laneColumn(rows);
+			expect(lanes.length).toBeGreaterThan(0);
+			for (const lane of lanes) expect(lane).toBe("   ");
 		}
 		live.flow.dispose();
 	});

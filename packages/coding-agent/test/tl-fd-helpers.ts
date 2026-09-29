@@ -1,7 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { type Component, Container, Spacer, type TUI } from "@earendil-works/pi-tui";
+import { type Component, Spacer, type TUI } from "@earendil-works/pi-tui";
 import { vi } from "vitest";
-import type { AgentConnectionSessionContext } from "../src/modes/agent-connection/index.js";
 import { AgentMessageComponent } from "../src/modes/interactive/components/agent-message.js";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
@@ -9,86 +8,15 @@ import { TimelineNoticeRow } from "../src/modes/interactive/components/system-no
 import { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { TurnStripComponent } from "../src/modes/interactive/components/turn-strip.js";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
-import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
+import { createReplayHost, type ReplayHost, type ReplayOptions, replayInto } from "./tl-fix-host.js";
 import { plain } from "./ui-blocks-helpers.js";
 
 /** The chat the interactive mode's own replay builds, and the other two ways to build one: live events, the test builder. */
 
-export type ReplayHost = {
-	chatContainer: Container;
-	currentTurnState?: TurnSummaryComponent["state"];
-	[key: string]: unknown;
-};
-
-export type ReplayOptions = {
-	clearChat?: boolean;
-	updateFooter?: boolean;
-	populateHistory?: boolean;
-	limitTranscript?: boolean;
-	keepCompactedHistory?: boolean;
-};
-
-type Proto = {
-	renderSessionContext(
-		this: ReplayHost,
-		context: AgentConnectionSessionContext,
-		options?: ReplayOptions,
-	): Promise<void>;
-};
-
-const proto = InteractiveMode.prototype as unknown as Proto;
+export type { ReplayHost, ReplayOptions } from "./tl-fix-host.js";
 
 export function createHost(): ReplayHost {
-	const noop = () => {};
-	const host: ReplayHost = {
-		chatContainer: new Container(),
-		pendingTools: new Map(),
-		pendingToolCreations: new Set(),
-		startedToolCalls: new Set(),
-		pendingToolGeneration: 0,
-		ipythonToolComponents: new Map(),
-		lateIpythonSentAgentMessages: new Map(),
-		toolDefinitionCache: new Map(),
-		processBlockOpenOrder: [],
-		toolOutputExpanded: false,
-		agentMessagesExpanded: false,
-		editDiffsExpanded: false,
-		thinkingExpanded: false,
-		hideThinkingBlock: false,
-		hiddenThinkingLabel: "Thinking...",
-		bindLocalSessionExtensions: false,
-		mermaidMarkdownTransform: undefined,
-		seenSubagentFailureIds: new Set(),
-		connectionCommands: [],
-		connectionState: {
-			isStreaming: false,
-			isCompacting: false,
-			isBashRunning: false,
-			retryAttempt: 0,
-			sessionActions: {},
-		},
-		chatTranscriptTrimmed: false,
-		chatCapRebuildFloor: 0,
-		editor: {},
-		footer: { invalidate: noop, setToolErrorCount: noop },
-		settingsManager: {
-			getShowImages: () => false,
-			getProcessMode: () => "quiet" as const,
-			getCodeBlockIndent: () => "  ",
-		},
-		ui: { requestRender: noop, isFullscreen: () => false, terminal: { rows: 40, columns: 100 } },
-		preloadToolDefinitions: async () => {},
-		getCachedToolDefinition: () => undefined,
-		getCurrentCwd: () => "/work/app",
-		updateEditorBorderColor: noop,
-		updateSubagentSummaryLine: noop,
-		handleTurnLanesClicked: noop,
-		resetBlockNavigation: noop,
-		addMessageToEditorHistory: noop,
-		showError: noop,
-	};
-	Object.setPrototypeOf(host, InteractiveMode.prototype);
-	return host;
+	return createReplayHost();
 }
 
 /** The mode's own replay of a session file's messages. */
@@ -97,11 +25,7 @@ export async function replay(
 	options: ReplayOptions = { clearChat: true },
 	host: ReplayHost = createHost(),
 ): Promise<ReplayHost> {
-	await proto.renderSessionContext.call(
-		host,
-		{ messages, thinkingLevel: "medium", serviceTier: "default", model: null } as AgentConnectionSessionContext,
-		options,
-	);
+	await replayInto(host, messages, options);
 	return host;
 }
 

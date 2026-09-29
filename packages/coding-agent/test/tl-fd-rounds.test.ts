@@ -13,6 +13,7 @@ import { timelineShowAll } from "../src/modes/interactive/components/timeline-la
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 import { built, replay, screenLines, screenOf, summariesOf } from "./tl-fd-helpers.js";
+import { modeMethod } from "./tl-fix-host.js";
 import { assistant, plain, T0 } from "./ui-blocks-helpers.js";
 import { handedBack, LiveChat } from "./ui-live-chat.js";
 
@@ -335,6 +336,9 @@ describe("the keys that act on the latest turn", () => {
 		chat.flow.dispose();
 	});
 
+	const toggleThinking = modeMethod<(this: object) => void>("toggleThinkingBlockVisibility");
+	const toggleOutput = modeMethod<(this: object) => void>("toggleToolOutputExpansion");
+
 	function keyMode(chat: Container) {
 		const fake = {
 			uiServices: { settingsManager: { getProcessMode: () => "quiet" as const } },
@@ -356,8 +360,12 @@ describe("the keys that act on the latest turn", () => {
 			},
 		};
 		Object.setPrototypeOf(fake, InteractiveMode.prototype);
-		// The key handlers are private; the fake drives them the way the other mode tests do.
-		return fake as any;
+		// The key handlers are private; the fake drives them by name (see tl-fix-host.ts).
+		return {
+			showToast: fake.showToast,
+			toggleThinkingBlockVisibility: () => toggleThinking.call(fake),
+			toggleToolOutputExpansion: () => toggleOutput.call(fake),
+		};
 	}
 
 	it("Ctrl+T opens the thoughts of the turn on screen, not of a turn nothing draws", async () => {

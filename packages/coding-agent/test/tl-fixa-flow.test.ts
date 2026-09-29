@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { type Component, Container, setKeybindings, type TUI } from "@earendil-works/pi-tui";
+import { type Component, setKeybindings } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	AGENT_MESSAGE_SOURCE,
@@ -8,120 +8,15 @@ import {
 } from "../src/core/agent-messages.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { createRlmChildTerminalNoticeMessage } from "../src/core/messages.js";
-import type { AgentConnectionSessionContext } from "../src/modes/agent-connection/index.js";
 import { AgentMessageComponent } from "../src/modes/interactive/components/agent-message.js";
-import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import { subagentNoticeRow } from "../src/modes/interactive/components/system-notice.js";
 import { timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
-import { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
-import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { built, replay, summariesOf } from "./tl-fd-helpers.js";
 import { assistant, plain, T0 } from "./ui-blocks-helpers.js";
 import { handedBack, LiveChat } from "./ui-live-chat.js";
 
-type ReplayHost = {
-	chatContainer: Container;
-	currentTurnState?: TurnSummaryComponent["state"];
-	[key: string]: unknown;
-};
-
-type ReplayOptions = {
-	clearChat?: boolean;
-	updateFooter?: boolean;
-	populateHistory?: boolean;
-	limitTranscript?: boolean;
-	keepCompactedHistory?: boolean;
-};
-
-type Proto = {
-	renderSessionContext(
-		this: ReplayHost,
-		context: AgentConnectionSessionContext,
-		options?: ReplayOptions,
-	): Promise<void>;
-};
-
-const proto = InteractiveMode.prototype as unknown as Proto;
-
-function createHost(): ReplayHost {
-	const noop = () => {};
-	const host: ReplayHost = {
-		chatContainer: new Container(),
-		pendingTools: new Map(),
-		pendingToolCreations: new Set(),
-		startedToolCalls: new Set(),
-		pendingToolGeneration: 0,
-		ipythonToolComponents: new Map(),
-		lateIpythonSentAgentMessages: new Map(),
-		toolDefinitionCache: new Map(),
-		processBlockOpenOrder: [],
-		toolOutputExpanded: false,
-		agentMessagesExpanded: false,
-		editDiffsExpanded: false,
-		thinkingExpanded: false,
-		hideThinkingBlock: false,
-		hiddenThinkingLabel: "Thinking...",
-		bindLocalSessionExtensions: false,
-		mermaidMarkdownTransform: undefined,
-		seenSubagentFailureIds: new Set(),
-		connectionCommands: [],
-		connectionState: {
-			isStreaming: false,
-			isCompacting: false,
-			isBashRunning: false,
-			retryAttempt: 0,
-			sessionActions: {},
-		},
-		chatTranscriptTrimmed: false,
-		chatCapRebuildFloor: 0,
-		editor: {},
-		footer: { invalidate: noop, setToolErrorCount: noop },
-		settingsManager: {
-			getShowImages: () => false,
-			getProcessMode: () => "quiet" as const,
-			getCodeBlockIndent: () => "  ",
-		},
-		ui: { requestRender: noop, isFullscreen: () => false, terminal: { rows: 40, columns: 100 } },
-		preloadToolDefinitions: async () => {},
-		getCachedToolDefinition: () => undefined,
-		getCurrentCwd: () => "/work/app",
-		updateEditorBorderColor: noop,
-		updateSubagentSummaryLine: noop,
-		handleTurnLanesClicked: noop,
-		resetBlockNavigation: noop,
-		addMessageToEditorHistory: noop,
-		showError: noop,
-	};
-	Object.setPrototypeOf(host, InteractiveMode.prototype);
-	return host;
-}
-
-async function replay(
-	messages: AgentMessage[],
-	options: ReplayOptions = { clearChat: true },
-	host: ReplayHost = createHost(),
-): Promise<ReplayHost> {
-	await proto.renderSessionContext.call(
-		host,
-		{ messages, thinkingLevel: "medium", serviceTier: "default", model: null } as AgentConnectionSessionContext,
-		options,
-	);
-	return host;
-}
-
-function built(messages: AgentMessage[]): Component[] {
-	return buildConversationComponents(messages, {
-		ui: { requestRender: vi.fn() } as unknown as TUI,
-		cwd: "/work/app",
-		toolOptions: {},
-		getToolDefinition: () => undefined,
-		processMode: "quiet",
-	});
-}
-
-const summariesOf = (children: readonly Component[]) =>
-	children.filter((child): child is TurnSummaryComponent => child instanceof TurnSummaryComponent);
 const screenOf = (children: readonly Component[], width = 100) =>
 	plain(children.flatMap((child) => child.render(width))).join("\n");
 
