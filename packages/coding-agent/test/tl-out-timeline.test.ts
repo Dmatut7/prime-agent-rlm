@@ -164,6 +164,33 @@ describe("your question on the timeline", () => {
 		expect(body.replace(/\s+/g, " ").trim()).toBe(text);
 	});
 
+	test("a first word longer than the row (a path, a URL) starts on the label's row, not the next one", () => {
+		const path = `/Users/a1/Desktop/ai/prime-agent/${"packages/coding-agent/src/".repeat(3)}assistant-message.ts`;
+		expect(path.length).toBeGreaterThan(100);
+		const rows = shown(question(`${path} 这个文件怎么样`).render(100));
+		// 100 columns: the words get 84 from column 16, and 5 fewer on the label's row.
+		expect(rows).toEqual([
+			` 18:47   ●      你   ${path.slice(0, 79)}`,
+			`         │      ${path.slice(79)} 这个文件怎么样`,
+			"         │",
+			"         │",
+		]);
+	});
+
+	test("a long word after the first still wraps at the full row width", () => {
+		const path =
+			"/Users/a1/Desktop/ai/prime-agent/packages/coding-agent/src/modes/interactive/components/user-message.ts";
+		const rows = shown(question(`看看 ${path}`).render(60)).slice(0, -2);
+		expect(rows[0]).toBe(" 18:47   ●      你   看看");
+		expect(
+			rows
+				.slice(1)
+				.map((line) => line.slice(16))
+				.join(""),
+		).toBe(path);
+		for (const line of rows.slice(1, -1)) expect(visibleWidth(line.slice(16))).toBe(44);
+	});
+
 	test("slash commands keep their highlight", () => {
 		const component = new UserMessageComponent("/compact focus", undefined, (name) => name === "compact", SENT_AT, {
 			quiet: true,

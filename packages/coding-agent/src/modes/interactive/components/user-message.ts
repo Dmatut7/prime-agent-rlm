@@ -201,13 +201,10 @@ class TimelineQuestion implements Component {
 		const lines: string[] = [];
 		this.mask.text.split("\n").forEach((raw, index) => {
 			const expanded = raw.replace(/\t/g, "   ");
-			// The first row's label takes the place of five blanks that make the wrap leave room for it.
-			const wrapped = wrapTextWithAnsi(index === 0 ? " ".repeat(TIMELINE_LABEL_WIDTH) + expanded : expanded, inner);
+			const wrapped = index === 0 ? this.wrapFirstLine(expanded, inner) : wrapTextWithAnsi(expanded, inner);
 			wrapped.forEach((piece, pieceIndex) => {
 				const isLabelRow = index === 0 && pieceIndex === 0;
-				const body = this.mask.restoreLine(
-					theme.fg("userMessageText", isLabelRow ? piece.slice(TIMELINE_LABEL_WIDTH) : piece),
-				);
+				const body = this.mask.restoreLine(theme.fg("userMessageText", piece));
 				lines.push(isLabelRow ? head + label + body : rail + body);
 			});
 		});
@@ -216,6 +213,19 @@ class TimelineQuestion implements Component {
 		this.cachedTime = time;
 		this.cachedLines = lines;
 		return lines;
+	}
+
+	/**
+	 * The first line of the question: its opening piece wraps at the width the
+	 * label leaves, the rest at the full width. A long first word (a path, a
+	 * URL) breaks to fill the label's row instead of leaving it alone.
+	 */
+	private wrapFirstLine(text: string, inner: number): string[] {
+		const opening = wrapTextWithAnsi(text, inner - TIMELINE_LABEL_WIDTH);
+		const [head = ""] = opening;
+		if (!text.startsWith(head)) return opening;
+		const rest = text.slice(head.length).replace(/^ +/, "");
+		return rest ? [head, ...wrapTextWithAnsi(rest, inner)] : [head];
 	}
 
 	getSelectionRegions(): ReadonlyArray<TableCellSelectionRegion> {
