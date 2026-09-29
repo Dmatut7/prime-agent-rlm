@@ -18,6 +18,7 @@ import {
 	mergeStepResult,
 	type StepFeedData,
 } from "./feed-data.js";
+import { stripInlineMarkdown } from "./inline-markdown.js";
 import type { TimelineLane } from "./timeline-gutter.js";
 import type { LaneOwner, TimelineLaneTracker } from "./timeline-lane.js";
 
@@ -151,10 +152,7 @@ export function thoughtSentence(text: string): string {
 			continue;
 		}
 		if (inFence || line === "" || line.startsWith("|") || /^[-=*_]{3,}$/.test(line)) continue;
-		const words = line
-			.replace(/^(?:#{1,6}\s+|>+\s*|[-*+]\s+|\d+[.)]\s+)+/, "")
-			.replace(/\*\*|__|`/g, "")
-			.trim();
+		const words = stripInlineMarkdown(line.replace(/^(?:#{1,6}\s+|>+\s*|[-*+]\s+|\d+[.)]\s+)+/, "")).trim();
 		if (words) return firstSentence(words);
 	}
 	return "";

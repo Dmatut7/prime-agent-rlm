@@ -3,6 +3,7 @@ import { type ThemeColor, theme } from "../theme/theme.js";
 import { spinnerFrame } from "../theme/working-icon.js";
 import { shortAgentName } from "./agent-message.js";
 import { sanitizeDisplayText } from "./diff-rows.js";
+import { styleInlineMarkdown } from "./inline-markdown.js";
 import {
 	formatTimelineTime,
 	TIMELINE_CONTENT_COL,
@@ -499,12 +500,21 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 			event.steps.length > 0
 				? width - TIMELINE_CONTENT_COL - visibleWidth(eventRight(event.steps.length, false)) - 4
 				: width - TIMELINE_CONTENT_COL;
-		const words = truncateToWidth(event.text, Math.max(1, width), "");
+		// The AI's own words keep their bold and drop their backticks; an error line is plain text.
+		const color: ThemeColor = event.kind === "fail" ? "timelineMust" : "text";
+		const words = truncateToWidth(
+			event.kind === "fail" ? theme.fg(color, event.text) : styleInlineMarkdown(event.text, color),
+			Math.max(1, width),
+			"",
+		);
 		const more = event.full !== undefined && (eventSaysMore(event) || visibleWidth(words) > textRoom);
 		const failDetail = event.kind === "fail" && detailRow?.detail !== undefined;
 		const openable = event.steps.length > 0 || more || failDetail;
 		const open = openable && ui.expanded.has(event.key);
-		const fullLines = open && more && event.full ? wrapTextWithAnsi(sanitizeDisplayText(event.full), bodyWidth) : [];
+		const fullLines =
+			open && more && event.full
+				? wrapTextWithAnsi(styleInlineMarkdown(sanitizeDisplayText(event.full), "timelineSoft"), bodyWidth)
+				: [];
 		if (event.kind === "steer") {
 			specs.push({
 				gutter: { ...(time ? { time } : {}), main: "user", lane },
@@ -512,10 +522,9 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 			});
 			return;
 		}
-		const color: ThemeColor = event.kind === "fail" ? "timelineMust" : "text";
 		specs.push({
 			gutter: { ...(time ? { time } : {}), main: "ai", lane },
-			content: theme.fg(color, words),
+			content: words,
 			...(openable
 				? {
 						right: eventRight(event.steps.length, open),
@@ -526,8 +535,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 				: {}),
 		});
 		if (open) {
-			for (const line of fullLines)
-				specs.push({ gutter: { main: "rail", lane }, content: theme.fg("timelineSoft", line) });
+			for (const line of fullLines) specs.push({ gutter: { main: "rail", lane }, content: line });
 			if (failDetail && detailRow?.detail) {
 				for (const line of detailRow.detail(bodyWidth))
 					specs.push({ gutter: { main: "rail", lane }, content: line });

@@ -13,7 +13,7 @@ import { createRlmChildTerminalNoticeMessage } from "../src/core/messages.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import { timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, type ThemeColor, theme } from "../src/modes/interactive/theme/theme.js";
 import { assistant } from "./ui-blocks-helpers.js";
 import { LiveChat } from "./ui-live-chat.js";
 
@@ -324,5 +324,108 @@ describe("a round woken only by a silent-finish notice", () => {
 		// A failed step the AI then corrected and answered is not an alarm: the round stays out of sight.
 		const fixed = replay(afterSummary([call("n3", at(19, 8, 35), undefined), broken])).join("\n");
 		expect(fixed).not.toContain("查过了，这条通知不用处理");
+	});
+});
+
+/** The AI's sentences as the real session has them: backticks, bold, and a link, all raw in the text. */
+describe("inline markdown in event rows", () => {
+	const WORDS = [
+		"上次审查收在 `adc7ca82c`（16:43），之后又落了一批。",
+		"**HEAD 上本批新测试有 4 个失败**（2 个文件，`grow-bottom-tui.test.ts` 悬停断言等），而且 **tui 包 690 行的测试**没人看。",
+		"设计稿见 [方向二](https://claude.ai/artifact/Xv4F9BkxFzPvdsLmARpvbN?sk=x)，路径 `**/*.ts` 要留着。",
+	];
+
+	function chatWith(words: string[]): LiveChat {
+		setMotionReduced(true);
+		vi.useFakeTimers();
+		vi.setSystemTime(at(18, 47));
+		const chat = new LiveChat();
+		chat.setClock(at(18, 47));
+		chat.user("审查");
+		words.forEach((text, index) => {
+			chat.say(at(18, 48 + index), {
+				words: text,
+				calls: [{ id: `k${index}`, code: "print(1)", details: {}, endsAt: at(18, 48 + index, 2) }],
+			});
+		});
+		chat.endRun();
+		vi.advanceTimersByTime(1000);
+		return chat;
+	}
+
+	it("draws code without its backticks, bold without its asterisks, and a link as its text", () => {
+		const rows = plain(chatWith(WORDS).lines(160));
+		const events = rows.filter((row) => /^ \d\d:\d\d {3}◆ {6}/.test(row));
+		expect(events).toHaveLength(3);
+		expect(events[0]).toContain("上次审查收在 adc7ca82c（16:43），之后又落了一批。");
+		expect(events[1]).toContain(
+			"HEAD 上本批新测试有 4 个失败（2 个文件，grow-bottom-tui.test.ts 悬停断言等），而且 tui 包 690 行的测试没人看。",
+		);
+		expect(events[2]).toContain("设计稿见 方向二，路径 **/*.ts 要留着。");
+		for (const row of events) {
+			expect(row).not.toContain("`");
+			expect(row).not.toContain("https://");
+		}
+		expect(events[1]).not.toContain("**");
+	});
+
+	it("paints bold words bold and code in the soft color, the rest in the text color", () => {
+		const raw = chatWith(WORDS).lines(160);
+		const line = raw.find((row) => stripAnsi(row).includes("HEAD 上本批新测试")) ?? "";
+		expect(line).toContain(theme.bold(theme.fg("text", "HEAD 上本批新测试有 4 个失败")));
+		expect(line).toContain(theme.fg("timelineSoft", "grow-bottom-tui.test.ts"));
+		expect(line).toContain(theme.fg("text", "（2 个文件，"));
+		const first = raw.find((row) => stripAnsi(row).includes("上次审查收在")) ?? "";
+		expect(first).toContain(theme.fg("timelineSoft", "adc7ca82c"));
+		const color = (token: ThemeColor) => theme.fg(token, "x").split("x")[0];
+		expect(color("timelineSoft")).not.toBe(color("text"));
+	});
+
+	it("still says a cut line opens to the whole text, without the markup", () => {
+		const long = `**${"很长的一句话".repeat(30)}**，后面还有 \`code\`。`;
+		const chat = chatWith([long]);
+		const rows = plain(chat.lines(100));
+		const event = rows.find((row) => /^ \d\d:\d\d {3}◆ {6}/.test(row)) ?? "";
+		expect(event).not.toContain("**");
+		expect(event.trimEnd().endsWith("▸")).toBe(true);
+	});
+
+	it("puts no raw markup on the live tail's sentence", () => {
+		setMotionReduced(true);
+		vi.useFakeTimers();
+		vi.setSystemTime(at(18, 47));
+		const chat = new LiveChat();
+		chat.setClock(at(18, 47));
+		chat.user("看一下");
+		vi.setSystemTime(at(18, 57));
+		chat.say(
+			at(18, 57),
+			{
+				thought: "实锤了，**256 色下四个底色撞码**，见 [报告](https://x.y/z)，先看 `kindSubagentBg`。",
+				calls: [
+					{
+						id: "r1",
+						code: 'r = await bash("npm test")',
+						details: {
+							activities: [
+								{
+									id: "r1-a",
+									kind: "command",
+									label: "npm test",
+									status: "running",
+									detail: "",
+									startedAt: at(18, 57),
+								},
+							],
+						},
+					},
+				],
+			},
+			{ open: true },
+		);
+		const spinner = plain(chat.lines(160)).find((row) => /^ \d\d:\d\d {3}[⠀-⣿]/.test(row)) ?? "";
+		expect(spinner).toContain("实锤了，256 色下四个底色撞码，见 报告，先看 kindSubagentBg");
+		for (const raw of ["**", "`", "https://", "]("]) expect(spinner).not.toContain(raw);
+		chat.flow.dispose();
 	});
 });
