@@ -4,14 +4,17 @@ import type { CustomMessage } from "../../core/messages.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
 import { SubagentLane } from "./components/agent-message.js";
 import {
+	assignWakeCause,
 	countThinkingSegments,
 	giveLaneTracker,
 	isWakeMessage,
 	latestThinkingText,
 	NO_STEP_STOP,
+	noteWakeInRound,
 	resolveTurnHeaders,
 	type StepResultStop,
 	stepResultStop,
+	WakeCause,
 } from "./components/conversation-components.js";
 import { formatFileChangePath, getToolFileChanges } from "./components/edit-summary.js";
 import { collectBashHandleCommands } from "./components/step-label.js";
@@ -132,6 +135,8 @@ export class LiveTurnFlow {
 	private readonly handleCommands = new Map<string, string>();
 	/** Which subagents of the current question are still out: the lane every timeline row is drawn in. */
 	readonly subagentLane = new SubagentLane();
+	/** What woke the run in progress; the turn it opens takes it. */
+	private pendingCause: WakeCause | undefined;
 
 	constructor(private readonly host: LiveTurnFlowHost) {}
 
@@ -153,6 +158,8 @@ export class LiveTurnFlow {
 		const state = new TurnActivityState(this.host.runStartedAt() ?? Date.now());
 		state.live = true;
 		state.startedByUser = this.starterKind === "user";
+		if (this.pendingCause) assignWakeCause(state, this.pendingCause);
+		this.pendingCause = undefined;
 		const summary = this.host.createSummary(state);
 		giveLaneTracker(summary, this.subagentLane.tracker);
 		summary.setExpanded(this.host.startExpanded());
@@ -169,6 +176,7 @@ export class LiveTurnFlow {
 		// exactly as a replay of the transcript groups it.
 		this.starterSinceRunStart = false;
 		this.starterKind = undefined;
+		this.pendingCause = undefined;
 		const state = this.host.currentState();
 		this.runCutMidTask =
 			this.host.quiet() &&
@@ -191,9 +199,13 @@ export class LiveTurnFlow {
 		if (isWakeMessage(message) && this.lastStop !== "toolUse" && !this.runCutMidTask) {
 			this.starterSinceRunStart = true;
 			this.starterKind = "wake";
+			this.pendingCause ??= new WakeCause();
+			this.pendingCause.add(message);
 			this.endLiveTurnForNewRun();
 			return false;
 		}
+		// Inside the tool loop the message joins the round that is running.
+		if (isWakeMessage(message)) noteWakeInRound(this.host.currentState(), message);
 		// A subagent notice is a row of the timeline the chat draws, never one of the box's.
 		if (isSubagentNoticeMessage(message)) return false;
 		if (!isBoxNoticeMessage(message)) return false;
@@ -227,6 +239,7 @@ export class LiveTurnFlow {
 		}
 		this.starterSinceRunStart = true;
 		this.starterKind = "user";
+		this.pendingCause = undefined;
 		if (quiet) this.endLiveTurnForNewRun();
 		// A new question: nobody is out yet.
 		this.subagentLane.reset();
@@ -778,6 +791,7 @@ export class LiveTurnFlow {
 		this.lostBox = undefined;
 		this.starterSinceRunStart = false;
 		this.starterKind = undefined;
+		this.pendingCause = undefined;
 		this.compactionAwaitingAfter = undefined;
 		this.handleCommands.clear();
 		this.subagentLane.reset();

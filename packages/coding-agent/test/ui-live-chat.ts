@@ -6,13 +6,14 @@ import {
 	createAgentSessionMessage,
 } from "../src/core/agent-messages.js";
 import { createRlmChildFailureMessage, createRlmChildTerminalNoticeMessage } from "../src/core/messages.js";
-import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import {
 	createAgentMessageRow,
 	createUserMessage,
 	foldEarlierAnswers,
 	giveLane,
 	lastDrawnComponent,
+	QuietAssistantMessage,
+	QuietTurnSummary,
 } from "../src/modes/interactive/components/conversation-components.js";
 import { subagentNoticeRow } from "../src/modes/interactive/components/system-notice.js";
 import { type TimelineHost, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
@@ -63,7 +64,7 @@ export class LiveChat {
 			cwd: () => "/work/app",
 			rlmNodeId: () => undefined,
 			createSummary: (state) => {
-				const summary = new TurnSummaryComponent(state);
+				const summary = new QuietTurnSummary(state);
 				summary.setTimelineHost(timelineHost);
 				return summary;
 			},
@@ -85,7 +86,7 @@ export class LiveChat {
 		return this.clock;
 	}
 
-	private reply(model: string, answer: string | undefined, cutMidStep = false): void {
+	private reply(model: string, answer: string | undefined, cutMidStep = false, endRun = true): void {
 		const content = cutMidStep
 			? [
 					{
@@ -100,12 +101,19 @@ export class LiveChat {
 				: [];
 		const message = assistant(this.tick(), content, cutMidStep ? "aborted" : "stop", model);
 		this.flow.assistantStart(message);
-		const component = new AssistantMessageComponent(undefined, false, undefined, "Thinking", { quiet: true });
+		const component = new QuietAssistantMessage(this.current?.state, undefined, false, undefined, "Thinking", {
+			quiet: true,
+		});
 		giveLane(component, this.flow.subagentLane.tracker.lane);
 		this.chat.addChild(component);
 		component.updateContent(message, false);
 		this.streamed(message);
 		this.flow.assistantEnd(message);
+		if (endRun) this.endRun();
+	}
+
+	/** The run is over (agent_end). */
+	endRun(): void {
 		this.flow.agentEnd();
 		this.streaming = false;
 	}
@@ -171,7 +179,7 @@ export class LiveChat {
 	/** A subagent's notice wakes the AI (it finished without a word, or it failed). */
 	wakeByNotice(
 		name: string,
-		options: { model?: string; answer?: string; failed?: boolean; lastText?: string } = {},
+		options: { model?: string; answer?: string; failed?: boolean; lastText?: string; running?: boolean } = {},
 	): void {
 		this.streaming = true;
 		this.flow.agentStart();
@@ -191,7 +199,7 @@ export class LiveChat {
 			const row = subagentNoticeRow(notice, this.flow.subagentLane);
 			if (row) this.chat.addChild(row);
 		}
-		this.reply(options.model ?? "glm-5.3-prime", options.answer);
+		this.reply(options.model ?? "glm-5.3-prime", options.answer, false, options.running !== true);
 	}
 
 	/** A wake-up whose message the chat does not show. */

@@ -19,7 +19,7 @@ import {
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import { TimelineNoticeRow } from "../src/modes/interactive/components/system-notice.js";
 import type { TimelineLane } from "../src/modes/interactive/components/timeline-gutter.js";
-import { TimelineLaneTracker } from "../src/modes/interactive/components/timeline-lane.js";
+import { TimelineLaneTracker, timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
 import { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
@@ -40,6 +40,7 @@ beforeEach(() => {
 afterEach(() => {
 	setMotionReduced(false);
 	vi.useRealTimers();
+	timelineShowAll.set(false);
 });
 
 const LONG_ANSWER = "审查完成：四个车道都收口了，这批代码本身没问题，但发版把一个测试弄红了，远程检查现在是红的。";
@@ -117,6 +118,9 @@ describe("the answer a turn ends on is never taken over by the turn a message wa
 		const answers = chat.chat.children.filter((child) => child instanceof AssistantMessageComponent);
 		expect(answers).toHaveLength(2);
 		expect(plain(answers[0]?.render(100) ?? []).join("\n")).toContain(LONG_ANSWER);
+		// The woken round only answered the notice with one short reply: not drawn unless 完整过程 is on.
+		expect(answers[1]?.render(100)).toEqual([]);
+		timelineShowAll.set(true);
 		expect(plain(answers[1]?.render(100) ?? []).join("\n")).toContain(ACK);
 		chat.flow.dispose();
 	});
@@ -173,7 +177,9 @@ describe("a live run and its replay draw the same layout", () => {
 		expect(layout.filter((entry) => entry.startsWith("report: "))).toHaveLength(2);
 		expect(layout.some((entry) => entry.startsWith("notice: "))).toBe(true);
 		expect(layout.find((entry) => entry.includes(LONG_ANSWER))?.startsWith("answer: ")).toBe(true);
-		expect(layout.filter((entry) => entry === "answer: (nothing drawn)")).toEqual([]);
+		// Only the acknowledgement of the silent subagent's notice is out of sight.
+		expect(layout.filter((entry) => entry === "answer: (nothing drawn)")).toHaveLength(1);
+		expect(layout.some((entry) => entry.includes(ACK))).toBe(false);
 	});
 
 	it("leaves the layout of a chat that nothing woke as it was", () => {
@@ -188,6 +194,134 @@ describe("a live run and its replay draw the same layout", () => {
 			assistant(T0 + 3_000, [{ type: "text", text: "好。" }], "stop"),
 		];
 		expect(outline(chat.chat.children)).toEqual(outline(replayed(messages)));
+		chat.flow.dispose();
+	});
+});
+
+describe("a round that is only the AI answering a notice", () => {
+	function chatWith(reply: string, options: { failed?: boolean } = {}): LiveChat {
+		const chat = new LiveChat();
+		chat.prompt("对最近的改动做全面的审查", { answer: LONG_ANSWER });
+		chat.wakeByNotice("review-grow-C-strip", { answer: reply, ...options });
+		vi.advanceTimersByTime(1_000);
+		return chat;
+	}
+
+	const drawn = (chat: LiveChat): string => plain(chat.lines()).join("\n");
+
+	it("draws neither its reply nor its turn head, and 完整过程 brings them back", () => {
+		const chat = chatWith(ACK);
+		expect(drawn(chat)).not.toContain(ACK);
+		const woken = chat.summaries()[1];
+		expect(woken?.render(100)).toEqual([]);
+		expect(woken?.getClickRegions()).toEqual([]);
+		timelineShowAll.set(true);
+		expect(drawn(chat)).toContain(ACK);
+		chat.flow.dispose();
+	});
+
+	it("keeps the long conclusion before it drawn", () => {
+		const chat = chatWith(ACK);
+		expect(drawn(chat)).toContain(LONG_ANSWER);
+		chat.flow.dispose();
+	});
+
+	it("draws the reply while the round still runs and takes it away when the run ends", () => {
+		const chat = new LiveChat();
+		chat.prompt("审查", { answer: LONG_ANSWER });
+		chat.wakeByNotice("review-grow-C-strip", { answer: ACK, running: true });
+		expect(drawn(chat)).toContain(ACK);
+		chat.endRun();
+		vi.advanceTimersByTime(1_000);
+		expect(drawn(chat)).not.toContain(ACK);
+		chat.flow.dispose();
+	});
+
+	it("counts a reply short up to 40 characters and no further", () => {
+		const reply = (length: number): AgentMessage[] => [
+			{ role: "user", content: "审查", timestamp: T0 },
+			assistant(T0 + 1_000, [{ type: "text", text: LONG_ANSWER }], "stop"),
+			noticeFor("review-grow-C-strip", T0 + 2_000),
+			assistant(T0 + 3_000, [{ type: "text", text: "好".repeat(length) }], "stop"),
+		];
+		expect(outline(replayed(reply(40))).at(-1)).toBe("answer: (nothing drawn)");
+		expect(outline(replayed(reply(41))).at(-1)).toBe(`answer: ${"好".repeat(41)}`);
+	});
+
+	it("draws a reply that is not short", () => {
+		const long =
+			"这条通知说它没交回，我去看了它留下的文件，发现它其实做完了，只是没发报告，结论和前面的汇总一致。".repeat(2);
+		const chat = chatWith(long);
+		expect(drawn(chat)).toContain(long.slice(0, 20));
+		chat.flow.dispose();
+	});
+
+	it("takes away the short reply to a failure notice, but the failure itself stays drawn", () => {
+		const chat = new LiveChat();
+		chat.prompt("审查", { answer: LONG_ANSWER });
+		chat.wakeByNotice("review-grow-C-strip", { failed: true, answer: ACK });
+		vi.advanceTimersByTime(1_000);
+		// A failed subagent is shown, and the short reply to it is still an acknowledgement.
+		expect(drawn(chat)).toContain("失败（出错）");
+		expect(drawn(chat)).not.toContain(ACK);
+		chat.flow.dispose();
+	});
+
+	it("draws the reply of a round a subagent's report woke, however short", () => {
+		const chat = new LiveChat();
+		chat.prompt("审查", { answer: LONG_ANSWER });
+		chat.wake("m1", { name: "review-grow-A-tui", answer: "收到。" });
+		vi.advanceTimersByTime(1_000);
+		expect(drawn(chat)).toContain("收到。");
+		chat.flow.dispose();
+	});
+
+	it("draws the reply when a report joined the round the notice woke", () => {
+		const messages: AgentMessage[] = [
+			{ role: "user", content: "审查", timestamp: T0 },
+			assistant(T0 + 1_000, [{ type: "text", text: LONG_ANSWER }], "stop"),
+			noticeFor("review-grow-C-strip", T0 + 2_000),
+			handedBack("m1", T0 + 3_000, "review-grow-A-tui"),
+			assistant(T0 + 4_000, [{ type: "text", text: "收到。" }], "stop"),
+		];
+		const layout = outline(replayed(messages));
+		expect(layout.some((entry) => entry.startsWith("answer: ") && entry.includes("收到。"))).toBe(true);
+	});
+
+	it("draws the reply of a round that ran steps, or that failed", () => {
+		const step = assistant(T0 + 3_000, [{ type: "toolCall", id: "t1", name: "ipython", arguments: { code: "1" } }]);
+		const withSteps: AgentMessage[] = [
+			{ role: "user", content: "审查", timestamp: T0 },
+			assistant(T0 + 1_000, [{ type: "text", text: LONG_ANSWER }], "stop"),
+			noticeFor("review-grow-C-strip", T0 + 2_000),
+			step,
+			{
+				role: "toolResult",
+				toolCallId: "t1",
+				toolName: "ipython",
+				content: [{ type: "text", text: "ok" }],
+				isError: false,
+				timestamp: T0 + 3_500,
+			},
+			assistant(T0 + 4_000, [{ type: "text", text: ACK }], "stop"),
+		];
+		expect(outline(replayed(withSteps)).some((entry) => entry.startsWith("answer: ") && entry.includes(ACK))).toBe(
+			true,
+		);
+		const failed: AgentMessage[] = [
+			{ role: "user", content: "审查", timestamp: T0 },
+			assistant(T0 + 1_000, [{ type: "text", text: LONG_ANSWER }], "stop"),
+			noticeFor("review-grow-C-strip", T0 + 2_000),
+			{ ...assistant(T0 + 3_000, [{ type: "text", text: ACK }], "error"), errorMessage: "503" },
+		];
+		expect(outline(replayed(failed)).some((entry) => entry.startsWith("answer: ") && entry.includes(ACK))).toBe(true);
+	});
+
+	it("never hides a round the owner started", () => {
+		const chat = new LiveChat();
+		chat.prompt("你好", { answer: "在的。" });
+		vi.advanceTimersByTime(1_000);
+		expect(drawn(chat)).toContain("在的。");
 		chat.flow.dispose();
 	});
 });

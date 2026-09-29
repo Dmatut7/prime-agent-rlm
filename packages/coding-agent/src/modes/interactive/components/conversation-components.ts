@@ -1,5 +1,13 @@
 import { ABORT_TRUNCATION_MARKER, type AgentMessage, TOOL_ABORT_FALLBACK_MESSAGE } from "@earendil-works/pi-agent-core";
-import { type Component, type MarkdownTheme, Spacer, type TUI } from "@earendil-works/pi-tui";
+import {
+	type ClickRegion,
+	type Component,
+	type MarkdownTheme,
+	Spacer,
+	type StickyHeader,
+	type TableCellSelectionRegion,
+	type TUI,
+} from "@earendil-works/pi-tui";
 import { type AgentSessionMessage, isAgentSessionMessage, startsAgentRun } from "../../../core/agent-messages.js";
 import {
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
@@ -31,7 +39,7 @@ import { SlashCommandMessageComponent } from "./slash-command-message.js";
 import { SlashCommandResultMessageComponent } from "./slash-command-result-message.js";
 import { isSubagentNoticeMessage, subagentNoticeRow, TimelineNoticeRow } from "./system-notice.js";
 import type { TimelineLane } from "./timeline-gutter.js";
-import type { TimelineLaneTracker } from "./timeline-lane.js";
+import { type TimelineLaneTracker, timelineShowAll } from "./timeline-lane.js";
 import {
 	selectLatestToolExpandHint,
 	ToolExecutionComponent,
@@ -117,6 +125,99 @@ export function giveLane(component: Component, lane: TimelineLane): void {
  */
 export function isWakeMessage(message: AgentMessage): boolean {
 	return message.role === "custom" && (startsAgentRun(message) || isSubagentNoticeMessage(message));
+}
+
+/** What woke a round the owner did not start: only subagent notices so far, or something with more to say. */
+export class WakeCause {
+	noticeOnly = true;
+
+	/** A message that woke the AI (or joined the round that woke it). */
+	add(message: AgentMessage): void {
+		if (!isSubagentNoticeMessage(message)) this.noticeOnly = false;
+	}
+}
+
+const wakeCauses = new WeakMap<TurnActivityState, WakeCause>();
+
+/** The round `state` is: woken by `cause`. */
+export function assignWakeCause(state: TurnActivityState, cause: WakeCause): void {
+	wakeCauses.set(state, cause);
+}
+
+/** A message that woke the AI landed in the round `state` (inside its tool loop): it is no longer notice-only. */
+export function noteWakeInRound(state: TurnActivityState | undefined, message: AgentMessage): void {
+	if (state) wakeCauses.get(state)?.add(message);
+}
+
+/** A reply this short, in a round woken only by notices, says nothing the owner needs. */
+const ACK_MAX_LENGTH = 40;
+
+/**
+ * Whether a finished round is only the AI answering a subagent notice with one
+ * short reply (`查过了，这条通知不用处理`): the owner did not start it, only notices
+ * woke it, it ran no steps and shows nothing else, and its one reply is short and
+ * did not fail. Such a round is not drawn unless "完整过程" is on.
+ */
+export function isAckRound(state: TurnActivityState): boolean {
+	if (timelineShowAll.value || state.startedByUser || !state.isTurnEnded) return false;
+	if (!wakeCauses.get(state)?.noticeOnly || state.steps.length > 0) return false;
+	const entries = state.timeline.entries;
+	const only = entries.length === 1 ? entries[0] : undefined;
+	if (only?.kind !== "message") return false;
+	const reply = only.message;
+	if (reply.stopReason === "error" || reply.stopReason === "aborted") return false;
+	if (reply.content.some((block) => block.type === "toolCall")) return false;
+	const text = reply.content
+		.map((block) => (block.type === "text" ? block.text : ""))
+		.join(" ")
+		.replace(/\s+/g, " ")
+		.trim();
+	return text.length <= ACK_MAX_LENGTH;
+}
+
+/** The turn head of a round that is only an acknowledgement: nothing of it is drawn. */
+export class QuietTurnSummary extends TurnSummaryComponent {
+	override render(width: number): string[] {
+		return isAckRound(this.state) ? [] : super.render(width);
+	}
+
+	override getClickRegions(): ReadonlyArray<ClickRegion> {
+		return isAckRound(this.state) ? [] : super.getClickRegions();
+	}
+
+	override getStickyHeaders(): ReadonlyArray<StickyHeader> {
+		return isAckRound(this.state) ? [] : super.getStickyHeaders();
+	}
+
+	override getFocusOrder(): readonly string[] {
+		return isAckRound(this.state) ? [] : super.getFocusOrder();
+	}
+}
+
+/** The reply of a round that is only an acknowledgement: nothing of it is drawn. */
+export class QuietAssistantMessage extends AssistantMessageComponent {
+	constructor(
+		private readonly round: TurnActivityState | undefined,
+		...args: ConstructorParameters<typeof AssistantMessageComponent>
+	) {
+		super(...args);
+	}
+
+	private get hidden(): boolean {
+		return this.round !== undefined && isAckRound(this.round);
+	}
+
+	override render(width: number): string[] {
+		return this.hidden ? [] : super.render(width);
+	}
+
+	override getClickRegions(): ReadonlyArray<ClickRegion> {
+		return this.hidden ? [] : super.getClickRegions();
+	}
+
+	override getSelectionRegions(): ReadonlyArray<TableCellSelectionRegion> {
+		return this.hidden ? [] : super.getSelectionRegions();
+	}
 }
 
 /** The nearest component above that draws something: a notice the timeline keeps out of sight does not count. */
@@ -236,11 +337,15 @@ export function buildConversationComponents(
 	const lane = new SubagentLane();
 	// A turn a message woke (a subagent's report, a notice) is not the owner's own.
 	let nextStartedByUser = true;
+	// What woke the turn about to start; the turn takes it when its first reply comes.
+	let pendingCause: WakeCause | undefined;
 
 	const ensureTurn = (startedAt: number): TurnActivityState => {
 		if (!turnState) {
 			turnState = new TurnActivityState(startedAt);
 			turnState.startedByUser = nextStartedByUser;
+			if (pendingCause) assignWakeCause(turnState, pendingCause);
+			pendingCause = undefined;
 			if (options.timelineHost) turnState.host = options.timelineHost;
 		}
 		return turnState;
@@ -269,7 +374,10 @@ export function buildConversationComponents(
 	for (const message of messages) {
 		// A message that wakes the AI after its turn ended starts the next turn: the answer the turn
 		// ended on stays its own, and the woken turn never folds it away (a live run does the same).
+		if (quiet && isWakeMessage(message) && insideToolLoop()) noteWakeInRound(turnState, message);
 		if (quiet && isWakeMessage(message) && !insideToolLoop()) {
+			pendingCause ??= new WakeCause();
+			pendingCause.add(message);
 			closeTurn();
 			turnState?.markTurnEnded(Number(message.timestamp) || Date.now());
 			turnState = undefined;
@@ -299,6 +407,7 @@ export function buildConversationComponents(
 			// A new question: nobody is out, and the turn is the owner's own.
 			lane.reset();
 			nextStartedByUser = true;
+			pendingCause = undefined;
 		}
 		if (message.role === "assistant") {
 			// The turn summary is created at the turn head, before the first
@@ -314,14 +423,15 @@ export function buildConversationComponents(
 			resultsArrived = false;
 			resultStop = NO_STEP_STOP;
 			if (!turnSummary) {
-				turnSummary = new TurnSummaryComponent(state);
+				turnSummary = new QuietTurnSummary(state);
 				turnSummary.setExpanded(expanded);
 				// TUI v4: quiet turns carry the one-line footnote at their head.
 				turnSummary.setQuiet(options.processMode === "quiet");
 				giveLaneTracker(turnSummary, lane.tracker);
 				components.push(turnSummary);
 			}
-			const answer = new AssistantMessageComponent(
+			const answer = new QuietAssistantMessage(
+				state,
 				message,
 				options.hideThinkingBlock ?? false,
 				options.markdownTheme,

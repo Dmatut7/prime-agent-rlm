@@ -173,9 +173,16 @@ describe("s3: a turn carried on by a subagent notice", () => {
 		const summaries = components.filter((component) => component instanceof TurnSummaryComponent);
 		expect(summaries).toHaveLength(2);
 		const closed = renderAll(components);
-		expect(closed).toContain("审查员看完了，没发现问题。");
 		// The woken turn does not fold the answer the first turn ended on away.
 		expect(closed).toContain("已经派审查员去看了");
+		// Its own one short reply to the notice is out of sight until 完整过程 is on.
+		expect(closed).not.toContain("审查员看完了，没发现问题。");
+		timelineShowAll.set(true);
+		try {
+			expect(renderAll(components)).toContain("审查员看完了，没发现问题。");
+		} finally {
+			timelineShowAll.set(false);
+		}
 	});
 
 	it("keeps what the subagent did out of sight until 完整过程 is on, then says it in Chinese", () => {

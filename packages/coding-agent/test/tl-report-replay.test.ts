@@ -171,6 +171,9 @@ describe("the mode's own replay of a conversation subagents woke", () => {
 			"turn(byUser=false)",
 		]);
 		expect(replayed).toEqual(outline(chat.chat.children));
+		// The acknowledgement of the silent subagent's notice is out of sight, live and replayed alike.
+		expect(replayed.filter((entry) => entry === "answer: (nothing drawn)")).toHaveLength(1);
+		expect(replayed.some((entry) => entry.includes(ACK))).toBe(false);
 		expect(replayed.find((entry) => entry.includes(LONG_ANSWER))?.startsWith("answer: ")).toBe(true);
 		chat.flow.dispose();
 	});

@@ -238,6 +238,7 @@ import {
 import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "./components/configuration-menu.js";
 import { formatContextTree } from "./components/context-tree-format.js";
 import {
+	assignWakeCause,
 	countThinkingSegments,
 	createAgentMessageRow,
 	createUserMessage,
@@ -248,8 +249,12 @@ import {
 	lastDrawnComponent,
 	latestThinkingText,
 	NO_STEP_STOP,
+	noteWakeInRound,
+	QuietAssistantMessage,
+	QuietTurnSummary,
 	resolveTurnHeaders,
 	stepResultStop,
+	WakeCause,
 } from "./components/conversation-components.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
@@ -7165,7 +7170,8 @@ export class InteractiveMode {
 		if (this.streamingComponent) {
 			this.chatContainer.removeChild(this.streamingComponent);
 		}
-		this.streamingComponent = new AssistantMessageComponent(
+		this.streamingComponent = new QuietAssistantMessage(
+			this.currentTurnState,
 			undefined,
 			this.hideThinkingBlock,
 			this.getMarkdownThemeWithSettings(),
@@ -8262,7 +8268,10 @@ export class InteractiveMode {
 		);
 	}
 
-	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
+	private addMessageToChat(
+		message: AgentMessage,
+		options?: { populateHistory?: boolean; round?: TurnActivityState },
+	): void {
 		if (message.role === "assistant") this.lastAssistantStopReason = message.stopReason;
 		switch (message.role) {
 			case "bashExecution": {
@@ -8374,7 +8383,8 @@ export class InteractiveMode {
 				break;
 			}
 			case "assistant": {
-				const assistantComponent = new AssistantMessageComponent(
+				const assistantComponent = new QuietAssistantMessage(
+					options?.round,
 					message,
 					this.hideThinkingBlock,
 					this.getMarkdownThemeWithSettings(),
@@ -8550,6 +8560,8 @@ export class InteractiveMode {
 			this.turnFlow.attachStrip(replayTurnSummary);
 		};
 
+		// What woke the turn about to start; the turn takes it when its first reply comes.
+		let replayCause: WakeCause | undefined;
 		// The run goes on inside the tool loop: a message right after a step's results belongs to the same turn.
 		const insideReplayToolLoop = (): boolean =>
 			replayQuiet &&
@@ -8561,7 +8573,10 @@ export class InteractiveMode {
 		for (const message of messagesToRender) {
 			// A message that wakes the AI after its turn ended starts the next turn: the answer the turn
 			// ended on stays its own, and the woken turn never folds it away (a live run does the same).
+			if (replayQuiet && isWakeMessage(message) && insideReplayToolLoop()) noteWakeInRound(replayTurnState, message);
 			if (replayQuiet && isWakeMessage(message) && !insideReplayToolLoop()) {
+				replayCause ??= new WakeCause();
+				replayCause.add(message);
 				replayTurnState?.markTurnEnded(Number(message.timestamp) || Date.now());
 				closeReplayTurn();
 				replayTurnState = undefined;
@@ -8589,6 +8604,7 @@ export class InteractiveMode {
 				replayStartedByUser = !this.createLegacyHeartbeatPromptMessage(message, this.getUserMessageText(message));
 				// A new question: nobody is out yet (a stored heartbeat prompt is not one).
 				if (replayStartedByUser) this.turnFlow.subagentLane.reset();
+				replayCause = undefined;
 			}
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
@@ -8597,6 +8613,8 @@ export class InteractiveMode {
 				if (!replayTurnState) {
 					replayTurnState = new TurnActivityState(Number(message.timestamp) || Date.now());
 					replayTurnState.startedByUser = replayStartedByUser;
+					if (replayCause) assignWakeCause(replayTurnState, replayCause);
+					replayCause = undefined;
 					replayTurnSummary = this.createTurnSummary(replayTurnState);
 					giveLaneTracker(replayTurnSummary, this.turnFlow.subagentLane.tracker);
 					replayTurnSummary.setExpanded(this.toolOutputExpanded);
@@ -8623,7 +8641,7 @@ export class InteractiveMode {
 				lastReplayAssistant = message;
 				replayResultsArrived = false;
 				replayResultStop = NO_STEP_STOP;
-				this.addMessageToChat(message);
+				this.addMessageToChat(message, { round: replayTurnState });
 				// Render tool call components
 				for (const content of message.content) {
 					if (content.type === "toolCall") {
@@ -10542,7 +10560,7 @@ export class InteractiveMode {
 
 	/** A new turn head, wired so its own clicks apply like the keys. */
 	private createTurnSummary(state: TurnActivityState): TurnSummaryComponent {
-		const summary = new TurnSummaryComponent(state);
+		const summary = new QuietTurnSummary(state);
 		summary.setOnLanesChange(() => this.handleTurnLanesClicked(summary));
 		summary.setTimelineHost(this.timelineHost());
 		return summary;
