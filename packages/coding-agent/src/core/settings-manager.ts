@@ -1714,7 +1714,7 @@ export class SettingsManager {
 			return undefined;
 		});
 
-		const primary: Settings = content ? SettingsManager.migrateSettings(JSON.parse(content)) : {};
+		const primary: Settings = content ? SettingsManager.parseSettingsFile(content) : {};
 		if (scope !== "project") {
 			return { settings: primary, ancestorParseErrors: [] };
 		}
@@ -1752,7 +1752,7 @@ export class SettingsManager {
 				throw error;
 			}
 			try {
-				ancestors.push(SettingsManager.migrateSettings(JSON.parse(raw)));
+				ancestors.push(SettingsManager.parseSettingsFile(raw));
 			} catch (error) {
 				// K3P-1: the broken ancestor is excluded from the merge and the
 				// failure is reported per file, instead of failing the entire
@@ -1789,6 +1789,21 @@ export class SettingsManager {
 		} catch (error) {
 			return { settings: {}, error: error as Error, ancestorParseErrors: [] };
 		}
+	}
+
+	/**
+	 * Parse a settings file and migrate it. Valid JSON that is not an object (an
+	 * array, null, a number ...) is a failed load like a syntax error: an array would
+	 * otherwise pass for a `Settings` whose keys are "0", "1" and every setting would
+	 * silently read as its default.
+	 */
+	private static parseSettingsFile(content: string): Settings {
+		const parsed: unknown = JSON.parse(content);
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+			const found = parsed === null ? "null" : Array.isArray(parsed) ? "an array" : `a ${typeof parsed}`;
+			throw new Error(`settings.json must hold a JSON object, found ${found}`);
+		}
+		return SettingsManager.migrateSettings(parsed as Record<string, unknown>);
 	}
 
 	/** Migrate old settings format to new format */
@@ -2252,9 +2267,7 @@ export class SettingsManager {
 		modifiedNestedFields: Map<keyof Settings, Set<string>>,
 	): void {
 		this.storage.withLock(scope, (current) => {
-			const currentFileSettings = current
-				? SettingsManager.migrateSettings(JSON.parse(current) as Record<string, unknown>)
-				: {};
+			const currentFileSettings = current ? SettingsManager.parseSettingsFile(current) : {};
 			const mergedSettings: Settings = { ...currentFileSettings };
 			for (const field of modifiedFields) {
 				const value = snapshotSettings[field];
