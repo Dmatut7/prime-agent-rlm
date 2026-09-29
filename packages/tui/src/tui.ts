@@ -444,6 +444,8 @@ export class TUI extends Container {
 	// Last known pointer cell, so the hover can follow content that moves under a still pointer.
 	private fullscreenPointer: { row: number; col: number } | null = null;
 	private fullscreenLeftMouseDown = false;
+	// Hover changes the frame-by-frame re-check may still make before the next input arrives.
+	private hoverRefreshBudget = 1;
 	private overlaySelectionRegions: FrameSelectionRegion[] = [];
 
 	// While set, doRender paints fixed frames via the viewport; the inline
@@ -705,32 +707,36 @@ export class TUI extends Container {
 		this.terminal.setMouseTracking(enabled);
 	}
 
-	/** Move the hover to the region under the pointer; regions without a hoverKey and onHover count as empty space. */
-	private updateFullscreenHover(target: FrameClickTarget | null): void {
+	/**
+	 * Move the hover to the region under the pointer; regions without a hoverKey and onHover
+	 * count as empty space. Returns whether the hover changed.
+	 */
+	private updateFullscreenHover(target: FrameClickTarget | null): boolean {
 		const region = target?.region;
 		const key = region?.onHover ? region.hoverKey : undefined;
 		if (!region || key === undefined) {
-			this.clearFullscreenHover();
-			return;
+			return this.clearFullscreenHover();
 		}
 		const previous = this.fullscreenHover;
 		if (previous?.key === key) {
 			// Same region in a newer frame: adopt its callbacks, nothing to report or redraw.
 			previous.region = region;
-			return;
+			return false;
 		}
 		this.fullscreenHover = { key, region };
 		previous?.region.onHover?.(false);
 		region.onHover?.(true);
 		this.requestRender();
+		return true;
 	}
 
-	private clearFullscreenHover(): void {
+	private clearFullscreenHover(): boolean {
 		const previous = this.fullscreenHover;
-		if (!previous) return;
+		if (!previous) return false;
 		this.fullscreenHover = null;
 		previous.region.onHover?.(false);
 		this.requestRender();
+		return true;
 	}
 
 	/** Forget the hover and where the pointer was: nothing is hoverable until the pointer moves again. */
@@ -749,15 +755,18 @@ export class TUI extends Container {
 	/**
 	 * After a frame is painted, look at the remembered pointer cell again: content that
 	 * scrolled or grew under a still pointer (no move report comes for that) changes what
-	 * is hovered. A change of key renders once more; an unchanged key does nothing, so
-	 * this settles after one extra frame.
+	 * is hovered. A change of key renders once more; an unchanged key does nothing.
+	 * Each input allows one such change: a hover callback that moves the region out from
+	 * under the pointer would otherwise be chased frame after frame, for ever.
 	 */
 	private refreshFullscreenHover(): void {
 		const pointer = this.fullscreenPointer;
 		const fullscreen = this.fullscreen;
-		if (!pointer || !fullscreen || this.fullscreenLeftMouseDown) return;
+		if (!pointer || !fullscreen || this.hoverRefreshBudget <= 0 || this.fullscreenLeftMouseDown) return;
 		if (!this.terminal.mouseTrackingActive || this.isHoverBlockedByOverlay()) return;
-		this.updateFullscreenHover(fullscreen.viewport.clickTargetAt(pointer.row, pointer.col));
+		if (this.updateFullscreenHover(fullscreen.viewport.clickTargetAt(pointer.row, pointer.col))) {
+			this.hoverRefreshBudget--;
+		}
 	}
 
 	override invalidate(): void {
@@ -1151,6 +1160,7 @@ export class TUI extends Container {
 	}
 
 	private handleInput(data: string): void {
+		this.hoverRefreshBudget = 1;
 		if (this.consumeHoverMove(data)) return;
 		this.reclaimModalFocus();
 		if (this.inputListeners.size > 0) {

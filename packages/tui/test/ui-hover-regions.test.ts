@@ -561,3 +561,95 @@ describe("legacy (non-SGR) hover moves", () => {
 		}
 	});
 });
+
+describe("a hover callback that changes the layout", () => {
+	// Hovering inserts a hint row above the region, so the region moves out from under the pointer.
+	class ShiftyTranscript implements Component {
+		hovered = false;
+		calls = 0;
+		render(): string[] {
+			const lines = Array.from({ length: 8 }, (_, index) => `row ${index}`);
+			if (this.hovered) lines.splice(3, 0, "hint");
+			return lines;
+		}
+		getClickRegions(): ReadonlyArray<ClickRegion> {
+			return [
+				{
+					line: this.hovered ? 4 : 3,
+					col: 0,
+					width: 10,
+					height: 1,
+					onClick: () => {},
+					hoverKey: "A",
+					onHover: (hovered) => {
+						this.calls++;
+						this.hovered = hovered;
+					},
+				},
+			];
+		}
+		invalidate(): void {}
+	}
+
+	async function withShifty(
+		test: (ctx: {
+			shifty: ShiftyTranscript;
+			dock: CountingDock;
+			send: (...inputs: string[]) => Promise<void>;
+		}) => Promise<void>,
+	): Promise<void> {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui = new TUI(terminal);
+		const shifty = new ShiftyTranscript();
+		const dock = new CountingDock();
+		tui.start();
+		tui.enterFullscreen({ scroll: [shifty], dock });
+		await terminal.waitForRender();
+		try {
+			await test({
+				shifty,
+				dock,
+				send: async (...inputs) => {
+					for (const input of inputs) terminal.sendInput(input);
+					await terminal.waitForRender();
+				},
+			});
+		} finally {
+			tui.stop();
+		}
+	}
+
+	// The transcript is top-aligned here, so row N of it is screen row N + 1.
+	const onRegion = move(3, 4);
+	const elsewhere = move(30, 8);
+
+	it("redraws a bounded number of times after one input instead of chasing the region for ever", async () => {
+		await withShifty(async ({ shifty, dock, send }) => {
+			const before = dock.frames;
+			await send(onRegion);
+			for (let i = 0; i < 10; i++) await send();
+			assert.ok(dock.frames - before <= 2, `frames after one input: ${dock.frames - before}`);
+			assert.ok(shifty.calls <= 2, `onHover calls after one input: ${shifty.calls}`);
+			const frames = dock.frames;
+			const calls = shifty.calls;
+			for (let i = 0; i < 10; i++) await send();
+			assert.strictEqual(dock.frames, frames, "and it stays quiet afterwards");
+			assert.strictEqual(shifty.calls, calls);
+		});
+	});
+
+	it("allows the same again after the next input", async () => {
+		await withShifty(async ({ shifty, dock, send }) => {
+			await send(onRegion);
+			await send(elsewhere);
+			for (let i = 0; i < 5; i++) await send();
+			const frames = dock.frames;
+			const calls = shifty.calls;
+			await send(onRegion);
+			for (let i = 0; i < 10; i++) await send();
+			assert.ok(dock.frames - frames <= 2, `frames after the second input: ${dock.frames - frames}`);
+			assert.ok(shifty.calls - calls >= 1, "the second input hovers again");
+			assert.ok(shifty.calls - calls <= 2, `onHover calls after the second input: ${shifty.calls - calls}`);
+		});
+	});
+});
