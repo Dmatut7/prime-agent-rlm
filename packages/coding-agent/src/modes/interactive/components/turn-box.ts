@@ -9,6 +9,7 @@ import {
 	TIMELINE_CONTENT_COL,
 	type TimelineGutter,
 	type TimelineLane,
+	type TimelineRowOptions,
 	timelineRow,
 } from "./timeline-gutter.js";
 import type { TimelineLaneTracker } from "./timeline-lane.js";
@@ -22,7 +23,13 @@ import {
 	type TimelineEvent,
 	type TimelineFacts,
 } from "./timeline-rows.js";
-import { formatBoxDuration, lastCompletedSentence, type TurnTimeline, thoughtSentence } from "./turn-timeline.js";
+import {
+	formatBoxDuration,
+	lastCompletedSentence,
+	type TimelineUiState,
+	type TurnTimeline,
+	thoughtSentence,
+} from "./turn-timeline.js";
 
 /**
  * A turn drawn on the timeline: one line per thing the AI said it does or found
@@ -44,17 +51,31 @@ export const BOX_FOCUS_MARKER = "\x1b_pi:box-focus\x07";
 
 /** Steps an opened event lists before `⋯ 另外 N 步`. */
 export const EVENT_STEPS_SHOWN = 3;
-/** In a run of consecutive events the first, the last two and up to three that carry news stay; the rest fold. */
+/** In a run of consecutive events the first, the last two, up to three that carry news and any the user opened or is on stay; the rest fold. */
 const EVENT_TAIL_SHOWN = 2;
 const EVENT_NEWS_SHOWN = 3;
 const EVENT_NEWS = /\*\*[^*\n]+\*\*|发现|实锤|出错|失败|问题|结论/;
+
+const NO_KEYS: ReadonlySet<string> = new Set();
+
+/** The key of the fold row that opens the run whose first event is `event`. */
+function foldKeyOf(event: TimelineEvent | undefined): string {
+	return `hid:${event?.key}`;
+}
 
 /**
  * The runs of events a long stretch folds into `⋯ 中间还有 N 件事`: a run is consecutive events
  * between two boundaries (the question, a dispatch, a return, an error line, a steer, the end),
  * and only a stretch of more than three is folded. A folded run is two events or more.
+ * An event in `pinned` (one the user opened, or the one the keyboard is on) is never folded: it
+ * splits the run around it, unless the run is unfolded already and every event of it shows.
  */
-export function foldedEventRuns(events: readonly TimelineEvent[], returnsAt: readonly number[]): number[][] {
+export function foldedEventRuns(
+	events: readonly TimelineEvent[],
+	returnsAt: readonly number[],
+	pinned: ReadonlySet<string> = NO_KEYS,
+	unfolded: ReadonlySet<string> = NO_KEYS,
+): number[][] {
 	const clusters: number[][] = [];
 	let current: number[] = [];
 	const close = (): void => {
@@ -78,6 +99,23 @@ export function foldedEventRuns(events: readonly TimelineEvent[], returnsAt: rea
 	});
 	close();
 	const runs: number[][] = [];
+	const settleRun = (run: number[]): void => {
+		if (run.length < 2) return;
+		if (unfolded.has(foldKeyOf(events[run[0] ?? 0]))) {
+			runs.push(run);
+			return;
+		}
+		let piece: number[] = [];
+		const flush = (): void => {
+			if (piece.length >= 2) runs.push(piece);
+			piece = [];
+		};
+		for (const index of run) {
+			if (pinned.has(events[index]?.key ?? "")) flush();
+			else piece.push(index);
+		}
+		flush();
+	};
 	for (const cluster of clusters) {
 		if (cluster.length <= 1 + EVENT_TAIL_SHOWN) continue;
 		const news = new Set<number>();
@@ -87,7 +125,7 @@ export function foldedEventRuns(events: readonly TimelineEvent[], returnsAt: rea
 		}
 		let run: number[] = [];
 		const settle = (): void => {
-			if (run.length >= 2) runs.push(run);
+			settleRun(run);
 			run = [];
 		};
 		for (const index of middle) {
@@ -99,10 +137,27 @@ export function foldedEventRuns(events: readonly TimelineEvent[], returnsAt: rea
 	return runs;
 }
 
+/** The events the fold leaves alone: the ones the user opened and the one the keyboard is on. */
+function pinnedEventKeys(events: readonly TimelineEvent[], ui: TimelineUiState): Set<string> {
+	const pinned = new Set<string>();
+	for (const event of events) if (ui.expanded.has(event.key)) pinned.add(event.key);
+	const focus = ui.focused ? ui.focusKey : undefined;
+	if (focus !== undefined) {
+		const owner = events.find(
+			(event) =>
+				focus === event.key || focus === `all:${event.key}` || event.steps.some((step) => step.key === focus),
+		);
+		if (owner) pinned.add(owner.key);
+	}
+	return pinned;
+}
+
 /** Columns of a step's content in front of its glyph. */
 const STEP_INDENT = 5;
 /** Columns a step's glyph and its gap take in front of the words. */
 const STEP_GLYPH_COLS = 3;
+/** Columns of its words a step keeps before its right side is shortened. */
+const STEP_WORDS_MIN = 12;
 
 /** A row that is only the main line and its lane: what a return keeps above itself. */
 const RAIL_GAP_ROW = /^(?:\x1b\[[0-9;]*m| )*│(?:\x1b\[[0-9;]*m| |┆)*$/;
@@ -346,6 +401,8 @@ interface LineSpec {
 	gutter: TimelineGutter;
 	content: string;
 	right?: string;
+	/** How the row gives way on a narrow screen. */
+	fit?: TimelineRowOptions;
 	/** Lines another part drew, taken as they are. */
 	raw?: InlineRow;
 	/** A line that can be pointed at, focused and clicked. */
@@ -415,6 +472,13 @@ function stepStatus(row: BoxRow, now: number): string {
 	const meta = parts.map((entry) => theme.fg(statusColor(entry), entry.text)).join("");
 	if (!took) return meta;
 	return `${meta}${meta ? " " : ""}${theme.fg("timelineFaint", took)}`;
+}
+
+/** What stays of a step's right side on a narrow line: its ✓ or ✗ when it has one, nothing otherwise. */
+function stepMark(row: BoxRow): string {
+	if (row.kind === "error" || row.status === "running") return "";
+	if (row.status === "failed") return `${theme.fg("timelineMust", "✗")}  `;
+	return row.meta[0]?.text.startsWith("✓") ? `${theme.fg("timelineFaint", "✓")}  ` : "";
 }
 
 /** A color that resets the background (or everything) inside a painted line. */
@@ -522,6 +586,8 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 	const folds = foldedEventRuns(
 		input.events,
 		inline.map((row) => row.at),
+		pinnedEventKeys(input.events, ui),
+		ui.expanded,
 	);
 	const runStart = new Map<number, number>();
 	for (const run of folds) for (const index of run) runStart.set(index, run[0] ?? index);
@@ -530,7 +596,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		const lane = laneOfEvent(index);
 		const start = runStart.get(index);
 		if (start !== undefined) {
-			const foldKey = `hid:${input.events[start]?.key}`;
+			const foldKey = foldKeyOf(input.events[start]);
 			const unfolded = ui.expanded.has(foldKey);
 			if (index === start) {
 				const count = folds.find((run) => run[0] === start)?.length ?? 0;
@@ -613,6 +679,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 					gutter: { main: "rail", lane },
 					content: `${" ".repeat(STEP_INDENT)}${theme.bold(theme.fg(glyphColor, glyph))}  ${theme.fg("timelineTime", stepWords(step))}`,
 					right: `${stepStatus(step, now)}  `,
+					fit: { minContent: STEP_INDENT + STEP_GLYPH_COLS + STEP_WORDS_MIN, short: stepMark(step) },
 					key: step.key,
 					onClick: toggle(step.key),
 					reveal: stepOpen ? 0 : STEP_REVEAL,
@@ -719,7 +786,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 			return;
 		}
 		const right = input.dropFirstRight && index === firstVisible ? "" : (spec.right ?? "");
-		const text = timelineRow(spec.gutter, spec.content, right, width);
+		const text = timelineRow(spec.gutter, spec.content, right, width, spec.fit);
 		const key = spec.key;
 		const focused = key !== undefined && key === focusKey;
 		const lit = key !== undefined && (focused || ui.hoverKey === key);
