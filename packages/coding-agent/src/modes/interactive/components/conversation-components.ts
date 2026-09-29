@@ -312,6 +312,19 @@ export function stepResultStop(message: { content?: unknown; details?: unknown; 
 	return { endsTurn: ownerStop, stopped: ownerStop || cut };
 }
 
+/**
+ * A reply that stopped on tool calls whose results have not come back yet. A report landing now is
+ * inside that step, though the transcript orders it before the result (the live run joins it too).
+ */
+export function awaitsStepResults(reply: AgentMessage | undefined, resultsArrived: boolean): boolean {
+	return (
+		!resultsArrived &&
+		reply?.role === "assistant" &&
+		reply.stopReason === "toolUse" &&
+		reply.content.some((block) => block.type === "toolCall")
+	);
+}
+
 /** Build conversation components from a message list, matching tool results to their calls. */
 export function buildConversationComponents(
 	messages: readonly AgentMessage[],
@@ -339,11 +352,14 @@ export function buildConversationComponents(
 	let nextStartedByUser = true;
 	// What woke the turn about to start; the turn takes it when its first reply comes.
 	let pendingCause: WakeCause | undefined;
+	// The owner's prompt opened the turn about to start: a report landing before its first reply does not take it over.
+	let promptOpened = false;
 
 	const ensureTurn = (startedAt: number): TurnActivityState => {
 		if (!turnState) {
 			turnState = new TurnActivityState(startedAt);
 			turnState.startedByUser = nextStartedByUser;
+			promptOpened = false;
 			if (pendingCause) assignWakeCause(turnState, pendingCause);
 			pendingCause = undefined;
 			if (options.timelineHost) turnState.host = options.timelineHost;
@@ -370,12 +386,15 @@ export function buildConversationComponents(
 		lastAssistant.stopReason === "toolUse" &&
 		resultsArrived &&
 		!resultStop.endsTurn;
+	// A report is inside the round while its step runs too, though its result comes after it in the transcript.
+	const insideRound = (): boolean =>
+		insideToolLoop() || (turnState !== undefined && awaitsStepResults(lastAssistant, resultsArrived));
 
 	for (const message of messages) {
 		// A message that wakes the AI after its turn ended starts the next turn: the answer the turn
 		// ended on stays its own, and the woken turn never folds it away (a live run does the same).
-		if (quiet && isWakeMessage(message) && insideToolLoop()) noteWakeInRound(turnState, message);
-		if (quiet && isWakeMessage(message) && !insideToolLoop()) {
+		if (quiet && isWakeMessage(message) && insideRound()) noteWakeInRound(turnState, message);
+		if (quiet && isWakeMessage(message) && !insideRound() && !promptOpened) {
 			pendingCause ??= new WakeCause();
 			pendingCause.add(message);
 			closeTurn();
@@ -407,6 +426,7 @@ export function buildConversationComponents(
 			// A new question: nobody is out, and the turn is the owner's own.
 			lane.reset();
 			nextStartedByUser = true;
+			promptOpened = true;
 			pendingCause = undefined;
 		}
 		if (message.role === "assistant") {
@@ -417,7 +437,7 @@ export function buildConversationComponents(
 			state.addThinkingSegments(countThinkingSegments(message));
 			state.latestThinking = latestThinkingText(message) || state.latestThinking;
 			state.modelId = message.model || state.modelId;
-			state.timeline.noteMessage(message, true);
+			state.timeline.noteMessage(message, true, true);
 			state.noteReplyAt(Number(message.timestamp));
 			lastAssistant = message;
 			resultsArrived = false;
@@ -586,7 +606,7 @@ export function buildConversationComponents(
 			// TUI v4: a received agent-message row is one comm in this turn.
 			turnSummary?.addCommMessage();
 			// A report that lands inside the running tool loop is a row of that turn, among its lines by time.
-			const round = quiet && isWakeMessage(message) && insideToolLoop() ? turnSummary : undefined;
+			const round = quiet && isWakeMessage(message) && insideRound() ? turnSummary : undefined;
 			const at = Number(message.timestamp) || 0;
 			const component = createAgentMessageRow(message, {
 				markdownTheme: options.markdownTheme,

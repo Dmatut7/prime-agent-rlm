@@ -239,6 +239,7 @@ import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "./compone
 import { formatContextTree } from "./components/context-tree-format.js";
 import {
 	assignWakeCause,
+	awaitsStepResults,
 	countThinkingSegments,
 	createAgentMessageRow,
 	createUserMessage,
@@ -8521,6 +8522,8 @@ export class InteractiveMode {
 		let replayResultStop = NO_STEP_STOP;
 		// The next turn's opener is a message the user sent, unless it is a stored heartbeat prompt.
 		let replayStartedByUser = true;
+		// The owner's prompt opened the turn about to start: a report landing before its first reply does not take it over.
+		let replayPromptOpened = false;
 		const closeReplayTurn = (): void => {
 			if (!replayQuiet || !replayTurnState || !replayTurnSummary) return;
 			replayTurnState.timeline.stopped = lastReplayAssistant?.stopReason === "aborted" || replayResultStop.stopped;
@@ -8537,12 +8540,16 @@ export class InteractiveMode {
 			lastReplayAssistant?.stopReason === "toolUse" &&
 			replayResultsArrived &&
 			!replayResultStop.endsTurn;
+		// A report is inside the round while its step runs too, though its result comes after it in the transcript.
+		const insideReplayRound = (): boolean =>
+			insideReplayToolLoop() ||
+			(replayQuiet && replayTurnState !== undefined && awaitsStepResults(lastReplayAssistant, replayResultsArrived));
 
 		for (const message of messagesToRender) {
 			// A message that wakes the AI after its turn ended starts the next turn: the answer the turn
 			// ended on stays its own, and the woken turn never folds it away (a live run does the same).
-			if (replayQuiet && isWakeMessage(message) && insideReplayToolLoop()) noteWakeInRound(replayTurnState, message);
-			if (replayQuiet && isWakeMessage(message) && !insideReplayToolLoop()) {
+			if (replayQuiet && isWakeMessage(message) && insideReplayRound()) noteWakeInRound(replayTurnState, message);
+			if (replayQuiet && isWakeMessage(message) && !insideReplayRound() && !replayPromptOpened) {
 				replayCause ??= new WakeCause();
 				replayCause.add(message);
 				replayTurnState?.markTurnEnded(Number(message.timestamp) || Date.now());
@@ -8570,6 +8577,7 @@ export class InteractiveMode {
 				lastReplayAssistant = undefined;
 				replaySentCommIds.clear();
 				replayStartedByUser = !this.createLegacyHeartbeatPromptMessage(message, this.getUserMessageText(message));
+				replayPromptOpened = replayStartedByUser;
 				// A new question: nobody is out yet (a stored heartbeat prompt is not one).
 				if (replayStartedByUser) this.turnFlow.subagentLane.reset();
 				replayCause = undefined;
@@ -8581,6 +8589,7 @@ export class InteractiveMode {
 				if (!replayTurnState) {
 					replayTurnState = new TurnActivityState(Number(message.timestamp) || Date.now());
 					replayTurnState.startedByUser = replayStartedByUser;
+					replayPromptOpened = false;
 					if (replayCause) assignWakeCause(replayTurnState, replayCause);
 					replayCause = undefined;
 					replayTurnSummary = this.createTurnSummary(replayTurnState);
@@ -8604,7 +8613,7 @@ export class InteractiveMode {
 				replayTurnState.modelId = message.model || replayTurnState.modelId;
 				replayTurnState.addThinkingSegments(countThinkingSegments(message));
 				replayTurnState.latestThinking = latestThinkingText(message) || replayTurnState.latestThinking;
-				replayTurnState.timeline.noteMessage(message, true);
+				replayTurnState.timeline.noteMessage(message, true, true);
 				replayTurnState.noteReplyAt(Number(message.timestamp));
 				lastReplayAssistant = message;
 				replayResultsArrived = false;
@@ -8727,7 +8736,7 @@ export class InteractiveMode {
 				// A subagent that ended, failed or went quiet: a row of the timeline, out of sight unless it failed.
 				this.addMessageToChat(message, {
 					...renderOptions,
-					...(isWakeMessage(message) && insideReplayToolLoop() && replayTurnSummary
+					...(isWakeMessage(message) && insideReplayRound() && replayTurnSummary
 						? { inlineIn: replayTurnSummary }
 						: {}),
 				});
@@ -8749,7 +8758,7 @@ export class InteractiveMode {
 				// All other messages use standard rendering; a report inside the tool loop goes into its turn.
 				this.addMessageToChat(message, {
 					...renderOptions,
-					...(replayQuiet && isWakeMessage(message) && insideReplayToolLoop() && replayTurnSummary
+					...(replayQuiet && isWakeMessage(message) && insideReplayRound() && replayTurnSummary
 						? { inlineIn: replayTurnSummary }
 						: {}),
 				});

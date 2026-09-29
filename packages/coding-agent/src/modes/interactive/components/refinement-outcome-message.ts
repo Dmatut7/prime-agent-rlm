@@ -26,8 +26,8 @@ import { timelineShowAll } from "./timeline-lane.js";
  * What the background refiner kept after a turn. The timeline hides it by
  * default; with the closing row's `完整过程 ▸` on it is one dim note,
  * `19:07 · 回合后整理记忆：新记 1 条（本会话）   展开 ▸`, that opens to the
- * memories in full. A refiner that produced nothing says so in amber instead
- * of claiming a memory was kept.
+ * memories in full. A refiner that failed, or refused an edit, says so in amber
+ * and is never hidden, like a failed subagent or compaction.
  */
 
 const KIND_MAP: Record<AppliedRefinementEdit["kind"], KernelMemoryChange["kind"]> = {
@@ -126,9 +126,11 @@ export class RefinementOutcomeMessageComponent implements Component, FocusableBl
 
 	private renderLines(width: number, forceShown: boolean): string[] {
 		this.regions = [];
-		if (!forceShown && !timelineShowAll.value) return [];
-		const safeWidth = Math.max(1, width);
 		const { edits, scope, failed, error } = this.message.details;
+		// Only a tidy that kept everything hides; one that failed or refused an edit is never out of sight.
+		const wentWrong = failed === true || edits.some((edit) => !edit.applied);
+		if (!forceShown && !timelineShowAll.value && !wentWrong) return [];
+		const safeWidth = Math.max(1, width);
 		const dim = (text: string) => theme.fg("timelineTime", text);
 		const row = (gutter: TimelineGutter, content: string, right = "") =>
 			timelineRow(gutter, content, right, safeWidth);
