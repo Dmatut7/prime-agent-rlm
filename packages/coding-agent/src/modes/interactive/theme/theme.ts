@@ -116,6 +116,20 @@ const ThemeJsonSchema = Type.Object({
 		activityText: Type.Optional(ColorValueSchema),
 		activityAccent: Type.Optional(ColorValueSchema),
 		memoryAccent: Type.Optional(ColorValueSchema),
+		timelineRail: Type.Optional(ColorValueSchema),
+		timelineTime: Type.Optional(ColorValueSchema),
+		timelineFaint: Type.Optional(ColorValueSchema),
+		timelineSoft: Type.Optional(ColorValueSchema),
+		timelineUser: Type.Optional(ColorValueSchema),
+		timelineAi: Type.Optional(ColorValueSchema),
+		timelineLane: Type.Optional(ColorValueSchema),
+		timelineSub: Type.Optional(ColorValueSchema),
+		timelineMemory: Type.Optional(ColorValueSchema),
+		timelineLive: Type.Optional(ColorValueSchema),
+		timelineMust: Type.Optional(ColorValueSchema),
+		timelineFix: Type.Optional(ColorValueSchema),
+		timelineOk: Type.Optional(ColorValueSchema),
+		timelineHoverBg: Type.Optional(ColorValueSchema),
 		churnBar: Type.Optional(ColorValueSchema),
 		diffAddedText: Type.Optional(ColorValueSchema),
 		diffRemovedText: Type.Optional(ColorValueSchema),
@@ -246,6 +260,19 @@ export type ThemeColor =
 	| "activityText"
 	| "activityAccent"
 	| "memoryAccent"
+	| "timelineRail"
+	| "timelineTime"
+	| "timelineFaint"
+	| "timelineSoft"
+	| "timelineUser"
+	| "timelineAi"
+	| "timelineLane"
+	| "timelineSub"
+	| "timelineMemory"
+	| "timelineLive"
+	| "timelineMust"
+	| "timelineFix"
+	| "timelineOk"
 	| "churnBar"
 	| "diffAddedText"
 	| "diffRemovedText"
@@ -266,6 +293,7 @@ export type ThemeColor =
 
 export type ThemeBg =
 	| "selectedBg"
+	| "timelineHoverBg"
 	| "userMessageBg"
 	| "customMessageBg"
 	| "toolPendingBg"
@@ -902,6 +930,20 @@ const CONVERSATION_LAYER_FALLBACKS: Record<string, string> = {
 	activityText: "text",
 	activityAccent: "assistantLabel",
 	memoryAccent: "accent",
+	timelineRail: "borderMuted",
+	timelineTime: "dim",
+	timelineFaint: "dim",
+	timelineSoft: "text",
+	timelineUser: "userLabel",
+	timelineAi: "activityAccent",
+	timelineLane: "warning",
+	timelineSub: "warning",
+	timelineMemory: "memoryAccent",
+	timelineLive: "warning",
+	timelineMust: "error",
+	timelineFix: "warning",
+	timelineOk: "success",
+	timelineHoverBg: "selectedBg",
 	churnBar: "assistantGutter",
 	diffAddedText: "toolDiffAdded",
 	diffRemovedText: "toolDiffRemoved",
@@ -995,6 +1037,7 @@ function createTheme(themeJson: ThemeJson, mode?: ColorMode, sourcePath?: string
 		"kindMemoryBg",
 		"kindMemoryHoverBg",
 		"kindPanelBg",
+		"timelineHoverBg",
 	]);
 	// A theme written before the conversation layers existed still renders them:
 	// each missing layer color borrows the closest core color.

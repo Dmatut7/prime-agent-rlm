@@ -379,6 +379,62 @@
 					"$ref": "#/$defs/colorValue",
 					"description": "Memory card and memory rows (optional)"
 				},
+				"timelineRail": {
+					"$ref": "#/$defs/colorValue",
+					"description": "The timeline's vertical line and its branch/join strokes (optional)"
+				},
+				"timelineTime": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Time stamps in the timeline's left column (optional)"
+				},
+				"timelineFaint": {
+					"$ref": "#/$defs/colorValue",
+					"description": "The faintest timeline text: step counts, collapse hints, the closing line (optional)"
+				},
+				"timelineSoft": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Secondary timeline text: step text, report bodies (optional)"
+				},
+				"timelineUser": {
+					"$ref": "#/$defs/colorValue",
+					"description": "The user's node and name on the timeline (optional)"
+				},
+				"timelineAi": {
+					"$ref": "#/$defs/colorValue",
+					"description": "The AI's event nodes, the summary title and the answer bar (optional)"
+				},
+				"timelineLane": {
+					"$ref": "#/$defs/colorValue",
+					"description": "The dotted subagent lane beside the timeline (optional)"
+				},
+				"timelineSub": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Subagent nodes and 'X 交回' labels (optional)"
+				},
+				"timelineMemory": {
+					"$ref": "#/$defs/colorValue",
+					"description": "The memory node, label and the bar beside remembered text (optional)"
+				},
+				"timelineLive": {
+					"$ref": "#/$defs/colorValue",
+					"description": "The live tip: what the AI is doing right now (optional)"
+				},
+				"timelineMust": {
+					"$ref": "#/$defs/colorValue",
+					"description": "A must-fix verdict from a subagent (optional)"
+				},
+				"timelineFix": {
+					"$ref": "#/$defs/colorValue",
+					"description": "A should-fix verdict, and a self-corrected step (optional)"
+				},
+				"timelineOk": {
+					"$ref": "#/$defs/colorValue",
+					"description": "A finished step's check mark (optional)"
+				},
+				"timelineHoverBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Timeline row under the pointer or keyboard focus (optional)"
+				},
 				"churnBar": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Churn bar next to changed files in the change card (optional)"
