@@ -67,7 +67,7 @@ export interface TimelineHost {
 	growBox?(): boolean;
 	/** `ui.timelineOpenWhileWorking`: a running turn's box starts open. */
 	openWhileWorking(): boolean;
-	/** `ui.timelineAutoFold`: a finished turn's box folds on its own unless the user opened or closed it. */
+	/** `ui.timelineAutoFold`: a finished turn's box folds on its own; only a box the user closed, or opened after the turn ended, stays as it is. */
 	autoFold(): boolean;
 	/** `hideThinkingBlock`: thinking rows say how long, never what. */
 	hideThinking?(): boolean;
@@ -290,14 +290,16 @@ export class TurnActivityState {
 	}
 
 	/**
-	 * Whether the box body shows: what the user chose, else the open/fold settings. An opening the
-	 * user made while the turn still ran lapses when it ends, so a finished box folds unless they
-	 * open it again; a closing stays.
+	 * Whether the box body shows: what the user chose, else the open/fold settings. With auto-fold on,
+	 * an opening the user made while the turn still ran lapses when it ends, so a finished box folds
+	 * unless they open it again; a closing stays, and with auto-fold off nothing lapses.
 	 */
 	get boxOpen(): boolean {
 		const ui = this.timeline.ui;
 		const live = this.boxLive;
-		if (ui.userOpen !== undefined && !(ui.userOpen && ui.userOpenWhileLive && !live)) return ui.userOpen;
+		if (ui.userOpen !== undefined && !(ui.userOpen && ui.userOpenWhileLive && !live && this.host.autoFold())) {
+			return ui.userOpen;
+		}
 		if (live) return this.host.openWhileWorking();
 		if (this.timeline.observedLive) return this.host.openWhileWorking() && !this.host.autoFold();
 		return false;
