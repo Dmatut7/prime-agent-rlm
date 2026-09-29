@@ -98,8 +98,8 @@ describe("changeTracking.enabled read from a hand-edited settings.json (FIX-10)"
 	});
 
 	it("says how a non-boolean value is read", () => {
-		expect(trackingWarnings(loadGlobal({ changeTracking: { enabled: "off" } }))[0].message).toContain("read as off");
-		expect(trackingWarnings(loadGlobal({ changeTracking: { enabled: "yes" } }))[0].message).toContain("read as on");
+		expect(trackingWarnings(loadGlobal({ changeTracking: { enabled: "off" } }))[0].message).toContain("reads as off");
+		expect(trackingWarnings(loadGlobal({ changeTracking: { enabled: "yes" } }))[0].message).toContain("reads as on");
 	});
 
 	it("names the project scope when the odd value sits in the project file", () => {
