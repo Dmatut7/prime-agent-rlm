@@ -126,6 +126,17 @@ export function reportParts(message: string): { label?: string; conclusion: stri
 }
 
 /**
+ * The key a subagent is on the lane by: its session name, else `fallback` (its
+ * active session id, which the dispatch side and the message side both know).
+ * The dispatch registers it with `tracker.spawned([laneKey(child.sessionName,
+ * child.activeSessionId)])` and a return releases it through `comeBack` with the
+ * same two values; empty when there is neither, which never matches anyone.
+ */
+export function laneKey(sessionName?: string, fallback?: string): string {
+	return sessionName?.trim() || fallback?.trim() || "";
+}
+
+/**
  * Which subagents of a question are still out, and how many came back in this
  * round: the tracker draws the lane, the count words the row that closes it.
  */
@@ -133,11 +144,12 @@ export class SubagentLane {
 	readonly tracker = new TimelineLaneTracker();
 	private back = 0;
 
-	/** A subagent handed back a report, failed or finished without a word. */
-	comeBack(name: string): TimelineReturn {
-		const wasOut = this.tracker.pending.includes(name);
+	/** A subagent handed back a report, failed or finished without a word, named the way {@link laneKey} reads. */
+	comeBack(sessionName: string | undefined, fallback?: string): TimelineReturn {
+		const name = laneKey(sessionName, fallback);
+		const wasOut = name !== "" && this.tracker.pending.includes(name);
 		const before = this.tracker.lane;
-		const result = this.tracker.reported(name);
+		const result = wasOut ? this.tracker.reported(name) : this.tracker.lane;
 		if (wasOut) this.back += 1;
 		const joined = wasOut && result === "join" ? this.back : undefined;
 		if (joined !== undefined) this.back = 0;

@@ -20,7 +20,7 @@ import {
 	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
 } from "../../../core/messages.js";
 import type { ProcessModeSetting } from "../../../core/settings-manager.js";
-import { AgentMessageComponent, agentMessageSenderName, SubagentLane } from "./agent-message.js";
+import { AgentMessageComponent, SubagentLane } from "./agent-message.js";
 import { AssistantMessageComponent } from "./assistant-message.js";
 import { BashExecutionComponent } from "./bash-execution.js";
 import {
@@ -252,7 +252,7 @@ export function createAgentMessageRow(
 	const tracker = options.lane.tracker;
 	const back =
 		message.details.fromRelationship === "child"
-			? options.lane.comeBack(agentMessageSenderName(message.details.from))
+			? options.lane.comeBack(message.details.from?.sessionName, message.details.from?.activeSessionId)
 			: { before: tracker.lane, after: tracker.lane };
 	return new AgentMessageComponent(message, options.markdownTheme, {
 		suppressLeadingSpace: options.previous instanceof AgentMessageComponent,

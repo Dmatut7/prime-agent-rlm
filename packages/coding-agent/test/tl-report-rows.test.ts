@@ -10,6 +10,7 @@ import { KeybindingsManager } from "../src/core/keybindings.js";
 import { createRlmChildFailureMessage, createRlmChildTerminalNoticeMessage } from "../src/core/messages.js";
 import {
 	AgentMessageComponent,
+	laneKey,
 	reportParts,
 	SubagentLane,
 	shortAgentName,
@@ -282,6 +283,48 @@ describe("opening a report", () => {
 		expect(plain(lit)).toEqual(plain(before));
 		region?.onHover?.(false);
 		expect(component.render(60)[0]).not.toContain(theme.getBgAnsi("timelineHoverBg"));
+	});
+});
+
+describe("the key a subagent is on the lane by", () => {
+	it("is the session name first, else the fallback, trimmed, and empty when there is neither", () => {
+		expect(laneKey("review-grow-B-box", "ac-1")).toBe("review-grow-B-box");
+		expect(laneKey("  review-grow-B-box  ", "ac-1")).toBe("review-grow-B-box");
+		expect(laneKey(undefined, " ac-1 ")).toBe("ac-1");
+		expect(laneKey("   ", "ac-1")).toBe("ac-1");
+		expect(laneKey(undefined, undefined)).toBe("");
+		expect(laneKey("", "")).toBe("");
+	});
+
+	it("releases a subagent by the name or the fallback the dispatch registered it under", () => {
+		const lane = new SubagentLane();
+		lane.tracker.spawned(["review-grow-B-box", "ac-2"]);
+		expect(lane.comeBack(" review-grow-B-box ", "ignored-because-named").before).toBe("on");
+		expect(lane.tracker.pending).toEqual(["ac-2"]);
+		expect(lane.comeBack(undefined, "ac-2").joined).toBe(2);
+	});
+
+	it("does not let a sender with neither a name nor an active session id release anyone", () => {
+		const lane = new SubagentLane();
+		lane.tracker.spawned(["agent", "review-grow-B-box"]);
+		const stranger = report("x", "好了", { relationship: "child" });
+		const details = { ...stranger.details, from: { clientId: "agent", sessionId: "agent" } };
+		const row = createAgentMessageRow({ ...stranger, details }, { quiet: true, lane, previous: undefined });
+		expect(lane.tracker.pending).toEqual(["agent", "review-grow-B-box"]);
+		expect(row.render(W).length).toBeGreaterThan(0);
+	});
+
+	it("releases the subagent a report names by its session name, then its active session id", () => {
+		const lane = new SubagentLane();
+		lane.tracker.spawned(["review-grow-B-box", "ac-2"]);
+		createAgentMessageRow(report("review-grow-B-box", okBody), { quiet: true, lane, previous: undefined });
+		expect(lane.tracker.pending).toEqual(["ac-2"]);
+		const unnamed = report("x", okBody);
+		createAgentMessageRow(
+			{ ...unnamed, details: { ...unnamed.details, from: { activeSessionId: "ac-2", sessionId: "s2" } } },
+			{ quiet: true, lane, previous: undefined },
+		);
+		expect(lane.tracker.active).toBe(false);
 	});
 });
 
