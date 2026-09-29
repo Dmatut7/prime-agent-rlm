@@ -157,6 +157,8 @@ const STEP_INDENT = 5;
 const STEP_GLYPH_COLS = 3;
 /** Columns of its words a step keeps before its right side is shortened. */
 const STEP_WORDS_MIN = 12;
+/** What the tail's running line says before the command. */
+const TIP_LABEL = "在跑  ";
 
 /** A row that is only the main line and its lane: what a return keeps above itself. */
 const RAIL_GAP_ROW = /^(?:\x1b\[[0-9;]*m| )*│(?:\x1b\[[0-9;]*m| |┆)*$/;
@@ -728,9 +730,11 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 				gutter: { main: "tip", lane },
 				content: theme.fg(
 					"timelineTime",
-					`${" ".repeat(STEP_INDENT)}${tail.running ? `在跑  ${tail.running.text}` : (tail.waiting ?? "")}`,
+					`${" ".repeat(STEP_INDENT)}${tail.running ? `${TIP_LABEL}${tail.running.text}` : (tail.waiting ?? "")}`,
 				),
 				...(elapsed ? { right: `${theme.fg("timelineFaint", elapsed)}  ` } : {}),
+				// Its clock goes before the command is cut below what a step line keeps.
+				fit: { minContent: STEP_INDENT + visibleWidth(TIP_LABEL) + STEP_WORDS_MIN, short: "" },
 			});
 		}
 		const pending = tracker?.pending ?? [];

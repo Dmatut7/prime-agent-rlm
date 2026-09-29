@@ -177,7 +177,13 @@ describe("a compaction after the turn's last answer", () => {
 		];
 	}
 
-	it("is a line of its own after the last event, not a step of an event that ended", async () => {
+	/** The chat's lines with the closing rows: the compaction after the last answer is one of them. */
+	const withClosingRows = (children: readonly Component[]): string[] =>
+		plain(children.flatMap((child) => child.render(100))).map((line) =>
+			line.replace(/\d\d:\d\d(?::\d\d)?/g, "HH:MM").trimEnd(),
+		);
+
+	it("is a line of its own after the last answer, not a step of an event that ended", async () => {
 		const chat = liveRun();
 		const replayed = await replay(messages());
 		for (const [where, children] of [
@@ -185,10 +191,12 @@ describe("a compaction after the turn's last answer", () => {
 			["mode replay", replayed.chatContainer.children],
 			["builder", built(messages())],
 		] as const) {
-			const lines = screenLines(children);
+			// The builder draws no closing part, which is where a compaction after the answer is said.
+			const lines = where === "builder" ? screenLines(children) : withClosingRows(children);
 			const at = lines.findIndex((entry) => entry.includes(DONE));
-			expect(at, where).toBeGreaterThan(-1);
-			expect(lines[at], where).not.toContain("步 ▸");
+			if (where === "builder") expect(at, where).toBe(-1);
+			else expect(at, where).toBeGreaterThan(lines.findIndex((entry) => entry.includes("总结")));
+			expect(lines[at] ?? "", where).not.toContain("步 ▸");
 			// The event of the command still counts its one step.
 			expect(
 				lines.some((entry) => entry.includes("先看目录里有什么") && entry.includes("1 步 ▸")),
