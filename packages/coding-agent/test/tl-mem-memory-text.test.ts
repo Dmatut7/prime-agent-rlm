@@ -154,6 +154,30 @@ describe("an opened memory shows its words in full", () => {
 		}
 	});
 
+	it("keeps to the contract a row that puts each line behind its own gutter relies on", () => {
+		// The exact shape another component imports: a change and a column count in, styled lines out.
+		const forRow: (change: KernelMemoryChange, width: number) => string[] = memoryBodyLines;
+		const changes = [
+			change({ after: "一段话\n\n第二段" }),
+			change({ op: "updated", previousTitle: "旧", title: "新", before: "甲", after: "乙" }),
+			change({ op: "deleted", before: "没了" }),
+			change({ op: "updated", textOmitted: "sensitive" }),
+		];
+		const widths = [4, 5, 8, 20, 60, 120];
+		expect(changes.length * widths.length).toBeGreaterThan(0);
+		for (const memory of changes) {
+			for (const width of widths) {
+				const lines = forRow(memory, width);
+				expect(lines.length, `${memory.op} at ${width}`).toBeGreaterThan(0);
+				for (const line of lines) {
+					expect(line, `${memory.op} at ${width}`).not.toContain("\n");
+					expect(visibleWidth(line), `${memory.op} at ${width}`).toBeLessThanOrEqual(width);
+				}
+			}
+		}
+		expect(plain(forRow(changes[0] as KernelMemoryChange, 60))).toEqual(["一段话", "", "第二段"]);
+	});
+
 	it("heads the row by what happened and what kind of thing it was", () => {
 		expect(memoryHeadLabel(change())).toBe("记住了");
 		expect(memoryHeadLabel(change({ op: "updated" }))).toBe("改了记忆");

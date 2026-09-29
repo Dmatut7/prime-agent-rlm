@@ -57,7 +57,14 @@ function plainLines(text: string, width: number): string[] {
 		.flatMap((line) => wrapped(line.trimEnd() === "" ? "" : theme.fg("timelineSoft", line.trimEnd()), width));
 }
 
-/** Every line of an opened memory change, each at most `width` columns wide. */
+/**
+ * The lines of an opened memory change, for a row that puts each behind its own
+ * gutter (`┃` on the timeline): the memory's words wrapped to `width` columns
+ * (at least 4) and never cut, blank lines kept; or, for a changed memory, only
+ * the differing lines under `原来` / `现在`; or what a delete removed. A rename
+ * comes first as `改名  旧 → 新`, and a text the kernel cut at its cap ends with
+ * one faint line saying so. Lines are styled, carry no gutter and no newline.
+ */
 export function memoryBodyLines(change: KernelMemoryChange, width: number): string[] {
 	const room = Math.max(4, width);
 	const label = (text: string) => theme.fg("timelineTime", text);
@@ -80,23 +87,23 @@ export function memoryBodyLines(change: KernelMemoryChange, width: number): stri
 	if (change.op === "created" || (!before && after)) {
 		lines.push(...plainLines(after, room));
 	} else if (change.op === "deleted" || (before && !after)) {
-		lines.push(label("删掉的"));
+		lines.push(...wrapped(label("删掉的"), room));
 		lines.push(...paint(before.split("\n").map((text) => ({ kind: "del" as const, text }))));
 	} else if (before || after) {
 		const rows = diffRowsFromEdit(before, after).filter((row) => row.kind !== "ctx");
 		const removed = rows.filter((row) => row.kind === "del");
 		const added = rows.filter((row) => row.kind === "add");
 		if (removed.length > 0) {
-			lines.push(label("原来"));
+			lines.push(...wrapped(label("原来"), room));
 			lines.push(...paint(removed));
 		}
 		if (added.length > 0) {
-			lines.push(label("现在"));
+			lines.push(...wrapped(label("现在"), room));
 			lines.push(...paint(added));
 		}
-		if (removed.length === 0 && added.length === 0) lines.push(label("内容没变"));
+		if (removed.length === 0 && added.length === 0) lines.push(...wrapped(label("内容没变"), room));
 	} else {
-		lines.push(label("没有记录到内容"));
+		lines.push(...wrapped(label("没有记录到内容"), room));
 	}
 	if (cutByKernel(change.before) || cutByKernel(change.after)) {
 		lines.push(...wrapped(theme.fg("timelineFaint", CUT_NOTE), room));
