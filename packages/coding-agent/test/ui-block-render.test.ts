@@ -309,6 +309,38 @@ describe("what hangs under a block", () => {
 		expect(turn.timeline.ui.expanded.has("act:c1:c1-a")).toBe(true);
 	});
 
+	it("keeps the panel color behind a diff line whose own tint ends inside the line", () => {
+		setMotionReduced(true);
+		const turn = quietTurn();
+		addActivities(turn, "e1", [], {
+			fileChanges: [
+				{
+					path: "/work/app/a.go",
+					relPath: "a.go",
+					kind: "modified",
+					scope: "project",
+					added: 1,
+					removed: 1,
+					source: "edit",
+					at: 1,
+					diff: "--- a/a.go\n+++ b/a.go\n@@ -1,2 +1,2 @@\n-old()\n+new()\n keep()\n",
+				},
+			],
+		});
+		turn.summary.render(WIDTH);
+		const key = turn.summary.getFocusOrder().find((entry) => entry.startsWith("file:"));
+		expect(key).toBeDefined();
+		turn.timeline.ui.toggleRow(key ?? "");
+		const lines = turn.summary.render(WIDTH);
+		const added = lines.find((line) => plain([line])[0]?.includes("new()")) ?? "";
+		expect(added).toBeTruthy();
+		const tint = theme.getBgAnsi("diffAddedLineBg");
+		const panel = theme.getBgAnsi("kindPanelBg");
+		expect(added).toContain(tint);
+		// After the tinted segment the panel color is put back for the rest of the line.
+		expect(added.lastIndexOf(panel)).toBeGreaterThan(added.indexOf(tint));
+	});
+
 	it("hangs a running command's latest output under its block", () => {
 		const turn = quietTurn();
 		addStep(turn, "c1", "r = await bash('go test')", "running");
