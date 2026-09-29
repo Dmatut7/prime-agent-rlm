@@ -294,20 +294,29 @@ deleted in the same cell.
   under `.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`), and any other file whose
   capped diff holds a likely credential (a private key block; `sk-`, `AKIA`/
   `ASIA`, `ghp_`, `github_pat_`, `xox?-`, `glpat-`, `AIza`, `hf_`, `npm_`,
-  `pypi-` tokens; JWTs; bearer tokens; `user:pass@` URLs; `password`/`secret`/
-  `api_key`/`token`-style assignments whose value is not a placeholder, number
-  or plain identifier), keeps its record and line counts without `diff`, with
-  `diffOmitted: "sensitive"`. A memory record whose `before` or `after` holds a
-  likely credential drops both texts and carries `textOmitted: "sensitive"`;
-  later edits of that entry in the same cell stay withheld. An activity's
+  `pypi-` tokens; JWTs; bearer tokens; `user:pass@` URLs; assignments to a
+  `password`/`secret`/`api_key`/`token`-style name, typed or not (`password:
+  str = ...`, Rust `let password: &str = ...`, Go `var password string = ...`),
+  whose value is not a placeholder, number or plain identifier), keeps its
+  record and line counts without `diff`, with `diffOmitted: "sensitive"`. A
+  memory record whose `before` or `after` holds a likely credential drops both
+  texts and carries `textOmitted: "sensitive"`; later edits of that entry in
+  the same cell stay withheld. Memory texts are scanned before they are cut to
+  4000 characters (the uncut start, a little past the cut), so a quoted value
+  the cut splits is still seen whole. A `title` or `previousTitle` that looks
+  like a credential counts the same: the record loses its texts, its title
+  reads as the entry's `id` (its `kind` when the id looks like a credential
+  too, or is the slug the harness made from the title) and the previous title
+  is left out; the `id` itself is sent as it is. An activity's
   `detail` (a command's latest or final output line, for example from `cat
   .env` or `echo $API_KEY`) gets the same scan; a `detail` that looks like a
   credential is left out of the record rather than sent. A step's `label` (the
   command line or task text) is scanned too, as it will be shown (blanks
   collapsed) and a little past the part that shows, so a key the length limit
   would cut is still seen whole; a label that looks like a credential reads as
-  the step's kind (`command`, for example). The scan runs only over the capped
-  text and treats its own failure as a secret. It cannot tell a real
+  the step's kind (`command`, for example). The scan runs only over bounded
+  text (a capped diff; the start of a memory text or label, a little past what
+  shows) and treats its own failure as a secret. It cannot tell a real
   credential from a value shaped like one, so ordinary code is withheld too: a
   test fixture such as `API_KEY = "test-1234567890abcdef"` or a JWT-shaped
   sample token on any line of a file's diff (changed lines and their context)
