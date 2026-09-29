@@ -204,12 +204,9 @@ export function noteWakeInRound(state: TurnActivityState | undefined, message: A
 	if (state) wakeCauses.get(state)?.add(message);
 }
 
-/** What a compaction the owner cancelled says it was (a cancel is the owner's own doing, not news). */
-const COMPACTION_CANCELLED = "已取消";
-
-/** A compaction that failed for real: one the owner cancelled, or that the session chose to wait on, did not. */
+/** A compaction that failed for real: one the owner cancelled (their own doing, not news), or that the session chose to wait on, did not. */
 function compactionFailed(compaction: TimelineCompaction): boolean {
-	return compaction.failed !== undefined && compaction.skipped !== true && compaction.failed !== COMPACTION_CANCELLED;
+	return compaction.failed !== undefined && compaction.skipped !== true && compaction.cancelled !== true;
 }
 
 /** Whether a round woken by bookkeeping did anything the owner would look for. */
@@ -806,7 +803,11 @@ const TERMINAL_ESCAPES = /\x1b\[[0-9;?]*[A-Za-z]|\x1b[\]_][^\x07]*\x07/g;
 function endsInBlankLine(children: readonly Component[], index: number): boolean {
 	for (let above = index - 1; above >= 0; above--) {
 		const component = children[above];
-		if (component instanceof TurnSummaryComponent) return false;
+		if (component instanceof TurnSummaryComponent) {
+			// A round left out draws nothing: what is above it decides.
+			if (isAckRound(component.state)) continue;
+			return false;
+		}
 		const last = component?.render(BLANK_PROBE_WIDTH).at(-1);
 		if (last !== undefined) return last.replace(TERMINAL_ESCAPES, "").trim() === "";
 	}

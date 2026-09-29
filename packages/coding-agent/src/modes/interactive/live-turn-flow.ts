@@ -779,6 +779,7 @@ export class LiveTurnFlow {
 			// The spend is the session's total so far: it says nothing about what an earlier question cost.
 			spend: () => (this.after(summary).laterQuestion ? undefined : this.host.subagentSpend?.()),
 			endsRequest: () => !isAckRound(state) && !this.after(summary).laterRound,
+			hidden: () => isAckRound(state),
 		};
 	}
 

@@ -49,6 +49,8 @@ export interface StripSource {
 	spend?(): StripSpend | undefined;
 	/** False while a later round of the same question is drawn (this turn then draws no closing row: the last one does). */
 	endsRequest?(): boolean;
+	/** True for a round the timeline leaves out: its strip draws nothing at all. */
+	hidden?(): boolean;
 }
 
 export const STRIP_EDITS = "strip:edits";
@@ -218,7 +220,7 @@ export class TurnStripComponent implements Component {
 		const facts = this.source.facts();
 		this.regions = [];
 		this.order = [];
-		if (!facts) return [];
+		if (!facts || this.source.hidden?.() === true) return [];
 		const safeWidth = Math.max(1, Math.floor(width));
 		const timeline = this.source.timeline;
 		const ui = timeline.ui;
@@ -307,8 +309,10 @@ export class TurnStripComponent implements Component {
 			});
 		});
 
-		if (hasSections) gap();
-		if (this.drawsClosingRow()) this.closingRow(safeWidth, push);
+		const closes = this.drawsClosingRow();
+		// A compaction row alone, with no closing row under it, leaves the next round to space itself.
+		if (hasSections && (closes || hasEditsRow || facts.memories.length > 0)) gap();
+		if (closes) this.closingRow(safeWidth, push);
 		return lines;
 	}
 

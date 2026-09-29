@@ -1001,13 +1001,15 @@ function eventRow(entry: TimelineEntry, ctx: RowBuildContext): BoxRow | undefine
 				? "上下文快满了，正在整理前面的内容…"
 				: skipped
 					? `暂不整理：${sanitizeDisplayText(compaction.failed ?? "稍后再试")}`
-					: compaction.failed
-						? `这次没整理成：${sanitizeDisplayText(compaction.failed)}`
-						: compaction.before !== undefined && compaction.after !== undefined
-							? `整理完成：${contextSize(compaction.before)} → ${contextSize(compaction.after)} tokens，重要的结论都留着`
-							: compaction.before !== undefined
-								? `整理完成（原来 ${contextSize(compaction.before)} tokens），重要的结论都留着`
-								: "整理完成，重要的结论都留着";
+					: compaction.cancelled === true
+						? "已取消，未整理"
+						: compaction.failed
+							? `这次没整理成：${sanitizeDisplayText(compaction.failed)}`
+							: compaction.before !== undefined && compaction.after !== undefined
+								? `整理完成：${contextSize(compaction.before)} → ${contextSize(compaction.after)} tokens，重要的结论都留着`
+								: compaction.before !== undefined
+									? `整理完成（原来 ${contextSize(compaction.before)} tokens），重要的结论都留着`
+									: "整理完成，重要的结论都留着";
 			return {
 				key: entry.key,
 				kind: "compact",

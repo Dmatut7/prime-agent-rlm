@@ -40,7 +40,7 @@ const ASK = "把依赖升级一下";
 const WORDS = "先看目录里有什么。";
 const ANSWER = "升级好了。";
 const DONE = "整理完成（原来 166k tokens），重要的结论都留着";
-const CANCELLED = "这次没整理成：已取消";
+const CANCELLED = "已取消，未整理";
 const REASON = "boom: no room";
 const FAILED = `这次没整理成：${REASON}`;
 
