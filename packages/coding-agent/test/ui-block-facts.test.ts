@@ -199,7 +199,8 @@ describe("a step with nothing of its own to open opens to the facts of its step"
 			region?.onHover?.(true);
 			const lit = turn.summary.render(WIDTH);
 			expect(lit[at], `${testCase.name} hover color`).toContain(hoverBg());
-			expect(plain(lit)[at], `${testCase.name} hover keeps the words`).toBe(plain(closed)[at]);
+			// The hover color runs out to the last column; a line with nothing on its right ends where its words do.
+			expect(plain(lit)[at]?.trimEnd(), `${testCase.name} hover keeps the words`).toBe(plain(closed)[at]?.trimEnd());
 			region?.onHover?.(false);
 			expect(turn.summary.render(WIDTH)[at], `${testCase.name} hover leaves`).not.toContain(hoverBg());
 

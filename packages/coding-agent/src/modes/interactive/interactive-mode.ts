@@ -279,7 +279,7 @@ import {
 } from "./components/footer.js";
 import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
-import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
+import { formatKeyText, type KeyTextOptions, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
 import { createMermaidMarkdownTransform } from "./components/mermaid.js";
 import { setMotionFrameRequester, setMotionReduced } from "./components/motion.js";
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
@@ -7816,7 +7816,7 @@ export class InteractiveMode {
 		}
 		// The first Esc on an idle empty prompt says what a second one would do.
 		if (this.escapeRepeatAction === "tree" && !this.hasInterruptibleWork() && this.editor.getText().length === 0) {
-			const escKey = keyText("app.input.clear", { primaryOnly: true });
+			const escKey = keyText("app.input.clear");
 			return `再按一次 ${escKey || "Esc"} 回退到之前的消息`;
 		}
 		const text = this.editor.getExpandedText?.() ?? this.editor.getText();
@@ -7897,7 +7897,7 @@ export class InteractiveMode {
 					spinner: spinnerFrame(getSpinnerTick()),
 					elapsedMs: elapsed,
 					outputTokens: tokens,
-					stopKey: keyText("app.input.clear", { primaryOnly: true }) || undefined,
+					stopKey: keyText("app.input.clear") || undefined,
 					spendCells: this.statusBarSpendCell("timelineLive"),
 				}),
 			);
@@ -7919,8 +7919,12 @@ export class InteractiveMode {
 
 	/** The keys that work right now, most useful first; the hint line drops them from the end. */
 	private getTrayHints(): string[] {
-		const hint = (keybinding: AppKeybinding, label: string): string | undefined => {
-			const key = keyText(keybinding, { primaryOnly: true });
+		const hint = (
+			keybinding: AppKeybinding,
+			label: string,
+			options: KeyTextOptions = { primaryOnly: true },
+		): string | undefined => {
+			const key = keyText(keybinding, options);
 			return key ? `${key} ${label}` : undefined;
 		};
 		// ← only reaches the session list from an empty prompt; with text it moves the cursor.
@@ -7941,7 +7945,11 @@ export class InteractiveMode {
 			return quietHints.filter((entry): entry is string => entry !== undefined);
 		}
 		const hints = this.isAgentStreaming()
-			? [hint("app.input.clear", "中断"), hint("app.tools.expand", "过程"), hint("app.thinking.toggle", "Thinking")]
+			? [
+					hint("app.input.clear", "中断", {}),
+					hint("app.tools.expand", "过程"),
+					hint("app.thinking.toggle", "Thinking"),
+				]
 			: !this.isNewChat()
 				? [
 						hint("app.tools.expand", "过程"),

@@ -49,8 +49,8 @@ describe("a turn in the fullscreen window grows with its content", () => {
 		expect(stepOrder(lines)).toEqual(Array.from({ length: 60 }, (_, index) => index));
 		expect(text(lines)).not.toContain("上面还有");
 		expect(text(lines)).not.toContain("有新内容");
-		// The event line, the sixty steps, one blank rail line and the spinner line: taller than two screens.
-		expect(lines).toHaveLength(63);
+		// The event line, the sixty steps, the `▴ 收起` line, one blank rail line and the spinner line: taller than two screens.
+		expect(lines).toHaveLength(64);
 		expect(lines.length).toBeGreaterThan(SCREEN * 2);
 	});
 
@@ -228,7 +228,8 @@ describe("walking the steps with the keyboard in a growing turn", () => {
 		const order = turn.summary.getFocusOrder();
 		expect(order.length).toBeGreaterThan(40);
 		const seen = new Set<string>();
-		for (const target of [order[1], order[25], order[order.length - 1]]) {
+		// The last target is the `▴ 收起` line under the steps; the last step is the one before it.
+		for (const target of [order[1], order[25], order[order.length - 2]]) {
 			ui.focusKey = target;
 			ui.bump();
 			const { words } = markedLine(turn);
@@ -286,8 +287,8 @@ describe("the frames of a long turn", () => {
 		turn.summary.toggleBox();
 		listAll(turn);
 		const first = turn.summary.render(100);
-		// The event line and its hundred and fifty steps.
-		expect(first).toHaveLength(151);
+		// The event line, its hundred and fifty steps and the `▴ 收起` line.
+		expect(first).toHaveLength(152);
 		expect(turn.summary.render(100)).toBe(first);
 		expect(turn.summary.render(100)).toBe(first);
 		turn.timeline.ui.setHover(turn.summary.getFocusOrder()[4] ?? "", true);

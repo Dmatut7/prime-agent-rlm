@@ -239,9 +239,9 @@ describe("the turn-end fold", () => {
 		const turn = quietTurn({ host: host({ viewportRows: () => 200 }) });
 		for (let index = 0; index < 40; index++) addCommand(turn, `c${index}`, `echo ${index}`);
 		listAll(turn);
-		// The event line, forty steps, a blank rail line and the spinner line.
+		// The event line, forty steps, the `▴ 收起` line, a blank rail line and the spinner line.
 		const before = turn.summary.render(100).length;
-		expect(before).toBe(43);
+		expect(before).toBe(44);
 		turn.state.markTurnEnded();
 		turn.state.finishBox();
 		expect(turn.summary.render(100)).toHaveLength(1);

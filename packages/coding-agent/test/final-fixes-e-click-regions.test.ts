@@ -181,8 +181,8 @@ describe("the timeline's click areas stay on the screen", () => {
 				const { lines, regions, order, ui } = openTimeline(width, listAll);
 				const where = `${width} columns, ${listAll ? "every step listed" : "three steps listed"}`;
 				const onLines = new Set(regions.map((region) => region.line));
-				// The event line, its steps (three and `全部 ›`, or all 21) and nothing else has an area.
-				expect(order.length, `targets at ${where}`).toBe(listAll ? 22 : 5);
+				// The event line, its steps (three and `全部 ›`, or all 21 and `▴ 收起`) and nothing else has an area.
+				expect(order.length, `targets at ${where}`).toBe(listAll ? 23 : 5);
 				expect(regions.length, `areas at ${where}`).toBe(order.length);
 				expect(onLines.has(0), `event area at ${where}`).toBe(true);
 				expect(
