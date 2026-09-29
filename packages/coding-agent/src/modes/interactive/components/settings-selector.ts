@@ -304,7 +304,7 @@ export class SettingsSelectorComponent extends Container {
 			{
 				id: "timeline-fold",
 				label: "干完自动收起",
-				description: "这一轮做完后框收成一行总结；你自己点开或收起过的框不动",
+				description: "这一轮做完后框自动收成一行总结（跑的时候你点开的也会收）；你收起的、跑完后你点开的框保持原样",
 				currentValue: config.timelineAutoFold ? "true" : "false",
 				values: ["true", "false"],
 			},

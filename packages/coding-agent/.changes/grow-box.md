@@ -1,5 +1,5 @@
 - Changed the turn box in the fullscreen window to grow with its content, so a long turn shows every step and the page scrolls instead of the box; opening a step grows it in place.
 - Changed the box header to a painted card row with a status pill (`⠹ 进行中`, `✓ 完成`, `■ 已停止`, `✗ 出错`), a bold title and an arrow on the right that lights up under the pointer.
 - Changed a folded box with nothing to keep on show to a single header card without frame lines.
-- Fixed a box the user opened while it ran staying open after the turn ended; it now folds when the turn ends.
+- Fixed a box the user opened while it ran staying open under the next turn after the run ended; it now folds when the turn ends, unless `ui.timelineAutoFold` is off.
 - Added a pinned copy of an open box's header, with a hint of how many steps are out of sight above it, for the fullscreen window to keep at the top while the box scrolls past.

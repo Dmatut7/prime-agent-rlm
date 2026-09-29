@@ -1,1 +1,1 @@
-- Added a pinned box header in the fullscreen view: when a box is taller than the screen, its header stays at the top of the window while you scroll through it, and clicking it collapses the box.
+- Added pinned headers to the fullscreen view: while the top of an open turn box has scrolled out of sight, its header stays at the top of the window, clicking it folds the box, and page keys and text selection leave the pinned rows alone.

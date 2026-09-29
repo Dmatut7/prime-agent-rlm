@@ -1,4 +1,4 @@
 - Changed the subagent area under the prompt to one row of small blocks, one per child, that opens the child on a click, pages sideways with the mouse wheel and the arrow keys, and shows a stalled descendant as a red block in the same row.
 - Changed the order under the prompt to input box, subagent blocks, then the status line, in both the normal and the fullscreen view.
-- Changed the status line to show the subagent spend (`子代理 ¥X · 全部 ¥Y`) before `Esc 停止`, dropping it before anything else on a narrow screen, and to hide its own subagent count while the blocks are shown.
+- Changed the status line to show the subagent spend (`子代理 ¥X · 全部 ¥Y`) in front of `Esc 停止`, trimming it step by step on a narrow screen after the location has gone, and to hide its own subagent count while the blocks are shown.
 - Added `app.subagents.prev` and `app.subagents.next` (default left and right) to move between the subagent blocks.
