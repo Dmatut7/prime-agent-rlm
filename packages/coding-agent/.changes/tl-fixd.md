@@ -1,1 +1,0 @@
-- Fixed a subagent report or your own words that land while the first reply is still sending a tool call: they now stay inside that round, as they do after a reload, instead of splitting it in two.

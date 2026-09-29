@@ -1,1 +1,0 @@
-- Fixed a round the timeline leaves out still printing its cancelled or skipped tidy-up row under the closing row, and a late memory line landing below it; the closing row is the last line again, and a cancelled tidy-up reads "已取消，未整理".

@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.11.18] - 2026-09-30
+
+- Fixed dragging to copy in the fullscreen view: a selection now copies only the words, without the time column or the timeline lines.
+
 ## [0.11.16] - 2026-09-29
 
 - Added pinned headers to the fullscreen view: while the top of an open turn box has scrolled out of sight, its header stays at the top of the window, clicking it folds the box, and page keys and text selection leave the pinned rows alone.

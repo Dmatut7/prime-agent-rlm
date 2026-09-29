@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.11.18] - 2026-09-30
+
+- Fixed copying from the conversation timeline: the time and the rail glyphs no longer come along, and the empty rows between paragraphs stay.
+- Fixed a round the timeline leaves out still printing its cancelled or skipped tidy-up row under the closing row, and a late memory line landing below it; the closing row is the last line again, and a cancelled tidy-up reads "已取消，未整理".
+- Fixed a subagent report or your own words that land while the first reply is still sending a tool call: they now stay inside that round, as they do after a reload, instead of splitting it in two.
+- Fixed subagent reports, notices and tidy-up notes showing raw `**`, backticks and link addresses; double-backtick code, links with parentheses and code inside bold now draw as words.
+- Fixed the timeline folding lines like "没问题" as if they were problems, "完整过程" not opening the folded middle events, and two light-theme colors (the subagent lane and the done mark) that were hard to read on white.
+- Fixed the subagent lane lighting rows from before a subagent went out when a long session is opened mid-run, and subagent blocks whose names shorten to the same letter now show their own names.
+- Fixed a retry that moved to a backup model reading "模型服务繁忙，已自动重试" after a reload; it now says which backup model took over, as it did live.
+
 ## [0.11.17] - 2026-09-30
 
 - Fixed subagent blocks, error blocks and the timeline grays looking the same in 256-color terminals such as macOS Terminal.app: error blocks are red there and the hover row no longer hides the timeline line.
