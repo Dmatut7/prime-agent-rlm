@@ -211,7 +211,7 @@ export class LiveTurnFlow {
 		const state = this.host.currentState();
 		const lastStop = this.lastStop ?? (state?.isTurnEnded ? undefined : this.replayedStop(state));
 		const wakes = isWakeMessage(message);
-		if (wakes && lastStop !== "toolUse" && !this.runCutMidTask) {
+		if (wakes && lastStop !== "toolUse" && !this.runCutMidTask && !this.stepInFlight(state)) {
 			this.starterSinceRunStart = true;
 			// A prompt opened this run and nothing has answered it yet: a report landing before the first
 			// answer does not take it over. Once an answer has landed, the message starts a round of its own.
@@ -291,7 +291,7 @@ export class LiveTurnFlow {
 		const state = this.host.currentState();
 		const summary = this.host.currentSummary();
 		const lastStop = this.lastStop ?? (state?.isTurnEnded ? undefined : this.replayedStop(state));
-		const steered = lastStop === "toolUse" || this.runCutMidTask;
+		const steered = lastStop === "toolUse" || this.runCutMidTask || this.stepInFlight(state);
 		if (quiet && steered && state?.boxMode) {
 			// A run that stopped to take this message goes on in the same box.
 			if (state.isTurnEnded && summary) this.resumeTurn(summary);
@@ -306,6 +306,22 @@ export class LiveTurnFlow {
 		// A new question: nobody is out yet.
 		this.subagentLane.reset();
 		return "prompt";
+	}
+
+	/**
+	 * The live turn has a tool call whose result has not come back. A reply that still streams reads
+	 * `stop` until it ends, so what says a step is on its way is the call itself: the turn's steps
+	 * (added as the call streams in) or the open message's content.
+	 */
+	private stepInFlight(state: TurnActivityState | undefined): boolean {
+		if (!state || state.isTurnEnded) return false;
+		if (
+			this.openMessage?.state === state &&
+			this.openMessage.message.content.some((block) => block.type === "toolCall")
+		) {
+			return true;
+		}
+		return state.steps.some((step) => step.status === "queued" || step.status === "running");
 	}
 
 	/**
