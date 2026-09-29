@@ -92,22 +92,39 @@ export function timelineGutter(gutter: TimelineGutter): string {
 	return `${time}${main}${lane}   `;
 }
 
+export interface TimelineRowOptions {
+	/** Columns the content keeps at least (all of it when it is shorter) before its right side is shortened; default 0, the content gives way first. */
+	minContent?: number;
+	/** What stays of the right side when the whole does not fit: its last word unless said (`""`: nothing). */
+	short?: string;
+}
+
 /**
  * One timeline row fitted to `width`: the gutter, the content, and `right`
  * pushed to the right edge with two trailing spaces. The content gives way
- * first; the row never runs past `width`.
+ * first, down to `minContent` columns; then the right side gives way to its
+ * short form (its last word unless said) and last to nothing (the content
+ * takes the whole row).
  */
-export function timelineRow(gutter: TimelineGutter, content: string, right = "", width = 80): string {
+export function timelineRow(
+	gutter: TimelineGutter,
+	content: string,
+	right = "",
+	width = 80,
+	options: TimelineRowOptions = {},
+): string {
 	const head = timelineGutter(gutter);
 	const room = Math.max(0, width - TIMELINE_CONTENT_COL);
-	// The right side keeps its last word (`▸` of `24 步 ▸`) when the whole of it does not fit: the content gives way first.
 	const trimmed = right.replace(/\s+$/, "");
 	// A right side with nothing visible in it (blanks, an empty colored run) takes no columns.
-	const forms = visibleWidth(trimmed) > 0 ? [right, trimmed.slice(trimmed.lastIndexOf(" ") + 1)] : [""];
+	const forms =
+		visibleWidth(trimmed) > 0 ? [right, options.short ?? trimmed.slice(trimmed.lastIndexOf(" ") + 1)] : [""];
+	const keep = Math.min(options.minContent ?? 0, visibleWidth(content));
 	for (const form of forms) {
 		const tail = form ? `${form}  ` : "";
 		const tailWidth = visibleWidth(tail);
 		if (tailWidth + 2 > room) continue;
+		if (tail && room - tailWidth - 2 < keep) continue;
 		const fitted = truncateToWidth(content, room - tailWidth - (tail ? 2 : 0), "…");
 		const pad = Math.max(tail ? 2 : 0, room - visibleWidth(fitted) - tailWidth);
 		return `${head}${fitted}${tail ? " ".repeat(pad) + tail : ""}`;
