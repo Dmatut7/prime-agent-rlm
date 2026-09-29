@@ -57,7 +57,7 @@ describe("adaptive TUI theme colors", () => {
 		const editorTheme = getEditorTheme();
 
 		expect(theme.getEditorBackgroundColor()?.("x")).toBe(theme.bg("userMessageBg", "x"));
-		expect(editorTheme.borderColor("x")).toBe(theme.fg("borderMuted", "x"));
+		expect(editorTheme.borderColor("x")).toBe(theme.fg("timelineRail", "x"));
 	});
 
 	it("keeps theme editor chrome on dark terminal backgrounds", () => {
@@ -69,7 +69,7 @@ describe("adaptive TUI theme colors", () => {
 		const editorTheme = getEditorTheme();
 
 		expect(theme.getEditorBackgroundColor()?.("x")).toBe(theme.bg("userMessageBg", "x"));
-		expect(editorTheme.borderColor("x")).toBe(theme.fg("borderMuted", "x"));
+		expect(editorTheme.borderColor("x")).toBe(theme.fg("timelineRail", "x"));
 	});
 
 	it("nudges the editor surface when it matches the terminal background", () => {
@@ -82,7 +82,7 @@ describe("adaptive TUI theme colors", () => {
 
 		expect(theme.getEditorBackgroundColor()?.("x")).not.toBe(theme.bg("userMessageBg", "x"));
 		expect(theme.getEditorBackgroundColor()?.("x")).toMatch(/\x1b\[48;2;\d+;\d+;\d+mx\x1b\[49m/);
-		expect(editorTheme.borderColor("x")).toBe(theme.fg("borderMuted", "x"));
+		expect(editorTheme.borderColor("x")).toBe(theme.fg("timelineRail", "x"));
 	});
 
 	it("keeps theme editor chrome on light terminal backgrounds", () => {
@@ -94,7 +94,7 @@ describe("adaptive TUI theme colors", () => {
 		const editorTheme = getEditorTheme();
 
 		expect(theme.getEditorBackgroundColor()?.("x")).toBe(theme.bg("userMessageBg", "x"));
-		expect(editorTheme.borderColor("x")).toBe(theme.fg("borderMuted", "x"));
+		expect(editorTheme.borderColor("x")).toBe(theme.fg("timelineRail", "x"));
 	});
 
 	it("keeps the theme selection background when the terminal background is unknown", () => {

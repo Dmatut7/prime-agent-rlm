@@ -1,0 +1,5 @@
+- Fixed pressing Ctrl+T a second time leaving the thinking rows on screen: it now closes the events it opened and puts the turn back as it was.
+- Added `⋯ 共 N 步   ▴ 收起` under the steps once `全部 ›` has listed them all, so the list folds back with a click or Enter.
+- Fixed a timeline row with nothing on its right (a file read, a step with no result) giving up six columns of its words.
+- Fixed the status line, the second-Esc hint and the interrupt hint showing only the first of several keys bound to stop a run.
+- Changed the light theme's AI, live, subagent and fix colors on the timeline to read at 4.5 to 1 or better on white.

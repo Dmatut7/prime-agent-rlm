@@ -5,12 +5,11 @@ import { VirtualTerminal } from "../../tui/test/virtual-terminal.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
-import { headerIndex } from "./grow-box-helpers.js";
 import { addStep, host, plain, type QuietTurn, quietTurn, T0 } from "./ui-blocks-helpers.js";
 
 /**
- * Folding a box from its pinned header: the folded card has to land where the window's top row is,
- * so the pin's `line` is the first row of the box (its top rule), the row the folded box starts on.
+ * Folding an open event from the window. The timeline pins nothing above the window: an event folds from
+ * its own line, and the folded line lands on the row the event started on, where the window's top row is.
  */
 
 const WIDTH = 70;
@@ -58,82 +57,101 @@ function addTimedCommand(turn: QuietTurn, index: number, ok = true): void {
 
 function openTurn(steps: number): QuietTurn {
 	setMotionReduced(true);
-	const turn = quietTurn({ host: host({ growBox: () => true, viewportRows: () => ROWS }) });
+	const turn = quietTurn({ host: host({ viewportRows: () => ROWS }) });
 	for (let index = 0; index < steps; index++) addTimedCommand(turn, index);
 	return turn;
 }
 
-function pinnedLine(turn: QuietTurn): number {
-	const [header] = turn.summary.getStickyHeaders();
-	if (!header) throw new Error("no sticky header");
-	return header.line;
+/** The turn's first event, opened with every step listed (`全部 ›` taken). */
+function listEverySteps(turn: QuietTurn): string {
+	turn.summary.render(WIDTH);
+	const eventKey = turn.summary.getFocusOrder().find((key) => key.startsWith("ev:")) ?? "";
+	expect(eventKey).not.toBe("");
+	turn.summary.activate(eventKey);
+	turn.summary.render(WIDTH);
+	expect(turn.summary.activate(`all:${eventKey}`)).toBe(true);
+	turn.summary.render(WIDTH);
+	return eventKey;
 }
 
-describe("the pinned header's line", () => {
+describe("the event line's row", () => {
 	for (const [name, shown, blank] of [
-		["with the `◆ prime` line", true, false],
+		["with the `◆ prime` line asked for", true, false],
 		["without it", false, false],
 		["with a blank line above", false, true],
 	] as const) {
-		it(`is the row a folded box starts on, ${name}`, () => {
+		it(`is the row a folded event stays on, ${name}`, () => {
 			const turn = openTurn(6);
 			turn.summary.setHeaderShown(shown);
-			turn.summary.setLeadingBlank(blank);
-			const open = plain(turn.summary.render(WIDTH));
-			const line = pinnedLine(turn);
-			expect(open[line]).toMatch(/^ ╭─+╮$/);
+			turn.summary.setLeadingRows(blank ? 1 : 0);
 			turn.summary.toggleBox();
-			const folded = turn.summary.render(WIDTH);
+			const open = plain(turn.summary.render(WIDTH));
+			const line = open.findIndex((row) => row.trimEnd().endsWith("6 步 ▴"));
+			// The `◆ prime` title line is gone: the event is the first line, or the second under a blank line.
+			expect(line).toBe(blank ? 1 : 0);
+			expect(open.join("\n")).not.toContain("◆ prime");
+			expect(open[line + 1]).toContain("$  echo step-0");
+			expect(turn.summary.getStickyHeaders()).toHaveLength(0);
+			turn.summary.toggleBox();
+			const folded = plain(turn.summary.render(WIDTH));
 			expect(turn.state.boxOpen).toBe(false);
-			expect(headerIndex(folded)).toBe(line);
+			expect(folded.findIndex((row) => row.trimEnd().endsWith("6 步 ▸"))).toBe(line);
+			expect(turn.summary.getStickyHeaders()).toHaveLength(0);
 		});
 	}
 
-	it("is the row the framed box starts on when a failure keeps the frame after the fold", () => {
+	it("is the row the first event stays on when a failure that ended the turn keeps its own red line after the fold", () => {
 		setMotionReduced(true);
-		const turn = quietTurn({ host: host({ growBox: () => true, viewportRows: () => ROWS }) });
+		const turn = quietTurn({ live: false, host: host({ viewportRows: () => ROWS }) });
 		addTimedCommand(turn, 0);
 		addTimedCommand(turn, 1, false);
 		addTimedCommand(turn, 2);
-		turn.summary.render(WIDTH);
-		const line = pinnedLine(turn);
+		turn.state.markTurnEnded(T0);
+		turn.state.finishBox(T0);
+		turn.summary.toggleBox();
+		const open = plain(turn.summary.render(WIDTH));
+		const line = open.findIndex((row) => row.trimEnd().endsWith("2 步 ▴"));
+		expect(line).toBe(0);
+		expect(open.findIndex((row) => row.includes("出错"))).toBeGreaterThan(line + 2);
 		turn.summary.toggleBox();
 		const folded = plain(turn.summary.render(WIDTH));
-		expect(folded[line]).toMatch(/^ ╭─+╮$/);
+		expect(turn.state.boxOpen).toBe(false);
+		expect(folded.findIndex((row) => row.trimEnd().endsWith("2 步 ▸"))).toBe(line);
+		// Nothing of the steps is left on show, but the failure keeps its line right under the first event.
+		expect(folded.filter((row) => row.includes("$  echo"))).toHaveLength(0);
+		expect(folded[line + 1]).toContain("出错");
+		expect(turn.summary.getStickyHeaders()).toHaveLength(0);
 	});
 
-	it("still says the same number of steps are out of sight for the same window top", () => {
+	it("says how many steps are out of sight on the event's own lines, and pins no hint of it", () => {
 		const turn = openTurn(12);
-		const lines = turn.summary.render(WIDTH);
-		const header = pinned(turn);
-		const headerRow = headerIndex(lines);
-		const hidden = (top: number): number => {
-			const match = /前面还有 (\d+) 步/.exec(stripAnsi(header.render(top - header.line)[1] ?? ""));
-			return match ? Number(match[1]) : 0;
-		};
-		// Blocks are two lines each and the first starts two lines under the header row.
-		expect([0, 1, 2, 3, 4, 9, 10, 40].map((past) => hidden(headerRow + past))).toEqual([0, 1, 1, 2, 2, 5, 5, 12]);
+		const closed = plain(turn.summary.render(WIDTH));
+		expect(closed[0]?.trimEnd().endsWith("12 步 ▸")).toBe(true);
+		turn.summary.toggleBox();
+		const open = plain(turn.summary.render(WIDTH));
+		expect(open[0]?.trimEnd().endsWith("12 步 ▴")).toBe(true);
+		// Three steps are listed; the rest is one line saying how many, then `全部 ›`.
+		expect(open.filter((row) => row.includes("$  echo step-"))).toHaveLength(3);
+		const more = open.find((row) => row.includes("另外 9 步")) ?? "";
+		expect(more.trimEnd().endsWith("全部 ›")).toBe(true);
+		expect(turn.summary.getStickyHeaders()).toHaveLength(0);
+		for (const row of open) expect(row).not.toContain("前面还有");
 	});
 });
-
-function pinned(turn: QuietTurn) {
-	const [header] = turn.summary.getStickyHeaders();
-	if (!header) throw new Error("no sticky header");
-	return header;
-}
 
 interface Screen {
 	terminal: VirtualTerminal;
 	tui: TUI;
 	turn: QuietTurn;
 	click(row: number): Promise<void>;
-	top(): string;
+	row(index: number): string;
 }
 
 async function startScreen(): Promise<Screen> {
 	const terminal = new VirtualTerminal(WIDTH, ROWS);
 	const tui = new TUI(terminal);
 	const turn = openTurn(STEPS);
+	listEverySteps(turn);
 	const chat = new Container();
 	chat.addChild(new Text("earlier chat", 0, 0));
 	chat.addChild(turn.summary);
@@ -155,36 +173,47 @@ async function startScreen(): Promise<Screen> {
 			terminal.sendInput(`\x1b[<0;10;${row}m`);
 			await terminal.waitForRender();
 		},
-		top: () => stripAnsi(terminal.getViewport()[0] ?? ""),
+		row: (index) => stripAnsi(terminal.getViewport()[index] ?? ""),
 	};
 }
 
-describe("a click on the pinned header in the fullscreen window", () => {
-	it("folds the box and shows the folded card at the window's top row", async () => {
+describe("a click on the top row of the fullscreen window", () => {
+	it("folds the event and leaves the folded line at the window's top row", async () => {
 		const screen = await startScreen();
 		screen.tui.scrollToTop();
-		screen.tui.scrollBy(12);
+		// "earlier chat" is the first chat line; the window's top row is the event's own line.
+		screen.tui.scrollBy(1);
 		await screen.terminal.waitForRender();
-		expect(screen.top()).toMatch(/进行中/);
-		expect(stripAnsi(screen.terminal.getViewport()[1] ?? "")).toContain("点框头可收起");
+		expect(screen.row(0)).toMatch(/◆ +跑了 30 条命令 +30 步 ▴\s*$/);
+		expect(screen.row(1)).toContain("$  echo step-0");
 
 		await screen.click(1);
 
 		expect(screen.turn.state.boxOpen).toBe(false);
-		expect(screen.top()).toMatch(/进行中/);
-		expect(screen.top()).toMatch(/›\s*$/);
-		expect(stripAnsi(screen.terminal.getViewport()[1] ?? "")).toContain("after 0");
+		expect(screen.row(0)).toMatch(/◆ +跑了 30 条命令 +30 步 ▸\s*$/);
+		const below = Array.from({ length: ROWS }, (_, index) => screen.row(index)).join("\n");
+		expect(below).toContain("after 0");
+		expect(below).not.toContain("$  echo step-");
+		expect(screen.turn.summary.getStickyHeaders()).toHaveLength(0);
 	});
 
-	it("keeps the header row where it was when the pinned rows had just come up", async () => {
+	it("acts on the step under it once the event line has scrolled out of sight: nothing is pinned above it", async () => {
 		const screen = await startScreen();
 		screen.tui.scrollToTop();
-		// The window's top is the header row itself (the top rule is just above it): the pin paints over the card in place.
-		screen.tui.scrollBy(3);
+		// The window's top is the first step, just under the event line (where a pinned header used to come up).
+		screen.tui.scrollBy(2);
 		await screen.terminal.waitForRender();
-		expect(screen.top()).toMatch(/进行中/);
+		expect(screen.row(0)).toContain("$  echo step-0");
+		expect(screen.row(0)).not.toContain("30 步");
+		expect(screen.turn.summary.getStickyHeaders()).toHaveLength(0);
+
 		await screen.click(1);
-		expect(screen.turn.state.boxOpen).toBe(false);
-		expect(screen.top()).toMatch(/进行中/);
+
+		// The click opens that step; it does not fold the event.
+		expect(screen.turn.state.boxOpen).toBe(true);
+		expect(screen.turn.timeline.ui.expanded.has("act:c0:c0-a")).toBe(true);
+		expect(screen.row(0)).toContain("$  echo step-0");
+		expect(screen.row(1)).toContain("echo step-0");
+		expect(Array.from({ length: ROWS }, (_, index) => screen.row(index)).join("\n")).toContain("结果");
 	});
 });

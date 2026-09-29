@@ -1,36 +1,59 @@
 import { type ClickRegion, type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { type ThemeColor, theme } from "../theme/theme.js";
-import { cleanMemoryTitle, symlinkVerb } from "./feed-data.js";
+import { formatSpendCost } from "../spend-format.js";
+import { theme } from "../theme/theme.js";
+import { shortMemoryTitle, symlinkVerb } from "./feed-data.js";
+import { memoryBodyLines, memoryHeadLabel } from "./memory-detail.js";
 import { slideCount } from "./motion.js";
-import { changeDetail, changeTotals, memoryDetail, omittedDiffText, type TimelineFacts } from "./timeline-rows.js";
-import { BOX_FOCUS_MARKER, boxOuterWidth, boxRegionWidth, fitBoxLines } from "./turn-box.js";
+import { formatTimelineTime, TIMELINE_CONTENT_COL, type TimelineGutter, timelineRow } from "./timeline-gutter.js";
+import { timelineShowAll } from "./timeline-lane.js";
+import { changeDetail, changeTotals, omittedDiffText, type TimelineFacts } from "./timeline-rows.js";
+import { BOX_FOCUS_MARKER } from "./turn-box.js";
 import type { TurnTimeline } from "./turn-timeline.js";
 
 /**
- * The one line under a finished turn's answer that says what it changed:
- * `✎ 改了 2 个文件 +20 −7 ▸ · ✦ 记住了 1 条 ▸`. Each half opens a list whose
- * items open to the diff or the memory's before and after. Renders nothing
- * for a turn that changed no files and kept no memories.
+ * What a finished turn leaves at the end of the timeline, in the order the
+ * design draws it:
+ *
+ * ```
+ *  19:05   ·      ✎ 改了 2 个文件 +20 −7 · 已提交 abc1234           ▸
+ *          │
+ *  19:06   ✦      记住了   grow 批次审查结论                        ▴
+ *          ┃      范围：merge/repl-kernel 的 16 个提交、96 个文件。
+ *          │
+ *          ╵      ✓ 用了 20 分钟 · 子代理 ¥4.20 · 全部 ¥9.80        完整过程 ▸
+ * ```
+ *
+ * A memory opens with one click straight to its words; a file list opens to
+ * the diffs. A compaction after the answer is a main-line row above the last
+ * row, which closes the request and toggles the rows the timeline hides by default.
  */
+
+/** What the host knows about the session's spend, as the status line shows it. */
+export interface StripSpend {
+	/** Every subagent's own cost. */
+	cost: number;
+	/** The root's own cost; the total is `parentCost + cost`. */
+	parentCost: number;
+	/** A scan budget cut the count short: the figures are lower bounds. */
+	partial?: boolean;
+}
 
 export interface StripSource {
 	timeline: TurnTimeline;
 	/** Facts of the finished turn; undefined while it still runs. */
 	facts(): TimelineFacts | undefined;
 	requestRender(): void;
+	/** How long the request took, when the host knows it exactly; else it is read off the timeline. */
+	elapsedMs?(): number | undefined;
+	/** The session's spend; without it the closing row names no money. */
+	spend?(): StripSpend | undefined;
+	/** False while a later round of the same question is drawn (this turn then draws no closing row: the last one does). */
+	endsRequest?(): boolean;
 }
 
-interface StripItem {
-	key: string;
-	/** Styled lead before the path (`▸ ✎ 新增 `). */
-	lead: string;
-	/** The file path or memory title; a path gives way from the left, keeping its file name. */
-	name: string;
-	nameColor: ThemeColor;
-	isPath: boolean;
-	right: string;
-	detail?: (width: number) => string[];
-}
+export const STRIP_EDITS = "strip:edits";
+export const STRIP_ALL = "strip:all";
+const ITEM_PREFIX = "strip:item:";
 
 /**
  * A path cut from the left to `width` columns at a directory boundary
@@ -54,8 +77,58 @@ function pathFloor(path: string): number {
 	return Math.min(visibleWidth(path), parts.length > 1 ? visibleWidth(name) + 2 : visibleWidth(name));
 }
 
-export const STRIP_EDITS = "strip:edits";
-export const STRIP_MEMORIES = "strip:memories";
+/** `20 分钟`, `1 分 30 秒`, `45 秒`, `2 小时 5 分钟`. */
+export function formatSpan(ms: number): string {
+	const seconds = Math.max(1, Math.round(ms / 1000));
+	if (seconds < 60) return `${seconds} 秒`;
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 10 && seconds % 60 > 0) return `${minutes} 分 ${seconds % 60} 秒`;
+	if (minutes < 60) return `${minutes} 分钟`;
+	const hours = Math.floor(minutes / 60);
+	return minutes % 60 === 0 ? `${hours} 小时` : `${hours} 小时 ${minutes % 60} 分钟`;
+}
+
+/** A stamp the kernel or the session wrote (epoch ms), as opposed to a counter standing in for one. */
+function isStamp(at: number | undefined): at is number {
+	return at !== undefined && at > 1e11;
+}
+
+/** The turn's span read off its own records: its first message to its finish (or last message). */
+function timelineElapsedMs(timeline: TurnTimeline): number | undefined {
+	const stamps: number[] = [];
+	for (const entry of timeline.entries) {
+		if (entry.kind === "message" && isStamp(entry.message.timestamp)) stamps.push(entry.message.timestamp);
+		if ((entry.kind === "steer" || entry.kind === "notice") && isStamp(entry.at)) stamps.push(entry.at);
+	}
+	const first = stamps.length > 0 ? Math.min(...stamps) : undefined;
+	const last = timeline.finishedAt ?? (stamps.length > 0 ? Math.max(...stamps) : undefined);
+	if (first === undefined || last === undefined || last <= first) return undefined;
+	return last - first;
+}
+
+/** The last message's stamp: the moment a fact without a stamp of its own is dated. */
+function lastStamp(timeline: TurnTimeline): number | undefined {
+	let last: number | undefined;
+	for (const entry of timeline.entries) {
+		if (entry.kind === "message" && isStamp(entry.message.timestamp)) {
+			last = Math.max(last ?? 0, entry.message.timestamp);
+		}
+	}
+	return last ?? (isStamp(timeline.finishedAt) ? timeline.finishedAt : undefined);
+}
+
+/** Columns the content may take when `right` sits at the row's end (what `timelineRow` leaves it). */
+function contentLimit(width: number, right: string): number {
+	const room = Math.max(0, width - TIMELINE_CONTENT_COL);
+	if (!right) return room;
+	const tail = visibleWidth(right) + 2;
+	return tail + 2 > room ? room : room - tail - 2;
+}
+
+/** The first of `forms` (fullest first) that fits `room`; the barest when none does. */
+function fitting(forms: readonly string[], room: number): string {
+	return forms.find((form) => visibleWidth(form) <= room) ?? forms.at(-1) ?? "";
+}
 
 function counts(added: number, removed: number): string {
 	const parts: string[] = [];
@@ -64,27 +137,20 @@ function counts(added: number, removed: number): string {
 	return parts.join(" ");
 }
 
-/** A strip segment from its fullest form to its barest: with counts, without, the number only, the glyph only. */
-type SegmentForm = "full" | "plain" | "count" | "bare";
-
-function editsSegment(facts: TimelineFacts, open: boolean, form: SegmentForm): string {
-	const caret = theme.fg("dim", open ? "▾" : "▸");
-	const glyph = theme.fg("runCardWarn", "✎");
-	const files = facts.projectChanges.length;
-	if (form === "bare") return `${glyph} ${caret}`;
-	if (form === "count") return `${glyph} ${theme.fg("muted", `${files} 个文件`)} ${caret}`;
-	const totals = form === "full" ? changeTotals(facts.projectChanges) : undefined;
-	const figures = totals ? ` ${counts(totals.added, totals.removed)}` : "";
-	return `${glyph} ${theme.fg("muted", `改了 ${files} 个文件`)}${figures} ${caret}`;
+interface RowSpec {
+	gutter: TimelineGutter;
+	content: string;
+	right?: string;
+	/** Focus and hover identity; a row without one is not a target. */
+	key?: string;
+	onClick?: () => void;
+	revealBelow?: number;
 }
 
-function memoriesSegment(facts: TimelineFacts, open: boolean, form: SegmentForm): string {
-	const caret = theme.fg("dim", open ? "▾" : "▸");
-	const glyph = theme.fg("memoryAccent", "✦");
-	const count = facts.memories.length;
-	if (form === "bare") return `${glyph} ${caret}`;
-	if (form === "count") return `${glyph} ${theme.fg("muted", `${count} 条`)} ${caret}`;
-	return `${glyph} ${theme.fg("muted", `记住了 ${count} 条`)} ${caret}`;
+type Push = (spec: RowSpec) => void;
+
+function gutterAt(main: TimelineGutter["main"], time?: string): TimelineGutter {
+	return time ? { main, time } : { main };
 }
 
 export class TurnStripComponent implements Component {
@@ -106,26 +172,35 @@ export class TurnStripComponent implements Component {
 		return this.order;
 	}
 
+	/** Whether this strip ends its question with the closing row right now (its turn finished, no later round of the question is drawn). */
+	drawsClosingRow(): boolean {
+		return this.source.facts() !== undefined && this.source.endsRequest?.() !== false;
+	}
+
 	/** What Enter does on a focused strip target (`展开`, `收起`). */
 	enterLabel(key: string): string | undefined {
 		const ui = this.source.timeline.ui;
 		if (key === STRIP_EDITS) return ui.stripOpen === "edits" ? "收起" : "展开";
-		if (key === STRIP_MEMORIES) return ui.stripOpen === "memories" ? "收起" : "展开";
-		if (key.startsWith("strip:item:")) return ui.stripExpanded.has(key.slice("strip:item:".length)) ? "收起" : "展开";
+		if (key === STRIP_ALL) return timelineShowAll.value ? "收起" : "展开";
+		if (key.startsWith(ITEM_PREFIX)) return ui.stripExpanded.has(key.slice(ITEM_PREFIX.length)) ? "收起" : "展开";
 		return undefined;
 	}
 
 	/** Enter on a focused strip target. Returns false when the key is not one of this strip's. */
 	activate(key: string): boolean {
 		const ui = this.source.timeline.ui;
-		if (key === STRIP_EDITS || key === STRIP_MEMORIES) {
-			const list = key === STRIP_EDITS ? "edits" : "memories";
-			ui.stripOpen = ui.stripOpen === list ? undefined : list;
+		if (key === STRIP_EDITS) {
+			ui.stripOpen = ui.stripOpen === "edits" ? undefined : "edits";
 			ui.bump();
 			return true;
 		}
-		if (key.startsWith("strip:item:")) {
-			const item = key.slice("strip:item:".length);
+		if (key === STRIP_ALL) {
+			timelineShowAll.set(!timelineShowAll.value);
+			ui.bump();
+			return true;
+		}
+		if (key.startsWith(ITEM_PREFIX)) {
+			const item = key.slice(ITEM_PREFIX.length);
 			if (ui.stripExpanded.has(item)) {
 				ui.stripExpanded.delete(item);
 				ui.stripExpandedAt.delete(item);
@@ -143,183 +218,218 @@ export class TurnStripComponent implements Component {
 		const facts = this.source.facts();
 		this.regions = [];
 		this.order = [];
-		if (!facts || (facts.projectChanges.length === 0 && facts.memories.length === 0 && !facts.commitId)) return [];
-		const ui = this.source.timeline.ui;
-		const focusedKey = ui.focused ? ui.focusKey : undefined;
+		if (!facts) return [];
+		const safeWidth = Math.max(1, Math.floor(width));
+		const timeline = this.source.timeline;
+		const ui = timeline.ui;
 		const lines: string[] = [];
-		const segments: Array<{ key: string; text: string }> = [];
-		if (facts.projectChanges.length > 0) {
-			segments.push({ key: STRIP_EDITS, text: editsSegment(facts, ui.stripOpen === "edits", "full") });
-		}
-		if (facts.memories.length > 0) {
-			segments.push({ key: STRIP_MEMORIES, text: memoriesSegment(facts, ui.stripOpen === "memories", "full") });
-		}
-		const tail: string[] = [];
-		if (facts.commitId) tail.push(theme.fg("dim", `  ·  已提交 ${facts.commitId}`));
-		if (facts.trackingIncomplete) tail.push(theme.fg("dim", "  （有些改动没记全）"));
-		// Whole segments drop from the right until the line fits: a cut never
-		// leaves half a number, and a click area never points past the edge.
-		const layout = (shown: ReadonlyArray<{ key: string; text: string }>, extra: readonly string[]) => {
-			let text = " ";
-			let focusLine = false;
-			const regions: Array<{ key: string; col: number; width: number }> = [];
-			shown.forEach((segment, index) => {
-				if (index > 0) text += theme.fg("dim", "  ·  ");
-				const focused = focusedKey === segment.key;
-				if (focused) focusLine = true;
-				regions.push({
-					key: segment.key,
-					col: visibleWidth(text),
-					width: visibleWidth(segment.text) + (focused ? 2 : 0),
-				});
-				text += focused ? theme.bg("cardFocusBg", ` ${segment.text} `) : segment.text;
-			});
-			return { text: text + extra.join(""), focusLine, regions };
+		const focusedKey = ui.focused ? ui.focusKey : undefined;
+		const stampFallback = lastStamp(timeline);
+		const stampOf = (at: number | undefined): string | undefined => {
+			const stamp = isStamp(at) ? at : stampFallback;
+			return stamp === undefined ? undefined : formatTimelineTime(stamp);
 		};
-		const shaped = (count: number, form: SegmentForm) =>
-			segments.slice(0, count).map((segment) => ({
-				key: segment.key,
-				text:
-					segment.key === STRIP_EDITS
-						? editsSegment(facts, ui.stripOpen === "edits", form)
-						: memoriesSegment(facts, ui.stripOpen === "memories", form),
-			}));
-		// Tighter wordings first, then segments from the right, then the first one's barest form.
-		const attempts: Array<[Array<{ key: string; text: string }>, string[]]> = [];
-		for (let extra = tail.length; extra >= 0; extra--) attempts.push([segments, tail.slice(0, extra)]);
-		const forms: SegmentForm[] = ["full", "plain", "count"];
-		for (let count = segments.length; count >= 1; count--) {
-			for (const form of forms) attempts.push([shaped(count, form), []]);
-		}
-		attempts.push([shaped(1, "bare"), []]);
-		let chosen = layout(segments, tail);
-		for (const [shown, extra] of attempts) {
-			chosen = layout(shown, extra);
-			if (visibleWidth(chosen.text) <= width) break;
-		}
-		for (const region of chosen.regions) {
-			if (region.col + region.width > width) continue;
-			this.order.push(region.key);
-			const key = region.key;
+
+		const push = (spec: RowSpec): void => {
+			const row = timelineRow(spec.gutter, spec.content, spec.right ?? "", safeWidth);
+			const key = spec.key;
+			if (key === undefined) {
+				lines.push(row);
+				return;
+			}
+			this.order.push(key);
+			const focused = focusedKey === key;
+			const lit = focused || ui.hoverKey === key;
+			const line = lit
+				? theme.bg("timelineHoverBg", row + " ".repeat(Math.max(0, safeWidth - visibleWidth(row))))
+				: row;
+			lines.push(`${focused ? BOX_FOCUS_MARKER : ""}${line}`);
+			const onClick = spec.onClick;
+			if (!onClick) return;
 			this.regions.push({
-				line: 0,
-				col: region.col,
-				width: region.width,
+				line: lines.length - 1,
+				col: 0,
+				width: safeWidth,
 				height: 1,
-				revealBelow: 6,
+				revealBelow: spec.revealBelow ?? 0,
 				onClick: () => {
-					this.activate(key);
+					onClick();
 					this.source.requestRender();
 				},
+				hoverKey: `${ui.id}:${key}`,
+				onHover: (hovered: boolean) => {
+					if (ui.setHover(key, hovered)) this.source.requestRender();
+				},
 			});
-		}
-		lines.push(`${chosen.focusLine ? BOX_FOCUS_MARKER : ""}${truncateToWidth(chosen.text, width, "")}`);
-
-		if (!ui.stripOpen) return lines;
-		const items = ui.stripOpen === "edits" ? this.editItems(facts) : this.memoryItems(facts);
-		const outer = boxOuterWidth(width);
-		const inner = outer - 4;
-		const regionWidth = boxRegionWidth(outer, width);
-		const border = (text: string) => theme.fg("boxBorder", text);
-		const boxLine = (content: string, bg?: "cardFocusBg"): string => {
-			const fitted = truncateToWidth(content, inner, "…", true);
-			const padded = ` ${fitted}${" ".repeat(Math.max(0, inner - visibleWidth(fitted)))} `;
-			return ` ${border("│")}${bg ? theme.bg(bg, padded) : padded}${border("│")}`;
 		};
-		lines.push(` ${border(`╭${"─".repeat(outer - 2)}╮`)}`);
-		for (const item of items) {
-			const opened = item.detail !== undefined && ui.stripExpanded.has(item.key);
-			const focusKey = `strip:item:${item.key}`;
-			const focused = focusedKey === focusKey;
-			this.order.push(focusKey);
-			const caret = item.detail ? theme.fg("dim", opened ? "▾" : "▸") : " ";
-			const lead = `${caret} ${item.lead}`;
-			const leadWidth = visibleWidth(lead);
-			// The name keeps its file name before the counts get room; counts that
-			// would squeeze it to `…` step aside.
-			const floor = item.isPath ? pathFloor(item.name) : Math.min(visibleWidth(item.name), 4);
-			const right = item.right && inner - leadWidth - visibleWidth(item.right) - 2 >= floor ? item.right : "";
-			const room = Math.max(1, inner - leadWidth - (right ? visibleWidth(right) + 2 : 0));
-			const name = item.isPath ? shortenPath(item.name, room) : truncateToWidth(item.name, room, "…");
-			const fitted = `${lead}${theme.fg(item.nameColor, name)}`;
-			const content = right
-				? `${fitted}${" ".repeat(Math.max(2, inner - visibleWidth(fitted) - visibleWidth(right)))}${right}`
-				: fitted;
-			lines.push(`${focused ? BOX_FOCUS_MARKER : ""}${boxLine(content, focused ? "cardFocusBg" : undefined)}`);
-			const itemKey = item.key;
-			if (item.detail) {
-				this.regions.push({
-					line: lines.length - 1,
-					col: 0,
-					width: regionWidth,
-					height: 1,
-					revealBelow: opened ? 0 : 10,
-					onClick: () => {
-						this.activate(`strip:item:${itemKey}`);
-						this.source.requestRender();
-					},
-				});
-			}
-			if (opened && item.detail) {
-				const detail = item.detail(Math.max(8, inner - 6));
-				const shown = slideCount(ui.stripExpandedAt.get(item.key), detail.length);
-				for (const detailLine of detail.slice(0, shown)) {
-					lines.push(boxLine(`    ${theme.fg("boxBorder", "│")} ${detailLine}`));
+		const gap = (): void => push({ gutter: { main: "rail" }, content: "" });
+		const caretFor = (open: boolean, openColor: "kindEdit" | "timelineMemory"): string =>
+			theme.bold(theme.fg(open ? openColor : "timelineFaint", open ? "▴" : "▸"));
+
+		const hasEditsRow = facts.projectChanges.length > 0 || facts.commitId !== undefined || facts.trackingIncomplete;
+		const afterAnswer = facts.afterAnswer ?? [];
+		const hasSections = hasEditsRow || facts.memories.length > 0 || afterAnswer.length > 0;
+		// The answer above ends with one blank row of its own; a section sits two rows below it.
+		if (hasSections) gap();
+		if (hasEditsRow) this.editsSection(facts, safeWidth, push, stampOf, caretFor);
+
+		facts.memories.forEach(({ key, change }, index) => {
+			if (index === 0 && hasEditsRow) gap();
+			const open = ui.stripExpanded.has(key);
+			const right = caretFor(open, "timelineMemory");
+			const head = memoryHeadLabel(change);
+			const titleRoom = Math.max(4, contentLimit(safeWidth, right) - visibleWidth(head) - 3);
+			const title = theme.fg("text", shortMemoryTitle(change.title || change.id || "", titleRoom));
+			push({
+				gutter: gutterAt("memory", stampOf(change.at)),
+				content: `${theme.bold(theme.fg("timelineMemory", head))}   ${title}`,
+				right,
+				key: `${ITEM_PREFIX}${key}`,
+				onClick: () => this.activate(`${ITEM_PREFIX}${key}`),
+				revealBelow: open ? 0 : 10,
+			});
+			if (open) {
+				const body = memoryBodyLines(change, Math.max(8, safeWidth - TIMELINE_CONTENT_COL));
+				const shown = slideCount(ui.stripExpandedAt.get(key), body.length);
+				for (const bodyLine of body.slice(0, shown)) {
+					push({ gutter: { main: "memoryBar" }, content: bodyLine });
 				}
+				if (index < facts.memories.length - 1) gap();
 			}
-		}
-		if (ui.stripOpen === "edits" && facts.scratchChanges.length > 0) {
-			lines.push(boxLine(theme.fg("dim", `  另有 ${facts.scratchChanges.length} 个临时文件，不算项目改动`)));
-		}
-		lines.push(` ${border(`╰${"─".repeat(outer - 2)}╯`)}`);
-		return fitBoxLines(lines, width);
+		});
+
+		// What happened after the answer (a compaction) comes after it, as a line of the main line.
+		afterAnswer.forEach((item, index) => {
+			if (index === 0 && (hasEditsRow || facts.memories.length > 0)) gap();
+			push({
+				gutter: gutterAt("ai", stampOf(item.at)),
+				content: theme.fg(item.failed ? "timelineMust" : "text", item.text),
+			});
+		});
+
+		if (hasSections) gap();
+		if (this.drawsClosingRow()) this.closingRow(safeWidth, push);
+		return lines;
 	}
 
-	private editItems(facts: TimelineFacts): StripItem[] {
-		return facts.projectChanges.map((change) => {
-			const verb: Record<typeof change.kind, string> = {
+	private editsSection(
+		facts: TimelineFacts,
+		width: number,
+		push: Push,
+		stampOf: (at: number | undefined) => string | undefined,
+		caretFor: (open: boolean, openColor: "kindEdit" | "timelineMemory") => string,
+	): void {
+		const ui = this.source.timeline.ui;
+		const files = facts.projectChanges.length;
+		const open = ui.stripOpen === "edits" && files > 0;
+		const glyph = theme.fg("kindEdit", "✎");
+		const soft = (text: string) => theme.fg("timelineSoft", text);
+		const dim = (text: string) => theme.fg("timelineTime", text);
+		const commit = facts.commitId ? dim(` · 已提交 ${facts.commitId}`) : "";
+		const incomplete = facts.trackingIncomplete ? dim(" （有些改动没记全）") : "";
+		const firstAt = facts.projectChanges.map((change) => change.firstAt).filter(isStamp);
+		const time = stampOf(firstAt.length > 0 ? Math.min(...firstAt) : undefined);
+		if (files === 0) {
+			const head = facts.commitId ? `已提交 ${facts.commitId}` : "";
+			const note = facts.trackingIncomplete ? `${head ? " " : ""}（有些改动没记全）` : "";
+			push({ gutter: gutterAt("note", time), content: dim(`${head}${note}`) });
+			return;
+		}
+		const right = caretFor(open, "kindEdit");
+		const totals = changeTotals(facts.projectChanges);
+		const figures = totals ? ` ${counts(totals.added, totals.removed)}` : "";
+		const room = contentLimit(width, right);
+		const content = fitting(
+			[
+				`${glyph} ${soft(`改了 ${files} 个文件`)}${figures}${commit}${incomplete}`,
+				`${glyph} ${soft(`改了 ${files} 个文件`)}${figures}${commit}`,
+				`${glyph} ${soft(`改了 ${files} 个文件`)}${figures}`,
+				`${glyph} ${soft(`改了 ${files} 个文件`)}`,
+				`${glyph} ${soft(`${files} 个文件`)}`,
+			],
+			room,
+		);
+		push({
+			gutter: gutterAt("note", time),
+			content,
+			right,
+			key: STRIP_EDITS,
+			onClick: () => this.activate(STRIP_EDITS),
+			revealBelow: open ? 0 : 10,
+		});
+		if (!open) return;
+		for (const change of facts.projectChanges) {
+			const key = `file:${change.key}`;
+			const opened = ui.stripExpanded.has(key);
+			const renamed = change.kind === "renamed" && change.oldPath;
+			const path = renamed ? `${change.oldPath} → ${change.path}` : change.path;
+			const verbs: Record<typeof change.kind, string> = {
 				created: "新增 ",
 				modified: "",
 				deleted: "删除 ",
 				renamed: "改名 ",
 			};
-			const color: ThemeColor = change.kind === "deleted" ? "diffRemovedText" : "runCardWarn";
-			const renamed = change.kind === "renamed" && change.oldPath;
-			const path = renamed ? `${change.oldPath} → ${change.path}` : change.path;
-			// The link itself changed, not its target's text: no diff, so no `+0 −0`.
+			const verb = change.symlink && !renamed ? `${symlinkVerb(change.kind)} ` : verbs[change.kind];
 			const omitted = omittedDiffText(change.omitted);
-			const figures = change.symlink
+			const figure = change.symlink
 				? ""
 				: omitted && change.added === 0 && change.removed === 0
-					? theme.fg("dim", omitted)
+					? dim(omitted)
 					: counts(change.added, change.removed);
-			const lead = change.symlink && !renamed ? `${symlinkVerb(change.kind)} ` : verb[change.kind];
-			return {
-				key: `file:${change.key}`,
-				lead: `${theme.fg(color, change.kind === "deleted" ? "✗" : "✎")} ${theme.fg("dim", lead)}`,
-				name: path,
-				nameColor: "activityText",
-				isPath: true,
-				right: figures,
-				detail: changeDetail(change),
-			};
-		});
+			const lead = `  ${theme.fg(change.kind === "deleted" ? "diffRemovedText" : "kindEdit", change.kind === "deleted" ? "✗" : "✎")} ${dim(verb)}`;
+			const caret = caretFor(opened, "kindEdit");
+			const withFigure = figure ? `${figure}  ${caret}` : caret;
+			const floor = pathFloor(path);
+			const leadWidth = visibleWidth(lead);
+			const fits = (tail: string) => contentLimit(width, tail) - leadWidth >= floor;
+			const tail = fits(withFigure) ? withFigure : caret;
+			const pathRoom = Math.max(1, contentLimit(width, tail) - leadWidth);
+			push({
+				gutter: { main: "rail" },
+				content: `${lead}${theme.fg("text", shortenPath(path, pathRoom))}`,
+				right: tail,
+				key: `${ITEM_PREFIX}${key}`,
+				onClick: () => this.activate(`${ITEM_PREFIX}${key}`),
+				revealBelow: opened ? 0 : 10,
+			});
+			if (opened) {
+				const detail = changeDetail(change)(Math.max(8, width - TIMELINE_CONTENT_COL - 4));
+				const shown = slideCount(ui.stripExpandedAt.get(key), detail.length);
+				for (const detailLine of detail.slice(0, shown)) {
+					push({ gutter: { main: "rail" }, content: `    ${detailLine}` });
+				}
+			}
+		}
+		if (facts.scratchChanges.length > 0) {
+			push({
+				gutter: { main: "rail" },
+				content: dim(`  另有 ${facts.scratchChanges.length} 个临时文件，不算项目改动`),
+			});
+		}
 	}
 
-	private memoryItems(facts: TimelineFacts): StripItem[] {
-		return facts.memories.map(({ key, change }) => {
-			const renamed = change.previousTitle && change.previousTitle !== change.title;
-			const what = change.op === "created" ? "新记" : change.op === "deleted" ? "删了" : renamed ? "改名" : "改了";
-			const scope = change.scope === "global" ? "全局 · " : change.scope === "project" ? "项目 · " : "本会话 · ";
-			return {
-				key,
-				lead: `${theme.fg("memoryAccent", "✦")} `,
-				name: cleanMemoryTitle(change.title),
-				nameColor: "activityText",
-				isPath: false,
-				right: theme.fg("dim", `${scope}${what}`),
-				detail: memoryDetail(change),
-			};
+	private closingRow(width: number, push: Push): void {
+		const timeline = this.source.timeline;
+		const elapsed = this.source.elapsedMs?.() ?? timelineElapsedMs(timeline);
+		const spent = elapsed === undefined ? "" : `用了 ${formatSpan(elapsed)}`;
+		const stopped = timeline.stopped;
+		const failed = timeline.errorEnded && !stopped;
+		const mark = stopped ? "■" : failed ? "✗" : "✓";
+		const label = stopped ? "已停止" : failed ? "出错" : spent ? "" : "完成";
+		const lead = [label, spent].filter((part) => part.length > 0).join(" · ");
+		const spend = this.source.spend?.();
+		const total = spend ? spend.parentCost + spend.cost : 0;
+		const lower = spend?.partial ? "≈" : "";
+		const sub = spend && spend.cost > 0 ? ` · 子代理 ${lower}${formatSpendCost(spend.cost)}` : "";
+		const all = total > 0 ? ` · 全部 ${lower}${formatSpendCost(total)}` : "";
+		const right = theme.fg("timelineFaint", `完整过程 ${timelineShowAll.value ? "▴" : "▸"}`);
+		const rest = fitting([`${lead}${sub}${all}`, `${lead}${sub}`, lead], contentLimit(width, right) - 2);
+		push({
+			gutter: { main: "end" },
+			content: `${theme.fg(failed ? "timelineMust" : "timelineFaint", mark)} ${theme.fg("timelineFaint", rest)}`,
+			right,
+			key: STRIP_ALL,
+			onClick: () => this.activate(STRIP_ALL),
 		});
 	}
 }

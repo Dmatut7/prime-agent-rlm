@@ -1,4 +1,10 @@
-import { type ClickRegion, type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	type ClickRegion,
+	type Component,
+	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 import type { KernelMemoryChange } from "../../../core/kernel/shared.js";
 import type { RefinementOutcomeMessage } from "../../../core/messages.js";
 import type { AppliedRefinementEdit, HarnessScope } from "../../../core/refinement/refinement.js";
@@ -11,16 +17,17 @@ import {
 	renderedCopyText,
 } from "./block-focus.js";
 import { sanitizeDisplayText } from "./diff-rows.js";
-import { cleanMemoryTitle } from "./feed-data.js";
-import { memoryDetail } from "./timeline-rows.js";
-import { boxOuterWidth, fitBoxLines } from "./turn-box.js";
+import { shortMemoryTitle } from "./feed-data.js";
+import { memoryBodyLines, memoryHeadLabel } from "./memory-detail.js";
+import { formatTimelineTime, TIMELINE_CONTENT_COL, type TimelineGutter, timelineRow } from "./timeline-gutter.js";
+import { timelineShowAll } from "./timeline-lane.js";
 
 /**
- * What the refiner kept after a turn, as one violet line in plain words:
- * `✦ 记住了 2 条 · 老板裁定 · 教道理循环状态 · 本会话 ▸`. Opening it lists
- * each entry with only the lines that changed (a rename said as `改名 A → B`).
- * A refiner that produced nothing says so in amber instead of claiming a
- * memory was kept.
+ * What the background refiner kept after a turn. The timeline hides it by
+ * default; with the closing row's `完整过程 ▸` on it is one dim note,
+ * `19:07 · 回合后整理记忆：新记 1 条（本会话）   展开 ▸`, that opens to the
+ * memories in full. A refiner that failed, or refused an edit, says so in amber
+ * and is never hidden, like a failed subagent or compaction.
  */
 
 const KIND_MAP: Record<AppliedRefinementEdit["kind"], KernelMemoryChange["kind"]> = {
@@ -40,6 +47,7 @@ const OP_MAP: Record<AppliedRefinementEdit["action"], KernelMemoryChange["op"]> 
 export function refinementEditAsMemoryChange(
 	edit: AppliedRefinementEdit,
 	fallbackScope: HarnessScope,
+	at = 0,
 ): KernelMemoryChange {
 	const scope = edit.after?.scope ?? edit.before?.scope ?? fallbackScope;
 	const title = edit.after?.title ?? edit.title ?? edit.before?.title ?? edit.id;
@@ -54,7 +62,7 @@ export function refinementEditAsMemoryChange(
 		...(previousTitle && previousTitle !== title ? { previousTitle } : {}),
 		...(edit.before?.content !== undefined ? { before: edit.before.content } : {}),
 		...(after !== undefined && edit.action !== "delete" ? { after } : {}),
-		at: 0,
+		at,
 	};
 }
 
@@ -62,13 +70,18 @@ function scopeWord(scope: HarnessScope): string {
 	return scope === "global" ? "全局" : "本会话";
 }
 
-/** Durable refinement outcome: one line, opened by its own click or Enter (never the process key). */
+let hoverIds = 0;
+
+/** Durable refinement outcome: one note row, opened by its own click or Enter (never the process key). */
 export class RefinementOutcomeMessageComponent implements Component, FocusableBlock, ExpandableBlock {
 	private expanded = false;
+	private hovered = false;
 	private blockFocus?: BlockFocusState;
 	private regions: ClickRegion[] = [];
 	private cachedWidth?: number;
+	private cachedShown?: boolean;
 	private cachedLines?: string[];
+	private readonly hoverKey = `refinement${++hoverIds}`;
 
 	constructor(private readonly message: RefinementOutcomeMessage) {}
 
@@ -87,7 +100,7 @@ export class RefinementOutcomeMessageComponent implements Component, FocusableBl
 	}
 
 	getBlockCopyText(): string {
-		return renderedCopyText(this.renderLines(100));
+		return renderedCopyText(this.renderLines(100, true));
 	}
 
 	getClickRegions(): ReadonlyArray<ClickRegion> {
@@ -96,105 +109,102 @@ export class RefinementOutcomeMessageComponent implements Component, FocusableBl
 
 	invalidate(): void {
 		this.cachedWidth = undefined;
+		this.cachedShown = undefined;
 		this.cachedLines = undefined;
 	}
 
 	render(width: number): string[] {
-		if (!this.cachedLines || this.cachedWidth !== width) {
-			this.cachedLines = this.renderLines(width);
+		const shown = timelineShowAll.value;
+		if (!this.cachedLines || this.cachedWidth !== width || this.cachedShown !== shown) {
+			this.cachedLines = this.renderLines(width, false);
 			this.cachedWidth = width;
+			this.cachedShown = shown;
 		}
 		const lines = this.cachedLines;
 		return this.blockFocus && lines.length > 0 ? decorateFocusedBlock(lines, width, this.blockFocus) : lines;
 	}
 
-	private renderLines(width: number): string[] {
-		const safeWidth = Math.max(1, width);
-		const { edits, scope, failed, error } = this.message.details;
-		const lines: string[] = [""];
+	private renderLines(width: number, forceShown: boolean): string[] {
 		this.regions = [];
+		const { edits, scope, failed, error } = this.message.details;
+		// Only a tidy that kept everything hides; one that failed or refused an edit is never out of sight.
+		const wentWrong = failed === true || edits.some((edit) => !edit.applied);
+		if (!forceShown && !timelineShowAll.value && !wentWrong) return [];
+		const safeWidth = Math.max(1, width);
+		const dim = (text: string) => theme.fg("timelineTime", text);
+		const row = (gutter: TimelineGutter, content: string, right = "") =>
+			timelineRow(gutter, content, right, safeWidth);
+		const time = Number.isFinite(this.message.timestamp) ? formatTimelineTime(this.message.timestamp) : undefined;
+		const noteGutter: TimelineGutter = time ? { main: "note", time } : { main: "note" };
+		const lines: string[] = [row({ main: "rail" }, "")];
 		if (failed || edits.length === 0) {
 			const reason = error ? sanitizeDisplayText(error).split("\n")[0] : undefined;
 			const why = reason ? `整理器这次没给出结果（${reason}），下一轮会再试` : "整理器这次没给出结果，下一轮会再试";
-			lines.push(
-				truncateToWidth(
-					` ${theme.fg("runCardWarn", "✦ 记忆没写进去")}${theme.fg("dim", ` · ${why}`)}`,
-					safeWidth,
-					"…",
-				),
-			);
+			lines.push(row(noteGutter, `${theme.fg("timelineFix", "回合后整理记忆：没写进去")}${dim(` · ${why}`)}`));
 			return lines;
 		}
 		const applied = edits.filter((edit) => edit.applied);
 		const failedEdits = edits.filter((edit) => !edit.applied);
-		const titles = [
-			...new Set(applied.map((edit) => cleanMemoryTitle(refinementEditAsMemoryChange(edit, scope).title))),
-		];
-		const caret = theme.fg("dim", this.expanded ? "▾" : "▸");
-		const head =
-			failedEdits.length > 0
-				? `${theme.fg("runCardWarn", `✦ 记住了 ${applied.length} 条，${failedEdits.length} 条没写进去`)}`
-				: `${theme.fg("memoryAccent", `✦ 记住了 ${applied.length} 条`)}`;
-		const tail = ` ${theme.fg("dim", `· ${scopeWord(scope)}`)} ${caret}`;
-		const room = Math.max(4, safeWidth - visibleWidth(` ${head}`) - visibleWidth(tail) - 3);
-		const titleText =
-			titles.length > 0 ? theme.fg("muted", ` · ${truncateToWidth(titles.join(" · "), room, "…")}`) : "";
-		lines.push(truncateToWidth(` ${head}${titleText}${tail}`, safeWidth, "…"));
+		const said = [
+			["新记", applied.filter((edit) => edit.action === "create").length],
+			["改了", applied.filter((edit) => edit.action === "update").length],
+			["删了", applied.filter((edit) => edit.action === "delete").length],
+		]
+			.filter(([, count]) => count !== 0)
+			.map(([word, count]) => `${word} ${count} 条`);
+		if (failedEdits.length > 0) said.push(`${failedEdits.length} 条没写进去`);
+		const text = `回合后整理记忆：${said.join("，")}（${scopeWord(scope)}）`;
+		const right = dim(this.expanded ? "收起 ▴" : "展开 ▸");
+		const head = row(noteGutter, failedEdits.length > 0 ? theme.fg("timelineFix", text) : dim(text), right);
+		lines.push(
+			this.hovered
+				? theme.bg("timelineHoverBg", head + " ".repeat(Math.max(0, safeWidth - visibleWidth(head))))
+				: head,
+		);
 		this.regions.push({
-			line: 1,
+			line: lines.length - 1,
 			col: 0,
 			width: safeWidth,
 			height: 1,
 			revealBelow: this.expanded ? 0 : 8,
 			onClick: () => this.setExpanded(!this.expanded),
+			hoverKey: this.hoverKey,
+			onHover: (hovered: boolean) => {
+				if (this.hovered === hovered) return;
+				this.hovered = hovered;
+				this.invalidate();
+			},
 		});
 		if (!this.expanded) return lines;
 
-		const outer = boxOuterWidth(safeWidth);
-		const inner = outer - 4;
-		const border = (text: string) => theme.fg("boxBorder", text);
-		const boxLine = (content: string): string => {
-			const fitted = truncateToWidth(content, inner, "…", true);
-			return ` ${border("│")} ${fitted}${" ".repeat(Math.max(0, inner - visibleWidth(fitted)))} ${border("│")}`;
-		};
-		lines.push(` ${border(`╭${"─".repeat(outer - 2)}╮`)}`);
+		const room = Math.max(8, safeWidth - TIMELINE_CONTENT_COL);
 		// The refiner's own note on why, once, above the entries.
 		const why = sanitizeDisplayText(this.message.details.summary ?? "")
 			.replace(/\s+/g, " ")
 			.trim();
-		if (why) lines.push(boxLine(theme.fg("dim", why)));
-		for (const edit of edits) {
-			const change = refinementEditAsMemoryChange(edit, scope);
-			const what =
-				change.op === "created"
-					? "新记"
-					: change.op === "deleted"
-						? "删了"
-						: change.previousTitle
-							? "改名"
-							: "改了";
-			const left = edit.applied
-				? `${theme.fg("memoryAccent", "✦")} ${theme.fg("activityText", cleanMemoryTitle(change.title))}`
-				: `${theme.fg("error", "✗")} ${theme.fg("activityText", cleanMemoryTitle(change.title))}`;
-			const right = edit.applied
-				? theme.fg("dim", what)
-				: theme.fg("error", `没写进去${edit.error ? `：${sanitizeDisplayText(edit.error)}` : ""}`);
-			const rightWidth = Math.min(visibleWidth(right), Math.floor(inner / 2));
-			const fittedRight = truncateToWidth(right, rightWidth, "…");
-			const fittedLeft = truncateToWidth(left, Math.max(4, inner - rightWidth - 2), "…");
-			lines.push(
-				boxLine(
-					`${fittedLeft}${" ".repeat(Math.max(2, inner - visibleWidth(fittedLeft) - visibleWidth(fittedRight)))}${fittedRight}`,
-				),
-			);
-			if (edit.applied) {
-				for (const detail of memoryDetail(change)(Math.max(8, inner - 4))) {
-					lines.push(boxLine(`  ${theme.fg("boxBorder", "│")} ${detail}`));
-				}
-			}
+		if (why) {
+			for (const part of wrapTextWithAnsi(dim(why), room)) lines.push(row({ main: "rail" }, part));
 		}
-		lines.push(` ${border(`╰${"─".repeat(outer - 2)}╯`)}`);
-		return fitBoxLines(lines, safeWidth);
+		edits.forEach((edit, index) => {
+			const change = refinementEditAsMemoryChange(edit, scope, this.message.timestamp);
+			if (index > 0 || why) lines.push(row({ main: "rail" }, ""));
+			if (!edit.applied) {
+				const reason = edit.error ? `：${sanitizeDisplayText(edit.error)}` : "";
+				const title = theme.fg("text", shortMemoryTitle(change.title, Math.max(4, room - 20)));
+				lines.push(
+					row(
+						{ main: "rail" },
+						`${theme.fg("timelineMust", "✗")} ${title}${theme.fg("timelineMust", `  没写进去${reason}`)}`,
+					),
+				);
+				return;
+			}
+			const label = memoryHeadLabel(change);
+			const title = theme.fg("text", shortMemoryTitle(change.title, Math.max(4, room - visibleWidth(label) - 3)));
+			lines.push(row({ main: "memory" }, `${theme.bold(theme.fg("timelineMemory", label))}   ${title}`));
+			for (const detail of memoryBodyLines(change, room)) lines.push(row({ main: "memoryBar" }, detail));
+		});
+		return lines.map((line) => (visibleWidth(line) > safeWidth ? truncateToWidth(line, safeWidth, "") : line));
 	}
 }
 

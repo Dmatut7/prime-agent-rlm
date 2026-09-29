@@ -10,10 +10,11 @@ import {
 	resolveTurnHeaders,
 } from "../src/modes/interactive/components/conversation-components.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
+import { formatTimelineTime } from "../src/modes/interactive/components/timeline-gutter.js";
 import { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
-import { assistant, plain, quietTurn, T0 } from "./ui-blocks-helpers.js";
+import { addCommand, assistant, plain, quietTurn, T0 } from "./ui-blocks-helpers.js";
 import { handedBack, LiveChat } from "./ui-live-chat.js";
 
 beforeAll(() => {
@@ -31,16 +32,36 @@ afterEach(() => {
 });
 
 const HEADER = "◆ prime";
+/** An event line: time, the AI's diamond, then its words at column 16. */
+const EVENT_LINE = /^ \d\d:\d\d {3}◆ {6}\S/;
+/** A blank row on the rail: what a woken turn puts above its first event. */
+const RAIL_ROW = "         │      ";
 
 function shows(summary: TurnSummaryComponent): boolean {
 	return plain(summary.render(100)).some((line) => line.includes(HEADER));
 }
 
+/** The lines of the turn that are events. */
+function eventLines(summary: TurnSummaryComponent): string[] {
+	return plain(summary.render(100)).filter((line) => EVENT_LINE.test(line));
+}
+
+/** A finished turn with one command, so it draws its event line (a turn with nothing to list draws nothing). */
 function turn(model: string, startedByUser: boolean): TurnSummaryComponent {
 	const made = quietTurn({ live: false });
 	made.state.modelId = model;
 	made.state.startedByUser = startedByUser;
+	addCommand(made, "c1", "echo one");
+	made.state.markTurnEnded(Date.now());
 	return made.summary;
+}
+
+/** Every turn of a live chat gets one finished command, so it draws its event line. */
+function withEvents(screen: LiveChat): LiveChat {
+	screen.summaries().forEach((summary, index) => {
+		addCommand({ state: summary.state, summary, timeline: summary.state.timeline }, `c${index}`, `echo ${index}`);
+	});
+	return screen;
 }
 
 const compactionNotice = () =>
@@ -51,8 +72,8 @@ const compactionNotice = () =>
 		timestamp: T0,
 	});
 
-describe("a woken turn under the same title draws no second title", () => {
-	it("hides the title of a turn that no user message opened when the title above it names the same model", () => {
+describe("a woken turn draws no title, whichever title is above it", () => {
+	it("starts a turn that no user message opened on its event line, however many turns follow each other", () => {
 		const first = turn("glm-5.3-prime", true);
 		const woken = turn("glm-5.3-prime", false);
 		const later = turn("glm-5.3-prime", false);
@@ -64,65 +85,84 @@ describe("a woken turn under the same title draws no second title", () => {
 			new AgentMessageComponent(handedBack("m2")),
 			later,
 		]);
-		expect([first, woken, later].map(shows)).toEqual([true, false, false]);
+		expect([first, woken, later].map(shows)).toEqual([false, false, false]);
+		// The turn the question opened starts with two empty rows, a woken turn with one.
+		const opening = [first, woken, later].map((summary) =>
+			plain(summary.render(100)).findIndex((line) => EVENT_LINE.test(line)),
+		);
+		expect(opening).toEqual([2, 1, 1]);
+		for (const summary of [first, woken, later]) expect(eventLines(summary)).toHaveLength(1);
 	});
 
-	it("draws the title of the first turn, of a turn after a user message and of a turn on another model", () => {
+	it("draws no title for the first turn, for a turn after a user message or for a turn on another model", () => {
 		const alone = turn("glm-5.3-prime", false);
 		resolveTurnHeaders([alone]);
-		expect(shows(alone)).toBe(true);
+		expect(shows(alone)).toBe(false);
+		expect(plain(alone.render(100))[0]).toMatch(EVENT_LINE);
 
 		const before = turn("glm-5.3-prime", true);
 		const prompted = turn("glm-5.3-prime", true);
 		resolveTurnHeaders([before, new UserMessageComponent("再来一次"), prompted]);
-		expect(shows(prompted)).toBe(true);
+		expect(shows(prompted)).toBe(false);
+		expect(plain(prompted.render(100))[2]).toMatch(EVENT_LINE);
 
 		const other = turn("glm-5.3-prime", true);
 		const switched = turn("gpt-5.5", false);
 		const back = turn("glm-5.3-prime", false);
 		resolveTurnHeaders([other, new AgentMessageComponent(handedBack("m3")), switched, back]);
-		// The nearest title shown above `back` names gpt-5.5, not its own model.
-		expect([shows(other), shows(switched), shows(back)]).toEqual([true, true, true]);
+		// A model change starts no title over; a turn straight under another turn gets a blank rail row instead.
+		expect([shows(other), shows(switched), shows(back)]).toEqual([false, false, false]);
+		expect(plain(other.render(100))[2]).toMatch(EVENT_LINE);
+		expect(plain(switched.render(100))[1]).toMatch(EVENT_LINE);
+		const backLines = plain(back.render(100));
+		expect(backLines).toHaveLength(2);
+		expect(backLines[0]).toBe(RAIL_ROW);
+		expect(backLines[1]).toMatch(EVENT_LINE);
 	});
 
-	it("draws the title of the first turn after a compaction", () => {
+	it("draws no title for the first turn after a compaction", () => {
 		const before = turn("glm-5.3-prime", true);
 		const after = turn("glm-5.3-prime", false);
 		resolveTurnHeaders([before, compactionNotice(), new AgentMessageComponent(handedBack("m4")), after]);
-		expect([shows(before), shows(after)]).toEqual([true, true]);
+		expect([shows(before), shows(after)]).toEqual([false, false]);
+		expect(plain(before.render(100))[2]).toMatch(EVENT_LINE);
+		expect(plain(after.render(100))[1]).toMatch(EVENT_LINE);
 	});
 
-	it("leaves the box a working header row and click area when the title is gone", () => {
+	it("leaves the woken turn a working event line and click area when no title is drawn", () => {
 		const first = turn("glm-5.3-prime", true);
 		const woken = turn("glm-5.3-prime", false);
 		resolveTurnHeaders([first, new AgentMessageComponent(handedBack("m5")), woken]);
 		const lines = plain(woken.render(100));
-		expect(lines[0]).toMatch(/^ ╭─+╮$/);
-		expect(lines[1]).toContain("│");
+		// One empty row under the return row, then the event line.
+		expect(lines).toHaveLength(2);
+		expect(lines[0]).toBe(RAIL_ROW);
+		expect(lines[1]).toMatch(/^ \d\d:\d\d {3}◆ {6}跑了 1 条命令 +1 步 ▸ {2}$/);
 		const regions = woken.getClickRegions();
-		const headerRow = regions.find((region) => region.line === 1 && !region.passive);
-		expect(headerRow).toBeDefined();
-		expect(regions.some((region) => region.line === 0 && region.width < 100)).toBe(false);
+		const eventRow = regions.find((region) => region.line === 1 && !region.passive);
+		expect(eventRow).toBeDefined();
+		expect(eventRow).toMatchObject({ col: 0, width: 100 });
+		expect(regions.some((region) => region.line !== 1)).toBe(false);
 		const before = woken.state.boxOpen;
-		headerRow?.onClick({ row: 0, col: 0 });
+		eventRow?.onClick({ row: 0, col: 0 });
 		expect(woken.state.boxOpen).toBe(!before);
 	});
 
-	it("moves the box's click areas down with the blank line a woken turn gets when no message row is above it", () => {
+	it("moves the event's click area down with the blank rail row a woken turn gets when no message row is above it", () => {
 		const first = turn("glm-5.3-prime", true);
 		const woken = turn("glm-5.3-prime", false);
 		resolveTurnHeaders([first, woken]);
 		const lines = plain(woken.render(100));
-		expect(lines[0]).toBe("");
-		expect(lines[1]).toMatch(/^ ╭─+╮$/);
+		expect(lines[0]).toBe(RAIL_ROW);
+		expect(lines[1]).toMatch(EVENT_LINE);
 		const regions = woken.getClickRegions();
-		const headerRow = regions.find((region) => region.line === 2 && !region.passive);
-		expect(headerRow).toBeDefined();
-		expect(regions.some((region) => region.line < 2)).toBe(false);
+		const eventRow = regions.find((region) => region.line === 1 && !region.passive);
+		expect(eventRow).toBeDefined();
+		expect(regions.some((region) => region.line < 1)).toBe(false);
 	});
 });
 
-describe("the live view draws one title per question", () => {
+describe("the live view draws no title, whichever question a turn belongs to", () => {
 	beforeEach(() => {
 		vi.useFakeTimers();
 		vi.setSystemTime(T0);
@@ -133,12 +173,16 @@ describe("the live view draws one title per question", () => {
 		screen.prompt("审查最近的提交");
 		screen.wake("m1");
 		screen.wake("m2");
+		withEvents(screen);
 		expect(screen.summaries()).toHaveLength(3);
-		expect(screen.summaries().map(shows)).toEqual([true, false, false]);
+		expect(screen.summaries().map(shows)).toEqual([false, false, false]);
+		// The flow still knows which turns a message woke; only the first one a prompt opened.
+		expect(screen.summaries().map((summary) => summary.state.startedByUser)).toEqual([true, false, false]);
+		for (const summary of screen.summaries()) expect(eventLines(summary)).toHaveLength(1);
 		screen.flow.dispose();
 	});
 
-	it("draws the title again after a new prompt and when the model changes", () => {
+	it("draws no title after a new prompt or when the model changes, and keeps track of which turns a prompt opened", () => {
 		const screen = new LiveChat();
 		screen.prompt("第一个问题");
 		screen.wake("m1");
@@ -146,16 +190,31 @@ describe("the live view draws one title per question", () => {
 		screen.wake("m2");
 		screen.wake("m3", { model: "gpt-5.5" });
 		screen.wake("m4", { model: "gpt-5.5" });
-		expect(screen.summaries().map(shows)).toEqual([true, false, true, false, true, false]);
+		withEvents(screen);
+		const summaries = screen.summaries();
+		expect(summaries).toHaveLength(6);
+		expect(summaries.map(shows)).toEqual([false, false, false, false, false, false]);
+		expect(summaries.map((summary) => summary.state.startedByUser)).toEqual([true, false, true, false, false, false]);
+		expect(summaries.map((summary) => summary.state.modelId)).toEqual([
+			"glm-5.3-prime",
+			"glm-5.3-prime",
+			"glm-5.3-prime",
+			"glm-5.3-prime",
+			"gpt-5.5",
+			"gpt-5.5",
+		]);
+		for (const summary of summaries) expect(eventLines(summary)).toHaveLength(1);
 		screen.flow.dispose();
 	});
 
-	it("keeps a run no message started in the box it continues, under its one title", () => {
+	it("keeps a run no message started in the box it continues, with no title", () => {
 		const screen = new LiveChat();
 		screen.prompt("第一个问题");
 		screen.continueOnItsOwn();
+		withEvents(screen);
 		expect(screen.summaries()).toHaveLength(1);
-		expect(screen.summaries().map(shows)).toEqual([true]);
+		expect(screen.summaries().map(shows)).toEqual([false]);
+		expect(eventLines(screen.summaries()[0] as TurnSummaryComponent)).toHaveLength(1);
 		screen.flow.dispose();
 	});
 });
@@ -171,8 +230,8 @@ function toolResult(id: string, at: number): ToolResultMessage {
 	};
 }
 
-describe("a replayed conversation draws one title per question", () => {
-	it("keeps the runs a handed-back message woke in the question's own box, under its one title", () => {
+describe("a replayed conversation draws no title, one turn per wake-up", () => {
+	it("starts a turn of its own at a handed-back message, under no title", () => {
 		const call = (id: string, at: number) =>
 			assistant(at, [{ type: "toolCall", id, name: "ipython", arguments: { code: "await bash('ls')" } }]);
 		const messages: AgentMessage[] = [
@@ -195,11 +254,28 @@ describe("a replayed conversation draws one title per question", () => {
 			processMode: "quiet",
 		});
 		const summaries = components.filter((component) => component instanceof TurnSummaryComponent);
-		expect(summaries).toHaveLength(2);
-		expect(summaries.map(shows)).toEqual([true, true]);
+		// The message that woke the AI after its answer starts the next turn: the answer stays under its own turn.
+		expect(summaries).toHaveLength(3);
+		expect(summaries.map(shows)).toEqual([false, false, false]);
 		const titles = components
 			.flatMap((component) => plain(component.render(100)))
 			.filter((line) => line.includes(HEADER));
-		expect(titles).toHaveLength(2);
+		expect(titles).toHaveLength(0);
+		const [question, woken, followUp] = summaries;
+		const stepLine = (at: number) => new RegExp(`^ ${formatTimelineTime(at)} {3}◆ {6}做了 1 步 +1 步 ▸ {2}$`);
+		const first = plain(question?.render(100) ?? []);
+		// Two empty rows under the question, then its event.
+		expect(first).toHaveLength(3);
+		expect(first.slice(0, 2)).toEqual([RAIL_ROW, RAIL_ROW]);
+		expect(first[2]).toMatch(stepLine(T0 + 1_000));
+		// The woken turn has its own event, for the run the handed-back message woke.
+		const second = plain(woken?.render(100) ?? []).filter((line) => EVENT_LINE.test(line));
+		expect(second).toHaveLength(1);
+		expect(second[0]).toMatch(stepLine(T0 + 5_000));
+		// A turn that only answered has nothing to list: its answer is drawn by the reply itself.
+		expect(plain(followUp?.render(100) ?? [])).toEqual([]);
+		// Each turn's answer is drawn once, under its own turn.
+		const screen = plain(components.flatMap((component) => component.render(100))).join("\n");
+		for (const answer of ["派出去了。", "审查完成。", "测试都过了。"]) expect(screen.match(answer)).toHaveLength(1);
 	});
 });

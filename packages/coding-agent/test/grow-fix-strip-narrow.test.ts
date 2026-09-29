@@ -110,8 +110,8 @@ describe("the subagent blocks on a narrow screen", () => {
 	it("gives a block at 24 columns its name before its state word, after the row scrolled", () => {
 		const line = strip([
 			{ id: "a", name: "reviewer-agent-long", state: "running" },
-			{ id: "b", name: "second-child-with-a-long-name", state: "running" },
-			{ id: "c", name: "third-child-with-a-long-name", state: "running" },
+			{ id: "b", name: "second-child-with-long-name", state: "running" },
+			{ id: "c", name: "third-child-with-long-name", state: "running" },
 		]);
 		scrollToEnd(line, 24);
 		const text = stripAnsi(line.render(24)[0] ?? "");

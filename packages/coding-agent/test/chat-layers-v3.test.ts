@@ -19,6 +19,8 @@ import {
 } from "../src/modes/interactive/components/running-card.js";
 import { turnStepLabel } from "../src/modes/interactive/components/step-label.js";
 import { SystemNoticeLine } from "../src/modes/interactive/components/system-notice.js";
+import { formatTimelineTime } from "../src/modes/interactive/components/timeline-gutter.js";
+import { timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
 import { TurnActivityState, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import {
 	sentAtText,
@@ -221,7 +223,7 @@ describe("the ◆ prime header and the gutter", () => {
 		).toBe(" ◆ prime  glm-5.3-prime · ⠸ working 9m 28s");
 	});
 
-	it("puts a settled turn's box under the header: a summary line, the clock and the tokens", () => {
+	it("draws a settled turn as one event line with what it did and its step count, no title and no card", () => {
 		const state = new TurnActivityState(T0);
 		state.modelId = "glm-5.3-prime";
 		state.addStep({ toolCallId: "a", toolName: "bash", args: { command: "npm test" }, status: "queued" });
@@ -231,27 +233,36 @@ describe("the ◆ prime header and the gutter", () => {
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
 		const lines = plain(summary.render(100));
-		expect(lines[0]).toBe(" ◆ prime  glm-5.3-prime");
-		// A settled box that keeps nothing on show is its header card alone: no frame.
-		expect(lines).toHaveLength(2);
-		expect(lines[1]).toMatch(/^ +✓ 完成 +跑了 1 条命令 +4秒 · ↓ 0 › *$/);
-		// The `◆ prime` line and the box header both open the box.
+		// The `◆ prime` title line and the header card (pill, clock, tokens) are gone: the summary is the event line.
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatch(new RegExp(`^ ${formatTimelineTime(T0)} {3}◆ {6}跑了 1 条命令 +1 步 ▸ {2}$`));
+		expect(lines.join("\n")).not.toMatch(/◆ prime|✓ 完成|进行中|4秒|↓ 0/);
+		// The event line is the one target and opens the step behind it.
 		const regions = summary.getClickRegions().filter((region) => !region.passive);
-		expect(regions[0]).toMatchObject({ line: 0, col: 0 });
-		expect(regions.some((region) => region.line === 1)).toBe(true);
+		expect(regions).toHaveLength(1);
+		expect(regions[0]).toMatchObject({ line: 0, col: 0, width: 100 });
+		regions[0]?.onClick({ line: 0, col: 0 } as never);
+		const opened = plain(summary.render(100));
+		expect(opened).toHaveLength(2);
+		expect(opened[0]).toMatch(/1 步 ▴ {2}$/);
+		expect(opened[1]).toMatch(/^ {9}│ {11}\$ {2}npm test +✓ 完成 {4}$/);
+		expect(state.boxOpen).toBe(true);
 	});
 
-	it("renders the live turn as the header plus a box that says what it is doing", () => {
+	it("draws the live turn as the spinner line that says what it is doing, with nothing to open yet", () => {
 		const state = liveState();
 		state.notePhase("waiting", T0);
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
 		const lines = plain(summary.render(100));
-		expect(lines[0]).toBe(" ◆ prime  glm-5.3-prime");
-		expect(lines[2]).toMatch(/^ │ +\S 进行中 +等待模型回应… /);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatch(/^ \d\d:\d\d {3}[⠀-⣿] {6}等待模型回应… *$/);
+		expect(lines.join("\n")).not.toMatch(/◆ prime|进行中/);
+		expect(summary.getClickRegions()).toHaveLength(0);
+		expect(summary.getFocusOrder()).toHaveLength(0);
 	});
 
-	it("runs a quiet answer flush under its box, with no rail", () => {
+	it("runs a quiet answer under its box as the timeline summary, its words on column 16", () => {
 		const answer = new AssistantMessageComponent(
 			{
 				role: "assistant",
@@ -278,7 +289,8 @@ describe("the ◆ prime header and the gutter", () => {
 		const lines = plain(answer.render(80)).map((line) => line.replace(/\x1b\][^\x07]*\x07/g, ""));
 		expect(lines.length).toBeGreaterThan(1);
 		for (const line of lines) expect(line.startsWith(" │")).toBe(false);
-		expect(lines.some((line) => line.startsWith(" 两个文件加起来 746 行。"))).toBe(true);
+		expect(lines.some((line) => /^ \d\d:\d\d {3}◆ {6}总结$/.test(line.trimEnd()))).toBe(true);
+		expect(lines.some((line) => line.trimEnd() === "         ┃      两个文件加起来 746 行。")).toBe(true);
 	});
 });
 
@@ -344,7 +356,7 @@ describe("system notices", () => {
 		expect(Math.abs(left - (60 - line.trim().length) / 2)).toBeLessThanOrEqual(1);
 	});
 
-	it("collapses a memory update to one line naming the entry, and expands to the diff", () => {
+	it("hides the background memory tidy by default; the full process shows it as one note that expands to the diff", () => {
 		const after: HarnessEntry = {
 			id: "eval-progress",
 			kind: "memory",
@@ -380,26 +392,32 @@ describe("system notices", () => {
 			scope: "local",
 		};
 		const component = new RefinementOutcomeMessageComponent(createRefinementOutcomeMessage(result));
-		const collapsed = plain(component.render(100)).filter((line) => line.trim());
-		expect(collapsed).toHaveLength(1);
-		expect(collapsed[0]).toBe(" ✦ 记住了 1 条 · 百轮评估进度 · 本会话 ▸");
-		// The entry's title names it; the summary's shorthand stays out of the line.
-		expect(collapsed[0]).not.toContain("老板令");
-		// A slug-like title (seen live: `eval100_0924百轮评估场_运行状态_评估后删`) reads as words.
-		const slug = structuredClone(result);
-		for (const edit of slug.appliedEdits) {
-			edit.title = "eval100_0924百轮评估场_运行状态_评估后删";
-			if (edit.after) edit.after.title = edit.title;
+		expect(component.render(100)).toEqual([]);
+		timelineShowAll.set(true);
+		try {
+			const collapsed = plain(component.render(100)).filter((line) => line.includes("回合后整理记忆"));
+			expect(collapsed).toHaveLength(1);
+			expect(collapsed[0]).toMatch(/^ \d\d:\d\d {3}· {6}回合后整理记忆：改了 1 条（本会话） +展开 ▸ {2}$/);
+			// The entry's title names it once opened; the summary's shorthand stays out of the row.
+			expect(collapsed[0]).not.toContain("老板令");
+			// A slug-like title (seen live: `eval100_0924百轮评估场_运行状态_评估后删`) reads as words.
+			const slug = structuredClone(result);
+			for (const edit of slug.appliedEdits) {
+				edit.title = "eval100_0924百轮评估场_运行状态_评估后删";
+				if (edit.after) edit.after.title = edit.title;
+			}
+			const slugComponent = new RefinementOutcomeMessageComponent(createRefinementOutcomeMessage(slug));
+			slugComponent.setExpanded(true);
+			const slugText = plain(slugComponent.render(120)).join("\n");
+			expect(slugText).toContain("eval100 0924百轮评估场 运行状态 评估后删");
+			expect(slugText).not.toContain("_");
+			component.setExpanded(true);
+			const expanded = plain(component.render(100)).join("\n");
+			expect(expanded).toContain("把协调记忆改写为");
+			expect(expanded).toContain("百轮评估进度");
+		} finally {
+			timelineShowAll.set(false);
 		}
-		const slugLine = plain(new RefinementOutcomeMessageComponent(createRefinementOutcomeMessage(slug)).render(120))
-			.filter((line) => line.trim())
-			.join("");
-		expect(slugLine).toContain("eval100 · 0924百轮评估场 · 运行状态 · 评估后删");
-		expect(slugLine).not.toContain("_");
-		component.setExpanded(true);
-		const expanded = plain(component.render(100)).join("\n");
-		expect(expanded).toContain("把协调记忆改写为");
-		expect(expanded).toContain("百轮评估进度");
 	});
 
 	it("collapses the kernel-restored notice to the centered line", () => {

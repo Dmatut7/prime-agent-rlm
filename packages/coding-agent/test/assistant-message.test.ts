@@ -396,7 +396,7 @@ describe("AssistantMessageComponent streaming identity", () => {
 		expect(render(true)).not.toContain("503 upstream overloaded");
 	});
 
-	test("quiet turns indent opened thinking traces; the answer keeps the one-column margin", () => {
+	test("quiet turns indent opened thinking traces; the answer is the timeline summary from column 16", () => {
 		initTheme("dark");
 		const message = createAssistantMessage([
 			{ type: "thinking" as const, thinking: "weighing options" },
@@ -409,8 +409,8 @@ describe("AssistantMessageComponent streaming identity", () => {
 			.render(80)
 			.map((line) => stripAnsi(line));
 		expect(lines.find((line) => line.includes("weighing options"))?.startsWith("   weighing")).toBe(true);
-		expect(lines.find((line) => line.includes("the answer"))?.startsWith(" the answer")).toBe(true);
-		// The answer sits under the turn's box, with no rail beside it.
-		expect(lines.some((line) => line.includes("│"))).toBe(false);
+		expect(lines.find((line) => line.includes("the answer"))?.startsWith("         ┃      the answer")).toBe(true);
+		// The trace is not on the timeline: no main-line row is drawn between it and the summary's own rows.
+		expect(lines.find((line) => line.includes("weighing options"))?.includes("│")).toBe(false);
 	});
 });

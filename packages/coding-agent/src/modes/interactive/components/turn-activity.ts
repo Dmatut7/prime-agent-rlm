@@ -9,10 +9,17 @@ import { theme } from "../theme/theme.js";
 import { getSpinnerTick } from "../theme/working-icon.js";
 import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock } from "./block-focus.js";
 import type { FileChangeSummary } from "./edit-summary.js";
-import { takeMotionActive } from "./motion.js";
-import { renderAssistantHeader } from "./running-card.js";
-import { type BoxRow, buildTimelineRows, type RowStep, type TimelineFacts, timelineFacts } from "./timeline-rows.js";
-import { boxBodyRows, computeBoxHeader, ROW_MOTION_MAX_ROWS, renderStickyHint, renderTurnBox } from "./turn-box.js";
+import type { TimelineLaneTracker } from "./timeline-lane.js";
+import {
+	type BoxRow,
+	buildTimelineView,
+	eventSaysMore,
+	type RowStep,
+	type TimelineEvent,
+	type TimelineFacts,
+	timelineFacts,
+} from "./timeline-rows.js";
+import { computeBoxHeader, computeLiveTail, EVENT_STEPS_SHOWN, type InlineRow, renderTurnBox } from "./turn-box.js";
 import { TurnTimeline } from "./turn-timeline.js";
 
 export type TurnStepStatus = "queued" | "running" | "done" | "error";
@@ -57,17 +64,13 @@ export const PROCESS_FOLD_EDGE = 3;
 /** What a turn's box reads from its host: the working directory, the screen height, the box settings. */
 export interface TimelineHost {
 	cwd(): string;
-	/** Terminal rows; the inline box body's height follows it, and an opened row never reveals more than a screen. */
+	/** Terminal rows; an opened line never asks the window to reveal more than a screen. */
 	viewportRows(): number;
-	/**
-	 * The box may grow with its content (the fullscreen window scrolls the page). Absent or false: the
-	 * body keeps a fixed height and scrolls inside the frame, because an inline screen redraws whole
-	 * whenever a row above its bottom changes and a box taller than the screen would flicker.
-	 */
+	/** Unused by the timeline: its lines always grow with the turn. */
 	growBox?(): boolean;
-	/** `ui.timelineOpenWhileWorking`: a running turn's box starts open. */
+	/** Unused by the timeline: a step list starts folded. */
 	openWhileWorking(): boolean;
-	/** `ui.timelineAutoFold`: a finished turn's box folds on its own; only a box the user closed, or opened after the turn ended, stays as it is. */
+	/** Unused by the timeline: every step list folds when the turn ends. */
 	autoFold(): boolean;
 	/** `hideThinkingBlock`: thinking rows say how long, never what. */
 	hideThinking?(): boolean;
@@ -99,6 +102,8 @@ export class TurnActivityState {
 	private collapsed = true;
 	/** U6 K3 ②: the turn's own Ctrl+T lane (the traces inside this turn's span). */
 	thinkingExpanded = false;
+	/** Event keys (`ev:`, `all:`) Ctrl+T opened that were not open already: closing the thoughts closes them again. */
+	readonly thinkingOpenedKeys = new Set<string>();
 	/** U6 K3 ②: the turn's own Ctrl+P lane (agent message rows inside this turn's span). */
 	agentMessagesExpanded = false;
 
@@ -263,14 +268,13 @@ export class TurnActivityState {
 	setCollapsed(collapsed: boolean): void {
 		if (this.boxMode) {
 			const ui = this.timeline.ui;
-			if (ui.userOpen === !collapsed && this.boxOpen === !collapsed) return;
-			const opening = collapsed === false && !this.boxOpen;
-			ui.userOpen = !collapsed;
-			ui.userOpenWhileLive = this.boxLive;
-			ui.foldStartedAt = undefined;
-			if (opening) {
-				ui.openedAt = Date.now();
-				ui.followNewest();
+			if (collapsed) {
+				ui.collapseEvents();
+				return;
+			}
+			for (const event of this.boxView().events) {
+				const opensToSomething = event.steps.length > 0 || eventSaysMore(event);
+				if (opensToSomething) ui.expanded.add(event.key);
 			}
 			ui.bump();
 			return;
@@ -289,44 +293,24 @@ export class TurnActivityState {
 		return this.turnEndedAt === undefined || (this.timeline.observedLive && this.timeline.finishedAt === undefined);
 	}
 
-	/**
-	 * Whether the box body shows: what the user chose, else the open/fold settings. With auto-fold on,
-	 * an opening the user made while the turn still ran lapses when it ends, so a finished box folds
-	 * unless they open it again; a closing stays, and with auto-fold off nothing lapses.
-	 */
+	/** Some event of the turn lists its steps. */
 	get boxOpen(): boolean {
-		const ui = this.timeline.ui;
-		const live = this.boxLive;
-		if (ui.userOpen !== undefined && !(ui.userOpen && ui.userOpenWhileLive && !live && this.host.autoFold())) {
-			return ui.userOpen;
-		}
-		if (live) return this.host.openWhileWorking();
-		if (this.timeline.observedLive) return this.host.openWhileWorking() && !this.host.autoFold();
+		for (const key of this.timeline.ui.expanded) if (key.startsWith("ev:")) return true;
 		return false;
 	}
 
-	/**
-	 * Apply the finished presentation (the summary header, the fold). The body
-	 * folds up row by row when it was open only because of the settings.
-	 */
+	/** Apply the finished presentation: every event folds its steps away. */
 	finishBox(now = Date.now()): void {
 		const timeline = this.timeline;
 		if (timeline.finishedAt !== undefined) return;
-		const wasOpen = this.boxOpen;
 		timeline.finishedAt = now;
-		// A body of a few rows folds row by row; a page of them just closes.
-		if (wasOpen && !this.boxOpen && timeline.ui.lastVisible <= ROW_MOTION_MAX_ROWS) {
-			timeline.ui.foldStartedAt = now;
-			timeline.ui.foldFromRows = Math.max(1, timeline.ui.lastVisible);
-		}
-		timeline.ui.bump();
+		timeline.ui.collapseEvents();
 	}
 
 	/** A retry or a compaction continues this turn after it ended: back to live. */
 	reopen(): void {
 		this.turnEndedAt = undefined;
 		this.timeline.finishedAt = undefined;
-		this.timeline.ui.foldStartedAt = undefined;
 		this.timeline.stopped = false;
 		this.timeline.errorEnded = false;
 		this.timeline.ui.bump();
@@ -348,15 +332,15 @@ export class TurnActivityState {
 		return steps;
 	}
 
-	private viewCache: { key: string; rows: BoxRow[]; facts: TimelineFacts } | undefined;
+	private viewCache: { key: string; rows: BoxRow[]; events: TimelineEvent[]; facts: TimelineFacts } | undefined;
 
 	/** The key of the last finished view (what a cached box was drawn from). */
 	boxViewKey(): string {
 		return this.viewCache?.key ?? "live";
 	}
 
-	/** The box rows and the turn's facts; memoized once the turn has finished. */
-	boxView(now = Date.now()): { rows: BoxRow[]; facts: TimelineFacts; live: boolean } {
+	/** The rows, the events they hang under and the turn's facts; memoized once the turn has finished. */
+	boxView(now = Date.now()): { rows: BoxRow[]; events: TimelineEvent[]; facts: TimelineFacts; live: boolean } {
 		const live = this.boxLive;
 		const cwd = this.host.cwd();
 		const hideThinking = this.host.hideThinking?.() ?? false;
@@ -372,13 +356,13 @@ export class TurnActivityState {
 			hideThinking,
 		].join(":");
 		if (!live && this.viewCache?.key === cacheKey) {
-			return { rows: this.viewCache.rows, facts: this.viewCache.facts, live };
+			return { rows: this.viewCache.rows, events: this.viewCache.events, facts: this.viewCache.facts, live };
 		}
 		const ctx = { now, cwd, steps: this.rowSteps(), live, stopped: this.timeline.stopped, hideThinking };
-		const rows = buildTimelineRows(this.timeline, ctx);
+		const { rows, events } = buildTimelineView(this.timeline, ctx);
 		const facts = timelineFacts(this.timeline, rows, ctx);
-		if (!live) this.viewCache = { key: cacheKey, rows, facts };
-		return { rows, facts, live };
+		if (!live) this.viewCache = { key: cacheKey, rows, events, facts };
+		return { rows, events, facts, live };
 	}
 
 	get startedAt(): number {
@@ -705,21 +689,13 @@ export class TurnActivityState {
 	}
 }
 
-/** Rows a pinned header covers at the top of the window: the header card and its hint. */
-const PINNED_ROWS = 2;
+/** A component that lists the click regions of the lines it drew. */
+interface HasClickRegions {
+	getClickRegions(): ReadonlyArray<ClickRegion>;
+}
 
-/** An open box's header as the last render drew it, in the component's own line numbers. */
-interface PinnedHeader {
-	/** The box's first row (its top rule): a folded box starts on this row, so a click that folds it from the pin lands there. */
-	line: number;
-	endLine: number;
-	headerText: string;
-	/** First line of each block the box shows. */
-	blockLines: number[];
-	width: number;
-	focused: boolean;
-	live: boolean;
-	regions: ClickRegion[];
+function hasClickRegions(component: Component): component is Component & HasClickRegions {
+	return "getClickRegions" in component && typeof component.getClickRegions === "function";
 }
 
 export class TurnSummaryComponent implements Component, FocusableBlock {
@@ -732,14 +708,14 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	/** Told after a click flipped a lane, so the host applies it to the turn's rows. */
 	private onLanesChange?: () => void;
 	private boxRegions: ClickRegion[] = [];
-	/** What the pinned copy of an open box's header repeats, taken from the last render. */
-	private pinned: PinnedHeader | undefined;
 	private boxFocusOrder: string[] = [];
 	private boxCacheKey: string | undefined;
-	/** The `◆ prime  <model>` line above the box; a woken turn under the same title leaves it out. */
-	private headerShown = true;
-	/** A blank line above the turn: a woken turn nothing else separates from what is above it. */
-	private leadingBlank = false;
+	/** Empty rows above the turn's lines: two under the question, one for a woken turn, none under a blank line. */
+	private leadingRows = 0;
+	/** Which subagents are out; absent: the turn draws no lane. */
+	private laneTracker: TimelineLaneTracker | undefined;
+	/** Rows that landed while the turn's run went on (a subagent's report), drawn among its lines by their time. */
+	private readonly inlineRows: Array<{ component: Component; at: number }> = [];
 
 	constructor(private readonly turnState: TurnActivityState) {}
 
@@ -752,17 +728,56 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		return this.turnState;
 	}
 
-	/** Whether the box has its own `◆ prime  <model>` line above it. */
-	setHeaderShown(shown: boolean): void {
-		if (this.headerShown === shown) return;
-		this.headerShown = shown;
+	/** The `◆ prime  <model>` title line is gone from the timeline; callers still say whether one would show. */
+	setHeaderShown(_shown: boolean): void {
+		// Nothing to draw: the timeline's lines carry the time and the AI's own words.
+	}
+
+	/** Which subagents are out, so the turn's lines draw the dotted lane beside them. */
+	setLaneTracker(tracker: TimelineLaneTracker | undefined): void {
+		if (this.laneTracker === tracker) return;
+		this.laneTracker = tracker;
+		this.turnState.timeline.laneTracker = tracker;
+		if (tracker) this.turnState.timeline.ui.startLane ??= tracker.lane;
+		// Subagents this turn already dispatched and still waits on are out.
+		const running = this.turnState.timeline.entries.flatMap((entry) =>
+			entry.kind === "subagent" && entry.sub.status === "running" ? [entry.sub.laneName ?? entry.sub.name] : [],
+		);
+		if (tracker && running.length > 0) tracker.spawned(running, this.turnState.timeline);
 		this.invalidate();
 	}
 
-	/** Whether a blank line separates this turn from what is above it. */
-	setLeadingBlank(blank: boolean): void {
-		if (this.leadingBlank === blank) return;
-		this.leadingBlank = blank;
+	/** A row that landed inside the turn: it is drawn among the turn's lines, after the events that came before it. */
+	addInlineRow(component: Component, at: number): void {
+		this.inlineRows.push({ component, at });
+		this.invalidate();
+	}
+
+	/** Each row that landed inside the turn (the expansion keys reach them through here). */
+	forEachInlineRow(visit: (component: Component) => void): void {
+		for (const { component } of this.inlineRows) visit(component);
+	}
+
+	/**
+	 * The row that is drawn straight above a row landing at `at`, when nothing else of the turn sits
+	 * between them (two reports in a row share one blank line above).
+	 */
+	inlineRowBefore(at: number): Component | undefined {
+		const last = this.inlineRows.at(-1);
+		if (!last) return undefined;
+		const later = this.turnState.timeline.entries.some(
+			(entry) =>
+				entry.kind === "message" &&
+				(entry.message.timestamp ?? 0) > last.at &&
+				(entry.message.timestamp ?? 0) <= at,
+		);
+		return later ? undefined : last.component;
+	}
+
+	/** How many empty main-line rows the turn draws above its first line. */
+	setLeadingRows(rows: number): void {
+		if (this.leadingRows === rows) return;
+		this.leadingRows = rows;
 		this.invalidate();
 	}
 
@@ -772,42 +787,22 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		this.invalidate();
 	}
 
-	/** The box's click regions: the `◆ prime` line and the box header toggle the box, rows toggle themselves. */
+	/** Click regions of the turn's lines: an event, a step, `全部 ›`. */
 	getClickRegions(): ReadonlyArray<ClickRegion> {
 		return this.quiet ? this.boxRegions : [];
 	}
 
-	/**
-	 * The open box's header, for the fullscreen window to keep on screen while the box's rows scroll
-	 * under the top edge: the header card as it is drawn here, and under it what is out of sight.
-	 */
+	/** The timeline has no frame to pin: nothing stays on screen above its lines. */
 	getStickyHeaders(): ReadonlyArray<StickyHeader> {
-		const pinned = this.pinned;
-		if (!this.quiet || !pinned) return [];
-		return [
-			{
-				line: pinned.line,
-				endLine: pinned.endLine,
-				render: (scrolledPast) => {
-					// The window's top row is `line + scrolledPast`; the pinned rows cover it and the row under it, so every block that starts above them is out of sight.
-					const covered = pinned.line + Math.max(0, scrolledPast) + PINNED_ROWS;
-					const hiddenSteps = pinned.blockLines.filter((line) => line < covered).length;
-					return [
-						pinned.headerText,
-						renderStickyHint({ width: pinned.width, hiddenSteps, focused: pinned.focused, live: pinned.live }),
-					];
-				},
-				regions: pinned.regions,
-			},
-		];
+		return [];
 	}
 
-	/** Keyboard targets of the box, top to bottom (`header`, then row keys). */
+	/** Keyboard targets of the turn, top to bottom: events, then the steps listed under the open ones. */
 	getFocusOrder(): readonly string[] {
 		return this.boxFocusOrder;
 	}
 
-	/** Open or close the whole box (a click on its header, Ctrl+O, Enter on its header). */
+	/** Open every event's step list, or fold them all (Ctrl+O). */
 	toggleBox(): void {
 		this.turnState.setCollapsed(this.turnState.boxOpen);
 		this.invalidate();
@@ -815,24 +810,39 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		this.turnState.host.requestRender();
 	}
 
-	/** What Enter does on a focused target (`展开`, `收起`), or undefined for a row with nothing to open. */
-	enterLabel(key: string): string | undefined {
-		const state = this.turnState;
-		if (key === "header") return state.boxOpen ? "收起" : "展开";
-		const row = state.boxView().rows.find((candidate) => candidate.key === key);
-		if (!row?.detail) return undefined;
-		return state.timeline.ui.expanded.has(key) ? "收起" : "展开";
+	/** The target a `header` focus (the walk's first stop) stands for. */
+	private resolveTarget(key: string): string | undefined {
+		return key === "header" ? this.boxFocusOrder[0] : key;
 	}
 
-	/** Enter on a focused target: the header toggles the box, a row opens or closes. */
+	/** What Enter does on a focused target (`展开`, `收起`), or undefined for one with nothing to open. */
+	enterLabel(key: string): string | undefined {
+		const target = this.resolveTarget(key);
+		if (target === undefined) return undefined;
+		if (this.turnState.timeline.ui.expanded.has(target)) return "收起";
+		return target.startsWith("all:") ? "全部" : "展开";
+	}
+
+	/** Enter on a focused target: an event or a step opens or closes, `全部 ›` lists every step and `▴ 收起` takes them back. */
 	activate(key: string): boolean {
-		if (key === "header") {
-			this.toggleBox();
-			return true;
+		const target = this.resolveTarget(key);
+		if (target === undefined || !this.boxFocusOrder.includes(target)) return false;
+		const ui = this.turnState.timeline.ui;
+		if (target.startsWith("all:")) {
+			if (!ui.expanded.delete(target)) ui.expanded.add(target);
+			ui.bump();
+		} else if (target.startsWith("ev:")) {
+			if (ui.expanded.has(target)) {
+				ui.expanded.delete(target);
+				ui.expanded.delete(`all:${target}`);
+			} else {
+				ui.expanded.add(target);
+			}
+			ui.bump();
+			this.onLanesChange?.();
+		} else {
+			ui.toggleRow(target);
 		}
-		const row = this.turnState.boxView().rows.find((candidate) => candidate.key === key);
-		if (!row?.detail) return false;
-		this.turnState.timeline.ui.toggleRow(key);
 		this.invalidate();
 		this.turnState.host.requestRender();
 		return true;
@@ -841,11 +851,19 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	/** Ctrl+T in the quiet conversation: open every thinking row of this turn, or close them all. */
 	toggleThinkingRows(): void {
 		const ui = this.turnState.timeline.ui;
-		const thinking = this.turnState
-			.boxView()
-			.rows.filter((row) => row.kind === "think" && row.detail && !row.factsOnly);
+		const view = this.turnState.boxView();
+		const thinking = view.rows.filter((row) => row.kind === "think" && row.detail && !row.factsOnly);
+		// A thought is open only while it is on screen: under an event that is closed (Ctrl+O folded it) it is not.
+		const onScreen = (row: BoxRow): boolean => {
+			if (!ui.expanded.has(row.key)) return false;
+			const event = view.events.find((candidate) => candidate.steps.some((step) => step.key === row.key));
+			if (!event) return true;
+			if (!ui.expanded.has(event.key)) return false;
+			const position = event.steps.findIndex((step) => step.key === row.key);
+			return position < EVENT_STEPS_SHOWN || ui.expanded.has(`all:${event.key}`);
+		};
 		this.setThinkingRows(
-			thinking.length > 0 ? thinking.some((row) => !ui.expanded.has(row.key)) : !this.turnState.thinkingExpanded,
+			thinking.length > 0 ? thinking.some((row) => !onScreen(row)) : !this.turnState.thinkingExpanded,
 		);
 	}
 
@@ -863,7 +881,20 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 			}
 		}
 		this.turnState.thinkingExpanded = open;
-		if (open && !this.turnState.boxOpen) this.turnState.setCollapsed(false);
+		if (open) {
+			// A thought shows only under an open event that lists it; closing the thoughts closes what this opened.
+			for (const event of this.turnState.boxView().events) {
+				if (!event.steps.some((step) => step.kind === "think" && step.detail && !step.factsOnly)) continue;
+				for (const key of [event.key, `all:${event.key}`]) {
+					if (ui.expanded.has(key)) continue;
+					ui.expanded.add(key);
+					this.turnState.thinkingOpenedKeys.add(key);
+				}
+			}
+		} else {
+			for (const key of this.turnState.thinkingOpenedKeys) ui.expanded.delete(key);
+			this.turnState.thinkingOpenedKeys.clear();
+		}
 		ui.bump();
 		this.invalidate();
 	}
@@ -908,7 +939,9 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	}
 
 	setBlockFocus(state: BlockFocusState | undefined): void {
+		const changed = (this.blockFocus === undefined) !== (state === undefined);
 		this.blockFocus = state;
+		if (changed) this.invalidate();
 	}
 
 	/** The process line and its rows as plain text. */
@@ -954,9 +987,8 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	}
 
 	/**
-	 * Quiet face: the `◆ prime  <model>` line, then the turn's box. The box
-	 * re-renders every frame while it is live or animating; a finished, still
-	 * box is cached until its UI state changes.
+	 * Quiet face: the turn's timeline lines. They re-render every frame while
+	 * the turn is live; a finished turn is cached until its UI state changes.
 	 */
 	private renderBox(width: number): string[] {
 		const state = this.turnState;
@@ -964,89 +996,65 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		const now = Date.now();
 		const viewportRows = host.viewportRows();
 		const ui = state.timeline.ui;
-		// The finished box's view has its own key (steps, entries, how it ended, cwd, hideThinking).
+		const tracker = this.laneTracker;
+		// The finished view has its own key (steps, entries, how it ended, cwd, hideThinking).
 		const view = state.boxView(now);
-		const grow = host.growBox?.() ?? false;
-		const cacheKey = `${width}:${viewportRows}:${grow}:${ui.version}:${state.boxOpen}:${this.headerShown}:${this.leadingBlank}:${state.boxViewKey()}`;
+		const cacheKey = `${width}:${viewportRows}:${ui.version}:${this.leadingRows}:${this.blockFocus !== undefined}:${tracker?.pending.join("|") ?? ""}:${state.boxViewKey()}`;
 		if (this.cachedLines && this.boxCacheKey === cacheKey) return this.cachedLines;
-		takeMotionActive();
+		const hideThinking = host.hideThinking?.() ?? false;
 		const header = computeBoxHeader({
 			rows: view.rows,
 			facts: view.facts,
 			timeline: state.timeline,
 			live: view.live,
 			phase: state.currentPhase,
-			currentThinking: host.hideThinking?.() ? "" : state.currentThinking,
+			currentThinking: hideThinking ? "" : state.currentThinking,
 			now,
+		});
+		const tail =
+			view.live && !state.timeline.stopped
+				? computeLiveTail({
+						rows: view.rows,
+						events: view.events,
+						header,
+						timeline: state.timeline,
+						hideThinking,
+						now,
+					})
+				: undefined;
+		const inline: InlineRow[] = this.inlineRows.map(({ component, at }) => {
+			const lines = component.render(width);
+			return { at, lines, regions: hasClickRegions(component) ? component.getClickRegions() : [] };
 		});
 		const box = renderTurnBox({
 			timeline: state.timeline,
 			rows: view.rows,
-			header,
+			events: view.events,
+			...(tail ? { tail } : {}),
 			width,
 			now,
 			tick: getSpinnerTick(),
-			live: view.live,
-			open: state.boxOpen,
-			grow,
-			maxBodyRows: boxBodyRows(viewportRows),
 			revealRows: viewportRows,
-			durationMs: state.turnDurationMs(now),
-			tokens: state.timeline.outputTokens(),
-			onToggleBox: () => this.toggleBox(),
+			...(tracker ? { lanes: tracker } : {}),
+			...(inline.length > 0 ? { inline } : {}),
+			leadingRows: this.leadingRows,
+			dropFirstRight: this.blockFocus !== undefined,
+			onToggleEvent: () => this.onLanesChange?.(),
 			onChange: () => {
 				this.invalidate();
 				host.requestRender();
 			},
 		});
 		this.boxFocusOrder = box.focusOrder;
-		const above: string[] = this.leadingBlank ? [""] : [];
-		const regions: ClickRegion[] = [];
-		if (this.headerShown) {
-			regions.push({
-				line: above.length,
-				col: 0,
-				width: Math.min(width, 9),
-				height: 1,
-				onClick: () => this.toggleBox(),
-			});
-			above.push(
-				renderAssistantHeader({
-					...(state.modelId ? { modelId: state.modelId } : {}),
-					durationMs: 0,
-					live: false,
-					plain: true,
-					tick: 0,
-					width,
-				}),
-			);
-		}
-		regions.push(...box.regions.map((region) => ({ ...region, line: region.line + above.length })));
-		this.boxRegions = regions;
-		const headerRegion = box.regions[0];
-		this.pinned =
-			state.boxOpen && headerRegion
-				? {
-						line: above.length + box.header.line - (box.framed ? 1 : 0),
-						endLine: above.length + box.lines.length - 1,
-						headerText: box.header.text,
-						blockLines: box.blockHeads.map((line) => line + above.length),
-						width,
-						focused: ui.focused,
-						live: view.live,
-						regions: [{ ...headerRegion, line: 0, revealBelow: 0 }],
-					}
-				: undefined;
-		const lines = [...above, ...box.lines];
-		const animating = takeMotionActive();
-		if (!view.live && !animating) {
-			this.cachedLines = lines;
+		this.boxRegions = box.regions;
+		if (!view.live && inline.length === 0) {
+			this.cachedLines = box.lines;
 			this.boxCacheKey = cacheKey;
 		} else {
 			this.cachedLines = undefined;
 			this.boxCacheKey = undefined;
 		}
-		return lines;
+		return box.lines;
 	}
 
 	/**

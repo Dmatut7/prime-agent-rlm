@@ -1,0 +1,4 @@
+- Fixed a short answer disappearing from a question you asked when a subagent's report or notice landed between your question and the AI's first word.
+- Fixed a report that arrives while a command runs splitting the turn in two after a compaction, a reconnect or an attach, which left the command spinning forever with its output missing.
+- Fixed a failed or partly refused background memory tidy being hidden until `完整过程` was on; only a tidy that kept everything stays hidden.
+- Fixed two AI messages stamped in the same millisecond showing as one row, and a subagent with no name leaving the dotted lane on forever.

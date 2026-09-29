@@ -44,7 +44,7 @@ function host(): TimelineHost {
 	};
 }
 
-/** A live turn whose box is open; the body shows at most eight of its rows. */
+/** A live turn: its lines grow with it and nothing is open until an event or a step is clicked. */
 function liveTurn() {
 	const state = new TurnActivityState(Date.now() - 5_000);
 	state.live = true;
@@ -90,21 +90,27 @@ function addCommand(turn: Turn, index: number, at: number): void {
 }
 
 /**
- * The box at `width` columns with every kind of click area on screen: the
- * header, the `↑ 上面还有` rule, the body rows, and the `↓ 有新内容` bar (the
- * body scrolled up when a new row arrived).
+ * The turn's lines at `width` columns with every kind of click area on screen: the event line, the steps it
+ * lists, and `⋯ 另外 N 步   全部 ›`; or, once that was taken, every step with the first one opened. A step
+ * that arrived while the event was open joins it.
  */
-function scrolledBox(width: number) {
+function openTimeline(width: number, listAll: boolean) {
 	setMotionReduced(true);
 	const turn = liveTurn();
 	const t0 = Date.now() - 4_000;
 	for (let index = 0; index < 20; index++) addCommand(turn, index, t0 + index);
 	turn.summary.render(width);
-	expect(turn.timeline.ui.scrollBody(-1)).toBe(true);
+	const eventKey = turn.summary.getFocusOrder().find((key) => key.startsWith("ev:")) ?? "";
+	expect(turn.summary.activate(eventKey)).toBe(true);
 	turn.summary.render(width);
+	if (listAll) {
+		expect(turn.summary.activate(`all:${eventKey}`)).toBe(true);
+		turn.summary.render(width);
+		expect(turn.summary.activate("act:s0:a0")).toBe(true);
+	}
 	addCommand(turn, 20, t0 + 20);
 	const lines = turn.summary.render(width);
-	return { lines, regions: turn.summary.getClickRegions() };
+	return { lines, regions: turn.summary.getClickRegions(), order: turn.summary.getFocusOrder(), ui: turn.timeline.ui };
 }
 
 function change(overrides: Partial<ChangeEntry> = {}): ChangeEntry {
@@ -147,14 +153,15 @@ function stripFacts(): TimelineFacts {
 function openStrip(list: "edits" | "memories", width: number) {
 	setMotionReduced(true);
 	const timeline = new TurnTimeline();
-	timeline.ui.stripOpen = list;
+	if (list === "edits") timeline.ui.stripOpen = "edits";
+	else timeline.ui.stripExpanded.add("m1");
 	const strip = new TurnStripComponent({ timeline, facts: stripFacts, requestRender: vi.fn() });
 	const lines = strip.render(width);
 	return { lines, regions: strip.getClickRegions() };
 }
 
 const NARROW_TO_THIRTY = Array.from({ length: 30 }, (_, index) => index + 1);
-/** Below 5 columns the frame cannot be drawn whole; from 5 up it fills the whole line. */
+/** Narrow to wide; below 5 columns the change strip's frame cannot be drawn whole, the timeline's lines can. */
 const FRAME_WIDTHS = [1, 2, 3, 4, 5, 6, 30, 80, 120, 121, 122, 200];
 
 beforeAll(() => {
@@ -166,36 +173,55 @@ afterEach(() => {
 	setMotionReduced(false);
 });
 
-describe("the box's click areas stay on the screen", () => {
-	it("puts no area of an open, scrolled box past the last column at 1 to 30 columns", () => {
+describe("the timeline's click areas stay on the screen", () => {
+	it("puts no area of an open event past the last column at 1 to 30 columns", () => {
 		expect(NARROW_TO_THIRTY.length).toBeGreaterThan(0);
 		for (const width of NARROW_TO_THIRTY) {
-			const { lines, regions } = scrolledBox(width);
-			const onLines = new Set(regions.map((region) => region.line));
-			// Header, the rule that scrolls up, the bar for new rows and at least one body row.
-			expect(onLines.has(2), `header area at ${width}`).toBe(true);
-			expect(onLines.has(3), `scroll-up rule area at ${width}`).toBe(true);
-			expect(onLines.has(lines.length - 1), `new-rows bar area at ${width}`).toBe(true);
-			expect(
-				regions.some((region) => region.line > 3 && region.line < lines.length - 1 && !region.passive),
-				`openable body row area at ${width}`,
-			).toBe(true);
-			for (const region of regions) {
-				expect(region.col + region.width, `area on line ${region.line} at ${width}`).toBeLessThanOrEqual(width);
+			for (const listAll of [false, true]) {
+				const { lines, regions, order, ui } = openTimeline(width, listAll);
+				const where = `${width} columns, ${listAll ? "every step listed" : "three steps listed"}`;
+				const onLines = new Set(regions.map((region) => region.line));
+				// The event line, its steps (three and `全部 ›`, or all 21 and `▴ 收起`) and nothing else has an area.
+				expect(order.length, `targets at ${where}`).toBe(listAll ? 23 : 5);
+				expect(regions.length, `areas at ${where}`).toBe(order.length);
+				expect(onLines.has(0), `event area at ${where}`).toBe(true);
+				expect(
+					regions.filter((region) => region.line > 0 && region.line < lines.length).length,
+					`step areas at ${where}`,
+				).toBe(order.length - 1);
+				if (!listAll) {
+					expect(
+						[...onLines].sort((a, b) => a - b),
+						`lines with an area at ${where}`,
+					).toEqual([0, 1, 2, 3, 4]);
+				} else {
+					// The opened step adds lines of its own (its output) that carry no area.
+					expect(lines.length, `lines at ${where}`).toBeGreaterThan(order.length + 2);
+				}
+				for (const key of order) {
+					expect(
+						regions.some((region) => region.hoverKey === `${ui.id}:${key}`),
+						`area of ${key} at ${where}`,
+					).toBe(true);
+				}
+				for (const region of regions) {
+					expect(region.col + region.width, `area on line ${region.line} at ${where}`).toBeLessThanOrEqual(width);
+					// Every area opens or folds something; none is a passive strip the wheel passes through.
+					expect(region.passive, `area on line ${region.line} at ${where}`).not.toBe(true);
+				}
 			}
 		}
 	});
 
-	it("gives every framed line of the box the whole frame's width, and 5 columns and up stay as they were", () => {
+	it("gives every line of the timeline the whole line's width, from 1 column up", () => {
 		expect(FRAME_WIDTHS.length).toBeGreaterThan(0);
 		for (const width of FRAME_WIDTHS) {
-			const { regions } = scrolledBox(width);
-			// Line 0 is the `◆ prime` line's own, shorter area.
-			const framed = regions.filter((region) => region.line > 0);
-			expect(framed.length, `framed areas at ${width}`).toBeGreaterThan(0);
-			for (const region of framed) {
+			const { regions } = openTimeline(width, false);
+			expect(regions.length, `areas at ${width}`).toBeGreaterThan(0);
+			for (const region of regions) {
 				expect(region.col, `column of line ${region.line} at ${width}`).toBe(0);
 				expect(region.width, `width of line ${region.line} at ${width}`).toBe(width);
+				expect(region.height, `height of line ${region.line} at ${width}`).toBe(1);
 			}
 		}
 	});
@@ -223,7 +249,7 @@ describe("the change strip's click areas stay on the screen", () => {
 		for (const list of ["edits", "memories"] as const) {
 			for (const width of FRAME_WIDTHS) {
 				const { lines, regions } = openStrip(list, width);
-				// The first line holds the segments' own areas; the list's items sit below it.
+				// The first row is the gap above the strip's rows; every row it draws below is a whole-width area.
 				const items = regions.filter((region) => region.line > 0);
 				expect(items.length, `${list} item areas at ${width}`).toBeGreaterThan(0);
 				for (const region of items) {

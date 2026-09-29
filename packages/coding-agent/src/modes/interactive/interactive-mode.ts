@@ -209,7 +209,7 @@ import {
 } from "../shared/startup-notices.js";
 import { AGENT_ACTIVITY_LABELS, AgentActivityTracker, formatTokenCount } from "./agent-activity.js";
 import { type AuthenticationResult, getAnthropicSubscriptionAuthWarning, ProviderAuthFlows } from "./auth-flows.js";
-import { AGENT_MESSAGE_TURN_INSET, AgentMessageComponent } from "./components/agent-message.js";
+import { AgentMessageComponent } from "./components/agent-message.js";
 import { ArminComponent } from "./components/armin.js";
 import { AssistantMessageComponent } from "./components/assistant-message.js";
 import { BashExecutionComponent } from "./components/bash-execution.js";
@@ -238,13 +238,25 @@ import {
 import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "./components/configuration-menu.js";
 import { formatContextTree } from "./components/context-tree-format.js";
 import {
+	assignWakeCause,
+	awaitsStepResults,
 	countThinkingSegments,
+	createAgentMessageRow,
+	createUserMessage,
 	foldEarlierAnswers,
-	isCompactAgentMessageNeighbor,
+	giveLane,
+	giveLaneTracker,
+	isWakeMessage,
+	lastDrawnComponent,
+	latestShownTurn,
 	latestThinkingText,
 	NO_STEP_STOP,
+	noteWakeInRound,
+	QuietAssistantMessage,
+	QuietTurnSummary,
 	resolveTurnHeaders,
 	stepResultStop,
+	WakeCause,
 } from "./components/conversation-components.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
@@ -262,12 +274,14 @@ import {
 	FooterComponent,
 	type FooterTelemetrySnapshot,
 	type FooterTelemetrySource,
+	finishedRunForms,
 	formatContextTokens,
 	type StatusBarState,
+	workingRunForms,
 } from "./components/footer.js";
 import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
-import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
+import { formatKeyText, type KeyTextOptions, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
 import { createMermaidMarkdownTransform } from "./components/mermaid.js";
 import { setMotionFrameRequester, setMotionReduced } from "./components/motion.js";
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
@@ -302,6 +316,7 @@ import {
 	summarizeSubagentSpend,
 	TrayInfoLine,
 } from "./components/subagent-summary-line.js";
+import { isSubagentNoticeMessage, subagentNoticeRow } from "./components/system-notice.js";
 import { ThinkingSelectorComponent } from "./components/thinking-selector.js";
 import {
 	selectLatestToolExpandHint,
@@ -326,12 +341,7 @@ import {
 } from "./components/turn-activity.js";
 import { BOX_FOCUS_MARKER } from "./components/turn-box.js";
 import { TurnBoxNavigator, turnBoxFocusHints } from "./components/turn-box-navigator.js";
-import {
-	boxRecordFromMessage,
-	formatBoxDuration,
-	formatBoxTokens,
-	isBoxNoticeMessage,
-} from "./components/turn-timeline.js";
+import { boxRecordFromMessage, isBoxNoticeMessage } from "./components/turn-timeline.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
 import { FeatureHintDeck } from "./feature-hints.js";
@@ -364,6 +374,7 @@ import { formatResumeHint } from "./resume-hint.js";
 import {
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
+	getEditorTextColors,
 	getEditorTheme,
 	getMarkdownTheme,
 	getThemeByName,
@@ -1616,8 +1627,6 @@ export class InteractiveMode {
 		this.liveTurnFlowStore ??= new LiveTurnFlow(this.createLiveTurnFlowHost());
 		return this.liveTurnFlowStore;
 	}
-	/** Output tokens of the whole session, from the session stats. */
-	private sessionOutputTokens: number | undefined;
 	/** The keyboard walking a turn's box (`app.turn.focus`). */
 	private boxFocus: { summary: TurnSummaryComponent; navigator: TurnBoxNavigator; resumeFollow: boolean } | undefined;
 	// U2: trailing consecutive errored tool results; a success resets it.
@@ -1799,8 +1808,7 @@ export class InteractiveMode {
 			autocompleteMaxVisible,
 			isArgumentCommand: builtinSlashCommandTakesArgument,
 			placeholder: this.startHint,
-			placeholderColor: (text) => theme.fg("dim", text),
-			hintColor: (text) => theme.fg("dim", text),
+			...getEditorTextColors(),
 		});
 		this.editor = this.defaultEditor;
 		this.mainContainer = new Container();
@@ -1817,6 +1825,8 @@ export class InteractiveMode {
 		// watermark (②), then the subagents line (③).
 		// The key hints ride the prompt's top rule; the tray line keeps status only.
 		this.defaultEditor.getBorderHints = () => this.getTrayHints();
+		// The design's foot: rule, prompt, then the subagent blocks (they take the bottom rule's row), then the status line.
+		this.defaultEditor.hideBottomRule = () => quietConversation(this) && this.subagentSummaryLine.hasBlocks();
 		this.trayInfoLine = new TrayInfoLine(
 			() => this.getTrayStatusLabel(),
 			() => [],
@@ -3496,7 +3506,6 @@ export class InteractiveMode {
 		this.contextUsageRefresh.lastSuccessGeneration = generation;
 		// Anything counted so far is now reflected in the snapshot; only later output is in-flight.
 		this.contextUsageTokenBaseline = this.activityTracker.getStatus().tokens;
-		this.sessionOutputTokens = stats.tokens?.output;
 		this.patchConnectionState({ contextUsage: stats.contextUsage });
 		// P2-D (Qwen review): the leading invalidation happened before the await
 		// - a frame that rendered while the RPC was in flight re-memoized the
@@ -3803,7 +3812,6 @@ export class InteractiveMode {
 		this.liveTurnFlowStore?.reset();
 		this.currentTurnState = undefined;
 		this.currentTurnSummary = undefined;
-		this.sessionOutputTokens = undefined;
 		this.resetSubagentSummary();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
@@ -3939,6 +3947,11 @@ export class InteractiveMode {
 			foldEarlierAnswers: (summary) => foldEarlierAnswers(this.chatContainer.children, summary),
 			requestRender: () => this.ui.requestRender(),
 			liveChanged: () => this.updateWorkingPulse(),
+			subagentSpend: () => {
+				// A replay can draw the closing row before the status line exists.
+				const spend = this.subagentSummaryLine?.getSubagentSpend();
+				return spend ? { cost: spend.cost, parentCost: spend.parentCost, partial: spend.partial } : undefined;
+			},
 		};
 	}
 
@@ -7155,7 +7168,8 @@ export class InteractiveMode {
 		if (this.streamingComponent) {
 			this.chatContainer.removeChild(this.streamingComponent);
 		}
-		this.streamingComponent = new AssistantMessageComponent(
+		this.streamingComponent = new QuietAssistantMessage(
+			this.currentTurnState,
 			undefined,
 			this.hideThinkingBlock,
 			this.getMarkdownThemeWithSettings(),
@@ -7174,6 +7188,7 @@ export class InteractiveMode {
 			},
 		);
 		this.streamingMessage = message;
+		giveLane(this.streamingComponent, this.turnFlow.subagentLane.tracker.lane);
 		this.chatContainer.addChild(this.streamingComponent);
 		this.streamingComponent.updateContent(this.streamingMessage, true);
 	}
@@ -7803,7 +7818,7 @@ export class InteractiveMode {
 		}
 		// The first Esc on an idle empty prompt says what a second one would do.
 		if (this.escapeRepeatAction === "tree" && !this.hasInterruptibleWork() && this.editor.getText().length === 0) {
-			const escKey = keyText("app.input.clear", { primaryOnly: true });
+			const escKey = keyText("app.input.clear");
 			return `再按一次 ${escKey || "Esc"} 回退到之前的消息`;
 		}
 		const text = this.editor.getExpandedText?.() ?? this.editor.getText();
@@ -7845,13 +7860,10 @@ export class InteractiveMode {
 			// Just compacted: the size is measured again with the next reply.
 			context = { warn: false };
 		}
-		const branch = this.footerDataProvider.getGitBranch();
-		const location = [formatSplashCwd(this.getCurrentCwd()), branch ?? undefined].filter(Boolean).join(" · ");
 		return {
 			model: model.id,
 			...(level ? { level } : {}),
 			...(context ? { context } : {}),
-			...(location ? { location } : {}),
 			// The strip under the prompt already shows a block per child.
 			subagents: this.subagentSummaryLine.hasChipRow() ? 0 : this.subagentCounts.running,
 			right: this.statusBarRight(),
@@ -7860,8 +7872,8 @@ export class InteractiveMode {
 	}
 
 	/** The subagent spend cell's forms for the status bar, fullest first; none without a figure or a connection. */
-	private statusBarSpendCell(): string[] {
-		return this.connectionLost ? [] : renderSubagentSpendCell(this.subagentSummaryLine.getSubagentSpend());
+	private statusBarSpendCell(color?: ThemeColor): string[] {
+		return this.connectionLost ? [] : renderSubagentSpendCell(this.subagentSummaryLine.getSubagentSpend(), color);
 	}
 
 	/**
@@ -7873,72 +7885,48 @@ export class InteractiveMode {
 		const toast = this.footerToast;
 		const toastChip =
 			toast && toast.until > Date.now() ? `${theme.bg("toastBg", theme.fg("toastText", ` ${toast.text} `))} ` : "";
-		const dot = theme.fg("dim", " · ");
 		const state = this.currentTurnState;
 		const working = this.isAgentStreaming() || this.turnFlow.hasLiveBox();
-		const spendCell = this.statusBarSpendCell();
 		const layout = (forms: string[], spendBearing: string[] = []) =>
 			[...spendBearing, ...forms].map((form) => `${toastChip}${form}`);
 		if (working || this.isAgentCompacting()) {
 			const startedAt = this.workingStartedAt ?? this.turnStartedAt;
 			const elapsed = state ? state.turnDurationMs() : startedAt !== undefined ? Date.now() - startedAt : 0;
 			const tokens = state ? state.timeline.outputTokens() : this.activityTracker.getStatus().tokens;
-			const label = working ? "工作中" : "整理上下文";
-			const spinner = theme.bold(theme.fg("activityAccent", spinnerFrame(getSpinnerTick())));
-			const clock = theme.fg("muted", formatBoxDuration(elapsed));
-			const figure = theme.fg("muted", `↓ ${formatBoxTokens(tokens)}`);
-			const escKey = keyText("app.input.clear", { primaryOnly: true });
-			const stop = escKey ? `${dot}${theme.fg("dim", `${escKey} 停止`)}` : "";
-			const head = `${spinner} ${theme.fg("activityText", label)}`;
-			const counted = `${head}${dot}${clock}${dot}${figure}${theme.fg("dim", " tokens")}`;
 			return layout(
-				[
-					`${counted}${stop}`,
-					`${head}${dot}${clock}${dot}${figure}${stop}`,
-					`${head}${dot}${clock}${dot}${figure}`,
-					`${head}${dot}${clock}`,
-				],
-				spendCell.map((cell) => `${counted}${dot}${cell}${stop}`),
+				workingRunForms({
+					label: working ? "工作中" : "整理上下文",
+					spinner: spinnerFrame(getSpinnerTick()),
+					elapsedMs: elapsed,
+					outputTokens: tokens,
+					stopKey: keyText("app.input.clear") || undefined,
+					spendCells: this.statusBarSpendCell("timelineLive"),
+				}),
 			);
 		}
-		const session =
-			this.sessionOutputTokens !== undefined && this.sessionOutputTokens > 0
-				? theme.fg("dim", `本会话 ↓ ${formatBoxTokens(this.sessionOutputTokens)}`)
-				: "";
 		if (this.connectionLost) return layout([`${theme.fg("error", "✗")} ${theme.fg("muted", "和后台的连接断了")}`]);
 		const last = this.liveTurnFlowStore?.lastFinished;
 		if (last) {
-			const stopped = last.timeline.stopped;
-			const head = stopped
-				? `${theme.fg("dim", "■")} ${theme.fg("muted", "已停止")}`
-				: last.timeline.errorEnded
-					? `${theme.fg("error", "✗")} ${theme.fg("muted", "出错")}`
-					: `${theme.fg("diffAddedText", "✓")} ${theme.fg("muted", "完成")}`;
-			const clock = theme.fg("muted", formatBoxDuration(last.turnDurationMs()));
-			const figure = theme.fg("muted", `↓ ${formatBoxTokens(last.timeline.outputTokens())}`);
-			const variants = [
-				`${head}${dot}${clock}${dot}${figure}${theme.fg("dim", " tokens")}`,
-				`${head}${dot}${clock}${dot}${figure}`,
-			];
-			if (session && !stopped) variants.unshift(`${variants[0]}${dot}${session}`);
-			const fullest = variants[0] ?? head;
-			variants.push(head);
 			return layout(
-				variants,
-				spendCell.map((cell) => `${fullest}${dot}${cell}`),
+				finishedRunForms({
+					outcome: last.timeline.stopped ? "stopped" : last.timeline.errorEnded ? "error" : "done",
+					elapsedMs: last.turnDurationMs(),
+					outputTokens: last.timeline.outputTokens(),
+					spendCells: this.statusBarSpendCell("timelineTime"),
+				}),
 			);
 		}
-		const quiet = session ? [`${session}${theme.fg("dim", " tokens")}`, session] : [""];
-		return layout(
-			quiet,
-			spendCell.map((cell) => (session ? `${quiet[0]}${dot}${cell}` : cell)),
-		);
+		return layout([""], this.statusBarSpendCell("timelineTime"));
 	}
 
 	/** The keys that work right now, most useful first; the hint line drops them from the end. */
 	private getTrayHints(): string[] {
-		const hint = (keybinding: AppKeybinding, label: string): string | undefined => {
-			const key = keyText(keybinding, { primaryOnly: true });
+		const hint = (
+			keybinding: AppKeybinding,
+			label: string,
+			options: KeyTextOptions = { primaryOnly: true },
+		): string | undefined => {
+			const key = keyText(keybinding, options);
 			return key ? `${key} ${label}` : undefined;
 		};
 		// ← only reaches the session list from an empty prompt; with text it moves the cursor.
@@ -7959,7 +7947,11 @@ export class InteractiveMode {
 			return quietHints.filter((entry): entry is string => entry !== undefined);
 		}
 		const hints = this.isAgentStreaming()
-			? [hint("app.input.clear", "中断"), hint("app.tools.expand", "过程"), hint("app.thinking.toggle", "Thinking")]
+			? [
+					hint("app.input.clear", "中断", {}),
+					hint("app.tools.expand", "过程"),
+					hint("app.thinking.toggle", "Thinking"),
+				]
 			: !this.isNewChat()
 				? [
 						hint("app.tools.expand", "过程"),
@@ -8188,12 +8180,13 @@ export class InteractiveMode {
 			this.chatContainer.addChild(new Spacer(1));
 		}
 		this.chatContainer.addChild(
-			new UserMessageComponent(
-				text,
-				this.getMarkdownThemeWithSettings(),
-				(name) => this.isRecognizedSlashCommand(name),
-				Date.now(),
-			),
+			createUserMessage(text, {
+				markdownTheme: this.getMarkdownThemeWithSettings(),
+				isRecognizedSlashCommand: (name) => this.isRecognizedSlashCommand(name),
+				sentAt: Date.now(),
+				quiet: quietConversation(this),
+				lane: this.turnFlow.subagentLane.tracker.lane,
+			}),
 		);
 	}
 
@@ -8227,10 +8220,15 @@ export class InteractiveMode {
 		if (message.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE) {
 			return new MalformedRefinementOutcomeMessageComponent();
 		}
+		// A subagent that ended, failed or went quiet is a row of the timeline: out of sight unless it failed.
+		const noticeRow = quietConversation(this) ? subagentNoticeRow(message, this.turnFlow.subagentLane) : undefined;
+		if (noticeRow) return noticeRow;
 		if (isAgentSessionMessage(message)) {
-			return new AgentMessageComponent(message, this.getMarkdownThemeWithSettings(), {
-				suppressLeadingSpace: isCompactAgentMessageNeighbor(this.chatContainer.children.at(-1)),
-				inset: this.isInsideQuietTurn() ? AGENT_MESSAGE_TURN_INSET : 0,
+			return createAgentMessageRow(message, {
+				markdownTheme: this.getMarkdownThemeWithSettings(),
+				quiet: quietConversation(this),
+				lane: this.turnFlow.subagentLane,
+				previous: lastDrawnComponent(this.chatContainer.children),
 			});
 		}
 		if (isInjectedPromptMessage(message)) {
@@ -8245,7 +8243,10 @@ export class InteractiveMode {
 		);
 	}
 
-	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
+	private addMessageToChat(
+		message: AgentMessage,
+		options?: { populateHistory?: boolean; round?: TurnActivityState; inlineIn?: TurnSummaryComponent },
+	): void {
 		if (message.role === "assistant") this.lastAssistantStopReason = message.stopReason;
 		switch (message.role) {
 			case "bashExecution": {
@@ -8277,7 +8278,15 @@ export class InteractiveMode {
 					if (isSessionSlashCommandMessage(message) && this.chatContainer.children.length > 0) {
 						this.chatContainer.addChild(new Spacer(1));
 					}
-					this.chatContainer.addChild(component);
+					// A report that joined the running round is a row of that turn, not of the chat's end.
+					if (!this.turnFlow.placeRow(component, Number(message.timestamp) || Date.now(), options?.inlineIn)) {
+						// A memory line after a finished request goes above its closing row, which stays the last line.
+						if (message.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE) {
+							this.turnFlow.addRowAboveClosingRow(component);
+						} else {
+							this.chatContainer.addChild(component);
+						}
+					}
 				}
 				break;
 			}
@@ -8331,21 +8340,23 @@ export class InteractiveMode {
 						component.setExpanded(this.toolOutputExpanded);
 						this.chatContainer.addChild(component);
 						if (skillBlock.userMessage) {
-							const userComponent = new UserMessageComponent(
-								skillBlock.userMessage,
-								this.getMarkdownThemeWithSettings(),
-								(name) => this.isRecognizedSlashCommand(name),
-								Number(message.timestamp) || undefined,
-							);
+							const userComponent = createUserMessage(skillBlock.userMessage, {
+								markdownTheme: this.getMarkdownThemeWithSettings(),
+								isRecognizedSlashCommand: (name) => this.isRecognizedSlashCommand(name),
+								sentAt: Number(message.timestamp) || undefined,
+								quiet: quietConversation(this),
+								lane: this.turnFlow.subagentLane.tracker.lane,
+							});
 							this.chatContainer.addChild(userComponent);
 						}
 					} else {
-						const userComponent = new UserMessageComponent(
-							textContent,
-							this.getMarkdownThemeWithSettings(),
-							(name) => this.isRecognizedSlashCommand(name),
-							Number(message.timestamp) || undefined,
-						);
+						const userComponent = createUserMessage(textContent, {
+							markdownTheme: this.getMarkdownThemeWithSettings(),
+							isRecognizedSlashCommand: (name) => this.isRecognizedSlashCommand(name),
+							sentAt: Number(message.timestamp) || undefined,
+							quiet: quietConversation(this),
+							lane: this.turnFlow.subagentLane.tracker.lane,
+						});
 						this.chatContainer.addChild(userComponent);
 					}
 					if (options?.populateHistory) {
@@ -8355,7 +8366,8 @@ export class InteractiveMode {
 				break;
 			}
 			case "assistant": {
-				const assistantComponent = new AssistantMessageComponent(
+				const assistantComponent = new QuietAssistantMessage(
+					options?.round,
 					message,
 					this.hideThinkingBlock,
 					this.getMarkdownThemeWithSettings(),
@@ -8375,6 +8387,7 @@ export class InteractiveMode {
 						quiet: this.settingsManager.getProcessMode() === "quiet",
 					},
 				);
+				giveLane(assistantComponent, this.turnFlow.subagentLane.tracker.lane);
 				this.chatContainer.addChild(assistantComponent);
 				break;
 			}
@@ -8465,6 +8478,36 @@ export class InteractiveMode {
 		// sent agent messages inside ipython tool details), deduped by id.
 		const replaySentCommIds = new Set<string>();
 		const replayQuiet = this.settingsManager.getProcessMode() === "quiet";
+		// A rebuild replays the question from its start: who is still out is learned again as it goes,
+		// and what the replay cannot see (a dispatch compacted away or outside the window) is taken back.
+		// A view that has learned nothing of its own (a window just opened on a running session) takes
+		// the subagents the session says are running as out since the start of what it shows.
+		let windowStartAt = Number.POSITIVE_INFINITY;
+		for (const message of windowed) {
+			const at = Number(message.timestamp);
+			if (Number.isFinite(at) && at > 0) windowStartAt = Math.min(windowStartAt, at);
+		}
+		const laneBefore = this.turnFlow.seedLane(
+			this.turnFlow.captureLane(),
+			this.subagentSnapshots?.values() ?? [],
+			Number.isFinite(windowStartAt) ? windowStartAt : Date.now(),
+		);
+		this.turnFlow.subagentLane.reset();
+		// The reports the conversation received are learned again too, the ones the window left out first.
+		// A compaction folded some away for good: what this view learned before that stays known.
+		const compacted = transcriptMessages.some((message) => message.role === "compactionSummary");
+		const reportsBefore = compacted ? this.turnFlow.reports.snapshot() : [];
+		this.turnFlow.reports.clear();
+		this.turnFlow.reports.restore(reportsBefore);
+		for (const message of transcriptMessages.slice(0, transcriptMessages.length - windowed.length)) {
+			this.turnFlow.reports.note(message);
+		}
+		// A replay with no question in it is a part of the question that is running.
+		if (!messagesToRender.some((message) => message.role === "user")) this.turnFlow.restoreLane(laneBefore);
+		const cutPrompt = cutTurn?.prompt;
+		const cutPromptIsAlone = !messagesToRender.slice(1).some((message) => message.role === "user");
+		// When the question the replay ends in began: an earlier dispatch is another question's.
+		let questionStartedAt: number | undefined;
 		const toolNames: string[] = [];
 		for (const message of messagesToRender) {
 			if (message.role !== "assistant") {
@@ -8521,6 +8564,14 @@ export class InteractiveMode {
 		let replayResultStop = NO_STEP_STOP;
 		// The next turn's opener is a message the user sent, unless it is a stored heartbeat prompt.
 		let replayStartedByUser = true;
+		// The owner's prompt opened the turn about to start: a report landing before its first reply does not take it over.
+		let replayPromptOpened = false;
+		// The quiet timeline's round ends where its own last message landed, not when whatever came after it began.
+		let replayRoundEndedAt: number | undefined;
+		const noteReplayRoundAt = (message: AgentMessage): void => {
+			const at = Number(message.timestamp);
+			if (replayQuiet && Number.isFinite(at) && at > 0) replayRoundEndedAt = Math.max(replayRoundEndedAt ?? 0, at);
+		};
 		const closeReplayTurn = (): void => {
 			if (!replayQuiet || !replayTurnState || !replayTurnSummary) return;
 			replayTurnState.timeline.stopped = lastReplayAssistant?.stopReason === "aborted" || replayResultStop.stopped;
@@ -8528,30 +8579,63 @@ export class InteractiveMode {
 			this.turnFlow.attachStrip(replayTurnSummary);
 		};
 
+		// What woke the turn about to start; the turn takes it when its first reply comes.
+		let replayCause: WakeCause | undefined;
+		// The run goes on inside the tool loop: a message right after a step's results belongs to the same turn.
+		const insideReplayToolLoop = (): boolean =>
+			replayQuiet &&
+			replayTurnState !== undefined &&
+			lastReplayAssistant?.stopReason === "toolUse" &&
+			replayResultsArrived &&
+			!replayResultStop.endsTurn;
+		// A report is inside the round while its step runs too, though its result comes after it in the transcript.
+		const insideReplayRound = (): boolean =>
+			insideReplayToolLoop() ||
+			(replayQuiet && replayTurnState !== undefined && awaitsStepResults(lastReplayAssistant, replayResultsArrived));
+
 		for (const message of messagesToRender) {
+			// A message that wakes the AI after its turn ended starts the next turn: the answer the turn
+			// ended on stays its own, and the woken turn never folds it away (a live run does the same).
+			if (replayQuiet && isWakeMessage(message) && insideReplayRound()) noteWakeInRound(replayTurnState, message);
+			if (replayQuiet && isWakeMessage(message) && !insideReplayRound() && !replayPromptOpened) {
+				replayCause ??= new WakeCause(this.turnFlow.reports);
+				replayCause.add(message);
+				replayTurnState?.markTurnEnded(replayRoundEndedAt ?? (Number(message.timestamp) || Date.now()));
+				closeReplayTurn();
+				replayTurnState = undefined;
+				replayTurnSummary = undefined;
+				lastReplayAssistant = undefined;
+				replaySentCommIds.clear();
+				replayStartedByUser = false;
+			}
+			this.turnFlow.reports.note(message);
 			if (message.role === "user") {
 				// A message typed while the AI was between its steps is an
 				// interjection inside that turn's box, not a new turn.
-				if (
-					replayQuiet &&
-					replayTurnState &&
-					lastReplayAssistant?.stopReason === "toolUse" &&
-					replayResultsArrived &&
-					!replayResultStop.endsTurn
-				) {
+				if (replayTurnState && insideReplayToolLoop()) {
 					const text = this.getUserMessageText(message).trim() || "[图片]";
 					replayTurnState.timeline.addSteer(text, Number(message.timestamp) || Date.now());
+					noteReplayRoundAt(message);
 					continue;
 				}
 				// Freeze the previous turn's clock (thinking-only turns have no
 				// steps to settle) before the next turn starts.
-				replayTurnState?.markTurnEnded(Number(message.timestamp) || Date.now());
+				replayTurnState?.markTurnEnded(replayRoundEndedAt ?? (Number(message.timestamp) || Date.now()));
 				closeReplayTurn();
 				replayTurnState = undefined;
 				replayTurnSummary = undefined;
 				lastReplayAssistant = undefined;
 				replaySentCommIds.clear();
 				replayStartedByUser = !this.createLegacyHeartbeatPromptMessage(message, this.getUserMessageText(message));
+				replayPromptOpened = replayStartedByUser;
+				// A new question: nobody is out yet (a stored heartbeat prompt is not one).
+				if (replayStartedByUser) {
+					this.turnFlow.subagentLane.reset();
+					questionStartedAt = Number(message.timestamp) || undefined;
+					// The prompt a window keeps of the question it cut into is the running question's own.
+					if (message === cutPrompt && cutPromptIsAlone) this.turnFlow.restoreLane(laneBefore, questionStartedAt);
+				}
+				replayCause = undefined;
 			}
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
@@ -8559,8 +8643,13 @@ export class InteractiveMode {
 				// first assistant component, and counts this message's thinking.
 				if (!replayTurnState) {
 					replayTurnState = new TurnActivityState(Number(message.timestamp) || Date.now());
+					replayRoundEndedAt = undefined;
 					replayTurnState.startedByUser = replayStartedByUser;
+					replayPromptOpened = false;
+					if (replayCause) assignWakeCause(replayTurnState, replayCause);
+					replayCause = undefined;
 					replayTurnSummary = this.createTurnSummary(replayTurnState);
+					giveLaneTracker(replayTurnSummary, this.turnFlow.subagentLane.tracker);
 					replayTurnSummary.setExpanded(this.toolOutputExpanded);
 					// TUI v4: quiet turns carry the one-line footnote at their head.
 					replayTurnSummary.setQuiet(replayQuiet);
@@ -8580,12 +8669,13 @@ export class InteractiveMode {
 				replayTurnState.modelId = message.model || replayTurnState.modelId;
 				replayTurnState.addThinkingSegments(countThinkingSegments(message));
 				replayTurnState.latestThinking = latestThinkingText(message) || replayTurnState.latestThinking;
-				replayTurnState.timeline.noteMessage(message, true);
+				replayTurnState.timeline.noteMessage(message, true, true);
 				replayTurnState.noteReplyAt(Number(message.timestamp));
+				noteReplayRoundAt(message);
 				lastReplayAssistant = message;
 				replayResultsArrived = false;
 				replayResultStop = NO_STEP_STOP;
-				this.addMessageToChat(message);
+				this.addMessageToChat(message, { round: replayTurnState });
 				// Render tool call components
 				for (const content of message.content) {
 					if (content.type === "toolCall") {
@@ -8662,6 +8752,7 @@ export class InteractiveMode {
 			} else if (message.role === "toolResult") {
 				replayResultsArrived = true;
 				replayResultStop = stepResultStop(message);
+				noteReplayRoundAt(message);
 				// Match tool results to pending tool components
 				const component = renderedPendingTools.get(message.toolCallId);
 				if (component) {
@@ -8699,11 +8790,18 @@ export class InteractiveMode {
 						replayTurnSummary?.addCommMessage();
 					}
 				}
+			} else if (replayQuiet && isSubagentNoticeMessage(message)) {
+				// A subagent that ended, failed or went quiet: a row of the timeline, out of sight unless it failed.
+				this.addMessageToChat(message, {
+					...renderOptions,
+					...(isWakeMessage(message) && insideReplayRound() && replayTurnSummary
+						? { inlineIn: replayTurnSummary }
+						: {}),
+				});
 			} else if (replayQuiet && replayTurnState && message.role === "custom" && isBoxNoticeMessage(message)) {
-				// The box says it as its own row (a subagent that finished, a compaction that waited).
+				// The box says it as its own row (a compaction that waited).
 				const record = boxRecordFromMessage(message);
 				const at = Number(message.timestamp) || 0;
-				if (record?.kind === "notice") replayTurnState.timeline.addNotice(record.notice, at);
 				if (record?.kind === "compaction") replayTurnState.timeline.addReplayCompaction(at, record.facts);
 			} else if (replayQuiet && replayTurnState && message.role === "compactionSummary") {
 				// Inside a turn the compaction is a row of its box.
@@ -8715,8 +8813,13 @@ export class InteractiveMode {
 				if (isAgentSessionMessage(message) && message.display) {
 					replayTurnSummary?.addCommMessage();
 				}
-				// All other messages use standard rendering
-				this.addMessageToChat(message, renderOptions);
+				// All other messages use standard rendering; a report inside the tool loop goes into its turn.
+				this.addMessageToChat(message, {
+					...renderOptions,
+					...(replayQuiet && isWakeMessage(message) && insideReplayRound() && replayTurnSummary
+						? { inlineIn: replayTurnSummary }
+						: {}),
+				});
 			}
 		}
 		// Within a box turn only the last reply's answer stays under the box, and a
@@ -8732,6 +8835,8 @@ export class InteractiveMode {
 		}
 		// Carry each box's live-only facts and open rows over to its replayed twin.
 		this.turnFlow.carryOver(carriedBoxes, { keepHistory: options.keepCompactedHistory === true });
+		this.turnFlow.restoreLane(laneBefore, questionStartedAt);
+		this.turnFlow.noteTaskLabels(this.subagentSnapshots?.values() ?? []);
 		if (replayTurnState && (renderedPendingTools.size > 0 || this.isAgentStreaming())) {
 			// Attaching mid-run: live tool and thinking events keep feeding this
 			// turn's group, so the replayed state stays the live one - and stays
@@ -8741,7 +8846,9 @@ export class InteractiveMode {
 			replayTurnState.live = true;
 		} else {
 			// The last replayed turn has no following user prompt; freeze its clock.
-			replayTurnState?.markTurnEnded(Number(messagesToRender.at(-1)?.timestamp) || Date.now());
+			replayTurnState?.markTurnEnded(
+				replayRoundEndedAt ?? (Number(messagesToRender.at(-1)?.timestamp) || Date.now()),
+			);
 			closeReplayTurn();
 			// Nothing is live: a turn object from before this render is gone from the chat.
 			this.currentTurnState = undefined;
@@ -9793,7 +9900,7 @@ export class InteractiveMode {
 			this.focusEditor();
 			return true;
 		}
-		const summary = this.latestTurnSummary();
+		const summary = this.latestShownTurnSummary();
 		if (!summary?.state.boxMode) {
 			this.showToast("还没有可以看的步骤");
 			return true;
@@ -10341,18 +10448,6 @@ export class InteractiveMode {
 		return true;
 	}
 
-	/** Whether the chat's tail is a quiet turn (its summary comes after the latest user message). */
-	private isInsideQuietTurn(): boolean {
-		if (this.settingsManager.getProcessMode() !== "quiet") return false;
-		const children = this.chatContainer.children;
-		for (let i = children.length - 1; i >= 0; i--) {
-			const child = children[i];
-			if (child instanceof TurnSummaryComponent) return true;
-			if (child instanceof UserMessageComponent) return false;
-		}
-		return false;
-	}
-
 	private latestTurnSummary(): TurnSummaryComponent | undefined {
 		const children = this.chatContainer.children;
 		for (let i = children.length - 1; i >= 0; i--) {
@@ -10362,6 +10457,11 @@ export class InteractiveMode {
 			}
 		}
 		return undefined;
+	}
+
+	/** The newest turn the chat draws: the keys act on what the owner sees, not on a round that is left out. */
+	private latestShownTurnSummary(): TurnSummaryComponent | undefined {
+		return latestShownTurn(this.chatContainer.children);
 	}
 
 	/**
@@ -10386,19 +10486,22 @@ export class InteractiveMode {
 		}
 		const state = summary.state;
 		summary.setExpanded(!state.isCollapsed);
+		const lanes = {
+			// A box shows its thinking as its own rows, never again in the answer.
+			thinking: !state.boxMode && state.thinkingExpanded,
+			// A box opens its own rows; the cards after it keep their own state.
+			tools: !state.boxMode && !state.isCollapsed,
+			agentMessages: state.agentMessagesExpanded,
+			editDiffs: !state.boxMode && !state.isCollapsed,
+		};
+		// The reports that landed inside the turn are its own rows, not children of the chat.
+		summary.forEachInlineRow((row) => applyExpansionLanes(row, lanes));
 		for (let i = start + 1; i < children.length; i++) {
 			const child = children[i];
 			if (child instanceof TurnSummaryComponent) {
 				break;
 			}
-			applyExpansionLanes(child, {
-				// A box shows its thinking as its own rows, never again in the answer.
-				thinking: !state.boxMode && state.thinkingExpanded,
-				// A box opens its own rows; the cards after it keep their own state.
-				tools: !state.boxMode && !state.isCollapsed,
-				agentMessages: state.agentMessagesExpanded,
-				editDiffs: !state.boxMode && !state.isCollapsed,
-			});
+			applyExpansionLanes(child, lanes);
 		}
 		return true;
 	}
@@ -10408,7 +10511,7 @@ export class InteractiveMode {
 		// calls, outputs, and edit diffs ride the same expanded state. The plain
 		// key acts on the latest turn; Alt+O acts globally (K3 ②).
 		if (!global) {
-			const summary = this.latestTurnSummary();
+			const summary = this.latestShownTurnSummary();
 			if (summary?.state.boxMode && summary.state.boxView().rows.length === 0) {
 				this.showToast("这一轮没有可以展开的步骤");
 				return;
@@ -10514,7 +10617,7 @@ export class InteractiveMode {
 
 	/** A new turn head, wired so its own clicks apply like the keys. */
 	private createTurnSummary(state: TurnActivityState): TurnSummaryComponent {
-		const summary = new TurnSummaryComponent(state);
+		const summary = new QuietTurnSummary(state);
 		summary.setOnLanesChange(() => this.handleTurnLanesClicked(summary));
 		summary.setTimelineHost(this.timelineHost());
 		return summary;
@@ -10562,7 +10665,7 @@ export class InteractiveMode {
 		// not mutually exclusive); only the conversation-wide fallback below
 		// (no turn at all, or nothing anywhere for Alt+P) says why nothing moved.
 		if (!global) {
-			const summary = this.latestTurnSummary();
+			const summary = this.latestShownTurnSummary();
 			if (summary) {
 				const next = !summary.state.agentMessagesExpanded;
 				summary.state.agentMessagesExpanded = next;
@@ -10635,6 +10738,8 @@ export class InteractiveMode {
 					agentMessages: state.agentMessagesExpanded,
 					editDiffs: !state.boxMode && !state.isCollapsed,
 				};
+				const lanes = turnLanes;
+				child.forEachInlineRow((row) => applyExpansionLanes(row, lanes));
 				continue;
 			}
 			applyExpansionLanes(child, turnLanes ?? globalLanes);
@@ -10672,7 +10777,7 @@ export class InteractiveMode {
 			return;
 		}
 		if (!global) {
-			const summary = this.latestTurnSummary();
+			const summary = this.latestShownTurnSummary();
 			if (summary && !turnHasThinking(summary)) {
 				this.showToast("这一轮没有思考内容");
 				return;

@@ -78,9 +78,9 @@ describe("assistant message quiet gate", () => {
 		setKeybindings(new KeybindingsManager());
 	});
 
-	test("quiet folds only the pre-tool preamble; text after the tool call stays visible (P1-1)", () => {
-		// One message that talks before AND after the tool call: the preamble
-		// folds, the closing narrative (the same message's conclusion) renders.
+	test("quiet folds all text of a message with tool calls; the timeline's event row is the one that says it", () => {
+		// One message that talks before AND after the tool call: both are the
+		// event row's, so neither repeats here as an answer.
 		const message = narration();
 		message.content = [
 			{ type: "text", text: "先查一下。" },
@@ -95,7 +95,8 @@ describe("assistant message quiet gate", () => {
 		const component = new AssistantMessageComponent(message, false, undefined, "思考", { quiet: true });
 		const rendered = render(component);
 		expect(rendered).not.toContain("先查一下。");
-		expect(rendered).toContain("结论：目录里有三个文件，可以收工。");
+		expect(rendered).not.toContain("结论：目录里有三个文件，可以收工。");
+		expect(rendered).toBe("");
 	});
 
 	test("quiet folds intermediate narration (text + tool call) to zero lines", () => {
@@ -150,7 +151,14 @@ describe("assistant message quiet gate", () => {
 		const quietText = quiet.map((c) => stripAnsi(c.render(100).join("\n")).trim());
 		const legacyText = legacy.map((c) => stripAnsi(c.render(100).join("\n")).trim());
 
-		expect(quietText.join("\n")).not.toContain("我先列出 /tmp 下按修改时间排序");
+		// Quiet: the narration of a step is a timeline event row (◆), never part of the answer (┃).
+		const quietLines = quietText.join("\n").split("\n");
+		const narrationLines = quietLines.filter((line) => line.includes("我先列出 /tmp 下按修改时间排序"));
+		expect(narrationLines.length).toBeGreaterThan(0);
+		for (const line of narrationLines) {
+			expect(line).toContain("◆");
+			expect(line).not.toContain("┃");
+		}
 		expect(legacyText.join("\n")).toContain("我先列出 /tmp 下按修改时间排序");
 	});
 });

@@ -1,4 +1,5 @@
 import type { AssistantMessage, AssistantMessageEvent } from "@earendil-works/pi-ai";
+import type { KernelActivity } from "../../../core/kernel/shared.js";
 import {
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CompactionOutcomeDetails,
@@ -10,6 +11,7 @@ import {
 	type RlmChildStallNoticeDetails,
 	type RlmChildTerminalNoticeDetails,
 } from "../../../core/messages.js";
+import { shortAgentName } from "./agent-message.js";
 import { sanitizeDisplayText } from "./diff-rows.js";
 import {
 	emptyStepFeedData,
@@ -18,6 +20,9 @@ import {
 	mergeStepResult,
 	type StepFeedData,
 } from "./feed-data.js";
+import { stripInlineMarkdown } from "./inline-markdown.js";
+import type { TimelineLane } from "./timeline-gutter.js";
+import type { LaneOwner, LaneSpans, TimelineLaneTracker } from "./timeline-lane.js";
 
 /**
  * Everything one assistant turn's box shows, in the order it happened: the
@@ -40,6 +45,14 @@ export interface TimelineRetry {
 	finalError?: string;
 }
 
+/** What is known about how a compaction ended when it did not simply finish. */
+export interface CompactionFacts {
+	before?: number;
+	failed?: string;
+	skipped?: boolean;
+	cancelled?: boolean;
+}
+
 export interface TimelineCompaction {
 	startedAt: number;
 	endedAt?: number;
@@ -50,6 +63,8 @@ export interface TimelineCompaction {
 	failed?: string;
 	/** Not a failure: the session chose to wait (the conversation is too short). */
 	skipped?: boolean;
+	/** Not a failure either: the owner cancelled it. */
+	cancelled?: boolean;
 	/** Rebuilt from the transcript; a live row of the same turn is the richer record. */
 	fromReplay?: boolean;
 }
@@ -66,6 +81,10 @@ export interface TimelineNotice {
 export interface TimelineSubagent {
 	childId: string;
 	name: string;
+	/** The task it was given, in a few words (its short tag comes from this). */
+	label?: string;
+	/** The key it is on the subagent lane by (`laneKey`): the name a report from it is released under; empty: not on the lane. */
+	laneName?: string;
 	status: "running" | "done" | "failed";
 	/** What it is doing now, in plain words. */
 	line?: string;
@@ -75,6 +94,11 @@ export interface TimelineSubagent {
 	report?: string;
 	startedAt: number;
 	endedAt?: number;
+}
+
+/** The key a subagent is on the lane by. */
+function subagentLane(sub: TimelineSubagent): string {
+	return sub.laneName ?? sub.name;
 }
 
 export type TimelineEntry =
@@ -126,6 +150,26 @@ export function firstSentence(text: string): string {
 	return sanitizeDisplayText((match?.[1] ?? match?.[2] ?? flat).trim());
 }
 
+/**
+ * The first sentence of a thought as words for the live tail: markup lines (a table,
+ * a code fence and what it holds, a rule) are skipped and a heading, quote or list
+ * marker is stripped, so the screen never shows raw markdown. "" when nothing is prose.
+ */
+export function thoughtSentence(text: string): string {
+	let inFence = false;
+	for (const raw of text.split("\n")) {
+		const line = raw.trim();
+		if (line.startsWith("```") || line.startsWith("~~~")) {
+			inFence = !inFence;
+			continue;
+		}
+		if (inFence || line === "" || line.startsWith("|") || /^[-=*_]{3,}$/.test(line)) continue;
+		const words = stripInlineMarkdown(line.replace(/^(?:#{1,6}\s+|>+\s*|[-*+]\s+|\d+[.)]\s+)+/, "")).trim();
+		if (words) return firstSentence(words);
+	}
+	return "";
+}
+
 let boxIdCounter = 0;
 
 /**
@@ -163,8 +207,11 @@ export class TimelineUiState {
 	/** Bring this row into the body's view on the next render (its opened lines too, when `revealDetail`). */
 	revealKey: string | undefined;
 	revealDetail = false;
+	/** Open rows and events (`ev:` keys), and events listing every step (`all:` keys). */
 	readonly expanded = new Set<string>();
 	readonly expandedAt = new Map<string, number>();
+	/** The lane the turn started in (subagents of earlier turns still out), taken when the lane tracker was first given. */
+	startLane: TimelineLane | undefined;
 	readonly enteredAt = new Map<string, number>();
 	readonly settledAt = new Map<string, number>();
 	readonly rowStatus = new Map<string, string>();
@@ -254,6 +301,14 @@ export class TimelineUiState {
 		return true;
 	}
 
+	/** Fold every event's step list (the turn ended); what the user opened inside a step stays with its step. */
+	collapseEvents(): void {
+		for (const key of [...this.expanded]) {
+			if (key.startsWith("ev:") || key.startsWith("all:")) this.expanded.delete(key);
+		}
+		this.bump();
+	}
+
 	/** Back to following the newest line. */
 	followNewest(): void {
 		this.follow = true;
@@ -262,7 +317,7 @@ export class TimelineUiState {
 	}
 }
 
-export class TurnTimeline {
+export class TurnTimeline implements LaneOwner {
 	readonly ui = new TimelineUiState();
 	readonly entries: TimelineEntry[] = [];
 	readonly stepData = new Map<string, StepFeedData>();
@@ -277,6 +332,11 @@ export class TurnTimeline {
 	finishedAt: number | undefined;
 	/** Steps of this turn the reopen window left out (its box says how many). */
 	earlierSteps = 0;
+	/** Who was out when, in the question this turn belongs to: what its lines read the lane from. */
+	laneSpans: LaneSpans | undefined;
+	private tracker: TimelineLaneTracker | undefined;
+	/** The task each subagent record was started with, kept until the record names the child. */
+	private readonly spawnTasks = new Map<string, string>();
 	/** Commands the step's code waits on through a handle, resolved from earlier cells. */
 	readonly stepHandleContext = new Map<string, ReadonlyMap<string, string>>();
 	private seq = 0;
@@ -289,9 +349,32 @@ export class TurnTimeline {
 		return this.seq;
 	}
 
-	/** Upsert one assistant message (streaming updates replace the stored reference). */
-	noteMessage(message: AssistantMessage, ended: boolean): void {
-		const key = `m:${message.timestamp}`;
+	/** Told of every subagent this turn dispatches, as it is noted (not when it is drawn). */
+	get laneTracker(): TimelineLaneTracker | undefined {
+		return this.tracker;
+	}
+
+	set laneTracker(tracker: TimelineLaneTracker | undefined) {
+		this.tracker = tracker;
+		this.laneSpans = tracker?.spans;
+	}
+
+	/**
+	 * The key of the newest row noted for a message stamped `timestamp`; `fresh` is the key a message
+	 * starting now gets (two messages can share a millisecond, and the later one is its own row).
+	 */
+	messageKey(timestamp: number, fresh = false): string {
+		const base = `m:${timestamp}`;
+		const same = this.entries.filter(
+			(entry) => entry.kind === "message" && (entry.key === base || entry.key.startsWith(`${base}#`)),
+		).length;
+		const index = fresh ? same + 1 : Math.max(1, same);
+		return index === 1 ? base : `${base}#${index}`;
+	}
+
+	/** Upsert one assistant message (streaming updates replace the stored reference); `fresh` starts a new row. */
+	noteMessage(message: AssistantMessage, ended: boolean, fresh = false): void {
+		const key = this.messageKey(message.timestamp, fresh);
 		const existing = this.entries.find((entry) => entry.kind === "message" && entry.key === key);
 		if (existing && existing.kind === "message") {
 			existing.message = message;
@@ -321,7 +404,7 @@ export class TurnTimeline {
 
 	/** Live stream events time the thinking blocks and measure their tokens from usage. */
 	noteStreamEvent(message: AssistantMessage, event: AssistantMessageEvent, now = Date.now()): void {
-		const messageKey = `m:${message.timestamp}`;
+		const messageKey = this.messageKey(message.timestamp);
 		if (event.type === "thinking_start" || event.type === "thinking_delta") {
 			const key = `${messageKey}:${event.contentIndex}`;
 			if (!this.thinkingTiming.has(key)) {
@@ -344,7 +427,7 @@ export class TurnTimeline {
 	}
 
 	private closeThinking(message: AssistantMessage, now: number): void {
-		const prefix = `m:${message.timestamp}:`;
+		const prefix = `${this.messageKey(message.timestamp)}:`;
 		for (const [key, timing] of this.thinkingTiming) {
 			if (key.startsWith(prefix) && timing.endedAt === undefined) {
 				timing.endedAt = now;
@@ -371,8 +454,94 @@ export class TurnTimeline {
 		partial: boolean,
 	): void {
 		const previous = this.stepData.get(toolCallId) ?? emptyStepFeedData();
-		this.stepData.set(toolCallId, mergeStepResult(previous, toolName, args, result, partial));
+		const merged = mergeStepResult(previous, toolName, args, result, partial);
+		this.stepData.set(toolCallId, merged);
+		this.noteSpawns(merged.activities);
 		this.ui.bump();
+	}
+
+	/**
+	 * A cell that started subagents (the kernel tracks each as a `subagent` record) dispatched them,
+	 * whichever way it did it. A record first says `running` under the task's own words while the
+	 * child is admitted, then turns `ok` under its session name (or `error` when it never started):
+	 * only a settled record with a name is a subagent, dispatched once, when no snapshot has told
+	 * the timeline already. The task the record began with is kept as the child's task.
+	 */
+	private noteSpawns(activities: readonly KernelActivity[]): void {
+		for (const activity of activities) {
+			if (activity.kind !== "subagent") continue;
+			if (activity.status === "running") {
+				this.spawnTasks.set(activity.id, activity.label);
+				continue;
+			}
+			const name = activity.status === "ok" ? activity.label.trim() : "";
+			if (!name || this.entries.some((entry) => entry.kind === "subagent" && subagentLane(entry.sub) === name)) {
+				continue;
+			}
+			const task = this.spawnTasks.get(activity.id)?.trim();
+			this.upsertSubagent(
+				{
+					childId: `spawn:${name}`,
+					name,
+					laneName: name,
+					...(task ? { label: task } : {}),
+					status: "running",
+					startedAt: activity.startedAt,
+				},
+				activity.startedAt,
+			);
+		}
+	}
+
+	/** A subagent this turn dispatched came back (its report or notice reached the chat at `at`). */
+	subagentReturned(name: string, at: number): void {
+		for (const entry of this.entries) {
+			if (entry.kind !== "subagent" || subagentLane(entry.sub) !== name || entry.sub.status !== "running") continue;
+			entry.sub = { ...entry.sub, status: "done", endedAt: at };
+			this.ui.bump();
+		}
+	}
+
+	spawnedAt(name: string): number | undefined {
+		for (const entry of this.entries) {
+			if (entry.kind === "subagent" && subagentLane(entry.sub) === name) return entry.sub.startedAt;
+		}
+		return undefined;
+	}
+
+	/**
+	 * A rebuild replaced the lane's record with what its replay learned: the subagents this timeline
+	 * still shows as out are out again, unless the replay saw them come back.
+	 */
+	reseedLane(): void {
+		const tracker = this.tracker;
+		// An earlier question's box keeps the lane it was drawn with: nobody of it is out any more.
+		if (!tracker || this.laneSpans !== tracker.spans) return;
+		for (const entry of this.entries) {
+			if (entry.kind !== "subagent" || entry.sub.status !== "running") continue;
+			const name = subagentLane(entry.sub);
+			if (!name) continue;
+			const back = tracker.spans.returnedAt(name);
+			if (back !== undefined && back > entry.sub.startedAt) {
+				entry.sub = { ...entry.sub, status: "done", endedAt: back };
+			} else {
+				tracker.spawned([name], this);
+			}
+		}
+		this.ui.bump();
+	}
+
+	/** The task each child was given, as the session recorded it, for the subagents this timeline knows only by name. */
+	noteTaskLabels(labels: ReadonlyMap<string, string>): void {
+		let changed = false;
+		for (const entry of this.entries) {
+			if (entry.kind !== "subagent" || entry.sub.label !== undefined) continue;
+			const label = labels.get(subagentLane(entry.sub));
+			if (!label) continue;
+			entry.sub = { ...entry.sub, label };
+			changed = true;
+		}
+		if (changed) this.ui.bump();
 	}
 
 	addSteer(text: string, at: number): void {
@@ -434,18 +603,19 @@ export class TurnTimeline {
 		return undefined;
 	}
 
-	endCompaction(endedAt: number, facts: { before?: number; failed?: string; skipped?: boolean }): void {
+	endCompaction(endedAt: number, facts: CompactionFacts): void {
 		const compaction = this.activeCompaction();
 		if (!compaction) return;
 		compaction.endedAt = endedAt;
 		if (facts.before !== undefined) compaction.before = facts.before;
 		if (facts.failed) compaction.failed = facts.failed;
 		if (facts.skipped) compaction.skipped = true;
+		if (facts.cancelled) compaction.cancelled = true;
 		this.ui.bump();
 	}
 
 	/** A compaction the transcript records (its summary, or why it did not happen), settled. */
-	addReplayCompaction(at: number, facts: { before?: number; failed?: string; skipped?: boolean }): void {
+	addReplayCompaction(at: number, facts: CompactionFacts): void {
 		const key = `compact:replay:${at}`;
 		if (this.entries.some((entry) => entry.key === key)) return;
 		this.entries.push({
@@ -459,6 +629,7 @@ export class TurnTimeline {
 				...(facts.before !== undefined ? { before: facts.before } : {}),
 				...(facts.failed ? { failed: facts.failed } : {}),
 				...(facts.skipped ? { skipped: true } : {}),
+				...(facts.cancelled ? { cancelled: true } : {}),
 			},
 		});
 		this.ui.bump();
@@ -476,15 +647,24 @@ export class TurnTimeline {
 	/** Insert or update the row of one subagent this turn started. */
 	upsertSubagent(update: Omit<TimelineSubagent, "startedAt"> & { startedAt?: number }, now = Date.now()): void {
 		const key = `sub:${update.childId}`;
-		const existing = this.entries.find((entry) => entry.kind === "subagent" && entry.key === key);
+		const lane = update.laneName ?? update.name;
+		// The same subagent may be told twice (its spawn record, then its snapshot): one entry.
+		const existing = this.entries.find(
+			(entry) =>
+				entry.kind === "subagent" && (entry.key === key || (lane !== "" && subagentLane(entry.sub) === lane)),
+		);
 		if (existing && existing.kind === "subagent") {
 			const wasRunning = existing.sub.status === "running";
+			const wasOffLane = !(existing.sub.laneName ?? existing.sub.name);
 			existing.sub = {
 				...existing.sub,
 				...update,
 				startedAt: existing.sub.startedAt,
 				...(wasRunning && update.status !== "running" ? { endedAt: now } : {}),
 			};
+			// A key that only shows up after the first sight puts the running subagent on the lane then.
+			const nowLane = existing.sub.laneName ?? existing.sub.name;
+			if (wasOffLane && nowLane && existing.sub.status === "running") this.laneTracker?.spawned([nowLane], this);
 		} else {
 			this.entries.push({
 				seq: this.nextSeq(),
@@ -492,12 +672,18 @@ export class TurnTimeline {
 				key,
 				sub: { ...update, startedAt: update.startedAt ?? now },
 			});
+			// A subagent with no key a report could release it by stays off the lane: it would never come back.
+			if (update.status === "running" && lane) this.laneTracker?.spawned([lane], this);
 		}
 		this.ui.bump();
 	}
 
-	hasSubagent(childId: string): boolean {
-		return this.entries.some((entry) => entry.kind === "subagent" && entry.key === `sub:${childId}`);
+	hasSubagent(childId: string, laneName?: string): boolean {
+		return this.entries.some(
+			(entry) =>
+				entry.kind === "subagent" &&
+				(entry.key === `sub:${childId}` || (laneName !== undefined && subagentLane(entry.sub) === laneName)),
+		);
 	}
 
 	messages(): AssistantMessage[] {
@@ -566,6 +752,13 @@ export class TurnTimeline {
 		// copy, live-only ones (retries, compactions, subagents) carry over as they
 		// were, and anything only the replay knows goes after them.
 		const fresh = new Map(next.entries.map((entry) => [entry.key, entry] as const));
+		// A subagent the live turn already knows is not dispatched a second time by its replayed twin.
+		const knownLanes = new Set(
+			this.entries.flatMap((entry) => (entry.kind === "subagent" ? [subagentLane(entry.sub)] : [])),
+		);
+		for (const [key, entry] of fresh) {
+			if (entry.kind === "subagent" && knownLanes.has(subagentLane(entry.sub))) fresh.delete(key);
+		}
 		// The live compaction row is the richer record of the same event as its replayed copy.
 		if (this.entries.some((entry) => entry.kind === "compact" && !entry.compaction.fromReplay)) {
 			for (const [key, entry] of fresh) {
@@ -603,6 +796,7 @@ export class TurnTimeline {
 		next.ui.primed = ui.primed;
 		next.ui.stripOpen = ui.stripOpen;
 		for (const key of ui.expanded) next.ui.expanded.add(key);
+		next.ui.startLane = ui.startLane;
 		for (const key of ui.stripExpanded) next.ui.stripExpanded.add(key);
 		for (const [key, status] of ui.rowStatus) next.ui.rowStatus.set(key, status);
 		next.ui.bump();
@@ -699,6 +893,12 @@ export function compactionMissText(event: { errorMessage?: string; errorSeverity
 	);
 }
 
+/** How a system line names a subagent: as short as its dispatch and return rows do. */
+function noticeName(sessionName: string | undefined): string {
+	const name = sanitizeDisplayText(sessionName ?? "").trim();
+	return name ? shortAgentName(name) : "子代理";
+}
+
 function childFailureWhy(details: RlmChildFailureDetails | undefined): string {
 	const kind = details?.kind;
 	if (kind === "stall_killed") return "长时间没动静，被自动终止";
@@ -713,13 +913,10 @@ function childFailureWhy(details: RlmChildFailureDetails | undefined): string {
  */
 export function boxRecordFromMessage(
 	message: CustomMessage,
-):
-	| { kind: "notice"; notice: TimelineNotice }
-	| { kind: "compaction"; facts: { failed?: string; skipped?: boolean } }
-	| undefined {
+): { kind: "notice"; notice: TimelineNotice } | { kind: "compaction"; facts: CompactionFacts } | undefined {
 	if (message.customType === RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE) {
 		const details = message.details as RlmChildTerminalNoticeDetails | undefined;
-		const name = sanitizeDisplayText(details?.sessionName ?? "").trim() || "子代理";
+		const name = noticeName(details?.sessionName);
 		if (details?.kind === "cancelled") {
 			const reason = details.reason ? `：${sanitizeDisplayText(details.reason).split("\n")[0]}` : "";
 			return { kind: "notice", notice: { tone: "muted", text: `子代理 ${name} 已取消${reason}` } };
@@ -737,7 +934,7 @@ export function boxRecordFromMessage(
 	}
 	if (message.customType === RLM_CHILD_FAILURE_CUSTOM_TYPE) {
 		const details = message.details as RlmChildFailureDetails | undefined;
-		const name = sanitizeDisplayText(details?.sessionName ?? "").trim() || "子代理";
+		const name = noticeName(details?.sessionName);
 		const error = details?.error?.trim();
 		return {
 			kind: "notice",
@@ -750,14 +947,14 @@ export function boxRecordFromMessage(
 	}
 	if (message.customType === RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE) {
 		const details = message.details as RlmChildStallNoticeDetails | undefined;
-		const name = sanitizeDisplayText(details?.sessionName ?? "").trim() || "子代理";
+		const name = noticeName(details?.sessionName);
 		const quiet = details?.silentMs ? `，已经 ${formatBoxDuration(details.silentMs)}没动静` : "，一阵没动静了";
 		return { kind: "notice", notice: { tone: "warn", text: `子代理 ${name} 还在跑${quiet}` } };
 	}
 	if (message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE) {
 		const details = message.details as CompactionOutcomeDetails | undefined;
 		const content = typeof message.content === "string" ? message.content : "";
-		if (details?.outcome === "cancelled") return { kind: "compaction", facts: { failed: "已取消" } };
+		if (details?.outcome === "cancelled") return { kind: "compaction", facts: { failed: "已取消", cancelled: true } };
 		const skipped = details?.outcome === "skipped";
 		return {
 			kind: "compaction",

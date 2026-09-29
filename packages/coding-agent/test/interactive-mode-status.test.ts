@@ -51,6 +51,7 @@ import { BashExecutionComponent } from "../src/modes/interactive/components/bash
 import type { ConfigurationMenuComponent } from "../src/modes/interactive/components/configuration-menu.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.js";
+import { formatTimelineTime } from "../src/modes/interactive/components/timeline-gutter.js";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import {
 	resetBudgetTruncatableTracking,
@@ -360,18 +361,33 @@ describe("InteractiveMode.renderSessionContext", () => {
 		// is settled and its clock froze on the abort stamp - not Date.now().
 		expect(summary!.state.steps.map((step) => step.status)).toEqual(["done", "error"]);
 		expect(summary!.state.isSettled).toBe(true);
-		const line = summary!
-			.render(120)
-			.join("\n")
-			.replace(/\u001b\[[0-9;]*m/g, "");
-		// The folded box says the run was stopped and keeps the work done so far.
-		expect(line).toContain("◆ prime  test-model");
-		expect(line).toMatch(/■ 已停止 +做到第 2 步/);
+		const hhmm = formatTimelineTime(1_000);
+		const lines = stripAnsi(summary!.render(120).join("\n")).split("\n");
+		// The turn opens with two empty rows under the question, then one event line: its steps stay behind
+		// `2 步 ▸`, and nothing is framed, titled or pilled.
+		expect(lines.slice(0, 2).map((line) => line.trimEnd())).toEqual(["         │", "         │"]);
+		lines.splice(0, 2);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]?.startsWith(` ${hhmm}   ◆`)).toBe(true);
+		expect(lines[0]?.trimEnd().endsWith("2 步 ▸")).toBe(true);
+		for (const gone of ["◆ prime", "已停止", "╭", "╰"]) expect(lines.join("\n")).not.toContain(gone);
+		// The line carries no clock or token count; the turn's clock (state) froze on the abort stamp, not Date.now().
+		expect(lines[0]).not.toMatch(/\d+秒|↓ \d+/);
 		// 1000 (first assistant) -> 2000 (abort stamp): 1 second, a fixed value.
-		expect(line).toMatch(/1秒 · ↓ \d+ ›/);
+		expect(summary!.state.turnDurationMs()).toBe(1_000);
+		expect(summary!.state.turnDurationMs(Date.now() + 3_600_000)).toBe(1_000);
 		// Frozen: repeated renders reuse the settled cache.
 		const first = summary!.render(120);
 		expect(summary!.render(120)).toBe(first);
+		// Opened, the event keeps the work done so far and shows the cut-short step as stopped (no spinner, no error).
+		expect(summary!.getFocusOrder().filter((key) => key.startsWith("ev:"))).toHaveLength(1);
+		summary!.activate(summary!.getFocusOrder()[0] ?? "");
+		const opened = stripAnsi(summary!.render(120).join("\n")).split("\n").slice(2);
+		expect(opened).toHaveLength(3);
+		expect(opened[0]?.trimEnd().endsWith("2 步 ▴")).toBe(true);
+		expect(opened[1]).toMatch(/^ {9}│ {11}✓ {2}运行命令 +✓ *$/);
+		expect(opened[2]).toMatch(/^ {9}│ {11}■ {2}运行命令 · 你停下了 *$/);
+		expect(opened.join("\n")).not.toContain("出错");
 	});
 
 	test("a turn replayed while the agent is still streaming stays running (attach mid-run)", async () => {
@@ -390,17 +406,25 @@ describe("InteractiveMode.renderSessionContext", () => {
 			| undefined;
 		expect(summary).toBeDefined();
 		expect(summary!.state.isTurnEnded).toBe(false);
-		const line = summary!
-			.render(120)
-			.join("\n")
-			.replace(/\u001b\[[0-9;]*m/g, "");
-		// Still running: the box stays open and waits for the model's next reply,
-		// with the finished step as a settled row.
-		// Column 1: the header keeps the one-column margin every chat row keeps.
-		expect(line).toMatch(/^ ◆ prime {2}test-model\n/);
-		expect(line).toContain("⌄");
-		expect(line).toContain("等待模型回应");
-		expect(line).toMatch(/✓ 运行命令/);
+		const hhmm = formatTimelineTime(1_000);
+		const lines = stripAnsi(summary!.render(120).join("\n")).split("\n");
+		// Still running: two empty rows under the question, the event line keeps its step behind `1 步 ▸`,
+		// one blank rail line follows, and the turn ends on the spinner line waiting for the model's next reply.
+		expect(lines.slice(0, 2).map((line) => line.trimEnd())).toEqual(["         │", "         │"]);
+		lines.splice(0, 2);
+		expect(lines).toHaveLength(3);
+		expect(lines[0]?.startsWith(` ${hhmm}   ◆`)).toBe(true);
+		expect(lines[0]?.trimEnd().endsWith("1 步 ▸")).toBe(true);
+		expect(lines[1]?.trimEnd()).toBe("         │");
+		expect(lines[2]).toMatch(new RegExp(`^ ${hhmm} {3}[⠀-⣿] {6}等待模型回应…\\s+第 1 步 *$`));
+		expect(lines.join("\n")).not.toContain("◆ prime");
+		expect(lines.join("\n")).not.toContain("⌄");
+		// The finished step is a settled row under its event.
+		summary!.activate(summary!.getFocusOrder()[0] ?? "");
+		const opened = stripAnsi(summary!.render(120).join("\n")).split("\n").slice(2);
+		expect(opened[0]?.trimEnd().endsWith("1 步 ▴")).toBe(true);
+		expect(opened[1]).toMatch(/^ {9}│ {11}✓ {2}运行命令 +✓ *$/);
+		expect(opened.some((line) => line.includes("等待模型回应"))).toBe(true);
 	});
 
 	test("a rebuild keeps an opened turn open (resync mid-run must not fold Ctrl+O)", async () => {
@@ -419,22 +443,32 @@ describe("InteractiveMode.renderSessionContext", () => {
 				| undefined;
 		const before = findSummary();
 		expect(before).toBeDefined();
-		// The live box starts open; the user opens the step row, then closes the box.
+		// Nothing is open at first, live or not: the user opens the event and then its step row.
+		expect(before!.state.boxOpen).toBe(false);
+		before!.toggleBox();
 		expect(before!.state.boxOpen).toBe(true);
 		before!.render(120);
-		const rowKey = before!.getFocusOrder().find((key) => key !== "header");
+		const rowKey = before!.getFocusOrder().find((key) => !key.startsWith("ev:") && !key.startsWith("all:"));
 		expect(rowKey).toBeDefined();
 		expect(before!.activate(rowKey!)).toBe(true);
-		before!.toggleBox();
-		expect(before!.state.boxOpen).toBe(false);
 
-		await renderMessages(harness, [...messages, { ...toolCallMessage("tool-2", "bash"), timestamp: 2_000 }], {
-			clearChat: true,
-		});
+		const rebuilt = [...messages, { ...toolCallMessage("tool-2", "bash"), timestamp: 2_000 }];
+		await renderMessages(harness, rebuilt, { clearChat: true });
+		const opened = findSummary();
+		expect(opened).toBeDefined();
+		expect(opened).not.toBe(before);
+		// The user's choices ride over the rebuild: the event is still open, and its row too.
+		expect(opened!.state.boxOpen).toBe(true);
+		expect(opened!.state.processBlockExpanded).toBe(true);
+		expect(opened!.state.timeline.ui.expanded.has(rowKey!)).toBe(true);
+
+		// Closing the event rides over a rebuild too: still closed, row still open.
+		opened!.toggleBox();
+		expect(opened!.state.boxOpen).toBe(false);
+		await renderMessages(harness, rebuilt, { clearChat: true });
 		const after = findSummary();
 		expect(after).toBeDefined();
-		expect(after).not.toBe(before);
-		// The user's choices ride over the rebuild: still closed, row still open.
+		expect(after).not.toBe(opened);
 		expect(after!.state.boxOpen).toBe(false);
 		expect(after!.state.processBlockExpanded).toBe(false);
 		expect(after!.state.timeline.ui.expanded.has(rowKey!)).toBe(true);

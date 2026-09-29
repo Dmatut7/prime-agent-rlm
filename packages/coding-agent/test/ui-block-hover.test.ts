@@ -2,19 +2,17 @@ import { type ClickRegion, setKeybindings } from "@earendil-works/pi-tui";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
+import { BOX_FOCUS_MARKER } from "../src/modes/interactive/components/turn-box.js";
 import { theme } from "../src/modes/interactive/theme/theme.js";
 import {
 	addActivities,
 	addCommand,
 	addSay,
-	bgAsFg,
 	hasBg,
 	host,
-	lineIndexWith,
 	plain,
 	type QuietTurn,
 	quietTurn,
-	rawLineWith,
 	T0,
 	useTruecolorTheme,
 } from "./ui-blocks-helpers.js";
@@ -37,138 +35,192 @@ afterEach(() => {
 
 const WIDTH = 100;
 const CMD_KEY = "act:c1:c1-a";
+const hoverBg = () => theme.getBgAnsi("timelineHoverBg");
 
 function regionsOn(turn: QuietTurn, line: number): ClickRegion[] {
 	return turn.summary.getClickRegions().filter((region) => region.line === line);
 }
 
+/** The one click area of a line. */
+function regionOn(turn: QuietTurn, line: number): ClickRegion | undefined {
+	const regions = regionsOn(turn, line);
+	expect(regions.length).toBeLessThanOrEqual(1);
+	return regions[0];
+}
+
+/** Display width of a plain line (wide characters count two columns). */
+function widthOf(line: string): number {
+	let cols = 0;
+	for (const ch of line) cols += /[ᄀ-ᅟ⺀-鿿가-힣＀-｠]/.test(ch) ? 2 : 1;
+	return cols;
+}
+
+/** Index of the first line after the first whose plain text contains `needle`, or -1. */
+function lineOf(lines: readonly string[], needle: string): number {
+	return plain(lines).findIndex((line, index) => index > 0 && line.includes(needle));
+}
+
+/** Two steps in one millisecond would share a message: every step is added a second after the last. */
+function useSteppedClock(): void {
+	vi.useFakeTimers({ toFake: ["Date"] });
+	vi.setSystemTime(T0);
+}
+
+function later(): void {
+	vi.setSystemTime(Date.now() + 1_000);
+}
+
+/** A turn with one command, its event opened, and the line its step sits on. */
 function boxWithCommand(options: { output?: string; text?: string } = {}) {
-	setMotionReduced(true);
 	const hostMock = host();
 	const turn = quietTurn({ host: hostMock });
-	addCommand(turn, "c1", options.text ?? "git status", { output: options.output ?? "clean" });
+	const label = options.text ?? "git status";
+	addCommand(turn, "c1", label, { output: options.output ?? "clean" });
+	turn.summary.toggleBox();
 	const lines = turn.summary.render(WIDTH);
-	const at = lineIndexWith(lines, `$ ${(options.text ?? "git status").slice(0, 16)}`);
+	const at = lineOf(lines, `$  ${label.slice(0, 16)}`);
+	expect(at).toBeGreaterThan(0);
 	return { turn, hostMock, at };
 }
 
-describe("a block tells the pointer layer who it is", () => {
-	it("gives the block's row and its separator row the same hover key and callback", () => {
+/** Indexes of the lines painted with the hover color. */
+function litLines(lines: readonly string[]): number[] {
+	return lines.flatMap((line, index) => (line.includes(hoverBg()) ? [index] : []));
+}
+
+describe("a line tells the pointer layer who it is", () => {
+	it("gives a step's line its own hover key and callback, and the row under it none", () => {
 		const { turn, at } = boxWithCommand();
-		const head = regionsOn(turn, at).find((region) => !region.passive);
-		const gap = regionsOn(turn, at + 1).find((region) => !region.passive);
+		const head = regionOn(turn, at);
 		expect(head?.hoverKey).toBeTypeOf("string");
 		expect(head?.hoverKey).toContain(CMD_KEY);
-		expect(gap?.hoverKey).toBe(head?.hoverKey);
 		expect(head?.onHover).toBeTypeOf("function");
-		expect(gap?.onHover).toBeTypeOf("function");
+		expect(regionsOn(turn, at + 1)).toHaveLength(0);
+		// The event above it is a target of its own.
+		const event = regionOn(turn, 0);
+		expect(event?.hoverKey).toContain(":ev:");
+		expect(event?.hoverKey).not.toBe(head?.hoverKey);
+		expect(event?.onHover).toBeTypeOf("function");
 	});
 
 	it("keeps the key the same from frame to frame and different between rows and between boxes", () => {
+		useSteppedClock();
 		const { turn, at } = boxWithCommand();
-		const keyOf = (t: QuietTurn, line: number) => regionsOn(t, line).find((region) => !region.passive)?.hoverKey;
+		const keyOf = (t: QuietTurn, line: number) => regionOn(t, line)?.hoverKey;
 		const first = keyOf(turn, at);
 		turn.summary.invalidate();
 		turn.summary.render(WIDTH);
 		expect(keyOf(turn, at)).toBe(first);
 
+		later();
 		addCommand(turn, "c2", "git log", { output: "abc" });
 		const lines = turn.summary.render(WIDTH);
-		const second = keyOf(turn, lineIndexWith(lines, "$ git log"));
+		const second = keyOf(turn, lineOf(lines, "$  git log"));
 		expect(second).toBeDefined();
 		expect(second).not.toBe(first);
 
+		later();
 		const other = boxWithCommand();
 		expect(keyOf(other.turn, other.at)).toBeDefined();
 		expect(keyOf(other.turn, other.at)).not.toBe(first);
 	});
 
-	it("gives what hangs under a block and a note no hover fields", () => {
-		setMotionReduced(true);
+	it("gives what hangs under a step, an interjection and the gaps no click area at all", () => {
+		useSteppedClock();
 		const turn = quietTurn();
 		addSay(turn, "趁等待，查一个风险点。", "s1");
+		later();
 		addCommand(turn, "c1", "git status", { output: "clean\nmore" });
-		turn.timeline.ui.toggleRow(CMD_KEY);
-		const lines = turn.summary.render(WIDTH);
-		const shown = plain(lines);
-		const passiveLines = [
-			lineIndexWith(lines, "趁等待"),
-			shown.findIndex((line) => line.includes("▎") && line.includes("clean")),
-		];
-		expect(passiveLines.every((line) => line > 0)).toBe(true);
-		for (const line of passiveLines) {
-			const regions = regionsOn(turn, line);
-			expect(regions.length, `regions on line ${line}`).toBeGreaterThan(0);
-			for (const region of regions) {
-				expect(region.hoverKey, `hover key on line ${line}`).toBeUndefined();
-				expect(region.onHover, `hover callback on line ${line}`).toBeUndefined();
-			}
+		later();
+		turn.timeline.addSteer("先别动安卓的，只升级 Go", Date.now());
+		turn.summary.toggleBox();
+		turn.summary.render(WIDTH);
+		turn.summary.activate(CMD_KEY);
+		const shown = plain(turn.summary.render(WIDTH));
+		const passive = {
+			detail: shown.findIndex((line) => /^ {9}│ {14}clean$/.test(line)),
+			steer: shown.findIndex((line) => line.includes("你插话")),
+			gap: shown.findIndex((line) => line.trimEnd() === "         │"),
+		};
+		expect(Object.values(passive).every((line) => line > 0)).toBe(true);
+		for (const [name, line] of Object.entries(passive)) {
+			expect(regionsOn(turn, line), `regions on the ${name} line`).toHaveLength(0);
 		}
 	});
 });
 
-describe("the block under the pointer lights up", () => {
-	it("repaints the block in its hover color with a colored caret and a hint, and leaves again", () => {
+describe("the line under the pointer lights up", () => {
+	it("paints the whole line in the hover color, moves nothing, and leaves again", () => {
 		const { turn, hostMock, at } = boxWithCommand();
-		const head = regionsOn(turn, at).find((region) => !region.passive);
-		expect(hasBg(rawLineWith(turn.summary.render(WIDTH), "$ git status"), "kindCommandBg")).toBe(true);
+		const calm = turn.summary.render(WIDTH);
+		expect(litLines(calm)).toHaveLength(0);
 
-		head?.onHover?.(true);
+		regionOn(turn, at)?.onHover?.(true);
 		expect(hostMock.requestRender).toHaveBeenCalled();
 		const lit = turn.summary.render(WIDTH);
 		const block = lit[at] ?? "";
-		expect(hasBg(block, "kindCommandHoverBg")).toBe(true);
-		expect(hasBg(block, "kindCommandBg")).toBe(false);
-		expect(block).toContain(theme.fg("kindCommand", "▸"));
-		expect(plain(lit)[at]).toMatch(/\$ git status +点开 ▸ +✓ done +│$/);
-		expect(block).toContain(theme.fg("kindCommand", "点开 ▸"));
-		expect((lit[at + 1] ?? "").includes(bgAsFg("kindCommandHoverBg"))).toBe(true);
+		expect(block.startsWith(hoverBg())).toBe(true);
+		expect(block.endsWith("\x1b[49m")).toBe(true);
+		expect(hasBg(block, "kindCommandHoverBg")).toBe(false);
+		// The line keeps its words and its width to the last column: no hint is added.
+		expect(plain(lit)[at]).toBe(plain(calm)[at]);
+		expect(plain(lit)[at]).not.toContain("点开");
+		expect(widthOf(plain(lit)[at] ?? "")).toBe(WIDTH);
+		expect(litLines(lit)).toEqual([at]);
 
-		head?.onHover?.(false);
-		const calm = turn.summary.render(WIDTH);
-		expect(hasBg(calm[at] ?? "", "kindCommandBg")).toBe(true);
-		expect(plain(calm)[at]).not.toContain("点开");
+		regionOn(turn, at)?.onHover?.(false);
+		const after = turn.summary.render(WIDTH);
+		expect(litLines(after)).toHaveLength(0);
+		expect(plain(after)).toEqual(plain(calm));
 	});
 
-	it("lights the block when the pointer is on its separator row too", () => {
+	it("lights only the line the pointer is on: an event does not light its steps, nor a step its event", () => {
 		const { turn, at } = boxWithCommand();
-		regionsOn(turn, at + 1)
-			.find((region) => !region.passive)
-			?.onHover?.(true);
-		expect(hasBg(turn.summary.render(WIDTH)[at] ?? "", "kindCommandHoverBg")).toBe(true);
+		regionOn(turn, 0)?.onHover?.(true);
+		expect(litLines(turn.summary.render(WIDTH))).toEqual([0]);
+		regionOn(turn, at)?.onHover?.(true);
+		expect(litLines(turn.summary.render(WIDTH))).toEqual([at]);
 	});
 
-	it("says 收起 on an opened block that is pointed at, and shows ▾ on it either way", () => {
+	it("keeps an opened event's arrow and an opened step's line as they are under the pointer, and Enter says 收起", () => {
 		const { turn, at } = boxWithCommand();
-		turn.timeline.ui.toggleRow(CMD_KEY);
-		const opened = turn.summary.render(WIDTH);
-		expect(hasBg(opened[at] ?? "", "kindCommandHoverBg")).toBe(true);
-		expect(plain(opened)[at]).toContain("▾");
-		expect(plain(opened)[at]).not.toContain("收起");
-		regionsOn(turn, at)
-			.find((region) => !region.passive)
-			?.onHover?.(true);
-		const pointed = plain(turn.summary.render(WIDTH))[at] ?? "";
-		expect(pointed).toContain("收起 ▴");
-		expect(pointed).toContain("▾");
+		const eventKey = turn.summary.getFocusOrder()[0] ?? "";
+		const opened = plain(turn.summary.render(WIDTH));
+		expect(opened[0]).toMatch(/1 步 ▴ {2}$/);
+		expect(turn.summary.enterLabel(eventKey)).toBe("收起");
+		regionOn(turn, 0)?.onHover?.(true);
+		expect(plain(turn.summary.render(WIDTH))[0]).toBe(opened[0]);
+		expect(plain(turn.summary.render(WIDTH))[0]).not.toContain("收起");
+
+		expect(turn.summary.enterLabel(CMD_KEY)).toBe("展开");
+		turn.summary.activate(CMD_KEY);
+		expect(turn.summary.enterLabel(CMD_KEY)).toBe("收起");
+		const before = plain(turn.summary.render(WIDTH))[at];
+		regionOn(turn, at)?.onHover?.(true);
+		const pointed = turn.summary.render(WIDTH);
+		expect(plain(pointed)[at]).toBe(before);
+		expect(plain(pointed)[at]).not.toMatch(/收起|▾|▴/);
+		expect(litLines(pointed)).toEqual([at]);
 	});
 
-	it("cuts a long text to make room for the hint instead of dropping the hint", () => {
+	it("cuts a long text to make room for the result instead of dropping the result", () => {
 		const long = `git log --stat --format=%H ${"very-long-argument ".repeat(8)}`.trim();
 		const { turn, at } = boxWithCommand({ text: long });
-		regionsOn(turn, at)
-			.find((region) => !region.passive)
-			?.onHover?.(true);
-		const lit = plain(turn.summary.render(60));
-		const line = lit.find((entry) => entry.includes("$ git log")) ?? "";
-		expect(line).toContain("点开 ▸");
+		const calm = plain(turn.summary.render(60))[at] ?? "";
+		expect(calm).toMatch(/^ {9}│ {11}\$ {2}git log .*…\s+✓ done {4}$/);
+		regionOn(turn, at)?.onHover?.(true);
+		const lit = turn.summary.render(60);
+		expect(lit[at]).toContain(hoverBg());
+		const line = plain(lit)[at] ?? "";
+		expect(line).toBe(calm);
 		expect(line).toContain("…");
-		expect(line).toMatch(/…\s+点开 ▸\s+✓ done\s+│$/);
+		expect(line).toMatch(/…\s+✓ done {4}$/);
+		expect(widthOf(line)).toBe(60);
 	});
 
-	it("only asks for a frame when the pointed block changed", () => {
+	it("only asks for a frame when the pointed line changed", () => {
 		const { turn, hostMock, at } = boxWithCommand();
-		const head = regionsOn(turn, at).find((region) => !region.passive);
+		const head = regionOn(turn, at);
 		const requests = () => vi.mocked(hostMock.requestRender).mock.calls.length;
 		const before = requests();
 		head?.onHover?.(false);
@@ -181,75 +233,101 @@ describe("the block under the pointer lights up", () => {
 		expect(requests()).toBe(before + 2);
 	});
 
-	it("keeps the newer block lit when the older one reports leaving after it", () => {
-		setMotionReduced(true);
+	it("keeps the newer step lit when the older one reports leaving after it", () => {
+		useSteppedClock();
 		const turn = quietTurn();
 		addCommand(turn, "c1", "git status", { output: "clean" });
+		later();
 		addCommand(turn, "c2", "git log", { output: "abc" });
+		turn.summary.toggleBox();
 		const lines = turn.summary.render(WIDTH);
-		const first = regionsOn(turn, lineIndexWith(lines, "$ git status")).find((region) => !region.passive);
-		const second = regionsOn(turn, lineIndexWith(lines, "$ git log")).find((region) => !region.passive);
+		const firstAt = lineOf(lines, "$  git status");
+		const secondAt = lineOf(lines, "$  git log");
+		expect(firstAt).toBeGreaterThan(0);
+		expect(secondAt).toBeGreaterThan(0);
+		const first = regionOn(turn, firstAt);
+		const second = regionOn(turn, secondAt);
 		first?.onHover?.(true);
 		second?.onHover?.(true);
 		first?.onHover?.(false);
-		const after = turn.summary.render(WIDTH);
-		expect(hasBg(rawLineWith(after, "$ git log"), "kindCommandHoverBg")).toBe(true);
-		expect(hasBg(rawLineWith(after, "$ git status"), "kindCommandBg")).toBe(true);
+		expect(litLines(turn.summary.render(WIDTH))).toEqual([secondAt]);
 	});
 });
 
 describe("the keyboard's selection looks like the pointer's", () => {
-	it("lights the selected block with its hover color and hint, not the old focus tint", () => {
+	it("lights the selected step with the hover color and marks it for the viewport, not with the old focus tint", () => {
 		const { turn, at } = boxWithCommand();
 		turn.timeline.ui.focused = true;
 		turn.timeline.ui.focusKey = CMD_KEY;
 		turn.timeline.ui.bump();
 		const lit = turn.summary.render(WIDTH);
-		expect(hasBg(lit[at] ?? "", "kindCommandHoverBg")).toBe(true);
+		expect(lit[at]?.startsWith(BOX_FOCUS_MARKER)).toBe(true);
+		expect(lit[at]).toContain(hoverBg());
 		expect(hasBg(lit[at] ?? "", "cardFocusBg")).toBe(false);
-		expect(plain(lit)[at]).toContain("点开 ▸");
-		expect((lit[at] ?? "").includes(theme.fg("kindCommand", "▸"))).toBe(true);
+		expect(litLines(lit)).toEqual([at]);
+		expect(lit.filter((line) => line.includes(BOX_FOCUS_MARKER))).toHaveLength(1);
+		expect(plain(lit)[at]).toMatch(/^ {9}│ {11}\$ {2}git status/);
+		expect(plain(lit)[at]).not.toContain("点开");
+		expect(widthOf(plain(lit)[at] ?? "")).toBe(WIDTH);
 	});
 
-	it("lights a selected block that only has the facts of its step to open, with the same hint", () => {
-		setMotionReduced(true);
+	it("lights a selected step that only has the facts of its step to open, the same way", () => {
 		const turn = quietTurn();
 		addActivities(turn, "r1", [{ id: "a", kind: "read", label: "README.md", status: "ok", startedAt: 1 }]);
+		turn.summary.toggleBox();
+		turn.summary.render(WIDTH);
 		turn.timeline.ui.focused = true;
 		turn.timeline.ui.focusKey = "act:r1:a";
 		turn.timeline.ui.bump();
 		const lines = turn.summary.render(WIDTH);
-		const at = lineIndexWith(lines, "读取 README.md");
-		expect(hasBg(lines[at] ?? "", "kindReadHoverBg")).toBe(true);
-		expect(plain(lines)[at]).toContain("点开 ▸");
+		const at = lineOf(lines, "读取 README.md");
+		expect(at).toBeGreaterThan(0);
+		expect(lines[at]?.startsWith(BOX_FOCUS_MARKER)).toBe(true);
+		expect(lines[at]).toContain(hoverBg());
+		expect(litLines(lines)).toEqual([at]);
+	});
+
+	it("lights the first line the walk stops on when the focus sits on `header`", () => {
+		const { turn } = boxWithCommand();
+		turn.timeline.ui.focused = true;
+		turn.timeline.ui.focusKey = "header";
+		turn.timeline.ui.bump();
+		const lines = turn.summary.render(WIDTH);
+		expect(lines[0]?.startsWith(BOX_FOCUS_MARKER)).toBe(true);
+		expect(litLines(lines)).toEqual([0]);
+		expect(turn.summary.enterLabel("header")).toBe("收起");
 	});
 });
 
-describe("a new row flashes in its hover color", () => {
-	it("flashes the block in its hover color, then settles to its own color", () => {
-		vi.useFakeTimers();
-		vi.setSystemTime(T0);
+describe("a new row does not flash", () => {
+	it("draws a new step in no hover color, then or a second later", () => {
+		useSteppedClock();
 		const turn = quietTurn({ startedAt: T0 - 5_000 });
 		turn.summary.render(WIDTH);
 		addCommand(turn, "c1", "git status", { output: "clean" });
-		const flashing = turn.summary.render(WIDTH);
-		expect(hasBg(rawLineWith(flashing, "$ git status"), "kindCommandHoverBg")).toBe(true);
+		turn.summary.toggleBox();
+		const fresh = turn.summary.render(WIDTH);
+		expect(lineOf(fresh, "$  git status")).toBeGreaterThan(0);
+		expect(litLines(fresh)).toHaveLength(0);
+		expect(fresh.some((line) => hasBg(line, "kindCommandHoverBg"))).toBe(false);
 		vi.setSystemTime(T0 + 1_000);
 		turn.summary.invalidate();
 		const settled = turn.summary.render(WIDTH);
-		expect(hasBg(rawLineWith(settled, "$ git status"), "kindCommandBg")).toBe(true);
-		expect(hasBg(rawLineWith(settled, "$ git status"), "kindCommandHoverBg")).toBe(false);
+		expect(lineOf(settled, "$  git status")).toBeGreaterThan(0);
+		expect(litLines(settled)).toHaveLength(0);
+		expect(plain(settled)).toEqual(plain(fresh));
 	});
 
-	it("does not flash with reduced motion", () => {
-		vi.useFakeTimers();
-		vi.setSystemTime(T0);
+	it("draws a new step in no hover color with reduced motion either", () => {
+		useSteppedClock();
 		setMotionReduced(true);
 		const turn = quietTurn({ startedAt: T0 - 5_000 });
 		turn.summary.render(WIDTH);
 		addCommand(turn, "c1", "git status", { output: "clean" });
+		turn.summary.toggleBox();
 		const lines = turn.summary.render(WIDTH);
-		expect(hasBg(rawLineWith(lines, "$ git status"), "kindCommandBg")).toBe(true);
-		expect(hasBg(rawLineWith(lines, "$ git status"), "kindCommandHoverBg")).toBe(false);
+		expect(lineOf(lines, "$  git status")).toBeGreaterThan(0);
+		expect(litLines(lines)).toHaveLength(0);
+		expect(lines.some((line) => hasBg(line, "kindCommandHoverBg"))).toBe(false);
 	});
 });

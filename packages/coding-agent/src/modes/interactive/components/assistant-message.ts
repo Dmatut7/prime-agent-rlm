@@ -1,7 +1,15 @@
 import { resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { type Component, Container, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
+import {
+	type Component,
+	Container,
+	Markdown,
+	type MarkdownTheme,
+	Spacer,
+	type TableCellSelectionRegion,
+	Text,
+} from "@earendil-works/pi-tui";
 import { LOGIN_RECOVERY_MESSAGE } from "../../../core/auth-guidance.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock } from "./block-focus.js";
@@ -12,6 +20,13 @@ import {
 	summarizeErrorDetails,
 } from "./collapsible-error.js";
 import type { MermaidMarkdownTransform } from "./mermaid.js";
+import {
+	formatTimelineTime,
+	TIMELINE_CONTENT_COL,
+	type TimelineLane,
+	timelineGutter,
+	timelineRow,
+} from "./timeline-gutter.js";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
@@ -33,6 +48,92 @@ export interface AssistantMessageComponentOptions {
 	 * (no tool calls) always renders in full.
 	 */
 	quiet?: boolean;
+	/** The subagent lane column of the timeline rows a quiet summary draws. */
+	lane?: TimelineLane;
+}
+
+/** Below this width the timeline's 16 left columns leave too little for words; the answer draws plain. */
+const TIMELINE_MIN_WIDTH = TIMELINE_CONTENT_COL + 8;
+
+/** A few fixed timeline rows (gaps, the summary header), built once per width. */
+class TimelineRows implements Component {
+	private cachedWidth?: number;
+	private cachedLines?: string[];
+
+	constructor(
+		private readonly build: (width: number) => string[],
+		private readonly narrow: string[] = [],
+	) {}
+
+	render(width: number): string[] {
+		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
+		this.cachedWidth = width;
+		this.cachedLines = width < TIMELINE_MIN_WIDTH ? this.narrow : this.build(width);
+		return this.cachedLines;
+	}
+
+	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
+	}
+}
+
+/**
+ * One Markdown block of the summary on the timeline: every row behind the
+ * answer bar (`┃`), the words from column 16 wrapped at the width minus 16.
+ * Paragraph gaps stay as empty bar rows.
+ */
+class TimelineAnswerBody implements Component {
+	private cachedWidth?: number;
+	private cachedSource?: string[];
+	private cachedLines?: string[];
+	private shift = TIMELINE_CONTENT_COL;
+
+	constructor(
+		private readonly markdown: Markdown,
+		private readonly lane: TimelineLane,
+	) {}
+
+	render(width: number): string[] {
+		const narrow = width < TIMELINE_MIN_WIDTH;
+		const margin = narrow ? 1 : TIMELINE_CONTENT_COL;
+		const source = this.markdown.render(Math.max(1, width - (narrow ? 2 : margin)));
+		if (this.cachedLines && this.cachedWidth === width && this.cachedSource === source) return this.cachedLines;
+		const lead = narrow ? " " : timelineGutter({ main: "answer", lane: this.lane });
+		this.shift = margin;
+		this.cachedWidth = width;
+		this.cachedSource = source;
+		this.cachedLines = source.map((line) => lead + line.replace(/ +$/, ""));
+		return this.cachedLines;
+	}
+
+	getSelectionRegions(): ReadonlyArray<TableCellSelectionRegion> {
+		return this.markdown.getSelectionRegions().map((region) => ({
+			...region,
+			col: region.col + this.shift,
+			tableLeft: region.tableLeft + this.shift,
+			tableRight: region.tableRight + this.shift,
+		}));
+	}
+
+	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedSource = undefined;
+		this.cachedLines = undefined;
+		this.markdown.invalidate();
+	}
+}
+
+/**
+ * The summary's Markdown: a heading is bold in the normal text color (the
+ * renderer already bolds it) and list numbers and bullets are the time column's dim.
+ */
+function getSummaryMarkdownTheme(baseTheme: MarkdownTheme): MarkdownTheme {
+	return {
+		...baseTheme,
+		heading: (text: string) => text,
+		listBullet: (text: string) => theme.fg("timelineTime", text),
+	};
 }
 
 function getThinkingMarkdownTheme(baseTheme: MarkdownTheme): MarkdownTheme {
@@ -95,6 +196,7 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 	private precededByToolActivity: boolean;
 	/** TUI v4 quiet-conversation gate; see {@link AssistantMessageComponentOptions.quiet}. */
 	private quiet = false;
+	private lane: TimelineLane = "off";
 	/** A later reply of the same turn took over: this answer's text lives on as a row in the box. */
 	private superseded = false;
 	private mermaidTransform?: MermaidMarkdownTransform;
@@ -119,6 +221,7 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 		this.thinkingExpanded = options.thinkingExpanded ?? false;
 		this.precededByToolActivity = options.precededByToolActivity ?? false;
 		this.quiet = options.quiet ?? false;
+		this.lane = options.lane ?? "off";
 		this.mermaidTransform = options.mermaidTransform;
 		this.baseUrl = options.cwd ? pathToFileURL(`${resolve(options.cwd)}${sep}`).href : undefined;
 
@@ -147,6 +250,13 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 	setSuperseded(superseded: boolean): void {
 		if (this.superseded === superseded) return;
 		this.superseded = superseded;
+		this.dirty = true;
+	}
+
+	/** The subagent lane the summary's rows draw; the conversation builder passes what was true when it appended this. */
+	setLane(lane: TimelineLane): void {
+		if (this.lane === lane) return;
+		this.lane = lane;
 		this.dirty = true;
 	}
 
@@ -263,6 +373,7 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 			`thinkingExpanded:${this.thinkingExpanded}`,
 			// TUI v4: a quiet-mode flip must rebuild so the narration fold applies.
 			`quiet:${this.quiet}`,
+			`lane:${this.lane}`,
 			`superseded:${this.superseded}`,
 			// In the signature so the streaming->final transition rebuilds (mermaid renders differently).
 			`streaming:${this.isStreaming}`,
@@ -314,17 +425,11 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 		// message in the default collapsed view.
 		const hasToolCalls = message.content.some((c) => c?.type === "toolCall");
 		this.hasToolCalls = hasToolCalls;
-		// TUI v4 quiet gate, block-level (batch1 review P1-1): only the text
-		// BEFORE the first tool call is the "先说再做" preamble narration that
-		// folds into the turn stats. Text AFTER a tool call - the same
-		// message's closing narrative / conclusion - stays visible, exactly
-		// like the turn's final no-tool output. Error surfaces never fold.
-		const firstToolCallIndex = message.content.findIndex((c) => c?.type === "toolCall");
-		const foldsText = (index: number): boolean =>
-			this.superseded || (this.quiet && firstToolCallIndex !== -1 && index < firstToolCallIndex);
-		const hasFoldedText = message.content.some(
-			(c, index) => c?.type === "text" && c.text.trim().length > 0 && foldsText(index),
-		);
+		// TUI v4 quiet gate: every text block of a message that carries tool calls
+		// is the event row's (the timeline draws it there in one line), so none of
+		// it repeats here as an answer. Error surfaces never fold.
+		const foldsText = this.superseded || (this.quiet && hasToolCalls);
+		const hasFoldedText = foldsText && message.content.some((c) => c?.type === "text" && c.text.trim().length > 0);
 		const rendersThinking = (c: AssistantMessage["content"][number]) =>
 			c?.type === "thinking" && c.thinking.trim() && !this.hideThinkingBlock && this.thinkingExpanded;
 		// A quiet turn's box already shows a model error as its own red row (or the
@@ -335,9 +440,8 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 			(!this.quiet || formatInlineLoginRecoveryMessage(message.errorMessage || "") !== undefined);
 		const hasVisibleContent =
 			message.content.some(
-				(c, index) =>
-					(c?.type === "text" && c.text.trim() && !foldsText(index)) ||
-					(c?.type === "thinking" && rendersThinking(c)),
+				(c) =>
+					(c?.type === "text" && c.text.trim() && !foldsText) || (c?.type === "thinking" && rendersThinking(c)),
 			) ||
 			// The error surfaces render in both lanes (aborted, or a
 			// non-tool-call error); toolCall blocks render as separate
@@ -345,26 +449,39 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 			message.stopReason === "aborted" ||
 			errorSurface;
 
-		if (hasVisibleContent) {
+		// The quiet turn's closing answer is the timeline's summary: its own rows
+		// (two gaps, the header, the bar) stand in for the leading Spacer.
+		const timelineAnswer =
+			this.quiet && !hasToolCalls && message.content.some((c) => c?.type === "text" && c.text.trim() && !foldsText);
+		const leadingSpacer = hasVisibleContent && !(timelineAnswer && !message.content.some(rendersThinking));
+		if (leadingSpacer) {
 			this.contentContainer.addChild(new Spacer(1));
 		}
 
 		// Render content in order
+		let summaryStarted = false;
 		for (let i = 0; i < message.content.length; i++) {
 			const content = message.content[i];
-			if (content?.type === "text" && content.text.trim() && !foldsText(i)) {
+			if (content?.type === "text" && content.text.trim() && !foldsText) {
 				// Assistant text messages with no background - trim the text
 				// Set paddingY=0 to avoid extra spacing before tool executions
 				const mermaidTransform = this.mermaidTransform;
 				const isStreaming = this.isStreaming;
-				const markdown = new Markdown(content.text.trim(), 1, 0, this.markdownTheme, undefined, {
+				const markdownTheme = timelineAnswer ? getSummaryMarkdownTheme(this.markdownTheme) : this.markdownTheme;
+				const markdown = new Markdown(content.text.trim(), timelineAnswer ? 0 : 1, 0, markdownTheme, undefined, {
 					baseUrl: this.baseUrl,
 					transform:
 						mermaidTransform && ((md, availableWidth) => mermaidTransform(md, availableWidth, isStreaming)),
 				});
 				this.blockMarkdowns.set(i, markdown);
 				this.lastBlockTexts.set(i, content.text.trim());
-				this.contentContainer.addChild(markdown);
+				if (timelineAnswer) {
+					this.contentContainer.addChild(summaryStarted ? this.summaryGap() : this.summaryLead(message));
+					summaryStarted = true;
+					this.contentContainer.addChild(new TimelineAnswerBody(markdown, this.lane));
+				} else {
+					this.contentContainer.addChild(markdown);
+				}
 			} else if (content?.type === "thinking" && content.thinking.trim()) {
 				// U6 noise cut: the collapsed view renders NO thinking rows at all -
 				// the turn's aggregate line carries the segment count (`思考 N 段`).
@@ -375,8 +492,8 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 				const hasVisibleContentAfter = message.content
 					.slice(i + 1)
 					.some(
-						(c, index) =>
-							(c?.type === "text" && c.text.trim() && !foldsText(i + 1 + index)) ||
+						(c) =>
+							(c?.type === "text" && c.text.trim() && !foldsText) ||
 							(c?.type === "thinking" && rendersThinking(c)),
 					);
 
@@ -413,9 +530,16 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 			}
 		}
 
+		if (timelineAnswer) {
+			const lane = this.lane;
+			this.contentContainer.addChild(
+				new TimelineRows((width) => [timelineRow({ main: "rail", lane }, "", "", width)]),
+			);
+		}
+
 		// The leading Spacer already separates the message from the turn head; the
 		// error surfaces add one only when rendered text sits above them.
-		const bodyAboveError = this.contentContainer.children.length > (hasVisibleContent ? 1 : 0);
+		const bodyAboveError = this.contentContainer.children.length > (leadingSpacer ? 1 : 0);
 		if (message.stopReason === "aborted") {
 			const reason = message.errorMessage;
 			const plainInterrupt = !reason || isPlainInterrupt(reason);
@@ -442,6 +566,37 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 		) {
 			this.contentContainer.addChild(new Spacer(1));
 		}
+	}
+
+	/**
+	 * Two empty main-line rows, `HH:MM ◆ 总结` and an empty answer row: what opens
+	 * the summary. While the message still streams it may yet turn out to be a
+	 * step that ends in a tool call, so only the two gap rows show; the header
+	 * follows once the message has finished without one.
+	 */
+	private summaryLead(message: AssistantMessage): Component {
+		const lane = this.lane;
+		const streaming = this.isStreaming;
+		const time = Number.isFinite(message.timestamp) ? formatTimelineTime(message.timestamp) : undefined;
+		return new TimelineRows(
+			(width) => [
+				timelineRow({ main: "rail", lane }, "", "", width),
+				timelineRow({ main: "rail", lane }, "", "", width),
+				...(streaming
+					? []
+					: [
+							timelineRow({ time, main: "ai", lane }, theme.bold(theme.fg("timelineAi", "总结")), "", width),
+							timelineRow({ main: "answer", lane }, "", "", width),
+						]),
+			],
+			[""],
+		);
+	}
+
+	/** An empty answer row between two text blocks of one summary. */
+	private summaryGap(): Component {
+		const lane = this.lane;
+		return new TimelineRows((width) => [timelineRow({ main: "answer", lane }, "", "", width)]);
 	}
 
 	private createErrorComponent(message: string, prefix?: string): Component {

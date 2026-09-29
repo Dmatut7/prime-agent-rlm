@@ -383,7 +383,7 @@ describe("ENG-4531 agent message UI", () => {
 		expect(assistantThenMessage[2]?.render(120)[0]).toBe("");
 	});
 
-	it("insets agent-message rows under a quiet turn so they line up with its steps", () => {
+	it("draws an agent-message row on the timeline in the quiet mode and keeps the legacy row otherwise", () => {
 		const second = createAgentSessionMessage(createPayload("Use shard seven."));
 		const options = {
 			ui: { requestRender: () => {} } as unknown as TUI,
@@ -401,7 +401,7 @@ describe("ENG-4531 agent message UI", () => {
 				?.render(120)
 				.find((line) => line.includes("◇")) ?? "",
 		);
-		expect(row.startsWith("   ◇ ")).toBe(true);
+		expect(row).toMatch(/^ \d\d:\d\d {3}│ {2}◇ {3}Planner 发来 {3}Use shard seven/);
 		const legacy = buildConversationComponents([fauxAssistantMessage("working"), second], {
 			...options,
 			processMode: "legacy",
@@ -433,8 +433,9 @@ describe("ENG-4531 agent message UI", () => {
 
 		addMessage(first);
 		addMessage(second);
-		expect(chatContainer.children[0]?.render(120)[0]).toBe("");
-		expect(chatContainer.children[1]?.render(120)[0]).not.toBe("");
+		// On the timeline the space above a block of rows is one blank main-line row, drawn once.
+		expect(stripAnsi(chatContainer.children[0]?.render(120)[0] ?? "").trimEnd()).toBe("         │");
+		expect(stripAnsi(chatContainer.children[1]?.render(120)[0] ?? "")).toMatch(/^ \d\d:\d\d {3}│ {2}◇ /);
 
 		addMessage(fauxAssistantMessage(fauxToolCall("ipython", { code: "print('live')" }), { stopReason: "toolUse" }));
 		expect(chatContainer.children[2]?.render(120)[0]).not.toBe("");
@@ -456,7 +457,8 @@ describe("ENG-4531 agent message UI", () => {
 
 		chatContainer.addChild(new Container());
 		addMessage(second);
-		expect(chatContainer.children[6]?.render(120)[0]).toBe("");
+		// An empty component above draws nothing, so the block still opens with its blank main-line row.
+		expect(stripAnsi(chatContainer.children[6]?.render(120)[0] ?? "").trimEnd()).toBe("         │");
 	});
 
 	it("renders persisted agent messages with a null sender", () => {

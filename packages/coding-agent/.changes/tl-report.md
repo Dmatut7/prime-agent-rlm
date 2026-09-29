@@ -1,0 +1,4 @@
+- Changed a subagent's report to one row on the timeline that says who came back, what it was about and its one-sentence conclusion (red for a must-fix, amber for a should-fix), opens to the whole report on a click, and is followed by a closing row once the last subagent is back.
+- Changed the notices that a subagent finished without a word or was cancelled to stay out of sight until "完整过程" is on, so they no longer sit in the turn's box; a subagent that failed or went quiet still shows as its own row.
+- Changed a run woken only by such notices that dispatched nothing, changed no files, saved no memory and ended without an unfixed error to draw nothing unless "完整过程" is on, however long its reply.
+- Fixed the answer a turn ended on being folded away when a subagent's notice woke the AI afterwards: the woken run now starts a turn of its own, live and when the session is reopened alike.

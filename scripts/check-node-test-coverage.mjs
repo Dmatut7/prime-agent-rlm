@@ -119,65 +119,88 @@ function xmlEscape(value) {
 }
 
 /**
- * One junit XML report, reduced to what the gate judges. Testcases directly under
- * `<testsuites>` are file-level results: node emits one per test file that failed to load,
- * named after the file. Everything else is grouped by `<testsuite>` (a `describe` block).
+ * One junit XML report, reduced to what the gate judges. `describe` blocks are `<testsuite>`
+ * elements and nest; every `<testcase>` belongs to the innermost suite still open when it
+ * appears, so a test that follows a nested describe is counted with its own suite. Testcases
+ * with no open suite are file-level results: node emits a failing one per test file that failed
+ * to load, named after the file, and a plain one per top-level `test()`.
  */
 function inspectReport(report, label) {
 	const text = typeof report === "string" ? report : "";
 	const suites = [];
-	for (const match of text.matchAll(/<testsuite\b([^>]*)>([\s\S]*?)<\/testsuite>/g)) {
-		const attributes = parseAttributes(match[1]);
-		const body = match[2];
-		const cases = [];
-		for (const caseMatch of body.matchAll(/<testcase\b([^>]*?)(?:\/>|>([\s\S]*?)<\/testcase>)/g)) {
-			const caseAttributes = parseAttributes(caseMatch[1]);
-			const caseBody = caseMatch[2] ?? "";
-			cases.push({
-				name: caseAttributes.name ?? "?",
-				skipped: caseBody.includes("<skipped"),
-				failed: caseBody.includes("<failure") || caseBody.includes("<error"),
-			});
+	const topLevelCases = [];
+	const open = [];
+	const tags = /<testsuite\b([^>]*?)(\/?)>|<\/testsuite>|<testcase\b([^>]*?)(?:\/>|>([\s\S]*?)<\/testcase>)/g;
+	for (const match of text.matchAll(tags)) {
+		if (match[0] === "</testsuite>") {
+			open.pop();
+			continue;
 		}
-		const counts = {
-			passed: cases.filter((entry) => !entry.skipped && !entry.failed).length,
-			failed: cases.filter((entry) => entry.failed).length,
-			notRun: cases.filter((entry) => entry.skipped).length,
+		if (match[0].startsWith("<testsuite")) {
+			const suite = {
+				name: parseAttributes(match[1]).name ?? "?",
+				parent: open.length > 0 ? open[open.length - 1] : null,
+				cases: [],
+				children: [],
+			};
+			suite.parent?.children.push(suite);
+			suites.push(suite);
+			if (match[2] !== "/") open.push(suite);
+			continue;
+		}
+		const caseBody = match[4] ?? "";
+		const entry = {
+			name: parseAttributes(match[3]).name ?? "?",
+			skipped: caseBody.includes("<skipped"),
+			failed: caseBody.includes("<failure") || caseBody.includes("<error"),
 		};
-		suites.push({
-			name: attributes.name ?? "?",
-			total: cases.length,
-			counts,
-			allNotRun: cases.length > 0 && counts.notRun === cases.length,
-		});
+		(open.length > 0 ? open[open.length - 1].cases : topLevelCases).push(entry);
 	}
-	// Top-level testcases: the remainder once every testsuite block is blanked out.
-	const withoutSuites = text.replace(/<testsuite\b[^>]*>[\s\S]*?<\/testsuite>/g, "");
-	const fileFailures = [];
-	for (const caseMatch of withoutSuites.matchAll(/<testcase\b([^>]*?)(?:\/>|>([\s\S]*?)<\/testcase>)/g)) {
-		const caseAttributes = parseAttributes(caseMatch[1]);
-		const caseBody = caseMatch[2] ?? "";
-		if (caseBody.includes("<failure") || caseBody.includes("<error")) {
-			fileFailures.push(caseAttributes.name ?? "?");
-		}
+
+	// A suite ran nothing when every test in it, nested suites included, was skipped. Only the
+	// outermost such suite is reported, so one skipped block is one nothing-suite however deep it nests.
+	const ranInSubtree = (suite) =>
+		suite.cases.filter((entry) => !entry.skipped).length +
+		suite.children.reduce((sum, child) => sum + ranInSubtree(child), 0);
+	const totalInSubtree = (suite) =>
+		suite.cases.length + suite.children.reduce((sum, child) => sum + totalInSubtree(child), 0);
+	for (const suite of suites) {
+		suite.total = suite.cases.length;
+		suite.counts = {
+			passed: suite.cases.filter((entry) => !entry.skipped && !entry.failed).length,
+			failed: suite.cases.filter((entry) => entry.failed).length,
+			notRun: suite.cases.filter((entry) => entry.skipped).length,
+		};
+		suite.subtreeTotal = totalInSubtree(suite);
+		suite.nothingRan = suite.subtreeTotal > 0 && ranInSubtree(suite) === 0;
 	}
+	for (const suite of suites) {
+		suite.allNotRun = suite.nothingRan && !suite.parent?.nothingRan;
+	}
+
+	const fileFailures = topLevelCases.filter((entry) => entry.failed).map((entry) => entry.name);
 	const summary = {};
 	for (const match of text.matchAll(/<!--\s*([a-z_]+)\s+(\d+)\s*-->/g)) {
 		summary[match[1]] = Number.parseInt(match[2], 10);
 	}
-	const totalTests = suites.reduce((sum, suite) => sum + suite.total, 0) + fileFailures.length;
-	const ran = suites.reduce((sum, suite) => sum + suite.counts.passed + suite.counts.failed, 0) + fileFailures.length;
+	const leaves = [...suites.flatMap((suite) => suite.cases), ...topLevelCases];
+	// A `describe` skipped by its options is one skipped testcase that the runner's summary counts
+	// neither in `tests` nor in `skipped`/`todo`; an `it.skip`/`it.todo` is counted in both. Only
+	// skipped cases beyond what the summary itemises are discounted, and only when it itemises any.
+	const skippedCases = leaves.filter((entry) => entry.skipped).length;
+	const itemised = (summary.skipped ?? 0) + (summary.todo ?? 0);
+	const uncounted = Number.isInteger(summary.skipped) ? Math.max(0, skippedCases - itemised) : 0;
 	return {
 		label,
-		totalTests,
-		ran,
+		testcaseElements: leaves.length,
+		totalTests: leaves.length - uncounted,
+		ran: leaves.filter((entry) => !entry.skipped).length,
 		nothingSuites: suites.filter((suite) => suite.allNotRun).length,
 		suites,
 		fileFailures,
 		summary,
 	};
 }
-
 
 function limitsFrom(options) {
 	return {
@@ -189,7 +212,7 @@ function limitsFrom(options) {
 
 function decide(inspection, limits) {
 	const failures = [];
-	if (inspection.suites.length === 0 && inspection.fileFailures.length === 0) {
+	if (inspection.totalTests === 0) {
 		failures.push(`${inspection.label}: the report lists no test suites at all (nothing was collected)`);
 	}
 	if (inspection.totalTests < limits.minTests) {
@@ -208,7 +231,7 @@ function decide(inspection, limits) {
 		failures.push(
 			`${inspection.label}: ${allNotRun.length} suite(s) ran nothing (describe.skip shape), over the ` +
 				`--max-nothing-suites budget of ${limits.maxNothingSuites}: ${allNotRun
-					.map((suite) => `${suite.name} (${suite.total} skipped)`)
+					.map((suite) => `${suite.name} (${suite.subtreeTotal} skipped)`)
 					.join(", ")}`,
 		);
 	}
@@ -218,8 +241,12 @@ function decide(inspection, limits) {
 	// The parser must agree with the runner's own summary: a regex that stopped matching the
 	// junit shape would otherwise count its way to a green gate.
 	if (Number.isInteger(inspection.summary.tests) && inspection.summary.tests !== inspection.totalTests) {
+		const discounted =
+			inspection.testcaseElements === inspection.totalTests
+				? ""
+				: ` (${inspection.testcaseElements} testcase elements, less ${inspection.testcaseElements - inspection.totalTests} skipped describe(s) the runner does not count)`;
 		failures.push(
-			`${inspection.label}: this parser counted ${inspection.totalTests} test(s) but the report's own ` +
+			`${inspection.label}: this parser counted ${inspection.totalTests} test(s)${discounted} but the report's own ` +
 				`summary says ${inspection.summary.tests} - the junit shape and this parser disagree`,
 		);
 	}
@@ -319,6 +346,71 @@ function driftingSummaryReport() {
 	return raw;
 }
 
+/** Hand-written junit body: `<testsuites>`, the given lines, then the runner's own summary comments. */
+function rawReport(lines, summary) {
+	const comments = Object.entries(summary).map(([key, value]) => `\t<!-- ${key} ${value} -->`);
+	return ['<?xml version="1.0" encoding="utf-8"?>', "<testsuites>", ...lines, ...comments, "</testsuites>"].join("\n");
+}
+
+const passLine = (name, depth = 2) => `${"\t".repeat(depth)}<testcase name="${name}" time="0.0001" classname="test"/>`;
+const skipLine = (name, depth = 2, type = "skipped") =>
+	`${"\t".repeat(depth)}<testcase name="${name}" time="0.0001" classname="test">\n${"\t".repeat(depth + 1)}<skipped type="${type}" message="true"/>\n${"\t".repeat(depth)}</testcase>`;
+const openSuite = (name, depth = 1) => `${"\t".repeat(depth)}<testsuite name="${name}" time="0.001" tests="0" failures="0" skipped="0">`;
+const closeSuite = (depth = 1) => `${"\t".repeat(depth)}</testsuite>`;
+
+/** Two testcases with a nested describe between them: the one after the nested suite is a sibling. */
+function nestedSuiteReport() {
+	return rawReport(
+		[openSuite("outer"), passLine("case A"), openSuite("inner", 2), passLine("case B", 3), closeSuite(2), passLine("case C"), closeSuite()],
+		{ tests: 3 },
+	);
+}
+
+/** A `describe(..., { skip })` is one skipped testcase that the runner leaves out of `tests`. */
+function skippedDescribeReport() {
+	return rawReport(
+		[openSuite("outer"), passLine("case A"), passLine("case B"), skipLine("skipped describe"), closeSuite()],
+		{ tests: 2, skipped: 0, todo: 0 },
+	);
+}
+
+/** An `it.skip` is counted by the runner in both `tests` and `skipped`. */
+function countedSkipReport() {
+	return rawReport(
+		[openSuite("outer"), passLine("case A"), passLine("case B"), skipLine("case C"), closeSuite()],
+		{ tests: 3, skipped: 1, todo: 0 },
+	);
+}
+
+/** A passing suite that nests a suite whose every test is skipped. */
+function nestedNothingSuiteReport() {
+	return rawReport(
+		[openSuite("outer"), passLine("case A"), openSuite("inner", 2), skipLine("case B", 3), skipLine("case C", 3), closeSuite(2), closeSuite()],
+		{ tests: 3, skipped: 2, todo: 0 },
+	);
+}
+
+/** Copied from a real `node --test` junit run (node 22) over a file with every one of those shapes. */
+function nodeEmittedReport() {
+	return rawReport(
+		[
+			openSuite("outer"),
+			passLine("a"),
+			openSuite("inner", 2),
+			passLine("b", 3),
+			closeSuite(2),
+			passLine("c"),
+			skipLine("skipped one"),
+			skipLine("todo one", 2, "todo"),
+			skipLine("skipped describe"),
+			closeSuite(),
+			passLine("top-level pass", 1),
+			skipLine("top todo", 1, "todo"),
+		],
+		{ tests: 7, pass: 4, fail: 0, cancelled: 0, skipped: 1, todo: 2 },
+	);
+}
+
 function runSelfTest() {
 	const dir = mkdtempSync(join(tmpdir(), "node-test-coverage-selftest-"));
 	const controls = [];
@@ -412,6 +504,37 @@ function runSelfTest() {
 			name: "a report with no summary comment is judged from its elements",
 			expectPass: true,
 			run: () => planted(reportXml([suiteXml("keys", ["pass", "pass"])], { summary: false }), "no-summary", { minTests: 2 }),
+		});
+
+		controls.push({
+			name: "nested suites: a testcase after a nested suite is counted",
+			expectPass: true,
+			run: () => planted(nestedSuiteReport(), "nested", { minTests: 3, minRanTests: 3 }),
+		});
+		controls.push({
+			name: "a skipped describe the runner does not count",
+			expectPass: true,
+			run: () => planted(skippedDescribeReport(), "skipped-describe", { minTests: 2, minRanTests: 2 }),
+		});
+		controls.push({
+			name: "an it.skip the runner does count is not discounted",
+			expectPass: true,
+			run: () => planted(countedSkipReport(), "counted-skip", { minTests: 3, minRanTests: 2 }),
+		});
+		controls.push({
+			name: "an it.skip the summary counted that the parser lost still fails",
+			expectPass: false,
+			run: () => planted(countedSkipReport().replace("tests 3", "tests 4"), "lost-case", { minTests: 3 }),
+		});
+		controls.push({
+			name: "nested all-skipped inner suite is still a nothing-suite",
+			expectPass: false,
+			run: () => planted(nestedNothingSuiteReport(), "nested-nothing", { minTests: 3, maxNothingSuites: 0 }),
+		});
+		controls.push({
+			name: "the shape node --test itself emits: nesting, skipped describe, todo, top-level tests",
+			expectPass: true,
+			run: () => planted(nodeEmittedReport(), "node-shape", { minTests: 7, minRanTests: 4, maxNothingSuites: 0 }),
 		});
 
 		const write = (name, report) => {

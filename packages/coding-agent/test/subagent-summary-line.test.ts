@@ -210,7 +210,7 @@ describe("SubagentSummaryLine", () => {
 		) => void;
 
 		update.call(mode, child("worker", "running"));
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("worker 运行中");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("worker 回答中");
 
 		update.call(mode, child("worker", "done", { activeSessionId: "active-worker" }));
 		expect(stripAnsi(line.render(100).join("\n"))).toContain("worker 空闲");
@@ -239,7 +239,7 @@ describe("SubagentSummaryLine", () => {
 		expect(stripAnsi(line.render(100).join("\n"))).toContain("worker 空闲");
 
 		update.call(mode, child("worker", "done", { activeSessionId: "resident-worker", activity: { kind: "waiting" } }));
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("worker 运行中");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("worker 回答中");
 
 		update.call(mode, child("worker", "done", { activeSessionId: "resident-worker" }));
 		expect(stripAnsi(line.render(100).join("\n"))).toContain("worker 空闲");
@@ -311,7 +311,7 @@ describe("SubagentSummaryLine", () => {
 		// One row for the whole family: the worker running, the stalled grandchild
 		// with its own block, marked 卡住.
 		expect(lines).toHaveLength(1);
-		expect(lines[0]).toContain("worker 运行中");
+		expect(lines[0]).toContain("worker 回答中");
 		expect(lines[0]).toContain("grandchild ⚠ 卡住");
 	});
 
@@ -1290,7 +1290,7 @@ describe("subagent panel rows (design board 06)", () => {
 	it("renders one row of blocks, one per child, in state order, with the state in words", () => {
 		const lines = panel().render(100).map(stripAnsi);
 		expect(lines).toHaveLength(1);
-		expect(lines[0]).toMatch(/^ {2}◇ review 运行中 {3}◇ docs 运行中 {3}◇ lint ✓ 已交回 /);
+		expect(lines[0]).toMatch(/^ {2}◇ review 回答中 {3}◇ docs 回答中 {3}◇ lint ✓ 已交回 /);
 		// No header, no per-child list, no rule.
 		expect(lines[0]).not.toContain("子代理 3");
 		expect(lines[0]).not.toContain("─");
@@ -1389,7 +1389,7 @@ describe("subagent panel rows (design board 06)", () => {
 			{ id: "i0", name: "vps-0", state: "idle" as const },
 		]);
 		const working = line.render(200).map(stripAnsi);
-		expect(working[0]).toContain("vps-run 运行中");
+		expect(working[0]).toContain("vps-run 回答中");
 		expect(working[0]).not.toContain("都做完了");
 	});
 

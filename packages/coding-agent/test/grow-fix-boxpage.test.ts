@@ -9,8 +9,8 @@ import { initTheme } from "../src/modes/interactive/theme/theme.js";
 import { addStep, host, type QuietTurn, quietTurn, T0 } from "./ui-blocks-helpers.js";
 
 /**
- * Walking a box with the keyboard in the fullscreen window: the box grows there, so it has no
- * inner scroll left and PageUp/PageDown page the whole transcript instead.
+ * Walking a turn's timeline with the keyboard: its lines grow with the turn and it has no inner scroll,
+ * so in the fullscreen window PageUp/PageDown page the whole transcript, and on an inline screen they move nothing.
  */
 
 const COLUMNS = 70;
@@ -72,11 +72,23 @@ function walkerMode(chat: Container, tui: TUI) {
 	return fake as any;
 }
 
+/** Opens the turn's one event with every step listed (`全部 ›` taken): nothing is open by default. */
+function listEverySteps(turn: QuietTurn): void {
+	turn.summary.render(COLUMNS);
+	const eventKey = turn.summary.getFocusOrder().find((key) => key.startsWith("ev:")) ?? "";
+	expect(eventKey).not.toBe("");
+	turn.summary.activate(eventKey);
+	turn.summary.render(COLUMNS);
+	expect(turn.summary.activate(`all:${eventKey}`)).toBe(true);
+	turn.summary.render(COLUMNS);
+}
+
 async function startWalk(options: { fullscreen: boolean }): Promise<Walk> {
 	const terminal = new VirtualTerminal(COLUMNS, ROWS);
 	const tui = new TUI(terminal);
-	const turn = quietTurn({ host: host({ growBox: () => options.fullscreen, viewportRows: () => ROWS }) });
+	const turn = quietTurn({ host: host({ viewportRows: () => ROWS }) });
 	for (let step = 0; step < STEPS; step++) addTimedCommand(turn, step);
+	listEverySteps(turn);
 	const chat = new Container();
 	chat.addChild(new Text("earlier chat", 0, 0));
 	chat.addChild(turn.summary);
@@ -93,7 +105,7 @@ async function startWalk(options: { fullscreen: boolean }): Promise<Walk> {
 	const steps = (): number[] =>
 		terminal
 			.getViewport()
-			.map((line) => /\$ echo step-(\d+)/.exec(stripAnsi(line))?.[1])
+			.map((line) => /\$ +echo step-(\d+)/.exec(stripAnsi(line))?.[1])
 			.filter((found): found is string => found !== undefined)
 			.map(Number);
 	return {
@@ -107,7 +119,7 @@ async function startWalk(options: { fullscreen: boolean }): Promise<Walk> {
 	};
 }
 
-describe("PageUp and PageDown while the keyboard walks a box in the fullscreen window", () => {
+describe("PageUp and PageDown while the keyboard walks the timeline in the fullscreen window", () => {
 	it("pages the transcript down, then back up", async () => {
 		const walk = await startWalk({ fullscreen: true });
 		const first = walk.steps();
@@ -137,14 +149,19 @@ describe("PageUp and PageDown while the keyboard walks a box in the fullscreen w
 	});
 });
 
-describe("PageUp and PageDown while the keyboard walks a box on an inline screen", () => {
-	it("keeps scrolling the box body itself, and leaves the screen alone", async () => {
+describe("PageUp and PageDown while the keyboard walks the timeline on an inline screen", () => {
+	it("has no body of its own to scroll: the screen keeps showing the newest lines", async () => {
 		const walk = await startWalk({ fullscreen: false });
 		expect(walk.tui.getScrollInfo()).toBeNull();
 		const before = walk.terminal.getViewport().join("\n");
+		const shown = walk.steps();
+		expect(shown.length).toBeGreaterThan(0);
+		expect(Math.max(...shown)).toBe(STEPS - 1);
 		await walk.press(PAGE_UP);
+		await walk.press(PAGE_DOWN);
 		const after = walk.terminal.getViewport().join("\n");
-		expect(after).not.toBe(before);
-		expect(stripAnsi(after)).toMatch(/step-\d+/);
+		expect(after).toBe(before);
+		expect(walk.steps()).toEqual(shown);
+		for (const gone of ["上面还有", "有新内容"]) expect(stripAnsi(after)).not.toContain(gone);
 	});
 });
