@@ -4,3 +4,7 @@
 - Fixed the `N 步 ▸` label losing its arrow on a narrow terminal: the arrow stays and the words give way first.
 - Fixed a report from a subagent the AI never dispatched, or a second report from one that was already back, drawing a closing `├──╯` line with no opening `├──╮`.
 - Fixed raw markdown (table rows, code fences, headings) showing on the live spinner line.
+- Changed a long stretch of events to show the first, the last two and the ones that carry news, with the rest folded into one `⋯  中间还有 N 件事 ▸` row that opens in place.
+- Changed the AI's events and the live spinner sentence to show its inline markdown as words: code without backticks, bold words bold, a link as its text.
+- Fixed subagents started from a Python cell missing their dispatch line, dotted lane and closing `├──╯` line.
+- Fixed empty rows: an answer-only turn no longer draws four between the question and its summary.
