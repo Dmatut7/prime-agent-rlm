@@ -119,6 +119,8 @@ describe("a replayed turn that ended on an interrupt or an error keeps its own c
 		expect(labelOf(summary).status).toBe("stopped");
 		// The stopped step is said on its own line once the event is opened; no line carries hours.
 		const closed = plain(summary.render(120));
+		expect(closed.slice(0, 2)).toEqual(["         │      ", "         │      "]);
+		closed.splice(0, 2);
 		expect(closed).toHaveLength(1);
 		expect(closed[0]?.trimEnd().endsWith("2 步 ▸")).toBe(true);
 		expect(summary.activate(summary.getFocusOrder()[0] ?? "")).toBe(true);

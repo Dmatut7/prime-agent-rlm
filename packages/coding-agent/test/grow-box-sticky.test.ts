@@ -62,7 +62,7 @@ describe("an open turn has no header to offer the window", () => {
 	it("keeps the lines where they are with no title line of its own and a blank above it", () => {
 		const turn = openTurn(3);
 		turn.summary.setHeaderShown(false);
-		turn.summary.setLeadingBlank(true);
+		turn.summary.setLeadingRows(1);
 		const lines = turn.summary.render(WIDTH);
 		const shown = plain(lines);
 		expect(turn.summary.getStickyHeaders()).toEqual([]);

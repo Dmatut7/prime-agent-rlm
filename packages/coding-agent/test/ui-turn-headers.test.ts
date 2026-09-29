@@ -86,10 +86,12 @@ describe("a woken turn draws no title, whichever title is above it", () => {
 			later,
 		]);
 		expect([first, woken, later].map(shows)).toEqual([false, false, false]);
-		for (const summary of [first, woken, later]) {
-			expect(plain(summary.render(100))[0]).toMatch(EVENT_LINE);
-			expect(eventLines(summary)).toHaveLength(1);
-		}
+		// The turn the question opened starts with two empty rows, a woken turn with one.
+		const opening = [first, woken, later].map((summary) =>
+			plain(summary.render(100)).findIndex((line) => EVENT_LINE.test(line)),
+		);
+		expect(opening).toEqual([2, 1, 1]);
+		for (const summary of [first, woken, later]) expect(eventLines(summary)).toHaveLength(1);
 	});
 
 	it("draws no title for the first turn, for a turn after a user message or for a turn on another model", () => {
@@ -102,7 +104,7 @@ describe("a woken turn draws no title, whichever title is above it", () => {
 		const prompted = turn("glm-5.3-prime", true);
 		resolveTurnHeaders([before, new UserMessageComponent("再来一次"), prompted]);
 		expect(shows(prompted)).toBe(false);
-		expect(plain(prompted.render(100))[0]).toMatch(EVENT_LINE);
+		expect(plain(prompted.render(100))[2]).toMatch(EVENT_LINE);
 
 		const other = turn("glm-5.3-prime", true);
 		const switched = turn("gpt-5.5", false);
@@ -110,8 +112,8 @@ describe("a woken turn draws no title, whichever title is above it", () => {
 		resolveTurnHeaders([other, new AgentMessageComponent(handedBack("m3")), switched, back]);
 		// A model change starts no title over; a turn straight under another turn gets a blank rail row instead.
 		expect([shows(other), shows(switched), shows(back)]).toEqual([false, false, false]);
-		expect(plain(other.render(100))[0]).toMatch(EVENT_LINE);
-		expect(plain(switched.render(100))[0]).toMatch(EVENT_LINE);
+		expect(plain(other.render(100))[2]).toMatch(EVENT_LINE);
+		expect(plain(switched.render(100))[1]).toMatch(EVENT_LINE);
 		const backLines = plain(back.render(100));
 		expect(backLines).toHaveLength(2);
 		expect(backLines[0]).toBe(RAIL_ROW);
@@ -123,8 +125,8 @@ describe("a woken turn draws no title, whichever title is above it", () => {
 		const after = turn("glm-5.3-prime", false);
 		resolveTurnHeaders([before, compactionNotice(), new AgentMessageComponent(handedBack("m4")), after]);
 		expect([shows(before), shows(after)]).toEqual([false, false]);
-		expect(plain(before.render(100))[0]).toMatch(EVENT_LINE);
-		expect(plain(after.render(100))[0]).toMatch(EVENT_LINE);
+		expect(plain(before.render(100))[2]).toMatch(EVENT_LINE);
+		expect(plain(after.render(100))[1]).toMatch(EVENT_LINE);
 	});
 
 	it("leaves the woken turn a working event line and click area when no title is drawn", () => {
@@ -132,13 +134,15 @@ describe("a woken turn draws no title, whichever title is above it", () => {
 		const woken = turn("glm-5.3-prime", false);
 		resolveTurnHeaders([first, new AgentMessageComponent(handedBack("m5")), woken]);
 		const lines = plain(woken.render(100));
-		expect(lines).toHaveLength(1);
-		expect(lines[0]).toMatch(/^ \d\d:\d\d {3}◆ {6}跑了 1 条命令 +1 步 ▸ {2}$/);
+		// One empty row under the return row, then the event line.
+		expect(lines).toHaveLength(2);
+		expect(lines[0]).toBe(RAIL_ROW);
+		expect(lines[1]).toMatch(/^ \d\d:\d\d {3}◆ {6}跑了 1 条命令 +1 步 ▸ {2}$/);
 		const regions = woken.getClickRegions();
-		const eventRow = regions.find((region) => region.line === 0 && !region.passive);
+		const eventRow = regions.find((region) => region.line === 1 && !region.passive);
 		expect(eventRow).toBeDefined();
 		expect(eventRow).toMatchObject({ col: 0, width: 100 });
-		expect(regions.some((region) => region.line !== 0)).toBe(false);
+		expect(regions.some((region) => region.line !== 1)).toBe(false);
 		const before = woken.state.boxOpen;
 		eventRow?.onClick({ row: 0, col: 0 });
 		expect(woken.state.boxOpen).toBe(!before);
@@ -260,8 +264,10 @@ describe("a replayed conversation draws no title, one turn per wake-up", () => {
 		const [question, woken, followUp] = summaries;
 		const stepLine = (at: number) => new RegExp(`^ ${formatTimelineTime(at)} {3}◆ {6}做了 1 步 +1 步 ▸ {2}$`);
 		const first = plain(question?.render(100) ?? []);
-		expect(first).toHaveLength(1);
-		expect(first[0]).toMatch(stepLine(T0 + 1_000));
+		// Two empty rows under the question, then its event.
+		expect(first).toHaveLength(3);
+		expect(first.slice(0, 2)).toEqual([RAIL_ROW, RAIL_ROW]);
+		expect(first[2]).toMatch(stepLine(T0 + 1_000));
 		// The woken turn has its own event, for the run the handed-back message woke.
 		const second = plain(woken?.render(100) ?? []).filter((line) => EVENT_LINE.test(line));
 		expect(second).toHaveLength(1);

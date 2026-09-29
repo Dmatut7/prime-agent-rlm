@@ -62,6 +62,13 @@ export function boxOuterWidth(width: number): number {
 	return Math.max(BOX_MIN_OUTER, Math.floor(width) - 1);
 }
 
+/** A row that is only the main line and its lane: what a return keeps above itself. */
+const RAIL_GAP_ROW = /^(?:\x1b\[[0-9;]*m| )*│(?:\x1b\[[0-9;]*m| |┆)*$/;
+
+function startsWithRailGap(line: string | undefined): boolean {
+	return line !== undefined && RAIL_GAP_ROW.test(line);
+}
+
 /** The click area of one framed line: the frame and its margin, never past the terminal's last column. */
 export function boxRegionWidth(outer: number, width: number): number {
 	return Math.min(outer + 1, Math.max(1, Math.floor(width)));
@@ -283,8 +290,8 @@ export interface BoxRenderInput {
 	lanes?: TimelineLaneTracker;
 	/** Rows that landed inside the turn, each drawn before the first event that started after it. */
 	inline?: readonly InlineRow[];
-	/** A blank line first: a turn a message woke, nothing else separates it from what is above. */
-	leadingGap?: boolean;
+	/** Empty main-line rows first: two under the question, one for a turn a message woke; none when what is above ends in a blank line. */
+	leadingRows?: number;
 	/** The first line leaves its right side out: block navigation puts its key hint there. */
 	dropFirstRight?: boolean;
 	/** An event was opened or closed (the host records what the user opened). */
@@ -447,14 +454,40 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 	const flushInline = (before: number): void => {
 		for (let row = inline[nextInline]; row && row.at < before; row = inline[nextInline]) {
 			nextInline += 1;
-			specs.push({ gutter: { main: "rail" }, content: "", raw: row });
+			// A row keeps a blank row above itself; two empty rows already there are enough.
+			const shared = trailingGaps() >= 2 && startsWithRailGap(row.lines[0]);
+			specs.push({
+				gutter: { main: "rail" },
+				content: "",
+				raw: shared
+					? {
+							...row,
+							lines: row.lines.slice(1),
+							regions: row.regions
+								.map((region) => ({ ...region, line: region.line - 1 }))
+								.filter((region) => region.line >= 0),
+						}
+					: row,
+			});
 		}
+	};
+	/** How many empty main-line rows end the lines so far. */
+	const trailingGaps = (): number => {
+		let count = 0;
+		for (let index = specs.length - 1; index >= 0; index--) {
+			const spec = specs[index];
+			if (!spec || spec.raw || spec.gutter.main !== "rail" || spec.content !== "") break;
+			count += 1;
+		}
+		return count;
 	};
 	const bodyWidth = Math.max(8, width - TIMELINE_CONTENT_COL - 2);
 	const detailWidth = Math.max(8, bodyWidth - STEP_INDENT - STEP_GLYPH_COLS);
 
-	if (input.leadingGap && (input.events.length > 0 || input.tail))
-		gap(tracker && startedOut && tracker.active ? "on" : "off");
+	if (input.events.length > 0 || input.tail || inline.length > 0) {
+		for (let row = 0; row < (input.leadingRows ?? 0); row++)
+			gap(tracker && startedOut && tracker.active ? "on" : "off");
+	}
 
 	input.events.forEach((event, index) => {
 		flushInline(event.at);

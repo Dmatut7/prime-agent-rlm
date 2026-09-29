@@ -83,7 +83,7 @@ describe("the event line's row", () => {
 		it(`is the row a folded event stays on, ${name}`, () => {
 			const turn = openTurn(6);
 			turn.summary.setHeaderShown(shown);
-			turn.summary.setLeadingBlank(blank);
+			turn.summary.setLeadingRows(blank ? 1 : 0);
 			turn.summary.toggleBox();
 			const open = plain(turn.summary.render(WIDTH));
 			const line = open.findIndex((row) => row.trimEnd().endsWith("6 步 ▴"));

@@ -8,7 +8,7 @@ import type { AgentConnectionRlmChildAgentSnapshot } from "../src/modes/agent-co
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import { timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
 import { type ThemeColor, theme } from "../src/modes/interactive/theme/theme.js";
-import { useTruecolorTheme } from "./ui-blocks-helpers.js";
+import { quietTurn, useTruecolorTheme } from "./ui-blocks-helpers.js";
 import { handedBack, LiveChat } from "./ui-live-chat.js";
 
 /**
@@ -437,6 +437,163 @@ describe("Tl2Live: the review, one subagent back, the AI at its checks", () => {
 			drow("", " ", "on", "A、C、D 还在干活"),
 		];
 		expectRows(rows, expected);
+	});
+});
+
+describe("the empty rows between blocks, counted", () => {
+	/** A turn's command runs before its answer, as in a tool loop. */
+	function withCommands(chat: LiveChat): LiveChat {
+		chat.summaries().forEach((summary, index) => {
+			const entries = summary.state.timeline.entries;
+			const before = entries.length;
+			const call = command(`w${index}`, `echo ${index}`, { start: at(18, 47, index) });
+			summary.state.addStep({
+				toolCallId: call.id,
+				toolName: "ipython",
+				args: { code: call.code },
+				status: "queued",
+			});
+			summary.state.timeline.noteMessage(
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: call.id, name: "ipython", arguments: { code: call.code } }],
+					api: "test-api",
+					provider: "test-provider",
+					model: "glm-5.3-prime",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: at(18, 47, index) - 1,
+				},
+				true,
+			);
+			summary.state.timeline.mergeStep(call.id, "ipython", { code: call.code }, { details: call.details }, false);
+			summary.state.setStepStatus(call.id, "done");
+			entries.unshift(...entries.splice(before));
+		});
+		return chat;
+	}
+
+	/** The rows with the clock words and the durations made the same, so rows compare by shape. */
+	function shape(chat: LiveChat): string[] {
+		return screen(chat).map((row) => row.replace(/^ \d\d:\d\d/, " HH:MM").replace(/用了 \d+ 秒/, "用了 N 秒"));
+	}
+
+	const row = (main: string, content = "", right = "") => drow("", main, "off", content, right);
+	const stamped = (main: string, content = "", right = "") => drow("HH:MM", main, "off", content, right);
+
+	it("puts two empty rows between the question and its summary when the turn has nothing to list", () => {
+		setMotionReduced(true);
+		vi.useFakeTimers();
+		vi.setSystemTime(at(18, 47));
+		const chat = new LiveChat();
+		chat.setClock(at(18, 47));
+		chat.prompt("你好", { answer: "在的。" });
+		vi.advanceTimersByTime(1000);
+		expect(shape(chat)).toEqual([
+			stamped("●", "你   你好"),
+			row("│"),
+			row("│"),
+			stamped("◆", "总结"),
+			row("┃"),
+			row("┃", "在的。"),
+			row("│"),
+			row("╵", "✓ 用了 N 秒", "完整过程 ▸"),
+		]);
+	});
+
+	it("puts two empty rows between the question and the events, and two before the summary, as Tl2Done has them", () => {
+		setMotionReduced(true);
+		vi.useFakeTimers();
+		vi.setSystemTime(at(18, 47));
+		const chat = new LiveChat();
+		chat.setClock(at(18, 47));
+		chat.prompt("跑一下", { answer: "跑完了。" });
+		withCommands(chat);
+		vi.advanceTimersByTime(1000);
+		expect(shape(chat)).toEqual([
+			stamped("●", "你   跑一下"),
+			row("│"),
+			row("│"),
+			stamped("◆", "跑了 1 条命令", "1 步 ▸"),
+			row("│"),
+			row("│"),
+			stamped("◆", "总结"),
+			row("┃"),
+			row("┃", "跑完了。"),
+			row("│"),
+			row("╵", "✓ 用了 N 秒", "完整过程 ▸"),
+		]);
+	});
+
+	it("puts one empty row between a return and the woken turn's first event, and never three in a row", () => {
+		setMotionReduced(true);
+		vi.useFakeTimers();
+		vi.setSystemTime(at(18, 47));
+		const chat = new LiveChat();
+		chat.setClock(at(18, 47));
+		chat.prompt("审查", { answer: "派出去了。" });
+		chat.wake("m1", { name: "B", answer: "B 回来了，没问题。" });
+		withCommands(chat);
+		vi.advanceTimersByTime(1000);
+		const rows = shape(chat);
+		expect(rows).toEqual([
+			stamped("●", "你   审查"),
+			row("│"),
+			row("│"),
+			stamped("◆", "跑了 1 条命令", "1 步 ▸"),
+			row("│"),
+			row("│"),
+			stamped("◆", "总结"),
+			row("┃"),
+			row("┃", "派出去了。"),
+			// The summary's own row, and the one the return keeps above itself.
+			row("│"),
+			row("│"),
+			drow("HH:MM", "│", "sub", "B 交回   审查完毕", "›"),
+			// The woken turn's lines open with one empty row.
+			row("│"),
+			stamped("◆", "跑了 1 条命令", "1 步 ▸"),
+			row("│"),
+			row("│"),
+			stamped("◆", "总结"),
+			row("┃"),
+			row("┃", "B 回来了，没问题。"),
+			row("│"),
+			row("╵", "✓ 用了 N 秒", "完整过程 ▸"),
+		]);
+		let run = 0;
+		let longest = 0;
+		for (const line of rows) {
+			run = /^ {9}│[ ┆]*$/.test(line) ? run + 1 : 0;
+			longest = Math.max(longest, run);
+		}
+		expect(longest).toBe(2);
+		chat.flow.dispose();
+	});
+
+	it("keeps two empty rows above a return that opens a turn, not three", () => {
+		setMotionReduced(true);
+		const turn = quietTurn({ live: false });
+		turn.summary.setLeadingRows(2);
+		// A report that landed before the turn drew a line of its own: the row is the first thing the turn draws.
+		turn.summary.addInlineRow(
+			{ render: () => ["         │      ", " 18:55   │  ◇   B 交回   审查完毕"], invalidate: () => {} },
+			at(18, 55),
+		);
+		turn.state.markTurnEnded(at(18, 56));
+		const lines = plain(turn.summary.render(W));
+		expect(lines.map((line) => line.trimEnd())).toEqual([
+			"         │",
+			"         │",
+			" 18:55   │  ◇   B 交回   审查完毕",
+		]);
 	});
 });
 

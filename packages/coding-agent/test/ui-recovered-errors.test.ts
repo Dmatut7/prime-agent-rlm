@@ -227,6 +227,13 @@ describe("a turn cut off after a failed step corrected nothing", () => {
 	}
 
 	const prompt: AgentMessage = { role: "user", content: "跑一下", timestamp: T0 };
+
+	/** The turn's lines without the two empty rows it opens with under the question. */
+	function ownLines(summary: TurnSummaryComponent): string[] {
+		const lines = summary.render(WIDTH);
+		expect(plain(lines.slice(0, 2))).toEqual(["         │      ", "         │      "]);
+		return lines.slice(2);
+	}
 	const FAILED_LINE = /^ \d\d:\d\d {3}◆ {6}运行 false 出错：command failed exit 1 +▸ {2}$/;
 
 	/** The red line of the failure, its count in the header, and what says it was not corrected. */
@@ -242,7 +249,7 @@ describe("a turn cut off after a failed step corrected nothing", () => {
 
 	it("keeps the red line and the count when the run ended right after the failed step", () => {
 		const summary = replayed([prompt, call("t1", T0 + 1_000), failedResult("t1", T0 + 2_000)]);
-		const closed = summary.render(WIDTH);
+		const closed = ownLines(summary);
 		expect(closed).toHaveLength(1);
 		expectAlarm(summary, closed);
 	});
@@ -254,7 +261,7 @@ describe("a turn cut off after a failed step corrected nothing", () => {
 			failedResult("t1", T0 + 2_000),
 			assistant(T0 + 3_000, [{ type: "text", text: "让我再试" }], "length"),
 		]);
-		const closed = summary.render(WIDTH);
+		const closed = ownLines(summary);
 		expect(closed).toHaveLength(1);
 		expectAlarm(summary, closed);
 	});
@@ -267,7 +274,7 @@ describe("a turn cut off after a failed step corrected nothing", () => {
 			call("t2", T0 + 3_000),
 			fixedResult("t2", T0 + 4_000),
 		]);
-		const closed = summary.render(WIDTH);
+		const closed = ownLines(summary);
 		expect(closed).toHaveLength(2);
 		expectAlarm(summary, closed);
 		expect(plain(closed)[1]).toMatch(/^ \d\d:\d\d {3}◆ {6}跑了 1 条命令 +1 步 ▸ {2}$/);
@@ -282,7 +289,7 @@ describe("a turn cut off after a failed step corrected nothing", () => {
 			fixedResult("t2", T0 + 4_000),
 			assistant(T0 + 5_000, [{ type: "text", text: "改好了。" }], "stop"),
 		]);
-		const closed = summary.render(WIDTH);
+		const closed = ownLines(summary);
 		expect(headerOf(summary.state).plain).toContain("出错 1 次，已改正");
 		expect(summary.state.boxView().facts.errorsRecovered).toBe(true);
 		expect(closed).toHaveLength(1);

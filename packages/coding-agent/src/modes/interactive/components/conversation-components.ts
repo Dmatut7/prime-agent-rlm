@@ -1,12 +1,11 @@
 import { ABORT_TRUNCATION_MARKER, type AgentMessage, TOOL_ABORT_FALLBACK_MESSAGE } from "@earendil-works/pi-agent-core";
-import {
-	type ClickRegion,
-	type Component,
-	type MarkdownTheme,
-	Spacer,
-	type StickyHeader,
-	type TableCellSelectionRegion,
-	type TUI,
+import type {
+	ClickRegion,
+	Component,
+	MarkdownTheme,
+	StickyHeader,
+	TableCellSelectionRegion,
+	TUI,
 } from "@earendil-works/pi-tui";
 import { type AgentSessionMessage, isAgentSessionMessage, startsAgentRun } from "../../../core/agent-messages.js";
 import {
@@ -28,7 +27,6 @@ import {
 	MalformedCompactionOutcomeMessageComponent,
 } from "./compaction-outcome-message.js";
 import { CompactionSummaryMessageComponent, QuietCompactionNoticeComponent } from "./compaction-summary-message.js";
-import { CustomMessageComponent } from "./custom-message.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./injected-prompt-message.js";
 import { IPythonCellComponent } from "./ipython-cell.js";
 import {
@@ -671,22 +669,6 @@ function isTitleBoundary(child: Component): boolean {
 	);
 }
 
-/**
- * Rows that already keep a blank line above them and none below: a turn woken
- * by one of them hangs straight under it, a turn woken by anything else gets a
- * blank line of its own.
- */
-function keepsItsOwnSpace(component: Component | undefined): boolean {
-	return (
-		component === undefined ||
-		component instanceof Spacer ||
-		component instanceof UserMessageComponent ||
-		component instanceof AgentMessageComponent ||
-		component instanceof InjectedPromptMessageComponent ||
-		component instanceof CustomMessageComponent
-	);
-}
-
 /** Width at which a component above is asked what it draws; only whether its last line is blank matters. */
 const BLANK_PROBE_WIDTH = 80;
 const TERMINAL_ESCAPES = /\x1b\[[0-9;?]*[A-Za-z]|\x1b[\]_][^\x07]*\x07/g;
@@ -713,25 +695,23 @@ function endsInBlankLine(children: readonly Component[], index: number): boolean
  * `◆ prime  <model>` line of its own, its box hangs under what is above. The
  * first turn, the first turn after a user message or a compaction, a turn a
  * user message opened and a turn on another model keep their title. Consecutive
- * groups stay one blank line apart: a woken turn whose message row is not right
- * above it gets that blank line itself, unless what is above already ends in one.
+ * groups stay apart by empty main-line rows: the block of a turn the user opened
+ * draws two above its lines, a woken turn's one, unless what is above already ends in a blank line.
  */
 export function resolveTurnHeaders(children: readonly Component[]): void {
 	let shownModel: string | undefined;
-	let previous: Component | undefined;
 	for (const [index, child] of children.entries()) {
 		if (child instanceof TurnSummaryComponent) {
 			const model = child.state.modelId;
 			const show = child.state.startedByUser || shownModel === undefined || shownModel !== model;
 			child.setHeaderShown(show);
-			child.setLeadingBlank(
-				!child.state.startedByUser && !keepsItsOwnSpace(previous) && !endsInBlankLine(children, index),
-			);
+			// The question leaves no empty row under itself: its turn's lines open with two, a woken turn's
+			// with one (none when what is above already ends in a blank line).
+			child.setLeadingRows(child.state.startedByUser ? 2 : endsInBlankLine(children, index) ? 0 : 1);
 			if (show) shownModel = model;
 		} else if (child instanceof UserMessageComponent || isTitleBoundary(child)) {
 			shownModel = undefined;
 		}
-		previous = child;
 	}
 }
 

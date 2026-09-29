@@ -464,9 +464,10 @@ describe("reopening a session", () => {
 		expect(box.state.turnDurationMs()).toBe(fullBox.state.turnDurationMs());
 		const shown = box.state.steps.length;
 		expect(shown).toBeLessThan(250);
-		const lines = opened(box).split("\n");
+		// Two empty rows under the question come first, then the turn's first event.
+		const lines = opened(box).split("\n").slice(2);
 		expect(lines[0]?.startsWith(` ${formatTimelineTime(T0)}   ◆      跑了 ${shown} 条命令`)).toBe(true);
-		expect(lines[0]?.slice(0, 16)).toBe(opened(fullBox).split("\n")[0]?.slice(0, 16));
+		expect(lines[0]?.slice(0, 16)).toBe(opened(fullBox).split("\n")[2]?.slice(0, 16));
 		expect(lines[1]?.trimEnd()).toBe(`         │           ◇  … 更早的 ${250 - shown} 步没列出`);
 	});
 

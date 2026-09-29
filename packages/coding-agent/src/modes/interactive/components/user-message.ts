@@ -156,13 +156,11 @@ class UserBubble implements Component {
 const TIMELINE_MIN_WIDTH = TIMELINE_CONTENT_COL + 8;
 /** `你` (2 columns) and three spaces: what the first row's text steps in by. */
 const TIMELINE_LABEL_WIDTH = 5;
-/** Main-line rows kept empty under the question. */
-const TIMELINE_GAP_ROWS = 2;
-
 /**
  * The question as the timeline's first row: `HH:MM ● 你   <text>`, further
- * lines on the main line with their text on column 16, then two empty
- * main-line rows. The words are the user's as typed, never Markdown.
+ * lines on the main line with their text on column 16. It leaves no empty
+ * row under itself: the block that follows draws the gap. The words are the
+ * user's as typed, never Markdown.
  */
 class TimelineQuestion implements Component {
 	private readonly mask: PromptTokenMask;
@@ -208,7 +206,6 @@ class TimelineQuestion implements Component {
 				lines.push(isLabelRow ? head + label + body : rail + body);
 			});
 		});
-		for (let gap = 0; gap < TIMELINE_GAP_ROWS; gap++) lines.push(rail);
 		this.cachedWidth = width;
 		this.cachedTime = time;
 		this.cachedLines = lines;

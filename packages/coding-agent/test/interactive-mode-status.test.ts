@@ -363,7 +363,10 @@ describe("InteractiveMode.renderSessionContext", () => {
 		expect(summary!.state.isSettled).toBe(true);
 		const hhmm = formatTimelineTime(1_000);
 		const lines = stripAnsi(summary!.render(120).join("\n")).split("\n");
-		// The folded turn is one event line: its steps stay behind `2 步 ▸`, and nothing is framed, titled or pilled.
+		// The turn opens with two empty rows under the question, then one event line: its steps stay behind
+		// `2 步 ▸`, and nothing is framed, titled or pilled.
+		expect(lines.slice(0, 2).map((line) => line.trimEnd())).toEqual(["         │", "         │"]);
+		lines.splice(0, 2);
 		expect(lines).toHaveLength(1);
 		expect(lines[0]?.startsWith(` ${hhmm}   ◆`)).toBe(true);
 		expect(lines[0]?.trimEnd().endsWith("2 步 ▸")).toBe(true);
@@ -379,7 +382,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 		// Opened, the event keeps the work done so far and shows the cut-short step as stopped (no spinner, no error).
 		expect(summary!.getFocusOrder().filter((key) => key.startsWith("ev:"))).toHaveLength(1);
 		summary!.activate(summary!.getFocusOrder()[0] ?? "");
-		const opened = stripAnsi(summary!.render(120).join("\n")).split("\n");
+		const opened = stripAnsi(summary!.render(120).join("\n")).split("\n").slice(2);
 		expect(opened).toHaveLength(3);
 		expect(opened[0]?.trimEnd().endsWith("2 步 ▴")).toBe(true);
 		expect(opened[1]).toMatch(/^ {9}│ {11}✓ {2}运行命令 +✓ *$/);
@@ -405,8 +408,10 @@ describe("InteractiveMode.renderSessionContext", () => {
 		expect(summary!.state.isTurnEnded).toBe(false);
 		const hhmm = formatTimelineTime(1_000);
 		const lines = stripAnsi(summary!.render(120).join("\n")).split("\n");
-		// Still running: the event line keeps its step behind `1 步 ▸`, one blank rail line follows,
-		// and the turn ends on the spinner line waiting for the model's next reply.
+		// Still running: two empty rows under the question, the event line keeps its step behind `1 步 ▸`,
+		// one blank rail line follows, and the turn ends on the spinner line waiting for the model's next reply.
+		expect(lines.slice(0, 2).map((line) => line.trimEnd())).toEqual(["         │", "         │"]);
+		lines.splice(0, 2);
 		expect(lines).toHaveLength(3);
 		expect(lines[0]?.startsWith(` ${hhmm}   ◆`)).toBe(true);
 		expect(lines[0]?.trimEnd().endsWith("1 步 ▸")).toBe(true);
@@ -416,7 +421,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 		expect(lines.join("\n")).not.toContain("⌄");
 		// The finished step is a settled row under its event.
 		summary!.activate(summary!.getFocusOrder()[0] ?? "");
-		const opened = stripAnsi(summary!.render(120).join("\n")).split("\n");
+		const opened = stripAnsi(summary!.render(120).join("\n")).split("\n").slice(2);
 		expect(opened[0]?.trimEnd().endsWith("1 步 ▴")).toBe(true);
 		expect(opened[1]).toMatch(/^ {9}│ {11}✓ {2}运行命令 +✓ *$/);
 		expect(opened.some((line) => line.includes("等待模型回应"))).toBe(true);

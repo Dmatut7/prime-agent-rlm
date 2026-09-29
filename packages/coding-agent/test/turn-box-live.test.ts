@@ -390,7 +390,11 @@ const SETTLE_MS = 450;
 
 /** A turn's lines as plain text. */
 function plainLines(box: TurnSummaryComponent): string[] {
-	return box.render(100).map((line) => stripAnsi(line).replace(/\x1b_[^\x07]*\x07/g, ""));
+	const lines = box.render(100).map((line) => stripAnsi(line).replace(/\x1b_[^\x07]*\x07/g, ""));
+	// The turn's own lines: the empty rows it opens with (two under a question, one for a woken turn) are left off.
+	let first = 0;
+	while (/^ {9}│ *$/.test(lines[first] ?? "")) first += 1;
+	return lines.slice(first);
 }
 
 /** The line ending a running turn: ` HH:MM ⠹ <sentence>      第 N 步`. */

@@ -708,8 +708,8 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	private boxRegions: ClickRegion[] = [];
 	private boxFocusOrder: string[] = [];
 	private boxCacheKey: string | undefined;
-	/** A blank line above the turn: a woken turn nothing else separates from what is above it. */
-	private leadingBlank = false;
+	/** Empty rows above the turn's lines: two under the question, one for a woken turn, none under a blank line. */
+	private leadingRows = 0;
 	/** Which subagents are out; absent: the turn draws no lane. */
 	private laneTracker: TimelineLaneTracker | undefined;
 	/** Rows that landed while the turn's run went on (a subagent's report), drawn among its lines by their time. */
@@ -772,10 +772,10 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		return later ? undefined : last.component;
 	}
 
-	/** Whether a blank line separates this turn from what is above it. */
-	setLeadingBlank(blank: boolean): void {
-		if (this.leadingBlank === blank) return;
-		this.leadingBlank = blank;
+	/** How many empty main-line rows the turn draws above its first line. */
+	setLeadingRows(rows: number): void {
+		if (this.leadingRows === rows) return;
+		this.leadingRows = rows;
 		this.invalidate();
 	}
 
@@ -983,7 +983,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		const tracker = this.laneTracker;
 		// The finished view has its own key (steps, entries, how it ended, cwd, hideThinking).
 		const view = state.boxView(now);
-		const cacheKey = `${width}:${viewportRows}:${ui.version}:${this.leadingBlank}:${this.blockFocus !== undefined}:${tracker?.pending.join("|") ?? ""}:${state.boxViewKey()}`;
+		const cacheKey = `${width}:${viewportRows}:${ui.version}:${this.leadingRows}:${this.blockFocus !== undefined}:${tracker?.pending.join("|") ?? ""}:${state.boxViewKey()}`;
 		if (this.cachedLines && this.boxCacheKey === cacheKey) return this.cachedLines;
 		const hideThinking = host.hideThinking?.() ?? false;
 		const header = computeBoxHeader({
@@ -1021,7 +1021,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 			revealRows: viewportRows,
 			...(tracker ? { lanes: tracker } : {}),
 			...(inline.length > 0 ? { inline } : {}),
-			leadingGap: this.leadingBlank,
+			leadingRows: this.leadingRows,
 			dropFirstRight: this.blockFocus !== undefined,
 			onToggleEvent: () => this.onLanesChange?.(),
 			onChange: () => {

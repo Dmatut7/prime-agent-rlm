@@ -80,13 +80,9 @@ describe("your question on the timeline", () => {
 		return new UserMessageComponent(text, undefined, undefined, SENT_AT, { quiet: true, ...options });
 	}
 
-	test("draws `HH:MM ● 你   <text>` and two empty main-line rows, no bubble, no `you` label", () => {
+	test("draws `HH:MM ● 你   <text>` and no empty row under it, no bubble, no `you` label", () => {
 		const lines = question().render(100);
-		expect(shown(lines)).toEqual([
-			" 18:47   ●      你   对最近的改动做全面的审查 多个代理一起",
-			"         │",
-			"         │",
-		]);
+		expect(shown(lines)).toEqual([" 18:47   ●      你   对最近的改动做全面的审查 多个代理一起"]);
 		expect(lines.join("")).not.toContain("\x1b[48");
 		expect(shown(lines).join("\n")).not.toContain("you");
 	});
@@ -106,27 +102,28 @@ describe("your question on the timeline", () => {
 		expect(first.split("\x1b[1m")).toHaveLength(3);
 	});
 
-	test("the two rows under it carry the main line in the rail color", () => {
-		const lines = question().render(100);
+	test("the continuation rows of a multi-line question carry the main line in the rail color", () => {
+		const lines = question("第一行\n第二行\n第三行").render(100);
+		expect(lines).toHaveLength(3);
 		expect(lines[1]).toContain(theme.fg("timelineRail", "│"));
 		expect(lines[2]).toContain(theme.fg("timelineRail", "│"));
 	});
 
 	test("the lane column follows the lane it was given, on every row", () => {
-		expect(shown(question(PROMPT, { lane: "on" }).render(100))).toEqual([
-			` 18:47   ●  ┆   你   ${PROMPT}`,
-			"         │  ┆",
-			"         │  ┆",
+		expect(shown(question(PROMPT, { lane: "on" }).render(100))).toEqual([` 18:47   ●  ┆   你   ${PROMPT}`]);
+		expect(shown(question("第一行\n第二行", { lane: "on" }).render(100))).toEqual([
+			" 18:47   ●  ┆   你   第一行",
+			"         │  ┆   第二行",
 		]);
 	});
 
 	test("setLane repaints a rendered question with the new lane", () => {
-		const component = question();
-		expect(shown(component.render(100))[1]).toBe("         │");
+		const component = question("第一行\n第二行");
+		expect(shown(component.render(100))[1]).toBe("         │      第二行");
 		component.setLane("on");
-		expect(shown(component.render(100))[1]).toBe("         │  ┆");
+		expect(shown(component.render(100))[1]).toBe("         │  ┆   第二行");
 		component.setLane("off");
-		expect(shown(component.render(100))[1]).toBe("         │");
+		expect(shown(component.render(100))[1]).toBe("         │      第二行");
 	});
 
 	test("a multi-line question continues on the main line, content on column 16", () => {
@@ -134,8 +131,6 @@ describe("your question on the timeline", () => {
 			" 18:47   ●      你   第一行",
 			"         │      第二行",
 			"         │      第三行",
-			"         │",
-			"         │",
 		]);
 	});
 
@@ -144,22 +139,19 @@ describe("your question on the timeline", () => {
 		const lines = shown(question(text).render(60));
 		expect(lines.length).toBeGreaterThan(4);
 		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(60);
-		const continuation = lines.slice(1, -2);
+		const continuation = lines.slice(1);
 		expect(continuation.length).toBeGreaterThan(0);
 		for (const line of continuation) {
 			expect(line.slice(0, 16)).toBe("         │      ");
 			expect(line.slice(16).trim().length).toBeGreaterThan(0);
 		}
-		const body = lines
-			.slice(0, -2)
-			.map((line, index) => (index === 0 ? line.slice(20) : line.slice(16)))
-			.join("");
+		const body = lines.map((line, index) => (index === 0 ? line.slice(20) : line.slice(16))).join("");
 		expect(body).toBe(text);
 	});
 
 	test("the words are never dropped by the wrap", () => {
 		const text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma";
-		const rows = shown(question(text).render(50)).slice(0, -2);
+		const rows = shown(question(text).render(50));
 		const body = rows.map((line, index) => (index === 0 ? line.slice(20) : line.slice(16))).join(" ");
 		expect(body.replace(/\s+/g, " ").trim()).toBe(text);
 	});
@@ -172,15 +164,13 @@ describe("your question on the timeline", () => {
 		expect(rows).toEqual([
 			` 18:47   ●      你   ${path.slice(0, 79)}`,
 			`         │      ${path.slice(79)} 这个文件怎么样`,
-			"         │",
-			"         │",
 		]);
 	});
 
 	test("a long word after the first still wraps at the full row width", () => {
 		const path =
 			"/Users/a1/Desktop/ai/prime-agent/packages/coding-agent/src/modes/interactive/components/user-message.ts";
-		const rows = shown(question(`看看 ${path}`).render(60)).slice(0, -2);
+		const rows = shown(question(`看看 ${path}`).render(60));
 		expect(rows[0]).toBe(" 18:47   ●      你   看看");
 		expect(
 			rows
@@ -189,6 +179,7 @@ describe("your question on the timeline", () => {
 				.join(""),
 		).toBe(path);
 		for (const line of rows.slice(1, -1)) expect(visibleWidth(line.slice(16))).toBe(44);
+		expect(visibleWidth((rows.at(-1) ?? "").slice(16))).toBeGreaterThan(0);
 	});
 
 	test("slash commands keep their highlight", () => {

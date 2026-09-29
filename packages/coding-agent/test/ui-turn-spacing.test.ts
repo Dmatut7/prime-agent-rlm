@@ -79,9 +79,11 @@ describe("the groups of consecutive turns are one blank line apart", () => {
 		const marks = shape(threeGroups());
 		expect(marks).not.toContain("B");
 		// A group is its message rows and its event line: rail rows before it, none inside it.
-		expect(marks).toContain("RME");
-		expect(marks).toContain("RMME");
-		expect(marks).not.toContain("MR");
+		// A woken turn's lines open with one empty row under the return row, as Tl2Live has it.
+		expect(marks).toContain("RMRE");
+		expect(marks).toContain("RMMRE");
+		expect(marks).not.toMatch(/MRR/);
+		expect(marks).not.toContain("RRR");
 		expect(marks).not.toContain("EE");
 		// An answer ends in the rail row of its own and the one the message row keeps above itself.
 		expect(marks).toContain("PRRM");
@@ -114,7 +116,7 @@ describe("the groups of consecutive turns are one blank line apart", () => {
 		chat.wake("m1", { model: "gpt-5.5" });
 		vi.advanceTimersByTime(1_000);
 		const marks = shape(withEvents(chat));
-		expect(marks).toContain("RME");
+		expect(marks).toContain("RMRE");
 		expect(marks).not.toContain("T");
 		expect(marks).not.toContain("B");
 	});

@@ -605,7 +605,7 @@ describe("long words and empty turns", () => {
 
 	it("draws nothing at all for a woken turn that has nothing to list", () => {
 		const turn = quietTurn(false);
-		turn.summary.setLeadingBlank(true);
+		turn.summary.setLeadingRows(1);
 		turn.state.markTurnEnded(T0);
 		expect(turn.summary.render(WIDTH)).toEqual([]);
 	});

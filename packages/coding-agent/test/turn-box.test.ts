@@ -1186,7 +1186,8 @@ describe("replay groups a transcript the way the live view does", () => {
 		// The timeline draws no header clock: the turn's clock is what the status bar reads off it.
 		expect(summary.state.turnDurationMs()).toBe(4_200);
 		expect(formatBoxDuration(summary.state.turnDurationMs())).toBe("4秒");
-		expect(plain(summary.render(120))[0]).toMatch(/^ \d\d:\d\d {3}◆ {6}做了 1 步 +1 步 ▸ {2}$/);
+		// Two empty rows under the question, then the event.
+		expect(plain(summary.render(120))[2]).toMatch(/^ \d\d:\d\d {3}◆ {6}做了 1 步 +1 步 ▸ {2}$/);
 	});
 
 	it("ends a turn the owner interrupted mid-step as stopped, and the next message starts a new turn", () => {

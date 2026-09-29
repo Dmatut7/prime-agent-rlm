@@ -269,7 +269,8 @@ describe("s5: a quiet compaction", () => {
 			expect(step.startsWith(`${STEP_PREFIX}⇣  ${words}`)).toBe(true);
 		}
 		// Both compactions are steps of the turn's one event, the command's event.
-		expect(lines[0]?.trimEnd().endsWith("3 步 ▴")).toBe(true);
+		expect(lines.slice(0, 2)).toEqual(["         │      ", "         │      "]);
+		expect(lines[2]?.trimEnd().endsWith("3 步 ▴")).toBe(true);
 		const out = renderAll(components);
 		for (const english of ["[compaction]", "Compacted from", "Auto-compaction skipped"]) {
 			expect(out).not.toContain(english);
