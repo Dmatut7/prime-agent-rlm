@@ -50,6 +50,61 @@ export const BOX_FOCUS_MARKER = "\x1b_pi:box-focus\x07";
 
 /** Steps an opened event lists before `⋯ 另外 N 步`. */
 export const EVENT_STEPS_SHOWN = 3;
+/** In a run of consecutive events the first, the last two and up to three that carry news stay; the rest fold. */
+const EVENT_TAIL_SHOWN = 2;
+const EVENT_NEWS_SHOWN = 3;
+const EVENT_NEWS = /\*\*[^*\n]+\*\*|发现|实锤|出错|失败|问题|结论/;
+
+/**
+ * The runs of events a long stretch folds into `⋯ 中间还有 N 件事`: a run is consecutive events
+ * between two boundaries (the question, a dispatch, a return, an error line, a steer, the end),
+ * and only a stretch of more than three is folded. A folded run is two events or more.
+ */
+export function foldedEventRuns(events: readonly TimelineEvent[], returnsAt: readonly number[]): number[][] {
+	const clusters: number[][] = [];
+	let current: number[] = [];
+	const close = (): void => {
+		if (current.length > 0) clusters.push(current);
+		current = [];
+	};
+	let landed = 0;
+	events.forEach((event, index) => {
+		let split = false;
+		while (landed < returnsAt.length && (returnsAt[landed] ?? 0) < event.at) {
+			landed += 1;
+			split = true;
+		}
+		if (split) close();
+		if (event.kind !== "say") {
+			close();
+			return;
+		}
+		current.push(index);
+		if (event.spawned.length > 0) close();
+	});
+	close();
+	const runs: number[][] = [];
+	for (const cluster of clusters) {
+		if (cluster.length <= 1 + EVENT_TAIL_SHOWN) continue;
+		const news = new Set<number>();
+		const middle = cluster.slice(1, -EVENT_TAIL_SHOWN);
+		for (const index of middle) {
+			if (news.size < EVENT_NEWS_SHOWN && EVENT_NEWS.test(events[index]?.text ?? "")) news.add(index);
+		}
+		let run: number[] = [];
+		const settle = (): void => {
+			if (run.length >= 2) runs.push(run);
+			run = [];
+		};
+		for (const index of middle) {
+			if (news.has(index)) settle();
+			else run.push(index);
+		}
+		settle();
+	}
+	return runs;
+}
+
 /** Columns of a step's content in front of its glyph. */
 const STEP_INDENT = 5;
 /** Columns a step's glyph and its gap take in front of the words. */
@@ -490,9 +545,34 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 			gap(tracker && startedOut && tracker.active ? "on" : "off");
 	}
 
+	const folds = foldedEventRuns(
+		input.events,
+		inline.map((row) => row.at),
+	);
+	const runStart = new Map<number, number>();
+	for (const run of folds) for (const index of run) runStart.set(index, run[0] ?? index);
 	input.events.forEach((event, index) => {
 		flushInline(event.at);
 		const lane = laneOfEvent(index);
+		const start = runStart.get(index);
+		if (start !== undefined) {
+			const foldKey = `hid:${input.events[start]?.key}`;
+			const unfolded = ui.expanded.has(foldKey);
+			if (index === start) {
+				const count = folds.find((run) => run[0] === start)?.length ?? 0;
+				specs.push({
+					gutter: { main: "rail", lane },
+					content: theme.fg("timelineFaint", `⋯  中间还有 ${count} 件事`),
+					right: unfolded
+						? `${theme.bold(theme.fg("timelineAi", "▴"))} ${theme.fg("timelineFaint", "收起")}`
+						: `${theme.fg("timelineFaint", `${count} 件事 `)}${theme.bold(theme.fg("timelineFaint", "▸"))}`,
+					key: foldKey,
+					onClick: toggle(foldKey),
+					reveal: unfolded ? 0 : EVENT_REVEAL,
+				});
+			}
+			if (!unfolded) return;
+		}
 		const time = event.at > 0 ? formatTimelineTime(event.at) : undefined;
 		const detailRow = event.row;
 		// Words the line cuts (or paragraphs it leaves out) open to the whole text.

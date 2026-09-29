@@ -46,6 +46,11 @@ describe("a narrower terminal does not make old steps look new", () => {
 			addCommand(turn, `c${index}`, `echo ${index}`, { output: "x" });
 			later();
 		}
+		// Eight events in a row fold to the first and the last two; the fold opens to all of them.
+		const folded = plain(turn.summary.render(120));
+		expect(folded.filter((line) => line.includes("◆"))).toHaveLength(3);
+		expect(folded.some((line) => line.includes("⋯  中间还有 5 件事"))).toBe(true);
+		turn.summary.activate(turn.summary.getFocusOrder().find((key) => key.startsWith("hid:")) ?? "");
 		const wide = plain(turn.summary.render(120));
 		const narrow = turn.summary.render(50);
 		const shortLines = plain(narrow);

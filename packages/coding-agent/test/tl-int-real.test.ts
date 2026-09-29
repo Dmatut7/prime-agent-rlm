@@ -429,3 +429,143 @@ describe("inline markdown in event rows", () => {
 		chat.flow.dispose();
 	});
 });
+
+/** The real session's first turn: about 45 events in a row, every step narrated. */
+describe("a long stretch of events folds to the first, the last two and what carries news", () => {
+	const TEXTS = [
+		"收到，我先看仓库最近的提交，确定这次要审的范围。",
+		"上次审查收在 `adc7ca82c`（16:43），之后到现在 18:41 又落了一批。",
+		"96 个文件，+5487/-852。我把完整文件清单拿出来，好切车道。",
+		"发版提交已推（origin 在 `c18d3e534`），grow 这批 19 个提交还没推。",
+		"预检结论：四个包版本齐平 0.11.15，旧 fragment 全部折叠干净。",
+		"`npm run check` 里带 `biome --write` 会改工作区文件，我改跑只读等价物。",
+		"后台五个检查已启动。等结果的同时我自己抽读最高风险的两个文件。",
+		"命令拼错了（`env -u` 少写了 `env` 前缀），不作数。重跑。",
+		"重跑期间，我抽读 `subagent-summary-line.ts` 的重写。",
+		"点击处理是点击时按键重新查当前项，处理正确。",
+		"**HEAD 上本批新测试有 4 个失败**，而且 tui 包的测试其实会被 `npm test` 跑到。",
+		"4 个失败全部定位到子代理条带这一族。",
+		"直接用仓库的 theme 模块算两色的转义码。",
+		"实锤了，这是个真产品缺陷，不只是测试问题。",
+		"主题按 `COLORTERM` 判真彩，macOS Terminal.app 这类常见终端落到 256 色。",
+	];
+
+	/** Words that carry news, by the rule the timeline states: bold, or 发现 / 实锤 / 出错 / 失败 / 问题 / 结论. */
+	const carriesNews = (text: string) => /\*\*[^*\n]+\*\*|发现|实锤|出错|失败|问题|结论/.test(text);
+
+	function longTurn(count: number, options: { dispatchAfter?: number } = {}): LiveChat {
+		setMotionReduced(true);
+		vi.useFakeTimers();
+		vi.setSystemTime(at(18, 47));
+		const chat = new LiveChat();
+		chat.setClock(at(18, 47));
+		chat.user("对最近的改动做全面的审查 多个代理一起");
+		for (let index = 0; index < count; index++) {
+			const time = at(18, 47) + index * 20_000;
+			vi.setSystemTime(time);
+			const spawn = options.dispatchAfter === index + 1;
+			chat.say(time, {
+				words: `${TEXTS[index % TEXTS.length]}（第 ${index + 1} 件）`,
+				calls: [
+					spawn
+						? { id: `s${index}`, code: "await rlm.spawn(...)", details: SPAWN_DETAILS, endsAt: time + 4_000 }
+						: { id: `k${index}`, code: "print(1)", details: {}, endsAt: time + 2_000 },
+				],
+			});
+		}
+		chat.say(at(19, 30), { words: "审查完成。" });
+		chat.endRun();
+		vi.advanceTimersByTime(1000);
+		return chat;
+	}
+
+	const eventRows = (chat: LiveChat, width = 160) =>
+		plain(chat.lines(width)).filter((row) => /^ \d\d:\d\d {3}◆ {2}[ ┆]/.test(row) && !row.endsWith("总结"));
+	const foldRows = (chat: LiveChat, width = 160) => plain(chat.lines(width)).filter((row) => row.includes("⋯  中间"));
+
+	it("shows the first event, the last two and up to three that carry news; the rest is one folded row", () => {
+		const chat = longTurn(45);
+		const rows = plain(chat.lines(160));
+		const events = rows.filter((row) => /^ \d\d:\d\d {3}◆ {6}/.test(row) && !row.endsWith("总结"));
+		const texts = Array.from({ length: 45 }, (_, index) => `${TEXTS[index % TEXTS.length]}（第 ${index + 1} 件）`);
+		const middle = texts.slice(1, -2);
+		const news = middle.filter(carriesNews).slice(0, 3);
+		expect(news.length).toBe(3);
+		const stripped = (text: string) => text.replace(/`/g, "").replace(/\*\*/g, "");
+		const shown = [texts[0], ...news, ...texts.slice(-2)].map(stripped);
+		expect(events).toHaveLength(shown.length);
+		shown.forEach((text, index) => {
+			expect(events[index], text).toContain(text.slice(0, 30));
+		});
+		const folds = foldRows(chat);
+		expect(folds.length).toBeGreaterThan(0);
+		const hiddenTotal = folds
+			.map((row) => Number(/中间还有 (\d+) 件事/.exec(row)?.[1]))
+			.reduce((sum, count) => sum + count, 0);
+		expect(hiddenTotal).toBe(45 - shown.length);
+		for (const row of folds) {
+			expect(row).toMatch(/^ {9}│ {6}⋯ {2}中间还有 \d+ 件事 +\d+ 件事 ▸ {2}$/);
+		}
+		chat.flow.dispose();
+	});
+
+	it("opens the folded events in place on a click and closes them again with 收起", () => {
+		const chat = longTurn(45);
+		const summary = chat.summaries()[0]!;
+		summary.render(160);
+		const key = summary.getFocusOrder().find((candidate) => candidate.startsWith("hid:")) ?? "";
+		expect(key).not.toBe("");
+		const before = eventRows(chat).length;
+		expect(summary.enterLabel(key)).toBe("展开");
+		summary.activate(key);
+		const opened = plain(chat.lines(160));
+		expect(eventRows(chat).length).toBeGreaterThan(before);
+		expect(opened.some((row) => row.includes("⋯  中间还有") && row.trimEnd().endsWith("▴ 收起"))).toBe(true);
+		expect(summary.enterLabel(key)).toBe("收起");
+		summary.activate(key);
+		expect(eventRows(chat).length).toBe(before);
+		chat.flow.dispose();
+	});
+
+	it("keeps the steps of a folded event reachable once the fold is opened", () => {
+		const chat = longTurn(45);
+		const summary = chat.summaries()[0]!;
+		summary.render(160);
+		summary.activate(summary.getFocusOrder().find((candidate) => candidate.startsWith("hid:")) ?? "");
+		summary.render(160);
+		const hiddenEvent = summary.getFocusOrder().filter((candidate) => candidate.startsWith("ev:"))[1] ?? "";
+		summary.activate(hiddenEvent);
+		expect(plain(summary.render(160)).some((row) => row.includes("Python") || row.includes("做了 1 步"))).toBe(true);
+		chat.flow.dispose();
+	});
+
+	it("does not fold a stretch of three events or fewer, or a single event in the middle", () => {
+		for (const count of [2, 3, 4]) {
+			const chat = longTurn(count);
+			expect(foldRows(chat), `${count} events`).toEqual([]);
+			expect(eventRows(chat)).toHaveLength(count);
+			chat.flow.dispose();
+		}
+	});
+
+	it("folds each stretch between boundaries on its own: the dispatch row ends one, a return starts the next", () => {
+		const chat = longTurn(45, { dispatchAfter: 20 });
+		chat.report(report(NAMES[0] ?? "", at(19, 20), "没问题"));
+		const rows = plain(chat.lines(160));
+		const split = rows.findIndex((row) => row.includes("├──╮"));
+		expect(split).toBeGreaterThan(0);
+		const before = rows.slice(0, split).filter((row) => row.includes("⋯  中间"));
+		const after = rows.slice(split + 1).filter((row) => row.includes("⋯  中间"));
+		expect(before.length).toBeGreaterThan(0);
+		expect(after.length).toBeGreaterThan(0);
+		// The event that carries the dispatch row is the last one of its stretch, so it is shown.
+		expect(rows[split - 1]).toContain("（第 20 件）");
+		chat.flow.dispose();
+	});
+
+	it("leaves the events of Tl2Done as they are: its stretches have two events", () => {
+		const chat = longTurn(2);
+		expect(foldRows(chat)).toEqual([]);
+		chat.flow.dispose();
+	});
+});
