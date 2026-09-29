@@ -17,7 +17,8 @@ const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
 const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0;\x07";
 
-const MOUSE_TRACKING_ON = "\x1b[?1003h\x1b[?1006h";
+// ?1002 first: a terminal that lacks ?1003 keeps clicks, wheel and drags; one that has it takes the next mode over.
+const MOUSE_TRACKING_ON = "\x1b[?1002h\x1b[?1003h\x1b[?1006h";
 const MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1002l";
 
 // A preserved alternate screen is adopted by the next ProcessTerminal during in-process handoff.

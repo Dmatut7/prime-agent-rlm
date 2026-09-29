@@ -2,7 +2,7 @@ import assert from "node:assert";
 import { describe, it } from "node:test";
 import { ProcessTerminal } from "../src/terminal.js";
 
-const ENABLE = "\x1b[?1003h\x1b[?1006h";
+const ENABLE = "\x1b[?1002h\x1b[?1003h\x1b[?1006h";
 const DISABLE = "\x1b[?1006l\x1b[?1003l\x1b[?1002l";
 
 function captureStdout(run: () => void): string[] {
@@ -24,7 +24,7 @@ function captureStdout(run: () => void): string[] {
 }
 
 describe("ProcessTerminal hover mouse tracking", () => {
-	it("turns on any-motion reporting in SGR format, and turns 1003, 1006 and the old 1002 off again", () => {
+	it("turns on any-motion reporting in SGR format (1002 first as a fallback), and turns 1003, 1006 and 1002 off again", () => {
 		const terminal = new ProcessTerminal();
 		const writes = captureStdout(() => {
 			terminal.setMouseTracking(true);
