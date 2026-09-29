@@ -22,20 +22,14 @@ import {
 	type TimelineEvent,
 	type TimelineFacts,
 } from "./timeline-rows.js";
-import {
-	formatBoxDuration,
-	lastCompletedSentence,
-	type TimelineUiState,
-	type TurnTimeline,
-	thoughtSentence,
-} from "./turn-timeline.js";
+import { formatBoxDuration, lastCompletedSentence, type TurnTimeline, thoughtSentence } from "./turn-timeline.js";
 
 /**
  * A turn drawn on the timeline: one line per thing the AI said it does or found
  * (`HH:MM ◆ words`), with the commands, thoughts and edits behind it folded into
- * `N 步 ▸`. An opened event lists its first three steps and `⋯ 另外 N 步   全部 ›`;
- * an opened step lists what it printed. Subagents the turn dispatched get one
- * `├──╮` line; a turn still running ends on `⠹ 正在…` and the command running now.
+ * `N 步 ▸`. An opened event lists its first three steps and `⋯ 另外 N 步   全部 ›`
+ * (which lists them all and ends on `⋯ 共 N 步   ▴ 收起`); an opened step lists
+ * what it printed. Subagents the turn dispatched get one `├──╮` line; a turn still running ends on `⠹ 正在…` and the command running now.
  * Rows are whole lines: a pointer or the keyboard paints the line, nothing moves.
  *
  * ```
@@ -110,14 +104,6 @@ const STEP_INDENT = 5;
 /** Columns a step's glyph and its gap take in front of the words. */
 const STEP_GLYPH_COLS = 3;
 
-/** Narrowest width the timeline is drawn at. */
-const BOX_MIN_OUTER = 4;
-
-/** The frame's width for `width` columns (the line also has a one-column margin). */
-export function boxOuterWidth(width: number): number {
-	return Math.max(BOX_MIN_OUTER, Math.floor(width) - 1);
-}
-
 /** A row that is only the main line and its lane: what a return keeps above itself. */
 const RAIL_GAP_ROW = /^(?:\x1b\[[0-9;]*m| )*│(?:\x1b\[[0-9;]*m| |┆)*$/;
 
@@ -125,15 +111,7 @@ function startsWithRailGap(line: string | undefined): boolean {
 	return line !== undefined && RAIL_GAP_ROW.test(line);
 }
 
-/** The click area of one framed line: the frame and its margin, never past the terminal's last column. */
-export function boxRegionWidth(outer: number, width: number): number {
-	return Math.min(outer + 1, Math.max(1, Math.floor(width)));
-}
-
-/**
- * The lines cut to `width` columns. A frame narrower than {@link BOX_MIN_OUTER}
- * cannot be drawn whole, and a line wider than the terminal breaks the screen.
- */
+/** The lines cut to `width` columns: a line wider than the terminal breaks the screen. */
 export function fitBoxLines(lines: string[], width: number): string[] {
 	const room = Math.max(1, Math.floor(width));
 	return lines.map((line) => (visibleWidth(line) > room ? truncateToWidth(line, room, "") : line));
@@ -459,10 +437,6 @@ function eventRight(steps: number, open: boolean): string {
 const EVENT_REVEAL = EVENT_STEPS_SHOWN + 1;
 const STEP_REVEAL = 8;
 
-export function eventOpen(ui: TimelineUiState, key: string): boolean {
-	return ui.expanded.has(key);
-}
-
 /**
  * Render the timeline. What is open, what the pointer is on and the lane each
  * line was first drawn with all live on the timeline's UI state.
@@ -653,11 +627,12 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 				}
 			}
 			const hidden = event.steps.length - listed.length;
-			if (hidden > 0) {
+			// Once every step is listed the same line stays, saying how many there are, and folds the list back.
+			if (hidden > 0 || (allOpen && event.steps.length > EVENT_STEPS_SHOWN)) {
 				specs.push({
 					gutter: { main: "rail", lane },
-					content: `${" ".repeat(STEP_INDENT)}${theme.bold(theme.fg("timelineFaint", "⋯"))}  ${theme.fg("timelineTime", `另外 ${hidden} 步`)}`,
-					right: `${theme.fg("timelineFaint", "全部 ›")}  `,
+					content: `${" ".repeat(STEP_INDENT)}${theme.bold(theme.fg("timelineFaint", "⋯"))}  ${theme.fg("timelineTime", hidden > 0 ? `另外 ${hidden} 步` : `共 ${event.steps.length} 步`)}`,
+					right: `${theme.fg("timelineFaint", hidden > 0 ? "全部 ›" : "▴ 收起")}  `,
 					key: `all:${event.key}`,
 					onClick: toggle(`all:${event.key}`),
 					reveal: Math.min(hidden, STEP_REVEAL),

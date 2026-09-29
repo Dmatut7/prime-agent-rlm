@@ -102,7 +102,8 @@ export function timelineRow(gutter: TimelineGutter, content: string, right = "",
 	const room = Math.max(0, width - TIMELINE_CONTENT_COL);
 	// The right side keeps its last word (`▸` of `24 步 ▸`) when the whole of it does not fit: the content gives way first.
 	const trimmed = right.replace(/\s+$/, "");
-	const forms = right ? [right, trimmed.slice(trimmed.lastIndexOf(" ") + 1)] : [""];
+	// A right side with nothing visible in it (blanks, an empty colored run) takes no columns.
+	const forms = visibleWidth(trimmed) > 0 ? [right, trimmed.slice(trimmed.lastIndexOf(" ") + 1)] : [""];
 	for (const form of forms) {
 		const tail = form ? `${form}  ` : "";
 		const tailWidth = visibleWidth(tail);

@@ -151,7 +151,14 @@ describe("assistant message quiet gate", () => {
 		const quietText = quiet.map((c) => stripAnsi(c.render(100).join("\n")).trim());
 		const legacyText = legacy.map((c) => stripAnsi(c.render(100).join("\n")).trim());
 
-		expect(quietText.join("\n")).not.toContain("我先列出 /tmp 下按修改时间排序");
+		// Quiet: the narration of a step is a timeline event row (◆), never part of the answer (┃).
+		const quietLines = quietText.join("\n").split("\n");
+		const narrationLines = quietLines.filter((line) => line.includes("我先列出 /tmp 下按修改时间排序"));
+		expect(narrationLines.length).toBeGreaterThan(0);
+		for (const line of narrationLines) {
+			expect(line).toContain("◆");
+			expect(line).not.toContain("┃");
+		}
 		expect(legacyText.join("\n")).toContain("我先列出 /tmp 下按修改时间排序");
 	});
 });

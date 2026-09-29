@@ -102,6 +102,8 @@ export class TurnActivityState {
 	private collapsed = true;
 	/** U6 K3 ②: the turn's own Ctrl+T lane (the traces inside this turn's span). */
 	thinkingExpanded = false;
+	/** Event keys (`ev:`, `all:`) Ctrl+T opened that were not open already: closing the thoughts closes them again. */
+	readonly thinkingOpenedKeys = new Set<string>();
 	/** U6 K3 ②: the turn's own Ctrl+P lane (agent message rows inside this turn's span). */
 	agentMessagesExpanded = false;
 
@@ -817,17 +819,17 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	enterLabel(key: string): string | undefined {
 		const target = this.resolveTarget(key);
 		if (target === undefined) return undefined;
-		if (target.startsWith("all:")) return "全部";
-		return this.turnState.timeline.ui.expanded.has(target) ? "收起" : "展开";
+		if (this.turnState.timeline.ui.expanded.has(target)) return "收起";
+		return target.startsWith("all:") ? "全部" : "展开";
 	}
 
-	/** Enter on a focused target: an event or a step opens or closes, `全部 ›` lists every step. */
+	/** Enter on a focused target: an event or a step opens or closes, `全部 ›` lists every step and `▴ 收起` takes them back. */
 	activate(key: string): boolean {
 		const target = this.resolveTarget(key);
 		if (target === undefined || !this.boxFocusOrder.includes(target)) return false;
 		const ui = this.turnState.timeline.ui;
 		if (target.startsWith("all:")) {
-			ui.expanded.add(target);
+			if (!ui.expanded.delete(target)) ui.expanded.add(target);
 			ui.bump();
 		} else if (target.startsWith("ev:")) {
 			if (ui.expanded.has(target)) {
@@ -872,12 +874,18 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		}
 		this.turnState.thinkingExpanded = open;
 		if (open) {
-			// A thought shows only under an open event that lists it.
+			// A thought shows only under an open event that lists it; closing the thoughts closes what this opened.
 			for (const event of this.turnState.boxView().events) {
 				if (!event.steps.some((step) => step.kind === "think" && step.detail && !step.factsOnly)) continue;
-				ui.expanded.add(event.key);
-				ui.expanded.add(`all:${event.key}`);
+				for (const key of [event.key, `all:${event.key}`]) {
+					if (ui.expanded.has(key)) continue;
+					ui.expanded.add(key);
+					this.turnState.thinkingOpenedKeys.add(key);
+				}
 			}
+		} else {
+			for (const key of this.turnState.thinkingOpenedKeys) ui.expanded.delete(key);
+			this.turnState.thinkingOpenedKeys.clear();
 		}
 		ui.bump();
 		this.invalidate();
