@@ -1,11 +1,13 @@
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
+import chalk from "chalk";
 import stripAnsi from "strip-ansi";
-import { beforeAll, describe, expect, test } from "vitest";
+import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
-import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
+import { theme } from "../src/modes/interactive/theme/theme.js";
+import { useTruecolorTheme } from "./ui-blocks-helpers.js";
 
 /**
  * The question row and the summary (answer) on the timeline, cell for cell
@@ -52,9 +54,25 @@ function quietAnswer(message: AssistantMessage, options: { lane?: "off" | "on" }
 	return new AssistantMessageComponent(message, false, undefined, "思考", { quiet: true, ...options });
 }
 
+let restoreTheme: () => void;
+let chalkLevel: typeof chalk.level;
+
 beforeAll(() => {
-	initTheme("dark");
+	restoreTheme = useTruecolorTheme();
+	// Bold only shows in the output when the color level is on; without it every bold assertion holds vacuously.
+	chalkLevel = chalk.level;
+	chalk.level = 3;
 	setKeybindings(new KeybindingsManager());
+});
+
+afterAll(() => {
+	chalk.level = chalkLevel;
+	restoreTheme();
+});
+
+test("the test environment really paints: bold and colors are in the output", () => {
+	expect(theme.bold("x")).toBe("\x1b[1mx\x1b[22m");
+	expect(theme.fg("timelineUser", "x")).toContain("\x1b[38;");
 });
 
 describe("your question on the timeline", () => {
@@ -84,6 +102,8 @@ describe("your question on the timeline", () => {
 		expect(first).toContain(theme.fg("timelineTime", " 18:47   "));
 		expect(first).toContain(theme.bold(theme.fg("timelineUser", "●")));
 		expect(first).toContain(theme.bold(theme.fg("timelineUser", "你")));
+		// Bold is on the label only: the dot and the label, not the time or the text.
+		expect(first.split("\x1b[1m")).toHaveLength(3);
 	});
 
 	test("the two rows under it carry the main line in the rail color", () => {
@@ -213,6 +233,8 @@ describe("the summary on the timeline", () => {
 		expect(header).toContain(theme.fg("timelineTime", " 19:06   "));
 		expect(header).toContain(theme.bold(theme.fg("timelineAi", "◆")));
 		expect(header).toContain(theme.bold(theme.fg("timelineAi", "总结")));
+		// The diamond and the word, not the time or the bar.
+		expect(header.split("\x1b[1m")).toHaveLength(3);
 		const body = lines.find((line) => stripAnsi(line).includes("审查完成")) ?? "";
 		expect(body).toContain(theme.fg("timelineAi", "┃"));
 	});
@@ -220,6 +242,7 @@ describe("the summary on the timeline", () => {
 	test("Markdown bold stays bold", () => {
 		const lines = quietAnswer(answer(SUMMARY)).render(100);
 		const heading = lines.find((line) => stripAnsi(line).includes("一句话结论")) ?? "";
+		expect(heading).toContain("\x1b[1m");
 		expect(heading).toContain(theme.bold("一句话结论"));
 	});
 
