@@ -152,6 +152,25 @@ describe("the task tag", () => {
 		expect(subagentTaskTag("  \n  ", "A")).toBeUndefined();
 	});
 
+	it("skips an opening sentence that only casts the child", () => {
+		expect(subagentTaskTag("你是审查者。请审查框的折叠。", "B")).toBe("审查框的折叠");
+		expect(subagentTaskTag("你是一个严格的代码审查者！检查钉住框头，看滚动", "A")).toBe("检查钉住框头");
+		expect(subagentTaskTag("You are a reviewer. Review pinned header", "A")).toBe("Review pinned…");
+		expect(subagentTaskTag("You're a tester. Run the suite. Report.", "D")).toBe("Run the suite");
+		expect(subagentTaskTag("As a release manager, tag it. Then publish", "D")).toBe("Then publish");
+	});
+
+	it("drops politeness and framing in front of the task", () => {
+		expect(subagentTaskTag("请检查折叠", "B")).toBe("检查折叠");
+		expect(subagentTaskTag("Please check folding", "B")).toBe("check folding");
+		expect(subagentTaskTag("Your task is to run the tests", "D")).toBe("run the tests");
+	});
+
+	it("falls back to the casting sentence when the brief has nothing else", () => {
+		expect(subagentTaskTag("你是审查者。", "B")).toBe("你是审查者");
+		expect(subagentTaskTag("You are a reviewer", "B")).toBe("You are a rev…");
+	});
+
 	it("does not repeat the child's own name", () => {
 		expect(subagentTaskTag("review: box folding", "review")).toBe("box folding");
 		expect(subagentTaskTag("review", "review")).toBeUndefined();
@@ -169,5 +188,33 @@ describe("the task tag", () => {
 		expect(byId.get("a")?.tag).toBe("钉住框头");
 		expect(byId.get("b")?.name).toBe("只有任务描述没有名字");
 		expect(byId.get("b")?.tag).toBeUndefined();
+	});
+
+	it("tells siblings apart even when their briefs open with the same casting sentence", () => {
+		const rows = buildSubagentPanelRows(
+			[
+				snapshot({ id: "a", sessionName: "A", label: "你是审查者。钉住框头的滚动行为。" }),
+				snapshot({ id: "b", sessionName: "B", label: "你是审查者。框的折叠和展开。" }),
+				snapshot({ id: "c", sessionName: "C", label: "You are a reviewer. Check the release notes" }),
+			],
+			undefined,
+		);
+		expect(rows.map((row) => `${row.name} ${row.tag}`)).toEqual([
+			"A 钉住框头的滚…",
+			"B 框的折叠和展开",
+			"C Check the rel…",
+		]);
+	});
+
+	it("leaves a tag off every child that shares it, since it tells none of them apart", () => {
+		const rows = buildSubagentPanelRows(
+			[
+				snapshot({ id: "a", sessionName: "A", label: "审查：第一部分" }),
+				snapshot({ id: "b", sessionName: "B", label: "审查：第二部分" }),
+				snapshot({ id: "c", sessionName: "C", label: "测试：跑一遍" }),
+			],
+			undefined,
+		);
+		expect(rows.map((row) => `${row.name} ${row.tag ?? "-"}`).sort()).toEqual(["A -", "B -", "C 测试"]);
 	});
 });

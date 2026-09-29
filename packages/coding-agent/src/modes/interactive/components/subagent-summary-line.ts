@@ -295,12 +295,30 @@ export function buildSubagentPanelRows(
 		if (activity) row.activity = activity;
 		return row;
 	});
-	return rows.sort((a, b) => rowOrder(a) - rowOrder(b));
+	// A tag several children share tells none of them apart; leave it off all of them.
+	const tagCounts = new Map<string, number>();
+	for (const row of rows) if (row.tag) tagCounts.set(row.tag, (tagCounts.get(row.tag) ?? 0) + 1);
+	const distinct = rows.map((row): SubagentPanelRow => {
+		if (!row.tag || (tagCounts.get(row.tag) ?? 0) < 2) return row;
+		const { tag: _shared, ...untagged } = row;
+		return untagged;
+	});
+	return distinct.sort((a, b) => rowOrder(a) - rowOrder(b));
 }
+
+/** A brief that opens by casting the child ("你是审查者。", "You are a reviewer."): that sentence names no task. */
+const ROLE_OPENING =
+	/^(?:你现在是|你将扮演|你扮演|你作为|你是|作为|(?:you are|you're|you will be|act as|as an?)(?=\s))/i;
+const SENTENCE_END = /[。！？!?]|\.(?=\s|$)/;
+/** Politeness or framing in front of the task itself ("请审查…", "Your task is to review…"). */
+const TASK_LEAD =
+	/^(?:请你|请|麻烦你|麻烦|帮我|你的任务是|任务是|你需要|你要|please\s|kindly\s|your (?:task|job|goal) is to\s|you (?:need|must|should) (?:to )?)\s*/i;
 
 /**
  * A few words on what a child was asked to do: the first clause of its task
- * brief (`钉住框头：检查……` gives `钉住框头`), without repeating the child's name.
+ * brief (`钉住框头：检查……` gives `钉住框头`), without repeating the child's name,
+ * skipping an opening sentence that only casts the child (`你是审查者。` /
+ * `You are a reviewer.`) and any "请" / "Please" in front of the task.
  */
 export function subagentTaskTag(label: string, name: string): string | undefined {
 	let brief = label.replace(/\s+/g, " ").trim();
@@ -308,6 +326,13 @@ export function subagentTaskTag(label: string, name: string): string | undefined
 	if (own && brief.toLowerCase().startsWith(own) && !/[\p{L}\p{N}]/u.test(brief.charAt(own.length))) {
 		brief = brief.slice(own.length).replace(/^[\s:：,，\-—]+/, "");
 	}
+	if (ROLE_OPENING.test(brief)) {
+		const end = brief.search(SENTENCE_END);
+		const rest = end === -1 ? "" : brief.slice(end + 1).trim();
+		// A brief that is nothing but the casting sentence has no better words to offer.
+		if (rest) brief = rest;
+	}
+	brief = brief.replace(TASK_LEAD, "");
 	const clause = brief.split(/[。！？!?；;：:，,]|\.\s|\s[—-]{1,2}\s/)[0]?.trim();
 	return clause ? truncateToWidth(clause, CHIP_TAG_MAX_WIDTH, "…") : undefined;
 }
