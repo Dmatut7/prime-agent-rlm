@@ -67,8 +67,19 @@ describe("the groups of consecutive turns are one blank line apart", () => {
 		expect(marks).not.toMatch(/C[CT]/);
 	});
 
-	it("draws the answer of the last box one blank line under it", () => {
-		expect(shape(threeGroups())).toMatch(/CBX$/);
+	it("draws the answer of the last box as the timeline summary: two main-line rows under it, the header, an empty bar row, the words", () => {
+		const chat = threeGroups();
+		expect(shape(chat)).toMatch(/CXXX$/);
+		const lines = plain(chat.lines()).map((line) => line.trimEnd());
+		const headers = lines.flatMap((line, index) => (/^ \d\d:\d\d {3}◆ {6}总结$/.test(line) ? [index] : []));
+		expect(headers.length).toBeGreaterThan(0);
+		// The last box's answer is the one at the end; an earlier plain answer of the same chat has its own summary.
+		const header = headers.at(-1) ?? -1;
+		expect(header).toBeGreaterThanOrEqual(2);
+		expect(lines[header - 2]?.trim()).toBe("│");
+		expect(lines[header - 1]?.trim()).toBe("│");
+		expect(lines[header + 1]).toBe("         ┃");
+		expect(lines[header + 2]).toBe("         ┃      审查完成。汇总如下。");
 	});
 
 	it("draws no title inside the woken groups but the first turn's", () => {
