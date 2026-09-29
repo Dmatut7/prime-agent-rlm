@@ -65,7 +65,7 @@ describe("a hovered line on a narrow terminal keeps its arrow", () => {
 		}
 	});
 
-	it("still paints the whole line on hover at 25 and 24 columns, where only the words fit", () => {
+	it("still paints the whole line on hover at 25 and 24 columns, where the arrow stays and the words give way", () => {
 		const widths = [25, 24];
 		expect(widths.length).toBeGreaterThan(0);
 		for (const width of widths) {
@@ -78,7 +78,7 @@ describe("a hovered line on a narrow terminal keeps its arrow", () => {
 			const litRaw = turn.summary.render(width)[0] ?? "";
 			expect(visibleWidth(litRaw), `width at ${width}`).toBe(width);
 			expect(litRaw.startsWith(theme.getBgAnsi("timelineHoverBg")), `hover paint at ${width}`).toBe(true);
-			expect(plain([litRaw])[0], `words at ${width}`).toMatch(/^ \d\d:\d\d {3}◆ {6}派审查/);
+			expect(plain([litRaw])[0], `words at ${width}`).toMatch(/^ \d\d:\d\d {3}◆ {6}派…\s+▸ {2}$/);
 			// Clicking the cut line still opens it.
 			region?.onClick({ line: 0, col: 0 } as never);
 			expect(turn.state.boxOpen, `opened at ${width}`).toBe(true);

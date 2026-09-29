@@ -100,12 +100,16 @@ export function timelineGutter(gutter: TimelineGutter): string {
 export function timelineRow(gutter: TimelineGutter, content: string, right = "", width = 80): string {
 	const head = timelineGutter(gutter);
 	const room = Math.max(0, width - TIMELINE_CONTENT_COL);
-	const tail = right ? `${right}  ` : "";
-	const tailWidth = visibleWidth(tail);
-	if (tailWidth + 2 > room) {
-		return truncateToWidth(`${head}${content}`, Math.max(1, width), "…");
+	// The right side keeps its last word (`▸` of `24 步 ▸`) when the whole of it does not fit: the content gives way first.
+	const trimmed = right.replace(/\s+$/, "");
+	const forms = right ? [right, trimmed.slice(trimmed.lastIndexOf(" ") + 1)] : [""];
+	for (const form of forms) {
+		const tail = form ? `${form}  ` : "";
+		const tailWidth = visibleWidth(tail);
+		if (tailWidth + 2 > room) continue;
+		const fitted = truncateToWidth(content, room - tailWidth - (tail ? 2 : 0), "…");
+		const pad = Math.max(tail ? 2 : 0, room - visibleWidth(fitted) - tailWidth);
+		return `${head}${fitted}${tail ? " ".repeat(pad) + tail : ""}`;
 	}
-	const fitted = truncateToWidth(content, room - tailWidth - (tail ? 2 : 0), "…");
-	const pad = Math.max(tail ? 2 : 0, room - visibleWidth(fitted) - tailWidth);
-	return `${head}${fitted}${tail ? " ".repeat(pad) + tail : ""}`;
+	return truncateToWidth(`${head}${content}`, Math.max(1, width), "…");
 }

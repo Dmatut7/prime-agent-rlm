@@ -132,6 +132,29 @@ export function firstSentence(text: string): string {
 	return sanitizeDisplayText((match?.[1] ?? match?.[2] ?? flat).trim());
 }
 
+/**
+ * The first sentence of a thought as words for the live tail: markup lines (a table,
+ * a code fence and what it holds, a rule) are skipped and a heading, quote or list
+ * marker is stripped, so the screen never shows raw markdown. "" when nothing is prose.
+ */
+export function thoughtSentence(text: string): string {
+	let inFence = false;
+	for (const raw of text.split("\n")) {
+		const line = raw.trim();
+		if (line.startsWith("```") || line.startsWith("~~~")) {
+			inFence = !inFence;
+			continue;
+		}
+		if (inFence || line === "" || line.startsWith("|") || /^[-=*_]{3,}$/.test(line)) continue;
+		const words = line
+			.replace(/^(?:#{1,6}\s+|>+\s*|[-*+]\s+|\d+[.)]\s+)+/, "")
+			.replace(/\*\*|__|`/g, "")
+			.trim();
+		if (words) return firstSentence(words);
+	}
+	return "";
+}
+
 let boxIdCounter = 0;
 
 /**

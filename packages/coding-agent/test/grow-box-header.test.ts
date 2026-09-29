@@ -395,7 +395,7 @@ describe("a narrow terminal", () => {
 		return turn;
 	}
 
-	it("keeps the count and the arrow, cuts the words first, and drops the count only when the gutter alone fills the line", () => {
+	it("keeps the count and the arrow, cuts the words first, keeps the arrow alone when the count no longer fits, and drops it only when the gutter alone fills the line", () => {
 		expect(widths.length).toBeGreaterThan(0);
 		const expected: Record<number, string> = {
 			80: `${HEAD}${EVENT_WORDS}${" ".repeat(43)}1 步 ▸  `,
@@ -403,7 +403,7 @@ describe("a narrow terminal", () => {
 			40: `${HEAD}${EVENT_WORDS}${" ".repeat(3)}1 步 ▸  `,
 			30: `${HEAD}跑…   1 步 ▸  `,
 			26: `${HEAD}  1 步 ▸  `,
-			24: `${HEAD}跑了 1 …`,
+			24: `${HEAD}跑…  ▸  `,
 			20: `${HEAD}跑…`,
 		};
 		for (const width of widths) {

@@ -22,11 +22,11 @@ import {
 	type TimelineFacts,
 } from "./timeline-rows.js";
 import {
-	firstSentence,
 	formatBoxDuration,
 	lastCompletedSentence,
 	type TimelineUiState,
 	type TurnTimeline,
+	thoughtSentence,
 } from "./turn-timeline.js";
 
 /**
@@ -221,7 +221,7 @@ function newestThought(timeline: TurnTimeline, hideThinking: boolean): string | 
 		for (let block = content.length - 1; block >= 0; block--) {
 			const item = content[block];
 			if (item?.type === "text" && (item.text ?? "").trim()) return undefined;
-			if (item?.type === "thinking" && (item.thinking ?? "").trim()) return firstSentence(item.thinking ?? "");
+			if (item?.type === "thinking" && (item.thinking ?? "").trim()) return thoughtSentence(item.thinking ?? "");
 		}
 	}
 	return undefined;
@@ -466,7 +466,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 			event.steps.length > 0
 				? width - TIMELINE_CONTENT_COL - visibleWidth(eventRight(event.steps.length, false)) - 4
 				: width - TIMELINE_CONTENT_COL;
-		const words = event.text.length > width ? event.text.slice(0, Math.max(1, width)) : event.text;
+		const words = truncateToWidth(event.text, Math.max(1, width), "");
 		const more = event.full !== undefined && (eventSaysMore(event) || visibleWidth(words) > textRoom);
 		const failDetail = event.kind === "fail" && detailRow?.detail !== undefined;
 		const openable = event.steps.length > 0 || more || failDetail;

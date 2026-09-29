@@ -18,10 +18,14 @@ export class TimelineLaneTracker {
 		return "split";
 	}
 
-	/** A subagent reported; `join` when it was the last one out, else `sub`. */
+	/**
+	 * A subagent reported: `join` when it was out and the last one, `sub` while others are still
+	 * out. A name that was never out (or a late report after the lane emptied) joins nothing.
+	 */
 	reported(name: string): TimelineLane {
-		this.out.delete(name);
-		return this.out.size === 0 ? "join" : "sub";
+		const wasOut = this.out.delete(name);
+		if (this.out.size > 0) return "sub";
+		return wasOut ? "join" : "off";
 	}
 
 	/** The lane for an ordinary row appended now. */
