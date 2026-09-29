@@ -87,6 +87,27 @@ function addStep(
 
 const plain = (lines: readonly string[]) => lines.map((line) => stripAnsi(line).replace(/\x1b_[^\x07]*\x07/g, ""));
 const text = (lines: readonly string[]) => plain(lines).join("\n");
+
+/** Open every event that lists steps (a click on each event line), and give the lines. */
+function openEvents(turn: ReturnType<typeof quietTurn>, width = 100): string[] {
+	turn.summary.render(width);
+	for (const key of turn.summary.getFocusOrder()) {
+		if (key.startsWith("ev:") && turn.summary.enterLabel(key) === "展开") turn.summary.activate(key);
+	}
+	return plain(turn.summary.render(width));
+}
+
+/** The character a click at `col` lands on. */
+function charAtColumn(line: string, col: number): string {
+	let at = 0;
+	for (const char of line) {
+		if (at === col) return char;
+		at += visibleWidth(char);
+		if (at > col) return "";
+	}
+	return "";
+}
+
 const WIDTHS = Array.from({ length: 30 }, (_, index) => index + 1);
 
 function change(overrides: Partial<ChangeEntry> = {}): ChangeEntry {
@@ -189,12 +210,15 @@ afterEach(() => {
 });
 
 describe("narrow terminals", () => {
-	it("never renders a box, strip or refinement line wider than the width it is given", () => {
+	it("never renders a timeline, strip or refinement line wider than the width it is given", () => {
 		setMotionReduced(true);
 		timelineShowAll.set(true);
 		const turn = quietTurn({ host: host({ viewportRows: () => 10 }) });
-		for (let index = 0; index < 8; index++) addStep(turn, `c${index}`, `await bash('make step${index}')`);
-		addStep(turn, "live", "await bash('go test ./...')", "running");
+		const base = Date.now() - 4_000;
+		for (let index = 0; index < 8; index++) {
+			addStep(turn, `c${index}`, `await bash('make step${index}')`, "done", base + index);
+		}
+		addStep(turn, "live", "await bash('go test ./...')", "running", base + 8);
 		const edits = strip(facts(), "edits");
 		const memories = strip(facts({ commitId: "abc1234", trackingIncomplete: true }), "memories");
 		const refinement = new RefinementOutcomeMessageComponent(createRefinementOutcomeMessage(refinementResult()));
@@ -213,10 +237,22 @@ describe("narrow terminals", () => {
 				expect(widest, `${name} at ${width}`).toBeLessThanOrEqual(width);
 			}
 		}
-		// The frame itself still spans the screen once there is room for it.
-		expect(plain(turn.summary.render(30)).some((line) => line.startsWith(" ╭") && visibleWidth(line) === 30)).toBe(
-			true,
-		);
+		// Opened, the step lines fit too.
+		turn.summary.toggleBox();
+		for (const width of WIDTHS) {
+			const lines = turn.summary.render(width);
+			expect(lines.length, `opened at ${width}`).toBeGreaterThan(0);
+			expect(Math.max(...lines.map((line) => visibleWidth(line))), `opened at ${width}`).toBeLessThanOrEqual(width);
+		}
+		turn.summary.toggleBox();
+		// The lines still span the screen once there is room for them: the count ends two columns from the right edge.
+		const roomy = plain(turn.summary.render(30));
+		expect(visibleWidth(roomy[0] ?? "")).toBe(30);
+		expect(roomy[0]?.endsWith("9 步 ▸  ")).toBe(true);
+		const spinner = roomy.find((line) => line.includes("第 9 步")) ?? "";
+		expect(visibleWidth(spinner)).toBe(30);
+		expect(spinner.endsWith("第 9 步  ")).toBe(true);
+		expect(roomy.join("\n")).not.toContain("╭");
 	});
 });
 
@@ -273,7 +309,7 @@ describe("the kernel's step records", () => {
 		addStep(turn, "c1", "for f in files: await bash(f)", "running");
 		const live = ["alpha", "bravo", "charlie"].map((name) => command(name, `echo ${name}`, { status: "ok" }));
 		turn.timeline.mergeStep("c1", "ipython", {}, { details: { activities: live } }, true);
-		expect(text(turn.summary.render(100))).toContain("echo alpha");
+		expect(openEvents(turn).join("\n")).toContain("$  echo alpha");
 		turn.timeline.mergeStep(
 			"c1",
 			"ipython",
@@ -282,10 +318,12 @@ describe("the kernel's step records", () => {
 			false,
 		);
 		turn.state.setStepStatus("c1", "done", Date.now());
-		const out = text(turn.summary.render(100));
+		const lines = openEvents(turn);
+		const out = lines.join("\n");
 		expect(out).not.toContain("echo alpha");
-		expect(out).toContain("echo bravo");
-		expect(out).toContain("… 更早的 1 步没列出");
+		expect(out).toContain("$  echo bravo");
+		const note = lines.find((line) => line.includes("更早的")) ?? "";
+		expect(note.trimEnd()).toBe("         │           …  更早的 1 步没列出");
 	});
 
 	it("shows a command left running as gone to the background, and its later outcome as one settled row", () => {
@@ -305,8 +343,8 @@ describe("the kernel's step records", () => {
 			},
 			false,
 		);
-		const before = text(turn.summary.render(100));
-		expect(before).toContain("npm run build · 转到后台继续跑");
+		const before = openEvents(turn).join("\n");
+		expect(before).toContain("$  npm run build · 转到后台继续跑");
 		expect(before).not.toMatch(/npm run build.*✓/);
 
 		addStep(turn, "c2", "print(h.wait())");
@@ -321,10 +359,10 @@ describe("the kernel's step records", () => {
 			},
 			false,
 		);
-		const after = plain(turn.summary.render(100));
+		const after = openEvents(turn);
 		const rows = after.filter((line) => line.includes("npm run build"));
 		expect(rows).toHaveLength(1);
-		expect(rows[0]).toContain("npm run build · 后台跑完了");
+		expect(rows[0]).toContain("$  npm run build · 后台跑完了");
 		expect(rows[0]).toContain("✓ built in 4s");
 		expect(after.join("\n")).not.toContain("转到后台继续跑");
 		expect(after.join("\n")).not.toContain("✓ 完成");
@@ -345,9 +383,10 @@ describe("the kernel's step records", () => {
 			},
 			false,
 		);
-		const row = plain(turn.summary.render(100)).find((line) => line.includes("npm run build")) ?? "";
-		expect(row).toContain("npm run build · 后台出错了");
-		expect(row).toContain("✗ 退出码 2");
+		const row = openEvents(turn).find((line) => line.includes("npm run build")) ?? "";
+		expect(row).toContain("$  npm run build · 后台出错了");
+		expect(row).toContain("退出码 2");
+		expect(row).not.toContain("✗ 退出码 2");
 	});
 
 	it("keys the background row off the kernel's flag while the cell is still being reported", () => {
@@ -361,7 +400,7 @@ describe("the kernel's step records", () => {
 			{ details: { activities: [command("d", "npm run dev", { status: "running", background: true })] } },
 			true,
 		);
-		expect(text(turn.summary.render(100))).toContain("npm run dev · 转到后台继续跑");
+		expect(openEvents(turn).join("\n")).toContain("$  npm run dev · 转到后台继续跑");
 	});
 
 	it("shows a commit's short id in the command's result column", () => {
@@ -385,8 +424,9 @@ describe("the kernel's step records", () => {
 			},
 			false,
 		);
-		const row = plain(turn.summary.render(100)).find((line) => line.includes("git commit")) ?? "";
-		expect(row).toMatch(/✓ 提交 a1b2c3d\s*│$/);
+		const row = openEvents(turn).find((line) => line.includes("git commit")) ?? "";
+		expect(row).toMatch(/\$ {2}git commit -am fix\s+✓ 提交 a1b2c3d {4}$/);
+		expect(visibleWidth(row)).toBe(100);
 	});
 
 	it("says a secret-looking diff or memory was not kept, with the line counts still shown", () => {
@@ -427,12 +467,12 @@ describe("the kernel's step records", () => {
 			false,
 		);
 		const summary = turn.summary;
-		const rows = plain(summary.render(100));
-		const fileRow = rows.find((line) => line.includes(".env")) ?? "";
+		const fileRow = openEvents(turn).find((line) => line.includes(".env")) ?? "";
 		expect(fileRow).toContain("+3 −1");
 		const toggle = (needle: string) => {
+			const rows = plain(summary.render(100));
 			const index = rows.findIndex((line) => line.includes(needle));
-			const region = summary.getClickRegions().find((candidate) => candidate.line === index && !candidate.passive);
+			const region = summary.getClickRegions().find((candidate) => candidate.line === index);
 			expect(region, needle).toBeDefined();
 			region?.onClick({ row: index, col: 2 });
 		};

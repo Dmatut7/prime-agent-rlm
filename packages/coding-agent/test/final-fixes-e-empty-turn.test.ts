@@ -2,17 +2,17 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { setKeybindings, type TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
-import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
+import { formatTimelineTime } from "../src/modes/interactive/components/timeline-gutter.js";
 import {
 	type TimelineHost,
 	TurnActivityState,
 	TurnSummaryComponent,
 } from "../src/modes/interactive/components/turn-activity.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
-import { headerPlain } from "./grow-box-helpers.js";
+import { type BoxHeader, computeBoxHeader } from "../src/modes/interactive/components/turn-box.js";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 const T0 = 1_700_000_000_000;
 
@@ -67,8 +67,30 @@ function finishedBox(replies: AssistantMessage[], options: { errorEnded?: boolea
 	return summary;
 }
 
-/** The box's header row: a finished box that keeps nothing on show is that row alone, under the `◆ prime` line. */
-const headerOf = (summary: TurnSummaryComponent) => headerPlain(summary.render(120));
+/**
+ * How the turn's facts sum up a finished turn. The timeline draws no summary line of a finished turn, but
+ * what it says (`想了 1 次`, `直接回答了`, `（这轮没有输出）`) is what the live tail falls back to and what stays worked out.
+ */
+function labelOf(summary: TurnSummaryComponent): BoxHeader {
+	const { state } = summary;
+	const view = state.boxView();
+	return computeBoxHeader({
+		rows: view.rows,
+		facts: view.facts,
+		timeline: state.timeline,
+		live: view.live,
+		phase: state.currentPhase,
+		currentThinking: "",
+		now: Date.now(),
+	});
+}
+
+/** A finished turn the timeline draws nothing of: no line, and nothing for the keyboard to walk. */
+function expectNothingDrawn(summary: TurnSummaryComponent): void {
+	expect(plain(summary.render(120))).toEqual([]);
+	expect(summary.getFocusOrder()).toEqual([]);
+	expect(summary.getClickRegions()).toHaveLength(0);
+}
 
 function replayedSummary(messages: AgentMessage[]): TurnSummaryComponent {
 	const components = buildConversationComponents(messages, {
@@ -88,15 +110,14 @@ beforeAll(() => {
 	setKeybindings(new KeybindingsManager());
 });
 
-afterEach(() => {
-	setMotionReduced(false);
-});
-
 describe("a turn that produced nothing says so instead of claiming an answer", () => {
 	it("says the turn had no output for a reply with no text, no step and no thought", () => {
-		const header = headerOf(finishedBox([assistant(T0 + 1_000, [], "length")]));
-		expect(header).toMatch(/✓ 完成 +（这轮没有输出）/);
-		expect(header).not.toContain("直接回答了");
+		const summary = finishedBox([assistant(T0 + 1_000, [], "length")]);
+		expectNothingDrawn(summary);
+		expect(summary.state.boxView().facts.noOutput).toBe(true);
+		const label = labelOf(summary);
+		expect(label).toMatchObject({ status: "done", glyph: "✓", plain: "（这轮没有输出）" });
+		expect(label.plain).not.toContain("直接回答了");
 	});
 
 	it("counts blank text and a blank thought as nothing too", () => {
@@ -108,9 +129,11 @@ describe("a turn that produced nothing says so instead of claiming an answer", (
 			],
 			"length",
 		);
-		const header = headerOf(finishedBox([blank]));
-		expect(header).toContain("（这轮没有输出）");
-		expect(header).not.toContain("直接回答了");
+		const summary = finishedBox([blank]);
+		expectNothingDrawn(summary);
+		expect(summary.state.boxView().facts.noOutput).toBe(true);
+		expect(labelOf(summary).plain).toContain("（这轮没有输出）");
+		expect(labelOf(summary).plain).not.toContain("直接回答了");
 	});
 
 	it("says it on a replayed session, whose facts are worked out again from its messages", () => {
@@ -118,65 +141,90 @@ describe("a turn that produced nothing says so instead of claiming an answer", (
 			{ role: "user", content: "在吗", timestamp: T0 },
 			assistant(T0 + 1_000, [], "length"),
 		]);
-		expect(headerOf(summary)).toContain("（这轮没有输出）");
+		expectNothingDrawn(summary);
+		expect(summary.state.boxView().facts.noOutput).toBe(true);
+		expect(labelOf(summary).plain).toContain("（这轮没有输出）");
 	});
 });
 
 describe("a turn that did say something keeps its wording", () => {
+	/** A plain answer is drawn by the answer's own lane, not by the timeline: nothing of it is drawn here. */
+	function expectAnsweredDirectly(summary: TurnSummaryComponent): void {
+		expectNothingDrawn(summary);
+		expect(summary.state.boxView().facts.noOutput).toBeUndefined();
+		const label = labelOf(summary);
+		expect(label).toMatchObject({ status: "done", glyph: "✓", plain: "直接回答了" });
+		expect(label.plain).not.toContain("这轮没有输出");
+	}
+
 	it("still says the turn answered directly for a plain text reply", () => {
-		const header = headerOf(
+		expectAnsweredDirectly(
 			finishedBox([assistant(T0 + 1_000, [{ type: "text", text: "好的，已经改好了。" }], "stop")]),
 		);
-		expect(header).toMatch(/✓ 完成 +直接回答了/);
-		expect(header).not.toContain("这轮没有输出");
 	});
 
 	it("still says it on a replayed plain text reply", () => {
-		const summary = replayedSummary([
-			{ role: "user", content: "在吗", timestamp: T0 },
-			assistant(T0 + 1_000, [{ type: "text", text: "在的。" }], "stop"),
-		]);
-		expect(headerOf(summary)).toMatch(/✓ 完成 +直接回答了/);
+		expectAnsweredDirectly(
+			replayedSummary([
+				{ role: "user", content: "在吗", timestamp: T0 },
+				assistant(T0 + 1_000, [{ type: "text", text: "在的。" }], "stop"),
+			]),
+		);
 	});
 
 	it("counts an empty reply followed by a text reply of the same turn as an answer", () => {
-		const header = headerOf(
+		expectAnsweredDirectly(
 			finishedBox([
 				assistant(T0 + 1_000, [], "length"),
 				assistant(T0 + 2_000, [{ type: "text", text: "换个说法重答一遍。" }], "stop"),
 			]),
 		);
-		expect(header).toMatch(/✓ 完成 +直接回答了/);
 	});
 
 	it("counts a text reply followed by an empty reply of the same turn as an answer too", () => {
-		const header = headerOf(
+		expectAnsweredDirectly(
 			finishedBox([
 				assistant(T0 + 1_000, [{ type: "text", text: "先答一句。" }], "stop"),
 				assistant(T0 + 2_000, [], "length"),
 			]),
 		);
-		expect(header).toMatch(/✓ 完成 +直接回答了/);
-		expect(header).not.toContain("这轮没有输出");
 	});
 
-	it("keeps counting a thought that has text as a thought", () => {
-		const header = headerOf(
-			finishedBox([assistant(T0 + 1_000, [{ type: "thinking", thinking: "先想一想。再想一想。" }], "length")]),
-		);
-		expect(header).toContain("想了 1 次");
-		expect(header).not.toContain("这轮没有输出");
-		expect(header).not.toContain("直接回答了");
+	it("keeps counting a thought that has text as a thought, on an event line of its own", () => {
+		const summary = finishedBox([
+			assistant(T0 + 1_000, [{ type: "thinking", thinking: "先想一想。再想一想。" }], "length"),
+		]);
+		const lines = plain(summary.render(120));
+		expect(lines).toHaveLength(1);
+		expect(lines[0]?.startsWith(` ${formatTimelineTime(T0 + 1_000)}   ◆`)).toBe(true);
+		expect(lines[0]).toContain("想了 1 次");
+		expect(lines[0]?.trimEnd().endsWith("1 步 ▸")).toBe(true);
+		expect(lines[0]).not.toContain("这轮没有输出");
+		expect(lines[0]).not.toContain("直接回答了");
+		const label = labelOf(summary);
+		expect(label.plain).toContain("想了 1 次");
+		expect(label.plain).not.toContain("这轮没有输出");
+		expect(label.plain).not.toContain("直接回答了");
 	});
 
-	it("leaves a turn that ended on a model error to its error row", () => {
+	it("leaves a turn that ended on a model error to its error line", () => {
 		const summary = finishedBox([assistant(T0 + 1_000, [], "error", "接口超时")], { errorEnded: true });
-		const header = headerOf(summary);
-		expect(header).toMatch(/✗ 出错 +1 处出错/);
-		expect(header).not.toContain("这轮没有输出");
-		expect(header).not.toContain("直接回答了");
-		setMotionReduced(true);
-		summary.toggleBox();
-		expect(plain(summary.render(120)).join("\n")).toContain("模型出错：接口超时");
+		const label = labelOf(summary);
+		expect(label).toMatchObject({ status: "error", glyph: "✗", plain: "1 处出错" });
+		expect(label.plain).not.toContain("这轮没有输出");
+		expect(label.plain).not.toContain("直接回答了");
+		// The failure that ended the turn is a red event line of its own, whatever the turn's steps are.
+		const raw = summary.render(120);
+		const lines = plain(raw);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]?.startsWith(` ${formatTimelineTime(T0 + 1_000)}   ◆`)).toBe(true);
+		expect(lines[0]).toContain("模型出错：接口超时");
+		expect(lines[0]?.trimEnd().endsWith("▸")).toBe(true);
+		expect(raw[0]).toContain(theme.getFgAnsi("timelineMust"));
+		// Opening it says why.
+		expect(summary.activate(summary.getFocusOrder()[0] ?? "")).toBe(true);
+		const open = plain(summary.render(120));
+		expect(open[0]?.trimEnd().endsWith("▴")).toBe(true);
+		expect(open[1]).toContain("接口超时");
 	});
 });

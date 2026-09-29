@@ -158,13 +158,15 @@ function renderChat(container: Container): string {
 
 function expandRenderedToolComponents(container: Container): void {
 	const boxes = container.children.filter((child) => child instanceof TurnSummaryComponent);
-	// The quiet conversation shows each step as a row in its turn's box: open
-	// the box and every row to assert the result the live event / replay delivered.
+	// The quiet conversation lists each step under its event in the turn's timeline: open
+	// the events and every step to assert the result the live event / replay delivered.
 	expect(boxes.length).toBeGreaterThan(0);
 	for (const box of boxes) {
 		if (!box.state.boxOpen) box.toggleBox();
 		box.render(120);
-		const rows = box.getFocusOrder().filter((key) => key !== "header");
+		const events = box.getFocusOrder().filter((key) => key.startsWith("ev:"));
+		expect(events.length).toBeGreaterThan(0);
+		const rows = box.getFocusOrder().filter((key) => !key.startsWith("ev:") && !key.startsWith("all:"));
 		expect(rows.length).toBeGreaterThan(0);
 		for (const key of rows) box.activate(key);
 	}

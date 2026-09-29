@@ -15,15 +15,16 @@ import type {
 import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import { SubagentSummaryLine } from "../src/modes/interactive/components/subagent-summary-line.js";
+import { formatTimelineTime } from "../src/modes/interactive/components/timeline-gutter.js";
 import { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 /**
- * The quiet turn box's lifecycle as the interactive mode drives it: the status
- * bar after a failed turn, a connection that closes mid-run, attaching to a
- * running session, and reopening a session whose last turn is longer than the
+ * The quiet turn timeline's lifecycle as the interactive mode drives it: the
+ * status bar after a failed turn, a connection that closes mid-run, attaching to
+ * a running session, and reopening a session whose last turn is longer than the
  * reopen window or ended on a stop. Events go through the mode's own event
  * queue (subscribeToAgent) into a real chat.
  */
@@ -260,12 +261,13 @@ function user(text: string, at: number): AgentMessage {
 	return { role: "user", content: text, timestamp: at };
 }
 
-/** A box's text with its body open (a finished box folds up), scrolled to its first row when asked. */
-function opened(box: TurnSummaryComponent, options: { top?: boolean } = {}): string {
+/** A box's text with its events open (a finished box folds them), every step listed when asked. */
+function opened(box: TurnSummaryComponent, options: { all?: boolean } = {}): string {
 	if (!box.state.boxOpen) box.toggleBox();
-	const text = stripAnsi(box.render(100).join("\n"));
-	if (!options.top) return text;
-	box.state.timeline.ui.scrollBody(-1_000_000);
+	box.render(100);
+	if (options.all) {
+		for (const key of box.getFocusOrder()) if (key.startsWith("all:")) box.activate(key);
+	}
 	return stripAnsi(box.render(100).join("\n"));
 }
 
@@ -365,7 +367,12 @@ describe("a connection that closes mid-run", () => {
 		expect(box.state.boxLive).toBe(false);
 		const text = opened(box);
 		expect(text).toContain("和后台的连接断了，这一轮后面的进展收不到");
-		expect(text).not.toMatch(/⠋|正在运行/);
+		expect(text).not.toMatch(/[⠀-⣿]|在跑|正在运行/);
+		// The loss ended the turn unfixed: it is its own red event line.
+		const raw = box.render(100);
+		const lost = raw.find((line) => stripAnsi(line).includes("和后台的连接断了，这一轮后面的进展收不到")) ?? "";
+		expect(stripAnsi(lost).startsWith(` ${formatTimelineTime(T0)}   ◆      和后台的连接断了`)).toBe(true);
+		expect(lost).toContain(theme.getFgAnsi("timelineMust"));
 		expect(screen.errors.some((error) => error.includes("和后台的连接断了"))).toBe(true);
 		expect(vi.getTimerCount()).toBe(0);
 	});
@@ -410,8 +417,11 @@ describe("attaching to a running session", () => {
 		const box = screen.boxes()[0]!;
 		expect(screen.boxes()).toHaveLength(1);
 		expect(box.state.steps.map((step) => [step.toolCallId, step.status])).toEqual([["live-1", "done"]]);
-		expect(opened(box)).toContain("sleep 5");
-		expect(opened(box)).not.toContain("正在运行 sleep 5");
+		const lines = opened(box).split("\n");
+		expect(lines.find((line) => line.includes("sleep 5"))).toMatch(/\$ {2}sleep 5\s+✓ slept {4}$/);
+		// The step handed back its result: the tail no longer names it as the command running now.
+		expect(lines.join("\n")).not.toContain("在跑");
+		expect(lines.join("\n")).toContain("等待模型回应…");
 	});
 });
 
@@ -428,8 +438,6 @@ describe("reopening a session", () => {
 		messages.push(assistant(at, [{ type: "text", text: "全部做完了。" }], "stop"));
 		return messages;
 	}
-
-	const clockOf = (box: TurnSummaryComponent) => /\d+分\d+秒|\d+秒/.exec(stripAnsi(box.render(120).join("\n")))?.[0];
 
 	it("keeps a long turn's prompt, clock and step count when the window starts inside it", async () => {
 		const messages = longTurn(250);
@@ -449,11 +457,17 @@ describe("reopening a session", () => {
 		expect(windowed.boxes()).toHaveLength(1);
 		const box = windowed.boxes()[0]!;
 		expect(windowed.prompts()).toEqual(["一轮超长任务"]);
-		expect(clockOf(box)).toBeDefined();
-		expect(clockOf(box)).toBe(clockOf(full.boxes()[0]!));
+		// The timeline draws no header clock: the turn's clock is what the status bar reads, and the first
+		// event carries the turn's real start (a stamp the window cut away), not the window's first message.
+		const fullBox = full.boxes()[0]!;
+		expect(box.state.turnDurationMs()).toBeGreaterThan(0);
+		expect(box.state.turnDurationMs()).toBe(fullBox.state.turnDurationMs());
 		const shown = box.state.steps.length;
 		expect(shown).toBeLessThan(250);
-		expect(opened(box, { top: true })).toContain(`… 更早的 ${250 - shown} 步没列出`);
+		const lines = opened(box).split("\n");
+		expect(lines[0]?.startsWith(` ${formatTimelineTime(T0)}   ◆      跑了 ${shown} 条命令`)).toBe(true);
+		expect(lines[0]?.slice(0, 16)).toBe(opened(fullBox).split("\n")[0]?.slice(0, 16));
+		expect(lines[1]?.trimEnd()).toBe(`         │           ◇  … 更早的 ${250 - shown} 步没列出`);
 	});
 
 	it("says nothing extra when the window starts at a prompt", async () => {
@@ -468,7 +482,7 @@ describe("reopening a session", () => {
 		expect(messages.length).toBe(402);
 		expect(windowed.prompts()).toEqual(["再做一件事"]);
 		expect(windowed.boxes()).toHaveLength(1);
-		expect(opened(windowed.boxes()[0]!)).not.toContain("没列出");
+		expect(opened(windowed.boxes()[0]!, { all: true })).not.toContain("没列出");
 	});
 
 	it("shows a turn the owner stopped mid-command as stopped, as it looked live", async () => {
@@ -489,9 +503,19 @@ describe("reopening a session", () => {
 		);
 		const box = screen.boxes()[0]!;
 		const text = opened(box);
-		expect(text).toContain("■ 已停止");
-		expect(text).toContain("■ sleep 100 · 你停下了");
+		// No pill says 已停止 any more: the step itself reads as stopped, faint, and nothing is drawn as a failure.
+		expect(text).not.toContain("已停止");
+		expect(text).toContain("■  sleep 100 · 你停下了");
 		expect(text).not.toMatch(/出错|✗/);
+		const raw = box.render(100);
+		const step = raw.find((line) => stripAnsi(line).includes("sleep 100")) ?? "";
+		expect(step).toContain(theme.fg("timelineFaint", "■"));
+		expect(raw.join("\n")).not.toContain(theme.getFgAnsi("timelineMust"));
+		expect(
+			stripAnsi(raw.join("\n"))
+				.split("\n")
+				.filter((line) => line.includes("◆")),
+		).toHaveLength(1);
 	});
 
 	it("keeps a message typed during a cut-off step as a row of the same turn, as live", async () => {
@@ -516,6 +540,15 @@ describe("reopening a session", () => {
 		);
 		expect(screen.boxes()).toHaveLength(1);
 		expect(screen.prompts()).toEqual(["跑一下 e2e"]);
-		expect(opened(screen.boxes()[0]!)).toContain("你插话：失败了就只跑出错的那个");
+		const lines = opened(screen.boxes()[0]!).split("\n");
+		const steer = lines.findIndex((line) => line.includes("你插话"));
+		expect(lines[steer]?.trimEnd()).toBe(
+			` ${formatTimelineTime(T0 + 2_000)}   ●      你插话   失败了就只跑出错的那个`,
+		);
+		// It sits between the two events of the one turn: the cut-off step above it, the next command below.
+		const events = lines.flatMap((line, index) => (line.includes("◆") ? [index] : []));
+		expect(events).toHaveLength(2);
+		expect(events[0]).toBeLessThan(steer);
+		expect(events[1]).toBeGreaterThan(steer);
 	});
 });

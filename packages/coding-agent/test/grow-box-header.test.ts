@@ -1,16 +1,15 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import stripAnsi from "strip-ansi";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { formatTimelineTime } from "../src/modes/interactive/components/timeline-gutter.js";
 import type { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
+import { BOX_FOCUS_MARKER } from "../src/modes/interactive/components/turn-box.js";
 import { initTheme, type ThemeBg, type ThemeColor, theme } from "../src/modes/interactive/theme/theme.js";
-import { headerIndex, headerPlain, headerRaw } from "./grow-box-helpers.js";
 import {
 	addCommand,
 	addStep,
 	hasBg,
-	host,
 	plain,
 	type QuietTurn,
 	quietTurn,
@@ -33,27 +32,60 @@ afterAll(() => {
 	restoreTheme();
 });
 
-afterEach(() => {
-	vi.useRealTimers();
-	setMotionReduced(false);
-});
-
 const WIDTH = 100;
+/** The words of the event line a single command makes when the AI said nothing before it. */
+const EVENT_WORDS = "跑了 1 条命令";
+/** An event line: time, the AI's diamond, then the gutter's spaces. */
+const EVENT_LINE = /^ \d\d:\d\d {3}◆/;
+/** The spinner line a running turn ends on. */
+const SPINNER_LINE = /^ \d\d:\d\d {3}[⠀-⣿]/;
+const FAILURE_WORDS = "Python 出错：ModuleNotFoundError: No module named 'nope'";
 
-function finished(options: { stopped?: boolean; failed?: boolean } = {}): QuietTurn {
-	setMotionReduced(true);
-	const turn = quietTurn({ live: false, host: host({ growBox: () => true }) });
+function finished(): QuietTurn {
+	const turn = quietTurn({ live: false });
 	addCommand(turn, "c1", "npm test");
-	if (options.stopped) turn.timeline.stopped = true;
-	if (options.failed) turn.timeline.errorEnded = true;
+	turn.state.markTurnEnded(Date.now());
+	return turn;
+}
+
+/** The turn's last step was still running when the owner stopped it. */
+function stopped(): QuietTurn {
+	const turn = quietTurn({ live: false });
+	addStep(turn, "r1", "await bash('sleep 5')", "running");
+	turn.timeline.stopped = true;
+	turn.state.markTurnEnded(Date.now());
+	return turn;
+}
+
+/** A failure the AI never fixed: the turn ended on it. */
+function failed(): QuietTurn {
+	const turn = quietTurn({ live: false });
+	addStep(turn, "x1", "import nope", "error");
+	turn.timeline.mergeStep(
+		"x1",
+		"ipython",
+		{},
+		{
+			isError: true,
+			details: { error: { ename: "ModuleNotFoundError", evalue: "No module named 'nope'", traceback: [] } },
+		},
+		false,
+	);
+	turn.timeline.errorEnded = true;
 	turn.state.markTurnEnded(Date.now());
 	return turn;
 }
 
 function running(): QuietTurn {
-	setMotionReduced(true);
-	const turn = quietTurn({ host: host({ growBox: () => true }) });
+	const turn = quietTurn();
 	addStep(turn, "r1", "await bash('sleep 5')", "running");
+	return turn;
+}
+
+/** A running turn whose event lists its step. */
+function runningOpen(): QuietTurn {
+	const turn = running();
+	turn.summary.toggleBox();
 	return turn;
 }
 
@@ -66,101 +98,138 @@ function paintedColumns(line: string, bg: ThemeBg): number {
 	return visibleWidth(stripAnsi(line.slice(from, to)));
 }
 
-function headerRegion(summary: TurnSummaryComponent) {
-	const region = summary.getClickRegions().find((candidate) => candidate.hoverKey?.endsWith(":header"));
-	if (!region) throw new Error("no header region");
+/** The turn's first line, with its colors. */
+function firstLine(turn: QuietTurn, width = WIDTH): string {
+	return turn.summary.render(width)[0] ?? "";
+}
+
+/** The click region of the turn's first line (its first event). */
+function eventRegion(summary: TurnSummaryComponent) {
+	const region = summary.getClickRegions().find((candidate) => candidate.line === 0);
+	if (!region) throw new Error("no event region");
 	return region;
 }
 
-describe("the header row is a card", () => {
-	it("paints the whole row, borders excepted, on the finished color, and on the running color while it runs", () => {
-		const turn = finished();
-		const raw = headerRaw(turn.summary.render(WIDTH));
-		expect(hasBg(raw, "boxHeadBg")).toBe(true);
-		expect(hasBg(raw, "boxHeadLiveBg")).toBe(false);
-		// A folded box is the card alone: it spans the box's width.
-		expect(paintedColumns(raw, "boxHeadBg")).toBe(WIDTH - 1);
+function hover(turn: QuietTurn, hovered: boolean): void {
+	turn.summary.render(WIDTH);
+	eventRegion(turn.summary).onHover?.(hovered);
+}
 
-		const live = running();
-		const liveRaw = headerRaw(live.summary.render(WIDTH));
-		expect(hasBg(liveRaw, "boxHeadLiveBg")).toBe(true);
-		expect(hasBg(liveRaw, "boxHeadBg")).toBe(false);
-		// Framed, the row fills the frame between its borders.
-		expect(paintedColumns(liveRaw, "boxHeadLiveBg")).toBe(WIDTH - 3);
-	});
-
-	it("uses colors that stand clearly apart from the box's own blocks", () => {
-		const head = theme.getBgAnsi("boxHeadBg");
-		const liveHead = theme.getBgAnsi("boxHeadLiveBg");
-		const panel = theme.getBgAnsi("kindPanelBg");
-		expect(head).not.toBe(liveHead);
-		expect(head).not.toBe(panel);
-		expect(liveHead).not.toBe(panel);
-	});
-
-	it("keeps the pill's own colors through the rest of the row", () => {
-		const raw = headerRaw(finished().summary.render(WIDTH));
-		const pill = theme.bg("boxPillDoneBg", theme.bold(theme.fg("boxPillDone", " ✓ 完成 ")));
-		expect(raw).toContain(pill + theme.getBgAnsi("boxHeadBg"));
-	});
-});
-
-describe("the status pill", () => {
-	const cases: Array<{ name: string; turn: () => QuietTurn; pill: string; fg: ThemeColor; bg: ThemeBg }> = [
-		{ name: "finished", turn: () => finished(), pill: " ✓ 完成 ", fg: "boxPillDone", bg: "boxPillDoneBg" },
-		{
-			name: "stopped",
-			turn: () => finished({ stopped: true }),
-			pill: " ■ 已停止 ",
-			fg: "boxPillStopped",
-			bg: "boxPillStoppedBg",
-		},
-		{
-			name: "failed",
-			turn: () => finished({ failed: true }),
-			pill: " ✗ 出错 ",
-			fg: "boxPillError",
-			bg: "boxPillErrorBg",
-		},
-	];
-
-	it("says how the turn ended, in its own words and colors, with a space each side", () => {
-		expect(cases.length).toBeGreaterThan(0);
-		for (const testCase of cases) {
-			const raw = headerRaw(testCase.turn().summary.render(WIDTH));
-			expect(raw, testCase.name).toContain(theme.bg(testCase.bg, theme.bold(theme.fg(testCase.fg, testCase.pill))));
+describe("an event line is lit as a whole", () => {
+	it("has no color behind it while calm, and the pointer paints the whole line, out to the last column, on the hover color", () => {
+		const turns = [
+			{ name: "finished", turn: finished() },
+			{ name: "running", turn: running() },
+		];
+		expect(turns.length).toBeGreaterThan(0);
+		for (const { name, turn } of turns) {
+			expect(firstLine(turn), name).not.toContain("\x1b[48;");
+			hover(turn, true);
+			const lit = firstLine(turn);
+			expect(hasBg(lit, "timelineHoverBg"), name).toBe(true);
+			expect(paintedColumns(lit, "timelineHoverBg"), name).toBe(WIDTH);
+			// The card colors of the old header are not used any more.
+			expect(hasBg(lit, "boxHeadBg"), name).toBe(false);
+			expect(hasBg(lit, "boxHeadLiveBg"), name).toBe(false);
 		}
 	});
 
-	it("says the turn goes on, with the spinner, while it runs", () => {
-		const live = running();
-		const raw = headerRaw(live.summary.render(WIDTH));
-		expect(stripAnsi(raw)).toMatch(/ \S 进行中 /);
-		expect(hasBg(raw, "boxPillLiveBg")).toBe(true);
-		expect(raw).toContain(theme.getFgAnsi("boxPillLive"));
+	it("uses colors that stand clearly apart: the hover color from the panel color, and the four status colors from each other", () => {
+		expect(theme.getBgAnsi("timelineHoverBg")).not.toBe(theme.getBgAnsi("kindPanelBg"));
+		const status: ThemeColor[] = ["timelineLive", "timelineOk", "timelineMust", "timelineFix"];
+		expect(new Set(status.map((token) => theme.getFgAnsi(token))).size).toBe(status.length);
 	});
 
-	it("does not say it twice in the words next to it", () => {
-		const stopped = headerPlain(finished({ stopped: true }).summary.render(WIDTH));
-		expect(stopped.match(/已停止/g)).toHaveLength(1);
-		expect(stopped).toMatch(/■ 已停止 +做到第 1 步，做好的都留着/);
+	it("keeps the diamond's and the arrow's own colors through the hover: the hover color opens once and closes once", () => {
+		const turn = finished();
+		hover(turn, true);
+		const lit = firstLine(turn);
+		expect(lit).toContain(theme.bold(theme.fg("timelineAi", "◆")));
+		expect(lit).toContain(theme.bold(theme.fg("timelineFaint", "▸")));
+		expect(lit.startsWith(theme.getBgAnsi("timelineHoverBg"))).toBe(true);
+		expect(lit.endsWith("\x1b[49m")).toBe(true);
+		expect(lit.split("\x1b[49m")).toHaveLength(2);
+	});
+});
+
+describe("how the turn stands", () => {
+	const cases: Array<{ name: string; turn: () => QuietTurn; line: string; raw: () => string }> = [
+		{
+			name: "finished",
+			turn: finished,
+			line: EVENT_WORDS,
+			raw: () => theme.fg("text", EVENT_WORDS),
+		},
+		{
+			name: "stopped",
+			turn: () => {
+				const turn = stopped();
+				turn.summary.toggleBox();
+				return turn;
+			},
+			line: "■  sleep 5 · 你停下了",
+			raw: () => theme.bold(theme.fg("timelineFaint", "■")),
+		},
+		{
+			name: "failed",
+			turn: failed,
+			line: FAILURE_WORDS,
+			raw: () => theme.fg("timelineMust", FAILURE_WORDS),
+		},
+	];
+
+	it("says how the turn ended in its own words and colors, and never ends on the spinner", () => {
+		expect(cases.length).toBeGreaterThan(0);
+		for (const testCase of cases) {
+			const lines = testCase.turn().summary.render(WIDTH);
+			const shown = plain(lines);
+			const at = shown.findIndex((line) => line.includes(testCase.line));
+			expect(at, testCase.name).toBeGreaterThanOrEqual(0);
+			expect(lines[at], testCase.name).toContain(testCase.raw());
+			expect(
+				shown.some((line) => SPINNER_LINE.test(line)),
+				testCase.name,
+			).toBe(false);
+			expect(shown.join("\n"), testCase.name).not.toContain("在跑");
+		}
+	});
+
+	it("says the turn goes on, with the spinner and the running command, while it runs", () => {
+		const lines = running().summary.render(WIDTH);
+		const shown = plain(lines);
+		const at = shown.findIndex((line) => SPINNER_LINE.test(line));
+		expect(at).toBeGreaterThan(0);
+		expect(shown[at]).toMatch(/^ \d\d:\d\d {3}[⠀-⣿] {6}正在运行命令 +第 1 步 {2}$/);
+		expect(lines[at]).toContain(theme.getFgAnsi("timelineLive"));
+		expect(shown[at + 1]).toMatch(/^ {9}╎ {11}在跑 {2}sleep 5 +\d+秒 {4}$/);
+	});
+
+	it("says the stop once, by the step it cut short, and keeps no status word beside it", () => {
+		const turn = stopped();
+		turn.summary.toggleBox();
+		const words = text(turn.summary.render(WIDTH));
+		expect(words.match(/你停下了/g)).toHaveLength(1);
+		for (const gone of ["已停止", "做到第", "进行中", "完成 "]) expect(words).not.toContain(gone);
 	});
 
 	it("has a color of its own in every theme", () => {
 		const tokens: Array<ThemeBg | ThemeColor> = [
-			"boxHeadBg",
-			"boxHeadLiveBg",
-			"boxHeadHoverBg",
-			"boxPillLive",
-			"boxPillLiveBg",
-			"boxPillDone",
-			"boxPillDoneBg",
-			"boxPillStopped",
-			"boxPillStoppedBg",
-			"boxPillError",
-			"boxPillErrorBg",
+			"timelineRail",
+			"timelineTime",
+			"timelineFaint",
+			"timelineSoft",
+			"timelineUser",
+			"timelineAi",
+			"timelineLane",
+			"timelineSub",
+			"timelineMemory",
+			"timelineLive",
+			"timelineMust",
+			"timelineFix",
+			"timelineOk",
+			"timelineHoverBg",
 		];
-		expect(tokens.length).toBe(11);
+		expect(tokens.length).toBe(14);
 		const ansiOf = (token: ThemeBg | ThemeColor): string =>
 			token.endsWith("Bg") ? theme.getBgAnsi(token as ThemeBg) : theme.getFgAnsi(token as ThemeColor);
 		const seen = new Map<string, string[]>();
@@ -178,175 +247,195 @@ describe("the status pill", () => {
 				name,
 			).toBe(true);
 		}
-		// Light is its own set, not the dark one: the header stays apart from a light page.
+		// Light is its own set, not the dark one: the lines stay apart from a light page.
 		expect(seen.get("light")).not.toEqual(seen.get("dark"));
 		expect(seen.get("prime")).toEqual(seen.get("dark"));
 	});
 });
 
-describe("the words, the clock and the arrow", () => {
-	it("draws the title bold in its own color, and the clock and tokens on the right", () => {
-		const turn = finished({ stopped: true });
-		const raw = headerRaw(turn.summary.render(WIDTH));
-		expect(raw).toContain(theme.bold(theme.fg("activityText", "做到第 1 步，做好的都留着")));
-		const words = headerPlain(turn.summary.render(WIDTH));
-		expect(words).toMatch(/做好的都留着 +\d+秒 · ↓ \d+ › *$/);
+describe("the words, the count and the arrow", () => {
+	it("draws the words in the text color and the count and arrow faint on the right, with no clock or tokens", () => {
+		const raw = firstLine(finished());
+		expect(raw).toContain(theme.fg("text", EVENT_WORDS));
+		expect(raw).toContain(theme.fg("timelineFaint", "1 步 ") + theme.bold(theme.fg("timelineFaint", "▸")));
+		const words = plain([raw])[0] ?? "";
+		expect(words).toMatch(/跑了 1 条命令 +1 步 ▸ {2}$/);
+		expect(words).not.toMatch(/\d+秒|↓/);
+		// The bold, colored sentence is the running tail's.
+		const live = running().summary.render(WIDTH);
+		const spin = live.find((line) => SPINNER_LINE.test(stripAnsi(line))) ?? "";
+		expect(spin).toContain(theme.bold(theme.fg("timelineLive", "正在运行命令")));
 	});
 
-	it("puts a bold arrow on the right: `›` folded, `⌄` open, and no caret on the left", () => {
+	it("puts a bold arrow on the right: `▸` folded, `▴` open, and no caret on the left", () => {
 		const turn = finished();
-		const folded = turn.summary.render(WIDTH);
-		expect(headerRaw(folded)).toContain(theme.bold(theme.fg("activityText", "›")));
-		expect(headerPlain(folded)).not.toMatch(/[▾▸]/);
-		expect(headerPlain(folded).trim().startsWith("✓")).toBe(true);
+		const folded = firstLine(turn);
+		const foldedWords = plain([folded])[0] ?? "";
+		expect(folded).toContain(theme.bold(theme.fg("timelineFaint", "▸")));
+		expect(foldedWords).not.toContain("▴");
+		expect(foldedWords).toMatch(EVENT_LINE);
+		expect(foldedWords.slice(0, foldedWords.indexOf(EVENT_WORDS))).not.toMatch(/[▸▴▾]/);
 		turn.summary.toggleBox();
-		const open = turn.summary.render(WIDTH);
-		expect(headerRaw(open)).toContain(theme.bold(theme.fg("activityText", "⌄")));
-		expect(headerPlain(open)).not.toMatch(/[▾▸]/);
+		const open = firstLine(turn);
+		const openWords = plain([open])[0] ?? "";
+		expect(open).toContain(theme.bold(theme.fg("timelineAi", "▴")));
+		expect(openWords).not.toContain("▸");
+		expect(openWords.slice(0, openWords.indexOf(EVENT_WORDS))).not.toMatch(/[▸▴▾]/);
 	});
 });
 
-describe("pointing at the header", () => {
-	it("lights the row and the arrow while the pointer is on it, and back after", () => {
+describe("pointing at an event line", () => {
+	it("lights the line while the pointer is on it, keeps its arrow, and goes back after", () => {
 		const turn = finished();
 		turn.summary.render(WIDTH);
-		const calm = headerRaw(turn.summary.render(WIDTH));
-		headerRegion(turn.summary).onHover?.(true);
-		const lit = headerRaw(turn.summary.render(WIDTH));
-		expect(hasBg(lit, "boxHeadHoverBg")).toBe(true);
+		const calm = firstLine(turn);
+		hover(turn, true);
+		const lit = firstLine(turn);
+		expect(hasBg(lit, "timelineHoverBg")).toBe(true);
 		expect(hasBg(lit, "boxHeadBg")).toBe(false);
-		expect(lit).toContain(theme.bold(theme.fg("activityAccent", "›")));
+		expect(lit).toContain(theme.bold(theme.fg("timelineFaint", "▸")));
 		expect(calm).not.toBe(lit);
-		headerRegion(turn.summary).onHover?.(false);
-		expect(headerRaw(turn.summary.render(WIDTH))).toBe(calm);
+		hover(turn, false);
+		expect(firstLine(turn)).toBe(calm);
 	});
 
 	it("names its region the same way every frame, and changes no row or region place on hover", () => {
 		const turn = finished();
 		const first = turn.summary.render(WIDTH);
 		const before = turn.summary.getClickRegions().map((region) => ({ line: region.line, height: region.height }));
-		const key = headerRegion(turn.summary).hoverKey;
-		expect(key).toBeDefined();
-		headerRegion(turn.summary).onHover?.(true);
+		const target = turn.summary.getFocusOrder()[0];
+		expect(target).toBeDefined();
+		const key = eventRegion(turn.summary).hoverKey;
+		expect(key).toBe(`${turn.timeline.ui.id}:${target}`);
+		eventRegion(turn.summary).onHover?.(true);
 		const lit = turn.summary.render(WIDTH);
-		expect(headerRegion(turn.summary).hoverKey).toBe(key);
+		expect(eventRegion(turn.summary).hoverKey).toBe(key);
 		expect(lit).toHaveLength(first.length);
 		expect(turn.summary.getClickRegions().map((region) => ({ line: region.line, height: region.height }))).toEqual(
 			before,
 		);
 	});
 
-	it("lights it for the keyboard focus too", () => {
+	it("lights it for the keyboard focus too, and marks it as the focused line", () => {
 		const turn = finished();
 		turn.timeline.ui.focused = true;
 		turn.timeline.ui.focusKey = "header";
 		turn.timeline.ui.bump();
-		expect(hasBg(headerRaw(turn.summary.render(WIDTH)), "boxHeadHoverBg")).toBe(true);
+		const line = firstLine(turn);
+		expect(hasBg(line, "timelineHoverBg")).toBe(true);
+		expect(line.startsWith(BOX_FOCUS_MARKER)).toBe(true);
+		expect(paintedColumns(line, "timelineHoverBg")).toBe(WIDTH);
 	});
 
-	it("lights the header of a box that is open, too", () => {
-		const live = running();
-		live.summary.render(WIDTH);
-		headerRegion(live.summary).onHover?.(true);
-		expect(hasBg(headerRaw(live.summary.render(WIDTH)), "boxHeadHoverBg")).toBe(true);
+	it("lights the line of an event that is open, too", () => {
+		const live = runningOpen();
+		hover(live, true);
+		const lines = live.summary.render(WIDTH);
+		expect(plain(lines)[0]).toMatch(/1 步 ▴ {2}$/);
+		expect(hasBg(lines[0] ?? "", "timelineHoverBg")).toBe(true);
 	});
 });
 
-describe("a folded box", () => {
+describe("a folded turn", () => {
 	it("is one row: no frame lines at all", () => {
 		const turn = finished();
 		turn.summary.setHeaderShown(false);
 		const lines = turn.summary.render(WIDTH);
 		expect(lines).toHaveLength(1);
 		expect(text(lines)).not.toMatch(/[╭╮╰╯├┤]/);
-		expect(headerIndex(lines)).toBe(0);
+		expect(plain(lines)[0]).toMatch(EVENT_LINE);
 	});
 
-	it("keeps the frame around a failure it keeps on show", () => {
-		setMotionReduced(true);
-		const turn = quietTurn({ live: false });
-		addStep(turn, "x1", "import nope", "error");
-		turn.timeline.mergeStep(
-			"x1",
-			"ipython",
-			{},
-			{
-				isError: true,
-				details: { error: { ename: "ModuleNotFoundError", evalue: "No module named 'nope'", traceback: [] } },
-			},
-			false,
-		);
-		turn.timeline.errorEnded = true;
-		turn.state.markTurnEnded(Date.now());
+	it("shows a failure it keeps on show as its own red line, with no frame around it", () => {
+		const turn = failed();
 		const lines = turn.summary.render(WIDTH);
 		const words = text(lines);
-		expect(words).toContain("╭");
-		expect(words).toContain("╰");
+		expect(lines).toHaveLength(1);
+		expect(words).not.toContain("╭");
+		expect(words).not.toContain("╰");
 		expect(words).toContain("ModuleNotFoundError");
+		expect(lines[0]).toContain(theme.fg("timelineMust", FAILURE_WORDS));
+		expect(turn.summary.activate(turn.summary.getFocusOrder()[0] ?? "")).toBe(true);
+		const open = turn.summary.render(WIDTH);
+		expect(open).toHaveLength(2);
+		expect(plain(open)[0]).toMatch(/▴ {2}$/);
+		expect(plain(open)[1]).toContain("ModuleNotFoundError");
+		expect(text(open)).not.toMatch(/[╭╮╰╯├┤]/);
 	});
 
-	it("keeps the frame around a box that is open", () => {
+	it("lists the steps of an open turn with no frame around them", () => {
 		const turn = finished();
 		turn.summary.toggleBox();
 		const words = text(turn.summary.render(WIDTH));
-		expect(words).toContain("╭");
-		expect(words).toContain("╰");
+		expect(words).not.toContain("╭");
+		expect(words).not.toContain("╰");
 		expect(words).toContain("npm test");
 	});
 
-	it("opens and folds from the same header row's click, whichever it is on", () => {
+	it("opens and folds from the same event line's click, whichever it is on", () => {
 		const turn = finished();
 		turn.summary.render(WIDTH);
-		headerRegion(turn.summary).onClick({ row: 0, col: 0 });
+		eventRegion(turn.summary).onClick({ row: 0, col: 0 });
 		expect(turn.state.boxOpen).toBe(true);
 		turn.summary.render(WIDTH);
-		headerRegion(turn.summary).onClick({ row: 0, col: 0 });
+		eventRegion(turn.summary).onClick({ row: 0, col: 0 });
 		expect(turn.state.boxOpen).toBe(false);
 	});
 });
 
 describe("a narrow terminal", () => {
-	const widths = [80, 50, 40, 30, 24, 20];
+	const widths = [80, 50, 40, 30, 26, 24, 20];
+	const AT = new Date(2026, 8, 29, 18, 47, 0).getTime();
+	const HEAD = ` ${formatTimelineTime(AT)}   ◆      `;
 
-	it("keeps the pill and the arrow, cuts the words, and drops the clock and tokens first", () => {
+	function fixed(): QuietTurn {
+		const turn = quietTurn({ live: false });
+		addStep(turn, "c1", "await bash('npm test')", "done", AT);
+		turn.state.markTurnEnded(AT + 5_000);
+		return turn;
+	}
+
+	it("keeps the count and the arrow, cuts the words first, and drops the count only when the gutter alone fills the line", () => {
 		expect(widths.length).toBeGreaterThan(0);
-		let clockGone = false;
-		let wordsCut = false;
+		const expected: Record<number, string> = {
+			80: `${HEAD}${EVENT_WORDS}${" ".repeat(43)}1 步 ▸  `,
+			50: `${HEAD}${EVENT_WORDS}${" ".repeat(13)}1 步 ▸  `,
+			40: `${HEAD}${EVENT_WORDS}${" ".repeat(3)}1 步 ▸  `,
+			30: `${HEAD}跑…   1 步 ▸  `,
+			26: `${HEAD}  1 步 ▸  `,
+			24: `${HEAD}跑了 1 …`,
+			20: `${HEAD}跑…`,
+		};
 		for (const width of widths) {
-			const turn = finished();
-			turn.summary.setHeaderShown(false);
-			const [line] = turn.summary.render(width);
-			const shown = stripAnsi(line ?? "");
+			const [line] = fixed().summary.render(width);
 			expect(visibleWidth(line ?? ""), `width ${width}`).toBeLessThanOrEqual(width);
-			expect(shown, `width ${width}`).toContain("✓ 完成");
-			expect(shown, `width ${width}`).toContain("›");
-			if (!/秒 · ↓/.test(shown)) {
-				clockGone = true;
-				// Once the clock is gone, the words have all the room there is.
-			}
-			if (/跑了 1 条命令/.test(shown) === false) wordsCut = true;
+			expect(plain([line ?? ""])[0], `width ${width}`).toBe(expected[width]);
 		}
-		expect(clockGone).toBe(true);
-		expect(wordsCut).toBe(true);
 	});
 
-	it("drops the clock before it cuts the words", () => {
+	it("cuts the words before it drops the count and the arrow", () => {
+		let sawWholeWords = false;
+		let sawCutWords = false;
 		for (const width of widths) {
-			const turn = finished();
-			turn.summary.setHeaderShown(false);
-			const shown = stripAnsi(turn.summary.render(width)[0] ?? "");
-			const hasClock = /秒 · ↓/.test(shown);
-			const hasWords = shown.includes("跑了 1 条命令");
-			if (hasClock) expect(hasWords, `width ${width}: the clock stays only beside whole words`).toBe(true);
+			const shown = plain(fixed().summary.render(width))[0] ?? "";
+			const hasWords = shown.includes(EVENT_WORDS);
+			if (hasWords) {
+				sawWholeWords = true;
+				expect(shown, `width ${width}: whole words stay only beside the arrow`).toContain("1 步 ▸");
+			} else sawCutWords = true;
 		}
+		expect(sawWholeWords).toBe(true);
+		expect(sawCutWords).toBe(true);
 	});
 
-	it("frames an open box down to the narrowest the frame can be", () => {
+	it("draws an open turn down to the narrowest the timeline can be, never wider than the terminal", () => {
 		for (const width of [40, 24, 12, 6, 4]) {
-			const live = running();
-			const lines = live.summary.render(width);
+			const lines = runningOpen().summary.render(width);
+			expect(lines, `width ${width}`).toHaveLength(5);
 			for (const line of lines) expect(visibleWidth(line), `width ${width}`).toBeLessThanOrEqual(width);
 		}
-		expect(plain(running().summary.render(40)).join("\n")).toContain("进行中");
+		const wide = text(runningOpen().summary.render(40));
+		expect(wide).toContain("正在运行命令");
+		expect(wide).toContain("在跑");
 	});
 });

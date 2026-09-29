@@ -1,12 +1,20 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
-import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import { TurnActivityState, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { BOX_FOCUS_MARKER } from "../src/modes/interactive/components/turn-box.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
-import { headerIndex, headerRaw } from "./grow-box-helpers.js";
-import { addCommand, addSay, addStep, host, plain, type QuietTurn, quietTurn } from "./ui-blocks-helpers.js";
+import {
+	addCommand,
+	addSay,
+	addStep,
+	hasBg,
+	host,
+	plain,
+	type QuietTurn,
+	quietTurn,
+	T0,
+	text,
+} from "./ui-blocks-helpers.js";
 
 beforeAll(() => {
 	initTheme("prime");
@@ -14,57 +22,62 @@ beforeAll(() => {
 
 afterEach(() => {
 	vi.useRealTimers();
-	setMotionReduced(false);
 });
 
 const WIDTH = 100;
+/** An event line: time, the AI's diamond. */
+const EVENT_LINE = /^ \d\d:\d\d {3}◆/;
+/** The spinner line a running turn ends on. */
+const SPINNER_LINE = /^ \d\d:\d\d {3}[⠀-⣿]/;
+/** What the old pinned header said about rows out of sight and about folding. */
+const OLD_HINT = /前面还有|往上滚|点框头可收起/;
 
+/** A turn of `steps` commands whose event lists its steps. */
 function openTurn(steps: number, options: { live?: boolean } = {}): QuietTurn {
-	setMotionReduced(true);
 	const turn = quietTurn({ live: options.live ?? true, host: host({ growBox: () => true, viewportRows: () => 40 }) });
 	for (let index = 0; index < steps; index++) addCommand(turn, `c${index}`, `echo step-${index}`);
+	turn.summary.toggleBox();
 	return turn;
 }
 
-/** Only pinned header of the box, once the box has rendered. */
-function pinned(turn: QuietTurn) {
-	const headers = turn.summary.getStickyHeaders();
-	expect(headers).toHaveLength(1);
-	const [header] = headers;
-	if (!header) throw new Error("no sticky header");
-	return header;
+/** The click region on line `line` of the turn's last frame. */
+function regionAt(turn: QuietTurn, line: number) {
+	const region = turn.summary.getClickRegions().find((candidate) => candidate.line === line);
+	if (!region) throw new Error(`no region on line ${line}`);
+	return region;
 }
 
-const hint = (rows: readonly string[]): string => stripAnsi(rows[1] ?? "");
-
-describe("an open box offers its header to the window", () => {
-	it("says where the box's first row (its top rule, just above the header row) and its last row are in its own output", () => {
+describe("an open turn has no header to offer the window", () => {
+	it("starts on its event line and ends on its spinner line, with no top or bottom rule and nothing pinned", () => {
 		const turn = openTurn(6);
 		const lines = turn.summary.render(WIDTH);
-		const header = pinned(turn);
-		expect(header.line).toBe(headerIndex(lines) - 1);
-		expect(header.line).toBeGreaterThan(0);
-		expect(plain(lines)[header.line]).toMatch(/^ ╭─+╮$/);
-		expect(header.endLine).toBe(lines.length - 1);
-		expect(plain(lines)[header.endLine]).toMatch(/^ ╰─+╯$/);
+		const shown = plain(lines);
+		expect(turn.summary.getStickyHeaders()).toEqual([]);
+		expect(shown[0]).toMatch(EVENT_LINE);
+		expect(shown[0]).toMatch(/6 步 ▴ {2}$/);
+		expect(shown[lines.length - 1]).toMatch(SPINNER_LINE);
+		expect(shown.some((line) => /^ ?[╭╰]─+[╮╯]$/.test(line))).toBe(false);
 	});
 
-	it("keeps the offsets right when the box has no `◆ prime` line of its own or a blank above it", () => {
+	it("keeps the lines where they are with no title line of its own and a blank above it", () => {
 		const turn = openTurn(3);
 		turn.summary.setHeaderShown(false);
 		turn.summary.setLeadingBlank(true);
 		const lines = turn.summary.render(WIDTH);
-		const header = pinned(turn);
-		expect(header.line).toBe(headerIndex(lines) - 1);
-		expect(plain(lines)[0]).toBe("");
-		expect(header.endLine).toBe(lines.length - 1);
+		const shown = plain(lines);
+		expect(turn.summary.getStickyHeaders()).toEqual([]);
+		// The blank line above is a blank line of the rail; the first event follows it.
+		expect(shown[0]?.trimEnd()).toBe("         │");
+		expect(shown[1]).toMatch(EVENT_LINE);
+		expect(shown[lines.length - 1]).toMatch(SPINNER_LINE);
 	});
 
-	it("offers nothing while the box is folded, before it renders, or in the older two-line view", () => {
+	it("offers nothing while the turn is folded, open, before it renders, or in the older two-line view", () => {
 		const turn = openTurn(3);
 		expect(turn.summary.getStickyHeaders()).toEqual([]);
 		turn.summary.render(WIDTH);
-		expect(turn.summary.getStickyHeaders()).toHaveLength(1);
+		expect(turn.state.boxOpen).toBe(true);
+		expect(turn.summary.getStickyHeaders()).toEqual([]);
 		turn.state.markTurnEnded();
 		turn.state.finishBox();
 		turn.summary.render(WIDTH);
@@ -72,7 +85,8 @@ describe("an open box offers its header to the window", () => {
 		expect(turn.summary.getStickyHeaders()).toEqual([]);
 		turn.summary.toggleBox();
 		turn.summary.render(WIDTH);
-		expect(turn.summary.getStickyHeaders()).toHaveLength(1);
+		expect(turn.state.boxOpen).toBe(true);
+		expect(turn.summary.getStickyHeaders()).toEqual([]);
 
 		const legacy = new TurnSummaryComponent(new TurnActivityState());
 		legacy.render(WIDTH);
@@ -80,164 +94,178 @@ describe("an open box offers its header to the window", () => {
 	});
 });
 
-describe("what the pinned rows say", () => {
-	it("repeats the header card exactly as it is drawn in place", () => {
+describe("what the lines say instead of pinned rows", () => {
+	it("draws the event line once, in place, and pins no copy of it", () => {
 		const turn = openTurn(5);
 		const lines = turn.summary.render(WIDTH);
-		const rows = pinned(turn).render(0);
-		expect(rows).toHaveLength(2);
-		expect(rows[0]).toBe(headerRaw(lines));
+		expect(turn.summary.getStickyHeaders()).toEqual([]);
+		expect(plain(lines).filter((line) => line.includes("跑了 5 条命令"))).toHaveLength(1);
 	});
 
-	it("follows the header's state: the spinner, the running clock and a hover", () => {
+	it("follows the state in place: the running clock and a hover", () => {
 		vi.useFakeTimers({ now: 1_700_000_000_000 });
-		const turn = openTurn(3);
-		const first = turn.summary.render(WIDTH);
-		expect(pinned(turn).render(0)[0]).toBe(headerRaw(first));
+		const turn = quietTurn();
+		addStep(turn, "r1", "await bash('sleep 5')", "running", Date.now() - 1_000);
+		turn.summary.toggleBox();
+		const first = plain(turn.summary.render(WIDTH));
+		const clockOf = (shown: string[]) => shown.find((line) => line.includes("在跑"))?.match(/(\d+)秒/)?.[1];
+		expect(clockOf(first)).toBe("1");
 		vi.advanceTimersByTime(7_000);
-		const later = turn.summary.render(WIDTH);
-		expect(headerRaw(later)).not.toBe(headerRaw(first));
-		expect(pinned(turn).render(0)[0]).toBe(headerRaw(later));
+		const later = plain(turn.summary.render(WIDTH));
+		expect(clockOf(later)).toBe("8");
+		expect(later.find((line) => line.includes("sleep 5") && !line.includes("在跑"))).toMatch(/8秒/);
 
-		const region = pinned(turn).regions?.[0];
-		region?.onHover?.(true);
+		regionAt(turn, 0).onHover?.(true);
 		const lit = turn.summary.render(WIDTH);
-		expect(pinned(turn).render(0)[0]).toBe(headerRaw(lit));
-		expect(headerRaw(lit)).not.toBe(headerRaw(later));
+		expect(hasBg(lit[0] ?? "", "timelineHoverBg")).toBe(true);
+		expect(turn.summary.getStickyHeaders()).toEqual([]);
 	});
 
-	it("is the same after the box, finished and unchanged, is served from its cache", () => {
+	it("is the same after the turn, finished and unchanged, is served from its cache", () => {
 		const turn = openTurn(4, { live: false });
 		turn.state.markTurnEnded();
-		turn.summary.toggleBox();
 		const first = turn.summary.render(WIDTH);
-		const rows = pinned(turn).render(3);
+		expect(turn.summary.getStickyHeaders()).toEqual([]);
 		expect(turn.summary.render(WIDTH)).toBe(first);
-		expect(pinned(turn).render(3)).toEqual(rows);
+		expect(turn.summary.getStickyHeaders()).toEqual([]);
 	});
 
-	it("leaves the keyboard-focus marker out of the copy: only the row in the transcript carries it", () => {
+	it("carries the keyboard-focus marker on one line only: the event line in the transcript", () => {
 		const turn = openTurn(4);
 		turn.timeline.ui.focused = true;
 		turn.timeline.ui.focusKey = "header";
 		turn.timeline.ui.bump();
 		const lines = turn.summary.render(WIDTH);
 		expect(lines.filter((line) => line.includes(BOX_FOCUS_MARKER))).toHaveLength(1);
-		const rows = pinned(turn).render(0);
-		expect(rows.join("")).not.toContain(BOX_FOCUS_MARKER);
-		expect(rows[0]).toBe(headerRaw(lines).split(BOX_FOCUS_MARKER).join(""));
+		expect(lines[0]?.startsWith(BOX_FOCUS_MARKER)).toBe(true);
+		expect(plain(lines)[0]).toMatch(EVENT_LINE);
+		expect(turn.summary.getStickyHeaders()).toEqual([]);
 	});
 
-	it("puts a faint hint under it, inside the frame, that says what is out of sight and that a click folds the box", () => {
+	it("draws no hint about what is out of sight or that a click folds the turn", () => {
 		const turn = openTurn(12);
-		turn.summary.render(WIDTH);
-		// The window's top is 7 rows under the header row, 8 under the top rule the pin counts from.
-		const rows = pinned(turn).render(8);
-		expect(hint(rows)).toMatch(/^ │ ↑ 前面还有 4 步，往上滚就能看到 · 点框头可收起 +│$/);
-		expect(visibleWidth(rows[1] ?? "")).toBe(WIDTH);
+		const words = text(turn.summary.render(WIDTH));
+		expect(words).not.toMatch(OLD_HINT);
+		expect(words).not.toContain("↑");
+		expect(turn.summary.getStickyHeaders()).toEqual([]);
 	});
 
-	it("counts the blocks the pinned rows cover or the window has scrolled past", () => {
-		const turn = openTurn(10);
-		turn.summary.render(WIDTH);
-		const header = pinned(turn);
-		// A block is two lines and the first one starts two lines under the header row: it counts once the
-		// window's top is past the header (or the pinned rows cover it). The pin counts rows from the top
-		// rule, one above the header row.
-		const counts = [0, 1, 2, 3, 4, 9, 10, 40].map((below) => {
-			const match = /前面还有 (\d+) 步/.exec(hint(header.render(below + 1)));
-			return match ? Number(match[1]) : 0;
-		});
-		expect(counts).toEqual([0, 1, 1, 2, 2, 5, 5, 10]);
-	});
-
-	it("does not count a short note the AI said between steps: it is not a block", () => {
-		setMotionReduced(true);
-		const turn = quietTurn({ host: host({ growBox: () => true }) });
-		addSay(turn, "先说一句。", "n1");
-		addCommand(turn, "c1", "echo one");
-		addSay(turn, "再说一句。", "n2");
-		addCommand(turn, "c2", "echo two");
-		turn.summary.render(WIDTH);
-		const words = hint(pinned(turn).render(200));
-		const blocks = plain(turn.summary.render(WIDTH)).filter((line) => /^ │ +[▸▾] /.test(line)).length;
-		expect(blocks).toBeGreaterThan(0);
-		expect(words).toContain(`前面还有 ${blocks} 步`);
-	});
-
-	it("says only that a click folds the box when no block is out of sight", () => {
-		const turn = openTurn(6);
-		turn.summary.render(WIDTH);
-		expect(hint(pinned(turn).render(0))).toMatch(/^ │ 点框头可收起 +│$/);
-	});
-
-	it("keeps the hint inside a narrow terminal", () => {
-		const turn = openTurn(8);
-		for (const width of [60, 40, 24, 12]) {
-			turn.summary.invalidate();
-			turn.summary.render(width);
-			const rows = pinned(turn).render(9);
-			expect(visibleWidth(rows[0] ?? ""), `header at ${width}`).toBeLessThanOrEqual(width);
-			expect(visibleWidth(rows[1] ?? ""), `hint at ${width}`).toBeLessThanOrEqual(width);
+	it("counts the steps once, in the event's own count, and the ones it does not list in `另外 N 步`", () => {
+		const counts = [1, 2, 3, 4, 10, 40];
+		expect(counts.length).toBeGreaterThan(0);
+		for (const count of counts) {
+			const shown = plain(openTurn(count).summary.render(WIDTH));
+			expect(shown[0], `${count} steps`).toMatch(new RegExp(`${count} 步 ▴ {2}$`));
+			const hidden = shown.find((line) => line.includes("另外"));
+			if (count > 3) expect(hidden, `${count} steps`).toContain(`另外 ${count - 3} 步`);
+			else expect(hidden, `${count} steps`).toBeUndefined();
+			expect(shown.join("\n"), `${count} steps`).not.toMatch(OLD_HINT);
 		}
 	});
 
-	it("marks its frame the way the box does while the turn runs and after", () => {
+	it("does not count a short note the AI said between steps: it is the event line, not a step", () => {
+		const turn = quietTurn({ host: host({ growBox: () => true }) });
+		addSay(turn, "先说一句。", "n1", T0);
+		addStep(turn, "c1", "await bash('echo one')", "done", T0 + 500);
+		addSay(turn, "再说一句。", "n2", T0 + 1_000);
+		addStep(turn, "c2", "await bash('echo two')", "done", T0 + 1_500);
+		turn.summary.toggleBox();
+		const shown = plain(turn.summary.render(WIDTH));
+		const events = shown.filter((line) => EVENT_LINE.test(line));
+		expect(events).toHaveLength(2);
+		expect(events[0]).toMatch(/先说一句。 +2 步 ▴ {2}$/);
+		expect(events[1]).toMatch(/再说一句。 +2 步 ▴ {2}$/);
+		const steps = shown.filter((line) => /^ {9}│ {11}\S/.test(line));
+		expect(steps).toHaveLength(4);
+		expect(steps.some((line) => line.includes("先说一句") || line.includes("再说一句"))).toBe(false);
+	});
+
+	it("draws no hint at all when nothing is out of sight", () => {
+		const turn = openTurn(6);
+		const words = text(turn.summary.render(WIDTH));
+		expect(words).not.toMatch(OLD_HINT);
+		expect(turn.summary.getStickyHeaders()).toEqual([]);
+	});
+
+	it("keeps every line inside a narrow terminal", () => {
+		const turn = openTurn(8);
+		for (const width of [60, 40, 24, 12]) {
+			turn.summary.invalidate();
+			const lines = turn.summary.render(width);
+			expect(lines.length, `width ${width}`).toBeGreaterThan(0);
+			for (const line of lines) expect(visibleWidth(line), `width ${width}`).toBeLessThanOrEqual(width);
+			expect(turn.summary.getStickyHeaders(), `width ${width}`).toEqual([]);
+		}
+	});
+
+	it("tells a running turn from a finished one by its last line, and draws no frame in either", () => {
 		const live = openTurn(3);
-		live.summary.render(WIDTH);
-		const liveRows = pinned(live).render(3);
+		const liveShown = plain(live.summary.render(WIDTH));
 		const done = openTurn(3, { live: false });
 		done.state.markTurnEnded();
-		done.summary.toggleBox();
-		done.summary.render(WIDTH);
-		const doneRows = pinned(done).render(3);
-		expect(liveRows[1]).not.toBe(doneRows[1]);
+		const doneShown = plain(done.summary.render(WIDTH));
+		expect(liveShown.at(-1)).toMatch(SPINNER_LINE);
+		expect(doneShown.some((line) => SPINNER_LINE.test(line))).toBe(false);
+		expect(doneShown.at(-1)).toMatch(/\$ +echo step-\d/);
+		for (const shown of [liveShown, doneShown]) expect(shown.join("\n")).not.toMatch(/[╭╮╰╯]/);
 	});
 });
 
-describe("a click on the pinned header", () => {
-	it("has one region on the header row, the same the box's own header has", () => {
+describe("a click on the event line", () => {
+	it("has one region on the event line, no second one on a pinned copy", () => {
 		const turn = openTurn(5);
 		turn.summary.render(WIDTH);
-		const header = pinned(turn);
-		expect(header.regions).toHaveLength(1);
-		const [region] = header.regions ?? [];
-		expect(region?.line).toBe(0);
+		expect(turn.summary.getStickyHeaders()).toEqual([]);
+		const onFirst = turn.summary.getClickRegions().filter((candidate) => candidate.line === 0);
+		expect(onFirst).toHaveLength(1);
+		const [region] = onFirst;
 		expect(region?.height).toBe(1);
 		expect(region?.col).toBe(0);
-		const inPlace = turn.summary.getClickRegions().find((candidate) => candidate.line === header.line + 1);
-		expect(inPlace?.hoverKey).toBeDefined();
-		expect(region?.hoverKey).toBe(inPlace?.hoverKey);
+		expect(region?.width).toBe(WIDTH);
+		expect(region?.hoverKey).toBe(`${turn.timeline.ui.id}:${turn.summary.getFocusOrder()[0]}`);
 	});
 
-	it("folds the whole box, as the header in place does", () => {
+	it("folds the whole event, and leaves nothing pinned behind", () => {
 		const turn = openTurn(5);
 		turn.summary.render(WIDTH);
-		const region = pinned(turn).regions?.[0];
 		expect(turn.state.boxOpen).toBe(true);
-		region?.onClick({ row: 0, col: 3 });
+		regionAt(turn, 0).onClick({ row: 0, col: 3 });
 		expect(turn.state.boxOpen).toBe(false);
 		turn.summary.render(WIDTH);
 		expect(turn.summary.getStickyHeaders()).toEqual([]);
 	});
 
-	it("does not ask the window to scroll: the box is open already", () => {
+	it("does not ask the window to scroll: the event is open already", () => {
 		const turn = openTurn(5);
 		turn.summary.render(WIDTH);
-		expect(pinned(turn).regions?.[0]?.revealBelow ?? 0).toBe(0);
+		expect(regionAt(turn, 0).revealBelow ?? 0).toBe(0);
+	});
+
+	it("asks the window for the rows opening it adds, while the event is folded", () => {
+		const turn = openTurn(5);
+		turn.summary.toggleBox();
+		turn.summary.render(WIDTH);
+		expect(turn.state.boxOpen).toBe(false);
+		// The first three steps and the `另外 2 步` line.
+		expect(regionAt(turn, 0).revealBelow).toBe(4);
 	});
 });
 
 describe("steps the window has to see", () => {
-	it("counts blocks by the lines they have when the box shows only part of them (an inline box)", () => {
-		setMotionReduced(true);
+	it("lists every step on an inline host as well, so there is no partial view to pin", () => {
 		const turn = quietTurn({ host: host({ growBox: () => false, viewportRows: () => 20 }) });
 		for (let index = 0; index < 20; index++) addStep(turn, `s${index}`, `await bash('echo ${index}')`);
-		const lines = turn.summary.render(WIDTH);
-		const header = pinned(turn);
-		expect(header.line).toBe(headerIndex(lines) - 1);
-		const shown = plain(lines).filter((line) => /\$ echo/.test(line)).length;
-		expect(shown).toBeLessThan(20);
-		expect(hint(header.render(400))).toContain(`前面还有 ${shown} 步`);
+		const folded = plain(turn.summary.render(WIDTH));
+		expect(folded[0]).toMatch(/20 步 ▸ {2}$/);
+		expect(turn.summary.getStickyHeaders()).toEqual([]);
+		turn.summary.toggleBox();
+		turn.summary.render(WIDTH);
+		const all = turn.summary.getFocusOrder().find((key) => key.startsWith("all:"));
+		expect(all).toBeDefined();
+		turn.summary.activate(all ?? "");
+		const lines = plain(turn.summary.render(WIDTH));
+		expect(lines.filter((line) => /\$ +echo \d+/.test(line))).toHaveLength(20);
+		expect(text(lines)).not.toMatch(OLD_HINT);
+		expect(turn.summary.getStickyHeaders()).toEqual([]);
 	});
 });

@@ -180,7 +180,7 @@ describe("renderers show a withheld edit as the reason, not as a diff", () => {
 	});
 });
 
-describe("the turn box lists a withheld edit when tracking is off", () => {
+describe("the timeline lists a withheld edit when tracking is off", () => {
 	const host = (): TimelineHost => ({
 		cwd: () => "/work/app",
 		viewportRows: () => 40,
@@ -198,7 +198,7 @@ describe("the turn box lists a withheld edit when tracking is off", () => {
 		vi.useRealTimers();
 	});
 
-	it("shows ✎ .env with the reason where the counts would be", () => {
+	it("lists ✎ .env as a step of its event, with the reason where the counts would be", () => {
 		const state = new TurnActivityState(Date.now() - 5_000);
 		state.live = true;
 		state.modelId = "glm-5.3-prime";
@@ -233,8 +233,23 @@ describe("the turn box lists a withheld edit when tracking is off", () => {
 		state.setStepStatus("d1", "running", timestamp);
 		state.setStepStatus("d1", "done", timestamp + 500);
 		state.timeline.mergeStep("d1", "ipython", {}, { details: { diffs: [withheld] } }, false);
-		const out = stripAnsi(summary.render(120).join("\n"));
-		expect(out).toMatch(new RegExp(`✎ \\.env\\s+${SENSITIVE_TEXT}`));
+		summary.render(120);
+		const eventKey = summary.getFocusOrder().find((key) => key.startsWith("ev:"));
+		expect(eventKey).toBeDefined();
+		// The event line says what the step did; the step behind `N 步 ▸` carries the reason.
+		expect(stripAnsi(summary.render(120)[0] ?? "")).toContain("改了 1 个文件");
+		summary.activate(eventKey ?? "");
+		const lines = summary.render(120).map((line) => stripAnsi(line));
+		const step = lines.find((line) => line.includes("✎"));
+		expect(step).toMatch(new RegExp(`✎  \\.env\\s+${SENSITIVE_TEXT}\\s*$`));
+		expect(step).not.toMatch(/\+0|−0/);
+		// Opened, the step says the same reason instead of a diff.
+		const stepKey = summary.getFocusOrder().find((key) => key.startsWith("file:"));
+		expect(stepKey).toBeDefined();
+		summary.activate(stepKey ?? "");
+		const opened = summary.render(120).map((line) => stripAnsi(line));
+		const at = opened.findIndex((line) => line.includes("✎"));
+		expect(opened[at + 1]?.trim().replace(/^│\s*/, "")).toBe(SENSITIVE_TEXT);
 	});
 });
 

@@ -1,0 +1,3 @@
+- Changed a turn's process from a framed box to timeline lines: one line per thing the AI said it does or found (time, diamond, its words), with the commands, thoughts and edits behind `N 步 ▸` (first three steps and `全部 ›` when opened), a dispatch line for subagents, and a spinner line with the running command while the turn works.
+- Changed a failure the AI did not fix to its own red line, while a mistake it fixed stays inside its steps as `下一格改好了`.
+- Changed every `N 步` to fold by itself when the turn ends.

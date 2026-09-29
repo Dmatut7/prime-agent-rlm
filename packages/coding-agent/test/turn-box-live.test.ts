@@ -22,15 +22,15 @@ import { type TimelineHost, TurnSummaryComponent } from "../src/modes/interactiv
 import { TurnStripComponent } from "../src/modes/interactive/components/turn-strip.js";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
 import { LiveTurnFlow } from "../src/modes/interactive/live-turn-flow.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 import { createHarness, type Harness } from "./suite/harness.js";
 
 /**
  * The quiet conversation's live path: real session events (the faux provider
  * and a fake `bash` tool) are recorded, then fed through the public
  * LiveTurnFlow into a real chat under fake timers, the way the interactive
- * mode feeds them. One prompt makes one box, a message typed meanwhile is a
- * row in it, a retry or a compaction carries the same box on, and every box
+ * mode feeds them. One prompt makes one timeline, a message typed meanwhile is
+ * a line of it, a retry or a compaction carries the same turn on, and every turn
  * settles into its finished face with no finish timer left behind.
  */
 
@@ -318,9 +318,16 @@ class LiveScreen {
 		return stripAnsi(this.chat.render(100).join("\n"));
 	}
 
-	/** A box's text with its body open (a finished box folds up). */
+	/** The chat as the terminal gets it, colors included. */
+	rawScreen(): string {
+		return this.chat.render(100).join("\n");
+	}
+
+	/** A turn's text with every event open and every step list whole (a finished turn folds up). */
 	opened(box: TurnSummaryComponent): string {
 		if (!box.state.boxOpen) box.toggleBox();
+		box.render(100);
+		for (const key of box.getFocusOrder().filter((target) => target.startsWith("all:"))) box.activate(key);
 		return stripAnsi(box.render(100).join("\n"));
 	}
 }
@@ -378,8 +385,73 @@ function transcriptAt(steps: readonly Recorded[], index: number): AgentMessage[]
 	return [];
 }
 
-/** Past the settle a finished box waits for (a retry or a compaction may still carry it on). */
+/** Past the settle a finished turn waits for (a retry or a compaction may still carry it on). */
 const SETTLE_MS = 450;
+
+/** A turn's lines as plain text. */
+function plainLines(box: TurnSummaryComponent): string[] {
+	return box.render(100).map((line) => stripAnsi(line).replace(/\x1b_[^\x07]*\x07/g, ""));
+}
+
+/** The line ending a running turn: ` HH:MM ⠹ <sentence>      第 N 步`. */
+const SPINNER_LINE = /^ \d\d:\d\d {3}[⠀-⣿] {6}/;
+
+/** The column a string starts at in a plain line (wide characters count two). */
+function cell(line: string, needle: string): number {
+	const at = line.indexOf(needle);
+	expect(at).toBeGreaterThanOrEqual(0);
+	let cols = 0;
+	for (const ch of line.slice(0, at)) cols += /[ᄀ-ᅟ⺀-鿿가-힣＀-｠]/.test(ch) ? 2 : 1;
+	return cols;
+}
+
+/** The one line of `text` that has `needle`. */
+function lineWith(text: string, needle: string): string {
+	const found = text.split("\n").filter((line) => line.includes(needle));
+	expect(found).toHaveLength(1);
+	return found[0] ?? "";
+}
+
+/** An event line: the AI's diamond at column 9, its words at column 16. */
+function expectEventLine(line: string, words: string): void {
+	expect(line).toMatch(/^ \d\d:\d\d {3}◆ {6}\S/);
+	expect(cell(line, "◆")).toBe(9);
+	expect(cell(line, words)).toBe(16);
+}
+
+/** The owner's steer as its own line: ` HH:MM ●      你插话   <text>`. */
+function expectSteerLine(text: string, said: string): void {
+	const line = lineWith(text, said);
+	expect(line).toMatch(/^ \d\d:\d\d {3}● {6}你插话 {3}/);
+	expect(line.trimEnd().endsWith(`你插话   ${said}`)).toBe(true);
+	expect(cell(line, "●")).toBe(9);
+	expect(cell(line, "你插话")).toBe(16);
+}
+
+/**
+ * A turn the owner stopped: no live face and no status pill, the event folded, the cut step
+ * a faint `■` step line once opened, and nothing drawn as a failure.
+ */
+function expectStopped(screen: LiveScreen, box: TurnSummaryComponent, command: string): void {
+	expect(box.state.boxLive).toBe(false);
+	expectNoLiveFace(box);
+	expect(screen.screen()).not.toContain("已停止");
+	expect(screen.screen()).not.toContain("✓");
+	const opened = screen.opened(box);
+	expect(lineWith(opened, `${command} · 你停下了`).startsWith(`         │           ■  ${command} · 你停下了`)).toBe(
+		true,
+	);
+	expect(opened).not.toMatch(/出错|✗/);
+	expect(screen.rawScreen()).not.toContain(theme.getFgAnsi("timelineMust"));
+}
+
+/** A turn that ended (not running): its live face, the spinner line and the running step, is gone. */
+function expectNoLiveFace(box: TurnSummaryComponent): void {
+	const lines = plainLines(box);
+	expect(lines.length).toBeGreaterThan(0);
+	expect(lines.filter((line) => SPINNER_LINE.test(line))).toEqual([]);
+	expect(lines.filter((line) => /第 \d+ 步\s*$/.test(line))).toEqual([]);
+}
 
 const harnesses: Harness[] = [];
 
@@ -463,7 +535,7 @@ function startScreen(steps: readonly Recorded[]): LiveScreen {
 }
 
 describe("a quiet turn, live", () => {
-	it("puts a message typed while a command runs in the same box as a row", async () => {
+	it("puts a message typed while a command runs in the same turn as a steer line", async () => {
 		const harness = await session();
 		const steps = record(harness);
 		const tests = holdCommand("npm test");
@@ -479,7 +551,12 @@ describe("a quiet turn, live", () => {
 		feed(screen, steps);
 		expect(screen.boxes()).toHaveLength(1);
 		expect(screen.prompts()).toBe(1);
-		expect(screen.screen()).toContain("你插话：顺便看下 lint");
+		// The steer sits in the turn's own lines, right after the event it cut in on.
+		const own = plainLines(screen.boxes()[0]!);
+		expectSteerLine(own.join("\n"), "顺便看下 lint");
+		expectEventLine(own[0] ?? "", "跑了 1 条命令");
+		expect(own.indexOf(lineWith(own.join("\n"), "你插话"))).toBe(1);
+		expectSteerLine(screen.screen(), "顺便看下 lint");
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(vi.getTimerCount()).toBe(0);
 	});
@@ -493,18 +570,27 @@ describe("a quiet turn, live", () => {
 		feed(screen, steps);
 		const box = screen.boxes()[0]!;
 		expect(screen.boxes()).toHaveLength(1);
-		// The settle: a retry or a compaction may still carry the turn on.
+		// The settle: a retry or a compaction may still carry the turn on, so the timeline still ends on its spinner line.
 		expect(box.state.boxLive).toBe(true);
+		const live = plainLines(box);
+		expect(live.filter((line) => SPINNER_LINE.test(line))).toHaveLength(1);
+		expect(live.at(-1)).toMatch(/^ \d\d:\d\d {3}[⠀-⣿] {6}等待模型回应…\s+第 1 步 {2}$/);
 		expect(screen.chat.children.some((child) => child instanceof TurnStripComponent)).toBe(false);
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(box.state.boxLive).toBe(false);
-		expect(screen.screen()).toMatch(/✓ 完成 .*跑了 1 条命令 .*›/);
+		// Finished: the event is folded on `1 步 ▸`, the spinner line is gone, and there is no frame or status pill.
+		expect(screen.screen()).not.toMatch(/[╭╮╰╯├┤]|完成 |进行中|已停止/);
+		const done = plainLines(box);
+		expect(done).toHaveLength(1);
+		expectEventLine(done[0] ?? "", "跑了 1 条命令");
+		expect(done[0]?.endsWith("1 步 ▸  ")).toBe(true);
+		expectNoLiveFace(box);
 		expect(screen.screen()).toContain("都过了。");
 		expect(screen.chat.children.at(-1)).toBeInstanceOf(TurnStripComponent);
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
-	it("reopens the same box for a retry, with the retry as a row", async () => {
+	it("reopens the same turn for a retry, with the retry as a step", async () => {
 		const harness = await session({ retry: true });
 		const steps = record(harness);
 		harness.setResponses([
@@ -519,20 +605,24 @@ describe("a quiet turn, live", () => {
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(screen.boxes()).toHaveLength(1);
 		const box = screen.boxes()[0]!;
-		// Waiting to retry: the box stays live with the retry row.
+		// Waiting to retry: the turn stays live, its spinner line says the retry and the retry is a step.
 		expect(box.state.boxLive).toBe(true);
-		expect(screen.screen()).toContain("↻");
+		const waiting = plainLines(box);
+		expect(waiting.at(-1)).toMatch(/^ \d\d:\d\d {3}[⠀-⣿] {6}模型服务繁忙，正在重试\s+第 2 步 {2}$/);
+		// A step that still runs wears the spinner and its own clock.
+		expect(screen.opened(box)).toMatch(/^ {9}│ {11}[⠀-⣿] {2}模型服务繁忙，正在重试 +\d+秒 {4}$/m);
 		feed(screen, steps.slice(indexAfter(steps, "auto_retry_start")));
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(screen.boxes()).toHaveLength(1);
 		expect(screen.boxes()[0]).toBe(box);
 		expect(box.state.boxLive).toBe(false);
+		expectNoLiveFace(box);
 		expect(screen.screen()).toContain("构建好了。");
-		expect(screen.opened(box)).toMatch(/↻/);
+		expect(screen.opened(box)).toMatch(/^ {9}│ {11}↻ {2}模型服务繁忙，已自动重试/m);
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
-	it("shows an automatic compaction as a row of the turn it interrupted, and the box finishes after it", async () => {
+	it("shows an automatic compaction as a step of the turn it interrupted, and the turn finishes after it", async () => {
 		const harness = await session({ compaction: true });
 		const steps = record(harness);
 		outputs.set("cat build.log", `build log${"x".repeat(250_000)}`);
@@ -550,25 +640,29 @@ describe("a quiet turn, live", () => {
 		const screen = startScreen(steps);
 		feed(screen, steps.slice(0, indexAfter(steps, "compaction_start")));
 		vi.advanceTimersByTime(SETTLE_MS);
-		// Compacting: the box waits for it.
+		// Compacting: the turn waits for it and its spinner line says so.
 		expect(screen.boxes()).toHaveLength(1);
 		expect(screen.boxes()[0]!.state.boxLive).toBe(true);
+		expect(plainLines(screen.boxes()[0]!).at(-1)).toMatch(
+			/^ \d\d:\d\d {3}[⠀-⣿] {6}上下文快满了，正在整理前面的内容\s+第 \d+ 步 {2}$/,
+		);
 		feed(screen, steps.slice(indexAfter(steps, "compaction_start")));
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(screen.boxes()).toHaveLength(1);
 		const box = screen.boxes()[0]!;
 		expect(box.state.boxLive).toBe(false);
+		expectNoLiveFace(box);
 		const compactions = harness.eventsOfType("compaction_end").length;
 		expect(compactions).toBeGreaterThan(0);
-		// Each compaction is one row in the box, and nowhere else.
+		// Each compaction is one step of the turn's event, and nowhere else.
 		const opened = screen.opened(box);
-		expect(opened.match(/⇣ 整理完成：[\d.]+k → [\d.]+k tokens/g)).toHaveLength(compactions);
+		expect(opened.match(/^ {9}│ {11}⇣ {2}整理完成：[\d.]+k → [\d.]+k tokens/gm)).toHaveLength(compactions);
 		expect(screen.screen()).not.toContain("前面的对话整理过了");
 		expect(screen.screen()).toContain("日志看完了。");
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
-	it("ends a turn the owner stopped mid-command as stopped, with a faint stopped row", async () => {
+	it("ends a turn the owner stopped mid-command as stopped, with a faint stopped step", async () => {
 		const harness = await session();
 		const steps = record(harness);
 		const slow = holdCommand("sleep 100");
@@ -584,14 +678,11 @@ describe("a quiet turn, live", () => {
 		vi.advanceTimersByTime(SETTLE_MS);
 		const box = screen.boxes()[0]!;
 		expect(screen.boxes()).toHaveLength(1);
-		expect(screen.screen()).toContain("■ 已停止");
-		const opened = screen.opened(box);
-		expect(opened).toContain("■ sleep 100 · 你停下了");
-		expect(opened).not.toMatch(/出错|✗/);
+		expectStopped(screen, box, "sleep 100");
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
-	it("starts a new box for the next prompt, and the previous box finishes right then", async () => {
+	it("starts a new turn for the next prompt, and the previous turn finishes right then", async () => {
 		const harness = await session();
 		const steps = record(harness);
 		await recordSimpleTurn(harness, "跑一下测试", "npm test", "测试都过了。");
@@ -638,9 +729,12 @@ describe("a quiet turn that ends without a run ending it", () => {
 		const box = screen.boxes()[0]!;
 		expect(screen.boxes()).toHaveLength(1);
 		expect(box.state.boxLive).toBe(false);
-		expect(screen.screen()).toContain("■ 已停止");
+		// Stopped, not failed: no live face, no status pill, nothing in the failure color.
+		expectNoLiveFace(box);
+		expect(screen.screen()).not.toContain("已停止");
+		expect(screen.rawScreen()).not.toContain(theme.getFgAnsi("timelineMust"));
 		const opened = screen.opened(box);
-		expect(opened).toMatch(/↻ .*已停止/);
+		expect(opened).toMatch(/^ {9}│ {11}↻ {2}.*已停止/m);
 		expect(opened).not.toContain("重试没成功");
 		expect(vi.getTimerCount()).toBe(0);
 	});
@@ -668,7 +762,18 @@ describe("a quiet turn that ends without a run ending it", () => {
 		vi.advanceTimersByTime(SETTLE_MS);
 		const box = screen.boxes()[0]!;
 		expect(box.state.boxLive).toBe(false);
-		expect(screen.screen()).toMatch(/✗ 出错 .*›/);
+		expectNoLiveFace(box);
+		// The failure that ended the turn is its own red event line, not a step behind `N 步`.
+		const failed = lineWith(screen.screen(), "重试没成功：模型一直不可用");
+		expectEventLine(failed, "模型服务繁忙，重试没成功：模型一直不可用");
+		expect(failed.endsWith("▸  ")).toBe(true);
+		expect(failed).not.toMatch(/\d+ 步/);
+		const raw =
+			screen
+				.rawScreen()
+				.split("\n")
+				.find((line) => line.includes("重试没成功：模型一直不可用")) ?? "";
+		expect(raw).toContain(theme.getFgAnsi("timelineMust"));
 		expect(screen.opened(box)).toContain("重试没成功：模型一直不可用");
 		expect(vi.getTimerCount()).toBe(0);
 	});
@@ -712,11 +817,15 @@ describe("a quiet turn that ends without a run ending it", () => {
 		feed(screen, steps);
 		vi.advanceTimersByTime(SETTLE_MS);
 		const box = screen.boxes()[0]!;
-		expect(screen.screen()).toContain("日志没问题。");
-		const opened = screen.opened(box);
-		expect(opened).not.toContain("先翻一下昨天的日志");
-		expect(opened).not.toContain("想了");
-		expect(opened).not.toContain("3.0k");
+		const shown = screen.screen();
+		expect(shown).toContain("日志没问题。");
+		// The kept attempt is a plain answer under the timeline, so the timeline draws no line at all.
+		expect(plainLines(box)).toEqual([]);
+		expect(screen.opened(box)).toBe("");
+		// Nothing of the dropped attempt (its thought, its thinking line, its tokens) is on the screen.
+		expect(shown).not.toContain("先翻一下昨天的日志");
+		expect(shown).not.toContain("想了");
+		expect(shown).not.toContain("3.0k");
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
@@ -730,7 +839,12 @@ describe("a quiet turn that ends without a run ending it", () => {
 		screen.flow.connectionLost();
 		const [box] = screen.boxes();
 		expect(box!.state.boxLive).toBe(false);
-		expect(screen.opened(box!)).toContain("和后台的连接断了");
+		// The cut step and the connection notice are failures that ended the turn: one red event line each.
+		const lost = lineWith(screen.opened(box!), "和后台的连接断了");
+		expectEventLine(lost, "和后台的连接断了，这一轮后面的进展收不到");
+		expectEventLine(lineWith(screen.opened(box!), "没收到结果"), "运行 npm test 出错：连接断了，没收到结果");
+		const rawLost = box!.render(100).find((line) => line.includes("和后台的连接断了")) ?? "";
+		expect(rawLost).toContain(theme.getFgAnsi("timelineMust"));
 		// Reconnected: the chat is rebuilt from the session as it is now.
 		vi.setSystemTime(steps.at(-1)!.at);
 		screen.flow.connectionRestored();
@@ -739,8 +853,12 @@ describe("a quiet turn that ends without a run ending it", () => {
 		const [twin] = screen.boxes();
 		expect(screen.boxes()).toHaveLength(1);
 		expect(twin!.state.boxLive).toBe(false);
-		// Opened above, so it stays open.
-		expect(screen.screen()).toMatch(/✓ 完成 .*跑了 1 条命令 .*⌄/);
+		// The twin finishes folded: its event sits on `1 步 ▸` (a finish folds every event; nothing stays open).
+		expectNoLiveFace(twin!);
+		const folded = plainLines(twin!);
+		expect(folded).toHaveLength(1);
+		expectEventLine(folded[0] ?? "", "跑了 1 条命令");
+		expect(folded[0]?.endsWith("1 步 ▸  ")).toBe(true);
 		expect(screen.opened(twin!)).not.toContain("连接断了");
 		expect(vi.getTimerCount()).toBe(0);
 	});
@@ -762,12 +880,10 @@ describe("a quiet turn seen from a second view", () => {
 		feed(screen, steps);
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(screen.boxes()).toHaveLength(1);
-		expect(screen.screen()).toContain("■ 已停止");
-		expect(screen.screen()).not.toContain("✓");
-		expect(screen.opened(screen.boxes()[0]!)).toContain("■ sleep 100 · 你停下了");
+		expectStopped(screen, screen.boxes()[0]!, "sleep 100");
 	});
 
-	it("puts a message typed after it attached mid-command in the same box", async () => {
+	it("puts a message typed after it attached mid-command in the same turn", async () => {
 		const harness = await session();
 		const steps = record(harness);
 		const tests = holdCommand("npm test");
@@ -787,12 +903,12 @@ describe("a quiet turn seen from a second view", () => {
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(screen.boxes()).toHaveLength(1);
 		expect(screen.prompts()).toBe(1);
-		expect(screen.opened(screen.boxes()[0]!)).toContain("你插话：顺便看下 lint");
+		expectSteerLine(screen.opened(screen.boxes()[0]!), "顺便看下 lint");
 	});
 });
 
 describe("a quiet turn a notice carries on", () => {
-	it("keeps only the later answer under the box, the earlier one folded into it", async () => {
+	it("keeps only the later answer under the timeline, the earlier one drawn as an event line of it", async () => {
 		const harness = await session();
 		const steps = record(harness);
 		harness.setResponses([reply("子代理回来了：当前目录有 3 个文件。"), reply("收到它的结束通知，结论不变。")]);
@@ -812,10 +928,15 @@ describe("a quiet turn a notice carries on", () => {
 		feed(screen, steps);
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(screen.boxes()).toHaveLength(1);
+		const box = screen.boxes()[0]!;
 		const shown = screen.screen();
-		expect(shown).toContain("收到它的结束通知，结论不变。");
-		expect(shown).not.toContain("子代理回来了");
-		expect(screen.opened(screen.boxes()[0]!)).toContain("子代理回来了：当前目录有 3 个文件");
+		// The later answer is the one answer under the timeline, not a line of it.
+		expect(shown.match(/收到它的结束通知，结论不变。/g)).toHaveLength(1);
+		expect(plainLines(box).join("\n")).not.toContain("收到它的结束通知");
+		// The earlier answer is not a second answer under the timeline: only its event line says it.
+		expect(shown.match(/子代理回来了：当前目录有 3 个文件/g)).toHaveLength(1);
+		expectEventLine(lineWith(plainLines(box).join("\n"), "子代理回来了"), "子代理回来了：当前目录有 3 个文件。");
+		expect(screen.opened(box).match(/子代理回来了：当前目录有 3 个文件/g)).toHaveLength(1);
 	});
 });
 
@@ -839,14 +960,11 @@ describe("a quiet turn replayed from its transcript", () => {
 		cold.rebuild(transcriptAt(steps, steps.length));
 		for (const screen of [live, cold]) {
 			expect(screen.boxes()).toHaveLength(1);
-			expect(screen.screen()).toContain("■ 已停止");
-			const opened = screen.opened(screen.boxes()[0]!);
-			expect(opened).toContain("■ sleep 100 · 你停下了");
-			expect(opened).not.toMatch(/出错|✗/);
+			expectStopped(screen, screen.boxes()[0]!, "sleep 100");
 		}
 	});
 
-	it("keeps a message typed during a cut-off step in the same box, as live", async () => {
+	it("keeps a message typed during a cut-off step in the same turn, as live", async () => {
 		const harness = await session();
 		const steps = record(harness);
 		const e2e = holdCommand("npm run e2e");
@@ -868,13 +986,13 @@ describe("a quiet turn replayed from its transcript", () => {
 		for (const screen of [live, cold]) {
 			expect(screen.boxes()).toHaveLength(1);
 			expect(screen.prompts()).toBe(1);
-			expect(screen.opened(screen.boxes()[0]!)).toContain("你插话：失败了就只跑出错的那个");
+			expectSteerLine(screen.opened(screen.boxes()[0]!), "失败了就只跑出错的那个");
 		}
 	});
 });
 
 describe("a quiet turn across a chat rebuild", () => {
-	it("carries a box waiting to retry over to its replayed twin, which finishes after the retry", async () => {
+	it("carries a turn waiting to retry over to its replayed twin, which finishes after the retry", async () => {
 		const harness = await session({ retry: true });
 		const steps = record(harness);
 		harness.setResponses([
@@ -892,17 +1010,20 @@ describe("a quiet turn across a chat rebuild", () => {
 		expect(screen.boxes()).toHaveLength(1);
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(twin!.state.boxLive).toBe(true);
-		expect(screen.screen()).toContain("↻");
+		// The twin still waits on its retry: the spinner line says it and the retry is a step.
+		expect(plainLines(twin!).at(-1)).toMatch(/^ \d\d:\d\d {3}[⠀-⣿] {6}模型服务繁忙，正在重试\s+第 \d+ 步 {2}$/);
+		expect(screen.opened(twin!)).toMatch(/^ {9}│ {11}[⠀-⣿] {2}模型服务繁忙，正在重试 +\d+秒 {4}$/m);
 		feed(screen, steps.slice(retrying));
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(screen.boxes()).toHaveLength(1);
 		expect(screen.boxes()[0]).toBe(twin);
 		expect(twin!.state.boxLive).toBe(false);
-		expect(screen.opened(twin!)).toMatch(/↻/);
+		expectNoLiveFace(twin!);
+		expect(screen.opened(twin!)).toMatch(/^ {9}│ {11}↻ {2}/m);
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
-	it("finishes a carried retry box whose retry ended while the view was away", async () => {
+	it("finishes a carried retry turn whose retry ended while the view was away", async () => {
 		const harness = await session({ retry: true });
 		const steps = record(harness);
 		harness.setResponses([
@@ -921,11 +1042,12 @@ describe("a quiet turn across a chat rebuild", () => {
 		const [twin] = screen.boxes();
 		expect(screen.boxes()).toHaveLength(1);
 		expect(twin!.state.boxLive).toBe(false);
+		expectNoLiveFace(twin!);
 		expect(screen.screen()).toContain("构建好了。");
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
-	it("finishes a box that was settling when the chat was rebuilt", async () => {
+	it("finishes a turn that was settling when the chat was rebuilt", async () => {
 		const harness = await session();
 		const steps = record(harness);
 		await recordSimpleTurn(harness, "跑一下测试", "npm test", "测试都过了。");
@@ -938,12 +1060,18 @@ describe("a quiet turn across a chat rebuild", () => {
 		expect(twin!.state.boxLive).toBe(true);
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(twin!.state.boxLive).toBe(false);
-		expect(screen.screen()).toMatch(/✓ 完成 .*跑了 1 条命令 .*›/);
+		// Finished: the event folded on `1 步 ▸`, no spinner line, no frame or status pill.
+		expect(screen.screen()).not.toMatch(/[╭╮╰╯├┤]|完成 |进行中|已停止/);
+		expectNoLiveFace(twin!);
+		const folded = plainLines(twin!);
+		expect(folded).toHaveLength(1);
+		expectEventLine(folded[0] ?? "", "跑了 1 条命令");
+		expect(folded[0]?.endsWith("1 步 ▸  ")).toBe(true);
 		expect(screen.chat.children.at(-1)).toBeInstanceOf(TurnStripComponent);
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
-	it("finishes a box the rebuild left settling as soon as the next prompt arrives", async () => {
+	it("finishes a turn the rebuild left settling as soon as the next prompt arrives", async () => {
 		const harness = await session();
 		const steps = record(harness);
 		await recordSimpleTurn(harness, "跑一下测试", "npm test", "测试都过了。");
@@ -965,7 +1093,7 @@ describe("a quiet turn across a chat rebuild", () => {
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
-	it("finishes every box when a rebuild leaves several settling at once", async () => {
+	it("finishes every turn when a rebuild leaves several settling at once", async () => {
 		const harness = await session();
 		const steps = record(harness);
 		const e2e = holdCommand("npm run e2e");
@@ -981,7 +1109,7 @@ describe("a quiet turn across a chat rebuild", () => {
 		const screen = startScreen(steps);
 		feed(screen, steps);
 		expect(screen.boxes()).toHaveLength(1);
-		expect(screen.screen()).toContain("你插话：失败了就只跑出错的那个");
+		expectSteerLine(screen.screen(), "失败了就只跑出错的那个");
 		vi.advanceTimersByTime(100);
 		screen.rebuild(transcriptAt(steps, steps.length));
 		const replayed = screen.boxes();

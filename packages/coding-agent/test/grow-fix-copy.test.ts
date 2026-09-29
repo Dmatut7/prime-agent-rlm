@@ -119,3 +119,47 @@ describe("the subagent spend setting", () => {
 		expect(row).toContain("subagent blocks");
 	});
 });
+
+/** The release that folded the box fragments into the changelogs; a released section never changes. */
+const RELEASE = "0.11.16";
+
+/** The bullets of one released section of a changelog (the release folds the `.changes` fragments into it). */
+function releasedBullets(changelog: string): string[] {
+	const text = read(changelog);
+	const heading = new RegExp(`^## \\[${RELEASE.replaceAll(".", "\\.")}\\] - .*$`, "m").exec(text);
+	if (!heading) throw new Error(`no ${RELEASE} section in ${changelog}`);
+	const rest = text.slice(heading.index + heading[0].length);
+	const next = rest.search(/^## /m);
+	return (next === -1 ? rest : rest.slice(0, next)).split("\n").filter((line) => line.trim().length > 0);
+}
+
+describe("the changelog entries of the release that brought the box", () => {
+	const changelogs = ["../CHANGELOG.md", "../../tui/CHANGELOG.md"];
+
+	it("are one past-tense bullet per line", () => {
+		expect(changelogs.length).toBeGreaterThan(0);
+		for (const changelog of changelogs) {
+			const lines = releasedBullets(changelog);
+			expect(lines.length, changelog).toBeGreaterThan(0);
+			for (const line of lines) expect(line, changelog).toMatch(/^- (Added|Changed|Fixed|Removed) /);
+		}
+	});
+
+	it("say the spend is trimmed after the location, not before anything else", () => {
+		const bottom = releasedBullets("../CHANGELOG.md").join("\n");
+		expect(bottom).not.toContain("before anything else");
+		expect(bottom).toContain("after the location");
+	});
+
+	it("say a mid-run opening folds unless auto-fold is off", () => {
+		const box = releasedBullets("../CHANGELOG.md").join("\n");
+		expect(box).toContain("unless `ui.timelineAutoFold` is off");
+	});
+
+	it("describe the pinned header as it works: while its top is out of sight, with the click and the page keys", () => {
+		const sticky = releasedBullets("../../tui/CHANGELOG.md").join("\n");
+		expect(sticky).not.toContain("taller than the screen");
+		expect(sticky).toContain("scrolled out of sight");
+		expect(sticky).toContain("page keys");
+	});
+});

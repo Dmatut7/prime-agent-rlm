@@ -1,13 +1,14 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai";
 import { setKeybindings, type TUI } from "@earendil-works/pi-tui";
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import stripAnsi from "strip-ansi";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
-import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
-import { headerPlain } from "./grow-box-helpers.js";
+import { type BoxHeader, computeBoxHeader } from "../src/modes/interactive/components/turn-box.js";
+import { formatBoxDuration } from "../src/modes/interactive/components/turn-timeline.js";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 const T0 = 1_700_000_000_000;
 
@@ -48,8 +49,8 @@ function toolResult(id: string, timestamp: number): ToolResultMessage {
 	};
 }
 
-/** The box header line of the one turn a replay of `messages` builds. */
-function replayedHeader(messages: AgentMessage[]): string {
+/** The one turn a replay of `messages` builds. */
+function replayedSummary(messages: AgentMessage[]): TurnSummaryComponent {
 	const components = buildConversationComponents(messages, {
 		ui: { requestRender: vi.fn() } as unknown as TUI,
 		cwd: "/work/app",
@@ -59,16 +60,39 @@ function replayedHeader(messages: AgentMessage[]): string {
 	});
 	const summaries = components.filter((component) => component instanceof TurnSummaryComponent);
 	expect(summaries).toHaveLength(1);
-	return headerPlain((summaries[0] as TurnSummaryComponent).render(120));
+	return summaries[0] as TurnSummaryComponent;
+}
+
+/** How the turn's facts sum up a finished turn (the timeline draws no header of it, and carries no clock in it). */
+function labelOf(summary: TurnSummaryComponent): BoxHeader {
+	const { state } = summary;
+	const view = state.boxView();
+	return computeBoxHeader({
+		rows: view.rows,
+		facts: view.facts,
+		timeline: state.timeline,
+		live: view.live,
+		phase: state.currentPhase,
+		currentThinking: "",
+		now: Date.now(),
+	});
+}
+
+const plain = (lines: readonly string[]) => lines.map((line) => stripAnsi(line).replace(/\x1b_[^\x07]*\x07/g, ""));
+
+/** The turn's clock as the status line reads it, and that it stopped with the turn: no hours pass however late it is asked. */
+function expectFourSeconds(summary: TurnSummaryComponent): void {
+	const { state } = summary;
+	expect(state.turnDurationMs()).toBe(4_000);
+	expect(state.turnDurationMs(Date.now() + 10 * 3_600_000)).toBe(4_000);
+	const clock = formatBoxDuration(state.turnDurationMs());
+	expect(clock).toMatch(/(?<!\d)4秒/);
+	expect(clock).not.toMatch(/小时/);
 }
 
 beforeAll(() => {
 	initTheme("prime");
 	setKeybindings(new KeybindingsManager());
-});
-
-afterEach(() => {
-	setMotionReduced(false);
 });
 
 describe("a replayed turn that ended on an interrupt or an error keeps its own clock", () => {
@@ -90,16 +114,31 @@ describe("a replayed turn that ended on an interrupt or an error keeps its own c
 	];
 
 	it("reads four seconds for a turn the owner interrupted, not the hours since its messages", () => {
-		const header = replayedHeader(cutOff("aborted"));
-		expect(header).toContain("已停止");
-		expect(header).toMatch(/(?<!\d)4秒/);
-		expect(header).not.toMatch(/小时/);
+		const summary = replayedSummary(cutOff("aborted"));
+		expectFourSeconds(summary);
+		expect(labelOf(summary).status).toBe("stopped");
+		// The stopped step is said on its own line once the event is opened; no line carries hours.
+		const closed = plain(summary.render(120));
+		expect(closed).toHaveLength(1);
+		expect(closed[0]?.trimEnd().endsWith("2 步 ▸")).toBe(true);
+		expect(summary.activate(summary.getFocusOrder()[0] ?? "")).toBe(true);
+		const open = plain(summary.render(120));
+		const stopped = open.find((line) => line.includes("你停下了")) ?? "";
+		expect(stopped).toContain("■");
+		expect(stopped).toContain("print(2)");
+		expect(open.join("\n")).not.toMatch(/小时/);
 	});
 
 	it("reads four seconds for a turn that ended on a model error too", () => {
-		const header = replayedHeader(cutOff("error", "model gave up"));
-		expect(header).toContain("✗");
-		expect(header).toMatch(/(?<!\d)4秒/);
-		expect(header).not.toMatch(/小时/);
+		const summary = replayedSummary(cutOff("error", "model gave up"));
+		expectFourSeconds(summary);
+		expect(labelOf(summary)).toMatchObject({ status: "error", glyph: "✗" });
+		// The failure that ended the turn is a red event line of its own, under the event of the step that ran.
+		const raw = summary.render(120);
+		const lines = plain(raw);
+		const failure = lines.findIndex((line) => line.includes("模型出错：model gave up"));
+		expect(failure).toBeGreaterThan(0);
+		expect(raw[failure]).toContain(theme.getFgAnsi("timelineMust"));
+		expect(lines.join("\n")).not.toMatch(/小时/);
 	});
 });
