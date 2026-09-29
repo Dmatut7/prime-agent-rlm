@@ -26,11 +26,14 @@ const CHIP_GAP = 1;
 /** Widest name inside a block before it is cut. */
 const CHIP_NAME_MAX_WIDTH = 16;
 
+/** Widest task tag after a block's name before it is cut. */
+const CHIP_TAG_MAX_WIDTH = 14;
+
 /** Blank columns the hint keeps clear of the row's right edge. */
-const HINT_MARGIN = 1;
+const HINT_MARGIN = 2;
 
 const CHIP_STATE_WORDS: Record<SubagentPanelRowState, string> = {
-	running: "运行中",
+	running: "回答中",
 	idle: "空闲",
 	done: "✓ 已交回",
 	failed: "✗ 出错",
@@ -38,9 +41,9 @@ const CHIP_STATE_WORDS: Record<SubagentPanelRowState, string> = {
 };
 
 const CHIP_STATE_COLORS: Record<SubagentPanelRowState, ThemeColor> = {
-	running: "kindCommand",
+	running: "timelineAi",
 	idle: "dim",
-	done: "success",
+	done: "timelineOk",
 	failed: "error",
 	stalled: "error",
 };
@@ -204,6 +207,8 @@ export interface SubagentPanelRow {
 	activeSessionId?: string;
 	/** Display name (session name, else label). */
 	name: string;
+	/** A few words on the child's task, shown after its name when there is room. */
+	tag?: string;
 	state: SubagentPanelRowState;
 	/** Run time so far, when the snapshot reports it. */
 	elapsedMs?: number;
@@ -277,6 +282,9 @@ export function buildSubagentPanelRows(
 						? "idle"
 						: "done";
 		const row: SubagentPanelRow = { id: child.id, name: child.sessionName ?? child.label, state };
+		// Without a session name the label is the name already; a tag would say it twice.
+		const tag = child.sessionName ? subagentTaskTag(child.label, child.sessionName) : undefined;
+		if (tag) row.tag = tag;
 		if (child.activeSessionId) row.activeSessionId = child.activeSessionId;
 		if (child.sessionDir) row.sessionDir = child.sessionDir;
 		if (child.durationMs !== undefined) row.elapsedMs = child.durationMs;
@@ -286,6 +294,20 @@ export function buildSubagentPanelRows(
 		return row;
 	});
 	return rows.sort((a, b) => rowOrder(a) - rowOrder(b));
+}
+
+/**
+ * A few words on what a child was asked to do: the first clause of its task
+ * brief (`钉住框头：检查……` gives `钉住框头`), without repeating the child's name.
+ */
+export function subagentTaskTag(label: string, name: string): string | undefined {
+	let brief = label.replace(/\s+/g, " ").trim();
+	const own = name.trim().toLowerCase();
+	if (own && brief.toLowerCase().startsWith(own) && !/[\p{L}\p{N}]/u.test(brief.charAt(own.length))) {
+		brief = brief.slice(own.length).replace(/^[\s:：,，\-—]+/, "");
+	}
+	const clause = brief.split(/[。！？!?；;：:，,]|\.\s|\s[—-]{1,2}\s/)[0]?.trim();
+	return clause ? truncateToWidth(clause, CHIP_TAG_MAX_WIDTH, "…") : undefined;
 }
 
 function rowOrder(row: SubagentPanelRow): number {
@@ -417,6 +439,7 @@ interface StripItem {
 	/** What Enter or a click opens; absent for the blocks that open the family view. */
 	row?: SubagentPanelRow;
 	name: string;
+	tag?: string;
 	state?: SubagentPanelRowState;
 }
 
@@ -461,6 +484,9 @@ export class SubagentSummaryLine implements Component, Focusable {
 	private items: readonly StripItem[] = [];
 	private itemsDirty = true;
 	private widthPrefix: number[] = [0];
+	private taggedWidthPrefix: number[] = [0];
+	/** Whether the blocks carry their task tags at the current width: only when every block has room for one. */
+	private tagged = false;
 	private selectedKey: string | undefined;
 	private selectedIndex = 0;
 	private windowStart = 0;
@@ -614,7 +640,14 @@ export class SubagentSummaryLine implements Component, Focusable {
 			}
 			if (this.rows.length > 0) {
 				for (const row of this.rows) {
-					items.push({ key: `row:${row.id}`, kind: "row", row, name: row.name, state: row.state });
+					items.push({
+						key: `row:${row.id}`,
+						kind: "row",
+						row,
+						name: row.name,
+						...(row.tag ? { tag: row.tag } : {}),
+						state: row.state,
+					});
 				}
 			} else {
 				items.push({ key: "counts", kind: "counts", name: "" });
@@ -622,7 +655,11 @@ export class SubagentSummaryLine implements Component, Focusable {
 		}
 		this.items = items;
 		this.widthPrefix = [0];
-		for (const item of items) this.widthPrefix.push((this.widthPrefix.at(-1) ?? 0) + this.chipWidth(item));
+		this.taggedWidthPrefix = [0];
+		for (const item of items) {
+			this.widthPrefix.push((this.widthPrefix.at(-1) ?? 0) + this.chipWidth(item, false));
+			this.taggedWidthPrefix.push((this.taggedWidthPrefix.at(-1) ?? 0) + this.chipWidth(item, true));
+		}
 		// Keep the selection on the same child when the blocks reorder (a child finishing moves down).
 		const kept = this.selectedKey === undefined ? -1 : items.findIndex((item) => item.key === this.selectedKey);
 		this.selectedIndex = kept !== -1 ? kept : Math.min(this.selectedIndex, Math.max(0, items.length - 1));
@@ -645,13 +682,21 @@ export class SubagentSummaryLine implements Component, Focusable {
 		this.invalidate();
 	}
 
+	/** Whether every block fits in the row with its task tag: then all of them carry one, else none does. */
+	private tagsFit(width: number): boolean {
+		const total = this.items.length;
+		if (!this.items.some((item) => item.tag)) return false;
+		return STRIP_INDENT + (this.taggedWidthPrefix[total] ?? 0) + (total - 1) * CHIP_GAP <= width;
+	}
+
 	/** How many blocks fit from `start` in `width` columns, counting the markers the row then needs. */
 	private fitCount(start: number, width: number): number {
 		const total = this.items.length;
+		const prefix = this.tagged ? this.taggedWidthPrefix : this.widthPrefix;
 		const leftWidth = start > 0 ? visibleWidth(leftMarkerText(start)) + CHIP_GAP : 0;
 		const fits = (count: number): boolean => {
 			const end = start + count;
-			const blocks = (this.widthPrefix[end] ?? 0) - (this.widthPrefix[start] ?? 0) + (count - 1) * CHIP_GAP;
+			const blocks = (prefix[end] ?? 0) - (prefix[start] ?? 0) + (count - 1) * CHIP_GAP;
 			const rightWidth = end < total ? CHIP_GAP + visibleWidth(rightMarkerText(total - end)) : 0;
 			return STRIP_INDENT + leftWidth + blocks + rightWidth <= width;
 		};
@@ -717,6 +762,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 		this.layout = undefined;
 		if (items.length === 0) return [];
 		const safeWidth = Math.max(1, width);
+		this.tagged = this.tagsFit(safeWidth);
 		if (this.focused && !this.focusedAtLastRender) this.followSelection(safeWidth);
 		this.focusedAtLastRender = this.focused;
 		const maxStart = this.lastStart(safeWidth);
@@ -756,7 +802,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 			if (!item) continue;
 			const selected = this.focused && index === this.selectedIndex;
 			const hovered = this.hoveredKey === item.key;
-			const chip = this.buildChip(item, selected, hovered, CHIP_NAME_MAX_WIDTH, room(col));
+			const chip = this.buildChip(item, selected, hovered, CHIP_NAME_MAX_WIDTH, room(col), this.tagged);
 			regions.push({
 				line: 0,
 				col,
@@ -804,7 +850,10 @@ export class SubagentSummaryLine implements Component, Focusable {
 		}
 		const hint = this.pickHint(safeWidth - col);
 		if (hint) {
-			line += " ".repeat(safeWidth - col - visibleWidth(hint) - HINT_MARGIN) + theme.fg("dim", hint);
+			line +=
+				" ".repeat(safeWidth - col - visibleWidth(hint) - HINT_MARGIN) +
+				theme.fg("timelineFaint", hint) +
+				" ".repeat(HINT_MARGIN);
 		}
 		regions.push({ line: 0, col: 0, width: safeWidth, height: 1, passive: true, onClick: () => {}, onWheel });
 		this.regions = regions;
@@ -867,6 +916,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 		hovered: boolean,
 		nameMax: number,
 		maxWidth = Number.POSITIVE_INFINITY,
+		withTag = false,
 	): { text: string; width: number } {
 		const lit = selected || hovered;
 		const orphan = item.kind === "orphan";
@@ -877,7 +927,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 			: lit
 				? "kindSubagentHoverBg"
 				: "kindSubagentBg";
-		const glyph = orphan ? theme.fg("kindError", "⚠") : theme.fg("kindSubagent", "◇");
+		const glyph = orphan ? theme.fg("kindError", "⚠") : theme.bold(theme.fg("timelineSub", "◇"));
 		const paint = (body: string): { text: string; width: number } => {
 			// A truncation inside the body ends with a full reset, which also clears the background: put it back.
 			const open = theme.bg(bg, "").replace(/\x1b\[49m$/, "");
@@ -898,11 +948,11 @@ export class SubagentSummaryLine implements Component, Focusable {
 			const shown = selected ? theme.underline(theme.bold(name)) : name;
 			return theme.fg("text", shown);
 		};
-		const build = (nameWidth: number, withState: boolean): { text: string; width: number } =>
+		const build = (nameWidth: number, withState: boolean, tag?: string): { text: string; width: number } =>
 			paint(
-				`${style(truncateToWidth(item.name, nameWidth, "…"))}${withState ? ` ${theme.fg(stateColor, stateWord)}` : ""}`,
+				`${style(`${truncateToWidth(item.name, nameWidth, "…")}${tag ? ` ${tag}` : ""}`)}${withState ? ` ${theme.fg(stateColor, stateWord)}` : ""}`,
 			);
-		let chip = build(nameMax, true);
+		let chip = build(nameMax, true, withTag ? item.tag : undefined);
 		if (chip.width > maxWidth) {
 			// Name width first, down to its first character; the state word goes only when that is not enough.
 			const floor = minCutWidth(item.name);
@@ -933,7 +983,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 	}
 
 	/** A block's width, from its plain text: the layout needs it without touching the theme. */
-	private chipWidth(item: StripItem): number {
+	private chipWidth(item: StripItem, withTag: boolean): number {
 		if (item.kind === "counts") {
 			const counts = this.countParts()
 				.map((part) => part.text)
@@ -942,7 +992,8 @@ export class SubagentSummaryLine implements Component, Focusable {
 		}
 		const glyph = item.kind === "orphan" ? "⚠" : "◇";
 		const word = item.kind === "orphan" ? "卡住" : CHIP_STATE_WORDS[item.state ?? "running"];
-		return visibleWidth(` ${glyph} ${truncateToWidth(item.name, CHIP_NAME_MAX_WIDTH, "…")} ${word} `);
+		const tag = withTag && item.tag ? ` ${item.tag}` : "";
+		return visibleWidth(` ${glyph} ${truncateToWidth(item.name, CHIP_NAME_MAX_WIDTH, "…")}${tag} ${word} `);
 	}
 
 	invalidate(): void {

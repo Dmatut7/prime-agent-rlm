@@ -124,16 +124,16 @@ describe("the subagent strip", () => {
 		]);
 		const [rendered] = line.render(120);
 		const text = plain([rendered ?? ""]);
-		expect(text).toContain(" ◇ alpha 运行中 ");
+		expect(text).toContain(" ◇ alpha 回答中 ");
 		expect(text).toContain(" ◇ beta 空闲 ");
 		expect(text).toContain(" ◇ gamma ✓ 已交回 ");
 		expect(text).toContain(" ◇ delta ✗ 出错 ");
 		expect(text).toContain(" ◇ epsilon ⚠ 卡住 ");
 		expect(count(rendered ?? "", bgOpen("kindSubagentBg"))).toBe(5);
-		expect(rendered).toContain(theme.fg("kindSubagent", "◇"));
-		expect(rendered).toContain(theme.fg("kindCommand", "运行中"));
+		expect(rendered).toContain(theme.bold(theme.fg("timelineSub", "◇")));
+		expect(rendered).toContain(theme.fg("timelineAi", "回答中"));
 		expect(rendered).toContain(theme.fg("dim", "空闲"));
-		expect(rendered).toContain(theme.fg("success", "✓ 已交回"));
+		expect(rendered).toContain(theme.fg("timelineOk", "✓ 已交回"));
 		expect(rendered).toContain(theme.fg("error", "✗ 出错"));
 		expect(rendered).toContain(theme.fg("error", "⚠ 卡住"));
 		// A space between blocks, and none of the old header or per-child list.
@@ -283,7 +283,7 @@ describe("the subagent strip", () => {
 			const regions = chipRegions(line);
 			const text = plain([rendered ?? ""]);
 			for (const [index, region] of regions.entries()) {
-				const block = ` ◇ agent-${index} 运行中 `;
+				const block = ` ◇ agent-${index} 回答中 `;
 				const at = text.indexOf(block);
 				expect(at).toBeGreaterThanOrEqual(0);
 				expect(region.line).toBe(0);

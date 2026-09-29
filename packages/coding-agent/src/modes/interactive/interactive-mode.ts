@@ -262,8 +262,10 @@ import {
 	FooterComponent,
 	type FooterTelemetrySnapshot,
 	type FooterTelemetrySource,
+	finishedRunForms,
 	formatContextTokens,
 	type StatusBarState,
+	workingRunForms,
 } from "./components/footer.js";
 import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
@@ -326,12 +328,7 @@ import {
 } from "./components/turn-activity.js";
 import { BOX_FOCUS_MARKER } from "./components/turn-box.js";
 import { TurnBoxNavigator, turnBoxFocusHints } from "./components/turn-box-navigator.js";
-import {
-	boxRecordFromMessage,
-	formatBoxDuration,
-	formatBoxTokens,
-	isBoxNoticeMessage,
-} from "./components/turn-timeline.js";
+import { boxRecordFromMessage, formatBoxTokens, isBoxNoticeMessage } from "./components/turn-timeline.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
 import { FeatureHintDeck } from "./feature-hints.js";
@@ -7883,22 +7880,15 @@ export class InteractiveMode {
 			const startedAt = this.workingStartedAt ?? this.turnStartedAt;
 			const elapsed = state ? state.turnDurationMs() : startedAt !== undefined ? Date.now() - startedAt : 0;
 			const tokens = state ? state.timeline.outputTokens() : this.activityTracker.getStatus().tokens;
-			const label = working ? "工作中" : "整理上下文";
-			const spinner = theme.bold(theme.fg("activityAccent", spinnerFrame(getSpinnerTick())));
-			const clock = theme.fg("muted", formatBoxDuration(elapsed));
-			const figure = theme.fg("muted", `↓ ${formatBoxTokens(tokens)}`);
-			const escKey = keyText("app.input.clear", { primaryOnly: true });
-			const stop = escKey ? `${dot}${theme.fg("dim", `${escKey} 停止`)}` : "";
-			const head = `${spinner} ${theme.fg("activityText", label)}`;
-			const counted = `${head}${dot}${clock}${dot}${figure}${theme.fg("dim", " tokens")}`;
 			return layout(
-				[
-					`${counted}${stop}`,
-					`${head}${dot}${clock}${dot}${figure}${stop}`,
-					`${head}${dot}${clock}${dot}${figure}`,
-					`${head}${dot}${clock}`,
-				],
-				spendCell.map((cell) => `${counted}${dot}${cell}${stop}`),
+				workingRunForms({
+					label: working ? "工作中" : "整理上下文",
+					spinner: spinnerFrame(getSpinnerTick()),
+					elapsedMs: elapsed,
+					outputTokens: tokens,
+					stopKey: keyText("app.input.clear", { primaryOnly: true }) || undefined,
+					spendCells: spendCell,
+				}),
 			);
 		}
 		const session =
@@ -7908,24 +7898,14 @@ export class InteractiveMode {
 		if (this.connectionLost) return layout([`${theme.fg("error", "✗")} ${theme.fg("muted", "和后台的连接断了")}`]);
 		const last = this.liveTurnFlowStore?.lastFinished;
 		if (last) {
-			const stopped = last.timeline.stopped;
-			const head = stopped
-				? `${theme.fg("dim", "■")} ${theme.fg("muted", "已停止")}`
-				: last.timeline.errorEnded
-					? `${theme.fg("error", "✗")} ${theme.fg("muted", "出错")}`
-					: `${theme.fg("diffAddedText", "✓")} ${theme.fg("muted", "完成")}`;
-			const clock = theme.fg("muted", formatBoxDuration(last.turnDurationMs()));
-			const figure = theme.fg("muted", `↓ ${formatBoxTokens(last.timeline.outputTokens())}`);
-			const variants = [
-				`${head}${dot}${clock}${dot}${figure}${theme.fg("dim", " tokens")}`,
-				`${head}${dot}${clock}${dot}${figure}`,
-			];
-			if (session && !stopped) variants.unshift(`${variants[0]}${dot}${session}`);
-			const fullest = variants[0] ?? head;
-			variants.push(head);
 			return layout(
-				variants,
-				spendCell.map((cell) => `${fullest}${dot}${cell}`),
+				finishedRunForms({
+					outcome: last.timeline.stopped ? "stopped" : last.timeline.errorEnded ? "error" : "done",
+					elapsedMs: last.turnDurationMs(),
+					outputTokens: last.timeline.outputTokens(),
+					...(this.sessionOutputTokens !== undefined ? { sessionTokens: this.sessionOutputTokens } : {}),
+					spendCells: spendCell,
+				}),
 			);
 		}
 		const quiet = session ? [`${session}${theme.fg("dim", " tokens")}`, session] : [""];

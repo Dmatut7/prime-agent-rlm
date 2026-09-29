@@ -87,14 +87,13 @@ describe("the status line's layout with a spend cell", () => {
 		initTheme("dark");
 	});
 
-	const working = "⠹ 工作中 · 1分26秒 · ↓ 7.1k";
+	const working = "⠹ 工作中 1分 · ↓ 7.1k";
 	const forms = renderSubagentSpendCell(spend({ unpriced: [{ model: "kimi-k3", tokens: 8_100_000 }] })).map(plain);
 	const right = [
-		...forms.map((form) => `${working} tokens · ${form} · Esc 停止`),
-		`${working} tokens · Esc 停止`,
+		...forms.map((form) => `${working} · ${form} · Esc 停止`),
 		`${working} · Esc 停止`,
 		working,
-		"⠹ 工作中 · 1分26秒",
+		"⠹ 工作中 1分",
 	];
 	const state: StatusBarState = {
 		model: "glm-5.3-prime",
@@ -108,7 +107,7 @@ describe("the status line's layout with a spend cell", () => {
 
 	it("puts the spend after the clock and the tokens and before Esc 停止 when there is room", () => {
 		const bar = plain(renderStatusBar(state, 240));
-		expect(bar).toContain("↓ 7.1k tokens · 子代理 ¥4.56 · 全部 ¥5.10");
+		expect(bar).toContain("↓ 7.1k · 子代理 ¥4.56 · 全部 ¥5.10");
 		expect(bar.indexOf("子代理 ¥")).toBeLessThan(bar.indexOf("Esc 停止"));
 		expect(bar).toContain("~/work/app");
 	});
@@ -126,10 +125,10 @@ describe("the status line's layout with a spend cell", () => {
 				expect(gone, `spend came back at ${width}`).toBe(false);
 				expect(bar).toMatch(/子代理 ¥4\.56/);
 				expect(bar).toContain("glm-5.3-prime");
-				expect(bar).toContain("工作中 · 1分26秒");
+				expect(bar).toContain("工作中 1分");
 			} else {
 				gone = true;
-				if (bar.includes("glm-5.3-prime · 思考强度 中") && bar.includes("↓ 7.1k tokens · Esc 停止")) {
+				if (bar.includes("glm-5.3-prime · 思考 中") && bar.includes("↓ 7.1k · Esc 停止")) {
 					droppedWhileStateIntact = true;
 				}
 			}
@@ -142,9 +141,9 @@ describe("the status line's layout with a spend cell", () => {
 	it("keeps the old ladder untouched without a spend cell", () => {
 		const plainState: StatusBarState = { ...state, spendForms: 0, right: right.slice(forms.length) };
 		const bar = plain(renderStatusBar(plainState, 160));
-		expect(bar).toContain("↓ 7.1k tokens · Esc 停止");
+		expect(bar).toContain("↓ 7.1k · Esc 停止");
 		expect(bar).not.toContain("¥");
-		expect(plain(renderStatusBar(plainState, 80))).toContain("工作中 · 1分26秒");
+		expect(plain(renderStatusBar(plainState, 80))).toContain("工作中 1分");
 	});
 });
 
@@ -223,7 +222,7 @@ describe("the status line as the interactive mode drives it", () => {
 		expect(bar(200)).not.toContain("¥");
 		strip.setSubagentSpend(spend());
 		const text = bar(200);
-		expect(text).toContain("↓ 7.1k tokens · 子代理 ¥4.56 · 全部 ¥5.10 · ");
+		expect(text).toContain("↓ 7.1k · 子代理 ¥4.56 · 全部 ¥5.10 · ");
 		expect(text.indexOf("子代理 ¥")).toBeLessThan(text.indexOf("Esc 停止"));
 		strip.setSubagentSpend(undefined);
 		expect(bar(200)).not.toContain("¥");
@@ -243,12 +242,12 @@ describe("the status line as the interactive mode drives it", () => {
 			if (text.includes("¥")) {
 				expect(spendGone, `spend back at ${width}`).toBe(false);
 				expect(text).toContain("glm-5.3-prime");
-				expect(text).toContain("工作中 · ");
+				expect(text).toContain("工作中 ");
 				expect(text).toMatch(/子代理 ¥4\.56/);
 			} else if (!spendGone) {
 				spendGone = true;
 				// The first width without the spend still has the whole run state.
-				stateIntactAfterSpend = text.includes("glm-5.3-prime") && /工作中 · [^ ]+ · ↓ 7\.1k tokens/.test(text);
+				stateIntactAfterSpend = text.includes("glm-5.3-prime") && /工作中 [^ ]+ · ↓ 7\.1k/.test(text);
 			}
 		}
 		expect(spendGone).toBe(true);

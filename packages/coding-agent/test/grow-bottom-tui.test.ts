@@ -104,7 +104,7 @@ describe("the subagent strip in a fullscreen terminal", () => {
 	it("sits on the last row, under the transcript, and shows the blocks", async () => {
 		const screen = await createScreen();
 		const text = await screen.stripText();
-		expect(text).toContain("◇ agent-0 运行中");
+		expect(text).toContain("◇ agent-0 回答中");
 		expect(text).toMatch(/还有 \d+ 个 ›/);
 	});
 

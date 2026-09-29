@@ -3,6 +3,7 @@ import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/p
 import stripAnsi from "strip-ansi";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.js";
 import { theme } from "../theme/theme.js";
+import { formatBoxTokens } from "./turn-timeline.js";
 
 /** U6 footer telemetry switch (settings `footer.telemetry`); `on` renders the watermark line. */
 export type FooterTelemetryMode = "off" | "on";
@@ -15,6 +16,12 @@ const WATERMARK_BAR_CELLS = 16;
 
 /** Gap between the line's groups (model, location, bar, figures). */
 const GROUP_GAP = "   ";
+
+/** Gap between the status line's groups: the model, the context meter, the rest. */
+const STATUS_GROUP_GAP = "    ";
+
+/** Blank columns the status line keeps clear of its right edge. */
+const STATUS_RIGHT_MARGIN = 2;
 
 /** The bar only appears once the context reaches this share of the compaction threshold. */
 const WATERMARK_BAR_MIN_LEVEL = 0.5;
@@ -88,17 +95,18 @@ const CONTEXT_METER_CELLS = 8;
 export const CONTEXT_JUST_COMPACTED = "刚整理过";
 
 function contextMeter(percent: number | undefined, warn: boolean, withBar: boolean): string {
-	if (percent === undefined) return `${theme.fg("dim", "上下文")} ${theme.fg("muted", CONTEXT_JUST_COMPACTED)}`;
+	if (percent === undefined) {
+		return `${theme.fg("timelineTime", "上下文")} ${theme.fg("muted", CONTEXT_JUST_COMPACTED)}`;
+	}
 	const clamped = Math.max(0, Math.min(100, percent));
 	const filled = Math.max(clamped > 0 ? 1 : 0, Math.round((clamped / 100) * CONTEXT_METER_CELLS));
-	const color = warn ? "warning" : "accent";
-	const bar = withBar
-		? ` ${theme.fg(color, "━".repeat(filled))}${theme.fg("dim", "─".repeat(CONTEXT_METER_CELLS - filled))}`
-		: "";
-	return `${theme.fg("dim", "上下文")}${bar} ${theme.fg(warn ? "warning" : "muted", `${Math.round(clamped)}%`)}`;
+	const color = warn ? "warning" : "timelineUser";
+	const used = filled > 0 ? theme.fg(color, "━".repeat(filled)) : "";
+	const free = filled < CONTEXT_METER_CELLS ? theme.fg("timelineRail", "━".repeat(CONTEXT_METER_CELLS - filled)) : "";
+	const bar = withBar ? ` ${used}${free}` : "";
+	return `${theme.fg("timelineTime", "上下文")}${bar} ${theme.fg(warn ? "warning" : "timelineTime", `${Math.round(clamped)}%`)}`;
 }
 
-/** Lay the status bar out in `width` columns, dropping the least useful groups first. */
 /** Width of a line whose numbers keep growing, with each number counted as at least three digits wide. */
 function steadyWidth(text: string): number {
 	let extra = 0;
@@ -107,15 +115,16 @@ function steadyWidth(text: string): number {
 	return visibleWidth(text) + extra;
 }
 
+/** Lay the status bar out in `width` columns, dropping the least useful groups first. */
 export function renderStatusBar(state: StatusBarState, width: number, badge?: string): string {
 	const safeWidth = Math.max(1, width);
-	const model = ` ${theme.fg("muted", state.level ? `${state.model} · 思考强度 ${state.level}` : state.model)}`;
+	const model = ` ${theme.fg("timelineTime", state.level ? `${state.model} · 思考 ${state.level}` : state.model)}`;
 	const chip = state.subagents > 0 ? theme.fg("activityAccent", `◇ ${state.subagents} 个子代理在跑`) : "";
 	const location = state.location ? theme.fg("dim", state.location) : "";
 	const badgeText = badge ? theme.fg("warning", badge) : "";
 	const meterBar = state.context ? contextMeter(state.context.percent, state.context.warn, true) : "";
 	const meterShort = state.context ? contextMeter(state.context.percent, state.context.warn, false) : "";
-	const join = (...groups: string[]) => groups.filter(Boolean).join(GROUP_GAP);
+	const join = (...groups: string[]) => groups.filter(Boolean).join(STATUS_GROUP_GAP);
 	const rights = state.right.length > 0 ? state.right : [""];
 	const right = (index: number) => rights[Math.min(index, rights.length - 1)] ?? "";
 	const spendForms = Math.max(0, Math.min(state.spendForms ?? 0, rights.length - 1));
@@ -143,14 +152,103 @@ export function renderStatusBar(state: StatusBarState, width: number, badge?: st
 	];
 	for (const [left, rightText] of candidates) {
 		const gap = rightText ? 2 : 0;
+		const margin = rightText ? STATUS_RIGHT_MARGIN : 0;
 		// Counters are measured as if they had at least three digits, so the
 		// layout does not change every time a clock or a count gains a digit.
-		if (visibleWidth(left) + gap + steadyWidth(rightText) + 1 <= safeWidth) {
-			const pad = Math.max(gap, safeWidth - visibleWidth(left) - visibleWidth(rightText) - 1);
-			return `${left}${" ".repeat(pad)}${rightText}${rightText ? " " : ""}`;
+		if (visibleWidth(left) + gap + steadyWidth(rightText) + margin <= safeWidth) {
+			const pad = Math.max(gap, safeWidth - visibleWidth(left) - visibleWidth(rightText) - margin);
+			return `${left}${" ".repeat(pad)}${rightText}${" ".repeat(margin)}`;
 		}
 	}
 	return truncateToWidth(model, safeWidth, "…");
+}
+
+/** A live run's clock: seconds for the first minute, then whole minutes (`45秒`, `10分`, `1小时05分`). */
+export function formatLiveClock(ms: number): string {
+	const seconds = Math.max(0, Math.floor(ms / 1000));
+	if (seconds < 60) return `${seconds}秒`;
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) return `${minutes}分`;
+	return `${Math.floor(minutes / 60)}小时${String(minutes % 60).padStart(2, "0")}分`;
+}
+
+/** A finished run's length the way it is said aloud (`45 秒`, `20 分钟`, `1 小时 5 分钟`). */
+export function formatDoneClock(ms: number): string {
+	const seconds = Math.max(0, Math.round(ms / 1000));
+	if (seconds < 60) return `${seconds} 秒`;
+	const minutes = Math.round(seconds / 60);
+	if (minutes < 60) return `${minutes} 分钟`;
+	const hours = Math.floor(minutes / 60);
+	const rest = minutes % 60;
+	return rest === 0 ? `${hours} 小时` : `${hours} 小时 ${rest} 分钟`;
+}
+
+const RUN_DOT = " · ";
+
+export interface WorkingRunInput {
+	/** `工作中`, or `整理上下文` while the context is being compacted. */
+	label: string;
+	/** The current spinner frame. */
+	spinner: string;
+	elapsedMs: number;
+	outputTokens: number;
+	/** The configured stop key's name; absent when none is bound. */
+	stopKey?: string;
+	/** The subagent spend cell's forms, fullest first (see renderSubagentSpendCell). */
+	spendCells: readonly string[];
+}
+
+/**
+ * The right side of the status line while the AI works, fullest form first:
+ * `⠹ 工作中 10分 · ↓ 180k · 子代理 ¥4.20 · 全部 ¥9.80 · Esc 停止`, all in the live
+ * color. The forms that carry the spend come first, one per spend form, so the
+ * spend goes before the clock or the tokens lose anything.
+ */
+export function workingRunForms(input: WorkingRunInput): string[] {
+	const head = `${input.spinner} ${input.label}`;
+	const counted = `${head} ${formatLiveClock(input.elapsedMs)}${RUN_DOT}↓ ${formatBoxTokens(input.outputTokens)}`;
+	const stop = input.stopKey ? `${RUN_DOT}${input.stopKey} 停止` : "";
+	const forms = [
+		...input.spendCells.map((cell) => `${counted}${RUN_DOT}${stripAnsi(cell)}${stop}`),
+		`${counted}${stop}`,
+		counted,
+		`${head} ${formatLiveClock(input.elapsedMs)}`,
+	];
+	return forms.filter((form, index) => forms.indexOf(form) === index).map((form) => theme.fg("timelineLive", form));
+}
+
+export interface FinishedRunInput {
+	outcome: "done" | "stopped" | "error";
+	elapsedMs: number;
+	outputTokens: number;
+	/** Output tokens of the whole conversation, shown after a completed run. */
+	sessionTokens?: number;
+	spendCells: readonly string[];
+}
+
+/**
+ * The right side of the status line after a run ended, fullest form first:
+ * `✓ 完成 · 20 分钟 · ↓ 286k`, dim. A stopped or failed run keeps its own words
+ * (a failure keeps its red mark).
+ */
+export function finishedRunForms(input: FinishedRunInput): string[] {
+	const dim = (text: string) => theme.fg("timelineTime", text);
+	const word = input.outcome === "stopped" ? "■ 已停止" : input.outcome === "error" ? "出错" : "✓ 完成";
+	// A failure keeps a red mark in front of otherwise dim text.
+	const paint = (text: string) =>
+		input.outcome === "error" ? `${theme.fg("error", "✗")}${dim(` ${text}`)}` : dim(text);
+	const base = `${word}${RUN_DOT}${formatDoneClock(input.elapsedMs)}${RUN_DOT}↓ ${formatBoxTokens(input.outputTokens)}`;
+	const session =
+		input.sessionTokens !== undefined && input.sessionTokens > 0 && input.outcome !== "stopped"
+			? `${RUN_DOT}本会话 ↓ ${formatBoxTokens(input.sessionTokens)}`
+			: "";
+	const fullest = `${base}${session}`;
+	return [
+		...input.spendCells.map((cell) => paint(`${fullest}${RUN_DOT}${stripAnsi(cell)}`)),
+		...(session ? [paint(fullest)] : []),
+		paint(base),
+		paint(word),
+	];
 }
 
 /**
