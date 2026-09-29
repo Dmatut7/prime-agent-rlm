@@ -1,0 +1,1 @@
+- Fixed a retry that moved to a backup model reading "模型服务繁忙，已自动重试" after a reload; it now says which backup model took over, as it did live.

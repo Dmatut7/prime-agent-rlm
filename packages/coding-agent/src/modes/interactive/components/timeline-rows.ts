@@ -1237,6 +1237,16 @@ function stepsSummary(steps: readonly BoxRow[], spawned: number): string {
 	return parts.join(" · ");
 }
 
+/** `provider/model` of the reply that retried a failed one, when another model served it; undefined when the same one did or a message names none. */
+function servingModelSwitch(
+	failed: { provider?: string; model?: string },
+	retry: { provider?: string; model?: string },
+): string | undefined {
+	if (!failed.model || !retry.model) return undefined;
+	if (failed.model === retry.model && failed.provider === retry.provider) return undefined;
+	return retry.provider ? `${retry.provider}/${retry.model}` : retry.model;
+}
+
 /** The entry comes after the reply that answered the turn, and no reply follows it. */
 function afterFinalAnswer(timeline: TurnTimeline, index: number): boolean {
 	for (let before = index - 1; before >= 0; before--) {
@@ -1403,7 +1413,10 @@ export function buildTimelineView(
 		const message = entry.message;
 		if (entry.ended && message.stopReason === "error" && message.errorMessage && lastRetryIndex < entryIndex) {
 			// A later reply of the turn is the retry the session made: said as the retry row it is live, not as a model error.
-			const retried = timeline.entries.slice(entryIndex + 1).some((later) => later.kind === "message");
+			const retryReply = timeline.entries.slice(entryIndex + 1).find((later) => later.kind === "message");
+			const retried = retryReply !== undefined;
+			// The transcript keeps no retry event, but a retry served by another model says it switched.
+			const backup = retryReply?.kind === "message" ? servingModelSwitch(message, retryReply.message) : undefined;
 			const retryRow = retried
 				? eventRow(
 						{
@@ -1414,7 +1427,10 @@ export function buildTimelineView(
 								startedAt: at,
 								delayMs: 0,
 								attempt: 1,
-								reason: describeRetryReason({ errorMessage: message.errorMessage }),
+								reason: describeRetryReason({
+									errorMessage: message.errorMessage,
+									...(backup ? { reason: "backup" as const, backupModel: backup } : {}),
+								}),
 								outcome: "ok",
 							},
 						},
