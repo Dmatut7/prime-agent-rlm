@@ -147,7 +147,8 @@ function stripFacts(): TimelineFacts {
 function openStrip(list: "edits" | "memories", width: number) {
 	setMotionReduced(true);
 	const timeline = new TurnTimeline();
-	timeline.ui.stripOpen = list;
+	if (list === "edits") timeline.ui.stripOpen = "edits";
+	else timeline.ui.stripExpanded.add("m1");
 	const strip = new TurnStripComponent({ timeline, facts: stripFacts, requestRender: vi.fn() });
 	const lines = strip.render(width);
 	return { lines, regions: strip.getClickRegions() };
@@ -223,7 +224,7 @@ describe("the change strip's click areas stay on the screen", () => {
 		for (const list of ["edits", "memories"] as const) {
 			for (const width of FRAME_WIDTHS) {
 				const { lines, regions } = openStrip(list, width);
-				// The first line holds the segments' own areas; the list's items sit below it.
+				// The first row is the gap above the strip's rows; every row it draws below is a whole-width area.
 				const items = regions.filter((region) => region.line > 0);
 				expect(items.length, `${list} item areas at ${width}`).toBeGreaterThan(0);
 				for (const region of items) {

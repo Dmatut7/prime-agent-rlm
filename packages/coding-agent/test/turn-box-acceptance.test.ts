@@ -409,8 +409,8 @@ describe("C-3: changes the kernel could not diff", () => {
 		expect(head).toContain("（有些改动没记全）");
 		expect(head).not.toContain("+0");
 		const line = text(strip.render(120));
-		expect(line).toContain("改了 1 个文件 ▸");
-		expect(line).toContain("（有些改动没记全）");
+		expect(line).toContain("改了 1 个文件 （有些改动没记全）");
+		expect(line).toContain("▸");
 		expect(line).not.toContain("+0");
 		strip.activate(STRIP_EDITS);
 		const list = text(strip.render(120));

@@ -1,6 +1,6 @@
 import { setKeybindings, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
-import { beforeAll, describe, expect, test } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import {
 	convertToLlm,
@@ -11,6 +11,8 @@ import {
 import type { HarnessEntry, RefinementResult } from "../src/core/refinement/refinement.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import { RefinementOutcomeMessageComponent } from "../src/modes/interactive/components/refinement-outcome-message.js";
+import { formatTimelineTime } from "../src/modes/interactive/components/timeline-gutter.js";
+import { timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 function entry(overrides: Partial<HarnessEntry> = {}): HarnessEntry {
@@ -75,22 +77,44 @@ describe("RefinementOutcomeMessageComponent", () => {
 		setKeybindings(new KeybindingsManager());
 	});
 
-	test("collapses to one violet line naming the entry in plain words, and opens to what it kept", () => {
+	// The background tidy is hidden until the closing row's `完整过程 ▸` is on; these tests look at it shown.
+	beforeEach(() => {
+		timelineShowAll.set(true);
+	});
+
+	afterEach(() => {
+		timelineShowAll.set(false);
+	});
+
+	test("is hidden by default; shown it is one dim note that opens to what it kept", () => {
 		const message = createRefinementOutcomeMessage(result());
 		const component = new RefinementOutcomeMessageComponent(message);
 
+		timelineShowAll.set(false);
+		expect(component.render(120)).toEqual([]);
+		expect(component.getBlockCopyText()).toContain("回合后整理记忆：新记 1 条（本会话）");
+		timelineShowAll.set(true);
+
 		const collapsed = rendered(component);
-		const lines = collapsed.split("\n").filter((line) => line.trim());
+		// The first row is the blank rail row that keeps the note off the line above it.
+		expect(collapsed.split("\n")[0]).toBe("         │      ");
+		const lines = collapsed.split("\n").filter((line) => line.includes("回合后整理记忆"));
 		expect(lines).toHaveLength(1);
-		expect(lines[0]).toBe(" ✦ 记住了 1 条 · Rhyme response guidance · 本会话 ▸");
+		expect(lines[0]).toMatch(
+			new RegExp(
+				`^ ${formatTimelineTime(message.timestamp)} {3}· {6}回合后整理记忆：新记 1 条（本会话） +展开 ▸ {2}$`,
+			),
+		);
 		expect(collapsed).not.toContain("memory updated");
 		expect(collapsed).not.toContain("Ctrl+O");
+		expect(collapsed).not.toContain("Rhyme response guidance");
 
 		component.setExpanded(true);
 		const expanded = rendered(component);
-		expect(expanded).toContain("▾");
-		expect(expanded).toContain("新记的");
-		expect(expanded).toContain("+ Make conversational responses rhyme.");
+		expect(expanded).toContain("收起 ▴");
+		expect(expanded).toContain("记住了提示   Rhyme response guidance");
+		expect(expanded).toContain("Make conversational responses rhyme.");
+		expect(expanded).not.toContain("+ Make conversational responses rhyme.");
 		// No JSON dump of the whole entry.
 		expect(expanded).not.toContain('"content"');
 	});
@@ -111,11 +135,11 @@ describe("RefinementOutcomeMessageComponent", () => {
 			{ ...partial.appliedEdits[0]!, id: "second", title: "Second", applied: false, error: "disk full" },
 		];
 		const failed = new RefinementOutcomeMessageComponent(createRefinementOutcomeMessage(partial));
-		const failedRow = failed.render(120).find((line) => stripAnsi(line).trim()) ?? "";
-		expect(stripAnsi(failedRow)).toContain("✦ 记住了 1 条，1 条没写进去");
+		const failedRow = failed.render(120).find((line) => stripAnsi(line).includes("回合后整理记忆")) ?? "";
+		expect(stripAnsi(failedRow)).toContain("回合后整理记忆：新记 1 条，1 条没写进去（本会话）");
 		const ok = new RefinementOutcomeMessageComponent(createRefinementOutcomeMessage(result()));
-		const okRow = ok.render(120).find((line) => stripAnsi(line).trim()) ?? "";
-		const colour = (row: string) => /\x1b\[38;[0-9;]*m/.exec(row)?.[0];
+		const okRow = ok.render(120).find((line) => stripAnsi(line).includes("回合后整理记忆")) ?? "";
+		const colour = (row: string) => /(\x1b\[38;[0-9;]*m)回合后/.exec(row)?.[1];
 		expect(colour(failedRow)).toBeDefined();
 		expect(colour(failedRow)).not.toBe(colour(okRow));
 
@@ -123,7 +147,7 @@ describe("RefinementOutcomeMessageComponent", () => {
 		failed.setBlockFocus({ reveal: false, toggleLabel: "展开" });
 		expect(stripAnsi(failed.render(160).join("\n"))).toContain("Enter 展开");
 		failed.setBlockFocus(undefined);
-		expect(failed.getBlockCopyText()).toContain("✦ 记住了 1 条，1 条没写进去");
+		expect(failed.getBlockCopyText()).toContain("回合后整理记忆：新记 1 条，1 条没写进去");
 		expect(failed.isBlockExpanded()).toBe(false);
 		failed.setExpanded(true);
 		expect(failed.isBlockExpanded()).toBe(true);
@@ -137,12 +161,12 @@ describe("RefinementOutcomeMessageComponent", () => {
 			}),
 		);
 		const line = rendered(nothing);
-		expect(line).toContain("✦ 记忆没写进去");
+		expect(line).toContain("回合后整理记忆：没写进去");
 		expect(line).toContain("下一轮会再试");
 		expect(line).not.toContain("记住了");
 	});
 
-	test("truncates the collapsed line so it never wraps", () => {
+	test("never draws a row wider than the screen, collapsed or open", () => {
 		const long = result();
 		const title =
 			"Local memory entries for the verifiers project context and running subagent tracking, plus a subagent spec";
@@ -151,17 +175,20 @@ describe("RefinementOutcomeMessageComponent", () => {
 		const component = new RefinementOutcomeMessageComponent(createRefinementOutcomeMessage(long));
 
 		const lines = component.render(80).map((line) => stripAnsi(line));
-		const content = lines.filter((line) => line.trim().length > 0);
+		const content = lines.filter((line) => line.trim().length > 0 && line.includes("回合后整理记忆"));
 		expect(content).toHaveLength(1);
-		expect(content[0]).toContain("✦ 记住了 1 条");
-		expect(content[0]).toContain("…");
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(80);
 		}
 
-		for (const width of [40, 24, 12]) {
-			for (const line of component.render(width)) {
-				expect(visibleWidth(stripAnsi(line))).toBeLessThanOrEqual(width);
+		for (const open of [false, true]) {
+			component.setExpanded(open);
+			const widths = [80, 40, 24, 12, 1];
+			expect(widths.length).toBeGreaterThan(0);
+			for (const width of widths) {
+				for (const line of component.render(width)) {
+					expect(visibleWidth(stripAnsi(line)), `width ${width}, open ${open}`).toBeLessThanOrEqual(width);
+				}
 			}
 		}
 	});
@@ -210,8 +237,10 @@ describe("RefinementOutcomeMessageComponent", () => {
 		});
 
 		expect(component).toBeInstanceOf(RefinementOutcomeMessageComponent);
-		expect(stripAnsi(component!.render(120).join("\n"))).toContain("✦ 记住了 1 条");
-		expect(stripAnsi(component!.render(120).join("\n"))).not.toContain("新记的");
+		expect(stripAnsi(component!.render(120).join("\n"))).toContain("回合后整理记忆：新记 1 条");
+		expect(stripAnsi(component!.render(120).join("\n"))).not.toContain("Make conversational responses rhyme.");
+		timelineShowAll.set(false);
+		expect(component!.render(120)).toEqual([]);
 	});
 
 	test("renders an informative outcome into the model context as a system receipt", () => {

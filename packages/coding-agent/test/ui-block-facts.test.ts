@@ -154,7 +154,7 @@ const CASES: FactsCase[] = [
 	{
 		name: "a memory without texts",
 		needle: "✦ 记住：go",
-		full: "记住：go · http · 请求要带 · context",
+		full: "记住：go http 请求要带 context",
 		result: "新记",
 		timed: false,
 		build: (turn) =>

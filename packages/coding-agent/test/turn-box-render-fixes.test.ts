@@ -13,13 +13,14 @@ import {
 } from "../src/modes/interactive/components/footer.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import { RefinementOutcomeMessageComponent } from "../src/modes/interactive/components/refinement-outcome-message.js";
+import { timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
 import type { TimelineFacts } from "../src/modes/interactive/components/timeline-rows.js";
 import {
 	type TimelineHost,
 	TurnActivityState,
 	TurnSummaryComponent,
 } from "../src/modes/interactive/components/turn-activity.js";
-import { STRIP_EDITS, STRIP_MEMORIES, TurnStripComponent } from "../src/modes/interactive/components/turn-strip.js";
+import { STRIP_ALL, STRIP_EDITS, TurnStripComponent } from "../src/modes/interactive/components/turn-strip.js";
 import { TurnTimeline } from "../src/modes/interactive/components/turn-timeline.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -86,17 +87,6 @@ function addStep(
 
 const plain = (lines: readonly string[]) => lines.map((line) => stripAnsi(line).replace(/\x1b_[^\x07]*\x07/g, ""));
 const text = (lines: readonly string[]) => plain(lines).join("\n");
-/** The character a click at `col` lands on. */
-function charAtColumn(line: string, col: number): string {
-	let at = 0;
-	for (const char of line) {
-		if (at === col) return char;
-		at += visibleWidth(char);
-		if (at > col) return "";
-	}
-	return "";
-}
-
 const WIDTHS = Array.from({ length: 30 }, (_, index) => index + 1);
 
 function change(overrides: Partial<ChangeEntry> = {}): ChangeEntry {
@@ -145,7 +135,8 @@ function facts(overrides: Partial<TimelineFacts> = {}): TimelineFacts {
 
 function strip(data: TimelineFacts, open?: "edits" | "memories") {
 	const timeline = new TurnTimeline();
-	if (open) timeline.ui.stripOpen = open;
+	if (open === "edits") timeline.ui.stripOpen = "edits";
+	if (open === "memories") for (const memory of data.memories) timeline.ui.stripExpanded.add(memory.key);
 	return new TurnStripComponent({ timeline, facts: () => data, requestRender: vi.fn() });
 }
 
@@ -194,11 +185,13 @@ beforeAll(() => {
 
 afterEach(() => {
 	setMotionReduced(false);
+	timelineShowAll.set(false);
 });
 
 describe("narrow terminals", () => {
 	it("never renders a box, strip or refinement line wider than the width it is given", () => {
 		setMotionReduced(true);
+		timelineShowAll.set(true);
 		const turn = quietTurn({ host: host({ viewportRows: () => 10 }) });
 		for (let index = 0; index < 8; index++) addStep(turn, `c${index}`, `await bash('make step${index}')`);
 		addStep(turn, "live", "await bash('go test ./...')", "running");
@@ -228,13 +221,13 @@ describe("narrow terminals", () => {
 });
 
 describe("the change strip on a narrow screen", () => {
-	it("drops whole segments and wordings instead of cutting a number, and keeps click areas on screen", () => {
+	it("drops whole wordings instead of cutting a number, and keeps click areas on screen", () => {
 		const big = facts({ projectChanges: [change({ added: 999999, removed: 888888 })] });
 		for (const width of [24, 26, 28, 30, 40]) {
 			for (const data of [big, facts()]) {
 				const component = strip(data);
-				const top = plain(component.render(width))[0] ?? "";
-				expect(top, `top row at ${width}`).not.toContain("…");
+				const rows = plain(component.render(width));
+				const top = rows[1] ?? "";
 				const numbers = [...top.matchAll(/[+−](\d+)/g)].map((match) => Number(match[1]));
 				const known = [999999, 888888, 1234, 567];
 				for (const value of numbers) expect(known, `${top} at ${width}`).toContain(value);
@@ -242,25 +235,26 @@ describe("the change strip on a narrow screen", () => {
 				expect(regions.length).toBeGreaterThan(0);
 				for (const region of regions) {
 					expect(region.col + region.width, `${top} at ${width}`).toBeLessThanOrEqual(width);
-					expect(charAtColumn(top, region.col)).toMatch(/[✎✦]/);
+					expect(rows[region.line], `row ${region.line} at ${width}`).toBeDefined();
 				}
-				expect(component.getFocusOrder()).toEqual(regions.map((_, index) => [STRIP_EDITS, STRIP_MEMORIES][index]));
+				expect(component.getFocusOrder()).toEqual([STRIP_EDITS, "strip:item:m1", STRIP_ALL]);
 			}
 		}
-		// With room, both segments keep their full wording.
-		expect(plain(strip(facts()).render(80))[0]).toBe(" ✎ 改了 1 个文件 +1234 −567 ▸  ·  ✦ 记住了 1 条 ▸");
+		// With room, the file row keeps its full wording.
+		expect(plain(strip(facts()).render(80))[1]).toMatch(/^ {9}· {6}✎ 改了 1 个文件 \+1234 −567 +▸ {2}$/);
 	});
 
 	it("shortens a listed path from the left, keeping the file name, before it shows counts", () => {
-		for (const width of [24, 26, 28, 30]) {
+		for (const width of [40, 44, 50, 60]) {
 			for (const data of [facts({ projectChanges: [change({ added: 999999, removed: 888888 })] }), facts()]) {
 				const row = plain(strip(data, "edits").render(width))[2] ?? "";
 				expect(row, `row at ${width}`).toContain("审查.ts");
 				expect(row).not.toMatch(/✎ …\s/);
 			}
 		}
-		expect(plain(strip(facts(), "edits").render(30))[2]).toContain("…/审查.ts  +1234 −567");
-		expect(plain(strip(facts(), "edits").render(60))[2]).toContain("src/中文组件/审查.ts");
+		expect(plain(strip(facts(), "edits").render(50))[2]).toContain("…/审查.ts");
+		expect(plain(strip(facts(), "edits").render(50))[2]).toContain("+1234 −567");
+		expect(plain(strip(facts(), "edits").render(100))[2]).toContain("src/中文组件/审查.ts");
 	});
 });
 

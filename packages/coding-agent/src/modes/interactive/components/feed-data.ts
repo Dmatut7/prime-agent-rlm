@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { MAX_ACTIVITIES_PER_CELL } from "../../../core/kernel/effects.js";
 import type {
 	KernelActivity,
@@ -541,23 +542,54 @@ export function changeCategory(path: string): "测试" | "文档" | "脚本" | "
 
 const TITLE_DATE_SUFFIX =
 	/[\s_·-]*[([（]?(?:\d{4}[-_/.]?\d{2}[-_/.]?\d{2}(?:[T_ -]?\d{2}[:-]?\d{2}(?:[:-]?\d{2})?)?|\d{2}[-/.]\d{2})[)\]）]?$/;
+const DATE_WORD = /^(?:\d{8}|\d{4}[-/.]\d{2}[-/.]\d{2})$/;
+
+/** A memory id where the model wrote no title: joined by underscores, no spaces. */
+function isSlugTitle(text: string): boolean {
+	return !/\s/.test(text) && text.includes("_");
+}
 
 /**
- * A memory title as a person reads it: no `snake_case` joints, no trailing
- * date stamp, no doubled separators. `a_b_c_2026-09-28` reads `a · b · c`.
+ * A memory title as a person reads it. A real title (it has spaces, or no
+ * underscores) is only cleaned of control characters and doubled spaces. An id
+ * standing in for a title (`prime_agent_grow批次审查_20260929_四车道`) loses its
+ * date words wherever they sit and its underscores become spaces, so it reads
+ * `prime agent grow批次审查 四车道`.
  */
 export function cleanMemoryTitle(title: string): string {
-	let text = sanitizeDisplayText(title).trim();
-	for (let pass = 0; pass < 2; pass++) text = text.replace(TITLE_DATE_SUFFIX, "").trim();
-	const cjk = /[㐀-鿿]/.test(text);
-	text = text.replace(/_+/g, cjk ? " · " : " ");
-	text = text
-		.replace(/\s*·\s*/g, " · ")
-		.replace(/( · )+/g, " · ")
-		.replace(/^ · | · $/g, "")
-		.replace(/\s+/g, " ")
-		.trim();
-	return text || sanitizeDisplayText(title).trim() || "（无标题）";
+	const raw = sanitizeDisplayText(title).trim();
+	if (!isSlugTitle(raw)) return raw.replace(/\s+/g, " ") || "（无标题）";
+	let slug = raw;
+	for (let pass = 0; pass < 2; pass++) slug = slug.replace(TITLE_DATE_SUFFIX, "").trim();
+	const words = slug.split("_").filter((word) => word.length > 0);
+	const kept: string[] = [];
+	for (let index = 0; index < words.length; index++) {
+		const word = words[index] ?? "";
+		if (DATE_WORD.test(word)) continue;
+		if (/^\d{4}$/.test(word) && /^\d{2}$/.test(words[index + 1] ?? "") && /^\d{2}$/.test(words[index + 2] ?? "")) {
+			index += 2;
+			continue;
+		}
+		kept.push(word);
+	}
+	return kept.join(" ") || raw.replace(/_+/g, " ").trim() || "（无标题）";
+}
+
+/**
+ * A title cut to `maxCols` columns at a word boundary and marked with `…`;
+ * a title with no boundary that fits is cut at its end.
+ */
+export function shortMemoryTitle(title: string, maxCols = 40): string {
+	const text = cleanMemoryTitle(title);
+	if (visibleWidth(text) <= maxCols) return text;
+	const room = Math.max(1, maxCols - 1);
+	let kept = "";
+	for (const word of text.split(" ")) {
+		const next = kept ? `${kept} ${word}` : word;
+		if (visibleWidth(next) > room) break;
+		kept = next;
+	}
+	return kept ? `${kept}…` : truncateToWidth(text, Math.max(1, maxCols), "…");
 }
 
 /** A short plain-words gloss for a result detail the kernel reports in English. */
