@@ -90,6 +90,14 @@ export interface BoxRow {
 	groupKey?: string;
 }
 
+export interface SpawnedSubagent {
+	name: string;
+	tag?: string;
+	running: boolean;
+	startedAt: number;
+	endedAt?: number;
+}
+
 /** One line of the timeline: what the AI said it does or found, with its steps behind `N 步 ▸`. */
 export interface TimelineEvent {
 	key: string;
@@ -105,8 +113,8 @@ export interface TimelineEvent {
 	more?: true;
 	/** The commands, thoughts and edits behind the line. */
 	steps: BoxRow[];
-	/** Subagents dispatched at this point, in order, each with the short tag of its task. */
-	spawned: Array<{ name: string; tag?: string; running: boolean }>;
+	/** Subagents dispatched at this point, in order, each with the short tag of its task and when it went out and (if known) came back. */
+	spawned: SpawnedSubagent[];
 	/** `fail`: the failed row (its opened lines say why). */
 	row?: BoxRow;
 }
@@ -1164,7 +1172,7 @@ type TimelineItem =
 			key: string;
 			at: number;
 			lead: string[];
-			spawned: Array<{ name: string; tag?: string; running: boolean }>;
+			spawned: SpawnedSubagent[];
 	  }
 	| { type: "steer"; key: string; at: number; text: string }
 	| { type: "fail"; key: string; at: number };
@@ -1289,6 +1297,8 @@ export function buildTimelineView(
 					name: entry.sub.name,
 					...(tag ? { tag } : {}),
 					running: entry.sub.status === "running" && !ctx.stopped,
+					startedAt: entry.sub.startedAt,
+					...(entry.sub.endedAt !== undefined ? { endedAt: entry.sub.endedAt } : {}),
 				});
 			} else if (entry.kind === "steer") {
 				const key = `ev:${entry.key}`;

@@ -15,6 +15,7 @@ import {
 	type BoxRowKind,
 	eventSaysMore,
 	type MetaPart,
+	type SpawnedSubagent,
 	summaryParts,
 	type TimelineEvent,
 	type TimelineFacts,
@@ -397,13 +398,23 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 	const ui = timeline.ui;
 	const specs: LineSpec[] = [];
 	const tracker = input.lanes;
-	const laneFor = (memoKey: string): TimelineLane => {
+	// A subagent is out for a line when it was dispatched above it and had not come back by the line's time.
+	const startedOut = ui.startLane === "on";
+	const isOut = (sub: SpawnedSubagent, at: number): boolean => {
+		if (sub.endedAt !== undefined) return at <= 0 || at < sub.endedAt;
+		return sub.running && (tracker?.pending.includes(sub.name) ?? false);
+	};
+	/** `on` once it was on: a line does not go dark when the agents come back. */
+	const remember = (memoKey: string, on: boolean): TimelineLane => {
+		if (ui.lanes.get(memoKey) === "on") return "on";
+		if (on) ui.lanes.set(memoKey, "on");
+		return on ? "on" : "off";
+	};
+	const laneOfEvent = (index: number): TimelineLane => {
 		if (!tracker) return "off";
-		const known = ui.lanes.get(memoKey);
-		if (known) return known;
-		const lane = tracker.lane;
-		ui.lanes.set(memoKey, lane);
-		return lane;
+		const at = input.events[index]?.at ?? 0;
+		const out = input.events.slice(0, index).some((event) => event.spawned.some((sub) => isOut(sub, at)));
+		return remember(`ln:${input.events[index]?.key}`, out || (startedOut && tracker.active));
 	};
 	const toggle = (key: string) => () => {
 		if (ui.expanded.has(key)) {
@@ -416,16 +427,17 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		if (key.startsWith("ev:")) input.onToggleEvent?.();
 		input.onChange();
 	};
-	const gap = (memoKey: string, lane: TimelineLane = laneFor(memoKey)): void => {
+	const gap = (lane: TimelineLane): void => {
 		specs.push({ gutter: { main: "rail", lane }, content: "" });
 	};
 	const bodyWidth = Math.max(8, width - TIMELINE_CONTENT_COL - 2);
 	const detailWidth = Math.max(8, bodyWidth - STEP_INDENT - STEP_GLYPH_COLS);
 
-	if (input.leadingGap && (input.events.length > 0 || input.tail)) gap("lead");
+	if (input.leadingGap && (input.events.length > 0 || input.tail))
+		gap(tracker && startedOut && tracker.active ? "on" : "off");
 
-	input.events.forEach((event) => {
-		const lane = laneFor(event.key);
+	input.events.forEach((event, index) => {
+		const lane = laneOfEvent(index);
 		const time = event.at > 0 ? formatTimelineTime(event.at) : undefined;
 		const detailRow = event.row;
 		// Words the line cuts (or paragraphs it leaves out) open to the whole text.
@@ -515,14 +527,21 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 				gutter: { main: "split", lane: tracker ? "split" : "off" },
 				content: `${theme.bold(theme.fg("timelineSub", "◇"))}  ${theme.fg("timelineSoft", event.spawned.map((sub) => (sub.tag ? `${shortAgentName(sub.name)} ${sub.tag}` : shortAgentName(sub.name))).join("   "))}`,
 			});
-			gap(`gap:${event.key}`);
+			gap(
+				tracker
+					? remember(
+							`gap:${event.key}`,
+							event.spawned.some((sub) => isOut(sub, sub.startedAt)),
+						)
+					: "off",
+			);
 		}
 	});
 
 	const tail = input.tail;
 	if (tail) {
 		const last = specs.at(-1);
-		if (last && !(last.gutter.main === "rail" && last.content === "")) gap("tail", tracker?.lane ?? "off");
+		if (last && !(last.gutter.main === "rail" && last.content === "")) gap(tracker?.lane ?? "off");
 		const lane = tracker?.lane ?? "off";
 		const stepNote = tail.stepCount > 0 ? theme.fg("timelineFaint", `第 ${tail.stepCount} 步`) : "";
 		specs.push({

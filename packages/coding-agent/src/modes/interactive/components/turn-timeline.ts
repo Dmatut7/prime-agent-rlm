@@ -170,7 +170,9 @@ export class TimelineUiState {
 	/** Open rows and events (`ev:` keys), and events listing every step (`all:` keys). */
 	readonly expanded = new Set<string>();
 	readonly expandedAt = new Map<string, number>();
-	/** The subagent lane each line was drawn with when it first appeared: a later frame keeps it. */
+	/** The lane the turn started in (subagents of earlier turns still out), taken when the lane tracker was first given. */
+	startLane: TimelineLane | undefined;
+	/** Lines drawn in the lane: once on, a line stays on after the agents have come back. */
 	readonly lanes = new Map<string, TimelineLane>();
 	readonly enteredAt = new Map<string, number>();
 	readonly settledAt = new Map<string, number>();
@@ -622,6 +624,7 @@ export class TurnTimeline {
 		next.ui.stripOpen = ui.stripOpen;
 		for (const key of ui.expanded) next.ui.expanded.add(key);
 		for (const [key, lane] of ui.lanes) next.ui.lanes.set(key, lane);
+		next.ui.startLane = ui.startLane;
 		for (const key of ui.stripExpanded) next.ui.stripExpanded.add(key);
 		for (const [key, status] of ui.rowStatus) next.ui.rowStatus.set(key, status);
 		next.ui.bump();

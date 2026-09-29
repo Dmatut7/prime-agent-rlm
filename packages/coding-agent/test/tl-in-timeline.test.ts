@@ -661,3 +661,74 @@ describe("the blank row above the live tail follows the lane as it is now", () =
 		expect(done[spinRow(done) - 1]?.trimEnd()).toBe("         │");
 	});
 });
+
+describe("a line's lane comes from where it sits relative to the dispatch", () => {
+	function dispatchTurn(options: { handedBack: boolean }) {
+		const turn = quietTurn(false);
+		const tracker = new TimelineLaneTracker();
+		turn.summary.setLaneTracker(tracker);
+		say(turn, T0, "先看最近的提交。", [{ id: "c1", command: "git log" }]);
+		say(turn, T0 + MINUTE, "派两个代理。", [{ id: "c2", command: "git branch" }]);
+		turn.timeline.upsertSubagent({ childId: "a", name: "A", label: "A 任务", status: "running" }, T0 + MINUTE);
+		turn.timeline.upsertSubagent({ childId: "b", name: "B", label: "B 任务", status: "running" }, T0 + MINUTE);
+		say(turn, T0 + 2 * MINUTE, "趁它们干活，我自己检查。", [{ id: "c3", command: "npx tsgo" }]);
+		if (options.handedBack) {
+			turn.timeline.upsertSubagent({ childId: "a", name: "A", status: "done" }, T0 + 4 * MINUTE);
+			turn.timeline.upsertSubagent({ childId: "b", name: "B", status: "done" }, T0 + 5 * MINUTE);
+			tracker.reported("A");
+			tracker.reported("B");
+		}
+		say(turn, T0 + 6 * MINUTE, "都回来了，收尾。", [{ id: "c4", command: "git status" }]);
+		turn.state.markTurnEnded(T0 + 7 * MINUTE);
+		turn.state.finishBox(T0 + 7 * MINUTE);
+		return { turn, tracker };
+	}
+	const laneOf = (lines: string[], needle: string) => lines.find((line) => line.includes(needle))?.slice(12, 13);
+
+	it("keeps `┆` off the lines above the dispatch when the first frame is drawn after it", () => {
+		const { turn, tracker } = dispatchTurn({ handedBack: false });
+		expect(tracker.active).toBe(true);
+		const lines = plain(turn.summary.render(WIDTH));
+		expect(laneOf(lines, "先看最近的提交")).toBe(" ");
+		expect(laneOf(lines, "派两个代理")).toBe(" ");
+		const split = lines.findIndex((line) => line.includes("├──╮"));
+		expect(lines[split + 1]?.trimEnd()).toBe("         │  ┆");
+		expect(laneOf(lines, "趁它们干活")).toBe("┆");
+	});
+
+	it("draws `┆` between the dispatch and the hand-back when a finished turn is drawn for the first time", () => {
+		const { turn, tracker } = dispatchTurn({ handedBack: true });
+		expect(tracker.active).toBe(false);
+		const lines = plain(turn.summary.render(WIDTH));
+		expect(laneOf(lines, "先看最近的提交")).toBe(" ");
+		expect(laneOf(lines, "派两个代理")).toBe(" ");
+		const split = lines.findIndex((line) => line.includes("├──╮"));
+		expect(lines[split + 1]?.trimEnd()).toBe("         │  ┆");
+		expect(laneOf(lines, "趁它们干活")).toBe("┆");
+		expect(laneOf(lines, "都回来了")).toBe(" ");
+	});
+
+	it("keeps a turn's lane the same when it is drawn again after the agents come back", () => {
+		const { turn, tracker } = dispatchTurn({ handedBack: false });
+		const first = plain(turn.summary.render(WIDTH));
+		turn.timeline.upsertSubagent({ childId: "a", name: "A", status: "done" }, T0 + 4 * MINUTE);
+		turn.timeline.upsertSubagent({ childId: "b", name: "B", status: "done" }, T0 + 5 * MINUTE);
+		tracker.reported("A");
+		tracker.reported("B");
+		const second = plain(turn.summary.render(WIDTH));
+		expect(second).toEqual(first);
+	});
+
+	it("starts a woken turn in the lane its tracker was in when the turn began", () => {
+		const tracker = new TimelineLaneTracker();
+		tracker.spawned(["Z"]);
+		const turn = quietTurn(false);
+		turn.summary.setLaneTracker(tracker);
+		say(turn, T0, "顺手看一下。", [{ id: "c1", command: "git log" }]);
+		turn.state.markTurnEnded(T0 + 5_000);
+		turn.state.finishBox(T0 + 5_000);
+		expect(laneOf(plain(turn.summary.render(WIDTH)), "顺手看一下")).toBe("┆");
+		tracker.reported("Z");
+		expect(laneOf(plain(turn.summary.render(WIDTH)), "顺手看一下")).toBe("┆");
+	});
+});
