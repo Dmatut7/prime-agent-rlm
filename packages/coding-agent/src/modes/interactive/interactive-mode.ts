@@ -8347,7 +8347,7 @@ export class InteractiveMode {
 								isRecognizedSlashCommand: (name) => this.isRecognizedSlashCommand(name),
 								sentAt: Number(message.timestamp) || undefined,
 								quiet: quietConversation(this),
-								lane: this.turnFlow.subagentLane.tracker.lane,
+								lane: this.turnFlow.subagentLane.tracker.laneAt(Number(message.timestamp) || undefined),
 							});
 							this.chatContainer.addChild(userComponent);
 						}
@@ -8357,7 +8357,7 @@ export class InteractiveMode {
 							isRecognizedSlashCommand: (name) => this.isRecognizedSlashCommand(name),
 							sentAt: Number(message.timestamp) || undefined,
 							quiet: quietConversation(this),
-							lane: this.turnFlow.subagentLane.tracker.lane,
+							lane: this.turnFlow.subagentLane.tracker.laneAt(Number(message.timestamp) || undefined),
 						});
 						this.chatContainer.addChild(userComponent);
 					}

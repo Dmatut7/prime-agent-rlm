@@ -24,10 +24,23 @@ export class LaneSpans {
 	private readonly list: LaneSpan[] = [];
 	private readonly back = new Map<string, number>();
 
-	/** `name` went out at `from`; already out: nothing changes. */
-	open(name: string, from: number): void {
-		if (this.list.some((span) => span.name === name && span.to === undefined)) return;
+	/**
+	 * `name` went out at `from`. Already out: the later of the two starts stands (a span seeded from
+	 * the start of a window is not later than the real dispatch), and a start that is only a guess
+	 * (`known` false) changes nothing.
+	 */
+	open(name: string, from: number, known = true): void {
+		const out = this.list.find((span) => span.name === name && span.to === undefined);
+		if (out) {
+			if (known) out.from = Math.max(out.from, from);
+			return;
+		}
 		this.list.push({ name, from });
+	}
+
+	/** A return learned from somewhere else; a return this record already has stands. */
+	noteBack(name: string, at: number): void {
+		if (!this.back.has(name)) this.back.set(name, at);
 	}
 
 	/** `name` came back at `at`; true when it was out. Its return is remembered either way. */
@@ -103,7 +116,8 @@ export class TimelineLaneTracker {
 	/** Subagents dispatched; returns the lane for the dispatching row (`split`). `owner` is told when one comes back. */
 	spawned(names: readonly string[], owner?: LaneOwner, at?: number): TimelineLane {
 		for (const name of names) {
-			this.store.open(name, at ?? owner?.spawnedAt?.(name) ?? Date.now());
+			const from = at ?? owner?.spawnedAt?.(name);
+			this.store.open(name, from ?? Date.now(), from !== undefined);
 			if (owner) this.owners.set(name, owner);
 		}
 		return "split";
@@ -124,6 +138,12 @@ export class TimelineLaneTracker {
 	/** A subagent that was not known to be out came back: its return is kept, the lane is untouched. */
 	noteReturned(name: string, at: number = Date.now()): void {
 		this.store.close(name, at);
+	}
+
+	/** The lane for a row stamped `at` (as now when it has no stamp): on when some subagent was out then. */
+	laneAt(at: number | undefined): TimelineLane {
+		if (at === undefined) return this.lane;
+		return this.store.outAt(at) ? "on" : "off";
 	}
 
 	/** The lane for an ordinary row appended now. */
@@ -152,6 +172,10 @@ export class TimelineLaneTracker {
 	 * `since` is when the question the replay ends in began: an earlier dispatch is another question's.
 	 */
 	restore(previous: LaneSnapshot, since?: number): void {
+		// A child that came back without ever being on the lane leaves only its return: without it a rebuild sees it out again.
+		for (const [name, at] of previous.returns) {
+			if (since === undefined || at >= since) this.store.noteBack(name, at);
+		}
 		for (const span of previous.spans) {
 			if (this.store.knows(span.name) || (since !== undefined && span.from < since)) continue;
 			const back = span.to ?? this.store.returnedAt(span.name);

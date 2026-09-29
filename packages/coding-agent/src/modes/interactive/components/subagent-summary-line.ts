@@ -347,6 +347,26 @@ function isSettledPanelRow(row: SubagentPanelRow): boolean {
 	return row.state === "idle" || row.state === "done" || (row.state === "failed" && row.acknowledged === true);
 }
 
+/**
+ * The name each block shows: the short one the return rows use, unless another child shortens to the
+ * same letter, in which case each of them keeps its own name (cut to the block's width when drawn).
+ */
+function shortNames(names: readonly string[]): Map<string, string> {
+	const byShort = new Map<string, Set<string>>();
+	for (const name of names) {
+		const short = shortAgentName(name);
+		const owners = byShort.get(short) ?? new Set<string>();
+		owners.add(name);
+		byShort.set(short, owners);
+	}
+	const shown = new Map<string, string>();
+	for (const name of names) {
+		const short = shortAgentName(name);
+		shown.set(name, (byShort.get(short)?.size ?? 1) > 1 ? name : short);
+	}
+	return shown;
+}
+
 /** The session a stall marker names: the text before its first `: `. */
 function stallMarkerName(marker: string): string {
 	const at = marker.indexOf(": ");
@@ -669,11 +689,15 @@ export class SubagentSummaryLine implements Component, Focusable {
 		if (this.counts.total > 0) {
 			const named = new Set(this.rows.map((row) => row.name));
 			const seen = new Set<string>();
+			const shown = shortNames([
+				...this.rows.map((row) => row.name),
+				...this.stallMarkers.map(stallMarkerName).filter((name) => !named.has(name)),
+			]);
 			for (const marker of this.stallMarkers) {
 				const name = stallMarkerName(marker);
 				if (named.has(name) || seen.has(name)) continue;
 				seen.add(name);
-				items.push({ key: `orphan:${name}`, kind: "orphan", name: shortAgentName(name) });
+				items.push({ key: `orphan:${name}`, kind: "orphan", name: shown.get(name) ?? name });
 			}
 			if (this.rows.length > 0) {
 				for (const row of this.dispatchOrder()) {
@@ -682,7 +706,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 						kind: "row",
 						row,
 						// The short name the timeline's return rows use: `review-grow-B-box` reads `B`.
-						name: shortAgentName(row.name),
+						name: shown.get(row.name) ?? row.name,
 						...(row.tag ? { tag: row.tag } : {}),
 						state: row.state,
 					});

@@ -1,0 +1,1 @@
+- Fixed the subagent lane lighting rows from before a subagent went out when a long session is opened mid-run, and subagent blocks whose names shorten to the same letter now show their own names.
