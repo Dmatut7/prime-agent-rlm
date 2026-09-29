@@ -10,7 +10,8 @@ import {
 	type SubagentPanelRowState,
 	SubagentSummaryLine,
 } from "../src/modes/interactive/components/subagent-summary-line.js";
-import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
+import { theme } from "../src/modes/interactive/theme/theme.js";
+import { useTruecolorTheme } from "./ui-blocks-helpers.js";
 
 /**
  * The subagent strip under the prompt: one row of small blocks, one per child,
@@ -67,14 +68,16 @@ function count(text: string, needle: string): number {
 
 describe("the subagent strip", () => {
 	const chalkLevel = chalk.level;
+	let restoreTheme: () => void;
 	beforeAll(() => {
 		// Bold and underline come from chalk, which is off without a terminal.
 		chalk.level = 3;
-		initTheme("dark");
+		restoreTheme = useTruecolorTheme("dark");
 		setKeybindings(new KeybindingsManager());
 	});
 	afterAll(() => {
 		chalk.level = chalkLevel;
+		restoreTheme();
 	});
 
 	it("takes exactly one row however many children there are and however narrow the screen", () => {
