@@ -14,6 +14,7 @@ import {
 	countRosterSubagentStatuses,
 	countSubtreeSubagentStatuses,
 	formatSubagentElapsed,
+	renderSubagentSpendCell,
 	type SubagentSpendSummary,
 	SubagentSummaryLine,
 	summarizeSubagentSpend,
@@ -59,7 +60,7 @@ describe("SubagentSummaryLine", () => {
 		setKeybindings(new KeybindingsManager());
 	});
 
-	it("renders nothing without children and a bordered agents tile with counts otherwise", () => {
+	it("renders nothing without children and one block with the counts when no child is described", () => {
 		const line = new SubagentSummaryLine();
 		expect(line.render(120)).toEqual([]);
 
@@ -76,17 +77,17 @@ describe("SubagentSummaryLine", () => {
 		expect(rendered[0]).not.toContain("收口");
 	});
 
-	it("hints ↓ 选择 when unfocused and Enter/→ 打开 when focused", () => {
+	it("hints ↓ 选一个进去看 when unfocused and Enter 进去 when focused", () => {
 		const line = new SubagentSummaryLine();
 		line.setSubagentCounts({ total: 1, running: 1, idle: 0, inactive: 0 });
 		line.setOpenable(true);
 
-		expect(stripAnsi(line.render(120)[0])).toContain("↓ 选择");
+		expect(stripAnsi(line.render(120)[0])).toContain("↓ 选一个进去看");
 
 		line.focused = true;
 		const focused = stripAnsi(line.render(120)[0]);
-		expect(focused).toContain("打开");
-		expect(focused).not.toContain("↓ 选择");
+		expect(focused).toContain("Enter 进去");
+		expect(focused).not.toContain("↓ 选一个进去看");
 	});
 
 	it("keeps the selection background across truncation resets when focused", () => {
@@ -162,7 +163,7 @@ describe("SubagentSummaryLine", () => {
 		});
 	});
 
-	it("opens on Enter or Right only when the daemon-backed line is selectable", () => {
+	it("opens on Enter only when the daemon-backed line is selectable; Right now moves to the next block", () => {
 		const line = new SubagentSummaryLine();
 		const onOpen = vi.fn();
 		line.onOpen = onOpen;
@@ -172,7 +173,7 @@ describe("SubagentSummaryLine", () => {
 		line.handleInput("\r");
 		line.handleInput("\x1b[C");
 
-		expect(onOpen).toHaveBeenCalledTimes(2);
+		expect(onOpen).toHaveBeenCalledTimes(1);
 	});
 
 	it("stays visible but non-selectable for an in-process connection", () => {
@@ -209,10 +210,10 @@ describe("SubagentSummaryLine", () => {
 		) => void;
 
 		update.call(mode, child("worker", "running"));
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("运行 1");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("worker 运行中");
 
 		update.call(mode, child("worker", "done", { activeSessionId: "active-worker" }));
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("空闲 1");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("worker 空闲");
 	});
 
 	it("counts a retained completed child as running while a follow-up turn is active", () => {
@@ -235,13 +236,13 @@ describe("SubagentSummaryLine", () => {
 		) => void;
 
 		update.call(mode, child("worker", "done", { activeSessionId: "resident-worker" }));
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("空闲 1");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("worker 空闲");
 
 		update.call(mode, child("worker", "done", { activeSessionId: "resident-worker", activity: { kind: "waiting" } }));
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("运行 1");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("worker 运行中");
 
 		update.call(mode, child("worker", "done", { activeSessionId: "resident-worker" }));
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("空闲 1");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("worker 空闲");
 	});
 
 	it("refreshes counts when startup seeding follows an early live child update", () => {
@@ -273,7 +274,7 @@ describe("SubagentSummaryLine", () => {
 		Reflect.set(mode, "rlmNodeId", "me");
 		seed.call(mode, [worker]);
 
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("收口 1");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("worker ✓ 已交回");
 	});
 
 	it("marks a stalled grandchild without needing it to be a direct child", () => {
@@ -306,12 +307,12 @@ describe("SubagentSummaryLine", () => {
 			}),
 		);
 
-		const rendered = stripAnsi(line.render(160).join("\n"));
-		expect(rendered).toContain("运行 2");
-		// The stalled grandchild gets its own row, marked 卡住 in the error color.
-		const row = rendered.split("\n").find((text) => text.includes("grandchild"));
-		expect(row).toContain("✗");
-		expect(row).toContain("卡住");
+		const lines = line.render(160).map(stripAnsi);
+		// One row for the whole family: the worker running, the stalled grandchild
+		// with its own block, marked 卡住.
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain("worker 运行中");
+		expect(lines[0]).toContain("grandchild ⚠ 卡住");
 	});
 
 	it("keeps the stall marker of a stalled session that has no row of its own", () => {
@@ -319,9 +320,11 @@ describe("SubagentSummaryLine", () => {
 		line.setSubagentCounts({ total: 2, running: 2, idle: 0, inactive: 0 });
 		line.setSubagentRows([{ id: "w", name: "worker", state: "running" }]);
 		line.setStallMarkers(["worker: stalled 70s", "roster-only: stalled 90s, in-flight: bash"]);
-		const rendered = stripAnsi(line.render(160).join("\n"));
-		expect(rendered).toContain("roster-only: stalled 90s, in-flight: bash");
-		expect(rendered).not.toContain("worker: stalled 70s");
+		const lines = line.render(160).map(stripAnsi);
+		// The session without a row becomes a red block in the same row; the one with a row says it there.
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain(" ⚠ roster-only 卡住 ");
+		expect(lines[0]).not.toContain("worker: stalled 70s");
 	});
 
 	it("clears a resident session id when a terminal update reports an evicted child", () => {
@@ -348,7 +351,7 @@ describe("SubagentSummaryLine", () => {
 		update.call(mode, child("worker", "running"));
 		update.call(mode, child("worker", "done"));
 
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("收口 1");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("worker ✓ 已交回");
 	});
 
 	it("removes a run on the producer's cancelled signal and keeps transcript-backed rows through repeated dones", () => {
@@ -380,7 +383,7 @@ describe("SubagentSummaryLine", () => {
 		update.call(mode, child("worker", "done"));
 		update.call(mode, child("worker", "done"));
 		expect(snapshots.has("worker")).toBe(true);
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("收口 1");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("worker ✓ 已交回");
 	});
 
 	it("counts parentSessionId-only roster children exactly like the agents view", () => {
@@ -555,7 +558,7 @@ describe("SubagentSummaryLine", () => {
 		line.focused = true;
 		line.onOpen = (row) => void open.call(mode, row?.activeSessionId);
 
-		line.handleInput("\x1b[B");
+		line.handleInput("\x1b[C");
 		line.handleInput("\r");
 		await vi.waitFor(() => expect(returnToAgentsView).toHaveBeenCalledWith("scoped_agents_view", "active-b", {}));
 	});
@@ -767,33 +770,35 @@ describe("subagent spend cell", () => {
 		expect(summary.partial).toBe(true);
 	});
 
-	it("renders the spend total in the counts row with money first and the mother total second", () => {
+	const plain = (text: string | undefined): string => stripAnsi(text ?? "");
+
+	it("shows the spend total with money first and the mother total second, on the status line's cell and not in the strip", () => {
 		const line = new SubagentSummaryLine();
 		line.setSubagentCounts({ total: 2, running: 1, idle: 1, inactive: 0 });
+		const before = line.render(120);
 		line.setSubagentSpend(spend({ cost: 4.56, tokens: 12_300_000, parentCost: 0.54 }));
 
-		const body = stripAnsi(line.render(120)[0]);
-		expect(body).toContain("¥4.56 · 12M tok ｜ 全部 ¥5.10");
-		expect(body).toContain("运行 1 · 空闲 1");
+		expect(plain(renderSubagentSpendCell(line.getSubagentSpend())[0])).toBe("子代理 ¥4.56 · 全部 ¥5.10");
+		// The strip stays as it was: the figure has moved to the status line.
+		expect(line.render(120)).toEqual(before);
+		expect(plain(line.render(120)[0])).not.toContain("¥");
 	});
 
 	it("keeps the cell blank for an all-zero summary and never shows ¥0.00", () => {
-		const line = new SubagentSummaryLine();
-		line.setSubagentCounts({ total: 1, running: 0, idle: 1, inactive: 0 });
-		line.setSubagentSpend(spend({}));
-		expect(stripAnsi(line.render(120)[0])).not.toContain("¥");
+		expect(renderSubagentSpendCell(spend({}))).toEqual([]);
 
 		// An all-unpriced family: tokens plus the warning, no ¥0.00 figure.
-		line.setSubagentSpend(spend({ tokens: 8_100_000, unpriced: [{ model: "kimi-k3", tokens: 8_100_000 }] }));
-		const body = stripAnsi(line.render(120)[0]);
+		const forms = renderSubagentSpendCell(
+			spend({ tokens: 8_100_000, unpriced: [{ model: "kimi-k3", tokens: 8_100_000 }] }),
+		);
+		expect(forms.length).toBeGreaterThan(0);
+		const body = plain(forms[0]);
 		expect(body).toContain("8.1M tok (kimi-k3 8.1M tok 未定价)");
 		expect(body).not.toContain("¥");
 	});
 
 	it("marks partial-tree figures as lower bounds and warns in the theme warning color", () => {
-		const line = new SubagentSummaryLine();
-		line.setSubagentCounts({ total: 1, running: 1, idle: 0, inactive: 0 });
-		line.setSubagentSpend(
+		const forms = renderSubagentSpendCell(
 			spend({
 				cost: 4.56,
 				tokens: 12_300_000,
@@ -802,89 +807,57 @@ describe("subagent spend cell", () => {
 				unpriced: [{ model: "kimi-k3", tokens: 8_100_000 }],
 			}),
 		);
-		const body = stripAnsi(line.render(120)[0]);
-		expect(body).toContain("≈¥4.56 · ≈12M tok ｜ 全部 ≈¥5.10");
-		const raw = line.render(120)[0];
-		expect(raw).toContain(theme.fg("warning", "(kimi-k3 8.1M tok 未定价)"));
-		expect(raw).toContain(theme.fg("accent", "¥4.56"));
+		expect(forms.length).toBeGreaterThan(0);
+		expect(plain(forms[0])).toContain("≈¥4.56 · 全部 ≈¥5.10");
+		expect(forms[0]).toContain(theme.fg("warning", "(kimi-k3 8.1M tok 未定价)"));
+		expect(forms[0]).toContain(theme.fg("accent", "¥4.56"));
 	});
 
-	it("degrades in a fixed order at narrow widths and never pushes the select hint out", () => {
-		const line = new SubagentSummaryLine();
-		line.setSubagentCounts({ total: 3, running: 1, idle: 1, inactive: 1 });
-		line.setSubagentSpend(
+	it("degrades in a fixed order, one thing per form, and never ends on a half figure", () => {
+		const forms = renderSubagentSpendCell(
 			spend({
 				cost: 4.56,
 				tokens: 12_300_000,
 				parentCost: 0.54,
 				unpriced: [{ model: "kimi-k3", tokens: 8_100_000 }],
 			}),
-		);
-		line.setOpenable(true);
-
-		// 110: everything fits.
-		const wide = stripAnsi(line.render(110)[0]);
-		expect(wide).toContain("¥4.56 · 12M tok ｜ 全部 ¥5.10 (kimi-k3 8.1M tok 未定价)");
-		// 95: the 全部 figure is the first cut.
-		const medium = stripAnsi(line.render(95)[0]);
-		expect(medium).toContain("¥4.56 · 12M tok");
-		expect(medium).not.toContain("全部 ¥");
-		expect(medium).toContain("(kimi-k3 8.1M tok 未定价)");
-		// 85: then the annotation's token counts.
-		const annotationlessTokens = stripAnsi(line.render(85)[0]);
-		expect(annotationlessTokens).toContain("(kimi-k3 未定价)");
-		expect(annotationlessTokens).not.toContain("8.1M");
-		// 70: annotation gone, primary survives.
-		const narrow = stripAnsi(line.render(70)[0]);
-		expect(narrow).toContain("¥4.56 · 12M tok");
-		expect(narrow).not.toContain("未定价");
-		// 55: with three count groups there is no room; the cell is dropped, never half-truncated.
-		const tight = stripAnsi(line.render(55)[0]);
-		expect(tight).not.toContain("¥");
-		expect(tight).toContain("↓ 选择");
-		for (const width of [110, 95, 85, 70, 55]) {
-			const body = stripAnsi(line.render(width)[0]);
-			expect(body).toContain("↓ 选择");
-			expect(visibleWidth(line.render(width)[0])).toBeLessThanOrEqual(width);
-		}
+		).map(plain);
+		expect(forms).toEqual([
+			// everything
+			"子代理 ¥4.56 · 全部 ¥5.10 (kimi-k3 8.1M tok 未定价)",
+			// the 全部 figure is the first cut
+			"子代理 ¥4.56 (kimi-k3 8.1M tok 未定价)",
+			// then the annotation's token counts
+			"子代理 ¥4.56 (kimi-k3 未定价)",
+			// then the annotation, leaving only the warning mark
+			"子代理 ¥4.56?",
+		]);
+		for (const form of forms) expect(form).not.toMatch(/¥[0-9.]*…/);
 	});
 
-	it("does not move the open hint or change the line width when figures grow", () => {
+	it("does not move the strip when the figures grow", () => {
 		const line = new SubagentSummaryLine();
 		line.setSubagentCounts({ total: 1, running: 1, idle: 0, inactive: 0 });
-		line.setSubagentSpend(spend({ cost: 4.56, tokens: 999_000, parentCost: 0.2 }));
+		line.setSubagentRows([{ id: "a", name: "review", state: "running" }]);
 		line.setOpenable(true);
-		const before = stripAnsi(line.render(120)[0]);
-		const beforeRaw = line.render(120)[0];
+		line.setSubagentSpend(spend({ cost: 4.56, tokens: 999_000, parentCost: 0.2 }));
+		const before = line.render(120)[0];
+		const beforeRegions = line.getClickRegions().map(({ col, width }) => ({ col, width }));
 
 		line.setSubagentSpend(spend({ cost: 12.34, tokens: 1_020_000, parentCost: 1.2 }));
-		const after = stripAnsi(line.render(120)[0]);
-		const afterRaw = line.render(120)[0];
+		const after = line.render(120)[0];
 
-		expect(before).toContain("¥4.56");
-		expect(after).toContain("¥12.34");
-		// Line length is padded to the inner width and the hint is right-anchored:
-		// growth only eats the blank gap between them.
-		expect(before.length).toBe(after.length);
-		expect(before.indexOf("↓ 选择")).toBe(after.indexOf("↓ 选择"));
-		expect(visibleWidth(beforeRaw)).toBe(visibleWidth(afterRaw));
+		expect(plain(renderSubagentSpendCell(line.getSubagentSpend())[0])).toContain("¥12.34");
+		expect(after).toBe(before);
+		expect(line.getClickRegions().map(({ col, width }) => ({ col, width }))).toEqual(beforeRegions);
+		expect(visibleWidth(after ?? "")).toBe(visibleWidth(before ?? ""));
 	});
 
-	it("keeps the spend colors readable over the selection background when focused", () => {
-		const line = new SubagentSummaryLine();
-		line.setSubagentCounts({ total: 2, running: 1, idle: 1, inactive: 0 });
-		line.setSubagentSpend(spend({ cost: 4.56, tokens: 12_300_000, parentCost: 0.54 }));
-		line.setOpenable(true);
-		line.focused = true;
-
-		const content = line.render(100)[0];
-		expect(content).toContain(theme.fg("accent", "¥4.56"));
-		expect(content).toContain(theme.fg("dim", "全部 ¥5.10"));
-		// The selection background wraps the whole row (also across the fg resets
-		// the spend segment emits, which never clear the background).
-		const selectedBg = theme.bg("selectedBg", "");
-		expect(content).toContain(selectedBg.slice(0, selectedBg.indexOf("\x1b[49m")));
-		expect(stripAnsi(content)).toContain("¥4.56 · 12M tok ｜ 全部 ¥5.10");
+	it("keeps the spend colors: money in the accent, the mother total dim", () => {
+		const forms = renderSubagentSpendCell(spend({ cost: 4.56, tokens: 12_300_000, parentCost: 0.54 }));
+		expect(forms.length).toBeGreaterThan(0);
+		expect(forms[0]).toContain(theme.fg("accent", "¥4.56"));
+		expect(forms[0]).toContain(theme.fg("dim", "全部 ¥5.10"));
 	});
 
 	/**
@@ -1273,28 +1246,24 @@ describe("spend price overrides", () => {
 	});
 
 	it("marks the re-priced model in the cell, and drops the marker before the figure", () => {
-		const line = new SubagentSummaryLine();
-		line.setSubagentCounts({ total: 1, running: 0, idle: 1, inactive: 0 });
-		line.setSubagentSpend(
+		const forms = renderSubagentSpendCell(
 			spend({
 				cost: 9,
 				tokens: 2_000_000,
+				parentCost: 0,
 				overridePriced: [{ model: "kimi-k3", tokens: 2_000_000 }],
 			}),
 		);
-
-		const wide = stripAnsi(line.render(120)[0]);
-		expect(wide).toContain("¥9.00 · 2.0M tok ｜ 全部 ¥9.00 (kimi-k3 2.0M tok 已改价)");
-		expect(line.render(120)[0]).toContain(theme.fg("accent", "(kimi-k3 2.0M tok 已改价)"));
+		expect(forms.length).toBeGreaterThan(0);
+		expect(forms.map(stripAnsi)[0]).toBe("子代理 ¥9.00 · 全部 ¥9.00 (kimi-k3 2.0M tok 已改价)");
+		expect(forms[0]).toContain(theme.fg("accent", "(kimi-k3 2.0M tok 已改价)"));
 
 		// The marker degrades with the rest of the annotation, and a truncated money
-		// figure is never shown: the cell drops whole rungs, it does not ellipsize.
-		const narrow = stripAnsi(line.render(50)[0]);
-		expect(narrow).toContain("¥9.00 · 2.0M tok");
-		expect(narrow).not.toContain("已改价");
-		for (const width of [120, 100, 80, 70, 60, 50]) {
-			expect(visibleWidth(line.render(width)[0])).toBeLessThanOrEqual(width);
-		}
+		// figure is never shown: the cell drops whole forms, it does not ellipsize.
+		const last = stripAnsi(forms.at(-1) ?? "");
+		expect(last).toBe("子代理 ¥9.00");
+		expect(last).not.toContain("已改价");
+		expect(forms.map(stripAnsi)).toContain("子代理 ¥9.00 (kimi-k3 已改价)");
 	});
 });
 
@@ -1318,49 +1287,48 @@ describe("subagent panel rows (design board 06)", () => {
 		return line;
 	}
 
-	it("renders a rule header then one row per child with state glyph, name column, state and activity", () => {
+	it("renders one row of blocks, one per child, in state order, with the state in words", () => {
 		const lines = panel().render(100).map(stripAnsi);
-		expect(lines).toHaveLength(4);
-		expect(lines[0]).toMatch(/^ 子代理 3 {2}运行 2 · 收口 1 ─+ ↓ 选择 ─ *$/);
-		expect(lines[1]).toBe("   ● review   运行 2:14    读取 footer.ts");
-		expect(lines[2]).toBe("   ● docs     运行 0:41    编辑 FORK_NOTES.md");
-		expect(lines[3]).toBe("   ✓ lint     完成 1:02    无问题");
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatch(/^ {2}◇ review 运行中 {3}◇ docs 运行中 {3}◇ lint ✓ 已交回 /);
+		// No header, no per-child list, no rule.
+		expect(lines[0]).not.toContain("子代理 3");
+		expect(lines[0]).not.toContain("─");
 	});
 
-	it("moves a › selector over the rows while focused and shows the row action", () => {
+	it("moves the selection over the blocks while focused and shows the keys", () => {
 		const line = panel();
 		line.focused = true;
-		let lines = line.render(100).map(stripAnsi);
-		expect(lines[1]?.startsWith(" › ● review")).toBe(true);
-		expect(lines[1]?.trimEnd().endsWith("Enter 打开")).toBe(true);
-		expect(lines[0]).not.toContain("选择");
-		line.handleInput("\x1b[B");
-		lines = line.render(100).map(stripAnsi);
-		expect(lines[1]?.startsWith("   ● review")).toBe(true);
-		expect(lines[2]?.startsWith(" › ● docs")).toBe(true);
+		const onOpen = vi.fn();
 		const onCancel = vi.fn();
+		line.onOpen = onOpen;
 		line.onCancel = onCancel;
-		line.handleInput("\x1b[A");
-		expect(onCancel).not.toHaveBeenCalled();
-		expect(stripAnsi(line.render(100)[1] ?? "").startsWith(" › ● review")).toBe(true);
+		expect(stripAnsi(line.render(120)[0] ?? "").trimEnd()).toMatch(/←\/→ 选 · Enter 进去 · Esc 返回 · .*全部停止$/);
+		line.handleInput("\r");
+		expect(onOpen).toHaveBeenLastCalledWith(expect.objectContaining({ id: "a" }));
+		line.handleInput("\x1b[C");
+		line.handleInput("\r");
+		expect(onOpen).toHaveBeenLastCalledWith(expect.objectContaining({ id: "b" }));
+		// Up leaves at once: there is no list to walk back up.
 		line.handleInput("\x1b[A");
 		expect(onCancel).toHaveBeenCalledTimes(1);
 	});
 
-	it("folds rows past four into a count row and drops stall marker lines while rows carry the state", () => {
+	it("pages a crowd of children sideways in one row and drops stall marker lines while rows carry the state", () => {
 		const line = new SubagentSummaryLine();
 		line.setSubagentCounts({ total: 6, running: 6, idle: 0, inactive: 0 });
 		line.setSubagentRows(
 			Array.from({ length: 6 }, (_, index) => ({ id: `c${index}`, name: `w${index}`, state: "running" as const })),
 		);
 		line.setStallMarkers(["w0: stalled 30s"]);
-		const lines = line.render(80).map(stripAnsi);
-		expect(lines).toHaveLength(6);
-		expect(lines[5]).toBe("   … 还有 2 个");
+		const lines = line.render(60).map(stripAnsi);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatch(/还有 \d+ 个 ›/);
+		// w0 has a block of its own: its marker adds nothing.
 		expect(lines.join("\n")).not.toContain("⚠");
 	});
 
-	it("scrolls the focused selection through every row past the fold and opens the one selected", () => {
+	it("reaches every child with the arrow keys and opens the one selected", () => {
 		const line = new SubagentSummaryLine();
 		line.setSubagentCounts({ total: 6, running: 6, idle: 0, inactive: 0 });
 		line.setSubagentRows(
@@ -1370,36 +1338,27 @@ describe("subagent panel rows (design board 06)", () => {
 		const onOpen = vi.fn();
 		line.onOpen = onOpen;
 		line.focused = true;
-		let lines = line.render(80).map(stripAnsi);
-		expect(lines.at(-1)).toBe("   ↓ 下面还有 2 个");
+		expect(line.render(60)).toHaveLength(1);
 
-		for (let press = 0; press < 5; press++) line.handleInput("\x1b[B");
-		lines = line.render(80).map(stripAnsi);
-		// Header, the fold above, then the last four rows with w5 selected; nothing below.
-		expect(lines).toHaveLength(6);
-		expect(lines[1]).toBe("   ↑ 上面还有 2 个");
-		expect(lines.slice(2).map((text) => text.match(/w\d/)?.[0])).toEqual(["w2", "w3", "w4", "w5"]);
-		expect(lines[5]?.startsWith(" › ● w5")).toBe(true);
-		expect(lines.join("\n")).not.toContain("下面还有");
-		// The last row is the floor: another ↓ stays on it.
-		line.handleInput("\x1b[B");
+		for (let press = 0; press < 5; press++) line.handleInput("\x1b[C");
+		const lines = line.render(60).map(stripAnsi);
+		expect(lines).toHaveLength(1);
+		// The row followed the selection to the last child, and nothing is left to the right.
+		expect(lines[0]).toContain("w5");
+		expect(lines[0]).not.toContain("›");
+		// The last block is the floor: another Right stays on it.
+		line.handleInput("\x1b[C");
 		line.handleInput("\r");
 		expect(onOpen).toHaveBeenCalledWith(expect.objectContaining({ id: "c5", name: "w5" }));
 
-		// Moving up inside the window leaves it where it is.
-		for (let press = 0; press < 3; press++) line.handleInput("\x1b[A");
-		lines = line.render(80).map(stripAnsi);
-		expect(lines[1]).toBe("   ↑ 上面还有 2 个");
-		expect(lines[2]?.startsWith(" › ● w2")).toBe(true);
-		// Past its top edge, the window follows.
-		line.handleInput("\x1b[A");
-		lines = line.render(80).map(stripAnsi);
-		expect(lines[1]).toBe("   ↑ 上面还有 1 个");
-		expect(lines[2]?.startsWith(" › ● w1")).toBe(true);
-		expect(lines.at(-1)).toBe("   ↓ 下面还有 1 个");
+		// Back through the row, the earlier children come back into view.
+		for (let press = 0; press < 5; press++) line.handleInput("\x1b[D");
+		expect(stripAnsi(line.render(60)[0] ?? "")).toContain("w0");
+		line.handleInput("\r");
+		expect(onOpen).toHaveBeenLastCalledWith(expect.objectContaining({ id: "c0" }));
 	});
 
-	it("folds an all-idle family to one line until the panel is focused", () => {
+	it("keeps an all-idle family in the same one row, with the auto-close note as the hint", () => {
 		const line = new SubagentSummaryLine();
 		line.setSubagentCounts({ total: 6, running: 0, idle: 5, inactive: 1 });
 		line.setSubagentRows([
@@ -1411,22 +1370,27 @@ describe("subagent panel rows (design board 06)", () => {
 			{ id: "d", name: "vps-done", state: "done" as const },
 		]);
 		line.setOpenable(true);
-		let lines = line.render(100).map(stripAnsi);
-		expect(lines).toHaveLength(2);
-		expect(lines[0]).toContain("↓ 选择");
-		expect(lines[1]).toBe("   都做完了，闲置一阵后会自动关闭（记录保留）");
-		// Focused, every child is listed again and reachable.
+		let lines = line.render(120).map(stripAnsi);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain("↓ 选一个进去看");
+		// With room, the note says what happens to finished children.
+		lines = line.render(200).map(stripAnsi);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain("都做完了，闲置一阵后会自动关闭（记录保留）");
+		// Focused, every child is still one row, reachable with the arrows.
 		line.focused = true;
 		lines = line.render(100).map(stripAnsi);
-		expect(lines[1]?.startsWith(" › ○ vps-0")).toBe(true);
-		expect(lines.at(-1)).toBe("   ↓ 下面还有 2 个");
-		// One child still working keeps the rows up.
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain("vps-0 空闲");
+		// One child still working: no note, the blocks speak for themselves.
 		line.focused = false;
 		line.setSubagentRows([
 			{ id: "r", name: "vps-run", state: "running" as const },
 			{ id: "i0", name: "vps-0", state: "idle" as const },
 		]);
-		expect(line.render(100).map(stripAnsi)[1]).toContain("vps-run");
+		const working = line.render(200).map(stripAnsi);
+		expect(working[0]).toContain("vps-run 运行中");
+		expect(working[0]).not.toContain("都做完了");
 	});
 
 	it("stops promising an idle close once every child is closed", () => {
@@ -1434,7 +1398,9 @@ describe("subagent panel rows (design board 06)", () => {
 		line.setSubagentCounts({ total: 2, running: 0, idle: 0, inactive: 2 });
 		line.setSubagentRows(buildSubagentPanelRows([child("a", "done"), child("b", "done")], undefined));
 		line.setOpenable(true);
-		expect(line.render(100).map(stripAnsi)[1]).toBe("   都做完了，已自动关闭（记录保留）");
+		const text = line.render(100).map(stripAnsi).join("\n");
+		expect(text).toContain("都做完了，已自动关闭（记录保留）");
+		expect(text).not.toContain("闲置一阵");
 	});
 
 	it("lets a failure the parent already received fold with the finished rows", () => {
@@ -1446,17 +1412,19 @@ describe("subagent panel rows (design board 06)", () => {
 		const line = new SubagentSummaryLine();
 		line.setSubagentCounts({ total: 3, running: 0, idle: 1, inactive: 2 });
 		line.setOpenable(true);
-		// Not seen yet: the failure holds the panel open, at the top.
+		// Not seen yet: the failure is the first block, and it says 出错 with no auto-close note.
 		line.setSubagentRows(buildSubagentPanelRows(children, undefined));
-		expect(line.render(100).map(stripAnsi)[1]).toContain("old");
-		// Its failure notice reached the parent: it no longer blocks the fold.
+		const fresh = line.render(200).map(stripAnsi)[0] ?? "";
+		expect(fresh).toMatch(/^ {2}◇ old ✗ 出错/);
+		expect(fresh).not.toContain("都结束了");
+		// Its failure notice reached the parent: it no longer counts as unsettled.
 		const rows = buildSubagentPanelRows(children, undefined, new Set(["old"]));
 		expect(rows.find((row) => row.id === "old")).toMatchObject({ state: "failed", acknowledged: true });
 		// It no longer ranks above a live child either.
 		expect(rows[0]?.id).toBe("other");
 		line.setSubagentRows(rows);
-		expect(line.render(100).map(stripAnsi)[1]).toBe(
-			"   都结束了（1 个出错，父代理已收到），闲置一阵后会自动关闭（记录保留）",
+		expect(line.render(200).map(stripAnsi)[0]).toContain(
+			"都结束了（1 个出错，父代理已收到），闲置一阵后会自动关闭（记录保留）",
 		);
 	});
 
@@ -1467,8 +1435,8 @@ describe("subagent panel rows (design board 06)", () => {
 		line.setSubagentRows([running("x"), running("y"), running("z")]);
 		line.setOpenable(true);
 		line.focused = true;
-		line.handleInput("\x1b[B");
-		// y finishes and sorts to the bottom: the selector goes with it.
+		line.handleInput("\x1b[C");
+		// y finishes and sorts to the end: the selection goes with it.
 		line.setSubagentRows([running("x"), running("z"), { id: "y", name: "y", state: "done" as const }]);
 		const onOpen = vi.fn();
 		line.onOpen = onOpen;
@@ -1476,17 +1444,16 @@ describe("subagent panel rows (design board 06)", () => {
 		expect(onOpen).toHaveBeenCalledWith(expect.objectContaining({ id: "y" }));
 	});
 
-	it("never exceeds the width and drops the activity column before anything else", () => {
+	it("never exceeds the width, stays one row, and does not show what each child is doing", () => {
 		const line = panel();
 		line.focused = true;
 		for (const width of [100, 60, 40, 28, 20, 12, 6]) {
-			for (const rendered of line.render(width)) {
-				expect(visibleWidth(rendered)).toBeLessThanOrEqual(width);
-			}
+			const rendered = line.render(width);
+			expect(rendered, `width ${width}`).toHaveLength(1);
+			expect(visibleWidth(rendered[0] ?? "")).toBeLessThanOrEqual(width);
+			expect(stripAnsi(rendered[0] ?? "")).not.toContain("FORK");
 		}
-		const narrow = line.render(28).map(stripAnsi);
-		expect(narrow[2]).toContain("docs");
-		expect(narrow[2]).not.toContain("FORK");
+		expect(stripAnsi(line.render(28)[0] ?? "")).toContain("review");
 	});
 
 	it("builds rows from snapshots, most relevant first, with Chinese states", () => {

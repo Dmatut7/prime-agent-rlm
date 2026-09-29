@@ -70,10 +70,16 @@ export interface StatusBarState {
 	context?: { percent?: number; warn: boolean };
 	/** Where the session runs; the first thing to go on a narrow screen. */
 	location?: string;
-	/** Subagents running right now. */
+	/** Subagents running right now; 0 hides the chip (the subagent strip already names every child). */
 	subagents: number;
 	/** The right side, styled, from the fullest form to the shortest. */
 	right: string[];
+	/**
+	 * How many of the leading `right` forms carry the subagent spend cell, each
+	 * form dropping it one step further. The form after them is the first without
+	 * it: the cell goes before the run's state and clock lose anything.
+	 */
+	spendForms?: number;
 }
 
 const CONTEXT_METER_CELLS = 8;
@@ -112,18 +118,26 @@ export function renderStatusBar(state: StatusBarState, width: number, badge?: st
 	const join = (...groups: string[]) => groups.filter(Boolean).join(GROUP_GAP);
 	const rights = state.right.length > 0 ? state.right : [""];
 	const right = (index: number) => rights[Math.min(index, rights.length - 1)] ?? "";
+	const spendForms = Math.max(0, Math.min(state.spendForms ?? 0, rights.length - 1));
+	// The forms without the spend cell, indexed the way the ladder below counts them.
+	const plain = (index: number) => right(spendForms + index);
 	// Most useful first: the model, what the run is doing, the context, the
-	// subagents; the location and the longer wordings go first when it is tight.
+	// subagents; the location goes first when it is tight, then the spend cell
+	// (a step at a time), then the longer wordings.
 	const candidates: Array<[string, string]> = [
 		[join(model, meterBar, chip, badgeText, location), right(0)],
 		[join(model, meterBar, chip, badgeText), right(0)],
-		[join(model, meterBar, chip, badgeText), right(1)],
-		[join(model, meterShort, chip, badgeText), right(1)],
-		[join(model, meterShort, chip, badgeText), right(2)],
-		[join(model, meterShort, chip, badgeText), right(3)],
-		[join(model, meterShort, badgeText), right(3)],
-		[join(model, chip), right(3)],
-		[model, right(3)],
+		...Array.from({ length: spendForms }, (_, step): [string, string] => [
+			join(model, meterBar, chip, badgeText),
+			right(step + 1),
+		]),
+		[join(model, meterBar, chip, badgeText), plain(1)],
+		[join(model, meterShort, chip, badgeText), plain(1)],
+		[join(model, meterShort, chip, badgeText), plain(2)],
+		[join(model, meterShort, chip, badgeText), plain(3)],
+		[join(model, meterShort, badgeText), plain(3)],
+		[join(model, chip), plain(3)],
+		[model, plain(3)],
 		[model, right(rights.length - 1)],
 		[model, ""],
 	];
@@ -218,6 +232,7 @@ export class FooterComponent implements Component {
 	private locationSource: (() => FooterLocation | undefined) | undefined;
 	private activitySource: (() => string | undefined) | undefined;
 	private statusBarSource: (() => StatusBarState | undefined) | undefined;
+	private spendSource: (() => readonly string[]) | undefined;
 	private toolErrorCount = 0;
 
 	constructor(private footerData: ReadonlyFooterDataProvider) {
@@ -266,6 +281,15 @@ export class FooterComponent implements Component {
 	 */
 	setStatusBarSource(source: (() => StatusBarState | undefined) | undefined): void {
 		this.statusBarSource = source;
+	}
+
+	/**
+	 * The subagent spend cell for the watermark line (the legacy face; the status
+	 * bar carries it itself): its forms, fullest first. The line uses the widest
+	 * that fits with everything else, else none - never a truncated figure.
+	 */
+	setSpendSource(source: (() => readonly string[]) | undefined): void {
+		this.spendSource = source;
 	}
 
 	/** U2: trailing consecutive tool errors; the badge renders from TOOL_ERROR_WARN_THRESHOLD. */
@@ -322,7 +346,12 @@ export class FooterComponent implements Component {
 
 		const activityText = this.activitySource?.()?.trim();
 		const activity = activityText ? `${activityText}${GROUP_GAP}` : "";
+		const spend = this.spendSource?.() ?? [];
 		const layouts: Array<[string, string]> = [
+			...spend.map((form): [string, string] => [
+				`${model}${locationGroup}`,
+				`${activity}${form}${GROUP_GAP}${bar}${figures}`,
+			]),
 			[`${model}${locationGroup}`, `${activity}${bar}${figures}`],
 			[model, `${activity}${bar}${figures}`],
 			[model, `${activity}${figures}`],

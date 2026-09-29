@@ -294,6 +294,7 @@ import {
 	countRosterSubagentStatuses,
 	countSubtreeSubagentStatuses,
 	formatSubagentStallMarker,
+	renderSubagentSpendCell,
 	type SubagentPanelRow,
 	type SubagentSummaryCounts,
 	SubagentSummaryLine,
@@ -1863,6 +1864,8 @@ export class InteractiveMode {
 		this.footer.setStatusBarSource(() =>
 			this.settingsManager.getProcessMode() === "quiet" ? this.getStatusBarState() : undefined,
 		);
+		// The legacy watermark line has no status bar to carry the subagent spend.
+		this.footer.setSpendSource(() => this.statusBarSpendCell());
 		this.setGoalAnnouncementBaseline(emptyGoalState());
 
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
@@ -2160,15 +2163,7 @@ export class InteractiveMode {
 		for (const container of this.getPromptContextContainers()) {
 			this.mainContainer.addChild(container);
 		}
-		this.mainContainer.addChild(this.trayInfoLine);
-		this.mainContainer.addChild(this.editorContainer);
-		this.footerSlot.addChild(this.footer);
-		this.mainContainer.addChild(this.footerSlot);
-		this.mainContainer.addChild(this.subagentSummaryLine);
-		this.mainContainer.addChild(this.widgetContainerBelow);
-		for (const component of this.getPromptDockComponents()) {
-			this.promptDock.addChild(component);
-		}
+		this.mountPromptArea();
 		this.ui.addChild(this.mainContainer);
 		this.ui.setFocus(this.editor);
 
@@ -7856,12 +7851,23 @@ export class InteractiveMode {
 			...(level ? { level } : {}),
 			...(context ? { context } : {}),
 			...(location ? { location } : {}),
-			subagents: this.subagentCounts.running,
+			// The strip under the prompt already shows a block per child.
+			subagents: this.subagentSummaryLine.hasChipRow() ? 0 : this.subagentCounts.running,
 			right: this.statusBarRight(),
+			spendForms: this.statusBarSpendCell().length,
 		};
 	}
 
-	/** The status bar's right side, fullest form first. */
+	/** The subagent spend cell's forms for the status bar, fullest first; none without a figure or a connection. */
+	private statusBarSpendCell(): string[] {
+		return this.connectionLost ? [] : renderSubagentSpendCell(this.subagentSummaryLine.getSubagentSpend());
+	}
+
+	/**
+	 * The status bar's right side, fullest form first. While the family has a
+	 * spend figure the leading `statusBarSpendCell().length` forms carry it after
+	 * the run's clock and tokens (before `Esc 停止`), each dropping it one step further.
+	 */
 	private statusBarRight(): string[] {
 		const toast = this.footerToast;
 		const toastChip =
@@ -7869,7 +7875,9 @@ export class InteractiveMode {
 		const dot = theme.fg("dim", " · ");
 		const state = this.currentTurnState;
 		const working = this.isAgentStreaming() || this.turnFlow.hasLiveBox();
-		const withToast = (variants: string[]) => variants.map((variant) => `${toastChip}${variant}`);
+		const spendCell = this.statusBarSpendCell();
+		const layout = (forms: string[], spendBearing: string[] = []) =>
+			[...spendBearing, ...forms].map((form) => `${toastChip}${form}`);
 		if (working || this.isAgentCompacting()) {
 			const startedAt = this.workingStartedAt ?? this.turnStartedAt;
 			const elapsed = state ? state.turnDurationMs() : startedAt !== undefined ? Date.now() - startedAt : 0;
@@ -7881,18 +7889,22 @@ export class InteractiveMode {
 			const escKey = keyText("app.input.clear", { primaryOnly: true });
 			const stop = escKey ? `${dot}${theme.fg("dim", `${escKey} 停止`)}` : "";
 			const head = `${spinner} ${theme.fg("activityText", label)}`;
-			return withToast([
-				`${head}${dot}${clock}${dot}${figure}${theme.fg("dim", " tokens")}${stop}`,
-				`${head}${dot}${clock}${dot}${figure}${stop}`,
-				`${head}${dot}${clock}${dot}${figure}`,
-				`${head}${dot}${clock}`,
-			]);
+			const counted = `${head}${dot}${clock}${dot}${figure}${theme.fg("dim", " tokens")}`;
+			return layout(
+				[
+					`${counted}${stop}`,
+					`${head}${dot}${clock}${dot}${figure}${stop}`,
+					`${head}${dot}${clock}${dot}${figure}`,
+					`${head}${dot}${clock}`,
+				],
+				spendCell.map((cell) => `${counted}${dot}${cell}${stop}`),
+			);
 		}
 		const session =
 			this.sessionOutputTokens !== undefined && this.sessionOutputTokens > 0
 				? theme.fg("dim", `本会话 ↓ ${formatBoxTokens(this.sessionOutputTokens)}`)
 				: "";
-		if (this.connectionLost) return withToast([`${theme.fg("error", "✗")} ${theme.fg("muted", "和后台的连接断了")}`]);
+		if (this.connectionLost) return layout([`${theme.fg("error", "✗")} ${theme.fg("muted", "和后台的连接断了")}`]);
 		const last = this.liveTurnFlowStore?.lastFinished;
 		if (last) {
 			const stopped = last.timeline.stopped;
@@ -7908,10 +7920,18 @@ export class InteractiveMode {
 				`${head}${dot}${clock}${dot}${figure}`,
 			];
 			if (session && !stopped) variants.unshift(`${variants[0]}${dot}${session}`);
+			const fullest = variants[0] ?? head;
 			variants.push(head);
-			return withToast(variants);
+			return layout(
+				variants,
+				spendCell.map((cell) => `${fullest}${dot}${cell}`),
+			);
 		}
-		return withToast(session ? [`${session}${theme.fg("dim", " tokens")}`, session] : [""]);
+		const quiet = session ? [`${session}${theme.fg("dim", " tokens")}`, session] : [""];
+		return layout(
+			quiet,
+			spendCell.map((cell) => (session ? `${quiet[0]}${dot}${cell}` : cell)),
+		);
 	}
 
 	/** The keys that work right now, most useful first; the hint line drops them from the end. */
@@ -10119,9 +10139,21 @@ export class InteractiveMode {
 		];
 	}
 
+	/** The prompt and what hangs under it, top to bottom: hint line, prompt, subagent strip, status line. */
 	private getPromptDockComponents(): Component[] {
-		// U6: ① tray info line, ② footer watermark, ③ subagents line.
-		return [this.trayInfoLine, this.editorContainer, this.footerSlot, this.subagentSummaryLine];
+		return [this.trayInfoLine, this.editorContainer, this.subagentSummaryLine, this.footerSlot];
+	}
+
+	/** Stack the prompt area in the main view and in the fullscreen dock, in the same order. */
+	private mountPromptArea(): void {
+		this.footerSlot.addChild(this.footer);
+		for (const component of this.getPromptDockComponents()) {
+			this.mainContainer.addChild(component);
+		}
+		this.mainContainer.addChild(this.widgetContainerBelow);
+		for (const component of this.getPromptDockComponents()) {
+			this.promptDock.addChild(component);
+		}
 	}
 
 	/** What the fullscreen transcript window scrolls over, top to bottom. */

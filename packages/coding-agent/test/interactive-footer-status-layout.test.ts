@@ -3,7 +3,11 @@ import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { FooterComponent, type FooterTelemetrySnapshot } from "../src/modes/interactive/components/footer.js";
-import { SubagentSummaryLine, TrayInfoLine } from "../src/modes/interactive/components/subagent-summary-line.js";
+import {
+	renderSubagentSpendCell,
+	SubagentSummaryLine,
+	TrayInfoLine,
+} from "../src/modes/interactive/components/subagent-summary-line.js";
 import { TopBar } from "../src/modes/interactive/components/top-bar.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -12,10 +16,12 @@ import { initTheme } from "../src/modes/interactive/theme/theme.js";
  * ① the hint line above the editor - status on the left (`深度 0`, goal,
  *    heartbeats, the context fallback only while footer.telemetry=off), the
  *    keys that work right now on the right (`Ctrl+O 过程 · Ctrl+T Thinking`),
- * ② (under the editor) the status line `glm-5.3-prime · max   ~/repo · main   ──●──│──  518k/1M · 49%`,
- * ③ `  运行 1 · 空闲 0 · 收口 2    子代理 ¥961.72 · 592M tok ｜ 全部 ¥1235.16    ↓ 选择`.
+ * ③ (right under the editor) the subagent strip: one row of blocks, here the
+ *    counts block `◇ 子代理 3  运行 1 · 收口 2` and `↓ 选一个进去看`,
+ * ② (last) the status line `glm-5.3-prime · max   ~/repo · main   ──●──│──  518k/1M · 49%`.
  * One fact one home: the model lives only in ②, the context figures only in ②
- * (fallback in ① while ② is off), the sub-agents only in ③.
+ * (fallback in ① while ② is off), the sub-agents only in ③, and the sub-agent
+ * money on the status bar's right side (see grow-bottom-status.test.ts).
  */
 
 const SNAPSHOT: FooterTelemetrySnapshot = {
@@ -27,6 +33,8 @@ const SNAPSHOT: FooterTelemetrySnapshot = {
 };
 
 const provider = { getGitBranch: () => null } as never;
+
+const spendFigures = { cost: 961.72, tokens: 592_000_000, parentCost: 273.44, unpriced: [], partial: false };
 
 function statusStack(options: {
 	telemetry: "off" | "on";
@@ -49,7 +57,7 @@ function statusStack(options: {
 	if (options.counts) subagents.setSubagentCounts(options.counts);
 	if (options.spend) subagents.setSubagentSpend(options.spend);
 	subagents.setOpenable(true);
-	return [topBar, info, footer, subagents].flatMap((component) => component.render(width).map(stripAnsi));
+	return [topBar, info, subagents, footer].flatMap((component) => component.render(width).map(stripAnsi));
 }
 
 describe("U6 status area layout", () => {
@@ -58,22 +66,23 @@ describe("U6 status area layout", () => {
 		setKeybindings(new KeybindingsManager());
 	});
 
-	it("renders the three-line bottom stack exactly as designed", () => {
+	it("renders the bottom stack exactly as designed: hint line, strip, status line", () => {
 		const lines = statusStack({
 			telemetry: "on",
 			counts: { total: 3, running: 1, idle: 0, inactive: 2 },
 			spend: { cost: 961.72, tokens: 592_000_000, parentCost: 273.44, unpriced: [], partial: false },
 		});
 		const nonEmpty = lines.map((line) => line.trimEnd()).filter((line) => line.trim().length > 0);
-		expect(nonEmpty).toHaveLength(4); // top bar, ①, ②, ③
+		expect(nonEmpty).toHaveLength(4); // top bar, ①, ③ (strip), ②
 		expect(nonEmpty[1]).toMatch(/^ 深度 0 +Ctrl\+O 过程 · Ctrl\+T Thinking · ← 会话列表 · \? 快捷键$/);
 		expect(visibleWidth(lines[1] ?? "")).toBe(110);
-		expect(nonEmpty[2]).toContain("glm-5.3-prime · max");
-		expect(nonEmpty[2]).toMatch(/●/);
-		expect(nonEmpty[2]).toContain("518k/1M · 49%");
-		expect(nonEmpty[3]).toContain("运行 1 · 收口 2");
-		expect(nonEmpty[3]).toContain("¥961.72 · 592M tok ｜ 全部 ¥1235.16");
-		expect(nonEmpty[3]).toContain("↓ 选择");
+		expect(nonEmpty[2]).toContain("运行 1 · 收口 2");
+		expect(nonEmpty[2]).toContain("↓ 选一个进去看");
+		// The money is not on the strip any more: it rides the status bar.
+		expect(nonEmpty[2]).not.toContain("¥");
+		expect(nonEmpty[3]).toContain("glm-5.3-prime · max");
+		expect(nonEmpty[3]).toMatch(/●/);
+		expect(nonEmpty[3]).toContain("518k/1M · 49%");
 	});
 
 	it("keeps one home per fact: no duplicate model name, no double context display", () => {
@@ -91,7 +100,9 @@ describe("U6 status area layout", () => {
 		expect(lines[0]).not.toContain("glm");
 		expect(lines[0]).not.toContain("518k");
 		expect(lines[0]).not.toContain("$");
-		expect(joined.match(/¥/g)).toHaveLength(2); // the ③ line's two figures only
+		// Money has one home too: the status bar's right side, which this stack (the
+		// watermark footer) does not include.
+		expect(joined).not.toContain("¥");
 		// ① carries neither while the footer line is on.
 		expect(lines[1]).not.toContain("518k");
 		expect(lines[1]).not.toContain("glm");
@@ -135,6 +146,7 @@ describe("U6 status area layout", () => {
 			counts: { total: 1, running: 1, idle: 0, inactive: 0 },
 		});
 		const subagentLine = lines.find((line) => line.includes("运行")) ?? "";
+		expect(subagentLine).toContain("◇ 子代理 1");
 		expect(subagentLine).toContain("运行 1");
 		expect(subagentLine).not.toContain("空闲");
 		expect(subagentLine).not.toContain("收口");
@@ -180,22 +192,26 @@ describe("U6 status area layout", () => {
 		}).filter((line) => line.trim().length > 0);
 		const statusLines = lines.slice(1).join("\n"); // everything but the chat-name header
 
-		// `·` separates same-kind segments, `｜` separates groups; no comma mixing.
+		// `·` separates same-kind segments; no comma mixing. The `｜` group separator
+		// went with the money cell, which moved to the status bar.
 		expect(statusLines).toContain(" · ");
-		expect(statusLines).toContain("｜");
+		expect(statusLines).not.toContain("｜");
 		expect(statusLines).not.toMatch(/[,，]/);
 		// Half-width digits with no internal spaces in every figure.
 		expect(statusLines).not.toMatch(/\d[ ]+\d/);
-		expect(statusLines).toContain("¥961.72");
-		expect(statusLines).toContain("¥1235.16");
+		expect(statusLines).not.toContain("¥");
 		expect(statusLines).toContain("518k/1M");
-		// Icon whitelist for the status lines: ● (bar level), ↓ (open hint).
+		const cell = stripAnsi(renderSubagentSpendCell(spendFigures)[0] ?? "");
+		expect(cell).toBe("子代理 ¥961.72 · 全部 ¥1235.16");
+		expect(cell).not.toMatch(/\d[ ]+\d/);
+		// Icon whitelist for the status lines: ● (bar level), ↓ (open hint), ◇ (the strip's block).
 		// Deleted decorations must stay gone: no storm glyph, no Σ/▍/◐/○, no box.
 		for (const banned of ["⚡", "⌁", "█", "Σ", "▍", "◐", "○", "╭", "╰", "subagents"]) {
 			expect(statusLines).not.toContain(banned);
 		}
 		expect(statusLines).toContain("●");
-		expect(statusLines).toContain("↓ 选择");
+		expect(statusLines).toContain("◇");
+		expect(statusLines).toContain("↓ 选一个进去看");
 		// English status words are gone; the counts read 运行/空闲/收口.
 		expect(statusLines).not.toMatch(/\b(running|idle|inactive|select|open)\b/);
 		expect(statusLines).toContain("运行 1");
@@ -263,13 +279,14 @@ describe("U6 status area layout", () => {
 		expect(speedLines).toHaveLength(2);
 		expect(speedLines[1]).toBe("88 tok/s · avg 66");
 
-		// Stall markers ride under ③ - which is exactly when subagents exist.
+		// A stall with no row of its own is a red block in ③'s one row - which is exactly when subagents exist.
 		const stalled = new SubagentSummaryLine();
 		stalled.setSubagentCounts({ total: 2, running: 2, idle: 0, inactive: 0 });
-		stalled.setStallMarkers(["stalled 214s, in-flight: ipython"]);
+		stalled.setStallMarkers(["worker: stalled 214s, in-flight: ipython"]);
 		const stallLines = stalled.render(110).map(stripAnsi);
+		expect(stallLines).toHaveLength(1);
 		expect(stallLines[0]).toContain("运行 2");
-		expect(stallLines[1]).toContain("⚠ stalled 214s");
+		expect(stallLines[0]).toContain("⚠ worker 卡住");
 	});
 
 	it("drops hints whole from the end when the hint line is too narrow", () => {
@@ -292,7 +309,7 @@ describe("U6 status area layout", () => {
 		}
 	});
 
-	it("protects the ↓ 选择 entry: figures truncate before the hint does (F5, DS2)", () => {
+	it("clips a wide family's counts block before anything else and never past the width", () => {
 		const subagents = new SubagentSummaryLine();
 		// A wide family - dynamic, long count string (the case a fixed-width
 		// pin cannot catch).
@@ -306,19 +323,26 @@ describe("U6 status area layout", () => {
 		});
 		subagents.setOpenable(true);
 		for (const width of [40, 36, 32, 30, 28, 26]) {
-			const line = stripAnsi(subagents.render(width)[0] ?? "");
-			expect(line.length).toBeLessThanOrEqual(width);
-			// The entry survives at every width; the counts/spend truncate.
-			expect(line).toContain("↓ 选择");
+			const rendered = subagents.render(width);
+			expect(rendered).toHaveLength(1);
+			const line = stripAnsi(rendered[0] ?? "");
+			expect(visibleWidth(rendered[0] ?? "")).toBeLessThanOrEqual(width);
+			// The block itself is the way in (clickable, selectable); the dim hint is what gives way.
+			expect(line).toContain("子代理 60");
+			expect(line).not.toContain("选一个进去看");
 		}
 		const at30 = stripAnsi(subagents.render(30)[0] ?? "");
-		// The 60-strong family's counts no longer fit whole at 30 - they
-		// truncate, and the entry still ends the line's content.
+		// The 60-strong family's counts no longer fit whole at 30 - they truncate.
 		expect(at30).toContain("…");
-		expect(at30.trimEnd().endsWith("↓ 选择")).toBe(true);
+		// With room, the hint is back at the end.
+		expect(
+			stripAnsi(subagents.render(110)[0] ?? "")
+				.trimEnd()
+				.endsWith("↓ 选一个进去看"),
+		).toBe(true);
 	});
 
-	it("reads as a rule header with the family name, counts, spend and hint, and still fits 80 (F7, DS2)", () => {
+	it("reads as one row with the family block and hint, and still fits 80 (F7, DS2)", () => {
 		const subagents = new SubagentSummaryLine();
 		subagents.setSubagentCounts({ total: 3, running: 1, idle: 0, inactive: 2 });
 		subagents.setSubagentSpend({
@@ -329,17 +353,18 @@ describe("U6 status area layout", () => {
 			partial: false,
 		});
 		subagents.setOpenable(true);
-		const at80 = stripAnsi(subagents.render(80)[0] ?? "");
-		// ` 子代理 3  运行 1 · 收口 2 ── ¥… ｜ 全部 ¥…  ↓ 选择 ─`: a dim rule joins the
-		// counts to the spend cell, and the hint stays right-anchored.
-		expect(at80).toMatch(/^ 子代理 3 {2}运行 1 · 收口 2 ─+ ¥961\.72/);
-		expect(at80.trimEnd().endsWith("↓ 选择 ─")).toBe(true);
-		expect(at80).toContain("全部 ¥1235.16");
-		expect(at80).toContain("↓ 选择");
+		const rendered = subagents.render(80);
+		expect(rendered).toHaveLength(1);
+		const at80 = stripAnsi(rendered[0] ?? "");
+		// ` ◇ 子代理 3  运行 1 · 收口 2 `: one block, the hint right-anchored, no rule, no money.
+		expect(at80).toMatch(/^ {2}◇ 子代理 3 {2}运行 1 · 收口 2 /);
+		expect(at80.trimEnd().endsWith("↓ 选一个进去看")).toBe(true);
 		expect(at80).not.toContain("…");
+		expect(at80).not.toContain("─");
+		expect(at80).not.toContain("¥");
 	});
 
-	it("keeps the full ③ line inside 80 columns with no truncation fragments (评审④)", () => {
+	it("keeps the strip inside every width with no truncation fragments (评审④)", () => {
 		const subagents = new SubagentSummaryLine();
 		subagents.setSubagentCounts({ total: 3, running: 1, idle: 0, inactive: 2 });
 		subagents.setSubagentSpend({
@@ -350,34 +375,31 @@ describe("U6 status area layout", () => {
 			partial: false,
 		});
 		subagents.setOpenable(true);
-		// The DS-measured 82-column overflow is gone: every group renders at 80.
+		// Every group renders at 80.
 		const at80 = stripAnsi(subagents.render(80)[0] ?? "");
 		expect(at80).toContain("运行 1 · 收口 2");
-		expect(at80).toContain("¥961.72 · 592M tok ｜ 全部 ¥1235.16");
-		expect(at80).toContain("↓ 选择");
+		expect(at80).toContain("↓ 选一个进去看");
 		expect(at80).not.toContain("…");
 
-		// The degradation ladder is the ③ line's primary constraint (评审④):
-		// every width fits, and money drops whole rungs - never a half figure.
+		// Every width fits, and no width shows a half money figure: the strip
+		// never shows money (the status bar's cell drops whole forms).
 		for (const width of [100, 80, 72, 56, 40, 30, 12]) {
 			const lines = subagents.render(width).map(stripAnsi);
+			expect(lines).toHaveLength(1);
 			for (const line of lines) {
 				expect(line.length).toBeLessThanOrEqual(width);
-				expect(line).not.toMatch(/¥[0-9]*…/);
+				expect(line).not.toContain("¥");
 			}
 		}
-		// At a width where the cell no longer fits, it is dropped whole.
-		const tight = stripAnsi(subagents.render(30)[0] ?? "");
-		expect(tight).not.toContain("¥9");
 	});
 
-	it("focused ③ keeps the Enter/→ open affordance without the ↓ hint", () => {
+	it("focused ③ keeps the Enter open affordance without the ↓ hint", () => {
 		const subagents = new SubagentSummaryLine();
 		subagents.setSubagentCounts({ total: 3, running: 1, idle: 0, inactive: 2 });
 		subagents.setOpenable(true);
 		subagents.focused = true;
 		const line = stripAnsi(subagents.render(110).join(""));
-		expect(line).toContain("打开");
-		expect(line).not.toContain("选择");
+		expect(line).toContain("Enter 进去");
+		expect(line).not.toContain("选一个进去看");
 	});
 });

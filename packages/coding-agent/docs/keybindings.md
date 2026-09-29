@@ -109,6 +109,8 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 | `app.modal.back` | `left` | Go back / close the current dialog |
 | `app.subagents.focus` | `alt+a` | Open child agents |
 | `app.subagents.stopAll` | `alt+x` | Stop every running subagent of this session (press again to confirm); also works in the agents view for the selected agent's family |
+| `app.subagents.prev` | `left` | Select the previous subagent in the strip below the prompt (while the strip has focus) |
+| `app.subagents.next` | `right` | Select the next subagent in the strip below the prompt (while the strip has focus) |
 | `app.stall.diagnostics` | `ctrl+y` | Show or close the stall diagnostics for the current turn. Active only while the stall action bar, or the diagnostics block it opened, is showing; otherwise `ctrl+y` keeps its editor meaning (`tui.editor.yank`) |
 
 ### Sessions

@@ -91,13 +91,13 @@ describe("ENG-4741 hint placement", () => {
 			queuedMessagesContainer,
 			sideQuestionContainer,
 		]);
-		// U6: the dock stacks ① tray info line, ② footer watermark, ③ subagents line.
-		expect(callPrivate(mode, "getPromptDockComponents")).toEqual([
-			editorContainer,
-			trayInfoLine,
-			footerSlot,
-			subagentSummaryLine,
-		]);
+		// The dock stacks the hint line, the prompt, the subagent strip, then the status line.
+		const dock = callPrivate(mode, "getPromptDockComponents") as unknown[];
+		expect(dock).toHaveLength(4);
+		expect(dock[0]).toBe(trayInfoLine);
+		expect(dock[1]).toBe(editorContainer);
+		expect(dock[2]).toBe(subagentSummaryLine);
+		expect(dock[3]).toBe(footerSlot);
 	});
 
 	it("keeps hints in the fullscreen transcript instead of the prompt dock", () => {

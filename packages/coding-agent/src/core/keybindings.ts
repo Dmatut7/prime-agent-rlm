@@ -34,6 +34,8 @@ export interface AppKeybindings {
 	"app.thinking.toggleAll": true;
 	"app.subagents.focus": true;
 	"app.subagents.stopAll": true;
+	"app.subagents.prev": true;
+	"app.subagents.next": true;
 	"app.heartbeats.open": true;
 	"app.heartbeats.openSelected": true;
 	"app.editor.external": true;
@@ -161,6 +163,14 @@ export const KEYBINDINGS = {
 	"app.subagents.stopAll": {
 		defaultKeys: "alt+x",
 		description: "Stop every running subagent (press again to confirm)",
+	},
+	"app.subagents.prev": {
+		defaultKeys: "left",
+		description: "Select the previous subagent in the strip below the prompt",
+	},
+	"app.subagents.next": {
+		defaultKeys: "right",
+		description: "Select the next subagent in the strip below the prompt",
 	},
 	"app.heartbeats.open": {
 		defaultKeys: "ctrl+r",
