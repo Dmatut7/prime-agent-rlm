@@ -262,8 +262,10 @@ import {
 	FooterComponent,
 	type FooterTelemetrySnapshot,
 	type FooterTelemetrySource,
+	finishedRunForms,
 	formatContextTokens,
 	type StatusBarState,
+	workingRunForms,
 } from "./components/footer.js";
 import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
@@ -326,12 +328,7 @@ import {
 } from "./components/turn-activity.js";
 import { BOX_FOCUS_MARKER } from "./components/turn-box.js";
 import { TurnBoxNavigator, turnBoxFocusHints } from "./components/turn-box-navigator.js";
-import {
-	boxRecordFromMessage,
-	formatBoxDuration,
-	formatBoxTokens,
-	isBoxNoticeMessage,
-} from "./components/turn-timeline.js";
+import { boxRecordFromMessage, isBoxNoticeMessage } from "./components/turn-timeline.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
 import { FeatureHintDeck } from "./feature-hints.js";
@@ -364,6 +361,7 @@ import { formatResumeHint } from "./resume-hint.js";
 import {
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
+	getEditorTextColors,
 	getEditorTheme,
 	getMarkdownTheme,
 	getThemeByName,
@@ -1616,8 +1614,6 @@ export class InteractiveMode {
 		this.liveTurnFlowStore ??= new LiveTurnFlow(this.createLiveTurnFlowHost());
 		return this.liveTurnFlowStore;
 	}
-	/** Output tokens of the whole session, from the session stats. */
-	private sessionOutputTokens: number | undefined;
 	/** The keyboard walking a turn's box (`app.turn.focus`). */
 	private boxFocus: { summary: TurnSummaryComponent; navigator: TurnBoxNavigator; resumeFollow: boolean } | undefined;
 	// U2: trailing consecutive errored tool results; a success resets it.
@@ -1799,8 +1795,7 @@ export class InteractiveMode {
 			autocompleteMaxVisible,
 			isArgumentCommand: builtinSlashCommandTakesArgument,
 			placeholder: this.startHint,
-			placeholderColor: (text) => theme.fg("dim", text),
-			hintColor: (text) => theme.fg("dim", text),
+			...getEditorTextColors(),
 		});
 		this.editor = this.defaultEditor;
 		this.mainContainer = new Container();
@@ -1817,6 +1812,8 @@ export class InteractiveMode {
 		// watermark (②), then the subagents line (③).
 		// The key hints ride the prompt's top rule; the tray line keeps status only.
 		this.defaultEditor.getBorderHints = () => this.getTrayHints();
+		// The design's foot: rule, prompt, then the subagent blocks (they take the bottom rule's row), then the status line.
+		this.defaultEditor.hideBottomRule = () => quietConversation(this) && this.subagentSummaryLine.hasBlocks();
 		this.trayInfoLine = new TrayInfoLine(
 			() => this.getTrayStatusLabel(),
 			() => [],
@@ -3496,7 +3493,6 @@ export class InteractiveMode {
 		this.contextUsageRefresh.lastSuccessGeneration = generation;
 		// Anything counted so far is now reflected in the snapshot; only later output is in-flight.
 		this.contextUsageTokenBaseline = this.activityTracker.getStatus().tokens;
-		this.sessionOutputTokens = stats.tokens?.output;
 		this.patchConnectionState({ contextUsage: stats.contextUsage });
 		// P2-D (Qwen review): the leading invalidation happened before the await
 		// - a frame that rendered while the RPC was in flight re-memoized the
@@ -3803,7 +3799,6 @@ export class InteractiveMode {
 		this.liveTurnFlowStore?.reset();
 		this.currentTurnState = undefined;
 		this.currentTurnSummary = undefined;
-		this.sessionOutputTokens = undefined;
 		this.resetSubagentSummary();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
@@ -7845,13 +7840,10 @@ export class InteractiveMode {
 			// Just compacted: the size is measured again with the next reply.
 			context = { warn: false };
 		}
-		const branch = this.footerDataProvider.getGitBranch();
-		const location = [formatSplashCwd(this.getCurrentCwd()), branch ?? undefined].filter(Boolean).join(" · ");
 		return {
 			model: model.id,
 			...(level ? { level } : {}),
 			...(context ? { context } : {}),
-			...(location ? { location } : {}),
 			// The strip under the prompt already shows a block per child.
 			subagents: this.subagentSummaryLine.hasChipRow() ? 0 : this.subagentCounts.running,
 			right: this.statusBarRight(),
@@ -7860,8 +7852,8 @@ export class InteractiveMode {
 	}
 
 	/** The subagent spend cell's forms for the status bar, fullest first; none without a figure or a connection. */
-	private statusBarSpendCell(): string[] {
-		return this.connectionLost ? [] : renderSubagentSpendCell(this.subagentSummaryLine.getSubagentSpend());
+	private statusBarSpendCell(color?: ThemeColor): string[] {
+		return this.connectionLost ? [] : renderSubagentSpendCell(this.subagentSummaryLine.getSubagentSpend(), color);
 	}
 
 	/**
@@ -7873,66 +7865,38 @@ export class InteractiveMode {
 		const toast = this.footerToast;
 		const toastChip =
 			toast && toast.until > Date.now() ? `${theme.bg("toastBg", theme.fg("toastText", ` ${toast.text} `))} ` : "";
-		const dot = theme.fg("dim", " · ");
 		const state = this.currentTurnState;
 		const working = this.isAgentStreaming() || this.turnFlow.hasLiveBox();
-		const spendCell = this.statusBarSpendCell();
 		const layout = (forms: string[], spendBearing: string[] = []) =>
 			[...spendBearing, ...forms].map((form) => `${toastChip}${form}`);
 		if (working || this.isAgentCompacting()) {
 			const startedAt = this.workingStartedAt ?? this.turnStartedAt;
 			const elapsed = state ? state.turnDurationMs() : startedAt !== undefined ? Date.now() - startedAt : 0;
 			const tokens = state ? state.timeline.outputTokens() : this.activityTracker.getStatus().tokens;
-			const label = working ? "工作中" : "整理上下文";
-			const spinner = theme.bold(theme.fg("activityAccent", spinnerFrame(getSpinnerTick())));
-			const clock = theme.fg("muted", formatBoxDuration(elapsed));
-			const figure = theme.fg("muted", `↓ ${formatBoxTokens(tokens)}`);
-			const escKey = keyText("app.input.clear", { primaryOnly: true });
-			const stop = escKey ? `${dot}${theme.fg("dim", `${escKey} 停止`)}` : "";
-			const head = `${spinner} ${theme.fg("activityText", label)}`;
-			const counted = `${head}${dot}${clock}${dot}${figure}${theme.fg("dim", " tokens")}`;
 			return layout(
-				[
-					`${counted}${stop}`,
-					`${head}${dot}${clock}${dot}${figure}${stop}`,
-					`${head}${dot}${clock}${dot}${figure}`,
-					`${head}${dot}${clock}`,
-				],
-				spendCell.map((cell) => `${counted}${dot}${cell}${stop}`),
+				workingRunForms({
+					label: working ? "工作中" : "整理上下文",
+					spinner: spinnerFrame(getSpinnerTick()),
+					elapsedMs: elapsed,
+					outputTokens: tokens,
+					stopKey: keyText("app.input.clear", { primaryOnly: true }) || undefined,
+					spendCells: this.statusBarSpendCell("timelineLive"),
+				}),
 			);
 		}
-		const session =
-			this.sessionOutputTokens !== undefined && this.sessionOutputTokens > 0
-				? theme.fg("dim", `本会话 ↓ ${formatBoxTokens(this.sessionOutputTokens)}`)
-				: "";
 		if (this.connectionLost) return layout([`${theme.fg("error", "✗")} ${theme.fg("muted", "和后台的连接断了")}`]);
 		const last = this.liveTurnFlowStore?.lastFinished;
 		if (last) {
-			const stopped = last.timeline.stopped;
-			const head = stopped
-				? `${theme.fg("dim", "■")} ${theme.fg("muted", "已停止")}`
-				: last.timeline.errorEnded
-					? `${theme.fg("error", "✗")} ${theme.fg("muted", "出错")}`
-					: `${theme.fg("diffAddedText", "✓")} ${theme.fg("muted", "完成")}`;
-			const clock = theme.fg("muted", formatBoxDuration(last.turnDurationMs()));
-			const figure = theme.fg("muted", `↓ ${formatBoxTokens(last.timeline.outputTokens())}`);
-			const variants = [
-				`${head}${dot}${clock}${dot}${figure}${theme.fg("dim", " tokens")}`,
-				`${head}${dot}${clock}${dot}${figure}`,
-			];
-			if (session && !stopped) variants.unshift(`${variants[0]}${dot}${session}`);
-			const fullest = variants[0] ?? head;
-			variants.push(head);
 			return layout(
-				variants,
-				spendCell.map((cell) => `${fullest}${dot}${cell}`),
+				finishedRunForms({
+					outcome: last.timeline.stopped ? "stopped" : last.timeline.errorEnded ? "error" : "done",
+					elapsedMs: last.turnDurationMs(),
+					outputTokens: last.timeline.outputTokens(),
+					spendCells: this.statusBarSpendCell("timelineTime"),
+				}),
 			);
 		}
-		const quiet = session ? [`${session}${theme.fg("dim", " tokens")}`, session] : [""];
-		return layout(
-			quiet,
-			spendCell.map((cell) => (session ? `${quiet[0]}${dot}${cell}` : cell)),
-		);
+		return layout([""], this.statusBarSpendCell("timelineTime"));
 	}
 
 	/** The keys that work right now, most useful first; the hint line drops them from the end. */

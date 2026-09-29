@@ -1,0 +1,4 @@
+- Changed the subagent blocks under the prompt to keep the order the children were sent out, show each child's task after its name (skipping "你是…" and "You are…" openings), say "回答中" in the AI's color and "✓ 已交回" in green, and put "↓ 选一个进去看" faint at the right edge.
+- Changed the status line to "思考 最高", an eight-cell context bar with the used share in the user color, a live-colored "⠹ 工作中 10分 · ↓ 180k · 子代理 ¥4.20 · 全部 ¥9.80 · Esc 停止" and a dim "✓ 完成 · 20 分钟 · ↓ 286k" once the run is done, without the session total or the place and branch.
+- Changed the prompt's rule to the timeline's rail color, the "›" mark to the soft color and the placeholder and key hints to the time color; while subagent blocks show, they take the row of the prompt's bottom rule.
+- Fixed the subagent spend on the status line losing the colors of its "未定价", "已改价" and "≈" marks.

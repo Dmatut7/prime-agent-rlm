@@ -127,16 +127,16 @@ describe("the subagent strip", () => {
 		]);
 		const [rendered] = line.render(120);
 		const text = plain([rendered ?? ""]);
-		expect(text).toContain(" ◇ alpha 运行中 ");
+		expect(text).toContain(" ◇ alpha 回答中 ");
 		expect(text).toContain(" ◇ beta 空闲 ");
 		expect(text).toContain(" ◇ gamma ✓ 已交回 ");
 		expect(text).toContain(" ◇ delta ✗ 出错 ");
 		expect(text).toContain(" ◇ epsilon ⚠ 卡住 ");
 		expect(count(rendered ?? "", bgOpen("kindSubagentBg"))).toBe(5);
-		expect(rendered).toContain(theme.fg("kindSubagent", "◇"));
-		expect(rendered).toContain(theme.fg("kindCommand", "运行中"));
+		expect(rendered).toContain(theme.bold(theme.fg("timelineSub", "◇")));
+		expect(rendered).toContain(theme.fg("timelineAi", "回答中"));
 		expect(rendered).toContain(theme.fg("dim", "空闲"));
-		expect(rendered).toContain(theme.fg("success", "✓ 已交回"));
+		expect(rendered).toContain(theme.fg("timelineOk", "✓ 已交回"));
 		expect(rendered).toContain(theme.fg("error", "✗ 出错"));
 		expect(rendered).toContain(theme.fg("error", "⚠ 卡住"));
 		// A space between blocks, and none of the old header or per-child list.
@@ -155,7 +155,7 @@ describe("the subagent strip", () => {
 		expect(visibleWidth(shown)).toBeGreaterThanOrEqual(12);
 	});
 
-	it("keeps the most-relevant-first order the panel rows come in", () => {
+	it("lays the blocks out in the order the children were dispatched, while the rows stay most-relevant-first", () => {
 		const child = (id: string, status: AgentConnectionRlmChildAgentSnapshot["status"], extra = {}) =>
 			({ id, label: id, status, sessionDir: `/tmp/${id}`, ...extra }) as AgentConnectionRlmChildAgentSnapshot;
 		const rows = buildSubagentPanelRows(
@@ -170,8 +170,10 @@ describe("the subagent strip", () => {
 			],
 			undefined,
 		);
+		// The list (the agents panel, the duty log) still ranks by state.
+		expect(rows.map((row) => row.id)).toEqual(["stall-1", "err-1", "run-1", "done-1"]);
 		const text = plain(strip(rows).render(160));
-		const order = ["stall-1", "err-1", "run-1", "done-1"].map((name) => text.indexOf(name));
+		const order = ["done-1", "run-1", "err-1", "stall-1"].map((name) => text.indexOf(name));
 		expect(order.every((at) => at >= 0)).toBe(true);
 		expect(order).toEqual([...order].sort((a, b) => a - b));
 	});
@@ -286,7 +288,7 @@ describe("the subagent strip", () => {
 			const regions = chipRegions(line);
 			const text = plain([rendered ?? ""]);
 			for (const [index, region] of regions.entries()) {
-				const block = ` ◇ agent-${index} 运行中 `;
+				const block = ` ◇ agent-${index} 回答中 `;
 				const at = text.indexOf(block);
 				expect(at).toBeGreaterThanOrEqual(0);
 				expect(region.line).toBe(0);

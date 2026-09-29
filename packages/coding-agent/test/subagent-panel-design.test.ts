@@ -30,7 +30,7 @@ describe("subagent panel matches design board 06", () => {
 			.map(strip)
 			.filter((row) => row.trim().length > 0);
 		expect(rows.length).toBe(1);
-		expect(rows[0]).toMatch(/^ {2}◇ review 运行中 {3}◇ docs 运行中 {3}◇ lint ✓ 已交回/);
+		expect(rows[0]).toMatch(/^ {2}◇ review 回答中 {3}◇ docs 回答中 {3}◇ lint ✓ 已交回/);
 		expect(rows[0]).not.toContain("─");
 		expect(rows[0]).not.toContain("footer.ts");
 		for (const row of rows) expect(row.length).toBeLessThanOrEqual(100);

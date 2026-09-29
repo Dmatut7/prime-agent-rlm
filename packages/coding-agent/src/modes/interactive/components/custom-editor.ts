@@ -18,6 +18,8 @@ export interface CustomEditorOptions extends EditorOptions {
 	isArgumentCommand?: (name: string) => boolean;
 	/** Color of the key hints embedded in the top rule; defaults to the border color. */
 	hintColor?: (text: string) => string;
+	/** Color of the ` › ` prompt mark; defaults to the theme's command color. */
+	promptColor?: (text: string) => string;
 }
 
 /**
@@ -37,6 +39,7 @@ export class CustomEditor extends Editor {
 	private readonly placeholderColor: (text: string) => string;
 	private readonly isArgumentCommand: (name: string) => boolean;
 	private readonly hintColor: (text: string) => string;
+	private readonly promptColor: ((text: string) => string) | undefined;
 	private readonly argTokenHighlighter = new ArgTokenHighlighter();
 	public actionHandlers: Map<AppKeybinding, () => unknown> = new Map();
 
@@ -50,6 +53,11 @@ export class CustomEditor extends Editor {
 	public getBorderHints?: () => readonly string[];
 	/** When set, the returned line is rendered inside the top of the editor box. */
 	public getHeaderLine?: () => string | undefined;
+	/**
+	 * While it returns true the box's bottom rule is left out because the row under the box takes its
+	 * place. A scroll indicator on that row ("↓ 还有 N 行") stays.
+	 */
+	public hideBottomRule?: () => boolean;
 	/** Handler for extension-registered shortcuts. Returns true if handled. */
 	public onExtensionShortcut?: (data: string) => boolean;
 
@@ -63,6 +71,7 @@ export class CustomEditor extends Editor {
 		this.placeholderColor = options?.placeholderColor ?? ((text) => text);
 		this.isArgumentCommand = options?.isArgumentCommand ?? (() => false);
 		this.hintColor = options?.hintColor ?? ((text) => this.borderColor(text));
+		this.promptColor = options?.promptColor;
 	}
 
 	protected override getPromptPrefix(): string {
@@ -73,7 +82,8 @@ export class CustomEditor extends Editor {
 		if (prefix.startsWith("!")) {
 			return this.borderColor(prefix);
 		}
-		return this.commandColor ? this.commandColor(prefix) : prefix;
+		const color = this.promptColor ?? this.commandColor;
+		return color ? color(prefix) : prefix;
 	}
 
 	protected override getHiddenTextPrefixLength(lineIndex: number, line: string): number {
@@ -172,6 +182,7 @@ export class CustomEditor extends Editor {
 		const isArgumentCommandLine = commandMatch !== null && this.isArgumentCommand(commandMatch[2]!);
 		this.argTokenHighlighter.reset(this.getLines(), isArgumentCommandLine);
 		let lines = super.render(width);
+		if (this.hideBottomRule?.() === true) lines = this.withoutBottomRule(lines);
 		if (this.placeholder && this.getText().length === 0 && lines.length >= 2) {
 			lines = [lines[0]!, this.renderPlaceholderLine(width), ...lines.slice(2)];
 		}
@@ -186,6 +197,13 @@ export class CustomEditor extends Editor {
 			];
 		}
 		return lines;
+	}
+
+	private withoutBottomRule(lines: string[]): string[] {
+		const bottom = lines.at(-1);
+		// Only a plain rule goes: a scroll indicator or a filled surface row says something.
+		if (bottom === undefined || lines.length < 3 || this.backgroundColor !== undefined) return lines;
+		return /^─+$/.test(bottom.replace(/\x1b\[[0-9;]*m/g, "")) ? lines.slice(0, -1) : lines;
 	}
 
 	private embedBorderHints(lines: string[], width: number): string[] {
