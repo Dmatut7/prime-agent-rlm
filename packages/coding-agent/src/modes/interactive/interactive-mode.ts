@@ -31,6 +31,7 @@ import {
 	CombinedAutocompleteProvider,
 	type Component,
 	Container,
+	FULLSCREEN_MAX_STICKY_ROWS,
 	isKeyRelease,
 	isMouseSequence,
 	Loader,
@@ -9800,6 +9801,13 @@ export class InteractiveMode {
 		const navigator: TurnBoxNavigator = new TurnBoxNavigator({
 			move: (direction) => this.moveBoxFocus(direction),
 			page: (direction) => {
+				if (this.ui.isFullscreen()) {
+					// The box grows with its content here and has no inner scroll: the page is the window's.
+					// A pinned box header covers up to FULLSCREEN_MAX_STICKY_ROWS rows of the window it lands on; leave them out of the step.
+					const window = this.ui.getScrollInfo()?.windowHeight ?? 0;
+					this.ui.scrollBy(direction * Math.max(1, window - 1 - FULLSCREEN_MAX_STICKY_ROWS));
+					return;
+				}
 				const ui = summary.state.timeline.ui;
 				if (ui.scrollBody(direction * Math.max(1, ui.lastVisible - 1))) {
 					summary.invalidate();
