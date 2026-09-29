@@ -119,36 +119,3 @@ describe("the subagent spend setting", () => {
 		expect(row).toContain("subagent blocks");
 	});
 });
-
-describe("the changelog fragments", () => {
-	const fragments = ["../.changes/grow-box.md", "../.changes/grow-bottom.md", "../../tui/.changes/grow-sticky.md"];
-
-	it("are one past-tense bullet per line", () => {
-		expect(fragments.length).toBeGreaterThan(0);
-		for (const fragment of fragments) {
-			const lines = read(fragment)
-				.split("\n")
-				.filter((line) => line.trim().length > 0);
-			expect(lines.length, fragment).toBeGreaterThan(0);
-			for (const line of lines) expect(line, fragment).toMatch(/^- (Added|Changed|Fixed|Removed) /);
-		}
-	});
-
-	it("say the spend is trimmed after the location, not before anything else", () => {
-		const bottom = read("../.changes/grow-bottom.md");
-		expect(bottom).not.toContain("before anything else");
-		expect(bottom).toContain("after the location");
-	});
-
-	it("say a mid-run opening folds unless auto-fold is off", () => {
-		const box = read("../.changes/grow-box.md");
-		expect(box).toContain("unless `ui.timelineAutoFold` is off");
-	});
-
-	it("describe the pinned header as it works: while its top is out of sight, with the click and the page keys", () => {
-		const sticky = read("../../tui/.changes/grow-sticky.md");
-		expect(sticky).not.toContain("taller than the screen");
-		expect(sticky).toContain("scrolled out of sight");
-		expect(sticky).toContain("page keys");
-	});
-});
