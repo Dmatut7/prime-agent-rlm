@@ -263,12 +263,14 @@ deleted in the same cell.
   tree (a moved `HEAD` adds `git diff --name-only`), a bounded mtime scan
   outside one. Ignored files, `.git`, `node_modules`, virtualenvs and caches are
   never reported.
-- That comparison covers only the git work tree (outside git: the directory
-  itself) of the session's working directory and of the directory Python is in
-  when it starts the process. A command that writes anywhere else
-  (`cd /tmp/build && make`, `curl -o /tmp/x`) is not listed: watching the whole
-  filesystem would cost every cell time. Python's own writes are listed
-  wherever they go, since the wrappers see each path.
+- That comparison covers the git work tree of the session's working directory
+  (outside git: the working directory itself, by a bounded mtime scan) and the
+  git work tree of the directory Python is in when it starts the process, if
+  that lies in one. A directory that is neither inside the session's working
+  directory nor in a git work tree is not looked at. A command that writes
+  anywhere else (`cd /tmp/build && make`, `curl -o /tmp/x`) is not listed:
+  watching the whole filesystem would cost every cell time. Python's own writes
+  are listed wherever they go, since the wrappers see each path.
 - A new file that is already gone again when the comparison looks at it is no
   creation, and BSD `sed -i`'s temp file (`.!<pid>!<name>`) is never reported;
   the edited file itself is.
