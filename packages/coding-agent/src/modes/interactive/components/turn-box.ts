@@ -470,15 +470,21 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		const expandable = row.detail !== undefined;
 		const opened = expandable && ui.expanded.has(row.key);
 		const focused = ui.focused && ui.focusKey === row.key;
+		const pointed = expandable && ui.hoverKey === row.key;
 		const stage = rowEnterStage(ui.enteredAt.get(row.key), now);
 		const errorFlash = row.kind === "error" && withinMotion(ui.settledAt.get(row.key), ERROR_FLASH_MS, now);
-		const lit = opened || focused || errorFlash || stage !== "none";
+		const active = pointed || focused;
+		const lit = opened || active || errorFlash || stage !== "none";
 		const accent: ThemeColor = style.fg ?? "activityText";
-		const rowCaret = expandable ? theme.fg(opened || focused ? accent : "activityText", opened ? "▾" : "▸") : " ";
+		const rowCaret = expandable ? theme.fg(opened || active ? accent : "activityText", opened ? "▾" : "▸") : " ";
+		// What a click would do, in the kind's color, ahead of the result.
+		const hint = expandable && active ? theme.fg(accent, opened ? "收起 ▴" : "点开 ▸") : "";
+		const result = rowRight(row, input);
+		const rowSide = hint && result ? `${hint}  ${result}` : hint || result;
 		const left = ` ${rowCaret} ${rowGlyph(row, style, timeline, input)} ${rowWords(row, style)}`;
 		const blockBg = lit ? style.hoverBg : style.bg;
 		body.push({
-			text: `${focused ? BOX_FOCUS_MARKER : ""}${paintBg(blockBg, `${spread(left, rowRight(row, input), Math.max(0, inner - 1))} `, inner)}`,
+			text: `${focused ? BOX_FOCUS_MARKER : ""}${paintBg(blockBg, `${spread(left, rowSide, Math.max(0, inner - 1))} `, inner)}`,
 			rowKey: row.key,
 			part: "head",
 		});
@@ -623,6 +629,10 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 						onClick: () => {
 							timeline.ui.toggleRow(key, Date.now());
 							input.onChange();
+						},
+						hoverKey: `${timeline.ui.id}:${key}`,
+						onHover: (hovered: boolean) => {
+							if (timeline.ui.setHover(key, hovered)) input.onChange();
 						},
 					}
 				: { passive: true, onClick: () => {} }),
