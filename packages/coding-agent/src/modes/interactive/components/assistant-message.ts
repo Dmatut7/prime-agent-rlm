@@ -124,6 +124,18 @@ class TimelineAnswerBody implements Component {
 	}
 }
 
+/**
+ * The summary's Markdown: a heading is bold in the normal text color (the
+ * renderer already bolds it) and list numbers and bullets are the time column's dim.
+ */
+function getSummaryMarkdownTheme(baseTheme: MarkdownTheme): MarkdownTheme {
+	return {
+		...baseTheme,
+		heading: (text: string) => text,
+		listBullet: (text: string) => theme.fg("timelineTime", text),
+	};
+}
+
 function getThinkingMarkdownTheme(baseTheme: MarkdownTheme): MarkdownTheme {
 	const quiet = (text: string) => theme.fg("thinkingText", text);
 	return {
@@ -455,18 +467,12 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 				// Set paddingY=0 to avoid extra spacing before tool executions
 				const mermaidTransform = this.mermaidTransform;
 				const isStreaming = this.isStreaming;
-				const markdown = new Markdown(
-					content.text.trim(),
-					timelineAnswer ? 0 : 1,
-					0,
-					this.markdownTheme,
-					undefined,
-					{
-						baseUrl: this.baseUrl,
-						transform:
-							mermaidTransform && ((md, availableWidth) => mermaidTransform(md, availableWidth, isStreaming)),
-					},
-				);
+				const markdownTheme = timelineAnswer ? getSummaryMarkdownTheme(this.markdownTheme) : this.markdownTheme;
+				const markdown = new Markdown(content.text.trim(), timelineAnswer ? 0 : 1, 0, markdownTheme, undefined, {
+					baseUrl: this.baseUrl,
+					transform:
+						mermaidTransform && ((md, availableWidth) => mermaidTransform(md, availableWidth, isStreaming)),
+				});
 				this.blockMarkdowns.set(i, markdown);
 				this.lastBlockTexts.set(i, content.text.trim());
 				if (timelineAnswer) {

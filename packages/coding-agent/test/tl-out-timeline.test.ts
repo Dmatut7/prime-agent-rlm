@@ -273,6 +273,23 @@ describe("the summary on the timeline", () => {
 		expect(heading).toContain(theme.bold("一句话结论"));
 	});
 
+	test("headings are bold in the normal text color and list markers take the time column's dim", () => {
+		const markdown = "## 标题\n\n1. 第一件\n2. 第二件\n\n- 一点";
+		const rows = quietAnswer(answer(markdown)).render(100);
+		const heading = rows.find((line) => stripAnsi(line).includes("标题")) ?? "";
+		expect(heading).toContain("\x1b[1m");
+		expect(heading).not.toContain(theme.getFgAnsi("mdHeading"));
+		for (const marker of ["1.", "2.", "-"]) {
+			const row = rows.find((line) => stripAnsi(line).includes(`${marker} `)) ?? "";
+			expect(row).toContain(`${theme.getFgAnsi("timelineTime")}${marker}`);
+			expect(row).not.toContain(theme.getFgAnsi("mdListBullet"));
+		}
+		// The same Markdown outside the summary keeps the theme's own heading and bullet colors.
+		const plainRows = new AssistantMessageComponent(answer(markdown), false, undefined, "思考", {}).render(100);
+		expect(plainRows.join("\n")).toContain(theme.getFgAnsi("mdHeading"));
+		expect(plainRows.join("\n")).toContain(theme.getFgAnsi("mdListBullet"));
+	});
+
 	test("the body starts on column 16 and wraps at the width minus 16", () => {
 		const long = "这是一段很长的回答，".repeat(20);
 		const rows = shown(quietAnswer(answer(long)).render(60));
