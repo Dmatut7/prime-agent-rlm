@@ -1,0 +1,1 @@
+- Added pinned headers to the fullscreen view: while the top of an open turn box has scrolled out of sight, its header stays at the top of the window, clicking it folds the box, and page keys and text selection leave the pinned rows alone.

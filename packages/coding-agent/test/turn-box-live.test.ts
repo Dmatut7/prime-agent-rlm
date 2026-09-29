@@ -498,7 +498,7 @@ describe("a quiet turn, live", () => {
 		expect(screen.chat.children.some((child) => child instanceof TurnStripComponent)).toBe(false);
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(box.state.boxLive).toBe(false);
-		expect(screen.screen()).toMatch(/▸ ✓ .*跑了 1 条命令/);
+		expect(screen.screen()).toMatch(/✓ 完成 .*跑了 1 条命令 .*›/);
 		expect(screen.screen()).toContain("都过了。");
 		expect(screen.chat.children.at(-1)).toBeInstanceOf(TurnStripComponent);
 		expect(vi.getTimerCount()).toBe(0);
@@ -668,7 +668,7 @@ describe("a quiet turn that ends without a run ending it", () => {
 		vi.advanceTimersByTime(SETTLE_MS);
 		const box = screen.boxes()[0]!;
 		expect(box.state.boxLive).toBe(false);
-		expect(screen.screen()).toMatch(/▸ ✗ /);
+		expect(screen.screen()).toMatch(/✗ 出错 .*›/);
 		expect(screen.opened(box)).toContain("重试没成功：模型一直不可用");
 		expect(vi.getTimerCount()).toBe(0);
 	});
@@ -740,7 +740,7 @@ describe("a quiet turn that ends without a run ending it", () => {
 		expect(screen.boxes()).toHaveLength(1);
 		expect(twin!.state.boxLive).toBe(false);
 		// Opened above, so it stays open.
-		expect(screen.screen()).toMatch(/▾ ✓ .*跑了 1 条命令/);
+		expect(screen.screen()).toMatch(/✓ 完成 .*跑了 1 条命令 .*⌄/);
 		expect(screen.opened(twin!)).not.toContain("连接断了");
 		expect(vi.getTimerCount()).toBe(0);
 	});
@@ -938,7 +938,7 @@ describe("a quiet turn across a chat rebuild", () => {
 		expect(twin!.state.boxLive).toBe(true);
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(twin!.state.boxLive).toBe(false);
-		expect(screen.screen()).toMatch(/▸ ✓ .*跑了 1 条命令/);
+		expect(screen.screen()).toMatch(/✓ 完成 .*跑了 1 条命令 .*›/);
 		expect(screen.chat.children.at(-1)).toBeInstanceOf(TurnStripComponent);
 		expect(vi.getTimerCount()).toBe(0);
 	});

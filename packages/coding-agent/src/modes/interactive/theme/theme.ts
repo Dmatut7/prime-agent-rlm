@@ -126,6 +126,18 @@ const ThemeJsonSchema = Type.Object({
 		cardFocusBg: Type.Optional(ColorValueSchema),
 		boxBorder: Type.Optional(ColorValueSchema),
 		boxBorderLive: Type.Optional(ColorValueSchema),
+		// The box header: a card row with a status pill (its own text and background per outcome)
+		boxHeadBg: Type.Optional(ColorValueSchema),
+		boxHeadLiveBg: Type.Optional(ColorValueSchema),
+		boxHeadHoverBg: Type.Optional(ColorValueSchema),
+		boxPillLive: Type.Optional(ColorValueSchema),
+		boxPillLiveBg: Type.Optional(ColorValueSchema),
+		boxPillDone: Type.Optional(ColorValueSchema),
+		boxPillDoneBg: Type.Optional(ColorValueSchema),
+		boxPillStopped: Type.Optional(ColorValueSchema),
+		boxPillStoppedBg: Type.Optional(ColorValueSchema),
+		boxPillError: Type.Optional(ColorValueSchema),
+		boxPillErrorBg: Type.Optional(ColorValueSchema),
 		// Per-kind timeline colors: a step block's glyph, its background and its background under the pointer
 		kindThink: Type.Optional(ColorValueSchema),
 		kindCommand: Type.Optional(ColorValueSchema),
@@ -239,6 +251,10 @@ export type ThemeColor =
 	| "diffRemovedText"
 	| "boxBorder"
 	| "boxBorderLive"
+	| "boxPillLive"
+	| "boxPillDone"
+	| "boxPillStopped"
+	| "boxPillError"
 	| "kindThink"
 	| "kindCommand"
 	| "kindRead"
@@ -268,6 +284,13 @@ export type ThemeBg =
 	| "rowFlashBg"
 	| "rowFlashFadeBg"
 	| "cardFocusBg"
+	| "boxHeadBg"
+	| "boxHeadLiveBg"
+	| "boxHeadHoverBg"
+	| "boxPillLiveBg"
+	| "boxPillDoneBg"
+	| "boxPillStoppedBg"
+	| "boxPillErrorBg"
 	| "kindThinkBg"
 	| "kindThinkHoverBg"
 	| "kindCommandBg"
@@ -889,6 +912,17 @@ const CONVERSATION_LAYER_FALLBACKS: Record<string, string> = {
 	cardFocusBg: "selectedBg",
 	boxBorder: "borderMuted",
 	boxBorderLive: "borderMuted",
+	boxHeadBg: "customMessageBg",
+	boxHeadLiveBg: "customMessageBg",
+	boxHeadHoverBg: "selectedBg",
+	boxPillLive: "runCardWarn",
+	boxPillLiveBg: "customMessageBg",
+	boxPillDone: "diffAddedText",
+	boxPillDoneBg: "customMessageBg",
+	boxPillStopped: "dim",
+	boxPillStoppedBg: "customMessageBg",
+	boxPillError: "error",
+	boxPillErrorBg: "customMessageBg",
 	kindThink: "memoryAccent",
 	kindCommand: "activityAccent",
 	kindRead: "accent",
@@ -939,6 +973,13 @@ function createTheme(themeJson: ThemeJson, mode?: ColorMode, sourcePath?: string
 		"rowFlashBg",
 		"rowFlashFadeBg",
 		"cardFocusBg",
+		"boxHeadBg",
+		"boxHeadLiveBg",
+		"boxHeadHoverBg",
+		"boxPillLiveBg",
+		"boxPillDoneBg",
+		"boxPillStoppedBg",
+		"boxPillErrorBg",
 		"kindThinkBg",
 		"kindThinkHoverBg",
 		"kindCommandBg",

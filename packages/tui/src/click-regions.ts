@@ -47,3 +47,30 @@ export interface ClickRegion {
 	 */
 	onHover?: (hovered: boolean) => void;
 }
+
+/**
+ * A header a component keeps on screen while the rows it heads scroll under the
+ * top of the fullscreen transcript window (the header of a box taller than the
+ * screen). Containers aggregate these with line offsets, like click regions.
+ *
+ * The window pins the innermost header whose `line` is above its top edge and
+ * whose box still has room below for the pinned rows before `endLine`. It paints
+ * at most three rows of `render`'s output (fewer in a short window), cut to the
+ * width, over the top rows of the window. Pinned rows are not selectable text, a
+ * click on the pinned header keeps its row in view if the box shrinks, and a
+ * region's `revealBelow` is ignored there. Inline mode never pins.
+ */
+export interface StickyHeader {
+	/** Zero-based line of the header's first row within the component's rendered output. */
+	line: number;
+	/** Zero-based line of the last row the header belongs to (the end of its box). */
+	endLine: number;
+	/**
+	 * Rows painted over the top of the transcript window while the header is
+	 * pinned. `scrolledPast` counts this component's rows from `line` that sit
+	 * above the window's top edge, so the header can say what is out of sight.
+	 */
+	render(scrolledPast: number): readonly string[];
+	/** Click regions of the pinned rows, in the coordinates of `render`'s output. */
+	regions?: ReadonlyArray<ClickRegion>;
+}

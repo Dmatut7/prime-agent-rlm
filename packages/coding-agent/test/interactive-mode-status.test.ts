@@ -366,9 +366,9 @@ describe("InteractiveMode.renderSessionContext", () => {
 			.replace(/\u001b\[[0-9;]*m/g, "");
 		// The folded box says the run was stopped and keeps the work done so far.
 		expect(line).toContain("◆ prime  test-model");
-		expect(line).toMatch(/▸ ■ 已停止 · 做到第 2 步/);
+		expect(line).toMatch(/■ 已停止 +做到第 2 步/);
 		// 1000 (first assistant) -> 2000 (abort stamp): 1 second, a fixed value.
-		expect(line).toMatch(/1秒 · ↓ \d+ │/);
+		expect(line).toMatch(/1秒 · ↓ \d+ ›/);
 		// Frozen: repeated renders reuse the settled cache.
 		const first = summary!.render(120);
 		expect(summary!.render(120)).toBe(first);
@@ -398,7 +398,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 		// with the finished step as a settled row.
 		// Column 1: the header keeps the one-column margin every chat row keeps.
 		expect(line).toMatch(/^ ◆ prime {2}test-model\n/);
-		expect(line).toContain("▾");
+		expect(line).toContain("⌄");
 		expect(line).toContain("等待模型回应");
 		expect(line).toMatch(/✓ 运行命令/);
 	});

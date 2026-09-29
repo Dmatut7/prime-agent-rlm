@@ -1,4 +1,11 @@
-import { type Component, type Focusable, getKeybindings, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	type ClickRegion,
+	type Component,
+	type Focusable,
+	getKeybindings,
+	truncateToWidth,
+	visibleWidth,
+} from "@earendil-works/pi-tui";
 import type { ContextTreeNode } from "../../../core/context-tree.js";
 import { nodeSpendMoney, type SpendPricing, spendRelevantTokens } from "../../../core/spend-pricing.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../../agent-connection/index.js";
@@ -7,36 +14,35 @@ import { type AgentRosterStatus, classifyAgentStatus } from "../../daemon/agent-
 import { classifySessionRosterStatus, type SessionSummary } from "../../daemon/daemon-session-list.js";
 import { formatTokenCount } from "../agent-activity.js";
 import { formatSpendCost } from "../spend-format.js";
-import { theme } from "../theme/theme.js";
+import { type ThemeBg, type ThemeColor, theme } from "../theme/theme.js";
 import { keyText } from "./keybinding-hints.js";
 
-/** Bound on stall marker lines so a wedged family cannot push the editor off screen. */
-const MAX_RENDERED_STALL_MARKERS = 3;
+/** Leading indent of the strip. */
+const STRIP_INDENT = 1;
 
-/**
- * U6 group gap (DS2 F7): the same four-space rhythm as the watermark line
- * above - the two status lines read as one block. The full second line -
- * counts, spend cell with annotations, and the hint - still fits 78 columns
- * with the wider gaps, under the 80-column floor.
- */
-/** Blank space always kept between the spend cell and the open hint. */
-const SPEND_MIN_GAP = 1;
+/** Blank columns between two blocks. */
+const CHIP_GAP = 1;
 
-/** Leading indent of the panel header. */
-const LINE_INDENT = " ";
+/** Widest name inside a block before it is cut. */
+const CHIP_NAME_MAX_WIDTH = 16;
 
-/** Widest name column before names truncate. */
-const ROW_NAME_MAX_WIDTH = 16;
+/** Blank columns the hint keeps clear of the row's right edge. */
+const HINT_MARGIN = 1;
 
-/** Narrowest activity column worth showing; below it the column drops. */
-const ROW_ACTIVITY_MIN_WIDTH = 8;
-
-const ROW_STATE_WORDS: Record<SubagentPanelRowState, string> = {
-	running: "运行",
+const CHIP_STATE_WORDS: Record<SubagentPanelRowState, string> = {
+	running: "运行中",
 	idle: "空闲",
-	done: "完成",
-	failed: "出错",
-	stalled: "卡住",
+	done: "✓ 已交回",
+	failed: "✗ 出错",
+	stalled: "⚠ 卡住",
+};
+
+const CHIP_STATE_COLORS: Record<SubagentPanelRowState, ThemeColor> = {
+	running: "kindCommand",
+	idle: "dim",
+	done: "success",
+	failed: "error",
+	stalled: "error",
 };
 
 /**
@@ -211,9 +217,6 @@ export interface SubagentPanelRow {
 	 */
 	acknowledged?: boolean;
 }
-
-/** Rows shown at once; the rest scroll into view as the selection moves. */
-export const SUBAGENT_PANEL_MAX_ROWS = 4;
 
 const ROW_STATE_ORDER: Record<SubagentPanelRowState, number> = {
 	stalled: 0,
@@ -407,60 +410,107 @@ export class TrayInfoLine implements Component {
 	}
 }
 
+/** One block of the strip: a child, a stalled descendant without a row of its own, or the family counts. */
+interface StripItem {
+	key: string;
+	kind: "row" | "orphan" | "counts";
+	/** What Enter or a click opens; absent for the blocks that open the family view. */
+	row?: SubagentPanelRow;
+	name: string;
+	state?: SubagentPanelRowState;
+}
+
+interface StripLayout {
+	width: number;
+	start: number;
+	count: number;
+	maxStart: number;
+}
+
+function leftMarkerText(hidden: number): string {
+	return `‹ 还有 ${hidden} 个`;
+}
+
+function rightMarkerText(hidden: number): string {
+	return `还有 ${hidden} 个 ›`;
+}
+
+/** The narrowest cut of `text` that still shows its first character (with the cut mark when more follows). */
+function minCutWidth(text: string): number {
+	const full = visibleWidth(text);
+	for (let width = 1; width < full; width++) {
+		const cut = truncateToWidth(text, width, "…");
+		if (cut !== "" && cut !== "…") return width;
+	}
+	return full;
+}
+
+/**
+ * The subagent strip under the prompt: one row of small blocks, one per child,
+ * ` ◇ review 运行中 `, in most-relevant-first order. When they do not all fit the
+ * row pages sideways (`‹ 还有 2 个` / `还有 3 个 ›`, the wheel over the row, or
+ * the arrow keys once it has focus). A click on a block, or Enter on the
+ * selected one, opens that child. The row never takes more than one line.
+ */
 export class SubagentSummaryLine implements Component, Focusable {
 	focused = false;
 	private counts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
 	private spend: SubagentSpendSummary | undefined;
 	private stallMarkers: readonly string[] = [];
 	private rows: readonly SubagentPanelRow[] = [];
-	private selectedRow = 0;
+	private items: readonly StripItem[] = [];
+	private itemsDirty = true;
+	private widthPrefix: number[] = [0];
+	private selectedKey: string | undefined;
+	private selectedIndex = 0;
 	private windowStart = 0;
+	private hoveredKey: string | undefined;
 	private openable = false;
+	private focusedAtLastRender = false;
+	private layout: StripLayout | undefined;
+	private regions: ClickRegion[] = [];
 	private cachedWidth?: number;
 	private cachedKey?: string;
 	private cachedLines?: string[];
 
-	/** Enter/open: the selected row, when the panel lists rows. */
+	/** Enter, or a click on a block: the child it stands for; `undefined` opens the family view. */
 	onOpen?: (row: SubagentPanelRow | undefined) => void;
-	/** The configurable stop-all-subagents key, pressed while the panel has focus. */
+	/** The configurable stop-all-subagents key, pressed while the strip has focus. */
 	onStopAll?: () => void;
 	onCancel?: () => void;
 	onChatAction?: (data: string) => void;
 
 	setSubagentCounts(counts: SubagentSummaryCounts): void {
 		this.counts = counts;
+		this.itemsDirty = true;
 	}
 
 	/**
-	 * Spend figure for the blank area between the counts and the open hint.
-	 * `undefined` (or an all-zero summary) keeps the cell blank: no sub-agents,
-	 * no data yet, or nothing spent - a ¥0.00 tile would be noise, not a figure.
+	 * The family's spend figure. The strip does not draw it: the status line under
+	 * it reads it back with getSubagentSpend and shows it on its right side.
 	 */
 	setSubagentSpend(spend: SubagentSpendSummary | undefined): void {
 		this.spend = spend;
 	}
 
-	/**
-	 * Per-child stall markers (see formatSubagentStallMarker). Rendered in the
-	 * error color below the counts box: a stalled child still counts as running,
-	 * so without this line a wedged subagent is indistinguishable from progress.
-	 */
-	setStallMarkers(markers: readonly string[]): void {
-		this.stallMarkers = markers;
+	getSubagentSpend(): SubagentSpendSummary | undefined {
+		return this.spend;
 	}
 
 	/**
-	 * Per-child rows (see buildSubagentPanelRows). With rows the panel lists each
-	 * child and a stall shows as the row's state; without them (a roster-only
-	 * family) the header stands alone and stall markers keep their own lines.
+	 * Per-child stall markers (see formatSubagentStallMarker). A marker whose
+	 * child has a block of its own is already said there (`⚠ 卡住`); one without
+	 * (a roster-only descendant) becomes a red block in the same row.
 	 */
+	setStallMarkers(markers: readonly string[]): void {
+		this.stallMarkers = markers;
+		this.itemsDirty = true;
+	}
+
+	/** Per-child rows (see buildSubagentPanelRows), most relevant first: one block each. */
 	setSubagentRows(rows: readonly SubagentPanelRow[]): void {
-		// Keep the selection on the same child when the rows reorder (a child
-		// finishing moves down the list), else clamp it into range.
-		const selectedId = this.rows[this.selectedRow]?.id;
 		this.rows = rows;
-		const kept = selectedId === undefined ? -1 : rows.findIndex((row) => row.id === selectedId);
-		this.selectedRow = kept !== -1 ? kept : Math.min(this.selectedRow, Math.max(0, rows.length - 1));
+		this.itemsDirty = true;
 	}
 
 	setOpenable(openable: boolean): void {
@@ -468,27 +518,38 @@ export class SubagentSummaryLine implements Component, Focusable {
 	}
 
 	isSelectable(): boolean {
-		return this.counts.total > 0 && this.openable;
+		return this.openable && this.getItems().length > 0;
+	}
+
+	/**
+	 * Whether the strip shows a block per child. The status line drops its own
+	 * `◇ N 个子代理在跑` chip only while it does; a family the roster counts but no
+	 * snapshot describes has just the one counts block.
+	 */
+	hasChipRow(): boolean {
+		return this.counts.total > 0 && this.rows.length > 0;
+	}
+
+	getClickRegions(): ReadonlyArray<ClickRegion> {
+		return this.regions;
 	}
 
 	handleInput(data: string): void {
 		const keybindings = getKeybindings();
+		if (keybindings.matches(data, "app.subagents.prev")) {
+			this.moveSelection(-1);
+			return;
+		}
+		if (keybindings.matches(data, "app.subagents.next")) {
+			this.moveSelection(1);
+			return;
+		}
 		if (keybindings.matches(data, "tui.select.confirm") || keybindings.matches(data, "app.agents.open")) {
-			if (this.isSelectable()) this.onOpen?.(this.rows[this.selectedRow]);
+			if (this.isSelectable()) this.open(this.getItems()[this.selectedIndex]);
 			return;
 		}
 		if (keybindings.matches(data, "app.subagents.stopAll")) {
 			this.onStopAll?.();
-			return;
-		}
-		if (keybindings.matches(data, "tui.select.up") && this.selectedRow > 0) {
-			this.selectedRow -= 1;
-			this.invalidate();
-			return;
-		}
-		if (keybindings.matches(data, "tui.select.down") && this.selectedRow < this.rows.length - 1) {
-			this.selectedRow += 1;
-			this.invalidate();
 			return;
 		}
 		if (
@@ -496,11 +557,14 @@ export class SubagentSummaryLine implements Component, Focusable {
 			keybindings.matches(data, "tui.select.cancel") ||
 			keybindings.matches(data, "app.agents.back")
 		) {
-			this.selectedRow = 0;
-			this.windowStart = 0;
+			this.selectedIndex = 0;
+			this.selectedKey = this.getItems()[0]?.key;
+			this.invalidate();
 			this.onCancel?.();
 			return;
 		}
+		// One row has no line below it: Down stays here instead of typing into the prompt.
+		if (keybindings.matches(data, "tui.select.down")) return;
 		this.onChatAction?.(data);
 	}
 
@@ -511,7 +575,8 @@ export class SubagentSummaryLine implements Component, Focusable {
 		}
 		const lines = this.renderLines(width);
 		this.cachedWidth = width;
-		this.cachedKey = key;
+		// Rendering may settle the window (a clamp, a follow): key on the settled state.
+		this.cachedKey = this.cacheKey();
 		this.cachedLines = lines;
 		return lines;
 	}
@@ -522,92 +587,265 @@ export class SubagentSummaryLine implements Component, Focusable {
 			this.counts.running,
 			this.counts.idle,
 			this.counts.inactive,
-			this.spendKey(),
 			this.openable ? 1 : 0,
 			this.focused ? 1 : 0,
-			this.stallMarkers.join("\u0000"),
-			this.selectedRow,
-			this.rows
-				.map((row) => [row.id, row.name, row.state, row.elapsedMs ?? "", row.activity ?? ""].join("\u0003"))
+			this.selectedKey ?? "",
+			this.windowStart,
+			this.hoveredKey ?? "",
+			this.getItems()
+				.map((item) => [item.key, item.name, item.state ?? ""].join("\u0003"))
 				.join("\u0000"),
 		].join("\u0001");
 	}
 
-	/** Cache identity of the spend cell; the rendered figure changes with every field. */
-	private spendKey(): string {
-		const spend = this.spend;
-		if (!spend) return "";
-		return [
-			spend.cost,
-			spend.tokens,
-			spend.parentCost,
-			spend.unpriced.map((entry) => `${entry.model}:${entry.tokens}`).join(","),
-			(spend.overridePriced ?? []).map((entry) => `${entry.model}:${entry.tokens}`).join(","),
-			spend.partial ? 1 : 0,
-		].join("\u0002");
+	/** The blocks in row order: red stall blocks first, then the children, or the counts block when no child is known. */
+	private getItems(): readonly StripItem[] {
+		if (!this.itemsDirty) return this.items;
+		this.itemsDirty = false;
+		const items: StripItem[] = [];
+		if (this.counts.total > 0) {
+			const named = new Set(this.rows.map((row) => row.name));
+			const seen = new Set<string>();
+			for (const marker of this.stallMarkers) {
+				const name = stallMarkerName(marker);
+				if (named.has(name) || seen.has(name)) continue;
+				seen.add(name);
+				items.push({ key: `orphan:${name}`, kind: "orphan", name });
+			}
+			if (this.rows.length > 0) {
+				for (const row of this.rows) {
+					items.push({ key: `row:${row.id}`, kind: "row", row, name: row.name, state: row.state });
+				}
+			} else {
+				items.push({ key: "counts", kind: "counts", name: "" });
+			}
+		}
+		this.items = items;
+		this.widthPrefix = [0];
+		for (const item of items) this.widthPrefix.push((this.widthPrefix.at(-1) ?? 0) + this.chipWidth(item));
+		// Keep the selection on the same child when the blocks reorder (a child finishing moves down).
+		const kept = this.selectedKey === undefined ? -1 : items.findIndex((item) => item.key === this.selectedKey);
+		this.selectedIndex = kept !== -1 ? kept : Math.min(this.selectedIndex, Math.max(0, items.length - 1));
+		this.selectedKey = items[this.selectedIndex]?.key;
+		return items;
 	}
 
-	/**
-	 * The rows on screen: a window of SUBAGENT_PANEL_MAX_ROWS that follows the
-	 * selection while the panel has focus, so every child is reachable with the
-	 * arrow keys; unfocused it shows the most relevant rows from the top.
-	 */
-	private visibleWindow(): { start: number; rows: readonly SubagentPanelRow[] } {
-		const size = Math.min(this.rows.length, SUBAGENT_PANEL_MAX_ROWS);
-		if (!this.focused) return { start: 0, rows: this.rows.slice(0, size) };
-		// The window moves only when the selection would leave it, like any list.
-		let start = Math.min(this.windowStart, this.rows.length - size);
-		if (this.selectedRow < start) start = this.selectedRow;
-		if (this.selectedRow >= start + size) start = this.selectedRow - size + 1;
-		this.windowStart = Math.max(0, start);
-		return { start: this.windowStart, rows: this.rows.slice(this.windowStart, this.windowStart + size) };
+	private open(item: StripItem | undefined): void {
+		if (!item || !this.openable) return;
+		this.onOpen?.(item.row);
 	}
 
-	/**
-	 * The subagent panel: a dim rule header with the family counts on the left
-	 * and the spend plus the open hint on the right -
-	 * ` 子代理 3  运行 2 · 收口 1 ────── 子代理 ¥12.40 · 592M tok ｜ 全部 ¥18.95  ↓ 选择 ─` -
-	 * then one row per child, most relevant first:
-	 * `   ● review   运行 2:14   读取 footer.ts`. Focus moves a ` › ` selector
-	 * over the rows. No children hides the panel.
-	 */
+	private moveSelection(delta: -1 | 1): void {
+		const items = this.getItems();
+		const next = Math.max(0, Math.min(items.length - 1, this.selectedIndex + delta));
+		if (next === this.selectedIndex) return;
+		this.selectedIndex = next;
+		this.selectedKey = items[next]?.key;
+		if (this.layout) this.followSelection(this.layout.width);
+		this.invalidate();
+	}
+
+	/** How many blocks fit from `start` in `width` columns, counting the markers the row then needs. */
+	private fitCount(start: number, width: number): number {
+		const total = this.items.length;
+		const leftWidth = start > 0 ? visibleWidth(leftMarkerText(start)) + CHIP_GAP : 0;
+		const fits = (count: number): boolean => {
+			const end = start + count;
+			const blocks = (this.widthPrefix[end] ?? 0) - (this.widthPrefix[start] ?? 0) + (count - 1) * CHIP_GAP;
+			const rightWidth = end < total ? CHIP_GAP + visibleWidth(rightMarkerText(total - end)) : 0;
+			return STRIP_INDENT + leftWidth + blocks + rightWidth <= width;
+		};
+		// The needed width only grows with the count, so the largest count that fits is found by bisection.
+		let low = 1;
+		let high = Math.max(1, total - start);
+		while (low < high) {
+			const middle = Math.ceil((low + high) / 2);
+			if (fits(middle)) low = middle;
+			else high = middle - 1;
+		}
+		return low;
+	}
+
+	/** The furthest the row scrolls: the first start from which every remaining block is on screen. */
+	private lastStart(width: number): number {
+		const total = this.items.length;
+		for (let start = 0; start < total; start++) {
+			if (start + this.fitCount(start, width) >= total) return start;
+		}
+		return Math.max(0, total - 1);
+	}
+
+	/** Scroll just far enough to bring the selected block into view. */
+	private followSelection(width: number): void {
+		let start = this.windowStart;
+		if (this.selectedIndex < start) {
+			start = this.selectedIndex;
+		} else {
+			while (start < this.selectedIndex && this.selectedIndex >= start + this.fitCount(start, width)) start += 1;
+		}
+		this.windowStart = start;
+	}
+
+	/** Where the previous screenful starts: the first start whose blocks reach the current one. */
+	private previousPageStart(start: number, width: number): number {
+		for (let candidate = 0; candidate < start; candidate++) {
+			if (candidate + this.fitCount(candidate, width) >= start) return candidate;
+		}
+		return Math.max(0, start - 1);
+	}
+
+	private scrollTo(start: number): void {
+		const layout = this.layout;
+		if (!layout) return;
+		this.windowStart = Math.max(0, Math.min(layout.maxStart, start));
+		this.invalidate();
+	}
+
+	/** Wheel over the row: one block sideways; false at either end, so the page scrolls instead. */
+	private wheel(direction: -1 | 1): boolean {
+		const layout = this.layout;
+		if (!layout) return false;
+		const next = Math.max(0, Math.min(layout.maxStart, layout.start + direction));
+		if (next === layout.start) return false;
+		this.scrollTo(next);
+		return true;
+	}
+
 	private renderLines(width: number): string[] {
-		if (this.counts.total === 0) return [];
+		const items = this.getItems();
+		this.regions = [];
+		this.layout = undefined;
+		if (items.length === 0) return [];
 		const safeWidth = Math.max(1, width);
-		const lines = [this.renderHeader(safeWidth)];
-		if (!this.focused && this.rows.length > 0 && this.rows.every(isSettledPanelRow)) {
-			// Nothing in flight: finished children would otherwise sit there as a
-			// block of rows until they close. One line says so; the header's ↓ still lists them.
-			lines.push(theme.fg("dim", truncateToWidth(`   ${this.settledFoldText()}`, safeWidth, "…")));
-			return lines;
+		if (this.focused && !this.focusedAtLastRender) this.followSelection(safeWidth);
+		this.focusedAtLastRender = this.focused;
+		const maxStart = this.lastStart(safeWidth);
+		this.windowStart = Math.max(0, Math.min(maxStart, this.windowStart));
+		const start = this.windowStart;
+		const count = this.fitCount(start, safeWidth);
+		this.layout = { width: safeWidth, start, count, maxStart };
+		const onWheel = (direction: -1 | 1): boolean => this.wheel(direction);
+		const regions: ClickRegion[] = [];
+		const room = (used: number): number => Math.max(1, safeWidth - used);
+
+		// A block always says at least the first character of its name: on a screen too narrow for that
+		// beside the `‹` marker the marker steps aside, and on one too narrow for it at all the block is left to the `›` marker.
+		const firstItem = items[start];
+		const minFirst = firstItem ? this.minChipWidth(firstItem) : 0;
+		let line = " ".repeat(Math.min(STRIP_INDENT, safeWidth));
+		let col = visibleWidth(line);
+		const leftSpan = start > 0 ? visibleWidth(leftMarkerText(start)) + CHIP_GAP : 0;
+		const showLeft = start > 0 && safeWidth - col - leftSpan >= minFirst;
+		const end = safeWidth - col - (showLeft ? leftSpan : 0) >= minFirst ? start + count : start;
+		if (showLeft) {
+			const marker = leftMarkerText(start);
+			const markerWidth = visibleWidth(marker);
+			regions.push({
+				line: 0,
+				col,
+				width: markerWidth,
+				height: 1,
+				onClick: () => this.scrollTo(this.previousPageStart(start, safeWidth)),
+				onWheel,
+			});
+			line += `${theme.fg("dim", marker)} `;
+			col += markerWidth + CHIP_GAP;
 		}
-		const { start, rows: shown } = this.visibleWindow();
-		if (start > 0) {
-			lines.push(theme.fg("dim", truncateToWidth(`   ↑ 上面还有 ${start} 个`, safeWidth, "")));
+		for (let index = start; index < end; index++) {
+			const item = items[index];
+			if (!item) continue;
+			const selected = this.focused && index === this.selectedIndex;
+			const hovered = this.hoveredKey === item.key;
+			const chip = this.buildChip(item, selected, hovered, CHIP_NAME_MAX_WIDTH, room(col));
+			regions.push({
+				line: 0,
+				col,
+				width: chip.width,
+				height: 1,
+				// The frame may be cached from before the row changed: open what the block is now.
+				onClick: () => this.open(this.getItems().find((current) => current.key === item.key)),
+				onWheel,
+				// A block that cannot be opened has nothing to light up for.
+				...(this.openable
+					? {
+							hoverKey: `subagent-chip:${item.key}`,
+							onHover: (isHovered: boolean) => {
+								if (isHovered) this.hoveredKey = item.key;
+								else if (this.hoveredKey === item.key) this.hoveredKey = undefined;
+								this.invalidate();
+							},
+						}
+					: {}),
+			});
+			line += chip.text;
+			col += chip.width;
+			if (index < end - 1) {
+				line += " ".repeat(CHIP_GAP);
+				col += CHIP_GAP;
+			}
 		}
-		shown.forEach((row, index) => {
-			lines.push(this.renderRow(row, safeWidth, this.focused && start + index === this.selectedRow));
-		});
-		const below = this.rows.length - start - shown.length;
-		if (below > 0) {
-			// Unfocused, the header's `↓ 选择` is the way in; focused, the arrow scrolls on.
-			const fold = this.focused ? `   ↓ 下面还有 ${below} 个` : `   … 还有 ${below} 个`;
-			lines.push(theme.fg("dim", truncateToWidth(fold, safeWidth, "")));
+		if (end < items.length) {
+			const marker = rightMarkerText(items.length - end);
+			const markerWidth = visibleWidth(marker);
+			line += " ".repeat(CHIP_GAP);
+			col += CHIP_GAP;
+			if (col + markerWidth <= safeWidth) {
+				regions.push({
+					line: 0,
+					col,
+					width: markerWidth,
+					height: 1,
+					onClick: () => this.scrollTo(start + count),
+					onWheel,
+				});
+				line += theme.fg("dim", marker);
+				col += markerWidth;
+			}
 		}
-		// A stalled session with a row already reads 卡住 there; one without a row
-		// (roster-only, or folded past the row cap) keeps its marker line, so a
-		// wedged descendant is never invisible.
-		const shownNames = new Set(shown.map((row) => row.name));
-		const orphanMarkers = this.stallMarkers.filter((marker) => !shownNames.has(stallMarkerName(marker)));
-		for (const marker of orphanMarkers.slice(0, MAX_RENDERED_STALL_MARKERS)) {
-			lines.push(theme.fg("error", truncateToWidth(`  ⚠ ${marker}`, safeWidth, "…")));
+		const hint = this.pickHint(safeWidth - col);
+		if (hint) {
+			line += " ".repeat(safeWidth - col - visibleWidth(hint) - HINT_MARGIN) + theme.fg("dim", hint);
 		}
-		return lines;
+		regions.push({ line: 0, col: 0, width: safeWidth, height: 1, passive: true, onClick: () => {}, onWheel });
+		this.regions = regions;
+		return [truncateToWidth(line, safeWidth, "")];
+	}
+
+	/** The widest hint that fits in `space` free columns, or nothing. */
+	private pickHint(space: number): string | undefined {
+		for (const hint of this.hintCandidates()) {
+			if (visibleWidth(hint) + 2 + HINT_MARGIN <= space) return hint;
+		}
+		return undefined;
+	}
+
+	private hintCandidates(): string[] {
+		if (!this.openable) return [];
+		const key = (binding: Parameters<typeof keyText>[0]): string => keyText(binding, { primaryOnly: true });
+		const say = (keys: string, words: string): string => (keys ? `${keys} ${words}` : "");
+		if (this.focused) {
+			const move = say([key("app.subagents.prev"), key("app.subagents.next")].filter(Boolean).join("/"), "选");
+			const enter = say(key("tui.select.confirm"), "进去");
+			const back = say(key("tui.select.cancel"), "返回");
+			const stop = this.rows.some((row) => row.state === "running" || row.state === "stalled")
+				? say(keyText("app.subagents.stopAll"), "全部停止")
+				: "";
+			return [[move, enter, back, stop], [move, enter, back], [enter, back], [back]]
+				.map((parts) => parts.filter(Boolean).join(" · "))
+				.filter(Boolean);
+		}
+		const enterHint = say(key("tui.editor.cursorDown"), "选一个进去看");
+		if (!enterHint) return [];
+		if (this.rows.length > 0 && this.rows.every(isSettledPanelRow)) {
+			return [`${this.settledFoldText()} · ${enterHint}`, this.settledFoldText(), enterHint];
+		}
+		return [enterHint];
 	}
 
 	/**
-	 * The fold line. "闲置一阵后会自动关闭" is only promised while some child is still
-	 * resident (idle); once they are all closed the line says so instead.
+	 * What became of a family whose children are all done. "闲置一阵后会自动关闭" is
+	 * only promised while some child is still resident (idle); once they are all
+	 * closed the text says so instead.
 	 */
 	private settledFoldText(): string {
 		const seenFailures = this.rows.filter((row) => row.state === "failed").length;
@@ -617,175 +855,145 @@ export class SubagentSummaryLine implements Component, Focusable {
 			: `${head}，已自动关闭（记录保留）`;
 	}
 
-	private renderHeader(safeWidth: number): string {
-		const counts = this.renderCounts();
-		const left = `${LINE_INDENT}${theme.fg("muted", `子代理 ${this.counts.total}`)}${counts ? `  ${counts}` : ""}`;
-		const rowsSelectable = this.rows.length > 0;
-		const anyWorking = this.rows.some((row) => row.state === "running" || row.state === "stalled");
-		const stopHint = this.focused && anyWorking ? `${keyText("app.subagents.stopAll")} 全部停止` : "";
-		const openHint = this.openable
-			? this.focused
-				? rowsSelectable
-					? stopHint
-					: `${keyText("tui.select.confirm")}/${keyText("app.agents.open")} 打开`
-				: `${keyText("tui.editor.cursorDown", { primaryOnly: true })} 选择`
-			: stopHint;
-		// F5 (DS2 review): the open hint never participates in truncation; the
-		// spend cell degrades (whole rungs) inside what the hint leaves, and a
-		// truncated money figure is never shown.
-		const tail = ` ${theme.fg("dim", "─")}`;
-		const hint = openHint ? `  ${theme.fg("dim", openHint)}` : "";
-		const minRule = 2;
-		const spendBudget =
-			safeWidth - visibleWidth(left) - visibleWidth(hint) - visibleWidth(tail) - minRule - 2 - SPEND_MIN_GAP;
-		const spend = this.renderSpend(Math.max(0, spendBudget));
-		const right = `${spend}${spend ? hint : hint.trimStart()}${tail}`;
-		const ruleWidth = safeWidth - visibleWidth(left) - visibleWidth(right) - 2;
-		const header =
-			ruleWidth >= minRule
-				? `${left} ${theme.fg("dim", "─".repeat(ruleWidth))} ${right}`
-				: `${truncateToWidth(left, Math.max(1, safeWidth - visibleWidth(hint)), "…")}${hint}`;
-		const fitted = truncateToWidth(header, safeWidth, "");
-		const padded = fitted + " ".repeat(Math.max(0, safeWidth - visibleWidth(fitted)));
-		// Without rows the header itself is the focus target.
-		if (this.focused && !rowsSelectable) {
-			return padded
-				.split("\x1b[0m")
-				.map((segment) => theme.bg("selectedBg", segment))
-				.join("\x1b[0m");
-		}
-		return padded;
-	}
-
-	private renderRow(row: SubagentPanelRow, safeWidth: number, selected: boolean): string {
-		const glyph =
-			row.state === "running"
-				? theme.fg("accent", "●")
-				: row.state === "idle"
-					? theme.fg("dim", "○")
-					: row.state === "done"
-						? theme.fg("success", "✓")
-						: theme.fg("error", "✗");
-		const prefix = selected ? ` ${theme.fg("accent", "›")} ` : "   ";
-		const nameWidth = Math.min(
-			ROW_NAME_MAX_WIDTH,
-			Math.max(...this.rows.map((entry) => visibleWidth(entry.name)), 4),
-		);
-		const name = truncateToWidth(row.name, nameWidth, "…");
-		const namePadded = name + " ".repeat(Math.max(0, nameWidth - visibleWidth(name)));
-		const stateText = `${ROW_STATE_WORDS[row.state]}${row.elapsedMs !== undefined ? ` ${formatSubagentElapsed(row.elapsedMs)}` : ""}`;
-		const stateColor = row.state === "failed" || row.state === "stalled" ? "error" : "muted";
-		const statePadded = stateText + " ".repeat(Math.max(0, 10 - visibleWidth(stateText)));
-		const head = `${prefix}${glyph} ${theme.fg("text", namePadded)}   ${theme.fg(stateColor, statePadded)}`;
-		const actions = selected && this.openable ? `${keyText("tui.select.confirm")} 打开 ` : "";
-		const available = safeWidth - visibleWidth(head) - 3 - (actions ? visibleWidth(actions) + 2 : 0);
-		const activity =
-			row.activity && available >= ROW_ACTIVITY_MIN_WIDTH
-				? `   ${theme.fg(row.state === "stalled" ? "error" : "dim", truncateToWidth(row.activity, available, "…"))}`
-				: "";
-		let line = truncateToWidth(`${head}${activity}`, safeWidth, "");
-		if (actions && visibleWidth(line) + visibleWidth(actions) + 1 <= safeWidth) {
-			line += " ".repeat(safeWidth - visibleWidth(line) - visibleWidth(actions)) + theme.fg("dim", actions);
-		}
-		if (!selected) return line;
-		const padded = line + " ".repeat(Math.max(0, safeWidth - visibleWidth(line)));
-		return padded
-			.split("\x1b[0m")
-			.map((segment) => theme.bg("selectedBg", segment))
-			.join("\x1b[0m");
-	}
-
-	/** `运行 1 · 空闲 0 · 收口 2` — zero-count classes are skipped entirely. */
-	private renderCounts(): string {
-		const parts: string[] = [];
-		if (this.counts.running > 0) {
-			parts.push(theme.fg("success", `运行 ${this.counts.running}`));
-		}
-		if (this.counts.idle > 0) {
-			parts.push(theme.fg("warning", `空闲 ${this.counts.idle}`));
-		}
-		if (this.counts.inactive > 0) {
-			parts.push(theme.fg("dim", `收口 ${this.counts.inactive}`));
-		}
-		return parts.join(theme.fg("dim", " · "));
-	}
-
 	/**
-	 * The spend cell, degraded to the widest form that fits `budget` columns.
-	 *
-	 * Degradation order (each step loses exactly one thing): the "全部" figure
-	 * first (the least valuable by design), then the annotations' token counts
-	 * (unpriced and override markers alike), then the annotations themselves,
-	 * then the whole cell - a truncated
-	 * money figure would read as a wrong number, so the cell is dropped, never
-	 * ellipsized. All-zero figures render nothing (no ¥0.00 noise), and an
-	 * all-unpriced family shows tokens plus the warning instead of ¥0.00.
+	 * One block: ` ◇ name 运行中 ` on the subagent gold, or ` ⚠ name 卡住 ` on red for a
+	 * stall without a row of its own. The pointed or selected block is brighter;
+	 * the selected one also underlines its name. Widths are the same either way.
+	 * A block that would overflow `maxWidth` gives up name width first, then its state.
 	 */
-	private renderSpend(budget: number): string {
-		const spend = this.spend;
-		if (!spend || (spend.cost === 0 && spend.tokens === 0)) return "";
-		const dot = theme.fg("dim", " · ");
-		// The header already names the family (`子代理 3`); the cell carries figures only.
-		const money =
-			spend.cost > 0
-				? `${spend.partial ? theme.fg("dim", "≈") : ""}${theme.fg("accent", formatSpendCost(spend.cost))}`
-				: "";
-		const tokens = theme.fg("dim", `${spend.partial ? "≈" : ""}${formatTokenCount(spend.tokens)} tok`);
-		const primary = money ? `${money}${dot}${tokens}` : tokens;
-		const total = spend.parentCost + spend.cost;
-		// `｜` separates the two spend groups (sub-agents vs the whole family);
-		// `·` stays inside a group.
-		const secondary =
-			total > 0
-				? `${theme.fg("dim", " ｜ ")}${theme.fg("dim", `全部 ${spend.partial ? "≈" : ""}${formatSpendCost(total)}`)}`
-				: "";
-		const annotate = (withTokens: boolean): string => {
-			const annotations = [
-				this.renderUnpricedAnnotation(spend, withTokens),
-				this.renderOverrideAnnotation(spend, withTokens),
-			];
-			const text = annotations.filter((annotation) => annotation.length > 0).join(" ");
-			return text ? ` ${text}` : "";
+	private buildChip(
+		item: StripItem,
+		selected: boolean,
+		hovered: boolean,
+		nameMax: number,
+		maxWidth = Number.POSITIVE_INFINITY,
+	): { text: string; width: number } {
+		const lit = selected || hovered;
+		const orphan = item.kind === "orphan";
+		const bg: ThemeBg = orphan
+			? lit
+				? "kindErrorHoverBg"
+				: "kindErrorBg"
+			: lit
+				? "kindSubagentHoverBg"
+				: "kindSubagentBg";
+		const glyph = orphan ? theme.fg("kindError", "⚠") : theme.fg("kindSubagent", "◇");
+		const paint = (body: string): { text: string; width: number } => {
+			// A truncation inside the body ends with a full reset, which also clears the background: put it back.
+			const open = theme.bg(bg, "").replace(/\x1b\[49m$/, "");
+			const text = theme.bg(bg, ` ${glyph} ${body} `.replaceAll("\x1b[0m", `\x1b[0m${open}`));
+			return { text, width: visibleWidth(text) };
 		};
-		const rungs = [
-			primary + secondary + annotate(true),
-			primary + annotate(true),
-			primary + annotate(false),
-			primary,
-		];
-		for (const rung of rungs) {
-			if (visibleWidth(rung) <= budget) return rung;
+		if (item.kind === "counts") {
+			const counts = this.countParts()
+				.map((part) => theme.fg(part.color, part.text))
+				.join(theme.fg("dim", " · "));
+			const body = `${theme.fg("text", `子代理 ${this.counts.total}`)}${counts ? `  ${counts}` : ""}`;
+			// " ◇ " and the closing space are 4 columns around the body.
+			return paint(truncateToWidth(body, Math.max(1, maxWidth - 4), "…"));
 		}
-		return "";
+		const stateWord = orphan ? "卡住" : CHIP_STATE_WORDS[item.state ?? "running"];
+		const stateColor: ThemeColor = orphan ? "kindError" : CHIP_STATE_COLORS[item.state ?? "running"];
+		const style = (name: string): string => {
+			const shown = selected ? theme.underline(theme.bold(name)) : name;
+			return theme.fg("text", shown);
+		};
+		const build = (nameWidth: number, withState: boolean): { text: string; width: number } =>
+			paint(
+				`${style(truncateToWidth(item.name, nameWidth, "…"))}${withState ? ` ${theme.fg(stateColor, stateWord)}` : ""}`,
+			);
+		let chip = build(nameMax, true);
+		if (chip.width > maxWidth) {
+			// Name width first, down to its first character; the state word goes only when that is not enough.
+			const floor = minCutWidth(item.name);
+			const frame = visibleWidth(` ${orphan ? "⚠" : "◇"}  `);
+			const withState = maxWidth - frame - visibleWidth(` ${stateWord}`);
+			const bare = maxWidth - frame;
+			if (withState >= floor) chip = build(Math.min(nameMax, withState), true);
+			else if (bare >= floor) chip = build(Math.min(nameMax, bare), false);
+			else return { text: "", width: 0 };
+		}
+		return chip;
 	}
 
-	/** `(kimi-k3 8.1M tok 未定价)`; `withTokens: false` drops the per-model token counts. */
-	private renderUnpricedAnnotation(spend: SubagentSpendSummary, withTokens: boolean): string {
-		if (spend.unpriced.length === 0) return "";
-		const models = spend.unpriced
-			.map((entry) => (withTokens ? `${entry.model} ${formatTokenCount(entry.tokens)}` : entry.model))
-			.join(" · ");
-		return theme.fg("warning", `(${models}${withTokens ? " tok" : ""} 未定价)`);
+	/** `运行 1 · 空闲 0 · 收口 2` - zero-count classes are skipped entirely. */
+	private countParts(): Array<{ text: string; color: ThemeColor }> {
+		const parts: Array<{ text: string; color: ThemeColor }> = [];
+		if (this.counts.running > 0) parts.push({ text: `运行 ${this.counts.running}`, color: "success" });
+		if (this.counts.idle > 0) parts.push({ text: `空闲 ${this.counts.idle}`, color: "warning" });
+		if (this.counts.inactive > 0) parts.push({ text: `收口 ${this.counts.inactive}`, color: "dim" });
+		return parts;
 	}
 
-	/**
-	 * `(qwen3.8-flash 8.1M tok 已改价)` for models the settings re-priced. The
-	 * marker is what makes a corrected price legible where the money is read: the
-	 * figure is right, and `/usage` names the override behind it.
-	 */
-	private renderOverrideAnnotation(spend: SubagentSpendSummary, withTokens: boolean): string {
-		const priced = spend.overridePriced ?? [];
-		if (priced.length === 0) return "";
-		const models = priced
-			.map((entry) => (withTokens ? `${entry.model} ${formatTokenCount(entry.tokens)}` : entry.model))
-			.join(" · ");
-		return theme.fg("accent", `(${models}${withTokens ? " tok" : ""} 已改价)`);
+	/** The least a block can be cut to and still name its child. */
+	private minChipWidth(item: StripItem): number {
+		const glyph = item.kind === "orphan" ? "⚠" : "◇";
+		const label = item.kind === "counts" ? `子代理 ${this.counts.total}` : item.name;
+		return visibleWidth(` ${glyph}  `) + minCutWidth(label);
+	}
+
+	/** A block's width, from its plain text: the layout needs it without touching the theme. */
+	private chipWidth(item: StripItem): number {
+		if (item.kind === "counts") {
+			const counts = this.countParts()
+				.map((part) => part.text)
+				.join(" · ");
+			return visibleWidth(` ◇ 子代理 ${this.counts.total}${counts ? `  ${counts}` : ""} `);
+		}
+		const glyph = item.kind === "orphan" ? "⚠" : "◇";
+		const word = item.kind === "orphan" ? "卡住" : CHIP_STATE_WORDS[item.state ?? "running"];
+		return visibleWidth(` ${glyph} ${truncateToWidth(item.name, CHIP_NAME_MAX_WIDTH, "…")} ${word} `);
 	}
 
 	invalidate(): void {
-		// Render output is derived from counts, spend, focus state, and theme/keybindings.
+		// Render output is derived from counts, rows, focus, hover, scroll, and theme/keybindings.
 		this.cachedWidth = undefined;
 		this.cachedKey = undefined;
 		this.cachedLines = undefined;
 	}
+}
+
+/**
+ * The spend cell for the status line, in the widest form first and each next
+ * form losing exactly one thing: the `全部` figure (the least valuable by
+ * design), the annotations' token counts, the annotations, then the
+ * annotation down to a bare `?` - a truncated money figure would read as a
+ * wrong number, so the caller drops the whole cell instead of ellipsizing it.
+ * All-zero figures give no forms (no ¥0.00 noise), and an all-unpriced family
+ * shows tokens plus the warning instead of ¥0.00.
+ */
+export function renderSubagentSpendCell(spend: SubagentSpendSummary | undefined): string[] {
+	if (!spend || (spend.cost === 0 && spend.tokens === 0)) return [];
+	const lower = spend.partial ? "≈" : "";
+	const money =
+		spend.cost > 0
+			? `${spend.partial ? theme.fg("dim", "≈") : ""}${theme.fg("accent", formatSpendCost(spend.cost))}`
+			: "";
+	const figure = money || theme.fg("dim", `${lower}${formatTokenCount(spend.tokens)} tok`);
+	const primary = `${theme.fg("muted", "子代理")} ${figure}`;
+	const total = spend.parentCost + spend.cost;
+	const secondary =
+		total > 0 ? `${theme.fg("dim", " · ")}${theme.fg("dim", `全部 ${lower}${formatSpendCost(total)}`)}` : "";
+	const annotate = (withTokens: boolean): string => {
+		const models = (entries: ReadonlyArray<{ model: string; tokens: number }>): string =>
+			entries
+				.map((entry) => (withTokens ? `${entry.model} ${formatTokenCount(entry.tokens)}` : entry.model))
+				.join(" · ");
+		const parts: string[] = [];
+		if (spend.unpriced.length > 0) {
+			parts.push(theme.fg("warning", `(${models(spend.unpriced)}${withTokens ? " tok" : ""} 未定价)`));
+		}
+		if ((spend.overridePriced ?? []).length > 0) {
+			parts.push(theme.fg("accent", `(${models(spend.overridePriced ?? [])}${withTokens ? " tok" : ""} 已改价)`));
+		}
+		return parts.length > 0 ? ` ${parts.join(" ")}` : "";
+	};
+	const mark = spend.unpriced.length > 0 ? theme.fg("warning", "?") : "";
+	const forms = [
+		primary + secondary + annotate(true),
+		primary + annotate(true),
+		primary + annotate(false),
+		primary + mark,
+	];
+	return forms.filter((form, index) => index === 0 || form !== forms[index - 1]);
 }

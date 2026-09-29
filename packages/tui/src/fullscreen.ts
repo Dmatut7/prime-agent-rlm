@@ -5,12 +5,15 @@
  * scroll position is application state, not terminal scrollback.
  */
 
-import type { ClickRegion } from "./click-regions.js";
+import type { ClickRegion, StickyHeader } from "./click-regions.js";
 import type { TableCellSelectionRegion } from "./selection-metadata.js";
 import { isImageLine } from "./terminal-image.js";
 import { sliceByColumn, stripAnsi, urlAtColumn, visibleWidth } from "./utils.js";
 
 export const FULLSCREEN_MIN_TRANSCRIPT_ROWS = 3;
+
+/** Most rows a sticky header may keep painted over the top of the transcript window. */
+export const FULLSCREEN_MAX_STICKY_ROWS = 3;
 
 export function clippedFullscreenDockHeight(dockLength: number, height: number): number {
 	const maxDock = Math.max(0, height - FULLSCREEN_MIN_TRANSCRIPT_ROWS);
@@ -65,6 +68,19 @@ export interface ProjectedRegionRows {
 	count: number;
 }
 
+/** The rows of a sticky header painted over the top of the transcript window in the last frame. */
+export interface PinnedRows {
+	/** Frame row of the first pinned row. */
+	firstRow: number;
+	count: number;
+	regions: ReadonlyArray<ClickRegion>;
+}
+
+interface PinnedHeader {
+	header: StickyHeader;
+	rows: string[];
+}
+
 /** A region projected onto the frame: the region plus its visible hit rows. */
 export interface FrameClickEntry extends ProjectedRegionRows {
 	region: ClickRegion;
@@ -108,8 +124,12 @@ export class FullscreenViewport {
 	private revealMarker: string | undefined;
 	/** Set by {@link setRevealMarker}; cleared once a frame has placed the marked row. */
 	private revealPending = false;
-	/** A click just changed the rows below the clicked transcript line; the next frame keeps that line put. */
-	private clickHold: { line: number; revealBelow: number } | undefined;
+	/**
+	 * A click just changed the rows below the clicked transcript line; the next frame keeps that line put.
+	 * `boxEndLine` is set for a click on a pinned header: the line is then brought back into view
+	 * only when the box no longer reaches that far.
+	 */
+	private clickHold: { line: number; revealBelow: number; boxEndLine?: number } | undefined;
 	private prevFrame: string[] = [];
 	private prevWidth = 0;
 	private prevHeight = 0;
@@ -119,6 +139,9 @@ export class FullscreenViewport {
 	private lastHeaderLines = 0;
 	private lastDockLines = 0;
 	private lastDockHeight = 0;
+	private stickyHeaders: ReadonlyArray<StickyHeader> = [];
+	private stickyWidth = 0;
+	private lastPinned: PinnedHeader | null = null;
 	private frameClickTargets: FrameClickTarget[] = [];
 	private lastTranscript: string[] = [];
 	private lastFrame: string[] = [];
@@ -173,13 +196,19 @@ export class FullscreenViewport {
 			// scroll offset keeps it on the same screen row. Only the rows the click
 			// opened below it may pull the window down, and never past the clicked row.
 			this.clickHold = undefined;
-			this.scrollTop = this.revealBelow(
-				this.scrollTop,
-				hold.line,
-				hold.line + hold.revealBelow,
-				windowHeight,
-				maxScroll,
-			);
+			const boxEndLine = hold.boxEndLine;
+			const boxKept =
+				boxEndLine !== undefined &&
+				this.stickyHeaders.some((header) => header.line === hold.line && header.endLine >= boxEndLine);
+			if (!boxKept) {
+				this.scrollTop = this.revealBelow(
+					this.scrollTop,
+					hold.line,
+					hold.line + hold.revealBelow,
+					windowHeight,
+					maxScroll,
+				);
+			}
 			this.following = this.scrollTop >= maxScroll;
 		}
 		const marker = this.revealMarker;
@@ -189,9 +218,10 @@ export class FullscreenViewport {
 			// freely instead of being pulled back to the marked row every frame.
 			if (row !== -1 && this.revealPending) {
 				this.revealPending = false;
-				if (row < this.scrollTop || row >= this.scrollTop + windowHeight) {
-					// Leave a little context above the revealed row.
-					this.scrollTop = Math.max(0, Math.min(row - 2, maxScroll));
+				const covered = this.pinnedRowCount(this.scrollTop, windowHeight);
+				if (row < this.scrollTop + covered || row >= this.scrollTop + windowHeight) {
+					// Leave a little context above the revealed row, below any pinned header.
+					this.scrollTop = Math.max(0, Math.min(this.topClearingPins(row, 2, windowHeight), maxScroll));
 					this.following = this.scrollTop >= maxScroll;
 				}
 			}
@@ -214,7 +244,94 @@ export class FullscreenViewport {
 		while (window.length < windowHeight) {
 			window.push("");
 		}
+		// Painted after the selection highlight: pinned rows are not selectable text.
+		this.lastPinned = this.pinAt(this.scrollTop, windowHeight);
+		if (this.lastPinned) {
+			const { rows } = this.lastPinned;
+			for (let i = 0; i < rows.length; i++) {
+				window[i] = marker && rows[i].includes(marker) ? rows[i].split(marker).join("") : rows[i];
+			}
+		}
 		return [...headerLines, ...window, ...dockLines];
+	}
+
+	/** Sticky headers of the transcript about to be composed, and the width their rows are cut to. */
+	setStickyHeaders(headers: ReadonlyArray<StickyHeader>, width: number): void {
+		this.stickyHeaders = headers;
+		this.stickyWidth = width;
+	}
+
+	/**
+	 * The header to keep painted when the window starts at transcript row `top`:
+	 * of the boxes that started above the window and go on below its top edge, the
+	 * innermost one whose pinned rows still fit before the box's last line.
+	 */
+	private pinAt(top: number, windowHeight: number): PinnedHeader | null {
+		const headers = this.stickyHeaders;
+		const maxRows = Math.min(FULLSCREEN_MAX_STICKY_ROWS, windowHeight - 1);
+		if (headers.length === 0 || top <= 0 || maxRows <= 0) return null;
+		const spanning: StickyHeader[] = [];
+		for (const header of headers) {
+			if (header.line < top && header.endLine > top) spanning.push(header);
+		}
+		if (spanning.length === 0) return null;
+		spanning.sort((a, b) => b.line - a.line);
+		const width = this.stickyWidth;
+		for (const header of spanning) {
+			const rows = header
+				.render(top - header.line)
+				.slice(0, maxRows)
+				.map((row) => {
+					if (isImageLine(row)) return IMAGE_PLACEHOLDER;
+					return visibleWidth(row) > width ? sliceByColumn(row, 0, width, true) : row;
+				});
+			if (rows.length > 0 && top + rows.length <= header.endLine) return { header, rows };
+		}
+		return null;
+	}
+
+	private pinnedRowCount(top: number, windowHeight: number): number {
+		return this.pinAt(top, windowHeight)?.rows.length ?? 0;
+	}
+
+	/**
+	 * The highest window top that shows `line` at least `context` rows below the
+	 * pinned rows. Pinned rows depend on the top they are pinned at, so this tries
+	 * each extra row of room in turn instead of assuming the pin of the current top.
+	 */
+	private topClearingPins(line: number, context: number, windowHeight: number): number {
+		for (let extra = 0; extra < FULLSCREEN_MAX_STICKY_ROWS; extra++) {
+			const top = Math.max(0, line - context - extra);
+			if (top === 0 || this.pinnedRowCount(top, windowHeight) <= extra) return top;
+		}
+		return Math.max(0, line - context - FULLSCREEN_MAX_STICKY_ROWS);
+	}
+
+	/** The pinned rows painted in the last frame, or null when none were. */
+	pinnedRows(): PinnedRows | null {
+		const pinned = this.lastPinned;
+		if (!pinned) return null;
+		return { firstRow: this.lastHeaderHeight, count: pinned.rows.length, regions: pinned.header.regions ?? [] };
+	}
+
+	/** Whether frame row `screenRow` shows a pinned row of the last frame. */
+	isPinnedRow(screenRow: number): boolean {
+		const pinned = this.lastPinned;
+		return (
+			pinned !== null && screenRow >= this.lastHeaderHeight && screenRow < this.lastHeaderHeight + pinned.rows.length
+		);
+	}
+
+	/**
+	 * A click on the pinned header is about to change the box under it (collapse
+	 * it): keep the window where it is, and let the next frame bring the header's
+	 * own row back into view if the box shrank. A click that leaves the box alone
+	 * moves nothing, and a window that follows the newest line keeps following.
+	 */
+	holdForPinnedHeader(): void {
+		const pinned = this.lastPinned;
+		if (!pinned || this.following) return;
+		this.clickHold = { line: pinned.header.line, revealBelow: 0, boxEndLine: pinned.header.endLine };
 	}
 
 	/**
@@ -228,11 +345,13 @@ export class FullscreenViewport {
 		windowHeight: number,
 		maxScroll: number,
 	): number {
+		// The anchor never goes above the window or under a pinned header.
+		const anchorTop = this.topClearingPins(anchorLine, 0, windowHeight);
 		let top = scrollTop;
 		if (endLine >= top + windowHeight) {
-			top = Math.min(endLine - windowHeight + 1, anchorLine);
+			top = Math.min(endLine - windowHeight + 1, anchorTop);
 		}
-		if (anchorLine < top) top = anchorLine;
+		if (anchorTop < top || anchorLine < top + this.pinnedRowCount(top, windowHeight)) top = anchorTop;
 		return Math.max(0, Math.min(top, maxScroll));
 	}
 
@@ -280,6 +399,14 @@ export class FullscreenViewport {
 	projectTranscriptRegion(line: number, height: number): ProjectedRegionRows | null {
 		const base = this.lastHeaderHeight - this.scrollTop;
 		return this.projectRows(line, height, this.lastHeaderHeight, this.lastWindowHeight, (row) => base + row);
+	}
+
+	/** Project a region of the pinned rows (coordinates of the header's `render` output). */
+	projectPinnedRegion(line: number, height: number): ProjectedRegionRows | null {
+		const pinned = this.lastPinned;
+		if (!pinned) return null;
+		const first = this.lastHeaderHeight;
+		return this.projectRows(line, height, first, pinned.rows.length, (row) => first + row);
 	}
 
 	/** Project a dock region; the dock keeps its bottom rows when clipped. */
@@ -587,7 +714,8 @@ export class FullscreenViewport {
 		const visibleEnd = visibleStart + visibleHeight - 1;
 		// The transcript window occupies frame rows [headerHeight, headerHeight +
 		// windowHeight); the pinned header sits above it and the dock below.
-		const windowStart = this.lastHeaderHeight;
+		// Sticky rows painted over the top of the window are not selectable: selection starts below them.
+		const windowStart = this.lastHeaderHeight + (this.lastPinned?.rows.length ?? 0);
 		const windowEnd = this.lastHeaderHeight + this.lastWindowHeight - 1;
 		const transcriptStart = Math.max(windowStart, visibleStart);
 		const transcriptEnd = Math.min(windowEnd, visibleEnd);
@@ -932,8 +1060,22 @@ export class FullscreenViewport {
 		this.following = true;
 	}
 
-	pageSize(): number {
-		return Math.max(1, this.lastWindowHeight - 1);
+	/**
+	 * Rows one page key scrolls: a window less one row of overlap, less the rows a
+	 * sticky header covers at the top of the window it lands on, so no row is
+	 * skipped under the pinned rows.
+	 */
+	pageSize(direction: SelectionScrollDirection = 1): number {
+		const room = Math.max(1, this.lastWindowHeight - 1);
+		if (this.stickyHeaders.length === 0) return room;
+		// Going up, the rows to keep in view sit below the pinned rows of the window we leave.
+		if (direction < 0) return Math.max(1, room - (this.lastPinned?.rows.length ?? 0));
+		for (let covered = 0; covered < FULLSCREEN_MAX_STICKY_ROWS; covered++) {
+			const step = Math.max(1, room - covered);
+			const top = Math.min(this.scrollTop + step, this.lastMaxScroll);
+			if (this.pinnedRowCount(top, this.lastWindowHeight) <= covered) return step;
+		}
+		return Math.max(1, room - FULLSCREEN_MAX_STICKY_ROWS);
 	}
 
 	windowHeight(): number {

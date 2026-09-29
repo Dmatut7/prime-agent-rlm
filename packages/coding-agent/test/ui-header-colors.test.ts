@@ -3,6 +3,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import { theme } from "../src/modes/interactive/theme/theme.js";
+import { headerRaw } from "./grow-box-helpers.js";
 import {
 	addActivities,
 	addClosingAnswer,
@@ -36,7 +37,7 @@ function finish(turn: QuietTurn): string {
 	setMotionReduced(true);
 	turn.state.markTurnEnded(Date.now());
 	turn.state.finishBox(Date.now());
-	return turn.summary.render(WIDTH)[2] ?? "";
+	return headerRaw(turn.summary.render(WIDTH));
 }
 
 const mutedDot = () => theme.fg("muted", " · ");
@@ -119,6 +120,6 @@ describe("the finished box header colors each count by kind", () => {
 		const turn = quietTurn({ live: false });
 		addThought(turn, "先看一下。再看一下。");
 		addCommand(turn, "c1", "git status");
-		expect(plain([finish(turn)])[0]).toMatch(/▸ ✓ 想了 1 次 · 跑了 1 条命令 +\d+秒 · ↓ \d+ │$/);
+		expect(plain([finish(turn)])[0]).toMatch(/ ✓ 完成 +想了 1 次 · 跑了 1 条命令 +\d+秒 · ↓ \d+ › *$/);
 	});
 });
