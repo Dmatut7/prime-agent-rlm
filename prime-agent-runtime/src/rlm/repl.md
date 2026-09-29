@@ -277,7 +277,9 @@ deleted in the same cell.
 - Symlinks: a write through a link is filed under the file it lands in (when
   that is a place tracking reports); a link that was created, removed or
   re-pointed is reported as itself with `symlink: true`, no line counts and no
-  diff; an untracked link to a changed file does not add a second row.
+  diff; a link replaced by a regular file of the same name is that file, a
+  modified one whose lines all show as added, with no `symlink`; an untracked
+  link to a changed file does not add a second row.
 - Records are sent as soon as a file's size and mtime hold still for one watch
   interval (0.15 s), and finally before the cell's `done`; that final
   collection is part of the interruptible finishing phase.
