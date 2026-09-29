@@ -5,7 +5,7 @@ export interface MouseEvent {
 	x: number;
 	/** One-based terminal row. */
 	y: number;
-	/** True for SGR `M` reports (press, wheel, or drag), false for release `m`. */
+	/** True for SGR `M` reports (press, wheel, drag, or hover move), false for release `m`. */
 	press: boolean;
 	/** Whether the SGR motion bit is set. */
 	motion: boolean;
@@ -18,6 +18,8 @@ export interface MouseEvent {
 export const MOUSE_WHEEL_UP = 64;
 export const MOUSE_WHEEL_DOWN = 65;
 export const MOUSE_BUTTON_LEFT = 0;
+/** SGR button code of a move with no button held (reported as 35 = 3 + motion bit). */
+export const MOUSE_BUTTON_NONE = 3;
 
 const SGR_MOUSE_PATTERN = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
 const MODIFIER_SHIFT = 4;
@@ -43,6 +45,11 @@ export function parseSgrMouseEvent(sequence: string): MouseEvent | null {
 		alt: (raw & MODIFIER_ALT) !== 0,
 		ctrl: (raw & MODIFIER_CTRL) !== 0,
 	};
+}
+
+/** A pointer move with no button held: the only report ?1003 adds over ?1002. */
+export function isMouseHover(event: MouseEvent): boolean {
+	return event.press && event.motion && event.button === MOUSE_BUTTON_NONE;
 }
 
 export function isWheelUp(event: MouseEvent): boolean {
