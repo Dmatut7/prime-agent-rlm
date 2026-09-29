@@ -1095,7 +1095,28 @@ export class TUI extends Container {
 		this.syncFullscreenMouseTracking();
 	}
 
+	/**
+	 * A pointer move with no button held exists only because hover turned on ?1003. It
+	 * drives hover and nothing else: input listeners, the focused component and the
+	 * modal focus guard see the same input as before that mode was on.
+	 */
+	private consumeHoverMove(data: string): boolean {
+		if (!isMouseSequence(data)) return false;
+		const event = parseSgrMouseEvent(data);
+		if (!event || !isMouseHover(event)) return false;
+		const fullscreen = this.fullscreen;
+		if (!fullscreen || !this.terminal.mouseTrackingActive) return true;
+		const modal = this.getTopmostVisibleOverlay();
+		if (this.isFullscreenOverlayFocused() || (modal && !modal.focusReleased)) {
+			this.clearFullscreenHover();
+		} else {
+			this.updateFullscreenHover(fullscreen.viewport.clickTargetAt(event.y - 1, event.x - 1));
+		}
+		return true;
+	}
+
 	private handleInput(data: string): void {
+		if (this.consumeHoverMove(data)) return;
 		this.reclaimModalFocus();
 		if (this.inputListeners.size > 0) {
 			let current = data;
@@ -1192,9 +1213,7 @@ export class TUI extends Container {
 			}
 			if (event && !overlayFocused) {
 				const viewport = fullscreen.viewport;
-				if (isMouseHover(event)) {
-					this.updateFullscreenHover(viewport.clickTargetAt(event.y - 1, event.x - 1));
-				} else if (isWheelUp(event) || isWheelDown(event)) {
+				if (isWheelUp(event) || isWheelDown(event)) {
 					this.stopSelectionAutoScroll();
 					const direction = isWheelUp(event) ? -1 : 1;
 					// A region with its own scrolling content (a box body) takes the
@@ -1234,7 +1253,6 @@ export class TUI extends Container {
 				}
 			} else if (event && overlayFocused) {
 				this.stopSelectionAutoScroll();
-				this.clearFullscreenHover();
 				const viewport = fullscreen.viewport;
 				if (event.button === MOUSE_BUTTON_LEFT && event.press && !event.motion) {
 					if (!viewport.beginFrameSelection(event.y - 1, event.x - 1)) {

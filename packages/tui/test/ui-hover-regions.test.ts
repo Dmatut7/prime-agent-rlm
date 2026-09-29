@@ -316,3 +316,80 @@ describe("fullscreen hover", () => {
 		);
 	});
 });
+
+describe("hover moves stay out of the input path", () => {
+	const HOVER_MOVES = [at(A), move(5, transcriptRow(A)), `\x1b[<39;3;${transcriptRow(B)}M`, move(BLANK_X, BLANK_Y)];
+
+	it("never hands a pure pointer move to input listeners, while clicks, drags and wheel still reach them", async () => {
+		await withHover(TWO_REGIONS, async ({ tui, log, send }) => {
+			const received: string[] = [];
+			tui.addInputListener((data) => {
+				received.push(data);
+				return undefined;
+			});
+			assert.ok(HOVER_MOVES.length > 0);
+
+			await send(...HOVER_MOVES);
+			assert.deepStrictEqual(received, [], "the listener saw no hover move");
+			assert.ok(log.length > 0, "the moves still drove the hover");
+
+			const others = [
+				`\x1b[<0;${BLANK_X};${transcriptRow(A)}M`,
+				`\x1b[<32;${BLANK_X};${transcriptRow(B)}M`,
+				`\x1b[<0;${BLANK_X};${transcriptRow(B)}m`,
+				"\x1b[<64;3;5M",
+				"x",
+			];
+			await send(...others);
+			assert.deepStrictEqual(received, others, "everything else is forwarded as before");
+		});
+	});
+
+	it("swallows moves in a session with mouse tracking off, and in inline mode", async () => {
+		await withHover(
+			TWO_REGIONS,
+			async ({ tui, send }) => {
+				const received: string[] = [];
+				tui.addInputListener((data) => {
+					received.push(data);
+					return undefined;
+				});
+				await send(...HOVER_MOVES);
+				assert.deepStrictEqual(received, []);
+			},
+			{ mouse: false },
+		);
+
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui = new TUI(terminal);
+		const listened: string[] = [];
+		const typed: string[] = [];
+		tui.addInputListener((data) => {
+			listened.push(data);
+			return undefined;
+		});
+		tui.addChild({ render: () => ["> "], invalidate: () => {}, handleInput: (data: string) => typed.push(data) });
+		const input = tui.children[0]!;
+		tui.setFocus(input);
+		tui.start();
+		try {
+			for (const sequence of HOVER_MOVES) terminal.sendInput(sequence);
+			terminal.sendInput("x");
+			assert.deepStrictEqual(listened, ["x"]);
+			assert.deepStrictEqual(typed, ["x"], "the focused component never sees a pointer move");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("does not light a region up under a modal overlay that has not reclaimed the keyboard yet", async () => {
+		await withHover(TWO_REGIONS, async ({ tui, log, send }) => {
+			const menu: Component = { render: () => ["menu"], invalidate: () => {}, handleInput: () => {} };
+			tui.showOverlay(menu, { width: 10, anchor: "bottom-right" });
+			const other: Component = { render: () => [], invalidate: () => {}, handleInput: () => {} };
+			tui.setFocus(other);
+			await send(at(A), at(B));
+			assert.deepStrictEqual(log, []);
+		});
+	});
+});
