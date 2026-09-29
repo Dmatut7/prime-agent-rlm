@@ -162,6 +162,7 @@ export class ProcessTerminal implements Terminal {
 	private _mouseTrackingActive = false;
 	// Set once the terminal is being drained for exit: reporting stays off however the UI asks.
 	private mouseTrackingSuspended = false;
+	private mouseExitGuard?: () => void;
 	private stdinBuffer?: StdinBuffer;
 	private stdinDataHandler?: (data: string) => void;
 	private keyboardProtocolFallbackTimer?: ReturnType<typeof setTimeout>;
@@ -403,6 +404,7 @@ export class ProcessTerminal implements Terminal {
 		if (this._mouseTrackingActive) {
 			process.stdout.write(MOUSE_TRACKING_OFF);
 			this._mouseTrackingActive = false;
+			this.disarmMouseExitGuard();
 		}
 		this.mouseTrackingSuspended = true;
 		if (this._kittyProtocolActive) {
@@ -457,6 +459,7 @@ export class ProcessTerminal implements Terminal {
 			process.stdout.write(MOUSE_TRACKING_OFF);
 			this._mouseTrackingActive = false;
 		}
+		this.disarmMouseExitGuard();
 		this.mouseTrackingSuspended = false;
 		if (this._altScreenActive) {
 			if (options.preserveAltScreen) {
@@ -606,6 +609,31 @@ export class ProcessTerminal implements Terminal {
 		// ?1003 (any-event tracking) reports drags for in-app selection and, since
 		// hover, plain moves too. Off also clears ?1002 in case an older run left it set.
 		this.write(enabled ? MOUSE_TRACKING_ON : MOUSE_TRACKING_OFF);
+		if (enabled) {
+			this.armMouseExitGuard();
+		} else {
+			this.disarmMouseExitGuard();
+		}
+	}
+
+	// A process that dies without stop() (uncaught exception, process.exit) must not
+	// leave ?1003 on: the shell would print a report for every pointer move.
+	private armMouseExitGuard(): void {
+		if (this.mouseExitGuard) return;
+		this.mouseExitGuard = () => {
+			try {
+				process.stdout.write(MOUSE_TRACKING_OFF);
+			} catch {
+				// The terminal is already gone; nothing left to restore.
+			}
+		};
+		process.on("exit", this.mouseExitGuard);
+	}
+
+	private disarmMouseExitGuard(): void {
+		if (!this.mouseExitGuard) return;
+		process.removeListener("exit", this.mouseExitGuard);
+		this.mouseExitGuard = undefined;
 	}
 
 	get mouseTrackingActive(): boolean {

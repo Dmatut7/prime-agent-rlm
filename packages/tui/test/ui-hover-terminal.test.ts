@@ -122,4 +122,62 @@ describe("ProcessTerminal mouse tracking around exit", () => {
 			assert.deepStrictEqual(writes, []);
 		});
 	});
+
+	describe("exit safety net", () => {
+		const registeredSince = (before: ReadonlyArray<unknown>) =>
+			process.listeners("exit").filter((listener) => !before.includes(listener));
+
+		it("registers one exit handler while tracking is on and removes it when tracking goes off", async () => {
+			const before = process.listeners("exit");
+			const terminal = new ProcessTerminal();
+			await withCapturedStdout(async () => {
+				terminal.setMouseTracking(true);
+				terminal.setMouseTracking(true);
+				assert.strictEqual(registeredSince(before).length, 1);
+				terminal.setMouseTracking(false);
+				assert.strictEqual(registeredSince(before).length, 0);
+				terminal.setMouseTracking(true);
+				assert.strictEqual(registeredSince(before).length, 1);
+				terminal.stop();
+				assert.strictEqual(registeredSince(before).length, 0, "stop() removes it");
+				terminal.setMouseTracking(true);
+				await terminal.drainInput(20, 5);
+				assert.strictEqual(registeredSince(before).length, 0, "closing reporting for the drain removes it");
+			});
+		});
+
+		it("restores the terminal from the exit handler when the process dies with tracking on", async () => {
+			const before = process.listeners("exit");
+			const terminal = new ProcessTerminal();
+			await withCapturedStdout(async (writes) => {
+				terminal.setMouseTracking(true);
+				const [handler] = registeredSince(before);
+				assert.ok(handler);
+				writes.length = 0;
+				handler(0);
+				assert.deepStrictEqual(writes, [DISABLE]);
+				terminal.setMouseTracking(false);
+			});
+		});
+
+		it("stays silent when the terminal is already gone", async () => {
+			const before = process.listeners("exit");
+			const terminal = new ProcessTerminal();
+			const originalWrite = process.stdout.write;
+			try {
+				await withCapturedStdout(async () => {
+					terminal.setMouseTracking(true);
+				});
+				const [handler] = registeredSince(before);
+				assert.ok(handler);
+				process.stdout.write = (() => {
+					throw new Error("EIO: i/o error, write");
+				}) as typeof process.stdout.write;
+				assert.doesNotThrow(() => handler(0));
+			} finally {
+				process.stdout.write = originalWrite;
+				await withCapturedStdout(async () => terminal.setMouseTracking(false));
+			}
+		});
+	});
 });
