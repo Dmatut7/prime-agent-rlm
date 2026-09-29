@@ -340,7 +340,7 @@ describe("ENG-4531 agent message UI", () => {
 
 		expect(components).toHaveLength(1);
 		expect(components[0]).toBeInstanceOf(AgentMessageComponent);
-		expect(render(components[0] as AgentMessageComponent)).toContain("收到消息 · 来自 父代理 Planner");
+		expect(render(components[0] as AgentMessageComponent)).toContain("◇ Planner 发来：Review shard seven.");
 	});
 
 	it("uses compact rebuilt spacing for agent messages next to messages and tool cells", () => {
@@ -399,9 +399,9 @@ describe("ENG-4531 agent message UI", () => {
 			quiet
 				.at(-1)
 				?.render(120)
-				.find((line) => line.includes("收到消息")) ?? "",
+				.find((line) => line.includes("◇")) ?? "",
 		);
-		expect(row.startsWith("   ◆ 收到消息")).toBe(true);
+		expect(row.startsWith("   ◇ ")).toBe(true);
 		const legacy = buildConversationComponents([fauxAssistantMessage("working"), second], {
 			...options,
 			processMode: "legacy",
@@ -410,9 +410,9 @@ describe("ENG-4531 agent message UI", () => {
 			legacy
 				.at(-1)
 				?.render(120)
-				.find((line) => line.includes("收到消息")) ?? "",
+				.find((line) => line.includes("◇")) ?? "",
 		);
-		expect(legacyRow.startsWith(" ◆ 收到消息")).toBe(true);
+		expect(legacyRow.startsWith(" ◇ ")).toBe(true);
 	});
 
 	it("suppresses live spacing between agent messages and following tool activity", () => {
@@ -475,7 +475,7 @@ describe("ENG-4531 agent message UI", () => {
 
 		expect(isAgentSessionMessage(persistedMessage)).toBe(true);
 		if (!isAgentSessionMessage(persistedMessage)) throw new Error("Expected an agent session message");
-		expect(render(new AgentMessageComponent(persistedMessage))).toContain("收到消息 · 来自 unknown");
+		expect(render(new AgentMessageComponent(persistedMessage))).toContain("◇ unknown 发来：Persisted message.");
 	});
 
 	it("renders relationship-aware sender labels with identifier fallbacks", () => {
@@ -495,13 +495,13 @@ describe("ENG-4531 agent message UI", () => {
 			from: { sessionId: "legacy-session" },
 		});
 
-		expect(render(new AgentMessageComponent(parent))).toContain("收到消息 · 来自 父代理 Planner");
-		expect(render(new AgentMessageComponent(sibling))).toContain("收到消息 · 来自 同级代理 Peer");
-		expect(render(new AgentMessageComponent(childById))).toContain("收到消息 · 来自 子代理 child-session");
-		expect(render(new AgentMessageComponent(unknownRelationship))).toContain("收到消息 · 来自 legacy-session");
+		expect(render(new AgentMessageComponent(parent))).toContain("◇ Planner 发来：From root.");
+		expect(render(new AgentMessageComponent(sibling))).toContain("◇ Peer 发来：From peer.");
+		expect(render(new AgentMessageComponent(childById))).toContain("◇ child-session 交回：From child.");
+		expect(render(new AgentMessageComponent(unknownRelationship))).toContain("◇ legacy-session 发来：Legacy sender.");
 		const expanded = new AgentMessageComponent(sibling);
 		expanded.setExpanded(true);
-		expect(render(expanded)).toContain("收到消息 · 来自 同级代理 Peer");
+		expect(render(expanded)).toContain("◇ Peer 发来");
 	});
 
 	it("renders a compact row and an aligned multiline gutter when expanded", () => {
@@ -509,7 +509,7 @@ describe("ENG-4531 agent message UI", () => {
 		const component = new AgentMessageComponent(createAgentSessionMessage(createPayload(body)));
 		const collapsed = render(component);
 
-		expect(collapsed).toContain("◆ 收到消息 · 来自 Planner");
+		expect(collapsed).toContain("◇ Planner 发来：Reply to your parent with exactly: hi Then wait for more work.");
 		// U6: no per-line expand hint — the global tail line owns the keys.
 		expect(collapsed).not.toContain("展开");
 		// Collapsed is one row: the body's second line never gets a row of its own.
@@ -519,7 +519,7 @@ describe("ENG-4531 agent message UI", () => {
 		const expanded = render(component);
 		expect(expanded).not.toContain("收起");
 		const expandedLines = expanded.split("\n");
-		expect(expandedLines[1]?.trimEnd()).toMatch(/^ ◆ 收到消息 · 来自 Planner$/);
+		expect(expandedLines[1]?.trimEnd()).toMatch(/^ ◇ Planner 发来$/);
 		expect(expandedLines.slice(2)).toEqual([
 			" ╰─ Reply to your parent with exactly: hi",
 			"    Then wait for more work.",

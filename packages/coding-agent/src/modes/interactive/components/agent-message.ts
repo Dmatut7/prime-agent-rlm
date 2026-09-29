@@ -8,7 +8,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { type AgentSessionMessage, formatAgentMessageParticipant } from "../../../core/agent-messages.js";
+import type { AgentSessionMessage } from "../../../core/agent-messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 
 function collapseText(text: string): string {
@@ -22,6 +22,27 @@ export function agentMessageSummaryLine(label: string, participant: string, prev
 		parts.push(theme.fg("muted", preview));
 	}
 	return parts.join(theme.fg("dim", " · "));
+}
+
+/**
+ * The row of a message received from another agent: `◇ <name> 交回：<preview>`
+ * from a subagent the receiver started, `◇ <name> 发来：<preview>` from anyone
+ * else (`◆` is prime's own mark). Without a preview the row is just the head.
+ */
+export function receivedAgentMessageLine(name: string, verb: "交回" | "发来", preview?: string): string {
+	const head = `${theme.fg("kindSubagent", "◇")} ${theme.fg("kindSubagent", name)} ${theme.fg("muted", verb)}`;
+	return preview ? `${head}${theme.fg("muted", `：${preview}`)}` : head;
+}
+
+/** Who sent a message, as its row names them; the same fallbacks the participant label uses. */
+function senderName(from: AgentSessionMessage["details"]["from"]): string {
+	return (
+		from?.sessionName?.trim() ||
+		from?.activeSessionId?.trim() ||
+		from?.clientId?.trim() ||
+		from?.sessionId?.trim() ||
+		"unknown"
+	);
 }
 
 /** Single-line message preview sized to fit after the summary-line prefix. */
@@ -141,20 +162,16 @@ export class AgentMessageComponent extends Container {
 	}
 
 	private headerText(): string {
-		const label = "收到消息";
-		const participant = formatAgentMessageParticipant(
-			"received",
-			this.message.details.fromRelationship,
-			this.message.details.from,
-		);
+		const name = senderName(this.message.details.from);
+		const verb = this.message.details.fromRelationship === "child" ? "交回" : "发来";
 		// U6: no per-line expand hint — the global tail line owns the Ctrl+O
 		// affordance (the header row stays clickable).
 		if (this.expanded) {
-			return agentMessageSummaryLine(label, participant);
+			return receivedAgentMessageLine(name, verb);
 		}
 
-		const prefixWidth = visibleWidth(`◆ ${label} · ${participant} · `);
+		const prefixWidth = visibleWidth(`◇ ${name} ${verb}：`);
 		const preview = agentMessagePreview(prefixWidth, this.message.details.message);
-		return agentMessageSummaryLine(label, participant, preview);
+		return receivedAgentMessageLine(name, verb, preview);
 	}
 }
