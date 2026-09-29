@@ -247,10 +247,14 @@ describe("fullscreen hover", () => {
 	});
 
 	it("does not clear the hover on keyboard input, or on a wheel tick that moves nothing", async () => {
-		await withHover(TWO_REGIONS, async ({ log, send }) => {
+		await withHover(TWO_REGIONS, async ({ tui, log, send, frames }) => {
+			tui.setFocus({ render: () => [], invalidate: () => {}, handleInput: () => {} });
 			await send(at(A));
+			const before = frames();
+			await send("x");
+			assert.ok(frames() > before, "a key press repaints, which re-checks the pointer cell");
 			// Already at the bottom, so the wheel tick has nowhere to scroll and A stays under the pointer.
-			await send("x", `\x1b[<65;3;${transcriptRow(A)}M`);
+			await send(`\x1b[<65;3;${transcriptRow(A)}M`);
 			assert.deepStrictEqual(log, ["A:true"]);
 		});
 	});
@@ -502,6 +506,34 @@ describe("hover follows the content under a still pointer", () => {
 			tui.requestRender();
 			await settle();
 			assert.deepStrictEqual(log, ["A:true", "A:false", "C:true"], "after the release the pointer's cell decides");
+		});
+	});
+
+	it("does not re-check under a modal overlay that became visible before it took the keyboard back", async () => {
+		await withHover(STACKED, async ({ tui, terminal, transcript, log, send, settle }) => {
+			const menu: Component = { render: () => ["menu"], invalidate: () => {}, handleInput: () => {} };
+			// Too narrow to show at first; no input has come since it turned visible, so it has not reclaimed the focus.
+			tui.showOverlay(menu, { width: 10, anchor: "bottom-right", visible: (columns) => columns >= 50 });
+			await send(at(A));
+			terminal.resize(60, 10);
+			await settle();
+			assert.ok(tui.hasOverlay(), "the overlay is visible now");
+			transcript.rows = 21;
+			tui.requestRender();
+			await settle();
+			assert.deepStrictEqual(log, ["A:true"], "the content moved, but the hover is left alone under the overlay");
+		});
+	});
+
+	it("takes a plain move as proof that the left button is up again after a lost release", async () => {
+		await withHover(STACKED, async ({ tui, transcript, log, send, settle }) => {
+			await send(at(A));
+			await send(`\x1b[<0;${BLANK_X};${BLANK_Y}M`);
+			await send(at(A));
+			transcript.rows = 21;
+			tui.requestRender();
+			await settle();
+			assert.deepStrictEqual(log, ["A:true", "A:false", "C:true"]);
 		});
 	});
 
