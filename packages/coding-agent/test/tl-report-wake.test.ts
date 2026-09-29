@@ -263,23 +263,24 @@ describe("a round that is only the AI answering a notice", () => {
 		chat.flow.dispose();
 	});
 
-	it("counts a reply short up to 40 characters and no further", () => {
+	it("takes the reply away whatever its length", () => {
 		const reply = (length: number): AgentMessage[] => [
 			{ role: "user", content: "审查", timestamp: T0 },
 			assistant(T0 + 1_000, [{ type: "text", text: LONG_ANSWER }], "stop"),
 			noticeFor("review-grow-C-strip", T0 + 2_000),
 			assistant(T0 + 3_000, [{ type: "text", text: "好".repeat(length) }], "stop"),
 		];
-		expect(outline(replayed(reply(40))).at(-1)).toBe("answer: (nothing drawn)");
-		const longer = outline(replayed(reply(41))).at(-1) ?? "";
-		expect(longer.startsWith("answer: ")).toBe(true);
-		expect(longer).toContain("好".repeat(41));
+		for (const length of [40, 41, 260]) {
+			expect(outline(replayed(reply(length))).at(-1), `${length} characters`).toBe("answer: (nothing drawn)");
+		}
 	});
 
-	it("draws a reply that is not short", () => {
+	it("brings a long reply back with 完整过程", () => {
 		const long =
 			"这条通知说它没交回，我去看了它留下的文件，发现它其实做完了，只是没发报告，结论和前面的汇总一致。".repeat(2);
 		const chat = chatWith(long);
+		expect(drawn(chat)).not.toContain(long.slice(0, 20));
+		timelineShowAll.set(true);
 		expect(drawn(chat)).toContain(long.slice(0, 20));
 		chat.flow.dispose();
 	});
@@ -316,9 +317,9 @@ describe("a round that is only the AI answering a notice", () => {
 		expect(layout.some((entry) => entry.startsWith("answer: ") && entry.includes("收到。"))).toBe(true);
 	});
 
-	it("draws the reply of a round that ran steps, or that failed", () => {
+	it("takes a round that only looked around away, and keeps one that changed a file, saved a memory, dispatched, or failed", () => {
 		const step = assistant(T0 + 3_000, [{ type: "toolCall", id: "t1", name: "ipython", arguments: { code: "1" } }]);
-		const withSteps: AgentMessage[] = [
+		const withDetails = (details: unknown): AgentMessage[] => [
 			{ role: "user", content: "审查", timestamp: T0 },
 			assistant(T0 + 1_000, [{ type: "text", text: LONG_ANSWER }], "stop"),
 			noticeFor("review-grow-C-strip", T0 + 2_000),
@@ -328,21 +329,58 @@ describe("a round that is only the AI answering a notice", () => {
 				toolCallId: "t1",
 				toolName: "ipython",
 				content: [{ type: "text", text: "ok" }],
+				details,
 				isError: false,
 				timestamp: T0 + 3_500,
 			},
 			assistant(T0 + 4_000, [{ type: "text", text: ACK }], "stop"),
 		];
-		expect(outline(replayed(withSteps)).some((entry) => entry.startsWith("answer: ") && entry.includes(ACK))).toBe(
-			true,
-		);
+		const shown = (messages: AgentMessage[]) =>
+			outline(replayed(messages)).some((entry) => entry.startsWith("answer: ") && entry.includes(ACK));
+		expect(
+			shown(withDetails({ activities: [{ id: "a", kind: "read", label: "x.md", status: "ok", startedAt: 1 }] })),
+		).toBe(false);
+		expect(
+			shown(
+				withDetails({
+					fileChanges: [
+						{
+							path: "/work/app/a.ts",
+							relPath: "a.ts",
+							kind: "modified",
+							scope: "project",
+							added: 1,
+							removed: 0,
+							source: "edit",
+							at: T0 + 3_400,
+						},
+					],
+				}),
+			),
+		).toBe(true);
+		expect(
+			shown(
+				withDetails({
+					memoryChanges: [
+						{ op: "created", kind: "memory", scope: "session", title: "结论 记忆", after: "x", at: T0 + 3_400 },
+					],
+				}),
+			),
+		).toBe(true);
+		expect(
+			shown(
+				withDetails({
+					activities: [{ id: "s", kind: "subagent", label: "review-x", status: "ok", startedAt: T0 + 3_300 }],
+				}),
+			),
+		).toBe(true);
 		const failed: AgentMessage[] = [
 			{ role: "user", content: "审查", timestamp: T0 },
 			assistant(T0 + 1_000, [{ type: "text", text: LONG_ANSWER }], "stop"),
 			noticeFor("review-grow-C-strip", T0 + 2_000),
 			{ ...assistant(T0 + 3_000, [{ type: "text", text: ACK }], "error"), errorMessage: "503" },
 		];
-		expect(outline(replayed(failed)).some((entry) => entry.startsWith("answer: ") && entry.includes(ACK))).toBe(true);
+		expect(shown(failed)).toBe(true);
 	});
 
 	it("never hides a round the owner started", () => {

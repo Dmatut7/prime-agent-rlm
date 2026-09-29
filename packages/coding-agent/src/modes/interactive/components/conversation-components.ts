@@ -147,30 +147,23 @@ export function noteWakeInRound(state: TurnActivityState | undefined, message: A
 	if (state) wakeCauses.get(state)?.add(message);
 }
 
-/** A reply this short, in a round woken only by notices, says nothing the owner needs. */
-const ACK_MAX_LENGTH = 40;
-
 /**
- * Whether a finished round is only the AI answering a subagent notice with one
- * short reply (`查过了，这条通知不用处理`): the owner did not start it, only notices
- * woke it, it ran no steps and shows nothing else, and its one reply is short and
- * did not fail. Such a round is not drawn unless "完整过程" is on.
+ * Whether a finished round is only the AI dealing with subagent notices (a child finished
+ * without a word, was cancelled): the owner did not start it, only such notices woke it (no
+ * report, no user input), and it did no work the owner would look for - it dispatched nothing,
+ * changed no files, saved no memory and ended without an unfixed error or a stop. Whatever the
+ * reply says and however many steps it took, such a round is not drawn unless "完整过程" is on.
  */
 export function isAckRound(state: TurnActivityState): boolean {
 	if (timelineShowAll.value || state.startedByUser || !state.isTurnEnded) return false;
-	if (!wakeCauses.get(state)?.noticeOnly || state.steps.length > 0) return false;
-	const entries = state.timeline.entries;
-	const only = entries.length === 1 ? entries[0] : undefined;
-	if (only?.kind !== "message") return false;
-	const reply = only.message;
-	if (reply.stopReason === "error" || reply.stopReason === "aborted") return false;
-	if (reply.content.some((block) => block.type === "toolCall")) return false;
-	const text = reply.content
-		.map((block) => (block.type === "text" ? block.text : ""))
-		.join(" ")
-		.replace(/\s+/g, " ")
-		.trim();
-	return text.length <= ACK_MAX_LENGTH;
+	if (!wakeCauses.get(state)?.noticeOnly) return false;
+	const timeline = state.timeline;
+	if (timeline.stopped || timeline.errorEnded) return false;
+	if (timeline.entries.some((entry) => entry.kind === "subagent")) return false;
+	const facts = state.boxView().facts;
+	if (facts.subagentCount > 0 || facts.projectChanges.length > 0 || facts.scratchChanges.length > 0) return false;
+	if (facts.memories.length > 0) return false;
+	return facts.errorCount === 0 || facts.errorsRecovered === true;
 }
 
 /** The turn head of a round that is only an acknowledgement: nothing of it is drawn. */

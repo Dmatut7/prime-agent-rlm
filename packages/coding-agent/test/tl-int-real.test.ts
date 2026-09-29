@@ -9,6 +9,7 @@ import {
 	createAgentSessionMessage,
 } from "../src/core/agent-messages.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
+import { createRlmChildTerminalNoticeMessage } from "../src/core/messages.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import { timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
@@ -77,14 +78,19 @@ function report(name: string, at_: number, conclusion: string): AgentSessionMess
 	);
 }
 
-function toolResult(id: string, at_: number, details: unknown = { status: "ok", stdout: "" }): AgentMessage {
+function toolResult(
+	id: string,
+	at_: number,
+	details: unknown = { status: "ok", stdout: "" },
+	isError = false,
+): AgentMessage {
 	return {
 		role: "toolResult",
 		toolCallId: id,
 		toolName: "ipython",
-		content: [{ type: "text", text: "ok" }],
+		content: [{ type: "text", text: isError ? "命令失败" : "ok" }],
 		details,
-		isError: false,
+		isError,
 		timestamp: at_,
 	};
 }
@@ -232,5 +238,91 @@ describe("subagents started from a Python cell get their dispatch row and lane",
 		expect(rows.find((row) => row.includes("├──╮"))).toContain("A ");
 		expect(chat.flow.subagentLane.tracker.pending).toEqual(NAMES);
 		chat.flow.dispose();
+	});
+});
+
+/** The round the real session shows after its summary: a notice that a child finished without a word. */
+describe("a round woken only by a silent-finish notice", () => {
+	const ACK =
+		"查过了，这条通知不用处理：车道 C 其实交了报告——我上一轮就收到了它的回复和完整报告文件，内容也已经并入给你的总报告里（就是 256 色撞码根因、旧面板信息丢失那几条）。它的报告文件还在 /tmp/review_20260929_growbatch/车道C_报告.md，四份车道报告都在原处，这条「没发回复」的系统提示是记账滞后，实际交付齐全。";
+
+	function afterSummary(extra: AgentMessage[] = [], reply: AgentMessage | undefined = undefined): AgentMessage[] {
+		const readReport = assistant(
+			at(19, 7),
+			[
+				{ type: "thinking", thinking: "先确认它交没交。" },
+				{
+					type: "toolCall",
+					id: "n1",
+					name: "ipython",
+					arguments: { code: 'print(open("/tmp/review/车道C_报告.md").read()[:200])' },
+				},
+			],
+			"toolUse",
+		);
+		return [
+			...transcript(),
+			createRlmChildTerminalNoticeMessage(
+				{ kind: "completed_without_reply", childId: "sub-80b28b9e", sessionName: NAMES[2] ?? "" },
+				at(19, 8),
+			),
+			readReport,
+			toolResult("n1", at(19, 8, 5), {
+				status: "ok",
+				stdout: "exists: True\n",
+				activities: [
+					{
+						id: "cmd-1",
+						kind: "command",
+						label: "cat 车道C_报告.md",
+						status: "ok",
+						detail: "",
+						startedAt: at(19, 8, 2),
+						endedAt: at(19, 8, 4),
+					},
+				],
+			}),
+			...extra,
+			reply ?? assistant(at(19, 9), [{ type: "text", text: ACK }], "stop"),
+		];
+	}
+
+	it("draws nothing of a long acknowledgement with three steps, and everything with 完整过程", () => {
+		setMotionReduced(true);
+		expect(ACK.length).toBeGreaterThan(150);
+		const rows = replay(afterSummary());
+		const screen = rows.join("\n");
+		expect(screen).toContain("审查完成，四车道都收口了。");
+		expect(screen).not.toContain("查过了，这条通知不用处理");
+		expect(rows.filter((row) => row.endsWith("总结"))).toHaveLength(1);
+		timelineShowAll.set(true);
+		expect(replay(afterSummary()).join("\n")).toContain("查过了，这条通知不用处理");
+	});
+
+	it("keeps the round when it saved a memory or ended on an unfixed error", () => {
+		setMotionReduced(true);
+		const memory = toolResult("n2", at(19, 8, 30), {
+			status: "ok",
+			memoryChanges: [
+				{
+					op: "created",
+					kind: "memory",
+					scope: "session",
+					title: "车道 收口 记账",
+					after: "已核",
+					at: at(19, 8, 30),
+				},
+			],
+		});
+		const saved = replay(afterSummary([call("n2", at(19, 8, 20), undefined), memory])).join("\n");
+		expect(saved).toContain("查过了，这条通知不用处理");
+		// The run ended right after a failed step, its last reply cut off: nothing corrected the failure.
+		const broken = toolResult("n3", at(19, 8, 40), { status: "error", error: "命令失败" }, true);
+		const cut = assistant(at(19, 9), [{ type: "text", text: "查过了，这条通知不用处理，让我再试" }], "length");
+		const failed = replay(afterSummary([call("n3", at(19, 8, 35), undefined), broken], cut)).join("\n");
+		expect(failed).toContain("查过了，这条通知不用处理");
+		// A failed step the AI then corrected and answered is not an alarm: the round stays out of sight.
+		const fixed = replay(afterSummary([call("n3", at(19, 8, 35), undefined), broken])).join("\n");
+		expect(fixed).not.toContain("查过了，这条通知不用处理");
 	});
 });
