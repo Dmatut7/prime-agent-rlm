@@ -1,0 +1,1 @@
+- Fixed subagent blocks, error blocks and the timeline grays looking the same in 256-color terminals such as macOS Terminal.app: error blocks are red there and the hover row no longer hides the timeline line.
