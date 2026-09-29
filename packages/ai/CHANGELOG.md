@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.15] - 2026-09-29
+
+- Fixed bare `</think>` lines showing up in replies between tool calls on OpenAI-compatible endpoints; reasoning that a provider streams inline between tags keeps its tags ([#41](https://github.com/Dmatut7/prime-agent-rlm/pull/41) by [@Lansyue](https://github.com/Lansyue)).
+- Fixed the thinking level having no effect on GLM models behind OpenAI-compatible endpoints: a model whose compat declares `supportsReasoningEffort` now also receives `reasoning_effort` mapped through its `thinkingLevelMap`.
+- Added the `claude-code` provider, which runs Claude models through the locally installed Claude Code CLI so usage draws from the Claude subscription instead of per-token billing.
+- Fixed log and error-body redaction missing `sk-` keys that contain a dot (such as the bailian `sk-ws-H.…` key).
+
 ## [0.11.14] - 2026-09-25
 
 - Changed the text-only image placeholder to say the image can be loaded again from its file path when a detail is missing from the earlier description.

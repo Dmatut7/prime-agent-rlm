@@ -1,7 +1,0 @@
-- Fixed the status bar saying "✓ 完成" after a turn that ended on an error; it now says "✗ 出错".
-- Fixed a turn box that kept "工作中" forever after the connection to the background session closed; the box now finishes and says the connection was lost.
-- Fixed a turn box that never finished after pressing Esc during a retry countdown, or when a retry gave up with no run after it.
-- Fixed an attempt the session dropped and started over still showing its thinking and tokens in the turn box.
-- Fixed a step that finished while attaching to a running session spinning forever in its box.
-- Fixed reopening a session whose last turn is longer than the reopen window: the box keeps its prompt, its real clock, and says how many earlier steps it left out.
-- Fixed a reopened session showing a turn the owner stopped as an error, and splitting a turn at a message typed during a cut-off step.

@@ -1,5 +1,0 @@
-- Fixed an earlier answer of a turn staying under its box next to the later answer that took over (for example after a subagent's notice carried the turn on); it now folds into the box.
-- Fixed a second window showing a turn stopped from another window as "✓ 完成"; it now says "■ 已停止".
-- Fixed a message typed in a window that joined a running turn mid-command starting a new box instead of showing as `你插话` in the running one.
-- Fixed a failed turn in the quiet conversation repeating its error under the box as an English `回顾：Model request failed …` line.
-- Changed the status bar's thinking level to read `思考强度 中`, so it is not mistaken for `思考中`.

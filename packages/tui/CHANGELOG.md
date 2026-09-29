@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.11.15] - 2026-09-29
+
+- Fixed an open menu ignoring keys after a dialog or tool prompt handed focus back to the editor; whatever took the keyboard while the menu was open gets it back when the menu closes ([#40](https://github.com/Dmatut7/prime-agent-rlm/pull/40) by [@Lansyue](https://github.com/Lansyue)).
+- Added `onWheel` and `passive` to click regions so a region can scroll its own content with the mouse wheel in the fullscreen viewport, handing the wheel back to the transcript at its ends.
+- Added `revealBelow` to click regions: a click that opens rows below itself keeps the clicked row under the pointer and scrolls only as far as needed to show them.
+- Fixed PageUp/PageDown going to the whole fullscreen viewport instead of a focused component that wants to page its own content, such as a turn box walk.
+- Fixed `matchesKey` and `parseKey` missing Alt+Shift+letter when a terminal without extended keys (tmux by default) sends it as ESC plus the uppercase letter, except Alt+Shift+B and Alt+Shift+F: ESC B and ESC F stay word movement (Alt+Left, Alt+Right); a lone Alt+Shift+O or Alt+Shift+P reaches the app after the input buffer's 10 ms flush.
+- Added mouse hover in fullscreen mode: interface regions can now react when the pointer enters or leaves them, because the terminal reports plain mouse moves.
+
 ## [0.11.14] - 2026-09-25
 
 - Added an Editor `transformPaste` hook that rewrites a bracketed paste before it is inserted.

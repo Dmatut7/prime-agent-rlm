@@ -1,4 +1,0 @@
-- Fixed `changeTracking.enabled` written as `"false"`, `"off"`, `"no"`, `"0"` or `0` leaving change tracking on; it now reads as off, and a value that is not `true` or `false` is reported as a settings warning saying how it was read.
-- Fixed Ctrl+P and Alt+P doing nothing, and saying nothing, in a chat with no agent message; they now say `还没有代理消息可以展开`.
-- Fixed Alt+Shift+O silently flipping the full-output switch after `/new` or a rebuild of the chat instead of saying `没有被省略的输出`, and fixed the discarded tool blocks staying in memory because of it.
-- Fixed a `settings.json` that does not parse starting the app in silence; the chat now shows a `settings.json 有错` line naming the file and what went wrong, since none of that file's settings apply.

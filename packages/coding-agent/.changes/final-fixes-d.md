@@ -1,2 +1,0 @@
-- Fixed Alt+Shift+O (show tool output in full) and the other Alt+Shift+letter shortcuts, such as the previous-model key, doing nothing in terminals without extended keys, for example tmux with its default settings.
-- Added the missing shortcuts to the keybindings reference: Alt+T and Alt+P, block navigation, expanding an agent's subagents and the stall diagnostics key; corrected the Ctrl+O description.

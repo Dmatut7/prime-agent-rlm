@@ -1,1 +1,0 @@
-- Added Claude Code models (`claude-code/claude-opus-5-5`, `claude-sonnet-5`, `claude-fable-5-1`, `claude-haiku-4-5`) that use your Claude subscription through the installed `claude` CLI, with the session's tools, memory and subagents working unchanged.

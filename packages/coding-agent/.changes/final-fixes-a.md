@@ -1,4 +1,0 @@
-- Fixed change tracking saving a diff in the clear when it held an `sk-` key with a dot in it (such as the bailian `sk-ws-H.…` key); the diff is now withheld like any other secret.
-- Fixed the edit skill's diff payload carrying the old and new text of an edit to a credential file, or to text that looks like a secret, into the session record; it now sends only the file's path, the edit rows say the content was not kept, and compaction still lists the file.
-- Changed change tracking to withhold more forms of a credential from saved records: a quoted passphrase of two to five words next to a credential's name, annotated assignments such as `password: str = "..."` and `:=` assignments, and URLs with a password but no user name such as `redis://:password@host`.
-- Fixed a step's label (a command line or a subagent's task text) being able to show a credential in the live step feed and the session record; a label that holds one now shows the step's kind instead.

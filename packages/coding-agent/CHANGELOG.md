@@ -1,5 +1,89 @@
 # Changelog
 
+## [0.11.15] - 2026-09-29
+
+- Changed the notice a parent gets when a subagent finishes without replying to carry the subagent's whole final answer (up to 4,000 characters, head and tail beyond that) instead of a 160-character preview, so the parent stops re-dispatching work that is already done.
+- Added Claude Code models (`claude-code/claude-opus-5-5`, `claude-sonnet-5`, `claude-fable-5-1`, `claude-haiku-4-5`) that use your Claude subscription through the installed `claude` CLI, with the session's tools, memory and subagents working unchanged.
+- Changed the agent's working guidance to explain why fixes need a test that failed first, why a report must match its evidence, and why problems noticed outside the task are worth reporting; the early-stop and silent-subagent notices now judge by whether the work is finished and proven.
+- Added change tracking to Python cells: each ipython result now records the files the cell created, edited, renamed or deleted (from Python or from `bash()` commands, with diffs), the harness memory, skill and note edits it made, and the commands, file reads, web searches and subagent spawns it ran, streamed live while the cell runs. Display-only: the model's context is unchanged; `changeTracking.enabled: false` turns it off.
+- Changed the quiet conversation to show each AI turn as one box under its `◆ prime` header: a live header says what is happening now, and the body lists the turn's thinking, commands, file reads, edits, memories, subagents, retries, compactions and interjections in order, each row opening to its full text, output or diff.
+- Added a change strip under each finished answer (`✎ 改了 2 个文件 +20 −7 ▸ · ✦ 记住了 1 条 ▸`) that opens the edited files' diffs and the memories' before and after.
+- Added a bottom status bar with the model, a context meter that turns amber at 80%, the running subagents and the run's state, time and output tokens.
+- Added `app.turn.focus` (default `alt+j`, also `ctrl+j` in terminals that tell it apart from a newline) to walk the latest box with the arrow keys, Enter to open a row and Escape to leave; the mouse wheel scrolls a box's body and a click toggles the box or a row.
+- Added the `ui.timelineOpenWhileWorking`, `ui.timelineAutoFold` and `ui.reduceMotion` settings, also in `/settings`.
+- Changed "waiting for a result" rows to name the command they wait for, and the recap line to read `回顾：`.
+- Added a short status message for a box's keys when there is nothing for them to act on (Ctrl+O/Alt+O, Ctrl+T/Alt+T, Alt+Shift+O, Ctrl+P/Alt+P, Alt+A, Alt+Up, Ctrl+Alt+Up/Down), instead of silently doing nothing; fixed Alt+O and Alt+T so they see a box's real steps and thinking instead of always treating it as empty.
+- Changed a box's walk (Alt+J) so Enter only offers to open a row that actually has more to show, and PageUp/PageDown scroll the box instead of the whole screen.
+- Changed legacy mode's Alt+J/Ctrl+J to toggle edit diffs, matching the quiet conversation's key.
+- Changed a command a box is still waiting on when its cell already ended to show as moved to the background instead of stuck running forever.
+- Added a stopped command's row shown faint instead of as an error, with a short result (`完成`, a test summary, or `退出码 N`) instead of its raw exit status.
+- Added a note to a turn's change summary when some of its file or memory changes could not be recorded in full.
+- Changed an earlier answer to fold once a later turn does real work, instead of staying fully expanded above it.
+- Added a "N 个已交回" count to a step that checked on subagents.
+- Fixed change tracking for Python cells that run many commands or work in a slow git repository: a cell keeps its latest 100 steps (with a count of earlier ones), live updates send only what changed, and a slow `git status` can no longer hold up a cell for longer than the tracking budget.
+- Fixed three change-tracking display problems: a file or memory change undone within the same cell no longer stays on screen, a command left running when its cell ends is shown as moved to the background (its result arrives in a later cell) instead of running forever, and a successful `git commit` step now carries its commit id.
+- Fixed change tracking listing a file git ignores when git is slow to check ignore rules, and a command that ends just as its cell ends no longer shows as running forever.
+- Fixed a command the owner stopped mid-run showing as a red "出错：Tool execution aborted" row in the turn box; it now shows as a faint `你停下了` row.
+- Fixed the turn box, the change strip and the memory note overflowing narrow terminals (24 columns or less), which crashed the non-fullscreen view.
+- Changed the change strip on narrow screens to drop whole parts instead of cutting a number, and to shorten file paths from the left so the file name stays visible.
+- Added a faint row saying how many earlier steps of a long cell are no longer listed.
+- Fixed a command that finished in the background showing twice; it now shows once, as finished (or failed with its exit code) in the background.
+- Added the short commit id to the result of a `git commit` step.
+- Added a note in place of the diff or memory text the kernel withheld because it looked like a secret; line counts still show.
+- Fixed the context meter disappearing after a compaction; it now says the context was just tidied until the next measurement.
+- Changed change tracking to keep secrets out of saved session records: credential files such as `.env` and private keys, and any diff or memory text holding a likely token or password, keep only their line counts.
+- Fixed the session's own storage folder and harness saves showing up as file changes when the session folder sits inside the working folder.
+- Fixed change tracking missing the files a background command (`h = bash(...)` not awaited) changed when it finished between cells; they are now listed in the next cell, next to the command's result.
+- Fixed macOS `sed -i` showing its short-lived temp file (`.!1234!name`) as a new file while the edited file was never listed.
+- Fixed change tracking for symlinks: a write through a link is listed under the real file, a new or removed link is shown as a link without its target's line counts, and a link to a changed file no longer adds a second row.
+- Documented that change tracking does not list files a command writes outside the session's working folder.
+- Fixed the status bar saying "✓ 完成" after a turn that ended on an error; it now says "✗ 出错".
+- Fixed a turn box that kept "工作中" forever after the connection to the background session closed; the box now finishes and says the connection was lost.
+- Fixed a turn box that never finished after pressing Esc during a retry countdown, or when a retry gave up with no run after it.
+- Fixed an attempt the session dropped and started over still showing its thinking and tokens in the turn box.
+- Fixed a step that finished while attaching to a running session spinning forever in its box.
+- Fixed reopening a session whose last turn is longer than the reopen window: the box keeps its prompt, its real clock, and says how many earlier steps it left out.
+- Fixed a reopened session showing a turn the owner stopped as an error, and splitting a turn at a message typed during a cut-off step.
+- Fixed a command step's last-output-line detail being able to show a credential (for example `cat .env` or `echo $API_KEY`); a detail that looks like a secret is now left out of the record instead of shown.
+- Fixed a symlink change showing as a file with `+0 −0`; the turn box, the change strip and the legacy edit summary now read it as a link (e.g. "新建链接 blink.txt").
+- Fixed an earlier answer of a turn staying under its box next to the later answer that took over (for example after a subagent's notice carried the turn on); it now folds into the box.
+- Fixed a second window showing a turn stopped from another window as "✓ 完成"; it now says "■ 已停止".
+- Fixed a message typed in a window that joined a running turn mid-command starting a new box instead of showing as `你插话` in the running one.
+- Fixed a failed turn in the quiet conversation repeating its error under the box as an English `回顾：Model request failed …` line.
+- Changed the status bar's thinking level to read `思考强度 中`, so it is not mistaken for `思考中`.
+- Fixed change tracking not listing symlinks that a command creates, re-points or removes in a working folder that is not a git repository; they now show as links.
+- Fixed a background command's finished record occasionally being reported after the end of the cell it belonged to.
+- Documented that files a background command changes between two cells can go unlisted when it is still running as the next cell starts and no background command ends in between.
+- Documented that the secret scan can also withhold the diff of ordinary code, such as a test fixture that looks like a credential.
+- Fixed Alt+Shift+O (show tool output in full) and the other Alt+Shift+letter shortcuts, such as the previous-model key, doing nothing in terminals without extended keys, for example tmux with its default settings.
+- Added the missing shortcuts to the keybindings reference: Alt+T and Alt+P, block navigation, expanding an agent's subagents and the stall diagnostics key; corrected the Ctrl+O description.
+- Fixed `changeTracking.enabled` written as `"false"`, `"off"`, `"no"`, `"0"` or `0` leaving change tracking on; it now reads as off, and a value that is not `true` or `false` is reported as a settings warning saying how it was read.
+- Fixed Ctrl+P and Alt+P doing nothing, and saying nothing, in a chat with no agent message; they now say `还没有代理消息可以展开`.
+- Fixed Alt+Shift+O silently flipping the full-output switch after `/new` or a rebuild of the chat instead of saying `没有被省略的输出`, and fixed the discarded tool blocks staying in memory because of it.
+- Fixed a `settings.json` that does not parse starting the app in silence; the chat now shows a `settings.json 有错` line naming the file and what went wrong, since none of that file's settings apply.
+- Fixed change tracking saving a diff in the clear when it held an `sk-` key with a dot in it (such as the bailian `sk-ws-H.…` key); the diff is now withheld like any other secret.
+- Fixed the edit skill's diff payload carrying the old and new text of an edit to a credential file, or to text that looks like a secret, into the session record; it now sends only the file's path, the edit rows say the content was not kept, and compaction still lists the file.
+- Changed change tracking to withhold more forms of a credential from saved records: a quoted passphrase of two to five words next to a credential's name, annotated assignments such as `password: str = "..."` and `:=` assignments, and URLs with a password but no user name such as `redis://:password@host`.
+- Fixed a step's label (a command line or a subagent's task text) being able to show a credential in the live step feed and the session record; a label that holds one now shows the step's kind instead.
+- Fixed the box of a finished turn that produced no text and no steps saying "直接回答了"; it now says "（这轮没有输出）".
+- Fixed the box and change strip click areas reaching past the screen edge in a terminal only 1 to 4 columns wide.
+- Fixed a long memory entry showing the start of a quoted password that straddled the 4000-character cut.
+- Fixed a memory entry whose title holds a credential being saved with that title; the title now shows the entry id and the texts are withheld.
+- Fixed Rust and Go credential declarations (`let password: &str = "..."`, `var token string = "..."`) not being withheld from change records.
+- Fixed a symlink replaced by a regular file of the same name showing as a link with no diff; it now lists as a modified file with its lines, in and outside a git repository.
+- Fixed on/off settings written as text, for example `"false"` in quotes, being read as on everywhere except `changeTracking.enabled`: nearly every on/off setting now reads `"false"`, `"off"`, `"no"`, `0` as off and warns that the value is not true or false; the agent-traces and telemetry consent settings and their project veto follow the same rule.
+- Fixed a settings.json whose top level is an array (`[]`) silently loading as defaults: like `null` or a number, it is now reported as a file that did not load, in the chat and at startup, in the global, project and repository-level files.
+- Fixed the "改动 N 个文件" total shown at the end of a turn in classic mode leaving out a file whose edit was withheld because it looks like a secret; it is now counted, and a turn with only withheld edits shows no "+0 −0".
+- Changed the turn box to fill the terminal's width instead of stopping at 120 columns.
+- Changed every step in the turn box into a block colored by its kind (thinking, command, read, file change, memory, subagent, error) with a small gap under it; an opened step, the live thought and a command's latest output hang under their block.
+- Changed every block to open on a click: a step with no lines of its own (a search, a command that printed nothing, a single file read, a notice) opens to its whole text, its result, when it happened and how long it took.
+- Changed a block to light up when the pointer is on it or the keyboard selects it, and to say `点开 ▸` (`收起 ▴` once open) ahead of its result.
+- Changed the AI's short notes between steps, and short interjections, to plain text that is not clickable; a long note stays a block that opens to the whole text.
+- Changed a question to show one `◆ prime` title even when subagents' handed-back messages wake the AI several times on the same model.
+- Changed a message a subagent hands back to read `◇ name 交回：…` (`发来：` from anyone else) instead of `◆ 收到消息 · 来自 …`.
+- Changed mistakes the AI corrected within a finished turn to appear as `出错 N 次，已改正` in the box header instead of a red row left outside the folded box.
+- Changed the finished box header's counts to be colored by kind.
+
 ## [0.11.14] - 2026-09-25
 
 - Fixed a pasted image file path on a text-only model: attach_image now loads it, the configured image model reads it, and the task hands back to the session model instead of the model delegating the image to a subagent.

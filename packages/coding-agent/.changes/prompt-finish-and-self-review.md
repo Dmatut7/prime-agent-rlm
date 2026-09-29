@@ -1,1 +1,0 @@
-- Changed the agent's working guidance to explain why fixes need a test that failed first, why a report must match its evidence, and why problems noticed outside the task are worth reporting; the early-stop and silent-subagent notices now judge by whether the work is finished and proven.

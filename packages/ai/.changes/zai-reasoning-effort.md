@@ -1,1 +1,0 @@
-- Fixed the thinking level having no effect on GLM models behind OpenAI-compatible endpoints: a model whose compat declares `supportsReasoningEffort` now also receives `reasoning_effort` mapped through its `thinkingLevelMap`.

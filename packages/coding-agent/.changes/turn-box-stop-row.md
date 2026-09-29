@@ -1,1 +1,0 @@
-- Fixed a command the owner stopped mid-run showing as a red "出错：Tool execution aborted" row in the turn box; it now shows as a faint `你停下了` row.
