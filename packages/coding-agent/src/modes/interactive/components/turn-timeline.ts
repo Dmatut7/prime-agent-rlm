@@ -148,8 +148,8 @@ export class TimelineUiState {
 	unseen = false;
 	/** Body line count at the last render (scrolling limits). */
 	lastBodyLines = 0;
-	/** Body lines at the last render without the lines the user opened, to notice new ones. */
-	lastContentLines = 0;
+	/** Rows at the last render, to notice new ones. */
+	lastRowCount = 0;
 	/** First body line and body height the last render showed (clicks and the wheel act on these). */
 	lastTop = 0;
 	lastVisible = 0;

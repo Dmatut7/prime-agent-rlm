@@ -561,10 +561,11 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		const total = body.length;
 		const visible = Math.min(total, input.maxBodyRows);
 		const maxTop = Math.max(0, total - visible);
-		// Only the turn's own new lines count as unseen, not what the user opened.
-		const content = body.reduce((count, line) => count + (line.detail ? 0 : 1), 0);
-		if (!ui.follow && content > ui.lastContentLines && ui.lastContentLines > 0) ui.unseen = true;
-		ui.lastContentLines = content;
+		// Only rows the turn added count as unseen: not what the user opened, and not
+		// the lines a row takes up, which a narrower terminal makes more of.
+		const content = rows.length;
+		if (!ui.follow && content > ui.lastRowCount && ui.lastRowCount > 0) ui.unseen = true;
+		ui.lastRowCount = content;
 		let top = ui.follow ? maxTop : Math.min(ui.scrollTop, maxTop);
 		const reveal = ui.revealKey;
 		if (reveal !== undefined && rowStart.has(reveal)) {
