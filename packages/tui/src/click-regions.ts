@@ -40,6 +40,10 @@ export interface ClickRegion {
 	onWheel?: (direction: -1 | 1) => boolean;
 	/** Stable identity of the region across frames; required for hover (regions are rebuilt every render). */
 	hoverKey?: string;
-	/** Called with true when the pointer enters this region and false when it leaves (fullscreen with mouse tracking only). */
+	/**
+	 * Called with true when the pointer enters this region and false when it leaves (fullscreen with mouse tracking only).
+	 * It may only change colors and styles: the number of rows and the position of regions must stay
+	 * the same, because the hover is re-checked against the pointer after every frame.
+	 */
 	onHover?: (hovered: boolean) => void;
 }

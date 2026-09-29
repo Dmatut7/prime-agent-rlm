@@ -17,6 +17,10 @@ const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
 const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0;\x07";
 
+// ?1002 first: a terminal that lacks ?1003 keeps clicks, wheel and drags; one that has it takes the next mode over.
+const MOUSE_TRACKING_ON = "\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+const MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1002l";
+
 // A preserved alternate screen is adopted by the next ProcessTerminal during in-process handoff.
 let pendingAltScreenHandoff: symbol | undefined;
 
@@ -127,8 +131,9 @@ export interface Terminal {
 	leaveAltScreen(): void;
 	get altScreenActive(): boolean;
 
-	// SGR mouse tracking (?1000 + ?1006); motion tracking is deliberately never
-	// enabled so native drag-selection keeps working.
+	// SGR mouse tracking (?1003 + ?1006). ?1003 reports every pointer move, not
+	// only drags, so components can react to hover. Any mouse reporting already
+	// takes native drag-selection from the terminal; selecting stays in-app.
 	setMouseTracking(enabled: boolean): void;
 	get mouseTrackingActive(): boolean;
 
@@ -156,6 +161,9 @@ export class ProcessTerminal implements Terminal {
 	private readonly altScreenHandoffToken = Symbol("altScreenHandoff");
 	private _altScreenActive = consumeAltScreenHandoff();
 	private _mouseTrackingActive = false;
+	// Set once the terminal is being drained for exit: reporting stays off however the UI asks.
+	private mouseTrackingSuspended = false;
+	private mouseExitGuard?: () => void;
 	private stdinBuffer?: StdinBuffer;
 	private stdinDataHandler?: (data: string) => void;
 	private keyboardProtocolFallbackTimer?: ReturnType<typeof setTimeout>;
@@ -186,6 +194,7 @@ export class ProcessTerminal implements Terminal {
 
 	start(onInput: (data: string) => void, onResize: () => void): void {
 		this.started = true;
+		this.mouseTrackingSuspended = false;
 		this.inputHandler = onInput;
 		this.resizeHandler = onResize;
 
@@ -391,6 +400,14 @@ export class ProcessTerminal implements Terminal {
 
 	async drainInput(maxMs = 1000, idleMs = 50): Promise<void> {
 		this.abortPendingInput();
+		// Like Kitty below, stop the source first: a pointer still moving would refresh
+		// the idle clock until maxMs, and reports still on their way would reach the shell.
+		if (this._mouseTrackingActive) {
+			process.stdout.write(MOUSE_TRACKING_OFF);
+			this._mouseTrackingActive = false;
+			this.disarmMouseExitGuard();
+		}
+		this.mouseTrackingSuspended = true;
 		if (this._kittyProtocolActive) {
 			// Disable Kitty keyboard protocol first so any late key releases
 			// do not generate new Kitty escape sequences.
@@ -440,9 +457,11 @@ export class ProcessTerminal implements Terminal {
 		}
 
 		if (this._mouseTrackingActive) {
-			process.stdout.write("\x1b[?1006l\x1b[?1002l");
+			process.stdout.write(MOUSE_TRACKING_OFF);
 			this._mouseTrackingActive = false;
 		}
+		this.disarmMouseExitGuard();
+		this.mouseTrackingSuspended = false;
 		if (this._altScreenActive) {
 			if (options.preserveAltScreen) {
 				pendingAltScreenHandoff = this.altScreenHandoffToken;
@@ -585,11 +604,37 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	setMouseTracking(enabled: boolean): void {
+		if (enabled && this.mouseTrackingSuspended) return;
 		if (enabled === this._mouseTrackingActive) return;
 		this._mouseTrackingActive = enabled;
-		// ?1002 (button-event tracking) reports drag motion for in-app selection
-		// but not hover, keeping passive mouse movement unreported.
-		this.write(enabled ? "\x1b[?1002h\x1b[?1006h" : "\x1b[?1006l\x1b[?1002l");
+		// ?1003 (any-event tracking) reports drags for in-app selection and, since
+		// hover, plain moves too. Off also clears ?1002 in case an older run left it set.
+		this.write(enabled ? MOUSE_TRACKING_ON : MOUSE_TRACKING_OFF);
+		if (enabled) {
+			this.armMouseExitGuard();
+		} else {
+			this.disarmMouseExitGuard();
+		}
+	}
+
+	// A process that dies without stop() (uncaught exception, process.exit) must not
+	// leave ?1003 on: the shell would print a report for every pointer move.
+	private armMouseExitGuard(): void {
+		if (this.mouseExitGuard) return;
+		this.mouseExitGuard = () => {
+			try {
+				process.stdout.write(MOUSE_TRACKING_OFF);
+			} catch {
+				// The terminal is already gone; nothing left to restore.
+			}
+		};
+		process.on("exit", this.mouseExitGuard);
+	}
+
+	private disarmMouseExitGuard(): void {
+		if (!this.mouseExitGuard) return;
+		process.removeListener("exit", this.mouseExitGuard);
+		this.mouseExitGuard = undefined;
 	}
 
 	get mouseTrackingActive(): boolean {

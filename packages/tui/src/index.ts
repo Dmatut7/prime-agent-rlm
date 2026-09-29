@@ -67,6 +67,7 @@ export {
 } from "./keys.js";
 export { latexToUnicode } from "./latex.js";
 export {
+	isMouseHover,
 	isMouseSequence,
 	isWheelDown,
 	isWheelUp,
