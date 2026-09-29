@@ -562,16 +562,26 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 		}
 	}
 
-	/** Two empty main-line rows, `HH:MM ◆ 总结` and an empty answer row: what opens the summary. */
+	/**
+	 * Two empty main-line rows, `HH:MM ◆ 总结` and an empty answer row: what opens
+	 * the summary. While the message still streams it may yet turn out to be a
+	 * step that ends in a tool call, so only the two gap rows show; the header
+	 * follows once the message has finished without one.
+	 */
 	private summaryLead(message: AssistantMessage): Component {
 		const lane = this.lane;
+		const streaming = this.isStreaming;
 		const time = Number.isFinite(message.timestamp) ? formatTimelineTime(message.timestamp) : undefined;
 		return new TimelineRows(
 			(width) => [
 				timelineRow({ main: "rail", lane }, "", "", width),
 				timelineRow({ main: "rail", lane }, "", "", width),
-				timelineRow({ time, main: "ai", lane }, theme.bold(theme.fg("timelineAi", "总结")), "", width),
-				timelineRow({ main: "answer", lane }, "", "", width),
+				...(streaming
+					? []
+					: [
+							timelineRow({ time, main: "ai", lane }, theme.bold(theme.fg("timelineAi", "总结")), "", width),
+							timelineRow({ main: "answer", lane }, "", "", width),
+						]),
 			],
 			[""],
 		);

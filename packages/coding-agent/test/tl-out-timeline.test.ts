@@ -257,14 +257,52 @@ describe("the summary on the timeline", () => {
 		expect(component.render(100)).toBe(component.render(100));
 	});
 
-	test("streaming grows the body in place without a second header", () => {
+	test("while it streams: the two gap rows and the words behind the bar, no header and no empty bar row", () => {
 		const component = new AssistantMessageComponent(undefined, false, undefined, "思考", { quiet: true });
 		component.updateContent(answer("先写一句。"), true);
-		expect(shown(component.render(100)).filter((line) => line.includes("总结"))).toHaveLength(1);
+		expect(shown(component.render(100))).toEqual([
+			"         │",
+			"         │",
+			"         ┃      先写一句。",
+			"         │",
+		]);
 		component.updateContent(answer("先写一句。\n\n再写一句。"), true);
 		const rows = shown(component.render(100));
-		expect(rows.filter((line) => line.includes("总结"))).toHaveLength(1);
-		expect(rows).toContain("         ┃      再写一句。");
+		expect(rows.join("\n")).not.toContain("总结");
+		expect(rows).toEqual([
+			"         │",
+			"         │",
+			"         ┃      先写一句。",
+			"         ┃",
+			"         ┃      再写一句。",
+			"         │",
+		]);
+	});
+
+	test("the header and the empty bar row appear once the message has finished with no tool calls", () => {
+		const component = new AssistantMessageComponent(undefined, false, undefined, "思考", { quiet: true });
+		component.updateContent(answer("先写一句。"), true);
+		expect(shown(component.render(100)).join("\n")).not.toContain("总结");
+		component.updateContent(answer("先写一句。"), false);
+		expect(shown(component.render(100))).toEqual([
+			"         │",
+			"         │",
+			" 19:06   ◆      总结",
+			"         ┃",
+			"         ┃      先写一句。",
+			"         │",
+		]);
+	});
+
+	test("a streaming summary draws the lane it was given on every row", () => {
+		const component = new AssistantMessageComponent(undefined, false, undefined, "思考", { quiet: true, lane: "on" });
+		component.updateContent(answer("先写一句。"), true);
+		expect(shown(component.render(100))).toEqual([
+			"         │  ┆",
+			"         │  ┆",
+			"         ┃  ┆   先写一句。",
+			"         │  ┆",
+		]);
 	});
 
 	test("an aborted answer keeps its `已中断` under the summary", () => {
@@ -314,11 +352,21 @@ describe("text of a message that carries tool calls is only the event row's", ()
 		expect(shown(quietAnswer(message).render(100)).join("\n")).toContain("已中断");
 	});
 
-	test("a streaming answer folds away once a tool call arrives, header and all", () => {
+	test("a streaming step that ends in a tool call never shows the summary header", () => {
 		const component = new AssistantMessageComponent(undefined, false, undefined, "思考", { quiet: true });
-		component.updateContent(answer("我先看一下"), true);
-		expect(shown(component.render(100)).join("\n")).toContain("总结");
+		const seen: string[] = [];
+		for (const words of ["我", "我先看", "我先看一下"]) {
+			component.updateContent(answer(words), true);
+			seen.push(...shown(component.render(100)));
+		}
+		expect(seen.length).toBeGreaterThan(0);
+		expect(seen.join("\n")).not.toContain("总结");
 		component.updateContent(assistant([{ type: "text", text: "我先看一下" }, call], { stopReason: "toolUse" }), true);
+		expect(component.render(100)).toEqual([]);
+		component.updateContent(
+			assistant([{ type: "text", text: "我先看一下" }, call], { stopReason: "toolUse" }),
+			false,
+		);
 		expect(component.render(100)).toEqual([]);
 	});
 
