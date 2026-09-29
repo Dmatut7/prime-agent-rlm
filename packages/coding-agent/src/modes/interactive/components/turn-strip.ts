@@ -24,8 +24,8 @@ import type { TurnTimeline } from "./turn-timeline.js";
  * ```
  *
  * A memory opens with one click straight to its words; a file list opens to
- * the diffs. The last row closes the request and toggles the rows the timeline
- * hides by default.
+ * the diffs. A compaction after the answer is a main-line row above the last
+ * row, which closes the request and toggles the rows the timeline hides by default.
  */
 
 /** What the host knows about the session's spend, as the status line shows it. */
@@ -262,7 +262,8 @@ export class TurnStripComponent implements Component {
 			theme.bold(theme.fg(open ? openColor : "timelineFaint", open ? "▴" : "▸"));
 
 		const hasEditsRow = facts.projectChanges.length > 0 || facts.commitId !== undefined || facts.trackingIncomplete;
-		const hasSections = hasEditsRow || facts.memories.length > 0;
+		const afterAnswer = facts.afterAnswer ?? [];
+		const hasSections = hasEditsRow || facts.memories.length > 0 || afterAnswer.length > 0;
 		// The answer above ends with one blank row of its own; a section sits two rows below it.
 		if (hasSections) gap();
 		if (hasEditsRow) this.editsSection(facts, safeWidth, push, stampOf, caretFor);
@@ -290,6 +291,15 @@ export class TurnStripComponent implements Component {
 				}
 				if (index < facts.memories.length - 1) gap();
 			}
+		});
+
+		// What happened after the answer (a compaction) comes after it, as a line of the main line.
+		afterAnswer.forEach((item, index) => {
+			if (index === 0 && (hasEditsRow || facts.memories.length > 0)) gap();
+			push({
+				gutter: gutterAt("ai", stampOf(item.at)),
+				content: theme.fg(item.failed ? "timelineMust" : "text", item.text),
+			});
 		});
 
 		if (hasSections) gap();

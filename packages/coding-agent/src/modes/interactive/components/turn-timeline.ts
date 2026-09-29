@@ -45,6 +45,14 @@ export interface TimelineRetry {
 	finalError?: string;
 }
 
+/** What is known about how a compaction ended when it did not simply finish. */
+export interface CompactionFacts {
+	before?: number;
+	failed?: string;
+	skipped?: boolean;
+	cancelled?: boolean;
+}
+
 export interface TimelineCompaction {
 	startedAt: number;
 	endedAt?: number;
@@ -55,6 +63,8 @@ export interface TimelineCompaction {
 	failed?: string;
 	/** Not a failure: the session chose to wait (the conversation is too short). */
 	skipped?: boolean;
+	/** Not a failure either: the owner cancelled it. */
+	cancelled?: boolean;
 	/** Rebuilt from the transcript; a live row of the same turn is the richer record. */
 	fromReplay?: boolean;
 }
@@ -593,18 +603,19 @@ export class TurnTimeline implements LaneOwner {
 		return undefined;
 	}
 
-	endCompaction(endedAt: number, facts: { before?: number; failed?: string; skipped?: boolean }): void {
+	endCompaction(endedAt: number, facts: CompactionFacts): void {
 		const compaction = this.activeCompaction();
 		if (!compaction) return;
 		compaction.endedAt = endedAt;
 		if (facts.before !== undefined) compaction.before = facts.before;
 		if (facts.failed) compaction.failed = facts.failed;
 		if (facts.skipped) compaction.skipped = true;
+		if (facts.cancelled) compaction.cancelled = true;
 		this.ui.bump();
 	}
 
 	/** A compaction the transcript records (its summary, or why it did not happen), settled. */
-	addReplayCompaction(at: number, facts: { before?: number; failed?: string; skipped?: boolean }): void {
+	addReplayCompaction(at: number, facts: CompactionFacts): void {
 		const key = `compact:replay:${at}`;
 		if (this.entries.some((entry) => entry.key === key)) return;
 		this.entries.push({
@@ -618,6 +629,7 @@ export class TurnTimeline implements LaneOwner {
 				...(facts.before !== undefined ? { before: facts.before } : {}),
 				...(facts.failed ? { failed: facts.failed } : {}),
 				...(facts.skipped ? { skipped: true } : {}),
+				...(facts.cancelled ? { cancelled: true } : {}),
 			},
 		});
 		this.ui.bump();
@@ -901,10 +913,7 @@ function childFailureWhy(details: RlmChildFailureDetails | undefined): string {
  */
 export function boxRecordFromMessage(
 	message: CustomMessage,
-):
-	| { kind: "notice"; notice: TimelineNotice }
-	| { kind: "compaction"; facts: { failed?: string; skipped?: boolean } }
-	| undefined {
+): { kind: "notice"; notice: TimelineNotice } | { kind: "compaction"; facts: CompactionFacts } | undefined {
 	if (message.customType === RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE) {
 		const details = message.details as RlmChildTerminalNoticeDetails | undefined;
 		const name = noticeName(details?.sessionName);
@@ -945,7 +954,7 @@ export function boxRecordFromMessage(
 	if (message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE) {
 		const details = message.details as CompactionOutcomeDetails | undefined;
 		const content = typeof message.content === "string" ? message.content : "";
-		if (details?.outcome === "cancelled") return { kind: "compaction", facts: { failed: "已取消" } };
+		if (details?.outcome === "cancelled") return { kind: "compaction", facts: { failed: "已取消", cancelled: true } };
 		const skipped = details?.outcome === "skipped";
 		return {
 			kind: "compaction",

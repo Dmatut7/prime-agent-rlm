@@ -93,6 +93,8 @@ export interface BoxRow {
 	files?: string[];
 	/** The event this row belongs to (its step list); absent for rows no event lists. */
 	groupKey?: string;
+	/** Comes after the turn's last answer: no event lists it, and the closing part of the turn draws it. */
+	trailing?: true;
 }
 
 export interface SpawnedSubagent {
@@ -993,6 +995,8 @@ function eventRow(entry: TimelineEntry, ctx: RowBuildContext): BoxRow | undefine
 			const compaction = entry.compaction;
 			const running = compaction.endedAt === undefined && !ctx.stopped;
 			const skipped = compaction.skipped === true;
+			// What the owner cancelled is what they asked for: it reads as a step, never as a failure.
+			const failedForReal = compaction.failed !== undefined && !skipped && compaction.cancelled !== true;
 			const text = running
 				? "上下文快满了，正在整理前面的内容…"
 				: skipped
@@ -1009,14 +1013,14 @@ function eventRow(entry: TimelineEntry, ctx: RowBuildContext): BoxRow | undefine
 				kind: "compact",
 				status: running ? "running" : "done",
 				glyph: "⇣",
-				glyphColor: compaction.failed && !skipped ? "runCardWarn" : "dim",
+				glyphColor: failedForReal ? "runCardWarn" : "dim",
 				text,
-				textColor: compaction.failed && !skipped ? "runCardWarn" : "muted",
+				textColor: failedForReal ? "runCardWarn" : "muted",
 				meta: [],
 				startedAt: compaction.startedAt,
 				...(compaction.endedAt ? { endedAt: compaction.endedAt } : {}),
 				// A compaction that did not happen stays on the timeline as a line of its own, as a failed retry does.
-				...(compaction.failed && !skipped && !running ? { persistent: true } : {}),
+				...(failedForReal && !running ? { persistent: true } : {}),
 			};
 		}
 		case "subagent": {
@@ -1231,6 +1235,17 @@ function stepsSummary(steps: readonly BoxRow[], spawned: number): string {
 	return parts.join(" · ");
 }
 
+/** The entry comes after the reply that answered the turn, and no reply follows it. */
+function afterFinalAnswer(timeline: TurnTimeline, index: number): boolean {
+	for (let before = index - 1; before >= 0; before--) {
+		const earlier = timeline.entries[before];
+		if (earlier?.kind !== "message") continue;
+		if (!earlier.ended || earlier.message.stopReason !== "stop") return false;
+		return !timeline.entries.slice(index + 1).some((later) => later.kind === "message");
+	}
+	return false;
+}
+
 /** Every row of a turn, in order. */
 export function buildTimelineRows(timeline: TurnTimeline, baseCtx: RowBuildContext): BoxRow[] {
 	return buildTimelineView(timeline, baseCtx).rows;
@@ -1295,16 +1310,6 @@ export function buildTimelineView(
 		const entry = timeline.entries[index];
 		if (entry?.kind === "message" && replyHasWork(entry.message)) workAfter = true;
 	}
-	/** The entry comes after the reply that answered the turn, and no reply follows it. */
-	const afterFinalAnswer = (index: number): boolean => {
-		for (let before = index - 1; before >= 0; before--) {
-			const earlier = timeline.entries[before];
-			if (earlier?.kind !== "message") continue;
-			if (!earlier.ended || earlier.message.stopReason !== "stop") return false;
-			return !timeline.entries.slice(index + 1).some((later) => later.kind === "message");
-		}
-		return false;
-	};
 	timeline.entries.forEach((entry, entryIndex) => {
 		if (entry.kind !== "message") {
 			const row = eventRow(entry, ctx);
@@ -1332,11 +1337,11 @@ export function buildTimelineView(
 						: entry.kind === "compact"
 							? entry.compaction.startedAt
 							: entry.at;
-				if (entry.kind === "compact" && !row.persistent && afterFinalAnswer(entryIndex)) {
-					// A compaction after the last answer belongs to no event: it says itself on a line of its own.
-					openEvent(`ev:${entry.key}`, at, [row.text]);
+				if (entry.kind === "compact" && afterFinalAnswer(timeline, entryIndex)) {
+					// A compaction after the last answer belongs to no event, and the answer is drawn above the
+					// closing part of the turn, not among the events: that part says it, in time order.
 					current = undefined;
-					rows.push(row);
+					rows.push({ ...row, trailing: true });
 				} else {
 					place(row, entry.key, at);
 				}
@@ -1510,6 +1515,8 @@ export interface TimelineFacts {
 	noOutput?: true;
 	/** The turn went fine, so its errors were mistakes it corrected itself. */
 	errorsRecovered?: true;
+	/** What happened after the turn's last answer (a compaction), for the closing part to say below it, in time order. */
+	afterAnswer?: Array<{ key: string; at: number; text: string; failed?: true }>;
 }
 
 export function timelineFacts(timeline: TurnTimeline, rows: readonly BoxRow[], ctx: RowBuildContext): TimelineFacts {
@@ -1538,6 +1545,18 @@ export function timelineFacts(timeline: TurnTimeline, rows: readonly BoxRow[], c
 	}
 	const hasOutput = timeline.entries.some((entry) => entry.kind === "message" && replyHasWork(entry.message));
 	const errorCount = rows.filter((row) => row.kind === "error").length;
+	const afterAnswer = rows.flatMap((row) =>
+		row.trailing
+			? [
+					{
+						key: row.key,
+						at: row.startedAt ?? 0,
+						text: row.text,
+						...(row.persistent ? { failed: true as const } : {}),
+					},
+				]
+			: [],
+	);
 	return {
 		thinkCount: rows.filter((row) => row.kind === "think").length,
 		commandCount: rows.filter((row) => row.kind === "cmd").length,
@@ -1552,6 +1571,7 @@ export function timelineFacts(timeline: TurnTimeline, rows: readonly BoxRow[], c
 		trackingIncomplete,
 		...(hasOutput ? {} : { noOutput: true as const }),
 		...(errorCount > 0 && endedWell(timeline, ctx) ? { errorsRecovered: true as const } : {}),
+		...(afterAnswer.length > 0 ? { afterAnswer } : {}),
 	};
 }
 

@@ -586,6 +586,7 @@ export class LiveTurnFlow {
 				...(event.result ? { before: event.result.tokensBefore } : {}),
 				...(failed ? { failed } : {}),
 				...(skipped ? { skipped: true } : {}),
+				...(event.aborted ? { cancelled: true } : {}),
 			});
 			const state = child.state;
 			if (state.isTurnEnded && state.timeline.finishedAt === undefined) this.scheduleFinish(state);
