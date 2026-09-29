@@ -1,0 +1,1 @@
+- Fixed a long memory entry showing the start of a quoted password that straddled the 4000-character cut.

@@ -299,6 +299,16 @@ def _looks_secret(text: str | None) -> bool:
         return True
 
 
+# A memory text is scanned this far into the text it is cut from: the cut takes the closing quote off a
+# value that crosses it, and an unterminated quote matches no value rule.
+_MEMORY_SCAN_CHARS = MAX_MEMORY_TEXT + 1024
+
+
+def _memory_text(text: str) -> tuple[str, bool]:
+    """`text` cut to the length a memory record carries, and whether the uncut start of it looks like a credential."""
+    return _clip(text, MAX_MEMORY_TEXT), _looks_secret(text[:_MEMORY_SCAN_CHARS])
+
+
 def _withhold_memory_texts(record: dict[str, Any], withheld: bool = False) -> None:
     """Drop both texts of a memory record when either holds a likely credential (or `withheld` says so)."""
     if withheld or _looks_secret(record.get("before")) or _looks_secret(record.get("after")):
@@ -2087,17 +2097,20 @@ class _Tracker:
             "id": rec.path,
             "title": info.display,
         }
+        secret = change.get("diffOmitted") == SENSITIVE
         before = rec.baseline.data if rec.baseline.state == "bytes" else None
         if before is not None and op != "created":
             text = _decode_text(before)
             if text is not None:
-                memory["before"] = _clip(text, MAX_MEMORY_TEXT)
+                memory["before"], hit = _memory_text(text)
+                secret = secret or hit
         if op != "deleted":
             after = self.cache.get(rec.path, _entry_sig(rec.path))
             text = _decode_text(after) if after is not None else None
             if text is not None:
-                memory["after"] = _clip(text, MAX_MEMORY_TEXT)
-        _withhold_memory_texts(memory, change.get("diffOmitted") == SENSITIVE)
+                memory["after"], hit = _memory_text(text)
+                secret = secret or hit
+        _withhold_memory_texts(memory, secret)
         memory["at"] = _now_ms()
         self.send(cell.id, {MEMORY_CHANGE_MIME: memory})
 
@@ -2197,7 +2210,7 @@ class _Tracker:
             # Sent under the lock: the cell cannot finish between being chosen here and the record going out.
             self.send_activity(cell.id, record)
 
-    def memory_change(self, record: dict[str, Any]) -> None:
+    def memory_change(self, record: dict[str, Any], withheld: bool = False) -> None:
         cell = self.cell
         if cell is None:
             return
@@ -2228,7 +2241,7 @@ class _Tracker:
                         record.pop("previousTitle", None)
             if not retract:
                 # Once withheld in a cell, an entry stays withheld: its earlier text held the secret.
-                _withhold_memory_texts(record, prior is not None and prior.get("textOmitted") == SENSITIVE)
+                _withhold_memory_texts(record, withheld or (prior is not None and prior.get("textOmitted") == SENSITIVE))
                 cell.memory[key] = record
         if retract:
             self.send(cell.id, {MEMORY_CHANGE_MIME: {"kind": key[0], "scope": key[1], "id": key[2], "retracted": True}})
@@ -2828,11 +2841,14 @@ def memory_change(
         }
         if previous_title is not None and previous_title != title:
             record["previousTitle"] = previous_title
+        secret = False
         if before is not None:
-            record["before"] = _clip(before, MAX_MEMORY_TEXT)
+            record["before"], hit = _memory_text(before)
+            secret = secret or hit
         if after is not None:
-            record["after"] = _clip(after, MAX_MEMORY_TEXT)
+            record["after"], hit = _memory_text(after)
+            secret = secret or hit
         record["at"] = _now_ms()
-        tracker.memory_change(record)
+        tracker.memory_change(record, secret)
     except Exception:  # noqa: BLE001
         pass
