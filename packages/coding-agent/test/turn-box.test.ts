@@ -409,9 +409,11 @@ describe("events inside the box", () => {
 			},
 			false,
 		);
+		// The turn ended on the error: nothing corrected it, so the red row stays out when folded.
+		turn.timeline.errorEnded = true;
 		turn.state.markTurnEnded(Date.now());
 		const closed = text(turn.summary.render(120));
-		expect(closed).toContain("▸ ✓");
+		expect(closed).toContain("▸ ✗");
 		expect(closed).toContain("ModuleNotFoundError: No module named 'nope'");
 		expect(closed).toContain("1 处出错");
 	});

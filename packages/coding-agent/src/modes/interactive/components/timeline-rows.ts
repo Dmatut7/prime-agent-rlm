@@ -1049,6 +1049,14 @@ function mergeReads(rows: BoxRow[]): BoxRow[] {
 	});
 }
 
+/**
+ * The turn is over and went fine: not running, not stopped by the owner, not
+ * ended on an error. Whatever went wrong on the way it corrected itself.
+ */
+function endedWell(timeline: TurnTimeline, ctx: RowBuildContext): boolean {
+	return !ctx.live && !ctx.stopped && !timeline.stopped && !timeline.errorEnded;
+}
+
 /** Every row of a turn, in order. */
 export function buildTimelineRows(timeline: TurnTimeline, baseCtx: RowBuildContext): BoxRow[] {
 	const settledActivities = new Map<string, { stepId: string; activity: KernelActivity }>();
@@ -1141,7 +1149,11 @@ export function buildTimelineRows(timeline: TurnTimeline, baseCtx: RowBuildConte
 		if (!seenSteps.has(step.toolCallId)) rows.push(...stepRows(step, timeline, ctx, order++));
 	}
 	const merged = mergeReads(rows);
-	return ctx.stopped ? merged.map((row) => (row.status === "running" ? stoppedRow(row) : row)) : merged;
+	const settled = ctx.stopped ? merged.map((row) => (row.status === "running" ? stoppedRow(row) : row)) : merged;
+	// A mistake a turn that went fine corrected no longer hangs outside the folded box: its header says so.
+	return endedWell(timeline, ctx)
+		? settled.map((row) => (row.kind === "error" && row.persistent ? { ...row, persistent: false } : row))
+		: settled;
 }
 
 /** The facts a finished box's header and the change strip say. */
@@ -1162,6 +1174,8 @@ export interface TimelineFacts {
 	trackingIncomplete: boolean;
 	/** No reply of the turn has text or a step: it produced nothing a reader sees. */
 	noOutput?: true;
+	/** The turn went fine, so its errors were mistakes it corrected itself. */
+	errorsRecovered?: true;
 }
 
 export function timelineFacts(timeline: TurnTimeline, rows: readonly BoxRow[], ctx: RowBuildContext): TimelineFacts {
@@ -1189,19 +1203,21 @@ export function timelineFacts(timeline: TurnTimeline, rows: readonly BoxRow[], c
 		});
 	}
 	const hasOutput = timeline.entries.some((entry) => entry.kind === "message" && replyHasWork(entry.message));
+	const errorCount = rows.filter((row) => row.kind === "error").length;
 	return {
 		thinkCount: rows.filter((row) => row.kind === "think").length,
 		commandCount: rows.filter((row) => row.kind === "cmd").length,
 		readCount: rows.reduce((sum, row) => sum + (row.kind === "read" ? (row.files?.length ?? 1) : 0), 0),
 		stepCount: new Set(steps.map((step) => step.toolCallId)).size + timeline.earlierSteps,
 		subagentCount: rows.filter((row) => row.kind === "subagent").length,
-		errorCount: rows.filter((row) => row.kind === "error").length,
+		errorCount,
 		projectChanges: changes.filter((change) => change.scope !== "scratch"),
 		scratchChanges: changes.filter((change) => change.scope === "scratch"),
 		memories,
 		...(commitId ? { commitId } : {}),
 		trackingIncomplete,
 		...(hasOutput ? {} : { noOutput: true as const }),
+		...(errorCount > 0 && endedWell(timeline, ctx) ? { errorsRecovered: true as const } : {}),
 	};
 }
 
@@ -1224,7 +1240,13 @@ export function summaryParts(facts: TimelineFacts): Array<{ text: string; color:
 	if (facts.subagentCount > 0) parts.push([{ text: `派了 ${facts.subagentCount} 个子代理`, color: "activityText" }]);
 	if (parts.length === 0 && facts.stepCount > 0)
 		parts.push([{ text: `做了 ${facts.stepCount} 步`, color: "activityText" }]);
-	if (facts.errorCount > 0) parts.push([{ text: `${facts.errorCount} 处出错`, color: "error" }]);
+	if (facts.errorCount > 0) {
+		parts.push(
+			facts.errorsRecovered
+				? [{ text: `出错 ${facts.errorCount} 次，已改正`, color: "kindRecovered" }]
+				: [{ text: `${facts.errorCount} 处出错`, color: "error" }],
+		);
+	}
 	if (parts.length === 0) parts.push([{ text: facts.noOutput ? "（这轮没有输出）" : "直接回答了", color: "muted" }]);
 	if (facts.trackingIncomplete) parts.at(-1)?.push({ text: " （有些改动没记全）", color: "dim" });
 	return parts;
