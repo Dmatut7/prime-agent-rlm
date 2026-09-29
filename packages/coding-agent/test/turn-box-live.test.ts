@@ -669,9 +669,10 @@ describe("a quiet turn, live", () => {
 		expectNoLiveFace(box);
 		const compactions = harness.eventsOfType("compaction_end").length;
 		expect(compactions).toBeGreaterThan(0);
-		// Each compaction is one step of the turn's event, and nowhere else.
+		// The compaction that interrupted the turn is one step of its event; the one after the last answer is a line of its own.
 		const opened = screen.opened(box);
-		expect(opened.match(/^ {9}│ {11}⇣ {2}整理完成：[\d.]+k → [\d.]+k tokens/gm)).toHaveLength(compactions);
+		expect(opened.match(/^ {9}│ {11}⇣ {2}整理完成：[\d.]+k → [\d.]+k tokens/gm)).toHaveLength(compactions - 1);
+		expect(screen.screen().match(/^ \d\d:\d\d {3}◆ {6}整理完成：[\d.]+k → [\d.]+k tokens/gm)).toHaveLength(1);
 		expect(screen.screen()).not.toContain("前面的对话整理过了");
 		expect(screen.screen()).toContain("日志看完了。");
 		expect(vi.getTimerCount()).toBe(0);

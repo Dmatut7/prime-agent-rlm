@@ -248,6 +248,7 @@ import {
 	giveLaneTracker,
 	isWakeMessage,
 	lastDrawnComponent,
+	latestShownTurn,
 	latestThinkingText,
 	NO_STEP_STOP,
 	noteWakeInRound,
@@ -8279,7 +8280,12 @@ export class InteractiveMode {
 					}
 					// A report that joined the running round is a row of that turn, not of the chat's end.
 					if (!this.turnFlow.placeRow(component, Number(message.timestamp) || Date.now(), options?.inlineIn)) {
-						this.chatContainer.addChild(component);
+						// A memory line after a finished request goes above its closing row, which stays the last line.
+						if (message.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE) {
+							this.turnFlow.addRowAboveClosingRow(component);
+						} else {
+							this.chatContainer.addChild(component);
+						}
 					}
 				}
 				break;
@@ -8474,6 +8480,11 @@ export class InteractiveMode {
 		const replayQuiet = this.settingsManager.getProcessMode() === "quiet";
 		// A rebuild replays the question from its start: who is still out is learned again as it goes.
 		this.turnFlow.subagentLane.reset();
+		// The reports the conversation received are learned again too, the ones the window left out first.
+		this.turnFlow.reports.clear();
+		for (const message of transcriptMessages.slice(0, transcriptMessages.length - windowed.length)) {
+			this.turnFlow.reports.note(message);
+		}
 		const toolNames: string[] = [];
 		for (const message of messagesToRender) {
 			if (message.role !== "assistant") {
@@ -8558,7 +8569,7 @@ export class InteractiveMode {
 			// ended on stays its own, and the woken turn never folds it away (a live run does the same).
 			if (replayQuiet && isWakeMessage(message) && insideReplayRound()) noteWakeInRound(replayTurnState, message);
 			if (replayQuiet && isWakeMessage(message) && !insideReplayRound() && !replayPromptOpened) {
-				replayCause ??= new WakeCause();
+				replayCause ??= new WakeCause(this.turnFlow.reports);
 				replayCause.add(message);
 				replayTurnState?.markTurnEnded(Number(message.timestamp) || Date.now());
 				closeReplayTurn();
@@ -8568,6 +8579,7 @@ export class InteractiveMode {
 				replaySentCommIds.clear();
 				replayStartedByUser = false;
 			}
+			this.turnFlow.reports.note(message);
 			if (message.role === "user") {
 				// A message typed while the AI was between its steps is an
 				// interjection inside that turn's box, not a new turn.
@@ -9846,7 +9858,7 @@ export class InteractiveMode {
 			this.focusEditor();
 			return true;
 		}
-		const summary = this.latestTurnSummary();
+		const summary = this.latestShownTurnSummary();
 		if (!summary?.state.boxMode) {
 			this.showToast("还没有可以看的步骤");
 			return true;
@@ -10405,6 +10417,11 @@ export class InteractiveMode {
 		return undefined;
 	}
 
+	/** The newest turn the chat draws: the keys act on what the owner sees, not on a round that is left out. */
+	private latestShownTurnSummary(): TurnSummaryComponent | undefined {
+		return latestShownTurn(this.chatContainer.children);
+	}
+
 	/**
 	 * Applies the lanes to one turn's span: the summary itself and every child
 	 * after it until the next turn's summary. Turn-less children (before the
@@ -10452,7 +10469,7 @@ export class InteractiveMode {
 		// calls, outputs, and edit diffs ride the same expanded state. The plain
 		// key acts on the latest turn; Alt+O acts globally (K3 ②).
 		if (!global) {
-			const summary = this.latestTurnSummary();
+			const summary = this.latestShownTurnSummary();
 			if (summary?.state.boxMode && summary.state.boxView().rows.length === 0) {
 				this.showToast("这一轮没有可以展开的步骤");
 				return;
@@ -10606,7 +10623,7 @@ export class InteractiveMode {
 		// not mutually exclusive); only the conversation-wide fallback below
 		// (no turn at all, or nothing anywhere for Alt+P) says why nothing moved.
 		if (!global) {
-			const summary = this.latestTurnSummary();
+			const summary = this.latestShownTurnSummary();
 			if (summary) {
 				const next = !summary.state.agentMessagesExpanded;
 				summary.state.agentMessagesExpanded = next;
@@ -10718,7 +10735,7 @@ export class InteractiveMode {
 			return;
 		}
 		if (!global) {
-			const summary = this.latestTurnSummary();
+			const summary = this.latestShownTurnSummary();
 			if (summary && !turnHasThinking(summary)) {
 				this.showToast("这一轮没有思考内容");
 				return;

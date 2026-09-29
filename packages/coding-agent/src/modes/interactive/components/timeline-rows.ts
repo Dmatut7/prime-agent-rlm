@@ -16,6 +16,7 @@ import { memoryBodyLines } from "./memory-detail.js";
 import { stepAction, turnStepLabel } from "./step-label.js";
 import { subagentTaskTag } from "./subagent-summary-line.js";
 import {
+	describeRetryReason,
 	firstSentence,
 	formatBoxDuration,
 	formatBoxTokens,
@@ -968,6 +969,8 @@ function eventRow(entry: TimelineEntry, ctx: RowBuildContext): BoxRow | undefine
 				meta: [],
 				startedAt: compaction.startedAt,
 				...(compaction.endedAt ? { endedAt: compaction.endedAt } : {}),
+				// A compaction that did not happen stays on the timeline as a line of its own, as a failed retry does.
+				...(compaction.failed && !skipped && !running ? { persistent: true } : {}),
 			};
 		}
 		case "subagent": {
@@ -1217,7 +1220,8 @@ export function buildTimelineView(
 		return item;
 	};
 	const place = (row: BoxRow, entryKey: string, at: number): void => {
-		if (row.persistent && !recovered && !ctx.live) {
+		// A failure is a line of its own unless the turn recovered from it; a compaction that failed never recovers.
+		if (row.persistent && (row.kind === "compact" || (!recovered && !ctx.live))) {
 			const key = `ev:${row.key}`;
 			items.push({ type: "fail", key, at });
 			current = undefined;
@@ -1244,6 +1248,16 @@ export function buildTimelineView(
 		const entry = timeline.entries[index];
 		if (entry?.kind === "message" && replyHasWork(entry.message)) workAfter = true;
 	}
+	/** The entry comes after the reply that answered the turn, and no reply follows it. */
+	const afterFinalAnswer = (index: number): boolean => {
+		for (let before = index - 1; before >= 0; before--) {
+			const earlier = timeline.entries[before];
+			if (earlier?.kind !== "message") continue;
+			if (!earlier.ended || earlier.message.stopReason !== "stop") return false;
+			return !timeline.entries.slice(index + 1).some((later) => later.kind === "message");
+		}
+		return false;
+	};
 	timeline.entries.forEach((entry, entryIndex) => {
 		if (entry.kind !== "message") {
 			const row = eventRow(entry, ctx);
@@ -1271,7 +1285,14 @@ export function buildTimelineView(
 						: entry.kind === "compact"
 							? entry.compaction.startedAt
 							: entry.at;
-				place(row, entry.key, at);
+				if (entry.kind === "compact" && !row.persistent && afterFinalAnswer(entryIndex)) {
+					// A compaction after the last answer belongs to no event: it says itself on a line of its own.
+					openEvent(`ev:${entry.key}`, at, [row.text]);
+					current = undefined;
+					rows.push(row);
+				} else {
+					place(row, entry.key, at);
+				}
 			}
 			return;
 		}
@@ -1319,8 +1340,27 @@ export function buildTimelineView(
 		});
 		const message = entry.message;
 		if (entry.ended && message.stopReason === "error" && message.errorMessage && lastRetryIndex < entryIndex) {
+			// A later reply of the turn is the retry the session made: said as the retry row it is live, not as a model error.
+			const retried = timeline.entries.slice(entryIndex + 1).some((later) => later.kind === "message");
+			const retryRow = retried
+				? eventRow(
+						{
+							seq: 0,
+							kind: "retry",
+							key: `retry:${entry.key}`,
+							retry: {
+								startedAt: at,
+								delayMs: 0,
+								attempt: 1,
+								reason: describeRetryReason({ errorMessage: message.errorMessage }),
+								outcome: "ok",
+							},
+						},
+						ctx,
+					)
+				: undefined;
 			place(
-				{
+				retryRow ?? {
 					key: `err:${entry.key}`,
 					kind: "error",
 					status: "failed",

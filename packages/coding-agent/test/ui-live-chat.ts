@@ -5,7 +5,11 @@ import {
 	type AgentSessionMessage,
 	createAgentSessionMessage,
 } from "../src/core/agent-messages.js";
-import { createRlmChildFailureMessage, createRlmChildTerminalNoticeMessage } from "../src/core/messages.js";
+import {
+	type CustomMessage,
+	createRlmChildFailureMessage,
+	createRlmChildTerminalNoticeMessage,
+} from "../src/core/messages.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../src/modes/agent-connection/types.js";
 import {
 	createAgentMessageRow,
@@ -174,7 +178,10 @@ export class LiveChat {
 		this.flow.agentStart();
 		const message = handedBack(id, this.tick(), options.name);
 		if (!this.flow.customMessage(message)) this.addMessageRow(message);
-		for (const other of options.also ?? []) this.addMessageRow(handedBack(other.id, this.tick(), other.name));
+		for (const other of options.also ?? []) {
+			const next = handedBack(other.id, this.tick(), other.name);
+			if (!this.flow.customMessage(next)) this.addMessageRow(next);
+		}
 		this.reply(options.model ?? "glm-5.3-prime", options.answer);
 	}
 
@@ -211,7 +218,14 @@ export class LiveChat {
 	/** A subagent's notice wakes the AI (it finished without a word, or it failed). */
 	wakeByNotice(
 		name: string,
-		options: { model?: string; answer?: string; failed?: boolean; lastText?: string; running?: boolean } = {},
+		options: {
+			model?: string;
+			answer?: string;
+			failed?: boolean;
+			cancelled?: boolean;
+			lastText?: string;
+			running?: boolean;
+		} = {},
 	): void {
 		this.streaming = true;
 		this.flow.agentStart();
@@ -219,12 +233,14 @@ export class LiveChat {
 		const notice = options.failed
 			? createRlmChildFailureMessage({ childId: `${name}-id`, sessionName: name, error: "boom", kind: "error" }, at)
 			: createRlmChildTerminalNoticeMessage(
-					{
-						kind: "completed_without_reply",
-						childId: `${name}-id`,
-						sessionName: name,
-						...(options.lastText ? { lastAssistantText: options.lastText } : {}),
-					},
+					options.cancelled
+						? { kind: "cancelled", childId: `${name}-id`, sessionName: name }
+						: {
+								kind: "completed_without_reply",
+								childId: `${name}-id`,
+								sessionName: name,
+								...(options.lastText ? { lastAssistantText: options.lastText } : {}),
+							},
 					at,
 				);
 		if (!this.flow.customMessage(notice)) {
@@ -337,6 +353,13 @@ export class LiveChat {
 	/** A subagent's message reaches the parent while its run goes on: its row lands in the chat. */
 	report(message: AgentSessionMessage): void {
 		if (!this.flow.customMessage(message)) this.addMessageRow(message);
+	}
+
+	/** A subagent's notice reaches the parent while its run goes on: the flow takes it, else it is a row of the chat. */
+	notice(message: CustomMessage): void {
+		if (this.flow.customMessage(message)) return;
+		const row = subagentNoticeRow(message, this.flow.subagentLane);
+		if (row && !this.flow.placeRow(row, message.timestamp)) this.chat.addChild(row);
 	}
 
 	/** A child's snapshot, as the daemon reports it. */

@@ -92,9 +92,27 @@ function transcript(): AgentMessage[] {
 		assistant(T0 + 1_000, [{ type: "text", text: "派出去了，等它们交回。" }], "stop"),
 		handedBack("m1", T0 + 2_000, "review-grow-A-tui"),
 		handedBack("m2", T0 + 3_000, "review-grow-B-box"),
+		handedBack("m3", T0 + 3_500, "review-grow-C-strip"),
 		assistant(T0 + 4_000, [{ type: "text", text: LONG_ANSWER }], "stop"),
 		noticeFor("review-grow-C-strip", T0 + 5_000),
 		assistant(T0 + 6_000, [{ type: "text", text: ACK }], "stop"),
+	];
+}
+
+/** The owner asks and the AI answers in full; subagent C had already handed its report back before that answer. */
+function answeredAfterReport(chat: LiveChat, ask = "对最近的改动做全面的审查"): void {
+	chat.user(ask);
+	chat.report(handedBack("m0", T0 + 500, "review-grow-C-strip"));
+	chat.say(T0 + 1_000, { words: LONG_ANSWER });
+	chat.endRun();
+}
+
+/** The same start as messages: C's report is in the transcript before the answer and the notice that follows it. */
+function reportedAndAnswered(): AgentMessage[] {
+	return [
+		{ role: "user", content: "审查", timestamp: T0 },
+		handedBack("m0", T0 + 500, "review-grow-C-strip"),
+		assistant(T0 + 1_000, [{ type: "text", text: LONG_ANSWER }], "stop"),
 	];
 }
 
@@ -103,7 +121,10 @@ function liveRun(): LiveChat {
 	chat.prompt("对最近的改动做全面的审查", { answer: "派出去了，等它们交回。" });
 	chat.wake("m1", {
 		name: "review-grow-A-tui",
-		also: [{ id: "m2", name: "review-grow-B-box" }],
+		also: [
+			{ id: "m2", name: "review-grow-B-box" },
+			{ id: "m3", name: "review-grow-C-strip" },
+		],
 		answer: LONG_ANSWER,
 	});
 	chat.wakeByNotice("review-grow-C-strip", { answer: ACK });
@@ -114,7 +135,7 @@ function liveRun(): LiveChat {
 describe("the answer a turn ends on is never taken over by the turn a message wakes", () => {
 	it("keeps the long conclusion under its own turn when a silent subagent's notice wakes the AI afterwards", () => {
 		const chat = new LiveChat();
-		chat.prompt("对最近的改动做全面的审查", { answer: LONG_ANSWER });
+		answeredAfterReport(chat);
 		chat.wakeByNotice("review-grow-C-strip", { answer: ACK });
 		vi.advanceTimersByTime(1_000);
 		expect(chat.summaries()).toHaveLength(2);
@@ -122,7 +143,7 @@ describe("the answer a turn ends on is never taken over by the turn a message wa
 		const answers = chat.chat.children.filter((child) => child instanceof AssistantMessageComponent);
 		expect(answers).toHaveLength(2);
 		expect(plain(answers[0]?.render(200) ?? []).join("\n")).toContain(LONG_ANSWER);
-		// The woken round only answered the notice with one short reply: not drawn unless 完整过程 is on.
+		// The woken round only answered the notice of a subagent that had reported: not drawn unless 完整过程 is on.
 		expect(answers[1]?.render(100)).toEqual([]);
 		timelineShowAll.set(true);
 		expect(plain(answers[1]?.render(200) ?? []).join("\n")).toContain(ACK);
@@ -200,7 +221,7 @@ describe("a live run and its replay draw the same layout", () => {
 			"turn(byUser=false)",
 			"turn(byUser=false)",
 		]);
-		expect(layout.filter((entry) => entry.startsWith("report: "))).toHaveLength(2);
+		expect(layout.filter((entry) => entry.startsWith("report: "))).toHaveLength(3);
 		expect(layout.some((entry) => entry.startsWith("notice: "))).toBe(true);
 		expect(layout.find((entry) => entry.includes(LONG_ANSWER))?.startsWith("answer: ")).toBe(true);
 		// Only the acknowledgement of the silent subagent's notice is out of sight.
@@ -227,7 +248,7 @@ describe("a live run and its replay draw the same layout", () => {
 describe("a round that is only the AI answering a notice", () => {
 	function chatWith(reply: string, options: { failed?: boolean } = {}): LiveChat {
 		const chat = new LiveChat();
-		chat.prompt("对最近的改动做全面的审查", { answer: LONG_ANSWER });
+		answeredAfterReport(chat);
 		chat.wakeByNotice("review-grow-C-strip", { answer: reply, ...options });
 		vi.advanceTimersByTime(1_000);
 		return chat;
@@ -252,11 +273,11 @@ describe("a round that is only the AI answering a notice", () => {
 		chat.flow.dispose();
 	});
 
-	it("draws the reply while the round still runs and takes it away when the run ends", () => {
+	it("leaves the reply out from its first word to its last, while the round runs and after it ends", () => {
 		const chat = new LiveChat();
-		chat.prompt("审查", { answer: LONG_ANSWER });
+		answeredAfterReport(chat, "审查");
 		chat.wakeByNotice("review-grow-C-strip", { answer: ACK, running: true });
-		expect(drawn(chat)).toContain(ACK);
+		expect(drawn(chat)).not.toContain(ACK);
 		chat.endRun();
 		vi.advanceTimersByTime(1_000);
 		expect(drawn(chat)).not.toContain(ACK);
@@ -265,8 +286,7 @@ describe("a round that is only the AI answering a notice", () => {
 
 	it("takes the reply away whatever its length", () => {
 		const reply = (length: number): AgentMessage[] => [
-			{ role: "user", content: "审查", timestamp: T0 },
-			assistant(T0 + 1_000, [{ type: "text", text: LONG_ANSWER }], "stop"),
+			...reportedAndAnswered(),
 			noticeFor("review-grow-C-strip", T0 + 2_000),
 			assistant(T0 + 3_000, [{ type: "text", text: "好".repeat(length) }], "stop"),
 		];
@@ -285,15 +305,26 @@ describe("a round that is only the AI answering a notice", () => {
 		chat.flow.dispose();
 	});
 
-	it("takes away the short reply to a failure notice, but the failure itself stays drawn", () => {
+	it("draws the reply to a failure notice, and the failure itself", () => {
 		const chat = new LiveChat();
-		chat.prompt("审查", { answer: LONG_ANSWER });
+		answeredAfterReport(chat, "审查");
 		chat.wakeByNotice("review-grow-C-strip", { failed: true, answer: ACK });
 		vi.advanceTimersByTime(1_000);
-		// A failed subagent is shown, and the short reply to it is still an acknowledgement.
+		// A failed subagent is news, even one that had reported: the AI's reply to it is drawn.
 		expect(drawn(chat)).toContain("失败（出错）");
-		expect(drawn(chat)).not.toContain(ACK);
+		expect(drawn(chat)).toContain(ACK);
 		chat.flow.dispose();
+	});
+
+	it("draws the reply to a silent finish of a subagent that never reported, and to a cancel of one", () => {
+		for (const cancelled of [false, true]) {
+			const chat = new LiveChat();
+			chat.prompt("审查", { answer: LONG_ANSWER });
+			chat.wakeByNotice("review-grow-D-docs", { answer: ACK, cancelled });
+			vi.advanceTimersByTime(1_000);
+			expect(drawn(chat)).toContain(ACK);
+			chat.flow.dispose();
+		}
 	});
 
 	it("draws the reply of a round a subagent's report woke, however short", () => {
@@ -320,8 +351,7 @@ describe("a round that is only the AI answering a notice", () => {
 	it("takes a round that only looked around away, and keeps one that changed a file, saved a memory, dispatched, or failed", () => {
 		const step = assistant(T0 + 3_000, [{ type: "toolCall", id: "t1", name: "ipython", arguments: { code: "1" } }]);
 		const withDetails = (details: unknown): AgentMessage[] => [
-			{ role: "user", content: "审查", timestamp: T0 },
-			assistant(T0 + 1_000, [{ type: "text", text: LONG_ANSWER }], "stop"),
+			...reportedAndAnswered(),
 			noticeFor("review-grow-C-strip", T0 + 2_000),
 			step,
 			{
@@ -375,8 +405,7 @@ describe("a round that is only the AI answering a notice", () => {
 			),
 		).toBe(true);
 		const failed: AgentMessage[] = [
-			{ role: "user", content: "审查", timestamp: T0 },
-			assistant(T0 + 1_000, [{ type: "text", text: LONG_ANSWER }], "stop"),
+			...reportedAndAnswered(),
 			noticeFor("review-grow-C-strip", T0 + 2_000),
 			{ ...assistant(T0 + 3_000, [{ type: "text", text: ACK }], "error"), errorMessage: "503" },
 		];

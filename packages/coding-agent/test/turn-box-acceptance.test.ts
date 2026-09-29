@@ -21,6 +21,7 @@ import { turnBoxFocusHints } from "../src/modes/interactive/components/turn-box-
 import { STRIP_EDITS, TurnStripComponent } from "../src/modes/interactive/components/turn-strip.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
+import { handedBack } from "./ui-live-chat.js";
 
 function usage(output: number): AssistantMessage["usage"] {
 	return {
@@ -209,10 +210,24 @@ describe("s3: a turn carried on by a subagent notice", () => {
 		const earlier = lineWith(closed.split("\n"), "已经派审查员去看了");
 		expect(earlier.startsWith("         ┃")).toBe(true);
 		expect(cell(earlier, "已经派审查员去看了")).toBe(16);
-		const summaryHeader = lineWith(closed.split("\n"), `${HH_MM(1_300)}   ◆      总结`);
-		expect(summaryHeader.trimEnd()).toBe(` ${HH_MM(1_300)}   ◆      总结`);
-		// Its own one short reply to the notice is out of sight until 完整过程 is on.
-		expect(closed).not.toContain("审查员看完了，没发现问题。");
+		// Each of the two rounds that answered has its own summary; the first is the earlier answer's.
+		const summaryHeaders = closed.split("\n").filter((line) => line.includes("◆      总结"));
+		expect(summaryHeaders).toHaveLength(2);
+		expect(summaryHeaders[0]?.trimEnd()).toBe(` ${HH_MM(1_300)}   ◆      总结`);
+		// The subagent never reported and its last words were news: the reply to the notice is drawn.
+		expect(closed).toContain("审查员看完了，没发现问题。");
+	});
+
+	it("leaves the reply to the notice out of sight when the subagent had already reported", () => {
+		setMotionReduced(true);
+		const reported: AgentMessage[] = [
+			...messages.slice(0, 4),
+			handedBack("r1", 1_350, "审查员"),
+			assistant(1_380, [{ type: "text", text: "收到审查员的报告了。" }], "stop"),
+			...messages.slice(4),
+		];
+		const components = replay(reported);
+		expect(renderAll(components)).not.toContain("审查员看完了，没发现问题。");
 		timelineShowAll.set(true);
 		try {
 			expect(renderAll(components)).toContain("审查员看完了，没发现问题。");

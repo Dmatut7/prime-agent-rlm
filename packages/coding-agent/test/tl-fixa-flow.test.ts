@@ -203,9 +203,10 @@ describe("a turn the owner opened stays the owner's when a report lands before t
 		expect(screenOf(host.chatContainer.children)).toContain(SHORT_ANSWER);
 	});
 
-	it("still hides the short reply of a round only a notice woke", () => {
+	it("still hides the short reply of a round only a notice of a subagent that had reported woke", () => {
 		const children = built([
 			{ role: "user", content: ASK, timestamp: T0 },
+			handedBack("m0", T0 + 500, "review-grow-C-strip"),
 			assistant(T0 + 1_000, [{ type: "text", text: "都在跑，稍等。" }], "stop"),
 			noticeFor("review-grow-C-strip", T0 + 2_000),
 			assistant(T0 + 3_000, [{ type: "text", text: SHORT_ANSWER }], "stop"),

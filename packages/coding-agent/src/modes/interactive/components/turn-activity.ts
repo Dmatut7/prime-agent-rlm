@@ -19,7 +19,7 @@ import {
 	type TimelineFacts,
 	timelineFacts,
 } from "./timeline-rows.js";
-import { computeBoxHeader, computeLiveTail, type InlineRow, renderTurnBox } from "./turn-box.js";
+import { computeBoxHeader, computeLiveTail, EVENT_STEPS_SHOWN, type InlineRow, renderTurnBox } from "./turn-box.js";
 import { TurnTimeline } from "./turn-timeline.js";
 
 export type TurnStepStatus = "queued" | "running" | "done" | "error";
@@ -851,11 +851,19 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	/** Ctrl+T in the quiet conversation: open every thinking row of this turn, or close them all. */
 	toggleThinkingRows(): void {
 		const ui = this.turnState.timeline.ui;
-		const thinking = this.turnState
-			.boxView()
-			.rows.filter((row) => row.kind === "think" && row.detail && !row.factsOnly);
+		const view = this.turnState.boxView();
+		const thinking = view.rows.filter((row) => row.kind === "think" && row.detail && !row.factsOnly);
+		// A thought is open only while it is on screen: under an event that is closed (Ctrl+O folded it) it is not.
+		const onScreen = (row: BoxRow): boolean => {
+			if (!ui.expanded.has(row.key)) return false;
+			const event = view.events.find((candidate) => candidate.steps.some((step) => step.key === row.key));
+			if (!event) return true;
+			if (!ui.expanded.has(event.key)) return false;
+			const position = event.steps.findIndex((step) => step.key === row.key);
+			return position < EVENT_STEPS_SHOWN || ui.expanded.has(`all:${event.key}`);
+		};
 		this.setThinkingRows(
-			thinking.length > 0 ? thinking.some((row) => !ui.expanded.has(row.key)) : !this.turnState.thinkingExpanded,
+			thinking.length > 0 ? thinking.some((row) => !onScreen(row)) : !this.turnState.thinkingExpanded,
 		);
 	}
 
