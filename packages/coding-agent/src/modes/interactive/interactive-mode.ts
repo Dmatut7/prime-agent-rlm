@@ -361,6 +361,7 @@ import { formatResumeHint } from "./resume-hint.js";
 import {
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
+	getEditorTextColors,
 	getEditorTheme,
 	getMarkdownTheme,
 	getThemeByName,
@@ -1794,8 +1795,7 @@ export class InteractiveMode {
 			autocompleteMaxVisible,
 			isArgumentCommand: builtinSlashCommandTakesArgument,
 			placeholder: this.startHint,
-			placeholderColor: (text) => theme.fg("dim", text),
-			hintColor: (text) => theme.fg("dim", text),
+			...getEditorTextColors(),
 		});
 		this.editor = this.defaultEditor;
 		this.mainContainer = new Container();

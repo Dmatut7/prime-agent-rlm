@@ -1,4 +1,4 @@
-import { Container, setKeybindings, Text, TUI, type TUI as TuiType } from "@earendil-works/pi-tui";
+import { Container, setKeybindings, Text, TUI, type TUI as TuiType, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.js";
@@ -9,7 +9,7 @@ import {
 	type SubagentPanelRow,
 	SubagentSummaryLine,
 } from "../src/modes/interactive/components/subagent-summary-line.js";
-import { getEditorTheme, initTheme } from "../src/modes/interactive/theme/theme.js";
+import { getEditorTextColors, getEditorTheme, initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 /**
  * The prompt's chrome, as the Tl2Live / Tl2Done design's foot draws it: a top rule, the input line,
@@ -146,5 +146,60 @@ describe("the strip reports whether it draws a row", () => {
 	it("is true with a block and false with none", () => {
 		expect(stripWith(rows).hasBlocks()).toBe(true);
 		expect(stripWith([]).hasBlocks()).toBe(false);
+	});
+});
+
+describe("the prompt's colors", () => {
+	beforeAll(() => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+	});
+
+	const WIDTH = 60;
+	const placeholder = "随时补充或纠正，Enter 发给 AI";
+
+	function editor(): CustomEditor {
+		const created = new CustomEditor(fakeTui, getEditorTheme(), new KeybindingsManager(), {
+			placeholder,
+			isArgumentCommand: (name) => name === "model",
+			...getEditorTextColors(),
+		});
+		created.getBorderHints = () => ["Ctrl+O 过程"];
+		return created;
+	}
+
+	it("draws the top rule in the rail color and the key hints inside it in the time color", () => {
+		const [top] = editor().render(WIDTH);
+		const label = " Ctrl+O 过程 ";
+		const rule = WIDTH - 2 - visibleWidth(label);
+		expect(top).toBe(
+			`${theme.fg("timelineRail", "─".repeat(rule))}${theme.fg("timelineTime", label)}${theme.fg("timelineRail", "──")}`,
+		);
+	});
+
+	it("draws the bottom rule in the rail color", () => {
+		const lines = editor().render(WIDTH);
+		expect(lines.at(-1)).toBe(theme.fg("timelineRail", "─").repeat(WIDTH));
+	});
+
+	it("draws the ` › ` prompt in the soft color, the placeholder in the time color", () => {
+		const line = editor().render(WIDTH)[1] ?? "";
+		expect(line).toContain(theme.fg("timelineSoft", " › "));
+		expect(line).toContain(theme.fg("timelineTime", placeholder));
+	});
+
+	it("keeps the prompt soft once text is typed, and the command token in the accent color", () => {
+		const typed = editor();
+		typed.setText("hello");
+		expect(typed.render(WIDTH)[1]).toContain(theme.fg("timelineSoft", " › "));
+		const command = editor();
+		command.setText("/model gpt");
+		const line = command.render(WIDTH)[1] ?? "";
+		expect(line).toContain(theme.fg("timelineSoft", " › "));
+		expect(line).toContain(theme.fg("accent", "/model"));
+	});
+
+	it("the editor theme's own border color is the rail color", () => {
+		expect(getEditorTheme().borderColor("x")).toBe(theme.fg("timelineRail", "x"));
 	});
 });

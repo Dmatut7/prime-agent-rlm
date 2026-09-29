@@ -18,6 +18,8 @@ export interface CustomEditorOptions extends EditorOptions {
 	isArgumentCommand?: (name: string) => boolean;
 	/** Color of the key hints embedded in the top rule; defaults to the border color. */
 	hintColor?: (text: string) => string;
+	/** Color of the ` › ` prompt mark; defaults to the theme's command color. */
+	promptColor?: (text: string) => string;
 }
 
 /**
@@ -37,6 +39,7 @@ export class CustomEditor extends Editor {
 	private readonly placeholderColor: (text: string) => string;
 	private readonly isArgumentCommand: (name: string) => boolean;
 	private readonly hintColor: (text: string) => string;
+	private readonly promptColor: ((text: string) => string) | undefined;
 	private readonly argTokenHighlighter = new ArgTokenHighlighter();
 	public actionHandlers: Map<AppKeybinding, () => unknown> = new Map();
 
@@ -68,6 +71,7 @@ export class CustomEditor extends Editor {
 		this.placeholderColor = options?.placeholderColor ?? ((text) => text);
 		this.isArgumentCommand = options?.isArgumentCommand ?? (() => false);
 		this.hintColor = options?.hintColor ?? ((text) => this.borderColor(text));
+		this.promptColor = options?.promptColor;
 	}
 
 	protected override getPromptPrefix(): string {
@@ -78,7 +82,8 @@ export class CustomEditor extends Editor {
 		if (prefix.startsWith("!")) {
 			return this.borderColor(prefix);
 		}
-		return this.commandColor ? this.commandColor(prefix) : prefix;
+		const color = this.promptColor ?? this.commandColor;
+		return color ? color(prefix) : prefix;
 	}
 
 	protected override getHiddenTextPrefixLength(lineIndex: number, line: string): number {

@@ -1637,11 +1637,24 @@ export function getSelectListTheme(): SelectListTheme {
 
 export function getEditorTheme(): EditorTheme {
 	return {
-		// The prompt is framed by two thin rules rather than a filled surface.
-		borderColor: (text: string) => theme.fg("borderMuted", text),
+		// The prompt is framed by thin rules rather than a filled surface.
+		borderColor: (text: string) => theme.fg("timelineRail", text),
 		autocompleteBackgroundColor: (text: string) => theme.getPopupBackgroundColor()(text),
 		selectList: getSelectListTheme(),
 		commandColor: (text: string) => theme.fg("accent", text),
+	};
+}
+
+/** The colors of the prompt line's own text: the ` › ` mark, the placeholder and the key hints in the top rule. */
+export function getEditorTextColors(): {
+	promptColor: (text: string) => string;
+	placeholderColor: (text: string) => string;
+	hintColor: (text: string) => string;
+} {
+	return {
+		promptColor: (text: string) => theme.fg("timelineSoft", text),
+		placeholderColor: (text: string) => theme.fg("timelineTime", text),
+		hintColor: (text: string) => theme.fg("timelineTime", text),
 	};
 }
 
