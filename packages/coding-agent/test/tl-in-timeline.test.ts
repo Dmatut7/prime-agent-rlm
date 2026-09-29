@@ -642,3 +642,22 @@ describe("long words and empty turns", () => {
 		expect(told).toHaveBeenCalledTimes(2);
 	});
 });
+
+describe("the blank row above the live tail follows the lane as it is now", () => {
+	it("draws `┆` there once agents are dispatched, though the tail was drawn before", () => {
+		const turn = quietTurn(true);
+		const tracker = new TimelineLaneTracker();
+		turn.summary.setLaneTracker(tracker);
+		say(turn, T0, "先看一下。", [{ id: "c1", command: "git status" }]);
+		const spinRow = (lines: string[]) => lines.findIndex((line) => /^ \d\d:\d\d {3}[⠀-⣿]/.test(line));
+		const before = plain(turn.summary.render(WIDTH));
+		expect(before[spinRow(before) - 1]?.trimEnd()).toBe("         │");
+		turn.timeline.upsertSubagent({ childId: "a", name: "A", status: "running" }, T0 + MINUTE);
+		say(turn, Date.now() - 5_000, "趁它们干活。", [{ id: "c2", command: "git diff", status: "running" }], false);
+		const after = plain(turn.summary.render(WIDTH));
+		expect(after[spinRow(after) - 1]?.trimEnd()).toBe("         │  ┆");
+		tracker.reported("A");
+		const done = plain(turn.summary.render(WIDTH));
+		expect(done[spinRow(done) - 1]?.trimEnd()).toBe("         │");
+	});
+});

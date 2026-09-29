@@ -522,7 +522,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 	const tail = input.tail;
 	if (tail) {
 		const last = specs.at(-1);
-		if (last && !(last.gutter.main === "rail" && last.content === "")) gap("tail");
+		if (last && !(last.gutter.main === "rail" && last.content === "")) gap("tail", tracker?.lane ?? "off");
 		const lane = tracker?.lane ?? "off";
 		const stepNote = tail.stepCount > 0 ? theme.fg("timelineFaint", `第 ${tail.stepCount} 步`) : "";
 		specs.push({
