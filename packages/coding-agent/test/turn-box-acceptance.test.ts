@@ -327,12 +327,12 @@ describe("the result column of a command", () => {
 
 	it("says done instead of dumping a line of the command's data", () => {
 		const out = openBox(commandTurn('{"name": "app", "version": "1.2.3", "private": true}'));
-		expect(out).toMatch(/\$ cat package\.json\s+✓ 完成 │/);
+		expect(out).toMatch(/\$ cat package\.json\s+✓ 完成\s+│/);
 		expect(out).not.toContain('"version"');
 	});
 
 	it("keeps a short status line as it is", () => {
-		expect(openBox(commandTurn("133 total"))).toMatch(/\$ cat package\.json\s+✓ 133 total │/);
+		expect(openBox(commandTurn("133 total"))).toMatch(/\$ cat package\.json\s+✓ 133 total\s+│/);
 	});
 });
 
@@ -351,7 +351,7 @@ describe("a step that checked on the subagents", () => {
 		turn.timeline.upsertSubagent({ childId: "b", name: "测试员", status: "done", result: "测试全过" });
 		finish(turn);
 		const out = openBox(turn);
-		expect(out).toMatch(/查看子代理\s+✓ 2 个已交回 │/);
+		expect(out).toMatch(/查看子代理\s+✓ 2 个已交回\s+│/);
 		expect(out).not.toContain("4.2秒");
 	});
 });
@@ -397,7 +397,7 @@ describe("C-3: changes the kernel could not diff", () => {
 	it("gives the reason on the row instead of +0 −0", () => {
 		const { turn } = omittedTurn();
 		const out = openBox(turn);
-		expect(out).toMatch(/✎ data\/big\.json\s+改动太大，没有显示 │/);
+		expect(out).toMatch(/✎ data\/big\.json\s+改动太大，没有显示\s+│/);
 		expect(out).not.toContain("+0");
 	});
 
@@ -478,7 +478,7 @@ describe("F2: a command left running in the background", () => {
 		);
 		finish(turn);
 		const out = openBox(turn);
-		expect(out).toMatch(/\$ npm run build\s+✓ built in 4s │/);
+		expect(out).toMatch(/\$ npm run build\s+✓ built in 4s\s+│/);
 		expect(out).not.toContain("转到后台继续跑");
 		expect(out.split("\n").filter((line) => line.includes("npm run build") && !line.includes("✓"))).toEqual([]);
 	});

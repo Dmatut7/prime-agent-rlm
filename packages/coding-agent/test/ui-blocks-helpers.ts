@@ -6,6 +6,7 @@ import {
 	TurnActivityState,
 	TurnSummaryComponent,
 } from "../src/modes/interactive/components/turn-activity.js";
+import { initTheme, type ThemeBg, type ThemeColor, theme } from "../src/modes/interactive/theme/theme.js";
 
 export const T0 = 1_700_000_000_000;
 
@@ -114,3 +115,72 @@ export function addCommand(
 export const plain = (lines: readonly string[]): string[] =>
 	lines.map((line) => stripAnsi(line).replace(/\x1b_[^\x07]*\x07/g, ""));
 export const text = (lines: readonly string[]): string => plain(lines).join("\n");
+
+/** Truecolor, so two neighbouring background colors never collapse into one 256-color step. */
+export function useTruecolorTheme(): () => void {
+	const previous = process.env.COLORTERM;
+	process.env.COLORTERM = "truecolor";
+	initTheme("prime");
+	return () => {
+		if (previous === undefined) delete process.env.COLORTERM;
+		else process.env.COLORTERM = previous;
+	};
+}
+
+export function hasBg(line: string, color: ThemeBg): boolean {
+	return line.includes(theme.getBgAnsi(color));
+}
+
+export function hasFg(line: string, color: ThemeColor): boolean {
+	return line.includes(theme.getFgAnsi(color));
+}
+
+/** The foreground escape that paints in a background color's own color (the block's separator row). */
+export function bgAsFg(color: ThemeBg): string {
+	return theme.getBgAnsi(color).replace("\x1b[48;", "\x1b[38;");
+}
+
+/** The box's own header is line 2 of a turn (after the `◆ prime` line and the top border): the body starts below it. */
+const FIRST_BODY_LINE = 4;
+
+/** The index of the first body line (never the header) whose plain text contains `needle`, or -1. */
+export function lineIndexWith(lines: readonly string[], needle: string): number {
+	const index = plain(lines).findIndex((line, at) => at >= FIRST_BODY_LINE && line.includes(needle));
+	return index;
+}
+
+/** The first body line (raw, with colors) whose plain text contains `needle`. */
+export function rawLineWith(lines: readonly string[], needle: string): string {
+	const index = lineIndexWith(lines, needle);
+	if (index < 0) throw new Error(`no line contains ${needle}`);
+	return lines[index] ?? "";
+}
+
+/** A finished step of `activities` (kernel records) on the turn. */
+export function addActivities(
+	turn: QuietTurn,
+	id: string,
+	activities: Array<Record<string, unknown>>,
+	extra: Record<string, unknown> = {},
+): void {
+	addStep(turn, id, "await work()");
+	turn.timeline.mergeStep(id, "ipython", {}, { details: { activities, ...extra } }, false);
+}
+
+export function addThought(turn: QuietTurn, textOfThought: string, timestamp = Date.now() - 3_000): void {
+	turn.timeline.noteMessage(assistant(timestamp, [{ type: "thinking", thinking: textOfThought }]), true);
+}
+
+/** A reply that says something and then calls a step: the words before the step become a note row. */
+export function addSay(turn: QuietTurn, words: string, id: string, timestamp = Date.now() - 2_000): void {
+	turn.timeline.noteMessage(
+		assistant(timestamp, [
+			{ type: "text", text: words },
+			{ type: "toolCall", id, name: "ipython", arguments: { code: "await bash('true')" } },
+		]),
+		true,
+	);
+	turn.state.addStep({ toolCallId: id, toolName: "ipython", args: { code: "await bash('true')" }, status: "queued" });
+	turn.state.setStepStatus(id, "running", timestamp);
+	turn.state.setStepStatus(id, "done", timestamp + 500);
+}

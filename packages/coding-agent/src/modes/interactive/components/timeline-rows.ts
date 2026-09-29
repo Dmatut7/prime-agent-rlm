@@ -74,6 +74,8 @@ export interface BoxRow {
 	window?: string;
 	/** Lines the row shows once opened; absent when it has nothing more to show. */
 	detail?: (width: number) => string[];
+	/** A note's whole text: when it fits in a few lines the box shows it as plain text instead of a block. */
+	fullText?: string;
 	/** Stays visible when the box folds (failures). */
 	persistent?: boolean;
 	/** Files a merged read row covers. */
@@ -860,17 +862,17 @@ function thinkRows(
 		} else if (block.type === "text" && (superseded || (firstToolCall !== -1 && index < firstToolCall))) {
 			const text = (block.text ?? "").trim();
 			if (!text) return;
-			const summary = firstSentence(text);
 			rows.push({
 				key: `say:${entry.key}:${index}`,
 				kind: "say",
 				status: "plain",
 				glyph: "·",
 				glyphColor: "dim",
-				text: summary,
+				text: firstSentence(text),
 				textColor: "muted",
 				meta: [],
-				...(saysMoreThan(text, summary) ? { detail: (width: number) => wrapped(text, width, "muted") } : {}),
+				fullText: text,
+				detail: (width: number) => wrapped(text, width, "muted"),
 			});
 		}
 	});
@@ -884,8 +886,7 @@ function contextSize(tokens: number): string {
 
 function eventRow(entry: TimelineEntry, ctx: RowBuildContext): BoxRow | undefined {
 	switch (entry.kind) {
-		case "steer": {
-			const long = visibleWidth(entry.text) > 48;
+		case "steer":
 			return {
 				key: entry.key,
 				kind: "steer",
@@ -897,9 +898,9 @@ function eventRow(entry: TimelineEntry, ctx: RowBuildContext): BoxRow | undefine
 				text: entry.text,
 				textColor: "activityText",
 				meta: [],
-				...(long ? { detail: (width: number) => wrapped(entry.text, width, "activityText") } : {}),
+				fullText: `你插话：${entry.text}`,
+				detail: (width: number) => wrapped(entry.text, width, "activityText"),
 			};
-		}
 		case "retry": {
 			const retry = entry.retry;
 			const remaining = Math.max(0, Math.ceil((retry.startedAt + retry.delayMs - ctx.now) / 1000));
