@@ -23,7 +23,7 @@ class HoverTranscript implements Component {
 	constructor(
 		private readonly specs: RegionSpec[],
 		private readonly log: string[],
-		private readonly rows = 20,
+		public rows = 20,
 	) {}
 
 	render(): string[] {
@@ -75,6 +75,7 @@ const at = (line: number) => move(3, transcriptRow(line));
 interface Harness {
 	terminal: LoggingVirtualTerminal;
 	tui: TUI;
+	transcript: HoverTranscript;
 	log: string[];
 	dock: CountingDock;
 	settle: () => Promise<void>;
@@ -91,14 +92,16 @@ async function withHover(
 	const tui = new TUI(terminal);
 	const log: string[] = [];
 	const dock = new CountingDock();
+	const transcript = new HoverTranscript(specs, log);
 	tui.start();
-	tui.enterFullscreen({ scroll: [new HoverTranscript(specs, log)], dock, mouse: options.mouse });
+	tui.enterFullscreen({ scroll: [transcript], dock, mouse: options.mouse });
 	await terminal.waitForRender();
 	const settle = () => terminal.waitForRender();
 	try {
 		await test({
 			terminal,
 			tui,
+			transcript,
 			log,
 			dock,
 			settle,
@@ -195,7 +198,7 @@ describe("fullscreen hover", () => {
 		});
 	});
 
-	it("keeps the hover through a left-button drag and selects text as before", async () => {
+	it("keeps the hover through a left-button drag, selects text as before, and follows the pointer after it", async () => {
 		await withHover(TWO_REGIONS, async ({ tui, terminal, log, send, settle }) => {
 			const copies: string[] = [];
 			tui.onCopy = (text) => copies.push(text);
@@ -206,11 +209,12 @@ describe("fullscreen hover", () => {
 			await send(`\x1b[<0;1;${transcriptRow(A - 1)}M`);
 			await send(`\x1b[<32;5;${transcriptRow(B)}M`, `\x1b[<32;${BLANK_X};${transcriptRow(B)}M`);
 			assert.ok(terminal.getWrites().includes("\x1b[7m"), "selection is highlighted while dragging");
+			assert.deepStrictEqual(log, ["A:true"], "the drag never changed the hover");
 			await send(`\x1b[<0;${BLANK_X};${transcriptRow(B)}m`);
 			await settle();
 			assert.strictEqual(copies.length, 1, "the drag copied its selection on release");
 			assert.strictEqual(copies[0], "row 12\nrow 13\nrow 14\nrow 15\nrow 16");
-			assert.deepStrictEqual(log, ["A:true"], "the drag never changed the hover");
+			assert.deepStrictEqual(log, ["A:true", "A:false"], "released over empty space: the hover follows the pointer");
 
 			await send(at(B));
 			assert.deepStrictEqual(log, ["A:true", "A:false", "B:true"], "hover works again after the drag");
@@ -225,10 +229,11 @@ describe("fullscreen hover", () => {
 		});
 	});
 
-	it("does not clear the hover on keyboard input or wheel scrolling", async () => {
+	it("does not clear the hover on keyboard input, or on a wheel tick that moves nothing", async () => {
 		await withHover(TWO_REGIONS, async ({ log, send }) => {
 			await send(at(A));
-			await send("x", "\x1b[5~", "\x1b[<64;3;5M");
+			// Already at the bottom, so the wheel tick has nowhere to scroll and A stays under the pointer.
+			await send("x", `\x1b[<65;3;${transcriptRow(A)}M`);
 			assert.deepStrictEqual(log, ["A:true"]);
 		});
 	});
@@ -390,6 +395,96 @@ describe("hover moves stay out of the input path", () => {
 			tui.setFocus(other);
 			await send(at(A), at(B));
 			assert.deepStrictEqual(log, []);
+		});
+	});
+});
+
+describe("hover follows the content under a still pointer", () => {
+	// B sits directly below A, so one row of upward movement carries the pointer from A to B.
+	const STACKED: RegionSpec[] = [
+		{ line: 12, hoverKey: "B" },
+		{ line: A, hoverKey: "A" },
+		{ line: 14, hoverKey: "C" },
+	];
+
+	it("re-checks the pointer cell after a wheel scroll moves other content under it", async () => {
+		await withHover(STACKED, async ({ log, send }) => {
+			await send(at(A));
+			// Wheel up one row: transcript row 12 now sits where row 13 was.
+			await send("\x1b[<64;3;3M");
+			assert.deepStrictEqual(log, ["A:true", "A:false", "B:true"]);
+		});
+	});
+
+	it("re-checks after the transcript grows and follow mode shifts the content up", async () => {
+		await withHover(STACKED, async ({ tui, transcript, log, send, settle }) => {
+			await send(at(A));
+			transcript.rows = 21;
+			tui.requestRender();
+			await settle();
+			assert.deepStrictEqual(log, ["A:true", "A:false", "C:true"]);
+			await send(move(BLANK_X, BLANK_Y));
+			assert.deepStrictEqual(log, ["A:true", "A:false", "C:true", "C:false"]);
+		});
+	});
+
+	it("does nothing, and redraws nothing, when the content under the pointer stays put", async () => {
+		await withHover(STACKED, async ({ tui, log, send, settle, frames }) => {
+			await send(at(A));
+			const before = frames();
+			for (let i = 0; i < 5; i++) {
+				tui.requestRender();
+				await settle();
+			}
+			assert.strictEqual(frames() - before, 5, "each requested frame is one frame, none follow from it");
+			assert.deepStrictEqual(log, ["A:true"]);
+		});
+	});
+
+	it("settles after a change: the frame that follows a hover change finds the same key and stops", async () => {
+		await withHover(STACKED, async ({ tui, transcript, log, send, settle, frames }) => {
+			await send(at(A));
+			transcript.rows = 21;
+			tui.requestRender();
+			await settle();
+			const before = frames();
+			await settle();
+			await settle();
+			assert.strictEqual(frames(), before, "no further frames once the hover matches the pointer");
+			assert.deepStrictEqual(log, ["A:true", "A:false", "C:true"]);
+		});
+	});
+
+	it("has nothing to re-check once an overlay took the focus, until the pointer moves again", async () => {
+		await withHover(STACKED, async ({ tui, transcript, log, send, settle }) => {
+			await send(at(A));
+			const menu: Component = { render: () => ["menu"], invalidate: () => {}, handleInput: () => {} };
+			const handle = tui.showOverlay(menu, { width: 10, anchor: "bottom-right" });
+			await settle();
+			handle.hide();
+			await settle();
+			transcript.rows = 21;
+			tui.requestRender();
+			await settle();
+			assert.deepStrictEqual(log, ["A:true", "A:false"], "the old pointer position was forgotten");
+			await send(at(A));
+			assert.deepStrictEqual(log, ["A:true", "A:false", "C:true"], "the next move starts hovering again");
+		});
+	});
+
+	it("keeps the hover while the left button is held, and follows the pointer once it is released", async () => {
+		await withHover(STACKED, async ({ tui, transcript, log, send, settle }) => {
+			await send(at(A));
+			await send(`\x1b[<0;${BLANK_X};${BLANK_Y}M`);
+			transcript.rows = 21;
+			tui.requestRender();
+			await settle();
+			assert.deepStrictEqual(log, ["A:true"], "content moved during a press, hover unchanged");
+
+			await send(`\x1b[<0;3;3m`);
+			tui.requestRender();
+			await settle();
+			assert.deepStrictEqual(log, ["A:true", "A:false", "C:true"], "after the release the pointer's cell decides");
 		});
 	});
 });

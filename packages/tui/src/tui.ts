@@ -441,6 +441,9 @@ export class TUI extends Container {
 	private fullscreenPressedClick: FrameClickTarget | null = null;
 	// The region under the pointer, kept across frames by hoverKey (regions are rebuilt per render).
 	private fullscreenHover: { key: string; region: ClickRegion } | null = null;
+	// Last known pointer cell, so the hover can follow content that moves under a still pointer.
+	private fullscreenPointer: { row: number; col: number } | null = null;
+	private fullscreenLeftMouseDown = false;
 	private overlaySelectionRegions: FrameSelectionRegion[] = [];
 
 	// While set, doRender paints fixed frames via the viewport; the inline
@@ -692,11 +695,12 @@ export class TUI extends Container {
 			this.fullscreenLeftMouseDragged = false;
 			this.fullscreenPressedHyperlink = null;
 			this.fullscreenPressedClick = null;
+			this.fullscreenLeftMouseDown = false;
 			this.fullscreen?.viewport.clearSelection();
-			this.clearFullscreenHover();
+			this.dropFullscreenHover();
 		} else if (this.isFullscreenOverlayFocused()) {
 			this.stopSelectionAutoScroll();
-			this.clearFullscreenHover();
+			this.dropFullscreenHover();
 		}
 		this.terminal.setMouseTracking(enabled);
 	}
@@ -727,6 +731,33 @@ export class TUI extends Container {
 		this.fullscreenHover = null;
 		previous.region.onHover?.(false);
 		this.requestRender();
+	}
+
+	/** Forget the hover and where the pointer was: nothing is hoverable until the pointer moves again. */
+	private dropFullscreenHover(): void {
+		this.fullscreenPointer = null;
+		this.clearFullscreenHover();
+	}
+
+	/** A visible capturing overlay owns, or is about to reclaim, the keyboard: the cells under it are not hoverable. */
+	private isHoverBlockedByOverlay(): boolean {
+		if (this.isFullscreenOverlayFocused()) return true;
+		const modal = this.getTopmostVisibleOverlay();
+		return modal !== undefined && !modal.focusReleased;
+	}
+
+	/**
+	 * After a frame is painted, look at the remembered pointer cell again: content that
+	 * scrolled or grew under a still pointer (no move report comes for that) changes what
+	 * is hovered. A change of key renders once more; an unchanged key does nothing, so
+	 * this settles after one extra frame.
+	 */
+	private refreshFullscreenHover(): void {
+		const pointer = this.fullscreenPointer;
+		const fullscreen = this.fullscreen;
+		if (!pointer || !fullscreen || this.fullscreenLeftMouseDown) return;
+		if (!this.terminal.mouseTrackingActive || this.isHoverBlockedByOverlay()) return;
+		this.updateFullscreenHover(fullscreen.viewport.clickTargetAt(pointer.row, pointer.col));
 	}
 
 	override invalidate(): void {
@@ -874,8 +905,10 @@ export class TUI extends Container {
 	enterFullscreen(options: FullscreenOptions): void {
 		if (this.fullscreen) return;
 		this.fullscreenLeftMouseDragged = false;
+		this.fullscreenLeftMouseDown = false;
 		this.fullscreenPressedHyperlink = null;
 		this.fullscreenPressedClick = null;
+		this.fullscreenPointer = null;
 		this.fullscreen = {
 			viewport: new FullscreenViewport(),
 			scroll: options.scroll,
@@ -1106,10 +1139,12 @@ export class TUI extends Container {
 		if (!event) return false;
 		const fullscreen = this.fullscreen;
 		if (!fullscreen || !this.terminal.mouseTrackingActive) return true;
-		const modal = this.getTopmostVisibleOverlay();
-		if (this.isFullscreenOverlayFocused() || (modal && !modal.focusReleased)) {
-			this.clearFullscreenHover();
+		if (this.isHoverBlockedByOverlay()) {
+			this.dropFullscreenHover();
 		} else {
+			// A move report means no button is down, whatever a lost release left behind.
+			this.fullscreenLeftMouseDown = false;
+			this.fullscreenPointer = { row: event.y - 1, col: event.x - 1 };
 			this.updateFullscreenHover(fullscreen.viewport.clickTargetAt(event.y - 1, event.x - 1));
 		}
 		return true;
@@ -1200,6 +1235,7 @@ export class TUI extends Container {
 			const leftReleaseWasDrag =
 				event?.button === MOUSE_BUTTON_LEFT && !event.press ? this.fullscreenLeftMouseDragged : false;
 			if (event?.button === MOUSE_BUTTON_LEFT && event.press) {
+				this.fullscreenLeftMouseDown = true;
 				this.fullscreenLeftMouseDragged = event.motion;
 				if (!event.motion) {
 					this.fullscreenPressedHyperlink = fullscreen.viewport.hyperlinkAt(event.y - 1, event.x - 1);
@@ -1213,6 +1249,7 @@ export class TUI extends Container {
 			}
 			if (event && !overlayFocused) {
 				const viewport = fullscreen.viewport;
+				this.fullscreenPointer = { row: event.y - 1, col: event.x - 1 };
 				if (isWheelUp(event) || isWheelDown(event)) {
 					this.stopSelectionAutoScroll();
 					const direction = isWheelUp(event) ? -1 : 1;
@@ -1279,6 +1316,7 @@ export class TUI extends Container {
 				}
 			}
 			if (event?.button === MOUSE_BUTTON_LEFT && !event.press) {
+				this.fullscreenLeftMouseDown = false;
 				this.fullscreenLeftMouseDragged = false;
 				this.fullscreenPressedHyperlink = null;
 				this.fullscreenPressedClick = null;
@@ -1954,6 +1992,7 @@ export class TUI extends Container {
 		} else {
 			this.terminal.hideCursor();
 		}
+		this.refreshFullscreenHover();
 	}
 
 	private doRender(): void {
