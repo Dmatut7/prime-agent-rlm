@@ -19,8 +19,8 @@ import {
 } from "../src/modes/interactive/components/running-card.js";
 import { turnStepLabel } from "../src/modes/interactive/components/step-label.js";
 import { SystemNoticeLine } from "../src/modes/interactive/components/system-notice.js";
-import { timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
 import { formatTimelineTime } from "../src/modes/interactive/components/timeline-gutter.js";
+import { timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
 import { TurnActivityState, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import {
 	sentAtText,

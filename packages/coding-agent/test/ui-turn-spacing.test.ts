@@ -26,29 +26,37 @@ afterEach(() => {
 
 /**
  * The chat as a string of what each line is: T a `◆ prime` title (there is none any
- * more), E an event line, S a running turn's spinner line, F a finished turn's closing
- * row, M a handed-back message row, R a blank row on the rail (what a woken turn puts
- * above its first event), B a blank line, X other text (a user bubble, an answer).
+ * more), E an event line, H the header of a turn's summary, P a row of the summary's bar,
+ * S a running turn's spinner line, F a finished turn's closing row, M a handed-back message
+ * row, R a blank row on the rail, B a blank line, X other text (a user line, a stopped notice).
  */
 function shape(chat: LiveChat): string {
 	const marks: string[] = [];
 	for (const line of plain(chat.lines())) {
 		if (line.trim() === "") marks.push("B");
 		else if (line.includes("╵")) marks.push("F");
-		else if (/^ {9}│ *$/.test(line)) marks.push("R");
+		else if (/^ {9}│[ ┆]*$/.test(line)) marks.push("R");
+		else if (/^ {9}┃/.test(line)) marks.push("P");
 		else if (line.includes("◆ prime")) marks.push("T");
+		else if (/^ \d\d:\d\d {3}◆ {6}总结\s*$/.test(line)) marks.push("H");
 		else if (/^ \d\d:\d\d {3}◆/.test(line)) marks.push("E");
 		else if (/^ \d\d:\d\d {3}[⠀-⣿]/.test(line)) marks.push("S");
-		else if (/^ {3}◇ /.test(line)) marks.push("M");
+		else if (/^ \d\d:\d\d {3}│ {2}◇ /.test(line)) marks.push("M");
 		else marks.push("X");
 	}
 	return marks.join("");
 }
 
-/** Every turn of the chat gets one finished command, so it draws an event line (a turn with nothing to list draws nothing). */
+/**
+ * Every turn of the chat gets one finished command that ran before its answer (the tool loop
+ * comes first), so it draws an event line (a turn with nothing to list draws nothing).
+ */
 function withEvents(chat: LiveChat): LiveChat {
 	chat.summaries().forEach((summary, index) => {
+		const entries = summary.state.timeline.entries;
+		const before = entries.length;
 		addCommand({ state: summary.state, summary, timeline: summary.state.timeline }, `c${index}`, `echo ${index}`);
+		entries.unshift(...entries.splice(before));
 	});
 	return chat;
 }
@@ -67,14 +75,16 @@ describe("the groups of consecutive turns are one blank line apart", () => {
 		return withEvents(chat);
 	}
 
-	it("leaves exactly one blank line between an event or an answer and the next group, and never two in a row", () => {
+	it("separates an answer from the next group by rail rows, and never draws a blank line in a row", () => {
 		const marks = shape(threeGroups());
-		expect(marks).not.toContain("BB");
-		// A group is its message rows and its event line: one blank line before it, none inside it.
-		expect(marks).toContain("BME");
-		expect(marks).toContain("BMME");
-		expect(marks).not.toContain("MB");
+		expect(marks).not.toContain("B");
+		// A group is its message rows and its event line: rail rows before it, none inside it.
+		expect(marks).toContain("RME");
+		expect(marks).toContain("RMME");
+		expect(marks).not.toContain("MR");
 		expect(marks).not.toContain("EE");
+		// An answer ends in the rail row of its own and the one the message row keeps above itself.
+		expect(marks).toContain("PRRM");
 	});
 
 	it("draws the answer of the last box as the timeline summary: two main-line rows under it, the header, an empty bar row, the words", () => {
@@ -95,6 +105,7 @@ describe("the groups of consecutive turns are one blank line apart", () => {
 		const marks = shape(threeGroups());
 		expect(marks).not.toContain("T");
 		expect(marks.match(/E/g)).toHaveLength(3);
+		expect(marks.match(/H/g)).toHaveLength(2);
 	});
 
 	it("keeps a woken group on another model straight under its message row, with no title", () => {
@@ -103,9 +114,9 @@ describe("the groups of consecutive turns are one blank line apart", () => {
 		chat.wake("m1", { model: "gpt-5.5" });
 		vi.advanceTimersByTime(1_000);
 		const marks = shape(withEvents(chat));
-		expect(marks).toContain("BME");
+		expect(marks).toContain("RME");
 		expect(marks).not.toContain("T");
-		expect(marks).not.toContain("BB");
+		expect(marks).not.toContain("B");
 	});
 
 	it("puts a blank rail row between two events when the message that woke the second one is not shown", () => {
@@ -116,15 +127,18 @@ describe("the groups of consecutive turns are one blank line apart", () => {
 		const marks = shape(withEvents(chat));
 		expect(marks).toContain("ERE");
 		expect(marks).not.toMatch(/EE/);
-		expect(marks).not.toContain("BB");
-		expect(plain(chat.lines()).filter((line) => /^ {9}│ *$/.test(line))).toEqual(["         │      "]);
+		expect(marks).not.toContain("B");
+		// The two rows under the question, and the one between the events.
+		expect(marks).toMatch(/^XRRERE/);
 	});
 
 	it("leaves no blank line above the first turn's event, which the user message already separates", () => {
 		const chat = new LiveChat();
 		chat.prompt("你好");
 		vi.advanceTimersByTime(1_000);
-		expect(shape(withEvents(chat))).toMatch(/^X+BE/);
+		const marks = shape(withEvents(chat));
+		expect(marks).toMatch(/^XRRE/);
+		expect(marks).not.toContain("B");
 	});
 
 	it("draws nothing for a turn with nothing to list", () => {
@@ -134,7 +148,7 @@ describe("the groups of consecutive turns are one blank line apart", () => {
 		vi.advanceTimersByTime(1_000);
 		expect(chat.summaries()).toHaveLength(2);
 		for (const summary of chat.summaries()) expect(summary.render(100)).toEqual([]);
-		expect(shape(chat)).not.toMatch(/[ESR]/);
+		expect(shape(chat)).not.toMatch(/[ES]/);
 	});
 });
 
@@ -155,7 +169,7 @@ describe("a woken turn does not add a blank line to one that is already there", 
 		chat.prompt("你好", { answer: "在的。" });
 		chat.wakeUnseen("m1");
 		vi.advanceTimersByTime(1_000);
-		expect(shape(withEvents(chat))).toContain("XRE");
+		expect(shape(withEvents(chat))).toContain("PRRE");
 	});
 
 	function wokenSummary() {

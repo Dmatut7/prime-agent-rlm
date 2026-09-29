@@ -3,16 +3,16 @@ import { type ClickRegion, setKeybindings } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
+import { shortAgentName } from "../src/modes/interactive/components/agent-message.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
+import { subagentTaskTag } from "../src/modes/interactive/components/subagent-summary-line.js";
 import { formatTimelineTime } from "../src/modes/interactive/components/timeline-gutter.js";
 import { TimelineLaneTracker } from "../src/modes/interactive/components/timeline-lane.js";
-import { subagentTaskTag } from "../src/modes/interactive/components/timeline-rows.js";
 import {
 	type TimelineHost,
 	TurnActivityState,
 	TurnSummaryComponent,
 } from "../src/modes/interactive/components/turn-activity.js";
-import { shortAgentName } from "../src/modes/interactive/components/turn-box.js";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 import { setWorkingPulseTick } from "../src/modes/interactive/theme/working-icon.js";
 

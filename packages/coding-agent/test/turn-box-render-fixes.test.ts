@@ -97,17 +97,6 @@ function openEvents(turn: ReturnType<typeof quietTurn>, width = 100): string[] {
 	return plain(turn.summary.render(width));
 }
 
-/** The character a click at `col` lands on. */
-function charAtColumn(line: string, col: number): string {
-	let at = 0;
-	for (const char of line) {
-		if (at === col) return char;
-		at += visibleWidth(char);
-		if (at > col) return "";
-	}
-	return "";
-}
-
 const WIDTHS = Array.from({ length: 30 }, (_, index) => index + 1);
 
 function change(overrides: Partial<ChangeEntry> = {}): ChangeEntry {

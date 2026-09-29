@@ -2,7 +2,7 @@ import { ABORT_TRUNCATION_MARKER, TOOL_ABORT_FALLBACK_MESSAGE } from "@earendil-
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { KernelActivity, KernelMemoryChange } from "../../../core/kernel/shared.js";
 import { type ThemeColor, theme } from "../theme/theme.js";
-import { type DiffRow, diffRowsFromEdit, renderDiffRows, sanitizeDisplayText } from "./diff-rows.js";
+import { renderDiffRows, sanitizeDisplayText } from "./diff-rows.js";
 import {
 	aggregateChanges,
 	type ChangeEntry,
@@ -12,7 +12,9 @@ import {
 	type StepFeedData,
 	symlinkVerb,
 } from "./feed-data.js";
+import { memoryBodyLines } from "./memory-detail.js";
 import { stepAction, turnStepLabel } from "./step-label.js";
+import { subagentTaskTag } from "./subagent-summary-line.js";
 import {
 	firstSentence,
 	formatBoxDuration,
@@ -92,6 +94,8 @@ export interface BoxRow {
 
 export interface SpawnedSubagent {
 	name: string;
+	/** The key it is on the subagent lane by. */
+	laneName: string;
 	tag?: string;
 	running: boolean;
 	startedAt: number;
@@ -410,52 +414,6 @@ function memoryNoun(change: KernelMemoryChange): string {
 	return "";
 }
 
-/** Before/after of a memory change: only the lines that changed, and a rename said in words. */
-export function memoryDetail(change: KernelMemoryChange): (width: number) => string[] {
-	return (width) => {
-		const lines: string[] = [];
-		const label = (text: string) => theme.fg("dim", text);
-		if (change.previousTitle && change.previousTitle !== change.title) {
-			lines.push(
-				`${label("改名  ")}${theme.fg("muted", cleanMemoryTitle(change.previousTitle))}${label(" → ")}${theme.fg("activityText", cleanMemoryTitle(change.title))}`,
-			);
-		}
-		if (change.textOmitted === "sensitive") {
-			lines.push(label(SENSITIVE_TEXT));
-			return lines.map((line) => truncateToWidth(line, width, "…"));
-		}
-		const before = change.before?.trimEnd() ?? "";
-		const after = change.after?.trimEnd() ?? "";
-		const paint = (rows: DiffRow[]) => renderDiffRows(rows, { width, indent: 0 }).map((line) => line);
-		if (change.op === "created" || (!before && after)) {
-			lines.push(label("新记的"));
-			lines.push(...paint(after.split("\n").map((text) => ({ kind: "add" as const, text }))));
-		} else if (change.op === "deleted" || (before && !after)) {
-			lines.push(label("删掉的"));
-			lines.push(...paint(before.split("\n").map((text) => ({ kind: "del" as const, text }))));
-		} else if (before || after) {
-			const rows = diffRowsFromEdit(before, after).filter((row) => row.kind !== "ctx");
-			const removed = rows.filter((row) => row.kind === "del");
-			const added = rows.filter((row) => row.kind === "add");
-			if (removed.length > 0) {
-				lines.push(label("原来"));
-				lines.push(...paint(removed));
-			}
-			if (added.length > 0) {
-				lines.push(label("现在"));
-				lines.push(...paint(added));
-			}
-			if (removed.length === 0 && added.length === 0) lines.push(label("内容没变"));
-		} else {
-			lines.push(label("没有记录到内容"));
-		}
-		return clip(
-			lines.map((line) => truncateToWidth(line, width, "…")),
-			width,
-		);
-	};
-}
-
 function memoryRow(key: string, change: KernelMemoryChange): BoxRow {
 	const noun = memoryNoun(change);
 	const title = cleanMemoryTitle(change.title);
@@ -477,7 +435,7 @@ function memoryRow(key: string, change: KernelMemoryChange): BoxRow {
 		meta,
 		// A live record carries no texts yet (they come with the step's end): nothing to open.
 		...(change.before !== undefined || change.after !== undefined || renamed || change.textOmitted
-			? { detail: memoryDetail(change) }
+			? { detail: (width: number) => memoryBodyLines(change, width) }
 			: {}),
 	};
 }
@@ -1185,18 +1143,15 @@ export function eventSaysMore(event: TimelineEvent): boolean {
 	return event.more === true;
 }
 
-/** Widest the short task tag beside a subagent's name may be. */
-export const TASK_TAG_MAX_WIDTH = 14;
-
-/** `钉住框头` from a task label like `A 钉住框头，看它有没有钉住`: the name is dropped, the first clause is kept. */
-export function subagentTaskTag(label: string, name: string): string | undefined {
-	let brief = label.replace(/\s+/g, " ").trim();
-	const own = name.trim().toLowerCase();
-	if (own && brief.toLowerCase().startsWith(own) && !/[\p{L}\p{N}]/u.test(brief.charAt(own.length))) {
-		brief = brief.slice(own.length).replace(/^[\s:：,，\-—]+/, "");
-	}
-	const clause = brief.split(/[。！？!?；;：:，,]|\.\s|\s[—-]{1,2}\s/)[0]?.trim();
-	return clause ? truncateToWidth(clause, TASK_TAG_MAX_WIDTH, "…") : undefined;
+/** A tag several siblings share tells none of them apart: it stays off all of them, as on the subagent blocks. */
+function distinctTags(spawned: SpawnedSubagent[]): SpawnedSubagent[] {
+	const counts = new Map<string, number>();
+	for (const sub of spawned) if (sub.tag) counts.set(sub.tag, (counts.get(sub.tag) ?? 0) + 1);
+	return spawned.map((sub) => {
+		if (!sub.tag || (counts.get(sub.tag) ?? 0) < 2) return sub;
+		const { tag: _shared, ...untagged } = sub;
+		return untagged;
+	});
 }
 
 /** Most characters an event's line keeps: past any terminal's width, and cheap to cut and paint. */
@@ -1298,6 +1253,7 @@ export function buildTimelineView(
 				const tag = subagentTaskTag(entry.sub.label ?? "", entry.sub.name);
 				group.spawned.push({
 					name: entry.sub.name,
+					laneName: entry.sub.laneName ?? entry.sub.name,
 					...(tag ? { tag } : {}),
 					running: entry.sub.status === "running" && !ctx.stopped,
 					startedAt: entry.sub.startedAt,
@@ -1432,7 +1388,7 @@ export function buildTimelineView(
 				...(lead ? { full: lead } : {}),
 				...(first?.more ? { more: true as const } : {}),
 				steps,
-				spawned: item.spawned,
+				spawned: distinctTags(item.spawned),
 			},
 		];
 	});

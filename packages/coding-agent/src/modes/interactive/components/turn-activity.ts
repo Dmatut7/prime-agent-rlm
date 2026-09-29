@@ -728,7 +728,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		if (tracker) this.turnState.timeline.ui.startLane ??= tracker.lane;
 		// Subagents this turn already dispatched and still waits on are out.
 		const running = this.turnState.timeline.entries.flatMap((entry) =>
-			entry.kind === "subagent" && entry.sub.status === "running" ? [entry.sub.name] : [],
+			entry.kind === "subagent" && entry.sub.status === "running" ? [entry.sub.laneName ?? entry.sub.name] : [],
 		);
 		if (tracker && running.length > 0) tracker.spawned(running);
 		this.invalidate();

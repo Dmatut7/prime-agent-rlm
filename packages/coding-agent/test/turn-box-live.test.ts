@@ -428,14 +428,25 @@ function expectSteerLine(text: string, said: string): void {
 	expect(cell(line, "你插话")).toBe(16);
 }
 
+/** A stopped turn says so once, on the closing row (`╵ ■ 已停止 · 用了 …`), never on its own lines. */
+function expectStoppedClosingRow(screen: LiveScreen, box: TurnSummaryComponent): void {
+	expect(plainLines(box).join("\n")).not.toContain("已停止");
+	expect(lineWith(screen.screen(), "已停止")).toMatch(/^ {9}╵ {6}■ 已停止 · 用了 /);
+}
+
 /**
- * A turn the owner stopped: no live face and no status pill, the event folded, the cut step
- * a faint `■` step line once opened, and nothing drawn as a failure.
+ * A turn the owner stopped: no live face and no status pill on its lines, the event folded, the cut
+ * step a faint `■` step line once opened, and nothing drawn as a failure.
  */
-function expectStopped(screen: LiveScreen, box: TurnSummaryComponent, command: string): void {
+function expectStopped(
+	screen: LiveScreen,
+	box: TurnSummaryComponent,
+	command: string,
+	options: { closingRow?: boolean } = {},
+): void {
 	expect(box.state.boxLive).toBe(false);
 	expectNoLiveFace(box);
-	expect(screen.screen()).not.toContain("已停止");
+	if (options.closingRow !== false) expectStoppedClosingRow(screen, box);
 	expect(screen.screen()).not.toContain("✓");
 	const opened = screen.opened(box);
 	expect(lineWith(opened, `${command} · 你停下了`).startsWith(`         │           ■  ${command} · 你停下了`)).toBe(
@@ -731,7 +742,7 @@ describe("a quiet turn that ends without a run ending it", () => {
 		expect(box.state.boxLive).toBe(false);
 		// Stopped, not failed: no live face, no status pill, nothing in the failure color.
 		expectNoLiveFace(box);
-		expect(screen.screen()).not.toContain("已停止");
+		expectStoppedClosingRow(screen, box);
 		expect(screen.rawScreen()).not.toContain(theme.getFgAnsi("timelineMust"));
 		const opened = screen.opened(box);
 		expect(opened).toMatch(/^ {9}│ {11}↻ {2}.*已停止/m);
@@ -908,7 +919,7 @@ describe("a quiet turn seen from a second view", () => {
 });
 
 describe("a quiet turn a notice carries on", () => {
-	it("keeps only the later answer under the timeline, the earlier one drawn as an event line of it", async () => {
+	it("starts the next turn when the notice wakes the AI, and the earlier answer stays under its own box", async () => {
 		const harness = await session();
 		const steps = record(harness);
 		harness.setResponses([reply("子代理回来了：当前目录有 3 个文件。"), reply("收到它的结束通知，结论不变。")]);
@@ -927,16 +938,11 @@ describe("a quiet turn a notice carries on", () => {
 		const screen = startScreen(steps);
 		feed(screen, steps);
 		vi.advanceTimersByTime(SETTLE_MS);
-		expect(screen.boxes()).toHaveLength(1);
-		const box = screen.boxes()[0]!;
+		expect(screen.boxes()).toHaveLength(2);
 		const shown = screen.screen();
-		// The later answer is the one answer under the timeline, not a line of it.
-		expect(shown.match(/收到它的结束通知，结论不变。/g)).toHaveLength(1);
-		expect(plainLines(box).join("\n")).not.toContain("收到它的结束通知");
-		// The earlier answer is not a second answer under the timeline: only its event line says it.
-		expect(shown.match(/子代理回来了：当前目录有 3 个文件/g)).toHaveLength(1);
-		expectEventLine(lineWith(plainLines(box).join("\n"), "子代理回来了"), "子代理回来了：当前目录有 3 个文件。");
-		expect(screen.opened(box).match(/子代理回来了：当前目录有 3 个文件/g)).toHaveLength(1);
+		expect(shown).toContain("收到它的结束通知，结论不变。");
+		// The answer the first turn ended on is not folded away by the turn the notice woke.
+		expect(shown).toContain("子代理回来了：当前目录有 3 个文件");
 	});
 });
 
@@ -958,9 +964,10 @@ describe("a quiet turn replayed from its transcript", () => {
 		// Reopened later: nothing carries over from a live box.
 		const cold = new LiveScreen();
 		cold.rebuild(transcriptAt(steps, steps.length));
+		// The closing row is the mode's replay and the live flow's; this cold rebuild is the builder alone.
 		for (const screen of [live, cold]) {
 			expect(screen.boxes()).toHaveLength(1);
-			expectStopped(screen, screen.boxes()[0]!, "sleep 100");
+			expectStopped(screen, screen.boxes()[0]!, "sleep 100", { closingRow: screen === live });
 		}
 	});
 

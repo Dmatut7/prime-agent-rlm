@@ -226,8 +226,8 @@ function toolResult(id: string, at: number): ToolResultMessage {
 	};
 }
 
-describe("a replayed conversation draws no title, one box per question", () => {
-	it("keeps the runs a handed-back message woke in the question's own box, with no title", () => {
+describe("a replayed conversation draws no title, one turn per wake-up", () => {
+	it("starts a turn of its own at a handed-back message, under no title", () => {
 		const call = (id: string, at: number) =>
 			assistant(at, [{ type: "toolCall", id, name: "ipython", arguments: { code: "await bash('ls')" } }]);
 		const messages: AgentMessage[] = [
@@ -250,19 +250,26 @@ describe("a replayed conversation draws no title, one box per question", () => {
 			processMode: "quiet",
 		});
 		const summaries = components.filter((component) => component instanceof TurnSummaryComponent);
-		expect(summaries).toHaveLength(2);
-		expect(summaries.map(shows)).toEqual([false, false]);
+		// The message that woke the AI after its answer starts the next turn: the answer stays under its own turn.
+		expect(summaries).toHaveLength(3);
+		expect(summaries.map(shows)).toEqual([false, false, false]);
 		const titles = components
 			.flatMap((component) => plain(component.render(100)))
 			.filter((line) => line.includes(HEADER));
 		expect(titles).toHaveLength(0);
-		// The run the handed-back message woke is the question's own box: both runs' steps are in the first box.
-		const [question, followUp] = summaries;
-		const events = plain(question?.render(100) ?? []);
-		expect(events).toHaveLength(2);
-		expect(events[0]).toMatch(new RegExp(`^ ${formatTimelineTime(T0 + 1_000)} {3}◆ {6}\\S.* +1 步 ▸ {2}$`));
-		expect(events[1]).toMatch(new RegExp(`^ ${formatTimelineTime(T0 + 3_000)} {3}◆ {6}派出去了。 +1 步 ▸ {2}$`));
+		const [question, woken, followUp] = summaries;
+		const stepLine = (at: number) => new RegExp(`^ ${formatTimelineTime(at)} {3}◆ {6}做了 1 步 +1 步 ▸ {2}$`);
+		const first = plain(question?.render(100) ?? []);
+		expect(first).toHaveLength(1);
+		expect(first[0]).toMatch(stepLine(T0 + 1_000));
+		// The woken turn has its own event, for the run the handed-back message woke.
+		const second = plain(woken?.render(100) ?? []).filter((line) => EVENT_LINE.test(line));
+		expect(second).toHaveLength(1);
+		expect(second[0]).toMatch(stepLine(T0 + 5_000));
 		// A turn that only answered has nothing to list: its answer is drawn by the reply itself.
 		expect(plain(followUp?.render(100) ?? [])).toEqual([]);
+		// Each turn's answer is drawn once, under its own turn.
+		const screen = plain(components.flatMap((component) => component.render(100))).join("\n");
+		for (const answer of ["派出去了。", "审查完成。", "测试都过了。"]) expect(screen.match(answer)).toHaveLength(1);
 	});
 });

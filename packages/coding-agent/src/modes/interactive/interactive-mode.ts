@@ -209,7 +209,7 @@ import {
 } from "../shared/startup-notices.js";
 import { AGENT_ACTIVITY_LABELS, AgentActivityTracker, formatTokenCount } from "./agent-activity.js";
 import { type AuthenticationResult, getAnthropicSubscriptionAuthWarning, ProviderAuthFlows } from "./auth-flows.js";
-import { AGENT_MESSAGE_TURN_INSET, AgentMessageComponent } from "./components/agent-message.js";
+import { AgentMessageComponent } from "./components/agent-message.js";
 import { ArminComponent } from "./components/armin.js";
 import { AssistantMessageComponent } from "./components/assistant-message.js";
 import { BashExecutionComponent } from "./components/bash-execution.js";
@@ -238,13 +238,23 @@ import {
 import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "./components/configuration-menu.js";
 import { formatContextTree } from "./components/context-tree-format.js";
 import {
+	assignWakeCause,
 	countThinkingSegments,
+	createAgentMessageRow,
+	createUserMessage,
 	foldEarlierAnswers,
-	isCompactAgentMessageNeighbor,
+	giveLane,
+	giveLaneTracker,
+	isWakeMessage,
+	lastDrawnComponent,
 	latestThinkingText,
 	NO_STEP_STOP,
+	noteWakeInRound,
+	QuietAssistantMessage,
+	QuietTurnSummary,
 	resolveTurnHeaders,
 	stepResultStop,
+	WakeCause,
 } from "./components/conversation-components.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
@@ -304,6 +314,7 @@ import {
 	summarizeSubagentSpend,
 	TrayInfoLine,
 } from "./components/subagent-summary-line.js";
+import { isSubagentNoticeMessage, subagentNoticeRow } from "./components/system-notice.js";
 import { ThinkingSelectorComponent } from "./components/thinking-selector.js";
 import {
 	selectLatestToolExpandHint,
@@ -3934,6 +3945,10 @@ export class InteractiveMode {
 			foldEarlierAnswers: (summary) => foldEarlierAnswers(this.chatContainer.children, summary),
 			requestRender: () => this.ui.requestRender(),
 			liveChanged: () => this.updateWorkingPulse(),
+			subagentSpend: () => {
+				const spend = this.subagentSummaryLine.getSubagentSpend();
+				return spend ? { cost: spend.cost, parentCost: spend.parentCost, partial: spend.partial } : undefined;
+			},
 		};
 	}
 
@@ -7150,7 +7165,8 @@ export class InteractiveMode {
 		if (this.streamingComponent) {
 			this.chatContainer.removeChild(this.streamingComponent);
 		}
-		this.streamingComponent = new AssistantMessageComponent(
+		this.streamingComponent = new QuietAssistantMessage(
+			this.currentTurnState,
 			undefined,
 			this.hideThinkingBlock,
 			this.getMarkdownThemeWithSettings(),
@@ -7169,6 +7185,7 @@ export class InteractiveMode {
 			},
 		);
 		this.streamingMessage = message;
+		giveLane(this.streamingComponent, this.turnFlow.subagentLane.tracker.lane);
 		this.chatContainer.addChild(this.streamingComponent);
 		this.streamingComponent.updateContent(this.streamingMessage, true);
 	}
@@ -8152,12 +8169,13 @@ export class InteractiveMode {
 			this.chatContainer.addChild(new Spacer(1));
 		}
 		this.chatContainer.addChild(
-			new UserMessageComponent(
-				text,
-				this.getMarkdownThemeWithSettings(),
-				(name) => this.isRecognizedSlashCommand(name),
-				Date.now(),
-			),
+			createUserMessage(text, {
+				markdownTheme: this.getMarkdownThemeWithSettings(),
+				isRecognizedSlashCommand: (name) => this.isRecognizedSlashCommand(name),
+				sentAt: Date.now(),
+				quiet: quietConversation(this),
+				lane: this.turnFlow.subagentLane.tracker.lane,
+			}),
 		);
 	}
 
@@ -8191,10 +8209,15 @@ export class InteractiveMode {
 		if (message.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE) {
 			return new MalformedRefinementOutcomeMessageComponent();
 		}
+		// A subagent that ended, failed or went quiet is a row of the timeline: out of sight unless it failed.
+		const noticeRow = quietConversation(this) ? subagentNoticeRow(message, this.turnFlow.subagentLane) : undefined;
+		if (noticeRow) return noticeRow;
 		if (isAgentSessionMessage(message)) {
-			return new AgentMessageComponent(message, this.getMarkdownThemeWithSettings(), {
-				suppressLeadingSpace: isCompactAgentMessageNeighbor(this.chatContainer.children.at(-1)),
-				inset: this.isInsideQuietTurn() ? AGENT_MESSAGE_TURN_INSET : 0,
+			return createAgentMessageRow(message, {
+				markdownTheme: this.getMarkdownThemeWithSettings(),
+				quiet: quietConversation(this),
+				lane: this.turnFlow.subagentLane,
+				previous: lastDrawnComponent(this.chatContainer.children),
 			});
 		}
 		if (isInjectedPromptMessage(message)) {
@@ -8209,7 +8232,10 @@ export class InteractiveMode {
 		);
 	}
 
-	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
+	private addMessageToChat(
+		message: AgentMessage,
+		options?: { populateHistory?: boolean; round?: TurnActivityState },
+	): void {
 		if (message.role === "assistant") this.lastAssistantStopReason = message.stopReason;
 		switch (message.role) {
 			case "bashExecution": {
@@ -8295,21 +8321,23 @@ export class InteractiveMode {
 						component.setExpanded(this.toolOutputExpanded);
 						this.chatContainer.addChild(component);
 						if (skillBlock.userMessage) {
-							const userComponent = new UserMessageComponent(
-								skillBlock.userMessage,
-								this.getMarkdownThemeWithSettings(),
-								(name) => this.isRecognizedSlashCommand(name),
-								Number(message.timestamp) || undefined,
-							);
+							const userComponent = createUserMessage(skillBlock.userMessage, {
+								markdownTheme: this.getMarkdownThemeWithSettings(),
+								isRecognizedSlashCommand: (name) => this.isRecognizedSlashCommand(name),
+								sentAt: Number(message.timestamp) || undefined,
+								quiet: quietConversation(this),
+								lane: this.turnFlow.subagentLane.tracker.lane,
+							});
 							this.chatContainer.addChild(userComponent);
 						}
 					} else {
-						const userComponent = new UserMessageComponent(
-							textContent,
-							this.getMarkdownThemeWithSettings(),
-							(name) => this.isRecognizedSlashCommand(name),
-							Number(message.timestamp) || undefined,
-						);
+						const userComponent = createUserMessage(textContent, {
+							markdownTheme: this.getMarkdownThemeWithSettings(),
+							isRecognizedSlashCommand: (name) => this.isRecognizedSlashCommand(name),
+							sentAt: Number(message.timestamp) || undefined,
+							quiet: quietConversation(this),
+							lane: this.turnFlow.subagentLane.tracker.lane,
+						});
 						this.chatContainer.addChild(userComponent);
 					}
 					if (options?.populateHistory) {
@@ -8319,7 +8347,8 @@ export class InteractiveMode {
 				break;
 			}
 			case "assistant": {
-				const assistantComponent = new AssistantMessageComponent(
+				const assistantComponent = new QuietAssistantMessage(
+					options?.round,
 					message,
 					this.hideThinkingBlock,
 					this.getMarkdownThemeWithSettings(),
@@ -8339,6 +8368,7 @@ export class InteractiveMode {
 						quiet: this.settingsManager.getProcessMode() === "quiet",
 					},
 				);
+				giveLane(assistantComponent, this.turnFlow.subagentLane.tracker.lane);
 				this.chatContainer.addChild(assistantComponent);
 				break;
 			}
@@ -8429,6 +8459,8 @@ export class InteractiveMode {
 		// sent agent messages inside ipython tool details), deduped by id.
 		const replaySentCommIds = new Set<string>();
 		const replayQuiet = this.settingsManager.getProcessMode() === "quiet";
+		// A rebuild replays the question from its start: who is still out is learned again as it goes.
+		this.turnFlow.subagentLane.reset();
 		const toolNames: string[] = [];
 		for (const message of messagesToRender) {
 			if (message.role !== "assistant") {
@@ -8492,17 +8524,35 @@ export class InteractiveMode {
 			this.turnFlow.attachStrip(replayTurnSummary);
 		};
 
+		// What woke the turn about to start; the turn takes it when its first reply comes.
+		let replayCause: WakeCause | undefined;
+		// The run goes on inside the tool loop: a message right after a step's results belongs to the same turn.
+		const insideReplayToolLoop = (): boolean =>
+			replayQuiet &&
+			replayTurnState !== undefined &&
+			lastReplayAssistant?.stopReason === "toolUse" &&
+			replayResultsArrived &&
+			!replayResultStop.endsTurn;
+
 		for (const message of messagesToRender) {
+			// A message that wakes the AI after its turn ended starts the next turn: the answer the turn
+			// ended on stays its own, and the woken turn never folds it away (a live run does the same).
+			if (replayQuiet && isWakeMessage(message) && insideReplayToolLoop()) noteWakeInRound(replayTurnState, message);
+			if (replayQuiet && isWakeMessage(message) && !insideReplayToolLoop()) {
+				replayCause ??= new WakeCause();
+				replayCause.add(message);
+				replayTurnState?.markTurnEnded(Number(message.timestamp) || Date.now());
+				closeReplayTurn();
+				replayTurnState = undefined;
+				replayTurnSummary = undefined;
+				lastReplayAssistant = undefined;
+				replaySentCommIds.clear();
+				replayStartedByUser = false;
+			}
 			if (message.role === "user") {
 				// A message typed while the AI was between its steps is an
 				// interjection inside that turn's box, not a new turn.
-				if (
-					replayQuiet &&
-					replayTurnState &&
-					lastReplayAssistant?.stopReason === "toolUse" &&
-					replayResultsArrived &&
-					!replayResultStop.endsTurn
-				) {
+				if (replayTurnState && insideReplayToolLoop()) {
 					const text = this.getUserMessageText(message).trim() || "[图片]";
 					replayTurnState.timeline.addSteer(text, Number(message.timestamp) || Date.now());
 					continue;
@@ -8516,6 +8566,9 @@ export class InteractiveMode {
 				lastReplayAssistant = undefined;
 				replaySentCommIds.clear();
 				replayStartedByUser = !this.createLegacyHeartbeatPromptMessage(message, this.getUserMessageText(message));
+				// A new question: nobody is out yet (a stored heartbeat prompt is not one).
+				if (replayStartedByUser) this.turnFlow.subagentLane.reset();
+				replayCause = undefined;
 			}
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
@@ -8524,7 +8577,10 @@ export class InteractiveMode {
 				if (!replayTurnState) {
 					replayTurnState = new TurnActivityState(Number(message.timestamp) || Date.now());
 					replayTurnState.startedByUser = replayStartedByUser;
+					if (replayCause) assignWakeCause(replayTurnState, replayCause);
+					replayCause = undefined;
 					replayTurnSummary = this.createTurnSummary(replayTurnState);
+					giveLaneTracker(replayTurnSummary, this.turnFlow.subagentLane.tracker);
 					replayTurnSummary.setExpanded(this.toolOutputExpanded);
 					// TUI v4: quiet turns carry the one-line footnote at their head.
 					replayTurnSummary.setQuiet(replayQuiet);
@@ -8549,7 +8605,7 @@ export class InteractiveMode {
 				lastReplayAssistant = message;
 				replayResultsArrived = false;
 				replayResultStop = NO_STEP_STOP;
-				this.addMessageToChat(message);
+				this.addMessageToChat(message, { round: replayTurnState });
 				// Render tool call components
 				for (const content of message.content) {
 					if (content.type === "toolCall") {
@@ -8663,11 +8719,13 @@ export class InteractiveMode {
 						replayTurnSummary?.addCommMessage();
 					}
 				}
+			} else if (replayQuiet && isSubagentNoticeMessage(message)) {
+				// A subagent that ended, failed or went quiet: a row of the timeline, out of sight unless it failed.
+				this.addMessageToChat(message, renderOptions);
 			} else if (replayQuiet && replayTurnState && message.role === "custom" && isBoxNoticeMessage(message)) {
-				// The box says it as its own row (a subagent that finished, a compaction that waited).
+				// The box says it as its own row (a compaction that waited).
 				const record = boxRecordFromMessage(message);
 				const at = Number(message.timestamp) || 0;
-				if (record?.kind === "notice") replayTurnState.timeline.addNotice(record.notice, at);
 				if (record?.kind === "compaction") replayTurnState.timeline.addReplayCompaction(at, record.facts);
 			} else if (replayQuiet && replayTurnState && message.role === "compactionSummary") {
 				// Inside a turn the compaction is a row of its box.
@@ -10305,18 +10363,6 @@ export class InteractiveMode {
 		return true;
 	}
 
-	/** Whether the chat's tail is a quiet turn (its summary comes after the latest user message). */
-	private isInsideQuietTurn(): boolean {
-		if (this.settingsManager.getProcessMode() !== "quiet") return false;
-		const children = this.chatContainer.children;
-		for (let i = children.length - 1; i >= 0; i--) {
-			const child = children[i];
-			if (child instanceof TurnSummaryComponent) return true;
-			if (child instanceof UserMessageComponent) return false;
-		}
-		return false;
-	}
-
 	private latestTurnSummary(): TurnSummaryComponent | undefined {
 		const children = this.chatContainer.children;
 		for (let i = children.length - 1; i >= 0; i--) {
@@ -10478,7 +10524,7 @@ export class InteractiveMode {
 
 	/** A new turn head, wired so its own clicks apply like the keys. */
 	private createTurnSummary(state: TurnActivityState): TurnSummaryComponent {
-		const summary = new TurnSummaryComponent(state);
+		const summary = new QuietTurnSummary(state);
 		summary.setOnLanesChange(() => this.handleTurnLanesClicked(summary));
 		summary.setTimelineHost(this.timelineHost());
 		return summary;

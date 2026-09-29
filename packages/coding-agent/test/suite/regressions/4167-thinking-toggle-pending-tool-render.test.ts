@@ -54,6 +54,7 @@ type RenderSessionContextThis = {
 	updateConnectionStateFromEvent(event: AgentConnectionSessionEvent): void;
 	getCurrentCwd(): string;
 	getRetryAttempt(): number;
+	subagentSummaryLine: { getSubagentSpend(): undefined };
 	preloadToolDefinitions(toolNames: Iterable<string>): Promise<void>;
 	getCachedToolDefinition(toolName: string): undefined;
 	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void;
@@ -102,6 +103,7 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 		updateConnectionStateFromEvent: vi.fn(),
 		getCurrentCwd: () => process.cwd(),
 		getRetryAttempt: () => 0,
+		subagentSummaryLine: { getSubagentSpend: () => undefined },
 		preloadToolDefinitions: async (_toolNames: Iterable<string>) => undefined,
 		getCachedToolDefinition: (_toolName: string) => undefined,
 		addMessageToChat(message: AgentMessage) {

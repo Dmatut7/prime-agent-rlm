@@ -70,6 +70,8 @@ export interface TimelineSubagent {
 	name: string;
 	/** The task it was given, in a few words (its short tag comes from this). */
 	label?: string;
+	/** The key it is on the subagent lane by (`laneKey`): the name a report from it is released under. */
+	laneName?: string;
 	status: "running" | "done" | "failed";
 	/** What it is doing now, in plain words. */
 	line?: string;
@@ -511,7 +513,7 @@ export class TurnTimeline {
 				key,
 				sub: { ...update, startedAt: update.startedAt ?? now },
 			});
-			if (update.status === "running") this.laneTracker?.spawned([update.name]);
+			if (update.status === "running") this.laneTracker?.spawned([update.laneName ?? update.name]);
 		}
 		this.ui.bump();
 	}

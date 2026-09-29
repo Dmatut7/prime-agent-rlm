@@ -1,6 +1,7 @@
 import { type ClickRegion, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { type ThemeColor, theme } from "../theme/theme.js";
 import { spinnerFrame } from "../theme/working-icon.js";
+import { shortAgentName } from "./agent-message.js";
 import { sanitizeDisplayText } from "./diff-rows.js";
 import {
 	formatTimelineTime,
@@ -316,16 +317,6 @@ const STEP_GLYPH_COLORS: Record<BoxRowKind, ThemeColor> = {
 	notice: "timelineFaint",
 };
 
-/**
- * A subagent named like `review-grow-B-box` reads as `B` on the timeline, the way a
- * hand-back row names it; a name without exactly one single-letter part stays whole.
- */
-export function shortAgentName(name: string): string {
-	const letters = name.split(/[-_ .]+/).filter((part) => /^[A-Za-z]$/.test(part));
-	const only = letters.length === 1 ? letters[0] : undefined;
-	return only ? only.toUpperCase() : name;
-}
-
 /** A step's words on one line. */
 function stepWords(row: BoxRow): string {
 	const gap = row.text && row.keyword && !row.keyword.endsWith("：") ? " " : "";
@@ -410,7 +401,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 	const startedOut = ui.startLane === "on";
 	const isOut = (sub: SpawnedSubagent, at: number): boolean => {
 		if (sub.endedAt !== undefined) return at <= 0 || at < sub.endedAt;
-		return sub.running && (tracker?.pending.includes(sub.name) ?? false);
+		return sub.running && (tracker?.pending.includes(sub.laneName) ?? false);
 	};
 	/** `on` once it was on: a line does not go dark when the agents come back. */
 	const remember = (memoKey: string, on: boolean): TimelineLane => {
@@ -578,10 +569,16 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		}
 		const pending = tracker?.pending ?? [];
 		if (pending.length > 0) {
+			const shown = new Map(
+				input.events.flatMap((event) => event.spawned.map((sub) => [sub.laneName, sub.name] as const)),
+			);
 			specs.push({ gutter: { main: "tip", lane }, content: "" });
 			specs.push({
 				gutter: { main: "blank", lane },
-				content: theme.fg("timelineLane", `${pending.map(shortAgentName).join("、")} 还在干活`),
+				content: theme.fg(
+					"timelineLane",
+					`${pending.map((key) => shortAgentName(shown.get(key) ?? key)).join("、")} 还在干活`,
+				),
 			});
 		}
 	}

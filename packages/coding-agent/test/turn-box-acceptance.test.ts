@@ -11,6 +11,7 @@ import { CustomEditor } from "../src/modes/interactive/components/custom-editor.
 import { getToolFileChanges } from "../src/modes/interactive/components/edit-summary.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import { formatTimelineTime } from "../src/modes/interactive/components/timeline-gutter.js";
+import { timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
 import {
 	type TimelineHost,
 	TurnActivityState,
@@ -197,36 +198,44 @@ describe("s3: a turn carried on by a subagent notice", () => {
 		assistant(1_500, [{ type: "text", text: "审查员看完了，没发现问题。" }], "stop"),
 	];
 
-	it("keeps only the last answer under the timeline and draws the earlier one as an event line of it", () => {
+	it("starts the next turn at the notice and leaves the earlier answer under its own turn", () => {
 		setMotionReduced(true);
 		const components = replay(messages);
 		const summaries = components.filter((component) => component instanceof TurnSummaryComponent);
-		expect(summaries).toHaveLength(1);
-		const summary = summaries[0] as TurnSummaryComponent;
-		const underneath = renderAll(components.filter((component) => component !== summary));
-		// The last answer is the one answer under the timeline, never a line of it.
-		expect(underneath.match(/审查员看完了，没发现问题。/g)).toHaveLength(1);
-		expect(text(summary.render(120))).not.toContain("审查员看完了，没发现问题。");
-		// The earlier answer is not a second answer under the timeline: only its event line says it.
-		expect(underneath).not.toContain("已经派审查员去看了");
-		const earlier = lineWith(plain(summary.render(120)), "已经派审查员去看了");
-		expect(earlier.startsWith(` ${HH_MM(1_300)}   ◆`)).toBe(true);
+		expect(summaries).toHaveLength(2);
+		const closed = renderAll(components);
+		// The woken turn does not fold the answer the first turn ended on away: it is that turn's summary, once.
+		expect(closed.match(/已经派审查员去看了/g)).toHaveLength(1);
+		const earlier = lineWith(closed.split("\n"), "已经派审查员去看了");
+		expect(earlier.startsWith("         ┃")).toBe(true);
 		expect(cell(earlier, "已经派审查员去看了")).toBe(16);
-		summary.setExpanded(true);
-		expect(renderAll(components).match(/已经派审查员去看了/g)).toHaveLength(1);
+		const summaryHeader = lineWith(closed.split("\n"), `${HH_MM(1_300)}   ◆      总结`);
+		expect(summaryHeader.trimEnd()).toBe(` ${HH_MM(1_300)}   ◆      总结`);
+		// Its own one short reply to the notice is out of sight until 完整过程 is on.
+		expect(closed).not.toContain("审查员看完了，没发现问题。");
+		timelineShowAll.set(true);
+		try {
+			expect(renderAll(components)).toContain("审查员看完了，没发现问题。");
+		} finally {
+			timelineShowAll.set(false);
+		}
 	});
 
-	it("says what the subagent did as a step of its event, in Chinese", () => {
+	it("keeps what the subagent did out of sight until 完整过程 is on, then says it in Chinese", () => {
 		setMotionReduced(true);
 		const components = replay(messages);
-		const summary = components.find((component) => component instanceof TurnSummaryComponent) as TurnSummaryComponent;
-		summary.setExpanded(true);
-		const out = renderAll(components);
-		const step = lineWith(plain(summary.render(120)), "子代理 审查员 做完了，没发回消息");
-		expect(step.startsWith("         │")).toBe(true);
-		expect(cell(step, "子代理 审查员 做完了，没发回消息")).toBe(16 + 5 + 3);
-		expect(out).not.toContain("subagent status");
-		expect(out).not.toContain("RLM child");
+		expect(renderAll(components)).not.toContain("做完了，没发回消息");
+		timelineShowAll.set(true);
+		try {
+			const out = renderAll(components);
+			const notice = lineWith(out.split("\n"), "子代理 审查员 做完了，没发回消息");
+			expect(notice.startsWith(` ${HH_MM(1_400)}`)).toBe(true);
+			expect(cell(notice, "子代理 审查员 做完了，没发回消息")).toBe(16);
+			expect(out).not.toContain("subagent status");
+			expect(out).not.toContain("RLM child");
+		} finally {
+			timelineShowAll.set(false);
+		}
 	});
 });
 
