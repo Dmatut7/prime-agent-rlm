@@ -10,8 +10,11 @@ import {
 	type StatusBarState,
 	workingRunForms,
 } from "../src/modes/interactive/components/footer.js";
-import { renderSubagentSpendCell } from "../src/modes/interactive/components/subagent-summary-line.js";
-import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
+import {
+	renderSubagentSpendCell,
+	type SubagentSpendSummary,
+} from "../src/modes/interactive/components/subagent-summary-line.js";
+import { initTheme, type ThemeColor, theme } from "../src/modes/interactive/theme/theme.js";
 
 /**
  * The status line, cell for cell against the Tl2Live / Tl2Done design's last row:
@@ -22,9 +25,47 @@ import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 const WIDTH = 160;
 const MINUTE = 60_000;
 
-function familySpend(): string[] {
-	return renderSubagentSpendCell({ cost: 4.2, tokens: 1_000_000, parentCost: 5.6, unpriced: [], partial: false });
+function familySpend(color?: ThemeColor, overrides: Partial<SubagentSpendSummary> = {}): string[] {
+	return renderSubagentSpendCell(
+		{ cost: 4.2, tokens: 1_000_000, parentCost: 5.6, unpriced: [], partial: false, ...overrides },
+		color,
+	);
 }
+
+/** The foreground escape in force at each visible character of a styled line. */
+function foregrounds(styled: string): Array<{ char: string; fg: string }> {
+	const cells: Array<{ char: string; fg: string }> = [];
+	let fg = "";
+	for (const match of styled.matchAll(/\x1b\[([0-9;]*)m|([^\x1b])/gu)) {
+		const [sequence, params, char] = match;
+		if (char !== undefined) cells.push({ char, fg });
+		else if (params?.startsWith("38;")) fg = sequence;
+		else if (params === "39" || params === "0") fg = "";
+	}
+	return cells;
+}
+
+/** Every visible character of `needle` in the line carries `color`'s foreground (a blank has no color to see). */
+function expectColored(styled: string, needle: string, color: ThemeColor): void {
+	const cells = foregrounds(styled);
+	const text = cells.map((cell) => cell.char).join("");
+	const at = text.indexOf(needle);
+	expect(at, `${needle} is on the line`).toBeGreaterThanOrEqual(0);
+	const first = [...text.slice(0, at)].length;
+	const open = theme.fg(color, "x").split("x")[0];
+	const wanted = [...needle];
+	expect(wanted.length).toBeGreaterThan(0);
+	for (const [index, char] of wanted.entries()) {
+		if (char.trim() === "") continue;
+		expect(cells[first + index]?.fg, `${char} of ${needle}`).toBe(open);
+	}
+}
+
+const WARNED: Partial<SubagentSpendSummary> = {
+	unpriced: [{ model: "x/y", tokens: 10 }],
+	overridePriced: [{ model: "qwen", tokens: 5 }],
+	partial: true,
+};
 
 function bar(state: Partial<StatusBarState> & Pick<StatusBarState, "right">, width = WIDTH): string {
 	const footer = new FooterComponent({ getGitBranch: () => null } as never);
@@ -41,7 +82,7 @@ function designRow(left: string, right: string, width = WIDTH): string {
 
 describe("the status line while the AI works", () => {
 	initTheme("dark");
-	const spendCells = familySpend();
+	const spendCells = familySpend("timelineLive");
 	beforeAll(() => {
 		initTheme("dark");
 		setKeybindings(new KeybindingsManager());
@@ -73,11 +114,33 @@ describe("the status line while the AI works", () => {
 
 	it("paints the whole right side in the live color, the first meter cell in the user color, the rest in the rail color", () => {
 		const line = bar(state);
-		expect(line).toContain(theme.fg("timelineLive", "⠹ 工作中 10分 · ↓ 180k · 子代理 ¥4.20 · 全部 ¥9.80 · Esc 停止"));
+		expectColored(line, "⠹ 工作中 10分 · ↓ 180k · 子代理 ¥4.20 · 全部 ¥9.80 · Esc 停止", "timelineLive");
 		expect(line).toContain(`${theme.fg("timelineUser", "━")}${theme.fg("timelineRail", "━━━━━━━")}`);
 		expect(line).toContain(theme.fg("timelineTime", "glm-5.3-prime · 思考 最高"));
 		expect(line).toContain(theme.fg("timelineTime", "上下文"));
 		expect(line).toContain(theme.fg("timelineTime", "12%"));
+	});
+
+	it("keeps the spend cell's own marks in their colors and paints only the plain text in the live color", () => {
+		const cells = familySpend("timelineLive", WARNED);
+		expect(cells.length).toBeGreaterThan(0);
+		const forms = workingRunForms({
+			label: "工作中",
+			spinner: "⠹",
+			elapsedMs: 10 * MINUTE,
+			outputTokens: 180_000,
+			stopKey: "Esc",
+			spendCells: cells,
+		});
+		const line = bar({ ...state, right: forms, spendForms: cells.length }, 260);
+		expect(plain(line)).toContain("子代理 ≈¥4.20 · 全部 ≈¥9.80 (x/y 10 tok 未定价) (qwen 5 tok 已改价) · Esc 停止");
+		expectColored(line, "⠹ 工作中 10分 · ↓ 180k · 子代理 ", "timelineLive");
+		expectColored(line, "≈", "dim");
+		expectColored(line, "¥4.20", "timelineLive");
+		expectColored(line, "全部 ", "timelineLive");
+		expectColored(line, "(x/y 10 tok 未定价)", "warning");
+		expectColored(line, "(qwen 5 tok 已改价)", "accent");
+		expectColored(line, " · Esc 停止", "timelineLive");
 	});
 
 	it("says 思考, not 思考强度", () => {
@@ -150,7 +213,25 @@ describe("the status line when the run is done", () => {
 	beforeAll(() => {
 		initTheme("dark");
 	});
-	const spendCells = () => familySpend();
+	const spendCells = (overrides: Partial<SubagentSpendSummary> = {}) => familySpend("timelineTime", overrides);
+
+	it("keeps the spend cell's own marks in their colors and paints only the plain text dim", () => {
+		const cells = spendCells(WARNED);
+		expect(cells.length).toBeGreaterThan(0);
+		const forms = finishedRunForms({
+			outcome: "done",
+			elapsedMs: 20 * MINUTE,
+			outputTokens: 286_000,
+			spendCells: cells,
+		});
+		const line = bar({ context: { percent: 14, warn: false }, right: forms, spendForms: cells.length }, 240);
+		expect(plain(line)).toContain("✓ 完成 · 20 分钟 · ↓ 286k · 子代理 ≈¥4.20 · 全部 ≈¥9.80 (x/y 10 tok 未定价)");
+		expectColored(line, "✓ 完成 · 20 分钟 · ↓ 286k · 子代理 ", "timelineTime");
+		expectColored(line, "≈", "dim");
+		expectColored(line, "¥4.20", "timelineTime");
+		expectColored(line, "(x/y 10 tok 未定价)", "warning");
+		expectColored(line, "(qwen 5 tok 已改价)", "accent");
+	});
 
 	it("reads `✓ 完成 · 20 分钟 · ↓ 286k` in the dim color, meter untouched", () => {
 		const forms = finishedRunForms({

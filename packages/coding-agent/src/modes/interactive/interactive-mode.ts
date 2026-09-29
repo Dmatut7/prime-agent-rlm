@@ -7857,8 +7857,8 @@ export class InteractiveMode {
 	}
 
 	/** The subagent spend cell's forms for the status bar, fullest first; none without a figure or a connection. */
-	private statusBarSpendCell(): string[] {
-		return this.connectionLost ? [] : renderSubagentSpendCell(this.subagentSummaryLine.getSubagentSpend());
+	private statusBarSpendCell(color?: ThemeColor): string[] {
+		return this.connectionLost ? [] : renderSubagentSpendCell(this.subagentSummaryLine.getSubagentSpend(), color);
 	}
 
 	/**
@@ -7873,7 +7873,6 @@ export class InteractiveMode {
 		const dot = theme.fg("dim", " · ");
 		const state = this.currentTurnState;
 		const working = this.isAgentStreaming() || this.turnFlow.hasLiveBox();
-		const spendCell = this.statusBarSpendCell();
 		const layout = (forms: string[], spendBearing: string[] = []) =>
 			[...spendBearing, ...forms].map((form) => `${toastChip}${form}`);
 		if (working || this.isAgentCompacting()) {
@@ -7887,7 +7886,7 @@ export class InteractiveMode {
 					elapsedMs: elapsed,
 					outputTokens: tokens,
 					stopKey: keyText("app.input.clear", { primaryOnly: true }) || undefined,
-					spendCells: spendCell,
+					spendCells: this.statusBarSpendCell("timelineLive"),
 				}),
 			);
 		}
@@ -7904,14 +7903,14 @@ export class InteractiveMode {
 					elapsedMs: last.turnDurationMs(),
 					outputTokens: last.timeline.outputTokens(),
 					...(this.sessionOutputTokens !== undefined ? { sessionTokens: this.sessionOutputTokens } : {}),
-					spendCells: spendCell,
+					spendCells: this.statusBarSpendCell("timelineTime"),
 				}),
 			);
 		}
 		const quiet = session ? [`${session}${theme.fg("dim", " tokens")}`, session] : [""];
 		return layout(
 			quiet,
-			spendCell.map((cell) => (session ? `${quiet[0]}${dot}${cell}` : cell)),
+			this.statusBarSpendCell().map((cell) => (session ? `${quiet[0]}${dot}${cell}` : cell)),
 		);
 	}
 

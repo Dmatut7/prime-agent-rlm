@@ -1012,19 +1012,27 @@ export class SubagentSummaryLine implements Component, Focusable {
  * wrong number, so the caller drops the whole cell instead of ellipsizing it.
  * All-zero figures give no forms (no ¥0.00 noise), and an all-unpriced family
  * shows tokens plus the warning instead of ¥0.00.
+ *
+ * With `color` the plain words and figures all take that one color, so the cell
+ * sits inside a line painted in it; the `≈` lower-bound mark and the warning
+ * annotations (`未定价`, `已改价`, `?`) keep their own colors either way.
  */
-export function renderSubagentSpendCell(spend: SubagentSpendSummary | undefined): string[] {
+export function renderSubagentSpendCell(spend: SubagentSpendSummary | undefined, color?: ThemeColor): string[] {
 	if (!spend || (spend.cost === 0 && spend.tokens === 0)) return [];
-	const lower = spend.partial ? "≈" : "";
-	const money =
+	const lower = spend.partial ? theme.fg("dim", "≈") : "";
+	const label = (text: string) => theme.fg(color ?? "muted", text);
+	const money = (text: string) => theme.fg(color ?? "accent", text);
+	const rest = (text: string) => theme.fg(color ?? "dim", text);
+	const figure =
 		spend.cost > 0
-			? `${spend.partial ? theme.fg("dim", "≈") : ""}${theme.fg("accent", formatSpendCost(spend.cost))}`
-			: "";
-	const figure = money || theme.fg("dim", `${lower}${formatTokenCount(spend.tokens)} tok`);
-	const primary = `${theme.fg("muted", "子代理")} ${figure}`;
+			? `${lower}${money(formatSpendCost(spend.cost))}`
+			: `${lower}${rest(`${formatTokenCount(spend.tokens)} tok`)}`;
+	const primary = `${label("子代理")} ${figure}`;
 	const total = spend.parentCost + spend.cost;
 	const secondary =
-		total > 0 ? `${theme.fg("dim", " · ")}${theme.fg("dim", `全部 ${lower}${formatSpendCost(total)}`)}` : "";
+		total > 0
+			? `${rest(" · ")}${lower ? `${rest("全部 ")}${lower}${rest(formatSpendCost(total))}` : rest(`全部 ${formatSpendCost(total)}`)}`
+			: "";
 	const annotate = (withTokens: boolean): string => {
 		const models = (entries: ReadonlyArray<{ model: string; tokens: number }>): string =>
 			entries

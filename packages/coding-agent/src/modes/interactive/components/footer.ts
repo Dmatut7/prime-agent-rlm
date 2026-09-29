@@ -194,27 +194,30 @@ export interface WorkingRunInput {
 	outputTokens: number;
 	/** The configured stop key's name; absent when none is bound. */
 	stopKey?: string;
-	/** The subagent spend cell's forms, fullest first (see renderSubagentSpendCell). */
+	/** The subagent spend cell's forms, fullest first, rendered with renderSubagentSpendCell(spend, "timelineLive"). */
 	spendCells: readonly string[];
 }
 
 /**
  * The right side of the status line while the AI works, fullest form first:
  * `⠹ 工作中 10分 · ↓ 180k · 子代理 ¥4.20 · 全部 ¥9.80 · Esc 停止`, all in the live
- * color. The forms that carry the spend come first, one per spend form, so the
- * spend goes before the clock or the tokens lose anything.
+ * color except the spend cell's own warning marks. The forms that carry the
+ * spend come first, one per spend form, so the spend goes before the clock or
+ * the tokens lose anything.
  */
 export function workingRunForms(input: WorkingRunInput): string[] {
+	const live = (text: string) => theme.fg("timelineLive", text);
 	const head = `${input.spinner} ${input.label}`;
-	const counted = `${head} ${formatLiveClock(input.elapsedMs)}${RUN_DOT}↓ ${formatBoxTokens(input.outputTokens)}`;
+	const clock = formatLiveClock(input.elapsedMs);
+	const counted = `${head} ${clock}${RUN_DOT}↓ ${formatBoxTokens(input.outputTokens)}`;
 	const stop = input.stopKey ? `${RUN_DOT}${input.stopKey} 停止` : "";
-	const forms = [
-		...input.spendCells.map((cell) => `${counted}${RUN_DOT}${stripAnsi(cell)}${stop}`),
-		`${counted}${stop}`,
-		counted,
-		`${head} ${formatLiveClock(input.elapsedMs)}`,
+	const plain = [`${counted}${stop}`, counted, `${head} ${clock}`].filter(
+		(form, index, all) => all.indexOf(form) === index,
+	);
+	return [
+		...input.spendCells.map((cell) => `${live(`${counted}${RUN_DOT}`)}${cell}${stop ? live(stop) : ""}`),
+		...plain.map(live),
 	];
-	return forms.filter((form, index) => forms.indexOf(form) === index).map((form) => theme.fg("timelineLive", form));
 }
 
 export interface FinishedRunInput {
@@ -223,6 +226,7 @@ export interface FinishedRunInput {
 	outputTokens: number;
 	/** Output tokens of the whole conversation, shown after a completed run. */
 	sessionTokens?: number;
+	/** The subagent spend cell's forms, fullest first, rendered with renderSubagentSpendCell(spend, "timelineTime"). */
 	spendCells: readonly string[];
 }
 
@@ -244,7 +248,7 @@ export function finishedRunForms(input: FinishedRunInput): string[] {
 			: "";
 	const fullest = `${base}${session}`;
 	return [
-		...input.spendCells.map((cell) => paint(`${fullest}${RUN_DOT}${stripAnsi(cell)}`)),
+		...input.spendCells.map((cell) => `${paint(`${fullest}${RUN_DOT}`)}${cell}`),
 		...(session ? [paint(fullest)] : []),
 		paint(base),
 		paint(word),
