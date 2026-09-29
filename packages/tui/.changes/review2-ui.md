@@ -1,1 +1,0 @@
-- Fixed `matchesKey` treating ESC B and ESC F as Alt+Shift+B and Alt+Shift+F as well as the word-movement keys Alt+Left and Alt+Right; they now mean word movement only, as `parseKey` already read them.
