@@ -8478,13 +8478,21 @@ export class InteractiveMode {
 		// sent agent messages inside ipython tool details), deduped by id.
 		const replaySentCommIds = new Set<string>();
 		const replayQuiet = this.settingsManager.getProcessMode() === "quiet";
-		// A rebuild replays the question from its start: who is still out is learned again as it goes.
+		// A rebuild replays the question from its start: who is still out is learned again as it goes,
+		// and what the replay cannot see (a dispatch compacted away or outside the window) is taken back.
+		const laneBefore = this.turnFlow.captureLane();
 		this.turnFlow.subagentLane.reset();
 		// The reports the conversation received are learned again too, the ones the window left out first.
 		this.turnFlow.reports.clear();
 		for (const message of transcriptMessages.slice(0, transcriptMessages.length - windowed.length)) {
 			this.turnFlow.reports.note(message);
 		}
+		// A replay with no question in it is a part of the question that is running.
+		if (!messagesToRender.some((message) => message.role === "user")) this.turnFlow.restoreLane(laneBefore);
+		const cutPrompt = cutTurn?.prompt;
+		const cutPromptIsAlone = !messagesToRender.slice(1).some((message) => message.role === "user");
+		// When the question the replay ends in began: an earlier dispatch is another question's.
+		let questionStartedAt: number | undefined;
 		const toolNames: string[] = [];
 		for (const message of messagesToRender) {
 			if (message.role !== "assistant") {
@@ -8599,7 +8607,12 @@ export class InteractiveMode {
 				replayStartedByUser = !this.createLegacyHeartbeatPromptMessage(message, this.getUserMessageText(message));
 				replayPromptOpened = replayStartedByUser;
 				// A new question: nobody is out yet (a stored heartbeat prompt is not one).
-				if (replayStartedByUser) this.turnFlow.subagentLane.reset();
+				if (replayStartedByUser) {
+					this.turnFlow.subagentLane.reset();
+					questionStartedAt = Number(message.timestamp) || undefined;
+					// The prompt a window keeps of the question it cut into is the running question's own.
+					if (message === cutPrompt && cutPromptIsAlone) this.turnFlow.restoreLane(laneBefore, questionStartedAt);
+				}
 				replayCause = undefined;
 			}
 			// Assistant messages need special handling for tool calls
@@ -8797,6 +8810,8 @@ export class InteractiveMode {
 		}
 		// Carry each box's live-only facts and open rows over to its replayed twin.
 		this.turnFlow.carryOver(carriedBoxes, { keepHistory: options.keepCompactedHistory === true });
+		this.turnFlow.restoreLane(laneBefore, questionStartedAt);
+		this.turnFlow.noteTaskLabels(this.subagentSnapshots?.values() ?? []);
 		if (replayTurnState && (renderedPendingTools.size > 0 || this.isAgentStreaming())) {
 			// Attaching mid-run: live tool and thinking events keep feeding this
 			// turn's group, so the replayed state stays the live one - and stays

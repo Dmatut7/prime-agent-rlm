@@ -18,7 +18,6 @@ import {
 	type BoxRowKind,
 	eventSaysMore,
 	type MetaPart,
-	type SpawnedSubagent,
 	summaryParts,
 	type TimelineEvent,
 	type TimelineFacts,
@@ -510,24 +509,12 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 	const ui = timeline.ui;
 	const specs: LineSpec[] = [];
 	const tracker = input.lanes;
-	// A subagent is out for a line when it was dispatched above it and had not come back by the line's time.
-	const startedOut = ui.startLane === "on";
-	const isOut = (sub: SpawnedSubagent, at: number): boolean => {
-		if (sub.endedAt !== undefined) return at <= 0 || at < sub.endedAt;
-		return sub.running && (tracker?.pending.includes(sub.laneName) ?? false);
-	};
-	/** `on` once it was on: a line does not go dark when the agents come back. */
-	const remember = (memoKey: string, on: boolean): TimelineLane => {
-		if (ui.lanes.get(memoKey) === "on") return "on";
-		if (on) ui.lanes.set(memoKey, "on");
-		return on ? "on" : "off";
-	};
-	const laneOfEvent = (index: number): TimelineLane => {
-		if (!tracker) return "off";
-		const at = input.events[index]?.at ?? 0;
-		const out = input.events.slice(0, index).some((event) => event.spawned.some((sub) => isOut(sub, at)));
-		return remember(`ln:${input.events[index]?.key}`, out || (startedOut && tracker.active));
-	};
+	// A line is on the lane when a subagent went out before its time and was not back by then, so a
+	// line reads the same whenever it is drawn, and in a replay as in the live view.
+	const spans = timeline.laneSpans ?? tracker?.spans;
+	const laneAt = (at: number, atDispatch = false): TimelineLane =>
+		tracker && spans?.outAt(at > 0 ? at : Number.POSITIVE_INFINITY, atDispatch) ? "on" : "off";
+	const laneOfEvent = (index: number): TimelineLane => laneAt(input.events[index]?.at ?? 0);
 	const toggle = (key: string) => () => {
 		if (ui.expanded.has(key)) {
 			ui.expanded.delete(key);
@@ -579,8 +566,8 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 	const detailWidth = Math.max(8, bodyWidth - STEP_INDENT - STEP_GLYPH_COLS);
 
 	if (input.events.length > 0 || input.tail || inline.length > 0) {
-		for (let row = 0; row < (input.leadingRows ?? 0); row++)
-			gap(tracker && startedOut && tracker.active ? "on" : "off");
+		const firstAt = input.events[0]?.at ?? input.tail?.at ?? 0;
+		for (let row = 0; row < (input.leadingRows ?? 0); row++) gap(laneAt(firstAt));
 	}
 
 	const folds = foldedEventRuns(
@@ -711,14 +698,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 				gutter: { main: "split", lane: tracker ? "split" : "off" },
 				content: `${theme.bold(theme.fg("timelineSub", "◇"))}  ${theme.fg("timelineSoft", event.spawned.map((sub) => (sub.tag ? `${shortAgentName(sub.name)} ${sub.tag}` : shortAgentName(sub.name))).join("   "))}`,
 			});
-			gap(
-				tracker
-					? remember(
-							`gap:${event.key}`,
-							event.spawned.some((sub) => isOut(sub, sub.startedAt)),
-						)
-					: "off",
-			);
+			gap(event.spawned.some((sub) => laneAt(sub.startedAt, true) === "on") ? "on" : "off");
 		}
 	});
 

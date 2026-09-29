@@ -2,7 +2,7 @@ import type { AssistantMessage, AssistantMessageEvent } from "@earendil-works/pi
 import type { Component, Container } from "@earendil-works/pi-tui";
 import type { CustomMessage } from "../../core/messages.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
-import { AgentMessageComponent, laneKey, SubagentLane } from "./components/agent-message.js";
+import { AgentMessageComponent, laneKey, SubagentLane, type SubagentLaneSnapshot } from "./components/agent-message.js";
 import {
 	assignWakeCause,
 	countThinkingSegments,
@@ -822,11 +822,44 @@ export class LiveTurnFlow {
 			if (!carried || carried === child) continue;
 			this.cancelFinish(carried.state);
 			carried.state.timeline.transferTo(child.state.timeline, { keepHistory });
+			// The lane was rebuilt from the replay alone: the subagents this box still shows as out are out again.
+			child.state.timeline.reseedLane();
 			if (keepHistory) child.state.adoptHistory(carried.state);
 			// A box that was still settling when the chat was rebuilt finishes here
 			// (the one a run still streams into waits for that run's end).
 			const timeline = child.state.timeline;
 			if (timeline.observedLive && timeline.finishedAt === undefined) this.scheduleFinish(child.state);
+		}
+	}
+
+	/** What the lane knows now, taken before a rebuild replays the chat from the start and forgets it. */
+	captureLane(): SubagentLaneSnapshot {
+		return this.subagentLane.snapshot();
+	}
+
+	/**
+	 * A rebuild replayed the chat: take back who is out that the replay could not see (the dispatch
+	 * was compacted away or lies outside the window), so the lane, the waiting names and the row that
+	 * closes the lane go on where they were. `since` is when the question the replay ends in began.
+	 */
+	restoreLane(snapshot: SubagentLaneSnapshot, since?: number): void {
+		this.subagentLane.restore(snapshot, since);
+		this.host.requestRender();
+	}
+
+	/**
+	 * The task each child was given, as the session recorded it, for boxes replayed from the
+	 * transcript alone (which names a child but not its task).
+	 */
+	noteTaskLabels(children: Iterable<AgentConnectionRlmChildAgentSnapshot>): void {
+		const labels = new Map<string, string>();
+		for (const child of children) {
+			const key = child.sessionName ? laneKey(child.sessionName, child.activeSessionId) : "";
+			if (key && child.label && child.status !== "cancelled") labels.set(key, child.label);
+		}
+		if (labels.size === 0) return;
+		for (const child of this.host.chat().children) {
+			if (child instanceof TurnSummaryComponent) child.state.timeline.noteTaskLabels(labels);
 		}
 	}
 
