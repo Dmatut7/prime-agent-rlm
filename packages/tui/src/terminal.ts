@@ -160,6 +160,8 @@ export class ProcessTerminal implements Terminal {
 	private readonly altScreenHandoffToken = Symbol("altScreenHandoff");
 	private _altScreenActive = consumeAltScreenHandoff();
 	private _mouseTrackingActive = false;
+	// Set once the terminal is being drained for exit: reporting stays off however the UI asks.
+	private mouseTrackingSuspended = false;
 	private stdinBuffer?: StdinBuffer;
 	private stdinDataHandler?: (data: string) => void;
 	private keyboardProtocolFallbackTimer?: ReturnType<typeof setTimeout>;
@@ -190,6 +192,7 @@ export class ProcessTerminal implements Terminal {
 
 	start(onInput: (data: string) => void, onResize: () => void): void {
 		this.started = true;
+		this.mouseTrackingSuspended = false;
 		this.inputHandler = onInput;
 		this.resizeHandler = onResize;
 
@@ -395,6 +398,13 @@ export class ProcessTerminal implements Terminal {
 
 	async drainInput(maxMs = 1000, idleMs = 50): Promise<void> {
 		this.abortPendingInput();
+		// Like Kitty below, stop the source first: a pointer still moving would refresh
+		// the idle clock until maxMs, and reports still on their way would reach the shell.
+		if (this._mouseTrackingActive) {
+			process.stdout.write(MOUSE_TRACKING_OFF);
+			this._mouseTrackingActive = false;
+		}
+		this.mouseTrackingSuspended = true;
 		if (this._kittyProtocolActive) {
 			// Disable Kitty keyboard protocol first so any late key releases
 			// do not generate new Kitty escape sequences.
@@ -447,6 +457,7 @@ export class ProcessTerminal implements Terminal {
 			process.stdout.write(MOUSE_TRACKING_OFF);
 			this._mouseTrackingActive = false;
 		}
+		this.mouseTrackingSuspended = false;
 		if (this._altScreenActive) {
 			if (options.preserveAltScreen) {
 				pendingAltScreenHandoff = this.altScreenHandoffToken;
@@ -589,6 +600,7 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	setMouseTracking(enabled: boolean): void {
+		if (enabled && this.mouseTrackingSuspended) return;
 		if (enabled === this._mouseTrackingActive) return;
 		this._mouseTrackingActive = enabled;
 		// ?1003 (any-event tracking) reports drags for in-app selection and, since
