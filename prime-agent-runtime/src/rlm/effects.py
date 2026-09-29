@@ -216,15 +216,15 @@ _SECRET_NAMES = (
 # A passphrase in quotes: two to five short words of letters and digits, a space apart.
 _PASSPHRASE = r"[a-z0-9]{2,12}(?: [a-z0-9]{2,12}){1,4}"
 # A type between a name and its `=`: `str`, `Optional[str]`, `&'static str`, `Option<&str>`, `*const c_char` (a
-# word of name characters and the marks of references, pointers and generics; at most three, blank-separated).
+# word of name characters and the marks of references, pointers and generics; at most three, on the name's line).
 _TYPE_WORD = r"[\w\[\].\"'&*][\w\[\].\"'&*<>]*"
 # What may follow the name: `secret_key`, `credentials`, a closing quote, then `=` or `:` (not `==`), a type
 # before the `=` (`: str =`, Rust `: &str =`), `:=`, or Go's `var password string =` (a type and no colon), and a
 # value: one quoted token, quoted words, or a bare token.
 _SECRET_ASSIGNMENT_TAIL = re.compile(
     r"(?:[_-]?key)?s?[\"']?"
-    r"(?:\s*(?<![=!<>])(?::\s*" + _TYPE_WORD + r"(?:\s+" + _TYPE_WORD + r"){0,2}\s*=(?!=)|:=|[:=](?!=))"
-    r"|\s+(?:\*|\[\d*\])*[a-z_][\w.]*\s*=(?!=))"
+    r"(?:\s*(?<![=!<>])(?::\s*" + _TYPE_WORD + r"(?:[ \t]+" + _TYPE_WORD + r"){0,2}[ \t]*=(?!=)|:=|[:=](?!=))"
+    r"|[ \t]+(?:\*|\[\d*\])*[a-z_][\w.]*[ \t]*=(?!=))"
     r"\s*"
     r"(?:(?P<quote>[\"'])(?:(?P<token>[^\"'\s]{8,})|(?P<words>" + _PASSPHRASE + r"))(?P=quote)"
     r"|(?P<bare>[^\s\"'#,;.(){}\[\]<>]{8,}))"

@@ -278,6 +278,21 @@ class AssignmentDeclarationFormsTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(effects.looks_secret(text))
 
+    def test_a_credential_word_at_a_line_end_does_not_reach_into_the_next_line(self):
+        # The type and Go forms stay on one line: a line ending in `token` followed by an ordinary
+        # assignment is code, not a declaration (found in cryptography and mcp during review).
+        ordinary = [
+            "raise InvalidToken\nunpadder = _PKCS7_128.unpadder()",
+            'TOKEN_PATH = "/token"\nREGISTRATION_PATH = "/register"',
+            'api_token: str\nbase_url = "https://example.com/api/v1"',
+            '# Where to fetch the token\nTOKEN_URL = "https://example.com/oauth/token"',
+            "def refresh(self, token\n             refresh_interval = 12345678):",
+        ]
+        self.assertGreater(len(ordinary), 0)
+        for text in ordinary:
+            with self.subTest(text=text):
+                self.assertFalse(effects.looks_secret(text))
+
     def test_the_earlier_forms_are_judged_as_before(self):
         withheld = [
             f'password: str = "{_PASSWORD}"',
