@@ -15,6 +15,7 @@ import {
 	isSessionSlashCommandMessage,
 	isSessionSlashCommandResultMessage,
 	REFINEMENT_OUTCOME_CUSTOM_TYPE,
+	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
 } from "../../../core/messages.js";
@@ -125,45 +126,106 @@ export function isWakeMessage(message: AgentMessage): boolean {
 	return message.role === "custom" && (startsAgentRun(message) || isSubagentNoticeMessage(message));
 }
 
-/** What woke a round the owner did not start: only subagent notices so far, or something with more to say. */
-export class WakeCause {
-	noticeOnly = true;
+/** Which subagents of the conversation have handed a report back, learned in transcript order. */
+export class ReceivedReports {
+	private readonly names = new Set<string>();
 
-	/** A message that woke the AI (or joined the round that woke it). */
+	/** A message of the conversation: a report from a child is remembered under its name. */
+	note(message: AgentMessage): void {
+		if (!isAgentSessionMessage(message) || message.details.fromRelationship !== "child") return;
+		const name = message.details.from?.sessionName?.trim();
+		if (name) this.names.add(name);
+	}
+
+	has(name: string): boolean {
+		return this.names.has(name);
+	}
+
+	clear(): void {
+		this.names.clear();
+	}
+}
+
+/** A notice that only says again what the AI has: a cancel or a silent finish of a subagent whose report came. */
+function repeatsReceivedReport(message: AgentMessage, reports: ReceivedReports): boolean {
+	if (message.role !== "custom" || message.customType !== RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE) return false;
+	const name = (message.details as { sessionName?: unknown } | undefined)?.sessionName;
+	return typeof name === "string" && name.trim() !== "" && reports.has(name.trim());
+}
+
+/**
+ * What woke a round the owner did not start. It is bookkeeping only while every message that
+ * woke it is a subagent notice that repeats a report already received; a report, a failure or
+ * a stall notice, a heartbeat, or a silent end of a child that never reported is news.
+ */
+export class WakeCause {
+	private onlyNotices = true;
+	private onlyRepeats = true;
+
+	constructor(private readonly reports: ReceivedReports) {}
+
+	/** A message that woke the AI (or joined the round that woke it), judged against the reports received before it. */
 	add(message: AgentMessage): void {
-		if (!isSubagentNoticeMessage(message)) this.noticeOnly = false;
+		if (!isSubagentNoticeMessage(message)) this.onlyNotices = false;
+		if (!repeatsReceivedReport(message, this.reports)) this.onlyRepeats = false;
+	}
+
+	get isBookkeeping(): boolean {
+		return this.onlyNotices && this.onlyRepeats;
 	}
 }
 
 const wakeCauses = new WeakMap<TurnActivityState, WakeCause>();
+/** Rounds that showed news once: they stay drawn from then on. */
+const revealedRounds = new WeakSet<TurnActivityState>();
 
 /** The round `state` is: woken by `cause`. */
 export function assignWakeCause(state: TurnActivityState, cause: WakeCause): void {
 	wakeCauses.set(state, cause);
 }
 
-/** A message that woke the AI landed in the round `state` (inside its tool loop): it is no longer notice-only. */
+/** A message that woke the AI landed in the round `state` (inside its tool loop): it may be news. */
 export function noteWakeInRound(state: TurnActivityState | undefined, message: AgentMessage): void {
 	if (state) wakeCauses.get(state)?.add(message);
 }
 
+/** Whether a round woken by bookkeeping did anything the owner would look for. */
+function roundHasNews(state: TurnActivityState): boolean {
+	const timeline = state.timeline;
+	if (timeline.stopped || timeline.errorEnded) return true;
+	if (timeline.entries.some((entry) => entry.kind === "subagent")) return true;
+	if (state.steps.length === 0 && timeline.entries.every((entry) => entry.kind === "message")) return false;
+	const facts = state.boxView().facts;
+	if (facts.subagentCount > 0 || facts.projectChanges.length > 0 || facts.scratchChanges.length > 0) return true;
+	if (facts.memories.length > 0) return true;
+	return state.isTurnEnded && facts.errorCount > 0 && facts.errorsRecovered !== true;
+}
+
 /**
- * Whether a finished round is only the AI dealing with subagent notices (a child finished
- * without a word, was cancelled): the owner did not start it, only such notices woke it (no
- * report, no user input), and it did no work the owner would look for - it dispatched nothing,
- * changed no files, saved no memory and ended without an unfixed error or a stop. Whatever the
- * reply says and however many steps it took, such a round is not drawn unless "完整过程" is on.
+ * Whether a round is only the AI dealing with bookkeeping notices (a child that reported earlier
+ * was cancelled or finished without a word): the owner did not start it, only such notices woke it,
+ * and it did no work the owner would look for - it dispatched nothing, changed no files, saved no
+ * memory and ended without an unfixed error or a stop. Whatever the reply says and however many
+ * steps it took, such a round is not drawn unless "完整过程" is on. It is decided when the round is
+ * woken and holds from its first word to its last; only news turns it into a drawn round, for good.
  */
 export function isAckRound(state: TurnActivityState): boolean {
-	if (timelineShowAll.value || state.startedByUser || !state.isTurnEnded) return false;
-	if (!wakeCauses.get(state)?.noticeOnly) return false;
-	const timeline = state.timeline;
-	if (timeline.stopped || timeline.errorEnded) return false;
-	if (timeline.entries.some((entry) => entry.kind === "subagent")) return false;
-	const facts = state.boxView().facts;
-	if (facts.subagentCount > 0 || facts.projectChanges.length > 0 || facts.scratchChanges.length > 0) return false;
-	if (facts.memories.length > 0) return false;
-	return facts.errorCount === 0 || facts.errorsRecovered === true;
+	if (timelineShowAll.value || state.startedByUser || revealedRounds.has(state)) return false;
+	if (!wakeCauses.get(state)?.isBookkeeping) return false;
+	if (roundHasNews(state)) {
+		revealedRounds.add(state);
+		return false;
+	}
+	return true;
+}
+
+/** The newest turn head the chat draws: a round that is left out is not one (with 完整过程 on, every round is). */
+export function latestShownTurn(children: readonly Component[]): TurnSummaryComponent | undefined {
+	for (let index = children.length - 1; index >= 0; index--) {
+		const child = children[index];
+		if (child instanceof TurnSummaryComponent && !isAckRound(child.state)) return child;
+	}
+	return undefined;
 }
 
 /** The turn head of a round that is only an acknowledgement: nothing of it is drawn. */
@@ -347,6 +409,8 @@ export function buildConversationComponents(
 	let nextStartedByUser = true;
 	// What woke the turn about to start; the turn takes it when its first reply comes.
 	let pendingCause: WakeCause | undefined;
+	// The reports the conversation has received so far: a notice that repeats one is bookkeeping.
+	const reports = new ReceivedReports();
 	// The owner's prompt opened the turn about to start: a report landing before its first reply does not take it over.
 	let promptOpened = false;
 
@@ -390,7 +454,7 @@ export function buildConversationComponents(
 		// ended on stays its own, and the woken turn never folds it away (a live run does the same).
 		if (quiet && isWakeMessage(message) && insideRound()) noteWakeInRound(turnState, message);
 		if (quiet && isWakeMessage(message) && !insideRound() && !promptOpened) {
-			pendingCause ??= new WakeCause();
+			pendingCause ??= new WakeCause(reports);
 			pendingCause.add(message);
 			closeTurn();
 			turnState?.markTurnEnded(Number(message.timestamp) || Date.now());
@@ -400,6 +464,7 @@ export function buildConversationComponents(
 			sentCommIds.clear();
 			nextStartedByUser = false;
 		}
+		reports.note(message);
 		if (message.role === "user") {
 			// Typed while the AI was between its steps: an interjection row in
 			// the quiet turn's box, not a new turn (the live view does the same).
@@ -568,8 +633,13 @@ export function buildConversationComponents(
 			}
 		} else if (quiet && message.role === "custom" && isSubagentNoticeMessage(message)) {
 			// A subagent that ended, failed or went quiet: a row of the timeline, out of sight unless it failed.
+			// One that lands inside the running tool loop is a row of that turn, among its lines by time.
 			const row = subagentNoticeRow(message, lane);
-			if (row) components.push(row);
+			if (row) {
+				const round = isWakeMessage(message) && insideRound() ? turnSummary : undefined;
+				if (round) round.addInlineRow(row, Number(message.timestamp) || 0);
+				else components.push(row);
+			}
 		} else if (quiet && turnState && message.role === "custom" && isBoxNoticeMessage(message)) {
 			// The box says it as its own row (a compaction that waited).
 			const record = boxRecordFromMessage(message);

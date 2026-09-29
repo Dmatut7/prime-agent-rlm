@@ -231,7 +231,12 @@ describe("完整过程 ▸ brings the hidden rows at once", () => {
 		vi.setSystemTime(at(18, 47));
 		const chat = new LiveChat();
 		chat.setClock(at(18, 47));
-		chat.prompt("审查", { answer: "审查完成：都没问题，四个车道都收口了，这批代码本身没问题，远程检查现在是绿的。" });
+		chat.user("审查");
+		chat.report(handedBack("m0", at(18, 47) + 500, "B"));
+		chat.say(at(18, 47) + 1_000, {
+			words: "审查完成：都没问题，四个车道都收口了，这批代码本身没问题，远程检查现在是绿的。",
+		});
+		chat.endRun();
 		vi.advanceTimersByTime(1000);
 		chat.wakeByNotice("B", { answer: ACK });
 		vi.advanceTimersByTime(1000);

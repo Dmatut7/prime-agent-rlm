@@ -148,6 +148,7 @@ function transcript(): AgentMessage[] {
 		assistant(T0 + 1_000, [{ type: "text", text: "派出去了，等它们交回。" }], "stop"),
 		handedBack("m1", T0 + 2_000, "review-grow-A-tui"),
 		handedBack("m2", T0 + 3_000, "review-grow-B-box"),
+		handedBack("m3", T0 + 3_500, "review-grow-C-strip"),
 		assistant(T0 + 4_000, [{ type: "text", text: LONG_ANSWER }], "stop"),
 		createRlmChildTerminalNoticeMessage(
 			{ kind: "completed_without_reply", childId: "c-id", sessionName: "review-grow-C-strip" },
@@ -164,7 +165,10 @@ describe("the mode's own replay of a conversation subagents woke", () => {
 		chat.prompt("对最近的改动做全面的审查", { answer: "派出去了，等它们交回。" });
 		chat.wake("m1", {
 			name: "review-grow-A-tui",
-			also: [{ id: "m2", name: "review-grow-B-box" }],
+			also: [
+				{ id: "m2", name: "review-grow-B-box" },
+				{ id: "m3", name: "review-grow-C-strip" },
+			],
 			answer: LONG_ANSWER,
 		});
 		chat.wakeByNotice("review-grow-C-strip", { answer: ACK });

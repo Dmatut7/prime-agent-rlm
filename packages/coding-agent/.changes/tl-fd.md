@@ -1,0 +1,7 @@
+- Fixed the AI's reply to a subagent notice being hidden whatever it said: only a cancel or a silent finish of a subagent whose report already came stays out of sight (from its first word to its last, never drawn and then taken away), while a failure, a stall warning and a silent finish of a subagent that never reported are drawn with the reply.
+- Fixed a report or notice that arrives after the AI's final answer, in the same run, being taken as part of your turn instead of starting its own.
+- Fixed Ctrl+O, Ctrl+T, Ctrl+P and Option+J acting on a turn that is left out of sight; they now act on the newest turn on screen.
+- Fixed a compaction that did not happen being folded into the steps; it is now a line of its own, and a compaction after the last answer no longer lands inside the step list of an event that had ended.
+- Fixed a model call that an automatic retry followed showing as `模型出错 … 下一格改好了` after reopening a session; it now reads `已自动重试` as it does live.
+- Fixed the memory tidy line landing under the closing row of a request while it was running and above it after reopening; the closing row is now always the last line.
+- Fixed Ctrl+T after Ctrl+O doing nothing on the third press: thoughts under a folded event now count as closed.

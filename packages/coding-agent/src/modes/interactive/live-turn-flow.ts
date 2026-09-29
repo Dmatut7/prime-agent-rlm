@@ -11,6 +11,7 @@ import {
 	latestThinkingText,
 	NO_STEP_STOP,
 	noteWakeInRound,
+	ReceivedReports,
 	resolveTurnHeaders,
 	type StepResultStop,
 	stepResultStop,
@@ -137,6 +138,8 @@ export class LiveTurnFlow {
 	readonly subagentLane = new SubagentLane();
 	/** What woke the run in progress; the turn it opens takes it. */
 	private pendingCause: WakeCause | undefined;
+	/** The reports this conversation has received: a notice that repeats one is bookkeeping (a replay learns them again). */
+	readonly reports = new ReceivedReports();
 	/** The message that just arrived joined the round that runs: its row sits inside that turn. */
 	private joinedRound = false;
 
@@ -203,22 +206,26 @@ export class LiveTurnFlow {
 		// How the run's last reply ended, as a message typed in a step would read it (a view attached mid-run replays it).
 		const state = this.host.currentState();
 		const lastStop = this.lastStop ?? (state?.isTurnEnded ? undefined : this.replayedStop(state));
-		if (isWakeMessage(message) && lastStop !== "toolUse" && !this.runCutMidTask) {
+		const wakes = isWakeMessage(message);
+		if (wakes && lastStop !== "toolUse" && !this.runCutMidTask) {
 			this.starterSinceRunStart = true;
-			// A prompt already opened this run: a report landing before the first answer does not take it over.
-			if (this.starterKind !== "user") {
+			// A prompt opened this run and nothing has answered it yet: a report landing before the first
+			// answer does not take it over. Once an answer has landed, the message starts a round of its own.
+			if (this.starterKind !== "user" || lastStop !== undefined) {
 				this.starterKind = "wake";
-				this.pendingCause ??= new WakeCause();
+				this.pendingCause ??= new WakeCause(this.reports);
 				this.pendingCause.add(message);
 			}
+			this.reports.note(message);
 			this.endLiveTurnForNewRun();
 			return false;
 		}
 		// Inside the tool loop the message joins the round that is running.
-		if (isWakeMessage(message)) {
+		if (wakes) {
 			noteWakeInRound(this.host.currentState(), message);
 			this.joinedRound = true;
 		}
+		this.reports.note(message);
 		// A subagent notice is a row of the timeline the chat draws, never one of the box's.
 		if (isSubagentNoticeMessage(message)) return false;
 		if (!isBoxNoticeMessage(message)) return false;
@@ -251,6 +258,22 @@ export class LiveTurnFlow {
 		if (before instanceof AgentMessageComponent && row instanceof AgentMessageComponent) row.joinPreviousRow();
 		summary.addInlineRow(row, at);
 		return true;
+	}
+
+	/**
+	 * A row that reaches the chat after its request's last turn finished (a memory line the tidy-up
+	 * wrote): it goes above the closing row, so that stays the request's last line, as in a replay.
+	 */
+	addRowAboveClosingRow(row: Component): void {
+		const chat = this.host.chat();
+		const last = chat.children.at(-1);
+		if (last instanceof TurnStripComponent) {
+			chat.removeChild(last);
+			chat.addChild(row);
+			chat.addChild(last);
+			return;
+		}
+		chat.addChild(row);
 	}
 
 	/** A user message arrived: an interjection in the running turn's box, or a new prompt. */
@@ -834,6 +857,7 @@ export class LiveTurnFlow {
 		this.starterSinceRunStart = false;
 		this.starterKind = undefined;
 		this.pendingCause = undefined;
+		this.reports.clear();
 		this.compactionAwaitingAfter = undefined;
 		this.handleCommands.clear();
 		this.subagentLane.reset();
