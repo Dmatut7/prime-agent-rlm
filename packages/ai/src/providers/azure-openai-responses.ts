@@ -253,6 +253,9 @@ function buildParams(
 		model: deploymentName,
 		input: messages,
 		stream: true,
+		// Stateless replay: openai-responses and codex already pin store:false;
+		// without it Azure retains the full conversation server-side by default.
+		store: false,
 		prompt_cache_key: options?.sessionId,
 	};
 
@@ -278,7 +281,12 @@ function buildParams(
 				summary: options?.reasoningSummary || "auto",
 			};
 			params.include = ["reasoning.encrypted_content"];
-		} else if (model.thinkingLevelMap?.off !== null) {
+		} else if (model.thinkingLevelMap?.off === null) {
+			// Thinking cannot be disabled on this model, so it emits reasoning items
+			// even without an explicit effort; ask for encrypted_content up front or
+			// the replayed thinkingSignature lacks the material to resume.
+			params.include = ["reasoning.encrypted_content"];
+		} else {
 			params.reasoning = {
 				effort: (model.thinkingLevelMap?.off ?? "none") as NonNullable<typeof params.reasoning>["effort"],
 			};

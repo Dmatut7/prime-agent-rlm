@@ -299,7 +299,7 @@ export function convertResponsesTools(tools: Tool[], options?: ConvertResponsesT
 	}));
 }
 
-type ResponsesUsageFrame = {
+export type ResponsesUsageFrame = {
 	input_tokens?: number;
 	output_tokens?: number;
 	total_tokens?: number;
@@ -322,6 +322,24 @@ function mergeResponsesUsage(
 		input_tokens_details: {
 			cached_tokens: current.input_tokens_details?.cached_tokens ?? previous?.input_tokens_details?.cached_tokens,
 		},
+	};
+}
+
+/** Build the pi-ai Usage counts from a Responses API usage frame. */
+export function usageFromResponsesFrame(frame: ResponsesUsageFrame): Usage {
+	const cachedTokens = frame.input_tokens_details?.cached_tokens || 0;
+	return {
+		// OpenAI includes cached tokens in input_tokens, so subtract to get non-cached input.
+		// Some upstream proxies report cached > input; clamp so a bogus frame cannot
+		// turn the non-cached input (and cost/overflow math downstream) negative.
+		input: Math.max(0, (frame.input_tokens || 0) - cachedTokens),
+		output: frame.output_tokens || 0,
+		cacheRead: cachedTokens,
+		cacheWrite: 0,
+		// Fall back to the component sum when the provider does not report
+		// total_tokens (same invariant as compaction).
+		totalTokens: frame.total_tokens || (frame.input_tokens || 0) + (frame.output_tokens || 0),
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
 }
 
@@ -374,6 +392,27 @@ export async function processResponsesStream<TApi extends Api>(
 	const slotsByOutputIndex = new Map<number, ResponsesItemSlot>();
 	let sawTerminalResponseEvent = false;
 	let lastRawUsage: ResponsesUsageFrame | undefined;
+
+	// Merge a terminal frame's usage into the message and price it. Shared by the
+	// completed/incomplete path and response.failed, whose frame can still carry
+	// the usage the failed attempt burned.
+	const recordTerminalUsage = (response: OpenAI.Responses.Response | undefined): void => {
+		if (response?.usage) {
+			// Merge per field: a late usage frame that leaves fields undefined
+			// (or omits usage entirely, as response.incomplete may) must not
+			// zero out counts recorded from an earlier terminal frame.
+			lastRawUsage = mergeResponsesUsage(lastRawUsage, response.usage);
+		}
+		if (lastRawUsage) {
+			output.usage = usageFromResponsesFrame(lastRawUsage);
+		}
+		calculateCost(model, output.usage);
+		if (options?.applyServiceTierPricing) {
+			// The response's service_tier is the tier actually served; the
+			// requested tier is only the fallback when the response omits it.
+			options.applyServiceTierPricing(output.usage, response?.service_tier ?? options.serviceTier);
+		}
+	};
 
 	const releaseSlot = (slot: ResponsesItemSlot): void => {
 		if (slot.itemId !== undefined && slotsByItemId.get(slot.itemId) === slot) {
@@ -765,35 +804,7 @@ export async function processResponsesStream<TApi extends Api>(
 			if (response?.id) {
 				output.responseId = response.id;
 			}
-			if (response?.usage) {
-				// Merge per field: a late usage frame that leaves fields undefined
-				// (or omits usage entirely, as response.incomplete may) must not
-				// zero out counts recorded from an earlier terminal frame.
-				lastRawUsage = mergeResponsesUsage(lastRawUsage, response.usage);
-			}
-			if (lastRawUsage) {
-				const cachedTokens = lastRawUsage.input_tokens_details?.cached_tokens || 0;
-				output.usage = {
-					// OpenAI includes cached tokens in input_tokens, so subtract to get non-cached input.
-					// Some upstream proxies report cached > input; clamp so a bogus frame cannot
-					// turn the non-cached input (and cost/overflow math downstream) negative.
-					input: Math.max(0, (lastRawUsage.input_tokens || 0) - cachedTokens),
-					output: lastRawUsage.output_tokens || 0,
-					cacheRead: cachedTokens,
-					cacheWrite: 0,
-					// Fall back to the component sum when the provider does not
-					// report total_tokens (same invariant as compaction).
-					totalTokens:
-						lastRawUsage.total_tokens || (lastRawUsage.input_tokens || 0) + (lastRawUsage.output_tokens || 0),
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				};
-			}
-			calculateCost(model, output.usage);
-			if (options?.applyServiceTierPricing) {
-				// The response's service_tier is the tier actually served; the
-				// requested tier is only the fallback when the response omits it.
-				options.applyServiceTierPricing(output.usage, response?.service_tier ?? options.serviceTier);
-			}
+			recordTerminalUsage(response);
 			if (event.type === "response.incomplete") {
 				// Incomplete responses are truncated, not completed: map the stop
 				// reason from incomplete_details.reason so the reason and the usage
@@ -823,6 +834,9 @@ export async function processResponsesStream<TApi extends Api>(
 				providerErrorType: event.code ?? undefined,
 			});
 		} else if (event.type === "response.failed") {
+			// A failed frame can still carry usage; the failed attempt's tokens are
+			// billed, so record them before throwing (same merge as completed).
+			recordTerminalUsage(event.response);
 			const error = event.response?.error;
 			const details = event.response?.incomplete_details;
 			const providerErrorType = error?.code ?? details?.reason;

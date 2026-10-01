@@ -5,7 +5,16 @@ import type {
 	ResponseInput,
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
-import { formatStreamFailureMessage, recordStreamFailure } from "../utils/stream-failure.js";
+import {
+	formatStreamFailureMessage,
+	recordStreamFailure,
+	streamFailureFromStopReason,
+} from "../utils/stream-failure.js";
+import {
+	logProviderRequestAttempt,
+	type ProviderRequestAttemptNotice,
+	type ProviderRetrySuppression,
+} from "./request-budget.js";
 import { DEFAULT_MAX_RETRY_DELAY_MS, parseRetryAfterMs } from "./retry-cap.js";
 
 // NEVER convert to top-level runtime imports - breaks browser/Vite builds
@@ -23,7 +32,7 @@ if (typeof process !== "undefined" && (process.versions?.node || process.version
 }
 
 import { getEnvApiKey } from "../env-api-keys.js";
-import { clampThinkingLevel } from "../models.js";
+import { calculateCost, clampThinkingLevel } from "../models.js";
 import { registerSessionResourceCleanup } from "../session-resources.js";
 import type {
 	Api,
@@ -42,7 +51,13 @@ import {
 } from "../utils/diagnostics.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
-import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
+import {
+	convertResponsesMessages,
+	convertResponsesTools,
+	processResponsesStream,
+	type ResponsesUsageFrame,
+	usageFromResponsesFrame,
+} from "./openai-responses-shared.js";
 import { buildBaseOptions } from "./simple-options.js";
 
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
@@ -214,6 +229,31 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				recordWebSocketSseFallback(options?.sessionId);
 			}
 
+			// This provider runs its own retry loops (WebSocket chain reset, SSE
+			// backoff, WS->SSE transport fallback) instead of an SDK client, so it
+			// must count every attempt into the shared cross-layer budget itself:
+			// the attempt that spends the chain's last request is not retried here
+			// either (same contract as retry-cap.ts for SDK-backed providers).
+			const reportRequestAttempt = (
+				recorded: { attempt: number; used: number; maxRequests?: number } | undefined,
+				note: { status?: number; networkError?: boolean; retrySuppressedBy?: ProviderRetrySuppression },
+			): void => {
+				const notice: ProviderRequestAttemptNotice = {
+					attempt: recorded?.attempt ?? 1,
+					used: recorded?.used ?? 1,
+					maxRequests: recorded?.maxRequests,
+					status: note.status,
+					networkError: note.networkError,
+					retrySuppressedBy: note.retrySuppressedBy,
+				};
+				try {
+					options?.onProviderRequestAttempt?.(notice);
+				} catch {
+					// A diagnostic sink must never change request behavior.
+				}
+				logProviderRequestAttempt(notice, model.provider);
+			};
+
 			if (transport !== "sse" && !websocketDisabledForSession) {
 				let websocketStarted = false;
 				// Retry a stale previous_response_id once on a fresh full body: the failed
@@ -222,6 +262,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				// error handling below (SSE fallback for transport failures).
 				let chainResetRetried = false;
 				for (;;) {
+					const recordedAttempt = options?.requestBudget?.record();
 					try {
 						await processWebSocketStream(
 							resolveCodexWebSocketUrl(model.baseUrl),
@@ -236,8 +277,12 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 							options,
 						);
 
+						reportRequestAttempt(recordedAttempt, {});
 						if (options?.signal?.aborted) {
 							throw new Error("Request was aborted");
+						}
+						if (output.stopReason === "aborted" || output.stopReason === "error") {
+							throw streamFailureFromStopReason(output.stopReasonRaw);
 						}
 						stream.push({
 							type: "done",
@@ -250,7 +295,16 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						const aborted = options?.signal?.aborted;
 						// Only reset the chain before visible output starts; retrying after
 						// content events would duplicate streamed assistant output.
-						if (!aborted && !websocketStarted && !chainResetRetried && isStaleCodexContinuationError(error)) {
+						const canChainReset =
+							!aborted && !websocketStarted && !chainResetRetried && isStaleCodexContinuationError(error);
+						const canSseFallback = !aborted && !websocketStarted && !isCodexNonTransportError(error);
+						const budgetBlocked = recordedAttempt !== undefined && !recordedAttempt.allowRetry;
+						reportRequestAttempt(recordedAttempt, {
+							networkError: true,
+							retrySuppressedBy:
+								budgetBlocked && (canChainReset || canSseFallback) ? "request_budget" : undefined,
+						});
+						if (canChainReset && !budgetBlocked) {
 							chainResetRetried = true;
 							// A failed attempt may have supplied response metadata before
 							// rejecting the continuation. Do not retain that dead anchor.
@@ -271,7 +325,9 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 							}),
 						);
 						recordWebSocketFailure(options?.sessionId, error);
-						if (websocketStarted) {
+						// The budget spent its last request on this attempt: surface the
+						// transport failure instead of falling back to another request.
+						if (websocketStarted || budgetBlocked) {
 							throw error;
 						}
 						recordWebSocketSseFallback(options?.sessionId);
@@ -289,6 +345,17 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					throw new Error("Request was aborted");
 				}
 
+				const recordedAttempt = options?.requestBudget?.record();
+				let attemptStatus: number | undefined;
+				let attemptReported = false;
+				const reportAttemptOnce = (note: {
+					networkError?: boolean;
+					retrySuppressedBy?: ProviderRetrySuppression;
+				}): void => {
+					if (attemptReported) return;
+					attemptReported = true;
+					reportRequestAttempt(recordedAttempt, { status: attemptStatus, ...note });
+				};
 				try {
 					response = await fetch(resolveCodexUrl(model.baseUrl), {
 						method: "POST",
@@ -296,20 +363,31 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						body: bodyJson,
 						signal: options?.signal,
 					});
+					attemptStatus = response.status;
 					await options?.onResponse?.(
 						{ status: response.status, headers: headersToRecord(response.headers) },
 						model,
 					);
 
 					if (response.ok) {
+						reportAttemptOnce({});
 						break;
 					}
 
 					const errorText = await response.text();
 					if (attempt < maxRetries && isRetryableError(response.status, errorText)) {
-						const delayMs = resolveRetryDelayMs(response, attempt, options?.maxRetryDelayMs);
-						await sleep(delayMs, options?.signal);
-						continue;
+						if (recordedAttempt !== undefined && !recordedAttempt.allowRetry) {
+							// The shared budget is spent: surface the provider's own error
+							// instead of burning another request (retry-cap.ts contract).
+							reportAttemptOnce({ retrySuppressedBy: "request_budget" });
+						} else {
+							const delayMs = resolveRetryDelayMs(response, attempt, options?.maxRetryDelayMs);
+							reportAttemptOnce({});
+							await sleep(delayMs, options?.signal);
+							continue;
+						}
+					} else {
+						reportAttemptOnce({});
 					}
 
 					const fakeResponse = new Response(errorText, {
@@ -331,6 +409,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					});
 				} catch (error) {
 					if (error instanceof RetryDelayCapError) {
+						reportAttemptOnce({ retrySuppressedBy: "retry_delay_cap" });
 						throw error;
 					}
 					if (error instanceof Error) {
@@ -340,10 +419,19 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					}
 					lastError = error instanceof Error ? error : new Error(String(error));
 					if (attempt < maxRetries && shouldRetryCaughtError(lastError, response?.status)) {
+						if (recordedAttempt !== undefined && !recordedAttempt.allowRetry) {
+							reportAttemptOnce({
+								networkError: attemptStatus === undefined ? true : undefined,
+								retrySuppressedBy: "request_budget",
+							});
+							throw lastError;
+						}
+						reportAttemptOnce({ networkError: attemptStatus === undefined ? true : undefined });
 						const delayMs = resolveCaughtRetryDelayMs(attempt, options?.maxRetryDelayMs);
 						await sleep(delayMs, options?.signal);
 						continue;
 					}
+					reportAttemptOnce({ networkError: attemptStatus === undefined ? true : undefined });
 					throw lastError;
 				}
 			}
@@ -363,12 +451,23 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				throw new Error("Request was aborted");
 			}
 
+			if (output.stopReason === "aborted" || output.stopReason === "error") {
+				throw streamFailureFromStopReason(output.stopReasonRaw);
+			}
+
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) {
 				// partialJson is only a streaming scratch buffer; never persist it.
 				delete (block as { partialJson?: string }).partialJson;
+			}
+			// A response.failed frame can still carry the usage the failed attempt
+			// burned; keep it so the failed turn bills like every other provider.
+			if (error instanceof CodexApiError && error.usage) {
+				output.usage = usageFromResponsesFrame(error.usage);
+				calculateCost(model, output.usage);
+				applyServiceTierPricing(output.usage, error.serviceTier ?? options?.serviceTier, model);
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			// Classify + redact like every other provider: the session's
@@ -519,6 +618,9 @@ class CodexApiError extends Error {
 	readonly payload?: Record<string, unknown>;
 	/** Parsed upstream error body, in the SDK convention the shared failure classifier reads. */
 	readonly error?: { code?: string; type?: string; message?: string };
+	/** Usage carried by a response.failed frame; the failed attempt's tokens are still billed. */
+	readonly usage?: ResponsesUsageFrame;
+	readonly serviceTier?: ResponseCreateParamsStreaming["service_tier"];
 
 	constructor(
 		message: string,
@@ -527,6 +629,8 @@ class CodexApiError extends Error {
 			status?: number;
 			payload?: Record<string, unknown>;
 			error?: { code?: string; type?: string; message?: string };
+			usage?: ResponsesUsageFrame;
+			serviceTier?: ResponseCreateParamsStreaming["service_tier"];
 			cause?: unknown;
 		},
 	) {
@@ -536,6 +640,8 @@ class CodexApiError extends Error {
 		this.status = options?.status;
 		this.payload = options?.payload;
 		this.error = options?.error;
+		this.usage = options?.usage;
+		this.serviceTier = options?.serviceTier;
 		this.cause = options?.cause;
 	}
 }
@@ -582,12 +688,24 @@ async function* mapCodexEvents(events: AsyncIterable<Record<string, unknown>>): 
 		}
 
 		if (type === "response.failed") {
-			const response = (event as { response?: { error?: { code?: string; message?: string } } }).response;
+			const response = (
+				event as {
+					response?: {
+						error?: { code?: string; message?: string };
+						usage?: ResponsesUsageFrame;
+						service_tier?: ResponseCreateParamsStreaming["service_tier"];
+					};
+				}
+			).response;
 			const code = response?.error?.code;
 			const message = response?.error?.message;
 			throw new CodexApiError(message || "Codex response failed", {
 				code,
 				payload: event,
+				// A failed frame can still report usage; the terminal catch records it
+				// on the message so the failed turn is billed like every other provider.
+				usage: response?.usage,
+				serviceTier: response?.service_tier ?? undefined,
 				// Attach the parsed body so the classified message keeps the
 				// provider's short text as detail (SDK convention).
 				...(message ? { error: { code, message } } : {}),
@@ -600,7 +718,11 @@ async function* mapCodexEvents(events: AsyncIterable<Record<string, unknown>>): 
 			const normalizedResponse = response
 				? { ...response, status: normalizeCodexStatus(response.status) }
 				: response;
-			yield { ...event, type: "response.completed", response: normalizedResponse } as ResponseStreamEvent;
+			// Keep the terminal event's own type: folding incomplete into completed hid
+			// content_filter truncations from the shared layer's incomplete branch (which
+			// maps content_filter to an error and records the raw reason).
+			const terminalType = type === "response.incomplete" ? "response.incomplete" : "response.completed";
+			yield { ...event, type: terminalType, response: normalizedResponse } as ResponseStreamEvent;
 			return;
 		}
 

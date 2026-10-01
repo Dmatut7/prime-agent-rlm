@@ -270,7 +270,12 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 				summary: options?.reasoningSummary || "auto",
 			};
 			params.include = ["reasoning.encrypted_content"];
-		} else if (model.provider !== "github-copilot" && model.thinkingLevelMap?.off !== null) {
+		} else if (model.provider !== "github-copilot" && model.thinkingLevelMap?.off === null) {
+			// Thinking cannot be disabled on this model, so it emits reasoning items
+			// even without an explicit effort; ask for encrypted_content up front or
+			// the replayed thinkingSignature lacks the material to resume.
+			params.include = ["reasoning.encrypted_content"];
+		} else if (model.provider !== "github-copilot") {
 			params.reasoning = {
 				effort: (model.thinkingLevelMap?.off ?? "none") as NonNullable<typeof params.reasoning>["effort"],
 			};

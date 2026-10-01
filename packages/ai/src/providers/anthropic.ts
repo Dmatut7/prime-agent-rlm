@@ -8,6 +8,7 @@ import type {
 } from "@anthropic-ai/sdk/resources/messages.js";
 import { getAnthropicCacheWriteCost, hasStandardAnthropicCachePricing } from "../cache-pricing.js";
 import { getEnvApiKey } from "../env-api-keys.js";
+import { getLogger } from "../log.js";
 import { calculateCost, clampThinkingLevel } from "../models.js";
 import type {
 	AnthropicMessagesCompat,
@@ -48,6 +49,8 @@ import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copi
 import { createRetryCapFetch } from "./retry-cap.js";
 import { adjustMaxTokensForThinking, buildBaseOptions } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
+
+const log = getLogger("ai.provider");
 
 /**
  * Resolve cache retention preference.
@@ -618,6 +621,24 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
 			const blocks = output.content as Block[];
 
+			// Anthropic-compatible proxies (e.g. z.ai) can reorder or interleave block
+			// indexes; a delta or stop matching no open block was previously dropped
+			// without a trace. Persist each miss so the loss stays attributable.
+			const recordUnroutedBlockEvent = (eventType: string, eventIndex: number, deltaType?: string): void => {
+				appendAssistantMessageDiagnostic(output, {
+					type: "anthropic_content_block_event_unrouted",
+					timestamp: Date.now(),
+					details: { eventType, index: eventIndex, deltaType, openBlockIndexes: blocks.map((b) => b.index) },
+				});
+				log.warn("anthropic content block event matched no open block", {
+					provider: model.provider,
+					model: model.id,
+					eventType,
+					index: eventIndex,
+					deltaType,
+				});
+			};
+
 			for await (const event of iterateAnthropicEvents(response, options?.signal, requestId, () => {
 				sseFramesWithoutEvent += 1;
 			})) {
@@ -686,9 +707,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 						stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
 					}
 				} else if (event.type === "content_block_delta") {
+					const index = blocks.findIndex((b) => b.index === event.index);
+					const block = blocks[index];
 					if (event.delta.type === "text_delta") {
-						const index = blocks.findIndex((b) => b.index === event.index);
-						const block = blocks[index];
 						if (block && block.type === "text") {
 							block.text += event.delta.text;
 							stream.push({
@@ -697,10 +718,10 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 								delta: event.delta.text,
 								partial: output,
 							});
+						} else {
+							recordUnroutedBlockEvent(event.type, event.index, event.delta.type);
 						}
 					} else if (event.delta.type === "thinking_delta") {
-						const index = blocks.findIndex((b) => b.index === event.index);
-						const block = blocks[index];
 						if (block && block.type === "thinking") {
 							block.thinking += event.delta.thinking;
 							stream.push({
@@ -709,10 +730,10 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 								delta: event.delta.thinking,
 								partial: output,
 							});
+						} else {
+							recordUnroutedBlockEvent(event.type, event.index, event.delta.type);
 						}
 					} else if (event.delta.type === "input_json_delta") {
-						const index = blocks.findIndex((b) => b.index === event.index);
-						const block = blocks[index];
 						if (block && block.type === "toolCall") {
 							block.partialJson += event.delta.partial_json;
 							// Throttled mid-stream parse; the content_block_stop parse is authoritative.
@@ -726,13 +747,15 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 								delta: event.delta.partial_json,
 								partial: output,
 							});
+						} else {
+							recordUnroutedBlockEvent(event.type, event.index, event.delta.type);
 						}
 					} else if (event.delta.type === "signature_delta") {
-						const index = blocks.findIndex((b) => b.index === event.index);
-						const block = blocks[index];
 						if (block && block.type === "thinking") {
 							block.thinkingSignature = block.thinkingSignature || "";
 							block.thinkingSignature += event.delta.signature;
+						} else {
+							recordUnroutedBlockEvent(event.type, event.index, event.delta.type);
 						}
 					}
 				} else if (event.type === "content_block_stop") {
@@ -766,6 +789,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 								partial: output,
 							});
 						}
+					} else {
+						recordUnroutedBlockEvent(event.type, event.index);
 					}
 				} else if (event.type === "message_delta") {
 					if (event.delta.stop_reason) {
@@ -1540,8 +1565,14 @@ function mapStopReason(reason: Anthropic.Messages.StopReason | string): StopReas
 			return "stop"; // We don't supply stop sequences, so this should never happen
 		case "sensitive": // Content flagged by safety filters (not yet in SDK types)
 			return "error";
+		case "model_context_window_exceeded":
+			// The model ran out of context mid-turn; same truncated-turn continuation
+			// as max_tokens (bedrock and claude-code map it to "length" too).
+			return "length";
 		default:
-			// Handle unknown stop reasons gracefully (API may add new values)
-			throw new Error(`Unhandled stop reason: ${reason}`);
+			// Handle unknown stop reasons gracefully (API may add new values): surface
+			// the turn as an error carrying the raw reason so streamFailureFromStopReason
+			// can classify it, instead of throwing away a nearly complete answer.
+			return "error";
 	}
 }

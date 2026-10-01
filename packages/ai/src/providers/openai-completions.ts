@@ -1215,7 +1215,9 @@ export function convertMessages(
 				.filter(isTextContentBlock)
 				.filter((block) => block.text.trim().length > 0)
 				.map((block) => sanitizeSurrogates(block.text))
-				.join("");
+				// Separate blocks: a bare join("") glued an abort trace straight onto the
+				// reply text ("...answer[assistant turn aborted: ...]") in replays.
+				.join("\n\n");
 
 			const replayReasoningDetails = msg.content
 				.filter(isThinkingContentBlock)

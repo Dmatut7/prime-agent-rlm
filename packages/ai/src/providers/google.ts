@@ -26,6 +26,7 @@ import {
 	recordStreamFailure,
 	StreamFailureError,
 	streamFailureFromStopReason,
+	streamFailureMessage,
 } from "../utils/stream-failure.js";
 import {
 	convertMessages,
@@ -102,6 +103,17 @@ export const streamGoogle: StreamFunction<"google-generative-ai", GoogleOptions>
 				// @google/genai documents GenerateContentResponse.responseId as an output-only field
 				// used to identify each response. Keep the first non-empty one from the stream.
 				output.responseId ||= chunk.responseId;
+				const blockReason = chunk.promptFeedback?.blockReason;
+				if (blockReason) {
+					// A prompt-level safety block ends the stream with no candidates and no
+					// finish reason; without this check it surfaced as a malformed-stream
+					// truncation and was retried as a transient fault with the same prompt.
+					const info = { kind: "safety" as const, providerErrorType: blockReason };
+					throw new StreamFailureError(
+						streamFailureMessage(info, chunk.promptFeedback?.blockReasonMessage || undefined),
+						info,
+					);
+				}
 				const candidate = chunk.candidates?.[0];
 				if (candidate?.content?.parts) {
 					for (const part of candidate.content.parts) {
