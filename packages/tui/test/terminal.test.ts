@@ -242,6 +242,166 @@ describe("ProcessTerminal alternate screen handoff", () => {
 	});
 });
 
+describe("ProcessTerminal kitty keyboard mode stack", () => {
+	it("pushes kitty flags onto the alternate screen stack and pops them before leaving", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?1u");
+			terminal.enterAltScreen();
+			terminal.leaveAltScreen();
+			terminal.stop();
+
+			// The alt screen has its own keyboard mode stack (kitty spec), so the
+			// startup push covers only the main screen: re-push after ?1049h and
+			// pop before ?1049l, while the alt stack is still the active one.
+			assert.deepEqual(writes, [
+				"\x1b[?2004h",
+				"\x1b[?u",
+				"\x1b[>7u",
+				"\x1b[?1049h",
+				"\x1b[>7u",
+				"\x1b[<u",
+				"\x1b[?1049l",
+				"\x1b[?2004l",
+				"\x1b[<u",
+			]);
+		} finally {
+			restore();
+		}
+	});
+
+	it("emits no kitty sequences around the alternate screen when kitty protocol is inactive", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			terminal.enterAltScreen();
+			terminal.leaveAltScreen();
+			terminal.stop();
+
+			assert.deepEqual(writes, ["\x1b[?2004h", "\x1b[?u", "\x1b[?1049h", "\x1b[?1049l", "\x1b[?2004l"]);
+		} finally {
+			restore();
+		}
+	});
+
+	it("keeps both screen stacks balanced across a preserved-alt-screen handoff", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		try {
+			const first = new ProcessTerminal();
+			first.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?1u");
+			first.enterAltScreen();
+			first.stop({ preserveAltScreen: true });
+
+			const second = new ProcessTerminal();
+			second.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?1u");
+			second.stop();
+
+			assert.deepEqual(writes, [
+				"\x1b[?2004h",
+				"\x1b[?u",
+				"\x1b[>7u",
+				"\x1b[?1049h",
+				"\x1b[>7u",
+				"\x1b[?2004l",
+				"\x1b[<u",
+				"\x1b[?2004h",
+				"\x1b[?u",
+				"\x1b[>7u",
+				"\x1b[<u",
+				"\x1b[?1049l",
+				"\x1b[?2004l",
+				"\x1b[<u",
+			]);
+		} finally {
+			restore();
+		}
+	});
+
+	it("pushes onto the active alt screen when the kitty answer arrives after entering it", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			terminal.enterAltScreen();
+			process.stdin.emit("data", "\x1b[?1u");
+			terminal.leaveAltScreen();
+			terminal.stop();
+
+			assert.deepEqual(writes, [
+				"\x1b[?2004h",
+				"\x1b[?u",
+				"\x1b[?1049h",
+				"\x1b[>7u",
+				"\x1b[<u",
+				"\x1b[?1049l",
+				"\x1b[?2004l",
+				"\x1b[<u",
+			]);
+		} finally {
+			restore();
+		}
+	});
+});
+
+function patchTerminalStdio(writes: string[]): () => void {
+	const originalWrite = process.stdout.write;
+	const originalIsRaw = Object.getOwnPropertyDescriptor(process.stdin, "isRaw");
+	const originalSetRawMode = Object.getOwnPropertyDescriptor(process.stdin, "setRawMode");
+	const originalResume = Object.getOwnPropertyDescriptor(process.stdin, "resume");
+	const originalPause = Object.getOwnPropertyDescriptor(process.stdin, "pause");
+	const originalStdinIsTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+	const originalStdoutIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+
+	Object.defineProperty(process.stdin, "isRaw", { configurable: true, get: () => false });
+	Object.defineProperty(process.stdin, "setRawMode", { configurable: true, value: () => process.stdin });
+	Object.defineProperty(process.stdin, "resume", { configurable: true, value: () => process.stdin });
+	Object.defineProperty(process.stdin, "pause", { configurable: true, value: () => process.stdin });
+	// The default-color probe only runs on TTYs; pinning it off keeps the write sequence deterministic.
+	Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: false });
+	Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: false });
+	process.stdout.write = ((...args: Parameters<typeof process.stdout.write>): boolean => {
+		const chunk = args[0];
+		writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+		const callback = args.find((arg): arg is (error?: Error | null) => void => typeof arg === "function");
+		callback?.();
+		return true;
+	}) as typeof process.stdout.write;
+
+	return () => {
+		process.stdout.write = originalWrite;
+		restoreProperty(process.stdin, "isRaw", originalIsRaw);
+		restoreProperty(process.stdin, "setRawMode", originalSetRawMode);
+		restoreProperty(process.stdin, "resume", originalResume);
+		restoreProperty(process.stdin, "pause", originalPause);
+		restoreProperty(process.stdin, "isTTY", originalStdinIsTTY);
+		restoreProperty(process.stdout, "isTTY", originalStdoutIsTTY);
+	};
+}
+
 function restoreProperty(object: object, key: PropertyKey, descriptor: PropertyDescriptor | undefined): void {
 	if (descriptor) {
 		Object.defineProperty(object, key, descriptor);

@@ -21,6 +21,14 @@ const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0;\x07";
 const MOUSE_TRACKING_ON = "\x1b[?1002h\x1b[?1003h\x1b[?1006h";
 const MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1002l";
 
+// Kitty keyboard protocol mode-stack operations. The pushed flags are
+// 1 (disambiguate escape codes) | 2 (report event types) | 4 (report alternate
+// keys); the base layout key keeps shortcuts working on non-Latin layouts.
+// The stack is per-screen: the main and alternate screens each have their own,
+// so entering the alt screen requires a fresh push there.
+const KITTY_FLAGS_PUSH = "\x1b[>7u";
+const KITTY_FLAGS_POP = "\x1b[<u";
+
 // A preserved alternate screen is adopted by the next ProcessTerminal during in-process handoff.
 let pendingAltScreenHandoff: symbol | undefined;
 
@@ -258,12 +266,8 @@ export class ProcessTerminal implements Terminal {
 					this._kittyProtocolActive = true;
 					setKittyProtocolActive(true);
 
-					// Enable Kitty keyboard protocol (push flags)
-					// Flag 1 = disambiguate escape codes
-					// Flag 2 = report event types (press/repeat/release)
-					// Flag 4 = report alternate keys (shifted key, base layout key)
-					// Base layout key enables shortcuts to work with non-Latin keyboard layouts
-					process.stdout.write("\x1b[>7u");
+					// Enable Kitty keyboard protocol (push flags onto the active screen's stack)
+					process.stdout.write(KITTY_FLAGS_PUSH);
 					return; // Don't forward protocol response to TUI
 				}
 			}
@@ -411,7 +415,7 @@ export class ProcessTerminal implements Terminal {
 		if (this._kittyProtocolActive) {
 			// Disable Kitty keyboard protocol first so any late key releases
 			// do not generate new Kitty escape sequences.
-			process.stdout.write("\x1b[<u");
+			process.stdout.write(KITTY_FLAGS_POP);
 			this._kittyProtocolActive = false;
 			setKittyProtocolActive(false);
 		}
@@ -478,7 +482,7 @@ export class ProcessTerminal implements Terminal {
 
 		// Disable Kitty keyboard protocol if not already done by drainInput()
 		if (this._kittyProtocolActive) {
-			process.stdout.write("\x1b[<u");
+			process.stdout.write(KITTY_FLAGS_POP);
 			this._kittyProtocolActive = false;
 			setKittyProtocolActive(false);
 		}
@@ -578,6 +582,11 @@ export class ProcessTerminal implements Terminal {
 		}
 		this._altScreenActive = true;
 		this.write("\x1b[?1049h");
+		// The alt screen's keyboard mode stack is independent of the main screen's,
+		// so the startup push does not reach fullscreen; re-push on the alt stack.
+		if (this._kittyProtocolActive) {
+			this.write(KITTY_FLAGS_PUSH);
+		}
 	}
 
 	leaveAltScreen(): void {
@@ -591,6 +600,11 @@ export class ProcessTerminal implements Terminal {
 		if (ownsPendingHandoff) {
 			pendingAltScreenHandoff = undefined;
 			cancelInputHandoff(this.altScreenHandoffToken);
+		}
+		// Pop while the alt screen is still active; after ?1049l the pop would eat
+		// the main screen stack entry pushed at startup.
+		if (this._kittyProtocolActive) {
+			this.write(KITTY_FLAGS_POP);
 		}
 		this.write("\x1b[?1049l");
 	}
