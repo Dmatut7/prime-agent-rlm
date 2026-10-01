@@ -1,0 +1,4 @@
+- Fixed the finish gate's strike count resetting on any tool result, so the "run a check, watch it fail, claim done anyway" loop now reaches the recorded release instead of being nudged forever.
+- Fixed the automatic-continuation budget running out on a bare completion claim ending the run silently: the release is now recorded (finish_gate_released, cause budget_exhausted) and surfaced to the owner.
+- Fixed dispose() leaving a provider-retry backoff sleep armed: the wait is aborted on dispose and the scheduled continuation no longer re-issues a turn on a disposed session.
+- Added quotaResumeAt to quota-park wake re-arm entries so the provider-reported reset time survives wake retries (resumeAt keeps driving the wake schedule; the status read side lands separately).

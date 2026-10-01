@@ -33,7 +33,10 @@ export function dutyEventFor(record: SelfRecoveryRecord): DutyEvent {
 			// Not handled work: the claim went out unverified, so the owner should check it.
 			return {
 				kind: "decision_needed",
-				question: `AI 声称完成但 ${record.strikes} 次拿不出验证证据，已放行，结论待你核对`,
+				question:
+					record.cause === "budget_exhausted"
+						? `AI 声称完成，续跑预算耗尽（已追问 ${record.strikes} 次）仍无验证证据，已放行，结论待你核对`
+						: `AI 声称完成但 ${record.strikes} 次拿不出验证证据，已放行，结论待你核对`,
 			};
 	}
 }
@@ -65,9 +68,11 @@ export type SelfRecoveryRecord =
 			 */
 			kind: "finish_gate_released";
 			excerpt: string;
-			/** Gate nudges this run already sent for the claim (FINISH_GATE_MAX_STRIKES at release). */
+			/** Gate nudges this run sent for the claim before the release. */
 			strikes: number;
 			ordinal: number;
+			/** "budget_exhausted": the continuation budget ran out before the strikes did. */
+			cause?: "budget_exhausted";
 			at: number;
 	  };
 
@@ -389,18 +394,20 @@ export function completionClaimWithoutEvidence(
 }
 
 /**
- * Consecutive finish-gate nudges this run already sent without the model doing any
- * new work since the latest one: a tool result after the last nudge is the asked-for
- * verification happening, so the count starts over. The caller releases the run once
- * this reaches FINISH_GATE_MAX_STRIKES.
+ * Finish-gate nudges this run already sent. Tool work after a nudge does not
+ * reset the count: any toolResult used to restart it, so the "run a check,
+ * watch it come back red, claim done anyway" loop never accumulated the strikes
+ * the release needs. The genuine-work exemption lives one layer up instead - a
+ * verification-shaped command that ran green makes the next claim unflagged
+ * (verifiedWork), so a reset here would only ever fire for a run the claim scan
+ * already cleared. The caller releases the run once this reaches
+ * FINISH_GATE_MAX_STRIKES.
  */
 export function finishGateStrikesInRun(messages: readonly AgentMessage[]): number {
 	let strikes = 0;
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
 		if (message?.role === "user") break;
-		// Work since the last nudge is the nudge being answered; it resets the count.
-		if (message?.role === "toolResult") break;
 		if (message?.role === "custom" && message.customType === AUTO_CONTINUE_CUSTOM_TYPE) {
 			const details = message.details as Partial<AutoContinueMessageDetails> | undefined;
 			if (details?.reason === "finish_gate") strikes += 1;

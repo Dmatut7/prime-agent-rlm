@@ -374,16 +374,37 @@ describe("finishGateStrikesInRun", () => {
 		expect(finishGateStrikesInRun(twice)).toBe(FINISH_GATE_MAX_STRIKES);
 	});
 
-	it("starts over when the model did new work after the last nudge", () => {
-		const messages = [
+	it("keeps counting through tool work after a nudge - only a green verification clears the claim", () => {
+		// The escape chain: a tool result after the last nudge used to restart the
+		// count, so "run the check, watch it come back red, claim done anyway" was
+		// nudged forever and never reached the release record. Tool work no longer
+		// resets the count, and a red check is not evidence either way.
+		const adversarial = [
 			userMessage("fix it"),
 			reply("修好了。"),
 			finishGateNudge(),
 			toolCallMessage("t1", "npm test"),
-			toolResultMessage("t1"),
-			reply("修好了，测试通过。"),
+			toolResultMessage("t1", true), // the check ran red
+			reply("搞定了。"),
+			finishGateNudge(),
+			toolCallMessage("t2", "npm test"),
+			toolResultMessage("t2", true),
+			reply("全部完成。"),
 		];
-		expect(finishGateStrikesInRun(messages)).toBe(0);
+		expect(finishGateStrikesInRun(adversarial)).toBe(FINISH_GATE_MAX_STRIKES);
+		// Even a green verification-shaped result leaves the count alone: the claim
+		// after it is simply never flagged (verifiedWork), so the old reset only
+		// ever fired for a run the claim scan had already cleared.
+		expect(
+			finishGateStrikesInRun([
+				userMessage("fix it"),
+				reply("修好了。"),
+				finishGateNudge(),
+				toolCallMessage("t3", "npm test"),
+				toolResultMessage("t3"),
+				reply("修好了，测试全部通过。"),
+			]),
+		).toBe(1);
 	});
 
 	it("ignores other automatic continues", () => {
@@ -427,6 +448,22 @@ describe("finish-gate message and records", () => {
 		expect(dutyEventFor({ kind: "finish_gate_released", excerpt: "修好了", strikes: 2, ordinal: 3, at: 1 })).toEqual({
 			kind: "decision_needed",
 			question: "AI 声称完成但 2 次拿不出验证证据，已放行，结论待你核对",
+		});
+	});
+
+	it("maps a budget-exhausted release to its own wording", () => {
+		expect(
+			dutyEventFor({
+				kind: "finish_gate_released",
+				excerpt: "修好了",
+				strikes: 1,
+				ordinal: 2,
+				cause: "budget_exhausted",
+				at: 1,
+			}),
+		).toEqual({
+			kind: "decision_needed",
+			question: "AI 声称完成，续跑预算耗尽（已追问 1 次）仍无验证证据，已放行，结论待你核对",
 		});
 	});
 });

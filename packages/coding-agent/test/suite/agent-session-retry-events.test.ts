@@ -755,6 +755,92 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.faux.state.callCount).toBe(1);
 	});
 
+	it("dispose during the retry sleep cancels the retry instead of re-issuing the turn", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 60_000 } },
+		});
+		harnesses.push(harness);
+		const continueSpy = vi.spyOn(harness.session.agent, "continue");
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("must never be requested"),
+		]);
+		const sawRetryStart = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type === "auto_retry_start") {
+					unsubscribe();
+					resolve();
+				}
+			});
+		});
+
+		const promptPromise = harness.session.prompt("test");
+		await sawRetryStart;
+		expect(harness.session.isRetrying).toBe(true);
+
+		// The 60s backoff sleep must die with the session: without the abort the
+		// sleep runs out and its scheduled continuation re-issues the turn onto a
+		// disposed session.
+		harness.session.dispose();
+		const settled = await Promise.race([
+			promptPromise.then(
+				() => "settled",
+				() => "settled",
+			),
+			new Promise((resolve) => setTimeout(() => resolve("hung"), 2_000)),
+		]);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		expect(settled).toBe("settled");
+		expect(harness.session.isRetrying).toBe(false);
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+	});
+
+	it("does not re-issue the turn when dispose lands between the retry sleep and the scheduled continue", async () => {
+		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
+		harnesses.push(harness);
+		const continueSpy = vi.spyOn(harness.session.agent, "continue");
+		// test-hygiene-allow: dispose must land between the resolved retry sleep and its scheduled continue; no public seam exposes that window
+		const internals = harness.session as unknown as {
+			_retryAttempt: number;
+			_retryPromise: Promise<void> | undefined;
+			_retryResolve: (() => void) | undefined;
+			_retryAfterDelay: (
+				message: AssistantMessage,
+				options: unknown,
+				emitStart: {
+					type: "auto_retry_start";
+					attempt: number;
+					maxAttempts: number;
+					delayMs: number;
+					errorMessage: string;
+				},
+				delayMs: number,
+			) => Promise<boolean>;
+		};
+		internals._retryAttempt = 1;
+		internals._retryPromise = new Promise<void>((resolve) => {
+			internals._retryResolve = resolve;
+		});
+
+		const message = fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" });
+		const didSchedule = await internals._retryAfterDelay(
+			message,
+			undefined,
+			{ type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 0, errorMessage: "overloaded_error" },
+			0,
+		);
+		expect(didSchedule).toBe(true);
+
+		// The scheduled continue is a pending 0ms timer; disposing synchronously
+		// lands it between the resolved sleep and the timer firing.
+		harness.session.dispose();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		expect(continueSpy).not.toHaveBeenCalled();
+	});
+
 	it("waits for the full loop when retry recovery produces tool calls", async () => {
 		const toolRuns: string[] = [];
 		const echoTool: AgentTool = {
@@ -1252,6 +1338,11 @@ describe("AgentSession retry and event characterization", () => {
 		// (readQuotaParkStatus walks to the newest park entry) does not lose it.
 		expect(quotaEntries(abortedHarness, "provider_quota_park").at(-1)?.provider).toBe("faux");
 		expect(readQuotaParkStatus(abortedHarness.session)?.provider).toBe("faux");
+		// The re-arm moves resumeAt to the wake-retry time but keeps the
+		// provider-reported reset on the entry as quotaResumeAt.
+		const reArmEntry = quotaEntries(abortedHarness, "provider_quota_park").at(-1);
+		expect(reArmEntry?.quotaResumeAt).toBe(new Date(parkedAtMs).toISOString());
+		expect(Date.parse(String(reArmEntry?.resumeAt))).toBeGreaterThan(parkedAtMs);
 
 		// The re-armed wake is recorded, so a restart restores the park with the retry job still owned.
 		const restarted = await createHarness({ existingSessionFile: abortedHarness.session.sessionFile!, settings });

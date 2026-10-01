@@ -746,6 +746,56 @@ describe("self-recovery: finish gate", () => {
 		// The one budgeted continue went to the gate; the second bare claim ends the run.
 		expect(autoContinues(harness)).toHaveLength(1);
 		expect(harness.faux.state.callCount).toBe(3);
+		// The budget running out on a bare claim is a finish-gate release too:
+		// recorded with its cause and announced, not silently let go.
+		expect(readSelfRecoveryRecords(harness.sessionManager.getBranch())).toMatchObject([
+			{ kind: "auto_continue", ordinal: 1 },
+			{ kind: "finish_gate_released", strikes: 1, cause: "budget_exhausted" },
+		]);
+		expect(dutyEvents(harness)).toContainEqual(expect.objectContaining({ kind: "decision_needed" }));
+		const notices = harness.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom_message" && entry.customType === "finish_gate_released");
+		expect(notices).toHaveLength(1);
+		expect(String((notices[0] as { content: unknown }).content)).toContain("budget is spent");
+	});
+
+	it("keeps the strike count through red re-checks, so the escape chain reaches the release record", async () => {
+		// A tool result after a nudge used to reset the strike count: "run the
+		// check, watch it go red, claim done anyway" drew a fresh nudge every time
+		// and never reached the release record. Tool work no longer resets the
+		// count; a red check is not evidence either way.
+		const failingTestTool = (): AgentTool => ({
+			name: "run_command",
+			label: "Run Command",
+			description: "Runs a command",
+			parameters: Type.Object({ command: Type.String() }),
+			execute: async (_toolCallId, params) => {
+				const command = String((params as { command?: unknown }).command ?? "");
+				if (command.includes("npm test")) throw new Error("exit code 1: 2 failed, 47 passed");
+				return { content: [{ type: "text", text: "command finished" }], details: {} };
+			},
+		});
+		const harness = await harnessWith({}, [failingTestTool()]);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("run_command", { command: "npm test" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("修好了。"),
+			fauxAssistantMessage(fauxToolCall("run_command", { command: "npm test" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("搞定了。"),
+			fauxAssistantMessage(fauxToolCall("run_command", { command: "npm test" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("全部完成。"),
+		]);
+		await harness.session.promptAndWait("fix it");
+
+		// Two challenges, then the release goes on the record instead of a third nudge.
+		expect(autoContinues(harness)).toHaveLength(2);
+		expect(harness.faux.state.callCount).toBe(6);
+		expect(readSelfRecoveryRecords(harness.sessionManager.getBranch())).toMatchObject([
+			{ kind: "auto_continue", ordinal: 1 },
+			{ kind: "auto_continue", ordinal: 2 },
+			{ kind: "finish_gate_released", strikes: 2 },
+		]);
+		expect(dutyEvents(harness)).toContainEqual(expect.objectContaining({ kind: "decision_needed" }));
 	});
 });
 

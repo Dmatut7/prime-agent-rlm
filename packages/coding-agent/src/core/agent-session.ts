@@ -2044,6 +2044,12 @@ interface ImageFallbackEpisode {
 /** Data carried by a persisted provider_quota_park entry, used to restore a park after a restart. */
 interface PersistedQuotaParkData {
 	resumeAt: string;
+	/**
+	 * Provider-reported quota reset time. Absent on the initial park entry (where
+	 * resumeAt IS the reset); present on wake re-arm entries, whose resumeAt is the
+	 * retry wake time instead. Read by the quota-park status side for the countdown.
+	 */
+	quotaResumeAt?: string;
 	parkCount: number;
 	jobId?: string;
 	/** Provider whose quota reset the park waits on; kept on re-arm/rebuild entries too. */
@@ -2059,6 +2065,7 @@ function isPersistedQuotaParkData(value: unknown): value is PersistedQuotaParkDa
 		typeof record.resumeAt === "string" &&
 		typeof record.parkCount === "number" &&
 		Number.isFinite(record.parkCount) &&
+		(record.quotaResumeAt === undefined || typeof record.quotaResumeAt === "string") &&
 		(record.jobId === undefined || typeof record.jobId === "string") &&
 		(record.provider === undefined || typeof record.provider === "string")
 	);
@@ -2646,6 +2653,12 @@ export class AgentSession {
 				parkCount: number;
 				/** Wall-clock wake time for the current park. */
 				resumeAtMs: number;
+				/**
+				 * Provider-reported quota reset the park waits on. resumeAtMs moves on
+				 * wake re-arms (it drives the wake schedule); this stays at the real
+				 * reset so re-arm entries can keep reporting it as quotaResumeAt.
+				 */
+				quotaResumeAtMs?: number;
 				/** Id of the durable one-shot wake job, when the session persists artifacts. */
 				jobId?: string;
 				/** Pending in-process wake timer for the current park. */
@@ -6168,8 +6181,10 @@ export class AgentSession {
 	 * answer is a finished answer). The finish gate covers the third way a run ends
 	 * early: a clean stop whose reply declares the work done without showing the proof
 	 * gets asked for the evidence. All of these count into the same per-prompt budget
-	 * (`selfRecovery.maxAutoContinues`); once it is spent the run is left to end. A
-	 * subagent cut off mid-answer while it still owes its parent the result is resumed
+	 * (`selfRecovery.maxAutoContinues`); once it is spent the run is left to end,
+	 * unless the last word is still a bare completion claim - that release is
+	 * recorded (finish_gate_released, cause budget_exhausted) instead of passing
+	 * silently. A subagent cut off mid-answer while it still owes its parent the result is resumed
 	 * under the same budget (a resumed child whose pre-restart reply state is unknown
 	 * is left alone, mirroring the reply nudge's conservatism), and a subagent that
 	 * finished its task without replying is asked once to send its result. Anything
@@ -6211,8 +6226,32 @@ export class AgentSession {
 			// The child-reply nudge is a one-shot (`used > 0` blocks repeats), so its budget is 1.
 			return createAutoContinueMessage({ reason: "child_reply_missing", ordinal: 1, maxOrdinal: 1 });
 		}
-		if (used >= settings.maxAutoContinues) return undefined;
 		const ranTools = ranToolsSinceLastPrompt(context.newMessages);
+		if (used >= settings.maxAutoContinues) {
+			// The budget is spent with the run still ending on a bare completion
+			// claim: that is the same unverified finish the gate exists to catch,
+			// so the release goes on the record instead of the run ending silently.
+			if (settings.finishGate && message.stopReason === "stop") {
+				const excerpt = completionClaimWithoutEvidence(message, {
+					ranTools,
+					promptText: lastUserPromptText(context.newMessages),
+					verifiedWork: ranTools && runHasVerificationEvidence(context.newMessages),
+				});
+				if (excerpt) {
+					const strikes = finishGateStrikesInRun(context.newMessages);
+					this._recordSelfRecovery({
+						kind: "finish_gate_released",
+						excerpt,
+						strikes,
+						ordinal: used + 1,
+						cause: "budget_exhausted",
+						at: Date.now(),
+					});
+					this._emitFinishGateReleasedNotice(excerpt, strikes, "budget_exhausted");
+				}
+			}
+			return undefined;
+		}
 		const ordinal = used + 1;
 		if (settings.autoContinue) {
 			// Cut off mid-answer: resume where the turn stopped instead of judging the
@@ -6271,19 +6310,22 @@ export class AgentSession {
 	 * context either - the same arrangement as _emitFallbackNotice. The literal
 	 * customType mirrors the "finish_gate_released" record kind in self-recovery.ts
 	 * and the TUI's FINISH_GATE_RELEASED_CUSTOM_TYPE; the source pin in
-	 * test/finish-gate-notice.test.ts anchors all three.
+	 * test/finish-gate-notice.test.ts anchors all three. A "budget_exhausted"
+	 * cause says the continuation budget ran out before the strike count did.
 	 */
-	private _emitFinishGateReleasedNotice(excerpt: string, strikes: number): void {
+	private _emitFinishGateReleasedNotice(excerpt: string, strikes: number, cause?: "budget_exhausted"): void {
 		const claim = excerpt.replace(/\s+/g, " ").trim();
 		const message: CustomMessage = {
 			role: "custom",
 			customType: "finish_gate_released",
 			content: [
-				`[finish gate] released an unverified completion claim after ${strikes} challenges.`,
+				cause === "budget_exhausted"
+					? `[finish gate] released an unverified completion claim after ${strikes} challenges: the continuation budget is spent.`
+					: `[finish gate] released an unverified completion claim after ${strikes} challenges.`,
 				`The reply claimed the work was done ("${claim}") but never showed the proof it was asked for, so the run was left to end. Treat the claimed completion as unverified and check it yourself before relying on it.`,
 			].join("\n"),
 			display: true,
-			details: { excerpt, strikes },
+			details: { excerpt, strikes, ...(cause === undefined ? {} : { cause }) },
 			timestamp: Date.now(),
 		};
 		try {
@@ -8083,6 +8125,10 @@ export class AgentSession {
 		for (const run of this._unsettledRlmChildRuns) run.suppressTerminalNotice = true;
 		for (const controller of this._rlmQuiescenceWaitAborts) controller.abort();
 		this._sessionActionCommitDisposeAbortController.abort();
+		// A retry sleeping off a provider backoff dies with the session: the abort
+		// rejects the sleep and its catch path resolves the retry, so the scheduled
+		// continuation can never re-issue a turn on a disposed session.
+		this._retryAbortController?.abort();
 		try {
 			// Invalidate scheduled timers and abort any in-flight review so a late
 			// resolution cannot write harness state or re-subscribe handlers.
@@ -20481,8 +20527,9 @@ export class AgentSession {
 		const retryGeneration = this._retryGeneration;
 		setTimeout(() => {
 			// A retry aborted between the sleep and this scheduled start must not
-			// re-issue the turn (e.g. onto a quota-blocked primary after a restore).
-			if (this._retryGeneration !== retryGeneration || !this.isRetrying) return;
+			// re-issue the turn (e.g. onto a quota-blocked primary after a restore),
+			// and a disposed session must never run one at all.
+			if (this._disposed || this._retryGeneration !== retryGeneration || !this.isRetrying) return;
 			this._refreshAgentLoopRuntimeSettings();
 			this.agent.continue().catch((error: unknown) => {
 				// A continue that never starts must still resolve the retry (else isRetrying
@@ -21442,6 +21489,7 @@ export class AgentSession {
 		this._quotaPark = {
 			parkCount,
 			resumeAtMs,
+			quotaResumeAtMs: resumeAtMs,
 			...(jobId !== undefined ? { jobId } : {}),
 			...(timer !== undefined ? { timer } : {}),
 			...(message.provider === undefined ? {} : { provider: message.provider }),
@@ -21681,6 +21729,11 @@ export class AgentSession {
 			return;
 		}
 		park.wakeRetries = retries;
+		// The wake schedule moves to the retry delay; the provider-reported reset the
+		// park waits on does not. Carry it onto the entry as quotaResumeAt so the
+		// status read side still shows the real reset instead of the retry time.
+		const quotaResumeAtMs = park.quotaResumeAtMs ?? park.resumeAtMs;
+		park.quotaResumeAtMs = quotaResumeAtMs;
 		park.resumeAtMs = Date.now() + QUOTA_WAKE_RETRY_DELAY_MS;
 		park.jobId = this._createQuotaResumeJob(park.resumeAtMs);
 		park.timer = this._scheduleQuotaResumeTimer(park.resumeAtMs);
@@ -21689,6 +21742,7 @@ export class AgentSession {
 		// The provider rides along so readQuotaParkStatus keeps it after the re-arm.
 		this.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
 			resumeAt: new Date(park.resumeAtMs).toISOString(),
+			quotaResumeAt: new Date(quotaResumeAtMs).toISOString(),
 			parkCount: park.parkCount,
 			...(park.jobId !== undefined ? { jobId: park.jobId } : {}),
 			...(park.provider !== undefined ? { provider: park.provider } : {}),
@@ -21775,6 +21829,8 @@ export class AgentSession {
 			if (!Number.isFinite(resumeAtMs) || resumeAtMs <= Date.now()) {
 				return;
 			}
+			const quotaResumeAtMs =
+				entry.data.quotaResumeAt === undefined ? undefined : Date.parse(entry.data.quotaResumeAt);
 			const jobId = this._restoreQuotaWakeJob(entry.data.jobId, resumeAtMs);
 			if (jobId === "user-cancelled") {
 				return;
@@ -21787,12 +21843,14 @@ export class AgentSession {
 					resumeAt: entry.data.resumeAt,
 					parkCount: entry.data.parkCount,
 					jobId,
+					...(entry.data.quotaResumeAt !== undefined ? { quotaResumeAt: entry.data.quotaResumeAt } : {}),
 					...(entry.data.provider !== undefined ? { provider: entry.data.provider } : {}),
 				});
 			}
 			this._quotaPark = {
 				parkCount: entry.data.parkCount,
 				resumeAtMs,
+				...(quotaResumeAtMs !== undefined && Number.isFinite(quotaResumeAtMs) ? { quotaResumeAtMs } : {}),
 				...(jobId !== undefined ? { jobId } : {}),
 				timer: this._scheduleQuotaResumeTimer(resumeAtMs),
 				...(entry.data.provider !== undefined ? { provider: entry.data.provider } : {}),
