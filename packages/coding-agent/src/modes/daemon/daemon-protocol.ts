@@ -303,8 +303,21 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   supervisor's worker_deliver_message forward - the worker protocol type had
 //   the field since rev 41 and supervisor/worker are the same binary, so no
 //   wire shape moved for it.
-export const DAEMON_SCHEMA_REVISION = 42;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-42-1dca6160dd80";
+// Revision 43 adds the optional DaemonSessionSnapshot.quotaPark field (wave-6
+//   R3-3): a parked session's attach snapshot now carries the park facts
+//   (parked, resumeAt, remainingMs, parkCount, provider), so an attach or
+//   reattach into a parked session renders the wait immediately instead of
+//   sitting blind until the next quota_park_status heartbeat (60s).
+//   Backward-compatible addition in the rev-42 class: the worker fills the
+//   field only for a client that declared quota_park_status on attach - which
+//   is why the capability joined the client-declarable set - the supervisor
+//   strips it again for served clients that never declared it, an old client
+//   never sees the field, and a new client talking to an old daemon reads the
+//   absent field as "not parked at snapshot time" and waits for the heartbeat
+//   exactly as before. The digest recomputation covers the snapshot-wrapper
+//   growth.
+export const DAEMON_SCHEMA_REVISION = 43;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-43-58af0e58aa27";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -332,7 +345,17 @@ export type DaemonClientCapability =
 	// (CompactAssistantDelta.toolCallArguments) and carry only the new fragment
 	// (toolcall_delta.delta). Consumers must accumulate the fragments and parse
 	// throttled; toolcall_end stays authoritative. Revision 30.
-	| "streaming_delta_fragments";
+	| "streaming_delta_fragments"
+	// The daemon fills DaemonSessionSnapshot.quotaPark for sessions parked on a
+	// provider usage reset (rev 43), so an attach into a parked session renders
+	// the wait immediately instead of sitting blind until the next
+	// quota_park_status heartbeat. Optional and additive: the field is absent for
+	// undeclared clients and for sessions that are not parked, and unknown-field
+	// tolerance already covers peers that never look. Also a server capability:
+	// the daemon additionally emits quota_park_status events for parked sessions
+	// (rev 42) - an immediate announce, a periodic heartbeat with the remaining
+	// wait, and one terminal parked:false.
+	| "quota_park_status";
 export type DaemonPromptAdmissionCancellationStatus = "cancelled" | "owned" | "unknown";
 export interface DaemonPromptAdmissionCancellationResult {
 	status: DaemonPromptAdmissionCancellationStatus;
@@ -407,13 +430,7 @@ export type DaemonServerCapability =
 	// The daemon honors send_message.deliveryMode ("steer"/"follow_up"). Rev 41;
 	// older daemons accept the field and ignore it (always steering), so a client
 	// that sets it must check this capability first or be refused by the gate.
-	| "send_message_delivery_mode"
-	// The daemon emits quota_park_status events for sessions parked on a
-	// provider usage reset (rev 42): an immediate announce, a periodic heartbeat
-	// with the remaining wait, and one terminal parked:false. Optional and
-	// additive; clients check before depending on the event, and unknown-type
-	// tolerance already covers peers that never look.
-	| "quota_park_status";
+	| "send_message_delivery_mode";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -441,6 +458,7 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"client_owned_sessions",
 	"streaming_deltas",
 	"streaming_delta_fragments",
+	"quota_park_status",
 ];
 
 /**
@@ -491,7 +509,6 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"stall_recovery_state",
 	"stall_action_bar",
 	"send_message_delivery_mode",
-	"quota_park_status",
 ];
 
 /**
@@ -704,6 +721,33 @@ export interface DaemonSessionSnapshot {
 	};
 	/** Live RLM child sessions (including grandchildren) hosted by the daemon under this session. */
 	children?: AgentConnectionRlmChildAgentSnapshot[];
+	/**
+	 * Quota-park status at snapshot build time (rev 43), present only when the
+	 * attaching client declared the quota_park_status capability and the session
+	 * is parked: an attach or reattach into a parked session renders the wait
+	 * from this field instead of sitting blind until the next quota_park_status
+	 * heartbeat. Absence means "not parked at snapshot time"; the heartbeat
+	 * stream stays the live channel from then on.
+	 */
+	quotaPark?: DaemonSessionSnapshotQuotaPark;
+}
+
+/**
+ * The park facts of a quota-parked session as they appear on the wire: the
+ * attach snapshot's quotaPark field and the payload of a parked:true
+ * quota_park_status event share this shape (built by quotaParkWireFacts).
+ */
+export interface DaemonSessionSnapshotQuotaPark {
+	/** Always true: the field itself is omitted when the session is not parked. */
+	parked: true;
+	/** ISO wake time of the active park; absent only for a park without persisted facts (in-memory sessions). */
+	resumeAt?: string;
+	/** Milliseconds until resumeAt at build time, clamped at 0 while the wake is firing. */
+	remainingMs?: number;
+	/** How many times this session has parked in the current episode. */
+	parkCount?: number;
+	/** Provider whose usage limit caused the park. */
+	provider?: string;
 }
 
 export interface DaemonAttachResult {

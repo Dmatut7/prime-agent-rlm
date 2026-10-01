@@ -208,6 +208,7 @@ import {
 	type DaemonResponse,
 	type DaemonSessionClosedReason,
 	type DaemonSessionSnapshot,
+	type DaemonSessionSnapshotQuotaPark,
 	type DaemonUpdateRestartManifest,
 	type DaemonUpdateRestartSession,
 	failure,
@@ -264,7 +265,7 @@ import {
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
-import { type QuotaParkStatus, readQuotaParkStatus } from "./quota-park-status.js";
+import { type QuotaParkStatus, quotaParkWireFacts, readQuotaParkStatus } from "./quota-park-status.js";
 import {
 	createRlmLedgerRegistrySeedSource,
 	type LegacyRlmSubagentRegistryEntry,
@@ -4873,14 +4874,9 @@ export class AgentDaemon {
 						},
 					};
 					setImmediate(() => {
-						void this.streamWorkerSnapshot(
-							client,
-							streamedResult,
-							transcript,
-							"attach",
-							snapshotSignal,
-							true,
-						).catch((error) => this.log(`could not stream attach snapshot: ${String(error)}`));
+						void this.streamWorkerSnapshot(client, streamedResult, transcript, "attach", snapshotSignal, true)
+							.catch((error) => this.log(`could not stream attach snapshot: ${String(error)}`))
+							.finally(() => this.announceQuotaParkAfterAttach(state));
 					});
 					return success(command.id, "attach", streamedResult);
 				}
@@ -4898,6 +4894,12 @@ export class AgentDaemon {
 						lastEventSequence: result.lastEventSequence,
 					});
 				}
+				// R3-3: announce an active park once the attach response has landed,
+				// so the client does not wait out the next heartbeat sweep for it.
+				// Deferred past the response write (and, above, past the snapshot
+				// stream): a broadcast while this client is still streaming its
+				// snapshot would queue a whole catch-up resync for it instead.
+				setImmediate(() => this.announceQuotaParkAfterAttach(state));
 				return success(command.id, "attach", result);
 			}
 
@@ -6045,7 +6047,8 @@ export class AgentDaemon {
 		state: ActiveSessionState,
 		command: Extract<DaemonCommand, { type: "attach" }>,
 	): Promise<DaemonAttachResult> {
-		const snapshot = await this.createSessionSnapshot(state);
+		const capabilities = daemonClientCapabilitiesForSession(client, state.activeSessionId);
+		const snapshot = await this.createSessionSnapshot(state, capabilities);
 		const replay =
 			command.resumeCursor?.activeSessionId && command.resumeCursor.activeSessionId !== state.activeSessionId
 				? {
@@ -6064,7 +6067,6 @@ export class AgentDaemon {
 				: createDaemonReplayInfo(command.resumeCursor, state.lastEventSequence, state.eventGeneration);
 		// Slim clients read summary/messages from the snapshot; duplicating them at
 		// the top level would serialize the full history twice more per attach.
-		const capabilities = daemonClientCapabilitiesForSession(client, state.activeSessionId);
 		const slim = capabilities.has("slim_attach");
 		return {
 			protocol: DAEMON_PROTOCOL_INFO,
@@ -6084,7 +6086,10 @@ export class AgentDaemon {
 		};
 	}
 
-	private async createSessionSnapshot(state: ActiveSessionState): Promise<DaemonSessionSnapshot> {
+	private async createSessionSnapshot(
+		state: ActiveSessionState,
+		capabilities: ReadonlySet<DaemonClientCapability>,
+	): Promise<DaemonSessionSnapshot> {
 		const metadata = state.runtime.metadata;
 		const parent =
 			metadata.parentActiveSessionId || metadata.parentSessionId || metadata.rlmParentNodeId || metadata.rlmChildId
@@ -6107,6 +6112,9 @@ export class AgentDaemon {
 		}
 		session = state.runtime.session;
 		const connectionState = this.createConnectionState(state);
+		// R3-3: a client that declared quota_park_status learns the park from the
+		// snapshot itself instead of sitting blind until the next heartbeat sweep.
+		const quotaPark = this.quotaParkForSnapshot(state, capabilities);
 		return {
 			activeSessionId: state.activeSessionId,
 			summary: summaryForActiveSession(state),
@@ -6122,7 +6130,30 @@ export class AgentDaemon {
 			},
 			...(parent ? { parent } : {}),
 			children,
+			...(quotaPark ? { quotaPark } : {}),
 		};
+	}
+
+	/**
+	 * The snapshot-time park facts for a client that declared the
+	 * quota_park_status capability, or undefined for undeclared clients, sessions
+	 * that are not parked, and sessions mid-teardown.
+	 */
+	private quotaParkForSnapshot(
+		state: ActiveSessionState,
+		capabilities: ReadonlySet<DaemonClientCapability>,
+	): DaemonSessionSnapshotQuotaPark | undefined {
+		if (!capabilities.has("quota_park_status")) {
+			return undefined;
+		}
+		let status: ReturnType<typeof readQuotaParkStatus>;
+		try {
+			status = readQuotaParkStatus(state.runtime.session);
+		} catch {
+			// A session mid-teardown offers no branch; the snapshot simply carries no park.
+			return undefined;
+		}
+		return status === undefined ? undefined : quotaParkWireFacts(status);
 	}
 
 	private async streamWorkerSnapshot(
@@ -7979,12 +8010,33 @@ export class AgentDaemon {
 	}
 
 	/**
+	 * R3-3: the attach-time half of the quota-park announce. Fires once per
+	 * attach, after the client can receive events again, and forces a re-emit of
+	 * an unchanged park: the attaching client may have missed the original
+	 * announce entirely (parked while nobody was attached), and dedup alone
+	 * would leave it blind until the next sweep.
+	 */
+	private announceQuotaParkAfterAttach(state: ActiveSessionState): void {
+		if (this.sessions.get(state.activeSessionId) !== state) {
+			return;
+		}
+		this.noteQuotaParkTransition(state, true);
+	}
+
+	/**
 	 * Event-driven half of the quota-park heartbeat (中断-10): announce a park
 	 * when it begins or its wake moves, close it once when it lifts. The
 	 * periodic sweep (sweepQuotaParkStatus) owns the steady-state heartbeat and
 	 * the transitions no session event marks (a park restored at bind).
+	 *
+	 * force re-announces an already-announced park: attach calls it once the
+	 * client can receive events again (after the attach response, resp. after
+	 * the snapshot stream), so a client that attaches into a parked session -
+	 * including one whose park was announced while nobody was attached - does
+	 * not wait out the next sweep for its first status. The dedup otherwise
+	 * stands: session-event calls never re-emit an unchanged park.
 	 */
-	private noteQuotaParkTransition(state: ActiveSessionState): void {
+	private noteQuotaParkTransition(state: ActiveSessionState, force = false): void {
 		if (this.shuttingDown || this.closingSessions.has(state.activeSessionId)) {
 			return;
 		}
@@ -8007,7 +8059,7 @@ export class AgentDaemon {
 			}
 			return;
 		}
-		if (!wasAnnounced || this.quotaParkAnnounced.get(state.activeSessionId) !== status.resumeAtMs) {
+		if (force || !wasAnnounced || this.quotaParkAnnounced.get(state.activeSessionId) !== status.resumeAtMs) {
 			this.quotaParkAnnounced.set(state.activeSessionId, status.resumeAtMs);
 			this.emitQuotaParkStatus(state, status);
 		}
@@ -8047,16 +8099,7 @@ export class AgentDaemon {
 		this.broadcastToSession(state, {
 			type: "quota_park_status",
 			activeSessionId: state.activeSessionId,
-			parked: true,
-			...(status.resumeAtMs !== undefined
-				? {
-						resumeAt: new Date(status.resumeAtMs).toISOString(),
-						// Clamped at 0: a wake firing right now is "resuming", not overdue.
-						remainingMs: Math.max(0, status.resumeAtMs - Date.now()),
-					}
-				: {}),
-			...(status.parkCount !== undefined ? { parkCount: status.parkCount } : {}),
-			...(status.provider !== undefined ? { provider: status.provider } : {}),
+			...quotaParkWireFacts(status),
 		});
 	}
 

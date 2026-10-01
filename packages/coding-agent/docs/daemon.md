@@ -140,7 +140,10 @@ Mutating commands are keyed by `clientId + commandId` and recorded before dispat
 - Reconnect retains the same command ID.
 - Clients acknowledge completed mutations so journal entries can be compacted.
 
-Workers journal operation transitions and detached subprocess identities. After a worker crash, recovery reaps its old process group and tracked detached bash trees, appends a visible recovery marker to the transcript, restores the root under the same active-session ID, and does not replay uncertain side effects.
+Workers journal operation transitions and detached subprocess identities. Recovery splits two cases:
+
+- Worker crash (the process dies with in-flight work): recovery reaps its old process group and tracked detached bash trees, appends a visible recovery marker to the transcript, restores the root under the same active-session ID, and does not replay uncertain side effects. A marker that is still the transcript tail when the session next binds queues one automatic resume prompt; the prompt lands as a user message, which consumes the marker, so the resume fires once per worker death.
+- Fatal error inside a session-hosting daemon (an uncaught exception or unhandled rejection): the process-level crash handler is fail-fast, because per-session state may already be corrupt. Before exiting it logs the error with its stack plus a snapshot of the sessions in flight, then fsyncs the worker recovery journal so the recovery inputs survive the process. The exit then flows through the worker-crash path above — the durable journal and the transcript marker, not the dead process's memory, drive what happens next.
 
 ## Coordinated Updates
 

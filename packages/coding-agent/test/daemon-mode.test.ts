@@ -5247,7 +5247,10 @@ describe("daemon mode helpers", () => {
 			const fixture = makePersistedRlmDaemonFixture(tempDir);
 			const internals = fixture.daemon as unknown as {
 				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
-				createSessionSnapshot(state: ActiveSessionState): Promise<DaemonAttachResult["snapshot"]>;
+				createSessionSnapshot(
+					state: ActiveSessionState,
+					capabilities: ReadonlySet<string>,
+				): Promise<DaemonAttachResult["snapshot"]>;
 				createConnectionState: ReturnType<typeof vi.fn>;
 				buildRlmChildSnapshotsWithPassiveRlmSubagents: ReturnType<typeof vi.fn>;
 			};
@@ -5267,7 +5270,7 @@ describe("daemon mode helpers", () => {
 				return [{ id: calls === 1 ? "old-child" : "new-child", status: "done", sessionDir: tempDir }];
 			});
 
-			const snapshot = await internals.createSessionSnapshot(state);
+			const snapshot = await internals.createSessionSnapshot(state, new Set());
 
 			expect(internals.buildRlmChildSnapshotsWithPassiveRlmSubagents).toHaveBeenCalledTimes(2);
 			expect(snapshot.children).toEqual([expect.objectContaining({ id: "new-child" })]);
@@ -5283,7 +5286,10 @@ describe("daemon mode helpers", () => {
 			const fixture = makePersistedRlmDaemonFixture(tempDir);
 			const internals = fixture.daemon as unknown as {
 				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
-				createSessionSnapshot(state: ActiveSessionState): Promise<DaemonAttachResult["snapshot"]>;
+				createSessionSnapshot(
+					state: ActiveSessionState,
+					capabilities: ReadonlySet<string>,
+				): Promise<DaemonAttachResult["snapshot"]>;
 				createConnectionState: ReturnType<typeof vi.fn>;
 				buildRlmChildSnapshotsWithPassiveRlmSubagents: ReturnType<typeof vi.fn>;
 			};
@@ -5303,7 +5309,7 @@ describe("daemon mode helpers", () => {
 				return [{ id: `child-${calls}`, status: "done", sessionDir: tempDir }];
 			});
 
-			await expect(internals.createSessionSnapshot(state)).resolves.toMatchObject({
+			await expect(internals.createSessionSnapshot(state, new Set())).resolves.toMatchObject({
 				children: [expect.objectContaining({ id: "child-4" })],
 				messages: [{ content: "transcript 4" }],
 				summary: { sessionId: "session-4" },

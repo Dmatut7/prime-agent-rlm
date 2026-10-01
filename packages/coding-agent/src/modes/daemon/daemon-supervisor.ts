@@ -7737,10 +7737,17 @@ export class DaemonSupervisor {
 				// later delta cannot be applied onto a historical message.
 				this.streamReconstructor.clear(activeSessionId);
 			}
+			const publicSnapshot = { ...result.snapshot, summary: publicSummary };
+			if (!client.capabilities.has("quota_park_status")) {
+				// The internal load declares quota_park_status so the cached snapshot
+				// carries the park facts; the wire contract (rev 43) fills them only
+				// for clients that declared the capability themselves.
+				delete publicSnapshot.quotaPark;
+			}
 			const publicResult: DaemonAttachResult = {
 				...result,
 				state: result.state ? publicSummary : undefined,
-				snapshot: { ...result.snapshot, summary: publicSummary },
+				snapshot: publicSnapshot,
 				client: { id: client.id, capabilities: [...client.capabilities] },
 			};
 			if (publicResult.state && publicResult.messages) {
@@ -7805,8 +7812,8 @@ export class DaemonSupervisor {
 						type: "attach",
 						activeSessionId,
 						capabilities: chunked
-							? ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"]
-							: ["attach_snapshot", "event_sequence", "slim_attach"],
+							? ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot", "quota_park_status"]
+							: ["attach_snapshot", "event_sequence", "slim_attach", "quota_park_status"],
 						supportsExtensionUi: false,
 						env: env ?? collectDaemonClientEnv(),
 					});
