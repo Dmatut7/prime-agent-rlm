@@ -1239,18 +1239,22 @@ describe("SettingsManager", () => {
 				maxPerSession: 0,
 			});
 			expect(manager.getRootStallRecoverySettings()).toEqual({
-				enabled: false,
+				// The root sweep defaults on (W2 中断-3); the 0s under test here are
+				// the window and the stop line, which must not fold back to defaults.
+				enabled: true,
 				humanWindowSeconds: 0,
 				maxPerSession: 0,
 			});
 		});
 
-		it("keeps the automatic stall actions off unless the owner opted into silence kills", () => {
-			// Warn-only is the watchdog default because silence is normal for long work;
-			// the daemon sweep must not bring the kill back behind it.
+		it("defaults the root sweep on while the subagent sweep stays opt-in", () => {
+			// Warn-only is the watchdog default because silence is normal for long work.
+			// A stalled child still reaches its parent through the stall notice, so the
+			// subagent sweep stays opt-in; an unattended main session has nobody to
+			// notify, so the root sweep recovers it by default (W2 中断-3).
 			const defaults = SettingsManager.inMemory({});
 			expect(defaults.getSubagentStallRecoverySettings().enabled).toBe(false);
-			expect(defaults.getRootStallRecoverySettings().enabled).toBe(false);
+			expect(defaults.getRootStallRecoverySettings().enabled).toBe(true);
 
 			const abortStage = SettingsManager.inMemory({ stallWatchdog: { abortAfterSeconds: 600 } });
 			expect(abortStage.getSubagentStallRecoverySettings().enabled).toBe(true);

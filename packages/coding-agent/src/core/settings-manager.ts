@@ -95,8 +95,19 @@ export const DEFAULT_STALL_ABORT_AFTER_SECONDS = 0;
 /** r4 recovery-shell: how long the sweep waits after first observing a child's stall before acting. */
 export const DEFAULT_SUBAGENT_STALL_RECOVERY_GRACE_SECONDS = 300;
 
-/** r4 recovery-shell: human window for a depth-0 session with an attached client; 0 in effect means "no human wait". */
-export const DEFAULT_ROOT_STALL_RECOVERY_HUMAN_WINDOW_SECONDS = 120;
+/**
+ * r4 recovery-shell: human window for a depth-0 session with an attached client;
+ * 0 in effect means "no human wait".
+ *
+ * Default 1500 (25 min): long enough that an interactive session is effectively
+ * warn-only - the owner gets the stall warning and any input inside the window
+ * cancels the automatic action for that episode - while a session nobody reacts
+ * to (the owner walked away) still gets one bounded recovery instead of sitting
+ * wedged for hours. A depth-0 session with NO attached client is unattended by
+ * definition, so the daemon skips the wait entirely (the window collapses to 0)
+ * and acts as soon as the evidence confirms.
+ */
+export const DEFAULT_ROOT_STALL_RECOVERY_HUMAN_WINDOW_SECONDS = 1500;
 
 /** r4 recovery-shell: consecutive auto actions per session before the stop line (children and roots alike); 0 arms the line immediately (notify only). */
 export const DEFAULT_STALL_RECOVERY_MAX_PER_SESSION = 3;
@@ -398,12 +409,15 @@ export interface ResolvedSubagentStallRecoverySettings {
  */
 export interface RootStallRecoverySettings {
 	/**
-	 * Unset: on only when `stallWatchdog.abortAfterSeconds` > 0, for the same reason as
-	 * `subagents.stallRecovery.enabled`. Off means the daemon never acts on a silent main
-	 * session - warn only.
+	 * Default: on. An unattended session (no attached client) that stalls past the
+	 * warn threshold would otherwise sit wedged until its idle eviction, so the
+	 * daemon's sweep recovers it by default; an attached client gets
+	 * `humanWindowSeconds` to react first, and any input in that window cancels the
+	 * action for the episode. `stallWatchdog.rootRecovery.enabled: false` is the
+	 * rollback handle that returns a main session to warn-only.
 	 */
 	enabled?: boolean;
-	/** Human window while a client is attached, in seconds; 0 means act as soon as the evidence confirms. Default 120. */
+	/** Human window while a client is attached, in seconds; 0 means act as soon as the evidence confirms. Default 1500 (25 min). */
 	humanWindowSeconds?: number;
 	/**
 	 * Consecutive auto actions per session before the stop line: only notifications
@@ -2895,8 +2909,10 @@ export class SettingsManager {
 
 	/**
 	 * Whether the owner opted into killing silent turns (a positive watchdog abort stage).
-	 * The daemon's automatic stall actions default to this: warn-only watchdogs (the
-	 * default, 9ada6d83b) must not get their silence kill back through the sweep.
+	 * The daemon's subagent stall actions default to this: warn-only watchdogs (the
+	 * default, 9ada6d83b) must not get their silence kill back through the sweep. The
+	 * depth-0 sweep is exempt: it defaults on (see getRootStallRecoverySettings),
+	 * because an unattended main session has no other recovery path.
 	 */
 	private stallAutoAbortOptedIn(): boolean {
 		return this.getStallWatchdogSettings().abortAfterSeconds > 0;
@@ -2906,7 +2922,11 @@ export class SettingsManager {
 	getRootStallRecoverySettings(): RootStallRecoverySettingsResolved {
 		const settings = this.settings.stallWatchdog?.rootRecovery ?? {};
 		return {
-			enabled: readBooleanSetting(settings.enabled, this.stallAutoAbortOptedIn()).value,
+			// Default on (W2 中断-3): an unattended main session has nobody watching,
+			// so the daemon sweep is its only recovery; an attached client gets the
+			// human window first. The subagent sweep keeps the abort-opt-in default -
+			// a stalled child already reaches its parent through the stall notice.
+			enabled: readBooleanSetting(settings.enabled, true).value,
 			humanWindowSeconds: nonNegativeFinite(
 				settings.humanWindowSeconds,
 				DEFAULT_ROOT_STALL_RECOVERY_HUMAN_WINDOW_SECONDS,

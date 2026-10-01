@@ -1,6 +1,6 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
-import { AUTO_CONTINUE_CUSTOM_TYPE } from "../src/core/messages.js";
+import { AUTO_CONTINUE_CUSTOM_TYPE, createAutoContinueMessage } from "../src/core/messages.js";
 import {
 	announcedNextStep,
 	createOutputTruncatedContinueMessage,
@@ -162,6 +162,28 @@ describe("createOutputTruncatedContinueMessage", () => {
 		expect(content).toContain('stopReason: "length"');
 		expect(content).toContain("Continue from where you stopped");
 		expect(content).toContain("2 of at most 4");
+	});
+});
+
+describe("createAutoContinueMessage", () => {
+	it("names the configured per-prompt budget instead of a hardcoded cap", () => {
+		const message = createAutoContinueMessage(
+			{ reason: "announced_next_step", excerpt: "接下来我去改", ordinal: 2, maxOrdinal: 4 },
+			7,
+		);
+		expect(message.customType).toBe(AUTO_CONTINUE_CUSTOM_TYPE);
+		expect(message.display).toBe(true);
+		expect(message.timestamp).toBe(7);
+		const content = String(message.content);
+		expect(content).toContain("2 of at most 4");
+		expect(content).not.toContain("of at most 2");
+	});
+
+	it("keeps the child-reply nudge a one-shot with no budget wording", () => {
+		const message = createAutoContinueMessage({ reason: "child_reply_missing", ordinal: 1, maxOrdinal: 1 });
+		const content = String(message.content);
+		expect(content).toContain("parent");
+		expect(content).not.toContain("of at most");
 	});
 });
 

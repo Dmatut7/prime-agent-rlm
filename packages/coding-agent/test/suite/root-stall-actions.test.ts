@@ -120,16 +120,17 @@ describe("stall recovery settings resolution", () => {
 	it("resolves the documented defaults", () => {
 		const manager = SettingsManager.inMemory({});
 
-		// Warn-only by default (silence is normal for long work): the automatic
-		// actions are off unless the owner opts into silence kills.
+		// Warn-only is the in-session watchdog default (silence is normal for long
+		// work): the subagent sweep stays opt-in, while the depth-0 sweep defaults on
+		// - an unattended main session has no other recovery (W2 中断-3).
 		expect(manager.getSubagentStallRecoverySettings()).toEqual({
 			enabled: false,
 			graceSeconds: 300,
 			maxPerSession: 3,
 		});
 		expect(manager.getRootStallRecoverySettings()).toEqual({
-			enabled: false,
-			humanWindowSeconds: 120,
+			enabled: true,
+			humanWindowSeconds: 1500,
 			maxPerSession: 3,
 		});
 	});
@@ -162,6 +163,6 @@ describe("stall recovery settings resolution", () => {
 			graceSeconds: 300,
 			maxPerSession: 3,
 		});
-		expect(manager.getRootStallRecoverySettings()).toMatchObject({ humanWindowSeconds: 120 });
+		expect(manager.getRootStallRecoverySettings()).toMatchObject({ humanWindowSeconds: 1500 });
 	});
 });

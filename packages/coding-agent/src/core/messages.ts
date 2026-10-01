@@ -491,6 +491,13 @@ export interface AutoContinueMessageDetails {
 	reason: "announced_next_step" | "child_reply_missing";
 	excerpt?: string;
 	ordinal: number;
+	/**
+	 * The per-prompt auto-continue budget the session configured
+	 * (`selfRecovery.maxAutoContinues`), so the wording never claims a hardcoded
+	 * cap that the setting has already changed. The child-reply nudge is a
+	 * one-shot, so its callers pass 1.
+	 */
+	maxOrdinal: number;
 }
 
 /**
@@ -512,7 +519,7 @@ export function createAutoContinueMessage(
 			: [
 					`[auto-continue] Your last reply ended by announcing a next step (${JSON.stringify(details.excerpt ?? "")}) but the turn stopped before doing it. If the owner left this running, a stop here leaves the work half done until they come back.`,
 					"Whether stopping is right depends on the task, not on that sentence: on whether the work the owner asked for is finished and you have seen proof of it. While the work is unfinished, the announced step is simply the next thing to do. Once it is finished and proven, the sentence was an offer, and the owner gains most from the final result stated plainly. Some steps are the owner's to authorize (irreversible, spending money, sending anything outside this machine), and an automatic continue is not their consent; for those, and for anything blocked or needing a decision only they can make, a useful stop says exactly what is needed.",
-					`This is an automatic continue (${details.ordinal} of at most 2 for this request).`,
+					`This is an automatic continue (${details.ordinal} of at most ${details.maxOrdinal} for this request).`,
 				].join("\n");
 	return {
 		role: "custom",

@@ -50,6 +50,18 @@ describe("AgentSession autonomous mode", () => {
 		}
 	});
 
+	it("ships the raised built-in budgets for unattended runs (中断-7)", () => {
+		// The 3/12/80k/30min envelope stopped healthy runs long before the task was
+		// done; the defaults are pinned so a future "small" tweak is a deliberate act.
+		const state = createAutonomousRuntimeState({ enabled: true });
+		expect(state.limits).toEqual({
+			maxContinuations: 20,
+			maxTurns: 50,
+			maxTokens: 400_000,
+			timeoutMs: 2 * 60 * 60 * 1000,
+		});
+	});
+
 	it("injects a host-side continuation when the assistant asks the user for help", async () => {
 		const harness = await createHarness({
 			autonomous: { enabled: true, maxContinuations: 1 },

@@ -211,6 +211,24 @@ describe("AgentSession compaction characterization", () => {
 				content: expect.stringContaining("were removed: large_text"),
 			}),
 		);
+		// The prune is also disclosed to the owner: a user-visible transcript notice
+		// (the <ipython_state> block above is the model-only channel, display: false).
+		// The notice stays out of the live model context - the model already got the
+		// same fact in the block - and lives in the transcript plus the event stream.
+		const pruneNoticeEntries = harness.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "custom_message" && entry.customType === "ipython_state_pruned");
+		expect(pruneNoticeEntries).toHaveLength(1);
+		expect(pruneNoticeEntries[0]).toMatchObject({
+			display: true,
+			content: expect.stringContaining("large_text"),
+		});
+		expect(String((pruneNoticeEntries[0] as { content: unknown }).content)).toContain("per-variable snapshot");
+		expect(
+			harness.session.messages.some(
+				(message) => message.role === "custom" && message.customType === "ipython_state_pruned",
+			),
+		).toBe(false);
 		expect(result.summary).toBe("summary from extension");
 		expect(compactionEntries).toHaveLength(1);
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
@@ -865,9 +883,12 @@ describe("AgentSession compaction characterization", () => {
 		await sessionInternals._checkCompaction({ ...overflowMessage, timestamp: Date.now() + 1 });
 		await sessionInternals._checkCompaction({ ...overflowMessage, timestamp: Date.now() + 2 });
 
+		// The second overflow spends the emergency shrink once before giving up; on
+		// this near-empty branch the shrink finds nothing to cut, so the episode
+		// ends terminal, and the third overflow changes nothing.
 		expect(runAutoCompactionSpy).toHaveBeenCalledTimes(1);
 		const message =
-			"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.";
+			"Context overflow recovery failed after one compact-and-retry attempt and one emergency context shrink. Try reducing context or switching to a larger-context model.";
 		expect(compactionErrors).toContain(message);
 		expect(harness.session.messages.at(-1)).toMatchObject({
 			role: "custom",
@@ -881,6 +902,79 @@ describe("AgentSession compaction characterization", () => {
 					entry.role === "custom" && entry.customType === "compaction_outcome" && entry.content === message,
 			),
 		).toHaveLength(1);
+	});
+
+	it("spends one emergency context shrink when the compact-and-retry overflows again", async () => {
+		// The second overflow proves summarization alone cannot fit the context, so
+		// the recovery spends the lossy valve once: the kept tail is dropped unsummarized
+		// (loudly), and only then does the request retry on the shrunken context.
+		const harness = await createHarness({
+			models: [{ id: "small-window", contextWindow: 10_000, maxTokens: 200 }],
+			settings: {
+				autoRefine: { enabled: false },
+				// keepRecentTokens above the emergency target (0.7 * 8000) so the first
+				// compaction's retained tail is big enough for the shrink to cut.
+				compaction: { enabled: true, reserveTokens: 800, keepRecentTokens: 6000, triggerRatio: 0.8 },
+				retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 },
+			},
+		});
+		harnesses.push(harness);
+		// Turn 1 carries two ~3k-token messages, so the overflow compaction's cut
+		// lands mid-history (user1 summarized, the assistant answer kept) instead of
+		// on the first message, which skips as "too short to compact".
+		harness.setResponses([fauxAssistantMessage(`noted ${"n".repeat(12_000)}`)]);
+		await harness.session.prompt(`first ${"z".repeat(12_000)}`);
+
+		const overflowStep = () =>
+			fauxAssistantMessage("", {
+				stopReason: "error",
+				errorMessage: "prompt is too long: 99999 tokens > 8000 maximum",
+				// After the first compaction commits, so the message is not dismissed as
+				// a stale pre-compaction error (Date.now() can tie inside one fast pass).
+				timestamp: Date.now() + 5000,
+			});
+		let finalRequestHadOverflowError: boolean | undefined;
+		harness.setResponses([
+			overflowStep,
+			() => fauxAssistantMessage("Summary of earlier work."),
+			overflowStep,
+			(context) => {
+				finalRequestHadOverflowError = context.messages.some(
+					(message) => message.role === "assistant" && message.stopReason === "error",
+				);
+				return fauxAssistantMessage("Recovered.");
+			},
+		]);
+		// ~5000 estimated tokens: kept by the first compaction, dropped by the shrink.
+		await harness.session.prompt(`second ${"y".repeat(20_000)}`);
+
+		await vi.waitFor(() => {
+			expect(getMessageText(harness.session.messages.at(-1))).toBe("Recovered.");
+		});
+
+		const compactions = harness.sessionManager.getBranch().filter((entry) => entry.type === "compaction");
+		expect(compactions).toHaveLength(2);
+		expect(String((compactions[1] as { summary?: unknown }).summary)).toContain("EMERGENCY CONTEXT SHRINK");
+		expect(harness.session.messages).toContainEqual(
+			expect.objectContaining({
+				role: "custom",
+				customType: "compaction_outcome",
+				content: expect.stringContaining("EMERGENCY CONTEXT SHRINK"),
+			}),
+		);
+		// The retry on the shrunken context does not re-read the overflow error.
+		expect(finalRequestHadOverflowError).toBe(false);
+		// The terminal failure wording belongs to the shrink-cannot-help path.
+		expect(
+			harness.session.messages.some(
+				(message) =>
+					message.role === "custom" &&
+					message.customType === "compaction_outcome" &&
+					String(getMessageText(message)).includes("Context overflow recovery failed"),
+			),
+		).toBe(false);
+		expect(harness.faux.state.callCount).toBe(5);
+		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
 	it("ignores stale pre-compaction assistant usage on pre-prompt checks", async () => {

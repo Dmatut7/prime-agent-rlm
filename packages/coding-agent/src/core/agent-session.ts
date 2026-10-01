@@ -6153,7 +6153,8 @@ export class AgentSession {
 			if (!settings.childReplyNudge || this._repliedToParentSinceTask !== false || used > 0) return undefined;
 			if (!ranToolsSinceLastPrompt(context.newMessages)) return undefined;
 			this._recordSelfRecovery({ kind: "child_reply_nudge", at: Date.now() });
-			return createAutoContinueMessage({ reason: "child_reply_missing", ordinal: 1 });
+			// The child-reply nudge is a one-shot (`used > 0` blocks repeats), so its budget is 1.
+			return createAutoContinueMessage({ reason: "child_reply_missing", ordinal: 1, maxOrdinal: 1 });
 		}
 		if (!settings.autoContinue || used >= settings.maxAutoContinues) return undefined;
 		const ranTools = ranToolsSinceLastPrompt(context.newMessages);
@@ -6172,7 +6173,12 @@ export class AgentSession {
 		const excerpt = announcedNextStep(message, { ranTools });
 		if (!excerpt) return undefined;
 		this._recordSelfRecovery({ kind: "auto_continue", excerpt, ordinal, at: Date.now() });
-		return createAutoContinueMessage({ reason: "announced_next_step", excerpt, ordinal });
+		return createAutoContinueMessage({
+			reason: "announced_next_step",
+			excerpt,
+			ordinal,
+			maxOrdinal: settings.maxAutoContinues,
+		});
 	}
 
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
@@ -13193,6 +13199,31 @@ export class AgentSession {
 		this.sessionManager.appendCustomMessageEntry(message.customType, message.content, message.display, undefined);
 		this._emit({ type: "message_start", message });
 		this._emit({ type: "message_end", message });
+
+		const pruned = snapshot?.pruned ?? [];
+		if (pruned.length > 0) {
+			// The prune deleted those names from the LIVE kernel, and the
+			// <ipython_state> block above is model-only (display: false), so without
+			// this notice the owner never hears that data was destroyed. Transcript +
+			// event stream only: the model already got the same fact in the block
+			// above, and a second copy would just pollute its context. The literal
+			// customType follows the ipython_state precedent - it never enters the
+			// input pipeline, so the input-classification coverage pin does not apply.
+			const pruneNotice = {
+				role: "custom" as const,
+				customType: "ipython_state_pruned",
+				content: [
+					`Kernel variables removed by the post-compaction snapshot: ${pruned.join(", ")}.`,
+					"Each exceeded the per-variable snapshot size limit, so it was deleted from the live Python kernel (too large to persist). The kernel and all other variables survived; the removed values are not in the kernel and not in the on-disk snapshot.",
+					"To use them again, recreate them: re-run the cell that built them or reload the data from its source.",
+				].join("\n"),
+				display: true,
+				timestamp: Date.now(),
+			} satisfies CustomMessage;
+			this.sessionManager.appendCustomMessageEntry(pruneNotice.customType, pruneNotice.content, true, undefined);
+			this._emit({ type: "message_start", message: pruneNotice });
+			this._emit({ type: "message_end", message: pruneNotice });
+		}
 	}
 
 	/**
@@ -15261,10 +15292,39 @@ export class AgentSession {
 			if (this._overflowRecovery !== "idle") {
 				if (this._overflowRecovery === "attempted") {
 					this._overflowRecovery = "reported";
+					// The compact-and-retry did not fit the context, so the second
+					// overflow is the signal that summarization alone cannot get the
+					// session under the window (e.g. one uncompactably large tail).
+					// Spend the lossy valve once before declaring the episode
+					// terminal; only a shrink that cannot run or cannot reach the
+					// target is the terminal failure.
+					this._registerCompactionFailure();
+					const shrink = await this._runEmergencyContextShrink(
+						"overflow",
+						`the retry after one compact-and-retry attempt still overflowed (${
+							assistantMessage.errorMessage ?? "context overflow"
+						})`,
+						{ force: true },
+					);
+					if (shrink.shrunk && shrink.reachedTarget) {
+						// Same retry-context rule as the first attempt: the overflow
+						// error is history, not something the retry should re-read. The
+						// shrink rebuilt the context from the branch, so the error is
+						// back - drop it, keeping the shrink's outcome notice at the tail.
+						const rebuilt = this.agent.state.messages;
+						let tail = rebuilt.length - 1;
+						while (tail >= 0 && rebuilt[tail].role === "custom") tail--;
+						const tailMessage = tail >= 0 ? rebuilt[tail] : undefined;
+						if (tailMessage?.role === "assistant" && tailMessage.stopReason === "error") {
+							rebuilt.splice(tail, 1);
+						}
+						this._schedulePostCompactionContinue(true);
+						return true;
+					}
 					this._endCompactionUnsuccessfully(
 						"overflow",
 						"failed",
-						"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
+						"Context overflow recovery failed after one compact-and-retry attempt and one emergency context shrink. Try reducing context or switching to a larger-context model.",
 					);
 				}
 				return false;
@@ -15427,6 +15487,11 @@ export class AgentSession {
 	 * carried into the replacement summary instead of being lost - until the estimate
 	 * lands under the threshold's emergency target.
 	 *
+	 * `options.force` skips the failure-streak gate: the overflow-recovery path
+	 * calls the valve on the second overflow, where the compaction itself
+	 * succeeded (so the streak is short) but the retry still overflowed - the
+	 * proof there is the repeated overflow, not a failing summarizer.
+	 *
 	 * Never silent. The loss is named in three places: the replacement summary the
 	 * model reads next turn, a persisted compaction-outcome notice the user reads in
 	 * the transcript, and a warn-level session log line. Nothing is deleted from the
@@ -15437,8 +15502,9 @@ export class AgentSession {
 	private async _runEmergencyContextShrink(
 		reason: CompactionOutcomeReason,
 		lastError: string,
+		options: { force?: boolean } = {},
 	): Promise<{ shrunk: boolean; reachedTarget: boolean }> {
-		if (this._consecutiveCompactionFailures < COMPACTION_EMERGENCY_SHRINK_FAILURES) {
+		if (!options.force && this._consecutiveCompactionFailures < COMPACTION_EMERGENCY_SHRINK_FAILURES) {
 			return { shrunk: false, reachedTarget: false };
 		}
 		const settings = this.settingsManager.getCompactionSettings();
@@ -21008,7 +21074,10 @@ export class AgentSession {
 		const args = this._toolCallArgs.get(event.toolCallId);
 		this._toolCallArgs.delete(event.toolCallId);
 		const text = toolResultText(event.result);
-		if (!isBadToolCall({ isError: event.isError, text, args })) {
+		// Resolve the tool's definition so a legitimate empty-args call to a tool
+		// whose schema requires nothing is not counted as a bad call; an
+		// unresolvable name keeps the conservative legacy reading (it counts).
+		if (!isBadToolCall({ isError: event.isError, text, args }, this.getToolDefinition(event.toolName))) {
 			if (!event.isError) this._badToolCallStreak = 0;
 			return;
 		}

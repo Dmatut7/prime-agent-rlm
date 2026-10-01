@@ -47,10 +47,10 @@ refusing.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `autonomous.maxContinuations` | number or `"unlimited"` | `3` | Continuation budget for autonomous runs |
-| `autonomous.maxTurns` | number or `"unlimited"` | `12` | Turn budget for autonomous runs |
-| `autonomous.maxTokens` | number or `"unlimited"` | `80000` | Token budget for autonomous runs |
-| `autonomous.timeoutMs` | number or `"unlimited"` | `1800000` | Wall-clock budget in milliseconds |
+| `autonomous.maxContinuations` | number or `"unlimited"` | `20` | Continuation budget for autonomous runs |
+| `autonomous.maxTurns` | number or `"unlimited"` | `50` | Turn budget for autonomous runs |
+| `autonomous.maxTokens` | number or `"unlimited"` | `400000` | Token budget for autonomous runs |
+| `autonomous.timeoutMs` | number or `"unlimited"` | `7200000` | Wall-clock budget in milliseconds (2 hours) |
 
 ```json
 {
@@ -464,14 +464,30 @@ notice, which is the only signal a parent gets when the abort is what ended the 
 
 To disable entirely: `{ "stallWatchdog": { "enabled": false } }`.
 
-The daemon's stall-recovery sweep (the automatic interrupt of a silent main session
-or subagent after the warning, `stallWatchdog.rootRecovery` and
-`subagents.stallRecovery`) follows the same opt-in: with `enabled` unset it is on
-only when `abortAfterSeconds` is positive, so a warn-only watchdog never gets its
-silence kill back through the sweep. Set `enabled: true` on either block to arm it
-independently, or `enabled: false` to keep it off even with an abort stage. When it
-is armed, the sweep re-checks the watchdog's exemption live on every pass, so a job
-that keeps producing stays excused.
+The daemon's stall-recovery sweep (the automatic interrupt of a silent session
+after the warning, `stallWatchdog.rootRecovery` and `subagents.stallRecovery`)
+has different defaults per session role:
+
+- **Main session (`stallWatchdog.rootRecovery`)**: on by default. The wait before
+  the sweep acts depends on whether anyone is watching. With no attached client
+  (unattended/headless runs), the wait collapses to zero and the sweep interrupts
+  the wedged turn and queues a recovery instruction as soon as its evidence
+  confirms - an unattended session has no other way back. With an attached
+  client, the sweep waits `stallWatchdog.rootRecovery.humanWindowSeconds`
+  (default `1500`, 25 minutes) after the warning, and any input in that window
+  cancels the automatic action for the episode, so an attended session is
+  effectively warn-only: nothing is interrupted while you are reacting, and only
+  a turn nobody touches for 25 minutes past the warning gets one bounded
+  recovery. The in-session abort (`abortAfterSeconds`) stays warn-only by
+  default either way; set `stallWatchdog.rootRecovery.enabled: false` to turn
+  the sweep off too and return to pure warn-only.
+- **Subagent (`subagents.stallRecovery`)**: off by default (notify only) unless
+  `stallWatchdog.abortAfterSeconds` is positive - a stalled child already
+  reaches its parent agent through the stall notice, and the parent decides.
+
+Either sweep re-checks the watchdog's exemption live on every pass, so a job
+that keeps producing stays excused, and stops acting after
+`maxPerSession` (default `3`) consecutive actions without external input.
 
 The per-call tool deadline (`tools.timeout`) never cancels a call just because the
 kernel cannot vouch for it (a synchronous cell freezes the kernel loop). At the

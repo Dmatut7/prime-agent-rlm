@@ -59,7 +59,7 @@ const SWITCHES: Switch[] = [
 	},
 	{
 		path: "stallWatchdog.rootRecovery.enabled",
-		fallback: false,
+		fallback: true,
 		read: (m) => m.getRootStallRecoverySettings().enabled,
 	},
 	{

@@ -56,10 +56,15 @@ export const DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT =
 export const DEFAULT_AUTONOMOUS_LIMITS: Required<
 	Omit<AgentAutonomousConfig, "enabled" | "continuationPrompt" | "gates" | "subagentKeepAliveMs">
 > = {
-	maxContinuations: 3,
-	maxTurns: 12,
-	maxTokens: 80_000,
-	timeoutMs: 30 * 60 * 1000,
+	// Sized for "work until done" unattended runs: the old 3/12/80k/30min envelope
+	// capped a run at three nudges and half an hour, which stopped healthy runs
+	// long before the task was finished. maxContinuations stays the tightest knob
+	// on purpose: twenty answered "keep going" nudges without terminal evidence is
+	// a run that is not converging.
+	maxContinuations: 20,
+	maxTurns: 50,
+	maxTokens: 400_000,
+	timeoutMs: 2 * 60 * 60 * 1000,
 };
 
 export const DEFAULT_AUTONOMOUS_GATES: Required<AgentAutonomousGateConfig> = {
@@ -72,7 +77,7 @@ export const DEFAULT_AUTONOMOUS_GATES: Required<AgentAutonomousGateConfig> = {
  * Default subagent keep-alive window: while subagents run, one continuation
  * per 25 minutes of continuous activity still fires so the parent can check
  * for hung or stopped children instead of sleeping until they finish. Kept
- * strictly below the default wall-clock budget (30 minutes) so the valve
+ * strictly below the default wall-clock budget (2 hours) so the valve
  * fires before the run's timeout caps it; keep custom windows below any
  * configured --timeout-ms for the same reason.
  */

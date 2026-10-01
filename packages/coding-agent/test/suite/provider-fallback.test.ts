@@ -234,6 +234,56 @@ describe("provider fallback chain (unattended self-recovery)", () => {
 		expect(readProviderFallbackEntries(harness.sessionManager.getEntries())).toEqual([]);
 	});
 
+	it("does not storm on empty-args errors from a tool whose schema requires nothing", async () => {
+		// 中断-智能-6 wiring: the session resolves the tool definition for the bad-call
+		// check, so a legitimate zero-argument call that fails in *execution* is the
+		// tool's own failure, not a malformed call - it must not trip the fallback.
+		const zeroArgFailing: AgentTool = {
+			name: "ping",
+			label: "ping",
+			description: "ping",
+			parameters: Type.Object({}),
+			execute: async () => {
+				throw new Error("backend unreachable");
+			},
+		};
+		const harness = await harnessWith({}, [zeroArgFailing]);
+		const served: string[] = [];
+		const calls = fauxAssistantMessage(
+			[fauxToolCall("ping", {}), fauxToolCall("ping", {}), fauxToolCall("ping", {})],
+			{ stopReason: "toolUse" },
+		);
+		const step = perModel({ "faux-1": [calls, fauxAssistantMessage("gave up")] }, served);
+		harness.setResponses([step, step]);
+
+		await harness.session.prompt("do the work");
+
+		expect(served).toEqual(["faux-1", "faux-1"]);
+		expect(harness.session.model?.id).toBe("faux-1");
+		expect(readProviderFallbackEntries(harness.sessionManager.getEntries())).toEqual([]);
+	});
+
+	it("still storms on empty-args errors when the tool's schema declares required parameters", async () => {
+		// Positive control for the wiring above: `echo` requires `text`, so a `{}`
+		// call never validates - that IS a malformed call and still trips the fallback.
+		const harness = await harnessWith({}, [echoTool]);
+		const served: string[] = [];
+		const calls = fauxAssistantMessage(
+			[fauxToolCall("echo", {}), fauxToolCall("echo", {}), fauxToolCall("echo", {})],
+			{ stopReason: "toolUse" },
+		);
+		const step = perModel({ "faux-1": [calls], "faux-kimi": [fauxAssistantMessage("kimi finished")] }, served);
+		harness.setResponses([step, step]);
+
+		await harness.session.prompt("do the work");
+
+		expect(served).toEqual(["faux-1", "faux-kimi"]);
+		expect(harness.session.model?.id).toBe("faux-kimi");
+		expect(readProviderFallbackEntries(harness.sessionManager.getEntries())).toEqual([
+			expect.objectContaining({ kind: "switch", to: "faux/faux-kimi", cause: "连续 3 次无效工具调用" }),
+		]);
+	});
+
 	it("waits in long rounds when every model fails, then starts over on the primary instead of ending", async () => {
 		const harness = await harnessWith();
 		const served: string[] = [];
