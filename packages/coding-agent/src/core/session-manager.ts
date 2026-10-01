@@ -1,5 +1,13 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, ImageContent, Message, ServiceTier, TextContent, Usage } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	getLogger,
+	type ImageContent,
+	type Message,
+	type ServiceTier,
+	type TextContent,
+	type Usage,
+} from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import {
 	appendFileSync,
@@ -77,6 +85,7 @@ import {
 } from "./usage.js";
 
 export const CURRENT_SESSION_VERSION = 3;
+const sessionManagerLog = getLogger("coding-agent.session-manager");
 const SESSION_LIST_SEARCH_TEXT_MAX_CHARS = 64 * 1024;
 const SESSION_LIST_PARSE_MAX_LINE_CHARS = 1024 * 1024;
 const SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS = 256;
@@ -888,6 +897,21 @@ export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEnt
 	return null;
 }
 
+/**
+ * Context-rebuild loss warnings, one per unique defect per process. A damaged
+ * transcript keeps feeding these paths on every turn, so an undeduplicated warn
+ * would repeat forever; the bound mirrors the transcript-line-skip ledger.
+ */
+const CONTEXT_LOSS_WARN_LIMIT = 256;
+const contextLossWarned = new Set<string>();
+
+function warnOnceOnContextLoss(key: string, msg: string, fields: Record<string, unknown>): void {
+	if (contextLossWarned.has(key)) return;
+	if (contextLossWarned.size >= CONTEXT_LOSS_WARN_LIMIT) contextLossWarned.clear();
+	contextLossWarned.add(key);
+	sessionManagerLog.warn(msg, fields);
+}
+
 export function buildSessionContext(
 	entries: SessionEntry[],
 	leafId?: string | null,
@@ -920,7 +944,25 @@ export function buildSessionContext(
 	let current: SessionEntry | undefined = leaf;
 	while (current) {
 		path.push(current);
-		current = current.parentId ? byId.get(current.parentId) : undefined;
+		if (!current.parentId) break;
+		const parent: SessionEntry | undefined = byId.get(current.parentId);
+		if (!parent) {
+			// The parent is gone from what we hold (a skipped bad line, a torn
+			// write): the walk stops here and everything before this entry leaves
+			// the rebuilt context. That loss was silent; name the broken link.
+			warnOnceOnContextLoss(
+				`chain:${current.id}:${current.parentId}`,
+				"session entry chain broken: history before this entry is dropped from the rebuilt context",
+				{
+					entryId: current.id,
+					missingParentId: current.parentId,
+					leafId: leaf.id,
+					retainedEntries: path.length,
+				},
+			);
+			break;
+		}
+		current = parent;
 	}
 	path.reverse();
 
@@ -976,6 +1018,26 @@ export function buildSessionContext(
 			if (foundFirstKept) {
 				appendMessage(entry, retainedMessages);
 			}
+		}
+		// A v1-migrated compaction can carry no anchor at all (migrateV1ToV2 leaves
+		// firstKeptEntryId unset when the index pointed at the header); an absent
+		// anchor is the old shape, not a miss. A present anchor that matches nothing
+		// on the walked path means the retained half of the window silently
+		// collapses to zero messages - name it instead of serving summary-only.
+		if (
+			!foundFirstKept &&
+			typeof compaction.firstKeptEntryId === "string" &&
+			compaction.firstKeptEntryId.length > 0
+		) {
+			warnOnceOnContextLoss(
+				`firstKept:${compaction.id}:${compaction.firstKeptEntryId}`,
+				"compaction firstKeptEntryId not found on the walked path: retained messages around the compaction are dropped",
+				{
+					compactionId: compaction.id,
+					firstKeptEntryId: compaction.firstKeptEntryId,
+					leafId: leaf.id,
+				},
+			);
 		}
 
 		messages.push(
@@ -1047,6 +1109,34 @@ export function getTranscriptLineSkips(): TranscriptLineSkip[] {
 
 export function clearTranscriptLineSkips(): void {
 	transcriptLineSkips.length = 0;
+}
+
+function countTranscriptLineSkipsFor(sessionFile: string): number {
+	let count = 0;
+	for (const skip of transcriptLineSkips) {
+		if (skip.sessionFile === sessionFile) count++;
+	}
+	return count;
+}
+
+/**
+ * Log-side signal that a load was lossy at all. The skip ledger above is the
+ * consumable record (file, line, reason per skip); this warn fires once per load
+ * that added to it and carries the first recorded skip for the file, so the log
+ * line alone already says where to look. The listing scan path is deliberately
+ * quiet: it re-reads the same damaged file on every refresh, so it only feeds
+ * the ledger, never the log.
+ */
+function warnOnLoadTranscriptLineSkips(sessionFile: string, skipsBefore: number): void {
+	const skippedNow = countTranscriptLineSkipsFor(sessionFile) - skipsBefore;
+	if (skippedNow <= 0) return;
+	const first = transcriptLineSkips.find((skip) => skip.sessionFile === sessionFile);
+	sessionManagerLog.warn("session transcript lines skipped on load; the entries on those lines are lost", {
+		sessionFile,
+		skippedLines: skippedNow,
+		firstSkippedLine: first?.line,
+		firstReason: first?.reason,
+	});
 }
 
 /**
@@ -1385,7 +1475,10 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	if (!existsSync(filePath)) return [];
 	assertRegularFileNoSymlink(filePath);
 	enforcePrivateTranscriptMode(filePath);
-	return finalizeLoadedEntries(parseEntriesFromBuffer(readFileSync(filePath), filePath));
+	const skipsBefore = countTranscriptLineSkipsFor(filePath);
+	const entries = finalizeLoadedEntries(parseEntriesFromBuffer(readFileSync(filePath), filePath));
+	warnOnLoadTranscriptLineSkips(filePath, skipsBefore);
+	return entries;
 }
 
 // Async loader for the daemon: reads off the event loop and yields while parsing so a
@@ -1398,9 +1491,14 @@ export async function loadEntriesFromFileAsync(
 	if (!existsSync(filePath)) return [];
 	assertRegularFileNoSymlink(filePath);
 	enforcePrivateTranscriptMode(filePath);
+	const skipsBefore = countTranscriptLineSkipsFor(filePath);
 	const streamThresholdBytes = options.streamThresholdBytes ?? SESSION_STREAMING_LOAD_THRESHOLD_BYTES;
 	if ((await stat(filePath)).size < streamThresholdBytes) {
-		return finalizeLoadedEntries(await parseEntriesFromBufferAsync(await readFile(filePath), filePath));
+		const bufferedEntries = finalizeLoadedEntries(
+			await parseEntriesFromBufferAsync(await readFile(filePath), filePath),
+		);
+		warnOnLoadTranscriptLineSkips(filePath, skipsBefore);
+		return bufferedEntries;
 	}
 
 	const entries: FileEntry[] = [];
@@ -1428,7 +1526,9 @@ export async function loadEntriesFromFileAsync(
 			await new Promise<void>((resolve) => setImmediate(resolve));
 		}
 	}
-	return finalizeLoadedEntries(entries);
+	const loaded = finalizeLoadedEntries(entries);
+	warnOnLoadTranscriptLineSkips(filePath, skipsBefore);
+	return loaded;
 }
 
 /**

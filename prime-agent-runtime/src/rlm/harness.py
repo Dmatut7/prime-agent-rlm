@@ -1255,7 +1255,14 @@ class HarnessState:
             "receiver_role='child', receiver_name=handle.name) for follow-ups.",
         ]
         for kind in _KINDS:
-            records = self.list(kind)[:max_entries_per_kind]
+            # The injection window is recency-first, not list()'s path-grouped
+            # order: a path-alphabetical first dimension parks every entry written
+            # under the default path behind any custom path, so newer memories
+            # structurally never reach the digest (audit M4: 45.8% of a real store
+            # sat below the window). Tie-break on id so one state renders one order.
+            kind_records = sorted(self.entries[kind].values(), key=lambda entry: entry.id)
+            kind_records.sort(key=_search_recency, reverse=True)
+            records = kind_records[:max_entries_per_kind]
             lines.append(f"{kind}: {len(self.entries[kind])}")
             for entry in records:
                 summary = _flatten_inline(entry.content)
@@ -1280,7 +1287,16 @@ class HarnessState:
                 )
             overflow = len(self.entries[kind]) - len(records)
             if overflow > 0:
-                lines.append(f"  - +{overflow} more")
+                # A bare count hides which entries fell out of the window; name every
+                # hidden one with id + title only (no content, so the catalog stays
+                # cheap), so the model can pull one explicitly with get() instead of
+                # reading a truncated digest as the whole store.
+                lines.append(f"  - +{overflow} more (id + title only; fetch with get):")
+                for entry in kind_records[max_entries_per_kind:]:
+                    catalog_title = _flatten_inline(entry.title)
+                    if len(catalog_title) > 120:
+                        catalog_title = f"{catalog_title[:117]}..."
+                    lines.append(f"    - [{entry.scope}:{_flatten_inline(entry.id)}] {catalog_title}")
         if self.refinements:
             lines.append(f"refinements: {len(self.refinements)}")
             for event in self.refinements[-5:]:

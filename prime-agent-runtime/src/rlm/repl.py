@@ -1142,6 +1142,19 @@ def _snapshot_state(
             skipped.append({"name": repr(name), "reason": "non-string namespace key is not a persistable name"})
             continue
         if name.startswith("_") or name in _ALWAYS_SKIP:
+            # A leading underscore is the private-name convention: the snapshot never
+            # persists such a name, but a user who bound one may still expect it back
+            # after a restart, so report it like every other skipped name instead of
+            # dropping it silently. Dunder names (__name__ and friends) are module
+            # bookkeeping present in every namespace, and the _ALWAYS_SKIP names are
+            # kernel-installed helpers; reporting either would be noise, not signal.
+            if name.startswith("_") and not (name.startswith("__") and name.endswith("__")):
+                skipped.append(
+                    {
+                        "name": name,
+                        "reason": "private-name convention: leading-underscore names are not persisted",
+                    }
+                )
             continue
         value = ns.get(name, missing)
         if value is missing:

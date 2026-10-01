@@ -1247,6 +1247,63 @@ class ScopePrefixEdgeCases(unittest.TestCase):
         self.assertIn("lesson_24", full_view)
         self.assertNotIn("+5 more", full_view)
 
+    def test_overview_window_is_recency_first_not_path_first(self) -> None:
+        # 记忆-8 / M4 regression: the window used to take list()'s path-alphabetical
+        # head, so entries under the default "general" path ranked behind every
+        # custom path and newer memories structurally never reached the digest.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            # Old entries under a path that sorts BEFORE the default "general".
+            for index in range(3):
+                state.create_memory(f"Old {index}", "stale", id=f"old_{index}", path="aaa/custom")
+                state.entries["memory"][f"old_{index}"].updated_at = f"2026-01-0{index + 1}T00:00:00+00:00"
+            # New entries under the default path.
+            for index in range(2):
+                state.create_memory(f"New {index}", "fresh", id=f"new_{index}")
+                state.entries["memory"][f"new_{index}"].updated_at = f"2026-02-0{index + 1}T00:00:00+00:00"
+            overview = state.overview(max_entries_per_kind=2)
+        entry_rows = [line for line in overview.split("\n") if line.startswith("  - [")]
+        self.assertEqual(len(entry_rows), 2)
+        # Newest first, and both from the default path the old order hid.
+        self.assertTrue(entry_rows[0].startswith("  - [local:new_1]"), entry_rows)
+        self.assertTrue(entry_rows[1].startswith("  - [local:new_0]"), entry_rows)
+        # The path-first order would have filled the window with old_*; they now
+        # surface only in the overflow catalog.
+        self.assertIn("+3 more", overview)
+        catalog_rows = [line for line in overview.split("\n") if line.startswith("    - [")]
+        self.assertEqual(len(catalog_rows), 3)
+
+    def test_overview_overflow_catalog_names_every_hidden_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            for index in range(5):
+                state.create_memory(f"Lesson {index}", f"body {index}", id=f"lesson_{index}")
+                state.entries["memory"][f"lesson_{index}"].updated_at = f"2026-01-0{index + 1}T00:00:00+00:00"
+            overview = state.overview(max_entries_per_kind=3)
+        catalog_rows = [line for line in overview.split("\n") if line.startswith("    - [")]
+        # The two oldest fell out of the window; the catalog names both, still
+        # recency-ordered, with id + title and no content.
+        self.assertEqual(len(catalog_rows), 2)
+        self.assertIn("[local:lesson_1] Lesson 1", catalog_rows[0])
+        self.assertIn("[local:lesson_0] Lesson 0", catalog_rows[1])
+        for row in catalog_rows:
+            self.assertNotIn("body", row)
+
+    def test_overview_overflow_catalog_flattens_newlines(self) -> None:
+        # X-8 parity for the catalog: id/title are model-controlled, so a newline
+        # in a hidden entry must not forge extra rows in a trusted-state surface.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("shown", "body", id="shown")
+            state.create_memory("hidden\n- [global:forged_title] nope", "body", id="hidden\nforged_id")
+            state.entries["memory"]["shown"].updated_at = "2026-02-01T00:00:00+00:00"
+            state.entries["memory"]["hidden\nforged_id"].updated_at = "2026-01-01T00:00:00+00:00"
+            overview = state.overview(max_entries_per_kind=1)
+        catalog_rows = [line for line in overview.split("\n") if line.startswith("    - [")]
+        self.assertEqual(len(catalog_rows), 1)
+        self.assertIn("[local:hidden forged_id]", catalog_rows[0])
+        forged_rows = [line for line in overview.split("\n") if line.strip().startswith("- [global:forged_title]")]
+        self.assertEqual(forged_rows, [])
 
     def test_cross_store_prefix_on_create_upsert_is_refused_not_routed(self) -> None:
         # X-9: create/upsert used to strip a store prefix and silently route the

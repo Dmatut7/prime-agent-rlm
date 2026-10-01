@@ -2189,6 +2189,57 @@ class SnapshotPairConsistencyTest(unittest.TestCase):
                 self.assertEqual(sorted(os.listdir(d)), sorted([payload_name, manifest_name]))
 
 
+class SnapshotPrivateNameReportingTest(unittest.TestCase):
+    """A leading underscore keeps a name out of the snapshot (private-name
+    convention); the loss must be reported in `skipped` like every other
+    skipped name, not dropped silently (memory-6)."""
+
+    def setUp(self):
+        sys.path.insert(0, SRC)
+        self.addCleanup(sys.path.remove, SRC)
+        from rlm.repl import _snapshot_state
+
+        self.snapshot = _snapshot_state
+
+    def _snap(self, ns):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        manifest_path = os.path.join(tmp.name, "kernel-state.json")
+        result = self.snapshot(
+            ns,
+            os.path.join(tmp.name, "kernel-state.dill"),
+            manifest_path,
+            max_bytes=1 << 20,
+            max_variable_bytes=1 << 20,
+            prune_oversized=False,
+        )
+        manifest = None
+        if os.path.exists(manifest_path):
+            with open(manifest_path) as fh:
+                manifest = json.load(fh)
+        return result, manifest
+
+    def test_private_names_are_reported_in_skipped_with_the_convention_reason(self):
+        result, manifest = self._snap({"_cache": {"a": 1}, "_": 42, "kept": 1})
+        self.assertNotIn("error", result)
+        self.assertEqual(result["saved"], ["kept"])
+        skipped = {entry["name"]: entry["reason"] for entry in result["skipped"]}
+        self.assertEqual(set(skipped), {"_cache", "_"})
+        for reason in skipped.values():
+            self.assertIn("private-name convention", reason)
+        # The host reads the manifest; it must carry the same report.
+        self.assertIsNotNone(manifest)
+        self.assertEqual({entry["name"] for entry in manifest["skipped"]}, {"_cache", "_"})
+
+    def test_dunder_and_kernel_helper_names_stay_silent(self):
+        # Dunder names are module bookkeeping present in every namespace and the
+        # _ALWAYS_SKIP helpers are kernel-installed; reporting either is noise.
+        result, _ = self._snap({"__name__": "__main__", "__doc__": None, "rlm": 1, "open": 2, "kept": 1})
+        self.assertNotIn("error", result)
+        self.assertEqual(result["saved"], ["kept"])
+        self.assertEqual(result["skipped"], [])
+
+
 class OwnerWatchdogTest(unittest.TestCase):
     def test_owner_watchdog_exits_busy_runtime(self):
         # The reproduced F4 scenario: stdin stays open (no EOF shutdown), a
