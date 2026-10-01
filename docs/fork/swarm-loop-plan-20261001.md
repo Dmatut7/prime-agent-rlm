@@ -205,3 +205,19 @@ orchestrator-workers + 确定性 gate；子代理任务书必须含目标/输出
 - W5-C 遗留：PI_DISABLE_CLAUDE_CODE_DETECTION 未写进 args.ts env 文档与 packages/ai/README。
 - 记忆-7（后台线程脏追踪）、显示-调研（终端宽度画像+mode 2027，需设计）。
 - 智能-4 边角（aborted 回合不占「最近」名额）、智能-5（prompt 禁 .get() 与运行时矛盾）。
+
+- 2026-10-01 波次 6（再审驱动）：5 批完成。再审集群（3 路）带回 7 条新发现 + 核销 5 条已失效登记。结果摘要：
+  - W6-A：finish gate 逃逸链两环修复——strikes 不再被任意 toolResult 清零（主对抗路径「跑检查→红→照样宣称完成」现在 2 次追问后落放行记录）；预算耗尽路径补 finish_gate_released 记录+通知（cause: budget_exhausted）；重试定时器 dispose 半侧封口（dispose 时 abort retry controller + _disposed 守卫）；quotaResumeAt 写侧（真实额度重置时间独立于探针时间）。
+  - W6-B：R3-1 幽灵 stall bar 跨会话吞 Esc 误中断新会话（会话切换时清理 stallActionBar+诊断监听）；R3-2 quota_park_status 进 sessionEventQueue 保序；R3-4 re-park 打提示行 + chip 带「第 N 次」；R3-6 chat cap floor 棘轮改滞后余量；R3-7 legacy+telemetry=off 时 park 钉住 statusContainer 行。
+  - W6-C：attach/快照带 park 状态（capability-gated 可选字段，schema rev 42→43，digest 重算）+ attach 后立即 force announce（60s 盲区闭合）；readQuotaParkStatus 优先 quotaResumeAt；daemon.md 恢复契约重写。
+  - W6-D：sweep 类序调整（total-cap backstop 排到 child-transcripts 后）；bash-temp 年龄遍按 mtime 最旧先收；total-cap 跳过零字节候选。
+  - W6-E：rlm.ts prompt 的 .get() 禁令改为「属性优先、.get() 亦可」（与运行时 _RecordAccess 对齐，加双向漂移 pin）；记忆-7 后台线程脏追踪：_replayable_snapshot 存活用户线程 veto + 内核线程登记表；PI_DISABLE_CLAUDE_CODE_DETECTION 进 README/providers 文档。
+- 2026-10-01 CI 转绿：run 36861026576 success。失败演化：0.11.18 预存红（tl-in-timeline）→ 波次1/2 引入的测试适配滞后（19 条峰值）→ 波次4修 17 条 + input-classification pin → 波次5 全绿。
+
+### 波次 6 跨批依赖（波次 7 处理）
+
+1. client 侧接 snapshot 的 quotaPark 字段：daemon-agent-connection.ts capabilities 加 quota_park_status、AgentConnectionSnapshot 镜像、interactive 侧 attach 后播种倒计时（事件层盲区已先闭合，此条是快照正典通道）。
+2. repl.md:415-437 同步（存活线程 veto 后旧表述过时）；effects.py 的 rlm-change-* 线程登记（需 lazy import 防环）。
+3. args.ts env 文档补 PI_DISABLE_CLAUDE_CODE_DETECTION。
+4. R3-5 重放双实现收敛（buildConversationComponents 生产零调用，需设计：生产重放改用 builder 或抽共享函数）——留波次 7 设计+实施。
+5. 再审1-#7（worker-recovery marker 双重排队窄窗口，P3 备查）。
