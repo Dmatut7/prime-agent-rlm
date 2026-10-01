@@ -987,6 +987,10 @@ const INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT = 400;
 // past this component cap, rebuild it through the initial-render window so a long
 // session's transcript stays bounded in memory.
 const LIVE_CHAT_COMPONENT_LIMIT = 800;
+// Slack above a post-rebuild floor: when the rendered window itself stays over
+// the cap, the floor parks the trigger past the current tree size plus this
+// margin, so growth retriggers a rebuild once per margin instead of every turn.
+const LIVE_CHAT_CAP_FLOOR_HYSTERESIS = 200;
 
 function initialRenderMessages(messages: AgentMessage[]): AgentMessage[] {
 	if (messages.length <= INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT) {
@@ -1575,7 +1579,12 @@ export class InteractiveMode {
 	private pendingToolGeneration = 0;
 	/** The chat tree currently shows a windowed tail instead of the full transcript. */
 	private chatTranscriptTrimmed = false;
-	/** Component count left by the last cap rebuild; prevents re-trimming a window that is itself over the cap. */
+	/**
+	 * Rebuild trigger floor: when the last cap rebuild still left the window over
+	 * the cap, the trigger parks at that size plus a hysteresis margin so a window
+	 * that cannot shrink is not re-trimmed on every settle. 0 while a rebuild
+	 * landed under the cap (ordinary growth re-triggers at the cap itself).
+	 */
 	private chatCapRebuildFloor = 0;
 	private chatCapRebuildInFlight = false;
 	private toolDefinitionCache = new Map<string, ToolExecutionDefinition | undefined>();
@@ -1698,6 +1707,8 @@ export class InteractiveMode {
 	 */
 	private quotaPark: { resumeAtMs?: number; parkCount?: number; provider?: string } | undefined = undefined;
 	private quotaParkTicker: ReturnType<typeof setInterval> | undefined = undefined;
+	/** The pinned status-container row for the one face with no countdown line (legacy + footer.telemetry off). */
+	private quotaParkStatusRow: Component | undefined = undefined;
 	private traceUploadAllAbortController: AbortController | undefined = undefined;
 
 	private readonly queueSelection = new QueueSelection();
@@ -1888,6 +1899,7 @@ export class InteractiveMode {
 				const [fullest] = quotaParkForms({
 					...(park.resumeAtMs !== undefined ? { remainingMs: park.resumeAtMs - Date.now() } : {}),
 					...(park.provider !== undefined ? { provider: park.provider } : {}),
+					...(park.parkCount !== undefined ? { parkCount: park.parkCount } : {}),
 				});
 				if (fullest) chips.push(fullest);
 			}
@@ -3824,6 +3836,12 @@ export class InteractiveMode {
 		// Same for a retry countdown or a compaction loader from the session being
 		// replaced: both keep an interval running that nothing in the next view owns.
 		this.disposeTransientStatusOverlays();
+		// A stall bar belongs to the session that stalled, input route included:
+		// left mounted, the old bar swallows the next session's first Esc as an
+		// interrupt for a turn that no longer exists. The diagnostics close key
+		// goes with it; its block was already dropped with the chat above.
+		this.removeStallActionBar({ render: false });
+		this.releaseStallDiagnostics();
 		this.pendingBashComponents = [];
 		this.activityTracker.reset();
 		this.contextUsageTokenBaseline = 0;
@@ -6357,7 +6375,16 @@ export class InteractiveMode {
 					this.patchConnectionState({ recap: event.recap });
 					this.renderRecap();
 				} else if (event.type === "quota_park_status") {
-					this.handleQuotaParkStatus(event);
+					// Applied through the same queue as the session events it races
+					// with (auto_retry_end, agent_start): in arrival order, never
+					// ahead of them, and a park announced for the session being
+					// replaced never lands on the new view.
+					const generation = this.sessionEventGeneration;
+					const run = this.sessionEventQueue.then(() =>
+						generation === this.sessionEventGeneration ? this.handleQuotaParkStatus(event) : undefined,
+					);
+					this.sessionEventQueue = run.catch(() => {});
+					await run;
 				} else if (event.type === "side_question_event") {
 					this.handleSideQuestionEvent(event.event);
 				} else if (event.type === "extension_ui_request") {
@@ -7892,10 +7919,12 @@ export class InteractiveMode {
 
 	/**
 	 * A quota_park_status heartbeat from the daemon (中断-10): remember the active
-	 * park so the status bar can count the wake down, and say it once in the chat
-	 * when a park begins. The event is unsequenced and self-healing - each tick
-	 * re-states the whole park, so the latest one wins and none is ever missed
-	 * for long.
+	 * park so the status bar can count the wake down, and say it in the chat when
+	 * a park begins - and again when a re-park pushes the wake further out. The
+	 * daemon's heartbeat is unsequenced and self-healing (each tick re-states the
+	 * whole park, so the latest one wins); the subscription funnels it through
+	 * the session event queue so it applies in arrival order against the session
+	 * events it races with (auto_retry_end, agent_start).
 	 */
 	private handleQuotaParkStatus(event: {
 		parked: boolean;
@@ -7911,26 +7940,41 @@ export class InteractiveMode {
 			return;
 		}
 		const resumeAtMs = event.resumeAt !== undefined ? Date.parse(event.resumeAt) : Number.NaN;
-		const began = this.quotaPark === undefined;
+		const nextResumeAtMs = Number.isFinite(resumeAtMs) ? resumeAtMs : undefined;
+		const previousPark = this.quotaPark;
+		const began = previousPark === undefined;
 		this.quotaPark = {
-			...(Number.isFinite(resumeAtMs) ? { resumeAtMs } : {}),
+			...(nextResumeAtMs !== undefined ? { resumeAtMs: nextResumeAtMs } : {}),
 			...(event.parkCount !== undefined ? { parkCount: event.parkCount } : {}),
 			...(event.provider !== undefined ? { provider: event.provider } : {}),
 		};
 		if (this.quotaParkTicker === undefined) {
 			// One frame a second, like the retry countdown; the ticker dies with the
-			// park (clearQuotaPark) and never holds the process open.
-			this.quotaParkTicker = setInterval(() => this.ui.requestRender(), 1000);
+			// park (clearQuotaPark) and never holds the process open. The sync in
+			// the tick re-pins the legacy park row if another status-container
+			// owner (a retry or compaction loader) cleared it mid-park.
+			this.quotaParkTicker = setInterval(() => {
+				this.syncQuotaParkStatusRow();
+				this.ui.requestRender();
+			}, 1000);
 			this.quotaParkTicker.unref?.();
 		}
-		if (began) {
+		// A re-park that pushes the wake out (or gives a wake time to a park that
+		// had none) is news too; steady heartbeats re-stating the same wake are
+		// not. showStatus merges back-to-back notices into the one line.
+		const wakeMovedOut =
+			!began &&
+			nextResumeAtMs !== undefined &&
+			(previousPark.resumeAtMs === undefined || nextResumeAtMs > previousPark.resumeAtMs);
+		if (began || wakeMovedOut) {
 			const countdown =
-				this.quotaPark.resumeAtMs !== undefined
-					? `，约 ${formatLiveClock(Math.max(0, this.quotaPark.resumeAtMs - Date.now()))}后自动恢复`
+				nextResumeAtMs !== undefined
+					? `，约 ${formatLiveClock(Math.max(0, nextResumeAtMs - Date.now()))}后自动恢复`
 					: "";
 			const count = event.parkCount !== undefined && event.parkCount > 1 ? `（本段第 ${event.parkCount} 次）` : "";
 			this.showStatus(`额度已用完，会话挂起等额度恢复${countdown}${count}。`, "warning");
 		}
+		this.syncQuotaParkStatusRow();
 		this.ui.requestRender();
 	}
 
@@ -7940,6 +7984,44 @@ export class InteractiveMode {
 		if (this.quotaParkTicker !== undefined) {
 			clearInterval(this.quotaParkTicker);
 			this.quotaParkTicker = undefined;
+		}
+		this.syncQuotaParkStatusRow();
+	}
+
+	/**
+	 * The park countdown rides the quiet status bar or the legacy watermark line
+	 * (the footer's activity chip), but the legacy face with `footer.telemetry`
+	 * off renders neither - a park there had no persistent indicator at all.
+	 * Pin one row in the status container for that combination instead; its text
+	 * is recomputed per render, so the park ticker counts it down.
+	 */
+	private syncQuotaParkStatusRow(): void {
+		const pinned =
+			this.quotaPark !== undefined && !quietConversation(this) && this.getFooterTelemetrySource().mode === "off";
+		if (!pinned) {
+			if (this.quotaParkStatusRow !== undefined) {
+				this.statusContainer.removeChild(this.quotaParkStatusRow);
+				this.quotaParkStatusRow = undefined;
+			}
+			return;
+		}
+		if (this.quotaParkStatusRow === undefined) {
+			this.quotaParkStatusRow = {
+				render: (width: number) => {
+					const park = this.quotaPark;
+					if (park === undefined) return [];
+					const [fullest] = quotaParkForms({
+						...(park.resumeAtMs !== undefined ? { remainingMs: park.resumeAtMs - Date.now() } : {}),
+						...(park.provider !== undefined ? { provider: park.provider } : {}),
+						...(park.parkCount !== undefined ? { parkCount: park.parkCount } : {}),
+					});
+					return [truncateToWidth(fullest ?? "额度等待", Math.max(1, width), "")];
+				},
+				invalidate: () => {},
+			};
+		}
+		if (!this.statusContainer.children.includes(this.quotaParkStatusRow)) {
+			this.statusContainer.addChild(this.quotaParkStatusRow);
 		}
 	}
 
@@ -8016,6 +8098,7 @@ export class InteractiveMode {
 				quotaParkForms({
 					...(park.resumeAtMs !== undefined ? { remainingMs: park.resumeAtMs - Date.now() } : {}),
 					...(park.provider !== undefined ? { provider: park.provider } : {}),
+					...(park.parkCount !== undefined ? { parkCount: park.parkCount } : {}),
 				}),
 			);
 		}
@@ -9148,7 +9231,14 @@ export class InteractiveMode {
 			const context = await this.agentConnection.getSessionContext();
 			if (this.liveChatCapBlocked()) return;
 			await this.renderSessionContext(context, { clearChat: true, limitTranscript: true });
-			this.chatCapRebuildFloor = this.chatContainer.children.length;
+			// The window itself can still sit over the cap (one huge turn fills it):
+			// ratchet the floor past it, with hysteresis, so the next rebuild waits
+			// for real growth instead of re-trimming on every settle. A rebuild
+			// that lands under the cap clears the floor - ordinary growth
+			// re-triggers at the cap itself.
+			const settledCount = this.chatContainer.children.length;
+			this.chatCapRebuildFloor =
+				settledCount > LIVE_CHAT_COMPONENT_LIMIT ? settledCount + LIVE_CHAT_CAP_FLOOR_HYSTERESIS : 0;
 			this.ui.requestRender();
 		} catch (error) {
 			this.showError(
@@ -9459,6 +9549,8 @@ export class InteractiveMode {
 	private removeStallActionBar(options: { render?: boolean } = {}): void {
 		this.stallActionBarEvent = undefined;
 		this.stallActionBarSettled = false;
+		this.stallActionBarMountedAt = undefined;
+		this.stallActionBarActivityAt = undefined;
 		const bar = this.stallActionBar;
 		if (bar === undefined) return;
 		this.stallActionBar = undefined;

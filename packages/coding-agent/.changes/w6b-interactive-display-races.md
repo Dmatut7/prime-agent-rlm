@@ -1,0 +1,5 @@
+- Fixed a replaced session's stall action bar and diagnostics key surviving the switch: the old bar no longer swallows the new session's first Esc as a bogus interrupt.
+- Fixed the quota-park countdown racing queued session events (double countdowns, flickering error state on lift): park heartbeats now apply in session-event order, and a park announced for a replaced session never lands on the new view.
+- Added a chat notice when a quota re-park pushes the wake time further out, and the park countdown now carries the episode count (第 N 次).
+- Fixed the live chat transcript cap re-trimming on every turn when one render window alone exceeds the cap: the rebuild trigger now parks with hysteresis and releases once a rebuild fits again.
+- Added a persistent park countdown row for the legacy face with footer telemetry off, which previously had no park indicator at all.

@@ -1650,8 +1650,31 @@ describe("InteractiveMode pending bash components", () => {
 			// real clearQuotaPark, so its ticker cannot tick into the next session's view.
 			quotaPark: { resumeAtMs: Date.now() + 60_000 } as { resumeAtMs?: number } | undefined,
 			quotaParkTicker: 1 as unknown as ReturnType<typeof setInterval> | undefined,
+			quotaParkStatusRow: undefined,
+			statusContainer: new Container(),
 			clearQuotaPark(this: unknown): void {
 				(InteractiveMode.prototype as unknown as { clearQuotaPark(this: unknown): void }).clearQuotaPark.call(this);
+			},
+			syncQuotaParkStatusRow(this: unknown): void {
+				(
+					InteractiveMode.prototype as unknown as { syncQuotaParkStatusRow(this: unknown): void }
+				).syncQuotaParkStatusRow.call(this);
+			},
+			// The stall action bar and its diagnostics close key are session-scoped
+			// the same way: the reset tears them down through the real methods.
+			stallActionBar: undefined,
+			stallDiagnosticsPanel: undefined,
+			removeStallActionBar(this: unknown, options?: { render?: boolean }): void {
+				(
+					InteractiveMode.prototype as unknown as {
+						removeStallActionBar(this: unknown, options?: { render?: boolean }): void;
+					}
+				).removeStallActionBar.call(this, options);
+			},
+			releaseStallDiagnostics(this: unknown): void {
+				(
+					InteractiveMode.prototype as unknown as { releaseStallDiagnostics(this: unknown): void }
+				).releaseStallDiagnostics.call(this);
 			},
 			disposeTransientStatusOverlays(this: unknown): void {
 				(

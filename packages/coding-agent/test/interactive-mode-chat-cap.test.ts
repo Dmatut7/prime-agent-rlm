@@ -40,6 +40,8 @@ type CapHarness = {
 	chatTranscriptTrimmed: boolean;
 	chatCapRebuildFloor: number;
 	chatCapRebuildInFlight: boolean;
+	/** Set by a test to stub the rebuild body; absent, the prototype's real method runs. */
+	renderSessionContext?: (context: AgentConnectionSessionContext, options?: unknown) => Promise<void>;
 	editor: { addToHistory?: (text: string) => void };
 	footer: { invalidate: () => void };
 	settingsManager: {
@@ -234,7 +236,8 @@ describe("InteractiveMode live chat component cap", () => {
 		expect(harness.chatContainer.children.length).toBeLessThanOrEqual(LIVE_CHAT_COMPONENT_LIMIT);
 		expect(harness.chatContainer.children.length).toBeGreaterThan(0);
 		expect(harness.chatTranscriptTrimmed).toBe(true);
-		expect(harness.chatCapRebuildFloor).toBe(harness.chatContainer.children.length);
+		// A rebuild that lands under the cap clears the floor: the cap itself is the trigger again.
+		expect(harness.chatCapRebuildFloor).toBe(0);
 
 		// Windowed rebuild keeps toolCall/toolResult pairing: every rendered tool
 		// component got its result, and user/assistant messages rendered too.
@@ -245,20 +248,72 @@ describe("InteractiveMode live chat component cap", () => {
 		expect(childComponents(harness.chatContainer, UserMessageComponent).length).toBeGreaterThan(0);
 	});
 
-	test("a second settle does not re-trim a windowed tree at its floor", async () => {
+	test("a second settle on a trimmed tree under the cap does not re-trim", async () => {
 		const harness = createCapHarness();
 		fillOverCap(harness.chatContainer);
 		await proto.enforceChatComponentCap.call(harness);
 		const boundedCount = harness.chatContainer.children.length;
+		expect(boundedCount).toBeLessThanOrEqual(LIVE_CHAT_COMPONENT_LIMIT);
 		const getSessionContext = harness.agentConnection.getSessionContext as ReturnType<typeof vi.fn>;
 		getSessionContext.mockClear();
 
-		// Still over the raw cap (floor above it), but no rebuild loop.
-		if (boundedCount > LIVE_CHAT_COMPONENT_LIMIT) {
-			await proto.enforceChatComponentCap.call(harness);
-			expect(getSessionContext).not.toHaveBeenCalled();
-		}
+		await proto.enforceChatComponentCap.call(harness);
+
+		expect(getSessionContext).not.toHaveBeenCalled();
 		expect(harness.chatContainer.children.length).toBe(boundedCount);
+	});
+
+	test("a window that stays over the cap ratchets the floor with hysteresis instead of re-trimming every settle", async () => {
+		// The render window itself cannot get this session under the cap (one huge
+		// turn fills it): the floor parks the trigger past the tree plus slack.
+		const overCapCount = LIVE_CHAT_COMPONENT_LIMIT + 50;
+		const harness = createCapHarness();
+		harness.renderSessionContext = vi.fn(async () => {
+			harness.chatContainer.clear();
+			fillOverCap(harness.chatContainer, overCapCount);
+		});
+		fillOverCap(harness.chatContainer);
+
+		await proto.enforceChatComponentCap.call(harness);
+
+		// Mirrors LIVE_CHAT_CAP_FLOOR_HYSTERESIS in interactive-mode.ts.
+		expect(harness.chatCapRebuildFloor).toBe(overCapCount + 200);
+		const getSessionContext = harness.agentConnection.getSessionContext as ReturnType<typeof vi.fn>;
+		getSessionContext.mockClear();
+
+		// Growth inside the hysteresis band does not re-trim...
+		fillOverCap(harness.chatContainer, 150);
+		await proto.enforceChatComponentCap.call(harness);
+		expect(getSessionContext).not.toHaveBeenCalled();
+
+		// ...and growth past it triggers exactly one rebuild.
+		fillOverCap(harness.chatContainer, 100);
+		await proto.enforceChatComponentCap.call(harness);
+		expect(getSessionContext).toHaveBeenCalledTimes(1);
+		expect(harness.chatCapRebuildFloor).toBe(overCapCount + 200);
+	});
+
+	test("a rebuild that lands back under the cap clears a stale ratchet floor", async () => {
+		const harness = createCapHarness();
+		harness.renderSessionContext = vi.fn(async () => {
+			harness.chatContainer.clear();
+			fillOverCap(harness.chatContainer, LIVE_CHAT_COMPONENT_LIMIT - 10);
+		});
+		// A ratchet from an earlier over-cap window would otherwise keep the
+		// trigger parked above the cap forever.
+		harness.chatCapRebuildFloor = 5000;
+		fillOverCap(harness.chatContainer, 5100);
+
+		await proto.enforceChatComponentCap.call(harness);
+
+		expect(harness.chatCapRebuildFloor).toBe(0);
+		const getSessionContext = harness.agentConnection.getSessionContext as ReturnType<typeof vi.fn>;
+		getSessionContext.mockClear();
+
+		// Ordinary growth re-triggers at the cap itself, not at the old floor.
+		fillOverCap(harness.chatContainer, 5);
+		await proto.enforceChatComponentCap.call(harness);
+		expect(getSessionContext).not.toHaveBeenCalled();
 	});
 
 	test("does not trim while a permission confirmation is active", async () => {

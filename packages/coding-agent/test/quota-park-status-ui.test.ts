@@ -46,6 +46,24 @@ describe("quotaParkForms", () => {
 		expect(forms).toEqual(["额度等待（恢复时间未知）", "额度等待"]);
 	});
 
+	it("adds the episode count on a re-park (第 N 次), provider first, count last", () => {
+		const forms = quotaParkForms({ remainingMs: 65 * 60 * 1000, provider: "anthropic", parkCount: 3 }).map(stripAnsi);
+		expect(forms[0]).toBe("额度等待 anthropic · 1小时05分后恢复 · 第 3 次");
+		expect(forms[1]).toBe("额度等待 · 1小时05分后恢复 · 第 3 次");
+		expect(forms[2]).toBe("额度等待 · 第 3 次");
+	});
+
+	it("omits the count on a first park and keeps it on an unknown wake", () => {
+		expect(quotaParkForms({ remainingMs: 45_000, parkCount: 1 }).map(stripAnsi)).toEqual([
+			"额度等待 · 45秒后恢复",
+			"额度等待",
+		]);
+		expect(quotaParkForms({ parkCount: 2 }).map(stripAnsi)).toEqual([
+			"额度等待（恢复时间未知） · 第 2 次",
+			"额度等待 · 第 2 次",
+		]);
+	});
+
 	it("keeps every status-bar layout within the width it claims (visibleWidth, narrow tier)", () => {
 		const right = quotaParkForms({ remainingMs: 3_600_000, provider: "anthropic" });
 		for (const width of [120, 60, 40, 24, 12]) {

@@ -244,20 +244,22 @@ export function finishedRunForms(input: FinishedRunInput): string[] {
  * quota reset (中断-10), fullest form first: `额度等待 · 1小时05分后恢复`. The
  * park ended the failed turn, so these forms replace the run's working/finished
  * forms for as long as the park lasts; the daemon's heartbeat re-anchors the
- * absolute resume time, and the renderer recomputes the remainder per frame.
+ * absolute resume time, and the renderer recomputes the remainder per frame. A
+ * re-park within one episode adds its count: `· 第 3 次`.
  */
-export function quotaParkForms(input: { remainingMs?: number; provider?: string }): string[] {
+export function quotaParkForms(input: { remainingMs?: number; provider?: string; parkCount?: number }): string[] {
 	const paint = (text: string) => theme.fg("warning", text);
 	const provider = input.provider?.trim();
 	const head = provider ? `额度等待 ${provider}` : "额度等待";
+	const count = input.parkCount !== undefined && input.parkCount > 1 ? ` · 第 ${input.parkCount} 次` : "";
 	if (input.remainingMs === undefined) {
 		// A parked session without a persisted park entry (in-memory session) has no
 		// wake time to count down to.
-		return [paint(`${head}（恢复时间未知）`), paint(head)];
+		return [paint(`${head}（恢复时间未知）${count}`), paint(`${head}${count}`)];
 	}
 	// Clamped at 0: a wake firing right now is "resuming", not overdue.
 	const tail = input.remainingMs <= 0 ? "正在恢复" : `${formatLiveClock(input.remainingMs)}后恢复`;
-	return [paint(`${head} · ${tail}`), paint(`额度等待 · ${tail}`), paint("额度等待")].filter(
+	return [paint(`${head} · ${tail}${count}`), paint(`额度等待 · ${tail}${count}`), paint(`额度等待${count}`)].filter(
 		(form, index, all) => all.indexOf(form) === index,
 	);
 }

@@ -27,6 +27,12 @@ type HandleEvent = (this: ModeFake, event: AgentConnectionSessionEvent) => Promi
 
 const handleEvent = (InteractiveMode.prototype as unknown as { handleEvent: HandleEvent }).handleEvent;
 
+type ResetCurrentSessionRenderState = (this: ModeFake, options?: { clearPromptStash?: boolean }) => void;
+
+const resetCurrentSessionRenderState = (
+	InteractiveMode.prototype as unknown as { resetCurrentSessionRenderState: ResetCurrentSessionRenderState }
+).resetCurrentSessionRenderState;
+
 function stallWarning(overrides: Partial<StallWarningEvent> = {}): StallWarningEvent {
 	return {
 		type: "stall_warning",
@@ -127,6 +133,40 @@ describe("InteractiveMode stall action bar lifecycle", () => {
 		};
 		Object.setPrototypeOf(fake, InteractiveMode.prototype);
 		return fake;
+	}
+
+	/**
+	 * The fields resetCurrentSessionRenderState touches beyond the stall bar's
+	 * own: stubbed to no-ops so the reset runs its real teardown against a real
+	 * chat container, the same shape as interactive-mode-interrupt-teardown's
+	 * sessionResetFake.
+	 */
+	function addSessionResetStubs(mode: ModeFake): void {
+		const editor = mode.editor as Record<string, unknown>;
+		editor.setText = () => {};
+		editor.clearHistory = () => {};
+		Object.assign(mode, {
+			endFeatureHintRun: () => {},
+			shortcutGuideContainer: new Container(),
+			pendingMessagesContainer: new Container(),
+			queuedMessagesContainer: new Container(),
+			queueSelection: { reset: () => "" },
+			// The promptStash accessor pair lives on the prototype; backing it with
+			// a real state object keeps both directions working.
+			promptStashState: { stash: undefined, queuedStashes: undefined },
+			ui: { ...(mode.ui as object), terminal: { abortPendingInput: () => {} } },
+			liveImageMarkerIds: () => new Set<number>(),
+			pastedImages: new Map(),
+			pendingToolCreations: new Set(),
+			activityTracker: { handleEvent: vi.fn(), reset: vi.fn() },
+			renderRecap: vi.fn(),
+			ipythonToolComponents: new Map(),
+			lateIpythonSentAgentMessages: new Map(),
+			resetSubagentSummary: () => {},
+			getGoalState: () => undefined,
+			setGoalAnnouncementBaseline: () => {},
+			syncGoalTray: () => {},
+		});
 	}
 
 	beforeAll(() => {
@@ -409,5 +449,48 @@ describe("InteractiveMode stall action bar lifecycle", () => {
 		// plus the summary and the dismiss note.
 		expect(rendered.split("\n").filter((line) => line.trim().length > 0)).toHaveLength(4);
 		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("session replacement tears the bar and its input route down with the old session (R3-1)", async () => {
+		const mode = createModeFake();
+		addSessionResetStubs(mode);
+		await handleEvent.call(mode, stallWarning());
+		const bar = mode.stallActionBar as StallActions;
+		const barRoute = addInputListener.mock.calls[0]?.[0] as (data: string) => { consume?: boolean } | undefined;
+		expect(renderChat(chatOf(mode))).toContain("中断这一轮");
+
+		const removedBefore = removeInputListener.mock.calls.length;
+		resetCurrentSessionRenderState.call(mode);
+
+		// The bar and its quiet-time reading go with the old session's chat...
+		expect(mode.stallActionBar).toBeUndefined();
+		expect(mode.stallActionBarMountedAt).toBeUndefined();
+		expect(chatOf(mode).children).toHaveLength(0);
+		// ...and its input route is unregistered: without this the dead bar
+		// swallowed the new session's first Esc as an interrupt.
+		expect(removeInputListener.mock.calls.length).toBe(removedBefore + 1);
+		expect(barRoute("\x1b")).toBeUndefined();
+		expect(mode.interruptOrClearInput).not.toHaveBeenCalled();
+		expect(bar.isDismissed).toBe(true);
+	});
+
+	it("session replacement also releases the diagnostics close key (R3-1)", async () => {
+		const mode = createModeFake();
+		addSessionResetStubs(mode);
+		await handleEvent.call(mode, stallWarning());
+		(mode.stallActionBar as StallActions).handleInput("\x19");
+		expect(renderChat(chatOf(mode))).toContain("诊断详情");
+		// Two registrations total: the bar's route, then the close key's.
+		expect(addInputListener).toHaveBeenCalledTimes(2);
+
+		const removedBefore = removeInputListener.mock.calls.length;
+		resetCurrentSessionRenderState.call(mode);
+
+		expect(chatOf(mode).children).toHaveLength(0);
+		// The close key's listener goes too; the bar's own removal already
+		// happened when the diagnostics opened.
+		expect(removeInputListener.mock.calls.length).toBe(removedBefore + 1);
+		const closeRoute = addInputListener.mock.calls.at(-1)?.[0] as (data: string) => { consume?: boolean } | undefined;
+		expect(closeRoute("\x19")).toBeUndefined();
 	});
 });
