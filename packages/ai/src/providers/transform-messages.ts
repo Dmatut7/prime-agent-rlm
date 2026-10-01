@@ -86,7 +86,8 @@ function abortTraceText(errorMessage: string | undefined): string | undefined {
  * An aborted assistant turn replays only what is safe: its text blocks plus a
  * bounded trace of the abort cause. Partial thinking and incomplete tool calls
  * are dropped (replaying them causes API errors), and a turn with neither text
- * nor cause disappears as before.
+ * nor cause disappears unless one of its orphaned tool results materializes a
+ * trace (see the toolResult branch of transformMessages).
  */
 function abortedAssistantTrace(message: AssistantMessage): AssistantMessage | undefined {
 	const textBlocks = message.content.filter(
@@ -99,6 +100,33 @@ function abortedAssistantTrace(message: AssistantMessage): AssistantMessage | un
 		content.push({ type: "text", text: trace });
 	}
 	return { ...message, content };
+}
+
+/**
+ * Bound on one folded tool-result text. Harvested results are already capped at
+ * the producer's 8 KiB; this keeps a replayed transcript from injecting more.
+ */
+const ABORT_TRACE_TOOL_RESULT_TEXT_LIMIT = 8 * 1024;
+
+/**
+ * Text of a tool result orphaned by an aborted turn, folded into the abort trace
+ * so the partial evidence the abort harvest preserved reaches the model after
+ * recovery instead of being dropped with its stripped tool call.
+ */
+function abortedToolResultText(message: ToolResultMessage): string | undefined {
+	const text = message.content
+		.filter((block): block is TextContent => block.type === "text")
+		.map((block) => block.text)
+		.join("\n")
+		.trim();
+	if (text.length === 0) return undefined;
+	// Codepoint-aware truncation, same as the cause trace above.
+	const chars = Array.from(text);
+	const bounded =
+		chars.length <= ABORT_TRACE_TOOL_RESULT_TEXT_LIMIT
+			? text
+			: `${chars.slice(0, ABORT_TRACE_TOOL_RESULT_TEXT_LIMIT - 1).join("")}…`;
+	return `[tool result from aborted turn (${message.toolName})]\n${bounded}`;
 }
 
 /**
@@ -196,6 +224,9 @@ export function transformMessages<TApi extends Api>(
 	const result: Message[] = [];
 	let pendingToolCalls: ToolCall[] = [];
 	let existingToolResultIds = new Set<string>();
+	// The most recent aborted assistant turn, whose stripped tool calls leave the
+	// turn's tool results orphaned: their text folds into this turn's trace.
+	let pendingAbortedTurn: { source: AssistantMessage; trace: AssistantMessage | undefined } | undefined;
 	const insertSyntheticToolResults = () => {
 		if (pendingToolCalls.length > 0) {
 			for (const tc of pendingToolCalls) {
@@ -228,6 +259,7 @@ export function transformMessages<TApi extends Api>(
 
 		if (msg.role === "assistant") {
 			insertSyntheticToolResults();
+			pendingAbortedTurn = undefined;
 
 			// Skip errored assistant messages entirely.
 			// These are incomplete turns that shouldn't be replayed:
@@ -243,10 +275,14 @@ export function transformMessages<TApi extends Api>(
 				// cause (MV-4), so drop it entirely only when there is nothing safe
 				// to keep: partial thinking and incomplete tool calls are still
 				// stripped, because replaying them is what the omission was for.
+				// The results those calls left behind fold into the trace as they
+				// arrive (see the toolResult branch), so the abort harvest is not
+				// silently lost.
 				const abortedTrace = abortedAssistantTrace(assistantMsg);
 				if (abortedTrace) {
 					result.push(abortedTrace);
 				}
+				pendingAbortedTurn = { source: assistantMsg, trace: abortedTrace };
 				continue;
 			}
 
@@ -259,6 +295,21 @@ export function transformMessages<TApi extends Api>(
 			result.push(msg);
 		} else if (msg.role === "toolResult") {
 			if (!pendingToolCalls.some((toolCall) => toolCall.id === msg.toolCallId)) {
+				// A result whose call was stripped with its aborted turn still carries
+				// the partial evidence the abort harvest preserved: fold its text into
+				// the abort trace (materializing one when the turn left neither text
+				// nor cause) instead of dropping it.
+				if (pendingAbortedTurn) {
+					const folded = abortedToolResultText(msg);
+					if (folded !== undefined) {
+						if (!pendingAbortedTurn.trace) {
+							pendingAbortedTurn.trace = { ...pendingAbortedTurn.source, content: [] };
+							result.push(pendingAbortedTurn.trace);
+						}
+						pendingAbortedTurn.trace.content.push({ type: "text", text: folded });
+					}
+					continue;
+				}
 				// Dropping is required (a result without its call is rejected by the API), but it
 				// must not be silent: the caller has to be able to see that the context changed.
 				logger.warn("Dropped a tool result that matches no tool call in the preceding assistant turn", {
@@ -272,6 +323,7 @@ export function transformMessages<TApi extends Api>(
 			result.push(msg);
 		} else if (msg.role === "user") {
 			insertSyntheticToolResults();
+			pendingAbortedTurn = undefined;
 			result.push(msg);
 		} else {
 			result.push(msg);

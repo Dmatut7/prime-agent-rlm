@@ -1530,8 +1530,12 @@ function mapStopReason(reason: Anthropic.Messages.StopReason | string): StopReas
 			return "toolUse";
 		case "refusal":
 			return "error";
-		case "pause_turn": // Stop is good enough -> resubmit
-			return "stop";
+		case "pause_turn":
+			// The server paused a long turn and expects the client to resubmit the
+			// conversation so the model can continue it. Mapping to "length" routes
+			// it into the same truncated-turn continuation as max_tokens instead of
+			// ending the turn as if the model had finished.
+			return "length";
 		case "stop_sequence":
 			return "stop"; // We don't supply stop sequences, so this should never happen
 		case "sensitive": // Content flagged by safety filters (not yet in SDK types)

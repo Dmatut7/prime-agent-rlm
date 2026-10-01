@@ -1,0 +1,4 @@
+- Fixed aborted turns silently dropping harvested partial tool results; their text now folds into the replayed abort trace so the model keeps the evidence after recovery.
+- Fixed Anthropic `pause_turn` mapping to `stop`; it now maps to `length` so a server-paused long turn is continued instead of ended.
+- Fixed OpenAI Responses replay aborting request building on a corrupt thinking signature; it now degrades to the thinking text and logs a diagnostic.
+- Fixed thinking-as-text replay sending assistant content as a content-part array, which made DeepSeek V3.2 via NVIDIA NIM mirror the block structure recursively; it now sends one plain string.

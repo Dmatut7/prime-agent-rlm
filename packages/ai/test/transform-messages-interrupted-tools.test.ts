@@ -54,11 +54,29 @@ describe.each([false, true])("interrupted tool history (cross-provider: %s)", (c
 		return transformMessages(messages, target, (id) => id.replace(/[^a-zA-Z0-9_-]/g, "_"));
 	}
 
-	it.each(["aborted", "error"] as const)("omits results from an %s assistant message", (reason) => {
-		const messages = [user, assistant(reason, "call|1"), toolResult("call|1")];
+	function abortedTraceWith(...foldedResultTexts: string[]): AssistantMessage {
+		return {
+			...assistant("aborted", "call|1"),
+			content: foldedResultTexts.map((text) => ({
+				type: "text" as const,
+				text: `[tool result from aborted turn (fixture_tool)]\n${text}`,
+			})),
+		};
+	}
+
+	it("omits results from an error assistant message", () => {
+		const messages = [user, assistant("error", "call|1"), toolResult("call|1")];
 		const original = structuredClone(messages);
 
 		expect(transform(messages)).toEqual([user]);
+		expect(messages).toEqual(original);
+	});
+
+	it("folds results from an aborted assistant message into a trace instead of dropping them", () => {
+		const messages = [user, assistant("aborted", "call|1"), toolResult("call|1")];
+		const original = structuredClone(messages);
+
+		expect(transform(messages)).toEqual([user, abortedTraceWith("completed")]);
 		expect(messages).toEqual(original);
 	});
 
@@ -69,7 +87,7 @@ describe.each([false, true])("interrupted tool history (cross-provider: %s)", (c
 		expect(transform(messages)).toEqual([user, assistant("toolUse", expectedId), toolResult(expectedId)]);
 	});
 
-	it("omits every result from consecutive interrupted turns", () => {
+	it("folds the aborted turn's results and still omits the errored turn's", () => {
 		const messages = [
 			user,
 			assistant("aborted", "call|1", "call|2"),
@@ -79,16 +97,16 @@ describe.each([false, true])("interrupted tool history (cross-provider: %s)", (c
 			toolResult("call|1"),
 		];
 
-		expect(transform(messages)).toEqual([user]);
+		expect(transform(messages)).toEqual([user, abortedTraceWith("completed")]);
 	});
 
-	it.each(["aborted", "error"] as const)("keeps valid exchanges before and after an %s turn", (reason) => {
+	it("keeps valid exchanges before and after an error turn", () => {
 		const before = [assistant("toolUse", "before|1"), toolResult("before|1")];
 		const retry = [assistant("toolUse", "call|1"), toolResult("call|1", "retry completed")];
 		const messages = [
 			user,
 			...before,
-			assistant(reason, "call|1", "call|2"),
+			assistant("error", "call|1", "call|2"),
 			toolResult("call|1", "interrupted result"),
 			user,
 			...retry,
@@ -96,6 +114,24 @@ describe.each([false, true])("interrupted tool history (cross-provider: %s)", (c
 		];
 
 		expect(transform(messages)).toEqual(transform([user, ...before, user, ...retry]));
+	});
+
+	it("keeps valid exchanges around an aborted turn and folds its result into the trace", () => {
+		const before = [assistant("toolUse", "before|1"), toolResult("before|1")];
+		const retry = [assistant("toolUse", "call|1"), toolResult("call|1", "retry completed")];
+		const messages = [
+			user,
+			...before,
+			assistant("aborted", "call|1", "call|2"),
+			toolResult("call|1", "interrupted result"),
+			user,
+			...retry,
+			toolResult("call|2", "late interrupted result"),
+		];
+
+		const clean = transform([user, ...before, user, ...retry]);
+		const expected = [...clean.slice(0, 3), abortedTraceWith("interrupted result"), ...clean.slice(3)];
+		expect(transform(messages)).toEqual(expected);
 	});
 });
 
@@ -114,6 +150,10 @@ describe("tool-result pairing boundaries", () => {
 			user,
 			assistant("toolUse", "before"),
 			{ ...toolResult("before", "No result provided"), isError: true, timestamp: expect.any(Number) },
+			{
+				...assistant("aborted", "interrupted"),
+				content: [{ type: "text", text: "[tool result from aborted turn (fixture_tool)]\ncompleted" }],
+			},
 			assistant("toolUse", "after", "missing"),
 			toolResult("after"),
 			{ ...toolResult("missing", "No result provided"), isError: true, timestamp: expect.any(Number) },

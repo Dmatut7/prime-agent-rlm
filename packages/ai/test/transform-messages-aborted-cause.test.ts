@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { transformMessages } from "../src/providers/transform-messages.js";
-import type { AssistantMessage, Message, Model, StopReason } from "../src/types.js";
+import type { AssistantMessage, Message, Model, StopReason, ToolResultMessage } from "../src/types.js";
 
 /**
  * MV-4: a turn aborted during pure streaming leaves no tool result to carry the
@@ -55,6 +55,17 @@ function keptText(messages: Message[]): string {
 		.filter((block): block is { type: "text"; text: string } => block.type === "text")
 		.map((block) => block.text)
 		.join("\n");
+}
+
+function toolResult(toolCallId: string, text: string): ToolResultMessage {
+	return {
+		role: "toolResult",
+		toolCallId,
+		toolName: "fixture_tool",
+		content: [{ type: "text", text }],
+		isError: true,
+		timestamp: 0,
+	};
 }
 
 const CAUSE =
@@ -127,5 +138,82 @@ describe("aborted assistant cause trace (MV-4)", () => {
 		const messages = [user, assistant([{ type: "text", text: "wip" }], "error", "upstream 503")];
 
 		expect(transformMessages(messages, model)).toEqual([user]);
+	});
+
+	it("folds a harvested tool result into the abort trace instead of dropping it", () => {
+		const messages = [
+			user,
+			assistant(
+				[
+					{ type: "toolCall", id: "call|1", name: "fixture_tool", arguments: {} },
+					{ type: "text", text: "running the long command" },
+				],
+				"aborted",
+				CAUSE,
+			),
+			toolResult("call|1", "partial build log: 42 tests passed"),
+		];
+		const original = structuredClone(messages);
+
+		const out = transformMessages(messages, model);
+
+		expect(out).toHaveLength(2);
+		expect(out.every((msg) => msg.role !== "toolResult")).toBe(true);
+		const kept = out[1] as AssistantMessage;
+		expect(kept.content.some((block) => block.type === "toolCall")).toBe(false);
+		const text = keptText(out);
+		expect(text).toContain("running the long command");
+		expect(text).toContain("stall_watchdog");
+		expect(text).toContain("[tool result from aborted turn (fixture_tool)]");
+		expect(text).toContain("partial build log: 42 tests passed");
+		expect(messages).toEqual(original);
+	});
+
+	it("materializes a trace from folded results when the aborted turn left neither text nor cause", () => {
+		const messages = [
+			user,
+			assistant([{ type: "toolCall", id: "call|1", name: "fixture_tool", arguments: {} }], "aborted"),
+			toolResult("call|1", "harvested partial output"),
+		];
+
+		const out = transformMessages(messages, model);
+
+		expect(out).toHaveLength(2);
+		const kept = out[1] as AssistantMessage;
+		expect(kept.role).toBe("assistant");
+		expect(kept.content).toEqual([
+			{ type: "text", text: "[tool result from aborted turn (fixture_tool)]\nharvested partial output" },
+		]);
+	});
+
+	it("folds several results of one aborted turn in order", () => {
+		const messages = [
+			user,
+			assistant([], "aborted", CAUSE),
+			toolResult("call|1", "first output"),
+			toolResult("call|2", "second output"),
+		];
+
+		const out = transformMessages(messages, model);
+
+		expect(out).toHaveLength(2);
+		const text = keptText(out);
+		expect(text.indexOf("first output")).toBeLessThan(text.indexOf("second output"));
+	});
+
+	it("bounds the folded tool result text", () => {
+		const huge = "x".repeat(16 * 1024);
+		const messages = [user, assistant([], "aborted", CAUSE), toolResult("call|1", huge)];
+
+		const out = transformMessages(messages, model);
+
+		const kept = out[1] as AssistantMessage;
+		const folded = kept.content
+			.filter((block): block is { type: "text"; text: string } => block.type === "text")
+			.map((block) => block.text)
+			.find((text) => text.includes("tool result from aborted turn"));
+		expect(folded).toBeDefined();
+		expect(folded!.endsWith("…")).toBe(true);
+		expect(folded!.length).toBeLessThanOrEqual(8 * 1024 + 100);
 	});
 });

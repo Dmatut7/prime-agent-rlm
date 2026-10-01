@@ -1211,17 +1211,11 @@ export function convertMessages(
 				content: compat.requiresAssistantAfterToolResult ? "" : null,
 			};
 
-			const assistantTextParts = msg.content
+			const assistantText = msg.content
 				.filter(isTextContentBlock)
 				.filter((block) => block.text.trim().length > 0)
-				.map(
-					(block) =>
-						({
-							type: "text",
-							text: sanitizeSurrogates(block.text),
-						}) satisfies ChatCompletionContentPartText,
-				);
-			const assistantText = assistantTextParts.map((part) => part.text).join("");
+				.map((block) => sanitizeSurrogates(block.text))
+				.join("");
 
 			const replayReasoningDetails = msg.content
 				.filter(isThinkingContentBlock)
@@ -1236,11 +1230,14 @@ export function convertMessages(
 				.filter((block) => block.thinking.trim().length > 0);
 			if (nonEmptyThinkingBlocks.length > 0) {
 				if (compat.requiresThinkingAsText) {
-					// Convert thinking blocks to plain text (no tags to avoid model mimicking them)
+					// Convert thinking blocks to plain text (no tags to avoid model mimicking them).
+					// Same plain-string form as the branches below: a content-part array
+					// made DeepSeek V3.2 via NVIDIA NIM mirror the block structure
+					// literally in its output (recursive nesting, see the else comment).
 					const thinkingText = nonEmptyThinkingBlocks
 						.map((block) => sanitizeSurrogates(block.thinking))
 						.join("\n\n");
-					assistantMsg.content = [{ type: "text", text: thinkingText }, ...assistantTextParts];
+					assistantMsg.content = assistantText.length > 0 ? `${thinkingText}\n\n${assistantText}` : thinkingText;
 				} else {
 					// Always send assistant content as a plain string (OpenAI Chat Completions
 					// API standard format). Sending as an array of {type:"text", text:"..."}

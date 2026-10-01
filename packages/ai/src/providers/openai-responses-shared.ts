@@ -43,6 +43,8 @@ function encodeTextSignatureV1(id: string, phase?: TextSignatureV1["phase"]): st
 	return JSON.stringify(payload);
 }
 
+const log = getLogger("ai.provider");
+
 function parseTextSignature(
 	signature: string | undefined,
 ): { id: string; phase?: TextSignatureV1["phase"] } | undefined {
@@ -166,8 +168,36 @@ export function convertResponsesMessages<TApi extends Api>(
 			for (const [blockIndex, block] of msg.content.entries()) {
 				if (block.type === "thinking") {
 					if (block.thinkingSignature) {
-						const reasoningItem = JSON.parse(block.thinkingSignature) as ResponseReasoningItem;
-						output.push(reasoningItem);
+						let reasoningItem: ResponseReasoningItem | undefined;
+						try {
+							reasoningItem = JSON.parse(block.thinkingSignature) as ResponseReasoningItem;
+						} catch {
+							reasoningItem = undefined;
+						}
+						if (reasoningItem) {
+							output.push(reasoningItem);
+						} else {
+							// A corrupt signature must not abort request building. Degrade to
+							// the thinking text (the same degradation as the Anthropic
+							// converter's unsigned-thinking path) and log it: the replay
+							// silently losing the block would be invisible otherwise.
+							log.warn("Dropped an unparseable thinking signature during Responses replay", {
+								provider: model.provider,
+								model: model.id,
+								signatureLength: block.thinkingSignature.length,
+							});
+							if (block.thinking.trim().length > 0) {
+								output.push({
+									type: "message",
+									role: "assistant",
+									content: [
+										{ type: "output_text", text: sanitizeSurrogates(block.thinking), annotations: [] },
+									],
+									status: "completed",
+									id: `msg_${msgIndex}_${blockIndex}`,
+								} satisfies ResponseOutputMessage);
+							}
+						}
 					}
 				} else if (block.type === "text") {
 					const textBlock = block as TextContent;
@@ -324,7 +354,6 @@ export async function processResponsesStream<TApi extends Api>(
 	const blockIndex = () => blocks.length - 1;
 	const indexOfBlock = (block: Block): number => blocks.indexOf(block);
 
-	const log = getLogger("ai.provider");
 	// The Responses protocol tags every item-scoped event with item_id/output_index,
 	// but some gateways replay events interleaved or without those coordinates.
 	// Every recovery below is persisted as a message diagnostic so a mangled

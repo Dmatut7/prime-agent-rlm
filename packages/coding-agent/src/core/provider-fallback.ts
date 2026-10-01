@@ -308,17 +308,36 @@ export function toolResultText(result: unknown): string {
 }
 
 /**
+ * Whether a JSON schema declares at least one required property. A tool whose
+ * schema requires nothing can legitimately be called with `{}`, so an empty-args
+ * error from it is the tool's own failure, not a malformed call.
+ */
+function toolSchemaHasRequiredParameters(parameters: unknown): boolean {
+	if (!parameters || typeof parameters !== "object") return false;
+	const required = (parameters as { required?: unknown }).required;
+	return Array.isArray(required) && required.length > 0;
+}
+
+/**
  * Whether a finished tool call was a broken call the model should not have
  * made: an unknown tool name (garbage streamed names land here) or a call to a
- * known tool with no arguments at all.
+ * known tool with no arguments at all when that tool's schema declares required
+ * parameters. When the caller cannot resolve the tool's schema, an empty-args
+ * error keeps the conservative legacy reading (it counts), so a storm of empty
+ * calls still trips the fallback.
  */
-export function isBadToolCall(result: { isError: boolean; text: string; args?: unknown }): boolean {
+export function isBadToolCall(
+	result: { isError: boolean; text: string; args?: unknown },
+	tool?: { parameters?: unknown },
+): boolean {
 	if (!result.isError) return false;
 	if (TOOL_NOT_FOUND_PATTERN.test(result.text.trim())) return true;
-	return (
+	const emptyArgs =
 		result.args === undefined ||
-		(typeof result.args === "object" && result.args !== null && Object.keys(result.args).length === 0)
-	);
+		(typeof result.args === "object" && result.args !== null && Object.keys(result.args).length === 0);
+	if (!emptyArgs) return false;
+	if (tool === undefined) return true;
+	return toolSchemaHasRequiredParameters(tool.parameters);
 }
 
 /** Whether any message in a context carries an image block. */

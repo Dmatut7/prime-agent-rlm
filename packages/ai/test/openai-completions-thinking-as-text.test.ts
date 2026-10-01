@@ -114,7 +114,7 @@ describe("openai-completions thinking-as-text replay", () => {
 		delete process.env.OPENAI_API_KEY;
 	});
 
-	it("serializes same-model thinking-plus-text replay as assistant text parts", () => {
+	it("serializes same-model thinking-plus-text replay as one plain assistant string", () => {
 		const messages = convertMessages(
 			buildModel(),
 			buildContext(
@@ -128,14 +128,11 @@ describe("openai-completions thinking-as-text replay", () => {
 
 		expect(messages[1]).toEqual({
 			role: "assistant",
-			content: [
-				{ type: "text", text: "internal reasoning" },
-				{ type: "text", text: "visible answer" },
-			],
+			content: "internal reasoning\n\nvisible answer",
 		});
 	});
 
-	it("serializes same-model thinking-only replay as assistant text parts", () => {
+	it("serializes same-model thinking-only replay as one plain assistant string", () => {
 		const messages = convertMessages(
 			buildModel(),
 			buildContext(buildAssistant([{ type: "thinking", thinking: "internal reasoning" }])),
@@ -144,7 +141,7 @@ describe("openai-completions thinking-as-text replay", () => {
 
 		expect(messages[1]).toEqual({
 			role: "assistant",
-			content: [{ type: "text", text: "internal reasoning" }],
+			content: "internal reasoning",
 		});
 	});
 
@@ -211,10 +208,7 @@ describe("openai-completions thinking-as-text replay", () => {
 			expect(requestBodies).toHaveLength(1);
 			expect(requestBodies[0]?.messages[1]).toEqual({
 				role: "assistant",
-				content: [
-					{ type: "text", text: "internal reasoning" },
-					{ type: "text", text: "visible answer" },
-				],
+				content: "internal reasoning\n\nvisible answer",
 			});
 
 			const terminalEvent = events.at(-1);
