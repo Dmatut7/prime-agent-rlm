@@ -14,6 +14,7 @@ import {
 import { createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 import { Writable } from "node:stream";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { getLogger } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
@@ -122,6 +123,7 @@ import {
 	DAEMON_PROTOCOL_INFO,
 	DAEMON_SCHEMA_ID,
 	DAEMON_SCHEMA_REVISION,
+	DAEMON_SLIM_ATTACH_MESSAGE_TAIL,
 	DAEMON_SUPERVISOR_ONLY_SERVER_CAPABILITIES,
 	DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
@@ -140,6 +142,7 @@ import {
 	missingDeclaredCommandCapability,
 	normalizeDeclaredCapabilities,
 	salvageDaemonCommandId,
+	slimAttachTranscriptWindow,
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
 } from "./daemon-protocol.js";
@@ -3195,7 +3198,9 @@ export class DaemonSupervisor {
 					attached.result.activeSessionId,
 					attached.result.lastEventCursor?.generation,
 				);
-				if (client.capabilities.has("chunked_snapshot")) {
+				// A slim_attach_transcript client was already served its tail window
+				// inline by attachClient; there is no chunk transfer to stream.
+				if (client.capabilities.has("chunked_snapshot") && !client.capabilities.has("slim_attach_transcript")) {
 					const transcript = attached.transcript;
 					if (!transcript) {
 						throw new Error("Session worker did not provide a snapshot transcript");
@@ -3247,7 +3252,7 @@ export class DaemonSupervisor {
 					detachingSessions?.delete(command.activeSessionId);
 					detachingSessions?.delete(command.targetActiveSessionId);
 					detachingSessions?.delete(targetActiveSessionId);
-					if (client.capabilities.has("chunked_snapshot")) {
+					if (client.capabilities.has("chunked_snapshot") && !client.capabilities.has("slim_attach_transcript")) {
 						const transcript =
 							attached.transcript ?? this.getOrCreateTranscriptCache(attached.worker, attached.result);
 						releaseTranscript = attached.releaseTranscript;
@@ -7683,8 +7688,23 @@ export class DaemonSupervisor {
 		// cached bytes. That replaced a second full serialization of the same messages in
 		// the supervisor, and a second full snapshot load from the worker for every legacy
 		// attach that followed a chunked one.
-		const wantsChunkedSnapshot = client.capabilities.has("chunked_snapshot");
+		//
+		// 文档-11 (rev 44): a slim_attach_transcript client is served from that same
+		// cache, but only the tail window crosses to the client — decoded from the
+		// trailing chunks, inline in the attach response, with snapshot.messagesOmitted
+		// saying how much older history exists. The cache itself always stays full
+		// (the internal worker load never declares the capability), so slim and full
+		// attaches share the one transfer.
+		const wantsSlimTranscript = client.capabilities.has("slim_attach_transcript");
+		const wantsChunkedSnapshot = client.capabilities.has("chunked_snapshot") || wantsSlimTranscript;
 		let result = match.worker.snapshotCache.get(activeSessionId);
+		if (result && !wantsSlimTranscript && result.snapshot.messagesOmitted !== undefined) {
+			// A windowed snapshot can sit in this cache only through a worker that
+			// filled messagesOmitted for a load that never declared the capability.
+			// Never serve it to a full-transcript client as if it were complete:
+			// drop it so the load below fetches the whole transcript instead.
+			result = undefined;
+		}
 		if (result && !wantsChunkedSnapshot) {
 			result = await this.snapshotWithDecodedTranscript(match.worker, activeSessionId, result);
 		}
@@ -7721,9 +7741,25 @@ export class DaemonSupervisor {
 				break;
 			}
 		}
-		const releaseTranscript = transcript?.retain();
+		let releaseTranscript = transcript?.retain();
 		client.attachedActiveSessionIds.add(activeSessionId);
 		try {
+			let slimWindow: { messages: AgentMessage[]; omittedMessages: number } | undefined;
+			if (wantsSlimTranscript) {
+				slimWindow = await this.slimAttachTranscriptTail(result, transcript);
+				if (slimWindow === undefined) {
+					// Nothing decodable backs the cached view (a failed or superseded
+					// transfer): reload the full snapshot and take the window from it,
+					// the same recovery the legacy decode fallback above uses.
+					result = await this.loadWorkerSnapshot(match.worker, activeSessionId, command.env, false);
+					slimWindow = slimAttachTranscriptWindow(result.snapshot.messages);
+				}
+				// The window crosses inline in the attach response; no chunk stream
+				// follows for this client, so the transfer handoff is consumed here.
+				releaseTranscript?.();
+				releaseTranscript = undefined;
+				transcript = undefined;
+			}
 			const publicSummary = this.publicSummary(match.worker, result.snapshot.summary);
 			if (publicSummary.streamingMessage?.role === "assistant") {
 				// Seed only when a stream is actually in progress and the shared
@@ -7738,6 +7774,15 @@ export class DaemonSupervisor {
 				this.streamReconstructor.clear(activeSessionId);
 			}
 			const publicSnapshot = { ...result.snapshot, summary: publicSummary };
+			if (slimWindow) {
+				publicSnapshot.messages = slimWindow.messages;
+				if (slimWindow.omittedMessages > 0) {
+					publicSnapshot.messagesOmitted = slimWindow.omittedMessages;
+				} else {
+					// The transcript fit the window: absence reads as "full transcript".
+					delete publicSnapshot.messagesOmitted;
+				}
+			}
 			if (!client.capabilities.has("quota_park_status")) {
 				// The internal load declares quota_park_status so the cached snapshot
 				// carries the park facts; the wire contract (rev 43) fills them only
@@ -7750,6 +7795,11 @@ export class DaemonSupervisor {
 				snapshot: publicSnapshot,
 				client: { id: client.id, capabilities: [...client.capabilities] },
 			};
+			if (wantsSlimTranscript) {
+				// The window was served inline; a streamed transfer id with no frames
+				// behind it would leave the client waiting for chunks that never come.
+				delete publicResult.snapshotStream;
+			}
 			if (publicResult.state && publicResult.messages) {
 				this.write(client, {
 					type: "session_attached",
@@ -7773,6 +7823,42 @@ export class DaemonSupervisor {
 			}
 			throw error;
 		}
+	}
+
+	/**
+	 * The tail window of a cached snapshot for a slim_attach_transcript client
+	 * (rev 44): sliced from the messages the cached result already carries, or
+	 * decoded from just the trailing chunks of the cached transfer — an 85k-message
+	 * transcript is never fully parsed to serve one attach. `undefined` means
+	 * neither source was usable (a transfer that failed, was superseded, or
+	 * disagrees with the summary's message count) and the caller reloads the full
+	 * snapshot instead of serving a gap.
+	 */
+	private async slimAttachTranscriptTail(
+		result: DaemonAttachResult,
+		transcript: SnapshotTranscriptCache | undefined,
+	): Promise<{ messages: AgentMessage[]; omittedMessages: number } | undefined> {
+		const totalMessages = result.snapshot.summary.messageCount;
+		const alreadyOmitted = result.snapshot.messagesOmitted ?? 0;
+		const carriedMessages = totalMessages - alreadyOmitted;
+		if (carriedMessages < 0) {
+			return undefined;
+		}
+		if (result.snapshot.messages.length >= carriedMessages) {
+			const window = slimAttachTranscriptWindow(result.snapshot.messages);
+			return { messages: window.messages, omittedMessages: alreadyOmitted + window.omittedMessages };
+		}
+		if (!transcript || !(await this.waitForSnapshotTransfer(transcript))) {
+			return undefined;
+		}
+		const decoded = transcript.decodeTailMessages(DAEMON_SLIM_ATTACH_MESSAGE_TAIL, carriedMessages);
+		if (!decoded || decoded.length > carriedMessages) {
+			// A decode longer than the summary accounts for means the cached transfer
+			// belongs to a newer generation than the snapshot: serving it would send
+			// a negative messagesOmitted. Reload instead of lying on the wire.
+			return undefined;
+		}
+		return { messages: decoded, omittedMessages: totalMessages - decoded.length };
 	}
 
 	private assertTelemetryAttachAllowed(worker: ResidentWorker, telemetryDisabled: true | undefined): void {

@@ -212,6 +212,7 @@ import {
 	type DaemonUpdateRestartManifest,
 	type DaemonUpdateRestartSession,
 	failure,
+	getMessagesWindow,
 	isDaemonCommandEnvelope,
 	isDaemonDialogExtensionUiRequest,
 	isDaemonMutatingCommand,
@@ -219,6 +220,7 @@ import {
 	missingDeclaredCommandCapability,
 	normalizeDeclaredCapabilities,
 	salvageDaemonCommandId,
+	slimAttachTranscriptWindow,
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
 } from "./daemon-protocol.js";
@@ -5487,9 +5489,15 @@ export class AgentDaemon {
 
 			case "get_messages": {
 				const state = this.getSessionState(command.activeSessionId);
-				return success(command.id, "get_messages", {
-					messages: state.runtime.session.messages,
-				});
+				// Rev 44: before/limit window the read (slim_attach_transcript
+				// backfill); without them the full transcript is returned as before,
+				// now with the total/firstIndex facts a paged reader reconciles
+				// against.
+				return success(
+					command.id,
+					"get_messages",
+					getMessagesWindow(state.runtime.session.messages, command.before, command.limit),
+				);
 			}
 
 			case "get_rlm_children": {
@@ -6115,11 +6123,18 @@ export class AgentDaemon {
 		// R3-3: a client that declared quota_park_status learns the park from the
 		// snapshot itself instead of sitting blind until the next heartbeat sweep.
 		const quotaPark = this.quotaParkForSnapshot(state, capabilities);
+		// 文档-11 (rev 44): a client that declared slim_attach_transcript gets only
+		// the tail window of the transcript plus the omitted count; the full history
+		// stays one paginated get_messages away. Applies to every snapshot built for
+		// the client (attach, replacement, resync), exactly like quotaPark.
+		const transcriptWindow = capabilities.has("slim_attach_transcript")
+			? slimAttachTranscriptWindow(session.messages)
+			: undefined;
 		return {
 			activeSessionId: state.activeSessionId,
 			summary: summaryForActiveSession(state),
 			state: connectionState,
-			messages: session.messages,
+			messages: transcriptWindow?.messages ?? session.messages,
 			// Omit duplicate heavy payloads from attach. The client can derive render
 			// context from messages + state, and fetch the full session tree lazily
 			// when the tree/branch selector opens.
@@ -6131,6 +6146,9 @@ export class AgentDaemon {
 			...(parent ? { parent } : {}),
 			children,
 			...(quotaPark ? { quotaPark } : {}),
+			...(transcriptWindow && transcriptWindow.omittedMessages > 0
+				? { messagesOmitted: transcriptWindow.omittedMessages }
+				: {}),
 		};
 	}
 

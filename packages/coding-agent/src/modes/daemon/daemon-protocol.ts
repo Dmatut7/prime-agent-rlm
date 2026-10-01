@@ -316,8 +316,31 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   absent field as "not parked at snapshot time" and waits for the heartbeat
 //   exactly as before. The digest recomputation covers the snapshot-wrapper
 //   growth.
-export const DAEMON_SCHEMA_REVISION = 43;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-43-58af0e58aa27";
+// Revision 44 adds the slim attach transcript (wave-7 文档-11): a client that
+//   declares the slim_attach_transcript capability on attach receives only the
+//   tail window of the transcript (DAEMON_SLIM_ATTACH_MESSAGE_TAIL messages) in
+//   DaemonSessionSnapshot.messages plus the optional messagesOmitted count,
+//   instead of the full history - an attach into an 81MB / 85k-entry session no
+//   longer transfers and re-parses the whole transcript per client.
+//   Capability-gated in both directions: the worker builds the windowed
+//   snapshot only for clients that declared the capability, the supervisor
+//   keeps its cached snapshot full (its internal loads never declare it) and
+//   cuts the tail per served client, and an old daemon never emits
+//   messagesOmitted, which a new client reads as "full transcript", exactly as
+//   before. The capability rides slim_attach's sibling rather than extending
+//   slim_attach itself because today's first-party client already declares
+//   slim_attach and expects snapshot.messages to be the complete transcript.
+//   The same window also gates the new get_messages pagination fields
+//   (before/limit), the backfill path a slim client uses for older history; an
+//   old daemon ignores the fields and answers with the full list, so the
+//   sender-side gate (minSchemaRevision 44 + capability) is what stops a client
+//   from depending on the smaller payload. Catch-up resyncs and replacement
+//   snapshots keep the full transcript: they are the repair channel, and a
+//   supervisor-side resync serves every client from the one cached chunk
+//   transfer. The digest recomputation covers the command-arm and
+//   snapshot-wrapper growth.
+export const DAEMON_SCHEMA_REVISION = 44;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-44-af9e1ae34e55";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -336,6 +359,16 @@ export type DaemonClientCapability =
 	| "slim_attach"
 	| "chunked_snapshot"
 	| "client_owned_sessions"
+	// The attach snapshot's transcript arrives as a tail window
+	// (DAEMON_SLIM_ATTACH_MESSAGE_TAIL messages) with DaemonSessionSnapshot.
+	// messagesOmitted saying how much older history exists, instead of the full
+	// message list (rev 44). The daemon also honors get_messages before/limit
+	// pagination so the client can backfill older pages on demand. Clients must
+	// treat an absent messagesOmitted as "full transcript" - that is both the
+	// old-daemon wire and the nothing-omitted case. Deliberately separate from
+	// slim_attach: today's first-party client declares slim_attach and expects
+	// the complete snapshot.messages, so the tail window needs its own opt-in.
+	| "slim_attach_transcript"
 	// The supervisor forwards compact assistant stream deltas
 	// (assistant_stream_delta) instead of rebuilt full message_update events to
 	// clients that advertise this capability. Clients must accumulate the deltas
@@ -456,6 +489,7 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"slim_attach",
 	"chunked_snapshot",
 	"client_owned_sessions",
+	"slim_attach_transcript",
 	"streaming_deltas",
 	"streaming_delta_fragments",
 	"quota_park_status",
@@ -730,6 +764,16 @@ export interface DaemonSessionSnapshot {
 	 * stream stays the live channel from then on.
 	 */
 	quotaPark?: DaemonSessionSnapshotQuotaPark;
+	/**
+	 * Slim attach transcript (rev 44, capability slim_attach_transcript): how
+	 * many leading messages were omitted from `messages`, which then holds only
+	 * the tail window (DAEMON_SLIM_ATTACH_MESSAGE_TAIL messages). Absent means
+	 * `messages` is the complete transcript - both on the old-daemon wire and
+	 * when the session simply fits the window. Older history is backfilled
+	 * through get_messages before/limit; `summary.messageCount` always counts
+	 * the full transcript, so messages.length + messagesOmitted equals it.
+	 */
+	messagesOmitted?: number;
 }
 
 /**
@@ -755,7 +799,12 @@ export interface DaemonAttachResult {
 	activeSessionId: string;
 	/** Omitted for clients with the "slim_attach" capability; use snapshot.summary. */
 	state?: SessionSummary;
-	/** Omitted for clients with the "slim_attach" capability; use snapshot.messages. */
+	/**
+	 * Omitted for clients with the "slim_attach" capability; use snapshot.messages.
+	 * Mirrors snapshot.messages, so a slim_attach_transcript client (rev 44)
+	 * receives the same tail window here; snapshot.messagesOmitted says how much
+	 * older history exists.
+	 */
 	messages?: AgentMessage[];
 	snapshot: DaemonSessionSnapshot;
 	replay: DaemonReplayInfo;
@@ -773,6 +822,73 @@ export interface DaemonAttachResult {
 }
 
 export const DAEMON_UPDATE_RESTART_FORMAT_VERSION = 1;
+
+/**
+ * Tail window size of the slim attach transcript (rev 44, capability
+ * slim_attach_transcript): a declaring client's attach snapshot carries at most
+ * this many trailing messages. A message count (not a byte budget) so the wire
+ * stays self-describing through `messagesOmitted`; older history is one
+ * paginated get_messages call away.
+ */
+export const DAEMON_SLIM_ATTACH_MESSAGE_TAIL = 100;
+
+/**
+ * The tail window of a transcript for a slim_attach_transcript client.
+ * `omittedMessages` counts the leading messages left out, so
+ * `messages.length + omittedMessages` is always the input length. A transcript
+ * that fits the window is returned whole with omittedMessages 0 (the snapshot
+ * then omits the field: absence means "full transcript" on the wire).
+ */
+export function slimAttachTranscriptWindow(
+	messages: readonly AgentMessage[],
+	tail: number = DAEMON_SLIM_ATTACH_MESSAGE_TAIL,
+): { messages: AgentMessage[]; omittedMessages: number } {
+	const size = messages.length;
+	const windowSize = Math.max(1, Math.floor(tail));
+	if (size <= windowSize) {
+		return { messages: [...messages], omittedMessages: 0 };
+	}
+	return { messages: messages.slice(size - windowSize), omittedMessages: size - windowSize };
+}
+
+export interface DaemonGetMessagesWindow {
+	messages: AgentMessage[];
+	/** Total messages in the transcript, regardless of the returned window. */
+	totalMessages: number;
+	/** Index of messages[0] in the full transcript; 0 for an unpaginated read. */
+	firstIndex: number;
+}
+
+/**
+ * The get_messages read window (rev 44): `before` is the exclusive end index
+ * into the full transcript (default: its end) and `limit` caps how many
+ * messages are returned (default: everything before `before`). Both must be
+ * non-negative integers when present; anything else is a caller bug and
+ * rejected, because silently clamping a garbage index would misalign the
+ * client's transcript bookkeeping.
+ */
+export function getMessagesWindow(
+	messages: readonly AgentMessage[],
+	before?: number,
+	limit?: number,
+): DaemonGetMessagesWindow {
+	for (const [name, value] of [
+		["before", before],
+		["limit", limit],
+	] as const) {
+		if (value !== undefined && (!Number.isInteger(value) || value < 0)) {
+			throw new RangeError(`get_messages ${name} must be a non-negative integer, got ${value}`);
+		}
+	}
+	const totalMessages = messages.length;
+	if (before === undefined && limit === undefined) {
+		return { messages: [...messages], totalMessages, firstIndex: 0 };
+	}
+	const end = Math.min(before ?? totalMessages, totalMessages);
+	const count = Math.min(limit ?? end, end);
+	const firstIndex = end - count;
+	return { messages: messages.slice(firstIndex, end), totalMessages, firstIndex };
+}
 
 export interface DaemonUpdateRestartQueue {
 	actions: SessionActionRecoverySnapshot;
@@ -1013,7 +1129,21 @@ export type DaemonCommand =
 	| { id?: string; type: "get_session_header"; activeSessionId: string }
 	| { id?: string; type: "get_state"; activeSessionId: string }
 	| { id?: string; type: "get_connection_state"; activeSessionId: string }
-	| { id?: string; type: "get_messages"; activeSessionId: string }
+	| {
+			id?: string;
+			type: "get_messages";
+			activeSessionId: string;
+			/**
+			 * Slim transcript backfill (rev 44, capability slim_attach_transcript):
+			 * return only messages[firstIndex..before), where `before` is this
+			 * exclusive end index into the full transcript (default: its end) and
+			 * `limit` caps the count (default: everything before `before`). An old
+			 * daemon ignores both fields and answers with the full list, so the
+			 * sender must check the capability before relying on the window.
+			 */
+			before?: number;
+			limit?: number;
+	  }
 	| { id?: string; type: "get_rlm_children"; activeSessionId: string }
 	| { id?: string; type: "get_session_stats"; activeSessionId: string }
 	| { id?: string; type: "get_context_tree"; activeSessionId: string }
@@ -1233,6 +1363,15 @@ const SEND_MESSAGE_DELIVERY_MODE_COMMAND = {
 	minProtocol: 7,
 	minSchemaRevision: 41,
 	capability: "send_message_delivery_mode",
+} as const;
+// get_messages before/limit (rev 44) rides the slim_attach_transcript capability:
+// an old daemon ignores the unknown fields and answers with the full list, so the
+// gate exists to stop a sender from depending on the smaller payload. The bare
+// command is unchanged and stays legacy.
+const GET_MESSAGES_WINDOW_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 44,
+	capability: "slim_attach_transcript",
 } as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
@@ -1499,6 +1638,9 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 	}
 	if (command.type === "send_message" && (command.deliveryMode === "steer" || command.deliveryMode === "follow_up")) {
 		requirements.push(SEND_MESSAGE_DELIVERY_MODE_COMMAND);
+	}
+	if (command.type === "get_messages" && (command.before !== undefined || command.limit !== undefined)) {
+		requirements.push(GET_MESSAGES_WINDOW_COMMAND);
 	}
 	return [...requirements, DAEMON_COMMAND_COMPATIBILITY[command.type]];
 }

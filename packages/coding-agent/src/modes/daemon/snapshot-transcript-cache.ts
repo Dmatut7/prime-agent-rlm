@@ -233,6 +233,62 @@ export class SnapshotTranscriptCache {
 		return messages;
 	}
 
+	/**
+	 * Rebuilds only the trailing `count` messages of the encoded transfer, walking
+	 * chunks from the end so a slim attach (capability slim_attach_transcript, rev
+	 * 44) never parses the whole transcript to serve its tail window.
+	 *
+	 * The same undefined contract as decodeMessages applies: incomplete, failed,
+	 * disposed, or a chunk that does not parse into this snapshot's frame all mean
+	 * "not usable" and the caller reloads. `expectedMessageCount` is the transfer's
+	 * total message count; it is validated only when the walk reached the first
+	 * chunk (a walk that stopped early never saw the whole transfer, so the
+	 * caller derives the omitted count from the snapshot summary instead). The
+	 * returned array has min(count, total) entries; how many were omitted is the
+	 * caller's arithmetic (summary.messageCount - returned length).
+	 */
+	decodeTailMessages(count: number, expectedMessageCount?: number): AgentMessage[] | undefined {
+		if (!this.complete || count < 1) {
+			return undefined;
+		}
+		const chunkMessages: AgentMessage[][] = [];
+		let seen = 0;
+		let reachedFirstChunk = false;
+		try {
+			for (let index = this.chunkCount - 1; index >= 0; index--) {
+				const frame: unknown = JSON.parse(this.readChunk(index).toString("utf8"));
+				if (
+					!isSnapshotTranscriptChunkFrame(frame) ||
+					frame.snapshotId !== this.snapshotId ||
+					frame.activeSessionId !== this.activeSessionId ||
+					frame.index !== index
+				) {
+					return undefined;
+				}
+				chunkMessages.unshift(frame.messages);
+				seen += frame.messages.length;
+				if (index === 0) {
+					reachedFirstChunk = true;
+				}
+				if (seen >= count) {
+					break;
+				}
+			}
+		} catch {
+			return undefined;
+		}
+		if (expectedMessageCount !== undefined && reachedFirstChunk && seen !== expectedMessageCount) {
+			return undefined;
+		}
+		const messages: AgentMessage[] = [];
+		for (const chunk of chunkMessages) {
+			for (const message of chunk) {
+				messages.push(message);
+			}
+		}
+		return messages.length > count ? messages.slice(messages.length - count) : messages;
+	}
+
 	appendEncodedChunk(buffer: Buffer): void {
 		if (this.completed || this.failure || this.disposed) {
 			throw new Error(`Snapshot transcript ${this.snapshotId} is not writable`);
