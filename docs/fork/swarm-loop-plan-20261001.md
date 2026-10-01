@@ -189,3 +189,19 @@ orchestrator-workers + 确定性 gate；子代理任务书必须含目标/输出
 3. session_context_loss 通知的 TUI 重放渲染（conversation-components.ts 加镜像分支，仿 IPYTHON_STATE_PRUNED）。
 4. 4620/4649×2/r43 环境红隔离：harness 层屏蔽 claude-code 探测（packages/ai env-api-keys 或测试设施）。
 5. daemon.md:143 恢复契约描述过时（W4-D 遗留）。
+
+- 2026-10-01 波次 5：5 批完成。结果摘要：
+  - W5-A：finish_gate_released 发射侧接线（display 通知进 transcript，不进模型上下文）；messages.ts convertToLlm 排除名单补 finish_gate_released + ipython_state_pruned（修注释与行为不符）。波次4依赖#1#2 销账。
+  - W5-B：session_context_loss 重放渲染补洞 + 整类兜底（buildConversationComponents 加 display:true 通用分支，关掉 11 个类型的洞）。波次4依赖#3 销账。
+  - W5-C：claude-code 探测加 PI_DISABLE_CLAUDE_CODE_DETECTION opt-out + 测试设施隔离（4620/4649/r43 环境红销账）；文档-9 MR-1 核验已在 HEAD 修复（1153b271b），销账。
+  - W5-D：文档-7 机器块防伪造核验已在 HEAD 落地（21c19bf24+84a6e65a5），删死代码 stripFileListBlocks，补 2 条伪造场景回归。销账。
+  - W5-E：回收器补三块——pi-bash 日志数量封顶（默认 100）、session-artifacts 总量上限（默认 8GiB，保留 resident/活引用/待执行 cron）、tombstone 抑制加 warn 记录。文档-5 大部销账（记账粒度取舍仍留用户拍板）。
+  - CI 尾巴：input-classification pin 补上 SESSION_CONTEXT_LOSS/FINISH_GATE_RELEASED/IPYTHON_STATE_PRUNED 三个新常量的归类（波次4遗漏，主席直修）。
+
+### 波次 5 遗留（波次 6 候选）
+
+- 文档-9 剩余 4 条重试语义（:719 429 等表照到点、:728 SDK 层重试零事件、upstream-725 重试定时器不可取消、audit-268 子代理回合级错误无重试）。
+- 文档-3 流式全量重发（需设计）；文档-16 子代理配额；文档-10 计费 2 条；文档-11 attach 全量重读；安全簇 文档-12/13（需用户拍板）。
+- W5-C 遗留：PI_DISABLE_CLAUDE_CODE_DETECTION 未写进 args.ts env 文档与 packages/ai/README。
+- 记忆-7（后台线程脏追踪）、显示-调研（终端宽度画像+mode 2027，需设计）。
+- 智能-4 边角（aborted 回合不占「最近」名额）、智能-5（prompt 禁 .get() 与运行时矛盾）。
