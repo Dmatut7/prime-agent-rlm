@@ -8,7 +8,17 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	closeSync,
+	existsSync,
+	fsyncSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { stat } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -634,6 +644,105 @@ interface StallRecoveryEpisode {
 class RuntimeOpenCancelledError extends Error {}
 class BoundSessionUnavailableError extends Error {}
 
+export interface DaemonCrashHandlerOptions {
+	log: (message: string) => void;
+	/**
+	 * In-flight session inventory, written to the crash log between the error
+	 * line and the exit. Called at crash time, so it must be synchronous and
+	 * cheap; the handler isolates a throw from it.
+	 */
+	captureContext?: () => string;
+	/**
+	 * Best-effort durability flush for the recovery inputs (the worker recovery
+	 * journal). Synchronous; the handler isolates a throw from it.
+	 */
+	flushRecoveryState?: () => void;
+	/** Exit hook, injectable so a test can assert the verdict without killing its runner. */
+	exit?: (code: number) => void;
+}
+
+/**
+ * Process-level last line of defence for a session-hosting daemon (the worker
+ * half of the supervisor/worker split). The policy is fail-fast: unlike the
+ * supervisor — a global single point that isolates a leaked promise — a session
+ * host exits on the first uncaught exception or unhandled rejection, because
+ * its per-session state may already be corrupt and the supervisor side owns the
+ * recovery (the dead worker's recovery journal drives the interruption markers
+ * and the automatic resume). Before the exit the handler logs the error with
+ * its stack plus a snapshot of the sessions in flight, then flushes the
+ * recovery journal, so both the crash site and the recovery inputs survive the
+ * process.
+ *
+ * Returns the uninstaller; a session host never uninstalls, tests do.
+ */
+export function installDaemonCrashHandlers(options: DaemonCrashHandlerOptions): () => void {
+	const log = options.log;
+	const exit = options.exit ?? ((code: number) => process.exit(code));
+	const onCrash = (label: string, error: unknown) => {
+		const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
+		// Every step is isolated: the crash may have half-mutated exactly the
+		// state these read, and the exit is the one thing that must always run.
+		try {
+			log(`${label}: ${detail}`);
+		} catch {
+			// The log sink may itself be the failure (a full disk); the exit still goes.
+		}
+		if (options.captureContext) {
+			try {
+				log(`crash context: ${options.captureContext()}`);
+			} catch {
+				// The inventory is diagnostic only.
+			}
+		}
+		try {
+			options.flushRecoveryState?.();
+		} catch {
+			// Best effort: journal records are appended synchronously, so nothing
+			// already acknowledged is still sitting in user space.
+		}
+		exit(1);
+	};
+	const onUncaughtException = (error: Error) => onCrash("uncaught exception", error);
+	const onUnhandledRejection = (reason: unknown) => onCrash("unhandled rejection", reason);
+	process.on("uncaughtException", onUncaughtException);
+	process.on("unhandledRejection", onUnhandledRejection);
+	return () => {
+		process.off("uncaughtException", onUncaughtException);
+		process.off("unhandledRejection", onUnhandledRejection);
+	};
+}
+
+/**
+ * Crash-time durability for a worker recovery journal: one fsync over the file
+ * the journal has been appending to. Appends are already synchronous writes, so
+ * this only covers the kernel-crash tail; a missing file means no record was
+ * ever written, which is not an error. Anything else propagates so the caller
+ * can log it.
+ *
+ * The descriptor is opened "r+": read-only opens cannot fsync on Windows
+ * (FlushFileBuffers needs write access), and unlike "a" this never creates the
+ * file.
+ */
+export function flushWorkerRecoveryJournalFile(path: string | undefined): void {
+	if (path === undefined) {
+		return;
+	}
+	let descriptor: number | undefined;
+	try {
+		descriptor = openSync(path, "r+");
+		fsyncSync(descriptor);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return;
+		}
+		throw error;
+	} finally {
+		if (descriptor !== undefined) {
+			closeSync(descriptor);
+		}
+	}
+}
+
 export async function runDaemonMode(options: DaemonModeOptions): Promise<never> {
 	const socketPath = normalizeSocketPath(options.socketPath ?? defaultDaemonSocketPath());
 	const daemon = new AgentDaemon(socketPath, options);
@@ -758,6 +867,10 @@ export class AgentDaemon {
 		},
 	);
 	private readonly recoveryJournal?: WorkerRecoveryJournal;
+	/** Kept for the crash-time fsync; set exactly when recoveryJournal is. */
+	private readonly recoveryJournalPath?: string;
+	/** Held so tests can detach the process-level handlers; production never uninstalls. */
+	private uninstallCrashHandlers?: () => void;
 	private readonly rosterReporter: WorkerRosterReporterState = {
 		lastComposed: new Map(),
 		lastComposedJson: new Map(),
@@ -800,6 +913,7 @@ export class AgentDaemon {
 		this.restoreActiveSessionId = options.worker?.restoreActiveSessionId;
 		const recoveryJournalPath = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 		if (options.worker && recoveryJournalPath) {
+			this.recoveryJournalPath = recoveryJournalPath;
 			this.recoveryJournal = new WorkerRecoveryJournal(recoveryJournalPath);
 		}
 		this.cronScheduler = new AgentCronScheduler(this.cronStore, {
@@ -828,18 +942,110 @@ export class AgentDaemon {
 	}
 
 	// A crash thrown outside a command handler would otherwise vanish with the
-	// detached stdio; capture its stack before the process goes down.
+	// detached stdio; capture its stack, the in-flight session inventory, and a
+	// final recovery-journal checkpoint before the process goes down. The policy
+	// itself (fail-fast, with every step isolated) lives in
+	// installDaemonCrashHandlers. The handlers stay installed for the process's
+	// whole life, shutdown included; the uninstaller is the test seam.
 	private installCrashHandlers(): void {
-		process.on("uncaughtException", (error) => {
-			this.log(`uncaught exception: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
-			process.exit(1);
+		this.uninstallCrashHandlers?.();
+		this.uninstallCrashHandlers = installDaemonCrashHandlers({
+			log: (message) => this.logCrashLine(message),
+			captureContext: () => this.crashContextSnapshot(),
+			flushRecoveryState: () => this.flushRecoveryStateForCrash(),
 		});
-		process.on("unhandledRejection", (reason) => {
-			this.log(
-				`unhandled rejection: ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`,
-			);
-			process.exit(1);
-		});
+	}
+
+	/**
+	 * Crash-path sibling of log(): each sink gets its own try, durable rotating
+	 * file first, because the crash may be the logging subsystem itself failing
+	 * (a full disk, a closed diagnostic pipe). The crash handler isolates the
+	 * callback as a whole; this keeps one dead sink from costing the others.
+	 */
+	private logCrashLine(message: string): void {
+		try {
+			appendRotatingLog(getDaemonLogPath(this.socketPath), `[${new Date().toISOString()}] ${message}`);
+		} catch {
+			// The disk may be the failure being reported.
+		}
+		try {
+			console.error(message);
+		} catch {
+			// stderr may be a closed pipe on a detached worker.
+		}
+		try {
+			structuredLog.warn(message, { socketPath: this.socketPath });
+		} catch {
+			// The structured sink may be the failure being reported.
+		}
+	}
+
+	/**
+	 * In-flight session inventory for the crash log. Runs at crash time, so it
+	 * reads the possibly half-mutated session state behind a per-session guard
+	 * and stays synchronous. The busy flag mirrors the recovery journal's
+	 * definition, so the log line says which sessions the supervisor will mark
+	 * interrupted.
+	 */
+	private crashContextSnapshot(): string {
+		if (this.sessions.size === 0) {
+			return "no sessions in flight";
+		}
+		const parts: string[] = [];
+		for (const state of this.sessions.values()) {
+			if (parts.length >= 32) {
+				parts.push(`+${this.sessions.size - parts.length} more`);
+				break;
+			}
+			try {
+				const session = state.runtime.session;
+				const busy = hasLiveSessionWork(state) || session.isRetrying || session.hasAcceptedPromptInFlight;
+				const binding = this.bindingSessions.has(state.activeSessionId) ? ", binding" : "";
+				const file = session.sessionFile ? `, ${session.sessionFile}` : "";
+				parts.push(
+					`${state.activeSessionId} (session ${session.sessionId}${file}, ${busy ? "busy" : "idle"}${binding})`,
+				);
+			} catch (error) {
+				parts.push(`${state.activeSessionId} (unreadable: ${String(error)})`);
+			}
+		}
+		return `${this.sessions.size} session(s) in flight: ${parts.join("; ")}`;
+	}
+
+	/**
+	 * Crash-time half of the recovery journal contract. The continuous
+	 * checkpoints (recordWorkerRecoveryState) can lose their latest write to a
+	 * transient I/O error, so the last record per session can drift from the
+	 * work actually in flight — and that record is exactly what the supervisor
+	 * reads to decide which sessions to mark interrupted. Rewrite only the
+	 * drifted records (an honest busy recompute keeps the in-flight operation
+	 * name intact when the journal is already current), then fsync the file so
+	 * even a kernel crash keeps the tail. Every step is isolated: the exit that
+	 * follows must not depend on any of this succeeding.
+	 */
+	private flushRecoveryStateForCrash(): void {
+		if (!this.recoveryJournal) {
+			return;
+		}
+		const recorded = new Map(
+			this.recoveryJournal.getLatest().map((record) => [record.activeSessionId, record] as const),
+		);
+		for (const state of this.sessions.values()) {
+			try {
+				const session = state.runtime.session;
+				const busy = hasLiveSessionWork(state) || session.isRetrying || session.hasAcceptedPromptInFlight;
+				const recordedEntry = recorded.get(state.activeSessionId);
+				// A session with no record yet (still binding) and no live work needs
+				// no marker; the supervisor only acts on busy records.
+				if (recordedEntry === undefined ? !busy : recordedEntry.busy === busy) {
+					continue;
+				}
+				this.recordWorkerRecoveryState(state, "crash");
+			} catch {
+				// A session too corrupt to read keeps its last journaled record.
+			}
+		}
+		flushWorkerRecoveryJournalFile(this.recoveryJournalPath);
 	}
 
 	async start(): Promise<void> {
