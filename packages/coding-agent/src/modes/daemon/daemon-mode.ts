@@ -270,6 +270,7 @@ import {
 } from "./daemon-worker-protocol.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import { type QuotaParkStatus, quotaParkWireFacts, readQuotaParkStatus } from "./quota-park-status.js";
+import { maybeInjectResumeBriefing } from "./resume-briefing.js";
 import {
 	createRlmLedgerRegistrySeedSource,
 	type LegacyRlmSubagentRegistryEntry,
@@ -295,6 +296,7 @@ import {
 	type SnapshotTranscriptChunkSource,
 	TranscriptMessageSerializationCache,
 } from "./snapshot-transcript-cache.js";
+import { injectSpawnErrataGate } from "./spawn-errata-gate.js";
 import {
 	connectProbeSupervisor,
 	probeSupervisorAvailability,
@@ -2131,6 +2133,15 @@ export class AgentDaemon {
 			this.bindingCompletions.delete(state.activeSessionId);
 			completeBinding();
 		}
+		// W14-B (C5): a freshly bound persisted session gets its in-flight state back
+		// (active goal, queued inputs, interrupted operations, duty-log tail, org-memory
+		// doc index) as next-turn context. Awaited so the briefing is already pending
+		// when the worker-recovery resume below queues its turn-starting prompt.
+		if (runtime.metadata.kind !== "subagent") {
+			await maybeInjectResumeBriefing(state.runtime.session).catch((error) =>
+				this.log(`could not inject resume briefing for ${state.activeSessionId}: ${String(error)}`),
+			);
+		}
 		this.resumeWorkerInterruptedSession(state);
 		this.registerCronStoreForState(state);
 		this.rebindCronJobsToState(state);
@@ -2165,6 +2176,15 @@ export class AgentDaemon {
 		}
 		this.registerCronStoreForState(state);
 		this.rebindCronJobsToState(state);
+		// W14-B (C5): /resume, /new-then-resume and fork replace the session under a
+		// live runtime without going through addRuntime - the same in-flight briefing
+		// the bind path injects. A message-less replacement (plain /new) is skipped
+		// by the builder before any filesystem read.
+		if (state.runtime.metadata.kind !== "subagent") {
+			void maybeInjectResumeBriefing(state.runtime.session).catch((error) =>
+				this.log(`could not inject resume briefing for ${state.activeSessionId}: ${String(error)}`),
+			);
+		}
 	}
 
 	private registerCronStoreForState(state: ActiveSessionState): void {
@@ -3362,6 +3382,13 @@ export class AgentDaemon {
 				`Failed to record RLM subagent spawn for ${options.id}: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
+		// W14-B (C4): a review-class spawn carries the read-the-ledger gate into the
+		// child's first turn. Admission is settled at this point and the parent's task
+		// prompt has not started the child yet, so the gate rides ahead of the task.
+		// Best-effort: a gate failure must not fail an admitted spawn.
+		await injectSpawnErrataGate(state.runtime.session, options.prompt, sessionManager.getCwd()).catch((error) =>
+			this.log(`could not inject spawn errata gate for ${options.id}: ${String(error)}`),
+		);
 		return runtime;
 	}
 

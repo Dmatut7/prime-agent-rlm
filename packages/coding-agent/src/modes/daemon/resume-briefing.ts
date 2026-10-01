@@ -1,0 +1,187 @@
+import { readdir, stat } from "node:fs/promises";
+import { join } from "node:path";
+import type { AgentSession } from "../../core/agent-session.js";
+import type { DutyLogSummary } from "../../core/duty-log.js";
+import { formatDutyDuration, summarizeDutyLog } from "../../core/duty-log.js";
+import type { GoalState } from "../../core/goals.js";
+import { findUnconsumedWorkerRecoveryMarker } from "./worker-recovery-resume.js";
+
+/**
+ * W14-B (C5, /tmp/wave10/model-cases.md): a session reopened after a restart
+ * came back with its transcript but no first-class statement of what was in
+ * flight, so the model ran its own checklist instead of resuming the
+ * interrupted task. On every fresh bind of a persisted session the daemon
+ * injects this briefing as next-turn context: active goal (+ persistent
+ * flag), queued inputs, operations the previous worker died with, the
+ * duty-log tail, and the repo's org-memory doc index. Delivery rides the
+ * pending-next-turn queue, so it reaches the model on the first turn after
+ * the reopen without starting a turn by itself, and is never persisted ahead
+ * of a turn (no transcript pollution, no double injection on the next bind).
+ */
+
+export const RESUME_BRIEFING_CUSTOM_TYPE = "session_resume_briefing";
+
+/** The repo's decision/errata ledger, named in the briefing when it is indexed. */
+export const EVOLUTION_LEDGER_RELATIVE_PATH = "docs/fork/evolution-ledger.md";
+
+/** How many org-memory docs the index lists, newest first. */
+const ORG_DOCS_LIMIT = 5;
+
+const OBJECTIVE_PREVIEW_CHARS = 160;
+
+export interface ResumeBriefingInput {
+	/** The rehydrated goal state; only non-idle, non-complete goals with an objective are reported. */
+	goal?: GoalState | undefined;
+	/** Queued (not yet delivered) inputs the rebuilt session still holds. */
+	queuedCount: number;
+	/** Operations the previous worker had in flight when it stopped (worker-recovery marker). */
+	interruptedOperations: readonly string[];
+	/** The duty-log summary over the transcript tail, when the session did anything. */
+	duty?: DutyLogSummary | undefined;
+	/** Org-memory docs (repo-relative paths), newest first. */
+	orgDocs: readonly string[];
+	now: number;
+}
+
+function preview(text: string, chars: number): string {
+	const flat = text.replace(/\s+/g, " ").trim();
+	return flat.length > chars ? `${flat.slice(0, chars - 1)}…` : flat;
+}
+
+function goalLine(goal: GoalState): string | undefined {
+	if (!goal.objective || goal.status === "idle" || goal.status === "complete") return undefined;
+	const budget = goal.tokenBudget === undefined ? `${goal.tokensUsed}` : `${goal.tokensUsed}/${goal.tokenBudget}`;
+	const persistent = goal.persistent ? " (persistent)" : "";
+	return `- Goal: status: ${goal.status}${persistent} — "${preview(goal.objective, OBJECTIVE_PREVIEW_CHARS)}" — ${budget} tokens used, ${goal.continuationsUsed} continuations used.`;
+}
+
+function dutyLine(duty: DutyLogSummary, now: number): string {
+	const parts = [
+		`worked ${formatDutyDuration(duty.activeMs)} and finished ${duty.finishedTurns} turn(s) over the ${formatDutyDuration(duty.awayMs)} before the reopen`,
+	];
+	if (duty.lastDoing) parts.push(`last doing: "${duty.lastDoing}"`);
+	if (duty.unfinished) parts.push(`possibly unfinished: "${duty.unfinished}"`);
+	if (duty.pending.length > 0) {
+		const first = duty.pending[0]!;
+		const age = now - first.at < 60_000 ? "just now" : `${formatDutyDuration(now - first.at)} ago`;
+		parts.push(`${duty.pending.length} decision(s) pending, first: "${first.question}" (${age})`);
+	}
+	const open = duty.incidents.filter(
+		(incident) => incident.kind === "child_failed" || incident.handled < incident.count,
+	);
+	if (open.length > 0) parts.push(`${open.length} incident class(es) not yet resolved`);
+	return `- Duty log tail: ${parts.join("; ")}.`;
+}
+
+/**
+ * The briefing text, or undefined when nothing was in flight (a resumed but
+ * otherwise quiet session stays quiet). Pure: every fact is passed in.
+ */
+export function buildResumeBriefing(input: ResumeBriefingInput): string | undefined {
+	const lines: string[] = [];
+	if (input.goal) {
+		const line = goalLine(input.goal);
+		if (line) lines.push(line);
+	}
+	if (input.interruptedOperations.length > 0) {
+		lines.push(
+			`- Interrupted work: the previous worker stopped with these operations in flight: ${input.interruptedOperations.join(", ")}. They were not replayed; inspect external side effects before redoing them.`,
+		);
+	}
+	if (input.queuedCount > 0) {
+		lines.push(`- ${input.queuedCount} queued input message(s) wait from before the reopen.`);
+	}
+	if (input.duty) lines.push(dutyLine(input.duty, input.now));
+	if (input.orgDocs.length > 0) {
+		const ledgerClause = input.orgDocs.includes(EVOLUTION_LEDGER_RELATIVE_PATH)
+			? ` Read ${EVOLUTION_LEDGER_RELATIVE_PATH} before initiating new lines of work.`
+			: "";
+		lines.push(`- Org memory (newest first): ${input.orgDocs.join(", ")}.${ledgerClause}`);
+	}
+	if (lines.length === 0) return undefined;
+	return [
+		"<session_resume_briefing>",
+		"This session was reopened from its saved transcript (restart, resume, or switch) and its in-memory state was rebuilt. In-flight facts at reopen:",
+		...lines,
+		"These are facts about where this session stood, not a new instruction. Prefer resuming the in-flight task over starting unrelated work unless the user's next message says otherwise.",
+		"</session_resume_briefing>",
+	].join("\n");
+}
+
+/** Operations an unconsumed worker-recovery marker carries, defensively parsed. */
+function interruptedOperationsOf(marker: ReturnType<typeof findUnconsumedWorkerRecoveryMarker>): string[] {
+	const details = marker?.details;
+	if (!details || typeof details !== "object") return [];
+	const operations = (details as Record<string, unknown>).operations;
+	if (!Array.isArray(operations)) return [];
+	return operations.filter((operation): operation is string => typeof operation === "string");
+}
+
+/** The newest org-memory docs under <cwd>/docs/fork, repo-relative, newest first. */
+async function listOrgMemoryDocs(cwd: string): Promise<string[]> {
+	const dir = join(cwd, "docs", "fork");
+	let names: string[];
+	try {
+		names = await readdir(dir);
+	} catch {
+		return [];
+	}
+	const docs: Array<{ path: string; mtimeMs: number }> = [];
+	for (const name of names) {
+		if (!name.endsWith(".md")) continue;
+		try {
+			const stats = await stat(join(dir, name));
+			if (!stats.isFile()) continue;
+			docs.push({ path: `docs/fork/${name}`, mtimeMs: stats.mtimeMs });
+		} catch {
+			// A doc that vanished mid-scan is simply not indexed.
+		}
+	}
+	return docs
+		.sort((a, b) => b.mtimeMs - a.mtimeMs)
+		.slice(0, ORG_DOCS_LIMIT)
+		.map((doc) => doc.path);
+}
+
+/** The public surface of AgentSession the briefing reads and writes. */
+export type ResumeBriefingSession = Pick<
+	AgentSession,
+	"goalState" | "getSessionActionSnapshot" | "sendCustomMessage" | "sessionManager"
+>;
+
+/**
+ * Inject the resume briefing as next-turn context. Returns true when a
+ * briefing landed. Skips sessions without any prior conversation (a fresh
+ * file has nothing to forget) and sessions where nothing was in flight.
+ * Callers: the daemon's fresh-bind paths (addRuntime, sessionReplaced).
+ */
+export async function maybeInjectResumeBriefing(
+	session: ResumeBriefingSession,
+	options: { now?: number } = {},
+): Promise<boolean> {
+	const now = options.now ?? Date.now();
+	const branch = session.sessionManager.getBranch();
+	if (!branch.some((entry) => entry.type === "message")) return false;
+	const briefing = buildResumeBriefing({
+		goal: session.goalState,
+		queuedCount: session.getSessionActionSnapshot().queuedCount,
+		interruptedOperations: interruptedOperationsOf(findUnconsumedWorkerRecoveryMarker(branch)),
+		duty: summarizeDutyLog({ entries: branch, now }),
+		orgDocs: await listOrgMemoryDocs(session.sessionManager.getCwd()),
+		now,
+	});
+	if (!briefing) return false;
+	await session.sendCustomMessage(
+		{
+			customType: RESUME_BRIEFING_CUSTOM_TYPE,
+			content: briefing,
+			display: false,
+			details: {
+				goalStatus: session.goalState.status,
+				queuedCount: session.getSessionActionSnapshot().queuedCount,
+			},
+		},
+		{ deliverAs: "nextTurn" },
+	);
+	return true;
+}
