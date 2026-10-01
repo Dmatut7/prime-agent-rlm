@@ -1,3 +1,9 @@
+## 2026-10-02 wave-9 收尾：五批落地 + 队列吞输入真回归修复 + digest 原地重算
+
+- 老板能感觉到的：排队等额度（quota park）更耐用了——重启后唤醒预算不丢、唤醒任务丢了会补上、等待中止后会自己再试一次而不是无声结束；「额度等待」状态不会再误报成「会话死了」通知上游；被取消的输入准备不再把排队消息永久卡住（这是 wave-9 自己引入、被验证集群抓到、本波修掉的真回归）；所有 provider 失败的终止路径（请求预算耗尽、Retry-After 超限、配额等待中止）现在统一多一次恢复轮才结束，和重试梯子耗尽的行为一致；`retry.emptyTurn.maxAttempts: 1` 现在真等于「不重试」（以前还留着一条升级慢梯）；compaction 收尾时内核状态写盘失败不再把已提交的压缩误判为失败；agent 循环的失败路径不再静默——流没给终止事件、工具事件槽崩了、调用方配置被中途改之类都各有明确收尾；凭证登录现在落盘即验证（写不进、读不回会直接报错而不是假装登录成功）；从别处克隆的项目缺包不再无人值守自动安装（跳过并警告，显式装用 `prime-agent package install <source> --local`）；`/share` 和 traces 上传的脱敏补上了 Prime CLI 的 api_key；会话记录写入带 fsync，断电不再丢已显示的轮次；Esc 键行为与文档一致（一下清草稿，不再莫名弹会话树）；bracketed paste 不再吞终端探测应答；`/settings` 搜索框里空格能正常输入了。
+- 做法：wave-9 未提交批次（w9a~w9h，73 文件 +3544/−510）经六路验证（agent 148 绿 / ai 全绿[本机 ollama 环境假失败豁免] / coding-agent 顶层 9081 绿+8 例本机 claude ambient 环境漂移 / suite 1616 全绿 / tui 1034 绿 / python 654 绿），12 个确定性红分流四路修复：2 个测试 harness 补字段、4 个旧契约测试同步到「终止路径也有恢复轮」的新有意行为、1 个 wave-9 自带测试注入点重写、1 个真源码回归（pump epoch 下沉后 deferred 分支不重调度）由主席修复（agent-session.ts:11368 补 `_scheduleSessionInputPump()`，agent-session-queue 114/114 绿）。HEAD 自带的 digest 红（wave-8 的 2f3f5a82d 加 messagesOmitted 未重算）按 rev-37 先例原地重算为 schema-44-69c0ff689f92。分五批提交（agent/ai/tui/runtime/coding-agent）+ 本档。新增长期记忆 docs/fork/evolution-ledger.md（演化账本，后续波次从它恢复）。需要重新编译并重启后才生效。
+- 验证新发现已进账本 Backlog：ai 包 ollama 门控测试缺陷、image-model 测试对本机 claude 凭证敏感、tui 的 vitest 配置历史错配、python 两条 ResourceWarning。
+
 ## 2026-10-01 wave-8 两批修复：attach 大会话客户端接通、in-process 也能看到额度等待
 
 - 老板能感觉到的：attach 一个很大的会话现在客户端也只加载最近 100 条，往上滚动时按需回填历史，大会话秒开；in-process（不经 daemon）的连接也能看到额度等待状态；文档补齐了 `PI_DISABLE_CLAUDE_CODE_DETECTION` 的用法说明。
