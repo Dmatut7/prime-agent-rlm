@@ -4,7 +4,12 @@ import { describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent, AgentSessionEventListener, PromptOptions } from "../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { emptyGoalState } from "../src/core/goals.js";
-import { SESSION_TREE_MAX_WIRE_DEPTH, SESSION_TREE_MAX_WIRE_NODES } from "../src/core/session-manager.js";
+import {
+	type CustomEntry,
+	SESSION_TREE_MAX_WIRE_DEPTH,
+	SESSION_TREE_MAX_WIRE_NODES,
+	type SessionEntry,
+} from "../src/core/session-manager.js";
 import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
 import type { AgentConnectionEvent, AgentConnectionState } from "../src/modes/agent-connection/types.js";
 
@@ -424,5 +429,104 @@ describe("InProcessAgentConnection", () => {
 		expect(runtime.rebindSession).toBeUndefined();
 		expect(runtime.beforeSessionInvalidate).toBeUndefined();
 		expect(runtime.disposed).toBe(true);
+	});
+});
+
+describe("initial snapshot quotaPark", () => {
+	// Mirrors the daemon attach snapshot (rev 43): the in-process adapter never
+	// emits quota_park_status events, so the initial snapshot is the only channel
+	// through which an in-process client learns the session is parked.
+	const resumeAt = new Date(Date.now() + 3_600_000).toISOString();
+
+	function parkEntry(data: { resumeAt: string; parkCount: number; provider?: string }): CustomEntry {
+		return {
+			id: "park-1",
+			parentId: null,
+			timestamp: new Date(1).toISOString(),
+			type: "custom",
+			customType: "provider_quota_park",
+			data,
+		};
+	}
+
+	function resumeEntry(): CustomEntry {
+		return {
+			id: "resume-1",
+			parentId: "park-1",
+			timestamp: new Date(2).toISOString(),
+			type: "custom",
+			customType: "provider_quota_resume",
+			data: { outcome: "wake" },
+		};
+	}
+
+	function parkedFakeSession(id: string, branch: SessionEntry[]): FakeSessionControl {
+		const control = createFakeSession(id, [userMessage("parked", 1)]);
+		Object.assign(control.session, { isQuotaParked: true });
+		Object.assign(control.session.sessionManager, { getBranch: () => branch });
+		return control;
+	}
+
+	it("seeds the snapshot quotaPark from the persisted park entry", async () => {
+		const session = parkedFakeSession("parked", [parkEntry({ resumeAt, parkCount: 2, provider: "openai" })]);
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+
+		const snapshot = await connection.getInitialSnapshot();
+
+		expect(snapshot.quotaPark).toMatchObject({ parked: true, resumeAt, parkCount: 2, provider: "openai" });
+		expect(snapshot.quotaPark?.remainingMs).toBeGreaterThan(3_600_000 - 60_000);
+		expect(snapshot.quotaPark?.remainingMs).toBeLessThanOrEqual(3_600_000);
+	});
+
+	it("omits quotaPark when the session is not parked, without walking the branch", async () => {
+		const session = createFakeSession("idle", [userMessage("idle", 1)]);
+		Object.assign(session.session, { isQuotaParked: false });
+		Object.assign(session.session.sessionManager, {
+			getBranch: () => {
+				throw new Error("branch must not be walked for a session that is not parked");
+			},
+		});
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+
+		const snapshot = await connection.getInitialSnapshot();
+
+		expect(snapshot.quotaPark).toBeUndefined();
+		expect("quotaPark" in snapshot).toBe(false);
+	});
+
+	it("treats a resume entry newer than the park entry as a spent park", async () => {
+		const session = parkedFakeSession("spent", [parkEntry({ resumeAt, parkCount: 1 }), resumeEntry()]);
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+
+		const snapshot = await connection.getInitialSnapshot();
+
+		expect(snapshot.quotaPark).toBeUndefined();
+		expect("quotaPark" in snapshot).toBe(false);
+	});
+
+	it("carries parked:true alone when the park has no persisted entry", async () => {
+		const session = parkedFakeSession("in-memory", []);
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+
+		const snapshot = await connection.getInitialSnapshot();
+
+		expect(snapshot.quotaPark).toEqual({ parked: true });
+	});
+
+	it("still returns the snapshot when the branch is unreadable mid-teardown", async () => {
+		const session = createFakeSession("teardown", [userMessage("teardown", 1)]);
+		Object.assign(session.session, { isQuotaParked: true });
+		Object.assign(session.session.sessionManager, {
+			getBranch: () => {
+				throw new Error("session is mid-teardown");
+			},
+		});
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+
+		const snapshot = await connection.getInitialSnapshot();
+
+		expect(snapshot.quotaPark).toBeUndefined();
+		expect("quotaPark" in snapshot).toBe(false);
+		expect(snapshot.messages).toEqual([userMessage("teardown", 1)]);
 	});
 });

@@ -1,0 +1,2 @@
+- Documented `PI_DISABLE_CLAUDE_CODE_DETECTION` in the usage.md environment-variable table, matching the provider docs.
+- Added the quota-park field to the in-process connection's initial snapshot, mirroring the daemon attach snapshot, so an in-process attach into a quota-parked session seeds the countdown immediately instead of staying blind.

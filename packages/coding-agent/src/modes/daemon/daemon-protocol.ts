@@ -334,10 +334,11 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   (before/limit), the backfill path a slim client uses for older history; an
 //   old daemon ignores the fields and answers with the full list, so the
 //   sender-side gate (minSchemaRevision 44 + capability) is what stops a client
-//   from depending on the smaller payload. Catch-up resyncs and replacement
-//   snapshots keep the full transcript: they are the repair channel, and a
-//   supervisor-side resync serves every client from the one cached chunk
-//   transfer. The digest recomputation covers the command-arm and
+//   from depending on the smaller payload. The window applies to every
+//   snapshot built for a declaring client (attach, replacement, resync); the
+//   supervisor-side resync path still serves non-declaring clients the full
+//   cached chunk transfer, and its cache always retains the full transcript.
+//   The digest recomputation covers the command-arm and
 //   snapshot-wrapper growth.
 export const DAEMON_SCHEMA_REVISION = 44;
 export const DAEMON_SCHEMA_ID = "protocol-7-schema-44-af9e1ae34e55";

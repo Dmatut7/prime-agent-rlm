@@ -20,6 +20,7 @@ import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/sess
 import { appendOwnedSessionLineAsync, SessionManager } from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
+import { type QuotaParkStatus, quotaParkWireFacts, readQuotaParkStatus } from "../daemon/quota-park-status.js";
 import type { HeadlessCompletionResult } from "../headless-completion.js";
 import { waitForHeadlessCompletion } from "../headless-completion.js";
 import {
@@ -151,7 +152,23 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async getInitialSnapshot(): Promise<AgentConnectionSnapshot> {
-		return createAgentConnectionSnapshot(this.runtimeHost);
+		const snapshot = createAgentConnectionSnapshot(this.runtimeHost);
+		// Mirror the daemon's rev-43 attach snapshot (daemon-mode.ts
+		// quotaParkForSnapshot): an attach into a quota-parked session learns the
+		// park from the snapshot itself. The in-process path has no capability
+		// handshake to gate on, and it never emits quota_park_status events (the
+		// daemon owns the park sweep), so this field is the only channel.
+		let parkStatus: QuotaParkStatus | undefined;
+		try {
+			parkStatus = readQuotaParkStatus(this.session);
+		} catch {
+			// A session mid-teardown offers no branch; the snapshot simply carries no park.
+			parkStatus = undefined;
+		}
+		if (parkStatus) {
+			snapshot.quotaPark = quotaParkWireFacts(parkStatus);
+		}
+		return snapshot;
 	}
 
 	async getRlmChildSnapshots(): Promise<AgentConnectionRlmChildAgentSnapshot[]> {
