@@ -1,0 +1,2 @@
+- Wrapped the remaining CLI startup error prints (`--fork` conflicts, session selector, missing cwd, and friends) and the shutdown confirmation prompt to the terminal width, so narrow terminals no longer split words mid-token.
+- Removed dead kernel-snapshot reference handling in the artifact-dir retention classes (no writer produces `.in-use` records any more); unreadable reference state still protects the directory.

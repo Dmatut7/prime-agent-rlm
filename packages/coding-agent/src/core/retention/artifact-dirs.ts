@@ -15,8 +15,10 @@
 // Every root the tree contains is therefore searched for transcripts (red test R-2).
 //
 // Nothing here deletes bytes that belong to a session that may come back:
-// a resident session, a live ledger edge, a live kernel-snapshot reference, or
-// any transcript anywhere keeps the directory.
+// a resident session, a live ledger edge, kernel-snapshot reference state that
+// cannot be read (the in-use reference writer is gone - nothing produces
+// `.in-use` records any more - so only the unverifiable state still protects),
+// or any transcript anywhere keeps the directory.
 import { join, resolve } from "node:path";
 import { readSessionArtifactTombstones, tombstoneInForce } from "../session-artifact-tombstones.js";
 import { isValidSessionId } from "../session-id.js";
@@ -52,7 +54,6 @@ export interface ArtifactCandidate {
 	tree: TreeAggregate;
 	tombstonePresent: boolean;
 	tombstoneInForce: boolean;
-	liveSnapshotReferences: number;
 	snapshotStateUnknown: boolean;
 	ledgerDeleted: boolean;
 	ledgerLive: boolean;
@@ -191,7 +192,6 @@ function buildCandidate(
 		tree,
 		tombstonePresent: tombstone !== undefined,
 		tombstoneInForce: tombstoneInForce(tombstone, tree.newestMtimeMs),
-		liveSnapshotReferences: snapshotState.references.length,
 		snapshotStateUnknown: snapshotState.unknown,
 		ledgerDeleted,
 		ledgerLive,
@@ -221,9 +221,6 @@ function protectionReason(
 	if (candidate.snapshotStateUnknown) {
 		return { path: candidate.path, reason: SKIP.unverifiable("kernel-snapshot-reference-state") };
 	}
-	if (candidate.liveSnapshotReferences > 0) {
-		return { path: candidate.path, reason: SKIP.inUse("pid"), detail: "live kernel snapshot reference" };
-	}
 	if (candidate.tree.unreadable) {
 		return { path: candidate.path, reason: SKIP.unverifiable("tree") };
 	}
@@ -233,7 +230,8 @@ function protectionReason(
 		// does not make the child live - what remains in its artifact directory
 		// (semantic edges, a kernel snapshot, a local harness copy) is residue by
 		// round-09 ruling 3. Nothing live can be written here: a resident session,
-		// a live lease and a live kernel reference were checked above.
+		// a live lease and unreadable kernel-snapshot reference state were checked
+		// above.
 		return undefined;
 	}
 	if (candidate.transcriptRoot !== undefined) {
@@ -255,9 +253,9 @@ function protectionReason(
 		}
 		// r38 LIFE-2 dead zone: a directory with no deletion record also has no
 		// writer left that could ever produce one - not resident, not leased, no
-		// ledger edge, no transcript, no kernel-snapshot reference, all checked
-		// above. When the ledger was positively scanned, "no live edge" is
-		// knowledge rather than a probe failure, so the class age window is the
+		// ledger edge, no transcript, kernel-snapshot reference state fully read,
+		// all checked above. When the ledger was positively scanned, "no live edge"
+		// is knowledge rather than a probe failure, so the class age window is the
 		// judge and the directory is reclaimable; an unscanned ledger keeps the
 		// skip, because "cannot disprove liveness" must not read as "gone".
 		if (options.ledgerScanned === true) {
@@ -483,11 +481,12 @@ export const artifactEmptyDirsModule: RetentionClassModule = {
 
 /**
  * Leftovers of a session that is provably gone: a deletion record (a tombstone
- * still in force, or a ledger delete for that child), no live kernel reference,
- * not resident or leased, and nothing written into the directory inside the
- * window. A live session writes into its artifact directory on every turn, so a
- * quiet directory is residue - and if any piece of evidence is missing, or if
- * anything inside the directory is still protected, the directory is kept.
+ * still in force, or a ledger delete for that child), readable kernel-snapshot
+ * reference state, not resident or leased, and nothing written into the
+ * directory inside the window. A live session writes into its artifact
+ * directory on every turn, so a quiet directory is residue - and if any piece
+ * of evidence is missing, or if anything inside the directory is still
+ * protected, the directory is kept.
  */
 export const artifactResidueModule: RetentionClassModule = {
 	id: "artifact-residue-dirs",

@@ -34,7 +34,7 @@ import {
 	formatShutdownNextSteps,
 	isVersionOnlyBuildId,
 } from "./daemon-ps-format.js";
-import { promptYesNo } from "./daemon-stop-confirm.js";
+import { formatConfirmPromptText, promptYesNo } from "./daemon-stop-confirm.js";
 import {
 	bindStopSelection,
 	currentShutdownScope,
@@ -46,6 +46,7 @@ import {
 	type ShutdownScope,
 	type StopSelection,
 } from "./daemon-stop-scope.js";
+import { getStdoutWidth } from "./stdout-wrap.js";
 
 /**
  * `daemon ps` discovers every prime-agent daemon on the machine, not just the
@@ -1537,7 +1538,11 @@ export async function runShutdownSelection(
 				`Shutdown requires confirmation in an interactive terminal. Use "prime-agent shutdown --force". Requested scope: ${describeShutdownScope(scoped.scope)}.`,
 			);
 		case "prompt": {
-			const confirmed = await promptYesNo(`${humanReport}\n${formatShutdownQuestion(scoped, selected)}`);
+			// Same wrapping as confirmDaemonSessionLoss: no mid-word folds at narrow widths,
+			// with room reserved for the " [y/N] " suffix readline appends.
+			const confirmed = await promptYesNo(
+				formatConfirmPromptText(`${humanReport}\n${formatShutdownQuestion(scoped, selected)}`, getStdoutWidth()),
+			);
 			if (!confirmed) {
 				console.log(chalk.dim("Shutdown cancelled."));
 				return;

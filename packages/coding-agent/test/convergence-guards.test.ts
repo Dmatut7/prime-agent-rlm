@@ -32,6 +32,8 @@ describe("process liveness has a single source", () => {
 	// semantics had drifted apart; the shared implementations live in utils/child-process.ts.
 	const convergedFiles = [
 		"core/session-lease.ts",
+		"core/turn-liveness.ts",
+		"core/kernel/bootstrap.ts",
 		"cli/daemon-ps.ts",
 		"cli/daemon-update-restart.ts",
 		"modes/daemon/daemon-mode.ts",
@@ -105,6 +107,7 @@ describe("wave-10 dead symbols stay deleted", () => {
 		"clearPrimeCliCredentials",
 		"getNewEntries",
 		"compareVersions",
+		"liveSnapshotReferences",
 	];
 
 	const sources = allSourceFiles().map((path) => ({ path, source: readFileSync(path, "utf8") }));

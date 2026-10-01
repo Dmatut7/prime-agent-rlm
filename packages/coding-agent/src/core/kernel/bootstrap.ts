@@ -10,6 +10,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { getLogger } from "@earendil-works/pi-ai";
 import { getPackageDir, isBunBinary } from "../../config.js";
+import { processIdExists } from "../../utils/child-process.js";
 import { readKernelBootstrapSettings } from "../settings-manager.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 import {
@@ -876,15 +877,6 @@ function bootstrapLockDir(venv: string): string {
 	return path.join(path.dirname(venv), `${path.basename(venv)}${BOOTSTRAP_LOCK_NAME}`);
 }
 
-function processIsRunning(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return isNodeError(error, "EPERM");
-	}
-}
-
 async function readLockPid(lockDir: string): Promise<number | null> {
 	try {
 		const raw = await readFile(path.join(lockDir, "pid"), "utf8");
@@ -957,7 +949,11 @@ async function acquireBootstrapLock(
 			}
 
 			const pid = await readLockPid(lockDir);
-			if (pid === null ? await lockMissingPidIsStale(lockDir) : !processIsRunning(pid)) {
+			// processIdExists, not isProcessAlive: the poll runs every BOOTSTRAP_LOCK_RETRY_MS
+			// for the whole wait, where forking `ps` per retry would cost more than the lock.
+			// A zombie holder is transient (its parent reaps it), so the cheap probe's one
+			// retry of delay is the worst case, and EPERM still means "somebody's bootstrap".
+			if (pid === null ? await lockMissingPidIsStale(lockDir) : !processIdExists(pid)) {
 				await rm(lockDir, { recursive: true, force: true });
 				continue;
 			}

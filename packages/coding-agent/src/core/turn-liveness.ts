@@ -29,6 +29,7 @@
  */
 
 import { getLogger } from "@earendil-works/pi-ai";
+import { processIdExists } from "../utils/child-process.js";
 import type { KernelLivenessSample, KernelRevivalVouch } from "./kernel/shared.js";
 import {
 	DEGRADED_READ_MAX_BYTES,
@@ -414,7 +415,7 @@ export interface KernelBashResidencyOptions {
 	now?: () => number;
 	/** Probe cap. Default {@link DEFAULT_KERNEL_BASH_PROBE_MAX}. */
 	maxProbes?: number;
-	/** Pid existence probe; injectable so tests need no real processes. Default `kill(pid, 0)`. */
+	/** Pid existence probe; injectable so tests need no real processes. Default {@link processIdExists}. */
 	isPidAlive?: (pid: number) => boolean;
 }
 
@@ -437,6 +438,15 @@ export interface KernelBashResidencyOptions {
  * it had before this fact existed. "Cannot prove live work" must mean "reclaimable as today", never
  * "resident forever" and never an exception inside an eviction sweep.
  *
+ * The default probe is `processIdExists` (kill(0), zombies count as existing, EPERM reads as
+ * "exists"). Deliberately not the ps-backed zombie check: this reader probes up to
+ * {@link DEFAULT_KERNEL_BASH_PROBE_MAX} pids per pass and that check forks `ps` per pid on
+ * macOS/BSD (~55ms each), the same trade reference-records.ts documents for its per-entry gate. A
+ * zombie handle is transient - its kernel parent reaps it - so counting it as live for one sweep
+ * costs nothing the next sweep does not correct. And deliberately not the start-id identity check:
+ * that one spawns a helper process per pid on macOS/BSD, and the age warn above is the bounded
+ * answer to pid reuse instead.
+ *
  * Still a lower bound, in two documented ways: the bounded tail read can miss a record whose newest
  * line fell outside the window, and candidates past the probe cap are counted live without a probe
  * (the direction that keeps a real script resident).
@@ -452,7 +462,7 @@ export function readKernelBashResidency(
 	}
 	const now = (options.now ?? Date.now)();
 	const maxProbes = options.maxProbes ?? DEFAULT_KERNEL_BASH_PROBE_MAX;
-	const isPidAlive = options.isPidAlive ?? defaultPidAlive;
+	const isPidAlive = options.isPidAlive ?? processIdExists;
 	try {
 		const records = readActiveOrphanProcesses(path, process.pid, { maxBytes: DEGRADED_READ_MAX_BYTES });
 		// The journal is shared by the host and its kernels; records written by a kernel carry the
@@ -486,21 +496,6 @@ export function readKernelBashResidency(
 		};
 	} catch (error) {
 		return { error: error instanceof Error ? error.message : String(error) };
-	}
-}
-
-/**
- * Does this pid still name a process. `kill(pid, 0)` never signals; EPERM means it exists and
- * belongs to somebody else, which for a residency question is still "alive". Deliberately not the
- * start-id identity check: that one spawns a helper process per pid on macOS/BSD, and the age warn
- * above is the bounded answer to pid reuse instead.
- */
-function defaultPidAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "EPERM";
 	}
 }
 

@@ -30,6 +30,7 @@ import {
 	launchDaemonUpdateRestartCoordinator,
 	waitForActiveDaemonUpdateRestartCoordinator,
 } from "./cli/daemon-update-restart.js";
+import { wrapForStderr } from "./cli/stdout-wrap.js";
 import {
 	ALLOW_REGISTRY_UPDATE_ENV,
 	APP_NAME,
@@ -1655,33 +1656,35 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 
 	if (options.invalidOption) {
 		if (options.invalidOption === "-l" && (options.command === "install" || options.command === "remove")) {
-			console.error(chalk.red('Option -l was removed. Use "--local".'));
+			console.error(wrapForStderr(chalk.red('Option -l was removed. Use "--local".')));
 			process.exitCode = 1;
 			return true;
 		}
-		console.error(chalk.red(`Unknown option ${options.invalidOption} for "${options.command}".`));
-		console.error(chalk.dim(`Use "${APP_NAME} --help" or "${getPackageCommandUsage(options.command)}".`));
+		console.error(wrapForStderr(chalk.red(`Unknown option ${options.invalidOption} for "${options.command}".`)));
+		console.error(
+			wrapForStderr(chalk.dim(`Use "${APP_NAME} --help" or "${getPackageCommandUsage(options.command)}".`)),
+		);
 		process.exitCode = 1;
 		return true;
 	}
 
 	if (options.missingOptionValue) {
-		console.error(chalk.red(`Missing value for ${options.missingOptionValue}.`));
-		console.error(chalk.dim(`Usage: ${getPackageCommandUsage(options.command)}`));
+		console.error(wrapForStderr(chalk.red(`Missing value for ${options.missingOptionValue}.`)));
+		console.error(wrapForStderr(chalk.dim(`Usage: ${getPackageCommandUsage(options.command)}`)));
 		process.exitCode = 1;
 		return true;
 	}
 
 	if (options.invalidArgument) {
-		console.error(chalk.red(`Unexpected argument ${options.invalidArgument}.`));
-		console.error(chalk.dim(`Usage: ${getPackageCommandUsage(options.command)}`));
+		console.error(wrapForStderr(chalk.red(`Unexpected argument ${options.invalidArgument}.`)));
+		console.error(wrapForStderr(chalk.dim(`Usage: ${getPackageCommandUsage(options.command)}`)));
 		process.exitCode = 1;
 		return true;
 	}
 
 	if (options.conflictingOptions) {
-		console.error(chalk.red(options.conflictingOptions));
-		console.error(chalk.dim(`Usage: ${getPackageCommandUsage(options.command)}`));
+		console.error(wrapForStderr(chalk.red(options.conflictingOptions)));
+		console.error(wrapForStderr(chalk.dim(`Usage: ${getPackageCommandUsage(options.command)}`)));
 		process.exitCode = 1;
 		return true;
 	}
