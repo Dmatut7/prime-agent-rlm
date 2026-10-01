@@ -162,22 +162,6 @@ export function computeFileLists(fileOps: FileOperations): { readFiles: string[]
 }
 
 /**
- * Remove <read-files>/<modified-files> blocks from a stored summary.
- *
- * The blocks are re-appended mechanically after every summarization (see
- * computeFileLists/formatFileOperations) and carried in the compaction entry's
- * details. Feeding stale blocks back into the update prompt makes the model
- * re-summarize them, so lists compound across repeated compactions. Strip
- * them before a previous summary reaches the summarizer; the details plus the
- * fresh append remain the single source of truth.
- */
-const FILE_LIST_BLOCK_PATTERN = /(?:\n*)<(read-files|modified-files)>[\s\S]*?<\/\1>/g;
-
-export function stripFileListBlocks(summary: string): string {
-	return summary.replace(FILE_LIST_BLOCK_PATTERN, "").trimEnd();
-}
-
-/**
  * Format file operations as XML tags for summary.
  *
  * Both lists go through renderMachineBlock like the other two blocks, so all four
