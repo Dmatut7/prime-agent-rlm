@@ -391,6 +391,26 @@ def _safe_detail(text: str, limit: int) -> str | None:
     return _one_line(text, limit)
 
 
+def _spawn_thread(target: Callable[..., Any], name: str, args: tuple[Any, ...] = ()) -> threading.Thread:
+    """Start one of the tracker's own threads, registered as kernel-owned when bash is loaded.
+
+    repl's snapshot-replay shortcut vetoes the replay while any live thread sits outside the
+    kernel-owned thread registry (``bash._register_kernel_thread``); the watcher is long-lived,
+    so an unregistered tracker thread would keep the shortcut off for the rest of the process.
+    The import is deferred because bash imports this module; a failed registration only costs a
+    full snapshot, so the thread still starts.
+    """
+    thread = threading.Thread(target=target, args=args, daemon=True, name=name)
+    try:
+        from .bash import _register_kernel_thread
+
+        _register_kernel_thread(thread)
+    except Exception:  # noqa: BLE001 - unregistered only costs a full snapshot
+        pass
+    thread.start()
+    return thread
+
+
 def _under(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
@@ -916,7 +936,7 @@ class _Tracker:
         # Resolved once, off every cell's path: a slow or hung git must not stall a write wrapper.
         self._cwd_git_resolved = threading.Event()
         self._refresh_paths()
-        threading.Thread(target=self._resolve_cwd_git_root, daemon=True, name="rlm-change-git-root").start()
+        _spawn_thread(self._resolve_cwd_git_root, "rlm-change-git-root")
 
     def _resolve_cwd_git_root(self) -> None:
         self.local.busy = True
@@ -1391,7 +1411,7 @@ class _Tracker:
             finally:
                 done.set()
 
-        threading.Thread(target=work, daemon=True, name="rlm-change-compare").start()
+        _spawn_thread(work, "rlm-change-compare")
         if not done.wait(max(0.0, _left(deadline))):
             cell.note_incomplete(_COMPARE_LATE)
             return
@@ -1645,9 +1665,7 @@ class _Tracker:
             if directories:
                 job = _SnapshotJob(directories)
                 cell.snapshots.append(job)
-                threading.Thread(
-                    target=self._run_snapshot, args=(cell, job), daemon=True, name="rlm-change-snapshot"
-                ).start()
+                _spawn_thread(self._run_snapshot, "rlm-change-snapshot", (cell, job))
             pending = [job for job in cell.snapshots if not job.done.is_set()]
         if wait:
             deadline = time.perf_counter() + max(0.0, cell.remaining())
@@ -1746,7 +1764,7 @@ class _Tracker:
                 self._gap_again = True
                 return
             self._gap_running = True
-        threading.Thread(target=self._gap_loop, daemon=True, name="rlm-change-gap").start()
+        _spawn_thread(self._gap_loop, "rlm-change-gap")
 
     def _gap_loop(self) -> None:
         self.local.busy = True
@@ -2140,8 +2158,7 @@ class _Tracker:
 
     def _wake_watcher(self) -> None:
         if self.watcher is None:
-            self.watcher = threading.Thread(target=self._watch_loop, daemon=True, name="rlm-change-watch")
-            self.watcher.start()
+            self.watcher = _spawn_thread(self._watch_loop, "rlm-change-watch")
         self.wake.set()
 
     def _watch_loop(self) -> None:

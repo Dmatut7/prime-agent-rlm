@@ -1,0 +1,3 @@
+- Fixed the worker-recovery resume marker staying armed after a session continued past the interruption through a custom-message continuation (self-recovery continues, the one-shot failure-recovery turns), which could queue a duplicate recovery resume on a later bind; those continuation types now consume the marker while notice-type custom messages still do not.
+- Fixed kernel snapshot replay staying off for the whole process once change tracking (on by default) woke its watcher thread: the tracker's `rlm-change-*` threads are now registered as kernel-owned, so they no longer veto the replay shortcut.
+- Documented `PI_DISABLE_CLAUDE_CODE_DETECTION=1` in `src/cli/args.ts`, pointing to the canonical environment-variable lists.

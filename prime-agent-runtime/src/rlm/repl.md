@@ -418,23 +418,28 @@ built-in types only: str/bytes/int/float/complex/bool/None/range, and
 tuple/frozenset of such) reuses its previously serialized blob instead of
 re-dumping it. A request that arrives with no cell executed and no restore
 applied since the last successful snapshot for the same parameters, every
-eligible name still bound to the identical object, and the committed pair intact
-on disk (regular files, payload size unchanged) is answered by replaying that
-snapshot's result without touching the files — so the manifest `timestamp`
+eligible name still bound to the identical object, no live thread outside the
+kernel-owned thread registry (the threads the kernel starts for its own
+bookkeeping are registered through `rlm.bash._register_kernel_thread`; any other
+live thread could be mutating a namespace value in place, which no fingerprint
+can see, so its presence alone forces a full snapshot), and the committed pair
+intact on disk (regular files, payload size unchanged) is answered by replaying
+that snapshot's result without touching the files — so the manifest `timestamp`
 reflects the last physical write. Any doubt falls through to a full snapshot.
 Mutable values are only reused under the no-cell-executed condition, because
-in-place mutation by a cell is invisible to identity; in-place mutation by a
-background thread while no cell runs is outside what the fingerprint can see
-(the same approximation the replay condition makes).
+in-place mutation by a cell is invisible to identity. The same mutation by a
+background thread is covered while the thread lives - the veto above - but
+leaves no signal once the thread has finished; that residual is what the
+terminal write-through below covers.
 
 `final: true` marks the host's terminal (dispose) snapshot, and such a request is
 never answered from the replay record: it is the last word on this namespace, so
 it is written even when every fingerprint says nothing changed. That covers the
-hole above for the snapshot a later kernel will restore from; ordinary per-cell
-snapshots keep the shortcut, so a payload written by one of them can still miss
-an in-place background mutation until the next cell or the terminal flush. The
-field is additive and ungated — a runtime without the shortcut has nothing to
-bypass and ignores it.
+residual above for the snapshot a later kernel will restore from; ordinary
+per-cell snapshots keep the shortcut, so a payload written by one of them can
+still miss an in-place mutation a finished background thread made until the next
+cell or the terminal flush. The field is additive and ungated — a runtime
+without the shortcut has nothing to bypass and ignores it.
 
 `preserve_names` (protocol 4, gated on the capability token) turns the write into
 a merge write: for each requested name the blob is copied verbatim from the

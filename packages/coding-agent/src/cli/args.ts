@@ -1,5 +1,14 @@
 /**
  * CLI argument parsing and help display
+ *
+ * Environment variables the CLI surface answers to are documented in
+ * docs/usage.md ("Environment Variables") and docs/providers.md; one deserves a
+ * pointer here because nothing on the command line reveals it:
+ *
+ * - `PI_DISABLE_CLAUDE_CODE_DETECTION` - set to `1` to keep an installed Claude
+ *   Code CLI from counting as a credential for the claude-code provider, so
+ *   tests and headless automation stay deterministic (read in
+ *   packages/ai/src/env-api-keys.ts).
  */
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";

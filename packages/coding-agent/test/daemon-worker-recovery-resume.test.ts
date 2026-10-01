@@ -18,8 +18,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  * 中断-6: a worker that dies mid-turn leaves a prime-agent.worker_recovery
  * marker on the transcript (supervisor catalog, from the dead worker's
  * recovery-journal busy records). On bind, a marker still tailing the branch
- * queues one automatic resume prompt; a message of either role after the marker
- * means the interruption was already answered.
+ * queues one automatic resume prompt; a message of either role, or a
+ * continuation custom message (self-recovery continue, failure-recovery turn),
+ * after the marker means the interruption was already answered.
  */
 
 let entrySeq = 0;
@@ -40,6 +41,16 @@ function markerEntry(): CustomMessageEntry {
 		content: "<prime_agent_worker_interrupted>…</prime_agent_worker_interrupted>",
 		display: false,
 		details: { activeSessionId: "dead-worker-session", operations: ["turn_end"] },
+	};
+}
+
+function customMessageEntry(customType: string): CustomMessageEntry {
+	return {
+		...entryBase(),
+		type: "custom_message",
+		customType,
+		content: "continuation or notice text",
+		display: true,
 	};
 }
 
@@ -69,6 +80,34 @@ describe("findUnconsumedWorkerRecoveryMarker", () => {
 	it("is consumed by any message after the marker - user or assistant", () => {
 		expect(findUnconsumedWorkerRecoveryMarker([markerEntry(), messageEntry("user")])).toBeUndefined();
 		expect(findUnconsumedWorkerRecoveryMarker([markerEntry(), messageEntry("assistant")])).toBeUndefined();
+	});
+
+	it("is consumed by a continuation custom message after the marker", () => {
+		// Self-recovery continues and the one-shot failure-recovery turns land as custom
+		// messages (the recovery turns through the prepared action's message override), so
+		// a session that continued past the interruption can tail one with no intervening
+		// message entry; queueing the resume again would double-continue the same work.
+		expect(findUnconsumedWorkerRecoveryMarker([markerEntry(), customMessageEntry("auto_continue")])).toBeUndefined();
+		expect(
+			findUnconsumedWorkerRecoveryMarker([markerEntry(), customMessageEntry("provider_failure_recovery")]),
+		).toBeUndefined();
+		expect(
+			findUnconsumedWorkerRecoveryMarker([markerEntry(), customMessageEntry("empty_response_recovery")]),
+		).toBeUndefined();
+	});
+
+	it("stays armed across notice custom messages - they record state, no turn answered them", () => {
+		const marker = markerEntry();
+		expect(findUnconsumedWorkerRecoveryMarker([marker, customMessageEntry("session_context_loss")])).toBe(marker);
+		expect(findUnconsumedWorkerRecoveryMarker([marker, customMessageEntry("ipython_state")])).toBe(marker);
+		expect(findUnconsumedWorkerRecoveryMarker([marker, customMessageEntry("finish_gate_released")])).toBe(marker);
+	});
+
+	it("a continuation consumes every older marker, while a newer marker still re-arms", () => {
+		const first = markerEntry();
+		const second = markerEntry();
+		expect(findUnconsumedWorkerRecoveryMarker([first, second, customMessageEntry("auto_continue")])).toBeUndefined();
+		expect(findUnconsumedWorkerRecoveryMarker([first, customMessageEntry("auto_continue"), second])).toBe(second);
 	});
 
 	it("returns only the newest of stacked markers (a session that died twice)", () => {
@@ -151,6 +190,19 @@ describe("daemon worker-recovery resume on bind", () => {
 		} as unknown as AgentSession;
 
 		internals.resumeWorkerInterruptedSession(makeBoundState("active-2", session));
+
+		expect(followUp).not.toHaveBeenCalled();
+	});
+
+	it("leaves a session whose marker was answered by a continuation custom message alone", () => {
+		const internals = makeDaemon();
+		const followUp = vi.fn(async () => true);
+		const session = {
+			sessionManager: { getBranch: () => [markerEntry(), customMessageEntry("auto_continue")] },
+			followUp,
+		} as unknown as AgentSession;
+
+		internals.resumeWorkerInterruptedSession(makeBoundState("active-4", session));
 
 		expect(followUp).not.toHaveBeenCalled();
 	});
