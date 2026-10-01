@@ -8,8 +8,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from rlm import harness as package_harness
 from rlm import rlm as callable_rlm
@@ -1679,5 +1681,190 @@ class HarnessSearchTest(unittest.TestCase):
             self.assertEqual(state.search("ab"), [])
 
 
+class HarnessPoisonEntryTest(unittest.TestCase):
+    """An entry that cannot serialize must be refused before it reaches memory or disk.
+
+    Regression: a metadata dict holding e.g. a datetime passed the shape check, was
+    inserted into the in-memory entries, and then crashed every later save() of the
+    whole store with an unhelpful TypeError, leaving memory and disk silently forked.
+    """
+
+    def test_non_serializable_metadata_is_rejected_and_names_the_leaf(self) -> None:
+        from datetime import datetime
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            state = HarnessState(state_path)
+            state.create_memory("Valid", "seed content", id="valid")
+            seeded = state_path.read_text(encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ValueError, r"memory entry 'poison' rejected: metadata must be JSON-serializable; metadata\['when'\]"
+            ):
+                state.create_memory("Poison", "x", id="poison", metadata={"when": datetime.now()})
+
+            # The poisoned entry never landed in memory or on disk, and the store
+            # keeps working (previously every later save wedged on the phantom entry).
+            self.assertIsNone(state.get("memory", "poison"))
+            self.assertEqual(state_path.read_text(encoding="utf-8"), seeded)
+            state.create_memory("After", "fine", id="after")
+            self.assertEqual(state.get("memory", "after").content, "fine")
+
+    def test_nested_and_circular_values_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            with self.assertRaisesRegex(ValueError, r"arguments\['items'\]\[2\] holds object"):
+                state.create_skill(
+                    "S", "c", id="s", reference=PYTHON_REFERENCE, arguments={"items": [1, 2, object()]}
+                )
+            circular: dict = {}
+            circular["self"] = circular
+            with self.assertRaisesRegex(ValueError, "circular reference"):
+                state.create_memory("Loop", "x", id="loop", metadata=circular)
+            self.assertEqual(state.list(), [])
+
+    def test_rejected_update_leaves_the_existing_entry_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            state = HarnessState(state_path)
+            state.create_memory("Valid", "original", id="v", metadata={"keep": "yes"})
+            seeded = state_path.read_text(encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, r"metadata\['bad'\] holds object"):
+                state.update_memory("v", "Renamed", "changed", metadata={"bad": object()})
+
+            entry = state.get("memory", "v")
+            self.assertEqual((entry.title, entry.content, entry.metadata, entry.version), ("Valid", "original", {"keep": "yes"}, 1))
+            self.assertEqual(state_path.read_text(encoding="utf-8"), seeded)
+
+
+class HarnessSaveRollbackTest(unittest.TestCase):
+    """A failed save() must not leave the in-memory store ahead of the file."""
+
+    def _failing_save(self):
+        harness_module = sys.modules["rlm.harness"]
+        return mock.patch.object(harness_module, "_write_private_json_atomic", side_effect=OSError("disk full"))
+
+    def test_failed_save_rolls_back_a_new_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Seed", "seed", id="seed")
+            with self._failing_save():
+                with self.assertRaises(OSError):
+                    state.create_memory("New", "new", id="new")
+            self.assertIsNone(state.get("memory", "new"))
+            state.create_memory("After", "ok", id="after")
+            reloaded = HarnessState(state.file_path)
+            self.assertEqual(sorted(entry.id for entry in reloaded.list("memory")), ["after", "seed"])
+
+    def test_failed_save_rolls_back_an_update(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Seed", "original", id="seed", metadata={"a": 1})
+            with self._failing_save():
+                with self.assertRaises(OSError):
+                    state.update_memory("seed", "Renamed", "changed", metadata={"b": 2})
+            entry = state.get("memory", "seed")
+            self.assertEqual((entry.title, entry.content, entry.metadata, entry.version), ("Seed", "original", {"a": 1}, 1))
+
+    def test_failed_save_rolls_back_a_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Seed", "original", id="seed")
+            with self._failing_save():
+                with self.assertRaises(OSError):
+                    state.delete_memory("seed")
+            self.assertIsNotNone(state.get("memory", "seed"))
+
+    def test_failed_save_rolls_back_a_refinement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            with self._failing_save():
+                with self.assertRaises(OSError):
+                    state.record_refinement("trigger", "change")
+            self.assertEqual(state.refinements, [])
+
+
+@unittest.skipIf(os.name == "nt", "flock is POSIX-only; Windows states are in-memory")
+class HarnessWriteLockTest(unittest.TestCase):
+    """sync+mutate+save is one critical section across threads and across kernels."""
+
+    def test_writes_take_a_sidecar_flock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("A", "a", id="a")
+            self.assertTrue((Path(temp_dir) / "harness_state.json.lock").exists())
+
+    def test_concurrent_threads_never_lose_an_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            threads = 8
+            per_thread = 15
+
+            def writer(worker: int) -> None:
+                for index in range(per_thread):
+                    state.create_memory(f"W{worker}-{index}", "x", id=f"w{worker}-{index}")
+
+    def test_concurrent_threads_never_lose_an_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            threads = 8
+            per_thread = 15
+            barrier = threading.Barrier(threads)
+            errors: list[BaseException] = []
+
+            def writer(worker: int) -> None:
+                try:
+                    barrier.wait(timeout=10)
+                    for index in range(per_thread):
+                        state.create_memory(f"W{worker}-{index}", "x", id=f"w{worker}-{index}")
+                except BaseException as error:  # noqa: BLE001 - reported below
+                    errors.append(error)
+
+            pool = [threading.Thread(target=writer, args=(worker,)) for worker in range(threads)]
+            for thread in pool:
+                thread.start()
+            for thread in pool:
+                thread.join(timeout=60)
+            self.assertFalse(errors, errors)
+            expected = {f"w{worker}-{index}" for worker in range(threads) for index in range(per_thread)}
+            self.assertEqual({entry.id for entry in state.list("memory")}, expected)
+            reloaded = HarnessState(Path(temp_dir) / "harness_state.json")
+            self.assertEqual({entry.id for entry in reloaded.list("memory")}, expected)
+
+    def test_concurrent_processes_serialize_on_the_flock(self) -> None:
+        # Two kernels sharing one store (the RLM swarm shape): without the flock the
+        # sync-mutate-save window silently drops one writer's entries.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            env = {key: value for key, value in os.environ.items() if not key.startswith(("RLM_", "PRIME_AGENT_", "PI_"))}
+            workers = 4
+            per_worker = 10
+            script = (
+                "import sys\n"
+                "from rlm.harness import HarnessState\n"
+                "state = HarnessState(sys.argv[1])\n"
+                "for index in range(%d):\n"
+                "    state.create_memory(f'{sys.argv[2]}-{index}', 'x', id=f'{sys.argv[2]}-{index}')\n"
+            ) % per_worker
+            processes = [
+                subprocess.Popen(
+                    [sys.executable, "-c", script, str(state_path), f"p{worker}"],
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for worker in range(workers)
+            ]
+            for proc in processes:
+                _stdout, stderr = proc.communicate(timeout=120)
+                self.assertEqual(proc.returncode, 0, stderr)
+            reloaded = HarnessState(state_path)
+            expected = {f"p{worker}-{index}" for worker in range(workers) for index in range(per_worker)}
+            self.assertEqual({entry.id for entry in reloaded.list("memory")}, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
+

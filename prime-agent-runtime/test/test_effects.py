@@ -1235,6 +1235,72 @@ ended.add("c2")
         self.assertIn(f"{extra} background commands", status[0]["incomplete"])
 
 
+class MemoryPendingTests(TrackerCase):
+    """A harness write with no live cell must still reach the host's memory feed.
+
+    Regression: `effects.memory_change` returned early when no cell was running, so a
+    write from a detached task or background thread was invisible on every channel.
+    """
+
+    def _wait_for_state_entries(self, state_file: str, marker: str, count: int) -> None:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                with open(state_file) as handle:
+                    if handle.read().count(marker) >= count:
+                        return
+            except OSError:
+                pass
+            time.sleep(0.05)
+        self.fail(f"never saw {count} {marker!r} entries in {state_file}")
+
+    def test_a_harness_write_after_its_cell_ended_reports_at_the_next_cell(self):
+        state_file = os.path.join(self.tmp, "harness-local", "harness_state.json")
+        cell = self.kernel.run(
+            "import threading, time\n"
+            "def write_late():\n"
+            "    time.sleep(0.5)\n"
+            "    rlm.harness.create_memory('Late', 'written after the cell', id='late')\n"
+            "threading.Thread(target=write_late).start()\n"
+        )
+        self.assertEqual(cell.status, "ok")
+        # The write itself is immediate; only its report waits for the next cell.
+        # Poll the state file so the write provably lands between the two cells.
+        self._wait_for_state_entries(state_file, '"id": "late"', 1)
+
+        cell2 = self.kernel.run("pass")
+        self.assertEqual(cell2.status, "ok")
+        memory = cell2.memory()
+        self.assertIn(("memory", "session", "late"), memory)
+        record = memory[("memory", "session", "late")]
+        self.assertEqual(record["op"], "created")
+        self.assertEqual(record["after"], "written after the cell")
+        # Nothing was retro-attributed to the finished cell.
+        self.assertNotIn(("memory", "session", "late"), cell.memory())
+
+    def test_pending_memory_past_the_cap_reports_how_many_were_lost(self):
+        state_file = os.path.join(self.tmp, "harness-local", "harness_state.json")
+        extra = 5
+        total = effects.MAX_PENDING_MEMORY + extra
+        cell = self.kernel.run(
+            "import threading, time\n"
+            "def write_many():\n"
+            "    time.sleep(0.5)\n"
+            f"    for i in range({total}):\n"
+            "        rlm.harness.create_memory(f'M{i}', 'x', id=f'm{i}')\n"
+            "threading.Thread(target=write_many).start()\n"
+        )
+        self.assertEqual(cell.status, "ok")
+        self._wait_for_state_entries(state_file, '"id": "m', total)
+
+        cell2 = self.kernel.run("pass")
+        self.assertEqual(cell2.status, "ok")
+        self.assertEqual(len(cell2.payloads(MEMORY)), effects.MAX_PENDING_MEMORY)
+        status = cell2.payloads(STATUS)
+        self.assertEqual(len(status), 1, status)
+        self.assertIn(f"{extra} harness memory writes", status[0]["incomplete"])
+
+
 class BudgetTests(TrackerCase):
     extra_env = {"PRIME_AGENT_CHANGE_TRACKING_BUDGET_MS": "1"}
 

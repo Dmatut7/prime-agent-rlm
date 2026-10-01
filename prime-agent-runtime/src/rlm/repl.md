@@ -390,7 +390,9 @@ runtime-minted id and awaits the matching `host_reply`, returning its `data`
 dict verbatim. Replies are routed on the reader thread like `interrupt` —
 never through the request queue, since the awaiting cell is itself the
 in-flight execute. Replies for unknown ids, or for a request whose awaiting
-cell was cancelled, are dropped. `rlm.repl.is_active()` reports whether the
+cell was cancelled, are reported as an unattributed (id-less) stderr frame
+rather than dropped: the host finished that work, so the model must not
+repeat it blindly. `rlm.repl.is_active()` reports whether the
 process is serving the protocol (importing the module does not count).
 
 ## Snapshot / restore

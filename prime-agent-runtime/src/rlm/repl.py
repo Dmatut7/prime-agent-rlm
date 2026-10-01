@@ -841,6 +841,10 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
         effects.discard_cell(cell_id)
         _current_cell.reset(token)
         _reset_current_cell(bash_token)
+        # One linecache entry per cell would otherwise grow with the session's total
+        # cell source. The cell's own errors were formatted before its done frame, so
+        # only a stale exception object printed by a later cell loses its source lines.
+        linecache.cache.pop(filename, None)
 
 
 def _drain_output() -> None:
@@ -1211,6 +1215,13 @@ def _snapshot_state(
                     oversized.append(name)
                 continue
         else:
+            if blob_cache is not None:
+                # Any fresh dump means a rebind: the old entry's identity check can
+                # never match again and it pins a dead object, so it always goes -
+                # also when the new value is mutable or fails to pickle.
+                replaced = blob_cache.pop(name, None)
+                if replaced is not None:
+                    cache_bytes -= len(replaced[1])
             buffer = io.BytesIO()
             try:
                 dill.dump(value, _CappedWriter(buffer, limit))
@@ -1226,12 +1237,7 @@ def _snapshot_state(
                 skipped.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
                 continue
             if blob_cache is not None and _deeply_immutable(value):
-                # An entry surviving to this fresh dump means a rebind: its identity check
-                # can never match again and it pins a dead object, so it always goes. The
-                # fresh blob is pinned only while the aggregate cache cap has room.
-                replaced = blob_cache.pop(name, None)
-                if replaced is not None:
-                    cache_bytes -= len(replaced[1])
+                # The fresh blob is pinned only while the aggregate cache cap has room.
                 if cache_bytes + len(blob) <= _SNAPSHOT_BLOB_CACHE_MAX_BYTES:
                     blob_cache[name] = (value, blob)
                     cache_bytes += len(blob)
@@ -1852,8 +1858,12 @@ async def _serve(queue: asyncio.Queue[dict[str, Any]], ns: dict[str, Any]) -> No
             # Kill live bash children now; atexit would wait on parked executor threads.
             _kill_live_handles()
             # Trailing coalesced output (including the MCP failure print above) must
-            # reach the host before the final done and process exit.
+            # reach the host before the final done and process exit. Raw bytes written
+            # to fds 1/2 since the last cell's drain (C extensions, children racing the
+            # kill) ride the pumps, so drain them too or they are lost at exit.
             _stream_coalescer.flush()
+            _pump_out.drain()
+            _pump_err.drain()
             if isinstance(rid, str):
                 _send({"event": "done", "id": rid, "status": "ok"})
             return
@@ -2161,6 +2171,32 @@ _pump_out: _Pump
 _pump_err: _Pump
 
 
+def _reset_after_fork_in_child() -> None:
+    """Detach the protocol channel in a forked child.
+
+    fork() copies the parent's fds and module state but not its threads: in the
+    child the coalescer's flush thread is gone (buffered output would never
+    ship), `_write_lock` may be inherited while a parent thread holds it (the
+    first print would deadlock), and a write that does reach the shared protocol
+    fd interleaves with the parent's frames with no cross-process lock - the
+    host reads torn frames as protocol corruption and kills the kernel (see
+    effects._disable_in_child for the same rule on the tracking side). So: the
+    protocol fd is forgotten (`_send` becomes a no-op), the coalescer and the
+    write lock are rebuilt per-process, and sys.stdout/sys.stderr fall back to
+    raw writers on the captured pipe fds, whose bytes the parent's pumps still
+    ship as unattributed (id:null) stream events.
+    """
+    global _protocol_fd, _write_lock, _stream_coalescer
+    _protocol_fd = -1
+    _write_lock = threading.Lock()
+    _stream_coalescer = _StreamCoalescer()
+    for name in ("stdout", "stderr"):
+        writer = getattr(sys, name, None)
+        if isinstance(writer, _TaggedWriter):
+            raw = io.FileIO(writer.fileno(), mode="w", closefd=False)
+            setattr(sys, name, io.TextIOWrapper(io.BufferedWriter(raw), encoding="utf-8", errors="replace"))
+
+
 def _setup_fds() -> int:
     """Reserve stdout for the protocol; route fds 1/2 through captured pipes."""
     global _protocol_fd, _pump_out, _pump_err
@@ -2189,6 +2225,10 @@ def main() -> None:
     _negotiated_protocol = resolve_protocol_version(os.environ.get(PROTOCOL_ENV_VAR))
     stdin_fd = _setup_fds()
     _stream_coalescer.start()
+    if hasattr(os, "register_at_fork"):
+        # Multiprocessing's fork start method (Linux default below 3.14) and in-cell
+        # os.fork() both land here: the child must not inherit the live protocol face.
+        os.register_at_fork(after_in_child=_reset_after_fork_in_child)
     _start_owner_watchdog()
     _start_heartbeat()
 

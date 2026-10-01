@@ -136,7 +136,7 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(env["GIT_SEQUENCE_EDITOR"], "true")
         self.assertEqual(env["EDITOR"], "true")
         self.assertEqual(env["VISUAL"], "true")
-        self.assertEqual(env["GIT_TERMINAL_PROMPTS"], "0")
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(env["GIT_ASKPASS"], "true")
         self.assertEqual(env["SSH_ASKPASS_REQUIRE"], "never")
         self.assertEqual(env["PAGER"], "cat")
@@ -145,7 +145,7 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_spawned_shell_receives_non_interactive_env(self):
         handle = bash(
-            'echo "$GIT_EDITOR|$GIT_SEQUENCE_EDITOR|$GIT_TERMINAL_PROMPTS|$GIT_ASKPASS|$SSH_ASKPASS_REQUIRE"'
+            'echo "$GIT_EDITOR|$GIT_SEQUENCE_EDITOR|$GIT_TERMINAL_PROMPT|$GIT_ASKPASS|$SSH_ASKPASS_REQUIRE"'
         )
         result = await handle
         self.assertEqual(result.exit_code, 0)
@@ -1381,6 +1381,60 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
                 records = [json.loads(line) for line in f if line.strip()]
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0]["pid"], os.getpid())
+
+    def test_journal_without_owner_fails_closed(self):
+        # A configured journal whose owner is missing enrolls nothing the host
+        # reaper could act on; like an unparsable owner, that is a failure, not
+        # a permissive pass.
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = os.path.join(tmp, "journal.jsonl")
+            with mock.patch.dict(os.environ, {"PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL": journal}):
+                os.environ.pop("PRIME_AGENT_KERNEL_OWNER_PID", None)
+                self.assertFalse(bash_module._record_journal(os.getpid(), active=True))
+            self.assertFalse(os.path.exists(journal))
+
+    def test_read_status_gives_up_on_newline_free_junk(self):
+        # A stray child holding the inherited status fd open could otherwise grow
+        # the accumulator without bound by never sending a newline.
+        status_r, status_w = os.pipe()
+        wake_r, wake_w = os.pipe()
+        handle = object.__new__(bash_module.BashHandle)
+        handle._status_read = status_r
+        handle._wake_read = wake_r
+        try:
+            os.write(status_w, b"x" * 4096)
+            self.assertIsNone(handle._read_status())
+        finally:
+            os.close(status_w)
+            os.close(wake_w)
+
+    async def test_spawn_after_the_spawning_cell_is_forgotten_stays_unattributed(self):
+        # A detached task keeps its cell's id in its copied context; spawning after
+        # the cell's bookkeeping was dropped must not resurrect a dead rid's entry
+        # (a leak for a never-reaping handle, and a rid no interrupt can target).
+        token = bash_module._set_current_cell("rid-dead")
+        try:
+            first = bash("true")
+            await first
+            self.assertEqual(first._cell_id, "rid-dead")
+            self.assertIn("rid-dead", bash_module._cell_handles)
+            bash_module._forget_cell("rid-dead")
+            self.assertNotIn("rid-dead", bash_module._cell_handles)
+            second = bash("true")
+            await second
+            self.assertIsNone(second._cell_id)
+            self.assertNotIn("rid-dead", bash_module._cell_handles)
+        finally:
+            bash_module._reset_current_cell(token)
+
+    def test_forgotten_cells_tombstones_are_bounded(self):
+        for index in range(bash_module._FORGOTTEN_CELLS_MAX + 10):
+            bash_module._forget_cell(f"rid-tombstone-{index}")
+        try:
+            self.assertLessEqual(len(bash_module._forgotten_cells), bash_module._FORGOTTEN_CELLS_MAX)
+        finally:
+            for index in range(bash_module._FORGOTTEN_CELLS_MAX + 10):
+                bash_module._forgotten_cells.pop(f"rid-tombstone-{index}", None)
 
 
 async def _poll_group_dead(pgid: int, timeout: float = 5.0) -> None:

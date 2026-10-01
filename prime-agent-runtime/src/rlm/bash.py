@@ -72,6 +72,13 @@ _current_cell: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 # Live handles by spawning cell id; an interrupt TERM/KILLs the interrupted
 # cell's handles (one-shot parity). Guarded by _live_lock.
 _cell_handles: dict[str, set["BashHandle"]] = {}
+# Finished cell ids (values unused): a detached task outlives its cell but keeps
+# the cell's id in its copied context, so without this tombstone a late spawn
+# would resurrect the dead cell's _cell_handles entry - a leak for a
+# never-reaping handle, attributed to a rid no interrupt can target anymore.
+# Bounded FIFO; a tombstone that ages out only restores the previous behavior.
+_FORGOTTEN_CELLS_MAX = 4096
+_forgotten_cells: dict[str, None] = {}
 
 
 class OutputText(str):
@@ -283,6 +290,10 @@ class BashHandle:
         self._cell_id: str | None = _current_cell.get()
         with _live_lock:
             _live_handles.add(self)
+            if self._cell_id in _forgotten_cells:
+                # Spawned from a detached task after its cell finished: attribute to
+                # nobody instead of resurrecting the dead cell's bookkeeping.
+                self._cell_id = None
             if self._cell_id is not None:
                 _cell_handles.setdefault(self._cell_id, set()).add(self)
         enrolled = _record_journal(self._pid, active=True)
@@ -567,6 +578,11 @@ class BashHandle:
                     if not chunk:
                         break  # EOF without a full status line
                     line += chunk
+                    if len(line) > 256:
+                        # A status line is a small integer. Endless newline-free bytes
+                        # mean a stray child holds the inherited fd open and streams
+                        # junk; stop reading instead of buffering without bound.
+                        return None
             return int(line)
         except (OSError, ValueError):
             return None
@@ -1332,7 +1348,7 @@ def _child_env() -> dict[str, str]:
             "FORCE_COLOR": "0",
             "GIT_EDITOR": "true",
             "GIT_SEQUENCE_EDITOR": "true",
-            "GIT_TERMINAL_PROMPTS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
             "GIT_ASKPASS": "true",
             "SSH_ASKPASS_REQUIRE": "never",
             "EDITOR": "true",
@@ -1499,8 +1515,12 @@ def _record_journal(pid: int, active: bool) -> bool:
 
     path = os.environ.get("PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL")
     owner = os.environ.get("PRIME_AGENT_KERNEL_OWNER_PID")
-    if not path or not owner:
+    if not path:
         return True
+    if not owner:
+        # A configured journal without a resolvable owner enrolls nothing the host
+        # reaper could act on: fail closed like the unparsable-owner branch below.
+        return False
     try:
         owner_pid = int(owner)
     except ValueError:
@@ -1574,6 +1594,9 @@ def _forget_cell(cell_id: str) -> None:
     """
     with _live_lock:
         _cell_handles.pop(cell_id, None)
+        _forgotten_cells[cell_id] = None
+        while len(_forgotten_cells) > _FORGOTTEN_CELLS_MAX:
+            _forgotten_cells.pop(next(iter(_forgotten_cells)))
 
 
 def _kill_live_handles() -> None:

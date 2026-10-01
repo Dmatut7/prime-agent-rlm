@@ -9,11 +9,13 @@ Execution still belongs to Prime Agent's TypeScript host and the existing
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
 import re
 import stat
+import threading
 import unicodedata
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
@@ -23,6 +25,11 @@ from typing import Any, Literal, Mapping, NamedTuple, Sequence
 
 from . import effects
 from ._yaml_compat import register_plain_str
+
+try:
+    import fcntl
+except ImportError:  # Windows: states are in-memory there and never lock
+    fcntl = None  # type: ignore[assignment]
 
 HarnessKind = Literal["prompt", "memory", "skill", "subagent"]
 HarnessScope = Literal["local", "global"]
@@ -493,6 +500,46 @@ def _require_optional_record(kind: str, entry_name: str, field: str, value: Any)
         )
 
 
+def _json_rejection(value: Any) -> str | None:
+    """None when ``json.dumps`` can serialize ``value``; else a description of the first bad leaf.
+
+    Entries persist through ``json.dump``, so a dict that merely *is* a dict is not enough:
+    ``metadata={"when": datetime.now()}`` passes the shape check and then wedges every later
+    save of the whole store. Containers are walked with a seen-set so a circular reference
+    (which ``json.dumps`` reports on the container, not a leaf) still terminates.
+    """
+    seen: set[int] = set()
+    stack: list[tuple[str, Any]] = [("", value)]
+    while stack:
+        path, item = stack.pop()
+        try:
+            json.dumps(item)
+            continue
+        except (TypeError, ValueError):
+            pass
+        if isinstance(item, (dict, list, tuple)):
+            if id(item) in seen:
+                return f"{path or '(root)'} (circular reference)"
+            seen.add(id(item))
+            if isinstance(item, dict):
+                stack.extend((f"{path}[{key!r}]", sub) for key, sub in item.items())
+            else:
+                stack.extend((f"{path}[{index}]", sub) for index, sub in enumerate(item))
+            continue
+        return f"{path or '(root)'} holds {_type_name(item)}"
+    return None
+
+
+def _require_json_serializable(kind: str, entry_name: str, field: str, value: Any) -> None:
+    if value is None:
+        return
+    rejection = _json_rejection(value)
+    if rejection is not None:
+        raise ValueError(
+            f"{kind} entry {entry_name!r} rejected: {field} must be JSON-serializable; {field}{rejection}"
+        )
+
+
 def _validate_entry_shape(
     kind: str,
     entry_id: Any,
@@ -521,6 +568,9 @@ def _validate_entry_shape(
     _require_optional_record(kind, entry_name, "reference", reference)
     _require_optional_record(kind, entry_name, "arguments", arguments)
     _require_optional_record(kind, entry_name, "metadata", metadata)
+    _require_json_serializable(kind, entry_name, "reference", reference)
+    _require_json_serializable(kind, entry_name, "arguments", arguments)
+    _require_json_serializable(kind, entry_name, "metadata", metadata)
     _require_text(kind, entry_name, "source", source)
     if kind == "skill":
         if reference is None:
@@ -596,7 +646,72 @@ class HarnessState:
         # mtime of the file as of the last load/save, used to detect out-of-process
         # writes (e.g. the host `/refine` command) and avoid clobbering them.
         self._loaded_mtime: tuple[str, int | None] = ("missing", None)
+        # Write-path serialization: the threading lock serializes threads inside this
+        # kernel; the sidecar flock serializes kernels sharing one store (the global
+        # store in an RLM swarm). Both wrap sync+mutate+save as one critical section.
+        self._write_lock = threading.RLock()
+        self._lock_depth = 0
+        self._lock_fd: int | None = None
         self.load()
+
+    def _flock_acquire(self) -> None:
+        """Take the store's cross-process write lock (a ``.lock`` sidecar of the state file)."""
+        if fcntl is None or self.file_path is None:
+            return
+        lock_path = Path(f"{self._lexical_file_path or self.file_path}.lock")
+        # The lock sidecar is save machinery like the atomic state write itself:
+        # untracked, so it never shows up as a file change next to the memory record.
+        with effects.untracked():
+            _ensure_private_directory(lock_path.parent)
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | _require_no_follow(), 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(f"Refusing to use non-regular private file: {lock_path}")
+            os.set_inheritable(fd, False)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(fd)
+            raise
+        self._lock_fd = fd
+
+    def _flock_release(self) -> None:
+        fd, self._lock_fd = self._lock_fd, None
+        if fd is None:
+            return
+        assert fcntl is not None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    @contextlib.contextmanager
+    def _write_guard(self) -> Generator[None, None, None]:
+        """Hold the write lock across sync+mutate+save.
+
+        The mtime guard in ``_sync_from_disk`` alone is a TOCTOU for any writer that is
+        not this process's single thread: two kernels sharing the global store could each
+        sync, mutate, and save, the second save silently overwriting the first's entries
+        while both report success, and one thread's in-flight upsert could vanish under a
+        concurrent thread's reload. Re-entrant, so ``create``/``update`` may call
+        ``_upsert`` (which saves) inside their own guarded existence check.
+        """
+        self._write_lock.acquire()
+        depth = self._lock_depth
+        self._lock_depth = depth + 1
+        if depth == 0:
+            try:
+                self._flock_acquire()
+            except BaseException:
+                self._lock_depth = depth
+                self._write_lock.release()
+                raise
+        try:
+            yield
+        finally:
+            self._lock_depth = depth
+            if depth == 0:
+                self._flock_release()
+            self._write_lock.release()
 
     def _ensure_local_writable(self) -> None:
         if self._local_write_error is not None:
@@ -617,10 +732,13 @@ class HarnessState:
         ``/refine`` command rewrites the same file from a separate process. Without
         this guard the next in-kernel ``save()`` would overwrite host edits with a
         stale snapshot. We re-read whenever the on-disk mtime no longer matches the
-        value recorded at our last load/save.
+        value recorded at our last load/save. Reloading happens under the write lock
+        so a read path cannot swap ``self.entries`` under a write in flight on
+        another thread.
         """
-        if self._disk_mtime() != self._loaded_mtime:
-            self.load()
+        with self._write_lock:
+            if self._disk_mtime() != self._loaded_mtime:
+                self.load()
 
     def load(self) -> "HarnessState":
         if self._lexical_file_path is not None:
@@ -759,19 +877,20 @@ class HarnessState:
         if self.file_path is None:
             # Deliberately in-memory state has no persistence target.
             return self
-        data = {
-            "schema": 1,
-            "entries": {
-                kind: {entry_id: asdict(entry) for entry_id, entry in records.items()}
-                for kind, records in self.entries.items()
-            },
-            "refinements": [asdict(event) for event in self.refinements],
-        }
-        # The entry-level memory record (see effects.memory_change) describes this write; a JSON
-        # diff of the whole state file next to it would say the same thing less clearly.
-        with effects.untracked():
-            _write_private_json_atomic(self._lexical_file_path or self.file_path, data)
-        self._loaded_mtime = self._disk_mtime()
+        with self._write_guard():
+            data = {
+                "schema": 1,
+                "entries": {
+                    kind: {entry_id: asdict(entry) for entry_id, entry in records.items()}
+                    for kind, records in self.entries.items()
+                },
+                "refinements": [asdict(event) for event in self.refinements],
+            }
+            # The entry-level memory record (see effects.memory_change) describes this write; a JSON
+            # diff of the whole state file next to it would say the same thing less clearly.
+            with effects.untracked():
+                _write_private_json_atomic(self._lexical_file_path or self.file_path, data)
+            self._loaded_mtime = self._disk_mtime()
         return self
 
     def upsert(
@@ -803,19 +922,20 @@ class HarnessState:
                 metadata=metadata,
                 source=source,
             )
-        self._sync_from_disk()
         self._ensure_local_writable()
-        return self._upsert(
-            kind,
-            title,
-            content,
-            id=id,
-            path=path,
-            reference=reference,
-            arguments=arguments,
-            metadata=metadata,
-            source=source,
-        )
+        with self._write_guard():
+            self._sync_from_disk()
+            return self._upsert(
+                kind,
+                title,
+                content,
+                id=id,
+                path=path,
+                reference=reference,
+                arguments=arguments,
+                metadata=metadata,
+                source=source,
+            )
 
     def _upsert(
         self,
@@ -861,6 +981,20 @@ class HarnessState:
         previous_title = existing.title if existing else None
         previous_content = existing.content if existing else None
         if existing:
+            # Snapshot the pre-mutation field values so a failed save can roll the
+            # entry back: the replaced dicts are fresh copies, so the originals stay
+            # intact under these references.
+            rollback = (
+                existing.title,
+                existing.content,
+                existing.path,
+                existing.reference,
+                existing.arguments,
+                existing.metadata,
+                existing.source,
+                existing.updated_at,
+                existing.version,
+            )
             existing.title = title
             existing.content = content
             # Preserve path/reference/arguments/metadata when the caller omits them
@@ -893,7 +1027,27 @@ class HarnessState:
                 source=source,
             )
             self.entries[kind][entry_id] = entry
-        self.save()
+        try:
+            self.save()
+        except BaseException:
+            # A failed save must not leave memory ahead of disk: the unwritten entry
+            # would otherwise stay in the cache, wedge every later save of the store
+            # if it was the cause, and show up in overview()/search() as a phantom.
+            if existing:
+                (
+                    existing.title,
+                    existing.content,
+                    existing.path,
+                    existing.reference,
+                    existing.arguments,
+                    existing.metadata,
+                    existing.source,
+                    existing.updated_at,
+                    existing.version,
+                ) = rollback
+            else:
+                self.entries[kind].pop(entry_id, None)
+            raise
         # Display-only: tells the host UI what changed; the model's view of the harness is unchanged.
         effects.memory_change(
             "updated" if existing else "created",
@@ -921,14 +1075,20 @@ class HarnessState:
         id, global_, _claimed_scope = _strip_scope_prefix(id, global_)
         if target := self._global_target(global_, kwargs):
             return target.delete(kind, id)
-        self._sync_from_disk()
         self._ensure_local_writable()
-        if kind not in self.entries:
-            raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
-        if id not in self.entries[kind]:
-            return False
-        removed = self.entries[kind].pop(id)
-        self.save()
+        with self._write_guard():
+            self._sync_from_disk()
+            if kind not in self.entries:
+                raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
+            if id not in self.entries[kind]:
+                return False
+            removed = self.entries[kind].pop(id)
+            try:
+                self.save()
+            except BaseException:
+                # Keep memory consistent with the file the delete never reached.
+                self.entries[kind][id] = removed
+                raise
         effects.memory_change("deleted", kind, self.scope, id, removed.title, before=removed.content)
         return True
 
@@ -973,27 +1133,28 @@ class HarnessState:
                 metadata=metadata,
                 source=source,
             )
-        self._sync_from_disk()
         self._ensure_local_writable()
-        if kind not in self.entries:
-            raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
-        _require_text(kind, _describe_entry(id, title), "title", title)
-        if id is not None:
-            _require_text(kind, _describe_entry(id, title), "id", id)
-        entry_id = id or _slug(title, kind)
-        if entry_id in self.entries[kind]:
-            raise ValueError(f"{kind} entry {entry_id!r} already exists")
-        return self._upsert(
-            kind,
-            title,
-            content,
-            id=entry_id,
-            path=path,
-            reference=reference,
-            arguments=arguments,
-            metadata=metadata,
-            source=source,
-        )
+        with self._write_guard():
+            self._sync_from_disk()
+            if kind not in self.entries:
+                raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
+            _require_text(kind, _describe_entry(id, title), "title", title)
+            if id is not None:
+                _require_text(kind, _describe_entry(id, title), "id", id)
+            entry_id = id or _slug(title, kind)
+            if entry_id in self.entries[kind]:
+                raise ValueError(f"{kind} entry {entry_id!r} already exists")
+            return self._upsert(
+                kind,
+                title,
+                content,
+                id=entry_id,
+                path=path,
+                reference=reference,
+                arguments=arguments,
+                metadata=metadata,
+                source=source,
+            )
 
     def update(
         self,
@@ -1024,24 +1185,25 @@ class HarnessState:
                 metadata=metadata,
                 source=source,
             )
-        self._sync_from_disk()
         self._ensure_local_writable()
-        if kind not in self.entries:
-            raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
-        _require_text(kind, _describe_entry(id, title), "id", id)
-        if id not in self.entries[kind]:
-            raise ValueError(f"{kind} entry {id!r} does not exist")
-        return self._upsert(
-            kind,
-            title,
-            content,
-            id=id,
-            path=path,
-            reference=reference,
-            arguments=arguments,
-            metadata=metadata,
-            source=source,
-        )
+        with self._write_guard():
+            self._sync_from_disk()
+            if kind not in self.entries:
+                raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
+            _require_text(kind, _describe_entry(id, title), "id", id)
+            if id not in self.entries[kind]:
+                raise ValueError(f"{kind} entry {id!r} does not exist")
+            return self._upsert(
+                kind,
+                title,
+                content,
+                id=id,
+                path=path,
+                reference=reference,
+                arguments=arguments,
+                metadata=metadata,
+                source=source,
+            )
 
     def create_memory(
         self,
@@ -1209,19 +1371,24 @@ class HarnessState:
             raise ValueError(
                 f"refinement event rejected: id must be a non-empty string when provided, got {_type_name(id)}"
             )
-        self._sync_from_disk()
         self._ensure_local_writable()
-        event_id = id or f"refine_{len(self.refinements) + 1:04d}"
-        normalized_changes = [changes] if isinstance(changes, str) else list(changes)
-        event = RefinementEvent(
-            id=event_id,
-            trigger=trigger,
-            changes=normalized_changes,
-            evidence=evidence,
-            outcome=outcome,
-        )
-        self.refinements.append(event)
-        self.save()
+        with self._write_guard():
+            self._sync_from_disk()
+            event_id = id or f"refine_{len(self.refinements) + 1:04d}"
+            normalized_changes = [changes] if isinstance(changes, str) else list(changes)
+            event = RefinementEvent(
+                id=event_id,
+                trigger=trigger,
+                changes=normalized_changes,
+                evidence=evidence,
+                outcome=outcome,
+            )
+            self.refinements.append(event)
+            try:
+                self.save()
+            except BaseException:
+                self.refinements.remove(event)
+                raise
         return event
 
     def plan_refinement(

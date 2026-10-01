@@ -96,6 +96,8 @@ COMMAND_UPDATE_INTERVAL_S = 0.5
 # Completions of background commands held while no cell is running, sent at the next cell's start;
 # past it the oldest are dropped and that cell says how many were lost.
 MAX_PENDING_COMPLETIONS = 64
+# Same bound for harness memory writes buffered while no cell is running.
+MAX_PENDING_MEMORY = 64
 _PATH_CACHE_LIMIT = 4096
 
 RULES_FILE_NAMES = frozenset({"AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"})
@@ -925,6 +927,11 @@ class _Tracker:
         self.cwd_git_root: str | None = None
         self.pending_completions: list[dict[str, Any]] = []
         self.lost_completions = 0
+        # Harness writes from a detached task or background thread after its cell
+        # ended have no cell to report in; they wait here for the next cell's start,
+        # the same contract pending_completions has for background commands.
+        self.pending_memory: list[dict[str, Any]] = []
+        self.lost_memory = 0
         # Where the last cell's command comparison ended, kept while it left commands running: a
         # command that ends before the next cell starts is compared against it (see `_gap_check`).
         self.carried: _After | None = None
@@ -965,6 +972,8 @@ class _Tracker:
         if session_dir:
             harness.add(os.path.join(os.path.realpath(session_dir), "harness", HARNESS_STATE_FILE_NAME))
         harness.add(os.path.join(self.agent_dir, "harness", HARNESS_STATE_FILE_NAME))
+        # The write-lock sidecars travel with their state files.
+        harness.update(f"{path}.lock" for path in list(harness))
         journal = (os.environ.get("PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL") or "").strip()
         roots = {os.path.realpath(prefix) for prefix in (sys.prefix, sys.base_prefix, sys.exec_prefix) if prefix}
         if session_dir:
@@ -1289,6 +1298,8 @@ class _Tracker:
             self.cell = cell
             completions, self.pending_completions = self.pending_completions, []
             lost, self.lost_completions = self.lost_completions, 0
+            memory_records, self.pending_memory = self.pending_memory, []
+            lost_memory, self.lost_memory = self.lost_memory, 0
             # From here on this cell's own snapshots cover commands still running.
             self.carried = None
             changes, self.pending_changes = self.pending_changes, {}
@@ -1303,6 +1314,14 @@ class _Tracker:
         # files they changed after their cell ended with them.
         for record in completions:
             self.send_activity(cell.id, record)
+        if lost_memory:
+            cell.note_incomplete(
+                f"{lost_memory} harness memory writes happened while no cell was running and their records were lost"
+            )
+        # Harness writes made while no cell was running (detached tasks, background
+        # threads) report here too, or the host's memory view would never refresh.
+        for record in memory_records:
+            self.send(cell.id, {MEMORY_CHANGE_MIME: record})
         if changes:
             self.apply_shell_changes(cell, list(changes.items()))
             with self.lock:
@@ -2251,7 +2270,17 @@ class _Tracker:
 
     def memory_change(self, record: dict[str, Any], withheld: bool = False) -> None:
         cell = self.cell
-        if cell is None:
+        if cell is None or cell.closing:
+            # No live cell to report in (a detached task or background thread writing
+            # after its cell ended, or a write racing this cell's close): buffer the
+            # record for the next cell's start instead of dropping it invisibly. The
+            # withholding scan runs now; buffered records never merge later.
+            _withhold_memory_texts(record, withheld)
+            with self.lock:
+                self.pending_memory.append(record)
+                if len(self.pending_memory) > MAX_PENDING_MEMORY:
+                    del self.pending_memory[0]
+                    self.lost_memory += 1
             return
         key = (record["kind"], record["scope"], record["id"])
         retract = False
@@ -2866,9 +2895,13 @@ def memory_change(
     before: str | None = None,
     after: str | None = None,
 ) -> None:
-    """Report one harness entry write (create/update/delete). Several writes to one entry in a cell merge."""
+    """Report one harness entry write (create/update/delete). Several writes to one entry in a cell merge.
+
+    With no live cell the tracker buffers the record and replays it at the next cell's
+    start, so a write from a detached task or background thread still reaches the host.
+    """
     tracker = _tracker
-    if tracker is None or tracker.cell is None:
+    if tracker is None:
         return
     try:
         record: dict[str, Any] = {

@@ -2446,6 +2446,178 @@ class ProtocolNegotiationTest(unittest.TestCase):
         self.assertEqual(set(kinds) - _PROTOCOL3_FRAME_KINDS, set())
 
 
+@unittest.skipUnless(hasattr(os, "fork"), "fork() is POSIX-only")
+class ForkChildProtocolTest(unittest.TestCase):
+    """A forked child must never write protocol frames on the parent's channel.
+
+    Regression: the child inherited the live protocol fd, the coalescer (whose flush
+    thread does not survive a fork), and a possibly-held write lock - small prints
+    vanished into the dead coalescer, big ones tore the parent's frames, and the
+    host read that as corruption and killed the kernel.
+    """
+
+    def setUp(self) -> None:
+        self.repl = ReplProcess()
+        self.addCleanup(self.repl.close)
+        self.assertEqual(self.repl.ready()[0]["event"], "ready")
+
+    _FORK_CELL = "\n".join(
+        [
+            "import os, sys",
+            "import rlm.repl as r",
+            "r._write_lock.acquire()",  # fork while the parent holds the write lock
+            "pid = os.fork()",
+            "if pid == 0:",
+            "    ok = r._protocol_fd == -1 and not r.is_active()",
+            "    ok = ok and not isinstance(sys.stdout, r._TaggedWriter)",
+            "    ok = ok and not isinstance(sys.stderr, r._TaggedWriter)",
+            "    r._send({'event': 'stdout', 'id': None, 'text': 'MUST-NOT-SHIP'})",
+            "    print('child-out')",
+            "    sys.stdout.flush()",
+            "    os._exit(0 if ok else 3)",
+            "_, status = os.waitpid(pid, 0)",
+            "r._write_lock.release()",
+            "assert os.waitstatus_to_exitcode(status) == 0, 'child saw the parent protocol face'",
+        ]
+    )
+
+    def test_fork_child_detaches_protocol_and_prints_to_the_raw_channel(self):
+        events = self.repl.execute("fork1", self._FORK_CELL)
+        self.assertEqual(one(events, "done")["status"], "ok")
+        # The child's print falls back to the captured pipe and arrives as an
+        # unattributed (id-less) frame - before the cell's done when the cell-end
+        # drain catches it, or just after when the child outlives the drain.
+        seen = stream_text(events, "stdout")
+        deadline = time.monotonic() + 10
+        while "child-out" not in seen and time.monotonic() < deadline:
+            event = self.repl.read_event(timeout=10)
+            self.assertNotIn("MUST-NOT-SHIP", event.get("text", ""))
+            if event.get("event") == "stdout":
+                self.assertIsNone(event["id"])
+                seen += event["text"]
+        self.assertIn("child-out", seen)
+        for event in events:
+            self.assertNotIn("MUST-NOT-SHIP", event.get("text", ""))
+            if event.get("event") == "stdout":
+                self.assertIsNone(event["id"])
+        # The protocol survived: no torn frame, the kernel serves the next cell.
+        events = self.repl.execute("after", "40 + 2")
+        self.assertEqual(one(events, "result")["text"], "42")
+
+    def test_fork_child_output_past_the_coalescer_cap_stays_off_the_protocol(self):
+        cell = "\n".join(
+            [
+                "import os, sys",
+                "pid = os.fork()",
+                "if pid == 0:",
+                "    sys.stdout.write('x' * 200_000)",
+                "    sys.stdout.flush()",
+                "    os._exit(0)",
+                "os.waitpid(pid, 0)",
+            ]
+        )
+        events = self.repl.execute("big", cell)
+        self.assertEqual(one(events, "done")["status"], "ok")
+        seen = stream_text(events, "stdout")
+        deadline = time.monotonic() + 15
+        while seen.count("x") < 200_000 and time.monotonic() < deadline:
+            event = self.repl.read_event(timeout=10)
+            if event.get("event") == "stdout":
+                self.assertIsNone(event["id"])
+                seen += event["text"]
+        self.assertEqual(seen.count("x"), 200_000)
+        for event in events:
+            if event.get("event") == "stdout":
+                self.assertIsNone(event["id"])
+        events = self.repl.execute("after", "'alive'")
+        self.assertEqual(one(events, "result")["text"], "'alive'")
+
+
+class LinecacheHygieneTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.repl = ReplProcess()
+        self.addCleanup(self.repl.close)
+        self.assertEqual(self.repl.ready()[0]["event"], "ready")
+
+    def test_finished_cells_drop_their_linecache_entry(self):
+        # One cached source listing per cell would otherwise grow with the session.
+        self.assertEqual(one(self.repl.execute("c1", "1"), "done")["status"], "ok")
+        events = self.repl.execute(
+            "c2",
+            "import linecache\nsorted(k for k in linecache.cache if k.startswith('<cell-'))",
+        )
+        # Only the running cell's own entry may be present.
+        self.assertEqual(one(events, "result")["text"], "['<cell-2>']")
+
+
+class SnapshotBlobCacheEvictionTest(unittest.TestCase):
+    """A rebind must evict the stale blob-cache entry, whatever the new value is.
+
+    Regression: the entry was dropped only when the new value was itself deeply
+    immutable and freshly dumped, so rebinding to a mutable or unpicklable value
+    pinned the dead object and its blob (and their share of the aggregate cap).
+    """
+
+    def test_rebind_evicts_the_stale_entry(self):
+        import rlm.repl as repl_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.dill")
+            manifest = os.path.join(tmp, "state.json")
+            cache: dict = {}
+            ns: dict = {"frozen": (1, 2, 3)}  # deeply immutable: cached after its first dump
+            repl_module._snapshot_state(ns, path, manifest, 1 << 20, 1 << 20, False, blob_cache=cache)
+            self.assertIn("frozen", cache)
+
+            ns["frozen"] = [1, 2, 3]  # rebind to a mutable value
+            repl_module._snapshot_state(ns, path, manifest, 1 << 20, 1 << 20, False, blob_cache=cache)
+            self.assertNotIn("frozen", cache)
+
+            ns["frozen"] = (4, 5)
+            repl_module._snapshot_state(ns, path, manifest, 1 << 20, 1 << 20, False, blob_cache=cache)
+            self.assertIn("frozen", cache)
+
+            ns["frozen"] = (x for x in ())  # rebind to a value dill cannot dump
+            result = repl_module._snapshot_state(ns, path, manifest, 1 << 20, 1 << 20, False, blob_cache=cache)
+            self.assertNotIn("frozen", cache)
+            self.assertTrue(any(skip["name"] == "frozen" for skip in result["skipped"]))
+
+
+class ShutdownDrainTest(unittest.TestCase):
+    def test_shutdown_drains_the_output_pumps_before_the_final_done(self):
+        import asyncio
+        import types
+
+        import rlm.repl as repl_module
+
+        events: list[dict] = []
+        drains: list[str] = []
+
+        def make_pump(name: str):
+            return types.SimpleNamespace(drain=lambda: drains.append(name))
+
+        async def drive() -> None:
+            queue: asyncio.Queue = asyncio.Queue()
+            task = asyncio.create_task(repl_module._serve(queue, {}))
+            await queue.put({"type": "shutdown", "id": "sd"})
+            await task
+
+        old_sigint = signal.getsignal(signal.SIGINT)
+        with (
+            mock.patch.object(repl_module, "_send", side_effect=lambda event: events.append(event)),
+            mock.patch.object(repl_module, "_pump_out", make_pump("out"), create=True),
+            mock.patch.object(repl_module, "_pump_err", make_pump("err"), create=True),
+            mock.patch.object(repl_module, "_kill_live_handles", lambda: None),
+            mock.patch.object(repl_module, "_stream_coalescer", mock.MagicMock()),
+            mock.patch.dict(sys.modules, {"rlm.mcp": None}),
+        ):
+            try:
+                asyncio.run(drive())
+            finally:
+                signal.signal(signal.SIGINT, old_sigint)
+        self.assertEqual(drains, ["out", "err"])
+        self.assertIn({"event": "done", "id": "sd", "status": "ok"}, events)
+
 
 if __name__ == "__main__":
     unittest.main()
