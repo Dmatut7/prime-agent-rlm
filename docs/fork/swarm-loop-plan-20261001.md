@@ -150,3 +150,26 @@ orchestrator-workers + 确定性 gate；子代理任务书必须含目标/输出
 4. `agent-messages.ts` :30 注释与 :211/:880 回执类型仍写死 "steer"。
 5. session-manager 三处 warn 需波次 2 在 agent-session.ts/daemon 侧透出到 TUI（批E遗留①）；`SessionManager.getBranch()` 同款静默断链未修（批E遗留②）。
 6. `prime-agent-runtime/src/rlm/repl.md:398-401` 文档与 E6 新行为不同步。
+
+- 2026-10-01 波次 2：5 批修复完成并已提交推送（`3e531906b..0b8f6d932`，纯净树 tsgo EXIT 0）。daemon 已 `shutdown --force` 重启跑新 bundle（schema rev 42），`--no-session -p` 冒烟通过。结果摘要：
+  - W2-A：auto-continue 文案预算参数化；isBadToolCall 接线工具 schema；无人值守 stall 恢复默认开（attached 25 分钟人窗/无客户端即介入/每会话上限 3 次）；overflow 二次恢复（force emergency shrink）；内核 prune 用户可见通知；autonomous 默认预算 20/50/400k/2h。
+  - W2-B：跨 worker deliveryMode 透传；worker 死亡后 bind 时自动恢复会话（一次死亡一次恢复）；quota_park_status 事件（capability 门禁，60s 心跳，rev 42）。
+  - W2-C：agent-messages 回执类型放宽；getBranch 断链 warn；`<read-files>` 接通 kernel read activities 通道（不再是死机制）；/tree 分支摘要补 fact-appendix/user-requests 账本。
+  - W2-D：/context 窄终端紧凑布局 + CJK 模型名对齐；`-v`=verbose/`-V`=version；keybindings.md 三条说明；repl.md 同步；文档-14 bounded-cache 确认已在 HEAD 修复（销账）。
+  - W2-E：跨模型 thinking 平铺只留最近回合，更早回合占位符。
+- 2026-10-01 波次 3：3 批（判官闸门+接线+再审）完成。结果摘要：
+  - W3-A：**假完成判官闸门**——root run 收尾时最后一条回复是完成声明但无证据（无验证命令跑绿记录、无证据措辞）→ 拦截并注入「给出证据/补齐再收尾」nudge（计入 maxAutoContinues 预算）；连拦 2 次放行 + duty log 留「待你核对」；`selfRecovery.finishGate` 默认开；闲聊不启用（需本轮有工具工作或任务式 prompt）。13 个既有测试的收尾台词适配。
+  - W3-B：TUI 消费 quota_park_status（footer 倒计时 chip + park 开始 warning 行）；ipython_state_pruned 重放渲染；follow_up 回执 delete hack 清除；autonomous 新默认文案同步（command-registry/README/usage/public-command pin）；-v/-V 联动残留 5 处补齐；ipython.ts 注释修正。
+  - W3-C 再审：波次 1/2 全部 30+ 项 verified。销账：文档-2（缓存命中 charge 已修）、文档-14。确认未修：记忆-5、记忆-7、文档-1/3/5/7/8/9/16、安全簇。
+
+### 波次 3 再审新发现（波次 4 处理）
+
+- N1、N3：已被 W3-B 同波修掉（销账）。
+- N2 [P2] harness digest 溢出目录无上限（harness.py:1294-1299，每条掉窗记忆占一行注入）→ 封顶 +「+N more ids omitted」。
+- N4 [P2] CLI send 不查 `send_message_delivery_mode` capability，对 rev-40 旧 daemon 静默降级（daemon-command.ts:931）→ 握手后检查，缺失报错。
+- N5 [P3] quota park re-arm 条目丢 provider 字段（agent-session.ts:21472,21566）→ 补齐。
+- N6 [suspect] length 续写收窄：要求 ranToolsSinceLastPrompt 且 _rlmDepth>0 直接 return → 纯文本截断与子代理截断无续跑。决策：评估是否放宽。
+- 半落地尾巴①：记忆-1 的三处 warn 仍只进日志，无 TUI/daemon 消费者（session-manager.ts:908-913）→ 透出到会话加载通知。
+- 半落地尾巴②：finish_gate nudge 在 TUI 走通用「自动继续」标签，放行提示无 inline 行（injected-prompt-message.ts / conversation-components.ts）→ 专属标签。
+- HEAD 基线 6 个 suite 测试预存红（4491-provider-stale-after-401、4620-fast-mode-settings、4649×2、f70、r43-auth-stale-recovery）→ 查归属并修复。
+- 智能-4 边角：lastReplayableAssistantIndex 不排除 aborted 回合 → 最新回合 aborted 时无回合保留完整思考（minor，方向安全，登记）。
