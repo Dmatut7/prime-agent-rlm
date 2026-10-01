@@ -3107,7 +3107,13 @@ export class SettingsManager {
 		if (!this.getRetryEnabled()) {
 			return { ...emptyTurn, maxAttempts: 1, escalatedAttempts: 0 };
 		}
-		return this._clampEscalatedEmptyTurnWaits({ ...emptyTurn });
+		const resolved = this._clampEscalatedEmptyTurnWaits({ ...emptyTurn });
+		// Same collapse the loop applies: `maxAttempts: 1` is documented as disabling
+		// retrying, so the resolved settings never advertise a slow tier that cannot run.
+		if (typeof resolved.maxAttempts === "number" && resolved.maxAttempts <= 1) {
+			return { ...resolved, escalatedAttempts: 0 };
+		}
+		return resolved;
 	}
 
 	/**

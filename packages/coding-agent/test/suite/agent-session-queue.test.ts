@@ -1917,7 +1917,11 @@ describe("AgentSession queue characterization", () => {
 		harness.session.setFollowUpMode("all");
 		let cleared: { steering: string[]; followUp: string[] } | undefined;
 		clearDuringRefineWait = () => {
-			cleared = harness.session.clearQueuedUserMessagesMatching((text) => text === clearedAgentMessage);
+			// First result wins: cancelling the preparing anchor invalidates the in-flight
+			// pass, so the surviving "kept" action is re-prepared afterwards and this
+			// hook's refine window (and this callback) fires a second time with the
+			// cleared message already gone.
+			cleared ??= harness.session.clearQueuedUserMessagesMatching((text) => text === clearedAgentMessage);
 		};
 		pause.release();
 		await harness.session.waitForIdle();

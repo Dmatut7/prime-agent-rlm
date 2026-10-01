@@ -1368,7 +1368,8 @@ async function parseEntriesFromBufferAsync(buffer: Buffer, sessionFile: string):
  * whole file; this fork only ever touches the trailing line and only under write
  * ownership, so the recovery rewrites just that line: drop the damaged tail, then
  * append the record back without its NUL prefix and with its terminator, through
- * the private-append path (0o600 / O_NOFOLLOW / fsync).
+ * the private-append path with its durable option (0o600 / O_NOFOLLOW / fsync on
+ * close).
  *
  * Interior NUL-filled lines are deliberately NOT recovered: that needs the
  * whole-file rewrite this fork rejects (a read-only open must not write, and a
@@ -1405,7 +1406,7 @@ function recoverNulPrefixedTrailingRecord(filePath: string): boolean {
 		// between them loses a line no reader could parse anyway, so the window is
 		// not a regression against the truncation it replaces.
 		repairTruncatedTrailingLine(filePath);
-		appendPrivateFile(filePath, recovered, { privateParent: true });
+		appendPrivateFile(filePath, recovered, { privateParent: true, durable: true });
 		return true;
 	} catch {
 		// An unreadable tail stays exactly as it was: the caller's torn/unverifiable
@@ -3388,6 +3389,7 @@ export class SessionManager {
 					appendPrivateFile(this.sessionFile, `${JSON.stringify(entry)}\n`, {
 						privateParent: this.ownsSessionDir,
 						requireTerminatedTail: true,
+						durable: true,
 					});
 				} catch (error) {
 					if (!(error instanceof UnterminatedTailError)) throw error;
@@ -3398,6 +3400,7 @@ export class SessionManager {
 					appendPrivateFile(this.sessionFile, `${JSON.stringify(entry)}\n`, {
 						privateParent: this.ownsSessionDir,
 						requireTerminatedTail: true,
+						durable: true,
 					});
 				}
 			} catch (error) {

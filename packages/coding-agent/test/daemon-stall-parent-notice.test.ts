@@ -250,6 +250,21 @@ describe("daemon-level stall notice to the parent session", () => {
 		}
 	});
 
+	it("delivers for a settled terminal run: the in-process subscription is guarded off there", () => {
+		// The two halves split on run liveness: the in-process subscription never fires
+		// for a settled run (agent-session side), so "done"/"error"/"cancelled" snapshots
+		// must not suppress this daemon notice or a follow-up stall goes silent.
+		for (const status of ["done", "error", "cancelled"] as const) {
+			const fixture = makeFixture(() => [settledChildSnapshot(status)]);
+			fixture.daemon.broadcastToSession(fixture.child, {
+				type: "session_event",
+				activeSessionId: "child-active",
+				event: stallWarning(45_000, 30_000),
+			});
+			expect(fixture.parentSendCustomMessage).toHaveBeenCalledTimes(1);
+		}
+	});
+
 	it("holds an excused child stall back from the parent until the excuse lapses", () => {
 		// A notice is a paid parent turn; for healthy long work it only says "still working".
 		vi.useFakeTimers({ now: 1_000_000 });

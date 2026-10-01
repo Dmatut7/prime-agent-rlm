@@ -221,7 +221,7 @@ export function sanitizedChildEnv(): NodeJS.ProcessEnv {
 		// side in `prime-agent-runtime/src/rlm/bash.py` `_child_env()`.
 		GIT_EDITOR: "true",
 		GIT_SEQUENCE_EDITOR: "true",
-		GIT_TERMINAL_PROMPTS: "0",
+		GIT_TERMINAL_PROMPT: "0",
 		GIT_ASKPASS: "true",
 		SSH_ASKPASS_REQUIRE: "never",
 		EDITOR: "true",

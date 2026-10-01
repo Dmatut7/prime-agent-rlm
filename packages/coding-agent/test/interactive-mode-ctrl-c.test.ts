@@ -13,7 +13,7 @@ type FakeEditor = {
 type FakeInteractiveMode = {
 	ctrlCExitHintExpiresAt: number;
 	ctrlCExitHintTimer: ReturnType<typeof setTimeout> | undefined;
-	escapeRepeatAction: "tree" | "clear" | undefined;
+	escapeRepeatAction: "tree" | undefined;
 	escapeRepeatExpiresAt: number;
 	escapeRepeatTimer: ReturnType<typeof setTimeout> | undefined;
 	traceUploadAllAbortController: AbortController | undefined;
@@ -294,7 +294,7 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		expect(mode.escapeRepeatAction).toBe("tree");
 	});
 
-	it("clears an idle draft on double Escape", () => {
+	it("clears an idle draft on a single Escape, with nothing armed behind it", () => {
 		const actionHandlers = new Map<string, () => void>();
 		const mode = createInteractiveFake({ editorText: "draft" });
 		const defaultEditor: NonNullable<FakeInteractiveMode["defaultEditor"]> = {
@@ -310,11 +310,11 @@ describe("InteractiveMode interrupt shortcuts", () => {
 
 		Reflect.get(InteractiveMode.prototype, "setupKeyHandlers").call(mode);
 		defaultEditor.onEscape?.();
-		expect(mode.editor.getText()).toBe("draft");
 
-		defaultEditor.onEscape?.();
-
+		// The documented behavior (keybindings.md: `app.input.clear` = Clear input):
+		// one press clears; no 500ms double-press window is involved.
 		expect(mode.editor.getText()).toBe("");
+		expect(mode.escapeRepeatAction).toBeUndefined();
 		expect(mode.agentConnection.abortAndSendQueued).not.toHaveBeenCalled();
 		expect(mode.agentConnection.abort).not.toHaveBeenCalled();
 	});
@@ -330,15 +330,32 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		expect(mode.editor.getText()).toBe("");
 	});
 
-	it("clears a whitespace draft on double Escape", () => {
+	it("clears a whitespace draft on a single Escape", () => {
 		const mode = createInteractiveFake({ editorText: "   " });
 		const handleEscape = Reflect.get(InteractiveMode.prototype, "handleEscape");
 
 		handleEscape.call(mode);
-		handleEscape.call(mode);
 
 		expect(mode.showTreeSelector).not.toHaveBeenCalled();
 		expect(mode.editor.getText()).toBe("");
+	});
+
+	it("does not arm the tree on the Escape that interrupts streaming work", () => {
+		const mode = createInteractiveFake({ editorText: "draft", streaming: true });
+		const handleEscape = Reflect.get(InteractiveMode.prototype, "handleEscape");
+
+		handleEscape.call(mode);
+		// Stop is just stop (the Ctrl+C rule): the interrupting press arms nothing,
+		// so the habitual second press cannot pop the session tree open.
+		expect(mode.agentConnection.abortAndSendQueued).toHaveBeenCalledTimes(1);
+		expect(mode.escapeRepeatAction).toBeUndefined();
+		expect(mode.editor.getText()).toBe("draft");
+
+		handleEscape.call(mode);
+
+		expect(mode.showTreeSelector).not.toHaveBeenCalled();
+		expect(mode.agentConnection.abortAndSendQueued).toHaveBeenCalledTimes(2);
+		expect(mode.escapeRepeatAction).toBeUndefined();
 	});
 
 	for (const [label, options] of [
@@ -346,15 +363,30 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		["compaction", { compacting: true }],
 		["a bash command", { bashRunning: true }],
 	] as const) {
-		it(`opens the tree after cancelling ${label} without clearing the draft`, () => {
+		it(`stops ${label} on Escape without arming the tree or clearing the draft`, () => {
 			const mode = createInteractiveFake({ editorText: "draft", ...options });
 			const handleEscape = Reflect.get(InteractiveMode.prototype, "handleEscape");
 
 			handleEscape.call(mode);
-			handleEscape.call(mode);
 
-			expect(mode.showTreeSelector).toHaveBeenCalledTimes(1);
+			// Stop is just stop: the press that cancelled the work arms no tree.
+			expect(mode.showTreeSelector).not.toHaveBeenCalled();
+			expect(mode.escapeRepeatAction).toBeUndefined();
 			expect(mode.editor.getText()).toBe("draft");
+
+			// The work gone and the draft still there, one Esc clears the draft...
+			mode.connectionState.isCompacting = false;
+			mode.connectionState.isBashRunning = false;
+			mode.connectionState.retryAttempt = 0;
+			handleEscape.call(mode);
+			expect(mode.editor.getText()).toBe("");
+			expect(mode.showTreeSelector).not.toHaveBeenCalled();
+
+			// ...and only the empty idle prompt keeps the double-press tree.
+			handleEscape.call(mode);
+			expect(mode.showTreeSelector).not.toHaveBeenCalled();
+			handleEscape.call(mode);
+			expect(mode.showTreeSelector).toHaveBeenCalledTimes(1);
 		});
 	}
 
@@ -368,9 +400,9 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		expect(mode.escapeRepeatAction).toBeUndefined();
 	});
 
-	it("expires the Escape repeat window", async () => {
+	it("expires the Escape tree-repeat window on an empty idle prompt", async () => {
 		const actionHandlers = new Map<string, () => void>();
-		const mode = createInteractiveFake({ editorText: "draft" });
+		const mode = createInteractiveFake({});
 		const defaultEditor: NonNullable<FakeInteractiveMode["defaultEditor"]> = {
 			onAction: vi.fn((action: string, handler: () => void) => {
 				actionHandlers.set(action, handler);
@@ -384,10 +416,17 @@ describe("InteractiveMode interrupt shortcuts", () => {
 
 		Reflect.get(InteractiveMode.prototype, "setupKeyHandlers").call(mode);
 		defaultEditor.onEscape?.();
+		expect(mode.escapeRepeatAction).toBe("tree");
 		await vi.advanceTimersByTimeAsync(500);
-		defaultEditor.onEscape?.();
 
-		expect(mode.editor.getText()).toBe("draft");
+		// Past the window the press re-arms instead of firing...
+		defaultEditor.onEscape?.();
+		expect(mode.showTreeSelector).not.toHaveBeenCalled();
+		expect(mode.escapeRepeatAction).toBe("tree");
+
+		// ...and the press inside the new window opens the tree.
+		defaultEditor.onEscape?.();
+		expect(mode.showTreeSelector).toHaveBeenCalledTimes(1);
 	});
 
 	it("opens keyboard shortcuts from the configured app action", () => {
@@ -408,5 +447,67 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		actionHandlers.get("app.shortcuts")?.();
 
 		expect(mode.showShortcutGuide).toHaveBeenCalledTimes(1);
+	});
+
+	it("a session replacement clears an armed Ctrl+C exit hint and Esc tree repeat", () => {
+		const mode = createInteractiveFake({});
+		Reflect.get(InteractiveMode.prototype, "showCtrlCExitHint").call(mode);
+		Reflect.get(InteractiveMode.prototype, "armEscapeRepeat").call(mode);
+		expect(mode.ctrlCExitHintExpiresAt).toBeGreaterThan(0);
+		expect(mode.escapeRepeatAction).toBe("tree");
+
+		// The session-scoped state resetCurrentSessionRenderState walks; everything
+		// not under test is stubbed, the two armed repeats above are the point.
+		Object.assign(mode, {
+			endFeatureHintRun: vi.fn(),
+			resetBlockNavigation: vi.fn(),
+			chatContainer: { clear: vi.fn() },
+			shortcutGuideContainer: { clear: vi.fn() },
+			pendingMessagesContainer: { clear: vi.fn() },
+			queuedMessagesContainer: { clear: vi.fn() },
+			pendingQueueEdit: undefined,
+			pendingQueueMove: false,
+			defaultEditor: { clearHistory: vi.fn(), setText: vi.fn() },
+			ui: { requestRender: vi.fn(), terminal: { abortPendingInput: vi.fn() } },
+			liveImageMarkerIds: vi.fn(() => new Set()),
+			pastedImages: new Map(),
+			discardRefineLoader: vi.fn(),
+			disposeTransientStatusOverlays: vi.fn(),
+			removeStallActionBar: vi.fn(),
+			releaseStallDiagnostics: vi.fn(),
+			pendingBashComponents: [],
+			activityTracker: { reset: vi.fn() },
+			contextUsageTokenBaseline: 0,
+			pendingToolGeneration: 0,
+			pendingTools: new Map(),
+			pendingToolCreations: new Set(),
+			startedToolCalls: new Set(),
+			agentRunFileChanges: new Map(),
+			renderRecap: vi.fn(),
+			ipythonToolComponents: new Map(),
+			lateIpythonSentAgentMessages: new Map(),
+			chatTranscriptTrimmed: true,
+			chatCapRebuildFloor: 1,
+			slimTranscriptOmitted: 5,
+			slimTranscriptBackfillInFlight: false,
+			slimTranscriptMarker: undefined,
+			slimTranscriptViewEpoch: 0,
+			slimOrphanToolResults: new Map([["tool-x", { role: "toolResult" }]]),
+			liveTurnFlowStore: undefined,
+			resetSubagentSummary: vi.fn(),
+			setGoalAnnouncementBaseline: vi.fn(),
+			getGoalState: vi.fn(() => ({})),
+			syncGoalTray: vi.fn(),
+		});
+
+		Reflect.get(InteractiveMode.prototype, "resetCurrentSessionRenderState").call(mode);
+
+		expect(mode.ctrlCExitHintExpiresAt).toBe(0);
+		expect(mode.ctrlCExitHintTimer).toBeUndefined();
+		expect(mode.escapeRepeatAction).toBeUndefined();
+		expect(mode.escapeRepeatTimer).toBeUndefined();
+		expect(mode.escapeRepeatExpiresAt).toBe(0);
+		expect(Reflect.get(mode, "slimOrphanToolResults").size).toBe(0);
+		expect(Reflect.get(mode, "slimTranscriptOmitted")).toBe(0);
 	});
 });

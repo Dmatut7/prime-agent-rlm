@@ -3416,7 +3416,16 @@ export class AgentDaemon {
 			// reclamation; deleting it reddens test/suite/live-kernel-work-residency.test.ts, while
 			// deleting this term reddens the policy tests in test/session-action-store.test.ts.
 			hasLiveKernelWork: state.runtime.session.isKernelWorkInFlight === true,
-			attachedClients: state.clients.size + state.pendingAttaches,
+			// A supervisor-role connection (worker_subscribe, snapshot loads) is the control
+			// plane watching, not a user viewing - and it is never torn down (no sender of
+			// worker_unsubscribe exists), so counting it pinned every child the supervisor
+			// ever touched against passivation. Align with the summary's
+			// directAttachedClients (daemon-session-list.ts), which already filters by role.
+			// pendingAttaches stays all-inclusive: an in-flight attach is busyness no matter
+			// who asked, and it settles on its own within one snapshot build.
+			attachedClients:
+				[...state.clients].filter((client) => client.authenticationRole !== "supervisor").length +
+				state.pendingAttaches,
 			hasRegisteredCronJob: jobs.some((job) => !isHeartbeatCronJob(job)),
 			lastActivityAt: Date.parse(summary.lastActivityAt ?? ""),
 			hasParent: state.runtime.metadata.kind === "subagent" && !!state.runtime.metadata.parentActiveSessionId,
@@ -3811,6 +3820,19 @@ export class AgentDaemon {
 					rehydratedModel = resolved;
 				}
 			}
+			// The registry grant is a spawn-time snapshot. SC-2 makes an operator's
+			// lowered cap the current policy for the whole subtree, but the push only
+			// reaches resident children - a passivated child rehydrated here would
+			// otherwise resurrect with the stale grant and spawn past the lowered cap.
+			// Clamp against the parent's cap as it stands now; a legacy entry without
+			// a recorded grant inherits the parent's current cap rather than a fresh
+			// global resolve. Note this lands as the child's base, so a later raise
+			// does not lift a rehydrated child back up on its own.
+			const parentRlmMaxDepth: number | undefined = parentState.runtime.session.rlmMaxDepth;
+			const rehydratedRlmMaxDepth =
+				entry.rlmMaxDepth === undefined || parentRlmMaxDepth === undefined
+					? (entry.rlmMaxDepth ?? parentRlmMaxDepth)
+					: Math.min(entry.rlmMaxDepth, parentRlmMaxDepth);
 			runtime = await withClientEnv(hydrationEnv, () =>
 				createAgentSessionRuntime(this.options.createRuntime, {
 					cwd: sessionManager.getCwd(),
@@ -3858,7 +3880,7 @@ export class AgentDaemon {
 							(existsSync(entry.sessionFile)
 								? resolveSessionRlmDepth(sessionManager.getHeader() ?? {}, entry.sessionFile)
 								: 1),
-						rlmMaxDepth: entry.rlmMaxDepth,
+						rlmMaxDepth: rehydratedRlmMaxDepth,
 						rlmParentNodeId: entry.rlmParentNodeId ?? entry.childId,
 					},
 					runtimeMetadata: {
@@ -6950,7 +6972,12 @@ export class AgentDaemon {
 						} else if (this.options.worker && options.fromState) {
 							// The supervisor can resolve and wake a saved worker even when it is no longer
 							// present in this worker's resident peer snapshot.
-							return this.sendRemoteAgentSessionMessage(options.fromState, targetSelector, message);
+							return this.sendRemoteAgentSessionMessage(
+								options.fromState,
+								targetSelector,
+								message,
+								options.deliveryMode,
+							);
 						} else {
 							throw error;
 						}
@@ -7146,6 +7173,7 @@ export class AgentDaemon {
 		fromState: ActiveSessionState,
 		targetSelector: string,
 		message: string,
+		deliveryMode?: AgentSessionMessageDeliveryMode,
 	): Promise<AgentSessionMessageReceipt> {
 		const link = this.supervisorLink();
 		if (!link) {
@@ -7176,6 +7204,10 @@ export class AgentDaemon {
 				message,
 				fromActiveSessionId: fromState.activeSessionId,
 				agentOrigin: true,
+				// Rev 41 honored the field at the client edge; this worker→supervisor leg
+				// dropped it, silently degrading a follow_up send into a steer. Optional on
+				// the wire, so a supervisor that predates rev 41 ignores it as before.
+				...(deliveryMode ? { deliveryMode } : {}),
 			},
 			30_000,
 		);
@@ -8157,16 +8189,18 @@ export class AgentDaemon {
 	 * Daemon-level half of the parent-facing stall notice. When a subagent session in
 	 * this worker trips the watchdog's warn stage, the parent session receives the same
 	 * `rlm_child_stall_notice` the live-run path delivers. The in-process subscription in
-	 * agent-session.ts covers only an active `rlm()` run - it is parked once the run
-	 * settles - so a retained child working a follow-up turn (agent_message.send) used to
-	 * go silent with no parent-facing signal at all: only a roster row the parent never
-	 * polls for.
+	 * agent-session.ts covers only an active `rlm()` run - it never delivers for a run
+	 * that has settled - so a retained child working a follow-up turn (agent_message.send)
+	 * would otherwise go silent with no parent-facing signal at all: only a roster row
+	 * the parent never polls for.
 	 *
-	 * Duplication is the one thing this method must not do. While the parent tracks a
-	 * live run (queued or running) for the child, its own subscription delivers the
-	 * notice and the daemon stays out of it. Delivery reuses the notice pipeline the
-	 * completed_without_reply terminal notices ride: a custom message with followUp
-	 * semantics, delivered on the parent's next activity rather than waking it.
+	 * Duplication is the one thing this method must not do, and the two halves split on
+	 * run liveness: while the parent tracks a live run (queued or running) for the
+	 * child, its own subscription delivers the notice and the daemon stays out of it;
+	 * once the run has settled, the in-process side is silent for it and this path is
+	 * the only one left. Delivery reuses the notice pipeline the completed_without_reply
+	 * terminal notices ride: a custom message with followUp semantics, delivered on the
+	 * parent's next activity rather than waking it.
 	 */
 	private notifyParentOfAgentStall(
 		state: ActiveSessionState,

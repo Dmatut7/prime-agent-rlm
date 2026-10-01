@@ -911,6 +911,13 @@ interface WorkerAttachData {
 	worker: ResidentWorker;
 	transcript?: SnapshotTranscriptCache;
 	releaseTranscript?: () => void;
+	/**
+	 * The reservation attachClient armed when it pre-registered the attach (absent when a
+	 * caller such as reattach or the catch-up drain already held one). The owner releases
+	 * it once the snapshot content has reached the client - streamSnapshot does so in its
+	 * finally for the streamed shapes - and only then are the deferred payloads replayed.
+	 */
+	releaseSnapshotReservation?: () => void;
 }
 
 interface SupervisorPromptAdmission {
@@ -3203,6 +3210,8 @@ export class DaemonSupervisor {
 				if (client.capabilities.has("chunked_snapshot") && !client.capabilities.has("slim_attach_transcript")) {
 					const transcript = attached.transcript;
 					if (!transcript) {
+						attached.releaseSnapshotReservation?.();
+						this.releaseDeferredSessionPayloads(client, attached.result.activeSessionId, false);
 						throw new Error("Session worker did not provide a snapshot transcript");
 					}
 					const streamedResult = this.createStreamedAttachResult(attached.result, transcript);
@@ -3215,18 +3224,30 @@ export class DaemonSupervisor {
 							transcript,
 							"attach",
 							attached.releaseTranscript,
+							// attachClient pre-registered the attach; the stream releases that
+							// reservation in its finally and replays the payloads the load
+							// window deferred behind it.
+							attached.releaseSnapshotReservation,
 						).catch((error) =>
 							this.log(
 								`Failed to stream attach snapshot for ${streamedResult.activeSessionId}: ${String(error)}`,
 							),
 						);
 					} catch (error) {
+						attached.releaseSnapshotReservation?.();
+						this.releaseDeferredSessionPayloads(client, attached.result.activeSessionId, false);
 						attached.releaseTranscript?.();
 						throw error;
 					}
 					return undefined;
 				}
-				return success(command.id, "attach", attached.result);
+				// The response is the snapshot for a non-streamed attach, so the
+				// reservation lifts only after it is written: payloads deferred during
+				// the load replay after it, never before it.
+				this.write(client, success(command.id, "attach", attached.result));
+				attached.releaseSnapshotReservation?.();
+				this.releaseDeferredSessionPayloads(client, attached.result.activeSessionId, true);
+				return undefined;
 			}
 			case "reattach": {
 				const target = await this.findWorkerForClient(client, command.targetActiveSessionId);
@@ -7673,77 +7694,93 @@ export class DaemonSupervisor {
 		}
 		this.requireAvailableWorkerClient(match.worker);
 		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
-		const duplicateValidation = this.currentSnapshotGeneration(match.worker, activeSessionId)?.validation;
-		if (duplicateValidation) {
-			await duplicateValidation.promise;
-		}
-		if (command.clientId) {
-			client.id = command.clientId;
-		}
-		client.capabilities = normalizeCapabilities(command.capabilities, command.supportsExtensionUi);
-		client.supportsExtensionUi = client.capabilities.has("extension_ui");
-
-		// The worker's chunk transfer is the one encoding of a transcript: every load asks
-		// for it, and a client that cannot consume the chunks is served by decoding the
-		// cached bytes. That replaced a second full serialization of the same messages in
-		// the supervisor, and a second full snapshot load from the worker for every legacy
-		// attach that followed a chunked one.
-		//
-		// 文档-11 (rev 44): a slim_attach_transcript client is served from that same
-		// cache, but only the tail window crosses to the client — decoded from the
-		// trailing chunks, inline in the attach response, with snapshot.messagesOmitted
-		// saying how much older history exists. The cache itself always stays full
-		// (the internal worker load never declares the capability), so slim and full
-		// attaches share the one transfer.
-		const wantsSlimTranscript = client.capabilities.has("slim_attach_transcript");
-		const wantsChunkedSnapshot = client.capabilities.has("chunked_snapshot") || wantsSlimTranscript;
-		let result = match.worker.snapshotCache.get(activeSessionId);
-		if (result && !wantsSlimTranscript && result.snapshot.messagesOmitted !== undefined) {
-			// A windowed snapshot can sit in this cache only through a worker that
-			// filled messagesOmitted for a load that never declared the capability.
-			// Never serve it to a full-transcript client as if it were complete:
-			// drop it so the load below fetches the whole transcript instead.
-			result = undefined;
-		}
-		if (result && !wantsChunkedSnapshot) {
-			result = await this.snapshotWithDecodedTranscript(match.worker, activeSessionId, result);
-		}
-		if (!result) {
-			result = await this.loadWorkerSnapshot(match.worker, activeSessionId, command.env, true);
-			if (!wantsChunkedSnapshot) {
-				const decoded = await this.snapshotWithDecodedTranscript(match.worker, activeSessionId, result);
-				if (decoded) {
-					result = decoded;
-				} else if (
-					result.snapshotStream &&
-					result.snapshot.messages.length < result.snapshot.summary.messageCount
-				) {
-					// The worker promised a chunk transfer this client cannot read and there is
-					// nothing decodable behind it (failed, disposed, or superseded). Ask for the
-					// full snapshot shape instead of handing over an empty transcript. A worker
-					// that never promised a transfer is trusted as-is, exactly as before.
-					result = await this.loadWorkerSnapshot(match.worker, activeSessionId, command.env, false);
-				}
-			}
-		}
-		this.requireAvailableWorkerClient(match.worker);
+		// Pre-register before the snapshot load, the pattern the reattach call site
+		// established: an event relayed while the load is in flight now passes the
+		// attached-session gate and is deferred behind the reservation, replaying after
+		// the snapshot lands instead of dropping between snapshot build and
+		// registration, which froze a fresh attach's view at snapshot time (an attach
+		// racing a turn_end left the spinner running forever). A caller that already
+		// armed a reservation for this session (reattach, the catch-up drain) keeps
+		// owning it.
 		const wasAttached = client.attachedActiveSessionIds.has(activeSessionId);
-		let transcript: SnapshotTranscriptCache | undefined;
-		if (wantsChunkedSnapshot) {
-			while (true) {
-				const validation = this.currentSnapshotGeneration(match.worker, activeSessionId)?.validation;
-				if (validation) {
-					await validation.promise;
-					continue;
-				}
-				result = match.worker.snapshotCache.get(activeSessionId) ?? result;
-				transcript = this.getOrCreateTranscriptCache(match.worker, result);
-				break;
-			}
-		}
-		let releaseTranscript = transcript?.retain();
+		const callerReserved = client.snapshotActiveSessionIds?.has(activeSessionId) === true;
+		// reserveSnapshotStream clears this marker on a fresh reservation; if the attach
+		// fails, the desynced view it recorded is still desynced, so put the marker back.
+		const hadDroppedDeferred = client.deferredSessionPayloadsDropped?.has(activeSessionId) === true;
+		const releaseSnapshotReservation = callerReserved
+			? undefined
+			: this.reserveSnapshotStream(client, activeSessionId);
 		client.attachedActiveSessionIds.add(activeSessionId);
+		let releaseTranscript: (() => void) | undefined;
 		try {
+			const duplicateValidation = this.currentSnapshotGeneration(match.worker, activeSessionId)?.validation;
+			if (duplicateValidation) {
+				await duplicateValidation.promise;
+			}
+			if (command.clientId) {
+				client.id = command.clientId;
+			}
+			client.capabilities = normalizeCapabilities(command.capabilities, command.supportsExtensionUi);
+			client.supportsExtensionUi = client.capabilities.has("extension_ui");
+
+			// The worker's chunk transfer is the one encoding of a transcript: every load asks
+			// for it, and a client that cannot consume the chunks is served by decoding the
+			// cached bytes. That replaced a second full serialization of the same messages in
+			// the supervisor, and a second full snapshot load from the worker for every legacy
+			// attach that followed a chunked one.
+			//
+			// 文档-11 (rev 44): a slim_attach_transcript client is served from that same
+			// cache, but only the tail window crosses to the client — decoded from the
+			// trailing chunks, inline in the attach response, with snapshot.messagesOmitted
+			// saying how much older history exists. The cache itself always stays full
+			// (the internal worker load never declares the capability), so slim and full
+			// attaches share the one transfer.
+			const wantsSlimTranscript = client.capabilities.has("slim_attach_transcript");
+			const wantsChunkedSnapshot = client.capabilities.has("chunked_snapshot") || wantsSlimTranscript;
+			let result = match.worker.snapshotCache.get(activeSessionId);
+			if (result && !wantsSlimTranscript && result.snapshot.messagesOmitted !== undefined) {
+				// A windowed snapshot can sit in this cache only through a worker that
+				// filled messagesOmitted for a load that never declared the capability.
+				// Never serve it to a full-transcript client as if it were complete:
+				// drop it so the load below fetches the whole transcript instead.
+				result = undefined;
+			}
+			if (result && !wantsChunkedSnapshot) {
+				result = await this.snapshotWithDecodedTranscript(match.worker, activeSessionId, result);
+			}
+			if (!result) {
+				result = await this.loadWorkerSnapshot(match.worker, activeSessionId, command.env, true);
+				if (!wantsChunkedSnapshot) {
+					const decoded = await this.snapshotWithDecodedTranscript(match.worker, activeSessionId, result);
+					if (decoded) {
+						result = decoded;
+					} else if (
+						result.snapshotStream &&
+						result.snapshot.messages.length < result.snapshot.summary.messageCount
+					) {
+						// The worker promised a chunk transfer this client cannot read and there is
+						// nothing decodable behind it (failed, disposed, or superseded). Ask for the
+						// full snapshot shape instead of handing over an empty transcript. A worker
+						// that never promised a transfer is trusted as-is, exactly as before.
+						result = await this.loadWorkerSnapshot(match.worker, activeSessionId, command.env, false);
+					}
+				}
+			}
+			this.requireAvailableWorkerClient(match.worker);
+			let transcript: SnapshotTranscriptCache | undefined;
+			if (wantsChunkedSnapshot) {
+				while (true) {
+					const validation = this.currentSnapshotGeneration(match.worker, activeSessionId)?.validation;
+					if (validation) {
+						await validation.promise;
+						continue;
+					}
+					result = match.worker.snapshotCache.get(activeSessionId) ?? result;
+					transcript = this.getOrCreateTranscriptCache(match.worker, result);
+					break;
+				}
+			}
+			releaseTranscript = transcript?.retain();
 			let slimWindow: { messages: AgentMessage[]; omittedMessages: number } | undefined;
 			if (wantsSlimTranscript) {
 				slimWindow = await this.slimAttachTranscriptTail(result, transcript);
@@ -7815,9 +7852,23 @@ export class DaemonSupervisor {
 			const detachingSessions = this.detachingInputPauseSessions?.get(client);
 			detachingSessions?.delete(command.activeSessionId);
 			detachingSessions?.delete(activeSessionId);
-			return { result: publicResult, worker: match.worker, transcript, releaseTranscript };
+			return {
+				result: publicResult,
+				worker: match.worker,
+				transcript,
+				releaseTranscript,
+				releaseSnapshotReservation,
+			};
 		} catch (error) {
 			releaseTranscript?.();
+			releaseSnapshotReservation?.();
+			// With the reservation gone this discards the withheld payloads; when a
+			// caller armed the reservation it stays owner and its own catch discards.
+			this.releaseDeferredSessionPayloads(client, activeSessionId, false);
+			if (hadDroppedDeferred) {
+				client.deferredSessionPayloadsDropped ??= new Set();
+				client.deferredSessionPayloadsDropped.add(activeSessionId);
+			}
 			if (!wasAttached) {
 				client.attachedActiveSessionIds.delete(activeSessionId);
 			}

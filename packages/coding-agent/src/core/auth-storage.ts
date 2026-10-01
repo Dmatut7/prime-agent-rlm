@@ -871,6 +871,14 @@ export class AuthStorage {
 
 	private persistProviderChange(provider: string, credential: AuthCredential | undefined): void {
 		if (this.loadError) {
+			// The write is skipped because the in-memory merge base cannot be trusted,
+			// but the skip must be drainable: a caller that only watches drainErrors
+			// otherwise sees a "successful" set() that never reached disk.
+			this.recordError(
+				new Error(
+					`Credential change for "${provider}" was not persisted: the credential store failed to load (${this.loadError.message})`,
+				),
+			);
 			return;
 		}
 
@@ -924,6 +932,48 @@ export class AuthStorage {
 		}
 		this.data[provider] = credential;
 		this.persistProviderChange(provider, credential);
+	}
+
+	/**
+	 * Set a provider's credential with the disk write verified: throws when the store
+	 * failed to load (a write would merge into state it cannot trust), when the write
+	 * itself fails, or when the credential cannot be read back afterwards. The plain
+	 * `set()` is the optimistic variant for paths whose failures surface through
+	 * `drainErrors()`; a login flow that is about to report success must use this one,
+	 * or a broken or unwritable store turns "Logged in" into a credential that never
+	 * survives the process. Disk-authoritative like `removeVerified`: in-memory state
+	 * is only updated after the write is proven.
+	 */
+	setVerified(provider: string, credential: AuthCredential): void {
+		if (this.loadError) {
+			throw new Error(
+				`Refusing to save the ${provider} credential: the credential store failed to load (${this.loadError.message}). Fix or remove the store file and try again.`,
+			);
+		}
+		let persisted: string | undefined;
+		this.storage.withLock((current) => {
+			const currentData = this.parseStorageData(current);
+			const merged: AuthStorageData = { ...currentData, [provider]: credential };
+			persisted = JSON.stringify(merged, null, 2);
+			return { result: undefined, next: persisted };
+		});
+		// The atomic writer throwing already covers a failed write; the read-back
+		// covers a store whose bytes do not round-trip to the credential just saved.
+		const readBack = this.storage.withLock((current) => ({ result: this.parseStorageData(current)[provider] }));
+		if (JSON.stringify(readBack) !== JSON.stringify(credential)) {
+			throw new Error(`The ${provider} credential could not be read back from the credential store after saving.`);
+		}
+		// The write just made the disk current with what we persist here: record it,
+		// or the next read would mistake it for an external change and reload.
+		this.rememberDiskState(persisted);
+		// Same bookkeeping as set(): a fresh credential is a full reset for the provider.
+		clearResolvedCommandCache();
+		this.clearStaleAuthSource(provider, "stored");
+		const runtimeValue = this.runtimeOverrides.get(provider);
+		if (runtimeValue !== undefined && credential.type === "api_key" && runtimeValue === credential.key) {
+			this.clearStaleAuthSource(provider, "runtime");
+		}
+		this.data[provider] = credential;
 	}
 
 	/**
@@ -1209,7 +1259,9 @@ export class AuthStorage {
 		}
 
 		const credentials = await provider.login(callbacks);
-		this.set(providerId, { type: "oauth", ...credentials });
+		// Verified: the caller reports success right after this returns, so a store
+		// that cannot be written must fail the login instead of faking it.
+		this.setVerified(providerId, { type: "oauth", ...credentials });
 	}
 
 	/**

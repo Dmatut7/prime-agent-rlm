@@ -1775,7 +1775,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 			expect(runCommandCaptureSpy).not.toHaveBeenCalled();
 		});
 
-		it("should reinstall pinned npm packages when installed version does not match", async () => {
+		it("should skip a pinned project package on version mismatch when no onMissing can ask", async () => {
 			const installedPath = join(tempDir, ".prime", "agent", "npm", "node_modules", "example");
 			mkdirSync(installedPath, { recursive: true });
 			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "1.0.0" }));
@@ -1785,8 +1785,13 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 				.spyOn(packageManager as any, "installParsedSource")
 				.mockResolvedValue(undefined);
 
-			await packageManager.resolve();
-			expect(installParsedSourceSpy).toHaveBeenCalledTimes(1);
+			const result = await packageManager.resolve();
+			// Project settings come from the cloned repository: without a caller that
+			// can ask, a version mismatch is reported, not reinstalled.
+			expect(installParsedSourceSpy).not.toHaveBeenCalled();
+			expect(result.diagnostics.some((d) => d.type === "warning" && d.message.includes("npm:example@2.0.0"))).toBe(
+				true,
+			);
 		});
 
 		it("should not check package updates when offline", async () => {

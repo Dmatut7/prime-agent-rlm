@@ -1500,7 +1500,9 @@ export class InteractiveMode {
 
 	private ctrlCExitHintExpiresAt = 0;
 	private ctrlCExitHintTimer: ReturnType<typeof setTimeout> | undefined = undefined;
-	private escapeRepeatAction: "tree" | "clear" | undefined;
+	// The armed second-press action of an idle empty prompt. Clearing a draft is
+	// a single Esc, so the only repeat action left is the tree walk-back.
+	private escapeRepeatAction: "tree" | undefined;
 	private escapeRepeatExpiresAt = 0;
 	private escapeRepeatTimer: ReturnType<typeof setTimeout> | undefined = undefined;
 	private anthropicSubscriptionWarningShown = false;
@@ -1585,6 +1587,12 @@ export class InteractiveMode {
 	private slimTranscriptOmitted = 0;
 	private slimTranscriptBackfillInFlight = false;
 	private slimTranscriptMarker: SlimTranscriptMarkerComponent | undefined;
+	/**
+	 * Tool results the rendered window replayed without their calls (the calls sit
+	 * in the omitted region above). A backfilled page that ends on such a call
+	 * settles it with the buffered real result instead of running forever.
+	 */
+	private slimOrphanToolResults = new Map<string, Extract<AgentMessage, { role: "toolResult" }>>();
 	/**
 	 * Bumped by every chat rebuild/reset, so a backfill that resolves into a view
 	 * rebuilt while the read was in flight drops its page instead of prepending
@@ -1726,7 +1734,13 @@ export class InteractiveMode {
 	private readonly queueSelection = new QueueSelection();
 	private isApplyingQueueSelectionText = false;
 	private queueMutationChain: Promise<void> = Promise.resolve();
-	private pendingQueueEdit: symbol | undefined;
+	/**
+	 * The in-flight queued-message mutation. `text` dedupes a repeat submit of the
+	 * same edit; `cancelled` is set by an Esc that backs out while the RPC is
+	 * already on the wire - the edit may still land server-side, but its
+	 * completion must not touch the editor or report to the user who walked away.
+	 */
+	private pendingQueueEdit: { cancelled: boolean; text: string } | undefined;
 	private pendingQueueMove = false;
 
 	private shutdownRequested = false;
@@ -3854,6 +3868,11 @@ export class InteractiveMode {
 		// goes with it; its block was already dropped with the chat above.
 		this.removeStallActionBar({ render: false });
 		this.releaseStallDiagnostics();
+		// Armed key repeats belong to the session being replaced too: a Ctrl+C
+		// exit arm (or an Esc tree arm) that survives the swap fires on the next
+		// session's first interrupt key.
+		this.clearCtrlCExitHint({ render: false });
+		this.clearEscapeRepeat();
 		this.pendingBashComponents = [];
 		this.activityTracker.reset();
 		this.contextUsageTokenBaseline = 0;
@@ -3869,6 +3888,7 @@ export class InteractiveMode {
 		this.slimTranscriptOmitted = 0;
 		this.slimTranscriptBackfillInFlight = false;
 		this.slimTranscriptMarker = undefined;
+		this.slimOrphanToolResults.clear();
 		this.slimTranscriptViewEpoch++;
 		// The previous session's turns are gone with its chat.
 		this.liveTurnFlowStore?.reset();
@@ -5829,6 +5849,13 @@ export class InteractiveMode {
 					this.showError(error instanceof Error ? error.message : String(error));
 					return;
 				}
+			}
+			// A repeat of the edit still in flight is a duplicate key press, not a
+			// new prompt: the mutation RPC already carries that text. Anything else
+			// submits as a new prompt (pinned behavior).
+			if (this.queueSelection?.isBrowsing && this.pendingQueueEdit && text.trim() === this.pendingQueueEdit.text) {
+				this.showStatus("正在修改排队消息…");
+				return;
 			}
 			text = text.trim();
 			if (!text) {
@@ -8707,6 +8734,25 @@ export class InteractiveMode {
 			if (message.role === "custom") this.noteSubagentFailureSeen(message);
 		}
 		this.chatTranscriptTrimmed = messagesToRender.length < transcriptMessages.length;
+		// A windowed render of the full transcript (the live cap rebuild) keeps the
+		// region above the window pageable through the slim marker. The marker's
+		// `before` index is the full-transcript index of the oldest contiguously
+		// rendered message: the window's tail shares object identity with the
+		// transcript, while the pairing copies initialRenderMessages synthesizes
+		// ahead of it do not.
+		const canPageTranscript = typeof this.agentConnection?.getMessagesWindow === "function";
+		if (this.chatTranscriptTrimmed && options.limitTranscript && canPageTranscript) {
+			let visibleCount = 0;
+			while (
+				visibleCount < windowed.length &&
+				visibleCount < transcriptMessages.length &&
+				windowed[windowed.length - 1 - visibleCount] ===
+					transcriptMessages[transcriptMessages.length - 1 - visibleCount]
+			) {
+				visibleCount++;
+			}
+			this.slimTranscriptOmitted = transcriptMessages.length - visibleCount;
+		}
 		// A full (unwindowed) render resets the cap-rebuild floor.
 		if (!options.limitTranscript) this.chatCapRebuildFloor = 0;
 		this.ipythonToolComponents.clear();
@@ -8787,7 +8833,9 @@ export class InteractiveMode {
 			this.chatContainer.addChild(marker);
 		}
 
-		if (messagesToRender.length < sessionContext.messages.length) {
+		// The static window note is the fallback for a view that cannot page: with
+		// a marker on top, the note only repeats it.
+		if (messagesToRender.length < sessionContext.messages.length && this.slimTranscriptMarker === undefined) {
 			this.chatContainer.addChild(
 				new Text(
 					theme.fg(
@@ -8894,6 +8942,9 @@ export class InteractiveMode {
 			},
 		});
 
+		// Results the window replayed without their calls wait here for a backfill
+		// page to bring the call in; the page then settles with the real result.
+		this.slimOrphanToolResults = replay.orphanToolResults;
 		for (const [toolCallId, component] of replay.pendingTools) {
 			component.setIncludeImageDimensions(true);
 			this.pendingTools.set(toolCallId, component);
@@ -9098,8 +9149,11 @@ export class InteractiveMode {
 		try {
 			const context = await this.agentConnection.getSessionContext();
 			if (this.liveChatCapBlocked()) return;
-			// The rebuild is sourced from the complete transcript (get_session_context
-			// is not windowed): the slim attach marker does not survive it.
+			// The rebuild sources the full transcript, so the attach-time omission
+			// count is stale: zero it here, and renderSessionContext re-derives it
+			// from the window it actually renders (the older region stays pageable
+			// through the slim marker instead of being reachable only by a full
+			// fullscreen reload).
 			this.slimTranscriptOmitted = 0;
 			await this.renderSessionContext(context, { clearChat: true, limitTranscript: true });
 			// The window itself can still sit over the cap (one huge turn fills it):
@@ -9152,7 +9206,7 @@ export class InteractiveMode {
 				this.showStatus("会话刚压缩过，较早的历史已在重整后的上下文里");
 				return;
 			}
-			const pageMessages = this.orderMessagesForTranscript(page.messages);
+			const pageMessages = this.pairBackfillToolResults(this.orderMessagesForTranscript(page.messages));
 			const toolNames: string[] = [];
 			for (const message of pageMessages) {
 				if (message.role !== "assistant") continue;
@@ -9165,7 +9219,7 @@ export class InteractiveMode {
 			const pageContainer = new Container();
 			// A backfilled page is closed history: no live wiring, and a turn the
 			// page cuts into keeps its body in the already-rendered tail below.
-			replayConversation(pageMessages, pageContainer, {
+			const pageReplay = replayConversation(pageMessages, pageContainer, {
 				ui: this.ui,
 				cwd: this.getCurrentCwd(),
 				toolOptions: { showImages: this.settingsManager.getShowImages() },
@@ -9183,6 +9237,10 @@ export class InteractiveMode {
 				mermaidTransform: this.mermaidMarkdownTransform,
 				keepFinalTurnOpen: () => false,
 			});
+			// Results in this page whose calls are older still wait for the next page.
+			for (const [toolCallId, result] of pageReplay.orphanToolResults) {
+				this.slimOrphanToolResults.set(toolCallId, result);
+			}
 			const markerIndex = this.chatContainer.children.indexOf(marker);
 			if (markerIndex === -1) return;
 			// Prepending shifts the transcript down by the page's height; keep the
@@ -9212,6 +9270,54 @@ export class InteractiveMode {
 		}
 	}
 
+	/**
+	 * Pair a backfill page's dangling tool calls before the replay: a call at the
+	 * page's end has its result in the already-loaded tail (the tail replay
+	 * buffered it as an orphan), or nowhere at all (the session was cut between
+	 * call and result). Appending the real - or a synthetic missing - result lets
+	 * the replay close the page's last turn instead of leaving a box that runs
+	 * forever waiting on a result sitting one screen below.
+	 */
+	private pairBackfillToolResults(messages: AgentMessage[]): AgentMessage[] {
+		const unanswered = new Map<string, string>();
+		for (const message of messages) {
+			if (message.role === "assistant") {
+				// Aborted/error replies settle their own calls as interrupted in the replay.
+				if (message.stopReason === "aborted" || message.stopReason === "error") continue;
+				for (const content of message.content) {
+					if (content.type === "toolCall") unanswered.set(content.id, content.name);
+				}
+			} else if (message.role === "toolResult") {
+				unanswered.delete(message.toolCallId);
+			}
+		}
+		if (unanswered.size === 0) return messages;
+		const settledAt = messages.at(-1)?.timestamp ?? Date.now();
+		const appended: AgentMessage[] = [];
+		for (const [toolCallId, toolName] of unanswered) {
+			const real = this.slimOrphanToolResults.get(toolCallId);
+			if (real) {
+				this.slimOrphanToolResults.delete(toolCallId);
+				appended.push(real);
+			} else {
+				appended.push({
+					role: "toolResult",
+					toolCallId,
+					toolName,
+					content: [
+						{
+							type: "text",
+							text: "结果不在这段记录里：可能在下方已加载的部分，或会话当时在调用之后断开了",
+						},
+					],
+					isError: true,
+					timestamp: settledAt,
+				});
+			}
+		}
+		return [...messages, ...appended];
+	}
+
 	private handleEscape(): void {
 		this.clearCtrlCExitHint();
 		// An open shortcut panel is the first thing Esc closes.
@@ -9226,9 +9332,13 @@ export class InteractiveMode {
 		}
 		// Editing a queued message: Esc backs out of the edit (the draft comes
 		// back, the message stays queued as it was) instead of interrupting the
-		// turn, which would send the queue unedited.
-		if (this.queueSelection?.isBrowsing && !this.pendingQueueEdit) {
+		// turn, which would send the queue unedited. With the mutation RPC still
+		// in flight the edit cannot be un-sent, but this Esc must not fall through
+		// to the interrupt either: mark the edit abandoned and back out of the
+		// edit UI; the completion then leaves the editor and the user alone.
+		if (this.queueSelection?.isBrowsing) {
 			this.clearEscapeRepeat();
+			if (this.pendingQueueEdit) this.pendingQueueEdit.cancelled = true;
 			this.setEditorTextFromQueueSelection(this.queueSelection.reset());
 			this.ui.requestRender();
 			return;
@@ -9236,10 +9346,6 @@ export class InteractiveMode {
 		const action = this.takeEscapeRepeatAction();
 		if (action === "tree") {
 			void this.showTreeSelector();
-			return;
-		}
-		if (action === "clear") {
-			this.clearInputBar();
 			return;
 		}
 
@@ -9256,13 +9362,27 @@ export class InteractiveMode {
 			return;
 		}
 
-		this.armEscapeRepeat(this.hasInterruptibleWork() || this.editor.getText().length === 0 ? "tree" : "clear");
+		if (this.hasInterruptibleWork()) {
+			// Stop is just stop (the handleInterruptKey rule): the press that stops
+			// running work does not also arm the tree, or the usual double press to
+			// stop a task would pop the session tree open.
+			this.interruptOrClearInput();
+			return;
+		}
+		if (this.editor.getText().length > 0) {
+			// One Esc clears an idle draft (what the keybinding doc promises); only
+			// the empty idle prompt arms the double-press tree walk-back below.
+			this.interruptOrClearInput();
+			this.clearInputBar();
+			return;
+		}
+		this.armEscapeRepeat();
 		this.interruptOrClearInput();
 	}
 
-	private armEscapeRepeat(action: "tree" | "clear"): void {
+	private armEscapeRepeat(): void {
 		this.clearEscapeRepeat();
-		this.escapeRepeatAction = action;
+		this.escapeRepeatAction = "tree";
 		this.escapeRepeatExpiresAt = Date.now() + InteractiveMode.ESCAPE_REPEAT_WINDOW_MS;
 		this.escapeRepeatTimer = setTimeout(() => {
 			this.clearEscapeRepeat();
@@ -9272,7 +9392,7 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private takeEscapeRepeatAction(): "tree" | "clear" | undefined {
+	private takeEscapeRepeatAction(): "tree" | undefined {
 		if (!this.escapeRepeatAction || this.escapeRepeatExpiresAt <= Date.now()) {
 			this.clearEscapeRepeat();
 			return undefined;
@@ -9823,6 +9943,11 @@ export class InteractiveMode {
 			);
 			return;
 		}
+		// Same dedupe as Enter: a repeat of the in-flight edit is not a new prompt.
+		if (this.queueSelection?.isBrowsing && this.pendingQueueEdit && text === this.pendingQueueEdit.text) {
+			this.showStatus("正在修改排队消息…");
+			return;
+		}
 		if (!text || !this.editor.onSubmit) return;
 
 		// Unlike Enter, Alt+Enter does not go through Editor.submitValue(), so
@@ -10277,11 +10402,11 @@ export class InteractiveMode {
 	 */
 	private applyQueueSelection(text: string, targetLane: "steering" | "followUp"): Promise<boolean> {
 		if (this.pendingQueueEdit || !this.queueSelection.selected) return Promise.resolve(false);
-		const pendingQueueEdit = Symbol("pending-queue-edit");
+		const trimmed = text.trim();
+		const pendingQueueEdit = { cancelled: false, text: trimmed };
 		this.pendingQueueEdit = pendingQueueEdit;
 		const sessionGeneration = this.sessionEventGeneration;
 		const submissionGeneration = this.inputSubmissionGeneration;
-		const trimmed = text.trim();
 		const mutation =
 			trimmed.length === 0
 				? ({ type: "delete" } as const)
@@ -10318,6 +10443,9 @@ export class InteractiveMode {
 					);
 				} catch (error) {
 					if (discardStaleSelection()) return true;
+					// The user backed out with Esc while the request was in flight:
+					// the failure is about an edit nobody is waiting for anymore.
+					if (pendingQueueEdit.cancelled) return true;
 					// The editor was already cleared by Enter; restore the edit before surfacing the error.
 					const editorUntouched =
 						submissionGeneration === this.inputSubmissionGeneration && this.editor.getText() === editorTextBefore;
@@ -10333,6 +10461,9 @@ export class InteractiveMode {
 				status = "rejected";
 			}
 			if (discardStaleSelection()) return true;
+			// Backed out mid-flight: the RPC may have landed, but the abandoned edit
+			// must not touch the editor, the history, or the status line.
+			if (pendingQueueEdit.cancelled) return true;
 			const editorUntouched =
 				submissionGeneration === this.inputSubmissionGeneration && this.editor.getText() === editorTextBefore;
 			if (status === "applied") {
@@ -13805,7 +13936,7 @@ export class InteractiveMode {
 **输入**
 \`!\` 运行 shell 命令 · \`/\` 命令 · \`@\` 引用文件
 \`${tab}\` 补全路径 · \`${newLine}\` 换行
-\`${clearInput}\` 中断 · 连按两次回退或清空输入
+\`${clearInput}\` 中断或清空输入 · 空输入时连按两次回退
 
 **查看与控制**
 \`${selectModel}\` 选模型 · \`/effort\` 调推理强度 · \`${expandTools}\` 过程${expandToolsFull ? ` · \`${expandToolsFull}\` 看全文` : ""}

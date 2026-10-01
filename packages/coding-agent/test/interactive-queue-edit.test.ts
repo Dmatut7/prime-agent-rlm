@@ -36,7 +36,7 @@ type Harness = {
 	sessionEventGeneration: number;
 	sessionEventQueue: Promise<void>;
 	inputSubmissionGeneration: number;
-	pendingQueueEdit: symbol | undefined;
+	pendingQueueEdit: { cancelled: boolean; text: string } | undefined;
 	pendingQueueMove: boolean;
 	queueMutationChain: Promise<void>;
 	enqueueQueueMutation: <T>(run: () => Promise<T>) => Promise<T>;
@@ -334,6 +334,109 @@ describe("interactive queued-message editing", () => {
 		resolveMutation("applied");
 		await pending;
 		expect(harness.editor.getText()).toBe("");
+	});
+
+	it("Esc during an in-flight queue edit backs out of the edit instead of interrupting the turn", async () => {
+		let resolveMutation: (status: string) => void = () => {};
+		const harness = createHarness({ steering: ["s1"], followUp: [] });
+		harness.agentConnection.mutateQueuedMessage.mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					resolveMutation = resolve;
+				}),
+		);
+		harness.editor.setText("draft");
+		harness.browseQueueSelection(-1);
+		harness.editor.setText(""); // Enter cleared the editor
+		const pending = harness.applyQueueSelection("s1 edited", "steering");
+		await vi.waitFor(() => expect(harness.agentConnection.mutateQueuedMessage).toHaveBeenCalledOnce());
+		expect(harness.pendingQueueEdit).toBeDefined();
+
+		const interruptOrClearInput = vi.fn();
+		const escapeHost = Object.assign(harness, {
+			clearCtrlCExitHint: vi.fn(),
+			shortcutGuideContainer: { children: [] },
+			sideQuestionEvent: undefined,
+			escapeRepeatTimer: undefined,
+			escapeRepeatAction: undefined,
+			escapeRepeatExpiresAt: 0,
+			clearEscapeRepeat: proto.clearEscapeRepeat,
+			takeEscapeRepeatAction: proto.takeEscapeRepeatAction,
+			interruptOrClearInput,
+			// A turn is running: before the fix this Esc interrupted it and flushed the queue.
+			hasInterruptibleWork: () => true,
+			settingsManager: { getProcessMode: () => "quiet" },
+		});
+		proto.handleEscape.call(escapeHost);
+
+		expect(interruptOrClearInput).not.toHaveBeenCalled();
+		expect(harness.queueSelection.isBrowsing).toBe(false);
+		expect(harness.editor.getText()).toBe("draft");
+		expect(harness.pendingQueueEdit?.cancelled).toBe(true);
+
+		// The RPC lands anyway; the abandoned edit's completion touches nothing.
+		resolveMutation("applied");
+		await pending;
+		expect(harness.pendingQueueEdit).toBeUndefined();
+		expect(harness.editor.getText()).toBe("draft");
+		expect(harness.editor.addToHistory).not.toHaveBeenCalled();
+		expect(harness.showStatus).not.toHaveBeenCalled();
+	});
+
+	it("Enter repeating the in-flight queue edit text is a duplicate, not a new prompt", async () => {
+		let resolveMutation: (status: string) => void = () => {};
+		const harness = createHarness({ steering: ["s1"], followUp: [] });
+		harness.agentConnection.mutateQueuedMessage.mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					resolveMutation = resolve;
+				}),
+		);
+		harness.browseQueueSelection(-1);
+		harness.editor.setText("");
+		const pending = harness.applyQueueSelection("s1 edited", "steering");
+		await vi.waitFor(() => expect(harness.agentConnection.mutateQueuedMessage).toHaveBeenCalledOnce());
+
+		Object.assign(harness, { defaultEditor: {} });
+		proto.setupEditorSubmitHandler.call(harness);
+		const onSubmit = (harness as unknown as { defaultEditor: { onSubmit: (text: string) => Promise<void> } })
+			.defaultEditor.onSubmit;
+		await onSubmit("s1 edited");
+
+		expect(harness.showStatus).toHaveBeenCalledWith("正在修改排队消息…");
+		// No new submission: the generation did not move and no second mutation went out.
+		expect(harness.inputSubmissionGeneration).toBe(0);
+		expect(harness.agentConnection.mutateQueuedMessage).toHaveBeenCalledOnce();
+
+		resolveMutation("applied");
+		await pending;
+	});
+
+	it("Alt+Enter repeating the in-flight queue edit text does not submit again", async () => {
+		let resolveMutation: (status: string) => void = () => {};
+		const harness = createHarness({ steering: ["s1"], followUp: [] });
+		harness.agentConnection.mutateQueuedMessage.mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					resolveMutation = resolve;
+				}),
+		);
+		harness.browseQueueSelection(-1);
+		// Alt+Enter applies without clearing the editor first: the editor still
+		// shows the edit while its RPC is in flight.
+		harness.editor.setText("kept text");
+		const pending = harness.applyQueueSelection("kept text", "followUp");
+		await vi.waitFor(() => expect(harness.agentConnection.mutateQueuedMessage).toHaveBeenCalledOnce());
+
+		const setText = vi.spyOn(harness.editor, "setText");
+		await proto.handleFollowUp.call(harness);
+
+		expect(harness.showStatus).toHaveBeenCalledWith("正在修改排队消息…");
+		expect(setText).not.toHaveBeenCalled();
+		expect(harness.agentConnection.mutateQueuedMessage).toHaveBeenCalledOnce();
+
+		resolveMutation("applied");
+		await pending;
 	});
 
 	it.each(["rejected", "invalid", "unsupported"])(

@@ -137,9 +137,13 @@ describe("InteractiveMode stall action bar lifecycle", () => {
 
 	/**
 	 * The fields resetCurrentSessionRenderState touches beyond the stall bar's
-	 * own: stubbed to no-ops so the reset runs its real teardown against a real
-	 * chat container, the same shape as interactive-mode-interrupt-teardown's
-	 * sessionResetFake.
+	 * own (editor setText/clearHistory, the containers, queueSelection,
+	 * promptStashState, ui.terminal, liveImageMarkerIds, pastedImages,
+	 * pendingToolCreations, activityTracker, renderRecap, ipythonToolComponents,
+	 * lateIpythonSentAgentMessages, slimOrphanToolResults, and the goal/subagent
+	 * reset hooks): stubbed to no-ops so the reset runs its real teardown
+	 * against a real chat container, the same shape as
+	 * interactive-mode-interrupt-teardown's sessionResetFake.
 	 */
 	function addSessionResetStubs(mode: ModeFake): void {
 		const editor = mode.editor as Record<string, unknown>;
@@ -162,6 +166,8 @@ describe("InteractiveMode stall action bar lifecycle", () => {
 			renderRecap: vi.fn(),
 			ipythonToolComponents: new Map(),
 			lateIpythonSentAgentMessages: new Map(),
+			// The reset calls .clear() for real; a real Map keeps that path live.
+			slimOrphanToolResults: new Map(),
 			resetSubagentSummary: () => {},
 			getGoalState: () => undefined,
 			setGoalAnnouncementBaseline: () => {},

@@ -15,6 +15,8 @@
  *
  * - `auth.json` through live storage passed in by the caller, then the files under the
  *   agent directory: `auth.json`, `models.json`, `settings.json`,
+ * - the Prime CLI config (`~/.prime/config.json`), whose `api_key` is this fork's main
+ *   Prime Inference credential and never reaches `auth.json`,
  * - the process environment, for names that carry a credential word,
  * - a `--api-key` runtime override from this process's own command line (it is not in any
  *   file and not necessarily in the environment either).
@@ -25,6 +27,7 @@
 
 import { readFileSync } from "node:fs";
 import { getAgentDir } from "../config.js";
+import { getPrimeCliConfigPath, loadPrimeCliConfig } from "./prime-inference-auth.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
 import { isComparableSecretValue, isLocationValuedCredential } from "./share-secret-detectors.js";
 
@@ -48,6 +51,12 @@ export interface ShareSecretValueOptions {
 	argv?: readonly string[];
 	/** Agent directory holding `auth.json` / `models.json` / `settings.json`. Defaults to `getAgentDir()`. */
 	agentDir?: string;
+	/**
+	 * Prime CLI config to read the shared Prime Inference `api_key` from. Defaults to
+	 * the real Prime CLI config path; pass `null` to skip the source (tests asserting
+	 * an exact collected set on a machine that has the file).
+	 */
+	primeCliConfigPath?: string | null;
 }
 
 const CREDENTIAL_ENV_NAME = /[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|PASSCODE|CREDENTIAL)[A-Z0-9_]*/i;
@@ -163,8 +172,24 @@ export function collectConfiguredShareSecretValues(options: ShareSecretValueOpti
 	collectFromAuthJson(agentDir, add);
 	collectFromModelsJson(agentDir, add);
 	collectFromSettingsJson(agentDir, add);
+	collectFromPrimeCliConfig(options.primeCliConfigPath, add);
 
 	return [...collected.values()];
+}
+
+/**
+ * The Prime CLI config holds this fork's main Prime Inference credential, and it is
+ * the one credential that never reaches `auth.json` (the session reads it from the
+ * shared file directly). `loadPrimeCliConfig` never throws: a missing or malformed
+ * config simply contributes nothing, same as the agent-dir files.
+ */
+function collectFromPrimeCliConfig(
+	configPath: string | null | undefined,
+	add: (raw: unknown, source: string) => void,
+): void {
+	if (configPath === null) return;
+	const config = loadPrimeCliConfig(getPrimeCliConfigPath(configPath));
+	add(config.apiKey, "prime CLI config (api_key)");
 }
 
 function collectFromAuthJson(agentDir: string, add: (raw: unknown, source: string) => void): void {

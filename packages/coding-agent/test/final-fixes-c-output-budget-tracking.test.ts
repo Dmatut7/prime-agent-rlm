@@ -136,6 +136,7 @@ function createRig(processMode: "quiet" | "legacy" = "legacy"): Rig {
 		lateIpythonSentAgentMessages: new Map(),
 		chatTranscriptTrimmed: false,
 		chatCapRebuildFloor: 0,
+		slimOrphanToolResults: new Map(),
 		liveTurnFlowStore: undefined,
 		currentTurnState: undefined,
 		currentTurnSummary: undefined,

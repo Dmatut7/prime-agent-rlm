@@ -340,8 +340,15 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   cached chunk transfer, and its cache always retains the full transcript.
 //   The digest recomputation covers the command-arm and
 //   snapshot-wrapper growth.
+//   Recovery (wave-9 chair): the window's connection-side mirror field
+//   AgentConnectionSnapshot.messagesOmitted (agent-connection/types.ts)
+//   landed in 2f3f5a82d without recomputing this constant, so the pushed
+//   rev 44 advertised af9e1ae34e55 while the slices hashed 69c0ff689f92.
+//   No wire shape moved after e3a945792 - the mirror only grew the field
+//   the daemon wire already carried - so the fix is the rev-37-class
+//   in-place recomputation below, not a new revision window.
 export const DAEMON_SCHEMA_REVISION = 44;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-44-af9e1ae34e55";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-44-69c0ff689f92";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;

@@ -503,7 +503,7 @@ export class ProviderAuthFlows {
 	}
 
 	private async completePrimeAgentTracesLogin(apiKey: string, closeDialog: () => void): Promise<AuthenticationResult> {
-		this.host.modelRegistry.authStorage.set(PRIME_AGENT_TRACES_PROVIDER_ID, {
+		this.host.modelRegistry.authStorage.setVerified(PRIME_AGENT_TRACES_PROVIDER_ID, {
 			type: "api_key",
 			key: apiKey,
 		});
@@ -757,7 +757,7 @@ export class ProviderAuthFlows {
 				throw new Error("API key cannot be empty.");
 			}
 
-			this.host.modelRegistry.authStorage.set(providerId, { type: "api_key", key: apiKey });
+			this.host.modelRegistry.authStorage.setVerified(providerId, { type: "api_key", key: apiKey });
 			// /login is a full credential reset: drop registry-layer stale marks too.
 			this.host.modelRegistry.clearProviderAuthStale(providerId);
 

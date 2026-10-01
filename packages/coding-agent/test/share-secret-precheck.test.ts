@@ -218,6 +218,8 @@ describe("credentials loaded by this session are treated as secrets regardless o
 			agentDir: mkdtempSync(join(tmpdir(), "prime-share-argv-")),
 			env: {},
 			argv: ["node", "prime-agent", "--api-key", SHAPELESS_VALUE],
+			// The exact-set assertion must not depend on whether this machine has a Prime CLI config.
+			primeCliConfigPath: null,
 		});
 		expect(collected).toEqual([{ value: SHAPELESS_VALUE, source: "cli --api-key" }]);
 	});

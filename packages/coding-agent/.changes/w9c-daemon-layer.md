@@ -1,0 +1,5 @@
+- Fixed idle RLM child sessions never being passivated once the supervisor had watched them: the worker counted its own supervisor-role connections as attached clients, so `childIdleEvictionMinutes` was dead configuration for every child anyone had looked at.
+- Fixed an attach-time event window: events relayed between snapshot build and client registration (e.g. a racing `turn_end`) were silently dropped, leaving a freshly attached view frozen at snapshot time; attach now pre-registers and defers those events, replaying them after the snapshot like reattach already did.
+- Fixed self-update restarts discarding the prepared session manifest when some sessions failed to restore on the main path; the manifest is now kept unless every session restored, matching the fallback path.
+- Fixed a worker-to-supervisor `send_message` hop dropping `deliveryMode`, so a follow-up send across workers no longer silently degrades into a steer.
+- Fixed a rehydrated (previously passivated) RLM child resurrecting with its spawn-time depth grant; the grant is now clamped to the parent's current `rlm max-depth` cap, so lowering the cap applies to the whole subtree.

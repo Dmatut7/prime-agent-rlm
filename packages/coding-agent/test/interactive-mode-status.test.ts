@@ -1667,6 +1667,21 @@ describe("InteractiveMode pending bash components", () => {
 			lateIpythonSentAgentMessages: new Map(),
 			resetPendingToolState: vi.fn(),
 			resetSubagentSummary: vi.fn(),
+			slimOrphanToolResults: new Map(),
+			// Armed interrupt-key repeats are session-scoped the same way: cleared
+			// through the real methods so a swap never leaks them into the next view.
+			clearCtrlCExitHint(this: unknown, options?: { render?: boolean }): void {
+				(
+					InteractiveMode.prototype as unknown as {
+						clearCtrlCExitHint(this: unknown, options?: { render?: boolean }): void;
+					}
+				).clearCtrlCExitHint.call(this, options);
+			},
+			clearEscapeRepeat(this: unknown): void {
+				(InteractiveMode.prototype as unknown as { clearEscapeRepeat(this: unknown): void }).clearEscapeRepeat.call(
+					this,
+				);
+			},
 			setGoalAnnouncementBaseline: vi.fn(),
 			syncGoalTray: vi.fn(),
 			getGoalState: () => emptyGoalState(),
@@ -5244,12 +5259,14 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		fakeThis.toggleThinkingBlockVisibility();
 		expect(state.thinkingBlockExpanded).toBe(true);
 
-		// A non-empty editor: Esc keeps its clear semantics.
+		// A non-empty editor: Esc keeps its clear semantics (a single press clears).
 		fakeThis.editor = { getText: () => "draft text", setText: vi.fn() };
+		fakeThis.queueSelection = { isBrowsing: false, hasDraft: false, reset: () => "" };
 		fakeThis.hasInterruptibleWork = () => false;
 		fakeThis.handleEscape();
 		expect(state.thinkingBlockExpanded).toBe(true);
 		expect(fakeThis.interruptOrClearInput).toHaveBeenCalledOnce();
+		expect(fakeThis.editor.setText).toHaveBeenCalledWith("", { clearUndo: false });
 
 		// Running work: Esc keeps its interrupt semantics.
 		fakeThis.editor = { getText: () => "", setText: vi.fn() };

@@ -143,7 +143,7 @@ describe("getShellEnv non-interactive defaults", () => {
 		// hang; these defaults make them fail fast or no-op.
 		expect(env.GIT_EDITOR).toBe("true");
 		expect(env.GIT_SEQUENCE_EDITOR).toBe("true");
-		expect(env.GIT_TERMINAL_PROMPTS).toBe("0");
+		expect(env.GIT_TERMINAL_PROMPT).toBe("0");
 		expect(env.GIT_ASKPASS).toBe("true");
 		expect(env.SSH_ASKPASS_REQUIRE).toBe("never");
 		expect(env.EDITOR).toBe("true");

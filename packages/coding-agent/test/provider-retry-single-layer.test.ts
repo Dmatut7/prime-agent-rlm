@@ -434,15 +434,32 @@ describe("one retry per path, at the outermost layer", () => {
 
 			const startedAt = Date.now();
 			await session.prompt("hello");
+			// afcc6e022: the refusal shares the spent ladder's terminal shape, so agent_end
+			// hands the failure shape back to the model as one recovery turn; that turn
+			// asks once more, is refused at the same cap, and only then is the episode
+			// terminal.
+			await session.waitForIdle();
 			const elapsedMs = Date.now() - startedAt;
 
 			// The provider answered 429 asking for 5s, the cap is 100ms: the wait must not
-			// happen, and this module must not retry into it either.
-			expect(server.requests()).toBe(1);
+			// happen, and this module must not retry into it either. The prompt's turn and
+			// the one-shot recovery turn spend exactly one refused request each.
+			expect(server.requests()).toBe(2);
 			expect(elapsedMs).toBeLessThan(2000);
 			expect(autoRetryStarts(events)).toEqual([]);
-			const end = events.find((event) => event.type === "auto_retry_end");
-			expect(end?.type === "auto_retry_end" ? end.finalError : "").toContain("retry.provider.maxRetryDelayMs=100ms");
+			const ends = events.filter(
+				(event): event is Extract<AgentSessionEvent, { type: "auto_retry_end" }> => event.type === "auto_retry_end",
+			);
+			expect(ends).toHaveLength(2);
+			expect(ends.every((end) => (end.finalError ?? "").includes("retry.provider.maxRetryDelayMs=100ms"))).toBe(
+				true,
+			);
+			// Exactly one recovery turn ran: the failure went back to the model once, and
+			// its own refused ladder stayed terminal instead of looping.
+			const recoveryNotices = session.messages.filter(
+				(message) => message.role === "custom" && message.customType === PROVIDER_FAILURE_RECOVERY_CUSTOM_TYPE,
+			);
+			expect(recoveryNotices).toHaveLength(1);
 		} finally {
 			await server.close();
 		}

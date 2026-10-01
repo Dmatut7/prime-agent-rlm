@@ -1216,6 +1216,9 @@ describe("self-update daemon restart", () => {
 			expect(mockState.lastCoordinatorStatus?.failures).toEqual([
 				{ sessionFile: failedSessionFile, message: "create failed" },
 			]);
+			// The failed session's queue snapshot lives only in the manifest, so the main
+			// path keeps it for the next handoff exactly like the fallback path does.
+			expect(existsSync(mockState.preparedManifestPath)).toBe(true);
 		} finally {
 			errorSpy.mockRestore();
 			logSpy.mockRestore();

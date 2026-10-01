@@ -159,6 +159,12 @@ export interface ConversationReplayResult {
 	turnOpen: boolean;
 	/** Tool cards whose results never came; production hands them to the live path. */
 	pendingTools: Map<string, ToolExecutionComponent>;
+	/**
+	 * Results whose calls this replay never saw (the call sits above the rendered
+	 * window). Production buffers them so a slim-transcript backfill page ending
+	 * on one of those calls can settle it with its real result.
+	 */
+	orphanToolResults: Map<string, Extract<AgentMessage, { role: "toolResult" }>>;
 }
 
 /** Parts of the timeline that other lines own take the subagent lane through these optional hooks. */
@@ -597,6 +603,9 @@ export function replayConversation(
 ): ConversationReplayResult {
 	const hooks = options.hooks;
 	const pendingTools = new Map<string, ToolExecutionComponent>();
+	// Results that arrived without their call in this replay (the call is above
+	// the window). Returned to the caller; a backfill page re-pairs them.
+	const orphanToolResults = new Map<string, Extract<AgentMessage, { role: "toolResult" }>>();
 	const expanded = options.toolsExpanded ?? false;
 	const thinkingExpanded = options.thinkingExpanded ?? false;
 	const agentMessagesExpanded = options.agentMessagesExpanded ?? false;
@@ -959,6 +968,10 @@ export function replayConversation(
 			if (component) {
 				component.updateResult(message);
 				pendingTools.delete(message.toolCallId);
+			} else {
+				// The call is outside this replay's window (or was already settled
+				// as interrupted): keep the result for a backfill page to re-pair.
+				orphanToolResults.set(message.toolCallId, message);
 			}
 			turnState?.setStepStatus(
 				message.toolCallId,
@@ -1089,6 +1102,7 @@ export function replayConversation(
 		turnSummary,
 		turnOpen,
 		pendingTools,
+		orphanToolResults,
 	};
 }
 

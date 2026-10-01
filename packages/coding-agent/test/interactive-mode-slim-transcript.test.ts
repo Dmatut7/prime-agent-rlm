@@ -5,6 +5,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { emptyUsage } from "../src/core/usage.js";
 import type { AgentConnectionSessionContext } from "../src/modes/agent-connection/index.js";
 import { DAEMON_SLIM_ATTACH_MESSAGE_TAIL } from "../src/modes/daemon/daemon-protocol.js";
+import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { InteractiveMode, SLIM_TRANSCRIPT_PAGE_SIZE } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -57,6 +58,31 @@ function assistantMessage(index: number, text?: string): Extract<AgentMessage, {
 	};
 }
 
+/** An assistant message whose tool call has no result in the same window (stopReason "toolUse"). */
+function assistantToolCall(index: number, toolCallId: string): Extract<AgentMessage, { role: "assistant" }> {
+	return {
+		role: "assistant",
+		content: [{ type: "toolCall", name: "wait", id: toolCallId, arguments: {} }],
+		api: "openai-responses",
+		provider: "openai",
+		model: "test-model",
+		usage: emptyUsage(),
+		stopReason: "toolUse",
+		timestamp: index + 0.5,
+	};
+}
+
+function toolResult(index: number, toolCallId: string, text: string): Extract<AgentMessage, { role: "toolResult" }> {
+	return {
+		role: "toolResult",
+		toolCallId,
+		toolName: "wait",
+		content: [{ type: "text", text }],
+		isError: false,
+		timestamp: index + 0.75,
+	};
+}
+
 /** `turns` user/assistant pairs; `label` prefixes the text so pages are told apart. */
 function transcript(turns: number, label: string, offset = 0): AgentMessage[] {
 	const messages: AgentMessage[] = [];
@@ -102,6 +128,7 @@ function createHarness(overrides: ModeFake = {}): ModeFake {
 		slimTranscriptBackfillInFlight: false,
 		slimTranscriptMarker: undefined,
 		slimTranscriptViewEpoch: 0,
+		slimOrphanToolResults: new Map(),
 		editor: {},
 		footer: { invalidate: vi.fn() },
 		settingsManager: {
@@ -388,6 +415,54 @@ describe("slim attach transcript backfill (rev 44)", () => {
 		const text = chatText(mode);
 		expect(text).not.toContain("未加载");
 		expect(text).toContain("full question 0");
+	});
+
+	it("a backfill page ending on a tool call pairs the result the tail window dropped", async () => {
+		// The window cut between the call and its result: the tail replay dropped
+		// the result as an orphan, and the page ends on the still-open call.
+		const tail: AgentMessage[] = [
+			toolResult(100, "tool-1", "the real result text"),
+			userMessage(101, "tail question"),
+			assistantMessage(101, "tail answer"),
+		];
+		const page: AgentMessage[] = [userMessage(98, "older question"), assistantToolCall(98, "tool-1")];
+		const getMessagesWindow = vi.fn(async () => ({ messages: page, totalMessages: 103, firstIndex: 98 }));
+		const mode = createHarness({
+			slimTranscriptOmitted: 100,
+			agentConnection: { getMessagesWindow },
+		});
+		await proto.renderSessionContext.call(mode, sessionContext(tail), {});
+		expect((mode.slimOrphanToolResults as Map<string, unknown>).has("tool-1")).toBe(true);
+
+		const updateResult = vi.spyOn(ToolExecutionComponent.prototype, "updateResult");
+		await proto.loadEarlierTranscriptPage.call(mode);
+
+		// The page's tool card settled with the real result instead of running forever.
+		expect(updateResult).toHaveBeenCalledWith(expect.objectContaining({ toolCallId: "tool-1", isError: false }));
+		expect((mode.slimOrphanToolResults as Map<string, unknown>).has("tool-1")).toBe(false);
+		expect(mode.showError).not.toHaveBeenCalled();
+		expect(chatText(mode)).toContain("older question");
+	});
+
+	it("a backfill page-end call with no result anywhere settles as missing, never running", async () => {
+		const tail: AgentMessage[] = [userMessage(50, "tail question"), assistantMessage(50, "tail answer")];
+		const page: AgentMessage[] = [userMessage(48, "older question"), assistantToolCall(48, "tool-9")];
+		const getMessagesWindow = vi.fn(async () => ({ messages: page, totalMessages: 52, firstIndex: 48 }));
+		const mode = createHarness({
+			slimTranscriptOmitted: 50,
+			agentConnection: { getMessagesWindow },
+		});
+		await proto.renderSessionContext.call(mode, sessionContext(tail), {});
+		expect((mode.slimOrphanToolResults as Map<string, unknown>).size).toBe(0);
+
+		const updateResult = vi.spyOn(ToolExecutionComponent.prototype, "updateResult");
+		await proto.loadEarlierTranscriptPage.call(mode);
+
+		// No result exists in the loaded view: the card closes as an error, so the
+		// page's last turn ends instead of spinning forever.
+		expect(updateResult).toHaveBeenCalledWith(expect.objectContaining({ toolCallId: "tool-9", isError: true }));
+		expect(mode.showError).not.toHaveBeenCalled();
+		expect(chatText(mode)).toContain("older question");
 	});
 });
 

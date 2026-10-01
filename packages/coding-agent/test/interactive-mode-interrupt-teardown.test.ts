@@ -234,6 +234,7 @@ describe("transient status overlays on teardown and session replacement", () => 
 			lateIpythonSentAgentMessages: new Map(),
 			chatTranscriptTrimmed: false,
 			chatCapRebuildFloor: 0,
+			slimOrphanToolResults: new Map(),
 			resetSubagentSummary: () => {},
 			getGoalState: () => undefined,
 			setGoalAnnouncementBaseline: () => {},

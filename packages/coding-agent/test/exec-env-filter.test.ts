@@ -64,7 +64,7 @@ describe("shell child env filtering", () => {
 
 		const result = await execCommand(
 			"/bin/sh",
-			["-c", 'echo "$GIT_EDITOR|$GIT_SEQUENCE_EDITOR|$GIT_TERMINAL_PROMPTS|$SSH_ASKPASS_REQUIRE"'],
+			["-c", 'echo "$GIT_EDITOR|$GIT_SEQUENCE_EDITOR|$GIT_TERMINAL_PROMPT|$SSH_ASKPASS_REQUIRE"'],
 			dir,
 			{},
 		);

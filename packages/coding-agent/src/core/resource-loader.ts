@@ -12,7 +12,7 @@ import { canonicalizePath, isLocalPath } from "../utils/paths.js";
 import { createEventBus, type EventBus } from "./event-bus.js";
 import { createExtensionRuntime, loadExtensionFromFactory, loadExtensions } from "./extensions/loader.js";
 import type { Extension, ExtensionFactory, ExtensionRuntime, LoadExtensionsResult } from "./extensions/types.js";
-import { DefaultPackageManager, type PathMetadata } from "./package-manager.js";
+import { DefaultPackageManager, type MissingSourceAction, type PathMetadata } from "./package-manager.js";
 import type { PromptTemplate } from "./prompt-templates.js";
 import { loadPromptTemplates } from "./prompt-templates.js";
 import { SettingsManager } from "./settings-manager.js";
@@ -134,6 +134,13 @@ export interface DefaultResourceLoaderOptions {
 	extraBuiltinSkillOverrides?: () => string[];
 	systemPrompt?: string;
 	appendSystemPrompt?: string[];
+	/**
+	 * Called when a configured package source is not installed. A caller that can ask
+	 * the user (interactive UI) returns the chosen action; when omitted, missing
+	 * project-scope packages are skipped (a cloned repository's settings must not
+	 * trigger an unattended install) and user/temporary scopes keep auto-installing.
+	 */
+	onMissingPackage?: (source: string) => Promise<MissingSourceAction>;
 	extensionsOverride?: (base: LoadExtensionsResult) => LoadExtensionsResult;
 	skillsOverride?: (base: { skills: Skill[]; diagnostics: ResourceDiagnostic[] }) => {
 		skills: Skill[];
@@ -173,6 +180,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private noContextFiles: boolean;
 	private systemPromptSource?: string;
 	private appendSystemPromptSource?: string[];
+	private onMissingPackage?: (source: string) => Promise<MissingSourceAction>;
 	private extensionsOverride?: (base: LoadExtensionsResult) => LoadExtensionsResult;
 	private skillsOverride?: (base: { skills: Skill[]; diagnostics: ResourceDiagnostic[] }) => {
 		skills: Skill[];
@@ -235,6 +243,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.noContextFiles = options.noContextFiles ?? false;
 		this.systemPromptSource = options.systemPrompt;
 		this.appendSystemPromptSource = options.appendSystemPrompt;
+		this.onMissingPackage = options.onMissingPackage;
 		this.extensionsOverride = options.extensionsOverride;
 		this.skillsOverride = options.skillsOverride;
 		this.promptsOverride = options.promptsOverride;
@@ -335,7 +344,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	async reload(): Promise<void> {
 		await this.settingsManager.reload();
-		const resolvedPaths = await this.packageManager.resolve();
+		const resolvedPaths = await this.packageManager.resolve(this.onMissingPackage);
 		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, {
 			temporary: true,
 		});

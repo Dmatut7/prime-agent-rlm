@@ -260,18 +260,24 @@ describe("AgentSession retry and event characterization", () => {
 					},
 				],
 			},
-			fauxAssistantMessage("unused"),
+			fauxAssistantMessage("picked the work back up"),
 		]);
 
 		await harness.session.prompt("test");
+		// The exceeds-cap refusal shares the spent ladder's terminal shape: agent_end
+		// hands the failure shape back to the model as one recovery turn before the
+		// episode ends.
+		await harness.session.waitForIdle();
 
-		expect(harness.faux.state.callCount).toBe(1);
+		// The second call is that one-shot recovery turn, not a retry into the
+		// over-cap wait: the wait loop is disabled, so nothing slept or re-pinged.
+		expect(harness.faux.state.callCount).toBe(2);
 		const retryEnd = harness.eventsOfType("auto_retry_end");
 		expect(retryEnd).toHaveLength(1);
 		expect(retryEnd[0]?.success).toBe(false);
 		expect(retryEnd[0]?.finalError).toContain("maxRetryDelayMs");
-		// The exceeds-cap terminal is not the ladder-exhaustion path: no recovery turn.
-		expect(providerFailureRecoveries(harness)).toHaveLength(0);
+		expect(providerFailureRecoveries(harness)).toHaveLength(1);
+		expect(getAssistantTexts(harness).at(-1)).toBe("picked the work back up");
 		expect(harness.session.isRetrying).toBe(false);
 	});
 
@@ -1137,36 +1143,60 @@ describe("AgentSession retry and event characterization", () => {
 			settings: waitSettings({ baseDelayMs: 1, maxDelayMs: 2, maxAttempts: 2, maxWaitMs: 10_000 }),
 		});
 		harnesses.push(harness);
-		harness.setResponses([quotaFailure(), quotaFailure(), quotaFailure()]);
+		harness.setResponses([
+			quotaFailure(),
+			quotaFailure(),
+			quotaFailure(),
+			fauxAssistantMessage("picked the work back up"),
+		]);
 
 		await harness.session.prompt("test");
+		// The aborted wait shares the spent ladder's terminal shape: agent_end hands
+		// the failure shape back to the model as one recovery turn before the
+		// episode ends.
+		await harness.session.waitForIdle();
 
 		const starts = harness.eventsOfType("auto_retry_start");
 		expect(starts.map((event) => [event.reason, event.attempt])).toEqual([
 			["usage", 1],
 			["usage", 2],
 		]);
-		expect(harness.faux.state.callCount).toBe(3);
+		// The fourth call is the one-shot recovery turn; it does not re-enter the
+		// ping loop (no further usage starts above).
+		expect(harness.faux.state.callCount).toBe(4);
 		const retryEnd = harness.eventsOfType("auto_retry_end");
 		expect(retryEnd).toHaveLength(1);
 		expect(retryEnd[0]?.success).toBe(false);
 		expect(retryEnd[0]?.finalError).toContain("maxAttempts");
+		expect(providerFailureRecoveries(harness)).toHaveLength(1);
+		expect(getAssistantTexts(harness).at(-1)).toBe("picked the work back up");
 		expect(harness.session.isRetrying).toBe(false);
 	});
 
 	it("aborts immediately when the provider-reported reset exceeds the wait bound and parking is disabled", async () => {
 		const harness = await createHarness({ settings: parkSettings({ pauseUntilReset: false }) });
 		harnesses.push(harness);
-		harness.setResponses([quotaFailure({ retryAfterMs: 3_600_000 }), fauxAssistantMessage("unused")]);
+		harness.setResponses([
+			quotaFailure({ retryAfterMs: 3_600_000 }),
+			fauxAssistantMessage("picked the work back up"),
+		]);
 
 		await harness.session.prompt("test");
+		// The refused wait shares the spent ladder's terminal shape: agent_end hands
+		// the failure shape back to the model as one recovery turn before the
+		// episode ends.
+		await harness.session.waitForIdle();
 
-		expect(harness.faux.state.callCount).toBe(1);
+		// The second call is the one-shot recovery turn; the wait itself was still
+		// refused up front, so nothing pinged and nothing parked.
+		expect(harness.faux.state.callCount).toBe(2);
 		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
 		const retryEnd = harness.eventsOfType("auto_retry_end");
 		expect(retryEnd).toHaveLength(1);
 		expect(retryEnd[0]?.success).toBe(false);
 		expect(retryEnd[0]?.finalError).toContain("maxWaitMs");
+		expect(providerFailureRecoveries(harness)).toHaveLength(1);
+		expect(getAssistantTexts(harness).at(-1)).toBe("picked the work back up");
 		expect(harness.session.isRetrying).toBe(false);
 		expect(harness.session.isQuotaParked).toBe(false);
 	});

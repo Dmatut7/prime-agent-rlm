@@ -1460,6 +1460,17 @@ interface RlmChildFollowUpWatch {
  */
 const WAIT_FOR_IDLE_STAGNANT_CYCLE_LIMIT = 16;
 
+/**
+ * Consecutive failed pump passes after which the session input pump stops
+ * rescheduling itself. The pump reschedules from its own finally, so a
+ * deterministic throw would otherwise spin the microtask queue without ever
+ * yielding to timers or IO - the 2026-09-19 100%-CPU wedge class. Every
+ * failure is logged; a clean pass resets the streak; and external triggers
+ * (admission, checkpoint changes, retry resolution) still schedule fresh
+ * passes, so a transient fault heals while a persistent one goes quiet.
+ */
+const SESSION_INPUT_PUMP_FAILURE_LIMIT = 8;
+
 /** One waitForIdle cycle's observable state; two equal snapshots mean the loop made no progress. */
 interface WaitForIdleProgress {
 	agentEventQueue: Promise<void>;
@@ -2054,6 +2065,12 @@ interface PersistedQuotaParkData {
 	jobId?: string;
 	/** Provider whose quota reset the park waits on; kept on re-arm/rebuild entries too. */
 	provider?: string;
+	/**
+	 * Wake re-arms consumed without a resume, carried on re-arm entries so a
+	 * restart does not reset the QUOTA_WAKE_MAX_RETRIES budget (the same
+	 * restart-safety parkCount already had).
+	 */
+	wakeRetries?: number;
 }
 
 function isPersistedQuotaParkData(value: unknown): value is PersistedQuotaParkData {
@@ -2067,7 +2084,9 @@ function isPersistedQuotaParkData(value: unknown): value is PersistedQuotaParkDa
 		Number.isFinite(record.parkCount) &&
 		(record.quotaResumeAt === undefined || typeof record.quotaResumeAt === "string") &&
 		(record.jobId === undefined || typeof record.jobId === "string") &&
-		(record.provider === undefined || typeof record.provider === "string")
+		(record.provider === undefined || typeof record.provider === "string") &&
+		(record.wakeRetries === undefined ||
+			(typeof record.wakeRetries === "number" && Number.isFinite(record.wakeRetries)))
 	);
 }
 
@@ -2523,6 +2542,12 @@ export class AgentSession {
 	private _sessionInputPumpRequested = false;
 	// Invalidates preparation when a branch pause starts and finishes before its next await resumes.
 	private _sessionInputPumpEpoch = 0;
+	/**
+	 * Consecutive pump passes that escaped with an error; a clean pass resets it.
+	 * At SESSION_INPUT_PUMP_FAILURE_LIMIT the pump stops rescheduling itself
+	 * (external triggers still can) instead of spinning on a deterministic throw.
+	 */
+	private _sessionInputPumpFailureStreak = 0;
 	private _sessionInputArrivalEpoch = 0;
 	// Persists abort/restart suspension after the initiating call returns.
 	private _sessionInputPumpSuspended = false;
@@ -2581,6 +2606,13 @@ export class AgentSession {
 	// is not the user cancelling the queued work, so the auto compaction's catch
 	// must treat it differently from abortCompaction()/requestAbort().
 	private _autoCompactionPreemptedByManual: AbortController | undefined = undefined;
+	/**
+	 * Set when a manual compact() preempted an in-flight OVERFLOW recovery: the
+	 * auto scope's willRetry path never ran, so the manual run owes the
+	 * overflowed request its retry (strip the rebuilt error tail + schedule the
+	 * continuation) when it settles. Consumed in _compact's finally.
+	 */
+	private _preemptedOverflowRecoveryRetry = false;
 	private _compactionOperation: Promise<void> | undefined = undefined;
 	/** Timer that aborts a compaction holding queued input for too long. */
 	// `unknown`, not `ReturnType<typeof setTimeout>`: when `stallWatchdogTimers` is
@@ -3750,6 +3782,18 @@ export class AgentSession {
 			);
 		const previousAnchor = preparing.at(-1);
 		const actions = this._actionStore.remove(predicate, candidates);
+		// A cancelled selected/preparing action may be the pump's in-flight
+		// preselected batch head; the pump re-reads the store when the epoch moves,
+		// so every cancel path moves it (the pump also re-checks the action's own
+		// state before driving it, as a second line of defense).
+		if (
+			actions.some((action) => {
+				const previous = previousStates.get(action.id);
+				return previous === "selected" || previous === "preparing";
+			})
+		) {
+			this._sessionInputPumpEpoch++;
+		}
 		const restorableMessages: CustomMessage[] = [];
 		const removed = new Set(actions);
 		if (previousAnchor && removed.has(previousAnchor)) {
@@ -7649,7 +7693,21 @@ export class AgentSession {
 				if (this._queueProviderFailureRecoveryTurn(msg)) return;
 			}
 
-			const compactionWillRetry = await this._checkCompaction(msg);
+			// The compaction check must never reject out of here: a throw would
+			// reject _processAgentEvent, which the event-queue catch swallows,
+			// leaving _finishActiveRetryWithFailure and _resolveRetry below
+			// unrun and the session wedged in isRetrying - the same shape the
+			// parent-notice guard below is armored against. Treat a failed check
+			// as "no compaction" so the terminal path closes the retry chain.
+			let compactionWillRetry = false;
+			try {
+				compactionWillRetry = await this._checkCompaction(msg);
+			} catch (error) {
+				sessionLog.error("compaction check failed at agent_end; treating the turn as terminal without compaction", {
+					sessionId: this.sessionId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
 			if (compactionWillRetry && this._retryAttempt > 0) {
 				return;
 			}
@@ -11173,6 +11231,7 @@ export class AgentSession {
 
 	private async _pumpSessionInputs(epoch: number): Promise<void> {
 		let blocked = false;
+		let failed = false;
 		try {
 			while (!this._disposed && !this._disposing && this._hasSelectableSessionInput()) {
 				await this.agent.waitForIdle();
@@ -11192,9 +11251,16 @@ export class AgentSession {
 				}
 				if (!this._hasCancelledDispatchCapture()) await this._agentEventQueue;
 				if (!preselected || preselected.payload.kind === "session_command") await this._waitForRefineIdle();
+				// A preselected action cancelled while this pass awaited (an abort,
+				// clearQueue or agent-message clear landing between the read above and
+				// here) is terminal and already released by the cancelling side;
+				// rolling it back or driving it into preparing would throw an illegal
+				// transition outside the batch try below. Treat it as gone.
+				const livePreselected = preselected?.lifecycle.state === "selected" ? preselected : undefined;
 				const activity = this._runtimeActivity();
 				const canSelectPreselectedTurn =
-					preselected?.payload.kind === "turn" && canSelectSessionAction({ ...activity, refinementApply: false });
+					livePreselected?.payload.kind === "turn" &&
+					canSelectSessionAction({ ...activity, refinementApply: false });
 				if (
 					this._isSessionInputHandoffDeferred(epoch) ||
 					(!canSelectPreselectedTurn && !canSelectSessionAction(activity))
@@ -11206,12 +11272,12 @@ export class AgentSession {
 					// (docs/fork/audit-20260919-findings.md, second-batch ledger). Rolling back
 					// also lets a `starts_when_admitted` agent-message sender observe the
 					// deferral instead of hanging on a delivery promise that can no longer settle.
-					if (preselected) this._actionStore.rollback(preselected);
+					if (livePreselected) this._actionStore.rollback(livePreselected);
 					this._notifySessionInputCheckpointChange();
-					if (preselected) this._emitQueueUpdate();
+					if (livePreselected) this._emitQueueUpdate();
 					return;
 				}
-				const first = preselected ?? this._actionStore.selectFirst();
+				const first = livePreselected ?? this._actionStore.selectFirst();
 				if (!first) return;
 				if (first.payload.kind === "session_command") {
 					await this._executeSelectedSessionCommand(first, epoch);
@@ -11226,7 +11292,7 @@ export class AgentSession {
 							? this.steeringMode
 							: this.followUpMode;
 				const actions: QueuedSessionAction[] = [first];
-				while (!preselected && mode === "all") {
+				while (!livePreselected && mode === "all") {
 					const next = this._actionStore.queuedActions(first.delivery)[0];
 					if (
 						!next ||
@@ -11300,7 +11366,17 @@ export class AgentSession {
 						this._settleDeferredDeliveredTurnActions(actions, transcript, this._asError(error));
 						if (undelivered.length > 0) this._emitQueueUpdate();
 						blocked = epoch !== this._sessionInputPumpEpoch || this._isBusyForSessionInput("pump");
-						if (blocked) return;
+						if (blocked) {
+							// The rollback above returned survivors to queued, and the
+							// finally below skips its self-reschedule when blocked - without
+							// a fresh pass the survivors wedge in the queue until some
+							// unrelated event happens to schedule one (the wave-4-e contract
+							// is that every busy-slot clear site reschedules). The scheduler
+							// self-guards (pause/suspend/disposed/empty queue), so this is
+							// safe whether the block was an epoch move or a busy sibling.
+							this._scheduleSessionInputPump();
+							return;
+						}
 						continue;
 					}
 					const terminalError = this._asError(error);
@@ -11344,9 +11420,33 @@ export class AgentSession {
 				}
 				if (epoch !== this._sessionInputPumpEpoch || blocked) return;
 			}
+		} catch (error) {
+			failed = true;
+			this._sessionInputPumpFailureStreak += 1;
+			// Logged, never propagated: a rejecting pump used to surface in
+			// waitForSessionInputIdle callers as an unexplained failure while the
+			// pump chain's own catch swallowed it without a trace. The failure
+			// streak fuses the self-reschedule below, so a deterministic throw
+			// cannot spin the microtask queue (the 2026-09-19 wedge class).
+			sessionLog.error("session input pump pass failed", {
+				sessionId: this.sessionId,
+				error: error instanceof Error ? error.message : String(error),
+				failureStreak: this._sessionInputPumpFailureStreak,
+			});
 		} finally {
+			if (!failed) this._sessionInputPumpFailureStreak = 0;
 			if (!blocked && epoch === this._sessionInputPumpEpoch && this._hasSelectableSessionInput()) {
-				this._scheduleSessionInputPump();
+				if (this._sessionInputPumpFailureStreak < SESSION_INPUT_PUMP_FAILURE_LIMIT) {
+					this._scheduleSessionInputPump();
+				} else if (this._sessionInputPumpFailureStreak === SESSION_INPUT_PUMP_FAILURE_LIMIT) {
+					// Give up once, loudly. Admission, checkpoint changes and retry
+					// resolution still schedule fresh passes; only the tight
+					// self-reschedule loop is fused.
+					sessionLog.error("session input pump stopped rescheduling itself after repeated failures", {
+						sessionId: this.sessionId,
+						failureStreak: this._sessionInputPumpFailureStreak,
+					});
+				}
 			}
 		}
 	}
@@ -11901,9 +12001,8 @@ export class AgentSession {
 		const clearable = this._actionStore
 			.clearableActions()
 			.filter((action) => action.payload.kind === "session_command" || action.payload.queueVisible);
-		if (clearable.some((action) => action.payload.kind === "turn" && action.lifecycle.state === "preparing")) {
-			this._sessionInputPumpEpoch++;
-		}
+		// The pump-epoch bump for cancelled selected/preparing actions lives in
+		// _cancelSessionActions, so every cancel path - not just this one - moves it.
 		const steering = clearable
 			.filter((action) => action.delivery === "next_turn_boundary")
 			.map((action) => action.payload.text);
@@ -13441,7 +13540,24 @@ export class AgentSession {
 		} else {
 			messages.push(message);
 		}
-		this.sessionManager.appendCustomMessageEntry(message.customType, message.content, message.display, undefined);
+		// The compaction already committed by the time this runs, so the kernel
+		// sync is post-commit best-effort: a failed append must not flip the
+		// compaction's outcome attribution (the caller would record the committed
+		// compaction as failed, and an overflow recovery would lose its retry).
+		// Degrade exactly like a compaction outcome: report the failure and track
+		// the message as unpersisted so context rebuilds still carry it (the
+		// in-memory push above is already ahead of the disk).
+		try {
+			this.sessionManager.appendCustomMessageEntryWithRollback(
+				message.customType,
+				message.content,
+				message.display,
+				undefined,
+			);
+		} catch (error) {
+			this._reportSessionPersistFailure(error);
+			this._unpersistedOutcomes.push(message);
+		}
 		this._emit({ type: "message_start", message });
 		this._emit({ type: "message_end", message });
 
@@ -13465,7 +13581,22 @@ export class AgentSession {
 				display: true,
 				timestamp: Date.now(),
 			} satisfies CustomMessage;
-			this.sessionManager.appendCustomMessageEntry(pruneNotice.customType, pruneNotice.content, true, undefined);
+			// Same post-commit best-effort rule as the ipython_state block above:
+			// the compaction already committed, so a failed append only reports.
+			// The notice deliberately stays out of _unpersistedOutcomes: it is a
+			// transcript/event disclosure for the owner, and re-merging it into a
+			// rebuilt context would tell the model the same fact twice (the
+			// ipython_state block already carries it).
+			try {
+				this.sessionManager.appendCustomMessageEntryWithRollback(
+					pruneNotice.customType,
+					pruneNotice.content,
+					true,
+					undefined,
+				);
+			} catch (error) {
+				this._reportSessionPersistFailure(error);
+			}
 			this._emit({ type: "message_start", message: pruneNotice });
 			this._emit({ type: "message_end", message: pruneNotice });
 		}
@@ -13835,6 +13966,24 @@ export class AgentSession {
 			resolveCompactionOperation();
 			this._notifySessionInputCheckpointChange();
 			this._scheduleSessionInputPump();
+			// A manual /compact that preempted an in-flight overflow recovery owes
+			// the overflowed request its retry: the auto scope's willRetry path
+			// never ran. A user-aborted manual run drops the debt (the abort owns
+			// the stop); a failed one still retries. The strip mirrors the
+			// willRetry path: a committed compaction (or a failure-path shrink)
+			// rebuilt the context from the branch, reintroducing the persisted
+			// overflow error at the tail, and continue() refuses an assistant tail.
+			if (this._preemptedOverflowRecoveryRetry) {
+				this._preemptedOverflowRecoveryRetry = false;
+				if (!compactionAbort.signal.aborted) {
+					const messages = this.agent.state.messages;
+					const last = messages[messages.length - 1];
+					if (last?.role === "assistant" && (last as AssistantMessage).stopReason === "error") {
+						this.agent.state.messages = messages.slice(0, -1);
+					}
+					this._schedulePostCompactionContinue(true);
+				}
+			}
 			if (didCompact) {
 				this._discardPendingAutoRefine({ cancelPostCompactionContinue: true });
 				if (this._goalState.status === "active" && !compactionAbort.signal.aborted) {
@@ -15867,6 +16016,16 @@ export class AgentSession {
 				this._schedulePostCompactionContinue(shouldContinueAfterCompaction);
 			}
 		};
+		// A model-issued compact.run request survives an unsuccessful compaction:
+		// the manual path already keeps it scheduled on failure ("on failure the
+		// request stays scheduled for the next turn boundary"), and the auto path
+		// used to drop it - the instructions never reached any summarizer and the
+		// request vanished. `??=` so a request issued while this compaction ran is
+		// not clobbered. A user abort stays consumed; a manual preemption hands
+		// the request to the manual run through the same restore.
+		const restorePendingRequest = () => {
+			if (pending !== undefined) this._pendingRequestedCompaction ??= pending;
+		};
 
 		this._emit({ type: "compaction_start", reason, customInstructions });
 		const autoCompactionAbort = new AbortController();
@@ -15900,6 +16059,7 @@ export class AgentSession {
 				);
 				if (reason === "threshold") this._armThresholdCompactionCooldown();
 				await this._runEmergencyContextShrink(reason, detail);
+				restorePendingRequest();
 				resumeAfterFailure();
 				return false;
 			}
@@ -15971,6 +16131,11 @@ export class AgentSession {
 					this._clearQueuedGoalContinuationAfterCancelledThresholdCompaction(
 						queuedGoalContinuationForThisCompaction,
 					);
+				} else {
+					// The manual run that preempted this scope inherits the pending
+					// compact.run request: _compact captures it after this catch
+					// settles (it waits on this scope's operation first).
+					restorePendingRequest();
 				}
 				this._endCompactionUnsuccessfully(
 					reason,
@@ -15978,6 +16143,15 @@ export class AgentSession {
 					`${reason === "requested" ? "Requested c" : "C"}ompaction cancelled`,
 					{ aborted: true, customInstructions },
 				);
+				if (preemptedByManualCompaction && reason === "overflow") {
+					// The preempted scope was an overflow recovery with willRetry
+					// pending: the manual run compacts the same context, but nothing
+					// would re-issue the overflowed request once it settles. Flag
+					// the debt so the manual path's tail schedules the retry, and
+					// report willRetry so this turn's terminal flow holds off.
+					this._preemptedOverflowRecoveryRetry = true;
+					return true;
+				}
 				return false;
 			}
 			if (error instanceof CompactionSkippedError) {
@@ -15990,6 +16164,7 @@ export class AgentSession {
 					{ errorSeverity: "warning", customInstructions },
 				);
 				if (reason === "threshold") this._armThresholdCompactionCooldown();
+				restorePendingRequest();
 				resumeAfterFailure();
 				return false;
 			}
@@ -16012,6 +16187,7 @@ export class AgentSession {
 			// so loudly. Runs before resumeAfterFailure so the continuation it schedules
 			// sees the shrunken context.
 			await this._runEmergencyContextShrink(reason, errorMessage);
+			restorePendingRequest();
 			resumeAfterFailure();
 			return false;
 		} finally {
@@ -20208,6 +20384,11 @@ export class AgentSession {
 	 */
 	private async _notifyParentOfTerminalError(message: AssistantMessage): Promise<void> {
 		if (this._rlmDepth <= 0 || this._disposed || this._disposing) return;
+		// A live quota park owns the resume: the parked turn's error is the park's
+		// pause, not the child's death, so the parent hears nothing until the wake
+		// (or a spent park budget, which clears the park first) settles it. The
+		// goal layer holds the same line in _finishGoalForTerminalAssistantMessage.
+		if (this._quotaPark !== undefined) return;
 		const controller = this._agentMessageController;
 		if (!controller?.roster || !controller.sendAgentMessage) return;
 		let parent: AgentFamilyRosterEntry | undefined;
@@ -20313,6 +20494,9 @@ export class AgentSession {
 				requestBudget: { used: requestBudget.used, maxRequests: requestBudget.maxRequests },
 				errorMessage: message.errorMessage,
 			});
+			// Same terminal shape as a spent ladder: agent_end hands the failure back
+			// to the model as one recovery turn before the episode is terminal.
+			this._providerFailureRecoveryPending = true;
 			this._markProviderAuthStaleForRetryFailure(message, options);
 			this._emit({
 				type: "auto_retry_end",
@@ -20429,6 +20613,9 @@ export class AgentSession {
 			if (waitClass === "transient" && waitPolicy.enabled) {
 				return this._handleProviderWait(message, options, waitPolicy, "unavailable");
 			}
+			// Same terminal shape as a spent ladder: agent_end hands the failure back
+			// to the model as one recovery turn before the episode is terminal.
+			this._providerFailureRecoveryPending = true;
 			this._markProviderAuthStaleForRetryFailure(message, options);
 			const restoredModel = this._restorePrimaryModelAfterBackup();
 			this._emit({
@@ -20438,6 +20625,7 @@ export class AgentSession {
 				finalError: `Provider requested a ${Math.ceil(delay.retryAfterMs / 1000)}s wait before retrying (above retry.provider.maxRetryDelayMs=${maxRetryDelayMs}ms): ${message.errorMessage || "unknown error"}`,
 				...(restoredModel ? { restoredModel } : {}),
 			});
+			this._terminalFailureAttemptCount = this._retryAttempt - 1;
 			this._retryAttempt = 0;
 			this._retryAuthFailureSources = [];
 			this._resolveRetry();
@@ -21415,6 +21603,11 @@ export class AgentSession {
 				this._cancelQuotaParkWake(stalePark);
 				this._quotaPark = undefined;
 			}
+			// Same terminal shape as a spent ladder: agent_end hands the failure
+			// back to the model as one recovery turn before the episode is
+			// terminal. The wait ran the longest of any failure path; it should
+			// not be the one that ends silently.
+			this._providerFailureRecoveryPending = true;
 			this._markProviderAuthStaleForRetryFailure(message, options);
 			const restoredModel = this._restorePrimaryModelAfterBackup();
 			this._emit({
@@ -21424,6 +21617,9 @@ export class AgentSession {
 				finalError: `${decision.message}: ${message.errorMessage || "unknown error"}`,
 				...(restoredModel ? { restoredModel } : {}),
 			});
+			// The pings that just ran are this episode's attempts: a later terminal
+			// notice reports them instead of the "no retries attempted" misreport.
+			this._terminalFailureAttemptCount = pingAttempt - 1;
 			this._retryAttempt = 0;
 			this._providerWait = undefined;
 			this._retryAuthFailureSources = [];
@@ -21523,6 +21719,10 @@ export class AgentSession {
 	): void {
 		this._markProviderAuthStaleForRetryFailure(message, options);
 		this._emit({ type: "auto_retry_end", success: false, attempt: parkedAttempt, finalError });
+		// The parked turn's pings are real attempts: a terminal notice after the
+		// park ends (wake budget spent, probe failing) must not report "no retries
+		// attempted". A successful resume resets this at the next message_end.
+		this._terminalFailureAttemptCount = parkedAttempt;
 		this._retryAttempt = 0;
 		this._providerWait = undefined;
 		this._retryAuthFailureSources = [];
@@ -21739,11 +21939,13 @@ export class AgentSession {
 		park.timer = this._scheduleQuotaResumeTimer(park.resumeAtMs);
 		// Record the replacement wake, or a restart reads the spent park entry,
 		// drops the park, and leaves this retry job armed with no owner to cancel.
-		// The provider rides along so readQuotaParkStatus keeps it after the re-arm.
+		// The provider rides along so readQuotaParkStatus keeps it after the re-arm,
+		// and wakeRetries rides along so a restart cannot reset the retry budget.
 		this.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
 			resumeAt: new Date(park.resumeAtMs).toISOString(),
 			quotaResumeAt: new Date(quotaResumeAtMs).toISOString(),
 			parkCount: park.parkCount,
+			wakeRetries: retries,
 			...(park.jobId !== undefined ? { jobId: park.jobId } : {}),
 			...(park.provider !== undefined ? { provider: park.provider } : {}),
 		});
@@ -21827,6 +22029,35 @@ export class AgentSession {
 			}
 			const resumeAtMs = Date.parse(entry.data.resumeAt);
 			if (!Number.isFinite(resumeAtMs) || resumeAtMs <= Date.now()) {
+				// The wake time passed while the session was down. The durable wake
+				// job normally still covers it (the daemon claims due jobs on
+				// sight), so only a wake that is definitely gone - never persisted,
+				// or lost with the job store - leaves the parked task with no
+				// resume path at all. Record that loss instead of dropping it
+				// silently; a wake the user cancelled is their choice and stays
+				// quiet, exactly like the live user-cancelled path below.
+				const job = entry.data.jobId === undefined ? undefined : this._findQuotaResumeJob(entry.data.jobId);
+				if (entry.data.jobId === undefined || job === undefined) {
+					sessionLog.warn(
+						"quota park's wake time passed and its durable wake job is gone; the parked task will not resume",
+						{
+							sessionId: this.sessionId,
+							resumeAt: entry.data.resumeAt,
+							parkCount: entry.data.parkCount,
+							jobId: entry.data.jobId ?? null,
+						},
+					);
+					try {
+						this.sessionManager.appendCustomEntry(QUOTA_RESUME_CUSTOM_ENTRY_TYPE, {
+							outcome: "wake-lost",
+							resumeAt: entry.data.resumeAt,
+							parkCount: entry.data.parkCount,
+							...(entry.data.provider !== undefined ? { provider: entry.data.provider } : {}),
+						});
+					} catch (error) {
+						this._reportSessionPersistFailure(error);
+					}
+				}
 				return;
 			}
 			const quotaResumeAtMs =
@@ -21845,6 +22076,7 @@ export class AgentSession {
 					jobId,
 					...(entry.data.quotaResumeAt !== undefined ? { quotaResumeAt: entry.data.quotaResumeAt } : {}),
 					...(entry.data.provider !== undefined ? { provider: entry.data.provider } : {}),
+					...(entry.data.wakeRetries !== undefined ? { wakeRetries: entry.data.wakeRetries } : {}),
 				});
 			}
 			this._quotaPark = {
@@ -21854,6 +22086,7 @@ export class AgentSession {
 				...(jobId !== undefined ? { jobId } : {}),
 				timer: this._scheduleQuotaResumeTimer(resumeAtMs),
 				...(entry.data.provider !== undefined ? { provider: entry.data.provider } : {}),
+				...(entry.data.wakeRetries !== undefined ? { wakeRetries: entry.data.wakeRetries } : {}),
 			};
 			return;
 		}

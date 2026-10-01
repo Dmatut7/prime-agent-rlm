@@ -1592,7 +1592,13 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 				failed: restoreResult.failed,
 			};
 			failures = restoreResult.failures;
-			clearPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+			// Same rule as the fallback restore above (a predecessor that would not
+			// stop): a session whose restore failed keeps its queue snapshot only
+			// inside this manifest, so clearing it here would delete the one recovery
+			// entry point left. Clear only when every session made it across.
+			if (restoreResult.failures.length === 0) {
+				clearPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+			}
 		}
 		statusWriter.update({
 			phase: "complete",
