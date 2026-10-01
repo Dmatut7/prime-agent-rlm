@@ -1,0 +1,1 @@
+- Changed the default Anthropic model to Claude Opus 5.5.

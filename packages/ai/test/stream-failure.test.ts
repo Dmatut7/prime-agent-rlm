@@ -116,6 +116,39 @@ describe("extractStreamFailureInfo", () => {
 		expect(extractStreamFailureInfo("not an error").kind).toBe("unknown");
 	});
 
+	// OpenAI moved overload signalling to 503 with code "server_is_overloaded"
+	// (changelog 2026-09-02); the body type stays "server_error", so the code is
+	// the only thing separating it from a plain 503.
+	test("classifies an OpenAI 503 server_is_overloaded as overloaded", () => {
+		const sdkError = Object.assign(new Error("503 The server had an error while processing your request"), {
+			status: 503,
+			error: {
+				message: "The server had an error while processing your request",
+				type: "server_error",
+				code: "server_is_overloaded",
+			},
+			requestID: "req_overloaded",
+		});
+		expect(extractStreamFailureInfo(sdkError)).toMatchObject({
+			kind: "overloaded",
+			providerErrorType: "server_is_overloaded",
+			status: 503,
+			requestId: "req_overloaded",
+		});
+	});
+
+	test("keeps a 503 without the overload code a plain server_error", () => {
+		const sdkError = Object.assign(new Error("503 The server had an error while processing your request"), {
+			status: 503,
+			error: { message: "The server had an error while processing your request", type: "server_error" },
+		});
+		expect(extractStreamFailureInfo(sdkError)).toMatchObject({
+			kind: "server_error",
+			providerErrorType: "server_error",
+			status: 503,
+		});
+	});
+
 	test("reads an unpaid balance out of an unparsed 400 body", () => {
 		const error = Object.assign(
 			new Error(

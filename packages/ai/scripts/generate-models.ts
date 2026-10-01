@@ -328,7 +328,9 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	) {
 		mergeThinkingLevelMap(model, { xhigh: "xhigh", max: "max" });
 	}
-	if (model.id.includes("fable-5") || model.id.includes("mythos-5")) {
+	if (model.id.includes("fable-5") || model.id.includes("mythos-5") || model.id.includes("opus-5-5")) {
+		// Claude Opus 5.5 thinks every turn like the Fable/Mythos 5 family:
+		// thinking cannot be disabled (off: null), xhigh/max efforts apply.
 		mergeThinkingLevelMap(model, { off: null, xhigh: "xhigh", max: "max" });
 	}
 	if (model.id.includes("mythos-preview")) {
@@ -1470,9 +1472,12 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 			}
 		}
 
-		// Process Kimi For Coding models
-		if (data["kimi-for-coding"]?.models) {
-			const kimiModels = data["kimi-for-coding"].models as Record<string, ModelsDevModel>;
+		// Process Kimi For Coding models. models.dev renamed the section to
+		// kimi-code-plan-cn / kimi-code-plan-global; the cn plan is the one served at
+		// this provider's api.kimi.com/coding endpoint.
+		const kimiForCoding = data["kimi-for-coding"] ?? data["kimi-code-plan-cn"];
+		if (kimiForCoding?.models) {
+			const kimiModels = kimiForCoding.models as Record<string, ModelsDevModel>;
 			const hasCanonicalModel = Object.prototype.hasOwnProperty.call(kimiModels, "kimi-for-coding");
 
 			const kimiAliases = new Set(["k2p5", "k2p6"]);

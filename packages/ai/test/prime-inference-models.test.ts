@@ -22,13 +22,13 @@ describe("Prime Inference models", () => {
 				"anthropic/claude-opus-4.7",
 				"anthropic/claude-opus-4.8",
 				"anthropic/claude-opus-5",
+				"anthropic/claude-opus-5.5",
 				"anthropic/claude-sonnet-5",
 				"deepseek/deepseek-v4-pro",
 				"google/gemini-2.5-pro",
 				"meta-llama/llama-4-maverick",
 				"minimax/minimax-m3",
 				"moonshotai/kimi-k2.7-code",
-				"nvidia/nemotron-3-super-120b-a12b",
 				"openai/gpt-5.4",
 				"openai/gpt-5.5",
 				"qwen/qwen3-coder-next",
@@ -96,8 +96,8 @@ describe("Prime Inference models", () => {
 			expect(model.input).toEqual(["text", "image"]);
 			expect(model.contextWindow).toBe(1048576);
 			expect(model.maxTokens).toBe(1048576);
-			expect(model.cost.input).toBe(provider === "prime-inference" ? 3.45 : 3);
-			expect(model.cost.output).toBe(provider === "prime-inference" ? 17.25 : 15);
+			expect(model.cost.input).toBe(provider === "prime-inference" ? 3.45 : 0.6635);
+			expect(model.cost.output).toBe(provider === "prime-inference" ? 17.25 : 10);
 		}
 	});
 
@@ -107,12 +107,6 @@ describe("Prime Inference models", () => {
 		expect(gemini.maxTokens).toBe(65536);
 		expect(gemini.input).toEqual(["text", "image"]);
 		expect(gemini.reasoning).toBe(true);
-
-		const nemotronSuper = getModel("prime-inference", "nvidia/nemotron-3-super-120b-a12b");
-		expect(nemotronSuper.reasoning).toBe(true);
-		expect(nemotronSuper.input).toEqual(["text"]);
-		expect(nemotronSuper.contextWindow).toBe(262144);
-		expect(nemotronSuper.maxTokens).toBe(4096);
 
 		const maverick = getModel("prime-inference", "meta-llama/llama-4-maverick");
 		expect(maverick.contextWindow).toBe(1048576);
@@ -207,7 +201,9 @@ describe("Prime Inference models", () => {
 		expect(getModel("prime-inference", "anthropic/claude-sonnet-4.6").contextWindow).toBe(1000000);
 		expect(getModel("prime-inference", "anthropic/claude-sonnet-5").contextWindow).toBe(1000000);
 		expect(getModel("prime-inference", "anthropic/claude-haiku-4.5").contextWindow).toBe(200000);
-		expect(getModel("prime-inference", "anthropic/claude-sonnet-4.5").contextWindow).toBe(200000);
+		// Prime's live catalog now publishes the 1M window for this route; the 200k
+		// override only fills in when the live entry stays silent.
+		expect(getModel("prime-inference", "anthropic/claude-sonnet-4.5").contextWindow).toBe(1000000);
 	});
 
 	it("resolves PRIME_API_KEY from the environment", () => {

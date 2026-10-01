@@ -866,9 +866,44 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 /**
  * Fable/Mythos models think every turn and reject an explicit
  * `thinking: {type: "disabled"}` (and any sampling params) with a 400.
+ * Claude Opus 5.5 joins them: thinking cannot be disabled on it at all
+ * (`enabled` with a budget 400s too, but adaptive models never take that path).
  */
 function isAlwaysOnAdaptiveThinkingModel(modelId: string): boolean {
-	return modelId.includes("fable-5") || modelId.includes("mythos-5") || modelId.includes("mythos-preview");
+	return (
+		modelId.includes("fable-5") ||
+		modelId.includes("mythos-5") ||
+		modelId.includes("mythos-preview") ||
+		modelId.includes("opus-5-5")
+	);
+}
+
+/**
+ * Claude Sonnet 5.5 rejects `thinking: {type: "disabled"}` with a 400; turning
+ * off up-front thinking is `thinking: {type: "between_tools"}` instead, accepted
+ * at high effort or below and with no other field on the object.
+ */
+function supportsBetweenToolsThinking(modelId: string): boolean {
+	return modelId.includes("sonnet-5-5");
+}
+
+/** Models whose API rejects a non-default `temperature` with a 400. */
+function rejectsSamplingParams(modelId: string): boolean {
+	return isAlwaysOnAdaptiveThinkingModel(modelId) || supportsBetweenToolsThinking(modelId);
+}
+
+/**
+ * Models that reject forced tool use (`tool_choice` types "any"/"tool") with a
+ * 400: Claude Sonnet 5.5, Claude Opus 5.5, and the Fable/Mythos 5.1 pair. The
+ * documented fallback is `auto` plus strict tool schemas.
+ */
+function rejectsForcedToolChoice(modelId: string): boolean {
+	return (
+		modelId.includes("sonnet-5-5") ||
+		modelId.includes("opus-5-5") ||
+		modelId.includes("fable-5-1") ||
+		modelId.includes("mythos-5-1")
+	);
 }
 
 /**
@@ -1122,8 +1157,8 @@ function buildParams(
 	}
 
 	// Temperature is incompatible with extended thinking (adaptive or budget-based),
-	// and always-on models reject sampling params outright.
-	if (options?.temperature !== undefined && !options?.thinkingEnabled && !isAlwaysOnAdaptiveThinkingModel(model.id)) {
+	// and always-on models plus Claude Sonnet 5.5 reject sampling params outright.
+	if (options?.temperature !== undefined && !options?.thinkingEnabled && !rejectsSamplingParams(model.id)) {
 		params.temperature = options.temperature;
 	}
 
@@ -1164,7 +1199,16 @@ function buildParams(
 				};
 			}
 		} else if (options?.thinkingEnabled === false && !isAlwaysOnAdaptiveThinkingModel(model.id)) {
-			params.thinking = { type: "disabled" };
+			if (supportsBetweenToolsThinking(model.id)) {
+				// Claude Sonnet 5.5: `disabled` is a 400. `between_tools` is its lowest
+				// thinking setting, takes no other field, and is rejected at xhigh/max
+				// effort - there the thinking field must be omitted (adaptive stays on).
+				if (options.effort !== "xhigh" && options.effort !== "max") {
+					params.thinking = { type: "between_tools" } as unknown as MessageCreateParamsStreaming["thinking"];
+				}
+			} else {
+				params.thinking = { type: "disabled" };
+			}
 		}
 	}
 
@@ -1176,7 +1220,11 @@ function buildParams(
 	}
 
 	if (options?.toolChoice) {
-		if (typeof options.toolChoice === "string") {
+		if (rejectsForcedToolChoice(model.id)) {
+			// Forced tool use is a documented 400 on these models; `auto` (with strict
+			// tool schemas) is the official migration path. `none` stays supported.
+			params.tool_choice = { type: options.toolChoice === "none" ? "none" : "auto" };
+		} else if (typeof options.toolChoice === "string") {
 			params.tool_choice = { type: options.toolChoice };
 		} else {
 			params.tool_choice = options.toolChoice;

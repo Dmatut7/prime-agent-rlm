@@ -172,8 +172,9 @@ function extractStreamFailureParts(error: unknown): { info: StreamFailureInfo; d
 		body = body.error as { type?: unknown; code?: unknown; message?: unknown };
 	}
 	const bodyType = body && typeof body === "object" ? (body.type ?? body.code) : undefined;
+	const bodyCode = body && typeof body === "object" ? body.code : undefined;
 	const bodyMessage = body && typeof body === "object" ? body.message : undefined;
-	const providerErrorType =
+	let providerErrorType =
 		typeof bodyType === "string"
 			? bodyType
 			: typeof err.code === "string"
@@ -193,6 +194,14 @@ function extractStreamFailureParts(error: unknown): { info: StreamFailureInfo; d
 	// Message text is too weak for these verdicts: without a structured type, only the status decides.
 	if ((kind === "auth" || kind === "permission") && providerErrorType === undefined) {
 		kind = classifyStreamFailure(undefined, status);
+	}
+	// OpenAI moved overload signalling to a 503 whose body type stays "server_error";
+	// only the code "server_is_overloaded" (changelog 2026-09-02) separates it from a
+	// plain 503, and a plain 503 must keep its server_error verdict.
+	const overloadCode = typeof bodyCode === "string" ? bodyCode : typeof err.code === "string" ? err.code : undefined;
+	if (kind === "server_error" && status === 503 && overloadCode?.toLowerCase() === "server_is_overloaded") {
+		kind = "overloaded";
+		providerErrorType = overloadCode;
 	}
 
 	return {
