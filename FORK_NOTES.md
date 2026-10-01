@@ -1,3 +1,8 @@
+## 2026-10-01 wave-2 swarm 五批修复：worker 死了会话自己接上、卡死 25 分钟自动介入
+
+- 老板能感觉到的：后台 worker 进程意外死掉后，会话会自动恢复接着跑，不用手动重开；模型额度用完进入等待（quota park）时，界面上能看到「在等额度、几点恢复、还要等多久」，不再干等；无人值守时卡死约 25 分钟会自动介入处理，不用人盯着；`/context` 在窄终端下不再排版错乱；`-v` 改回 CLI 惯例的 verbose（以前占着 version）；跨模型 fallback 时只重放最近一轮的思考内容，省上下文。
+- 做法：五个修复批次并行施工，各自独立提交（loop/会话核心、daemon/worker、记忆/compaction、显示杂项、跨模型 thinking 收敛）；daemon 协议升到 rev 42（新增 quota_park_status 事件，向后兼容、capability 门控）；纯净树 `tsgo --noEmit` 通过后推送。需要重新编译并重启后才生效。
+
 ## 2026-10-01 wave-1 swarm 六批修复：自动化不再轻易中途停、send --steer/--follow-up 真能用
 
 - 老板能感觉到的：自动化跑到重试耗尽、遇到临时限流（retry-after）、输出被截断时不再直接停，会继续往下走；`prime-agent send --steer/--follow-up` 经 daemon 协议真正接通，CLI 与斜杠命令解析收紧；超宽行不再把 daemon 搞崩（改为截断显示），徽标宽度与 OSC133 顺序修正；会话被占用时报错给出可操作的解决办法，启动提示更友好；静默的记忆丢失会亮告警；跨 provider 修了一批坑（被中断轮次的工具证据保留、Anthropic pause_turn 正确映射为 length、思考签名损坏与 thinking-as-text 等重放路径加固、坏工具调用缺必填参数时正确换模型）。
