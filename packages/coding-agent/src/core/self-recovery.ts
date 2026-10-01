@@ -433,6 +433,12 @@ export interface OutputTruncatedContinueDetails {
 	reason: "output_truncated";
 	ordinal: number;
 	maxOrdinal: number;
+	/**
+	 * Set when the truncated turn is a subagent's: its transcript prose is not the
+	 * deliverable, so the message also says the result must be sent to the parent
+	 * before stopping.
+	 */
+	deliverable?: "parent_reply";
 }
 
 /**
@@ -453,6 +459,11 @@ export function createOutputTruncatedContinueMessage(
 		content: [
 			`[auto-continue] Your last reply was cut off by the output limit (stopReason: "length"): the turn ended mid-answer and the work is not done.`,
 			"Continue from where you stopped: pick up the interrupted sentence or step and carry on. Do not restart, re-explain, or repeat what is already in the transcript; when the next move is a tool call, make it. Once the work is finished and verified, end with the result stated plainly.",
+			...(details.deliverable === "parent_reply"
+				? [
+						"Your reply text is not the deliverable: the parent agent sees only what you send with `agent_message.send`, so when the work is finished, send the result before you stop.",
+					]
+				: []),
 			`This is an automatic continue (${details.ordinal} of at most ${details.maxOrdinal} for this request).`,
 		].join("\n"),
 		display: true,

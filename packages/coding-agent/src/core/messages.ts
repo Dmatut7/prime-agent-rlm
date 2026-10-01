@@ -60,6 +60,12 @@ export const ASYNC_BASH_COMPLETION_CUSTOM_TYPE = "async_bash_completion";
 export const EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE = "empty_response_recovery";
 /** Self-recovery continue: the session nudges itself after an announced-but-undone step or a missing child reply. */
 export const AUTO_CONTINUE_CUSTOM_TYPE = "auto_continue";
+/**
+ * Owner-facing notice a session writes on load when its transcript is damaged
+ * (skipped lines, broken entry chain, unresolvable compaction anchor):
+ * transcript + UI only, so convertToLlm excludes it.
+ */
+export const SESSION_CONTEXT_LOSS_CUSTOM_TYPE = "session_context_loss";
 export const ASYNC_BASH_COMPLETION_PREVIEW_LABEL = "Background command finished";
 
 export const THINKING_LEVEL_CLAMPED_CUSTOM_TYPE = "thinking_level_clamped";
@@ -1579,7 +1585,8 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						m.customType === COMPACTION_OUTCOME_CUSTOM_TYPE ||
 						m.customType === MCP_CONNECTION_OUTCOME_CUSTOM_TYPE ||
 						m.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE ||
-						m.customType === PROVIDER_FALLBACK_NOTICE_CUSTOM_TYPE
+						m.customType === PROVIDER_FALLBACK_NOTICE_CUSTOM_TYPE ||
+						m.customType === SESSION_CONTEXT_LOSS_CUSTOM_TYPE
 					) {
 						return undefined;
 					}

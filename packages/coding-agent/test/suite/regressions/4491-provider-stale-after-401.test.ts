@@ -1,6 +1,7 @@
 import type { AgentEvent } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
+import { PROVIDER_FAILURE_RECOVERY_CUSTOM_TYPE } from "../../../src/core/self-recovery.js";
 import { createHarness, type Harness } from "../harness.js";
 
 function provider401Message(): AssistantMessage {
@@ -218,22 +219,37 @@ describe("issue #4491 provider stale after repeated 401", () => {
 			},
 		});
 		harnesses.push(harness);
-		harness.setResponses([provider401Message(), provider500Message(), provider500Message()]);
+		harness.setResponses([
+			provider401Message(),
+			provider500Message(),
+			provider500Message(),
+			// The spent ladder hands the failure shape back to the model as one
+			// recovery turn (afcc6e022), so the run no longer ends at exhaustion.
+			fauxAssistantMessage("picked the work back up"),
+		]);
 
 		await harness.session.prompt("hello");
+		await harness.session.waitForIdle();
 
-		expect(harness.faux.state.callCount).toBe(3);
+		expect(harness.faux.state.callCount).toBe(4);
 		expect(harness.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual([1, 2]);
 		expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([false]);
 		expect(harness.authStorage.hasAuth(harness.getModel().provider)).toBe(false);
 		await expect(harness.authStorage.getApiKey(harness.getModel().provider)).resolves.toBeUndefined();
 
+		const recoveryNotices = harness.session.messages.filter(
+			(message) => message.role === "custom" && message.customType === PROVIDER_FAILURE_RECOVERY_CUSTOM_TYPE,
+		);
+		expect(recoveryNotices).toHaveLength(1);
+
 		const assistantMessages = harness.session.messages.filter(
 			(message): message is AssistantMessage => message.role === "assistant",
 		);
-		const finalAssistant = assistantMessages[assistantMessages.length - 1];
-		expect(finalAssistant?.errorMessage).toContain("500 Internal Server Error");
-		expect(finalAssistant?.errorMessage).toContain("Run /login to update credentials.");
+		const erroredAssistant = assistantMessages.filter((message) => message.stopReason === "error").at(-1);
+		expect(erroredAssistant?.errorMessage).toContain("500 Internal Server Error");
+		expect(erroredAssistant?.errorMessage).toContain("Run /login to update credentials.");
+		// The recovery turn's answer is the run's last word, not the 500.
+		expect(assistantMessages[assistantMessages.length - 1]?.stopReason).toBe("stop");
 	});
 
 	it("marks concrete auth failures stale when retry is disabled", async () => {

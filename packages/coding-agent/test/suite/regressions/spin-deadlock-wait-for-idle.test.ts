@@ -210,9 +210,16 @@ describe("waitForIdle spin deadlock (audit 2026-09-19)", () => {
 			// The delivered dispatch is terminal work: it must not outlive the wait.
 			expect(returned?.unfinished ?? 1, describeVerdict(verdict)).toBe(0);
 		}
+		if (mode === "orphan") {
+			// The rolled-back turn dispatches once the bash releases the busy slot: it must
+			// complete inside the wait, not outlive it. A return with work still unfinished
+			// is the give-up fuse firing on the swallowed-input orphan
+			// (docs/fork/audit-20260919-findings.md, second-batch ledger).
+			expect(returned?.unfinished ?? 1, describeVerdict(verdict)).toBe(0);
+		}
 	}
 
-	it("keeps the event loop alive for a turn stranded in `selected` behind a running bash", {
+	it("keeps the event loop alive for a turn the pump selected and rolled back behind a running bash", {
 		timeout: 120_000,
 	}, async () => {
 		await expectNoStarvation("orphan");

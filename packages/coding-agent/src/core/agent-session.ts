@@ -303,6 +303,7 @@ import {
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 	type RlmChildFailureDetails,
+	SESSION_CONTEXT_LOSS_CUSTOM_TYPE,
 	THINKING_LEVEL_CLAMPED_CUSTOM_TYPE,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
@@ -472,10 +473,17 @@ import {
 	transitionSessionAction,
 	type WakePolicy,
 } from "./session-action-store.js";
-import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionMessageEntry } from "./session-manager.js";
+import type {
+	BranchSummaryEntry,
+	CompactionEntry,
+	SessionContext,
+	SessionMessageEntry,
+	TranscriptLineSkip,
+} from "./session-manager.js";
 import {
 	CURRENT_SESSION_VERSION,
 	getLatestCompactionEntry,
+	getTranscriptLineSkips,
 	loadEntriesFromFileAsync,
 	type SessionHeader,
 	SessionManager,
@@ -1488,6 +1496,14 @@ function waitForIdlePoll(): Promise<void> {
 
 const IPYTHON_SENT_AGENT_MESSAGE_CUSTOM_ENTRY = "ipython_sent_agent_message";
 
+/** Details of the session_context_loss notice; `signature` dedups re-resumes of the same damage. */
+interface SessionContextLossDetails {
+	/** Stable description of the defect set, so a second resume of the same damage adds no copy. */
+	signature: string;
+	/** One clause per defect found (bad lines, broken chain, unresolvable compaction anchor). */
+	findings: string[];
+}
+
 /**
  * How many new branch entries must accumulate before a skipped or failed
  * threshold compaction retries. Prevents re-firing every turn when the context
@@ -2030,6 +2046,8 @@ interface PersistedQuotaParkData {
 	resumeAt: string;
 	parkCount: number;
 	jobId?: string;
+	/** Provider whose quota reset the park waits on; kept on re-arm/rebuild entries too. */
+	provider?: string;
 }
 
 function isPersistedQuotaParkData(value: unknown): value is PersistedQuotaParkData {
@@ -2041,7 +2059,8 @@ function isPersistedQuotaParkData(value: unknown): value is PersistedQuotaParkDa
 		typeof record.resumeAt === "string" &&
 		typeof record.parkCount === "number" &&
 		Number.isFinite(record.parkCount) &&
-		(record.jobId === undefined || typeof record.jobId === "string")
+		(record.jobId === undefined || typeof record.jobId === "string") &&
+		(record.provider === undefined || typeof record.provider === "string")
 	);
 }
 
@@ -2635,6 +2654,8 @@ export class AgentSession {
 				waking?: boolean;
 				/** Wake re-arms consumed without a resume; bounded by QUOTA_WAKE_MAX_RETRIES. */
 				wakeRetries?: number;
+				/** Provider whose quota reset the park waits on; carried onto re-arm entries. */
+				provider?: string;
 		  }
 		| undefined = undefined;
 	/** Lazily built session-artifact store for durable quota-resume wake jobs. */
@@ -3123,6 +3144,7 @@ export class AgentSession {
 		// After reflow on purpose: reflow pushes messages, and the empty-context test
 		// below must see the session the way the rest of the constructor left it.
 		this._ensureHarnessDigestContext();
+		this._discloseContextLossOnLoad();
 	}
 
 	/** Refreshes MCP provider registrations without rebuilding the session runtime. */
@@ -6140,14 +6162,19 @@ export class AgentSession {
 	 * nothing to say. A main session whose turn stopped right after tool work with a
 	 * reply that only announces the next step gets one automatic continue, and so does
 	 * a turn the output budget cut off mid-answer (stopReason "length" - including a
-	 * provider pause the model layer reports as a length stop). The finish gate covers
-	 * the third way a run ends early: a clean stop whose reply declares the work done
-	 * without showing the proof gets asked for the evidence. All of these count into
-	 * the same per-prompt budget (`selfRecovery.maxAutoContinues`); once it is spent
-	 * the run is left to end. A subagent that finished its task without replying is
-	 * asked once to send its result. Anything that reads as a final answer or waiting
-	 * on children is left alone; a question or offer ending only exempts a turn that
-	 * did no tool work.
+	 * provider pause the model layer reports as a length stop). A truncated answer is
+	 * incomplete whether or not the turn ran tools, so the truncation continue does
+	 * not require tool work; the announced-next-step scan still does (a pure chat
+	 * answer is a finished answer). The finish gate covers the third way a run ends
+	 * early: a clean stop whose reply declares the work done without showing the proof
+	 * gets asked for the evidence. All of these count into the same per-prompt budget
+	 * (`selfRecovery.maxAutoContinues`); once it is spent the run is left to end. A
+	 * subagent cut off mid-answer while it still owes its parent the result is resumed
+	 * under the same budget (a resumed child whose pre-restart reply state is unknown
+	 * is left alone, mirroring the reply nudge's conservatism), and a subagent that
+	 * finished its task without replying is asked once to send its result. Anything
+	 * that reads as a final answer or waiting on children is left alone; a question
+	 * or offer ending only exempts a turn that did no tool work.
 	 */
 	private _selfRecoveryContinuation(context: GetContinuationMessagesContext): AgentMessage | undefined {
 		const settings = this.settingsManager.getSelfRecoverySettings();
@@ -6157,7 +6184,27 @@ export class AgentSession {
 		if (this._hasUnsettledRlmQuiescenceWork()) return undefined;
 		const used = autoContinuesInRun(context.newMessages);
 		if (this._rlmDepth > 0) {
-			if (message.stopReason !== "stop") return undefined;
+			// Cut off mid-answer before the result reached the parent: resume under the
+			// shared per-prompt budget. `_repliedToParentSinceTask === false` is the
+			// known-unreplied state; a resumed child (undefined) may have delivered
+			// before the restart, so it is not continued on this signal alone.
+			if (message.stopReason === "length") {
+				if (!settings.autoContinue || this._repliedToParentSinceTask !== false) return undefined;
+				if (used >= settings.maxAutoContinues) return undefined;
+				const ordinal = used + 1;
+				this._recordSelfRecovery({
+					kind: "auto_continue",
+					excerpt: "output truncated (stopReason: length)",
+					ordinal,
+					at: Date.now(),
+				});
+				return createOutputTruncatedContinueMessage({
+					reason: "output_truncated",
+					ordinal,
+					maxOrdinal: settings.maxAutoContinues,
+					deliverable: "parent_reply",
+				});
+			}
 			if (!settings.childReplyNudge || this._repliedToParentSinceTask !== false || used > 0) return undefined;
 			if (!ranToolsSinceLastPrompt(context.newMessages)) return undefined;
 			this._recordSelfRecovery({ kind: "child_reply_nudge", at: Date.now() });
@@ -6167,8 +6214,10 @@ export class AgentSession {
 		if (used >= settings.maxAutoContinues) return undefined;
 		const ranTools = ranToolsSinceLastPrompt(context.newMessages);
 		const ordinal = used + 1;
-		if (settings.autoContinue && ranTools) {
-			// Cut off mid-answer: resume where the turn stopped instead of judging the text.
+		if (settings.autoContinue) {
+			// Cut off mid-answer: resume where the turn stopped instead of judging the
+			// text. Tool work is not required here - a long prose answer the budget cut
+			// off mid-sentence is as unfinished as a tool-working turn.
 			if (message.stopReason === "length") {
 				const excerpt = "output truncated (stopReason: length)";
 				this._recordSelfRecovery({ kind: "auto_continue", excerpt, ordinal, at: Date.now() });
@@ -6178,15 +6227,17 @@ export class AgentSession {
 					maxOrdinal: settings.maxAutoContinues,
 				});
 			}
-			const excerpt = announcedNextStep(message, { ranTools });
-			if (excerpt) {
-				this._recordSelfRecovery({ kind: "auto_continue", excerpt, ordinal, at: Date.now() });
-				return createAutoContinueMessage({
-					reason: "announced_next_step",
-					excerpt,
-					ordinal,
-					maxOrdinal: settings.maxAutoContinues,
-				});
+			if (ranTools) {
+				const excerpt = announcedNextStep(message, { ranTools });
+				if (excerpt) {
+					this._recordSelfRecovery({ kind: "auto_continue", excerpt, ordinal, at: Date.now() });
+					return createAutoContinueMessage({
+						reason: "announced_next_step",
+						excerpt,
+						ordinal,
+						maxOrdinal: settings.maxAutoContinues,
+					});
+				}
 			}
 		}
 		if (!settings.finishGate || message.stopReason !== "stop") return undefined;
@@ -11071,7 +11122,15 @@ export class AgentSession {
 					(!canSelectPreselectedTurn && !canSelectSessionAction(activity))
 				) {
 					blocked = true;
+					// A preselected action must not outlive a blocked return: `selected` work is
+					// invisible to the queue-based reschedule sources, so it stranded until an
+					// unrelated admission happened to wake a pump - one input silently swallowed
+					// (docs/fork/audit-20260919-findings.md, second-batch ledger). Rolling back
+					// also lets a `starts_when_admitted` agent-message sender observe the
+					// deferral instead of hanging on a delivery promise that can no longer settle.
+					if (preselected) this._actionStore.rollback(preselected);
 					this._notifySessionInputCheckpointChange();
+					if (preselected) this._emitQueueUpdate();
 					return;
 				}
 				const first = preselected ?? this._actionStore.selectFirst();
@@ -11271,7 +11330,10 @@ export class AgentSession {
 	 * parked on this predicate rely on every clear site notifying the
 	 * session-input checkpoint waiters; the idle waiter therefore parks on
 	 * every source except disposal, whose clear site runs only at the end of
-	 * a teardown that can itself block.
+	 * a teardown that can itself block. A clear site must also reschedule the
+	 * session-input pump: work the pump rolled back into the queue while the
+	 * site held the busy slot has no other dispatch source short of the next
+	 * unrelated admission.
 	 */
 	private _isBusyForSessionInput(point: "preflight" | "pump"): boolean {
 		const externalBusy = this.isCompacting || this.isRetrying || this.isBashRunning;
@@ -13185,6 +13247,80 @@ export class AgentSession {
 
 	private _clampThinkingLevel(level: ThinkingLevel, _availableLevels: ThinkingLevel[]): ThinkingLevel {
 		return this.model ? (clampThinkingLevel(this.model, level) as ThinkingLevel) : "off";
+	}
+
+	/**
+	 * 半落地尾巴① (记忆-1 surface half): session-manager's three context-loss
+	 * warnings - transcript lines skipped on load, a broken entry chain, a
+	 * compaction retention anchor that matches nothing - are log-only, so a damaged
+	 * session looks healthy to the owner while the history before the damage is
+	 * simply not in context. On construction the session says so itself: one
+	 * persisted, user-visible notice (display: true; a custom message never reaches
+	 * the model). Deduped by the defect signature: resuming the same damaged
+	 * session must not stack a copy of the notice per resume.
+	 */
+	private _discloseContextLossOnLoad(): void {
+		const findings: string[] = [];
+		const sessionFile = this.sessionFile;
+		if (sessionFile) {
+			// The skip ledger is process-global and every read of the same damaged file
+			// adds its own copy (listing scans, a reload), so count the distinct damage:
+			// the set of lines that failed, not the number of reads that saw them.
+			const skipped = new Map<string, TranscriptLineSkip>();
+			for (const skip of getTranscriptLineSkips()) {
+				if (skip.sessionFile === sessionFile) skipped.set(`${skip.line}:${skip.reason}`, skip);
+			}
+			if (skipped.size > 0) {
+				const first = skipped.values().next().value as TranscriptLineSkip;
+				findings.push(
+					`${skipped.size} transcript line${skipped.size === 1 ? "" : "s"} could not be read (line ${first.line}: ${first.reason})`,
+				);
+			}
+		}
+		const branch = this.sessionManager.getBranch();
+		const head = branch[0];
+		if (head?.parentId) {
+			// The leaf-to-root walk stopped early: this parent id names an entry the
+			// transcript map does not hold (a skipped bad line, a torn write), and
+			// everything before it left the rebuilt context.
+			findings.push(`the entry chain is broken before entry ${head.id} (missing parent ${head.parentId})`);
+		}
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry?.type !== "compaction") continue;
+			// Only the newest compaction anchors the rebuilt context, so only its
+			// missing anchor collapses the retained tail (mirrors buildSessionContext).
+			const anchor = entry.firstKeptEntryId;
+			if (typeof anchor === "string" && anchor.length > 0 && !branch.slice(0, index).some((e) => e.id === anchor)) {
+				findings.push(`compaction ${entry.id}'s retained tail (firstKeptEntryId ${anchor}) matches no entry`);
+			}
+			break;
+		}
+		if (findings.length === 0) return;
+		const signature = findings.join(" | ");
+		const alreadyNoted = branch.some(
+			(entry) =>
+				entry.type === "custom_message" &&
+				entry.customType === SESSION_CONTEXT_LOSS_CUSTOM_TYPE &&
+				(entry.details as Partial<SessionContextLossDetails> | undefined)?.signature === signature,
+		);
+		if (alreadyNoted) return;
+		const message = {
+			role: "custom" as const,
+			customType: SESSION_CONTEXT_LOSS_CUSTOM_TYPE,
+			content: [
+				`This session's transcript is damaged: ${findings.join("; ")}.`,
+				"Everything before the damaged point is missing from the context this session runs on - the model cannot see it. Nothing was deleted: the transcript file on disk still holds every readable entry, and /export, /tree and /fork can still reach them.",
+				"If the missing history matters, restore the transcript from a backup or continue in a fresh session (/new); otherwise no action is needed.",
+			].join("\n"),
+			display: true,
+			details: { signature, findings } satisfies SessionContextLossDetails,
+			timestamp: Date.now(),
+		} satisfies CustomMessage<SessionContextLossDetails>;
+		this.sessionManager.appendCustomMessageEntry(message.customType, message.content, true, message.details);
+		// No event subscribers exist this early in construction; the attaching UI picks
+		// the notice up from the transcript, so land it where session.messages reads.
+		this.agent.state.messages.push(message);
 	}
 
 	private async _syncKernelStateAfterCompaction(): Promise<void> {
@@ -15542,8 +15678,25 @@ export class AgentSession {
 		const contextWindow = this.model?.contextWindow ?? 0;
 		const threshold = compactionThresholdTokens(contextWindow, settings, this._compactionWindowLimits());
 		if (threshold <= 0) return { shrunk: false, reachedTarget: false };
-		const plan = planEmergencyShrink(this.sessionManager.getBranch(), threshold);
+		const branch = this.sessionManager.getBranch();
+		const plan = planEmergencyShrink(branch, threshold);
 		if (!plan) return { shrunk: false, reachedTarget: false };
+		// 记忆-5: the shrink writes no summarizer output of its own, so without a
+		// details carry-over the next compaction would read this entry's undefined
+		// details and the fact/user-request ledger chain would break (generation and
+		// file lists lost). The summary text already carries the dropped span's
+		// summaries forward verbatim; adopt the newest superseded compaction's details
+		// so the structured ledger continues too. A hook-authored entry's details are
+		// extension data, not ours (the same gate prepareCompaction applies), and an
+		// entry without details has nothing to adopt - the rendered-block fallback in
+		// prepareCompaction covers those, exactly as before.
+		let supersededDetails: unknown;
+		for (let index = plan.firstKeptEntryIndex - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry?.type !== "compaction") continue;
+			if (!entry.fromHook && entry.details !== undefined) supersededDetails = entry.details;
+			break;
+		}
 		const summary = buildEmergencyShrinkSummary(plan, {
 			consecutiveFailures: this._consecutiveCompactionFailures,
 			lastError,
@@ -15559,7 +15712,7 @@ export class AgentSession {
 				summary,
 				plan.firstKeptEntryId,
 				plan.tokensBefore,
-				undefined,
+				supersededDetails,
 				false,
 				undefined,
 				{
@@ -21259,6 +21412,7 @@ export class AgentSession {
 			resumeAtMs,
 			...(jobId !== undefined ? { jobId } : {}),
 			...(timer !== undefined ? { timer } : {}),
+			...(message.provider === undefined ? {} : { provider: message.provider }),
 		};
 		this.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
 			resumeAt: new Date(resumeAtMs).toISOString(),
@@ -21500,10 +21654,12 @@ export class AgentSession {
 		park.timer = this._scheduleQuotaResumeTimer(park.resumeAtMs);
 		// Record the replacement wake, or a restart reads the spent park entry,
 		// drops the park, and leaves this retry job armed with no owner to cancel.
+		// The provider rides along so readQuotaParkStatus keeps it after the re-arm.
 		this.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
 			resumeAt: new Date(park.resumeAtMs).toISOString(),
 			parkCount: park.parkCount,
 			...(park.jobId !== undefined ? { jobId: park.jobId } : {}),
+			...(park.provider !== undefined ? { provider: park.provider } : {}),
 		});
 	}
 
@@ -21594,10 +21750,12 @@ export class AgentSession {
 			if (jobId !== undefined && jobId !== entry.data.jobId) {
 				// A rebuilt wake replaces the cancelled one: record it, so the next
 				// restore reuses this job instead of arming another one beside it.
+				// The provider rides along so readQuotaParkStatus keeps it after the rebuild.
 				this.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
 					resumeAt: entry.data.resumeAt,
 					parkCount: entry.data.parkCount,
 					jobId,
+					...(entry.data.provider !== undefined ? { provider: entry.data.provider } : {}),
 				});
 			}
 			this._quotaPark = {
@@ -21605,6 +21763,7 @@ export class AgentSession {
 				resumeAtMs,
 				...(jobId !== undefined ? { jobId } : {}),
 				timer: this._scheduleQuotaResumeTimer(resumeAtMs),
+				...(entry.data.provider !== undefined ? { provider: entry.data.provider } : {}),
 			};
 			return;
 		}
@@ -21766,6 +21925,9 @@ export class AgentSession {
 		} finally {
 			this._bashAbortControllers.delete(abortController);
 			this._notifySessionInputCheckpointChange();
+			// Work the pump rolled back while this command held the busy slot has no
+			// other dispatch source.
+			this._scheduleSessionInputPump();
 		}
 	}
 
@@ -22317,6 +22479,9 @@ export class AgentSession {
 			}
 			resolveBranchSummaryOperation();
 			this._notifySessionInputCheckpointChange();
+			// Same contract as the bash/retry/compaction clear sites: work the pump
+			// rolled back while the branch mutation held the busy slot needs a reschedule.
+			this._scheduleSessionInputPump();
 		}
 	}
 

@@ -485,13 +485,74 @@ describe("self-recovery: announced-but-undone steps", () => {
 		expect(harness.faux.state.callCount).toBe(4);
 	});
 
-	it("never continues a truncated pure chat answer with no tool work", async () => {
+	it("continues a truncated pure-text answer with no tool work", async () => {
+		// N6: a long answer the output budget cut off mid-sentence is unfinished
+		// whether or not the turn ran tools, so the truncation continue no longer
+		// requires tool work (the per-prompt budget still caps it).
 		const harness = await harnessWith();
-		harness.setResponses([fauxAssistantMessage("半截回答", { stopReason: "length" })]);
+		harness.setResponses([
+			fauxAssistantMessage("半截回答", { stopReason: "length" }),
+			fauxAssistantMessage("补完了。"),
+		]);
 		await harness.session.promptAndWait("hi");
 
-		expect(autoContinues(harness)).toHaveLength(0);
-		expect(harness.faux.state.callCount).toBe(1);
+		const nudges = autoContinues(harness);
+		expect(nudges).toHaveLength(1);
+		expect(String((nudges[0] as { content: unknown }).content)).toContain("Continue from where you stopped");
+		expect(harness.faux.state.callCount).toBe(2);
+	});
+
+	it("caps pure-text truncation continues at the per-prompt budget", async () => {
+		const harness = await harnessWith({ selfRecovery: { maxAutoContinues: 2 } });
+		harness.setResponses([
+			fauxAssistantMessage("第一段", { stopReason: "length" }),
+			fauxAssistantMessage("第二段", { stopReason: "length" }),
+			fauxAssistantMessage("第三段", { stopReason: "length" }),
+			fauxAssistantMessage("never called"),
+		]);
+		await harness.session.promptAndWait("hi");
+
+		expect(autoContinues(harness)).toHaveLength(2);
+		expect(harness.faux.state.callCount).toBe(3);
+	});
+
+	it("resumes a subagent cut off mid-answer while it still owes the parent a reply", async () => {
+		const harness = await createHarness({ rlmDepth: 1 });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("半截报告", { stopReason: "length" }),
+			fauxAssistantMessage("写完了"),
+		]);
+		await harness.session.promptAndWait("do the task");
+
+		const nudges = autoContinues(harness);
+		expect(nudges).toHaveLength(1);
+		const content = String((nudges[0] as { content: unknown }).content);
+		expect(content).toContain("Continue from where you stopped");
+		// A subagent's prose is not the deliverable: the continue says the result
+		// must reach the parent before the run stops.
+		expect(content).toContain("agent_message.send");
+		expect(harness.faux.state.callCount).toBe(2);
+	});
+
+	it("leaves a resumed subagent's truncated turn alone when its pre-restart reply state is unknown", async () => {
+		const first = await createHarness({ rlmDepth: 1, persistSession: true });
+		harnesses.push(first);
+		first.sessionManager.materializeSessionFile();
+		first.setResponses([fauxAssistantMessage("some earlier work")]);
+		await first.session.promptAndWait("earlier task");
+		const sessionFile = first.session.sessionFile!;
+		first.session.dispose();
+
+		// A child resumed with messages on the branch may have replied before the
+		// restart, so a truncated turn is not continued on this signal alone.
+		const resumed = await createHarness({ rlmDepth: 1, existingSessionFile: sessionFile });
+		harnesses.push(resumed);
+		resumed.setResponses([fauxAssistantMessage("半截报告", { stopReason: "length" })]);
+		await resumed.session.promptAndWait("new task");
+
+		expect(autoContinues(resumed)).toHaveLength(0);
+		expect(resumed.faux.state.callCount).toBe(1);
 	});
 
 	it("continues a turn that announced work but ended in a question once tools ran", async () => {

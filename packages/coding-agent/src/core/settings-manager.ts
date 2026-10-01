@@ -695,8 +695,11 @@ export interface ToolTimeoutSettings {
 export interface SelfRecoverySettings {
 	/**
 	 * Default true. When a main-session turn ends right after tool work with a reply that
-	 * only announces the next step - or with output cut off by the token budget - send one
-	 * automatic "continue" (at most `maxAutoContinues` per prompt).
+	 * only announces the next step, or any turn whose output was cut off by the token
+	 * budget (`stopReason: "length"` - a long prose answer counts too), send one
+	 * automatic "continue" (at most `maxAutoContinues` per prompt). A subagent cut off
+	 * mid-answer while it still owes its parent the result is resumed under the same
+	 * budget.
 	 */
 	autoContinue?: boolean;
 	/**

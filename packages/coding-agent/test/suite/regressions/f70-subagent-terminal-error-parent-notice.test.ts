@@ -102,15 +102,23 @@ describe("F70 subagent terminal error notifies the parent", () => {
 			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
 			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
 			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			// The spent ladder hands the failure shape back to the model as one
+			// recovery turn (afcc6e022) before the episode is terminal; the recovery
+			// turn gets its own ladder and exhausts it too, and only then does the
+			// terminal notice go out.
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
 		]);
 
 		await harness.session.promptAndWait("do the task");
+		await harness.session.waitForIdle();
 
 		const notice = lastTerminalNotice(sendAgentMessage);
 		expect(notice).toContain(SUBAGENT_TERMINAL_ERROR_NOTICE_PREFIX);
 		expect(notice).toContain("overloaded_error");
 		expect(notice).toContain("auto-retry exhausted after 2 attempt(s)");
-		expect(harness.faux.state.callCount).toBe(3);
+		expect(harness.faux.state.callCount).toBe(6);
 	});
 
 	it("keeps retryable errors on the existing retry path without notifying the parent", async () => {

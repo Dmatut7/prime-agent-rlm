@@ -955,6 +955,12 @@ describe("AgentSession compaction characterization", () => {
 		const compactions = harness.sessionManager.getBranch().filter((entry) => entry.type === "compaction");
 		expect(compactions).toHaveLength(2);
 		expect(String((compactions[1] as { summary?: unknown }).summary)).toContain("EMERGENCY CONTEXT SHRINK");
+		// 记忆-5: the shrink adopts the superseded compaction's details, so the
+		// structured fact/user-request ledger chain survives the emergency head
+		// instead of resetting to the rendered-block fallback.
+		const firstDetails = (compactions[0] as { details?: unknown }).details;
+		expect(firstDetails).toBeDefined();
+		expect((compactions[1] as { details?: unknown }).details).toEqual(firstDetails);
 		expect(harness.session.messages).toContainEqual(
 			expect.objectContaining({
 				role: "custom",

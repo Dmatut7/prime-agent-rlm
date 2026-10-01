@@ -24,6 +24,7 @@ import { AgentCronJobStore } from "../../src/core/cron-jobs.js";
 import { EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE } from "../../src/core/messages.js";
 import { PROVIDER_FAILURE_RECOVERY_CUSTOM_TYPE } from "../../src/core/self-recovery.js";
 import type { Settings } from "../../src/core/settings-manager.js";
+import { readQuotaParkStatus } from "../../src/modes/daemon/quota-park-status.js";
 import { createHarness, getAssistantTexts, getUserTexts, type Harness } from "./harness.js";
 
 function normalizeEventOrder(events: Harness["events"]): string[] {
@@ -1247,11 +1248,16 @@ describe("AgentSession retry and event characterization", () => {
 		expect((await aborted()).stopReason).toBe("aborted");
 		const reArmed = quotaPark(abortedHarness);
 		expect([reArmed?.waking, (reArmed?.resumeAtMs ?? 0) > parkedAtMs]).toEqual([false, true]);
+		// N5: the re-arm entry keeps the provider, so a status read anchored at it
+		// (readQuotaParkStatus walks to the newest park entry) does not lose it.
+		expect(quotaEntries(abortedHarness, "provider_quota_park").at(-1)?.provider).toBe("faux");
+		expect(readQuotaParkStatus(abortedHarness.session)?.provider).toBe("faux");
 
 		// The re-armed wake is recorded, so a restart restores the park with the retry job still owned.
 		const restarted = await createHarness({ existingSessionFile: abortedHarness.session.sessionFile!, settings });
 		harnesses.push(restarted);
 		expect([restarted.session.isQuotaParked, quotaPark(restarted)?.parkCount]).toEqual([true, 1]);
+		expect(readQuotaParkStatus(restarted.session)?.provider).toBe("faux");
 		expect(readQuotaWakeJob(abortedHarness, reArmed?.jobId)?.status).toBe("active");
 		restarted.setResponses([fauxAssistantMessage("recovered")]);
 		await wakeQuotaProbe(restarted)();
@@ -1341,6 +1347,9 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.session.isQuotaParked).toBe(true);
 		const wakeJob = readQuotaWakeJob(harness, quotaPark(harness)?.jobId);
 		expect(wakeJob?.status).toBe("active");
+		// N5: the wake the navigation rebuilt is recorded with the provider kept.
+		expect(quotaEntries(harness, "provider_quota_park").at(-1)?.provider).toBe("faux");
+		expect(readQuotaParkStatus(harness.session)?.provider).toBe("faux");
 
 		const restarted = await createHarness({ existingSessionFile: harness.session.sessionFile!, settings });
 		harnesses.push(restarted);

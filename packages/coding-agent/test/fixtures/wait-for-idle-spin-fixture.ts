@@ -11,13 +11,17 @@
  * Two modes, one per stranded shape. Both are built from public API plus one documented
  * seam each; no private member is probed.
  *
- *   orphan  A turn the pump selected but refused to dispatch, stranded in `selected`
- *           while a real `executeBash` holds the pump busy. `selected` is not `queued`,
- *           so the idle waiter's park (which reads `queuedActions()`) never engages and
- *           the loop reschedules a pump that immediately blocks again. The seam: the
- *           agent's own idle wait is held at the pump's first await so the bash starts
- *           inside the window between admission and the pump's block check - without
- *           the hold that interleaving is a race.
+ *   orphan  A turn the pump selected at admission and then refused to dispatch, because
+ *           a real `executeBash` started inside the window between admission and the
+ *           pump's block check. The blocked pump must roll the selection back into the
+ *           queue: a `selected` orphan is invisible to the queue-based reschedule
+ *           sources, so before the rollback fix it stranded until the next unrelated
+ *           admission - one input silently swallowed - and the idle waiter's park (which
+ *           reads `queuedActions()`) never engaged, so the loop rescheduled a pump that
+ *           immediately blocked again. Once the bash ends its clear site reschedules the
+ *           pump and the turn dispatches. The seam: the agent's own idle wait is held at
+ *           the pump's first await so the bash starts inside the window between admission
+ *           and the pump's block check - without the hold that interleaving is a race.
  *
  *   leak    A dispatched turn whose primary reached the transcript and whose dispatch
  *           then failed while a queued-work pause made the pump classify the failure as
@@ -72,10 +76,12 @@ async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<boo
 const quietSettings = { stallWatchdog: { enabled: false }, retry: { enabled: false } } as const;
 
 /**
- * The orphan shape: a `selected` turn the pump refused to dispatch, plus a real bash
- * holding the pump busy for a few seconds. Once the bash ends the turn must dispatch and
- * the wait must return - a wedged loop cannot even notice the bash ended, because
- * noticing is an event-loop turn.
+ * The orphan shape: a turn the pump selected at admission and then refused to dispatch
+ * because a real bash started inside the admission-to-block-check window. The blocked
+ * pump must roll the action back into the queue (a `selected` orphan has no dispatch
+ * source); once the bash ends, its clear site reschedules the pump, the turn dispatches,
+ * and the wait returns because the work completed - a wedged loop cannot even notice the
+ * bash ended, because noticing is an event-loop turn.
  */
 async function strandSelectedOrphan(harness: Harness): Promise<string | undefined> {
 	const agent = harness.session.agent;
@@ -102,11 +108,18 @@ async function strandSelectedOrphan(harness: Harness): Promise<string | undefine
 	// From here the agent is idle as far as anybody can tell; only the bash blocks.
 	agent.waitForIdle = () => Promise.resolve();
 	releasePump();
-	if (!(await waitFor(() => harness.session.queuedActionCount === 0, 10_000))) {
-		return "the stranded action is still counted as queued";
+	// The blocked pump must park the turn (roll the selection back into the queue)
+	// instead of dispatching it behind the bash. A direct prompt is not
+	// queue-visible, so the rollback is observable only as "still pending, still
+	// undelivered" from the public surface; the outer wait then proves the bash
+	// clear site rescheduled the pump, because the turn dispatches with no further
+	// admission and the wait returns on completed work.
+	await sleep(200);
+	if (harness.session.messages.some((message) => message.role === "user")) {
+		return "the turn dispatched while a bash command held the busy slot";
 	}
-	if (harness.session.unfinishedActionCount === 0) {
-		return "the stranded action reached a terminal state before the wait started";
+	if (harness.session.unfinishedActionCount !== 1) {
+		return "the blocked pump lost the parked action instead of keeping it pending";
 	}
 	return undefined;
 }
