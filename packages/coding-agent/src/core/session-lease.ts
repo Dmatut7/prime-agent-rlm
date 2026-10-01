@@ -17,6 +17,7 @@ import { readFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { lockSync } from "proper-lockfile";
+import { APP_NAME } from "../config.js";
 import { execFileSyncHidden } from "../utils/child-process.js";
 
 export const SESSION_LEASES_ENABLED_ENV = "PRIME_AGENT_INTERNAL_SESSION_LEASES";
@@ -41,8 +42,8 @@ export class SessionAlreadyActiveError extends Error {
 	) {
 		super(
 			activeSessionId
-				? `Session is already active in ${activeSessionId}: ${sessionPath}`
-				: `Session is already active in another process: ${sessionPath}`,
+				? `Session is already active in ${activeSessionId}: ${sessionPath}. Run "${APP_NAME} attach ${activeSessionId}" to attach to it, "${APP_NAME} list" to see active sessions, or "${APP_NAME} stop ${activeSessionId}" to stop it.`
+				: `Session is already active in another process: ${sessionPath}. Run "${APP_NAME} list" to find the holding session and "${APP_NAME} stop <id>" to stop it.`,
 		);
 		this.name = "SessionAlreadyActiveError";
 	}

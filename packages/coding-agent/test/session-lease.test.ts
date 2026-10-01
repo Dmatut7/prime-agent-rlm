@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { lockSync } from "proper-lockfile";
 import { afterEach, describe, expect, it } from "vitest";
+import { APP_NAME } from "../src/config.js";
 import {
 	acquireSessionLeaseAsync,
 	canonicalSessionPath,
@@ -463,5 +464,23 @@ describe("session leases", () => {
 	it("is inert for direct SDK runtimes unless worker isolation enables it", async () => {
 		const agentDir = createTempDir();
 		await expect(acquireSessionLeaseAsync(join(agentDir, "session.jsonl"), agentDir, {})).resolves.toBeUndefined();
+	});
+});
+
+describe("SessionAlreadyActiveError message", () => {
+	it("names attach/list/stop remediation when the holder session id is known", () => {
+		const error = new SessionAlreadyActiveError("/tmp/session.jsonl", "abc123");
+		expect(error.message).toContain("/tmp/session.jsonl");
+		expect(error.message).toContain(`${APP_NAME} attach abc123`);
+		expect(error.message).toContain(`${APP_NAME} list`);
+		expect(error.message).toContain(`${APP_NAME} stop abc123`);
+	});
+
+	it("names list/stop remediation when the holder session id is unknown", () => {
+		const error = new SessionAlreadyActiveError("/tmp/session.jsonl");
+		expect(error.message).toContain("another process");
+		expect(error.message).toContain(`${APP_NAME} list`);
+		expect(error.message).toContain(`${APP_NAME} stop <id>`);
+		expect(error.activeSessionId).toBeUndefined();
 	});
 });

@@ -1,7 +1,7 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseArgs } from "../src/cli/args.js";
 import { SessionSelectorNotFoundError } from "../src/cli/session-resolver.js";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "../src/core/agent-session-runtime.js";
@@ -148,5 +148,43 @@ describe("session cwd handling", () => {
 	it("preserves an explicit catalog directory for in-memory bootstrap sessions", () => {
 		const manager = SessionManager.inMemory("/tmp/project", "/tmp/sessions");
 		expect(manager.getSessionDir()).toBe("/tmp/sessions");
+	});
+
+	it("prints a notice when --continue finds no previous session for the cwd", async () => {
+		const cwd = createTempDir("pi-continue-empty-cwd");
+		const sessionDir = createTempDir("pi-continue-empty-session-dir");
+		cleanupPaths.push(cwd, sessionDir);
+
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			const parsed = parseArgs(["--continue"]);
+			const sessionManager = await createSessionManager(parsed, cwd, sessionDir);
+
+			expect(sessionManager.getSessionFile()).toBeDefined();
+			const output = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+			expect(output).toContain(`No previous session for ${cwd}; starting a new one.`);
+		} finally {
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("prints no notice when --continue resumes a previous session", async () => {
+		const cwd = createTempDir("pi-continue-resume-cwd");
+		const sessionDir = createTempDir("pi-continue-resume-session-dir");
+		const sessionFile = join(sessionDir, "session.jsonl");
+		cleanupPaths.push(cwd, sessionDir);
+		writeSessionFile(sessionFile, cwd);
+
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			const parsed = parseArgs(["--continue"]);
+			const sessionManager = await createSessionManager(parsed, cwd, sessionDir);
+
+			expect(sessionManager.getSessionFile()).toBe(sessionFile);
+			const output = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+			expect(output).not.toContain("No previous session");
+		} finally {
+			errorSpy.mockRestore();
+		}
 	});
 });

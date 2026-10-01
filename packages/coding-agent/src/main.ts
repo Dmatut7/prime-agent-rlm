@@ -75,7 +75,12 @@ import {
 	SESSION_LEASES_ENABLED_ENV,
 	SessionAlreadyActiveError,
 } from "./core/session-lease.js";
-import { repairOwnedSessionFile, SessionManager } from "./core/session-manager.js";
+import {
+	findMostRecentSessionForCwd,
+	getDefaultSessionDir,
+	repairOwnedSessionFile,
+	SessionManager,
+} from "./core/session-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
 import { shareExportIdentityHintFromFile } from "./core/share-session.js";
 import { setStallRuntimeDaemonWorker } from "./core/stall-evidence.js";
@@ -348,6 +353,30 @@ export function shouldEnsureDaemonBeforeActiveSessionLookup(options: DaemonActiv
 	);
 }
 
+/**
+ * Startup errors the CLI reports as one actionable line instead of a stack
+ * trace: a session lease conflict and daemon-side session creation failures.
+ * Anything else is unexpected and must rethrow so the failure stays visible.
+ */
+export function describeSessionStartupError(error: unknown): string | undefined {
+	if (error instanceof SessionAlreadyActiveError || error instanceof DaemonSessionCreateError) {
+		return `Error: ${error.message}`;
+	}
+	return undefined;
+}
+
+/** The third option when a resume target lives in another project: go there instead of forking. */
+export function crossProjectResumeHint(resumeSelector: string, projectCwd: string): string {
+	return `Or continue it in that project: cd ${projectCwd} && ${APP_NAME} --resume ${resumeSelector}`;
+}
+
+/** Where to look for sessions after a selector miss; the left-arrow browser only exists in interactive mode. */
+export function sessionSelectorRecoveryHint(appMode: AppMode): string {
+	return appMode === "interactive"
+		? `Open ${APP_NAME} and press left-arrow to browse sessions.`
+		: `Run "${APP_NAME} list --all" to see sessions.`;
+}
+
 interface ActiveDaemonSessionSummaryLookupOptions {
 	fallbackOnError?: boolean;
 }
@@ -545,6 +574,7 @@ export async function createSessionManager(
 					process.exit(1);
 				}
 				console.log(chalk.yellow(`Session found in different project: ${resolved.cwd}`));
+				console.log(chalk.dim(crossProjectResumeHint(resumeSelector, resolved.cwd)));
 				const shouldFork = await promptConfirm("Fork this session into current directory?");
 				if (!shouldFork) {
 					console.log(chalk.dim("Aborted."));
@@ -556,6 +586,12 @@ export async function createSessionManager(
 	}
 
 	if (parsed.continue) {
+		// continueRecent silently falls back to a fresh session; say so, or the user
+		// cannot tell a continued session from a new one.
+		const dir = sessionDir ?? getDefaultSessionDir(cwd);
+		if (!findMostRecentSessionForCwd(dir, cwd)) {
+			console.error(chalk.dim(`No previous session for ${cwd}; starting a new one.`));
+		}
 		return SessionManager.continueRecent(cwd, sessionDir);
 	}
 
@@ -1465,7 +1501,7 @@ export async function main(args: string[], options?: MainOptions) {
 					? ` Did you mean '${error.suggestion}'?`
 					: "";
 			console.error(chalk.red(`Error: ${error.message}.${suggestion}`));
-			console.error(chalk.dim(`Open ${APP_NAME} and press left-arrow to browse sessions.`));
+			console.error(chalk.dim(sessionSelectorRecoveryHint(appMode)));
 			process.exit(1);
 		}
 	}
@@ -1697,8 +1733,9 @@ export async function main(args: string[], options?: MainOptions) {
 			({ connection, summary } = await (prefire?.connection ??
 				createDaemonClientConnection(daemonConnectionOptions)));
 		} catch (error) {
-			if (error instanceof DaemonSessionCreateError) {
-				console.error(chalk.red(`Error: ${error.message}`));
+			const startupError = describeSessionStartupError(error);
+			if (startupError) {
+				console.error(chalk.red(startupError));
 				process.exit(1);
 			}
 			throw error;
@@ -1796,8 +1833,9 @@ export async function main(args: string[], options?: MainOptions) {
 				supportsExtensionUi: appMode === "rpc",
 			}));
 		} catch (error) {
-			if (error instanceof SessionAlreadyActiveError || error instanceof DaemonSessionCreateError) {
-				console.error(chalk.red(`Error: ${error.message}`));
+			const startupError = describeSessionStartupError(error);
+			if (startupError) {
+				console.error(chalk.red(startupError));
 				process.exit(1);
 			}
 			throw error;
@@ -1860,8 +1898,9 @@ export async function main(args: string[], options?: MainOptions) {
 			...(directSessionLease ? { sessionLease: directSessionLease } : {}),
 		});
 	} catch (error) {
-		if (error instanceof SessionAlreadyActiveError) {
-			console.error(chalk.red(`Error: ${error.message}`));
+		const startupError = describeSessionStartupError(error);
+		if (startupError) {
+			console.error(chalk.red(startupError));
 			process.exit(1);
 		}
 		throw error;

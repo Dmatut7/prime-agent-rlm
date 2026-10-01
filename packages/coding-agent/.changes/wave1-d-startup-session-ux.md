@@ -1,0 +1,5 @@
+- Fixed interactive startup failing with an unhandled error when the target session is already active elsewhere; it now prints a one-line error with remediation.
+- Added attach/list/stop remediation guidance to the "session is already active" error message.
+- Added a startup notice when `--continue` finds no previous session in the current directory and starts a new one.
+- Added a "continue it in the original project" hint to the cross-project `--resume` prompt.
+- Fixed the session-not-found error suggesting the interactive left-arrow browser in print/pipe mode; it now suggests `prime-agent list --all`.

@@ -3,14 +3,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { StaleDaemonError } from "../src/cli/daemon-launch.js";
+import { APP_NAME } from "../src/config.js";
 import { mergeAgentSessionRuntimeConfig } from "../src/core/agent-session-config.js";
 import type { CreateAgentSessionOptions } from "../src/core/sdk.js";
+import { SessionAlreadyActiveError } from "../src/core/session-lease.js";
 import {
 	type AppMode,
+	crossProjectResumeHint,
 	type DaemonCreatePrefireDecision,
 	type DaemonInteractivePrefire,
 	type DaemonInteractiveSessionManagerDecision,
 	daemonServerDefaultSessionConfig,
+	describeSessionStartupError,
 	disposePrefiredDaemonConnection,
 	findActiveDaemonSessionSummaryForSessionFile,
 	type InteractiveDaemonStartupDecision,
@@ -18,6 +22,7 @@ import {
 	parseAgentsViewCommand,
 	prefireDaemonInteractiveConnection,
 	resolveRuntimeSessionOptions,
+	sessionSelectorRecoveryHint,
 	shouldEnsureDaemonBeforeActiveSessionLookup,
 	shouldEnsureInteractiveDaemonForStartup,
 	shouldOpenAgentsViewForDaemonInteractive,
@@ -29,6 +34,7 @@ import {
 	shouldUseDaemonInteractive,
 	shouldUseEphemeralSessionManagerForDaemonInteractive,
 } from "../src/main.js";
+import { DaemonSessionCreateError } from "../src/modes/daemon/daemon-errors.js";
 import type { DaemonAgentConnection, SessionSummary } from "../src/modes/index.js";
 
 describe("interactive startup routing", () => {
@@ -577,6 +583,44 @@ describe("prefired daemon create disposal", () => {
 			5_000,
 		);
 		expect(disposed).toBe(1);
+	});
+});
+
+describe("session startup error rendering", () => {
+	test("renders a lease conflict as a one-line actionable error", () => {
+		const line = describeSessionStartupError(new SessionAlreadyActiveError("/tmp/s.jsonl", "abc123"));
+		expect(line).toBeDefined();
+		expect(line).toContain("Error:");
+		expect(line).toContain(`${APP_NAME} attach abc123`);
+	});
+
+	test("renders a daemon session create failure as a one-line error", () => {
+		expect(describeSessionStartupError(new DaemonSessionCreateError("boom"))).toBe("Error: boom");
+	});
+
+	test("leaves unexpected errors to rethrow", () => {
+		expect(describeSessionStartupError(new Error("boom"))).toBeUndefined();
+		expect(describeSessionStartupError("boom")).toBeUndefined();
+	});
+});
+
+describe("cross-project resume hint", () => {
+	test("points at resuming under the original project directory", () => {
+		expect(crossProjectResumeHint("fix-123", "/tmp/other-project")).toBe(
+			`Or continue it in that project: cd /tmp/other-project && ${APP_NAME} --resume fix-123`,
+		);
+	});
+});
+
+describe("session selector recovery hint", () => {
+	test("interactive mode points at the left-arrow session browser", () => {
+		expect(sessionSelectorRecoveryHint("interactive")).toContain("left-arrow");
+	});
+
+	test("print mode does not suggest the interactive browser", () => {
+		const hint = sessionSelectorRecoveryHint("print");
+		expect(hint).not.toContain("left-arrow");
+		expect(hint).toContain(`${APP_NAME} list --all`);
 	});
 });
 
