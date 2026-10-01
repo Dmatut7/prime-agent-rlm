@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -12,8 +13,87 @@ const distCliPath = join(packageDir, "dist", "cli.js");
 const srcCliPath = join(packageDir, "src", "cli.ts");
 const defaultNodeProfileDir = join(repoRoot, "profiles-node");
 const defaultBunProfileDir = join(repoRoot, "profiles-bun");
-const agentDirEnvName = "PI_CODING_AGENT_DIR";
+const agentDirEnvName = "PRIME_AGENT_CODING_AGENT_DIR";
 const startupBenchmarkEnvName = "PI_STARTUP_BENCHMARK";
+const defaultRunTimeoutMs = 120_000;
+const daemonProtocol = { name: "prime-agent.daemon", version: 7 };
+
+/**
+ * Politely stop the daemon a benchmark child ensured on an isolated socket.
+ * The child spawns it detached (outside the child's process group), so the
+ * run's kill-tree cannot reach it; the shutdown command is the clean path and
+ * undeclared connections are exempt from the control_plane capability gate.
+ */
+async function shutdownDaemonAtSocket(socketPath) {
+	const request = `${JSON.stringify({ type: "command", id: "s1", protocol: daemonProtocol, command: { type: "shutdown" } })}\n`;
+	await new Promise((resolve) => {
+		const socket = connect(socketPath);
+		let buffer = "";
+		const finish = () => {
+			socket.destroy();
+			resolve(undefined);
+		};
+		const timer = setTimeout(finish, 5000);
+		socket.once("error", finish);
+		socket.on("data", (chunk) => {
+			buffer += chunk.toString("utf8");
+			let idx = buffer.indexOf("\n");
+			while (idx !== -1) {
+				const line = buffer.slice(0, idx);
+				buffer = buffer.slice(idx + 1);
+				idx = buffer.indexOf("\n");
+				let msg;
+				try {
+					msg = JSON.parse(line);
+				} catch {
+					continue;
+				}
+				if (msg.type === "daemon_hello") {
+					socket.write(request);
+				} else if (msg.type === "response" && msg.id === "s1") {
+					clearTimeout(timer);
+					finish();
+					return;
+				}
+			}
+		});
+	});
+	// Wait until the socket stops accepting connections (daemon gone).
+	const deadline = Date.now() + 15000;
+	while (Date.now() < deadline) {
+		const alive = await new Promise((resolve) => {
+			const probe = connect(socketPath);
+			probe.once("connect", () => {
+				probe.destroy();
+				resolve(true);
+			});
+			probe.once("error", () => resolve(false));
+		});
+		if (!alive) {
+			break;
+		}
+		await new Promise((r) => setTimeout(r, 50));
+	}
+	// The daemon process outlives its socket by a few writes (compile cache,
+	// logs); give it a beat so the caller's rmSync does not hit ENOTEMPTY.
+	await new Promise((r) => setTimeout(r, 300));
+}
+
+function makeIsolatedTmpDir() {
+	if (process.platform === "win32") {
+		return undefined;
+	}
+	// Short base: the daemon/worker sockets under <TMPDIR>/prime-agent-<uid>/
+	// must fit the ~104-char unix socket path limit, which os.tmpdir() on
+	// macOS (/var/folders/...) plus a long prefix would exceed.
+	return mkdtempSync(join("/tmp", "prime-prof-tmp-"));
+}
+
+/** Stop the daemon an isolated benchmark child may have ensured; no-op when none exists. */
+async function shutdownIsolatedDaemon(isolatedTmpDir) {
+	const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+	await shutdownDaemonAtSocket(join(isolatedTmpDir, `prime-agent-${uid}`, "daemon.sock"));
+}
 
 function printHelp() {
 	console.log(`Usage:
@@ -33,8 +113,12 @@ Options:
                          Default: profiles-node for Node, profiles-bun for Bun
   --label <name>         Profile name prefix (default: <mode>-startup)
   --runtime <name>       node, bun, or auto (default: auto)
-  --agent-dir <dir>      Use a specific PI_CODING_AGENT_DIR for the benchmark run
+  --agent-dir <dir>      Use a specific PRIME_AGENT_CODING_AGENT_DIR for the benchmark run
   --isolated-agent-dir   Use a fresh temporary agent dir instead of the normal one
+                         (also isolates TMPDIR so the run never talks to a daemon
+                         already running on the default socket, and shuts down the
+                         daemon an rpc run ensured)
+  --timeout <seconds>    Kill a benchmark run that has not exited (default: 120)
   --no-offline           Do not force PI_OFFLINE=1 / PI_SKIP_VERSION_CHECK=1
   --skip-build           Reuse the current dist/cli.js without rebuilding first (Node only)
   --cpu-profile          Write CPU profiles for benchmark runs
@@ -83,6 +167,7 @@ function parseArgs(argv) {
 		agentDir: undefined,
 		isolatedAgentDir: false,
 		cpuProfile: false,
+		timeoutMs: defaultRunTimeoutMs,
 	};
 
 	for (let index = 0; index < argv.length; index++) {
@@ -120,7 +205,8 @@ function parseArgs(argv) {
 				arg === "--profile-dir" ||
 				arg === "--label" ||
 				arg === "--runtime" ||
-				arg === "--agent-dir") &&
+				arg === "--agent-dir" ||
+				arg === "--timeout") &&
 			index + 1 >= argv.length
 		) {
 			throw new Error(`Missing value for ${arg}`);
@@ -158,6 +244,11 @@ function parseArgs(argv) {
 
 		if (arg === "--agent-dir") {
 			options.agentDir = resolve(argv[++index]);
+			continue;
+		}
+
+		if (arg === "--timeout") {
+			options.timeoutMs = parseIntegerFlag(argv[++index], "--timeout") * 1000;
 			continue;
 		}
 
@@ -278,6 +369,52 @@ async function waitForExit(child, errorPrefix) {
 	});
 }
 
+function killChildTree(child, signal) {
+	if (child.exitCode !== null || child.signalCode !== null) {
+		return;
+	}
+	if (process.platform !== "win32" && child.pid !== undefined) {
+		// Benchmark children spawn detached (own process group), so a group
+		// signal also reaches the kernel/worker children a wedged run leaves
+		// behind instead of orphaning them.
+		try {
+			process.kill(-child.pid, signal);
+			return;
+		} catch {
+			// Fall through to the direct signal below.
+		}
+	}
+	try {
+		child.kill(signal);
+	} catch {
+		// Already gone.
+	}
+}
+
+async function waitForExitWithTimeout(child, errorPrefix, timeoutMs) {
+	let timeout;
+	let forceKill;
+	try {
+		return await Promise.race([
+			waitForExit(child, errorPrefix),
+			new Promise((_, reject) => {
+				timeout = setTimeout(() => {
+					killChildTree(child, "SIGTERM");
+					forceKill = setTimeout(() => killChildTree(child, "SIGKILL"), 2000);
+					forceKill.unref?.();
+					reject(
+						new Error(`${errorPrefix} did not exit within ${Math.round(timeoutMs / 1000)}s; killed its process tree`),
+					);
+				}, timeoutMs);
+				timeout.unref?.();
+			}),
+		]);
+	} finally {
+		clearTimeout(timeout);
+		clearTimeout(forceKill);
+	}
+}
+
 async function runBuild() {
 	process.stdout.write("Building packages/tui, packages/ai, packages/agent, and packages/coding-agent...\n");
 	const startedAt = performance.now();
@@ -357,13 +494,23 @@ function getRuntimeCommand(runtime, mode, profileDir, profileName, cpuProfile) {
 	};
 }
 
-function createBenchmarkEnv(options, isolatedAgentDir) {
+function createBenchmarkEnv(options, isolatedAgentDir, isolatedTmpDir) {
 	const env = { ...process.env };
 	if (options.agentDir) {
 		env[agentDirEnvName] = options.agentDir;
 	} else if (isolatedAgentDir) {
 		env[agentDirEnvName] = isolatedAgentDir;
 	}
+	if (isolatedTmpDir) {
+		// The daemon socket path derives from $TMPDIR, not the agent dir, and a
+		// client prefers a live default-socket daemon (agent-dir registry) over
+		// its isolated agent dir. Without this the rpc benchmark would create
+		// its session on the user's already-running daemon.
+		env.TMPDIR = isolatedTmpDir;
+	}
+	// The child gates its timings report on PI_TIMING; without it both modes
+	// produce an empty timings block.
+	env.PI_TIMING = "1";
 	if (options.mode === "tui") {
 		env[startupBenchmarkEnvName] = "1";
 	}
@@ -383,12 +530,14 @@ async function runTuiBenchmarkRun({ runtime, runIndex, measuredIndex, options, p
 	if (isolatedAgentDir) {
 		mkdirSync(isolatedAgentDir, { recursive: true });
 	}
+	const isolatedTmpDir = tempRoot ? makeIsolatedTmpDir() : undefined;
 
 	const command = getRuntimeCommand(runtime, "tui", profileDir, profileName, options.cpuProfile);
 	const child = spawn(command.executable, command.args, {
 		cwd: packageDir,
-		env: createBenchmarkEnv(options, isolatedAgentDir),
+		env: createBenchmarkEnv(options, isolatedAgentDir, isolatedTmpDir),
 		stdio: ["inherit", "ignore", "pipe"],
+		detached: process.platform !== "win32",
 		shell: process.platform === "win32" && runtime === "bun",
 	});
 
@@ -399,25 +548,35 @@ async function runTuiBenchmarkRun({ runtime, runIndex, measuredIndex, options, p
 	});
 
 	const startedAt = performance.now();
-	const exitCode = await waitForExit(child, `Benchmark ${measuredIndex === undefined ? `warmup ${runNumber}` : `run ${measuredIndex}`}`);
-	const elapsedMs = performance.now() - startedAt;
-
+	let exitCode;
 	try {
-		if (exitCode !== 0) {
-			throw new Error(stderr.trim() || `Benchmark child exited with code ${exitCode}`);
-		}
-
-		const profilePath = options.cpuProfile ? join(profileDir, profileName) : undefined;
-		if (profilePath && !existsSync(profilePath)) {
-			throw new Error(`CPU profile was not written: ${profilePath}`);
-		}
-
-		return { elapsedMs, profilePath, timings: parseStartupTimings(stderr) };
+		exitCode = await waitForExitWithTimeout(
+			child,
+			`Benchmark ${measuredIndex === undefined ? `warmup ${runNumber}` : `run ${measuredIndex}`}`,
+			options.timeoutMs,
+		);
 	} finally {
+		// The wait itself can throw (timeout): the isolated dirs must go either way.
+		if (isolatedTmpDir) {
+			await shutdownIsolatedDaemon(isolatedTmpDir);
+			rmSync(isolatedTmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+		}
 		if (tempRoot) {
-			rmSync(tempRoot, { recursive: true, force: true });
+			rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 		}
 	}
+	const elapsedMs = performance.now() - startedAt;
+
+	if (exitCode !== 0) {
+		throw new Error(stderr.trim() || `Benchmark child exited with code ${exitCode}`);
+	}
+
+	const profilePath = options.cpuProfile ? join(profileDir, profileName) : undefined;
+	if (profilePath && !existsSync(profilePath)) {
+		throw new Error(`CPU profile was not written: ${profilePath}`);
+	}
+
+	return { elapsedMs, profilePath, timings: parseStartupTimings(stderr) };
 }
 
 function splitJsonLines(buffer, onLine) {
@@ -442,12 +601,14 @@ async function runRpcBenchmarkRun({ runtime, runIndex, measuredIndex, options, p
 	if (isolatedAgentDir) {
 		mkdirSync(isolatedAgentDir, { recursive: true });
 	}
+	const isolatedTmpDir = tempRoot ? makeIsolatedTmpDir() : undefined;
 
 	const command = getRuntimeCommand(runtime, "rpc", profileDir, profileName, options.cpuProfile);
 	const child = spawn(command.executable, command.args, {
 		cwd: packageDir,
-		env: createBenchmarkEnv(options, isolatedAgentDir),
+		env: createBenchmarkEnv(options, isolatedAgentDir, isolatedTmpDir),
 		stdio: ["pipe", "pipe", "pipe"],
+		detached: process.platform !== "win32",
 		shell: process.platform === "win32" && runtime === "bun",
 	});
 
@@ -496,30 +657,42 @@ async function runRpcBenchmarkRun({ runtime, runIndex, measuredIndex, options, p
 	child.stdin.setDefaultEncoding("utf8");
 	child.stdin.write(`${JSON.stringify({ id: requestId, type: "get_state" })}\n`);
 
-	const exitCode = await waitForExit(child, `Benchmark ${measuredIndex === undefined ? `warmup ${runNumber}` : `run ${measuredIndex}`}`);
-
+	let exitCode;
 	try {
-		if (responseError) {
-			throw new Error(responseError);
-		}
-		if (readyElapsedMs === undefined) {
-			throw new Error(stderr.trim() || "RPC benchmark did not receive get_state response");
-		}
-		if (exitCode !== 0) {
-			throw new Error(stderr.trim() || `Benchmark child exited with code ${exitCode}`);
-		}
-
-		const profilePath = options.cpuProfile ? join(profileDir, profileName) : undefined;
-		if (profilePath && !existsSync(profilePath)) {
-			throw new Error(`CPU profile was not written: ${profilePath}`);
-		}
-
-		return { elapsedMs: readyElapsedMs, profilePath, timings: parseStartupTimings(stderr) };
+		exitCode = await waitForExitWithTimeout(
+			child,
+			`Benchmark ${measuredIndex === undefined ? `warmup ${runNumber}` : `run ${measuredIndex}`}`,
+			options.timeoutMs,
+		);
 	} finally {
+		// The wait itself can throw (timeout): the isolated dirs must go either way.
+		if (isolatedTmpDir) {
+			// The ensured daemon outlives the rpc child (spawned detached, own
+			// process group), so it needs an explicit shutdown before the dir goes.
+			await shutdownIsolatedDaemon(isolatedTmpDir);
+			rmSync(isolatedTmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+		}
 		if (tempRoot) {
-			rmSync(tempRoot, { recursive: true, force: true });
+			rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 		}
 	}
+
+	if (responseError) {
+		throw new Error(responseError);
+	}
+	if (readyElapsedMs === undefined) {
+		throw new Error(stderr.trim() || "RPC benchmark did not receive get_state response");
+	}
+	if (exitCode !== 0) {
+		throw new Error(stderr.trim() || `Benchmark child exited with code ${exitCode}`);
+	}
+
+	const profilePath = options.cpuProfile ? join(profileDir, profileName) : undefined;
+	if (profilePath && !existsSync(profilePath)) {
+		throw new Error(`CPU profile was not written: ${profilePath}`);
+	}
+
+	return { elapsedMs: readyElapsedMs, profilePath, timings: parseStartupTimings(stderr) };
 }
 
 async function runBenchmarkRun(params) {

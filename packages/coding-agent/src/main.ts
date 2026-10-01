@@ -1969,8 +1969,9 @@ export async function main(args: string[], options?: MainOptions) {
 			console.log(chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+M to cycle)")}`));
 		}
 
+		const agentConnection = new InProcessAgentConnection(runtime);
 		const interactiveMode = new InteractiveMode({
-			agentConnection: new InProcessAgentConnection(runtime),
+			agentConnection,
 			localSessionHost: createInteractiveModeLocalSessionHost(runtime),
 			startupNotice: takeInteractiveTelemetryNotice(runtime.services),
 			promptStashStore: new ClientPromptStashStore(),
@@ -1984,18 +1985,25 @@ export async function main(args: string[], options?: MainOptions) {
 			verbose: parsed.verbose,
 		});
 		if (startupBenchmark) {
-			await interactiveMode.init();
-			time("interactiveMode.init");
-			printTimings();
-			interactiveMode.stop();
-			stopThemeWatcher();
+			try {
+				await interactiveMode.init();
+				time("interactiveMode.init");
+			} finally {
+				interactiveMode.stop();
+				stopThemeWatcher();
+				printTimings();
+				// init() leaves the in-process runtime (kernel child, sockets, session
+				// lease) holding the event loop; without disposing it the benchmark
+				// process never exits — this must also run when init() throws.
+				await agentConnection.dispose();
+			}
 			if (process.stdout.writableLength > 0) {
 				await new Promise<void>((resolve) => process.stdout.once("drain", resolve));
 			}
 			if (process.stderr.writableLength > 0) {
 				await new Promise<void>((resolve) => process.stderr.once("drain", resolve));
 			}
-			return;
+			await exitAfterOrphanJournalFlush(0);
 		}
 
 		await preloadCodeHighlighter();

@@ -704,12 +704,12 @@ class MeasurementTests(unittest.TestCase):
                 "PRIME_SANDBOX_API_KEY": "fake",
                 "GITHUB_TOKEN": "fake",
                 "PRIME_TEAM_ID": "private-team",
-                "PI_CODING_AGENT_DIR": "/personal",
+                "PRIME_AGENT_CODING_AGENT_DIR": "/personal",
             },
         ):
             env = environment("benchmark1")
         self.assertFalse(any("KEY" in name or "TOKEN" in name or "TEAM" in name for name in env))
-        self.assertNotIn("PI_CODING_AGENT_DIR", env)
+        self.assertNotIn("PRIME_AGENT_CODING_AGENT_DIR", env)
 
     def test_completion_requires_every_metric(self):
         side = Side(sha=SHA)

@@ -1,0 +1,1 @@
+- Fixed the `PI_STARTUP_BENCHMARK` TUI profile mode hanging forever after rendering: the benchmark branch now disposes the in-process runtime and prints the timings block (the profile script also sets `PI_TIMING=1` and gained a `--timeout` kill switch).
