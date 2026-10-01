@@ -78,7 +78,9 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
 async function cancelCell(harness: Harness, startedPath: string, code: string): Promise<void> {
 	harness.setResponses([fauxAssistantMessage(fauxToolCall("ipython", { code }), { stopReason: "toolUse" })]);
 	const prompt = harness.session.prompt("run the cancellation fixture");
-	await expect.poll(() => existsSync(startedPath)).toBe(true);
+	// Subprocess spawn + cell delivery on a loaded machine can exceed the 1s
+	// default poll window; the assertion is unchanged, only the wait is realistic.
+	await expect.poll(() => existsSync(startedPath), { timeout: 5_000 }).toBe(true);
 	await harness.session.abort();
 	await prompt;
 }
@@ -108,7 +110,7 @@ describe.skipIf(process.platform === "win32")("headless Python cancellation", ()
 		const cancelled = await calls[0];
 		const oldPid = pid();
 
-		await expect.poll(() => isAlive(oldPid)).toBe(false);
+		await expect.poll(() => isAlive(oldPid), { timeout: 5_000 }).toBe(false);
 		expect(provisioner.hasRunningKernel).toBe(false);
 		expect(cancelled).toMatchObject({ details: { status: "aborted" }, isError: true });
 		expect(getMessageText(cancelled)).toContain("kernel was killed");
@@ -147,7 +149,9 @@ describe.skipIf(process.platform === "win32")("headless Python cancellation", ()
 		const manager = await provisioner.ensure();
 		const controller = new AbortController();
 		const cell = manager.execute("wedged", { signal: controller.signal });
-		await expect.poll(() => existsSync(startedPath)).toBe(true);
+		// Subprocess spawn + cell delivery on a loaded machine can exceed the 1s
+		// default poll window; the assertion is unchanged, only the wait is realistic.
+		await expect.poll(() => existsSync(startedPath), { timeout: 5_000 }).toBe(true);
 		controller.abort();
 		await cell;
 		const oldPid = pid();
@@ -156,7 +160,7 @@ describe.skipIf(process.platform === "win32")("headless Python cancellation", ()
 		const followup = await readValue(harness);
 		expect(followup).toContain("<ipython_kernel_reset>");
 		expect(followup).toMatch(/\n0$/);
-		await expect.poll(() => isAlive(oldPid)).toBe(false);
+		await expect.poll(() => isAlive(oldPid), { timeout: 5_000 }).toBe(false);
 		expect(pid()).not.toBe(oldPid);
 	});
 });

@@ -217,10 +217,6 @@ export function clearPrimeCliCredentialsWithReport(
 	return { config: loadPrimeCliConfig(configPath), removedApiKey, removedTeamSelection };
 }
 
-export function clearPrimeCliCredentials(configPath: string = defaultPrimeCliConfigPath()): PrimeCliConfig {
-	return clearPrimeCliCredentialsWithReport(configPath).config;
-}
-
 export function savePrimeCliTeamSelection(
 	team: PrimeTeam | null,
 	configPath: string = defaultPrimeCliConfigPath(),

@@ -77,6 +77,7 @@ packages/coding-agent/test/kernel-venv-in-use.test.ts|none|any|skips one test on
 packages/coding-agent/test/package-temp-cache.test.ts|helper|any|guard is the local IS_WINDOWS constant (= process.platform === "win32"), so it runs on the linux runner
 packages/coding-agent/test/proper-lockfile-compromise.test.ts|none|any|skips one test on win32
 packages/coding-agent/test/repl-kernel-startup.test.ts|none|any|one test skips on win32 (it.skipIf(process.platform === "win32") on the FIFO-at-the-stderr-log-path case); the platform condition came in with the P3 repl frozen file and needs no other platform, the rest of the file runs on linux
+packages/coding-agent/test/session-lease.test.ts|none|any|one test skips on win32 (the zombie-reaping test forks a real zombie child, POSIX-only)
 packages/coding-agent/test/session-manager/flat-storage.test.ts|none|any|three tests run everywhere but win32
 packages/coding-agent/test/suite/regressions/6008-headless-python-cancellation.test.ts|none|any|one describe skips on win32
 REGISTRY

@@ -18,7 +18,8 @@ import type { Dirent } from "node:fs";
 import { lstatSync } from "node:fs";
 import { readdir, rm } from "node:fs/promises";
 import path from "node:path";
-import { getProcessStartId, getProcessStartIdsAsync, isProcessAlive } from "../session-lease.js";
+import { processIdExists } from "../../utils/child-process.js";
+import { getProcessStartId, getProcessStartIdsAsync } from "../session-lease.js";
 import {
 	confirmReferenceIsStale,
 	inspectReferenceEntry,
@@ -341,7 +342,9 @@ export async function readKernelVenvInUseState(
 	const pidsToResolve = new Set<number>();
 	for (const candidate of candidates) {
 		const record = candidate.facts.record;
-		if (record?.processStartId !== undefined && isProcessAlive(record.pid)) {
+		// processIdExists keeps the RC-4 contract: this gate runs per entry, so a
+		// zombie-checking probe would fork `ps` per live holder.
+		if (record?.processStartId !== undefined && processIdExists(record.pid)) {
 			pidsToResolve.add(record.pid);
 		}
 	}

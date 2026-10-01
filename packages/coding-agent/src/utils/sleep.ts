@@ -123,12 +123,32 @@ export function sleepSync(delayMs: number): void {
 }
 
 /**
- * Sleep helper that respects abort signal.
+ * How a timer wait ends early, and whether it may hold the process open.
  */
-export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+export interface SleepOptions {
+	/** Abort cancels the wait: it rejects by default, or resolves when `resolveOnAbort` is set. */
+	signal?: AbortSignal;
+	/** The wait must not keep the event loop alive (daemon watchdog races that ride a deadline). */
+	unref?: boolean;
+	/** Resolve instead of rejecting on abort, for retry loops that re-check the signal themselves. */
+	resolveOnAbort?: boolean;
+}
+
+/**
+ * Sleep helper that respects abort signal. Without a signal this is a plain timer
+ * wait - the local `delay(ms)` copies this replaced. The abort contract rejects by
+ * default; `resolveOnAbort` exists for loops that throw `signal.reason` themselves
+ * right after the wait, so cancellation keeps the caller's own error.
+ */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void>;
+export function sleep(ms: number, options?: SleepOptions): Promise<void>;
+export function sleep(ms: number, options?: AbortSignal | SleepOptions): Promise<void> {
 	return new Promise((resolve, reject) => {
+		const signal = options instanceof AbortSignal ? options : options?.signal;
+		const resolveOnAbort = options instanceof AbortSignal ? false : options?.resolveOnAbort === true;
+		const settleOnAbort = () => (resolveOnAbort ? resolve() : reject(new Error("Aborted")));
 		if (signal?.aborted) {
-			reject(new Error("Aborted"));
+			settleOnAbort();
 			return;
 		}
 
@@ -136,10 +156,13 @@ export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 			signal?.removeEventListener("abort", onAbort);
 			resolve();
 		}, ms);
+		if (options !== undefined && !(options instanceof AbortSignal) && options.unref === true) {
+			timeout.unref();
+		}
 
 		const onAbort = () => {
 			clearTimeout(timeout);
-			reject(new Error("Aborted"));
+			settleOnAbort();
 		};
 
 		signal?.addEventListener("abort", onAbort, { once: true });

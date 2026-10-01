@@ -20,6 +20,7 @@ import type { DeleteSessionFileResult } from "../../core/session-file-actions.js
 import { SessionAlreadyActiveError } from "../../core/session-lease.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { SettingsManager } from "../../core/settings-manager.js";
+import { sleep } from "../../utils/sleep.js";
 import { AgentsViewRosterStore, STALE_ROSTER_DAEMON_MESSAGE } from "../agents-view/roster-store.js";
 import { CompactAssistantStreamReconstructor } from "../daemon/compact-session-stream.js";
 import {
@@ -218,10 +219,6 @@ const updateTransportReconnects = new WeakMap<DaemonTransportClient, Promise<voi
 
 const OWNED_SESSION_PROMOTE_RETRY_MS = 200;
 
-function delay(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function formatErrorSentence(error: unknown): string {
 	const message = (error instanceof Error ? error.message : String(error)).trim();
 	if (!message) {
@@ -263,7 +260,7 @@ function reconnectDaemonTransportAfterUpdate(client: DaemonTransportClient): Pro
 				} catch (error) {
 					lastError = error;
 				}
-				await delay(UPDATE_RECONNECT_RETRY_MS);
+				await sleep(UPDATE_RECONNECT_RETRY_MS);
 			}
 			throw lastError ?? new Error("the updated daemon did not become available");
 		})
@@ -1915,7 +1912,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.backgroundRetryWake?.();
 		this.backgroundRetryWake = undefined;
 		if (this.options.ownedSession && !this.client.isConnected && this.reconnectPromise) {
-			await Promise.race([this.reconnectPromise, delay(OWNED_SESSION_DISPOSE_RECONNECT_WAIT_MS)]).catch(
+			await Promise.race([this.reconnectPromise, sleep(OWNED_SESSION_DISPOSE_RECONNECT_WAIT_MS)]).catch(
 				() => undefined,
 			);
 		}
@@ -1973,7 +1970,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				lastError = error;
 			}
 			if (attempt < attempts - 1) {
-				await delay(OWNED_SESSION_PROMOTE_RETRY_MS);
+				await sleep(OWNED_SESSION_PROMOTE_RETRY_MS);
 			}
 		}
 		return lastError instanceof Error ? lastError.message : String(lastError);
@@ -2691,7 +2688,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				lastError = error;
 			}
 			if (this.disposed || this.terminalCloseEmitted) return false;
-			await delay(options.retryMs);
+			await sleep(options.retryMs);
 		}
 		if (this.disposed || this.terminalCloseEmitted) {
 			return false;
@@ -2779,7 +2776,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					status: "reconnecting",
 					error: `Daemon snapshot recovery failed; retrying in ${retryDelayMs}ms. Recovery error: ${formatErrorSentence(recoveryError)}`,
 				});
-				await delay(retryDelayMs);
+				await sleep(retryDelayMs);
 				if (this.disposed) {
 					return;
 				}

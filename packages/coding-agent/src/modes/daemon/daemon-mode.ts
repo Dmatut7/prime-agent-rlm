@@ -151,8 +151,10 @@ import {
 	type WaitTimeoutFacts,
 	withBound,
 } from "../../utils/bounded-wait.js";
+import { isProcessAlive } from "../../utils/child-process.js";
 import { mapConcurrent } from "../../utils/map-concurrent.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
+import { sleep } from "../../utils/sleep.js";
 import {
 	createAgentConnectionCommands,
 	createAgentConnectionResourceSnapshot,
@@ -534,10 +536,6 @@ const RECOVERY_CHECKPOINT_EVENTS: ReadonlySet<string> = new Set([
 	"session_action_update",
 	"rlm_child_update",
 ]);
-
-function delay(ms: number): Promise<void> {
-	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
-}
 
 type RuntimeOpenGuard = () => boolean | Promise<boolean>;
 type SupervisorGenerationClaim = Omit<Extract<DaemonWorkerCommand, { type: "worker_auth" }>, "id" | "type" | "token">;
@@ -1410,7 +1408,7 @@ export class AgentDaemon {
 					} catch {
 						// An invalid owner is reclaimed atomically below.
 					}
-					if (ownerPid && this.isProcessAlive(ownerPid)) {
+					if (ownerPid && isProcessAlive(ownerPid)) {
 						// Somebody else is already launching the replacement. Not an error:
 						// this round stands down and the monitor rechecks on its backoff.
 						this.log(`supervisor launch lock held by pid ${ownerPid}; backing off`);
@@ -1460,7 +1458,7 @@ export class AgentDaemon {
 					this.log(`launched replacement supervisor on ${supervisorSocketPath}`);
 					return;
 				}
-				await delay(50);
+				await sleep(50);
 			}
 		} catch (error) {
 			this.log(`failed to launch replacement supervisor: ${String(error)}`);
@@ -1469,15 +1467,6 @@ export class AgentDaemon {
 				rmSync(lockDirectory, { recursive: true, force: true });
 			}
 			this.supervisorLaunchInProgress = false;
-		}
-	}
-
-	private isProcessAlive(pid: number): boolean {
-		try {
-			process.kill(pid, 0);
-			return true;
-		} catch (error) {
-			return (error as NodeJS.ErrnoException).code === "EPERM";
 		}
 	}
 
@@ -7851,7 +7840,7 @@ export class AgentDaemon {
 			return;
 		}
 		session.abortBash();
-		await Promise.race([state.inFlightBash ?? Promise.resolve(), delay(UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS)]);
+		await Promise.race([state.inFlightBash ?? Promise.resolve(), sleep(UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS)]);
 	}
 
 	private async closeSessionOnce(

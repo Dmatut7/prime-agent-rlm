@@ -6,6 +6,8 @@ import { getLogger } from "@earendil-works/pi-ai";
 import lockfile from "proper-lockfile";
 import { getProcessStartId } from "../../core/session-lease.js";
 import { writeFileAtomicSync } from "../../utils/atomic-file.js";
+import { isProcessAlive, processIdExists } from "../../utils/child-process.js";
+import { sleep } from "../../utils/sleep.js";
 import { defaultDaemonSocketDir, normalizeSocketPath } from "./daemon-socket.js";
 
 const DAEMON_SUPERVISOR_REGISTRY_DIR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
@@ -237,7 +239,7 @@ class RenewableRegistryRecord {
 				if (attempt >= RENEWAL_RETRY_ATTEMPTS) {
 					throw error;
 				}
-				await delay(RENEWAL_RETRY_MS);
+				await sleep(RENEWAL_RETRY_MS);
 			}
 		}
 	}
@@ -762,7 +764,7 @@ export async function acquireDaemonSupervisorOwnership(
 						"; the shutdown holds its admission until it finishes — retry in a few seconds",
 				);
 			}
-			await delay(SHUTDOWN_ADMISSION_WAIT_MS);
+			await sleep(SHUTDOWN_ADMISSION_WAIT_MS);
 		}
 	} catch (error) {
 		rmSync(candidateDirectory, { recursive: true, force: true });
@@ -795,7 +797,11 @@ export async function assertDaemonSupervisorOwnerCurrent(
 		current.pid !== owner.pid ||
 		current.processStartId !== owner.processStartId ||
 		current.socketPath !== normalizeSocketPath(owner.socketPath) ||
-		!isProcessAlive(current.pid)
+		// Cheap liveness only: this check runs on every supervisor fence poll
+		// (250ms), and the unchanged-fingerprint path must never shell out to `ps`
+		// (ENG-4603). A zombie supervisor passes here but its dead socket and the
+		// fingerprint-gated identity revalidation below still catch it.
+		!processIdExists(current.pid)
 	) {
 		throw new DaemonSupervisorOwnershipLostError(owner.generation, { socketPath: owner.socketPath, registryDir });
 	}
@@ -844,7 +850,7 @@ export async function acquireDaemonShutdownAdmission(
 		if (Date.now() >= deadline) {
 			throw new DaemonShutdownAdmissionError(describeShutdownAdmissionHolder(holder, waitTimeoutMs));
 		}
-		await delay(SHUTDOWN_ADMISSION_WAIT_MS);
+		await sleep(SHUTDOWN_ADMISSION_WAIT_MS);
 	}
 }
 
@@ -878,7 +884,7 @@ export async function waitForDaemonShutdownAdmissionClear(
 		if (Date.now() >= deadline) {
 			return false;
 		}
-		await delay(pollMs);
+		await sleep(pollMs);
 	}
 }
 
@@ -983,7 +989,7 @@ export async function waitForDaemonStartupFence(
 		if (Date.now() >= deadline) {
 			throw new Error(`Timed out waiting for predecessor daemon process ${fence.pid} to exit`);
 		}
-		await delay(STARTUP_FENCE_POLL_MS);
+		await sleep(STARTUP_FENCE_POLL_MS);
 	}
 }
 
@@ -1019,15 +1025,6 @@ function isProcessIdentityAlive(identity: ProcessIdentity): boolean {
 	}
 	const observed = getProcessStartId(identity.pid);
 	return observed === undefined || observed === identity.processStartId;
-}
-
-function isProcessAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code !== "ESRCH";
-	}
-	return true;
 }
 
 function canonicalizeFilesystemPath(path: string): string {
@@ -1373,8 +1370,4 @@ function startupFencePath(directory: string, socketPath: string): string {
 
 function shutdownAdmissionPath(registryDir: string): string {
 	return resolve(registryDir, SHUTDOWN_ADMISSION_FILE_NAME);
-}
-
-function delay(ms: number): Promise<void> {
-	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }

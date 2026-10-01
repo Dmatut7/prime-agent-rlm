@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
 import { getDaemonLogPath } from "../../config.js";
 import { isAgentTaskState } from "../../core/agent-task-state.js";
+import { sleep } from "../../utils/sleep.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import {
 	createDaemonCommandEnvelope,
@@ -773,7 +774,7 @@ export class DaemonClient {
 					}
 					const delayMs = Math.min(remainingMs, MAX_RECONNECT_DELAY_MS, 100 * 2 ** Math.min(attempt, 5));
 					attempt++;
-					await delay(delayMs);
+					await sleep(delayMs);
 				}
 			}
 			if (this.closed || this.reconnectOptions !== options) {
@@ -796,10 +797,6 @@ export class DaemonClient {
 			// UI status callbacks must never interrupt transport recovery.
 		}
 	}
-}
-
-function delay(ms: number): Promise<void> {
-	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
 
 function isDaemonClosing(value: unknown): value is Extract<DaemonOutbound, { type: "daemon_closing" }> {

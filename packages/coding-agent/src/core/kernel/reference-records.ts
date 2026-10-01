@@ -34,8 +34,9 @@ import {
 	rmSync,
 	writeSync,
 } from "node:fs";
+import { processIdExists } from "../../utils/child-process.js";
 import { requireNoFollow } from "../../utils/private-files.js";
-import { getProcessStartId, isProcessAlive } from "../session-lease.js";
+import { getProcessStartId } from "../session-lease.js";
 
 export const REFERENCE_RECORD_VERSION = 1;
 /** A reference file is named for the pid that holds it. */
@@ -92,7 +93,12 @@ export function referenceIsLive(
 	record: ReferenceRecord,
 	currentStartIdOf: ProcessStartIdLookup = getProcessStartId,
 ): boolean {
-	if (!isProcessAlive(record.pid)) return false;
+	// processIdExists, not isProcessAlive: this check runs per reference entry in
+	// the batched read paths (RC-4), where a zombie check would fork `ps` per pid
+	// (~55ms each on macOS). A zombie holder is transient by definition and the
+	// start-identity match below still applies to it, so the cheap probe keeps the
+	// O(1)-fork contract without weakening the verdict.
+	if (!processIdExists(record.pid)) return false;
 	if (record.processStartId === undefined) return true;
 	const current = currentStartIdOf(record.pid);
 	return current === undefined || current === record.processStartId;

@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
@@ -24,6 +25,7 @@ import {
 	SESSION_LEASES_ENABLED_ENV,
 	SessionAlreadyActiveError,
 } from "../src/core/session-lease.js";
+import { isZombieProcess } from "../src/utils/child-process.js";
 
 const tempDirs: string[] = [];
 
@@ -247,6 +249,58 @@ describe("session leases", () => {
 		const lease = await acquireSessionLeaseAsync(sessionPath, agentDir, enabledEnvironment("replacement"));
 		expect(lease?.sessionPath).toBe(sessionPath);
 		lease?.release();
+	});
+
+	// A zombie has exited but still occupies its pid, so a bare kill(pid, 0) probe reads
+	// it as alive; the owner's work is over and its lease must not linger until reaping.
+	it.skipIf(process.platform === "win32")("reclaims a lease whose owner process is an unreaped zombie", async () => {
+		const parent = spawn(
+			"perl",
+			["-e", '$| = 1; my $pid = fork(); if ($pid) { print "$pid\\n"; sleep 30 } else { exit 0 }'],
+			{ stdio: ["ignore", "pipe", "ignore"] },
+		);
+		try {
+			const zombiePid = await new Promise<number>((resolvePid, rejectPid) => {
+				let output = "";
+				const timer = setTimeout(() => rejectPid(new Error("Timed out waiting for the zombie pid")), 5000);
+				parent.stdout?.on("data", (chunk: Buffer) => {
+					output += chunk.toString();
+					const parsed = Number.parseInt(output.trim(), 10);
+					if (Number.isInteger(parsed) && parsed > 0) {
+						clearTimeout(timer);
+						resolvePid(parsed);
+					}
+				});
+			});
+			const deadline = Date.now() + 5000;
+			while (!isZombieProcess(zombiePid) && Date.now() < deadline) {
+				await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+			}
+			expect(isZombieProcess(zombiePid)).toBe(true);
+
+			const agentDir = createTempDir();
+			const sessionPath = canonicalSessionPath(resolve(agentDir, "zombie-owner.jsonl"));
+			const key = createHash("sha256").update(sessionPath).digest("hex");
+			const lockDirectory = join(agentDir, "session-leases", `${key}.lock`);
+			mkdirSync(lockDirectory, { recursive: true });
+			writeFileSync(
+				join(lockDirectory, "owner.json"),
+				JSON.stringify({
+					version: 1,
+					token: "stale",
+					pid: zombiePid,
+					activeSessionId: "zombie-owner",
+					sessionPath,
+					createdAt: new Date(0).toISOString(),
+				}),
+			);
+
+			const lease = await acquireSessionLeaseAsync(sessionPath, agentDir, enabledEnvironment("replacement"));
+			expect(lease?.sessionPath).toBe(sessionPath);
+			lease?.release();
+		} finally {
+			parent.kill("SIGKILL");
+		}
 	});
 
 	it("reports guard contention as a coordination failure", async () => {

@@ -25,7 +25,8 @@ import {
 	readRecordedDaemonSocketOwners,
 } from "../modes/daemon/daemon-supervisor-ownership.js";
 import type { DaemonWorkerDescriptor } from "../modes/daemon/daemon-worker-protocol.js";
-import { signalProcessGroupOrProcess } from "../utils/child-process.js";
+import { isProcessAlive, processIdExists, signalProcessGroupOrProcess } from "../utils/child-process.js";
+import { sleep } from "../utils/sleep.js";
 import {
 	type ClientBuildIdentity,
 	describeBuildMismatch,
@@ -956,12 +957,8 @@ export function verifyHelloSupervisorPid(
 	if (!Number.isInteger(pid) || pid === undefined || pid <= 0) {
 		return undefined;
 	}
-	try {
-		process.kill(pid, 0);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "EPERM") {
-			return undefined;
-		}
+	if (!processIdExists(pid)) {
+		return undefined;
 	}
 	if (expectedProcessStartId) {
 		const observedStartId = getProcessStartId(pid);
@@ -1888,7 +1885,7 @@ async function terminateVerifiedResiduals(
 			if (quietPeriod === "complete") {
 				return;
 			}
-			await delay(100);
+			await sleep(100);
 			continue;
 		}
 		quietSince = undefined;
@@ -2013,7 +2010,7 @@ async function terminateVerifiedListener(sweep: ShutdownSweep, listener: Discove
 	const signalled = await signalAndRecordStop(sweep.report, listener.pid, "terminate");
 	const deadline = Date.now() + 1000;
 	while (getProcessStartId(listener.pid) === processStartId && Date.now() < deadline) {
-		await delay(50);
+		await sleep(50);
 	}
 	let escalated = false;
 	if (getProcessStartId(listener.pid) === processStartId) {
@@ -2436,7 +2433,7 @@ async function stopTrackedProcess(
 	signalProcessGroupOrProcess(pid, "SIGTERM");
 	let deadline = Date.now() + 500;
 	while (isProcessAlive(pid) && Date.now() < deadline) {
-		await delay(25);
+		await sleep(25);
 	}
 	if (!isProcessAlive(pid)) {
 		return true;
@@ -2449,7 +2446,7 @@ async function stopTrackedProcess(
 	signalProcessGroupOrProcess(pid, "SIGKILL");
 	deadline = Date.now() + 1000;
 	while (isProcessAlive(pid) && Date.now() < deadline) {
-		await delay(25);
+		await sleep(25);
 	}
 	return !isProcessAlive(pid);
 }
@@ -2723,7 +2720,7 @@ export async function forceKillDaemon(pid: number): Promise<boolean> {
 		if (!isProcessAlive(pid)) {
 			return delivered;
 		}
-		await delay(50);
+		await sleep(50);
 	}
 	try {
 		process.kill(pid, "SIGKILL");
@@ -2750,19 +2747,6 @@ export async function signalAndRecordStop(
 		ledger.recordSignal(pid);
 	}
 	return delivered;
-}
-
-function isProcessAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "EPERM";
-	}
-}
-
-function delay(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function canConnectToSocket(socketPath: string, timeoutMs: number): Promise<boolean> {
@@ -2803,7 +2787,7 @@ async function shutdownDaemon(socketPath: string, force: boolean): Promise<boole
 		if (!(await canConnectToSocket(socketPath, 250))) {
 			return true;
 		}
-		await delay(50);
+		await sleep(50);
 	}
 	return false;
 }

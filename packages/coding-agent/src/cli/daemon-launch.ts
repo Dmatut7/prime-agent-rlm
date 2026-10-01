@@ -29,6 +29,7 @@ import {
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_TOKEN_ENV,
 } from "../modes/daemon/daemon-worker-protocol.js";
+import { sleep } from "../utils/sleep.js";
 import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
 import { createCliSubprocessEnv, formatCurrentCliCommand } from "./subprocess-launch.js";
 
@@ -42,10 +43,6 @@ export function isDaemonSessionSummary(value: unknown): value is SessionSummary 
 	}
 	const summary = value as { activeSessionId?: unknown; id?: unknown };
 	return typeof summary.activeSessionId === "string" || typeof summary.id === "string";
-}
-
-function delay(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // Daemon replacement used to be silent (no crash, no log), so a daemon dying
@@ -311,7 +308,7 @@ async function waitForDaemonGone(
 		) {
 			return true;
 		}
-		await delay(25);
+		await sleep(25);
 	}
 	// A daemon can exit without removing its Unix socket (for example, after a crash
 	// during shutdown). Once the cleanup grace has elapsed, a non-listening socket
@@ -536,7 +533,7 @@ Then retry the original command.`,
 		if (childFailure) {
 			exitDeadline ??= Date.now() + DAEMON_STARTUP_EXIT_GRACE_MS;
 		}
-		await delay(25);
+		await sleep(25);
 	}
 
 	throwIfFailed();

@@ -65,10 +65,6 @@ export function isKernelSnapshotGenerationName(name: string): boolean {
 	return GENERATION_NAME.test(name);
 }
 
-export function kernelSnapshotReferencePath(artifactDir: string, pid: number): string {
-	return join(kernelSnapshotGenerationsDir(artifactDir), KERNEL_SNAPSHOT_IN_USE_DIR_NAME, `${pid}.json`);
-}
-
 export interface KernelSnapshotReference {
 	pid: number;
 	processStartId?: string;

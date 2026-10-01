@@ -3,6 +3,7 @@ import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import lockfile from "proper-lockfile";
+import { sleep } from "../../utils/sleep.js";
 import { queryWindowsUserSid, restrictWindowsNamedPipeAccess, windowsDaemonPipePath } from "./windows-named-pipe.js";
 
 export { normalizeSocketPath } from "../../utils/daemon-socket-path.js";
@@ -153,7 +154,7 @@ async function prepareUnixDaemonSocketPath(socketPath: string, lease?: DaemonSoc
 	}
 	const deadline = Date.now() + DAEMON_SOCKET_RELEASE_GRACE_MS;
 	while (Date.now() < deadline) {
-		await delay(DAEMON_SOCKET_RELEASE_POLL_MS);
+		await sleep(DAEMON_SOCKET_RELEASE_POLL_MS);
 		if (!existsSync(socketPath)) {
 			return;
 		}
@@ -341,8 +342,4 @@ function canConnectToUnixSocket(socketPath: string): Promise<boolean> {
 		socket.once("connect", () => finish(true));
 		socket.once("error", () => finish(false));
 	});
-}
-
-function delay(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
 }

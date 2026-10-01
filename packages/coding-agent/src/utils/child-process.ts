@@ -82,7 +82,13 @@ export function shouldUseWindowsShell(command: string): boolean {
 	return commandName.endsWith(".cmd") || commandName.endsWith(".bat") || WINDOWS_SHELL_COMMANDS.has(commandName);
 }
 
-/** Cheap kill(0) existence probe; counts zombies as existing. */
+/**
+ * Cheap kill(0) existence probe; counts zombies as existing, and fail-closes to
+ * "exists" only on EPERM (a live process owned by somebody else). This and
+ * {@link isProcessAlive} are the repo's only liveness probes - do not write local
+ * kill(pid, 0) copies: the last drift left five of them disagreeing on zombie and
+ * error semantics along the lease/ownership reclaim path (wave-10 audit §1.1).
+ */
 export function processIdExists(pid: number): boolean {
 	try {
 		process.kill(pid, 0);

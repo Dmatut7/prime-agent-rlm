@@ -14,6 +14,8 @@ import {
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_TOKEN_ENV,
 } from "../modes/daemon/daemon-worker-protocol.js";
+import { isProcessAlive } from "../utils/child-process.js";
+import { sleep } from "../utils/sleep.js";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "./subprocess-launch.js";
 
 export const DAEMON_UPDATE_RESTART_COORDINATOR_FLAG = "--internal-update-restart-coordinator";
@@ -141,10 +143,6 @@ export function buildDaemonUpdateRestartReport(status: DaemonUpdateRestartStatus
 		report.warnings.push(`Could not restore ${failure.sessionFile}: ${failure.message}`);
 	}
 	return report;
-}
-
-function delay(ms: number): Promise<void> {
-	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
 
 function statusLivenessId(status: DaemonUpdateRestartStatus): string {
@@ -354,15 +352,6 @@ async function withCoordinatorRegistryGuard<T>(registryDir: string, action: () =
 	}
 }
 
-function isProcessAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code !== "ESRCH";
-	}
-	return true;
-}
-
 function matchesProcessStartId(identity: DaemonUpdateRestartProcessIdentity): boolean {
 	if (!identity.processStartId) {
 		return true;
@@ -513,7 +502,7 @@ export async function waitForActiveDaemonUpdateRestartCoordinator(
 		if (Date.now() - lastProgressAt >= progressTimeoutMs) {
 			throw new Error(`Timed out waiting for active daemon update restart progress on ${record.socketPath}`);
 		}
-		await delay(50);
+		await sleep(50);
 	}
 }
 
@@ -611,6 +600,6 @@ export async function launchDaemonUpdateRestartCoordinator(
 		if (Date.now() - lastProgressAt >= progressTimeoutMs) {
 			throw new Error(`Timed out waiting for daemon update restart progress on ${socketPath}`);
 		}
-		await delay(50);
+		await sleep(50);
 	}
 }

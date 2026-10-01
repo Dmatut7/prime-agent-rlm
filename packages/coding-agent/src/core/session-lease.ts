@@ -18,7 +18,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { lockSync } from "proper-lockfile";
 import { APP_NAME } from "../config.js";
-import { execFileSyncHidden } from "../utils/child-process.js";
+import { execFileSyncHidden, isProcessAlive } from "../utils/child-process.js";
 
 export const SESSION_LEASES_ENABLED_ENV = "PRIME_AGENT_INTERNAL_SESSION_LEASES";
 export const SESSION_LEASE_OWNER_ID_ENV = "PRIME_AGENT_INTERNAL_SESSION_LEASE_OWNER_ID";
@@ -153,15 +153,6 @@ function readLeaseOwner(directory: string): SessionLeaseOwner | "absent" | "unre
 			return "corrupt";
 		}
 		throw error;
-	}
-}
-
-export function isProcessAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "EPERM";
 	}
 }
 

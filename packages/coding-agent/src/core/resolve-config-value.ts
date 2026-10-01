@@ -127,9 +127,6 @@ function executeCommand(commandConfig: string): string | undefined {
 	return result;
 }
 
-/**
- * Resolve all header values using the same resolution logic as API keys.
- */
 export function resolveConfigValueUncached(config: string): string | undefined {
 	if (config.startsWith("!")) {
 		return executeCommandUncached(config);
@@ -148,31 +145,4 @@ export function resolveConfigValueOrThrow(config: string, description: string): 
 	}
 
 	throw new Error(`Failed to resolve ${description}`);
-}
-
-/**
- * Resolve all header values using the same resolution logic as API keys.
- */
-export function resolveHeaders(headers: Record<string, string> | undefined): Record<string, string> | undefined {
-	if (!headers) return undefined;
-	const resolved: Record<string, string> = {};
-	for (const [key, value] of Object.entries(headers)) {
-		const resolvedValue = resolveConfigValue(value);
-		if (resolvedValue) {
-			resolved[key] = resolvedValue;
-		}
-	}
-	return Object.keys(resolved).length > 0 ? resolved : undefined;
-}
-
-export function resolveHeadersOrThrow(
-	headers: Record<string, string> | undefined,
-	description: string,
-): Record<string, string> | undefined {
-	if (!headers) return undefined;
-	const resolved: Record<string, string> = {};
-	for (const [key, value] of Object.entries(headers)) {
-		resolved[key] = resolveConfigValueOrThrow(value, `${description} header "${key}"`);
-	}
-	return Object.keys(resolved).length > 0 ? resolved : undefined;
 }

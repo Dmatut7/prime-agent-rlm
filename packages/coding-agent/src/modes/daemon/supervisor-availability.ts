@@ -1,4 +1,5 @@
 import { createConnection } from "node:net";
+import { sleep } from "../../utils/sleep.js";
 
 /**
  * P1-7b, 250ms tier: a worker decides its supervisor is gone.
@@ -56,10 +57,6 @@ export function connectProbeSupervisor(socketPath: string, timeoutMs: number): P
 		socket.once("connect", () => finish(true));
 		socket.once("error", () => finish(false));
 	});
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
 
 export async function probeSupervisorAvailability(

@@ -11,7 +11,9 @@
 // resumable session has one, so honouring it here would reclaim nothing. What it
 // never overrides (the keep list, each a `skipped` entry with a fixed reason):
 //   * a resident, leased or ledger-live session;
-//   * a live kernel-snapshot reference, or reference state that cannot be read;
+//   * kernel-snapshot reference state that cannot be read (the in-use reference
+//     writer is gone - nothing produces `.in-use` records any more - so only the
+//     unverifiable state still protects);
 //   * an unreadable tree;
 //   * a directory holding `scheduled-jobs.json` - pending cron work is user data;
 //   * a directory holding another session's transcript that is not on record as
@@ -59,7 +61,6 @@ function capProtection(candidate: {
 	resident: boolean;
 	ledgerLive: boolean;
 	snapshotStateUnknown: boolean;
-	liveSnapshotReferences: number;
 	tree: { unreadable: boolean; names: string[] };
 }): RetentionSkip | undefined {
 	if (candidate.resident) {
@@ -70,9 +71,6 @@ function capProtection(candidate: {
 	}
 	if (candidate.snapshotStateUnknown) {
 		return { path: candidate.path, reason: SKIP.unverifiable("kernel-snapshot-reference-state") };
-	}
-	if (candidate.liveSnapshotReferences > 0) {
-		return { path: candidate.path, reason: SKIP.inUse("pid"), detail: "live kernel snapshot reference" };
 	}
 	if (candidate.tree.unreadable) {
 		return { path: candidate.path, reason: SKIP.unverifiable("tree") };

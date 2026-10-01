@@ -79,6 +79,7 @@ import {
 	signalProcessGroupOrProcess,
 	spawnHidden,
 } from "../../utils/child-process.js";
+import { sleep } from "../../utils/sleep.js";
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import type { PrivateFrame } from "../session-worker/private-framing.js";
@@ -1000,14 +1001,6 @@ function isSupervisorShutdownAdmissionCancelled(error: unknown): boolean {
 			"code" in error &&
 			(error as { code?: unknown }).code === "supervisor_recovery_cancelled")
 	);
-}
-
-function delay(ms: number): Promise<void> {
-	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
-}
-
-function unrefDelay(ms: number): Promise<void> {
-	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms).unref());
 }
 
 function commitWorkerStartupGate(gate: Writable): Promise<void> {
@@ -3539,7 +3532,7 @@ export class DaemonSupervisor {
 					// still-recovering worker fails daemon-side inside the caller's budget
 					// instead of surfacing as a client transport timeout.
 					const forward = this.forwardToWorker(match.worker, command, HEARTBEAT_LIST_FORWARD_TIMEOUT_MS);
-					const forwardDeadline = unrefDelay(HEARTBEAT_LIST_FORWARD_TIMEOUT_MS).then(() => {
+					const forwardDeadline = sleep(HEARTBEAT_LIST_FORWARD_TIMEOUT_MS, { unref: true }).then(() => {
 						throw new Error(
 							`Timed out waiting for session worker to list heartbeats within ${HEARTBEAT_LIST_FORWARD_TIMEOUT_MS}ms`,
 						);
@@ -3560,7 +3553,7 @@ export class DaemonSupervisor {
 				// HEARTBEAT_LIST_LAUNCH_WAIT_MS the catalog proceeds with whatever
 				// registered, and workers that are still starting surface through the
 				// per-worker state error below instead of being omitted.
-				await Promise.race([Promise.allSettled(openings), unrefDelay(HEARTBEAT_LIST_LAUNCH_WAIT_MS)]);
+				await Promise.race([Promise.allSettled(openings), sleep(HEARTBEAT_LIST_LAUNCH_WAIT_MS, { unref: true })]);
 				for (const worker of this.workers.values()) {
 					selectedWorkers.add(worker);
 				}
@@ -3586,7 +3579,7 @@ export class DaemonSupervisor {
 								? worker.heartbeatSnapshot
 								: undefined;
 						if (worker.client && worker.descriptor.lifecycle === "ready") {
-							const deadline = unrefDelay(HEARTBEAT_LIST_FANOUT_TIMEOUT_MS).then(() => {
+							const deadline = sleep(HEARTBEAT_LIST_FANOUT_TIMEOUT_MS, { unref: true }).then(() => {
 								throw new Error(
 									`Timed out listing heartbeats on worker ${workerId} within ${HEARTBEAT_LIST_FANOUT_TIMEOUT_MS}ms`,
 								);
@@ -4395,7 +4388,7 @@ export class DaemonSupervisor {
 		this.scheduleWorkerStopFinalization(worker);
 		const finalization = worker.stopFinalization;
 		if (finalization) {
-			await Promise.race([finalization.catch(() => undefined), unrefDelay(STALE_RECLAIM_WAIT_MS)]);
+			await Promise.race([finalization.catch(() => undefined), sleep(STALE_RECLAIM_WAIT_MS, { unref: true })]);
 		}
 		if (this.workers.get(worker.descriptor.workerId) === worker) {
 			// The process is confirmed dead, so the registration must never be
@@ -4766,7 +4759,7 @@ export class DaemonSupervisor {
 				}
 				const remaining = deadline - Date.now();
 				if (remaining <= 0) break;
-				await delay(Math.min(backoffMs, remaining));
+				await sleep(Math.min(backoffMs, remaining));
 				backoffMs = Math.min(backoffMs * 2, WORKER_PROBE_BACKOFF_MAX_MS);
 			}
 		}
@@ -5398,7 +5391,7 @@ export class DaemonSupervisor {
 			// SIGKILL is uninterceptable; this wait only covers kernel teardown of the old process and socket.
 			const killDeadline = Date.now() + 1000;
 			while (identity() === "current" && Date.now() < killDeadline) {
-				await delay(25);
+				await sleep(25);
 			}
 		}
 		const finalIdentity = identity();
@@ -5547,7 +5540,7 @@ export class DaemonSupervisor {
 
 	private async resumeDeferredWorkerRecovery(worker: ResidentWorker, disconnectError: Error): Promise<void> {
 		while (true) {
-			await unrefDelay(DEFERRED_RECOVERY_RECHECK_MS);
+			await sleep(DEFERRED_RECOVERY_RECHECK_MS, { unref: true });
 			if (!this.isWorkerRecoveryCandidate(worker)) {
 				return;
 			}
@@ -5803,7 +5796,7 @@ export class DaemonSupervisor {
 		worker.recovery = (async () => {
 			let keepProbingLiveWorker = false;
 			for (const retryDelay of WORKER_RETRY_DELAYS_MS) {
-				await delay(retryDelay);
+				await sleep(retryDelay);
 				keepProbingLiveWorker = false;
 				if (this.isWorkerRecoveryCancelled(worker)) {
 					return;
@@ -7426,7 +7419,7 @@ export class DaemonSupervisor {
 		}
 		await this.raceDeliveryAbort(
 			entry,
-			unrefDelay(this.pendingDeliveryRetryIntervalMs ?? PENDING_DELIVERY_RETRY_INTERVAL_MS),
+			sleep(this.pendingDeliveryRetryIntervalMs ?? PENDING_DELIVERY_RETRY_INTERVAL_MS, { unref: true }),
 		);
 	}
 
@@ -9860,7 +9853,7 @@ export class DaemonSupervisor {
 		};
 		const gracefulDeadline = Date.now() + (force ? 500 : 2000);
 		while (isWorkerProcessAlive() && Date.now() < gracefulDeadline) {
-			await delay(25);
+			await sleep(25);
 		}
 		let sigkillSent = false;
 		if (force && isWorkerProcessAlive()) {
@@ -9873,7 +9866,7 @@ export class DaemonSupervisor {
 			}
 			const forceDeadline = Date.now() + 1000;
 			while (isWorkerProcessAlive() && Date.now() < forceDeadline) {
-				await delay(25);
+				await sleep(25);
 			}
 		}
 		if (isWorkerProcessAlive()) {
@@ -10019,7 +10012,7 @@ export class DaemonSupervisor {
 					killed = true;
 				}
 			}
-			await unrefDelay(STOP_FINALIZATION_RECHECK_MS);
+			await sleep(STOP_FINALIZATION_RECHECK_MS, { unref: true });
 		}
 		// Retry transient cleanup failures (for example catalog archival) so a
 		// dead worker's registration is never stranded permanently. Each attempt
@@ -10036,7 +10029,7 @@ export class DaemonSupervisor {
 				return;
 			} catch (error) {
 				this.reportCleanupFailure(`timed-out worker stop ${worker.descriptor.workerId}`, error);
-				await unrefDelay(STOP_FINALIZATION_RETRY_MS);
+				await sleep(STOP_FINALIZATION_RETRY_MS, { unref: true });
 			}
 		}
 	}

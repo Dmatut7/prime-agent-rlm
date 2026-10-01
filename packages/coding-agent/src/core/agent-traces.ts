@@ -7,6 +7,7 @@ import { appendRotatingLog, getAgentDir, getAgentTracesLogPath, getSessionsDir, 
 import { readFirstLineSync } from "../utils/file-lines.js";
 import { backgroundNetworkOptOut } from "../utils/privacy-opt-out.js";
 import { ensurePrivateDirectory, tightenPrivateFileMode, writePrivateFileAtomic } from "../utils/private-files.js";
+import { sleep } from "../utils/sleep.js";
 import type { AuthStorage } from "./auth-storage.js";
 import {
 	loadPrimeCliConfig,
@@ -84,10 +85,6 @@ export interface AgentTraceUploadOptions {
 	signal?: AbortSignal;
 	/** Reports every wait the upload arms before its next request. */
 	onUploadDelay?: (delay: AgentTraceUploadDelay) => void;
-}
-
-export interface AgentTraceSessionUploadOptions extends Omit<AgentTraceUploadOptions, "sessionFile"> {
-	sessionManager: SessionManager;
 }
 
 export interface AgentTraceUploadSchedule {
@@ -399,24 +396,6 @@ async function fetchWithTimeout(
 	}
 }
 
-function delay(ms: number, signal?: AbortSignal): Promise<void> {
-	return new Promise((resolve) => {
-		if (signal?.aborted) {
-			resolve();
-			return;
-		}
-		const timeout = setTimeout(finish, ms);
-		timeout.unref();
-		const onAbort = () => finish();
-		function finish() {
-			clearTimeout(timeout);
-			signal?.removeEventListener("abort", onAbort);
-			resolve();
-		}
-		signal?.addEventListener("abort", onAbort, { once: true });
-	});
-}
-
 function traceUploadRetryDelay(retryIndex: number): number {
 	const exponentialDelay = Math.min(
 		TRACE_UPLOAD_RETRY_MAX_DELAY_MS,
@@ -481,7 +460,9 @@ async function fetchWithRetry(request: TraceUploadRequest): Promise<Response> {
 		if (!signal?.aborted) {
 			onUploadDelay?.({ reason: "retry-backoff", delayMs: backoffMs });
 		}
-		await delay(backoffMs, signal);
+		// resolveOnAbort keeps cancellation on the signal.reason throw below instead
+		// of turning it into a bare "Aborted" error.
+		await sleep(backoffMs, { signal, unref: true, resolveOnAbort: true });
 		if (signal?.aborted) {
 			throw signal.reason ?? new Error("Trace upload cancelled");
 		}
@@ -600,7 +581,7 @@ function createTraceUploadAllRequestGate(
 			const waitMs = Math.max(0, nextRequestAt - Date.now());
 			if (waitMs > 0) {
 				onUploadDelay?.({ reason: "rate-limit", delayMs: waitMs });
-				await delay(waitMs, signal);
+				await sleep(waitMs, { signal, unref: true, resolveOnAbort: true });
 			}
 			if (!signal?.aborted) {
 				nextRequestAt = Date.now() + TRACE_UPLOAD_ALL_MIN_REQUEST_INTERVAL_MS;
@@ -1246,13 +1227,6 @@ async function performAgentTraceUpload(
 		bytesStored: responseData ? (numberField(responseData, "bytes_stored") ?? bodyBytes) : bodyBytes,
 		key: responseData ? stringField(responseData, "key") : undefined,
 	};
-}
-
-export function uploadAgentTraceSession(options: AgentTraceSessionUploadOptions): Promise<AgentTraceUploadResult> {
-	return uploadAgentTraceFile({
-		...options,
-		sessionFile: options.sessionManager.getSessionFile(),
-	});
 }
 
 /** Bounds whenIdle() drain loops so a retry that re-arms cannot spin forever. */
