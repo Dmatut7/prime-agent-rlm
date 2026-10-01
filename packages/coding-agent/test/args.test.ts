@@ -8,8 +8,8 @@ describe("parseArgs", () => {
 			expect(result.version).toBe(true);
 		});
 
-		test("parses -v shorthand", () => {
-			const result = parseArgs(["-v"]);
+		test("parses -V shorthand", () => {
+			const result = parseArgs(["-V"]);
 			expect(result.version).toBe(true);
 		});
 
@@ -440,6 +440,13 @@ describe("parseArgs", () => {
 		test("parses --verbose flag", () => {
 			const result = parseArgs(["--verbose"]);
 			expect(result.verbose).toBe(true);
+		});
+
+		test("parses -v shorthand", () => {
+			const result = parseArgs(["-v"]);
+			expect(result.verbose).toBe(true);
+			// CLI convention: lowercase -v is verbose, uppercase -V is version.
+			expect(result.version).toBeUndefined();
 		});
 	});
 

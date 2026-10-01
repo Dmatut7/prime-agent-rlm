@@ -13384,7 +13384,9 @@ export class InteractiveMode {
 		let info: string;
 		try {
 			const tree = await this.agentConnection.getContextTree();
-			const width = Math.max(60, Math.min(this.ui.terminal.columns - 2, 120));
+			// Let narrow terminals through instead of pinning the render width to 60:
+			// below 62 columns the formatter switches to a one-line-per-agent layout.
+			const width = Math.min(Math.max(this.ui.terminal.columns - 2, 24), 120);
 			info = formatContextTree(tree, width, this.spendPricing());
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));

@@ -398,8 +398,12 @@ process is serving the protocol (importing the module does not count).
 `snapshot` serializes the user namespace with `dill` (recurse mode), one name
 at a time: `_`-prefixed names and
 `{rlm, mcp, bash, asyncio, In, Out, get_ipython, exit, quit, open}` are always
-skipped; a name whose pickle exceeds `max_variable_bytes` or would push the
-total over `max_bytes` is skipped and reported. With `prune_oversized`, only
+skipped; a skipped `_`-prefixed name that is not a dunder (`__x__`) is reported
+in `skipped` — the private-name convention keeps it out of the snapshot, but a
+user who bound one may still expect it back after a restart — while dunder
+names and the kernel-installed names above are dropped without a report. A name
+whose pickle exceeds `max_variable_bytes` or would push the total over
+`max_bytes` is skipped and reported. With `prune_oversized`, only
 names exceeding the per-variable cap (`max_variable_bytes`) are also deleted
 from the namespace and listed in `pruned`; names skipped for the aggregate
 `max_bytes` cap are reported in `skipped` but kept in the namespace. The

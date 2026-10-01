@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, getModel, type Usage } from "@earendil-works/pi-ai";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
@@ -562,5 +563,110 @@ describe("formatContextTree with price overrides", () => {
 		);
 		expect(output).toContain("Prices");
 		expect(output).toContain("bailian/qwen3.8-flash: no model in this tree matches this override key");
+	});
+
+	it("aligns the source column by visible width when a model id contains wide characters", () => {
+		// Padding by string length under-pads a CJK model id (2 chars, 4 columns), which
+		// pushed the source column two cells right for that row.
+		const tree = node({
+			model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+			ownUsage: createUsage(900, 100, 0.01),
+			totalUsage: createUsage(900, 100, 0.01),
+			children: [
+				node({
+					id: "sub-aaaa1111",
+					label: "worker",
+					status: "done",
+					model: { provider: "bailian", id: "模型-x" },
+					ownUsage: createUsage(1_000_000, 0, 1),
+					totalUsage: createUsage(1_000_000, 0, 1),
+				}),
+			],
+		});
+		const output = stripAnsi(formatContextTree(tree, 100, pricing({ "bailian/模型-x": { input: 7 } })));
+		const rows = output.split("\n");
+		const asciiRow = rows.find(
+			(line) => line.includes("anthropic/claude-sonnet-4-5") && line.includes("models.json"),
+		);
+		const wideRow = rows.find((line) => line.includes("bailian/模型-x") && line.includes("override"));
+		expect(asciiRow).toBeDefined();
+		expect(wideRow).toBeDefined();
+		const asciiColumn = visibleWidth(asciiRow!.slice(0, asciiRow!.indexOf("models.json")));
+		const wideColumn = visibleWidth(wideRow!.slice(0, wideRow!.indexOf("override")));
+		expect(wideColumn).toBe(asciiColumn);
+	});
+});
+
+/**
+ * Below 62 columns the aligned table cannot fit, so the formatter switches to one
+ * truncated line per agent. The guarantee a narrow terminal needs is that no line
+ * exceeds the width: an overlong row wraps or clamps and garbles the tree.
+ */
+describe("formatContextTree compact layout", () => {
+	function node(overrides: Partial<ContextTreeNode>): ContextTreeNode {
+		return {
+			id: "root",
+			label: "main agent",
+			status: "active",
+			ownUsage: emptyUsage(),
+			totalUsage: emptyUsage(),
+			children: [],
+			...overrides,
+		};
+	}
+
+	function busyTree(): ContextTreeNode {
+		return node({
+			model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+			ownUsage: createUsage(40000, 5200, 0.84),
+			totalUsage: createUsage(52100, 5950, 1.1),
+			contextUsage: { tokens: 62300, contextWindow: 200000, percent: 31.15 },
+			children: [
+				node({
+					id: "sub-aaaa1111",
+					label: "summarize the authentication module in detail",
+					status: "done",
+					ownUsage: createUsage(12100, 750, 0.21),
+					totalUsage: createUsage(12100, 750, 0.21),
+					contextUsage: { tokens: 18000, contextWindow: 200000, percent: 9 },
+				}),
+			],
+		});
+	}
+
+	it("renders one line per agent and keeps every line inside the width", () => {
+		const width = 44;
+		const output = formatContextTree(busyTree(), width);
+		const plain = stripAnsi(output);
+		expect(plain).toContain("tokens · cost · context");
+		expect(plain).toContain("$0.84");
+		expect(plain).toContain("31%");
+		// The aligned table with its column header is gone.
+		expect(plain).not.toContain("spend: whole session, every branch");
+		for (const line of output.split("\n")) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+	});
+
+	it("clamps rows whose tree prefix alone would exceed the width", () => {
+		let deep = node({ id: "leaf", label: "deepest worker", status: "running", ownUsage: createUsage(100, 10, 0.01) });
+		for (let depth = 0; depth < 8; depth++) {
+			deep = node({ id: `d${depth}`, label: `agent ${depth}`, status: "done", children: [deep] });
+		}
+		const width = 30;
+		// Only the tree rows carry the no-overflow guarantee; plain text lines (totals,
+		// model) are word-wrapped by the chat renderer and may exceed it.
+		const rows = formatContextTree(deep, width)
+			.split("\n")
+			.filter((line) => /[●◇◆✓✗]/.test(stripAnsi(line)));
+		expect(rows.length).toBe(9);
+		for (const row of rows) {
+			expect(visibleWidth(row)).toBeLessThanOrEqual(width);
+		}
+	});
+
+	it("keeps the aligned table at 62 columns and switches below it", () => {
+		expect(stripAnsi(formatContextTree(busyTree(), 62))).toContain("spend: whole session, every branch");
+		expect(stripAnsi(formatContextTree(busyTree(), 61))).not.toContain("spend: whole session, every branch");
 	});
 });

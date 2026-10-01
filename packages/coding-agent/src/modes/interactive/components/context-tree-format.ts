@@ -15,6 +15,12 @@ import { theme } from "../theme/theme.js";
 
 const CONTEXT_BAR_WIDTH = 10;
 const MIN_LABEL_WIDTH = 16;
+/**
+ * Below this width the aligned table cannot fit: the label column would sit at
+ * its floor and the rows would still overflow. Narrow terminals get one
+ * truncated line per agent instead of columns.
+ */
+const COMPACT_LAYOUT_WIDTH = 62;
 
 interface ContextTreeRow {
 	node: ContextTreeNode;
@@ -79,6 +85,17 @@ function formatContextColumn(contextUsage: ContextUsage | undefined, withBar: bo
 	const barColor = contextUsage.percent >= 80 ? "warning" : "accent";
 	const bar = theme.fg(barColor, "▓".repeat(filled)) + theme.fg("dim", "░".repeat(CONTEXT_BAR_WIDTH - filled));
 	return `${bar} ${text}`;
+}
+
+/** The context column squeezed to its percent for the compact one-line layout. */
+function formatContextCompact(contextUsage: ContextUsage | undefined): string {
+	if (!contextUsage) {
+		return "-";
+	}
+	if (contextUsage.tokens === null || contextUsage.percent === null) {
+		return "?";
+	}
+	return `${Math.round(contextUsage.percent)}%`;
 }
 
 function padEndAnsi(text: string, width: number): string {
@@ -178,10 +195,10 @@ function formatPriceSources(root: ContextTreeNode, pricing: SpendPricing | undef
 	if (rows.length === 0) {
 		return lines;
 	}
-	const modelWidth = Math.max(...rows.map((row) => row.model.length));
+	const modelWidth = Math.max(...rows.map((row) => visibleWidth(row.model)));
 	for (const row of rows) {
 		const source = row.source === "override" ? theme.fg("accent", "override") : theme.fg("dim", "models.json");
-		lines.push(`${theme.fg("dim", `  ${row.model.padEnd(modelWidth)}`)}  ${source}`);
+		lines.push(`${theme.fg("dim", `  ${padEndAnsi(row.model, modelWidth)}`)}  ${source}`);
 	}
 	return lines;
 }
@@ -237,25 +254,43 @@ export function formatContextTree(root: ContextTreeNode, width: number, pricing?
 		lines.push("");
 	}
 
-	lines.push(
-		theme.fg(
-			"dim",
-			`${" ".repeat(2)}${padEndAnsi("agent", labelWidth)}  ${padStartAnsi(tokenHeader, tokenWidth)}  ${padStartAnsi(costHeader, costWidth)}  ${contextHeader}`,
-		),
-	);
-	lines.push(theme.fg("dim", `${" ".repeat(2)}spend: whole session, every branch · context: current branch`));
-
-	for (const [index, row] of rows.entries()) {
-		const labelSpace = Math.max(1, labelWidth - row.prefix.length - 2);
-		const label = truncateToWidth(row.node.label, labelSpace, "...");
-		const labelCell = padEndAnsi(
-			`${theme.fg("dim", row.prefix)}${statusIcon(row.node.status)} ${label}`,
-			labelWidth + 2,
+	const compact = width < COMPACT_LAYOUT_WIDTH;
+	if (compact) {
+		lines.push(theme.fg("dim", "  tokens · cost · context"));
+		for (const [index, row] of rows.entries()) {
+			const suffix = ` ${tokenCells[index]} ${costCells[index]} ${formatContextCompact(row.node.contextUsage)}`;
+			const labelSpace = Math.max(1, width - row.prefix.length - 2 - visibleWidth(suffix));
+			const label = truncateToWidth(row.node.label, labelSpace, "...");
+			// A deep tree prefix can eat the whole budget by itself; clamp the finished
+			// line so no row ever exceeds the terminal and garbles what follows it.
+			lines.push(
+				truncateToWidth(
+					`${theme.fg("dim", row.prefix)}${statusIcon(row.node.status)} ${label}${theme.fg("dim", suffix)}`,
+					width,
+				),
+			);
+		}
+	} else {
+		lines.push(
+			theme.fg(
+				"dim",
+				`${" ".repeat(2)}${padEndAnsi("agent", labelWidth)}  ${padStartAnsi(tokenHeader, tokenWidth)}  ${padStartAnsi(costHeader, costWidth)}  ${contextHeader}`,
+			),
 		);
-		const tokenCell = padStartAnsi(tokenCells[index], tokenWidth);
-		const costCell = padStartAnsi(theme.fg("dim", costCells[index]), costWidth);
-		const contextCell = formatContextColumn(row.node.contextUsage, row.node.id === "root");
-		lines.push(`${labelCell}  ${tokenCell}  ${costCell}  ${contextCell}`);
+		lines.push(theme.fg("dim", `${" ".repeat(2)}spend: whole session, every branch · context: current branch`));
+
+		for (const [index, row] of rows.entries()) {
+			const labelSpace = Math.max(1, labelWidth - row.prefix.length - 2);
+			const label = truncateToWidth(row.node.label, labelSpace, "...");
+			const labelCell = padEndAnsi(
+				`${theme.fg("dim", row.prefix)}${statusIcon(row.node.status)} ${label}`,
+				labelWidth + 2,
+			);
+			const tokenCell = padStartAnsi(tokenCells[index], tokenWidth);
+			const costCell = padStartAnsi(theme.fg("dim", costCells[index]), costWidth);
+			const contextCell = formatContextColumn(row.node.contextUsage, row.node.id === "root");
+			lines.push(`${labelCell}  ${tokenCell}  ${costCell}  ${contextCell}`);
+		}
 	}
 
 	// A capped scan is a partial roster: name what is missing instead of letting the
@@ -263,9 +298,8 @@ export function formatContextTree(root: ContextTreeNode, width: number, pricing?
 	const scanTotals = sumScanDiagnostics(root);
 	if (scanTotals.skipped > 0) {
 		const detail = `(scan budget: ${scanTotals.reasons.join(", ") || "reached"}; ${scanTotals.scanned} child sessions read, ${formatScannedBytes(scanTotals.bytesRead)})`;
-		lines.push(
-			`${theme.fg("warning", `${scanTotals.skipped.toLocaleString()}+ more agents not shown`)} ${theme.fg("dim", detail)}`,
-		);
+		const line = `${theme.fg("warning", `${scanTotals.skipped.toLocaleString()}+ more agents not shown`)} ${theme.fg("dim", detail)}`;
+		lines.push(compact ? truncateToWidth(line, width) : line);
 	}
 
 	const totals = sumOwnUsage(root);

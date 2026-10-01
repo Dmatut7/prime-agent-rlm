@@ -62,7 +62,7 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 
 | Keybinding id | Default | Description |
 |--------|---------|-------------|
-| `tui.editor.yank` | `ctrl+y` | Paste most recently deleted text |
+| `tui.editor.yank` | `ctrl+y` | Paste most recently deleted text. While the stall action bar (or its diagnostics block) is showing, `ctrl+y` belongs to `app.stall.diagnostics` and does not yank |
 | `tui.editor.yankPop` | `alt+y` | Cycle through deleted text after yank |
 | `tui.editor.undo` | `ctrl+-` | Undo last edit |
 | `tui.editor.insertSpace` | `shift+space` | Insert a space from shifted space |
@@ -98,14 +98,14 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 |--------|---------|-------------|
 | `app.interrupt` | *(none)* | Interrupt current operation |
 | `app.clear` | `ctrl+c` | Interrupt current operation, then exit |
-| `app.input.clear` | `escape` | Clear input |
+| `app.input.clear` | `escape` | Clear input. Double duty: while the agent is streaming (or other work is running), the same key interrupts the current operation instead of clearing |
 | `app.exit` | `ctrl+d` | Exit (when editor empty) |
 | `app.suspend` | `ctrl+z` (none on Windows) | Suspend to background |
 | `app.editor.external` | `ctrl+g` | Open in external editor (`$VISUAL` or `$EDITOR`) |
 | `app.clipboard.pasteImage` | `ctrl+v` (`alt+v` on Windows) | Paste image from clipboard |
 | `app.clipboard.copyLoginUrl` | `c`, `alt+c` | Copy the sign-in URL from a login dialog |
 | `app.shortcuts` | `?` | Show keyboard shortcuts |
-| `app.prompt.stash` | `ctrl+s` | Stash or restore draft prompt |
+| `app.prompt.stash` | `ctrl+s` | Stash or restore draft prompt. In terminals where software flow control (IXON) is not disabled, `ctrl+s` never reaches the app: it freezes terminal output (XOFF) until `ctrl+q` — rebind this action there |
 | `app.modal.back` | `left` | Go back / close the current dialog |
 | `app.subagents.focus` | `alt+a` | Open child agents |
 | `app.subagents.stopAll` | `alt+x` | Stop every running subagent of this session (press again to confirm); also works in the agents view for the selected agent's family |

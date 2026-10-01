@@ -232,7 +232,7 @@ export function parseArgs(rawArgs: string[]): Args {
 
 		if (arg === "--help" || arg === "-h") {
 			result.help = true;
-		} else if (arg === "--version" || arg === "-v") {
+		} else if (arg === "--version" || arg === "-V") {
 			result.version = true;
 		} else if (arg === "--mode") {
 			if (i + 1 >= args.length) {
@@ -430,7 +430,7 @@ export function parseArgs(rawArgs: string[]): Args {
 				type: "error",
 				message: `--list-models was removed. Use "${APP_NAME} model list [search]".`,
 			});
-		} else if (arg === "--verbose") {
+		} else if (arg === "--verbose" || arg === "-v") {
 			result.verbose = true;
 		} else if (arg === "--offline") {
 			result.offline = true;
