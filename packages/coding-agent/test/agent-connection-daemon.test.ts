@@ -92,6 +92,18 @@ class FakeDaemonClient {
 	readonly requests: DaemonCommand[] = [];
 	readonly requestTimeouts: number[] = [];
 	attachResultFactory: ((command: Extract<DaemonCommand, { type: "attach" }>) => DaemonAttachResult) | undefined;
+	/** Overrides the reattach response, exactly what a daemon would send. */
+	reattachResultFactory: ((command: Extract<DaemonCommand, { type: "reattach" }>) => DaemonAttachResult) | undefined;
+	/** Overrides the get_messages response; receives the command so before/limit are visible. */
+	getMessagesWindowFactory:
+		| ((command: Extract<DaemonCommand, { type: "get_messages" }>) => {
+				messages: AgentMessage[];
+				totalMessages?: number;
+				firstIndex?: number;
+		  })
+		| undefined;
+	/** When set, switch_session fails the way a daemon does for an already-attached session. */
+	switchSessionAlreadyActive: { sessionPath: string; activeSessionId: string } | undefined;
 	restoredAttachGate: Promise<void> | undefined;
 	restoredAttachCompleted = 0;
 	closeCount = 0;
@@ -219,12 +231,30 @@ class FakeDaemonClient {
 						createConnectionState(command.activeSessionId, "session-current"),
 				};
 			case "get_messages":
+				if (this.getMessagesWindowFactory) {
+					return {
+						type: "response",
+						command: command.type,
+						success: true,
+						data: this.getMessagesWindowFactory(command),
+					};
+				}
 				return {
 					type: "response",
 					command: command.type,
 					success: true,
 					data: { messages: [{ role: "user", content: "current prompt", timestamp: 4 }] },
 				};
+			case "reattach":
+				if (this.reattachResultFactory) {
+					return {
+						type: "response",
+						command: command.type,
+						success: true,
+						data: this.reattachResultFactory(command),
+					};
+				}
+				throw new Error(`Unexpected command: ${command.type}`);
 			case "get_rlm_children":
 				await this.rlmChildrenGate;
 				return {
@@ -577,6 +607,19 @@ class FakeDaemonClient {
 					},
 				};
 			case "switch_session":
+				if (this.switchSessionAlreadyActive) {
+					return {
+						type: "response",
+						command: command.type,
+						success: false,
+						error: "Session is already active in another client",
+						errorInfo: {
+							code: "session_already_active",
+							sessionPath: this.switchSessionAlreadyActive.sessionPath,
+							activeSessionId: this.switchSessionAlreadyActive.activeSessionId,
+						},
+					};
+				}
 				return {
 					type: "response",
 					command: command.type,
@@ -3033,6 +3076,7 @@ describe("DaemonAgentConnection", () => {
 				"streaming_deltas",
 				"streaming_delta_fragments",
 				"quota_park_status",
+				"slim_attach_transcript",
 			],
 			resumeCursor: {
 				activeSessionId: "active-1",
@@ -3595,6 +3639,155 @@ describe("DaemonAgentConnection", () => {
 		expect(roundTrip).toEqual(wire);
 	});
 
+	it("declares slim_attach_transcript on attach and mirrors the snapshot's messagesOmitted (rev 44)", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const tail: AgentMessage[] = [{ role: "user", content: "tail prompt", timestamp: 100 }];
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12, {
+				messages: tail,
+			});
+			// The daemon fills snapshot.messagesOmitted only for clients that declared
+			// the capability, and only when history was actually held back.
+			return { ...result, snapshot: { ...result.snapshot, messagesOmitted: 250 } };
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		expect(fakeClient.requests[0]).toMatchObject({
+			type: "attach",
+			capabilities: expect.arrayContaining(["slim_attach_transcript"]) as unknown as string[],
+		});
+		const snapshot = await connection.getInitialSnapshot();
+		expect(snapshot.messages).toEqual(tail);
+		expect(snapshot.messagesOmitted).toBe(250);
+		await connection.dispose();
+	});
+
+	it("keeps messagesOmitted absent on a full-transcript (old-daemon) snapshot", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		const snapshot = await connection.getInitialSnapshot();
+		expect(snapshot.messagesOmitted).toBeUndefined();
+		expect("messagesOmitted" in snapshot).toBe(false);
+		await connection.dispose();
+	});
+
+	it("declares slim_attach_transcript on reattach after a session switch conflict", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.switchSessionAlreadyActive = { sessionPath: "/tmp/other.jsonl", activeSessionId: "active-target" };
+		fakeClient.reattachResultFactory = (command) =>
+			createAttachResult(command.targetActiveSessionId, command.clientId, command.capabilities, 20, {
+				state: createConnectionState(command.targetActiveSessionId, "session-target"),
+			});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		await expect(connection.switchSession("/tmp/other.jsonl")).resolves.toEqual({ cancelled: false });
+
+		const reattach = fakeClient.requests.find((request) => request.type === "reattach");
+		expect(reattach).toMatchObject({
+			type: "reattach",
+			activeSessionId: "active-1",
+			targetActiveSessionId: "active-target",
+			capabilities: expect.arrayContaining(["slim_attach_transcript"]) as unknown as string[],
+		});
+		await connection.dispose();
+	});
+
+	it("sends get_messages before/limit for a slim backfill and passes the window facts through", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("slim_attach_transcript");
+		const page: AgentMessage[] = [{ role: "user", content: "older prompt", timestamp: 50 }];
+		fakeClient.getMessagesWindowFactory = (command) => {
+			expect(command).toMatchObject({ type: "get_messages", activeSessionId: "active-1", before: 250, limit: 100 });
+			return { messages: page, totalMessages: 350, firstIndex: 150 };
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		await expect(connection.getMessagesWindow({ before: 250, limit: 100 })).resolves.toEqual({
+			messages: page,
+			totalMessages: 350,
+			firstIndex: 150,
+		});
+		await connection.dispose();
+	});
+
+	it("refuses a paged get_messages read against a daemon without the capability", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		await expect(connection.getMessagesWindow({ before: 250, limit: 100 })).rejects.toBeInstanceOf(
+			DaemonCapabilityUnavailableError,
+		);
+		// The refusal is local: no request goes out with fields an old daemon would ignore.
+		expect(fakeClient.requests.filter((request) => request.type === "get_messages")).toHaveLength(0);
+		await connection.dispose();
+	});
+
+	it("defaults the window facts for an old daemon's bare get_messages answer", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const full: AgentMessage[] = [
+			{ role: "user", content: "first", timestamp: 1 },
+			{ role: "user", content: "second", timestamp: 2 },
+		];
+		fakeClient.getMessagesWindowFactory = (command) => {
+			// An old daemon ignores unknown fields and answers the bare shape.
+			expect(command).not.toHaveProperty("before");
+			expect(command).not.toHaveProperty("limit");
+			return { messages: full };
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		await expect(connection.getMessagesWindow()).resolves.toEqual({
+			messages: full,
+			totalMessages: 2,
+			firstIndex: 0,
+		});
+		await connection.dispose();
+	});
+
+	it("getMessages re-reads the full transcript instead of serving a slim snapshot's tail", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const tail: AgentMessage[] = [{ role: "user", content: "tail prompt", timestamp: 100 }];
+		const full: AgentMessage[] = [
+			{ role: "user", content: "first prompt", timestamp: 1 },
+			{ role: "user", content: "tail prompt", timestamp: 100 },
+		];
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12, {
+				messages: tail,
+			});
+			return { ...result, snapshot: { ...result.snapshot, messagesOmitted: 250 } };
+		};
+		fakeClient.getMessagesWindowFactory = (command) => {
+			expect(command).not.toHaveProperty("before");
+			return { messages: full, totalMessages: full.length, firstIndex: 0 };
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		// The cached slim snapshot is fresh, but getMessages callers expect everything.
+		await expect(connection.getMessages()).resolves.toEqual(full);
+		expect(fakeClient.requests.filter((request) => request.type === "get_messages")).toHaveLength(1);
+		await connection.dispose();
+	});
+
+	it("getMessages serves the cached snapshot when it holds the complete transcript", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		const snapshot = await connection.getInitialSnapshot();
+		await expect(connection.getMessages()).resolves.toEqual(snapshot.messages);
+		// No get_messages round-trip: the fresh snapshot was complete.
+		expect(fakeClient.requests.filter((request) => request.type === "get_messages")).toHaveLength(0);
+		await connection.dispose();
+	});
+
 	it("maps resume_queue outcomes: drained, empty queue, and real errors", async () => {
 		const fakeClient = new FakeDaemonClient();
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
@@ -3937,6 +4130,7 @@ describe("DaemonAgentConnection", () => {
 				"streaming_deltas",
 				"streaming_delta_fragments",
 				"quota_park_status",
+				"slim_attach_transcript",
 			],
 			resumeCursor: {
 				activeSessionId: "active-1",
@@ -3958,6 +4152,7 @@ describe("DaemonAgentConnection", () => {
 				"streaming_deltas",
 				"streaming_delta_fragments",
 				"quota_park_status",
+				"slim_attach_transcript",
 			],
 			resumeCursor: {
 				activeSessionId: "active-1",
@@ -4026,6 +4221,7 @@ describe("DaemonAgentConnection", () => {
 				"streaming_deltas",
 				"streaming_delta_fragments",
 				"quota_park_status",
+				"slim_attach_transcript",
 			],
 		});
 

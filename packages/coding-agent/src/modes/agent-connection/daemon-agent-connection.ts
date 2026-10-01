@@ -70,6 +70,7 @@ import type {
 	AgentConnectionForkOptions,
 	AgentConnectionHeadlessCompletionOptions,
 	AgentConnectionHeartbeat,
+	AgentConnectionMessagesWindow,
 	AgentConnectionModel,
 	AgentConnectionModelCatalog,
 	AgentConnectionModelCycleResult,
@@ -573,6 +574,12 @@ export class DaemonAgentConnection implements AgentConnection {
 					// parked session, so an attach into a park seeds the countdown
 					// instead of sitting blind until the next heartbeat.
 					"quota_park_status",
+					// rev 44: the attach snapshot's transcript arrives as a tail
+					// window plus messagesOmitted instead of the full history; the
+					// interactive view renders the omission marker and backfills
+					// older pages through get_messages before/limit. getMessages()
+					// keeps serving the full transcript to every other consumer.
+					"slim_attach_transcript",
 					...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
 				],
 				env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
@@ -790,7 +797,12 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async getMessages(): Promise<AgentMessage[]> {
-		if (this.latestSnapshotIsFresh && this.latestSnapshot) {
+		// A slim-attached snapshot (rev 44, messagesOmitted set) holds only the tail
+		// window. getMessages callers (RPC/ACP/print/debug surfaces) expect the
+		// complete transcript, so the cached tail does not serve them: read the
+		// full list. getInitialSnapshot() stays the slim path - it is what the
+		// interactive view renders.
+		if (this.latestSnapshotIsFresh && this.latestSnapshot && this.latestSnapshot.messagesOmitted === undefined) {
 			return this.latestSnapshot.messages;
 		}
 		const data = await this.requestData<{ messages: AgentMessage[] }>({
@@ -798,6 +810,33 @@ export class DaemonAgentConnection implements AgentConnection {
 			activeSessionId: this.activeSessionId,
 		});
 		return data.messages;
+	}
+
+	/**
+	 * The paged transcript read behind the slim attach backfill (rev 44,
+	 * capability slim_attach_transcript). An old daemon answers the bare
+	 * get_messages shape ({ messages }) and ignores before/limit, so the window
+	 * fields are only sent when the daemon advertised the capability; the
+	 * response facts then default to the full-list shape.
+	 */
+	async getMessagesWindow(options: { before?: number; limit?: number } = {}): Promise<AgentConnectionMessagesWindow> {
+		if (
+			(options.before !== undefined || options.limit !== undefined) &&
+			!this.client.supportsServerCapability("slim_attach_transcript")
+		) {
+			throw new DaemonCapabilityUnavailableError("get_messages", "slim_attach_transcript");
+		}
+		const data = await this.requestData<{ messages: AgentMessage[]; totalMessages?: number; firstIndex?: number }>({
+			type: "get_messages",
+			activeSessionId: this.activeSessionId,
+			...(options.before !== undefined ? { before: options.before } : {}),
+			...(options.limit !== undefined ? { limit: options.limit } : {}),
+		});
+		return {
+			messages: data.messages,
+			totalMessages: data.totalMessages ?? data.messages.length,
+			firstIndex: data.firstIndex ?? 0,
+		};
 	}
 
 	async getSessionHeader(): Promise<AgentConnectionSessionHeader | undefined> {
@@ -1703,6 +1742,9 @@ export class DaemonAgentConnection implements AgentConnection {
 					// parked session, so an attach into a park seeds the countdown
 					// instead of sitting blind until the next heartbeat.
 					"quota_park_status",
+					// rev 44: see attach(). The replacement snapshot for a reattach
+					// arrives windowed with messagesOmitted, exactly like an attach.
+					"slim_attach_transcript",
 					...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
 				],
 				env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
@@ -3256,6 +3298,11 @@ function mapDaemonSessionSnapshot(snapshot: DaemonSessionSnapshot, replay?: Daem
 	}
 	if (snapshot.quotaPark) {
 		connectionSnapshot.quotaPark = snapshot.quotaPark;
+	}
+	// Rev 44: present only when the attach was slim and history was held back;
+	// absence means `messages` is the complete transcript.
+	if (snapshot.messagesOmitted !== undefined) {
+		connectionSnapshot.messagesOmitted = snapshot.messagesOmitted;
 	}
 	if (replay) {
 		connectionSnapshot.replay = replay;

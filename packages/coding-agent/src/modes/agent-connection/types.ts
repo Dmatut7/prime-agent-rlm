@@ -362,6 +362,20 @@ export interface AgentConnectionSessionContext {
 	model: { provider: string; modelId: string } | null;
 }
 
+/**
+ * One paged read of the transcript (daemon protocol rev 44, capability
+ * slim_attach_transcript): mirrors DaemonGetMessagesWindow in daemon-protocol.ts.
+ * `firstIndex` + `messages.length` locates the window inside the full transcript,
+ * and `totalMessages` reconciles it against what the session holds.
+ */
+export interface AgentConnectionMessagesWindow {
+	messages: AgentMessage[];
+	/** Total messages in the transcript, regardless of the returned window. */
+	totalMessages: number;
+	/** Index of messages[0] in the full transcript; 0 for an unpaginated read. */
+	firstIndex: number;
+}
+
 export type AgentConnectionReplayStatus = "complete" | "partial" | "unavailable";
 
 export interface AgentConnectionReplayInfo {
@@ -408,12 +422,23 @@ export interface AgentConnectionSnapshotQuotaPark {
 export interface AgentConnectionSnapshot {
 	state: AgentConnectionState;
 	messages: AgentMessage[];
+	/**
+	 * Slim attach transcript (daemon protocol rev 44, capability
+	 * slim_attach_transcript): how many leading messages were omitted from
+	 * `messages`, which then holds only the tail window. Absent means `messages`
+	 * is the complete transcript - both on the old-daemon wire and when the
+	 * session fits the window. Older history is backfilled through
+	 * {@link AgentConnection.getMessagesWindow}.
+	 */
+	messagesOmitted?: number;
 	/** In-flight assistant message, separate from finalized transcript messages. */
 	streamingMessage?: AgentMessage;
 	/**
-	 * Quota-park status at snapshot build time (daemon protocol rev 43), present
-	 * only when the attaching client declared the quota_park_status capability and
-	 * the session was parked. Absence means "not parked at snapshot time"; the
+	 * Quota-park status at snapshot build time (daemon protocol rev 43). On the
+	 * daemon path it is present only when the attaching client declared the
+	 * quota_park_status capability and the session was parked; the in-process
+	 * adapter fills it unconditionally (no capability handshake exists there).
+	 * Absence means "not parked at snapshot time"; the
 	 * quota_park_status event stream stays the live channel from then on.
 	 */
 	quotaPark?: AgentConnectionSnapshotQuotaPark;
@@ -961,7 +986,23 @@ export interface AgentConnection {
 	getState(): Promise<AgentConnectionState>;
 	getInitialSnapshot(): Promise<AgentConnectionSnapshot>;
 	getRlmChildSnapshots(): Promise<AgentConnectionRlmChildAgentSnapshot[]>;
+	/**
+	 * The complete transcript. On a slim-attached daemon connection (the snapshot
+	 * carried messagesOmitted) this deliberately re-reads the full list instead of
+	 * serving the cached tail window: callers of getMessages (RPC/ACP/print/debug
+	 * surfaces) expect the whole transcript.
+	 */
 	getMessages(): Promise<AgentMessage[]>;
+	/**
+	 * Paged transcript read (daemon protocol rev 44, capability
+	 * slim_attach_transcript): `before` is the exclusive end index into the full
+	 * transcript (default: its end) and `limit` caps the count (default: everything
+	 * before `before`). Without both fields the full transcript comes back with its
+	 * facts. Optional: adapters without a paged read (the in-process one) omit the
+	 * method; their snapshots never carry messagesOmitted either, so callers only
+	 * reach for this when a paged read exists.
+	 */
+	getMessagesWindow?(options?: { before?: number; limit?: number }): Promise<AgentConnectionMessagesWindow>;
 	getSessionHeader(): Promise<AgentConnectionSessionHeader | undefined>;
 	getCommands(): Promise<AgentConnectionSlashCommand[]>;
 	getResourceSnapshot(): Promise<AgentConnectionResourceSnapshot>;

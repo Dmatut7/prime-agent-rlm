@@ -828,6 +828,76 @@ export class BrandSplashHeader implements Component {
 	}
 }
 
+/**
+ * The slim attach transcript marker at the top of the chat (daemon protocol rev
+ * 44): how many older messages the daemon held back from the attach snapshot.
+ * Clicking it - or wheeling up over it at the top of the fullscreen transcript -
+ * loads the previous page. Click regions only dispatch in fullscreen with mouse
+ * tracking on, so the hint is shown only there; inline the line is informational
+ * (the fullscreen toggle is the way in).
+ */
+export class SlimTranscriptMarkerComponent implements Component {
+	private memo: { width: number; omitted: number; loading: boolean; clickable: boolean; lines: string[] } | undefined;
+	private regions: ClickRegion[] = [];
+
+	constructor(
+		private readonly omittedCount: () => number,
+		private readonly loadingNow: () => boolean,
+		private readonly clickable: () => boolean,
+		private readonly onLoadEarlier: () => void,
+	) {}
+
+	invalidate(): void {
+		this.memo = undefined;
+	}
+
+	render(width: number): string[] {
+		const safeWidth = Math.max(1, width);
+		const omitted = this.omittedCount();
+		const loading = this.loadingNow();
+		const clickable = this.clickable() && !loading;
+		const memo = this.memo;
+		if (
+			memo &&
+			memo.width === safeWidth &&
+			memo.omitted === omitted &&
+			memo.loading === loading &&
+			memo.clickable === clickable
+		) {
+			return memo.lines;
+		}
+		const label = loading ? "… 正在加载更早的消息…" : `… 更早的 ${omitted} 条消息未加载`;
+		// The hint trails the count, so truncation on a narrow terminal drops it first.
+		const hint = clickable ? "（点击或在此处向上滚动加载）" : "";
+		const line = truncateToWidth(theme.fg("dim", label + hint), safeWidth, "");
+		this.regions = clickable
+			? [
+					{
+						line: 0,
+						col: 0,
+						width: Math.max(1, visibleWidth(line)),
+						height: 1,
+						onClick: () => this.onLoadEarlier(),
+						onWheel: (direction) => {
+							// Wheeling up over the topmost line reaches for older history;
+							// returning false lets the transcript scroll as usual too.
+							if (direction === -1) this.onLoadEarlier();
+							return false;
+						},
+					},
+				]
+			: [];
+		// The blank row is the marker's own spacer, so removing the one component
+		// lifts the whole marker out of the chat.
+		this.memo = { width: safeWidth, omitted, loading, clickable, lines: [line, ""] };
+		return this.memo.lines;
+	}
+
+	getClickRegions(): ReadonlyArray<ClickRegion> {
+		return this.regions;
+	}
+}
+
 type StartupPromptBarrierOutcome = "admitted" | "retained" | "lifecycle-cancelled";
 
 type GoalAnnouncementSnapshot = {
@@ -910,6 +980,13 @@ const LIVE_CHAT_COMPONENT_LIMIT = 800;
 // the cap, the floor parks the trigger past the current tree size plus this
 // margin, so growth retriggers a rebuild once per margin instead of every turn.
 const LIVE_CHAT_CAP_FLOOR_HYSTERESIS = 200;
+/**
+ * Page size of the slim attach backfill (daemon protocol rev 44): one trigger of
+ * the transcript-top marker loads this many older messages through get_messages
+ * before/limit. Matches the daemon's attach tail (DAEMON_SLIM_ATTACH_MESSAGE_TAIL);
+ * test/interactive-mode-slim-transcript.test.ts pins the two together.
+ */
+export const SLIM_TRANSCRIPT_PAGE_SIZE = 100;
 
 function initialRenderMessages(messages: AgentMessage[]): AgentMessage[] {
 	if (messages.length <= INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT) {
@@ -1498,6 +1575,22 @@ export class InteractiveMode {
 	private pendingToolGeneration = 0;
 	/** The chat tree currently shows a windowed tail instead of the full transcript. */
 	private chatTranscriptTrimmed = false;
+	/**
+	 * Slim attach transcript (daemon protocol rev 44): messages older than the
+	 * rendered view that exist only on the daemon. Seeded from the snapshot's
+	 * messagesOmitted, paged in through the marker's load-earlier trigger; a
+	 * rebuild sourced from the full session context resets it to 0. Invariant:
+	 * the full-transcript index of the oldest loaded message.
+	 */
+	private slimTranscriptOmitted = 0;
+	private slimTranscriptBackfillInFlight = false;
+	private slimTranscriptMarker: SlimTranscriptMarkerComponent | undefined;
+	/**
+	 * Bumped by every chat rebuild/reset, so a backfill that resolves into a view
+	 * rebuilt while the read was in flight drops its page instead of prepending
+	 * history meant for a transcript the chat no longer shows.
+	 */
+	private slimTranscriptViewEpoch = 0;
 	/**
 	 * Rebuild trigger floor: when the last cap rebuild still left the window over
 	 * the cap, the trigger parks at that size plus a hysteresis margin so a window
@@ -3771,6 +3864,12 @@ export class InteractiveMode {
 		this.lateIpythonSentAgentMessages.clear();
 		this.chatTranscriptTrimmed = false;
 		this.chatCapRebuildFloor = 0;
+		// The slim attach window belongs to the session being torn down; the next
+		// view re-seeds it from its own snapshot.
+		this.slimTranscriptOmitted = 0;
+		this.slimTranscriptBackfillInFlight = false;
+		this.slimTranscriptMarker = undefined;
+		this.slimTranscriptViewEpoch++;
 		// The previous session's turns are gone with its chat.
 		this.liveTurnFlowStore?.reset();
 		this.currentTurnState = undefined;
@@ -3821,6 +3920,10 @@ export class InteractiveMode {
 		this.streamingMessage = undefined;
 		this.rlmNodeId = snapshot.parent?.childId;
 		this.replaceSubagentSummary(snapshot.children);
+		// A resync snapshot for a slim client is windowed again (rev 44): re-seed the
+		// omission count from it; pages backfilled before the reconnect are gone with
+		// the rebuilt chat, and the marker counts what the new tail does not hold.
+		this.slimTranscriptOmitted = snapshot.messagesOmitted ?? 0;
 		await this.renderSessionContext(this.getSessionContextFromConnectionSnapshot(snapshot), {
 			clearChat: true,
 			updateFooter: true,
@@ -8575,6 +8678,9 @@ export class InteractiveMode {
 			keepCompactedHistory?: boolean;
 		} = {},
 	): Promise<void> {
+		// A rebuild invalidates any backfill read still in flight: its page was
+		// cut from the transcript this render replaces.
+		this.slimTranscriptViewEpoch++;
 		// A rebuild (resync, cap trim, setting change) re-creates every turn;
 		// carry each turn's open blocks over, keyed by its first tool call.
 		const turnLanes = this.captureTurnLanes();
@@ -8664,6 +8770,21 @@ export class InteractiveMode {
 			for (const message of sessionContext.messages) {
 				this.addMessageToEditorHistory(message);
 			}
+		}
+
+		// Slim attach (rev 44): the daemon held back older history. The marker sits
+		// above the transcript and pages it in on demand; added before the replay so
+		// the replayed messages land below it.
+		this.slimTranscriptMarker = undefined;
+		if (this.slimTranscriptOmitted > 0) {
+			const marker = new SlimTranscriptMarkerComponent(
+				() => this.slimTranscriptOmitted,
+				() => this.slimTranscriptBackfillInFlight,
+				() => this.ui.isFullscreen() && this.settingsManager.getFullscreenMouse(),
+				() => void this.loadEarlierTranscriptPage(),
+			);
+			this.slimTranscriptMarker = marker;
+			this.chatContainer.addChild(marker);
 		}
 
 		if (messagesToRender.length < sessionContext.messages.length) {
@@ -8813,6 +8934,9 @@ export class InteractiveMode {
 		// An attach (or replace) into a parked session seeds the countdown from the
 		// snapshot instead of sitting blind until the next quota_park_status heartbeat.
 		this.applySnapshotQuotaPark(snapshot.quotaPark);
+		// Slim attach (rev 44): the tail window carries the count of older messages
+		// left on the daemon; absence means the full transcript is here.
+		this.slimTranscriptOmitted = snapshot.messagesOmitted ?? 0;
 		this.restoreTurnStartFromMessages(context.messages);
 		await this.renderSessionContext(context, {
 			updateFooter: true,
@@ -8939,6 +9063,9 @@ export class InteractiveMode {
 
 	private async rebuildChatFromMessages(options: { keepCompactedHistory?: boolean } = {}): Promise<void> {
 		const context = await this.agentConnection.getSessionContext();
+		// get_session_context returns the complete transcript, so nothing is held
+		// back on the daemon side anymore: the slim attach marker is done.
+		this.slimTranscriptOmitted = 0;
 		await this.renderSessionContext(context, { clearChat: true, ...options });
 		this.reattachLiveChatComponents();
 	}
@@ -8971,6 +9098,9 @@ export class InteractiveMode {
 		try {
 			const context = await this.agentConnection.getSessionContext();
 			if (this.liveChatCapBlocked()) return;
+			// The rebuild is sourced from the complete transcript (get_session_context
+			// is not windowed): the slim attach marker does not survive it.
+			this.slimTranscriptOmitted = 0;
 			await this.renderSessionContext(context, { clearChat: true, limitTranscript: true });
 			// The window itself can still sit over the cap (one huge turn fills it):
 			// ratchet the floor past it, with hysteresis, so the next rebuild waits
@@ -8987,6 +9117,98 @@ export class InteractiveMode {
 			);
 		} finally {
 			this.chatCapRebuildInFlight = false;
+		}
+	}
+
+	/**
+	 * The slim-attach marker's load-earlier trigger (rev 44): page the previous
+	 * SLIM_TRANSCRIPT_PAGE_SIZE messages in through get_messages before/limit and
+	 * prepend them between the marker and the attach tail. Only the prepended
+	 * components are new - the live chat (a streaming turn included) is never
+	 * rebuilt, so a message landing mid-load cannot be lost from the view. A chat
+	 * rebuild or session reset while the read is in flight invalidates the page
+	 * through slimTranscriptViewEpoch.
+	 */
+	private async loadEarlierTranscriptPage(): Promise<void> {
+		if (this.slimTranscriptBackfillInFlight) return;
+		const marker = this.slimTranscriptMarker;
+		const omitted = this.slimTranscriptOmitted;
+		if (!marker || omitted <= 0) return;
+		const getMessagesWindow = this.agentConnection.getMessagesWindow?.bind(this.agentConnection);
+		if (!getMessagesWindow) return;
+		this.slimTranscriptBackfillInFlight = true;
+		marker.invalidate();
+		this.ui.requestRender();
+		const epoch = this.slimTranscriptViewEpoch;
+		try {
+			// `before` is the full-transcript index of the oldest loaded message -
+			// exactly the omission count the view tracks.
+			const page = await getMessagesWindow({ before: omitted, limit: SLIM_TRANSCRIPT_PAGE_SIZE });
+			if (epoch !== this.slimTranscriptViewEpoch || this.slimTranscriptMarker !== marker) return;
+			if (page.firstIndex + page.messages.length !== omitted) {
+				// The daemon's transcript shrank under the read (a compaction landed
+				// after the attach): the page would not abut the loaded tail. The
+				// compaction's own rebuild redraws the chat; leave it to that.
+				this.showStatus("会话刚压缩过，较早的历史已在重整后的上下文里");
+				return;
+			}
+			const pageMessages = this.orderMessagesForTranscript(page.messages);
+			const toolNames: string[] = [];
+			for (const message of pageMessages) {
+				if (message.role !== "assistant") continue;
+				for (const content of message.content) {
+					if (content.type === "toolCall") toolNames.push(content.name);
+				}
+			}
+			await this.preloadToolDefinitions(toolNames);
+			if (epoch !== this.slimTranscriptViewEpoch || this.slimTranscriptMarker !== marker) return;
+			const pageContainer = new Container();
+			// A backfilled page is closed history: no live wiring, and a turn the
+			// page cuts into keeps its body in the already-rendered tail below.
+			replayConversation(pageMessages, pageContainer, {
+				ui: this.ui,
+				cwd: this.getCurrentCwd(),
+				toolOptions: { showImages: this.settingsManager.getShowImages() },
+				getToolDefinition: (name) => this.getCachedToolDefinition(name),
+				markdownTheme: this.getMarkdownThemeWithSettings(),
+				hideThinkingBlock: this.hideThinkingBlock,
+				hiddenThinkingLabel: this.hiddenThinkingLabel,
+				toolsExpanded: this.toolOutputExpanded,
+				thinkingExpanded: this.thinkingExpanded,
+				agentMessagesExpanded: this.agentMessagesExpanded,
+				editDiffsExpanded: this.editDiffsExpanded,
+				isRecognizedSlashCommand: (name) => this.isRecognizedSlashCommand(name),
+				processMode: this.settingsManager.getProcessMode(),
+				timelineHost: this.timelineHost(),
+				mermaidTransform: this.mermaidMarkdownTransform,
+				keepFinalTurnOpen: () => false,
+			});
+			const markerIndex = this.chatContainer.children.indexOf(marker);
+			if (markerIndex === -1) return;
+			// Prepending shifts the transcript down by the page's height; keep the
+			// scrolled-to row where it was (a following view is unaffected: scrollBy
+			// clamps to the bottom there).
+			const pageHeight = pageContainer.render(this.ui.terminal.columns).length;
+			this.chatContainer.children.splice(markerIndex + 1, 0, ...pageContainer.children);
+			this.slimTranscriptOmitted = page.firstIndex;
+			if (page.firstIndex === 0) {
+				// The whole transcript is loaded now: the marker leaves the chat.
+				this.chatContainer.removeChild(marker);
+				this.slimTranscriptMarker = undefined;
+			} else {
+				marker.invalidate();
+			}
+			this.ui.scrollBy(pageHeight);
+			this.ui.requestRender();
+		} catch (error) {
+			if (epoch !== this.slimTranscriptViewEpoch) return;
+			this.showError(`加载更早的消息失败：${error instanceof Error ? error.message : String(error)}`);
+		} finally {
+			// Only this call can hold the flag: a rebuild mid-flight drops the page
+			// above, and the (possibly new) marker reads the flag for its loading row.
+			this.slimTranscriptBackfillInFlight = false;
+			this.slimTranscriptMarker?.invalidate();
+			this.ui.requestRender();
 		}
 	}
 

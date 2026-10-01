@@ -19,6 +19,7 @@ export type {
 	AgentConnectionForkOptions,
 	AgentConnectionHeartbeat,
 	AgentConnectionLabelEntry,
+	AgentConnectionMessagesWindow,
 	AgentConnectionModel,
 	AgentConnectionModelCatalog,
 	AgentConnectionModelChangeEntry,
