@@ -1,0 +1,1 @@
+- Changed unknown-tool errors to carry the available tool list plus a did-you-mean suggestion, and added a per-run breaker that ends the run with a classified error after 5 unknown-tool calls, so a model that keeps inventing tool names no longer loops unbounded when no fallback chain is configured.

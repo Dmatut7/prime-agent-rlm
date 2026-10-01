@@ -28,6 +28,7 @@ import type {
 	StreamFn,
 	ThinkingLevel,
 	ToolExecutionMode,
+	ToolNotFoundBreakerConfig,
 	ToolTimeoutConfig,
 	UndeliveredMessageSource,
 } from "./types.js";
@@ -136,6 +137,8 @@ export interface AgentOptions {
 	emptyTurnRetry?: EmptyTurnRetryConfig;
 	/** See `AgentLoopConfig.toolTimeout`. Hosts refresh this per run for hot settings. */
 	toolTimeout?: ToolTimeoutConfig;
+	/** See `AgentLoopConfig.toolNotFoundBreaker`. Unset uses the loop defaults. */
+	toolNotFoundBreaker?: ToolNotFoundBreakerConfig;
 }
 
 class PendingMessageQueue {
@@ -280,6 +283,7 @@ export class Agent {
 	public streamStallTimeoutMs?: number;
 	public emptyTurnRetry?: EmptyTurnRetryConfig;
 	public toolTimeout?: ToolTimeoutConfig;
+	public toolNotFoundBreaker?: ToolNotFoundBreakerConfig;
 
 	constructor(options: AgentOptions = {}) {
 		this._state = createMutableAgentState(options.initialState);
@@ -305,6 +309,7 @@ export class Agent {
 		this.streamStallTimeoutMs = options.streamStallTimeoutMs;
 		this.emptyTurnRetry = options.emptyTurnRetry;
 		this.toolTimeout = options.toolTimeout;
+		this.toolNotFoundBreaker = options.toolNotFoundBreaker;
 	}
 
 	/**
@@ -547,6 +552,7 @@ export class Agent {
 			streamStallTimeoutMs: this.streamStallTimeoutMs,
 			emptyTurnRetry: this.emptyTurnRetry,
 			toolTimeout: this.toolTimeout,
+			toolNotFoundBreaker: this.toolNotFoundBreaker,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
 			shouldStopAfterTurn: async (context) => this.shouldStopAfterTurn?.(context) ?? false,

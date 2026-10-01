@@ -339,6 +339,18 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * this deadline.
 	 */
 	toolTimeout?: ToolTimeoutConfig;
+
+	/**
+	 * Per-run breaker for unknown-tool calls ("Tool X not found"). Every such call
+	 * already gets an enriched receipt (the available tool names plus a did-you-mean
+	 * suggestion); the breaker adds the bounds: at `warnAfter` unknown-tool calls the
+	 * receipt becomes a forced-correction warning, and at `terminateAfter` the run
+	 * ends with a classified terminal error (`stopReasonRaw:
+	 * "tool_not_found_breaker_tripped"`) instead of asking the model again. Unset
+	 * fields use `TOOL_NOT_FOUND_BREAKER_DEFAULTS` from the loop; `enabled: false`
+	 * disables counting and termination but keeps the enriched receipts.
+	 */
+	toolNotFoundBreaker?: ToolNotFoundBreakerConfig;
 }
 
 /** Backoff budget for the loop's empty-turn retries; see `AgentLoopConfig.emptyTurnRetry`. */
@@ -434,6 +446,22 @@ export interface ToolTimeoutConfig {
 	 * deadline stands; a throwing or empty answer leaves the generic cause alone.
 	 */
 	describeCancellation?: (info: ToolTimeoutVouchInfo) => string | undefined;
+}
+
+/**
+ * Breaker policy for unknown-tool calls; see `AgentLoopConfig.toolNotFoundBreaker`.
+ * Two counters run per run, and either can trip each threshold: consecutive
+ * unknown-tool calls (reset by any call whose name resolves), and the per-name
+ * cumulative count (never reset within the run, so a model that corrects itself and
+ * relapses on the same invented name is still caught).
+ */
+export interface ToolNotFoundBreakerConfig {
+	/** Master switch. Defaults to true; `false` keeps the enriched receipts only. */
+	enabled?: boolean;
+	/** Unknown-tool calls before the receipt becomes a forced-correction warning. Default 3. */
+	warnAfter?: number;
+	/** Unknown-tool calls before the run ends with a classified terminal error. Default 5, clamped to >= warnAfter. */
+	terminateAfter?: number;
 }
 
 /**

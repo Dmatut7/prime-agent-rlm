@@ -15,7 +15,13 @@ import type { ToolResultMessage } from "@earendil-works/pi-ai";
 /** How long a session stays on a fallback before the next turn probes the primary again. */
 export const PROVIDER_FALLBACK_RETURN_AFTER_MS = 30 * 60_000;
 
-/** Consecutive invalid tool calls from one model that count as a storm. */
+/**
+ * Consecutive invalid tool calls from one model that count as a storm. The agent
+ * loop's tool-not-found breaker warns at the same count (its default `warnAfter`):
+ * the receipt starts spelling out the correction on the turn where a configured
+ * fallback chain would switch models, and the breaker terminates the run at its own
+ * higher `terminateAfter` when no chain exists or the backup keeps failing too.
+ */
 export const BAD_TOOL_CALL_STORM_THRESHOLD = 3;
 
 /** First long wait once the whole chain failed; doubles per round. */
@@ -291,7 +297,11 @@ export function describeProviderFailureCause(
 	return `${name}连续出错`;
 }
 
-const TOOL_NOT_FOUND_PATTERN = /^Tool (.+) not found$/;
+// The first line of the loop's unknown-tool receipt keeps the historical shape
+// verbatim; everything the breaker appends (available tools, did-you-mean, the
+// warning) lives on later lines, so this matches line one and tolerates both the
+// legacy single-line receipt and the enriched multi-line one.
+const TOOL_NOT_FOUND_PATTERN = /^Tool ([^\n]+) not found(?=$|\n)/;
 
 /** The text blocks of a tool result (`{ content: [{ type: "text", text }] }`), joined. */
 export function toolResultText(result: unknown): string {

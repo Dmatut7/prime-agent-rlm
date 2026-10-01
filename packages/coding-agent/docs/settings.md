@@ -659,6 +659,15 @@ When a command hits the timeout, its process group is killed and the model
 receives an error explaining that the command was killed and how to re-run it
 with a larger `timeout` (or `timeout: 0` for no limit).
 
+Unknown-tool calls ("Tool X not found") are self-correcting by default: every such
+error receipt lists the available tool names and suggests the closest match. A
+per-run breaker bounds a model that keeps inventing names anyway - at 3 unknown-tool
+calls (the same count the fallback chain's bad-call storm detector uses) the receipt
+becomes a forced-correction warning, and at 5 the run ends with a classified,
+non-retryable error instead of spending more provider requests. Both thresholds are
+host-configurable through the agent loop's `toolNotFoundBreaker` option
+(`{ enabled, warnAfter, terminateAfter }`); there is no per-session settings key yet.
+
 ### Shell
 
 | Setting | Type | Default | Description |

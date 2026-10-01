@@ -33,6 +33,7 @@ import type {
 	AgentToolResult,
 	EmptyTurnRetryConfig,
 	StreamFn,
+	ToolNotFoundBreakerConfig,
 	ToolTimeoutVerdict,
 	UndeliveredMessageSource,
 } from "./types.js";
@@ -768,6 +769,11 @@ async function runLoop(
 	const config: AgentLoopConfig = { ...configInput };
 	let firstTurn = true;
 	let lastTurn: Parameters<NonNullable<AgentLoopConfig["getContinuationMessages"]>>[0] | undefined;
+	// Per-run breaker for unknown-tool calls: the in-run backstop below the
+	// session-side bad-call storm detector (which needs a configured fallback chain
+	// to act). Counts survive model switches within the run on purpose - a storm is
+	// a property of the run, and the storm detector is what resets per agent_start.
+	const notFoundBreaker = resolveToolNotFoundBreaker(config.toolNotFoundBreaker);
 
 	// Products a poll already produced but this run will not consume (the abort won
 	// the race, or the run died before injecting them) go back to the host: the poll
@@ -858,7 +864,14 @@ async function runLoop(
 				const toolResults: ToolResultMessage[] = [];
 				hasMoreToolCalls = false;
 				if (toolCalls.length > 0) {
-					const executedToolBatch = await executeToolCalls(currentContext, message, config, signal, emit);
+					const executedToolBatch = await executeToolCalls(
+						currentContext,
+						message,
+						config,
+						signal,
+						emit,
+						notFoundBreaker,
+					);
 					toolResults.push(...executedToolBatch.messages);
 					hasMoreToolCalls = !executedToolBatch.terminate;
 
@@ -870,6 +883,24 @@ async function runLoop(
 
 				await emit({ type: "turn_end", message, toolResults });
 				if (signal?.aborted) {
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
+				if (notFoundBreaker.trip) {
+					// The turn completed truthfully (every started call has its result); what
+					// ends here is the run. The terminal error carries the lifecycle
+					// diagnostic, so hosts classify it as non-retryable instead of resending
+					// the same context to the model that keeps inventing tool names.
+					const terminalMessage = createToolNotFoundBreakerTerminalMessage(
+						config,
+						notFoundBreaker.trip,
+						notFoundBreaker,
+						currentContext.tools,
+					);
+					currentContext.messages.push(terminalMessage);
+					newMessages.push(terminalMessage);
+					await emit({ type: "message_start", message: { ...terminalMessage } });
+					await emit({ type: "message_end", message: terminalMessage });
 					await emit({ type: "agent_end", messages: newMessages });
 					return;
 				}
@@ -1666,15 +1697,24 @@ async function executeToolCalls(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	notFoundBreaker: ToolNotFoundBreakerState,
 ): Promise<ExecutedToolCallBatch> {
 	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
 	const hasSequentialToolCall = toolCalls.some(
 		(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
 	);
 	if (config.toolExecution === "sequential" || hasSequentialToolCall) {
-		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
+		return executeToolCallsSequential(
+			currentContext,
+			assistantMessage,
+			toolCalls,
+			config,
+			signal,
+			emit,
+			notFoundBreaker,
+		);
 	}
-	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit);
+	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit, notFoundBreaker);
 }
 
 type ExecutedToolCallBatch = {
@@ -1689,6 +1729,7 @@ async function executeToolCallsSequential(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	notFoundBreaker: ToolNotFoundBreakerState,
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallOutcome[] = [];
 	const messages: ToolResultMessage[] = [];
@@ -1705,7 +1746,14 @@ async function executeToolCallsSequential(
 			args: toolCall.arguments,
 		});
 
-		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+		const preparation = await prepareToolCall(
+			currentContext,
+			assistantMessage,
+			toolCall,
+			config,
+			signal,
+			notFoundBreaker,
+		);
 		let finalized: FinalizedToolCallOutcome;
 		if (preparation.kind === "immediate") {
 			finalized = {
@@ -1751,6 +1799,7 @@ async function executeToolCallsParallel(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	notFoundBreaker: ToolNotFoundBreakerState,
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallEntry[] = [];
 
@@ -1762,7 +1811,14 @@ async function executeToolCallsParallel(
 			args: toolCall.arguments,
 		});
 
-		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+		const preparation = await prepareToolCall(
+			currentContext,
+			assistantMessage,
+			toolCall,
+			config,
+			signal,
+			notFoundBreaker,
+		);
 		if (preparation.kind === "immediate") {
 			const finalized = {
 				toolCall,
@@ -1885,15 +1941,22 @@ async function prepareToolCall(
 	toolCall: AgentToolCall,
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
+	notFoundBreaker: ToolNotFoundBreakerState,
 ): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
 	const tool = currentContext.tools?.find((t) => t.name === toolCall.name);
 	if (!tool) {
+		const escalation = notFoundBreaker.enabled ? recordToolNotFound(notFoundBreaker, toolCall.name) : "plain";
 		return {
 			kind: "immediate",
-			result: createErrorToolResult(`Tool ${toolCall.name} not found`),
+			result: createErrorToolResult(
+				formatToolNotFoundReceipt(toolCall.name, currentContext.tools, escalation, notFoundBreaker),
+			),
 			isError: true,
 		};
 	}
+	// A call whose name resolves is not part of the unknown-tool streak, whatever its
+	// arguments or execution do next; the per-name counts deliberately survive this.
+	notFoundBreaker.consecutive = 0;
 
 	try {
 		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
@@ -2173,6 +2236,224 @@ function createErrorToolResult(message: string): AgentToolResult<any> {
 		content: [{ type: "text", text: message }],
 		details: {},
 	};
+}
+
+/**
+ * Defaults for the per-run tool-not-found breaker; overridable via
+ * `AgentLoopConfig.toolNotFoundBreaker`. `warnAfter` matches the session-side
+ * bad-call storm threshold (`BAD_TOOL_CALL_STORM_THRESHOLD` in the coding agent) on
+ * purpose: the turn where the fallback chain would switch models is the turn the
+ * receipt starts spelling out the correction.
+ */
+export const TOOL_NOT_FOUND_BREAKER_DEFAULTS = { warnAfter: 3, terminateAfter: 5 } as const;
+
+/**
+ * Synthetic `stopReasonRaw` for a run the tool-not-found breaker ended. Not a
+ * provider value: callers use it to tell this classified termination apart from a
+ * retryable provider failure.
+ */
+export const TOOL_NOT_FOUND_BREAKER_STOP_REASON_RAW = "tool_not_found_breaker_tripped";
+
+/** Whether a message is the terminal tool-not-found breaker failure. */
+export function isToolNotFoundBreakerFailure(message: AssistantMessage): boolean {
+	return message.stopReason === "error" && message.stopReasonRaw === TOOL_NOT_FOUND_BREAKER_STOP_REASON_RAW;
+}
+
+/** Diagnostic type carrying the breaker's trip facts (name, counts, thresholds, tool list). */
+export const TOOL_NOT_FOUND_BREAKER_DIAGNOSTIC_TYPE = "tool_not_found_breaker";
+
+/** The available-tools list is capped so a huge tool surface cannot flood the receipt. */
+const TOOL_NOT_FOUND_RECEIPT_TOOL_LIMIT = 40;
+
+/** Classic Levenshtein over short strings (tool names); full matrix is fine at this size. */
+function toolNameEditDistance(a: string, b: string): number {
+	const previous: number[] = Array.from({ length: b.length + 1 }, (_unused, index) => index);
+	const current: number[] = new Array(b.length + 1).fill(0);
+	for (let i = 1; i <= a.length; i++) {
+		current[0] = i;
+		for (let j = 1; j <= b.length; j++) {
+			current[j] = Math.min(
+				previous[j]! + 1,
+				current[j - 1]! + 1,
+				previous[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1),
+			);
+		}
+		previous.splice(0, previous.length, ...current);
+	}
+	return previous[b.length]!;
+}
+
+/**
+ * Nearest available tool names for a name the model called that does not exist.
+ * Three evidence classes, best first: case-insensitive equality, prefix containment
+ * (an XML-corrupted name like `ipython</arg_value>` still starts with the real tool
+ * name - the C1 corruption shape), then typo-range edit distance. At most three.
+ */
+export function suggestToolNames(badName: string, available: readonly string[]): string[] {
+	if (available.length === 0 || badName.length === 0) return [];
+	const lowerBad = badName.toLowerCase();
+	const typoBound = Math.max(2, Math.floor(badName.length / 3));
+	const scored: Array<{ name: string; score: number }> = [];
+	for (const name of available) {
+		const lowerName = name.toLowerCase();
+		let score: number | undefined;
+		if (lowerName === lowerBad) {
+			score = 0;
+		} else if (lowerBad.startsWith(lowerName) || lowerName.startsWith(lowerBad)) {
+			score = 0.5;
+		} else {
+			const distance = toolNameEditDistance(lowerBad, lowerName);
+			if (distance <= typoBound) score = distance + 1;
+		}
+		if (score !== undefined) scored.push({ name, score });
+	}
+	return scored
+		.sort((left, right) => left.score - right.score || left.name.localeCompare(right.name))
+		.slice(0, 3)
+		.map((entry) => entry.name);
+}
+
+function formatAvailableTools(tools: readonly AgentTool<any>[] | undefined): string {
+	const names = (tools ?? []).map((tool) => tool.name);
+	if (names.length === 0) return "No tools are available in this run; do not make tool calls.";
+	const listed = names.slice(0, TOOL_NOT_FOUND_RECEIPT_TOOL_LIMIT);
+	const suffix = names.length > listed.length ? `, …(+${names.length - listed.length} more)` : "";
+	return `Available tools: ${listed.join(", ")}${suffix}.`;
+}
+
+type ToolNotFoundEscalation = "plain" | "warn" | "trip";
+
+interface ToolNotFoundBreakerTrip {
+	toolName: string;
+	nameCount: number;
+	consecutive: number;
+	total: number;
+}
+
+interface ToolNotFoundBreakerState {
+	readonly enabled: boolean;
+	readonly warnAfter: number;
+	readonly terminateAfter: number;
+	/** Consecutive unknown-tool calls; any call whose name resolves resets it. */
+	consecutive: number;
+	/** Per-name cumulative counts; never reset within the run (the correct-then-relapse shape). */
+	readonly nameCounts: Map<string, number>;
+	total: number;
+	trip?: ToolNotFoundBreakerTrip;
+}
+
+function resolveToolNotFoundBreaker(config?: ToolNotFoundBreakerConfig): ToolNotFoundBreakerState {
+	const finitePositive = (value: number | undefined): number | undefined =>
+		typeof value === "number" && Number.isFinite(value) && value >= 1 ? Math.floor(value) : undefined;
+	const warnAfter = finitePositive(config?.warnAfter) ?? TOOL_NOT_FOUND_BREAKER_DEFAULTS.warnAfter;
+	const terminateAfter = Math.max(
+		warnAfter,
+		finitePositive(config?.terminateAfter) ?? TOOL_NOT_FOUND_BREAKER_DEFAULTS.terminateAfter,
+	);
+	return {
+		enabled: config?.enabled !== false,
+		warnAfter,
+		terminateAfter,
+		consecutive: 0,
+		nameCounts: new Map(),
+		total: 0,
+	};
+}
+
+/** Records one unknown-tool call and reports the receipt level it earns. */
+function recordToolNotFound(state: ToolNotFoundBreakerState, name: string): ToolNotFoundEscalation {
+	state.total += 1;
+	state.consecutive += 1;
+	const nameCount = (state.nameCounts.get(name) ?? 0) + 1;
+	state.nameCounts.set(name, nameCount);
+	if (!state.trip && (nameCount >= state.terminateAfter || state.consecutive >= state.terminateAfter)) {
+		state.trip = { toolName: name, nameCount, consecutive: state.consecutive, total: state.total };
+	}
+	if (state.trip) return "trip";
+	if (nameCount >= state.warnAfter || state.consecutive >= state.warnAfter) return "warn";
+	return "plain";
+}
+
+/**
+ * The receipt for one unknown-tool call. The first line keeps the historical
+ * `Tool X not found` shape verbatim: the session-side bad-call storm classifier
+ * matches on it, and a multi-line suffix must not break that pairing.
+ */
+function formatToolNotFoundReceipt(
+	name: string,
+	tools: readonly AgentTool<any>[] | undefined,
+	escalation: ToolNotFoundEscalation,
+	state: ToolNotFoundBreakerState,
+): string {
+	const lines = [`Tool ${name} not found`];
+	const suggestions = suggestToolNames(
+		name,
+		(tools ?? []).map((tool) => tool.name),
+	);
+	const suggestionText =
+		suggestions.length > 0 ? ` Did you mean: ${suggestions.map((s) => `"${s}"`).join(", ")}?` : "";
+	lines.push(`${formatAvailableTools(tools)}${suggestionText}`);
+	if (escalation === "warn") {
+		lines.push(
+			`[tool-not-found breaker] ${state.total} unknown-tool call(s) this run; the run stops at ${state.terminateAfter}. ` +
+				"Stop guessing tool names: before your next tool call, restate which of the available tools you will use, then call only those exact names.",
+		);
+	} else if (escalation === "trip") {
+		lines.push(
+			`[tool-not-found breaker] ${state.total} unknown-tool call(s) this run: the limit of ${state.terminateAfter} is reached, ` +
+				"so the run stops after this batch instead of asking the model again.",
+		);
+	}
+	return lines.join("\n");
+}
+
+/** Terminal assistant message for a run the breaker ended: classified, non-retryable. */
+function createToolNotFoundBreakerTerminalMessage(
+	config: AgentLoopConfig,
+	trip: ToolNotFoundBreakerTrip,
+	state: ToolNotFoundBreakerState,
+	tools: readonly AgentTool<any>[] | undefined,
+): AssistantMessage {
+	const errorMessage =
+		`Stopped by the tool-not-found breaker: ${trip.total} unknown-tool call(s) in this run ` +
+		`(${trip.nameCount} for "${trip.toolName}"), limit ${state.terminateAfter}. ` +
+		"The model kept calling tool names that do not exist even though every error receipt listed the available tools, " +
+		"so the run was ended instead of spending more provider requests. " +
+		"This is a model-side failure: switch the session to another model (or fix the tool setup) before resuming.";
+	const message: AssistantMessage = {
+		role: "assistant",
+		content: [{ type: "text", text: "" }],
+		api: config.model.api,
+		provider: config.model.provider,
+		model: config.model.id,
+		usage: cloneUsage(EMPTY_USAGE),
+		stopReason: "error",
+		stopReasonRaw: TOOL_NOT_FOUND_BREAKER_STOP_REASON_RAW,
+		errorMessage,
+		timestamp: Date.now(),
+	};
+	appendAssistantMessageDiagnostic(message, {
+		type: TOOL_NOT_FOUND_BREAKER_DIAGNOSTIC_TYPE,
+		timestamp: Date.now(),
+		details: {
+			toolName: trip.toolName,
+			nameCount: trip.nameCount,
+			consecutive: trip.consecutive,
+			total: trip.total,
+			warnAfter: state.warnAfter,
+			terminateAfter: state.terminateAfter,
+			availableTools: (tools ?? []).map((tool) => tool.name),
+		},
+	});
+	// Loop-machinery terminal states are never re-sent the same context: the session's
+	// retry classifier reads this diagnostic type (see the run-failure path above).
+	appendAssistantMessageDiagnostic(
+		message,
+		createAssistantMessageDiagnostic("agent_lifecycle_failure", new Error(errorMessage), {
+			source: "tool_not_found_breaker",
+		}),
+	);
+	return message;
 }
 
 async function emitToolExecutionEnd(finalized: FinalizedToolCallOutcome, emit: AgentEventSink): Promise<void> {
