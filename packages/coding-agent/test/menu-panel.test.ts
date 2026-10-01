@@ -89,6 +89,33 @@ describe("MenuPanel", () => {
 		}
 	});
 
+	it("marks truncated row content with an ellipsis instead of a silent cut", () => {
+		const row = new MenuRow({
+			primary: "a-very-long-model-name-that-cannot-fit",
+			secondary: "provider · session · every 45m · steer",
+			selected: false,
+		});
+
+		const lines = row.render(30).map((line) => stripAnsi(line));
+		const primaryLine = lines.find((line) => line.includes("a-very-long"));
+		const secondaryLine = lines.find((line) => line.includes("provider"));
+
+		expect(primaryLine).toContain("…");
+		expect(secondaryLine).toContain("…");
+		for (const line of lines) {
+			expect(visibleWidth(line)).toBe(30);
+		}
+	});
+
+	it("does not ellipsize row content that fits", () => {
+		const row = new MenuRow({ primary: "short", secondary: "fits fine", selected: false });
+
+		const lines = row.render(60).map((line) => stripAnsi(line));
+
+		expect(lines.join("\n")).not.toContain("…");
+		expect(lines.join("\n")).toContain("fits fine");
+	});
+
 	it("collapses adjacent row padding around the selected row", () => {
 		const createList = (selectedIndex: number): MenuList => {
 			const list = new MenuList();

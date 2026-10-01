@@ -2,6 +2,7 @@ import { setKeybindings } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
+import type { PromptStashState } from "../src/modes/interactive/prompt-stash-state.js";
 
 type FakeEditor = {
 	text: string;
@@ -41,10 +42,14 @@ type FakeInteractiveMode = {
 	updatePendingMessagesDisplay: Mock;
 	showError: Mock;
 	showWarning: Mock;
+	showStatus: Mock;
+	showToast: Mock;
 	showTreeSelector: Mock;
 	shutdown: Mock;
 	updateEditorBorderColor: Mock;
-	queueSelection: { isBrowsing: boolean; reset: () => string };
+	queueSelection: { isBrowsing: boolean; hasDraft?: boolean; reset: () => string };
+	promptStashState: PromptStashState;
+	pastedImages: Map<number, unknown>;
 	defaultEditor?: {
 		onAction: Mock;
 		getHeaderLine?: () => string | undefined;
@@ -116,10 +121,14 @@ function createInteractiveFake(options: {
 		},
 		subagentSummaryLine: { invalidate: vi.fn() },
 		ui: { requestRender: vi.fn() },
-		queueSelection: { isBrowsing: false, reset: () => "" },
+		queueSelection: { isBrowsing: false, hasDraft: false, reset: () => "" },
+		promptStashState: {},
+		pastedImages: new Map(),
 		updatePendingMessagesDisplay: vi.fn(),
 		showError: vi.fn(),
 		showWarning: vi.fn(),
+		showStatus: vi.fn(),
+		showToast: vi.fn(),
 		showTreeSelector: vi.fn(),
 		shutdown: vi.fn().mockResolvedValue(undefined),
 		updateEditorBorderColor: vi.fn(),
@@ -338,6 +347,57 @@ describe("InteractiveMode interrupt shortcuts", () => {
 
 		expect(mode.showTreeSelector).not.toHaveBeenCalled();
 		expect(mode.editor.getText()).toBe("");
+	});
+
+	it("stashes an idle draft on Escape; the stash key restores it", () => {
+		const mode = createInteractiveFake({ editorText: "draft text to test esc" });
+		const handleEscape = Reflect.get(InteractiveMode.prototype, "handleEscape");
+
+		handleEscape.call(mode);
+
+		// One press still clears; the draft survives in the stash instead of vanishing.
+		expect(mode.editor.getText()).toBe("");
+		expect(mode.promptStashState.stash?.text).toBe("draft text to test esc");
+		expect(mode.showToast).toHaveBeenCalledWith("✓ stashed");
+		expect(mode.escapeRepeatAction).toBeUndefined();
+
+		// The restore path is the manual stash's: Ctrl+S on the empty editor.
+		Reflect.get(InteractiveMode.prototype, "handlePromptStash").call(mode);
+		expect(mode.editor.getText()).toBe("draft text to test esc");
+		expect(mode.promptStashState.stash).toBeUndefined();
+		expect(mode.showToast).toHaveBeenCalledWith("✓ draft restored");
+	});
+
+	it("queues an earlier manual stash behind the Escape-stashed draft", () => {
+		const mode = createInteractiveFake({ editorText: "esc cleared draft" });
+		mode.promptStashState.stash = { text: "manual stash" };
+		const handleEscape = Reflect.get(InteractiveMode.prototype, "handleEscape");
+		const handlePromptStash = Reflect.get(InteractiveMode.prototype, "handlePromptStash");
+
+		handleEscape.call(mode);
+
+		expect(mode.editor.getText()).toBe("");
+		expect(mode.promptStashState.stash?.text).toBe("esc cleared draft");
+		expect(mode.promptStashState.queuedStashes?.map((stash) => stash.text)).toEqual(["manual stash"]);
+
+		// The draft Esc just cleared restores first; the older stash is next in line.
+		handlePromptStash.call(mode);
+		expect(mode.editor.getText()).toBe("esc cleared draft");
+		mode.editor.setText("");
+		handlePromptStash.call(mode);
+		expect(mode.editor.getText()).toBe("manual stash");
+		expect(mode.promptStashState.stash).toBeUndefined();
+	});
+
+	it("clears a whitespace-only draft without stashing it", () => {
+		const mode = createInteractiveFake({ editorText: "  \n  " });
+
+		Reflect.get(InteractiveMode.prototype, "handleEscape").call(mode);
+
+		expect(mode.editor.getText()).toBe("");
+		expect(mode.promptStashState.stash).toBeUndefined();
+		expect(mode.promptStashState.queuedStashes).toBeUndefined();
+		expect(mode.showToast).not.toHaveBeenCalled();
 	});
 
 	it("does not arm the tree on the Escape that interrupts streaming work", () => {

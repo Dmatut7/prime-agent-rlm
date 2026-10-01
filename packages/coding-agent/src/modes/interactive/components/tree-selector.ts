@@ -13,6 +13,7 @@ import type { AgentConnectionSessionTreeNode } from "../../agent-connection/inde
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { keyHint, keyText } from "./keybinding-hints.js";
+import { SegmentedHintText } from "./segmented-hint.js";
 
 /** Gutter info: position (displayIndent where connector was) and whether to show │ */
 interface GutterInfo {
@@ -1227,14 +1228,20 @@ export class TreeSelectorComponent extends Container implements Focusable {
 			keyText("app.tree.filter.all"),
 		].join("/");
 		const cycleKeys = `${keyText("app.tree.filter.cycleForward")}/${keyText("app.tree.filter.cycleBackward")}`;
+		// Segment-per-hint: width truncation drops whole trailing hints behind an
+		// ellipsis instead of cutting a key name in half.
 		this.addChild(
-			new TruncatedText(
-				theme.fg(
-					"muted",
-					`  ↑/↓ 移动 · ←/→ 翻页 · ^←/^→ 或 Alt+←/Alt+→ 折叠/切分支 · ${keyText("app.tree.editLabel")} 标签 · ${filterKeys} 筛选（${cycleKeys} 切换） · ${keyText("app.tree.toggleLabelTimestamp")} 标签时间 · Enter 回到这里`,
-				),
-				0,
-				0,
+			new SegmentedHintText(
+				[
+					"  ↑/↓ 移动",
+					"←/→ 翻页",
+					"^←/^→ 或 Alt+←/Alt+→ 折叠/切分支",
+					`${keyText("app.tree.editLabel")} 标签`,
+					`${filterKeys} 筛选（${cycleKeys} 切换）`,
+					`${keyText("app.tree.toggleLabelTimestamp")} 标签时间`,
+					"Enter 回到这里",
+				].map((segment) => theme.fg("muted", segment)),
+				theme.fg("muted", " · "),
 			),
 		);
 		this.addChild(new SearchLine(this.treeList));

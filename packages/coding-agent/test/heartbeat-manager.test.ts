@@ -157,4 +157,34 @@ describe("HeartbeatManagerComponent", () => {
 			{ id: "user", action: "stop" },
 		]);
 	});
+
+	it("keeps the schedule unit whole or marks the cut with an ellipsis", () => {
+		const component = new HeartbeatManagerComponent({
+			getHeartbeats: () => [
+				heartbeat("user", {
+					source: "heartbeat",
+					schedule: { kind: "interval", expression: "every 45m", intervalMs: 2_700_000 },
+				}),
+			],
+			getRows: () => 20,
+			onAction: async () => {},
+			onClose: () => {},
+			requestRender: () => {},
+		});
+
+		// ux-80 F1: the row used to hard-cut "every 45m" into "every 45" with no marker,
+		// leaving the unit unrecoverable. A cut must always carry the ellipsis.
+		let sawScheduleCut = false;
+		for (let width = 28; width <= 72; width += 2) {
+			const lines = component.render(width).map(stripAnsi);
+			for (const line of lines) {
+				expect(visibleWidth(line)).toBe(width);
+				if (line.includes("every 45") && !line.includes("every 45m")) {
+					sawScheduleCut = true;
+					expect(line).toContain("…");
+				}
+			}
+		}
+		expect(sawScheduleCut).toBe(true);
+	});
 });

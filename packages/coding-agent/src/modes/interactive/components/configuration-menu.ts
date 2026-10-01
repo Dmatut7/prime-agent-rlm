@@ -35,6 +35,8 @@ export interface ConfigurationMenuOptions {
 	scopedModels: ReadonlyArray<ConfigurationMenuScopedModel>;
 	availableModels: ReadonlyArray<Model<Api>>;
 	configuredProviders: ReadonlySet<string>;
+	/** Providers a live probe disproved despite a configured claim (see ModelSelectorOptions). */
+	unconfiguredProviders?: ReadonlySet<string>;
 	recentModels?: ReadonlyArray<string>;
 	initialModelSearch?: string;
 	getRows?: () => number;
@@ -149,6 +151,7 @@ export class ConfigurationMenuComponent extends Container implements Focusable {
 			{
 				availableModels: options.availableModels,
 				configuredProviders: options.configuredProviders,
+				unconfiguredProviders: options.unconfiguredProviders,
 				header: tabBar,
 				getHeaderRows,
 				getRows: options.getRows,
@@ -224,6 +227,11 @@ export class ConfigurationMenuComponent extends Container implements Focusable {
 		configuredProviders?: ReadonlySet<string>,
 	): void {
 		this.bodies.models.updateState(currentModel, models, configuredProviders);
+	}
+
+	/** Live probe results re-badge/re-sort the models tab without rebuilding the menu. */
+	updateUnconfiguredProviders(unconfiguredProviders: ReadonlySet<string> | undefined): void {
+		this.bodies.models.setUnconfiguredProviders(unconfiguredProviders);
 	}
 
 	handleInput(keyData: string): void {

@@ -46,6 +46,9 @@ interface ConfigurationHarness {
 	showFullPaneOverlay(component: Component, width: number): OverlayHandle;
 	showError(message: string): void;
 	showStatus(message: string): void;
+	// Mirrors InteractiveMode's private field: showConfigurationMenu consults it
+	// for the claude-code probe gate (wave-12 model-menu honesty).
+	connectionConfiguredProviders: Set<string>;
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
@@ -162,6 +165,7 @@ describe("ENG-4658 onboarding transitions", () => {
 		};
 		fakeThis.showError = vi.fn();
 		fakeThis.showStatus = vi.fn();
+		fakeThis.connectionConfiguredProviders = new Set<string>();
 
 		const configuration = fakeThis.showConfigurationMenu("providers");
 		expect(menu).toBeDefined();

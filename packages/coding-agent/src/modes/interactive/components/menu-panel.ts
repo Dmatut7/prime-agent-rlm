@@ -363,12 +363,12 @@ export class MenuRow implements Component, FullWidthMenuComponent {
 		const metaWidth = visibleWidth(meta);
 		const gap = meta ? 2 : 0;
 		const primaryWidth = Math.max(1, innerWidth - metaWidth - gap);
-		const primaryText = truncateToWidth(primary, primaryWidth, "", true);
+		const primaryText = truncateToWidth(primary, primaryWidth, "…", true);
 		const primaryLine = meta ? primaryText + " ".repeat(gap) + meta : primaryText;
 		const lines: string[] = [];
 		lines.push(this.rowLine(primaryLine, safeWidth, this.selected));
 		if (secondary) {
-			lines.push(this.rowLine(truncateToWidth(secondary, innerWidth, "", true), safeWidth, this.selected));
+			lines.push(this.rowLine(truncateToWidth(secondary, innerWidth, "…", true), safeWidth, this.selected));
 		}
 		return lines;
 	}

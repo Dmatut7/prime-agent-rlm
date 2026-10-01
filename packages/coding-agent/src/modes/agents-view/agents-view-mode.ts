@@ -3199,7 +3199,34 @@ export class AgentsViewMode implements Component, Focusable {
 			(suffix): suffix is string => suffix !== undefined && suffix.length > 0,
 		);
 		const titleContent = suffixes.length > 0 ? `${title} ${theme.fg("dim", `· ${suffixes.join(" · ")}`)}` : title;
-		const titleCell = formatTableCell(titleContent, titleWidth);
+		// Truncation eats the variable summary first, then the title tail; the
+		// model:effort label keeps every column it fits in (#502 contract). A cut
+		// always ends in an ellipsis so a shortened title reads as shortened.
+		let titleCell: string;
+		if (visibleWidth(titleContent) <= titleWidth) {
+			titleCell = formatTableCell(titleContent, titleWidth);
+		} else {
+			const coreSuffixes = [statusLabel, modelLabel].filter(
+				(suffix): suffix is string => suffix !== undefined && suffix.length > 0,
+			);
+			const coreText = coreSuffixes.join(" · ");
+			const coreContent = coreText ? `${title} ${theme.fg("dim", `· ${coreText}`)}` : title;
+			const coreWidth = visibleWidth(coreContent);
+			if (summaryText && coreWidth < titleWidth) {
+				const summaryBudget = titleWidth - coreWidth - 2;
+				titleCell =
+					summaryBudget > 0
+						? formatTableCell(
+								`${coreContent}${theme.fg("dim", ` · ${truncateToWidth(summaryText, summaryBudget, "…")}`)}`,
+								titleWidth,
+							)
+						: formatTableCell(coreContent, titleWidth);
+			} else if (coreText && coreWidth <= titleWidth) {
+				titleCell = formatTableCell(coreContent, titleWidth);
+			} else {
+				titleCell = formatTableCell(titleContent, titleWidth);
+			}
+		}
 		const cells = [
 			icon,
 			pendingDelete || pendingKill ? theme.fg("error", titleCell) : titleCell,
@@ -3634,12 +3661,12 @@ function rowSessionModel(row: AgentsViewRow): { provider: string; modelId: strin
 }
 
 function formatTableCell(value: string, width: number): string {
-	const truncated = truncateToWidth(value, width, "");
+	const truncated = truncateToWidth(value, width, "…");
 	return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
 }
 
 function formatRightTableCell(value: string, width: number): string {
-	const truncated = truncateToWidth(value, width, "");
+	const truncated = truncateToWidth(value, width, "…");
 	return " ".repeat(Math.max(0, width - visibleWidth(truncated))) + truncated;
 }
 

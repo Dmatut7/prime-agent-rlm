@@ -5262,6 +5262,8 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		// A non-empty editor: Esc keeps its clear semantics (a single press clears).
 		fakeThis.editor = { getText: () => "draft text", setText: vi.fn() };
 		fakeThis.queueSelection = { isBrowsing: false, hasDraft: false, reset: () => "" };
+		fakeThis.promptStashState = {};
+		fakeThis.showToast = vi.fn();
 		fakeThis.hasInterruptibleWork = () => false;
 		fakeThis.handleEscape();
 		expect(state.thinkingBlockExpanded).toBe(true);

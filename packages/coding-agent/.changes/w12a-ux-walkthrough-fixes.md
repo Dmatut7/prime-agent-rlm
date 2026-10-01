@@ -1,0 +1,3 @@
+- Fixed Esc silently destroying the input draft: clearing an idle prompt now stashes the draft first, so the same Ctrl+S that restores a manual stash brings it back.
+- Fixed the /model menu showing Claude Code models as signed in whenever the `claude` binary is installed: the menu now asks the CLI's own login state (`claude auth status`) and badges/sorts by the answer.
+- Fixed menu rows hard-cutting overflowing text with no marker (a heartbeat's "every 45m" could lose its unit): truncated rows now end with an ellipsis, and the /tree key hint drops whole trailing hints instead of cutting a key name in half.

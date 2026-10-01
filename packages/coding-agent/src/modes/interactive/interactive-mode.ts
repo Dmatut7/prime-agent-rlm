@@ -209,6 +209,7 @@ import {
 } from "../shared/startup-notices.js";
 import { AGENT_ACTIVITY_LABELS, AgentActivityTracker, formatTokenCount } from "./agent-activity.js";
 import { type AuthenticationResult, getAnthropicSubscriptionAuthWarning, ProviderAuthFlows } from "./auth-flows.js";
+import { checkClaudeCodeLoggedIn } from "./claude-code-login-probe.js";
 import { AgentMessageComponent } from "./components/agent-message.js";
 import { ArminComponent } from "./components/armin.js";
 import { AssistantMessageComponent } from "./components/assistant-message.js";
@@ -403,6 +404,8 @@ const MODEL_CATALOG_REFRESH_TTL_MS = 60_000;
  */
 export const AGENTS_VIEW_HANDOFF_STATUS_MESSAGE = "Opening the agents view…";
 const FEATURE_HINT_DELAY_MS = 5_000;
+/** The provider set a probe-disproved claude-code login demotes in the model menu. */
+const CLAUDE_CODE_UNCONFIGURED_SET: ReadonlySet<string> = new Set(["claude-code"]);
 /**
  * Spend-cell refresh cadence. The figure comes from the context tree, whose
  * disk scan is budgeted but not free, so events coalesce through a debounce and
@@ -1406,6 +1409,8 @@ export function formatAgentDepthLabel(depth: number | undefined, hasChildren: bo
 export class InteractiveMode {
 	private static readonly EXIT_HINT_DURATION_MS = 2000;
 	private static readonly ESCAPE_REPEAT_WINDOW_MS = 500;
+	/** How long a settled claude-code login probe answer is trusted before re-asking the CLI. */
+	private static readonly CLAUDE_CODE_LOGIN_STATUS_TTL_MS = 60_000;
 
 	private uiServices: InteractiveModeUiServices;
 	private agentConnection: AgentConnection;
@@ -1455,6 +1460,13 @@ export class InteractiveMode {
 	private inputSubmissionsPending = 0;
 	private pendingPromptStashReleases: { sessionId: string; state: PromptStashState }[] = [];
 	private readonly retainedSubmissionGenerations = new WeakMap<PromptStash, number>();
+	/**
+	 * Last settled answer of the claude-code login probe (claude auth status). Undefined
+	 * means unknown: the badge and the select gate keep the catalog's claim until the
+	 * probe disproves it.
+	 */
+	private claudeCodeLoginStatus: { value: boolean; checkedAt: number } | undefined;
+	private claudeCodeLoginCheck: Promise<boolean> | undefined;
 	private admitPendingStartupPrompts: (() => Promise<StartupPromptBarrierOutcome>) | undefined;
 	private agentsViewRequest: InteractiveModeRunResult["type"] | undefined;
 	private openChildActiveSessionId: string | undefined;
@@ -5394,6 +5406,23 @@ export class InteractiveMode {
 		}
 		this.promptStash = this.snapshotPromptStash(text);
 		this.editor.setText("");
+		this.showToast("✓ stashed");
+	}
+
+	/**
+	 * Esc clearing an idle draft stashes it first: the clear stays one press, but the
+	 * draft survives in the same stash Ctrl+S restores from. The just-cleared draft takes
+	 * the head slot so the next restore brings it back; an earlier manual stash queues
+	 * behind it unchanged.
+	 */
+	private stashDraftBeforeEscapeClear(): void {
+		const text = this.editor.getText();
+		if (!text.trim()) return;
+		const existing = [this.promptStashState.stash, ...(this.promptStashState.queuedStashes ?? [])].filter(
+			(stash): stash is PromptStash => stash !== undefined,
+		);
+		this.promptStashState.stash = this.snapshotPromptStash(text);
+		this.promptStashState.queuedStashes = existing.length > 0 ? existing : undefined;
 		this.showToast("✓ stashed");
 	}
 
@@ -9370,8 +9399,11 @@ export class InteractiveMode {
 			return;
 		}
 		if (this.editor.getText().length > 0) {
-			// One Esc clears an idle draft (what the keybinding doc promises); only
-			// the empty idle prompt arms the double-press tree walk-back below.
+			// One Esc clears an idle draft (what the keybinding doc promises); the
+			// draft is stashed first so the clear is recoverable through the same
+			// Ctrl+S restore as a manual stash. Only the empty idle prompt arms the
+			// double-press tree walk-back below.
+			this.stashDraftBeforeEscapeClear();
 			this.interruptOrClearInput();
 			this.clearInputBar();
 			return;
@@ -11726,7 +11758,38 @@ export class InteractiveMode {
 	}
 
 	private isModelProviderConfigured(model: AgentConnectionModel): boolean {
+		if (this.getProbeUnconfiguredProviders()?.has(model.provider)) return false;
 		return this.connectionConfiguredProviders.has(model.provider) || this.modelRegistry.hasConfiguredAuth(model);
+	}
+
+	/**
+	 * Providers the claude-code login probe disproved even though ambient detection claims
+	 * them (an installed `claude` binary is not a credential). Unknown probe state yields
+	 * undefined: the catalog's claim stands until disproved.
+	 */
+	private getProbeUnconfiguredProviders(): ReadonlySet<string> | undefined {
+		return this.claudeCodeLoginStatus?.value === false ? CLAUDE_CODE_UNCONFIGURED_SET : undefined;
+	}
+
+	/**
+	 * Ask the claude CLI whether it is logged in, once per TTL window; concurrent callers
+	 * share the in-flight check. Fire-and-forget callers get the settled answer through
+	 * claudeCodeLoginStatus.
+	 */
+	private probeClaudeCodeLoginStatus(): Promise<boolean> {
+		const cached = this.claudeCodeLoginStatus;
+		if (cached && Date.now() - cached.checkedAt < InteractiveMode.CLAUDE_CODE_LOGIN_STATUS_TTL_MS) {
+			return Promise.resolve(cached.value);
+		}
+		this.claudeCodeLoginCheck ??= checkClaudeCodeLoggedIn()
+			.then((value) => {
+				this.claudeCodeLoginStatus = { value, checkedAt: Date.now() };
+				return value;
+			})
+			.finally(() => {
+				this.claudeCodeLoginCheck = undefined;
+			});
+		return this.claudeCodeLoginCheck;
 	}
 
 	private applyConnectionModelCatalog(catalog: AgentConnectionModelCatalog): void {
@@ -12144,6 +12207,7 @@ export class InteractiveMode {
 				scopedModels: this.getScopedModelState(),
 				availableModels: modelCatalog,
 				configuredProviders: this.connectionConfiguredProviders,
+				unconfiguredProviders: this.getProbeUnconfiguredProviders(),
 				recentModels: this.settingsManager.getRecentModels(),
 				initialModelSearch,
 				getRows: () => this.ui.terminal.rows,
@@ -12177,6 +12241,13 @@ export class InteractiveMode {
 				onCancel: finish,
 			});
 			handle = this.showFullPaneOverlay(menu, 96);
+			// Ambient detection claims claude-code whenever the binary exists; ask the CLI
+			// whether it is actually logged in and re-badge the open menu when it is not.
+			if (this.connectionConfiguredProviders.has("claude-code")) {
+				void this.probeClaudeCodeLoginStatus().then(() => {
+					if (!settled) menu.updateUnconfiguredProviders(this.getProbeUnconfiguredProviders());
+				});
+			}
 			refreshModels(initialModelSearch !== undefined);
 		});
 	}

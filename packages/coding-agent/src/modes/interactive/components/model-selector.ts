@@ -107,6 +107,12 @@ function scoreModelSearch(item: ModelItem, query: string): ModelSearchMatch | nu
 export interface ModelSelectorOptions {
 	availableModels?: ReadonlyArray<Model<any>>;
 	configuredProviders?: ReadonlySet<string>;
+	/**
+	 * Providers a live probe disproved even though the catalog/local detection claims
+	 * them configured (e.g. a `claude` binary that was never logged in). They badge and
+	 * sort as unconfigured.
+	 */
+	unconfiguredProviders?: ReadonlySet<string>;
 	header?: Component;
 	getHeaderRows?: () => number;
 	subtitle?: string;
@@ -153,6 +159,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private onCancelCallback: () => void;
 	private availableModels?: ReadonlyArray<Model<any>>;
 	private configuredProviders?: ReadonlySet<string>;
+	private unconfiguredProviders?: ReadonlySet<string>;
 	private recentRank: Map<string, number>;
 	private errorMessage?: string;
 	private tui: TUI;
@@ -194,6 +201,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.onCancelCallback = onCancel;
 		this.availableModels = options.availableModels;
 		this.configuredProviders = options.configuredProviders;
+		this.unconfiguredProviders = options.unconfiguredProviders;
 		this.recentRank = new Map((options.recentModels ?? []).map((key, i) => [key, i]));
 		this.viewport = { getRows: options.getRows };
 		this.getHeaderRows = options.header ? (options.getHeaderRows ?? (() => 2)) : () => 0;
@@ -274,6 +282,28 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.tui.requestRender();
 	}
 
+	/**
+	 * Live result of an async auth probe: re-badges and re-sorts in place, keeping the
+	 * user's search query and selection, when a provider's claimed sign-in is disproved
+	 * (or a real login lands) while the menu is open.
+	 */
+	setUnconfiguredProviders(unconfiguredProviders: ReadonlySet<string> | undefined): void {
+		if (this.unconfiguredProviders === unconfiguredProviders) return;
+		this.unconfiguredProviders = unconfiguredProviders;
+		const query = this.searchInput.getValue();
+		const selectedKey = this.getSelectedModelKey();
+		this.loadModels();
+		this.filterModels(query);
+		if (selectedKey) {
+			const selectedIndex = this.filteredModels.findIndex((item) => this.getModelKey(item) === selectedKey);
+			if (selectedIndex >= 0) {
+				this.selectedIndex = selectedIndex;
+			}
+		}
+		this.updateList();
+		this.tui.requestRender();
+	}
+
 	private loadModels(): void {
 		let models: ModelItem[];
 		this.errorMessage = undefined;
@@ -343,6 +373,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private isProviderConfigured(item: ModelItem): boolean {
+		if (this.unconfiguredProviders?.has(item.provider)) return false;
 		return this.configuredProviders?.has(item.provider) || this.modelRegistry.hasConfiguredAuth(item.model);
 	}
 
