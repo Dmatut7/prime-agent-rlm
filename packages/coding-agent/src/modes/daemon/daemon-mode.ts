@@ -33,6 +33,7 @@ import {
 	type AgentSessionMessageAbortReceipt,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
+	type AgentSessionMessageDeliveryMode,
 	type AgentSessionMessageDeliveryStatus,
 	type AgentSessionMessageEndpoint,
 	type AgentSessionMessageListResult,
@@ -5012,6 +5013,7 @@ export class AgentDaemon {
 					clientId: client.id,
 					senderKey: this.createCliAgentMessageSenderKey(),
 					origin: command.agentOrigin === true ? "agent" : "cli",
+					deliveryMode: command.deliveryMode,
 				});
 				return success(command.id, "send_message", receipt);
 			}
@@ -6616,6 +6618,12 @@ export class AgentDaemon {
 		clientId?: string;
 		senderKey?: string;
 		origin: "agent" | "cli";
+		/**
+		 * How a busy target takes the message: "follow_up" queues behind the current
+		 * turn, anything else (undefined/"auto"/"steer") keeps the default steering
+		 * delivery. Honored since rev 41 - see send_message_delivery_mode.
+		 */
+		deliveryMode?: AgentSessionMessageDeliveryMode;
 	}): Promise<AgentSessionMessageReceipt> {
 		if (this.agentMessagesPaused) {
 			throw new Error("Agent messaging is paused");
@@ -6693,14 +6701,21 @@ export class AgentDaemon {
 			target: this.createAgentSessionMessageEndpoint(targetState),
 		};
 		try {
-			const outcome = await this.acceptAgentSessionMessage(targetState, payload);
+			const outcome = await this.acceptAgentSessionMessage(targetState, payload, options.deliveryMode);
 			// A queued send is a fact the sender must be able to act on: how full the
 			// target's queue is, and whether this is a repeat of an unread earlier send.
 			const queued =
 				outcome.status === "queued"
 					? this.recordQueuedAgentMessage(senderKey, targetState.activeSessionId, outcome)
 					: this.clearQueuedAgentMessage(senderKey, targetState.activeSessionId);
-			return createAgentSessionMessageReceipt(payload, outcome.status, undefined, queued);
+			const receipt = createAgentSessionMessageReceipt(payload, outcome.status, undefined, queued);
+			if (options.deliveryMode === "follow_up") {
+				// createAgentSessionMessageReceipt stamps deliveryMode: "steer" (the type in
+				// agent-messages.ts admits no other value); a follow-up receipt must not
+				// claim a steer it did not perform.
+				delete receipt.deliveryMode;
+			}
+			return receipt;
 		} catch (error) {
 			this.agentMessageRateLimiter.refund(rateLimitKey);
 			throw error;
@@ -6981,6 +6996,7 @@ export class AgentDaemon {
 	private async acceptAgentSessionMessage(
 		targetState: ActiveSessionState,
 		payload: AgentSessionMessagePayload,
+		deliveryMode?: AgentSessionMessageDeliveryMode,
 	): Promise<{
 		status: AgentSessionMessageDeliveryStatus;
 		queuedReason?: AgentMessageQueuedReason;
@@ -6992,7 +7008,7 @@ export class AgentDaemon {
 		let queuedReason: AgentMessageQueuedReason | undefined;
 		await targetState.runtime.session.acceptAgentMessagePrompt(message.content, {
 			expandPromptTemplates: false,
-			streamingBehavior: "steer",
+			streamingBehavior: deliveryMode === "follow_up" ? "followUp" : "steer",
 			queueIfBusy: true,
 			customMessage: message,
 			admissionCommitted: () => {

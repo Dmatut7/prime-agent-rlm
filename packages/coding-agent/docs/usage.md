@@ -13,7 +13,7 @@ The interface has four main areas:
 - **Startup header** - compact brand and runtime summary; `--verbose` also lists loaded context files, prompt templates, skills, and extensions
 - **Messages** - user messages, assistant responses, tool calls, tool results, notifications, errors, and extension UI
 - **Editor** - where you type
-- **Footer** - empty by default; use `/usage` for token, cost, and context details
+- **Footer** - one telemetry line by default (model, thinking level, watermark, context figures; turn it off with `footer.telemetry: "off"` in settings); use `/usage` for token, cost, and context details
 
 The editor can be replaced temporarily by built-in UI such as `/settings` or by custom extension UI.
 
@@ -46,7 +46,7 @@ Type `/` in the editor to open command completion. Extensions can register custo
 | `/new` | Start a new session |
 | `/name <name>` | Set session display name |
 | `/session` | Show session file, ID, and message counts |
-| `/traces [status\|on\|off\|preview\|upload-current\|upload-all\|login]` | Preview, upload, or manage opt-in trace sharing |
+| `/traces [status\|on\|off\|preview\|upload\|upload-current\|upload-all\|login]` | Preview, upload, or manage opt-in trace sharing |
 | `/usage`, `/context` | Show the parent and subagent context, token, and cost breakdown |
 | `/speed [on\|off]` | Toggle footer readout of model output tok/sec (latest response and session average) |
 | `/tree` | Jump to any point in the session and continue from there |
@@ -56,10 +56,11 @@ Type `/` in the editor to open command completion. Extensions can register custo
 | `/refine [instructions]` | Refine or roll back session-backed harness state |
 | `/copy` | Copy last assistant message to clipboard |
 | `/btw <question>`, `/side <question>` | Ask an inline side question without adding it to the session; replies continue the side conversation, esc returns |
-| `/export [file]` | Export session to HTML |
+| `/export [file]` | Export session to HTML, or to JSONL when the path ends in `.jsonl` |
 | `/share` | Upload the full session (messages, system prompt, tools) as a private GitHub gist |
 | `/reload` | Reload keybindings, extensions, skills, prompts, and context files |
 | `/hotkeys` | Show all keyboard shortcuts |
+| `/help` | Show the command overview |
 | `/changelog` | Display version history |
 | `/quit` | Quit Prime Agent |
 
@@ -160,7 +161,7 @@ Append to the default prompt without replacing it with `APPEND_SYSTEM.md` in eit
 
 ## Exporting and Sharing Sessions
 
-Use `/export [file]` to write a session to HTML.
+Use `/export [file]` to write a session to HTML, or to JSONL when the path ends in `.jsonl`.
 
 Use `/share` to upload a private GitHub gist with a shareable HTML link. The gist contains the **full session**: messages, system prompt, and tool definitions. If the session looks like it contains secrets (`sk-`, `AKIA`, `ghp_`, Bearer tokens), `/share` warns and asks for confirmation before uploading. Matched secret text is never shown in the warning.
 
@@ -173,16 +174,22 @@ prime-agent [options] [@files...] [messages...]
 ### Shell Commands
 
 ```bash
+prime-agent help [command]
 prime-agent agents
 prime-agent list [--all]
 prime-agent attach <agent>
 prime-agent stop <agent>
 prime-agent rename <agent> <name>
-prime-agent send <agent> <message>
+prime-agent send [--from <agent>] [--steer|--follow-up] <agent> <message>
 prime-agent schedule <list|add|cancel>
 prime-agent status
 prime-agent doctor [--fix]
+prime-agent retention <status|sweep> [--dry-run]
 prime-agent shutdown [--force]
+
+prime-agent model list [search]
+prime-agent mcp <add|list|get|remove>
+prime-agent session export <file> [output]
 
 prime-agent package install <source> [--local]
 prime-agent package remove <source> [--local]
@@ -290,7 +297,7 @@ Autonomous limits and gates do not sandbox IPython or commands, and the elapsed-
 | `--autonomous-max-tokens <n>` | Set the maximum accumulated tokens. Default: `80000`; accounting includes input, output, and cache-write tokens, but excludes cache-read tokens. |
 | `--autonomous-timeout-ms <n>` | Set the maximum elapsed autonomous time in milliseconds. Default: `1800000` (30 minutes). |
 
-All `<n>` values must be positive integers: zero, negative, fractional, and non-numeric values are rejected. Value-taking autonomous flags require a separate argument, not `--flag=value`. A missing value is rejected, and a following long option is not consumed as a value. Repeating a numeric flag uses its last value; repeating `--autonomous-gate` appends another gate.
+All `<n>` values must be positive integers: zero, negative, fractional, and non-numeric values are rejected. Value-taking flags accept both a separate argument and the `--flag=value` form. A missing value is rejected, and a following long option is not consumed as a value. Repeating a numeric flag uses its last value; repeating `--autonomous-gate` appends another gate.
 
 After each assistant response, configured gates run before the ordinary continuation limits are evaluated. All gates must pass for the run to finish. A failed gate supplies bounded command output to the next continuation so the agent can repair it; Prime Agent avoids rerunning an unchanged failed gate and advances its attempt count instead. A passing gate permits completion even if a continuation, turn, token, or time limit has otherwise been reached. If a gate does not pass, or if there are no gates, the host can inject another continuation only while all four limits remain below their configured values. Limits are checked in this order: continuations, turns, tokens, then elapsed time. Reaching one prevents another automatic continuation; it does not imply task success.
 

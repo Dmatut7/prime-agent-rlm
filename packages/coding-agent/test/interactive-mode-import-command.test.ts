@@ -7,6 +7,17 @@ type PathCommand = "/export" | "/import";
 type InteractiveModePrototype = {
 	getPathCommandArgument(this: unknown, text: string, command: PathCommand): string | undefined;
 	handleImportCommand(this: ImportCommandContext, text: string): Promise<void>;
+	handleExportCommand(this: ExportCommandContext, text: string): Promise<void>;
+};
+
+type ExportCommandContext = {
+	agentConnection: {
+		exportToHtml: (outputPath?: string) => Promise<string>;
+		exportToJsonl: (outputPath: string) => Promise<string>;
+	};
+	showError: (message: string) => void;
+	showStatus: (message: string, severity?: string) => void;
+	getPathCommandArgument: (text: string, command: PathCommand) => string | undefined;
 };
 
 type ImportCommandContext = {
@@ -140,5 +151,58 @@ describe("InteractiveMode /import parsing", () => {
 		expect(showError).toHaveBeenCalledWith("导入会话失败：File not found: /tmp/missing-session.jsonl");
 		expect(showStatus).not.toHaveBeenCalled();
 		expect(handleFatalRuntimeError).not.toHaveBeenCalled();
+	});
+});
+
+describe("InteractiveMode /export parsing", () => {
+	it("throws a usage error for an unclosed quote instead of falling back to the default path", () => {
+		expect(() => interactiveModePrototype.getPathCommandArgument('/export "unclosed/path.html', "/export")).toThrow(
+			"用法：/export <路径>（引号未闭合）",
+		);
+		expect(() => interactiveModePrototype.getPathCommandArgument("/import 'unclosed", "/import")).toThrow(
+			"用法：/import <路径>（引号未闭合）",
+		);
+	});
+
+	it("reports the unclosed-quote usage error and exports nothing", async () => {
+		const exportToHtml = vi.fn(async () => "/tmp/default.html");
+		const exportToJsonl = vi.fn(async () => "/tmp/out.jsonl");
+		const showError = vi.fn();
+		const showStatus = vi.fn();
+
+		const context: ExportCommandContext = {
+			agentConnection: { exportToHtml, exportToJsonl },
+			showError,
+			showStatus,
+			getPathCommandArgument: interactiveModePrototype.getPathCommandArgument,
+		};
+
+		await interactiveModePrototype.handleExportCommand.call(context, '/export "unclosed');
+
+		expect(showError).toHaveBeenCalledWith("用法：/export <路径>（引号未闭合）");
+		expect(exportToHtml).not.toHaveBeenCalled();
+		expect(exportToJsonl).not.toHaveBeenCalled();
+		expect(showStatus).not.toHaveBeenCalled();
+	});
+
+	it("routes a .jsonl export path to the JSONL exporter", async () => {
+		const exportToHtml = vi.fn(async () => "/tmp/default.html");
+		const exportToJsonl = vi.fn(async () => "/tmp/out.jsonl");
+		const showError = vi.fn();
+		const showStatus = vi.fn();
+
+		const context: ExportCommandContext = {
+			agentConnection: { exportToHtml, exportToJsonl },
+			showError,
+			showStatus,
+			getPathCommandArgument: interactiveModePrototype.getPathCommandArgument,
+		};
+
+		await interactiveModePrototype.handleExportCommand.call(context, "/export out.jsonl");
+
+		expect(exportToJsonl).toHaveBeenCalledWith("out.jsonl");
+		expect(exportToHtml).not.toHaveBeenCalled();
+		expect(showError).not.toHaveBeenCalled();
+		expect(showStatus).toHaveBeenCalledWith("会话已导出到：/tmp/out.jsonl");
 	});
 });

@@ -44,7 +44,7 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 	},
 	{
 		path: ["send"],
-		usage: "send [--from <agent>] <agent> <message>",
+		usage: "send [--from <agent>] [--steer|--follow-up] <agent> <message>",
 		summary: "Send a message to an agent",
 		options: [
 			"--from <agent>  Identify the sending agent",

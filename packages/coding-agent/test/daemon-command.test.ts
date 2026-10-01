@@ -384,6 +384,59 @@ describe("daemon command", () => {
 		});
 	});
 
+	it("passes send --steer through as a send_message deliveryMode", async () => {
+		await expect(
+			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "send", "worker", "--steer", "hello"]),
+		).resolves.toBe(true);
+
+		const client = daemonClientMock.instances[0];
+		expect(client?.requests[0]).toEqual({
+			type: "send_message",
+			targetActiveSessionId: "worker",
+			fromActiveSessionId: undefined,
+			message: "hello",
+			deliveryMode: "steer",
+		});
+	});
+
+	it("passes send --follow-up through as a send_message deliveryMode", async () => {
+		await expect(
+			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "send", "--follow-up", "worker", "hello"]),
+		).resolves.toBe(true);
+
+		const client = daemonClientMock.instances[0];
+		expect(client?.requests[0]).toEqual({
+			type: "send_message",
+			targetActiveSessionId: "worker",
+			fromActiveSessionId: undefined,
+			message: "hello",
+			deliveryMode: "follow_up",
+		});
+	});
+
+	it("rejects send with both --steer and --follow-up", async () => {
+		await expect(
+			handleDaemonCommand([
+				"daemon",
+				"--socket",
+				"/tmp/prime-agent.sock",
+				"send",
+				"worker",
+				"--steer",
+				"--follow-up",
+				"hello",
+			]),
+		).resolves.toBe(true);
+
+		expect(daemonClientMock.instances[0]?.requests).toEqual([]);
+		expect(
+			consoleErrorMessages.some(
+				(message) =>
+					typeof message === "string" && message.includes("--steer and --follow-up cannot be used together"),
+			),
+		).toBe(true);
+	});
+
 	it("preserves cron add separator before the scheduled prompt", async () => {
 		await expect(
 			handleDaemonCommand([

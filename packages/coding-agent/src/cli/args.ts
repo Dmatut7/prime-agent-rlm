@@ -144,7 +144,67 @@ export function isValidThinkingLevel(level: string): level is ThinkingLevel {
 	return THINKING_LEVELS.includes(level as ThinkingLevel);
 }
 
-export function parseArgs(args: string[]): Args {
+/**
+ * Value-taking options that also accept the `--flag=value` spelling. Without this the
+ * equals form fell into unknownFlags (meant for extension flags) and the option silently
+ * did nothing. Options with dedicated equals handling below (--resume=, --export=,
+ * --list-models=) keep theirs.
+ */
+const EQUALS_FORM_OPTIONS: ReadonlySet<string> = new Set([
+	"--mode",
+	"--daemon-socket",
+	"--provider",
+	"--model",
+	"--api-key",
+	"--cwd",
+	"--system-prompt",
+	"--append-system-prompt",
+	"--fork",
+	"--session-dir",
+	"--models",
+	"--tools",
+	"--thinking",
+	"--extension",
+	"--skill",
+	"--prompt-template",
+	"--theme",
+	"--autonomous-gate",
+	"--autonomous-gate-retries",
+	"--autonomous-gate-timeout-ms",
+	"--autonomous-max-continuations",
+	"--autonomous-max-turns",
+	"--autonomous-max-tokens",
+	"--autonomous-timeout-ms",
+	"--goal",
+	"--goal-token-budget",
+]);
+
+/** Rewrite `--flag=value` for known value-taking options into the two-token form the parser handles. */
+function expandEqualsFormOptions(args: string[]): string[] {
+	const expanded: string[] = [];
+	let endOfOptions = false;
+	for (const arg of args) {
+		if (endOfOptions || arg === INTERNAL_RUNTIME_COMMAND_MARKER) {
+			expanded.push(arg);
+			continue;
+		}
+		if (arg === "--") {
+			endOfOptions = true;
+			expanded.push(arg);
+			continue;
+		}
+		const eqIndex = arg.startsWith("--") ? arg.indexOf("=") : -1;
+		if (eqIndex > 2 && EQUALS_FORM_OPTIONS.has(arg.slice(0, eqIndex))) {
+			expanded.push(arg.slice(0, eqIndex), arg.slice(eqIndex + 1));
+		} else {
+			expanded.push(arg);
+		}
+	}
+	return expanded;
+}
+
+export function parseArgs(rawArgs: string[]): Args {
+	const args = expandEqualsFormOptions(rawArgs);
 	const result: Args = {
 		messages: [],
 		fileArgs: [],
@@ -174,10 +234,19 @@ export function parseArgs(args: string[]): Args {
 			result.help = true;
 		} else if (arg === "--version" || arg === "-v") {
 			result.version = true;
-		} else if (arg === "--mode" && i + 1 < args.length) {
+		} else if (arg === "--mode") {
+			if (i + 1 >= args.length) {
+				result.diagnostics.push({ type: "error", message: "--mode requires a value" });
+				continue;
+			}
 			const mode = args[++i];
 			if (mode === "text" || mode === "json" || mode === "rpc" || mode === "acp" || mode === "daemon") {
 				result.mode = mode;
+			} else {
+				result.diagnostics.push({
+					type: "error",
+					message: `Invalid --mode value "${mode}". Valid values: text, json, rpc, acp, daemon`,
+				});
 			}
 		} else if (arg === "--daemon-socket" && i + 1 < args.length) {
 			result.daemonSocket = args[++i];

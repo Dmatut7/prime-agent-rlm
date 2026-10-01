@@ -133,6 +133,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		takesArgument: true,
 	},
 	{ name: "hotkeys", description: "查看全部快捷键" },
+	{ name: "help", description: "查看命令概览；快捷键见 /hotkeys" },
 	{ name: "fork", description: "从之前的某条消息分叉出新会话" },
 	{ name: "clone", description: "在当前位置复制一份会话" },
 	{ name: "tree", description: "浏览会话历史树（切换分支）" },
@@ -268,6 +269,34 @@ export function builtinSlashCommandTakesArgument(name: string): boolean {
 	if (name === "clear") return false;
 	return BUILTIN_SLASH_COMMAND_BY_NAME.get(resolveBuiltinSlashCommandName(name))?.takesArgument === true;
 }
+
+/**
+ * Canonical names of built-in commands that take no argument. An argument after one of
+ * these is a usage error, never a prompt: interactive mode intercepts them before the
+ * dispatch chain, where e.g. "/share extra" used to fall through to the model verbatim.
+ * Commands that accept an optional argument (effort, traces, compact, ...) are not
+ * listed even though they leave takesArgument unset.
+ */
+export const NO_ARGUMENT_BUILTIN_SLASH_COMMANDS: ReadonlySet<string> = new Set([
+	"settings",
+	"scoped-models",
+	"share",
+	"copy",
+	"session",
+	"system-prompt",
+	"logs",
+	"context",
+	"changelog",
+	"hotkeys",
+	"help",
+	"fork",
+	"clone",
+	"tree",
+	"login",
+	"logout",
+	"reload",
+	"quit",
+]);
 
 export function resolveSlashCommand(command: ParsedSlashCommand): ResolvedSlashCommand {
 	const name = resolveBuiltinSlashCommandName(command.name);

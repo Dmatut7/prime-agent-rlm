@@ -190,6 +190,23 @@ describe("parseArgs", () => {
 			expect(result.mode).toBe("rpc");
 		});
 
+		test("rejects an invalid --mode value", () => {
+			const result = parseArgs(["--mode", "bogus"]);
+			expect(result.mode).toBeUndefined();
+			expect(result.unknownFlags.has("mode")).toBe(false);
+			expect(result.diagnostics).toContainEqual({
+				type: "error",
+				message: 'Invalid --mode value "bogus". Valid values: text, json, rpc, acp, daemon',
+			});
+		});
+
+		test("rejects --mode without a value", () => {
+			const result = parseArgs(["--mode"]);
+			expect(result.mode).toBeUndefined();
+			expect(result.unknownFlags.has("mode")).toBe(false);
+			expect(result.diagnostics).toContainEqual({ type: "error", message: "--mode requires a value" });
+		});
+
 		test("parses --fork", () => {
 			const result = parseArgs(["--fork", "1234abcd"]);
 			expect(result.fork).toBe("1234abcd");
@@ -234,6 +251,75 @@ describe("parseArgs", () => {
 		test("parses --models as comma-separated list", () => {
 			const result = parseArgs(["--models", "gpt-4o,claude-sonnet,gemini-pro"]);
 			expect(result.models).toEqual(["gpt-4o", "claude-sonnet", "gemini-pro"]);
+		});
+	});
+
+	describe("--flag=value form", () => {
+		test("parses --mode=json", () => {
+			const result = parseArgs(["--mode=json"]);
+			expect(result.mode).toBe("json");
+			expect(result.unknownFlags.size).toBe(0);
+		});
+
+		test("rejects an invalid --mode= value", () => {
+			const result = parseArgs(["--mode=bogus"]);
+			expect(result.mode).toBeUndefined();
+			expect(result.diagnostics).toContainEqual({
+				type: "error",
+				message: 'Invalid --mode value "bogus". Valid values: text, json, rpc, acp, daemon',
+			});
+		});
+
+		test("parses --model=<id>", () => {
+			const result = parseArgs(["--model=openai/gpt-4o"]);
+			expect(result.model).toBe("openai/gpt-4o");
+			expect(result.unknownFlags.size).toBe(0);
+		});
+
+		test("parses --thinking=<level>", () => {
+			const result = parseArgs(["--thinking=high"]);
+			expect(result.thinking).toBe("high");
+		});
+
+		test("parses --models=<patterns>", () => {
+			const result = parseArgs(["--models=gpt-4o,claude-sonnet"]);
+			expect(result.models).toEqual(["gpt-4o", "claude-sonnet"]);
+		});
+
+		test("parses repeatable options in equals form", () => {
+			const result = parseArgs(["--extension=./a.ts", "--extension=./b.ts", "--skill=./s.md"]);
+			expect(result.extensions).toEqual(["./a.ts", "./b.ts"]);
+			expect(result.skills).toEqual(["./s.md"]);
+		});
+
+		test("parses numeric autonomous options in equals form", () => {
+			const result = parseArgs(["--autonomous-max-turns=5", "--autonomous-timeout-ms=60000"]);
+			expect(result.autonomous).toBe(true);
+			expect(result.autonomousMaxTurns).toBe(5);
+			expect(result.autonomousTimeoutMs).toBe(60000);
+			expect(result.diagnostics).toEqual([]);
+		});
+
+		test("keeps a value containing further equals signs intact", () => {
+			const result = parseArgs(["--system-prompt=a=b"]);
+			expect(result.systemPrompt).toBe("a=b");
+		});
+
+		test("reports an empty --goal= value", () => {
+			const result = parseArgs(["--goal="]);
+			expect(result.goal).toBeUndefined();
+			expect(result.diagnostics).toContainEqual({ type: "error", message: "--goal requires a non-empty objective" });
+		});
+
+		test("keeps unknown --flag=value in unknownFlags", () => {
+			const result = parseArgs(["--unknown-thing=value"]);
+			expect(result.unknownFlags.get("unknown-thing")).toBe("value");
+		});
+
+		test("does not expand --flag=value after the -- separator", () => {
+			const result = parseArgs(["--", "--mode=json"]);
+			expect(result.mode).toBeUndefined();
+			expect(result.messages).toEqual(["--mode=json"]);
 		});
 	});
 

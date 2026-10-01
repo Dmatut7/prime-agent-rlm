@@ -145,6 +145,7 @@ import {
 	BUILTIN_SLASH_COMMANDS,
 	builtinSlashCommandTakesArgument,
 	isBuiltinSlashCommandName,
+	NO_ARGUMENT_BUILTIN_SLASH_COMMANDS,
 	parseSlashCommand,
 	resolveBuiltinSlashCommandName,
 } from "../../core/slash-commands.js";
@@ -5817,6 +5818,14 @@ export class InteractiveMode {
 					return;
 				}
 				if (commandName) {
+					// No-argument built-ins reject arguments instead of falling through to
+					// the prompt (the /clear pattern): "/share extra" used to reach the
+					// model verbatim. Restore the draft so the user can fix the command.
+					if (commandArgs && NO_ARGUMENT_BUILTIN_SLASH_COMMANDS.has(commandName)) {
+						this.editor.setText(text);
+						this.showError(`用法：/${commandName}`);
+						return;
+					}
 					void captureAgentCommandUsed({
 						agentDir: getAgentDir(),
 						settingsManager: this.settingsManager,
@@ -5937,6 +5946,12 @@ export class InteractiveMode {
 				if (commandName === "hotkeys" && !commandArgs) {
 					this.echoLocalCommand(text);
 					this.handleHotkeysCommand();
+					this.editor.setText("");
+					return;
+				}
+				if (commandName === "help") {
+					this.echoLocalCommand(text);
+					this.handleHelpCommand();
 					this.editor.setText("");
 					return;
 				}
@@ -7689,7 +7704,7 @@ export class InteractiveMode {
 	private async openScopedAgentsView(childActiveSessionId?: string, row?: SubagentPanelRow): Promise<void> {
 		if (!this.options.returnToAgentsView) {
 			this.focusEditor();
-			this.showStatus("会话列表需要后台服务；不带 --no-daemon 启动才能浏览会话");
+			this.showStatus("会话列表在 --no-session 启动的会话里不可用（会话不入库，后台服务没有可浏览的记录）");
 			return;
 		}
 		// The row's child identity rides along: a child the daemon closed after it sat
@@ -9502,7 +9517,7 @@ export class InteractiveMode {
 
 	private async requestAgentsView(): Promise<void> {
 		if (!this.options.returnToAgentsView) {
-			this.showStatus("会话列表需要后台服务；不带 --no-daemon 启动才能浏览会话");
+			this.showStatus("会话列表在 --no-session 启动的会话里不可用（会话不入库，后台服务没有可浏览的记录）");
 			return;
 		}
 		await this.returnToAgentsView();
@@ -12658,7 +12673,15 @@ export class InteractiveMode {
 	}
 
 	private async handleExportCommand(text: string): Promise<void> {
-		const outputPath = this.getPathCommandArgument(text, "/export");
+		let outputPath: string | undefined;
+		try {
+			outputPath = this.getPathCommandArgument(text, "/export");
+		} catch (error) {
+			// Malformed path argument (unclosed quote): report it instead of silently
+			// exporting to the default path.
+			this.showError(error instanceof Error ? error.message : String(error));
+			return;
+		}
 
 		try {
 			if (outputPath?.endsWith(".jsonl")) {
@@ -12699,7 +12722,7 @@ export class InteractiveMode {
 		if (firstChar === '"' || firstChar === "'") {
 			const closingQuoteIndex = argsString.indexOf(firstChar, 1);
 			if (closingQuoteIndex < 0) {
-				return undefined;
+				throw new Error(`用法：${command} <路径>（引号未闭合）`);
 			}
 			return argsString.slice(1, closingQuoteIndex);
 		}
@@ -12712,7 +12735,13 @@ export class InteractiveMode {
 	}
 
 	private async handleImportCommand(text: string): Promise<void> {
-		const inputPath = this.getPathCommandArgument(text, "/import");
+		let inputPath: string | undefined;
+		try {
+			inputPath = this.getPathCommandArgument(text, "/import");
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+			return;
+		}
 		if (!inputPath) {
 			this.showError("用法：/import <文件.jsonl>");
 			return;
@@ -13779,6 +13808,18 @@ ${blocksPrev ? `| \`${blocksPrev}\`${blocksNext ? ` / \`${blocksNext}\`` : ""} |
 
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Markdown(hotkeys.trim(), 1, 1, this.getMarkdownThemeWithSettings()));
+		this.ui.requestRender();
+	}
+
+	private handleHelpCommand(): void {
+		const lines = BUILTIN_SLASH_COMMANDS.map((command) => {
+			const hint = command.argumentHint ? ` ${command.argumentHint}` : "";
+			return `- \`/${command.name}${hint}\` — ${command.description}`;
+		});
+		const markdown = `**命令概览**\n\n${lines.join("\n")}\n\n快捷键见 \`/hotkeys\`，启动参数见 \`${APP_NAME} --help\`。`;
+
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Markdown(markdown, 1, 1, this.getMarkdownThemeWithSettings()));
 		this.ui.requestRender();
 	}
 

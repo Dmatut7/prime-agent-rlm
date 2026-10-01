@@ -4,6 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import chalk from "chalk";
 import { expandTildePath } from "../config.js";
+import type { AgentSessionMessageDeliveryMode } from "../core/agent-messages.js";
 import type { AgentSessionEvent } from "../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../core/agent-session-config.js";
 import { type AgentCronJob, formatAgentCronJob } from "../core/cron-jobs.js";
@@ -932,6 +933,7 @@ async function runSend(client: DaemonClient, args: string[], json: boolean): Pro
 		targetActiveSessionId: parsed.targetActiveSessionId,
 		fromActiveSessionId: parsed.fromActiveSessionId,
 		message: parsed.message,
+		...(parsed.deliveryMode ? { deliveryMode: parsed.deliveryMode } : {}),
 	});
 	const data = requireSuccess(response);
 	if (json) {
@@ -950,12 +952,14 @@ interface ParsedSendArgs {
 	targetActiveSessionId: string;
 	fromActiveSessionId?: string;
 	message: string;
+	deliveryMode?: AgentSessionMessageDeliveryMode;
 }
 
 function parseSendArgs(args: string[]): ParsedSendArgs {
 	let fromActiveSessionId: string | undefined;
 	let targetActiveSessionId: string | undefined;
 	let explicitMessage: string | undefined;
+	let deliveryMode: AgentSessionMessageDeliveryMode | undefined;
 	const messageParts: string[] = [];
 	let parseOptions = true;
 
@@ -972,6 +976,14 @@ function parseSendArgs(args: string[]): ParsedSendArgs {
 			}
 			fromActiveSessionId = value;
 			index++;
+			continue;
+		}
+		if (parseOptions && (arg === "--steer" || arg === "--follow-up")) {
+			const requested: AgentSessionMessageDeliveryMode = arg === "--steer" ? "steer" : "follow_up";
+			if (deliveryMode !== undefined && deliveryMode !== requested) {
+				throw new Error("--steer and --follow-up cannot be used together");
+			}
+			deliveryMode = requested;
 			continue;
 		}
 		if (parseOptions && arg === "--message") {
@@ -998,16 +1010,21 @@ function parseSendArgs(args: string[]): ParsedSendArgs {
 	}
 
 	if (explicitMessage !== undefined && messageParts.length > 0) {
-		throw new Error("Usage: prime-agent send [--from <agent>] <agent> [--message <message>|<message>]");
+		throw new Error(
+			"Usage: prime-agent send [--from <agent>] [--steer|--follow-up] <agent> [--message <message>|<message>]",
+		);
 	}
 	const message = (explicitMessage ?? messageParts.join(" ")).trim();
 	if (!targetActiveSessionId || !message) {
-		throw new Error("Usage: prime-agent send [--from <agent>] <agent> [--message <message>|<message>]");
+		throw new Error(
+			"Usage: prime-agent send [--from <agent>] [--steer|--follow-up] <agent> [--message <message>|<message>]",
+		);
 	}
 	return {
 		targetActiveSessionId,
 		fromActiveSessionId,
 		message,
+		deliveryMode,
 	};
 }
 

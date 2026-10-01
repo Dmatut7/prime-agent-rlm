@@ -5,6 +5,7 @@ import {
 	builtinSlashCommandTakesArgument,
 	isBuiltinSlashCommandName,
 	isSessionSlashCommandName,
+	NO_ARGUMENT_BUILTIN_SLASH_COMMANDS,
 	parseRefineCommandOptions,
 	parseSessionSlashCommand,
 	parseSlashCommand,
@@ -92,6 +93,42 @@ describe("built-in slash commands", () => {
 		expect(builtinSlashCommandTakesArgument("mcp")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("new")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("clear")).toBe(false);
+	});
+
+	test("exposes /help as the built-in command overview", () => {
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "help")).toMatchObject({
+			description: "查看命令概览；快捷键见 /hotkeys",
+		});
+		expect(isBuiltinSlashCommandName("help")).toBe(true);
+		expect(builtinSlashCommandTakesArgument("help")).toBe(false);
+	});
+
+	test("no-argument built-in set only names registered commands that take no argument", () => {
+		expect(NO_ARGUMENT_BUILTIN_SLASH_COMMANDS.size).toBeGreaterThan(0);
+		for (const name of NO_ARGUMENT_BUILTIN_SLASH_COMMANDS) {
+			expect(isBuiltinSlashCommandName(name)).toBe(true);
+			expect(builtinSlashCommandTakesArgument(name)).toBe(false);
+		}
+		// The commands whose stray arguments used to reach the model verbatim.
+		for (const name of [
+			"share",
+			"copy",
+			"session",
+			"system-prompt",
+			"context",
+			"logs",
+			"changelog",
+			"hotkeys",
+			"fork",
+			"clone",
+			"tree",
+			"login",
+			"logout",
+			"settings",
+			"scoped-models",
+		]) {
+			expect(NO_ARGUMENT_BUILTIN_SLASH_COMMANDS.has(name)).toBe(true);
+		}
 	});
 });
 

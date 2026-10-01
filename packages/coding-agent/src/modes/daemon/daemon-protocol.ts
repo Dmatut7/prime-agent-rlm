@@ -278,8 +278,16 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   or response required-field changes: an older client ignores every one of
 //   these additions, exactly as it ignored empty_response_exhausted at rev 39,
 //   so the revision is a window marker with the digest as the identity.
-export const DAEMON_SCHEMA_REVISION = 40;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-40-ac8dd6b7277f";
+// Revision 41 honors send_message.deliveryMode: the field sat on the wire
+//   since before the revision ledger as accepted-and-ignored legacy input, and
+//   this daemon now delivers "steer"/"follow_up" as asked. The wire shapes are
+//   byte-identical to rev 40, so the digest does not move; what moves is the
+//   semantics, which is exactly the rev-39 fromActiveSessionId class: a
+//   rev-40 peer accepts the field and silently steers instead, so an explicit
+//   deliveryMode rides the new send_message_delivery_mode capability with the
+//   revision as its floor - the sender is refused rather than misdelivered.
+export const DAEMON_SCHEMA_REVISION = 41;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-41-ac8dd6b7277f";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -378,7 +386,11 @@ export type DaemonServerCapability =
 	// does not know the field degrades to its existing plain-text stall render.
 	// Build support, not an enabled verdict - the actions field itself carries
 	// the live armed/disarmed facts (autoRecoveryArmed), not the capability.
-	| "stall_action_bar";
+	| "stall_action_bar"
+	// The daemon honors send_message.deliveryMode ("steer"/"follow_up"). Rev 41;
+	// older daemons accept the field and ignore it (always steering), so a client
+	// that sets it must check this capability first or be refused by the gate.
+	| "send_message_delivery_mode";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -455,6 +467,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"child_stall_auto_recovery",
 	"stall_recovery_state",
 	"stall_action_bar",
+	"send_message_delivery_mode",
 ];
 
 /**
@@ -1144,6 +1157,15 @@ const ABORT_AGENT_TARGET_COMMAND = {
 	minSchemaRevision: 39,
 	capability: "abort_agent_target",
 } as const;
+// send_message.deliveryMode was accepted-and-ignored legacy input until rev 41 (the
+// daemon always steered). The bare command is unchanged, so only a command carrying
+// an explicit steer/follow_up request needs the gate; a rev-40 peer would silently
+// steer instead of queueing the follow-up the sender asked for.
+const SEND_MESSAGE_DELIVERY_MODE_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 41,
+	capability: "send_message_delivery_mode",
+} as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
@@ -1406,6 +1428,9 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 		command.fromActiveSessionId !== undefined
 	) {
 		requirements.push(ABORT_AGENT_TARGET_COMMAND);
+	}
+	if (command.type === "send_message" && (command.deliveryMode === "steer" || command.deliveryMode === "follow_up")) {
+		requirements.push(SEND_MESSAGE_DELIVERY_MODE_COMMAND);
 	}
 	return [...requirements, DAEMON_COMMAND_COMPATIBILITY[command.type]];
 }

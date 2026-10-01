@@ -1,0 +1,7 @@
+- Fixed `prime-agent send --steer/--follow-up`: the flags are parsed, sent as `send_message.deliveryMode`, and honored by the daemon (queued as follow-up instead of always steering). The explicit delivery mode is gated behind the new `send_message_delivery_mode` daemon capability (schema revision 41), so an older daemon refuses the request instead of silently steering.
+- Fixed `--mode` with an invalid or missing value failing silently; it now reports an error diagnostic and aborts startup.
+- Fixed `--flag=value` being silently ignored for known value-taking options (e.g. `--model=openai/gpt-4o`, `--thinking=high`, `--autonomous-max-turns=5`); the equals form now parses like the space-separated form.
+- Fixed no-argument built-in slash commands (`/share`, `/copy`, `/session`, `/system-prompt`, `/context`, `/logs`, `/changelog`, `/hotkeys`, `/fork`, `/clone`, `/tree`, `/login`, `/logout`, `/settings`, `/scoped-models`, and friends) leaking to the model as prompts when given arguments; they now report a usage error.
+- Added `/help`, an in-session command overview (keyboard shortcuts remain under `/hotkeys`).
+- Fixed `/export "unclosed-quote` silently exporting to the default path; an unclosed quote now reports a usage error (same for `/import`).
+- Fixed the agents-view guidance message pointing at a nonexistent `--no-daemon` flag; it now names the real cause (`--no-session`).

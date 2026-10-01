@@ -2742,7 +2742,61 @@ describe("daemon mode helpers", () => {
 		await expect(send).rejects.toThrow("Agent messaging is paused");
 	});
 
-	it("ignores a legacy follow-up mode and always steers agent messages", async () => {
+	it("honors an explicit follow_up delivery mode instead of steering", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const targetState = makeState("target");
+		const acceptAgentMessagePrompt = vi.fn(
+			(_message: string, options?: { preflightResult?: (accepted: boolean, queued?: boolean) => void }) => {
+				options?.preflightResult?.(true, true);
+				return Promise.resolve();
+			},
+		);
+		targetState.runtime = {
+			...targetState.runtime,
+			cwd: "/tmp",
+			session: {
+				sessionId: "session-target",
+				sessionName: "Target",
+				isStreaming: true,
+				isCompacting: false,
+				isRetrying: false,
+				isBashRunning: false,
+				unfinishedActionCount: 0,
+				acceptAgentMessagePrompt,
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(targetState.activeSessionId, targetState);
+
+		const response = await internals.handleCommand(makeClient("cli-client", targetState.activeSessionId), {
+			type: "send_message",
+			targetActiveSessionId: targetState.activeSessionId,
+			message: "queue behind the turn",
+			deliveryMode: "follow_up",
+		});
+
+		expect(acceptAgentMessagePrompt).toHaveBeenCalledWith(
+			expect.stringContaining("queue behind the turn"),
+			expect.objectContaining({
+				streamingBehavior: "followUp",
+				customMessage: expect.objectContaining({ customType: "agent_message" }),
+			}),
+		);
+		// The receipt's deliveryMode marker is typed "steer"-only; a follow-up send
+		// must not claim a steer it did not perform.
+		expect(response).toMatchObject({ data: { deliveryStatus: "queued" } });
+		expect((response as { data?: { deliveryMode?: string } }).data?.deliveryMode).toBeUndefined();
+	});
+
+	it("keeps steering as the default agent-message delivery mode", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -2780,7 +2834,6 @@ describe("daemon mode helpers", () => {
 			type: "send_message",
 			targetActiveSessionId: targetState.activeSessionId,
 			message: "do not defer",
-			deliveryMode: "follow_up",
 		});
 
 		expect(response).toMatchObject({ data: { deliveryStatus: "queued", deliveryMode: "steer" } });
