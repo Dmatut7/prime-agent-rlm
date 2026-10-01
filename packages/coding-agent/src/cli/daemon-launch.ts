@@ -594,7 +594,7 @@ export function ensureInteractiveDaemonRunning(socketPath: string, spawnCwd?: st
 	return promise;
 }
 
-const EARLY_LAUNCH_EXCLUDED_FLAGS = new Set(["--help", "-h", "--version", "-v", "--list-models", "--export"]);
+const EARLY_LAUNCH_EXCLUDED_FLAGS = new Set(["--help", "-h", "--version", "-V", "--list-models", "--export"]);
 const EARLY_LAUNCH_VALUE_FLAGS = new Set([
 	"--mode",
 	"--daemon-socket",

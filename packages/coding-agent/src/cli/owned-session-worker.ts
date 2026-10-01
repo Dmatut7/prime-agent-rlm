@@ -38,7 +38,7 @@ interface OwnedSessionRecoveryDescriptor {
 	updatedAt: string;
 }
 
-const NON_SESSION_FLAGS = new Set(["--help", "-h", "--version", "-v", "--list-models", "--export"]);
+const NON_SESSION_FLAGS = new Set(["--help", "-h", "--version", "-V", "--list-models", "--export"]);
 
 const NON_SESSION_COMMANDS = new Set([...PUBLIC_COMMAND_NAMES, ...REMOVED_COMMAND_NAMES]);
 

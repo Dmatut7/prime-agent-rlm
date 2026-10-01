@@ -277,6 +277,8 @@ import {
 	type FooterTelemetrySource,
 	finishedRunForms,
 	formatContextTokens,
+	formatLiveClock,
+	quotaParkForms,
 	type StatusBarState,
 	workingRunForms,
 } from "./components/footer.js";
@@ -1685,6 +1687,17 @@ export class InteractiveMode {
 	/** The `已自动切换到 …` row a backup/fallback retry shows once it succeeds. */
 	private pendingModelFallbackNotice: string | undefined = undefined;
 	private retryCountdown: CountdownTimer | undefined = undefined;
+	/**
+	 * The session's active quota park (中断-10), from the daemon's
+	 * quota_park_status heartbeat: the status bar counts the wake down while it
+	 * lasts. Undefined means no park is announced - the pull sources then cost a
+	 * single undefined check per render. The ticker exists only while a park is
+	 * shown; the daemon's 60s heartbeat re-anchors resumeAtMs, so the display
+	 * recomputes the remainder from the absolute time instead of counting down
+	 * locally.
+	 */
+	private quotaPark: { resumeAtMs?: number; parkCount?: number; provider?: string } | undefined = undefined;
+	private quotaParkTicker: ReturnType<typeof setInterval> | undefined = undefined;
 	private traceUploadAllAbortController: AbortController | undefined = undefined;
 
 	private readonly queueSelection = new QueueSelection();
@@ -1867,6 +1880,16 @@ export class InteractiveMode {
 						`${theme.fg("chipText", ` ${spinnerFrame(getSpinnerTick())} `)}${theme.fg("chipText", `${label} ${elapsed} `)}`,
 					),
 				);
+			}
+			// The quota-park countdown (中断-10): the quiet face carries it in the
+			// status bar, so this chip only ever renders on the legacy watermark line.
+			const park = this.quotaPark;
+			if (park) {
+				const [fullest] = quotaParkForms({
+					...(park.resumeAtMs !== undefined ? { remainingMs: park.resumeAtMs - Date.now() } : {}),
+					...(park.provider !== undefined ? { provider: park.provider } : {}),
+				});
+				if (fullest) chips.push(fullest);
 			}
 			return chips.length > 0 ? chips.join(" ") : undefined;
 		});
@@ -4470,6 +4493,9 @@ export class InteractiveMode {
 			this.statusContainer.removeChild(this.autoCompactionLoader);
 			this.autoCompactionLoader = undefined;
 		}
+		// A quota park belongs to the session that announced it; the next view is
+		// not parked until the new session's own heartbeat says so.
+		this.clearQuotaPark();
 	}
 
 	/** Stops and removes the loader without remounting old-session state. */
@@ -6314,6 +6340,10 @@ export class InteractiveMode {
 					const run = this.sessionEventQueue.then(async () => {
 						if (generation !== this.sessionEventGeneration) return false;
 						this.connectionLost = false;
+						// A park that lifted while the link was down sent its parked:false
+						// into the void; drop the local state and let the daemon's next
+						// heartbeat (60s cadence) re-announce a park that is still active.
+						this.clearQuotaPark();
 						this.liveTurnFlowStore?.connectionRestored();
 						await this.refreshCommandCatalogForCurrentSession?.();
 						if (generation !== this.sessionEventGeneration) return false;
@@ -6326,6 +6356,8 @@ export class InteractiveMode {
 					this.sessionRecap = event.recap;
 					this.patchConnectionState({ recap: event.recap });
 					this.renderRecap();
+				} else if (event.type === "quota_park_status") {
+					this.handleQuotaParkStatus(event);
 				} else if (event.type === "side_question_event") {
 					this.handleSideQuestionEvent(event.event);
 				} else if (event.type === "extension_ui_request") {
@@ -6378,6 +6410,7 @@ export class InteractiveMode {
 		this.retryCountdown = undefined;
 		this.retryLoader?.stop();
 		this.retryLoader = undefined;
+		this.clearQuotaPark();
 		this.syncWorkingLoader();
 		this.ui.requestRender();
 	}
@@ -7858,6 +7891,59 @@ export class InteractiveMode {
 	}
 
 	/**
+	 * A quota_park_status heartbeat from the daemon (中断-10): remember the active
+	 * park so the status bar can count the wake down, and say it once in the chat
+	 * when a park begins. The event is unsequenced and self-healing - each tick
+	 * re-states the whole park, so the latest one wins and none is ever missed
+	 * for long.
+	 */
+	private handleQuotaParkStatus(event: {
+		parked: boolean;
+		resumeAt?: string;
+		remainingMs?: number;
+		parkCount?: number;
+		provider?: string;
+	}): void {
+		if (!event.parked) {
+			if (this.quotaPark === undefined) return;
+			this.clearQuotaPark();
+			this.ui.requestRender();
+			return;
+		}
+		const resumeAtMs = event.resumeAt !== undefined ? Date.parse(event.resumeAt) : Number.NaN;
+		const began = this.quotaPark === undefined;
+		this.quotaPark = {
+			...(Number.isFinite(resumeAtMs) ? { resumeAtMs } : {}),
+			...(event.parkCount !== undefined ? { parkCount: event.parkCount } : {}),
+			...(event.provider !== undefined ? { provider: event.provider } : {}),
+		};
+		if (this.quotaParkTicker === undefined) {
+			// One frame a second, like the retry countdown; the ticker dies with the
+			// park (clearQuotaPark) and never holds the process open.
+			this.quotaParkTicker = setInterval(() => this.ui.requestRender(), 1000);
+			this.quotaParkTicker.unref?.();
+		}
+		if (began) {
+			const countdown =
+				this.quotaPark.resumeAtMs !== undefined
+					? `，约 ${formatLiveClock(Math.max(0, this.quotaPark.resumeAtMs - Date.now()))}后自动恢复`
+					: "";
+			const count = event.parkCount !== undefined && event.parkCount > 1 ? `（本段第 ${event.parkCount} 次）` : "";
+			this.showStatus(`额度已用完，会话挂起等额度恢复${countdown}${count}。`, "warning");
+		}
+		this.ui.requestRender();
+	}
+
+	/** Forget the announced park and stop its ticker (park lifted, session replaced, connection gone). */
+	private clearQuotaPark(): void {
+		this.quotaPark = undefined;
+		if (this.quotaParkTicker !== undefined) {
+			clearInterval(this.quotaParkTicker);
+			this.quotaParkTicker = undefined;
+		}
+	}
+
+	/**
 	 * The quiet conversation's status bar: model and thinking level, context
 	 * use, running subagents, and on the right what the run is doing (working,
 	 * stopped, done) with its clock and output tokens.
@@ -7918,6 +8004,18 @@ export class InteractiveMode {
 					outputTokens: tokens,
 					stopKey: keyText("app.input.clear") || undefined,
 					spendCells: this.statusBarSpendCell("timelineLive"),
+				}),
+			);
+		}
+		// A quota park ended its turn, so no run form covers it: the right side
+		// counts the wake down instead (中断-10). A live probe turn (a heartbeat
+		// testing the reset) still wins above while it runs.
+		const park = this.quotaPark;
+		if (park) {
+			return layout(
+				quotaParkForms({
+					...(park.resumeAtMs !== undefined ? { remainingMs: park.resumeAtMs - Date.now() } : {}),
+					...(park.provider !== undefined ? { provider: park.provider } : {}),
 				}),
 			);
 		}

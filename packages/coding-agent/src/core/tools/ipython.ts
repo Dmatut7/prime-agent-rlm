@@ -1193,7 +1193,9 @@ export function assembleIpythonToolResult(
 			attachments: r.attachments,
 			sentAgentMessages: r.sentAgentMessages,
 			// Display-only: the text above is built from stdout/stderr/result alone, so these
-			// records never reach the model, and compaction reads none of them.
+			// records never reach the model. One reader besides the UI: compaction's file
+			// tracking reads the edit diffs and the kind:"read" records in activities
+			// (core/compaction/utils.ts extractFileOpsFromToolResult).
 			...finalEffectsDetails(r),
 			kernelRestarted: options.kernelRestarted,
 			...(options.resetNotice ? { kernelReset: true as const } : {}),

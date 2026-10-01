@@ -1646,6 +1646,13 @@ describe("InteractiveMode pending bash components", () => {
 			retryCountdown: { dispose: disposeRetryCountdown },
 			retryLoader: undefined,
 			autoCompactionLoader: undefined,
+			// A mounted quota park is session-scoped too: the reset clears it through the
+			// real clearQuotaPark, so its ticker cannot tick into the next session's view.
+			quotaPark: { resumeAtMs: Date.now() + 60_000 } as { resumeAtMs?: number } | undefined,
+			quotaParkTicker: 1 as unknown as ReturnType<typeof setInterval> | undefined,
+			clearQuotaPark(this: unknown): void {
+				(InteractiveMode.prototype as unknown as { clearQuotaPark(this: unknown): void }).clearQuotaPark.call(this);
+			},
 			disposeTransientStatusOverlays(this: unknown): void {
 				(
 					InteractiveMode.prototype as unknown as { disposeTransientStatusOverlays(this: unknown): void }
@@ -1668,6 +1675,9 @@ describe("InteractiveMode pending bash components", () => {
 		expect(endFeatureHintRun).toHaveBeenCalledOnce();
 		// The replaced session's retry countdown keeps ticking into the next view otherwise.
 		expect(disposeRetryCountdown).toHaveBeenCalledOnce();
+		// Same for the announced quota park and its ticker.
+		expect((fakeThis as unknown as { quotaPark: unknown; quotaParkTicker: unknown }).quotaPark).toBeUndefined();
+		expect((fakeThis as unknown as { quotaPark: unknown; quotaParkTicker: unknown }).quotaParkTicker).toBeUndefined();
 		expect((fakeThis as unknown as { activeBashComponent: unknown }).activeBashComponent).toBeUndefined();
 		// Queue browsing is session-scoped: Enter in the next session must be a
 		// fresh prompt, and the previous session's stashed draft is discarded.
@@ -1850,6 +1860,7 @@ describe("InteractiveMode connection events", () => {
 			sessionEventGeneration: 0,
 			renderResyncedSession: vi.fn(async () => {}),
 			refreshCommandCatalogForCurrentSession: vi.fn(async () => {}),
+			clearQuotaPark: vi.fn(),
 			resetSideQuestion: vi.fn(),
 			resetExtensionUI: vi.fn(),
 			resetCurrentSessionRenderState: vi.fn(),
@@ -1898,6 +1909,7 @@ describe("InteractiveMode connection events", () => {
 			sessionEventGeneration: 0,
 			refreshCommandCatalogForCurrentSession: vi.fn(() => catalog),
 			renderResyncedSession: vi.fn(async () => {}),
+			clearQuotaPark: vi.fn(),
 			resetSideQuestion: vi.fn(),
 			resetExtensionUI: vi.fn(),
 			applyConnectionStateSnapshot: vi.fn(),

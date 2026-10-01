@@ -2790,10 +2790,10 @@ describe("daemon mode helpers", () => {
 				customMessage: expect.objectContaining({ customType: "agent_message" }),
 			}),
 		);
-		// The receipt's deliveryMode marker is typed "steer"-only; a follow-up send
-		// must not claim a steer it did not perform.
-		expect(response).toMatchObject({ data: { deliveryStatus: "queued" } });
-		expect((response as { data?: { deliveryMode?: string } }).data?.deliveryMode).toBeUndefined();
+		// The receipt records the mode the delivery actually used: a follow-up send
+		// says follow_up, not the steer default (wave-3: the factory takes the mode
+		// directly, no more delete hack).
+		expect(response).toMatchObject({ data: { deliveryStatus: "queued", deliveryMode: "follow_up" } });
 	});
 
 	it("keeps steering as the default agent-message delivery mode", async () => {

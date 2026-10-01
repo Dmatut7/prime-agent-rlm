@@ -6738,14 +6738,15 @@ export class AgentDaemon {
 				outcome.status === "queued"
 					? this.recordQueuedAgentMessage(senderKey, targetState.activeSessionId, outcome)
 					: this.clearQueuedAgentMessage(senderKey, targetState.activeSessionId);
-			const receipt = createAgentSessionMessageReceipt(payload, outcome.status, undefined, queued);
-			if (options.deliveryMode === "follow_up") {
-				// createAgentSessionMessageReceipt stamps deliveryMode: "steer" (the type in
-				// agent-messages.ts admits no other value); a follow-up receipt must not
-				// claim a steer it did not perform.
-				delete receipt.deliveryMode;
-			}
-			return receipt;
+			// acceptAgentSessionMessage resolves the wire's "auto"/absent to steer, so
+			// the receipt records the effective mode, never the alias.
+			return createAgentSessionMessageReceipt(
+				payload,
+				outcome.status,
+				undefined,
+				queued,
+				options.deliveryMode === "follow_up" ? "follow_up" : "steer",
+			);
 		} catch (error) {
 			this.agentMessageRateLimiter.refund(rateLimitKey);
 			throw error;

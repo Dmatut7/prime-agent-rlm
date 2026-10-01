@@ -433,7 +433,10 @@ describe("public command routing", () => {
 			expect(help).toContain(option);
 		}
 		expect(help).toContain("default: 300000");
-		expect(help).toContain("default: 1800000");
+		expect(help).toContain("follow-up limit (default: 20)");
+		expect(help).toContain("assistant-turn limit (default: 50)");
+		expect(help).toContain("token limit (default: 400000)");
+		expect(help).toContain("wall-clock limit in ms (default: 7200000)");
 		expect(help).toContain("Commands:");
 		expect(help).toContain("shutdown");
 		expect(help).not.toContain("Environment Variables:");

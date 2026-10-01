@@ -292,10 +292,10 @@ Autonomous limits and gates do not sandbox IPython or commands, and the elapsed-
 | `--autonomous-gate <command>` | Add a shell command that must pass before the run can finish. Repeatable commands run in CLI order; the default is no gates. |
 | `--autonomous-gate-retries <n>` | Set the per-gate retry limit. Default: `3`. A failed gate can continue while its recorded attempt is at most this value; the next failed attempt exhausts the gate. |
 | `--autonomous-gate-timeout-ms <n>` | Set the timeout for each gate process in milliseconds. Default: `300000` (5 minutes). A timed-out gate is failed and its process tree is stopped. |
-| `--autonomous-max-continuations <n>` | Set the maximum host-injected follow-up messages. Default: `3`. |
-| `--autonomous-max-turns <n>` | Set the maximum assistant responses counted while autonomous mode is enabled. Default: `12`. |
-| `--autonomous-max-tokens <n>` | Set the maximum accumulated tokens. Default: `80000`; accounting includes input, output, and cache-write tokens, but excludes cache-read tokens. |
-| `--autonomous-timeout-ms <n>` | Set the maximum elapsed autonomous time in milliseconds. Default: `1800000` (30 minutes). |
+| `--autonomous-max-continuations <n>` | Set the maximum host-injected follow-up messages. Default: `20`. |
+| `--autonomous-max-turns <n>` | Set the maximum assistant responses counted while autonomous mode is enabled. Default: `50`. |
+| `--autonomous-max-tokens <n>` | Set the maximum accumulated tokens. Default: `400000`; accounting includes input, output, and cache-write tokens, but excludes cache-read tokens. |
+| `--autonomous-timeout-ms <n>` | Set the maximum elapsed autonomous time in milliseconds. Default: `7200000` (2 hours). |
 
 All `<n>` values must be positive integers: zero, negative, fractional, and non-numeric values are rejected. Value-taking flags accept both a separate argument and the `--flag=value` form. A missing value is rejected, and a following long option is not consumed as a value. Repeating a numeric flag uses its last value; repeating `--autonomous-gate` appends another gate.
 
@@ -330,10 +330,10 @@ Goals are separate from autonomous mode: `--goal <objective>` starts a persisten
 | `--cwd <dir>` | Use a specific working directory for the session |
 | `--system-prompt <text>` | Replace default prompt; context files and skills are still appended |
 | `--append-system-prompt <text>` | Append to system prompt |
-| `--verbose` | Force verbose startup |
+| `-v`, `--verbose` | Force verbose startup |
 | `--offline` | Disable startup network operations |
 | `-h`, `--help` | Show help |
-| `-v`, `--version` | Show version |
+| `-V`, `--version` | Show version |
 | `--` | End option parsing and treat all following arguments as messages |
 
 ### File Arguments

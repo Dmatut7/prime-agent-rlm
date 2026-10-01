@@ -28,6 +28,7 @@ import {
 	MalformedCompactionOutcomeMessageComponent,
 } from "./compaction-outcome-message.js";
 import { CompactionSummaryMessageComponent, QuietCompactionNoticeComponent } from "./compaction-summary-message.js";
+import { CustomMessageComponent } from "./custom-message.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./injected-prompt-message.js";
 import { IPythonCellComponent } from "./ipython-cell.js";
 import {
@@ -407,6 +408,14 @@ export function awaitsStepResults(reply: AgentMessage | undefined, resultsArrive
 	);
 }
 
+/**
+ * Mirrors the literal customType in core/agent-session.ts
+ * (_syncKernelStateAfterCompaction's prune notice), which is module-private
+ * there - the same mirror arrangement as quota-park-status.ts. The source pin in
+ * test/ipython-state-pruned-replay.test.ts fails if either side is renamed.
+ */
+const IPYTHON_STATE_PRUNED_CUSTOM_TYPE = "ipython_state_pruned";
+
 /** Build conversation components from a message list, matching tool results to their calls. */
 export function buildConversationComponents(
 	messages: readonly AgentMessage[],
@@ -702,6 +711,13 @@ export function buildConversationComponents(
 					? new RefinementOutcomeMessageComponent(message)
 					: new MalformedRefinementOutcomeMessageComponent(),
 			);
+		} else if (message.role === "custom" && message.customType === IPYTHON_STATE_PRUNED_CUSTOM_TYPE) {
+			// 记忆-2 visibility: the post-compaction snapshot deleted live kernel
+			// variables, and this notice is the only place the owner hears about it.
+			// The live face renders it through the generic custom-message box; replay
+			// must not drop it into the "other custom" hole below.
+			if (!message.display) continue;
+			components.push(new CustomMessageComponent(message, undefined, options.markdownTheme));
 		} else if (isAgentSessionMessage(message) && message.display) {
 			// TUI v4: a received agent-message row is one comm in this turn.
 			turnSummary?.addCommMessage();

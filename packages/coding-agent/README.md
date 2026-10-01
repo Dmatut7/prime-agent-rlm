@@ -619,10 +619,10 @@ Autonomous budgets and gates are not a security sandbox. See [Security and Sandb
 | `--autonomous-gate <command>` | Add a repeatable shell command that must pass before completion |
 | `--autonomous-gate-retries <n>` | Positive per-gate retry limit; default `3` |
 | `--autonomous-gate-timeout-ms <n>` | Positive per-gate timeout in milliseconds; default `300000` |
-| `--autonomous-max-continuations <n>` | Positive host follow-up limit; default `3` |
-| `--autonomous-max-turns <n>` | Positive assistant-turn limit; default `12` |
-| `--autonomous-max-tokens <n>` | Positive token limit; default `80000` |
-| `--autonomous-timeout-ms <n>` | Positive wall-clock limit in milliseconds; default `1800000` |
+| `--autonomous-max-continuations <n>` | Positive host follow-up limit; default `20` |
+| `--autonomous-max-turns <n>` | Positive assistant-turn limit; default `50` |
+| `--autonomous-max-tokens <n>` | Positive token limit; default `400000` |
+| `--autonomous-timeout-ms <n>` | Positive wall-clock limit in milliseconds; default `7200000` |
 
 Gates run before the continuation, turn, token, and wall-clock limits are evaluated; every configured gate must pass for autonomous completion. See the [usage guide](docs/usage.md#autonomous-options) for validation rules, retry behavior, and detailed limit interactions.
 
@@ -632,9 +632,9 @@ Gates run before the continuation, turn, token, and wall-clock limits are evalua
 |--------|-------------|
 | `--system-prompt <text>` | Replace default prompt (context files and skills still appended) |
 | `--append-system-prompt <text>` | Append to system prompt |
-| `--verbose` | Force verbose startup |
+| `-v`, `--verbose` | Force verbose startup |
 | `-h`, `--help` | Show help |
-| `-v`, `--version` | Show version |
+| `-V`, `--version` | Show version |
 
 ### File Arguments
 

@@ -3467,6 +3467,81 @@ describe("DaemonAgentConnection", () => {
 			waitForRlmQuiescence: true,
 		});
 	});
+
+	it("forwards quota_park_status when the hello advertises the capability (中断-10)", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("quota_park_status");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe(async (event) => {
+			events.push(event);
+		});
+
+		const resumeAt = new Date(Date.now() + 3_600_000).toISOString();
+		fakeClient.emitMessage({
+			type: "quota_park_status",
+			activeSessionId: "active-1",
+			parked: true,
+			resumeAt,
+			remainingMs: 3_599_000,
+			parkCount: 2,
+			provider: "anthropic",
+		});
+
+		await vi.waitFor(() => expect(events).toHaveLength(1));
+		expect(events[0]).toEqual({
+			type: "quota_park_status",
+			parked: true,
+			resumeAt,
+			remainingMs: 3_599_000,
+			parkCount: 2,
+			provider: "anthropic",
+		});
+
+		fakeClient.emitMessage({ type: "quota_park_status", activeSessionId: "active-1", parked: false });
+		await vi.waitFor(() => expect(events).toHaveLength(2));
+		expect(events[1]).toEqual({ type: "quota_park_status", parked: false });
+		await connection.dispose();
+	});
+
+	it("drops quota_park_status when the capability was not advertised", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe(async (event) => {
+			events.push(event);
+		});
+
+		fakeClient.emitMessage({
+			type: "quota_park_status",
+			activeSessionId: "active-1",
+			parked: true,
+			resumeAt: new Date(Date.now() + 60_000).toISOString(),
+		});
+		// The dispatch is synchronous up to the emit; a short wait proves nothing arrives.
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(events).toHaveLength(0);
+		await connection.dispose();
+	});
+
+	it("ignores a quota_park_status heartbeat addressed to another session", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("quota_park_status");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe(async (event) => {
+			events.push(event);
+		});
+
+		fakeClient.emitMessage({ type: "quota_park_status", activeSessionId: "active-other", parked: true });
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(events).toHaveLength(0);
+		await connection.dispose();
+	});
+
 	it("maps resume_queue outcomes: drained, empty queue, and real errors", async () => {
 		const fakeClient = new FakeDaemonClient();
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");

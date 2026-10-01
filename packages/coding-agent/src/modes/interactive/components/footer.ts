@@ -240,6 +240,29 @@ export function finishedRunForms(input: FinishedRunInput): string[] {
 }
 
 /**
+ * The right side of the status line while the session is parked on a provider
+ * quota reset (中断-10), fullest form first: `额度等待 · 1小时05分后恢复`. The
+ * park ended the failed turn, so these forms replace the run's working/finished
+ * forms for as long as the park lasts; the daemon's heartbeat re-anchors the
+ * absolute resume time, and the renderer recomputes the remainder per frame.
+ */
+export function quotaParkForms(input: { remainingMs?: number; provider?: string }): string[] {
+	const paint = (text: string) => theme.fg("warning", text);
+	const provider = input.provider?.trim();
+	const head = provider ? `额度等待 ${provider}` : "额度等待";
+	if (input.remainingMs === undefined) {
+		// A parked session without a persisted park entry (in-memory session) has no
+		// wake time to count down to.
+		return [paint(`${head}（恢复时间未知）`), paint(head)];
+	}
+	// Clamped at 0: a wake firing right now is "resuming", not overdue.
+	const tail = input.remainingMs <= 0 ? "正在恢复" : `${formatLiveClock(input.remainingMs)}后恢复`;
+	return [paint(`${head} · ${tail}`), paint(`额度等待 · ${tail}`), paint("额度等待")].filter(
+		(form, index, all) => all.indexOf(form) === index,
+	);
+}
+
+/**
  * Token figure shared by every context readout: `518k/1M`, `1.2M/2M`.
  * Exact powers (and near-powers like a 1,048,576 window) read as 1M, not 1.0M.
  */

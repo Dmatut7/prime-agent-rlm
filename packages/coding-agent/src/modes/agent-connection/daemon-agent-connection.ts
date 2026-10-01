@@ -2298,6 +2298,25 @@ export class DaemonAgentConnection implements AgentConnection {
 			await this.emit({ type: "session_status", recap: message.recap });
 			return;
 		}
+		if (message.type === "quota_park_status") {
+			// Capability-gated (rev 42): a client depends on the heartbeat only when
+			// the hello advertised quota_park_status; anything else is dropped like
+			// every other unknown outbound type. The event is unsequenced and
+			// self-healing (each tick carries the absolute resumeAt), so there is no
+			// snapshot bookkeeping here - forward it and let the UI hold the latest.
+			if (!this.client.supportsServerCapability("quota_park_status")) {
+				return;
+			}
+			await this.emit({
+				type: "quota_park_status",
+				parked: message.parked,
+				...(message.resumeAt !== undefined ? { resumeAt: message.resumeAt } : {}),
+				...(message.remainingMs !== undefined ? { remainingMs: message.remainingMs } : {}),
+				...(message.parkCount !== undefined ? { parkCount: message.parkCount } : {}),
+				...(message.provider !== undefined ? { provider: message.provider } : {}),
+			});
+			return;
+		}
 		if (message.type === "session_resynced") {
 			this.resetEventGapBaseline();
 			this.attachedSessionId = message.snapshot.state.sessionId;

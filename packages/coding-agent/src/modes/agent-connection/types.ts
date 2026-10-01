@@ -824,6 +824,27 @@ export type AgentConnectionEvent =
 	| { type: "session_replaced"; state: AgentConnectionState; messages: AgentMessage[] }
 	| { type: "session_resynced"; snapshot: AgentConnectionSnapshot }
 	| { type: "session_status"; recap?: string }
+	| {
+			/**
+			 * Quota-park heartbeat (daemon protocol rev 42, server capability
+			 * quota_park_status): the session is parked on a provider usage reset.
+			 * Unsequenced and self-healing - every tick carries the absolute
+			 * resumeAt - and closed by one parked:false when the park lifts. Only
+			 * the daemon adapter emits it (the daemon owns the park sweep); the
+			 * in-process adapter never does. resumeAt/remainingMs are absent only
+			 * for a parked session without a persisted park entry.
+			 */
+			type: "quota_park_status";
+			parked: boolean;
+			/** ISO wake time of the active park. */
+			resumeAt?: string;
+			/** Milliseconds until resumeAt, clamped at 0 while the wake is firing. */
+			remainingMs?: number;
+			/** How many times this session has parked in the current episode. */
+			parkCount?: number;
+			/** Provider whose usage limit caused the park. */
+			provider?: string;
+	  }
 	| { type: "extension_ui_request"; request: AgentConnectionExtensionUiRequest }
 	| { type: "extension_error"; extensionPath: string; event: string; error: string }
 	| {
