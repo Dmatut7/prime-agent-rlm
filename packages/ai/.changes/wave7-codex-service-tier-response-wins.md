@@ -1,0 +1,1 @@
+- Fixed Codex service-tier cost estimation billing the requested flex/priority tier even when the response reported the request was actually served at the default tier; the response-reported tier now wins, matching the non-Codex Responses path.
