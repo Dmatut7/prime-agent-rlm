@@ -173,3 +173,19 @@ orchestrator-workers + 确定性 gate；子代理任务书必须含目标/输出
 - 半落地尾巴②：finish_gate nudge 在 TUI 走通用「自动继续」标签，放行提示无 inline 行（injected-prompt-message.ts / conversation-components.ts）→ 专属标签。
 - HEAD 基线 6 个 suite 测试预存红（4491-provider-stale-after-401、4620-fast-mode-settings、4649×2、f70、r43-auth-stale-recovery）→ 查归属并修复。
 - 智能-4 边角：lastReplayableAssistantIndex 不排除 aborted 回合 → 最新回合 aborted 时无回合保留完整思考（minor，方向安全，登记）。
+
+- 2026-10-01 波次 4：5 批修复完成 + CI 红治理。结果摘要：
+  - W4-A：length 续写放宽到纯文本回合与子代理（子代理带「先 send 给 parent」指令，resumed 子代理保守不续）；quota park re-arm 补 provider；emergency shrink 过继 details 不断账本链；context-loss 三处 warn 透出为用户可见 transcript 通知（session_context_loss，含 convertToLlm 排除）；基线红 4491/f70 修复（波次1恢复轮改坏的测试期望），4620/4649/r43 确认为本机 claude 探测环境红（CI 不复现，隔离修法待做）。
+  - W4-B：harness digest 溢出目录封顶 50 行；finish_gate 专属 TUI 标签 + finish_gate_released 放行提示渲染（发射侧待 W5 接线）。
+  - W4-C：CLI send 显式 --steer/--follow-up 前查 capability，旧 daemon 报错拒绝而非静默降级。
+  - W4-D：daemon 崩溃 fail-fast + 快速恢复链闭合（crash handlers 写现场/flush journal/漂移修复 fsync；验证 daemon 死亡→journal→恢复 prompt 全链完整）。文档-8 销账。
+  - W4-E：泵 blocked 早退孤儿吞输入修复（回滚 preselected + clear site 重调度），变异实证两半各有独立覆盖。文档-1 销账。
+- 2026-10-01 CI 治理：远程 CI 自 0.11.18 release 起连红 4 个 run。诊断：19 条失败 = 波次2 stub 缺新 Map 字段 13 条（daemon-stall 两文件）+ 波次1 恢复轮改期望 4 条（4491/f70 波次4已修 + provider-retry-single-layer×2）+ 波次1 有意行为变更的过期断言 2 条（startup 文案、/tree 带参拦截）。全部测试侧适配，src 不动；已修（wave4-ci-test-repairs）。build-check-test 只是聚合闸门。tl-in-timeline 预存红已被波次1顺带修好。
+
+### 波次 4 跨批依赖（波次 5 首批处理）
+
+1. finish_gate_released 的发射侧：agent-session.ts 放行分支补发 display 消息 + messages.ts convertToLlm 排除名单加 "finish_gate_released"（W4-B 渲染侧已就绪，pin 测试锚定字面量）。
+2. ipython_state_pruned 不在 convertToLlm 排除清单——注释声称不进模型上下文但实际会进（W4-A 发现③），加入排除名单。
+3. session_context_loss 通知的 TUI 重放渲染（conversation-components.ts 加镜像分支，仿 IPYTHON_STATE_PRUNED）。
+4. 4620/4649×2/r43 环境红隔离：harness 层屏蔽 claude-code 探测（packages/ai env-api-keys 或测试设施）。
+5. daemon.md:143 恢复契约描述过时（W4-D 遗留）。
