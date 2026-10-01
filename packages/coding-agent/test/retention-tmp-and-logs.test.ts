@@ -103,6 +103,9 @@ function baseSettings(overrides: Partial<ResolvedRetentionSettings> = {}): Resol
 		tmpOtherDirDays: 0,
 		bashTempFileHours: 24,
 		bashTempFileMaxBytes: 256 * 1024 * 1024,
+		bashTempFileMaxCount: 100,
+		sessionArtifactsMaxBytes: 8 * 1024 * 1024 * 1024,
+		sessionArtifactsCapMinAgeDays: 7,
 		staleLeaseHours: 24,
 		kernelSnapshotGenerations: 1,
 		kernelSnapshotReclaimEnabled: false,
@@ -607,11 +610,14 @@ describe("bash temp files (R5 read side)", () => {
 		expectSkippedPathsSurvive(result);
 	});
 
-	it("is off when the hours knob is off, and floors the age rule with the cooldown", async () => {
+	it("is off when both the hours and the count knob are off, and floors the age rule with the cooldown", async () => {
 		const { roots } = createSandbox();
 		const log = writeLog(roots.tmpDir, "pi-bash-abcdef0123456789.log", "old\n", 2 * MS_PER_HOUR);
 
-		const off = await sweep(bashTempFilesModule, makeContext(roots, { bashTempFileHours: 0 }));
+		const off = await sweep(
+			bashTempFilesModule,
+			makeContext(roots, { bashTempFileHours: 0, bashTempFileMaxCount: 0 }),
+		);
 		expect(off.disabled).toBe(true);
 		expect(off.scanned).toBe(0);
 		expect(off.skipped).toEqual([]);

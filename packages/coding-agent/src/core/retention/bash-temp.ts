@@ -1,8 +1,10 @@
 // R5 retention class (read side): `pi-bash-*.log` temp files left by bash runs.
 //
 // Design: /tmp/audit_r/round-08/disk-retention.md §1 R5 — the write-side cap
-// (`retention.bashTempFileMaxBytes`, owned elsewhere) and this age sweep are two
-// halves of one fix; sweeping without capping refills the dir next week.
+// (`retention.bashTempFileMaxBytes`, owned elsewhere), this age sweep and the
+// count cap (`retention.bashTempFileMaxCount`) are the three halves of one fix;
+// sweeping without capping refills the dir next week, and an age window alone
+// does not bound how many files a busy day creates (round-09 S3).
 // §3: regular files only, non-following lstat, `unverifiable:` on anything else.
 // §4: fixed reasons, dry-run parity.
 
@@ -49,8 +51,12 @@ async function scanAndReclaim(context: RetentionClassContext): Promise<Retention
 		capped: false,
 		disabled: false,
 	};
-	if (!(settings.bashTempFileHours > 0)) {
-		context.log(`retention bash-temp-files: disabled (retention.bashTempFileHours=${settings.bashTempFileHours})`);
+	const ageHours = settings.bashTempFileHours > 0 ? settings.bashTempFileHours : 0;
+	const maxCount = settings.bashTempFileMaxCount > 0 ? Math.floor(settings.bashTempFileMaxCount) : 0;
+	if (ageHours === 0 && maxCount === 0) {
+		context.log(
+			`retention bash-temp-files: disabled (retention.bashTempFileHours=${settings.bashTempFileHours}, retention.bashTempFileMaxCount=${settings.bashTempFileMaxCount})`,
+		);
 		return { ...result, disabled: true };
 	}
 
@@ -67,8 +73,12 @@ async function scanAndReclaim(context: RetentionClassContext): Promise<Retention
 	}
 
 	// The cooldown floor keeps a file that a running bash command is still appending to.
-	const thresholdMs = Math.max(settings.bashTempFileHours * MS_PER_HOUR, settings.cooldownMinutes * MS_PER_MINUTE);
-	const requests: ReclaimRequest[] = [];
+	// It gates both passes: the age pass never goes below it, and the count pass uses
+	// it directly (a file young enough to be mid-write is kept however many there are).
+	const cooldownMs = settings.cooldownMinutes * MS_PER_MINUTE;
+	const ageThresholdMs = Math.max(ageHours * MS_PER_HOUR, cooldownMs);
+	const agedOut: { path: string; bytes: number; mtimeMs: number }[] = [];
+	const survivors: { path: string; bytes: number; mtimeMs: number }[] = [];
 
 	for (const name of names) {
 		if (!BASH_TEMP_FILE_SHAPE.test(name)) continue;
@@ -87,15 +97,70 @@ async function scanAndReclaim(context: RetentionClassContext): Promise<Retention
 			continue;
 		}
 		const ageMs = context.now - stats.mtimeMs;
-		if (ageMs <= thresholdMs) {
+		if (ageHours > 0 && ageMs > ageThresholdMs) {
+			agedOut.push({ path, bytes: stats.size, mtimeMs: stats.mtimeMs });
+			continue;
+		}
+		survivors.push({ path, bytes: stats.size, mtimeMs: stats.mtimeMs });
+	}
+
+	const requests: ReclaimRequest[] = [];
+	for (const file of agedOut) {
+		requests.push({
+			path: file.path,
+			kind: "file",
+			bytes: file.bytes,
+			entries: 1,
+			signature: statSignature(file.path),
+		});
+	}
+
+	// Count pass (round-09 S3's second half): the age window bounds how old a file
+	// gets, not how many a busy day creates. Over the cap the newest `maxCount`
+	// survivors stay; the oldest of the rest go, down to the cooldown floor.
+	const cooldownKept = new Set<string>();
+	if (maxCount > 0 && survivors.length > maxCount) {
+		const oldestFirst = [...survivors].sort((a, b) => a.mtimeMs - b.mtimeMs || a.path.localeCompare(b.path));
+		const excess = survivors.length - maxCount;
+		let dropped = 0;
+		for (const file of oldestFirst) {
+			if (dropped >= excess) break;
+			if (context.now - file.mtimeMs <= cooldownMs) {
+				cooldownKept.add(file.path);
+				continue;
+			}
+			dropped += 1;
+			requests.push({
+				path: file.path,
+				kind: "file",
+				bytes: file.bytes,
+				entries: 1,
+				signature: statSignature(file.path),
+			});
+		}
+	}
+
+	// Kept files report why, one entry per path: the cooldown floor when it is what
+	// saved an over-cap file, otherwise the age window (the pre-count-cap report).
+	const requestedPaths = new Set(requests.map((request) => request.path));
+	for (const file of survivors) {
+		if (requestedPaths.has(file.path)) continue;
+		const ageMs = context.now - file.mtimeMs;
+		if (cooldownKept.has(file.path)) {
 			result.skipped.push({
-				path,
+				path: file.path,
 				reason: SKIP.young("bash-temp-file"),
-				detail: `age ${Math.round(ageMs / MS_PER_MINUTE)}m <= ${Math.round(thresholdMs / MS_PER_MINUTE)}m`,
+				detail: `age ${Math.round(ageMs / MS_PER_MINUTE)}m <= ${Math.round(cooldownMs / MS_PER_MINUTE)}m (count cap keeps the cooldown floor)`,
 			});
 			continue;
 		}
-		requests.push({ path, kind: "file", bytes: stats.size, entries: 1, signature: statSignature(path) });
+		if (ageHours > 0) {
+			result.skipped.push({
+				path: file.path,
+				reason: SKIP.young("bash-temp-file"),
+				detail: `age ${Math.round(ageMs / MS_PER_MINUTE)}m <= ${Math.round(ageThresholdMs / MS_PER_MINUTE)}m`,
+			});
+		}
 	}
 
 	const outcome = await reclaimWithinBudget(context, requests);

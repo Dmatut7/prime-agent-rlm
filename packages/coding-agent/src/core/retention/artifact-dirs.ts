@@ -383,9 +383,10 @@ async function planArtifactDirs(context: RetentionClassContext, mode: "empty" | 
 /**
  * Why a candidate may not be removed even though its own evidence allows it: a
  * kept nested candidate, or a transcript in its subtree whose session is not on
- * record as deleted.
+ * record as deleted. Exported for the `artifact-total-cap` class, which owes the
+ * same keep-as-a-whole guarantee.
  */
-function descendantBlocker(
+export function descendantBlocker(
 	candidate: ArtifactCandidate,
 	candidates: readonly ArtifactCandidate[],
 	decision: ReadonlyMap<string, RetentionSkip | "reclaim">,

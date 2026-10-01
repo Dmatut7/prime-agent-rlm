@@ -13,6 +13,7 @@ export type RetentionClassId =
 	| "kernel-snapshot-generations"
 	| "artifact-residue-dirs"
 	| "artifact-empty-dirs"
+	| "artifact-total-cap"
 	| "child-transcripts"
 	| "logs"
 	| "tmp-rlm-dirs"
@@ -108,6 +109,23 @@ export interface ResolvedRetentionSettings {
 	bashTempFileHours: number;
 	/** Write-side cap for one `pi-bash-*.log` file (0 = unlimited). */
 	bashTempFileMaxBytes: number;
+	/**
+	 * Count cap for `pi-bash-*.log` temp files: the newest this many are kept, older
+	 * ones past the cooldown floor go first (0 = off). The count half of round-09 S3;
+	 * `bashTempFileHours` alone bounds age, not a busy day's file count.
+	 */
+	bashTempFileMaxCount: number;
+	/**
+	 * Total-byte ceiling for the whole session-artifact tree (0 = off). Over the
+	 * ceiling the `artifact-total-cap` class reclaims the coldest non-live session
+	 * directories until the tree fits again.
+	 */
+	sessionArtifactsMaxBytes: number;
+	/**
+	 * Age floor for the total-cap class: a directory touched within this many days is
+	 * never reclaimed under byte pressure (0 = only `cooldownMinutes` applies).
+	 */
+	sessionArtifactsCapMinAgeDays: number;
 	/** Lease directories whose owner is provably gone (0 = off; the pid double-check still gates). */
 	staleLeaseHours: number;
 	/** Retired kernel snapshot generations kept after the referenced ones (0 = delete all retired). */

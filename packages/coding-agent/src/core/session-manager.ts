@@ -578,6 +578,24 @@ export function getSessionArtifactsRoot(sessionDir: string): string {
 
 const tightenedArtifactDirectories = new Set<string>();
 
+/**
+ * Sessions whose tombstone-suppressed artifact recreation was already logged in
+ * this process. One warn per session: a deleted session's cron registration can
+ * retry on every tick, and an undeduplicated warn would repeat forever.
+ */
+const suppressedArtifactRecreations = new Set<string>();
+
+function warnOnceOnSuppressedArtifactRecreation(sessionDir: string, sessionId: string): void {
+	const key = `${sessionDir}:${sessionId}`;
+	if (suppressedArtifactRecreations.has(key)) return;
+	if (suppressedArtifactRecreations.size >= 1024) suppressedArtifactRecreations.clear();
+	suppressedArtifactRecreations.add(key);
+	sessionManagerLog.warn("session artifact directory recreation suppressed by a delete tombstone", {
+		sessionId,
+		sessionDir,
+	});
+}
+
 /** Transcripts already tightened in this process, so the warning is emitted once each. */
 const tightenedTranscripts = new Set<string>();
 
@@ -3276,6 +3294,10 @@ export class SessionManager {
 			return getSessionArtifactPath(this.sessionDir, this.sessionId, false);
 		}
 		if (this.sessionArtifactCreationSuppressed()) {
+			// Not silent (round-08 S1's second half): the tombstone says this directory
+			// belongs to a deleted session, so the write falls back to the read path and
+			// the suppression is on record once per session.
+			warnOnceOnSuppressedArtifactRecreation(this.sessionDir, this.sessionId);
 			return getSessionArtifactPath(this.sessionDir, this.sessionId, false);
 		}
 		return getSessionArtifactPath(this.sessionDir, this.sessionId, true);

@@ -12,6 +12,7 @@ import { readdirSync } from "node:fs";
 import { basename, join } from "node:path";
 import { activeSessionLeaseDirectories, classifyLeaseDirectory } from "../session-lease.js";
 import { artifactEmptyDirsModule, artifactResidueModule } from "./artifact-dirs.js";
+import { artifactTotalCapModule } from "./artifact-total-cap.js";
 import { bashTempFilesModule } from "./bash-temp.js";
 import { childTranscriptsModule } from "./child-transcripts.js";
 import { yieldToEventLoop } from "./fs-walk.js";
@@ -40,6 +41,9 @@ const CLASS_MODULES = [
 	kernelSnapshotGenerationsModule,
 	artifactResidueModule,
 	artifactEmptyDirsModule,
+	// After the residue/empty classes: they reclaim by age and evidence first, and
+	// the cap class measures what is left against the tree's total-byte ceiling.
+	artifactTotalCapModule,
 	childTranscriptsModule,
 	logsModule,
 	tmpRlmDirsModule,
