@@ -16,6 +16,7 @@ import {
 	isSessionSlashCommandResultMessage,
 	REFINEMENT_OUTCOME_CUSTOM_TYPE,
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
+	SESSION_CONTEXT_LOSS_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
 } from "../../../core/messages.js";
@@ -412,7 +413,7 @@ export function awaitsStepResults(reply: AgentMessage | undefined, resultsArrive
  * Mirrors the literal customType in core/agent-session.ts
  * (_syncKernelStateAfterCompaction's prune notice), which is module-private
  * there - the same mirror arrangement as quota-park-status.ts. The source pin in
- * test/ipython-state-pruned-replay.test.ts fails if either side is renamed.
+ * test/quota-park-status-ui.test.ts fails if either side is renamed.
  */
 const IPYTHON_STATE_PRUNED_CUSTOM_TYPE = "ipython_state_pruned";
 
@@ -718,6 +719,13 @@ export function buildConversationComponents(
 			// must not drop it into the "other custom" hole below.
 			if (!message.display) continue;
 			components.push(new CustomMessageComponent(message, undefined, options.markdownTheme));
+		} else if (message.role === "custom" && message.customType === SESSION_CONTEXT_LOSS_CUSTOM_TYPE) {
+			// 半落地尾巴① visibility: the transcript-damage notice the session writes
+			// on load is the only place the owner hears the rebuilt context lost
+			// history. The live face renders it through the generic custom-message
+			// box; replay must not drop it into the "other custom" hole below.
+			if (!message.display) continue;
+			components.push(new CustomMessageComponent(message, undefined, options.markdownTheme));
 		} else if (isAgentSessionMessage(message) && message.display) {
 			// TUI v4: a received agent-message row is one comm in this turn.
 			turnSummary?.addCommMessage();
@@ -737,6 +745,16 @@ export function buildConversationComponents(
 			const component = new InjectedPromptMessageComponent(message, options.markdownTheme);
 			component.setExpanded(expanded);
 			components.push(component);
+		} else if (message.role === "custom" && message.display) {
+			// Mirror of the live path's createDisplayedCustomMessageComponent
+			// fallback: every remaining owner-visible custom notice
+			// (provider_failure_recovery, empty_response_recovery, system_interruption,
+			// stall_recovery_escalation, rlm_child_recovery_action,
+			// image_delivery_suspicion, async_bash_completion, autonomous_status,
+			// mcp_connection_outcome, ipython_bootstrap_failed, provider_fallback,
+			// thinking_level_clamped, ...) renders as the generic box instead of
+			// dropping into the "other custom" hole. display:false stays hidden.
+			components.push(new CustomMessageComponent(message, undefined, options.markdownTheme));
 		} else if (message.role === "user") {
 			const text = readUserText(message.content);
 			const hasContent =
@@ -755,7 +773,7 @@ export function buildConversationComponents(
 				);
 			}
 		}
-		// Non-conversational messages (bash/branch-summary/compaction/other custom) aren't shown.
+		// Non-conversational messages (bash/branch-summary/compaction) and display:false customs aren't shown.
 	}
 	// The last turn has no following user prompt; freeze its clock at the last
 	// message so a thinking-only line stops ticking.
