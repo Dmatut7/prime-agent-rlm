@@ -34,6 +34,7 @@ describe("process liveness has a single source", () => {
 		"core/session-lease.ts",
 		"core/turn-liveness.ts",
 		"core/kernel/bootstrap.ts",
+		"cli/daemon-launch.ts",
 		"cli/daemon-ps.ts",
 		"cli/daemon-update-restart.ts",
 		"modes/daemon/daemon-mode.ts",

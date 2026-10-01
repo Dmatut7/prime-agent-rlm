@@ -29,6 +29,8 @@ interface FakeDaemonOptions {
 	failList?: boolean;
 	/** When false, the server ignores `shutdown` and stays up. */
 	respondToShutdown?: boolean;
+	/** Supervisor pid advertised in the hello; the shutdown wait reads it as the process expected to exit. */
+	supervisorPid?: number;
 	protocolVersion?: number;
 	appVersion?: string;
 	schemaId?: string;
@@ -71,6 +73,7 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 						: (options.schemaId ?? DAEMON_SCHEMA_ID),
 				clientId: "fake-client",
 				serverCapabilities: options.serverCapabilities ?? [],
+				...(options.supervisorPid !== undefined ? { supervisorPid: options.supervisorPid } : {}),
 				...((options.runtimeBuildId ?? options.runtimeLauncherPath)
 					? {
 							runtime: {
@@ -718,5 +721,32 @@ describe("shutdownDaemonAndWait", () => {
 		cleanups.push(daemon.close);
 		expect(await shutdownDaemonAndWait(daemon.socketPath, 100)).toBe(true);
 		expect(existsSync(daemon.socketPath)).toBe(true);
+	});
+
+	it("does not report gone while the supervisor pid the hello named still exists", async () => {
+		const sleeper = spawn(process.execPath, ["-e", "setInterval(() => undefined, 1000)"], { stdio: "ignore" });
+		cleanups.push(async () => {
+			if (sleeper.exitCode === null && sleeper.signalCode === null) {
+				sleeper.kill("SIGKILL");
+				await new Promise<void>((resolve) => sleeper.once("close", () => resolve()));
+			}
+		});
+		const daemon = await startFakeDaemon({ supervisorPid: sleeper.pid });
+		cleanups.push(daemon.close);
+
+		// The socket is closed and the shutdown was accepted, but the pid probe must
+		// outvote both: waitForDaemonGone can only answer false after the full window.
+		expect(await shutdownDaemonAndWait(daemon.socketPath, 400)).toBe(false);
+	});
+
+	it("reports gone when the supervisor pid the hello named no longer exists", async () => {
+		const exited = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+		await new Promise<void>((resolve) => exited.once("exit", () => resolve()));
+		const deadPid = exited.pid;
+		expect(deadPid).toBeGreaterThan(0);
+		const daemon = await startFakeDaemon({ supervisorPid: deadPid! });
+		cleanups.push(daemon.close);
+
+		expect(await shutdownDaemonAndWait(daemon.socketPath, 1000)).toBe(true);
 	});
 });

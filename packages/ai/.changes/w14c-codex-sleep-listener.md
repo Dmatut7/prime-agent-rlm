@@ -1,0 +1,1 @@
+- Fixed the Codex provider's backoff sleep leaking its abort listener (the timer was cleared but the listener stayed); the abort error wording is unchanged.

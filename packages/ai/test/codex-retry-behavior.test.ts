@@ -1,3 +1,4 @@
+import { getEventListeners } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { streamOpenAICodexResponses } from "../src/providers/openai-codex-responses.js";
 import type { Context, Model } from "../src/types.js";
@@ -231,5 +232,57 @@ describe("openai-codex SSE retry behavior", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+
+	it("detaches the backoff sleep's abort listener once the sleep resolves", async () => {
+		// A session-scoped signal outlives every retry sleep; a listener left behind
+		// per sleep accumulates on it (MaxListenersExceededWarning, retained closures).
+		const controller = new AbortController();
+		let responsesCalls = 0;
+		installFetchMock(async (input) => {
+			if (!isCodexResponsesUrl(input)) {
+				return new Response("not found", { status: 404 });
+			}
+			responsesCalls += 1;
+			if (responsesCalls === 1) {
+				return new Response("rate limited", { status: 429, headers: { "Retry-After": "0" } });
+			}
+			return sseSuccessResponse();
+		});
+
+		const result = await streamOpenAICodexResponses(createModel(), createContext(), {
+			apiKey: mockToken(),
+			transport: "sse",
+			maxRetries: 1,
+			signal: controller.signal,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+	});
+
+	it("rejects an aborted backoff sleep with the pinned vocabulary and detaches its listener", async () => {
+		const controller = new AbortController();
+		installFetchMock(async (input) => {
+			if (!isCodexResponsesUrl(input)) {
+				return new Response("not found", { status: 404 });
+			}
+			return new Response("rate limited", { status: 429, headers: { "Retry-After": "1" } });
+		});
+
+		const resultPromise = streamOpenAICodexResponses(createModel(), createContext(), {
+			apiKey: mockToken(),
+			transport: "sse",
+			maxRetries: 3,
+			signal: controller.signal,
+		}).result();
+		// Abort while the 1s Retry-After backoff sleep is still pending.
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		controller.abort();
+		const result = await resultPromise;
+
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toContain("Request was aborted");
+		expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
 	});
 });

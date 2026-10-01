@@ -29,6 +29,7 @@ import {
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_TOKEN_ENV,
 } from "../modes/daemon/daemon-worker-protocol.js";
+import { processIdExists } from "../utils/child-process.js";
 import { sleep } from "../utils/sleep.js";
 import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
 import { createCliSubprocessEnv, formatCurrentCliCommand } from "./subprocess-launch.js";
@@ -272,10 +273,11 @@ function hasProcessIdentityExited(identity: DaemonProcessIdentity | undefined, v
 	if (!identity) {
 		return true;
 	}
-	try {
-		process.kill(identity.pid, 0);
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "ESRCH";
+	// processIdExists, not isProcessAlive: waitForDaemonGone polls this every 25ms,
+	// and the zombie-aware probe forks ps per call on macOS. A zombie supervisor is
+	// unreachable on its socket anyway, so cheap kill(0) semantics suffice here.
+	if (!processIdExists(identity.pid)) {
+		return true;
 	}
 	if (!identity.processStartId || !verifyProcessStartId) {
 		return false;

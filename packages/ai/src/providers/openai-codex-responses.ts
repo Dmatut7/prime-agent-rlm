@@ -167,11 +167,18 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 			reject(new Error("Request was aborted"));
 			return;
 		}
-		const timeout = setTimeout(resolve, ms);
-		signal?.addEventListener("abort", () => {
+		// Detach on both settle paths: the signal is session-scoped and outlives every
+		// retry sleep, so a leftover listener per sleep accumulates on it. The abort
+		// path relies on `once`; the resolve path removes it explicitly.
+		const onAbort = () => {
 			clearTimeout(timeout);
 			reject(new Error("Request was aborted"));
-		});
+		};
+		const timeout = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		signal?.addEventListener("abort", onAbort, { once: true });
 	});
 }
 

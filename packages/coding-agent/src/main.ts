@@ -33,7 +33,7 @@ import {
 	SessionSelectorError,
 	SessionSelectorNotFoundError,
 } from "./cli/session-resolver.js";
-import { getStdoutWidth, wrapForStderr } from "./cli/stdout-wrap.js";
+import { getStdoutWidth, wrapForStderr, wrapForStdout } from "./cli/stdout-wrap.js";
 import { APP_NAME, expandTildePath, getAgentDir, getSessionDirEnvOverride, VERSION } from "./config.js";
 import {
 	type AgentExecutionMode,
@@ -581,11 +581,11 @@ export async function createSessionManager(
 					);
 					process.exit(1);
 				}
-				console.log(chalk.yellow(`Session found in different project: ${resolved.cwd}`));
-				console.log(chalk.dim(crossProjectResumeHint(resumeSelector, resolved.cwd)));
+				console.log(wrapForStdout(chalk.yellow(`Session found in different project: ${resolved.cwd}`)));
+				console.log(wrapForStdout(chalk.dim(crossProjectResumeHint(resumeSelector, resolved.cwd))));
 				const shouldFork = await promptConfirm("Fork this session into current directory?");
 				if (!shouldFork) {
-					console.log(chalk.dim("Aborted."));
+					console.log(wrapForStdout(chalk.dim("Aborted.")));
 					process.exit(0);
 				}
 				return forkSessionOrExit(resolved.path, cwd, sessionDir);
@@ -1390,7 +1390,7 @@ export async function main(args: string[], options?: MainOptions) {
 		// invalidate the export, it just drops the notice.
 		const identityHint = shareExportIdentityHintFromFile(result);
 		if (identityHint !== undefined) {
-			console.log(chalk.yellow(identityHint));
+			console.log(wrapForStdout(chalk.yellow(identityHint)));
 		}
 		process.exit(0);
 	}
@@ -1657,7 +1657,7 @@ export async function main(args: string[], options?: MainOptions) {
 					return `${sm.model.id}${thinkingStr}`;
 				})
 				.join(", ");
-			console.log(chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+M to cycle)")}`));
+			console.log(wrapForStdout(chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+M to cycle)")}`)));
 		}
 
 		const promptStashStore = new ClientPromptStashStore();
@@ -1981,7 +1981,7 @@ export async function main(args: string[], options?: MainOptions) {
 					return `${sm.model.id}${thinkingStr}`;
 				})
 				.join(", ");
-			console.log(chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+M to cycle)")}`));
+			console.log(wrapForStdout(chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+M to cycle)")}`)));
 		}
 
 		const agentConnection = new InProcessAgentConnection(runtime);
