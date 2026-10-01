@@ -92,7 +92,7 @@ function createRig(processMode: "quiet" | "legacy" = "legacy"): Rig {
 		customHeader: undefined,
 		builtInHeader: undefined,
 		uiServices: { settingsManager: { getProcessMode: () => processMode } },
-		settingsManager: { getProcessMode: () => processMode, getShowImages: () => true },
+		settingsManager: { getProcessMode: () => processMode, getShowImages: () => true, getCodeBlockIndent: () => "  " },
 		showToast: (text: string) => {
 			toasts.push(text);
 		},

@@ -50,6 +50,7 @@ type CapHarness = {
 		setFullscreen: (enabled: boolean) => void;
 		getFullscreenMouse: () => boolean;
 		getProcessMode: () => "quiet" | "legacy";
+		getCodeBlockIndent: () => string;
 	};
 	preloadToolDefinitions: (names: string[]) => Promise<void>;
 	getCachedToolDefinition: () => undefined;
@@ -59,6 +60,8 @@ type CapHarness = {
 	showError: ReturnType<typeof vi.fn>;
 	updateEditorBorderColor: () => void;
 	addMessageToChat: (message: AgentMessage, options?: { populateHistory?: boolean }) => void;
+	connectionCommands: unknown[];
+	seenSubagentFailureIds: Set<string>;
 	agentConnection: { getSessionContext: () => Promise<AgentConnectionSessionContext> };
 	ui: {
 		requestRender: () => void;
@@ -182,6 +185,7 @@ function createCapHarness(overrides: Partial<CapHarness> = {}): CapHarness {
 			setFullscreen: vi.fn(),
 			getFullscreenMouse: () => false,
 			getProcessMode: () => "quiet" as const,
+			getCodeBlockIndent: () => "  ",
 		},
 		preloadToolDefinitions: vi.fn(async () => {}),
 		getCachedToolDefinition: () => undefined,
@@ -191,6 +195,8 @@ function createCapHarness(overrides: Partial<CapHarness> = {}): CapHarness {
 		showError: vi.fn(),
 		updateEditorBorderColor: vi.fn(),
 		addMessageToChat,
+		connectionCommands: [],
+		seenSubagentFailureIds: new Set<string>(),
 		agentConnection: { getSessionContext: vi.fn(async () => sessionContext(longTranscript())) },
 		ui: {
 			requestRender: vi.fn(),

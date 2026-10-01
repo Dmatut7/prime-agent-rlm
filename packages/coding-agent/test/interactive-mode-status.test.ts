@@ -48,8 +48,12 @@ import type { AuthenticationResult } from "../src/modes/interactive/auth-flows.j
 import { AgentMessageComponent } from "../src/modes/interactive/components/agent-message.js";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import { BashExecutionComponent } from "../src/modes/interactive/components/bash-execution.js";
+import { QuietCompactionNoticeComponent } from "../src/modes/interactive/components/compaction-summary-message.js";
 import type { ConfigurationMenuComponent } from "../src/modes/interactive/components/configuration-menu.js";
-import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
+import {
+	buildConversationComponents,
+	QuietAssistantMessage,
+} from "../src/modes/interactive/components/conversation-components.js";
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.js";
 import { formatTimelineTime } from "../src/modes/interactive/components/timeline-gutter.js";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
@@ -58,6 +62,7 @@ import {
 	toolOutputFull,
 } from "../src/modes/interactive/components/tool-output-budget.js";
 import { TurnActivityState, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
+import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
 import { formatSplashCwd, InteractiveMode, truncatePathMiddle } from "../src/modes/interactive/interactive-mode.js";
 import { PastedImageFiles } from "../src/modes/interactive/pasted-image-files.js";
 import { ClientPromptStashStore, type PromptStashState } from "../src/modes/interactive/prompt-stash-state.js";
@@ -226,17 +231,21 @@ type RenderSessionContextHarness = {
 	toolOutputExpanded: boolean;
 	chatContainer: Container;
 	editor: { addToHistory?: (text: string) => void };
-	footer: { invalidate: () => void };
+	footer: { invalidate: () => void; setToolErrorCount?: (count: number) => void };
 	updateEditorBorderColor: () => void;
 	resetPendingToolState: () => void;
 	preloadToolDefinitions: (toolNames: string[]) => Promise<void>;
-	settingsManager: { getShowImages: () => boolean; getProcessMode: () => "quiet" | "legacy" };
+	settingsManager: {
+		getShowImages: () => boolean;
+		getProcessMode: () => "quiet" | "legacy";
+		getCodeBlockIndent: () => string;
+	};
 	getCachedToolDefinition: () => undefined;
 	getCurrentCwd: () => string;
 	getRetryAttempt: () => number;
 	ui: { requestRender: () => void; isFullscreen: () => boolean; requestRenderPreservingViewport: () => void };
-	addMessageToChat: (message: AgentMessage, options?: { populateHistory?: boolean }) => void;
 	connectionState?: AgentConnectionState;
+	seenSubagentFailureIds: Set<string>;
 };
 
 type RenderSessionContextOptions = {
@@ -259,13 +268,9 @@ const renderSessionContext = (
 function createRenderSessionContextHarness(overrides: Partial<RenderSessionContextHarness> = {}): {
 	harness: RenderSessionContextHarness;
 	chatContainer: Container;
-	addMessageToChat: ReturnType<typeof vi.fn>;
 	addToHistory: ReturnType<typeof vi.fn>;
 } {
 	const chatContainer = overrides.chatContainer ?? new Container();
-	const addMessageToChat = vi.fn(() => {
-		chatContainer.addChild({ render: () => ["assistant"], invalidate: () => {} });
-	});
 	const addToHistory = vi.fn();
 	const harness: RenderSessionContextHarness = {
 		pendingTools: new Map<string, ToolExecutionComponent>(),
@@ -278,16 +283,20 @@ function createRenderSessionContextHarness(overrides: Partial<RenderSessionConte
 		updateEditorBorderColor: vi.fn(),
 		resetPendingToolState: vi.fn(),
 		preloadToolDefinitions: vi.fn(async () => {}),
-		settingsManager: { getShowImages: () => true, getProcessMode: () => "quiet" as const },
+		settingsManager: {
+			getShowImages: () => true,
+			getProcessMode: () => "quiet" as const,
+			getCodeBlockIndent: () => "  ",
+		},
 		getCachedToolDefinition: () => undefined,
 		getCurrentCwd: () => process.cwd(),
 		getRetryAttempt: () => 0,
 		ui: { requestRender: vi.fn(), isFullscreen: () => false, requestRenderPreservingViewport: vi.fn() },
-		addMessageToChat,
+		seenSubagentFailureIds: new Set<string>(),
 		...overrides,
 	};
 	Object.setPrototypeOf(harness, InteractiveMode.prototype);
-	return { harness, chatContainer, addMessageToChat, addToHistory };
+	return { harness, chatContainer, addToHistory };
 }
 
 function userMessage(content: string, timestamp: number): Extract<AgentMessage, { role: "user" }> {
@@ -324,6 +333,13 @@ async function renderMessages(
 		harness,
 		{ messages, thinkingLevel: "medium", serviceTier: "default", model: null },
 		options,
+	);
+}
+
+/** The replayed prompt rows of a harness chat (the real replay draws them itself). */
+function userRows(chatContainer: Container): UserMessageComponent[] {
+	return chatContainer.children.filter(
+		(child): child is UserMessageComponent => child instanceof UserMessageComponent,
 	);
 }
 
@@ -509,14 +525,13 @@ describe("InteractiveMode.renderSessionContext", () => {
 				settingsManager: {
 					getShowImages: () => true,
 					getProcessMode: () => "quiet" as const,
+					getCodeBlockIndent: () => "  ",
 				},
 				getCachedToolDefinition: () => undefined,
 				getCurrentCwd: () => process.cwd(),
 				getRetryAttempt: () => 0,
 				ui: { requestRender: vi.fn() },
-				addMessageToChat: vi.fn(() => {
-					chatContainer.addChild({ render: () => ["assistant"], invalidate: () => {} });
-				}),
+				seenSubagentFailureIds: new Set<string>(),
 			};
 			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
 
@@ -566,14 +581,13 @@ describe("InteractiveMode.renderSessionContext", () => {
 					// The legacy face draws the tool's own output inline (a quiet
 					// turn keeps it inside the box row).
 					getProcessMode: () => "legacy" as const,
+					getCodeBlockIndent: () => "  ",
 				},
 				getCachedToolDefinition: () => undefined,
 				getCurrentCwd: () => process.cwd(),
 				getRetryAttempt: () => 0,
 				ui: { requestRender: vi.fn() },
-				addMessageToChat: vi.fn(() => {
-					chatContainer.addChild({ render: () => ["assistant"], invalidate: () => {} });
-				}),
+				seenSubagentFailureIds: new Set<string>(),
 			};
 			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
 
@@ -601,18 +615,19 @@ describe("InteractiveMode.renderSessionContext", () => {
 	});
 
 	test("renders only the recent tail for very long initial transcripts", async () => {
-		const { harness, chatContainer, addMessageToChat } = createRenderSessionContextHarness();
+		const { harness, chatContainer } = createRenderSessionContextHarness();
 		const messages = Array.from({ length: 405 }, (_, index) => userMessage(`message ${index}`, index));
 
 		await renderMessages(harness, messages, { limitTranscript: true });
 
-		expect(addMessageToChat).toHaveBeenCalledTimes(400);
-		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({ content: "message 5" });
+		const prompts = userRows(chatContainer);
+		expect(prompts).toHaveLength(400);
+		expect(prompts[0]!.getBlockCopyText()).toBe("message 5");
 		expect(renderAll(chatContainer)).toContain("为了打开得快，只显示最近 400 条消息（共 405 条）");
 	});
 
 	test("keeps equal-timestamp legacy messages after the compaction summary", async () => {
-		const { harness, addMessageToChat } = createRenderSessionContextHarness();
+		const { harness, chatContainer } = createRenderSessionContextHarness();
 		const earlier = userMessage("earlier", 4);
 		const summary = {
 			role: "compactionSummary",
@@ -623,11 +638,20 @@ describe("InteractiveMode.renderSessionContext", () => {
 		const equalLater = userMessage("equal later", 5);
 
 		await renderMessages(harness, [summary, earlier, equalLater]);
-		expect(addMessageToChat.mock.calls.map((call) => call[0])).toEqual([earlier, summary, equalLater]);
+		const rows = chatContainer.children;
+		// A prompt after the summary keeps its separator row, as the live view draws it.
+		expect(rows.map((row) => row.constructor.name)).toEqual([
+			"UserMessageComponent",
+			"QuietCompactionNoticeComponent",
+			"Spacer",
+			"UserMessageComponent",
+		]);
+		expect((rows[0] as UserMessageComponent).getBlockCopyText()).toBe("earlier");
+		expect((rows[3] as UserMessageComponent).getBlockCopyText()).toBe("equal later");
 	});
 
 	test("orders the compaction summary at its exact boundary before bounding the initial transcript", async () => {
-		const { harness, addMessageToChat } = createRenderSessionContextHarness();
+		const { harness, chatContainer } = createRenderSessionContextHarness();
 		const retained = Array.from({ length: 5 }, (_, index) => userMessage(`retained ${index}`, 5));
 		const summary = {
 			role: "compactionSummary",
@@ -640,31 +664,36 @@ describe("InteractiveMode.renderSessionContext", () => {
 
 		await renderMessages(harness, [summary, ...retained, ...later], { limitTranscript: true });
 
-		expect(addMessageToChat).toHaveBeenCalledTimes(400);
-		expect(addMessageToChat.mock.calls[0]?.[0]).toBe(summary);
-		expect(addMessageToChat.mock.calls[1]?.[0]).toMatchObject({ content: "later 0" });
+		const prompts = userRows(chatContainer);
+		expect(prompts).toHaveLength(399);
+		expect(prompts[0]!.getBlockCopyText()).toBe("later 0");
+		// The summary opens the window: its row stands before the first kept prompt.
+		const summaryRow = chatContainer.children.findIndex((row) => row instanceof QuietCompactionNoticeComponent);
+		expect(summaryRow).toBeGreaterThan(-1);
+		expect(summaryRow).toBeLessThan(chatContainer.children.indexOf(prompts[0]!));
 	});
 
 	test("preserves the full transcript when rebuilding a cleared transcript", async () => {
-		const { harness, chatContainer, addMessageToChat } = createRenderSessionContextHarness();
+		const { harness, chatContainer } = createRenderSessionContextHarness();
 		chatContainer.addChild({ render: () => ["old transcript"], invalidate: () => {} });
 		const messages = Array.from({ length: 405 }, (_, index) => userMessage(`message ${index}`, index));
 
 		await renderMessages(harness, messages, { clearChat: true });
 
-		expect(addMessageToChat).toHaveBeenCalledTimes(405);
-		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({ content: "message 0" });
+		const prompts = userRows(chatContainer);
+		expect(prompts).toHaveLength(405);
+		expect(prompts[0]!.getBlockCopyText()).toBe("message 0");
 		expect(renderAll(chatContainer)).not.toContain("old transcript");
-		expect(renderAll(chatContainer)).not.toContain("for faster open");
+		expect(renderAll(chatContainer)).not.toContain("为了打开得快");
 	});
 
 	test("populates editor history from the full transcript when initial rendering is capped", async () => {
-		const { harness, addMessageToChat, addToHistory } = createRenderSessionContextHarness();
+		const { harness, chatContainer, addToHistory } = createRenderSessionContextHarness();
 		const messages = Array.from({ length: 405 }, (_, index) => userMessage(`message ${index}`, index));
 
 		await renderMessages(harness, messages, { populateHistory: true, limitTranscript: true });
 
-		expect(addMessageToChat).toHaveBeenCalledTimes(400);
+		expect(userRows(chatContainer)).toHaveLength(400);
 		expect(addToHistory).toHaveBeenCalledTimes(405);
 		expect(addToHistory.mock.calls[0]?.[0]).toBe("message 0");
 		expect(addToHistory.mock.calls.at(-1)?.[0]).toBe("message 404");
@@ -707,7 +736,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 	});
 
 	test("trims capped initial renders past orphaned tool results", async () => {
-		const { harness, chatContainer, addMessageToChat } = createRenderSessionContextHarness();
+		const { harness, chatContainer } = createRenderSessionContextHarness();
 		const messages = [
 			toolCallMessage("tool-old", "old_tool"),
 			toolResultMessage("tool-old", "old_tool", [{ type: "text", text: "old result" }]),
@@ -716,13 +745,14 @@ describe("InteractiveMode.renderSessionContext", () => {
 
 		await renderMessages(harness, messages, { limitTranscript: true });
 
-		expect(addMessageToChat).toHaveBeenCalledTimes(399);
-		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({ content: "message 0" });
+		const prompts = userRows(chatContainer);
+		expect(prompts).toHaveLength(399);
+		expect(prompts[0]!.getBlockCopyText()).toBe("message 0");
 		expect(renderAll(chatContainer)).toContain("为了打开得快，只显示最近 399 条消息（共 401 条）");
 	});
 
 	test("omits a trailing orphaned tool result without dropping the recent tail", async () => {
-		const { harness, chatContainer, addMessageToChat } = createRenderSessionContextHarness();
+		const { harness, chatContainer } = createRenderSessionContextHarness();
 		const messages = [
 			toolCallMessage("tool-old", "old_tool"),
 			...Array.from({ length: 399 }, (_, index) => userMessage(`message ${index}`, index)),
@@ -731,15 +761,17 @@ describe("InteractiveMode.renderSessionContext", () => {
 
 		await renderMessages(harness, messages, { limitTranscript: true });
 
-		expect(addMessageToChat).toHaveBeenCalledTimes(399);
-		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({ role: "assistant" });
-		expect(addMessageToChat.mock.calls[1]?.[0]).toMatchObject({ content: "message 1" });
-		expect(addMessageToChat.mock.calls.at(-1)?.[0]).toMatchObject({ content: "message 398" });
+		// The window opens on the orphaned call's assistant message, then the kept prompts.
+		expect(chatContainer.children.some((row) => row instanceof QuietAssistantMessage)).toBe(true);
+		const prompts = userRows(chatContainer);
+		expect(prompts).toHaveLength(398);
+		expect(prompts[0]!.getBlockCopyText()).toBe("message 1");
+		expect(prompts.at(-1)!.getBlockCopyText()).toBe("message 398");
 		expect(renderAll(chatContainer)).toContain("为了打开得快，只显示最近 400 条消息（共 401 条）");
 	});
 
 	test("keeps a bounded tool-call context when the recent tail contains only tool results", async () => {
-		const { harness, chatContainer, addMessageToChat } = createRenderSessionContextHarness();
+		const { harness, chatContainer } = createRenderSessionContextHarness();
 		const toolCallIds = Array.from({ length: 400 }, (_, index) => `tool-${index}`);
 		const assistantMessage: Extract<AgentMessage, { role: "assistant" }> = {
 			...toolCallMessage(toolCallIds[0]!, "custom_tool"),
@@ -752,8 +784,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 
 		await renderMessages(harness, messages, { limitTranscript: true });
 
-		expect(addMessageToChat).toHaveBeenCalledOnce();
-		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({ role: "assistant" });
+		expect(chatContainer.children.filter((row) => row instanceof QuietAssistantMessage)).toHaveLength(1);
 		expect(harness.preloadToolDefinitions).toHaveBeenCalledWith(Array(399).fill("custom_tool"));
 		expect(renderAll(chatContainer)).toContain("为了打开得快，只显示最近 400 条消息（共 401 条）");
 	});
@@ -1788,6 +1819,7 @@ describe("InteractiveMode connection events", () => {
 			})),
 			seedSubagentSummary: vi.fn(),
 			applyConnectionStateSnapshot: vi.fn(),
+			applySnapshotQuotaPark: vi.fn(),
 			renderSessionContext: renderSessionContextMock,
 			restoreStreamingMessageFromSnapshot,
 			restoreTurnStartFromMessages: vi.fn(),
@@ -1883,7 +1915,7 @@ describe("InteractiveMode connection events", () => {
 			sessionEventGeneration: 0,
 			renderResyncedSession: vi.fn(async () => {}),
 			refreshCommandCatalogForCurrentSession: vi.fn(async () => {}),
-			clearQuotaPark: vi.fn(),
+			applySnapshotQuotaPark: vi.fn(),
 			resetSideQuestion: vi.fn(),
 			resetExtensionUI: vi.fn(),
 			resetCurrentSessionRenderState: vi.fn(),
@@ -1932,7 +1964,7 @@ describe("InteractiveMode connection events", () => {
 			sessionEventGeneration: 0,
 			refreshCommandCatalogForCurrentSession: vi.fn(() => catalog),
 			renderResyncedSession: vi.fn(async () => {}),
-			clearQuotaPark: vi.fn(),
+			applySnapshotQuotaPark: vi.fn(),
 			resetSideQuestion: vi.fn(),
 			resetExtensionUI: vi.fn(),
 			applyConnectionStateSnapshot: vi.fn(),

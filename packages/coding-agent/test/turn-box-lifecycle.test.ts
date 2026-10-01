@@ -216,7 +216,9 @@ function createScreen(
 		prompts: () =>
 			chatContainer.children
 				.filter((child) => child instanceof UserMessageComponent)
-				.map((child) => stripAnsi(child.render(100).join("\n")).trim().split("\n").at(-1)?.trim() ?? ""),
+				// The prompt's words, however the row draws them (bubble in the stubbed
+				// live path, timeline row in the real replay).
+				.map((child) => (child as UserMessageComponent).getBlockCopyText()),
 	};
 }
 

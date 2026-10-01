@@ -45,6 +45,7 @@ type RenderSessionContextThis = {
 	settingsManager: {
 		getShowImages(): boolean;
 		getProcessMode(): "quiet" | "legacy";
+		getCodeBlockIndent(): string;
 	};
 	toolOutputExpanded: boolean;
 	isInitialized: boolean;
@@ -93,6 +94,7 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 		settingsManager: {
 			getShowImages: () => false,
 			getProcessMode: () => "quiet",
+			getCodeBlockIndent: () => "  ",
 		},
 		toolOutputExpanded: false,
 		isInitialized: true,

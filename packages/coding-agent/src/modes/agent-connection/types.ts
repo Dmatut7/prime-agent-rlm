@@ -385,11 +385,38 @@ export interface AgentConnectionParentMetadata {
 	childId?: string;
 }
 
+/**
+ * The park facts of a quota-parked session as the attach/reattach snapshot
+ * carries them (daemon protocol rev 43): the same wire shape as the payload of
+ * a parked quota_park_status event, always parked. Mirrors
+ * DaemonSessionSnapshotQuotaPark in daemon-protocol.ts; the mirror is pinned by
+ * test/agent-connection-daemon.test.ts so the two cannot drift silently.
+ */
+export interface AgentConnectionSnapshotQuotaPark {
+	/** Always true: the field itself is omitted when the session is not parked. */
+	parked: true;
+	/** ISO wake time of the active park; absent only for a park without persisted facts. */
+	resumeAt?: string;
+	/** Milliseconds until resumeAt at snapshot build time, clamped at 0 while the wake is firing. */
+	remainingMs?: number;
+	/** How many times this session has parked in the current episode. */
+	parkCount?: number;
+	/** Provider whose usage limit caused the park. */
+	provider?: string;
+}
+
 export interface AgentConnectionSnapshot {
 	state: AgentConnectionState;
 	messages: AgentMessage[];
 	/** In-flight assistant message, separate from finalized transcript messages. */
 	streamingMessage?: AgentMessage;
+	/**
+	 * Quota-park status at snapshot build time (daemon protocol rev 43), present
+	 * only when the attaching client declared the quota_park_status capability and
+	 * the session was parked. Absence means "not parked at snapshot time"; the
+	 * quota_park_status event stream stays the live channel from then on.
+	 */
+	quotaPark?: AgentConnectionSnapshotQuotaPark;
 	sessionContext?: AgentConnectionSessionContext;
 	sessionTree?: {
 		tree: AgentConnectionSessionTreeNode[];

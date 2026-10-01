@@ -569,6 +569,10 @@ export class DaemonAgentConnection implements AgentConnection {
 					"chunked_snapshot",
 					"streaming_deltas",
 					"streaming_delta_fragments",
+					// rev 43: the attach/reattach snapshot carries quotaPark for a
+					// parked session, so an attach into a park seeds the countdown
+					// instead of sitting blind until the next heartbeat.
+					"quota_park_status",
 					...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
 				],
 				env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
@@ -1695,6 +1699,10 @@ export class DaemonAgentConnection implements AgentConnection {
 					"chunked_snapshot",
 					"streaming_deltas",
 					"streaming_delta_fragments",
+					// rev 43: the attach/reattach snapshot carries quotaPark for a
+					// parked session, so an attach into a park seeds the countdown
+					// instead of sitting blind until the next heartbeat.
+					"quota_park_status",
 					...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
 				],
 				env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
@@ -3245,6 +3253,9 @@ function mapDaemonSessionSnapshot(snapshot: DaemonSessionSnapshot, replay?: Daem
 	}
 	if (snapshot.children) {
 		connectionSnapshot.children = snapshot.children;
+	}
+	if (snapshot.quotaPark) {
+		connectionSnapshot.quotaPark = snapshot.quotaPark;
 	}
 	if (replay) {
 		connectionSnapshot.replay = replay;

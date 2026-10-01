@@ -11,7 +11,6 @@ import {
 	type Model,
 	type ServiceTier,
 	supportsFastMode,
-	type TextContent,
 	type ToolCall,
 } from "@earendil-works/pi-ai";
 import { BUILTIN_MCP_CATALOG } from "@earendil-works/pi-ai/mcp";
@@ -239,25 +238,18 @@ import {
 import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "./components/configuration-menu.js";
 import { formatContextTree } from "./components/context-tree-format.js";
 import {
-	assignWakeCause,
-	awaitsStepResults,
-	countThinkingSegments,
+	applyExpansionLanes,
 	createAgentMessageRow,
+	createProviderFallbackNoticeRow,
 	createUserMessage,
 	foldEarlierAnswers,
 	giveLane,
-	giveLaneTracker,
-	isWakeMessage,
 	lastDrawnComponent,
 	latestShownTurn,
-	latestThinkingText,
-	NO_STEP_STOP,
-	noteWakeInRound,
 	QuietAssistantMessage,
 	QuietTurnSummary,
-	resolveTurnHeaders,
+	replayConversation,
 	stepResultStop,
-	WakeCause,
 } from "./components/conversation-components.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
@@ -319,7 +311,7 @@ import {
 	summarizeSubagentSpend,
 	TrayInfoLine,
 } from "./components/subagent-summary-line.js";
-import { isSubagentNoticeMessage, subagentNoticeRow } from "./components/system-notice.js";
+import { subagentNoticeRow } from "./components/system-notice.js";
 import { ThinkingSelectorComponent } from "./components/thinking-selector.js";
 import {
 	selectLatestToolExpandHint,
@@ -338,13 +330,11 @@ import { TreeSelectorComponent } from "./components/tree-selector.js";
 import {
 	PROCESS_FOLD_THRESHOLD,
 	type TimelineHost,
-	TurnActivityState,
-	type TurnStep,
+	type TurnActivityState,
 	TurnSummaryComponent,
 } from "./components/turn-activity.js";
 import { BOX_FOCUS_MARKER } from "./components/turn-box.js";
 import { TurnBoxNavigator, turnBoxFocusHints } from "./components/turn-box-navigator.js";
-import { boxRecordFromMessage, isBoxNoticeMessage } from "./components/turn-timeline.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
 import { FeatureHintDeck } from "./feature-hints.js";
@@ -528,25 +518,6 @@ export function styleQueuedMessagePreview(
 	)}`;
 }
 
-/**
- * A fallback-chain notice as one status row, like the live switch notice, so a
- * return to the primary or an unread image reads the same live and on replay.
- */
-function createProviderFallbackNoticeRow(message: CustomMessage): Component {
-	const text =
-		typeof message.content === "string"
-			? message.content
-			: message.content
-					.filter((block): block is TextContent => block.type === "text")
-					.map((block) => block.text)
-					.join("\n");
-	const kind = (message.details as { kind?: unknown } | undefined)?.kind;
-	const row = new Container();
-	row.addChild(new Spacer(1));
-	row.addChild(new Text(theme.fg(kind === "return" ? "dim" : "warning", text), 1, 0));
-	return row;
-}
-
 interface ProcessModeReader {
 	getProcessMode?: () => string;
 }
@@ -567,58 +538,6 @@ function quietConversation(mode: object): boolean {
 
 function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
-}
-
-/**
- * One lane bundle: where each expansion surface reads its state from. The
- * per-turn values come from the owning turn's TurnActivityState; the globals
- * serve turn-less children and the header (K3 ②).
- */
-function applyExpansionLanes(
-	child: unknown,
-	lanes: { thinking: boolean; tools: boolean; agentMessages: boolean; editDiffs: boolean },
-): void {
-	if (child instanceof AssistantMessageComponent) {
-		// U6 two-key model: T drives the thinking traces; O drives the error
-		// detail surface.
-		child.setThinkingExpanded(lanes.thinking);
-	}
-	// A memory card opens by its own click or Enter; the process key never opens it.
-	if (isExpandable(child) && !(child instanceof RefinementOutcomeMessageComponent)) {
-		child.setExpanded(child instanceof AgentMessageComponent ? lanes.agentMessages : lanes.tools);
-	}
-	if (hasAgentMessagesExpansion(child)) {
-		child.setAgentMessagesExpanded(lanes.agentMessages);
-	}
-	if (hasEditDiffsExpansion(child)) {
-		child.setEditDiffsExpanded(lanes.editDiffs);
-	}
-}
-
-interface AgentMessagesExpandable {
-	setAgentMessagesExpanded(expanded: boolean): void;
-}
-
-function hasAgentMessagesExpansion(obj: unknown): obj is AgentMessagesExpandable {
-	return (
-		typeof obj === "object" &&
-		obj !== null &&
-		"setAgentMessagesExpanded" in obj &&
-		typeof (obj as AgentMessagesExpandable).setAgentMessagesExpanded === "function"
-	);
-}
-
-interface EditDiffsExpandable {
-	setEditDiffsExpanded(expanded: boolean): void;
-}
-
-function hasEditDiffsExpansion(obj: unknown): obj is EditDiffsExpandable {
-	return (
-		typeof obj === "object" &&
-		obj !== null &&
-		"setEditDiffsExpanded" in obj &&
-		typeof (obj as EditDiffsExpandable).setEditDiffsExpanded === "function"
-	);
 }
 
 class ExpandableText extends Text implements Expandable {
@@ -6359,9 +6278,10 @@ export class InteractiveMode {
 						if (generation !== this.sessionEventGeneration) return false;
 						this.connectionLost = false;
 						// A park that lifted while the link was down sent its parked:false
-						// into the void; drop the local state and let the daemon's next
-						// heartbeat (60s cadence) re-announce a park that is still active.
-						this.clearQuotaPark();
+						// into the void; the resync snapshot's quotaPark field (rev 43) is
+						// authoritative for snapshot time, so seed from it instead of
+						// waiting out the next heartbeat (60s cadence).
+						this.applySnapshotQuotaPark(event.snapshot.quotaPark);
 						this.liveTurnFlowStore?.connectionRestored();
 						await this.refreshCommandCatalogForCurrentSession?.();
 						if (generation !== this.sessionEventGeneration) return false;
@@ -7918,6 +7838,24 @@ export class InteractiveMode {
 	}
 
 	/**
+	 * The snapshot's quotaPark field (rev 43) is the park state at snapshot build
+	 * time: an attach, replace or resync into a parked session seeds the countdown
+	 * from it instead of sitting blind until the next quota_park_status heartbeat.
+	 * Absence means "not parked at snapshot time" - a stale local park from a view
+	 * that just changed hands is cleared on the spot.
+	 */
+	private applySnapshotQuotaPark(quotaPark: AgentConnectionSnapshot["quotaPark"]): void {
+		if (quotaPark === undefined) {
+			if (this.quotaPark !== undefined) {
+				this.clearQuotaPark();
+				this.ui.requestRender();
+			}
+			return;
+		}
+		this.handleQuotaParkStatus(quotaPark);
+	}
+
+	/**
 	 * A quota_park_status heartbeat from the daemon (中断-10): remember the active
 	 * park so the status bar can count the wake down, and say it in the chat when
 	 * a park begins - and again when a re-park pushes the wake further out. The
@@ -8667,14 +8605,6 @@ export class InteractiveMode {
 		if (!options.limitTranscript) this.chatCapRebuildFloor = 0;
 		this.ipythonToolComponents.clear();
 		this.lateIpythonSentAgentMessages.clear();
-		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
-		// U4: the startup replay mirrors buildConversationComponents' turn grouping:
-		// one aggregate line per agent turn, settled tools hidden while collapsed.
-		let replayTurnState: TurnActivityState | undefined;
-		let replayTurnSummary: TurnSummaryComponent | undefined;
-		// TUI v4: comms counted per replayed turn (received agent-message rows +
-		// sent agent messages inside ipython tool details), deduped by id.
-		const replaySentCommIds = new Set<string>();
 		const replayQuiet = this.settingsManager.getProcessMode() === "quiet";
 		// A rebuild replays the question from its start: who is still out is learned again as it goes,
 		// and what the replay cannot see (a dispatch compacted away or outside the window) is taken back.
@@ -8736,8 +8666,6 @@ export class InteractiveMode {
 			}
 		}
 
-		const renderOptions = { ...options, populateHistory: false };
-
 		if (messagesToRender.length < sessionContext.messages.length) {
 			this.chatContainer.addChild(
 				new Text(
@@ -8752,282 +8680,100 @@ export class InteractiveMode {
 			this.chatContainer.addChild(new Spacer(1));
 		}
 
-		// A replayed quiet turn ends like a live one: its box says how the run
-		// ended, and the change strip goes under its answer.
-		let lastReplayAssistant: AssistantMessage | undefined;
-		// An interjection lands after the step's results came back; a user
-		// message straight after a tool call (an orphaned call) starts a turn.
-		let replayResultsArrived = false;
-		// How the last step's result says the turn went on (the owner's stop ends it there).
-		let replayResultStop = NO_STEP_STOP;
-		// The next turn's opener is a message the user sent, unless it is a stored heartbeat prompt.
-		let replayStartedByUser = true;
-		// The owner's prompt opened the turn about to start: a report landing before its first reply does not take it over.
-		let replayPromptOpened = false;
-		// The quiet timeline's round ends where its own last message landed, not when whatever came after it began.
-		let replayRoundEndedAt: number | undefined;
-		const noteReplayRoundAt = (message: AgentMessage): void => {
-			const at = Number(message.timestamp);
-			if (replayQuiet && Number.isFinite(at) && at > 0) replayRoundEndedAt = Math.max(replayRoundEndedAt ?? 0, at);
-		};
-		const closeReplayTurn = (): void => {
-			if (!replayQuiet || !replayTurnState || !replayTurnSummary) return;
-			replayTurnState.timeline.stopped = lastReplayAssistant?.stopReason === "aborted" || replayResultStop.stopped;
-			replayTurnState.timeline.errorEnded = lastReplayAssistant?.stopReason === "error";
-			this.turnFlow.attachStrip(replayTurnSummary);
-		};
-
-		// What woke the turn about to start; the turn takes it when its first reply comes.
-		let replayCause: WakeCause | undefined;
-		// The run goes on inside the tool loop: a message right after a step's results belongs to the same turn.
-		const insideReplayToolLoop = (): boolean =>
-			replayQuiet &&
-			replayTurnState !== undefined &&
-			lastReplayAssistant?.stopReason === "toolUse" &&
-			replayResultsArrived &&
-			!replayResultStop.endsTurn;
-		// A report is inside the round while its step runs too, though its result comes after it in the transcript.
-		const insideReplayRound = (): boolean =>
-			insideReplayToolLoop() ||
-			(replayQuiet && replayTurnState !== undefined && awaitsStepResults(lastReplayAssistant, replayResultsArrived));
-
-		for (const message of messagesToRender) {
-			// A message that wakes the AI after its turn ended starts the next turn: the answer the turn
-			// ended on stays its own, and the woken turn never folds it away (a live run does the same).
-			if (replayQuiet && isWakeMessage(message) && insideReplayRound()) noteWakeInRound(replayTurnState, message);
-			if (replayQuiet && isWakeMessage(message) && !insideReplayRound() && !replayPromptOpened) {
-				replayCause ??= new WakeCause(this.turnFlow.reports);
-				replayCause.add(message);
-				replayTurnState?.markTurnEnded(replayRoundEndedAt ?? (Number(message.timestamp) || Date.now()));
-				closeReplayTurn();
-				replayTurnState = undefined;
-				replayTurnSummary = undefined;
-				lastReplayAssistant = undefined;
-				replaySentCommIds.clear();
-				replayStartedByUser = false;
-			}
-			this.turnFlow.reports.note(message);
-			if (message.role === "user") {
-				// A message typed while the AI was between its steps is an
-				// interjection inside that turn's box, not a new turn.
-				if (replayTurnState && insideReplayToolLoop()) {
-					const text = this.getUserMessageText(message).trim() || "[图片]";
-					replayTurnState.timeline.addSteer(text, Number(message.timestamp) || Date.now());
-					noteReplayRoundAt(message);
-					continue;
-				}
-				// Freeze the previous turn's clock (thinking-only turns have no
-				// steps to settle) before the next turn starts.
-				replayTurnState?.markTurnEnded(replayRoundEndedAt ?? (Number(message.timestamp) || Date.now()));
-				closeReplayTurn();
-				replayTurnState = undefined;
-				replayTurnSummary = undefined;
-				lastReplayAssistant = undefined;
-				replaySentCommIds.clear();
-				replayStartedByUser = !this.createLegacyHeartbeatPromptMessage(message, this.getUserMessageText(message));
-				replayPromptOpened = replayStartedByUser;
-				// A new question: nobody is out yet (a stored heartbeat prompt is not one).
-				if (replayStartedByUser) {
-					this.turnFlow.subagentLane.reset();
-					questionStartedAt = Number(message.timestamp) || undefined;
+		// R3-5: THE replay is replayConversation (components/conversation-components.ts) -
+		// the same single implementation buildConversationComponents exposes to tests.
+		// The hooks wire what only a live session has: the shared lane and report
+		// memory, the heartbeat catalog, cached tool definitions, extension
+		// renderers, the change strips, and the per-turn lanes carried over a rebuild.
+		const replay = replayConversation(messagesToRender, this.chatContainer, {
+			ui: this.ui,
+			cwd: this.getCurrentCwd(),
+			toolOptions: { showImages: this.settingsManager.getShowImages() },
+			getToolDefinition: (name) => this.getCachedToolDefinition(name),
+			markdownTheme: this.getMarkdownThemeWithSettings(),
+			hideThinkingBlock: this.hideThinkingBlock,
+			hiddenThinkingLabel: this.hiddenThinkingLabel,
+			toolsExpanded: this.toolOutputExpanded,
+			thinkingExpanded: this.thinkingExpanded,
+			agentMessagesExpanded: this.agentMessagesExpanded,
+			editDiffsExpanded: this.editDiffsExpanded,
+			isRecognizedSlashCommand: (name) => this.isRecognizedSlashCommand(name),
+			processMode: this.settingsManager.getProcessMode(),
+			timelineHost: this.timelineHost(),
+			mermaidTransform: this.mermaidMarkdownTransform,
+			// Attaching mid-run: live tool and thinking events keep feeding the last
+			// turn's group, so the replayed state stays the live one - and stays
+			// running until agent_end stamps it. Tool calls without results keep the
+			// turn open either way (the engine's pendingTools).
+			keepFinalTurnOpen: () => this.isAgentStreaming(),
+			hooks: {
+				subagentLane: this.turnFlow.subagentLane,
+				reports: this.turnFlow.reports,
+				userLane: (at) => this.turnFlow.subagentLane.tracker.laneAt(at),
+				renderUserPrompt: (message, text) => {
+					// A stored heartbeat prompt renders as an injected notice and never opens an owner turn.
+					const heartbeatMessage = this.createLegacyHeartbeatPromptMessage(message, text);
+					if (!heartbeatMessage) return undefined;
+					const component = new InjectedPromptMessageComponent(
+						heartbeatMessage,
+						this.getMarkdownThemeWithSettings(),
+					);
+					component.setExpanded(this.toolOutputExpanded);
+					return { components: [component], ownerOpened: false };
+				},
+				createTurnSummary: (state) => this.createTurnSummary(state),
+				onTurnCreated: (state) => {
+					// A window that starts inside a long turn keeps the turn's prompt, its
+					// real start, and a row saying how many of its steps it left out.
+					if (!cutTurn) return;
+					if (cutTurn.startedAt !== undefined) state.startedEarlier(cutTurn.startedAt);
+					if (cutTurn.hiddenSteps > 0) {
+						state.timeline.earlierSteps = cutTurn.hiddenSteps;
+						state.timeline.addNotice(
+							{ tone: "muted", text: `… 更早的 ${cutTurn.hiddenSteps} 步没列出` },
+							cutTurn.startedAt ?? 0,
+						);
+					}
+					cutTurn = undefined;
+				},
+				onOwnerPrompt: (message, at) => {
+					// When the question the replay ends in began: an earlier dispatch is another question's.
+					questionStartedAt = at;
 					// The prompt a window keeps of the question it cut into is the running question's own.
 					if (message === cutPrompt && cutPromptIsAlone) this.turnFlow.restoreLane(laneBefore, questionStartedAt);
-				}
-				replayCause = undefined;
-			}
-			// Assistant messages need special handling for tool calls
-			if (message.role === "assistant") {
-				// U6: the turn's aggregate line renders at the turn head, before the
-				// first assistant component, and counts this message's thinking.
-				if (!replayTurnState) {
-					replayTurnState = new TurnActivityState(Number(message.timestamp) || Date.now());
-					replayRoundEndedAt = undefined;
-					replayTurnState.startedByUser = replayStartedByUser;
-					replayPromptOpened = false;
-					if (replayCause) assignWakeCause(replayTurnState, replayCause);
-					replayCause = undefined;
-					replayTurnSummary = this.createTurnSummary(replayTurnState);
-					giveLaneTracker(replayTurnSummary, this.turnFlow.subagentLane.tracker);
-					replayTurnSummary.setExpanded(this.toolOutputExpanded);
-					// TUI v4: quiet turns carry the one-line footnote at their head.
-					replayTurnSummary.setQuiet(replayQuiet);
-					this.chatContainer.addChild(replayTurnSummary);
-					if (cutTurn) {
-						if (cutTurn.startedAt !== undefined) replayTurnState.startedEarlier(cutTurn.startedAt);
-						if (cutTurn.hiddenSteps > 0) {
-							replayTurnState.timeline.earlierSteps = cutTurn.hiddenSteps;
-							replayTurnState.timeline.addNotice(
-								{ tone: "muted", text: `… 更早的 ${cutTurn.hiddenSteps} 步没列出` },
-								cutTurn.startedAt ?? 0,
-							);
-						}
-						cutTurn = undefined;
+				},
+				onToolStep: (state, summary, content) => {
+					if (replayQuiet) this.turnFlow.noteStepHandles(state, content.id, content.arguments);
+					const lanes = state.steps.length === 1 ? turnLanes.get(content.id) : undefined;
+					if (lanes && summary) {
+						state.setProcessKeySteps(lanes.keySteps);
+						state.thinkingExpanded = lanes.thinking;
+						state.agentMessagesExpanded = lanes.comms;
+						summary.setExpanded(lanes.process);
+						restoredSummaries.push(summary);
 					}
-				}
-				replayTurnState.modelId = message.model || replayTurnState.modelId;
-				replayTurnState.addThinkingSegments(countThinkingSegments(message));
-				replayTurnState.latestThinking = latestThinkingText(message) || replayTurnState.latestThinking;
-				replayTurnState.timeline.noteMessage(message, true, true);
-				replayTurnState.noteReplyAt(Number(message.timestamp));
-				noteReplayRoundAt(message);
-				lastReplayAssistant = message;
-				replayResultsArrived = false;
-				replayResultStop = NO_STEP_STOP;
-				this.addMessageToChat(message, { round: replayTurnState });
-				// Render tool call components
-				for (const content of message.content) {
-					if (content.type === "toolCall") {
-						replayTurnState.addStep({
-							toolCallId: content.id,
-							toolName: content.name,
-							args: content.arguments,
-							status: "running",
-						} satisfies TurnStep);
-						if (replayQuiet) this.turnFlow.noteStepHandles(replayTurnState, content.id, content.arguments);
-						const lanes = replayTurnState.steps.length === 1 ? turnLanes.get(content.id) : undefined;
-						if (lanes && replayTurnSummary) {
-							replayTurnState.setProcessKeySteps(lanes.keySteps);
-							replayTurnState.thinkingExpanded = lanes.thinking;
-							replayTurnState.agentMessagesExpanded = lanes.comms;
-							replayTurnSummary.setExpanded(lanes.process);
-							restoredSummaries.push(replayTurnSummary);
-						}
-						const component = new ToolExecutionComponent(
-							content.name,
-							content.id,
-							content.arguments,
-							{
-								showImages: this.settingsManager.getShowImages(),
-								includeImageDimensions: false,
-							},
-							this.getCachedToolDefinition(content.name),
-							this.ui,
-							this.getCurrentCwd(),
-						);
-						component.setTurnActivity(replayTurnState);
-						component.setExpanded(this.toolOutputExpanded || !replayTurnState.isCollapsed);
-						component.setAgentMessagesExpanded(
-							this.agentMessagesExpanded || replayTurnState.agentMessagesExpanded,
-						);
-						component.setEditDiffsExpanded(this.editDiffsExpanded);
-						selectLatestToolExpandHint(this.chatContainer.children, component);
-						this.chatContainer.addChild(component);
-						this.registerIpythonToolComponent(content.name, content.id, component);
+				},
+				onToolComponent: (component, content) => {
+					this.registerIpythonToolComponent(content.name, content.id, component);
+				},
+				retryAttempt: () => this.getRetryAttempt(),
+				onToolResult: (message, state) => {
+					recordStepFileChanges(state, message.toolCallId, message, this.getCurrentCwd());
+				},
+				extensionMessageRenderer: (customType) =>
+					this.bindLocalSessionExtensions
+						? this.getLocalSessionHost().getExtensionRunner().getMessageRenderer(customType)
+						: undefined,
+				// A replayed quiet turn ends like a live one: its box says how the run
+				// ended, and the change strip goes under its answer.
+				onTurnClose: (_state, summary) => this.turnFlow.attachStrip(summary),
+				onAssistantMessage: (message) => {
+					this.lastAssistantStopReason = message.stopReason;
+				},
+			},
+		});
 
-						if (message.stopReason === "aborted" || message.stopReason === "error") {
-							let errorMessage: string;
-							if (message.stopReason === "aborted") {
-								const retryAttempt = this.getRetryAttempt();
-								errorMessage =
-									retryAttempt > 0
-										? `重试 ${retryAttempt} 次后已中断`
-										: message.errorMessage &&
-												message.errorMessage !== "Request was aborted" &&
-												message.errorMessage !== "Operation aborted"
-											? message.errorMessage
-											: "已中断";
-							} else {
-								errorMessage = message.errorMessage || "Error";
-							}
-							component.updateResult({ content: [{ type: "text", text: errorMessage }], isError: true });
-							replayTurnState.timeline.mergeStep(
-								content.id,
-								content.name,
-								content.arguments,
-								{ content: [{ type: "text", text: errorMessage }], isError: true },
-								false,
-							);
-							// Batch1 review P1-2: settle the step like the live path
-							// (message_end) does - without this the aborted turn's
-							// steps stay "running" forever, the footnote's duration
-							// becomes Date.now()-startedAt and never freezes.
-							replayTurnState.setStepStatus(content.id, "error", Number(message.timestamp) || Date.now());
-						} else {
-							renderedPendingTools.set(content.id, component);
-						}
-					}
-				}
-			} else if (message.role === "toolResult") {
-				replayResultsArrived = true;
-				replayResultStop = stepResultStop(message);
-				noteReplayRoundAt(message);
-				// Match tool results to pending tool components
-				const component = renderedPendingTools.get(message.toolCallId);
-				if (component) {
-					component.updateResult(message);
-					renderedPendingTools.delete(message.toolCallId);
-				}
-				replayTurnState?.setStepStatus(
-					message.toolCallId,
-					message.isError ? "error" : "done",
-					Number(message.timestamp) || Date.now(),
-				);
-				replayTurnState?.timeline.mergeStep(
-					message.toolCallId,
-					message.toolName,
-					replayTurnState.steps.find((step) => step.toolCallId === message.toolCallId)?.args,
-					message,
-					false,
-				);
-				recordStepFileChanges(replayTurnState, message.toolCallId, message, this.getCurrentCwd());
-				// TUI v4: sent agent messages riding this tool result count as comms.
-				const details =
-					typeof message.details === "object" && message.details !== null
-						? (message.details as Record<string, unknown>)
-						: {};
-				if (Array.isArray(details.sentAgentMessages)) {
-					for (const entry of details.sentAgentMessages) {
-						const id =
-							typeof entry === "object" && entry !== null && "id" in entry
-								? String((entry as Record<string, unknown>).id)
-								: undefined;
-						if (id === undefined || replaySentCommIds.has(id)) {
-							continue;
-						}
-						replaySentCommIds.add(id);
-						replayTurnSummary?.addCommMessage();
-					}
-				}
-			} else if (replayQuiet && isSubagentNoticeMessage(message)) {
-				// A subagent that ended, failed or went quiet: a row of the timeline, out of sight unless it failed.
-				this.addMessageToChat(message, {
-					...renderOptions,
-					...(isWakeMessage(message) && insideReplayRound() && replayTurnSummary
-						? { inlineIn: replayTurnSummary }
-						: {}),
-				});
-			} else if (replayQuiet && replayTurnState && message.role === "custom" && isBoxNoticeMessage(message)) {
-				// The box says it as its own row (a compaction that waited).
-				const record = boxRecordFromMessage(message);
-				const at = Number(message.timestamp) || 0;
-				if (record?.kind === "compaction") replayTurnState.timeline.addReplayCompaction(at, record.facts);
-			} else if (replayQuiet && replayTurnState && message.role === "compactionSummary") {
-				// Inside a turn the compaction is a row of its box.
-				replayTurnState.timeline.addReplayCompaction(Number(message.timestamp) || 0, {
-					before: message.tokensBefore,
-				});
-			} else {
-				// TUI v4: a received agent-message row is one comm in this turn.
-				if (isAgentSessionMessage(message) && message.display) {
-					replayTurnSummary?.addCommMessage();
-				}
-				// All other messages use standard rendering; a report inside the tool loop goes into its turn.
-				this.addMessageToChat(message, {
-					...renderOptions,
-					...(replayQuiet && isWakeMessage(message) && insideReplayRound() && replayTurnSummary
-						? { inlineIn: replayTurnSummary }
-						: {}),
-				});
-			}
-		}
-		// Within a box turn only the last reply's answer stays under the box, and a
-		// turn no user message opened draws no second title.
-		if (replayQuiet) {
-			foldEarlierAnswers(this.chatContainer.children);
-			resolveTurnHeaders(this.chatContainer.children);
-		}
-
-		for (const [toolCallId, component] of renderedPendingTools) {
+		for (const [toolCallId, component] of replay.pendingTools) {
 			component.setIncludeImageDimensions(true);
 			this.pendingTools.set(toolCallId, component);
 		}
@@ -9035,19 +8781,11 @@ export class InteractiveMode {
 		this.turnFlow.carryOver(carriedBoxes, { keepHistory: options.keepCompactedHistory === true });
 		this.turnFlow.restoreLane(laneBefore, questionStartedAt);
 		this.turnFlow.noteTaskLabels(this.subagentSnapshots?.values() ?? []);
-		if (replayTurnState && (renderedPendingTools.size > 0 || this.isAgentStreaming())) {
-			// Attaching mid-run: live tool and thinking events keep feeding this
-			// turn's group, so the replayed state stays the live one - and stays
-			// running until agent_end stamps it.
-			this.currentTurnState = replayTurnState;
-			this.currentTurnSummary = replayTurnSummary;
-			replayTurnState.live = true;
+		if (replay.turnOpen && replay.turnState && replay.turnSummary) {
+			this.currentTurnState = replay.turnState;
+			this.currentTurnSummary = replay.turnSummary;
+			replay.turnState.live = true;
 		} else {
-			// The last replayed turn has no following user prompt; freeze its clock.
-			replayTurnState?.markTurnEnded(
-				replayRoundEndedAt ?? (Number(messagesToRender.at(-1)?.timestamp) || Date.now()),
-			);
-			closeReplayTurn();
 			// Nothing is live: a turn object from before this render is gone from the chat.
 			this.currentTurnState = undefined;
 			this.currentTurnSummary = undefined;
@@ -9072,6 +8810,9 @@ export class InteractiveMode {
 		this.rlmNodeId = snapshot.parent?.childId;
 		this.seedSubagentSummary(snapshot.children);
 		this.applyConnectionStateSnapshot(state);
+		// An attach (or replace) into a parked session seeds the countdown from the
+		// snapshot instead of sitting blind until the next quota_park_status heartbeat.
+		this.applySnapshotQuotaPark(snapshot.quotaPark);
 		this.restoreTurnStartFromMessages(context.messages);
 		await this.renderSessionContext(context, {
 			updateFooter: true,

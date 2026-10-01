@@ -20,6 +20,7 @@ import type {
 	AgentConnectionSavedSessionInfo,
 	AgentConnectionSessionTreeFlatNode,
 	AgentConnectionSessionTreeNode,
+	AgentConnectionSnapshotQuotaPark,
 	AgentConnectionState,
 } from "../src/modes/agent-connection/types.js";
 import { createCompactAssistantDelta } from "../src/modes/daemon/compact-session-stream.js";
@@ -42,6 +43,7 @@ import {
 	type DaemonEventMeta,
 	type DaemonOutbound,
 	type DaemonResponse,
+	type DaemonSessionSnapshotQuotaPark,
 } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonRoutedClient } from "../src/modes/daemon/daemon-routed-client.js";
 import type { DaemonWorkerClient } from "../src/modes/daemon/daemon-worker-client.js";
@@ -3030,6 +3032,7 @@ describe("DaemonAgentConnection", () => {
 				"chunked_snapshot",
 				"streaming_deltas",
 				"streaming_delta_fragments",
+				"quota_park_status",
 			],
 			resumeCursor: {
 				activeSessionId: "active-1",
@@ -3542,6 +3545,56 @@ describe("DaemonAgentConnection", () => {
 		await connection.dispose();
 	});
 
+	it("declares quota_park_status on attach and mirrors the snapshot's quotaPark field (rev 43)", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const quotaPark: DaemonSessionSnapshotQuotaPark = {
+			parked: true,
+			resumeAt: new Date(Date.now() + 3_600_000).toISOString(),
+			remainingMs: 3_599_000,
+			parkCount: 2,
+			provider: "anthropic",
+		};
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12);
+			return { ...result, snapshot: { ...result.snapshot, quotaPark } };
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		// The daemon fills snapshot.quotaPark only for clients that declared the capability.
+		expect(fakeClient.requests[0]).toMatchObject({
+			type: "attach",
+			capabilities: expect.arrayContaining(["quota_park_status"]) as unknown as string[],
+		});
+		const snapshot = await connection.getInitialSnapshot();
+		expect(snapshot.quotaPark).toEqual(quotaPark);
+		await connection.dispose();
+	});
+
+	it("keeps quotaPark absent on the snapshot of an unparked session", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		const snapshot = await connection.getInitialSnapshot();
+		expect(snapshot.quotaPark).toBeUndefined();
+		expect("quotaPark" in snapshot).toBe(false);
+		await connection.dispose();
+	});
+
+	it("pins the connection snapshot's quotaPark mirror to the daemon wire shape", () => {
+		// Both directions assignable: the two declarations cannot drift silently.
+		const wire: DaemonSessionSnapshotQuotaPark = {
+			parked: true,
+			resumeAt: "2026-01-01T00:00:00.000Z",
+			remainingMs: 1,
+			parkCount: 1,
+			provider: "openai",
+		};
+		const mirror: AgentConnectionSnapshotQuotaPark = wire;
+		const roundTrip: DaemonSessionSnapshotQuotaPark = mirror;
+		expect(roundTrip).toEqual(wire);
+	});
+
 	it("maps resume_queue outcomes: drained, empty queue, and real errors", async () => {
 		const fakeClient = new FakeDaemonClient();
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
@@ -3883,6 +3936,7 @@ describe("DaemonAgentConnection", () => {
 				"chunked_snapshot",
 				"streaming_deltas",
 				"streaming_delta_fragments",
+				"quota_park_status",
 			],
 			resumeCursor: {
 				activeSessionId: "active-1",
@@ -3903,6 +3957,7 @@ describe("DaemonAgentConnection", () => {
 				"chunked_snapshot",
 				"streaming_deltas",
 				"streaming_delta_fragments",
+				"quota_park_status",
 			],
 			resumeCursor: {
 				activeSessionId: "active-1",
@@ -3970,6 +4025,7 @@ describe("DaemonAgentConnection", () => {
 				"chunked_snapshot",
 				"streaming_deltas",
 				"streaming_delta_fragments",
+				"quota_park_status",
 			],
 		});
 

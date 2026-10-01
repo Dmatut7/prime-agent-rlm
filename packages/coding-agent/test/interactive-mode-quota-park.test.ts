@@ -338,3 +338,130 @@ describe("quota_park_status queueing (R3-2)", () => {
 		await listener({ type: "quota_park_status", parked: false });
 	});
 });
+
+describe("snapshot quotaPark seeding (rev 43)", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+
+	beforeEach(() => {
+		vi.useFakeTimers({ now: T0 });
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	const seedProto = InteractiveMode.prototype as unknown as {
+		applySnapshotQuotaPark(
+			this: ModeFake,
+			quotaPark:
+				| { parked: true; resumeAt?: string; remainingMs?: number; parkCount?: number; provider?: string }
+				| undefined,
+		): void;
+		renderInitialMessages(this: ModeFake): Promise<void>;
+	};
+
+	function renderFake(snapshot: unknown): ModeFake {
+		return parkFake({
+			agentConnection: { getInitialSnapshot: vi.fn(async () => snapshot) },
+			getSessionContextFromConnectionSnapshot: vi.fn((snap: { messages: unknown }) => ({
+				messages: (snap as { messages: unknown[] }).messages,
+				thinkingLevel: "medium",
+				serviceTier: "default",
+				model: null,
+			})),
+			seedSubagentSummary: vi.fn(),
+			applyConnectionStateSnapshot: vi.fn(),
+			restoreTurnStartFromMessages: vi.fn(),
+			renderSessionContext: vi.fn(async () => {}),
+			restoreStreamingMessageFromSnapshot: vi.fn(async () => {}),
+			showDutyLog: vi.fn(async () => {}),
+			rlmNodeId: undefined,
+		});
+	}
+
+	it("an attach into a parked session seeds the countdown from the snapshot", async () => {
+		const resumeAt = isoIn(3_600_000);
+		const mode = renderFake({
+			state: {},
+			messages: [],
+			quotaPark: { parked: true, resumeAt, remainingMs: 3_599_000, parkCount: 2, provider: "anthropic" },
+		});
+
+		await seedProto.renderInitialMessages.call(mode);
+
+		const park = mode.quotaPark as { resumeAtMs?: number; parkCount?: number; provider?: string } | undefined;
+		expect(park?.resumeAtMs).toBe(Date.parse(resumeAt));
+		expect(park?.parkCount).toBe(2);
+		expect(park?.provider).toBe("anthropic");
+		// The attach announces the park like a heartbeat would, and the pinned row carries the countdown.
+		expect(chatText(mode)).toContain("额度已用完，会话挂起等额度恢复");
+		expect((mode.statusContainer as Container).children.length).toBe(1);
+
+		seedProto.applySnapshotQuotaPark.call(mode, undefined);
+		expect(mode.quotaPark).toBeUndefined();
+	});
+
+	it("an attach into an unparked session clears a stale local park", async () => {
+		const mode = renderFake({ state: {}, messages: [] });
+		proto.handleQuotaParkStatus.call(mode, { type: "quota_park_status", parked: true, resumeAt: isoIn(3_600_000) });
+		expect(mode.quotaPark).toBeDefined();
+
+		await seedProto.renderInitialMessages.call(mode);
+
+		expect(mode.quotaPark).toBeUndefined();
+		expect((mode.statusContainer as Container).children).toHaveLength(0);
+	});
+
+	function resyncFake() {
+		const listeners: Array<(event: AgentConnectionEvent) => Promise<void>> = [];
+		const mode = parkFake({
+			agentConnection: {
+				subscribe: vi.fn((callback: (event: AgentConnectionEvent) => Promise<void>) => {
+					listeners.push(callback);
+					return () => {};
+				}),
+			},
+			sessionEventQueue: Promise.resolve(),
+			sessionEventGeneration: 0,
+			connectionLost: true,
+			liveTurnFlowStore: undefined,
+			refreshCommandCatalogForCurrentSession: vi.fn(async () => {}),
+			renderResyncedSession: vi.fn(async () => {}),
+			handleEvent: vi.fn(),
+		});
+		proto.subscribeToAgent.call(mode);
+		const listener = listeners[0];
+		if (!listener) throw new Error("subscribeToAgent registered no listener");
+		return { mode, listener };
+	}
+
+	it("a resync snapshot without quotaPark clears the local park instead of waiting a heartbeat out", async () => {
+		const { mode, listener } = resyncFake();
+		proto.handleQuotaParkStatus.call(mode, { type: "quota_park_status", parked: true, resumeAt: isoIn(3_600_000) });
+		expect(mode.quotaPark).toBeDefined();
+
+		await listener({ type: "session_resynced", snapshot: { state: {} as never, messages: [] } });
+
+		expect(mode.quotaPark).toBeUndefined();
+		expect((mode.statusContainer as Container).children).toHaveLength(0);
+		expect(mode.renderResyncedSession).toHaveBeenCalledTimes(1);
+	});
+
+	it("a resync snapshot carrying quotaPark seeds the countdown at once", async () => {
+		const { mode, listener } = resyncFake();
+		const resumeAt = isoIn(3_600_000);
+
+		await listener({
+			type: "session_resynced",
+			snapshot: { state: {} as never, messages: [], quotaPark: { parked: true, resumeAt, provider: "openai" } },
+		});
+
+		const park = mode.quotaPark as { resumeAtMs?: number; provider?: string } | undefined;
+		expect(park?.resumeAtMs).toBe(Date.parse(resumeAt));
+		expect(park?.provider).toBe("openai");
+		expect(chatText(mode)).toContain("额度已用完，会话挂起等额度恢复");
+	});
+});
