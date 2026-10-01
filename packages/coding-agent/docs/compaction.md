@@ -219,9 +219,10 @@ After navigation with summary:
 
 Both compaction and branch summarization track files cumulatively. When generating a summary, Prime Agent extracts file operations from:
 - Tool calls in the messages being summarized
+- The kernel's structured reports on ipython tool results: edit-skill diffs (`details.diffs`, modified files) and change-tracker read activities (`details.activities` records with `kind: "read"`, read files)
 - Previous compaction or branch summary `details` (if any)
 
-This means file tracking accumulates across multiple compactions or nested branch summaries, preserving the full history of read and modified files.
+This means file tracking accumulates across multiple compactions or nested branch summaries, preserving the full history of read and modified files. Reads and writes that never pass a structured channel - shell-side `cat`/`grep`, cell-side `open(..., "w")` - stay untracked; both lists are best-effort for those.
 
 ### BranchSummaryEntry Structure
 
@@ -258,7 +259,7 @@ So the values that must be exact no longer go through the model. Compaction appe
 
 | Block | Source | Contents |
 |-------|--------|----------|
-| `<read-files>`, `<modified-files>` | tool calls + previous `details` | cumulative file lists |
+| `<read-files>`, `<modified-files>` | tool calls + kernel diff/read reports on ipython results + previous `details` | cumulative file lists |
 | `<fact-appendix>` | regex over the summarized slice | error signatures, commit SHAs, paths, threshold numbers, issue refs |
 | `<user-requests>` | user messages and `!commands` | the user's own words, verbatim |
 
@@ -366,7 +367,7 @@ line, its opening tag a whole line of strict shape (`<user-requests-evil>` and
 the last matching opener wins. So a tool `path` argument or a narrative that merely names a tag can
 write a look-alike ahead of the real block without becoming the block that is read.
 
-Everything from `<read-files>` down is machine-generated (see [Fidelity](#fidelity-what-survives-without-the-model)). The narrative above it is the model's; the blocks are rebuilt from the transcript on every compaction and are stripped out of the previous summary before it is sent back to the model. Branch summaries carry the file blocks only.
+Everything from `<read-files>` down is machine-generated (see [Fidelity](#fidelity-what-survives-without-the-model)). The narrative above it is the model's; the blocks are rebuilt from the transcript on every compaction and are stripped out of the previous summary before it is sent back to the model. Branch summaries carry all four blocks too, built from the branch slice with small fixed budgets (the window-proportionate compaction budgets would dwarf a branch narrative), but without a carry-forward ledger: a branch summary is a terminal artifact, not a generation in a chain.
 
 ### Message Serialization
 

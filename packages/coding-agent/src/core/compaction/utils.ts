@@ -48,12 +48,13 @@ function getToolCallPath(args: Record<string, unknown>): string | undefined {
  *
  * Assistant side: only statically recognizable writes are recorded - tools whose
  * name indicates a file modification and that expose a path-like argument
- * (including write-style extension tools). Kernel side: the edit skill reports
- * its edits as structured diff displays that ride on the ipython tool result's
- * details, and that channel is what extractFileOpsFromToolResult records. Cell
- * writes with no structured report (bash redirections, open(..., "w"), notebook
- * edits) still cannot be attributed statically; <modified-files> stays
- * best-effort for those.
+ * (including write-style extension tools). Kernel side: the ipython tool result's
+ * details carry two structured channels - the edit skill's diffs (path, oldStr,
+ * newStr) and the change tracker's read activities (kind "read", label = display
+ * path) - and extractFileOpsFromToolResult records both. Cell writes with no
+ * structured report (bash redirections, open(..., "w"), notebook edits) still
+ * cannot be attributed statically, and shell-side reads (bash cat/grep) never
+ * pass the read wrapper; both lists stay best-effort for those.
  */
 export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOperations): void {
 	if (message.role === "toolResult") {
@@ -85,15 +86,16 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOp
 }
 
 /**
- * Record kernel-performed edits reported on a tool result.
+ * Record kernel-performed edits and reads reported on a tool result.
  *
- * The default toolset routes file edits through the ipython kernel, and the
- * kernel's edit skill reports each edit as a structured diff display (path,
- * oldStr, newStr) captured into the ipython tool result's details. No
- * assistant-side tool call ever carries that path, so without this branch
- * <modified-files> never renders in the default configuration. Live file reads
- * stay uncaptured on purpose: parsing arbitrary Python for reads is brittle, and
- * the structured diff channel is the one kernel signal a summary can trust.
+ * The default toolset routes file work through the ipython kernel, and the kernel
+ * reports it structurally on the tool result's details: the edit skill's diffs
+ * (path, oldStr, newStr) and the change tracker's read activities (one record per
+ * file a cell opened, kind "read", label = the display path). No assistant-side
+ * tool call ever carries those paths, so without this branch neither block renders
+ * in the default configuration. Reads that never pass the kernel's read wrapper
+ * (bash cat/grep, os.scandir walks) stay uncaptured; the activity channel is the
+ * one read signal a summary can trust, same as the diff channel for edits.
  */
 function extractFileOpsFromToolResult(message: ToolResultMessage, fileOps: FileOperations): void {
 	if (message.toolName !== "ipython") return;
@@ -106,6 +108,13 @@ function extractFileOpsFromToolResult(message: ToolResultMessage, fileOps: FileO
 		if (typeof diff !== "object" || diff === null || Array.isArray(diff)) continue;
 		const path = (diff as Record<string, unknown>).path;
 		if (typeof path === "string" && path.length > 0) fileOps.edited.add(path);
+	}
+	const activities = Array.isArray(details.activities) ? details.activities : [];
+	for (const activity of activities) {
+		if (typeof activity !== "object" || activity === null || Array.isArray(activity)) continue;
+		const record = activity as Record<string, unknown>;
+		if (record.kind !== "read") continue;
+		if (typeof record.label === "string" && record.label.length > 0) fileOps.read.add(record.label);
 	}
 }
 

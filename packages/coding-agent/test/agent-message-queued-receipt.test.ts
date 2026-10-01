@@ -79,6 +79,14 @@ describe("P0-3a queued agent-message receipts", () => {
 		expect(receipt.queuedNotice).toBeUndefined();
 	});
 
+	it("stamps the delivery mode the send used, defaulting to steer", () => {
+		expect(createAgentSessionMessageReceipt(makePayload(), "delivered").deliveryMode).toBe("steer");
+		// A follow-up send must not claim a steer it did not perform (rev 41).
+		expect(
+			createAgentSessionMessageReceipt(makePayload(), "delivered", undefined, undefined, "follow_up").deliveryMode,
+		).toBe("follow_up");
+	});
+
 	it("states the consequence and the retry ceiling on the first queued send", () => {
 		const notice = formatAgentMessageQueuedNotice({
 			reason: "target_suspended",

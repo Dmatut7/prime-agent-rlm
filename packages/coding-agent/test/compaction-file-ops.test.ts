@@ -139,6 +139,61 @@ describe("extractFileOpsFromMessage write-tool coverage (scan2 C5)", () => {
 	});
 });
 
+describe("extractFileOpsFromMessage kernel read channel (记忆-3)", () => {
+	const readActivity = (label: string) => ({
+		id: `read-${label}`,
+		kind: "read",
+		label,
+		status: "ok",
+		startedAt: 1,
+		endedAt: 1,
+	});
+
+	it("records kernel-reported read activities into the read list", () => {
+		const ops = createFileOps();
+		extractFileOpsFromMessage(
+			toolResultWithDetails({
+				activities: [readActivity("src/a.ts"), readActivity("src/b.ts")],
+			}),
+			ops,
+		);
+		expect([...ops.read].sort()).toEqual(["src/a.ts", "src/b.ts"]);
+		expect(ops.edited.size).toBe(0);
+	});
+
+	it("keeps reads and edits from one cell apart, and a read of an edited file stays modified-only", () => {
+		const ops = createFileOps();
+		extractFileOpsFromMessage(
+			toolResultWithDetails({
+				diffs: [{ path: "src/edited.ts", oldStr: "a", newStr: "b" }],
+				activities: [readActivity("src/edited.ts"), readActivity("src/read-only.ts")],
+			}),
+			ops,
+		);
+		const { readFiles, modifiedFiles } = computeFileLists(ops);
+		expect(readFiles).toEqual(["src/read-only.ts"]);
+		expect(modifiedFiles).toEqual(["src/edited.ts"]);
+		const rendered = formatFileOperations(readFiles, modifiedFiles);
+		expect(rendered).toContain("<read-files>\nsrc/read-only.ts\n</read-files>");
+	});
+
+	it("ignores non-read activities, non-ipython tools and malformed records", () => {
+		const ops = createFileOps();
+		const otherKinds = [
+			{ id: "a1", kind: "command", label: "npm test", status: "ok", startedAt: 1 },
+			{ id: "a2", kind: "search", label: "needle", status: "ok", startedAt: 1 },
+			{ id: "a3", kind: "read", label: "", status: "ok", startedAt: 1 },
+			{ id: "a4", kind: "read", status: "ok", startedAt: 1 },
+			null,
+			"read",
+		];
+		extractFileOpsFromMessage(toolResultWithDetails({ activities: otherKinds }), ops);
+		extractFileOpsFromMessage(toolResultWithDetails({ activities: [readActivity("src/x.ts")] }, "bash"), ops);
+		extractFileOpsFromMessage(toolResultWithDetails({ activities: "not-an-array" }), ops);
+		expect(ops.read.size).toBe(0);
+	});
+});
+
 describe("summarization prompt anchor", () => {
 	it("keeps open tasks, errors and user constraints in scope when anchoring to the newest kept state", () => {
 		const text = buildSummarizationPromptText({

@@ -26,7 +26,11 @@ export const DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS = 1000;
 export const SUBAGENT_TERMINAL_ERROR_NOTICE_PREFIX = "[subagent-terminal-error]";
 export const SUBAGENT_TERMINAL_ERROR_SUMMARY_MAX_CHARS = 500;
 
-/** Legacy daemon wire input accepted and ignored for compatibility. */
+/**
+ * Daemon wire input for how a send reaches the target. Accepted-and-ignored legacy
+ * input until daemon protocol rev 41, which honors it behind the
+ * send_message_delivery_mode capability; "auto" resolves server-side.
+ */
 export type AgentSessionMessageDeliveryMode = "auto" | "steer" | "follow_up";
 export type AgentSessionMessageDeliveryStatus = "delivered" | "queued";
 /** Why a send was queued instead of delivered; reported back to the sender. */
@@ -208,7 +212,12 @@ export interface AgentSessionMessageReceipt {
 	 * as success to a model that then waits forever.
 	 */
 	queuedNotice?: string;
-	deliveryMode?: "steer";
+	/**
+	 * Which delivery mode the send used. Absent on receipts from before the daemon
+	 * honored send_message.deliveryMode (protocol rev 41) and on legacy callers that
+	 * never stated one.
+	 */
+	deliveryMode?: "steer" | "follow_up";
 }
 
 export interface AgentSessionMessageSendInput {
@@ -864,6 +873,7 @@ export function createAgentSessionMessageReceipt(
 	status: AgentSessionMessageDeliveryStatus,
 	at = new Date().toISOString(),
 	queued?: AgentSessionMessageQueuedFacts,
+	deliveryMode: "steer" | "follow_up" = "steer",
 ): AgentSessionMessageReceipt {
 	return {
 		id: payload.id,
@@ -877,7 +887,7 @@ export function createAgentSessionMessageReceipt(
 		...(status === "queued" && queued?.position !== undefined ? { queuedPosition: queued.position } : {}),
 		...(status === "queued" && queued?.repeatCount !== undefined ? { queuedRepeatCount: queued.repeatCount } : {}),
 		...(status === "queued" && queued?.notice ? { queuedNotice: queued.notice } : {}),
-		deliveryMode: "steer",
+		deliveryMode,
 	};
 }
 

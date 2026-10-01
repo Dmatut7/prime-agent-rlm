@@ -10,6 +10,7 @@ import {
 	getTranscriptLineSkips,
 	loadEntriesFromFile,
 	type SessionEntry,
+	SessionManager,
 	type SessionMessageEntry,
 } from "../../src/core/session-manager.js";
 
@@ -178,5 +179,35 @@ describe("buildSessionContext loss warnings", () => {
 		];
 		buildSessionContext(legacy, "after-v");
 		expect(sessionManagerWarns()).toHaveLength(0);
+	});
+});
+
+describe("getBranch loss warnings (批E遗留②)", () => {
+	const getBranchWarns = () => sessionManagerWarns().filter((entry) => entry.msg?.includes("getBranch"));
+
+	it("warns once when the parent chain is broken, and keeps the truncated branch", () => {
+		const file = transcriptFile([
+			HEADER_LINE,
+			userLine("gb-root", null),
+			userLine("gb-mid", "gb-gone"),
+			userLine("gb-leaf", "gb-mid"),
+		]);
+		const mgr = SessionManager.open(file);
+		// A non-leaf walk skips the leaf-branch cache, so the second call walks again
+		// and the warn-once bound is what keeps it quiet.
+		const branch = mgr.getBranch("gb-mid");
+		expect(branch.map((entry) => entry.id)).toEqual(["gb-mid"]);
+		expect(getBranchWarns()).toHaveLength(1);
+		expect(getBranchWarns()[0]?.entryId).toBe("gb-mid");
+		expect(getBranchWarns()[0]?.missingParentId).toBe("gb-gone");
+		mgr.getBranch("gb-mid");
+		expect(getBranchWarns()).toHaveLength(1);
+	});
+
+	it("positive control: an intact chain does not warn", () => {
+		const file = transcriptFile([HEADER_LINE, userLine("gb2-root", null), userLine("gb2-leaf", "gb2-root")]);
+		const mgr = SessionManager.open(file);
+		expect(mgr.getBranch().map((entry) => entry.id)).toEqual(["gb2-root", "gb2-leaf"]);
+		expect(getBranchWarns()).toHaveLength(0);
 	});
 });

@@ -28,6 +28,7 @@ import {
 } from "../provider-retry.js";
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.js";
 import { estimateTokens, summarizationInflation } from "./compaction.js";
+import { buildFactLedger, renderFactAppendix } from "./fact-appendix.js";
 import {
 	buildSummarizationPromptText,
 	clampConversationText,
@@ -35,6 +36,7 @@ import {
 	SUMMARIZATION_INFLATION_FLOOR,
 	summarizationFrameText,
 } from "./summarization-budget.js";
+import { buildUserRequestLedger, renderUserRequests } from "./user-requests.js";
 import {
 	computeFileLists,
 	createFileOps,
@@ -203,6 +205,13 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 	// This ensures we capture cumulative file tracking from nested branch summaries
 	// Only extract from pi-generated summaries (fromHook !== true), not extension-generated ones
 	for (const entry of entries) {
+		if (entry.type === "message" && entry.message.role === "toolResult") {
+			// Tool results are not summarizer messages (getMessageFromEntry leaves them
+			// paired with their call), but their structured details carry the kernel's
+			// file operations - the diff channel and the read-activity channel - which
+			// no assistant message in this slice ever names.
+			extractFileOpsFromMessage(entry.message, fileOps);
+		}
 		if (entry.type === "branch_summary" && !entry.fromHook && entry.details) {
 			const details = entry.details as BranchSummaryDetails;
 			if (Array.isArray(details.readFiles)) {
@@ -313,6 +322,16 @@ export function branchSummaryMaxTokens(model: Model<any>): number {
 	}
 	return Math.min(adjusted.maxTokens, BRANCH_SUMMARY_MAX_TOKENS_WITH_THINKING_CAP);
 }
+
+/**
+ * Budgets for the machine blocks on a branch summary. The window-proportionate
+ * compaction budgets (sized against keepRecentTokens and the summarized slice)
+ * would dwarf a narrative capped at BRANCH_SUMMARY_MAX_TOKENS, so the branch path
+ * spends a small fixed share per block instead; both sit above the ledgers' own
+ * minimums (header plus a handful of records).
+ */
+const BRANCH_FACT_APPENDIX_TOKEN_BUDGET = 1000;
+const BRANCH_USER_REQUESTS_TOKEN_BUDGET = 1000;
 
 /**
  * Generate a summary of abandoned branch entries.
@@ -430,6 +449,18 @@ export async function generateBranchSummary(
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);
+	// The same deterministic blocks a compaction appends: a branch summary's
+	// narrative goes through the summarizer, so SHAs, thresholds and the user's own
+	// words would otherwise ride the same low-fidelity channel. No carry-forward
+	// ledger here - a branch summary is a terminal artifact, not a generation in a
+	// chain - so both ledgers start fresh at generation 1.
+	const facts = buildFactLedger({ messages, generation: 1, tokenBudget: BRANCH_FACT_APPENDIX_TOKEN_BUDGET });
+	const userRequests = buildUserRequestLedger({
+		messages,
+		generation: 1,
+		tokenBudget: BRANCH_USER_REQUESTS_TOKEN_BUDGET,
+	});
+	summary += renderFactAppendix(facts) + renderUserRequests(userRequests);
 
 	return {
 		summary: summary || "No summary generated",

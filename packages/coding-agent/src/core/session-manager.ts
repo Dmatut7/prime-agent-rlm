@@ -4107,7 +4107,26 @@ export class SessionManager {
 		let current = startId ? this.byId.get(startId) : undefined;
 		while (current) {
 			path.push(current);
-			current = current.parentId ? this.byId.get(current.parentId) : undefined;
+			if (!current.parentId) break;
+			const parent = this.byId.get(current.parentId);
+			if (!parent) {
+				// Same silent loss as buildSessionContext's walk: a missing parent (a
+				// skipped bad line, a torn write) truncates the branch here and drops
+				// everything older. Name the broken link instead of serving a
+				// shortened branch as if it were whole.
+				warnOnceOnContextLoss(
+					`branch:${current.id}:${current.parentId}`,
+					"session entry chain broken: getBranch is dropping the history before this entry",
+					{
+						entryId: current.id,
+						missingParentId: current.parentId,
+						startId,
+						retainedEntries: path.length,
+					},
+				);
+				break;
+			}
+			current = parent;
 		}
 		path.reverse();
 		if (isLeafPath) {
