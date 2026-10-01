@@ -433,8 +433,9 @@ import {
 import {
 	announcedNextStep,
 	autoContinuesInRun,
+	createOutputTruncatedContinueMessage,
+	createProviderFailureRecoveryMessage,
 	dutyEventFor,
-	MAX_AUTO_CONTINUES_PER_PROMPT,
 	ranToolsSinceLastPrompt,
 	SELF_RECOVERY_CUSTOM_ENTRY,
 	type SelfRecoveryRecord,
@@ -2589,6 +2590,19 @@ export class AgentSession {
 	 * and the second exhaustion in the same episode is the hard stop.
 	 */
 	private _emptyTurnRecoveryUsed = 0;
+	/**
+	 * The same per-episode budget for the provider-failure recovery: when the retry
+	 * ladder is spent, the failure shape goes back to the model as one queued turn
+	 * instead of the run ending silently. Reset by any non-error assistant message.
+	 */
+	private _providerFailureRecoveryUsed = 0;
+	/**
+	 * Set by the retry handler when the ladder is spent and the run would end:
+	 * agent_end then queues the one-shot provider-failure recovery turn (and skips
+	 * the terminal flow while it is pending), or lets the failure go terminal when
+	 * the episode's recovery was already spent.
+	 */
+	private _providerFailureRecoveryPending = false;
 	/** Bumped by every retry resolution; stale scheduled-continue callbacks check it before touching retry state. */
 	private _retryGeneration = 0;
 	private _retryPromise: Promise<void> | undefined = undefined;
@@ -6119,29 +6133,44 @@ export class AgentSession {
 	/**
 	 * Self-recovery for unattended runs, after goal and autonomous continuations had
 	 * nothing to say. A main session whose turn stopped right after tool work with a
-	 * reply that only announces the next step gets one automatic continue (at most
-	 * {@link MAX_AUTO_CONTINUES_PER_PROMPT} per prompt); a subagent that finished its
-	 * task without replying is asked once to send its result. Anything that reads as a
-	 * final answer, a question, or waiting on children is left alone.
+	 * reply that only announces the next step gets one automatic continue, and so does
+	 * a turn the output budget cut off mid-answer (stopReason "length" - including a
+	 * provider pause the model layer reports as a length stop); both count into the
+	 * same per-prompt budget (`selfRecovery.maxAutoContinues`). A subagent that
+	 * finished its task without replying is asked once to send its result. Anything
+	 * that reads as a final answer or waiting on children is left alone; a question
+	 * or offer ending only exempts a turn that did no tool work.
 	 */
 	private _selfRecoveryContinuation(context: GetContinuationMessagesContext): AgentMessage | undefined {
 		const settings = this.settingsManager.getSelfRecoverySettings();
 		const message = context.message;
-		if (message.stopReason !== "stop") return undefined;
+		if (message.stopReason !== "stop" && message.stopReason !== "length") return undefined;
 		if (this._goalState.status === "active") return undefined;
 		if (this._hasUnsettledRlmQuiescenceWork()) return undefined;
 		const used = autoContinuesInRun(context.newMessages);
 		if (this._rlmDepth > 0) {
+			if (message.stopReason !== "stop") return undefined;
 			if (!settings.childReplyNudge || this._repliedToParentSinceTask !== false || used > 0) return undefined;
 			if (!ranToolsSinceLastPrompt(context.newMessages)) return undefined;
 			this._recordSelfRecovery({ kind: "child_reply_nudge", at: Date.now() });
 			return createAutoContinueMessage({ reason: "child_reply_missing", ordinal: 1 });
 		}
-		if (!settings.autoContinue || used >= MAX_AUTO_CONTINUES_PER_PROMPT) return undefined;
-		if (!ranToolsSinceLastPrompt(context.newMessages)) return undefined;
-		const excerpt = announcedNextStep(message);
-		if (!excerpt) return undefined;
+		if (!settings.autoContinue || used >= settings.maxAutoContinues) return undefined;
+		const ranTools = ranToolsSinceLastPrompt(context.newMessages);
+		if (!ranTools) return undefined;
 		const ordinal = used + 1;
+		// Cut off mid-answer: resume where the turn stopped instead of judging the text.
+		if (message.stopReason === "length") {
+			const excerpt = "output truncated (stopReason: length)";
+			this._recordSelfRecovery({ kind: "auto_continue", excerpt, ordinal, at: Date.now() });
+			return createOutputTruncatedContinueMessage({
+				reason: "output_truncated",
+				ordinal,
+				maxOrdinal: settings.maxAutoContinues,
+			});
+		}
+		const excerpt = announcedNextStep(message, { ranTools });
+		if (!excerpt) return undefined;
 		this._recordSelfRecovery({ kind: "auto_continue", excerpt, ordinal, at: Date.now() });
 		return createAutoContinueMessage({ reason: "announced_next_step", excerpt, ordinal });
 	}
@@ -7346,6 +7375,9 @@ export class AgentSession {
 					// It also ends the empty-response failure episode: the recovery
 					// continuation budget is per-episode, so a fresh ladder starts fresh.
 					this._emptyTurnRecoveryUsed = 0;
+					// Same for the provider-failure recovery: a real answer ends the
+					// failure episode, so a later exhaustion re-arms its one-shot turn.
+					this._providerFailureRecoveryUsed = 0;
 				}
 				if (assistantMsg.stopReason !== "error") {
 					this._fallbackLongWaitRound = 0;
@@ -7442,6 +7474,17 @@ export class AgentSession {
 				this._resolveRetry();
 				if (this._queueEmptyTurnRecoveryTurn(msg)) return;
 				this._emitEmptyResponseExhausted(msg);
+			}
+
+			// The provider retry ladder ends here: one recovery turn per failure
+			// episode hands the failure shape back to the model, so - exactly like the
+			// empty-response recovery above - the episode is not terminal while that
+			// turn is pending: the compaction check, the parent terminal notice and
+			// goal finalization wait for the recovery turn's own agent_end. The retry
+			// chain itself was already closed by the exhausted branch that set the flag.
+			if (this._providerFailureRecoveryPending) {
+				this._providerFailureRecoveryPending = false;
+				if (this._queueProviderFailureRecoveryTurn(msg)) return;
 			}
 
 			const compactionWillRetry = await this._checkCompaction(msg);
@@ -19694,6 +19737,64 @@ export class AgentSession {
 		return true;
 	}
 
+	/**
+	 * Queue the one-shot recovery continuation for an exhausted provider retry
+	 * ladder: the failure shape goes back to the model as a custom message that
+	 * wakes an idle session, so the task gets a turn to recover - or to say exactly
+	 * what it needs - instead of a silent stop. Returns false, leaving the episode
+	 * terminal, when the episode's recovery was already spent or admission is
+	 * paused; the caller's terminal flow still runs then.
+	 */
+	private _queueProviderFailureRecoveryTurn(message: AssistantMessage): boolean {
+		if (this._disposed || this._disposing) return false;
+		// One continuation per failure episode. A recovery turn that itself exhausts
+		// the ladder is the hard stop: a provider that never answers must not turn
+		// recovery into a self-loop.
+		if (this._providerFailureRecoveryUsed >= 1) return false;
+		const recoveryMessage = createProviderFailureRecoveryMessage({
+			attempts: this._terminalFailureAttemptCount,
+			waitClass: providerWaitClass(
+				providerStreamFailureKind(message),
+				providerStreamFailureStatus(message),
+				message.errorMessage,
+			),
+			...(message.errorMessage === undefined ? {} : { errorMessage: message.errorMessage }),
+			...(message.provider === undefined ? {} : { provider: message.provider }),
+			...(message.model === undefined ? {} : { model: message.model }),
+		});
+		try {
+			const action = this._createPreparedTurnAction("followUp", recoveryMessage.content as string, undefined, {
+				message: recoveryMessage,
+				suppressAutonomousContinuation: true,
+				// An idle session must be woken to run the recovery turn (the async-bash
+				// completion notices admit with the same shape).
+				resumeIfIdle: true,
+				source: "internal",
+				executionPolicy: this._turnExecutionPolicy("injected"),
+				queueVisible: false,
+			});
+			const result = this._admitSessionInput(action, { wake: false });
+			if (!result.accepted) {
+				sessionLog.warn("provider-failure recovery continuation was not admitted", {
+					sessionId: this.sessionId,
+				});
+				return false;
+			}
+		} catch (error) {
+			// A paused admission window (compaction, update restart) must not silently
+			// burn the budget: leave the episode terminal instead of parking a
+			// half-admitted turn that may never run.
+			sessionLog.warn("provider-failure recovery continuation could not be admitted; the run stays terminal", {
+				sessionId: this.sessionId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
+		}
+		this._providerFailureRecoveryUsed = 1;
+		this._scheduleSessionInputPump();
+		return true;
+	}
+
 	/** The exhaustion diagnostic's facts, with safe defaults when a fixture omits it. */
 	private _readEmptyTurnExhaustionDetails(message: AssistantMessage): {
 		attempts: number;
@@ -19967,6 +20068,10 @@ export class AgentSession {
 			if (waitClass === "transient" && waitPolicy.enabled) {
 				return this._handleProviderWait(message, options, waitPolicy, "unavailable");
 			}
+			// The ladder is spent. The run is not terminal yet: agent_end hands the
+			// failure shape back to the model as one queued recovery turn (once per
+			// episode), and only a spent recovery budget ends the run for good.
+			this._providerFailureRecoveryPending = true;
 			this._markProviderAuthStaleForRetryFailure(message, options);
 			const restoredModel = this._restorePrimaryModelAfterBackup();
 			this._emit({
@@ -19990,6 +20095,12 @@ export class AgentSession {
 			maxRetryDelayMs,
 		});
 		if (delay.kind === "exceeds-cap") {
+			// A transient failure whose server-requested wait outgrew the quick-retry cap
+			// is not terminal: the bounded wait channel owns long waits (and its own
+			// abort bounds), so the run survives a "come back in five minutes".
+			if (waitClass === "transient" && waitPolicy.enabled) {
+				return this._handleProviderWait(message, options, waitPolicy, "unavailable");
+			}
 			this._markProviderAuthStaleForRetryFailure(message, options);
 			const restoredModel = this._restorePrimaryModelAfterBackup();
 			this._emit({

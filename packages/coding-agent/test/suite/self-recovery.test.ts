@@ -12,9 +12,11 @@ import { createHarness, type Harness } from "./harness.js";
 
 /**
  * Self-recovery for unattended runs: a silent step is stopped (a busy one never
- * is), a turn that stops right after announcing its next step is continued at most
- * twice, a subagent that finishes without replying is asked once to reply, and every
- * action lands in the transcript for the duty log.
+ * is), a turn that stops right after announcing its next step - or whose output the
+ * token budget cut off - is continued within the per-prompt budget
+ * (`selfRecovery.maxAutoContinues`, default 4), a subagent that finishes without
+ * replying is asked once to reply, and every action lands in the transcript for the
+ * duty log.
  */
 
 function sample(overrides: Partial<KernelLivenessSample> = {}): KernelLivenessSample {
@@ -422,8 +424,8 @@ describe("self-recovery: announced-but-undone steps", () => {
 		expect(dutyEvents(harness)).toContainEqual(expect.objectContaining({ kind: "auto_continue" }));
 	});
 
-	it("stops after two automatic continues for one request", async () => {
-		const harness = await harnessWith();
+	it("stops at the configured automatic-continue budget for one request", async () => {
+		const harness = await harnessWith({ selfRecovery: { maxAutoContinues: 2 } });
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("read_file", { path: "a.ts" }), { stopReason: "toolUse" }),
 			fauxAssistantMessage("Let me check the next file."),
@@ -434,6 +436,75 @@ describe("self-recovery: announced-but-undone steps", () => {
 
 		expect(autoContinues(harness)).toHaveLength(2);
 		expect(harness.faux.state.callCount).toBe(4);
+	});
+
+	it("allows four automatic continues per request by default", async () => {
+		const harness = await harnessWith();
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("read_file", { path: "a.ts" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("Let me check the next file."),
+			fauxAssistantMessage("Let me check the next file."),
+			fauxAssistantMessage("Let me check the next file."),
+			fauxAssistantMessage("Let me check the next file."),
+			fauxAssistantMessage("Let me check the next file."),
+		]);
+		await harness.session.promptAndWait("check the files");
+
+		expect(autoContinues(harness)).toHaveLength(4);
+		expect(harness.faux.state.callCount).toBe(6);
+	});
+
+	it("continues from where it stopped when the output budget cuts the turn off", async () => {
+		const harness = await harnessWith();
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("read_file", { path: "a.ts" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("分析到一半", { stopReason: "length" }),
+			fauxAssistantMessage("两个文件都改好了，全部完成。"),
+		]);
+		await harness.session.promptAndWait("fix both files");
+
+		expect(harness.faux.state.callCount).toBe(3);
+		const nudges = autoContinues(harness);
+		expect(nudges).toHaveLength(1);
+		expect(String((nudges[0] as { content: unknown }).content)).toContain("Continue from where you stopped");
+		const records = readSelfRecoveryRecords(harness.sessionManager.getBranch());
+		expect(records).toMatchObject([{ kind: "auto_continue", ordinal: 1 }]);
+	});
+
+	it("counts a truncation continue into the same per-prompt budget", async () => {
+		const harness = await harnessWith({ selfRecovery: { maxAutoContinues: 2 } });
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("read_file", { path: "a.ts" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("分析到一半", { stopReason: "length" }),
+			fauxAssistantMessage("还是写不完", { stopReason: "length" }),
+			fauxAssistantMessage("终于写完了。"),
+		]);
+		await harness.session.promptAndWait("fix both files");
+
+		expect(autoContinues(harness)).toHaveLength(2);
+		expect(harness.faux.state.callCount).toBe(4);
+	});
+
+	it("never continues a truncated pure chat answer with no tool work", async () => {
+		const harness = await harnessWith();
+		harness.setResponses([fauxAssistantMessage("半截回答", { stopReason: "length" })]);
+		await harness.session.promptAndWait("hi");
+
+		expect(autoContinues(harness)).toHaveLength(0);
+		expect(harness.faux.state.callCount).toBe(1);
+	});
+
+	it("continues a turn that announced work but ended in a question once tools ran", async () => {
+		const harness = await harnessWith();
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("read_file", { path: "a.ts" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("第一个文件看完了，接下来我改第二个文件，可以吗？"),
+			fauxAssistantMessage("两个文件都改好了，全部完成。"),
+		]);
+		await harness.session.promptAndWait("fix both files");
+
+		expect(autoContinues(harness)).toHaveLength(1);
+		expect(harness.faux.state.callCount).toBe(3);
 	});
 
 	it.each([

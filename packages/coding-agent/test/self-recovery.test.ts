@@ -1,6 +1,13 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
-import { announcedNextStep, dutyEventFor } from "../src/core/self-recovery.js";
+import { AUTO_CONTINUE_CUSTOM_TYPE } from "../src/core/messages.js";
+import {
+	announcedNextStep,
+	createOutputTruncatedContinueMessage,
+	createProviderFailureRecoveryMessage,
+	dutyEventFor,
+	PROVIDER_FAILURE_RECOVERY_CUSTOM_TYPE,
+} from "../src/core/self-recovery.js";
 
 function reply(text: string, stopReason: AssistantMessage["stopReason"] = "stop"): AssistantMessage {
 	return {
@@ -92,6 +99,30 @@ describe("announcedNextStep", () => {
 	it("excerpts the announcing line", () => {
 		expect(announcedNextStep(reply("分析如下。\n\n接下来我去改第二个文件"))).toBe("接下来我去改第二个文件");
 	});
+
+	describe("with tool work on the books", () => {
+		// A turn that ran tools and then parks on a question or an offer leaves the
+		// unattended run half done, so those two exemptions stop applying; waits and
+		// owner-approval gates stay exempt - nudging past them would run gated work.
+		it.each([
+			"第一个文件看完了，接下来我改第二个文件，可以吗？",
+			"改好了，测试全部通过。接下来我可以帮你把文档也补上。",
+			"Fixed one file. Next I will update the other, ok?",
+		])("no longer exempts the question or offer in %j", (text) => {
+			expect(announcedNextStep(reply(text), { ranTools: true })).toBeDefined();
+			// Without the tool-work fact the same reply stays a finished answer.
+			expect(announcedNextStep(reply(text))).toBeUndefined();
+		});
+
+		it.each([
+			["an approval gate", "测试都过了。我会在你批准后推送到 main。"],
+			["waiting on children", "子代理已派出，等待子代理回复。"],
+			["an owner decision ask", "改之前要不要我先备份？"],
+			["a final answer", "两个文件都改好了，结论是配置写错了。"],
+		])("still leaves %s alone", (_name, text) => {
+			expect(announcedNextStep(reply(text), { ranTools: true })).toBeUndefined();
+		});
+	});
 });
 
 describe("dutyEventFor", () => {
@@ -115,5 +146,53 @@ describe("dutyEventFor", () => {
 			kind: "auto_continue",
 			reason: "child_reply_missing",
 		});
+	});
+});
+
+describe("createOutputTruncatedContinueMessage", () => {
+	it("asks the model to resume, counts into the shared auto-continue budget", () => {
+		const message = createOutputTruncatedContinueMessage(
+			{ reason: "output_truncated", ordinal: 2, maxOrdinal: 4 },
+			7,
+		);
+		expect(message.customType).toBe(AUTO_CONTINUE_CUSTOM_TYPE);
+		expect(message.display).toBe(true);
+		expect(message.timestamp).toBe(7);
+		const content = String(message.content);
+		expect(content).toContain('stopReason: "length"');
+		expect(content).toContain("Continue from where you stopped");
+		expect(content).toContain("2 of at most 4");
+	});
+});
+
+describe("createProviderFailureRecoveryMessage", () => {
+	it("carries the failure shape and the one-shot notice", () => {
+		const message = createProviderFailureRecoveryMessage(
+			{
+				attempts: 3,
+				waitClass: "permanent",
+				errorMessage: "overloaded_error",
+				provider: "faux",
+				model: "faux-1",
+			},
+			9,
+		);
+		expect(message.customType).toBe(PROVIDER_FAILURE_RECOVERY_CUSTOM_TYPE);
+		expect(message.display).toBe(true);
+		const content = String(message.content);
+		expect(content).toContain("attempts: 3");
+		expect(content).toContain("class: permanent");
+		expect(content).toContain("faux/faux-1");
+		expect(content).toContain("overloaded_error");
+		expect(content).toContain("one-shot");
+	});
+
+	it("truncates a very long error message", () => {
+		const message = createProviderFailureRecoveryMessage({
+			attempts: 1,
+			waitClass: "transient",
+			errorMessage: "x".repeat(1000),
+		});
+		expect(String(message.content).length).toBeLessThan(2000);
 	});
 });

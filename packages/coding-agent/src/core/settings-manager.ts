@@ -64,6 +64,8 @@ export const TOOL_TIMEOUT_MIN_AFTER_MS = 60_000;
 export const TOOL_TIMEOUT_MAX_AFTER_MS = 600_000;
 /** Default silence after which a call with no output and no progress is stuck (five minutes). */
 export const DEFAULT_SILENT_STUCK_SECONDS = 300;
+/** Automatic continues one prompt may receive (`selfRecovery.maxAutoContinues`; 0 disables them). */
+export const DEFAULT_MAX_AUTO_CONTINUES_PER_PROMPT = 4;
 /** Floor for `silentStuckSeconds`; in practice the per-call deadline (at least a minute) is asked first. */
 export const SILENT_STUCK_MIN_SECONDS = 1;
 export const SILENT_STUCK_MAX_SECONDS = 3600;
@@ -679,7 +681,8 @@ export interface ToolTimeoutSettings {
 export interface SelfRecoverySettings {
 	/**
 	 * Default true. When a main-session turn ends right after tool work with a reply that
-	 * only announces the next step, send one automatic "continue" (at most two per prompt).
+	 * only announces the next step - or with output cut off by the token budget - send one
+	 * automatic "continue" (at most `maxAutoContinues` per prompt).
 	 */
 	autoContinue?: boolean;
 	/**
@@ -689,6 +692,12 @@ export interface SelfRecoverySettings {
 	 * parent an extra turn.
 	 */
 	childReplyNudge?: boolean;
+	/**
+	 * Default 4. Automatic continues one prompt may receive, shared by the
+	 * announced-next-step and the truncated-output continuations; 0 disables them
+	 * without touching the other self-recovery actions.
+	 */
+	maxAutoContinues?: number;
 }
 
 export interface WarningSettings {
@@ -1133,7 +1142,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	providerBackupModel: null,
 	providerFallbackModels: null,
 	autonomous: null,
-	selfRecovery: ["autoContinue", "childReplyNudge"],
+	selfRecovery: ["autoContinue", "childReplyNudge", "maxAutoContinues"],
 	shellPath: null,
 	quietStartup: null,
 	shellCommandPrefix: null,
@@ -2985,11 +2994,15 @@ export class SettingsManager {
 		return Number.isFinite(raw) && raw >= 1 ? raw : 1000;
 	}
 
-	getSelfRecoverySettings(): { autoContinue: boolean; childReplyNudge: boolean } {
+	getSelfRecoverySettings(): { autoContinue: boolean; childReplyNudge: boolean; maxAutoContinues: number } {
 		const settings = this.settings.selfRecovery;
+		const maxAutoContinues = Number(settings?.maxAutoContinues ?? DEFAULT_MAX_AUTO_CONTINUES_PER_PROMPT);
 		return {
 			autoContinue: readBooleanSetting(settings?.autoContinue, true).value,
 			childReplyNudge: readBooleanSetting(settings?.childReplyNudge, false).value,
+			maxAutoContinues: Number.isFinite(maxAutoContinues)
+				? Math.max(0, Math.floor(maxAutoContinues))
+				: DEFAULT_MAX_AUTO_CONTINUES_PER_PROMPT,
 		};
 	}
 

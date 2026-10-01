@@ -265,7 +265,7 @@ Rollback:
 | `retry.baseDelayMs` | number | `2000` | Base delay for agent-level exponential backoff (2s, 4s, 8s) |
 | `retry.provider.timeoutMs` | number | SDK default | Provider/SDK request timeout in milliseconds (covers the request up to response headers) |
 | `retry.provider.maxRetries` | number | `retry.maxRetries` | Provider-failure retries: the retry count the agent's retry loop (and the provider-retry module the one-shot consumers use) applies. Set to `0` to stop retrying provider failures; a path with no module layer (refinement, side questions) lets the provider client retry that many times instead |
-| `retry.provider.maxRetryDelayMs` | number | `60000` | Max server-requested delay before failing (60s) |
+| `retry.provider.maxRetryDelayMs` | number | `60000` | Max server-requested delay honored by the quick-retry loop (60s); a longer transient wait moves to the bounded wait-for-recovery loop instead of failing |
 | `retry.provider.streamStallTimeoutMs` | number | `300000` | Abort a provider stream after this many milliseconds without any response events (5 min). A stall on a silent connection settles as a retryable error, so auto-retry picks it up; a stall while the provider has asked us to wait settles as a rate-limit failure and is not auto-retried. Set to `0` to disable |
 | `retry.emptyTurn.maxAttempts` | number | `3` | Total provider attempts for one turn while replies come back empty (no text, no tool calls). `1` disables in-place empty-turn retries |
 | `retry.emptyTurn.baseDelayMs` | number | `500` | First wait between empty-turn attempts; doubles per attempt |
@@ -274,7 +274,7 @@ Rollback:
 
 Retries happen exactly once per path, at that path's outermost layer. A module-wrapped path (the agent's own turns, compaction) counts them here and the provider client makes a single attempt; a path with no module layer (a `/refine` request, a `/btw` side question) has no such layer, so the provider client retries it `retry.provider.maxRetries` times instead. `retry.provider.maxRetryDelayMs` is handed to the provider client either way, because that is where a server-requested wait is refused before the SDK sleeps through it - refusing a wait spends no extra request.
 
-When a provider requests a retry delay longer than `retry.provider.maxRetryDelayMs` (e.g., "quota will reset after 5h" delivered as `Retry-After: 18000`), the request fails immediately with an informative error instead of waiting silently. Set to `0` to disable the cap. The cap is enforced in every provider that retries client-side: OpenAI Completions/Responses, Azure OpenAI, Anthropic Messages (via the SDK's `x-should-retry: false` escape hatch, so the provider's own error and rate-limit classification survive) and Codex SSE. Mistral, Google and Vertex AI do not retry 429 at all, so they ignore it.
+When a provider requests a retry delay longer than `retry.provider.maxRetryDelayMs` (e.g., "quota will reset after 5h" delivered as `Retry-After: 18000`), a transient failure (5xx, overload, network) moves into the bounded wait-for-recovery loop below instead of dying at the cap, while a failure waiting cannot help (auth, refusal, invalid request) still fails immediately with an informative error instead of waiting silently. Set to `0` to disable the cap. The cap is enforced in every provider that retries client-side: OpenAI Completions/Responses, Azure OpenAI, Anthropic Messages (via the SDK's `x-should-retry: false` escape hatch, so the provider's own error and rate-limit classification survive) and Codex SSE. Mistral, Google and Vertex AI do not retry 429 at all, so they ignore it.
 
 `retry.enabled: false` also collapses `retry.emptyTurn.maxAttempts` to a single attempt: switching automatic resends off means the empty-reply path does not keep resending either.
 
@@ -358,6 +358,30 @@ available, authenticated model, the bounded wait runs instead.
       "baseDelayMs": 500,
       "maxDelayMs": 4000
     }
+  }
+}
+```
+
+When the provider retry ladder is spent and no wait or fallback applies, the run does
+not end silently: the session queues one recovery turn per failure episode that hands
+the failure shape (attempts, class, last error) back to the model, so it can pick the
+work back up or say exactly what it needs. A recovery turn that also exhausts the
+ladder is terminal.
+
+### Self-Recovery
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `selfRecovery.autoContinue` | boolean | `true` | Continue a turn that stopped right after tool work while only announcing its next step, or whose output was cut off by the token budget (`stopReason: "length"`) |
+| `selfRecovery.childReplyNudge` | boolean | `false` | Ask a subagent that finished without replying once to send its result |
+| `selfRecovery.maxAutoContinues` | number | `4` | Automatic continues one prompt may receive, shared by announced-next-step and truncated-output continuations; `0` disables them |
+
+```json
+{
+  "selfRecovery": {
+    "autoContinue": true,
+    "childReplyNudge": false,
+    "maxAutoContinues": 4
   }
 }
 ```

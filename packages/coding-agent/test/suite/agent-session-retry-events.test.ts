@@ -22,6 +22,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentCronJobStore } from "../../src/core/cron-jobs.js";
 import { EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE } from "../../src/core/messages.js";
+import { PROVIDER_FAILURE_RECOVERY_CUSTOM_TYPE } from "../../src/core/self-recovery.js";
 import type { Settings } from "../../src/core/settings-manager.js";
 import { createHarness, getAssistantTexts, getUserTexts, type Harness } from "./harness.js";
 
@@ -121,7 +122,7 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.faux.state.callCount).toBe(3);
 	});
 
-	it("exhausts max retries and emits a failure event", async () => {
+	it("exhausts max retries, emits a failure event, and hands the failure shape back to the model once", async () => {
 		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } } });
 		harnesses.push(harness);
 		const retryEvents: string[] = [];
@@ -134,12 +135,142 @@ describe("AgentSession retry and event characterization", () => {
 			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
 			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
 			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("picked the work back up"),
+		]);
+
+		await harness.session.prompt("test");
+		await harness.session.waitForIdle();
+
+		expect(retryEvents).toEqual(["start:1", "start:2", "end:false"]);
+		// The fourth call is the one-shot recovery turn the exhausted ladder queued:
+		// the failure shape goes back to the model instead of the run ending silently.
+		expect(harness.faux.state.callCount).toBe(4);
+		expect(harness.session.isRetrying).toBe(false);
+		const recoveries = providerFailureRecoveries(harness);
+		expect(recoveries).toHaveLength(1);
+		const content = String((recoveries[0] as { content: unknown }).content);
+		expect(content).toContain("provider-failure recovery");
+		expect(content).toContain("attempts: 2");
+		expect(content).toContain("overloaded_error");
+		expect(getAssistantTexts(harness).at(-1)).toBe("picked the work back up");
+	});
+
+	it("queues no second recovery turn when the recovery turn also exhausts the ladder", async () => {
+		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 } } });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			// The recovery turn gets its own ladder and exhausts it too.
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("never called"),
+		]);
+
+		await harness.session.prompt("test");
+		await harness.session.waitForIdle();
+
+		expect(harness.faux.state.callCount).toBe(4);
+		expect(providerFailureRecoveries(harness)).toHaveLength(1);
+		expect(harness.session.isRetrying).toBe(false);
+	});
+
+	it("a real answer re-arms the one-shot recovery for a later failure episode", async () => {
+		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 } } });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("recovered once"),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("recovered twice"),
+		]);
+
+		await harness.session.prompt("test");
+		await harness.session.waitForIdle();
+		await harness.session.prompt("test again");
+		await harness.session.waitForIdle();
+
+		expect(harness.faux.state.callCount).toBe(6);
+		expect(providerFailureRecoveries(harness)).toHaveLength(2);
+	});
+
+	it("moves a transient failure whose requested wait exceeds the cap into the bounded wait loop", async () => {
+		const harness = await createHarness({
+			settings: {
+				retry: {
+					enabled: true,
+					maxRetries: 3,
+					baseDelayMs: 1,
+					provider: {
+						maxRetryDelayMs: 50,
+						waitForUsage: { baseDelayMs: 1, maxDelayMs: 4, maxAttempts: 5, maxWaitMs: 10_000 },
+					},
+				},
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			{
+				...fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 slow down" }),
+				diagnostics: [
+					{
+						type: "provider_stream_failure",
+						timestamp: Date.now(),
+						details: { kind: "overloaded", status: 503, retryAfterMs: 100 },
+					},
+				],
+			},
+			fauxAssistantMessage("recovered"),
 		]);
 
 		await harness.session.prompt("test");
 
-		expect(retryEvents).toEqual(["start:1", "start:2", "end:false"]);
-		expect(harness.faux.state.callCount).toBe(3);
+		// The 100ms server-requested wait is above the 50ms quick-retry cap, so the
+		// bounded wait loop owns it instead of the run ending at the cap.
+		const starts = harness.eventsOfType("auto_retry_start");
+		expect(starts.map((event) => [event.reason, event.delayMs])).toEqual([["unavailable", 100]]);
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([true]);
+		expect(harness.session.isRetrying).toBe(false);
+	});
+
+	it("still ends at the cap when the wait-for-recovery loop is disabled", async () => {
+		const harness = await createHarness({
+			settings: {
+				retry: {
+					enabled: true,
+					maxRetries: 3,
+					baseDelayMs: 1,
+					provider: { maxRetryDelayMs: 50, waitForUsage: { enabled: false } },
+				},
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			{
+				...fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 slow down" }),
+				diagnostics: [
+					{
+						type: "provider_stream_failure",
+						timestamp: Date.now(),
+						details: { kind: "overloaded", status: 503, retryAfterMs: 100 },
+					},
+				],
+			},
+			fauxAssistantMessage("unused"),
+		]);
+
+		await harness.session.prompt("test");
+
+		expect(harness.faux.state.callCount).toBe(1);
+		const retryEnd = harness.eventsOfType("auto_retry_end");
+		expect(retryEnd).toHaveLength(1);
+		expect(retryEnd[0]?.success).toBe(false);
+		expect(retryEnd[0]?.finalError).toContain("maxRetryDelayMs");
+		// The exceeds-cap terminal is not the ladder-exhaustion path: no recovery turn.
+		expect(providerFailureRecoveries(harness)).toHaveLength(0);
 		expect(harness.session.isRetrying).toBe(false);
 	});
 
@@ -310,6 +441,15 @@ describe("AgentSession retry and event characterization", () => {
 			(message) =>
 				message.role === "custom" &&
 				(message as { customType?: string }).customType === EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE,
+		) as Array<Extract<AssistantMessage, { role: "custom" }>>;
+	}
+
+	/** The one-shot recovery turns queued after an exhausted provider retry ladder. */
+	function providerFailureRecoveries(harness: Harness): Array<Extract<AssistantMessage, { role: "custom" }>> {
+		return harness.session.messages.filter(
+			(message) =>
+				message.role === "custom" &&
+				(message as { customType?: string }).customType === PROVIDER_FAILURE_RECOVERY_CUSTOM_TYPE,
 		) as Array<Extract<AssistantMessage, { role: "custom" }>>;
 	}
 

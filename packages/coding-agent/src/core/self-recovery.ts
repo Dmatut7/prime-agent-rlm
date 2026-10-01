@@ -1,7 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { DutyEvent } from "./duty-log.js";
-import { AUTO_CONTINUE_CUSTOM_TYPE } from "./messages.js";
+import { AUTO_CONTINUE_CUSTOM_TYPE, type CustomMessage } from "./messages.js";
 import type { SessionEntry } from "./session-manager.js";
 
 /**
@@ -30,9 +30,6 @@ export function dutyEventFor(record: SelfRecoveryRecord): DutyEvent {
 			return { kind: "auto_continue", reason: "child_reply_missing" };
 	}
 }
-
-/** Automatic continues one prompt may receive; the second one is the last. */
-export const MAX_AUTO_CONTINUES_PER_PROMPT = 2;
 
 /** Excerpt length carried in the nudge and shown in the UI. */
 const PLAN_EXCERPT_MAX_CHARS = 80;
@@ -88,17 +85,26 @@ const OWNER_CHECKLIST_INTRO =
 	/你需要|需要你|请你|请(?:手动|自行)|你(?:来|自己)|手动|\bfor you\b|\byou(?:'ll)? need\b|\bmanual/iu;
 
 // Replies that are complete as they are: waiting on children, idle acknowledgements,
-// questions to the user. Never nudged (the 1961-turn "待命" loop lesson).
+// waiting on the owner's approval. Never nudged (the 1961-turn "待命" loop lesson).
 const FINAL_REPLY_PATTERNS: readonly RegExp[] = [
 	// "看看是否需要进一步修改" is the model talking to itself, not a question to the owner.
 	/待命|等待(?:子代理|回复|结果|你的)|等你|请确认|需要你|你来决定|(?<!看看?|检查|确认|判断|评估)是否需要|(?<!看看?|检查|确认|判断|评估)要不要/u,
-	/\b(?:waiting for|standing by|let me know|should i|do you want)\b/i,
-	// Offers, not commitments: "接下来我可以……" / "如需要我再……" after a finished answer.
-	/(?:我|也|还)(?:可以|能)(?:帮|再|继续|进一步|顺便)|如(?:果)?(?:你)?(?:需要|愿意|想)|如需|若需要|有需要|需要的话/u,
-	/\b(?:if you(?:'d)? (?:like|want|need)|i can also|i could|happy to|feel free)\b/i,
+	/\b(?:waiting for|standing by)\b/i,
 	// Waiting on the owner's approval: the step is gated on purpose, never nudged past it.
 	/你批准后|你确认后|等你(?:批准|确认|同意|点头)|经你同意|你同意后|你说可以/u,
 	/\b(?:once you approve|after your (?:go-ahead|approval|confirmation|ok)|with your permission|until you (?:say|confirm|approve)|i'?ll wait for your)\b/i,
+];
+
+// Questions and offers read as a finished answer only when the turn was pure chat.
+// A turn that already ran tools is mid-task: the same ending parks the work on a
+// question nobody is there to answer, so these exemptions stop applying once the
+// run has tool work on the books (the nudge message itself tells the model a
+// finished task should just say so).
+const QUESTION_OR_OFFER_PATTERNS: readonly RegExp[] = [
+	/\b(?:let me know|should i|do you want)\b/i,
+	// Offers, not commitments: "接下来我可以……" / "如需要我再……" after a finished answer.
+	/(?:我|也|还)(?:可以|能)(?:帮|再|继续|进一步|顺便)|如(?:果)?(?:你)?(?:需要|愿意|想)|如需|若需要|有需要|需要的话/u,
+	/\b(?:if you(?:'d)? (?:like|want|need)|i can also|i could|happy to|feel free)\b/i,
 	/[?？]\s*$/u,
 ];
 
@@ -120,15 +126,24 @@ function excerptOf(text: string): string {
 	return lastLine.length > PLAN_EXCERPT_MAX_CHARS ? `${lastLine.slice(0, PLAN_EXCERPT_MAX_CHARS - 1)}…` : lastLine;
 }
 
+export interface AnnouncementScanOptions {
+	/**
+	 * The turn this reply belongs to already ran tools. A pure chat answer that ends
+	 * in a question or an offer is a finished answer; the same ending after real tool
+	 * work parks a task nobody is watching, so those two exemptions stop applying.
+	 */
+	ranTools?: boolean;
+}
+
 /**
  * The announced-but-not-done next step of a turn that just stopped, or undefined
  * when the reply is a real answer. Pure: callers own the caps and gates.
  */
-export function announcedNextStep(message: AssistantMessage): string | undefined {
+export function announcedNextStep(message: AssistantMessage, options?: AnnouncementScanOptions): string | undefined {
 	if (message.stopReason !== "stop") return undefined;
 	if (message.content.some((block) => block.type === "toolCall")) return undefined;
 	const text = assistantText(message);
-	return textAnnouncesNextStep(text) ? excerptOf(text) : undefined;
+	return textAnnouncesNextStep(text, options) ? excerptOf(text) : undefined;
 }
 
 /**
@@ -136,10 +151,11 @@ export function announcedNextStep(message: AssistantMessage): string | undefined
  * phrase in its tail or an unchecked checklist item, and not a final answer, a
  * question or a wait. Shared by auto-continue and the duty log's "可能没做完".
  */
-export function textAnnouncesNextStep(text: string): boolean {
+export function textAnnouncesNextStep(text: string, options?: AnnouncementScanOptions): boolean {
 	if (!text) return false;
 	const tail = text.slice(-240);
 	if (FINAL_REPLY_PATTERNS.some((pattern) => pattern.test(tail))) return false;
+	if (!options?.ranTools && QUESTION_OR_OFFER_PATTERNS.some((pattern) => pattern.test(tail))) return false;
 	if (hasOpenOwnChecklist(text)) return true;
 	const announcement = closingAnnouncement(closingSentence(text));
 	return announcement !== undefined && announcesWork(announcement);
@@ -227,4 +243,81 @@ export function readSelfRecoveryRecords(entries: readonly SessionEntry[]): SelfR
 		}
 	}
 	return records;
+}
+
+/** Details of the automatic continue that resumes a turn cut off by the output budget. */
+export interface OutputTruncatedContinueDetails {
+	reason: "output_truncated";
+	ordinal: number;
+	maxOrdinal: number;
+}
+
+/**
+ * The session's own continue after a turn cut off by the output budget (stopReason
+ * "length" - which is also how a provider pause the model layer reports as a length
+ * stop arrives): the answer stopped mid-sentence, so the instruction is to resume,
+ * not to re-plan. It carries the AUTO_CONTINUE custom type, so it counts into the
+ * same per-prompt budget as the announced-next-step continues; `display: true`
+ * keeps it visible and auditable.
+ */
+export function createOutputTruncatedContinueMessage(
+	details: OutputTruncatedContinueDetails,
+	timestamp = Date.now(),
+): CustomMessage<OutputTruncatedContinueDetails> {
+	return {
+		role: "custom",
+		customType: AUTO_CONTINUE_CUSTOM_TYPE,
+		content: [
+			`[auto-continue] Your last reply was cut off by the output limit (stopReason: "length"): the turn ended mid-answer and the work is not done.`,
+			"Continue from where you stopped: pick up the interrupted sentence or step and carry on. Do not restart, re-explain, or repeat what is already in the transcript; when the next move is a tool call, make it. Once the work is finished and verified, end with the result stated plainly.",
+			`This is an automatic continue (${details.ordinal} of at most ${details.maxOrdinal} for this request).`,
+		].join("\n"),
+		display: true,
+		details,
+		timestamp,
+	};
+}
+
+/** Session custom-message type for the one-shot recovery turn after an exhausted provider retry ladder. */
+export const PROVIDER_FAILURE_RECOVERY_CUSTOM_TYPE = "provider_failure_recovery";
+
+/** The failure shape handed back to the model when the provider retry ladder ran out. */
+export interface ProviderFailureRecoveryDetails {
+	attempts: number;
+	waitClass: string;
+	errorMessage?: string;
+	provider?: string;
+	model?: string;
+}
+
+/**
+ * The one-shot recovery continuation after the provider retry ladder is spent
+ * (the empty-response ladder's recovery has the same shape): the failure goes
+ * back to the model itself, so the task gets one turn to recover or to say
+ * exactly what it needs instead of ending in a silent stop. `display: true`
+ * keeps the transcript auditable.
+ */
+export function createProviderFailureRecoveryMessage(
+	details: ProviderFailureRecoveryDetails,
+	timestamp = Date.now(),
+): CustomMessage<ProviderFailureRecoveryDetails> {
+	const facts = [`attempts: ${details.attempts}`, `class: ${details.waitClass}`];
+	if (details.provider && details.model) facts.push(`model: ${details.provider}/${details.model}`);
+	if (details.errorMessage) {
+		const error = details.errorMessage;
+		facts.push(`last error: ${error.length > 300 ? `${error.slice(0, 299)}…` : error}`);
+	}
+	return {
+		role: "custom",
+		customType: PROVIDER_FAILURE_RECOVERY_CUSTOM_TYPE,
+		content: [
+			`[provider-failure recovery] The last model request kept failing at the provider until the automatic retry ladder was spent (${facts.join("; ")}), so the session stopped resending rather than burn budget against an endpoint that keeps saying no.`,
+			"The context is intact and the task is still open. This is not a user instruction: it is the failure shape, handed to you because the alternative was the run ending here without a word.",
+			"Pick the work back up yourself; nobody else will. The action you meant to take last may or may not have happened, and repeating a half-done edit or commit can do damage, so look at the current state before redoing anything. Save in-progress work to files now, so another failure does not lose it. If the failure is one only the owner can fix (credentials, quota, network), say in your reply exactly what is needed: a silent end reads to the owner as a finished task. A subagent sends its parent one short status line, because the parent cannot see this notice.",
+			"This is an automatic one-shot continuation; the system will not send another for this failure episode.",
+		].join("\n"),
+		display: true,
+		details,
+		timestamp,
+	};
 }
