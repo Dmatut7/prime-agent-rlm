@@ -24,6 +24,13 @@ const NON_VISION_TOOL_IMAGE_PLACEHOLDER = `(tool image not shown to this model, 
 
 const logger = getLogger("transform-messages");
 
+// Cross-model replay flattens thinking into assistant text, so under a provider
+// fallback chain every older turn's full reasoning would be re-sent on every
+// request. Only the most recent replayed turn keeps the flattened text; earlier
+// turns get this marker, which is enough to tell the new model that reasoning
+// happened there without paying for it again.
+const CROSS_MODEL_THINKING_PLACEHOLDER = "[prior reasoning omitted]";
+
 function replaceImagesWithPlaceholder(content: (TextContent | ImageContent)[], placeholder: string): TextContent[] {
 	const result: TextContent[] = [];
 	let previousWasPlaceholder = false;
@@ -142,7 +149,17 @@ export function transformMessages<TApi extends Api>(
 	const toolCallIdMap = new Map<string, string>();
 	const imageAwareMessages = downgradeUnsupportedImages(messages, model);
 
-	const transformed = imageAwareMessages.map((msg) => {
+	// Errored turns are skipped in the pairing pass below and never reach the
+	// provider, so the most recent turn they could shadow is the one before them.
+	let lastReplayableAssistantIndex = -1;
+	for (let i = 0; i < imageAwareMessages.length; i++) {
+		const candidate = imageAwareMessages[i];
+		if (candidate.role === "assistant" && (candidate as AssistantMessage).stopReason !== "error") {
+			lastReplayableAssistantIndex = i;
+		}
+	}
+
+	const transformed = imageAwareMessages.map((msg, index) => {
 		if (msg.role === "user") {
 			return msg;
 		}
@@ -161,6 +178,8 @@ export function transformMessages<TApi extends Api>(
 				assistantMsg.provider === model.provider &&
 				assistantMsg.api === model.api &&
 				assistantMsg.model === model.id;
+			const isMostRecentTurn = index === lastReplayableAssistantIndex;
+			let crossModelThinkingOmitted = false;
 
 			const transformedContent = assistantMsg.content.flatMap((block) => {
 				if (block.type === "thinking") {
@@ -175,9 +194,18 @@ export function transformMessages<TApi extends Api>(
 					// Skip empty thinking blocks, convert others to plain text
 					if (!block.thinking || block.thinking.trim() === "") return [];
 					if (isSameModel) return block;
+					if (isMostRecentTurn) {
+						return {
+							type: "text" as const,
+							text: block.thinking,
+						};
+					}
+					// One placeholder per older turn, not one per block.
+					if (crossModelThinkingOmitted) return [];
+					crossModelThinkingOmitted = true;
 					return {
 						type: "text" as const,
-						text: block.thinking,
+						text: CROSS_MODEL_THINKING_PLACEHOLDER,
 					};
 				}
 

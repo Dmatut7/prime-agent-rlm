@@ -1,0 +1,1 @@
+- Fixed cross-model replay flattening every past turn's thinking into assistant text, which re-sent all prior reasoning on every request along a provider fallback chain; now only the most recent turn keeps the flattened thinking and earlier turns get a short "[prior reasoning omitted]" placeholder.
