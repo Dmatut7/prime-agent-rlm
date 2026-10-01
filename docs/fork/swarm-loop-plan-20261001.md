@@ -221,3 +221,18 @@ orchestrator-workers + 确定性 gate；子代理任务书必须含目标/输出
 3. args.ts env 文档补 PI_DISABLE_CLAUDE_CODE_DETECTION。
 4. R3-5 重放双实现收敛（buildConversationComponents 生产零调用，需设计：生产重放改用 builder 或抽共享函数）——留波次 7 设计+实施。
 5. 再审1-#7（worker-recovery marker 双重排队窄窗口，P3 备查）。
+
+- 2026-10-01 波次 7：4 批完成。结果摘要：
+  - W7-A：worker-recovery marker 消费判定放宽到续跑白名单（auto_continue/empty_response_recovery/provider_failure_recovery），双重排队窗口关闭；repl.md 同步存活线程 veto；effects.py 线程登记（修掉 watcher 线程让快照回放整进程失效的真 bug）；args.ts 补 env 文档头。
+  - W7-B：client 侧接 quotaPark 快照（attach 播种倒计时，resync 快照权威）；**R3-5 重放双实现收敛**——生产 renderSessionContext 的消息循环抽成 replayConversation 单一 engine，builder 变包装器，净删 ~440 行漂移循环；coding-agent 全套件 10627 通过 0 失败。
+  - W7-C：Codex service-tier 改按响应值计价（删 resolveCodexServiceTier，响应 default 即标准价）；google usage 负值地板核验已在 HEAD（销账）。
+  - W7-D：slim_attach_transcript capability（schema rev 44）——attach 只传最近 100 条 + messagesOmitted，get_messages 分页回填，supervisor 缓存保全量 + 防撒谎守卫。client 侧接线留波次 8。
+- CI：run 36861026576（波次5）、36866050779（波次6）连续 success。
+
+### 波次 7 跨批依赖（波次 8 处理）
+
+1. slim_attach_transcript 的 client 侧接线：daemon-agent-connection.ts 声明 capability、AgentConnectionSnapshot 镜像 messagesOmitted、interactive 侧渲染「更早 N 条」标记 + 滚动回填走 get_messages before/limit。
+2. usage.md 的 Environment Variables 表补 PI_DISABLE_CLAUDE_CODE_DETECTION 行。
+3. in-process-agent-connection 的 quotaPark（minor）。
+4. resolveServiceTier 钩子已无调用方（openai-responses-shared.ts:70-73），可选清理。
+5. 深层双排队残余（W7-A 遗留③，需 daemon-mode→agent-session 新 API，P3）。
