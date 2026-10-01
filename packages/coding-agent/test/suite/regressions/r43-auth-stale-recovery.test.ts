@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { type AssistantMessage, fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createAgentSessionFromServices, createAgentSessionServices } from "../../../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../../../src/core/auth-storage.js";
 import { ModelRegistry } from "../../../src/core/model-registry.js";
@@ -40,6 +40,17 @@ function registryModel(id: string) {
 
 describe("r43 MC-2 stale auth recovery", () => {
 	const harnesses: Harness[] = [];
+
+	beforeAll(() => {
+		// These tests build AuthStorage/ModelRegistry directly, bypassing the harness and its
+		// ambient-detection pin: without this, a machine with the Claude Code CLI installed
+		// leaks the claude-code catalog into getAvailable() and the length assertions drift.
+		vi.stubEnv("PI_DISABLE_CLAUDE_CODE_DETECTION", "1");
+	});
+
+	afterAll(() => {
+		vi.unstubAllEnvs();
+	});
 
 	afterEach(() => {
 		while (harnesses.length > 0) {

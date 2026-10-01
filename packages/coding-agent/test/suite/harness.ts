@@ -147,6 +147,12 @@ function createTempDir(): string {
 }
 
 export async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
+	// Machine-state isolation: on a box with the Claude Code CLI installed, env credential
+	// detection would leak the real claude-code catalog models into getAvailable() and make
+	// cycleModel()/findRlmModels() assertions depend on the machine. The faux provider is the
+	// only ambient credential a harness session may see. Set for the worker's lifetime rather
+	// than per-harness restore: no suite test may observe real ambient detection.
+	process.env.PI_DISABLE_CLAUDE_CODE_DETECTION = "1";
 	const tempDir = createTempDir();
 	const fauxProvider: FauxProviderRegistration = registerFauxProvider({
 		api: options.api,

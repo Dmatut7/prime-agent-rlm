@@ -191,6 +191,11 @@ export function findEnvKeys(provider: string): string[] | undefined {
 	return found.length > 0 ? found : undefined;
 }
 
+function isEnvFlagEnabled(value: string | undefined): boolean {
+	if (!value) return false;
+	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
+}
+
 /**
  * Get API key for provider from known environment variables, e.g. OPENAI_API_KEY.
  *
@@ -221,6 +226,10 @@ export function getEnvApiKey(provider: string): string | undefined {
 
 	// Claude Code signs in with its own `claude` login; an installed CLI is the credential.
 	if (provider === "claude-code") {
+		// An installed `claude` binary is ambient machine state, not an explicit credential:
+		// the opt-out keeps model availability deterministic for tests/headless automation and
+		// for users who keep the CLI but never want it used as a credential here.
+		if (isEnvFlagEnabled(process.env.PI_DISABLE_CLAUDE_CODE_DETECTION)) return undefined;
 		return findClaudeCodeExecutable() ? "<authenticated>" : undefined;
 	}
 
