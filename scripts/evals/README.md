@@ -14,6 +14,16 @@ fixed 15/8/5 slices of SWE-bench Verified, SWE-bench Pro, and ScaleSWE. It runs
 only when a maintainer applies the exact `pre-release` label. See
 [`short_swe/README.md`](short_swe/README.md) for its trust boundary and commands.
 
+## exam-v1
+
+A fixed seven-question capability exam (multi-step tooling, long-context
+recall, interruption recovery, repo comprehension) for per-wave model
+baselines. Prompts are the contract (`*/prompt.txt`); graders recompute
+expected answers from the live repo where the question is repo-derived.
+Model-free self-tests: `cd exam-v1 && python3 -m unittest discover -s tests -v`.
+See [`exam-v1/README.md`](exam-v1/README.md) for how to run (one agent home,
+serial runs).
+
 ## swarm-fanout
 
 Measures multi-agent orchestration under one prompt: decompose a job

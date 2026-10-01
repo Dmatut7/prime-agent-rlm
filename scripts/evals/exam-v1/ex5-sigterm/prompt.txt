@@ -1,0 +1,9 @@
+Read-only question about the repository at <REPO>; do not modify it. A
+headless `--mode json` CLI process receives a signal mid-turn. Write
+<WORK>/answers.json with keys: sigterm_exit, sigint_exit, sighup_exit
+(integers) and file (repo-relative path of the source file that installs the
+mapping).
+
+Answer by reading the source only. Do not execute, build, or signal the CLI
+under test, and do not measure exit codes by running real processes.
+Then reply with only DONE.

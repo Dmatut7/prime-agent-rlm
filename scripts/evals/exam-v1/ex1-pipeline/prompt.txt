@@ -1,0 +1,12 @@
+This repository holds a stdlib-only Python project: analyze.py summarizes the
+quarterly sales CSVs in data/ into report.md. The script is buggy.
+
+1. Make `python3 analyze.py` run cleanly (exit 0).
+2. Ensure the report numbers are correct: empty units cells count as 0, and
+   prices carry a "$" prefix that is not part of the number.
+3. report.md must contain exactly these four lines:
+   q1_units: <int>
+   q2_units: <int>
+   total_revenue_cents: <int>
+   top_category: <name>
+Do not touch the CSVs. Do not add dependencies.

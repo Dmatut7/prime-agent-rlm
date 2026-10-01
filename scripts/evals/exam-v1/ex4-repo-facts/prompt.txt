@@ -1,0 +1,10 @@
+Read-only questions about the repository at <REPO>. Do not modify anything
+in that repository. Write answers.json at <WORK>/answers.json with keys:
+  daemon_protocol_version, daemon_schema_revision,
+  kernel_protocol_version, kernel_min_protocol, kernel_default_protocol,
+  kernel_heartbeat_interval_ms, kernel_heartbeat_env_var,
+  ledger_digest
+where ledger_digest is the RLM ledger file stem for sessions dir <SESSIONS>:
+the first 16 hex chars of sha256 of the canonicalized (realpath) directory
+path, per packages/coding-agent/src/modes/daemon/rlm-ledger.ts. <SESSIONS>
+exists on disk. Then reply with only DONE.

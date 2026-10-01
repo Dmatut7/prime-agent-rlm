@@ -1,0 +1,10 @@
+The docs/ directory holds 25 markdown files. Exactly 5 lines in the whole
+corpus match this exact pattern: NEEDLE-<WORD>-<DIGIT> = <5-digit number>
+(example shape: NEEDLE-ALPHA-3 = 48213). Look-alikes exist (DRAFT- prefix,
+missing spaces around "=", missing the digit segment) - they do not count.
+
+Write answers.json at the repository root (one level above docs/):
+{"needles": {"<ID>": <int>, ...}, "total": <sum of the 5 values>}
+where <ID> is the needle id WITHOUT the NEEDLE- prefix: for example, the line
+NEEDLE-ALPHA-3 = 48213 contributes the entry "ALPHA-3": 48213.
+Then reply with only DONE.
