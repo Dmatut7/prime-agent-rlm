@@ -80,6 +80,7 @@ packages/coding-agent/test/repl-kernel-startup.test.ts|none|any|one test skips o
 packages/coding-agent/test/session-lease.test.ts|none|any|one test skips on win32 (the zombie-reaping test forks a real zombie child, POSIX-only)
 packages/coding-agent/test/session-manager/flat-storage.test.ts|none|any|three tests run everywhere but win32
 packages/coding-agent/test/suite/regressions/6008-headless-python-cancellation.test.ts|none|any|one describe skips on win32
+packages/coding-agent/test/suite/regressions/w14a-ex3-recovery-chain.test.ts|none|any|the whole describe skips on win32 (SIGTERM/recovery-chain semantics are POSIX)
 REGISTRY
 }
 

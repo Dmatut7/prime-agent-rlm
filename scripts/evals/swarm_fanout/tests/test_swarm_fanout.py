@@ -627,6 +627,23 @@ class ScorerTests(unittest.TestCase):
         self.assertEqual(result["total_spawns"], 17)
         self.assertFalse(result["dedup"])
 
+    def test_deleted_after_reply_still_proves_delegation(self):
+        # The task prompt sanctions rlm.delete_subagent cleanup: a child that
+        # delivered its reply and was then deleted still proves delegation.
+        # Liveness at teardown is not part of the contract.
+        outcome = passing_outcome(self.fixture)
+        deletes = [
+            delete_line(record["childId"], record["child"], "user")
+            for record in ledger_spawn_records(outcome["ledger_text"])
+        ]
+        outcome["ledger_text"] = "\n".join(outcome["ledger_text"].splitlines() + deletes) + "\n"
+        result = scorer.score_fixture(self.fixture, outcome)
+        self.assertTrue(result["receipts"])
+        self.assertEqual(result["live_depth1_edges"], 0)
+        self.assertTrue(result["delegation_evidence"])
+        self.assertEqual(result["verified_shard_workers"], 8)
+        self.assertTrue(result["resolved"])
+
     def test_silent_drop_blocks_receipts(self):
         outcome = passing_outcome(self.fixture)
         records = ledger_spawn_records(outcome["ledger_text"])
@@ -748,6 +765,7 @@ from pathlib import Path
 ANSWERS = __ANSWERS__
 MODE = "__MODE__"
 PARENT_ID = "019aaaaa-aaaa-4aaa-8aaa-00000000000a"
+WORKER_ID = "019bbbbb-bbbb-4bbb-8bbb-00000000000b"
 
 
 def assistant_event(tokens):
@@ -771,6 +789,10 @@ if MODE == "artifact-only":
     sys.exit(0)
 
 artifacts_root = sessions_dir.parent / "session-artifacts"
+# The split-id mode reproduces the REPL-kernel line's client/worker session-id
+# split: the ledger parent names the print-mode client session file, but the
+# daemon hangs child artifacts under the worker's session id instead.
+artifacts_parent = artifacts_root / (WORKER_ID if MODE == "split-id" else PARENT_ID)
 ledger_lines = [
     json.dumps({"v": 1, "op": "meta", "at": "2026-09-12T00:00:00.000Z", "sessionsDir": str(sessions_dir)})
 ]
@@ -786,7 +808,7 @@ for shard_file, answer in ANSWERS.items():
     stem = shard_file.rsplit(".", 1)[0]
     child_id = "sub-" + hashlib.sha256(stem.encode()).hexdigest()[:8]
     child_session = hashlib.sha256(("s" + shard_file).encode()).hexdigest()[:16]
-    child_dir = artifacts_root / PARENT_ID / child_id
+    child_dir = artifacts_parent / child_id
     child_dir.mkdir(parents=True, exist_ok=True)
     child_file = child_dir / (child_session + ".jsonl")
     child_header = {
@@ -906,6 +928,52 @@ class LedgerPathTests(unittest.TestCase):
             shutil.rmtree(agent_home, ignore_errors=True)
 
 
+class CollectChildSessionDirsTests(unittest.TestCase):
+    """The collector scans session-artifacts/*/sub-* directly (D7)."""
+
+    def test_collects_under_a_worker_id_the_parent_file_does_not_name(self):
+        workdir = Path(tempfile.mkdtemp(prefix="swarm-fanout-collect-"))
+        try:
+            sessions_dir = workdir / "sessions"
+            sessions_dir.mkdir()
+            (sessions_dir / "client-id.jsonl").write_text("{}\n")
+            child_dir = workdir / "session-artifacts" / "worker-id" / "sub-abc12345"
+            child_dir.mkdir(parents=True)
+            (child_dir / "child-session.jsonl").write_text("{}\n")
+            self.assertEqual(
+                runner.collect_child_session_dirs(sessions_dir),
+                {"sub-abc12345": ["child-session.jsonl"]},
+            )
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    def test_ignores_non_sub_dirs_and_sub_dirs_without_session_files(self):
+        workdir = Path(tempfile.mkdtemp(prefix="swarm-fanout-collect-"))
+        try:
+            sessions_dir = workdir / "sessions"
+            sessions_dir.mkdir()
+            worker_artifacts = workdir / "session-artifacts" / "worker-id"
+            # Kernel-state dirs sit next to sub-* dirs and can hold jsonl
+            # files (semantic-edges.jsonl); only sub-* dirs with session
+            # files are child sessions.
+            nested = worker_artifacts / "session-artifacts" / "child-session-id"
+            nested.mkdir(parents=True)
+            (nested / "semantic-edges.jsonl").write_text("{}\n")
+            (worker_artifacts / "sub-empty00").mkdir()
+            self.assertEqual(runner.collect_child_session_dirs(sessions_dir), {})
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    def test_missing_artifacts_root_collects_nothing(self):
+        workdir = Path(tempfile.mkdtemp(prefix="swarm-fanout-collect-"))
+        try:
+            sessions_dir = workdir / "sessions"
+            sessions_dir.mkdir()
+            self.assertEqual(runner.collect_child_session_dirs(sessions_dir), {})
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
 class RunnerTests(unittest.TestCase):
     """The runner must emit a scored result in every launch failure mode."""
 
@@ -944,6 +1012,22 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(result["coverage"])
         self.assertFalse(result["delegation_evidence"])
         self.assertFalse(result["resolved"])
+
+    def test_stub_agent_split_client_worker_ids_resolves(self):
+        # D7 regression: on the REPL-kernel line the ledger's parent field is
+        # the print-mode CLIENT session file while the daemon hangs child
+        # artifacts under the WORKER session id (EX-6 first run). Deriving the
+        # artifacts dir from the parent session file finds nothing there; the
+        # runner must collect sub-* dirs without relying on that id.
+        fixture = fixture_manifest("json-events")
+        stub = write_stub_agent(fixture, mode="split-id")
+        argv = ["--fixture", str(FIXTURES / "json-events"), "--model", "test/fake", "--agent-bin", str(stub)]
+        exit_code, result = self.run_runner(argv)
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(result["delegation_evidence"])
+        self.assertEqual(result["child_session_dirs"], 8)
+        self.assertEqual(result["verified_shard_workers"], 8)
+        self.assertTrue(result["resolved"])
 
     def test_missing_agent_bin_scores_unresolved(self):
         argv = [
@@ -1030,6 +1114,40 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(result["PRIME_AGENT_SESSION_DIR"], str(workdir / "sessions"))
             self.assertEqual(result["PRIME_AGENT_CODING_AGENT_DIR"], str(workdir / "agent-home"))
         finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    def test_agent_env_copies_auth_and_models_files(self):
+        # D4: custom providers inline their credentials in models.json, so an
+        # isolated home holding only auth.json cannot resolve `--model
+        # custom/...`; exam-v1's examlib copies both files and so must the
+        # runner.
+        source_home = Path(tempfile.mkdtemp(prefix="swarm-fanout-source-"))
+        workdir = Path(tempfile.mkdtemp(prefix="swarm-fanout-env-"))
+        try:
+            (source_home / "auth.json").write_text("{}\n")
+            (source_home / "models.json").write_text("{}\n")
+            env = {"PRIME_AGENT_CODING_AGENT_DIR": str(source_home)}
+            with unittest.mock.patch.dict(os.environ, env, clear=True):
+                result = runner.agent_env(workdir / "agent-home", str(workdir / "sessions"))
+            target_home = workdir / "agent-home"
+            self.assertTrue((target_home / "auth.json").is_file())
+            self.assertTrue((target_home / "models.json").is_file())
+            self.assertEqual(result["PRIME_AGENT_CODING_AGENT_DIR"], str(target_home))
+        finally:
+            shutil.rmtree(source_home, ignore_errors=True)
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    def test_agent_env_tolerates_a_source_home_without_credential_files(self):
+        source_home = Path(tempfile.mkdtemp(prefix="swarm-fanout-source-"))
+        workdir = Path(tempfile.mkdtemp(prefix="swarm-fanout-env-"))
+        try:
+            env = {"PRIME_AGENT_CODING_AGENT_DIR": str(source_home)}
+            with unittest.mock.patch.dict(os.environ, env, clear=True):
+                runner.agent_env(workdir / "agent-home", str(workdir / "sessions"))
+            self.assertFalse((workdir / "agent-home" / "auth.json").exists())
+            self.assertFalse((workdir / "agent-home" / "models.json").exists())
+        finally:
+            shutil.rmtree(source_home, ignore_errors=True)
             shutil.rmtree(workdir, ignore_errors=True)
 
     def test_shutdown_agent_daemon_waits_for_late_socket(self):

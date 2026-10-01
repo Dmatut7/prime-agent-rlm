@@ -8,10 +8,12 @@ without a model or network.
 Rubric (all four are required for a resolved run):
   - coverage: every shard's answer appears in combined-index.md and
     matches the machine-computed expected value from the fixture.
-  - delegation evidence: at least one live depth-1 spawn edge per shard,
-    each with a distinct childId and distinct name in the RLM ledger, and
-    at least one sub-* child session dir per shard holding a session
-    file. A parent that answers everything itself fails here.
+  - delegation evidence: at least one depth-1 spawn edge per shard that is
+    live or was deleted only after its reply reached the parent (the task
+    prompt sanctions rlm.delete_subagent cleanup), each with a distinct
+    childId and distinct name in the RLM ledger, and at least one sub-*
+    child session dir per shard holding a session file. A parent that
+    answers everything itself fails here.
   - dedup: no shard's worker name is spawned twice while another child
     for that shard is still live, and total depth-1 spawns stay within
     one retry per shard (2x the shard count).
@@ -44,7 +46,12 @@ def score_fixture(fixture: dict, outcome: dict) -> dict:
     edges = replay_edges(records)
     answers = parse_answers(outcome.get("artifact_text", ""))
     coverage = score_coverage(fixture, answers)
-    delegation = score_delegation(fixture, edges, outcome.get("child_session_dirs", {}))
+    delegation = score_delegation(
+        fixture,
+        edges,
+        outcome.get("child_session_dirs", {}),
+        replied_child_session_ids(outcome.get("parent_transcript_text", "")),
+    )
     dedup = score_dedup(fixture, records)
     receipts = score_receipts(edges, outcome.get("parent_transcript_text", ""))
     usage = outcome.get("usage") or {}
@@ -224,24 +231,40 @@ def score_coverage(fixture: dict, answers: dict[str, list[str]]) -> dict:
     }
 
 
-def score_delegation(fixture: dict, edges: dict[str, dict], child_session_dirs: dict[str, list[str]]) -> dict:
+def score_delegation(
+    fixture: dict,
+    edges: dict[str, dict],
+    child_session_dirs: dict[str, list[str]],
+    replied_child_sessions: set[str] | None = None,
+) -> dict:
     """Spawn evidence must exist per shard: ledger edges plus child dirs.
 
-    Every shard's worker name must have a live depth-1 ledger edge, and
-    every such edge must be backed by its real child session dir: the
-    edge's recorded child file must exist in the collected sub-* dirs.
-    A parent that answers every shard without spawning one child per
-    shard fails delegation even though coverage may pass - the no-spawn
-    cheat is the blind-answer analog of swe-fix-loop's blind patch, and
-    helper-named children do not substitute for shard workers.
+    Every shard's worker name must have a depth-1 ledger edge that is live
+    or was deleted only after its reply reached the parent - the task prompt
+    sanctions rlm.delete_subagent cleanup, so liveness at teardown is not
+    part of the contract, but a child deleted before any reply was a silent
+    drop and never counts. Every counting edge must be backed by its real
+    child session dir: the edge's recorded child file must exist in the
+    collected sub-* dirs. A parent that answers every shard without spawning
+    one child per shard fails delegation even though coverage may pass - the
+    no-spawn cheat is the blind-answer analog of swe-fix-loop's blind patch,
+    and helper-named children do not substitute for shard workers.
     """
+    replied = replied_child_sessions or set()
     required_workers = {shard["worker"] for shard in fixture.get("shards", [])}
-    live_depth1 = [edge for edge in edges.values() if edge.get("depth") == 1 and edge.get("deleted") is None]
-    worker_names = {edge.get("name") for edge in live_depth1 if edge.get("name") in required_workers}
+    counting = []
+    for edge in edges.values():
+        if edge.get("depth") != 1:
+            continue
+        if edge.get("deleted") is not None and _session_id_from_file(edge.get("child")) not in replied:
+            continue
+        counting.append(edge)
+    live_depth1 = [edge for edge in counting if edge.get("deleted") is None]
+    worker_names = {edge.get("name") for edge in counting if edge.get("name") in required_workers}
     verified_workers = 0
     claimed_sessions: set[tuple[str, str]] = set()
     for worker in required_workers:
-        for edge in live_depth1:
+        for edge in counting:
             if edge.get("name") != worker:
                 continue
             session = _edge_session_dir_and_file(edge)
@@ -255,7 +278,7 @@ def score_delegation(fixture: dict, edges: dict[str, dict], child_session_dirs: 
     return {
         "delegation_evidence": passed,
         "live_depth1_edges": len({edge["childId"] for edge in live_depth1}),
-        "distinct_worker_names": len({edge.get("name") for edge in live_depth1 if edge.get("name")}),
+        "distinct_worker_names": len({edge.get("name") for edge in counting if edge.get("name")}),
         "child_session_dirs": len(child_session_dirs),
         "verified_shard_workers": verified_workers,
     }
@@ -335,6 +358,28 @@ def score_dedup(fixture: dict, records: list[dict]) -> dict:
     }
 
 
+def replied_child_session_ids(parent_transcript_text: str) -> set[str]:
+    """Session ids of children whose reply was delivered into the parent.
+
+    Only an explicit child reply counts: the daemon always stamps
+    fromRelationship on delivered messages, so a record missing it (or
+    claiming another relationship) with a matching session id is not the
+    child's reply.
+    """
+    replies: set[str] = set()
+    for entry in _transcript_records(parent_transcript_text):
+        if entry.get("customType") != REPLY_CUSTOM_TYPE:
+            continue
+        details = entry.get("details") or {}
+        if details.get("fromRelationship") != "child":
+            continue
+        sender = details.get("from") or {}
+        session_id = sender.get("sessionId")
+        if isinstance(session_id, str) and session_id:
+            replies.add(session_id)
+    return replies
+
+
 def score_receipts(edges: dict[str, dict], parent_transcript_text: str) -> dict:
     """Every depth-1 child must be accounted for in the parent transcript.
 
@@ -343,22 +388,10 @@ def score_receipts(edges: dict[str, dict], parent_transcript_text: str) -> dict:
     naming the childId. Deleted children are still checked: deleting a
     silently failed child hides the drop, it does not receipt it.
     """
-    replies: set[str] = set()
+    replies = replied_child_session_ids(parent_transcript_text)
     notices: set[str] = set()
     for entry in _transcript_records(parent_transcript_text):
-        if entry.get("customType") == REPLY_CUSTOM_TYPE:
-            details = entry.get("details") or {}
-            # Only an explicit child reply receipts a child: the daemon
-            # always stamps fromRelationship on delivered messages, so a
-            # record missing it (or claiming another relationship) with a
-            # matching session id is not the child's reply.
-            if details.get("fromRelationship") != "child":
-                continue
-            sender = details.get("from") or {}
-            session_id = sender.get("sessionId")
-            if isinstance(session_id, str) and session_id:
-                replies.add(session_id)
-        elif entry.get("customType") in NOTICE_CUSTOM_TYPES:
+        if entry.get("customType") in NOTICE_CUSTOM_TYPES:
             details = entry.get("details") or {}
             child_id = details.get("childId")
             if isinstance(child_id, str) and child_id:

@@ -118,28 +118,32 @@ def find_parent_session_file(sessions_dir: Path, ledger_text: str) -> Path | Non
     return max(session_files, key=lambda path: path.stat().st_mtime)
 
 
-def collect_child_session_dirs(sessions_dir: Path, parent_session_file: Path | None) -> dict[str, list[str]]:
-    """sub-* child dirs under the parent's session artifact dir, by name.
+def collect_child_session_dirs(sessions_dir: Path) -> dict[str, list[str]]:
+    """sub-* child session dirs anywhere under session-artifacts/, by name.
 
     Child sessions live next to their parent's artifacts
     (session-artifacts/<parent-id>/sub-<uuid8>/), each holding the
-    child's session JSONL. The dir-to-files mapping lets the scorer
-    verify each ledger edge's recorded child file exists on disk, so a
-    dir unrelated to the ledger's children cannot stand in for one.
+    child's session JSONL. The parent-id directory cannot be derived from
+    the parent session file: on the REPL-kernel line the ledger's parent
+    is the print-mode client session while the daemon hangs child
+    artifacts under the worker's session id (D7). Scanning every
+    session-artifacts/*/sub-* dir sidesteps the split; the scorer still
+    verifies each ledger edge's recorded child file against this mapping,
+    so a dir unrelated to the ledger's children cannot stand in for one.
     """
-    if parent_session_file is None:
-        return {}
     artifacts_root = sessions_dir.parent / "session-artifacts"
-    parent_artifacts = artifacts_root / parent_session_file.stem
-    if not parent_artifacts.is_dir():
+    if not artifacts_root.is_dir():
         return {}
     child_dirs: dict[str, list[str]] = {}
-    for child_dir in sorted(parent_artifacts.iterdir()):
-        if not child_dir.is_dir() or not child_dir.name.startswith("sub-"):
+    for parent_artifacts in sorted(artifacts_root.iterdir()):
+        if not parent_artifacts.is_dir():
             continue
-        session_files = sorted(path.name for path in child_dir.glob("*.jsonl"))
-        if session_files:
-            child_dirs[child_dir.name] = session_files
+        for child_dir in sorted(parent_artifacts.iterdir()):
+            if not child_dir.is_dir() or not child_dir.name.startswith("sub-"):
+                continue
+            session_files = sorted(path.name for path in child_dir.glob("*.jsonl"))
+            if session_files:
+                child_dirs[child_dir.name] = session_files
     return child_dirs
 
 
@@ -226,8 +230,9 @@ def agent_env(agent_home: Path, sessions_dir: str) -> dict:
     them would try to attach to the parent's worker), the agent runs under
     its own PRIME_AGENT_CODING_AGENT_DIR / PI_CODING_AGENT_DIR (the workspace
     launcher's env prefix derives from the package config name) so it never
-    touches a production agent dir, and the credential file is copied in so
-    model auth works without sharing any state.
+    touches a production agent dir, and the credential files (auth.json and
+    models.json - custom providers inline their credentials there) are copied
+    in file-to-file so model auth works without sharing any state.
 
     The session dir env override matters beyond the --session-dir flag: the
     detached daemon is launched without that flag and keys its RLM spawn
@@ -245,10 +250,14 @@ def agent_env(agent_home: Path, sessions_dir: str) -> dict:
     ):
         env.pop(key, None)
     source_agent_dir = Path(env.get("PRIME_AGENT_CODING_AGENT_DIR") or Path.home() / ".prime" / "agent")
-    source_auth = source_agent_dir / "auth.json"
-    if source_auth.is_file():
-        agent_home.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_auth, agent_home / "auth.json")
+    for name in ("auth.json", "models.json"):
+        # File-to-file copies, never read into memory here: auth.json holds the
+        # model auth, models.json inlines custom-provider credentials (without
+        # it an isolated home cannot resolve `--model custom/...`).
+        source = source_agent_dir / name
+        if source.is_file():
+            agent_home.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, agent_home / name)
     env["PRIME_AGENT_CODING_AGENT_DIR"] = str(agent_home)
     env["PI_CODING_AGENT_DIR"] = str(agent_home)
     env["PRIME_AGENT_SESSION_DIR"] = sessions_dir
@@ -315,7 +324,7 @@ def collect_outcome(sessions_dir: Path, agent_home: Path, repo_dir: Path, agent_
     return {
         "ledger_text": ledger_text,
         "parent_transcript_text": parent_transcript_text,
-        "child_session_dirs": collect_child_session_dirs(sessions_dir, parent_session_file),
+        "child_session_dirs": collect_child_session_dirs(sessions_dir),
         "artifact_text": read_artifact_text(repo_dir, "combined-index.md"),
         "usage": scorer.summarize_usage(agent_log),
     }
