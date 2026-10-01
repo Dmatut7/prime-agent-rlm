@@ -1037,6 +1037,9 @@ describe("stall event enrichment and S1", () => {
 			stallRecoveryEpisodes: new Map(),
 			stallRecoveryActionCounts: new Map(),
 			stallRecoveryNoticedAt: new Map(),
+			// The quota-park transition hook (4f699741b) also hangs off broadcastToSession.
+			closingSessions: new Map(),
+			quotaParkAnnounced: new Map(),
 			scheduleRosterFlush: vi.fn(),
 			summarizer: { notifyActivity: vi.fn() },
 			isDiscardableDraft: vi.fn(() => false),

@@ -57,23 +57,25 @@ function makeSubmitContext() {
 
 // Rebuilt from upstream eee9d814b for the /speed command. Upstream's sibling
 // tests assert the 292ae3028 usage-error unification ("/tree with args shows
-// Usage: /tree"); the fork's selective merge 67334bf1a kept its own guards
-// (args to guarded commands fall through to the model, /heartbeats ignores
-// them), so those tests are adapted here to pin the fork behavior.
+// Usage: /tree"); the fork's selective merge 67334bf1a first kept its own
+// guards (args to guarded commands fall through to the model, /heartbeats
+// ignores them), and wave 1's NO_ARGUMENT_BUILTIN_SLASH_COMMANDS guard then
+// aligned the guarded commands with the upstream behavior: arguments are
+// rejected with a usage error and the draft is restored, so these tests pin
+// that behavior.
 describe("InteractiveMode no-argument command usage", () => {
 	beforeAll(() => initTheme("dark"));
 
-	it("sends arguments to guarded /tree, /settings, and /session to the model instead of erroring", async () => {
+	it("rejects arguments to guarded /tree, /settings, and /session with a usage error and restores the draft", async () => {
 		for (const command of ["tree", "settings", "session"]) {
 			const context = makeSubmitContext();
 			const prompt = (context.agentConnection as { prompt: ReturnType<typeof vi.fn> }).prompt;
 			prototype.setupEditorSubmitHandler.call(context);
 			await context.defaultEditor.onSubmit?.(`/${command} stray argument`);
-			expect(prompt).toHaveBeenCalledWith(
-				`/${command} stray argument`,
-				expect.objectContaining({ streamingBehavior: "steer", queueIfBusy: true }),
-			);
-			expect(context.showError).not.toHaveBeenCalled();
+			expect(context.showError).toHaveBeenCalledWith(`用法：/${command}`);
+			// The draft is restored so the user can fix the command.
+			expect(context.editor.getText()).toBe(`/${command} stray argument`);
+			expect(prompt).not.toHaveBeenCalled();
 			expect(context.showTreeSelector).not.toHaveBeenCalled();
 			expect(context.showSettingsSelector).not.toHaveBeenCalled();
 			expect(context.handleSessionCommand).not.toHaveBeenCalled();

@@ -253,7 +253,7 @@ describe("InteractiveMode startup hints", () => {
 
 		await Reflect.get(InteractiveMode.prototype, "requestAgentsView").call(mode);
 
-		expect(showStatus).toHaveBeenCalledWith(expect.stringContaining("需要后台服务"));
+		expect(showStatus).toHaveBeenCalledWith(expect.stringContaining("会话列表在 --no-session 启动的会话里不可用"));
 		expect(shutdown).not.toHaveBeenCalled();
 	});
 

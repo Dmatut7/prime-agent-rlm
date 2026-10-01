@@ -31,6 +31,7 @@ import {
 import { planRefinement } from "../src/core/refinement/index.js";
 import { DefaultResourceLoader } from "../src/core/resource-loader.js";
 import { createAgentSession } from "../src/core/sdk.js";
+import { PROVIDER_FAILURE_RECOVERY_CUSTOM_TYPE } from "../src/core/self-recovery.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { type SideQuestionEvent, startSideQuestion } from "../src/core/side-question.js";
@@ -286,13 +287,21 @@ describe("one retry per path, at the outermost layer", () => {
 			});
 
 			await session.prompt("hello");
+			// afcc6e022: the spent ladder hands the failure shape back to the model as one
+			// recovery turn carrying a fresh ladder, so the run no longer ends at
+			// exhaustion. The recovery turn's ladder is spent too - a provider that never
+			// answers is the hard stop, not another recovery.
+			await session.waitForIdle();
 
-			// One attempt + two module retries. While the provider client also retried, the
-			// same settings spent (1 + client retries) requests per attempt - the SDKs default
-			// to 2, so nine requests for this one turn, counted as two retries.
-			expect(server.requests()).toBe(3);
-			expect(autoRetryStarts(events).map((event) => event.attempt)).toEqual([1, 2]);
+			// One attempt + two module retries per ladder, and the ladder runs twice: the
+			// prompt's own turn and the one-shot recovery turn.
+			expect(server.requests()).toBe(6);
+			expect(autoRetryStarts(events).map((event) => event.attempt)).toEqual([1, 2, 1, 2]);
 			expect(autoRetryStarts(events).every((event) => event.maxAttempts === 2)).toBe(true);
+			const recoveryNotices = session.messages.filter(
+				(message) => message.role === "custom" && message.customType === PROVIDER_FAILURE_RECOVERY_CUSTOM_TYPE,
+			);
+			expect(recoveryNotices).toHaveLength(1);
 		} finally {
 			await server.close();
 		}
@@ -327,10 +336,13 @@ describe("one retry per path, at the outermost layer", () => {
 			});
 
 			await session.prompt("hello");
+			// The one-shot recovery turn after the spent ladder (afcc6e022) runs a fresh
+			// ladder at the same provider-scoped count.
+			await session.waitForIdle();
 
-			expect(autoRetryStarts(events).map((event) => event.attempt)).toEqual([1]);
-			expect(autoRetryStarts(events)[0]?.maxAttempts).toBe(1);
-			expect(server.requests()).toBe(2);
+			expect(autoRetryStarts(events).map((event) => event.attempt)).toEqual([1, 1]);
+			expect(autoRetryStarts(events).every((event) => event.maxAttempts === 1)).toBe(true);
+			expect(server.requests()).toBe(4);
 		} finally {
 			await server.close();
 		}

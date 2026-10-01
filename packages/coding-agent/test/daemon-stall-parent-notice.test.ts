@@ -51,6 +51,9 @@ function makeDaemon(sessions: Map<string, ActiveSessionState>): NoticeFixture["d
 		stallRecoveryNoticedAt: new Map(),
 		stallRecoveryEpisodes: new Map(),
 		stallRecoveryActionCounts: new Map(),
+		// The quota-park transition hook (4f699741b) also hangs off broadcastToSession.
+		closingSessions: new Map(),
+		quotaParkAnnounced: new Map(),
 		rosterReporter: {
 			lastComposed: new Map(),
 			lastComposedJson: new Map(),
