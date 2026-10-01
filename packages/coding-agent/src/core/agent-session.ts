@@ -6252,6 +6252,7 @@ export class AgentSession {
 			// The claim was challenged twice and still came back bare: let the run end,
 			// and leave on the record that the claimed completion was never verified.
 			this._recordSelfRecovery({ kind: "finish_gate_released", excerpt, strikes, ordinal, at: Date.now() });
+			this._emitFinishGateReleasedNotice(excerpt, strikes);
 			return undefined;
 		}
 		this._recordSelfRecovery({ kind: "auto_continue", excerpt, ordinal, at: Date.now() });
@@ -6261,6 +6262,37 @@ export class AgentSession {
 			ordinal,
 			maxOrdinal: settings.maxAutoContinues,
 		});
+	}
+
+	/**
+	 * Owner-facing notice that the finish gate let a completion claim through
+	 * unverified: shown in the chat, kept in the transcript, never part of the
+	 * model's context (convertToLlm drops the type), and not pushed onto the live
+	 * context either - the same arrangement as _emitFallbackNotice. The literal
+	 * customType mirrors the "finish_gate_released" record kind in self-recovery.ts
+	 * and the TUI's FINISH_GATE_RELEASED_CUSTOM_TYPE; the source pin in
+	 * test/finish-gate-notice.test.ts anchors all three.
+	 */
+	private _emitFinishGateReleasedNotice(excerpt: string, strikes: number): void {
+		const claim = excerpt.replace(/\s+/g, " ").trim();
+		const message: CustomMessage = {
+			role: "custom",
+			customType: "finish_gate_released",
+			content: [
+				`[finish gate] released an unverified completion claim after ${strikes} challenges.`,
+				`The reply claimed the work was done ("${claim}") but never showed the proof it was asked for, so the run was left to end. Treat the claimed completion as unverified and check it yourself before relying on it.`,
+			].join("\n"),
+			display: true,
+			details: { excerpt, strikes },
+			timestamp: Date.now(),
+		};
+		try {
+			this.sessionManager.appendCustomMessageEntry(message.customType, message.content, true, message.details);
+		} catch (error) {
+			this._reportSessionPersistFailure(error);
+		}
+		this._emit({ type: "message_start", message });
+		this._emit({ type: "message_end", message });
 	}
 
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;

@@ -66,6 +66,20 @@ export const AUTO_CONTINUE_CUSTOM_TYPE = "auto_continue";
  * transcript + UI only, so convertToLlm excludes it.
  */
 export const SESSION_CONTEXT_LOSS_CUSTOM_TYPE = "session_context_loss";
+/**
+ * Owner-facing notice the finish gate writes when it lets an unverified completion
+ * claim through (agent-session.ts's release branch): transcript + UI only, so
+ * convertToLlm excludes it. The TUI mirrors the literal in injected-prompt-message.ts.
+ */
+export const FINISH_GATE_RELEASED_CUSTOM_TYPE = "finish_gate_released";
+/**
+ * Owner-facing notice that the post-compaction snapshot deleted oversized live
+ * kernel variables (agent-session.ts's `_syncKernelStateAfterCompaction`). The
+ * model already got the same fact in the model-only `<ipython_state>` block, so a
+ * second copy would just pollute its context: convertToLlm excludes it. The TUI
+ * mirrors the literal in conversation-components.ts.
+ */
+export const IPYTHON_STATE_PRUNED_CUSTOM_TYPE = "ipython_state_pruned";
 export const ASYNC_BASH_COMPLETION_PREVIEW_LABEL = "Background command finished";
 
 export const THINKING_LEVEL_CLAMPED_CUSTOM_TYPE = "thinking_level_clamped";
@@ -1586,7 +1600,9 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						m.customType === MCP_CONNECTION_OUTCOME_CUSTOM_TYPE ||
 						m.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE ||
 						m.customType === PROVIDER_FALLBACK_NOTICE_CUSTOM_TYPE ||
-						m.customType === SESSION_CONTEXT_LOSS_CUSTOM_TYPE
+						m.customType === SESSION_CONTEXT_LOSS_CUSTOM_TYPE ||
+						m.customType === FINISH_GATE_RELEASED_CUSTOM_TYPE ||
+						m.customType === IPYTHON_STATE_PRUNED_CUSTOM_TYPE
 					) {
 						return undefined;
 					}
