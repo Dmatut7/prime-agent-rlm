@@ -236,3 +236,14 @@ orchestrator-workers + 确定性 gate；子代理任务书必须含目标/输出
 3. in-process-agent-connection 的 quotaPark（minor）。
 4. resolveServiceTier 钩子已无调用方（openai-responses-shared.ts:70-73），可选清理。
 5. 深层双排队残余（W7-A 遗留③，需 daemon-mode→agent-session 新 API，P3）。
+
+- 2026-10-01 波次 8：2 批完成（接线收尾）。结果摘要：
+  - W8-A：slim_attach_transcript client 接线——attach/reattach 声明 capability、messagesOmitted 镜像、聊天顶部「更早 N 条未加载」标记行（可点击/滚轮回填上一页，abut 守卫+epoch 防竞态，不重建 live chat）；getMessages 全量守卫保证 rpc/acp/print 不受 slim 影响。
+  - W8-B：usage.md 补 PI_DISABLE_CLAUDE_CODE_DETECTION；resolveServiceTier 死钩子删除；in-process 快照补 quotaPark（无 capability 握手，直填）。
+  - 主席直修：daemon-protocol rev-44 头注释与实现不符（resync/replacement 实际也窗口化）、types.ts quotaPark 注释补 in-process 前提。
+
+### 波次 8 遗留（登记）
+
+- slim 回填页 inline 模式无触发器（click region 只 fullscreen+mouse 派发；加键位需动 core/keybindings.ts，斜杠命令需动 slash-commands.ts）。
+- W5-C 遗留③：dev 机设真实 provider key 时 getAvailable 断言仍漂移（只隔离了磁盘探测源）。
+- 显示-调研（终端宽度画像 + mode 2027 探测）仍是设计项，未立项。
