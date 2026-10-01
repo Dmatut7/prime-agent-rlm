@@ -14,17 +14,23 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-02，wave-11 已SHIP）
+## 当前状态（2026-10-02，wave-12 已SHIP）
 
-- HEAD = 491a5b4dc：wave-11 四批已提交（cc63e5154 ai+目录、e04ef147d 熔断、ff6984d98 目标+启动、491a5b4dc 画像基建）。
-- wave-11 成果：/goal --persistent 持续目标（S1 销账）；重启崩栈→有界等待+干净报错（S2 销账）；
-  Claude Sonnet/Opus 5.5 适配+目录刷新+默认切 Opus 5.5（死线 2026-11-30 前完成）；OpenAI 503 过载分类；
-  工具错误熔断+自纠回执（C1 类事故 152 连错→5 次内熔断）；profile:tui 挂死修复+两个 bench 重写
-  （attach slim 实测 -88.4% 与第一方一致）；考题集首基线 3/5 机判、5/5 内容裁决（/tmp/wave11/exam-baseline.md）。
-- 门禁：check EXIT 0、agent 162、ai 全绿（修掉 catalog 漂移漏网 pin 2 处）、suite 1622+1 flake 复绿、
-  顶层 9103+已知豁免、hygiene OK、纯净树 tsgo 0。
-- daemon 仍跑旧 bundle（3 忙会话未强杀）；新 build 待重启生效。
-- 恢复指令：读 Backlog + 下一波主题；wave-10/11 证据库在 /tmp/wave10 与 /tmp/wave11。
+- HEAD = 8d21b965d：wave-12 四批已提交（a80d64bc2 审计债、fd1dd4e4c UX 包、50893b6fc CLI 换行、
+  8d21b965d 考题集入仓）。FORK_NOTES wave-12 节已写。
+- wave-12 成果：Esc 草稿自动 stash；/model claude-code 真实登录探测+活更新徽标；截断全省略号
+  （菜单/树提示/心跳/会话列表，502 契约保住）；CLI/stdout 宽度感知换行+--daemon-socket 指引；
+  isProcessAlive 6 份收敛（僵尸语义统一）+ 热路径零 fork（processIdExists）；sleep 11 份收敛
+  （+unref/resolveOnAbort）；死代码 -330 行 + convergence-guards 防再分叉；exam-v1 入仓
+  scripts/evals/（D1-D6 修复，EX-2 重跑 PASS）；6008 flake 治理（轮询窗 5s）。
+- 自伤回归已修（主席）：502（省略号吃掉 model:effort 一列→截断优先级重构）、4658（4658 测试 stub
+  缺 connectionConfiguredProviders）、4603（栅栏轮询被共享 isProcessAlive 带上 ps 风暴→换
+  processIdExists）、kernel-venv ps-fork O(1) 契约（同源）。教训：收敛共享实现时必须审查每个调用点
+  的成本契约（纯 kill0 vs 带 ps 的僵尸检查），语义对≠成本对。
+- 门禁：check EXIT 0、hygiene OK、tsgo 0、顶层 9202 绿+已知豁免（8 环境漂移+2 负载 flake）、
+  suite 1621+2 已知 flake 隔离复绿（4603 shutdown、6008——6008 已根治）。
+- daemon 仍跑旧 bundle（忙会话未强杀）。新 build 已就位待重启。
+- 恢复指令：读 Backlog + 下一波主题；证据库 /tmp/wave10、/tmp/wave11。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
 
@@ -62,9 +68,10 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
    （现仅 loop 级可配）。
 5. ~~画像基建~~ 销账（wave-11：profile:tui 修复 + bench 重写）。残余：kernel venv 硬编码 ~/.prime
    参数化（bootstrap.ts:585）、worker socket 不认 --daemon-socket。
-6. 【UX 插队候选】Esc 清草稿前自动 stash（数据丢失类）；/model 菜单 claude-code 徽标谎报登录态；
-   截断统一省略号（every 45m→every 45 丢单位）；CLI/stdout 宽度感知换行；双击 Esc 落点=编辑重发
-   最近用户消息；watermark 可选花费段（默认关）。
+6. 【UX 插队候选·部分销账】wave-12 已修：Esc stash、徽标诚实、截断统一、CLI 换行。残余：
+   双击 Esc 落点=编辑重发最近用户消息（/tree 选择器默认高亮+Enter fork）；watermark 可选花费段
+   （默认关）；claude-code 菜单内登录流仍是通用 API-key 对话框（应外链 `claude auth login`）；
+   CLAUDE_CODE_OAUTH_TOKEN 单设时 daemon 侧不认（packages/ai env-api-keys）。
 7. 【终端】kitty 键盘模式栈疑似活 bug（terminal.ts:266 主屏 push 一次，enterAltScreen 不重推）先真机
    复核；探测总线改 DA 栅栏+分版本 DECRQM（消盲发 2026/双定时器/粘贴内应答，是 2027/2031/图片占位前置）。
 8. 【审计债】isProcessAlive 6 份 3 语义收敛（僵尸分歧=正确性）；sleep/delay 11 份本地拷贝收敛；
@@ -81,7 +88,8 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
     回收器已上（wave-5），缺收敛数字。
 15. 【环境假失败治理】ai 包 ollama 门控测试缺陷（beforeAll 提前 return 不真 skip）；
     image-model 8 例对 claude ambient 凭证敏感（改用限定名可根治）；tui vitest.config.ts 历史错配；
-    python 两条 ResourceWarning；dev 机真实 key 时 getAvailable 断言漂移（W5-C 遗留③）。
+    python 两条 ResourceWarning；dev 机真实 key 时 getAvailable 断言漂移（W5-C 遗留③）；
+    4603 shutdown 测试负载敏感（已知，未治）。
 16. 【安全簇 文档-12/13】供应链校验、traces 上传零脱敏、auth.json 0644 —— 硬约束：先写方案问老板。
 17. 【智能-4 边角】aborted 回合不占「最近思考保留」名额（minor）。
 18. 【考题集运营】EX-3 恢复链无 CI 覆盖（faux 模型+真 CLI 子进程可补）；双模型 A/B 待首基线后定。
@@ -98,11 +106,13 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-12 候选）
+## 下一波主题（wave-13 候选）
 
-1. Backlog-6 UX 插队候选打包（Esc stash + /model 徽标 + 截断统一 + CLI 换行）——小活高产，走查证据齐全。
-2. Backlog-7 kitty 键盘模式真机复核 + 探测总线设计稿。
-3. Backlog-8 审计债打包（isProcessAlive 收敛 + 死代码清仓）。
-4. 考题集运营：修 D1/D2/D3 判分缺陷（EX-2 必挂、repo-untouched 归因），然后双模型 A/B。
-5. W11 遗留：settings 接线 tools.notFoundBreaker 键位；Sonnet 4.5 存量迁移提示（死线前）；
-   Bedrock 5.5 塑形实测；goal.create host payload 开放 persistent（需老板拍板：模型自设持续目标的风险）。
+1. Backlog-7 kitty 键盘模式栈真机复核（terminal.ts:266 疑似活 bug，tmux 可验）+ 探测总线设计稿
+   （DA 栅栏+分版本 DECRQM，是 2027/2031/图片占位前置）。
+2. Backlog-10 组织记忆硬门（立项前强制检索勘误台账——C4 白烧一整波的教训）。
+3. wave-12 残余：turn-liveness.ts:500/bootstrap.ts:881 两处 kill(0) 探针收敛或注释点名；
+   artifact-dirs.ts:224 不可达分支；main.ts 其余 ~15 打印点接 wrapForStderr；
+   daemon-ps/package-manager-cli 的冲突提示接同款。
+4. Backlog-13 slim 回填 inline 触发器。
+5. 考题集：EX-3/EX-6 首跑 + 双模型 A/B（EX-1/2/4/5/7 各一遍，成本可控）。
