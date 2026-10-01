@@ -20,7 +20,9 @@ import {
 	acquireDaemonShutdownAdmission,
 	acquireDaemonSupervisorOwnership,
 	assertDaemonSupervisorOwnerCurrent,
+	isDaemonShutdownAdmissionError,
 	persistDaemonStartupFenceFromOwner,
+	waitForDaemonShutdownAdmissionClear,
 	waitForDaemonStartupFence,
 } from "../src/modes/daemon/daemon-supervisor-ownership.js";
 
@@ -455,5 +457,104 @@ describe("daemon supervisor ownership registry", () => {
 		expect(lostOnDisk.message).toContain("sessions are preserved");
 		expect(lostOnDisk.message).not.toBe(neverAcquired.message);
 		await ownership.release();
+	});
+});
+
+describe("shutdown admission at daemon startup", () => {
+	function delay(ms: number): Promise<void> {
+		return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+	}
+
+	it("waits for an active shutdown admission to clear instead of failing startup", async () => {
+		const paths = createPaths();
+		mkdirSync(paths.registryDir, { recursive: true, mode: 0o700 });
+		process.env[registryDirEnv] = paths.registryDir;
+		const admission = await acquireDaemonShutdownAdmission();
+
+		const acquiring = acquireDaemonSupervisorOwnership({
+			agentDir: paths.agentDir,
+			appVersion: "test",
+			descriptorDir: paths.descriptorDir,
+			generation: "startup-waiter",
+			registryDir: paths.registryDir,
+			socketPath: paths.socketPath,
+			shutdownAdmissionWaitMs: 2000,
+		});
+		// Let the startup side poll the still-held admission at least once.
+		await delay(150);
+		await admission.release();
+
+		const ownership = await acquiring;
+		expect(ownership.record.socketPath).toBe(paths.socketPath);
+		await ownership.release();
+	});
+
+	it("refuses startup with daemon_shutdown_in_progress when the admission outlives the wait", async () => {
+		const paths = createPaths();
+		mkdirSync(paths.registryDir, { recursive: true, mode: 0o700 });
+		process.env[registryDirEnv] = paths.registryDir;
+		const admission = await acquireDaemonShutdownAdmission();
+
+		const refusal = await acquireDaemonSupervisorOwnership({
+			agentDir: paths.agentDir,
+			appVersion: "test",
+			descriptorDir: paths.descriptorDir,
+			generation: "startup-refused",
+			registryDir: paths.registryDir,
+			socketPath: paths.socketPath,
+			shutdownAdmissionWaitMs: 150,
+		}).then(
+			() => undefined,
+			(error: unknown) => error as Error & { code?: string },
+		);
+		expect(refusal).toMatchObject({ code: "daemon_shutdown_in_progress", name: "DaemonShutdownAdmissionError" });
+		expect(refusal?.message).toContain("still in progress");
+		expect(refusal?.message).toContain(String(process.pid));
+
+		await admission.release();
+		// Once the shutdown clears, the same acquisition proceeds.
+		const ownership = await acquire(paths, "startup-after-clear");
+		await ownership.release();
+	});
+
+	it("recognizes the shutdown admission signature across its thrown and wrapped shapes", () => {
+		expect(isDaemonShutdownAdmissionError({ name: "DaemonShutdownAdmissionError" })).toBe(true);
+		expect(isDaemonShutdownAdmissionError({ code: "daemon_shutdown_in_progress" })).toBe(true);
+		expect(isDaemonShutdownAdmissionError(new Error("Daemon shutdown is in progress"))).toBe(true);
+		expect(
+			isDaemonShutdownAdmissionError(
+				new Error("Daemon shutdown is still in progress after a 7000ms startup wait (held by pid 42)"),
+			),
+		).toBe(true);
+		expect(
+			isDaemonShutdownAdmissionError(
+				new Error(
+					"Prime Agent daemon exited during startup (code 1). Recent daemon log (/tmp/daemon.log):\n" +
+						"DaemonShutdownAdmissionError: Daemon shutdown is in progress\n    at async main (chunk.js:1:1)",
+				),
+			),
+		).toBe(true);
+		expect(isDaemonShutdownAdmissionError(new Error("Timed out waiting for daemon to start"))).toBe(false);
+		expect(isDaemonShutdownAdmissionError(new Error("random failure"))).toBe(false);
+		expect(isDaemonShutdownAdmissionError("daemon_shutdown_in_progress")).toBe(false);
+		expect(isDaemonShutdownAdmissionError(undefined)).toBe(false);
+	});
+
+	it("reports a clear admission immediately and a held one only after it clears or the wait ends", async () => {
+		const paths = createPaths();
+		mkdirSync(paths.registryDir, { recursive: true, mode: 0o700 });
+		process.env[registryDirEnv] = paths.registryDir;
+
+		await expect(waitForDaemonShutdownAdmissionClear(1000)).resolves.toBe(true);
+
+		const admission = await acquireDaemonShutdownAdmission();
+		const cleared = waitForDaemonShutdownAdmissionClear(2000);
+		await delay(120);
+		await admission.release();
+		await expect(cleared).resolves.toBe(true);
+
+		const held = await acquireDaemonShutdownAdmission();
+		await expect(waitForDaemonShutdownAdmissionClear(120)).resolves.toBe(false);
+		await held.release();
 	});
 });

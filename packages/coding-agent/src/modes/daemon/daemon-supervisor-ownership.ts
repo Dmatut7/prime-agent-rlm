@@ -23,6 +23,16 @@ const SHUTDOWN_ADMISSION_LEASE_MS = 5000;
 const SHUTDOWN_ADMISSION_REFRESH_MS = 1000;
 const SHUTDOWN_ADMISSION_WAIT_MS = 50;
 /**
+ * How long a starting daemon waits for an in-progress shutdown admission to
+ * clear before refusing: roughly one lease plus a renewal margin. A restart
+ * right after `prime-agent shutdown` lands inside this window and previously
+ * failed outright with a DaemonShutdownAdmissionError stack; the admission is
+ * released as soon as the shutdown finishes, so waiting it out is the normal
+ * case. A holder still alive past the wait is a wedged shutdown — refuse once,
+ * with the holder's pid, so the CLI can say so in one line instead of a stack.
+ */
+const SHUTDOWN_ADMISSION_STARTUP_WAIT_MS = 7_000;
+/**
  * A waiter refuses instead of hanging forever once a live holder has been silent
  * for this long: two processes must never run shutdown work at once, so waiting is
  * the only safe move, but an unbounded wait turns a wedged holder into a wedged
@@ -103,6 +113,8 @@ interface AcquireDaemonSupervisorOwnershipOptions {
 	generation: string;
 	appVersion: string;
 	registryDir?: string;
+	/** Overrides SHUTDOWN_ADMISSION_STARTUP_WAIT_MS (tests). */
+	shutdownAdmissionWaitMs?: number;
 }
 
 class DaemonSupervisorAlreadyRunningError extends Error {
@@ -138,6 +150,29 @@ class DaemonShutdownAdmissionError extends Error {
 		super(message);
 		this.name = "DaemonShutdownAdmissionError";
 	}
+}
+
+/**
+ * Whether an error carries the shutdown-admission signature, in any of the
+ * shapes it reaches a caller: the thrown DaemonShutdownAdmissionError itself
+ * (in-process), a same-named/-coded rethrow across a bundle boundary, or the
+ * daemon-launch wrapper whose message quotes the daemon log tail (stack of the
+ * child's DaemonShutdownAdmissionError included).
+ */
+export function isDaemonShutdownAdmissionError(error: unknown): boolean {
+	if (!error || typeof error !== "object") {
+		return false;
+	}
+	const candidate = error as { name?: unknown; code?: unknown; message?: unknown };
+	if (candidate.name === "DaemonShutdownAdmissionError" || candidate.code === "daemon_shutdown_in_progress") {
+		return true;
+	}
+	return (
+		typeof candidate.message === "string" &&
+		(candidate.message.includes("DaemonShutdownAdmissionError") ||
+			candidate.message.includes("daemon_shutdown_in_progress") ||
+			/daemon shutdown is (?:still )?in progress/i.test(candidate.message))
+	);
 }
 
 /**
@@ -644,66 +679,91 @@ export async function acquireDaemonSupervisorOwnership(
 	const ownerDirectory = ownerDirectoryPath(registryDir, options.generation);
 	mkdirSync(candidateDirectory, { mode: 0o700 });
 	const staleDirectories: string[] = [];
+	const admissionWaitMs = options.shutdownAdmissionWaitMs ?? SHUTDOWN_ADMISSION_STARTUP_WAIT_MS;
+	const admissionDeadline = Date.now() + admissionWaitMs;
+	let admissionHolder: DaemonShutdownAdmissionRecord | undefined;
 	try {
 		writeOwnerScope(candidateDirectory, record);
 		writeOwnerRecord(candidateDirectory, record);
-		await withDaemonSupervisorRegistryGuard(registryDir, () => {
-			if (readActiveShutdownAdmission(registryDir)) {
-				throw new DaemonShutdownAdmissionError();
-			}
-			for (const directory of listOwnerDirectories(registryDir)) {
-				const owner = readOwnerRecordForScope(directory, (scope) => ownerConflicts(scope, record));
-				if (!owner) {
-					continue;
+		// A shutdown that is still running holds the shutdown admission (the holder
+		// renews its lease until it releases). Starting over it used to throw
+		// DaemonShutdownAdmissionError immediately, so a restart inside the shutdown
+		// window always crashed; wait the admission out instead, bounded by roughly
+		// one lease plus margin. The registry guard is never held across a wait
+		// iteration: holding it would starve the holder's own lease renewal.
+		while (true) {
+			let admitted = false;
+			await withDaemonSupervisorRegistryGuard(registryDir, () => {
+				admissionHolder = readActiveShutdownAdmission(registryDir);
+				if (admissionHolder) {
+					return;
 				}
-				if (ownerConflicts(owner, record)) {
-					if (isProcessIdentityAlive(owner)) {
-						throw new DaemonSupervisorAlreadyRunningError(owner);
+				for (const directory of listOwnerDirectories(registryDir)) {
+					const owner = readOwnerRecordForScope(directory, (scope) => ownerConflicts(scope, record));
+					if (!owner) {
+						continue;
 					}
-				} else if (owner.agentDir === record.agentDir) {
-					// Same agent dir, different socket: the second half of the uniqueness
-					// constraint. A daemon that owns an agent dir owns its sessions,
-					// harness state and leases; a live one keeps that ownership whatever
-					// `$TMPDIR` (and therefore whatever socket path) the newcomer resolved.
-					if (isProcessIdentityAlive(owner)) {
-						throw new DaemonAgentDirAlreadyRunningError(
-							{
-								generation: owner.generation,
-								pid: owner.pid,
-								socketPath: owner.socketPath,
-								agentDir: owner.agentDir,
-								phase: owner.phase,
-								createdAt: owner.createdAt,
-							},
-							record.agentDir,
-						);
+					if (ownerConflicts(owner, record)) {
+						if (isProcessIdentityAlive(owner)) {
+							throw new DaemonSupervisorAlreadyRunningError(owner);
+						}
+					} else if (owner.agentDir === record.agentDir) {
+						// Same agent dir, different socket: the second half of the uniqueness
+						// constraint. A daemon that owns an agent dir owns its sessions,
+						// harness state and leases; a live one keeps that ownership whatever
+						// `$TMPDIR` (and therefore whatever socket path) the newcomer resolved.
+						if (isProcessIdentityAlive(owner)) {
+							throw new DaemonAgentDirAlreadyRunningError(
+								{
+									generation: owner.generation,
+									pid: owner.pid,
+									socketPath: owner.socketPath,
+									agentDir: owner.agentDir,
+									phase: owner.phase,
+									createdAt: owner.createdAt,
+								},
+								record.agentDir,
+							);
+						}
+					} else if (isProcessAlive(owner.pid) && !isAbandonedOwnerFootprint(owner)) {
+						// Somebody else's live daemon on this box: none of our business.
+						// Only the cheap kill(0) is spent here, deliberately: this loop runs
+						// over every owner directory on the machine inside the registry
+						// guard, on the daemon startup path, and the identity check forks
+						// `ps`/`powershell`. Treating a live pid as alive even when it may be
+						// a recycled one only postpones reclaiming that directory to whoever
+						// eventually conflicts with it, which is exactly today's behavior.
+						continue;
 					}
-				} else if (isProcessAlive(owner.pid) && !isAbandonedOwnerFootprint(owner)) {
-					// Somebody else's live daemon on this box: none of our business.
-					// Only the cheap kill(0) is spent here, deliberately: this loop runs
-					// over every owner directory on the machine inside the registry
-					// guard, on the daemon startup path, and the identity check forks
-					// `ps`/`powershell`. Treating a live pid as alive even when it may be
-					// a recycled one only postpones reclaiming that directory to whoever
-					// eventually conflicts with it, which is exactly today's behavior.
-					continue;
+					// Dead owners, and owners whose whole footprint was deleted, are
+					// reclaimed whether or not they conflict. Recovery used
+					// to be keyed on a conflict only, so an owner recorded for a different
+					// socket path (a test fixture, `--daemon-socket`, the two generations of
+					// an update handoff) stayed in this global registry forever — 36 of 45
+					// directories on one machine, two weeks old — and every later acquire and
+					// startup fence paid a full-table readdir + readFileSync + JSON.parse for
+					// each of them. Both liveness predicates above are conservative in the same
+					// direction (an unobservable identity counts as alive), so this only ever
+					// takes a directory whose process is provably gone.
+					const staleDirectory = `${directory}.stale-${randomUUID()}`;
+					renameSync(directory, staleDirectory);
+					staleDirectories.push(staleDirectory);
 				}
-				// Dead owners, and owners whose whole footprint was deleted, are
-				// reclaimed whether or not they conflict. Recovery used
-				// to be keyed on a conflict only, so an owner recorded for a different
-				// socket path (a test fixture, `--daemon-socket`, the two generations of
-				// an update handoff) stayed in this global registry forever — 36 of 45
-				// directories on one machine, two weeks old — and every later acquire and
-				// startup fence paid a full-table readdir + readFileSync + JSON.parse for
-				// each of them. Both liveness predicates above are conservative in the same
-				// direction (an unobservable identity counts as alive), so this only ever
-				// takes a directory whose process is provably gone.
-				const staleDirectory = `${directory}.stale-${randomUUID()}`;
-				renameSync(directory, staleDirectory);
-				staleDirectories.push(staleDirectory);
+				renameSync(candidateDirectory, ownerDirectory);
+				admitted = true;
+			});
+			if (admitted) {
+				break;
 			}
-			renameSync(candidateDirectory, ownerDirectory);
-		});
+			if (Date.now() >= admissionDeadline) {
+				throw new DaemonShutdownAdmissionError(
+					`Daemon shutdown is still in progress after a ${admissionWaitMs}ms startup wait` +
+						(admissionHolder ? ` (held by pid ${admissionHolder.pid})` : "") +
+						"; the shutdown holds its admission until it finishes — retry in a few seconds",
+				);
+			}
+			await delay(SHUTDOWN_ADMISSION_WAIT_MS);
+		}
 	} catch (error) {
 		rmSync(candidateDirectory, { recursive: true, force: true });
 		throw error;
@@ -798,6 +858,28 @@ export async function isDaemonShutdownAdmissionActive(): Promise<boolean> {
 	return withDaemonSupervisorRegistryGuard(registryDir, () =>
 		shutdownAdmissionIsActive(readShutdownAdmission(shutdownAdmissionPath(registryDir))),
 	);
+}
+
+/**
+ * Bounded wait for an in-progress shutdown to release its admission: true once no
+ * admission is active, false when the timeout ran out first. The CLI uses this
+ * after catching the admission signature — the common restart-while-shutting-down
+ * window clears in well under a second once the shutdown command finishes.
+ */
+export async function waitForDaemonShutdownAdmissionClear(
+	timeoutMs: number,
+	pollMs: number = SHUTDOWN_ADMISSION_WAIT_MS,
+): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (true) {
+		if (!(await isDaemonShutdownAdmissionActive())) {
+			return true;
+		}
+		if (Date.now() >= deadline) {
+			return false;
+		}
+		await delay(pollMs);
+	}
 }
 
 export async function persistDaemonStartupFenceFromOwner(

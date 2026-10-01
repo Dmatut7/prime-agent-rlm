@@ -224,11 +224,14 @@ import {
 	type GoalHostResponse,
 	type GoalState,
 	type GoalStatus,
+	goalContinuationLimit,
 	goalHostResponse,
 	goalTokenDeltaForUsage,
 	isPersistedGoalState,
 	MAX_GOAL_CONTINUATIONS,
 	normalizeGoalState,
+	parseGoalPersistentFlag,
+	persistentGoalCompletionRejection,
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
@@ -1667,7 +1670,7 @@ type GoalSlashCommand =
 	| { kind: "clear" }
 	| { kind: "pause" }
 	| { kind: "resume" }
-	| { kind: "start"; objective: string; tokenBudget?: number };
+	| { kind: "start"; objective: string; tokenBudget?: number; persistent?: boolean };
 
 type AutonomousSlashCommand = { kind: "status" } | { kind: "on"; config?: AgentAutonomousConfig } | { kind: "off" };
 
@@ -3894,7 +3897,7 @@ export class AgentSession {
 		this._emitQueueUpdate();
 	}
 
-	private _startGoal(objectiveText: string, tokenBudget: number | undefined): GoalState {
+	private _startGoal(objectiveText: string, tokenBudget: number | undefined, persistent?: boolean): GoalState {
 		const objective = validateGoalObjective(objectiveText);
 		const budget = validateGoalBudget(tokenBudget);
 		const now = Date.now();
@@ -3910,6 +3913,7 @@ export class AgentSession {
 			createdAt: now,
 			updatedAt: now,
 		};
+		if (persistent) goal.persistent = true;
 		this._goalAccountingStartedAt = now;
 		this._goalContinuationAwaitsRlmWork = false;
 		this._setGoalState(goal);
@@ -4031,9 +4035,13 @@ export class AgentSession {
 			return { kind: "resume" };
 		}
 
+		const persistentParse = parseGoalPersistentFlag(rest);
+		const persistent = persistentParse.persistent;
+		const goalArgs = persistentParse.rest;
+
 		let tokenBudget: number | undefined;
-		let objective = rest;
-		const firstToken = rest.split(/\s+/, 1)[0] ?? "";
+		let objective = goalArgs;
+		const firstToken = goalArgs.split(/\s+/, 1)[0] ?? "";
 		if (
 			firstToken === "--budget" ||
 			firstToken === "--token-budget" ||
@@ -4042,17 +4050,17 @@ export class AgentSession {
 		) {
 			let valueText: string;
 			if (firstToken === "--budget" || firstToken === "--token-budget") {
-				const withoutFlag = rest.slice(firstToken.length).trimStart();
+				const withoutFlag = goalArgs.slice(firstToken.length).trimStart();
 				const nextSpace = withoutFlag.search(/\s/);
 				if (nextSpace < 0) {
-					throw new Error("Usage: /goal [--budget <tokens>] <objective>");
+					throw new Error("Usage: /goal [--persistent] [--budget <tokens>] <objective>");
 				}
 				valueText = withoutFlag.slice(0, nextSpace);
 				objective = withoutFlag.slice(nextSpace + 1).trim();
 			} else {
 				const separator = firstToken.indexOf("=");
 				valueText = firstToken.slice(separator + 1);
-				objective = rest.slice(firstToken.length).trim();
+				objective = goalArgs.slice(firstToken.length).trim();
 			}
 			tokenBudget = parseGoalBudgetValue(valueText);
 		}
@@ -4061,6 +4069,7 @@ export class AgentSession {
 			kind: "start",
 			objective: validateGoalObjective(objective),
 			tokenBudget,
+			persistent,
 		};
 	}
 
@@ -4890,7 +4899,7 @@ export class AgentSession {
 		}
 		this._ensureGoalRuntimeActive();
 		this._clearQueuedGoalContexts();
-		this._startGoal(command.objective, command.tokenBudget);
+		this._startGoal(command.objective, command.tokenBudget, command.persistent);
 		await this._runOrQueueGoalContext(previousWasActive ? "objective_updated" : "continuation", images);
 		return true;
 	}
@@ -6088,6 +6097,9 @@ export class AgentSession {
 		if (!this._goalState.objective || this._goalState.status === "idle") {
 			throw new Error("cannot complete goal because this thread has no goal");
 		}
+		if (this._goalState.persistent && this._goalState.status === "active") {
+			throw new Error(persistentGoalCompletionRejection(this._goalState));
+		}
 		const goal = this._goalWithAccountedWallClock();
 		// A turn can cross the budget and complete the goal at once: accounting
 		// runs at message_end, before the completing ipython cell executes, so a
@@ -6110,7 +6122,10 @@ export class AgentSession {
 	 * dangling active (G1, r37 hbgoal-ts).
 	 */
 	private _goalContinuationBudgetExhausted(): boolean {
-		if (this._goalState.status !== "active" || this._goalState.continuationsUsed < MAX_GOAL_CONTINUATIONS) {
+		if (
+			this._goalState.status !== "active" ||
+			this._goalState.continuationsUsed < goalContinuationLimit(this._goalState)
+		) {
 			return false;
 		}
 		const goal = this._goalWithAccountedWallClock();
