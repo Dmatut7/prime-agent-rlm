@@ -42,6 +42,29 @@ describe("AssistantMessageComponent", () => {
 		expect(lines[lines.length - 1].startsWith(OSC133_ZONE_END + OSC133_ZONE_FINAL)).toBe(true);
 	});
 
+	test("keeps the OSC 133 markers in zone order across the rendered lines", () => {
+		initTheme("dark");
+
+		// A short answer renders with a leading blank row, so A sits on the first
+		// line and B,C on the last; the single-line branch keeps the same A<B<C order.
+		const component = new AssistantMessageComponent(createAssistantMessage([{ type: "text", text: "hello" }]));
+		const lines = component.render(40);
+
+		expect(lines.length).toBeGreaterThan(1);
+		expect(lines[0]).toContain(OSC133_ZONE_START);
+		expect(lines[0]).not.toContain(OSC133_ZONE_END);
+		expect(lines[0]).not.toContain(OSC133_ZONE_FINAL);
+		expect(lines[lines.length - 1]?.startsWith(OSC133_ZONE_END + OSC133_ZONE_FINAL)).toBe(true);
+
+		const joined = lines.join("\n");
+		const start = joined.indexOf(OSC133_ZONE_START);
+		const end = joined.indexOf(OSC133_ZONE_END);
+		const final = joined.indexOf(OSC133_ZONE_FINAL);
+		expect(start).toBeGreaterThanOrEqual(0);
+		expect(start).toBeLessThan(end);
+		expect(end).toBeLessThan(final);
+	});
+
 	test("does not accumulate OSC 133 markers on repeated renders", () => {
 		initTheme("dark");
 

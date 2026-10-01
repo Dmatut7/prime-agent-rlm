@@ -106,8 +106,16 @@ function merged(pieces: InlinePiece[]): InlinePiece[] {
 	return out;
 }
 
+/**
+ * Performance guard (tl2 FIX-D): splitInline rescans the remaining text for
+ * every `[`, so a very long single line parses in O(n²). Past this many
+ * characters a line is shown as plain text instead of parsed.
+ */
+export const INLINE_MARKDOWN_MAX_LENGTH = 4096;
+
 /** The words with their inline markup taken out. */
 export function stripInlineMarkdown(text: string): string {
+	if (text.length > INLINE_MARKDOWN_MAX_LENGTH) return text;
 	return splitInline(text)
 		.map((piece) => piece.text)
 		.join("");
@@ -115,6 +123,7 @@ export function stripInlineMarkdown(text: string): string {
 
 /** The words in `color`, bold where the AI made them bold, code in the soft color. */
 export function styleInlineMarkdown(text: string, color: ThemeColor): string {
+	if (text.length > INLINE_MARKDOWN_MAX_LENGTH) return theme.fg(color, text);
 	return splitInline(text)
 		.map((piece) => {
 			const painted = theme.fg(piece.code && color === "text" ? "timelineSoft" : color, piece.text);

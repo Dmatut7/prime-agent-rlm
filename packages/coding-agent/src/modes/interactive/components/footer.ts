@@ -491,14 +491,17 @@ export class FooterComponent implements Component {
 		// number. (The badge's visible width is the plain string; the color
 		// wrapper adds zero columns.)
 		const telemetry = this.telemetryText(
-			toolErrorBadge ? Math.max(1, safeWidth - toolErrorBadge.length - 1) : safeWidth,
+			toolErrorBadge ? Math.max(1, safeWidth - visibleWidth(toolErrorBadge) - 1) : safeWidth,
 		);
 		if (!telemetry && !toolErrorBadge && (!this.speedEnabled || !this.speedText)) {
 			return this.emptyLines;
 		}
 		const lines: string[] = [];
 		if (telemetry && toolErrorBadge) {
-			lines.push(`${telemetry} ${theme.fg("warning", toolErrorBadge)}`);
+			// The budget above reserves the badge's width, but below badge + 2
+			// columns even the one-cell watermark plus the badge overflows:
+			// clamp the assembled line like the badge-only branch does.
+			lines.push(truncateToWidth(`${telemetry} ${theme.fg("warning", toolErrorBadge)}`, safeWidth, ""));
 		} else if (telemetry) {
 			lines.push(truncateToWidth(telemetry, safeWidth, ""));
 		} else if (toolErrorBadge) {

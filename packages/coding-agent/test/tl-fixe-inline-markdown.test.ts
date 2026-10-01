@@ -10,7 +10,11 @@ import { KeybindingsManager } from "../src/core/keybindings.js";
 import { createRefinementOutcomeMessage, createRlmChildTerminalNoticeMessage } from "../src/core/messages.js";
 import type { HarnessEntry, RefinementResult } from "../src/core/refinement/refinement.js";
 import { AgentMessageComponent, reportParts, SubagentLane } from "../src/modes/interactive/components/agent-message.js";
-import { stripInlineMarkdown, styleInlineMarkdown } from "../src/modes/interactive/components/inline-markdown.js";
+import {
+	INLINE_MARKDOWN_MAX_LENGTH,
+	stripInlineMarkdown,
+	styleInlineMarkdown,
+} from "../src/modes/interactive/components/inline-markdown.js";
 import { RefinementOutcomeMessageComponent } from "../src/modes/interactive/components/refinement-outcome-message.js";
 import { subagentNoticeRow } from "../src/modes/interactive/components/system-notice.js";
 import { timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
@@ -72,6 +76,21 @@ describe("what the inline markup of a sentence turns into", () => {
 		expect(raw).toContain(theme.bold(theme.fg("timelineSoft", "b")));
 		expect(raw).toContain(theme.bold(theme.fg("text", " c")));
 		expect(plain([raw])[0]).toBe("看 a b c 吧");
+	});
+
+	it("leaves a very long line as plain text instead of parsing it", () => {
+		// splitInline rescans the remaining text for every `[`, so past the guard
+		// a single line parses in O(n²) (tl2 FIX-D 硬门槛: 50KB took 1.1s): the
+		// markup is left as written instead.
+		const long = `${"x".repeat(INLINE_MARKDOWN_MAX_LENGTH)} **bold** \`code\` [link](https://x.y)`;
+		expect(long.length).toBeGreaterThan(INLINE_MARKDOWN_MAX_LENGTH);
+		expect(stripInlineMarkdown(long)).toBe(long);
+		expect(styleInlineMarkdown(long, "text")).toBe(theme.fg("text", long));
+
+		// Exactly at the guard the line still parses.
+		const atGuard = `${"x".repeat(INLINE_MARKDOWN_MAX_LENGTH - "**b**".length)}**b**`;
+		expect(atGuard.length).toBe(INLINE_MARKDOWN_MAX_LENGTH);
+		expect(stripInlineMarkdown(atGuard)).toBe(`${"x".repeat(INLINE_MARKDOWN_MAX_LENGTH - "**b**".length)}b`);
 	});
 });
 

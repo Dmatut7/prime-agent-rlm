@@ -2,7 +2,11 @@ import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
-import { FooterComponent, type FooterTelemetrySnapshot } from "../src/modes/interactive/components/footer.js";
+import {
+	FooterComponent,
+	type FooterTelemetrySnapshot,
+	TOOL_ERROR_WARN_THRESHOLD,
+} from "../src/modes/interactive/components/footer.js";
 import {
 	renderSubagentSpendCell,
 	SubagentSummaryLine,
@@ -170,6 +174,23 @@ describe("U6 status area layout", () => {
 				expect(line.length).toBeLessThanOrEqual(width);
 			}
 		}
+	});
+
+	it("keeps every line within the width while the tool-error badge rides the status line", () => {
+		// The badge `⚠ 工具错误×N` is CJK-heavy: 工具错误 is 8 columns but 4 code
+		// units. The watermark budget used to subtract the badge's `.length` and
+		// overflow the line by exactly those 4 columns (显示-1).
+		const footer = new FooterComponent(provider);
+		footer.setTelemetrySource(() => ({ mode: "on", snapshot: SNAPSHOT }));
+		footer.setToolErrorCount(TOOL_ERROR_WARN_THRESHOLD);
+		const widths = [110, 80, 62, 61, 50, 43, 30, 20, 12, 8, 5];
+		expect(widths.length).toBeGreaterThan(0);
+		for (const width of widths) {
+			for (const line of footer.render(width)) {
+				expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+			}
+		}
+		expect(stripAnsi(footer.render(110).join("\n"))).toContain(`⚠ 工具错误×${TOOL_ERROR_WARN_THRESHOLD}`);
 	});
 
 	it("keeps the compaction state the only threshold: 即将压缩 at the notch", () => {

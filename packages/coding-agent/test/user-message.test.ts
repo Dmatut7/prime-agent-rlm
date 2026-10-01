@@ -32,6 +32,21 @@ describe("UserMessageComponent", () => {
 		expect(lines[2].endsWith(BG_RESET)).toBe(true);
 	});
 
+	test("keeps the OSC 133 markers in zone order on a single-line quiet question", () => {
+		clearDefaultTerminalColors();
+		initTheme("dark");
+
+		const lines = new UserMessageComponent("hi", undefined, () => false, undefined, { quiet: true }).render(80);
+		expect(lines).toHaveLength(1);
+		const line = lines[0] ?? "";
+		expect(line.startsWith(OSC133_ZONE_START + OSC133_ZONE_END + OSC133_ZONE_FINAL)).toBe(true);
+		const start = line.indexOf(OSC133_ZONE_START);
+		const end = line.indexOf(OSC133_ZONE_END);
+		const final = line.indexOf(OSC133_ZONE_FINAL);
+		expect(start).toBeLessThan(end);
+		expect(end).toBeLessThan(final);
+	});
+
 	test("does not accumulate OSC 133 markers on repeated renders", () => {
 		clearDefaultTerminalColors();
 		initTheme("dark");

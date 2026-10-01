@@ -336,8 +336,13 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 			return this.decoratedLines;
 		}
 		const decorated = lines.slice();
-		decorated[0] = OSC133_ZONE_START + decorated[0];
-		decorated[decorated.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + decorated[decorated.length - 1];
+		if (decorated.length === 1) {
+			// A single line carries all three markers in zone order (A before B before C).
+			decorated[0] = OSC133_ZONE_START + OSC133_ZONE_END + OSC133_ZONE_FINAL + decorated[0];
+		} else {
+			decorated[0] = OSC133_ZONE_START + decorated[0];
+			decorated[decorated.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + decorated[decorated.length - 1];
+		}
 		this.decoratedSource = lines;
 		this.decoratedLines = decorated;
 		return decorated;
