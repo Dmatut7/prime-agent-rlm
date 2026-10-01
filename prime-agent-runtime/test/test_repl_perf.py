@@ -7,8 +7,8 @@ sessions. These tests pin the two shortcuts and their invalidation:
 - blob reuse: a name still bound to the identical deeply-immutable object reuses its
   serialized blob, and the payload stays byte-identical to a full re-serialization;
 - replay: a snapshot request with no cell executed, no restore applied, every eligible
-  binding identical, and the committed pair intact on disk replays the previous result
-  without touching the files;
+  binding identical, no live non-kernel thread that could be mutating in place, and the
+  committed pair intact on disk replays the previous result without touching the files;
 - coalescing: tagged stream writes batch into one frame per short window while frame
   ordering, attribution, and the before-done drain guarantee stay exactly as they were.
 """
@@ -197,7 +197,9 @@ class SnapshotReplayProtocolTest(unittest.TestCase):
     """End-to-end over the protocol: when the whole write is skipped, and when it is not."""
 
     def setUp(self) -> None:
-        self.repl = ReplProcess()
+        # Change tracking off: its tracker threads are not kernel-registered, and a
+        # live non-kernel thread vetoes the replay under test (see _has_live_user_thread).
+        self.repl = ReplProcess(env={"PRIME_AGENT_CHANGE_TRACKING": "0"})
         self.addCleanup(self.repl.close)
         self.repl.ready()
         self._tmp = tempfile.TemporaryDirectory()
@@ -284,20 +286,73 @@ class SnapshotReplayProtocolTest(unittest.TestCase):
             self.assertEqual(fh.read(), b"sentinel")
 
 
-    def test_a_final_request_writes_through_the_replay_shortcut(self) -> None:
-        """`final` is the host's dispose flush: it must never be answered from the record.
-
-        A background thread mutating a value IN PLACE between two snapshots is invisible to
-        every fingerprint the shortcut checks (no cell ran, no binding was replaced, the
-        committed pair is intact), so a plain request legitimately replays a stale payload.
-        The terminal request is the last word on this namespace, so it writes through.
-        """
+    def test_a_live_user_thread_vetoes_the_replay(self) -> None:
+        """A live non-kernel thread may be mutating a namespace value in place right now,
+        which no fingerprint can see, so the replay shortcut stays off while it runs."""
         code = (
             "import threading, time\n"
             "box = ['initial']\n"
             "def mutate_later():\n"
-            "    time.sleep(1.5)\n"
+            "    time.sleep(3.0)\n"
             "    box.append('late')\n"
+            "threading.Thread(target=mutate_later, daemon=True).start()\n"
+        )
+        self.assertEqual(one(self.repl.execute("c1", code), "done")["status"], "ok")
+        self.assertEqual(self.snapshot("s1")["status"], "ok")
+        before = self.pair_facts()
+        # The mutator is still sleeping: no cell ran and nothing was rebound, yet the
+        # snapshot must be a physical write, not a replay.
+        d2 = self.snapshot("s2")
+        self.assertEqual(d2["status"], "ok")
+        self.assertNotEqual(before, self.pair_facts(), "a live user thread must veto the replay")
+
+    def test_kernel_owned_threads_do_not_veto_the_replay(self) -> None:
+        """A running bash() handle keeps its pump/report/watch threads and the journal
+        flusher alive; they never touch the namespace, so the replay stays on."""
+        journal = os.path.join(self._tmp.name, "journal.jsonl")
+        repl = ReplProcess(
+            env={
+                "PRIME_AGENT_CHANGE_TRACKING": "0",
+                "PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL": journal,
+                "PRIME_AGENT_KERNEL_OWNER_PID": str(os.getpid()),
+            }
+        )
+        self.addCleanup(repl.close)
+        repl.ready()
+        self.assertEqual(
+            one(repl.execute("c1", "from rlm import bash\nx = 41\nh = bash('sleep 30')"), "done")["status"], "ok"
+        )
+        # Kill the background command before close() kills the kernel, so the child
+        # process is reaped by its own handle instead of outliving the test.
+        self.addCleanup(lambda: repl.execute("cleanup", "h.kill()"))
+        repl.send({"type": "snapshot", "id": "s1", "path": self.path, "manifest_path": self.manifest})
+        d1 = one(repl.until_done("s1"), "done")
+        self.assertEqual(d1["status"], "ok")
+        before = self.pair_facts()
+        repl.send({"type": "snapshot", "id": "s2", "path": self.path, "manifest_path": self.manifest})
+        d2 = one(repl.until_done("s2"), "done")
+        self.assertEqual(d2["status"], "ok")
+        self.assertEqual(before, self.pair_facts(), "registered kernel threads must not veto the replay")
+        for field in ("saved", "skipped", "pruned", "bytes"):
+            self.assertEqual(d1[field], d2[field], field)
+
+    def test_a_final_request_writes_through_the_replay_shortcut(self) -> None:
+        """`final` is the host's dispose flush: it must never be answered from the record.
+
+        A background thread mutating a value IN PLACE between two snapshots leaves no
+        fingerprint once it has finished (no cell ran, no binding was replaced, the
+        committed pair is intact, and no live thread remains to veto the replay), so a
+        plain request legitimately replays a stale payload. The terminal request is the
+        last word on this namespace, so it writes through.
+        """
+        marker = os.path.join(self._tmp.name, "mutated.txt")
+        code = (
+            "import threading, time\n"
+            "box = ['initial']\n"
+            "def mutate_later():\n"
+            "    time.sleep(1.0)\n"
+            "    box.append('late')\n"
+            f"    open({marker!r}, 'w').write('done')\n"
             "threading.Thread(target=mutate_later, daemon=True).start()\n"
         )
         self.assertEqual(one(self.repl.execute("c1", code), "done")["status"], "ok")
@@ -308,9 +363,14 @@ class SnapshotReplayProtocolTest(unittest.TestCase):
                 return dill.loads(dill.load(fh)["box"])
 
         self.assertEqual(box_on_disk(), ["initial"])
+        # Wait for the background mutation to land and its thread to finish: only a
+        # finished thread leaves the replay fingerprint blind to its in-place change.
+        deadline = time.monotonic() + 15
+        while not os.path.exists(marker):
+            self.assertLess(time.monotonic(), deadline, "the mutator thread never ran")
+            time.sleep(0.05)
+        time.sleep(0.5)
         before = self.pair_facts()
-        # The background mutation lands here; no cell runs, so no fingerprint invalidates.
-        time.sleep(2.0)
         replayed = self.snapshot("s2")
         self.assertEqual(replayed["status"], "ok")
         self.assertEqual(before, self.pair_facts(), "a replayed snapshot must not touch the pair")

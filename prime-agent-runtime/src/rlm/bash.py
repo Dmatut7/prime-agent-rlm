@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from collections import deque
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
@@ -47,6 +48,20 @@ _live_handles: set["BashHandle"] = set()
 _live_lock = threading.Lock()
 _hook_installed = False
 _hook_lock = threading.Lock()
+
+# Kernel-owned background threads, registered at start. repl's snapshot replay
+# shortcut (_replayable_snapshot) treats any live thread outside this set as a
+# potential in-place namespace mutator - invisible to its dirty-tracking
+# fingerprints - and falls back to a full snapshot, so every thread the kernel
+# starts for its own bookkeeping must be registered here. Weak: a finished
+# thread drops out once threading releases it, so bash() churn cannot grow it.
+_kernel_threads: weakref.WeakSet[threading.Thread] = weakref.WeakSet()
+
+
+def _register_kernel_thread(thread: threading.Thread) -> threading.Thread:
+    """Mark a kernel-owned background thread as namespace-clean and return it."""
+    _kernel_threads.add(thread)
+    return thread
 
 # Cell attribution for interrupt kills: repl.py sets the active cell id around
 # each execute; asyncio tasks spawned by the cell copy the context and keep the
@@ -298,9 +313,8 @@ class BashHandle:
         self._step = effects.command_started(command)
         if self._step is not None:
             self._buffer.on_write = self._step.output
-        threading.Thread(target=self._pump, daemon=True).start()
-        threading.Thread(target=self._report, daemon=True).start()
-        threading.Thread(target=self._watch, daemon=True).start()
+        for target in (self._pump, self._report, self._watch):
+            _register_kernel_thread(threading.Thread(target=target, daemon=True)).start()
 
     @property
     def pid(self) -> int:
@@ -1464,8 +1478,8 @@ def _queue_journal_fsync() -> None:
     with _journal_flusher_lock:
         if _journal_flusher is not None and _journal_flusher.is_alive():
             return
-        flusher = threading.Thread(
-            target=_journal_flush_loop, name="rlm-journal-fsync", daemon=True
+        flusher = _register_kernel_thread(
+            threading.Thread(target=_journal_flush_loop, name="rlm-journal-fsync", daemon=True)
         )
         try:
             flusher.start()

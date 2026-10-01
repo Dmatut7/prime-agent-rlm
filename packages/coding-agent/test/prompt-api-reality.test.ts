@@ -91,6 +91,18 @@ describe("RLM prompt names only real runtime API", () => {
 		expect(new Set(named)).toEqual(new Set(fields));
 	});
 
+	it("describes attribute access as preferred without forbidding the dict-style reads the runtime provides", () => {
+		// _RecordAccess in __init__.py explicitly implements .get() and [], so a prompt
+		// that forbids them lies about the runtime; attribute access is preferred only
+		// because a typo raises instead of silently returning None.
+		expect(rlmInit).toContain("class _RecordAccess");
+		expect(rlmInit).toMatch(/def get\(self, key/);
+		expect(rlmInit).toMatch(/def __getitem__\(self, key/);
+		expect(prompt).not.toContain("never `.get()`");
+		expect(prompt).toContain("a typo raises instead of silently returning `None`");
+		expect(prompt).toContain("`.get()` and `[]` work too");
+	});
+
 	it("describes harness CRUD as synchronous with its real positional parameters", () => {
 		for (const kind of ["memory", "prompt_note", "skill", "subagent"]) {
 			const create = methodSignature(`create_${kind}`);

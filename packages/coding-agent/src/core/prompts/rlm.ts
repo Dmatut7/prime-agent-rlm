@@ -225,7 +225,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		parts.push(
 			"",
 			"A callable `rlm` is already in your global namespace. `await rlm('sub-task')` spawns a child and returns immediately after task admission with `rlm_child_id`, `name`, `session_dir`, and `model`; it never waits for or returns the child's answer.",
-			"Spawn handles and `await rlm.list_subagents()` rows are frozen dataclasses, not dicts: read fields by attribute, never `.get()`. A row's fields are `rlm_child_id`, `session_name` (not `name`), `session_dir`, `status`, `active_session_id`, and `session_id`.",
+			"Spawn handles and `await rlm.list_subagents()` rows are frozen dataclasses, not dicts: read fields by attribute (a typo raises instead of silently returning `None`), though `.get()` and `[]` work too. A row's fields are `rlm_child_id`, `session_name` (not `name`), `session_dir`, `status`, `active_session_id`, and `session_id`.",
 			"Choose a stable child name with `await rlm('sub-task', name='api-reviewer')`; names must be unique among siblings. If omitted, the host generates a readable unique name.",
 			"A child inherits your model. If a different model is explicitly requested, use `await rlm.find_models(...)` and an exact returned selector. An unavailable requested model fails spawn; decide whether to retry or omit `model`. Children also inherit your thinking level; the `thinking` option overrides it with any level the resolved child model supports, and an unsupported level fails spawn.",
 		);
@@ -238,7 +238,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 			parts.push("Use `await rlm.list_subagents()` to recover direct child handles after admission.");
 		}
 		parts.push(
-			"Collect typed results with `await rlm.collect(targets=None, timeout_ms=0)`: one snapshot per direct child (status, settled, answer preview, error, `terminal_kind`, `stall_abort`) without steering anyone and without spending message caps. Snapshots are frozen dataclass instances, not dicts: read fields by attribute (`.session_name`, never `.get()`), and the field list is `rlm_child_id`, `session_name` (not `name`), `session_dir`, `status`, `settled`, `answer_preview`, `error`, `duration_ms`, `tool_use_count`, `replied_since_task`, `activity_kind`, `terminal_kind`, `terminal_reason`, `stall_abort`. `timeout_ms` bounds only that call and never rejects - a timeout returns the current snapshots, the host caps one wait at its read-only request budget, and nothing is cancelled by it, so waiting is a poll, not a commitment.",
+			"Collect typed results with `await rlm.collect(targets=None, timeout_ms=0)`: one snapshot per direct child (status, settled, answer preview, error, `terminal_kind`, `stall_abort`) without steering anyone and without spending message caps. Snapshots are frozen dataclass instances, not dicts: read fields by attribute (`.session_name`; a typo raises instead of silently returning `None`), though `.get()` and `[]` work too, and the field list is `rlm_child_id`, `session_name` (not `name`), `session_dir`, `status`, `settled`, `answer_preview`, `error`, `duration_ms`, `tool_use_count`, `replied_since_task`, `activity_kind`, `terminal_kind`, `terminal_reason`, `stall_abort`. `timeout_ms` bounds only that call and never rejects - a timeout returns the current snapshots, the host caps one wait at its read-only request budget, and nothing is cancelled by it, so waiting is a poll, not a commitment.",
 		);
 		if (hasAgentObserve) {
 			parts.push("Use `agent_observe` to inspect a child's rollout.");

@@ -31,8 +31,10 @@ from typing import Any
 from . import effects
 from .bash import (
     _forget_cell,
+    _kernel_threads,
     _kill_cell_handles,
     _kill_live_handles,
+    _register_kernel_thread,
     _reset_current_cell,
     _set_current_cell,
     live_handle_facts,
@@ -207,7 +209,9 @@ class _StreamCoalescer:
     def start(self) -> None:
         """Arm the window-enforcing flush thread (serving processes only)."""
         if self._thread is None:
-            self._thread = threading.Thread(target=self._run, daemon=True, name="rlm-stream-flush")
+            self._thread = _register_kernel_thread(
+                threading.Thread(target=self._run, daemon=True, name="rlm-stream-flush")
+            )
             self._thread.start()
 
     def append(self, stream: str, cell_id: str | None, text: str) -> None:
@@ -377,7 +381,7 @@ class _Pump:
         self._lock = threading.Lock()
         self._watch: tuple[bytes, threading.Event] | None = None
         self._buf = b""
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread = _register_kernel_thread(threading.Thread(target=self._run, daemon=True))
         self._thread.start()
 
     def drain(self) -> None:
@@ -981,7 +985,10 @@ def _merge_preserved_blobs(
 # Both are fingerprints, not proofs, against mutators outside the event loop: a
 # background thread mutating a value IN PLACE while no cell runs is invisible to them
 # (rebinding is not - identity is checked). In-place mutation by cells is always caught
-# because any executed cell bumps _cell_counter and invalidates the replay record.
+# because any executed cell bumps _cell_counter and invalidates the replay record, and a
+# live thread outside the kernel-owned registry vetoes the replay outright
+# (_has_live_user_thread); only a mutation by a thread that already finished stays
+# invisible, which is why `final` requests still write through.
 _snapshot_blob_cache: dict[str, tuple[Any, bytes]] = {}
 # Aggregate bound on the bytes the cache may pin. Without it a data-heavy kernel keeps a
 # serialized second copy of every deeply-immutable value it ever binds for as long as the
@@ -1019,16 +1026,33 @@ def _deeply_immutable(value: Any, seen: set[int] | None = None) -> bool:
         return False
 
 
+def _has_live_user_thread() -> bool:
+    """True when a live non-main thread sits outside the kernel-owned registry.
+
+    Kernel threads (registered via bash._register_kernel_thread) never touch the user
+    namespace, so they cannot threaten the replay fingerprint. Any other live thread
+    may be mutating a namespace value in place right now - invisible to every
+    fingerprint - so its presence alone forces a full snapshot. A thread that already
+    finished leaves no signal; that residual is why `final` requests still write
+    through.
+    """
+    main = threading.main_thread()
+    return any(thread is not main and thread not in _kernel_threads for thread in threading.enumerate())
+
+
 def _replayable_snapshot(key: tuple, path: str, manifest_path: str, ns: dict[str, Any]) -> dict[str, Any] | None:
     """The last committed result when this exact request provably adds nothing.
 
     Cheap and conservative: any doubt (a cell ran, a restore applied, a name appeared,
-    vanished, or was rebound, a file moved or changed size) falls through to a full
-    snapshot. The on-disk check keeps the host's corrupt-snapshot isolation intact -
-    an isolated (renamed) or truncated pair is never replayed over.
+    vanished, or was rebound, a live non-kernel thread could be mutating in place, a
+    file moved or changed size) falls through to a full snapshot. The on-disk check
+    keeps the host's corrupt-snapshot isolation intact - an isolated (renamed) or
+    truncated pair is never replayed over.
     """
     record = _last_snapshot_record
     if record is None or record["key"] != key:
+        return None
+    if _has_live_user_thread():
         return None
     if record["cells"] != _cell_counter or record["restores"] != _restore_counter:
         return None
@@ -1680,11 +1704,12 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
             )
             # A `final` request is the host's last word on this namespace (the dispose
             # flush), so it is never answered from the replay record: a background thread
-            # that mutated a value IN PLACE after the last snapshot is invisible to every
-            # fingerprint here (identity unchanged, no cell ran), and only a physical write
-            # captures it. Unlike preserve_names this field carries no protocol gate - a
-            # runtime that predates it has no replay shortcut to bypass, so ignoring the key
-            # degrades to the full write it already performs.
+            # that mutated a value IN PLACE and has already finished is invisible to every
+            # fingerprint here (identity unchanged, no cell ran, no live thread left to
+            # veto), and only a physical write captures it. Unlike preserve_names this
+            # field carries no protocol gate - a runtime that predates it has no replay
+            # shortcut to bypass, so ignoring the key degrades to the full write it
+            # already performs.
             replay = None if final else _replayable_snapshot(key, req["path"], req["manifest_path"], ns)
             if replay is not None:
                 # Nothing ran and no binding changed since the last committed snapshot,
@@ -1980,8 +2005,8 @@ def _owner_watchdog(owner: int, initial_ppid: int) -> None:
 
 
 def _start_owner_watchdog() -> None:
-    threading.Thread(
-        target=_owner_watchdog, args=(_resolve_owner_pid(), os.getppid()), daemon=True
+    _register_kernel_thread(
+        threading.Thread(target=_owner_watchdog, args=(_resolve_owner_pid(), os.getppid()), daemon=True)
     ).start()
 
 
@@ -2129,7 +2154,7 @@ def _start_heartbeat() -> None:
     _heartbeat_interval_ms = heartbeat_interval_ms()
     if negotiated_protocol() < HEARTBEAT_MIN_PROTOCOL:
         return
-    threading.Thread(target=_heartbeat_loop, daemon=True, name="rlm-heartbeat").start()
+    _register_kernel_thread(threading.Thread(target=_heartbeat_loop, daemon=True, name="rlm-heartbeat")).start()
 
 
 _pump_out: _Pump
@@ -2200,7 +2225,7 @@ def main() -> None:
     # startup path the host waits for, and it finishes before the first request is served.
     effects.install(_send_effect)
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    threading.Thread(target=_read_requests, args=(stdin_fd, queue), daemon=True).start()
+    _register_kernel_thread(threading.Thread(target=_read_requests, args=(stdin_fd, queue), daemon=True)).start()
 
     _serve_task = _loop.create_task(_serve(queue, user_module.__dict__))
     # _sigint_handler has no task to target before serving starts, so installing

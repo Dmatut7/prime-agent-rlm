@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 
 from . import host_request
+from .bash import _register_kernel_thread
 from .mcp_base import _parse_result, _read_auth, _resolve_config_value
 
 __all__ = ["McpStartupError", "call_tool", "close", "list_tools", "reload"]
@@ -43,7 +44,9 @@ class _StderrTail(io.TextIOBase):
         self._lock = threading.Lock()
         self._capture = True
         self._pipe_closed = False
-        self._reader = threading.Thread(target=self._drain, name="mcp-stderr-drain", daemon=True)
+        self._reader = _register_kernel_thread(
+            threading.Thread(target=self._drain, name="mcp-stderr-drain", daemon=True)
+        )
         self._reader.start()
 
     def fileno(self) -> int:

@@ -44,7 +44,7 @@ The `claude-code` provider runs Claude through the Claude Code CLI installed on 
 
 Claude Code only serves as the model: its own tools, memory, `CLAUDE.md` loading and compaction are switched off, and the session's tools are handed to it over a loopback MCP server, so tools, memory, subagents and compaction behave exactly as with any other provider. The thinking level maps to Claude Code's `--effort`.
 
-- The CLI is looked up on `PATH`, then in `~/.local/bin` and `~/.claude/local`.
+- The CLI is looked up on `PATH`, then in `~/.local/bin` and `~/.claude/local`. Set `PI_DISABLE_CLAUDE_CODE_DETECTION=1` to keep an installed `claude` CLI from counting as a credential, so tests and headless automation stay deterministic.
 - Inherited `ANTHROPIC_*` and `CLAUDE_CODE_*` variables are not passed to the CLI, so an API key set for something else cannot move billing off the plan. `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) is kept.
 - Keep extra usage turned off at [claude.ai/settings/usage](https://claude.ai/settings/usage). If Claude Code reports that a request is billed to extra usage anyway, the request is stopped and fails as a quota error, so `providerFallbackModels` can take over. A used-up plan fails as a rate limit with the reset time Claude Code announced.
 - After a finished turn the CLI process stays up for 20 minutes for the session's next message, which keeps Claude's prompt cache warm. Each waiting process uses about 250 MB of memory.
