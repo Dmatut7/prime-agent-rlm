@@ -177,16 +177,18 @@ export class SettingsList implements Component {
 		} else if (kb.matches(data, "tui.select.down")) {
 			if (displayItems.length === 0) return;
 			this.selectedIndex = this.selectedIndex === displayItems.length - 1 ? 0 : this.selectedIndex + 1;
-		} else if (kb.matches(data, "tui.select.confirm") || kb.matches(data, "tui.select.toggle")) {
+		} else if (kb.matches(data, "tui.select.confirm")) {
+			this.activateItem();
+		} else if (kb.matches(data, "tui.select.toggle") && !this.searchEnabled) {
+			// While searching, the query owns printable characters: a space is
+			// search text (labels contain spaces), not "toggle the selected
+			// setting" - otherwise every typed space silently cycles whichever
+			// setting the filter happens to have selected. Enter still activates.
 			this.activateItem();
 		} else if (kb.matches(data, "tui.select.cancel")) {
 			this.onCancel();
 		} else if (this.searchEnabled && this.searchInput) {
-			const sanitized = data.replace(/ /g, "");
-			if (!sanitized) {
-				return;
-			}
-			this.searchInput.handleInput(sanitized);
+			this.searchInput.handleInput(data);
 			this.applyFilter(this.searchInput.getValue());
 		}
 	}
@@ -232,7 +234,7 @@ export class SettingsList implements Component {
 		lines.push(
 			truncateToWidth(
 				this.theme.hint(
-					this.searchEnabled ? "  输入可搜索 · Enter/空格 修改 · Esc 取消" : "  Enter/空格 修改 · Esc 取消",
+					this.searchEnabled ? "  输入可搜索 · Enter 修改 · Esc 取消" : "  Enter/空格 修改 · Esc 取消",
 				),
 				width,
 			),

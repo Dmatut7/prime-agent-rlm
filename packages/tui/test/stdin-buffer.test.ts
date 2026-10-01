@@ -942,6 +942,71 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedPaste, [content]);
 			assert.deepStrictEqual(emittedSequences, []);
 		});
+
+		it("emits a sequence the paste start cut short instead of dropping it", async () => {
+			// A bare ESC still inside its completion window when the paste arrives is
+			// a real Escape keypress; the paste must not swallow it.
+			processInput("\x1b");
+			processInput("\x1b[200~pasted\x1b[201~");
+			await waitForPasteSettle();
+
+			assert.deepStrictEqual(emittedSequences, ["\x1b"]);
+			assert.deepStrictEqual(emittedPaste, ["pasted"]);
+		});
+
+		it("diverts terminal query answers arriving mid-paste out of the paste text", async () => {
+			// On a slow link the answers to the startup probes (Kitty keyboard flags,
+			// OSC 10/11 default colors, cell size) can land inside an open paste.
+			processInput("\x1b[200~hello ");
+			processInput("\x1b[?1u");
+			processInput("\x1b]10;rgb:ffff/ffff/ffff\x07");
+			processInput("\x1b[6;18;104t");
+			processInput("world\x1b[201~");
+			await waitForPasteSettle();
+
+			assert.deepStrictEqual(emittedPaste, ["hello world"]);
+			assert.deepStrictEqual(emittedSequences, ["\x1b[?1u", "\x1b]10;rgb:ffff/ffff/ffff\x07", "\x1b[6;18;104t"]);
+		});
+
+		it("reassembles a terminal query answer split across paste chunks", async () => {
+			processInput("\x1b[200~abc\x1b]10;rg");
+			processInput("b:ffff/ffff/ffff\x07def\x1b[201~");
+			await waitForPasteSettle();
+
+			assert.deepStrictEqual(emittedPaste, ["abcdef"]);
+			assert.deepStrictEqual(emittedSequences, ["\x1b]10;rgb:ffff/ffff/ffff\x07"]);
+		});
+
+		it("returns a terminal-answer lookalike that never completes to the paste text", async () => {
+			processInput("\x1b[200~see \x1b]10;no-terminator");
+			processInput("\x1b[201~");
+			await waitForPasteSettle();
+
+			assert.deepStrictEqual(emittedPaste, ["see \x1b]10;no-terminator"]);
+			assert.deepStrictEqual(emittedSequences, []);
+		});
+
+		it("waits one extra completion window for a torn paste start marker", async () => {
+			// A paste start split across packets ("\x1b[20" + "0~…") must not flush the
+			// fragment to the key path: the rest of the paste would arrive as
+			// keystrokes and its escape sequences would run as editing commands.
+			processInput("\x1b[20");
+			await wait(15); // past the plain completion window: nothing may flush yet
+			assert.deepStrictEqual(emittedSequences, []);
+
+			processInput("0~hello\x1b[201~");
+			await waitForPasteSettle();
+
+			assert.deepStrictEqual(emittedSequences, []);
+			assert.deepStrictEqual(emittedPaste, ["hello"]);
+		});
+
+		it("flushes a torn paste start marker that never completes after the extra window", async () => {
+			processInput("\x1b[20");
+			await wait(30); // both windows pass with no follow-up
+			assert.deepStrictEqual(emittedSequences, ["\x1b[20"]);
+			assert.strictEqual(buffer.isPasteMode(), false);
+		});
 	});
 
 	describe("Destroy", () => {

@@ -496,8 +496,6 @@ interface ParsedModifyOtherKeysSequence {
 	modifier: number;
 }
 
-let _lastEventType: KeyEventType = "press";
-
 /**
  * Key sequences are complete, short escape sequences (StdinBuffer emits one per
  * event). Anything else - pasted text, a bracketed paste payload - is data, not a
@@ -599,7 +597,6 @@ function parseKittySequence(data: string): ParsedKittySequence | null {
 		const baseLayoutKey = csiUMatch[3] ? parseInt(csiUMatch[3], 10) : undefined;
 		const modValue = csiUMatch[4] ? parseInt(csiUMatch[4], 10) : 1;
 		const eventType = parseEventType(csiUMatch[5]);
-		_lastEventType = eventType;
 		return { codepoint, shiftedKey, baseLayoutKey, modifier: modValue - 1, eventType };
 	}
 
@@ -608,7 +605,6 @@ function parseKittySequence(data: string): ParsedKittySequence | null {
 		const modValue = parseInt(arrowMatch[1]!, 10);
 		const eventType = parseEventType(arrowMatch[2]);
 		const arrowCodes: Record<string, number> = { A: -1, B: -2, C: -3, D: -4 };
-		_lastEventType = eventType;
 		return { codepoint: arrowCodes[arrowMatch[3]!]!, modifier: modValue - 1, eventType };
 	}
 
@@ -628,7 +624,6 @@ function parseKittySequence(data: string): ParsedKittySequence | null {
 		};
 		const codepoint = funcCodes[keyNum];
 		if (codepoint !== undefined) {
-			_lastEventType = eventType;
 			return { codepoint, modifier: modValue - 1, eventType };
 		}
 	}
@@ -639,7 +634,6 @@ function parseKittySequence(data: string): ParsedKittySequence | null {
 		const modValue = parseInt(homeEndMatch[1]!, 10);
 		const eventType = parseEventType(homeEndMatch[2]);
 		const codepoint = homeEndMatch[3] === "H" ? FUNCTIONAL_CODEPOINTS.home : FUNCTIONAL_CODEPOINTS.end;
-		_lastEventType = eventType;
 		return { codepoint, modifier: modValue - 1, eventType };
 	}
 

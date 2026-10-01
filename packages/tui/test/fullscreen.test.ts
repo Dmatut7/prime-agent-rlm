@@ -761,6 +761,92 @@ describe("TUI fullscreen mode", () => {
 		tui.stop();
 	});
 
+	it("drag-selects with legacy X10 mouse reports on terminals without SGR", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20));
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		// X10 encoding: ESC [ M followed by button/column/row bytes at value + 32.
+		const x10 = (button: number, x: number, y: number) =>
+			`\x1b[M${String.fromCharCode(32 + button)}${String.fromCharCode(32 + x)}${String.fromCharCode(32 + y)}`;
+		terminal.sendInput(x10(0, 1, 1)); // left press
+		terminal.sendInput(x10(32, 6, 2)); // drag
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes("\x1b[7m"), "selection highlighted while dragging");
+
+		terminal.sendInput(x10(3, 6, 2)); // release (X10 reports button 3)
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, ["Line 12\nLine"]);
+
+		tui.stop();
+	});
+
+	it("drops a transcript selection when the transcript is replaced", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20));
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;1;1M");
+		terminal.sendInput("\x1b[<32;6;2M");
+		await terminal.waitForRender();
+
+		// A rebuild (compaction, resync) replaces every transcript line; the
+		// selection's line indexes now point at unrelated rows.
+		chat.lines = lines(20, "Replaced");
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;6;2m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, [], "release must not copy rows the selection no longer points at");
+
+		tui.stop();
+	});
+
+	it("keeps a transcript selection across streaming appends", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20));
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;1;1M");
+		terminal.sendInput("\x1b[<32;6;2M");
+		await terminal.waitForRender();
+
+		chat.lines = [...lines(20), "Line 20"];
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;6;2m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, ["Line 12\nLine"]);
+
+		tui.stop();
+	});
+
+	it("clamps the painted cursor position to the frame", () => {
+		const viewport = new FullscreenViewport();
+		let written = "";
+		viewport.paint(
+			(data) => {
+				written += data;
+			},
+			["line"],
+			10,
+			5,
+			{ row: 99, col: 99 },
+		);
+		assert.ok(
+			written.includes("\x1b[5;10H"),
+			`cursor past the frame must clamp to the bottom-right cell, got: ${JSON.stringify(written)}`,
+		);
+	});
+
 	it("keeps wrapped table-cell selection inside the originating cell", async () => {
 		const terminal = new LoggingVirtualTerminal(40, 12);
 		const tui = new TUI(terminal);

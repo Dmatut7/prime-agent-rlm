@@ -181,6 +181,84 @@ describe("TUI Kitty image cleanup", () => {
 
 		tui.stop();
 	});
+
+	it("degrades an inline image whose block straddles the top of a full repaint", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui = new TUI(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+
+		// A 12-row image whose block starts at line 5. The repaint window covers
+		// only the last 10 lines (from line 9), so the sequence line's cursor-up
+		// would clamp at the top edge and misalign every row after it.
+		const kitty = encodeKitty("AAAA", { columns: 4, rows: 12, imageId: 424, moveCursor: false });
+		const imageLine = `\x1b[11A${kitty}\x1b[11B`;
+		component.lines = [
+			"text0",
+			"text1",
+			"text2",
+			"text3",
+			"text4",
+			...Array<string>(11).fill(""),
+			imageLine,
+			"after1",
+			"after2",
+		];
+		tui.start();
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		terminal.resize(36, 10);
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		assert.ok(!writes.includes(kitty), "a straddling image line must not be re-emitted");
+		assert.ok(writes.includes("[image]"), "a placeholder is written instead");
+		const viewport = await terminal.flushAndGetViewport();
+		assert.strictEqual(viewport[7], "[image]");
+		assert.strictEqual(viewport[8], "after1");
+		assert.strictEqual(viewport[9], "after2");
+
+		tui.stop();
+	});
+
+	it("degrades a straddling image line caught in a differential rewrite range", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui = new TUI(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+
+		// 33 lines, viewport top at 23. The image's sequence line (31) sits inside
+		// the window, but its block starts at 22 - one row above it - so a diff
+		// that rewrites lines 24..32 would repaint the sequence line at screen row
+		// 8 with a cursor-up of 9.
+		const kitty = encodeKitty("BBBB", { columns: 4, rows: 10, imageId: 425, moveCursor: false });
+		const imageLine = `\x1b[9A${kitty}\x1b[9B`;
+		const base = [
+			...Array.from({ length: 22 }, (_, i) => `text${i}`),
+			...Array<string>(9).fill(""),
+			imageLine,
+			"tail",
+		];
+		component.lines = base;
+		tui.start();
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		component.lines = base.map((line, i) => (i === 24 ? "x" : i === 32 ? "tailx" : line));
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		assert.ok(!writes.includes("\x1b[2J"), "no full redraw for a bottom-of-screen change");
+		assert.ok(!writes.includes(kitty), "a straddling image line must not be rewritten by the diff");
+		assert.ok(writes.includes("[image]"), "a placeholder is written instead");
+		const viewport = await terminal.flushAndGetViewport();
+		assert.strictEqual(viewport[8], "[image]");
+		assert.strictEqual(viewport[9], "tailx");
+
+		tui.stop();
+	});
 });
 
 describe("TUI resize handling", () => {

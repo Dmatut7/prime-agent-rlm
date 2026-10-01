@@ -60,25 +60,38 @@ function legacyCoordinate(char: string): number {
 	return code > 32 && code <= 255 ? code - 32 : 0;
 }
 
-/** The pointer move a report carries, in the SGR or the legacy `ESC [ M` encoding; null for anything else. */
-export function parseMouseHover(sequence: string): MouseEvent | null {
+/**
+ * A full mouse report in the SGR or the legacy X10 (`ESC [ M` + three bytes)
+ * encoding; null for anything else. X10 carries no release button: a release
+ * reports button code 3 without the motion bit, and a move with no button held
+ * reports code 3 with it. The synthetic `press` keeps the two apart - a hover
+ * move counts as pressed so it is never mistaken for a release.
+ */
+export function parseMouseEvent(sequence: string): MouseEvent | null {
 	const sgr = parseSgrMouseEvent(sequence);
-	if (sgr) return isMouseHover(sgr) ? sgr : null;
+	if (sgr) return sgr;
 	const legacy = sequence.match(LEGACY_MOUSE_PATTERN);
 	if (!legacy) return null;
 	const raw = legacy[1]!.charCodeAt(0) - 32;
 	if (raw < 0) return null;
-	const event: MouseEvent = {
-		button: raw & ~(MODIFIER_SHIFT | MODIFIER_ALT | MODIFIER_CTRL | MOTION_BIT),
+	const motion = (raw & MOTION_BIT) !== 0;
+	const button = raw & ~(MODIFIER_SHIFT | MODIFIER_ALT | MODIFIER_CTRL | MOTION_BIT);
+	return {
+		button,
 		x: legacyCoordinate(legacy[2]!),
 		y: legacyCoordinate(legacy[3]!),
-		press: true,
-		motion: (raw & MOTION_BIT) !== 0,
+		press: button !== MOUSE_BUTTON_NONE || motion,
+		motion,
 		shift: (raw & MODIFIER_SHIFT) !== 0,
 		alt: (raw & MODIFIER_ALT) !== 0,
 		ctrl: (raw & MODIFIER_CTRL) !== 0,
 	};
-	return isMouseHover(event) ? event : null;
+}
+
+/** The pointer move a report carries, in the SGR or the legacy `ESC [ M` encoding; null for anything else. */
+export function parseMouseHover(sequence: string): MouseEvent | null {
+	const event = parseMouseEvent(sequence);
+	return event !== null && isMouseHover(event) ? event : null;
 }
 
 export function isWheelUp(event: MouseEvent): boolean {

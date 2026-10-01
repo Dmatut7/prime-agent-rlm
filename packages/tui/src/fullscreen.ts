@@ -233,6 +233,18 @@ export class FullscreenViewport {
 		this.lastHeaderLines = (header ?? []).length;
 		this.lastDockLines = dock.length;
 		this.lastDockHeight = dockLines.length;
+		// A rebuild or compaction replaces transcript rows, shifting every line
+		// index; a selection anchored to the old rows would copy whatever now sits
+		// at those indexes. Streaming appends keep the anchored lines identical,
+		// so they never disturb an in-flight selection.
+		if (this.selectionMode === "transcript" || this.selectionMode === "table") {
+			const stale = [this.selectionAnchor, this.selectionHead].some(
+				(point) =>
+					point !== null &&
+					(point.line >= transcript.length || transcript[point.line] !== this.lastTranscript[point.line]),
+			);
+			if (stale) this.clearSelection();
+		}
 		this.lastTranscript = transcript;
 		this.tableCellSelectionRegions = tableCellSelectionRegions;
 
@@ -1029,7 +1041,9 @@ export class FullscreenViewport {
 			buffer += visibleWidth(line) > width ? sliceByColumn(line, 0, width, true) : line;
 		}
 		if (cursorPos) {
-			buffer += `\x1b[${Math.min(cursorPos.row, height - 1) + 1};${cursorPos.col + 1}H`;
+			const cursorRow = Math.max(0, Math.min(cursorPos.row, height - 1));
+			const cursorCol = Math.max(0, Math.min(cursorPos.col, width - 1));
+			buffer += `\x1b[${cursorRow + 1};${cursorCol + 1}H`;
 		}
 		buffer += "\x1b[?2026l";
 		write(buffer);

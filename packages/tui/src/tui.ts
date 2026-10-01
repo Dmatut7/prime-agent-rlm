@@ -24,12 +24,19 @@ import {
 	isWheelDown,
 	isWheelUp,
 	MOUSE_BUTTON_LEFT,
+	parseMouseEvent,
 	parseMouseHover,
-	parseSgrMouseEvent,
 } from "./mouse.js";
 import { stripContentStartMarkers, type TableCellSelectionRegion } from "./selection-metadata.js";
 import type { Terminal } from "./terminal.js";
-import { deleteKittyImage, getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.js";
+import {
+	deleteKittyImage,
+	getCapabilities,
+	IMAGE_LINE_PLACEHOLDER,
+	imageLineRowOffset,
+	isImageLine,
+	setCellDimensions,
+} from "./terminal-image.js";
 import {
 	extractSegments,
 	normalizeTerminalOutput,
@@ -1266,7 +1273,7 @@ export class TUI extends Container {
 
 		if (isMouseSequence(data)) {
 			// consumed even when disabled — mouse reports are garbage downstream
-			const event = this.terminal.mouseTrackingActive ? parseSgrMouseEvent(data) : null;
+			const event = this.terminal.mouseTrackingActive ? parseMouseEvent(data) : null;
 			const leftReleaseWasDrag =
 				event?.button === MOUSE_BUTTON_LEFT && !event.press ? this.fullscreenLeftMouseDragged : false;
 			if (event?.button === MOUSE_BUTTON_LEFT && event.press) {
@@ -1857,6 +1864,23 @@ export class TUI extends Container {
 		return this.deleteKittyImages(ids);
 	}
 
+	/**
+	 * Replace image lines whose block straddles the top of the painted window
+	 * with a placeholder. A sequence line written while its leading blank rows
+	 * are above the window paints at the clamped top edge and shifts every row
+	 * after it (see imageLineRowOffset), and because the content lines compare
+	 * unchanged afterwards the misalignment never self-heals.
+	 */
+	private degradeStraddlingImageLines(lines: string[], from: number, to: number, windowTop: number): void {
+		for (let i = Math.max(from, windowTop); i <= to; i++) {
+			const line = lines[i];
+			if (line === undefined || !isImageLine(line)) continue;
+			if (i - imageLineRowOffset(line) < windowTop) {
+				lines[i] = IMAGE_LINE_PLACEHOLDER;
+			}
+		}
+	}
+
 	/** Splice overlay content into a base line at a specific column. Single-pass optimized. */
 	private compositeLineAt(
 		baseLine: string,
@@ -2123,6 +2147,7 @@ export class TUI extends Container {
 			if (preserveViewport && this.previousLines.length > 0) {
 				const windowStart = Math.max(0, newLines.length - height);
 				const visibleCount = newLines.length - windowStart;
+				this.degradeStraddlingImageLines(newLines, windowStart, newLines.length - 1, windowStart);
 				// Rows the previous frame occupied on screen.
 				const prevScreenRows = Math.min(height, this.previousLines.length);
 				// Only delete Kitty images within the repainted viewport. Images that
@@ -2178,6 +2203,9 @@ export class TUI extends Container {
 			}
 
 			const renderStart = clear && this.previousLines.length > 0 ? Math.max(0, newLines.length - height) : 0;
+			if (renderStart > 0) {
+				this.degradeStraddlingImageLines(newLines, renderStart, newLines.length - 1, renderStart);
+			}
 			if (clear) {
 				const previousVisibleTop = Math.min(prevViewportTop, Math.max(0, this.previousLines.length - height));
 				const previousVisibleBottom = Math.min(this.previousLines.length - 1, previousVisibleTop + height - 1);
@@ -2390,6 +2418,7 @@ export class TUI extends Container {
 		// Only render changed lines (firstChanged to lastChanged), not all lines to end
 		// This reduces flicker when only a single line changes (e.g., spinner animation)
 		const renderEnd = Math.min(lastChanged, newLines.length - 1);
+		this.degradeStraddlingImageLines(newLines, firstChanged, renderEnd, viewportTop);
 		for (let i = firstChanged; i <= renderEnd; i++) {
 			if (i > firstChanged) buffer += "\r\n";
 			buffer += "\x1b[2K"; // Clear current line

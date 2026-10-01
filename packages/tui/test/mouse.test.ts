@@ -1,6 +1,13 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { isMouseSequence, isWheelDown, isWheelUp, parseSgrMouseEvent } from "../src/mouse.js";
+import {
+	isMouseHover,
+	isMouseSequence,
+	isWheelDown,
+	isWheelUp,
+	parseMouseEvent,
+	parseSgrMouseEvent,
+} from "../src/mouse.js";
 import { StdinBuffer } from "../src/stdin-buffer.js";
 
 describe("parseSgrMouseEvent", () => {
@@ -57,6 +64,75 @@ describe("isMouseSequence", () => {
 		assert.strictEqual(isMouseSequence("\x1b[<64;10;5M"), true);
 		assert.strictEqual(isMouseSequence("\x1b[M   "), true);
 		assert.strictEqual(isMouseSequence("\x1b[A"), false);
+	});
+});
+
+describe("parseMouseEvent", () => {
+	const legacy = (button: number, x: number, y: number) =>
+		`\x1b[M${String.fromCharCode(32 + button)}${String.fromCharCode(32 + x)}${String.fromCharCode(32 + y)}`;
+
+	it("prefers the SGR encoding when both could match", () => {
+		const event = parseMouseEvent("\x1b[<0;5;6m");
+		assert.deepStrictEqual(event, {
+			button: 0,
+			x: 5,
+			y: 6,
+			press: false,
+			motion: false,
+			shift: false,
+			alt: false,
+			ctrl: false,
+		});
+	});
+
+	it("parses a legacy X10 press, drag and release", () => {
+		assert.deepStrictEqual(parseMouseEvent(legacy(0, 10, 5)), {
+			button: 0,
+			x: 10,
+			y: 5,
+			press: true,
+			motion: false,
+			shift: false,
+			alt: false,
+			ctrl: false,
+		});
+
+		const drag = parseMouseEvent(legacy(32, 10, 5));
+		assert.strictEqual(drag?.button, 0);
+		assert.strictEqual(drag?.motion, true);
+		assert.strictEqual(drag?.press, true);
+
+		// X10 has no release button: a release reports button code 3 with no motion.
+		const release = parseMouseEvent(legacy(3, 10, 5));
+		assert.strictEqual(release?.button, 3);
+		assert.strictEqual(release?.press, false);
+		assert.strictEqual(release?.motion, false);
+	});
+
+	it("keeps a legacy hover move pressed so it cannot read as a release", () => {
+		const hover = parseMouseEvent(legacy(35, 10, 5));
+		assert.strictEqual(hover?.button, 3);
+		assert.strictEqual(hover?.motion, true);
+		assert.strictEqual(hover?.press, true);
+		assert.strictEqual(isMouseHover(hover!), true);
+	});
+
+	it("parses legacy wheel reports and modifier bits", () => {
+		const wheel = parseMouseEvent(legacy(64, 10, 5));
+		assert.strictEqual(wheel?.press, true);
+		assert.strictEqual(isWheelUp(wheel!), true);
+
+		const modified = parseMouseEvent(legacy(0 + 4 + 8 + 16, 1, 1));
+		assert.strictEqual(modified?.button, 0);
+		assert.strictEqual(modified?.shift, true);
+		assert.strictEqual(modified?.alt, true);
+		assert.strictEqual(modified?.ctrl, true);
+	});
+
+	it("returns null for non-mouse input and truncated reports", () => {
+		assert.strictEqual(parseMouseEvent("\x1b[A"), null);
+		assert.strictEqual(parseMouseEvent("a"), null);
+		assert.strictEqual(parseMouseEvent("\x1b[M"), null);
 	});
 });
 

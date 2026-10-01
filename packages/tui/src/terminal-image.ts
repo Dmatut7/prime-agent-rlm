@@ -155,6 +155,28 @@ export function isImageLine(line: string): boolean {
 	return line.includes(KITTY_PREFIX) || line.includes(ITERM2_PREFIX);
 }
 
+const IMAGE_LINE_CURSOR_UP = /^\x1b\[(\d+)A/;
+
+/**
+ * Rows an image line paints above itself through its leading cursor-up, or 0
+ * for a line without one. The image's block starts this many lines above the
+ * line carrying the sequence, so the sequence line may only be written when
+ * those rows are on screen: a terminal clamps a cursor-up that runs past the
+ * top edge, and the image then lands on unrelated rows while the matching
+ * cursor-down leaves every row after it shifted.
+ */
+export function imageLineRowOffset(line: string): number {
+	const match = IMAGE_LINE_CURSOR_UP.exec(line);
+	return match ? Number.parseInt(match[1]!, 10) : 0;
+}
+
+/**
+ * Text written instead of an image line whose block does not fit the painted
+ * window (see imageLineRowOffset). Deliberately plain: it flows through the
+ * normal line pipeline, so it must not itself contain an image sequence.
+ */
+export const IMAGE_LINE_PLACEHOLDER = "\x1b[2m[image]\x1b[0m";
+
 /**
  * Generate a random image ID for Kitty graphics protocol.
  * Uses random IDs to avoid collisions between different module instances

@@ -75,6 +75,7 @@ export {
 	MOUSE_WHEEL_DOWN,
 	MOUSE_WHEEL_UP,
 	type MouseEvent,
+	parseMouseEvent,
 	parseSgrMouseEvent,
 } from "./mouse.js";
 export { VersionedRenderCache } from "./render-cache.js";

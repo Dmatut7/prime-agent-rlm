@@ -370,6 +370,61 @@ const MOUSE_REPORT_PREFIX_REGEX = /^\x1b(\[(<[\d;]*|M[\s\S]{0,2})?)?$/;
 const PARTIAL_MOUSE_REPORT_REGEX = /^\x1b\[(<[\d;]*|M[\s\S]{0,2})$/;
 
 /**
+ * Terminal query answers that can land inside an open paste on a slow link: the
+ * Kitty keyboard flags answer (`CSI ? flags u`), the cell-size answer
+ * (`CSI 6 ; h ; w t`) and the OSC 10/11 default-color answers. They are
+ * responses to this process's own probes, never paste text, so they are lifted
+ * out of the paste stream and delivered as data sequences to their regular
+ * consumers.
+ */
+const TERMINAL_RESPONSE_REGEX = /\x1b\[\?\d+u|\x1b\[6;\d+;\d+t|\x1b\]1[01];[^\x07\x1b]+(?:\x07|\x1b\\)/g;
+
+/** A tail that can still grow into a complete terminal response with the next chunk. */
+const TERMINAL_RESPONSE_PREFIX_REGEX =
+	/^\x1b(?:\[(?:\?\d*|6(?:;\d*(?:;\d*)?)?)?|\](?:1[01]?(?:;[^\x07\x1b]*)?(?:\x1b)?)?)?$/;
+
+/** Responses are short (the longest is an OSC color answer); only a bounded tail is rescanned. */
+const TERMINAL_RESPONSE_MAX_TAIL = 64;
+
+function trailingTerminalResponsePrefix(text: string): string {
+	const tail = text.slice(-TERMINAL_RESPONSE_MAX_TAIL);
+	for (let i = 0; i < tail.length; i++) {
+		if (tail.charCodeAt(i) !== 0x1b) continue;
+		const candidate = tail.slice(i);
+		if (TERMINAL_RESPONSE_PREFIX_REGEX.test(candidate)) return candidate;
+	}
+	return "";
+}
+
+/**
+ * Lift complete terminal responses out of a paste chunk. A trailing partial
+ * response travels as `hold` instead of paste text, so one split across chunks
+ * is reassembled against the next chunk instead of leaking half into the paste.
+ */
+function extractTerminalResponses(chunk: string): { text: string; responses: string[]; hold: string } {
+	const responses: string[] = [];
+	const text = chunk.replace(TERMINAL_RESPONSE_REGEX, (match) => {
+		responses.push(match);
+		return "";
+	});
+	return { text, responses, hold: trailingTerminalResponsePrefix(text) };
+}
+
+/**
+ * Whether `data` is a proper prefix of a bracketed-paste marker longer than a
+ * bare ESC - a marker torn across packets. Bare ESC is excluded: it is the
+ * Escape key far more often than the start of a paste, and its completion
+ * window must not double.
+ */
+function isPartialPasteMarkerPrefix(data: string): boolean {
+	return (
+		data.length >= 2 &&
+		data.length < BRACKETED_PASTE_START.length &&
+		(BRACKETED_PASTE_START.startsWith(data) || BRACKETED_PASTE_END.startsWith(data))
+	);
+}
+
+/**
  * Buffers stdin input and emits complete sequences via the 'data' event.
  * Handles partial escape sequences that arrive across multiple chunks.
  */
@@ -395,7 +450,11 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private pasteTerminated: boolean = false;
 	/** Start of a mouse report at the end of what arrived behind the last end marker. */
 	private pasteMouseHold: string = "";
+	/** Tail of the last paste chunk that can still grow into a terminal response. */
+	private pasteResponseHold: string = "";
 	private pendingKittyPrintableCodepoint: number | undefined;
+	/** The completion-window flush already waited out one extra window for a torn paste marker. */
+	private sequenceTimeoutExtended: boolean = false;
 
 	constructor(options: StdinBufferOptions = {}) {
 		super();
@@ -410,6 +469,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			clearTimeout(this.timeout);
 			this.timeout = null;
 		}
+		this.sequenceTimeoutExtended = false;
 
 		// Handle high-byte conversion (for compatibility with parseKeypress)
 		// If buffer has single byte > 127, convert to ESC + (byte - 128)
@@ -457,7 +517,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		if (this.pasteMode) {
 			const chunk = this.buffer;
 			this.buffer = "";
-			this.appendPasteChunk(chunk);
+			this.appendPasteInput(chunk);
 			return;
 		}
 
@@ -469,6 +529,12 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				for (const sequence of result.sequences) {
 					this.emitDataSequence(sequence);
 				}
+				// A sequence the paste start cut short (e.g. a bare ESC still inside
+				// its completion window) is real input: emit it with the same
+				// semantics as a timeout flush instead of dropping it.
+				if (result.remainder.length > 0) {
+					this.emitDataSequence(result.remainder);
+				}
 			}
 
 			this.pendingKittyPrintableCodepoint = undefined;
@@ -477,7 +543,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.resetPasteState();
 			const initialContent = this.buffer;
 			this.buffer = "";
-			this.appendPasteChunk(initialContent);
+			this.appendPasteInput(initialContent);
 			return;
 		}
 
@@ -490,13 +556,52 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 
 		if (this.buffer.length > 0) {
 			this.timeout = setTimeout(() => {
-				const flushed = this.flush();
-
-				for (const sequence of flushed) {
-					this.emitDataSequence(sequence);
-				}
+				this.onSequenceTimeout();
 			}, this.timeoutMs);
 		}
+	}
+
+	/**
+	 * Flush the buffered sequence after its completion window. A buffer that is
+	 * a proper prefix of a bracketed-paste marker gets one extra window first: a
+	 * paste start torn across packets ("\x1b[20" + "0~…") would otherwise flush
+	 * the fragment as a key and let the rest of the paste reach the key parser,
+	 * where its escape sequences execute as editing commands.
+	 */
+	private onSequenceTimeout(): void {
+		if (!this.sequenceTimeoutExtended && isPartialPasteMarkerPrefix(this.buffer)) {
+			this.sequenceTimeoutExtended = true;
+			this.timeout = setTimeout(() => {
+				this.onSequenceTimeout();
+			}, this.timeoutMs);
+			return;
+		}
+		this.sequenceTimeoutExtended = false;
+		const flushed = this.flush();
+
+		for (const sequence of flushed) {
+			this.emitDataSequence(sequence);
+		}
+	}
+
+	/**
+	 * Route a chunk that arrived while paste mode is on into the paste. Terminal
+	 * query answers (Kitty flags, cell size, OSC 10/11 colors) are lifted out and
+	 * delivered as data sequences - they answer this process's own probes and are
+	 * not paste text. A tail that can still grow into one is held for the next
+	 * chunk; whatever never completes is returned to the paste verbatim when the
+	 * paste closes.
+	 */
+	private appendPasteInput(chunk: string): void {
+		const combined = this.pasteResponseHold + chunk;
+		const { text, responses, hold } = extractTerminalResponses(combined);
+		this.pasteResponseHold = hold;
+		for (const response of responses) {
+			this.emitDataSequence(response);
+		}
+		// The hold is a suffix of `text`; it travels with the next chunk instead
+		// of entering the paste twice.
+		this.appendPasteChunk(hold.length > 0 ? text.slice(0, text.length - hold.length) : text);
 	}
 
 	/**
@@ -647,7 +752,9 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		if (!this.pasteMode) {
 			return;
 		}
-		const content = this.joinPasteChunks();
+		// A held partial response never completed once the stream is quiet: it is
+		// paste text after all, returned verbatim.
+		const content = this.joinPasteChunks() + this.pasteResponseHold;
 		const lastEnd = content.lastIndexOf(BRACKETED_PASTE_END);
 		let text = lastEnd === -1 ? content : content.slice(0, lastEnd);
 		let reports: string[] = [];
@@ -688,10 +795,11 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.pastePending = "";
 		this.pasteTerminated = false;
 		this.pasteMouseHold = "";
+		this.pasteResponseHold = "";
 	}
 
 	private finishPasteWithoutTerminator(): void {
-		this.emitPasteAndContinue(this.joinPasteChunks());
+		this.emitPasteAndContinue(this.joinPasteChunks() + this.pasteResponseHold);
 	}
 
 	/**
