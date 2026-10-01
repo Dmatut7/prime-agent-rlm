@@ -31,6 +31,9 @@ _DEFAULT_FILE_NAME = "harness_state.json"
 _DEFAULT_HARNESS_DIR_NAME = "harness"
 WINDOWS_PERSISTENCE_UNSUPPORTED_ERROR = "Persistent harness storage is unsupported on Windows"
 _KINDS: tuple[HarnessKind, ...] = ("prompt", "memory", "skill", "subagent")
+# The overflow catalog in overview() names hidden entries one line each; cap it
+# so a huge store cannot turn the digest into the dump the window was avoiding.
+_OVERFLOW_CATALOG_MAX = 50
 _state_cache: dict[tuple[Path, HarnessScope], "HarnessState"] = {}
 
 
@@ -1287,16 +1290,22 @@ class HarnessState:
                 )
             overflow = len(self.entries[kind]) - len(records)
             if overflow > 0:
-                # A bare count hides which entries fell out of the window; name every
-                # hidden one with id + title only (no content, so the catalog stays
+                # A bare count hides which entries fell out of the window; name the
+                # hidden ones with id + title only (no content, so the catalog stays
                 # cheap), so the model can pull one explicitly with get() instead of
-                # reading a truncated digest as the whole store.
+                # reading a truncated digest as the whole store. The catalog itself
+                # is capped: every hidden entry costs one injected line, so a large
+                # store would otherwise blow the digest up past the window it saved.
                 lines.append(f"  - +{overflow} more (id + title only; fetch with get):")
-                for entry in kind_records[max_entries_per_kind:]:
+                catalog_entries = kind_records[max_entries_per_kind:]
+                for entry in catalog_entries[:_OVERFLOW_CATALOG_MAX]:
                     catalog_title = _flatten_inline(entry.title)
                     if len(catalog_title) > 120:
                         catalog_title = f"{catalog_title[:117]}..."
                     lines.append(f"    - [{entry.scope}:{_flatten_inline(entry.id)}] {catalog_title}")
+                omitted = len(catalog_entries) - _OVERFLOW_CATALOG_MAX
+                if omitted > 0:
+                    lines.append(f"    - +{omitted} more ids omitted")
         if self.refinements:
             lines.append(f"refinements: {len(self.refinements)}")
             for event in self.refinements[-5:]:

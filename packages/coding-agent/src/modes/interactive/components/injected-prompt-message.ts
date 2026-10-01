@@ -38,8 +38,27 @@ import {
 import { SystemNoticeLine } from "./system-notice.js";
 import { boxRecordFromMessage } from "./turn-timeline.js";
 
+/**
+ * The finish gate's release notice: the gate challenged a done-claim, the
+ * claim came back without proof again, and the gate let the run end anyway. Emitted from agent-session.ts's
+ * finish-gate release branch; the string mirrors the "finish_gate_released"
+ * record kind in core/self-recovery.ts (pinned in test/finish-gate-notice.test.ts),
+ * the same mirror arrangement as IPYTHON_STATE_PRUNED_CUSTOM_TYPE in
+ * conversation-components.ts.
+ */
+export const FINISH_GATE_RELEASED_CUSTOM_TYPE = "finish_gate_released";
+
+/** Details of the finish gate's release notice (see self-recovery.ts). */
+export interface FinishGateReleasedDetails {
+	/** The done-claim the gate let through unverified. */
+	excerpt?: string;
+	/** Nudges the claim survived before the release. */
+	strikes?: number;
+}
+
 type InjectedPromptDetails =
 	| AutoContinueMessageDetails
+	| FinishGateReleasedDetails
 	| GoalContextDetails
 	| HeartbeatPromptDetails
 	| IpythonStateRestoredDetails
@@ -53,6 +72,7 @@ export function isInjectedPromptMessage(message: AgentMessage): message is Injec
 	return (
 		message.role === "custom" &&
 		(message.customType === AUTO_CONTINUE_CUSTOM_TYPE ||
+			message.customType === FINISH_GATE_RELEASED_CUSTOM_TYPE ||
 			message.customType === HEARTBEAT_PROMPT_CUSTOM_TYPE ||
 			message.customType === GOAL_CONTEXT_CUSTOM_TYPE ||
 			message.customType === IPYTHON_STATE_RESTORED_CUSTOM_TYPE ||
@@ -186,8 +206,24 @@ export class InjectedPromptMessageComponent extends Container implements Focusab
 				if (details?.reason === "child_reply_missing") {
 					return { label: "↻ 自动继续", detail: "提醒把结果发给父代理" };
 				}
+				if (details?.reason === "finish_gate") {
+					// The finish gate challenged a done-claim: not a routine continue, so it
+					// must not wear the generic "自动继续" label - the owner has to see the
+					// run was caught finishing without proof.
+					const detail = details.excerpt ? `刚才说要「${collapseText(details.excerpt)}」` : "完成声明没有证据";
+					return { label: "⚠ 完成核验 · 要求给出证据", detail };
+				}
 				const detail = details?.excerpt ? `刚才说要「${collapseText(details.excerpt)}」` : "上一步没做完";
 				return { label: "↻ 自动继续", detail };
+			}
+			case FINISH_GATE_RELEASED_CUSTOM_TYPE: {
+				// Not a continue: the gate let the claim through unproven, so the row
+				// says who has to check it now.
+				const details = this.message.details as FinishGateReleasedDetails | undefined;
+				const claim = details?.excerpt
+					? `说要「${collapseText(details.excerpt)}」的证据始终没给`
+					: "完成声明始终没给出证据";
+				return { label: "⚠ 完成核验 · 已放行（未验证）", detail: `${claim}，结论待你核对` };
 			}
 			case HEARTBEAT_PROMPT_CUSTOM_TYPE: {
 				const details = this.message.details as HeartbeatPromptDetails | undefined;
@@ -227,8 +263,21 @@ export class InjectedPromptMessageComponent extends Container implements Focusab
 			// The session continued on its own: one quiet row saying why.
 			const details = this.message.details as AutoContinueMessageDetails | undefined;
 			if (details?.reason === "child_reply_missing") return theme.fg("dim", "自动继续：提醒把结果发给父代理");
+			if (details?.reason === "finish_gate") {
+				const excerpt = details.excerpt ? `刚才说要「${collapseText(details.excerpt)}」` : "完成声明没有证据";
+				return theme.fg("dim", truncateToWidth(`完成核验：${excerpt}，要求给出证据`, 100));
+			}
 			const excerpt = details?.excerpt ? `刚才说要「${collapseText(details.excerpt)}」` : "上一步没做完";
 			return theme.fg("dim", truncateToWidth(`自动继续：${excerpt}`, 100));
+		}
+		if (this.message.customType === FINISH_GATE_RELEASED_CUSTOM_TYPE) {
+			const details = this.message.details as FinishGateReleasedDetails | undefined;
+			const strikes =
+				typeof details?.strikes === "number" && details.strikes > 1
+					? `连问 ${details.strikes} 次仍无证据`
+					: "始终没给出证据";
+			const claim = details?.excerpt ? `说要「${collapseText(details.excerpt)}」，` : "";
+			return theme.fg("dim", truncateToWidth(`完成核验：${claim}${strikes}，已放行，结论待你核对`, 100));
 		}
 		if (this.message.customType === HEARTBEAT_PROMPT_CUSTOM_TYPE) {
 			return this.heartbeatHeaderText();

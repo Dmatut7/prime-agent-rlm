@@ -1,0 +1,3 @@
+- Fixed the harness memory overview's overflow catalog growing one injected line per hidden entry: it now names at most 50 hidden entries per kind and closes with a "+N more ids omitted" line.
+- Changed the finish gate's nudge label in the session view: it now reads "⚠ 完成核验 · 要求给出证据" instead of the generic "自动继续", so a run caught finishing without proof is recognizable at a glance, live and on replay.
+- Added the session-view rendering for the finish gate's release notice ("⚠ 完成核验 · 已放行（未验证）" with the released claim and a "结论待你核对" pointer), so a run the gate let through unproven leaves a visible row in the conversation, live and on replay.

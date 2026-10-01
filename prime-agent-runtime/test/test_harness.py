@@ -1305,6 +1305,36 @@ class ScopePrefixEdgeCases(unittest.TestCase):
         forged_rows = [line for line in overview.split("\n") if line.strip().startswith("- [global:forged_title]")]
         self.assertEqual(forged_rows, [])
 
+    def test_overview_overflow_catalog_is_capped_with_an_omitted_tail(self) -> None:
+        # N2: the catalog names every hidden entry one line each; without a cap a
+        # large store turns the digest into the dump the window was avoiding.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            for index in range(60):
+                state.create_memory(f"Lesson {index}", f"body {index}", id=f"lesson_{index}")
+                state.entries["memory"][f"lesson_{index}"].updated_at = f"2026-01-01T00:00:{index:02d}+00:00"
+            overview = state.overview(max_entries_per_kind=5)
+        lines = overview.split("\n")
+        catalog_rows = [line for line in lines if line.startswith("    - [")]
+        self.assertEqual(len(catalog_rows), 50)
+        # The cap keeps the recency order: the 50 newest hidden entries are named.
+        self.assertIn("[local:lesson_54]", catalog_rows[0])
+        self.assertIn("[local:lesson_5]", catalog_rows[-1])
+        omitted_rows = [line for line in lines if "more ids omitted" in line]
+        self.assertEqual(omitted_rows, ["    - +5 more ids omitted"])
+        # The 5 oldest are neither in the window nor in the catalog.
+        for index in range(5):
+            self.assertNotIn(f"lesson_{index}]", overview)
+
+    def test_overview_overflow_catalog_under_the_cap_has_no_omitted_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            for index in range(30):
+                state.create_memory(f"Lesson {index}", f"body {index}", id=f"lesson_{index}")
+            overview = state.overview(max_entries_per_kind=5)
+        self.assertIn("+25 more", overview)
+        self.assertNotIn("more ids omitted", overview)
+
     def test_cross_store_prefix_on_create_upsert_is_refused_not_routed(self) -> None:
         # X-9: create/upsert used to strip a store prefix and silently route the
         # write to the other store (a local-session create with id
