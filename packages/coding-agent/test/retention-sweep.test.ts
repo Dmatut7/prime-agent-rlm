@@ -237,6 +237,22 @@ describe("retention sweep - deleted-session residue (ruling 3)", () => {
 	});
 });
 
+describe("retention sweep - class order", () => {
+	it("runs the age/evidence classes before the artifact total-byte backstop", async () => {
+		const f = fixture();
+		const report = await runRetentionSweep({ settings: resolveRetentionSettings({}), roots: f.roots });
+		const order = report.classes.map((entry) => entry.class);
+		// The cap class is the destructive backstop: the cheaper age/evidence
+		// classes spend the shared per-sweep budget first, and what they reclaim
+		// may bring the tree back under the ceiling on its own.
+		expect(order.indexOf("artifact-residue-dirs")).toBeLessThan(order.indexOf("artifact-total-cap"));
+		expect(order.indexOf("artifact-empty-dirs")).toBeLessThan(order.indexOf("artifact-total-cap"));
+		expect(order.indexOf("child-transcripts")).toBeLessThan(order.indexOf("artifact-total-cap"));
+		// The ledger compaction rewrites the evidence file the other classes read.
+		expect(order.indexOf("rlm-ledger-compaction")).toBe(order.length - 1);
+	});
+});
+
 describe("retention sweep - report discipline", () => {
 	it("keeps the dry run and the real run in the same shape (red test R-5)", async () => {
 		const f = fixture();

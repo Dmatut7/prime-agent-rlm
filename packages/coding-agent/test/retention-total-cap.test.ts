@@ -238,6 +238,27 @@ describe("bash-temp count cap", () => {
 	});
 });
 
+describe("bash-temp age pass reclaim order", () => {
+	it("spends a capped per-sweep budget on the oldest files first, not on dictionary order", async () => {
+		const { roots } = createSandbox();
+		const now = Date.now();
+		// Dictionary order puts the newer file (0000...) ahead of the older one
+		// (ffff...); the mtime order must be the one the budget is spent in.
+		const newer = writeBashTemp(roots, "pi-bash-0000000000000001.log", "1", 3 * MS_PER_HOUR, now);
+		const older = writeBashTemp(roots, "pi-bash-ffffffffffffffff.log", "2", 5 * MS_PER_HOUR, now);
+
+		const result = await bashTempFilesModule.scanAndReclaim(
+			makeContext(roots, { bashTempFileHours: 1, bashTempFileMaxCount: 0, maxDeleteEntriesPerSweep: 1 }, { now }),
+		);
+
+		expect(result.reclaimed).toBe(1);
+		expect(existsSync(older)).toBe(false);
+		expect(existsSync(newer)).toBe(true);
+		const capped = result.skipped.find((entry) => entry.path === newer);
+		expect(capped?.reason).toBe("cap-hit");
+	});
+});
+
 describe("artifact-total-cap", () => {
 	it("is disabled at 0 and scans nothing", async () => {
 		const { roots } = createSandbox();
@@ -370,6 +391,28 @@ describe("artifact-total-cap", () => {
 		const oversized = result.skipped.find((entry) => entry.path === huge);
 		expect(oversized?.reason).toBe("cap-hit");
 		expect(oversized?.detail).toContain("maxDeleteBytesPerSweep");
+	});
+
+	it("never spends per-sweep entries on zero-byte directories", async () => {
+		const { roots } = createSandbox();
+		const now = Date.now();
+		// The empty directory is the oldest, so oldest-first ordering puts it ahead
+		// of the payload directory; with one entry of budget it must not be spent.
+		const empty = join(roots.artifactRoot, "aa01");
+		mkdirSync(empty, { recursive: true, mode: 0o700 });
+		agePath(empty, 40 * MS_PER_DAY, now);
+		const payload = makeArtifactDir(roots, "aa02", { bytes: 600, ageMs: 30 * MS_PER_DAY, now });
+
+		const result = await artifactTotalCapModule.scanAndReclaim(
+			makeContext(roots, { sessionArtifactsMaxBytes: 100, maxDeleteEntriesPerSweep: 1 }, { now }),
+		);
+
+		// The single entry goes to the directory that actually holds bytes; the
+		// empty one is the empty-dirs class's to judge by age.
+		expect(result.reclaimed).toBe(1);
+		expect(existsSync(payload)).toBe(false);
+		expect(existsSync(empty)).toBe(true);
+		expect(result.skipped.filter((entry) => entry.reason === "cap-hit")).toEqual([]);
 	});
 
 	it("reports the same reclaims in a dry run without deleting", async () => {

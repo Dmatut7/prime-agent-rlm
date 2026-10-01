@@ -155,8 +155,11 @@ async function scanAndReclaim(context: RetentionClassContext): Promise<Retention
 	}
 
 	// Oldest-touched first, path as the tie-break so two sweeps judge identically.
+	// Zero-byte candidates stay out: reclaiming one frees nothing against the byte
+	// ceiling but still spends one per-sweep entry, starving the candidates behind
+	// it - and the empty-dirs class already owns those directories by age.
 	const reclaimable = candidates
-		.filter((candidate) => decision.get(candidate.path) === "reclaim")
+		.filter((candidate) => decision.get(candidate.path) === "reclaim" && candidate.tree.bytes > 0)
 		.sort((a, b) => a.tree.newestMtimeMs - b.tree.newestMtimeMs || a.path.localeCompare(b.path));
 	let projected = totalBytes;
 	const requests: ReclaimRequest[] = [];

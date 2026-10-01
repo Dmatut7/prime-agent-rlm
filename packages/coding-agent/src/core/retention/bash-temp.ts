@@ -105,6 +105,10 @@ async function scanAndReclaim(context: RetentionClassContext): Promise<Retention
 	}
 
 	const requests: ReclaimRequest[] = [];
+	// Oldest first, path as the tie-break: the shared per-sweep budget can cap
+	// mid-list, and the scan's dictionary order would spend it on whichever hex
+	// names sort first instead of on the coldest files.
+	agedOut.sort((a, b) => a.mtimeMs - b.mtimeMs || a.path.localeCompare(b.path));
 	for (const file of agedOut) {
 		requests.push({
 			path: file.path,

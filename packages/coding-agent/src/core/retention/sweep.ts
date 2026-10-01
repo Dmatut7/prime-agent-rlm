@@ -41,10 +41,15 @@ const CLASS_MODULES = [
 	kernelSnapshotGenerationsModule,
 	artifactResidueModule,
 	artifactEmptyDirsModule,
-	// After the residue/empty classes: they reclaim by age and evidence first, and
-	// the cap class measures what is left against the tree's total-byte ceiling.
-	artifactTotalCapModule,
+	// The age/evidence classes spend the shared per-sweep budget before the
+	// byte-pressure backstop: child transcripts are the cheaper judgement (an age
+	// window, no tree walk of its own), and what they reclaim may bring the
+	// artifact tree back under its ceiling on its own.
 	childTranscriptsModule,
+	// After the residue/empty/child-transcript classes: they reclaim by age and
+	// evidence first, and the cap class measures what is left against the tree's
+	// total-byte ceiling.
+	artifactTotalCapModule,
 	logsModule,
 	tmpRlmDirsModule,
 	tmpOtherDirsModule,
