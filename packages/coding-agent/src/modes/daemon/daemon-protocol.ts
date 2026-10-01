@@ -286,8 +286,25 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   rev-40 peer accepts the field and silently steers instead, so an explicit
 //   deliveryMode rides the new send_message_delivery_mode capability with the
 //   revision as its floor - the sender is refused rather than misdelivered.
-export const DAEMON_SCHEMA_REVISION = 41;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-41-ac8dd6b7277f";
+// Revision 42 adds the quota_park_status outbound event (wave-2 中断-10): a
+//   parked session (retry.provider.waitForUsage.pauseUntilReset, up to 24h) now
+//   emits a periodic per-session status - parked, resumeAt, remainingMs,
+//   parkCount, provider - so an attached client can render the wait instead of
+//   sitting silent. Backward-compatible addition in the rev-39
+//   empty_response_exhausted class: old clients have no case for the type and
+//   already ignore unknown outbound messages (daemon-client.ts handleLine
+//   dispatches them to listeners untouched), no command or required field
+//   changes, and the digest recomputation covers the union growth. The
+//   quota_park_status server capability advertises emission so a client checks
+//   before depending on the event; the event itself is unsequenced and
+//   self-healing (every tick carries the absolute resumeAt), so it stays out of
+//   the gap-detection family a missed heartbeat would needlessly trigger. The
+//   same window wires the long-declared optional deliveryMode through the
+//   supervisor's worker_deliver_message forward - the worker protocol type had
+//   the field since rev 41 and supervisor/worker are the same binary, so no
+//   wire shape moved for it.
+export const DAEMON_SCHEMA_REVISION = 42;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-42-1dca6160dd80";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -390,7 +407,13 @@ export type DaemonServerCapability =
 	// The daemon honors send_message.deliveryMode ("steer"/"follow_up"). Rev 41;
 	// older daemons accept the field and ignore it (always steering), so a client
 	// that sets it must check this capability first or be refused by the gate.
-	| "send_message_delivery_mode";
+	| "send_message_delivery_mode"
+	// The daemon emits quota_park_status events for sessions parked on a
+	// provider usage reset (rev 42): an immediate announce, a periodic heartbeat
+	// with the remaining wait, and one terminal parked:false. Optional and
+	// additive; clients check before depending on the event, and unknown-type
+	// tolerance already covers peers that never look.
+	| "quota_park_status";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -468,6 +491,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"stall_recovery_state",
 	"stall_action_bar",
 	"send_message_delivery_mode",
+	"quota_park_status",
 ];
 
 /**
@@ -1632,6 +1656,28 @@ export type DaemonOutbound =
 	| { type: "side_question_event"; activeSessionId: string; event: AgentConnectionSideQuestionEvent }
 	| { type: "session_status"; activeSessionId: string; recap?: string; meta?: DaemonEventMeta }
 	| {
+			/**
+			 * Quota-park heartbeat (rev 42, capability quota_park_status): a session
+			 * parked on a provider usage reset announces the park once, repeats it on
+			 * a slow interval while it lasts, and closes with one parked:false when
+			 * the park lifts. Unsequenced and self-healing - every tick carries the
+			 * absolute resumeAt, so a lost tick is repaired by the next and no gap
+			 * detection applies. resumeAt/remainingMs are absent only for a parked
+			 * session without a persisted park entry (in-memory sessions).
+			 */
+			type: "quota_park_status";
+			activeSessionId: string;
+			parked: boolean;
+			/** ISO wake time of the active park. */
+			resumeAt?: string;
+			/** Milliseconds until resumeAt, clamped at 0 while the wake is firing. */
+			remainingMs?: number;
+			/** How many times this session has parked in the current episode. */
+			parkCount?: number;
+			/** Provider whose usage limit caused the park. */
+			provider?: string;
+	  }
+	| {
 			type: "session_replaced";
 			activeSessionId: string;
 			state: AgentConnectionState;
@@ -1733,6 +1779,7 @@ export const DAEMON_OUTBOUND_COMPATIBILITY = {
 	session_event: LEGACY_DAEMON_COMMAND,
 	side_question_event: LEGACY_DAEMON_COMMAND,
 	session_status: LEGACY_DAEMON_COMMAND,
+	quota_park_status: { minProtocol: 7, minSchemaRevision: 42, capability: "quota_park_status" },
 	session_replaced: LEGACY_DAEMON_COMMAND,
 	session_resynced: LEGACY_DAEMON_COMMAND,
 	session_attached: LEGACY_DAEMON_COMMAND,

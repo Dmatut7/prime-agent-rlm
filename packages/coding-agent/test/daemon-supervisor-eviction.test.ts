@@ -598,6 +598,54 @@ describe("daemon supervisor whole-tree eviction", () => {
 		});
 	});
 
+	it("forwards the sender's deliveryMode on the cross-worker delivery", async () => {
+		// Wave-1 honored deliveryMode on the local path but the supervisor's
+		// worker_deliver_message forward dropped it, so a cross-worker follow_up
+		// silently steered (swarm-loop-plan wave-2, cross-batch leftover 3).
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const source = makeWorker("source", [makeSummary("source-active", now)]);
+		const target = makeWorker("target", [makeSummary("target-active", now)]);
+		target.descriptor.rootActiveSessionId = "target-active";
+		target.client!.requestWorker.mockResolvedValue({
+			type: "response",
+			command: "worker_deliver_message",
+			success: true,
+			data: { deliveryStatus: "queued" },
+		});
+		supervisor.workers.set("source", source);
+		supervisor.workers.set("target", target);
+		seedSupervisorRoster(supervisor, source);
+		seedSupervisorRoster(supervisor, target);
+		const client = { id: "sender", attachedActiveSessionIds: new Set<string>() };
+
+		const response = await supervisor.handleCommand(client, {
+			id: "message-follow-up",
+			type: "send_message",
+			targetActiveSessionId: "target-active",
+			fromActiveSessionId: "source-active",
+			message: "queue behind the running turn",
+			deliveryMode: "follow_up",
+		});
+
+		expect(target.client?.requestWorker).toHaveBeenCalledWith(
+			expect.objectContaining({
+				type: "worker_deliver_message",
+				targetActiveSessionId: "target-active",
+				message: "queue behind the running turn",
+				deliveryMode: "follow_up",
+			}),
+			freshLongTierBudget(),
+			expect.objectContaining({ onDispatch: expect.any(Function) }),
+		);
+		expect(response).toMatchObject({
+			success: true,
+			id: "message-follow-up",
+			command: "send_message",
+			data: { deliveryStatus: "queued" },
+		});
+	});
+
 	it("fails an unknown agent-message selector without forwarding it back to the worker", async () => {
 		const now = Date.parse("2026-08-01T12:00:00.000Z");
 		const supervisor = makeSupervisor();

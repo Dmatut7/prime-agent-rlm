@@ -7232,6 +7232,11 @@ export class DaemonSupervisor {
 			type: "worker_deliver_message",
 			targetActiveSessionId,
 			message: command.message,
+			// The client edge already gated an explicit deliveryMode behind
+			// send_message_delivery_mode (rev 41); dropping it here silently steered a
+			// cross-worker follow_up. Optional on the wire: a same-binary worker always
+			// understands it, and the field predates this wiring in the protocol type.
+			...(command.deliveryMode ? { deliveryMode: command.deliveryMode } : {}),
 			...(fromRelationship ? { fromRelationship } : {}),
 			sender: {
 				activeSessionId: senderKey,

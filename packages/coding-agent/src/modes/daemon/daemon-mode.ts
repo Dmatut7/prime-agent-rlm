@@ -254,6 +254,7 @@ import {
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
+import { type QuotaParkStatus, readQuotaParkStatus } from "./quota-park-status.js";
 import {
 	createRlmLedgerRegistrySeedSource,
 	type LegacyRlmSubagentRegistryEntry,
@@ -289,6 +290,7 @@ import {
 import { SupervisorLink } from "./supervisor-link.js";
 import { writeUpdateRestartManifestFile } from "./update-restart-manifest.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
+import { findUnconsumedWorkerRecoveryMarker, WORKER_RECOVERY_RESUME_PROMPT } from "./worker-recovery-resume.js";
 
 /**
  * Re-entry ceiling for one subagent hydration (M19). Unrelated to `RLM_MAX_DEPTH` on purpose:
@@ -339,6 +341,12 @@ const DAEMON_CHILD_STALL_NOTICE_MIN_INTERVAL_MS = 10 * 60_000;
  * hundreds of sessions pays only the map walk.
  */
 const STALL_RECOVERY_SWEEP_INTERVAL_MS = 15_000;
+/**
+ * 中断-10: cadence of the quota-park status heartbeat. A parked session is idle
+ * by definition, so a slow tick refreshes the client's remaining-time render;
+ * the park begin/lift itself is announced off session events, not this timer.
+ */
+const QUOTA_PARK_STATUS_INTERVAL_MS = 60_000;
 /**
  * r4 recovery-shell: how long the sweep watches after an action before the
  * one-time escalation notice. Still dead here means the intervention did not
@@ -761,6 +769,14 @@ export class AgentDaemon {
 	};
 	private rosterFlushScheduled = false;
 	private rosterHeartbeatTimer?: ReturnType<typeof setInterval>;
+	private quotaParkStatusTimer?: ReturnType<typeof setInterval>;
+	/**
+	 * Sessions whose quota park this daemon announced, keyed to the announced
+	 * wake: a resumeAt change re-announces, an unannounced park announces, a
+	 * lifted park closes with one parked:false. Presence, not the value, is the
+	 * "did we announce" fact (a parked in-memory session announces undefined).
+	 */
+	private readonly quotaParkAnnounced = new Map<string, number | undefined>();
 	private rlmSpawnLedgerInstance?: RlmSpawnLedger;
 	/** In-flight admission spawn appends, awaited (and consumed) by createRlmSubagentRuntime. */
 	private readonly pendingRlmSpawnAppends = new Map<string, Promise<void>>();
@@ -893,6 +909,16 @@ export class AgentDaemon {
 				});
 		}, STALL_RECOVERY_SWEEP_INTERVAL_MS);
 		this.stallRecoveryTimer.unref();
+		// The park heartbeat sweep is synchronous (a boolean gate plus one branch
+		// walk per parked session), so it needs no in-flight guard.
+		this.quotaParkStatusTimer = setInterval(() => {
+			try {
+				this.sweepQuotaParkStatus();
+			} catch (error) {
+				this.log(`quota park status sweep failed: ${String(error)}`);
+			}
+		}, QUOTA_PARK_STATUS_INTERVAL_MS);
+		this.quotaParkStatusTimer.unref();
 		this.startSupervisorMonitor();
 	}
 
@@ -1907,6 +1933,7 @@ export class AgentDaemon {
 			this.bindingCompletions.delete(state.activeSessionId);
 			completeBinding();
 		}
+		this.resumeWorkerInterruptedSession(state);
 		this.registerCronStoreForState(state);
 		this.rebindCronJobsToState(state);
 		if (runtime.metadata.kind !== "subagent") {
@@ -4388,6 +4415,9 @@ export class AgentDaemon {
 						// sender's session lives in another worker; without it this send
 						// reported no relationship and defeated every direction gate.
 						...(command.fromRelationship ? { fromRelationship: command.fromRelationship } : {}),
+						// The supervisor forwards the sender's deliveryMode verbatim; the
+						// client edge (send_message_delivery_mode, rev 41) already gated it.
+						...(command.deliveryMode ? { deliveryMode: command.deliveryMode } : {}),
 						origin: "agent",
 					});
 					this.writeWorkerSuccess(client, command, receipt);
@@ -7431,6 +7461,7 @@ export class AgentDaemon {
 		descendantCollector?: Set<ActiveSessionState>,
 		disposal?: AgentSessionRuntimeDisposeOptions,
 	): Promise<void> {
+		this.quotaParkAnnounced.delete(state.activeSessionId);
 		this.abortWaitingPromptAdmissionsForSession(state.activeSessionId);
 		for (const client of state.clients) {
 			this.abortSideQuestionsFor(client, state.activeSessionId);
@@ -7732,6 +7763,126 @@ export class AgentDaemon {
 				this.writeSerialized(client, serialized, sequencedMessage);
 			}
 		}
+		if (message.type === "session_event") {
+			// auto_retry_end is where a park begins, turn traffic is where one
+			// lifts: announce off the event so the first status does not wait a
+			// full heartbeat interval.
+			this.noteQuotaParkTransition(state);
+		}
+	}
+
+	/**
+	 * Event-driven half of the quota-park heartbeat (中断-10): announce a park
+	 * when it begins or its wake moves, close it once when it lifts. The
+	 * periodic sweep (sweepQuotaParkStatus) owns the steady-state heartbeat and
+	 * the transitions no session event marks (a park restored at bind).
+	 */
+	private noteQuotaParkTransition(state: ActiveSessionState): void {
+		if (this.shuttingDown || this.closingSessions.has(state.activeSessionId)) {
+			return;
+		}
+		let status: ReturnType<typeof readQuotaParkStatus>;
+		try {
+			status = readQuotaParkStatus(state.runtime.session);
+		} catch {
+			// A session mid-teardown offers no branch; closeSession drops the announce.
+			return;
+		}
+		const wasAnnounced = this.quotaParkAnnounced.has(state.activeSessionId);
+		if (status === undefined) {
+			if (wasAnnounced) {
+				this.quotaParkAnnounced.delete(state.activeSessionId);
+				this.broadcastToSession(state, {
+					type: "quota_park_status",
+					activeSessionId: state.activeSessionId,
+					parked: false,
+				});
+			}
+			return;
+		}
+		if (!wasAnnounced || this.quotaParkAnnounced.get(state.activeSessionId) !== status.resumeAtMs) {
+			this.quotaParkAnnounced.set(state.activeSessionId, status.resumeAtMs);
+			this.emitQuotaParkStatus(state, status);
+		}
+	}
+
+	/** Slow heartbeat while a park lasts: refreshes remainingMs for attached clients. */
+	private sweepQuotaParkStatus(): void {
+		if (this.shuttingDown) {
+			return;
+		}
+		for (const state of [...this.sessions.values()]) {
+			if (this.closingSessions.has(state.activeSessionId)) {
+				continue;
+			}
+			let status: ReturnType<typeof readQuotaParkStatus>;
+			try {
+				status = readQuotaParkStatus(state.runtime.session);
+			} catch {
+				continue;
+			}
+			if (status === undefined) {
+				if (this.quotaParkAnnounced.delete(state.activeSessionId)) {
+					this.broadcastToSession(state, {
+						type: "quota_park_status",
+						activeSessionId: state.activeSessionId,
+						parked: false,
+					});
+				}
+				continue;
+			}
+			this.quotaParkAnnounced.set(state.activeSessionId, status.resumeAtMs);
+			this.emitQuotaParkStatus(state, status);
+		}
+	}
+
+	private emitQuotaParkStatus(state: ActiveSessionState, status: QuotaParkStatus): void {
+		this.broadcastToSession(state, {
+			type: "quota_park_status",
+			activeSessionId: state.activeSessionId,
+			parked: true,
+			...(status.resumeAtMs !== undefined
+				? {
+						resumeAt: new Date(status.resumeAtMs).toISOString(),
+						// Clamped at 0: a wake firing right now is "resuming", not overdue.
+						remainingMs: Math.max(0, status.resumeAtMs - Date.now()),
+					}
+				: {}),
+			...(status.parkCount !== undefined ? { parkCount: status.parkCount } : {}),
+			...(status.provider !== undefined ? { provider: status.provider } : {}),
+		});
+	}
+
+	/**
+	 * 中断-6: a worker that died mid-turn leaves a prime-agent.worker_recovery
+	 * marker on the transcript (the supervisor's catalog writes it from the dead
+	 * worker's recovery-journal busy records), and until now nothing consumed it
+	 * - the session reopened and the interrupted turn was simply never resumed.
+	 * A marker that is still the transcript tail on bind queues one resume
+	 * prompt; the prompt lands as a user message, which consumes the marker, so
+	 * this fires once per worker death. See worker-recovery-resume.ts.
+	 */
+	private resumeWorkerInterruptedSession(state: ActiveSessionState): void {
+		let marker: ReturnType<typeof findUnconsumedWorkerRecoveryMarker>;
+		try {
+			marker = findUnconsumedWorkerRecoveryMarker(state.runtime.session.sessionManager.getBranch());
+		} catch {
+			return;
+		}
+		if (marker === undefined) {
+			return;
+		}
+		this.log(
+			`session ${state.activeSessionId} carries an unconsumed worker-recovery marker; queueing the automatic resume`,
+		);
+		void state.runtime.session.followUp(WORKER_RECOVERY_RESUME_PROMPT, undefined, { resumeIfIdle: true }).then(
+			(queued) => {
+				if (!queued) {
+					this.log(`worker-recovery resume for ${state.activeSessionId} was not admitted`);
+				}
+			},
+			(error) => this.log(`could not queue worker-recovery resume for ${state.activeSessionId}: ${String(error)}`),
+		);
 	}
 
 	/**
@@ -9099,6 +9250,10 @@ export class AgentDaemon {
 		if (this.stallRecoveryTimer) {
 			clearInterval(this.stallRecoveryTimer);
 			this.stallRecoveryTimer = undefined;
+		}
+		if (this.quotaParkStatusTimer) {
+			clearInterval(this.quotaParkStatusTimer);
+			this.quotaParkStatusTimer = undefined;
 		}
 		this.log(`shutting down (exit ${exitCode}); closing ${this.sessions.size} active session(s)`);
 		const closingReason = this.getShutdownClosingReason();

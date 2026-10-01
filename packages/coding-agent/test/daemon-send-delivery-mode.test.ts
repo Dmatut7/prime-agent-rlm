@@ -49,16 +49,19 @@ describe("send_message deliveryMode compatibility gate", () => {
 		expect(compatibilities.length).toBe(2);
 		expect(compatibilities[0]).toEqual({
 			minProtocol: DAEMON_PROTOCOL_VERSION,
-			minSchemaRevision: DAEMON_SCHEMA_REVISION,
+			// Pinned at the introducing revision: later windows must not raise the
+			// floor, or a rev-41 daemon that honors the field would be refused.
+			minSchemaRevision: 41,
 			capability: "send_message_delivery_mode",
 		});
+		expect(DAEMON_SCHEMA_REVISION).toBeGreaterThanOrEqual(41);
 	});
 
 	it("refuses an explicit delivery mode against a rev-40 daemon without the capability", () => {
 		const requirement = getDaemonCommandCompatibilities(sendMessage("follow_up"))[0]!;
 		const oldDaemonHello = {
 			protocol: DAEMON_PROTOCOL_INFO,
-			schemaRevision: DAEMON_SCHEMA_REVISION - 1,
+			schemaRevision: 40,
 			serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES.filter(
 				(capability) => capability !== "send_message_delivery_mode",
 			),
@@ -71,7 +74,7 @@ describe("send_message deliveryMode compatibility gate", () => {
 		const requirement = getDaemonCommandCompatibilities(sendMessage("follow_up"))[0]!;
 		const newDaemonHello = {
 			protocol: DAEMON_PROTOCOL_INFO,
-			schemaRevision: DAEMON_SCHEMA_REVISION,
+			schemaRevision: 41,
 			serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
 		};
 
