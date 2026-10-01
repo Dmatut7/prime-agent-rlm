@@ -198,6 +198,25 @@ describe("empty-turn retry policy", () => {
 		expect(assistant.errorMessage).toMatch(/budget/i);
 	});
 
+	it("maxAttempts 1 disables the whole ladder, slow tier included", async () => {
+		const { streamFn, calls, gapsMs } = emptyStreamFn();
+		const startedAt = Date.now();
+
+		// No escalatedAttempts override on purpose: the default slow tier (3 attempts at
+		// 30s+) must not run behind a single-attempt policy - the documented "1 disables
+		// retrying" contract covers every in-place resend.
+		const { assistant } = await run({ emptyTurnRetry: { maxAttempts: 1 } }, streamFn);
+
+		expect(calls()).toBe(1);
+		expect(gapsMs()).toHaveLength(0);
+		expect(Date.now() - startedAt).toBeLessThan(5_000);
+		expect(isEmptyTurnRetryExhausted(assistant)).toBe(true);
+		const details = emptyExhaustionDiagnostic(assistant);
+		expect(details.attempts).toBe(1);
+		expect(details.escalatedAttempts).toBe(0);
+		expect(details.terminatedBy).toBe("attempts");
+	});
+
 	it("does not wait when a single attempt is configured", async () => {
 		const { streamFn, calls, gapsMs } = emptyStreamFn();
 		const startedAt = Date.now();
@@ -328,7 +347,9 @@ describe("empty-turn retry escalated slow tier", () => {
 		const { assistant } = await run(
 			{
 				emptyTurnRetry: {
-					maxAttempts: 1,
+					maxAttempts: 2,
+					baseDelayMs: 1,
+					maxDelayMs: 5,
 					escalatedAttempts: 2,
 					// The reviewer's probe shape: base 400 above cap 50 must not
 					// resolve to a 400ms wait.
@@ -339,9 +360,9 @@ describe("empty-turn retry escalated slow tier", () => {
 			streamFn,
 		);
 
-		expect(calls()).toBe(3); // 1 fast + 2 slow
+		expect(calls()).toBe(4); // 2 fast + 2 slow
 		const gaps = gapsMs();
-		expect(gaps).toHaveLength(2);
+		expect(gaps).toHaveLength(3);
 		for (const gap of gaps) {
 			expect(gap).toBeLessThanOrEqual(60); // 50ms cap plus scheduler slack
 		}
@@ -355,7 +376,9 @@ describe("empty-turn retry escalated slow tier", () => {
 		const { assistant } = await run(
 			{
 				emptyTurnRetry: {
-					maxAttempts: 1,
+					maxAttempts: 2,
+					baseDelayMs: 1,
+					maxDelayMs: 5,
 					escalatedAttempts: 2,
 					escalatedBaseDelayMs: 400,
 					escalatedMaxDelayMs: 50,
@@ -366,7 +389,7 @@ describe("empty-turn retry escalated slow tier", () => {
 			streamFn,
 		);
 
-		expect(calls()).toBe(3);
+		expect(calls()).toBe(4);
 		for (const gap of gapsMs()) {
 			expect(gap).toBeLessThanOrEqual(55); // the 45ms clamp plus scheduler slack
 		}
@@ -413,7 +436,9 @@ describe("empty-turn retry escalated slow tier", () => {
 		const { assistant } = await run(
 			{
 				emptyTurnRetry: {
-					maxAttempts: 1,
+					maxAttempts: 2,
+					baseDelayMs: 1,
+					maxDelayMs: 5,
 					escalatedAttempts: 2,
 					// The next slow wait would be 60s: the abort must cut through it.
 					escalatedBaseDelayMs: 60_000,
@@ -425,7 +450,7 @@ describe("empty-turn retry escalated slow tier", () => {
 		);
 
 		expect(Date.now() - startedAt).toBeLessThan(5_000);
-		expect(calls()).toBeLessThanOrEqual(2);
+		expect(calls()).toBeLessThanOrEqual(3);
 		expect(assistant.stopReason).toBe("aborted");
 		expect(isEmptyTurnRetryExhausted(assistant)).toBe(false);
 	});

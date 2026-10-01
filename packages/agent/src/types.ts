@@ -115,6 +115,9 @@ export interface ShouldStopAfterTurnContext {
 
 export type GetContinuationMessagesContext = ShouldStopAfterTurnContext;
 
+/** Which poll channel produced a batch handed back through `onUndeliveredMessages`. */
+export type UndeliveredMessageSource = "steering" | "followUp" | "continuation";
+
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
 
@@ -258,6 +261,21 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	getContinuationMessages?: (context: GetContinuationMessagesContext, signal?: AbortSignal) => Promise<AgentMessage[]>;
 
 	/**
+	 * Hand-back point for messages a poll produced but the run will not consume.
+	 *
+	 * Polls (`getSteeringMessages`, `getFollowUpMessages`, `getContinuationMessages`)
+	 * spend their products as they produce them - a drained queue, a consumed
+	 * one-shot budget. When the run is aborted while a poll is in flight, or dies
+	 * before injecting the polled messages, the loop used to drop those products
+	 * silently. It now calls this hook with them instead, exactly once per lost
+	 * batch, so the host can re-queue, persist, or un-spend them.
+	 *
+	 * Contract: must not throw or reject. The loop does not await the hook (it runs
+	 * on the abort/exit path), so it should be fast and side-effect-only.
+	 */
+	onUndeliveredMessages?: (messages: AgentMessage[], source: UndeliveredMessageSource) => void | Promise<void>;
+
+	/**
 	 * Tool execution mode. Defaults to `"parallel"`.
 	 * Parallel mode preflights calls sequentially, executes allowed calls concurrently, emits
 	 * `tool_execution_end` in completion order, then emits tool-result messages in assistant source order.
@@ -304,7 +322,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * calls). The loop retries with an exponential wait between attempts and reports
 	 * the terminal failure through `stopReason: "error"` plus a diagnostic.
 	 *
-	 * `maxAttempts` is the total number of provider calls (1 disables retrying);
+	 * `maxAttempts` is the total number of provider calls before the escalated slow
+	 * tier; `1` disables all in-place retrying, slow tier included;
 	 * `baseDelayMs` doubles per attempt and is clamped by `maxDelayMs`;
 	 * `maxTotalDelayMs` bounds the whole turn and, when reached, ends the retries
 	 * early with the budget named as the reason. Unset fields use
@@ -324,7 +343,10 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 
 /** Backoff budget for the loop's empty-turn retries; see `AgentLoopConfig.emptyTurnRetry`. */
 export interface EmptyTurnRetryConfig {
-	/** Total provider attempts for one turn while replies stay empty. */
+	/**
+	 * Total provider attempts for one turn while replies stay empty, before the
+	 * escalated slow tier. `1` disables every in-place retry, slow tier included.
+	 */
 	maxAttempts?: number;
 	/** First (and doubling base) wait between attempts, in ms. `0` means no gap. */
 	baseDelayMs?: number;
@@ -337,6 +359,7 @@ export interface EmptyTurnRetryConfig {
 	 * this many more times with much longer waits, for providers whose empty turns
 	 * mean a queue that clears in minutes, not milliseconds. `0` disables the tier
 	 * (the previous behavior); unset uses `ESCALATED_EMPTY_TURN_RETRY_DEFAULTS`.
+	 * Inert when `maxAttempts` is 1: a single-attempt policy disables the whole ladder.
 	 */
 	escalatedAttempts?: number;
 	/** First (and doubling base) slow-tier wait, in ms. */

@@ -128,6 +128,9 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 		};
 
 		let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+		// A terminal done/error event is what settles result(); a clean EOF without one
+		// would leave result() pending forever, so the EOF path must close as an error.
+		let sawTerminalEvent = false;
 
 		const abortHandler = () => {
 			if (reader) {
@@ -190,6 +193,9 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 							const proxyEvent = JSON.parse(data) as ProxyAssistantMessageEvent;
 							const event = processProxyEvent(proxyEvent, partial);
 							if (event) {
+								if (event.type === "done" || event.type === "error") {
+									sawTerminalEvent = true;
+								}
 								stream.push(event);
 							}
 						}
@@ -199,6 +205,19 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 
 			if (options.signal?.aborted) {
 				throw new Error("Request aborted by user");
+			}
+
+			if (!sawTerminalEvent) {
+				// The server closed the connection before the terminal event (crash,
+				// middleware cutoff): end the stream as an explicit error instead of
+				// leaving result() pending forever.
+				partial.stopReason = "error";
+				partial.errorMessage = "Proxy stream ended without a terminal done/error event";
+				stream.push({
+					type: "error",
+					reason: "error",
+					error: partial,
+				});
 			}
 
 			stream.end();

@@ -710,7 +710,7 @@ describe("Agent", () => {
 		]);
 	});
 
-	it("removes a whole queued batch when one message matches", () => {
+	it("removes only the matching messages from a queued batch", () => {
 		const agent = new Agent();
 		const prefix = { role: "user" as const, content: "Prefix", timestamp: Date.now() };
 		const prompt = { role: "user" as const, content: "Prompt", timestamp: Date.now() + 1 };
@@ -718,8 +718,11 @@ describe("Agent", () => {
 		agent.followUp([prefix, prompt]);
 		agent.followUp(next);
 
-		expect(agent.removeQueuedMessages((message) => message === prompt)).toEqual([prefix, prompt]);
+		// Per-message removal: the batch-mate keeps its place instead of riding along.
+		expect(agent.removeQueuedMessages((message) => message === prompt)).toEqual([prompt]);
 		expect(agent.hasQueuedMessages()).toBe(true);
+		expect(agent.removeQueuedMessages(() => true)).toEqual([prefix, next]);
+		expect(agent.hasQueuedMessages()).toBe(false);
 	});
 
 	it("forwards sessionId to streamFn options", async () => {

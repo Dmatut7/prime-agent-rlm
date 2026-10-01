@@ -9,6 +9,7 @@ import {
 	appendAssistantMessageDiagnostic,
 	type Context,
 	classifyStreamFailure,
+	createAssistantMessageDiagnostic,
 	EventStream,
 	getProviderRequestBudget,
 	type ImageContent,
@@ -33,6 +34,7 @@ import type {
 	EmptyTurnRetryConfig,
 	StreamFn,
 	ToolTimeoutVerdict,
+	UndeliveredMessageSource,
 } from "./types.js";
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
@@ -494,16 +496,96 @@ function createStalledAssistantMessage(
 	return message;
 }
 
+/**
+ * Synthesized terminal message for a run that died from a non-abort failure the
+ * loop could not place (host hook violation, stream machinery). Mirrors the shape
+ * `Agent.handleRunFailure` produces so consumers see one failure convention.
+ */
+function createRunFailureAssistantMessage(config: AgentLoopConfig, error: unknown): AssistantMessage {
+	const message: AssistantMessage = {
+		role: "assistant",
+		content: [{ type: "text", text: "" }],
+		api: config.model.api,
+		provider: config.model.provider,
+		model: config.model.id,
+		usage: cloneUsage(EMPTY_USAGE),
+		stopReason: "error",
+		errorMessage: error instanceof Error ? error.message : String(error),
+		timestamp: Date.now(),
+	};
+	appendAssistantMessageDiagnostic(
+		message,
+		createAssistantMessageDiagnostic("agent_lifecycle_failure", error, { source: "agent_loop_stream" }),
+	);
+	return message;
+}
+
+/**
+ * Sentinel for the EOF race below: an already-settled `result()` wins the race
+ * deterministically, so a race that resolves with the sentinel means the result
+ * promise was still pending when the iterator completed.
+ */
+const STREAM_RESULT_PENDING: unique symbol = Symbol("streamResultPending");
+const STREAM_RESULT_PENDING_PROMISE = Promise.resolve(STREAM_RESULT_PENDING);
+
+/**
+ * Synthetic `stopReasonRaw` for a provider stream whose iterator completed without
+ * a terminal done/error event. Not a provider value: the loop synthesizes it when
+ * `result()` is still pending at EOF, which for an EventStream means it would
+ * never settle (`end()` without a result) - a hang, not an answer.
+ */
+export const STREAM_EOF_STOP_REASON_RAW = "stream_ended_without_terminal_event";
+
+/** Whether a message is the synthesized bare-EOF stream failure. */
+export function isStreamEofFailure(message: AssistantMessage): boolean {
+	return message.stopReason === "error" && message.stopReasonRaw === STREAM_EOF_STOP_REASON_RAW;
+}
+
+function createStreamEofAssistantMessage(
+	config: AgentLoopConfig,
+	partialMessage: AssistantMessage | null,
+): AssistantMessage {
+	return {
+		role: "assistant",
+		content: partialMessage ? cloneAssistantContent(partialMessage.content) : [{ type: "text", text: "" }],
+		api: partialMessage?.api ?? config.model.api,
+		provider: partialMessage?.provider ?? config.model.provider,
+		model: partialMessage?.model ?? config.model.id,
+		usage: cloneUsage(partialMessage?.usage ?? EMPTY_USAGE),
+		stopReason: "error",
+		stopReasonRaw: STREAM_EOF_STOP_REASON_RAW,
+		errorMessage:
+			"The provider stream ended without a terminal done/error event, so the response is incomplete and its final state is unknown. " +
+			"This usually indicates a dropped connection or a proxy/middleware that closed the stream early; retrying the turn normally succeeds.",
+		timestamp: Date.now(),
+	};
+}
+
 function endAgentStreamOnError(
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 	promise: Promise<AgentMessage[]>,
+	config: AgentLoopConfig,
 ): void {
 	void promise.then(
 		(messages) => {
 			stream.end(messages);
 		},
-		() => {
-			stream.end([]);
+		(error: unknown) => {
+			// The abort path keeps its pinned shape: the stream ends with an empty
+			// result and no agent_end.
+			if (isAbortError(error)) {
+				stream.end([]);
+				return;
+			}
+			// Any other failure must not end the stream as if the run had completed
+			// with no output: surface it as a terminal agent_end carrying a synthesized
+			// error message, so both for-await consumers and result() awaiters can
+			// tell the run failed - and why.
+			const message = createRunFailureAssistantMessage(config, error);
+			stream.push({ type: "message_start", message });
+			stream.push({ type: "message_end", message });
+			stream.push({ type: "agent_end", messages: [message] });
+			stream.end();
 		},
 	);
 }
@@ -511,11 +593,36 @@ function endAgentStreamOnError(
 async function pollMessagesUnlessAborted(
 	poll: (() => AgentMessage[] | Promise<AgentMessage[]>) | undefined,
 	signal: AbortSignal | undefined,
+	onLateProducts?: (messages: AgentMessage[]) => void,
 ): Promise<AgentMessage[]> {
 	if (!poll || signal?.aborted) {
 		return [];
 	}
-	return (await maybePromiseWithAbort(poll(), signal)) || [];
+	// The poll spends its products as it runs (a drained queue, a consumed one-shot
+	// budget). When the abort wins the race below the poll can still settle with
+	// products afterwards; they must go back to the host, not vanish. Delivery is
+	// marked inside the raced chain itself so the late-check can never run before it.
+	let outcome: "pending" | "delivered" | "aborted" = "pending";
+	const polled = Promise.resolve(poll()).then((messages) => messages ?? []);
+	const raced = raceWithAbort(
+		polled.then((messages) => {
+			if (outcome === "pending") outcome = "delivered";
+			return messages;
+		}),
+		signal,
+		() => {
+			if (outcome === "pending") outcome = "aborted";
+		},
+	);
+	void polled.then(
+		(messages) => {
+			if (outcome !== "delivered" && messages.length > 0) {
+				onLateProducts?.(messages);
+			}
+		},
+		() => undefined,
+	);
+	return raced;
 }
 
 /**
@@ -543,6 +650,7 @@ export function agentLoop(
 			signal,
 			streamFn,
 		),
+		config,
 	);
 
 	return stream;
@@ -583,6 +691,7 @@ export function agentLoopContinue(
 			signal,
 			streamFn,
 		),
+		config,
 	);
 
 	return stream;
@@ -648,151 +757,197 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 async function runLoop(
 	currentContext: AgentContext,
 	newMessages: AgentMessage[],
-	config: AgentLoopConfig,
+	configInput: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFn?: StreamFn,
 ): Promise<void> {
+	// The loop retargets model/reasoning/serviceTier as the run moves between
+	// models; work on a copy so a caller that reuses its config object across runs
+	// never inherits the previous run's last switch.
+	const config: AgentLoopConfig = { ...configInput };
 	let firstTurn = true;
 	let lastTurn: Parameters<NonNullable<AgentLoopConfig["getContinuationMessages"]>>[0] | undefined;
-	let pendingMessages: AgentMessage[] = await pollMessagesUnlessAborted(config.getSteeringMessages, signal);
+
+	// Products a poll already produced but this run will not consume (the abort won
+	// the race, or the run died before injecting them) go back to the host: the poll
+	// spent them (drained queue, burned one-shot budget), so dropping them here
+	// would lose user input without a trace.
+	const handBackUndelivered = (messages: AgentMessage[], source: UndeliveredMessageSource): void => {
+		if (messages.length === 0) return;
+		const hook = config.onUndeliveredMessages;
+		if (!hook) return;
+		try {
+			void Promise.resolve(hook(messages, source)).catch(() => undefined);
+		} catch {
+			// The hook contract is must-not-throw; a broken hook must not break the exit path.
+		}
+	};
+	const pollSteering = (): Promise<AgentMessage[]> =>
+		pollMessagesUnlessAborted(config.getSteeringMessages, signal, (messages) =>
+			handBackUndelivered(messages, "steering"),
+		);
+	const pollFollowUp = (): Promise<AgentMessage[]> =>
+		pollMessagesUnlessAborted(config.getFollowUpMessages, signal, (messages) =>
+			handBackUndelivered(messages, "followUp"),
+		);
+	const pollContinuation = (
+		turn: Parameters<NonNullable<AgentLoopConfig["getContinuationMessages"]>>[0] | undefined,
+	): Promise<AgentMessage[]> =>
+		pollMessagesUnlessAborted(
+			turn ? () => config.getContinuationMessages?.(turn, signal) ?? [] : undefined,
+			signal,
+			(messages) => handBackUndelivered(messages, "continuation"),
+		);
+
+	let pendingMessages: AgentMessage[] = [];
+	let pendingSource: UndeliveredMessageSource = "steering";
 
 	const shouldStopBeforeTurn = (): boolean => !firstTurn && (config.shouldStopBeforeTurn?.() ?? false);
 
-	while (true) {
-		throwIfAborted(signal);
-		let hasMoreToolCalls = true;
-
-		while (hasMoreToolCalls || pendingMessages.length > 0) {
-			throwIfAborted(signal);
-			if (!firstTurn) {
-				await emit({ type: "turn_start" });
-			} else {
-				firstTurn = false;
-			}
-
-			if (pendingMessages.length > 0) {
-				for (const message of pendingMessages) {
-					await emit({ type: "message_start", message });
-					await emit({ type: "message_end", message });
-					currentContext.messages.push(message);
-					newMessages.push(message);
-				}
-				pendingMessages = [];
-			}
-
-			const nextModel = config.takeNextTurnModel?.();
-			if (nextModel) {
-				config.model = nextModel.model;
-				config.reasoning = nextModel.reasoning;
-				config.serviceTier = nextModel.serviceTier;
-			}
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+	// Delivers polled messages one at a time, keeping the not-yet-delivered remainder
+	// in pendingMessages so a failure mid-batch hands it back instead of losing it.
+	const deliverPendingMessages = async (): Promise<void> => {
+		const delivering = pendingMessages;
+		for (let index = 0; index < delivering.length; index += 1) {
+			const message = delivering[index]!;
+			await emit({ type: "message_start", message });
+			await emit({ type: "message_end", message });
+			currentContext.messages.push(message);
 			newMessages.push(message);
+			pendingMessages = delivering.slice(index + 1);
+		}
+	};
 
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
-				await emit({ type: "turn_end", message, toolResults: [] });
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
-			}
+	try {
+		pendingMessages = await pollSteering();
 
-			const toolCalls = message.content.filter((c) => c.type === "toolCall");
+		while (true) {
+			throwIfAborted(signal);
+			let hasMoreToolCalls = true;
 
-			const toolResults: ToolResultMessage[] = [];
-			hasMoreToolCalls = false;
-			if (toolCalls.length > 0) {
-				const executedToolBatch = await executeToolCalls(currentContext, message, config, signal, emit);
-				toolResults.push(...executedToolBatch.messages);
-				hasMoreToolCalls = !executedToolBatch.terminate;
+			while (hasMoreToolCalls || pendingMessages.length > 0) {
+				throwIfAborted(signal);
+				if (!firstTurn) {
+					await emit({ type: "turn_start" });
+				} else {
+					firstTurn = false;
+				}
 
-				for (const result of toolResults) {
-					currentContext.messages.push(result);
-					newMessages.push(result);
+				if (pendingMessages.length > 0) {
+					await deliverPendingMessages();
+				}
+
+				const nextModel = config.takeNextTurnModel?.();
+				if (nextModel) {
+					config.model = nextModel.model;
+					config.reasoning = nextModel.reasoning;
+					config.serviceTier = nextModel.serviceTier;
+				}
+				const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+				newMessages.push(message);
+
+				if (message.stopReason === "error" || message.stopReason === "aborted") {
+					await emit({ type: "turn_end", message, toolResults: [] });
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
+
+				const toolCalls = message.content.filter((c) => c.type === "toolCall");
+
+				const toolResults: ToolResultMessage[] = [];
+				hasMoreToolCalls = false;
+				if (toolCalls.length > 0) {
+					const executedToolBatch = await executeToolCalls(currentContext, message, config, signal, emit);
+					toolResults.push(...executedToolBatch.messages);
+					hasMoreToolCalls = !executedToolBatch.terminate;
+
+					for (const result of toolResults) {
+						currentContext.messages.push(result);
+						newMessages.push(result);
+					}
+				}
+
+				await emit({ type: "turn_end", message, toolResults });
+				if (signal?.aborted) {
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
+				lastTurn = {
+					message,
+					toolResults,
+					context: currentContext,
+					newMessages,
+				};
+
+				const shouldStopResult = await settlePostTurn(
+					maybePromiseWithAbort(
+						config.shouldStopAfterTurn?.({
+							message,
+							toolResults,
+							context: currentContext,
+							newMessages,
+						}) ?? false,
+						signal,
+					),
+					signal,
+				);
+				if (shouldStopResult.status === "aborted") {
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
+				if (shouldStopResult.value || shouldStopBeforeTurn()) {
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
+
+				const steeringMessagesResult = await settlePostTurn(pollSteering(), signal);
+				if (steeringMessagesResult.status === "aborted") {
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
+				pendingMessages = steeringMessagesResult.value;
+				pendingSource = "steering";
+				// Steering drained by this poll owns the turn boundary; stop only when it was empty.
+				if (pendingMessages.length === 0 && shouldStopBeforeTurn()) {
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
 				}
 			}
 
-			await emit({ type: "turn_end", message, toolResults });
-			if (signal?.aborted) {
+			if (shouldStopBeforeTurn()) break;
+			const followUpMessagesResult = await settlePostTurn(pollFollowUp(), signal);
+			if (followUpMessagesResult.status === "aborted") {
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}
-			lastTurn = {
-				message,
-				toolResults,
-				context: currentContext,
-				newMessages,
-			};
+			const followUpMessages = followUpMessagesResult.value;
+			if (followUpMessages.length > 0) {
+				pendingMessages = followUpMessages;
+				pendingSource = "followUp";
+				continue;
+			}
 
-			const shouldStopResult = await settlePostTurn(
-				maybePromiseWithAbort(
-					config.shouldStopAfterTurn?.({
-						message,
-						toolResults,
-						context: currentContext,
-						newMessages,
-					}) ?? false,
-					signal,
-				),
-				signal,
-			);
-			if (shouldStopResult.status === "aborted") {
+			if (shouldStopBeforeTurn()) break;
+			const continuationMessagesResult = await settlePostTurn(pollContinuation(lastTurn), signal);
+			if (continuationMessagesResult.status === "aborted") {
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}
-			if (shouldStopResult.value || shouldStopBeforeTurn()) {
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
+			const continuationMessages = continuationMessagesResult.value;
+			if (continuationMessages.length > 0) {
+				pendingMessages = continuationMessages;
+				pendingSource = "continuation";
+				continue;
 			}
 
-			const steeringMessagesResult = await settlePostTurn(
-				pollMessagesUnlessAborted(config.getSteeringMessages, signal),
-				signal,
-			);
-			if (steeringMessagesResult.status === "aborted") {
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
-			}
-			pendingMessages = steeringMessagesResult.value;
-			// Steering drained by this poll owns the turn boundary; stop only when it was empty.
-			if (pendingMessages.length === 0 && shouldStopBeforeTurn()) {
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
-			}
+			break;
 		}
-
-		if (shouldStopBeforeTurn()) break;
-		const followUpMessagesResult = await settlePostTurn(
-			pollMessagesUnlessAborted(config.getFollowUpMessages, signal),
-			signal,
-		);
-		if (followUpMessagesResult.status === "aborted") {
-			await emit({ type: "agent_end", messages: newMessages });
-			return;
-		}
-		const followUpMessages = followUpMessagesResult.value;
-		if (followUpMessages.length > 0) {
-			pendingMessages = followUpMessages;
-			continue;
-		}
-
-		if (shouldStopBeforeTurn()) break;
-		const continuationMessagesResult = lastTurn
-			? await settlePostTurn(
-					maybePromiseWithAbort(config.getContinuationMessages?.(lastTurn, signal) ?? [], signal),
-					signal,
-				)
-			: ({ status: "completed", value: [] } satisfies PostTurnResult<AgentMessage[]>);
-		if (continuationMessagesResult.status === "aborted") {
-			await emit({ type: "agent_end", messages: newMessages });
-			return;
-		}
-		const continuationMessages = continuationMessagesResult.value || [];
-		if (continuationMessages.length > 0) {
-			pendingMessages = continuationMessages;
-			continue;
-		}
-
-		break;
+	} catch (error) {
+		// The run died with polled-but-undelivered messages in hand: they never
+		// reached the context, so hand them back instead of dropping them.
+		handBackUndelivered(pendingMessages, pendingSource);
+		throw error;
 	}
 
 	await emit({ type: "agent_end", messages: newMessages });
@@ -867,10 +1022,15 @@ function resolveEmptyTurnRetryPolicy(options?: EmptyTurnRetryConfig): {
 	// The slow tier is an extension of the attempt count, not a second retry loop:
 	// its waits budget separately from the fast tier's so a small fast budget cannot
 	// starve it and a long slow wait cannot exceed the fast tier's cap.
-	const escalatedAttempts = Math.max(
-		0,
-		Math.floor(options?.escalatedAttempts ?? ESCALATED_EMPTY_TURN_RETRY_DEFAULTS.escalatedAttempts),
-	);
+	//
+	// `maxAttempts: 1` is documented as disabling retrying, and the slow tier IS a
+	// retry: a single-attempt policy collapses the whole ladder, not just the fast
+	// tier. (Previously a lone `maxAttempts: 1` still escalated into the default
+	// three slow-tier resends with tens-of-seconds waits.)
+	const escalatedAttempts =
+		maxAttempts <= 1
+			? 0
+			: Math.max(0, Math.floor(options?.escalatedAttempts ?? ESCALATED_EMPTY_TURN_RETRY_DEFAULTS.escalatedAttempts));
 	const escalatedClampMs =
 		typeof options?.escalatedMaxDelayClampMs === "number" && options.escalatedMaxDelayClampMs > 0
 			? options.escalatedMaxDelayClampMs
@@ -1340,6 +1500,16 @@ async function runAssistantStreamAttempt(
 		// twice (appendMessage has no dedupe) and double-fired extension handlers.
 		return finalMessage;
 	};
+	const finishEofMessage = async () => {
+		const finalMessage = createStreamEofAssistantMessage(config, partialMessage);
+		if (addedPartial) {
+			context.messages[context.messages.length - 1] = finalMessage;
+		} else {
+			context.messages.push(finalMessage);
+			await emit({ type: "message_start", message: { ...finalMessage } });
+		}
+		return finalMessage;
+	};
 
 	try {
 		throwIfAborted(signal);
@@ -1454,7 +1624,20 @@ async function runAssistantStreamAttempt(
 			}
 		}
 
-		const finalMessage = normalizeToolCallIds(await maybePromiseWithAbort(response.result(), signal));
+		// The iterator completed without a terminal done/error event. A well-formed
+		// stream settles result() together with its terminal push, so an already-settled
+		// result wins this race deterministically and a still-pending one never settles
+		// at all (EventStream.end() without a result) - and the stall timer is already
+		// disarmed, so awaiting it would hang the turn with no watchdog left. Treat the
+		// bare EOF as the stream failure it is.
+		const eofOutcome = await Promise.race([response.result(), STREAM_RESULT_PENDING_PROMISE]);
+		if (eofOutcome === STREAM_RESULT_PENDING) {
+			if (signal?.aborted) {
+				return finishAbortedMessage();
+			}
+			return finishEofMessage();
+		}
+		const finalMessage = normalizeToolCallIds(eofOutcome);
 		if (addedPartial) {
 			context.messages[context.messages.length - 1] = finalMessage;
 		} else {
@@ -1591,17 +1774,37 @@ async function executeToolCallsParallel(
 			continue;
 		}
 
-		finalizedCalls.push(async () => {
-			const executed = await executePreparedToolCall(preparation, signal, emit, config);
-			const finalized = await finalizeExecutedToolCall(
-				currentContext,
-				assistantMessage,
-				preparation,
-				executed,
-				config,
-				signal,
-			);
-			await emitToolExecutionEnd(finalized, emit);
+		finalizedCalls.push(async (): Promise<FinalizedToolCallOutcome> => {
+			// Every started call must produce exactly one result: a failure anywhere in
+			// this closure converges to this call's error outcome instead of rejecting
+			// the Promise.all batch, which would orphan the in-flight siblings - their
+			// side effects land either way, and a missing result reads as "not executed"
+			// to the model.
+			let finalized: FinalizedToolCallOutcome;
+			try {
+				const executed = await executePreparedToolCall(preparation, signal, emit, config);
+				finalized = await finalizeExecutedToolCall(
+					currentContext,
+					assistantMessage,
+					preparation,
+					executed,
+					config,
+					signal,
+				);
+			} catch (error) {
+				return {
+					toolCall: preparation.toolCall,
+					result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+					isError: true,
+				};
+			}
+			try {
+				await emitToolExecutionEnd(finalized, emit);
+			} catch {
+				// The call itself finished; only the completion notification failed. Keep
+				// the real result so the transcript stays truthful - a tool whose effects
+				// landed must not read as failed to the model.
+			}
 			return finalized;
 		});
 	}
@@ -1939,14 +2142,18 @@ async function finalizeExecutedToolCall(
 	}
 
 	if (abortedDuringFinalize || executed.abortedInFlight === true) {
-		// The run abort keeps its cause when both producers fired: an intentional
-		// interrupt outranks the deadline. A deadline cancellation carries its own
-		// cause and labels, so the model reads "this call was cancelled", not "the
-		// turn was aborted".
+		// A fired run signal outranks the per-call deadline, with or without a cause
+		// text: the deadline's own wording claims "the turn was not" aborted, which is
+		// a lie once the turn is dying. The timeout cause is also dropped from the
+		// appended text in that case, or the stub would carry the same claim.
 		const timeoutCause = executed.timeoutAbortCause;
-		const cause = abortCauseFromSignal(signal) ?? timeoutCause;
+		const runAborted = signal?.aborted === true;
+		const signalCause = abortCauseFromSignal(signal);
+		const cause = signalCause ?? (runAborted ? undefined : timeoutCause);
 		const labels =
-			timeoutCause !== undefined && cause === timeoutCause ? TOOL_TIMEOUT_HARVEST_LABELS : TURN_ABORT_HARVEST_LABELS;
+			!runAborted && timeoutCause !== undefined && cause === timeoutCause
+				? TOOL_TIMEOUT_HARVEST_LABELS
+				: TURN_ABORT_HARVEST_LABELS;
 		return {
 			toolCall: prepared.toolCall,
 			result: await preserveAbortedToolResult(executed, result, cause, labels),

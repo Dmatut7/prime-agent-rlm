@@ -242,6 +242,32 @@ describe("per-tool-call deadline", () => {
 		expect(textOf(toolResult)).not.toContain("per-call deadline");
 	});
 
+	it("a run abort after the deadline fired still speaks the run-abort language", async () => {
+		// W9-B finding 9: the deadline cancels the call (its cause text claims "the turn
+		// was not" aborted), then the run abort lands during finalize with no cause of
+		// its own. The result must not keep the deadline's wording for a dying turn.
+		const controller = new AbortController();
+		const { messages } = await runToolTurn({
+			tools: [slowTool(60)],
+			toolCalls: [{ id: "tool_1", name: "slow" }],
+			signal: controller.signal,
+			config: {
+				toolTimeout: { afterMs: 30 },
+				afterToolCall: async () => {
+					controller.abort();
+					return undefined;
+				},
+			},
+		});
+
+		const toolResult = toolResultOf(messages);
+		expect(toolResult.isError).toBe(true);
+		expect(textOf(toolResult)).toContain("late partial output");
+		expect(textOf(toolResult)).toContain(ABORT_TRUNCATION_MARKER);
+		expect(textOf(toolResult)).not.toContain(TOOL_TIMEOUT_CAUSE_PREFIX);
+		expect(textOf(toolResult)).not.toContain("the turn was not");
+	});
+
 	it("a deadline-cancelled tool result never carries terminate back into a live turn", async () => {
 		// 0902 deep review, must-2: the tool settled `terminate: true` in flight, and the
 		// deadline harvested its partial output. The harvested result must NOT spread

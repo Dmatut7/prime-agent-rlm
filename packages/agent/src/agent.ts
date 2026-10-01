@@ -29,6 +29,7 @@ import type {
 	ThinkingLevel,
 	ToolExecutionMode,
 	ToolTimeoutConfig,
+	UndeliveredMessageSource,
 } from "./types.js";
 
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
@@ -45,6 +46,11 @@ const EMPTY_USAGE = {
 	totalTokens: 0,
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
+
+/** Fresh copy per failure message: a shared reference would let one in-place edit poison every later failure. */
+function cloneEmptyUsage(): typeof EMPTY_USAGE {
+	return { ...EMPTY_USAGE, cost: { ...EMPTY_USAGE.cost } };
+}
 
 const DEFAULT_MODEL = {
 	id: "unknown",
@@ -111,6 +117,12 @@ export interface AgentOptions {
 	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>;
 	shouldStopBeforeTurn?: () => boolean;
 	getContinuationMessages?: (context: GetContinuationMessagesContext, signal?: AbortSignal) => Promise<AgentMessage[]>;
+	/**
+	 * See `AgentLoopConfig.onUndeliveredMessages`. When unset, the Agent re-queues
+	 * undelivered products into the queue they were drained from (continuation
+	 * products ride the follow-up queue), so an abort never drops queued input.
+	 */
+	onUndeliveredMessages?: (messages: AgentMessage[], source: UndeliveredMessageSource) => void | Promise<void>;
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;
 	sessionId?: string;
@@ -161,14 +173,25 @@ class PendingMessageQueue {
 		this.batches = [];
 	}
 
+	/**
+	 * Removes the matching messages, per message: a hit inside a batch removes only
+	 * the matching entries and the rest of the batch keeps its place and atomicity.
+	 */
 	removeWhere(predicate: (message: AgentMessage) => boolean): AgentMessage[] {
 		const removed: AgentMessage[] = [];
 		const retained: AgentMessage[][] = [];
 		for (const batch of this.batches) {
-			if (batch.some(predicate)) {
-				removed.push(...batch);
-			} else {
+			const kept = batch.filter((message) => {
+				if (predicate(message)) {
+					removed.push(message);
+					return false;
+				}
+				return true;
+			});
+			if (kept.length === batch.length) {
 				retained.push(batch);
+			} else if (kept.length > 0) {
+				retained.push(kept);
 			}
 		}
 		this.batches = retained;
@@ -231,6 +254,7 @@ export class Agent {
 		context: GetContinuationMessagesContext,
 		signal?: AbortSignal,
 	) => Promise<AgentMessage[]>;
+	public onUndeliveredMessages?: (messages: AgentMessage[], source: UndeliveredMessageSource) => void | Promise<void>;
 	/**
 	 * Per-run model override. When set, every LLM request for prompt and
 	 * continuation runs uses this model (with its own thinking level and
@@ -270,6 +294,7 @@ export class Agent {
 		this.shouldStopAfterTurn = options.shouldStopAfterTurn;
 		this.shouldStopBeforeTurn = options.shouldStopBeforeTurn;
 		this.getContinuationMessages = options.getContinuationMessages;
+		this.onUndeliveredMessages = options.onUndeliveredMessages;
 		this.steeringQueue = new PendingMessageQueue(options.steeringMode ?? "one-at-a-time");
 		this.followUpQueue = new PendingMessageQueue(options.followUpMode ?? "one-at-a-time");
 		this.sessionId = options.sessionId;
@@ -539,6 +564,19 @@ export class Agent {
 			},
 			getFollowUpMessages: async () => this.followUpQueue.drain(),
 			getContinuationMessages: async (context, signal) => this.getContinuationMessages?.(context, signal) ?? [],
+			onUndeliveredMessages: (messages, source) => {
+				if (this.onUndeliveredMessages) {
+					return this.onUndeliveredMessages(messages, source);
+				}
+				// Default: nothing is dropped. Products go back to the queue they were
+				// drained from; continuation products ride the follow-up queue.
+				if (source === "steering") {
+					this.steeringQueue.enqueue(messages);
+				} else {
+					this.followUpQueue.enqueue(messages);
+				}
+				return undefined;
+			},
 			takeNextTurnModel: () => {
 				const pending = this.pendingTurnModel;
 				if (!pending) return undefined;
@@ -590,7 +628,7 @@ export class Agent {
 			api: runModel.api,
 			provider: runModel.provider,
 			model: runModel.id,
-			usage: EMPTY_USAGE,
+			usage: cloneEmptyUsage(),
 			stopReason: aborted ? "aborted" : "error",
 			errorMessage: error instanceof Error ? error.message : String(error),
 			diagnostics: aborted
