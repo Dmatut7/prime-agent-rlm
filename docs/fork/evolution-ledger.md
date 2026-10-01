@@ -14,17 +14,23 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-02，wave-13 已SHIP）
+## 当前状态（2026-10-02，wave-14 已SHIP）
 
-- HEAD = 8d1e50dc8（+6418574fe kitty）：wave-13 三批已提交。wave-13 三批：kitty 键盘模式栈修复（tui）、wave-12 残余清零
-  （探针收敛+死分支+19 打印点）、考题集 EX-3/EX-6 首跑+双模型 A/B。
-- 关键数字：EX-3 glm PASS 7/7（24.7s/58k tok）；EX-6 glm 内容 PASS（机判挂在 D7 判分器缺陷）；
-  EX-4：glm 对且 219k tok vs claude-sonnet-5 错且 1.55M tok（读仓取常量类 glm 准 7 倍省）。
-- 模型画像结论：日常本仓负载默认 glm-5.3-prime 保持；claude-code/sonnet-5 在流程类（EX-1/2/5/7）
-  打平但更贵。EX-6 runner 的 D7（client/worker session id 分裂收集不到子会话）与 D4 回填
-  （swarm_fanout/runner.py 的 agent_env 拷 models.json）登记 wave-14。
-- kitty 真机手感（ghostty/kitty 下 fullscreen 的 shift+enter）待老板按一次确认；tmux 内协议不可达。
-- 恢复指令：读 Backlog + 下一波主题；证据库 /tmp/wave10、/tmp/wave11、/tmp/wave13。
+- HEAD = d476f62bc + 文档批：wave-14 三批已提交（25b3432b7 考题、c273b1ae8 组织记忆、d476f62bc 小项）。
+- wave-14 成果：恢复简报注入（resume/attach/worker 恢复后自动带在途状态：goal 含 persistent 标记、
+  排队数、死时在跑操作、duty log 尾部、docs/fork 索引；C5 销账）+ 派波勘误门（审查/复审类 spawn
+  自动附「先读台账」，C4 销账）；考题集 D7/D8 修复 + EX-3 转 CI（w14a-ex3-recovery-chain，真 CLI
+  子进程，5 连绿）+ EX-6 重跑 8/8；daemon-launch 探针收敛收尾；codex sleep listener 修复；
+  main.ts console.log 全包装。
+- 调研刷新（W14-D）：三家 changelog 窗口内无新条目；Claude Code 2.1.287 三条正中桥接面（建议老板
+  升级后用 claude 线复跑 EX-3/EX-6）；kitty 0.49.2 修 macOS 渲染回归（Backlog-7 验收前置）。
+- 痛点复扫（W14-E）：今日零新抱怨；S1/S2 今日未复发；老板 00:28 明说「循环下去就不会停那种」——
+  /goal --persistent 正是答案，但他 daemon 未重启还看不见。S4 磁盘（4.1GB）仍未收敛。
+- 主席事故登记：误把 `prime-agent daemon-ps`（非命令）打成提示词发给 Kovak 会话一次（正确命令是
+  `prime-agent daemon ps`）；耗费一轮额度，无其他影响。
+- 4603 shutdown 例升级定性：三度负载红，疑似真竞态（worker 把 shutdown --force 后的 daemon 重拉起，
+  W11-D F3 同族），wave-15 立项专项，不再当 flake 豁免。
+- 恢复指令：读 Backlog + 下一波主题；证据库 /tmp/wave10、/tmp/wave11、/tmp/wave13、/tmp/wave14。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
 
@@ -100,13 +106,13 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-14 候选）
+## 下一波主题（wave-15 候选）
 
-1. 考题集运营：D7 修复（runner 从 ledger child 路径收集 artifacts 根 + 回归测试）+ D4 回填
-   （runner agent_env 拷 models.json）+ 每波例行跑一遍。
-2. Backlog-10 组织记忆硬门（立项前强制检索勘误台账——C4 白烧一整波的教训）。
-3. Backlog-7 残余：探测总线设计稿（DA 栅栏+分版本 DECRQM，2027/2031/图片占位前置）；
-   kitty 栈老板真机确认后销账。
+1. 【专项】4603 shutdown 竞态：worker 在 supervisor 死后重拉 daemon 的路径（W11-D F3 实证：
+   孤儿 worker 在 bench socket 上重起 daemon）与 shutdown --force 的交互，修复后 4603 应稳定绿。
+2. Backlog-10 残余：恢复注入的 in-process 路径（W14-B 遗留②）；agent-session.ts:19651 提示词
+   内嵌点（主席可选，与 daemon 侧注入二选一防重复）。
+3. Backlog-7 残余：探测总线设计稿（DA 栅栏+分版本 DECRQM）；kitty 栈待老板真机确认（≥0.49.2）。
 4. Backlog-13 slim 回填 inline 触发器。
-5. 登记：cli/daemon-launch.ts:276 仍有一处 kill(0) 内联（W13-B 报告）；codex sleep 的 abort
-   listener 不摘除（packages/ai）；main.ts 的 console.log 打印点未包（W13-B 建议④）。
+5. F15（09-30 登记的子代理编号/重试文案不一致）横跨 5 波未认领——wave-15 正式立项或明确降级。
+6. 考题集例行跑 + runner agent_env 剥 RLM_SESSION_DIR（W14-A 遗留）。
