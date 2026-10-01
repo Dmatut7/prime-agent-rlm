@@ -928,6 +928,18 @@ function requireNoExtraArgs(args: string[], usage: string): void {
 
 async function runSend(client: DaemonClient, args: string[], json: boolean): Promise<void> {
 	const parsed = parseSendArgs(args);
+	if (parsed.deliveryMode) {
+		// A rev-40 daemon accepted send_message.deliveryMode and silently steered;
+		// refuse before the request leaves so an update-window daemon cannot degrade
+		// an explicit --follow-up into a steer. The bare send stays on the legacy path.
+		await client.waitForHello();
+		if (!client.supportsServerCapability("send_message_delivery_mode")) {
+			const flag = parsed.deliveryMode === "follow_up" ? "--follow-up" : "--steer";
+			throw new Error(
+				`The connected daemon is too old to honor ${flag} (send_message_delivery_mode requires daemon schema revision 41+). Restart the daemon to pick up the current version: prime-agent shutdown, then run prime-agent again.`,
+			);
+		}
+	}
 	const response = await client.request({
 		type: "send_message",
 		targetActiveSessionId: parsed.targetActiveSessionId,

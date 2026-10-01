@@ -1,0 +1,1 @@
+- Fixed `prime-agent send --steer/--follow-up` against a daemon older than schema revision 41 (e.g. one still running during an update restart window): the CLI now refuses with a restart-and-retry error instead of letting the old daemon silently steer the message. Bare `send` without an explicit delivery mode is unaffected.

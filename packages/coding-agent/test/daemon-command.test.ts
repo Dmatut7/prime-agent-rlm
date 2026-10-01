@@ -33,6 +33,8 @@ const daemonClientMock = vi.hoisted(() => {
 		sessions: [] as Array<Record<string, unknown>>,
 		/** Optional live-session summary returned by the mocked create request. */
 		createdSession: undefined as Record<string, unknown> | undefined,
+		/** Server capabilities the mocked daemon hello advertises. */
+		serverCapabilities: ["send_message_delivery_mode"] as string[],
 	};
 
 	class MockDaemonClient {
@@ -48,6 +50,12 @@ const daemonClientMock = vi.hoisted(() => {
 
 		async connect(): Promise<void> {
 			if (behavior.connectFails) throw new Error("mock connect failed");
+		}
+
+		async waitForHello(): Promise<void> {}
+
+		supportsServerCapability(capability: string): boolean {
+			return behavior.serverCapabilities.includes(capability);
 		}
 
 		async request(command: Command): Promise<Response> {
@@ -144,6 +152,7 @@ describe("daemon command", () => {
 		daemonClientMock.behavior.connectFails = false;
 		daemonClientMock.behavior.sessions = [];
 		daemonClientMock.behavior.createdSession = undefined;
+		daemonClientMock.behavior.serverCapabilities = ["send_message_delivery_mode"];
 		consoleErrorMessages = [];
 		vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null | undefined) => {
 			throw new Error(`exit ${code}`);
@@ -435,6 +444,45 @@ describe("daemon command", () => {
 					typeof message === "string" && message.includes("--steer and --follow-up cannot be used together"),
 			),
 		).toBe(true);
+	});
+
+	it.each(["--follow-up", "--steer"] as const)(
+		"refuses send %s against a daemon without send_message_delivery_mode",
+		async (flag) => {
+			daemonClientMock.behavior.serverCapabilities = [];
+
+			await expect(
+				handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "send", "worker", flag, "hello"]),
+			).resolves.toBe(true);
+
+			expect(daemonClientMock.instances[0]?.requests).toEqual([]);
+			expect(process.exitCode).toBe(1);
+			expect(
+				consoleErrorMessages.some(
+					(message) =>
+						typeof message === "string" &&
+						message.includes(`too old to honor ${flag}`) &&
+						message.includes("send_message_delivery_mode"),
+				),
+			).toBe(true);
+		},
+	);
+
+	it("keeps bare send on the legacy path against a daemon without send_message_delivery_mode", async () => {
+		daemonClientMock.behavior.serverCapabilities = [];
+
+		await expect(
+			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "send", "worker", "hello"]),
+		).resolves.toBe(true);
+
+		const client = daemonClientMock.instances[0];
+		expect(client?.requests[0]).toEqual({
+			type: "send_message",
+			targetActiveSessionId: "worker",
+			fromActiveSessionId: undefined,
+			message: "hello",
+		});
+		expect(process.exitCode).toBeUndefined();
 	});
 
 	it("preserves cron add separator before the scheduled prompt", async () => {

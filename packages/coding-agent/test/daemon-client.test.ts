@@ -239,6 +239,60 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("does not send an explicit send_message deliveryMode to a rev-40 daemon without the capability", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, [], 40);
+
+		await expect(
+			client.request({
+				type: "send_message",
+				targetActiveSessionId: "target",
+				message: "hello",
+				deliveryMode: "follow_up",
+			}),
+		).rejects.toThrow("does not support send_message_delivery_mode");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("sends a bare send_message to a rev-40 daemon on the legacy path", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, [], 40);
+
+		const request = client.request({ type: "send_message", targetActiveSessionId: "target", message: "hello" });
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		client.close();
+		await expect(request).rejects.toThrow("closed before the operation completed");
+	});
+
+	it("sends an explicit send_message deliveryMode to a daemon advertising the capability", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["send_message_delivery_mode"], 41);
+
+		const request = client.request({
+			type: "send_message",
+			targetActiveSessionId: "target",
+			message: "hello",
+			deliveryMode: "steer",
+		});
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		expect(socket.writes[0]).toContain('"deliveryMode":"steer"');
+		client.close();
+		await expect(request).rejects.toThrow("closed before the operation completed");
+	});
+
 	it("does not send subagent deletion to an old daemon without the capability", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();
