@@ -14,23 +14,17 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-02，wave-12 已SHIP）
+## 当前状态（2026-10-02，wave-13 已SHIP）
 
-- HEAD = 8d21b965d：wave-12 四批已提交（a80d64bc2 审计债、fd1dd4e4c UX 包、50893b6fc CLI 换行、
-  8d21b965d 考题集入仓）。FORK_NOTES wave-12 节已写。
-- wave-12 成果：Esc 草稿自动 stash；/model claude-code 真实登录探测+活更新徽标；截断全省略号
-  （菜单/树提示/心跳/会话列表，502 契约保住）；CLI/stdout 宽度感知换行+--daemon-socket 指引；
-  isProcessAlive 6 份收敛（僵尸语义统一）+ 热路径零 fork（processIdExists）；sleep 11 份收敛
-  （+unref/resolveOnAbort）；死代码 -330 行 + convergence-guards 防再分叉；exam-v1 入仓
-  scripts/evals/（D1-D6 修复，EX-2 重跑 PASS）；6008 flake 治理（轮询窗 5s）。
-- 自伤回归已修（主席）：502（省略号吃掉 model:effort 一列→截断优先级重构）、4658（4658 测试 stub
-  缺 connectionConfiguredProviders）、4603（栅栏轮询被共享 isProcessAlive 带上 ps 风暴→换
-  processIdExists）、kernel-venv ps-fork O(1) 契约（同源）。教训：收敛共享实现时必须审查每个调用点
-  的成本契约（纯 kill0 vs 带 ps 的僵尸检查），语义对≠成本对。
-- 门禁：check EXIT 0、hygiene OK、tsgo 0、顶层 9202 绿+已知豁免（8 环境漂移+2 负载 flake）、
-  suite 1621+2 已知 flake 隔离复绿（4603 shutdown、6008——6008 已根治）。
-- daemon 仍跑旧 bundle（忙会话未强杀）。新 build 已就位待重启。
-- 恢复指令：读 Backlog + 下一波主题；证据库 /tmp/wave10、/tmp/wave11。
+- HEAD = 8d1e50dc8（+6418574fe kitty）：wave-13 三批已提交。wave-13 三批：kitty 键盘模式栈修复（tui）、wave-12 残余清零
+  （探针收敛+死分支+19 打印点）、考题集 EX-3/EX-6 首跑+双模型 A/B。
+- 关键数字：EX-3 glm PASS 7/7（24.7s/58k tok）；EX-6 glm 内容 PASS（机判挂在 D7 判分器缺陷）；
+  EX-4：glm 对且 219k tok vs claude-sonnet-5 错且 1.55M tok（读仓取常量类 glm 准 7 倍省）。
+- 模型画像结论：日常本仓负载默认 glm-5.3-prime 保持；claude-code/sonnet-5 在流程类（EX-1/2/5/7）
+  打平但更贵。EX-6 runner 的 D7（client/worker session id 分裂收集不到子会话）与 D4 回填
+  （swarm_fanout/runner.py 的 agent_env 拷 models.json）登记 wave-14。
+- kitty 真机手感（ghostty/kitty 下 fullscreen 的 shift+enter）待老板按一次确认；tmux 内协议不可达。
+- 恢复指令：读 Backlog + 下一波主题；证据库 /tmp/wave10、/tmp/wave11、/tmp/wave13。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
 
@@ -106,13 +100,13 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-13 候选）
+## 下一波主题（wave-14 候选）
 
-1. Backlog-7 kitty 键盘模式栈真机复核（terminal.ts:266 疑似活 bug，tmux 可验）+ 探测总线设计稿
-   （DA 栅栏+分版本 DECRQM，是 2027/2031/图片占位前置）。
+1. 考题集运营：D7 修复（runner 从 ledger child 路径收集 artifacts 根 + 回归测试）+ D4 回填
+   （runner agent_env 拷 models.json）+ 每波例行跑一遍。
 2. Backlog-10 组织记忆硬门（立项前强制检索勘误台账——C4 白烧一整波的教训）。
-3. wave-12 残余：turn-liveness.ts:500/bootstrap.ts:881 两处 kill(0) 探针收敛或注释点名；
-   artifact-dirs.ts:224 不可达分支；main.ts 其余 ~15 打印点接 wrapForStderr；
-   daemon-ps/package-manager-cli 的冲突提示接同款。
+3. Backlog-7 残余：探测总线设计稿（DA 栅栏+分版本 DECRQM，2027/2031/图片占位前置）；
+   kitty 栈老板真机确认后销账。
 4. Backlog-13 slim 回填 inline 触发器。
-5. 考题集：EX-3/EX-6 首跑 + 双模型 A/B（EX-1/2/4/5/7 各一遍，成本可控）。
+5. 登记：cli/daemon-launch.ts:276 仍有一处 kill(0) 内联（W13-B 报告）；codex sleep 的 abort
+   listener 不摘除（packages/ai）；main.ts 的 console.log 打印点未包（W13-B 建议④）。

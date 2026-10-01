@@ -1,3 +1,9 @@
+## 2026-10-02 wave-13 三批：全屏下 kitty 键盘增强真生效、收尾清理、考题集双模型首测
+
+- 老板能感觉到的：全屏模式下 Shift+Enter、按键释放事件等 kitty 键盘增强现在真的生效了（以前只在主屏注册过，进全屏就静默退回普通模式——kitty 官方规范要求主/备屏各自独立栈，现在进出全屏对称注册/注销）；启动、fork、会话选择等所有 CLI 报错在窄终端都按词换行。注意：kitty 协议在 tmux 里不可达，字节序列已钉测试，但在 kitty/ghostty 真终端里的手感待你实际按一次确认。
+- 底下：wave-12 残余清零（最后两处 kill(0) 内联探针收敛、artifact-dirs 不可达分支连生产者一起删、main.ts 剩余 19 处裸 console.error 全部接入宽度感知换行、shutdown/update 确认提示同款）；考题集首次双模型 A/B 出数（EX-3 恢复链、EX-6 八shard扇出 glm 全通；EX-4 上 glm 比 claude-sonnet-5 准且省 7 倍 token——「读仓取常量」类问题 claude 会把宿主默认当内核常量答错还烧 155 万 token）+ EX-6 判分器一个真缺陷（D7：REPL 线 client/worker session id 分裂导致子会话目录收集不到）已登记待修。
+- 做法：三路建造（tui kitty 栈/残余清理/考题集）。门禁：check EXIT 0、hygiene OK、tui 1039 全绿、coding-agent 顶层复扫绿（已知环境豁免除外）。需要重新编译并重启后才生效（daemon 有忙会话未强杀）。
+
 ## 2026-10-02 wave-12 四批：Esc 不再吞草稿、/model 不再谎报、终端窄档不再丢字、审计债清仓
 
 - 老板能感觉到的：按 Esc 清输入框不再永久销毁草稿（自动暂存，Ctrl+S 原路径恢复）；/model 菜单里 claude-code 系不再谎报「已登录」（真实探测 `claude auth status`，未登录会带去登录流程）；窄终端下截断统一带省略号，定时任务的「every 45m」不再被切成「every 45」，/tree 键位提示不再把按键名切半，会话列表的模型名在省略号下也保得住；`--help` 和启动报错在窄终端按词换行不再断词，daemon 冲突提示会告诉你 `--daemon-socket` 这条不关停的活路。
