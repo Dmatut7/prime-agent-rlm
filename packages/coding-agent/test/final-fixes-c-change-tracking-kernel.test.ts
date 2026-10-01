@@ -28,7 +28,7 @@ describe.skipIf(python === null)("changeTracking.enabled written as a string rea
 				}),
 				{ stopReason: "toolUse" },
 			),
-			fauxAssistantMessage("done"),
+			fauxAssistantMessage("tracking state printed"),
 		]);
 		await harness.session.prompt("check the kernel");
 		const results = harness.session.messages.filter((message) => message.role === "toolResult");

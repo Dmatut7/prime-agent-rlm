@@ -374,13 +374,15 @@ ladder is terminal.
 |---------|------|---------|-------------|
 | `selfRecovery.autoContinue` | boolean | `true` | Continue a turn that stopped right after tool work while only announcing its next step, or whose output was cut off by the token budget (`stopReason: "length"`) |
 | `selfRecovery.childReplyNudge` | boolean | `false` | Ask a subagent that finished without replying once to send its result |
-| `selfRecovery.maxAutoContinues` | number | `4` | Automatic continues one prompt may receive, shared by announced-next-step and truncated-output continuations; `0` disables them |
+| `selfRecovery.finishGate` | boolean | `true` | When a run ends on a completion claim ("修好了", "done") that shows no proof, ask for the evidence (test output, command results, checked file state) before letting it stop. A claim that cites its evidence or follows a green verification command is left alone; a claim repeated without proof is released after two nudges with a note in the transcript. Pure chat never triggers it |
+| `selfRecovery.maxAutoContinues` | number | `4` | Automatic continues one prompt may receive, shared by announced-next-step, truncated-output and finish-gate continuations; `0` disables them |
 
 ```json
 {
   "selfRecovery": {
     "autoContinue": true,
     "childReplyNudge": false,
+    "finishGate": true,
     "maxAutoContinues": 4
   }
 }

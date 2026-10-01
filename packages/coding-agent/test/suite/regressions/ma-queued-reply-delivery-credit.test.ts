@@ -202,13 +202,13 @@ describe("queued child reply delivered later", () => {
 
 		parent.setResponses([
 			fauxAssistantMessage(fauxToolCall("hold_the_turn", {}), { stopReason: "toolUse" }),
-			fauxAssistantMessage("the long parent turn finished"),
+			fauxAssistantMessage("the long parent turn ended"),
 			fauxAssistantMessage("the parent read the queued reply"),
 			fauxAssistantMessage("the parent is idle again"),
 		]);
 		child.setResponses([
 			fauxAssistantMessage(fauxToolCall("reply_to_parent", {}), { stopReason: "toolUse" }),
-			fauxAssistantMessage("the child finished after replying"),
+			fauxAssistantMessage("the child wrapped up after replying"),
 		]);
 
 		// The parent is mid-turn for the whole child run, which is what makes the
@@ -355,7 +355,7 @@ describe("queued child reply delivered later", () => {
 		]);
 		child.setResponses([
 			fauxAssistantMessage(fauxToolCall("reply_to_parent", {}), { stopReason: "toolUse" }),
-			fauxAssistantMessage("the child finished after replying"),
+			fauxAssistantMessage("the child wrapped up after replying"),
 		]);
 
 		const handle = await parent.session.runRlmChild("audit and reply", { name: "suspended-reply-worker" });
@@ -420,9 +420,9 @@ describe("queued child reply delivered later", () => {
 		]);
 		child.setResponses([
 			fauxAssistantMessage(fauxToolCall("reply_to_parent", {}), { stopReason: "toolUse" }),
-			fauxAssistantMessage("the first run finished after replying"),
+			fauxAssistantMessage("the first run wrapped up after replying"),
 			// The second run never replies: that is the fact the verdict must keep.
-			fauxAssistantMessage("the second run finished quietly"),
+			fauxAssistantMessage("the second run wrapped up quietly"),
 		]);
 
 		parent.session.requestAbort();

@@ -188,7 +188,7 @@ describe("provider fallback chain (unattended self-recovery)", () => {
 			],
 			{ stopReason: "toolUse" },
 		);
-		const step = perModel({ "faux-1": [garbage], "faux-kimi": [fauxAssistantMessage("kimi finished")] }, served);
+		const step = perModel({ "faux-1": [garbage], "faux-kimi": [fauxAssistantMessage("kimi answered")] }, served);
 		harness.setResponses([step, step]);
 
 		await harness.session.prompt("do the work");

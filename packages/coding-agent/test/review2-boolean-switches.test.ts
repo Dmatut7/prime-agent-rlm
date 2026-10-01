@@ -74,6 +74,7 @@ const SWITCHES: Switch[] = [
 	},
 	{ path: "selfRecovery.autoContinue", fallback: true, read: (m) => m.getSelfRecoverySettings().autoContinue },
 	{ path: "selfRecovery.childReplyNudge", fallback: false, read: (m) => m.getSelfRecoverySettings().childReplyNudge },
+	{ path: "selfRecovery.finishGate", fallback: true, read: (m) => m.getSelfRecoverySettings().finishGate },
 	{
 		path: "retry.emptyTurn.recovery.enabled",
 		fallback: true,

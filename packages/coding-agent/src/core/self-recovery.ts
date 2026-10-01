@@ -1,14 +1,15 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { DutyEvent } from "./duty-log.js";
-import { AUTO_CONTINUE_CUSTOM_TYPE, type CustomMessage } from "./messages.js";
+import { AUTO_CONTINUE_CUSTOM_TYPE, type AutoContinueMessageDetails, type CustomMessage } from "./messages.js";
 import type { SessionEntry } from "./session-manager.js";
 
 /**
  * Self-recovery for unattended runs: what the session does on its own when a
- * step hangs, a turn stops right after announcing more work, or a subagent
- * finishes without replying. Every action is recorded as a session entry so a
- * later duty log can say what happened while nobody was watching.
+ * step hangs, a turn stops right after announcing more work, a run ends on a
+ * completion claim it never proved, or a subagent finishes without replying.
+ * Every action is recorded as a session entry so a later duty log can say what
+ * happened while nobody was watching.
  */
 
 /** Session custom-entry type for one self-recovery action. Not a message: the model never sees it. */
@@ -28,6 +29,12 @@ export function dutyEventFor(record: SelfRecoveryRecord): DutyEvent {
 			return { kind: "auto_continue", reason: record.excerpt };
 		case "child_reply_nudge":
 			return { kind: "auto_continue", reason: "child_reply_missing" };
+		case "finish_gate_released":
+			// Not handled work: the claim went out unverified, so the owner should check it.
+			return {
+				kind: "decision_needed",
+				question: `AI 声称完成但 ${record.strikes} 次拿不出验证证据，已放行，结论待你核对`,
+			};
 	}
 }
 
@@ -49,7 +56,20 @@ export type SelfRecoveryRecord =
 			at: number;
 	  }
 	| { kind: "auto_continue"; excerpt: string; ordinal: number; at: number }
-	| { kind: "child_reply_nudge"; at: number };
+	| { kind: "child_reply_nudge"; at: number }
+	| {
+			/**
+			 * The finish gate let a completion claim through after the model kept
+			 * claiming done without showing proof: recorded so the transcript and the
+			 * duty log carry that the claim was never verified.
+			 */
+			kind: "finish_gate_released";
+			excerpt: string;
+			/** Gate nudges this run already sent for the claim (FINISH_GATE_MAX_STRIKES at release). */
+			strikes: number;
+			ordinal: number;
+			at: number;
+	  };
 
 // Where an announcement starts: the head of a clause, after an optional filler word. Only the
 // sentence a reply ends on is read, and a mid-clause match ("刚宣布还有下一步就停轮") is a
@@ -231,6 +251,164 @@ export function autoContinuesInRun(messages: readonly AgentMessage[]): number {
 	return count;
 }
 
+/**
+ * The finish gate (the Stop-hook / goal-judge pattern applied at the turn boundary):
+ * a run that ends on a completion claim gets asked for the proof before it may stop.
+ * Detection is heuristic by design - a misfire costs one paid turn, a miss costs the
+ * owner a false "done" - so the claim set stays small and strong, exemptions stay
+ * wide, and two nudges without proof release the run (see FINISH_GATE_MAX_STRIKES).
+ */
+
+/**
+ * Consecutive finish-gate nudges one claim may draw before the run is let go: each
+ * nudge is a paid turn, and a model that answers the ask with the same bare claim
+ * twice is not going to produce the proof on a third.
+ */
+export const FINISH_GATE_MAX_STRIKES = 2;
+
+// Strong completion declarations only ("改好了", "done", "fixed", ...). Weak ones
+// ("跑完了", "写完了") stay out: they report a step, not the task.
+const CN_COMPLETION_CLAIM =
+	/完成了|已完成|全部完成|任务完成|修好了|修复了|已修复|修复完成|搞定了|弄好了|改好了|改完了|做完了|做好了|已全部/u;
+const EN_COMPLETION_CLAIM = /\b(?:all done|done|fixed|completed|finished|resolved|implemented|all set)\b/i;
+
+// The claim is backed when the reply itself cites the proof: a test or check that
+// passed, a clean exit, a verification that already happened.
+const CN_EVIDENCE =
+	/测试(?:全部|全|都)?通过|全部通过|跑通了|编译通过|构建(?:成功|通过)|已验证|验证(?:通过|过)了?|校验通过|检查(?:通过|完毕)|用例(?:全部|全)?通过|已核对/u;
+const EN_EVIDENCE =
+	/\b\d+\s+tests?\s+pass(?:ed)?\b|\btests?\s+(?:all\s+)?pass(?:es|ed)?\b|\ball tests pass\b|\btest suite is green\b|\bbuild (?:succeeds|succeeded|passes|passed)\b|\bchecks? pass(?:es|ed)?\b|\bexit(?:ed)?(?:\s+with)?(?:\s+code)?\s+0\b|\blint(?:s)? (?:is|are) clean\b|\bverified\b/i;
+
+// A task-shaped prompt ("修复这个 bug", "fix the footer") makes a completion claim
+// with no tool work suspicious on its own; pure chat never reaches the gate.
+const CN_TASK_VERB =
+	/修复|修一下|修好|实现|添加|加上|新增|删除|删掉|去掉|运行|跑一下|跑通|执行|检查|排查|分析|部署|更新|升级|重构|优化|安装|配置|迁移|改写|写个|写一个|做一?个|做一下|解决|处理|调查|看下|看看|查一下/u;
+const EN_TASK_VERB =
+	/\b(?:fix|implement|add|create|write|update|change|refactor|remove|delete|run|execute|check|investigate|debug|deploy|build|test|install|configure|migrate|optimize|resolve|verify)\b/i;
+
+// A command that checks the work: when one of these ran green earlier in the run,
+// the transcript already carries the proof and the claim does not need to repeat it.
+const VERIFICATION_COMMAND =
+	/(?:^|[\s;&|`"'(])(?:(?:npm|pnpm|yarn|bun|deno|npx|uv|uvx|cargo|go|mvn|gradle|make|xcodebuild|swift|bazel)\s+[^\n;&|]{0,120}?\b(?:tests?|spec|check|build|lint|type-?check|compile|verify|clippy)\b|py\.?test|vitest|jest|mocha|phpunit|rspec|ctest|tsc|tsgo|eslint|biome\s+check|ruff\s+check|mypy|pyright)(?=[\s;'")]|$)/i;
+
+/** Whether a prompt reads as a task ("修复这个 bug") rather than chat ("这个函数是干什么的"). */
+function promptRequestsWork(promptText: string | undefined): boolean {
+	if (!promptText) return false;
+	const head = promptText.trim().slice(0, 400);
+	return CN_TASK_VERB.test(head) || EN_TASK_VERB.test(head);
+}
+
+/** Text of the prompt that opened this run (the last user message in it), when known. */
+export function lastUserPromptText(messages: readonly AgentMessage[]): string | undefined {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message?.role !== "user") continue;
+		const content = message.content;
+		const text =
+			typeof content === "string"
+				? content
+				: content
+						.filter((block): block is TextContent => block.type === "text")
+						.map((block) => block.text)
+						.join("\n");
+		return text.trim() || undefined;
+	}
+	return undefined;
+}
+
+/**
+ * Whether this run already produced its own proof: a verification-shaped command
+ * (a test suite, a build, a lint or type check) that ran green after the last user
+ * prompt. The claim then stands on the transcript and citing it is courtesy, not a
+ * gate-worthy omission. Read tools and failed runs never count.
+ */
+export function runHasVerificationEvidence(messages: readonly AgentMessage[]): boolean {
+	const commands = new Map<string, string>();
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message?.role === "user") break;
+		if (message?.role !== "assistant") continue;
+		for (const block of message.content) {
+			if (block.type !== "toolCall") continue;
+			const args = block.arguments as Record<string, unknown> | undefined;
+			const command = [args?.command, args?.code, args?.cmd].find((value) => typeof value === "string");
+			if (typeof command === "string") commands.set(block.id, command);
+		}
+	}
+	if (commands.size === 0) return false;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message?.role === "user") break;
+		if (message?.role !== "toolResult" || message.isError) continue;
+		const command = commands.get(message.toolCallId);
+		if (command !== undefined && VERIFICATION_COMMAND.test(command)) return true;
+	}
+	return false;
+}
+
+export interface FinishGateScanOptions {
+	/** The run did tool work after its last user prompt. */
+	ranTools: boolean;
+	/** Text of the prompt that opened the run, when known (the no-tool-work lane needs it). */
+	promptText?: string;
+	/** A verification-shaped command already ran green in this run (see runHasVerificationEvidence). */
+	verifiedWork?: boolean;
+}
+
+/**
+ * Whether a reply declares the task done without showing the proof, in a turn the
+ * gate applies to: the run did tool work, or the prompt asked for work. Waits,
+ * approval gates and - for a tool-free turn - questions and offers stay final
+ * answers; a claim that cites its evidence (or follows a green verification command)
+ * is a finished answer, not a bare one.
+ */
+function textClaimsCompletionWithoutEvidence(text: string, options: FinishGateScanOptions): boolean {
+	if (!text) return false;
+	if (!options.ranTools && !promptRequestsWork(options.promptText)) return false;
+	if (options.verifiedWork) return false;
+	const tail = text.slice(-240);
+	if (FINAL_REPLY_PATTERNS.some((pattern) => pattern.test(tail))) return false;
+	if (!options.ranTools && QUESTION_OR_OFFER_PATTERNS.some((pattern) => pattern.test(tail))) return false;
+	if (!CN_COMPLETION_CLAIM.test(text) && !EN_COMPLETION_CLAIM.test(text)) return false;
+	return !CN_EVIDENCE.test(text) && !EN_EVIDENCE.test(text);
+}
+
+/**
+ * The unproven completion claim of a turn that just stopped, or undefined when the
+ * reply is a real answer. Pure: callers own the budget, the strike count and the
+ * release. Mirrors announcedNextStep's guards (clean stop, no pending tool call).
+ */
+export function completionClaimWithoutEvidence(
+	message: AssistantMessage,
+	options: FinishGateScanOptions,
+): string | undefined {
+	if (message.stopReason !== "stop") return undefined;
+	if (message.content.some((block) => block.type === "toolCall")) return undefined;
+	const text = assistantText(message);
+	return textClaimsCompletionWithoutEvidence(text, options) ? excerptOf(text) : undefined;
+}
+
+/**
+ * Consecutive finish-gate nudges this run already sent without the model doing any
+ * new work since the latest one: a tool result after the last nudge is the asked-for
+ * verification happening, so the count starts over. The caller releases the run once
+ * this reaches FINISH_GATE_MAX_STRIKES.
+ */
+export function finishGateStrikesInRun(messages: readonly AgentMessage[]): number {
+	let strikes = 0;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message?.role === "user") break;
+		// Work since the last nudge is the nudge being answered; it resets the count.
+		if (message?.role === "toolResult") break;
+		if (message?.role === "custom" && message.customType === AUTO_CONTINUE_CUSTOM_TYPE) {
+			const details = message.details as Partial<AutoContinueMessageDetails> | undefined;
+			if (details?.reason === "finish_gate") strikes += 1;
+		}
+	}
+	return strikes;
+}
+
 /** Every self-recovery action recorded on a branch, oldest first. */
 export function readSelfRecoveryRecords(entries: readonly SessionEntry[]): SelfRecoveryRecord[] {
 	const records: SelfRecoveryRecord[] = [];
@@ -238,7 +416,12 @@ export function readSelfRecoveryRecords(entries: readonly SessionEntry[]): SelfR
 		if (entry.type !== "custom" || entry.customType !== SELF_RECOVERY_CUSTOM_ENTRY) continue;
 		const data = entry.data as Partial<SelfRecoveryRecord> | undefined;
 		if (!data || typeof data !== "object" || typeof data.kind !== "string" || typeof data.at !== "number") continue;
-		if (data.kind === "stuck_step_stopped" || data.kind === "auto_continue" || data.kind === "child_reply_nudge") {
+		if (
+			data.kind === "stuck_step_stopped" ||
+			data.kind === "auto_continue" ||
+			data.kind === "child_reply_nudge" ||
+			data.kind === "finish_gate_released"
+		) {
 			records.push(data as SelfRecoveryRecord);
 		}
 	}

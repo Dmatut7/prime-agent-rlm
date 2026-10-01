@@ -433,10 +433,15 @@ import {
 import {
 	announcedNextStep,
 	autoContinuesInRun,
+	completionClaimWithoutEvidence,
 	createOutputTruncatedContinueMessage,
 	createProviderFailureRecoveryMessage,
 	dutyEventFor,
+	FINISH_GATE_MAX_STRIKES,
+	finishGateStrikesInRun,
+	lastUserPromptText,
 	ranToolsSinceLastPrompt,
+	runHasVerificationEvidence,
 	SELF_RECOVERY_CUSTOM_ENTRY,
 	type SelfRecoveryRecord,
 } from "./self-recovery.js";
@@ -6135,11 +6140,14 @@ export class AgentSession {
 	 * nothing to say. A main session whose turn stopped right after tool work with a
 	 * reply that only announces the next step gets one automatic continue, and so does
 	 * a turn the output budget cut off mid-answer (stopReason "length" - including a
-	 * provider pause the model layer reports as a length stop); both count into the
-	 * same per-prompt budget (`selfRecovery.maxAutoContinues`). A subagent that
-	 * finished its task without replying is asked once to send its result. Anything
-	 * that reads as a final answer or waiting on children is left alone; a question
-	 * or offer ending only exempts a turn that did no tool work.
+	 * provider pause the model layer reports as a length stop). The finish gate covers
+	 * the third way a run ends early: a clean stop whose reply declares the work done
+	 * without showing the proof gets asked for the evidence. All of these count into
+	 * the same per-prompt budget (`selfRecovery.maxAutoContinues`); once it is spent
+	 * the run is left to end. A subagent that finished its task without replying is
+	 * asked once to send its result. Anything that reads as a final answer or waiting
+	 * on children is left alone; a question or offer ending only exempts a turn that
+	 * did no tool work.
 	 */
 	private _selfRecoveryContinuation(context: GetContinuationMessagesContext): AgentMessage | undefined {
 		const settings = this.settingsManager.getSelfRecoverySettings();
@@ -6156,25 +6164,48 @@ export class AgentSession {
 			// The child-reply nudge is a one-shot (`used > 0` blocks repeats), so its budget is 1.
 			return createAutoContinueMessage({ reason: "child_reply_missing", ordinal: 1, maxOrdinal: 1 });
 		}
-		if (!settings.autoContinue || used >= settings.maxAutoContinues) return undefined;
+		if (used >= settings.maxAutoContinues) return undefined;
 		const ranTools = ranToolsSinceLastPrompt(context.newMessages);
-		if (!ranTools) return undefined;
 		const ordinal = used + 1;
-		// Cut off mid-answer: resume where the turn stopped instead of judging the text.
-		if (message.stopReason === "length") {
-			const excerpt = "output truncated (stopReason: length)";
-			this._recordSelfRecovery({ kind: "auto_continue", excerpt, ordinal, at: Date.now() });
-			return createOutputTruncatedContinueMessage({
-				reason: "output_truncated",
-				ordinal,
-				maxOrdinal: settings.maxAutoContinues,
-			});
+		if (settings.autoContinue && ranTools) {
+			// Cut off mid-answer: resume where the turn stopped instead of judging the text.
+			if (message.stopReason === "length") {
+				const excerpt = "output truncated (stopReason: length)";
+				this._recordSelfRecovery({ kind: "auto_continue", excerpt, ordinal, at: Date.now() });
+				return createOutputTruncatedContinueMessage({
+					reason: "output_truncated",
+					ordinal,
+					maxOrdinal: settings.maxAutoContinues,
+				});
+			}
+			const excerpt = announcedNextStep(message, { ranTools });
+			if (excerpt) {
+				this._recordSelfRecovery({ kind: "auto_continue", excerpt, ordinal, at: Date.now() });
+				return createAutoContinueMessage({
+					reason: "announced_next_step",
+					excerpt,
+					ordinal,
+					maxOrdinal: settings.maxAutoContinues,
+				});
+			}
 		}
-		const excerpt = announcedNextStep(message, { ranTools });
+		if (!settings.finishGate || message.stopReason !== "stop") return undefined;
+		const excerpt = completionClaimWithoutEvidence(message, {
+			ranTools,
+			promptText: lastUserPromptText(context.newMessages),
+			verifiedWork: ranTools && runHasVerificationEvidence(context.newMessages),
+		});
 		if (!excerpt) return undefined;
+		const strikes = finishGateStrikesInRun(context.newMessages);
+		if (strikes >= FINISH_GATE_MAX_STRIKES) {
+			// The claim was challenged twice and still came back bare: let the run end,
+			// and leave on the record that the claimed completion was never verified.
+			this._recordSelfRecovery({ kind: "finish_gate_released", excerpt, strikes, ordinal, at: Date.now() });
+			return undefined;
+		}
 		this._recordSelfRecovery({ kind: "auto_continue", excerpt, ordinal, at: Date.now() });
 		return createAutoContinueMessage({
-			reason: "announced_next_step",
+			reason: "finish_gate",
 			excerpt,
 			ordinal,
 			maxOrdinal: settings.maxAutoContinues,

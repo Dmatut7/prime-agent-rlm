@@ -707,9 +707,19 @@ export interface SelfRecoverySettings {
 	 */
 	childReplyNudge?: boolean;
 	/**
+	 * Default true. The finish gate: when a main-session run ends on a completion
+	 * claim ("修好了", "done") that shows no proof - no test run, no command output,
+	 * no checked file state - the session asks once for the evidence (at most
+	 * `maxAutoContinues` per prompt, shared with the other continuations). A claim
+	 * that cites its evidence, or follows a verification command that ran green, is
+	 * left alone, and a claim the model keeps repeating without proof is released
+	 * after two nudges with a note in the transcript. Pure chat never triggers it.
+	 */
+	finishGate?: boolean;
+	/**
 	 * Default 4. Automatic continues one prompt may receive, shared by the
-	 * announced-next-step and the truncated-output continuations; 0 disables them
-	 * without touching the other self-recovery actions.
+	 * announced-next-step, the truncated-output and the finish-gate continuations;
+	 * 0 disables them without touching the other self-recovery actions.
 	 */
 	maxAutoContinues?: number;
 }
@@ -1156,7 +1166,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	providerBackupModel: null,
 	providerFallbackModels: null,
 	autonomous: null,
-	selfRecovery: ["autoContinue", "childReplyNudge", "maxAutoContinues"],
+	selfRecovery: ["autoContinue", "childReplyNudge", "maxAutoContinues", "finishGate"],
 	shellPath: null,
 	quietStartup: null,
 	shellCommandPrefix: null,
@@ -1399,6 +1409,7 @@ const BOOLEAN_SWITCHES: ReadonlyArray<{ path: string; raw: (settings: Settings) 
 	{ path: "daemon.failedWorkerReapEnabled", raw: (s) => s.daemon?.failedWorkerReapEnabled },
 	{ path: "selfRecovery.autoContinue", raw: (s) => s.selfRecovery?.autoContinue },
 	{ path: "selfRecovery.childReplyNudge", raw: (s) => s.selfRecovery?.childReplyNudge },
+	{ path: "selfRecovery.finishGate", raw: (s) => s.selfRecovery?.finishGate },
 	{ path: "tools.timeout.enabled", raw: (s) => s.tools?.timeout?.enabled },
 	{ path: "ui.timelineOpenWhileWorking", raw: (s) => s.ui?.timelineOpenWhileWorking },
 	{ path: "ui.timelineAutoFold", raw: (s) => s.ui?.timelineAutoFold },
@@ -3014,12 +3025,18 @@ export class SettingsManager {
 		return Number.isFinite(raw) && raw >= 1 ? raw : 1000;
 	}
 
-	getSelfRecoverySettings(): { autoContinue: boolean; childReplyNudge: boolean; maxAutoContinues: number } {
+	getSelfRecoverySettings(): {
+		autoContinue: boolean;
+		childReplyNudge: boolean;
+		finishGate: boolean;
+		maxAutoContinues: number;
+	} {
 		const settings = this.settings.selfRecovery;
 		const maxAutoContinues = Number(settings?.maxAutoContinues ?? DEFAULT_MAX_AUTO_CONTINUES_PER_PROMPT);
 		return {
 			autoContinue: readBooleanSetting(settings?.autoContinue, true).value,
 			childReplyNudge: readBooleanSetting(settings?.childReplyNudge, false).value,
+			finishGate: readBooleanSetting(settings?.finishGate, true).value,
 			maxAutoContinues: Number.isFinite(maxAutoContinues)
 				? Math.max(0, Math.floor(maxAutoContinues))
 				: DEFAULT_MAX_AUTO_CONTINUES_PER_PROMPT,

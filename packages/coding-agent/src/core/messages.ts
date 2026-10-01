@@ -488,7 +488,12 @@ export function createEmptyResponseRecoveryMessage(
 
 /** Details of an automatic continue (see self-recovery.ts). */
 export interface AutoContinueMessageDetails {
-	reason: "announced_next_step" | "child_reply_missing";
+	/**
+	 * announced_next_step: the reply ended on a plan it never carried out.
+	 * child_reply_missing: a subagent finished without sending its result.
+	 * finish_gate: the reply declared the work done without showing the proof.
+	 */
+	reason: "announced_next_step" | "child_reply_missing" | "finish_gate";
 	excerpt?: string;
 	ordinal: number;
 	/**
@@ -502,7 +507,8 @@ export interface AutoContinueMessageDetails {
 
 /**
  * The session's own continue after a turn that stopped right after announcing its
- * next step (or a subagent that finished without replying): the model is told plainly
+ * next step, after a run that ended on an unproven completion claim (the finish
+ * gate), or for a subagent that finished without replying: the model is told plainly
  * what happened and that nobody is waiting to approve it. `display: true` keeps it
  * visible and auditable.
  */
@@ -516,11 +522,17 @@ export function createAutoContinueMessage(
 					"[auto-continue] You ended your run without sending your result to your parent agent, which is waiting for it. The parent sees only what you send; your final text stays in your own transcript.",
 					'If your task calls for an answer, send it now with `await agent_message.send(<your result>, receiver_role="parent")`, then stop. If no answer is needed, reply with one short line saying so.',
 				].join("\n")
-			: [
-					`[auto-continue] Your last reply ended by announcing a next step (${JSON.stringify(details.excerpt ?? "")}) but the turn stopped before doing it. If the owner left this running, a stop here leaves the work half done until they come back.`,
-					"Whether stopping is right depends on the task, not on that sentence: on whether the work the owner asked for is finished and you have seen proof of it. While the work is unfinished, the announced step is simply the next thing to do. Once it is finished and proven, the sentence was an offer, and the owner gains most from the final result stated plainly. Some steps are the owner's to authorize (irreversible, spending money, sending anything outside this machine), and an automatic continue is not their consent; for those, and for anything blocked or needing a decision only they can make, a useful stop says exactly what is needed.",
-					`This is an automatic continue (${details.ordinal} of at most ${details.maxOrdinal} for this request).`,
-				].join("\n");
+			: details.reason === "finish_gate"
+				? [
+						`[finish gate] Your last reply declares the work done (${JSON.stringify(details.excerpt ?? "")}), but nothing in it shows the proof: no test run, no command output, no checked file state backs the claim. If the owner left this running, a bare claim reads as a finished task whether or not it is one.`,
+						"Back the claim or drop it. Run the check that proves the work (the tests, the build, the command whose output should have changed) and quote its result, or point at the tool output above that already proves it. If the check fails, fix and verify again. If nothing here can prove it (the owner's environment, credentials, production), say exactly what the owner must run: that is a useful stop, and a bare claim is not.",
+						`This is an automatic continue (${details.ordinal} of at most ${details.maxOrdinal} for this request).`,
+					].join("\n")
+				: [
+						`[auto-continue] Your last reply ended by announcing a next step (${JSON.stringify(details.excerpt ?? "")}) but the turn stopped before doing it. If the owner left this running, a stop here leaves the work half done until they come back.`,
+						"Whether stopping is right depends on the task, not on that sentence: on whether the work the owner asked for is finished and you have seen proof of it. While the work is unfinished, the announced step is simply the next thing to do. Once it is finished and proven, the sentence was an offer, and the owner gains most from the final result stated plainly. Some steps are the owner's to authorize (irreversible, spending money, sending anything outside this machine), and an automatic continue is not their consent; for those, and for anything blocked or needing a decision only they can make, a useful stop says exactly what is needed.",
+						`This is an automatic continue (${details.ordinal} of at most ${details.maxOrdinal} for this request).`,
+					].join("\n");
 	return {
 		role: "custom",
 		customType: AUTO_CONTINUE_CUSTOM_TYPE,

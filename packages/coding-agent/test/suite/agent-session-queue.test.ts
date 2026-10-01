@@ -3840,7 +3840,7 @@ describe("AgentSession withdrawn completion notices", () => {
 		let providerSawParkedContext = false;
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
-			fauxAssistantMessage("Finished the original work."),
+			fauxAssistantMessage("The original work wrapped up."),
 			(context) => {
 				providerSawParkedContext = context.messages.some((message) => getMessageText(message) === "carry this");
 				return fauxAssistantMessage("Follow-up turn complete.");

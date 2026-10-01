@@ -232,15 +232,15 @@ describe("a terminal notice published after its verdict went stale", () => {
 
 		parent.setResponses([
 			fauxAssistantMessage(fauxToolCall("hold_the_turn", {}), { stopReason: "toolUse" }),
-			fauxAssistantMessage("the long parent turn finished"),
+			fauxAssistantMessage("the long parent turn ended"),
 			fauxAssistantMessage("the parent read what was queued"),
 			fauxAssistantMessage("the parent is idle again"),
 			fauxAssistantMessage("the parent stays idle"),
 		]);
 		child.setResponses([
 			fauxAssistantMessage(fauxToolCall("reply_to_parent", {}), { stopReason: "toolUse" }),
-			fauxAssistantMessage("the child finished after replying"),
-			fauxAssistantMessage("the child finished a second, silent task"),
+			fauxAssistantMessage("the child wrapped up after replying"),
+			fauxAssistantMessage("the child wrapped up a second, silent task"),
 		]);
 
 		// The parent is mid-turn for the whole child run, which is what makes the
@@ -377,7 +377,7 @@ describe("a terminal notice published after its verdict went stale", () => {
 		family.child = child;
 		parent.setResponses([
 			fauxAssistantMessage(fauxToolCall("hold_the_turn", {}), { stopReason: "toolUse" }),
-			fauxAssistantMessage("the long parent turn finished"),
+			fauxAssistantMessage("the long parent turn ended"),
 			fauxAssistantMessage("the parent read the child's own error report"),
 			fauxAssistantMessage("the parent is idle again"),
 		]);
@@ -594,7 +594,7 @@ describe("a terminal notice published after its verdict went stale", () => {
 		family.child = child;
 		parent.setResponses([
 			fauxAssistantMessage(fauxToolCall("hold_the_turn", {}), { stopReason: "toolUse" }),
-			fauxAssistantMessage("the long parent turn finished"),
+			fauxAssistantMessage("the long parent turn ended"),
 			fauxAssistantMessage("the parent read the child's own error report"),
 			fauxAssistantMessage("the parent keeps working"),
 			fauxAssistantMessage("the parent is idle again"),

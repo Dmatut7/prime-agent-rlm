@@ -250,7 +250,7 @@ describe("image routing across interruptions, follow-ups, lag and fallback", () 
 				fauxAssistantMessage([fauxText("图里是登录页，按钮错位了。"), fauxToolCall("run_step", {})], {
 					stopReason: "toolUse",
 				}),
-				fauxAssistantMessage("修好了。"),
+				fauxAssistantMessage("修好了，已验证过截图。"),
 			],
 			served,
 		);
@@ -265,7 +265,10 @@ describe("image routing across interruptions, follow-ups, lag and fallback", () 
 		const h = await harness();
 		const served: Served[] = [];
 		const toolOnly = () => fauxAssistantMessage(fauxToolCall("run_step", {}), { stopReason: "toolUse" });
-		const script = [...Array.from({ length: IMAGE_ROUTE_MAX_REQUESTS }, toolOnly), fauxAssistantMessage("完成。")];
+		const script = [
+			...Array.from({ length: IMAGE_ROUTE_MAX_REQUESTS }, toolOnly),
+			fauxAssistantMessage("完成，已验证通过。"),
+		];
 		const step = scripted(script, served);
 		h.setResponses(script.map(() => step));
 
@@ -285,7 +288,7 @@ describe("image routing across interruptions, follow-ups, lag and fallback", () 
 				fauxAssistantMessage([fauxText("图里是登录页，按钮错位了。"), fauxToolCall("run_step", {})], {
 					stopReason: "toolUse",
 				}),
-				fauxAssistantMessage("修好了。"),
+				fauxAssistantMessage("修好了，已验证过截图。"),
 			],
 			served,
 		);
@@ -378,7 +381,7 @@ describe("image routing across interruptions, follow-ups, lag and fallback", () 
 					fauxAssistantMessage([fauxText("截图里是登录页，按钮错位了。"), fauxToolCall("run_step", {})], {
 						stopReason: "toolUse",
 					}),
-					fauxAssistantMessage("修好了。"),
+					fauxAssistantMessage("修好了，已验证过截图。"),
 				],
 				served,
 			);
@@ -400,7 +403,7 @@ describe("image routing across interruptions, follow-ups, lag and fallback", () 
 					fauxAssistantMessage([fauxText("图里是登录页，按钮错位了。"), fauxToolCall("run_step", {})], {
 						stopReason: "toolUse",
 					}),
-					fauxAssistantMessage("修好了。"),
+					fauxAssistantMessage("修好了，已验证过截图。"),
 				],
 				served,
 			);

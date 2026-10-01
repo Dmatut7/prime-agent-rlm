@@ -133,7 +133,7 @@ describe("self-recovery: silent steps", () => {
 		const harness = await stuckHarness(commandTool(5_000));
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("run_command", { command: "sleep 999" }), { stopReason: "toolUse" }),
-			fauxAssistantMessage("换了个办法，已完成。"),
+			fauxAssistantMessage("换了个办法，这次跑通了。"),
 		]);
 		const started = Date.now();
 		await harness.session.promptAndWait("run it");
@@ -230,7 +230,7 @@ describe("self-recovery: silent steps", () => {
 			fauxAssistantMessage(fauxToolCall("run_command", { command: "timeout 4 ./long-quiet-job" }), {
 				stopReason: "toolUse",
 			}),
-			fauxAssistantMessage("完成。"),
+			fauxAssistantMessage("长任务跑完了，输出正常。"),
 		]);
 		await harness.session.promptAndWait("run the job");
 
@@ -307,7 +307,7 @@ describe("self-recovery: calls the kernel cannot vouch for", () => {
 		harnesses.push(harness);
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("run_command", { command }), { stopReason: "toolUse" }),
-			fauxAssistantMessage("done"),
+			fauxAssistantMessage("命令输出已拿到。"),
 		]);
 		await harness.session.promptAndWait("go");
 		return toolResultTexts(harness)[0] ?? "";
@@ -411,7 +411,7 @@ describe("self-recovery: announced-but-undone steps", () => {
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("read_file", { path: "a.ts" }), { stopReason: "toolUse" }),
 			fauxAssistantMessage("第一个文件看完了，接下来我去改第二个文件"),
-			fauxAssistantMessage("两个文件都改好了，全部完成。"),
+			fauxAssistantMessage("两个文件都改好了，测试全部通过。"),
 		]);
 		await harness.session.promptAndWait("fix both files");
 
@@ -459,7 +459,7 @@ describe("self-recovery: announced-but-undone steps", () => {
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("read_file", { path: "a.ts" }), { stopReason: "toolUse" }),
 			fauxAssistantMessage("分析到一半", { stopReason: "length" }),
-			fauxAssistantMessage("两个文件都改好了，全部完成。"),
+			fauxAssistantMessage("两个文件都改好了，测试全部通过。"),
 		]);
 		await harness.session.promptAndWait("fix both files");
 
@@ -499,7 +499,7 @@ describe("self-recovery: announced-but-undone steps", () => {
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("read_file", { path: "a.ts" }), { stopReason: "toolUse" }),
 			fauxAssistantMessage("第一个文件看完了，接下来我改第二个文件，可以吗？"),
-			fauxAssistantMessage("两个文件都改好了，全部完成。"),
+			fauxAssistantMessage("两个文件都改好了，测试全部通过。"),
 		]);
 		await harness.session.promptAndWait("fix both files");
 
@@ -508,7 +508,7 @@ describe("self-recovery: announced-but-undone steps", () => {
 	});
 
 	it.each([
-		["a final answer", "两个文件都改好了，结论是配置写错了。"],
+		["a final answer", "两个文件都改好了，测试全部通过；结论是配置写错了。"],
 		["a question to the user", "改之前要不要我先备份？"],
 		["waiting on children", "子代理已派出，等待子代理回复。"],
 	])("never continues %s", async (_name, reply) => {
@@ -540,6 +540,151 @@ describe("self-recovery: announced-but-undone steps", () => {
 		await harness.session.promptAndWait("fix both files");
 
 		expect(autoContinues(harness)).toHaveLength(0);
+	});
+});
+
+describe("self-recovery: finish gate", () => {
+	const harnesses: Harness[] = [];
+	afterEach(() => {
+		while (harnesses.length > 0) harnesses.pop()?.cleanup();
+	});
+
+	function quickTool(): AgentTool {
+		return {
+			name: "read_file",
+			label: "Read",
+			description: "Reads",
+			parameters: Type.Object({ path: Type.String() }),
+			execute: async () => ({ content: [{ type: "text", text: "file body" }], details: {} }),
+		};
+	}
+
+	function commandTool(): AgentTool {
+		return {
+			name: "run_command",
+			label: "Run Command",
+			description: "Runs a command",
+			parameters: Type.Object({ command: Type.String() }),
+			execute: async () => ({ content: [{ type: "text", text: "command finished" }], details: {} }),
+		};
+	}
+
+	async function harnessWith(settings = {}, tools: AgentTool[] = [quickTool()]): Promise<Harness> {
+		const harness = await createHarness({ tools, settings });
+		harnesses.push(harness);
+		return harness;
+	}
+
+	it("asks for the proof when a run ends on a bare completion claim", async () => {
+		const harness = await harnessWith();
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("read_file", { path: "a.ts" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("修好了。"),
+			fauxAssistantMessage("修好了，测试全部通过：47 个用例全绿。"),
+		]);
+		await harness.session.promptAndWait("fix it");
+
+		expect(harness.faux.state.callCount).toBe(3);
+		const nudges = autoContinues(harness);
+		expect(nudges).toHaveLength(1);
+		const content = String((nudges[0] as { content: unknown }).content);
+		expect(content).toContain("[finish gate]");
+		expect(content).toContain("1 of at most 4");
+		expect(readSelfRecoveryRecords(harness.sessionManager.getBranch())).toMatchObject([
+			{ kind: "auto_continue", ordinal: 1 },
+		]);
+	});
+
+	it("releases after two nudges when the claim stays bare, and says so on the record", async () => {
+		const harness = await harnessWith();
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("read_file", { path: "a.ts" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("修好了。"),
+			fauxAssistantMessage("搞定了。"),
+			fauxAssistantMessage("全部完成。"),
+		]);
+		await harness.session.promptAndWait("fix it");
+
+		// Two nudges, then the run is let go instead of nudging forever.
+		expect(autoContinues(harness)).toHaveLength(2);
+		expect(harness.faux.state.callCount).toBe(4);
+		expect(readSelfRecoveryRecords(harness.sessionManager.getBranch())).toMatchObject([
+			{ kind: "auto_continue", ordinal: 1 },
+			{ kind: "auto_continue", ordinal: 2 },
+			{ kind: "finish_gate_released", strikes: 2 },
+		]);
+		expect(dutyEvents(harness)).toContainEqual(expect.objectContaining({ kind: "decision_needed" }));
+	});
+
+	it("never gates a claim that cites its evidence", async () => {
+		const harness = await harnessWith();
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("read_file", { path: "a.ts" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("修好了，测试全部通过。"),
+		]);
+		await harness.session.promptAndWait("fix it");
+
+		expect(autoContinues(harness)).toHaveLength(0);
+		expect(harness.faux.state.callCount).toBe(2);
+	});
+
+	it("never gates a claim backed by a verification command that ran green", async () => {
+		const harness = await harnessWith({}, [commandTool()]);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("run_command", { command: "npm test" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("修好了。"),
+		]);
+		await harness.session.promptAndWait("fix it");
+
+		expect(autoContinues(harness)).toHaveLength(0);
+		expect(harness.faux.state.callCount).toBe(2);
+	});
+
+	it("gates a claim made with no tool work at all when the prompt asked for work", async () => {
+		const harness = await harnessWith();
+		harness.setResponses([
+			fauxAssistantMessage("修好了。"),
+			fauxAssistantMessage("这里无法验证：需要你本地跑 npm test。"),
+		]);
+		await harness.session.promptAndWait("修复这个崩溃");
+
+		expect(autoContinues(harness)).toHaveLength(1);
+		expect(harness.faux.state.callCount).toBe(2);
+	});
+
+	it("leaves pure chat alone", async () => {
+		const harness = await harnessWith();
+		harness.setResponses([fauxAssistantMessage("搞定了。")]);
+		await harness.session.promptAndWait("你好");
+
+		expect(autoContinues(harness)).toHaveLength(0);
+		expect(harness.faux.state.callCount).toBe(1);
+	});
+
+	it("is off when selfRecovery.finishGate is false", async () => {
+		const harness = await harnessWith({ selfRecovery: { finishGate: false } });
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("read_file", { path: "a.ts" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("修好了。"),
+		]);
+		await harness.session.promptAndWait("fix it");
+
+		expect(autoContinues(harness)).toHaveLength(0);
+		expect(harness.faux.state.callCount).toBe(2);
+	});
+
+	it("counts gate nudges into the per-prompt budget", async () => {
+		const harness = await harnessWith({ selfRecovery: { maxAutoContinues: 1 } });
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("read_file", { path: "a.ts" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("修好了。"),
+			fauxAssistantMessage("搞定了。"),
+		]);
+		await harness.session.promptAndWait("fix it");
+
+		// The one budgeted continue went to the gate; the second bare claim ends the run.
+		expect(autoContinues(harness)).toHaveLength(1);
+		expect(harness.faux.state.callCount).toBe(3);
 	});
 });
 

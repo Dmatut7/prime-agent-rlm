@@ -231,7 +231,7 @@ describe("AgentSession prompt characterization", () => {
 
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("echo", { text: "hello" }), { stopReason: "toolUse" }),
-			fauxAssistantMessage("done"),
+			fauxAssistantMessage("the echo came back"),
 		]);
 
 		await harness.session.prompt("start");

@@ -885,7 +885,7 @@ describe("AgentSession concurrent prompt guard", () => {
 					if (toolResultCount > 0) {
 						const message: AssistantMessage = {
 							role: "assistant",
-							content: [{ type: "text", text: "done" }],
+							content: [{ type: "text", text: "the result is in" }],
 							api: "anthropic-messages",
 							provider: "anthropic",
 							model: "mock",
@@ -1031,7 +1031,7 @@ describe("AgentSession concurrent prompt guard", () => {
 					if (hasToolResult) {
 						const message: AssistantMessage = {
 							role: "assistant",
-							content: [{ type: "text", text: "done" }],
+							content: [{ type: "text", text: "the result is in" }],
 							api: "anthropic-messages",
 							provider: "anthropic",
 							model: "mock",
