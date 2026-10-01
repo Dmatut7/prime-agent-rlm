@@ -33,6 +33,7 @@ import {
 	SessionSelectorError,
 	SessionSelectorNotFoundError,
 } from "./cli/session-resolver.js";
+import { getStdoutWidth, wrapForStderr } from "./cli/stdout-wrap.js";
 import { APP_NAME, expandTildePath, getAgentDir, getSessionDirEnvOverride, VERSION } from "./config.js";
 import {
 	type AgentExecutionMode,
@@ -164,11 +165,11 @@ function takeInteractiveTelemetryNotice(services: AgentSessionServices): string 
 	return notice;
 }
 
-function reportDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]): void {
+export function reportDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]): void {
 	for (const diagnostic of diagnostics) {
 		const color = diagnostic.type === "error" ? chalk.red : diagnostic.type === "warning" ? chalk.yellow : chalk.dim;
 		const prefix = diagnostic.type === "error" ? "Error: " : diagnostic.type === "warning" ? "Warning: " : "";
-		console.error(color(`${prefix}${diagnostic.message}`));
+		console.error(wrapForStderr(color(`${prefix}${diagnostic.message}`), { continuationIndent: prefix.length }));
 	}
 }
 
@@ -432,16 +433,19 @@ async function promptConfirm(message: string): Promise<boolean> {
 }
 
 // Only busy sessions (streaming, compacting, or pending messages) lose work;
-// idle loaded sessions reload from disk on the fresh daemon.
-const STARTUP_SESSION_LOSS_COPY: DaemonSessionLossCopy = {
+// idle loaded sessions reload from disk on the fresh daemon. Every variant
+// names the no-loss alternative: a private --daemon-socket leaves the running
+// service alone instead of stopping it.
+export const STARTUP_SESSION_LOSS_COPY: DaemonSessionLossCopy = {
 	busyDetail(count) {
 		const { noun, pronoun } = pluralizeSessions(count);
-		return `A background service from a different Prime Agent version is running with ${count} busy ${noun}. Stopping it will terminate ${pronoun}.`;
+		return `A background service from a different Prime Agent version is running with ${count} busy ${noun}. Stopping it will terminate ${pronoun}; to keep it running, cancel and re-run with --daemon-socket <path>.`;
 	},
 	unlistableDetail:
-		"A background service from a different Prime Agent version is running and its sessions could not be listed. Stopping it may terminate active sessions.",
+		"A background service from a different Prime Agent version is running and its sessions could not be listed. Stopping it may terminate active sessions; to keep it running, cancel and re-run with --daemon-socket <path>.",
 	question: "Stop it and continue?",
-	nonTtyHint: 'Run "prime-agent shutdown" to stop it, then retry.',
+	nonTtyHint:
+		'Run "prime-agent shutdown" to stop it, then retry, or re-run with --daemon-socket <path> to keep it running.',
 };
 
 // The promise to keep after awaiting readiness. Wrapped in an object so it
@@ -463,7 +467,9 @@ async function takeOverStaleDaemonOrExit(socketPath: string): Promise<DaemonRead
 	}
 	if (!(await shutdownDaemonAndWait(socketPath))) {
 		console.error(
-			chalk.red(`Could not stop the background service on ${socketPath}. Run "prime-agent shutdown" and retry.`),
+			wrapForStderr(
+				chalk.red(`Could not stop the background service on ${socketPath}. Run "prime-agent shutdown" and retry.`),
+			),
 		);
 		process.exit(1);
 	}
@@ -472,7 +478,7 @@ async function takeOverStaleDaemonOrExit(socketPath: string): Promise<DaemonRead
 		await ready;
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		console.error(chalk.red(`Could not start the background service: ${message}`));
+		console.error(wrapForStderr(chalk.red(`Could not start the background service: ${message}`)));
 		process.exit(1);
 	}
 	return { ready };
@@ -1358,7 +1364,7 @@ export async function main(args: string[], options?: MainOptions) {
 		process.exit(0);
 	}
 	if (parsed.help) {
-		console.log(formatTopLevelHelp());
+		console.log(formatTopLevelHelp(getStdoutWidth()));
 		process.exit(0);
 	}
 
@@ -1735,7 +1741,7 @@ export async function main(args: string[], options?: MainOptions) {
 		} catch (error) {
 			const startupError = describeSessionStartupError(error);
 			if (startupError) {
-				console.error(chalk.red(startupError));
+				console.error(wrapForStderr(chalk.red(startupError)));
 				process.exit(1);
 			}
 			throw error;
@@ -1835,7 +1841,7 @@ export async function main(args: string[], options?: MainOptions) {
 		} catch (error) {
 			const startupError = describeSessionStartupError(error);
 			if (startupError) {
-				console.error(chalk.red(startupError));
+				console.error(wrapForStderr(chalk.red(startupError)));
 				process.exit(1);
 			}
 			throw error;
@@ -1900,7 +1906,7 @@ export async function main(args: string[], options?: MainOptions) {
 	} catch (error) {
 		const startupError = describeSessionStartupError(error);
 		if (startupError) {
-			console.error(chalk.red(startupError));
+			console.error(wrapForStderr(chalk.red(startupError)));
 			process.exit(1);
 		}
 		throw error;

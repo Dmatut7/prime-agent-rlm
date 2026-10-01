@@ -28,6 +28,7 @@ import { discoverDaemons, runPs, runReap, runShutdownSelection } from "./daemon-
 import { resolveStopSelection, type StopSelectionFlags } from "./daemon-stop-scope.js";
 import { DAEMON_UPDATE_RESTART_COORDINATOR_FLAG } from "./daemon-update-restart.js";
 import { collectReadonlyDoctorChecks, type DoctorCheck, resolveDoctorCheckRoots } from "./doctor-checks.js";
+import { getStdoutWidth } from "./stdout-wrap.js";
 
 export interface PublicCommandResult {
 	handled: boolean;
@@ -181,13 +182,13 @@ function continueWith(args: string[]): PublicCommandResult {
 
 function printRequestedHelp(path: string[]): PublicCommandResult {
 	if (path.length === 0) {
-		console.log(formatTopLevelHelp());
+		console.log(formatTopLevelHelp(getStdoutWidth()));
 		return HANDLED;
 	}
 	if (REMOVED_COMMAND_NAMES.has(path[0]!)) {
 		return rejectRemovedCommand(path);
 	}
-	const help = formatCommandHelp(path);
+	const help = formatCommandHelp(path, getStdoutWidth());
 	if (help) {
 		console.log(help);
 		return HANDLED;

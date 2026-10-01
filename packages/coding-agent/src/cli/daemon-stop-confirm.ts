@@ -13,17 +13,26 @@
 import { createInterface } from "node:readline";
 import chalk from "chalk";
 import { isSessionBusy, type RunningDaemonProbe } from "./daemon-launch.js";
+import { getStderrWidth, getStdoutWidth, wrapCliText } from "./stdout-wrap.js";
+
+/** promptYesNo appends this after the message; prompts reserve its width so the suffix never overflows the last line. */
+const YES_NO_SUFFIX = " [y/N] ";
 
 /** Prompt for a yes/no answer at a TTY. Empty/anything-but-yes resolves false (default No). */
 export function promptYesNo(message: string): Promise<boolean> {
 	return new Promise((resolve) => {
 		const rl = createInterface({ input: process.stdin, output: process.stdout });
-		rl.question(`${message} [y/N] `, (answer) => {
+		rl.question(`${message}${YES_NO_SUFFIX}`, (answer) => {
 			rl.close();
 			const normalized = answer.trim().toLowerCase();
 			resolve(normalized === "y" || normalized === "yes");
 		});
 	});
+}
+
+/** Word-wrap a confirmation prompt to the terminal, keeping room for the yes/no suffix. */
+export function formatConfirmPromptText(message: string, width: number | undefined): string {
+	return wrapCliText(message, width, { reserveColumns: YES_NO_SUFFIX.length });
 }
 
 export function pluralizeSessions(count: number): { noun: string; pronoun: string } {
@@ -69,8 +78,8 @@ export async function confirmDaemonSessionLoss(
 		detail = copy.busyDetail(busySessionCount);
 	}
 	if (!process.stdin.isTTY) {
-		console.error(chalk.red(`${detail} ${copy.nonTtyHint}`));
+		console.error(chalk.red(wrapCliText(`${detail} ${copy.nonTtyHint}`, getStderrWidth())));
 		return false;
 	}
-	return promptYesNo(`${detail} ${copy.question}`);
+	return promptYesNo(formatConfirmPromptText(`${detail} ${copy.question}`, getStdoutWidth()));
 }

@@ -1,0 +1,1 @@
+- Fixed `--help` and startup errors hard-folding mid-word at narrow terminals: help tables, diagnostics, and the stale-daemon conflict prompt now word-wrap to the terminal width with hanging indents, and the conflict message names `--daemon-socket` as the keep-it-running alternative.

@@ -1,12 +1,13 @@
 import { APP_NAME } from "../config.js";
 import { findSlashCommandSuggestion } from "../core/slash-commands.js";
+import { formatAlignedRows, wrapCliText } from "./stdout-wrap.js";
 
 export interface CommandSpec {
 	path: readonly string[];
 	usage: string;
 	summary: string;
 	description?: string;
-	options?: readonly string[];
+	options?: readonly (readonly [option: string, summary: string])[];
 	examples?: readonly string[];
 }
 
@@ -25,7 +26,10 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		path: ["list"],
 		usage: "list [--all] [--json]",
 		summary: "List agents",
-		options: ["-a, --all  Include saved agents", "--json      Print JSON"],
+		options: [
+			["-a, --all", "Include saved agents"],
+			["--json", "Print JSON"],
+		],
 	},
 	{
 		path: ["attach"],
@@ -47,10 +51,10 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		usage: "send [--from <agent>] [--steer|--follow-up] <agent> <message>",
 		summary: "Send a message to an agent",
 		options: [
-			"--from <agent>  Identify the sending agent",
-			"--steer         Deliver as steering when the agent is busy",
-			"--follow-up     Queue the message after the current turn",
-			"--json          Print JSON",
+			["--from <agent>", "Identify the sending agent"],
+			["--steer", "Deliver as steering when the agent is busy"],
+			["--follow-up", "Queue the message after the current turn"],
+			["--json", "Print JSON"],
 		],
 	},
 	{
@@ -87,13 +91,13 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		description:
 			"Without --fix, doctor is strictly read-only: it prints the background service table plus health checks (stored auth credentials, kernel venv readiness, session transcript headers), each with a verdict and the next step to take. --fix cleans only the services in scope, and the scope is the socket dir this shell talks to, never the whole machine. --dry-run prints the per-service plan without touching anything; --orphans refuses every service that still has live sessions, worker processes or cpu. Repeat with --all to widen to every daemon discovered on this machine.",
 		options: [
-			"--fix           Remove stale sockets and stop idle services in scope",
-			"--dry-run       List each cleanup target without touching anything",
-			"--all           Whole-machine scope: every daemon discovered on this machine",
-			"--socket <path> Clean only the daemon on this socket",
-			"--socket-dir <dir>  Clean only daemons whose socket lives in this directory",
-			"--orphans       Skip anything with live sessions, worker processes or cpu",
-			"--json          Print JSON",
+			["--fix", "Remove stale sockets and stop idle services in scope"],
+			["--dry-run", "List each cleanup target without touching anything"],
+			["--all", "Whole-machine scope: every daemon discovered on this machine"],
+			["--socket <path>", "Clean only the daemon on this socket"],
+			["--socket-dir <dir>", "Clean only daemons whose socket lives in this directory"],
+			["--orphans", "Skip anything with live sessions, worker processes or cpu"],
+			["--json", "Print JSON"],
 		],
 	},
 	{
@@ -102,7 +106,10 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		summary: "Inspect and run the disk-retention sweep",
 		description:
 			"Retention reclaims only resources no live session references: deleted sessions' artifact leftovers, kernel venv and kernel snapshot generations, log files whose socket is gone, empty prime-agent-rlm-* temp directories, pi-bash temp files, and stale session leases. Configure gaps and switches under retention.* in settings.json; retention.enabled=false reports without deleting.",
-		options: ["--dry-run  Report what a sweep would reclaim without deleting", "--json     Print JSON"],
+		options: [
+			["--dry-run", "Report what a sweep would reclaim without deleting"],
+			["--json", "Print JSON"],
+		],
 		examples: [`retention status`, `retention sweep --dry-run`],
 	},
 	{
@@ -112,13 +119,13 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		description:
 			"Scope defaults to this shell's own socket dir, i.e. the services `list`/`attach`/`stop` talk to; every other daemon on the machine is named and left running. Stopping the whole machine requires --all. Either way the pre-stop report names each socket, its pid and its live session count, and --force prints that report instead of skipping it.",
 		options: [
-			"--force             Skip the confirmation and kill unresponsive processes (still names every target)",
-			"--all               Whole-machine scope: every daemon discovered on this machine",
-			"--socket <path>     Stop only the daemon on this socket",
-			"--socket-dir <dir>  Stop only daemons whose socket lives in this directory",
-			"--orphans           Stop only services with no live sessions, workers or cpu",
-			"--dry-run           Print the scoped plan without stopping anything",
-			"--json              Print JSON",
+			["--force", "Skip the confirmation and kill unresponsive processes (still names every target)"],
+			["--all", "Whole-machine scope: every daemon discovered on this machine"],
+			["--socket <path>", "Stop only the daemon on this socket"],
+			["--socket-dir <dir>", "Stop only daemons whose socket lives in this directory"],
+			["--orphans", "Stop only services with no live sessions, workers or cpu"],
+			["--dry-run", "Print the scoped plan without stopping anything"],
+			["--json", "Print JSON"],
 		],
 		examples: ["shutdown --dry-run", "shutdown --socket /tmp/ci/daemon.sock", "shutdown --all --force"],
 	},
@@ -158,13 +165,13 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		path: ["package", "install"],
 		usage: "package install <source> [--local]",
 		summary: "Install a capability package",
-		options: ["--local  Install into the current project instead of the user configuration"],
+		options: [["--local", "Install into the current project instead of the user configuration"]],
 	},
 	{
 		path: ["package", "remove"],
 		usage: "package remove <source> [--local]",
 		summary: "Remove a capability package",
-		options: ["--local  Remove from the current project configuration"],
+		options: [["--local", "Remove from the current project configuration"]],
 	},
 	{
 		path: ["package", "list"],
@@ -329,50 +336,57 @@ export function findCommandSuggestion(input: string, candidates: readonly string
 	return findSlashCommandSuggestion(input, candidates);
 }
 
-export function formatTopLevelHelp(): string {
+export function formatTopLevelHelp(width?: number): string {
 	const commands = COMMAND_SPECS.filter((spec) => spec.path.length === 1);
-	const commandWidth = Math.max(...commands.map((spec) => spec.path[0]!.length));
-	const options = TOP_LEVEL_OPTION_GROUPS.map((group) => formatOptionGroup(group.heading, group.options)).join("\n\n");
-	return `${APP_NAME} - AI coding assistant with a Python REPL tool
-
-Usage:
-  ${APP_NAME} [options] [@files...] [message...]
-  ${APP_NAME} <command> [args...]
-
-Options:
-${options}
-
-Commands:
-${commands.map((spec) => `  ${spec.path[0]!.padEnd(commandWidth)}  ${spec.summary}`).join("\n")}
-
-Run "${APP_NAME} help <command>" for command details.`;
+	const options = TOP_LEVEL_OPTION_GROUPS.map((group) => formatOptionGroup(group.heading, group.options, width)).join(
+		"\n\n",
+	);
+	const title = wrapCliText(`${APP_NAME} - AI coding assistant with a Python REPL tool`, width);
+	const usage = wrapCliText(
+		`  ${APP_NAME} [options] [@files...] [message...]\n  ${APP_NAME} <command> [args...]`,
+		width,
+		{
+			continuationIndent: 4,
+		},
+	);
+	const commandRows = formatAlignedRows(
+		commands.map((spec) => [spec.path[0]!, spec.summary] as const),
+		width,
+	).join("\n");
+	const footer = wrapCliText(`Run "${APP_NAME} help <command>" for command details.`, width);
+	return `${title}\n\nUsage:\n${usage}\n\nOptions:\n${options}\n\nCommands:\n${commandRows}\n\n${footer}`;
 }
 
-function formatOptionGroup(heading: string, options: readonly TopLevelOption[]): string {
-	const width = Math.max(...options.map(([option]) => option.length));
-	return `${heading}:\n${options.map(([option, summary]) => `  ${option.padEnd(width)}  ${summary}`).join("\n")}`;
+function formatOptionGroup(heading: string, options: readonly TopLevelOption[], width?: number): string {
+	return `${heading}:\n${formatAlignedRows(options, width).join("\n")}`;
 }
 
-export function formatCommandHelp(path: readonly string[]): string | undefined {
+export function formatCommandHelp(path: readonly string[], width?: number): string | undefined {
 	const spec = getCommandSpec(path);
 	if (!spec) {
 		return undefined;
 	}
 	const children = getChildCommandSpecs(path);
-	const sections = [`Usage:\n  ${APP_NAME} ${spec.usage}`, "", `${spec.summary}.`];
+	const sections = [
+		`Usage:\n${wrapCliText(`  ${APP_NAME} ${spec.usage}`, width, { continuationIndent: 4 })}`,
+		"",
+		`${spec.summary}.`,
+	];
 	if (spec.description) {
-		sections.push("", spec.description);
+		sections.push("", wrapCliText(spec.description, width));
 	}
 	if (children.length > 0) {
-		const width = Math.max(...children.map((child) => child.path.at(-1)!.length));
 		sections.push(
 			"",
 			"Commands:",
-			...children.map((child) => `  ${child.path.at(-1)!.padEnd(width)}  ${child.summary}`),
+			...formatAlignedRows(
+				children.map((child) => [child.path.at(-1)!, child.summary] as const),
+				width,
+			),
 		);
 	}
 	if (spec.options && spec.options.length > 0) {
-		sections.push("", "Options:", ...spec.options.map((option) => `  ${option}`));
+		sections.push("", "Options:", ...formatAlignedRows(spec.options, width));
 	}
 	if (spec.examples && spec.examples.length > 0) {
 		sections.push("", "Examples:", ...spec.examples.map((example) => `  ${APP_NAME} ${example}`));
