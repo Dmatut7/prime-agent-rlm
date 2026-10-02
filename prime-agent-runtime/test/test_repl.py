@@ -745,7 +745,8 @@ class ReplTest(unittest.TestCase):
             payload = {"x": dill.dumps(1)}
             with open(path, "wb") as fh:
                 dill.dump(payload, fh)
-            data = open(path, "rb").read()
+            with open(path, "rb") as fh:
+                data = fh.read()
             with open(path, "wb") as fh:
                 fh.write(data[: max(1, len(data) // 2)])  # simulate a torn write
             self.repl.send({"type": "restore", "id": "r0", "path": path})

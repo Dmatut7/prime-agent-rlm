@@ -15,14 +15,17 @@ import { SettingsManager } from "../src/core/settings-manager.js";
 import { assistantMsg, createTestResourceLoader } from "./utilities.js";
 
 const IMAGE: ImageContent = { type: "image", mimeType: "image/png", data: "aGk=" };
-const SET = { imageModel: "claude-haiku-4-5" };
-const SET_BLOCKED = { imageModel: "claude-haiku-4-5", images: { blockImages: true } };
+// Bare "claude-haiku-4-5" also exists under the ambient claude-code provider (any
+// machine with the `claude` binary), which makes a bare id unresolvable here; pin
+// the provider so the settings reference survives ambient credentials.
+const SET = { imageModel: "anthropic/claude-haiku-4-5" };
+const SET_BLOCKED = { imageModel: "anthropic/claude-haiku-4-5", images: { blockImages: true } };
 const SET_UNUSABLE = { imageModel: "openai/gpt-5.4" };
 const SET_TEXTONLY = { imageModel: "deepseek/deepseek-v4-pro" };
 const RETRY = { enabled: true, maxRetries: 3, baseDelayMs: 1 };
 const SET_BACKUP_TEXT = { ...SET, providerBackupModel: "deepseek/deepseek-v4-pro", retry: RETRY };
 const SET_BACKUP_VISION = { ...SET, providerBackupModel: "claude-opus-4-7", retry: RETRY };
-const SET_BACKUP_SAME = { ...SET, providerBackupModel: "claude-haiku-4-5", retry: RETRY };
+const SET_BACKUP_SAME = { ...SET, providerBackupModel: "anthropic/claude-haiku-4-5", retry: RETRY };
 const SERVED_IMAGE = ["claude-haiku-4-5", "claude-haiku-4-5"];
 const SERVED_BACKUP = ["claude-haiku-4-5", "claude-opus-4-7"];
 const transientFailure = (): AssistantMessage => ({

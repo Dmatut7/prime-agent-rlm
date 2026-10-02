@@ -1443,6 +1443,9 @@ describe("Generate E2E Tests", () => {
 	describe.skipIf(!ollamaInstalled)("Ollama Provider (gpt-oss-20b via OpenAI Completions)", () => {
 		let llm: Model<"openai-completions">;
 		let ollamaProcess: ChildProcess | null = null;
+		// The binary gate above cannot see a missing server or model: when setup bails
+		// out early the tests must skip, not run against an undefined model.
+		let ollamaReady = false;
 
 		beforeAll(async () => {
 			try {
@@ -1495,6 +1498,7 @@ describe("Generate E2E Tests", () => {
 				},
 				name: "Ollama GPT-OSS 20B",
 			};
+			ollamaReady = true;
 		}, 30000); // 30 second timeout for setup
 
 		afterAll(() => {
@@ -1504,23 +1508,28 @@ describe("Generate E2E Tests", () => {
 			}
 		});
 
-		it("should complete basic text generation", { retry: 3 }, async () => {
+		it("should complete basic text generation", { retry: 3 }, async (ctx) => {
+			ctx.skip(!ollamaReady, "ollama setup incomplete (server/model unavailable)");
 			await basicTextGeneration(llm, { apiKey: "test" });
 		});
 
-		it("should handle tool calling", { retry: 3 }, async () => {
+		it("should handle tool calling", { retry: 3 }, async (ctx) => {
+			ctx.skip(!ollamaReady, "ollama setup incomplete (server/model unavailable)");
 			await handleToolCall(llm, { apiKey: "test" });
 		});
 
-		it("should handle streaming", { retry: 3 }, async () => {
+		it("should handle streaming", { retry: 3 }, async (ctx) => {
+			ctx.skip(!ollamaReady, "ollama setup incomplete (server/model unavailable)");
 			await handleStreaming(llm, { apiKey: "test" });
 		});
 
-		it("should handle thinking mode", { retry: 3 }, async () => {
+		it("should handle thinking mode", { retry: 3 }, async (ctx) => {
+			ctx.skip(!ollamaReady, "ollama setup incomplete (server/model unavailable)");
 			await handleThinking(llm, { apiKey: "test", reasoningEffort: "medium" });
 		});
 
-		it("should handle multi-turn with thinking and tools", { retry: 3 }, async () => {
+		it("should handle multi-turn with thinking and tools", { retry: 3 }, async (ctx) => {
+			ctx.skip(!ollamaReady, "ollama setup incomplete (server/model unavailable)");
 			await multiTurn(llm, { apiKey: "test", reasoningEffort: "medium" });
 		});
 	});

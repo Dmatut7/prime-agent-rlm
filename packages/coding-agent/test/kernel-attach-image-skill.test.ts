@@ -398,7 +398,7 @@ describe("model.info over a session's kernel host bridge", () => {
 	}
 
 	it("lets a routed image turn attach images: model.info reports the serving image model", async () => {
-		const fixture = createAttachSession({ imageModel: "claude-haiku-4-5" });
+		const fixture = createAttachSession({ imageModel: "anthropic/claude-haiku-4-5" });
 		try {
 			await fixture.session.prompt("describe", { images: [IMAGE] });
 			expect(fixture.servedIds).toEqual(["claude-haiku-4-5", "claude-haiku-4-5"]);
@@ -416,7 +416,7 @@ describe("model.info over a session's kernel host bridge", () => {
 	});
 
 	it("routes an attach on an image-free turn to imageModel, then hands the task back", async () => {
-		const fixture = createAttachSession({ imageModel: "claude-haiku-4-5" }, (call, attachCode) => {
+		const fixture = createAttachSession({ imageModel: "anthropic/claude-haiku-4-5" }, (call, attachCode) => {
 			if (call === 1) return attachToolCallMessage("call-1", attachCode);
 			if (call === 2) {
 				const next = attachToolCallMessage("call-2", 'print("next")');
@@ -448,7 +448,7 @@ describe("model.info over a session's kernel host bridge", () => {
 	it.each([
 		[
 			"images are turned off",
-			{ imageModel: "claude-haiku-4-5", images: { blockImages: true } },
+			{ imageModel: "anthropic/claude-haiku-4-5", images: { blockImages: true } },
 			"Images are turned off",
 		],
 		["imageModel cannot be used", { imageModel: "openai/gpt-5.4" }, "'openai/gpt-5.4' cannot be used"],

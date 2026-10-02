@@ -82,6 +82,9 @@ class ReplProcess:
                 self.proc.wait(timeout=5)
         except Exception:
             pass
+        for stream in (self.proc.stdin, self.proc.stdout):
+            if stream is not None:
+                stream.close()
 
 
 def one(events: list[dict], kind: str) -> dict | None:

@@ -430,6 +430,9 @@ describe("Context overflow error handling", () => {
 	describe.skipIf(!ollamaInstalled)("Ollama (local)", () => {
 		let ollamaProcess: ChildProcess | null = null;
 		let model: Model<"openai-completions">;
+		// The binary gate above cannot see a missing server or model: when setup bails
+		// out early the tests must skip, not run against an undefined model.
+		let ollamaReady = false;
 
 		beforeAll(async () => {
 			try {
@@ -477,6 +480,7 @@ describe("Context overflow error handling", () => {
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				name: "Ollama GPT-OSS 20B",
 			};
+			ollamaReady = true;
 		}, 60000);
 
 		afterAll(() => {
@@ -486,7 +490,8 @@ describe("Context overflow error handling", () => {
 			}
 		});
 
-		it("gpt-oss:20b - should detect overflow via isContextOverflow (ollama silently truncates)", async () => {
+		it("gpt-oss:20b - should detect overflow via isContextOverflow (ollama silently truncates)", async (ctx) => {
+			ctx.skip(!ollamaReady, "ollama setup incomplete (server/model unavailable)");
 			const result = await testContextOverflow(model, "ollama");
 			logResult(result);
 
