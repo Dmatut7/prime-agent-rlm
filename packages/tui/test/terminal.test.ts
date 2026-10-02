@@ -2,6 +2,7 @@ import assert from "node:assert";
 import { describe, it } from "node:test";
 import { ProcessTerminal } from "../src/terminal.js";
 import { resetCapabilitiesCache } from "../src/terminal-image.js";
+import { isGrapheme2027Active } from "../src/utils.js";
 
 describe("ProcessTerminal dimensions", () => {
 	it("falls back to COLUMNS and LINES before default dimensions", () => {
@@ -263,7 +264,7 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 			// pop before ?1049l, while the alt stack is still the active one.
 			assert.deepEqual(writes, [
 				"\x1b[?2004h",
-				"\x1b[?u\x1b[c",
+				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[c",
 				"\x1b[>7u",
 				"\x1b[?1049h",
 				"\x1b[>7u",
@@ -290,7 +291,13 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 			terminal.leaveAltScreen();
 			terminal.stop();
 
-			assert.deepEqual(writes, ["\x1b[?2004h", "\x1b[?u\x1b[c", "\x1b[?1049h", "\x1b[?1049l", "\x1b[?2004l"]);
+			assert.deepEqual(writes, [
+				"\x1b[?2004h",
+				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[c",
+				"\x1b[?1049h",
+				"\x1b[?1049l",
+				"\x1b[?2004l",
+			]);
 		} finally {
 			restore();
 		}
@@ -319,14 +326,14 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 
 			assert.deepEqual(writes, [
 				"\x1b[?2004h",
-				"\x1b[?u\x1b[c",
+				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[c",
 				"\x1b[>7u",
 				"\x1b[?1049h",
 				"\x1b[>7u",
 				"\x1b[?2004l",
 				"\x1b[<u",
 				"\x1b[?2004h",
-				"\x1b[?u\x1b[c",
+				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[c",
 				"\x1b[>7u",
 				"\x1b[<u",
 				"\x1b[?1049l",
@@ -354,7 +361,7 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 
 			assert.deepEqual(writes, [
 				"\x1b[?2004h",
-				"\x1b[?u\x1b[c",
+				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[c",
 				"\x1b[?1049h",
 				"\x1b[>7u",
 				"\x1b[<u",
@@ -420,7 +427,7 @@ describe("ProcessTerminal probe bus wiring", () => {
 			);
 			terminal.stop();
 
-			assert.deepEqual(writes.slice(0, 3), ["\x1b[?2004h", "\x1b[>7u", "\x1b[c"]);
+			assert.deepEqual(writes.slice(0, 3), ["\x1b[?2004h", "\x1b[>7u", "\x1b[?2026$p\x1b[?2027$p\x1b[c"]);
 			assert.ok(!writes.includes("\x1b[>4;2m"));
 		} finally {
 			restore();
@@ -439,9 +446,155 @@ describe("ProcessTerminal probe bus wiring", () => {
 			);
 			terminal.stop();
 
-			assert.deepEqual(writes.slice(0, 3), ["\x1b[?2004h", "\x1b[>4;2m", "\x1b[c"]);
+			assert.deepEqual(writes.slice(0, 3), ["\x1b[?2004h", "\x1b[>4;2m", "\x1b[?2026$p\x1b[?2027$p\x1b[c"]);
 			assert.ok(!writes.includes("\x1b[>7u"));
 		} finally {
+			restore();
+		}
+	});
+});
+
+describe("ProcessTerminal grapheme 2027 mode", () => {
+	it("enables DECSET 2027 on a supported DECRPM answer and resets it on stop", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?2027;1$y");
+			assert.equal(isGrapheme2027Active(), true);
+			process.stdin.emit("data", "\x1b[?64;1;2;6c");
+			terminal.stop();
+
+			assert.equal(isGrapheme2027Active(), false);
+			assert.deepEqual(writes, [
+				"\x1b[?2004h",
+				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[c",
+				"\x1b[?2027h",
+				"\x1b[>4;2m",
+				"\x1b[?2004l",
+				"\x1b[?2027l",
+				"\x1b[>4;0m",
+			]);
+		} finally {
+			restore();
+		}
+	});
+
+	it("never enables 2027 when the DA fence lands first (kitty-shaped silence)", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?64;1;2;6c");
+			terminal.stop();
+
+			assert.ok(!writes.includes("\x1b[?2027h"));
+			assert.ok(!writes.includes("\x1b[?2027l"));
+			assert.equal(isGrapheme2027Active(), false);
+		} finally {
+			restore();
+		}
+	});
+
+	it("never enables 2027 on a Pv=0 refusal (kitty-shaped answer)", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?2027;0$y");
+			process.stdin.emit("data", "\x1b[?64;1;2;6c");
+			terminal.stop();
+
+			assert.ok(!writes.includes("\x1b[?2027h"));
+			assert.ok(!writes.includes("\x1b[?2027l"));
+		} finally {
+			restore();
+		}
+	});
+
+	it("PI_TERMINAL_GRAPHEME_2027=1 enables 2027 during start without probing", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		process.env.PI_TERMINAL_GRAPHEME_2027 = "1";
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			terminal.stop();
+
+			assert.deepEqual(writes, [
+				"\x1b[?2004h",
+				"\x1b[?2027h",
+				"\x1b[?u\x1b[?2026$p\x1b[c",
+				"\x1b[?2004l",
+				"\x1b[?2027l",
+			]);
+		} finally {
+			restore();
+		}
+	});
+
+	it("PI_TERMINAL_GRAPHEME_2027=0 skips the query and stays off even when the terminal answers", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		process.env.PI_TERMINAL_GRAPHEME_2027 = "0";
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?2027;1$y");
+			terminal.stop();
+
+			assert.deepEqual(writes, ["\x1b[?2004h", "\x1b[?u\x1b[?2026$p\x1b[c", "\x1b[?2004l"]);
+		} finally {
+			restore();
+		}
+	});
+
+	it("does not enable 2027 while the alt screen is active (per-screen semantics unverified)", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		try {
+			const first = new ProcessTerminal();
+			first.start(
+				() => {},
+				() => {},
+			);
+			first.enterAltScreen();
+			first.stop({ preserveAltScreen: true });
+
+			const second = new ProcessTerminal();
+			second.start(
+				() => {},
+				() => {},
+			);
+			assert.equal(second.altScreenActive, true);
+			process.stdin.emit("data", "\x1b[?2027;1$y");
+			second.stop();
+
+			assert.ok(!writes.includes("\x1b[?2027h"), "no mode-set may land on the wrong screen");
+			assert.equal(isGrapheme2027Active(), false);
+		} finally {
+			const cleanup = new ProcessTerminal();
+			if (cleanup.altScreenActive) {
+				cleanup.stop();
+			}
 			restore();
 		}
 	});

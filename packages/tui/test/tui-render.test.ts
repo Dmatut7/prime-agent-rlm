@@ -1024,3 +1024,66 @@ describe("TUI synchronous flush", () => {
 		assert.strictEqual(terminal.getWrites(), "", "A stopped renderer paints nothing");
 	});
 });
+
+describe("TUI synchronized output (mode 2026)", () => {
+	it("wraps frames in 2026 markers while the verdict is still pending (status-quo blind send)", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui = new TUI(terminal);
+		const component = new TestComponent();
+		component.lines = ["hello"];
+		tui.addChild(component);
+
+		tui.start();
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		assert.ok(writes.includes("\x1b[?2026h"), `expected a begin marker in: ${JSON.stringify(writes)}`);
+		assert.ok(writes.includes("\x1b[?2026l"), `expected an end marker in: ${JSON.stringify(writes)}`);
+		tui.stop();
+	});
+
+	it("keeps wrapping when the terminal answers 2026 unsupported (design blind-send fallback)", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui = new TUI(terminal);
+		const component = new TestComponent();
+		component.lines = ["hello"];
+		tui.addChild(component);
+
+		tui.start();
+		terminal.sendInput("\x1b[?2026;0$y");
+		assert.strictEqual(terminal.probeBus?.query("sync2026").verdict, "unsupported");
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		component.lines = ["hello", "world"];
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		assert.ok(writes.includes("\x1b[?2026h"), `probe-refused 2026 must still wrap: ${JSON.stringify(writes)}`);
+		tui.stop();
+	});
+
+	it("emits no 2026 markers at all under PI_TERMINAL_SYNC_2026=0", async () => {
+		await withEnv({ PI_TERMINAL_SYNC_2026: "0" }, async () => {
+			const terminal = new LoggingVirtualTerminal(40, 10);
+			const tui = new TUI(terminal);
+			const component = new TestComponent();
+			component.lines = ["hello"];
+			tui.addChild(component);
+
+			tui.start();
+			await terminal.waitForRender();
+
+			component.lines = ["hello", "world"];
+			tui.requestRender();
+			await terminal.waitForRender();
+
+			assert.ok(
+				!terminal.getWrites().includes("?2026"),
+				`env kill switch must strip all 2026 markers: ${JSON.stringify(terminal.getWrites())}`,
+			);
+			tui.stop();
+		});
+	});
+});

@@ -27,7 +27,7 @@ import {
 	parseMouseEvent,
 	parseMouseHover,
 } from "./mouse.js";
-import type { CapabilityState } from "./probe-bus.js";
+import { type CapabilityState, sync2026FrameWrapping } from "./probe-bus.js";
 import { stripContentStartMarkers, type TableCellSelectionRegion } from "./selection-metadata.js";
 import type { Terminal } from "./terminal.js";
 import {
@@ -856,6 +856,20 @@ export class TUI extends Container {
 		this.cellSizeProbeUnsubscribe = bus.onChange("cellSize", (_cap, state) => apply(state));
 	}
 
+	/**
+	 * Whether frames go out wrapped in mode 2026 synchronized-output markers.
+	 * The probe verdict never turns wrapping off (blind sends are harmless -
+	 * unsupporting terminals ignore the mode-set); only the env escape hatch
+	 * does. Terminals without a probe bus keep the status-quo wrap.
+	 */
+	private shouldSync2026(): boolean {
+		const bus = this.terminal.probeBus;
+		if (!bus) {
+			return true;
+		}
+		return sync2026FrameWrapping(bus.query("sync2026"));
+	}
+
 	stop(options: TuiStopOptions = {}): void {
 		const preserveAltScreen = options.preserveAltScreen === true && this.terminal.altScreenActive;
 		const flushFullscreen = options.flushFullscreen ?? !preserveAltScreen;
@@ -959,8 +973,10 @@ export class TUI extends Container {
 	/**
 	 * Render a scrollable transcript window on the alternate screen with `dock`
 	 * pinned to the bottom rows; the primary screen stays untouched until exit.
-	 * Wheel tracking is enabled blind — probing is not viable (tmux never
-	 * answers DECRQM) and unsupporting terminals ignore the mode-sets.
+	 * Wheel tracking stays blind-enabled by choice: the probe bus owns startup
+	 * capability verdicts (tmux 3.6+ does answer DECRQM for the mouse family,
+	 * 3.7+ for mode 2026), but the pointer modes are not probed - unsupporting
+	 * terminals simply ignore the mode-sets.
 	 */
 	enterFullscreen(options: FullscreenOptions): void {
 		if (this.fullscreen) return;
@@ -2056,7 +2072,14 @@ export class TUI extends Container {
 		const cursorPos = this.extractCursorPosition(frame, height);
 		fullscreen.viewport.applyFrameSelection(frame, height, this.overlaySelectionRegions);
 		this.applyLineResets(frame);
-		fullscreen.viewport.paint((data) => this.terminal.write(data), frame, width, height, cursorPos);
+		fullscreen.viewport.paint(
+			(data) => this.terminal.write(data),
+			frame,
+			width,
+			height,
+			cursorPos,
+			this.shouldSync2026(),
+		);
 		if (cursorPos && this.showHardwareCursor) {
 			this.terminal.showCursor();
 		} else {
@@ -2078,6 +2101,7 @@ export class TUI extends Container {
 		this.preserveViewportOnNextRender = false;
 		const width = this.terminal.columns;
 		const height = this.terminal.rows;
+		const sync2026 = this.shouldSync2026();
 		const widthChanged = this.previousWidth !== 0 && this.previousWidth !== width;
 		const heightChanged = this.previousHeight !== 0 && this.previousHeight !== height;
 		const previousBufferLength = this.previousHeight > 0 ? this.previousViewportTop + this.previousHeight : height;
@@ -2131,7 +2155,7 @@ export class TUI extends Container {
 		// clear terminal scrollback: users rely on it to read long prior messages.
 		const fullRender = (clear: boolean, preserveViewport = false): void => {
 			this.fullRedrawCount += 1;
-			let buffer = "\x1b[?2026h"; // Begin synchronized output
+			let buffer = sync2026 ? "\x1b[?2026h" : ""; // Begin synchronized output
 
 			// Viewport-preserving repaint: rewrite only the visible viewport in
 			// place, leaving terminal scrollback untouched. Keeps the user
@@ -2177,7 +2201,7 @@ export class TUI extends Container {
 					}
 					if (leftover > 0) buffer += `\x1b[${leftover}A`; // Back up to the last content row
 				}
-				buffer += "\x1b[?2026l"; // End synchronized output
+				if (sync2026) buffer += "\x1b[?2026l"; // End synchronized output
 				this.terminal.write(buffer);
 				this.cursorRow = Math.max(0, newLines.length - 1);
 				this.hardwareCursorRow = this.cursorRow;
@@ -2210,7 +2234,7 @@ export class TUI extends Container {
 				if (i > renderStart) buffer += "\r\n";
 				buffer += newLines[i];
 			}
-			buffer += "\x1b[?2026l"; // End synchronized output
+			if (sync2026) buffer += "\x1b[?2026l"; // End synchronized output
 			this.terminal.write(buffer);
 			this.cursorRow = Math.max(0, newLines.length - 1);
 			this.hardwareCursorRow = this.cursorRow;
@@ -2311,7 +2335,7 @@ export class TUI extends Container {
 		// All changes are in deleted lines (nothing to render, just clear)
 		if (firstChanged >= newLines.length) {
 			if (this.previousLines.length > newLines.length) {
-				let buffer = "\x1b[?2026h";
+				let buffer = sync2026 ? "\x1b[?2026h" : "";
 				buffer += this.deleteChangedKittyImages(firstChanged, lastChanged);
 				// Move to end of new content (clamp to 0 for empty content)
 				const targetRow = Math.max(0, newLines.length - 1);
@@ -2341,7 +2365,7 @@ export class TUI extends Container {
 				if (extraLines > 0) {
 					buffer += `\x1b[${extraLines}A`;
 				}
-				buffer += "\x1b[?2026l";
+				if (sync2026) buffer += "\x1b[?2026l";
 				this.terminal.write(buffer);
 				this.cursorRow = targetRow;
 				this.hardwareCursorRow = targetRow;
@@ -2381,8 +2405,8 @@ export class TUI extends Container {
 		}
 
 		// Render from first changed line to end
-		// Build buffer with all updates wrapped in synchronized output
-		let buffer = "\x1b[?2026h"; // Begin synchronized output
+		// Build buffer with all updates, wrapped in synchronized output when on
+		let buffer = sync2026 ? "\x1b[?2026h" : ""; // Begin synchronized output
 		buffer += this.deleteChangedKittyImages(firstChanged, lastChanged);
 		const prevViewportBottom = prevViewportTop + height - 1;
 		const moveTargetRow = appendStart ? firstChanged - 1 : firstChanged;
@@ -2460,7 +2484,7 @@ export class TUI extends Container {
 			buffer += `\x1b[${extraLines}A`;
 		}
 
-		buffer += "\x1b[?2026l"; // End synchronized output
+		if (sync2026) buffer += "\x1b[?2026l"; // End synchronized output
 
 		if (process.env.PI_TUI_DEBUG === "1") {
 			const debugDir = "/tmp/tui";

@@ -847,6 +847,65 @@ describe("TUI fullscreen mode", () => {
 		);
 	});
 
+	it("wraps painted frames in 2026 markers by default and skips them when sync2026 is off", () => {
+		const paintWith = (sync2026: boolean): string => {
+			const viewport = new FullscreenViewport();
+			let written = "";
+			viewport.paint(
+				(data) => {
+					written += data;
+				},
+				["line"],
+				10,
+				5,
+				null,
+				sync2026,
+			);
+			return written;
+		};
+
+		const wrapped = paintWith(true);
+		assert.ok(wrapped.startsWith("\x1b[?2026h"), `default paint must open the frame: ${JSON.stringify(wrapped)}`);
+		assert.ok(wrapped.endsWith("\x1b[?2026l"), `default paint must close the frame: ${JSON.stringify(wrapped)}`);
+
+		const bare = paintWith(false);
+		assert.ok(!bare.includes("?2026"), `sync2026 off must drop every marker: ${JSON.stringify(bare)}`);
+		assert.ok(bare.includes("line"), "frame content still paints without the markers");
+	});
+
+	it("passes the sync2026 verdict down to the fullscreen paint (env kill switch)", async () => {
+		const previous = process.env.PI_TERMINAL_SYNC_2026;
+		process.env.PI_TERMINAL_SYNC_2026 = "0";
+		try {
+			const terminal = new LoggingVirtualTerminal(40, 12);
+			const tui = new TUI(terminal);
+			const chat = new TestComponent();
+			chat.lines = ["one", "two", "three"];
+			const dock = new TestComponent();
+			dock.lines = ["> prompt"];
+			tui.addChild(chat);
+			tui.addChild(dock);
+			tui.start();
+			tui.enterFullscreen({ scroll: [chat], dock });
+			await terminal.waitForRender();
+
+			chat.lines = ["one", "two", "changed"];
+			tui.requestRender();
+			await terminal.waitForRender();
+
+			const writes = terminal.getWrites();
+			assert.ok(!writes.includes("?2026"), `fullscreen paint must honor the kill switch: ${JSON.stringify(writes)}`);
+			assert.ok(writes.includes("changed"), "frame content still paints without the markers");
+			tui.stop();
+		} finally {
+			if (previous === undefined) {
+				delete process.env.PI_TERMINAL_SYNC_2026;
+			} else {
+				process.env.PI_TERMINAL_SYNC_2026 = previous;
+			}
+		}
+	});
+
 	it("keeps wrapped table-cell selection inside the originating cell", async () => {
 		const terminal = new LoggingVirtualTerminal(40, 12);
 		const tui = new TUI(terminal);

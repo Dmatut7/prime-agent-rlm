@@ -1,6 +1,6 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { type CapabilityState, ProbeBus } from "../src/probe-bus.js";
+import { type CapabilityState, ProbeBus, sync2026FrameWrapping } from "../src/probe-bus.js";
 import { QUERY_DEFAULT_BACKGROUND, QUERY_DEFAULT_FOREGROUND } from "../src/terminal-colors.js";
 
 const DA_ANSWER = "\x1b[?64;1;2;6c";
@@ -20,7 +20,7 @@ describe("ProbeBus", () => {
 		it("writes every probe query ahead of the primary-DA fence", () => {
 			const { bus, writes } = startBus({ env: {} });
 			try {
-				const expected = `\x1b[?u${QUERY_DEFAULT_FOREGROUND}${QUERY_DEFAULT_BACKGROUND}\x1b[16t\x1b[c`;
+				const expected = `\x1b[?u\x1b[?2026$p\x1b[?2027$p${QUERY_DEFAULT_FOREGROUND}${QUERY_DEFAULT_BACKGROUND}\x1b[16t\x1b[c`;
 				assert.deepStrictEqual(writes, [expected]);
 			} finally {
 				bus.dispose();
@@ -30,7 +30,7 @@ describe("ProbeBus", () => {
 		it("skips the queries the caller gates off and reports those capabilities unknown", () => {
 			const { bus, writes } = startBus({ env: {} }, { queryOscColors: false, queryCellSize: false });
 			try {
-				assert.deepStrictEqual(writes, ["\x1b[?u\x1b[c"]);
+				assert.deepStrictEqual(writes, ["\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[c"]);
 				assert.deepStrictEqual(bus.query("oscColors"), { verdict: "unknown", source: "default" });
 				assert.deepStrictEqual(bus.query("cellSize"), { verdict: "unknown", source: "default" });
 				// Never asked, so the DA fence must not flip them to unsupported.
@@ -170,13 +170,11 @@ describe("ProbeBus", () => {
 				assert.strictEqual(bus.handleSequence(DA_ANSWER), true);
 				await bus.settled;
 
-				for (const cap of ["kittyKeyboard", "oscColors", "cellSize"] as const) {
+				for (const cap of ["kittyKeyboard", "sync2026", "grapheme2027", "oscColors", "cellSize"] as const) {
 					assert.deepStrictEqual(bus.query(cap), { verdict: "unsupported", source: "default" }, cap);
 				}
-				// DECRQM capabilities were never queried: the fence says nothing about them.
-				for (const cap of ["sync2026", "grapheme2027", "scheme2031"] as const) {
-					assert.strictEqual(bus.query(cap).verdict, "unknown", cap);
-				}
+				// scheme2031's query only a later phase sends: the fence says nothing about it.
+				assert.strictEqual(bus.query("scheme2031").verdict, "unknown");
 				assert.deepStrictEqual(kittySeen, [{ verdict: "unsupported", source: "default" }]);
 			} finally {
 				bus.dispose();
@@ -305,6 +303,144 @@ describe("ProbeBus", () => {
 		});
 	});
 
+	describe("sync2026 probing and the frame-wrap decision", () => {
+		it("a DECRPM answer for mode 2026 flips the capability ahead of the fence", () => {
+			const { bus } = startBus({ env: {} });
+			try {
+				const seen: CapabilityState[] = [];
+				bus.onChange("sync2026", (_cap, state) => seen.push(state));
+				assert.strictEqual(bus.handleSequence("\x1b[?2026;2$y"), true);
+				assert.deepStrictEqual(bus.query("sync2026"), { verdict: "supported", source: "probe", decrpmValue: 2 });
+				assert.deepStrictEqual(seen, [{ verdict: "supported", source: "probe", decrpmValue: 2 }]);
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("PI_TERMINAL_SYNC_2026=0 skips the DECRQM query and judges the capability off", () => {
+			const { bus, writes } = startBus({ env: { PI_TERMINAL_SYNC_2026: "0" } });
+			try {
+				assert.ok(!writes.join("").includes("\x1b[?2026$p"));
+				assert.deepStrictEqual(bus.query("sync2026"), { verdict: "unsupported", source: "env-override" });
+				// The fence must not touch an override.
+				bus.handleSequence(DA_ANSWER);
+				assert.strictEqual(bus.query("sync2026").verdict, "unsupported");
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("PI_TERMINAL_SYNC_2026=1 forces support without probing", () => {
+			const { bus, writes } = startBus({ env: { PI_TERMINAL_SYNC_2026: "1" } });
+			try {
+				assert.ok(!writes.join("").includes("\x1b[?2026$p"));
+				assert.deepStrictEqual(bus.query("sync2026"), { verdict: "supported", source: "env-override" });
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("an env override is final for sync2026: answers are consumed but change nothing", () => {
+			const { bus } = startBus({ env: { PI_TERMINAL_SYNC_2026: "0" } });
+			try {
+				assert.strictEqual(bus.handleSequence("\x1b[?2026;1$y"), true);
+				assert.deepStrictEqual(bus.query("sync2026"), { verdict: "unsupported", source: "env-override" });
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("sync2026FrameWrapping keeps wrapping for every probe outcome; only the env kill switch turns it off", () => {
+			// Design §3.2: 2026 blind-sends are harmless (unsupported terminals ignore
+			// the mode-set), so supported / reset / refused / silent all keep wrapping.
+			const wrapping: CapabilityState[] = [
+				{ verdict: "pending", source: "default" },
+				{ verdict: "supported", source: "probe", decrpmValue: 1 },
+				{ verdict: "supported", source: "probe", decrpmValue: 2 },
+				{ verdict: "supported", source: "probe", decrpmValue: 3 },
+				{ verdict: "unsupported", source: "probe", decrpmValue: 0 },
+				{ verdict: "unsupported", source: "probe", decrpmValue: 4 },
+				{ verdict: "unsupported", source: "default" },
+				{ verdict: "unknown", source: "default" },
+				{ verdict: "supported", source: "env-override" },
+			];
+			assert.ok(wrapping.length > 0);
+			for (const state of wrapping) {
+				assert.strictEqual(sync2026FrameWrapping(state), true, JSON.stringify(state));
+			}
+			assert.strictEqual(sync2026FrameWrapping({ verdict: "unsupported", source: "env-override" }), false);
+		});
+	});
+
+	describe("grapheme2027 probing and the kitty evasion paths", () => {
+		it("a DECRPM set/reset answer for mode 2027 flips the capability supported", () => {
+			const { bus } = startBus({ env: {} });
+			try {
+				assert.strictEqual(bus.handleSequence("\x1b[?2027;1$y"), true);
+				assert.deepStrictEqual(bus.query("grapheme2027"), {
+					verdict: "supported",
+					source: "probe",
+					decrpmValue: 1,
+				});
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("kitty evasion via refusal: a Pv=0 answer judges 2027 unsupported", () => {
+			const { bus } = startBus({ env: {} });
+			try {
+				const seen: CapabilityState[] = [];
+				bus.onChange("grapheme2027", (_cap, state) => seen.push(state));
+				assert.strictEqual(bus.handleSequence("\x1b[?2027;0$y"), true);
+				assert.deepStrictEqual(bus.query("grapheme2027"), {
+					verdict: "unsupported",
+					source: "probe",
+					decrpmValue: 0,
+				});
+				assert.strictEqual(seen.length, 1);
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("kitty evasion via silence: the DA fence judges 2027 unsupported", () => {
+			const { bus } = startBus({ env: {} });
+			try {
+				const seen: CapabilityState[] = [];
+				bus.onChange("grapheme2027", (_cap, state) => seen.push(state));
+				assert.strictEqual(bus.handleSequence(DA_ANSWER), true);
+				assert.deepStrictEqual(bus.query("grapheme2027"), { verdict: "unsupported", source: "default" });
+				assert.deepStrictEqual(seen, [{ verdict: "unsupported", source: "default" }]);
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("PI_TERMINAL_GRAPHEME_2027=0 skips the DECRQM query and never enables", () => {
+			const { bus, writes } = startBus({ env: { PI_TERMINAL_GRAPHEME_2027: "0" } });
+			try {
+				assert.ok(!writes.join("").includes("\x1b[?2027$p"));
+				assert.deepStrictEqual(bus.query("grapheme2027"), { verdict: "unsupported", source: "env-override" });
+				// The override is final: a supporting answer is consumed but inert.
+				assert.strictEqual(bus.handleSequence("\x1b[?2027;1$y"), true);
+				assert.strictEqual(bus.query("grapheme2027").verdict, "unsupported");
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("PI_TERMINAL_GRAPHEME_2027=1 forces support without probing", () => {
+			const { bus, writes } = startBus({ env: { PI_TERMINAL_GRAPHEME_2027: "1" } });
+			try {
+				assert.ok(!writes.join("").includes("\x1b[?2027$p"));
+				assert.deepStrictEqual(bus.query("grapheme2027"), { verdict: "supported", source: "env-override" });
+			} finally {
+				bus.dispose();
+			}
+		});
+	});
+
 	describe("guards and lifecycle", () => {
 		it("never consumes a bare CSI c (the shift+right key)", () => {
 			const { bus } = startBus({ env: {} });
@@ -312,12 +448,10 @@ describe("ProbeBus", () => {
 				assert.strictEqual(bus.handleSequence("\x1b[c"), false);
 				assert.strictEqual(bus.handleSequence("\x1b[1;2c"), false);
 				// Nothing changed: queried capabilities stay pending, unqueried stay unknown.
-				for (const cap of ["kittyKeyboard", "oscColors", "cellSize"] as const) {
+				for (const cap of ["kittyKeyboard", "sync2026", "grapheme2027", "oscColors", "cellSize"] as const) {
 					assert.strictEqual(bus.query(cap).verdict, "pending", cap);
 				}
-				for (const cap of ["sync2026", "grapheme2027", "scheme2031"] as const) {
-					assert.strictEqual(bus.query(cap).verdict, "unknown", cap);
-				}
+				assert.strictEqual(bus.query("scheme2031").verdict, "unknown");
 			} finally {
 				bus.dispose();
 			}

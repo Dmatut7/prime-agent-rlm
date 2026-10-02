@@ -1023,12 +1023,15 @@ export class FullscreenViewport {
 		width: number,
 		height: number,
 		cursorPos: { row: number; col: number } | null,
+		// Wrap the frame in mode 2026 synchronized-output markers. The caller
+		// decides from the probe-bus verdict (sync2026FrameWrapping).
+		sync2026 = true,
 	): void {
 		if (frame.length > height) {
 			frame = frame.slice(frame.length - height);
 		}
 
-		let buffer = "\x1b[?2026h";
+		let buffer = sync2026 ? "\x1b[?2026h" : "";
 		if (width !== this.prevWidth || height !== this.prevHeight || this.prevFrame.length === 0) {
 			buffer += "\x1b[2J\x1b[H";
 			this.prevFrame = [];
@@ -1045,7 +1048,9 @@ export class FullscreenViewport {
 			const cursorCol = Math.max(0, Math.min(cursorPos.col, width - 1));
 			buffer += `\x1b[${cursorRow + 1};${cursorCol + 1}H`;
 		}
-		buffer += "\x1b[?2026l";
+		if (sync2026) {
+			buffer += "\x1b[?2026l";
+		}
 		write(buffer);
 
 		this.prevFrame = frame;

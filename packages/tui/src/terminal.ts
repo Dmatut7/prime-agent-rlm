@@ -6,6 +6,7 @@ import { ProbeBus } from "./probe-bus.js";
 import { StdinBuffer } from "./stdin-buffer.js";
 import { setDefaultTerminalColors } from "./terminal-colors.js";
 import { getCapabilities } from "./terminal-image.js";
+import { isGrapheme2027Active, setGrapheme2027Active } from "./utils.js";
 
 const cjsRequire = createRequire(import.meta.url);
 
@@ -168,6 +169,7 @@ export class ProcessTerminal implements Terminal {
 	private resizeHandler?: () => void;
 	private _kittyProtocolActive = false;
 	private _modifyOtherKeysActive = false;
+	private _grapheme2027Active = false;
 	private readonly altScreenHandoffToken = Symbol("altScreenHandoff");
 	private _altScreenActive = consumeAltScreenHandoff();
 	private _mouseTrackingActive = false;
@@ -233,9 +235,9 @@ export class ProcessTerminal implements Terminal {
 		// since that resets console mode flags.
 		this.enableWindowsVTInput();
 
-		// Probe terminal capabilities (Kitty keyboard, OSC 10/11 default colors,
-		// cell size) through the probe bus; the primary-DA fence judges whatever
-		// stays unanswered. See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
+		// Probe terminal capabilities (Kitty keyboard, DECRQM 2026/2027, OSC 10/11
+		// default colors, cell size) through the probe bus; the primary-DA fence
+		// judges whatever stays unanswered. See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
 		this.startProbeBus();
 	}
 
@@ -307,6 +309,11 @@ export class ProcessTerminal implements Terminal {
 				this.resizeHandler?.();
 			}
 		});
+		bus.onChange("grapheme2027", (_cap, state) => {
+			if (state.verdict === "supported") {
+				this.enableGrapheme2027();
+			}
+		});
 		bus.start((data) => process.stdout.write(data), {
 			queryOscColors: process.stdin.isTTY === true && process.stdout.isTTY === true,
 			queryCellSize: getCapabilities().images !== null,
@@ -322,6 +329,24 @@ export class ProcessTerminal implements Terminal {
 
 		// Enable Kitty keyboard protocol (push flags onto the active screen's stack)
 		process.stdout.write(KITTY_FLAGS_PUSH);
+	}
+
+	/**
+	 * DECSET 2027 (grapheme cluster mode). Only a definitive "supported" verdict
+	 * enables it: kitty refuses the mode outright (kitty#7799), and both of its
+	 * evasion shapes - a Pv=0 answer, or silence past the DA fence - converge on
+	 * not enabling (docs/fork/probe-bus-design.md §3.2). Main screen only: the
+	 * mode's per-screen semantics are unverified (same caveat as the kitty
+	 * keyboard stack once had), so while the alt screen is active the mode-set
+	 * could land on the wrong screen and stays off.
+	 */
+	private enableGrapheme2027(): void {
+		if (this._grapheme2027Active || this._altScreenActive) {
+			return;
+		}
+		this._grapheme2027Active = true;
+		setGrapheme2027Active(true);
+		process.stdout.write("\x1b[?2027h");
 	}
 
 	/**
@@ -434,6 +459,17 @@ export class ProcessTerminal implements Terminal {
 
 		// Disable bracketed paste mode
 		process.stdout.write("\x1b[?2004l");
+
+		// Reset grapheme cluster mode on the main screen. Skipped for a preserved
+		// alt screen: the mode-set would land on the still-active alt screen, and
+		// the main-screen mode deliberately survives the handoff (the next
+		// in-process terminal re-probes anyway). The module bit is the source of
+		// truth so a terminal that inherited the mode still resets it on exit.
+		if (isGrapheme2027Active() && !options.preserveAltScreen) {
+			process.stdout.write("\x1b[?2027l");
+			this._grapheme2027Active = false;
+			setGrapheme2027Active(false);
+		}
 
 		// Disable Kitty keyboard protocol if not already done by drainInput()
 		if (this._kittyProtocolActive) {

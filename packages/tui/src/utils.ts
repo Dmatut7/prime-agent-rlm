@@ -4,6 +4,25 @@ import { eastAsianWidth } from "get-east-asian-width";
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 /**
+ * Whether the terminal has mode 2027 (grapheme cluster mode) set, mirrored from
+ * ProcessTerminal. The width math below is grapheme-based either way: with the
+ * mode set the terminal clusters exactly like the math; without it the known
+ * wcwidth divergence stands (docs/fork/probe-bus-design.md §3.2 - kitty refuses
+ * 2027 outright, so both of its evasion shapes converge on not enabling). A
+ * CSI 6 n cursor-measured width fallback for the off path is registered there
+ * as future work and would key off this bit.
+ */
+let grapheme2027Active = false;
+
+export function setGrapheme2027Active(active: boolean): void {
+	grapheme2027Active = active;
+}
+
+export function isGrapheme2027Active(): boolean {
+	return grapheme2027Active;
+}
+
+/**
  * Get the shared grapheme segmenter instance.
  */
 export function getSegmenter(): Intl.Segmenter {

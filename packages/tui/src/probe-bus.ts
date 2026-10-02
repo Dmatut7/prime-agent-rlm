@@ -52,6 +52,16 @@ export interface CapabilityState {
 
 export type ProbeListener = (cap: ProbeCapability, state: CapabilityState) => void;
 
+/**
+ * The sync2026 decision table (docs/fork/probe-bus-design.md §3.2): frames stay
+ * wrapped in synchronized-output markers for every probe outcome — supported or
+ * reset the terminal joins in, refused or silent it ignores the mode-sets —
+ * and only the PI_TERMINAL_SYNC_2026=0 escape hatch turns the wrapping off.
+ */
+export function sync2026FrameWrapping(state: CapabilityState): boolean {
+	return !(state.source === "env-override" && state.verdict === "unsupported");
+}
+
 export interface ProbeBusOptions {
 	/** Wall-clock fallback when no primary-DA answer arrives (default 1000ms). */
 	fallbackMs?: number;
@@ -70,6 +80,8 @@ export interface ProbeBusStartOptions {
 export const PROBE_FALLBACK_MS = 1000;
 
 const KITTY_KEYBOARD_QUERY = "\x1b[?u";
+const SYNC_2026_QUERY = "\x1b[?2026$p";
+const GRAPHEME_2027_QUERY = "\x1b[?2027$p";
 const CELL_SIZE_QUERY = "\x1b[16t";
 const PRIMARY_DA_QUERY = "\x1b[c";
 
@@ -100,7 +112,7 @@ const DECRPM_MODE_PER_CAPABILITY: Partial<Record<number, ProbeCapability>> = {
 };
 
 /** Capabilities with a query in flight in this phase; the rest stay "unknown" until theirs lands. */
-const QUERIED_CAPABILITIES: ProbeCapability[] = ["kittyKeyboard", "oscColors", "cellSize"];
+const QUERIED_CAPABILITIES: ProbeCapability[] = ["kittyKeyboard", "sync2026", "grapheme2027", "oscColors", "cellSize"];
 
 const ALL_CAPABILITIES = Object.keys(ENV_VAR_PER_CAPABILITY) as ProbeCapability[];
 
@@ -159,6 +171,12 @@ export class ProbeBus {
 		let burst = "";
 		if (this.isPending("kittyKeyboard")) {
 			burst += KITTY_KEYBOARD_QUERY;
+		}
+		if (this.isPending("sync2026")) {
+			burst += SYNC_2026_QUERY;
+		}
+		if (this.isPending("grapheme2027")) {
+			burst += GRAPHEME_2027_QUERY;
 		}
 		if (this.isPending("oscColors")) {
 			burst += QUERY_DEFAULT_FOREGROUND + QUERY_DEFAULT_BACKGROUND;
