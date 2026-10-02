@@ -327,7 +327,7 @@ import {
 	toolOutputFull,
 } from "./components/tool-output-budget.js";
 import { TopBar } from "./components/top-bar.js";
-import { TreeSelectorComponent } from "./components/tree-selector.js";
+import { findLatestUserMessageEntryId, TreeSelectorComponent } from "./components/tree-selector.js";
 import {
 	PROCESS_FOLD_THRESHOLD,
 	type TimelineHost,
@@ -1559,6 +1559,7 @@ export class InteractiveMode {
 	 */
 	private footerTelemetryDirty = true;
 	private footerTelemetryCached: FooterTelemetrySource | undefined;
+	private footerSessionCost: number | undefined;
 	private streamingMessage: AssistantMessage | undefined = undefined;
 	private sideQuestionComponent: SideQuestionComponent | undefined;
 	private sideQuestionEvent: AgentConnectionSideQuestionEvent | undefined;
@@ -3566,6 +3567,11 @@ export class InteractiveMode {
 			contextWindow: usage?.contextWindow,
 			compactionThresholdTokens: thresholdTokens,
 		};
+		// Optional spend segment (footer.sessionSpend): fed by the stats refresh
+		// that already runs after each turn, so it costs no extra fetch per frame.
+		if (settingsManager?.getFooterSessionSpend?.() && this.footerSessionCost !== undefined) {
+			snapshot.sessionCost = this.footerSessionCost;
+		}
 		return { mode, snapshot };
 	}
 
@@ -3587,6 +3593,7 @@ export class InteractiveMode {
 		this.contextUsageRefresh.lastSuccessGeneration = generation;
 		// Anything counted so far is now reflected in the snapshot; only later output is in-flight.
 		this.contextUsageTokenBaseline = this.activityTracker.getStatus().tokens;
+		this.footerSessionCost = stats.cost;
 		this.patchConnectionState({ contextUsage: stats.contextUsage });
 		// P2-D (Qwen review): the leading invalidation happened before the await
 		// - a frame that rendered while the RPC was in flight re-memoized the
@@ -3893,6 +3900,7 @@ export class InteractiveMode {
 		this.pendingBashComponents = [];
 		this.activityTracker.reset();
 		this.contextUsageTokenBaseline = 0;
+		this.footerSessionCost = undefined;
 		this.resetPendingToolState();
 		this.agentRunFileChanges.clear();
 		this.renderRecap();
@@ -5973,12 +5981,17 @@ export class InteractiveMode {
 				}
 				if (commandName === "scoped-models" && !commandArgs) {
 					this.editor.setText("");
+					restorePromptStashAfterSubmit = false;
 					await this.showModelsSelector();
 					return;
 				}
 				if (commandName === "model") {
 					const searchTerm = commandArgs || undefined;
 					this.editor.setText("");
+					// Menu-class commands settle on close without submitting: restoring
+					// the stash here would splice the old draft into the next typed
+					// command (wave-19 walkthrough F1, same class as /tree below).
+					restorePromptStashAfterSubmit = false;
 					await this.handleModelCommand(searchTerm);
 					return;
 				}
@@ -6106,16 +6119,19 @@ export class InteractiveMode {
 				}
 				if (commandName === "login" && !commandArgs) {
 					this.editor.setText("");
+					restorePromptStashAfterSubmit = false;
 					await this.showConfigurationMenu("providers");
 					return;
 				}
 				if (commandName === "logout" && !commandArgs) {
 					this.editor.setText("");
+					restorePromptStashAfterSubmit = false;
 					await this.showLogoutSelector();
 					return;
 				}
 				if (commandName === "mcp") {
 					this.editor.setText("");
+					restorePromptStashAfterSubmit = false;
 					await this.handleMcpCommand(commandArgs);
 					return;
 				}
@@ -9411,7 +9427,7 @@ export class InteractiveMode {
 		}
 		const action = this.takeEscapeRepeatAction();
 		if (action === "tree") {
-			void this.showTreeSelector();
+			void this.showTreeSelector(undefined, { preselectLatestUserMessage: true });
 			return;
 		}
 
@@ -12444,7 +12460,10 @@ export class InteractiveMode {
 		}
 	}
 
-	private async showTreeSelector(initialSelectedId?: string): Promise<void> {
+	private async showTreeSelector(
+		initialSelectedId?: string,
+		options?: { preselectLatestUserMessage?: boolean },
+	): Promise<void> {
 		let tree: AgentConnectionSessionTreeNode[];
 		let realLeafId: string | null;
 		let truncationNotice: string | undefined;
@@ -12469,6 +12488,14 @@ export class InteractiveMode {
 			this.showStatus("会话里还没有内容");
 			return;
 		}
+
+		// A double-Esc open lands on the latest user message so Enter forks it back
+		// into the editor for an edit-and-resend, whatever filter mode is configured.
+		// The explicit /tree entry keeps the current-leaf highlight for browsing.
+		const effectiveInitialSelectedId =
+			options?.preselectLatestUserMessage && initialSelectedId === undefined
+				? findLatestUserMessageEntryId(tree, realLeafId)
+				: initialSelectedId;
 
 		this.showSelector((done) => {
 			const selector = new TreeSelectorComponent(
@@ -12575,7 +12602,7 @@ export class InteractiveMode {
 							this.showError(error instanceof Error ? error.message : String(error));
 						});
 				},
-				initialSelectedId,
+				effectiveInitialSelectedId,
 				initialFilterMode,
 				truncationNotice,
 			);

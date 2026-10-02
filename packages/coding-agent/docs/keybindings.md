@@ -98,7 +98,7 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 |--------|---------|-------------|
 | `app.interrupt` | *(none)* | Interrupt current operation |
 | `app.clear` | `ctrl+c` | Interrupt current operation, then exit |
-| `app.input.clear` | `escape` | Clear input. Double duty: while the agent is streaming (or other work is running), the same key interrupts the current operation instead of clearing. On an empty idle prompt, press twice to step back to earlier messages |
+| `app.input.clear` | `escape` | Clear input. Double duty: while the agent is streaming (or other work is running), the same key interrupts the current operation instead of clearing. On an empty idle prompt, press twice to open the session tree with the latest user message pre-highlighted; Enter forks it back into the editor to edit and resend |
 | `app.exit` | `ctrl+d` | Exit (when editor empty) |
 | `app.suspend` | `ctrl+z` (none on Windows) | Suspend to background |
 | `app.editor.external` | `ctrl+g` | Open in external editor (`$VISUAL` or `$EDITOR`) |

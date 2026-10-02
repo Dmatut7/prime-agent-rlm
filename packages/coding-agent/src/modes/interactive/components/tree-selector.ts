@@ -9,6 +9,7 @@ import {
 	TruncatedText,
 	truncateToWidth,
 } from "@earendil-works/pi-tui";
+import { shortenPathHome } from "../../../utils/shorten-path.js";
 import type { AgentConnectionSessionTreeNode } from "../../agent-connection/index.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
@@ -38,6 +39,37 @@ interface FlatNode {
 
 /** Filter mode for tree display */
 export type FilterMode = "default" | "no-tools" | "user-only" | "labeled-only" | "all";
+
+/**
+ * Walk the active path from the leaf upward and return the closest user message
+ * entry - the "edit the last thing I said" target a double-Esc open preselects,
+ * so Enter forks it back into the editor regardless of the active filter mode.
+ * Undefined when the path holds no user message (or there is no leaf).
+ */
+export function findLatestUserMessageEntryId(
+	tree: AgentConnectionSessionTreeNode[],
+	leafId: string | null,
+): string | undefined {
+	if (!leafId) return undefined;
+	const nodeById = new Map<string, AgentConnectionSessionTreeNode>();
+	const stack = [...tree];
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		nodeById.set(node.entry.id, node);
+		for (const child of node.children) stack.push(child);
+	}
+	let currentId: string | null = leafId;
+	while (currentId !== null) {
+		const node = nodeById.get(currentId);
+		if (!node) return undefined;
+		const entry = node.entry;
+		if (entry.type === "message" && entry.message.role === "user") {
+			return entry.id;
+		}
+		currentId = entry.parentId ?? null;
+	}
+	return undefined;
+}
 
 /**
  * Tree list component with selection and ASCII art visualization
@@ -899,15 +931,9 @@ class TreeList implements Component {
 	}
 
 	private formatToolCall(name: string, args: Record<string, unknown>): string {
-		const shortenPath = (p: string): string => {
-			const home = process.env.HOME || process.env.USERPROFILE || "";
-			if (home && p.startsWith(home)) return `~${p.slice(home.length)}`;
-			return p;
-		};
-
 		switch (name) {
 			case "edit": {
-				const path = shortenPath(String(args.path || args.file_path || ""));
+				const path = shortenPathHome(String(args.path || args.file_path || ""));
 				return `[edit: ${path}]`;
 			}
 			case "bash": {

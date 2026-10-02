@@ -8,7 +8,10 @@ import type {
 	AgentConnectionSessionMessageEntry,
 	AgentConnectionSessionTreeNode,
 } from "../src/modes/agent-connection/index.js";
-import { TreeSelectorComponent } from "../src/modes/interactive/components/tree-selector.js";
+import {
+	findLatestUserMessageEntryId,
+	TreeSelectorComponent,
+} from "../src/modes/interactive/components/tree-selector.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 beforeAll(() => {
@@ -722,5 +725,52 @@ describe("TreeSelectorComponent", () => {
 			selector.handleInput(DOWN); // user-3a → asst-3a (not user-3b)
 			expect(list.getSelectedNode()?.entry.id).toBe("asst-3a");
 		});
+	});
+});
+
+describe("findLatestUserMessageEntryId", () => {
+	test("walks up from the leaf to the latest user message on the active path", () => {
+		const tree = buildTree([
+			userMessage("user-1", null, "first"),
+			assistantMessage("asst-1", "user-1", "reply 1"),
+			userMessage("user-2", "asst-1", "second"),
+			assistantMessage("asst-2", "user-2", "reply 2"),
+		]);
+
+		expect(findLatestUserMessageEntryId(tree, "asst-2")).toBe("user-2");
+	});
+
+	test("follows the active branch, not the chronologically last user message", () => {
+		// Branch A is active (leaf asst-3a); branch B carries the later user message.
+		const tree = buildTree([
+			userMessage("user-1", null, "root"),
+			assistantMessage("asst-1", "user-1", "reply"),
+			userMessage("user-2a", "asst-1", "branch A"),
+			assistantMessage("asst-2a", "user-2a", "branch A reply"),
+			userMessage("user-2b", "asst-1", "branch B"),
+			assistantMessage("asst-2b", "user-2b", "branch B reply"),
+		]);
+
+		expect(findLatestUserMessageEntryId(tree, "asst-2a")).toBe("user-2a");
+		expect(findLatestUserMessageEntryId(tree, "asst-2b")).toBe("user-2b");
+	});
+
+	test("returns the leaf itself when the leaf is a user message", () => {
+		const tree = buildTree([userMessage("user-1", null, "only message")]);
+
+		expect(findLatestUserMessageEntryId(tree, "user-1")).toBe("user-1");
+	});
+
+	test("returns undefined when the active path holds no user message", () => {
+		const tree = buildTree([modelChange("model-1", null), serviceTierChange("tier-1", "model-1", "priority")]);
+
+		expect(findLatestUserMessageEntryId(tree, "tier-1")).toBeUndefined();
+	});
+
+	test("returns undefined without a leaf or with an unknown leaf id", () => {
+		const tree = buildTree([userMessage("user-1", null, "hello")]);
+
+		expect(findLatestUserMessageEntryId(tree, null)).toBeUndefined();
+		expect(findLatestUserMessageEntryId(tree, "missing")).toBeUndefined();
 	});
 });

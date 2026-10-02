@@ -339,6 +339,19 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		expect(mode.editor.getText()).toBe("");
 	});
 
+	it("asks the tree to preselect the latest user message on double Escape", () => {
+		// The double-Esc landing is the edit-and-resend flow: the tree opens with
+		// the latest user message highlighted, so Enter forks it back into the
+		// editor. The explicit /tree entry keeps the current-leaf highlight.
+		const mode = createInteractiveFake({});
+		const handleEscape = Reflect.get(InteractiveMode.prototype, "handleEscape");
+
+		handleEscape.call(mode);
+		handleEscape.call(mode);
+
+		expect(mode.showTreeSelector).toHaveBeenCalledWith(undefined, { preselectLatestUserMessage: true });
+	});
+
 	it("clears a whitespace draft on a single Escape", () => {
 		const mode = createInteractiveFake({ editorText: "   " });
 		const handleEscape = Reflect.get(InteractiveMode.prototype, "handleEscape");
