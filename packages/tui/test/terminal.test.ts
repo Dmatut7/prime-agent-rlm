@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { ProcessTerminal } from "../src/terminal.js";
+import { clearDefaultTerminalColors, getDefaultTerminalColors } from "../src/terminal-colors.js";
 import { resetCapabilitiesCache } from "../src/terminal-image.js";
 import { isGrapheme2027Active } from "../src/utils.js";
 
@@ -264,7 +265,7 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 			// pop before ?1049l, while the alt stack is still the active one.
 			assert.deepEqual(writes, [
 				"\x1b[?2004h",
-				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[c",
+				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[?2031$p\x1b[c",
 				"\x1b[>7u",
 				"\x1b[?1049h",
 				"\x1b[>7u",
@@ -293,7 +294,7 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 
 			assert.deepEqual(writes, [
 				"\x1b[?2004h",
-				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[c",
+				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[?2031$p\x1b[c",
 				"\x1b[?1049h",
 				"\x1b[?1049l",
 				"\x1b[?2004l",
@@ -326,14 +327,14 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 
 			assert.deepEqual(writes, [
 				"\x1b[?2004h",
-				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[c",
+				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[?2031$p\x1b[c",
 				"\x1b[>7u",
 				"\x1b[?1049h",
 				"\x1b[>7u",
 				"\x1b[?2004l",
 				"\x1b[<u",
 				"\x1b[?2004h",
-				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[c",
+				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[?2031$p\x1b[c",
 				"\x1b[>7u",
 				"\x1b[<u",
 				"\x1b[?1049l",
@@ -361,7 +362,7 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 
 			assert.deepEqual(writes, [
 				"\x1b[?2004h",
-				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[c",
+				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[?2031$p\x1b[c",
 				"\x1b[?1049h",
 				"\x1b[>7u",
 				"\x1b[<u",
@@ -427,7 +428,11 @@ describe("ProcessTerminal probe bus wiring", () => {
 			);
 			terminal.stop();
 
-			assert.deepEqual(writes.slice(0, 3), ["\x1b[?2004h", "\x1b[>7u", "\x1b[?2026$p\x1b[?2027$p\x1b[c"]);
+			assert.deepEqual(writes.slice(0, 3), [
+				"\x1b[?2004h",
+				"\x1b[>7u",
+				"\x1b[?2026$p\x1b[?2027$p\x1b[?2031$p\x1b[c",
+			]);
 			assert.ok(!writes.includes("\x1b[>4;2m"));
 		} finally {
 			restore();
@@ -446,7 +451,11 @@ describe("ProcessTerminal probe bus wiring", () => {
 			);
 			terminal.stop();
 
-			assert.deepEqual(writes.slice(0, 3), ["\x1b[?2004h", "\x1b[>4;2m", "\x1b[?2026$p\x1b[?2027$p\x1b[c"]);
+			assert.deepEqual(writes.slice(0, 3), [
+				"\x1b[?2004h",
+				"\x1b[>4;2m",
+				"\x1b[?2026$p\x1b[?2027$p\x1b[?2031$p\x1b[c",
+			]);
 			assert.ok(!writes.includes("\x1b[>7u"));
 		} finally {
 			restore();
@@ -472,7 +481,7 @@ describe("ProcessTerminal grapheme 2027 mode", () => {
 			assert.equal(isGrapheme2027Active(), false);
 			assert.deepEqual(writes, [
 				"\x1b[?2004h",
-				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[c",
+				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[?2031$p\x1b[c",
 				"\x1b[?2027h",
 				"\x1b[>4;2m",
 				"\x1b[?2004l",
@@ -539,7 +548,7 @@ describe("ProcessTerminal grapheme 2027 mode", () => {
 			assert.deepEqual(writes, [
 				"\x1b[?2004h",
 				"\x1b[?2027h",
-				"\x1b[?u\x1b[?2026$p\x1b[c",
+				"\x1b[?u\x1b[?2026$p\x1b[?2031$p\x1b[c",
 				"\x1b[?2004l",
 				"\x1b[?2027l",
 			]);
@@ -561,7 +570,7 @@ describe("ProcessTerminal grapheme 2027 mode", () => {
 			process.stdin.emit("data", "\x1b[?2027;1$y");
 			terminal.stop();
 
-			assert.deepEqual(writes, ["\x1b[?2004h", "\x1b[?u\x1b[?2026$p\x1b[c", "\x1b[?2004l"]);
+			assert.deepEqual(writes, ["\x1b[?2004h", "\x1b[?u\x1b[?2026$p\x1b[?2031$p\x1b[c", "\x1b[?2004l"]);
 		} finally {
 			restore();
 		}
@@ -595,6 +604,84 @@ describe("ProcessTerminal grapheme 2027 mode", () => {
 			if (cleanup.altScreenActive) {
 				cleanup.stop();
 			}
+			restore();
+		}
+	});
+});
+
+describe("ProcessTerminal mode 2031 color-scheme pushes", () => {
+	it("enables 2031 on a supported DECRPM answer and resets it on stop", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?2031;2$y");
+			assert.ok(writes.includes("\x1b[?2031h"));
+			terminal.stop();
+			assert.ok(writes.includes("\x1b[?2031l"));
+		} finally {
+			restore();
+		}
+	});
+
+	it("routes a 997 push into an OSC re-query, refreshes the default colors and triggers a redraw", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		let resizes = 0;
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {
+					resizes++;
+				},
+			);
+			process.stdin.emit("data", "\x1b[?2031;1$y");
+			process.stdin.emit("data", "\x1b[?997;2n");
+			assert.ok(writes.join("").includes("\x1b]10;?\x1b\\\x1b]11;?\x1b\\"));
+
+			process.stdin.emit("data", "\x1b]10;rgb:ffff/ffff/ffff\x07");
+			// A half-answered refresh does not redraw yet.
+			assert.equal(resizes, 0);
+			process.stdin.emit("data", "\x1b]11;rgb:eeee/eeee/eeee\x1b\\");
+			assert.deepEqual(getDefaultTerminalColors(), {
+				foreground: { r: 255, g: 255, b: 255 },
+				background: { r: 238, g: 238, b: 238 },
+			});
+			assert.equal(resizes, 1);
+			terminal.stop();
+		} finally {
+			clearDefaultTerminalColors();
+			restore();
+		}
+	});
+
+	it("ignores pushes when PI_TERMINAL_SCHEME_2031=0", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		process.env.PI_TERMINAL_SCHEME_2031 = "0";
+		let resizes = 0;
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {
+					resizes++;
+				},
+			);
+			process.stdin.emit("data", "\x1b[?997;1n");
+			process.stdin.emit("data", "\x1b]10;rgb:ffff/ffff/ffff\x07");
+			process.stdin.emit("data", "\x1b]11;rgb:eeee/eeee/eeee\x1b\\");
+			assert.ok(!writes.join("").includes("\x1b[?2031h"));
+			assert.ok(!writes.join("").includes("\x1b]10;?"));
+			assert.equal(getDefaultTerminalColors(), undefined);
+			assert.equal(resizes, 0);
+			terminal.stop();
+		} finally {
 			restore();
 		}
 	});

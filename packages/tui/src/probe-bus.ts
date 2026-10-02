@@ -12,6 +12,9 @@
  * Consumers subscribe per capability instead of greping the input stream: both
  * the plain stdin path and the paste-strip path (stdin-buffer.ts) feed
  * `handleSequence`, which consumes every probe-answer shape it recognizes.
+ * Mode-2031 appearance pushes (`CSI ? 997 ; n`) can arrive at any time once the
+ * mode is enabled; the bus routes each push into an OSC 10/11 re-query so the
+ * oscColors state (and everything subscribed to it) tracks the new scheme.
  *
  * Per-capability env escape hatches (`PI_TERMINAL_<CAP>`): "0" disables the
  * probe and the capability, "1" forces support without probing, anything else
@@ -82,8 +85,15 @@ export const PROBE_FALLBACK_MS = 1000;
 const KITTY_KEYBOARD_QUERY = "\x1b[?u";
 const SYNC_2026_QUERY = "\x1b[?2026$p";
 const GRAPHEME_2027_QUERY = "\x1b[?2027$p";
+const SCHEME_2031_QUERY = "\x1b[?2031$p";
 const CELL_SIZE_QUERY = "\x1b[16t";
 const PRIMARY_DA_QUERY = "\x1b[c";
+
+// DECSET/DECRST 2031: subscribe to (and later unsubscribe from) color-scheme
+// pushes. Enabled once the capability is judged supported, reset on dispose so
+// the next process in this terminal does not inherit unsolicited pushes.
+const SCHEME_2031_ENABLE = "\x1b[?2031h";
+const SCHEME_2031_DISABLE = "\x1b[?2031l";
 
 const KITTY_ANSWER_REGEX = /^\x1b\[\?\d+u$/;
 const DECRPM_ANSWER_REGEX = /^\x1b\[\?(\d+);(\d+)\$y$/;
@@ -111,8 +121,16 @@ const DECRPM_MODE_PER_CAPABILITY: Partial<Record<number, ProbeCapability>> = {
 	2031: "scheme2031",
 };
 
-/** Capabilities with a query in flight in this phase; the rest stay "unknown" until theirs lands. */
-const QUERIED_CAPABILITIES: ProbeCapability[] = ["kittyKeyboard", "sync2026", "grapheme2027", "oscColors", "cellSize"];
+function sameDefaultColors(a: DefaultTerminalColors | undefined, b: DefaultTerminalColors | undefined): boolean {
+	if (a === b) {
+		return true;
+	}
+	if (!a || !b) {
+		return false;
+	}
+	const sameRgb = (x: Rgb, y: Rgb) => x.r === y.r && x.g === y.g && x.b === y.b;
+	return sameRgb(a.foreground, b.foreground) && sameRgb(a.background, b.background);
+}
 
 const ALL_CAPABILITIES = Object.keys(ENV_VAR_PER_CAPABILITY) as ProbeCapability[];
 
@@ -125,6 +143,8 @@ export class ProbeBus {
 	private started = false;
 	private disposed = false;
 	private settledFlag = false;
+	private scheme2031Enabled = false;
+	private write?: (data: string) => void;
 	private oscForeground?: Rgb;
 	private oscBackground?: Rgb;
 	private resolveSettled!: () => void;
@@ -135,10 +155,7 @@ export class ProbeBus {
 		this.fallbackMs = options.fallbackMs ?? PROBE_FALLBACK_MS;
 		this.env = options.env ?? process.env;
 		for (const cap of ALL_CAPABILITIES) {
-			// Capabilities whose query only a later phase sends have nothing in
-			// flight; "unknown" (not "pending") is the honest starting verdict.
-			const queried = QUERIED_CAPABILITIES.includes(cap);
-			this.states.set(cap, { verdict: queried ? "pending" : "unknown", source: "default" });
+			this.states.set(cap, { verdict: "pending", source: "default" });
 		}
 		this.settled = new Promise<void>((resolve) => {
 			this.resolveSettled = resolve;
@@ -154,10 +171,12 @@ export class ProbeBus {
 			return;
 		}
 		this.started = true;
+		this.write = write;
 
 		for (const cap of ALL_CAPABILITIES) {
 			this.applyEnvOverride(cap);
 		}
+		this.maybeEnableScheme2031();
 
 		// A capability the caller gated off was never asked: unknown, not pending,
 		// so the fence leaves it alone.
@@ -177,6 +196,9 @@ export class ProbeBus {
 		}
 		if (this.isPending("grapheme2027")) {
 			burst += GRAPHEME_2027_QUERY;
+		}
+		if (this.isPending("scheme2031")) {
+			burst += SCHEME_2031_QUERY;
 		}
 		if (this.isPending("oscColors")) {
 			burst += QUERY_DEFAULT_FOREGROUND + QUERY_DEFAULT_BACKGROUND;
@@ -219,14 +241,23 @@ export class ProbeBus {
 				// decision tables in the design.
 				const verdict: ProbeVerdict = pv >= 1 && pv <= 3 ? "supported" : "unsupported";
 				this.setStateUnlessOverridden(cap, { verdict, source: "probe", decrpmValue: pv });
+				if (cap === "scheme2031") {
+					this.maybeEnableScheme2031();
+				}
 			}
 			return true;
 		}
 
 		if (SCHEME_PUSH_REGEX.test(sequence)) {
-			// A 997 push means mode 2031 is live. Later phases route this into an
-			// oscColors refresh; the bus only records the capability for now.
+			// A 997 push means mode 2031 is live (even if a previous owner set it):
+			// record the capability, make sure the mode is enabled, and route the
+			// push into an oscColors refresh (docs/fork/probe-bus-design.md §4) so
+			// an appearance flip re-themes without waiting for a restart (P8).
 			this.setStateUnlessOverridden("scheme2031", { verdict: "supported", source: "probe" });
+			this.maybeEnableScheme2031();
+			if (this.query("scheme2031").verdict === "supported") {
+				this.refreshOscColors();
+			}
 			return true;
 		}
 
@@ -252,9 +283,13 @@ export class ProbeBus {
 		}
 
 		if (OSC_COLOR_ANSWER_SHAPE_REGEX.test(sequence)) {
-			// The probe closes at the fence: late color answers are consumed but
-			// dropped, as before the bus (phase 5 revisits this for 2031 pushes).
-			if (this.isPending("oscColors")) {
+			// The startup probe closes at the fence: late color answers are dropped,
+			// except while mode 2031 is live - those answer a 997-triggered re-query
+			// and are the whole point of the refresh. An env override stays final.
+			const oscColors = this.states.get("oscColors")!;
+			const refreshOpen =
+				oscColors.source !== "env-override" && this.states.get("scheme2031")!.verdict === "supported";
+			if (this.isPending("oscColors") || refreshOpen) {
 				const response = parseOscColorResponse(sequence);
 				if (response) {
 					if (response.kind === "foreground") {
@@ -314,6 +349,10 @@ export class ProbeBus {
 			return;
 		}
 		this.disposed = true;
+		if (this.scheme2031Enabled) {
+			this.scheme2031Enabled = false;
+			this.write?.(SCHEME_2031_DISABLE);
+		}
 		if (this.fallbackTimer) {
 			clearTimeout(this.fallbackTimer);
 			this.fallbackTimer = undefined;
@@ -324,6 +363,36 @@ export class ProbeBus {
 
 	private isPending(cap: ProbeCapability): boolean {
 		return this.states.get(cap)!.verdict === "pending";
+	}
+
+	/**
+	 * DECSET 2031 once the capability is judged supported (probe answer or env
+	 * force). Idempotent; the matching DECRST goes out from dispose().
+	 */
+	private maybeEnableScheme2031(): void {
+		if (this.scheme2031Enabled || !this.write) {
+			return;
+		}
+		if (this.query("scheme2031").verdict !== "supported") {
+			return;
+		}
+		this.scheme2031Enabled = true;
+		this.write(SCHEME_2031_ENABLE);
+	}
+
+	/**
+	 * Re-issue the OSC 10/11 queries after a 997 push; their answers come back
+	 * through handleSequence and update the oscColors state. The staged colors
+	 * are cleared first so a half-answered refresh cannot mix a new foreground
+	 * with a stale background.
+	 */
+	private refreshOscColors(): void {
+		if (!this.write || this.states.get("oscColors")!.source === "env-override") {
+			return;
+		}
+		this.oscForeground = undefined;
+		this.oscBackground = undefined;
+		this.write(QUERY_DEFAULT_FOREGROUND + QUERY_DEFAULT_BACKGROUND);
 	}
 
 	private applyEnvOverride(cap: ProbeCapability): void {
@@ -373,7 +442,7 @@ export class ProbeBus {
 			prev.decrpmValue === next.decrpmValue &&
 			prev.cellSize?.widthPx === next.cellSize?.widthPx &&
 			prev.cellSize?.heightPx === next.cellSize?.heightPx &&
-			prev.defaultColors === next.defaultColors
+			sameDefaultColors(prev.defaultColors, next.defaultColors)
 		) {
 			return;
 		}

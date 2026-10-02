@@ -140,7 +140,7 @@ export class ProbeBus {
 | 2 | 总线核心 + DA 栅栏：新建 `probe-bus.ts`；kitty/OSC 10/11 迁移上总线；150ms/100ms 定时器降级为单一兜底；env 逃逸门落地 | `packages/tui/src/probe-bus.ts`（新）、`packages/tui/src/terminal.ts`、`packages/tui/test/probe-bus.test.ts`（新） | 阶段 1 |
 | 3 | 2026 决策化：8 处盲发点按 `sync2026` 状态包帧；`tui.ts:940-945` 注释按分版本现实重写；cell size 迁移订阅 | `packages/tui/src/tui.ts`、`packages/tui/src/fullscreen.ts` | 阶段 2 |
 | 4 | 2027：探测+按 §3.2 表决策开启；`utils.ts` 宽度数学与模式位对齐；kitty 不答规避路径；per-screen 语义真机复核登记 | `packages/tui/src/utils.ts`、`packages/tui/src/terminal.ts`（与阶段 2 同文件，须串行不并行） | 阶段 2 |
-| 5 | 2031：探测+开启+997n 推送订阅，外观切换即时重着色（消 P8） | `packages/tui/src/terminal-colors.ts`、`packages/tui/src/probe-bus.ts` | 阶段 2 |
+| 5 | 2031：探测+开启+997n 推送订阅，外观切换即时重着色（消 P8）（**已落地**，W20-F 2026-10-03；实现收于 `probe-bus.ts` 一处，`terminal-colors.ts` 存储/订阅机制按 §4 约定未动） | `packages/tui/src/terminal-colors.ts`、`packages/tui/src/probe-bus.ts` | 阶段 2 |
 | 6 | Kitty Unicode placeholders 图片（U+10EEEE，kitty 0.28+）：图片走文本网格占位，`isImageLine`（`terminal-image.ts:149-156`）改认占位行；先 Ghostty 小步试点（消 P1/P2） | `packages/tui/src/terminal-image.ts`、`packages/tui/src/fullscreen.ts`、`packages/tui/src/utils.ts` | 阶段 2（应答通道）+ 阶段 4（占位符宽度数学） |
 
 阶段 4 与阶段 5 互不依赖可并行；阶段 3/4 都碰 `tui.ts`/`terminal.ts` 的相邻区域，实施波按共享 worktree 纪律串行提交。
@@ -166,7 +166,7 @@ cd packages/tui && env -u RLM_DEPTH -u RLM_SESSION_DIR node --test --import tsx 
 
 ## 7. 风险与未决项
 
-1. **kitty 对未识别 DECRQM 的应答行为未实测**（答 0 还是不答）——§3.2 已把两条路径都收敛到「不开 2027」，风险已对冲；实施波顺手在 kitty 真机记录一次实际行为进本文件。
+1. **kitty 对未识别 DECRQM 的应答行为：已销账**（2026-10-03，W20-F，kitty master 源码证据，无需真机）。kitty 对 DECRQM **必答**：`vt-parser.c`（`case DECSTR / '$'` 分支）把 `CSI ? Ps $ p` 派发到 `screen.c` 的 `report_mode_status`；该函数 `ans` 初始 0、switch 无 default 分支、应答恒写出——未识别模式（含 2027，kitty#7799 拒做）答 `CSI ? Ps ; 0 $ y`（Pv=0，"not recognized"），**不存在「沉默」路径**；kitty 只产出 Pv∈{0,1,2}（不答 3/4）。§3.2 的双路径对冲简化为单路径：kitty 形终端一律走 Pv=0 判负。旁证（2031 落地依据）：mode 2031 = `COLOR_PREFERENCE_NOTIFICATION`（`modes.h`），997 推送由 `window.py` 的 `report_color_scheme_preference` 发出（暗=`CSI ? 997 ; 1 n`、亮=`CSI ? 997 ; 2 n`），且 DECSET 2031 是 SIMPLE_MODE——**开启瞬间不补发当前值**，初始配色仍靠启动时的 OSC 10/11 首探，推送只在外观变化（或应用显式发 `CSI ? 996 n` 查询，`screen.c` 有该分支）时到达。
 2. **2027 per-screen 语义未复核**（同 F3 先例）——阶段 4 含真机复核项；复核前只在主屏开。
 3. **2031 在 tmux 3.6 已支持**（CHANGES「Add mode 2031 support」，issue 4353）——但同样只代表 pane 透传；外层不推 997n 时退回 OSC 10/11 现状，不恶化。
 4. **Windows conhost/裸 pty 不答 DA**——兜底定时器路径必须有测试覆盖（阶段 2 用例），不能因栅栏上线而删掉最后保险。

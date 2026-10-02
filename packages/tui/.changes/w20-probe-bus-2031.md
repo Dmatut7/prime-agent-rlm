@@ -1,0 +1,2 @@
+- Added DECRQM probing for terminal mode 2031 (color-scheme change notifications) to the startup capability bus, judged by the primary-DA fence; `PI_TERMINAL_SCHEME_2031=0/1` overrides the probe.
+- Fixed the interface not re-theming when the terminal switches between dark and light after startup: a mode-2031 `CSI ? 997 ; n` push now triggers an OSC 10/11 re-query, refreshing the default colors and redrawing immediately.

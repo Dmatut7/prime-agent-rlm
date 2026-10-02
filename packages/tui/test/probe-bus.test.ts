@@ -20,7 +20,7 @@ describe("ProbeBus", () => {
 		it("writes every probe query ahead of the primary-DA fence", () => {
 			const { bus, writes } = startBus({ env: {} });
 			try {
-				const expected = `\x1b[?u\x1b[?2026$p\x1b[?2027$p${QUERY_DEFAULT_FOREGROUND}${QUERY_DEFAULT_BACKGROUND}\x1b[16t\x1b[c`;
+				const expected = `\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[?2031$p${QUERY_DEFAULT_FOREGROUND}${QUERY_DEFAULT_BACKGROUND}\x1b[16t\x1b[c`;
 				assert.deepStrictEqual(writes, [expected]);
 			} finally {
 				bus.dispose();
@@ -30,7 +30,7 @@ describe("ProbeBus", () => {
 		it("skips the queries the caller gates off and reports those capabilities unknown", () => {
 			const { bus, writes } = startBus({ env: {} }, { queryOscColors: false, queryCellSize: false });
 			try {
-				assert.deepStrictEqual(writes, ["\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[c"]);
+				assert.deepStrictEqual(writes, ["\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[?2031$p\x1b[c"]);
 				assert.deepStrictEqual(bus.query("oscColors"), { verdict: "unknown", source: "default" });
 				assert.deepStrictEqual(bus.query("cellSize"), { verdict: "unknown", source: "default" });
 				// Never asked, so the DA fence must not flip them to unsupported.
@@ -170,11 +170,16 @@ describe("ProbeBus", () => {
 				assert.strictEqual(bus.handleSequence(DA_ANSWER), true);
 				await bus.settled;
 
-				for (const cap of ["kittyKeyboard", "sync2026", "grapheme2027", "oscColors", "cellSize"] as const) {
+				for (const cap of [
+					"kittyKeyboard",
+					"sync2026",
+					"grapheme2027",
+					"scheme2031",
+					"oscColors",
+					"cellSize",
+				] as const) {
 					assert.deepStrictEqual(bus.query(cap), { verdict: "unsupported", source: "default" }, cap);
 				}
-				// scheme2031's query only a later phase sends: the fence says nothing about it.
-				assert.strictEqual(bus.query("scheme2031").verdict, "unknown");
 				assert.deepStrictEqual(kittySeen, [{ verdict: "unsupported", source: "default" }]);
 			} finally {
 				bus.dispose();
@@ -185,7 +190,14 @@ describe("ProbeBus", () => {
 			const { bus } = startBus({ env: {}, fallbackMs: 5 });
 			try {
 				await bus.settled;
-				for (const cap of ["kittyKeyboard", "oscColors", "cellSize"] as const) {
+				for (const cap of [
+					"kittyKeyboard",
+					"sync2026",
+					"grapheme2027",
+					"scheme2031",
+					"oscColors",
+					"cellSize",
+				] as const) {
 					assert.deepStrictEqual(bus.query(cap), { verdict: "unknown", source: "default" }, cap);
 				}
 			} finally {
@@ -441,17 +453,264 @@ describe("ProbeBus", () => {
 		});
 	});
 
+	describe("scheme2031 probing and the 997 push refresh", () => {
+		it("sends the DECRQM 2031 query and starts pending", () => {
+			const { bus, writes } = startBus({ env: {} });
+			try {
+				assert.ok(writes[0]!.includes("\x1b[?2031$p"));
+				assert.deepStrictEqual(bus.query("scheme2031"), { verdict: "pending", source: "default" });
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("enables mode 2031 on a set answer (Pv=1)", () => {
+			const { bus, writes } = startBus({ env: {} });
+			try {
+				const seen: CapabilityState[] = [];
+				bus.onChange("scheme2031", (_cap, state) => seen.push(state));
+				assert.strictEqual(bus.handleSequence("\x1b[?2031;1$y"), true);
+				assert.deepStrictEqual(bus.query("scheme2031"), { verdict: "supported", source: "probe", decrpmValue: 1 });
+				assert.deepStrictEqual(writes.slice(1), ["\x1b[?2031h"]);
+				assert.strictEqual(seen.length, 1);
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("enables mode 2031 on a reset answer (Pv=2): the terminal knows the mode", () => {
+			const { bus, writes } = startBus({ env: {} });
+			try {
+				assert.strictEqual(bus.handleSequence("\x1b[?2031;2$y"), true);
+				assert.deepStrictEqual(bus.query("scheme2031"), { verdict: "supported", source: "probe", decrpmValue: 2 });
+				assert.deepStrictEqual(writes.slice(1), ["\x1b[?2031h"]);
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("never enables on a refusal (Pv=0/4), fence silence, or the fallback timer", async () => {
+			const refused = startBus({ env: {} });
+			try {
+				refused.bus.handleSequence("\x1b[?2031;0$y");
+				assert.deepStrictEqual(refused.bus.query("scheme2031"), {
+					verdict: "unsupported",
+					source: "probe",
+					decrpmValue: 0,
+				});
+				assert.ok(!refused.writes.join("").includes("\x1b[?2031h"));
+			} finally {
+				refused.bus.dispose();
+			}
+
+			const fenced = startBus({ env: {} });
+			try {
+				fenced.bus.handleSequence(DA_ANSWER);
+				assert.strictEqual(fenced.bus.query("scheme2031").verdict, "unsupported");
+				assert.ok(!fenced.writes.join("").includes("\x1b[?2031h"));
+			} finally {
+				fenced.bus.dispose();
+			}
+
+			const timedOut = startBus({ env: {}, fallbackMs: 5 });
+			try {
+				await timedOut.bus.settled;
+				assert.strictEqual(timedOut.bus.query("scheme2031").verdict, "unknown");
+				assert.ok(!timedOut.writes.join("").includes("\x1b[?2031h"));
+			} finally {
+				timedOut.bus.dispose();
+			}
+		});
+
+		it("writes the DECSET only once for repeated supported answers", () => {
+			const { bus, writes } = startBus({ env: {} });
+			try {
+				bus.handleSequence("\x1b[?2031;1$y");
+				bus.handleSequence("\x1b[?2031;3$y");
+				const decsets = writes.filter((write) => write.includes("\x1b[?2031h"));
+				assert.strictEqual(decsets.length, 1);
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("PI_TERMINAL_SCHEME_2031=1 enables the mode without probing", () => {
+			const { bus, writes } = startBus({ env: { PI_TERMINAL_SCHEME_2031: "1" } });
+			try {
+				assert.ok(!writes.join("").includes("\x1b[?2031$p"));
+				assert.deepStrictEqual(writes[0], "\x1b[?2031h");
+				assert.deepStrictEqual(bus.query("scheme2031"), { verdict: "supported", source: "env-override" });
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("PI_TERMINAL_SCHEME_2031=0 skips the query and never enables, even on answers and pushes", () => {
+			const { bus, writes } = startBus({ env: { PI_TERMINAL_SCHEME_2031: "0" } });
+			try {
+				assert.ok(!writes.join("").includes("\x1b[?2031$p"));
+				assert.deepStrictEqual(bus.query("scheme2031"), { verdict: "unsupported", source: "env-override" });
+				assert.strictEqual(bus.handleSequence("\x1b[?2031;1$y"), true);
+				assert.strictEqual(bus.handleSequence("\x1b[?997;1n"), true);
+				assert.strictEqual(bus.query("scheme2031").verdict, "unsupported");
+				// The burst was the only write: no DECSET, no OSC re-query.
+				assert.strictEqual(writes.length, 1);
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("routes a 997 push into an OSC 10/11 re-query once 2031 is live", () => {
+			const { bus, writes } = startBus({ env: {} });
+			try {
+				bus.handleSequence("\x1b[?2031;1$y");
+				assert.strictEqual(bus.handleSequence("\x1b[?997;2n"), true);
+				assert.strictEqual(bus.handleSequence("\x1b[?997;1n"), true);
+				assert.deepStrictEqual(writes.slice(1), [
+					"\x1b[?2031h",
+					QUERY_DEFAULT_FOREGROUND + QUERY_DEFAULT_BACKGROUND,
+					QUERY_DEFAULT_FOREGROUND + QUERY_DEFAULT_BACKGROUND,
+				]);
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("a stray push (mode left set by a previous owner) enables 2031 and refreshes", async () => {
+			const { bus, writes } = startBus({ env: {} });
+			try {
+				bus.handleSequence(DA_ANSWER);
+				await bus.settled;
+				assert.strictEqual(bus.query("scheme2031").verdict, "unsupported");
+				assert.strictEqual(bus.handleSequence("\x1b[?997;1n"), true);
+				assert.strictEqual(bus.query("scheme2031").verdict, "supported");
+				assert.deepStrictEqual(writes.slice(1), [
+					"\x1b[?2031h",
+					QUERY_DEFAULT_FOREGROUND + QUERY_DEFAULT_BACKGROUND,
+				]);
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("skips the re-query when OSC colors are disabled by env", () => {
+			const { bus, writes } = startBus({ env: { PI_TERMINAL_OSC_COLORS: "0" } });
+			try {
+				bus.handleSequence("\x1b[?2031;1$y");
+				bus.handleSequence("\x1b[?997;1n");
+				assert.deepStrictEqual(writes.slice(1), ["\x1b[?2031h"]);
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("refresh answers after the fence update oscColors once; a same-color refresh does not re-notify", async () => {
+			const { bus } = startBus({ env: {} });
+			try {
+				const seen: CapabilityState[] = [];
+				bus.onChange("oscColors", (_cap, state) => seen.push(state));
+
+				// Startup probe answers, then the fence closes the startup window.
+				bus.handleSequence("\x1b]10;rgb:ffff/ffff/ffff\x07");
+				bus.handleSequence("\x1b]11;rgb:0000/0000/0000\x1b\\");
+				bus.handleSequence(DA_ANSWER);
+				await bus.settled;
+				assert.strictEqual(seen.length, 1);
+
+				// Appearance flips: push, re-query, new colors - accepted past the fence.
+				bus.handleSequence("\x1b[?2031;1$y");
+				bus.handleSequence("\x1b[?997;2n");
+				assert.strictEqual(bus.handleSequence("\x1b]10;rgb:0000/0000/0000\x07"), true);
+				assert.strictEqual(bus.handleSequence("\x1b]11;rgb:ffff/ffff/ffff\x1b\\"), true);
+				assert.strictEqual(seen.length, 2);
+				assert.deepStrictEqual(bus.query("oscColors").defaultColors, {
+					foreground: { r: 0, g: 0, b: 0 },
+					background: { r: 255, g: 255, b: 255 },
+				});
+
+				// Another push whose answers repeat the same colors is absorbed silently.
+				bus.handleSequence("\x1b[?997;2n");
+				bus.handleSequence("\x1b]10;rgb:0000/0000/0000\x07");
+				bus.handleSequence("\x1b]11;rgb:ffff/ffff/ffff\x1b\\");
+				assert.strictEqual(seen.length, 2);
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("a late DECRPM past the fence still enables 2031, and its refresh reopens oscColors", async () => {
+			const { bus } = startBus({ env: {} });
+			try {
+				bus.handleSequence(DA_ANSWER);
+				await bus.settled;
+				assert.strictEqual(bus.query("oscColors").verdict, "unsupported");
+
+				bus.handleSequence("\x1b[?2031;2$y");
+				bus.handleSequence("\x1b[?997;1n");
+				bus.handleSequence("\x1b]10;rgb:ffff/ffff/ffff\x07");
+				bus.handleSequence("\x1b]11;rgb:0000/0000/0000\x1b\\");
+				assert.strictEqual(bus.query("oscColors").verdict, "supported");
+				assert.deepStrictEqual(bus.query("oscColors").defaultColors, {
+					foreground: { r: 255, g: 255, b: 255 },
+					background: { r: 0, g: 0, b: 0 },
+				});
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("a half-answered refresh does not emit a mixed color pair", () => {
+			const { bus } = startBus({ env: {} });
+			try {
+				const seen: CapabilityState[] = [];
+				bus.onChange("oscColors", (_cap, state) => seen.push(state));
+				bus.handleSequence("\x1b]10;rgb:ffff/ffff/ffff\x07");
+				bus.handleSequence("\x1b]11;rgb:0000/0000/0000\x1b\\");
+				assert.strictEqual(seen.length, 1);
+
+				bus.handleSequence("\x1b[?2031;1$y");
+				bus.handleSequence("\x1b[?997;2n");
+				// Only the foreground answer arrives: no notification, old colors kept.
+				bus.handleSequence("\x1b]10;rgb:0000/0000/0000\x07");
+				assert.strictEqual(seen.length, 1);
+				assert.deepStrictEqual(bus.query("oscColors").defaultColors, {
+					foreground: { r: 255, g: 255, b: 255 },
+					background: { r: 0, g: 0, b: 0 },
+				});
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("resets mode 2031 on dispose only when it was enabled", () => {
+			const enabled = startBus({ env: {} });
+			enabled.bus.handleSequence("\x1b[?2031;1$y");
+			enabled.bus.dispose();
+			assert.strictEqual(enabled.writes.at(-1), "\x1b[?2031l");
+
+			const plain = startBus({ env: {} });
+			plain.bus.dispose();
+			assert.ok(!plain.writes.join("").includes("\x1b[?2031l"));
+		});
+	});
+
 	describe("guards and lifecycle", () => {
 		it("never consumes a bare CSI c (the shift+right key)", () => {
 			const { bus } = startBus({ env: {} });
 			try {
 				assert.strictEqual(bus.handleSequence("\x1b[c"), false);
 				assert.strictEqual(bus.handleSequence("\x1b[1;2c"), false);
-				// Nothing changed: queried capabilities stay pending, unqueried stay unknown.
-				for (const cap of ["kittyKeyboard", "sync2026", "grapheme2027", "oscColors", "cellSize"] as const) {
+				// Nothing changed: every queried capability stays pending.
+				for (const cap of [
+					"kittyKeyboard",
+					"sync2026",
+					"grapheme2027",
+					"scheme2031",
+					"oscColors",
+					"cellSize",
+				] as const) {
 					assert.strictEqual(bus.query(cap).verdict, "pending", cap);
 				}
-				assert.strictEqual(bus.query("scheme2031").verdict, "unknown");
 			} finally {
 				bus.dispose();
 			}
