@@ -2,7 +2,7 @@
 
 Bidirectional grader checks: every grader must accept a gold sample and
 reject wrong samples, and the wave-11 baseline defects (D1-D6, recorded in
-README.md) must stay fixed:
+README.md) plus the wave-15 integrity defect (D9) must stay fixed:
 
   D1  EX-2 answers.json lives at fixture/answers.json (one level above
       docs/, as the prompt states), not at the work root.
@@ -14,6 +14,12 @@ README.md) must stay fixed:
       alongside auth.json, file-to-file.
   D5  README documents that one agent home serves one daemon at a time.
   D6  ex5-sigterm/prompt.txt forbids executing the CLI under test.
+  D9  Grading rails (git-status-pre.txt, pre-resume.json, run-meta.json,
+      agent.log) live in a --rail-dir OUTSIDE the agent-writable work dir;
+      graders fail closed when the rail dir overlaps the work dir, when
+      run-meta.json is missing, or when a rail file's mtime postdates the
+      run start the driver recorded (the wave-15 incident: the agent
+      overwrote the pre-run snapshot mid-run, then self-ran the grader).
 
 No agent, model, or network is invoked. Python 3.9 stdlib only.
 
@@ -27,9 +33,12 @@ import hashlib
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -278,6 +287,79 @@ class ExamlibTest(unittest.TestCase):
             nested_log = agent_log_text(cwd, []) + nested + "\n"
             self.assertEqual(examlib.repo_write_paths_from_log(nested_log, repo), {"src/a.ts"})
 
+    def test_resolve_rail_dir_refuses_overlap_with_work(self):
+        # D9: everything under --work is agent-writable, so a rail dir that
+        # nests either way is forgeable and refused; a sibling is fine.
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp) / "work"
+            work.mkdir()
+            sibling = Path(tmp) / "rail"
+            self.assertEqual(examlib.resolve_rail_dir(sibling, work), sibling.resolve())
+            for bad in (work, work / "rail", Path(tmp)):
+                with self.assertRaises(ValueError, msg=str(bad)):
+                    examlib.resolve_rail_dir(bad, work)
+
+    def test_record_and_read_run_meta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rail = Path(tmp) / "rail"
+            rail.mkdir()
+            examlib.record_run_meta(rail, exam="EX-TEST", started_at=1000.5)
+            examlib.record_run_meta(rail, phase_b_started_at=1001.5)
+            meta = examlib.read_run_meta(rail)
+            self.assertEqual(meta["exam"], "EX-TEST")
+            self.assertEqual(meta["started_at"], 1000.5)
+            # Later driver phases merge into the same record.
+            self.assertEqual(meta["phase_b_started_at"], 1001.5)
+            self.assertEqual(examlib.epoch_field(meta, "started_at"), 1000.5)
+            self.assertIsNone(examlib.epoch_field(meta, "missing"))
+            self.assertIsNone(examlib.epoch_field({"flag": True}, "flag"))
+            self.assertIsNone(examlib.epoch_field({"s": "1000"}, "s"))
+        self.assertEqual(examlib.read_run_meta(Path(tmp) / "nonexistent"), {})
+
+    def test_verify_rail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            work.mkdir()
+            rail = root / "rail"
+            rail.mkdir()
+            pre = rail / "git-status-pre.txt"
+            log = rail / "agent.log"
+            pre.write_text("pre\n")
+            log.write_text("log\n")
+            started_at = time.time() - 60
+            old = started_at - 60
+            os.utime(pre, (old, old))
+            files = [("pre_status", "git-status-pre.txt", started_at), ("agent_log", "agent.log", None)]
+
+            checks = examlib.verify_rail(rail, work, files)
+            self.assertTrue(checks["rail_ok"], checks)
+            self.assertTrue(checks["rail_dir_outside_work"])
+            self.assertTrue(checks["rail_pre_status_present"])
+            self.assertTrue(checks["rail_pre_status_predates_run"])
+            self.assertTrue(checks["rail_agent_log_present"])
+
+            # D9 incident shape: the snapshot rewritten after the run started.
+            pre.write_text("forged mid-run\n")
+            checks = examlib.verify_rail(rail, work, files)
+            self.assertFalse(checks["rail_ok"])
+            self.assertFalse(checks["rail_pre_status_predates_run"])
+
+            # A missing rail file fails closed.
+            pre.unlink()
+            checks = examlib.verify_rail(rail, work, files)
+            self.assertFalse(checks["rail_ok"])
+            self.assertFalse(checks["rail_pre_status_present"])
+            self.assertFalse(checks["rail_pre_status_predates_run"])
+
+            # A rail dir reachable by the agent is no rail.
+            inner = work / "rail"
+            inner.mkdir()
+            (inner / "git-status-pre.txt").write_text("pre\n")
+            checks = examlib.verify_rail(inner, work, [("pre_status", "git-status-pre.txt", None)])
+            self.assertFalse(checks["rail_dir_outside_work"])
+            self.assertFalse(checks["rail_ok"])
+
 
 class Ex1Test(unittest.TestCase):
     def setUp(self):
@@ -420,7 +502,12 @@ class Ex2Test(unittest.TestCase):
 class Ex3Test(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.work = Path(self.tmp.name) / "ex3"
+        self.root = Path(self.tmp.name)
+        self.work = self.root / "ex3"
+        # D9: the pre-resume snapshot is a grading rail and lives outside the
+        # agent-writable work dir.
+        self.rail = self.root / "ex3-rail"
+        self.rail.mkdir()
         fixture = self.work / "fixture"
         fixture.mkdir(parents=True)
         self.token = "WK-AAAA00"
@@ -443,17 +530,28 @@ class Ex3Test(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def grade(self, run=None, pre=None):
+    def write_legit_rail(self, pre=None) -> None:
+        # Driver order: snapshot the pre-resume state, then record the
+        # phase-B launch time over it.
+        (self.rail / "pre-resume.json").write_text(json.dumps(pre or self.pre, indent=2) + "\n")
+        examlib.record_run_meta(self.rail, exam="EX-3", started_at=time.time() - 120)
+        examlib.record_run_meta(self.rail, phase_b_started_at=time.time())
+
+    def grade(self, run=None):
         (self.work / "run.json").write_text(json.dumps(run or self.run))
-        (self.work / "pre-resume.json").write_text(json.dumps(pre or self.pre))
-        return run_grader("ex3-recovery/grade_ex3.py", "--work", str(self.work))
+        return run_grader(
+            "ex3-recovery/grade_ex3.py", "--work", str(self.work), "--rail-dir", str(self.rail)
+        )
 
     def test_gold_passes(self):
+        self.write_legit_rail()
         code, verdict, err = self.grade()
         self.assertEqual(code, 0, err)
         self.assertTrue(verdict["pass"], json.dumps(verdict))
+        self.assertTrue(verdict["checks"]["rail_ok"], json.dumps(verdict))
 
     def test_wrong_tick_count_fails(self):
+        self.write_legit_rail()
         (self.work / "fixture" / "phase-b.txt").write_text("token: %s\nheartbeat_ticks: 8\n" % self.token)
         code, verdict, err = self.grade()
         self.assertEqual(code, 1, err)
@@ -461,6 +559,7 @@ class Ex3Test(unittest.TestCase):
         self.assertFalse(verdict["checks"]["phase_b_ticks_ok"])
 
     def test_rewritten_phase_a_fails(self):
+        self.write_legit_rail()
         (self.work / "fixture" / "phase-a.txt").write_text(self.token + "\nredone\n")
         code, verdict, err = self.grade()
         self.assertEqual(code, 1, err)
@@ -468,11 +567,39 @@ class Ex3Test(unittest.TestCase):
         self.assertFalse(verdict["checks"]["phase_a_untouched"])
 
     def test_uninterrupted_phase_a_fails(self):
+        self.write_legit_rail()
         run = dict(self.run, phase_a_exit_code=0)
         code, verdict, err = self.grade(run=run)
         self.assertEqual(code, 1, err)
         self.assertFalse(verdict["pass"])
         self.assertFalse(verdict["checks"]["phase_a_interrupted"])
+
+    def test_tampered_pre_resume_grades_red(self):
+        # D9: pre-resume.json rewritten after the phase-B launch voids the
+        # run even when the tampered content is self-consistent with the
+        # agent's (wrong) phase-b.txt - the mtime rule, not the content,
+        # catches it.
+        tampered = dict(self.pre, heartbeat_lines_at_kill=8)
+        examlib.record_run_meta(self.rail, exam="EX-3", started_at=time.time() - 120)
+        examlib.record_run_meta(self.rail, phase_b_started_at=time.time() - 60)
+        (self.rail / "pre-resume.json").write_text(json.dumps(tampered, indent=2) + "\n")
+        (self.work / "fixture" / "phase-b.txt").write_text("token: %s\nheartbeat_ticks: 8\n" % self.token)
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertTrue(verdict["checks"]["phase_b_ticks_ok"], json.dumps(verdict))
+        self.assertFalse(verdict["checks"]["rail_pre_resume_predates_run"])
+        self.assertFalse(verdict["checks"]["rail_ok"])
+
+    def test_missing_rail_files_grade_red(self):
+        # No run-meta.json and no pre-resume.json: fail closed, no crash.
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertFalse(verdict["checks"]["rail_run_meta_present"])
+        self.assertFalse(verdict["checks"]["rail_pre_resume_present"])
+        self.assertFalse(verdict["checks"]["rail_ok"])
+        self.assertFalse(verdict["checks"]["phase_b_correct"])
 
 
 class Ex4Ex5Base(unittest.TestCase):
@@ -483,11 +610,24 @@ class Ex4Ex5Base(unittest.TestCase):
         self.work = self.root / "work"
         self.sessions = self.work / "sessions"
         self.sessions.mkdir(parents=True)
-        self.pre_status = self.work / "git-status-pre.txt"
-        self.agent_log = self.work / "agent.log"
+        # D9: rails (pre-run snapshot, run metadata, agent log) live outside
+        # the agent-writable work dir; the prompt never names this path.
+        self.rail = self.root / "rail"
+        self.rail.mkdir()
+        self.pre_status = self.rail / "git-status-pre.txt"
+        self.agent_log = self.rail / "agent.log"
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def start_run(self, started_at=None) -> None:
+        # The driver's rail-side record, written before the agent launches.
+        examlib.record_run_meta(
+            self.rail,
+            exam="RUN-MANUAL",
+            work=str(self.work),
+            started_at=time.time() if started_at is None else started_at,
+        )
 
     def write_log(self, calls) -> None:
         self.agent_log.write_text(agent_log_text(self.work, calls))
@@ -501,10 +641,8 @@ class Ex4Ex5Base(unittest.TestCase):
             str(self.work),
             "--sessions-dir",
             str(self.sessions),
-            "--pre-status",
-            str(self.pre_status),
-            "--agent-log",
-            str(self.agent_log),
+            "--rail-dir",
+            str(self.rail),
         )
 
     def grade_ex5(self):
@@ -514,10 +652,8 @@ class Ex4Ex5Base(unittest.TestCase):
             str(self.repo),
             "--work",
             str(self.work),
-            "--pre-status",
-            str(self.pre_status),
-            "--agent-log",
-            str(self.agent_log),
+            "--rail-dir",
+            str(self.rail),
         )
 
     def expected_ex4(self):
@@ -545,14 +681,17 @@ class Ex4Ex5Base(unittest.TestCase):
 class Ex4Test(Ex4Ex5Base):
     def test_gold_passes(self):
         snapshot_pre_status(self.repo, self.pre_status)
+        self.start_run()
         self.write_log([read_only_call(self.repo)])
         (self.work / "answers.json").write_text(json.dumps(self.expected_ex4()))
         code, verdict, err = self.grade_ex4()
         self.assertEqual(code, 0, err)
         self.assertTrue(verdict["pass"], json.dumps(verdict))
+        self.assertTrue(verdict["checks"]["rail_ok"], json.dumps(verdict))
 
     def test_stale_value_fails(self):
         snapshot_pre_status(self.repo, self.pre_status)
+        self.start_run()
         self.write_log([read_only_call(self.repo)])
         answers = self.expected_ex4()
         answers["daemon_schema_revision"] = FAKE_DSR - 1
@@ -565,6 +704,7 @@ class Ex4Test(Ex4Ex5Base):
     def test_foreign_lane_drift_does_not_fail(self):
         # D3: a path another lane dirtied mid-run is reported, not blamed.
         snapshot_pre_status(self.repo, self.pre_status)
+        self.start_run()
         self.write_log([read_only_call(self.repo)])
         (self.work / "answers.json").write_text(json.dumps(self.expected_ex4()))
         drift = self.repo / "packages/coding-agent/src/other-lane.ts"
@@ -580,6 +720,7 @@ class Ex4Test(Ex4Ex5Base):
         # drift appends a comment, so recomputed values are unchanged and the
         # run passes with the drift reported as foreign.
         snapshot_pre_status(self.repo, self.pre_status)
+        self.start_run()
         drifted = self.repo / "packages/coding-agent/src/modes/daemon/daemon-protocol.ts"
         self.write_log([read_only_call(self.repo)])
         (self.work / "answers.json").write_text(json.dumps(self.expected_ex4()))
@@ -594,6 +735,7 @@ class Ex4Test(Ex4Ex5Base):
 
     def test_agent_repo_write_is_blamed(self):
         snapshot_pre_status(self.repo, self.pre_status)
+        self.start_run()
         target = self.repo / "packages/coding-agent/src/modes/daemon/daemon-protocol.ts"
         self.write_log(
             [
@@ -615,24 +757,98 @@ class Ex4Test(Ex4Ex5Base):
         dirty = self.repo / "packages/coding-agent/src/modes/print-mode.ts"
         dirty.write_text(FAKE_PRINT_MODE_TS + "// already dirty before the run\n")
         snapshot_pre_status(self.repo, self.pre_status)
+        self.start_run()
         self.write_log([read_only_call(self.repo)])
         (self.work / "answers.json").write_text(json.dumps(self.expected_ex4()))
         code, verdict, err = self.grade_ex4()
         self.assertEqual(code, 0, err)
         self.assertTrue(verdict["pass"], json.dumps(verdict))
 
+    def test_forged_pre_status_mid_run_grades_red(self):
+        # D9 incident replay (wave-15, claude line): the agent overwrote the
+        # pre-run snapshot with a mid-run `git status`, erasing the drift the
+        # rail would have reported. The mtime rule voids the run even though
+        # pre and post now agree.
+        now = time.time()
+        snapshot_pre_status(self.repo, self.pre_status)
+        os.utime(self.pre_status, (now - 120, now - 120))  # operator snapshotted pre-launch
+        self.start_run(started_at=now - 60)
+        self.write_log([read_only_call(self.repo)])
+        (self.work / "answers.json").write_text(json.dumps(self.expected_ex4()))
+        drift = self.repo / "packages/coding-agent/src/other-lane.ts"
+        drift.write_text("// drift the agent wants to hide\n")
+        snapshot_pre_status(self.repo, self.pre_status)  # the forgery: pre := post
+        code, verdict, err = self.grade_ex4()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertFalse(verdict["checks"]["rail_pre_status_predates_run"])
+        self.assertFalse(verdict["checks"]["rail_ok"])
+        self.assertFalse(verdict["checks"]["repo_untouched"])
+
+    def test_rail_dir_inside_work_grades_red(self):
+        # A rail the agent can reach is no rail: refuse to grade on it even
+        # when every file inside is consistent.
+        self.rail = self.work / "rail"
+        self.rail.mkdir()
+        self.pre_status = self.rail / "git-status-pre.txt"
+        self.agent_log = self.rail / "agent.log"
+        snapshot_pre_status(self.repo, self.pre_status)
+        self.start_run()
+        self.write_log([read_only_call(self.repo)])
+        (self.work / "answers.json").write_text(json.dumps(self.expected_ex4()))
+        code, verdict, err = self.grade_ex4()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertFalse(verdict["checks"]["rail_dir_outside_work"])
+        self.assertFalse(verdict["checks"]["rail_ok"])
+        self.assertFalse(verdict["checks"]["repo_untouched"])
+
+    def test_missing_run_meta_grades_red(self):
+        # Without the driver's run-start record the mtime rule has no anchor;
+        # fail closed instead of trusting the snapshot.
+        snapshot_pre_status(self.repo, self.pre_status)
+        self.write_log([read_only_call(self.repo)])
+        (self.work / "answers.json").write_text(json.dumps(self.expected_ex4()))
+        code, verdict, err = self.grade_ex4()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertFalse(verdict["checks"]["rail_run_meta_present"])
+        self.assertFalse(verdict["checks"]["rail_ok"])
+        self.assertFalse(verdict["checks"]["repo_untouched"])
+
+    def test_missing_agent_log_grades_red(self):
+        snapshot_pre_status(self.repo, self.pre_status)
+        self.start_run()
+        (self.work / "answers.json").write_text(json.dumps(self.expected_ex4()))
+        code, verdict, err = self.grade_ex4()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertFalse(verdict["checks"]["rail_agent_log_present"])
+        self.assertFalse(verdict["checks"]["repo_untouched"])
+
+    def test_prompt_forbids_grader_and_rail_access(self):
+        # D9: the prompt itself must outlaw the wave-15 tampering moves.
+        prompt = " ".join((PACK / "ex4-repo-facts/prompt.txt").read_text().lower().split())
+        self.assertIn("do not read or execute any grading scripts", prompt)
+        self.assertIn("git-status-pre.txt", prompt)
+        self.assertIn("run-meta.json", prompt)
+        self.assertIn("agent.log", prompt)
+
 
 class Ex5Test(Ex4Ex5Base):
     def test_gold_passes(self):
         snapshot_pre_status(self.repo, self.pre_status)
+        self.start_run()
         self.write_log([read_only_call(self.repo)])
         (self.work / "answers.json").write_text(json.dumps(self.expected_ex5()))
         code, verdict, err = self.grade_ex5()
         self.assertEqual(code, 0, err)
         self.assertTrue(verdict["pass"], json.dumps(verdict))
+        self.assertTrue(verdict["checks"]["rail_ok"], json.dumps(verdict))
 
     def test_wrong_exit_code_fails(self):
         snapshot_pre_status(self.repo, self.pre_status)
+        self.start_run()
         self.write_log([read_only_call(self.repo)])
         answers = self.expected_ex5()
         answers["sigterm_exit"] = 1
@@ -644,6 +860,7 @@ class Ex5Test(Ex4Ex5Base):
 
     def test_foreign_lane_drift_does_not_fail(self):
         snapshot_pre_status(self.repo, self.pre_status)
+        self.start_run()
         self.write_log([read_only_call(self.repo)])
         (self.work / "answers.json").write_text(json.dumps(self.expected_ex5()))
         (self.repo / "packages/coding-agent/src/other-lane.ts").write_text("// parallel\n")
@@ -652,11 +869,33 @@ class Ex5Test(Ex4Ex5Base):
         self.assertTrue(verdict["pass"], json.dumps(verdict))
         self.assertTrue(verdict["checks"]["repo_untouched"])
 
+    def test_forged_pre_status_mid_run_grades_red(self):
+        # D9: same mtime rule as EX-4 - a re-snapshotted pre-status voids the
+        # run even when its content matches the post state.
+        now = time.time()
+        snapshot_pre_status(self.repo, self.pre_status)
+        os.utime(self.pre_status, (now - 120, now - 120))
+        self.start_run(started_at=now - 60)
+        self.write_log([read_only_call(self.repo)])
+        (self.work / "answers.json").write_text(json.dumps(self.expected_ex5()))
+        snapshot_pre_status(self.repo, self.pre_status)  # the forgery
+        code, verdict, err = self.grade_ex5()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertFalse(verdict["checks"]["rail_pre_status_predates_run"])
+        self.assertFalse(verdict["checks"]["repo_untouched"])
+
     def test_prompt_forbids_executing_the_cli(self):
         # D6: no empirical signal harnesses; source reading only.
         prompt = " ".join((PACK / "ex5-sigterm/prompt.txt").read_text().lower().split())
         self.assertIn("do not execute", prompt)
         self.assertIn("signal the cli under test", prompt)
+
+    def test_prompt_forbids_grader_and_rail_access(self):
+        # D9: the prompt itself must outlaw the wave-15 tampering moves.
+        prompt = " ".join((PACK / "ex5-sigterm/prompt.txt").read_text().lower().split())
+        self.assertIn("do not read or execute any grading scripts", prompt)
+        self.assertIn("git-status-pre.txt", prompt)
 
 
 class Ex7Test(unittest.TestCase):
@@ -700,6 +939,214 @@ class Ex7Test(unittest.TestCase):
         self.assertFalse(verdict["checks"]["exact_key_set"])
 
 
+# --- stub agent + socket stub for driver wiring tests -----------------------
+#
+# The stub is a stand-in for the real CLI: it receives the same launch
+# arguments the drivers would give prime-agent, emits one assistant
+# message_end line (so usage accounting has something to sum), and plays
+# both EX-3 phases from the launch flags. The socket stub accepts the
+# driver's shutdown envelope so examlib.shutdown_daemon returns at once.
+
+STUB_AGENT = """\
+#!/usr/bin/env python3
+# Stub CLI for the exam-v1 driver wiring tests.
+import json
+import re
+import sys
+from pathlib import Path
+
+argv = sys.argv[1:]
+cwd = Path(argv[argv.index("--cwd") + 1])
+sessions = Path(argv[argv.index("--session-dir") + 1])
+prompt = argv[argv.index("--") + 1] if "--" in argv else ""
+
+print(json.dumps({"type": "message_end", "message": {"role": "assistant", "usage": {"totalTokens": 25}}}))
+
+if "--resume" in argv:
+    # EX-3 phase B: report the surviving token and the heartbeat count.
+    token = (cwd / "phase-a.txt").read_text().strip()
+    ticks = len((cwd / "heartbeat.log").read_text().splitlines())
+    (cwd / "phase-b.txt").write_text("token: %s\\nheartbeat_ticks: %d\\n" % (token, ticks))
+    sys.exit(0)
+
+match = re.search(r"one line: (\\S+)", prompt)
+if match:
+    # EX-3 phase A: plant the artifacts plus a resumable session file, then
+    # exit 143 (the print-mode SIGTERM mapping the driver expects).
+    (cwd / "phase-a.txt").write_text(match.group(1) + "\\n")
+    (cwd / "heartbeat.log").write_text("tick\\n")
+    (sessions / "stub-session.jsonl").write_text(json.dumps({"type": "session", "id": "stub"}) + "\\n")
+    sys.exit(143)
+sys.exit(0)
+"""
+
+
+class SocketStub:
+    """Accept one shutdown-envelope connection, then close (daemon stand-in)."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(str(path))
+        self.server.listen(1)
+        self.server.settimeout(15)
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self) -> None:
+        try:
+            connection, _ = self.server.accept()
+            connection.settimeout(5)
+            try:
+                connection.recv(4096)
+            except OSError:
+                pass
+            connection.close()
+        except OSError:
+            pass
+        finally:
+            self.server.close()
+
+    def close(self) -> None:
+        # Unblock a still-waiting accept (the driver errored before its
+        # shutdown); on the happy path the envelope was already served and
+        # this connect just fails.
+        unblock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            unblock.settimeout(1)
+            unblock.connect(str(self.path))
+        except OSError:
+            pass
+        finally:
+            unblock.close()
+        self.thread.join(timeout=20)
+
+
+class DriverRailBase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.work = self.root / "work"
+        self.work.mkdir()
+        self.rail = self.root / "rail"
+        # An empty stand-in agent home: agent_env must never read the real
+        # ~/.prime/agent for credentials.
+        self.fake_home = self.root / "source-home"
+        self.fake_home.mkdir()
+        self.stub = self.root / "stub-agent"
+        self.stub.write_text(STUB_AGENT)
+        self.stub.chmod(0o755)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_driver(self, script: str, *extra: str):
+        env = dict(os.environ)
+        env["PRIME_AGENT_CODING_AGENT_DIR"] = str(self.fake_home)
+        for leaked in ("RLM_DEPTH", "RLM_SESSION_DIR", "RLM_MAX_DEPTH"):
+            env.pop(leaked, None)
+        return subprocess.run(
+            [sys.executable, str(PACK / script)] + list(extra),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+        )
+
+
+class RunManualRailTest(DriverRailBase):
+    def run_manual(self, *extra: str):
+        return self.run_driver(
+            "run_manual.py",
+            "--work",
+            str(self.work),
+            "--prompt-file",
+            str(PACK / "ex4-repo-facts/prompt.txt"),
+            "--agent-bin",
+            str(self.stub),
+            "--timeout",
+            "60",
+            *extra,
+        )
+
+    def test_rail_dir_inside_work_is_refused(self):
+        proc = self.run_manual("--rail-dir", str(self.work / "rail"))
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("outside", proc.stderr)
+
+    def test_rail_run_writes_rails_outside_work(self):
+        server = SocketStub(self.work / "d.sock")
+        proc = self.run_manual("--rail-dir", str(self.rail))
+        server.close()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        run_meta = json.loads((self.rail / "run-meta.json").read_text())
+        self.assertEqual(run_meta["exam"], "RUN-MANUAL")
+        self.assertIsInstance(run_meta["started_at"], (int, float))
+        agent_log = self.rail / "agent.log"
+        self.assertTrue(agent_log.is_file())
+        self.assertIn('"totalTokens": 25', agent_log.read_text())
+        # Nothing agent-writable holds a grading rail anymore.
+        self.assertFalse((self.work / "agent.log").exists())
+        run_json = json.loads((self.work / "run.json").read_text())
+        self.assertEqual(run_json["usage"], {"tokens": 25, "turns": 1})
+        self.assertEqual(run_json["rail_dir"], str(self.rail.resolve()))
+
+    def test_without_rail_dir_keeps_legacy_layout(self):
+        # EX-1/EX-2 have no drift rail; run_manual still works without one.
+        server = SocketStub(self.work / "d.sock")
+        proc = self.run_manual()
+        server.close()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue((self.work / "agent.log").is_file())
+        self.assertFalse((self.root / "rail" / "run-meta.json").exists())
+
+
+class RunEx3RailTest(DriverRailBase):
+    def run_ex3(self, *extra: str):
+        return self.run_driver(
+            "ex3-recovery/run_ex3.py",
+            "--work",
+            str(self.work),
+            "--model",
+            "test/fake",
+            "--agent-bin",
+            str(self.stub),
+            "--timeout",
+            "60",
+            "--seed",
+            "1",
+            *extra,
+        )
+
+    def test_rail_dir_inside_work_is_refused(self):
+        proc = self.run_ex3("--rail-dir", str(self.work / "rail"))
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("outside", proc.stderr)
+
+    def test_full_stub_run_writes_rails_and_grades_green(self):
+        # End to end, model-free: the stub agent plays both EX-3 phases, the
+        # driver lands every rail outside the work dir, and the grader passes
+        # on the rail flow.
+        servers = [SocketStub(self.work / "d1.sock"), SocketStub(self.work / "d2.sock")]
+        proc = self.run_ex3("--rail-dir", str(self.rail))
+        for server in servers:
+            server.close()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue((self.rail / "pre-resume.json").is_file())
+        self.assertFalse((self.work / "pre-resume.json").exists())
+        run_meta = json.loads((self.rail / "run-meta.json").read_text())
+        self.assertIsInstance(run_meta["started_at"], (int, float))
+        self.assertIsInstance(run_meta["phase_b_started_at"], (int, float))
+        pre_mtime = (self.rail / "pre-resume.json").stat().st_mtime
+        self.assertLessEqual(pre_mtime, run_meta["phase_b_started_at"])
+        code, verdict, err = run_grader(
+            "ex3-recovery/grade_ex3.py", "--work", str(self.work), "--rail-dir", str(self.rail)
+        )
+        self.assertEqual(code, 0, err + json.dumps(verdict))
+        self.assertTrue(verdict["pass"], json.dumps(verdict))
+        self.assertTrue(verdict["checks"]["rail_ok"], json.dumps(verdict))
+
+
 class DocsTest(unittest.TestCase):
     def test_readme_documents_same_home_serialization(self):
         # D5: a second daemon on one agent home is refused with
@@ -710,6 +1157,12 @@ class DocsTest(unittest.TestCase):
         self.assertIn("DaemonAgentDirAlreadyRunningError", text)
         self.assertRegex(text.lower(), r"serial")
 
+    def test_readme_documents_the_rail_dir_contract(self):
+        # D9: the how-to-run must put grading rails outside the work dir.
+        text = (PACK / "README.md").read_text()
+        self.assertIn("--rail-dir", text)
+        self.assertIn("run-meta.json", text)
+
     def test_every_exam_has_a_prompt_source(self):
         for rel in (
             "ex1-pipeline/prompt.txt",
@@ -718,6 +1171,17 @@ class DocsTest(unittest.TestCase):
             "ex5-sigterm/prompt.txt",
         ):
             self.assertTrue((PACK / rel).is_file(), rel + " missing")
+
+    def test_driver_prompts_forbid_grader_access(self):
+        # D9: the inline prompts (EX-3 phases, EX-7 final) carry the same
+        # prohibition as the prompt files.
+        ex3 = (PACK / "ex3-recovery/run_ex3.py").read_text().lower()
+        self.assertEqual(ex3.count("do not read or execute any grading scripts"), 2)
+        ex7 = (PACK / "ex7-session-recall/run_ex7.py").read_text().lower()
+        self.assertIn("do not read or execute any grading scripts", ex7)
+        for rel in ("ex1-pipeline/prompt.txt", "ex2-needles/prompt.txt"):
+            prompt = " ".join((PACK / rel).read_text().lower().split())
+            self.assertIn("do not read or execute any grading scripts", prompt, rel)
 
 
 if __name__ == "__main__":

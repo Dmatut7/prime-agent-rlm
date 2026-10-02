@@ -7,4 +7,11 @@ in that repository. Write answers.json at <WORK>/answers.json with keys:
 where ledger_digest is the RLM ledger file stem for sessions dir <SESSIONS>:
 the first 16 hex chars of sha256 of the canonicalized (realpath) directory
 path, per packages/coding-agent/src/modes/daemon/rlm-ledger.ts. <SESSIONS>
-exists on disk. Then reply with only DONE.
+exists on disk.
+
+Integrity rules: answer from your own reading of the sources. Do not read
+or execute any grading scripts (the exam's grade_*.py), and do not read,
+create, overwrite, or delete any grading rails (pre-run snapshots such as
+git-status-pre.txt, run metadata such as run-meta.json, or this run's
+agent.log). The only file you may write is <WORK>/answers.json.
+Then reply with only DONE.

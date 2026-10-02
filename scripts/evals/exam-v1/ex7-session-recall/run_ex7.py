@@ -66,6 +66,7 @@ def main() -> int:
         "Write the file facts.json in the current directory: a JSON object mapping exactly the keys "
         + ", ".join(QUERY_KEYS)
         + " to their current values (use the superseding value where one was given). "
+        "Do not read or execute any grading scripts (the exam's grade_*.py). "
         "Then reply with only DONE."
     )
 

@@ -9,4 +9,6 @@ quarterly sales CSVs in data/ into report.md. The script is buggy.
    q2_units: <int>
    total_revenue_cents: <int>
    top_category: <name>
-Do not touch the CSVs. Do not add dependencies.
+Do not touch the CSVs. Do not add dependencies. Do not read or execute any
+grading scripts (the exam's grade_*.py); fix the script from your own
+diagnosis.

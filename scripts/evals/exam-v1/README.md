@@ -62,19 +62,20 @@ python3 $PACK/run_manual.py --work /tmp/exam/ex2 --model $M \
     --prompt-file $PACK/ex2-needles/prompt.txt --cwd /tmp/exam/ex2/fixture
 python3 $PACK/ex2-needles/grade_ex2.py --work /tmp/exam/ex2
 
-# EX-3 (driver handles kill/resume; grading is a separate step)
-python3 $PACK/ex3-recovery/run_ex3.py --work /tmp/exam/ex3 --model $M
-python3 $PACK/ex3-recovery/grade_ex3.py --work /tmp/exam/ex3
+# EX-3 (driver handles kill/resume; grading is a separate step; rails live
+# in a rail dir OUTSIDE the work dir - the prompt never names it)
+python3 $PACK/ex3-recovery/run_ex3.py --work /tmp/exam/ex3 --rail-dir /tmp/exam/ex3-rail --model $M
+python3 $PACK/ex3-recovery/grade_ex3.py --work /tmp/exam/ex3 --rail-dir /tmp/exam/ex3-rail
 
 # EX-4 / EX-5 (read-only against the repo; pre-snapshot feeds the drift rail)
-mkdir -p /tmp/exam/ex4/sessions
-git status --porcelain > /tmp/exam/ex4/git-status-pre.txt
+RAIL=/tmp/exam/ex4-rail
+mkdir -p "$RAIL" /tmp/exam/ex4/sessions
+git status --porcelain > "$RAIL/git-status-pre.txt"
 python3 $PACK/run_manual.py --work /tmp/exam/ex4 --model $M \
-    --prompt-file $PACK/ex4-repo-facts/prompt.txt \
+    --prompt-file $PACK/ex4-repo-facts/prompt.txt --rail-dir "$RAIL" \
     --var REPO=$PWD --var WORK=/tmp/exam/ex4 --var SESSIONS=/tmp/exam/ex4/sessions
 python3 $PACK/ex4-repo-facts/grade_ex4.py --repo $PWD --work /tmp/exam/ex4 \
-    --sessions-dir /tmp/exam/ex4/sessions \
-    --pre-status /tmp/exam/ex4/git-status-pre.txt --agent-log /tmp/exam/ex4/agent.log
+    --sessions-dir /tmp/exam/ex4/sessions --rail-dir "$RAIL"
 # EX-5: same flow with ex5-sigterm/prompt.txt and grade_ex5.py (no --sessions-dir)
 
 # EX-6 (stock harness, unchanged)
@@ -93,13 +94,39 @@ peak context and wall time.
 
 ### The repo-untouched rail (EX-4/EX-5)
 
-Both graders take `--agent-log` and attribute drift: the pre/post
-`git status --porcelain` path-set difference is blamed on the agent only for
-paths its own log proves it wrote (write/edit path arguments, or bash/ipython
-texts that carry a write indicator and name the path). Drift from parallel
-lanes sharing the worktree is reported as `foreign_drift` in the verdict and
-does not fail the run. Residual gap, by design: a write the heuristic cannot
+Both graders attribute drift: the pre/post `git status --porcelain`
+path-set difference is blamed on the agent only for paths its own log
+proves it wrote (write/edit path arguments, or bash/ipython texts that
+carry a write indicator and name the path). Drift from parallel lanes
+sharing the worktree is reported as `foreign_drift` in the verdict and does
+not fail the run. Residual gap, by design: a write the heuristic cannot
 spell out (heavily computed paths) grades as foreign.
+
+### Grading-rail integrity (EX-3/EX-4/EX-5, D9)
+
+A rail is a grader input the agent must never touch: the pre-run
+`git-status-pre.txt` snapshot, EX-3's `pre-resume.json`, the
+driver-recorded `run-meta.json`, and the `agent.log` used for write
+attribution. The wave-15 claude run overwrote the pre-run snapshot mid-run
+(erasing the drift evidence), truncated agent.log, and self-ran the grader.
+The hardening:
+
+1. Rails live in an operator-chosen `--rail-dir` OUTSIDE the agent-writable
+   work dir; the prompt never names the path. Drivers refuse a rail dir
+   that nests into `--work` either way, and graders fail closed on one.
+2. Drivers record `started_at` (and EX-3's `phase_b_started_at`) in
+   `<rail>/run-meta.json` before the agent launches. Graders reject a rail
+   file whose mtime postdates its deadline (EX-3's snapshot is written
+   mid-run, so its deadline is the phase-B launch), and fail closed when
+   run-meta.json is missing or anchor-less.
+3. Every exam prompt explicitly forbids reading/executing the grading
+   scripts and touching rail files.
+
+Residual gap, documented honestly: an adversarial agent that discovers the
+rail-dir path can rewrite `run-meta.json` itself. The rail stops the
+observed incidental/self-verification tampering pattern; full isolation
+from a determined adversary needs OS-level sandboxing (read-only mounts),
+which this stdlib-only pack deliberately does not attempt.
 
 ## Self-tests
 
@@ -127,6 +154,18 @@ python3 -m unittest discover -s tests -v
 - **D6** EX-5: the prompt now forbids executing the CLI under test (a wave-11
   model burned 667k tokens measuring exit codes empirically after it had
   already written the correct answers).
+
+## Defect history (v1.1 -> v1.2, from the wave-15 run)
+
+- **D9** EX-4 (claude line): the agent overwrote `git-status-pre.txt` with a
+  mid-run `git status` (voiding the drift rail), truncated `agent.log`, and
+  ran `grade_ex4.py` itself for self-verification. Hardened on three axes:
+  rails moved into a `--rail-dir` outside the agent-writable work dir
+  (EX-3's `pre-resume.json` moved the same way); graders reject rail files
+  whose mtime postdates the driver-recorded run start and fail closed
+  without `run-meta.json`; every exam prompt now explicitly forbids
+  reading/executing graders and touching rail files. Grader CLI change:
+  `--pre-status`/`--agent-log` are replaced by `--rail-dir`.
 
 ## Known limits / v1.1 candidates
 

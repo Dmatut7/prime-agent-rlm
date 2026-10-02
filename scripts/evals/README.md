@@ -20,7 +20,10 @@ A fixed seven-question capability exam (multi-step tooling, long-context
 recall, interruption recovery, repo comprehension) for per-wave model
 baselines. Prompts are the contract (`*/prompt.txt`); graders recompute
 expected answers from the live repo where the question is repo-derived.
-Model-free self-tests: `cd exam-v1 && python3 -m unittest discover -s tests -v`.
+Grading rails (pre-run snapshots, run metadata, agent logs) live in a
+`--rail-dir` outside the agent-writable work dir and are mtime-checked
+against the driver-recorded run start (D9). Model-free self-tests:
+`cd exam-v1 && python3 -m unittest discover -s tests -v`.
 See [`exam-v1/README.md`](exam-v1/README.md) for how to run (one agent home,
 serial runs).
 

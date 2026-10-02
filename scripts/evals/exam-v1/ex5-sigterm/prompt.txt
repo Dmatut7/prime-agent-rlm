@@ -6,4 +6,9 @@ mapping).
 
 Answer by reading the source only. Do not execute, build, or signal the CLI
 under test, and do not measure exit codes by running real processes.
+Integrity rules: do not read or execute any grading scripts (the exam's
+grade_*.py), and do not read, create, overwrite, or delete any grading
+rails (pre-run snapshots such as git-status-pre.txt, run metadata such as
+run-meta.json, or this run's agent.log). The only file you may write is
+<WORK>/answers.json.
 Then reply with only DONE.

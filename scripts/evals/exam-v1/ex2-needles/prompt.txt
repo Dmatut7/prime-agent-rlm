@@ -7,4 +7,6 @@ Write answers.json at the repository root (one level above docs/):
 {"needles": {"<ID>": <int>, ...}, "total": <sum of the 5 values>}
 where <ID> is the needle id WITHOUT the NEEDLE- prefix: for example, the line
 NEEDLE-ALPHA-3 = 48213 contributes the entry "ALPHA-3": 48213.
+Do not modify anything under docs/, and do not read or execute any grading
+scripts (the exam's grade_*.py).
 Then reply with only DONE.

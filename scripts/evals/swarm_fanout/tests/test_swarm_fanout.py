@@ -273,6 +273,14 @@ class FixtureIntegrity(unittest.TestCase):
             self.assertIn(f"for shards/{first['file']} the child name is {first['worker']}", task)
             self.assertNotIn(f"{other_prefix}-01", task)
 
+    def test_task_txt_forbids_harness_access(self):
+        # exam-v1 D9 (wave-15): the prompt must outlaw reading or executing
+        # the harness/manifest and touching anything outside the repo copy.
+        for name in ("json-events", "csv-metrics"):
+            task = (FIXTURES / name / "task.txt").read_text().lower()
+            self.assertIn("do not read or execute the eval harness", task, name)
+            self.assertIn("outside this repository", task, name)
+
     def test_worker_names_and_artifact_are_wellformed(self):
         for name in ("json-events", "csv-metrics"):
             manifest = fixture_manifest(name)

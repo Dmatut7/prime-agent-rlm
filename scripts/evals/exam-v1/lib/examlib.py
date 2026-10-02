@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Shared helpers for the MI-EXAM v1 scenario drivers (EX-3, EX-7).
+"""Shared helpers for the MI-EXAM v1 scenario drivers (EX-3, EX-7) and graders.
 
 Self-contained cousin of scripts/evals/swarm_fanout/runner.py: the daemon
 shutdown envelope mirrors runner.py:182-218 (protocol version 7, `shutdown`
 command), the session-file pick mirrors runner.py:104-118, and the env
 isolation mirrors runner.py:221-258 (auth.json and models.json are copied
 file-to-file, never read into memory here).
+
+The grading-rail helpers (resolve_rail_dir/record_run_meta/read_run_meta/
+verify_rail) implement the D9 hardening: rails live outside the
+agent-writable work dir and graders reject rail files rewritten after the
+run started.
 """
 from __future__ import annotations
 
@@ -112,6 +117,110 @@ def usage_from_json_log(log_text: str) -> dict:
             tokens += total
             turns += 1
     return {"tokens": tokens, "turns": turns}
+
+
+# --- Grading rails (D9) ------------------------------------------------------
+#
+# A rail is a grader input the exam agent must never touch: the pre-run
+# `git status` snapshot (EX-4/EX-5), the pre-resume snapshot (EX-3), the
+# driver-recorded run metadata, and the agent log. Rails live in an
+# operator-chosen --rail-dir OUTSIDE the agent-writable work dir, and the
+# prompt never names that path. Drivers record the run start (and EX-3's
+# phase-B start) into run-meta.json before launching the agent; graders
+# reject a rail file whose mtime postdates its deadline - a snapshot
+# rewritten after launch is tampering (the wave-15 incident) - and fail
+# closed when the run-meta anchor is missing.
+
+RUN_META_NAME = "run-meta.json"
+
+
+def _paths_overlap(a: Path, b: Path) -> bool:
+    """True when either resolved path is the other or contains the other."""
+    if a == b:
+        return True
+    for inner, outer in ((a, b), (b, a)):
+        try:
+            inner.relative_to(outer)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def resolve_rail_dir(rail_dir, work) -> Path:
+    """Driver side: the rail dir must sit outside the agent-writable work dir.
+
+    Everything under --work is writable by the exam agent; a rail dir nested
+    in it (or wrapping it) is forgeable, so refuse instead of recording
+    trustworthy-looking rails.
+    """
+    rail = Path(rail_dir).resolve()
+    if _paths_overlap(rail, Path(work).resolve()):
+        raise ValueError(
+            "rail dir %s must live outside --work (%s): everything under --work is agent-writable"
+            % (rail, Path(work).resolve())
+        )
+    return rail
+
+
+def record_run_meta(rail_dir, **fields) -> Path:
+    """Driver side: write/merge run-meta.json. Call BEFORE the agent launches."""
+    path = Path(rail_dir) / RUN_META_NAME
+    meta = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text())
+        except ValueError:
+            loaded = None
+        if isinstance(loaded, dict):
+            meta = loaded
+    meta.update(fields)
+    path.write_text(json.dumps(meta, indent=2) + "\n")
+    return path
+
+
+def read_run_meta(rail_dir) -> dict:
+    """Grader side: parsed run-meta.json, or {} when absent or unparseable."""
+    try:
+        meta = json.loads((Path(rail_dir) / RUN_META_NAME).read_text())
+    except (OSError, ValueError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def epoch_field(meta: dict, key: str):
+    """A numeric epoch-seconds field, or None (bools are not epochs)."""
+    value = meta.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def verify_rail(rail_dir, work, files) -> dict:
+    """Grader-side rail integrity checks; fail closed on any violation.
+
+    files: (label, filename, deadline) triples. Each file must exist in the
+    rail dir, and the rail dir must sit outside the agent-writable work dir.
+    A deadline of None means the file's mtime legitimately advances during
+    the run (agent.log); otherwise the mtime must not postdate the deadline
+    (the driver-recorded run start, or EX-3's phase-B start).
+    """
+    checks = {}
+    rail = Path(rail_dir).resolve()
+    outside = not _paths_overlap(rail, Path(work).resolve())
+    checks["rail_dir_outside_work"] = outside
+    ok = outside
+    for label, filename, deadline in files:
+        path = rail / filename
+        present = path.is_file()
+        checks["rail_%s_present" % label] = present
+        ok = ok and present
+        if deadline is not None:
+            predates = present and path.stat().st_mtime <= deadline
+            checks["rail_%s_predates_run" % label] = bool(predates)
+            ok = ok and predates
+    checks["rail_ok"] = bool(ok)
+    return checks
 
 
 def porcelain_paths(status_text: str) -> set:

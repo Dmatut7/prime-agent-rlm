@@ -24,11 +24,18 @@ agent. Attribution comes from the agent's write-path set, extracted from its
 touched for writing is reported as foreign_drift (parallel lanes share the
 worktree) and does not fail the run.
 
+Rail integrity (D9): the pre-run snapshot, the driver-recorded
+run-meta.json, and the agent log live in --rail-dir OUTSIDE the
+agent-writable work dir, and the prompt never names that path. The grader
+fails closed when the rail dir overlaps the work dir, when run-meta.json
+lacks the run-start timestamp, or when the pre-run snapshot's mtime
+postdates that timestamp (the wave-15 incident: the agent re-snapshotted
+`git status` over git-status-pre.txt mid-run, erasing the drift evidence).
+
 Usage:
     python3 grade_ex4.py --repo /path/to/prime-agent --work /path/to/ex4-work \
         --sessions-dir /tmp/prime-exam/ex4/sessions \
-        --pre-status /path/to/ex4-work/git-status-pre.txt \
-        --agent-log /path/to/ex4-work/agent.log
+        --rail-dir /path/to/ex4-rail
 """
 from __future__ import annotations
 
@@ -62,8 +69,11 @@ def main() -> int:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--work", required=True)
     parser.add_argument("--sessions-dir", required=True, help="Literal path pinned in the prompt")
-    parser.add_argument("--pre-status", required=True, help="File holding pre-run `git status --porcelain` output")
-    parser.add_argument("--agent-log", required=True, help="The agent's --mode json log (write attribution)")
+    parser.add_argument(
+        "--rail-dir",
+        required=True,
+        help="Dir outside --work holding the grading rails (git-status-pre.txt, run-meta.json, agent.log)",
+    )
     args = parser.parse_args()
 
     repo = Path(args.repo)
@@ -118,15 +128,30 @@ def main() -> int:
             verdict["expected"] = expected
             verdict["actual"] = answers
 
+    # D9 rail verification: the drift rail is meaningless unless its inputs
+    # are provably untouched by the agent (see the module docstring).
+    rail = Path(args.rail_dir)
+    run_meta = examlib.read_run_meta(rail)
+    started_at = examlib.epoch_field(run_meta, "started_at")
+    checks.update(
+        examlib.verify_rail(
+            rail,
+            work,
+            [("pre_status", "git-status-pre.txt", started_at), ("agent_log", "agent.log", None)],
+        )
+    )
+    checks["rail_run_meta_present"] = started_at is not None
+    checks["rail_ok"] = bool(checks["rail_ok"] and checks["rail_run_meta_present"])
+
     # Repo-untouched rail with write attribution: only drift the agent's own
     # log proves it wrote fails the run; other lanes' drift is reported.
-    agent_log = Path(args.agent_log)
-    checks["agent_log_present"] = agent_log.is_file()
-    pre = Path(args.pre_status).read_text() if Path(args.pre_status).is_file() else None
+    agent_log = rail / "agent.log"
+    pre_path = rail / "git-status-pre.txt"
+    pre = pre_path.read_text() if pre_path.is_file() else None
     post = subprocess.run(
         ["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True, timeout=30
     ).stdout
-    if pre is None or not agent_log.is_file():
+    if pre is None or not agent_log.is_file() or not checks["rail_ok"]:
         checks["repo_untouched"] = False
     else:
         drift = examlib.porcelain_paths(pre) ^ examlib.porcelain_paths(post)

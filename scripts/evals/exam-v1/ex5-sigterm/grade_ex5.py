@@ -8,12 +8,13 @@ loud with needs_reauthor rather than grading against stale constants.
 
 Safety rail: same write-attributed drift rule as grade_ex4.py - only repo
 drift the agent's own --mode json log proves it wrote fails the run; foreign
-parallel-lane drift is reported as foreign_drift.
+parallel-lane drift is reported as foreign_drift. The rail inputs live in
+--rail-dir outside the agent-writable work dir and the pre-run snapshot must
+predate the driver-recorded run start (D9; see grade_ex4.py's docstring).
 
 Usage:
     python3 grade_ex5.py --repo /path/to/prime-agent --work /path/to/ex5-work \
-        --pre-status /path/to/ex5-work/git-status-pre.txt \
-        --agent-log /path/to/ex5-work/agent.log
+        --rail-dir /path/to/ex5-rail
 """
 from __future__ import annotations
 
@@ -36,8 +37,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--work", required=True)
-    parser.add_argument("--pre-status", required=True)
-    parser.add_argument("--agent-log", required=True, help="The agent's --mode json log (write attribution)")
+    parser.add_argument(
+        "--rail-dir",
+        required=True,
+        help="Dir outside --work holding the grading rails (git-status-pre.txt, run-meta.json, agent.log)",
+    )
     args = parser.parse_args()
 
     repo = Path(args.repo)
@@ -86,13 +90,27 @@ def main() -> int:
             verdict["expected"] = expected
             verdict["actual"] = answers
 
-    agent_log = Path(args.agent_log)
-    checks["agent_log_present"] = agent_log.is_file()
-    pre = Path(args.pre_status).read_text() if Path(args.pre_status).is_file() else None
+    # D9 rail verification (same contract as grade_ex4.py).
+    rail = Path(args.rail_dir)
+    run_meta = examlib.read_run_meta(rail)
+    started_at = examlib.epoch_field(run_meta, "started_at")
+    checks.update(
+        examlib.verify_rail(
+            rail,
+            work,
+            [("pre_status", "git-status-pre.txt", started_at), ("agent_log", "agent.log", None)],
+        )
+    )
+    checks["rail_run_meta_present"] = started_at is not None
+    checks["rail_ok"] = bool(checks["rail_ok"] and checks["rail_run_meta_present"])
+
+    agent_log = rail / "agent.log"
+    pre_path = rail / "git-status-pre.txt"
+    pre = pre_path.read_text() if pre_path.is_file() else None
     post = subprocess.run(
         ["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True, timeout=30
     ).stdout
-    if pre is None or not agent_log.is_file():
+    if pre is None or not agent_log.is_file() or not checks["rail_ok"]:
         checks["repo_untouched"] = False
     else:
         drift = examlib.porcelain_paths(pre) ^ examlib.porcelain_paths(post)

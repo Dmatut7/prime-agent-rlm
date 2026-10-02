@@ -36,3 +36,6 @@ How to run the fan-out:
    - <shard-file-name>: <answer>
    Copy each answer verbatim from the child's reply. The file must
    cover all 8 shards.
+
+Do not read or execute the eval harness (runner.py, scorer.py,
+fixture.json) and do not read or modify anything outside this repository.
