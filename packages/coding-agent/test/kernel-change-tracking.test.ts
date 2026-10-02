@@ -338,7 +338,7 @@ describe("change tracking never reaches the model", () => {
 		expect(plain.details).not.toHaveProperty("activities");
 	});
 
-	it("compaction's file lists and token estimates ignore the new fields", () => {
+	it("compaction's file lists read the new fields, token estimates still ignore them", () => {
 		const details = assembleIpythonToolResult(withEffects, { kernelRestarted: false }).details;
 		const message = (withDetails: IpythonToolDetails): AgentMessage =>
 			({
@@ -352,7 +352,10 @@ describe("change tracking never reaches the model", () => {
 			}) as ToolResultMessage as AgentMessage;
 		const ops = createFileOps();
 		extractFileOpsFromMessage(message(details), ops);
-		expect(computeFileLists(ops)).toEqual({ readFiles: [], modifiedFiles: [] });
+		// Wave-18 (W18-D): compaction's modified-files list is fed by the kernel's
+		// fileChanges channel - the display-only boundary is about model context,
+		// not about the structured handoff.
+		expect(computeFileLists(ops)).toEqual({ readFiles: [], modifiedFiles: [fileChange.path] });
 		const bare = message({ status: "ok", stdout: "done\n", result: "42" });
 		expect(estimateTokens(message(details))).toBe(estimateTokens(bare));
 		expect(estimateTokensByContent(message(details))).toBe(estimateTokensByContent(bare));

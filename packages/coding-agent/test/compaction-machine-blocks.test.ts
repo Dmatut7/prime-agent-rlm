@@ -49,7 +49,8 @@ describe("machine blocks", () => {
 		// Stripping is idempotent: a second pass cannot eat narrative text.
 		expect(stripMachineBlocks(stripped)).toBe(NARRATIVE);
 		// K3R2/MVS-3: the kernel roster notices join as strip-only members.
-		expect(MACHINE_BLOCK_TAGS.length).toBe(6);
+		// W18-D: session-handoff joins as a regular rendered member.
+		expect(MACHINE_BLOCK_TAGS.length).toBe(7);
 	});
 
 	it("collapses the blank lines a stripped block leaves behind", () => {

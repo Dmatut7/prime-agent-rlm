@@ -49,12 +49,16 @@ function getToolCallPath(args: Record<string, unknown>): string | undefined {
  * Assistant side: only statically recognizable writes are recorded - tools whose
  * name indicates a file modification and that expose a path-like argument
  * (including write-style extension tools). Kernel side: the ipython tool result's
- * details carry two structured channels - the edit skill's diffs (path, oldStr,
- * newStr) and the change tracker's read activities (kind "read", label = display
- * path) - and extractFileOpsFromToolResult records both. Cell writes with no
- * structured report (bash redirections, open(..., "w"), notebook edits) still
- * cannot be attributed statically, and shell-side reads (bash cat/grep) never
- * pass the read wrapper; both lists stay best-effort for those.
+ * details carry three structured channels - the change tracker's file records
+ * (`fileChanges`, one per file a cell created/modified/renamed/deleted, whatever
+ * wrote it: Python file APIs, a bash() child or the edit skill), the edit skill's
+ * diffs (path, oldStr, newStr) and the change tracker's read activities (kind
+ * "read", label = display path) - and extractFileOpsFromToolResult records all
+ * three. The change-record channel is the one that closes the 94.5%-empty hole
+ * of W18-D: a cell-side write with no structured edit report (bash redirections,
+ * open(..., "w"), notebook edits) is exactly what the tracker observes and the
+ * old diff-only channel could not attribute. Shell-side reads (bash cat/grep)
+ * never pass the read wrapper, so the read list stays best-effort for those.
  */
 export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOperations): void {
 	if (message.role === "toolResult") {
@@ -89,13 +93,24 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOp
  * Record kernel-performed edits and reads reported on a tool result.
  *
  * The default toolset routes file work through the ipython kernel, and the kernel
- * reports it structurally on the tool result's details: the edit skill's diffs
- * (path, oldStr, newStr) and the change tracker's read activities (one record per
- * file a cell opened, kind "read", label = the display path). No assistant-side
- * tool call ever carries those paths, so without this branch neither block renders
- * in the default configuration. Reads that never pass the kernel's read wrapper
- * (bash cat/grep, os.scandir walks) stay uncaptured; the activity channel is the
- * one read signal a summary can trust, same as the diff channel for edits.
+ * reports it structurally on the tool result's details: the change tracker's file
+ * records (`fileChanges`, one per file a cell created/modified/renamed/deleted,
+ * whatever wrote it - Python file APIs, a bash() child, the edit skill), the edit
+ * skill's diffs (`diffs`) and the read activities (one record per file a cell
+ * opened, kind "read", label = the display path). No assistant-side tool call ever
+ * carries those paths, so without this branch neither block renders in the default
+ * configuration. The `fileChanges` channel is what closes the W18-D hole: a
+ * cell-side write with no edit-skill diff (bash redirections, open(..., "w"),
+ * notebook edits) was previously unattributable, which is how 103 of 109
+ * production summaries ended up with both file lists empty.
+ *
+ * `fileChanges` kinds map onto the summary's two-list model: a creation is a
+ * write; a modification, rename or deletion is an edit (the list means "files
+ * whose state this session changed", which a deletion is; a rename lists the new
+ * path, the one that exists now). A sensitive file's change record withholds its
+ * diff but keeps its path, and the path is all compaction reads. Reads that never
+ * pass the kernel's read wrapper (bash cat/grep, os.scandir walks) stay
+ * uncaptured; the activity channel is the one read signal a summary can trust.
  */
 function extractFileOpsFromToolResult(message: ToolResultMessage, fileOps: FileOperations): void {
 	if (message.toolName !== "ipython") return;
@@ -103,6 +118,18 @@ function extractFileOpsFromToolResult(message: ToolResultMessage, fileOps: FileO
 		typeof message.details === "object" && message.details !== null && !Array.isArray(message.details)
 			? (message.details as Record<string, unknown>)
 			: {};
+	const fileChanges = Array.isArray(details.fileChanges) ? details.fileChanges : [];
+	for (const change of fileChanges) {
+		if (typeof change !== "object" || change === null || Array.isArray(change)) continue;
+		const path = (change as Record<string, unknown>).path;
+		if (typeof path !== "string" || path.length === 0) continue;
+		const kind = (change as Record<string, unknown>).kind;
+		if (kind === "created") {
+			fileOps.written.add(path);
+		} else if (kind === "modified" || kind === "renamed" || kind === "deleted") {
+			fileOps.edited.add(path);
+		}
+	}
 	const diffs = Array.isArray(details.diffs) ? details.diffs : [];
 	for (const diff of diffs) {
 		if (typeof diff !== "object" || diff === null || Array.isArray(diff)) continue;

@@ -246,7 +246,7 @@ export const MEMORY_CHANGE_DISPLAY_MIME = "application/vnd.prime-agent.memory-ch
 
 /**
  * One file effect of a cell, whatever wrote it (Python file APIs, a `bash()` child, the edit skill).
- * Display-only: the TUI renders it, and nothing forwards it into model context or compaction.
+ * Display-only in the transcript; compaction reads it for the modified-files handoff (wave-18).
  */
 export interface KernelFileChange {
 	/** Absolute path after the change. */

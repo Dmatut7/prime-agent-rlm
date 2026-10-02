@@ -44,12 +44,18 @@ const blockLog = getLogger("coding-agent.compaction");
  * not feed that stale roster back - the fresh notice is appended after every
  * compaction, so an old generation has no reuse value. Nothing renders them;
  * they are recognized so stripping and the delimiter-shape checks cover them.
+ *
+ * `session-handoff` (W18-D) is a regular rendered member: the in-flight work
+ * ledger a compaction assembles from the session timeline. It lives in the tail
+ * like the other ledgers, so it is stripped before a previous summary goes back
+ * to the summarizer and rebuilt from the branch every generation.
  */
 export const MACHINE_BLOCK_TAGS = [
 	"read-files",
 	"modified-files",
 	"fact-appendix",
 	"user-requests",
+	"session-handoff",
 	"ipython_state",
 	"ipython_state_restored",
 ] as const;
@@ -63,7 +69,7 @@ export type MachineBlockTag = (typeof MACHINE_BLOCK_TAGS)[number];
  * matches can end its own block, or forge another one, on the next parse.
  */
 const BLOCK_DELIMITER_SHAPE =
-	/<\/?(?:read-files|modified-files|fact-appendix|user-requests|ipython_state_restored|ipython_state)\b/;
+	/<\/?(?:read-files|modified-files|fact-appendix|user-requests|session-handoff|ipython_state_restored|ipython_state)\b/;
 
 /** Whether text carries anything that would read back as a machine-block delimiter. */
 export function readsAsBlockDelimiter(text: string): boolean {

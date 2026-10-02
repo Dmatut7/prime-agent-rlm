@@ -29,6 +29,7 @@ import {
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.js";
 import { estimateTokens, summarizationInflation } from "./compaction.js";
 import { buildFactLedger, renderFactAppendix } from "./fact-appendix.js";
+import { buildSessionHandoff, renderSessionHandoff } from "./session-handoff.js";
 import {
 	buildSummarizationPromptText,
 	clampConversationText,
@@ -461,6 +462,11 @@ export async function generateBranchSummary(
 		tokenBudget: BRANCH_USER_REQUESTS_TOKEN_BUDGET,
 	});
 	summary += renderFactAppendix(facts) + renderUserRequests(userRequests);
+	// The structured handoff too (W18-D): children admitted on the abandoned branch
+	// keep running after the navigation, and a summary that forgets them strands
+	// them. Slice-scoped: a branch summary is a terminal artifact with no
+	// carried-forward ledger, so the scan covers the abandoned entries only.
+	summary += renderSessionHandoff(buildSessionHandoff(entries, { generation: 1 }));
 
 	return {
 		summary: summary || "No summary generated",

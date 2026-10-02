@@ -526,7 +526,8 @@ export interface IpythonToolDetails {
 	/**
 	 * Every file effect of the cell, in observation order. Absent when the cell reported none; `[]`
 	 * when everything it reported was retracted (a file restored to how it started), which replaces
-	 * any earlier list. Display-only: never sent to the model or read by compaction.
+	 * any earlier list. Display-only in the transcript; compaction reads it for the modified-files
+	 * handoff (wave-18).
 	 */
 	fileChanges?: KernelFileChange[];
 	/** Harness memory, skill, note, and rules-file changes made by the cell. Absent / `[]` like `fileChanges`. Display-only. */

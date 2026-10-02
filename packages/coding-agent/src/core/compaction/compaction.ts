@@ -30,6 +30,14 @@ import {
 } from "./fact-appendix.js";
 import { stripMachineBlocks } from "./machine-blocks.js";
 import {
+	buildSessionHandoff,
+	emptyHandoffLedger,
+	type HandoffLedger,
+	parseSessionHandoff,
+	renderSessionHandoff,
+	sessionHandoffFromDetails,
+} from "./session-handoff.js";
+import {
 	announcedInputLimit,
 	buildSummarizationPromptText,
 	clampConversationText,
@@ -77,6 +85,13 @@ export interface CompactionDetails {
 	facts?: FactLedger;
 	/** Ledger behind the rendered <user-requests> block. */
 	userRequests?: UserRequestLedger;
+	/**
+	 * In-flight work ledger behind the rendered <session-handoff> block (W18-D):
+	 * subagents admitted and never heard dying, background commands still running,
+	 * owner decisions still owed. Carried structurally so a child admitted in a
+	 * since-summarized slice stays named until its death record lands.
+	 */
+	handoff?: HandoffLedger;
 }
 
 export interface SummarySlice {
@@ -1383,7 +1398,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
  * from the transcript every compaction, so the only thing the narrative has to carry
  * is what a fact means and whether the work around it is done.
  */
-const MACHINE_BLOCKS_NOTE = `Machine-generated blocks are appended after your summary and are not part of it: <read-files> and <modified-files>, <fact-appendix> (commit SHAs, paths, threshold numbers, error signatures and issue references, extracted from the transcript by regex) and <user-requests> (the user's own words, verbatim). They are rebuilt every compaction and never pass through you, so do not restate, renumber, re-spell or "correct" their contents anywhere in your sections - a restated SHA or threshold is a second, unreliable copy of a value that is already preserved exactly. Where one of them matters to the plan, refer to it and record its status (done, in progress, blocked, or still owed to the user) instead.`;
+const MACHINE_BLOCKS_NOTE = `Machine-generated blocks are appended after your summary and are not part of it: <read-files> and <modified-files>, <fact-appendix> (commit SHAs, paths, threshold numbers, error signatures and issue references, extracted from the transcript by regex), <user-requests> (the user's own words, verbatim) and <session-handoff> (work in flight at compaction time: subagents this session admitted and never heard dying, background commands still running, owner decisions still owed - assembled from the session timeline). They are rebuilt every compaction and never pass through you, so do not restate, renumber, re-spell or "correct" their contents anywhere in your sections - a restated SHA or threshold is a second, unreliable copy of a value that is already preserved exactly. Where one of them matters to the plan, refer to it and record its status (done, in progress, blocked, or still owed to the user) instead.`;
 
 /**
  * Build the instruction portion of the summarization prompt: the initial or
@@ -1728,6 +1743,12 @@ export interface CompactionPreparation {
 	previousFacts?: FactLedger;
 	/** Verbatim user-request ledger carried forward from the previous compaction. */
 	previousUserRequests?: UserRequestLedger;
+	/**
+	 * In-flight work ledger for this generation (W18-D): assembled from the whole
+	 * branch in prepareCompaction, rendered into the summary and carried in the
+	 * entry's details. Optional only so extension-built preparations keep compiling.
+	 */
+	handoff?: HandoffLedger;
 	/** Compaction generation being written; 1 for a session's first compaction. */
 	generation?: number;
 	/** Effective keepRecentTokens after the window cap; sizes the machine blocks. */
@@ -1780,6 +1801,7 @@ export function prepareCompaction(
 	let previousSummarySource: string | undefined;
 	let previousFacts: FactLedger | undefined;
 	let previousUserRequests: UserRequestLedger | undefined;
+	let previousHandoff: HandoffLedger | undefined;
 	let previousGeneration = 0;
 	let boundaryStart = 0;
 	if (prevCompactionIndex >= 0) {
@@ -1812,6 +1834,11 @@ export function prepareCompaction(
 		previousUserRequests =
 			(machineAuthored ? userRequestLedgerFromDetails(prevCompaction.details, generation) : undefined) ??
 			renderedUserRequests;
+		// Same contract as the other two ledgers: details first, rendered block as the
+		// fallback, nothing at all from a hook-authored entry.
+		previousHandoff = machineAuthored
+			? (sessionHandoffFromDetails(prevCompaction.details) ?? parseSessionHandoff(storedSummary))
+			: undefined;
 		const firstKeptEntryIndex = pathEntries.findIndex((entry) => entry.id === prevCompaction.firstKeptEntryId);
 		boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
 	}
@@ -1876,6 +1903,12 @@ export function prepareCompaction(
 		extractFileOpsFromSummary(previousSummarySource, fileOps);
 	}
 
+	// The handoff scans the whole branch, not the leaving slice: in-flight work is
+	// a statement about compaction time, so a spawn in the retained tail belongs to
+	// it exactly like one in the summarized slice, and a death notice anywhere in
+	// the branch resolves it. Carry-forward comes from the previous entry's ledger.
+	const handoff = buildSessionHandoff(pathEntries, { generation: previousGeneration + 1, previous: previousHandoff });
+
 	return {
 		firstKeptEntryId,
 		messagesToSummarize,
@@ -1885,6 +1918,7 @@ export function prepareCompaction(
 		previousSummary,
 		previousFacts,
 		previousUserRequests,
+		handoff,
 		generation: previousGeneration + 1,
 		keepRecentTokens,
 		recentStateAnchor,
@@ -2092,6 +2126,7 @@ export async function compact(
 			modifiedFiles,
 			facts: appendix.facts,
 			userRequests: appendix.userRequests,
+			handoff: appendix.handoff,
 		} as CompactionDetails,
 		usage,
 	};
@@ -2102,7 +2137,9 @@ export interface CompactionAppendix {
 	facts: FactLedger;
 	/** Ledger behind the rendered <user-requests> block; carried in entry details. */
 	userRequests: UserRequestLedger;
-	/** Both blocks rendered, in summary order; empty when neither ledger has content. */
+	/** In-flight work ledger behind the rendered <session-handoff> block; carried in entry details. */
+	handoff: HandoffLedger;
+	/** All blocks rendered, in summary order; empty when no ledger has content. */
 	text: string;
 }
 
@@ -2139,10 +2176,15 @@ export function buildCompactionAppendix(preparation: CompactionPreparation): Com
 		previous: preparation.previousUserRequests,
 		tokenBudget: userRequestsTokenBudget(keepRecentTokens),
 	});
+	// The handoff is computed in prepareCompaction from the whole branch (in-flight
+	// is a statement about compaction time, not about the leaving slice); here it is
+	// only rendered. An extension-built preparation without one degrades to no block.
+	const handoff = preparation.handoff ?? emptyHandoffLedger(generation);
 	return {
 		facts,
 		userRequests,
-		text: `${renderFactAppendix(facts)}${renderUserRequests(userRequests)}`,
+		handoff,
+		text: `${renderFactAppendix(facts)}${renderUserRequests(userRequests)}${renderSessionHandoff(handoff)}`,
 	};
 }
 
