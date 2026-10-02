@@ -1,0 +1,1 @@
+- The `prime-agent daemon attach` monitor now declares the streaming delta capabilities, so monitoring a session no longer pays a full-snapshot reserialization per delta (a 100k-character answer: 602MB to 1.78MB on the wire).

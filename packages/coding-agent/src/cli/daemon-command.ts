@@ -13,7 +13,7 @@ import { formatStallEventLines, type StallEventView } from "../core/stall-diagno
 import type { AgentConnectionSessionEvent } from "../modes/agent-connection/types.js";
 import { resolveDaemonSocketForAgentDir } from "../modes/daemon/daemon-agent-endpoint.js";
 import { DaemonClient, type DaemonClientMessageListener } from "../modes/daemon/daemon-client.js";
-import type { DaemonOutbound, DaemonResponse } from "../modes/daemon/daemon-protocol.js";
+import type { DaemonClientCapability, DaemonOutbound, DaemonResponse } from "../modes/daemon/daemon-protocol.js";
 import { DAEMON_FIRST_PARTY_CONTROL_CAPABILITIES } from "../modes/daemon/daemon-protocol.js";
 import { matchesSessionIdSuffix } from "../modes/daemon/daemon-session-id.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
@@ -1311,6 +1311,17 @@ const printJsonLine: DaemonClientMessageListener = (value) => {
 	console.log(JSON.stringify(value));
 };
 
+// The monitor REPL's attach capability set: the two default capabilities plus
+// the compact streaming encodings. All four predate this client by many schema
+// revisions, so an older daemon simply filters the unknown-to-it ones and the
+// monitor keeps working on the rebuilt full-event path.
+const MONITOR_ATTACH_CAPABILITIES: readonly DaemonClientCapability[] = [
+	"attach_snapshot",
+	"event_sequence",
+	"streaming_deltas",
+	"streaming_delta_fragments",
+];
+
 class DaemonAttachTerminal {
 	private rl?: Interface;
 	private isStreaming = false;
@@ -1344,7 +1355,17 @@ class DaemonAttachTerminal {
 		});
 
 		try {
-			await requireSuccessAsync(this.client.request({ type: "attach", activeSessionId: this.activeSessionId }));
+			// The monitor never renders stream bodies, so it declares the compact
+			// delta capabilities and drops the deltas: undeclared, the supervisor
+			// rebuilds and serializes a full message_update for every delta on
+			// this client's behalf (O(answer^2) wire bytes per turn).
+			await requireSuccessAsync(
+				this.client.request({
+					type: "attach",
+					activeSessionId: this.activeSessionId,
+					capabilities: MONITOR_ATTACH_CAPABILITIES,
+				}),
+			);
 			await closePromise;
 		} finally {
 			unsubscribe();
@@ -1434,6 +1455,14 @@ class DaemonAttachTerminal {
 			case "session_event":
 				if (message.event.type !== "refine_complete") {
 					this.handleSessionEvent(message.event);
+				}
+				return;
+			case "assistant_stream_delta":
+				// Compact deltas replace message_update for this client. The monitor
+				// drops stream bodies but keeps the tool-call notice it used to read
+				// from message_update's toolcall_end.
+				if (message.assistantMessageEvent.type === "toolcall_end") {
+					this.writeLine(chalk.dim(`Tool call: ${message.assistantMessageEvent.toolCall.name}`));
 				}
 				return;
 			case "session_replaced":

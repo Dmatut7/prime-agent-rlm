@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const daemonClientMock = vi.hoisted(() => {
-	type Listener = (message: { type: string; activeSessionId?: string; event?: { type: string } }) => void;
+	type Listener = (message: {
+		type: string;
+		activeSessionId?: string;
+		event?: { type: string };
+		assistantMessageEvent?: { type: string; toolCall?: { name?: string } };
+	}) => void;
 	type CloseListener = (error: Error) => void;
 	type Command = {
 		type: string;
@@ -16,6 +21,7 @@ const daemonClientMock = vi.hoisted(() => {
 		includeInactive?: boolean;
 		all?: boolean;
 		sessionPath?: string;
+		capabilities?: readonly string[];
 		config?: {
 			extensionFlagValues?: Record<string, boolean | string>;
 			initialGoal?: { objective: string; tokenBudget?: number };
@@ -139,6 +145,31 @@ vi.mock("node:child_process", async (importOriginal) => {
 	return { ...original, spawn: spawnMock.mockSpawn as never };
 });
 
+const readlineMock = vi.hoisted(() => {
+	const instances: { close(): void }[] = [];
+	return { instances };
+});
+
+vi.mock("node:readline", async (importOriginal) => {
+	const original = (await importOriginal()) as Record<string, unknown>;
+	const { EventEmitter } = await import("node:events");
+	class FakeInterface extends EventEmitter {
+		setPrompt(): void {}
+		prompt(): void {}
+		close(): void {
+			this.emit("close");
+		}
+	}
+	return {
+		...original,
+		createInterface: () => {
+			const rl = new FakeInterface();
+			readlineMock.instances.push(rl);
+			return rl;
+		},
+	};
+});
+
 import { handleDaemonCommand } from "../src/cli/daemon-command.js";
 
 describe("daemon command", () => {
@@ -153,6 +184,7 @@ describe("daemon command", () => {
 		daemonClientMock.behavior.sessions = [];
 		daemonClientMock.behavior.createdSession = undefined;
 		daemonClientMock.behavior.serverCapabilities = ["send_message_delivery_mode"];
+		readlineMock.instances.length = 0;
 		consoleErrorMessages = [];
 		vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null | undefined) => {
 			throw new Error(`exit ${code}`);
@@ -639,6 +671,57 @@ describe("daemon command", () => {
 
 		expect(process.exitCode).toBe(1);
 		expect(consoleErrorMessages.join(" ")).toContain("attach requires an interactive terminal");
+	});
+
+	it("monitor attach declares compact streaming capabilities and keeps tool-call notices from deltas", async () => {
+		// The attach terminal requires a TTY for stdin; fake it and drive the
+		// terminal through the mocked readline interface.
+		const stdinTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+		Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+		const written: string[] = [];
+		vi.spyOn(process.stdout, "write").mockImplementation(((chunk: unknown) => {
+			written.push(String(chunk));
+			return true;
+		}) as typeof process.stdout.write);
+		try {
+			const command = handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "attach", "active-1"]);
+			for (let i = 0; i < 5; i++) {
+				await flushPromises();
+			}
+
+			const client = daemonClientMock.instances[0];
+			// Without streaming_deltas the supervisor rebuilds and serializes a full
+			// message_update per delta for this client; with them the monitor gets
+			// the worker's compact deltas verbatim.
+			expect(client?.requests[0]).toEqual({
+				type: "attach",
+				activeSessionId: "active-1",
+				capabilities: ["attach_snapshot", "event_sequence", "streaming_deltas", "streaming_delta_fragments"],
+			});
+
+			client?.emitMessage({
+				type: "assistant_stream_delta",
+				activeSessionId: "active-1",
+				assistantMessageEvent: { type: "toolcall_end", toolCall: { name: "bash" } },
+			});
+			client?.emitMessage({
+				type: "assistant_stream_delta",
+				activeSessionId: "active-1",
+				assistantMessageEvent: { type: "text_delta" },
+			});
+			expect(written.join("")).toContain("Tool call: bash");
+			expect(written.join("")).not.toContain("text_delta");
+
+			readlineMock.instances[0]?.close();
+			await expect(command).resolves.toBe(true);
+			expect(client?.requests.map((request) => request.type)).toEqual(["attach", "detach"]);
+		} finally {
+			if (stdinTTY) {
+				Object.defineProperty(process.stdin, "isTTY", stdinTTY);
+			} else {
+				delete (process.stdin as { isTTY?: boolean }).isTTY;
+			}
+		}
 	});
 
 	it("prints the created session for non-interactive --json open instead of attaching", async () => {

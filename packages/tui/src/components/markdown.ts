@@ -161,6 +161,46 @@ interface LexCache {
 }
 
 /**
+ * Sealed line prefix of the growing final block. While a single block (one
+ * paragraph, one fence) streams in, the block is never blank-line terminated,
+ * so the lex cache and the per-block slots never apply and the whole block
+ * would be re-rendered every frame (O(n^2) per answer). Completed lines whose
+ * rendering later text cannot change are sealed: rendered once, then served
+ * from this cache while the per-frame validation holds. Sealing never destroys
+ * the source text: width changes, invalidate(), edits and every validation
+ * failure fall back to the full render path.
+ */
+interface FinalBlockSeal {
+	blockType: "paragraph" | "code";
+	/** Sealed prefix of the block token's text; always ends right after a "\n". */
+	source: string;
+	/** Offset in token.text where the unsealed tail begins (== source.length). */
+	tailFrom: number;
+	/** Fully post-processed block lines (wrap, margins, padding) for the prefix. */
+	lines: string[];
+	width: number;
+	capsVersion: number;
+	/**
+	 * Wrap-level seal of the growing (newline-free) tail line: the sealed prefix
+	 * of the line's rendered string. Engages only while the rendered line is
+	 * plain text (no ANSI): wrapped pieces of a plain append-only string are
+	 * append-stable except the last one, and pieces re-wrapped from a piece
+	 * boundary are byte-identical to the full wrap (greedy fill restarts from
+	 * an empty line with a clean ANSI tracker).
+	 */
+	wrapSealedW?: string;
+	/** Padded block lines produced for wrapSealedW. */
+	wrapLines?: string[];
+	/** Latched when the growing line's rendered string contains ANSI codes. */
+	wrapIneligible?: boolean;
+}
+
+// Inline constructs whose rendering appends the default style prefix after the
+// construct's reset. A seal boundary immediately after one of these would make
+// the sealed prefix render trim a style restore that the full render keeps.
+const STYLE_PREFIX_CONSTRUCTS = new Set(["strong", "em", "codespan", "link", "del", "inlineMath"]);
+
+/**
  * Latest offset where re-lexing the text from that point reproduces the token
  * stream a full re-lex would produce, for any text that keeps this prefix. The
  * boundary must sit at a token start (block tokens tile the text exactly) and
@@ -306,6 +346,8 @@ export class Markdown implements Component {
 	// token stream and hit by token identity (see BlockSlot); rebuilt each
 	// render so it stays bounded to the current document's blocks.
 	private blockSlots: BlockSlot[] = [];
+	// Line-level seal for the growing final block; see FinalBlockSeal.
+	private finalBlockSeal?: FinalBlockSeal;
 	// Block-token lex cache; see LexCache. Survives setText (streaming) and
 	// invalidate() (tokens do not depend on the theme), but is only reused when
 	// the normalized text is unchanged up to the cached cut offset.
@@ -345,6 +387,7 @@ export class Markdown implements Component {
 		// External invalidation (e.g. theme change) affects rendered output, so
 		// the per-block cache must go too.
 		this.blockSlots = [];
+		this.finalBlockSeal = undefined;
 	}
 
 	/**
@@ -419,15 +462,20 @@ export class Markdown implements Component {
 		const cacheable = Object.keys(tokens.links).length === 0;
 
 		// Render, wrap, and pad per top-level block so unchanged blocks can be
-		// served from the cache. The final block is never cached: while streaming,
-		// appended text can reinterpret it (unterminated fences, growing lists);
-		// once a block is no longer last, its raw text is final.
+		// served from the cache. The final block is never slot-cached: while
+		// streaming, appended text can reinterpret it (unterminated fences,
+		// growing lists); once a block is no longer last, its raw text is final.
+		// The final block instead seals its completed lines (see FinalBlockSeal),
+		// which bounds per-frame work to the unsealed tail for single-block
+		// documents. PI_MARKDOWN_LINE_SEAL=0 disables sealing.
+		const lineSealing = process.env.PI_MARKDOWN_LINE_SEAL !== "0";
 		const nextSlots: BlockSlot[] = [];
 		const contentLines: string[] = [];
 		for (let i = 0; i < tokens.length; i++) {
 			const token = tokens[i];
 			const nextTokenType = tokens[i + 1]?.type;
-			const useCache = cacheable && i < tokens.length - 1;
+			const isFinalBlock = i === tokens.length - 1;
+			const useCache = cacheable && !isFinalBlock;
 			let blockLines: string[] | undefined;
 			if (useCache) {
 				const slot = this.blockSlots[i];
@@ -442,7 +490,14 @@ export class Markdown implements Component {
 				}
 			}
 			if (!blockLines) {
-				blockLines = this.renderBlock(token, nextTokenType, width, contentWidth);
+				if (isFinalBlock && cacheable && lineSealing) {
+					blockLines = this.renderFinalBlockSealed(token, width, contentWidth, capsVersion);
+				} else {
+					if (isFinalBlock) {
+						this.finalBlockSeal = undefined;
+					}
+					blockLines = this.renderBlock(token, nextTokenType, width, contentWidth);
+				}
 			}
 			if (useCache) {
 				nextSlots.push({ token, width, nextType: nextTokenType, capsVersion, lines: blockLines });
@@ -480,11 +535,15 @@ export class Markdown implements Component {
 
 	/** Render one top-level block: token lines, wrapping, margins, background. */
 	private renderBlock(token: Token, nextTokenType: string | undefined, width: number, contentWidth: number): string[] {
-		const tokenLines = this.renderToken(token, contentWidth, nextTokenType);
+		return this.renderTokenLinesToBlockLines(
+			this.renderToken(token, contentWidth, nextTokenType),
+			width,
+			contentWidth,
+		);
+	}
 
-		const leftMargin = " ".repeat(this.paddingX);
-		const rightMargin = " ".repeat(this.paddingX);
-		const bgFn = this.defaultTextStyle?.bgColor;
+	/** Wrap, margin, and pad already-rendered token lines into block lines. */
+	private renderTokenLinesToBlockLines(tokenLines: string[], width: number, contentWidth: number): string[] {
 		const blockLines: string[] = [];
 
 		for (const line of tokenLines) {
@@ -493,18 +552,382 @@ export class Markdown implements Component {
 				continue;
 			}
 			for (const wrapped of wrapTextWithAnsi(line, contentWidth)) {
-				const lineWithMargins = leftMargin + wrapped + rightMargin;
-				if (bgFn) {
-					blockLines.push(applyBackgroundToLine(lineWithMargins, width, bgFn));
-				} else {
-					const visibleLen = visibleWidth(lineWithMargins);
-					const paddingNeeded = Math.max(0, width - visibleLen);
-					blockLines.push(lineWithMargins + " ".repeat(paddingNeeded));
-				}
+				blockLines.push(this.padBlockLine(wrapped, width));
 			}
 		}
 
 		return blockLines;
+	}
+
+	/** Add margins, background, and right padding to one wrapped line. */
+	private padBlockLine(wrapped: string, width: number): string {
+		const leftMargin = " ".repeat(this.paddingX);
+		const rightMargin = " ".repeat(this.paddingX);
+		const bgFn = this.defaultTextStyle?.bgColor;
+		const lineWithMargins = leftMargin + wrapped + rightMargin;
+		if (bgFn) {
+			return applyBackgroundToLine(lineWithMargins, width, bgFn);
+		}
+		const visibleLen = visibleWidth(lineWithMargins);
+		const paddingNeeded = Math.max(0, width - visibleLen);
+		return lineWithMargins + " ".repeat(paddingNeeded);
+	}
+
+	/**
+	 * Render the final block through the line seal: the sealed prefix comes from
+	 * the cache, only the unsealed tail is rendered. Blocks whose rendering later
+	 * text can re-interpret in ways the seal validation does not cover (tables
+	 * re-flow column widths per row; lists re-absorb separated items; fences are
+	 * highlighted whole-block when the theme provides highlightCode) keep the
+	 * full per-frame re-render.
+	 */
+	private renderFinalBlockSealed(token: Token, width: number, contentWidth: number, capsVersion: number): string[] {
+		if (token.type === "paragraph") {
+			const sealed = this.renderFinalParagraphSealed(token as Tokens.Paragraph, width, contentWidth, capsVersion);
+			if (sealed) {
+				return sealed;
+			}
+		} else if (token.type === "code" && !this.theme.highlightCode) {
+			const sealed = this.renderFinalCodeSealed(token as Tokens.Code, width, contentWidth, capsVersion);
+			if (sealed) {
+				return sealed;
+			}
+		}
+		this.finalBlockSeal = undefined;
+		return this.renderBlock(token, undefined, width, contentWidth);
+	}
+
+	/**
+	 * Paragraph seal. A seal boundary is an offset right after a "\n" inside the
+	 * paragraph text where a split render is byte-identical to the full render:
+	 * - only text tokens may cross the boundary. Any construct spanning it
+	 *   (cross-line emphasis, codespans, math, a br) re-styles the sealed side,
+	 *   so such boundaries are never sealed and a fresh token stream showing a
+	 *   construct across the seal invalidates it (this is what catches a `*`
+	 *   opener sealed as plain text gaining its closer later);
+	 * - the line before the boundary must not end with a construct when a
+	 *   default style prefix is active, because the sealed prefix render would
+	 *   trim the trailing style restore that the full render keeps mid-string;
+	 * - reference-link definitions disable sealing entirely (the caller only
+	 *   enters this path when tokens.links is empty), since a later definition
+	 *   re-types earlier references.
+	 * Block-level re-typing (setext underlines, table delimiter rows) changes
+	 * the final token's type or raw prefix, which the per-frame seal validation
+	 * rejects before any sealed line is served.
+	 */
+	private renderFinalParagraphSealed(
+		token: Tokens.Paragraph,
+		width: number,
+		contentWidth: number,
+		capsVersion: number,
+	): string[] | undefined {
+		const text = token.text;
+		const inlineTokens = token.tokens;
+		if (typeof text !== "string" || !inlineTokens) {
+			return undefined;
+		}
+		let seal = this.finalBlockSeal;
+		if (
+			seal &&
+			(seal.blockType !== "paragraph" ||
+				seal.width !== width ||
+				seal.capsVersion !== capsVersion ||
+				!text.startsWith(seal.source) ||
+				(seal.tailFrom > 0 && !this.paragraphSealIntact(inlineTokens, seal.tailFrom)))
+		) {
+			seal = undefined;
+			this.finalBlockSeal = undefined;
+		}
+		if (!seal) {
+			seal = { blockType: "paragraph", source: "", tailFrom: 0, lines: [], width, capsVersion };
+			this.finalBlockSeal = seal;
+		}
+		const target = this.lastSealableParagraphOffset(inlineTokens, text);
+		if (target === -1) {
+			this.finalBlockSeal = undefined;
+			return undefined;
+		}
+		if (target > seal.tailFrom) {
+			const extension = this.renderInlineRegionToBlockLines(
+				inlineTokens,
+				seal.tailFrom,
+				target - 1,
+				width,
+				contentWidth,
+			);
+			if (!extension) {
+				this.finalBlockSeal = undefined;
+				return undefined;
+			}
+			seal.lines.push(...extension);
+			seal.source = text.slice(0, target);
+			seal.tailFrom = target;
+			// The growing line just completed into the sealed prefix; its
+			// wrap-level seal belongs to the old line.
+			seal.wrapSealedW = undefined;
+			seal.wrapLines = undefined;
+			seal.wrapIneligible = false;
+		}
+		const tailTokens = this.sliceInlineTokens(inlineTokens, seal.tailFrom, text.length);
+		if (!tailTokens) {
+			this.finalBlockSeal = undefined;
+			return undefined;
+		}
+		const tailText = this.renderInlineTokens(tailTokens);
+		if (seal.wrapIneligible || tailText.includes("\x1b")) {
+			// ANSI in the tail (an inline construct on the growing line) breaks the
+			// wrap seal's plain-text precondition; render the tail whole. The latch
+			// clears when the line completes into the hard seal.
+			if (tailText.includes("\x1b")) {
+				seal.wrapIneligible = true;
+			}
+			seal.wrapSealedW = undefined;
+			seal.wrapLines = undefined;
+			return [...seal.lines, ...this.renderTokenLinesToBlockLines([tailText], width, contentWidth)];
+		}
+		// A plain tail has no ANSI state to carry across segments, so the complete
+		// (but unsealable) lines render independently of the growing last line.
+		const lastBreak = tailText.lastIndexOf("\n");
+		const headLines =
+			lastBreak === -1 ? [] : this.renderTokenLinesToBlockLines([tailText.slice(0, lastBreak)], width, contentWidth);
+		const growing = lastBreak === -1 ? tailText : tailText.slice(lastBreak + 1);
+		const growingLines = this.wrapSealGrowingLine(seal, growing, width, contentWidth);
+		return [...seal.lines, ...headLines, ...growingLines];
+	}
+
+	/**
+	 * Wrap-level seal for the growing tail line. The rendered line w must be
+	 * plain text (no ANSI escapes): then a wrapped piece is a plain substring of
+	 * w, greedy wrapping from a piece boundary reproduces the full wrap's suffix
+	 * exactly (fresh line, clean tracker), and every piece except the last is
+	 * append-stable — the last piece may still grow or re-split when a growing
+	 * word crosses the width, so it is re-wrapped every frame. The per-piece
+	 * verification (piece is a prefix of the remaining text at the walked
+	 * offset, followed by the whitespace run the wrap consumed) pins the
+	 * piece-boundary offsets without reimplementing the wrap; a mismatch just
+	 * skips the extension.
+	 */
+	private wrapSealGrowingLine(seal: FinalBlockSeal, w: string, width: number, contentWidth: number): string[] {
+		let sealedW = seal.wrapSealedW ?? "";
+		let sealedLines = seal.wrapLines ?? [];
+		if (!w.startsWith(sealedW)) {
+			// The line's rendered prefix changed (e.g. a construct completed and
+			// gained styling before the plain check saw it); re-seal from scratch.
+			sealedW = "";
+			sealedLines = [];
+		}
+		const tail = w.slice(sealedW.length);
+		const wrapped = wrapTextWithAnsi(tail, contentWidth);
+		if (wrapped.length > 1) {
+			let consumed = 0;
+			let aligned = true;
+			for (let i = 0; i < wrapped.length - 1; i++) {
+				const piece = wrapped[i];
+				if (!tail.startsWith(piece, consumed)) {
+					aligned = false;
+					break;
+				}
+				consumed += piece.length;
+				while (consumed < tail.length && tail[consumed].trim() === "") {
+					consumed++;
+				}
+			}
+			if (aligned) {
+				for (let i = 0; i < wrapped.length - 1; i++) {
+					sealedLines.push(this.padBlockLine(wrapped[i], width));
+				}
+				seal.wrapSealedW = sealedW + tail.slice(0, consumed);
+				seal.wrapLines = sealedLines;
+			}
+		}
+		return [...sealedLines, this.padBlockLine(wrapped[wrapped.length - 1], width)];
+	}
+
+	/**
+	 * Whether the sealed boundary still sits inside a plain text token of the
+	 * fresh token stream (plus the style-prefix rule from the paragraph seal
+	 * comment). The seal source prefix itself is verified by the caller.
+	 */
+	private paragraphSealIntact(inlineTokens: Token[], tailFrom: number): boolean {
+		let pos = 0;
+		for (let i = 0; i < inlineTokens.length; i++) {
+			const token = inlineTokens[i];
+			const raw = (token as { raw?: unknown }).raw;
+			if (typeof raw !== "string") {
+				return false;
+			}
+			const start = pos;
+			const end = pos + raw.length;
+			if (start <= tailFrom - 1 && end > tailFrom - 1) {
+				if (token.type !== "text" || (token as { text?: unknown }).text !== raw) {
+					return false;
+				}
+				if (
+					start === tailFrom - 1 &&
+					i > 0 &&
+					this.getDefaultStylePrefix() !== "" &&
+					STYLE_PREFIX_CONSTRUCTS.has(inlineTokens[i - 1].type)
+				) {
+					return false;
+				}
+				return true;
+			}
+			pos = end;
+		}
+		return false;
+	}
+
+	/**
+	 * Largest sealable offset (right after a "\n", leaving a non-empty tail) in
+	 * the paragraph text, or 0 when none qualifies. Returns -1 when the inline
+	 * tokens do not tile the text exactly, meaning region slicing is unsafe.
+	 */
+	private lastSealableParagraphOffset(inlineTokens: Token[], text: string): number {
+		const stylePrefix = this.getDefaultStylePrefix();
+		let pos = 0;
+		let best = 0;
+		for (let i = 0; i < inlineTokens.length; i++) {
+			const token = inlineTokens[i];
+			const raw = (token as { raw?: unknown }).raw;
+			if (typeof raw !== "string") {
+				return -1;
+			}
+			if (token.type === "text") {
+				if ((token as { text?: unknown }).text !== raw) {
+					return -1;
+				}
+				let idx = raw.indexOf("\n");
+				while (idx !== -1) {
+					const k = pos + idx + 1;
+					const trimsStylePrefix =
+						idx === 0 && i > 0 && stylePrefix !== "" && STYLE_PREFIX_CONSTRUCTS.has(inlineTokens[i - 1].type);
+					if (k < text.length && !trimsStylePrefix) {
+						best = k;
+					}
+					idx = raw.indexOf("\n", idx + 1);
+				}
+			}
+			pos += raw.length;
+		}
+		return pos === text.length ? best : -1;
+	}
+
+	/**
+	 * Slice the inline tokens covering the text region [from, to), truncating
+	 * the text tokens that cross the region ends. Returns undefined when a
+	 * non-text token crosses a region boundary; callers fall back to the full
+	 * render.
+	 */
+	private sliceInlineTokens(inlineTokens: Token[], from: number, to: number): Token[] | undefined {
+		const slice: Token[] = [];
+		let pos = 0;
+		for (const token of inlineTokens) {
+			const raw = (token as { raw?: unknown }).raw;
+			if (typeof raw !== "string") {
+				return undefined;
+			}
+			const start = pos;
+			const end = pos + raw.length;
+			pos = end;
+			if (end <= from || start >= to) {
+				continue;
+			}
+			if (start >= from && end <= to) {
+				slice.push(token);
+				continue;
+			}
+			if (token.type !== "text" || (token as { text?: unknown }).text !== raw) {
+				return undefined;
+			}
+			const part = raw.slice(Math.max(from, start) - start, Math.min(to, end) - start);
+			slice.push({ type: "text", raw: part, text: part } as Token);
+		}
+		return slice;
+	}
+
+	/** Render the inline tokens covering [from, to) into block lines. */
+	private renderInlineRegionToBlockLines(
+		inlineTokens: Token[],
+		from: number,
+		to: number,
+		width: number,
+		contentWidth: number,
+	): string[] | undefined {
+		const slice = this.sliceInlineTokens(inlineTokens, from, to);
+		if (!slice) {
+			return undefined;
+		}
+		return this.renderTokenLinesToBlockLines([this.renderInlineTokens(slice)], width, contentWidth);
+	}
+
+	/**
+	 * Fence/indented-code seal. Code lines render independently of each other
+	 * (no inline constructs), so every hard-newline-terminated line of the block
+	 * text is sealed as soon as it completes. Only used when the theme has no
+	 * highlightCode: a whole-block highlighter is context-sensitive across the
+	 * full code text, so a growing fence with one keeps the full re-render.
+	 */
+	private renderFinalCodeSealed(
+		token: Tokens.Code,
+		width: number,
+		contentWidth: number,
+		capsVersion: number,
+	): string[] | undefined {
+		const text = token.text;
+		if (typeof text !== "string") {
+			return undefined;
+		}
+		const lang = typeof token.lang === "string" ? token.lang : undefined;
+		let seal = this.finalBlockSeal;
+		if (
+			seal &&
+			(seal.blockType !== "code" ||
+				seal.width !== width ||
+				seal.capsVersion !== capsVersion ||
+				!text.startsWith(seal.source))
+		) {
+			seal = undefined;
+			this.finalBlockSeal = undefined;
+		}
+		if (!seal) {
+			seal = { blockType: "code", source: "", tailFrom: 0, lines: [], width, capsVersion };
+			this.finalBlockSeal = seal;
+		}
+		// Largest offset right after a "\n" that still leaves a non-empty tail.
+		let target = 0;
+		let idx = text.indexOf("\n");
+		while (idx !== -1) {
+			if (idx + 1 < text.length) {
+				target = idx + 1;
+			}
+			idx = text.indexOf("\n", idx + 1);
+		}
+		if (target > seal.tailFrom) {
+			const extension = this.renderTokenLinesToBlockLines(
+				this.renderCodeTextLines(text.slice(seal.tailFrom, target - 1), lang),
+				width,
+				contentWidth,
+			);
+			seal.lines.push(...extension);
+			seal.source = text.slice(0, target);
+			seal.tailFrom = target;
+			// The growing code line just completed into the sealed prefix.
+			seal.wrapSealedW = undefined;
+			seal.wrapLines = undefined;
+			seal.wrapIneligible = false;
+		}
+		// The tail is exactly the growing line: the hard seal covers every
+		// newline-terminated line, so it never contains "\n".
+		const w = this.renderCodeTextLines(text.slice(seal.tailFrom), lang)[0] ?? "";
+		if (seal.wrapIneligible || w.includes("\x1b")) {
+			if (w.includes("\x1b")) {
+				seal.wrapIneligible = true;
+			}
+			seal.wrapSealedW = undefined;
+			seal.wrapLines = undefined;
+			return [...seal.lines, ...this.renderTokenLinesToBlockLines([w], width, contentWidth)];
+		}
+		return [...seal.lines, ...this.wrapSealGrowingLine(seal, w, width, contentWidth)];
 	}
 
 	/**
@@ -932,12 +1355,16 @@ export class Markdown implements Component {
 		if (!("text" in token) || typeof token.text !== "string") {
 			return [];
 		}
-
-		const indent = this.theme.codeBlockIndent ?? "  ";
 		const lang = "lang" in token && typeof token.lang === "string" ? token.lang : undefined;
+		return this.renderCodeTextLines(token.text, lang);
+	}
+
+	/** Render code text to indented, optionally highlighted lines. */
+	private renderCodeTextLines(codeText: string, lang: string | undefined): string[] {
+		const indent = this.theme.codeBlockIndent ?? "  ";
 		const renderedCodeLines = this.theme.highlightCode
-			? this.theme.highlightCode(token.text, lang)
-			: token.text.split("\n").map((codeLine) => this.theme.codeBlock(codeLine));
+			? this.theme.highlightCode(codeText, lang)
+			: codeText.split("\n").map((codeLine) => this.theme.codeBlock(codeLine));
 		const codeLines = renderedCodeLines.length > 0 ? renderedCodeLines : [this.theme.codeBlock("")];
 
 		return codeLines.map((codeLine) => `${indent}${codeLine}`);
