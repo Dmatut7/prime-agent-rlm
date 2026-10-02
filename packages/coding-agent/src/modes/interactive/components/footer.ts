@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.js";
+import { formatSpendCost } from "../spend-format.js";
 import { theme } from "../theme/theme.js";
 import { formatBoxTokens } from "./turn-timeline.js";
 
@@ -60,6 +61,16 @@ export interface FooterTelemetrySnapshot {
 	 * (评审③ - the bar never reports a threshold that does not exist).
 	 */
 	compactionThresholdTokens?: number;
+	/**
+	 * The session's own cumulative spend in the models.json cost unit: the root
+	 * agent's ownUsage as priced by the spend pipeline (the money recorded on the
+	 * session's messages at the models.json rates, same 口径 as /usage). Present
+	 * only when the `footer.sessionSpend` setting is on and a figure exists;
+	 * renders as `本次 ¥4.20` ahead of the watermark bar and is the first segment
+	 * dropped at narrow widths. Zero and unusable values render nothing (no
+	 * ¥0.00 noise, same rule as the subagent spend cell).
+	 */
+	sessionCost?: number;
 }
 
 /**
@@ -457,13 +468,31 @@ export class FooterComponent implements Component {
 
 		const activityText = this.activitySource?.()?.trim();
 		const activity = activityText ? `${activityText}${GROUP_GAP}` : "";
+		const sessionCost = snapshot.sessionCost;
+		// The opt-in `本次 ¥…` segment rides ahead of the bar, in the same slot
+		// family as the subagent spend cell, and is the first segment dropped at
+		// narrow widths: the rungs after the with-session ones are the original
+		// ladder, so a session without the segment renders exactly as before.
+		const sessionSpend =
+			typeof sessionCost === "number" && Number.isFinite(sessionCost) && sessionCost > 0
+				? `${theme.fg("muted", "本次")} ${theme.fg("accent", formatSpendCost(sessionCost))}${GROUP_GAP}`
+				: "";
 		const spend = this.spendSource?.() ?? [];
 		const layouts: Array<[string, string]> = [
 			...spend.map((form): [string, string] => [
 				`${model}${locationGroup}`,
-				`${activity}${form}${GROUP_GAP}${bar}${figures}`,
+				`${activity}${form}${GROUP_GAP}${sessionSpend}${bar}${figures}`,
 			]),
-			[`${model}${locationGroup}`, `${activity}${bar}${figures}`],
+			[`${model}${locationGroup}`, `${activity}${sessionSpend}${bar}${figures}`],
+			...(sessionSpend
+				? [
+						...spend.map((form): [string, string] => [
+							`${model}${locationGroup}`,
+							`${activity}${form}${GROUP_GAP}${bar}${figures}`,
+						]),
+						[`${model}${locationGroup}`, `${activity}${bar}${figures}`] as [string, string],
+					]
+				: []),
 			[model, `${activity}${bar}${figures}`],
 			[model, `${activity}${figures}`],
 			[model, figures],

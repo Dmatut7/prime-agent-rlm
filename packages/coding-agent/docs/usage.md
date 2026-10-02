@@ -13,7 +13,7 @@ The interface has four main areas:
 - **Startup header** - compact brand and runtime summary; `--verbose` also lists loaded context files, prompt templates, skills, and extensions
 - **Messages** - user messages, assistant responses, tool calls, tool results, notifications, errors, and extension UI
 - **Editor** - where you type
-- **Footer** - one telemetry line by default (model, thinking level, watermark, context figures; turn it off with `footer.telemetry: "off"` in settings); use `/usage` for token, cost, and context details
+- **Footer** - one telemetry line by default (model, thinking level, watermark, context figures; turn it off with `footer.telemetry: "off"` in settings, or add the session's own cumulative spend as `本次 ¥…` with `footer.sessionSpend: true`); use `/usage` for token, cost, and context details
 
 The editor can be replaced temporarily by built-in UI such as `/settings` or by custom extension UI.
 

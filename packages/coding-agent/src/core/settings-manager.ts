@@ -1020,6 +1020,14 @@ export type FooterTelemetrySetting = "off" | "on";
 export interface FooterSettings {
 	/** Default: "on" — one line: model · thinking level · watermark bar · context figures. */
 	telemetry?: FooterTelemetrySetting;
+	/**
+	 * Default: false — when true, the watermark line adds the session's own
+	 * cumulative spend segment (`本次 ¥4.20`): the root agent's ownUsage as priced
+	 * by the spend pipeline (the money recorded on the session's messages, same
+	 * 口径 as /usage). Off keeps cost out of the persistent UI; `/usage` reports
+	 * it on demand either way.
+	 */
+	sessionSpend?: boolean;
 }
 
 /** A JSON object that merges key-by-key; arrays and nulls replace wholesale. */
@@ -1170,7 +1178,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	autoRefine: ["enabled", "turnInterval", "compact", "cooldownMs"],
 	agentTraces: ["enabled"],
 	telemetry: ["enabled", "noticeShown"],
-	footer: ["telemetry"],
+	footer: ["telemetry", "sessionSpend"],
 	branchSummary: ["reserveTokens", "skipPrompt"],
 	retention: [
 		"enabled",
@@ -1432,6 +1440,7 @@ const BOOLEAN_SWITCHES: ReadonlyArray<{ path: string; raw: (settings: Settings) 
 	{ path: "showHardwareCursor", raw: (s) => s.showHardwareCursor },
 	{ path: "agentTraces.enabled", raw: (s) => s.agentTraces?.enabled },
 	{ path: "telemetry.enabled", raw: (s) => s.telemetry?.enabled },
+	{ path: "footer.sessionSpend", raw: (s) => s.footer?.sessionSpend },
 	{ path: "changeTracking.enabled", raw: (s) => s.changeTracking?.enabled },
 	{ path: "autoRefine.enabled", raw: (s) => s.autoRefine?.enabled },
 	{ path: "autoRefine.compact", raw: (s) => s.autoRefine?.compact },
@@ -2731,6 +2740,20 @@ export class SettingsManager {
 	setFooterTelemetry(telemetry: FooterTelemetrySetting): void {
 		this.globalSettings.footer = { ...this.globalSettings.footer, telemetry };
 		this.markModified("footer", "telemetry");
+		this.save();
+	}
+
+	/**
+	 * The watermark line's opt-in session spend segment (`本次 ¥…`). Default off:
+	 * cost stays out of the persistent UI unless the user asks for it.
+	 */
+	getFooterSessionSpend(): boolean {
+		return readBooleanSetting(this.settings.footer?.sessionSpend, false).value;
+	}
+
+	setFooterSessionSpend(enabled: boolean): void {
+		this.globalSettings.footer = { ...this.globalSettings.footer, sessionSpend: enabled };
+		this.markModified("footer", "sessionSpend");
 		this.save();
 	}
 
