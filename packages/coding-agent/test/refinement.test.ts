@@ -1583,6 +1583,7 @@ describe("global refinement history", () => {
 		expect(request.systemPrompt).toContain("never the child's answer");
 		expect(request.systemPrompt).toContain('receiver_role="parent"');
 		expect(request.systemPrompt).toContain("await rlm.list_subagents()");
+		expect(request.systemPrompt).toContain("include_terminal=True");
 		expect(request.systemPrompt).toContain('receiver_role="child"');
 		expect(request.systemPrompt).not.toContain("asyncio.create_task(rlm");
 		expect(request.systemPrompt).not.toContain("asyncio.gather(rlm");

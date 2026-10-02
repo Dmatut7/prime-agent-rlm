@@ -20,7 +20,7 @@
  * Listing is conservative on purpose: a record is removed only by a death
  * record later in the branch, so the block may name work that has since
  * finished quietly - never the reverse. The header tells the reader that
- * rlm.list_subagents() is the ground truth.
+ * rlm.list_subagents(include_terminal=True) is the ground truth.
  */
 
 import { DUTY_EVENT_CUSTOM_TYPE, parseDutyEvent } from "../duty-log.js";
@@ -247,7 +247,7 @@ export function buildSessionHandoff(
 /* -------------------------------------------------------------------------- */
 
 const HANDOFF_HEADER =
-	"Machine-assembled from the session timeline at compaction time, no model involved: work still in flight when this summary was written. k=subagent: a child this session admitted, with no failure or cancellation record later in this transcript (it may still have finished quietly or been deleted - rlm.list_subagents() is the ground truth; admitting=true means the spawn call itself had not returned). k=background: a bash() command the kernel still had running. k=decision: an owner decision the duty log recorded as still owed. Refer to entries by their exact name/id; do not restate them as fact without checking.";
+	"Machine-assembled from the session timeline at compaction time, no model involved: work still in flight when this summary was written. k=subagent: a child this session admitted, with no failure or cancellation record later in this transcript (it may still have finished quietly or been deleted - rlm.list_subagents(include_terminal=True) is the ground truth; admitting=true means the spawn call itself had not returned). k=background: a bash() command the kernel still had running. k=decision: an owner decision the duty log recorded as still owed. Refer to entries by their exact name/id; do not restate them as fact without checking.";
 
 type WireHandoff =
 	| { k: "subagent"; n: string; s?: number; m?: string; a?: 1 }

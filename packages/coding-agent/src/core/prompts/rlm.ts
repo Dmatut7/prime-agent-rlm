@@ -232,10 +232,12 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		if (hasAgentMessage) {
 			parts.push(
 				"Children reply explicitly with `await agent_message.send(message, receiver_role='parent')` when an answer is needed. Replies and follow-ups arrive as ordinary agent messages; not every task requires a reply.",
-				"Use `await agent_message.list_agents()` to discover family and `await rlm.list_subagents()` to recover direct child handles. Use `agent_message.send(..., receiver_role='child', receiver_name=handle.name)` for follow-ups; a `list_subagents()` row names the child as `row.session_name`.",
+				"Use `await agent_message.list_agents()` to discover family and `await rlm.list_subagents()` for your active direct children; a child that finished leaves the active list - `await rlm.list_subagents(include_terminal=True)` still names it, and `rlm.collect` reads its result. Use `agent_message.send(..., receiver_role='child', receiver_name=handle.name)` for follow-ups; a `list_subagents()` row names the child as `row.session_name`.",
 			);
 		} else {
-			parts.push("Use `await rlm.list_subagents()` to recover direct child handles after admission.");
+			parts.push(
+				"Use `await rlm.list_subagents()` for your active direct children after admission; `await rlm.list_subagents(include_terminal=True)` also names finished ones, and `rlm.collect` reads their results.",
+			);
 		}
 		parts.push(
 			"Collect typed results with `await rlm.collect(targets=None, timeout_ms=0)`: one snapshot per direct child (status, settled, answer preview, error, `terminal_kind`, `stall_abort`) without steering anyone and without spending message caps. Snapshots are frozen dataclass instances, not dicts: read fields by attribute (`.session_name`; a typo raises instead of silently returning `None`), though `.get()` and `[]` work too, and the field list is `rlm_child_id`, `session_name` (not `name`), `session_dir`, `status`, `settled`, `answer_preview`, `error`, `duration_ms`, `tool_use_count`, `replied_since_task`, `activity_kind`, `terminal_kind`, `terminal_reason`, `stall_abort`. `timeout_ms` bounds only that call and never rejects - a timeout returns the current snapshots, the host caps one wait at its read-only request budget, and nothing is cancelled by it, so waiting is a poll, not a commitment.",
@@ -287,7 +289,7 @@ export function buildSubagentGuidance(
 		);
 	}
 	lines.push(
-		"After a kernel restart or compaction, recover handles with `await rlm.list_subagents()` instead of guessing names.",
+		"After a kernel restart or compaction, recover handles with `await rlm.list_subagents()` (the active list; pass `include_terminal=True` to also name finished children) instead of guessing names.",
 		"`collect` previews are compact by design, so ask for large outputs in files and read them selectively. A child killed by the stall watchdog still reports `status='done'`: read `terminal_kind` before trusting a completion, or you will build on work that never finished.",
 	);
 	if (options.includeRefineExamples ?? true) {

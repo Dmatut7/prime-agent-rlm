@@ -136,6 +136,7 @@ class HarnessStateTest(unittest.TestCase):
             self.assertIn("never the child's answer", overview)
             self.assertIn("receiver_role='parent'", overview)
             self.assertIn("await rlm.list_subagents()", overview)
+            self.assertIn("include_terminal=True", overview)
             self.assertIn("receiver_role='child'", overview)
             self.assertIn("refinements: 1", reloaded.overview())
 

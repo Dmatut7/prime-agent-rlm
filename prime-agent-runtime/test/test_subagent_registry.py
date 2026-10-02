@@ -247,6 +247,113 @@ class RlmSubagentRegistryTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "missing session_name"):
                 asyncio.run(rlm_module.list_subagents())
 
+    def test_include_terminal_forwards_the_flag_to_the_host(self) -> None:
+        """W23-A: the wave-21 roster defaults to active children; the flag re-admits terminal ones."""
+        host_request = AsyncMock(return_value={"subagents": []})
+
+        with patch.object(rlm_module, "host_request", host_request):
+            subagents = asyncio.run(rlm_module.rlm.list_subagents(include_terminal=True))
+
+        self.assertEqual(subagents, [])
+        host_request.assert_awaited_once_with("rlm.list_subagents", {"include_terminal": True})
+
+    def test_include_terminal_defaults_to_the_active_roster_wire_shape(self) -> None:
+        host_request = AsyncMock(return_value={"subagents": []})
+
+        with patch.object(rlm_module, "host_request", host_request):
+            asyncio.run(rlm_module.list_subagents())
+            asyncio.run(rlm_module.list_subagents(include_terminal=False))
+
+        # No flag on the wire: a host that predates the wave-21 roster sees the
+        # byte-identical request shape it always did.
+        self.assertEqual(host_request.await_count, 2)
+        for call in host_request.await_args_list:
+            self.assertEqual(call.args, ("rlm.list_subagents",))
+
+    def test_include_terminal_rejects_non_bool(self) -> None:
+        with self.assertRaisesRegex(TypeError, "include_terminal must be bool"):
+            asyncio.run(rlm_module.list_subagents(include_terminal="yes"))
+
+
+
+class RlmPruneSubagentsTest(unittest.TestCase):
+    """`rlm.prune_subagents` (W23-A): retire terminal children from the roster views."""
+
+    def _pruned_payload(self) -> dict:
+        return {
+            "rlm_child_id": "sub-a1b2c3d4",
+            "active_session_id": None,
+            "session_id": "session-child",
+            "session_name": "api-reviewer",
+            "session_dir": "/tmp/parent/sub-a1b2c3d4",
+            "status": "completed",
+        }
+
+    def test_prune_without_targets_retires_every_terminal_child(self) -> None:
+        host_request = AsyncMock(return_value={"pruned": [self._pruned_payload()]})
+
+        with patch.object(rlm_module, "host_request", host_request):
+            pruned = asyncio.run(rlm_module.rlm.prune_subagents())
+
+        self.assertEqual(len(pruned), 1)
+        self.assertIsInstance(pruned[0], rlm_module.RLMSubagent)
+        self.assertEqual(pruned[0].rlm_child_id, "sub-a1b2c3d4")
+        self.assertEqual(pruned[0].session_name, "api-reviewer")
+        self.assertEqual(pruned[0].session_dir, Path("/tmp/parent/sub-a1b2c3d4"))
+        self.assertEqual(pruned[0].status, "completed")
+        host_request.assert_awaited_once_with("rlm.prune_subagents", {"targets": []})
+
+    def test_prune_normalizes_handles_rows_and_names(self) -> None:
+        host_request = AsyncMock(return_value={"pruned": []})
+        handle = rlm_module.RLMSpawnHandle(
+            rlm_child_id="sub-h1",
+            name="worker-h",
+            session_dir=Path("/tmp/parent/sub-h1"),
+            model="faux/faux-model",
+        )
+        row = rlm_module.RLMSubagent(
+            rlm_child_id="sub-r1",
+            active_session_id=None,
+            session_id=None,
+            session_name="worker-r",
+            session_dir=Path("/tmp/parent/sub-r1"),
+            status="completed",
+        )
+
+        with patch.object(rlm_module, "host_request", host_request):
+            pruned = asyncio.run(rlm_module.prune_subagents([handle, row, "worker-b"]))
+
+        self.assertEqual(pruned, [])
+        host_request.assert_awaited_once_with(
+            "rlm.prune_subagents", {"targets": ["sub-h1", "sub-r1", "worker-b"]}
+        )
+
+    def test_prune_accepts_a_single_target(self) -> None:
+        host_request = AsyncMock(return_value={"pruned": []})
+
+        with patch.object(rlm_module, "host_request", host_request):
+            asyncio.run(rlm_module.rlm.prune_subagents("  worker-b  "))
+
+        host_request.assert_awaited_once_with("rlm.prune_subagents", {"targets": ["worker-b"]})
+
+    def test_prune_validates_targets(self) -> None:
+        with self.assertRaisesRegex(TypeError, "targets must be"):
+            asyncio.run(rlm_module.prune_subagents(42))
+        with self.assertRaisesRegex(TypeError, "prune target"):
+            asyncio.run(rlm_module.prune_subagents(["ok", ""]))
+
+    def test_prune_rejects_invalid_payloads(self) -> None:
+        invalid_payloads = [
+            ({"pruned": "nope"}, "invalid pruned list"),
+            ({"pruned": ["nope"]}, "invalid subagent entry"),
+            ({"pruned": [{"status": "completed"}]}, "missing rlm_child_id"),
+        ]
+        self.assertGreater(len(invalid_payloads), 0)
+        for payload, expected in invalid_payloads:
+            host_request = AsyncMock(return_value=payload)
+            with patch.object(rlm_module, "host_request", host_request):
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    asyncio.run(rlm_module.prune_subagents())
 
 
 class RlmCollectTest(unittest.TestCase):

@@ -232,9 +232,22 @@ def _subagent_from_payload(payload: Any, operation: str = "rlm.list_subagents") 
     )
 
 
-async def list_subagents() -> list[RLMSubagent]:
-    """List direct RLM children retained by the current parent session."""
-    payload = await host_request("rlm.list_subagents")
+async def list_subagents(include_terminal: bool = False) -> list[RLMSubagent]:
+    """List direct RLM children tracked by the current parent session.
+
+    The default view is the active roster: children still queued or running.
+    Pass ``include_terminal=True`` to also list children whose run reached a
+    terminal state (completed or error); terminal children stay addressable
+    through ``collect`` and ``delete_subagent`` either way. The flag is omitted
+    from the wire when false, so a host that predates the roster split sees the
+    request shape it always did.
+    """
+    if not isinstance(include_terminal, bool):
+        raise TypeError(f"include_terminal must be bool, got {type(include_terminal).__name__}")
+    if include_terminal:
+        payload = await host_request("rlm.list_subagents", {"include_terminal": True})
+    else:
+        payload = await host_request("rlm.list_subagents")
     entries = payload.get("subagents")
     if not isinstance(entries, list):
         raise RuntimeError("rlm.list_subagents returned an invalid subagents registry")
@@ -247,15 +260,44 @@ _RLM_CHILD_TERMINAL_KINDS = frozenset(
 )
 
 
-def _collect_target_selector(target: Any) -> str:
-    """Normalize a collect target: spawn handle, subagent row, or a name/id string."""
+def _target_selector(target: Any, operation: str) -> str:
+    """Normalize a child selector: spawn handle, subagent row, or a name/id string."""
     if isinstance(target, (RLMSpawnHandle, RLMSubagent)):
         return target.rlm_child_id
     if isinstance(target, str) and target.strip():
         return target.strip()
     raise TypeError(
-        f"collect target must be RLMSpawnHandle, RLMSubagent, or non-empty str, got {type(target).__name__}"
+        f"{operation} target must be RLMSpawnHandle, RLMSubagent, or non-empty str, got {type(target).__name__}"
     )
+
+
+def _target_selectors(targets: Any, operation: str) -> list[str]:
+    """Normalize the shared ``targets`` argument: None/empty means every direct child."""
+    if targets is None:
+        return []
+    if isinstance(targets, (RLMSpawnHandle, RLMSubagent, str)):
+        return [_target_selector(targets, operation)]
+    if isinstance(targets, (list, tuple)):
+        return [_target_selector(target, operation) for target in targets]
+    raise TypeError(f"targets must be None, a target, or a list of targets, got {type(targets).__name__}")
+
+
+async def prune_subagents(targets: Any = None) -> list[RLMSubagent]:
+    """Retire terminal direct children from the roster views; returns the pruned rows.
+
+    Pruning is registry bookkeeping, not deletion: a pruned child keeps its
+    transcript, its ``collect`` result, and its ``delete_subagent`` selector, and
+    a child the parent re-engages (a follow-up turn) leaves the pruned set on its
+    own. Running children are refused - pruning is not cancellation. ``targets``
+    selects children like ``collect`` does (spawn handles, subagent rows, or
+    name/id strings); ``None`` (or an empty list) retires every terminal child.
+    """
+    selectors = _target_selectors(targets, "prune")
+    payload = await host_request("rlm.prune_subagents", {"targets": selectors})
+    pruned = payload.get("pruned")
+    if not isinstance(pruned, list):
+        raise RuntimeError("rlm.prune_subagents returned an invalid pruned list")
+    return [_subagent_from_payload(entry, "rlm.prune_subagents") for entry in pruned]
 
 
 def _optional_str(payload: dict[str, Any], field: str) -> str | None:
@@ -375,14 +417,7 @@ async def collect(
     """
     if not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool) or timeout_ms < 0:
         raise TypeError("timeout_ms must be a non-negative int")
-    if targets is None:
-        selectors: list[str] = []
-    elif isinstance(targets, (RLMSpawnHandle, RLMSubagent, str)):
-        selectors = [_collect_target_selector(targets)]
-    elif isinstance(targets, (list, tuple)):
-        selectors = [_collect_target_selector(target) for target in targets]
-    else:
-        raise TypeError(f"targets must be None, a target, or a list of targets, got {type(targets).__name__}")
+    selectors = _target_selectors(targets, "collect")
     payload = await host_request(
         "rlm.collect",
         {"targets": selectors, "timeout_ms": timeout_ms, "wake_on_message": True},
@@ -529,8 +564,11 @@ class _RLMCallable:
     async def find_models(self, query: str = "", limit: int = 8) -> list[RLMModel]:
         return await find_models(query, limit)
 
-    async def list_subagents(self) -> list[RLMSubagent]:
-        return await list_subagents()
+    async def list_subagents(self, include_terminal: bool = False) -> list[RLMSubagent]:
+        return await list_subagents(include_terminal)
+
+    async def prune_subagents(self, targets: Any = None) -> list[RLMSubagent]:
+        return await prune_subagents(targets)
 
     async def collect(self, targets: Any = None, *, timeout_ms: int = 0) -> list[RLMChildResult]:
         return await collect(targets, timeout_ms=timeout_ms)
@@ -584,6 +622,7 @@ __all__ = [
     "host_request",
     "list_subagents",
     "messages_pending",
+    "prune_subagents",
     "rlm",
     "run",
     "wait_messages",

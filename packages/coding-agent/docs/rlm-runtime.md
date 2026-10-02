@@ -116,7 +116,8 @@ The runtime ships the call to the host as a `host_request` event and keeps its e
 rlm
 spawn(prompt: str, *, name: str, model: str | None = None, thinking: str | None = None)
 find_models(query: str = "", limit: int = 8)
-list_subagents()
+list_subagents(include_terminal=False)
+prune_subagents(targets=None)
 collect(targets=None, *, timeout_ms=0)
 wait_messages(timeout_ms: int = 0)
 messages_pending()
@@ -169,7 +170,7 @@ End the turn instead of waiting for completion. Children send requested answers 
 
 ## Parent-Scoped Sub-Agent Registry
 
-The TypeScript parent maintains the authoritative direct-child registry. `await rlm.list_subagents()` returns stable child IDs, active-session IDs when daemon-backed, session IDs, names, directories, and running/completed status.
+The TypeScript parent maintains the authoritative direct-child registry. `await rlm.list_subagents()` returns the active roster (queued/running) with stable child IDs, active-session IDs when daemon-backed, session IDs, names, and directories; pass `include_terminal=True` to also see completed/errored children, and `await rlm.prune_subagents()` to forget terminal children explicitly.
 
 This registry survives kernel restart, compaction, and parent restore. Successfully completed daemon-backed children are rehydrated from the parent artifact registry. Inline children remain inspectable in the current process but have no active-session ID.
 

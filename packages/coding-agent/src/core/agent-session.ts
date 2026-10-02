@@ -18609,7 +18609,15 @@ export class AgentSession {
 
 	releaseRlmChildSession(childId: string, session: AgentSession): (() => void) | false {
 		const run = this._activeRlmChildRuns.get(childId);
-		if (run?.session === session && run.status === "done") {
+		// An errored run never leaves the active map (unlike a done one, which moves
+		// to the retained sessions), so without its arm here a still-resident errored
+		// child could never be handed to idle passivation and leaked for the worker's
+		// lifetime. The settled gate keeps the release from racing the run's own
+		// terminal bookkeeping: the classification lands before settle, so the closed
+		// record this publishes carries it. The closer keeps the audit surfaces - the
+		// retired-run record, the closed collect entry, and the roster row all keep
+		// the error.
+		if (run?.session === session && (run.status === "done" || (run.status === "error" && run.settled))) {
 			const unsubscribe = run.unsubscribe ?? noopRlmChildEventUnsubscribe;
 			const closed = this._closedRlmChildRecord(childId, session, run);
 			return () => {

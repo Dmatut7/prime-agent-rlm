@@ -161,7 +161,7 @@ describe("name-occupied copy (C15)", () => {
 	it("tells a genuine name clash to list or rename", () => {
 		const taken = formatAgentSessionNameUnavailable("worker", 1);
 		expect(taken).toContain('Agent name "worker" is unavailable');
-		expect(taken).toContain("rlm.list_subagents()");
+		expect(taken).toContain("rlm.list_subagents(include_terminal=True)");
 		expect(taken).toContain("different `name=`");
 		expect(taken).not.toContain("already in flight");
 	});

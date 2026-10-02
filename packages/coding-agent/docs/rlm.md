@@ -92,7 +92,7 @@ An admission handle contains `rlm_child_id`, `name`, `session_dir`, and `model`.
 The parent-scoped child registry survives compaction, kernel restart, and parent restoration:
 
 ```python
-children = await rlm.list_subagents()
+children = await rlm.list_subagents()  # active roster; add include_terminal=True for finished ones
 for child in children:
     print(child.session_name, child.status, child.active_session_id)
 ```

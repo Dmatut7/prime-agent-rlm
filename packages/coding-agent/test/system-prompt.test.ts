@@ -162,7 +162,9 @@ describe("buildRlmPrompt", () => {
 		for (const prompt of [withoutObserve, withObserve]) {
 			expect(prompt).toContain("await rlm.list_subagents()");
 			expect(prompt).toContain("await rlm.delete_subagent(child)");
-			expect(prompt).toContain("recover direct child handles");
+			// The wave-21 roster defaults to active children; the prompt must say so.
+			expect(prompt).toContain("await rlm.list_subagents(include_terminal=True)");
+			expect(prompt).not.toContain("recover direct child handles");
 			expect(prompt).not.toContain("Write a small disk registry");
 		}
 	});
@@ -527,7 +529,8 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("returns at admission, not completion");
 		expect(prompt).toContain("Results arrive through an available messaging capability");
 		expect(prompt).toContain("await rlm.collect(targets=None, timeout_ms=0)");
-		expect(prompt).toContain("recover direct child handles");
+		expect(prompt).toContain("list_subagents(include_terminal=True)");
+		expect(prompt).not.toContain("recover direct child handles");
 		expect(prompt).toContain("kernel restart or compaction");
 		expect(prompt).toContain("rlm.list_subagents");
 		expect(prompt).toContain("rlm.delete_subagent");

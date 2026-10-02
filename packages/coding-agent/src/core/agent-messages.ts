@@ -311,7 +311,7 @@ function agentSessionNameUnavailablePrefix(name: string, depth: number): string 
 export function formatAgentSessionNameUnavailable(name: string, depth: number): string {
 	return (
 		`${agentSessionNameUnavailablePrefix(name, depth)}. ` +
-		"Call `await rlm.list_subagents()` to see the children already registered under this parent, " +
+		"Call `await rlm.list_subagents(include_terminal=True)` to see the children already registered under this parent, " +
 		"or pass a different `name=`."
 	);
 }
@@ -327,7 +327,7 @@ export function formatAgentSessionNameParentUnconfirmed(name: string, depth: num
 		`Agent name "${name}" is unavailable: a same-depth agent of that name exists, but its ` +
 		`parent could not be confirmed against this one (depth ${depth}; the two record different ` +
 		"identifier shapes and the catalog cannot compare them). " +
-		"Call `await rlm.list_subagents()` to see the existing children and their parents, " +
+		"Call `await rlm.list_subagents(include_terminal=True)` to see the existing children and their parents, " +
 		"or pass a different `name=`."
 	);
 }

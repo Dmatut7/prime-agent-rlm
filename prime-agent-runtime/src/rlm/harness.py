@@ -1428,8 +1428,9 @@ class HarnessState:
             "handle = await rlm('sub-task'); admission returns immediately with rlm_child_id, name, session_dir, "
             "and model, never the child's answer. Results arrive only through explicit agent_message replies or "
             "files; children reply with await agent_message.send(message, receiver_role='parent'). Use "
-            "await rlm.list_subagents() to recover direct child handles and await agent_message.send(..., "
-            "receiver_role='child', receiver_name=handle.name) for follow-ups.",
+            "await rlm.list_subagents() for active direct children (include_terminal=True names finished ones, "
+            "rlm.collect reads their results) and await agent_message.send(..., receiver_role='child', "
+            "receiver_name=handle.name) for follow-ups.",
         ]
         for kind in _KINDS:
             # The injection window is recency-first, not list()'s path-grouped
