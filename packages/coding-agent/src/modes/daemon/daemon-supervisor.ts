@@ -966,6 +966,17 @@ type SupervisorCommandHandlers = {
 	[K in DaemonCommand["type"]]?: SupervisorCommandHandler<K>;
 };
 
+type DaemonWorkerOutboundFrameHeader = Extract<DaemonWorkerFrameHeader, { kind: "outbound" }>;
+
+type WorkerFrameHandler = (
+	worker: ResidentWorker,
+	frame: PrivateFrame<DaemonWorkerFrameHeader>,
+	header: DaemonWorkerOutboundFrameHeader,
+	source?: DaemonWorkerClient,
+) => void;
+
+type WorkerFrameHandlers = Partial<Record<DaemonWorkerOutboundFrameHeader["outboundType"], WorkerFrameHandler>>;
+
 class SupervisorRecoveryCancelledError extends Error {
 	readonly code = "supervisor_recovery_cancelled" as const;
 }
@@ -8661,12 +8672,42 @@ export class DaemonSupervisor {
 		);
 	}
 
+	private workerFrameHandlersCache?: WorkerFrameHandlers;
+
+	/**
+	 * Frames the supervisor consumes or swallows itself, keyed by outbound type.
+	 * Everything else falls through to relayWorkerOutboundFrame, which drops
+	 * frames without a session id. Built lazily because prototype-only test
+	 * harnesses never run the constructor, so a field initializer would leave
+	 * them without a table.
+	 */
+	private get workerFrameHandlers(): WorkerFrameHandlers {
+		this.workerFrameHandlersCache ??= {
+			roster_delta: (worker, frame, _header, source) => this.handleWorkerRosterDeltaFrame(worker, frame, source),
+			roster_heartbeat: () => {},
+			heartbeats_changed: (worker) => this.handleWorkerHeartbeatsChangedFrame(worker),
+			session_snapshot_begin: (worker, frame, header) => this.handleWorkerSnapshotBeginFrame(worker, frame, header),
+			session_snapshot_chunk: (worker, frame, header) => this.handleWorkerSnapshotChunkFrame(worker, frame, header),
+			session_snapshot_end: (worker, frame, header) => this.handleWorkerSnapshotEndFrame(worker, frame, header),
+			session_snapshot_failed: (worker, frame, header) =>
+				this.handleWorkerSnapshotFailedFrame(worker, frame, header),
+			daemon_hello: () => {},
+			response: () => {},
+			session_list_progress: () => {},
+			session_list_item: () => {},
+			session_attached: () => {},
+			session_detached: () => {},
+		};
+		return this.workerFrameHandlersCache;
+	}
+
 	private handleWorkerFrame(
 		worker: ResidentWorker,
 		frame: PrivateFrame<DaemonWorkerFrameHeader>,
 		source?: DaemonWorkerClient,
 	): void {
-		if (frame.header.kind !== "outbound") {
+		const header = frame.header;
+		if (header.kind !== "outbound") {
 			return;
 		}
 		if (source !== undefined && source !== worker.client && source !== worker.pendingClient) {
@@ -8674,330 +8715,355 @@ export class DaemonSupervisor {
 		}
 		worker.lastFrameAt = Date.now();
 		this.clearRosterStaleness(worker);
-		const {
-			outboundType,
-			activeSessionId,
-			snapshotId: frameSnapshotId,
-			sessionEventType,
-			payloadEncoding,
-			snapshotPurpose,
-		} = frame.header;
-		if (outboundType === "roster_delta") {
-			this.consumeWorkerRosterDelta(worker, frame.payload, source);
+		const handler = this.workerFrameHandlers[header.outboundType];
+		if (handler) {
+			handler(worker, frame, header, source);
 			return;
 		}
-		if (outboundType === "roster_heartbeat") {
+		this.relayWorkerOutboundFrame(worker, frame, header);
+	}
+
+	private handleWorkerRosterDeltaFrame(
+		worker: ResidentWorker,
+		frame: PrivateFrame<DaemonWorkerFrameHeader>,
+		source?: DaemonWorkerClient,
+	): void {
+		this.consumeWorkerRosterDelta(worker, frame.payload, source);
+	}
+
+	private handleWorkerHeartbeatsChangedFrame(worker: ResidentWorker): void {
+		worker.heartbeatSnapshotStale = true;
+		this.broadcastHeartbeatsChanged();
+	}
+
+	private handleWorkerSnapshotBeginFrame(
+		worker: ResidentWorker,
+		frame: PrivateFrame<DaemonWorkerFrameHeader>,
+		header: DaemonWorkerOutboundFrameHeader,
+	): void {
+		const { activeSessionId, snapshotId: frameSnapshotId } = header;
+		if (!activeSessionId) {
 			return;
 		}
-		if (outboundType === "heartbeats_changed") {
-			worker.heartbeatSnapshotStale = true;
-			this.broadcastHeartbeatsChanged();
-			return;
-		}
-		if (outboundType === "session_snapshot_begin" && activeSessionId) {
-			try {
-				const begin = JSON.parse(frame.payload.toString("utf8")) as Extract<
-					DaemonOutbound,
-					{ type: "session_snapshot_begin" }
-				>;
-				if (
-					begin.type !== "session_snapshot_begin" ||
-					begin.activeSessionId !== activeSessionId ||
-					typeof begin.snapshotId !== "string" ||
-					(frameSnapshotId !== undefined && frameSnapshotId !== begin.snapshotId) ||
-					typeof begin.targetChunkBytes !== "number" ||
-					!begin.snapshot ||
-					!isSessionSummary(begin.snapshot.summary)
-				) {
-					throw new Error("Worker returned an invalid snapshot begin frame");
-				}
-				const publicSummary = this.publicSummary(worker, begin.snapshot.summary);
-				const snapshot = {
-					...begin.snapshot,
-					summary: publicSummary,
-					messages: [],
-				};
-				const result: DaemonAttachResult = {
-					protocol: DAEMON_PROTOCOL_INFO,
-					activeSessionId,
-					snapshot,
-					replay: {
-						status: "complete",
-						toSequence: snapshot.lastEventSequence,
-						...(snapshot.lastEventCursor ? { toCursor: snapshot.lastEventCursor } : {}),
-					},
-					lastEventSequence: snapshot.lastEventSequence,
-					...(snapshot.lastEventCursor ? { lastEventCursor: snapshot.lastEventCursor } : {}),
-					snapshotStream: {
-						id: begin.snapshotId,
-						messageCount: begin.messageCount,
-						targetChunkBytes: begin.targetChunkBytes,
-					},
-					client: { id: "supervisor", capabilities: ["chunked_snapshot"] },
-				};
-				const generations = this.snapshotGenerationsFor(worker, activeSessionId);
-				let generation = generations.get(begin.snapshotId);
-				if (generation?.incoming) {
-					this.failWorkerSnapshotCache(
-						worker,
-						activeSessionId,
-						new Error(`Snapshot ${begin.snapshotId} restarted before completion`),
-						true,
-						begin.snapshotId,
-					);
-					return;
-				}
-				// Snapshot summaries/state include live fields (for example activity and attached client
-				// counts) that can change without advancing the transcript sequence. Treat the stable
-				// transfer envelope as identity; duplicate chunks and end metadata are still byte-checked.
-				const duplicate =
-					generation?.transcript.complete === true &&
-					generation.end !== undefined &&
-					generation.result.snapshotStream?.messageCount === begin.messageCount &&
-					generation.result.snapshotStream?.targetChunkBytes === begin.targetChunkBytes &&
-					generation.result.lastEventSequence === result.lastEventSequence &&
-					generation.result.snapshot.lastEventSequence === result.snapshot.lastEventSequence &&
-					generation.result.snapshot.lastEventCursor?.generation === result.snapshot.lastEventCursor?.generation &&
-					generation.result.snapshot.lastEventCursor?.sequence === result.snapshot.lastEventCursor?.sequence;
-				if (generation?.transcript.complete && !duplicate) {
-					this.failWorkerSnapshotCache(
-						worker,
-						activeSessionId,
-						new Error(`Snapshot ${begin.snapshotId} did not match the cached transfer`),
-						true,
-						begin.snapshotId,
-					);
-					return;
-				}
-				const currentGeneration = this.currentSnapshotGeneration(worker, activeSessionId);
-				const currentResult = currentGeneration?.result ?? worker.snapshotCache.get(activeSessionId);
-				const isOlderThanCurrent =
-					currentGeneration !== undefined &&
-					currentGeneration.transcript.snapshotId !== begin.snapshotId &&
-					currentResult !== undefined &&
-					result.lastEventSequence < currentResult.lastEventSequence;
-				if (isOlderThanCurrent && !generation) {
-					return;
-				}
-				if (duplicate && generation) {
-					generation.incoming = true;
-					generation.duplicateChunkIndex = 0;
-					generation.duplicateResult = result;
-					generation.validation = this.createSnapshotDuplicateValidation();
-					if (currentGeneration === generation) {
-						worker.snapshotCache.delete(activeSessionId);
-					}
-					return;
-				}
-				if (
-					currentGeneration &&
-					currentGeneration.transcript.snapshotId !== begin.snapshotId &&
-					!isOlderThanCurrent
-				) {
-					if (!currentGeneration.transcript.complete && !currentGeneration.incoming) {
-						this.failWorkerSnapshotCache(
-							worker,
-							activeSessionId,
-							new Error(`Snapshot ${currentGeneration.transcript.snapshotId} was superseded`),
-							false,
-							currentGeneration.transcript.snapshotId,
-						);
-					} else {
-						this.retireWorkerSnapshotCache(worker, activeSessionId, currentGeneration.transcript);
-					}
-				}
-				if (!generation) {
-					const transcript = new SnapshotTranscriptCache({
-						activeSessionId,
-						snapshotId: begin.snapshotId,
-						cacheRoot: this.snapshotCacheRoot,
-						targetChunkBytes: begin.targetChunkBytes,
-					});
-					generation = {
-						transcript,
-						result,
-						incoming: false,
-						retired: isOlderThanCurrent,
-					};
-					this.snapshotGenerationsFor(worker, activeSessionId).set(begin.snapshotId, generation);
-				}
-				generation.result = result;
-				generation.begin = Buffer.from(frame.payload);
-				generation.end = undefined;
-				generation.incoming = true;
-				generation.duplicateChunkIndex = undefined;
-				generation.duplicateResult = undefined;
-				generation.validation = undefined;
-				if (!isOlderThanCurrent) {
-					generation.retired = false;
-					worker.transcriptCaches.set(activeSessionId, generation.transcript);
-					worker.snapshotCache.set(activeSessionId, result);
-				}
-			} catch (error) {
-				this.log(`Invalid worker snapshot begin frame: ${String(error)}`);
+		try {
+			const begin = JSON.parse(frame.payload.toString("utf8")) as Extract<
+				DaemonOutbound,
+				{ type: "session_snapshot_begin" }
+			>;
+			if (
+				begin.type !== "session_snapshot_begin" ||
+				begin.activeSessionId !== activeSessionId ||
+				typeof begin.snapshotId !== "string" ||
+				(frameSnapshotId !== undefined && frameSnapshotId !== begin.snapshotId) ||
+				typeof begin.targetChunkBytes !== "number" ||
+				!begin.snapshot ||
+				!isSessionSummary(begin.snapshot.summary)
+			) {
+				throw new Error("Worker returned an invalid snapshot begin frame");
+			}
+			const publicSummary = this.publicSummary(worker, begin.snapshot.summary);
+			const snapshot = {
+				...begin.snapshot,
+				summary: publicSummary,
+				messages: [],
+			};
+			const result: DaemonAttachResult = {
+				protocol: DAEMON_PROTOCOL_INFO,
+				activeSessionId,
+				snapshot,
+				replay: {
+					status: "complete",
+					toSequence: snapshot.lastEventSequence,
+					...(snapshot.lastEventCursor ? { toCursor: snapshot.lastEventCursor } : {}),
+				},
+				lastEventSequence: snapshot.lastEventSequence,
+				...(snapshot.lastEventCursor ? { lastEventCursor: snapshot.lastEventCursor } : {}),
+				snapshotStream: {
+					id: begin.snapshotId,
+					messageCount: begin.messageCount,
+					targetChunkBytes: begin.targetChunkBytes,
+				},
+				client: { id: "supervisor", capabilities: ["chunked_snapshot"] },
+			};
+			const generations = this.snapshotGenerationsFor(worker, activeSessionId);
+			let generation = generations.get(begin.snapshotId);
+			if (generation?.incoming) {
 				this.failWorkerSnapshotCache(
 					worker,
 					activeSessionId,
-					error instanceof Error ? error : new Error(String(error)),
+					new Error(`Snapshot ${begin.snapshotId} restarted before completion`),
 					true,
+					begin.snapshotId,
 				);
-			}
-			return;
-		}
-		if (outboundType === "session_snapshot_chunk" && activeSessionId) {
-			const snapshotId = frameSnapshotId ?? worker.transcriptCaches.get(activeSessionId)?.snapshotId;
-			if (!snapshotId) {
 				return;
 			}
-			const generation = this.snapshotGeneration(worker, activeSessionId, snapshotId);
-			if (generation?.incoming) {
-				try {
-					const duplicateIndex = generation.duplicateChunkIndex;
-					if (duplicateIndex === undefined) {
-						generation.transcript.appendEncodedChunk(Buffer.from(frame.payload));
-					} else {
-						const chunk = JSON.parse(frame.payload.toString("utf8")) as Extract<
-							DaemonOutbound,
-							{ type: "session_snapshot_chunk" }
-						>;
-						if (
-							chunk.type !== "session_snapshot_chunk" ||
-							chunk.activeSessionId !== activeSessionId ||
-							chunk.snapshotId !== generation.transcript.snapshotId ||
-							chunk.index !== duplicateIndex ||
-							!generation.transcript.readChunk(duplicateIndex).equals(Buffer.from(frame.payload))
-						) {
-							throw new Error(
-								`Duplicate snapshot ${generation.transcript.snapshotId} did not match cached bytes`,
-							);
-						}
-						generation.duplicateChunkIndex = duplicateIndex + 1;
-					}
-				} catch (error) {
+			// Snapshot summaries/state include live fields (for example activity and attached client
+			// counts) that can change without advancing the transcript sequence. Treat the stable
+			// transfer envelope as identity; duplicate chunks and end metadata are still byte-checked.
+			const duplicate =
+				generation?.transcript.complete === true &&
+				generation.end !== undefined &&
+				generation.result.snapshotStream?.messageCount === begin.messageCount &&
+				generation.result.snapshotStream?.targetChunkBytes === begin.targetChunkBytes &&
+				generation.result.lastEventSequence === result.lastEventSequence &&
+				generation.result.snapshot.lastEventSequence === result.snapshot.lastEventSequence &&
+				generation.result.snapshot.lastEventCursor?.generation === result.snapshot.lastEventCursor?.generation &&
+				generation.result.snapshot.lastEventCursor?.sequence === result.snapshot.lastEventCursor?.sequence;
+			if (generation?.transcript.complete && !duplicate) {
+				this.failWorkerSnapshotCache(
+					worker,
+					activeSessionId,
+					new Error(`Snapshot ${begin.snapshotId} did not match the cached transfer`),
+					true,
+					begin.snapshotId,
+				);
+				return;
+			}
+			const currentGeneration = this.currentSnapshotGeneration(worker, activeSessionId);
+			const currentResult = currentGeneration?.result ?? worker.snapshotCache.get(activeSessionId);
+			const isOlderThanCurrent =
+				currentGeneration !== undefined &&
+				currentGeneration.transcript.snapshotId !== begin.snapshotId &&
+				currentResult !== undefined &&
+				result.lastEventSequence < currentResult.lastEventSequence;
+			if (isOlderThanCurrent && !generation) {
+				return;
+			}
+			if (duplicate && generation) {
+				generation.incoming = true;
+				generation.duplicateChunkIndex = 0;
+				generation.duplicateResult = result;
+				generation.validation = this.createSnapshotDuplicateValidation();
+				if (currentGeneration === generation) {
+					worker.snapshotCache.delete(activeSessionId);
+				}
+				return;
+			}
+			if (currentGeneration && currentGeneration.transcript.snapshotId !== begin.snapshotId && !isOlderThanCurrent) {
+				if (!currentGeneration.transcript.complete && !currentGeneration.incoming) {
 					this.failWorkerSnapshotCache(
 						worker,
 						activeSessionId,
-						error instanceof Error ? error : new Error(String(error)),
-						true,
-						generation.transcript.snapshotId,
+						new Error(`Snapshot ${currentGeneration.transcript.snapshotId} was superseded`),
+						false,
+						currentGeneration.transcript.snapshotId,
 					);
+				} else {
+					this.retireWorkerSnapshotCache(worker, activeSessionId, currentGeneration.transcript);
 				}
 			}
+			if (!generation) {
+				const transcript = new SnapshotTranscriptCache({
+					activeSessionId,
+					snapshotId: begin.snapshotId,
+					cacheRoot: this.snapshotCacheRoot,
+					targetChunkBytes: begin.targetChunkBytes,
+				});
+				generation = {
+					transcript,
+					result,
+					incoming: false,
+					retired: isOlderThanCurrent,
+				};
+				this.snapshotGenerationsFor(worker, activeSessionId).set(begin.snapshotId, generation);
+			}
+			generation.result = result;
+			generation.begin = Buffer.from(frame.payload);
+			generation.end = undefined;
+			generation.incoming = true;
+			generation.duplicateChunkIndex = undefined;
+			generation.duplicateResult = undefined;
+			generation.validation = undefined;
+			if (!isOlderThanCurrent) {
+				generation.retired = false;
+				worker.transcriptCaches.set(activeSessionId, generation.transcript);
+				worker.snapshotCache.set(activeSessionId, result);
+			}
+		} catch (error) {
+			this.log(`Invalid worker snapshot begin frame: ${String(error)}`);
+			this.failWorkerSnapshotCache(
+				worker,
+				activeSessionId,
+				error instanceof Error ? error : new Error(String(error)),
+				true,
+			);
+		}
+	}
+
+	private handleWorkerSnapshotChunkFrame(
+		worker: ResidentWorker,
+		frame: PrivateFrame<DaemonWorkerFrameHeader>,
+		header: DaemonWorkerOutboundFrameHeader,
+	): void {
+		const { activeSessionId, snapshotId: frameSnapshotId } = header;
+		if (!activeSessionId) {
 			return;
 		}
-		if (outboundType === "session_snapshot_end" && activeSessionId) {
-			const snapshotId = frameSnapshotId ?? worker.transcriptCaches.get(activeSessionId)?.snapshotId;
-			if (!snapshotId) {
-				return;
-			}
-			const generation = this.snapshotGeneration(worker, activeSessionId, snapshotId);
-			if (!generation?.incoming) {
-				return;
-			}
-			const transcript = generation.transcript;
+		const snapshotId = frameSnapshotId ?? worker.transcriptCaches.get(activeSessionId)?.snapshotId;
+		if (!snapshotId) {
+			return;
+		}
+		const generation = this.snapshotGeneration(worker, activeSessionId, snapshotId);
+		if (generation?.incoming) {
 			try {
-				const duplicateChunkCount = generation.duplicateChunkIndex;
-				if (duplicateChunkCount === undefined) {
-					transcript.markComplete();
-					if (!generation.begin) {
-						throw new Error(`Snapshot ${transcript.snapshotId} has no begin frame`);
-					}
-					generation.end = Buffer.from(frame.payload);
+				const duplicateIndex = generation.duplicateChunkIndex;
+				if (duplicateIndex === undefined) {
+					generation.transcript.appendEncodedChunk(Buffer.from(frame.payload));
 				} else {
-					const end = JSON.parse(frame.payload.toString("utf8")) as Extract<
+					const chunk = JSON.parse(frame.payload.toString("utf8")) as Extract<
 						DaemonOutbound,
-						{ type: "session_snapshot_end" }
+						{ type: "session_snapshot_chunk" }
 					>;
 					if (
-						end.type !== "session_snapshot_end" ||
-						end.activeSessionId !== activeSessionId ||
-						end.snapshotId !== transcript.snapshotId ||
-						end.chunkCount !== duplicateChunkCount ||
-						end.chunkCount !== transcript.chunkCount ||
-						!generation.end?.equals(frame.payload)
+						chunk.type !== "session_snapshot_chunk" ||
+						chunk.activeSessionId !== activeSessionId ||
+						chunk.snapshotId !== generation.transcript.snapshotId ||
+						chunk.index !== duplicateIndex ||
+						!generation.transcript.readChunk(duplicateIndex).equals(Buffer.from(frame.payload))
 					) {
-						throw new Error(`Duplicate snapshot ${transcript.snapshotId} ended with different metadata`);
+						throw new Error(`Duplicate snapshot ${generation.transcript.snapshotId} did not match cached bytes`);
 					}
-					if (!generation.duplicateResult) {
-						throw new Error(`Duplicate snapshot ${transcript.snapshotId} has no result`);
-					}
-					generation.result = generation.duplicateResult;
-					if (worker.transcriptCaches.get(activeSessionId) === transcript) {
-						worker.snapshotCache.set(activeSessionId, generation.duplicateResult);
-					}
-					this.settleSnapshotDuplicateValidation(generation);
+					generation.duplicateChunkIndex = duplicateIndex + 1;
 				}
-				generation.incoming = false;
-				generation.duplicateChunkIndex = undefined;
-				generation.duplicateResult = undefined;
 			} catch (error) {
 				this.failWorkerSnapshotCache(
 					worker,
 					activeSessionId,
 					error instanceof Error ? error : new Error(String(error)),
 					true,
-					transcript.snapshotId,
+					generation.transcript.snapshotId,
 				);
-				return;
 			}
-			const published = worker.transcriptCaches.get(activeSessionId) === transcript;
-			if (generation.retired) {
-				this.deleteSnapshotGeneration(worker, activeSessionId, generation);
-				transcript.dispose();
-			}
-			if (published && (snapshotPurpose === "replacement" || snapshotPurpose === "catchup")) {
-				this.queueSnapshotResync(activeSessionId, snapshotPurpose);
-			}
+		}
+	}
+
+	private handleWorkerSnapshotEndFrame(
+		worker: ResidentWorker,
+		frame: PrivateFrame<DaemonWorkerFrameHeader>,
+		header: DaemonWorkerOutboundFrameHeader,
+	): void {
+		const { activeSessionId, snapshotId: frameSnapshotId, snapshotPurpose } = header;
+		if (!activeSessionId) {
 			return;
 		}
-		if (outboundType === "session_snapshot_failed" && activeSessionId) {
-			try {
-				const failed = JSON.parse(frame.payload.toString("utf8")) as Extract<
+		const snapshotId = frameSnapshotId ?? worker.transcriptCaches.get(activeSessionId)?.snapshotId;
+		if (!snapshotId) {
+			return;
+		}
+		const generation = this.snapshotGeneration(worker, activeSessionId, snapshotId);
+		if (!generation?.incoming) {
+			return;
+		}
+		const transcript = generation.transcript;
+		try {
+			const duplicateChunkCount = generation.duplicateChunkIndex;
+			if (duplicateChunkCount === undefined) {
+				transcript.markComplete();
+				if (!generation.begin) {
+					throw new Error(`Snapshot ${transcript.snapshotId} has no begin frame`);
+				}
+				generation.end = Buffer.from(frame.payload);
+			} else {
+				const end = JSON.parse(frame.payload.toString("utf8")) as Extract<
 					DaemonOutbound,
-					{ type: "session_snapshot_failed" }
+					{ type: "session_snapshot_end" }
 				>;
 				if (
-					failed.type !== "session_snapshot_failed" ||
-					failed.activeSessionId !== activeSessionId ||
-					typeof failed.snapshotId !== "string" ||
-					typeof failed.error !== "string" ||
-					(frameSnapshotId !== undefined && frameSnapshotId !== failed.snapshotId)
+					end.type !== "session_snapshot_end" ||
+					end.activeSessionId !== activeSessionId ||
+					end.snapshotId !== transcript.snapshotId ||
+					end.chunkCount !== duplicateChunkCount ||
+					end.chunkCount !== transcript.chunkCount ||
+					!generation.end?.equals(frame.payload)
 				) {
-					throw new Error("Worker returned an invalid snapshot failure frame");
+					throw new Error(`Duplicate snapshot ${transcript.snapshotId} ended with different metadata`);
 				}
-				const currentGeneration = this.currentSnapshotGeneration(worker, activeSessionId);
-				const generation =
-					this.snapshotGeneration(worker, activeSessionId, failed.snapshotId) ??
-					(currentGeneration?.transcript.snapshotId === failed.snapshotId ? currentGeneration : undefined);
-				if (!generation) {
-					return;
+				if (!generation.duplicateResult) {
+					throw new Error(`Duplicate snapshot ${transcript.snapshotId} has no result`);
 				}
-				this.failSnapshotTransfer(
-					worker,
-					activeSessionId,
-					failed.snapshotId,
-					new Error(failed.error),
-					snapshotPurpose,
-				);
-			} catch (error) {
-				this.failWorkerSnapshotCache(
-					worker,
-					activeSessionId,
-					error instanceof Error ? error : new Error(String(error)),
-					true,
-				);
+				generation.result = generation.duplicateResult;
+				if (worker.transcriptCaches.get(activeSessionId) === transcript) {
+					worker.snapshotCache.set(activeSessionId, generation.duplicateResult);
+				}
+				this.settleSnapshotDuplicateValidation(generation);
 			}
+			generation.incoming = false;
+			generation.duplicateChunkIndex = undefined;
+			generation.duplicateResult = undefined;
+		} catch (error) {
+			this.failWorkerSnapshotCache(
+				worker,
+				activeSessionId,
+				error instanceof Error ? error : new Error(String(error)),
+				true,
+				transcript.snapshotId,
+			);
 			return;
 		}
-		if (
-			outboundType === "daemon_hello" ||
-			outboundType === "response" ||
-			outboundType === "session_list_progress" ||
-			outboundType === "session_list_item" ||
-			outboundType === "session_attached" ||
-			outboundType === "session_detached" ||
-			!activeSessionId
-		) {
+		const published = worker.transcriptCaches.get(activeSessionId) === transcript;
+		if (generation.retired) {
+			this.deleteSnapshotGeneration(worker, activeSessionId, generation);
+			transcript.dispose();
+		}
+		if (published && (snapshotPurpose === "replacement" || snapshotPurpose === "catchup")) {
+			this.queueSnapshotResync(activeSessionId, snapshotPurpose);
+		}
+	}
+
+	private handleWorkerSnapshotFailedFrame(
+		worker: ResidentWorker,
+		frame: PrivateFrame<DaemonWorkerFrameHeader>,
+		header: DaemonWorkerOutboundFrameHeader,
+	): void {
+		const { activeSessionId, snapshotId: frameSnapshotId, snapshotPurpose } = header;
+		if (!activeSessionId) {
+			return;
+		}
+		try {
+			const failed = JSON.parse(frame.payload.toString("utf8")) as Extract<
+				DaemonOutbound,
+				{ type: "session_snapshot_failed" }
+			>;
+			if (
+				failed.type !== "session_snapshot_failed" ||
+				failed.activeSessionId !== activeSessionId ||
+				typeof failed.snapshotId !== "string" ||
+				typeof failed.error !== "string" ||
+				(frameSnapshotId !== undefined && frameSnapshotId !== failed.snapshotId)
+			) {
+				throw new Error("Worker returned an invalid snapshot failure frame");
+			}
+			const currentGeneration = this.currentSnapshotGeneration(worker, activeSessionId);
+			const generation =
+				this.snapshotGeneration(worker, activeSessionId, failed.snapshotId) ??
+				(currentGeneration?.transcript.snapshotId === failed.snapshotId ? currentGeneration : undefined);
+			if (!generation) {
+				return;
+			}
+			this.failSnapshotTransfer(
+				worker,
+				activeSessionId,
+				failed.snapshotId,
+				new Error(failed.error),
+				snapshotPurpose,
+			);
+		} catch (error) {
+			this.failWorkerSnapshotCache(
+				worker,
+				activeSessionId,
+				error instanceof Error ? error : new Error(String(error)),
+				true,
+			);
+		}
+	}
+
+	private relayWorkerOutboundFrame(
+		worker: ResidentWorker,
+		frame: PrivateFrame<DaemonWorkerFrameHeader>,
+		header: DaemonWorkerOutboundFrameHeader,
+	): void {
+		const { outboundType, activeSessionId, sessionEventType, payloadEncoding } = header;
+		if (!activeSessionId) {
 			return;
 		}
 		let publicPayload = frame.payload;

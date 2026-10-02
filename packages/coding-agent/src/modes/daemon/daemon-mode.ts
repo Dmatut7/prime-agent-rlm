@@ -758,6 +758,16 @@ export async function runDaemonMode(options: DaemonModeOptions): Promise<never> 
 	return new Promise(() => {});
 }
 
+type AgentDaemonCommandHandler<K extends DaemonCommand["type"] = DaemonCommand["type"]> = (
+	client: DaemonSocketClient,
+	command: Extract<DaemonCommand, { type: K }>,
+	onPromptHandlerOwnsAdmission: () => void,
+) => Promise<DaemonResponse | undefined>;
+
+type AgentDaemonCommandHandlers = {
+	[K in DaemonCommand["type"]]?: AgentDaemonCommandHandler<K>;
+};
+
 export class AgentDaemon {
 	private server?: Server;
 	private shuttingDown = false;
@@ -4752,6 +4762,124 @@ export class AgentDaemon {
 		}
 	}
 
+	private commandHandlersCache?: AgentDaemonCommandHandlers;
+
+	/**
+	 * Commands the worker answers itself, keyed by command type. Supervisor-only
+	 * DaemonCommand types have no entry and fall through unanswered, matching the
+	 * old switch's missing default. Built lazily because prototype-only test
+	 * harnesses never run the constructor, so a field initializer would leave
+	 * them without a table.
+	 */
+	private get commandHandlers(): AgentDaemonCommandHandlers {
+		this.commandHandlersCache ??= {
+			ack_result: () => this.handleAckResult(),
+			list: (_client, command) => this.handleList(command),
+			list_saved_sessions: (client, command) => this.handleListSavedSessions(client, command),
+			create: (_client, command) => this.handleCreate(command),
+			attach: (client, command) => this.handleAttach(client, command),
+			detach: (client, command) => this.handleDetach(client, command),
+			kill: (_client, command) => this.handleKill(command),
+			rename: (_client, command) => this.handleRename(command),
+			rename_saved_session: (_client, command) => this.handleRenameSavedSession(command),
+			delete_saved_session: (_client, command) => this.handleDeleteSavedSession(command),
+			cancel_prompt_admission: (_client, command) => this.handleCancelPromptAdmission(command),
+			prompt: (client, command, onPromptHandlerOwnsAdmission) =>
+				this.handlePrompt(client, command, onPromptHandlerOwnsAdmission),
+			prompt_and_wait: (client, command, onPromptHandlerOwnsAdmission) =>
+				this.handlePrompt(client, command, onPromptHandlerOwnsAdmission),
+			steer: (_client, command) => this.handleSteer(command),
+			follow_up: (_client, command) => this.handleFollowUp(command),
+			restore_next_turn: (_client, command) => this.handleRestoreNextTurn(command),
+			restore_actions: (_client, command) => this.handleRestoreActions(command),
+			append_custom_message: (_client, command) => this.handleAppendCustomMessage(command),
+			resume_queue: (_client, command) => this.handleResumeQueue(command),
+			send_message: (client, command) => this.handleSendMessage(client, command),
+			agent_messages_status: (_client, command) => this.handleAgentMessagesStatus(command),
+			agent_messages_pause: (_client, command) => this.handleAgentMessagesPause(command),
+			agent_messages_resume: (_client, command) => this.handleAgentMessagesResume(command),
+			agent_messages_clear: (_client, command) => this.handleAgentMessagesClear(command),
+			abort: (_client, command) => this.handleAbort(command),
+			abort_and_send_queued: (_client, command) => this.handleAbortAndSendQueued(command),
+			start_side_question: (client, command) => this.handleStartSideQuestion(client, command),
+			abort_side_question: (client, command) => this.handleAbortSideQuestion(client, command),
+			execute_bash: (_client, command) => this.handleExecuteBash(command),
+			execute_bash_and_wait: (_client, command) => this.handleExecuteBashAndWait(command),
+			abort_bash: (_client, command) => this.handleAbortBash(command),
+			cancel_rlm_child: (_client, command) => this.handleCancelRlmChild(command),
+			delete_rlm_subagent: (_client, command) => this.handleDeleteRlmSubagent(command),
+			acquire_session_input_pause: (client, command) => this.handleAcquireSessionInputPause(client, command),
+			release_session_input_pause: (client, command) => this.handleReleaseSessionInputPause(client, command),
+			wait_for_idle: (_client, command) => this.handleWaitForIdle(command),
+			wait_for_headless_completion: (_client, command) => this.handleWaitForHeadlessCompletion(command),
+			get_session_header: (_client, command) => this.handleGetSessionHeader(command),
+			get_state: (_client, command) => this.handleGetState(command),
+			get_connection_state: (_client, command) => this.handleGetConnectionState(command),
+			get_messages: (_client, command) => this.handleGetMessages(command),
+			get_rlm_children: (_client, command) => this.handleGetRlmChildren(command),
+			get_session_stats: (_client, command) => this.handleGetSessionStats(command),
+			get_context_tree: (_client, command) => this.handleGetContextTree(command),
+			get_commands: (_client, command) => this.handleGetCommands(command),
+			get_resource_snapshot: (_client, command) => this.handleGetResourceSnapshot(command),
+			replace_acp_mcp_servers: (client, command) => this.handleReplaceAcpMcpServers(client, command),
+			get_available_models: (_client, command) => this.handleGetAvailableModels(command),
+			get_model_catalog: (_client, command) => this.handleGetModelCatalog(command),
+			get_queue: (_client, command) => this.handleGetQueue(command),
+			mutate_queued_message: (_client, command) => this.handleMutateQueuedMessage(command),
+			clear_queue: (_client, command) => this.handleClearQueue(command),
+			abort_and_clear_queue: (_client, command) => this.handleAbortAndClearQueue(command),
+			cron_list: (_client, command) => this.handleCronList(command),
+			heartbeats_list: (_client, command) => this.handleHeartbeatsList(command),
+			heartbeat_manage: (_client, command) => this.handleHeartbeatManage(command),
+			cron_add: (_client, command) => this.handleCronAdd(command),
+			cron_cancel: (_client, command) => this.handleCronCancel(command),
+			heartbeat_get: (_client, command) => this.handleHeartbeatGet(command),
+			heartbeat_set: (_client, command) => this.handleHeartbeatSet(command),
+			heartbeat_update: (_client, command) => this.handleHeartbeatUpdate(command),
+			set_model: (_client, command) => this.handleSetModel(command),
+			cycle_model: (_client, command) => this.handleCycleModel(command),
+			set_scoped_models: (_client, command) => this.handleSetScopedModels(command),
+			set_thinking_level: (_client, command) => this.handleSetThinkingLevel(command),
+			set_service_tier: (_client, command) => this.handleSetServiceTier(command),
+			cycle_thinking_level: (_client, command) => this.handleCycleThinkingLevel(command),
+			set_transport: (_client, command) => this.handleSetTransport(command),
+			set_steering_mode: (_client, command) => this.handleSetSteeringMode(command),
+			set_follow_up_mode: (_client, command) => this.handleSetFollowUpMode(command),
+			set_auto_compaction: (_client, command) => this.handleSetAutoCompaction(command),
+			set_auto_retry: (_client, command) => this.handleSetAutoRetry(command),
+			compact: (_client, command) => this.handleCompact(command),
+			refine: (_client, command) => this.handleRefine(command),
+			abort_compaction: (_client, command) => this.handleAbortCompaction(command),
+			abort_branch_summary: (_client, command) => this.handleAbortBranchSummary(command),
+			abort_retry: (_client, command) => this.handleAbortRetry(command),
+			reload: (_client, command) => this.handleReload(command),
+			new_session: (_client, command) => this.handleNewSession(command),
+			switch_session: (_client, command) => this.handleSwitchSession(command),
+			fork: (_client, command) => this.handleFork(command),
+			navigate_tree: (_client, command) => this.handleNavigateTree(command),
+			import_jsonl: (_client, command) => this.handleImportJsonl(command),
+			export_html: (_client, command) => this.handleExportHtml(command),
+			export_jsonl: (_client, command) => this.handleExportJsonl(command),
+			set_session_name: (_client, command) => this.handleSetSessionName(command),
+			get_rlm_max_depth_status: (_client, command) => this.handleGetRlmMaxDepthStatus(command),
+			set_rlm_max_depth: (_client, command) => this.handleSetRlmMaxDepth(command),
+			get_session_context: (_client, command) => this.handleGetSessionContext(command),
+			get_session_tree: (_client, command) => this.handleGetSessionTree(command),
+			get_user_messages_for_forking: (_client, command) => this.handleGetUserMessagesForForking(command),
+			get_last_assistant_text: (_client, command) => this.handleGetLastAssistantText(command),
+			get_system_prompt: (_client, command) => this.handleGetSystemPrompt(command),
+			get_tool_definition: (_client, command) => this.handleGetToolDefinition(command),
+			set_session_entry_label: (_client, command) => this.handleSetSessionEntryLabel(command),
+			extension_ui_response: (_client, command) => this.handleExtensionUiResponse(command),
+			declare_client_capabilities: (client, command) => this.handleDeclareClientCapabilities(client, command),
+			prepare_update_restart: (_client, command) => this.handlePrepareUpdateRestart(command),
+			retry_worker: () => this.handleRetryWorker(),
+			restart: (_client, command) => this.handleRestart(command),
+			shutdown: (_client, command) => this.handleShutdown(command),
+		};
+		return this.commandHandlersCache;
+	}
+
 	private async handleCommand(
 		client: DaemonSocketClient,
 		command: DaemonCommand,
@@ -4773,1342 +4901,1521 @@ export class AgentDaemon {
 				);
 			}
 		}
-		switch (command.type) {
-			case "ack_result":
-				return undefined;
-			case "list": {
-				const activeSessions = Array.from(this.sessions.values());
-				const scheduledJobs = this.cronStore.list();
-				const listSessionDir = command.sessionDir ?? this.options.defaultSessionConfig.sessionDir;
-				let savedSessions: SessionInfo[] = [];
-				if (command.all) {
-					savedSessions = command.cwd
-						? await SessionManager.list(resolve(command.cwd), listSessionDir)
-						: listSessionDir !== undefined
-							? await SessionManager.listAll(undefined, listSessionDir)
-							: await SessionManager.listAll();
-				}
-				const sessions = await this.buildSessionListWithPassiveRlmSubagents(
-					activeSessions,
-					savedSessions,
-					scheduledJobs,
-				);
-				return success(command.id, "list", {
-					sessions: command.omitStreamingMessages ? sessions.map(summaryWithoutStreamingMessage) : sessions,
-				});
-			}
+		const handler = this.commandHandlers[command.type] as AgentDaemonCommandHandler | undefined;
+		if (handler) {
+			return handler(client, command, onPromptHandlerOwnsAdmission);
+		}
+		return undefined;
+	}
 
-			case "list_saved_sessions": {
-				let activeSessionId: string | undefined;
-				let cwd: string;
-				let sessionDir: string | undefined;
-				if ("activeSessionId" in command) {
-					activeSessionId = command.activeSessionId;
-					const sessionManager = this.getSessionState(activeSessionId).runtime.session.sessionManager;
-					cwd = sessionManager.getCwd();
-					sessionDir = sessionManager.getSessionDir();
-				} else {
-					cwd = resolve(command.cwd);
-					sessionDir = command.sessionDir;
-				}
-				const callbacks = command.id
-					? {
-							onProgress: (loaded: number, total: number) => {
-								this.write(client, {
-									id: command.id,
-									type: "session_list_progress",
-									command: "list_saved_sessions",
-									...(activeSessionId ? { activeSessionId } : {}),
-									loaded,
-									total,
-								});
-							},
-							onSession: (session: SessionInfo) => {
-								this.write(client, {
-									id: command.id,
-									type: "session_list_item",
-									command: "list_saved_sessions",
-									...(activeSessionId ? { activeSessionId } : {}),
-									session: serializeSavedSessionInfo(session),
-								});
-							},
-						}
-					: undefined;
-				const savedSessions =
-					command.scope === "current"
-						? await SessionManager.list(cwd, sessionDir, callbacks)
-						: await SessionManager.listAll(callbacks, sessionDir);
-				const sessions = await withPassiveRlmDescendantInfos(savedSessions, this.rlmSpawnLedgerFor(sessionDir), {
-					...(command.scope === "current" ? { cwd } : {}),
-					...(callbacks ? { onSession: callbacks.onSession } : {}),
-					log: (message) => this.log(message),
-				});
-				return success(command.id, "list_saved_sessions", {
-					sessions: sessions.map(serializeSavedSessionInfo),
-				});
-			}
+	private async handleAckResult(): Promise<DaemonResponse | undefined> {
+		return undefined;
+	}
 
-			case "create": {
-				const state = await this.createRuntime(command);
-				return success(command.id, "create", summaryForActiveSession(state));
-			}
+	private async handleList(command: Extract<DaemonCommand, { type: "list" }>): Promise<DaemonResponse | undefined> {
+		const activeSessions = Array.from(this.sessions.values());
+		const scheduledJobs = this.cronStore.list();
+		const listSessionDir = command.sessionDir ?? this.options.defaultSessionConfig.sessionDir;
+		let savedSessions: SessionInfo[] = [];
+		if (command.all) {
+			savedSessions = command.cwd
+				? await SessionManager.list(resolve(command.cwd), listSessionDir)
+				: listSessionDir !== undefined
+					? await SessionManager.listAll(undefined, listSessionDir)
+					: await SessionManager.listAll();
+		}
+		const sessions = await this.buildSessionListWithPassiveRlmSubagents(activeSessions, savedSessions, scheduledJobs);
+		return success(command.id, "list", {
+			sessions: command.omitStreamingMessages ? sessions.map(summaryWithoutStreamingMessage) : sessions,
+		});
+	}
 
-			case "attach": {
-				const state = await this.getOrHydrateBoundSessionState(command.activeSessionId);
-				if (command.clientId) {
-					client.id = command.clientId;
-				}
-				setDaemonClientSessionCapabilities(
-					client,
-					state.activeSessionId,
-					normalizeClientCapabilities(command.capabilities, command.supportsExtensionUi),
-				);
-				const streamsSnapshot =
-					client.transport === "private-framed" &&
-					daemonClientCapabilitiesForSession(client, state.activeSessionId).has("chunked_snapshot");
-				// Attach is admitted during update-restart preparation as a read. Env
-				// adoption remains safe while mutations are only draining; after fencing,
-				// defer it until rollback so the checkpoint never omits a live identity.
-				const clientEnv = filterClientEnv(command.env);
-				const deferClientEnv = this.updateRestart && this.updateRestart.phase !== "preparing";
-				if (!deferClientEnv) this.adoptClientEnv(state, clientEnv);
-				const snapshotSignal = streamsSnapshot
-					? markClientSnapshotStreaming(client, state.activeSessionId)
-					: undefined;
-				let result: DaemonAttachResult;
-				state.pendingAttaches++;
-				try {
-					result = await this.createAttachResult(client, state, command);
-					if (
-						this.sessions.get(state.activeSessionId) !== state ||
-						this.closingSessions.has(state.activeSessionId)
-					) {
-						throw new BoundSessionUnavailableError(
-							`Active session ${state.activeSessionId} closed during attach`,
-						);
-					}
-				} catch (error) {
-					removeDaemonClientSessionCapabilities(client, state.activeSessionId);
-					if (streamsSnapshot) {
-						finishClientSnapshotStreaming(client, state.activeSessionId);
-					}
-					throw error;
-				} finally {
-					state.pendingAttaches--;
-				}
-				state.clients.add(client);
-				client.attachedActiveSessionIds.add(state.activeSessionId);
-				// Carrier-less mutation: a direct viewer changes directAttachedClients with no session event.
-				if (client.authenticationRole === "session_client") this.scheduleRosterFlush();
-				if (deferClientEnv && clientEnv) {
-					this.updateRestart?.deferredClientEnv.push({
-						client,
-						state,
-						env: clientEnv,
-					});
-				}
-				if (streamsSnapshot) {
-					const snapshotId = this.nextSnapshotId(state);
-					let transcript: SnapshotTranscriptChunkSource;
-					try {
-						transcript = createSnapshotTranscriptChunks({
-							activeSessionId: state.activeSessionId,
-							snapshotId,
-							messages: result.snapshot.messages,
-							serializedMessages: this.serializedTranscriptFor(state, result.snapshot.messages),
-							targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
-							signal: snapshotSignal,
+	private async handleListSavedSessions(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "list_saved_sessions" }>,
+	): Promise<DaemonResponse | undefined> {
+		let activeSessionId: string | undefined;
+		let cwd: string;
+		let sessionDir: string | undefined;
+		if ("activeSessionId" in command) {
+			activeSessionId = command.activeSessionId;
+			const sessionManager = this.getSessionState(activeSessionId).runtime.session.sessionManager;
+			cwd = sessionManager.getCwd();
+			sessionDir = sessionManager.getSessionDir();
+		} else {
+			cwd = resolve(command.cwd);
+			sessionDir = command.sessionDir;
+		}
+		const callbacks = command.id
+			? {
+					onProgress: (loaded: number, total: number) => {
+						this.write(client, {
+							id: command.id,
+							type: "session_list_progress",
+							command: "list_saved_sessions",
+							...(activeSessionId ? { activeSessionId } : {}),
+							loaded,
+							total,
 						});
-					} catch (error) {
-						state.clients.delete(client);
-						client.attachedActiveSessionIds.delete(state.activeSessionId);
-						removeDaemonClientSessionCapabilities(client, state.activeSessionId);
-						finishClientSnapshotStreaming(client, state.activeSessionId);
-						throw error;
-					}
-					const streamedResult: DaemonAttachResult = {
-						...result,
-						messages: result.messages ? [] : undefined,
-						snapshot: { ...result.snapshot, messages: [] },
-						snapshotStream: {
-							id: snapshotId,
-							messageCount: result.snapshot.messages.length,
-							targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
-						},
-					};
-					setImmediate(() => {
-						void this.streamWorkerSnapshot(client, streamedResult, transcript, "attach", snapshotSignal, true)
-							.catch((error) => this.log(`could not stream attach snapshot: ${String(error)}`))
-							.finally(() => this.announceQuotaParkAfterAttach(state));
-					});
-					return success(command.id, "attach", streamedResult);
+					},
+					onSession: (session: SessionInfo) => {
+						this.write(client, {
+							id: command.id,
+							type: "session_list_item",
+							command: "list_saved_sessions",
+							...(activeSessionId ? { activeSessionId } : {}),
+							session: serializeSavedSessionInfo(session),
+						});
+					},
 				}
-				// Slim clients consume only the command response; legacy clients (e.g.
-				// the plain daemon attach REPL) read state/messages off this event.
-				// Skipping it for slim clients halves the attach payload.
-				if (result.state && result.messages) {
-					this.write(client, {
-						type: "session_attached",
-						activeSessionId: state.activeSessionId,
-						state: result.state,
-						messages: result.messages,
-						snapshot: result.snapshot,
-						replay: result.replay,
-						lastEventSequence: result.lastEventSequence,
-					});
-				}
-				// R3-3: announce an active park once the attach response has landed,
-				// so the client does not wait out the next heartbeat sweep for it.
-				// Deferred past the response write (and, above, past the snapshot
-				// stream): a broadcast while this client is still streaming its
-				// snapshot would queue a whole catch-up resync for it instead.
-				setImmediate(() => this.announceQuotaParkAfterAttach(state));
-				return success(command.id, "attach", result);
-			}
+			: undefined;
+		const savedSessions =
+			command.scope === "current"
+				? await SessionManager.list(cwd, sessionDir, callbacks)
+				: await SessionManager.listAll(callbacks, sessionDir);
+		const sessions = await withPassiveRlmDescendantInfos(savedSessions, this.rlmSpawnLedgerFor(sessionDir), {
+			...(command.scope === "current" ? { cwd } : {}),
+			...(callbacks ? { onSession: callbacks.onSession } : {}),
+			log: (message) => this.log(message),
+		});
+		return success(command.id, "list_saved_sessions", {
+			sessions: sessions.map(serializeSavedSessionInfo),
+		});
+	}
 
-			case "detach": {
-				if (command.activeSessionId) {
-					const state = this.getSessionState(command.activeSessionId);
-					for (const [pauseId, entry] of this.sessionInputPauses) {
-						if (entry.owner !== client || entry.activeSessionId !== command.activeSessionId) continue;
-						entry.pause.release();
-						this.sessionInputPauses.delete(pauseId);
-					}
-					this.detachClientFromSession(client, state);
-				} else {
-					for (const [pauseId, entry] of this.sessionInputPauses) {
-						if (entry.owner !== client) continue;
-						entry.pause.release();
-						this.sessionInputPauses.delete(pauseId);
-					}
-					this.detachClient(client);
-				}
-				return success(command.id, "detach");
-			}
+	private async handleCreate(
+		command: Extract<DaemonCommand, { type: "create" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = await this.createRuntime(command);
+		return success(command.id, "create", summaryForActiveSession(state));
+	}
 
-			case "kill": {
-				const state = this.getSessionState(command.activeSessionId);
-				await this.closeSession(state, "killed");
-				return success(command.id, "kill");
+	private async handleAttach(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "attach" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = await this.getOrHydrateBoundSessionState(command.activeSessionId);
+		if (command.clientId) {
+			client.id = command.clientId;
+		}
+		setDaemonClientSessionCapabilities(
+			client,
+			state.activeSessionId,
+			normalizeClientCapabilities(command.capabilities, command.supportsExtensionUi),
+		);
+		const streamsSnapshot =
+			client.transport === "private-framed" &&
+			daemonClientCapabilitiesForSession(client, state.activeSessionId).has("chunked_snapshot");
+		// Attach is admitted during update-restart preparation as a read. Env
+		// adoption remains safe while mutations are only draining; after fencing,
+		// defer it until rollback so the checkpoint never omits a live identity.
+		const clientEnv = filterClientEnv(command.env);
+		const deferClientEnv = this.updateRestart && this.updateRestart.phase !== "preparing";
+		if (!deferClientEnv) this.adoptClientEnv(state, clientEnv);
+		const snapshotSignal = streamsSnapshot ? markClientSnapshotStreaming(client, state.activeSessionId) : undefined;
+		let result: DaemonAttachResult;
+		state.pendingAttaches++;
+		try {
+			result = await this.createAttachResult(client, state, command);
+			if (this.sessions.get(state.activeSessionId) !== state || this.closingSessions.has(state.activeSessionId)) {
+				throw new BoundSessionUnavailableError(`Active session ${state.activeSessionId} closed during attach`);
 			}
-
-			case "rename": {
-				const state = this.getSessionState(command.activeSessionId);
-				const name = command.name.trim();
-				if (!name) {
-					throw new Error("Session name cannot be empty");
-				}
-				await this.setStateSessionNameForCommand(state, name);
-				return success(command.id, "rename", summaryForActiveSession(state));
+		} catch (error) {
+			removeDaemonClientSessionCapabilities(client, state.activeSessionId);
+			if (streamsSnapshot) {
+				finishClientSnapshotStreaming(client, state.activeSessionId);
 			}
+			throw error;
+		} finally {
+			state.pendingAttaches--;
+		}
+		state.clients.add(client);
+		client.attachedActiveSessionIds.add(state.activeSessionId);
+		// Carrier-less mutation: a direct viewer changes directAttachedClients with no session event.
+		if (client.authenticationRole === "session_client") this.scheduleRosterFlush();
+		if (deferClientEnv && clientEnv) {
+			this.updateRestart?.deferredClientEnv.push({
+				client,
+				state,
+				env: clientEnv,
+			});
+		}
+		if (streamsSnapshot) {
+			const snapshotId = this.nextSnapshotId(state);
+			let transcript: SnapshotTranscriptChunkSource;
+			try {
+				transcript = createSnapshotTranscriptChunks({
+					activeSessionId: state.activeSessionId,
+					snapshotId,
+					messages: result.snapshot.messages,
+					serializedMessages: this.serializedTranscriptFor(state, result.snapshot.messages),
+					targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
+					signal: snapshotSignal,
+				});
+			} catch (error) {
+				state.clients.delete(client);
+				client.attachedActiveSessionIds.delete(state.activeSessionId);
+				removeDaemonClientSessionCapabilities(client, state.activeSessionId);
+				finishClientSnapshotStreaming(client, state.activeSessionId);
+				throw error;
+			}
+			const streamedResult: DaemonAttachResult = {
+				...result,
+				messages: result.messages ? [] : undefined,
+				snapshot: { ...result.snapshot, messages: [] },
+				snapshotStream: {
+					id: snapshotId,
+					messageCount: result.snapshot.messages.length,
+					targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
+				},
+			};
+			setImmediate(() => {
+				void this.streamWorkerSnapshot(client, streamedResult, transcript, "attach", snapshotSignal, true)
+					.catch((error) => this.log(`could not stream attach snapshot: ${String(error)}`))
+					.finally(() => this.announceQuotaParkAfterAttach(state));
+			});
+			return success(command.id, "attach", streamedResult);
+		}
+		// Slim clients consume only the command response; legacy clients (e.g.
+		// the plain daemon attach REPL) read state/messages off this event.
+		// Skipping it for slim clients halves the attach payload.
+		if (result.state && result.messages) {
+			this.write(client, {
+				type: "session_attached",
+				activeSessionId: state.activeSessionId,
+				state: result.state,
+				messages: result.messages,
+				snapshot: result.snapshot,
+				replay: result.replay,
+				lastEventSequence: result.lastEventSequence,
+			});
+		}
+		// R3-3: announce an active park once the attach response has landed,
+		// so the client does not wait out the next heartbeat sweep for it.
+		// Deferred past the response write (and, above, past the snapshot
+		// stream): a broadcast while this client is still streaming its
+		// snapshot would queue a whole catch-up resync for it instead.
+		setImmediate(() => this.announceQuotaParkAfterAttach(state));
+		return success(command.id, "attach", result);
+	}
 
-			case "rename_saved_session": {
-				if (command.activeSessionId) {
-					this.getSessionState(command.activeSessionId);
-				}
-				const state = this.findActiveSessionByFile(command.sessionPath);
-				const name = command.name.trim();
-				if (!name) {
-					throw new Error("Session name cannot be empty");
-				}
-				if (state) {
-					await this.setStateSessionNameForCommand(state, name);
-				} else {
-					const info = await readSessionInfo(command.sessionPath);
-					if (!info) throw new Error(`Session not found: ${command.sessionPath}`);
-					const depth = info.rlmDepth ?? 0;
-					await this.withSessionNameReservation(
+	private async handleDetach(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "detach" }>,
+	): Promise<DaemonResponse | undefined> {
+		if (command.activeSessionId) {
+			const state = this.getSessionState(command.activeSessionId);
+			for (const [pauseId, entry] of this.sessionInputPauses) {
+				if (entry.owner !== client || entry.activeSessionId !== command.activeSessionId) continue;
+				entry.pause.release();
+				this.sessionInputPauses.delete(pauseId);
+			}
+			this.detachClientFromSession(client, state);
+		} else {
+			for (const [pauseId, entry] of this.sessionInputPauses) {
+				if (entry.owner !== client) continue;
+				entry.pause.release();
+				this.sessionInputPauses.delete(pauseId);
+			}
+			this.detachClient(client);
+		}
+		return success(command.id, "detach");
+	}
+
+	private async handleKill(command: Extract<DaemonCommand, { type: "kill" }>): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		await this.closeSession(state, "killed");
+		return success(command.id, "kill");
+	}
+
+	private async handleRename(
+		command: Extract<DaemonCommand, { type: "rename" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const name = command.name.trim();
+		if (!name) {
+			throw new Error("Session name cannot be empty");
+		}
+		await this.setStateSessionNameForCommand(state, name);
+		return success(command.id, "rename", summaryForActiveSession(state));
+	}
+
+	private async handleRenameSavedSession(
+		command: Extract<DaemonCommand, { type: "rename_saved_session" }>,
+	): Promise<DaemonResponse | undefined> {
+		if (command.activeSessionId) {
+			this.getSessionState(command.activeSessionId);
+		}
+		const state = this.findActiveSessionByFile(command.sessionPath);
+		const name = command.name.trim();
+		if (!name) {
+			throw new Error("Session name cannot be empty");
+		}
+		if (state) {
+			await this.setStateSessionNameForCommand(state, name);
+		} else {
+			const info = await readSessionInfo(command.sessionPath);
+			if (!info) throw new Error(`Session not found: ${command.sessionPath}`);
+			const depth = info.rlmDepth ?? 0;
+			await this.withSessionNameReservation(
+				{
+					name,
+					depth,
+					...(depth > 0 && info.parentSessionPath ? { parentSessionPath: info.parentSessionPath } : {}),
+				},
+				async () => {
+					await this.assertFamilySessionNameAvailable(
 						{
 							name,
 							depth,
 							...(depth > 0 && info.parentSessionPath ? { parentSessionPath: info.parentSessionPath } : {}),
+							ignoreSessionId: info.id,
 						},
-						async () => {
-							await this.assertFamilySessionNameAvailable(
-								{
-									name,
-									depth,
-									...(depth > 0 && info.parentSessionPath
-										? { parentSessionPath: info.parentSessionPath }
-										: {}),
-									ignoreSessionId: info.id,
-								},
-								undefined,
-								true,
+						undefined,
+						true,
+					);
+					// Same torn-tail rule as the catalog rename path: repair before
+					// appending, or the session_info line glues onto a torn tail.
+					// K3P-5: and the same lease rule - the repair truncates, so it
+					// only happens under the write lease, never over a live writer.
+					await appendOwnedSessionLineAsync(command.sessionPath, this.agentDir, (manager) => {
+						manager.appendSessionInfo(name);
+					});
+					await this.rlmSpawnLedger()
+						.appendRenameByChildPath(command.sessionPath, name)
+						.catch((error) => {
+							this.log(
+								`failed to append RLM ledger rename: ${error instanceof Error ? error.message : String(error)}`,
 							);
-							// Same torn-tail rule as the catalog rename path: repair before
-							// appending, or the session_info line glues onto a torn tail.
-							// K3P-5: and the same lease rule - the repair truncates, so it
-							// only happens under the write lease, never over a live writer.
-							await appendOwnedSessionLineAsync(command.sessionPath, this.agentDir, (manager) => {
-								manager.appendSessionInfo(name);
-							});
-							await this.rlmSpawnLedger()
-								.appendRenameByChildPath(command.sessionPath, name)
-								.catch((error) => {
-									this.log(
-										`failed to append RLM ledger rename: ${error instanceof Error ? error.message : String(error)}`,
-									);
-								});
-						},
-					);
-				}
-				return success(command.id, "rename_saved_session");
-			}
-
-			case "delete_saved_session": {
-				if (command.activeSessionId) {
-					this.getSessionState(command.activeSessionId);
-				}
-				if (this.findActiveSessionByFile(command.sessionPath)) {
-					throw new Error("Cannot delete the currently active session");
-				}
-				const composedEntry = this.rosterEntryForSessionPath(canonicalSessionPath(command.sessionPath));
-				const { deletedInfo, ledgerEdge } = await tombstoneSavedSessionDelete(
-					this.rlmSpawnLedger(),
-					command.sessionPath,
-					composedEntry?.summary,
-				);
-				const result = await this.deleteSavedSessionFile(command.sessionPath, {
-					afterFileRemoved: () => {
-						this.cancelScheduledJobsForSessionFile(command.sessionPath);
-					},
-				});
-				if (result.ok && this.options.worker) {
-					const removedAgentId =
-						composedEntry?.agentId ??
-						(ledgerEdge ? this.rosterAgentIdForRlmChild(ledgerEdge.childId, ledgerEdge.parent) : deletedInfo?.id);
-					if (removedAgentId) {
-						this.rosterReporter.removedAgentIds.set(
-							removedAgentId,
-							composedEntry?.summary.sessionId ?? deletedInfo?.id,
-						);
-						this.scheduleRosterFlush();
-					}
-				}
-				return success(command.id, "delete_saved_session", result);
-			}
-
-			case "cancel_prompt_admission": {
-				const admission = this.promptAdmissions.get(
-					this.promptAdmissionKey(command.activeSessionId, command.admissionId),
-				);
-				if (!admission) {
-					return success(command.id, command.type, {
-						status: "unknown" as const,
-					});
-				}
-				if (admission.status === "owned") {
-					if (command.cancelOwned) admission.controller?.abort();
-					return success(command.id, command.type, {
-						status: "owned" as const,
-					});
-				}
-				if (admission.status === "waiting") {
-					admission.status = "cancelled";
-					admission.controller?.abort();
-				}
-				return success(command.id, command.type, {
-					status: "cancelled" as const,
-				});
-			}
-
-			case "prompt":
-			case "prompt_and_wait": {
-				onPromptHandlerOwnsAdmission();
-				const admissionKey = command.admissionId
-					? this.promptAdmissionKey(command.activeSessionId, command.admissionId)
-					: undefined;
-				const admission = admissionKey ? this.promptAdmissions.get(admissionKey) : undefined;
-				if (command.admissionId && !admission) {
-					throw new Error("Prompt admission was not registered during command parsing");
-				}
-				const clearAdmission = () => {
-					if (admissionKey && this.promptAdmissions.get(admissionKey) === admission) {
-						this.promptAdmissions.delete(admissionKey);
-					}
-				};
-				const commitAdmission = () => {
-					if (admission?.status === "waiting") admission.status = "owned";
-				};
-				let state: ActiveSessionState;
-				try {
-					if (admission?.status === "cancelled") throw new PromptAdmissionCancelledError();
-					state = this.getBoundSessionState(command.activeSessionId);
-				} catch (error) {
-					clearAdmission();
-					throw error;
-				}
-				// C (blind-1 F1 / blind-3 finding 3): a client prompt is external
-				// input. Marked once the target session is resolved, whether the
-				// admission later delivers or queues it: the human is driving this
-				// session, so the live stall episode is kept alive and the
-				// consecutive-action count resets here, not only for agent messages.
-				this.noteExternalSessionInput(state);
-				const options: PromptOptions = {
-					content: command.content,
-					images: command.images,
-					streamingBehavior: command.streamingBehavior,
-					queueIfBusy: command.queueIfBusy ?? command.streamingBehavior !== undefined,
-					resumeIfIdle: command.streamingBehavior !== undefined,
-					expandPromptTemplates: command.expandPromptTemplates,
-					skipInputHandlers: command.expandPromptTemplates === false ? true : undefined,
-					source: command.source,
-					...(admission?.controller
-						? {
-								signal: admission.controller.signal,
-								admissionCommitted: commitAdmission,
-							}
-						: {}),
-				};
-				if (command.type === "prompt_and_wait") {
-					try {
-						await state.runtime.session.promptAndWait(command.message, {
-							...options,
-							preflightResult: (didSucceed) => {
-								if (didSucceed) this.recordWorkerRecoveryState(state, "prompt_accepted", true);
-							},
 						});
-						return success(command.id, command.type);
-					} finally {
-						clearAdmission();
-					}
-				}
+				},
+			);
+		}
+		return success(command.id, "rename_saved_session");
+	}
 
-				let responseSent = false;
-				let preflightRejected = false;
-				const sendSuccessResponse = () => {
-					if (responseSent) return;
-					responseSent = true;
-					this.write(client, success(command.id, "prompt"));
-				};
-				const prompt =
-					command.agentMessageId !== undefined && command.expandPromptTemplates === false
-						? state.runtime.session.acceptAgentMessagePrompt.bind(state.runtime.session)
-						: state.runtime.session.promptUntilAccepted.bind(state.runtime.session);
-				void prompt(command.message, {
+	private async handleDeleteSavedSession(
+		command: Extract<DaemonCommand, { type: "delete_saved_session" }>,
+	): Promise<DaemonResponse | undefined> {
+		if (command.activeSessionId) {
+			this.getSessionState(command.activeSessionId);
+		}
+		if (this.findActiveSessionByFile(command.sessionPath)) {
+			throw new Error("Cannot delete the currently active session");
+		}
+		const composedEntry = this.rosterEntryForSessionPath(canonicalSessionPath(command.sessionPath));
+		const { deletedInfo, ledgerEdge } = await tombstoneSavedSessionDelete(
+			this.rlmSpawnLedger(),
+			command.sessionPath,
+			composedEntry?.summary,
+		);
+		const result = await this.deleteSavedSessionFile(command.sessionPath, {
+			afterFileRemoved: () => {
+				this.cancelScheduledJobsForSessionFile(command.sessionPath);
+			},
+		});
+		if (result.ok && this.options.worker) {
+			const removedAgentId =
+				composedEntry?.agentId ??
+				(ledgerEdge ? this.rosterAgentIdForRlmChild(ledgerEdge.childId, ledgerEdge.parent) : deletedInfo?.id);
+			if (removedAgentId) {
+				this.rosterReporter.removedAgentIds.set(
+					removedAgentId,
+					composedEntry?.summary.sessionId ?? deletedInfo?.id,
+				);
+				this.scheduleRosterFlush();
+			}
+		}
+		return success(command.id, "delete_saved_session", result);
+	}
+
+	private async handleCancelPromptAdmission(
+		command: Extract<DaemonCommand, { type: "cancel_prompt_admission" }>,
+	): Promise<DaemonResponse | undefined> {
+		const admission = this.promptAdmissions.get(
+			this.promptAdmissionKey(command.activeSessionId, command.admissionId),
+		);
+		if (!admission) {
+			return success(command.id, command.type, {
+				status: "unknown" as const,
+			});
+		}
+		if (admission.status === "owned") {
+			if (command.cancelOwned) admission.controller?.abort();
+			return success(command.id, command.type, {
+				status: "owned" as const,
+			});
+		}
+		if (admission.status === "waiting") {
+			admission.status = "cancelled";
+			admission.controller?.abort();
+		}
+		return success(command.id, command.type, {
+			status: "cancelled" as const,
+		});
+	}
+
+	private async handlePrompt(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "prompt" | "prompt_and_wait" }>,
+		onPromptHandlerOwnsAdmission: () => void,
+	): Promise<DaemonResponse | undefined> {
+		onPromptHandlerOwnsAdmission();
+		const admissionKey = command.admissionId
+			? this.promptAdmissionKey(command.activeSessionId, command.admissionId)
+			: undefined;
+		const admission = admissionKey ? this.promptAdmissions.get(admissionKey) : undefined;
+		if (command.admissionId && !admission) {
+			throw new Error("Prompt admission was not registered during command parsing");
+		}
+		const clearAdmission = () => {
+			if (admissionKey && this.promptAdmissions.get(admissionKey) === admission) {
+				this.promptAdmissions.delete(admissionKey);
+			}
+		};
+		const commitAdmission = () => {
+			if (admission?.status === "waiting") admission.status = "owned";
+		};
+		let state: ActiveSessionState;
+		try {
+			if (admission?.status === "cancelled") throw new PromptAdmissionCancelledError();
+			state = this.getBoundSessionState(command.activeSessionId);
+		} catch (error) {
+			clearAdmission();
+			throw error;
+		}
+		// C (blind-1 F1 / blind-3 finding 3): a client prompt is external
+		// input. Marked once the target session is resolved, whether the
+		// admission later delivers or queues it: the human is driving this
+		// session, so the live stall episode is kept alive and the
+		// consecutive-action count resets here, not only for agent messages.
+		this.noteExternalSessionInput(state);
+		const options: PromptOptions = {
+			content: command.content,
+			images: command.images,
+			streamingBehavior: command.streamingBehavior,
+			queueIfBusy: command.queueIfBusy ?? command.streamingBehavior !== undefined,
+			resumeIfIdle: command.streamingBehavior !== undefined,
+			expandPromptTemplates: command.expandPromptTemplates,
+			skipInputHandlers: command.expandPromptTemplates === false ? true : undefined,
+			source: command.source,
+			...(admission?.controller
+				? {
+						signal: admission.controller.signal,
+						admissionCommitted: commitAdmission,
+					}
+				: {}),
+		};
+		if (command.type === "prompt_and_wait") {
+			try {
+				await state.runtime.session.promptAndWait(command.message, {
 					...options,
-					agentMessageId: command.agentMessageId,
-					customMessage: command.customMessage,
 					preflightResult: (didSucceed) => {
-						if (didSucceed) {
-							this.recordWorkerRecoveryState(state, "prompt_accepted", true);
-							sendSuccessResponse();
-						} else {
-							preflightRejected = true;
-						}
+						if (didSucceed) this.recordWorkerRecoveryState(state, "prompt_accepted", true);
 					},
-				})
-					.then(() => {
-						if (preflightRejected) {
-							const error = new Error("Prompt was not accepted by the session.");
-							this.write(client, failure(command.id, "prompt", error, serializeDaemonError(error)));
-						} else {
-							sendSuccessResponse();
-						}
-					})
-					.catch((error) => {
-						if (responseSent) {
-							this.broadcastToSession(state, failure(undefined, "prompt", error, serializeDaemonError(error)));
-						} else {
-							this.write(client, failure(command.id, "prompt", error, serializeDaemonError(error)));
-						}
-					})
-					.finally(clearAdmission);
-				return undefined;
-			}
-
-			case "steer": {
-				const state = this.getBoundSessionState(command.activeSessionId);
-				// C: a client steer is external input - same rule as the prompt case.
-				this.noteExternalSessionInput(state);
-				if (command.expandPromptTemplates === false) {
-					await state.runtime.session.restoreSteeringMessage(command.message, command.images, {
-						queueKey: command.queueKey,
-						agentMessageId: command.agentMessageId,
-						content: command.content,
-						customMessage: command.customMessage,
-						prefixMessages: command.prefixMessages,
-					});
-				} else {
-					await state.runtime.session.steer(command.message, command.images, {
-						queueKey: command.queueKey,
-						agentMessageId: command.agentMessageId,
-						resumeIfIdle: true,
-					});
-				}
-				this.recordWorkerRecoveryState(state, "steer_queued", true);
-				return success(command.id, "steer");
-			}
-
-			case "follow_up": {
-				const state = this.getBoundSessionState(command.activeSessionId);
-				// C: a client follow-up is external input - same rule as the prompt case.
-				this.noteExternalSessionInput(state);
-				let queued = true;
-				let admitted = true;
-				if (command.expandPromptTemplates === false) {
-					queued = await state.runtime.session.restoreFollowUpMessage(command.message, command.images, {
-						queueKey: command.queueKey,
-						agentMessageId: command.agentMessageId,
-						content: command.content,
-						customMessage: command.customMessage,
-						prefixMessages: command.prefixMessages,
-					});
-					admitted = queued;
-				} else {
-					queued = await state.runtime.session.followUp(command.message, command.images, {
-						queueKey: command.queueKey,
-						agentMessageId: command.agentMessageId,
-						resumeIfIdle: true,
-					});
-					admitted = queued;
-				}
-				if (admitted) {
-					this.recordWorkerRecoveryState(state, "follow_up_queued", true);
-				}
-				return success(command.id, "follow_up", { queued });
-			}
-
-			case "restore_next_turn": {
-				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.restorePendingNextTurnMessages(command.messages);
-				return success(command.id, "restore_next_turn");
-			}
-
-			case "restore_actions": {
-				const state = this.getSessionState(command.activeSessionId);
-				const restored = await state.runtime.session.restoreSessionActions(command.snapshot);
-				if (restored > 0) this.recordWorkerRecoveryState(state, "actions_restored", true);
-				return success(command.id, "restore_actions", { restored });
-			}
-
-			case "append_custom_message": {
-				const state = this.getSessionState(command.activeSessionId);
-				await state.runtime.session.sendCustomMessage(command.message);
-				return success(command.id, "append_custom_message");
-			}
-
-			case "resume_queue": {
-				const state = this.getSessionState(command.activeSessionId);
-				// C: a client asking to resume queued work is external input - someone
-				// is minding this session even though the queue never drained.
-				this.noteExternalSessionInput(state);
-				// Connection-facing resume: the update-restart fence stays up (the
-				// false result maps to the "No queued work to resume" no-op below).
-				if (!state.runtime.session.resumeQueuedWorkFromConnection()) {
-					const error = new Error("No queued work to resume");
-					return failure(command.id, "resume_queue", error, serializeDaemonError(error));
-				}
-				return success(command.id, "resume_queue");
-			}
-
-			case "send_message": {
-				const fromState = command.fromActiveSessionId
-					? this.getSessionState(command.fromActiveSessionId)
-					: undefined;
-				const receipt = await this.sendAgentSessionMessage({
-					targetSelector: command.targetActiveSessionId,
-					message: command.message,
-					fromState,
-					clientId: client.id,
-					senderKey: this.createCliAgentMessageSenderKey(),
-					origin: command.agentOrigin === true ? "agent" : "cli",
-					deliveryMode: command.deliveryMode,
-				});
-				return success(command.id, "send_message", receipt);
-			}
-
-			case "agent_messages_status": {
-				return success(command.id, "agent_messages_status", this.getAgentMessageSafetyStatus());
-			}
-
-			case "agent_messages_pause": {
-				this.agentMessagesPaused = true;
-				this.agentMessageRateLimiter.clear();
-				await this.clearQueuedAgentSessionMessagesForAllStates();
-				return success(command.id, "agent_messages_pause", this.getAgentMessageSafetyStatus());
-			}
-
-			case "agent_messages_resume": {
-				this.agentMessagesPaused = false;
-				return success(command.id, "agent_messages_resume", this.getAgentMessageSafetyStatus());
-			}
-
-			case "agent_messages_clear": {
-				const state = this.getSessionState(command.activeSessionId);
-				this.agentMessageRateLimiter.clearMatching((key) => key.endsWith(`->${state.activeSessionId}`));
-				const cleared = state.runtime.session.clearQueuedAgentMessages();
-				return success(command.id, "agent_messages_clear", cleared);
-			}
-
-			case "abort": {
-				const state = this.getSessionState(command.activeSessionId);
-				this.assertAgentOriginAbortReach(command.fromActiveSessionId, state);
-				// C: an abort command is external input, and it resets the
-				// consecutive-action stop line - whoever issued it (a client Esc or
-				// a supervising agent) is attending this session, so the chain of
-				// "auto actions without external input" restarts from zero.
-				this.noteExternalSessionInput(state);
-				state.runtime.session.requestAbort();
-				return success(command.id, "abort");
-			}
-
-			case "abort_and_send_queued": {
-				const state = this.getSessionState(command.activeSessionId);
-				this.assertAgentOriginAbortReach(command.fromActiveSessionId, state);
-				// C: same external-input rule as the plain abort above.
-				this.noteExternalSessionInput(state);
-				state.runtime.session.abortAndSendQueued();
-				return success(command.id, "abort_and_send_queued");
-			}
-
-			case "start_side_question": {
-				const state = this.getSessionState(command.activeSessionId);
-				if (this.sideQuestionRuns.has(command.sideQuestionId)) {
-					throw new Error(`Side question already exists: ${command.sideQuestionId}`);
-				}
-				if (this.hasActiveSideQuestionFor(client, state.activeSessionId)) {
-					throw new Error("A side question is already running for this client and session");
-				}
-				const run = startSideQuestion(
-					state.runtime.session.agent,
-					command.sideQuestionId,
-					command.question,
-					(event) => {
-						this.write(client, {
-							type: "side_question_event",
-							activeSessionId: state.activeSessionId,
-							event,
-						});
-						if (event.status !== "running") {
-							this.sideQuestionRuns.delete(event.id);
-						}
-					},
-					command.previousTurns,
-					// No module layer wraps a side question: the provider client is its
-					// outermost retry layer and retries per this session's policy.
-					providerRetryPolicy(state.runtime.session.settingsManager),
-				);
-				this.sideQuestionRuns.set(command.sideQuestionId, {
-					run,
-					client,
-					activeSessionId: state.activeSessionId,
-				});
-				void run.done.catch((error) => {
-					this.sideQuestionRuns.delete(command.sideQuestionId);
-					this.log(
-						`side question ${command.sideQuestionId} failed: ${error instanceof Error ? error.message : String(error)}`,
-					);
-				});
-				return success(command.id, "start_side_question");
-			}
-
-			case "abort_side_question": {
-				this.getSessionState(command.activeSessionId);
-				const entry = this.sideQuestionRuns.get(command.sideQuestionId);
-				if (!entry || entry.client !== client || entry.activeSessionId !== command.activeSessionId) {
-					return success(command.id, "abort_side_question", { aborted: false });
-				}
-				entry.run.abort();
-				return success(command.id, "abort_side_question", { aborted: true });
-			}
-
-			case "execute_bash": {
-				const state = this.getSessionState(command.activeSessionId);
-				if (state.runtime.session.isBashRunning) {
-					throw new Error("A bash command is already running");
-				}
-				// Respond before completion (bash can outlive the client request
-				// timeout); output and completion stream via bash_* session events.
-				const bash = state.runtime.session.runUserBash(command.command, {
-					excludeFromContext: command.excludeFromContext,
-					transient: command.transient,
-					runId: command.runId,
-				});
-				state.inFlightBash = Promise.allSettled([state.inFlightBash, bash]).then(() => undefined);
-				void bash.catch((error) => {
-					this.broadcastToSession(state, failure(undefined, "execute_bash", error, serializeDaemonError(error)));
-				});
-				return success(command.id, "execute_bash");
-			}
-
-			case "execute_bash_and_wait": {
-				const state = this.getSessionState(command.activeSessionId);
-				const bash = state.runtime.session.executeBash(command.command);
-				state.inFlightBash = Promise.allSettled([state.inFlightBash, bash]).then(() => undefined);
-				try {
-					return success(command.id, "execute_bash_and_wait", await bash);
-				} finally {
-					this.scheduleRosterFlush();
-				}
-			}
-
-			case "abort_bash": {
-				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.abortBash();
-				return success(command.id, "abort_bash");
-			}
-
-			case "cancel_rlm_child": {
-				const state = this.getSessionState(command.activeSessionId);
-				const cancelled = state.runtime.session.cancelRlmChildRun(command.childId);
-				return success(command.id, "cancel_rlm_child", { cancelled });
-			}
-
-			case "delete_rlm_subagent": {
-				const state = this.getSessionState(command.activeSessionId);
-				const isResidentChildRunning = () => {
-					const childState = [...this.sessions.values()].find(
-						(candidate) =>
-							candidate.runtime.metadata.kind === "subagent" &&
-							candidate.runtime.metadata.rlmChildId === command.childId,
-					);
-					return (
-						childState !== undefined &&
-						(childState.runtime.session.isStreaming || childState.runtime.session.unfinishedActionCount > 0)
-					);
-				};
-				const result = isResidentChildRunning()
-					? "running"
-					: await state.runtime.session.deleteInactiveRlmSubagent(command.childId, isResidentChildRunning);
-				return success(command.id, "delete_rlm_subagent", {
-					deleted: result === "deleted",
-					...(result === "running" ? { reason: "running" } : {}),
-				});
-			}
-
-			case "acquire_session_input_pause": {
-				const existing = [...this.sessionInputPauses].find(
-					([, entry]) =>
-						entry.owner === client &&
-						entry.activeSessionId === command.activeSessionId &&
-						entry.leaseKey === command.leaseKey,
-				);
-				if (existing) {
-					return success(command.id, "acquire_session_input_pause", { pauseId: existing[0] });
-				}
-				const state = this.getSessionState(command.activeSessionId);
-				const pauseId = randomUUID();
-				this.sessionInputPauses.set(pauseId, {
-					activeSessionId: command.activeSessionId,
-					owner: client,
-					leaseKey: command.leaseKey,
-					pause: state.runtime.session.acquireSessionInputPause(),
-				});
-				return success(command.id, "acquire_session_input_pause", { pauseId });
-			}
-
-			case "release_session_input_pause": {
-				const entry = this.sessionInputPauses.get(command.pauseId);
-				if (!entry) return success(command.id, "release_session_input_pause");
-				if (entry.owner !== client || entry.activeSessionId !== command.activeSessionId) {
-					throw new Error(`Session input pause is owned by another client: ${command.pauseId}`);
-				}
-				this.sessionInputPauses.delete(command.pauseId);
-				entry.pause.release();
-				return success(command.id, "release_session_input_pause");
-			}
-
-			case "wait_for_idle": {
-				const state = this.getSessionState(command.activeSessionId);
-				await state.runtime.session.waitForIdle();
-				return success(command.id, "wait_for_idle");
-			}
-
-			case "wait_for_headless_completion": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(
-					command.id,
-					"wait_for_headless_completion",
-					await waitForHeadlessCompletion(state.runtime.session, {
-						waitForRlmQuiescence: command.waitForRlmQuiescence,
-						// The wait is read-only; autonomous gate continuations are not.
-						// Stop prompting once an update-restart transaction is underway so
-						// the checkpoint never races a gate continuation turn.
-						shouldStopGateContinuations: () => this.updateRestart !== undefined,
-					}),
-				);
-			}
-
-			case "get_session_header": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(command.id, "get_session_header", {
-					header: state.runtime.session.sessionManager.getHeader(),
-				});
-			}
-
-			case "get_state": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(command.id, "get_state", summaryForActiveSession(state));
-			}
-
-			case "get_connection_state": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(command.id, "get_connection_state", this.createConnectionState(state));
-			}
-
-			case "get_messages": {
-				const state = this.getSessionState(command.activeSessionId);
-				// Rev 44: before/limit window the read (slim_attach_transcript
-				// backfill); without them the full transcript is returned as before,
-				// now with the total/firstIndex facts a paged reader reconciles
-				// against.
-				return success(
-					command.id,
-					"get_messages",
-					getMessagesWindow(state.runtime.session.messages, command.before, command.limit),
-				);
-			}
-
-			case "get_rlm_children": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(command.id, "get_rlm_children", {
-					children: state.runtime.session.getRlmChildSnapshots(),
-					eventSequence: state.lastEventSequence,
-				});
-			}
-
-			case "get_session_stats": {
-				const state = this.getSessionState(command.activeSessionId);
-				const stats: SessionStats = state.runtime.session.getSessionStats();
-				return success(command.id, "get_session_stats", stats);
-			}
-
-			case "get_context_tree": {
-				const state = this.getSessionState(command.activeSessionId);
-				const tree = state.runtime.session.getContextTree();
-				// The scan diagnostics ride the tree for clients that render them; log them
-				// too, so a headless caller that ignores the field still leaves a record
-				// that the roster it received was partial.
-				const scan = tree.scan;
-				if (scan?.truncated) {
-					this.log(
-						`get_context_tree truncated: ${scan.skippedByBudget} child sessions not shown (budget: ${scan.truncatedReason}); ${scan.scannedChildren} read, ${scan.bytesRead} of ${scan.bytesPlanned} bytes`,
-					);
-				}
-				return success(command.id, "get_context_tree", tree);
-			}
-
-			case "get_commands": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(command.id, "get_commands", {
-					commands: createAgentConnectionCommands(state.runtime.session),
-				});
-			}
-
-			case "get_resource_snapshot": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(
-					command.id,
-					"get_resource_snapshot",
-					createAgentConnectionResourceSnapshot(state.runtime.session),
-				);
-			}
-
-			case "replace_acp_mcp_servers": {
-				if (!command.ownerId) throw new Error("ACP MCP owner id is required");
-				const state = this.getSessionState(command.activeSessionId);
-				if (!state.clients.has(client)) throw new Error("Daemon client is not attached to this session");
-				if (command.servers.length > 0 && state.runtime.session.isStreaming) {
-					throw new Error("Cannot replace ACP MCP servers while the agent is running");
-				}
-				const commandPause =
-					command.servers.length > 0 ? state.runtime.session.acquireSessionInputPause() : undefined;
-				try {
-					let currentOwner = this.acpMcpOwners.get(state.activeSessionId);
-					if (currentOwner?.release) {
-						await currentOwner.release.catch(() => undefined);
-						currentOwner = this.acpMcpOwners.get(state.activeSessionId);
-					}
-					const ownedByClient = currentOwner?.client === client && currentOwner.ownerId === command.ownerId;
-					if (command.servers.length === 0 && !ownedByClient) {
-						return success(command.id, "replace_acp_mcp_servers");
-					}
-					if (command.servers.length === 0) {
-						if (!currentOwner) return success(command.id, "replace_acp_mcp_servers");
-						const release = state.runtime.session.releaseAcpMcpServers(command.ownerId, currentOwner.serverNames);
-						currentOwner.release = release;
-						try {
-							await release;
-						} catch (error) {
-							currentOwner.release = undefined;
-							throw error;
-						}
-						if (this.acpMcpOwners.get(state.activeSessionId) === currentOwner) {
-							this.acpMcpOwners.delete(state.activeSessionId);
-						}
-						return success(command.id, "replace_acp_mcp_servers");
-					}
-
-					if (currentOwner && !ownedByClient) {
-						throw new Error("ACP MCP configuration is owned by another daemon client");
-					}
-					const claim = {
-						client,
-						ownerId: command.ownerId,
-						serverNames: [
-							...new Set([
-								...(currentOwner?.serverNames ?? []),
-								...command.servers.map((server) => server.name),
-							]),
-						],
-					};
-					this.acpMcpOwners.set(state.activeSessionId, claim);
-					const rollback = async (): Promise<void> => {
-						try {
-							await state.runtime.session.releaseAcpMcpServers(command.ownerId, claim.serverNames);
-						} catch (error) {
-							this.log(`failed to roll back ACP MCP config: ${String(error)}`);
-						}
-						if (this.acpMcpOwners.get(state.activeSessionId) === claim) {
-							this.acpMcpOwners.delete(state.activeSessionId);
-						}
-					};
-					try {
-						await withClientEnv(state.clientEnv, async () =>
-							state.runtime.session.replaceAcpMcpServers(command.servers, command.ownerId),
-						);
-					} catch (error) {
-						await rollback();
-						throw error;
-					}
-					if (!state.clients.has(client) || this.acpMcpOwners.get(state.activeSessionId) !== claim) {
-						await rollback();
-						throw new Error("Daemon client detached during ACP MCP replacement");
-					}
-					return success(command.id, "replace_acp_mcp_servers");
-				} finally {
-					commandPause?.release();
-				}
-			}
-
-			case "get_available_models": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(command.id, "get_available_models", {
-					models: await state.runtime.session.modelRegistry.refreshAvailableModels(),
-				});
-			}
-
-			case "get_model_catalog": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(
-					command.id,
-					"get_model_catalog",
-					await state.runtime.session.modelRegistry.refreshModelCatalog(),
-				);
-			}
-
-			case "get_queue": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(command.id, "get_queue", {
-					steering: [...state.runtime.session.getSteeringMessagePreviews()],
-					followUp: [...state.runtime.session.getFollowUpMessagePreviews()],
-				});
-			}
-
-			case "mutate_queued_message": {
-				const state = this.getSessionState(command.activeSessionId);
-				const status = state.runtime.session.mutateQueuedMessage(
-					command.lane,
-					command.index,
-					command.expectedText,
-					command.mutation,
-				);
-				return success(command.id, "mutate_queued_message", { status });
-			}
-
-			case "clear_queue": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(command.id, "clear_queue", state.runtime.session.clearQueue());
-			}
-
-			case "abort_and_clear_queue": {
-				const state = this.getSessionState(command.activeSessionId);
-				const queue = state.runtime.session.clearQueue();
-				state.runtime.session.requestAbort();
-				return success(command.id, "abort_and_clear_queue", queue);
-			}
-
-			case "cron_list": {
-				const jobs = this.cronStore.list().filter((job) => {
-					if (!command.includeInactive && job.status !== "active" && job.status !== "paused") {
-						return false;
-					}
-					if (command.activeSessionId && job.activeSessionId !== command.activeSessionId) {
-						return false;
-					}
-					return true;
-				});
-				return success(command.id, "cron_list", { jobs });
-			}
-
-			case "heartbeats_list":
-				return success(command.id, "heartbeats_list", {
-					heartbeats: this.listHeartbeats(),
-				});
-
-			case "heartbeat_manage": {
-				const heartbeat = this.manageHeartbeat(command.activeSessionId, command.jobId, command.action);
-				if (!heartbeat) {
-					throw new Error(`No active heartbeat found: ${command.jobId}`);
-				}
-				return success(command.id, "heartbeat_manage", { heartbeat });
-			}
-
-			case "cron_add": {
-				const state = this.getSessionState(command.activeSessionId);
-				const job = this.createCronJobForState(state, command.schedule, command.prompt);
-				this.scheduleRosterFlush();
-				return success(command.id, "cron_add", { job });
-			}
-
-			case "cron_cancel": {
-				const job = this.cronStore.cancel(command.jobId);
-				if (!job) {
-					throw new Error(`No cron job found: ${command.jobId}`);
-				}
-				const state = this.sessions.get(job.activeSessionId);
-				if (state) {
-					this.removeQueuedHeartbeatFollowUp(state, job);
-				}
-				this.cronScheduler.wake();
-				this.scheduleRosterFlush();
-				return success(command.id, "cron_cancel", { job });
-			}
-
-			case "heartbeat_get": {
-				const state = this.getSessionState(command.activeSessionId);
-				const heartbeat = this.cronStore.getHeartbeat(state.activeSessionId);
-				return success(command.id, "heartbeat_get", {
-					heartbeat: heartbeat ?? null,
-				});
-			}
-
-			case "heartbeat_set": {
-				const state = this.getSessionState(command.activeSessionId);
-				const deliveryMode = normalizeHeartbeatDeliveryMode(command.deliveryMode);
-				const heartbeat = this.createHeartbeatForState(state, command.schedule, command.prompt, deliveryMode);
-				return success(command.id, "heartbeat_set", { heartbeat });
-			}
-
-			case "heartbeat_update": {
-				const state = this.getSessionState(command.activeSessionId);
-				const heartbeat = this.updateHeartbeatForState(state, command.action);
-				return success(command.id, "heartbeat_update", {
-					heartbeat: heartbeat ?? null,
-				});
-			}
-
-			case "set_model": {
-				const state = this.getSessionState(command.activeSessionId);
-				const session = state.runtime.session;
-				const availableModels = await session.modelRegistry.refreshAvailableModels();
-				const model = availableModels.find((candidate) => {
-					return candidate.provider === command.provider && candidate.id === command.modelId;
-				});
-				if (!model) {
-					throw new Error(`Model not found: ${command.provider}/${command.modelId}`);
-				}
-				await session.setModel(model, {
-					waitForExtensions: !(session.isStreaming || session.isCompacting),
-				});
-				this.scheduleRosterFlush();
-				return success(command.id, "set_model", model);
-			}
-
-			case "cycle_model": {
-				const state = this.getSessionState(command.activeSessionId);
-				const session = state.runtime.session;
-				const result = await session.cycleModel(command.direction, {
-					waitForExtensions: !(session.isStreaming || session.isCompacting),
-				});
-				this.scheduleRosterFlush();
-				return success(command.id, "cycle_model", result ?? null);
-			}
-
-			case "set_scoped_models": {
-				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.setScopedModels(command.scopedModels);
-				return success(command.id, "set_scoped_models");
-			}
-
-			case "set_thinking_level": {
-				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.setThinkingLevel(command.level);
-				return success(command.id, "set_thinking_level");
-			}
-
-			case "set_service_tier": {
-				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.setServiceTier(command.serviceTier);
-				return success(command.id, "set_service_tier");
-			}
-
-			case "cycle_thinking_level": {
-				const state = this.getSessionState(command.activeSessionId);
-				const level = state.runtime.session.cycleThinkingLevel();
-				return success(command.id, "cycle_thinking_level", level ? { level } : null);
-			}
-
-			case "set_transport": {
-				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.settingsManager.setTransport(command.transport);
-				state.runtime.session.agent.transport = command.transport;
-				return success(command.id, "set_transport");
-			}
-
-			case "set_steering_mode": {
-				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.setSteeringMode(command.mode);
-				return success(command.id, "set_steering_mode");
-			}
-
-			case "set_follow_up_mode": {
-				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.setFollowUpMode(command.mode);
-				return success(command.id, "set_follow_up_mode");
-			}
-
-			case "set_auto_compaction": {
-				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.setAutoCompactionEnabled(command.enabled);
-				return success(command.id, "set_auto_compaction");
-			}
-
-			case "set_auto_retry": {
-				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.setAutoRetryEnabled(command.enabled);
-				return success(command.id, "set_auto_retry");
-			}
-
-			case "compact": {
-				const state = this.getSessionState(command.activeSessionId);
-				const result = await state.runtime.session.compact(command.customInstructions);
-				return success(command.id, "compact", result);
-			}
-
-			case "refine": {
-				const state = this.getSessionState(command.activeSessionId);
-				const result = await state.runtime.session.refine({
-					instructions: command.instructions,
-					rollbackId: command.rollbackId,
-					global: command.global,
-				});
-				return success(command.id, "refine", result);
-			}
-
-			case "abort_compaction": {
-				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.abortCompaction();
-				return success(command.id, "abort_compaction");
-			}
-
-			case "abort_branch_summary": {
-				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.abortBranchSummary();
-				return success(command.id, "abort_branch_summary");
-			}
-
-			case "abort_retry": {
-				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.abortRetry();
-				return success(command.id, "abort_retry");
-			}
-
-			case "reload": {
-				const state = this.getSessionState(command.activeSessionId);
-				// Reload re-evaluates extension modules, which capture client env
-				// (e.g. herdr pane identity) synchronously at load.
-				await withClientEnv(state.clientEnv, () => state.runtime.session.reload());
-				return success(command.id, "reload");
-			}
-
-			case "new_session": {
-				const state = this.getSessionState(command.activeSessionId);
-				const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
-				const result = await state.runtime.newSession(options);
-				this.rebindCronJobsToState(state);
-				return success(command.id, "new_session", result);
-			}
-
-			case "switch_session": {
-				const state = this.getSessionState(command.activeSessionId);
-				const result = await state.runtime.switchSession(command.sessionPath, {
-					cwdOverride: command.cwdOverride,
-				});
-				this.rebindCronJobsToState(state);
-				return success(command.id, "switch_session", result);
-			}
-
-			case "fork": {
-				const state = this.getSessionState(command.activeSessionId);
-				const result = await state.runtime.fork(command.entryId, {
-					position: command.position,
-				});
-				this.rebindCronJobsToState(state);
-				return success(command.id, "fork", result);
-			}
-
-			case "navigate_tree": {
-				const state = this.getSessionState(command.activeSessionId);
-				const result = await state.runtime.session.navigateTree(command.targetId, {
-					summarize: command.summarize,
-					customInstructions: command.customInstructions,
-					replaceInstructions: command.replaceInstructions,
-					label: command.label,
-				});
-				// Carrier-less mutation: branch navigation swaps the message list
-				// without a session event, so the row refresh must be scheduled.
-				this.scheduleRosterFlush();
-				return success(command.id, "navigate_tree", result);
-			}
-
-			case "import_jsonl": {
-				const state = this.getSessionState(command.activeSessionId);
-				const result = await state.runtime.importFromJsonl(command.inputPath, command.cwdOverride);
-				return success(command.id, "import_jsonl", result);
-			}
-
-			case "export_html": {
-				const state = this.getSessionState(command.activeSessionId);
-				const path = await state.runtime.session.exportToHtml(command.outputPath);
-				return success(command.id, "export_html", { path });
-			}
-
-			case "export_jsonl": {
-				const state = this.getSessionState(command.activeSessionId);
-				const path = state.runtime.session.exportToJsonl(command.outputPath);
-				return success(command.id, "export_jsonl", { path });
-			}
-
-			case "set_session_name": {
-				const state = this.getSessionState(command.activeSessionId);
-				const name = command.name.trim();
-				if (!name) {
-					throw new Error("Session name cannot be empty");
-				}
-				await this.setStateSessionNameForCommand(state, name);
-				return success(command.id, "set_session_name");
-			}
-
-			case "get_rlm_max_depth_status": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(command.id, "get_rlm_max_depth_status", state.runtime.session.getRlmMaxDepthStatus());
-			}
-
-			case "set_rlm_max_depth": {
-				const state = this.getSessionState(command.activeSessionId);
-				const result = await state.runtime.session.setRlmMaxDepth(command.maxDepth, { global: command.global });
-				return success(command.id, "set_rlm_max_depth", result);
-			}
-
-			case "get_session_context": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(command.id, "get_session_context", {
-					context: state.runtime.session.buildSessionContext(),
-				});
-			}
-
-			case "get_session_tree": {
-				const state = this.getSessionState(command.activeSessionId);
-				const sessionManager = state.runtime.session.sessionManager;
-				// Every entry ships whole, so an uncapped response is O(entries) bytes - a
-				// 100k-entry session is ~90MB per call. The cap keeps the live leaf's entry
-				// and ancestor chain first and the newest entries after them: the leaf is NOT
-				// the last entry in file order after a rewind, because branch() records the
-				// move with a leaf_position marker appended as the file's last line, so a
-				// pure tail cut would drop the resumable branch while leafId still points at
-				// it. The stats travel to the client so the omission is reportable, not
-				// silent.
-				const bounded = sessionManager.getBoundedFlatTree();
-				if (bounded.stats.truncated) {
-					this.log(
-						`get_session_tree truncated: ${bounded.stats.returnedNodes} of ${bounded.stats.totalEntries} entries (max ${bounded.stats.maxNodes}); older branches omitted`,
-					);
-				}
-				return success(command.id, "get_session_tree", {
-					flatNodes: bounded.nodes,
-					leafId: sessionManager.getLeafId(),
-					treeBound: bounded.stats,
-				});
-			}
-
-			case "get_user_messages_for_forking": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(command.id, "get_user_messages_for_forking", {
-					messages: state.runtime.session.getUserMessagesForForking(),
-				});
-			}
-
-			case "get_last_assistant_text": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(command.id, "get_last_assistant_text", {
-					text: state.runtime.session.getLastAssistantText(),
-				});
-			}
-
-			case "get_system_prompt": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(command.id, "get_system_prompt", {
-					systemPrompt: state.runtime.session.systemPrompt,
-				});
-			}
-
-			case "get_tool_definition": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(command.id, "get_tool_definition", {
-					toolDefinition: createAgentConnectionToolDefinition(
-						state.runtime.session.getToolDefinition(command.name),
-					),
-				});
-			}
-
-			case "set_session_entry_label": {
-				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.sessionManager.appendLabelChange(command.entryId, command.label);
-				return success(command.id, "set_session_entry_label");
-			}
-
-			case "extension_ui_response": {
-				const state = this.getSessionState(command.activeSessionId);
-				const pending = state.extensionUiRequests.get(command.requestId);
-				if (!pending) {
-					throw new Error(`Unknown extension UI request: ${command.requestId}`);
-				}
-				state.extensionUiRequests.delete(command.requestId);
-				pending.resolve(command.response);
-				return success(command.id, "extension_ui_response");
-			}
-
-			case "declare_client_capabilities": {
-				client.declaredCommandCapabilities = new Set(normalizeDeclaredCapabilities(command.capabilities));
-				client.declaredCapabilities = true;
-				return success(command.id, command.type, { declared: [...client.declaredCommandCapabilities] });
-			}
-
-			case "prepare_update_restart":
-				this.log(
-					`prepare_update_restart command received over socket; ${this.sessions.size} active session(s) will be closed`,
-				);
-				return success(command.id, "prepare_update_restart", await this.prepareUpdateRestart());
-
-			case "retry_worker":
-				throw new Error("Worker retry is only available through the daemon supervisor");
-
-			case "restart":
-				setImmediate(() => {
-					void this.shutdown(0);
 				});
 				return success(command.id, command.type);
-
-			case "shutdown":
-				this.log(`shutdown command received over socket; ${this.sessions.size} active session(s) will be closed`);
-				setImmediate(() => {
-					void this.shutdown(0);
-				});
-				return success(command.id, "shutdown");
+			} finally {
+				clearAdmission();
+			}
 		}
+
+		let responseSent = false;
+		let preflightRejected = false;
+		const sendSuccessResponse = () => {
+			if (responseSent) return;
+			responseSent = true;
+			this.write(client, success(command.id, "prompt"));
+		};
+		const prompt =
+			command.agentMessageId !== undefined && command.expandPromptTemplates === false
+				? state.runtime.session.acceptAgentMessagePrompt.bind(state.runtime.session)
+				: state.runtime.session.promptUntilAccepted.bind(state.runtime.session);
+		void prompt(command.message, {
+			...options,
+			agentMessageId: command.agentMessageId,
+			customMessage: command.customMessage,
+			preflightResult: (didSucceed) => {
+				if (didSucceed) {
+					this.recordWorkerRecoveryState(state, "prompt_accepted", true);
+					sendSuccessResponse();
+				} else {
+					preflightRejected = true;
+				}
+			},
+		})
+			.then(() => {
+				if (preflightRejected) {
+					const error = new Error("Prompt was not accepted by the session.");
+					this.write(client, failure(command.id, "prompt", error, serializeDaemonError(error)));
+				} else {
+					sendSuccessResponse();
+				}
+			})
+			.catch((error) => {
+				if (responseSent) {
+					this.broadcastToSession(state, failure(undefined, "prompt", error, serializeDaemonError(error)));
+				} else {
+					this.write(client, failure(command.id, "prompt", error, serializeDaemonError(error)));
+				}
+			})
+			.finally(clearAdmission);
+		return undefined;
+	}
+
+	private async handleSteer(command: Extract<DaemonCommand, { type: "steer" }>): Promise<DaemonResponse | undefined> {
+		const state = this.getBoundSessionState(command.activeSessionId);
+		// C: a client steer is external input - same rule as the prompt case.
+		this.noteExternalSessionInput(state);
+		if (command.expandPromptTemplates === false) {
+			await state.runtime.session.restoreSteeringMessage(command.message, command.images, {
+				queueKey: command.queueKey,
+				agentMessageId: command.agentMessageId,
+				content: command.content,
+				customMessage: command.customMessage,
+				prefixMessages: command.prefixMessages,
+			});
+		} else {
+			await state.runtime.session.steer(command.message, command.images, {
+				queueKey: command.queueKey,
+				agentMessageId: command.agentMessageId,
+				resumeIfIdle: true,
+			});
+		}
+		this.recordWorkerRecoveryState(state, "steer_queued", true);
+		return success(command.id, "steer");
+	}
+
+	private async handleFollowUp(
+		command: Extract<DaemonCommand, { type: "follow_up" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getBoundSessionState(command.activeSessionId);
+		// C: a client follow-up is external input - same rule as the prompt case.
+		this.noteExternalSessionInput(state);
+		let queued = true;
+		let admitted = true;
+		if (command.expandPromptTemplates === false) {
+			queued = await state.runtime.session.restoreFollowUpMessage(command.message, command.images, {
+				queueKey: command.queueKey,
+				agentMessageId: command.agentMessageId,
+				content: command.content,
+				customMessage: command.customMessage,
+				prefixMessages: command.prefixMessages,
+			});
+			admitted = queued;
+		} else {
+			queued = await state.runtime.session.followUp(command.message, command.images, {
+				queueKey: command.queueKey,
+				agentMessageId: command.agentMessageId,
+				resumeIfIdle: true,
+			});
+			admitted = queued;
+		}
+		if (admitted) {
+			this.recordWorkerRecoveryState(state, "follow_up_queued", true);
+		}
+		return success(command.id, "follow_up", { queued });
+	}
+
+	private async handleRestoreNextTurn(
+		command: Extract<DaemonCommand, { type: "restore_next_turn" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		state.runtime.session.restorePendingNextTurnMessages(command.messages);
+		return success(command.id, "restore_next_turn");
+	}
+
+	private async handleRestoreActions(
+		command: Extract<DaemonCommand, { type: "restore_actions" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const restored = await state.runtime.session.restoreSessionActions(command.snapshot);
+		if (restored > 0) this.recordWorkerRecoveryState(state, "actions_restored", true);
+		return success(command.id, "restore_actions", { restored });
+	}
+
+	private async handleAppendCustomMessage(
+		command: Extract<DaemonCommand, { type: "append_custom_message" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		await state.runtime.session.sendCustomMessage(command.message);
+		return success(command.id, "append_custom_message");
+	}
+
+	private async handleResumeQueue(
+		command: Extract<DaemonCommand, { type: "resume_queue" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		// C: a client asking to resume queued work is external input - someone
+		// is minding this session even though the queue never drained.
+		this.noteExternalSessionInput(state);
+		// Connection-facing resume: the update-restart fence stays up (the
+		// false result maps to the "No queued work to resume" no-op below).
+		if (!state.runtime.session.resumeQueuedWorkFromConnection()) {
+			const error = new Error("No queued work to resume");
+			return failure(command.id, "resume_queue", error, serializeDaemonError(error));
+		}
+		return success(command.id, "resume_queue");
+	}
+
+	private async handleSendMessage(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "send_message" }>,
+	): Promise<DaemonResponse | undefined> {
+		const fromState = command.fromActiveSessionId ? this.getSessionState(command.fromActiveSessionId) : undefined;
+		const receipt = await this.sendAgentSessionMessage({
+			targetSelector: command.targetActiveSessionId,
+			message: command.message,
+			fromState,
+			clientId: client.id,
+			senderKey: this.createCliAgentMessageSenderKey(),
+			origin: command.agentOrigin === true ? "agent" : "cli",
+			deliveryMode: command.deliveryMode,
+		});
+		return success(command.id, "send_message", receipt);
+	}
+
+	private async handleAgentMessagesStatus(
+		command: Extract<DaemonCommand, { type: "agent_messages_status" }>,
+	): Promise<DaemonResponse | undefined> {
+		return success(command.id, "agent_messages_status", this.getAgentMessageSafetyStatus());
+	}
+
+	private async handleAgentMessagesPause(
+		command: Extract<DaemonCommand, { type: "agent_messages_pause" }>,
+	): Promise<DaemonResponse | undefined> {
+		this.agentMessagesPaused = true;
+		this.agentMessageRateLimiter.clear();
+		await this.clearQueuedAgentSessionMessagesForAllStates();
+		return success(command.id, "agent_messages_pause", this.getAgentMessageSafetyStatus());
+	}
+
+	private async handleAgentMessagesResume(
+		command: Extract<DaemonCommand, { type: "agent_messages_resume" }>,
+	): Promise<DaemonResponse | undefined> {
+		this.agentMessagesPaused = false;
+		return success(command.id, "agent_messages_resume", this.getAgentMessageSafetyStatus());
+	}
+
+	private async handleAgentMessagesClear(
+		command: Extract<DaemonCommand, { type: "agent_messages_clear" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		this.agentMessageRateLimiter.clearMatching((key) => key.endsWith(`->${state.activeSessionId}`));
+		const cleared = state.runtime.session.clearQueuedAgentMessages();
+		return success(command.id, "agent_messages_clear", cleared);
+	}
+
+	private async handleAbort(command: Extract<DaemonCommand, { type: "abort" }>): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		this.assertAgentOriginAbortReach(command.fromActiveSessionId, state);
+		// C: an abort command is external input, and it resets the
+		// consecutive-action stop line - whoever issued it (a client Esc or
+		// a supervising agent) is attending this session, so the chain of
+		// "auto actions without external input" restarts from zero.
+		this.noteExternalSessionInput(state);
+		state.runtime.session.requestAbort();
+		return success(command.id, "abort");
+	}
+
+	private async handleAbortAndSendQueued(
+		command: Extract<DaemonCommand, { type: "abort_and_send_queued" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		this.assertAgentOriginAbortReach(command.fromActiveSessionId, state);
+		// C: same external-input rule as the plain abort above.
+		this.noteExternalSessionInput(state);
+		state.runtime.session.abortAndSendQueued();
+		return success(command.id, "abort_and_send_queued");
+	}
+
+	private async handleStartSideQuestion(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "start_side_question" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		if (this.sideQuestionRuns.has(command.sideQuestionId)) {
+			throw new Error(`Side question already exists: ${command.sideQuestionId}`);
+		}
+		if (this.hasActiveSideQuestionFor(client, state.activeSessionId)) {
+			throw new Error("A side question is already running for this client and session");
+		}
+		const run = startSideQuestion(
+			state.runtime.session.agent,
+			command.sideQuestionId,
+			command.question,
+			(event) => {
+				this.write(client, {
+					type: "side_question_event",
+					activeSessionId: state.activeSessionId,
+					event,
+				});
+				if (event.status !== "running") {
+					this.sideQuestionRuns.delete(event.id);
+				}
+			},
+			command.previousTurns,
+			// No module layer wraps a side question: the provider client is its
+			// outermost retry layer and retries per this session's policy.
+			providerRetryPolicy(state.runtime.session.settingsManager),
+		);
+		this.sideQuestionRuns.set(command.sideQuestionId, {
+			run,
+			client,
+			activeSessionId: state.activeSessionId,
+		});
+		void run.done.catch((error) => {
+			this.sideQuestionRuns.delete(command.sideQuestionId);
+			this.log(
+				`side question ${command.sideQuestionId} failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		});
+		return success(command.id, "start_side_question");
+	}
+
+	private async handleAbortSideQuestion(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "abort_side_question" }>,
+	): Promise<DaemonResponse | undefined> {
+		this.getSessionState(command.activeSessionId);
+		const entry = this.sideQuestionRuns.get(command.sideQuestionId);
+		if (!entry || entry.client !== client || entry.activeSessionId !== command.activeSessionId) {
+			return success(command.id, "abort_side_question", { aborted: false });
+		}
+		entry.run.abort();
+		return success(command.id, "abort_side_question", { aborted: true });
+	}
+
+	private async handleExecuteBash(
+		command: Extract<DaemonCommand, { type: "execute_bash" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		if (state.runtime.session.isBashRunning) {
+			throw new Error("A bash command is already running");
+		}
+		// Respond before completion (bash can outlive the client request
+		// timeout); output and completion stream via bash_* session events.
+		const bash = state.runtime.session.runUserBash(command.command, {
+			excludeFromContext: command.excludeFromContext,
+			transient: command.transient,
+			runId: command.runId,
+		});
+		state.inFlightBash = Promise.allSettled([state.inFlightBash, bash]).then(() => undefined);
+		void bash.catch((error) => {
+			this.broadcastToSession(state, failure(undefined, "execute_bash", error, serializeDaemonError(error)));
+		});
+		return success(command.id, "execute_bash");
+	}
+
+	private async handleExecuteBashAndWait(
+		command: Extract<DaemonCommand, { type: "execute_bash_and_wait" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const bash = state.runtime.session.executeBash(command.command);
+		state.inFlightBash = Promise.allSettled([state.inFlightBash, bash]).then(() => undefined);
+		try {
+			return success(command.id, "execute_bash_and_wait", await bash);
+		} finally {
+			this.scheduleRosterFlush();
+		}
+	}
+
+	private async handleAbortBash(
+		command: Extract<DaemonCommand, { type: "abort_bash" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		state.runtime.session.abortBash();
+		return success(command.id, "abort_bash");
+	}
+
+	private async handleCancelRlmChild(
+		command: Extract<DaemonCommand, { type: "cancel_rlm_child" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const cancelled = state.runtime.session.cancelRlmChildRun(command.childId);
+		return success(command.id, "cancel_rlm_child", { cancelled });
+	}
+
+	private async handleDeleteRlmSubagent(
+		command: Extract<DaemonCommand, { type: "delete_rlm_subagent" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const isResidentChildRunning = () => {
+			const childState = [...this.sessions.values()].find(
+				(candidate) =>
+					candidate.runtime.metadata.kind === "subagent" &&
+					candidate.runtime.metadata.rlmChildId === command.childId,
+			);
+			return (
+				childState !== undefined &&
+				(childState.runtime.session.isStreaming || childState.runtime.session.unfinishedActionCount > 0)
+			);
+		};
+		const result = isResidentChildRunning()
+			? "running"
+			: await state.runtime.session.deleteInactiveRlmSubagent(command.childId, isResidentChildRunning);
+		return success(command.id, "delete_rlm_subagent", {
+			deleted: result === "deleted",
+			...(result === "running" ? { reason: "running" } : {}),
+		});
+	}
+
+	private async handleAcquireSessionInputPause(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "acquire_session_input_pause" }>,
+	): Promise<DaemonResponse | undefined> {
+		const existing = [...this.sessionInputPauses].find(
+			([, entry]) =>
+				entry.owner === client &&
+				entry.activeSessionId === command.activeSessionId &&
+				entry.leaseKey === command.leaseKey,
+		);
+		if (existing) {
+			return success(command.id, "acquire_session_input_pause", { pauseId: existing[0] });
+		}
+		const state = this.getSessionState(command.activeSessionId);
+		const pauseId = randomUUID();
+		this.sessionInputPauses.set(pauseId, {
+			activeSessionId: command.activeSessionId,
+			owner: client,
+			leaseKey: command.leaseKey,
+			pause: state.runtime.session.acquireSessionInputPause(),
+		});
+		return success(command.id, "acquire_session_input_pause", { pauseId });
+	}
+
+	private async handleReleaseSessionInputPause(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "release_session_input_pause" }>,
+	): Promise<DaemonResponse | undefined> {
+		const entry = this.sessionInputPauses.get(command.pauseId);
+		if (!entry) return success(command.id, "release_session_input_pause");
+		if (entry.owner !== client || entry.activeSessionId !== command.activeSessionId) {
+			throw new Error(`Session input pause is owned by another client: ${command.pauseId}`);
+		}
+		this.sessionInputPauses.delete(command.pauseId);
+		entry.pause.release();
+		return success(command.id, "release_session_input_pause");
+	}
+
+	private async handleWaitForIdle(
+		command: Extract<DaemonCommand, { type: "wait_for_idle" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		await state.runtime.session.waitForIdle();
+		return success(command.id, "wait_for_idle");
+	}
+
+	private async handleWaitForHeadlessCompletion(
+		command: Extract<DaemonCommand, { type: "wait_for_headless_completion" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		return success(
+			command.id,
+			"wait_for_headless_completion",
+			await waitForHeadlessCompletion(state.runtime.session, {
+				waitForRlmQuiescence: command.waitForRlmQuiescence,
+				// The wait is read-only; autonomous gate continuations are not.
+				// Stop prompting once an update-restart transaction is underway so
+				// the checkpoint never races a gate continuation turn.
+				shouldStopGateContinuations: () => this.updateRestart !== undefined,
+			}),
+		);
+	}
+
+	private async handleGetSessionHeader(
+		command: Extract<DaemonCommand, { type: "get_session_header" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		return success(command.id, "get_session_header", {
+			header: state.runtime.session.sessionManager.getHeader(),
+		});
+	}
+
+	private async handleGetState(
+		command: Extract<DaemonCommand, { type: "get_state" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		return success(command.id, "get_state", summaryForActiveSession(state));
+	}
+
+	private async handleGetConnectionState(
+		command: Extract<DaemonCommand, { type: "get_connection_state" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		return success(command.id, "get_connection_state", this.createConnectionState(state));
+	}
+
+	private async handleGetMessages(
+		command: Extract<DaemonCommand, { type: "get_messages" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		// Rev 44: before/limit window the read (slim_attach_transcript
+		// backfill); without them the full transcript is returned as before,
+		// now with the total/firstIndex facts a paged reader reconciles
+		// against.
+		return success(
+			command.id,
+			"get_messages",
+			getMessagesWindow(state.runtime.session.messages, command.before, command.limit),
+		);
+	}
+
+	private async handleGetRlmChildren(
+		command: Extract<DaemonCommand, { type: "get_rlm_children" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		return success(command.id, "get_rlm_children", {
+			children: state.runtime.session.getRlmChildSnapshots(),
+			eventSequence: state.lastEventSequence,
+		});
+	}
+
+	private async handleGetSessionStats(
+		command: Extract<DaemonCommand, { type: "get_session_stats" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const stats: SessionStats = state.runtime.session.getSessionStats();
+		return success(command.id, "get_session_stats", stats);
+	}
+
+	private async handleGetContextTree(
+		command: Extract<DaemonCommand, { type: "get_context_tree" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const tree = state.runtime.session.getContextTree();
+		// The scan diagnostics ride the tree for clients that render them; log them
+		// too, so a headless caller that ignores the field still leaves a record
+		// that the roster it received was partial.
+		const scan = tree.scan;
+		if (scan?.truncated) {
+			this.log(
+				`get_context_tree truncated: ${scan.skippedByBudget} child sessions not shown (budget: ${scan.truncatedReason}); ${scan.scannedChildren} read, ${scan.bytesRead} of ${scan.bytesPlanned} bytes`,
+			);
+		}
+		return success(command.id, "get_context_tree", tree);
+	}
+
+	private async handleGetCommands(
+		command: Extract<DaemonCommand, { type: "get_commands" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		return success(command.id, "get_commands", {
+			commands: createAgentConnectionCommands(state.runtime.session),
+		});
+	}
+
+	private async handleGetResourceSnapshot(
+		command: Extract<DaemonCommand, { type: "get_resource_snapshot" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		return success(command.id, "get_resource_snapshot", createAgentConnectionResourceSnapshot(state.runtime.session));
+	}
+
+	private async handleReplaceAcpMcpServers(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "replace_acp_mcp_servers" }>,
+	): Promise<DaemonResponse | undefined> {
+		if (!command.ownerId) throw new Error("ACP MCP owner id is required");
+		const state = this.getSessionState(command.activeSessionId);
+		if (!state.clients.has(client)) throw new Error("Daemon client is not attached to this session");
+		if (command.servers.length > 0 && state.runtime.session.isStreaming) {
+			throw new Error("Cannot replace ACP MCP servers while the agent is running");
+		}
+		const commandPause = command.servers.length > 0 ? state.runtime.session.acquireSessionInputPause() : undefined;
+		try {
+			let currentOwner = this.acpMcpOwners.get(state.activeSessionId);
+			if (currentOwner?.release) {
+				await currentOwner.release.catch(() => undefined);
+				currentOwner = this.acpMcpOwners.get(state.activeSessionId);
+			}
+			const ownedByClient = currentOwner?.client === client && currentOwner.ownerId === command.ownerId;
+			if (command.servers.length === 0 && !ownedByClient) {
+				return success(command.id, "replace_acp_mcp_servers");
+			}
+			if (command.servers.length === 0) {
+				if (!currentOwner) return success(command.id, "replace_acp_mcp_servers");
+				const release = state.runtime.session.releaseAcpMcpServers(command.ownerId, currentOwner.serverNames);
+				currentOwner.release = release;
+				try {
+					await release;
+				} catch (error) {
+					currentOwner.release = undefined;
+					throw error;
+				}
+				if (this.acpMcpOwners.get(state.activeSessionId) === currentOwner) {
+					this.acpMcpOwners.delete(state.activeSessionId);
+				}
+				return success(command.id, "replace_acp_mcp_servers");
+			}
+
+			if (currentOwner && !ownedByClient) {
+				throw new Error("ACP MCP configuration is owned by another daemon client");
+			}
+			const claim = {
+				client,
+				ownerId: command.ownerId,
+				serverNames: [
+					...new Set([...(currentOwner?.serverNames ?? []), ...command.servers.map((server) => server.name)]),
+				],
+			};
+			this.acpMcpOwners.set(state.activeSessionId, claim);
+			const rollback = async (): Promise<void> => {
+				try {
+					await state.runtime.session.releaseAcpMcpServers(command.ownerId, claim.serverNames);
+				} catch (error) {
+					this.log(`failed to roll back ACP MCP config: ${String(error)}`);
+				}
+				if (this.acpMcpOwners.get(state.activeSessionId) === claim) {
+					this.acpMcpOwners.delete(state.activeSessionId);
+				}
+			};
+			try {
+				await withClientEnv(state.clientEnv, async () =>
+					state.runtime.session.replaceAcpMcpServers(command.servers, command.ownerId),
+				);
+			} catch (error) {
+				await rollback();
+				throw error;
+			}
+			if (!state.clients.has(client) || this.acpMcpOwners.get(state.activeSessionId) !== claim) {
+				await rollback();
+				throw new Error("Daemon client detached during ACP MCP replacement");
+			}
+			return success(command.id, "replace_acp_mcp_servers");
+		} finally {
+			commandPause?.release();
+		}
+	}
+
+	private async handleGetAvailableModels(
+		command: Extract<DaemonCommand, { type: "get_available_models" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		return success(command.id, "get_available_models", {
+			models: await state.runtime.session.modelRegistry.refreshAvailableModels(),
+		});
+	}
+
+	private async handleGetModelCatalog(
+		command: Extract<DaemonCommand, { type: "get_model_catalog" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		return success(command.id, "get_model_catalog", await state.runtime.session.modelRegistry.refreshModelCatalog());
+	}
+
+	private async handleGetQueue(
+		command: Extract<DaemonCommand, { type: "get_queue" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		return success(command.id, "get_queue", {
+			steering: [...state.runtime.session.getSteeringMessagePreviews()],
+			followUp: [...state.runtime.session.getFollowUpMessagePreviews()],
+		});
+	}
+
+	private async handleMutateQueuedMessage(
+		command: Extract<DaemonCommand, { type: "mutate_queued_message" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const status = state.runtime.session.mutateQueuedMessage(
+			command.lane,
+			command.index,
+			command.expectedText,
+			command.mutation,
+		);
+		return success(command.id, "mutate_queued_message", { status });
+	}
+
+	private async handleClearQueue(
+		command: Extract<DaemonCommand, { type: "clear_queue" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		return success(command.id, "clear_queue", state.runtime.session.clearQueue());
+	}
+
+	private async handleAbortAndClearQueue(
+		command: Extract<DaemonCommand, { type: "abort_and_clear_queue" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const queue = state.runtime.session.clearQueue();
+		state.runtime.session.requestAbort();
+		return success(command.id, "abort_and_clear_queue", queue);
+	}
+
+	private async handleCronList(
+		command: Extract<DaemonCommand, { type: "cron_list" }>,
+	): Promise<DaemonResponse | undefined> {
+		const jobs = this.cronStore.list().filter((job) => {
+			if (!command.includeInactive && job.status !== "active" && job.status !== "paused") {
+				return false;
+			}
+			if (command.activeSessionId && job.activeSessionId !== command.activeSessionId) {
+				return false;
+			}
+			return true;
+		});
+		return success(command.id, "cron_list", { jobs });
+	}
+
+	private async handleHeartbeatsList(
+		command: Extract<DaemonCommand, { type: "heartbeats_list" }>,
+	): Promise<DaemonResponse | undefined> {
+		return success(command.id, "heartbeats_list", {
+			heartbeats: this.listHeartbeats(),
+		});
+	}
+
+	private async handleHeartbeatManage(
+		command: Extract<DaemonCommand, { type: "heartbeat_manage" }>,
+	): Promise<DaemonResponse | undefined> {
+		const heartbeat = this.manageHeartbeat(command.activeSessionId, command.jobId, command.action);
+		if (!heartbeat) {
+			throw new Error(`No active heartbeat found: ${command.jobId}`);
+		}
+		return success(command.id, "heartbeat_manage", { heartbeat });
+	}
+
+	private async handleCronAdd(
+		command: Extract<DaemonCommand, { type: "cron_add" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const job = this.createCronJobForState(state, command.schedule, command.prompt);
+		this.scheduleRosterFlush();
+		return success(command.id, "cron_add", { job });
+	}
+
+	private async handleCronCancel(
+		command: Extract<DaemonCommand, { type: "cron_cancel" }>,
+	): Promise<DaemonResponse | undefined> {
+		const job = this.cronStore.cancel(command.jobId);
+		if (!job) {
+			throw new Error(`No cron job found: ${command.jobId}`);
+		}
+		const state = this.sessions.get(job.activeSessionId);
+		if (state) {
+			this.removeQueuedHeartbeatFollowUp(state, job);
+		}
+		this.cronScheduler.wake();
+		this.scheduleRosterFlush();
+		return success(command.id, "cron_cancel", { job });
+	}
+
+	private async handleHeartbeatGet(
+		command: Extract<DaemonCommand, { type: "heartbeat_get" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const heartbeat = this.cronStore.getHeartbeat(state.activeSessionId);
+		return success(command.id, "heartbeat_get", {
+			heartbeat: heartbeat ?? null,
+		});
+	}
+
+	private async handleHeartbeatSet(
+		command: Extract<DaemonCommand, { type: "heartbeat_set" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const deliveryMode = normalizeHeartbeatDeliveryMode(command.deliveryMode);
+		const heartbeat = this.createHeartbeatForState(state, command.schedule, command.prompt, deliveryMode);
+		return success(command.id, "heartbeat_set", { heartbeat });
+	}
+
+	private async handleHeartbeatUpdate(
+		command: Extract<DaemonCommand, { type: "heartbeat_update" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const heartbeat = this.updateHeartbeatForState(state, command.action);
+		return success(command.id, "heartbeat_update", {
+			heartbeat: heartbeat ?? null,
+		});
+	}
+
+	private async handleSetModel(
+		command: Extract<DaemonCommand, { type: "set_model" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const session = state.runtime.session;
+		const availableModels = await session.modelRegistry.refreshAvailableModels();
+		const model = availableModels.find((candidate) => {
+			return candidate.provider === command.provider && candidate.id === command.modelId;
+		});
+		if (!model) {
+			throw new Error(`Model not found: ${command.provider}/${command.modelId}`);
+		}
+		await session.setModel(model, {
+			waitForExtensions: !(session.isStreaming || session.isCompacting),
+		});
+		this.scheduleRosterFlush();
+		return success(command.id, "set_model", model);
+	}
+
+	private async handleCycleModel(
+		command: Extract<DaemonCommand, { type: "cycle_model" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const session = state.runtime.session;
+		const result = await session.cycleModel(command.direction, {
+			waitForExtensions: !(session.isStreaming || session.isCompacting),
+		});
+		this.scheduleRosterFlush();
+		return success(command.id, "cycle_model", result ?? null);
+	}
+
+	private async handleSetScopedModels(
+		command: Extract<DaemonCommand, { type: "set_scoped_models" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		state.runtime.session.setScopedModels(command.scopedModels);
+		return success(command.id, "set_scoped_models");
+	}
+
+	private async handleSetThinkingLevel(
+		command: Extract<DaemonCommand, { type: "set_thinking_level" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		state.runtime.session.setThinkingLevel(command.level);
+		return success(command.id, "set_thinking_level");
+	}
+
+	private async handleSetServiceTier(
+		command: Extract<DaemonCommand, { type: "set_service_tier" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		state.runtime.session.setServiceTier(command.serviceTier);
+		return success(command.id, "set_service_tier");
+	}
+
+	private async handleCycleThinkingLevel(
+		command: Extract<DaemonCommand, { type: "cycle_thinking_level" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const level = state.runtime.session.cycleThinkingLevel();
+		return success(command.id, "cycle_thinking_level", level ? { level } : null);
+	}
+
+	private async handleSetTransport(
+		command: Extract<DaemonCommand, { type: "set_transport" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		state.runtime.session.settingsManager.setTransport(command.transport);
+		state.runtime.session.agent.transport = command.transport;
+		return success(command.id, "set_transport");
+	}
+
+	private async handleSetSteeringMode(
+		command: Extract<DaemonCommand, { type: "set_steering_mode" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		state.runtime.session.setSteeringMode(command.mode);
+		return success(command.id, "set_steering_mode");
+	}
+
+	private async handleSetFollowUpMode(
+		command: Extract<DaemonCommand, { type: "set_follow_up_mode" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		state.runtime.session.setFollowUpMode(command.mode);
+		return success(command.id, "set_follow_up_mode");
+	}
+
+	private async handleSetAutoCompaction(
+		command: Extract<DaemonCommand, { type: "set_auto_compaction" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		state.runtime.session.setAutoCompactionEnabled(command.enabled);
+		return success(command.id, "set_auto_compaction");
+	}
+
+	private async handleSetAutoRetry(
+		command: Extract<DaemonCommand, { type: "set_auto_retry" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		state.runtime.session.setAutoRetryEnabled(command.enabled);
+		return success(command.id, "set_auto_retry");
+	}
+
+	private async handleCompact(
+		command: Extract<DaemonCommand, { type: "compact" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const result = await state.runtime.session.compact(command.customInstructions);
+		return success(command.id, "compact", result);
+	}
+
+	private async handleRefine(
+		command: Extract<DaemonCommand, { type: "refine" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const result = await state.runtime.session.refine({
+			instructions: command.instructions,
+			rollbackId: command.rollbackId,
+			global: command.global,
+		});
+		return success(command.id, "refine", result);
+	}
+
+	private async handleAbortCompaction(
+		command: Extract<DaemonCommand, { type: "abort_compaction" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		state.runtime.session.abortCompaction();
+		return success(command.id, "abort_compaction");
+	}
+
+	private async handleAbortBranchSummary(
+		command: Extract<DaemonCommand, { type: "abort_branch_summary" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		state.runtime.session.abortBranchSummary();
+		return success(command.id, "abort_branch_summary");
+	}
+
+	private async handleAbortRetry(
+		command: Extract<DaemonCommand, { type: "abort_retry" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		state.runtime.session.abortRetry();
+		return success(command.id, "abort_retry");
+	}
+
+	private async handleReload(
+		command: Extract<DaemonCommand, { type: "reload" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		// Reload re-evaluates extension modules, which capture client env
+		// (e.g. herdr pane identity) synchronously at load.
+		await withClientEnv(state.clientEnv, () => state.runtime.session.reload());
+		return success(command.id, "reload");
+	}
+
+	private async handleNewSession(
+		command: Extract<DaemonCommand, { type: "new_session" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
+		const result = await state.runtime.newSession(options);
+		this.rebindCronJobsToState(state);
+		return success(command.id, "new_session", result);
+	}
+
+	private async handleSwitchSession(
+		command: Extract<DaemonCommand, { type: "switch_session" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const result = await state.runtime.switchSession(command.sessionPath, {
+			cwdOverride: command.cwdOverride,
+		});
+		this.rebindCronJobsToState(state);
+		return success(command.id, "switch_session", result);
+	}
+
+	private async handleFork(command: Extract<DaemonCommand, { type: "fork" }>): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const result = await state.runtime.fork(command.entryId, {
+			position: command.position,
+		});
+		this.rebindCronJobsToState(state);
+		return success(command.id, "fork", result);
+	}
+
+	private async handleNavigateTree(
+		command: Extract<DaemonCommand, { type: "navigate_tree" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const result = await state.runtime.session.navigateTree(command.targetId, {
+			summarize: command.summarize,
+			customInstructions: command.customInstructions,
+			replaceInstructions: command.replaceInstructions,
+			label: command.label,
+		});
+		// Carrier-less mutation: branch navigation swaps the message list
+		// without a session event, so the row refresh must be scheduled.
+		this.scheduleRosterFlush();
+		return success(command.id, "navigate_tree", result);
+	}
+
+	private async handleImportJsonl(
+		command: Extract<DaemonCommand, { type: "import_jsonl" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const result = await state.runtime.importFromJsonl(command.inputPath, command.cwdOverride);
+		return success(command.id, "import_jsonl", result);
+	}
+
+	private async handleExportHtml(
+		command: Extract<DaemonCommand, { type: "export_html" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const path = await state.runtime.session.exportToHtml(command.outputPath);
+		return success(command.id, "export_html", { path });
+	}
+
+	private async handleExportJsonl(
+		command: Extract<DaemonCommand, { type: "export_jsonl" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const path = state.runtime.session.exportToJsonl(command.outputPath);
+		return success(command.id, "export_jsonl", { path });
+	}
+
+	private async handleSetSessionName(
+		command: Extract<DaemonCommand, { type: "set_session_name" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const name = command.name.trim();
+		if (!name) {
+			throw new Error("Session name cannot be empty");
+		}
+		await this.setStateSessionNameForCommand(state, name);
+		return success(command.id, "set_session_name");
+	}
+
+	private async handleGetRlmMaxDepthStatus(
+		command: Extract<DaemonCommand, { type: "get_rlm_max_depth_status" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		return success(command.id, "get_rlm_max_depth_status", state.runtime.session.getRlmMaxDepthStatus());
+	}
+
+	private async handleSetRlmMaxDepth(
+		command: Extract<DaemonCommand, { type: "set_rlm_max_depth" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const result = await state.runtime.session.setRlmMaxDepth(command.maxDepth, { global: command.global });
+		return success(command.id, "set_rlm_max_depth", result);
+	}
+
+	private async handleGetSessionContext(
+		command: Extract<DaemonCommand, { type: "get_session_context" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		return success(command.id, "get_session_context", {
+			context: state.runtime.session.buildSessionContext(),
+		});
+	}
+
+	private async handleGetSessionTree(
+		command: Extract<DaemonCommand, { type: "get_session_tree" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const sessionManager = state.runtime.session.sessionManager;
+		// Every entry ships whole, so an uncapped response is O(entries) bytes - a
+		// 100k-entry session is ~90MB per call. The cap keeps the live leaf's entry
+		// and ancestor chain first and the newest entries after them: the leaf is NOT
+		// the last entry in file order after a rewind, because branch() records the
+		// move with a leaf_position marker appended as the file's last line, so a
+		// pure tail cut would drop the resumable branch while leafId still points at
+		// it. The stats travel to the client so the omission is reportable, not
+		// silent.
+		const bounded = sessionManager.getBoundedFlatTree();
+		if (bounded.stats.truncated) {
+			this.log(
+				`get_session_tree truncated: ${bounded.stats.returnedNodes} of ${bounded.stats.totalEntries} entries (max ${bounded.stats.maxNodes}); older branches omitted`,
+			);
+		}
+		return success(command.id, "get_session_tree", {
+			flatNodes: bounded.nodes,
+			leafId: sessionManager.getLeafId(),
+			treeBound: bounded.stats,
+		});
+	}
+
+	private async handleGetUserMessagesForForking(
+		command: Extract<DaemonCommand, { type: "get_user_messages_for_forking" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		return success(command.id, "get_user_messages_for_forking", {
+			messages: state.runtime.session.getUserMessagesForForking(),
+		});
+	}
+
+	private async handleGetLastAssistantText(
+		command: Extract<DaemonCommand, { type: "get_last_assistant_text" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		return success(command.id, "get_last_assistant_text", {
+			text: state.runtime.session.getLastAssistantText(),
+		});
+	}
+
+	private async handleGetSystemPrompt(
+		command: Extract<DaemonCommand, { type: "get_system_prompt" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		return success(command.id, "get_system_prompt", {
+			systemPrompt: state.runtime.session.systemPrompt,
+		});
+	}
+
+	private async handleGetToolDefinition(
+		command: Extract<DaemonCommand, { type: "get_tool_definition" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		return success(command.id, "get_tool_definition", {
+			toolDefinition: createAgentConnectionToolDefinition(state.runtime.session.getToolDefinition(command.name)),
+		});
+	}
+
+	private async handleSetSessionEntryLabel(
+		command: Extract<DaemonCommand, { type: "set_session_entry_label" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		state.runtime.session.sessionManager.appendLabelChange(command.entryId, command.label);
+		return success(command.id, "set_session_entry_label");
+	}
+
+	private async handleExtensionUiResponse(
+		command: Extract<DaemonCommand, { type: "extension_ui_response" }>,
+	): Promise<DaemonResponse | undefined> {
+		const state = this.getSessionState(command.activeSessionId);
+		const pending = state.extensionUiRequests.get(command.requestId);
+		if (!pending) {
+			throw new Error(`Unknown extension UI request: ${command.requestId}`);
+		}
+		state.extensionUiRequests.delete(command.requestId);
+		pending.resolve(command.response);
+		return success(command.id, "extension_ui_response");
+	}
+
+	private async handleDeclareClientCapabilities(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "declare_client_capabilities" }>,
+	): Promise<DaemonResponse | undefined> {
+		client.declaredCommandCapabilities = new Set(normalizeDeclaredCapabilities(command.capabilities));
+		client.declaredCapabilities = true;
+		return success(command.id, command.type, { declared: [...client.declaredCommandCapabilities] });
+	}
+
+	private async handlePrepareUpdateRestart(
+		command: Extract<DaemonCommand, { type: "prepare_update_restart" }>,
+	): Promise<DaemonResponse | undefined> {
+		this.log(
+			`prepare_update_restart command received over socket; ${this.sessions.size} active session(s) will be closed`,
+		);
+		return success(command.id, "prepare_update_restart", await this.prepareUpdateRestart());
+	}
+
+	private async handleRetryWorker(): Promise<DaemonResponse | undefined> {
+		throw new Error("Worker retry is only available through the daemon supervisor");
+	}
+
+	private async handleRestart(
+		command: Extract<DaemonCommand, { type: "restart" }>,
+	): Promise<DaemonResponse | undefined> {
+		setImmediate(() => {
+			void this.shutdown(0);
+		});
+		return success(command.id, command.type);
+	}
+
+	private async handleShutdown(
+		command: Extract<DaemonCommand, { type: "shutdown" }>,
+	): Promise<DaemonResponse | undefined> {
+		this.log(`shutdown command received over socket; ${this.sessions.size} active session(s) will be closed`);
+		setImmediate(() => {
+			void this.shutdown(0);
+		});
+		return success(command.id, "shutdown");
 	}
 
 	private async createAttachResult(

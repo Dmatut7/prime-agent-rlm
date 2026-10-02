@@ -347,8 +347,14 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   No wire shape moved after e3a945792 - the mirror only grew the field
 //   the daemon wire already carried - so the fix is the rev-37-class
 //   in-place recomputation below, not a new revision window.
+//   Recovery (wave-20 W20-A): the AgentDaemon.handleCommand table refactor
+//   moved the get_session_tree response assembly out of the switch case the
+//   treeAssembly slice hashed and into the handleGetSessionTree method, so
+//   the slice markers moved from the case labels to the handler names (same
+//   response keys, byte-moved body). No wire shape moved, so this is another
+//   rev-37-class in-place recomputation, not a new revision window.
 export const DAEMON_SCHEMA_REVISION = 44;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-44-69c0ff689f92";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-44-381c9c9e5e17";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;

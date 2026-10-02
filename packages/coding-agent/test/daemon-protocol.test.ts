@@ -138,8 +138,8 @@ function readDaemonSchemaSliceSources(): DaemonSchemaSliceSources {
 			daemonProtocolSource.indexOf("export interface DaemonAttachResult"),
 		),
 		treeAssembly: daemonModeSource.slice(
-			daemonModeSource.indexOf('case "get_session_tree": {'),
-			daemonModeSource.indexOf('case "get_user_messages_for_forking": {'),
+			daemonModeSource.indexOf("private async handleGetSessionTree("),
+			daemonModeSource.indexOf("private async handleGetUserMessagesForForking("),
 		),
 		connectionTreeContract: connectionTypesSource.slice(
 			connectionTypesSource.indexOf("export interface AgentConnectionSessionTreeFlatNode"),
@@ -308,9 +308,9 @@ describe("daemon protocol helpers", () => {
 		expect(sources.stallExemption).toContain("export interface StallExemptionDiagnostics");
 		expect(sources.snapshotWrapper).toContain("export interface DaemonSessionSnapshot");
 		expect(sources.snapshotWrapper).toContain("bound?: SessionTreeDepthStats");
-		expect(sources.treeAssembly).toContain('case "get_session_tree"');
-		// The assembly slice must carry the actual response keys, not just the case label:
-		// a renamed key with a stale marker would otherwise hash unrelated text.
+		expect(sources.treeAssembly).toContain("private async handleGetSessionTree(");
+		// The assembly slice must carry the actual response keys, not just the handler
+		// name: a renamed key with a stale marker would otherwise hash unrelated text.
 		expect(sources.treeAssembly).toContain("treeBound: bounded.stats");
 		expect(sources.connectionTreeContract).toContain("export interface AgentConnectionSessionTreeBound");
 		expect(sources.connectionTreeContract).toContain("export interface AgentConnectionSessionTreeFlatStats");
