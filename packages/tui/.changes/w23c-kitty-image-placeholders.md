@@ -1,0 +1,1 @@
+- Changed Ghostty image rendering to kitty Unicode placeholders (text-grid cells, one transmit per image), restoring inline and fullscreen image display without the inline-sequence redraw freezes; `PI_TERMINAL_KITTY_PLACEHOLDERS=0` restores the text fallback and `PI_ENABLE_GHOSTTY_IMAGES=1` still selects the legacy inline path.

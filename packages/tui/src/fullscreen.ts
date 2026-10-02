@@ -7,7 +7,7 @@
 
 import type { ClickRegion, StickyHeader } from "./click-regions.js";
 import { contentStartColumn, type TableCellSelectionRegion } from "./selection-metadata.js";
-import { isImageLine } from "./terminal-image.js";
+import { isImageLine, isImageSequenceLine } from "./terminal-image.js";
 import { sliceByColumn, stripAnsi, urlAtColumn, visibleWidth } from "./utils.js";
 
 export const FULLSCREEN_MIN_TRANSCRIPT_ROWS = 3;
@@ -20,7 +20,9 @@ export function clippedFullscreenDockHeight(dockLength: number, height: number):
 	return Math.min(dockLength, maxDock);
 }
 
-// Kitty images span multiple physical rows and cannot be clipped to a window.
+// Inline graphics sequences span multiple physical rows and cannot be clipped
+// to a window. Kitty Unicode placeholder rows are plain text cells and pass
+// through: the terminal clips them like any other text.
 const IMAGE_PLACEHOLDER = "\x1b[2m[image — view in inline mode]\x1b[0m";
 
 export interface ScrollInfo {
@@ -250,7 +252,7 @@ export class FullscreenViewport {
 
 		const window = transcript.slice(this.scrollTop, this.scrollTop + windowHeight);
 		for (let i = 0; i < window.length; i++) {
-			if (isImageLine(window[i])) window[i] = IMAGE_PLACEHOLDER;
+			if (isImageSequenceLine(window[i])) window[i] = IMAGE_PLACEHOLDER;
 		}
 		this.highlightSelection(window);
 		while (window.length < windowHeight) {
@@ -294,7 +296,7 @@ export class FullscreenViewport {
 				.render(top - header.line)
 				.slice(0, maxRows)
 				.map((row) => {
-					if (isImageLine(row)) return IMAGE_PLACEHOLDER;
+					if (isImageSequenceLine(row)) return IMAGE_PLACEHOLDER;
 					return visibleWidth(row) > width ? sliceByColumn(row, 0, width, true) : row;
 				});
 			if (rows.length > 0 && top + rows.length <= header.endLine) return { header, rows };

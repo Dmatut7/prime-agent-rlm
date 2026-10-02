@@ -1,4 +1,5 @@
 import { eastAsianWidth } from "get-east-asian-width";
+import { KITTY_PLACEHOLDER_CODEPOINT } from "./terminal-image.js";
 
 // Grapheme segmenter (shared instance)
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
@@ -167,6 +168,13 @@ function finalizeTruncatedResult(
  * check to avoid running the RGI_Emoji regex unnecessarily.
  */
 function graphemeWidth(segment: string): number {
+	// Kitty image placeholder cells (U+10EEEE + row/column diacritics): the
+	// terminal renders each cell as one column, but the base is a
+	// default-ignorable PUA code point the zero-width rules below would eat.
+	if (segment.codePointAt(0) === KITTY_PLACEHOLDER_CODEPOINT) {
+		return 1;
+	}
+
 	// Zero-width clusters
 	if (zeroWidthRegex.test(segment)) {
 		return 0;

@@ -5,7 +5,7 @@ import { setKittyProtocolActive } from "./keys.js";
 import { ProbeBus } from "./probe-bus.js";
 import { StdinBuffer } from "./stdin-buffer.js";
 import { setDefaultTerminalColors } from "./terminal-colors.js";
-import { getCapabilities } from "./terminal-image.js";
+import { drainKittyImageTransmits, getCapabilities, invalidateKittyImageTransmits } from "./terminal-image.js";
 import { isGrapheme2027Active, setGrapheme2027Active } from "./utils.js";
 
 const cjsRequire = createRequire(import.meta.url);
@@ -515,10 +515,15 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	write(data: string): void {
-		process.stdout.write(data);
+		// Kitty placeholder images upload once per screen generation (see
+		// terminal-image.ts); the transmit must reach the terminal before the
+		// placeholder cells that reference it, so flush it ahead of every write.
+		const transmits = drainKittyImageTransmits();
+		const out = transmits === "" ? data : transmits + data;
+		process.stdout.write(out);
 		if (this.writeLogPath) {
 			try {
-				fs.appendFileSync(this.writeLogPath, data, { encoding: "utf8" });
+				fs.appendFileSync(this.writeLogPath, out, { encoding: "utf8" });
 			} catch {
 				// Ignore logging errors
 			}
@@ -565,6 +570,9 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	enterAltScreen(): void {
+		// The alt screen keeps its own kitty image storage; placeholder
+		// transmits made on the main screen do not carry over.
+		invalidateKittyImageTransmits();
 		if (this._altScreenActive) return;
 		if (this.ownsPendingAltScreenHandoff()) {
 			pendingAltScreenHandoff = undefined;
@@ -588,6 +596,8 @@ export class ProcessTerminal implements Terminal {
 		const ownsPendingHandoff = this.ownsPendingAltScreenHandoff();
 		if (!this._altScreenActive && !ownsPendingHandoff) return;
 		this._altScreenActive = false;
+		// Back on the main screen, alt-screen placeholder transmits are gone.
+		invalidateKittyImageTransmits();
 		if (ownsPendingHandoff) {
 			pendingAltScreenHandoff = undefined;
 			cancelInputHandoff(this.altScreenHandoffToken);

@@ -12,7 +12,8 @@
  * - `PI_TERMINAL_<CAP>` - per-capability terminal probe overrides
  *   (`0` = off, `1` = force on, unset = probe): KITTY_KEYBOARD, SYNC_2026,
  *   GRAPHEME_2027, SCHEME_2031, OSC_COLORS, CELL_SIZE (read in
- *   packages/tui/src/probe-bus.ts).
+ *   packages/tui/src/probe-bus.ts), plus KITTY_PLACEHOLDERS for kitty
+ *   unicode-placeholder image rendering (packages/tui/src/terminal-image.ts).
  */
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";

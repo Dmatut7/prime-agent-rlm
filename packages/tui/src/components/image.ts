@@ -1,11 +1,14 @@
 import {
 	allocateImageId,
+	allocatePlaceholderImageId,
 	getCapabilities,
 	getCellDimensionsVersion,
 	getImageDimensions,
+	getKittyImageTransmitsVersion,
 	type ImageDimensions,
 	imageFallback,
 	renderImage,
+	renderKittyPlaceholderImage,
 } from "../terminal-image.js";
 import type { Component } from "../tui.js";
 
@@ -49,6 +52,7 @@ export class Image implements Component {
 	private cachedWidth?: number;
 	private cachedFullscreenFallback?: boolean;
 	private cachedCellDimensionsVersion?: number;
+	private cachedKittyTransmitsVersion?: number;
 
 	constructor(
 		base64Data: string,
@@ -82,15 +86,18 @@ export class Image implements Component {
 		this.cachedWidth = undefined;
 		this.cachedFullscreenFallback = undefined;
 		this.cachedCellDimensionsVersion = undefined;
+		this.cachedKittyTransmitsVersion = undefined;
 	}
 
 	render(width: number): string[] {
 		const cellDimensionsVersion = getCellDimensionsVersion();
+		const kittyTransmitsVersion = getKittyImageTransmitsVersion();
 		if (
 			this.cachedLines &&
 			this.cachedWidth === width &&
 			this.cachedFullscreenFallback === fullscreenFallback &&
-			this.cachedCellDimensionsVersion === cellDimensionsVersion
+			this.cachedCellDimensionsVersion === cellDimensionsVersion &&
+			this.cachedKittyTransmitsVersion === kittyTransmitsVersion
 		) {
 			return this.cachedLines;
 		}
@@ -98,13 +105,30 @@ export class Image implements Component {
 		const maxWidth = Math.min(width - 2, this.options.maxWidthCells ?? 60);
 
 		const caps = getCapabilities();
+		// Placeholder rows are text cells: they survive the fullscreen window's
+		// clipping and the scrollback redraw loop, so the fullscreen text
+		// fallback does not apply to them.
+		const usePlaceholders =
+			caps.images === "kitty" &&
+			caps.imagePlaceholders === true &&
+			this.base64Data !== undefined &&
+			this.options.fallbackOnly !== true;
 		let lines: string[];
 
-		if (fullscreenFallback || this.options.fallbackOnly === true) {
+		if ((fullscreenFallback && !usePlaceholders) || this.options.fallbackOnly === true) {
 			const parts = [this.mimeType];
 			parts.push(`${this.dimensions.widthPx}×${this.dimensions.heightPx}`);
 			if (this.options.filename) parts.unshift(this.options.filename);
 			lines = [this.theme.fallbackColor(`${this.options.fallbackPrefix ?? ""}[${parts.join(" · ")}]`)];
+		} else if (usePlaceholders && this.base64Data !== undefined) {
+			if (this.imageId === undefined) {
+				this.imageId = allocatePlaceholderImageId();
+			}
+			const result = renderKittyPlaceholderImage(this.base64Data, this.dimensions, {
+				maxWidthCells: maxWidth,
+				imageId: this.imageId,
+			});
+			lines = result.lines;
 		} else if (caps.images && this.base64Data !== undefined) {
 			if (caps.images === "kitty" && this.imageId === undefined) {
 				this.imageId = allocateImageId();
@@ -146,6 +170,7 @@ export class Image implements Component {
 		this.cachedWidth = width;
 		this.cachedFullscreenFallback = fullscreenFallback;
 		this.cachedCellDimensionsVersion = cellDimensionsVersion;
+		this.cachedKittyTransmitsVersion = kittyTransmitsVersion;
 
 		return lines;
 	}

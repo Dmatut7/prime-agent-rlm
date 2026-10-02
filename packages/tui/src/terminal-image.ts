@@ -2,6 +2,12 @@ export type ImageProtocol = "kitty" | "iterm2" | null;
 
 export interface TerminalCapabilities {
 	images: ImageProtocol;
+	/**
+	 * Kitty images render as Unicode placeholder cells (U+10EEEE grid, kitty
+	 * 0.28+) instead of inline graphics sequences: the transmit goes out once
+	 * per image and the redraw loop only ever rewrites text cells.
+	 */
+	imagePlaceholders?: boolean;
 	trueColor: boolean;
 	hyperlinks: boolean;
 }
@@ -70,6 +76,10 @@ export function detectCapabilities(): TerminalCapabilities {
 	const enableGhosttyImages = ["1", "true", "yes", "on"].includes(
 		(process.env.PI_ENABLE_GHOSTTY_IMAGES ?? "").toLowerCase(),
 	);
+	// PI_TERMINAL_KITTY_PLACEHOLDERS follows the probe-bus escape-hatch
+	// convention (docs/fork/probe-bus-design.md §3.4): exactly "0" disables,
+	// exactly "1" forces on for any kitty-protocol terminal.
+	const placeholderOverride = process.env.PI_TERMINAL_KITTY_PLACEHOLDERS ?? "";
 
 	// tmux and screen swallow OSC 8 by default (passthrough is opt-in and wraps
 	// sequences differently). Force hyperlinks off whenever we detect them, even
@@ -82,27 +92,28 @@ export function detectCapabilities(): TerminalCapabilities {
 	}
 
 	if (process.env.KITTY_WINDOW_ID || termProgram === "kitty") {
-		return { images: "kitty", trueColor: true, hyperlinks: true };
-	}
-
-	if (
-		enableGhosttyImages &&
-		(termProgram === "ghostty" || term.includes("ghostty") || process.env.GHOSTTY_RESOURCES_DIR)
-	) {
-		return { images: "kitty", trueColor: true, hyperlinks: true };
+		return { images: "kitty", imagePlaceholders: placeholderOverride === "1", trueColor: true, hyperlinks: true };
 	}
 
 	if (termProgram === "ghostty" || term.includes("ghostty") || process.env.GHOSTTY_RESOURCES_DIR) {
-		// Ghostty advertises Kitty graphics support, but Prime Agent's scrollback
-		// redraw loop has repeatedly frozen user sessions when image escape
-		// sequences are emitted inline. Prefer the text fallback by default so
-		// attach_image remains safe; opt in with PI_ENABLE_GHOSTTY_IMAGES=1 while
-		// testing terminal-image rendering changes.
-		return { images: null, trueColor: true, hyperlinks: true };
+		if (enableGhosttyImages) {
+			// Legacy inline kitty sequences, kept as an explicit testing opt-in:
+			// they repeatedly froze Ghostty sessions when re-emitted by the
+			// scrollback redraw loop. The default below renders through Unicode
+			// placeholders instead, which keeps graphics data out of the redraw
+			// stream entirely.
+			return { images: "kitty", imagePlaceholders: false, trueColor: true, hyperlinks: true };
+		}
+		if (placeholderOverride === "0") {
+			return { images: null, trueColor: true, hyperlinks: true };
+		}
+		// Every released Ghostty (graphics_unicode.zig landed before v1.0.0)
+		// implements kitty Unicode placeholders.
+		return { images: "kitty", imagePlaceholders: true, trueColor: true, hyperlinks: true };
 	}
 
 	if (process.env.WEZTERM_PANE || termProgram === "wezterm") {
-		return { images: "kitty", trueColor: true, hyperlinks: true };
+		return { images: "kitty", imagePlaceholders: placeholderOverride === "1", trueColor: true, hyperlinks: true };
 	}
 
 	if (process.env.ITERM_SESSION_ID || termProgram === "iterm.app") {
@@ -146,13 +157,37 @@ export function setCapabilities(caps: TerminalCapabilities): void {
 const KITTY_PREFIX = "\x1b_G";
 const ITERM2_PREFIX = "\x1b]1337;File=";
 
-export function isImageLine(line: string): boolean {
+/**
+ * The kitty graphics Unicode placeholder character (kitty 0.28+). Each cell of
+ * an image's text-grid footprint is this code point plus combining diacritics.
+ */
+export const KITTY_PLACEHOLDER_CODEPOINT = 0x10eeee;
+export const KITTY_PLACEHOLDER_CHAR = "\u{10EEEE}";
+
+/**
+ * Lines carrying inline graphics escape sequences (kitty APC / iTerm2 OSC).
+ * These must never enter a diffed repaint region unchanged: re-writing them
+ * re-uploads the payload (the Ghostty freeze this file's placeholder path
+ * exists to avoid).
+ */
+export function isImageSequenceLine(line: string): boolean {
 	// Fast path: sequence at line start (single-row images)
 	if (line.startsWith(KITTY_PREFIX) || line.startsWith(ITERM2_PREFIX)) {
 		return true;
 	}
 	// Slow path: sequence elsewhere (multi-row images have cursor-up prefix)
 	return line.includes(KITTY_PREFIX) || line.includes(ITERM2_PREFIX);
+}
+
+/**
+ * Any line the renderer must treat as image content: inline graphics sequences
+ * or Unicode placeholder cell rows. Placeholder rows are plain text and safe to
+ * repaint; the distinction matters only where raw sequences would be
+ * re-emitted or cannot be clipped (fullscreen), which is what
+ * isImageSequenceLine is for.
+ */
+export function isImageLine(line: string): boolean {
+	return isImageSequenceLine(line) || line.includes(KITTY_PLACEHOLDER_CHAR);
 }
 
 const IMAGE_LINE_CURSOR_UP = /^\x1b\[(\d+)A/;
@@ -197,14 +232,18 @@ export function encodeKitty(
 		moveCursor?: boolean;
 	} = {},
 ): string {
-	const CHUNK_SIZE = 4096;
-
 	const params: string[] = ["a=T", "f=100", "q=2"];
 
 	if (options.moveCursor === false) params.push("C=1");
 	if (options.columns) params.push(`c=${options.columns}`);
 	if (options.rows) params.push(`r=${options.rows}`);
 	if (options.imageId) params.push(`i=${options.imageId}`);
+
+	return encodeKittyChunks(base64Data, params);
+}
+
+function encodeKittyChunks(base64Data: string, params: string[]): string {
+	const CHUNK_SIZE = 4096;
 
 	if (base64Data.length <= CHUNK_SIZE) {
 		return `\x1b_G${params.join(",")};${base64Data}\x1b\\`;
@@ -247,6 +286,146 @@ export function deleteKittyImage(imageId: number): string {
  */
 export function deleteAllKittyImages(): string {
 	return "\x1b_Ga=d,d=A,q=2\x1b\\";
+}
+
+/**
+ * Row/column diacritics for kitty Unicode placeholders, index = grid number.
+ * Copied from kitty's gen/rowcolumn-diacritics.txt (the graphics protocol's
+ * canonical table); 0x0305 is row/column 0 per the spec's own examples.
+ */
+const ROWCOLUMN_DIACRITICS: readonly number[] = [
+	0x0305, 0x030d, 0x030e, 0x0310, 0x0312, 0x033d, 0x033e, 0x033f, 0x0346, 0x034a, 0x034b, 0x034c, 0x0350, 0x0351,
+	0x0352, 0x0357, 0x035b, 0x0363, 0x0364, 0x0365, 0x0366, 0x0367, 0x0368, 0x0369, 0x036a, 0x036b, 0x036c, 0x036d,
+	0x036e, 0x036f, 0x0483, 0x0484, 0x0485, 0x0486, 0x0487, 0x0592, 0x0593, 0x0594, 0x0595, 0x0597, 0x0598, 0x0599,
+	0x059c, 0x059d, 0x059e, 0x059f, 0x05a0, 0x05a1, 0x05a8, 0x05a9, 0x05ab, 0x05ac, 0x05af, 0x05c4, 0x0610, 0x0611,
+	0x0612, 0x0613, 0x0614, 0x0615, 0x0616, 0x0617, 0x0657, 0x0658, 0x0659, 0x065a, 0x065b, 0x065d, 0x065e, 0x06d6,
+	0x06d7, 0x06d8, 0x06d9, 0x06da, 0x06db, 0x06dc, 0x06df, 0x06e0, 0x06e1, 0x06e2, 0x06e4, 0x06e7, 0x06e8, 0x06eb,
+	0x06ec, 0x0730, 0x0732, 0x0733, 0x0735, 0x0736, 0x073a, 0x073d, 0x073f, 0x0740, 0x0741, 0x0743, 0x0745, 0x0747,
+	0x0749, 0x074a, 0x07eb, 0x07ec, 0x07ed, 0x07ee, 0x07ef, 0x07f0, 0x07f1, 0x07f3, 0x0816, 0x0817, 0x0818, 0x0819,
+	0x081b, 0x081c, 0x081d, 0x081e, 0x081f, 0x0820, 0x0821, 0x0822, 0x0823, 0x0825, 0x0826, 0x0827, 0x0829, 0x082a,
+	0x082b, 0x082c, 0x082d, 0x0951, 0x0953, 0x0954, 0x0f82, 0x0f83, 0x0f86, 0x0f87, 0x135d, 0x135e, 0x135f, 0x17dd,
+	0x193a, 0x1a17, 0x1a75, 0x1a76, 0x1a77, 0x1a78, 0x1a79, 0x1a7a, 0x1a7b, 0x1a7c, 0x1b6b, 0x1b6d, 0x1b6e, 0x1b6f,
+	0x1b70, 0x1b71, 0x1b72, 0x1b73, 0x1cd0, 0x1cd1, 0x1cd2, 0x1cda, 0x1cdb, 0x1ce0, 0x1dc0, 0x1dc1, 0x1dc3, 0x1dc4,
+	0x1dc5, 0x1dc6, 0x1dc7, 0x1dc8, 0x1dc9, 0x1dcb, 0x1dcc, 0x1dd1, 0x1dd2, 0x1dd3, 0x1dd4, 0x1dd5, 0x1dd6, 0x1dd7,
+	0x1dd8, 0x1dd9, 0x1dda, 0x1ddb, 0x1ddc, 0x1ddd, 0x1dde, 0x1ddf, 0x1de0, 0x1de1, 0x1de2, 0x1de3, 0x1de4, 0x1de5,
+	0x1de6, 0x1dfe, 0x20d0, 0x20d1, 0x20d4, 0x20d5, 0x20d6, 0x20d7, 0x20db, 0x20dc, 0x20e1, 0x20e7, 0x20e9, 0x20f0,
+	0x2cef, 0x2cf0, 0x2cf1, 0x2de0, 0x2de1, 0x2de2, 0x2de3, 0x2de4, 0x2de5, 0x2de6, 0x2de7, 0x2de8, 0x2de9, 0x2dea,
+	0x2deb, 0x2dec, 0x2ded, 0x2dee, 0x2def, 0x2df0, 0x2df1, 0x2df2, 0x2df3, 0x2df4, 0x2df5, 0x2df6, 0x2df7, 0x2df8,
+	0x2df9, 0x2dfa, 0x2dfb, 0x2dfc, 0x2dfd, 0x2dfe, 0x2dff, 0xa66f, 0xa67c, 0xa67d, 0xa6f0, 0xa6f1, 0xa8e0, 0xa8e1,
+	0xa8e2, 0xa8e3, 0xa8e4, 0xa8e5, 0xa8e6, 0xa8e7, 0xa8e8, 0xa8e9, 0xa8ea, 0xa8eb, 0xa8ec, 0xa8ed, 0xa8ee, 0xa8ef,
+	0xa8f0, 0xa8f1, 0xaab0, 0xaab2, 0xaab3, 0xaab7, 0xaab8, 0xaabe, 0xaabf, 0xaac1, 0xfe20, 0xfe21, 0xfe22, 0xfe23,
+	0xfe24, 0xfe25, 0xfe26, 0x10a0f, 0x10a38, 0x1d185, 0x1d186, 0x1d187, 0x1d188, 0x1d189, 0x1d1aa, 0x1d1ab, 0x1d1ac,
+	0x1d1ad, 0x1d242, 0x1d243, 0x1d244,
+];
+
+/** Largest placeholder grid dimension the diacritic table can encode. */
+export const KITTY_PLACEHOLDER_GRID_LIMIT = ROWCOLUMN_DIACRITICS.length;
+
+function rowcolumnDiacritic(value: number): string {
+	return String.fromCodePoint(ROWCOLUMN_DIACRITICS[value]!);
+}
+
+/**
+ * Image ids for the placeholder path live in the 24-bit range the foreground
+ * color encodes directly, keeping the per-cell diacritic count at two.
+ */
+export function allocatePlaceholderImageId(): number {
+	return Math.floor(Math.random() * 0xffffff) + 1;
+}
+
+export interface KittyPlaceholderRowsOptions {
+	imageId: number;
+	columns: number;
+	rows: number;
+}
+
+/**
+ * The text-grid footprint of an image as placeholder cell rows (kitty 0.28+).
+ * Every cell carries explicit row and column diacritics: the spec's
+ * left-neighbor inheritance breaks under horizontal clipping, which the
+ * fullscreen window applies constantly. The image id sits in the foreground
+ * color (24-bit) plus, for larger ids, the spec's third diacritic.
+ */
+export function encodeKittyPlaceholderRows(options: KittyPlaceholderRowsOptions): string[] {
+	const columns = Math.max(1, Math.min(options.columns, KITTY_PLACEHOLDER_GRID_LIMIT));
+	const rows = Math.max(1, Math.min(options.rows, KITTY_PLACEHOLDER_GRID_LIMIT));
+	const id = options.imageId;
+	const highByte = id > 0xffffff ? rowcolumnDiacritic(id >>> 24) : "";
+	const color = `\x1b[38;2;${(id >> 16) & 0xff};${(id >> 8) & 0xff};${id & 0xff}m`;
+
+	const lines: string[] = [];
+	for (let row = 0; row < rows; row++) {
+		const rowDiacritic = rowcolumnDiacritic(row);
+		let line = color;
+		for (let column = 0; column < columns; column++) {
+			line += KITTY_PLACEHOLDER_CHAR + rowDiacritic + rowcolumnDiacritic(column) + highByte;
+		}
+		lines.push(`${line}\x1b[39m`);
+	}
+	return lines;
+}
+
+/**
+ * Transmit once per (image id, grid geometry): the kitty virtual placement
+ * (a=T,U=1) uploads the payload without displaying it, and the placeholder
+ * cell rows reference it afterwards. ProcessTerminal.write flushes the queue
+ * ahead of whatever frame carries the cells, so the redraw stream itself only
+ * ever contains text.
+ */
+const placeholderTransmits = new Map<number, string>();
+let placeholderTransmitQueue: string[] = [];
+let placeholderTransmitsVersion = 0;
+
+export function getKittyImageTransmitsVersion(): number {
+	return placeholderTransmitsVersion;
+}
+
+/** Queued transmit sequences, oldest first; empties the queue. */
+export function drainKittyImageTransmits(): string {
+	if (placeholderTransmitQueue.length === 0) return "";
+	const drained = placeholderTransmitQueue.join("");
+	placeholderTransmitQueue = [];
+	return drained;
+}
+
+/**
+ * Forget every transmitted image (the alt screen keeps its own image storage,
+ * so screen switches re-transmit). Bumps the version so components holding
+ * cached placeholder lines re-render and re-queue their transmit.
+ */
+export function invalidateKittyImageTransmits(): void {
+	placeholderTransmits.clear();
+	placeholderTransmitsVersion++;
+}
+
+export interface KittyPlaceholderRender {
+	lines: string[];
+	rows: number;
+	columns: number;
+	imageId: number;
+}
+
+export function renderKittyPlaceholderImage(
+	base64Data: string,
+	imageDimensions: ImageDimensions,
+	options: { maxWidthCells?: number; imageId: number },
+): KittyPlaceholderRender {
+	const columns = Math.max(1, Math.min(options.maxWidthCells ?? 80, KITTY_PLACEHOLDER_GRID_LIMIT));
+	const rows = Math.max(
+		1,
+		Math.min(calculateImageRows(imageDimensions, columns, getCellDimensions()), KITTY_PLACEHOLDER_GRID_LIMIT),
+	);
+	const imageId = options.imageId;
+
+	const geometry = `${columns}x${rows}`;
+	if (placeholderTransmits.get(imageId) !== geometry) {
+		placeholderTransmits.set(imageId, geometry);
+		placeholderTransmitQueue.push(
+			encodeKittyChunks(base64Data, ["a=T", "U=1", "f=100", "q=2", `i=${imageId}`, `c=${columns}`, `r=${rows}`]),
+		);
+	}
+
+	return { lines: encodeKittyPlaceholderRows({ imageId, columns, rows }), rows, columns, imageId };
 }
 
 export function encodeITerm2(

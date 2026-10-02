@@ -5,7 +5,15 @@ import { Image } from "../src/components/image.js";
 import { Markdown } from "../src/components/markdown.js";
 import { FullscreenViewport } from "../src/fullscreen.js";
 import type { TerminalStopOptions } from "../src/terminal.js";
-import { resetCapabilitiesCache, setCapabilities, setCellDimensions } from "../src/terminal-image.js";
+import {
+	drainKittyImageTransmits,
+	encodeKittyPlaceholderRows,
+	invalidateKittyImageTransmits,
+	KITTY_PLACEHOLDER_CHAR,
+	resetCapabilitiesCache,
+	setCapabilities,
+	setCellDimensions,
+} from "../src/terminal-image.js";
 import { type Component, Container, TUI } from "../src/tui.js";
 import { defaultMarkdownTheme } from "./test-themes.js";
 import { VirtualTerminal } from "./virtual-terminal.js";
@@ -216,6 +224,54 @@ describe("TUI fullscreen mode", () => {
 			tui.stop();
 		} finally {
 			resetCapabilitiesCache();
+		}
+	});
+
+	it("passes unicode-placeholder image rows through the fullscreen window", () => {
+		const viewport = new FullscreenViewport();
+		const placeholderRows = encodeKittyPlaceholderRows({ imageId: 42, columns: 3, rows: 2 });
+		const transcript = ["before", ...placeholderRows, "after"];
+		const frame = viewport.composeFrame(transcript, ["dock"], 6);
+		assert.ok(frame.includes(placeholderRows[0]!));
+		assert.ok(frame.includes(placeholderRows[1]!));
+		assert.ok(!frame.some((line) => line.includes("view in inline mode")));
+	});
+
+	it("still substitutes inline graphics-sequence lines in the fullscreen window", () => {
+		const viewport = new FullscreenViewport();
+		const transcript = ["before", "\x1b_Ga=T,f=100;data\x1b\\", "after"];
+		const frame = viewport.composeFrame(transcript, ["dock"], 5);
+		assert.ok(frame.some((line) => line.includes("view in inline mode")));
+	});
+
+	it("renders unicode-placeholder images directly in fullscreen without inline sequences", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true, imagePlaceholders: true });
+		setCellDimensions({ widthPx: 10, heightPx: 10 });
+		invalidateKittyImageTransmits();
+		drainKittyImageTransmits();
+		try {
+			const { terminal, tui, chat, dock } = setup(["before"], 80);
+			const image = new Image(
+				"AAAA",
+				"image/png",
+				{ fallbackColor: (value) => value },
+				{ maxWidthCells: 4 },
+				{ widthPx: 20, heightPx: 20 },
+			);
+			tui.enterFullscreen({ scroll: [chat, image], dock });
+			await terminal.waitForRender();
+
+			const writes = terminal.getWrites();
+			assert.ok(writes.includes(KITTY_PLACEHOLDER_CHAR));
+			assert.ok(!writes.includes("\x1b_G"));
+			assert.ok(!terminal.getViewport().some((line) => line.includes("[image/png")));
+
+			tui.stop();
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+			invalidateKittyImageTransmits();
+			drainKittyImageTransmits();
 		}
 	});
 

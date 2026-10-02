@@ -2,7 +2,14 @@ import assert from "node:assert";
 import { describe, it } from "node:test";
 import { ProcessTerminal } from "../src/terminal.js";
 import { clearDefaultTerminalColors, getDefaultTerminalColors } from "../src/terminal-colors.js";
-import { resetCapabilitiesCache } from "../src/terminal-image.js";
+import {
+	allocatePlaceholderImageId,
+	drainKittyImageTransmits,
+	getKittyImageTransmitsVersion,
+	invalidateKittyImageTransmits,
+	renderKittyPlaceholderImage,
+	resetCapabilitiesCache,
+} from "../src/terminal-image.js";
 import { isGrapheme2027Active } from "../src/utils.js";
 
 describe("ProcessTerminal dimensions", () => {
@@ -762,3 +769,68 @@ function restoreProperty(object: object, key: PropertyKey, descriptor: PropertyD
 		Reflect.deleteProperty(object, key);
 	}
 }
+
+describe("ProcessTerminal kitty placeholder transmits", () => {
+	function captureStdout(): { writes: string[]; restore: () => void } {
+		const originalWrite = process.stdout.write;
+		const writes: string[] = [];
+		process.stdout.write = ((...args: Parameters<typeof process.stdout.write>): boolean => {
+			const chunk = args[0];
+			writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			const callback = args.find((arg): arg is (error?: Error | null) => void => typeof arg === "function");
+			callback?.();
+			return true;
+		}) as typeof process.stdout.write;
+		return {
+			writes,
+			restore: () => {
+				process.stdout.write = originalWrite;
+			},
+		};
+	}
+
+	it("flushes queued placeholder transmits ahead of the payload, once per image", () => {
+		const { writes, restore } = captureStdout();
+		invalidateKittyImageTransmits();
+		drainKittyImageTransmits();
+		try {
+			const imageId = allocatePlaceholderImageId();
+			renderKittyPlaceholderImage("AAAA", { widthPx: 20, heightPx: 20 }, { maxWidthCells: 4, imageId });
+
+			const terminal = new ProcessTerminal();
+			terminal.write("PAYLOAD");
+			assert.strictEqual(writes.length, 1);
+			const transmitIndex = writes[0]!.indexOf(`\x1b_Ga=T,U=1,`);
+			const payloadIndex = writes[0]!.indexOf("PAYLOAD");
+			assert.ok(transmitIndex !== -1, "transmit sequence written");
+			assert.ok(transmitIndex < payloadIndex, "transmit precedes the frame payload");
+			assert.ok(writes[0]!.includes(`,i=${imageId},`));
+
+			terminal.write("MORE");
+			assert.strictEqual(writes[1], "MORE");
+		} finally {
+			restore();
+			invalidateKittyImageTransmits();
+			drainKittyImageTransmits();
+		}
+	});
+
+	it("invalidates placeholder transmits on both alt-screen transitions", () => {
+		const { restore } = captureStdout();
+		invalidateKittyImageTransmits();
+		drainKittyImageTransmits();
+		try {
+			const terminal = new ProcessTerminal();
+			const before = getKittyImageTransmitsVersion();
+			terminal.enterAltScreen();
+			const afterEnter = getKittyImageTransmitsVersion();
+			assert.ok(afterEnter > before, "entering the alt screen invalidates");
+			terminal.leaveAltScreen();
+			assert.ok(getKittyImageTransmitsVersion() > afterEnter, "leaving the alt screen invalidates");
+		} finally {
+			restore();
+			invalidateKittyImageTransmits();
+			drainKittyImageTransmits();
+		}
+	});
+});

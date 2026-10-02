@@ -1,18 +1,28 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { Image } from "../src/components/image.js";
+import { Image, withFullscreenImageFallback } from "../src/components/image.js";
 import {
+	allocatePlaceholderImageId,
 	deleteAllKittyImages,
 	deleteKittyImage,
 	detectCapabilities,
+	drainKittyImageTransmits,
 	encodeKitty,
+	encodeKittyPlaceholderRows,
+	getKittyImageTransmitsVersion,
 	hyperlink,
+	invalidateKittyImageTransmits,
 	isImageLine,
+	isImageSequenceLine,
+	KITTY_PLACEHOLDER_CHAR,
+	KITTY_PLACEHOLDER_GRID_LIMIT,
 	renderImage,
+	renderKittyPlaceholderImage,
 	resetCapabilitiesCache,
 	setCapabilities,
 	setCellDimensions,
 } from "../src/terminal-image.js";
+import { sliceByColumn, visibleWidth } from "../src/utils.js";
 
 const ENV_KEYS = [
 	"TERM",
@@ -22,6 +32,7 @@ const ENV_KEYS = [
 	"KITTY_WINDOW_ID",
 	"GHOSTTY_RESOURCES_DIR",
 	"PI_ENABLE_GHOSTTY_IMAGES",
+	"PI_TERMINAL_KITTY_PLACEHOLDERS",
 	"WEZTERM_PANE",
 	"ITERM_SESSION_ID",
 	"CMUX_WORKSPACE_ID",
@@ -218,18 +229,28 @@ describe("detectCapabilities", () => {
 		});
 	});
 
-	it("disables Ghostty images by default to avoid inline image freezes", () => {
+	it("defaults Ghostty to Unicode-placeholder kitty images, keeping inline sequences out of redraws", () => {
 		withEnv({ TERM_PROGRAM: "ghostty", CMUX_WORKSPACE_ID: "workspace" }, () => {
 			const caps = detectCapabilities();
-			assert.strictEqual(caps.images, null);
+			assert.strictEqual(caps.images, "kitty");
+			assert.strictEqual(caps.imagePlaceholders, true);
 			assert.strictEqual(caps.hyperlinks, true);
 		});
 	});
 
-	it("can opt Ghostty back into Kitty images for rendering tests", () => {
+	it("keeps the legacy inline kitty path on Ghostty behind PI_ENABLE_GHOSTTY_IMAGES", () => {
 		withEnv({ TERM_PROGRAM: "ghostty", PI_ENABLE_GHOSTTY_IMAGES: "1" }, () => {
 			const caps = detectCapabilities();
 			assert.strictEqual(caps.images, "kitty");
+			assert.strictEqual(caps.imagePlaceholders, false);
+			assert.strictEqual(caps.hyperlinks, true);
+		});
+	});
+
+	it("disables Ghostty images entirely with PI_TERMINAL_KITTY_PLACEHOLDERS=0", () => {
+		withEnv({ TERM_PROGRAM: "ghostty", PI_TERMINAL_KITTY_PLACEHOLDERS: "0" }, () => {
+			const caps = detectCapabilities();
+			assert.strictEqual(caps.images, null);
 			assert.strictEqual(caps.hyperlinks, true);
 		});
 	});
@@ -395,5 +416,288 @@ describe("hyperlink", () => {
 		const result = hyperlink("README.md", "file:///home/user/README.md");
 		assert.ok(result.includes("file:///home/user/README.md"));
 		assert.ok(result.includes("README.md"));
+	});
+});
+
+describe("kitty unicode placeholders", () => {
+	// Row/column diacritics from kitty's gen/rowcolumn-diacritics.txt: index 0 is
+	// U+0305, index 1 is U+030D, index 2 is U+030E (the graphics-protocol spec's
+	// own examples use exactly these three).
+	const DIACRITIC_0 = "\u0305";
+	const DIACRITIC_1 = "\u030D";
+	const DIACRITIC_2 = "\u030E";
+
+	it("forces placeholder rendering off tmux even when the outer terminal is ghostty", () => {
+		withEnv({ TMUX: "/tmp/tmux-1000/default,1234,0", TERM_PROGRAM: "ghostty" }, () => {
+			const caps = detectCapabilities();
+			assert.strictEqual(caps.images, null);
+		});
+	});
+
+	it("keeps kitty itself on the inline path unless placeholders are forced", () => {
+		withEnv({ KITTY_WINDOW_ID: "1" }, () => {
+			assert.strictEqual(detectCapabilities().imagePlaceholders ?? false, false);
+		});
+		withEnv({ KITTY_WINDOW_ID: "1", PI_TERMINAL_KITTY_PLACEHOLDERS: "1" }, () => {
+			assert.strictEqual(detectCapabilities().imagePlaceholders, true);
+		});
+	});
+
+	it("keeps wezterm on the inline path unless placeholders are forced", () => {
+		withEnv({ WEZTERM_PANE: "0" }, () => {
+			assert.strictEqual(detectCapabilities().imagePlaceholders ?? false, false);
+		});
+		withEnv({ WEZTERM_PANE: "0", PI_TERMINAL_KITTY_PLACEHOLDERS: "1" }, () => {
+			assert.strictEqual(detectCapabilities().imagePlaceholders, true);
+		});
+	});
+
+	it("allocates placeholder image ids in the 24-bit range the foreground color encodes", () => {
+		for (let i = 0; i < 32; i++) {
+			const id = allocatePlaceholderImageId();
+			assert.ok(id >= 1 && id <= 0xffffff, `id ${id} outside 24-bit range`);
+		}
+	});
+
+	it("encodes each placeholder cell as U+10EEEE plus explicit row and column diacritics", () => {
+		const lines = encodeKittyPlaceholderRows({ imageId: 42, columns: 2, rows: 2 });
+		assert.strictEqual(lines.length, 2);
+		const cell = (row: number, column: number) =>
+			KITTY_PLACEHOLDER_CHAR + (row === 0 ? DIACRITIC_0 : DIACRITIC_1) + (column === 0 ? DIACRITIC_0 : DIACRITIC_1);
+		assert.strictEqual(lines[0], `\x1b[38;2;0;0;42m${cell(0, 0)}${cell(0, 1)}\x1b[39m`);
+		assert.strictEqual(lines[1], `\x1b[38;2;0;0;42m${cell(1, 0)}${cell(1, 1)}\x1b[39m`);
+	});
+
+	it("encodes image ids above 24 bits with the spec's third diacritic", () => {
+		// The spec's own example: id 33554474 = 42 + (2 << 24) renders with
+		// foreground 42 and U+030E (diacritic index 2) as the high byte.
+		const lines = encodeKittyPlaceholderRows({ imageId: 33554474, columns: 2, rows: 1 });
+		assert.strictEqual(
+			lines[0],
+			`\x1b[38;2;0;0;42m` +
+				`${KITTY_PLACEHOLDER_CHAR}${DIACRITIC_0}${DIACRITIC_0}${DIACRITIC_2}` +
+				`${KITTY_PLACEHOLDER_CHAR}${DIACRITIC_0}${DIACRITIC_1}${DIACRITIC_2}` +
+				`\x1b[39m`,
+		);
+	});
+
+	it("clamps placeholder grids to the diacritic table size", () => {
+		const lines = encodeKittyPlaceholderRows({ imageId: 7, columns: 400, rows: 400 });
+		assert.strictEqual(lines.length, KITTY_PLACEHOLDER_GRID_LIMIT);
+		assert.strictEqual(visibleWidth(lines[0]!), KITTY_PLACEHOLDER_GRID_LIMIT);
+	});
+
+	it("measures every placeholder row as exactly its column count", () => {
+		const lines = encodeKittyPlaceholderRows({ imageId: 42, columns: 17, rows: 5 });
+		assert.strictEqual(lines.length, 5);
+		for (const line of lines) {
+			assert.strictEqual(visibleWidth(line), 17);
+		}
+	});
+
+	it("slices placeholder rows on cell boundaries without splitting a cell", () => {
+		const line = encodeKittyPlaceholderRows({ imageId: 42, columns: 4, rows: 1 })[0]!;
+		const sliced = sliceByColumn(line, 1, 2, true);
+		assert.strictEqual(visibleWidth(sliced), 2);
+		const cells = sliced.match(new RegExp(KITTY_PLACEHOLDER_CHAR, "gu"));
+		assert.strictEqual(cells?.length, 2);
+	});
+
+	it("recognizes placeholder rows as image lines but not as graphics-sequence lines", () => {
+		const row = encodeKittyPlaceholderRows({ imageId: 42, columns: 2, rows: 1 })[0]!;
+		assert.strictEqual(isImageLine(row), true);
+		assert.strictEqual(isImageSequenceLine(row), false);
+		assert.strictEqual(isImageSequenceLine("\x1b_Ga=T,f=100;data\x1b\\"), true);
+		assert.strictEqual(isImageSequenceLine("\x1b]1337;File=inline=1:data==\x07"), true);
+		assert.strictEqual(isImageSequenceLine("plain text"), false);
+	});
+
+	it("renders placeholder lines and queues the transmit once per image id", () => {
+		const imageId = allocatePlaceholderImageId();
+		invalidateKittyImageTransmits();
+		drainKittyImageTransmits();
+		try {
+			const result = renderKittyPlaceholderImage(
+				"AAAA",
+				{ widthPx: 20, heightPx: 20 },
+				{ maxWidthCells: 4, imageId },
+			);
+			assert.strictEqual(result.imageId, imageId);
+			assert.strictEqual(result.columns, 4);
+			assert.strictEqual(result.rows, 2);
+			assert.strictEqual(result.lines.length, 2);
+			for (const line of result.lines) {
+				assert.ok(!line.includes("\x1b_G"), "placeholder lines carry no graphics sequences");
+				assert.ok(isImageLine(line));
+			}
+
+			const firstDrain = drainKittyImageTransmits();
+			assert.ok(firstDrain.includes(`\x1b_Ga=T,U=1,f=100,q=2,i=${imageId},c=4,r=2;AAAA\x1b\\`));
+
+			// Same id and geometry: no retransmit.
+			renderKittyPlaceholderImage("AAAA", { widthPx: 20, heightPx: 20 }, { maxWidthCells: 4, imageId });
+			assert.strictEqual(drainKittyImageTransmits(), "");
+
+			// Geometry change retransmits so the virtual placement tracks the grid.
+			renderKittyPlaceholderImage("AAAA", { widthPx: 40, heightPx: 40 }, { maxWidthCells: 8, imageId });
+			const geometryDrain = drainKittyImageTransmits();
+			assert.ok(geometryDrain.includes(`,i=${imageId},c=8,r=`));
+
+			// Invalidation (screen switch) forces a retransmit of the next render.
+			invalidateKittyImageTransmits();
+			renderKittyPlaceholderImage("AAAA", { widthPx: 20, heightPx: 20 }, { maxWidthCells: 4, imageId });
+			assert.ok(drainKittyImageTransmits().includes(`,i=${imageId},`));
+		} finally {
+			invalidateKittyImageTransmits();
+			drainKittyImageTransmits();
+		}
+	});
+
+	it("chunks large placeholder transmits like encodeKitty does", () => {
+		const imageId = allocatePlaceholderImageId();
+		invalidateKittyImageTransmits();
+		drainKittyImageTransmits();
+		try {
+			renderKittyPlaceholderImage("A".repeat(5000), { widthPx: 20, heightPx: 20 }, { maxWidthCells: 4, imageId });
+			const drained = drainKittyImageTransmits();
+			assert.ok(drained.includes(",m=1;"));
+			assert.ok(drained.includes("\x1b_Gm=0;"));
+		} finally {
+			invalidateKittyImageTransmits();
+			drainKittyImageTransmits();
+		}
+	});
+
+	it("bumps the transmit version on invalidation so image components re-render", () => {
+		const before = getKittyImageTransmitsVersion();
+		invalidateKittyImageTransmits();
+		assert.ok(getKittyImageTransmitsVersion() > before);
+	});
+});
+
+describe("Image component with unicode placeholders", () => {
+	const placeholderCaps = { images: "kitty", trueColor: true, hyperlinks: true, imagePlaceholders: true } as const;
+
+	it("renders placeholder rows without any inline graphics sequence", () => {
+		setCapabilities(placeholderCaps);
+		setCellDimensions({ widthPx: 10, heightPx: 10 });
+		invalidateKittyImageTransmits();
+		drainKittyImageTransmits();
+		try {
+			const image = new Image(
+				"AAAA",
+				"image/png",
+				{ fallbackColor: (value) => value },
+				{ maxWidthCells: 4 },
+				{ widthPx: 20, heightPx: 20 },
+			);
+			const lines = image.render(10);
+			assert.strictEqual(lines.length, 4);
+			for (const line of lines) {
+				assert.ok(!line.includes("\x1b_G"));
+				assert.ok(line.includes(KITTY_PLACEHOLDER_CHAR));
+				assert.strictEqual(visibleWidth(line), 4);
+			}
+			const imageId = image.getImageId();
+			assert.ok(imageId !== undefined && imageId >= 1 && imageId <= 0xffffff);
+			assert.ok(drainKittyImageTransmits().includes(`,i=${imageId},c=4,r=4;`));
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+			invalidateKittyImageTransmits();
+			drainKittyImageTransmits();
+		}
+	});
+
+	it("keeps rendering placeholder rows under the fullscreen fallback guard", () => {
+		setCapabilities(placeholderCaps);
+		setCellDimensions({ widthPx: 10, heightPx: 10 });
+		invalidateKittyImageTransmits();
+		drainKittyImageTransmits();
+		try {
+			const image = new Image(
+				"AAAA",
+				"image/png",
+				{ fallbackColor: (value) => value },
+				{ maxWidthCells: 4 },
+				{ widthPx: 20, heightPx: 20 },
+			);
+			const lines = withFullscreenImageFallback(() => image.render(10));
+			assert.strictEqual(lines.length, 4);
+			assert.ok(lines.every((line) => line.includes(KITTY_PLACEHOLDER_CHAR)));
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+			invalidateKittyImageTransmits();
+			drainKittyImageTransmits();
+		}
+	});
+
+	it("keeps the textual fallback under the fullscreen guard when placeholders are off", () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		setCellDimensions({ widthPx: 10, heightPx: 10 });
+		try {
+			const image = new Image(
+				"AAAA",
+				"image/png",
+				{ fallbackColor: (value) => value },
+				{ maxWidthCells: 4 },
+				{ widthPx: 20, heightPx: 20 },
+			);
+			const lines = withFullscreenImageFallback(() => image.render(10));
+			assert.deepStrictEqual(lines, ["[image/png · 20×20]"]);
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
+	});
+
+	it("honors fallbackOnly even when placeholders are available", () => {
+		setCapabilities(placeholderCaps);
+		try {
+			const image = new Image(
+				"AAAA",
+				"image/png",
+				{ fallbackColor: (value) => value },
+				{ fallbackOnly: true },
+				{ widthPx: 20, heightPx: 20 },
+			);
+			assert.deepStrictEqual(image.render(10), ["[image/png · 20×20]"]);
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+
+	it("requeues the transmit when the transmit registry was invalidated", () => {
+		setCapabilities(placeholderCaps);
+		setCellDimensions({ widthPx: 10, heightPx: 10 });
+		invalidateKittyImageTransmits();
+		drainKittyImageTransmits();
+		try {
+			const image = new Image(
+				"AAAA",
+				"image/png",
+				{ fallbackColor: (value) => value },
+				{ maxWidthCells: 4 },
+				{ widthPx: 20, heightPx: 20 },
+			);
+			image.render(10);
+			const imageId = image.getImageId();
+			drainKittyImageTransmits();
+
+			// A second render is a cache hit and must not requeue.
+			image.render(10);
+			assert.strictEqual(drainKittyImageTransmits(), "");
+
+			// After invalidation the cached lines are stale: re-render requeues.
+			invalidateKittyImageTransmits();
+			image.render(10);
+			assert.ok(drainKittyImageTransmits().includes(`,i=${imageId},`));
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+			invalidateKittyImageTransmits();
+			drainKittyImageTransmits();
+		}
 	});
 });
