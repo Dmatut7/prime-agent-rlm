@@ -14,16 +14,15 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-03，wave-22 已 SHIP）
+## 当前状态（2026-10-03 晨，wave-23 已 SHIP）
 
-- HEAD = 见 git log（wave-22 三批 + 文档批）。老板的输入连按五 bug：A/B/D/E 修复（Kitty repeat
-  动作侧过滤+repeatable 白名单、ESC 撕裂重组窗延长、Option+↓ 死键补齐、思考账本迁 TimelineUiState
-  机制化清账），F 判定设计行为已文档化（双击 Esc 开树是 wave-19 特性，草稿 stash 不丢）。
-- suite 1659/1659 EXIT 0（4603 连续两波稳定）；顶层 9329 绿+2 已知负载抖动；tui 1153；CI 绿。
-- 遥测：老板自重启后仍零生产会话（四项新特性零曝光），等他真用；compaction 交接生产零触发。
-- 调研：Claude Code 2.1.288 changelog 出（Ctrl+C 找回草稿与我们 wave-12 同构；子代理超时续跑
-  范式入 Backlog-11 参照）；Anthropic containment 文补登记（安全簇头号参照）。
-- 新验收规矩执行中：本波所有显示数字已对过外部真值（A/B 数字在 FORK_NOTES/各 lane 报告）。
+- HEAD = 见 git log（五批：收尸收尾、扩展键 repeat、kitty 占位符、对账工具、文档批）。
+- wave-23：W21-A 遗留清零（措辞/Python wrapper/errored 收编）；扩展快捷键 repeat 守卫；
+  alt+t 丢键销账（伪影）；探测总线阶段 6（kitty 占位符，Ghostty 默认开）；对账工具
+  check-display-reconciliation.mjs 落地并进 CI 自检链（落地当天复判出 +23442 现场）。
+- 遥测：老板 10-03 04:14-06:00 真实用了产品（52 回合）；记忆写侧落第一条有机生产记忆
+  （auto-refine）；读侧检索仍 0（样本少，继续观察）；compaction 交接生产零触发。
+- 老板新信号：「审查代理看不见显示层小 bug」→ 对账工具 + 任务书模板已带显示层走查项。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -100,12 +99,10 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-23 候选）
+## 下一波主题（wave-24 候选）
 
-1. W21-A 遗留：prompts/rlm.ts 与 refinement.ts 的 list_subagents 措辞对齐；Python 侧
-   rlm.prune_subagents/list_subagents(include_terminal) wrapper；errored 孩子的 daemon 侧回收。
-2. W22-C 遗留：扩展快捷键的裸 matchesKey 绕过 manager（interactive-mode.ts:4232，repeat 仍会
-   重触发扩展 handler）；alt+t 60ms 连按疑似丢首按（复测钉死）。
-3. 记忆阶段 2（等老板真实使用后的遥测）；compaction 交接假 HOME 演练出数。
-4. 探测总线阶段 6（kitty 图片占位符）。
-5. GLM 长上下文压缩阈值（等老板拍板）；安全簇（等老板拍板，Anthropic containment 文是参照）。
+1. 记忆阶段 2 决策点：老板已恢复使用产品，本周内看检索使用率数据再定。
+2. 流式 R4（帧成本随总线长，窗口化）+ markdown 单段残余（guard-line split-lex，高风险项）。
+3. 探测总线真机复核（kitty/ghostty 各录一次 DECRQM+2031+占位符行为）+ 占位符复制路径映射 [image]。
+4. W23-C 遗留：占位图片 id 计数/删除接线；kitty 默认开占位需 XTVERSION 探测。
+5. GLM 压缩阈值与安全簇（等老板拍板）；win32 四条。
