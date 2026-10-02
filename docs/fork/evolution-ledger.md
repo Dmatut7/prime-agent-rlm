@@ -14,19 +14,20 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-02，wave-16 记忆深调研完成，设计稿落地）
+## 当前状态（2026-10-02，wave-17 记忆提示词层已 SHIP）
 
-- HEAD = 01ee6e0a5 + 本批文档（wave-15 三提交已推送）。
-- wave-16（记忆专项，老板点名）：五路调研完成，产物 /tmp/wave16/（memory-map/memory-failures/
-  memory-peers/memory-frameworks/recall-options），综合设计稿 docs/fork/memory-recall-design.md。
-- 核心实测：1574 条库存无界、注入窗 0.38% 条目、检索器 96.5% 召回但 263 会话只用 31 次
-  （prompt 没教）；主病根=发现与纪律，不是检索质量；业界无一家用向量嵌入做核心记忆管道。
-- 设计决策：三阶段（接线→digest 两层→写入防腐），明确否决加窗口/embedding/审批 inbox。
-- wave-17 = 按设计稿施工（阶段 1+2 先做，A/B 基线先行）。
-- 老板采纳项（两轮对齐后定稿）：定期召回信号机制——每 N 轮程序自动检索但只亮「id+标题目录」
-  信号，正文取阅由模型决策（老板明确否决程序强制塞正文）。性能实测 p50=29ms/p95=42ms（真实
-  1574 条库）。防缺陷：低分不发信号、亮相去重、取阅率遥测做唯一判官。设计稿阶段 1.5 已重写。
-- 恢复指令：wave-17 按 memory-recall-design.md 施工；4603/F15 从 /tmp/w15-aborted + 波次 15 节恢复。
+- HEAD = 见 git log（两批代码 + 本文档批）。本波按老板拍板走提示词层（不加程序机制）。
+- 调研修正了设计假设：①「每 N 轮」写进提示词不可靠（OpenAI 官方承认指令随对话衰减、他们靠
+  程序重投；Anthropic 明说定点执行就该写 hook）——定稿为事件触发纪律句；②真正的病根比措辞
+  更深：读侧教学零存在、digest 溢出行只给 overview 导致 468KB 全量 dump 实案、scope 陷阱
+  （digest 合并视图 vs search 默认 local）、dir() 屏蔽内省、await search 即 TypeError。
+- 落地：rlm.ts 读侧契约（签名+scope+纪律+预算+零命中语义+先查再写）、refinement.ts 指路具名化
+  +溢出行 search 优先、resume-briefing 记忆行、DIGEST_PREFIX 目录指针、kernel dir()/await 兼容、
+  REQUIRED_HARNESS_METHODS 补 search/get。
+- 程序信号机制（设计稿阶段 1.5）降级为备选：先跑遥测看提示词层的检索使用率，不达标再上机制。
+- 遗留：await get() 未命中返回 None 不可 await（正确行为，提示词教判 None）；harness.list() 仍
+  plain list（无实证不动）；yaml.safe_dump 对非空搜索结果条目级失败（存量，未扩大）。
+- 恢复指令：见「下一波主题」；4603/F15 从 /tmp/w15-aborted + 波次 15 节恢复。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
 
@@ -102,9 +103,11 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-17 = 记忆设计稿施工）
+## 下一波主题（wave-18 候选）
 
-按 docs/fork/memory-recall-design.md：阶段 1 接线（prompt 教检索 + 溢出具名 + 写前 search 软门 +
-排序多信号）+ 阶段 2 digest 两层（全量索引硬上限 + top-k 详情 + path 归并）；A/B 基线先建
-（离线 recall@k + 在线插桩 + EX-8 记忆题）。之后波次再排：4603 竞态（/tmp/w15-aborted 续）、
-F15 裁决、D9 判分器硬化、探测总线实施阶段 1-2、阶段 3 consolidation 工序。
+1. wave-15 续债：4603 shutdown 竞态（/tmp/w15-aborted 仪器化线索）+ F15 裁决。
+2. 记忆设计稿阶段 2（digest 两层重构：全量索引硬上限+top-k 详情+path 归并）——等 wave-17 提示词层
+   使用率遥测跑几天再上；若使用率仍低，评估程序信号机制（阶段 1.5 备选）。
+3. D9 判分器硬化（轨输入移出 agent 可写区）。
+4. 探测总线实施阶段 1-2（probe-bus-design.md）。
+5. compaction 摘要带文件/子代理回执的结构化交接（M16-2：94.5% 双空）。
