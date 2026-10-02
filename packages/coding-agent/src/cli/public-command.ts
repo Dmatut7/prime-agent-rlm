@@ -170,7 +170,11 @@ function normalizeLeadingDaemonSocketOption(args: string[]): string[] {
 	}
 	const socketPath = args[1];
 	const command = args[2];
-	if (socketPath === undefined || (command !== "stop" && command !== "rename")) {
+	// Any known public command normalizes, not just stop/rename: an unrecognized
+	// word stays put so a prompt that happens to follow the flag is never
+	// reordered (wave-19 walkthrough F2: `--daemon-socket X shutdown` used to
+	// start the TUI with "shutdown" as the prompt).
+	if (socketPath === undefined || !PUBLIC_COMMAND_NAMES.has(command ?? "")) {
 		return args;
 	}
 	return [command, ...args.slice(3), option, socketPath];
