@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { ProcessTerminal } from "../src/terminal.js";
+import { resetCapabilitiesCache } from "../src/terminal-image.js";
 
 describe("ProcessTerminal dimensions", () => {
 	it("falls back to COLUMNS and LINES before default dimensions", () => {
@@ -262,7 +263,7 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 			// pop before ?1049l, while the alt stack is still the active one.
 			assert.deepEqual(writes, [
 				"\x1b[?2004h",
-				"\x1b[?u",
+				"\x1b[?u\x1b[c",
 				"\x1b[>7u",
 				"\x1b[?1049h",
 				"\x1b[>7u",
@@ -289,7 +290,7 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 			terminal.leaveAltScreen();
 			terminal.stop();
 
-			assert.deepEqual(writes, ["\x1b[?2004h", "\x1b[?u", "\x1b[?1049h", "\x1b[?1049l", "\x1b[?2004l"]);
+			assert.deepEqual(writes, ["\x1b[?2004h", "\x1b[?u\x1b[c", "\x1b[?1049h", "\x1b[?1049l", "\x1b[?2004l"]);
 		} finally {
 			restore();
 		}
@@ -318,14 +319,14 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 
 			assert.deepEqual(writes, [
 				"\x1b[?2004h",
-				"\x1b[?u",
+				"\x1b[?u\x1b[c",
 				"\x1b[>7u",
 				"\x1b[?1049h",
 				"\x1b[>7u",
 				"\x1b[?2004l",
 				"\x1b[<u",
 				"\x1b[?2004h",
-				"\x1b[?u",
+				"\x1b[?u\x1b[c",
 				"\x1b[>7u",
 				"\x1b[<u",
 				"\x1b[?1049l",
@@ -353,7 +354,7 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 
 			assert.deepEqual(writes, [
 				"\x1b[?2004h",
-				"\x1b[?u",
+				"\x1b[?u\x1b[c",
 				"\x1b[?1049h",
 				"\x1b[>7u",
 				"\x1b[<u",
@@ -361,6 +362,85 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 				"\x1b[?2004l",
 				"\x1b[<u",
 			]);
+		} finally {
+			restore();
+		}
+	});
+});
+
+describe("ProcessTerminal probe bus wiring", () => {
+	it("enables kitty on an answer ahead of the DA fence, never touching modifyOtherKeys", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?1u");
+			process.stdin.emit("data", "\x1b[?64;1;2;6c");
+			terminal.stop();
+
+			assert.ok(writes.includes("\x1b[>7u"));
+			assert.ok(!writes.includes("\x1b[>4;2m"));
+		} finally {
+			restore();
+		}
+	});
+
+	it("falls back to modifyOtherKeys when the DA fence arrives without a kitty answer", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?64;1;2;6c");
+			terminal.stop();
+
+			assert.ok(writes.includes("\x1b[>4;2m"));
+			assert.ok(!writes.includes("\x1b[>7u"));
+		} finally {
+			restore();
+		}
+	});
+
+	it("PI_TERMINAL_KITTY_KEYBOARD=1 pushes kitty flags without probing", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		process.env.PI_TERMINAL_KITTY_KEYBOARD = "1";
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			terminal.stop();
+
+			assert.deepEqual(writes.slice(0, 3), ["\x1b[?2004h", "\x1b[>7u", "\x1b[c"]);
+			assert.ok(!writes.includes("\x1b[>4;2m"));
+		} finally {
+			restore();
+		}
+	});
+
+	it("PI_TERMINAL_KITTY_KEYBOARD=0 skips the kitty query and enables modifyOtherKeys", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		process.env.PI_TERMINAL_KITTY_KEYBOARD = "0";
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			terminal.stop();
+
+			assert.deepEqual(writes.slice(0, 3), ["\x1b[?2004h", "\x1b[>4;2m", "\x1b[c"]);
+			assert.ok(!writes.includes("\x1b[>7u"));
 		} finally {
 			restore();
 		}
@@ -375,6 +455,31 @@ function patchTerminalStdio(writes: string[]): () => void {
 	const originalPause = Object.getOwnPropertyDescriptor(process.stdin, "pause");
 	const originalStdinIsTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
 	const originalStdoutIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+	// The probe bus's burst depends on image-capability detection and PI_TERMINAL_*
+	// overrides; pin both off so the asserted write sequence is environment-proof.
+	const probedEnvVars = [
+		"TMUX",
+		"TERM",
+		"TERM_PROGRAM",
+		"COLORTERM",
+		"KITTY_WINDOW_ID",
+		"WEZTERM_PANE",
+		"ITERM_SESSION_ID",
+		"GHOSTTY_RESOURCES_DIR",
+		"PI_ENABLE_GHOSTTY_IMAGES",
+		"PI_TERMINAL_KITTY_KEYBOARD",
+		"PI_TERMINAL_SYNC_2026",
+		"PI_TERMINAL_GRAPHEME_2027",
+		"PI_TERMINAL_SCHEME_2031",
+		"PI_TERMINAL_OSC_COLORS",
+		"PI_TERMINAL_CELL_SIZE",
+	];
+	const savedEnv = new Map<string, string | undefined>();
+	for (const name of probedEnvVars) {
+		savedEnv.set(name, process.env[name]);
+		delete process.env[name];
+	}
+	resetCapabilitiesCache();
 
 	Object.defineProperty(process.stdin, "isRaw", { configurable: true, get: () => false });
 	Object.defineProperty(process.stdin, "setRawMode", { configurable: true, value: () => process.stdin });
@@ -399,6 +504,14 @@ function patchTerminalStdio(writes: string[]): () => void {
 		restoreProperty(process.stdin, "pause", originalPause);
 		restoreProperty(process.stdin, "isTTY", originalStdinIsTTY);
 		restoreProperty(process.stdout, "isTTY", originalStdoutIsTTY);
+		for (const [name, value] of savedEnv) {
+			if (value === undefined) {
+				delete process.env[name];
+			} else {
+				process.env[name] = value;
+			}
+		}
+		resetCapabilitiesCache();
 	};
 }
 

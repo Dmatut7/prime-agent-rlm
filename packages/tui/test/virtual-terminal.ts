@@ -1,5 +1,6 @@
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import xterm from "@xterm/headless";
+import { ProbeBus } from "../src/probe-bus.js";
 import type { Terminal, TerminalStopOptions } from "../src/terminal.js";
 
 const XtermTerminal = xterm.Terminal;
@@ -8,6 +9,9 @@ export class VirtualTerminal implements Terminal {
 	private xterm: XtermTerminalType;
 	private inputHandler?: (data: string) => void;
 	private resizeHandler?: () => void;
+	// Mirrors ProcessTerminal: probes go through a real bus so consumers
+	// (e.g. the TUI's cell-size subscription) observe the same single source.
+	private _probeBus?: ProbeBus;
 	private _columns: number;
 	private _rows: number;
 	private _altScreenActive = false;
@@ -29,6 +33,13 @@ export class VirtualTerminal implements Terminal {
 		this.inputHandler = onInput;
 		this.resizeHandler = onResize;
 		this.xterm.write("\x1b[?2004h");
+		const bus = new ProbeBus();
+		this._probeBus = bus;
+		bus.start((data) => this.xterm.write(data));
+	}
+
+	get probeBus(): ProbeBus | undefined {
+		return this._probeBus;
 	}
 
 	async drainInput(_maxMs?: number, _idleMs?: number): Promise<void> {}
@@ -37,6 +48,8 @@ export class VirtualTerminal implements Terminal {
 
 	stop(_options?: TerminalStopOptions): void {
 		this.xterm.write("\x1b[?2004l");
+		this._probeBus?.dispose();
+		this._probeBus = undefined;
 		this.inputHandler = undefined;
 		this.resizeHandler = undefined;
 	}
@@ -114,6 +127,10 @@ export class VirtualTerminal implements Terminal {
 	setProgress(_active: boolean): void {}
 
 	sendInput(data: string): void {
+		// Probe answers are consumed by the bus exactly like on a ProcessTerminal.
+		if (this._probeBus?.handleSequence(data)) {
+			return;
+		}
 		if (this.inputHandler) {
 			this.inputHandler(data);
 		}

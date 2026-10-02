@@ -2,14 +2,10 @@ import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import { setKittyProtocolActive } from "./keys.js";
+import { ProbeBus } from "./probe-bus.js";
 import { StdinBuffer } from "./stdin-buffer.js";
-import {
-	parseOscColorResponse,
-	QUERY_DEFAULT_BACKGROUND,
-	QUERY_DEFAULT_FOREGROUND,
-	type Rgb,
-	setDefaultTerminalColors,
-} from "./terminal-colors.js";
+import { setDefaultTerminalColors } from "./terminal-colors.js";
+import { getCapabilities } from "./terminal-image.js";
 
 const cjsRequire = createRequire(import.meta.url);
 
@@ -120,6 +116,12 @@ export interface Terminal {
 	// Whether Kitty keyboard protocol is active
 	get kittyProtocolActive(): boolean;
 
+	/**
+	 * Startup capability probes (docs/fork/probe-bus-design.md). Undefined on
+	 * terminals that do not probe (test doubles, minimal implementations).
+	 */
+	readonly probeBus?: ProbeBus;
+
 	// Cursor positioning (relative to current position)
 	moveBy(lines: number): void; // Move cursor up (negative) or down (positive) by N lines
 
@@ -174,13 +176,8 @@ export class ProcessTerminal implements Terminal {
 	private mouseExitGuard?: () => void;
 	private stdinBuffer?: StdinBuffer;
 	private stdinDataHandler?: (data: string) => void;
-	private keyboardProtocolFallbackTimer?: ReturnType<typeof setTimeout>;
+	private _probeBus?: ProbeBus;
 	private progressInterval?: ReturnType<typeof setInterval>;
-	private defaultColorProbe?: {
-		foreground?: Rgb;
-		background?: Rgb;
-		timeout: ReturnType<typeof setTimeout>;
-	};
 	private writeLogPath = (() => {
 		const env = process.env.PI_TUI_WRITE_LOG || "";
 		if (!env) return "";
@@ -198,6 +195,10 @@ export class ProcessTerminal implements Terminal {
 
 	get kittyProtocolActive(): boolean {
 		return this._kittyProtocolActive;
+	}
+
+	get probeBus(): ProbeBus | undefined {
+		return this._probeBus;
 	}
 
 	start(onInput: (data: string) => void, onResize: () => void): void {
@@ -232,44 +233,27 @@ export class ProcessTerminal implements Terminal {
 		// since that resets console mode flags.
 		this.enableWindowsVTInput();
 
-		// Query and enable Kitty keyboard protocol
-		// The query handler intercepts input temporarily, then installs the user's handler
-		// See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
-		this.queryAndEnableKittyProtocol();
+		// Probe terminal capabilities (Kitty keyboard, OSC 10/11 default colors,
+		// cell size) through the probe bus; the primary-DA fence judges whatever
+		// stays unanswered. See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
+		this.startProbeBus();
 	}
 
 	/**
 	 * Set up StdinBuffer to split batched input into individual sequences.
 	 * This ensures components receive single events, making matchesKey/isKeyRelease work correctly.
 	 *
-	 * Also watches for Kitty protocol response and enables it when detected.
-	 * This is done here (after stdinBuffer parsing) rather than on raw stdin
-	 * to handle the case where the response arrives split across multiple events.
+	 * Probe answers are routed to the probe bus here (after StdinBuffer parsing,
+	 * so an answer split across multiple stdin events is reassembled first);
+	 * everything else goes to the input handler.
 	 */
 	private setupStdinBuffer(): void {
 		this.stdinBuffer = new StdinBuffer({ timeout: 10 });
 
-		// Kitty protocol response pattern: \x1b[?<flags>u
-		const kittyResponsePattern = /^\x1b\[\?(\d+)u$/;
-
 		// Forward individual sequences to the input handler
 		this.stdinBuffer.on("data", (sequence) => {
-			if (this.handleDefaultColorProbeResponse(sequence)) {
+			if (this._probeBus?.handleSequence(sequence)) {
 				return;
-			}
-
-			// Check for Kitty protocol response (only if not already enabled)
-			if (!this._kittyProtocolActive) {
-				const match = sequence.match(kittyResponsePattern);
-				if (match) {
-					this.clearKeyboardProtocolFallbackTimer();
-					this._kittyProtocolActive = true;
-					setKittyProtocolActive(true);
-
-					// Enable Kitty keyboard protocol (push flags onto the active screen's stack)
-					process.stdout.write(KITTY_FLAGS_PUSH);
-					return; // Don't forward protocol response to TUI
-				}
 			}
 
 			if (this.inputHandler) {
@@ -291,82 +275,53 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	/**
-	 * Query terminal for Kitty keyboard protocol support and enable if available.
-	 *
-	 * Sends CSI ? u to query current flags. If terminal responds with CSI ? <flags> u,
-	 * it supports the protocol and we enable it with CSI > 1 u.
-	 *
-	 * If no Kitty response arrives shortly after startup, fall back to enabling
-	 * xterm modifyOtherKeys mode 2. This is needed for tmux, which can forward
-	 * modified enter keys as CSI-u when extended-keys is enabled, but may not
-	 * answer the Kitty protocol query.
-	 *
-	 * The response is detected in setupStdinBuffer's data handler, which properly
-	 * handles the case where the response arrives split across multiple stdin events.
+	 * Probe the terminal's capabilities through a fresh ProbeBus: listeners are
+	 * registered first (env overrides fire synchronously out of start()), then
+	 * every query goes out in one burst with the primary-DA fence last. An
+	 * unanswered capability is judged at the fence (or by the bus's fallback
+	 * timer), not by per-probe wall-clock timers.
 	 */
-	private queryAndEnableKittyProtocol(): void {
+	private startProbeBus(): void {
 		this.setupStdinBuffer();
 		process.stdin.on("data", this.stdinDataHandler!);
-		this.queryDefaultTerminalColors();
-		process.stdout.write("\x1b[?u");
-		this.clearKeyboardProtocolFallbackTimer();
-		this.keyboardProtocolFallbackTimer = setTimeout(() => {
-			this.keyboardProtocolFallbackTimer = undefined;
+
+		const bus = new ProbeBus();
+		this._probeBus = bus;
+		bus.onChange("kittyKeyboard", (_cap, state) => {
+			if (state.verdict === "supported") {
+				this.enableKittyProtocol();
+				return;
+			}
+			// Judged unsupported (DA fence) or unknown (fallback timer): enable
+			// xterm modifyOtherKeys mode 2. This is needed for tmux, which can
+			// forward modified enter keys as CSI-u when extended-keys is enabled,
+			// but may not answer the Kitty protocol query.
 			if (!this._kittyProtocolActive && !this._modifyOtherKeysActive) {
 				process.stdout.write("\x1b[>4;2m");
 				this._modifyOtherKeysActive = true;
 			}
-		}, 150);
+		});
+		bus.onChange("oscColors", (_cap, state) => {
+			if (state.verdict === "supported" && state.defaultColors) {
+				setDefaultTerminalColors(state.defaultColors);
+				this.resizeHandler?.();
+			}
+		});
+		bus.start((data) => process.stdout.write(data), {
+			queryOscColors: process.stdin.isTTY === true && process.stdout.isTTY === true,
+			queryCellSize: getCapabilities().images !== null,
+		});
 	}
 
-	private clearKeyboardProtocolFallbackTimer(): void {
-		if (!this.keyboardProtocolFallbackTimer) {
+	private enableKittyProtocol(): void {
+		if (this._kittyProtocolActive) {
 			return;
 		}
-		clearTimeout(this.keyboardProtocolFallbackTimer);
-		this.keyboardProtocolFallbackTimer = undefined;
-	}
+		this._kittyProtocolActive = true;
+		setKittyProtocolActive(true);
 
-	private queryDefaultTerminalColors(): void {
-		if (process.stdin.isTTY !== true || process.stdout.isTTY !== true) {
-			return;
-		}
-		this.finishDefaultColorProbe();
-		this.defaultColorProbe = {
-			timeout: setTimeout(() => this.finishDefaultColorProbe(), 100),
-		};
-		process.stdout.write(QUERY_DEFAULT_FOREGROUND);
-		process.stdout.write(QUERY_DEFAULT_BACKGROUND);
-	}
-
-	private handleDefaultColorProbeResponse(sequence: string): boolean {
-		const response = parseOscColorResponse(sequence);
-		if (!response) {
-			return false;
-		}
-		if (!this.defaultColorProbe) {
-			return true;
-		}
-
-		this.defaultColorProbe[response.kind] = response.rgb;
-		if (this.defaultColorProbe.foreground && this.defaultColorProbe.background) {
-			this.finishDefaultColorProbe();
-		}
-		return true;
-	}
-
-	private finishDefaultColorProbe(): void {
-		if (!this.defaultColorProbe) {
-			return;
-		}
-
-		const { foreground, background, timeout } = this.defaultColorProbe;
-		clearTimeout(timeout);
-		this.defaultColorProbe = undefined;
-		if (foreground && background) {
-			setDefaultTerminalColors({ foreground, background });
-			this.resizeHandler?.();
-		}
+		// Enable Kitty keyboard protocol (push flags onto the active screen's stack)
+		process.stdout.write(KITTY_FLAGS_PUSH);
 	}
 
 	/**
@@ -453,8 +408,8 @@ export class ProcessTerminal implements Terminal {
 	stop(options: TerminalStopOptions = {}): void {
 		const wasStarted = this.started;
 		this.started = false;
-		this.finishDefaultColorProbe();
-		this.clearKeyboardProtocolFallbackTimer();
+		this._probeBus?.dispose();
+		this._probeBus = undefined;
 
 		if (this.clearProgressInterval()) {
 			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);

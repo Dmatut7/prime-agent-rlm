@@ -27,11 +27,11 @@ import {
 	parseMouseEvent,
 	parseMouseHover,
 } from "./mouse.js";
+import type { CapabilityState } from "./probe-bus.js";
 import { stripContentStartMarkers, type TableCellSelectionRegion } from "./selection-metadata.js";
 import type { Terminal } from "./terminal.js";
 import {
 	deleteKittyImage,
-	getCapabilities,
 	IMAGE_LINE_PLACEHOLDER,
 	imageLineRowOffset,
 	isImageLine,
@@ -468,6 +468,7 @@ export class TUI extends Container {
 	private fullRedrawCount = 0;
 	private preserveViewportOnNextRender = false; // One-shot: repaint visible viewport in place instead of replaying scrollback
 	private stopped = false;
+	private cellSizeProbeUnsubscribe?: () => void;
 	private fullscreenLeftMouseDragged = false;
 	private fullscreenPressedHyperlink: string | null = null;
 	private fullscreenPressedClick: FrameClickTarget | null = null;
@@ -814,7 +815,7 @@ export class TUI extends Container {
 			() => this.requestRender(),
 		);
 		this.terminal.hideCursor();
-		this.queryCellSize();
+		this.subscribeCellSizeProbe();
 		this.requestRender();
 	}
 
@@ -829,14 +830,30 @@ export class TUI extends Container {
 		this.inputListeners.delete(listener);
 	}
 
-	private queryCellSize(): void {
-		// Only query if terminal supports images (cell size is only used for image rendering)
-		if (!getCapabilities().images) {
+	/**
+	 * Follow the terminal's cell-size probe (CSI 16 t, sent by the probe bus when
+	 * image rendering is enabled). The answer arrives through the bus, not the
+	 * input stream; a terminal without a probe bus simply keeps the default cell
+	 * geometry.
+	 */
+	private subscribeCellSizeProbe(): void {
+		const bus = this.terminal.probeBus;
+		if (!bus) {
 			return;
 		}
-		// Query terminal for cell size in pixels: CSI 16 t
-		// Response format: CSI 6 ; height ; width t
-		this.terminal.write("\x1b[16t");
+		const apply = (state: CapabilityState): void => {
+			if (state.verdict !== "supported" || !state.cellSize) {
+				return;
+			}
+			setCellDimensions(state.cellSize);
+			// Images keep the cell-dimensions version in their cache key, so a change
+			// here re-renders only image components on the next frame.
+			this.requestRender();
+		};
+		// Catch up on a verdict the bus reached before this subscription (e.g. an
+		// env-forced one), then follow later answers.
+		apply(bus.query("cellSize"));
+		this.cellSizeProbeUnsubscribe = bus.onChange("cellSize", (_cap, state) => apply(state));
 	}
 
 	stop(options: TuiStopOptions = {}): void {
@@ -844,6 +861,8 @@ export class TUI extends Container {
 		const flushFullscreen = options.flushFullscreen ?? !preserveAltScreen;
 		this.exitFullscreen({ flush: flushFullscreen, leaveAltScreen: !preserveAltScreen });
 		this.stopped = true;
+		this.cellSizeProbeUnsubscribe?.();
+		this.cellSizeProbeUnsubscribe = undefined;
 		if (this.renderTimer) {
 			clearTimeout(this.renderTimer);
 			this.renderTimer = undefined;
@@ -1212,11 +1231,6 @@ export class TUI extends Container {
 			data = current;
 		}
 
-		// Consume terminal cell size responses without blocking unrelated input.
-		if (this.consumeCellSizeResponse(data)) {
-			return;
-		}
-
 		// Filter Kitty key-release events before the global debug and fullscreen
 		// viewport paths: keybindings match press and release sequences alike, so
 		// without this a release re-triggers them (e.g. PageUp scrolls two pages).
@@ -1412,26 +1426,6 @@ export class TUI extends Container {
 		}
 		pressed.region.onClick({ row: row - pressed.anchor, col: col - pressed.region.col });
 		this.requestRender();
-	}
-
-	private consumeCellSizeResponse(data: string): boolean {
-		// Response format: ESC [ 6 ; height ; width t
-		const match = data.match(/^\x1b\[6;(\d+);(\d+)t$/);
-		if (!match) {
-			return false;
-		}
-
-		const heightPx = parseInt(match[1], 10);
-		const widthPx = parseInt(match[2], 10);
-		if (heightPx <= 0 || widthPx <= 0) {
-			return true;
-		}
-
-		setCellDimensions({ widthPx, heightPx });
-		// Images keep the cell-dimensions version in their cache key, so a change
-		// here re-renders only image components on the next frame.
-		this.requestRender();
-		return true;
 	}
 
 	/**

@@ -986,6 +986,71 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedSequences, []);
 		});
 
+		it("diverts DECRPM, primary-DA and 2031-push answers arriving mid-paste out of the paste text", async () => {
+			// The probe bus adds three answer shapes on top of the Kitty/OSC/cell-size
+			// ones: DECRPM mode answers (`CSI ? Ps ; Pv $ y`), the primary-DA fence
+			// answer (`CSI ? ... c`) and mode-2031 scheme pushes (`CSI ? 997 ; 1|2 n`).
+			const cases = [
+				{ name: "DECRPM", answer: "\x1b[?2027;1$y" },
+				{ name: "primary DA", answer: "\x1b[?64;1;2;6c" },
+				{ name: "2031 scheme push", answer: "\x1b[?997;1n" },
+			];
+			assert.ok(cases.length > 0);
+			for (const { name, answer } of cases) {
+				buffer.clear();
+				emittedSequences.length = 0;
+				emittedPaste.length = 0;
+				processInput("\x1b[200~before");
+				processInput(answer);
+				processInput("after\x1b[201~");
+				await waitForPasteSettle();
+				assert.deepStrictEqual(emittedPaste, ["beforeafter"], name);
+				assert.deepStrictEqual(emittedSequences, [answer], name);
+			}
+		});
+
+		it("reassembles a torn DECRPM answer split across paste chunks", async () => {
+			processInput("\x1b[200~abc\x1b[?202");
+			processInput("7;1$ydef\x1b[201~");
+			await waitForPasteSettle();
+
+			assert.deepStrictEqual(emittedPaste, ["abcdef"]);
+			assert.deepStrictEqual(emittedSequences, ["\x1b[?2027;1$y"]);
+		});
+
+		it("reassembles a torn primary-DA answer split across paste chunks", async () => {
+			processInput("\x1b[200~abc\x1b[?64;1");
+			processInput(";2cdef\x1b[201~");
+			await waitForPasteSettle();
+
+			assert.deepStrictEqual(emittedPaste, ["abcdef"]);
+			assert.deepStrictEqual(emittedSequences, ["\x1b[?64;1;2c"]);
+		});
+
+		it("keeps a bare CSI c (the shift+right shape) inside the paste text", async () => {
+			// The DA answer is `CSI ? ... c` with a mandatory `?` prefix; a bare
+			// `\x1b[c` is the shift+right key (keys.ts) and must never be stripped.
+			processInput("\x1b[200~a\x1b[cb\x1b[201~");
+			await waitForPasteSettle();
+
+			assert.deepStrictEqual(emittedPaste, ["a\x1b[cb"]);
+			assert.deepStrictEqual(emittedSequences, []);
+		});
+
+		it("keeps a torn bare CSI c (the shift+right shape) inside the paste text", async () => {
+			processInput("\x1b[200~a\x1b[");
+			processInput("cb\x1b[201~");
+			await waitForPasteSettle();
+
+			assert.deepStrictEqual(emittedPaste, ["a\x1b[cb"]);
+			assert.deepStrictEqual(emittedSequences, []);
+		});
+
+		it("passes a bare CSI c through to the key path outside a paste", () => {
+			processInput("\x1b[c");
+			assert.deepStrictEqual(emittedSequences, ["\x1b[c"]);
+		});
+
 		it("waits one extra completion window for a torn paste start marker", async () => {
 			// A paste start split across packets ("\x1b[20" + "0~…") must not flush the
 			// fragment to the key path: the rest of the paste would arrive as

@@ -1,0 +1,3 @@
+- Changed startup capability probing (Kitty keyboard, OSC 10/11 default colors, cell size) to a single probe bus that judges unanswered queries at the primary-DA fence, replacing the 150ms/100ms fixed timers with one 1000ms fallback; on slow links a late Kitty answer still enables the protocol instead of leaking into the paste stream.
+- Added `PI_TERMINAL_KITTY_KEYBOARD`, `PI_TERMINAL_OSC_COLORS` and `PI_TERMINAL_CELL_SIZE` env overrides (`0` disables the probe and capability, `1` forces support without probing).
+- Fixed DECRPM (`CSI ? … $ y`), primary-DA (`CSI ? … c`) and 2031 scheme-push (`CSI ? 997 ; 1|2 n`) answers arriving mid-paste leaking into the pasted text; a bare `CSI c` (the shift+right key) is still delivered as a key.

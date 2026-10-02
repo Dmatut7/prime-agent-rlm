@@ -372,16 +372,22 @@ const PARTIAL_MOUSE_REPORT_REGEX = /^\x1b\[(<[\d;]*|M[\s\S]{0,2})$/;
 /**
  * Terminal query answers that can land inside an open paste on a slow link: the
  * Kitty keyboard flags answer (`CSI ? flags u`), the cell-size answer
- * (`CSI 6 ; h ; w t`) and the OSC 10/11 default-color answers. They are
- * responses to this process's own probes, never paste text, so they are lifted
- * out of the paste stream and delivered as data sequences to their regular
- * consumers.
+ * (`CSI 6 ; h ; w t`), the OSC 10/11 default-color answers, DECRPM mode answers
+ * (`CSI ? Ps ; Pv $ y`), the primary-DA fence answer (`CSI ? ... c`) and
+ * mode-2031 scheme pushes (`CSI ? 997 ; 1|2 n`, which can arrive whenever the
+ * appearance flips, not only inside the startup window). They are responses to
+ * this process's own probes, never paste text, so they are lifted out of the
+ * paste stream and delivered as data sequences to their regular consumers.
+ *
+ * The DA branch must keep its `?` prefix: a bare `\x1b[c` is the shift+right
+ * key (keys.ts), never a probe answer.
  */
-const TERMINAL_RESPONSE_REGEX = /\x1b\[\?\d+u|\x1b\[6;\d+;\d+t|\x1b\]1[01];[^\x07\x1b]+(?:\x07|\x1b\\)/g;
+const TERMINAL_RESPONSE_REGEX =
+	/\x1b\[\?\d+u|\x1b\[\?\d+(?:;\d+)*\$y|\x1b\[\?[\d;]*c|\x1b\[\?997;[12]n|\x1b\[6;\d+;\d+t|\x1b\]1[01];[^\x07\x1b]+(?:\x07|\x1b\\)/g;
 
 /** A tail that can still grow into a complete terminal response with the next chunk. */
 const TERMINAL_RESPONSE_PREFIX_REGEX =
-	/^\x1b(?:\[(?:\?\d*|6(?:;\d*(?:;\d*)?)?)?|\](?:1[01]?(?:;[^\x07\x1b]*)?(?:\x1b)?)?)?$/;
+	/^\x1b(?:\[(?:\?\d*(?:;\d*)*\$?|6(?:;\d*(?:;\d*)?)?)?|\](?:1[01]?(?:;[^\x07\x1b]*)?(?:\x1b)?)?)?$/;
 
 /** Responses are short (the longest is an OSC color answer); only a bounded tail is rescanned. */
 const TERMINAL_RESPONSE_MAX_TAIL = 64;
