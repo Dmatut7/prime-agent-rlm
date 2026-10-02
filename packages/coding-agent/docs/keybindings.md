@@ -174,6 +174,7 @@ Use `tab` to cycle forward and `shift+tab` to cycle backward through Providers, 
 | `app.messages.expand` | `ctrl+p` | Collapse or expand agent-to-agent messages |
 | `app.messages.expandAll` | `alt+p` | Expand agent messages in every turn |
 | `app.edits.expand` | `ctrl+j` | Collapse or expand edit diffs |
+| `app.transcript.loadEarlier` | `alt+u` | Load the previous page of earlier messages held back above the transcript (the top-of-chat "earlier messages not loaded" marker shown after a slim attach); the inline-mode equivalent of clicking the marker, also available as `/backfill` |
 | `app.turn.focus` | `alt+j`, `ctrl+j` | Walk the latest turn's box: arrows move, PageUp/PageDown scroll it, Enter opens a row, Escape leaves. Outside the quiet conversation (`ui.processMode: "legacy"`) both keys open or close the edit diffs instead, like `app.edits.expand`. Terminals without extended keys (tmux without `extended-keys`) send `ctrl+j` as a newline, so there `alt+j` is the key that reaches the app |
 | `app.message.followUp` | `alt+enter` | Queue follow-up message |
 | `app.message.navigateOlder` | `alt+up` | Select the next older pending message |

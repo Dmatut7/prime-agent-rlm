@@ -1,10 +1,19 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { Container } from "@earendil-works/pi-tui";
+import { Container, type EditorTheme, setKeybindings, type TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { type AppKeybinding, KEYBINDINGS, KeybindingsManager } from "../src/core/keybindings.js";
+import {
+	BUILTIN_SLASH_COMMANDS,
+	builtinSlashCommandTakesArgument,
+	isBuiltinSlashCommandName,
+	NO_ARGUMENT_BUILTIN_SLASH_COMMANDS,
+} from "../src/core/slash-commands.js";
 import { emptyUsage } from "../src/core/usage.js";
 import type { AgentConnectionSessionContext } from "../src/modes/agent-connection/index.js";
 import { DAEMON_SLIM_ATTACH_MESSAGE_TAIL } from "../src/modes/daemon/daemon-protocol.js";
+import { CustomEditor } from "../src/modes/interactive/components/custom-editor.js";
+import { formatKeyText } from "../src/modes/interactive/components/keybinding-hints.js";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { InteractiveMode, SLIM_TRANSCRIPT_PAGE_SIZE } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
@@ -34,6 +43,9 @@ type Proto = {
 		options?: { updateFooter?: boolean; populateHistory?: boolean; clearChat?: boolean; limitTranscript?: boolean },
 	): Promise<void>;
 	loadEarlierTranscriptPage(this: ModeFake): Promise<void>;
+	requestTranscriptBackfill(this: ModeFake): void;
+	setupKeyHandlers(this: ModeFake): void;
+	setupEditorSubmitHandler(this: ModeFake): void;
 	rebuildChatFromMessages(this: ModeFake): Promise<void>;
 	renderInitialMessages(this: ModeFake): Promise<void>;
 	renderResyncedSession(this: ModeFake, snapshot: unknown): Promise<void>;
@@ -171,6 +183,8 @@ function chatText(mode: ModeFake, width = 120): string {
 describe("slim attach transcript marker (rev 44)", () => {
 	beforeAll(() => {
 		initTheme("dark");
+		// The marker's inline hint names the bound key through the global manager.
+		setKeybindings(new KeybindingsManager());
 	});
 
 	afterEach(() => {
@@ -214,11 +228,13 @@ describe("slim attach transcript marker (rev 44)", () => {
 		expect(markerLine).toContain("250");
 	});
 
-	it("shows the load hint only where clicks dispatch (fullscreen + mouse)", async () => {
+	it("shows the click hint only where clicks dispatch (fullscreen + mouse)", async () => {
 		const clickable = createHarness({ slimTranscriptOmitted: 5 });
 		await proto.renderSessionContext.call(clickable, sessionContext(transcript(1, "tail")), {});
 		expect(chatText(clickable)).toContain("点击或在此处向上滚动加载");
+	});
 
+	it("names the non-mouse triggers inline, where click regions never dispatch", async () => {
 		const inline = createHarness({
 			slimTranscriptOmitted: 5,
 			ui: {
@@ -234,6 +250,25 @@ describe("slim attach transcript marker (rev 44)", () => {
 		const text = chatText(inline);
 		expect(text).toContain("更早的 5 条消息未加载");
 		expect(text).not.toContain("点击");
+		expect(text).toContain("/backfill");
+		expect(text).toContain(formatKeyText("alt+u"));
+	});
+
+	it("keeps the marker bare in fullscreen without the mouse (neither entry works there)", async () => {
+		const fullscreenNoMouse = createHarness({
+			slimTranscriptOmitted: 5,
+			settingsManager: {
+				getShowImages: () => false,
+				getFullscreenMouse: () => false,
+				getProcessMode: () => "quiet" as const,
+				getCodeBlockIndent: () => "  ",
+			},
+		});
+		await proto.renderSessionContext.call(fullscreenNoMouse, sessionContext(transcript(1, "tail")), {});
+		const text = chatText(fullscreenNoMouse);
+		expect(text).toContain("更早的 5 条消息未加载");
+		expect(text).not.toContain("点击");
+		expect(text).not.toContain("/backfill");
 	});
 });
 
@@ -553,5 +588,215 @@ describe("slim attach omission seeding (rev 44)", () => {
 			messages: [],
 		});
 		expect(mode.slimTranscriptOmitted).toBe(0);
+	});
+});
+
+const passthrough = (text: string) => text;
+
+const editorTheme: EditorTheme = {
+	borderColor: passthrough,
+	selectList: {
+		selectedPrefix: passthrough,
+		selectedText: passthrough,
+		description: passthrough,
+		scrollInfo: passthrough,
+		noMatch: passthrough,
+	},
+};
+
+const fakeTui = {
+	requestRender: vi.fn(),
+	terminal: { rows: 24, columns: 80 },
+} as unknown as TUI;
+
+/** The editor-submit fields setupEditorSubmitHandler reads before the command dispatch. */
+function submitFields(): ModeFake {
+	let editorText = "";
+	return {
+		defaultEditor: {},
+		editor: {
+			getText: () => editorText,
+			setText: (text: string) => {
+				editorText = text;
+			},
+		},
+		submittedInputBehavior: "steer",
+		queueSelection: undefined,
+		pendingQueueEdit: undefined,
+		inputSubmissionGeneration: 0,
+		inputSubmissionsPending: 0,
+		clearShortcutGuide: vi.fn(),
+		dutyLogContainer: undefined,
+		promptStashState: {},
+		promptStashSessionId: "session-1",
+		promptStash: undefined,
+		pendingSubmittedPromptStash: undefined,
+		latestEditorPromptStash: undefined,
+		snapshotPromptStash: vi.fn(() => ({ text: "" })),
+		sideQuestionComponent: undefined,
+		isShuttingDown: false,
+		agentsViewRequest: undefined,
+		pendingPromptStashReleases: [],
+		restorePromptStashIfEditorEmpty: vi.fn(),
+		completeDeferredPromptStashRelease: vi.fn(),
+		flushPendingBashComponents: vi.fn(),
+		collectImagesFor: vi.fn(() => []),
+		updatePendingMessagesDisplay: vi.fn(),
+	};
+}
+
+function submitter(mode: ModeFake): (text: string) => Promise<void> {
+	proto.setupEditorSubmitHandler.call(mode);
+	const submit = (mode.defaultEditor as { onSubmit?: (text: string) => Promise<void> }).onSubmit;
+	expect(submit).toBeDefined();
+	return submit!;
+}
+
+describe("slim attach backfill non-mouse triggers", () => {
+	beforeAll(() => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("registers /backfill as a no-argument built-in command", () => {
+		expect(isBuiltinSlashCommandName("backfill")).toBe(true);
+		expect(BUILTIN_SLASH_COMMANDS.some((command) => command.name === "backfill")).toBe(true);
+		expect(NO_ARGUMENT_BUILTIN_SLASH_COMMANDS.has("backfill")).toBe(true);
+		expect(builtinSlashCommandTakesArgument("backfill")).toBe(false);
+	});
+
+	it("binds app.transcript.loadEarlier to alt+u, a key no other default claims", () => {
+		const manager = new KeybindingsManager();
+		expect(manager.getKeys("app.transcript.loadEarlier")).toEqual(["alt+u"]);
+		const ids = Object.keys(KEYBINDINGS);
+		expect(ids.length).toBeGreaterThan(0);
+		for (const id of ids) {
+			if (id === "app.transcript.loadEarlier") continue;
+			expect(manager.getKeys(id as AppKeybinding), id).not.toContain("alt+u");
+		}
+	});
+
+	it("dispatches the bound key through the editor to the registered action", () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
+		const onLoadEarlier = vi.fn();
+		editor.onAction("app.transcript.loadEarlier", onLoadEarlier);
+
+		editor.handleInput("\x1bu"); // legacy alt+u
+
+		expect(onLoadEarlier).toHaveBeenCalledOnce();
+		expect(editor.getText()).toBe("");
+	});
+
+	it("wires the keybinding action in setupKeyHandlers to the page load", async () => {
+		const page = transcript(2, "older", 0);
+		const getMessagesWindow = vi.fn(async () => ({ messages: page, totalMessages: 254, firstIndex: 246 }));
+		const mode = createHarness({
+			slimTranscriptOmitted: 250,
+			agentConnection: { getMessagesWindow },
+		});
+		await proto.renderSessionContext.call(mode, sessionContext(transcript(2, "tail", 500)), {});
+		const handlers = new Map<string, () => unknown>();
+		mode.defaultEditor = {
+			onAction: (action: string, handler: () => unknown) => handlers.set(action, handler),
+		};
+
+		proto.setupKeyHandlers.call(mode);
+		const handler = handlers.get("app.transcript.loadEarlier");
+		expect(handler).toBeDefined();
+		handler!();
+
+		await vi.waitFor(() => expect(mode.slimTranscriptOmitted).toBe(246));
+		expect(getMessagesWindow).toHaveBeenCalledWith({ before: 250, limit: 100 });
+		const text = chatText(mode);
+		expect(text).toContain("older question 0");
+		expect(text).toContain("tail question 0");
+	});
+
+	it("the typed /backfill command loads a page through the same backfill path", async () => {
+		const page = transcript(2, "older", 0);
+		const getMessagesWindow = vi.fn(async () => ({ messages: page, totalMessages: 254, firstIndex: 246 }));
+		const prompt = vi.fn(async () => undefined);
+		const mode = createHarness({
+			slimTranscriptOmitted: 250,
+			agentConnection: { getMessagesWindow, prompt },
+			...submitFields(),
+		});
+		await proto.renderSessionContext.call(mode, sessionContext(transcript(2, "tail", 500)), {});
+		const submit = submitter(mode);
+
+		await submit("/backfill");
+
+		await vi.waitFor(() => expect(mode.slimTranscriptOmitted).toBe(246));
+		expect(getMessagesWindow).toHaveBeenCalledWith({ before: 250, limit: 100 });
+		expect(prompt).not.toHaveBeenCalled();
+		expect(chatText(mode)).toContain("older question 0");
+	});
+
+	it("/backfill with nothing held back says so instead of prompting", async () => {
+		const prompt = vi.fn(async () => undefined);
+		const fields = submitFields();
+		const editor = fields.editor as { getText: () => string };
+		const mode = createHarness({
+			slimTranscriptOmitted: 0,
+			agentConnection: {
+				getMessagesWindow: vi.fn(),
+				prompt,
+			},
+			...fields,
+		});
+		const submit = submitter(mode);
+
+		await submit("/backfill");
+
+		expect(mode.showStatus).toHaveBeenCalledWith("没有更早的消息可加载");
+		expect(editor.getText()).toBe("");
+		expect(prompt).not.toHaveBeenCalled();
+	});
+
+	it("/backfill rejects stray arguments with a usage error and restores the draft", async () => {
+		const prompt = vi.fn(async () => undefined);
+		const fields = submitFields();
+		const editor = fields.editor as { getText: () => string };
+		const mode = createHarness({
+			agentConnection: { prompt },
+			...fields,
+		});
+		const submit = submitter(mode);
+
+		await submit("/backfill 5");
+
+		expect(mode.showError).toHaveBeenCalledWith("用法：/backfill");
+		expect(editor.getText()).toBe("/backfill 5");
+		expect(prompt).not.toHaveBeenCalled();
+	});
+
+	it("a second trigger while a page load is in flight says so and does not double-read", async () => {
+		let resolveRead:
+			| ((window: { messages: AgentMessage[]; totalMessages: number; firstIndex: number }) => void)
+			| undefined;
+		const getMessagesWindow = vi.fn(
+			() =>
+				new Promise<{ messages: AgentMessage[]; totalMessages: number; firstIndex: number }>((resolve) => {
+					resolveRead = resolve;
+				}),
+		);
+		const mode = createHarness({
+			slimTranscriptOmitted: 250,
+			agentConnection: { getMessagesWindow },
+		});
+		await proto.renderSessionContext.call(mode, sessionContext(transcript(2, "tail", 500)), {});
+
+		proto.requestTranscriptBackfill.call(mode);
+		await vi.waitFor(() => expect(getMessagesWindow).toHaveBeenCalledTimes(1));
+		proto.requestTranscriptBackfill.call(mode);
+
+		expect(mode.showStatus).toHaveBeenCalledWith("正在加载更早的消息…");
+		expect(getMessagesWindow).toHaveBeenCalledTimes(1);
+		resolveRead?.({ messages: transcript(2, "older", 0), totalMessages: 254, firstIndex: 246 });
+		await vi.waitFor(() => expect(mode.slimTranscriptOmitted).toBe(246));
 	});
 });

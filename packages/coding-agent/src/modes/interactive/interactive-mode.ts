@@ -836,11 +836,14 @@ export class BrandSplashHeader implements Component {
  * 44): how many older messages the daemon held back from the attach snapshot.
  * Clicking it - or wheeling up over it at the top of the fullscreen transcript -
  * loads the previous page. Click regions only dispatch in fullscreen with mouse
- * tracking on, so the hint is shown only there; inline the line is informational
- * (the fullscreen toggle is the way in).
+ * tracking on, so the hint is shown only there; inline the line names the
+ * non-mouse entries (the app.transcript.loadEarlier key and /backfill), and in
+ * fullscreen without the mouse it stays bare (neither entry reaches that view).
  */
 export class SlimTranscriptMarkerComponent implements Component {
-	private memo: { width: number; omitted: number; loading: boolean; clickable: boolean; lines: string[] } | undefined;
+	private memo:
+		| { width: number; omitted: number; loading: boolean; clickable: boolean; hint: string; lines: string[] }
+		| undefined;
 	private regions: ClickRegion[] = [];
 
 	constructor(
@@ -848,6 +851,7 @@ export class SlimTranscriptMarkerComponent implements Component {
 		private readonly loadingNow: () => boolean,
 		private readonly clickable: () => boolean,
 		private readonly onLoadEarlier: () => void,
+		private readonly inlineHint: () => string,
 	) {}
 
 	invalidate(): void {
@@ -859,19 +863,20 @@ export class SlimTranscriptMarkerComponent implements Component {
 		const omitted = this.omittedCount();
 		const loading = this.loadingNow();
 		const clickable = this.clickable() && !loading;
+		// The hint trails the count, so truncation on a narrow terminal drops it first.
+		const hint = loading ? "" : clickable ? "（点击或在此处向上滚动加载）" : this.inlineHint();
 		const memo = this.memo;
 		if (
 			memo &&
 			memo.width === safeWidth &&
 			memo.omitted === omitted &&
 			memo.loading === loading &&
-			memo.clickable === clickable
+			memo.clickable === clickable &&
+			memo.hint === hint
 		) {
 			return memo.lines;
 		}
 		const label = loading ? "… 正在加载更早的消息…" : `… 更早的 ${omitted} 条消息未加载`;
-		// The hint trails the count, so truncation on a narrow terminal drops it first.
-		const hint = clickable ? "（点击或在此处向上滚动加载）" : "";
 		const line = truncateToWidth(theme.fg("dim", label + hint), safeWidth, "");
 		this.regions = clickable
 			? [
@@ -892,7 +897,7 @@ export class SlimTranscriptMarkerComponent implements Component {
 			: [];
 		// The blank row is the marker's own spacer, so removing the one component
 		// lifts the whole marker out of the chat.
-		this.memo = { width: safeWidth, omitted, loading, clickable, lines: [line, ""] };
+		this.memo = { width: safeWidth, omitted, loading, clickable, hint, lines: [line, ""] };
 		return this.memo.lines;
 	}
 
@@ -5309,6 +5314,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.edits.expand", () => this.toggleEditDiffExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
 		this.defaultEditor.onAction("app.thinking.toggleAll", () => this.toggleThinkingBlockVisibility(true));
+		this.defaultEditor.onAction("app.transcript.loadEarlier", () => this.requestTranscriptBackfill());
 		this.defaultEditor.onAction("app.subagents.focus", () => this.focusSubagentSummaryFromKey());
 		this.defaultEditor.onAction("app.subagents.stopAll", () => void this.requestStopAllSubagents());
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
@@ -6085,6 +6091,11 @@ export class InteractiveMode {
 				if (commandName === "clone" && !commandArgs) {
 					this.editor.setText("");
 					await this.handleCloneCommand();
+					return;
+				}
+				if (commandName === "backfill" && !commandArgs) {
+					this.editor.setText("");
+					this.requestTranscriptBackfill();
 					return;
 				}
 				if (commandName === "tree" && !commandArgs) {
@@ -8857,6 +8868,13 @@ export class InteractiveMode {
 				() => this.slimTranscriptBackfillInFlight,
 				() => this.ui.isFullscreen() && this.settingsManager.getFullscreenMouse(),
 				() => void this.loadEarlierTranscriptPage(),
+				() => {
+					// Fullscreen without the mouse gets no hint: slash commands cannot be
+					// typed there and the editor's keys do not fire.
+					if (this.ui.isFullscreen()) return "";
+					const key = this.getAppKeyDisplay("app.transcript.loadEarlier");
+					return key ? `（/backfill 或 ${key} 加载）` : "（/backfill 加载）";
+				},
 			);
 			this.slimTranscriptMarker = marker;
 			this.chatContainer.addChild(marker);
@@ -9201,6 +9219,25 @@ export class InteractiveMode {
 		} finally {
 			this.chatCapRebuildInFlight = false;
 		}
+	}
+
+	/**
+	 * The slim-attach backfill's non-mouse entries (the app.transcript.loadEarlier
+	 * key and /backfill): the marker's click regions only dispatch in fullscreen
+	 * with mouse tracking on, so inline mode reaches the same page load through
+	 * here. The guards mirror the trigger's own; a typed command or key press gets
+	 * a status line where a click would have shown the marker's loading row.
+	 */
+	private requestTranscriptBackfill(): void {
+		if (this.slimTranscriptBackfillInFlight) {
+			this.showStatus("正在加载更早的消息…");
+			return;
+		}
+		if (!this.slimTranscriptMarker || this.slimTranscriptOmitted <= 0) {
+			this.showStatus("没有更早的消息可加载");
+			return;
+		}
+		void this.loadEarlierTranscriptPage();
 	}
 
 	/**
@@ -14063,6 +14100,7 @@ ${shortcutsKey ? `\`${shortcutsKey}\` 快捷键（再按一次关闭） · ` : "
 		const blocksPrev = this.getAppKeyDisplay("app.blocks.prev");
 		const blocksNext = this.getAppKeyDisplay("app.blocks.next");
 		const reorderQueue = `${this.getAppKeyDisplay("app.message.moveEarlier")} / ${this.getAppKeyDisplay("app.message.moveLater")}`;
+		const loadEarlier = this.getAppKeyDisplay("app.transcript.loadEarlier");
 		const pasteImage = this.getAppKeyDisplay("app.clipboard.pasteImage");
 		const viewportPageUp = this.getEditorKeyDisplay("tui.viewport.pageUp");
 		const viewportPageDown = this.getEditorKeyDisplay("tui.viewport.pageDown");
@@ -14114,7 +14152,7 @@ ${expandToolsFull ? `| \`${expandToolsFull}\` | 看全文（不限行数） |\n`
 | \`${browseQueue}\` | 查看或修改排队消息 |
 ${blocksPrev ? `| \`${blocksPrev}\`${blocksNext ? ` / \`${blocksNext}\`` : ""} | 逐块浏览对话（没有排队消息时；${blockNavigationKeysText()}） |\n` : ""}
 | \`${reorderQueue}\` | 调整排队消息顺序 |
-| \`${pasteImage}\` | 从剪贴板粘贴图片 |
+${loadEarlier ? `| \`${loadEarlier}\` | 加载对话顶部未加载的更早消息（同 /backfill） |\n` : ""}| \`${pasteImage}\` | 从剪贴板粘贴图片 |
 | \`/\` | 命令 |
 
 **全屏模式（\`/fullscreen\`）**

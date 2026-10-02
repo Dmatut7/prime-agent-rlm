@@ -137,6 +137,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "fork", description: "从之前的某条消息分叉出新会话" },
 	{ name: "clone", description: "在当前位置复制一份会话" },
 	{ name: "tree", description: "浏览会话历史树（切换分支）" },
+	{ name: "backfill", description: "加载对话顶部标记未加载的更早消息" },
 	{ name: "login", description: "登录模型服务" },
 	{ name: "logout", description: "退出模型服务登录" },
 	{
@@ -292,6 +293,7 @@ export const NO_ARGUMENT_BUILTIN_SLASH_COMMANDS: ReadonlySet<string> = new Set([
 	"fork",
 	"clone",
 	"tree",
+	"backfill",
 	"login",
 	"logout",
 	"reload",

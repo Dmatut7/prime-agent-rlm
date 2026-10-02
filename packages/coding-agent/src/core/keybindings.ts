@@ -32,6 +32,7 @@ export interface AppKeybindings {
 	"app.turn.focus": true;
 	"app.thinking.toggle": true;
 	"app.thinking.toggleAll": true;
+	"app.transcript.loadEarlier": true;
 	"app.subagents.focus": true;
 	"app.subagents.stopAll": true;
 	"app.subagents.prev": true;
@@ -154,6 +155,14 @@ export const KEYBINDINGS = {
 	"app.thinking.toggleAll": {
 		defaultKeys: "alt+t",
 		description: "Expand thinking traces in every turn",
+		defaultKeyScope: "editor",
+	},
+	// The slim attach marker's inline entry: click regions only dispatch in
+	// fullscreen with mouse tracking on, so the same page load gets a key (/backfill
+	// is the other entry). alt+u is unclaimed by the editor and the other app actions.
+	"app.transcript.loadEarlier": {
+		defaultKeys: "alt+u",
+		description: "Load the previous page of earlier messages held back above the transcript",
 		defaultKeyScope: "editor",
 	},
 	"app.subagents.focus": {
