@@ -1,17 +1,7 @@
-import { randomBytes } from "node:crypto";
-import { basename, dirname, join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Box, type Component, Container, Spacer, Text, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { constants } from "fs";
-import {
-	access as fsAccess,
-	chmod as fsChmod,
-	readFile as fsReadFile,
-	rename as fsRename,
-	stat as fsStat,
-	unlink as fsUnlink,
-	writeFile as fsWriteFile,
-} from "fs/promises";
+import { access as fsAccess, readFile as fsReadFile, stat as fsStat } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { renderDiff } from "../../modes/interactive/components/diff.js";
 import {
@@ -19,6 +9,8 @@ import {
 	FILE_CHANGE_DIFF_INDENT,
 	formatFileChangeSummaryLine,
 } from "../../modes/interactive/components/edit-summary.js";
+import { writeFileAtomicAsync } from "../../utils/atomic-file.js";
+import { shortenPathHome } from "../../utils/shorten-path.js";
 import type { ToolDefinition } from "../extensions/types.js";
 import {
 	applyEditsToNormalizedContent,
@@ -34,7 +26,7 @@ import {
 } from "./edit-diff.js";
 import { withFileMutationQueue } from "./file-mutation-queue.js";
 import { resolveToCwd } from "./path-utils.js";
-import { invalidArgText, shortenPath, str } from "./render-utils.js";
+import { invalidArgText, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
 type EditPreview = EditDiffResult | EditDiffError;
@@ -93,16 +85,12 @@ export interface EditOperations {
 
 /**
  * Write a file atomically: content goes to a temp file in the target directory
- * first, then a rename commits it. If the signal aborts before the rename, the
+ * first, then a rename commits it. The temp file is fsynced before the rename
+ * and the rename retries transient Windows file locks, matching the durability
+ * of writeFileAtomicSync. If the signal aborts before the rename, the
  * original file is untouched and the temp file is removed.
  */
 export async function writeFileAtomic(absolutePath: string, content: string, signal?: AbortSignal): Promise<void> {
-	if (signal?.aborted) {
-		throw new Error("Operation aborted");
-	}
-
-	const tempPath = join(dirname(absolutePath), `.${basename(absolutePath)}.${randomBytes(6).toString("hex")}.tmp`);
-
 	let mode: number | undefined;
 	try {
 		const stats = await fsStat(absolutePath);
@@ -110,23 +98,7 @@ export async function writeFileAtomic(absolutePath: string, content: string, sig
 	} catch {
 		// Target does not exist yet; fall back to default permissions.
 	}
-
-	await fsWriteFile(tempPath, content, "utf-8");
-
-	try {
-		if (mode !== undefined) {
-			await fsChmod(tempPath, mode);
-		}
-		// Re-check right before committing: an abort that arrived during the temp
-		// write must not replace the original file.
-		if (signal?.aborted) {
-			throw new Error("Operation aborted");
-		}
-		await fsRename(tempPath, absolutePath);
-	} catch (error) {
-		await fsUnlink(tempPath).catch(() => {});
-		throw error;
-	}
+	await writeFileAtomicAsync(absolutePath, content, { mode, fsync: true, fsyncDir: true, signal });
 }
 
 const defaultEditOperations: EditOperations = {
@@ -249,7 +221,7 @@ function formatEditCall(
 ): string {
 	const invalidArg = invalidArgText(theme);
 	const rawPath = str(args?.file_path ?? args?.path);
-	const path = rawPath !== null ? shortenPath(rawPath) : null;
+	const path = rawPath !== null ? shortenPathHome(rawPath) : null;
 	const pathDisplay = path === null ? invalidArg : path ? theme.fg("accent", path) : theme.fg("toolOutput", "...");
 	return `${theme.fg("toolTitle", theme.bold("edit"))} ${pathDisplay}`;
 }

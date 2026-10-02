@@ -1,4 +1,5 @@
-import { type ClickRegion, type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { type ClickRegion, type Component, visibleWidth } from "@earendil-works/pi-tui";
+import { shortenPathToWidth } from "../../../utils/shorten-path.js";
 import { formatSpendCost } from "../spend-format.js";
 import { theme } from "../theme/theme.js";
 import { shortMemoryTitle, symlinkVerb } from "./feed-data.js";
@@ -63,13 +64,7 @@ const ITEM_PREFIX = "strip:item:";
  * alone is too wide is cut at its end.
  */
 export function shortenPath(path: string, width: number): string {
-	if (visibleWidth(path) <= width) return path;
-	const parts = path.split("/");
-	for (let start = 1; start < parts.length; start++) {
-		const candidate = `…/${parts.slice(start).join("/")}`;
-		if (visibleWidth(candidate) <= width) return candidate;
-	}
-	return truncateToWidth(parts.at(-1) ?? path, width, "…");
+	return shortenPathToWidth(path, width);
 }
 
 /** Columns a path needs to keep its file name whole. */

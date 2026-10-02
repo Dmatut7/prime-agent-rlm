@@ -1,17 +1,7 @@
-import * as os from "node:os";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { getImageDimensions, imageFallback } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { sanitizeBinaryOutput } from "../../utils/shell.js";
-
-export function shortenPath(path: unknown): string {
-	if (typeof path !== "string") return "";
-	const home = os.homedir();
-	if (path.startsWith(home)) {
-		return `~${path.slice(home.length)}`;
-	}
-	return path;
-}
 
 export function str(value: unknown): string | null {
 	if (typeof value === "string") return value;

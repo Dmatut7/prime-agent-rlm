@@ -11,6 +11,8 @@ import {
 	writeSync,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
+// Bare specifier: test mocks register against "fs/promises" (see edit-atomic-write.test.ts).
+import { chmod, open, rename, unlink, writeFile } from "fs/promises";
 
 const WIN32_RENAME_ATTEMPTS = 5;
 
@@ -34,6 +36,26 @@ function renameOntoSync(from: string, to: string): void {
 				throw error;
 			}
 			sleepSync(10 * attempt);
+		}
+	}
+}
+
+// Async twin of renameOntoSync; same transient-error policy, off the event loop.
+async function renameOnto(from: string, to: string): Promise<void> {
+	for (let attempt = 1; ; attempt++) {
+		try {
+			await rename(from, to);
+			return;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (
+				process.platform !== "win32" ||
+				(code !== "EPERM" && code !== "EACCES" && code !== "EBUSY") ||
+				attempt >= WIN32_RENAME_ATTEMPTS
+			) {
+				throw error;
+			}
+			await new Promise((resolveAttempt) => setTimeout(resolveAttempt, 10 * attempt));
 		}
 	}
 }
@@ -80,6 +102,73 @@ export function writeFileAtomicSync(path: string, data: string, options: WriteFi
 				fsyncSync(directoryDescriptor);
 			} finally {
 				closeSync(directoryDescriptor);
+			}
+		} catch {
+			// Unavailable on some platforms; the atomic rename still protects readers.
+		}
+	}
+}
+
+export interface WriteFileAtomicAsyncOptions extends Omit<WriteFileAtomicOptions, "beforeRename"> {
+	/** Async-capable variant of the sync hook. */
+	beforeRename?: (tempPath: string) => void | Promise<void>;
+	/** When aborted before the rename, the destination stays untouched and the temp file is removed. */
+	signal?: AbortSignal;
+}
+
+/**
+ * Async twin of writeFileAtomicSync with the same guarantee set: temp file
+ * beside the destination, optional fsync, exact mode past the umask, atomic
+ * rename with the Windows transient-lock retry. writeFile writes the payload
+ * in full, so no short-write loop is needed here.
+ */
+export async function writeFileAtomicAsync(
+	path: string,
+	data: string,
+	options: WriteFileAtomicAsyncOptions = {},
+): Promise<void> {
+	if (options.signal?.aborted) {
+		throw new Error("Operation aborted");
+	}
+	const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+	try {
+		await writeFile(tempPath, data, {
+			encoding: "utf8",
+			flag: "wx",
+			...(options.mode === undefined ? {} : { mode: options.mode }),
+		});
+		// An abort that arrived during the temp write skips the fsync/chmod and
+		// goes straight to cleanup; the pre-rename check below is the commit gate.
+		if (options.signal?.aborted) {
+			throw new Error("Operation aborted");
+		}
+		if (options.fsync) {
+			const handle = await open(tempPath, "r");
+			try {
+				await handle.sync();
+			} finally {
+				await handle.close();
+			}
+		}
+		// writeFile's mode is masked by the umask; enforce the requested bits exactly.
+		if (options.mode !== undefined) await chmod(tempPath, options.mode);
+		await options.beforeRename?.(tempPath);
+		// Re-check right before committing: an abort that arrived during the temp
+		// write must not replace the original file.
+		if (options.signal?.aborted) {
+			throw new Error("Operation aborted");
+		}
+		await renameOnto(tempPath, path);
+	} finally {
+		await unlink(tempPath).catch(() => {});
+	}
+	if (options.fsyncDir) {
+		try {
+			const directoryHandle = await open(dirname(path), "r");
+			try {
+				await directoryHandle.sync();
+			} finally {
+				await directoryHandle.close();
 			}
 		} catch {
 			// Unavailable on some platforms; the atomic rename still protects readers.

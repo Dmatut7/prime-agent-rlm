@@ -5,6 +5,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { shortenPathToWidth } from "../../../utils/shorten-path.js";
 import { theme } from "../theme/theme.js";
 import type { FileChangeSummary } from "./edit-summary.js";
 import { keyText } from "./keybinding-hints.js";
@@ -89,19 +90,8 @@ export function turnFootNoteDurationText(durationMs: number): string {
 
 /** Keep a path's tail readable: `…/scratchpad/shop.md` beats a head cut mid-segment. */
 function shortenPath(path: string, width: number): string {
-	if (visibleWidth(path) <= width) {
-		return path;
-	}
-	const parts = path.split("/").filter((part) => part.length > 0);
 	// An absolute path outside the project reads best as its last two segments.
-	const maxKeep = path.startsWith("/") ? Math.min(2, parts.length - 1) : parts.length - 1;
-	for (let keep = maxKeep; keep >= 1; keep--) {
-		const candidate = `…/${parts.slice(-keep).join("/")}`;
-		if (visibleWidth(candidate) <= width) {
-			return candidate;
-		}
-	}
-	return truncateToWidth(parts.at(-1) ?? path, width, "…");
+	return shortenPathToWidth(path, width, { absoluteMaxSegments: 2, filterEmptySegments: true });
 }
 
 /** A running turn's clock in whole seconds: `16s`, `1m 05s` (matches the status line). */

@@ -7,6 +7,8 @@ import { createEditToolDefinition, writeFileAtomic } from "../src/core/tools/edi
 
 const fsHooks = vi.hoisted(() => ({
 	onAfterWriteFile: undefined as (() => void) | undefined,
+	fsyncCount: 0,
+	renameFault: { code: "", remaining: 0, calls: 0 },
 }));
 
 vi.mock("fs/promises", async (importOriginal) => {
@@ -18,6 +20,26 @@ vi.mock("fs/promises", async (importOriginal) => {
 	return {
 		...actual,
 		writeFile: writeFileWithHook,
+		open: (async (...args: Parameters<typeof actual.open>) => {
+			const handle = await actual.open(...args);
+			if (typeof args[0] === "string" && args[0].endsWith(".tmp")) {
+				const originalSync = handle.sync.bind(handle);
+				handle.sync = async () => {
+					fsHooks.fsyncCount++;
+					return originalSync();
+				};
+			}
+			return handle;
+		}) as typeof actual.open,
+		rename: (async (from: Parameters<typeof actual.rename>[0], to: Parameters<typeof actual.rename>[1]) => {
+			if (fsHooks.renameFault.code) {
+				fsHooks.renameFault.calls++;
+				if (fsHooks.renameFault.remaining-- > 0) {
+					throw Object.assign(new Error("rename blocked"), { code: fsHooks.renameFault.code });
+				}
+			}
+			return actual.rename(from, to);
+		}) as typeof actual.rename,
 	};
 });
 
@@ -36,6 +58,9 @@ async function tempFileResidues(dir: string): Promise<string[]> {
 
 afterEach(async () => {
 	fsHooks.onAfterWriteFile = undefined;
+	fsHooks.fsyncCount = 0;
+	Object.assign(fsHooks.renameFault, { code: "", remaining: 0, calls: 0 });
+	vi.restoreAllMocks();
 	await Promise.all(tempDirs.splice(0, tempDirs.length).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -77,6 +102,45 @@ describe("writeFileAtomic", () => {
 		await expect(writeFileAtomic(file, "corrupted", controller.signal)).rejects.toThrow("Operation aborted");
 
 		expect(await readFile(file, "utf-8")).toBe("original");
+		expect(await tempFileResidues(dir)).toEqual([]);
+	});
+
+	it("fsyncs the temp file before the rename commits it", async () => {
+		const dir = await createTempDir();
+		const file = join(dir, "target.txt");
+		await writeFile(file, "before", "utf-8");
+
+		await writeFileAtomic(file, "after");
+
+		expect(fsHooks.fsyncCount).toBeGreaterThan(0);
+		expect(await readFile(file, "utf-8")).toBe("after");
+	});
+
+	it("retries a transient Windows rename lock instead of failing the edit", async () => {
+		const dir = await createTempDir();
+		const file = join(dir, "target.txt");
+		await writeFile(file, "before", "utf-8");
+		vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+		Object.assign(fsHooks.renameFault, { code: "EPERM", remaining: 2, calls: 0 });
+
+		await writeFileAtomic(file, "after");
+
+		expect(fsHooks.renameFault.calls).toBe(3);
+		expect(await readFile(file, "utf-8")).toBe("after");
+		expect(await tempFileResidues(dir)).toEqual([]);
+	});
+
+	it("bounds failed rename retries and keeps the original file", async () => {
+		const dir = await createTempDir();
+		const file = join(dir, "target.txt");
+		await writeFile(file, "before", "utf-8");
+		vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+		Object.assign(fsHooks.renameFault, { code: "EBUSY", remaining: 10, calls: 0 });
+
+		await expect(writeFileAtomic(file, "after")).rejects.toThrow("rename blocked");
+
+		expect(fsHooks.renameFault.calls).toBe(5);
+		expect(await readFile(file, "utf-8")).toBe("before");
 		expect(await tempFileResidues(dir)).toEqual([]);
 	});
 });
