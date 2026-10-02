@@ -14,16 +14,16 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-03，wave-21 已 SHIP）
+## 当前状态（2026-10-03，wave-22 已 SHIP）
 
-- HEAD = 见 git log。wave-21：W21-A 子代理收尸（listRlmSubagents 默认活跃清单+prune 兜底）、
-  W21-B+G 消息唤醒（内核协议 v5 + TS 宿主接线）、W21-C 流式两腿（R1 监控 attach 能力声明 +
-  R3 markdown 行级密封，A/B：渲染 14.2s→0.9s、wire 602MB→1.78MB）、W21-F 虚报修复（_ABSENT
-  误判统一降级 unknown + 两个文件大小上限 256KB/1MiB→4MiB/8MiB + +0 不显示 + 回归测试钉死）。
-- 新硬规则（老板经外部审查下的）：每波交付里凡屏幕显示数字/文案的路径，必须拿外部真值交叉
-  对账（git diff --stat / wc -l / git status）；「测试绿≠屏幕上对」。已写进本节，后续波次照此验收。
-- 老板的输入连按报告已复现归因（/tmp/wave21/input-repeat.md，5 bug+2 陷阱到行号），wave-22 修。
-- 遥测：老板自 wave-19 重启后零新会话，记忆/交接指标等流量。
+- HEAD = 见 git log（wave-22 三批 + 文档批）。老板的输入连按五 bug：A/B/D/E 修复（Kitty repeat
+  动作侧过滤+repeatable 白名单、ESC 撕裂重组窗延长、Option+↓ 死键补齐、思考账本迁 TimelineUiState
+  机制化清账），F 判定设计行为已文档化（双击 Esc 开树是 wave-19 特性，草稿 stash 不丢）。
+- suite 1659/1659 EXIT 0（4603 连续两波稳定）；顶层 9329 绿+2 已知负载抖动；tui 1153；CI 绿。
+- 遥测：老板自重启后仍零生产会话（四项新特性零曝光），等他真用；compaction 交接生产零触发。
+- 调研：Claude Code 2.1.288 changelog 出（Ctrl+C 找回草稿与我们 wave-12 同构；子代理超时续跑
+  范式入 Backlog-11 参照）；Anthropic containment 文补登记（安全簇头号参照）。
+- 新验收规矩执行中：本波所有显示数字已对过外部真值（A/B 数字在 FORK_NOTES/各 lane 报告）。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -100,14 +100,12 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-22 候选）
+## 下一波主题（wave-23 候选）
 
-1. 【输入连按五 bug】（/tmp/wave21/input-repeat.md，全部归因到行）：A Kitty repeat 事件过滤
-   （动作侧，视口滚动/文本键合法依赖 repeat 不能全局滤）、B legacy Option ESC 前缀撕裂吞草稿、
-   D Option+↓ 死键、E 思考/过程车道混按记账错乱、F Esc 连按吞字评估。
-2. W21-A 遗留：prompts/rlm.ts 与 refinement.ts 的 list_subagents 措辞对齐新默认（活跃清单）；
-   Python 侧 rlm.prune_subagents/list_subagents(include_terminal) wrapper；errored 孩子的 daemon 侧
-   常驻回收。
-3. 记忆阶段 2 / compaction 交接生产复核（等流量）。
+1. W21-A 遗留：prompts/rlm.ts 与 refinement.ts 的 list_subagents 措辞对齐；Python 侧
+   rlm.prune_subagents/list_subagents(include_terminal) wrapper；errored 孩子的 daemon 侧回收。
+2. W22-C 遗留：扩展快捷键的裸 matchesKey 绕过 manager（interactive-mode.ts:4232，repeat 仍会
+   重触发扩展 handler）；alt+t 60ms 连按疑似丢首按（复测钉死）。
+3. 记忆阶段 2（等老板真实使用后的遥测）；compaction 交接假 HOME 演练出数。
 4. 探测总线阶段 6（kitty 图片占位符）。
-5. GLM 长上下文压缩阈值评估（等老板拍板）。
+5. GLM 长上下文压缩阈值（等老板拍板）；安全簇（等老板拍板，Anthropic containment 文是参照）。
