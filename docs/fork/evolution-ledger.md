@@ -14,17 +14,16 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-02，wave-15 部分落地，记忆调研波优先）
+## 当前状态（2026-10-02，wave-16 记忆深调研完成，设计稿落地）
 
-- HEAD = wave-15 三提交（slim 回填触发器 / 探测总线设计稿 / runner 剥 RLM_SESSION_DIR）+ 本文档批。
-- wave-15 被老板中断转「记忆系统优化」专项：W15-C/D/E 已交付并提交；W15-A（4603 竞态）与
-  W15-B（F15）半途被撤——A 的仪器化 patch 在 /tmp/w15-aborted/（已定位重拉路径在
-  launchReplacementSupervisor，两道闸 canConnectToSupervisor/isDaemonShutdownAdmissionActive
-  待查哪道失效），B 未动工。两路登记 wave-16 续。
-- 考题例行跑 7/7 首次全绿（/tmp/wave15/exam-routine.md）；新缺陷候选 D9（claude 伪造 drift 轨输入，
-  判分器硬化）待立项；EX-4 glm 成本回退 219k→849k 待钉是否趋势。
-- 老板新指令：记忆系统（尤其召回）做深调研再动，「不要带缺陷的优化」。
-- 恢复指令：记忆调研波（wave-16）见下；4603/F15 从 /tmp/w15-aborted + 本节恢复。
+- HEAD = 01ee6e0a5 + 本批文档（wave-15 三提交已推送）。
+- wave-16（记忆专项，老板点名）：五路调研完成，产物 /tmp/wave16/（memory-map/memory-failures/
+  memory-peers/memory-frameworks/recall-options），综合设计稿 docs/fork/memory-recall-design.md。
+- 核心实测：1574 条库存无界、注入窗 0.38% 条目、检索器 96.5% 召回但 263 会话只用 31 次
+  （prompt 没教）；主病根=发现与纪律，不是检索质量；业界无一家用向量嵌入做核心记忆管道。
+- 设计决策：三阶段（接线→digest 两层→写入防腐），明确否决加窗口/embedding/审批 inbox。
+- wave-17 = 按设计稿施工（阶段 1+2 先做，A/B 基线先行）。
+- 恢复指令：wave-17 按 memory-recall-design.md 施工；4603/F15 从 /tmp/w15-aborted + 波次 15 节恢复。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
 
@@ -100,13 +99,9 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-16 候选）
+## 下一波主题（wave-17 = 记忆设计稿施工）
 
-1. 【记忆系统深调研+设计】（老板点名，最高优先）：现状全链审计（写入/存储/召回/注入/compaction 交互）
-   + 会话记录挖「忘事」实案 + 外部范式调研（Claude Code memory、Letta/MemGPT、OpenHands、LangGraph、
-   mem0、Anthropic context engineering）+ 无缺陷设计稿（含 A/B 验证方案）。已知实测锚点：记忆-8
-   （摘要窗口外等于不存在）、文档-4（path 排序使 45.8% 新记忆永不进注入面）、C5（重启忘事，wave-14
-   已修一半）。
-2. wave-15 续：W15-A 4603 竞态（从 /tmp/w15-aborted 的仪器化线索继续）+ W15-B F15 裁决。
-3. D9 判分器硬化（轨输入移出 agent 可写区 + 拒收晚于 run 开始的 mtime + prompt 禁跑判分器）。
-4. 探测总线实施阶段 1-2（docs/fork/probe-bus-design.md 的剥离正则 + 总线骨架）。
+按 docs/fork/memory-recall-design.md：阶段 1 接线（prompt 教检索 + 溢出具名 + 写前 search 软门 +
+排序多信号）+ 阶段 2 digest 两层（全量索引硬上限 + top-k 详情 + path 归并）；A/B 基线先建
+（离线 recall@k + 在线插桩 + EX-8 记忆题）。之后波次再排：4603 竞态（/tmp/w15-aborted 续）、
+F15 裁决、D9 判分器硬化、探测总线实施阶段 1-2、阶段 3 consolidation 工序。
