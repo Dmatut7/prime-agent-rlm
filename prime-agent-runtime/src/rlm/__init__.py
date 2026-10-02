@@ -448,6 +448,12 @@ class _HarnessProxy:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._resolve(), name)
 
+    def __dir__(self) -> list[str]:
+        # Models discover the harness API through dir(); proxy it so the public
+        # state methods (search/get/overview/...) show up instead of only this
+        # proxy's own underscore-prefixed machinery.
+        return [name for name in dir(self._resolve()) if not name.startswith("_")]
+
     def __repr__(self) -> str:
         return repr(self._resolve())
 

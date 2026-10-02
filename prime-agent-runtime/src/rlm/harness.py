@@ -24,7 +24,7 @@ from collections.abc import Generator
 from typing import Any, Literal, Mapping, NamedTuple, Sequence
 
 from . import effects
-from ._yaml_compat import register_plain_str
+from ._yaml_compat import register_plain_list, register_plain_str
 
 try:
     import fcntl
@@ -438,6 +438,13 @@ class HarnessSearchHit(NamedTuple):
     id: str
     score: float
     snippet: str
+
+
+class AwaitableSearchHits(list[HarnessSearchHit], _AwaitableResult):
+    """A synchronous ``HarnessState.search`` result list that also tolerates ``await``."""
+
+
+register_plain_list(AwaitableSearchHits)
 
 
 _ENTRY_FIELDS = {field.name for field in fields(HarnessEntry)}
@@ -1489,10 +1496,12 @@ class HarnessState:
         *,
         global_: bool = False,
         **kwargs: Any,
-    ) -> list[HarnessSearchHit]:
+    ) -> AwaitableSearchHits:
         """Return ``(kind, id, score, snippet)`` hits ranked by term overlap.
 
-        Terms are scored against an entry's title, content, and path/id
+        The result is a plain list for iteration and unpacking that also
+        tolerates ``await`` (awaiting it returns the same list). Terms are
+        scored against an entry's title, content, and path/id
         identifier slots; matching more distinct slots counts more. Each
         matched term is discounted by its document frequency across the
         ranked corpus (tf-idf style, ``log(1 + N / df)``), so a rare,
@@ -1515,7 +1524,7 @@ class HarnessState:
             raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
         terms = _harness_query_terms(query)
         if not terms:
-            return []
+            return AwaitableSearchHits()
 
         entries = self.list(kind)
 
@@ -1546,7 +1555,7 @@ class HarnessState:
         # (kind, id) asc without making the identifier tiebreak reverse too.
         scored.sort(key=lambda hit: (hit[0].kind, hit[0].id))
         scored.sort(key=lambda hit: (hit[1], _search_recency(hit[0])), reverse=True)
-        return [
+        return AwaitableSearchHits(
             HarnessSearchHit(
                 entry.kind,
                 entry.id,
@@ -1554,7 +1563,7 @@ class HarnessState:
                 _search_snippet(f"{entry.title} {entry.content}", terms),
             )
             for entry, score in scored[:limit]
-        ]
+        )
 
     def snapshot(self, *, global_: bool = False, **kwargs: Any) -> dict[str, Any]:
         if target := self._global_target(global_, kwargs):

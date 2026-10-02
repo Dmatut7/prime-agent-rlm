@@ -49,6 +49,18 @@ class BashResultHabitsTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(await result, result)
 
 
+class HarnessIntrospectionHabitsTest(unittest.TestCase):
+    def test_dir_on_the_session_proxy_lists_the_public_state_methods(self) -> None:
+        # Models discover the harness API through dir(); the session proxy used
+        # to show only its own underscore-prefixed machinery, so the usual
+        # `[n for n in dir(rlm.harness) if not n.startswith("_")]` came back [].
+        names = dir(rlm.harness)
+        public = [name for name in names if not name.startswith("_")]
+        self.assertGreater(len(public), 0)
+        for method in ("search", "get", "overview", "create_memory"):
+            self.assertIn(method, public)
+
+
 class HarnessAwaitHabitsTest(unittest.IsolatedAsyncioTestCase):
     async def test_awaited_crud_returns_the_same_entry_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -63,6 +75,28 @@ class HarnessAwaitHabitsTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("exam-note", state.overview())
             event = await state.record_refinement("trigger", ["change"])
             self.assertEqual(event.trigger, "trigger")
+
+    async def test_awaited_search_returns_the_same_ranked_hits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            entry = state.create_memory("exam-note", "hello")
+            hits = state.search("exam")
+            self.assertIsInstance(hits, list)
+            self.assertEqual([hit.id for hit in hits], [entry.id])
+            for kind, id, _score, _snippet in hits:
+                self.assertEqual((kind, id), (entry.kind, entry.id))
+            self.assertIs(await hits, hits)
+            self.assertEqual(await state.search("exam"), hits)
+            self.assertEqual(await state.search("no-such-term"), [])
+
+    def test_search_hits_survive_pickling_for_kernel_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("exam-note", "hello")
+            hits = state.search("exam")
+            restored = pickle.loads(pickle.dumps(hits))
+            self.assertEqual(restored, hits)
+            self.assertEqual(restored[0].id, hits[0].id)
 
 
 class SubagentRecordHabitsTest(unittest.TestCase):

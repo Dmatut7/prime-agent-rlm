@@ -13,6 +13,7 @@ import {
 	getKernelVenvDir,
 	type KernelPythonSkill,
 	pythonSkillContentHash,
+	REQUIRED_HARNESS_METHODS,
 	resolveRuntimeIdentity,
 } from "../src/core/kernel/bootstrap.js";
 
@@ -250,6 +251,19 @@ describe("kernel bootstrap", () => {
 		process.env.PRIME_AGENT_KERNEL_VENV = venv;
 
 		expect(getKernelVenvDir()).toBe(venv);
+	});
+
+	it("gates readiness on the harness read API the prompt teaches, and only on real runtime methods", () => {
+		// search/get are how the prompt sends models to the harness; a venv whose
+		// runtime predates them must fail the ready check and rebuild. Every gated
+		// name must also be a real HarnessState method, or the check could never pass.
+		expect(REQUIRED_HARNESS_METHODS).toContain("search");
+		expect(REQUIRED_HARNESS_METHODS).toContain("get");
+		const harnessSource = readFileSync(resolve(__dirname, "../../../prime-agent-runtime/src/rlm/harness.py"), "utf8");
+		expect(REQUIRED_HARNESS_METHODS.length).toBeGreaterThan(0);
+		for (const method of REQUIRED_HARNESS_METHODS) {
+			expect(harnessSource, `harness.py has no ${method}`).toMatch(new RegExp(`^    def ${method}\\(`, "m"));
+		}
 	});
 
 	it("bootstraps a missing venv with uv, prime-agent-runtime, and default extra packages", async () => {

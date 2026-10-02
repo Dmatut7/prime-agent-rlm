@@ -107,7 +107,7 @@ function uvCommandTimeoutMs(): number {
 	const raw = Number.parseInt(process.env.PRIME_AGENT_KERNEL_UV_TIMEOUT_MS ?? "", 10);
 	return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_UV_COMMAND_TIMEOUT_MS;
 }
-const REQUIRED_HARNESS_METHODS = [
+export const REQUIRED_HARNESS_METHODS = [
 	"create_memory",
 	"update_memory",
 	"delete_memory",
@@ -121,6 +121,10 @@ const REQUIRED_HARNESS_METHODS = [
 	"update_prompt_note",
 	"delete_prompt_note",
 	"record_refinement",
+	// The read path the prompt teaches; a venv whose runtime predates it must
+	// fail the ready check and rebuild instead of booting into missing API.
+	"search",
+	"get",
 ];
 // Range, not equality: the runtime this check runs against is the copy installed in the venv,
 // which comes from resolveRuntimeSourceDir() — on a built checkout that is

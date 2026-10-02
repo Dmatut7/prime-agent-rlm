@@ -4,7 +4,7 @@ import importlib.util
 import unittest
 
 from rlm.bash import OutputText
-from rlm.harness import AwaitableText
+from rlm.harness import AwaitableSearchHits, AwaitableText
 
 HAS_YAML = importlib.util.find_spec("yaml") is not None
 
@@ -18,6 +18,13 @@ class YamlSafeDumpTest(unittest.TestCase):
             dumped = yaml.safe_dump({"v": value})
             self.assertEqual(yaml.safe_load(dumped), {"v": str(value)})
             self.assertNotIn("python/object", yaml.dump({"v": value}))
+
+    def test_search_hits_dump_as_a_plain_list(self):
+        import yaml
+
+        dumped = yaml.safe_dump({"v": AwaitableSearchHits()})
+        self.assertEqual(yaml.safe_load(dumped), {"v": []})
+        self.assertNotIn("python/object", yaml.dump({"v": AwaitableSearchHits()}))
 
 
 if __name__ == "__main__":
