@@ -1294,7 +1294,9 @@ describe("ENG-4603 worker recovery convergence", () => {
 		expect(listenersBeforeShutdown).toContain(`p${successorService.pid}`);
 		const namedByPath = lsofListenersOf(listenersBeforeShutdown, socketPath);
 		if (namedByPath.length > 0) {
-			expect(namedByPath.sort()).toEqual(
+			// Both sides sort numerically: the default lexicographic sort disagrees
+			// with it whenever the two pids have different digit counts.
+			expect(namedByPath.sort((left, right) => left - right)).toEqual(
 				[predecessorService.pid, successorService.pid].sort((left, right) => left - right),
 			);
 		}
@@ -1446,6 +1448,107 @@ describe("ENG-4603 worker recovery convergence", () => {
 			expect(result.stdout).toContain(idle.text);
 		}
 	}, 150_000);
+
+	it("never resurrects a supervisor whose deliberate shutdown tombstoned the socket", async () => {
+		if (process.platform === "win32") return;
+		const paths = await createPaths();
+		const supervisor = spawnSupervisor(paths);
+		await waitForType(supervisor, "booted");
+		supervisor.child.send({ type: "go" });
+		await waitForType(supervisor, "ready", 60_000);
+		const client = await connectEventually(paths.socketPath);
+		const stopped = await client.request({ type: "shutdown", force: true }, 10_000);
+		if (!stopped.success) throw new Error(stopped.error);
+		client.close();
+		await waitForExit(supervisor);
+
+		// A worker that outlived the deliberate stop: no claim, a dead socket, and a
+		// resurrection loop that must never outvote the shutdown. The poll fails fast
+		// the moment any daemon takes ownership or re-binds the socket; on unfixed
+		// code the worker launches a replacement within its first probe round (~2.5s),
+		// so a 15s quiet window is several launch decisions deep.
+		const workerSocketPath = join(paths.agentDir, "t-worker.sock");
+		const worker = spawnStandaloneWorker(paths, workerSocketPath, "eng-4603-tombstone");
+		try {
+			await waitForPath(workerSocketPath).catch((error: unknown) => {
+				throw new Error(`${String(error)}\nworker stdout: ${worker.stdout}\nworker stderr: ${worker.stderr}`);
+			});
+			const deadline = Date.now() + 15_000;
+			while (Date.now() < deadline) {
+				const owners = listOwnerRecords(paths.registryDir);
+				if (owners.length > 0) {
+					throw new Error(
+						`supervisor resurrected after a deliberate shutdown: owner records name pids ${owners.map((owner) => owner.pid).join(", ")}`,
+					);
+				}
+				if (existsSync(paths.socketPath)) {
+					throw new Error("supervisor socket reappeared after a deliberate shutdown");
+				}
+				await delay(50);
+			}
+		} finally {
+			await terminateTrackedFixtureProcess(worker);
+		}
+
+		// Even a daemon that a worker's relaunch already spawned (the tombstone landed
+		// after the worker's own check) must refuse the socket at startup instead of
+		// taking it over. The marker env var is the one launchReplacementSupervisor
+		// sets on its child; spelled out here so the test runs on unfixed code too.
+		const relaunchEnv = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_RELAUNCH";
+		const spawnDaemon = (extraEnv: NodeJS.ProcessEnv): ProcessHandle =>
+			trackProcess(
+				spawn(
+					paths.executablePath,
+					[tsxPath, cliPath, "--mode", "daemon", "--daemon-socket", paths.socketPath, "--offline"],
+					{
+						cwd: paths.agentDir,
+						env: {
+							...process.env,
+							[supervisorRegistryDirEnv]: paths.registryDir,
+							[ENV_AGENT_DIR]: paths.agentDir,
+							PI_OFFLINE: "1",
+							TMPDIR: paths.socketTmpDir,
+							TSX_TSCONFIG_PATH: tsconfigPath,
+							...extraEnv,
+						},
+						stdio: ["ignore", "pipe", "pipe"],
+					},
+				),
+				"client",
+			);
+		const marked = spawnDaemon({ [relaunchEnv]: "1" });
+		const markedDeadline = Date.now() + 30_000;
+		while (marked.child.exitCode === null && Date.now() < markedDeadline) {
+			const owners = listOwnerRecords(paths.registryDir);
+			if (owners.length > 0) {
+				throw new Error(
+					`a relaunch-spawned daemon took over a tombstoned socket: owner records name pids ${owners.map((owner) => owner.pid).join(", ")}`,
+				);
+			}
+			await delay(50);
+		}
+		if (marked.child.exitCode === null) {
+			throw new Error(`relaunch-spawned daemon never exited the tombstoned socket\n${marked.stderr}`);
+		}
+		expect(marked.child.exitCode, marked.stderr).toBe(0);
+		expect(listOwnerRecords(paths.registryDir)).toEqual([]);
+
+		// A deliberate start is not a relaunch: it boots on the same socket and lifts
+		// the tombstone, so later crash recovery works again.
+		const deliberate = spawnDaemon({});
+		try {
+			await connectEventually(paths.socketPath);
+		} catch (error) {
+			throw new Error(
+				`deliberate start did not boot on the tombstoned socket: ${String(error)}\n${deliberate.stderr}`,
+			);
+		}
+		const deliberateClient = await connectEventually(paths.socketPath);
+		const deliberateStop = await deliberateClient.request({ type: "shutdown", force: true }, 10_000);
+		if (!deliberateStop.success) throw new Error(deliberateStop.error);
+		deliberateClient.close();
+		await waitForExit(deliberate);
+	}, 120_000);
 
 	it("spawns fixture processes through a private wrapper, never a hard link of the runner's node", async () => {
 		if (process.platform === "win32") return;

@@ -33,10 +33,10 @@ Normal interactive sessions use resident workers:
 - The supervisor starts one detached process group per active root tree.
 - Closing the TUI detaches the client; it does not stop the worker.
 - Worker descriptors, authentication tokens, active-session IDs, session paths, and recovery journals are written with owner-only permissions under the agent directory.
-- Workers monitor the public supervisor socket. If it disappears, one worker acquires an atomic launch lease and starts a replacement supervisor.
+- Workers monitor the public supervisor socket. If it stays unreachable through a short grace period (5 seconds, so a supervisor succession is not mistaken for a crash), one worker acquires an atomic launch lease and starts a replacement supervisor.
 - A replacement supervisor adopts live workers and their active-session IDs.
 - A worker crash affects one root tree. Recovery retries after 250 ms, 1 second, and 5 seconds; three failures mark that root failed.
-- `prime-agent shutdown` stops the supervisor and all workers; `--force` also terminates unresponsive worker process groups and tracked children.
+- `prime-agent shutdown` stops the supervisor and all workers; `--force` also terminates unresponsive worker process groups and tracked children. A supervisor that exits intentionally records a shutdown tombstone for its socket: workers never resurrect a tombstoned supervisor, and a worker-spawned replacement refuses it at startup. Starting the daemon explicitly lifts the tombstone.
 
 There is no fixed session, worker, client, or workload cap in this layer.
 

@@ -23,6 +23,7 @@ import {
 	acquireDaemonShutdownAdmission,
 	findLiveDaemonOwnersForAgentDir,
 	readRecordedDaemonSocketOwners,
+	recordDaemonShutdownTombstone,
 } from "../modes/daemon/daemon-supervisor-ownership.js";
 import type { DaemonWorkerDescriptor } from "../modes/daemon/daemon-worker-protocol.js";
 import { isProcessAlive, processIdExists, signalProcessGroupOrProcess } from "../utils/child-process.js";
@@ -2035,6 +2036,12 @@ async function terminateVerifiedListener(sweep: ShutdownSweep, listener: Discove
 	// not a stop this run performed, however convenient the timing (X-1).
 	if (!stopped || (!signalled && !escalated)) {
 		return false;
+	}
+	if (escalated) {
+		// A SIGKILLed supervisor never ran its shutdown entry, so it never wrote
+		// its own tombstone: without this record its orphaned workers could
+		// resurrect the socket after the sweep leaves (wave-18 W18-A chain).
+		recordDaemonShutdownTombstone(listener.socketPath);
 	}
 	// This run is what took that service down, which is also the only thing that
 	// may explain a worker of it disappearing inside the same window.

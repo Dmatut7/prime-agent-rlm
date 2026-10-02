@@ -23,6 +23,7 @@ import { getDaemonRuntimeIdentity } from "../modes/daemon/daemon-runtime-identit
 import { isSessionSummaryBusy, type SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import {
+	DAEMON_SUPERVISOR_RELAUNCH_ENV,
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
@@ -481,6 +482,10 @@ Then retry the original command.`,
 	delete env[ORPHAN_PROCESS_JOURNAL_ENV];
 	delete env[SESSION_LEASES_ENABLED_ENV];
 	delete env[SESSION_LEASE_OWNER_ID_ENV];
+	// An interactive start is always deliberate: a CLI running inside a worker's
+	// session subprocess would otherwise inherit the worker-relaunch marker and be
+	// refused by a tombstoned socket.
+	delete env[DAEMON_SUPERVISOR_RELAUNCH_ENV];
 
 	const logOffset = currentDaemonLogSize(socketPath);
 	const child = spawn(

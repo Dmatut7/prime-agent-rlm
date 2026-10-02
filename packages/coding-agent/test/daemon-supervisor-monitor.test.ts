@@ -37,6 +37,7 @@ import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js"
 import {
 	SUPERVISOR_PROBE_INTERVAL_MS,
 	SUPERVISOR_RECHECK_MAX_MS,
+	SUPERVISOR_RELAUNCH_GRACE_MS,
 } from "../src/modes/daemon/supervisor-availability.js";
 import { WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
 import type { PrivateFrame } from "../src/modes/session-worker/private-framing.js";
@@ -1275,11 +1276,11 @@ describe("daemon worker supervisor monitoring", () => {
 
 	it("keeps the supervisor monitor armed after a replacement binds but exits before claiming", async () => {
 		vi.useFakeTimers();
-		// The supervisor socket is dead, answers once during the replacement launch,
-		// then dies again before the replacement ever claims the worker. Probe
-		// results are consumed by the round's failed attempts, then by the
-		// post-launch recheck.
-		const probeResults = [false, false, false, true, false, false, false, false];
+		// The supervisor socket is dead past the succession grace, answers once during
+		// the replacement launch, then dies again before the replacement ever claims
+		// the worker. Probe results are consumed by the round's failed attempts, then
+		// by the post-launch recheck.
+		const probeResults = [false, false, false, false, false, false, true, false, false, false];
 		let probeCount = 0;
 		const daemon = createHarness(async () => {
 			const result = probeResults[Math.min(probeCount, probeResults.length - 1)];
@@ -1329,7 +1330,18 @@ describe("daemon worker supervisor monitoring", () => {
 
 		daemon.scheduleSupervisorAvailabilityCheck("/tmp/supervisor.sock", 1500);
 		await runArmedRound();
-		expect(probeCount).toBe(4);
+		// The succession grace: a fresh absence may be a handoff gap, so the first
+		// failed round starts the orphan window but does not launch a replacement.
+		expect(probeCount).toBe(3);
+		expect(daemon.launchReplacementSupervisor).not.toHaveBeenCalled();
+		expect(daemon.supervisorAvailabilityState.supervisorAbsentSince).toBeDefined();
+		expect(daemon.supervisorMonitorTimer).toBeDefined();
+
+		// The absence outlives the grace with the socket still dead: this is a crash,
+		// and the worker offers a replacement.
+		daemon.supervisorAvailabilityState.supervisorAbsentSince = Date.now() - SUPERVISOR_RELAUNCH_GRACE_MS;
+		await runArmedRound();
+		expect(probeCount).toBe(7);
 		expect(daemon.launchReplacementSupervisor).toHaveBeenCalledOnce();
 		// The replacement answering mid-launch restarts the orphan window...
 		expect(daemon.supervisorAvailabilityState.supervisorAbsentSince).toBeUndefined();
@@ -1337,10 +1349,11 @@ describe("daemon worker supervisor monitoring", () => {
 		// instead of orphaning the worker if the replacement exits unclaimed.
 		expect(daemon.supervisorMonitorTimer).toBeDefined();
 
-		// The recheck the round armed is a fresh handle: run it to its own settle.
+		// The recheck the round armed is a fresh handle: run it to its own settle. The
+		// socket is dead again, and the grace opens a fresh absence before any relaunch.
 		await runArmedRound();
-		expect(daemon.launchReplacementSupervisor).toHaveBeenCalledTimes(2);
-		expect(daemon.canConnectToSupervisor).toHaveBeenCalledTimes(8);
+		expect(daemon.launchReplacementSupervisor).toHaveBeenCalledOnce();
+		expect(daemon.canConnectToSupervisor).toHaveBeenCalledTimes(10);
 		// The socket died again: the orphan window is running, the monitor stays armed.
 		expect(daemon.supervisorAvailabilityState.supervisorAbsentSince).toBeDefined();
 		expect(daemon.supervisorMonitorTimer).toBeDefined();

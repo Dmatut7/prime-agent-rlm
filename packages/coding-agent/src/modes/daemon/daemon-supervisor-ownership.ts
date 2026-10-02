@@ -117,6 +117,11 @@ interface AcquireDaemonSupervisorOwnershipOptions {
 	registryDir?: string;
 	/** Overrides SHUTDOWN_ADMISSION_STARTUP_WAIT_MS (tests). */
 	shutdownAdmissionWaitMs?: number;
+	/**
+	 * Set only for a worker-driven replacement launch: a relaunch refuses a socket
+	 * whose last shutdown was deliberate (the tombstone), instead of undoing it.
+	 */
+	relaunch?: boolean;
 }
 
 class DaemonSupervisorAlreadyRunningError extends Error {
@@ -696,6 +701,12 @@ export async function acquireDaemonSupervisorOwnership(
 		while (true) {
 			let admitted = false;
 			await withDaemonSupervisorRegistryGuard(registryDir, () => {
+				// A worker-driven relaunch never takes a tombstoned socket, whatever the
+				// admission says: the tombstone is the last deliberate word on it, and
+				// lifting it is reserved for a start that is not a relaunch.
+				if (options.relaunch && readDaemonShutdownTombstone(record.socketPath, registryDir)) {
+					throw new DaemonShutdownTombstonedError(record.socketPath);
+				}
 				admissionHolder = readActiveShutdownAdmission(registryDir);
 				if (admissionHolder) {
 					return;
@@ -752,6 +763,11 @@ export async function acquireDaemonSupervisorOwnership(
 					staleDirectories.push(staleDirectory);
 				}
 				renameSync(candidateDirectory, ownerDirectory);
+				// The lift half of the tombstone lifecycle: a start that is not a
+				// worker-driven relaunch restores this socket's crash recovery.
+				if (!options.relaunch) {
+					rmSync(shutdownTombstonePath(registryDir, record.socketPath), { force: true });
+				}
 				admitted = true;
 			});
 			if (admitted) {
@@ -885,6 +901,99 @@ export async function waitForDaemonShutdownAdmissionClear(
 			return false;
 		}
 		await sleep(pollMs);
+	}
+}
+
+const SHUTDOWN_TOMBSTONE_DIR_NAME = "shutdown-tombstones";
+
+/**
+ * A durable "this socket's last supervisor was stopped deliberately" marker.
+ *
+ * The shutdown admission only exists while a shutdown command runs, so it cannot
+ * speak for the time after: a worker that outlived the sweep (or was never
+ * tracked by it) would see a dead socket, no admission, and resurrect the daemon
+ * the user just shut down. The supervisor writes the tombstone as the first step
+ * of its own intentional shutdown, so the marker precedes any worker's relaunch
+ * decision; the worker's relaunch checks it before spawning, and a relaunched
+ * daemon refuses the socket again at ownership time. Only a deliberate start —
+ * one that is not a worker-driven relaunch — lifts the tombstone when it
+ * acquires ownership, restoring crash-recovery resurrection for that socket.
+ */
+export interface DaemonShutdownTombstone {
+	version: 1;
+	socketPath: string;
+	stoppedAt: string;
+	pid: number;
+	processStartId?: string;
+}
+
+function shutdownTombstonePath(registryDir: string, socketPath: string): string {
+	const key = createHash("sha256").update(normalizeSocketPath(socketPath)).digest("hex");
+	return resolve(registryDir, SHUTDOWN_TOMBSTONE_DIR_NAME, `${key}.json`);
+}
+
+/** The stopping supervisor's own record of the deliberate stop. Synchronous: shutdown never waits on it. */
+export function recordDaemonShutdownTombstone(
+	socketPath: string,
+	registryDir: string = defaultDaemonSupervisorRegistryDir(),
+): void {
+	const processStartId = getProcessStartId(process.pid);
+	const record: DaemonShutdownTombstone = {
+		version: OWNER_VERSION,
+		socketPath: normalizeSocketPath(socketPath),
+		stoppedAt: new Date().toISOString(),
+		pid: process.pid,
+		...(processStartId ? { processStartId } : {}),
+	};
+	mkdirSync(dirname(shutdownTombstonePath(registryDir, socketPath)), { recursive: true, mode: 0o700 });
+	writeJsonAtomically(shutdownTombstonePath(registryDir, socketPath), record);
+}
+
+/**
+ * Lock-free read for the relaunch gates: writes are rename-atomic, and a record
+ * that cannot be parsed protects nothing, so it reads as absent — crash recovery
+ * stays the default when the marker is unusable.
+ */
+export function readDaemonShutdownTombstone(
+	socketPath: string,
+	registryDir: string = defaultDaemonSupervisorRegistryDir(),
+): DaemonShutdownTombstone | undefined {
+	let value: unknown;
+	try {
+		value = JSON.parse(readFileSync(shutdownTombstonePath(registryDir, socketPath), "utf8"));
+	} catch {
+		return undefined;
+	}
+	const tombstone = value as Partial<DaemonShutdownTombstone> | undefined;
+	if (
+		!tombstone ||
+		typeof tombstone !== "object" ||
+		tombstone.version !== OWNER_VERSION ||
+		tombstone.socketPath !== normalizeSocketPath(socketPath) ||
+		typeof tombstone.stoppedAt !== "string" ||
+		!Number.isInteger(tombstone.pid) ||
+		(tombstone.pid ?? 0) <= 0
+	) {
+		return undefined;
+	}
+	return tombstone as DaemonShutdownTombstone;
+}
+
+/**
+ * A worker-driven relaunch must never take over a tombstoned socket: the spawn
+ * escaped every earlier gate (its worker died mid-launch, or the tombstone
+ * landed between the worker's check and the child's boot), and the shutdown it
+ * would undo is the last deliberate word on that socket.
+ */
+export class DaemonShutdownTombstonedError extends Error {
+	readonly code = "daemon_shutdown_tombstoned" as const;
+
+	constructor(readonly socketPath: string) {
+		super(
+			`Daemon supervisor socket ${socketPath} was shut down deliberately; ` +
+				"a worker-driven relaunch will not revive it — start the daemon explicitly to lift the tombstone",
+		);
+		this.name = "DaemonShutdownTombstonedError";
 	}
 }
 

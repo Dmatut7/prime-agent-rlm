@@ -239,7 +239,9 @@ function readSupervisorConfig(agentDir: string): { defaultSessionConfig?: { sess
 }
 
 async function connectEventually(socketPath: string, child?: ChildProcess): Promise<DaemonClient> {
-	const deadline = Date.now() + 15_000;
+	// Worker-driven resurrections carry the 5s succession grace plus the socket
+	// lease's staleness window before the replacement can listen.
+	const deadline = Date.now() + 30_000;
 	let lastError: unknown;
 	while (Date.now() < deadline) {
 		if (child && (child.exitCode !== null || child.signalCode !== null)) {
@@ -310,8 +312,8 @@ async function waitForExit(child: ChildProcess): Promise<void> {
 	});
 }
 
-async function waitForProcessGone(pid: number): Promise<void> {
-	const deadline = Date.now() + 10_000;
+async function waitForProcessGone(pid: number, timeoutMs = 10_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		try {
 			process.kill(pid, 0);
@@ -776,16 +778,28 @@ describe("daemon supervisor resident workers", () => {
 			supportsExtensionUi: false,
 		});
 
-		supervisor.kill("SIGTERM");
+		// A crash, not a stop: a SIGTERM would run the supervisor's own shutdown,
+		// which tombstones the socket as deliberately stopped and no worker would
+		// resurrect it. The replacement this test waits on is the workers' crash
+		// recovery, and that only owes a SIGKILLed supervisor. Kill by the hello
+		// pid: the spawned child can be a tsx wrapper, and killing the wrapper
+		// leaves the real supervisor listening.
+		const crashedSupervisorPid = client.hello?.supervisorPid;
+		if (!crashedSupervisorPid) throw new Error("Daemon hello did not expose its supervisor pid");
+		process.kill(crashedSupervisorPid, "SIGKILL");
 		await waitForExit(supervisor);
 		children.delete(supervisor);
 		await connection.dispose();
 
-		await waitForProcessGone(summary.workerPid);
+		// The worker's release is driven by the replacement it resurrects: the
+		// succession grace (5s) plus the replacement's boot and adoption sit inside
+		// these budgets.
+		await waitForProcessGone(summary.workerPid, 30_000);
 		workerPids.delete(summary.workerPid);
 		await waitForCondition(
 			() => countWorkerDescriptors(agentDir) === 0,
 			"Adopted client-owned worker descriptor was not removed",
+			30_000,
 		);
 		const replacementClient = await connectEventually(socketPath);
 		await replacementClient.request({ type: "shutdown" });
@@ -1344,7 +1358,14 @@ describe("daemon supervisor resident workers", () => {
 		const listed = await client.request({ type: "list" });
 		expect(listed.success).toBe(true);
 		expect(requireSessionList(listed.success ? listed.data : undefined)).toHaveLength(2);
-		supervisor.kill("SIGTERM");
+		// A crash, not a stop: SIGKILL keeps the supervisor's own shutdown (and its
+		// deliberate-stop tombstone) out of the way, so the workers' resurrection
+		// loop is what brings the socket back. Kill by the hello pid: the spawned
+		// child can be a tsx wrapper, and killing the wrapper leaves the real
+		// supervisor listening.
+		const crashedSupervisorPid = client.hello?.supervisorPid;
+		if (!crashedSupervisorPid) throw new Error("Daemon hello did not expose its supervisor pid");
+		process.kill(crashedSupervisorPid, "SIGKILL");
 		await waitForExit(supervisor);
 		children.delete(supervisor);
 		client.close();
@@ -1482,7 +1503,14 @@ describe("daemon supervisor resident workers", () => {
 		const listed = await client.request({ type: "list" });
 		expect(listed.success).toBe(true);
 		expect(requireSessionList(listed.success ? listed.data : undefined)).toHaveLength(PROCESS_STRESS_WORKERS);
-		supervisor.kill("SIGTERM");
+		// A crash, not a stop: SIGKILL keeps the supervisor's own shutdown (and its
+		// deliberate-stop tombstone) out of the way, so the workers' resurrection
+		// loop is what brings the socket back. Kill by the hello pid: the spawned
+		// child can be a tsx wrapper, and killing the wrapper leaves the real
+		// supervisor listening.
+		const crashedSupervisorPid = client.hello?.supervisorPid;
+		if (!crashedSupervisorPid) throw new Error("Daemon hello did not expose its supervisor pid");
+		process.kill(crashedSupervisorPid, "SIGKILL");
 		await waitForExit(supervisor);
 		children.delete(supervisor);
 		client.close();
@@ -1609,11 +1637,18 @@ describe("daemon supervisor resident workers", () => {
 		// 3 (and not 4, 5, ...) is the no-duplicate pin.
 		expect(replacementMessageCounts.at(-1)).toBe(3);
 
-		firstSupervisor.kill("SIGTERM");
+		// A crash, not a stop: SIGKILL keeps the deliberate-stop tombstone out of
+		// the way, so the worker resurrects the supervisor and this client
+		// reconnects. Kill by the hello pid: the spawned child can be a tsx
+		// wrapper, and killing the wrapper leaves the real supervisor listening.
+		// The succession grace pushes the swap past the old budget.
+		const crashedSupervisorPid = client.hello?.supervisorPid;
+		if (!crashedSupervisorPid) throw new Error("Daemon hello did not expose its supervisor pid");
+		process.kill(crashedSupervisorPid, "SIGKILL");
 		await waitForExit(firstSupervisor);
 		children.delete(firstSupervisor);
 
-		const reconnectDeadline = Date.now() + 15_000;
+		const reconnectDeadline = Date.now() + 30_000;
 		while (!connectionEvents.includes("connection_status:connected") && Date.now() < reconnectDeadline) {
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
 		}
@@ -1722,7 +1757,7 @@ describe("daemon supervisor resident workers", () => {
 		await waitForSocketGone(socketPath);
 		await waitForProcessGone(recovered.workerPid);
 		workerPids.delete(recovered.workerPid);
-	});
+	}, 60_000);
 
 	it("runs a session-artifact cron job while the supervisor is being replaced", {
 		tags: ["process-stress"],

@@ -9,6 +9,7 @@ import {
 	SUPERVISOR_PROBE_ATTEMPTS,
 	SUPERVISOR_RECHECK_BACKOFF_MS,
 	SUPERVISOR_RECHECK_MAX_MS,
+	SUPERVISOR_RELAUNCH_GRACE_MS,
 	SUPERVISOR_SHUTDOWN_ADMISSION_RECHECK_MS,
 	type SupervisorAvailabilityDeps,
 	type SupervisorAvailabilityState,
@@ -150,7 +151,7 @@ describe("P1-7b supervisor availability round", () => {
 		expect((await checkSupervisorAvailability(socketPath, state, shuttingDown.deps)).nextDelayMs).toBeUndefined();
 	});
 
-	it("launches a replacement after a whole round fails, and backs off the recheck", async () => {
+	it("launches a replacement only after the absence outlives the succession grace, and backs off the recheck", async () => {
 		const root = mkdtempSync(join(tmpdir(), "ma-t4-2-probe-dead-"));
 		roots.push(root);
 		const socketPath = join(root, "supervisor.sock");
@@ -166,20 +167,32 @@ describe("P1-7b supervisor availability round", () => {
 
 		const first = await checkSupervisorAvailability(socketPath, state, deps);
 		const afterFirstRound = [...failedAttempts];
-		const second = await checkSupervisorAvailability(socketPath, state, deps);
-
-		// Positive control: self-healing is preserved, one launch per failed round.
-		expect(stub.calls).toBe(2);
-		expect(existsSync(stub.lockDirectory)).toBe(true);
-		expect(first.launchedReplacement).toBe(true);
+		// A fresh absence is a succession gap as often as a crash: the first failed
+		// round starts the absence clock and the orphan window, but does not launch.
+		expect(stub.calls).toBe(0);
+		expect(existsSync(stub.lockDirectory)).toBe(false);
+		expect(first.launchedReplacement).toBe(false);
 		expect(first.probe).toEqual({ available: false, attempts: SUPERVISOR_PROBE_ATTEMPTS });
 		// The countable signature carries the attempt number, one line per failed probe.
 		expect(afterFirstRound).toEqual(["1/3", "2/3", "3/3"]);
-		expect(failedAttempts).toHaveLength(2 * SUPERVISOR_PROBE_ATTEMPTS);
-		// The recheck backs off with the number of rounds that failed in a row.
-		expect(state.consecutiveFailures).toBe(2);
+		expect(state.consecutiveFailures).toBe(1);
+		expect(state.supervisorAbsentSince).toBeTypeOf("number");
 		expect(first.nextDelayMs).toBe(SUPERVISOR_RECHECK_BACKOFF_MS[0]);
+
+		// The grace elapsed without the socket coming back: this absence is a crash,
+		// and self-healing launches the replacement from here on — one launch per
+		// failed round, the recheck backing off.
+		state.supervisorAbsentSince = Date.now() - SUPERVISOR_RELAUNCH_GRACE_MS;
+		const second = await checkSupervisorAvailability(socketPath, state, deps);
+		const third = await checkSupervisorAvailability(socketPath, state, deps);
+
+		expect(stub.calls).toBe(2);
+		expect(existsSync(stub.lockDirectory)).toBe(true);
+		expect(second.launchedReplacement).toBe(true);
+		expect(failedAttempts).toHaveLength(3 * SUPERVISOR_PROBE_ATTEMPTS);
+		expect(state.consecutiveFailures).toBe(3);
 		expect(second.nextDelayMs).toBe(SUPERVISOR_RECHECK_BACKOFF_MS[1]);
+		expect(third.nextDelayMs).toBe(SUPERVISOR_RECHECK_BACKOFF_MS[2]);
 	});
 
 	it("stops monitoring once the supervisor authenticated or the worker is shutting down", async () => {

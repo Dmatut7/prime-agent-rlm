@@ -172,7 +172,10 @@ import {
 } from "./daemon-socket.js";
 import {
 	acquireDaemonSupervisorOwnership,
+	DaemonShutdownTombstonedError,
 	isDaemonShutdownAdmissionActive,
+	readDaemonShutdownTombstone,
+	recordDaemonShutdownTombstone,
 	waitForDaemonStartupFence,
 	writeJsonAtomically,
 } from "./daemon-supervisor-ownership.js";
@@ -191,6 +194,7 @@ import {
 	type DaemonWorkerRequestHooks,
 } from "./daemon-worker-client.js";
 import {
+	DAEMON_SUPERVISOR_RELAUNCH_ENV,
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_INSTANCE_ID_ENV,
 	DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY,
@@ -882,6 +886,12 @@ export interface DaemonSupervisorOptions {
 	pendingDeliveryLogThrottleMs?: number;
 	/** Overrides how long update-restart preparation waits for in-flight mutations to drain. */
 	updateRestartDrainTimeoutMs?: number;
+	/**
+	 * This boot is a worker-driven replacement launch (set from
+	 * DAEMON_SUPERVISOR_RELAUNCH_ENV by the mode entry): ownership acquisition
+	 * refuses a socket whose last shutdown was deliberate instead of undoing it.
+	 */
+	relaunch?: boolean;
 }
 
 interface PersistedSupervisorConfig {
@@ -1343,8 +1353,28 @@ function normalizeCapabilities(
 
 export async function runDaemonSupervisorMode(options: DaemonSupervisorOptions): Promise<never> {
 	const socketPath = normalizeSocketPath(options.socketPath ?? defaultDaemonSocketPath());
-	const supervisor = new DaemonSupervisor(socketPath, options);
-	await supervisor.start();
+	const relaunch = process.env[DAEMON_SUPERVISOR_RELAUNCH_ENV] !== undefined;
+	// A worker-spawned replacement never opens a tombstoned socket: the deliberate
+	// shutdown is the last word on it, and only an explicit start lifts the marker.
+	// Refuse before touching the socket lease so the refusal never lurks on a lock.
+	if (relaunch && readDaemonShutdownTombstone(socketPath)) {
+		console.error(
+			`Not resurrecting ${socketPath}: its last shutdown was deliberate; start the daemon explicitly to run it again`,
+		);
+		process.exit(0);
+	}
+	const supervisor = new DaemonSupervisor(socketPath, { ...options, relaunch });
+	try {
+		await supervisor.start();
+	} catch (error) {
+		// The tombstone can land while this boot waits out the socket lease or the
+		// startup fence; the guarded ownership acquire is the authoritative refusal.
+		if (error instanceof DaemonShutdownTombstonedError) {
+			console.error(error.message);
+			process.exit(0);
+		}
+		throw error;
+	}
 	return new Promise(() => {});
 }
 
@@ -1452,6 +1482,8 @@ export class DaemonSupervisor {
 	private readonly retentionSweepCheckIntervalMs: number;
 	private retentionSweepTimer?: NodeJS.Timeout;
 	private lastRetentionSweepAtMs = 0;
+	/** True when this process is a worker-driven replacement launch (DAEMON_SUPERVISOR_RELAUNCH_ENV). */
+	private readonly relaunch: boolean;
 
 	constructor(
 		private readonly socketPath: string,
@@ -1485,6 +1517,7 @@ export class DaemonSupervisor {
 		this.pendingDeliveryTargetGoneGraceMs = options.pendingDeliveryTargetGoneGraceMs;
 		this.pendingDeliveryLogThrottleMs = options.pendingDeliveryLogThrottleMs;
 		this.updateRestartDrainTimeoutMs = options.updateRestartDrainTimeoutMs;
+		this.relaunch = options.relaunch === true;
 	}
 
 	async start(): Promise<void> {
@@ -1504,6 +1537,7 @@ export class DaemonSupervisor {
 				agentDir,
 				generation: this.generation,
 				appVersion: VERSION,
+				relaunch: this.relaunch,
 			});
 			this.assertSocketLeaseHeld();
 			await prepareDaemonSocketPath(this.socketPath, this.socketLease);
@@ -4484,6 +4518,11 @@ export class DaemonSupervisor {
 			[SESSION_LEASE_OWNER_ID_ENV]: rootActiveSessionId,
 		});
 		delete workerEnvironment.RLM_DEPTH;
+		// Workers are deliberate launches: the relaunch marker must never leak into a
+		// worker (and from there into session subprocesses), or an explicit daemon
+		// start from inside a session would read as a relaunch and refuse a
+		// tombstoned socket.
+		delete workerEnvironment[DAEMON_SUPERVISOR_RELAUNCH_ENV];
 		await this.assertRecoveryAllowed();
 		const child: ChildProcess = spawnHidden(launch.command, launch.args, {
 			cwd: createCommand.config?.cwd ?? process.cwd(),
@@ -10375,6 +10414,18 @@ export class DaemonSupervisor {
 			process.exit(exitCode);
 		}
 		this.shuttingDown = true;
+		// The deliberate-stop marker must land before anything else: a worker whose
+		// claim drops during this shutdown arms its resurrection loop within 100ms,
+		// and only the tombstone tells a relaunch that this exit was intentional. An
+		// update handoff is not a stop — its successor lifts nothing and its workers
+		// must keep recovering — so neither a relaunch nor an "update" close writes one.
+		if (!relaunch && closingReason !== "update") {
+			try {
+				recordDaemonShutdownTombstone(this.socketPath);
+			} catch (error) {
+				this.log(`could not record the shutdown tombstone: ${String(error)}`);
+			}
+		}
 		// P1-7c/B10: answer every pending delivery before the workers go, so a
 		// sender still waiting learns the message was not delivered instead of
 		// watching the daemon leave with it.
@@ -10446,6 +10497,9 @@ export class DaemonSupervisor {
 			delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
 			delete environment[SESSION_LEASES_ENABLED_ENV];
 			delete environment[SESSION_LEASE_OWNER_ID_ENV];
+			// A restart relaunch is a deliberate start: it must not carry the
+			// worker-relaunch marker even when this supervisor was itself one.
+			delete environment[DAEMON_SUPERVISOR_RELAUNCH_ENV];
 			const replacement = spawnHidden(launch.command, launch.args, {
 				cwd: this.defaultSessionConfig.cwd ?? process.cwd(),
 				detached: true,

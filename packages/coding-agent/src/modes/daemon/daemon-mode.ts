@@ -250,8 +250,13 @@ import {
 	prepareDaemonSocketPath,
 	restrictDaemonSocketPath,
 } from "./daemon-socket.js";
-import { assertDaemonSupervisorOwnerCurrent, isDaemonShutdownAdmissionActive } from "./daemon-supervisor-ownership.js";
 import {
+	assertDaemonSupervisorOwnerCurrent,
+	isDaemonShutdownAdmissionActive,
+	readDaemonShutdownTombstone,
+} from "./daemon-supervisor-ownership.js";
+import {
+	DAEMON_SUPERVISOR_RELAUNCH_ENV,
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
@@ -1437,6 +1442,16 @@ export class AgentDaemon {
 			if (await isDaemonShutdownAdmissionActive()) {
 				return;
 			}
+			// The admission only covers an in-flight shutdown; the tombstone covers the
+			// time after: the last word on this socket was a deliberate stop, so this
+			// worker must not resurrect it. A deliberate start lifts the marker.
+			if (readDaemonShutdownTombstone(supervisorSocketPath)) {
+				this.log(
+					`not relaunching the supervisor on ${supervisorSocketPath}: its last shutdown was deliberate; ` +
+						"start the daemon explicitly to run it again",
+				);
+				return;
+			}
 			const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", supervisorSocketPath]);
 			const environment = createCliSubprocessEnv();
 			delete environment[DAEMON_WORKER_ROLE_ENV];
@@ -1447,6 +1462,10 @@ export class AgentDaemon {
 			delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
 			delete environment[SESSION_LEASES_ENABLED_ENV];
 			delete environment[SESSION_LEASE_OWNER_ID_ENV];
+			// Marks the child as a worker-driven relaunch: if the tombstone lands while
+			// it boots (a shutdown that started after this check), the ownership
+			// acquire refuses the socket instead of undoing the stop.
+			environment[DAEMON_SUPERVISOR_RELAUNCH_ENV] = "1";
 			const child = spawn(launch.command, launch.args, {
 				cwd: this.options.defaultSessionConfig.cwd ?? process.cwd(),
 				detached: true,

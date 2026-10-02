@@ -19,6 +19,17 @@ export const SUPERVISOR_RECHECK_BACKOFF_MS: readonly number[] = [5_000, 10_000, 
 export const SUPERVISOR_RECHECK_MAX_MS = 60_000;
 /** A shutdown admission in progress is not a failure: recheck at the first ladder step. */
 export const SUPERVISOR_SHUTDOWN_ADMISSION_RECHECK_MS = SUPERVISOR_RECHECK_BACKOFF_MS[0]!;
+/**
+ * How long the supervisor socket must stay unreachable before this worker offers
+ * a replacement. A succession — an update handoff, an adoption gap, a hidden
+ * supervisor releasing the path a successor is still booting into — looks exactly
+ * like a crash for the first probe rounds, and a replacement spawned into that
+ * gap lurks on the socket lease and takes over the moment the real supervisor
+ * leaves, undoing even a later deliberate shutdown. One ladder step of absence
+ * (the first failed round's recheck) is the price of telling the two apart; a
+ * genuine crash simply resurrects one round later.
+ */
+export const SUPERVISOR_RELAUNCH_GRACE_MS = SUPERVISOR_RECHECK_BACKOFF_MS[0]!;
 
 export interface SupervisorProbeResult {
 	available: boolean;
@@ -181,6 +192,22 @@ export async function checkSupervisorAvailability(
 	// The supervisor socket is unreachable; remember when the worker last saw it so
 	// the orphan window below stays bounded (upstream #2246).
 	state.supervisorAbsentSince ??= Date.now();
+	if (Date.now() - state.supervisorAbsentSince < SUPERVISOR_RELAUNCH_GRACE_MS) {
+		// Too fresh to call a crash: a succession gap looks identical. The orphan
+		// window keeps running during the grace, so a worker whose window is shorter
+		// than the grace still exits on time instead of being pinned by the ladder.
+		if (deps.isOrphanedLongEnough()) {
+			await deps.onOrphaned();
+		}
+		if (deps.isShuttingDown() || deps.isConnected()) {
+			return { probe, launchedReplacement: false };
+		}
+		return {
+			probe,
+			launchedReplacement: false,
+			nextDelayMs: supervisorRecheckDelayMs(state.consecutiveFailures),
+		};
+	}
 	await deps.launchReplacement(socketPath);
 	if (await deps.connectAfterLaunch(socketPath)) {
 		// A replacement came up during the launch: the orphan window must restart

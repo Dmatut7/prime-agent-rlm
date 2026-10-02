@@ -20,6 +20,13 @@ export const DAEMON_WORKER_SUPERVISOR_SOCKET_ENV = "PRIME_AGENT_INTERNAL_DAEMON_
 export const DAEMON_WORKER_RECOVERY_JOURNAL_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_RECOVERY_JOURNAL";
 export const DAEMON_WORKER_STARTUP_GATE_FD_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_STARTUP_GATE_FD";
 export const DAEMON_WORKER_STARTUP_GATE_COMMIT = "start\n";
+/**
+ * Set on a supervisor process spawned by a worker's replacement launch, so the
+ * boot can tell "worker resurrecting a crashed supervisor" from a deliberate
+ * start: only the former refuses a socket whose last shutdown was intentional
+ * (the shutdown tombstone), instead of undoing the shutdown.
+ */
+export const DAEMON_SUPERVISOR_RELAUNCH_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_RELAUNCH";
 export type DaemonWorkerLifecycle = "starting" | "ready" | "recovering" | "stopping" | "failed";
 
 // Worker->supervisor roster frames live outside the client-facing DaemonOutbound schema.
