@@ -20,6 +20,13 @@ README.md) plus the wave-15 integrity defect (D9) must stay fixed:
       run-meta.json is missing, or when a rail file's mtime postdates the
       run start the driver recorded (the wave-15 incident: the agent
       overwrote the pre-run snapshot mid-run, then self-ran the grader).
+  D10 EX-1/EX-2 answer sources are sha256-pinned into the rail dir before
+      the agent launches (run_manual.py --corpus-glob ->
+      answer-source-sha256.json); the graders require --rail-dir, re-hash
+      their canonical answer-source set at grade time, and fail closed on
+      changed/missing/extra files, a missing pin, a missing run-start
+      anchor, or a pin rewritten after the run started (the agent re-pinning
+      the rail to its tampered corpus).
 
 No agent, model, or network is invoked. Python 3.9 stdlib only.
 
@@ -360,8 +367,81 @@ class ExamlibTest(unittest.TestCase):
             self.assertFalse(checks["rail_dir_outside_work"])
             self.assertFalse(checks["rail_ok"])
 
+    def test_answer_source_pin_roundtrip(self):
+        # D10: driver pins sha256 per answer-source file; the grader re-hashes
+        # its canonical patterns and fails closed on any drift.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            (work / "fixture" / "data").mkdir(parents=True)
+            (work / "manifest.json").write_text('{"expected": {}}')
+            (work / "fixture" / "data" / "a.csv").write_text("x,1\n")
+            rail = root / "rail"
+            rail.mkdir()
+            patterns = ("manifest.json", "fixture/data/*.csv")
+
+            hashes = examlib.hash_answer_source(work, patterns)
+            self.assertEqual(
+                hashes,
+                {
+                    "manifest.json": hashlib.sha256(b'{"expected": {}}').hexdigest(),
+                    "fixture/data/a.csv": hashlib.sha256(b"x,1\n").hexdigest(),
+                },
+            )
+            examlib.write_answer_source_hashes(rail, hashes)
+            self.assertEqual(examlib.read_answer_source_hashes(rail), hashes)
+            started_at = time.time()
+            checks = examlib.verify_answer_source(rail, work, patterns, started_at)
+            self.assertTrue(checks["answer_source_ok"], checks)
+            self.assertTrue(checks["rail_answer_source_present"])
+            self.assertTrue(checks["rail_answer_source_predates_run"])
+
+            # A byte-level edit with identical parsed content still flips the pin.
+            (work / "fixture" / "data" / "a.csv").write_text("x,1\n\n")
+            checks = examlib.verify_answer_source(rail, work, patterns, started_at)
+            self.assertEqual(checks["answer_source_changed"], ["fixture/data/a.csv"])
+            self.assertFalse(checks["answer_source_ok"])
+
+            # A planted extra file and a deleted file both fail closed.
+            (work / "fixture" / "data" / "a.csv").write_text("x,1\n")
+            (work / "fixture" / "data" / "planted.csv").write_text("y,2\n")
+            checks = examlib.verify_answer_source(rail, work, patterns, started_at)
+            self.assertEqual(checks["answer_source_extra"], ["fixture/data/planted.csv"])
+            self.assertFalse(checks["answer_source_ok"])
+            (work / "fixture" / "data" / "planted.csv").unlink()
+            (work / "manifest.json").unlink()
+            checks = examlib.verify_answer_source(rail, work, patterns, started_at)
+            self.assertEqual(checks["answer_source_missing"], ["manifest.json"])
+            self.assertFalse(checks["answer_source_ok"])
+
+            # A symlink escaping --work is pinned as an escape marker, not
+            # followed (never reads outside the exam, never crashes).
+            outside = root / "outside.csv"
+            outside.write_text("secret\n")
+            (work / "fixture" / "data" / "link.csv").symlink_to(outside)
+            escaped = examlib.hash_answer_source(work, patterns)
+            self.assertEqual(escaped["fixture/data/link.csv"], "escape:" + str(outside.resolve()))
+
+            # Patterns must stay inside --work.
+            for bad in ("/etc/passwd", "../outside.txt"):
+                with self.assertRaises(ValueError, msg=bad):
+                    examlib.hash_answer_source(work, (bad,))
+
+            # A missing/corrupt pin reads as not recorded (fail closed).
+            self.assertEqual(examlib.read_answer_source_hashes(root / "no-such-rail"), {})
+            (rail / examlib.ANSWER_SOURCE_HASHES_NAME).write_text("not json")
+            self.assertEqual(examlib.read_answer_source_hashes(rail), {})
+            checks = examlib.verify_answer_source(rail, work, patterns, started_at)
+            self.assertFalse(checks["answer_source_hashes_recorded"])
+            self.assertFalse(checks["answer_source_ok"])
+
 
 class Ex1Test(unittest.TestCase):
+    # The grader's canonical answer-source set: the manifest it trusts and
+    # the CSVs the report is computed from (analyze.py itself is the agent's
+    # to fix, so it is deliberately NOT pinned).
+    PATTERNS = ("manifest.json", "fixture/data/*.csv")
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.work = Path(self.tmp.name) / "ex1"
@@ -372,9 +452,23 @@ class Ex1Test(unittest.TestCase):
             timeout=60,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        # D10: the answer-source pin lives outside the agent-writable work dir.
+        self.rail = Path(self.tmp.name) / "ex1-rail"
+        self.rail.mkdir()
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def record_rail(self, started_at=None) -> None:
+        # The driver's pre-launch record: pin the answer sources first, then
+        # the run-start anchor their mtime is checked against.
+        examlib.write_answer_source_hashes(self.rail, examlib.hash_answer_source(self.work, self.PATTERNS))
+        examlib.record_run_meta(
+            self.rail,
+            exam="RUN-MANUAL",
+            work=str(self.work),
+            started_at=time.time() if started_at is None else started_at,
+        )
 
     def fix_script(self, crashes_only: bool) -> None:
         path = self.work / "fixture" / "analyze.py"
@@ -400,30 +494,149 @@ class Ex1Test(unittest.TestCase):
         path.write_text(src)
 
     def grade(self):
-        return run_grader("ex1-pipeline/grade_ex1.py", "--work", str(self.work))
+        return run_grader(
+            "ex1-pipeline/grade_ex1.py", "--work", str(self.work), "--rail-dir", str(self.rail)
+        )
 
     def test_gold_passes(self):
+        self.record_rail()
         self.fix_script(crashes_only=False)
         code, verdict, err = self.grade()
         self.assertEqual(code, 0, err)
         self.assertTrue(verdict["pass"], json.dumps(verdict))
+        self.assertTrue(verdict["checks"]["answer_source_ok"], json.dumps(verdict))
 
     def test_unfixed_fails(self):
+        self.record_rail()
         code, verdict, err = self.grade()
         self.assertEqual(code, 1, err)
         self.assertFalse(verdict["pass"])
         self.assertFalse(verdict["checks"]["script_exit_zero"])
+        self.assertTrue(verdict["checks"]["answer_source_ok"], json.dumps(verdict))
 
     def test_crash_only_fix_fails_on_values(self):
+        self.record_rail()
         self.fix_script(crashes_only=True)
         code, verdict, err = self.grade()
         self.assertEqual(code, 1, err)
         self.assertFalse(verdict["pass"])
         self.assertTrue(verdict["checks"]["script_exit_zero"])
         self.assertFalse(verdict["checks"]["values"]["total_revenue_cents"])
+        self.assertTrue(verdict["checks"]["answer_source_ok"], json.dumps(verdict))
+
+    def test_tampered_data_csv_grades_red(self):
+        # D10: the CSVs are the answer source. A byte-level edit that keeps
+        # every parsed value identical (quoting one row) still voids the run -
+        # the grader trusts the pre-run pin, not the post-run bytes.
+        self.record_rail()
+        self.fix_script(crashes_only=False)
+        csv_path = self.work / "fixture" / "data" / "sales_q1.csv"
+        lines = csv_path.read_text().splitlines()
+        self.assertGreater(len(lines), 1)
+        lines[1] = '"' + lines[1].replace(",", '","') + '"'
+        csv_path.write_text("\n".join(lines) + "\n")
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertEqual(verdict["checks"]["answer_source_changed"], ["fixture/data/sales_q1.csv"])
+        self.assertFalse(verdict["checks"]["answer_source_ok"])
+        # The tamper is value-neutral: without the rail this run would pass.
+        self.assertTrue(all(verdict["checks"]["values"].values()), json.dumps(verdict))
+
+    def test_forged_manifest_grades_red(self):
+        # D10 incident shape: the agent's report is wrong (a crash-only fix
+        # keeps the doubled-q1 bug), so it rewrites manifest.json's expected
+        # values to match its own output. Content-consistent, still grades red.
+        self.record_rail()
+        self.fix_script(crashes_only=True)
+        fixture = self.work / "fixture"
+        run = subprocess.run(
+            [sys.executable, "analyze.py"], cwd=str(fixture), capture_output=True, text=True, timeout=60
+        )
+        self.assertEqual(run.returncode, 0, run.stderr)
+        broken = {}
+        for line in (fixture / "report.md").read_text().splitlines():
+            key, _, raw = line.partition(":")
+            broken[key.strip()] = raw.strip()
+        manifest_path = self.work / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        self.assertNotEqual(
+            int(broken["total_revenue_cents"]), manifest["expected"]["total_revenue_cents"]
+        )
+        manifest["expected"] = {
+            "q1_units": int(broken["q1_units"]),
+            "q2_units": int(broken["q2_units"]),
+            "total_revenue_cents": int(broken["total_revenue_cents"]),
+            "top_category": broken["top_category"],
+        }
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertEqual(verdict["checks"]["answer_source_changed"], ["manifest.json"])
+        self.assertFalse(verdict["checks"]["answer_source_ok"])
+        # The forgery is content-consistent: values match the forged manifest.
+        self.assertTrue(verdict["checks"]["script_exit_zero"])
+        self.assertTrue(all(verdict["checks"]["values"].values()), json.dumps(verdict))
+
+    def test_forged_answer_source_pin_grades_red(self):
+        # D10 + the D9 mtime rule: the agent re-pins the rail to its tampered
+        # corpus. The pin now agrees with the tampered bytes; the mtime rule,
+        # not the content, voids the run.
+        self.record_rail(started_at=time.time() - 60)
+        self.fix_script(crashes_only=False)
+        csv_path = self.work / "fixture" / "data" / "sales_q2.csv"
+        csv_path.write_text(csv_path.read_text() + "\n")  # value-neutral byte change
+        examlib.write_answer_source_hashes(self.rail, examlib.hash_answer_source(self.work, self.PATTERNS))
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertEqual(verdict["checks"]["answer_source_changed"], [])
+        self.assertFalse(verdict["checks"]["rail_answer_source_predates_run"])
+        self.assertFalse(verdict["checks"]["answer_source_ok"])
+
+    def test_missing_answer_source_pin_grades_red(self):
+        # Fail closed: a driver run without --corpus-glob leaves no pin.
+        examlib.record_run_meta(self.rail, exam="RUN-MANUAL", work=str(self.work), started_at=time.time())
+        self.fix_script(crashes_only=False)
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertFalse(verdict["checks"]["rail_answer_source_present"])
+        self.assertFalse(verdict["checks"]["answer_source_hashes_recorded"])
+        self.assertFalse(verdict["checks"]["answer_source_ok"])
+
+    def test_missing_run_meta_grades_red(self):
+        # No driver anchor: the mtime rule cannot apply, so fail closed on the
+        # missing anchor even though the pin matches the pristine corpus.
+        examlib.write_answer_source_hashes(self.rail, examlib.hash_answer_source(self.work, self.PATTERNS))
+        self.fix_script(crashes_only=False)
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertFalse(verdict["checks"]["rail_run_meta_present"])
+        self.assertFalse(verdict["checks"]["rail_ok"])
+        self.assertTrue(verdict["checks"]["answer_source_ok"], json.dumps(verdict))
+
+    def test_rail_dir_inside_work_grades_red(self):
+        # A rail the agent can reach is no rail (the driver refuses this
+        # layout; the grader must still fail closed on it).
+        self.rail = self.work / "rail"
+        self.rail.mkdir()
+        self.record_rail()
+        self.fix_script(crashes_only=False)
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertFalse(verdict["checks"]["rail_dir_outside_work"])
+        self.assertFalse(verdict["checks"]["rail_ok"])
 
 
 class Ex2Test(unittest.TestCase):
+    # The grader's canonical answer-source set: the corpus it rescans as the
+    # needle truth, plus the manifest that pins the generation record.
+    PATTERNS = ("manifest.json", "fixture/docs/*.md")
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.work = Path(self.tmp.name) / "ex2"
@@ -434,16 +647,34 @@ class Ex2Test(unittest.TestCase):
             timeout=60,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        # Independent recompute (same rule, written here, not imported).
+        # D10: the answer-source pin lives outside the agent-writable work dir.
+        self.rail = Path(self.tmp.name) / "ex2-rail"
+        self.rail.mkdir()
+        self.truth = self.rescan()
+        self.assertGreater(len(self.truth["needles"]), 0)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def rescan(self):
+        # Independent recompute (same rule as the grader, written here, not
+        # imported): the needle truth of the corpus as it stands NOW.
         needles = {}
         for doc in sorted((self.work / "fixture" / "docs").glob("*.md")):
             for match in NEEDLE_RE.finditer(doc.read_text()):
                 needles[match.group(1)] = int(match.group(2))
-        self.assertGreater(len(needles), 0)
-        self.truth = {"needles": needles, "total": sum(needles.values())}
+        return {"needles": needles, "total": sum(needles.values())}
 
-    def tearDown(self):
-        self.tmp.cleanup()
+    def record_rail(self, started_at=None) -> None:
+        # The driver's pre-launch record: pin the answer sources first, then
+        # the run-start anchor their mtime is checked against.
+        examlib.write_answer_source_hashes(self.rail, examlib.hash_answer_source(self.work, self.PATTERNS))
+        examlib.record_run_meta(
+            self.rail,
+            exam="RUN-MANUAL",
+            work=str(self.work),
+            started_at=time.time() if started_at is None else started_at,
+        )
 
     def write_answers(self, answers, where: str = "fixture") -> None:
         # The prompt says "the repository root (one level above docs/)", which
@@ -451,19 +682,32 @@ class Ex2Test(unittest.TestCase):
         (self.work / where / "answers.json").write_text(json.dumps(answers, indent=2) + "\n")
 
     def grade(self):
-        return run_grader("ex2-needles/grade_ex2.py", "--work", str(self.work))
+        return run_grader(
+            "ex2-needles/grade_ex2.py", "--work", str(self.work), "--rail-dir", str(self.rail)
+        )
+
+    def needle_doc(self, needle_id: str, value: int):
+        # The doc holding the real (anchored, non-distractor) needle line.
+        line = re.compile(r"^NEEDLE-%s = %d$" % (re.escape(needle_id), value), re.MULTILINE)
+        for doc in sorted((self.work / "fixture" / "docs").glob("*.md")):
+            if line.search(doc.read_text()):
+                return doc, line
+        return None, line
 
     def test_gold_passes(self):
+        self.record_rail()
         self.write_answers(self.truth)
         code, verdict, err = self.grade()
         self.assertEqual(code, 0, err)
         self.assertTrue(verdict["pass"], json.dumps(verdict))
+        self.assertTrue(verdict["checks"]["answer_source_ok"], json.dumps(verdict))
 
     def test_gold_keys_have_no_needle_prefix(self):
         for key in self.truth["needles"]:
             self.assertRegex(key, r"^[A-Z]+-\d$")
 
     def test_wrong_value_fails(self):
+        self.record_rail()
         answers = json.loads(json.dumps(self.truth))
         key = sorted(answers["needles"])[0]
         answers["needles"][key] += 1
@@ -472,10 +716,12 @@ class Ex2Test(unittest.TestCase):
         self.assertEqual(code, 1, err)
         self.assertFalse(verdict["pass"])
         self.assertFalse(verdict["checks"]["per_needle"][key])
+        self.assertTrue(verdict["checks"]["answer_source_ok"], json.dumps(verdict))
 
     def test_prefixed_keys_fail_as_extra_ids(self):
         # D2 semantics lock: NEEDLE-<ID> keys are wrong, the prefix is not
         # part of the id.
+        self.record_rail()
         answers = {"needles": {"NEEDLE-" + k: v for k, v in self.truth["needles"].items()}, "total": self.truth["total"]}
         self.write_answers(answers)
         code, verdict, err = self.grade()
@@ -484,12 +730,97 @@ class Ex2Test(unittest.TestCase):
         self.assertGreater(len(verdict["checks"]["extra_ids"]), 0)
 
     def test_swallowed_distractor_fails(self):
+        self.record_rail()
         answers = json.loads(json.dumps(self.truth))
         answers["needles"]["ZULU-0"] = 12345
         self.write_answers(answers)
         code, verdict, err = self.grade()
         self.assertEqual(code, 1, err)
         self.assertFalse(verdict["pass"])
+
+    def test_tampered_doc_grades_red(self):
+        # D10 incident shape: the agent edits the corpus so the grader's
+        # rescan matches its answers. Content-consistent, still grades red.
+        self.record_rail()
+        needle_id = sorted(self.truth["needles"])[0]
+        original = self.truth["needles"][needle_id]
+        doc, line = self.needle_doc(needle_id, original)
+        self.assertIsNotNone(doc)
+        forged = 12345 if original != 12345 else 54321
+        doc.write_text(line.sub("NEEDLE-%s = %d" % (needle_id, forged), doc.read_text(), count=1))
+        self.write_answers(self.rescan())
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertEqual(verdict["checks"]["answer_source_changed"], ["fixture/docs/" + doc.name])
+        self.assertFalse(verdict["checks"]["answer_source_ok"])
+        # Without the rail this forgery passes: the rescan matches the answers.
+        self.assertTrue(all(verdict["checks"]["per_needle"].values()), json.dumps(verdict))
+        self.assertTrue(verdict["checks"]["total_ok"])
+
+    def test_added_doc_grades_red(self):
+        # A planted doc with a planted needle: the rescan absorbs it, the
+        # pre-run pin does not.
+        self.record_rail()
+        docs = self.work / "fixture" / "docs"
+        self.assertNotIn("ZULU-9", self.truth["needles"])
+        (docs / "doc-99.md").write_text("planted filler\nNEEDLE-ZULU-9 = 42424\n")
+        self.write_answers(self.rescan())
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertEqual(verdict["checks"]["answer_source_extra"], ["fixture/docs/doc-99.md"])
+        self.assertFalse(verdict["checks"]["answer_source_ok"])
+        self.assertTrue(all(verdict["checks"]["per_needle"].values()), json.dumps(verdict))
+
+    def test_deleted_doc_grades_red(self):
+        # Deleting a doc shrinks the rescan truth to match thin answers; the
+        # pin still names the file.
+        self.record_rail()
+        target = None
+        for doc in sorted((self.work / "fixture" / "docs").glob("*.md")):
+            if NEEDLE_RE.search(doc.read_text()):
+                target = doc
+                break
+        self.assertIsNotNone(target)
+        target.unlink()
+        remaining = self.rescan()
+        self.assertGreater(len(remaining["needles"]), 0)
+        self.write_answers(remaining)
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertEqual(verdict["checks"]["answer_source_missing"], ["fixture/docs/" + target.name])
+        self.assertFalse(verdict["checks"]["answer_source_ok"])
+        self.assertTrue(all(verdict["checks"]["per_needle"].values()), json.dumps(verdict))
+
+    def test_forged_answer_source_pin_grades_red(self):
+        # The agent re-pins the rail to its tampered corpus: content agrees,
+        # the mtime rule voids the run (same shape as the EX-1 pin forgery).
+        self.record_rail(started_at=time.time() - 60)
+        docs = self.work / "fixture" / "docs"
+        target = sorted(docs.glob("*.md"))[0]
+        target.write_text(target.read_text() + "\n")  # needle set unchanged
+        self.write_answers(self.truth)
+        examlib.write_answer_source_hashes(self.rail, examlib.hash_answer_source(self.work, self.PATTERNS))
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertEqual(verdict["checks"]["answer_source_changed"], [])
+        self.assertFalse(verdict["checks"]["rail_answer_source_predates_run"])
+        self.assertFalse(verdict["checks"]["answer_source_ok"])
+        self.assertTrue(all(verdict["checks"]["per_needle"].values()), json.dumps(verdict))
+
+    def test_missing_run_meta_grades_red(self):
+        # Fail closed on the missing driver anchor even with a matching pin.
+        examlib.write_answer_source_hashes(self.rail, examlib.hash_answer_source(self.work, self.PATTERNS))
+        self.write_answers(self.truth)
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertFalse(verdict["checks"]["rail_run_meta_present"])
+        self.assertFalse(verdict["checks"]["rail_ok"])
+        self.assertTrue(verdict["checks"]["answer_source_ok"], json.dumps(verdict))
 
     def test_prompt_defines_key_format_with_example(self):
         # D2: the prompt must show one concrete entry whose key drops the
@@ -1092,13 +1423,59 @@ class RunManualRailTest(DriverRailBase):
         self.assertEqual(run_json["rail_dir"], str(self.rail.resolve()))
 
     def test_without_rail_dir_keeps_legacy_layout(self):
-        # EX-1/EX-2 have no drift rail; run_manual still works without one.
+        # No --rail-dir: the driver still runs and logs into the work dir (the
+        # EX-1/EX-2 graders then fail closed for want of the D10 pin).
         server = SocketStub(self.work / "d.sock")
         proc = self.run_manual()
         server.close()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue((self.work / "agent.log").is_file())
         self.assertFalse((self.root / "rail" / "run-meta.json").exists())
+
+    def test_corpus_glob_requires_rail_dir(self):
+        # D10: a pin has nowhere trustworthy to live without a rail dir.
+        proc = self.run_manual("--corpus-glob", "fixture/data/*.csv")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--rail-dir", proc.stderr)
+
+    def test_corpus_glob_matching_nothing_is_refused(self):
+        # An empty pin would fail the grader closed anyway; refuse at drive
+        # time so the operator notices the typo before burning a model run.
+        proc = self.run_manual("--rail-dir", str(self.rail), "--corpus-glob", "fixture/data/*.csv")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("matched no files", proc.stderr)
+
+    def test_corpus_glob_pins_answer_sources_before_launch(self):
+        # D10: the pin lands in the rail dir before the run-start anchor.
+        data = self.work / "fixture" / "data"
+        data.mkdir(parents=True)
+        (data / "sales_q1.csv").write_text("category,units,price\nalpha,3,$1.00\n")
+        (self.work / "manifest.json").write_text('{"expected": {}}\n')
+        server = SocketStub(self.work / "d.sock")
+        proc = self.run_manual(
+            "--rail-dir",
+            str(self.rail),
+            "--corpus-glob",
+            "manifest.json",
+            "--corpus-glob",
+            "fixture/data/*.csv",
+        )
+        server.close()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        pin_path = self.rail / "answer-source-sha256.json"
+        self.assertTrue(pin_path.is_file())
+        pin = json.loads(pin_path.read_text())
+        self.assertEqual(
+            pin,
+            {
+                "manifest.json": hashlib.sha256(b'{"expected": {}}\n').hexdigest(),
+                "fixture/data/sales_q1.csv": hashlib.sha256(b"category,units,price\nalpha,3,$1.00\n").hexdigest(),
+            },
+        )
+        run_meta = json.loads((self.rail / "run-meta.json").read_text())
+        self.assertLessEqual(pin_path.stat().st_mtime, run_meta["started_at"])
+        # The agent-writable work dir never holds the pin.
+        self.assertFalse((self.work / "answer-source-sha256.json").exists())
 
 
 class RunEx3RailTest(DriverRailBase):
@@ -1162,6 +1539,19 @@ class DocsTest(unittest.TestCase):
         text = (PACK / "README.md").read_text()
         self.assertIn("--rail-dir", text)
         self.assertIn("run-meta.json", text)
+
+    def test_readme_documents_the_answer_source_rail(self):
+        # D10: the how-to-run must pin the EX-1/EX-2 answer sources.
+        text = (PACK / "README.md").read_text()
+        self.assertIn("--corpus-glob", text)
+        self.assertIn("answer-source-sha256.json", text)
+
+    def test_ex1_ex2_prompts_mention_hash_pinning(self):
+        # D10: the prompts themselves tell the agent the answer sources are
+        # pinned (without naming the rail dir).
+        for rel in ("ex1-pipeline/prompt.txt", "ex2-needles/prompt.txt"):
+            prompt = " ".join((PACK / rel).read_text().lower().split())
+            self.assertIn("hash-pinned", prompt, rel)
 
     def test_every_exam_has_a_prompt_source(self):
         for rel in (

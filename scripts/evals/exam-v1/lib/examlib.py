@@ -10,10 +10,15 @@ file-to-file, never read into memory here).
 The grading-rail helpers (resolve_rail_dir/record_run_meta/read_run_meta/
 verify_rail) implement the D9 hardening: rails live outside the
 agent-writable work dir and graders reject rail files rewritten after the
-run started.
+run started. The answer-source helpers (hash_answer_source/
+write_answer_source_hashes/read_answer_source_hashes/verify_answer_source)
+implement the D10 hardening for EX-1/EX-2: the driver pins a sha256 per
+answer-source file into the rail dir before launch, and graders re-hash
+their canonical set at grade time.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -220,6 +225,108 @@ def verify_rail(rail_dir, work, files) -> dict:
             checks["rail_%s_predates_run" % label] = bool(predates)
             ok = ok and predates
     checks["rail_ok"] = bool(ok)
+    return checks
+
+
+# --- Answer-source pinning (D10) ---------------------------------------------
+#
+# EX-1/EX-2 grade against artifacts that sit inside the agent-writable work
+# dir: EX-1 trusts manifest.json (the expected values) and a run of
+# analyze.py over fixture/data/*.csv; EX-2 rescans fixture/docs/*.md as the
+# needle truth at grade time. A tampering agent can therefore forge a pass
+# (rewrite the manifest to its broken output; edit the corpus to match its
+# answers). The driver pins a sha256 per answer-source file into
+# answer-source-sha256.json BEFORE the agent launches (same D9 ordering:
+# the pin lands before the started_at anchor); the grader re-hashes its
+# canonical set and fails on any changed/missing/extra file, and the D9
+# mtime rule catches an agent that re-pins the rail to its tampered corpus.
+
+ANSWER_SOURCE_HASHES_NAME = "answer-source-sha256.json"
+
+
+def sha256_file(path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def hash_answer_source(work, patterns) -> dict:
+    """Map of work-relative POSIX path -> sha256 for every file a pattern hits.
+
+    Patterns are Path.glob patterns relative to --work; absolute patterns and
+    patterns with `..` segments are refused (the rail must never point outside
+    the work dir). A symlinked match whose target escapes --work is recorded
+    with an `escape:<resolved>` marker instead of a hash, so the grader flags
+    it as changed rather than crashing or reading outside the exam.
+    """
+    root = Path(work).resolve()
+    hashes = {}
+    for pattern in patterns:
+        parsed = Path(pattern)
+        if parsed.is_absolute() or ".." in parsed.parts:
+            raise ValueError("answer-source pattern %r must stay inside --work" % pattern)
+        for path in sorted(root.glob(pattern)):
+            if not path.is_file():
+                continue
+            resolved = path.resolve()
+            try:
+                rel = resolved.relative_to(root).as_posix()
+            except ValueError:
+                rel = path.relative_to(root).as_posix()
+                hashes[rel] = "escape:" + str(resolved)
+                continue
+            hashes[rel] = sha256_file(resolved)
+    return hashes
+
+
+def write_answer_source_hashes(rail_dir, hashes: dict) -> Path:
+    """Driver side: pin the answer-source hashes into the rail dir. Call BEFORE
+    record_run_meta so the pin's mtime predates the run-start anchor."""
+    path = Path(rail_dir) / ANSWER_SOURCE_HASHES_NAME
+    path.write_text(json.dumps(hashes, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def read_answer_source_hashes(rail_dir) -> dict:
+    """Grader side: the recorded {path: sha256} map, or {} when absent or
+    unparseable (fail closed: the caller treats {} as not recorded)."""
+    try:
+        recorded = json.loads((Path(rail_dir) / ANSWER_SOURCE_HASHES_NAME).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(recorded, dict):
+        return {}
+    return {key: value for key, value in recorded.items() if isinstance(key, str) and isinstance(value, str)}
+
+
+def verify_answer_source(rail_dir, work, patterns, deadline) -> dict:
+    """Grader-side answer-source integrity; fail closed on any violation.
+
+    Combines the D9 rail check on the pin file (present in a rail dir outside
+    --work, mtime not after the run-start deadline) with a content comparison:
+    the grader re-hashes its canonical patterns and requires the exact
+    recorded set - a changed, missing (deleted), or extra (planted) file all
+    void the run. An empty recording fails closed (a driver invoked without
+    --corpus-glob must not pass vacuously).
+    """
+    checks = verify_rail(rail_dir, work, [("answer_source", ANSWER_SOURCE_HASHES_NAME, deadline)])
+    recorded = read_answer_source_hashes(rail_dir)
+    checks["answer_source_hashes_recorded"] = bool(recorded)
+    current = hash_answer_source(work, patterns)
+    checks["answer_source_missing"] = sorted(set(recorded) - set(current))
+    checks["answer_source_extra"] = sorted(set(current) - set(recorded))
+    checks["answer_source_changed"] = sorted(
+        path for path in set(recorded) & set(current) if recorded[path] != current[path]
+    )
+    checks["answer_source_ok"] = bool(
+        checks["rail_ok"]
+        and checks["answer_source_hashes_recorded"]
+        and not checks["answer_source_missing"]
+        and not checks["answer_source_extra"]
+        and not checks["answer_source_changed"]
+    )
     return checks
 
 

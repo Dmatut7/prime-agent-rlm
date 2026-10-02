@@ -50,17 +50,25 @@ default `~/.prime/agent`) must be serial.
 PACK=scripts/evals/exam-v1   # run from the repo root
 M=provider/model-id          # or drop --model for the configured default
 
-# EX-1 (generate -> agent works in fixture/ -> grade)
+# EX-1 (generate -> agent works in fixture/ -> grade; the answer sources -
+# manifest.json and the CSVs - are sha256-pinned into the rail dir pre-run)
+RAIL1=/tmp/exam/ex1-rail
 python3 $PACK/ex1-pipeline/gen_ex1.py --out /tmp/exam/ex1 --seed 20261002
 python3 $PACK/run_manual.py --work /tmp/exam/ex1 --model $M \
-    --prompt-file $PACK/ex1-pipeline/prompt.txt --cwd /tmp/exam/ex1/fixture
-python3 $PACK/ex1-pipeline/grade_ex1.py --work /tmp/exam/ex1
+    --prompt-file $PACK/ex1-pipeline/prompt.txt --cwd /tmp/exam/ex1/fixture \
+    --rail-dir "$RAIL1" \
+    --corpus-glob manifest.json --corpus-glob 'fixture/data/*.csv'
+python3 $PACK/ex1-pipeline/grade_ex1.py --work /tmp/exam/ex1 --rail-dir "$RAIL1"
 
-# EX-2 (agent writes fixture/answers.json - one level above docs/, per prompt)
+# EX-2 (agent writes fixture/answers.json - one level above docs/, per prompt;
+# answer sources: manifest.json and the docs/ corpus)
+RAIL2=/tmp/exam/ex2-rail
 python3 $PACK/ex2-needles/gen_ex2.py --out /tmp/exam/ex2 --seed 20261002
 python3 $PACK/run_manual.py --work /tmp/exam/ex2 --model $M \
-    --prompt-file $PACK/ex2-needles/prompt.txt --cwd /tmp/exam/ex2/fixture
-python3 $PACK/ex2-needles/grade_ex2.py --work /tmp/exam/ex2
+    --prompt-file $PACK/ex2-needles/prompt.txt --cwd /tmp/exam/ex2/fixture \
+    --rail-dir "$RAIL2" \
+    --corpus-glob manifest.json --corpus-glob 'fixture/docs/*.md'
+python3 $PACK/ex2-needles/grade_ex2.py --work /tmp/exam/ex2 --rail-dir "$RAIL2"
 
 # EX-3 (driver handles kill/resume; grading is a separate step; rails live
 # in a rail dir OUTSIDE the work dir - the prompt never names it)
@@ -128,6 +136,31 @@ observed incidental/self-verification tampering pattern; full isolation
 from a determined adversary needs OS-level sandboxing (read-only mounts),
 which this stdlib-only pack deliberately does not attempt.
 
+### Answer-source integrity (EX-1/EX-2, D10)
+
+Both graders trust artifacts inside the agent-writable work dir: EX-1 grades
+against `manifest.json` (the expected values) over `fixture/data/*.csv`, and
+EX-2 rescans `fixture/docs/*.md` as the needle truth at grade time. A
+tampering agent can therefore forge a pass - rewrite the manifest to match
+its broken report, or edit/plant/delete corpus docs to match its answers.
+The rail (same D9 mechanics, new pin file):
+
+1. The driver hashes every answer-source file (`--corpus-glob`, sha256)
+   into `<rail>/answer-source-sha256.json` BEFORE the agent launches, then
+   records the run-start anchor in `run-meta.json`.
+2. The graders require `--rail-dir` and re-hash their canonical set
+   (EX-1: `manifest.json` + `fixture/data/*.csv`; EX-2: `manifest.json` +
+   `fixture/docs/*.md`). Any changed/missing/extra file fails the run, as
+   do a missing pin, a missing run-start anchor, and a pin whose mtime
+   postdates the anchor (an agent re-pinning the rail to its tampered
+   corpus is caught by the mtime rule, not the content).
+3. `analyze.py` is deliberately NOT pinned (fixing it is the exam), and the
+   prompts forbid touching the CSVs/`docs/` or anything outside the fixture
+   directory, without naming the rail dir.
+
+Same residual gap as D9: an agent that finds the rail dir can rewrite
+`run-meta.json` itself; OS-level sandboxing stays out of scope.
+
 ## Self-tests
 
 Model-free, bidirectional (gold sample passes, wrong samples fail), including
@@ -166,6 +199,17 @@ python3 -m unittest discover -s tests -v
   without `run-meta.json`; every exam prompt now explicitly forbids
   reading/executing graders and touching rail files. Grader CLI change:
   `--pre-status`/`--agent-log` are replaced by `--rail-dir`.
+
+## Defect history (v1.2 -> v1.3, wave-19 hardening)
+
+- **D10** EX-1/EX-2 answer sources sat unprotected in the agent-writable
+  work dir: EX-1's `manifest.json` (the expected values the grader trusts)
+  could be rewritten to match a broken report, and EX-2's `docs/` corpus
+  (the grader's rescanned truth) could be edited, planted, or deleted to
+  match the agent's answers.json. Both graders now require `--rail-dir`
+  holding a pre-run `answer-source-sha256.json` the driver records via
+  `--corpus-glob`; changed/missing/extra answer-source files, a missing or
+  anchor-less run-meta, and a post-launch-rewritten pin all grade red.
 
 ## Known limits / v1.1 candidates
 
