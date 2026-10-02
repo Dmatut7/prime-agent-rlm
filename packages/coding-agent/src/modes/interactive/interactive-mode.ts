@@ -32,6 +32,7 @@ import {
 	Container,
 	FULLSCREEN_MAX_STICKY_ROWS,
 	isKeyRelease,
+	isKeyRepeat,
 	isMouseSequence,
 	Loader,
 	type LoaderIndicatorOptions,
@@ -4228,6 +4229,11 @@ export class InteractiveMode {
 		});
 
 		this.defaultEditor.onExtensionShortcut = (data: string) => {
+			// Press-only, the KeybindingsManager default: matchesKey ignores the Kitty
+			// event type, so a held shortcut would re-fire at the auto-repeat rate.
+			// Decline instead of consuming so an unbound key's repeat still reaches
+			// the editor's text insertion.
+			if (isKeyRepeat(data)) return false;
 			for (const [shortcutStr, shortcut] of shortcuts) {
 				if (matchesKey(data, shortcutStr as KeyId)) {
 					Promise.resolve(shortcut.handler(createContext())).catch((err) => {
