@@ -946,7 +946,11 @@ export class AgentDaemon {
 	private log(message: string): void {
 		console.error(message);
 		structuredLog.warn(message, { socketPath: this.socketPath });
-		appendRotatingLog(getDaemonLogPath(this.socketPath), `[${new Date().toISOString()}] ${message}`);
+		// A fixture-built daemon (tests) can have no socketPath; logging must never
+		// throw, least of all from inside another error's handler.
+		if (this.socketPath) {
+			appendRotatingLog(getDaemonLogPath(this.socketPath), `[${new Date().toISOString()}] ${message}`);
+		}
 	}
 
 	// A crash thrown outside a command handler would otherwise vanish with the

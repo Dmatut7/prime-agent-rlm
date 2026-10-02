@@ -1390,12 +1390,36 @@ function readLiveShutdownAdmission(registryDir: string): DaemonShutdownAdmission
 	return undefined;
 }
 
-/** Advisory face ("is a shutdown running right now?"): a lapsed lease reads as no. */
+/** Advisory face ("is a shutdown running right now?"): see shutdownAdmissionIsActive. */
 function readActiveShutdownAdmission(registryDir: string): DaemonShutdownAdmissionRecord | undefined {
 	const admission = readLiveShutdownAdmission(registryDir);
 	return shutdownAdmissionIsActive(admission) ? admission : undefined;
 }
 
+/**
+ * The advisory read deliberately diverges from the acquire side: a lapsed lease
+ * reads as inactive even while the holder's process is alive, where
+ * `acquireDaemonShutdownAdmission` treats a live holder as holding however stale
+ * its lease looks. The admission file is global to this registry — one record for
+ * every daemon on the box — so reading a live-but-silent holder as "holding" would
+ * pin every worker monitor, every startup wait and every CLI restart retry on the
+ * machine until that process dies. A wedged shutdown command must not freeze
+ * crash recovery fleet-wide; the lapse is the escape hatch, and a holder that is
+ * merely stalled re-announces itself on its next renew.
+ *
+ * Wave-19 re-evaluated closing this window (live holder = active) after the
+ * wave-18 tombstone landed, and kept it. A deliberate stop is already durable
+ * without this read: the supervisor writes the tombstone before any shutdown
+ * step, the CLI writes it after a SIGKILL escalation, and a worker-driven
+ * relaunch refuses a tombstoned socket both pre-spawn and at ownership acquire —
+ * so the lapse no longer opens the 4603 resurrection window the admission used to
+ * cover alone. The known residual is the update handoff, which holds this
+ * admission without a tombstone by design: a coordinator stalled past its lease
+ * mid-handoff reads as "no shutdown" here, and a worker already past its relaunch
+ * grace can race the coordinator's successor. If that race ever bites, the fix is
+ * a durable handoff marker analogous to the tombstone — not a read-side change
+ * that trades a narrow race for an unbounded fleet-wide pin.
+ */
 function shutdownAdmissionIsActive(admission: DaemonShutdownAdmissionRecord | undefined): boolean {
 	return admission !== undefined && Date.parse(admission.expiresAt) > Date.now() && isProcessIdentityAlive(admission);
 }

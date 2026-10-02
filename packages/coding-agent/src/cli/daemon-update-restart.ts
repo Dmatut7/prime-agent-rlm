@@ -8,6 +8,7 @@ import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
 import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
 import { defaultDaemonSocketDir, defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import {
+	DAEMON_SUPERVISOR_RELAUNCH_ENV,
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
@@ -529,6 +530,11 @@ function coordinatorEnvironment(agentDir: string): NodeJS.ProcessEnv {
 	delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
 	delete environment[SESSION_LEASES_ENABLED_ENV];
 	delete environment[SESSION_LEASE_OWNER_ID_ENV];
+	// The coordinator restarts the daemon as a deliberate start: the
+	// worker-relaunch marker must never leak into it (or anything it spawns), or
+	// the successor reads as a relaunch — refused by a tombstoned socket and never
+	// lifting the tombstone. Same scrub as the worker and restart-relaunch spawns.
+	delete environment[DAEMON_SUPERVISOR_RELAUNCH_ENV];
 	return environment;
 }
 

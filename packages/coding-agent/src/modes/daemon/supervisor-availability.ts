@@ -167,6 +167,10 @@ export async function checkSupervisorAvailability(
 		return { launchedReplacement: false };
 	}
 	if (await deps.isShutdownAdmissionActive()) {
+		// Advisory read: a lapsed lease with a live holder reads inactive on purpose
+		// (shutdownAdmissionIsActive), so a wedged shutdown command cannot pin this
+		// worker forever; a merely stalled holder re-announces on its next renew. The
+		// deliberate-shutdown case is backstopped by the tombstone in the launch gate.
 		state.supervisorAbsentSince = undefined;
 		return { nextDelayMs: SUPERVISOR_SHUTDOWN_ADMISSION_RECHECK_MS, launchedReplacement: false };
 	}
