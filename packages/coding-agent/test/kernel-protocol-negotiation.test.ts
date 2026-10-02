@@ -21,8 +21,9 @@ function writeFakeRuntime(filePath: string): void {
 const fs = require("node:fs");
 const readline = require("node:readline");
 const MIN = 3;
-const MAX = 4;
+const MAX = 5;
 const frameLog = process.env.FAKE_REPL_FRAME_LOG;
+const requestLog = process.env.FAKE_REPL_REQUEST_LOG;
 const requested = process.env.${KERNEL_PROTOCOL_ENV_VAR};
 fs.writeFileSync(process.env.FAKE_REPL_ENV_LOG, requested === undefined ? "unset" : requested);
 const clamp = (raw) => {
@@ -48,6 +49,7 @@ emit({
 const input = readline.createInterface({ input: process.stdin });
 input.on("line", (line) => {
   const request = JSON.parse(line);
+  if (requestLog) fs.appendFileSync(requestLog, line + "\\n");
   if (request.type === "execute") {
     if (request.code === "emit-v4-frame") {
       emit({ event: "heartbeat", id: request.id, alive: true });
@@ -95,10 +97,12 @@ describe("kernel protocol negotiation", () => {
 		manager: ReplKernelManager;
 		envLogPath: string;
 		frameLogPath: string;
+		requestLogPath: string;
 	} {
 		const python = join(tempDir, "python");
 		const envLogPath = join(tempDir, "env-probe");
 		const frameLogPath = join(tempDir, "frames.log");
+		const requestLogPath = join(tempDir, "requests.log");
 		writeFakeRuntime(python);
 		const manager = new ReplKernelManager({
 			python,
@@ -106,6 +110,7 @@ describe("kernel protocol negotiation", () => {
 			env: {
 				FAKE_REPL_ENV_LOG: envLogPath,
 				FAKE_REPL_FRAME_LOG: frameLogPath,
+				FAKE_REPL_REQUEST_LOG: requestLogPath,
 				...(options.forcedProtocol === undefined
 					? {}
 					: { FAKE_REPL_FORCE_READY_PROTOCOL: String(options.forcedProtocol) }),
@@ -113,7 +118,16 @@ describe("kernel protocol negotiation", () => {
 				...options.env,
 			},
 		});
-		return { manager, envLogPath, frameLogPath };
+		return { manager, envLogPath, frameLogPath, requestLogPath };
+	}
+
+	/** Request lines the fake kernel received, in arrival order. */
+	function requestLines(requestLogPath: string): string[] {
+		return existsSync(requestLogPath)
+			? readFileSync(requestLogPath, "utf8")
+					.split("\n")
+					.filter((line) => line.length > 0)
+			: [];
 	}
 
 	it("reports no capabilities before the kernel is ready", () => {
@@ -123,16 +137,17 @@ describe("kernel protocol negotiation", () => {
 		expect(manager.negotiatedProtocol).toBeUndefined();
 	});
 
-	it("asks the kernel for protocol 4 and records the negotiated capabilities", async () => {
+	it("asks the kernel for protocol 5 and records the negotiated capabilities", async () => {
 		const { manager, envLogPath, frameLogPath } = newManager();
 
 		try {
 			await manager.start();
 
-			expect(readFileSync(envLogPath, "utf8")).toBe("4");
-			expect(manager.negotiatedProtocol).toBe(4);
-			expect(manager.kernelCapabilities).toEqual({ protocol: 4, protocol4: true, preserveNames: false });
-			// Positive control: a protocol-3 round trip still works under protocol 4.
+			expect(readFileSync(envLogPath, "utf8")).toBe("5");
+			expect(manager.negotiatedProtocol).toBe(5);
+			expect(manager.kernelCapabilities).toEqual({ protocol: 5, protocol4: true, preserveNames: false });
+			expect(manager.supportsMessageNotify).toBe(false);
+			// Positive control: a protocol-3 round trip still works under protocol 5.
 			const result = await manager.execute("say-hi");
 			expect(result.stdout).toContain("hi");
 			expect(frameKinds(frameLogPath)).toEqual(expect.arrayContaining(["ready", "stdout", "done"]));
@@ -149,7 +164,9 @@ describe("kernel protocol negotiation", () => {
 
 			// The protocol number alone must not unlock a request field: a runtime built
 			// between the protocol bump and the preserve_names change still announces 4.
-			expect(manager.kernelCapabilities).toEqual({ protocol: 4, protocol4: true, preserveNames: true });
+			expect(manager.kernelCapabilities).toEqual({ protocol: 5, protocol4: true, preserveNames: true });
+			// ...and a token this feature does not read must not unlock it either.
+			expect(manager.supportsMessageNotify).toBe(false);
 		} finally {
 			await manager.shutdown({ snapshot: true, drainHostRequests: true });
 		}
@@ -173,7 +190,7 @@ describe("kernel protocol negotiation", () => {
 		try {
 			await manager.start();
 
-			expect(manager.kernelCapabilities).toEqual({ protocol: 4, protocol4: true, preserveNames: false });
+			expect(manager.kernelCapabilities).toEqual({ protocol: 5, protocol4: true, preserveNames: false });
 			// Positive control: the kernel really did announce tokens, and the session works.
 			expect((await manager.execute("say-hi")).stdout).toContain("hi");
 			expect(frameKinds(frameLogPath)).toContain("ready");
@@ -190,7 +207,7 @@ describe("kernel protocol negotiation", () => {
 			await manager.start();
 
 			// `export PRIME_AGENT_KERNEL_PROTOCOL=3` is the documented rollback lever for
-			// every gated feature, so the host must pass it through instead of forcing 4.
+			// every gated feature, so the host must pass it through instead of forcing a newer one.
 			expect(readFileSync(envLogPath, "utf8")).toBe("3");
 			expect(manager.kernelCapabilities).toEqual({ protocol: 3, protocol4: false, preserveNames: false });
 		} finally {
@@ -233,7 +250,7 @@ describe("kernel protocol negotiation", () => {
 	it("rejects a runtime announcing a protocol outside the supported range", async () => {
 		// 3.5 pins the integer check: a fractional announcement is a corrupt frame, not a
 		// version this host could serve.
-		const outOfRange = [2, 5, 3.5];
+		const outOfRange = [2, 6, 3.5];
 		expect(outOfRange.length).toBeGreaterThan(0);
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -241,7 +258,7 @@ describe("kernel protocol negotiation", () => {
 			for (const protocol of outOfRange) {
 				const { manager } = newManager({ forcedProtocol: protocol });
 				try {
-					await expect(manager.start()).rejects.toThrow(new RegExp(`speaks protocol ${protocol}, expected 3-4`));
+					await expect(manager.start()).rejects.toThrow(new RegExp(`speaks protocol ${protocol}, expected 3-5`));
 					expect(manager.kernelCapabilities).toBeUndefined();
 				} finally {
 					await manager.shutdown({ snapshot: true, drainHostRequests: true });
@@ -253,15 +270,19 @@ describe("kernel protocol negotiation", () => {
 	});
 
 	it("clears the negotiated capabilities when the kernel goes away", async () => {
-		const { manager } = newManager();
+		const { manager } = newManager({ announce: ["message_notify"] });
 
 		await manager.start();
-		expect(manager.kernelCapabilities).toEqual({ protocol: 4, protocol4: true, preserveNames: false });
+		expect(manager.kernelCapabilities).toEqual({ protocol: 5, protocol4: true, preserveNames: false });
+		expect(manager.supportsMessageNotify).toBe(true);
 
 		await manager.shutdown({ snapshot: true, drainHostRequests: true });
 
 		expect(manager.kernelCapabilities).toBeUndefined();
 		expect(manager.negotiatedProtocol).toBeUndefined();
+		// A replacement kernel must earn its own announcement: the notify frame is gated
+		// on the capability, so a stale bit must not survive the teardown.
+		expect(manager.supportsMessageNotify).toBe(false);
 	});
 
 	it("treats a protocol-4 frame from a protocol-3 kernel as corruption", async () => {
@@ -282,6 +303,70 @@ describe("kernel protocol negotiation", () => {
 			expect(frameKinds(frameLogPath)).toContain("heartbeat");
 		} finally {
 			errorSpy.mockRestore();
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+		}
+	});
+
+	it("pushes a notify frame to a kernel that announced message_notify", async () => {
+		const { manager, requestLogPath } = newManager({ announce: ["message_notify"] });
+
+		try {
+			await manager.start();
+			expect(manager.supportsMessageNotify).toBe(true);
+
+			await expect(manager.notifyAgentMessageArrived()).resolves.toBe(true);
+
+			// The write resolves when the OS accepted the bytes; the fake's log line lands
+			// when its reader loop turns, so poll instead of reading at once.
+			await vi.waitFor(() => {
+				expect(requestLines(requestLogPath).filter((line) => JSON.parse(line).type === "notify")).toEqual([
+					JSON.stringify({ type: "notify", kind: "agent_message" }),
+				]);
+			});
+		} finally {
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+		}
+	});
+
+	it("never sends a notify frame without the kernel's message_notify token", async () => {
+		// A runtime that announced protocol 5 but no token predates the notify frame; the
+		// version number alone must not authorize one.
+		const { manager, requestLogPath } = newManager();
+
+		try {
+			await manager.start();
+			expect(manager.negotiatedProtocol).toBe(5);
+			expect(manager.supportsMessageNotify).toBe(false);
+
+			await expect(manager.notifyAgentMessageArrived()).resolves.toBe(false);
+
+			// Ordering proof of absence: the execute line below necessarily lands after any
+			// notify the pipe carried before it, so once it is in the log, no notify came.
+			expect((await manager.execute("say-hi")).stdout).toContain("hi");
+			await vi.waitFor(() => {
+				expect(requestLines(requestLogPath).some((line) => JSON.parse(line).type === "execute")).toBe(true);
+			});
+			expect(requestLines(requestLogPath).filter((line) => JSON.parse(line).type === "notify")).toEqual([]);
+		} finally {
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+		}
+	});
+
+	it("keeps message_notify off when the kernel negotiated 3, whatever it announces", async () => {
+		const { manager, requestLogPath } = newManager({ forcedProtocol: 3, announce: ["message_notify"] });
+
+		try {
+			await manager.start();
+			expect(manager.supportsMessageNotify).toBe(false);
+
+			await expect(manager.notifyAgentMessageArrived()).resolves.toBe(false);
+
+			expect((await manager.execute("say-hi")).stdout).toContain("hi");
+			await vi.waitFor(() => {
+				expect(requestLines(requestLogPath).some((line) => JSON.parse(line).type === "execute")).toBe(true);
+			});
+			expect(requestLines(requestLogPath).filter((line) => JSON.parse(line).type === "notify")).toEqual([]);
+		} finally {
 			await manager.shutdown({ snapshot: true, drainHostRequests: true });
 		}
 	});

@@ -428,7 +428,7 @@ describe("AgentSession rlm recursion", () => {
 			throw new Error("Missing retained child session");
 		}
 		expect(childSession.sessionName).toBe("api-reviewer");
-		expect((await root.listRlmSubagents()).subagents[0]?.session_name).toBe("api-reviewer");
+		expect((await root.listRlmSubagents({ includeTerminal: true })).subagents[0]?.session_name).toBe("api-reviewer");
 
 		await expect(root.runRlmChild("inspect another API", { name: "api-reviewer" })).rejects.toThrow(
 			'Agent name "api-reviewer" is unavailable: an agent of that name already exists at depth 1 under this parent',
@@ -675,7 +675,7 @@ describe("AgentSession rlm recursion", () => {
 				recap: "restored recap",
 			}),
 		]);
-		expect((await root.listRlmSubagents()).subagents).toEqual([
+		expect((await root.listRlmSubagents({ includeTerminal: true })).subagents).toEqual([
 			expect.objectContaining({
 				rlm_child_id: childId,
 				session_name: "restored-worker",
@@ -1396,7 +1396,7 @@ describe("AgentSession rlm recursion", () => {
 
 		const spawned = await root.runRlmChild("start failing child", { name: "failing-worker" });
 		await vi.waitFor(async () => {
-			expect((await root.listRlmSubagents()).subagents).toContainEqual(
+			expect((await root.listRlmSubagents({ includeTerminal: true })).subagents).toContainEqual(
 				expect.objectContaining({ rlm_child_id: spawned.rlm_child_id, status: "error" }),
 			);
 		});
@@ -1578,7 +1578,7 @@ describe("AgentSession rlm recursion", () => {
 
 		const spawned = await root.runRlmChild("reply first", { name: "reply-worker" });
 		await vi.waitFor(async () => {
-			expect((await root.listRlmSubagents()).subagents).toContainEqual(
+			expect((await root.listRlmSubagents({ includeTerminal: true })).subagents).toContainEqual(
 				expect.objectContaining({ rlm_child_id: spawned.rlm_child_id, status: "completed" }),
 			);
 		});
@@ -2180,7 +2180,7 @@ describe("AgentSession rlm recursion", () => {
 		await vi.waitFor(() => {
 			expect(completeRlmSubagentRuntime).toHaveBeenCalledWith(spawned.rlm_child_id, child);
 		});
-		expect((await root.listRlmSubagents()).subagents).toContainEqual(
+		expect((await root.listRlmSubagents({ includeTerminal: true })).subagents).toContainEqual(
 			expect.objectContaining({ rlm_child_id: spawned.rlm_child_id, status: "completed" }),
 		);
 	});
@@ -2283,7 +2283,7 @@ describe("AgentSession rlm recursion", () => {
 				},
 			],
 		};
-		expect(await root.listRlmSubagents()).toEqual(expectedRegistry);
+		expect(await root.listRlmSubagents({ includeTerminal: true })).toEqual(expectedRegistry);
 		const inspectable = root as unknown as InspectableRlmSession;
 		const conflictingDeletion = {
 			...expectedRegistry.subagents[0],
@@ -2304,7 +2304,10 @@ describe("AgentSession rlm recursion", () => {
 		if (!listHandler || !deleteHandler) {
 			throw new Error("Missing RLM subagent registry host handlers");
 		}
-		await expect(listHandler({})).resolves.toEqual(expectedRegistry);
+		// The kernel roster's default view is the active list; the completed child
+		// retired from it but stays on the terminal-inclusive view.
+		await expect(listHandler({})).resolves.toEqual({ subagents: [] });
+		await expect(listHandler({ include_terminal: true })).resolves.toEqual(expectedRegistry);
 		await expect(deleteHandler({ target: expectedSessionName })).resolves.toEqual({
 			subagent: expectedRegistry.subagents[0],
 		});
@@ -2372,10 +2375,10 @@ describe("AgentSession rlm recursion", () => {
 			},
 		];
 
-		expect(await root.listRlmSubagents()).toEqual({ subagents: expected });
+		expect(await root.listRlmSubagents({ includeTerminal: true })).toEqual({ subagents: expected });
 		await expect(root.deleteRlmSubagent("finished-worker")).resolves.toEqual({ subagent: expected[1] });
 		expect(deleteRlmSubagentRuntime).toHaveBeenCalledWith("finished-child", undefined);
-		expect(await root.listRlmSubagents()).toEqual({ subagents: [expected[0]] });
+		expect(await root.listRlmSubagents({ includeTerminal: true })).toEqual({ subagents: [expected[0]] });
 	});
 
 	it("coalesces concurrent deletion of the same passive daemon child", async () => {
@@ -4239,12 +4242,12 @@ describe("AgentSession rlm recursion", () => {
 
 		await root.runRlmChild("failing startup", { name: "failed-worker" });
 		await vi.waitFor(async () => {
-			expect((await root.listRlmSubagents()).subagents[0]).toMatchObject({
+			expect((await root.listRlmSubagents({ includeTerminal: true })).subagents[0]).toMatchObject({
 				session_name: "failed-worker",
 				status: "error",
 			});
 		});
-		const failed = (await root.listRlmSubagents()).subagents[0];
+		const failed = (await root.listRlmSubagents({ includeTerminal: true })).subagents[0];
 		await expect(root.deleteRlmSubagent("failed-worker")).resolves.toEqual({ subagent: failed });
 		const internals = root as unknown as InspectableRlmSession;
 		expect(internals._activeRlmChildRuns.size).toBe(0);

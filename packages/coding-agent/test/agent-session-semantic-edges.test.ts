@@ -339,7 +339,9 @@ describe("AgentSession semantic edges", () => {
 		await root.prompt("parent turn two");
 		const spawned = await spawnDuringRun(root, () => root.runRlmChild("child task"));
 		const childId = basename(spawned.session_dir);
-		await waitForAsync(async () => (await root.listRlmSubagents()).subagents[0]?.status === "completed");
+		await waitForAsync(
+			async () => (await root.listRlmSubagents({ includeTerminal: true })).subagents[0]?.status === "completed",
+		);
 
 		const rootEvents = ledgerFor(root);
 		expect(existsSync(childLedgerPath(spawned.session_dir))).toBe(true);
@@ -388,7 +390,9 @@ describe("AgentSession semantic edges", () => {
 		expect(root.semanticEdges.lastTurnRequestId).toBeDefined();
 
 		const spawned = await root.runRlmChild("out-of-band child");
-		await waitForAsync(async () => (await root.listRlmSubagents()).subagents[0]?.status === "completed");
+		await waitForAsync(
+			async () => (await root.listRlmSubagents({ includeTerminal: true })).subagents[0]?.status === "completed",
+		);
 
 		const registration = readSemanticEdgeLedger(childLedgerPath(spawned.session_dir)).find(
 			(event) => event.type === "session_registered",
@@ -411,7 +415,9 @@ describe("AgentSession semantic edges", () => {
 		const resumedManager = SessionManager.open(sessionFile, join(tempDir, "sessions"));
 		const { session: resumed } = createSession({ sessionManager: resumedManager });
 		const spawned = await spawnDuringRun(resumed, () => resumed.runRlmChild("child after resume"));
-		await waitForAsync(async () => (await resumed.listRlmSubagents()).subagents[0]?.status === "completed");
+		await waitForAsync(
+			async () => (await resumed.listRlmSubagents({ includeTerminal: true })).subagents[0]?.status === "completed",
+		);
 
 		const childEvents = readSemanticEdgeLedger(childLedgerPath(spawned.session_dir));
 		expect(childEvents.find((event) => event.type === "session_registered")).toMatchObject({
@@ -431,7 +437,9 @@ describe("AgentSession semantic edges", () => {
 		const spawnPromise = spawnDuringRun(root, () => root.runRlmChild("child task"));
 		const laterId = root.semanticEdges.startTurnRequest("later-body-hash");
 		const spawned = await spawnPromise;
-		await waitForAsync(async () => (await root.listRlmSubagents()).subagents[0]?.status === "completed");
+		await waitForAsync(
+			async () => (await root.listRlmSubagents({ includeTerminal: true })).subagents[0]?.status === "completed",
+		);
 
 		const childEvents = readSemanticEdgeLedger(childLedgerPath(spawned.session_dir));
 		const registration = childEvents.find((event) => event.type === "session_registered");
@@ -471,7 +479,9 @@ describe("AgentSession semantic edges", () => {
 
 		await root.prompt("parent turn");
 		await root.runRlmChild("doomed child");
-		await waitForAsync(async () => (await root.listRlmSubagents()).subagents[0]?.status !== "running");
+		await waitForAsync(
+			async () => (await root.listRlmSubagents({ includeTerminal: true })).subagents[0]?.status !== "running",
+		);
 
 		const child = state.child;
 		if (!child) throw new Error("Missing child session");
@@ -500,7 +510,9 @@ describe("AgentSession semantic edges", () => {
 
 		await root.prompt("parent turn");
 		await root.runRlmChild("doomed child");
-		await waitForAsync(async () => (await root.listRlmSubagents()).subagents[0]?.status !== "running");
+		await waitForAsync(
+			async () => (await root.listRlmSubagents({ includeTerminal: true })).subagents[0]?.status !== "running",
+		);
 
 		expect(state.child).toBeDefined();
 		expect(ledgerFor(root).filter((event) => event.type === "child_returned")).toEqual([]);
@@ -703,7 +715,9 @@ describe("AgentSession semantic edges", () => {
 
 			// Child runs still settle normally; the parent's return claim is a no-op.
 			await root.runRlmChild("child task");
-			await waitForAsync(async () => (await root.listRlmSubagents()).subagents[0]?.status === "completed");
+			await waitForAsync(
+				async () => (await root.listRlmSubagents({ includeTerminal: true })).subagents[0]?.status === "completed",
+			);
 			expect(warn).toHaveBeenCalledOnce();
 		} finally {
 			warn.mockRestore();

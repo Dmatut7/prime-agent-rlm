@@ -362,6 +362,12 @@ async def collect(
     poll, not a commitment. Completed children keep their result until deleted, so a
     later ``collect`` re-reads them without waiting.
 
+    The request asks the host to end the wait early when an agent message arrives for
+    this session (``wake_on_message``; a host that predates message wake ignores the
+    field and waits as before). Such a reply carries ``messages_pending`` and is
+    surfaced as a printed note plus the ``messages_pending()`` counter, so the model
+    can end its turn and receive the message instead of re-arming a long wait.
+
     Each entry carries ``terminal_kind`` and ``stall_abort`` next to the raw
     ``status``: a child killed by the stall watchdog still reports ``status="done"``,
     and only these two fields distinguish the kill from a child that finished
@@ -377,11 +383,63 @@ async def collect(
         selectors = [_collect_target_selector(target) for target in targets]
     else:
         raise TypeError(f"targets must be None, a target, or a list of targets, got {type(targets).__name__}")
-    payload = await host_request("rlm.collect", {"targets": selectors, "timeout_ms": timeout_ms})
+    payload = await host_request(
+        "rlm.collect",
+        {"targets": selectors, "timeout_ms": timeout_ms, "wake_on_message": True},
+    )
     results = payload.get("results")
     if not isinstance(results, list):
         raise RuntimeError("rlm.collect returned an invalid results list")
-    return [_child_result_from_payload(entry) for entry in results]
+    entries = [_child_result_from_payload(entry) for entry in results]
+    _note_collect_message_wake(payload.get("messages_pending"))
+    return entries
+
+
+def _note_collect_message_wake(messages_pending: Any) -> None:
+    """Surface a host message-wake to the model reading this cell's output.
+
+    The host sets ``messages_pending`` (true, or the pending count) on a collect reply it
+    ended early because an agent message arrived for this session. The note prints into the
+    cell's own output - the channel the model actually reads - and the same arrivals enter
+    the wake ledger, so a following ``messages_pending()``/``wait_messages()`` agrees.
+    Anything but a positive count is ignored: a malformed value must not fake a wake.
+    """
+    if messages_pending is True:
+        count = 1
+    elif isinstance(messages_pending, int) and not isinstance(messages_pending, bool) and messages_pending > 0:
+        count = messages_pending
+    else:
+        return
+    from . import repl
+
+    repl.note_message_wake(count)
+    print(f"[rlm] {count} agent message(s) pending for this session; end the turn to receive them.")
+
+
+def messages_pending() -> int:
+    """Agent-message arrivals the host pushed (or reported) that no wait has consumed yet.
+
+    A peek: reading the count never drains it. ``wait_messages`` drains.
+    """
+    from . import repl
+
+    return repl.messages_pending()
+
+
+async def wait_messages(timeout_ms: int = 0) -> int:
+    """Wait until an agent message for this session has arrived; return the pending count.
+
+    This is the wakeable wait for a fan-in loop: a host that announced message-wake support
+    pushes a notification the moment a child's ``agent_message`` arrives, and a wait parked
+    here returns at that point instead of at the timeout. The message itself is not delivered
+    here - it enters the conversation as an ordinary queued prompt at the next turn boundary,
+    so end the turn to receive it; the wake only says the wait is over. Returns the number of
+    arrivals consumed (0 on timeout), draining the pending count ``messages_pending()`` peeks
+    at.
+    """
+    from . import repl
+
+    return await repl.wait_message_wake(timeout_ms)
 
 
 async def delete_subagent(target: str | RLMSubagent | RLMSpawnHandle) -> RLMSubagent:
@@ -477,6 +535,12 @@ class _RLMCallable:
     async def collect(self, targets: Any = None, *, timeout_ms: int = 0) -> list[RLMChildResult]:
         return await collect(targets, timeout_ms=timeout_ms)
 
+    async def wait_messages(self, timeout_ms: int = 0) -> int:
+        return await wait_messages(timeout_ms)
+
+    def messages_pending(self) -> int:
+        return messages_pending()
+
     async def delete_subagent(self, target: str | RLMSubagent | RLMSpawnHandle) -> RLMSubagent:
         return await delete_subagent(target)
 
@@ -519,8 +583,10 @@ __all__ = [
     "harness",
     "host_request",
     "list_subagents",
+    "messages_pending",
     "rlm",
     "run",
+    "wait_messages",
 ]
 
 # Lazily re-export the MCP base class. Kept lazy so `import rlm` never requires

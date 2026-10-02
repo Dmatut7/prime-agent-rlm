@@ -44,7 +44,7 @@ from .bash import (
 # negotiated from the host's PRIME_AGENT_KERNEL_PROTOCOL request, because the host treats a
 # frame kind it does not know as protocol corruption and repairs (kills) the kernel: nothing
 # added by a later protocol may be emitted unless the host asked for it.
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 # Oldest host this runtime still serves; a request below it is raised to it.
 MIN_PROTOCOL_VERSION = 3
 # What a host that never sets the variable gets, i.e. the protocol every shipped host speaks.
@@ -79,6 +79,15 @@ def negotiated_protocol() -> int:
 PRESERVE_NAMES_MIN_PROTOCOL = 4
 CAPABILITY_PRESERVE_NAMES = "preserve_names"
 
+# Message-wake notification (protocol 5): a host that sees the `message_notify` capability
+# may push `{"type":"notify","kind":"agent_message"}` at any time, and the kernel records the
+# arrival and wakes cells parked in `rlm.wait_messages`. The frame carries no message content:
+# the message itself still enters the parent's conversation as an ordinary queued prompt at
+# the next turn boundary, so a notification never raises into running code.
+MESSAGE_NOTIFY_MIN_PROTOCOL = 5
+CAPABILITY_MESSAGE_NOTIFY = "message_notify"
+NOTIFY_KIND_AGENT_MESSAGE = "agent_message"
+
 
 def kernel_capabilities() -> list[str]:
     """Capability tokens announced in the ready frame.
@@ -89,9 +98,12 @@ def kernel_capabilities() -> list[str]:
     session negotiated down to 3 announces nothing and its frames stay byte-identical to the
     protocol-3 ones.
     """
+    capabilities = []
     if negotiated_protocol() >= PRESERVE_NAMES_MIN_PROTOCOL:
-        return [CAPABILITY_PRESERVE_NAMES]
-    return []
+        capabilities.append(CAPABILITY_PRESERVE_NAMES)
+    if negotiated_protocol() >= MESSAGE_NOTIFY_MIN_PROTOCOL:
+        capabilities.append(CAPABILITY_MESSAGE_NOTIFY)
+    return capabilities
 
 DEFAULT_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
 DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES = 16 * 1024 * 1024
@@ -127,6 +139,12 @@ _pending_host: dict[str, "asyncio.Future[dict[str, Any]]"] = {}
 # Set on the loop thread once stdin hits EOF or a shutdown request arrives; no
 # host reply can arrive after that, so waiting (and future) host_request calls fail.
 _host_closed = False
+
+# Message-wake ledger (protocol 5): agent-message arrivals the host pushed through `notify`
+# requests, not yet consumed by a cell through wait_message_wake. Loop-thread only state:
+# writes arrive via call_soon_threadsafe, reads come from cell code running on the loop.
+_messages_pending = 0
+_message_waiters: set["asyncio.Future[None]"] = set()
 
 # Interrupt bookkeeping shared between the reader thread and the loop thread.
 _interrupt_lock = threading.Lock()
@@ -333,6 +351,11 @@ def _fail_pending_host_requests() -> None:
     for future in _pending_host.values():
         if not future.done():
             future.set_exception(RuntimeError("host connection closed; host_request cannot be answered"))
+    # Message waits have no host reply to fail; wake them as timeouts so a cell parked in
+    # rlm.wait_messages does not hold the queued shutdown.
+    for waiter in list(_message_waiters):
+        if not waiter.done():
+            waiter.set_result(None)
 
 
 def _resolve_host_reply(rid: str, data: dict[str, Any]) -> None:
@@ -367,6 +390,61 @@ def _resolve_host_reply(rid: str, data: dict[str, Any]) -> None:
         )
 
     _loop.call_soon_threadsafe(deliver)
+
+
+def messages_pending() -> int:
+    """Agent-message arrivals not yet consumed by a wait; a peek, never a drain."""
+    return _messages_pending
+
+
+def note_message_wake(count: int = 1) -> None:
+    """Record agent-message arrivals and wake every parked message wait. Loop thread only.
+
+    Every waiter wakes (event semantics); each decides on its own whether the pending count
+    is news. The ledger only grows here - draining is wait_message_wake's job, so a peek
+    through messages_pending() never consumes.
+    """
+    global _messages_pending
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+        return
+    _messages_pending += count
+    for waiter in list(_message_waiters):
+        if not waiter.done():
+            waiter.set_result(None)
+
+
+def _expire_message_wait(waiter: "asyncio.Future[None]") -> None:
+    if not waiter.done():
+        waiter.set_result(None)
+
+
+async def wait_message_wake(timeout_ms: int) -> int:
+    """Wait until an agent-message arrival is pending; drain the ledger and return the count.
+
+    The wake lands at this await point: a notification never raises into running code and
+    never wakes an unrelated wait. ``timeout_ms=0`` is a non-blocking drain; a timeout (or a
+    closed host connection, from which no notification can arrive anymore) returns 0.
+    """
+    global _messages_pending
+    if not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool) or timeout_ms < 0:
+        raise TypeError("timeout_ms must be a non-negative int")
+    if _messages_pending:
+        pending, _messages_pending = _messages_pending, 0
+        return pending
+    if timeout_ms <= 0 or _host_closed:
+        return 0
+    if _loop is None:
+        raise RuntimeError("repl runtime is not serving")
+    waiter: asyncio.Future[None] = _loop.create_future()
+    timer = _loop.call_later(timeout_ms / 1000, _expire_message_wait, waiter)
+    _message_waiters.add(waiter)
+    try:
+        await waiter
+    finally:
+        timer.cancel()
+        _message_waiters.discard(waiter)
+    pending, _messages_pending = _messages_pending, 0
+    return pending
 
 
 class _Pump:
@@ -1888,6 +1966,27 @@ def _protocol_error(message: str) -> None:
     _send({"event": "error", "id": None, "ename": "ProtocolError", "evalue": message, "traceback": []})
 
 
+def _handle_notify(req: dict[str, Any]) -> None:
+    """Reader-thread entry for a message-wake push (protocol 5 `message_notify`).
+
+    Like `host_reply` this never touches the request queue: the cell it must wake IS the
+    in-flight execute. The frame carries a kind, never message content - the message enters
+    the parent's conversation as an ordinary queued prompt at the next turn boundary, so all
+    the kernel records is the arrival. A conforming host gates the frame on the announced
+    capability; one that arrives anyway is still honored (a recorded wake is harmless), and
+    kinds this runtime does not wait on are ignored so a newer host degrades instead of
+    erroring.
+    """
+    assert _loop is not None
+    kind = req.get("kind")
+    if not isinstance(kind, str) or not kind:
+        _protocol_error("notify request needs a non-empty string kind")
+        return
+    if kind != NOTIFY_KIND_AGENT_MESSAGE:
+        return
+    _loop.call_soon_threadsafe(note_message_wake)
+
+
 def _handle_request_line(raw: bytes, queue: asyncio.Queue[dict[str, Any]]) -> None:
     assert _loop is not None
     req = json.loads(raw)
@@ -1909,6 +2008,9 @@ def _handle_request_line(raw: bytes, queue: asyncio.Queue[dict[str, Any]]) -> No
             _resolve_host_reply(rid, data)
         else:
             _protocol_error("host_reply request needs string id and dict data")
+        return
+    if rtype == "notify":
+        _handle_notify(req)
         return
     if not isinstance(rtype, str) or rtype not in _REQUIRED_FIELDS:
         _protocol_error(f"unknown request type: {rtype!r}")

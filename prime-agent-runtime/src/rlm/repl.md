@@ -3,7 +3,7 @@
 `python -m rlm.repl` starts a CPython REPL runtime that executes code cells in
 one persistent `__main__` namespace on a single asyncio event loop. The wire
 format is newline-delimited JSON: one object per line, UTF-8, no other framing.
-The runtime speaks protocol versions `3` and `4`. Which one a process uses is
+The runtime speaks protocol versions `3` through `5`. Which one a process uses is
 negotiated at startup (see [Protocol negotiation](#protocol-negotiation)) and
 announced in the `ready` event.
 
@@ -11,7 +11,7 @@ announced in the `ready` event.
 
 The host may request a version through the `PRIME_AGENT_KERNEL_PROTOCOL`
 environment variable. The runtime clamps the request into
-`[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]` (`[3, 4]`) and reports the result in
+`[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]` (`[3, 5]`) and reports the result in
 its `ready` frame; an unset, unparsable, or out-of-range value degrades to
 `DEFAULT_PROTOCOL_VERSION` (`3`) instead of failing, so an old host or a stale
 venv still boots. Inside the kernel, `rlm.repl.negotiated_protocol()` is the
@@ -31,6 +31,7 @@ corruption — it repairs, which means killing, the kernel:
 | Token | Since | Gates |
 |---|---|---|
 | `preserve_names` | 4 | the snapshot request field `preserve_names` and the `preserved` field of its `done` frame |
+| `message_notify` | 5 | the host may push `notify` requests (see [Message wake](#message-wake)) |
 
 Version 4 also adds one frame kind rather than a request field: `heartbeat`
 (see [Liveness heartbeat](#liveness-heartbeat)), gated on the negotiated version
@@ -61,13 +62,14 @@ it.
 | `execute` | `{"type":"execute","id":str,"code":str}` |
 | `interrupt` | `{"type":"interrupt","id"?:str}` — no reply |
 | `host_reply` | `{"type":"host_reply","id":str,"data":{"status":"ok","result":{...}}}` or an error envelope — no reply |
+| `notify` | `{"type":"notify","kind":str}` — no reply; see [Message wake](#message-wake). Protocol 5 capability `message_notify` |
 | `snapshot` | `{"type":"snapshot","id":str,"path":str,"manifest_path":str,"max_bytes"?:int,"max_variable_bytes"?:int,"prune_oversized"?:bool,"final"?:bool,"preserve_names"?:[str,...]}` — `preserve_names` needs the negotiated protocol 4 and the `preserve_names` capability token; `final` is ungated, a runtime without the snapshot replay shortcut ignores it |
 | `restore` | `{"type":"restore","id":str,"path":str}` |
 | `list_names` | `{"type":"list_names","id":str}` |
 | `shutdown` | `{"type":"shutdown","id"?:str}` |
 
-Requests other than `interrupt` and `host_reply` run strictly in order, one at
-a time. A malformed line
+Requests other than `interrupt`, `host_reply` and `notify` run strictly in
+order, one at a time. A malformed line
 produces `{"event":"error","id":null,"ename":"ProtocolError",...}` and the
 runtime keeps serving. Closing stdin is equivalent to `shutdown`.
 
@@ -223,6 +225,45 @@ blocked in synchronous code cannot be broken (best-effort parity):
 Both paths end with an `error` event (`ename` `KeyboardInterrupt`) and
 `done` with `status:"error"`; the runtime keeps serving. When nothing is
 running or queued, SIGINT and interrupt requests are ignored.
+
+## Message wake
+
+A child reports back with `agent_message.send(..., receiver_role="parent")`. The
+message reaches the parent session while the parent may be parked inside one
+long cell - typically a fan-in loop around a long `rlm.collect` wait - and the
+message itself only enters the parent's conversation as an ordinary queued
+prompt at the next turn boundary. Protocol 5 gives the host a way to tell the
+kernel *that* a message arrived, so a waiting cell can stop waiting:
+
+`{"type":"notify","kind":"agent_message"}` — no reply, handled on the reader
+thread like `host_reply`, never queued behind the in-flight execute it must
+wake. A host sends the frame only when the kernel announced the
+`message_notify` capability; one that arrives anyway is still honored (a
+recorded wake is harmless). The frame carries a kind, never message content.
+
+The kernel records arrivals in a loop-thread ledger and wakes every parked
+`rlm.wait_messages` wait. The cell-facing surface (see the `rlm` package
+docstrings):
+
+- `rlm.messages_pending()` peeks at the unconsumed arrival count.
+- `await rlm.wait_messages(timeout_ms)` drains the ledger: it returns the
+  number of arrivals consumed as soon as one is pending, or `0` on timeout
+  (`timeout_ms=0` is a non-blocking drain). The wake lands at the await point -
+  a notification never raises into running code and never wakes an unrelated
+  wait, and a synchronous section only observes the arrival at its next await.
+- `rlm.collect` asks the host to end its wait early on a message arrival via
+  the `wake_on_message: true` request field. A host that predates message wake
+  ignores the field and the wait behaves exactly as before; a wake-capable host
+  answers with the current snapshots and sets `messages_pending` (true, or the
+  pending count) on the result, which the kernel surfaces as a note printed into
+  the cell's own output plus the same ledger, so the model learns to end its
+  turn and receive the message instead of re-arming a long wait.
+
+A malformed `notify` (missing or non-string `kind`) earns a `ProtocolError`
+event and the runtime keeps serving; a well-formed kind this runtime does not
+wait on is ignored, so a newer host degrades instead of erroring. Arrivals that
+land while no cell runs stay pending for the next wait. Shutdown wakes parked
+message waits as timeouts, so they cannot hold the serve loop.
 
 ## Display bridge
 

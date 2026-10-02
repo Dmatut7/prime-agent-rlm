@@ -107,6 +107,8 @@ for entry in results:
 
 `timeout_ms=0` (the default) is a non-blocking read; a positive value blocks only that call, and a timeout returns the current snapshots instead of failing. Nothing is cancelled by the wait. `terminal_kind` and `stall_abort` say how a settled child actually ended - `status` reads `done` even for a child the stall watchdog killed. See [RLM Runtime Architecture](rlm-runtime.md#typed-fan-in-rlmcollect).
 
+A parked collect also ends early when an agent message arrives for the parent session: the reply then carries `messages_pending` and the cell prints a note saying so. End the turn to receive the message; re-arming a long wait without consuming it waits the full bound again, so there is no instant-answer spin. A cell that only wants the wake itself uses `await rlm.wait_messages(timeout_ms)` (returns the arrivals consumed, `0` on timeout) and `rlm.messages_pending()` (a peek that never drains).
+
 Successfully completed daemon-backed children remain addressable while their parent session is open. Delete a child only when its context is no longer needed:
 
 ```python

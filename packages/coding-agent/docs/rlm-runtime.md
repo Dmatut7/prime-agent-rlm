@@ -118,6 +118,8 @@ spawn(prompt: str, *, name: str, model: str | None = None, thinking: str | None 
 find_models(query: str = "", limit: int = 8)
 list_subagents()
 collect(targets=None, *, timeout_ms=0)
+wait_messages(timeout_ms: int = 0)
+messages_pending()
 delete_subagent(target: RLMSpawnHandle | RLMSubagent | str)
 host_request(request_type: str, payload: dict | None = None)
 RLMSpawnHandle
@@ -199,11 +201,23 @@ The wait is bounded and never destructive:
 - A timeout returns the current snapshots. It does not raise, does not steer the parent, and does not cancel, abort, or delete any child.
 - The host caps one wait just inside its read-only host-request budget (the `agentMessage.targetWaitSeconds` short tier, 60s by default) so a collect can never lose a race with the kernel's own bound and turn into a timeout error. The effective value is returned in the host reply payload as `timeout_ms`, and a shortened wait is logged as `rlm collect wait clamped`.
 - Aborting the cell (Esc) ends the wait the same way: snapshots, not an error.
+- An agent message admitted for the parent session ends the wait early (kernel protocol 5): the host pushes a `notify` frame to the kernel on admission, and a collect asking with `wake_on_message` answers at that point with the current snapshots plus `messages_pending`, which the kernel prints as a note telling the model to end its turn. The message itself still enters the conversation as an ordinary queued prompt at the next turn boundary. Only arrivals newer than the last early answer end a wait, so re-arming a long collect without consuming the reported message waits the full bound instead of spinning. A host or kernel that predates message wake ignores the field and waits exactly as before.
 - A settled child keeps its envelope until it is deleted, so re-collecting after a compaction or a kernel restart costs nothing.
 
 `status` is the raw run status and reads `done` for a child the stall watchdog killed. `terminal_kind` is the classification the child's own terminal path recorded - `stall_killed`, `aborted`, `error`, `cancelled`, `completed_without_reply`, or `none` when the parent already knows - and `stall_abort` carries the watchdog facts (`silent_ms`, `threshold_ms`, `in_flight_tools`, `kernel_reasons`, `settled`). Read those two before trusting a completion. `terminal_kind` is absent while a run is in flight, and for a child whose notice path never ran (a suppressed or explicitly deleted child, or one rehydrated without a run).
 
 `collect` is a read: it is on the cancellable kernel host-request whitelist, so a cell abort cancels the wait and nothing else. Large child outputs still belong in files; the envelope's `answer_preview` is a compact preview, not the child's full result.
+
+## Message Wake (`rlm.wait_messages`)
+
+A cell that only needs to know *that* a reply arrived - not the reply itself - parks on the host's admission ledger instead of polling:
+
+```python
+arrived = await rlm.wait_messages(timeout_ms=30_000)  # arrivals consumed; 0 on timeout
+pending = rlm.messages_pending()                      # a peek; never drains
+```
+
+The wake lands at the await point: a notification never raises into running code. The message content is never delivered here - it enters the parent's conversation as an ordinary queued prompt at the next turn boundary, so the correct reaction to a wake is to end the turn. On the host side the admission path pushes a `notify` frame to the session's kernel (gated on the `message_notify` capability the kernel announces in its `ready` frame; protocol 5), and the kernel records the arrival in a ledger that wakes every parked `wait_messages`. Arrivals that land while no cell runs stay pending for the next wait, and kernel shutdown wakes parked waits as timeouts so they cannot hold the serve loop. The wire contract lives in `prime-agent-runtime/src/rlm/repl.md` ("Message wake").
 
 ## Usage and Cost Attribution
 

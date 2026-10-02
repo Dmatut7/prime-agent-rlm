@@ -119,7 +119,9 @@ describe.skipIf(kernelPythonWithoutHeartbeat)(
 			const manager = newManager();
 			try {
 				await manager.start();
-				expect(manager.negotiatedProtocol).toBe(4);
+				// The default request is the newest protocol this host speaks; the heartbeat
+				// gate only needs >= 4, but the pin keeps a silent downgrade visible.
+				expect(manager.negotiatedProtocol).toBe(5);
 
 				const awaited = await manager.execute(tickProbe(`import asyncio\nawait asyncio.sleep(${CELL_SECONDS})`));
 				expect(awaited.status).toBe("ok");

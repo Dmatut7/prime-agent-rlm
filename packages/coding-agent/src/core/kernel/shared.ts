@@ -648,6 +648,10 @@ export interface KernelClient {
 	readonly hostRequestOldestAgeMs?: number;
 	/** Whether a cell is executing right now. */
 	readonly hasActiveExecution?: boolean;
+	/** True while the running kernel announced protocol-5 message wake (`message_notify`). */
+	readonly supportsMessageNotify?: boolean;
+	/** Best-effort protocol-5 `notify` frame for an admitted agent message; resolves false when unsupported/undeliverable; never throws. */
+	notifyAgentMessageArrived?(): Promise<boolean>;
 	/** Kernel process id while the child is alive. */
 	readonly kernelPid?: number;
 	/** Whether the newest heartbeat reports live bash handles; false when it reports none. */

@@ -51,7 +51,7 @@ describe("ENG-4649 subagent model selection", () => {
 
 			expect(result.model).toBe(`${provider}/model-319`);
 			await vi.waitFor(async () => {
-				const childEntry = (await harness.session.listRlmSubagents()).subagents[0];
+				const childEntry = (await harness.session.listRlmSubagents({ includeTerminal: true })).subagents[0];
 				expect(childEntry?.status).toBe("completed");
 				expect(harness.session.getRlmChildSession(childEntry!.rlm_child_id)?.model?.id).toBe("model-319");
 			});
@@ -187,7 +187,9 @@ describe("ENG-4649 subagent model selection", () => {
 			});
 			expect(result.model).toBe(`${codexProvider}/parent-model`);
 			await vi.waitFor(async () => {
-				expect((await harness.session.listRlmSubagents()).subagents[0]?.status).toBe("completed");
+				expect((await harness.session.listRlmSubagents({ includeTerminal: true })).subagents[0]?.status).toBe(
+					"completed",
+				);
 			});
 		} finally {
 			vi.unstubAllGlobals();
@@ -212,7 +214,7 @@ describe("ENG-4649 subagent model selection", () => {
 			expect(result.model).toBe(`${codexProvider}/parent-model`);
 			await vi.waitFor(
 				async () => {
-					const childEntry = (await harness.session.listRlmSubagents()).subagents[0];
+					const childEntry = (await harness.session.listRlmSubagents({ includeTerminal: true })).subagents[0];
 					expect(childEntry?.status).toBe("completed");
 					expect(harness.session.getRlmChildSession(childEntry!.rlm_child_id)?.model?.id).toBe("parent-model");
 				},
@@ -322,9 +324,11 @@ describe("ENG-4649 subagent model selection", () => {
 				model: `${provider}/child-model`,
 			});
 			await vi.waitFor(async () => {
-				expect((await harness.session.listRlmSubagents()).subagents[0]?.status).toBe("completed");
+				expect((await harness.session.listRlmSubagents({ includeTerminal: true })).subagents[0]?.status).toBe(
+					"completed",
+				);
 			});
-			const childEntry = (await harness.session.listRlmSubagents()).subagents[0];
+			const childEntry = (await harness.session.listRlmSubagents({ includeTerminal: true })).subagents[0];
 			const child = harness.session.getRlmChildSession(childEntry!.rlm_child_id);
 			expect(child?.model?.id).toBe("child-model");
 			expect(child?.thinkingLevel).toBe("off");
@@ -369,7 +373,7 @@ describe("ENG-4649 subagent model selection", () => {
 				thinking,
 			});
 			await vi.waitFor(async () => {
-				const childEntry = (await harness.session.listRlmSubagents()).subagents[0];
+				const childEntry = (await harness.session.listRlmSubagents({ includeTerminal: true })).subagents[0];
 				const child = harness.session.getRlmChildSession(childEntry!.rlm_child_id);
 				expect(child?.thinkingLevel).toBe(thinking);
 			});
@@ -392,7 +396,7 @@ describe("ENG-4649 subagent model selection", () => {
 
 			await harness.session.runRlmChild("inherit effort", { model: `${provider}/child-model` });
 			await vi.waitFor(async () => {
-				const childEntry = (await harness.session.listRlmSubagents()).subagents[0];
+				const childEntry = (await harness.session.listRlmSubagents({ includeTerminal: true })).subagents[0];
 				const child = harness.session.getRlmChildSession(childEntry!.rlm_child_id);
 				expect(child?.thinkingLevel).toBe("high");
 			});
@@ -514,7 +518,7 @@ describe("ENG-4649 subagent model selection", () => {
 
 			expect(result.model).toBe(`${provider}/z-ai/glm-5.3`);
 			await vi.waitFor(async () => {
-				const childEntry = (await harness.session.listRlmSubagents()).subagents[0];
+				const childEntry = (await harness.session.listRlmSubagents({ includeTerminal: true })).subagents[0];
 				expect(childEntry?.status).toBe("completed");
 				expect(harness.session.getRlmChildSession(childEntry!.rlm_child_id)?.model?.id).toBe("z-ai/glm-5.3");
 			});

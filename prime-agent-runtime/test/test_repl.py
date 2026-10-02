@@ -2366,17 +2366,19 @@ class ProtocolNegotiationTest(unittest.TestCase):
             ("2", 3),
             ("3", 3),
             ("4", 4),
-            ("9", 4),
+            ("5", 5),
+            ("9", 5),
             (3, 3),
             (4, 4),
+            (5, 5),
         ]
         self.assertGreater(len(cases), 0)
         for raw, expected in cases:
             with self.subTest(raw=raw):
                 self.assertEqual(repl_module.resolve_protocol_version(raw), expected)
-        # The advertised ceiling moved to 4 while the default stayed at 3: an old host that
+        # The advertised ceiling moved to 5 while the default stayed at 3: an old host that
         # never sets the variable keeps getting the protocol it understands.
-        self.assertEqual(repl_module.PROTOCOL_VERSION, 4)
+        self.assertEqual(repl_module.PROTOCOL_VERSION, 5)
         self.assertEqual(repl_module.MIN_PROTOCOL_VERSION, 3)
         self.assertEqual(repl_module.DEFAULT_PROTOCOL_VERSION, 3)
         self.assertEqual(repl_module.PROTOCOL_ENV_VAR, "PRIME_AGENT_KERNEL_PROTOCOL")
@@ -2405,7 +2407,7 @@ class ProtocolNegotiationTest(unittest.TestCase):
         self.assertEqual(repl.shutdown(), 0)
 
     def test_out_of_range_or_unparsable_request_degrades_instead_of_failing(self):
-        for requested, expected in [("9", 4), ("1", 3), ("nonsense", 3)]:
+        for requested, expected in [("9", 5), ("1", 3), ("nonsense", 3)]:
             with self.subTest(requested=requested):
                 ready, _ = self.spawn(requested).ready()
                 self.assertEqual(ready["protocol"], expected)

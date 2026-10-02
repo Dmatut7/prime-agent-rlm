@@ -317,7 +317,7 @@ class RlmCollectTest(unittest.TestCase):
         self.assertIsNone(running.answer_preview)
         self.assertEqual(running.activity_kind, "executing")
         self.assertIsNone(running.terminal_kind)
-        host_request.assert_awaited_once_with("rlm.collect", {"targets": [], "timeout_ms": 0})
+        host_request.assert_awaited_once_with("rlm.collect", {"targets": [], "timeout_ms": 0, "wake_on_message": True})
 
     def test_collect_exposes_stall_watchdog_facts(self) -> None:
         """Fork enhancement: a watchdog kill must be distinguishable from a no-reply finish."""
@@ -363,7 +363,7 @@ class RlmCollectTest(unittest.TestCase):
         self.assertEqual(stall.kernel_reasons, ("no_kernel_heartbeat",))
         self.assertTrue(stall.settled)
         host_request.assert_awaited_once_with(
-            "rlm.collect", {"targets": ["stall-worker"], "timeout_ms": 1000}
+            "rlm.collect", {"targets": ["stall-worker"], "timeout_ms": 1000, "wake_on_message": True}
         )
 
     def test_collect_normalizes_spawn_handles_and_names(self) -> None:
@@ -388,7 +388,7 @@ class RlmCollectTest(unittest.TestCase):
 
         self.assertEqual(results, [])
         host_request.assert_awaited_once_with(
-            "rlm.collect", {"targets": ["sub-h1", "sub-r1", "worker-b"], "timeout_ms": 250}
+            "rlm.collect", {"targets": ["sub-h1", "sub-r1", "worker-b"], "timeout_ms": 250, "wake_on_message": True}
         )
 
     def test_collect_accepts_a_single_target(self) -> None:
@@ -397,7 +397,7 @@ class RlmCollectTest(unittest.TestCase):
         with patch.object(rlm_module, "host_request", host_request):
             asyncio.run(rlm_module.rlm.collect("worker-b"))
 
-        host_request.assert_awaited_once_with("rlm.collect", {"targets": ["worker-b"], "timeout_ms": 0})
+        host_request.assert_awaited_once_with("rlm.collect", {"targets": ["worker-b"], "timeout_ms": 0, "wake_on_message": True})
 
     def test_collect_accepts_single_spawn_handle_and_subagent_row(self) -> None:
         handle = rlm_module.RLMSpawnHandle(
@@ -422,7 +422,7 @@ class RlmCollectTest(unittest.TestCase):
 
             self.assertEqual(results, [])
             host_request.assert_awaited_once_with(
-                "rlm.collect", {"targets": [expected_selector], "timeout_ms": 0}
+                "rlm.collect", {"targets": [expected_selector], "timeout_ms": 0, "wake_on_message": True}
             )
 
     def test_collect_validates_arguments(self) -> None:

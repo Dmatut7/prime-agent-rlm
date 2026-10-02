@@ -130,6 +130,22 @@ export interface RlmCollectResult {
 	results: RlmCollectResultEntry[];
 }
 
+/**
+ * The session's agent-message arrival ledger, exposed to a wake-capable collect
+ * (kernel protocol 5 `wake_on_message`). The count is monotonic for the session's
+ * lifetime; a parked wait resolves once the count advances past the caller's marker.
+ */
+export interface RlmCollectMessageWakeSource {
+	/** Agent messages admitted for this session so far. */
+	arrivalCount(): number;
+	/**
+	 * Resolve true once the arrival count exceeds `since`; false on timeout or abort.
+	 * An abort is the collect ending for its own reason (deadline, cell interrupt, or a
+	 * settled child) and never makes this wait reject.
+	 */
+	waitForArrival(since: number, timeoutMs: number, signal?: AbortSignal): Promise<boolean>;
+}
+
 export type RlmCollectHandler = (
 	targets: string[],
 	timeoutMs: number,
@@ -462,6 +478,12 @@ export interface CreateRlmCollectHostHandlerOptions {
 	maxWaitMs?: () => number | undefined;
 	/** Reported when a requested wait was cut down to that bound. */
 	onClamped?: (facts: { requestedMs: number; effectiveMs: number }) => void;
+	/**
+	 * The session's arrival ledger behind the protocol-5 `wake_on_message` request
+	 * field. Absent means this host never ends a collect early for a message: a
+	 * kernel that asks for the wake gets exactly the pre-protocol-5 wait.
+	 */
+	messageWake?: RlmCollectMessageWakeSource;
 }
 
 /**
@@ -476,6 +498,14 @@ export function createRlmCollectHostHandler(
 	handler: RlmCollectHandler,
 	options?: CreateRlmCollectHostHandlerOptions,
 ): HostRequestHandler {
+	/**
+	 * The anti-spin gate behind `wake_on_message`: only an arrival newer than the
+	 * last early answer may end a wait. Without it a model that re-arms a long
+	 * collect without consuming the reported message would be answered immediately
+	 * again, forever - an instant-answer spin that still burns one model round-trip
+	 * per lap.
+	 */
+	let lastMessageWakeAnsweredCount = 0;
 	return async (payload, signal) => {
 		const rawTargets = payload.targets;
 		if (rawTargets !== undefined && rawTargets !== null && !Array.isArray(rawTargets)) {
@@ -500,13 +530,69 @@ export function createRlmCollectHostHandler(
 				);
 			}
 		}
+		const rawWakeOnMessage = payload.wake_on_message;
+		if (rawWakeOnMessage !== undefined && rawWakeOnMessage !== null && typeof rawWakeOnMessage !== "boolean") {
+			throw new Error("rlm.collect wake_on_message must be a boolean");
+		}
 		const requestedMs = typeof rawTimeout === "number" ? rawTimeout : 0;
 		const timeoutMs = clampRlmCollectWaitMs(requestedMs, options?.maxWaitMs?.());
 		if (timeoutMs !== requestedMs) {
 			options?.onClamped?.({ requestedMs, effectiveMs: timeoutMs });
 		}
-		const { results } = await handler(targets, timeoutMs, signal);
-		return { results, timeout_ms: timeoutMs };
+		// The wake path only applies to an actual parked wait: a non-blocking read has
+		// nothing to cut short, and an already-aborted request must not start one.
+		const messageWake =
+			rawWakeOnMessage === true && timeoutMs > 0 && !signal?.aborted ? options?.messageWake : undefined;
+		if (messageWake === undefined) {
+			const { results } = await handler(targets, timeoutMs, signal);
+			return { results, timeout_ms: timeoutMs };
+		}
+		const since = lastMessageWakeAnsweredCount;
+		// The collect and the arrival wait share one derived signal: an arrival aborts it
+		// to end the settlement wait early (the collect's abort path returns the current
+		// snapshots), and the request's own abort - a cell interrupt - propagates through
+		// it. The original signal stays the handler's identity only on the plain path.
+		const wakeController = new AbortController();
+		const abortFromRequest = () => {
+			wakeController.abort(signal?.reason instanceof Error ? signal.reason : new Error("rlm.collect aborted"));
+		};
+		if (signal) signal.addEventListener("abort", abortFromRequest, { once: true });
+		const collectPromise = handler(targets, timeoutMs, wakeController.signal).then(
+			(value) => ({ ok: true as const, value }),
+			(error: unknown) => ({ ok: false as const, error }),
+		);
+		const wakePromise = messageWake.waitForArrival(since, timeoutMs, wakeController.signal).then(
+			(arrived) => {
+				// A request abort racing an arrival wins: the cell is gone, so this is not a
+				// reportable wake, and the gate marker must stay put so the next wait still
+				// reports the message that never got announced.
+				const woken = arrived === true && !signal?.aborted;
+				if (woken) wakeController.abort(new Error("rlm.collect ended early: an agent message arrived"));
+				return woken;
+			},
+			() => false,
+		);
+		try {
+			const outcome = await collectPromise;
+			// Release the arrival waiter when the wait ended for its own reason (deadline,
+			// settled children, abort): it must not hold its listener until its own timeout.
+			if (!wakeController.signal.aborted) wakeController.abort(new Error("rlm.collect ended"));
+			const woken = await wakePromise;
+			if (!outcome.ok) throw outcome.error;
+			if (!woken) return { results: outcome.value.results, timeout_ms: timeoutMs };
+			const pendingNow = Math.max(since, messageWake.arrivalCount());
+			lastMessageWakeAnsweredCount = pendingNow;
+			return {
+				results: outcome.value.results,
+				timeout_ms: timeoutMs,
+				// The kernel mirrors this into the cell's output as "N message(s) pending; end
+				// the turn to receive them", so the number is the news this answer carries -
+				// arrivals since the last early answer, never the session's whole backlog.
+				messages_pending: Math.max(1, pendingNow - since),
+			};
+		} finally {
+			if (signal) signal.removeEventListener("abort", abortFromRequest);
+		}
 	};
 }
 

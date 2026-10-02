@@ -109,7 +109,7 @@ import { claimKernelVenvBootSync, recordKernelVenvInUseSync, releaseKernelVenvIn
 /** Newest kernel protocol this host speaks, and the one it asks the kernel for. */
 const kernelLog = getLogger("coding-agent.kernel");
 
-const REPL_PROTOCOL_VERSION = 4;
+const REPL_PROTOCOL_VERSION = 5;
 /**
  * Oldest kernel protocol this host still serves. The handshake is a range, not an
  * exact match: a venv whose runtime predates a protocol addition reports the older
@@ -118,6 +118,22 @@ const REPL_PROTOCOL_VERSION = 4;
 const REPL_PROTOCOL_VERSION_MIN = 3;
 /** Protocol that introduced gated frames (heartbeat, snapshot `preserve_names`). */
 const KERNEL_PROTOCOL_V4 = 4;
+/**
+ * Protocol that introduced the host→kernel `notify` request frame (message wake). The
+ * frame carries no reply and is handled on the kernel's reader thread, so the one wait
+ * it must interrupt - the in-flight execute - never has to finish first.
+ */
+const KERNEL_PROTOCOL_V5 = 5;
+/**
+ * Capability token a kernel announces for protocol-5 message wake: the host may push
+ * `notify` frames telling it an agent message was admitted for this session. Gated on
+ * the kernel's own token, never the version alone - the same rule as preserve_names.
+ * Kept in this file (not shared.ts) so the token ships with the only writer of the
+ * frame; the kernel side names it CAPABILITY_MESSAGE_NOTIFY.
+ */
+const KERNEL_CAPABILITY_MESSAGE_NOTIFY = "message_notify";
+/** The one notify kind this host sends; a kind the runtime does not wait on is ignored. */
+const KERNEL_NOTIFY_KIND_AGENT_MESSAGE = "agent_message";
 /**
  * Negotiation variable. The host only sets it when nobody else did, so
  * `export PRIME_AGENT_KERNEL_PROTOCOL=3` stays a working rollback for every gated
@@ -490,6 +506,14 @@ export class ReplKernelManager {
 	/** Capability tokens from the current child's ready frame; empty until it arrives. */
 	private announcedKernelCapabilities: string[] = [];
 	/**
+	 * The message-wake bit of the same handshake: negotiated protocol 5 AND the kernel's
+	 * own `message_notify` token. Kept apart from {@link negotiatedCapabilities} (its type
+	 * is shared.ts's `KernelCapabilities`) but assigned and cleared in lockstep with it,
+	 * so a gated `notify` frame never goes out on the strength of a previous incarnation's
+	 * negotiation either.
+	 */
+	private messageNotifySupported = false;
+	/**
 	 * Protocol the current child announced in its `ready` frame, captured synchronously by the
 	 * frame loop. `negotiatedCapabilities` is only assigned once `waitForReady` has resolved, so a
 	 * gated frame that shares the ready frame's stdout chunk would otherwise be judged against
@@ -671,6 +695,15 @@ export class ReplKernelManager {
 	/** Protocol capabilities agreed at the ready handshake; undefined until ready. */
 	get kernelCapabilities(): KernelCapabilities | undefined {
 		return this.negotiatedCapabilities;
+	}
+
+	/**
+	 * True while the running kernel announced protocol-5 message wake (`message_notify`).
+	 * Gates every `notify` frame: a runtime that predates the frame kind would answer it
+	 * with a ProtocolError, so the version number alone never authorizes one.
+	 */
+	get supportsMessageNotify(): boolean {
+		return this.messageNotifySupported;
 	}
 
 	/** Protocol version the running kernel announced; undefined until ready. */
@@ -1222,6 +1255,9 @@ export class ReplKernelManager {
 					protocol >= KERNEL_PROTOCOL_V4 &&
 					this.announcedKernelCapabilities.includes(KERNEL_CAPABILITY_PRESERVE_NAMES),
 			};
+			this.messageNotifySupported =
+				protocol >= KERNEL_PROTOCOL_V5 &&
+				this.announcedKernelCapabilities.includes(KERNEL_CAPABILITY_MESSAGE_NOTIFY);
 		} catch (e) {
 			// Both exits report through `startupFailureError`: a kernel that dies before it is ready
 			// tears itself down first (which makes this start stale), so the budget fact would
@@ -2749,6 +2785,31 @@ export class ReplKernelManager {
 		await this.writeLine({ type: "interrupt", id: requestId });
 	}
 
+	/**
+	 * Tell the kernel an agent message was admitted for this session (protocol-5
+	 * `notify` frame). Fire-and-forget like the frame itself: the kernel never replies,
+	 * so there is nothing to await beyond the write. Best effort - a kernel without the
+	 * capability, or one whose stdin is already gone, resolves false, and the message
+	 * still enters the conversation at the next turn boundary either way; the wake only
+	 * tells a parked wait (`rlm.wait_messages`, a `wake_on_message` collect) to stop
+	 * waiting. Never throws into the admission path.
+	 */
+	async notifyAgentMessageArrived(): Promise<boolean> {
+		if (!this.messageNotifySupported) return false;
+		try {
+			await this.writeLine({ type: "notify", kind: KERNEL_NOTIFY_KIND_AGENT_MESSAGE });
+			return true;
+		} catch (error) {
+			// The frame is a hint, so its loss is not a warning on its own: a dying kernel
+			// already reports itself, and the admission it announced is durable regardless.
+			kernelLog.debug("kernel message-wake notify frame was not delivered", {
+				error: errorMessage(error),
+				sessionId: this.options.sessionId,
+			});
+			return false;
+		}
+	}
+
 	private cleanupResources(
 		killSignal: NodeJS.Signals = "SIGTERM",
 		options: { keepHostRequests?: boolean; keepBackgroundOutput?: boolean; activeExecutionError?: Error } = {},
@@ -2783,6 +2844,7 @@ export class ReplKernelManager {
 		// this list, so the clear is hygiene, not correctness — but a future reader must
 		// never be able to combine a new negotiation with a previous child's announcement.
 		this.announcedKernelCapabilities = [];
+		this.messageNotifySupported = false;
 		this.readyAnnouncedProtocol = undefined;
 		// Liveness facts belong to the child that reported them: a replacement kernel must earn
 		// its own first frame before anything vouches for it again, and a rejection streak from a

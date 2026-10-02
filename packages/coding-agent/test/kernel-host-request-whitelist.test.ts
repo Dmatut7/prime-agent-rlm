@@ -36,6 +36,7 @@ describe("cancellable kernel host request whitelist (P1-2a)", () => {
 		const sideEffecting = [
 			"rlm.run", // admits a child that must outlive the turn (M7)
 			"rlm.delete_subagent", // deletes a child and its artifacts
+			"rlm.prune_subagents", // retires terminal children from the roster views
 			"agent_message.send", // delivers a message the recipient may act on
 			"goal.create",
 			"goal.complete",
