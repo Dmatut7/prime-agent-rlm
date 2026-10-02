@@ -14,19 +14,21 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-02 晚，wave-19 已 SHIP，CI 修复随波）
+## 当前状态（2026-10-03 凌晨，wave-20 已 SHIP）
 
-- HEAD = 见 git log（九批 + 本文档批）。wave-19 = 十二路大扇出（8 建造 + 4 侦察）。
-- 落地：探测总线阶段 3+4；环境假失败清零（ollama 真跳过、image-model 限定名——8 例环境漂移销账）；
-  W18-A 遗留两项（lapse 语义论证保留+注释、coordinator 擦标记）；D10 答案源哈希轨；双击 Esc 预选
-  最近用户消息；F1 菜单命令不再静默拼回草稿（/settings 保留测试钉住的恢复语义）；F2 前置标志后
-  的命令字识别；shortenPath 收敛 + edit 耐久性（fsync）；footer.sessionSpend 可选花费段；
-  DaemonSupervisor.handleCommand 表化（914 行 cc=230 → 30 行 dispatch+注册表，逐 token 守恒）。
-- CI 红修复：wave-18 的 4c5a83ad3 CI 红 = unhandled rejection（fixture daemon 无 socketPath 时
-  log() 扔 TypeError 吃掉 catch 链），daemon-mode.ts log 加守卫；本地 suite 复扫 EXIT 0。
-- 侦察：记忆提示词效果首读样本太少（n=1），继续观察；走查复验 wave-12/13 修复全生效；
-  老板今日信号：P1 想搞清 GLM 工具出错类别（wave-11 熔断射程外的类别待分类立项）、P2 弃用
-  claude-code 提供商；调研新增 Codex 0.162 四条 + Gemini 一条（进 Backlog-9/12 参照）。
+- HEAD = 见 git log。wave-20 八路：daemon 双 switch 表化（digest 原位重算 381c9c9e5e17，无 wire
+  变更）、GLM 错误分类+校验失败入熔断、考题例行跑 7/7、双遥测复读、流式设计稿、探测总线阶段 5、
+  调研刷新、痛点快扫。
+- 老板新痛点（插队）：「你代理用完了怎么不关」——completed 子代理不从注册表回收，wave-21 立项
+  修（优先）。另：老板对威胁评估夸大三连怼——派单模板需「威胁贴实际配置」纪律句。
+- 新发现内核缺口：子→父 agent_message 只在父代 cell 边界投递，长 cell 会饿死扇入直到屏障放弃
+  （EX-6 首跑 FAIL 实证）；wave-21 候选：等待中被消息唤醒。
+- 遥测现状：wave-17 提示词层上线后老板零新会话（他还没用），记忆使用率无数据；compaction 交接
+  上线后零压缩事件。两个扫描器在 /tmp/wave20/ 可复跑。
+- 文档-3 销账大半：主链路 9-15 已修（2.64GB→3.6MB），剩余 R1（legacy attach 腿）/R3（流中
+  markdown 永不缓存 O(n²)）按 streaming-resend-design.md 施工。
+- 环境纪律事故：考题 lane 往真实 ~/.prime/supervisor-owners 写了墓碑——已清，examlib+runner
+  已加 registry 隔离闸（PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR）。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -103,14 +105,11 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-20 候选）
+## 下一波主题（wave-21 候选）
 
-1. AgentDaemon.handleCommand 表化（daemon-mode.ts:4716，cc=141，101 case）+ handleWorkerFrame
-   （cc=151）——同 W19-B8 模式；注意 Object.create harness 形态的懒初始化注册表先例。
-2. GLM 工具出错分类（老板 P1：「GLM 为什么老是调用工具出错」——从 01a0f7f8 会话取原始记录分类，
-   落在 wave-11 熔断射程外的类别立项修）。
-3. 记忆阶段 2（digest 两层重构）——等提示词层遥测积累（至少一天会话量）。
-4. 探测总线阶段 5-6（2031 配色推送、kitty 图片占位符）+ 真机复核登记。
-5. Backlog：文档-3 流式全量重发设计（新增同行佐证 Codex #50207 + Gemini #29568）；
-   compaction 交接的生产命中率复核；exam v1.4（manifest 防读侧）。
-6. win32 四条登记项（文档-6）与安全簇（先问老板）。
+1. 【老板痛点·插队】completed 子代理自动回收/清理入口（rlm.prune_subagents 或会话收尾清册）。
+2. 【内核健壮性】子→父消息唤醒等待中的父 cell（修 EX-6 暴露的长 cell 扇入饿死）。
+3. 流式 R1+R3 施工（streaming-resend-design.md：监控 attach 声明能力 + 流中 markdown 行级密封）。
+4. 记忆阶段 2（等遥测）；compaction 交接生产命中率复核（有生产压缩事件后）。
+5. 探测总线阶段 6（kitty 图片占位符）+ 真机复核。
+6. GLM 长上下文压缩阈值评估（P3，需老板拍板：35 万 token 区 GLM 乱码率高发）。
