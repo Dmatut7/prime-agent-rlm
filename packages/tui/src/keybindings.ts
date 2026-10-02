@@ -1,4 +1,4 @@
-import { type KeyId, matchesKey } from "./keys.js";
+import { isKeyRepeat, type KeyId, matchesKey } from "./keys.js";
 
 /**
  * Global keybinding registry.
@@ -60,124 +60,196 @@ export interface KeybindingDefinition {
 	defaultKeys: KeyId | KeyId[];
 	description?: string;
 	defaultKeyScope?: string;
+	/**
+	 * Opt in to Kitty key-repeat events. Actions are press-only by default so a
+	 * held toggle flips once instead of ping-ponging at the auto-repeat rate;
+	 * hold-to-repeat keys (viewport scroll, cursor movement, deletion) set this.
+	 */
+	repeatable?: boolean;
 }
 
 export type KeybindingDefinitions = Record<string, KeybindingDefinition>;
 export type KeybindingsConfig = Record<string, KeyId | KeyId[] | undefined>;
 
 export const TUI_KEYBINDINGS = {
-	"tui.editor.cursorUp": { defaultKeys: "up", description: "Move cursor up", defaultKeyScope: "editor" },
-	"tui.editor.cursorDown": { defaultKeys: "down", description: "Move cursor down", defaultKeyScope: "editor" },
+	"tui.editor.cursorUp": {
+		defaultKeys: "up",
+		description: "Move cursor up",
+		defaultKeyScope: "editor",
+		repeatable: true,
+	},
+	"tui.editor.cursorDown": {
+		defaultKeys: "down",
+		description: "Move cursor down",
+		defaultKeyScope: "editor",
+		repeatable: true,
+	},
 	"tui.editor.cursorLeft": {
 		defaultKeys: ["left", "ctrl+b"],
 		description: "Move cursor left",
 		defaultKeyScope: "editor",
+		repeatable: true,
 	},
 	"tui.editor.cursorRight": {
 		defaultKeys: ["right", "ctrl+f"],
 		description: "Move cursor right",
 		defaultKeyScope: "editor",
+		repeatable: true,
 	},
 	"tui.editor.cursorWordLeft": {
 		defaultKeys: ["alt+left", "ctrl+left", "alt+b"],
 		description: "Move cursor word left",
 		defaultKeyScope: "editor",
+		repeatable: true,
 	},
 	"tui.editor.cursorWordRight": {
 		defaultKeys: ["alt+right", "ctrl+right", "alt+f"],
 		description: "Move cursor word right",
 		defaultKeyScope: "editor",
+		repeatable: true,
 	},
 	"tui.editor.cursorLineStart": {
 		defaultKeys: ["home", "ctrl+a"],
 		description: "Move to line start",
 		defaultKeyScope: "editor",
+		repeatable: true,
 	},
 	"tui.editor.cursorLineEnd": {
 		defaultKeys: ["end", "ctrl+e"],
 		description: "Move to line end",
 		defaultKeyScope: "editor",
+		repeatable: true,
 	},
 	"tui.editor.jumpForward": {
 		defaultKeys: "ctrl+]",
 		description: "Jump forward to character",
 		defaultKeyScope: "editor",
+		repeatable: true,
 	},
 	"tui.editor.jumpBackward": {
 		defaultKeys: "ctrl+alt+]",
 		description: "Jump backward to character",
 		defaultKeyScope: "editor",
+		repeatable: true,
 	},
-	"tui.editor.pageUp": { defaultKeys: "pageUp", description: "Page up", defaultKeyScope: "editor" },
-	"tui.editor.pageDown": { defaultKeys: "pageDown", description: "Page down", defaultKeyScope: "editor" },
+	"tui.editor.pageUp": {
+		defaultKeys: "pageUp",
+		description: "Page up",
+		defaultKeyScope: "editor",
+		repeatable: true,
+	},
+	"tui.editor.pageDown": {
+		defaultKeys: "pageDown",
+		description: "Page down",
+		defaultKeyScope: "editor",
+		repeatable: true,
+	},
 	"tui.editor.deleteCharBackward": {
 		defaultKeys: ["backspace", "shift+backspace"],
 		description: "Delete character backward",
 		defaultKeyScope: "editor",
+		repeatable: true,
 	},
 	"tui.editor.deleteCharForward": {
 		defaultKeys: ["delete", "ctrl+d", "shift+delete"],
 		description: "Delete character forward",
 		defaultKeyScope: "editor",
+		repeatable: true,
 	},
 	"tui.editor.deleteWordBackward": {
 		defaultKeys: ["ctrl+w", "alt+backspace"],
 		description: "Delete word backward",
 		defaultKeyScope: "editor",
+		repeatable: true,
 	},
 	"tui.editor.deleteWordForward": {
 		defaultKeys: ["alt+d", "alt+delete"],
 		description: "Delete word forward",
 		defaultKeyScope: "editor",
+		repeatable: true,
 	},
 	"tui.editor.deleteToLineStart": {
 		defaultKeys: "ctrl+u",
 		description: "Delete to line start",
 		defaultKeyScope: "editor",
+		repeatable: true,
 	},
 	"tui.editor.deleteToLineEnd": {
 		defaultKeys: "ctrl+k",
 		description: "Delete to line end",
 		defaultKeyScope: "editor",
+		repeatable: true,
 	},
-	"tui.editor.yank": { defaultKeys: "ctrl+y", description: "Yank", defaultKeyScope: "editor" },
-	"tui.editor.yankPop": { defaultKeys: "alt+y", description: "Yank pop", defaultKeyScope: "editor" },
-	"tui.editor.undo": { defaultKeys: "ctrl+-", description: "Undo", defaultKeyScope: "editor" },
+	"tui.editor.yank": {
+		defaultKeys: "ctrl+y",
+		description: "Yank",
+		defaultKeyScope: "editor",
+		repeatable: true,
+	},
+	"tui.editor.yankPop": {
+		defaultKeys: "alt+y",
+		description: "Yank pop",
+		defaultKeyScope: "editor",
+		repeatable: true,
+	},
+	"tui.editor.undo": {
+		defaultKeys: "ctrl+-",
+		description: "Undo",
+		defaultKeyScope: "editor",
+		repeatable: true,
+	},
 	"tui.editor.insertSpace": {
 		defaultKeys: "shift+space",
 		description: "Insert a space (shifted space)",
 		defaultKeyScope: "editor",
+		repeatable: true,
 	},
 	"tui.input.newLine": {
 		defaultKeys: "shift+enter",
 		description: "Insert newline",
 		defaultKeyScope: "editor",
+		repeatable: true,
 	},
 	"tui.input.submit": { defaultKeys: "enter", description: "Submit input", defaultKeyScope: "editor" },
-	"tui.input.tab": { defaultKeys: "tab", description: "Tab / autocomplete", defaultKeyScope: "editor" },
-	"tui.input.copy": { defaultKeys: "ctrl+c", description: "Copy selection", defaultKeyScope: "editor" },
+	"tui.input.tab": {
+		defaultKeys: "tab",
+		description: "Tab / autocomplete",
+		defaultKeyScope: "editor",
+		repeatable: true,
+	},
+	"tui.input.copy": {
+		defaultKeys: "ctrl+c",
+		description: "Copy selection",
+		defaultKeyScope: "editor",
+		repeatable: true,
+	},
 	"tui.viewport.pageUp": {
 		defaultKeys: "pageUp",
 		description: "Scroll transcript up a page (fullscreen)",
+		repeatable: true,
 	},
 	"tui.viewport.pageDown": {
 		defaultKeys: "pageDown",
 		description: "Scroll transcript down a page (fullscreen)",
+		repeatable: true,
 	},
 	"tui.viewport.top": {
 		defaultKeys: "shift+alt+up",
 		description: "Scroll transcript to top (fullscreen)",
+		repeatable: true,
 	},
 	"tui.viewport.follow": {
 		defaultKeys: "ctrl+shift+down",
 		description: "Scroll to bottom and follow output (fullscreen)",
+		repeatable: true,
 	},
-	"tui.select.up": { defaultKeys: "up", description: "Move selection up" },
-	"tui.select.down": { defaultKeys: "down", description: "Move selection down" },
-	"tui.select.pageUp": { defaultKeys: "pageUp", description: "Selection page up" },
+	"tui.select.up": { defaultKeys: "up", description: "Move selection up", repeatable: true },
+	"tui.select.down": { defaultKeys: "down", description: "Move selection down", repeatable: true },
+	"tui.select.pageUp": { defaultKeys: "pageUp", description: "Selection page up", repeatable: true },
 	"tui.select.pageDown": {
 		defaultKeys: "pageDown",
 		description: "Selection page down",
+		repeatable: true,
 	},
 	"tui.select.confirm": { defaultKeys: "enter", description: "Confirm selection" },
 	"tui.select.cancel": {
@@ -185,8 +257,8 @@ export const TUI_KEYBINDINGS = {
 		description: "Cancel selection",
 	},
 	"tui.select.toggle": { defaultKeys: "space", description: "Toggle or activate the selected item" },
-	"tui.select.upSecondary": { defaultKeys: "k", description: "Move selection up (secondary)" },
-	"tui.select.downSecondary": { defaultKeys: "j", description: "Move selection down (secondary)" },
+	"tui.select.upSecondary": { defaultKeys: "k", description: "Move selection up (secondary)", repeatable: true },
+	"tui.select.downSecondary": { defaultKeys: "j", description: "Move selection down (secondary)", repeatable: true },
 	"tui.debug.dump": { defaultKeys: "shift+ctrl+d", description: "Dump TUI debug information" },
 	// Deliberately no defaultKeyScope: the stall action bar is up while a turn
 	// is streaming and the editor is not necessarily focused, so the host
@@ -275,6 +347,7 @@ export class KeybindingsManager {
 	}
 
 	matches(data: string, keybinding: Keybinding): boolean {
+		if (isKeyRepeat(data) && !this.definitions[keybinding]?.repeatable) return false;
 		const keys = this.keysById.get(keybinding) ?? [];
 		for (const key of keys) {
 			if (matchesKey(data, key)) return true;

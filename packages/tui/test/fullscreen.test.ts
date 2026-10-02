@@ -344,6 +344,42 @@ describe("TUI fullscreen mode", () => {
 		tui.stop();
 	});
 
+	it("viewport keys fire on kitty repeat while one-shot actions fire once", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(30));
+		const editor = new TestComponent();
+		tui.setFocus(editor);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		// Holding PageUp under the Kitty keyboard protocol sends press then repeat
+		// events; every event scrolls a page, matching legacy terminal auto-repeat.
+		terminal.sendInput(PAGE_UP);
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.getViewport()[0], "Line 15");
+
+		terminal.sendInput("\x1b[5;1:2~"); // pageUp repeat
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.getViewport()[0], "Line 8");
+
+		terminal.sendInput("\x1b[5;1:2~");
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.getViewport()[0], "Line 1");
+
+		// One-shot actions must not re-fire on repeat: press + repeat dumps once.
+		let debugCount = 0;
+		tui.onDebug = () => {
+			debugCount++;
+		};
+		terminal.sendInput("\x1b[100;6:1u"); // shift+ctrl+d press
+		await waitFor(() => debugCount === 1);
+		terminal.sendInput("\x1b[100;6:2u"); // repeat, must not re-fire
+		terminal.sendInput(FOLLOW); // FIFO marker: once this renders, the repeat was handled
+		await terminal.waitForRender();
+		assert.strictEqual(debugCount, 1);
+
+		tui.stop();
+	});
+
 	it("row-diffs frames: only changed rows are repainted", async () => {
 		const { terminal, tui, chat, dock } = setup(lines(20));
 		tui.enterFullscreen({ scroll: [chat], dock });
