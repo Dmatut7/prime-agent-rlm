@@ -14,21 +14,16 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-03 凌晨，wave-20 已 SHIP）
+## 当前状态（2026-10-03，wave-21 已 SHIP）
 
-- HEAD = 见 git log。wave-20 八路：daemon 双 switch 表化（digest 原位重算 381c9c9e5e17，无 wire
-  变更）、GLM 错误分类+校验失败入熔断、考题例行跑 7/7、双遥测复读、流式设计稿、探测总线阶段 5、
-  调研刷新、痛点快扫。
-- 老板新痛点（插队）：「你代理用完了怎么不关」——completed 子代理不从注册表回收，wave-21 立项
-  修（优先）。另：老板对威胁评估夸大三连怼——派单模板需「威胁贴实际配置」纪律句。
-- 新发现内核缺口：子→父 agent_message 只在父代 cell 边界投递，长 cell 会饿死扇入直到屏障放弃
-  （EX-6 首跑 FAIL 实证）；wave-21 候选：等待中被消息唤醒。
-- 遥测现状：wave-17 提示词层上线后老板零新会话（他还没用），记忆使用率无数据；compaction 交接
-  上线后零压缩事件。两个扫描器在 /tmp/wave20/ 可复跑。
-- 文档-3 销账大半：主链路 9-15 已修（2.64GB→3.6MB），剩余 R1（legacy attach 腿）/R3（流中
-  markdown 永不缓存 O(n²)）按 streaming-resend-design.md 施工。
-- 环境纪律事故：考题 lane 往真实 ~/.prime/supervisor-owners 写了墓碑——已清，examlib+runner
-  已加 registry 隔离闸（PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR）。
+- HEAD = 见 git log。wave-21：W21-A 子代理收尸（listRlmSubagents 默认活跃清单+prune 兜底）、
+  W21-B+G 消息唤醒（内核协议 v5 + TS 宿主接线）、W21-C 流式两腿（R1 监控 attach 能力声明 +
+  R3 markdown 行级密封，A/B：渲染 14.2s→0.9s、wire 602MB→1.78MB）、W21-F 虚报修复（_ABSENT
+  误判统一降级 unknown + 两个文件大小上限 256KB/1MiB→4MiB/8MiB + +0 不显示 + 回归测试钉死）。
+- 新硬规则（老板经外部审查下的）：每波交付里凡屏幕显示数字/文案的路径，必须拿外部真值交叉
+  对账（git diff --stat / wc -l / git status）；「测试绿≠屏幕上对」。已写进本节，后续波次照此验收。
+- 老板的输入连按报告已复现归因（/tmp/wave21/input-repeat.md，5 bug+2 陷阱到行号），wave-22 修。
+- 遥测：老板自 wave-19 重启后零新会话，记忆/交接指标等流量。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -105,11 +100,14 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-21 候选）
+## 下一波主题（wave-22 候选）
 
-1. 【老板痛点·插队】completed 子代理自动回收/清理入口（rlm.prune_subagents 或会话收尾清册）。
-2. 【内核健壮性】子→父消息唤醒等待中的父 cell（修 EX-6 暴露的长 cell 扇入饿死）。
-3. 流式 R1+R3 施工（streaming-resend-design.md：监控 attach 声明能力 + 流中 markdown 行级密封）。
-4. 记忆阶段 2（等遥测）；compaction 交接生产命中率复核（有生产压缩事件后）。
-5. 探测总线阶段 6（kitty 图片占位符）+ 真机复核。
-6. GLM 长上下文压缩阈值评估（P3，需老板拍板：35 万 token 区 GLM 乱码率高发）。
+1. 【输入连按五 bug】（/tmp/wave21/input-repeat.md，全部归因到行）：A Kitty repeat 事件过滤
+   （动作侧，视口滚动/文本键合法依赖 repeat 不能全局滤）、B legacy Option ESC 前缀撕裂吞草稿、
+   D Option+↓ 死键、E 思考/过程车道混按记账错乱、F Esc 连按吞字评估。
+2. W21-A 遗留：prompts/rlm.ts 与 refinement.ts 的 list_subagents 措辞对齐新默认（活跃清单）；
+   Python 侧 rlm.prune_subagents/list_subagents(include_terminal) wrapper；errored 孩子的 daemon 侧
+   常驻回收。
+3. 记忆阶段 2 / compaction 交接生产复核（等流量）。
+4. 探测总线阶段 6（kitty 图片占位符）。
+5. GLM 长上下文压缩阈值评估（等老板拍板）。
