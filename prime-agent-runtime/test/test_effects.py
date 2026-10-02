@@ -355,7 +355,9 @@ class PythonWriteTests(TrackerCase):
         self.assertEqual(cell.memory()[("rules_file", "global", target)]["op"], "created")
 
     def test_large_file_keeps_counts_without_a_diff_and_long_diffs_are_capped(self):
-        big = "".join(f"line {i}\n" for i in range(200_000))
+        # Past MAX_BASELINE_FILE_BYTES the before-content is not kept: counts without a diff.
+        big = "".join(f"line {i:08d}\n" for i in range(effects.MAX_BASELINE_FILE_BYTES // 14 + 1))
+        self.assertGreater(len(big), effects.MAX_BASELINE_FILE_BYTES)
         self.write("big.txt", big)
         cell = self.kernel.run(
             "open('big.txt', 'a').write('tail\\n')\n"

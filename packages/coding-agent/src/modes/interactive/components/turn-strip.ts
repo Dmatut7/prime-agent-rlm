@@ -129,7 +129,9 @@ function fitting(forms: readonly string[], room: number): string {
 
 function counts(added: number, removed: number): string {
 	const parts: string[] = [];
-	if (added > 0 || removed === 0) parts.push(theme.fg("diffAddedText", `+${added}`));
+	// 0/0 renders nothing: "+0" told the user a change happened that didn't
+	// (wave-21; the same fix as timeline-rows.ts countsMeta).
+	if (added > 0) parts.push(theme.fg("diffAddedText", `+${added}`));
 	if (removed > 0) parts.push(theme.fg("diffRemovedText", `−${removed}`));
 	return parts.join(" ");
 }

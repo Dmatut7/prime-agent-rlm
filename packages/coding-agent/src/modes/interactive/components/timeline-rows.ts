@@ -222,8 +222,9 @@ function failMeta(result: string | undefined): MetaPart[] {
 }
 
 function countsMeta(added: number, removed: number): MetaPart[] {
+	// A change with no known lines says nothing: never `+0`.
 	const parts: MetaPart[] = [];
-	if (added > 0 || removed === 0) parts.push({ text: `+${added}`, color: "diffAddedText" });
+	if (added > 0) parts.push({ text: `+${added}`, color: "diffAddedText" });
 	if (added > 0 && removed > 0) parts.push({ text: " ", color: "dim" });
 	if (removed > 0) parts.push({ text: `−${removed}`, color: "diffRemovedText" });
 	return parts;

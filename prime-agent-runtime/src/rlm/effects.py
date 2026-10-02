@@ -70,7 +70,11 @@ WATCH_TICK_BUDGET_S = 0.1
 # A file whose size and mtime held still across one interval is reported live.
 WATCH_INTERVAL_S = 0.15
 MAX_FILES_PER_CELL = 400
-MAX_BASELINE_FILE_BYTES = 1 << 20
+# Whole before-content is kept for files up to this size; past it a change degrades to
+# counts with the diff omitted. 8MiB covers the biggest sources this repo edits on itself
+# (packages/coding-agent/src/core/agent-session.ts is ~1MiB), which the old 1MiB cap
+# already dropped to "no_baseline".
+MAX_BASELINE_FILE_BYTES = 8 << 20
 MAX_BASELINE_BYTES_PER_CELL = 24 << 20
 MAX_COUNT_FILE_BYTES = 8 << 20
 MAX_DIFF_LINES = 400
@@ -87,7 +91,11 @@ MAX_GIT_ENTRIES = 5000
 MAX_GIT_BLOBS = 200
 MAX_SCAN_FILES = 5000
 MAX_ROOTS_PER_CELL = 3
-SNAPSHOT_CONTENT_FILE_BYTES = 256 * 1024
+# Files up to this size get their content cached by the before-snapshot, so a shell change
+# to an already-dirty file still diffs against what the cell started from. 4MiB covers the
+# repo's biggest sources (agent-session.ts ~1MiB); the old 256KB silently dropped those to
+# "no_baseline".
+SNAPSHOT_CONTENT_FILE_BYTES = 4 << 20
 SNAPSHOT_CONTENT_FILES = 300
 SNAPSHOT_CONTENT_BYTES = 4 << 20
 CONTENT_CACHE_BYTES = 8 << 20
@@ -598,7 +606,7 @@ class _After:
 
     def __init__(self) -> None:
         self.repos: dict[str, _RepoState] = {}
-        self.scan: tuple[str, dict[str, tuple[int, int]]] | None = None
+        self.scan: tuple[str, dict[str, tuple[int, int]], frozenset[str]] | None = None
         self.roots: set[str] = set()
 
 
@@ -618,7 +626,7 @@ class _Cell:
         self.baseline_bytes = 0
         self.diff_chars = 0
         self.repos: dict[str, _RepoState] = {}
-        self.scan: tuple[str, dict[str, tuple[int, int]]] | None = None
+        self.scan: tuple[str, dict[str, tuple[int, int]], frozenset[str]] | None = None
         self.roots_seen: set[str] = set()
         self.snapshots: list[_SnapshotJob] = []
         # bash() steps started by this cell that have not finished yet.
@@ -1246,12 +1254,16 @@ class _Tracker:
             offset += size + 1
         return found
 
-    def scan(self, root: str, deadline: float) -> dict[str, tuple[int, int]] | None:
-        """(size, mtime_ns) per file under root, None past the file cap; `_OutOfTime` past the deadline.
+    def scan(self, root: str, deadline: float) -> tuple[dict[str, tuple[int, int]], frozenset[str]] | None:
+        """(size, mtime_ns) per file under root plus the directories it could not read, None
+        past the file cap; `_OutOfTime` past the deadline.
 
         A symlink is an entry of its own with `_entry_sig`'s signature; it is never walked into.
+        A file under a directory the scan could not read is missing from the result without
+        being absent on disk: the caller must not read that gap as a creation.
         """
         found: dict[str, tuple[int, int]] = {}
+        lost: set[str] = set()
         stack = [root]
         while stack:
             if _left(deadline) <= 0:
@@ -1270,13 +1282,15 @@ class _Tracker:
                                 continue
                             info = entry.stat(follow_symlinks=False)
                         except OSError:
+                            lost.add(current)
                             continue
                         found[entry.path] = (_LINK_SIZE if is_link else info.st_size, info.st_mtime_ns)
                         if len(found) > MAX_SCAN_FILES:
                             return None
             except OSError:
+                lost.add(current)
                 continue
-        return found
+        return found, frozenset(lost)
 
     # ----------------------------------------------------------------- sending
 
@@ -1706,7 +1720,7 @@ class _Tracker:
         # A snapshot gets the cell's budget, like any other tracker step that stands in its way.
         deadline = started + cell.budget_s
         repos: dict[str, _RepoState] = {}
-        scan: tuple[str, dict[str, tuple[int, int]]] | None = None
+        scan: tuple[str, dict[str, tuple[int, int]], frozenset[str]] | None = None
         notes: list[str] = []
         try:
             for directory in job.directories:
@@ -1720,12 +1734,13 @@ class _Tracker:
                         continue
                     repos[root] = state
                 elif directory == self.cwd and cell.scan is None:
-                    found = self.scan(directory, deadline)
-                    if found is None:
+                    scanned = self.scan(directory, deadline)
+                    if scanned is None:
                         notes.append("the working directory is too large to scan for command changes")
                         continue
+                    found, lost = scanned
                     self._cache_recent(found, deadline)
-                    scan = (directory, found)
+                    scan = (directory, found, lost)
         except _OutOfTime:
             notes.append(_SNAPSHOT_LATE)
         except Exception:  # noqa: BLE001
@@ -1857,7 +1872,7 @@ class _Tracker:
         for before in list(cell.repos.values()):
             self._compare_repo(cell, before, deadline, changes, after)
         if cell.scan is not None:
-            self._compare_scan(cell, cell.scan[0], cell.scan[1], deadline, changes, after)
+            self._compare_scan(cell, cell.scan[0], cell.scan[1], cell.scan[2], deadline, changes, after)
         return changes
 
     def apply_shell_changes(self, cell: _Cell, changes: list[tuple[str, _Content]]) -> None:
@@ -1912,6 +1927,7 @@ class _Tracker:
                     cell.note_incomplete("too many files changed by commands to list")
                     return
         need_blob: list[str] = []
+        probe_untracked: list[str] = []
         pending: list[tuple[str, _Content | None]] = []
         for path in sorted(candidates):
             with self.lock:
@@ -1925,20 +1941,38 @@ class _Tracker:
                 if prior == current:
                     continue
                 if prior is None:
-                    pending.append((path, _ABSENT))
+                    # git listed the file but the snapshot could not stat it (an atomic save
+                    # landing mid-snapshot, a transient error, a non-regular placeholder): the
+                    # before content is lost, not absent. Unless git said the file was deleted,
+                    # it was there - a file the before-state knew about degrades to unknown,
+                    # never to created.
+                    if before.entries[path] in (".D", "D.", "DD"):
+                        pending.append((path, _ABSENT))
+                    else:
+                        pending.append((path, _UNKNOWN))
                     continue
                 pending.append((path, self._prior_content(path, prior)))
                 continue
             if after.entries.get(path) == "??":
-                if current is not None:
+                if current is None:
                     # A new file already gone again (a tool's temp file) is no creation.
+                    continue
+                if before.oid is None:
                     pending.append((path, _ABSENT))
+                    continue
+                # Untracked now is not proof of new: an index change (git rm --cached, a
+                # reset) untracks a file the before-commit still holds. Ask the before-commit
+                # before calling it a creation; probed after the tracked entries so a flood
+                # of new files cannot crowd out real diffs.
+                probe_untracked.append(path)
+                pending.append((path, None))
                 continue
             if before.oid is None:
                 pending.append((path, _UNKNOWN))
                 continue
             need_blob.append(path)
             pending.append((path, None))
+        need_blob.extend(probe_untracked)
         blobs: dict[str, bytes | None] = {}
         if need_blob:
             wanted = need_blob[:MAX_GIT_BLOBS]
@@ -1961,16 +1995,18 @@ class _Tracker:
         cell: _Cell,
         root: str,
         before: dict[str, tuple[int, int]],
+        before_lost: frozenset[str],
         deadline: float,
         changes: list[tuple[str, _Content]],
         ended: _After | None = None,
     ) -> None:
-        after = self.scan(root, deadline)
-        if after is None:
+        scanned = self.scan(root, deadline)
+        if scanned is None:
             cell.note_incomplete("the working directory is too large to scan for command changes")
             return
+        after, after_lost = scanned
         if ended is not None:
-            ended.scan = (root, after)
+            ended.scan = (root, after, after_lost)
         for path in sorted(set(before) | set(after)):
             prior = before.get(path)
             if prior == after.get(path):
@@ -1982,7 +2018,11 @@ class _Tracker:
                 continue
             if prior is None:
                 if _entry_sig(path) is not None:
-                    changes.append((path, _ABSENT))
+                    # Missing from the before-scan: new, or inside a directory the scan could
+                    # not read back then. Only the gap degrades to unknown - a file the
+                    # before-state could not see is not thereby a creation.
+                    unseen = any(_under(path, gap) for gap in before_lost)
+                    changes.append((path, _UNKNOWN if unseen else _ABSENT))
                 continue
             changes.append((path, self._prior_content(path, prior)))
 
