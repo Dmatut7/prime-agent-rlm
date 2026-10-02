@@ -82,14 +82,20 @@ describe("skill invocation doctrine: Python modules, not shell commands", () => 
 		const repl = formatHarnessStateForPrompt(emptyHarnessState());
 		expect(repl).not.toContain("in shell when a CLI exists");
 		expect(repl).toContain("not a shell command");
+		// The REPL variant names the read-side calls as the way past the window.
+		expect(repl).toContain("`rlm.harness.get(kind, id)`");
+		expect(repl).toContain("`rlm.harness.search('terms')`");
 
 		// Shell-only sessions get the digest without REPL examples; the prompt half is
-		// checked too, since the digest no longer rides inside it (#2098).
+		// checked too, since the digest no longer rides inside it (#2098). REPL-only
+		// read calls must not be named there either.
 		const shellOnly = formatHarnessStateForPrompt(emptyHarnessState(), {
 			includeIpythonExamples: false,
 			includeShellExamples: true,
 		});
 		expect(shellOnly).not.toContain("use installed skills as shell commands");
+		expect(shellOnly).not.toContain("rlm.harness.get(");
+		expect(shellOnly).not.toContain("rlm.harness.search(");
 
 		const shellOnlyPrompt = buildSystemPrompt({
 			selectedTools: ["bash"],

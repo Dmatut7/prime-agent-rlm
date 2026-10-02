@@ -5,7 +5,7 @@
  * checklist instead of resuming the interrupted task. On every fresh bind of
  * a persisted session the daemon now injects a resume briefing (active goal +
  * persistent flag, queued inputs, interrupted worker operations, duty-log
- * tail, org-memory doc index) as next-turn context.
+ * tail, org-memory doc index, harness-store pointer) as next-turn context.
  */
 import { mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -148,6 +148,20 @@ describe("W14-B resume briefing builder", () => {
 			now: 1_000_000,
 		});
 		expect(briefing).toContain("not a new instruction");
+	});
+
+	it("points at the continual harness stores that survived the reopen", () => {
+		// The reopen is exactly when the model cannot tell what it knew: the
+		// briefing names the persistent stores and the read call into them.
+		const briefing = buildResumeBriefing({
+			queuedCount: 1,
+			interruptedOperations: [],
+			orgDocs: [],
+			now: 1_000_000,
+		});
+		expect(briefing).toContain("continual harness");
+		expect(briefing).toContain("survived the reopen");
+		expect(briefing).toContain("`rlm.harness.search('terms', global_=True)`");
 	});
 });
 

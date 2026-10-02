@@ -13,7 +13,8 @@ import { findUnconsumedWorkerRecoveryMarker } from "./worker-recovery-resume.js"
  * interrupted task. On every fresh bind of a persisted session the daemon
  * injects this briefing as next-turn context: active goal (+ persistent
  * flag), queued inputs, operations the previous worker died with, the
- * duty-log tail, and the repo's org-memory doc index. Delivery rides the
+ * duty-log tail, the repo's org-memory doc index, and a pointer to the
+ * continual harness stores with the read call into them. Delivery rides the
  * pending-next-turn queue, so it reaches the model on the first turn after
  * the reopen without starting a turn by itself, and is never persisted ahead
  * of a turn (no transcript pollution, no double injection on the next bind).
@@ -103,6 +104,10 @@ export function buildResumeBriefing(input: ResumeBriefingInput): string | undefi
 		"<session_resume_briefing>",
 		"This session was reopened from its saved transcript (restart, resume, or switch) and its in-memory state was rebuilt. In-flight facts at reopen:",
 		...lines,
+		// The reopen is exactly when the model cannot tell what it knew; the
+		// persistent stores are still on disk, and the read call into them is
+		// named here so recall does not depend on remembering they exist.
+		"- Your continual harness memories, skills, and notes survived the reopen; query them with `rlm.harness.search('terms', global_=True)` before answering \"did we ...\" questions or starting new lines of work.",
 		"These are facts about where this session stood, not a new instruction. Prefer resuming the in-flight task over starting unrelated work unless the user's next message says otherwise.",
 		"</session_resume_briefing>",
 	].join("\n");

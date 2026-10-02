@@ -118,4 +118,29 @@ describe("RLM prompt names only real runtime API", () => {
 		expect(prompt).toContain("Create calls take `(title, content, *, id=None, path=...)`");
 		expect(prompt).toContain("update calls take `(id, title, content)`");
 	});
+
+	it("documents the read-side harness calls with their real signatures", () => {
+		// The prompt teaches search/get as the way into the store; the signatures
+		// it prints must match harness.py or the lesson is a NameError/TypeError.
+		const search = methodSignature("search");
+		expect(search.isAsync).toBe(false);
+		expect(search.params).toEqual(["query", "kind", "limit", "global_"]);
+		const get = methodSignature("get");
+		expect(get.isAsync).toBe(false);
+		expect(get.params).toEqual(["kind", "id", "global_"]);
+		expect(prompt).toContain("`rlm.harness.search(query, kind=None, limit=10)`");
+		expect(prompt).toContain("`rlm.harness.get(kind, id)`");
+	});
+
+	it("teaches the read-side scope trap and the zero-hit semantics", () => {
+		// The digest merges both stores while search/get default to local; the
+		// prompt must say so, or a `[global:…]` entry reads as missing.
+		expect(prompt).toContain("the harness digest merges both stores");
+		expect(prompt).toContain("when in doubt, search both");
+		// Zero hits on a substring match is not proof of absence.
+		expect(prompt).toContain("Zero hits means the words did not match");
+		expect(prompt).toContain("synonyms");
+		// Search-before-write keeps a second copy of an existing memory out.
+		expect(prompt).toContain("before creating a memory that may already exist");
+	});
 });

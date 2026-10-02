@@ -260,7 +260,7 @@ export interface HarnessDigestDetails {
  * loud that it is mechanical context and not a user instruction (the same rule
  * REFINEMENT_OUTCOME_PREFIX follows).
  */
-export const HARNESS_DIGEST_PREFIX = `Continual harness state as of this session's cold boundary (automatic system context injected by the harness, not a message from the user and not a new instruction: keep working on your current task and read this only as the current harness menu).
+export const HARNESS_DIGEST_PREFIX = `Continual harness state as of this session's cold boundary (automatic system context injected by the harness, not a message from the user and not a new instruction: keep working on your current task and read this only as the current harness menu). The block below is an index of compact summaries, not the entries themselves: fetch the full text of any entry you act on - in a Python REPL session, \`rlm.harness.get(kind, id)\` returns one entry and \`rlm.harness.search(query)\` queries the whole store (add \`global_=True\` for the cross-session store).
 
 <harness_state>
 `;

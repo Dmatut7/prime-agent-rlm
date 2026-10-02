@@ -406,6 +406,11 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("# Continual Harness State");
 		expect(prompt).toContain("Local continual harness entries belong to this Prime Agent session");
 		expect(prompt).toContain("The continual harness entries below are compact summaries, not full descriptions");
+		// The routing line names the read-side calls: the window is an index,
+		// and acting on an entry takes its full text first.
+		expect(prompt).toContain("`rlm.harness.get(kind, id)`");
+		expect(prompt).toContain("`rlm.harness.search('terms')`");
+		expect(prompt).toContain("add `global_=True` for a `[global:…]` id");
 		expect(prompt).toContain("Use global continual harness refinement only for stable cross-session lessons");
 		expect(prompt).toContain("When to call `await refine.run()`");
 		expect(prompt).toContain("Call contract: read each installed Python skill's SKILL.md");
@@ -500,6 +505,8 @@ describe("buildSystemPrompt", () => {
 
 		expect(prompt).toContain("memory: 8");
 		expect(prompt).toContain("- +2 more memory entries");
+		// The overflow hint leads with search, not with a wide overview window.
+		expect(prompt).toContain("rlm.harness.search('terms', kind='memory', global_=True)");
 		expect(prompt).toContain(`${"x".repeat(177)}...`);
 		expect(prompt).not.toContain(longContent);
 	});

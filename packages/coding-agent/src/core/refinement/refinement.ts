@@ -58,8 +58,8 @@ const HARNESS_DIGEST_FINGERPRINT_VERSION = 1;
 /** The refiner's own view is wider than the injected face but still truncated. */
 const REFINER_OVERVIEW_ENTRY_LIMIT = 40;
 /** How to read entries the view had to drop, per session capability. */
-const KERNEL_FULL_LIST_HINT =
-	"read them all with `rlm.harness.overview(max_entries_per_kind=...)` (`global_=True` for global entries)";
+const kernelFullListHint = (kind: RefinementKind): string =>
+	`search them with \`rlm.harness.search('terms', kind='${kind}', global_=True)\` or list them with \`rlm.harness.overview(max_entries_per_kind=..., global_=True)\``;
 const HARNESS_STATE_FILE_HINT = "the full list stays in the harness state file";
 
 export type RefinementKind = "prompt" | "memory" | "skill" | "subagent";
@@ -1136,8 +1136,12 @@ export function formatHarnessStateForPrompt(
 		// this line the prefix reads as decoration, a seat that sees 1005 global
 		// memories still asks for a local refinement, and a local store that is
 		// simply empty reads as "there are no memories at all".
-		"Every entry id below is prefixed with the store it lives in, as in `[global:foo]` or `[local:foo]`; edits always use the bare id. Reads and `refine.run()` default to this session's local store, so an entry shown as `[global:foo]` is only addressable with an explicitly global request (`await refine.run(..., global_=True)`), and a local refinement cannot update or delete it.",
-		"The continual harness entries below are compact summaries, not full descriptions. Use them as routing/context hints; inspect or refine the underlying continual harness entry only when detail matters.",
+		includeIpythonExamples
+			? "Every entry id below is prefixed with the store it lives in, as in `[global:foo]` or `[local:foo]`; edits always use the bare id. Reads and `refine.run()` default to this session's local store, so an entry shown as `[global:foo]` is only addressable with an explicitly global request (`rlm.harness.search(..., global_=True)`, `rlm.harness.get(..., global_=True)`, `await refine.run(..., global_=True)`), and a local refinement cannot update or delete it."
+			: "Every entry id below is prefixed with the store it lives in, as in `[global:foo]` or `[local:foo]`; edits always use the bare id. Reads and `refine.run()` default to this session's local store, so an entry shown as `[global:foo]` is only addressable with an explicitly global request (`await refine.run(..., global_=True)`), and a local refinement cannot update or delete it.",
+		includeIpythonExamples
+			? "The continual harness entries below are compact summaries, not full descriptions (the window shows a few entries per kind and the opening characters of each). Use them as routing hints: fetch the full text of any entry you act on with `rlm.harness.get(kind, id)` (add `global_=True` for a `[global:…]` id), and query the whole store with `rlm.harness.search('terms')` whenever the window does not show what you need."
+			: "The continual harness entries below are compact summaries, not full descriptions. Use them as routing/context hints; inspect or refine the underlying continual harness entry only when detail matters.",
 		"Default to local continual harness refinement for current task progress, temporary blockers, and session coordination. Use global continual harness refinement only for stable cross-session lessons, durable user preferences, reusable skills/subagents, or explicitly project-qualified facts.",
 		"Use these continual harness prompt notes, memories, skills, and subagent specs when they are relevant. The base system prompt is immutable; prompt entries below are supplemental notes only.",
 		"",
@@ -1183,7 +1187,11 @@ export function formatHarnessStateForPrompt(
 			lines.push(`${kind}: ${entries.length}`);
 		}
 		if (rankedByRelevance && entries.length > maxEntriesPerKind) {
-			lines.push("(entries ranked by relevance to the current task; see harness.search)");
+			lines.push(
+				includeIpythonExamples
+					? `(entries ranked by relevance to the current task; more via \`rlm.harness.search(query, kind='${kind}')\`, \`global_=True\` for the cross-session store)`
+					: "(entries ranked by relevance to the current task)",
+			);
 		}
 		for (const entry of entries.slice(0, maxEntriesPerKind)) {
 			const malformation = harnessEntryMalformation(entry);
@@ -1224,7 +1232,7 @@ export function formatHarnessStateForPrompt(
 					kind,
 					overflow,
 					entries.length,
-					includeIpythonExamples ? KERNEL_FULL_LIST_HINT : HARNESS_STATE_FILE_HINT,
+					includeIpythonExamples ? kernelFullListHint(kind) : HARNESS_STATE_FILE_HINT,
 				),
 			);
 		}

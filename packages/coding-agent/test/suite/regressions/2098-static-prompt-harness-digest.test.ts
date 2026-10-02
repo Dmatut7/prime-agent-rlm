@@ -314,6 +314,11 @@ describe("#2098 static system prompt with an in-context harness digest", () => {
 		// reads as a user instruction (same doctrine as REFINEMENT_OUTCOME_PREFIX).
 		expect(HARNESS_DIGEST_PREFIX).toContain("not a message from the user");
 		expect(HARNESS_DIGEST_PREFIX).toContain("not a new instruction");
+		// The framing says the block is an index and names the read-side calls,
+		// so the menu does not read as the entries themselves.
+		expect(HARNESS_DIGEST_PREFIX).toContain("index of compact summaries");
+		expect(HARNESS_DIGEST_PREFIX).toContain("`rlm.harness.get(kind, id)`");
+		expect(HARNESS_DIGEST_PREFIX).toContain("`rlm.harness.search(query)`");
 		expect(llm[0]).toContain(HARNESS_DIGEST_PREFIX.trim());
 		expect(llm[0]).toContain("# Continual Harness State");
 		expect(llm[0]).toContain(HARNESS_DIGEST_SUFFIX.trim());
@@ -1025,7 +1030,9 @@ describe("#2098 static system prompt with an in-context harness digest", () => {
 		expect(digests).toHaveLength(2);
 		const delta = getMessageText(digests[1] as CustomMessage);
 		expect(delta).toContain("[global:zz_distinctive]");
-		expect(delta).toContain("(entries ranked by relevance to the current task; see harness.search)");
+		expect(delta).toContain(
+			"(entries ranked by relevance to the current task; more via `rlm.harness.search(query, kind='memory')`, `global_=True` for the cross-session store)",
+		);
 		// Append-only still holds: the first carrier is untouched.
 		expect(getMessageText(first[0] as CustomMessage)).not.toContain("[global:zz_distinctive]");
 	});

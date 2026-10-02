@@ -1956,8 +1956,10 @@ describe("harness digest relevance ranking (#2241 phase 2 / upstream #2392 IDF /
 		expect(ranked).toContain("[global:rare]");
 		expect(ranked).toContain("[global:common0]");
 		expect(ranked).not.toContain("[global:common1]");
-		// The overflow window names the ranking and points at harness.search.
-		expect(ranked).toContain("(entries ranked by relevance to the current task; see harness.search)");
+		// The overflow window names the ranking and points at rlm.harness.search.
+		expect(ranked).toContain(
+			"(entries ranked by relevance to the current task; more via `rlm.harness.search(query, kind='memory')`, `global_=True` for the cross-session store)",
+		);
 	});
 
 	it("breaks score ties by stable identifier order, not recency", () => {
@@ -2047,9 +2049,11 @@ describe("harness digest relevance ranking (#2241 phase 2 / upstream #2392 IDF /
 		expect(lines).toContain("memory: 3");
 		expect(lines).toContain("prompt: 3");
 		const markerLineAfter = (kind: string) => lines[lines.indexOf(`${kind}: 3`) + 1];
-		expect(markerLineAfter("memory")).toBe("(entries ranked by relevance to the current task; see harness.search)");
+		expect(markerLineAfter("memory")).toBe(
+			"(entries ranked by relevance to the current task; more via `rlm.harness.search(query, kind='memory')`, `global_=True` for the cross-session store)",
+		);
 		expect(markerLineAfter("prompt")).not.toBe(
-			"(entries ranked by relevance to the current task; see harness.search)",
+			"(entries ranked by relevance to the current task; more via `rlm.harness.search(query, kind='prompt')`, `global_=True` for the cross-session store)",
 		);
 	});
 

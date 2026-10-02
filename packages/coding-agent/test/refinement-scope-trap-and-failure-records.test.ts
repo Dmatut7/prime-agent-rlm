@@ -351,6 +351,8 @@ describe("overflow hint readability (MV-3)", () => {
 		const overview = formatHarnessStateForPrompt(state, { maxEntriesPerKind: 2 });
 
 		expect(overview).toContain("+4 more memory entries");
+		// Search is the way into the hidden bulk; overview only lists.
+		expect(overview).toContain("rlm.harness.search('terms', kind='memory', global_=True)");
 		// `rlm.get_harness_state()` returns an object whose REPL repr is an
 		// opaque address; the hint must name a readable entry instead.
 		expect(overview).toContain("rlm.harness.overview(max_entries_per_kind=");
