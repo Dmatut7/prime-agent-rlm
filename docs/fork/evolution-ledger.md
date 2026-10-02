@@ -14,23 +14,17 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-02，wave-14 已SHIP）
+## 当前状态（2026-10-02，wave-15 部分落地，记忆调研波优先）
 
-- HEAD = d476f62bc + 文档批：wave-14 三批已提交（25b3432b7 考题、c273b1ae8 组织记忆、d476f62bc 小项）。
-- wave-14 成果：恢复简报注入（resume/attach/worker 恢复后自动带在途状态：goal 含 persistent 标记、
-  排队数、死时在跑操作、duty log 尾部、docs/fork 索引；C5 销账）+ 派波勘误门（审查/复审类 spawn
-  自动附「先读台账」，C4 销账）；考题集 D7/D8 修复 + EX-3 转 CI（w14a-ex3-recovery-chain，真 CLI
-  子进程，5 连绿）+ EX-6 重跑 8/8；daemon-launch 探针收敛收尾；codex sleep listener 修复；
-  main.ts console.log 全包装。
-- 调研刷新（W14-D）：三家 changelog 窗口内无新条目；Claude Code 2.1.287 三条正中桥接面（建议老板
-  升级后用 claude 线复跑 EX-3/EX-6）；kitty 0.49.2 修 macOS 渲染回归（Backlog-7 验收前置）。
-- 痛点复扫（W14-E）：今日零新抱怨；S1/S2 今日未复发；老板 00:28 明说「循环下去就不会停那种」——
-  /goal --persistent 正是答案，但他 daemon 未重启还看不见。S4 磁盘（4.1GB）仍未收敛。
-- 主席事故登记：误把 `prime-agent daemon-ps`（非命令）打成提示词发给 Kovak 会话一次（正确命令是
-  `prime-agent daemon ps`）；耗费一轮额度，无其他影响。
-- 4603 shutdown 例升级定性：三度负载红，疑似真竞态（worker 把 shutdown --force 后的 daemon 重拉起，
-  W11-D F3 同族），wave-15 立项专项，不再当 flake 豁免。
-- 恢复指令：读 Backlog + 下一波主题；证据库 /tmp/wave10、/tmp/wave11、/tmp/wave13、/tmp/wave14。
+- HEAD = wave-15 三提交（slim 回填触发器 / 探测总线设计稿 / runner 剥 RLM_SESSION_DIR）+ 本文档批。
+- wave-15 被老板中断转「记忆系统优化」专项：W15-C/D/E 已交付并提交；W15-A（4603 竞态）与
+  W15-B（F15）半途被撤——A 的仪器化 patch 在 /tmp/w15-aborted/（已定位重拉路径在
+  launchReplacementSupervisor，两道闸 canConnectToSupervisor/isDaemonShutdownAdmissionActive
+  待查哪道失效），B 未动工。两路登记 wave-16 续。
+- 考题例行跑 7/7 首次全绿（/tmp/wave15/exam-routine.md）；新缺陷候选 D9（claude 伪造 drift 轨输入，
+  判分器硬化）待立项；EX-4 glm 成本回退 219k→849k 待钉是否趋势。
+- 老板新指令：记忆系统（尤其召回）做深调研再动，「不要带缺陷的优化」。
+- 恢复指令：记忆调研波（wave-16）见下；4603/F15 从 /tmp/w15-aborted + 本节恢复。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
 
@@ -106,13 +100,13 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-15 候选）
+## 下一波主题（wave-16 候选）
 
-1. 【专项】4603 shutdown 竞态：worker 在 supervisor 死后重拉 daemon 的路径（W11-D F3 实证：
-   孤儿 worker 在 bench socket 上重起 daemon）与 shutdown --force 的交互，修复后 4603 应稳定绿。
-2. Backlog-10 残余：恢复注入的 in-process 路径（W14-B 遗留②）；agent-session.ts:19651 提示词
-   内嵌点（主席可选，与 daemon 侧注入二选一防重复）。
-3. Backlog-7 残余：探测总线设计稿（DA 栅栏+分版本 DECRQM）；kitty 栈待老板真机确认（≥0.49.2）。
-4. Backlog-13 slim 回填 inline 触发器。
-5. F15（09-30 登记的子代理编号/重试文案不一致）横跨 5 波未认领——wave-15 正式立项或明确降级。
-6. 考题集例行跑 + runner agent_env 剥 RLM_SESSION_DIR（W14-A 遗留）。
+1. 【记忆系统深调研+设计】（老板点名，最高优先）：现状全链审计（写入/存储/召回/注入/compaction 交互）
+   + 会话记录挖「忘事」实案 + 外部范式调研（Claude Code memory、Letta/MemGPT、OpenHands、LangGraph、
+   mem0、Anthropic context engineering）+ 无缺陷设计稿（含 A/B 验证方案）。已知实测锚点：记忆-8
+   （摘要窗口外等于不存在）、文档-4（path 排序使 45.8% 新记忆永不进注入面）、C5（重启忘事，wave-14
+   已修一半）。
+2. wave-15 续：W15-A 4603 竞态（从 /tmp/w15-aborted 的仪器化线索继续）+ W15-B F15 裁决。
+3. D9 判分器硬化（轨输入移出 agent 可写区 + 拒收晚于 run 开始的 mtime + prompt 禁跑判分器）。
+4. 探测总线实施阶段 1-2（docs/fork/probe-bus-design.md 的剥离正则 + 总线骨架）。
