@@ -324,7 +324,9 @@ export const PASTE_SETTLE_MS = 20;
 export type StdinBufferOptions = {
 	/**
 	 * Maximum time to wait for sequence completion (default: 10ms)
-	 * After this time, the buffer is flushed even if incomplete
+	 * After this time, the buffer is flushed even if incomplete - except that a
+	 * bare ESC and a torn paste-marker prefix each get one extra window first
+	 * (see `onSequenceTimeout`).
 	 */
 	timeout?: number;
 	/**
@@ -419,8 +421,8 @@ function extractTerminalResponses(chunk: string): { text: string; responses: str
 /**
  * Whether `data` is a proper prefix of a bracketed-paste marker longer than a
  * bare ESC - a marker torn across packets. Bare ESC is excluded: it is the
- * Escape key far more often than the start of a paste, and its completion
- * window must not double.
+ * Escape key far more often than the start of a paste, and its extra window
+ * comes from the Option-chord branch of `onSequenceTimeout`, not from this one.
  */
 function isPartialPasteMarkerPrefix(data: string): boolean {
 	return (
@@ -459,7 +461,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	/** Tail of the last paste chunk that can still grow into a terminal response. */
 	private pasteResponseHold: string = "";
 	private pendingKittyPrintableCodepoint: number | undefined;
-	/** The completion-window flush already waited out one extra window for a torn paste marker. */
+	/** The completion-window flush already waited out one extra window for a torn paste marker or a torn Option chord. */
 	private sequenceTimeoutExtended: boolean = false;
 
 	constructor(options: StdinBufferOptions = {}) {
@@ -568,14 +570,22 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	}
 
 	/**
-	 * Flush the buffered sequence after its completion window. A buffer that is
-	 * a proper prefix of a bracketed-paste marker gets one extra window first: a
-	 * paste start torn across packets ("\x1b[20" + "0~…") would otherwise flush
-	 * the fragment as a key and let the rest of the paste reach the key parser,
-	 * where its escape sequences execute as editing commands.
+	 * Flush the buffered sequence after its completion window. Two shapes get
+	 * one extra window first:
+	 *
+	 * - A buffer that is a proper prefix of a bracketed-paste marker: a paste
+	 *   start torn across packets ("\x1b[20" + "0~…") would otherwise flush the
+	 *   fragment as a key and let the rest of the paste reach the key parser,
+	 *   where its escape sequences execute as editing commands.
+	 * - A bare ESC: a legacy Option/Alt chord arrives as ESC plus the key byte,
+	 *   and a link or input device that delivers those two bytes more than one
+	 *   window apart would otherwise flush the ESC as a lone Escape (triggering
+	 *   draft-clear) and leak the letter as text. The extra window reassembles
+	 *   the chord; a real Escape key still flushes, one window later - a wait
+	 *   that stays below perceptible latency.
 	 */
 	private onSequenceTimeout(): void {
-		if (!this.sequenceTimeoutExtended && isPartialPasteMarkerPrefix(this.buffer)) {
+		if (!this.sequenceTimeoutExtended && (isPartialPasteMarkerPrefix(this.buffer) || this.buffer === ESC)) {
 			this.sequenceTimeoutExtended = true;
 			this.timeout = setTimeout(() => {
 				this.onSequenceTimeout();

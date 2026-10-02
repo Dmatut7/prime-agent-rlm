@@ -183,4 +183,48 @@ describe("InteractiveMode block navigation", () => {
 		queued.connectionState.sessionActions.followUps = ["later"];
 		expect(queued.hasBrowsableQueue()).toBe(true);
 	});
+
+	function captureEditorActions(mode: any): Map<string, () => unknown> {
+		const handlers = new Map<string, () => unknown>();
+		mode.defaultEditor = {
+			onAction: (action: string, handler: () => unknown) => {
+				handlers.set(action, handler);
+			},
+		};
+		mode.setupKeyHandlers();
+		return handlers;
+	}
+
+	it("starts block navigation from alt+down when nothing is queued", () => {
+		const user = new UserMessageComponent("问题");
+		const answer = assistant("回答。");
+		const mode = createMode([user, answer]);
+		const handlers = captureEditorActions(mode);
+
+		// The editor registrations mirror the keybinding table: both block
+		// directions exist (app.blocks.next used to never be registered).
+		expect(handlers.has("app.blocks.prev")).toBe(true);
+		expect(handlers.has("app.blocks.next")).toBe(true);
+
+		// Alt+Down with an empty queue walks the conversation blocks like Alt+Up.
+		handlers.get("app.message.navigateNewer")?.();
+		expect(mode.blockNavigation?.focused).toBe(answer);
+
+		// app.blocks.next shares the default key and moves the focus onward.
+		handlers.get("app.blocks.next")?.();
+		expect(mode.blockNavigation).toBeDefined();
+	});
+
+	it("keeps alt+down on the pending-message browser while messages are queued", () => {
+		const mode = createMode([new UserMessageComponent("hi")]);
+		const handlers = captureEditorActions(mode);
+
+		mode.connectionState.sessionActions.followUps = ["later"];
+		const move = vi.fn(() => undefined);
+		mode.queueSelection = { isBrowsing: false, move };
+		mode.editor.getText = () => "";
+		handlers.get("app.message.navigateNewer")?.();
+		expect(move).toHaveBeenCalledOnce();
+		expect(mode.blockNavigation).toBeUndefined();
+	});
 });

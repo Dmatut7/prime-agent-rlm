@@ -1,0 +1,1 @@
+- Fixed Option+↓ doing nothing when no messages are queued: it now starts conversation block navigation like Option+↑, and `app.blocks.next` is registered as an editor action so rebinding it works.

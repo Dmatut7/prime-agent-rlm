@@ -379,6 +379,32 @@ describe("StdinBuffer", () => {
 			processInput("\x1b\x1b[A");
 			assert.deepStrictEqual(emittedSequences, ["\x1b", "\x1b[A"]);
 		});
+
+		it("reassembles an Option chord whose letter arrives one window after its ESC", async () => {
+			// A legacy Option key is ESC + the letter as two bytes; a link or input
+			// device that delivers them more than one completion window apart used
+			// to flush the ESC as a lone Escape (clearing the draft) and leak the
+			// letter into the editor as text.
+			processInput("\x1b");
+			await wait(15);
+			assert.deepStrictEqual(emittedSequences, []);
+			processInput("o");
+			assert.deepStrictEqual(emittedSequences, ["\x1bo"]);
+		});
+
+		it("reassembles a ctrl+alt chord whose control byte arrives one window after its ESC", async () => {
+			processInput("\x1b");
+			await wait(15);
+			processInput("\x0f");
+			assert.deepStrictEqual(emittedSequences, ["\x1b\x0f"]);
+		});
+
+		it("reassembles a CSI sequence torn apart after its ESC byte", async () => {
+			processInput("\x1b");
+			await wait(15);
+			processInput("[A");
+			assert.deepStrictEqual(emittedSequences, ["\x1b[A"]);
+		});
 	});
 
 	describe("Edge Cases", () => {
@@ -391,7 +417,11 @@ describe("StdinBuffer", () => {
 			processInput("\x1b");
 			assert.deepStrictEqual(emittedSequences, []);
 
-			await wait(15);
+			// A bare ESC holds one extra window so a torn Option chord can still
+			// complete; a real Escape key still flushes, one window later.
+			await wait(12);
+			assert.deepStrictEqual(emittedSequences, []);
+			await wait(40);
 			assert.deepStrictEqual(emittedSequences, ["\x1b"]);
 		});
 

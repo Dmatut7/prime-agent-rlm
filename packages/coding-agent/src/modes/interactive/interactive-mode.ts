@@ -5339,8 +5339,10 @@ export class InteractiveMode {
 		});
 		this.defaultEditor.onAction("app.message.navigateNewer", () => {
 			if (this.hasBrowsableQueue()) this.browseQueueSelection(1);
+			else this.startBlockNavigation(1);
 		});
 		this.defaultEditor.onAction("app.blocks.prev", () => this.startBlockNavigation(-1));
+		this.defaultEditor.onAction("app.blocks.next", () => this.startBlockNavigation(1));
 		this.defaultEditor.onAction("app.message.moveEarlier", () => this.moveQueueSelection(-1));
 		this.defaultEditor.onAction("app.message.moveLater", () => this.moveQueueSelection(1));
 		this.defaultEditor.onAction("app.session.new", () => this.handleClearCommand());
