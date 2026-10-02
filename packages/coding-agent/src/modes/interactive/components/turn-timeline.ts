@@ -173,6 +173,29 @@ export function thoughtSentence(text: string): string {
 let boxIdCounter = 0;
 
 /**
+ * A box's open-key set. A key leaving the set is reported, so the thinking
+ * lane's ledger (the events Ctrl+T opened) forgets it the moment anything
+ * closes it - the box folding (Ctrl+O), Enter on the event, a click. A key
+ * reopened after that is the user's own, and closing the thoughts leaves it.
+ */
+class ExpandedKeys extends Set<string> {
+	constructor(private readonly keyClosed: (key: string) => void) {
+		super();
+	}
+
+	override delete(key: string): boolean {
+		const removed = super.delete(key);
+		if (removed) this.keyClosed(key);
+		return removed;
+	}
+
+	override clear(): void {
+		for (const key of this) this.keyClosed(key);
+		super.clear();
+	}
+}
+
+/**
  * The per-row UI state of a box: what is open, where its body is scrolled,
  * which rows are new (the enter highlight) or just finished (the flash). It
  * lives on the timeline, so it survives re-renders, resizes and chat rebuilds.
@@ -207,8 +230,14 @@ export class TimelineUiState {
 	/** Bring this row into the body's view on the next render (its opened lines too, when `revealDetail`). */
 	revealKey: string | undefined;
 	revealDetail = false;
+	/**
+	 * Event keys (`ev:`, `all:`) the thinking lane opened itself: closing the
+	 * thoughts closes them again. A key leaves the ledger the moment anything
+	 * closes it (see ExpandedKeys), so one the user reopened stays the user's.
+	 */
+	readonly thinkingOpenedKeys = new Set<string>();
 	/** Open rows and events (`ev:` keys), and events listing every step (`all:` keys). */
-	readonly expanded = new Set<string>();
+	readonly expanded = new ExpandedKeys((key) => this.thinkingOpenedKeys.delete(key));
 	readonly expandedAt = new Map<string, number>();
 	/** The lane the turn started in (subagents of earlier turns still out), taken when the lane tracker was first given. */
 	startLane: TimelineLane | undefined;
@@ -796,6 +825,7 @@ export class TurnTimeline implements LaneOwner {
 		next.ui.primed = ui.primed;
 		next.ui.stripOpen = ui.stripOpen;
 		for (const key of ui.expanded) next.ui.expanded.add(key);
+		for (const key of ui.thinkingOpenedKeys) next.ui.thinkingOpenedKeys.add(key);
 		next.ui.startLane = ui.startLane;
 		for (const key of ui.stripExpanded) next.ui.stripExpanded.add(key);
 		for (const [key, status] of ui.rowStatus) next.ui.rowStatus.set(key, status);

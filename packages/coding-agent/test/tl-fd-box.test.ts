@@ -401,4 +401,37 @@ describe("Ctrl+T after Ctrl+O", () => {
 		turn.summary.toggleThinkingRows();
 		expect(draw(turn)).toContain("思考了 先想第一步");
 	});
+
+	it("leaves a box the owner reopened with Ctrl+O open when the thoughts close", () => {
+		const turn = finished(4);
+		turn.summary.toggleThinkingRows();
+		expect(turn.state.boxOpen).toBe(true);
+		turn.summary.toggleBox();
+		expect(turn.state.boxOpen).toBe(false);
+		turn.summary.toggleBox();
+		expect(turn.state.boxOpen).toBe(true);
+		turn.summary.toggleThinkingRows();
+		expect(turn.state.thinkingExpanded).toBe(false);
+		// The reopened box is the owner's own: closing the thoughts folds only their rows.
+		expect(turn.state.boxOpen).toBe(true);
+		expect(draw(turn)).toContain("思考了 先想第一步");
+		expect(draw(turn)).not.toContain("再想第二步");
+	});
+
+	it("leaves a box the owner reopened by hand open when the thoughts close", () => {
+		const turn = finished(4);
+		turn.summary.toggleThinkingRows();
+		turn.summary.render(100);
+		const key = turn.summary.getFocusOrder().find((entry) => entry.startsWith("ev:")) ?? "";
+		expect(key).not.toBe("");
+		turn.summary.activate(key);
+		expect(turn.state.boxOpen).toBe(false);
+		turn.summary.activate(key);
+		expect(turn.state.boxOpen).toBe(true);
+		turn.summary.toggleThinkingRows();
+		expect(turn.state.thinkingExpanded).toBe(false);
+		expect(turn.state.boxOpen).toBe(true);
+		expect(draw(turn)).toContain("思考了 先想第一步");
+		expect(draw(turn)).not.toContain("再想第二步");
+	});
 });

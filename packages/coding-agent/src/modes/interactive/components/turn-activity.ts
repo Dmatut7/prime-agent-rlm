@@ -102,8 +102,6 @@ export class TurnActivityState {
 	private collapsed = true;
 	/** U6 K3 ②: the turn's own Ctrl+T lane (the traces inside this turn's span). */
 	thinkingExpanded = false;
-	/** Event keys (`ev:`, `all:`) Ctrl+T opened that were not open already: closing the thoughts closes them again. */
-	readonly thinkingOpenedKeys = new Set<string>();
 	/** U6 K3 ②: the turn's own Ctrl+P lane (agent message rows inside this turn's span). */
 	agentMessagesExpanded = false;
 
@@ -888,12 +886,12 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 				for (const key of [event.key, `all:${event.key}`]) {
 					if (ui.expanded.has(key)) continue;
 					ui.expanded.add(key);
-					this.turnState.thinkingOpenedKeys.add(key);
+					ui.thinkingOpenedKeys.add(key);
 				}
 			}
 		} else {
-			for (const key of this.turnState.thinkingOpenedKeys) ui.expanded.delete(key);
-			this.turnState.thinkingOpenedKeys.clear();
+			for (const key of [...ui.thinkingOpenedKeys]) ui.expanded.delete(key);
+			ui.thinkingOpenedKeys.clear();
 		}
 		ui.bump();
 		this.invalidate();
