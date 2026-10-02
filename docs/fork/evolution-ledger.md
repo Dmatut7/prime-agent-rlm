@@ -14,17 +14,19 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-02，wave-18 已 SHIP）
+## 当前状态（2026-10-02 晚，wave-19 已 SHIP，CI 修复随波）
 
-- HEAD = 见 git log（五批 + 本文档批）。五批：4603 竞态修复（宽限期+关机墓碑+复活拒绝+CLI SIGKILL
-  补墓碑）、F15 双项（同名子代理继任编号 name-2/-3 + 重试文案重放推导）、D9 判分器硬化
-  （+EX-3 同款轨污染）、compaction 结构化交接（<session-handoff> + fileChanges 接入
-  modified-files，94.5% 双空→程序拼接）、探测总线阶段 1+2（剥离正则+probe-bus.ts+三消费点迁移
-  +1000ms 兜底+六个 PI_TERMINAL_* 逃逸门）。
-- 4603 根因实录：两道闸从未失效——重拉发生在 admission 生效之前（0.7s 失败探针就把继任启动空窗
-  误判成崩溃）+释放之后 52ms 拿到 ownership；寄生 daemon 卡在 lockfile 重试里对扫描隐形。
-- wave-15 全部清账（A/B 两路在 wave-18 完成）。
-- 老板机器：daemon 已重启跑新 bundle（16:19，wave-9~18 全部生效）。
+- HEAD = 见 git log（九批 + 本文档批）。wave-19 = 十二路大扇出（8 建造 + 4 侦察）。
+- 落地：探测总线阶段 3+4；环境假失败清零（ollama 真跳过、image-model 限定名——8 例环境漂移销账）；
+  W18-A 遗留两项（lapse 语义论证保留+注释、coordinator 擦标记）；D10 答案源哈希轨；双击 Esc 预选
+  最近用户消息；F1 菜单命令不再静默拼回草稿（/settings 保留测试钉住的恢复语义）；F2 前置标志后
+  的命令字识别；shortenPath 收敛 + edit 耐久性（fsync）；footer.sessionSpend 可选花费段；
+  DaemonSupervisor.handleCommand 表化（914 行 cc=230 → 30 行 dispatch+注册表，逐 token 守恒）。
+- CI 红修复：wave-18 的 4c5a83ad3 CI 红 = unhandled rejection（fixture daemon 无 socketPath 时
+  log() 扔 TypeError 吃掉 catch 链），daemon-mode.ts log 加守卫；本地 suite 复扫 EXIT 0。
+- 侦察：记忆提示词效果首读样本太少（n=1），继续观察；走查复验 wave-12/13 修复全生效；
+  老板今日信号：P1 想搞清 GLM 工具出错类别（wave-11 熔断射程外的类别待分类立项）、P2 弃用
+  claude-code 提供商；调研新增 Codex 0.162 四条 + Gemini 一条（进 Backlog-9/12 参照）。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -101,12 +103,14 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-19 候选）
+## 下一波主题（wave-20 候选）
 
-1. 探测总线阶段 3-5（2026 同步输出/2027 字宽/2031 配色推送，按 probe-bus-design.md 迁移表；
-   阶段 4 前 kitty/ghostty 真机录一次 DECRQM 行为）。
-2. 记忆设计稿阶段 2（digest 两层）——先看 wave-17 提示词层的使用率遥测再动。
-3. W18-A 遗留裁决：admission lapse 读侧语义要不要关窗；update-restart spawn 擦 relaunch 标记。
-4. EX-1/EX-2 答案源防篡改 rail（corpus 哈希）；考题集例行跑。
-5. compaction 交接上线后复核生产命中率（对照 103/109 基线）+ 决策「已决」通道。
-6. Backlog：组织记忆 in-process 路径、安全簇（先问老板）、win32 四条、文档-3 流式全量重发。
+1. AgentDaemon.handleCommand 表化（daemon-mode.ts:4716，cc=141，101 case）+ handleWorkerFrame
+   （cc=151）——同 W19-B8 模式；注意 Object.create harness 形态的懒初始化注册表先例。
+2. GLM 工具出错分类（老板 P1：「GLM 为什么老是调用工具出错」——从 01a0f7f8 会话取原始记录分类，
+   落在 wave-11 熔断射程外的类别立项修）。
+3. 记忆阶段 2（digest 两层重构）——等提示词层遥测积累（至少一天会话量）。
+4. 探测总线阶段 5-6（2031 配色推送、kitty 图片占位符）+ 真机复核登记。
+5. Backlog：文档-3 流式全量重发设计（新增同行佐证 Codex #50207 + Gemini #29568）；
+   compaction 交接的生产命中率复核；exam v1.4（manifest 防读侧）。
+6. win32 四条登记项（文档-6）与安全簇（先问老板）。
