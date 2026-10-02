@@ -267,6 +267,10 @@ def agent_env(agent_home: Path, sessions_dir: str) -> dict:
     env["PI_SESSION_DIR"] = sessions_dir
     env["PRIME_AGENT_CODING_AGENT_SESSION_DIR"] = sessions_dir
     env["PI_CODING_AGENT_SESSION_DIR"] = sessions_dir
+    # The supervisor registry (owner records, shutdown tombstones) defaults to
+    # the machine-global ~/.prime/supervisor-owners; keep eval daemons' records
+    # inside the isolated home.
+    env["PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR"] = str(agent_home / "supervisor-owners")
     return env
 
 
