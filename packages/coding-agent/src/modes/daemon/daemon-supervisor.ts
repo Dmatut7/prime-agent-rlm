@@ -956,6 +956,16 @@ function throwIfAdmissionCancelled(admission: SupervisorPromptAdmission | undefi
 	if (admission?.status === "cancelled") throw new PromptAdmissionCancelledError();
 }
 
+type SupervisorCommandHandler<K extends DaemonCommand["type"] = DaemonCommand["type"]> = (
+	client: DaemonSocketClient,
+	command: Extract<DaemonCommand, { type: K }>,
+	cancellationAdmission?: SupervisorPromptAdmission,
+) => Promise<DaemonResponse | undefined>;
+
+type SupervisorCommandHandlers = {
+	[K in DaemonCommand["type"]]?: SupervisorCommandHandler<K>;
+};
+
 class SupervisorRecoveryCancelledError extends Error {
 	readonly code = "supervisor_recovery_cancelled" as const;
 }
@@ -3116,826 +3126,68 @@ export class DaemonSupervisor {
 		}
 	}
 
+	private commandHandlersCache?: SupervisorCommandHandlers;
+
+	/**
+	 * Commands the supervisor answers or shapes itself, keyed by command type. Types
+	 * absent here fall through to send_message shaping, the agent-origin abort gate,
+	 * then the generic worker forward. Built lazily because prototype-only test
+	 * harnesses never run the constructor, so a field initializer would leave them
+	 * without a table.
+	 */
+	private get commandHandlers(): SupervisorCommandHandlers {
+		this.commandHandlersCache ??= {
+			cancel_prompt_admission: (client, command, cancellationAdmission) =>
+				this.handleCancelPromptAdmission(client, command, cancellationAdmission),
+			ack_result: (client, command) => this.handleAckResult(client, command),
+			declare_client_capabilities: (client, command) => this.handleDeclareClientCapabilities(client, command),
+			list: (client, command) => this.handleList(client, command),
+			roster_subscribe: (client, command) => this.handleRosterSubscribe(client, command),
+			roster_unsubscribe: (client, command) => this.handleRosterUnsubscribe(client, command),
+			list_agent_peers: (_client, command) => this.handleListAgentPeers(command),
+			get_direct_worker_transport: (client, command) => this.handleGetDirectWorkerTransport(client, command),
+			list_saved_sessions: (client, command) => this.handleSavedSessionList(client, command),
+			create: (client, command) => this.handleCreate(client, command),
+			attach: (client, command) => this.handleAttach(client, command),
+			reattach: (client, command) => this.handleReattach(client, command),
+			acquire_session_input_pause: (client, command) => this.handleAcquireSessionInputPause(client, command),
+			release_session_input_pause: (client, command) => this.handleReleaseSessionInputPause(client, command),
+			detach: (client, command) => this.handleDetach(client, command),
+			complete_owned_session: (client, command) => this.handleCompleteOwnedSession(client, command),
+			promote_owned_session: (client, command) => this.handlePromoteOwnedSession(client, command),
+			retry_worker: (client, command) => this.handleRetryWorker(client, command),
+			restart: (_client, command) => this.handleRestart(command),
+			shutdown: (_client, command) => this.handleShutdown(command),
+			prepare_update_restart: (_client, command) => this.handlePrepareUpdateRestart(command),
+			agent_messages_status: (client, command) => this.handleAgentMessagesStatus(client, command),
+			agent_messages_pause: (client, command) => this.handleAgentMessagesPauseResume(client, command),
+			agent_messages_resume: (client, command) => this.handleAgentMessagesPauseResume(client, command),
+			cron_list: (client, command) => this.handleCronList(client, command),
+			heartbeats_list: (client, command) => this.handleHeartbeatsList(client, command),
+			heartbeat_manage: (client, command) => this.handleHeartbeatManage(client, command),
+			cron_add: (client, command) => this.handleCronAdd(client, command),
+			cron_cancel: (client, command) => this.handleCronCancel(client, command),
+			heartbeat_get: (client, command) => this.handleHeartbeatGet(client, command),
+			heartbeat_set: (client, command) => this.handleHeartbeatSet(client, command),
+			heartbeat_update: (client, command) => this.handleHeartbeatUpdate(client, command),
+			rename_saved_session: (client, command) => this.handleRenameSavedSession(client, command),
+			delete_saved_session: (client, command) => this.handleDeleteSavedSession(client, command),
+		};
+		return this.commandHandlersCache;
+	}
+
 	private async handleCommand(
 		client: DaemonSocketClient,
 		command: DaemonCommand,
 		cancellationAdmission?: SupervisorPromptAdmission,
 	): Promise<DaemonResponse | undefined> {
-		switch (command.type) {
-			case "cancel_prompt_admission": {
-				const admission =
-					cancellationAdmission ?? this.getPromptAdmission(client, command.activeSessionId, command.admissionId);
-				if (!admission) return success(command.id, command.type, { status: "unknown" as const });
-				if (admission.status === "owned") return success(command.id, command.type, { status: "owned" as const });
-				// A definitive cancellation never downgrades to unknown/waiting.
-				if (admission.status === "cancelled") {
-					return success(command.id, command.type, { status: "cancelled" as const });
-				}
-				if (!admission.worker || !admission.workerActiveSessionId) {
-					admission.status = "cancelled";
-					admission.controller.abort();
-					return success(command.id, command.type, { status: "cancelled" as const });
-				}
-				const response = await this.forwardToWorker(admission.worker, {
-					...command,
-					activeSessionId: admission.workerActiveSessionId,
-					admissionId: admission.workerAdmissionId,
-				});
-				const status =
-					response.success && response.data && typeof response.data === "object" && "status" in response.data
-						? (response.data as { status: "cancelled" | "owned" | "unknown" }).status
-						: "unknown";
-				// Re-read: a socket close may have cancelled during the round-trip (cast widens TS's pre-await narrowing).
-				const current = (admission as SupervisorPromptAdmission).status;
-				if (status === "owned") admission.status = "owned";
-				else if (status === "cancelled") admission.status = "cancelled";
-				else if (current !== "cancelled") admission.status = "waiting";
-				return { ...response, id: command.id };
-			}
-			case "ack_result":
-				this.commandJournal.acknowledge(client.id, command.commandId);
-				return undefined;
-			case "declare_client_capabilities": {
-				// Connection-level command-gating set. Distinct from attach event
-				// capabilities. Re-declarations replace the previous set.
-				client.declaredCommandCapabilities = new Set(normalizeDeclaredCapabilities(command.capabilities));
-				client.declaredCapabilities = true;
-				return success(command.id, command.type, { declared: [...client.declaredCommandCapabilities] });
-			}
-			case "list":
-				return this.handleList(client, command);
-			case "roster_subscribe":
-				client.rosterSubscribed = true;
-				return success(command.id, command.type, { roster: this.rosterEntriesForClient() });
-			case "roster_unsubscribe":
-				client.rosterSubscribed = false;
-				client.rosterResyncPending = false;
-				return success(command.id, command.type);
-			case "list_agent_peers": {
-				const requester = [...this.workers.values()].find(
-					(worker) => worker.descriptor.authenticationToken === command.workerToken,
-				);
-				if (!requester) throw new Error("Worker authentication failed");
-				const peers = [...this.workers.values()]
-					.filter(
-						(worker) =>
-							worker !== requester &&
-							this.isLiveWorker(worker) &&
-							worker.descriptor.lifecycle === "ready" &&
-							worker.client !== undefined,
-					)
-					.flatMap((worker) => {
-						const root = this.roster().byActiveSessionId(worker.descriptor.rootActiveSessionId);
-						return root ? [this.agentPeerSummary(sessionSummaryFromRosterEntry(root))] : [];
-					});
-				return success(command.id, command.type, { peers });
-			}
-			case "get_direct_worker_transport": {
-				const match = await this.findWorkerForClient(client, command.activeSessionId);
-				if (match.worker.descriptor.ownerClientId !== undefined) {
-					throw new Error("Direct transport is unavailable for client-owned workers");
-				}
-				const ticket = await this.issuePeerTransport(match.worker, match.summary);
-				return success(command.id, command.type, ticket);
-			}
-			case "list_saved_sessions":
-				return this.handleSavedSessionList(client, command);
-			case "create": {
-				const worker = await this.createOrReuseWorker(this.protocolClientId(client), command);
-				const requestedSummary = command.sessionPath
-					? this.findSummaryInWorker(worker, command.sessionPath)
-					: undefined;
-				if (
-					requestedSummary &&
-					(requestedSummary.activeSessionId ?? requestedSummary.id) !== worker.descriptor.rootActiveSessionId
-				) {
-					// A create forwarded to a recovering worker still surfaces an opaque lifecycle error.
-					const response = await this.forwardToWorker(worker, withoutSupervisorCreateFields(command));
-					if (response.success && isSessionSummary(response.data)) {
-						this.writeRosterEntry(workerRosterEntryFromSummary(response.data), worker);
-						return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
-					}
-					return responseWithId(response, command.id);
-				}
-				const root = this.roster().byActiveSessionId(worker.descriptor.rootActiveSessionId);
-				if (!root) {
-					throw new Error("Session worker started without a root session");
-				}
-				return success(command.id, "create", this.publicSummary(worker, sessionSummaryFromRosterEntry(root)));
-			}
-			case "attach": {
-				const attached = await this.attachClient(client, command);
-				// A client-driven attach reseeds the whole view, so any catch-up
-				// failure streak for that session is over (I-8).
-				this.noteClientViewReseeded(
-					client,
-					attached.result.activeSessionId,
-					attached.result.lastEventCursor?.generation,
-				);
-				// A slim_attach_transcript client was already served its tail window
-				// inline by attachClient; there is no chunk transfer to stream.
-				if (client.capabilities.has("chunked_snapshot") && !client.capabilities.has("slim_attach_transcript")) {
-					const transcript = attached.transcript;
-					if (!transcript) {
-						attached.releaseSnapshotReservation?.();
-						this.releaseDeferredSessionPayloads(client, attached.result.activeSessionId, false);
-						throw new Error("Session worker did not provide a snapshot transcript");
-					}
-					const streamedResult = this.createStreamedAttachResult(attached.result, transcript);
-					try {
-						this.write(client, success(command.id, "attach", streamedResult));
-						void this.streamSnapshot(
-							client,
-							attached.worker,
-							streamedResult,
-							transcript,
-							"attach",
-							attached.releaseTranscript,
-							// attachClient pre-registered the attach; the stream releases that
-							// reservation in its finally and replays the payloads the load
-							// window deferred behind it.
-							attached.releaseSnapshotReservation,
-						).catch((error) =>
-							this.log(
-								`Failed to stream attach snapshot for ${streamedResult.activeSessionId}: ${String(error)}`,
-							),
-						);
-					} catch (error) {
-						attached.releaseSnapshotReservation?.();
-						this.releaseDeferredSessionPayloads(client, attached.result.activeSessionId, false);
-						attached.releaseTranscript?.();
-						throw error;
-					}
-					return undefined;
-				}
-				// The response is the snapshot for a non-streamed attach, so the
-				// reservation lifts only after it is written: payloads deferred during
-				// the load replay after it, never before it.
-				this.write(client, success(command.id, "attach", attached.result));
-				attached.releaseSnapshotReservation?.();
-				this.releaseDeferredSessionPayloads(client, attached.result.activeSessionId, true);
-				return undefined;
-			}
-			case "reattach": {
-				const target = await this.findWorkerForClient(client, command.targetActiveSessionId);
-				const targetActiveSessionId = target.summary.activeSessionId ?? target.summary.id;
-				if (targetActiveSessionId === command.activeSessionId) {
-					const detachingSessions = this.detachingInputPauseSessions?.get(client);
-					detachingSessions?.delete(command.activeSessionId);
-					detachingSessions?.delete(command.targetActiveSessionId);
-					detachingSessions?.delete(targetActiveSessionId);
-					return success(command.id, command.type, { cancelled: false });
-				}
-				const targetWasAttached = client.attachedActiveSessionIds.has(targetActiveSessionId);
-				const releaseSnapshotReservation = this.reserveSnapshotStream(client, targetActiveSessionId);
-				let releaseTranscript: (() => void) | undefined;
-				client.attachedActiveSessionIds.add(targetActiveSessionId);
-				try {
-					const attached = await this.attachClient(client, {
-						...command,
-						type: "attach",
-						activeSessionId: targetActiveSessionId,
-					});
-					const detachingSessions = this.detachingInputPauseSessions?.get(client);
-					detachingSessions?.delete(command.activeSessionId);
-					detachingSessions?.delete(command.targetActiveSessionId);
-					detachingSessions?.delete(targetActiveSessionId);
-					if (client.capabilities.has("chunked_snapshot") && !client.capabilities.has("slim_attach_transcript")) {
-						const transcript =
-							attached.transcript ?? this.getOrCreateTranscriptCache(attached.worker, attached.result);
-						releaseTranscript = attached.releaseTranscript;
-						const streamedResult = this.createStreamedAttachResult(attached.result, transcript);
-						this.write(client, success(command.id, command.type, streamedResult));
-						this.detachClient(client, command.activeSessionId);
-						const streaming = this.streamSnapshot(
-							client,
-							attached.worker,
-							streamedResult,
-							transcript,
-							"replacement",
-							releaseTranscript,
-							releaseSnapshotReservation,
-						);
-						releaseTranscript = undefined;
-						void streaming.catch((error) =>
-							this.log(`Failed to stream reattach snapshot for ${targetActiveSessionId}: ${String(error)}`),
-						);
-						return undefined;
-					}
-					this.write(client, success(command.id, command.type, attached.result));
-					this.detachClient(client, command.activeSessionId);
-					releaseSnapshotReservation();
-					this.releaseDeferredSessionPayloads(client, targetActiveSessionId, true);
-					return undefined;
-				} catch (error) {
-					releaseTranscript?.();
-					if (!targetWasAttached) {
-						this.detachClient(client, targetActiveSessionId);
-					}
-					releaseSnapshotReservation();
-					this.releaseDeferredSessionPayloads(client, targetActiveSessionId, targetWasAttached);
-					throw error;
-				}
-			}
-			case "acquire_session_input_pause": {
-				const detachingSessions = this.detachingInputPauseSessions.get(client);
-				if (detachingSessions?.has(command.activeSessionId)) {
-					throw new Error(`Session is detaching: ${command.activeSessionId}`);
-				}
-				const match = await this.findWorkerForClient(client, command.activeSessionId);
-				const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
-				if (detachingSessions?.has(command.activeSessionId) || detachingSessions?.has(activeSessionId)) {
-					throw new Error(`Session is detaching: ${command.activeSessionId}`);
-				}
-				const ownerClientId = this.protocolClientId(client);
-				const connectionId = this.connectionIds.get(client);
-				if (!connectionId) throw new Error("Daemon client connection identity is unavailable");
-				const acquisitionEpoch = this.sessionInputPauseEpochs.get(client) ?? 0;
-				const existing = [...this.sessionInputPauses.values()].find(
-					(entry) =>
-						entry.owner === client &&
-						entry.worker === match.worker &&
-						entry.activeSessionId === activeSessionId &&
-						entry.leaseKey === command.leaseKey &&
-						!entry.releaseTask,
-				);
-				if (existing) {
-					return success(command.id, command.type, { pauseId: existing.pauseId });
-				}
-				const response = await this.forwardToWorker(match.worker, {
-					...command,
-					activeSessionId,
-					leaseKey: JSON.stringify([connectionId, ownerClientId, command.leaseKey]),
-				});
-				if (!response.success) return response;
-				const pauseId = (response.data as { pauseId?: unknown } | undefined)?.pauseId;
-				if (typeof pauseId !== "string") throw new Error("Worker returned an invalid session input pause id");
-				if (!this.clients.has(client) || (this.sessionInputPauseEpochs.get(client) ?? 0) !== acquisitionEpoch) {
-					try {
-						const release = await this.forwardToWorker(match.worker, {
-							id: randomUUID(),
-							type: "release_session_input_pause",
-							activeSessionId,
-							pauseId,
-						});
-						if (!release.success) throw new Error(release.error);
-					} catch (error) {
-						const invalidated = match.worker.client;
-						if (invalidated) {
-							// Close and deregister as a pair, in the order the other disconnect
-							// paths use: `handleWorkerClose` only acts while `worker.client`
-							// still names this client, so it has to run first. Leaving the
-							// registration pointing at a closed client keeps it claiming a ready
-							// transport until the 'close' event lands, and a delivery dispatched
-							// in that window fails without a byte being written.
-							const failure = error instanceof Error ? error : new Error(String(error));
-							this.background(
-								this.handleWorkerClose(match.worker, invalidated, failure),
-								`worker close handling for ${match.worker.descriptor.workerId}`,
-							);
-							invalidated.close();
-						}
-						throw error;
-					}
-					throw new Error("Session input pause acquisition was invalidated before completion");
-				}
-				this.sessionInputPauses.set(pauseId, {
-					owner: client,
-					worker: match.worker,
-					activeSessionId,
-					requestedActiveSessionId: command.activeSessionId,
-					leaseKey: command.leaseKey,
-					pauseId,
-				});
-				return response;
-			}
-			case "release_session_input_pause": {
-				const entry = this.sessionInputPauses.get(command.pauseId);
-				if (!entry) return success(command.id, command.type);
-				if (entry.owner !== client) {
-					throw new Error(`Session input pause is owned by another client: ${command.pauseId}`);
-				}
-				if (
-					command.activeSessionId !== entry.activeSessionId &&
-					command.activeSessionId !== entry.requestedActiveSessionId
-				) {
-					throw new Error(`Session input pause belongs to another session: ${command.pauseId}`);
-				}
-				const releaseTask =
-					entry.releaseTask ??
-					this.forwardToWorker(entry.worker, {
-						...command,
-						activeSessionId: entry.activeSessionId,
-					});
-				entry.releaseTask = releaseTask;
-				try {
-					const response = await releaseTask;
-					if (response.success && this.sessionInputPauses.get(command.pauseId) === entry) {
-						this.sessionInputPauses.delete(command.pauseId);
-					}
-					return response;
-				} finally {
-					if (this.sessionInputPauses.get(command.pauseId) === entry && entry.releaseTask === releaseTask) {
-						entry.releaseTask = undefined;
-					}
-				}
-			}
-			case "detach": {
-				const detachingSessions = this.detachingInputPauseSessions.get(client) ?? new Set<string>();
-				this.detachingInputPauseSessions.set(client, detachingSessions);
-				if (command.activeSessionId) detachingSessions.add(command.activeSessionId);
-				else for (const activeSessionId of client.attachedActiveSessionIds) detachingSessions.add(activeSessionId);
-				this.sessionInputPauseEpochs.set(client, (this.sessionInputPauseEpochs.get(client) ?? 0) + 1);
-				this.detachClient(client, command.activeSessionId);
-				await this.releaseClientSessionInputPauses(client, command.activeSessionId, true);
-				return success(command.id, "detach");
-			}
-			case "complete_owned_session": {
-				const match = await this.findWorkerForClient(client, command.activeSessionId);
-				if (match.worker.descriptor.ownerClientId !== this.protocolClientId(client)) {
-					throw new Error("Session is not owned by this client");
-				}
-				if (match.worker.ownerCleanupTimer) {
-					clearTimeout(match.worker.ownerCleanupTimer);
-					match.worker.ownerCleanupTimer = undefined;
-				}
-				await this.stopWorker(match.worker, true);
-				return success(command.id, command.type);
-			}
-			case "promote_owned_session": {
-				const match = await this.findWorkerForClient(client, command.activeSessionId);
-				await this.promoteOwnedWorker(client, match.worker);
-				return success(command.id, command.type, this.publicSummary(match.worker, match.summary));
-			}
-			case "retry_worker": {
-				const direct = [...this.workers.values()].find(
-					(worker) =>
-						worker.descriptor.rootActiveSessionId === command.activeSessionId ||
-						worker.descriptor.rootSessionId === command.activeSessionId,
-				);
-				const worker = direct ?? (await this.findWorkerForClient(client, command.activeSessionId)).worker;
-				this.assertWorkerAccessibleToClient(client, worker, command.activeSessionId);
-				if ((this.workerStopCounts?.get(worker) ?? 0) > 0) {
-					throw new Error("Session worker is stopping; retry after it finishes");
-				}
-				await this.retryWorkerRecovery(worker);
-				if (this.workers.get(worker.descriptor.workerId)?.descriptor.lifecycle !== "ready") {
-					throw new Error(worker.descriptor.lastError ?? "Session worker recovery failed");
-				}
-				const summary = worker.summaries.get(worker.descriptor.rootActiveSessionId);
-				return success(command.id, command.type, summary ? this.publicSummary(worker, summary) : undefined);
-			}
-			case "restart":
-				setImmediate(() => this.background(this.shutdown(0, false, true, false, "update"), "restart shutdown"));
-				return success(command.id, command.type);
-			case "shutdown": {
-				// An update-restart coordinator stops a prepared daemon with this command;
-				// attached windows need the "update" reason to recover instead of dying.
-				// Capture the reason now: a later phase change must not rewrite it.
-				const closingReason: DaemonClosingReason = this.updateRestartPhase === "prepared" ? "update" : "shutdown";
-				setImmediate(() =>
-					this.background(this.shutdown(0, true, false, command.force === true, closingReason), "daemon shutdown"),
-				);
-				return success(command.id, "shutdown");
-			}
-			case "prepare_update_restart": {
-				const manifest = await this.prepareUpdateRestart();
-				return success(command.id, "prepare_update_restart", manifest);
-			}
-			case "agent_messages_status": {
-				if (command.activeSessionId) {
-					const match = await this.findWorkerForClient(client, command.activeSessionId);
-					return this.forwardToWorker(match.worker, command);
-				}
-				const first = [...this.workers.values()].find((worker) => this.isLiveWorker(worker) && worker.client);
-				if (!first) {
-					return success(command.id, command.type, { paused: false, limits: {} });
-				}
-				return this.forwardToWorker(first, command);
-			}
-			case "agent_messages_pause":
-			case "agent_messages_resume": {
-				if (command.activeSessionId) {
-					const match = await this.findWorkerForClient(client, command.activeSessionId);
-					return this.forwardToWorker(match.worker, command);
-				}
-				const responses = await Promise.all(
-					[...this.workers.values()]
-						.filter((worker) => this.isLiveWorker(worker) && worker.client)
-						.map((worker) => this.forwardToWorker(worker, command)),
-				);
-				const failed = responses.find((response) => !response.success);
-				return failed ?? success(command.id, command.type, responses.find((response) => response.success)?.data);
-			}
-			case "cron_list": {
-				if (command.activeSessionId) {
-					const match = await this.findWorkerForClient(client, command.activeSessionId);
-					return this.forwardToWorker(match.worker, command);
-				}
-				const jobs = new Map<string, AgentCronJob>();
-				const responses = await Promise.all(
-					[...this.workers.values()]
-						.filter(
-							(worker) => this.isLiveWorker(worker) && worker.client && worker.descriptor.lifecycle === "ready",
-						)
-						.map((worker) =>
-							this.forwardToWorker(worker, command, 5000).catch((error: unknown) =>
-								failure(command.id, command.type, error, serializeDaemonError(error)),
-							),
-						),
-				);
-				for (const response of responses) {
-					if (!response.success) {
-						this.log(`Could not list scheduled jobs from a worker: ${response.error}`);
-						continue;
-					}
-					for (const job of cronJobsFromResponse(response)) {
-						jobs.set(job.id, job);
-					}
-				}
-				for (const { job } of await this.collectPassiveScheduledJobs(command.includeInactive === true)) {
-					if (!jobs.has(job.id)) jobs.set(job.id, job);
-				}
-				return success(command.id, "cron_list", { jobs: sortCronJobs([...jobs.values()]) });
-			}
-			case "heartbeats_list": {
-				if (command.activeSessionId) {
-					const match = await this.findWorkerForClient(client, command.activeSessionId);
-					// The forward may first join an in-flight recovery whose budget far exceeds
-					// the client's request timeout, so bound the whole operation: a stuck or
-					// still-recovering worker fails daemon-side inside the caller's budget
-					// instead of surfacing as a client transport timeout.
-					const forward = this.forwardToWorker(match.worker, command, HEARTBEAT_LIST_FORWARD_TIMEOUT_MS);
-					const forwardDeadline = sleep(HEARTBEAT_LIST_FORWARD_TIMEOUT_MS, { unref: true }).then(() => {
-						throw new Error(
-							`Timed out waiting for session worker to list heartbeats within ${HEARTBEAT_LIST_FORWARD_TIMEOUT_MS}ms`,
-						);
-					});
-					return Promise.race([forward, forwardDeadline]).catch((error: unknown) =>
-						failure(command.id, command.type, error, serializeDaemonError(error)),
-					);
-				}
-				const openings = [...this.catalogOpeningWorkers.values()];
-				const selectedWorkers = new Set(this.workers.values());
-				for (const opening of openings) {
-					opening.then(
-						(worker) => selectedWorkers.add(worker),
-						() => undefined,
-					);
-				}
-				// Slow launches must not outrun the caller's request budget: after
-				// HEARTBEAT_LIST_LAUNCH_WAIT_MS the catalog proceeds with whatever
-				// registered, and workers that are still starting surface through the
-				// per-worker state error below instead of being omitted.
-				await Promise.race([Promise.allSettled(openings), sleep(HEARTBEAT_LIST_LAUNCH_WAIT_MS, { unref: true })]);
-				for (const worker of this.workers.values()) {
-					selectedWorkers.add(worker);
-				}
-				const workers = [...this.workers.values()].filter(
-					(worker) =>
-						selectedWorkers.has(worker) && this.isLiveWorker(worker) && worker.descriptor.lifecycle !== "failed",
-				);
-				const heartbeats = new Map<string, AgentConnectionHeartbeat>();
-				// Per-worker independence (F4). This was a Promise.all whose first failure
-				// response became the whole list's response and whose slowest worker set the
-				// latency, so one wedged worker burned the full forward budget on every
-				// session switch and one recovering worker hid every healthy heartbeat.
-				// Each worker now settles on its own and answers with its live list or, when
-				// that fails, its last complete snapshot; anything else is a counted absence.
-				const shares = await Promise.allSettled(
-					workers.map(async (worker): Promise<HeartbeatFanoutShare> => {
-						const workerId = worker.descriptor.workerId;
-						// A last complete snapshot answers whenever the worker has not said its
-						// heartbeats changed since; one it declared stale must not. Read at the
-						// point of use, because a heartbeats_changed frame can land mid-forward.
-						const freshSnapshot = (): AgentConnectionHeartbeat[] | undefined =>
-							worker.heartbeatSnapshot !== undefined && worker.heartbeatSnapshotStale !== true
-								? worker.heartbeatSnapshot
-								: undefined;
-						if (worker.client && worker.descriptor.lifecycle === "ready") {
-							const deadline = sleep(HEARTBEAT_LIST_FANOUT_TIMEOUT_MS, { unref: true }).then(() => {
-								throw new Error(
-									`Timed out listing heartbeats on worker ${workerId} within ${HEARTBEAT_LIST_FANOUT_TIMEOUT_MS}ms`,
-								);
-							});
-							// Bounded as a whole, not just the request: the forward first joins an
-							// in-flight recovery whose budget is not ours to set.
-							const response = await Promise.race([
-								this.forwardToWorker(worker, command, HEARTBEAT_LIST_FANOUT_TIMEOUT_MS),
-								deadline,
-							]).catch((error: unknown) =>
-								failure(command.id, command.type, error, serializeDaemonError(error)),
-							);
-							if (response.success) {
-								const listed = heartbeatsFromResponse(response);
-								worker.heartbeatSnapshot = listed;
-								worker.heartbeatSnapshotStale = false;
-								return { workerId, heartbeats: listed };
-							}
-							const cached = freshSnapshot();
-							return cached === undefined
-								? { workerId, absence: response }
-								: { workerId, heartbeats: cached, absence: response };
-						}
-						const cached = freshSnapshot();
-						if (cached !== undefined) {
-							return { workerId, heartbeats: cached };
-						}
-						const state = worker.descriptor.lifecycle === "ready" ? "disconnected" : worker.descriptor.lifecycle;
-						const error = new Error(`Cannot list heartbeats while session worker is ${state}`);
-						return { workerId, absence: failure(command.id, command.type, error, serializeDaemonError(error)) };
-					}),
-				);
-				const absent: string[] = [];
-				let answered = 0;
-				let firstAbsence: DaemonResponse | undefined;
-				for (const share of shares) {
-					if (share.status === "rejected") {
-						// The attempt above catches its own failures, so a rejection is a defect:
-						// cost that worker's rows, never the healthy workers'.
-						firstAbsence ??= failure(command.id, command.type, share.reason, serializeDaemonError(share.reason));
-						absent.push(
-							`unknown worker (${share.reason instanceof Error ? share.reason.message : String(share.reason)})`,
-						);
-						continue;
-					}
-					if (share.value.heartbeats !== undefined) {
-						answered += 1;
-						for (const heartbeat of share.value.heartbeats) {
-							heartbeats.set(heartbeat.job.id, heartbeat);
-						}
-					}
-					const absence = share.value.absence;
-					if (absence === undefined) {
-						continue;
-					}
-					firstAbsence ??= absence;
-					absent.push(`${share.value.workerId} (${absence.success ? "no error reported" : absence.error})`);
-				}
-				// Total blindness is still a failure: an empty success would tell every
-				// client "no heartbeats armed" when in fact nothing could be asked.
-				if (answered === 0 && firstAbsence !== undefined) {
-					return firstAbsence;
-				}
-				if (absent.length > 0) {
-					this.log(
-						`heartbeats_list is partial: ${absent.length} of ${workers.length} workers could not answer: ${absent.join(", ")}`,
-					);
-				}
-				// Passivated sessions keep their armed heartbeats; no worker can list them.
-				// Served from the shared snapshot: this loop is on the response path of every
-				// session switch, and a fresh scan per request is what pushed concurrent
-				// lists past the client transport deadline.
-				for (const { job, info } of await this.catalogPassiveScheduledJobs()) {
-					if (!isHeartbeatCronJob(job) || heartbeats.has(job.id)) continue;
-					heartbeats.set(job.id, {
-						job,
-						...(info.name !== undefined ? { sessionName: info.name } : {}),
-						...(info.firstMessage !== undefined ? { firstMessage: info.firstMessage } : {}),
-					});
-				}
-				return success(command.id, "heartbeats_list", { heartbeats: [...heartbeats.values()] });
-			}
-			case "heartbeat_manage": {
-				const cachedWorker = [...this.workers.values()].find((worker) =>
-					worker.heartbeatSnapshot?.some(
-						(heartbeat) =>
-							heartbeat.job.id === command.jobId && heartbeat.job.activeSessionId === command.activeSessionId,
-					),
-				);
-				if (!cachedWorker) {
-					// Passive jobs are managed against their durable store; no wake just to flip a status.
-					const passive = (await this.collectPassiveScheduledJobs()).find(
-						({ job }) => job.id === command.jobId && job.activeSessionId === command.activeSessionId,
-					);
-					if (passive) {
-						const store = AgentCronJobStore.forSessionArtifacts();
-						store.registerSessionArtifact(
-							passive.info.id,
-							getSessionArtifactPathForFile(resolve(passive.info.path), passive.info.id),
-						);
-						const heartbeat = store.manageHeartbeat(command.activeSessionId, command.jobId, command.action);
-						if (heartbeat) {
-							this.broadcastHeartbeatsChanged();
-							return success(command.id, "heartbeat_manage", { heartbeat });
-						}
-					}
-				}
-				const worker = cachedWorker ?? (await this.findWorkerForClient(client, command.activeSessionId)).worker;
-				this.assertWorkerAccessibleToClient(client, worker, command.activeSessionId);
-				const response = await this.forwardToWorker(worker, command);
-				if (
-					response.success &&
-					response.data &&
-					typeof response.data === "object" &&
-					"heartbeat" in response.data
-				) {
-					const job = (response.data as { heartbeat?: AgentCronJob }).heartbeat;
-					if (job && worker.heartbeatSnapshot) {
-						const existing = worker.heartbeatSnapshot.find((heartbeat) => heartbeat.job.id === job.id);
-						const remaining = worker.heartbeatSnapshot.filter((heartbeat) => heartbeat.job.id !== job.id);
-						worker.heartbeatSnapshot =
-							job.status === "active" || job.status === "paused"
-								? [...remaining, existing ? { ...existing, job } : { job }]
-								: remaining;
-					}
-				}
-				return response;
-			}
-			case "cron_add": {
-				const match = await this.findWorkerForClient(client, command.activeSessionId);
-				const response = await this.forwardToWorker(match.worker, command);
-				if (response.success && command.promoteOwnedSession) {
-					await this.promoteOwnedWorker(client, match.worker);
-				}
-				return response;
-			}
-			case "cron_cancel": {
-				if (command.activeSessionId) {
-					const match = await this.findWorkerForClient(client, command.activeSessionId);
-					return this.forwardToWorker(match.worker, command);
-				}
-				const listed = await Promise.all(
-					[...this.workers.values()]
-						.filter(
-							(worker) => this.isLiveWorker(worker) && worker.client && worker.descriptor.lifecycle === "ready",
-						)
-						.map(async (worker) => ({
-							worker,
-							response: await this.forwardToWorker(
-								worker,
-								{ type: "cron_list", includeInactive: true },
-								5000,
-							).catch(() => undefined),
-						})),
-				);
-				for (const candidate of listed) {
-					if (
-						candidate.response?.success &&
-						cronJobsFromResponse(candidate.response).some((job) => job.id === command.jobId)
-					) {
-						return this.forwardToWorker(candidate.worker, command);
-					}
-				}
-				const passive = (await this.collectPassiveScheduledJobs()).find(({ job }) => job.id === command.jobId);
-				if (passive) {
-					const store = AgentCronJobStore.forSessionArtifacts();
-					store.registerSessionArtifact(
-						passive.info.id,
-						getSessionArtifactPathForFile(resolve(passive.info.path), passive.info.id),
-					);
-					const job = store.cancel(command.jobId);
-					if (job) {
-						this.broadcastHeartbeatsChanged();
-						return success(command.id, "cron_cancel", { job });
-					}
-				}
-				throw new Error(`No cron job found: ${command.jobId}`);
-			}
-			case "heartbeat_get": {
-				const match = await this.findWorkerForClient(client, command.activeSessionId);
-				return this.forwardToWorker(match.worker, command);
-			}
-			case "heartbeat_set": {
-				const match = await this.findWorkerForClient(client, command.activeSessionId);
-				const response = await this.forwardToWorker(match.worker, command);
-				if (response.success && command.promoteOwnedSession) {
-					await this.promoteOwnedWorker(client, match.worker);
-				}
-				return response;
-			}
-			case "heartbeat_update": {
-				const match = await this.findWorkerForClient(client, command.activeSessionId);
-				return this.forwardToWorker(match.worker, command);
-			}
-			case "rename_saved_session": {
-				const target = await this.savedSessionNameReservationInput(command.sessionPath, command.name.trim());
-				return await this.withSessionNameReservation(target, async () => {
-					await this.assertSupervisorSavedSessionNameAvailable(command.sessionPath, target.name);
-					if (!command.activeSessionId) {
-						await this.catalog.rename(command.sessionPath, command.name);
-						// Third rename write point: an offline saved-session rename
-						// changes the name the ledger carries for that child.
-						await this.rlmSpawnLedger()
-							.appendRenameByChildPath(command.sessionPath, target.name)
-							.catch((error) => {
-								this.log(
-									`failed to append RLM ledger rename: ${error instanceof Error ? error.message : String(error)}`,
-								);
-							});
-						const entry = this.roster().bySessionFile(canonicalSessionPath(command.sessionPath));
-						if (entry) {
-							this.writeRosterEntry({ ...entry, summary: { ...entry.summary, sessionName: target.name } });
-						}
-						// Heartbeat rows carry the owning session's display name; drop the
-						// snapshot so the next list shows the new one.
-						this.invalidatePassiveScheduledJobs();
-						return success(command.id, command.type);
-					}
-					const match = await this.findWorkerForClient(client, command.activeSessionId);
-					return await this.forwardToWorker(match.worker, {
-						...command,
-						activeSessionId: match.summary.activeSessionId ?? match.summary.id,
-					});
-				});
-			}
-			case "delete_saved_session":
-				if (!command.activeSessionId) {
-					const deletedPath = canonicalSessionPath(command.sessionPath);
-					const entry = this.roster().bySessionFile(deletedPath);
-					if (entry?.summary.activeSessionId !== undefined) {
-						throw new Error("Cannot delete the currently active session");
-					}
-					const owner = this.findWorkerBySessionFile(command.sessionPath);
-					if (owner) {
-						// A client-owned worker's files are invisible to other clients: a foreign delete is an unknown target.
-						this.assertWorkerAccessibleToClient(client, owner, command.sessionPath);
-						if (owner.client && !this.isWorkerStopping(owner)) {
-							return this.forwardToWorker(owner, command);
-						}
-						if (!(await this.reclaimStaleWorkerRegistration(owner))) {
-							throw new Error(
-								`Session worker is ${this.effectiveWorkerState(owner)}; retry the delete once it is reachable`,
-							);
-						}
-					}
-					await tombstoneSavedSessionDelete(this.rlmSpawnLedger(), command.sessionPath, entry?.summary);
-					const result = await this.catalog.delete(command.sessionPath);
-					if (result.ok && entry && this.roster().get(entry.agentId) === entry) {
-						this.roster().delete(entry.agentId);
-					}
-					// The deleted session's armed heartbeats must leave the catalog snapshot
-					// too; their rows would otherwise linger until the refresh TTL.
-					if (result.ok) this.invalidatePassiveScheduledJobs();
-					return success(command.id, command.type, result);
-				}
-				break;
+		const handler = this.commandHandlers[command.type] as SupervisorCommandHandler | undefined;
+		if (handler) {
+			return handler(client, command, cancellationAdmission);
 		}
-
 		if (command.type === "send_message") {
-			// Same gate the worker side applies (daemon-mode.ts): an empty target used to
-			// fall through to the catalog, where `"".startsWith` matches every saved
-			// session, so a single-session cwd silently retargeted the message while a
-			// multi-session one reported it as ambiguous.
-			assertDirectAgentMessageTarget(command.targetActiveSessionId);
-			// agentOrigin without fromActiveSessionId is trusted only at the direct socket-client boundary.
-			const source = command.fromActiveSessionId
-				? await this.findWorkerForClient(client, command.fromActiveSessionId)
-				: undefined;
-			let target: WorkerMatch;
-			try {
-				target = await this.findWorkerForClient(client, command.targetActiveSessionId);
-			} catch (error) {
-				if (!(error instanceof Error) || !error.message.startsWith("Unknown active session:")) throw error;
-				const cwd = source?.summary.cwd ?? this.defaultSessionConfig.cwd ?? process.cwd();
-				let sessionPath: string;
-				try {
-					sessionPath = await this.catalog.resolve(
-						command.targetActiveSessionId,
-						cwd,
-						source?.worker.descriptor.sessionDir ?? this.defaultSessionConfig.sessionDir,
-					);
-				} catch (catalogError) {
-					// Preserve selector ambiguity so a2a senders can distinguish it from
-					// the original unknown-active-session lookup failure.
-					if (catalogError instanceof Error && catalogError.message.startsWith("Ambiguous session selector")) {
-						throw catalogError;
-					}
-					throw error;
-				}
-				if (source && command.agentOrigin === true) {
-					const targetInfo = await readSessionInfo(sessionPath);
-					if (!targetInfo) throw new Error(`Unknown active session: ${command.targetActiveSessionId}`);
-					assertAgentFamilyReach(
-						this.familyCatalogEntry(source.summary),
-						this.familyCatalogEntry(summaryForInactiveSession(targetInfo)),
-					);
-				}
-				const worker = await this.createOrReuseWorker(this.protocolClientId(client), {
-					type: "create",
-					sessionPath,
-					continueRecent: false,
-				});
-				const root = this.roster().byActiveSessionId(worker.descriptor.rootActiveSessionId);
-				const summary =
-					this.findSummaryInWorker(worker, sessionPath) ??
-					(root ? sessionSummaryFromRosterEntry(root) : undefined);
-				if (!summary) throw new Error("Woken session worker has no target session");
-				target = { worker, summary };
-			}
-			const targetActiveSessionId = target.summary.activeSessionId ?? target.summary.id;
-			if (source && command.agentOrigin === true) {
-				assertAgentFamilyReach(this.familyCatalogEntry(source.summary), this.familyCatalogEntry(target.summary));
-			}
-			if (source) {
-				if ((source.summary.activeSessionId ?? source.summary.id) === targetActiveSessionId) {
-					throw new Error("Agent messaging cannot target the sending session");
-				}
-				return await this.deliverAgentMessage(client, command, source, target, targetActiveSessionId);
-			}
-			return this.forwardToWorker(target.worker, { ...command, targetActiveSessionId });
+			return this.handleSendMessage(client, command);
 		}
-
 		// Agent-originated aborts (agent_message.abort's cross-worker half): the plain
 		// abort commands would fall through to the generic forward below with no family
 		// gate, so the agent-origin shape gets the same reach proof a send_message gets.
@@ -3952,7 +3204,927 @@ export class DaemonSupervisor {
 				fromActiveSessionId: command.fromActiveSessionId,
 			});
 		}
+		return this.forwardRoutedCommand(client, command);
+	}
 
+	private async handleCancelPromptAdmission(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "cancel_prompt_admission" }>,
+		cancellationAdmission?: SupervisorPromptAdmission,
+	): Promise<DaemonResponse | undefined> {
+		const admission =
+			cancellationAdmission ?? this.getPromptAdmission(client, command.activeSessionId, command.admissionId);
+		if (!admission) return success(command.id, command.type, { status: "unknown" as const });
+		if (admission.status === "owned") return success(command.id, command.type, { status: "owned" as const });
+		// A definitive cancellation never downgrades to unknown/waiting.
+		if (admission.status === "cancelled") {
+			return success(command.id, command.type, { status: "cancelled" as const });
+		}
+		if (!admission.worker || !admission.workerActiveSessionId) {
+			admission.status = "cancelled";
+			admission.controller.abort();
+			return success(command.id, command.type, { status: "cancelled" as const });
+		}
+		const response = await this.forwardToWorker(admission.worker, {
+			...command,
+			activeSessionId: admission.workerActiveSessionId,
+			admissionId: admission.workerAdmissionId,
+		});
+		const status =
+			response.success && response.data && typeof response.data === "object" && "status" in response.data
+				? (response.data as { status: "cancelled" | "owned" | "unknown" }).status
+				: "unknown";
+		// Re-read: a socket close may have cancelled during the round-trip (cast widens TS's pre-await narrowing).
+		const current = (admission as SupervisorPromptAdmission).status;
+		if (status === "owned") admission.status = "owned";
+		else if (status === "cancelled") admission.status = "cancelled";
+		else if (current !== "cancelled") admission.status = "waiting";
+		return { ...response, id: command.id };
+	}
+
+	private async handleAckResult(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "ack_result" }>,
+	): Promise<DaemonResponse | undefined> {
+		this.commandJournal.acknowledge(client.id, command.commandId);
+		return undefined;
+	}
+
+	private async handleDeclareClientCapabilities(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "declare_client_capabilities" }>,
+	): Promise<DaemonResponse | undefined> {
+		// Connection-level command-gating set. Distinct from attach event
+		// capabilities. Re-declarations replace the previous set.
+		client.declaredCommandCapabilities = new Set(normalizeDeclaredCapabilities(command.capabilities));
+		client.declaredCapabilities = true;
+		return success(command.id, command.type, { declared: [...client.declaredCommandCapabilities] });
+	}
+
+	private async handleRosterSubscribe(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "roster_subscribe" }>,
+	): Promise<DaemonResponse | undefined> {
+		client.rosterSubscribed = true;
+		return success(command.id, command.type, { roster: this.rosterEntriesForClient() });
+	}
+
+	private async handleRosterUnsubscribe(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "roster_unsubscribe" }>,
+	): Promise<DaemonResponse | undefined> {
+		client.rosterSubscribed = false;
+		client.rosterResyncPending = false;
+		return success(command.id, command.type);
+	}
+
+	private async handleListAgentPeers(
+		command: Extract<DaemonCommand, { type: "list_agent_peers" }>,
+	): Promise<DaemonResponse | undefined> {
+		const requester = [...this.workers.values()].find(
+			(worker) => worker.descriptor.authenticationToken === command.workerToken,
+		);
+		if (!requester) throw new Error("Worker authentication failed");
+		const peers = [...this.workers.values()]
+			.filter(
+				(worker) =>
+					worker !== requester &&
+					this.isLiveWorker(worker) &&
+					worker.descriptor.lifecycle === "ready" &&
+					worker.client !== undefined,
+			)
+			.flatMap((worker) => {
+				const root = this.roster().byActiveSessionId(worker.descriptor.rootActiveSessionId);
+				return root ? [this.agentPeerSummary(sessionSummaryFromRosterEntry(root))] : [];
+			});
+		return success(command.id, command.type, { peers });
+	}
+
+	private async handleGetDirectWorkerTransport(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "get_direct_worker_transport" }>,
+	): Promise<DaemonResponse | undefined> {
+		const match = await this.findWorkerForClient(client, command.activeSessionId);
+		if (match.worker.descriptor.ownerClientId !== undefined) {
+			throw new Error("Direct transport is unavailable for client-owned workers");
+		}
+		const ticket = await this.issuePeerTransport(match.worker, match.summary);
+		return success(command.id, command.type, ticket);
+	}
+
+	private async handleCreate(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "create" }>,
+	): Promise<DaemonResponse | undefined> {
+		const worker = await this.createOrReuseWorker(this.protocolClientId(client), command);
+		const requestedSummary = command.sessionPath ? this.findSummaryInWorker(worker, command.sessionPath) : undefined;
+		if (
+			requestedSummary &&
+			(requestedSummary.activeSessionId ?? requestedSummary.id) !== worker.descriptor.rootActiveSessionId
+		) {
+			// A create forwarded to a recovering worker still surfaces an opaque lifecycle error.
+			const response = await this.forwardToWorker(worker, withoutSupervisorCreateFields(command));
+			if (response.success && isSessionSummary(response.data)) {
+				this.writeRosterEntry(workerRosterEntryFromSummary(response.data), worker);
+				return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
+			}
+			return responseWithId(response, command.id);
+		}
+		const root = this.roster().byActiveSessionId(worker.descriptor.rootActiveSessionId);
+		if (!root) {
+			throw new Error("Session worker started without a root session");
+		}
+		return success(command.id, "create", this.publicSummary(worker, sessionSummaryFromRosterEntry(root)));
+	}
+
+	private async handleAttach(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "attach" }>,
+	): Promise<DaemonResponse | undefined> {
+		const attached = await this.attachClient(client, command);
+		// A client-driven attach reseeds the whole view, so any catch-up
+		// failure streak for that session is over (I-8).
+		this.noteClientViewReseeded(client, attached.result.activeSessionId, attached.result.lastEventCursor?.generation);
+		// A slim_attach_transcript client was already served its tail window
+		// inline by attachClient; there is no chunk transfer to stream.
+		if (client.capabilities.has("chunked_snapshot") && !client.capabilities.has("slim_attach_transcript")) {
+			const transcript = attached.transcript;
+			if (!transcript) {
+				attached.releaseSnapshotReservation?.();
+				this.releaseDeferredSessionPayloads(client, attached.result.activeSessionId, false);
+				throw new Error("Session worker did not provide a snapshot transcript");
+			}
+			const streamedResult = this.createStreamedAttachResult(attached.result, transcript);
+			try {
+				this.write(client, success(command.id, "attach", streamedResult));
+				void this.streamSnapshot(
+					client,
+					attached.worker,
+					streamedResult,
+					transcript,
+					"attach",
+					attached.releaseTranscript,
+					// attachClient pre-registered the attach; the stream releases that
+					// reservation in its finally and replays the payloads the load
+					// window deferred behind it.
+					attached.releaseSnapshotReservation,
+				).catch((error) =>
+					this.log(`Failed to stream attach snapshot for ${streamedResult.activeSessionId}: ${String(error)}`),
+				);
+			} catch (error) {
+				attached.releaseSnapshotReservation?.();
+				this.releaseDeferredSessionPayloads(client, attached.result.activeSessionId, false);
+				attached.releaseTranscript?.();
+				throw error;
+			}
+			return undefined;
+		}
+		// The response is the snapshot for a non-streamed attach, so the
+		// reservation lifts only after it is written: payloads deferred during
+		// the load replay after it, never before it.
+		this.write(client, success(command.id, "attach", attached.result));
+		attached.releaseSnapshotReservation?.();
+		this.releaseDeferredSessionPayloads(client, attached.result.activeSessionId, true);
+		return undefined;
+	}
+
+	private async handleReattach(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "reattach" }>,
+	): Promise<DaemonResponse | undefined> {
+		const target = await this.findWorkerForClient(client, command.targetActiveSessionId);
+		const targetActiveSessionId = target.summary.activeSessionId ?? target.summary.id;
+		if (targetActiveSessionId === command.activeSessionId) {
+			const detachingSessions = this.detachingInputPauseSessions?.get(client);
+			detachingSessions?.delete(command.activeSessionId);
+			detachingSessions?.delete(command.targetActiveSessionId);
+			detachingSessions?.delete(targetActiveSessionId);
+			return success(command.id, command.type, { cancelled: false });
+		}
+		const targetWasAttached = client.attachedActiveSessionIds.has(targetActiveSessionId);
+		const releaseSnapshotReservation = this.reserveSnapshotStream(client, targetActiveSessionId);
+		let releaseTranscript: (() => void) | undefined;
+		client.attachedActiveSessionIds.add(targetActiveSessionId);
+		try {
+			const attached = await this.attachClient(client, {
+				...command,
+				type: "attach",
+				activeSessionId: targetActiveSessionId,
+			});
+			const detachingSessions = this.detachingInputPauseSessions?.get(client);
+			detachingSessions?.delete(command.activeSessionId);
+			detachingSessions?.delete(command.targetActiveSessionId);
+			detachingSessions?.delete(targetActiveSessionId);
+			if (client.capabilities.has("chunked_snapshot") && !client.capabilities.has("slim_attach_transcript")) {
+				const transcript = attached.transcript ?? this.getOrCreateTranscriptCache(attached.worker, attached.result);
+				releaseTranscript = attached.releaseTranscript;
+				const streamedResult = this.createStreamedAttachResult(attached.result, transcript);
+				this.write(client, success(command.id, command.type, streamedResult));
+				this.detachClient(client, command.activeSessionId);
+				const streaming = this.streamSnapshot(
+					client,
+					attached.worker,
+					streamedResult,
+					transcript,
+					"replacement",
+					releaseTranscript,
+					releaseSnapshotReservation,
+				);
+				releaseTranscript = undefined;
+				void streaming.catch((error) =>
+					this.log(`Failed to stream reattach snapshot for ${targetActiveSessionId}: ${String(error)}`),
+				);
+				return undefined;
+			}
+			this.write(client, success(command.id, command.type, attached.result));
+			this.detachClient(client, command.activeSessionId);
+			releaseSnapshotReservation();
+			this.releaseDeferredSessionPayloads(client, targetActiveSessionId, true);
+			return undefined;
+		} catch (error) {
+			releaseTranscript?.();
+			if (!targetWasAttached) {
+				this.detachClient(client, targetActiveSessionId);
+			}
+			releaseSnapshotReservation();
+			this.releaseDeferredSessionPayloads(client, targetActiveSessionId, targetWasAttached);
+			throw error;
+		}
+	}
+
+	private async handleAcquireSessionInputPause(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "acquire_session_input_pause" }>,
+	): Promise<DaemonResponse | undefined> {
+		const detachingSessions = this.detachingInputPauseSessions.get(client);
+		if (detachingSessions?.has(command.activeSessionId)) {
+			throw new Error(`Session is detaching: ${command.activeSessionId}`);
+		}
+		const match = await this.findWorkerForClient(client, command.activeSessionId);
+		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
+		if (detachingSessions?.has(command.activeSessionId) || detachingSessions?.has(activeSessionId)) {
+			throw new Error(`Session is detaching: ${command.activeSessionId}`);
+		}
+		const ownerClientId = this.protocolClientId(client);
+		const connectionId = this.connectionIds.get(client);
+		if (!connectionId) throw new Error("Daemon client connection identity is unavailable");
+		const acquisitionEpoch = this.sessionInputPauseEpochs.get(client) ?? 0;
+		const existing = [...this.sessionInputPauses.values()].find(
+			(entry) =>
+				entry.owner === client &&
+				entry.worker === match.worker &&
+				entry.activeSessionId === activeSessionId &&
+				entry.leaseKey === command.leaseKey &&
+				!entry.releaseTask,
+		);
+		if (existing) {
+			return success(command.id, command.type, { pauseId: existing.pauseId });
+		}
+		const response = await this.forwardToWorker(match.worker, {
+			...command,
+			activeSessionId,
+			leaseKey: JSON.stringify([connectionId, ownerClientId, command.leaseKey]),
+		});
+		if (!response.success) return response;
+		const pauseId = (response.data as { pauseId?: unknown } | undefined)?.pauseId;
+		if (typeof pauseId !== "string") throw new Error("Worker returned an invalid session input pause id");
+		if (!this.clients.has(client) || (this.sessionInputPauseEpochs.get(client) ?? 0) !== acquisitionEpoch) {
+			try {
+				const release = await this.forwardToWorker(match.worker, {
+					id: randomUUID(),
+					type: "release_session_input_pause",
+					activeSessionId,
+					pauseId,
+				});
+				if (!release.success) throw new Error(release.error);
+			} catch (error) {
+				const invalidated = match.worker.client;
+				if (invalidated) {
+					// Close and deregister as a pair, in the order the other disconnect
+					// paths use: `handleWorkerClose` only acts while `worker.client`
+					// still names this client, so it has to run first. Leaving the
+					// registration pointing at a closed client keeps it claiming a ready
+					// transport until the 'close' event lands, and a delivery dispatched
+					// in that window fails without a byte being written.
+					const failure = error instanceof Error ? error : new Error(String(error));
+					this.background(
+						this.handleWorkerClose(match.worker, invalidated, failure),
+						`worker close handling for ${match.worker.descriptor.workerId}`,
+					);
+					invalidated.close();
+				}
+				throw error;
+			}
+			throw new Error("Session input pause acquisition was invalidated before completion");
+		}
+		this.sessionInputPauses.set(pauseId, {
+			owner: client,
+			worker: match.worker,
+			activeSessionId,
+			requestedActiveSessionId: command.activeSessionId,
+			leaseKey: command.leaseKey,
+			pauseId,
+		});
+		return response;
+	}
+
+	private async handleReleaseSessionInputPause(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "release_session_input_pause" }>,
+	): Promise<DaemonResponse | undefined> {
+		const entry = this.sessionInputPauses.get(command.pauseId);
+		if (!entry) return success(command.id, command.type);
+		if (entry.owner !== client) {
+			throw new Error(`Session input pause is owned by another client: ${command.pauseId}`);
+		}
+		if (
+			command.activeSessionId !== entry.activeSessionId &&
+			command.activeSessionId !== entry.requestedActiveSessionId
+		) {
+			throw new Error(`Session input pause belongs to another session: ${command.pauseId}`);
+		}
+		const releaseTask =
+			entry.releaseTask ??
+			this.forwardToWorker(entry.worker, {
+				...command,
+				activeSessionId: entry.activeSessionId,
+			});
+		entry.releaseTask = releaseTask;
+		try {
+			const response = await releaseTask;
+			if (response.success && this.sessionInputPauses.get(command.pauseId) === entry) {
+				this.sessionInputPauses.delete(command.pauseId);
+			}
+			return response;
+		} finally {
+			if (this.sessionInputPauses.get(command.pauseId) === entry && entry.releaseTask === releaseTask) {
+				entry.releaseTask = undefined;
+			}
+		}
+	}
+
+	private async handleDetach(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "detach" }>,
+	): Promise<DaemonResponse | undefined> {
+		const detachingSessions = this.detachingInputPauseSessions.get(client) ?? new Set<string>();
+		this.detachingInputPauseSessions.set(client, detachingSessions);
+		if (command.activeSessionId) detachingSessions.add(command.activeSessionId);
+		else for (const activeSessionId of client.attachedActiveSessionIds) detachingSessions.add(activeSessionId);
+		this.sessionInputPauseEpochs.set(client, (this.sessionInputPauseEpochs.get(client) ?? 0) + 1);
+		this.detachClient(client, command.activeSessionId);
+		await this.releaseClientSessionInputPauses(client, command.activeSessionId, true);
+		return success(command.id, "detach");
+	}
+
+	private async handleCompleteOwnedSession(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "complete_owned_session" }>,
+	): Promise<DaemonResponse | undefined> {
+		const match = await this.findWorkerForClient(client, command.activeSessionId);
+		if (match.worker.descriptor.ownerClientId !== this.protocolClientId(client)) {
+			throw new Error("Session is not owned by this client");
+		}
+		if (match.worker.ownerCleanupTimer) {
+			clearTimeout(match.worker.ownerCleanupTimer);
+			match.worker.ownerCleanupTimer = undefined;
+		}
+		await this.stopWorker(match.worker, true);
+		return success(command.id, command.type);
+	}
+
+	private async handlePromoteOwnedSession(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "promote_owned_session" }>,
+	): Promise<DaemonResponse | undefined> {
+		const match = await this.findWorkerForClient(client, command.activeSessionId);
+		await this.promoteOwnedWorker(client, match.worker);
+		return success(command.id, command.type, this.publicSummary(match.worker, match.summary));
+	}
+
+	private async handleRetryWorker(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "retry_worker" }>,
+	): Promise<DaemonResponse | undefined> {
+		const direct = [...this.workers.values()].find(
+			(worker) =>
+				worker.descriptor.rootActiveSessionId === command.activeSessionId ||
+				worker.descriptor.rootSessionId === command.activeSessionId,
+		);
+		const worker = direct ?? (await this.findWorkerForClient(client, command.activeSessionId)).worker;
+		this.assertWorkerAccessibleToClient(client, worker, command.activeSessionId);
+		if ((this.workerStopCounts?.get(worker) ?? 0) > 0) {
+			throw new Error("Session worker is stopping; retry after it finishes");
+		}
+		await this.retryWorkerRecovery(worker);
+		if (this.workers.get(worker.descriptor.workerId)?.descriptor.lifecycle !== "ready") {
+			throw new Error(worker.descriptor.lastError ?? "Session worker recovery failed");
+		}
+		const summary = worker.summaries.get(worker.descriptor.rootActiveSessionId);
+		return success(command.id, command.type, summary ? this.publicSummary(worker, summary) : undefined);
+	}
+
+	private async handleRestart(
+		command: Extract<DaemonCommand, { type: "restart" }>,
+	): Promise<DaemonResponse | undefined> {
+		setImmediate(() => this.background(this.shutdown(0, false, true, false, "update"), "restart shutdown"));
+		return success(command.id, command.type);
+	}
+
+	private async handleShutdown(
+		command: Extract<DaemonCommand, { type: "shutdown" }>,
+	): Promise<DaemonResponse | undefined> {
+		// An update-restart coordinator stops a prepared daemon with this command;
+		// attached windows need the "update" reason to recover instead of dying.
+		// Capture the reason now: a later phase change must not rewrite it.
+		const closingReason: DaemonClosingReason = this.updateRestartPhase === "prepared" ? "update" : "shutdown";
+		setImmediate(() =>
+			this.background(this.shutdown(0, true, false, command.force === true, closingReason), "daemon shutdown"),
+		);
+		return success(command.id, "shutdown");
+	}
+
+	private async handlePrepareUpdateRestart(
+		command: Extract<DaemonCommand, { type: "prepare_update_restart" }>,
+	): Promise<DaemonResponse | undefined> {
+		const manifest = await this.prepareUpdateRestart();
+		return success(command.id, "prepare_update_restart", manifest);
+	}
+
+	private async handleAgentMessagesStatus(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "agent_messages_status" }>,
+	): Promise<DaemonResponse | undefined> {
+		if (command.activeSessionId) {
+			const match = await this.findWorkerForClient(client, command.activeSessionId);
+			return this.forwardToWorker(match.worker, command);
+		}
+		const first = [...this.workers.values()].find((worker) => this.isLiveWorker(worker) && worker.client);
+		if (!first) {
+			return success(command.id, command.type, { paused: false, limits: {} });
+		}
+		return this.forwardToWorker(first, command);
+	}
+
+	private async handleAgentMessagesPauseResume(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "agent_messages_pause" | "agent_messages_resume" }>,
+	): Promise<DaemonResponse | undefined> {
+		if (command.activeSessionId) {
+			const match = await this.findWorkerForClient(client, command.activeSessionId);
+			return this.forwardToWorker(match.worker, command);
+		}
+		const responses = await Promise.all(
+			[...this.workers.values()]
+				.filter((worker) => this.isLiveWorker(worker) && worker.client)
+				.map((worker) => this.forwardToWorker(worker, command)),
+		);
+		const failed = responses.find((response) => !response.success);
+		return failed ?? success(command.id, command.type, responses.find((response) => response.success)?.data);
+	}
+
+	private async handleCronList(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "cron_list" }>,
+	): Promise<DaemonResponse | undefined> {
+		if (command.activeSessionId) {
+			const match = await this.findWorkerForClient(client, command.activeSessionId);
+			return this.forwardToWorker(match.worker, command);
+		}
+		const jobs = new Map<string, AgentCronJob>();
+		const responses = await Promise.all(
+			[...this.workers.values()]
+				.filter((worker) => this.isLiveWorker(worker) && worker.client && worker.descriptor.lifecycle === "ready")
+				.map((worker) =>
+					this.forwardToWorker(worker, command, 5000).catch((error: unknown) =>
+						failure(command.id, command.type, error, serializeDaemonError(error)),
+					),
+				),
+		);
+		for (const response of responses) {
+			if (!response.success) {
+				this.log(`Could not list scheduled jobs from a worker: ${response.error}`);
+				continue;
+			}
+			for (const job of cronJobsFromResponse(response)) {
+				jobs.set(job.id, job);
+			}
+		}
+		for (const { job } of await this.collectPassiveScheduledJobs(command.includeInactive === true)) {
+			if (!jobs.has(job.id)) jobs.set(job.id, job);
+		}
+		return success(command.id, "cron_list", { jobs: sortCronJobs([...jobs.values()]) });
+	}
+
+	private async handleHeartbeatsList(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "heartbeats_list" }>,
+	): Promise<DaemonResponse | undefined> {
+		if (command.activeSessionId) {
+			const match = await this.findWorkerForClient(client, command.activeSessionId);
+			// The forward may first join an in-flight recovery whose budget far exceeds
+			// the client's request timeout, so bound the whole operation: a stuck or
+			// still-recovering worker fails daemon-side inside the caller's budget
+			// instead of surfacing as a client transport timeout.
+			const forward = this.forwardToWorker(match.worker, command, HEARTBEAT_LIST_FORWARD_TIMEOUT_MS);
+			const forwardDeadline = sleep(HEARTBEAT_LIST_FORWARD_TIMEOUT_MS, { unref: true }).then(() => {
+				throw new Error(
+					`Timed out waiting for session worker to list heartbeats within ${HEARTBEAT_LIST_FORWARD_TIMEOUT_MS}ms`,
+				);
+			});
+			return Promise.race([forward, forwardDeadline]).catch((error: unknown) =>
+				failure(command.id, command.type, error, serializeDaemonError(error)),
+			);
+		}
+		const openings = [...this.catalogOpeningWorkers.values()];
+		const selectedWorkers = new Set(this.workers.values());
+		for (const opening of openings) {
+			opening.then(
+				(worker) => selectedWorkers.add(worker),
+				() => undefined,
+			);
+		}
+		// Slow launches must not outrun the caller's request budget: after
+		// HEARTBEAT_LIST_LAUNCH_WAIT_MS the catalog proceeds with whatever
+		// registered, and workers that are still starting surface through the
+		// per-worker state error below instead of being omitted.
+		await Promise.race([Promise.allSettled(openings), sleep(HEARTBEAT_LIST_LAUNCH_WAIT_MS, { unref: true })]);
+		for (const worker of this.workers.values()) {
+			selectedWorkers.add(worker);
+		}
+		const workers = [...this.workers.values()].filter(
+			(worker) =>
+				selectedWorkers.has(worker) && this.isLiveWorker(worker) && worker.descriptor.lifecycle !== "failed",
+		);
+		const heartbeats = new Map<string, AgentConnectionHeartbeat>();
+		// Per-worker independence (F4). This was a Promise.all whose first failure
+		// response became the whole list's response and whose slowest worker set the
+		// latency, so one wedged worker burned the full forward budget on every
+		// session switch and one recovering worker hid every healthy heartbeat.
+		// Each worker now settles on its own and answers with its live list or, when
+		// that fails, its last complete snapshot; anything else is a counted absence.
+		const shares = await Promise.allSettled(
+			workers.map(async (worker): Promise<HeartbeatFanoutShare> => {
+				const workerId = worker.descriptor.workerId;
+				// A last complete snapshot answers whenever the worker has not said its
+				// heartbeats changed since; one it declared stale must not. Read at the
+				// point of use, because a heartbeats_changed frame can land mid-forward.
+				const freshSnapshot = (): AgentConnectionHeartbeat[] | undefined =>
+					worker.heartbeatSnapshot !== undefined && worker.heartbeatSnapshotStale !== true
+						? worker.heartbeatSnapshot
+						: undefined;
+				if (worker.client && worker.descriptor.lifecycle === "ready") {
+					const deadline = sleep(HEARTBEAT_LIST_FANOUT_TIMEOUT_MS, { unref: true }).then(() => {
+						throw new Error(
+							`Timed out listing heartbeats on worker ${workerId} within ${HEARTBEAT_LIST_FANOUT_TIMEOUT_MS}ms`,
+						);
+					});
+					// Bounded as a whole, not just the request: the forward first joins an
+					// in-flight recovery whose budget is not ours to set.
+					const response = await Promise.race([
+						this.forwardToWorker(worker, command, HEARTBEAT_LIST_FANOUT_TIMEOUT_MS),
+						deadline,
+					]).catch((error: unknown) => failure(command.id, command.type, error, serializeDaemonError(error)));
+					if (response.success) {
+						const listed = heartbeatsFromResponse(response);
+						worker.heartbeatSnapshot = listed;
+						worker.heartbeatSnapshotStale = false;
+						return { workerId, heartbeats: listed };
+					}
+					const cached = freshSnapshot();
+					return cached === undefined
+						? { workerId, absence: response }
+						: { workerId, heartbeats: cached, absence: response };
+				}
+				const cached = freshSnapshot();
+				if (cached !== undefined) {
+					return { workerId, heartbeats: cached };
+				}
+				const state = worker.descriptor.lifecycle === "ready" ? "disconnected" : worker.descriptor.lifecycle;
+				const error = new Error(`Cannot list heartbeats while session worker is ${state}`);
+				return { workerId, absence: failure(command.id, command.type, error, serializeDaemonError(error)) };
+			}),
+		);
+		const absent: string[] = [];
+		let answered = 0;
+		let firstAbsence: DaemonResponse | undefined;
+		for (const share of shares) {
+			if (share.status === "rejected") {
+				// The attempt above catches its own failures, so a rejection is a defect:
+				// cost that worker's rows, never the healthy workers'.
+				firstAbsence ??= failure(command.id, command.type, share.reason, serializeDaemonError(share.reason));
+				absent.push(
+					`unknown worker (${share.reason instanceof Error ? share.reason.message : String(share.reason)})`,
+				);
+				continue;
+			}
+			if (share.value.heartbeats !== undefined) {
+				answered += 1;
+				for (const heartbeat of share.value.heartbeats) {
+					heartbeats.set(heartbeat.job.id, heartbeat);
+				}
+			}
+			const absence = share.value.absence;
+			if (absence === undefined) {
+				continue;
+			}
+			firstAbsence ??= absence;
+			absent.push(`${share.value.workerId} (${absence.success ? "no error reported" : absence.error})`);
+		}
+		// Total blindness is still a failure: an empty success would tell every
+		// client "no heartbeats armed" when in fact nothing could be asked.
+		if (answered === 0 && firstAbsence !== undefined) {
+			return firstAbsence;
+		}
+		if (absent.length > 0) {
+			this.log(
+				`heartbeats_list is partial: ${absent.length} of ${workers.length} workers could not answer: ${absent.join(", ")}`,
+			);
+		}
+		// Passivated sessions keep their armed heartbeats; no worker can list them.
+		// Served from the shared snapshot: this loop is on the response path of every
+		// session switch, and a fresh scan per request is what pushed concurrent
+		// lists past the client transport deadline.
+		for (const { job, info } of await this.catalogPassiveScheduledJobs()) {
+			if (!isHeartbeatCronJob(job) || heartbeats.has(job.id)) continue;
+			heartbeats.set(job.id, {
+				job,
+				...(info.name !== undefined ? { sessionName: info.name } : {}),
+				...(info.firstMessage !== undefined ? { firstMessage: info.firstMessage } : {}),
+			});
+		}
+		return success(command.id, "heartbeats_list", { heartbeats: [...heartbeats.values()] });
+	}
+
+	private async handleHeartbeatManage(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "heartbeat_manage" }>,
+	): Promise<DaemonResponse | undefined> {
+		const cachedWorker = [...this.workers.values()].find((worker) =>
+			worker.heartbeatSnapshot?.some(
+				(heartbeat) =>
+					heartbeat.job.id === command.jobId && heartbeat.job.activeSessionId === command.activeSessionId,
+			),
+		);
+		if (!cachedWorker) {
+			// Passive jobs are managed against their durable store; no wake just to flip a status.
+			const passive = (await this.collectPassiveScheduledJobs()).find(
+				({ job }) => job.id === command.jobId && job.activeSessionId === command.activeSessionId,
+			);
+			if (passive) {
+				const store = AgentCronJobStore.forSessionArtifacts();
+				store.registerSessionArtifact(
+					passive.info.id,
+					getSessionArtifactPathForFile(resolve(passive.info.path), passive.info.id),
+				);
+				const heartbeat = store.manageHeartbeat(command.activeSessionId, command.jobId, command.action);
+				if (heartbeat) {
+					this.broadcastHeartbeatsChanged();
+					return success(command.id, "heartbeat_manage", { heartbeat });
+				}
+			}
+		}
+		const worker = cachedWorker ?? (await this.findWorkerForClient(client, command.activeSessionId)).worker;
+		this.assertWorkerAccessibleToClient(client, worker, command.activeSessionId);
+		const response = await this.forwardToWorker(worker, command);
+		if (response.success && response.data && typeof response.data === "object" && "heartbeat" in response.data) {
+			const job = (response.data as { heartbeat?: AgentCronJob }).heartbeat;
+			if (job && worker.heartbeatSnapshot) {
+				const existing = worker.heartbeatSnapshot.find((heartbeat) => heartbeat.job.id === job.id);
+				const remaining = worker.heartbeatSnapshot.filter((heartbeat) => heartbeat.job.id !== job.id);
+				worker.heartbeatSnapshot =
+					job.status === "active" || job.status === "paused"
+						? [...remaining, existing ? { ...existing, job } : { job }]
+						: remaining;
+			}
+		}
+		return response;
+	}
+
+	private async handleCronAdd(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "cron_add" }>,
+	): Promise<DaemonResponse | undefined> {
+		const match = await this.findWorkerForClient(client, command.activeSessionId);
+		const response = await this.forwardToWorker(match.worker, command);
+		if (response.success && command.promoteOwnedSession) {
+			await this.promoteOwnedWorker(client, match.worker);
+		}
+		return response;
+	}
+
+	private async handleCronCancel(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "cron_cancel" }>,
+	): Promise<DaemonResponse | undefined> {
+		if (command.activeSessionId) {
+			const match = await this.findWorkerForClient(client, command.activeSessionId);
+			return this.forwardToWorker(match.worker, command);
+		}
+		const listed = await Promise.all(
+			[...this.workers.values()]
+				.filter((worker) => this.isLiveWorker(worker) && worker.client && worker.descriptor.lifecycle === "ready")
+				.map(async (worker) => ({
+					worker,
+					response: await this.forwardToWorker(worker, { type: "cron_list", includeInactive: true }, 5000).catch(
+						() => undefined,
+					),
+				})),
+		);
+		for (const candidate of listed) {
+			if (
+				candidate.response?.success &&
+				cronJobsFromResponse(candidate.response).some((job) => job.id === command.jobId)
+			) {
+				return this.forwardToWorker(candidate.worker, command);
+			}
+		}
+		const passive = (await this.collectPassiveScheduledJobs()).find(({ job }) => job.id === command.jobId);
+		if (passive) {
+			const store = AgentCronJobStore.forSessionArtifacts();
+			store.registerSessionArtifact(
+				passive.info.id,
+				getSessionArtifactPathForFile(resolve(passive.info.path), passive.info.id),
+			);
+			const job = store.cancel(command.jobId);
+			if (job) {
+				this.broadcastHeartbeatsChanged();
+				return success(command.id, "cron_cancel", { job });
+			}
+		}
+		throw new Error(`No cron job found: ${command.jobId}`);
+	}
+
+	private async handleHeartbeatGet(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "heartbeat_get" }>,
+	): Promise<DaemonResponse | undefined> {
+		const match = await this.findWorkerForClient(client, command.activeSessionId);
+		return this.forwardToWorker(match.worker, command);
+	}
+
+	private async handleHeartbeatSet(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "heartbeat_set" }>,
+	): Promise<DaemonResponse | undefined> {
+		const match = await this.findWorkerForClient(client, command.activeSessionId);
+		const response = await this.forwardToWorker(match.worker, command);
+		if (response.success && command.promoteOwnedSession) {
+			await this.promoteOwnedWorker(client, match.worker);
+		}
+		return response;
+	}
+
+	private async handleHeartbeatUpdate(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "heartbeat_update" }>,
+	): Promise<DaemonResponse | undefined> {
+		const match = await this.findWorkerForClient(client, command.activeSessionId);
+		return this.forwardToWorker(match.worker, command);
+	}
+
+	private async handleRenameSavedSession(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "rename_saved_session" }>,
+	): Promise<DaemonResponse | undefined> {
+		const target = await this.savedSessionNameReservationInput(command.sessionPath, command.name.trim());
+		return await this.withSessionNameReservation(target, async () => {
+			await this.assertSupervisorSavedSessionNameAvailable(command.sessionPath, target.name);
+			if (!command.activeSessionId) {
+				await this.catalog.rename(command.sessionPath, command.name);
+				// Third rename write point: an offline saved-session rename
+				// changes the name the ledger carries for that child.
+				await this.rlmSpawnLedger()
+					.appendRenameByChildPath(command.sessionPath, target.name)
+					.catch((error) => {
+						this.log(
+							`failed to append RLM ledger rename: ${error instanceof Error ? error.message : String(error)}`,
+						);
+					});
+				const entry = this.roster().bySessionFile(canonicalSessionPath(command.sessionPath));
+				if (entry) {
+					this.writeRosterEntry({ ...entry, summary: { ...entry.summary, sessionName: target.name } });
+				}
+				// Heartbeat rows carry the owning session's display name; drop the
+				// snapshot so the next list shows the new one.
+				this.invalidatePassiveScheduledJobs();
+				return success(command.id, command.type);
+			}
+			const match = await this.findWorkerForClient(client, command.activeSessionId);
+			return await this.forwardToWorker(match.worker, {
+				...command,
+				activeSessionId: match.summary.activeSessionId ?? match.summary.id,
+			});
+		});
+	}
+
+	private async handleDeleteSavedSession(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "delete_saved_session" }>,
+	): Promise<DaemonResponse | undefined> {
+		if (!command.activeSessionId) {
+			const deletedPath = canonicalSessionPath(command.sessionPath);
+			const entry = this.roster().bySessionFile(deletedPath);
+			if (entry?.summary.activeSessionId !== undefined) {
+				throw new Error("Cannot delete the currently active session");
+			}
+			const owner = this.findWorkerBySessionFile(command.sessionPath);
+			if (owner) {
+				// A client-owned worker's files are invisible to other clients: a foreign delete is an unknown target.
+				this.assertWorkerAccessibleToClient(client, owner, command.sessionPath);
+				if (owner.client && !this.isWorkerStopping(owner)) {
+					return this.forwardToWorker(owner, command);
+				}
+				if (!(await this.reclaimStaleWorkerRegistration(owner))) {
+					throw new Error(
+						`Session worker is ${this.effectiveWorkerState(owner)}; retry the delete once it is reachable`,
+					);
+				}
+			}
+			await tombstoneSavedSessionDelete(this.rlmSpawnLedger(), command.sessionPath, entry?.summary);
+			const result = await this.catalog.delete(command.sessionPath);
+			if (result.ok && entry && this.roster().get(entry.agentId) === entry) {
+				this.roster().delete(entry.agentId);
+			}
+			// The deleted session's armed heartbeats must leave the catalog snapshot
+			// too; their rows would otherwise linger until the refresh TTL.
+			if (result.ok) this.invalidatePassiveScheduledJobs();
+			return success(command.id, command.type, result);
+		}
+		// A live session's delete routes to its worker through the generic forward.
+		return this.forwardRoutedCommand(client, command);
+	}
+
+	private async handleSendMessage(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "send_message" }>,
+	): Promise<DaemonResponse | undefined> {
+		// Same gate the worker side applies (daemon-mode.ts): an empty target used to
+		// fall through to the catalog, where `"".startsWith` matches every saved
+		// session, so a single-session cwd silently retargeted the message while a
+		// multi-session one reported it as ambiguous.
+		assertDirectAgentMessageTarget(command.targetActiveSessionId);
+		// agentOrigin without fromActiveSessionId is trusted only at the direct socket-client boundary.
+		const source = command.fromActiveSessionId
+			? await this.findWorkerForClient(client, command.fromActiveSessionId)
+			: undefined;
+		let target: WorkerMatch;
+		try {
+			target = await this.findWorkerForClient(client, command.targetActiveSessionId);
+		} catch (error) {
+			if (!(error instanceof Error) || !error.message.startsWith("Unknown active session:")) throw error;
+			const cwd = source?.summary.cwd ?? this.defaultSessionConfig.cwd ?? process.cwd();
+			let sessionPath: string;
+			try {
+				sessionPath = await this.catalog.resolve(
+					command.targetActiveSessionId,
+					cwd,
+					source?.worker.descriptor.sessionDir ?? this.defaultSessionConfig.sessionDir,
+				);
+			} catch (catalogError) {
+				// Preserve selector ambiguity so a2a senders can distinguish it from
+				// the original unknown-active-session lookup failure.
+				if (catalogError instanceof Error && catalogError.message.startsWith("Ambiguous session selector")) {
+					throw catalogError;
+				}
+				throw error;
+			}
+			if (source && command.agentOrigin === true) {
+				const targetInfo = await readSessionInfo(sessionPath);
+				if (!targetInfo) throw new Error(`Unknown active session: ${command.targetActiveSessionId}`);
+				assertAgentFamilyReach(
+					this.familyCatalogEntry(source.summary),
+					this.familyCatalogEntry(summaryForInactiveSession(targetInfo)),
+				);
+			}
+			const worker = await this.createOrReuseWorker(this.protocolClientId(client), {
+				type: "create",
+				sessionPath,
+				continueRecent: false,
+			});
+			const root = this.roster().byActiveSessionId(worker.descriptor.rootActiveSessionId);
+			const summary =
+				this.findSummaryInWorker(worker, sessionPath) ?? (root ? sessionSummaryFromRosterEntry(root) : undefined);
+			if (!summary) throw new Error("Woken session worker has no target session");
+			target = { worker, summary };
+		}
+		const targetActiveSessionId = target.summary.activeSessionId ?? target.summary.id;
+		if (source && command.agentOrigin === true) {
+			assertAgentFamilyReach(this.familyCatalogEntry(source.summary), this.familyCatalogEntry(target.summary));
+		}
+		if (source) {
+			if ((source.summary.activeSessionId ?? source.summary.id) === targetActiveSessionId) {
+				throw new Error("Agent messaging cannot target the sending session");
+			}
+			return await this.deliverAgentMessage(client, command, source, target, targetActiveSessionId);
+		}
+		return this.forwardToWorker(target.worker, { ...command, targetActiveSessionId });
+	}
+
+	private async forwardRoutedCommand(
+		client: DaemonSocketClient,
+		command: DaemonCommand,
+	): Promise<DaemonResponse | undefined> {
 		if (!("activeSessionId" in command) || typeof command.activeSessionId !== "string") {
 			throw new Error(`Supervisor cannot route daemon command: ${command.type}`);
 		}
