@@ -1388,6 +1388,8 @@ function visibleSessionActionProjection(actions: readonly QueuedSessionAction[])
 const WAIT_FOR_IDLE_POLL_MS = 50;
 /** Deleted or released child runs kept for re-validating their late terminal notices. */
 const RETIRED_RLM_CHILD_RUNS_MAX = 1024;
+/** Mirrors RLM_SUBAGENT_SESSION_NAME_MAX_LENGTH in core/rlm-runtime.ts: the cap a minted successor name must stay under. */
+const RLM_SUCCESSOR_SESSION_NAME_CAP = 64;
 
 /** The verdict fields of a child run that its late terminal notices are re-validated against. */
 type RetiredRlmChildRun = Pick<
@@ -2934,6 +2936,17 @@ export class AgentSession {
 	private _abandonedRlmQuiescenceChildIds = new Set<string>();
 	private _rlmQuiescenceWaitAborts = new Set<AbortController>();
 	private _pendingRlmSubagentSessionNames = new Set<string>();
+	/**
+	 * Every child session name this session has ever admitted or learned of
+	 * (deleted and idle-closed bearers included). The timeline keys a child's
+	 * dispatch row, lane and return rows by name, so a re-spawn wearing the exact
+	 * name of a child the transcript still shows would merge into that child's
+	 * rows: the successor takes a numbered name instead. Seeded lazily from the
+	 * transcript's spawn records so a re-opened session numbers re-spawns of
+	 * children a previous process deleted.
+	 */
+	private readonly _rlmHistoricalChildNames = new Set<string>();
+	private _rlmHistoricalChildNamesSeeded = false;
 	// Inline mode keeps finished child sessions so the inspector can still read them;
 	// the daemon does the same by leaving the child session resident in its registry.
 	private _rlmChildSessions = new Map<string, RetainedRlmChild>();
@@ -18310,6 +18323,9 @@ export class AgentSession {
 
 	private async _deleteResolvedRlmSubagent(subagent: RlmSubagentRegistryEntry): Promise<RlmDeleteSubagentResult> {
 		const childId = subagent.rlm_child_id;
+		// The freed name stays in the name history: a later re-spawn of it is
+		// numbered instead of merging into the deleted child's display rows.
+		if (subagent.session_name) this._rlmHistoricalChildNamesNow().add(subagent.session_name);
 		const run = this._activeRlmChildRuns.get(childId);
 		if (run) {
 			if (run.deletionCleanupFailed) {
@@ -18387,6 +18403,7 @@ export class AgentSession {
 			return false;
 		}
 		this._rlmChildSessions.set(childId, { session, run: this._activeRlmChildRuns.get(childId) });
+		if (session.sessionName) this._rlmHistoricalChildNamesNow().add(session.sessionName);
 		if (unsubscribe) {
 			this._rlmChildUnsubscribes.set(childId, unsubscribe);
 		}
@@ -18444,6 +18461,9 @@ export class AgentSession {
 
 	private _publishClosedRlmChild(childId: string, closed: ClosedRlmChildRelease): void {
 		this._stopRlmChildFollowUpWatch(childId);
+		// The closed child's name is free from here on; the history keeps it so a
+		// re-spawn is numbered instead of merging into this child's display rows.
+		if (closed.snapshot.sessionName) this._rlmHistoricalChildNamesNow().add(closed.snapshot.sessionName);
 		if (this._disposed || this._disposing || this._isRlmChildHiddenFromCollect(childId)) return;
 		this._rememberClosedRlmChild(childId, closed.record);
 		this._emit({ type: "rlm_child_update", child: closed.snapshot });
@@ -19184,6 +19204,61 @@ export class AgentSession {
 		return cancelled;
 	}
 
+	/**
+	 * Every child name this session knows, seeding the set from the transcript on
+	 * first use: a re-opened session's only memory of a child a previous process
+	 * deleted or closed is the spawn record its cell left (an "ok" subagent
+	 * activity's label is the admitted name).
+	 */
+	private _rlmHistoricalChildNamesNow(): Set<string> {
+		if (this._rlmHistoricalChildNamesSeeded) return this._rlmHistoricalChildNames;
+		this._rlmHistoricalChildNamesSeeded = true;
+		for (const entry of this.sessionManager.getBranch()) {
+			if (entry.type !== "message") continue;
+			const message = entry.message;
+			if (message.role !== "toolResult") continue;
+			const activities = (message.details as { activities?: unknown } | undefined)?.activities;
+			if (!Array.isArray(activities)) continue;
+			for (const activity of activities) {
+				if (typeof activity !== "object" || activity === null) continue;
+				const record = activity as { kind?: unknown; status?: unknown; label?: unknown };
+				if (record.kind !== "subagent" || record.status !== "ok") continue;
+				if (typeof record.label !== "string" || record.label.trim() === "") continue;
+				this._rlmHistoricalChildNames.add(record.label.trim());
+			}
+		}
+		return this._rlmHistoricalChildNames;
+	}
+
+	/**
+	 * The numbered successor for a re-used child name (`name-2`, `name-3`, ...),
+	 * or undefined when the name is fresh. Only reached once the requested name
+	 * itself passed the availability gate, so the earlier bearer is gone (deleted
+	 * or idle-closed) and only its display rows remain; the minted candidate is
+	 * reserved and availability-checked like a requested name, and a candidate
+	 * that fails either check is skipped. The returned name stays reserved until
+	 * the caller's reservation release runs.
+	 */
+	private async _mintRlmSuccessorSessionName(requested: string | undefined): Promise<string | undefined> {
+		if (requested === undefined) return undefined;
+		const historical = this._rlmHistoricalChildNamesNow();
+		if (!historical.has(requested)) return undefined;
+		for (let n = 2; n < 1000; n++) {
+			const suffix = `-${n}`;
+			const candidate = `${requested.slice(0, RLM_SUCCESSOR_SESSION_NAME_CAP - suffix.length)}${suffix}`;
+			if (historical.has(candidate) || this._pendingRlmSubagentSessionNames.has(candidate)) continue;
+			this._pendingRlmSubagentSessionNames.add(candidate);
+			try {
+				await this._assertRlmSubagentSessionNameAvailable(candidate, true);
+			} catch {
+				this._pendingRlmSubagentSessionNames.delete(candidate);
+				continue;
+			}
+			return candidate;
+		}
+		return undefined;
+	}
+
 	private async _assertRlmSubagentSessionNameAvailable(name: string, ignorePendingReservation = false): Promise<void> {
 		const depth = this._rlmDepth + 1;
 		if (!ignorePendingReservation && this._pendingRlmSubagentSessionNames.has(name)) {
@@ -19350,8 +19425,11 @@ export class AgentSession {
 		// and the ledger spawn edge only lands at daemon admission - so releasing
 		// earlier lets two parallel same-name spawns both pass availability and both
 		// append a durable edge, leaving delete/agent_message selectors ambiguous.
+		// A minted successor name is reserved the same way.
+		let mintedSessionName: string | undefined;
 		const releaseReservedSessionName = () => {
 			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
+			if (mintedSessionName) this._pendingRlmSubagentSessionNames.delete(mintedSessionName);
 		};
 		let modelSelection: RlmSubagentModelSelection;
 		let childSessionDir = "";
@@ -19359,6 +19437,12 @@ export class AgentSession {
 		let sessionName = "";
 		try {
 			if (requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(requestedSessionName, true);
+			// The requested name is free, but a child of this session may have worn it
+			// before (deleted or idle-closed since): the timeline keys a child's
+			// dispatch row, lane and return rows by name, and an exactly recycled
+			// name would merge the new child into the old one's rows. The successor
+			// takes a numbered name instead.
+			mintedSessionName = await this._mintRlmSuccessorSessionName(requestedSessionName);
 			// An unpinned spawn model resolves against the persisted subagent
 			// default; an unavailable default fails the spawn instead of silently
 			// inheriting the parent model.
@@ -19377,10 +19461,15 @@ export class AgentSession {
 			if (this._disposed || this._disposing) {
 				throw new Error("Cannot spawn a subagent after its parent was disposed");
 			}
-			const admitted = await this._admitChildRlmSessionDir(requestedSessionName, prompt, signal);
+			const admitted = await this._admitChildRlmSessionDir(
+				mintedSessionName ?? requestedSessionName,
+				prompt,
+				signal,
+			);
 			childSessionDir = admitted.childSessionDir;
 			childNodeId = admitted.childNodeId;
 			sessionName = admitted.sessionName;
+			this._rlmHistoricalChildNamesNow().add(sessionName);
 		} catch (error) {
 			releaseReservedSessionName();
 			throw error;

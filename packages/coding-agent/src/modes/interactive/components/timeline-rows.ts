@@ -1,6 +1,17 @@
 import { ABORT_TRUNCATION_MARKER, TOOL_ABORT_FALLBACK_MESSAGE } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { KernelActivity, KernelMemoryChange } from "../../../core/kernel/shared.js";
+import {
+	DEFAULT_PROVIDER_RETRY_POLICY,
+	DEFAULT_PROVIDER_WAIT_POLICY,
+	providerRetryPolicy,
+	providerStreamFailureKind,
+	providerStreamFailureRetryAfterMs,
+	providerStreamFailureStatus,
+	providerWaitClass,
+} from "../../../core/provider-retry.js";
+import { SettingsManager } from "../../../core/settings-manager.js";
 import { previewIpythonCode } from "../../../core/tools/code-preview.js";
 import { type ThemeColor, theme } from "../theme/theme.js";
 import { shortAgentName } from "./agent-message.js";
@@ -147,6 +158,11 @@ export interface RowBuildContext {
 	stopped: boolean;
 	/** `hideThinkingBlock`: thinking rows keep their time and size, never their text. */
 	hideThinking?: boolean;
+	/**
+	 * The retry settings a replayed retry row's reason is derived with (see
+	 * `replayRetryReason`). Absent: read from the current settings on disk.
+	 */
+	retryPolicy?: ReplayRetryPolicy;
 	/** Activity id → the finished record of a background command and the step it arrived with. */
 	settledActivities?: ReadonlyMap<string, { stepId: string; activity: KernelActivity }>;
 	/** Activity id → the first step that listed it still running (where a background command started). */
@@ -1247,6 +1263,89 @@ function servingModelSwitch(
 	return retry.provider ? `${retry.provider}/${retry.model}` : retry.model;
 }
 
+/** The retry settings a replayed retry row's reason is derived with. */
+export interface ReplayRetryPolicy {
+	/** `retry.provider.maxRetries ?? retry.maxRetries`: the quick-retry ladder's length. */
+	maxRetries: number;
+	/** `retry.provider.maxRetryDelayMs`: a server-requested wait beyond it leaves the ladder (0 disables the cap). */
+	maxRetryDelayMs: number;
+	/** `retry.provider.waitForUsage.enabled`: the bounded wait-for-recovery channel's switch. */
+	waitForRecovery: boolean;
+}
+
+const DEFAULT_REPLAY_RETRY_POLICY: ReplayRetryPolicy = {
+	maxRetries: DEFAULT_PROVIDER_RETRY_POLICY.maxRetries,
+	maxRetryDelayMs: DEFAULT_PROVIDER_RETRY_POLICY.maxRetryDelayMs,
+	waitForRecovery: DEFAULT_PROVIDER_WAIT_POLICY.enabled,
+};
+
+/** The current settings' retry policy, or the defaults when they cannot be read. */
+function readReplayRetryPolicy(cwd: string): ReplayRetryPolicy {
+	try {
+		const settings = SettingsManager.create(cwd);
+		const retry = providerRetryPolicy(settings);
+		return {
+			maxRetries: retry.maxRetries,
+			maxRetryDelayMs: retry.maxRetryDelayMs,
+			waitForRecovery: settings.getProviderWaitSettings().enabled,
+		};
+	} catch {
+		return DEFAULT_REPLAY_RETRY_POLICY;
+	}
+}
+
+/**
+ * The reason a replayed retry row shows, re-derived from the failed message the
+ * transcript kept. A live row reads the session's `auto_retry_start` event, which
+ * a transcript does not persist; the failed message's diagnostics do persist, so
+ * the wait routing of `_handleRetryableError` is replayed here:
+ *
+ * - a retry another model served is the backup/fallback branch, which runs before
+ *   any wait (the live row says the switch);
+ * - a quota-class failure enters the usage wait on its first failure, so every
+ *   retried quota failure reads `usage`;
+ * - a transient-class failure joins the unavailability wait once the quick ladder
+ *   is spent (`attempt` past `maxRetries`) or the server-requested wait outgrows
+ *   `maxRetryDelayMs`; before that the live row is a quick retry that reads the
+ *   error text, so the replay does the same.
+ *
+ * Accepted approximations: the policy read is the *current* settings, not the
+ * settings at the time; the attempt count is the run of consecutive failures on
+ * the serving model (a clean reply resets the live ladder, a fallback switch
+ * restarts it, a user-configured backup switch keeps it counting - one step of
+ * drift at the ladder's edge); a quota park ends the turn instead of showing a
+ * retry. A failure without diagnostics classifies as permanent and keeps the
+ * error-text reason, as it did live.
+ */
+export function replayRetryReason(
+	failed: AssistantMessage,
+	backupModel: string | undefined,
+	attempt: number,
+	policy: ReplayRetryPolicy,
+): { errorMessage: string; reason?: "usage" | "unavailable" | "backup"; backupModel?: string } {
+	const errorMessage = failed.errorMessage ?? "";
+	if (backupModel !== undefined) {
+		return { errorMessage, reason: "backup", backupModel };
+	}
+	const waitClass = providerWaitClass(
+		providerStreamFailureKind(failed),
+		providerStreamFailureStatus(failed),
+		errorMessage,
+	);
+	if (policy.waitForRecovery && waitClass === "quota") {
+		return { errorMessage, reason: "usage" };
+	}
+	if (policy.waitForRecovery && waitClass === "transient") {
+		const retryAfterMs = providerStreamFailureRetryAfterMs(failed);
+		const exceedsCap =
+			retryAfterMs !== undefined && policy.maxRetryDelayMs > 0 && retryAfterMs > policy.maxRetryDelayMs;
+		if (exceedsCap || attempt > policy.maxRetries) {
+			return { errorMessage, reason: "unavailable" };
+		}
+	}
+	return { errorMessage };
+}
+
 /** The entry comes after the reply that answered the turn, and no reply follows it. */
 function afterFinalAnswer(timeline: TurnTimeline, index: number): boolean {
 	for (let before = index - 1; before >= 0; before--) {
@@ -1314,6 +1413,18 @@ export function buildTimelineView(
 	timeline.entries.forEach((entry, index) => {
 		if (entry.kind === "retry") lastRetryIndex = index;
 	});
+	// The run of consecutive failed model calls one retry ladder climbed, per
+	// serving model: a clean reply resets the ladder live, and a switch to
+	// another model starts a new one. The replayed retry reason reads it as the
+	// attempt number (see replayRetryReason).
+	let failureRun = 0;
+	let failureRunServedBy = "";
+	// Read once per build, and only when a replayed retry row needs it.
+	let retryPolicy: ReplayRetryPolicy | undefined;
+	const replayPolicy = (): ReplayRetryPolicy => {
+		retryPolicy ??= ctx.retryPolicy ?? readReplayRetryPolicy(ctx.cwd);
+		return retryPolicy;
+	};
 	const seenSteps = new Set<string>();
 	const laterWork: boolean[] = [];
 	let workAfter = false;
@@ -1411,6 +1522,19 @@ export function buildTimelineView(
 			}
 		});
 		const message = entry.message;
+		if (entry.ended) {
+			if (message.stopReason === "error") {
+				const servedBy = `${message.provider}/${message.model}`;
+				if (servedBy === failureRunServedBy) failureRun += 1;
+				else {
+					failureRun = 1;
+					failureRunServedBy = servedBy;
+				}
+			} else {
+				failureRun = 0;
+				failureRunServedBy = "";
+			}
+		}
 		if (entry.ended && message.stopReason === "error" && message.errorMessage && lastRetryIndex < entryIndex) {
 			// A later reply of the turn is the retry the session made: said as the retry row it is live, not as a model error.
 			const retryReply = timeline.entries.slice(entryIndex + 1).find((later) => later.kind === "message");
@@ -1427,10 +1551,7 @@ export function buildTimelineView(
 								startedAt: at,
 								delayMs: 0,
 								attempt: 1,
-								reason: describeRetryReason({
-									errorMessage: message.errorMessage,
-									...(backup ? { reason: "backup" as const, backupModel: backup } : {}),
-								}),
+								reason: describeRetryReason(replayRetryReason(message, backup, failureRun, replayPolicy())),
 								outcome: "ok",
 							},
 						},

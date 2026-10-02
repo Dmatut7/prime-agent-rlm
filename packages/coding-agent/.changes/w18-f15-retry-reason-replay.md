@@ -1,0 +1,1 @@
+- Fixed a reopened session's retry rows disagreeing with the live ones: a retried quota exhaustion again reads 「额度用完或被限流」 and a long provider outage 「模型暂时都不可用」 — the replay re-derives the reason from the failed message's persisted diagnostics (the transcript keeps no retry events), reading the current retry settings as a stand-in for the ones at the time.

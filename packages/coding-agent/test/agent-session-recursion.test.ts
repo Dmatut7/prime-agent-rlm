@@ -439,6 +439,52 @@ describe("AgentSession rlm recursion", () => {
 		);
 	});
 
+	it("numbers a re-spawn whose name a finished-and-deleted child already wore", async () => {
+		const root = createSession();
+		const first = await root.runRlmChild("first tour", { name: "reviewer" });
+		await waitFor(() => root.getRlmChildSession(first.rlm_child_id)?.getLastAssistantText() !== undefined);
+
+		// The timeline keys a child's dispatch row, lane and return rows by session
+		// name, so a re-spawn wearing the exact name of a child the transcript still
+		// shows would merge into that child's rows. The successor takes a number.
+		await root.deleteRlmSubagent("reviewer");
+
+		const second = await root.runRlmChild("second tour", { name: "reviewer" });
+		expect(second.name).toBe("reviewer-2");
+		await waitFor(() => root.getRlmChildSession(second.rlm_child_id)?.getLastAssistantText() !== undefined);
+
+		await root.deleteRlmSubagent("reviewer-2");
+		const third = await root.runRlmChild("third tour", { name: "reviewer" });
+		expect(third.name).toBe("reviewer-3");
+	});
+
+	it("numbers a re-spawn whose name a re-opened transcript's spawn record already wore", async () => {
+		const manager = SessionManager.create(tempDir, join(tempDir, "ghost-sessions"));
+		manager.newSession({ rlmDepth: 0 });
+		// What the previous process's cell left: an admitted spawn is an "ok"
+		// subagent activity whose label is the child's session name.
+		manager.appendMessage({
+			role: "toolResult",
+			toolCallId: "cell-1",
+			toolName: "ipython",
+			content: [{ type: "text", text: "" }],
+			details: {
+				activities: [{ id: "a1", kind: "subagent", label: "ghost-worker", status: "ok", startedAt: 1 }],
+			},
+			isError: false,
+			timestamp: 1,
+		});
+		manager.flushNow();
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Missing persisted session file");
+
+		const reopened = createSession({
+			sessionManager: SessionManager.open(sessionFile, join(tempDir, "ghost-sessions")),
+		});
+		const spawned = await reopened.runRlmChild("again", { name: "ghost-worker" });
+		expect(spawned.name).toBe("ghost-worker-2");
+	});
+
 	it("falls back to listed family metadata when a controller lacks name validation", async () => {
 		const listAgents = vi.fn(() => ({
 			current: { activeSessionId: "parent-active", sessionId: "unrelated-current" },
@@ -729,7 +775,9 @@ describe("AgentSession rlm recursion", () => {
 		expect(internals._rlmChildCleanupFailures.size).toBe(0);
 		expect(internals._rlmChildSessions.size).toBe(0);
 		await expect(root.runRlmChild("replacement", { name: "retained-retry-worker" })).resolves.toMatchObject({
-			name: "retained-retry-worker",
+			// The freed name spawns again; the successor wears a number because the
+			// deleted child's display rows still answer to the plain name.
+			name: "retained-retry-worker-2",
 		});
 	});
 
@@ -1595,7 +1643,9 @@ describe("AgentSession rlm recursion", () => {
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
 		expect(internals._activeRlmChildRuns.has(spawned.rlm_child_id)).toBe(false);
 		await expect(root.runRlmChild("replacement child", { name: "reusable-worker" })).resolves.toMatchObject({
-			name: "reusable-worker",
+			// The freed name spawns again; the successor wears a number because the
+			// deleted child's display rows still answer to the plain name.
+			name: "reusable-worker-2",
 		});
 	});
 
@@ -2109,7 +2159,9 @@ describe("AgentSession rlm recursion", () => {
 		await expect(
 			root.runRlmChild("replacement after cleanup", { name: "settled-error-worker" }),
 		).resolves.toMatchObject({
-			name: "settled-error-worker",
+			// The freed name spawns again; the successor wears a number because the
+			// deleted child's display rows still answer to the plain name.
+			name: "settled-error-worker-2",
 		});
 	});
 
@@ -3949,7 +4001,9 @@ describe("AgentSession rlm recursion", () => {
 		).toHaveLength(1);
 		expect(internals._rlmChildCleanupFailures.size).toBe(0);
 		await expect(root.runRlmChild("replacement", { name: "retry-worker" })).resolves.toMatchObject({
-			name: "retry-worker",
+			// The freed name spawns again; the successor wears a number because the
+			// deleted child's display rows still answer to the plain name.
+			name: "retry-worker-2",
 		});
 	});
 
@@ -4196,7 +4250,9 @@ describe("AgentSession rlm recursion", () => {
 		expect(internals._activeRlmChildRuns.size).toBe(0);
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
 		await expect(root.runRlmChild("replacement", { name: "failed-worker" })).resolves.toMatchObject({
-			name: "failed-worker",
+			// The freed name spawns again; the successor wears a number because the
+			// deleted child's display rows still answer to the plain name.
+			name: "failed-worker-2",
 		});
 	});
 
@@ -4230,7 +4286,9 @@ describe("AgentSession rlm recursion", () => {
 		await waitFor(() => (root as unknown as InspectableRlmSession)._activeRlmChildRuns.size === 0);
 		expect(setSessionName).not.toHaveBeenCalled();
 		await expect(root.runRlmChild("replacement", { name: "reserved-worker" })).resolves.toMatchObject({
-			name: "reserved-worker",
+			// The freed name spawns again; the successor wears a number because the
+			// deleted child's display rows still answer to the plain name.
+			name: "reserved-worker-2",
 		});
 	});
 
