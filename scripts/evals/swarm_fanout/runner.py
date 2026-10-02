@@ -243,10 +243,13 @@ def agent_env(agent_home: Path, sessions_dir: str) -> dict:
     for key in (
         "PRIME_AGENT_BASH_SHELL",
         "PRIME_AGENT_BASH_COMMAND_PREFIX",
-        # Depth overrides from an embedding RLM session would start the
-        # eval parent at the wrong depth or block spawning shard children.
+        # Overrides from an embedding RLM session would start the eval
+        # parent at the wrong depth, block spawning shard children, or pin
+        # its kernel to the embedding session's artifact dir
+        # (agent-session.ts _rlmKernelEnv provisions all three).
         "RLM_DEPTH",
         "RLM_MAX_DEPTH",
+        "RLM_SESSION_DIR",
     ):
         env.pop(key, None)
     source_agent_dir = Path(env.get("PRIME_AGENT_CODING_AGENT_DIR") or Path.home() / ".prime" / "agent")

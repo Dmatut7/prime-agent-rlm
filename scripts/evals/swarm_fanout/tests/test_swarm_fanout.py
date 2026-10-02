@@ -1100,16 +1100,27 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse((decoy / "shards").exists())
 
     def test_agent_env_strips_embedding_overrides(self):
-        # RLM depth overrides from an embedding session must not leak into
-        # the eval agent: the eval parent must be an independent root.
+        # RLM provisioning overrides from an embedding session must not leak
+        # into the eval agent: the eval parent must be an independent root.
+        # RLM_SESSION_DIR is the per-session artifact dir the host injects
+        # into a kernel (agent-session.ts _rlmKernelEnv); a leak would pin
+        # the eval agent's kernel to the embedding session's artifacts.
         env = dict(os.environ)
-        env.update({"RLM_DEPTH": "2", "RLM_MAX_DEPTH": "2", "PRIME_AGENT_INTERNAL_TOKEN": "x"})
+        env.update(
+            {
+                "RLM_DEPTH": "2",
+                "RLM_MAX_DEPTH": "2",
+                "RLM_SESSION_DIR": "/leak",
+                "PRIME_AGENT_INTERNAL_TOKEN": "x",
+            }
+        )
         workdir = Path(tempfile.mkdtemp(prefix="swarm-fanout-env-"))
         try:
             with unittest.mock.patch.dict(os.environ, env, clear=True):
                 result = runner.agent_env(workdir / "agent-home", str(workdir / "sessions"))
             self.assertNotIn("RLM_DEPTH", result)
             self.assertNotIn("RLM_MAX_DEPTH", result)
+            self.assertNotIn("RLM_SESSION_DIR", result)
             self.assertNotIn("PRIME_AGENT_INTERNAL_TOKEN", result)
             self.assertEqual(result["PRIME_AGENT_SESSION_DIR"], str(workdir / "sessions"))
             self.assertEqual(result["PRIME_AGENT_CODING_AGENT_DIR"], str(workdir / "agent-home"))
