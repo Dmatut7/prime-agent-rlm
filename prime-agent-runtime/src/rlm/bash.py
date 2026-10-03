@@ -119,8 +119,47 @@ class BashResult:
         return _resolved(self).__await__()
 
 
+def _utf8_incomplete_suffix(data: bytes) -> int:
+    """Length of a trailing partial UTF-8 sequence in `data` (0 when it ends on a
+    character boundary). Only a proper prefix of a valid sequence counts; invalid
+    content bytes are left for errors="replace" so real output is never hidden."""
+    i = len(data)
+    continuation = 0
+    while i > 0 and continuation < 3 and data[i - 1] & 0xC0 == 0x80:
+        continuation += 1
+        i -= 1
+    if continuation == 0:
+        # A lone leading byte right at the end starts a sequence the data cuts off.
+        return 1 if i > 0 and data[i - 1] >= 0xC2 else 0
+    if i == 0 or data[i - 1] & 0xC0 == 0x80:
+        return 0  # no leading byte in reach: malformed content, not a cut
+    lead = data[i - 1]
+    if lead < 0xC2:
+        return 0  # ASCII before orphans or an overlong lead: malformed content
+    expected = 2 if lead < 0xE0 else 3 if lead < 0xF0 else 4
+    present = continuation + 1
+    return present if present < expected else 0
+
+
+def _utf8_leading_continuations(data: bytes) -> int:
+    """Length of the leading continuation-byte run in `data`: the remainder of a
+    character whose start was cut away. A leading byte is never stripped - its
+    continuations follow inside the contiguous data, so the character is whole."""
+    count = 0
+    while count < 3 and count < len(data) and data[count] & 0xC0 == 0x80:
+        count += 1
+    return count
+
+
 class _BoundedBuffer:
-    """First _HEAD_CAP bytes plus a rolling _TAIL_CAP-byte tail; the middle is dropped."""
+    """First _HEAD_CAP bytes plus a rolling _TAIL_CAP-byte tail; the middle is dropped.
+
+    Once bytes were dropped, text() strips the partial UTF-8 sequence at each
+    side of the dropped joint and counts the stripped bytes as dropped, so the
+    persisted text never splits a character and written == retained + dropped
+    holds exactly (Codex #50427 parity). size() still counts the raw buffered
+    bytes; the strip is a render-time adjustment of at most 6 bytes.
+    """
 
     def __init__(self) -> None:
         self._head = bytearray()
@@ -167,7 +206,20 @@ class _BoundedBuffer:
             tail = b"".join(self._tail)
             dropped = self._dropped
         if not dropped:
+            # Head and tail rejoin byte-exactly; a character straddling the head
+            # cap survives whole, so nothing may be stripped here.
             return (head + tail).decode("utf-8", errors="replace")
+        # Neither side of the dropped joint may split a UTF-8 character; the
+        # stripped partial bytes join the dropped count so the marker keeps
+        # accounting for every written byte.
+        cut = _utf8_incomplete_suffix(head)
+        if cut:
+            head = head[:-cut]
+            dropped += cut
+        lead = _utf8_leading_continuations(tail)
+        if lead:
+            tail = tail[lead:]
+            dropped += lead
         marker = f"\n... [{dropped} bytes dropped] ...\n"
         return head.decode("utf-8", errors="replace") + marker + tail.decode("utf-8", errors="replace")
 

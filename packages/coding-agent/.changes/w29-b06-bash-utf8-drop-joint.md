@@ -1,0 +1,1 @@
+- Fixed persisted bash output splitting a UTF-8 character at the head/tail drop joint: when the middle of a long output is dropped, the partial bytes on each side of the joint are stripped into the dropped count, so the saved text never shows a mojibake boundary and written == retained + dropped holds exactly (Codex #50427 parity).

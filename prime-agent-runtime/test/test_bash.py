@@ -332,6 +332,67 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(text.endswith("b" * 1000))
         self.assertIn("a" * 1000 + "b" * 1000, text)
 
+    def test_buffer_text_is_byte_exact_when_nothing_is_dropped(self):
+        # Without eviction the head and tail rejoin byte-exactly, so a character
+        # straddling the head cap survives whole.
+        stream = b"x" * (bash_module._HEAD_CAP - 1) + "é".encode() + b"tail"
+        buffer = bash_module._BoundedBuffer()
+        buffer.write(stream)
+        self.assertEqual(buffer.text(), stream.decode())
+
+    def test_buffer_text_never_splits_utf8_at_the_dropped_joint(self):
+        # Codex #50427 parity: persisted output keeps the beginning and the end
+        # without splitting UTF-8 characters, and the dropped count covers the
+        # stripped partial characters too (written == retained + dropped).
+        head_cap = bash_module._HEAD_CAP
+        tail_cap = bash_module._TAIL_CAP
+        total = head_cap + tail_cap + 10
+        stream = bytearray(b"z" * total)
+        stream[head_cap - 1 : head_cap + 1] = "é".encode()  # straddles the head cap
+        cut = total - tail_cap  # the tail window's first stream byte
+        stream[cut - 1 : cut + 1] = "é".encode()  # straddles the tail window's cut
+        buffer = bash_module._BoundedBuffer()
+        buffer.write(bytes(stream))
+        text = buffer.text()
+        self.assertNotIn("\ufffd", text)
+        start = text.index("... [") + len("... [")
+        end = text.index(" bytes dropped]")
+        dropped = int(text[start:end])
+        marker = f"\n... [{dropped} bytes dropped] ...\n"
+        retained = len(text.encode()) - len(marker.encode())
+        self.assertEqual(retained + dropped, total)
+        # 10 evicted + 1 stripped at the head joint + 1 at the tail joint.
+        self.assertEqual(dropped, 12)
+
+    async def test_bash_output_cap_keeps_utf8_characters_whole(self):
+        # End-to-end over the wire: output past the caps is persisted with head
+        # and tail kept, no split characters, and an exact dropped count.
+        if shutil.which("awk") is None:
+            self.skipTest("awk unavailable")
+        head_cap = bash_module._HEAD_CAP
+        tail_cap = bash_module._TAIL_CAP
+        euros = tail_cap // 3 + 10
+        command = (
+            "awk 'BEGIN{"
+            f"for(i=0;i<{head_cap - 1};i++)printf \"a\";"
+            'printf "\\303\\251";'
+            f"for(i=0;i<{euros};i++)printf \"\\342\\202\\254\";"
+            'printf "b"'
+            "}'"
+        )
+        result = await bash(command)
+        self.assertEqual(result.exit_code, 0)
+        self.assertNotIn("\ufffd", result.output)
+        total = (head_cap - 1) + 2 + euros * 3 + 1
+        start = result.output.index("... [") + len("... [")
+        end = result.output.index(" bytes dropped]")
+        dropped = int(result.output[start:end])
+        marker = f"\n... [{dropped} bytes dropped] ...\n"
+        retained = len(result.output.encode()) - len(marker.encode())
+        self.assertEqual(retained + dropped, total)
+        self.assertTrue(result.output.startswith("a" * 100))
+        self.assertTrue(result.output.endswith("€" * 20 + "b"))
+
     async def test_running_reflects_group_liveness(self):
         handle = bash("echo fg; sleep 30 &")
         result = await asyncio.wait_for(handle, timeout=5)
