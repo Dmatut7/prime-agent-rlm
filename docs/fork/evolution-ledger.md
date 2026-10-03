@@ -14,16 +14,16 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-03 午，wave-27 已 SHIP）
+## 当前状态（2026-10-03 午后，wave-28 已 SHIP）
 
-- HEAD = 见 git log。wave-27 五路：僵尸轮询停轮（客户端终态学习，零 wire 变更）+ 重启剧目销账
-  （拉起方冒烟会话的 owned 生命周期，无害）；第四刀（-195 行，累计 -2187）；压缩空转措辞分家
-  （missing-entry-ids 走真失败路径）；考题例行 6/7 + EX-6 键格式契约立项；调研全源零新增。
-- 遥测：老板 10:37-10:55 用了产品（wave-24 前的 bundle）——记忆读侧首次真多查询检索（search×3+
-  overview×1，找上一波审查上下文）；新痛点：变更计数跨窗口误归因（审查会话被记了别的 lane 的
-  改动，「我让你做审查 你改代码了吗」——立项 wave-28）；老板 TUI 被我开工仪式的 shutdown --force
-  归档过一次活会话（10:55 事故）——开工仪式从今起先查活跃会话再 shutdown。
-- 孤儿 worker 54434 查清是 wave-21 台架泄漏，已清理。
+- HEAD = 见 git log（四批：EX-6 契约、spend 停轮、归因标签化、第五刀）。
+- wave-28：老板裁决变更计数继续显示全局变动但分作者（own/ambient 标签化全链路：kernel 观测 →
+  turn-strip/footnote 分行显示 → 压缩交接只带本会话的）；EX-6 键格式契约修复；spend cell 停轮；
+  AgentSession 第五刀（-186 行，累计 23500→21129，-2371）。
+- 遥测：老板今天重度使用且在线；wave-24/25/26 修复全部在役零抱怨；僵尸轮询修复后无 15 秒循环复现；
+  记忆读侧维持有机使用（spawn 后 3 秒即检索的先例）；compaction 生产仍零触发（演练已出数，
+  从积压销账）。
+- 我的流程教训（wave-27）：收工重启也要先查活跃会话（开工仪式已改，收工把老板的活会话归档过一次）。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -100,11 +100,12 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-28 候选）
+## 下一波主题（wave-29 候选）
 
-1. 【老板痛点】变更计数跨窗口误归因：change tracker 的「前后对比工作区」口径不分作者——审查会话
-   被记上别 lane 的改动。修法：按会话归属过滤或按时间窗收紧。
-2. EX-6 键格式契约修复（task.txt 钉死裸文件名 + scorer 归一化前缀，三连失败趋势）。
-3. spend cell 停轮收尾（W27-A 遗留：noteConnectionClosed 里停 idle tick）。
-4. AgentSession 第五刀（终态分类簇 + snapshot 小件收口）；委托壳瘦身评估。
-5. 记忆阶段 2 决策（遥测已有机检索发生，数据再看一周）；GLM 压缩阈值+安全簇等老板拍板。
+1. AgentSession 第六刀（quiescence 簇 + stall-notice 簇；壳瘦身评审）。
+2. 记忆阶段 2 决策（遥测：检索已有机发生——继续积累）；语义近重复（embedding）待老板拍板。
+3. 真机复核包（2027 per-screen + 占位符 + 2031 深浅色）。
+4. 子代理 spawn/delete 加一行解释性 status（W25-D 遗留）；/model「推荐+理由」。
+5. W28-A′ 遗留：turn-box 完整过程视图加 ambient 行内标记（2 行 hunk）；子代理写入算 own 还是
+   ambient 的产品裁决（现=ambient「别的窗口或进程」）。
+6. 调研转化：Codex #49105 重连不确定提交恢复、#50434 /copy 键盘选块——对照现状立项或销账。
