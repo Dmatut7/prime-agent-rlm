@@ -1,4 +1,15 @@
-## 2026-10-03 wave-32 六路：暖 worker 池、worker 模块图瘦身、alt+x 二击根治、字节稳定不变量
+## 2026-10-03 wave-33 七路：暖池二期、ambient 间隙补检、autocompact 两洞、compile cache 随包分发
+
+- 暖 worker 池二期：预热阶段把工具装配/设置读取一并做掉（claim 首建税 60ms 移出受理路径），首个 create 86.4→75.8ms、稳态 90.5→80.4ms；spare 三态一等公民化（warming 中 claim 有界等待 750ms 不丢、failed 显式终态落日志）；审计证实无关生命周期事件（set_model/reload/kill 已认领会话）不波及池内 spare。Windows 代码审查通过。
+- agents-view 的 alt+x 同型缺陷修复（与 wave-32 P2 同构：待命快照点名集合 + 如实回执），4 例回归钉住。
+- ambient 覆盖缺口补上：cell 结束必留终态，下一 cell 开始时若间隙 ≥0.5s 做一次有界补检——纯思考/长间隙里的工作区写入不再永久漏报（此前无命令结束就无检测时机）；顺带修了 accounting 去重、baseline 毒化、stale 链三处相邻缺陷。
+- autocompact 两洞（CC 2.1.288/2.1.282 同款）：①zero-usage 回复不再让阈值判定失效（usage 锚点要求 >0，兜底退回内容密度估算）——此前遇 zero-usage 提供商会一路跳过 autocompact 直到 Prompt-too-long；②压缩摘要被 refusal 时按既有 fallback 链换模型重试一次，不再直接计失败连击。
+- compile cache 随包分发：build 时在隔离子进程生成缓存（106 chunk/5.7MB）进 dist，运行时 manifest 校验（格式+Node 版本）通过才挂载、用户自设 NODE_COMPILE_CACHE 优先、任何不匹配安全退化默认目录。首装冷启动首帧 398→328ms（−70ms）、--help 185→115ms。
+- 考题集首个真模型基线（stepfun step-5-preview，$0 已配）：7/7 全过，共 2.29M tok；判分器自检 13/13。最突出失败模式：过度自验（答案写对后反复重跑验证，EX-4 约 60-70% 花费是冗余验证循环）——提示词/编排侧立项候选。
+- 调研零版本增量；拿到 Codex 暖池遥测三件套命名（prewarm duration/age-at-first-turn/phase）与 CC 确认键演化全史（我们的 armed 快照+二击+常显提示与其收敛形态一致）。
+- 门禁：check EXIT 0、hygiene OK、单测 9533 绿（3 例负载抖动隔离即绿）、suite 1669/1669、tui 1262/1262、python 768（1 例负载阈值隔离即绿）。需要重新编译并重启后才生效。
+
+
 
 - 暖 worker 池上线（默认开，`PRIME_AGENT_WARM_POOL=0` 关）：daemon 预建 cwd 键控的待命 worker，claim 要求 cwd（realpath 归一）+ 环境指纹逐字节一致、2s 健康检查、失败回退冷启动；spare 对枚举/恢复不可见，10min TTL、内存压力释放、关闭/更新前排空。实测首个 agent 受理 245→89ms（−64%）、稳态 269→106ms（−61%）。CC 暖池九条实践族逐条闭环，零 wire 变更。
 - worker 入口模块图瘦身：eager 图 9.4→6.61MB（−30%），zod 等 20+ 符号改 dispatch 点惰性加载（守恒逐调用点核对），worker create 配对中位再 −35ms。
