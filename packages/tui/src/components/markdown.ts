@@ -276,6 +276,136 @@ function buildLexCache(normalizedText: string, tokens: TokensList): LexCache {
 }
 
 /**
+ * Split-lex state for a single growing final paragraph. The block-level lex
+ * cache can only reuse tokens up to a blank-line boundary, so a paragraph that
+ * never contains one (a long streamed answer, a growing wrapped line) is
+ * re-lexed in full on every frame — the dominant per-frame cost left after
+ * line sealing. While the guards documented on trySplitLex hold, only the
+ * unverified tail after `cut` is lexed; the inline prefix tokens are reused.
+ */
+interface SplitLex {
+	/** The block-cache cut this state was built against; any drift invalidates. */
+	baseCut: number;
+	/** Source offset where the growing paragraph starts. */
+	paraFrom: number;
+	/** Source offset the verified inline prefix tiles up to; the tail starts here. */
+	cut: number;
+	/** Inline tokens tiling [paraFrom, cut); verified span-safe (see findSafeInlineCut). */
+	prefixTokens: Token[];
+	/** normalizedText.slice(0, cut), for the per-frame append check. */
+	prefix: string;
+}
+
+/** Below this paragraph size a full lex is cheap enough that splitting adds only overhead. */
+const MIN_SPLIT_LEX_PARAGRAPH_CHARS = 4096;
+
+/**
+ * Characters that can open an inline construct spanning the split point. A
+ * matched pair lives inside a closed construct token (stable); these chars in
+ * a *text* token are unmatched delimiters a later frame could still claim.
+ */
+const INLINE_DELIM_CHARS = new Set(["*", "_", "`", "[", "<", "$", "~", "\\"]);
+
+/**
+ * Rightmost split offset inside the paragraph's inline token stream where a
+ * splice reproduces a full re-lex exactly, or undefined when none qualifies:
+ * - the cut sits inside a plain text token (type text, text === raw, no child
+ *   tokens) or right at its end, with a whitespace character immediately
+ *   before it. The whitespace rule keeps word-shaped constructs (autolinks,
+ *   emails) from spanning the cut: they cannot contain whitespace, and probe
+ *   P4 (marked 18.0.7) shows start-of-tail is flank-equivalent to a space for
+ *   emphasis/codespan/link/del openers;
+ * - every text token in [minRel, cut) is plain and free of INLINE_DELIM_CHARS,
+ *   so no unmatched opener waits in the prefix for a closer in the tail
+ *   (construct tokens are closed by definition and append-stable);
+ * - minRel onward is the only region examined: [0, minRel) was verified when
+ *   the cut last advanced, and the check there is inductive.
+ */
+function findSafeInlineCut(tokens: Token[], text: string, minRel: number): number | undefined {
+	let pos = 0;
+	let candidate: number | undefined;
+	let prefixClean = true;
+	for (const token of tokens) {
+		const raw = (token as { raw?: unknown }).raw;
+		if (typeof raw !== "string") {
+			return undefined;
+		}
+		const start = pos;
+		const end = pos + raw.length;
+		pos = end;
+		if (end <= minRel) {
+			continue;
+		}
+		if (token.type !== "text") {
+			// Closed construct: append-stable, nothing to scan, no cut inside.
+			continue;
+		}
+		const plain = (token as { text?: unknown }).text === raw;
+		const from = Math.max(start, minRel);
+		let delim = -1;
+		for (let i = from - start; i < raw.length; i++) {
+			if (INLINE_DELIM_CHARS.has(raw[i])) {
+				delim = i;
+				break;
+			}
+		}
+		if (plain && prefixClean) {
+			// j may sit at the token end only when a later token follows
+			// (non-empty tail is required either way).
+			const hi = Math.min(delim === -1 ? end : start + delim, text.length - 1);
+			for (let j = hi; j > from; j--) {
+				const before = text[j - 1];
+				if (before === " " || before === "\n") {
+					candidate = j;
+					break;
+				}
+			}
+		}
+		if (delim !== -1) {
+			prefixClean = false;
+		}
+	}
+	return pos === text.length ? candidate : undefined;
+}
+
+/**
+ * Concatenate the verified inline prefix with the freshly lexed tail tokens.
+ * When both sides of the junction are text tokens they must merge into one: a
+ * full lex produces a single text token across the junction, and two adjacent
+ * tokens render differently from one once a default text style wraps each in
+ * its own ANSI pair.
+ */
+function spliceInlineTokens(prefix: Token[], tail: Token[]): Token[] | undefined {
+	const last = prefix[prefix.length - 1];
+	const first = tail[0];
+	if (last?.type === "text" && first?.type === "text") {
+		const lastRaw = (last as { raw?: unknown }).raw;
+		const firstRaw = (first as { raw?: unknown }).raw;
+		const lastText = (last as { text?: unknown }).text;
+		const firstText = (first as { text?: unknown }).text;
+		if (
+			typeof lastRaw !== "string" ||
+			typeof firstRaw !== "string" ||
+			typeof lastText !== "string" ||
+			typeof firstText !== "string"
+		) {
+			return undefined;
+		}
+		const merged = { type: "text", raw: lastRaw + firstRaw, text: lastText + firstText } as Token;
+		return [...prefix.slice(0, -1), merged, ...tail.slice(1)];
+	}
+	return [...prefix, ...tail];
+}
+
+/** A setext underline absorbs the whole preceding paragraph (probe E1/E9). */
+const SETEXT_LINE_REGEX = /^ {0,3}(?:=+|-+) *$/;
+/**
+ * A table delimiter row re-types the preceding line as a table header (probe
+ * E4); alone at a tail start it lexes as plain paragraph text instead.
+ */
+const TABLE_DELIM_LINE_REGEX = /^ {0,3}\|?[ :|-]*-[ :|-]*$/;
+
+/**
  * Default text styling for markdown content.
  * Applied to all text unless overridden by markdown formatting.
  */
@@ -352,6 +482,9 @@ export class Markdown implements Component {
 	// invalidate() (tokens do not depend on the theme), but is only reused when
 	// the normalized text is unchanged up to the cached cut offset.
 	private lexCache?: LexCache;
+	// Inline split of the growing final paragraph; see SplitLex. Same survival
+	// rules as the lex cache; every frame re-validates before reusing.
+	private splitLex?: SplitLex;
 
 	constructor(
 		text: string,
@@ -406,18 +539,166 @@ export class Markdown implements Component {
 	 */
 	private lex(normalizedText: string): TokensList {
 		const cache = this.lexCache;
-		if (cache && cache.cut > 0 && normalizedText.startsWith(cache.prefix)) {
-			const tailTokens = pickMarkdownParser(normalizedText).lexer(normalizedText.slice(cache.cut));
+		const cacheHit = cache !== undefined && cache.cut > 0 && normalizedText.startsWith(cache.prefix);
+		const base = cacheHit ? cache.cut : 0;
+		const baseTokens = cacheHit ? cache.tokens : [];
+		const parser = pickMarkdownParser(normalizedText);
+		const spliced = this.trySplitLex(normalizedText, base, baseTokens, parser);
+		if (spliced) {
+			return spliced;
+		}
+		if (cacheHit) {
+			const tailTokens = parser.lexer(normalizedText.slice(cache.cut));
 			if (Object.keys(tailTokens.links ?? {}).length === 0) {
 				const tokens = cache.tokens.concat(tailTokens) as TokensList;
 				tokens.links = tailTokens.links ?? {};
 				this.lexCache = buildLexCache(normalizedText, tokens);
+				this.splitLex = this.bootstrapSplitLex(normalizedText, tokens);
 				return tokens;
 			}
 		}
-		const tokens = pickMarkdownParser(normalizedText).lexer(normalizedText);
+		const tokens = parser.lexer(normalizedText);
 		this.lexCache = buildLexCache(normalizedText, tokens);
+		this.splitLex = this.bootstrapSplitLex(normalizedText, tokens);
 		return tokens;
+	}
+
+	/**
+	 * Lex only the unverified tail of a single growing final paragraph, splicing
+	 * the result onto the verified inline prefix. Returns undefined unless every
+	 * guard holds; the caller then falls back to the ordinary (cached-prefix or
+	 * full) lex, so a rejected split never changes behavior, only speed:
+	 * - the block-cache context and the whole split prefix are append-stable
+	 *   (baseCut equality + one startsWith);
+	 * - the tail must lex to exactly one paragraph and nothing else. Any block
+	 *   construct starting or completing in the tail (list, fence, html,
+	 *   heading, hr, table, math block, indented code, a blank line ending the
+	 *   paragraph) changes the token count or the first token's type, which is
+	 *   the same re-typing a full lex would perform - falling back reproduces
+	 *   it exactly;
+	 * - a reference definition in the tail (links non-empty) could resolve
+	 *   references in the reused prefix, so it falls back;
+	 * - when the tail starts at a line start, its first line must not be a
+	 *   setext underline or a table delimiter row: both reach BACK across the
+	 *   cut and re-type prefix content (heading absorption, header promotion)
+	 *   while the tail lexed alone keeps them as inert paragraph text;
+	 * - inline spanning across the cut is excluded by construction of
+	 *   split.cut (see findSafeInlineCut).
+	 */
+	private trySplitLex(
+		normalizedText: string,
+		base: number,
+		baseTokens: Token[],
+		parser: Marked,
+	): TokensList | undefined {
+		if (process.env.PI_MARKDOWN_SPLIT_LEX === "0") {
+			return undefined;
+		}
+		const split = this.splitLex;
+		if (
+			!split ||
+			split.baseCut !== base ||
+			split.cut >= normalizedText.length ||
+			!normalizedText.startsWith(split.prefix)
+		) {
+			return undefined;
+		}
+		const tail = normalizedText.slice(split.cut);
+		if (normalizedText[split.cut - 1] === "\n") {
+			const newline = tail.indexOf("\n");
+			const firstLine = newline === -1 ? tail : tail.slice(0, newline);
+			if (SETEXT_LINE_REGEX.test(firstLine) || TABLE_DELIM_LINE_REGEX.test(firstLine)) {
+				return undefined;
+			}
+		}
+		const tailTokens = parser.lexer(tail);
+		if (tailTokens.length !== 1 || tailTokens[0]?.type !== "paragraph") {
+			return undefined;
+		}
+		if (Object.keys(tailTokens.links ?? {}).length > 0) {
+			return undefined;
+		}
+		const tailParagraph = tailTokens[0] as Tokens.Paragraph;
+		if (!Array.isArray(tailParagraph.tokens)) {
+			return undefined;
+		}
+		const inlineTokens = spliceInlineTokens(split.prefixTokens, tailParagraph.tokens);
+		if (!inlineTokens) {
+			return undefined;
+		}
+		// marked strips exactly one trailing "\n" from a paragraph's text (probe
+		// P1); the prefix tiles the source exactly (induction), so the merged
+		// text is the source slice with the same single strip applied.
+		const text = normalizedText.slice(split.paraFrom, split.cut) + tailParagraph.text;
+		const paragraph = {
+			type: "paragraph",
+			raw: normalizedText.slice(split.paraFrom),
+			text,
+			tokens: inlineTokens,
+		} as Tokens.Paragraph;
+		const tokens = baseTokens.concat([paragraph]) as TokensList;
+		tokens.links = {};
+		this.lexCache = buildLexCache(normalizedText, tokens);
+		// Advance the cut through the freshly lexed tail so the next frame's tail
+		// stays small. Keeping the old cut when no further safe point exists is
+		// correct: the tail simply re-lexes until one appears.
+		const advanceTo = findSafeInlineCut(inlineTokens, text, split.cut - split.paraFrom);
+		if (advanceTo !== undefined) {
+			const prefixTokens = this.sliceInlineTokens(inlineTokens, 0, advanceTo);
+			if (prefixTokens) {
+				const cut = split.paraFrom + advanceTo;
+				this.splitLex = {
+					baseCut: base,
+					paraFrom: split.paraFrom,
+					cut,
+					prefixTokens,
+					prefix: normalizedText.slice(0, cut),
+				};
+			}
+		}
+		return tokens;
+	}
+
+	/**
+	 * Build split-lex state from a freshly lexed stream: the final block must be
+	 * a paragraph reaching the end of the text, large enough for splitting to
+	 * pay, with a safe inline cut (findSafeInlineCut). Any other shape disables
+	 * splitting until a qualifying paragraph streams in.
+	 */
+	private bootstrapSplitLex(normalizedText: string, tokens: TokensList): SplitLex | undefined {
+		if (Object.keys(tokens.links ?? {}).length > 0) {
+			return undefined;
+		}
+		const last = tokens[tokens.length - 1];
+		if (!last || last.type !== "paragraph") {
+			return undefined;
+		}
+		const raw = (last as { raw?: unknown }).raw;
+		const paragraph = last as Tokens.Paragraph;
+		if (typeof raw !== "string" || !Array.isArray(paragraph.tokens)) {
+			return undefined;
+		}
+		const paraFrom = normalizedText.length - raw.length;
+		if (paragraph.text.length < MIN_SPLIT_LEX_PARAGRAPH_CHARS) {
+			return undefined;
+		}
+		// The spliced stream is baseTokens plus the single paragraph, so the
+		// paragraph must start exactly at the block-cache cut; anything between
+		// (an unstable list/html block before it) is not tracked by this cache.
+		const baseCut = this.lexCache?.cut ?? 0;
+		if (paraFrom !== baseCut) {
+			return undefined;
+		}
+		const cutRel = findSafeInlineCut(paragraph.tokens, paragraph.text, 0);
+		if (cutRel === undefined) {
+			return undefined;
+		}
+		const prefixTokens = this.sliceInlineTokens(paragraph.tokens, 0, cutRel);
+		if (!prefixTokens) {
+			return undefined;
+		}
+		const cut = paraFrom + cutRel;
+		return { baseCut, paraFrom, cut, prefixTokens, prefix: normalizedText.slice(0, cut) };
 	}
 
 	render(width: number): string[] {

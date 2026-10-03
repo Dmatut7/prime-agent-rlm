@@ -1,0 +1,1 @@
+- Fixed streaming markdown re-lexing the whole in-flight paragraph every frame: a verified inline cut now splits the growing final paragraph, so only the unverified tail is lexed per frame (measured 80k-character single-paragraph stream: 892ms to 302ms total render CPU, last-200 frame average 1.016ms to 0.348ms). `PI_MARKDOWN_SPLIT_LEX=0` opts out.
