@@ -14,15 +14,15 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-03 晨，wave-23 已 SHIP）
+## 当前状态（2026-10-03，wave-24 已 SHIP）
 
-- HEAD = 见 git log（五批：收尸收尾、扩展键 repeat、kitty 占位符、对账工具、文档批）。
-- wave-23：W21-A 遗留清零（措辞/Python wrapper/errored 收编）；扩展快捷键 repeat 守卫；
-  alt+t 丢键销账（伪影）；探测总线阶段 6（kitty 占位符，Ghostty 默认开）；对账工具
-  check-display-reconciliation.mjs 落地并进 CI 自检链（落地当天复判出 +23442 现场）。
-- 遥测：老板 10-03 04:14-06:00 真实用了产品（52 回合）；记忆写侧落第一条有机生产记忆
-  （auto-refine）；读侧检索仍 0（样本少，继续观察）；compaction 交接生产零触发。
-- 老板新信号：「审查代理看不见显示层小 bug」→ 对账工具 + 任务书模板已带显示层走查项。
+- HEAD = 见 git log（四批：Enter cooked 窗+占位符收尾、split-lex、AgentSession 第一刀、session_name 别名）。
+- wave-24：回车丢失根因=attach/resume→TUI raw 切换间的 cooked 窗口（ICRNL 把 \r 翻成 \n），复现率
+  7/8→修复后 6/6；RLM child-run 簇抽出（-916 行，逐字节守恒）；markdown split-lex（892ms→302ms）；
+  R4 销账（0.59ms 已达标）；占位符复制/id 接线；子代理默认模型判定=设计（真缺口是 model_change
+  不进模型上下文，已立项）；degraded_read 画像=turn 密度使然非回归（降噪立项）。
+- FORK_NOTES 文风已改（不再写「老板能感觉到的」，纯技术白描），从 wave-24 节起生效。
+- 遥测：老板 01a0fef3 会话里自愿 refine.run 首次生产成功；读侧检索仍 0；他正亲自审计记忆系统。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -99,10 +99,11 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-24 候选）
+## 下一波主题（wave-25 候选）
 
-1. 记忆阶段 2 决策点：老板已恢复使用产品，本周内看检索使用率数据再定。
-2. 流式 R4（帧成本随总线长，窗口化）+ markdown 单段残余（guard-line split-lex，高风险项）。
-3. 探测总线真机复核（kitty/ghostty 各录一次 DECRQM+2031+占位符行为）+ 占位符复制路径映射 [image]。
-4. W23-C 遗留：占位图片 id 计数/删除接线；kitty 默认开占位需 XTVERSION 探测。
-5. GLM 压缩阈值与安全簇（等老板拍板）；win32 四条。
+1. 【立项】model_change 进模型上下文（切换后注入模型可见通告——「杀了重派」抖动的根治点）。
+2. 【立项】degraded_read 降噪（liveBashHandles=0 的簿记降 debug，真担保才 info）。
+3. AgentSession 第二刀（snapshot 三件套/collect/delete 簇，复用 RlmChildRunHost 模式）。
+4. 记忆阶段 2（遥测等老板更多使用）；compaction 交接假 HOME 演练出数。
+5. 列表生长密封（W24-B 遗留：单 list 2.67ms/帧 lex 未增量）。
+6. 真机复核包（2027 per-screen + 占位符真机行为 + 2031 深浅色，kitty/ghostty 各录一次）。

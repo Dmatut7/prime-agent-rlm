@@ -1,3 +1,11 @@
+## 2026-10-03 wave-24 五路：回车被 tty 吃掉的真凶、AgentSession 第一刀、流式收尾
+
+- 修复回车提交丢失：attach/resume/启动后到 TUI 把 stdin 切 raw 之间有一个 cooked 模式窗口，此窗口里回车的 \r 被内核行规翻译成 \n，变成插入换行而不是提交——用户看到「打了字回车没反应」。tmux 实测 resume 后立即输入的复现率 7/8，修复后 6/6 提交、首帧 9-80ms。修法：interactive 模式在最早知道要进 TUI 的点提前 engage raw 模式，TUI start 时接捧（后台 -p 脚本路径实测不受影响）。
+- AgentSession 拆分第一刀：RLM child-run 簇（~1000 行）从 agent-session.ts（23500→22584 行）机械抽到新模块 core/rlm-child-run.ts，行为逐字节守恒（脚本化比对 + 184 个波及测试全绿）。45 个成员去私有化是本次 seam 成本，后续刀复用同一模式。
+- 流式收尾：单段/生长行 markdown 的每帧全量 lex 改 guard-line split-lex（80k 单段渲染 CPU 892ms→302ms，后段帧均值 1.02→0.35ms）；R4 帧成本实测 0.59ms 已达标，窗口化不立项。Ghostty 图片占位符收尾：复制选区里的占位行映射为 [image]，占位图 id 进计数/删除机制。
+- 三个实测信号立项结论：子代理默认模型是设计（继承会话当前模型，含中途切换；提示词已写明）——老板目击的抖动真因是 model_change 不进模型上下文，已立项；RLMSpawnHandle.session_name 别名补齐；degraded_read 频率升高是 turn 密度使然不是回归（130/130 条全是空担保簿记，降噪立项）。
+- 门禁：check EXIT 0、hygiene OK、tui 1207 全绿、python 689 绿、复扫见账本。需要重新编译并重启后才生效。
+
 ## 2026-10-03 wave-23 五路：子代理收尾账清、kitty 图片占位符、对账工具落地
 
 - 老板能感觉到的：子代理收尸的尾巴清完了（模型侧的 list_subagents/prune_subagents 文档与 Python 入口补齐，出错没收的孩子也会被回收）；扩展快捷键按住不再连发；Ghostty 终端里图片改成占位符渲染（不再冻结/错位）；你立的「屏幕数字要对真值」的规矩变成了仓里的对账工具（scripts/check-display-reconciliation.mjs，已进 CI 自检链）——它落地当天就把 +23442 那起事故的现场精确复判了出来。
