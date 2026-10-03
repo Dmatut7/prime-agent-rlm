@@ -14,15 +14,16 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-03，wave-25 已 SHIP）
+## 当前状态（2026-10-03，wave-26 已 SHIP）
 
-- HEAD = 见 git log。wave-25 五路：model_change 进模型上下文（live 推送 + 装配合成 + suite 回归）、
-  degraded_read 降噪、视口不跟随指示灯（unseenLines + 反显提示）、AgentSession 第二刀（-742 行，
-  累计 -1658）、列表生长密封（11.5×）。
-- 遥测新数字：记忆读侧零检索被打破（子代理 spawn 后 3 秒全局 search 首次有机发生；主会话 3 search
-  +1 get）；refine.run 自愿生产首次成功；compaction 交接仍零生产触发。
-- 老板会话实证（01a0fef3）：「发消息屏幕无变化」的第二个成因=全屏视口不跟随（2026-07 老缺口，
-  fullscreen.ts:220/388 提交路径无 scrollToBottom）——指示灯已上，提交回底在 wave-26。
+- HEAD = 见 git log。wave-26 五路：提交自动回底闭环（TUI 侧 clickHold 让位 + unseen 计数口径修正 +
+  interactive-mode 两处接线）、AgentSession 第三刀（-355 行，retention/roster 两簇）、compaction
+  交接生产实证（假 HOME 真压缩，三点验证全过）、记忆写侧近重复闸（τ=0.40 真库校准 ~97% 精度）、
+  调研+遥测（老板自 wave-24 后未再用产品，等他回来验证 Enter 修复/指示灯的体感）。
+- 新登记：僵尸轮询（客户端持死会话 id 每 15 秒吃硬错误 48 分钟——应回 session-gone 终态）+
+  重启固定剧目（10/10 次重启打掉 1 个活跃会话 worker，疑似拉起方自挂会话）——wave-27 立项。
+- 压缩演练附带发现：「Session is too short to compact」空转文案易误读；小窗口+大单条下压缩几乎
+  不瘦身（生产 1M 窗口无此问题）。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -99,13 +100,10 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-26 候选）
+## 下一波主题（wave-27 候选）
 
-1. 【老板亲历】提交路径自动回底（submit → scrollToBottom，fullscreen.ts:220/388 缺口）+ 
-   审查车道「显示层走查」进任务书模板。
-2. AgentSession 第三刀（retention/release + roster 簇，rlm-child-retention/roster.ts）。
-3. 记忆阶段 2 决策（遥测：检索已有机发生但样本小；写侧 auto-refine 落地质量复核）。
-4. compaction 交接假 HOME 演练出数（积压四波，别再等流量）。
-5. 真机复核包（2027 per-screen + 占位符 + 2031）。
-6. 调研转化：Codex #49105 排队消息重连恢复、#49075 子代理环境保护、#49036/57 交接上下文进审查
-   ——逐条对照我们现状立项或销账。
+1. 僵尸轮询修复（未知会话回 session-gone 终态让客户端停轮）+ 重启剧目调查销账。
+2. AgentSession 第四刀（follow-up 簇 rlm-child-followup.ts + 删壳评估）。
+3. 记忆阶段 2 决策（遥测再积累）；语义近重复（embedding）立项待拍板。
+4. 压缩空转文案区分「无可总结」vs「失败」（W26-C 附带发现 A）。
+5. 真机复核包；exam v1.4（manifest 防读侧）。
