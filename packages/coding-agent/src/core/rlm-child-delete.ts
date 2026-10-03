@@ -7,7 +7,8 @@
  * structurally, so the move changes no runtime behavior.
  */
 import type { AgentSessionMessageController, AgentSessionMessageListResult } from "./agent-messages.js";
-import type { AgentSession, AgentSessionEvent, RetainedRlmChild, RlmSubagentRosterView } from "./agent-session.js";
+import type { AgentSession, AgentSessionEvent, RetainedRlmChild } from "./agent-session.js";
+import type { RlmSubagentRosterView } from "./rlm-child-roster.js";
 import { createAgentMessageDeferred, type RlmChildRun } from "./rlm-child-run.js";
 import type {
 	RlmDeleteSubagentResult,

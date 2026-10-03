@@ -267,6 +267,8 @@ const RLM_CHILD_PROGRESS_NOTE_RING_MAX = 5;
 
 export function noopRlmChildAbort(): void {}
 
+export function noopRlmChildEventUnsubscribe(): void {}
+
 /**
  * Derivation counters for the RLM child streaming-scaling needle: the invariant
  * "a streaming chunk pays O(delta), never a re-derive over the full text" is
