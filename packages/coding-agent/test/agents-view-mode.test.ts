@@ -2542,4 +2542,131 @@ describe("agents view: closed subagents and stop-all", () => {
 		});
 		expect(self.setStatusMessage).toHaveBeenLastCalledWith("已停止 1 个子代理");
 	});
+
+	function runningChild(childId: string): SessionSummary {
+		return summary({
+			activeSessionId: `active-${childId}`,
+			sessionId: `session-${childId}`,
+			runtimeKind: "subagent",
+			parentActiveSessionId: "root-active",
+			rlmChildId: childId,
+			isSessionActive: true,
+		});
+	}
+
+	function stopAllSelf(children: SessionSummary[], request: (command: { childId: string }) => Promise<unknown>) {
+		const root = summary({ activeSessionId: "root-active", sessionId: "root-session", sessionName: "boss" });
+		const self: Record<string, unknown> = {
+			rows: [{ kind: "agent", identity: "root", summary: root, runningSubagentCount: children.length }],
+			selectedIndex: 0,
+			lastListedSummaries: [root, ...children],
+			requireClient: () => ({ request }),
+			setStatusMessage: vi.fn(),
+			refreshSessions: vi.fn(async () => true),
+			stopAllSubagentsRoot() {
+				return invoke("stopAllSubagentsRoot", self);
+			},
+		};
+		return { self, root };
+	}
+
+	// Regression for the same ordering defect wave-32 P2 fixed in interactive-mode:
+	// the confirming press fell through to the empty-roster branch, which disarmed -
+	// and the roster is event-fed, so it can read empty across a resync gap.
+	it("confirms against the armed children when the roster reads empty mid-window", async () => {
+		const request = vi.fn(async (_command: { childId: string }) => ({
+			success: true as const,
+			data: { cancelled: true },
+		}));
+		const { self, root } = stopAllSelf([runningChild("sub-a")], request);
+
+		await invoke("handleStopAllSubagents", self);
+		expect(request).not.toHaveBeenCalled();
+		expect(self.setStatusMessage).toHaveBeenLastCalledWith(expect.stringContaining("再按一次"), {
+			tone: "warning",
+		});
+
+		// The resync gap: descendants momentarily vanish from the listed summaries.
+		self.lastListedSummaries = [root];
+		await invoke("handleStopAllSubagents", self);
+		expect(request).toHaveBeenCalledTimes(1);
+		expect(request).toHaveBeenCalledWith({
+			type: "cancel_rlm_child",
+			activeSessionId: "root-active",
+			childId: "sub-a",
+		});
+		expect(self.setStatusMessage).toHaveBeenLastCalledWith("已停止 1 个子代理");
+	});
+
+	it("still answers 没有在跑 on a first press with an empty roster", async () => {
+		const request = vi.fn(async (_command: { childId: string }) => ({
+			success: true as const,
+			data: { cancelled: true },
+		}));
+		const { self } = stopAllSelf([], request);
+
+		await invoke("handleStopAllSubagents", self);
+		expect(self.setStatusMessage).toHaveBeenLastCalledWith(expect.stringContaining("现在没有在跑的子代理"));
+		expect(request).not.toHaveBeenCalled();
+
+		// Nothing was armed: the next press is a first press again, not a confirmation.
+		await invoke("handleStopAllSubagents", self);
+		expect(self.setStatusMessage).toHaveBeenLastCalledWith(expect.stringContaining("现在没有在跑的子代理"));
+		expect(request).not.toHaveBeenCalled();
+	});
+
+	it("reports children that settled on their own between the presses, without claiming a stop", async () => {
+		// cancel_rlm_child answers cancelled:false for a run that already settled
+		// (daemon-side cancelRlmChildRun is idempotent), the way a child that
+		// finished inside the confirm window answers.
+		const request = vi.fn(async (_command: { childId: string }) => ({
+			success: true as const,
+			data: { cancelled: false },
+		}));
+		const { self } = stopAllSelf([runningChild("sub-a"), runningChild("sub-b")], request);
+
+		await invoke("handleStopAllSubagents", self);
+		await invoke("handleStopAllSubagents", self);
+		expect(self.setStatusMessage).toHaveBeenLastCalledWith("要停的子代理已经自己结束了");
+
+		// A mixed window reports the partial stop honestly instead of rounding up.
+		request.mockImplementation(async (command: { childId: string }) => ({
+			success: true as const,
+			data: { cancelled: command.childId === "sub-a" },
+		}));
+		await invoke("handleStopAllSubagents", self);
+		await invoke("handleStopAllSubagents", self);
+		expect(self.setStatusMessage).toHaveBeenLastCalledWith("已停止 1 个子代理（其余 1 个已经自己结束）");
+	});
+
+	it("re-arms instead of stopping when the confirm window has expired", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(new Date("2026-10-03T00:00:00Z"));
+			const request = vi.fn(async (_command: { childId: string }) => ({
+				success: true as const,
+				data: { cancelled: true },
+			}));
+			const { self } = stopAllSelf([runningChild("sub-a")], request);
+
+			await invoke("handleStopAllSubagents", self);
+			vi.setSystemTime(new Date("2026-10-03T00:00:06Z"));
+			await invoke("handleStopAllSubagents", self);
+			expect(request).not.toHaveBeenCalled();
+			expect(self.setStatusMessage).toHaveBeenLastCalledWith(expect.stringContaining("再按一次"), {
+				tone: "warning",
+			});
+
+			await invoke("handleStopAllSubagents", self);
+			expect(request).toHaveBeenCalledTimes(1);
+			expect(request).toHaveBeenCalledWith({
+				type: "cancel_rlm_child",
+				activeSessionId: "root-active",
+				childId: "sub-a",
+			});
+			expect(self.setStatusMessage).toHaveBeenLastCalledWith("已停止 1 个子代理");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 });

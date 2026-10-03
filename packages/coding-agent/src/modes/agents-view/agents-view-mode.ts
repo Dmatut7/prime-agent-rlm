@@ -956,7 +956,12 @@ export class AgentsViewMode implements Component, Focusable {
 	private savedCatalogReady = false;
 	/** A closed child to reopen once the saved catalog lists it (see resolveDeferredChildOpen). */
 	private deferredChildOpen: AgentsViewPendingChildOpen | undefined;
-	/** Armed by the first stop-all press: which family, how many, and until when. */
+	/**
+	 * Armed by the first stop-all press: which family, which children, and until when.
+	 * The child ids are snapshotted at the arming press: the roster is event-fed and
+	 * can read empty mid-resync, so the confirming press must not re-derive the
+	 * target set from it.
+	 */
 	private stopAllArmed: { rootActiveSessionId: string; childIds: string[]; until: number } | undefined;
 	private savedCatalogGeneration = 0;
 	private heartbeatCatalogGeneration = 0;
@@ -2347,12 +2352,60 @@ export class AgentsViewMode implements Component, Focusable {
 	/**
 	 * The stop-all-subagents key: stops every working subagent in the selected
 	 * agent's family (or the scoped family). The first press names how many, a second
-	 * press within the window stops them - children keep spending while the owner is
-	 * away, and one key is how they stop without walking every row.
+	 * press within the window stops exactly the children the first press named -
+	 * children keep spending while the owner is away, and one key is how they stop
+	 * without walking every row.
 	 */
 	private async handleStopAllSubagents(): Promise<void> {
 		const root = this.stopAllSubagentsRoot();
 		const rootActiveSessionId = root?.activeSessionId;
+		const now = Date.now();
+		const armed = this.stopAllArmed;
+		if (armed !== undefined && armed.rootActiveSessionId === rootActiveSessionId && now <= armed.until) {
+			// Confirming press: stop exactly the children the first press named. The
+			// roster (lastListedSummaries) is event-fed and can read empty mid-resync,
+			// so it is not re-read here - re-reading it used to drop the confirmation
+			// into the "没有在跑" branch and silently disarm.
+			this.stopAllArmed = undefined;
+			const client = this.requireClient();
+			this.setStatusMessage(`正在停止 ${armed.childIds.length} 个子代理…`);
+			const results = await Promise.allSettled(
+				armed.childIds.map(async (childId) => {
+					const data = requireDaemonData(
+						await client.request({
+							type: "cancel_rlm_child",
+							activeSessionId: armed.rootActiveSessionId,
+							childId,
+						}),
+					);
+					return isRecord(data) && data.cancelled === true;
+				}),
+			);
+			const failures = results.filter((result) => result.status === "rejected");
+			if (failures.length > 0) {
+				const first = failures[0];
+				const error = first?.status === "rejected" ? first.reason : undefined;
+				this.setStatusMessage(
+					isUnknownDaemonCommandError(error, "cancel_rlm_child")
+						? "后台服务是旧版本，停不了子代理；重启后台服务后再试"
+						: formatError(`有 ${failures.length} 个子代理没停下`, error),
+					{ tone: "warning" },
+				);
+			} else {
+				const stopped = results.filter((result) => result.status === "fulfilled" && result.value === true).length;
+				if (stopped === armed.childIds.length) {
+					this.setStatusMessage(`已停止 ${stopped} 个子代理`);
+				} else if (stopped === 0) {
+					this.setStatusMessage("要停的子代理已经自己结束了");
+				} else {
+					this.setStatusMessage(
+						`已停止 ${stopped} 个子代理（其余 ${armed.childIds.length - stopped} 个已经自己结束）`,
+					);
+				}
+			}
+			await this.refreshSessions();
+			return;
+		}
 		if (!root || !rootActiveSessionId) {
 			this.stopAllArmed = undefined;
 			this.setStatusMessage("先选中一个正在运行的会话，才能停止它的子代理");
@@ -2367,38 +2420,11 @@ export class AgentsViewMode implements Component, Focusable {
 			this.setStatusMessage(`${getAgentsViewSessionTitle(root)} 现在没有在跑的子代理`);
 			return;
 		}
-		const now = Date.now();
-		const armed = this.stopAllArmed;
-		if (!armed || armed.rootActiveSessionId !== rootActiveSessionId || now > armed.until) {
-			this.stopAllArmed = { rootActiveSessionId, childIds, until: now + STOP_ALL_SUBAGENTS_CONFIRM_WINDOW_MS };
-			this.setStatusMessage(
-				`再按一次 ${keyText("app.subagents.stopAll")} 停止 ${getAgentsViewSessionTitle(root)} 的全部 ${childIds.length} 个在跑的子代理（做到一半的会停下，记录保留）`,
-				{ tone: "warning" },
-			);
-			return;
-		}
-		this.stopAllArmed = undefined;
-		const client = this.requireClient();
-		this.setStatusMessage(`正在停止 ${armed.childIds.length} 个子代理…`);
-		const results = await Promise.allSettled(
-			armed.childIds.map((childId) =>
-				client.request({ type: "cancel_rlm_child", activeSessionId: rootActiveSessionId, childId }),
-			),
+		this.stopAllArmed = { rootActiveSessionId, childIds, until: now + STOP_ALL_SUBAGENTS_CONFIRM_WINDOW_MS };
+		this.setStatusMessage(
+			`再按一次 ${keyText("app.subagents.stopAll")} 停止 ${getAgentsViewSessionTitle(root)} 的全部 ${childIds.length} 个在跑的子代理（做到一半的会停下，记录保留）`,
+			{ tone: "warning" },
 		);
-		const failures = results.filter((result) => result.status === "rejected");
-		if (failures.length > 0) {
-			const first = failures[0];
-			const error = first?.status === "rejected" ? first.reason : undefined;
-			this.setStatusMessage(
-				isUnknownDaemonCommandError(error, "cancel_rlm_child")
-					? "后台服务是旧版本，停不了子代理；重启后台服务后再试"
-					: formatError(`有 ${failures.length} 个子代理没停下`, error),
-				{ tone: "warning" },
-			);
-		} else {
-			this.setStatusMessage(`已停止 ${armed.childIds.length} 个子代理`);
-		}
-		await this.refreshSessions();
 	}
 
 	/** The live agent whose subagents the stop-all key acts on: the selected family, else the scope. */
