@@ -1,4 +1,14 @@
-## 2026-10-03 wave-31 八路：worker create 拆解回收、probe-bus 硬化、模型表刷新、buildId 互杀修复
+## 2026-10-03 wave-32 六路：暖 worker 池、worker 模块图瘦身、alt+x 二击根治、字节稳定不变量
+
+- 暖 worker 池上线（默认开，`PRIME_AGENT_WARM_POOL=0` 关）：daemon 预建 cwd 键控的待命 worker，claim 要求 cwd（realpath 归一）+ 环境指纹逐字节一致、2s 健康检查、失败回退冷启动；spare 对枚举/恢复不可见，10min TTL、内存压力释放、关闭/更新前排空。实测首个 agent 受理 245→89ms（−64%）、稳态 269→106ms（−61%）。CC 暖池九条实践族逐条闭环，零 wire 变更。
+- worker 入口模块图瘦身：eager 图 9.4→6.61MB（−30%），zod 等 20+ 符号改 dispatch 点惰性加载（守恒逐调用点核对），worker create 配对中位再 −35ms。
+- alt+x 二击确认偶发不落根治：旧实现确认击时现算 roster，attach 窗 roster 瞬空会静默解除待命（第三击实为重新待命）；改为待命时快照点名集合，确认击按快照停，回执如实报「全停/已自行结束/部分」。4 例新回归钉住（含 roster 空窗二击）。同型缺陷在 agents-view 的 handleStopAllSubagents 也存在，已立项下波。
+- 记忆渲染字节稳定不变量钉住：digest/compaction 交接/内核 overview 同输入逐字节相同（10 例新测试），prompt cache 命中前提成立；全仓无 structured-outputs 依赖（不需要 kill switch，核查清单在 /tmp/wave32/mem-stable.md）。
+- 实机验证 wave-31 三修复全过（ambient 标题、buildId 双向不互杀、Ctrl+Z drain 无杂散字节）；新观察：纯思考 cell 间隙的 ambient 写入不被检测（无命令结束就无 gap-check），疑似内核覆盖缺口，已立项。
+- 调研 6 条增量（/tmp/wave32/research.md）：Codex 环境预热三态设计（pending 一等公民）与 CC 两条暖池漏采（tool 装配进预热、无关 reload 不得杀 spare）已记入暖池迭代清单；沙箱商公开数字（池化 ~3ms vs 冷启动 500-2000ms）佐证验收目标量级。
+- 门禁：check EXIT 0、hygiene OK、单测 9511 绿（暖池健康检查例+process-tree-cpu 负载抖动，隔离即绿）、suite 1664/1664 全绿、tui 1262/1262、python 765（2 例负载抖动隔离即绿）。需要重新编译并重启后才生效。
+
+
 
 - worker create 拆出构成（316ms：模块图 147 / spawn 25 / 建连轮询 25 / 握手 15 / create 处理 60-80 / persist 28-32）并回收两刀安全项：daemon 模式跳过被丢弃的 boot SessionManager（-16ms/worker）、内核 prewarm 推迟一个 macrotask（21ms 哈希移出 create 响应路径）——配对中位 −25ms、稳态 ~303→278ms、离群点消失。暖 worker 池提案已出（CC 2.1.136-238 九条实践族当设计清单），下波评审。
 - get_state 复核为阴性结果：处理器本身 2.3ms、attach 握手已携带预聚合快照——预热范式现状即已实现，剩余 823ms 全在 worker spawn 与客户端模块加载。零改动立项关闭。
