@@ -289,6 +289,49 @@ describe("timeline steps from the kernel's records", () => {
 		expect(out).toContain("✦  记住：go http 请求要带 context");
 		expect(out).not.toContain("_2026");
 	});
+
+	it("marks a change another window or process made as 工作区, keeping the session's own rows bare", () => {
+		const turn = quietTurn();
+		addStep(turn, "e1", "edit(...)");
+		turn.timeline.mergeStep(
+			"e1",
+			"ipython",
+			{},
+			{
+				details: {
+					fileChanges: [
+						{
+							path: "/work/app/modules/aichat/client.go",
+							relPath: "modules/aichat/client.go",
+							kind: "modified",
+							scope: "project",
+							added: 12,
+							removed: 4,
+							source: "edit",
+							at: 1,
+						},
+						{
+							path: "/work/app/notes.md",
+							relPath: "notes.md",
+							kind: "modified",
+							scope: "project",
+							added: 3,
+							removed: 1,
+							source: "shell",
+							origin: "ambient",
+							at: 2,
+						},
+					],
+				},
+			},
+			false,
+		);
+		const lines = openEvents(turn);
+		// The session's own row stays bare; the ambient one carries the marker the change
+		// strip splits out as 「工作区另有 N 个变动」.
+		expect(lines.some((line) => /^ {9}│ {11}✎ {2}modules\/aichat\/client\.go\s+\+12 −4 {4}$/.test(line))).toBe(true);
+		expect(lines.some((line) => /^ {9}│ {11}✎ {2}notes\.md\s+工作区 \+3 −1 {4}$/.test(line))).toBe(true);
+	});
 });
 
 describe("timeline rows without kernel records (today's data)", () => {

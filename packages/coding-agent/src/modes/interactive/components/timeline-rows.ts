@@ -401,6 +401,8 @@ function changeRow(key: string, change: ChangeEntry, status: BoxRowStatus): BoxR
 	const meta: MetaPart[] = [];
 	if (scratch) meta.push({ text: "临时 ", color: "dim" });
 	if (change.scope === "memory") meta.push({ text: "规则文件 ", color: "dim" });
+	// Another window or process changed it: the row says so, as the change strip's split does.
+	if (change.origin === "ambient") meta.push({ text: "工作区 ", color: "dim" });
 	// The link itself changed, not its target's text: no diff, so no `+0 −0`.
 	if (!change.symlink) {
 		const omitted = omittedDiffText(change.omitted);
