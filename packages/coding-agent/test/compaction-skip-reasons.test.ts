@@ -69,6 +69,20 @@ function assistantMessage(text: string): AgentMessage {
 	} as AssistantMessage as AgentMessage;
 }
 
+/** An assistant message whose provider-reported usage keeps the session over the threshold. */
+function assistantMessageWithTokens(text: string, totalTokens: number): AgentMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		usage: { ...createUsage(), totalTokens },
+		stopReason: "stop",
+		timestamp: Date.now(),
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "claude-sonnet-4-5",
+	} as AssistantMessage as AgentMessage;
+}
+
 function messageEntry(message: AgentMessage): SessionMessageEntry {
 	return link({
 		type: "message",
@@ -222,6 +236,95 @@ describe("compactionSkipMessage wording (W27-C)", () => {
 
 	it("already-compacted keeps the established wording", () => {
 		expect(compactionSkipMessage("already-compacted")).toBe("Already compacted");
+	});
+});
+
+describe("over-threshold nothing-to-summarize carries the shrink evaluation (W29-B10)", () => {
+	// A 100k window makes the trigger threshold 80_000 at the default 0.8 ratio
+	// (the 16384 reserve leaves an 83_616 ceiling, so the ratio binds).
+	const WINDOW = 100_000;
+	/** One message larger than the trigger threshold on its own (~100k content-priced tokens). */
+	const WALL = "x".repeat(400_000);
+
+	it("an over-threshold skip carries the shrink plan for the divisible context outside the kept tail", () => {
+		// The wave-29 spin: the kept tail starts at the oversized head, so the
+		// summarization path finds nothing to do - but the oldest entry is a cut
+		// point of its own, so the emergency shrink can drop it and keep the tail.
+		const wall = messageEntry(userMessage(WALL));
+		const followUp = messageEntry(userMessage("继续"));
+		const reply = messageEntry(assistantMessageWithTokens("done", 100_005));
+		const entries: SessionEntry[] = [wall, followUp, reply];
+		const outcome = prepareCompactionOutcome(entries, settings(), WINDOW);
+		expect(outcome.kind).toBe("skip");
+		if (outcome.kind !== "skip") return;
+		expect(outcome.reason).toBe("nothing-to-summarize");
+		const plan = outcome.emergencyShrink;
+		expect(plan).toBeDefined();
+		expect(plan?.firstKeptEntryId).toBe(followUp.id);
+		expect(plan?.reachedTarget).toBe(true);
+		expect(plan?.span.droppedEntries).toBe(1);
+		expect(plan?.span.droppedRoles).toEqual({ user: 1 });
+		expect(plan?.tokensAfter).toBeLessThanOrEqual(plan?.targetTokens ?? -1);
+		// The legacy wrapper still collapses every skip to undefined.
+		expect(prepareCompaction(entries, settings(), WINDOW)).toBeUndefined();
+	});
+
+	it("an over-threshold skip on one wall-sized message carries null: the shrink has nothing to cut", () => {
+		// The oversized entry IS the whole context - no cut point exists past it, so
+		// the evaluation says so explicitly instead of leaving the caller guessing.
+		const entries: SessionEntry[] = [messageEntry(userMessage(WALL))];
+		const outcome = prepareCompactionOutcome(entries, settings(), WINDOW);
+		expect(outcome.kind).toBe("skip");
+		if (outcome.kind !== "skip") return;
+		expect(outcome.reason).toBe("nothing-to-summarize");
+		expect(outcome.emergencyShrink).toBeNull();
+	});
+
+	it("an under-threshold nothing-to-summarize skip stays benign: no evaluation is attached", () => {
+		const entries: SessionEntry[] = [
+			messageEntry(userMessage("hello")),
+			messageEntry(assistantMessage("hi there")),
+			messageEntry(userMessage("how are you")),
+			messageEntry(assistantMessage("great")),
+		];
+		const outcome = prepareCompactionOutcome(entries, DEFAULT_COMPACTION_SETTINGS, WINDOW);
+		expect(outcome.kind).toBe("skip");
+		if (outcome.kind !== "skip") return;
+		expect(outcome.reason).toBe("nothing-to-summarize");
+		expect("emergencyShrink" in outcome).toBe(false);
+	});
+
+	it("no known window means no evaluation: the skip cannot be classified as over-threshold", () => {
+		const entries: SessionEntry[] = [messageEntry(userMessage(WALL))];
+		const outcome = prepareCompactionOutcome(entries, settings());
+		expect(outcome.kind).toBe("skip");
+		if (outcome.kind !== "skip") return;
+		expect("emergencyShrink" in outcome).toBe(false);
+	});
+
+	it("already-compacted never carries the evaluation, even over the threshold", () => {
+		const kept = messageEntry(userMessage(WALL));
+		const entries: SessionEntry[] = [
+			messageEntry(userMessage("summarized")),
+			kept,
+			compactionEntry("First summary", kept.id),
+		];
+		const outcome = prepareCompactionOutcome(entries, settings(), WINDOW);
+		expect(outcome.kind).toBe("skip");
+		if (outcome.kind !== "skip") return;
+		expect(outcome.reason).toBe("already-compacted");
+		expect("emergencyShrink" in outcome).toBe(false);
+	});
+
+	it("missing-entry-ids never carries the evaluation: it already takes the failure path", () => {
+		const giantAssistant = messageEntry(assistantMessageWithTokens(WALL, 100_005));
+		giantAssistant.id = "";
+		const entries: SessionEntry[] = [messageEntry(userMessage("do the work")), giantAssistant];
+		const outcome = prepareCompactionOutcome(entries, settings(), WINDOW);
+		expect(outcome.kind).toBe("skip");
+		if (outcome.kind !== "skip") return;
+		expect(outcome.reason).toBe("missing-entry-ids");
+		expect("emergencyShrink" in outcome).toBe(false);
 	});
 });
 

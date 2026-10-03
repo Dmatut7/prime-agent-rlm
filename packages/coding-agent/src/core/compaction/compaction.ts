@@ -1788,7 +1788,21 @@ export type CompactionSkipReason =
 
 export type PrepareCompactionOutcome =
 	| { kind: "ready"; preparation: CompactionPreparation }
-	| { kind: "skip"; reason: CompactionSkipReason };
+	| {
+			kind: "skip";
+			reason: CompactionSkipReason;
+			/**
+			 * W29-B10: the emergency-shrink evaluation, attached only to an
+			 * over-threshold "nothing-to-summarize" skip. A plan means the oldest
+			 * non-summary context outside the kept tail is divisible - the shrink
+			 * valve can act now instead of waiting out a failure streak the skip
+			 * path never feeds. Null means even the deepest shrink cut cannot move
+			 * (one oversized entry IS the whole retained context) - escalate to the
+			 * user (/model, /new). Absent means the branch is under the trigger
+			 * threshold, or no window is known to compare against: the benign skip.
+			 */
+			emergencyShrink?: EmergencyShrinkPlan | null;
+	  };
 
 /**
  * The user-facing wording for one skip reason, canonical so every caller (the
@@ -1806,6 +1820,41 @@ export function compactionSkipMessage(reason: CompactionSkipReason): string {
 		case "missing-entry-ids":
 			return "Compaction cannot run: a session entry has no id — the session may need to be migrated";
 	}
+}
+
+/**
+ * The "nothing to summarize" verdict, with the emergency-shrink evaluation attached
+ * when the branch is over the trigger threshold (W29-B10).
+ *
+ * Under the threshold the verdict is benign: the kept tail legitimately covers the
+ * session. Over the threshold the same verdict is the idle spin - every turn
+ * re-triggers compaction, the summarization path keeps finding nothing to cut
+ * because the kept tail starts at one oversized entry, and a skip never counted as
+ * a failure, so the emergency-shrink valve never ran either. The evaluation closes
+ * that gap at the one place that already holds the branch, the settings and the
+ * window: the planner answers whether the context outside the kept tail is
+ * divisible (a plan) or whether the oversized entry is a genuine wall (null), and
+ * the caller escalates accordingly. The planner runs once per skip, linear in the
+ * branch, and only while over the threshold - the benign skip pays nothing.
+ */
+function nothingToSummarizeOutcome(
+	pathEntries: SessionEntry[],
+	settings: CompactionSettings,
+	contextWindow: number | undefined,
+	limits: CompactionWindowLimits | undefined,
+	contextTokens: number,
+): PrepareCompactionOutcome {
+	const threshold = compactionThresholdTokens(contextWindow ?? 0, settings, limits);
+	// The same predicate the threshold hook and the admission gate read, so the
+	// evaluation attaches exactly when the trigger keeps firing.
+	if (threshold > 0 && shouldCompact(contextTokens, contextWindow ?? 0, settings, limits)) {
+		return {
+			kind: "skip",
+			reason: "nothing-to-summarize",
+			emergencyShrink: planEmergencyShrink(pathEntries, threshold) ?? null,
+		};
+	}
+	return { kind: "skip", reason: "nothing-to-summarize" };
 }
 
 export function prepareCompactionOutcome(
@@ -1898,7 +1947,7 @@ export function prepareCompactionOutcome(
 	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
 	if (!firstKeptEntry) {
 		// An empty branch keeps no entry at the cut: there is nothing to summarize.
-		return { kind: "skip", reason: "nothing-to-summarize" };
+		return nothingToSummarizeOutcome(pathEntries, settings, contextWindow, limits, tokensBefore);
 	}
 	if (!firstKeptEntry.id) {
 		// Session needs migration
@@ -1927,9 +1976,11 @@ export function prepareCompactionOutcome(
 
 	// Avoid a compaction that would summarize no history: it keeps the same
 	// firstKeptEntryId, so the context it produces is no smaller than the one it
-	// replaces, and a threshold compaction would re-fire every turn.
+	// replaces, and a threshold compaction would re-fire every turn. When the
+	// branch is over the threshold anyway, the skip carries the emergency-shrink
+	// evaluation so the caller can act on it instead of idling (W29-B10).
 	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) {
-		return { kind: "skip", reason: "nothing-to-summarize" };
+		return nothingToSummarizeOutcome(pathEntries, settings, contextWindow, limits, tokensBefore);
 	}
 	const fileOps = extractFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex);
 	// Split turns retain their suffix, but their prefix file operations still belong in the summary.
