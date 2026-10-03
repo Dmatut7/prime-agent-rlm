@@ -1,6 +1,6 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { ProcessTerminal } from "../src/terminal.js";
+import { engageEarlyRawMode, ProcessTerminal, releaseEarlyRawMode } from "../src/terminal.js";
 import { clearDefaultTerminalColors, getDefaultTerminalColors } from "../src/terminal-colors.js";
 import {
 	allocatePlaceholderImageId,
@@ -117,6 +117,110 @@ describe("ProcessTerminal alternate screen handoff", () => {
 			restoreProperty(process.stdin, "resume", originalResume);
 			restoreProperty(process.stdin, "pause", originalPause);
 		}
+	});
+
+	describe("early raw mode", () => {
+		function mockStdinRaw(initialRaw: boolean) {
+			const originalIsTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+			const originalIsRaw = Object.getOwnPropertyDescriptor(process.stdin, "isRaw");
+			const originalSetRawMode = Object.getOwnPropertyDescriptor(process.stdin, "setRawMode");
+			const originalResume = Object.getOwnPropertyDescriptor(process.stdin, "resume");
+			const originalPause = Object.getOwnPropertyDescriptor(process.stdin, "pause");
+			let isRaw = initialRaw;
+			let resumeCalls = 0;
+			const rawModeChanges: boolean[] = [];
+			Object.defineProperty(process.stdin, "isTTY", { configurable: true, get: () => true });
+			Object.defineProperty(process.stdin, "isRaw", { configurable: true, get: () => isRaw });
+			Object.defineProperty(process.stdin, "setRawMode", {
+				configurable: true,
+				value: (enabled: boolean) => {
+					isRaw = enabled;
+					rawModeChanges.push(enabled);
+					return process.stdin;
+				},
+			});
+			Object.defineProperty(process.stdin, "resume", {
+				configurable: true,
+				value: () => {
+					resumeCalls++;
+					return process.stdin;
+				},
+			});
+			Object.defineProperty(process.stdin, "pause", { configurable: true, value: () => process.stdin });
+			return {
+				get isRaw() {
+					return isRaw;
+				},
+				get resumeCalls() {
+					return resumeCalls;
+				},
+				rawModeChanges,
+				restore() {
+					restoreProperty(process.stdin, "isTTY", originalIsTTY);
+					restoreProperty(process.stdin, "isRaw", originalIsRaw);
+					restoreProperty(process.stdin, "setRawMode", originalSetRawMode);
+					restoreProperty(process.stdin, "resume", originalResume);
+					restoreProperty(process.stdin, "pause", originalPause);
+				},
+			};
+		}
+
+		it("engages raw without reading, and the first terminal still restores cooked on stop", () => {
+			const stdin = mockStdinRaw(false);
+			const originalWrite = process.stdout.write;
+			process.stdout.write = ((...args: Parameters<typeof process.stdout.write>): boolean => {
+				const callback = args.find((arg): arg is (error?: Error | null) => void => typeof arg === "function");
+				callback?.();
+				return true;
+			}) as typeof process.stdout.write;
+			try {
+				engageEarlyRawMode();
+				assert.equal(stdin.isRaw, true);
+				// Input must keep buffering in the kernel until start() reads it.
+				assert.equal(stdin.resumeCalls, 0);
+
+				const terminal = new ProcessTerminal();
+				terminal.start(
+					() => {},
+					() => {},
+				);
+				terminal.stop();
+				// The pre-engage mode was cooked: stop() must not leave the tty raw.
+				assert.equal(stdin.isRaw, false);
+				assert.deepEqual(stdin.rawModeChanges, [true, true, false]);
+			} finally {
+				releaseEarlyRawMode();
+				process.stdout.write = originalWrite;
+				stdin.restore();
+			}
+		});
+
+		it("restores the original mode when the process exits before any terminal starts", () => {
+			const stdin = mockStdinRaw(false);
+			try {
+				engageEarlyRawMode();
+				assert.equal(stdin.isRaw, true);
+				releaseEarlyRawMode();
+				assert.equal(stdin.isRaw, false);
+				assert.deepEqual(stdin.rawModeChanges, [true, false]);
+			} finally {
+				releaseEarlyRawMode();
+				stdin.restore();
+			}
+		});
+
+		it("is a no-op when stdin is already raw", () => {
+			const stdin = mockStdinRaw(true);
+			try {
+				engageEarlyRawMode();
+				assert.deepEqual(stdin.rawModeChanges, []);
+				releaseEarlyRawMode();
+				assert.deepEqual(stdin.rawModeChanges, []);
+			} finally {
+				releaseEarlyRawMode();
+				stdin.restore();
+			}
+		});
 	});
 
 	it("does not inherit an active alternate screen before it is preserved", () => {

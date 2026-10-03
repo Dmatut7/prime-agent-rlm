@@ -1,0 +1,2 @@
+- Fixed fullscreen selection copies over kitty placeholder image rows leaking U+10EEEE cells into the clipboard; each image now copies as a single `[image]` line (consecutive rows of one image collapse).
+- Fixed kitty placeholder images never being freed in inline mode: their ids are now tracked from the placeholder rows' SGR foreground color and deleted when the image leaves the transcript, while images still on screen are never deleted.

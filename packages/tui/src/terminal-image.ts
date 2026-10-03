@@ -333,6 +333,34 @@ export function allocatePlaceholderImageId(): number {
 	return Math.floor(Math.random() * 0xffffff) + 1;
 }
 
+/**
+ * Clipboard stand-in for kitty placeholder image rows: the U+10EEEE cells are
+ * terminal-local rendering state, so selection copy maps each image (the
+ * consecutive rows sharing its id) to one marker line.
+ */
+export const KITTY_PLACEHOLDER_COPY_MARKER = "[image]";
+
+const PLACEHOLDER_COLOR_REGEX = /\x1b\[38;2;(\d{1,3});(\d{1,3});(\d{1,3})m/;
+
+/**
+ * The image id a placeholder row carries in its 24-bit SGR foreground color
+ * (see encodeKittyPlaceholderRows), or null for lines without placeholder
+ * cells. Exact for every id allocatePlaceholderImageId can produce; ids above
+ * 24 bits additionally need the spec's third diacritic, which the placeholder
+ * path never emits.
+ */
+export function extractKittyPlaceholderImageId(line: string): number | null {
+	if (!line.includes(KITTY_PLACEHOLDER_CHAR)) return null;
+	const match = PLACEHOLDER_COLOR_REGEX.exec(line);
+	if (!match) return null;
+	const r = Number(match[1]);
+	const g = Number(match[2]);
+	const b = Number(match[3]);
+	if (r > 255 || g > 255 || b > 255) return null;
+	const id = (r << 16) | (g << 8) | b;
+	return id > 0 ? id : null;
+}
+
 export interface KittyPlaceholderRowsOptions {
 	imageId: number;
 	columns: number;

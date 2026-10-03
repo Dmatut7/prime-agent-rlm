@@ -1,7 +1,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
-import { deleteKittyImage, encodeKitty } from "../src/terminal-image.js";
+import { deleteKittyImage, encodeKitty, encodeKittyPlaceholderRows } from "../src/terminal-image.js";
 import { type Component, TUI } from "../src/tui.js";
 import { VirtualTerminal } from "./virtual-terminal.js";
 
@@ -150,6 +150,79 @@ describe("TUI Kitty image cleanup", () => {
 		assert.ok(deleteIndex >= 0, "previous image should be deleted during full redraw");
 		assert.ok(clearIndex >= 0, "full redraw should clear the screen");
 		assert.ok(deleteIndex < clearIndex, "old image should be deleted before the screen is cleared");
+
+		tui.stop();
+	});
+
+	it("deletes placeholder image ids whose rows leave the transcript", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui = new TUI(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+
+		component.lines = ["top", ...encodeKittyPlaceholderRows({ imageId: 42, columns: 2, rows: 2 }), "bottom"];
+		tui.start();
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		component.lines = ["plain text"];
+		tui.requestRender(true);
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		const deleteIndex = writes.indexOf(deleteKittyImage(42));
+		const clearIndex = writes.indexOf("\x1b[2J");
+		assert.ok(deleteIndex >= 0, "departed placeholder image should be deleted during full redraw");
+		assert.ok(clearIndex >= 0, "full redraw should clear the screen");
+		assert.ok(deleteIndex < clearIndex, "placeholder image should be deleted before the screen is cleared");
+
+		tui.stop();
+	});
+
+	it("keeps placeholder images whose rows survive a changed region", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui = new TUI(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+
+		const placeholderRows = encodeKittyPlaceholderRows({ imageId: 42, columns: 2, rows: 2 });
+		component.lines = ["top", ...placeholderRows, "bottom"];
+		tui.start();
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		// A line above the image changes; the image rows are unchanged and stay
+		// on screen. Placeholder rows carry no transmit of their own, so deleting
+		// the id would blank the image with nothing re-uploading it.
+		component.lines = ["changed", ...placeholderRows, "bottom"];
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		assert.ok(writes.includes("changed"), "the edited line should be repainted");
+		assert.ok(!writes.includes(deleteKittyImage(42)), "a placeholder image still on screen must not be deleted");
+
+		tui.stop();
+	});
+
+	it("deletes a replaced placeholder image id without touching its successor", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui = new TUI(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+
+		component.lines = ["top", ...encodeKittyPlaceholderRows({ imageId: 42, columns: 2, rows: 2 }), "bottom"];
+		tui.start();
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		component.lines = ["top", ...encodeKittyPlaceholderRows({ imageId: 43, columns: 2, rows: 2 }), "bottom"];
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		assert.ok(writes.includes(deleteKittyImage(42)), "replaced placeholder image should be deleted");
+		assert.ok(!writes.includes(deleteKittyImage(43)), "the incoming placeholder image must not be deleted");
 
 		tui.stop();
 	});

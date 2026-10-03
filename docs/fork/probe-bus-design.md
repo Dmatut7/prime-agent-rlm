@@ -167,11 +167,11 @@ cd packages/tui && env -u RLM_DEPTH -u RLM_SESSION_DIR node --test --import tsx 
 ## 7. 风险与未决项
 
 1. **kitty 对未识别 DECRQM 的应答行为：已销账**（2026-10-03，W20-F，kitty master 源码证据，无需真机）。kitty 对 DECRQM **必答**：`vt-parser.c`（`case DECSTR / '$'` 分支）把 `CSI ? Ps $ p` 派发到 `screen.c` 的 `report_mode_status`；该函数 `ans` 初始 0、switch 无 default 分支、应答恒写出——未识别模式（含 2027，kitty#7799 拒做）答 `CSI ? Ps ; 0 $ y`（Pv=0，"not recognized"），**不存在「沉默」路径**；kitty 只产出 Pv∈{0,1,2}（不答 3/4）。§3.2 的双路径对冲简化为单路径：kitty 形终端一律走 Pv=0 判负。旁证（2031 落地依据）：mode 2031 = `COLOR_PREFERENCE_NOTIFICATION`（`modes.h`），997 推送由 `window.py` 的 `report_color_scheme_preference` 发出（暗=`CSI ? 997 ; 1 n`、亮=`CSI ? 997 ; 2 n`），且 DECSET 2031 是 SIMPLE_MODE——**开启瞬间不补发当前值**，初始配色仍靠启动时的 OSC 10/11 首探，推送只在外观变化（或应用显式发 `CSI ? 996 n` 查询，`screen.c` 有该分支）时到达。
-2. **2027 per-screen 语义未复核**（同 F3 先例）——阶段 4 含真机复核项；复核前只在主屏开。
-3. **2031 在 tmux 3.6 已支持**（CHANGES「Add mode 2031 support」，issue 4353）——但同样只代表 pane 透传；外层不推 997n 时退回 OSC 10/11 现状，不恶化。
-4. **Windows conhost/裸 pty 不答 DA**——兜底定时器路径必须有测试覆盖（阶段 2 用例），不能因栅栏上线而删掉最后保险。
-5. **OSC 10/11 在 tmux 下的可达性**随版本/配置（allow-passthrough）漂移——总线不为此做特判，unknown 即退回现状（COLORFGBG 启发式仍由 `terminal-colors.ts:163-178` 兜底）。
-6. daemon wire 协议零改动：本设计全部发生在 TUI 进程与本机终端之间，不触碰 daemon 命令/事件/响应形状。
+2. **2027 per-screen 语义未复核**（同 F3 先例）——**仍待真机**（2026-10-03 W24-A 复核：此条无仓内或上游文字证据可销，必须在 kitty/ghostty/foot 真机各录一次进/出 alt 屏行为；复核前只在主屏开）。
+3. **2031 在 tmux 3.6 已支持：已销账**（2026-10-03，W24-A，上游原文复核，无需真机）。tmux master CHANGES 的「CHANGES FROM 3.5a TO 3.6」一节含原文「Add mode 2031 support to automatically report dark or light theme…（from Jonathan Slenders, issue 4353）」，版本归属 3.6 确认。语义仍只代表 pane 透传；外层不推 997n 时退回 OSC 10/11 现状，不恶化。
+4. **Windows conhost/裸 pty 不答 DA：已销账**（2026-10-03，W24-A，仓内测试证据，无需真机）。兜底定时器路径已有覆盖并钉死：`probe-bus.test.ts`「marks still-pending capabilities unknown when the fallback timer fires without a DA」+「lets the first settle win: a DA after the timer changes nothing」——栅栏上线后最后保险仍在。
+5. **OSC 10/11 在 tmux 下的可达性**随版本/配置（allow-passthrough）漂移——**设计已接受、仓内兜底复核在案**（2026-10-03，W24-A）：总线不为此做特判，unknown 即退回现状；COLORFGBG 启发式兜底仍在 `terminal-colors.ts:163-178`（经 `getTerminalBackgroundKind` `:193-199` 串接），unknown 判负路径有 `probe-bus.test.ts` 用例钉住。残余仅是被动观察项（可达性矩阵随真机配置漂移），无待办动作。
+6. **daemon wire 协议零改动：已销账**（2026-10-03，W24-A，git 证据，无需真机）。探测总线阶段 1-6 提交（`b547ea5a2`/`1b9eeceac`/`193903eb8`/`4a489d1f2`）触碰面仅 `packages/tui/**` + 本文档 + `cli/args.ts` env 文档；`daemon-protocol.ts` 与命令/事件兼容表零触碰，全部交互发生在 TUI 进程与本机终端之间。
 
 ## 8. 证据索引
 

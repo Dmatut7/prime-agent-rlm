@@ -81,7 +81,13 @@ export {
 export { VersionedRenderCache } from "./render-cache.js";
 export { CONTENT_START_MARKER, type TableCellSelectionRegion } from "./selection-metadata.js";
 export { StdinBuffer, type StdinBufferEventMap, type StdinBufferOptions } from "./stdin-buffer.js";
-export { ProcessTerminal, type Terminal, type TerminalStopOptions } from "./terminal.js";
+export {
+	engageEarlyRawMode,
+	ProcessTerminal,
+	releaseEarlyRawMode,
+	type Terminal,
+	type TerminalStopOptions,
+} from "./terminal.js";
 export {
 	bestAnsiColor,
 	blendColor,
@@ -116,6 +122,7 @@ export {
 	encodeITerm2,
 	encodeKitty,
 	encodeKittyPlaceholderRows,
+	extractKittyPlaceholderImageId,
 	getCapabilities,
 	getCellDimensions,
 	getGifDimensions,
@@ -133,6 +140,7 @@ export {
 	isImageSequenceLine,
 	KITTY_PLACEHOLDER_CHAR,
 	KITTY_PLACEHOLDER_CODEPOINT,
+	KITTY_PLACEHOLDER_COPY_MARKER,
 	KITTY_PLACEHOLDER_GRID_LIMIT,
 	type KittyPlaceholderRender,
 	type KittyPlaceholderRowsOptions,

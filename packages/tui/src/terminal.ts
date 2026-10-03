@@ -83,6 +83,60 @@ function cancelInputHandoff(token: symbol): void {
 	}
 }
 
+// Early raw mode: the interactive CLI engages raw mode as soon as it knows the
+// TUI will run, long before ProcessTerminal.start() (daemon handshake, session
+// load and theme setup sit between). A tty still in cooked mode ICRNL-mangles a
+// queued Enter (CR -> LF), and LF is the editor's insert-newline key, so the
+// keystroke visibly does nothing. Raw mode is set without resuming stdin: the
+// bytes keep buffering in the kernel, untranslated, until start() reads them.
+let earlyRawMode: { wasRaw: boolean } | undefined;
+
+const restoreEarlyRawModeOnExit = (): void => {
+	if (!earlyRawMode) {
+		return;
+	}
+	const { wasRaw } = earlyRawMode;
+	earlyRawMode = undefined;
+	try {
+		process.stdin.setRawMode?.(wasRaw);
+	} catch {
+		// The terminal is already gone; nothing left to restore.
+	}
+};
+
+export function engageEarlyRawMode(): void {
+	if (earlyRawMode) {
+		return;
+	}
+	if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== "function") {
+		return;
+	}
+	const wasRaw = process.stdin.isRaw ?? false;
+	if (wasRaw) {
+		// Already raw: there is no cooked window to close.
+		return;
+	}
+	earlyRawMode = { wasRaw };
+	process.stdin.setRawMode(true);
+	process.once("exit", restoreEarlyRawModeOnExit);
+}
+
+/** Restore the tty when the process exits before any ProcessTerminal adopted it. Exported for tests. */
+export function releaseEarlyRawMode(): void {
+	process.removeListener("exit", restoreEarlyRawModeOnExit);
+	restoreEarlyRawModeOnExit();
+}
+
+function consumeEarlyRawMode(): boolean | undefined {
+	if (!earlyRawMode) {
+		return undefined;
+	}
+	const { wasRaw } = earlyRawMode;
+	earlyRawMode = undefined;
+	process.removeListener("exit", restoreEarlyRawModeOnExit);
+	return wasRaw;
+}
+
 /**
  * Minimal terminal interface for TUI
  */
@@ -209,8 +263,10 @@ export class ProcessTerminal implements Terminal {
 		this.inputHandler = onInput;
 		this.resizeHandler = onResize;
 
-		// Save previous state and enable raw mode
-		this.wasRaw = consumeInputHandoff() ?? process.stdin.isRaw ?? false;
+		// Save previous state and enable raw mode. An early-engaged raw mode (see
+		// engageEarlyRawMode) already made the tty raw, so isRaw would answer true;
+		// the mode to restore on stop is the pre-engage one, not that.
+		this.wasRaw = consumeInputHandoff() ?? consumeEarlyRawMode() ?? process.stdin.isRaw ?? false;
 		if (process.stdin.setRawMode) {
 			process.stdin.setRawMode(true);
 		}

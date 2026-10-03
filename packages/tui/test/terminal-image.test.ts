@@ -9,6 +9,7 @@ import {
 	drainKittyImageTransmits,
 	encodeKitty,
 	encodeKittyPlaceholderRows,
+	extractKittyPlaceholderImageId,
 	getKittyImageTransmitsVersion,
 	hyperlink,
 	invalidateKittyImageTransmits,
@@ -572,6 +573,28 @@ describe("kitty unicode placeholders", () => {
 		const before = getKittyImageTransmitsVersion();
 		invalidateKittyImageTransmits();
 		assert.ok(getKittyImageTransmitsVersion() > before);
+	});
+
+	it("extracts the image id from a placeholder row's SGR foreground color", () => {
+		const ids = [1, 42, 0xabcd12, 0xffffff];
+		assert.ok(ids.length > 0);
+		for (const imageId of ids) {
+			const row = encodeKittyPlaceholderRows({ imageId, columns: 2, rows: 1 })[0]!;
+			assert.strictEqual(extractKittyPlaceholderImageId(row), imageId);
+		}
+	});
+
+	it("extracts no image id from truecolor text lines without placeholder cells", () => {
+		assert.strictEqual(extractKittyPlaceholderImageId("\x1b[38;2;0;0;42mplain\x1b[39m"), null);
+		assert.strictEqual(extractKittyPlaceholderImageId("plain text"), null);
+		assert.strictEqual(extractKittyPlaceholderImageId("\x1b_Ga=T,f=100,i=42;data\x1b\\"), null);
+	});
+
+	it("extracts no image id from placeholder rows without a parseable 24-bit color", () => {
+		assert.strictEqual(extractKittyPlaceholderImageId(KITTY_PLACEHOLDER_CHAR), null);
+		assert.strictEqual(extractKittyPlaceholderImageId(`\x1b[38;2;300;0;1m${KITTY_PLACEHOLDER_CHAR}\x1b[39m`), null);
+		// id 0 is never allocated: allocatePlaceholderImageId starts at 1
+		assert.strictEqual(extractKittyPlaceholderImageId(`\x1b[38;2;0;0;0m${KITTY_PLACEHOLDER_CHAR}\x1b[39m`), null);
 	});
 });
 

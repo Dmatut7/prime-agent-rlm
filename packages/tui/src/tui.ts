@@ -32,6 +32,7 @@ import { stripContentStartMarkers, type TableCellSelectionRegion } from "./selec
 import type { Terminal } from "./terminal.js";
 import {
 	deleteKittyImage,
+	extractKittyPlaceholderImageId,
 	IMAGE_LINE_PLACEHOLDER,
 	imageLineRowOffset,
 	isImageLine,
@@ -51,7 +52,12 @@ const KITTY_SEQUENCE_PREFIX = "\x1b_G";
 
 function extractKittyImageIds(line: string): number[] {
 	const sequenceStart = line.indexOf(KITTY_SEQUENCE_PREFIX);
-	if (sequenceStart === -1) return [];
+	if (sequenceStart === -1) {
+		// Unicode-placeholder rows are plain cells: the image id lives in the
+		// row's 24-bit SGR foreground color instead of a graphics sequence.
+		const placeholderId = extractKittyPlaceholderImageId(line);
+		return placeholderId === null ? [] : [placeholderId];
+	}
 
 	const paramsStart = sequenceStart + KITTY_SEQUENCE_PREFIX.length;
 	const paramsEnd = line.indexOf(";", paramsStart);
@@ -1860,13 +1866,38 @@ export class TUI extends Container {
 		return expandedLastChanged;
 	}
 
-	private deleteChangedKittyImages(firstChanged: number, lastChanged: number): string {
+	private deleteChangedKittyImages(firstChanged: number, lastChanged: number, newLines: readonly string[]): string {
 		if (firstChanged < 0 || lastChanged < firstChanged) return "";
 
 		const ids = new Set<number>();
+		const placeholderIds = new Set<number>();
 		const maxLine = Math.min(lastChanged, this.previousLines.length - 1);
 		for (let i = firstChanged; i <= maxLine; i++) {
-			for (const id of extractKittyImageIds(this.previousLines[i] ?? "")) {
+			const line = this.previousLines[i] ?? "";
+			const placeholderId = extractKittyPlaceholderImageId(line);
+			if (placeholderId !== null) {
+				placeholderIds.add(placeholderId);
+				continue;
+			}
+			for (const id of extractKittyImageIds(line)) {
+				ids.add(id);
+			}
+		}
+
+		// Placeholder rows carry no transmit of their own: deleting an image
+		// whose cells survive into the new frame would blank it, since nothing
+		// re-uploads the payload. Only free placeholder images the new frame no
+		// longer references. Inline sequences re-upload on repaint, so their
+		// delete-then-redraw contract applies unconditionally.
+		if (placeholderIds.size > 0) {
+			for (const line of newLines) {
+				const surviving = extractKittyPlaceholderImageId(line);
+				if (surviving !== null) {
+					placeholderIds.delete(surviving);
+					if (placeholderIds.size === 0) break;
+				}
+			}
+			for (const id of placeholderIds) {
 				ids.add(id);
 			}
 		}
@@ -2171,7 +2202,7 @@ export class TUI extends Container {
 				// Only delete Kitty images within the repainted viewport. Images that
 				// live in scrollback above the visible slice are never redrawn here, so
 				// deleting them would leave broken history when the user scrolls up.
-				buffer += this.deleteChangedKittyImages(prevViewportTop, prevViewportTop + prevScreenRows - 1);
+				buffer += this.deleteChangedKittyImages(prevViewportTop, prevViewportTop + prevScreenRows - 1, newLines);
 				// Move the hardware cursor up to the top of the visible screen.
 				// Use the local prevViewportTop (height-adjusted earlier in doRender)
 				// rather than the field, so the move stays consistent with the rest
@@ -2227,7 +2258,7 @@ export class TUI extends Container {
 			if (clear) {
 				const previousVisibleTop = Math.min(prevViewportTop, Math.max(0, this.previousLines.length - height));
 				const previousVisibleBottom = Math.min(this.previousLines.length - 1, previousVisibleTop + height - 1);
-				buffer += this.deleteChangedKittyImages(previousVisibleTop, previousVisibleBottom);
+				buffer += this.deleteChangedKittyImages(previousVisibleTop, previousVisibleBottom, newLines);
 				buffer += "\x1b[2J\x1b[H"; // Clear screen and home while preserving scrollback
 			}
 			for (let i = renderStart; i < newLines.length; i++) {
@@ -2336,7 +2367,7 @@ export class TUI extends Container {
 		if (firstChanged >= newLines.length) {
 			if (this.previousLines.length > newLines.length) {
 				let buffer = sync2026 ? "\x1b[?2026h" : "";
-				buffer += this.deleteChangedKittyImages(firstChanged, lastChanged);
+				buffer += this.deleteChangedKittyImages(firstChanged, lastChanged, newLines);
 				// Move to end of new content (clamp to 0 for empty content)
 				const targetRow = Math.max(0, newLines.length - 1);
 				if (targetRow < prevViewportTop) {
@@ -2407,7 +2438,7 @@ export class TUI extends Container {
 		// Render from first changed line to end
 		// Build buffer with all updates, wrapped in synchronized output when on
 		let buffer = sync2026 ? "\x1b[?2026h" : ""; // Begin synchronized output
-		buffer += this.deleteChangedKittyImages(firstChanged, lastChanged);
+		buffer += this.deleteChangedKittyImages(firstChanged, lastChanged, newLines);
 		const prevViewportBottom = prevViewportTop + height - 1;
 		const moveTargetRow = appendStart ? firstChanged - 1 : firstChanged;
 		if (moveTargetRow > prevViewportBottom) {

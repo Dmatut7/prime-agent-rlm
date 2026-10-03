@@ -9,7 +9,7 @@ import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { type Api, type ImageContent, type Model, modelsAreEqual } from "@earendil-works/pi-ai";
 import { registerBuiltinMcpOAuthProviders } from "@earendil-works/pi-ai/mcp";
-import { ProcessTerminal, setKeybindings, TUI } from "@earendil-works/pi-tui";
+import { engageEarlyRawMode, ProcessTerminal, releaseEarlyRawMode, setKeybindings, TUI } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { type Args, type Mode, parseArgs } from "./cli/args.js";
 import { formatTopLevelHelp } from "./cli/command-registry.js";
@@ -1359,6 +1359,18 @@ export async function main(args: string[], options?: MainOptions) {
 		process.exit(1);
 	}
 	setLogContext({ mode: appMode });
+	if (appMode === "interactive") {
+		// Keystrokes typed before the TUI's start() (daemon handshake, session load)
+		// must buffer untranslated: a cooked pty ICRNL-mangles Enter's CR into LF,
+		// and LF is the editor's insert-newline key, so the submit silently vanishes.
+		// This is the earliest point that knows the run is interactive; non-interactive
+		// runs never engage, so a backgrounded `-p`/`--mode` job keeps cooked mode and
+		// cannot SIGTTOU-stop on a setRawMode it never needed.
+		engageEarlyRawMode();
+	} else {
+		// Defensive symmetry for direct main() callers that engaged on their own.
+		releaseEarlyRawMode();
+	}
 	const shouldTakeOverStdout = appMode !== "interactive";
 	if (shouldTakeOverStdout) {
 		takeOverStdout();

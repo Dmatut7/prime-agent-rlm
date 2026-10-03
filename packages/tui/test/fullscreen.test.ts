@@ -853,6 +853,46 @@ describe("TUI fullscreen mode", () => {
 		tui.stop();
 	});
 
+	it("copies kitty placeholder image rows as a single [image] marker", async () => {
+		const placeholderRows = encodeKittyPlaceholderRows({ imageId: 42, columns: 3, rows: 3 });
+		const { terminal, tui, chat, dock } = setup(["before", ...placeholderRows, "after"]);
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;1;1M");
+		terminal.sendInput("\x1b[<32;7;5M");
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;7;5m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, ["before\n[image]\nafter"]);
+		assert.ok(!copies[0]!.includes(KITTY_PLACEHOLDER_CHAR), "the clipboard must not leak U+10EEEE placeholder cells");
+
+		tui.stop();
+	});
+
+	it("copies consecutive placeholder images with different ids as separate markers", async () => {
+		const first = encodeKittyPlaceholderRows({ imageId: 42, columns: 2, rows: 2 });
+		const second = encodeKittyPlaceholderRows({ imageId: 43, columns: 2, rows: 1 });
+		const { terminal, tui, chat, dock } = setup(["x", ...first, ...second, "y"]);
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;1;1M");
+		terminal.sendInput("\x1b[<32;2;5M");
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;2;5m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, ["x\n[image]\n[image]\ny"]);
+
+		tui.stop();
+	});
+
 	it("drag-selects with legacy X10 mouse reports on terminals without SGR", async () => {
 		const { terminal, tui, chat, dock } = setup(lines(20));
 		const copies: string[] = [];

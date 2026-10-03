@@ -7,7 +7,13 @@
 
 import type { ClickRegion, StickyHeader } from "./click-regions.js";
 import { contentStartColumn, type TableCellSelectionRegion } from "./selection-metadata.js";
-import { isImageLine, isImageSequenceLine } from "./terminal-image.js";
+import {
+	extractKittyPlaceholderImageId,
+	isImageLine,
+	isImageSequenceLine,
+	KITTY_PLACEHOLDER_CHAR,
+	KITTY_PLACEHOLDER_COPY_MARKER,
+} from "./terminal-image.js";
 import { sliceByColumn, stripAnsi, urlAtColumn, visibleWidth } from "./utils.js";
 
 export const FULLSCREEN_MIN_TRANSCRIPT_ROWS = 3;
@@ -893,6 +899,7 @@ export class FullscreenViewport {
 		sel: { start: SelectionPoint; end: SelectionPoint },
 	): string | null {
 		const lines: string[] = [];
+		let lastImageMarker: number | null = null;
 		for (let lineIndex = sel.start.line; lineIndex <= sel.end.line; lineIndex++) {
 			const line = sourceLines[lineIndex] ?? "";
 			const spans = this.selectedFrameSpans(lineIndex, sel, regions);
@@ -901,10 +908,31 @@ export class FullscreenViewport {
 			for (const span of spans) {
 				parts.push(stripAnsi(sliceByColumn(line, span.from, Math.max(0, span.to - span.from))));
 			}
-			lines.push(parts.join("").trimEnd());
+			const text = parts.join("").trimEnd();
+			const marker = this.placeholderCopyMarker(line, text);
+			if (marker) {
+				if (marker.imageId !== null && marker.imageId === lastImageMarker) continue;
+				lastImageMarker = marker.imageId;
+				lines.push(KITTY_PLACEHOLDER_COPY_MARKER);
+				continue;
+			}
+			lastImageMarker = null;
+			lines.push(text);
 		}
 		const text = lines.join("\n");
 		return text.trim().length > 0 ? text : null;
+	}
+
+	/**
+	 * Clipboard text for one selected line: kitty placeholder rows copy as one
+	 * [image] marker per image instead of leaking the U+10EEEE cells. The rows
+	 * of an image share its id (encoded in the row's SGR foreground color), so
+	 * callers collapse consecutive rows reporting the same id; a null id never
+	 * collapses.
+	 */
+	private placeholderCopyMarker(line: string, text: string): { imageId: number | null } | null {
+		if (!text.includes(KITTY_PLACEHOLDER_CHAR)) return null;
+		return { imageId: extractKittyPlaceholderImageId(line) };
 	}
 
 	private extractSelectionText(
@@ -914,6 +942,7 @@ export class FullscreenViewport {
 		const lines: string[] = [];
 		// Rows that are only a gutter: kept between paragraphs, dropped at the ends of the selection.
 		const gutterOnly = new Set<number>();
+		let lastImageMarker: number | null = null;
 		for (let lineIndex = sel.start.line; lineIndex <= sel.end.line; lineIndex++) {
 			const line = sourceLines[lineIndex] ?? "";
 			const span = this.selectionSpan(lineIndex, sel);
@@ -925,6 +954,14 @@ export class FullscreenViewport {
 			const from = Math.min(Math.max(span.from, contentStart ?? 0), width);
 			const to = Math.min(span.to, width);
 			const text = stripAnsi(sliceByColumn(line, from, Math.max(0, to - from))).trimEnd();
+			const marker = this.placeholderCopyMarker(line, text);
+			if (marker) {
+				if (marker.imageId !== null && marker.imageId === lastImageMarker) continue;
+				lastImageMarker = marker.imageId;
+				lines.push(KITTY_PLACEHOLDER_COPY_MARKER);
+				continue;
+			}
+			lastImageMarker = null;
 			if (contentStart !== undefined && text === "") gutterOnly.add(lines.length);
 			lines.push(text);
 		}
