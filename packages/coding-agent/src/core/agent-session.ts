@@ -16287,7 +16287,15 @@ export class AgentSession {
 		const hasSnapshot =
 			!!this._ipythonKernelSnapshotDir && existsSync(snapshotPathIn(this._ipythonKernelSnapshotDir));
 		if ((this._prewarmIpythonKernel || hasSnapshot) && this.getActiveToolNames().includes("ipython")) {
-			this._ipythonKernelProvisioner?.prewarm();
+			// Deferred one macrotask: the prewarm chain runs skill-content hashing
+			// synchronously before its first await, and this build sits inside the
+			// daemon create command — inline, that hashing delayed the create
+			// response. The kernel still starts at session creation, just after the
+			// reply goes out instead of before it.
+			setImmediate(() => {
+				if (this._disposed) return;
+				this._ipythonKernelProvisioner?.prewarm();
+			});
 		}
 
 		// Subsequent builds are in-process rebuilds (/reload), not a fresh resume.

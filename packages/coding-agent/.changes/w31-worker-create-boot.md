@@ -1,0 +1,2 @@
+- Skipped the discarded boot-time session manager in daemon mode, removing a `git remote get-url` spawn from every session worker's startup.
+- Deferred the Python kernel prewarm past the session create response so its skill-content hashing no longer blocks session creation.

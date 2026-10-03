@@ -1502,8 +1502,16 @@ export async function main(args: string[], options?: MainOptions) {
 		console.error(wrapForStderr(chalk.red(`Error: No active agent found matching '${publicCommand.attachAgent}'`)));
 		process.exit(1);
 	}
-	let sessionManager: SessionManager;
-	if (activeDaemonSessionSummary) {
+	// Daemon processes (supervisor and workers) never use the boot-time session
+	// manager: sessions are created per create command below. Building one here ran
+	// SessionManager.create -> newSession -> captureGitContext, whose `git remote
+	// get-url` spawnSync sat on every worker's listen path; skipping it keeps cwd
+	// (the only value the daemon config read from the manager) without the cost.
+	const skipsBootSessionManager = appMode === "daemon" && parsed.listModels === undefined;
+	let sessionManager: SessionManager | undefined;
+	if (skipsBootSessionManager) {
+		// No boot session manager; see the daemon early-return below.
+	} else if (activeDaemonSessionSummary) {
 		sessionManager = createSessionManagerForActiveDaemonSummary(activeDaemonSessionSummary, cwd);
 	} else if (
 		useDaemonInteractive &&
@@ -1530,7 +1538,9 @@ export async function main(args: string[], options?: MainOptions) {
 			process.exit(1);
 		}
 	}
-	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
+	// A fresh manager (the only kind that can be missing here) always resolves to
+	// the existing process cwd, so the skipped daemon branch cannot hide an issue.
+	const missingSessionCwdIssue = sessionManager ? getMissingSessionCwdIssue(sessionManager, cwd) : undefined;
 	if (missingSessionCwdIssue) {
 		if (appMode === "interactive") {
 			const selectedCwd = await promptForMissingSessionCwd(missingSessionCwdIssue, startupSettingsManager);
@@ -1545,14 +1555,13 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("createSessionManager");
 
+	const sessionCwd = sessionManager?.getCwd() ?? cwd;
 	const telemetrySettingsManager =
-		sessionManager.getCwd() === cwd
-			? startupSettingsManager
-			: SettingsManager.create(sessionManager.getCwd(), agentDir);
+		sessionCwd === cwd ? startupSettingsManager : SettingsManager.create(sessionCwd, agentDir);
 	const telemetryDisabled = isTelemetryEnabled(telemetrySettingsManager) ? undefined : true;
 	const defaultSessionConfig = runtimeConfigFromArgs(
 		parsed,
-		sessionManager.getCwd(),
+		sessionCwd,
 		agentDir,
 		sessionDir,
 		appMode,
@@ -1588,6 +1597,9 @@ export async function main(args: string[], options?: MainOptions) {
 			});
 		}
 		return;
+	}
+	if (!sessionManager) {
+		throw new Error("Non-daemon startup must have built a session manager");
 	}
 	if (useDaemonInteractive) {
 		// Startup concurrency: the daemon create/attach RPC (worker spawn +
