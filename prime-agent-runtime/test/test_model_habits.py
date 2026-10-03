@@ -119,6 +119,11 @@ class SubagentRecordHabitsTest(unittest.TestCase):
     def test_spawn_handles_and_collect_snapshots_answer_dict_reads(self) -> None:
         handle = rlm.RLMSpawnHandle(rlm_child_id="c1", name="counter", session_dir=Path("/tmp/c1"), model="m")
         self.assertEqual(handle.get("name"), "counter")
+        # The roster/result spelling of the same field: models reach for
+        # `session_name` on the handle because rows and snapshots use it.
+        self.assertEqual(handle.session_name, "counter")
+        self.assertEqual(handle["session_name"], "counter")
+        self.assertEqual(handle.get("session_name"), "counter")
         snapshot = rlm.RLMChildResult(
             rlm_child_id="c1",
             session_name="counter",

@@ -32,6 +32,11 @@ class RLMSpawnHandle(_RecordAccess):
     session_dir: Path
     model: str
 
+    @property
+    def session_name(self) -> str:
+        """The roster/result spelling of ``name``."""
+        return self.name
+
 
 @dataclass(frozen=True)
 class RLMModel(_RecordAccess):
@@ -158,7 +163,11 @@ def emit(data: dict[str, Any]) -> None:
 async def run(prompt: str, **kwargs: Any) -> RLMSpawnHandle:
     """Spawn a recursive Prime Agent child and return once its task is admitted.
 
-    ``model`` selects a child with an exact ``provider/model`` selector.
+    ``model`` selects a child with an exact ``provider/model`` selector. Without it
+    the child inherits this session's current model — a mid-session model switch
+    changes what an unpinned spawn resolves to — unless the user's settings pin a
+    subagent default model; the returned handle's ``model`` field carries the
+    resolved selector, so check it when the choice matters.
     ``thinking`` sets the child reasoning level (e.g. 'off', 'low', 'medium', 'high');
     defaults to the parent level; levels invalid for the resolved model fail the spawn.
     """
