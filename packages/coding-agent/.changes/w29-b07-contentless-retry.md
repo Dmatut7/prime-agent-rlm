@@ -1,0 +1,1 @@
+- Changed the shared provider retry policy to also retry a clean stop with nothing usable in it (a thinking-only or empty reply, no tool call and no text): the provider returned no answer rather than an answer, so it is resent under the same cap and backoff as a stream failure; an exhausted chain still returns the last empty response unchanged.

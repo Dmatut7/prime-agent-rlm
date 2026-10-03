@@ -78,6 +78,25 @@ export function isFauxProviderQueueExhausted(message: AssistantMessage): boolean
 	return message.provider === "faux" && message.errorMessage === "No more faux responses queued";
 }
 
+/**
+ * A clean stop whose content carries nothing the caller can use - no tool call and
+ * no non-empty text (a thinking-only reply, or no content at all). This is the
+ * one-shot twin of the agent loop's empty-turn rule (`isEmptyAssistantTurn` in
+ * packages/agent/src/agent-loop.ts): the provider returned a clean stop with
+ * nothing in it, not an answer, so the shared retry policy treats it like a
+ * transient failure and resends. `length` is excluded for the same reason the loop
+ * excludes it: it is a budget signal, and an identical resend re-spends the budget
+ * instead of producing content.
+ */
+export function isContentlessCompletion(message: AssistantMessage): boolean {
+	if (message.stopReason === "error" || message.stopReason === "aborted" || message.stopReason === "length") {
+		return false;
+	}
+	return !message.content.some(
+		(part) => part.type === "toolCall" || (part.type === "text" && part.text.trim().length > 0),
+	);
+}
+
 export function providerStreamFailureDetails(message: AssistantMessage): Record<string, unknown> | undefined {
 	const failure = message.diagnostics?.find((diagnostic) => diagnostic.type === "provider_stream_failure");
 	const details = failure?.details;
@@ -147,6 +166,12 @@ export function providerRetryDelay(
  * AgentSession auto-retry loop. Callers pair it with
  * {@link providerRetryStreamOptions} so the provider layer itself makes a single
  * attempt and the retries counted here are the only retries that happen.
+ *
+ * Two shapes are retried: provider failures (`stopReason: "error"`) and
+ * contentless clean stops ({@link isContentlessCompletion} - a thinking-only or
+ * empty reply is the provider returning nothing usable, not an answer). Both share
+ * the same cap and backoff; an exhausted contentless chain returns the last empty
+ * response unchanged, so the caller's terminal handling does not change.
  */
 export async function completeWithProviderRetry(
 	attemptCompletion: () => Promise<AssistantMessage>,
@@ -157,7 +182,7 @@ export async function completeWithProviderRetry(
 	let retriesPerformed = 0;
 	for (;;) {
 		const message = await attemptCompletion();
-		if (message.stopReason !== "error") {
+		if (message.stopReason !== "error" && !isContentlessCompletion(message)) {
 			return message;
 		}
 		if (options?.signal?.aborted) {

@@ -35,6 +35,13 @@ function providerError(): AssistantMessage {
 	};
 }
 
+function completedMessage(
+	content: AssistantMessage["content"],
+	stopReason: AssistantMessage["stopReason"] = "stop",
+): AssistantMessage {
+	return { ...providerError(), content, stopReason, errorMessage: undefined };
+}
+
 describe("completeWithProviderRetry", () => {
 	it("returns an aborted result instead of the provider error when cancelled during backoff", async () => {
 		const controller = new AbortController();
@@ -68,6 +75,110 @@ describe("completeWithProviderRetry", () => {
 			kind: "wait",
 			delayMs: 2_147_483_647,
 		});
+	});
+
+	// The one-shot twin of the agent loop's empty-turn ladder: a clean stop with
+	// nothing usable in it (thinking-only, or no content at all) is the provider
+	// returning an empty reply, not an answer, so the shared policy resends it.
+	it("retries a thinking-only clean stop until content arrives", async () => {
+		let attempts = 0;
+		const result = await completeWithProviderRetry(
+			async () => {
+				attempts++;
+				return attempts === 1
+					? completedMessage([{ type: "thinking", thinking: "let me think" }])
+					: completedMessage([{ type: "text", text: "the summary" }]);
+			},
+			{ policy: { enabled: true, maxRetries: 3, baseDelayMs: 1, maxRetryDelayMs: 0 } },
+		);
+
+		expect(attempts).toBe(2);
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([{ type: "text", text: "the summary" }]);
+	});
+
+	it("caps contentless retries at maxRetries and returns the last empty response", async () => {
+		let attempts = 0;
+		const result = await completeWithProviderRetry(
+			async () => {
+				attempts++;
+				return completedMessage([]);
+			},
+			{ policy: { enabled: true, maxRetries: 2, baseDelayMs: 1, maxRetryDelayMs: 0 } },
+		);
+
+		expect(attempts).toBe(3); // 1 initial + 2 retries
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([]);
+	});
+
+	it("does not retry a stop response that carries text", async () => {
+		let attempts = 0;
+		const result = await completeWithProviderRetry(
+			async () => {
+				attempts++;
+				return completedMessage([{ type: "text", text: "content" }]);
+			},
+			{ policy: { enabled: true, maxRetries: 3, baseDelayMs: 1, maxRetryDelayMs: 0 } },
+		);
+
+		expect(attempts).toBe(1);
+		expect(result.stopReason).toBe("stop");
+	});
+
+	it("does not retry a response whose tool call carries the payload", async () => {
+		let attempts = 0;
+		await completeWithProviderRetry(
+			async () => {
+				attempts++;
+				return completedMessage([{ type: "toolCall", id: "call_1", name: "noop", arguments: {} }], "toolUse");
+			},
+			{ policy: { enabled: true, maxRetries: 3, baseDelayMs: 1, maxRetryDelayMs: 0 } },
+		);
+
+		expect(attempts).toBe(1);
+	});
+
+	it("does not retry a contentless response that ended on length", async () => {
+		// A length stop is a budget signal (the same exclusion the loop's empty-turn
+		// ladder makes): an identical resend re-spends the budget instead of answering.
+		let attempts = 0;
+		const result = await completeWithProviderRetry(
+			async () => {
+				attempts++;
+				return completedMessage([{ type: "thinking", thinking: "still thinking" }], "length");
+			},
+			{ policy: { enabled: true, maxRetries: 3, baseDelayMs: 1, maxRetryDelayMs: 0 } },
+		);
+
+		expect(attempts).toBe(1);
+		expect(result.stopReason).toBe("length");
+	});
+
+	it("makes a single attempt at a contentless stop when the policy disables retries", async () => {
+		let attempts = 0;
+		const result = await completeWithProviderRetry(
+			async () => {
+				attempts++;
+				return completedMessage([]);
+			},
+			{ policy: { enabled: false, maxRetries: 3, baseDelayMs: 1, maxRetryDelayMs: 60_000 } },
+		);
+
+		expect(attempts).toBe(1);
+		expect(result.stopReason).toBe("stop");
+	});
+
+	it("returns an aborted result instead of the empty response when cancelled during the resend wait", async () => {
+		const controller = new AbortController();
+		setTimeout(() => controller.abort(), 10);
+
+		const result = await completeWithProviderRetry(async () => completedMessage([]), {
+			policy: { enabled: true, maxRetries: 3, baseDelayMs: 60_000, maxRetryDelayMs: 0 },
+			signal: controller.signal,
+		});
+
+		expect(result.stopReason).toBe("aborted");
 	});
 });
 
