@@ -174,7 +174,8 @@ case "${1:-}" in
 esac
 
 # Snapshot git's pre-push stdin once: the fork's v-tag verdict reads it first,
-# then upstream #2446's mirror/deletion guard re-reads the same lines.
+# then upstream #2446's mirror/deletion guard and the fd1dd4e4c secret scan
+# re-read the same lines.
 _snapshot=$(mktemp "${TMPDIR:-/tmp}/prime-agent-pre-push.XXXXXX")
 cat > "$_snapshot"
 
@@ -188,5 +189,15 @@ fi
 # fork's v-tag ban; its rules and escape hatch live in scripts/pre-push-guard.sh.
 sh "$(dirname "$0")/../scripts/pre-push-guard.sh" "$@" < "$_snapshot"
 guard_status=$?
+if [ "$guard_status" -ne 0 ]; then
+	rm -f "$_snapshot"
+	exit "$guard_status"
+fi
+# fd1dd4e4c leaked an account email + org UUID in a pushed commit message; the
+# stages above only ever look at refs. Stage 3 scans the content this push would
+# newly publish (messages + added diff lines); rules and the escape hatch live
+# in scripts/pre-push-secret-scan.mjs.
+node "$(dirname "$0")/../scripts/pre-push-secret-scan.mjs" < "$_snapshot"
+scan_status=$?
 rm -f "$_snapshot"
-exit "$guard_status"
+exit "$scan_status"

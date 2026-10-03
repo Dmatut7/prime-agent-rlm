@@ -7,8 +7,13 @@
 - **本仓允许并需要 `npm run build`。** 官方那条「NEVER run `npm run build`」是因为官方跑发布版二进制；但本 fork 的本地 `prime-agent` 命令是符号链接 → `packages/coding-agent/dist/bundle/cli.js`，所以根目录 `npm run build` 正是把已安装命令刷新到最新源码的唯一方式。用户要装 / 更新到最新版时就 build。免构建替代：`./prime-agent.sh`（tsx 现场跑最新源码，启动稍慢）。
 - **build 后必须重启才生效：** `prime-agent shutdown`（停旧 daemon + 所有 worker）→ 重开 `prime-agent`；旧会话用 `prime-agent --resume` 或 `prime-agent attach <agent>` 恢复。daemon 不重启就还是旧 bundle。
 - **`install.sh` / `curl … install.sh | sh` 装的是官方发布版，不含本 fork 改动**——要本 fork 最新版只能 build 或 `prime-agent.sh`，别用官方安装器。
-- 其余继承规则（git 并行安全、changelog fragment、代码质量、daemon 协议、依赖 7 天龄、禁 inline import 等）在本 fork 仍适用。
+- 其余继承规则（git 并行安全、changelog fragment、代码质量、daemon 协议、依赖 7 天龄等）在本 fork 仍适用。
 - **每次 `git push` 前必须更新 FORK_NOTES.md**：在最新一节（或新开日期节）用一两句话写清这批提交改了什么、用户能感觉到什么。推送没带文档更新的，视为交付不完整。
+- **提交说明一律 `git commit -F <文件>`**，不用 `-m` 内联（反引号会在 shell 里执行——wave-40 审查第 0 条就是这么泄的）。推送前的敏感信息扫描已机制化在 `.husky/pre-push`（scripts/pre-push-secret-scan.mjs；误拦时按报错里的 marker 豁免，`PRIME_AGENT_ALLOW_SECRET_PUSH=1` 仅限明确知情）。
+- **刹车必须带恢复**：任何会让任务停下或打断的新机制（熔断、看门狗、完成检查），同一次交付必须写清「触发后怎么恢复」并带故障注入测试；默认开启前先跑过长时间故障场景。
+- **协议/数据形状改动**：提交说明里列出所有旧形状的消费路径并逐一打勾（wave-40 必修 1 就是漏了补发路径）。
+- **inline import 的有据例外**：仅限入口启动路径的性能惰性加载（wave-32 worker 模块图 A/B：create −35ms，cli.ts/main.ts 的 dispatch 点）；库代码与热路径仍禁。
+- **测试不得替换被测段**：mock 掉被测逻辑等于没测；私有成员探针走 test-hygiene 门，「替换被测段」走评审自觉。
 
 ## Conversational Style
 

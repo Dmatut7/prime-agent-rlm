@@ -203,6 +203,39 @@ describe("bare EOF stream termination (W9-B finding 4)", () => {
 		expect(assistant.content).toEqual([{ type: "text", text: "partial answer" }]);
 	});
 
+	it("classifies the terminal-less EOF as an unknown provider_stream_failure, so the session can route it", async () => {
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "start",
+					partial: createAssistantMessage([{ type: "text", text: "partial answer" }]),
+				});
+				stream.end();
+			});
+			return stream;
+		};
+
+		const messages = await runAgentLoop(
+			[createUserMessage("Hello")],
+			createContext(),
+			baseConfig(),
+			async () => {},
+			undefined,
+			streamFn,
+		);
+
+		const assistant = messages.find((message) => message.role === "assistant");
+		expect(assistant?.role).toBe("assistant");
+		if (assistant?.role !== "assistant") throw new Error("expected an assistant message");
+		expect(isStreamEofFailure(assistant)).toBe(true);
+		// Without the structured diagnostic the session's providerWaitClass reads the
+		// missing kind as permanent and never engages the fallback model chain.
+		const diagnostic = assistant.diagnostics?.find((entry) => entry.type === "provider_stream_failure");
+		expect(diagnostic).toBeDefined();
+		expect(diagnostic?.details).toMatchObject({ kind: "unknown", streamedContent: true });
+	});
+
 	it("streamProxy closes a terminal-less EOF with an explicit error event", async () => {
 		const events = [
 			{ type: "start" },

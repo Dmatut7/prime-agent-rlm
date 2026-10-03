@@ -7,6 +7,7 @@ import { type Component, setKeybindings } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
+import { SettingsManager } from "../src/core/settings-manager.js";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import { timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
 import { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
@@ -289,5 +290,43 @@ describe("the settings the replay derives with", () => {
 		expect(retryLines(openedFully(replayed.chatContainer.children))).toEqual(live);
 		expect(retryLines(openedFully(built(messages)))).toEqual(live);
 		chat.flow.dispose();
+	});
+});
+
+describe("the retry policy source", () => {
+	const retriedQuotaTranscript = (): AgentMessage[] => [
+		{ role: "user", content: ASK, timestamp: T0 },
+		quotaFailure(T0 + 1_000, "glm-5.3-prime"),
+		assistant(T0 + 4_000, [{ type: "text", text: DONE }], "stop", "glm-5.3-prime"),
+	];
+
+	it("reads the policy from the timeline host when it provides one, never touching the settings files", () => {
+		const spy = vi.spyOn(SettingsManager, "create");
+		const children = built(retriedQuotaTranscript());
+		const summary = children.find((child): child is TurnSummaryComponent => child instanceof TurnSummaryComponent);
+		expect(summary).toBeDefined();
+		summary?.setTimelineHost({
+			cwd: () => "/work/app",
+			viewportRows: () => 40,
+			openWhileWorking: () => true,
+			autoFold: () => true,
+			requestRender: () => {},
+			// The wait channel is off here and on in the (empty) settings on disk: the
+			// row proves whose policy was read.
+			retryPolicy: () => ({ maxRetries: 3, maxRetryDelayMs: 60_000, waitForRecovery: false }),
+		});
+		spy.mockClear();
+
+		expect(retryLine(opened(children))).toContain("被限流，已自动重试");
+		expect(spy).not.toHaveBeenCalled();
+		spy.mockRestore();
+	});
+
+	it("falls back to the settings on disk when the host has no policy", () => {
+		const spy = vi.spyOn(SettingsManager, "create");
+
+		expect(retryLine(opened(built(retriedQuotaTranscript())))).toContain("额度用完或被限流，已自动重试");
+		expect(spy).toHaveBeenCalled();
+		spy.mockRestore();
 	});
 });

@@ -212,7 +212,9 @@ class CollectMessageWakeTest(unittest.TestCase):
     """rlm.collect asks for the early wake and surfaces a messages_pending reply."""
 
     def setUp(self):
-        # collect rides the ungated host bridge: no protocol-5 negotiation needed.
+        # collect rides the ungated host bridge: no protocol-5 negotiation needed. At
+        # protocol 3 the kernel announces no message_notify capability, so the collect
+        # reply is the only channel that can record an arrival into the ledger.
         self.proc = spawn(None)
         self.addCleanup(self.proc.close)
         ready, _ = self.proc.ready()
@@ -272,6 +274,51 @@ class CollectMessageWakeTest(unittest.TestCase):
         self.assertNotIn("pending", out)
         events = self.proc.execute("c5", "import rlm\nprint(f'PENDING {rlm.messages_pending()}')")
         self.assertIn("PENDING 0", stream_text(events, "stdout"))
+
+
+class CollectWakeLedgerAccountingTest(unittest.TestCase):
+    """Exactly-once ledger accounting across the two arrival channels.
+
+    A host that honors the announced ``message_notify`` capability pushes a ``notify``
+    frame for every admission, and that push is what records the arrival in the
+    ledger. The same arrival also rides back on the early collect reply as
+    ``messages_pending``; if the reply recorded it again, one real message would count
+    as two and ``messages_pending()``/``wait_messages()`` would over-report forever.
+    """
+
+    def test_collect_reply_does_not_double_record_a_pushed_arrival(self):
+        proc = spawn("5")
+        self.addCleanup(proc.close)
+        ready, _ = proc.ready()
+        self.assertEqual(ready["protocol"], 5)
+        # The admission push records the arrival once...
+        proc.send({"type": "notify", "kind": "agent_message"})
+        code = "\n".join(
+            [
+                "import rlm",
+                "results = await rlm.collect(['child-1'], timeout_ms=120000)",
+                "print(f'COLLECTED {len(results)}')",
+            ]
+        )
+        proc.send({"type": "execute", "id": "d1", "code": code})
+        request = read_until(proc, lambda e: e.get("event") == "host_request")
+        self.assertEqual(request["data"]["type"], "rlm.collect")
+        # ...and the early reply reporting that same arrival must not record it again.
+        proc.send(
+            {
+                "type": "host_reply",
+                "id": request["id"],
+                "data": {"status": "ok", "result": {"results": [], "messages_pending": 1}},
+            }
+        )
+        events = proc.until_done("d1")
+        self.assertEqual(one(events, "done")["status"], "ok")
+        out = stream_text(events, "stdout")
+        self.assertIn("COLLECTED 0", out)
+        # The model-visible note still prints: the model must still end its turn.
+        self.assertIn("1 agent message(s) pending", out)
+        events = proc.execute("d2", "import rlm\nprint(f'PENDING {rlm.messages_pending()}')")
+        self.assertIn("PENDING 1", stream_text(events, "stdout"))
 
 
 if __name__ == "__main__":

@@ -1710,20 +1710,27 @@ describe("daemon supervisor resident workers", () => {
 			workerPids.delete(pid);
 		}
 
-		let failed: SessionSummary | undefined;
+		let relaunched: SessionSummary | undefined;
 		const recoveryDeadline = Date.now() + 20_000;
 		while (Date.now() < recoveryDeadline) {
 			const response = await client.request({ type: "list" });
 			if (response.success) {
-				failed = requireSessionList(response.data).find(
+				relaunched = requireSessionList(response.data).find(
 					(summary) =>
 						(summary.activeSessionId ?? summary.id) === (createdSummary.activeSessionId ?? createdSummary.id),
 				);
-				if (failed?.workerState === "failed") break;
+				if (relaunched?.workerState === "ready" && relaunched.workerPid !== createdSummary.workerPid) break;
 			}
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
 		}
-		expect(failed).toMatchObject({ workerState: "failed", activeSessionId: createdSummary.activeSessionId });
+		// Wave-40 ③: the blocking bash left in-progress operations in the worker's
+		// recovery journal, so the daemon relaunches the crashed daemon-owned worker
+		// itself instead of parking it failed until the create below. The relaunched
+		// process is a fresh pid serving the same session.
+		expect(relaunched).toMatchObject({ workerState: "ready", activeSessionId: createdSummary.activeSessionId });
+		expect(relaunched?.workerPid).toBeDefined();
+		expect(relaunched?.workerPid).not.toBe(createdSummary.workerPid);
+		if (relaunched?.workerPid) workerPids.add(relaunched.workerPid);
 		await connection.dispose();
 
 		const reopened = await client.request({

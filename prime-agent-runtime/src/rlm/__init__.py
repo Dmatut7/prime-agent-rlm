@@ -444,8 +444,11 @@ def _note_collect_message_wake(messages_pending: Any) -> None:
 
     The host sets ``messages_pending`` (true, or the pending count) on a collect reply it
     ended early because an agent message arrived for this session. The note prints into the
-    cell's own output - the channel the model actually reads - and the same arrivals enter
-    the wake ledger, so a following ``messages_pending()``/``wait_messages()`` agrees.
+    cell's own output - the channel the model actually reads. The ledger write depends on
+    the channel: once this kernel announced ``message_notify``, a conforming host pushes a
+    ``notify`` frame for every admission and those pushes are the ledger's record, so
+    recording the reply's count as well would count each arrival twice; without the
+    capability no push can arrive and the reply is the only channel, so it records here.
     Anything but a positive count is ignored: a malformed value must not fake a wake.
     """
     if messages_pending is True:
@@ -456,7 +459,8 @@ def _note_collect_message_wake(messages_pending: Any) -> None:
         return
     from . import repl
 
-    repl.note_message_wake(count)
+    if repl.CAPABILITY_MESSAGE_NOTIFY not in repl.kernel_capabilities():
+        repl.note_message_wake(count)
     print(f"[rlm] {count} agent message(s) pending for this session; end the turn to receive them.")
 
 

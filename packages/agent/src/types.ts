@@ -452,16 +452,31 @@ export interface ToolTimeoutConfig {
  * Breaker policy for unknown-tool calls; see `AgentLoopConfig.toolNotFoundBreaker`.
  * Two counters run per run, and either can trip each threshold: consecutive
  * unknown-tool calls (reset by any call whose name resolves), and the per-name
- * cumulative count (never reset within the run, so a model that corrects itself and
- * relapses on the same invented name is still caught).
+ * count (decayed by resolved calls, so an occasional miss in a long task does not
+ * accumulate to the limit, while a storm with no resolved calls in between outruns
+ * the decay). Hitting the limit grants a recovery turn instead of ending the run
+ * outright; a relapse inside that turn is what terminates.
  */
 export interface ToolNotFoundBreakerConfig {
 	/** Master switch. Defaults to true; `false` keeps the enriched receipts only. */
 	enabled?: boolean;
 	/** Unknown-tool calls before the receipt becomes a forced-correction warning. Default 3. */
 	warnAfter?: number;
-	/** Unknown-tool calls before the run ends with a classified terminal error. Default 5, clamped to >= warnAfter. */
+	/** Unknown-tool calls before the breaker trips. Default 5, clamped to >= warnAfter. */
 	terminateAfter?: number;
+	/**
+	 * Forgiveness per resolved tool call: every call whose name resolves subtracts this
+	 * from every per-name miss count (floored at zero). Default 1; 0 keeps the per-name
+	 * counts cumulative for the whole run (the pre-decay behavior).
+	 */
+	decayPerResolvedCall?: number;
+	/**
+	 * Recovery turns granted at the limit before the run ends. Default 1: hitting the
+	 * limit opens one turn in which a resolved call (or a clean stop) closes the
+	 * episode and resets the counts, and a single further unknown-tool call ends the
+	 * run. 0 ends the run at the limit (the pre-recovery behavior).
+	 */
+	recoveryTurns?: number;
 }
 
 /**

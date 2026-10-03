@@ -203,6 +203,9 @@ export type GitPaths = {
 /**
  * Find git metadata paths by walking up from cwd.
  * Handles both regular git repos (.git is a directory) and worktrees (.git is a file).
+ * A `.git` directory is only a repository when it has a HEAD, a refs directory, and
+ * an object store — git's own discovery (setup.c is_git_directory) walks past an
+ * empty or half-written `.git`, and so does this walk.
  */
 export function findGitPaths(cwd: string): GitPaths | null {
 	let dir = cwd;
@@ -223,10 +226,8 @@ export function findGitPaths(cwd: string): GitPaths | null {
 							: gitDir;
 						return { repoDir: dir, commonGitDir, headPath };
 					}
-				} else if (stat.isDirectory()) {
-					const headPath = join(gitPath, "HEAD");
-					if (!existsSync(headPath)) return null;
-					return { repoDir: dir, commonGitDir: gitPath, headPath };
+				} else if (stat.isDirectory() && isGitDirShape(gitPath)) {
+					return { repoDir: dir, commonGitDir: gitPath, headPath: join(gitPath, "HEAD") };
 				}
 			} catch {
 				return null;
@@ -236,6 +237,14 @@ export function findGitPaths(cwd: string): GitPaths | null {
 		if (parent === dir) return null;
 		dir = parent;
 	}
+}
+
+function isGitDirShape(gitPath: string): boolean {
+	if (!existsSync(join(gitPath, "HEAD")) || !existsSync(join(gitPath, "refs"))) {
+		return false;
+	}
+	// GIT_OBJECT_DIRECTORY relocates the object store.
+	return existsSync(process.env.GIT_OBJECT_DIRECTORY ?? join(gitPath, "objects"));
 }
 
 export interface GitContext {
@@ -334,6 +343,10 @@ function captureHeadFromFiles(cwd: string): { commit: string | null; branch: str
 	} catch {
 		return undefined;
 	}
+	// Reftable repos keep refs (and the real HEAD symref) in .git/reftable; the
+	// HEAD file is a placeholder (`refs/heads/.invalid`), so only the CLI reads
+	// them right.
+	if (existsSync(join(paths.commonGitDir, "reftable"))) return undefined;
 	if (GIT_OBJECT_ID_PATTERN.test(head)) {
 		// Detached HEAD: `branch --show-current` prints nothing, HEAD is the commit.
 		return { commit: head, branch: null };

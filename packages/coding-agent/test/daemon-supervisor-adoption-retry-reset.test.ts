@@ -1,10 +1,32 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import { type FakeWorkerHandle, startFakeWorker } from "./fixtures/supervisor-fake-worker.js";
 import {
 	disposeSupervisorHarnesses,
 	type SupervisorHarness,
 	startSupervisorHarness,
 } from "./fixtures/supervisor-harness.js";
+
+/**
+ * Wave-40 ③: a crashed daemon-owned worker whose sessions carry scheduled jobs is
+ * now relaunched from its durable create command instead of parking at once. The
+ * park-then-re-adopt ladder under test here is what runs when that relaunch cannot
+ * produce a worker, so the launch boundary fails instead of spawning a real
+ * process into the test runner.
+ */
+function failWorkerRelaunches(): void {
+	vi.spyOn(
+		DaemonSupervisor.prototype as unknown as {
+			launchWorker(
+				command: unknown,
+				existing?: unknown,
+				ownerClientId?: string,
+				requestTimeoutMs?: number,
+			): Promise<unknown>;
+		},
+		"launchWorker",
+	).mockRejectedValue(new Error("test boundary: worker relaunch cannot spawn in this harness"));
+}
 
 /**
  * FIX-8b. `adoptionRetryAttempt` only ever grew: a worker whose adoption failed
@@ -42,6 +64,7 @@ async function waitForReAdoptions(harness: SupervisorHarness, count: number, tim
 
 describe("FIX-8b adoption retry budget", () => {
 	it("resets the re-adoption backoff once an adoption succeeded", async () => {
+		failWorkerRelaunches();
 		const harness = await startSupervisorHarness({
 			prefix: "fix-8-adoption-retry-reset-",
 			// The worker answers hello and auth only, so adoption wedges on its next

@@ -168,12 +168,13 @@ export const DEFAULT_RETENTION_BASH_TEMP_FILE_MAX_BYTES = 256 * 1024 * 1024;
 /** Count half of the `pi-bash-*.log` bound: the age window alone does not cap a busy day. */
 export const DEFAULT_RETENTION_BASH_TEMP_FILE_MAX_COUNT = 100;
 /**
- * Total-byte ceiling for the session-artifact tree (documents-5 S2: measured 6 GB
- * with no reclaimer for sessions that were never explicitly deleted). Over the
- * ceiling the coldest non-live artifact directories are reclaimed oldest-first.
+ * Total-byte ceiling for the reclaimable kernel snapshot payloads of the
+ * session-artifact tree (documents-5 S2: measured 6 GB with no reclaimer for
+ * sessions that were never explicitly deleted). Over the ceiling the largest
+ * cold `kernel-state.dill` payloads are reclaimed first.
  */
 export const DEFAULT_RETENTION_SESSION_ARTIFACTS_MAX_BYTES = 8 * 1024 * 1024 * 1024;
-/** Age floor below which byte pressure alone never reclaims a session's artifact directory. */
+/** Age floor below which byte pressure alone never reclaims a session's kernel snapshot. */
 export const DEFAULT_RETENTION_SESSION_ARTIFACTS_CAP_MIN_AGE_DAYS = 7;
 export const DEFAULT_RETENTION_STALE_LEASE_HOURS = 24;
 export const DEFAULT_RETENTION_KERNEL_SNAPSHOT_GENERATIONS = 1;
@@ -604,14 +605,17 @@ export interface RetentionSettings {
 	 */
 	bashTempFileMaxCount?: number;
 	/**
-	 * Total-byte ceiling for the session-artifact tree. Over the ceiling, the sweep's
-	 * `artifact-total-cap` class reclaims the coldest session directories
-	 * oldest-first until the tree fits again. A directory is never touched while its
-	 * session is resident, leased, ledger-live, referenced by a live kernel, holding
-	 * scheduled cron jobs, holding another session's live transcript, or younger
-	 * than `sessionArtifactsCapMinAgeDays`; the transcript in `sessions/` stays, so a
-	 * reclaimed session still resumes (its artifact directory is recreated on
-	 * demand, its kernel state restarts empty). Default: 8 GiB; 0 = off.
+	 * Total-byte ceiling for the reclaimable kernel snapshot payloads of the
+	 * session-artifact tree. Over the ceiling, the sweep's `artifact-total-cap`
+	 * class reclaims cold sessions' `kernel-state.dill` payloads largest-first
+	 * until the counted bytes fit again. A snapshot is never taken while its
+	 * session is resident, leased, ledger-live, referenced by a live kernel,
+	 * holding scheduled cron jobs, or younger than
+	 * `sessionArtifactsCapMinAgeDays`; protected bytes never count toward the
+	 * ceiling, and the directory itself - harness memory, pasted images, edges,
+	 * transcripts - is never this class's to take, so a reclaimed session resumes
+	 * with everything but its kernel namespace (the kernel restarts empty, the
+	 * fresh-start path). Default: 8 GiB; 0 = off.
 	 */
 	sessionArtifactsMaxBytes?: number;
 	/**

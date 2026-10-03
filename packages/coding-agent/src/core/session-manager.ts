@@ -1047,6 +1047,20 @@ export function buildSessionContext(
 	if (compaction) {
 		const compactionIdx = path.findIndex((e) => e.type === "compaction" && e.id === compaction.id);
 
+		// The pre-compaction ledger is summarized away, but a post-compaction
+		// model_change is only a real switch against what ran before the
+		// compaction: seed the comparison from the last model_change ahead of the
+		// compaction point, or the switch back (fallback episode ending, restored
+		// primary) would synthesize no notice and the rebuilt context would carry
+		// one model's messages into another model's requests without a word.
+		for (let i = compactionIdx - 1; i >= 0; i--) {
+			const entry = path[i];
+			if (entry.type === "model_change") {
+				lastModelChange = `${entry.provider}/${entry.modelId}`;
+				break;
+			}
+		}
+
 		// Collect kept messages (before compaction, starting from firstKeptEntryId).
 		// The context remains summary-first for the model; retainedMessageCount records
 		// the exact chronological presentation boundary for clients.
@@ -1094,6 +1108,9 @@ export function buildSessionContext(
 			),
 			...retainedMessages,
 		);
+		// The summary is content the model reads: a later model_change compares
+		// against the seeded pre-compaction model, not against an empty context.
+		seenContentEntry = true;
 
 		for (let i = compactionIdx + 1; i < path.length; i++) {
 			const entry = path[i];

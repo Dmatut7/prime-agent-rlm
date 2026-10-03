@@ -1968,6 +1968,207 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(supervisor.persistWorker).toHaveBeenCalledWith(worker);
 	});
 
+	/**
+	 * Wave-40 ③: a crashed daemon-owned worker used to park failed even when its
+	 * work record showed live obligations (an in-progress operation in the recovery
+	 * journal, or a registered heartbeat/cron schedule), leaving scheduled sessions
+	 * dark until a client happened to attach. The daemon now re-launches it from the
+	 * durable create command with its own environment, rate-capped per worker.
+	 */
+	describe("daemon-owned worker crash relaunch", () => {
+		const crashTempDirs: string[] = [];
+		afterEach(() => {
+			for (const directory of crashTempDirs.splice(0)) rmSync(directory, { recursive: true, force: true });
+		});
+		interface CrashWorker {
+			descriptor: {
+				workerId: string;
+				pid: number;
+				processStartId: string;
+				rootActiveSessionId: string;
+				rootSessionId: string;
+				sessionFile: string;
+				recoveryJournalPath: string;
+				lifecycle?: string;
+				consecutiveFailures: number;
+				lastError?: string;
+				lastFailureAt?: string;
+				createCommand: { type: "create"; sessionPath?: string };
+			};
+			intentionalStop: boolean;
+			stopRevision: number;
+			recovery?: Promise<void>;
+			daemonCrashRestarts?: { count: number; firstAt: number };
+		}
+		interface CrashHarness {
+			workers: Map<string, CrashWorker>;
+			shuttingDown: boolean;
+			connectWorker: ReturnType<typeof vi.fn>;
+			recoverUncertainWorkerOperations: ReturnType<typeof vi.fn>;
+			launchWorker: ReturnType<typeof vi.fn>;
+			persistWorker: ReturnType<typeof vi.fn>;
+			assertRecoveryAllowed: ReturnType<typeof vi.fn>;
+			adoptionRetryTimers: Map<CrashWorker, unknown>;
+			adoptionRetryDelaysMs: readonly number[];
+			adoptionRequestTimeoutMs: number;
+			recoverWorker(target: CrashWorker): Promise<void>;
+		}
+
+		function makeCrashFixture(options: { busyJournal?: boolean; cronJob?: boolean }) {
+			const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-crash-relaunch-"));
+			crashTempDirs.push(directory);
+			const sessionFile = join(directory, "session.jsonl");
+			writeFileSync(
+				sessionFile,
+				`${JSON.stringify({ type: "session", version: 3, id: "session-1", timestamp: new Date().toISOString(), cwd: directory })}\n`,
+				{ mode: 0o600 },
+			);
+			const recoveryJournalPath = join(directory, "worker.recovery.jsonl");
+			if (options.busyJournal) {
+				new WorkerRecoveryJournal(recoveryJournalPath).record({
+					activeSessionId: "active-1",
+					sessionId: "session-1",
+					sessionFile,
+					busy: true,
+					operation: "prompt",
+				});
+			}
+			const worker: CrashWorker = {
+				descriptor: {
+					workerId: "worker-crashed",
+					// pid reuse: the live pid belongs to somebody else, so recovery reaches
+					// the replacement decision instead of probing or claiming ambiguity.
+					pid: process.pid,
+					processStartId: "different-process-start",
+					rootActiveSessionId: "active-1",
+					rootSessionId: "session-1",
+					sessionFile,
+					recoveryJournalPath,
+					consecutiveFailures: 0,
+					createCommand: { type: "create", sessionPath: sessionFile },
+				},
+				intentionalStop: false,
+				stopRevision: 0,
+			};
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				workers: new Map([[worker.descriptor.workerId, worker]]),
+				shuttingDown: false,
+				socketPath: join(directory, "daemon.sock"),
+				connectWorker: vi.fn(),
+				recoverUncertainWorkerOperations: vi.fn(async () => {}),
+				launchWorker: vi.fn(async () => worker),
+				persistWorker: vi.fn(),
+				assertRecoveryAllowed: vi.fn(async () => {}),
+				adoptionRetryTimers: new Map(),
+				adoptionRetryDelaysMs: [60_000],
+				adoptionRequestTimeoutMs: 12_345,
+			}) as CrashHarness;
+			if (options.cronJob) {
+				seedSupervisorRoster(supervisor, {
+					descriptor: { workerId: worker.descriptor.workerId },
+					summaries: new Map([
+						[
+							"active-1",
+							{
+								id: "active-1",
+								activeSessionId: "active-1",
+								lifecycle: "live",
+								activity: "idle",
+								isSessionActive: false,
+								sessionId: "session-1",
+								sessionFile,
+								cwd: directory,
+								isStreaming: false,
+								isCompacting: false,
+								attachedClients: 0,
+								messageCount: 1,
+								sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+								hasRegisteredCronJob: true,
+							} satisfies SessionSummary,
+						],
+					]),
+				});
+			}
+			return { worker, supervisor };
+		}
+
+		it("relaunches a crashed daemon-owned worker whose sessions have scheduled jobs", async () => {
+			vi.useFakeTimers();
+			const { worker, supervisor } = makeCrashFixture({ cronJob: true });
+
+			const recovery = supervisor.recoverWorker(worker);
+			await vi.advanceTimersByTimeAsync(250);
+			await recovery;
+
+			// No owner to wait for: the daemon re-drives the worker from the durable
+			// create command, after marking the uncertain operations interrupted.
+			expect(supervisor.launchWorker).toHaveBeenCalledWith(
+				{ type: "create", sessionPath: worker.descriptor.sessionFile },
+				worker,
+				undefined,
+				12_345,
+			);
+			expect(supervisor.recoverUncertainWorkerOperations).toHaveBeenCalledWith(worker);
+			expect(supervisor.recoverUncertainWorkerOperations.mock.invocationCallOrder[0]).toBeLessThan(
+				supervisor.launchWorker.mock.invocationCallOrder[0],
+			);
+			expect(worker.descriptor.lifecycle).not.toBe("failed");
+			expect(worker.daemonCrashRestarts).toEqual({ count: 1, firstAt: Date.now() });
+		});
+
+		it("relaunches a crashed daemon-owned worker with an in-progress operation and no schedule", async () => {
+			vi.useFakeTimers();
+			const { worker, supervisor } = makeCrashFixture({ busyJournal: true });
+
+			const recovery = supervisor.recoverWorker(worker);
+			await vi.advanceTimersByTimeAsync(250);
+			await recovery;
+
+			expect(supervisor.launchWorker).toHaveBeenCalledWith(
+				{ type: "create", sessionPath: worker.descriptor.sessionFile },
+				worker,
+				undefined,
+				12_345,
+			);
+		});
+
+		it("keeps a crashed daemon-owned worker with nothing in flight parked", async () => {
+			vi.useFakeTimers();
+			const { worker, supervisor } = makeCrashFixture({});
+
+			const recovery = supervisor.recoverWorker(worker);
+			await vi.advanceTimersByTimeAsync(250);
+			await recovery;
+
+			expect(supervisor.launchWorker).not.toHaveBeenCalled();
+			expect(worker.descriptor.lifecycle).toBe("failed");
+			expect(worker.descriptor.lastError).toBe("Waiting for a client with fresh runtime context");
+		});
+
+		it("parks a worker that keeps crashing once the restart budget is spent, and re-arms after the window", async () => {
+			vi.useFakeTimers();
+			const { worker, supervisor } = makeCrashFixture({ cronJob: true });
+			worker.daemonCrashRestarts = { count: 3, firstAt: Date.now() };
+
+			const recovery = supervisor.recoverWorker(worker);
+			await vi.advanceTimersByTimeAsync(250);
+			await recovery;
+
+			expect(supervisor.launchWorker).not.toHaveBeenCalled();
+			expect(worker.descriptor.lifecycle).toBe("failed");
+			expect(worker.descriptor.lastError).toContain("crashed 3 times");
+			expect(worker.descriptor.lastError).toContain("retry_worker");
+			// The budget decayed by the next episode past the window: relaunch again.
+			worker.daemonCrashRestarts = { count: 3, firstAt: Date.now() - 11 * 60 * 1000 };
+			worker.descriptor.lifecycle = "recovering";
+			const second = supervisor.recoverWorker(worker);
+			await vi.advanceTimersByTimeAsync(250);
+			await second;
+			expect(supervisor.launchWorker).toHaveBeenCalledOnce();
+			expect(worker.daemonCrashRestarts).toEqual({ count: 1, firstAt: Date.now() });
+		});
+	});
+
 	it("rejects create reuse when a failed worker cannot be safely reclaimed", async () => {
 		const worker = {
 			descriptor: {

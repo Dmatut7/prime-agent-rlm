@@ -1,5 +1,6 @@
 import { setKeybindings } from "@earendil-works/pi-tui";
 import { beforeAll, beforeEach, describe, expect, test } from "vitest";
+import { DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT } from "../src/core/autonomous.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type {
@@ -772,5 +773,40 @@ describe("findLatestUserMessageEntryId", () => {
 
 		expect(findLatestUserMessageEntryId(tree, null)).toBeUndefined();
 		expect(findLatestUserMessageEntryId(tree, "missing")).toBeUndefined();
+	});
+
+	test("skips system-generated continuation prompts: the preselect target is the last thing the human said", () => {
+		const tree = buildTree([
+			userMessage("user-1", null, "do the refactor"),
+			assistantMessage("asst-1", "user-1", "working"),
+			userMessage(
+				"auto-1",
+				"asst-1",
+				"[autonomous-continuation: subagent-keep-alive]\n\nSubagents have been running for at least 5 minutes without a reply",
+			),
+			assistantMessage("asst-2", "auto-1", "still working"),
+		]);
+
+		expect(findLatestUserMessageEntryId(tree, "asst-2")).toBe("user-1");
+	});
+
+	test("skips the default autonomous continuation prompt too", () => {
+		const tree = buildTree([
+			userMessage("user-1", null, "do the refactor"),
+			assistantMessage("asst-1", "user-1", "working"),
+			userMessage("auto-1", "asst-1", DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT),
+			assistantMessage("asst-2", "auto-1", "still working"),
+		]);
+
+		expect(findLatestUserMessageEntryId(tree, "asst-2")).toBe("user-1");
+	});
+
+	test("returns undefined when the only user messages are machine continuations", () => {
+		const tree = buildTree([
+			userMessage("auto-1", null, "[autonomous-continuation: gate-failed]\n\nThe gate failed"),
+			assistantMessage("asst-1", "auto-1", "working"),
+		]);
+
+		expect(findLatestUserMessageEntryId(tree, "asst-1")).toBeUndefined();
 	});
 });

@@ -3,6 +3,7 @@ import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { estimateTextTokensByContent } from "../src/core/compaction/content-density.js";
 import {
+	BRANCH_USER_REQUESTS_HEADER,
 	buildUserRequestLedger,
 	clipUserRequest,
 	collectUserRequests,
@@ -280,6 +281,18 @@ describe("user request ledger", () => {
 
 	it("renders nothing for an empty ledger", () => {
 		expect(renderUserRequests(emptyUserRequestLedger(1))).toBe("");
+	});
+
+	it("keeps the live-obligation header by default and swaps it for an abandoned branch", () => {
+		const ledger = buildUserRequestLedger({ messages: [userMessage("保持现状")], generation: 1 });
+		expect(renderUserRequests(ledger)).toContain("live obligation");
+		// A branch summary renders the same records under a header that says they are
+		// not current instructions.
+		const branch = renderUserRequests(ledger, { header: BRANCH_USER_REQUESTS_HEADER });
+		expect(branch).not.toContain("live obligation");
+		expect(branch).toContain("left behind");
+		// The swap is header-only: the records survive byte-exact either way.
+		expect(parseUserRequests(branch)?.records.map((record) => record.text)).toEqual(["保持现状"]);
 	});
 
 	it("skips malformed lines and reports no block when there is none", () => {

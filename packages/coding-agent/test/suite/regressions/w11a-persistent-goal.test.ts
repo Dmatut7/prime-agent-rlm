@@ -5,6 +5,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { AgentSession } from "../../../src/core/agent-session.js";
 import { createHarness, getAssistantTexts, getMessageText, type Harness } from "../harness.js";
 
+async function waitForCondition(predicate: () => boolean, label: string): Promise<void> {
+	for (let attempt = 0; attempt < 400; attempt++) {
+		if (predicate()) return;
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	throw new Error(`timed out waiting for ${label}`);
+}
+
 // W11-A (boss pain S1, 2026-09-30 x4): a goal the model declares complete used
 // to end the run even when the user asked for keep-going work. `/goal
 // --persistent` starts a goal that never auto-terminates: goal.complete() is
@@ -38,7 +46,12 @@ describe("W11-A persistent goal", () => {
 
 	async function createGoalHarness(): Promise<Harness> {
 		const sessionRef: { current?: AgentSession } = {};
-		const harness = await createHarness({ tools: [createFauxIpythonTool(sessionRef)] });
+		const harness = await createHarness({
+			tools: [createFauxIpythonTool(sessionRef)],
+			// The persistent goal's continuation throttle (30s in production) would
+			// make each turn below wait it out; shrink it so the test stays fast.
+			persistentGoalMinContinuationIntervalMs: 10,
+		});
 		sessionRef.current = harness.session;
 		harnesses.push(harness);
 		return harness;
@@ -61,7 +74,10 @@ describe("W11-A persistent goal", () => {
 		// (budget_limited); a persistent goal consumes every queued response. The
 		// trailing empty text is the harness's queue-exhausted placeholder, and the
 		// terminal "error" status is the same artifact - the point is the goal never
-		// hit budget_limited despite five continuations.
+		// hit budget_limited despite five continuations. The continuation throttle
+		// ends the run between turns and re-wakes it, so the chain spans several
+		// runs now: wait for the queue to drain instead of reading mid-flight.
+		await waitForCondition(() => getAssistantTexts(harness).length >= 6, "the continuation chain to drain");
 		expect(getAssistantTexts(harness).slice(0, 6)).toEqual([
 			"step one, not done",
 			"step two, not done",

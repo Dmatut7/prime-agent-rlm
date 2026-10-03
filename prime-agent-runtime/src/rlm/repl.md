@@ -185,6 +185,10 @@ Cells compile with `PyCF_ALLOW_TOP_LEVEL_AWAIT` and run as tasks on the
 persistent event loop, so `await` works at top level and background tasks
 created by a cell keep running between cells. Each cell's source is registered
 in `linecache` under `<cell-N>`, so tracebacks show the offending source line.
+Finished cells keep their entries - an error raised later by a function an
+earlier cell defined still shows that cell's line, and `inspect.getsource`
+works on it - bounded to the most recent 200 cells so a long session does not
+pin every cell's source.
 Tracebacks are plain `traceback` formatting with the runtime's own frames
 stripped, keeping cell and library frames; no colors, no decoration.
 
@@ -256,8 +260,11 @@ docstrings):
   ignores the field and the wait behaves exactly as before; a wake-capable host
   answers with the current snapshots and sets `messages_pending` (true, or the
   pending count) on the result, which the kernel surfaces as a note printed into
-  the cell's own output plus the same ledger, so the model learns to end its
-  turn and receive the message instead of re-arming a long wait.
+  the cell's own output, so the model learns to end its turn and receive the
+  message instead of re-arming a long wait. The ledger records each arrival
+  exactly once: the admission push is the record for a kernel that announced
+  `message_notify`; the reply's count is recorded only for one that did not,
+  where the reply is the only channel.
 
 A malformed `notify` (missing or non-string `kind`) earns a `ProtocolError`
 event and the runtime keeps serving; a well-formed kind this runtime does not

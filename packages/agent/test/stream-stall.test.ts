@@ -226,6 +226,81 @@ describe("agent loop stream stall detection", () => {
 		}
 	});
 
+	it("classifies a stall with no provider answer as an unknown provider_stream_failure", async () => {
+		const context = createContext();
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			streamStallTimeoutMs: 40,
+		};
+		const streamFn = vi.fn(() => new MockAssistantStream()); // accepts the request, never streams
+
+		const messages = await runAgentLoop(
+			[createUserMessage("hello")],
+			context,
+			config,
+			async () => {},
+			undefined,
+			streamFn as never,
+		);
+		const assistant = lastAssistant(messages);
+
+		expect(assistant?.stopReason).toBe("error");
+		expect(assistant?.errorMessage).toContain("Stream stalled");
+		// No Retry-After wait was observed, so nothing explains the silence: the failure
+		// must still carry the structured diagnostic, classified unknown, or the session
+		// reads it as permanent and never engages the fallback model chain.
+		expect(assistant?.stopReasonRaw).not.toBe(SERVER_DIRECTED_RETRY_STALL_STOP_REASON_RAW);
+		const diagnostic = assistant?.diagnostics?.find((entry) => entry.type === "provider_stream_failure");
+		expect(diagnostic).toBeDefined();
+		expect(diagnostic?.details).toMatchObject({
+			kind: "unknown",
+			stallAttribution: "no_response",
+			streamedContent: false,
+		});
+	});
+
+	it("classifies a mid-stream stall with no retry record as unknown, keeping the partial output", async () => {
+		const context = createContext();
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			streamStallTimeoutMs: 60,
+		};
+		const stream = new MockAssistantStream();
+		const streamFn = vi.fn(() => {
+			stream.push({ type: "start", partial: createAssistantMessage([{ type: "text", text: "" }]) });
+			stream.push({
+				type: "text_delta",
+				contentIndex: 0,
+				delta: "half an answer",
+				partial: createAssistantMessage([{ type: "text", text: "half an answer" }]),
+			});
+			// Then the connection dies: no terminal event, no further delta, no 429 on record.
+			return stream;
+		});
+
+		const messages = await runAgentLoop(
+			[createUserMessage("hello")],
+			context,
+			config,
+			async () => {},
+			undefined,
+			streamFn as never,
+		);
+		const assistant = lastAssistant(messages);
+
+		expect(assistant?.stopReason).toBe("error");
+		expect(assistant?.content).toEqual([{ type: "text", text: "half an answer" }]);
+		const diagnostic = assistant?.diagnostics?.find((entry) => entry.type === "provider_stream_failure");
+		expect(diagnostic).toBeDefined();
+		expect(diagnostic?.details).toMatchObject({
+			kind: "unknown",
+			stallAttribution: "mid_stream_interruption",
+			streamedContent: true,
+		});
+	});
+
 	it("classifies a stall during a server-requested retry wait as throttling, not a dead connection", async () => {
 		const context = createContext();
 		const config: AgentLoopConfig = {

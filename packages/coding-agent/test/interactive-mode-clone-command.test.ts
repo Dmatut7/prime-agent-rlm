@@ -7,6 +7,9 @@ type CloneCommandContext = {
 		fork: (entryId: string, options?: { position?: "before" | "at" }) => Promise<{ cancelled: boolean }>;
 	};
 	renderCurrentSessionState: () => void;
+	carryPromptStashAcrossFork?: (priorSessionId: string | undefined, priorState: unknown) => void;
+	promptStashSessionId?: string;
+	promptStashState?: Record<string, unknown>;
 	editor: { setText: (text: string) => void };
 	showStatus: (message: string) => void;
 	showError: (message: string) => void;
@@ -32,6 +35,8 @@ describe("InteractiveMode /clone", () => {
 		const context: CloneCommandContext = {
 			agentConnection: { getSessionTree, fork },
 			renderCurrentSessionState,
+			carryPromptStashAcrossFork: vi.fn(),
+			promptStashState: {},
 			editor: { setText },
 			showStatus,
 			showError,
@@ -43,6 +48,8 @@ describe("InteractiveMode /clone", () => {
 		expect(getSessionTree).toHaveBeenCalledWith();
 		expect(fork).toHaveBeenCalledWith("leaf-123", { position: "at" });
 		expect(renderCurrentSessionState).toHaveBeenCalled();
+		// The stash carry runs before the editor gets the forked draft.
+		expect(context.carryPromptStashAcrossFork).toHaveBeenCalledWith(undefined, context.promptStashState);
 		expect(setText).toHaveBeenCalledWith("");
 		expect(showStatus).toHaveBeenCalledWith("已复制到新会话");
 		expect(showError).not.toHaveBeenCalled();

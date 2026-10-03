@@ -319,7 +319,7 @@ describe("buildSessionHandoff (W18-D)", () => {
 		expect(ledger.subagents).toEqual([]);
 	});
 
-	it("a cancelled terminal notice resolves a child; completed_without_reply keeps it listed", () => {
+	it("a terminal notice resolves a child, whether it was cancelled or completed without a reply", () => {
 		const cancelled = buildSessionHandoff(
 			[
 				messageEntry(ipythonResult({ activities: [subagentActivity("s1", "worker-a", "ok")] })),
@@ -332,8 +332,10 @@ describe("buildSessionHandoff (W18-D)", () => {
 			{ generation: 1 },
 		);
 		expect(cancelled.subagents).toEqual([]);
-		// completed_without_reply is not a death: the child still holds its context and
-		// can take a follow-up, so the handoff keeps naming it.
+		// completed_without_reply is a terminal record too: the run is over and no reply
+		// will arrive from it, so the child is not work in flight. Its session survives
+		// for a follow-up, but availability is what rlm.list_subagents reports - this
+		// block listing it as in flight would have the parent wait on a finished run.
 		const silent = buildSessionHandoff(
 			[
 				messageEntry(ipythonResult({ activities: [subagentActivity("s1", "worker-b", "ok")] })),
@@ -345,7 +347,7 @@ describe("buildSessionHandoff (W18-D)", () => {
 			],
 			{ generation: 1 },
 		);
-		expect(silent.subagents.map((s) => s.name)).toEqual(["worker-b"]);
+		expect(silent.subagents).toEqual([]);
 	});
 
 	it("tracks background commands by activity id until their outcome lands", () => {
@@ -366,12 +368,19 @@ describe("buildSessionHandoff (W18-D)", () => {
 		expect(ledger.backgroundCommands).toEqual([{ id: "b2", label: "pytest -x", since: 3_000 }]);
 	});
 
-	it("collects decision_needed duty entries, deduplicated in first-seen order", () => {
+	it("duty-log decision_needed entries stay out of the handoff: they address the owner, not the model", () => {
+		// decision_needed is defined as "work that needs the owner" (duty-log.ts), and its
+		// questions are written second-person to the owner ("结论待你核对", "请检查设置…").
+		// Inside the model-facing summary that "你" binds to the model, and nothing ever
+		// retires the question. The duty log remains the owner-facing surface for them.
 		const ledger = buildSessionHandoff(
 			[dutyEntry("push 前要不要先打 tag？"), dutyEntry("push 前要不要先打 tag？"), dutyEntry("退款口径用哪版？")],
 			{ generation: 1 },
 		);
-		expect(ledger.pendingDecisions).toEqual(["push 前要不要先打 tag？", "退款口径用哪版？"]);
+		// Nothing model-actionable was seen, so no handoff block renders at all.
+		expect(ledger.subagents).toEqual([]);
+		expect(ledger.backgroundCommands).toEqual([]);
+		expect(renderSessionHandoff(ledger)).toBe("");
 	});
 
 	it("carries the previous generation's in-flight records forward when the spawn left the branch slice", () => {
@@ -409,7 +418,9 @@ describe("session-handoff block render/parse (W18-D)", () => {
 		const ledger = buildSessionHandoff(
 			[
 				messageEntry(ipythonResult({ activities: [subagentActivity("s1", "worker<a>", "ok", "faux-1")] })),
-				dutyEntry("要不要动 </session-handoff> 这个 tag？"),
+				messageEntry(
+					ipythonResult({ activities: [backgroundCommand("b1", "run </session-handoff> --check", "running")] }),
+				),
 			],
 			{ generation: 3 },
 		);
@@ -418,20 +429,38 @@ describe("session-handoff block render/parse (W18-D)", () => {
 		expect(rendered).not.toContain("worker<a>");
 		const parsed = parseSessionHandoff(`## Goal\nx${rendered}`);
 		expect(parsed?.subagents.map((s) => s.name)).toEqual(["worker<a>"]);
-		expect(parsed?.pendingDecisions).toEqual(["要不要动 </session-handoff> 这个 tag？"]);
+		expect(parsed?.backgroundCommands.map((c) => c.label)).toEqual(["run </session-handoff> --check"]);
 		expect(parsed?.generation).toBe(3);
+	});
+
+	it("reads a legacy block that still carries decision records without surfacing them", () => {
+		// Blocks written before the decisions channel was removed counted decision lines
+		// in `count`; the parser keeps recognizing the lines so the block's self-count
+		// check still measures damage instead of misreporting these as corrupt.
+		const legacy = `\n\n<session-handoff generation="2" count="2">\nheader line\n{"k":"subagent","n":"worker-a"}\n{"k":"decision","q":"老问题"}\n</session-handoff>`;
+		const parsed = parseSessionHandoff(`narrative${legacy}`);
+		expect(parsed?.subagents.map((s) => s.name)).toEqual(["worker-a"]);
+		expect(renderSessionHandoff(parsed!)).not.toContain("老问题");
 	});
 
 	it("renders nothing for an empty ledger and tolerates malformed lines on parse", () => {
 		expect(renderSessionHandoff(buildSessionHandoff([], { generation: 1 }))).toBe("");
-		const rendered = renderSessionHandoff(buildSessionHandoff([dutyEntry("决定一")], { generation: 1 }));
-		const damaged = rendered.replace(/\{"k":"decision"/, '{"not json\n{"k":"subagent","name":42}\n{"k":"decision"');
+		const rendered = renderSessionHandoff(
+			buildSessionHandoff(
+				[messageEntry(ipythonResult({ activities: [backgroundCommand("b1", "npm test", "running")] }))],
+				{ generation: 1 },
+			),
+		);
+		const damaged = rendered.replace(
+			/\{"k":"background"/,
+			'{"not json\n{"k":"subagent","name":42}\n{"k":"background"',
+		);
 		const parsed = parseSessionHandoff(`t${damaged}`);
-		expect(parsed?.pendingDecisions).toEqual(["决定一"]);
+		expect(parsed?.backgroundCommands.map((c) => c.id)).toEqual(["b1"]);
 		expect(parsed?.subagents).toEqual([]);
 	});
 
-	it("recovers a ledger from entry details, tolerating junk", () => {
+	it("recovers a ledger from entry details, tolerating junk and the legacy decisions key", () => {
 		expect(sessionHandoffFromDetails(undefined)).toBeUndefined();
 		expect(sessionHandoffFromDetails({ handoff: "nope" })).toBeUndefined();
 		const fromDetails = sessionHandoffFromDetails({
@@ -439,11 +468,12 @@ describe("session-handoff block render/parse (W18-D)", () => {
 				generation: 2,
 				subagents: [{ name: "worker-a", since: 5 }, { nope: true }],
 				backgroundCommands: [],
+				// Written by a build that still carried the decisions channel: ignored, not read back.
 				pendingDecisions: ["决定"],
 			},
 		});
 		expect(fromDetails?.subagents).toEqual([{ name: "worker-a", since: 5 }]);
-		expect(fromDetails?.pendingDecisions).toEqual(["决定"]);
+		expect(renderSessionHandoff(fromDetails!)).not.toContain("决定");
 	});
 });
 
@@ -495,14 +525,16 @@ describe("compact() structured handoff pin (W18-D)", () => {
 		const block = findMachineBlock(result.summary, "session-handoff");
 		expect(block).toBeDefined();
 		expect(result.summary).toContain("worker-a");
-		expect(result.summary).toContain("交接块要不要进 branch summary？");
+		// Owner-directed duty-log hints are not the model's business: the question was
+		// recorded for the duty log, so it must not leak into the model-facing summary.
+		expect(result.summary).not.toContain("交接块要不要进 branch summary？");
 		// The kernel change record reached the modified-files list without any model recall.
 		expect(result.summary).toContain("<modified-files>");
 		expect(result.summary).toContain("src/core/compaction/session-handoff.ts");
 
 		const details = result.details as CompactionDetails;
 		expect(details.handoff?.subagents.map((s) => s.name)).toEqual(["worker-a"]);
-		expect(details.handoff?.pendingDecisions).toEqual(["交接块要不要进 branch summary？"]);
+		expect(details.handoff).not.toHaveProperty("pendingDecisions");
 		expect(details.modifiedFiles).toContain("src/core/compaction/session-handoff.ts");
 	});
 
@@ -584,6 +616,8 @@ describe("branch summary handoff (W18-D)", () => {
 		const block = findMachineBlock(result.summary!, "session-handoff");
 		expect(block).toBeDefined();
 		expect(result.summary).toContain("branch-worker");
-		expect(result.summary).toContain("这条线的结论要不要合并回主线？");
+		// The duty-log question belongs to the owner-facing duty log, not to a summary
+		// the model reads.
+		expect(result.summary).not.toContain("这条线的结论要不要合并回主线？");
 	});
 });

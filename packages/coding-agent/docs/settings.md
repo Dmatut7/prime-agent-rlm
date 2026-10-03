@@ -757,8 +757,8 @@ with one compact line per sweep appended to `<agentDir>/retention/history.jsonl`
 | `retention.sweepLockEnabled` | boolean | `true` | One sweep per agent dir at a time, across processes: a second trigger reports the last sweep instead of walking the tree twice and re-writing the sweep history. `false` goes back to concurrent sweeps |
 | `retention.emptyArtifactDirDays` | number | `7` | Artifact directories with no file anywhere in the subtree, once the session that owned them is provably gone; `0` disables |
 | `retention.deletedSessionResidueDays` | number | `7` | Artifact directories that still hold leftovers (a semantic-edges stub, a local harness copy, a stale kernel snapshot) of a session whose deletion is on record; `0` disables. A directory whose id was reused by a new session is never reclaimed |
-| `retention.sessionArtifactsMaxBytes` | number | `8589934592` | Total-byte ceiling for the whole session-artifact tree. Over the ceiling the `artifact-total-cap` class reclaims the coldest non-live session directories oldest-first until the tree fits (see below); `0` disables |
-| `retention.sessionArtifactsCapMinAgeDays` | number | `7` | Age floor for the total-byte ceiling: a directory with a write newer than this is never reclaimed under byte pressure; `0` leaves only `retention.cooldownMinutes` as the floor |
+| `retention.sessionArtifactsMaxBytes` | number | `8589934592` | Total-byte ceiling for the reclaimable kernel snapshot payloads of the session-artifact tree. Over the ceiling the `artifact-total-cap` class reclaims cold sessions' `kernel-state.dill` payloads largest-first until they fit (see below); protected bytes never count toward the ceiling. `0` disables |
+| `retention.sessionArtifactsCapMinAgeDays` | number | `7` | Age floor for the total-byte ceiling: a session whose artifact directory has a write newer than this never loses its kernel snapshot to byte pressure; `0` leaves only `retention.cooldownMinutes` as the floor |
 | `retention.childTranscriptDays` | number | `30` | Sub-agent transcripts (`sub-xxxxxxxx/<uuid>.jsonl`) older than this. A live child is kept by its ledger edge; a deleted child's transcript is residue whose durable record is the display tombstone plus the ledger delete record. `0` = off |
 | `retention.logFileDays` | number | `14` | Log files whose socket no longer exists; the newest file of a rotated group and every log of a live socket are kept; `0` disables |
 | `retention.tmpRlmDirHours` | number | `24` | Empty `prime-agent-rlm-*` temp directories; `0` disables. The daemon's own `prime-agent-<uid>` socket directory is never a candidate |
@@ -801,15 +801,19 @@ contains a child transcript is kept between days 7 and 30 with the reason
 
 The windows above only reach sessions whose deletion is on record; a session that is never explicitly
 deleted would otherwise keep its artifact directory forever. `retention.sessionArtifactsMaxBytes`
-(default 8 GiB) is the backstop: while the whole session-artifact tree fits under the ceiling the
-`artifact-total-cap` class does nothing, and over the ceiling it reclaims the coldest directories
-oldest-first until the tree fits. Byte pressure never overrides liveness: a directory whose session is
-resident, leased, or ledger-live, one with a live kernel-snapshot reference or an unreadable reference
-state, one holding `scheduled-jobs.json` (pending cron work), one holding another session's live
-transcript, and anything written within `retention.sessionArtifactsCapMinAgeDays` (default 7) are all
-kept, each with its reason in the sweep report. A reclaimed session keeps its transcript in
-`sessions/`, so it still resumes: the artifact directory is recreated on demand and the Python kernel
-restarts empty (a missing snapshot is already the fresh-start path). One directory larger than
+(default 8 GiB) is the backstop: while the reclaimable kernel snapshot payloads fit under the ceiling
+the `artifact-total-cap` class does nothing, and over the ceiling it reclaims `kernel-state.dill`
+payloads largest-first until the counted bytes fit. The reclaim unit is the snapshot file, never the
+directory: the session's harness memory (`harness/`), pasted images, semantic edges, cron jobs, and
+nested transcripts are never this class's to take, so a reclaimed session loses only its kernel
+namespace - the transcript in `sessions/` stays, the memory stays, and the Python kernel restarts
+empty (a missing snapshot is already the fresh-start path). Only reclaimable bytes count toward the
+ceiling: a kept session's payload, the irreplaceable rest of an eligible session's directory, and
+anything written within `retention.sessionArtifactsCapMinAgeDays` (default 7) cannot push the tree
+over it, and a nested `session-artifacts/` root counts exactly once. Byte pressure never overrides
+liveness: a session that is resident, leased, or ledger-live, one with a live kernel-snapshot
+reference or an unreadable reference state, and one holding `scheduled-jobs.json` (pending cron
+work) are all kept, each with its reason in the sweep report. One snapshot larger than
 `retention.maxDeleteBytesPerSweep` is skipped with a `cap-hit` reason naming the knob to raise rather
 than wedging the class.
 
@@ -819,8 +823,9 @@ from one root but present in another (a sub-agent's transcript lives under
 `<parentArtifactDir>/sub-xxxxxxxx/`, not in `sessions/`), a lease record that cannot be parsed, and a
 kernel snapshot whose reference state is unreadable are all reported as `unverifiable:` or
 `in-use:`/`reference:` reasons in the report, never treated as reclaimable. The global harness memory
-library (`<agentDir>/harness/`) is not in any sweep class: only the per-session copy inside an artifact
-directory leaves, and only as part of removing that whole directory.
+library (`<agentDir>/harness/`) is not in any sweep class, and neither is a session's local harness
+store: the residue and empty classes take a whole artifact directory only when the session is
+provably gone, and the total-byte ceiling never takes more than the kernel snapshot file.
 
 ```json
 {

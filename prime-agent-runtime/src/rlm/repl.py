@@ -25,6 +25,7 @@ import time
 import traceback
 import types
 import uuid
+from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -119,6 +120,10 @@ _DISPLAY_PAYLOAD_CAP = 16 * 1024 * 1024
 
 # Names the session bootstrap re-creates on every start; never snapshotted.
 _ALWAYS_SKIP = {"rlm", "mcp", "bash", "asyncio", "In", "Out", "get_ipython", "exit", "quit", "open"}
+# Leading-underscore names the host bootstrap owns (`_prime_agent_*` helpers,
+# `_PrimeAgent*` wrapper classes): never persisted, and never reported either -
+# the bootstrap re-binds them on every start, so a "not saved" entry is noise.
+_INTERNAL_NAME_PREFIXES = ("_prime_agent_", "_PrimeAgent", "_PRIME_AGENT_")
 # IPython-injected names that may appear in a snapshot payload; never restored.
 _RESTORE_SKIP = {"In", "Out", "get_ipython"}
 
@@ -132,6 +137,12 @@ _serve_task: asyncio.Task[Any] | None = None
 _current_cell: contextvars.ContextVar[str | None] = contextvars.ContextVar("_current_cell", default=None)
 _active: dict[str, Any] = {"task": None, "rid": None, "interrupted": False}
 _cell_counter = 0
+# Every cell's source is registered in linecache under <cell-N>; finished cells keep
+# their entries so an error raised later by a function an earlier cell defined still
+# shows its source line (and inspect.getsource works). The backlog is bounded so a
+# long session does not pin every cell's source: past the keep limit the oldest go.
+_CELL_LINECACHE_KEEP = 200
+_cell_linecache_names: deque[str] = deque()
 # Namespace-mutation epochs for snapshot dirty-tracking: any executed cell or applied
 # restore invalidates the replay shortcut (see _replayable_snapshot).
 _restore_counter = 0
@@ -290,6 +301,9 @@ class _StreamCoalescer:
 
 
 _stream_coalescer = _StreamCoalescer()
+# True only in a forked child after _reset_after_fork_in_child: _TaggedWriter then
+# writes straight to its captured pipe fd instead of the (child-dead) coalescer.
+_fork_detached = False
 
 
 def emit(data: dict[str, Any]) -> None:
@@ -576,6 +590,12 @@ class _TaggedWriter(io.TextIOBase):
     and .buffer expose the captured pipe so subprocesses, C-level writers, and
     sys.stdout.buffer.write() keep working through the raw channel
     (null-attributed).
+
+    A forked child detaches from the protocol (_reset_after_fork_in_child), but a
+    reference to a pre-fork writer still points here; the child's fresh coalescer
+    has no flush thread and its _send is a no-op, so appending would swallow the
+    text. Detached writers therefore write straight to the captured pipe fd, whose
+    bytes the parent's pumps still ship as unattributed stream events.
     """
 
     def __init__(self, stream: str, fallback_fd: int) -> None:
@@ -587,15 +607,27 @@ class _TaggedWriter(io.TextIOBase):
         if not isinstance(text, str):
             raise TypeError(f"write() argument must be str, not {type(text).__name__}")
         if text:
-            # Buffered and coalesced into one frame per short window (see
-            # _StreamCoalescer); the id is captured here, at write time. The
-            # coalescer bounds every frame at _STREAM_FRAME_MAX_CHARS (64 KiB,
-            # upstream #2423's cap) and flushes on threshold, so a burst cannot
-            # produce an unbounded single stream frame.
-            _stream_coalescer.append(self._stream, _current_cell.get(), text)
+            if _fork_detached:
+                view = memoryview(text.encode("utf-8", "replace"))
+                try:
+                    # Pipe writes can be short for payloads above the pipe capacity.
+                    while view:
+                        view = view[os.write(self._fallback_fd, view) :]
+                except OSError:
+                    # A dead pipe in a detached child must not raise into its code.
+                    pass
+            else:
+                # Buffered and coalesced into one frame per short window (see
+                # _StreamCoalescer); the id is captured here, at write time. The
+                # coalescer bounds every frame at _STREAM_FRAME_MAX_CHARS (64 KiB,
+                # upstream #2423's cap) and flushes on threshold, so a burst cannot
+                # produce an unbounded single stream frame.
+                _stream_coalescer.append(self._stream, _current_cell.get(), text)
         return len(text)
 
     def flush(self) -> None:
+        if _fork_detached:
+            return  # fd writes are unbuffered; nothing is held anywhere
         _stream_coalescer.flush(self._stream)
 
     def fileno(self) -> int:
@@ -922,10 +954,11 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
         effects.discard_cell(cell_id)
         _current_cell.reset(token)
         _reset_current_cell(bash_token)
-        # One linecache entry per cell would otherwise grow with the session's total
-        # cell source. The cell's own errors were formatted before its done frame, so
-        # only a stale exception object printed by a later cell loses its source lines.
-        linecache.cache.pop(filename, None)
+        # The cell's own errors were formatted before its done frame; its entry stays for
+        # later tracebacks that reference it, and the bounded backlog evicts the oldest.
+        _cell_linecache_names.append(filename)
+        while len(_cell_linecache_names) > _CELL_LINECACHE_KEEP:
+            linecache.cache.pop(_cell_linecache_names.popleft(), None)
 
 
 def _drain_output() -> None:
@@ -1255,9 +1288,14 @@ def _snapshot_state(
             # persists such a name, but a user who bound one may still expect it back
             # after a restart, so report it like every other skipped name instead of
             # dropping it silently. Dunder names (__name__ and friends) are module
-            # bookkeeping present in every namespace, and the _ALWAYS_SKIP names are
-            # kernel-installed helpers; reporting either would be noise, not signal.
-            if name.startswith("_") and not (name.startswith("__") and name.endswith("__")):
+            # bookkeeping present in every namespace, the _ALWAYS_SKIP names are
+            # kernel-installed helpers, and the _INTERNAL_NAME_PREFIXES names are the
+            # host bootstrap's own; reporting any of those would be noise, not signal.
+            if (
+                name.startswith("_")
+                and not (name.startswith("__") and name.endswith("__"))
+                and not name.startswith(_INTERNAL_NAME_PREFIXES)
+            ):
                 skipped.append(
                     {
                         "name": name,
@@ -2295,12 +2333,14 @@ def _reset_after_fork_in_child() -> None:
     protocol fd is forgotten (`_send` becomes a no-op), the coalescer and the
     write lock are rebuilt per-process, and sys.stdout/sys.stderr fall back to
     raw writers on the captured pipe fds, whose bytes the parent's pumps still
-    ship as unattributed (id:null) stream events.
+    ship as unattributed (id:null) stream events. A stale reference to a pre-fork
+    writer lands in the same place: `_fork_detached` routes its writes to the fd.
     """
-    global _protocol_fd, _write_lock, _stream_coalescer
+    global _protocol_fd, _write_lock, _stream_coalescer, _fork_detached
     _protocol_fd = -1
     _write_lock = threading.Lock()
     _stream_coalescer = _StreamCoalescer()
+    _fork_detached = True
     for name in ("stdout", "stderr"):
         writer = getattr(sys, name, None)
         if isinstance(writer, _TaggedWriter):

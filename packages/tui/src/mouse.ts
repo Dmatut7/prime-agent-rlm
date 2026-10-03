@@ -94,6 +94,17 @@ export function parseMouseHover(sequence: string): MouseEvent | null {
 	return event !== null && isMouseHover(event) ? event : null;
 }
 
+/**
+ * Whether the event is a legacy X10 release: button code 3 with no motion bit.
+ * X10 releases carry no button identity, so a consumer that keys on the
+ * released button (click and hyperlink dispatch) must map the event back to the
+ * last pressed button itself. SGR releases always carry their own button, so
+ * code 3 without motion only ever comes from the legacy encoding.
+ */
+export function isLegacyMouseRelease(event: MouseEvent): boolean {
+	return !event.press && !event.motion && event.button === MOUSE_BUTTON_NONE;
+}
+
 export function isWheelUp(event: MouseEvent): boolean {
 	return event.press && event.button === MOUSE_WHEEL_UP;
 }

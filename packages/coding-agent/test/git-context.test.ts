@@ -11,7 +11,7 @@ function git(cwd: string, ...args: string[]): string {
 
 function initRepo(dir: string): void {
 	git(dir, "init", "-q", "-b", "main");
-	git(dir, "config", "user.email", "t@t.co");
+	git(dir, "config", "user.email", "t@example.com");
 	git(dir, "config", "user.name", "t");
 }
 
@@ -20,6 +20,23 @@ function commit(dir: string, message: string): string {
 	git(dir, "add", "-A");
 	git(dir, "commit", "-q", "-m", message);
 	return git(dir, "rev-parse", "HEAD");
+}
+
+let reftableSupport: boolean | undefined;
+/** Whether the git on this machine can init a reftable repo (git >= 2.45). */
+function supportsReftable(): boolean {
+	if (reftableSupport === undefined) {
+		const probe = mkdtempSync(join(tmpdir(), "git-reftable-probe-"));
+		try {
+			execFileSync("git", ["init", "-q", "--ref-format=reftable", "repo"], { cwd: probe, stdio: "ignore" });
+			reftableSupport = true;
+		} catch {
+			reftableSupport = false;
+		} finally {
+			rmSync(probe, { recursive: true, force: true });
+		}
+	}
+	return reftableSupport;
 }
 
 describe("captureGitContext", () => {
@@ -121,6 +138,38 @@ describe("captureGitContext", () => {
 		vi.stubEnv("GIT_DIR", join(dir, "does-not-exist"));
 
 		expect(captureGitContext(dir)).toBeNull();
+	});
+
+	it("walks past an embedded empty .git directory like git discovery does", () => {
+		initRepo(dir);
+		const sha = commit(dir, "init");
+		const sub = join(dir, "sub");
+		mkdirSync(join(sub, ".git"), { recursive: true });
+
+		expect(captureGitContext(sub)).toEqual({ branch: "main", commit: sha });
+	});
+
+	it("walks past a .git directory that has HEAD but no object store", () => {
+		initRepo(dir);
+		const sha = commit(dir, "init");
+		const sub = join(dir, "sub");
+		mkdirSync(join(sub, ".git"), { recursive: true });
+		writeFileSync(join(sub, ".git", "HEAD"), "ref: refs/heads/main\n");
+
+		expect(captureGitContext(sub)).toEqual({ branch: "main", commit: sha });
+	});
+
+	it.skipIf(!supportsReftable())("reads a reftable repository through the git CLI fallback", () => {
+		const repo = join(dir, "reftable-repo");
+		mkdirSync(repo);
+		git(repo, "init", "-q", "--ref-format=reftable", "-b", "main");
+		git(repo, "config", "user.email", "t@example.com");
+		git(repo, "config", "user.name", "t");
+		const sha = commit(repo, "init");
+
+		// The HEAD file in a reftable repo is a placeholder ("refs/heads/.invalid");
+		// only the git CLI reads the real symref out of the reftable.
+		expect(captureGitContext(repo)).toEqual({ branch: "main", commit: sha });
 	});
 });
 

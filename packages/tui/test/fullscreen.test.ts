@@ -362,6 +362,69 @@ describe("TUI fullscreen mode", () => {
 		tui.stop();
 	});
 
+	it("a prepended page keeps the paused window on its rows - no snap to the bottom, no fake new-content", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput(WHEEL_UP);
+		await terminal.waitForRender();
+		const before = tui.getScrollInfo();
+		assert.strictEqual(before?.following, false);
+		assert.strictEqual(before?.unseenBelow, 0);
+
+		// A backfill page lands ABOVE the window (the slim-attach "load earlier" path).
+		chat.lines = [...lines(12, "Older"), ...chat.lines];
+		tui.noteTranscriptPrepend(12);
+		await terminal.waitForRender();
+
+		const info = tui.getScrollInfo();
+		assert.strictEqual(info?.following, false, "a paused view never snaps back to following");
+		assert.strictEqual(
+			info?.linesAbove,
+			(before?.linesAbove ?? 0) + 12,
+			"the window keeps the rows it showed before the page landed",
+		);
+		assert.strictEqual(info?.unseenBelow, 0, "history inserted above the window is not new content");
+		assert.ok(!terminal.getViewport().join("\n").includes("新内容"));
+		tui.stop();
+	});
+
+	it("a prepend under a following window leaves the tail glued to the bottom", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+		assert.strictEqual(tui.getScrollInfo()?.following, true);
+
+		chat.lines = [...lines(12, "Older"), ...chat.lines];
+		tui.noteTranscriptPrepend(12);
+		await terminal.waitForRender();
+
+		const info = tui.getScrollInfo();
+		assert.strictEqual(info?.following, true);
+		assert.strictEqual(info?.unseenBelow, 0);
+		assert.strictEqual(info?.linesBelow, 0);
+		tui.stop();
+	});
+
+	it("counts only rows appended below when a prepend lands in the same frame", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput(WHEEL_UP);
+		await terminal.waitForRender();
+
+		chat.lines = [...lines(12, "Older"), ...chat.lines, ...lines(5, "New")];
+		tui.noteTranscriptPrepend(12);
+		await terminal.waitForRender();
+
+		const info = tui.getScrollInfo();
+		assert.strictEqual(info?.following, false);
+		assert.strictEqual(info?.unseenBelow, 5, "only the rows appended below the window count as new");
+		tui.stop();
+	});
+
 	it("clears the new-content flag when following resumes", async () => {
 		const { terminal, tui, chat, dock } = setup(lines(20), 80);
 		tui.enterFullscreen({ scroll: [chat], dock });
@@ -1420,6 +1483,40 @@ describe("TUI fullscreen mode", () => {
 
 		terminal.sendInput("\x1b[<0;2;1M");
 		terminal.sendInput("\x1b[<0;2;1m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(opened, ["https://example.com/docs"]);
+
+		tui.stop();
+	});
+
+	// X10 encoding: ESC [ M then three bytes (32 + button/x/y). A release reports
+	// button code 3 regardless of which button was released.
+	const legacyMouse = (button: number, x: number, y: number) =>
+		`\x1b[M${String.fromCharCode(32 + button)}${String.fromCharCode(32 + x)}${String.fromCharCode(32 + y)}`;
+
+	it("opens a hyperlink on a legacy X10 click (release carries no button)", async () => {
+		const transcript = lines(20);
+		transcript[12] = "see \x1b]8;;https://example.com/docs\x1b\\\x1b[36mdocs\x1b[39m\x1b]8;;\x1b\\ here";
+		const { terminal, tui, chat, dock } = setup(transcript);
+		const opened: string[] = [];
+		tui.onOpenUrl = (url) => opened.push(url);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput(legacyMouse(0, 6, 1));
+		terminal.sendInput(legacyMouse(3, 6, 1));
+		await terminal.waitForRender();
+		assert.deepStrictEqual(opened, ["https://example.com/docs"]);
+
+		// A right-button click still does not open: the release maps back to the
+		// button that was actually pressed.
+		terminal.sendInput(legacyMouse(2, 6, 1));
+		terminal.sendInput(legacyMouse(3, 6, 1));
+		await terminal.waitForRender();
+		assert.deepStrictEqual(opened, ["https://example.com/docs"]);
+
+		// A release with no preceding press stays button-less and inert.
+		terminal.sendInput(legacyMouse(3, 6, 1));
 		await terminal.waitForRender();
 		assert.deepStrictEqual(opened, ["https://example.com/docs"]);
 

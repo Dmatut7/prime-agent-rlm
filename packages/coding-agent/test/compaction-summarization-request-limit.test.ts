@@ -502,3 +502,109 @@ describe("summarization request stays inside the provider's real input limit", (
 		expect(recorded[0].tokens).toBeLessThanOrEqual(CONTEXT_WINDOW);
 	});
 });
+
+describe("an empty or truncated summarization result is a failure, not a summary", () => {
+	beforeEach(() => {
+		completeSimpleMock.mockReset();
+	});
+
+	function lengthResponse(): AssistantMessage {
+		// Cut at the output cap: the text is a prefix of the intended summary.
+		return { ...okResponse(), stopReason: "length" };
+	}
+
+	function emptyResponse(): AssistantMessage {
+		// A clean stop with nothing in it (a thinking-only reply, or no content at all).
+		return { ...okResponse(), content: [] };
+	}
+
+	it("generateSummary rejects a response cut off at the output cap", async () => {
+		completeSimpleMock.mockResolvedValue(lengthResponse());
+		await expect(
+			generateSummary(
+				[bigUserMessage("only ")],
+				createModel({ contextWindow: CONTEXT_WINDOW }),
+				RESERVE_TOKENS,
+				"test-key",
+			),
+		).rejects.toThrow('stopReason "length"');
+	});
+
+	it("generateSummary rejects a clean stop that carries no text", async () => {
+		completeSimpleMock.mockResolvedValue(emptyResponse());
+		await expect(
+			generateSummary(
+				[bigUserMessage("only ")],
+				createModel({ contextWindow: CONTEXT_WINDOW }),
+				RESERVE_TOKENS,
+				"test-key",
+			),
+		).rejects.toThrow("no text");
+	});
+
+	it("compact() retries an unusable result on a smaller slice instead of saving it", async () => {
+		let calls = 0;
+		completeSimpleMock.mockImplementation(async () => {
+			calls += 1;
+			return calls === 1 ? lengthResponse() : okResponse();
+		});
+		const messages: AgentMessage[] = [];
+		for (let i = 0; i < 40; i++) messages.push(bigUserMessage(`m${i} `));
+
+		const result = await compact(
+			createPreparation(messages),
+			createModel({ contextWindow: CONTEXT_WINDOW }),
+			"test-key",
+		);
+
+		expect(result.summary).toContain("Summarized");
+		expect(calls).toBe(2);
+	});
+
+	it("compact() fails when the summarizer keeps returning nothing usable", async () => {
+		completeSimpleMock.mockResolvedValue(emptyResponse());
+		const messages: AgentMessage[] = [];
+		for (let i = 0; i < 40; i++) messages.push(bigUserMessage(`m${i} `));
+
+		await expect(
+			compact(createPreparation(messages), createModel({ contextWindow: CONTEXT_WINDOW }), "test-key"),
+		).rejects.toThrow("no text");
+		// One attempt plus the bounded retry budget, never an unbounded loop and never a
+		// saved empty summary.
+		expect(completeSimpleMock).toHaveBeenCalledTimes(3);
+	});
+
+	it("a branch summary cut at the output cap is an error, not a saved fragment", async () => {
+		// completeWithProviderRetry deliberately never resends a budget signal, so the
+		// guard in generateBranchSummary is the only thing between a truncated narrative
+		// and a stored branch summary.
+		completeSimpleMock.mockResolvedValue(lengthResponse());
+		const result = await generateBranchSummary(branchEntries(4, false), {
+			model: createModel({ contextWindow: CONTEXT_WINDOW }),
+			apiKey: "test-key",
+			signal: new AbortController().signal,
+			reserveTokens: RESERVE_TOKENS,
+			retry: { enabled: false, maxRetries: 0, baseDelayMs: 0, maxRetryDelayMs: 0 },
+		});
+		expect(result.summary).toBeUndefined();
+		expect(result.error).toContain('stopReason "length"');
+	});
+
+	it("a branch summary whose exhausted retry chain stays empty is an error", async () => {
+		// completeWithProviderRetry resends a contentless clean stop, but the chain has a
+		// cap; the last empty response must surface as a failure - previously the literal
+		// text "No summary generated" was stored as the branch summary.
+		completeSimpleMock.mockResolvedValue(emptyResponse());
+		const result = await generateBranchSummary(branchEntries(4, false), {
+			model: createModel({ contextWindow: CONTEXT_WINDOW }),
+			apiKey: "test-key",
+			signal: new AbortController().signal,
+			reserveTokens: RESERVE_TOKENS,
+			retry: { enabled: true, maxRetries: 1, baseDelayMs: 0, maxRetryDelayMs: 0 },
+		});
+		expect(result.summary).toBeUndefined();
+		expect(result.error).toContain("no text");
+		// One attempt plus the one configured retry.
+		expect(completeSimpleMock).toHaveBeenCalledTimes(2);
+	});
+});

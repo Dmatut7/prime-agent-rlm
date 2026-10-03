@@ -10,6 +10,7 @@ import {
 	findUnconsumedWorkerRecoveryMarker,
 	WORKER_RECOVERY_MARKER_CUSTOM_TYPE,
 	WORKER_RECOVERY_RESUME_PROMPT,
+	workerRecoveryResumeVerdict,
 } from "../src/modes/daemon/worker-recovery-resume.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -33,14 +34,20 @@ function entryBase(): { id: string; parentId: string | null; timestamp: string }
 	};
 }
 
-function markerEntry(): CustomMessageEntry {
+function markerEntry(options?: { queuedInputs?: string[]; timestamp?: string }): CustomMessageEntry {
+	const base = entryBase();
 	return {
-		...entryBase(),
+		...base,
+		...(options?.timestamp === undefined ? {} : { timestamp: options.timestamp }),
 		type: "custom_message",
 		customType: WORKER_RECOVERY_MARKER_CUSTOM_TYPE,
 		content: "<prime_agent_worker_interrupted>…</prime_agent_worker_interrupted>",
 		display: false,
-		details: { activeSessionId: "dead-worker-session", operations: ["turn_end"] },
+		details: {
+			activeSessionId: "dead-worker-session",
+			operations: ["turn_end"],
+			...(options?.queuedInputs === undefined ? {} : { queuedInputs: options.queuedInputs }),
+		},
 	};
 }
 
@@ -54,12 +61,17 @@ function customMessageEntry(customType: string): CustomMessageEntry {
 	};
 }
 
-function messageEntry(role: "user" | "assistant"): SessionMessageEntry {
+function messageEntry(role: "user" | "assistant", text = "text"): SessionMessageEntry {
 	return {
 		...entryBase(),
 		type: "message",
-		message: { role, content: "text", timestamp: Date.now() } as SessionMessageEntry["message"],
+		message: { role, content: text, timestamp: Date.now() } as SessionMessageEntry["message"],
 	};
+}
+
+/** The resume prompt as it lands in the transcript: a user message carrying it. */
+function resumePromptEntry(): SessionMessageEntry {
+	return messageEntry("user", WORKER_RECOVERY_RESUME_PROMPT);
 }
 
 function stateEntry(): SessionEntry {
@@ -216,6 +228,133 @@ describe("daemon worker-recovery resume on bind", () => {
 		} as unknown as AgentSession;
 
 		internals.resumeWorkerInterruptedSession(makeBoundState("active-3", session));
+
+		expect(followUp).not.toHaveBeenCalled();
+	});
+});
+
+describe("workerRecoveryResumeVerdict: the crash loop guard", () => {
+	it("resumes a fresh interruption and carries the marker's queued inputs", () => {
+		const marker = markerEntry({ queuedInputs: ["继续把测试修完", "然后看一眼 lint"] });
+		const verdict = workerRecoveryResumeVerdict([messageEntry("user"), marker]);
+		expect(verdict.kind).toBe("resume");
+		if (verdict.kind !== "resume") throw new Error("expected resume");
+		expect(verdict.marker).toBe(marker);
+		expect(verdict.queuedInputs).toEqual(["继续把测试修完", "然后看一眼 lint"]);
+	});
+
+	it("skips when there is nothing to answer", () => {
+		expect(workerRecoveryResumeVerdict([messageEntry("user")]).kind).toBe("skip");
+		expect(workerRecoveryResumeVerdict([markerEntry(), messageEntry("user")]).kind).toBe("skip");
+	});
+
+	it("one previous auto-resume still allows the next", () => {
+		const branch = [markerEntry(), resumePromptEntry(), messageEntry("assistant"), markerEntry()];
+		expect(workerRecoveryResumeVerdict(branch).kind).toBe("resume");
+	});
+
+	it("stops auto-resuming after two consecutive crash-resume cycles", () => {
+		const branch = [
+			markerEntry(),
+			resumePromptEntry(),
+			messageEntry("assistant"),
+			markerEntry(),
+			resumePromptEntry(),
+			messageEntry("assistant"),
+			markerEntry(),
+		];
+		const verdict = workerRecoveryResumeVerdict(branch);
+		expect(verdict.kind).toBe("skip");
+		if (verdict.kind !== "skip") throw new Error("expected skip");
+		expect(verdict.reason).toBe("resume-loop");
+	});
+
+	it("a real user message resets the consecutive count", () => {
+		const branch = [
+			markerEntry(),
+			resumePromptEntry(),
+			markerEntry(),
+			resumePromptEntry(),
+			messageEntry("user", "别管了，换个方向"),
+			markerEntry(),
+		];
+		expect(workerRecoveryResumeVerdict(branch).kind).toBe("resume");
+	});
+
+	it("replayed queued inputs do not reset the count (they are the resume's own cargo)", () => {
+		const branch = [
+			markerEntry({ queuedInputs: ["排队的活"] }),
+			messageEntry("user", "排队的活"),
+			resumePromptEntry(),
+			markerEntry({ queuedInputs: ["排队的活"] }),
+			messageEntry("user", "排队的活"),
+			resumePromptEntry(),
+			markerEntry(),
+		];
+		const verdict = workerRecoveryResumeVerdict(branch);
+		expect(verdict.kind).toBe("skip");
+		if (verdict.kind !== "skip") throw new Error("expected skip");
+		expect(verdict.reason).toBe("resume-loop");
+	});
+
+	it("does not auto-resume an interruption older than a day", () => {
+		const stale = markerEntry({ timestamp: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString() });
+		const verdict = workerRecoveryResumeVerdict([messageEntry("user"), stale]);
+		expect(verdict.kind).toBe("skip");
+		if (verdict.kind !== "skip") throw new Error("expected skip");
+		expect(verdict.reason).toBe("stale");
+	});
+});
+
+describe("daemon worker-recovery resume on bind: replay and loop guard", () => {
+	function makeDaemon(): DaemonInternals {
+		const daemon = new AgentDaemon("/tmp/prime-agent-worker-recovery-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-worker-recovery-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		return daemon as unknown as DaemonInternals;
+	}
+
+	it("replays the marker's queued inputs before the resume prompt", async () => {
+		const internals = makeDaemon();
+		const followUp = vi.fn(async () => true);
+		const session = {
+			sessionManager: {
+				getBranch: () => [messageEntry("user"), markerEntry({ queuedInputs: ["先跑测试", "再修 lint"] })],
+			},
+			followUp,
+		} as unknown as AgentSession;
+
+		internals.resumeWorkerInterruptedSession(makeBoundState("active-r1", session));
+		await vi.waitFor(() => expect(followUp).toHaveBeenCalledTimes(3));
+
+		expect(followUp.mock.calls[0]).toEqual(["先跑测试", undefined, { resumeIfIdle: false }]);
+		expect(followUp.mock.calls[1]).toEqual(["再修 lint", undefined, { resumeIfIdle: false }]);
+		expect(followUp.mock.calls[2]).toEqual([WORKER_RECOVERY_RESUME_PROMPT, undefined, { resumeIfIdle: true }]);
+	});
+
+	it("does not auto-resume a session caught in a crash-resume loop", async () => {
+		const internals = makeDaemon();
+		const followUp = vi.fn(async () => true);
+		const session = {
+			sessionManager: {
+				getBranch: () => [
+					markerEntry(),
+					resumePromptEntry(),
+					messageEntry("assistant"),
+					markerEntry(),
+					resumePromptEntry(),
+					messageEntry("assistant"),
+					markerEntry(),
+				],
+			},
+			followUp,
+		} as unknown as AgentSession;
+
+		internals.resumeWorkerInterruptedSession(makeBoundState("active-r2", session));
+		await Promise.resolve();
 
 		expect(followUp).not.toHaveBeenCalled();
 	});

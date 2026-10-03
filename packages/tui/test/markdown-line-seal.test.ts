@@ -162,6 +162,51 @@ describe("markdown final-block line sealing identity", () => {
 		assertStreamedIdentity(doc, 72, 4);
 	});
 
+	it("code text ending in newlines keeps the trailing blank lines of a full render", () => {
+		// Indented code keeps its trailing newline in token.text and a fence keeps
+		// trailing blank lines; the sealed render must render every tail line, not
+		// only the growing one, or the streaming block is one blank line short.
+		const cases = [
+			"    indented one\n    indented two\n    indented three",
+			"```\ncode line\n\n\ntail",
+			"```\nline one\nline two\n```",
+		];
+		for (const doc of cases) {
+			assert.ok(doc.length > 0, "cases must not be empty");
+			assertStreamedIdentity(doc, 60, 1);
+		}
+	});
+
+	it("sealed code render matches the unsealed render for trailing newlines", () => {
+		const cases = ["    indented one\n    indented two\n", "```\ncode line\n\n\n", "```\nline one\nline two\n"];
+		for (const doc of cases) {
+			assert.ok(doc.length > 0, "cases must not be empty");
+			const streamed = new Markdown("", 1, 0, defaultMarkdownTheme);
+			for (let pos = 0; pos <= doc.length; pos++) {
+				const text = doc.slice(0, pos);
+				streamed.setText(text);
+				process.env.PI_MARKDOWN_LINE_SEAL = "0";
+				let expected: string;
+				try {
+					expected = new Markdown(text, 1, 0, defaultMarkdownTheme).render(60).join("\n");
+				} finally {
+					delete process.env.PI_MARKDOWN_LINE_SEAL;
+				}
+				assert.strictEqual(streamed.render(60).join("\n"), expected, `frame at ${pos} of ${JSON.stringify(doc)}`);
+			}
+		}
+	});
+
+	it("an unmatched backtick re-typing sealed emphasis falls back to a full render", () => {
+		// marked evaluates emphasis flanking on a codespan-masked copy of the whole
+		// paragraph, so a dangling tail backtick can un-type a `*...*` pair already
+		// sealed as italic without any token crossing the seal boundary.
+		assertStreamedIdentity("`zx``*e`*e* ghgh\nx`ghb x`x`*ghx``*e", 82, 1);
+		assertStreamedIdentity("`z``*ex`f*`b x`*y*cd *y*\nb x`x`*y*\na \n ", 70, 1);
+		assertStreamedIdentity("`*ef*``gh`z*y*\nx`b *y*`*e*y* b `\n \ncd cd ", 50, 1);
+		assertStreamedIdentity("b `*ex``f*`*y*gh\n x`*y** ``` gh", 86, 1);
+	});
+
 	it("narrow width stress on a mixed document", () => {
 		const doc = `${PROSE_LINE}\n\n- list item one\n- list item two\n\n${PROSE_LINE.slice(0, 90)}`;
 		assertStreamedIdentity(doc, 24, 3);

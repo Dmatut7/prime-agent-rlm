@@ -225,6 +225,7 @@ import {
 	isPersistedGoalState,
 	MAX_GOAL_CONTINUATIONS,
 	normalizeGoalState,
+	PERSISTENT_GOAL_MIN_CONTINUATION_INTERVAL_MS,
 	parseGoalPersistentFlag,
 	persistentGoalCompletionRejection,
 	validateGoalBudget,
@@ -294,6 +295,8 @@ import {
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	isSessionSlashCommandMessage,
+	type ModelChangeMessage,
+	type ModelChangeNoticeDetails,
 	PYTHON_SKILLS_UNAVAILABLE_CUSTOM_TYPE,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
@@ -946,6 +949,12 @@ export interface AgentSessionConfig {
 	 */
 	stallAbortSettleGraceMs?: number;
 	/**
+	 * Minimum wall-clock spacing between the automatic continuations of a
+	 * persistent goal. Defaults to PERSISTENT_GOAL_MIN_CONTINUATION_INTERVAL_MS;
+	 * exposed so tests can shrink the throttle instead of waiting it out.
+	 */
+	persistentGoalMinContinuationIntervalMs?: number;
+	/**
 	 * Timers/clock the stall watchdog runs on. Injectable so tests drive the warn/abort/deferral
 	 * cascade deterministically with a fake clock instead of real 50-100ms thresholds racing a
 	 * loaded runner; defaults to real setTimeout and Date.now. The thresholds themselves still
@@ -1465,6 +1474,14 @@ interface SessionContextLossDetails {
  * cannot actually shrink (e.g. a single tool result larger than the usable window).
  */
 const THRESHOLD_COMPACTION_RETRY_MIN_NEW_ENTRIES = 5;
+
+/**
+ * Failed runs of one model-requested compaction before the request is dropped
+ * with a visible outcome. Every failure also arms the branch-growth cooldown, so
+ * the next attempt waits for new material (or a model change) instead of burning
+ * a summarization call on the same failing context at every turn boundary.
+ */
+const REQUESTED_COMPACTION_MAX_FAILED_ATTEMPTS = 3;
 
 /**
  * How long a compaction may hold queued input before the session aborts it and lets
@@ -2106,7 +2123,7 @@ export class AgentSession {
 	 * Retry once the branch grows by a few entries or the model changes.
 	 */
 	private _thresholdCompactionCooldown: { branchEntryCount: number; modelKey: string } | undefined;
-	private _pendingRequestedCompaction: { customInstructions?: string } | undefined;
+	private _pendingRequestedCompaction: { customInstructions?: string; failedAttempts?: number } | undefined;
 	private _pendingRequestedRefine: { instructions?: string; global?: boolean } | undefined;
 
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -2256,6 +2273,16 @@ export class AgentSession {
 	private _userBashRunning = false;
 	private _userBashAbortRequested = false;
 	private _pendingBashMessages: BashExecutionMessage[] = [];
+	/**
+	 * Model-change notices recorded while a run is streaming. Pushed at the next
+	 * tool-batch boundary (turn_end) instead of mid-batch: an immediate push lands
+	 * between an assistant tool call and its tool result, and the next request
+	 * then pairs them wrong (the model re-runs the tool whose result it never
+	 * saw). The durable model_change ledger entry is still written at once; this
+	 * queue holds only the live-context notice. Same deferral shape as
+	 * _pendingBashMessages.
+	 */
+	private _pendingModelChangeMessages: ModelChangeMessage[] = [];
 
 	private _extensionRunner!: ExtensionRunner;
 	private _execEnvProvider?: () => Record<string, string | undefined> | undefined;
@@ -2399,6 +2426,13 @@ export class AgentSession {
 	_rlmQuiescenceWaitAborts = new Set<AbortController>();
 	_pendingRlmSubagentSessionNames = new Set<string>();
 	/**
+	 * Cap slots held by spawns between the live-children check and the run's
+	 * registration (the admission round-trip is async). Counted by the
+	 * `_rlmMaxConcurrentChildren` gate so parallel spawns cannot both pass it on
+	 * the same pre-admission count.
+	 */
+	readonly _pendingRlmChildAdmissions = new Set<string>();
+	/**
 	 * Every child session name this session has ever admitted or learned of
 	 * (deleted and idle-closed bearers included). The timeline keys a child's
 	 * dispatch row, lane and return rows by name, so a re-spawn wearing the exact
@@ -2471,6 +2505,12 @@ export class AgentSession {
 	private readonly _scheduledAutoRefineTimers = new Set<ReturnType<typeof setTimeout>>();
 	_stallWatchdog: StallWatchdog | undefined;
 	readonly _stallAbortSettleGraceMs: number | undefined;
+	/** Minimum spacing between a persistent goal's automatic continuations. */
+	private readonly _persistentGoalMinContinuationIntervalMs: number;
+	/** When the last goal continuation was handed out; the throttle's clock. */
+	private _goalContinuationLastAt: number | undefined;
+	/** The one pending wake a throttled persistent-goal continuation may hold. */
+	private _goalContinuationWakeTimer: ReturnType<typeof setTimeout> | undefined;
 	/** Injected watchdog timers; undefined means real timers (production). */
 	readonly _stallWatchdogTimers: StallWatchdogTimers | undefined;
 	/** Aggregates the kernel/host facts the watchdog's vouch samples (T1-3). */
@@ -2588,6 +2628,8 @@ export class AgentSession {
 		this._autoRefineReviewer = config.autoRefineReviewer;
 		this._serializedRefine = config.serializedRefine ?? false;
 		this._stallAbortSettleGraceMs = config.stallAbortSettleGraceMs;
+		this._persistentGoalMinContinuationIntervalMs =
+			config.persistentGoalMinContinuationIntervalMs ?? PERSISTENT_GOAL_MIN_CONTINUATION_INTERVAL_MS;
 		this._stallWatchdogTimers = config.stallWatchdogTimers;
 		this._stallKernelLivenessFacts = config.stallKernelLivenessFacts;
 		this._stallJournaledBashHandles = config.stallJournaledBashHandles;
@@ -4479,7 +4521,11 @@ export class AgentSession {
 
 	private async _shouldStopForThresholdCompaction(context: ShouldStopAfterTurnContext): Promise<boolean> {
 		this._continueAfterThresholdCompaction = false;
-		if (this._pendingRequestedCompaction === undefined && !(await this._thresholdCompactionNeeded(context))) {
+		this._dropSpentRequestedCompaction();
+		const requestedReady =
+			this._pendingRequestedCompaction !== undefined &&
+			!this._isThresholdCompactionCoolingDown(this._sessionContextWindow());
+		if (!requestedReady && !(await this._thresholdCompactionNeeded(context))) {
 			return false;
 		}
 
@@ -5638,6 +5684,13 @@ export class AgentSession {
 		if (this._goalContinuationBudgetExhausted()) {
 			return [];
 		}
+		// A persistent goal's continuation is its heartbeat: when turns end as fast
+		// as the provider answers, an unspaced heartbeat is a billing spin. The
+		// throttled continuation is not dropped - it wakes once the interval has
+		// elapsed - so the goal keeps going without the spin.
+		if (this._throttlePersistentGoalContinuation()) {
+			return [];
+		}
 		try {
 			this._ensureGoalRuntimeActive(context.context);
 			const nextGoal = {
@@ -5647,6 +5700,7 @@ export class AgentSession {
 				lastError: undefined,
 			};
 			this._setGoalState(nextGoal);
+			this._goalContinuationLastAt = Date.now();
 			return [createGoalContextMessage(this._goalState, "continuation")];
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -5656,6 +5710,68 @@ export class AgentSession {
 				// The continuation hook must not reject; listener failures should not crash the agent loop.
 			}
 			return [];
+		}
+	}
+
+	/**
+	 * Spacing for the persistent-goal heartbeat. Returns true (and schedules the
+	 * delayed wake) when the last continuation is younger than the minimum
+	 * interval; the first continuation after a goal starts is never throttled.
+	 */
+	private _throttlePersistentGoalContinuation(): boolean {
+		if (!this._goalState.persistent) return false;
+		const last = this._goalContinuationLastAt;
+		if (last === undefined) return false;
+		const remainingMs = this._persistentGoalMinContinuationIntervalMs - (Date.now() - last);
+		if (remainingMs <= 0) return false;
+		this._schedulePersistentGoalContinuationWake(remainingMs);
+		return true;
+	}
+
+	private _schedulePersistentGoalContinuationWake(delayMs: number): void {
+		if (this._goalContinuationWakeTimer !== undefined) return;
+		this._goalContinuationWakeTimer = setTimeout(() => {
+			this._goalContinuationWakeTimer = undefined;
+			if (this._disposed || this._disposing) return;
+			if (this._goalState.status !== "active" || !this._goalState.persistent) return;
+			this._queueThrottledGoalContinuation();
+		}, delayMs);
+		// A throttle wake must never hold a dying process open.
+		this._goalContinuationWakeTimer.unref?.();
+	}
+
+	/**
+	 * Queue the continuation a throttle held back, once the interval has elapsed.
+	 * Mirrors the threshold-compaction goal continuation: counted at queue time,
+	 * rolled back when admission rejects it.
+	 */
+	private _queueThrottledGoalContinuation(): void {
+		if (this._goalContinuationBudgetExhausted()) {
+			return;
+		}
+		const goalBeforeQueue = this._goalState;
+		try {
+			this._ensureGoalRuntimeActive();
+			this._goalContinuationLastAt = Date.now();
+			this._setGoalState({
+				...this._goalState,
+				continuationsUsed: this._goalState.continuationsUsed + 1,
+				lastReason: undefined,
+				lastError: undefined,
+			});
+			const goalMessage = createGoalContextMessage(this._goalState, "continuation");
+			const normalized = normalizeMessageContent(goalMessage.content);
+			this._admitSessionInput(
+				this._createPreparedTurnAction("followUp", normalized.text, normalized.images, {
+					message: goalMessage,
+					// The throttle fires while the session is idle: the wake must start the turn.
+					resumeIfIdle: true,
+				}),
+			);
+		} catch {
+			// Admission can race a pause or disposal; roll back the queue-time
+			// increment so the next natural stop re-queues and re-counts it.
+			this._setGoalState(goalBeforeQueue);
 		}
 	}
 
@@ -5844,8 +5960,12 @@ export class AgentSession {
 	/**
 	 * Owner-facing notice that the finish gate let a completion claim through
 	 * unverified: shown in the chat, kept in the transcript, never part of the
-	 * model's context (convertToLlm drops the type), and not pushed onto the live
-	 * context either - the same arrangement as _emitFallbackNotice. The literal
+	 * model's context (convertToLlm drops the type). It also joins the live
+	 * message list: the notice fires at the turn boundary (the tool batch is
+	 * closed, so no tool_use/tool_result pairing can break), and a session view
+	 * rebuilt from live state - switching away and back - must still show the
+	 * "treat the claimed completion as unverified" reminder instead of dropping
+	 * it with the transient event stream. The literal
 	 * customType mirrors the "finish_gate_released" record kind in self-recovery.ts
 	 * and the TUI's FINISH_GATE_RELEASED_CUSTOM_TYPE; the source pin in
 	 * test/finish-gate-notice.test.ts anchors all three. A "budget_exhausted"
@@ -5871,6 +5991,7 @@ export class AgentSession {
 		} catch (error) {
 			this._reportSessionPersistFailure(error);
 		}
+		this.agent.state.messages.push(message);
 		this._emit({ type: "message_start", message });
 		this._emit({ type: "message_end", message });
 	}
@@ -6085,6 +6206,18 @@ export class AgentSession {
 		this._recordFallbackActivity(event);
 		this._createRetryPromiseForAgentEnd(event);
 		this._routeImagesOnAgentEvent(event);
+		// A completed turn's tool batch is closed (turn_end follows the batch's
+		// tool results): deferred model-change notices land here, synchronously, so
+		// the loop's next request already carries them. Skipped on error/abort
+		// turns - the retry machinery expects the failed assistant message last.
+		if (
+			event.type === "turn_end" &&
+			event.message.role === "assistant" &&
+			event.message.stopReason !== "error" &&
+			event.message.stopReason !== "aborted"
+		) {
+			this._flushPendingModelChangeMessages();
+		}
 		if (event.type === "message_start" || event.type === "message_end") {
 			for (const action of this._actionStore.ownedActions()) {
 				if (
@@ -6576,6 +6709,16 @@ export class AgentSession {
 				});
 			}
 			if (compactionWillRetry && this._retryAttempt > 0) {
+				// The retry chain ends here: the compaction owns the continuation now
+				// (its scheduled continue waits on waitForRetry() first), so returning
+				// with the chain still open wedges the continuation on a promise
+				// nobody will resolve - isRetrying sticks and only Esc unwedges the
+				// session. Close it exactly like the empty-ladder recovery above:
+				// _finishActiveRetryWithFailure is idempotent (no-op without a live
+				// chain) and keeps the retry ledger honest (auto_retry_end
+				// success:false, backup restore, counter reset).
+				this._finishActiveRetryWithFailure(msg);
+				this._resolveRetry();
 				return;
 			}
 			this._finishActiveRetryWithFailure(msg);
@@ -7045,6 +7188,10 @@ export class AgentSession {
 		// a disposed session must not keep a live timer (or a fake-clock registration).
 		this._clearCompactionGateWatchdog();
 		this._clearRlmTerminalNoticeAbandonTimer();
+		if (this._goalContinuationWakeTimer !== undefined) {
+			clearTimeout(this._goalContinuationWakeTimer);
+			this._goalContinuationWakeTimer = undefined;
+		}
 		for (const run of this._unsettledRlmChildRuns) run.suppressTerminalNotice = true;
 		for (const controller of this._rlmQuiescenceWaitAborts) controller.abort();
 		this._sessionActionCommitDisposeAbortController.abort();
@@ -7523,6 +7670,9 @@ export class AgentSession {
 		if (policy.validateModelAndAuth) await this._validateCanStartAgentRun();
 		steps.afterValidation?.();
 		if (!policy.flushPendingBashBeforeValidation) this._flushPendingBashMessages();
+		// Deferred model-change notices ride the same barrier: a prompt about to
+		// commit must carry every switch recorded before it.
+		this._flushPendingModelChangeMessages();
 
 		if (policy.preTurnCompaction === "beforeModelSelection") await this._runPreTurnCompaction();
 		if (policy.awaitPendingModelSelection) {
@@ -11945,10 +12095,14 @@ export class AgentSession {
 		const serviceTier = this._getServiceTierForModelSwitch();
 		this.agent.state.model = model;
 		this._clearModelOverrideWhenIdle();
+		// The ledger entry lands even for a no-op re-selection: a restarted session
+		// reads "the owner picked this model" from it (a fallback episode the owner
+		// ended with an explicit pick must not rebuild). The model-facing notice is
+		// the only part a same-model call skips: there is no switch to learn.
 		this.sessionManager.appendModelChange(model.provider, model.id);
-		this.agent.state.messages.push(
-			createModelChangeMessage({ provider: model.provider, modelId: model.id }, Date.now()),
-		);
+		if (!modelsAreEqual(model, previousModel)) {
+			this._pushModelChangeNotice({ provider: model.provider, modelId: model.id });
+		}
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 
 		this.setThinkingLevel(thinkingLevel);
@@ -12018,10 +12172,7 @@ export class AgentSession {
 		this._fallback = undefined;
 		this.agent.state.model = next.model;
 		this._clearModelOverrideWhenIdle();
-		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
-		this.agent.state.messages.push(
-			createModelChangeMessage({ provider: next.model.provider, modelId: next.model.id }, Date.now()),
-		);
+		this._recordModelChangeForContext({ provider: next.model.provider, modelId: next.model.id });
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
 		this.setThinkingLevel(thinkingLevel);
@@ -12063,10 +12214,7 @@ export class AgentSession {
 		this._fallback = undefined;
 		this.agent.state.model = nextModel;
 		this._clearModelOverrideWhenIdle();
-		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
-		this.agent.state.messages.push(
-			createModelChangeMessage({ provider: nextModel.provider, modelId: nextModel.id }, Date.now()),
-		);
+		this._recordModelChangeForContext({ provider: nextModel.provider, modelId: nextModel.id });
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 
 		this.setThinkingLevel(thinkingLevel);
@@ -12989,6 +13137,9 @@ export class AgentSession {
 		}
 		const newEntries = this.sessionManager.getEntries();
 		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
+		// The rebuild synthesizes switch notices from the ledger; a still-pending
+		// deferred copy would land a second time on the next flush.
+		this._pendingModelChangeMessages = [];
 		this._mergeUnpersistedOutcomes(this.agent.state.messages);
 		this._restoreLateIpythonSentAgentMessages();
 
@@ -13362,6 +13513,9 @@ export class AgentSession {
 				} else {
 					this._postCompactionContinuationScheduled = false;
 					this._refreshAgentLoopRuntimeSettings();
+					// Idle between runs: deferred switch notices land ahead of the
+					// continuation's first request.
+					this._flushPendingModelChangeMessages();
 					continuation = this.agent.continue();
 				}
 			} finally {
@@ -14613,7 +14767,11 @@ export class AgentSession {
 			return await this._runAutoCompaction("overflow", true);
 		}
 
-		if (this._pendingRequestedCompaction !== undefined) {
+		this._dropSpentRequestedCompaction();
+		if (
+			this._pendingRequestedCompaction !== undefined &&
+			!this._isThresholdCompactionCoolingDown(this._sessionContextWindow())
+		) {
 			return await this._runAutoCompaction("requested", false);
 		}
 
@@ -14672,6 +14830,24 @@ export class AgentSession {
 			branchEntryCount: this.sessionManager.getBranch().length,
 			modelKey: this._currentModelKey(),
 		};
+	}
+
+	/**
+	 * The failure budget of a model-requested compaction: once the pending request
+	 * has failed REQUESTED_COMPACTION_MAX_FAILED_ATTEMPTS times, drop it instead of
+	 * restoring it for yet another turn boundary, and say so where the owner reads
+	 * it. A fresh compact.run request starts with a fresh budget.
+	 */
+	private _dropSpentRequestedCompaction(): void {
+		const pending = this._pendingRequestedCompaction;
+		if (pending === undefined) return;
+		if ((pending.failedAttempts ?? 0) < REQUESTED_COMPACTION_MAX_FAILED_ATTEMPTS) return;
+		this._pendingRequestedCompaction = undefined;
+		this._persistCompactionOutcome(
+			"requested",
+			"failed",
+			`Requested compaction gave up after ${pending.failedAttempts} failed attempts; the context is unchanged. The model may request it again, or run /compact by hand.`,
+		);
 	}
 
 	/**
@@ -14854,6 +15030,9 @@ export class AgentSession {
 			return { shrunk: false, reachedTarget: false };
 		}
 		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
+		// Same rebuild-vs-deferral rule as the compaction commit: the synthesized
+		// notices come from the ledger, so pending copies must not double them.
+		this._pendingModelChangeMessages = [];
 		this._mergeUnpersistedOutcomes(this.agent.state.messages);
 		this._restoreLateIpythonSentAgentMessages();
 		this._persistCompactionOutcome(reason, "failed", buildEmergencyShrinkNotice(plan, lastError));
@@ -14902,9 +15081,14 @@ export class AgentSession {
 		// used to drop it - the instructions never reached any summarizer and the
 		// request vanished. `??=` so a request issued while this compaction ran is
 		// not clobbered. A user abort stays consumed; a manual preemption hands
-		// the request to the manual run through the same restore.
-		const restorePendingRequest = () => {
-			if (pending !== undefined) this._pendingRequestedCompaction ??= pending;
+		// the request to the manual run through the same restore. Restores after a
+		// failure or skip count the spent attempt: the gate at the turn boundary
+		// drops the request once the budget is exhausted, so a deterministically
+		// failing summarizer cannot spin one attempt per turn forever.
+		const restorePendingRequest = (countFailure = true) => {
+			if (pending === undefined) return;
+			const failedAttempts = (pending.failedAttempts ?? 0) + (countFailure ? 1 : 0);
+			this._pendingRequestedCompaction ??= { customInstructions: pending.customInstructions, failedAttempts };
 		};
 
 		this._emit({ type: "compaction_start", reason, customInstructions });
@@ -14937,7 +15121,7 @@ export class AgentSession {
 					reason === "threshold" && shouldContinueAfterCompaction,
 					queuedAutonomousContinuationsForThisCompaction,
 				);
-				if (reason === "threshold") this._armThresholdCompactionCooldown();
+				if (reason !== "overflow") this._armThresholdCompactionCooldown();
 				await this._runEmergencyContextShrink(reason, detail);
 				restorePendingRequest();
 				resumeAfterFailure();
@@ -14969,10 +15153,21 @@ export class AgentSession {
 			const willContinueAfterCompaction = willRetry || shouldContinueAfterCompaction || hasQueuedMessages;
 
 			if (willRetry) {
+				// Strip the trailing run of failed attempts, not just the last one: a
+				// retry chain leaves one errored assistant per attempt on the branch,
+				// the compaction rebuild retains them all, and a single slice would
+				// leave an earlier failure last - which agent.continue() refuses
+				// ("Cannot continue from message role: assistant"), silently killing
+				// the scheduled continuation.
 				const messages = this.agent.state.messages;
-				const lastMsg = messages[messages.length - 1];
-				if (lastMsg?.role === "assistant" && (lastMsg as AssistantMessage).stopReason === "error") {
-					this.agent.state.messages = messages.slice(0, -1);
+				let stripCount = 0;
+				while (stripCount < messages.length) {
+					const tail = messages[messages.length - 1 - stripCount];
+					if (tail?.role !== "assistant" || (tail as AssistantMessage).stopReason !== "error") break;
+					stripCount += 1;
+				}
+				if (stripCount > 0) {
+					this.agent.state.messages = messages.slice(0, -stripCount);
 				}
 
 				this._schedulePostCompactionContinue(true);
@@ -15014,8 +15209,9 @@ export class AgentSession {
 				} else {
 					// The manual run that preempted this scope inherits the pending
 					// compact.run request: _compact captures it after this catch
-					// settles (it waits on this scope's operation first).
-					restorePendingRequest();
+					// settles (it waits on this scope's operation first). Not a
+					// failure: the restore does not spend the request's budget.
+					restorePendingRequest(false);
 				}
 				this._endCompactionUnsuccessfully(
 					reason,
@@ -15043,7 +15239,7 @@ export class AgentSession {
 						: `Auto-compaction skipped: ${errorMessage}`,
 					{ errorSeverity: "warning", customInstructions },
 				);
-				if (reason === "threshold") this._armThresholdCompactionCooldown();
+				if (reason !== "overflow") this._armThresholdCompactionCooldown();
 				// W29-B10: an over-threshold nothing-to-summarize skip is the idle
 				// spin - it repeats at every turn boundary and used to count as
 				// nothing, so the shrink valve never ran. Count it on its own streak
@@ -15051,9 +15247,9 @@ export class AgentSession {
 				// keepRecentTokens halving for the next attempt), and once the spin
 				// reaches the same count the failure valve uses, spend the shrink.
 				// A transient mid-loop skip stays benign: the next successful
-				// compaction clears the streak. Overflow and requested keep their
-				// own valves (the attempted-branch forced shrink and compact()'s
-				// skip tail); spending the valve here too would collide with them.
+				// compaction clears the streak. Overflow keeps its own valve (the
+				// attempted-branch forced shrink); a requested compaction's repeats
+				// are bounded by the request's failure budget and the cooldown.
 				if (reason === "threshold" && error.emergencyShrink) {
 					this._consecutiveCompactionSkips++;
 					if (this._consecutiveCompactionSkips >= COMPACTION_EMERGENCY_SHRINK_FAILURES) {
@@ -15077,7 +15273,7 @@ export class AgentSession {
 				}${recoveryHint}`,
 				{ customInstructions },
 			);
-			if (reason === "threshold") this._armThresholdCompactionCooldown();
+			if (reason !== "overflow") this._armThresholdCompactionCooldown();
 			// Last resort: a streak of failures leaves the context over the threshold with
 			// no way back down, so the valve drops the oldest non-summary context and says
 			// so loudly. Runs before resumeAfterFailure so the continuation it schedules
@@ -15939,6 +16135,19 @@ export class AgentSession {
 			// Display-only change tracking for the UI; always set, so the kernel never guesses.
 			[CHANGE_TRACKING_ENV_VAR]: this.settingsManager.getChangeTrackingEnabled() ? "1" : "0",
 		};
+		// The kernel's harness write path reads these three at write time; settings.json is the
+		// user-facing surface, so forward the resolved values. An explicit shell export wins over
+		// settings: the spawn merges process.env under this dict, so leaving the key out keeps the
+		// user's override live.
+		if (process.env.PRIME_AGENT_HARNESS_ENFORCE_INDEX_CAP === undefined) {
+			env.PRIME_AGENT_HARNESS_ENFORCE_INDEX_CAP = this.settingsManager.getHarnessEnforceIndexCap() ? "1" : "0";
+		}
+		if (process.env.PRIME_AGENT_HARNESS_INDEX_MAX_BYTES === undefined) {
+			env.PRIME_AGENT_HARNESS_INDEX_MAX_BYTES = String(this.settingsManager.getHarnessDigestIndexMaxBytes());
+		}
+		if (process.env.PRIME_AGENT_HARNESS_PATH_VOCABULARY === undefined) {
+			env.PRIME_AGENT_HARNESS_PATH_VOCABULARY = this.settingsManager.getHarnessPathVocabulary().join(",");
+		}
 		const rlmSessionDir = this._ensureRlmSessionDir();
 		if (rlmSessionDir) {
 			env.RLM_SESSION_DIR = rlmSessionDir;
@@ -17670,6 +17879,9 @@ export class AgentSession {
 		if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
 			this.agent.state.messages = messages.slice(0, -1);
 		}
+		// The run is idle between the failure and the scheduled continue: deferred
+		// switch notices land now, ahead of the retried request.
+		this._flushPendingModelChangeMessages();
 
 		this._retryAbortController = new AbortController();
 		try {
@@ -17733,6 +17945,8 @@ export class AgentSession {
 	 * run routed for images also rejects a text-only backup the same way: the
 	 * retry then stays on the routed model instead of serving the turn's
 	 * images to a model that would silently downgrade them to placeholders.
+	 * A backup whose window cannot hold the current context resolves to
+	 * undefined too: the retry would just fail again on the backup.
 	 */
 	private _resolveBackupModel(): Model<any> | undefined {
 		const reference = this.settingsManager.getProviderBackupModel();
@@ -17743,6 +17957,17 @@ export class AgentSession {
 		}
 		if (this.agent.modelOverride && !backupModel.input.includes("image")) {
 			return undefined;
+		}
+		// The backup takes the turn as-is, context included: a window that cannot
+		// hold it would fail the retry on the backup instead of on the primary.
+		// Same 0.9 headroom as the fallback chain; when the measured usage is
+		// unknowable (right after a compaction), price the context by content.
+		if (backupModel.contextWindow > 0) {
+			const contextTokens =
+				this.getContextUsage()?.tokens ?? estimateContextTokens(this.agent.state.messages).tokens;
+			if (contextTokens > backupModel.contextWindow * 0.9) {
+				return undefined;
+			}
 		}
 		return backupModel;
 	}
@@ -17778,10 +18003,7 @@ export class AgentSession {
 			};
 		}
 		// Session-log the switch so primary->backup->primary transitions stay debuggable.
-		this.sessionManager.appendModelChange(backupModel.provider, backupModel.id);
-		this.agent.state.messages.push(
-			createModelChangeMessage({ provider: backupModel.provider, modelId: backupModel.id }, Date.now()),
-		);
+		this._recordModelChangeForContext({ provider: backupModel.provider, modelId: backupModel.id });
 		this._startFreshRequestLadder();
 		this._backupModel = {
 			backup: backupModel,
@@ -18001,10 +18223,7 @@ export class AgentSession {
 		this._fallback.current = next;
 		this._fallback.switchedAtMs = Date.now();
 		this._fallback.tried.push(key(next));
-		this.sessionManager.appendModelChange(next.provider, next.id);
-		this.agent.state.messages.push(
-			createModelChangeMessage({ provider: next.provider, modelId: next.id }, Date.now()),
-		);
+		this._recordModelChangeForContext({ provider: next.provider, modelId: next.id });
 		const fromReference = key(from);
 		this._recordFallbackEntry({
 			kind: "switch",
@@ -18092,14 +18311,18 @@ export class AgentSession {
 		) {
 			return;
 		}
-		const candidate = this._lastServingModel(current) ?? this._registryDefaultModel(current);
+		// The configured image model only ever answered routed image turns: it is a
+		// cheap vision helper, not a session driver, and it is often the last model
+		// that served anything beside the rejected one. Moving the session - and a
+		// saved default - onto it would turn one rejection into a silent downgrade,
+		// so it is skipped in both resolution paths; when nothing else can serve,
+		// the selection stands for the owner to fix.
+		const imageRoute = this._imageRouteModel();
+		const candidate = this._lastServingModel(current, imageRoute) ?? this._registryDefaultModel(current, imageRoute);
 		if (!candidate) return;
 		this.agent.state.model = candidate;
 		this._clearModelOverrideWhenIdle();
-		this.sessionManager.appendModelChange(candidate.provider, candidate.id);
-		this.agent.state.messages.push(
-			createModelChangeMessage({ provider: candidate.provider, modelId: candidate.id }, Date.now()),
-		);
+		this._recordModelChangeForContext({ provider: candidate.provider, modelId: candidate.id });
 		// A saved default pointing at the rejected model is the same stale selection:
 		// move it with the session. A default naming another model is somebody else's
 		// choice and is left alone.
@@ -18129,21 +18352,35 @@ export class AgentSession {
 		this._trackModelSelectEmitError(this._queueModelSelectEmit(candidate, current, "restore"));
 	}
 
+	/** The configured image-route helper, resolved against what can serve right now. */
+	private _imageRouteModel(): Model<any> | undefined {
+		const reference = this.settingsManager.getImageModel();
+		if (!reference) return undefined;
+		return findExactModelReferenceMatch(reference, this._modelRegistry.getAvailable());
+	}
+
 	/** The last model that actually answered on this branch, when it can still serve. */
-	private _lastServingModel(exclude: Model<any>): Model<any> | undefined {
+	private _lastServingModel(exclude: Model<any>, alsoSkip?: Model<any>): Model<any> | undefined {
 		for (let index = this.agent.state.messages.length - 1; index >= 0; index -= 1) {
 			const message = this.agent.state.messages[index];
 			if (message.role !== "assistant") continue;
 			if (message.stopReason === "error" || message.stopReason === "aborted") continue;
 			const found = this._modelRegistry.find(message.provider, message.model);
-			if (found && !modelsAreEqual(found, exclude) && this._modelRegistry.hasConfiguredAuth(found)) return found;
+			if (!found || modelsAreEqual(found, exclude) || (alsoSkip !== undefined && modelsAreEqual(found, alsoSkip))) {
+				continue;
+			}
+			if (this._modelRegistry.hasConfiguredAuth(found)) return found;
 		}
 		return undefined;
 	}
 
 	/** The registry's preferred default among what can serve right now, never the rejected model. */
-	private _registryDefaultModel(exclude: Model<any>): Model<any> | undefined {
-		const available = this._modelRegistry.getAvailable().filter((model) => !modelsAreEqual(model, exclude));
+	private _registryDefaultModel(exclude: Model<any>, alsoSkip?: Model<any>): Model<any> | undefined {
+		const available = this._modelRegistry
+			.getAvailable()
+			.filter(
+				(model) => !modelsAreEqual(model, exclude) && (alsoSkip === undefined || !modelsAreEqual(model, alsoSkip)),
+			);
 		if (available.length === 0) return undefined;
 		return findPreferredDefaultModel(available) ?? available[0];
 	}
@@ -18483,10 +18720,7 @@ export class AgentSession {
 		}
 		this._startFreshRequestLadder();
 		const primary = `${fallback.primary.provider}/${fallback.primary.id}`;
-		this.sessionManager.appendModelChange(fallback.primary.provider, fallback.primary.id);
-		this.agent.state.messages.push(
-			createModelChangeMessage({ provider: fallback.primary.provider, modelId: fallback.primary.id }, Date.now()),
-		);
+		this._recordModelChangeForContext({ provider: fallback.primary.provider, modelId: fallback.primary.id });
 		this._recordDutyEvent({ kind: "model_restored", to: primary });
 		this._recordFallbackEntry({
 			kind: "return",
@@ -18690,10 +18924,7 @@ export class AgentSession {
 		// Restore the saved effective tier: reclamping from the current state
 		// would keep the tier the backup clamped it to.
 		this._clampServiceTierForModel(backup.serviceTier);
-		this.sessionManager.appendModelChange(backup.primary.provider, backup.primary.id);
-		this.agent.state.messages.push(
-			createModelChangeMessage({ provider: backup.primary.provider, modelId: backup.primary.id }, Date.now()),
-		);
+		this._recordModelChangeForContext({ provider: backup.primary.provider, modelId: backup.primary.id });
 		return `${backup.primary.provider}/${backup.primary.id}`;
 	}
 
@@ -18998,10 +19229,13 @@ export class AgentSession {
 	 * exactly the ordering corruption the deferral exists to prevent.
 	 */
 	private _flushPendingBashMessagesBeforeDispose(): void {
-		if (this._pendingBashMessages.length === 0) return;
+		if (this._pendingBashMessages.length === 0 && this._pendingModelChangeMessages.length === 0) return;
 		if (this.isStreaming) return;
 		try {
 			this._flushPendingBashMessages();
+			// Not persisted here on purpose: the durable model_change ledger entry
+			// was written at switch time and the rebuild synthesizes the notice.
+			this._flushPendingModelChangeMessages();
 		} catch (error) {
 			// Disposal stays best-effort; a failed transcript write is still reported
 			// through the regular persist-failure channel.
@@ -19023,6 +19257,42 @@ export class AgentSession {
 		}
 
 		this._pendingBashMessages = [];
+	}
+
+	/**
+	 * Record a model switch: the durable ledger entry lands at once (a restart
+	 * re-derives the notice from it), the live-context notice waits out an open
+	 * tool batch. Pushing mid-run would interleave the notice between an
+	 * assistant tool call and its tool result - the ordering corruption
+	 * _pendingBashMessages defers for the same reason.
+	 */
+	private _recordModelChangeForContext(details: ModelChangeNoticeDetails): void {
+		this.sessionManager.appendModelChange(details.provider, details.modelId);
+		this._pushModelChangeNotice(details);
+	}
+
+	/** The live-context half of a switch record; deferred while a tool batch is open. */
+	private _pushModelChangeNotice(details: ModelChangeNoticeDetails): void {
+		const message = createModelChangeMessage(details, Date.now());
+		if (this.isStreaming) {
+			this._pendingModelChangeMessages.push(message);
+			return;
+		}
+		this.agent.state.messages.push(message);
+	}
+
+	/**
+	 * Flush the deferred model-change notices. Safe points: a completed tool
+	 * batch (turn_end), the prompt-preparation barrier, and pre-continue call
+	 * sites - never mid-batch, and not on a failed/aborted turn, where the retry
+	 * machinery expects the failed assistant message to be the tail.
+	 */
+	private _flushPendingModelChangeMessages(): void {
+		if (this._pendingModelChangeMessages.length === 0) return;
+		for (const message of this._pendingModelChangeMessages) {
+			this.agent.state.messages.push(message);
+		}
+		this._pendingModelChangeMessages = [];
 	}
 
 	getRlmMaxDepthStatus(): RlmMaxDepthStatus {
@@ -19322,6 +19592,9 @@ export class AgentSession {
 
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
+			// The rebuild synthesizes switch notices from the ledger; a still-pending
+			// deferred copy would land a second time on the next flush.
+			this._pendingModelChangeMessages = [];
 			this._mergeUnpersistedOutcomes(this.agent.state.messages);
 			this._restoreLateIpythonSentAgentMessages();
 			// A context rebuild is a cold boundary: refresh the digest like resume does.

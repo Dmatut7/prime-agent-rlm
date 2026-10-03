@@ -233,17 +233,18 @@ describe("tool-not-found receipt", () => {
 });
 
 describe("tool-not-found breaker", () => {
-	it("warns at the Nth unknown-tool call and terminates the run at the Mth (defaults 3/5)", async () => {
+	it("warns at the Nth, grants one recovery turn at the Mth, and terminates on a relapse inside it (defaults 3/5)", async () => {
 		const steps = Array.from({ length: TOOL_NOT_FOUND_BREAKER_DEFAULTS.terminateAfter + 3 }, (_unused, index) =>
 			assistantWith([toolCall(`c${index}`, "rlm")]),
 		);
 		const { messages, streamCalls } = await runScripted({ tools: [ipythonTool, echoTool], steps });
 
-		// The run stopped at the default terminateAfter: five provider requests, not eight.
-		expect(streamCalls()).toBe(TOOL_NOT_FOUND_BREAKER_DEFAULTS.terminateAfter);
+		// Five misses earn one recovery turn instead of ending the run; the sixth - a
+		// relapse inside that recovery turn - is what ends it.
+		expect(streamCalls()).toBe(TOOL_NOT_FOUND_BREAKER_DEFAULTS.terminateAfter + 1);
 
 		const receipts = toolResultTexts(messages);
-		expect(receipts).toHaveLength(TOOL_NOT_FOUND_BREAKER_DEFAULTS.terminateAfter);
+		expect(receipts).toHaveLength(TOOL_NOT_FOUND_BREAKER_DEFAULTS.terminateAfter + 1);
 		expect(receipts[0]).not.toContain("tool-not-found breaker");
 		expect(receipts[1]).not.toContain("tool-not-found breaker");
 		// The warn receipt carries the forced-correction instruction (restate the tools).
@@ -251,6 +252,12 @@ describe("tool-not-found breaker", () => {
 		expect(receipts[2]).toContain("restate");
 		expect(receipts[2]).toContain("ipython");
 		expect(receipts[3]).toContain("tool-not-found breaker");
+		// The limit hit grants the recovery turn rather than stopping the run.
+		expect(receipts[4]).toContain("recovery turn");
+		expect(receipts[4]).not.toContain("the run stops");
+		// The relapse inside the recovery turn ends the run.
+		expect(receipts[5]).toContain("recovery turn");
+		expect(receipts[5]).toContain("the run stops");
 
 		// The terminal message is a classified error, not a silent stop.
 		const terminal = lastAssistant(messages);
@@ -258,7 +265,7 @@ describe("tool-not-found breaker", () => {
 		expect(terminal.stopReasonRaw).toBe(TOOL_NOT_FOUND_BREAKER_STOP_REASON_RAW);
 		expect(isToolNotFoundBreakerFailure(terminal)).toBe(true);
 		expect(terminal.errorMessage).toContain('"rlm"');
-		expect(terminal.errorMessage).toContain("5");
+		expect(terminal.errorMessage).toContain("6");
 		expect(
 			terminal.diagnostics?.some(
 				(diagnostic) =>
@@ -271,6 +278,7 @@ describe("tool-not-found breaker", () => {
 		);
 		expect(breakerDiagnostic).toBeDefined();
 		expect((breakerDiagnostic?.details ?? {}) as { toolName?: string }).toMatchObject({ toolName: "rlm" });
+		expect((breakerDiagnostic?.details ?? {}) as { recoveriesUsed?: number }).toMatchObject({ recoveriesUsed: 1 });
 	});
 
 	it("counts a whole parallel batch: four bad calls in one message warn on the third", async () => {
@@ -291,18 +299,46 @@ describe("tool-not-found breaker", () => {
 		expect(lastAssistant(messages).stopReason).toBe("stop");
 	});
 
-	it("C2 relapse: a recovered name that comes back still counts toward the per-name limit", async () => {
+	it("C2 relapse: a good call decays the per-name count, so an occasional relapse warns instead of ending the run", async () => {
 		const { messages, streamCalls } = await runScripted({
 			tools: [ipythonTool, echoTool],
 			steps: [
 				// Four hallucinated `rlm` calls in one batch (the C2 opening).
 				assistantWith([toolCall("c1", "rlm"), toolCall("c2", "rlm"), toolCall("c3", "rlm"), toolCall("c4", "rlm")]),
-				// The model finds the right path and runs one good call...
+				// The model finds the right path and runs one good call, decaying `rlm` 4 -> 3...
 				assistantWith([toolCall("c5", "ipython", { code: "spawn()" })]),
-				// ...and four lines later relapses (C2 verbatim). The fifth `rlm` trips the breaker.
+				// ...and four lines later relapses (C2 verbatim). The decayed count is 4:
+				// a warn, not the cumulative fifth that used to kill the whole task.
+				assistantWith([toolCall("c6", "rlm")]),
+				assistantWith([{ type: "text", text: "recovered" }]),
+			],
+		});
+
+		expect(streamCalls()).toBe(4);
+		const receipts = toolResultTexts(messages);
+		// 4 bad receipts + the good call's result + the relapse receipt.
+		expect(receipts).toHaveLength(6);
+		expect(receipts[5]).toContain("Tool rlm not found");
+		expect(receipts[5]).toContain("tool-not-found breaker");
+		expect(receipts[5]).not.toContain("final correction");
+		expect(receipts[5]).not.toContain("the run stops");
+		const last = lastAssistant(messages);
+		expect(last.stopReason).toBe("stop");
+		expect(isToolNotFoundBreakerFailure(last)).toBe(false);
+	});
+
+	it("decayPerResolvedCall: 0 keeps per-name counts cumulative, so the C2 relapse still trips", async () => {
+		const { messages, streamCalls } = await runScripted({
+			tools: [ipythonTool, echoTool],
+			steps: [
+				assistantWith([toolCall("c1", "rlm"), toolCall("c2", "rlm"), toolCall("c3", "rlm"), toolCall("c4", "rlm")]),
+				assistantWith([toolCall("c5", "ipython", { code: "spawn()" })]),
+				// The fifth cumulative `rlm` hits the limit; with recoveryTurns 0 the run
+				// ends at once, exactly as the breaker behaved before decay and recovery.
 				assistantWith([toolCall("c6", "rlm")]),
 				assistantWith([{ type: "text", text: "should never be requested" }]),
 			],
+			config: { toolNotFoundBreaker: { decayPerResolvedCall: 0, recoveryTurns: 0 } },
 		});
 
 		expect(streamCalls()).toBe(3);
@@ -335,10 +371,63 @@ describe("tool-not-found breaker", () => {
 			config: { toolNotFoundBreaker: { warnAfter: 1, terminateAfter: 2 } },
 		});
 
-		expect(streamCalls()).toBe(2);
+		// warn at 1, recovery granted at 2, the relapse inside the recovery turn ends it.
+		expect(streamCalls()).toBe(3);
 		const receipts = toolResultTexts(messages);
 		expect(receipts[0]).toContain("tool-not-found breaker");
+		expect(receipts[1]).toContain("recovery turn");
 		expect(isToolNotFoundBreakerFailure(lastAssistant(messages))).toBe(true);
+	});
+
+	it("recoveryTurns: 0 keeps the legacy behavior of ending the run at the limit", async () => {
+		const steps = Array.from({ length: 7 }, (_unused, index) => assistantWith([toolCall(`c${index}`, "rlm")]));
+		const { messages, streamCalls } = await runScripted({
+			tools: [echoTool],
+			steps,
+			config: { toolNotFoundBreaker: { recoveryTurns: 0 } },
+		});
+
+		expect(streamCalls()).toBe(TOOL_NOT_FOUND_BREAKER_DEFAULTS.terminateAfter);
+		const receipts = toolResultTexts(messages);
+		expect(receipts).toHaveLength(TOOL_NOT_FOUND_BREAKER_DEFAULTS.terminateAfter);
+		for (const receipt of receipts) {
+			expect(receipt).not.toContain("recovery turn");
+		}
+		expect(receipts[4]).toContain("the run stops");
+		expect(isToolNotFoundBreakerFailure(lastAssistant(messages))).toBe(true);
+	});
+
+	it("the recovery turn may answer without tool calls: a clean stop closes the episode", async () => {
+		const steps = [
+			...Array.from({ length: 5 }, (_unused, index) => assistantWith([toolCall(`c${index}`, "rlm")])),
+			assistantWith([{ type: "text", text: "sorry, no such tool - here is the answer" }]),
+		];
+		const { messages, streamCalls } = await runScripted({ tools: [echoTool], steps });
+
+		expect(streamCalls()).toBe(6);
+		const last = lastAssistant(messages);
+		expect(last.stopReason).toBe("stop");
+		expect(isToolNotFoundBreakerFailure(last)).toBe(false);
+	});
+
+	it("a clean recovery turn resets the episode: a later storm climbs the ladder again before terminating", async () => {
+		const steps = [
+			// First storm: the 5th miss grants the recovery turn.
+			...Array.from({ length: 5 }, (_unused, index) => assistantWith([toolCall(`c${index}`, "rlm")])),
+			// The recovery turn makes a resolved call: episode closed, counts reset.
+			assistantWith([toolCall("c5", "echo", { text: "correction took" })]),
+			// Second storm: fresh counts, no recovery left - the 5th miss terminates.
+			...Array.from({ length: 5 }, (_unused, index) => assistantWith([toolCall(`d${index}`, "rlm")])),
+			assistantWith([{ type: "text", text: "should never be requested" }]),
+		];
+		const { messages, streamCalls } = await runScripted({ tools: [echoTool], steps });
+
+		expect(streamCalls()).toBe(11);
+		const terminal = lastAssistant(messages);
+		expect(isToolNotFoundBreakerFailure(terminal)).toBe(true);
+		// The per-name count restarted after the recovery: 5 fresh misses, 10 in total.
+		expect(terminal.errorMessage).toContain('(5 for "rlm")');
+		expect(terminal.errorMessage).toContain("10");
 	});
 
 	it("disabled keeps the enriched receipts but never counts and never terminates", async () => {
@@ -365,14 +454,19 @@ describe("tool-not-found breaker", () => {
 	it("the terminal turn still delivers its tool results before the run ends", async () => {
 		const steps = [
 			...Array.from({ length: 4 }, (_unused, index) => assistantWith([toolCall(`c${index}`, "rlm")])),
+			// The 5th miss grants the recovery turn; the batch's good call still executes.
 			assistantWith([toolCall("c4", "rlm"), toolCall("c5", "echo", { text: "evidence" })]),
+			// The relapse inside the recovery turn is the tripping batch; its good call executes too.
+			assistantWith([toolCall("c6", "rlm"), toolCall("c7", "echo", { text: "trip-batch-evidence" })]),
 		];
 		const { messages, events } = await runScripted({ tools: [echoTool], steps });
 
-		// The tripping batch's good call still executed and its result is on record.
+		// Both batches' good calls executed and their results are on record.
 		const receipts = toolResultTexts(messages);
 		expect(receipts.some((text) => text === "evidence")).toBe(true);
+		expect(receipts.some((text) => text === "trip-batch-evidence")).toBe(true);
 		expect(events.some((event) => event.type === "turn_end")).toBe(true);
 		expect(events.at(-1)?.type).toBe("agent_end");
+		expect(isToolNotFoundBreakerFailure(lastAssistant(messages))).toBe(true);
 	});
 });

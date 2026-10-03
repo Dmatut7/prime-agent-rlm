@@ -4,13 +4,17 @@
  * C1: GLM streamed XML-corrupted tool names and re-issued them 152 times over 44
  * minutes - the receipt never listed the available tools and nothing in the run
  * bounded the loop (the fallback storm detector only acts when a fallback chain is
- * configured). C2: the model corrected itself and relapsed four lines later, which
- * only per-name cumulative counting catches. C3: invented cross-harness tool names.
+ * configured). C2: the model corrected itself and relapsed four lines later. C3:
+ * invented cross-harness tool names.
  *
- * The loop now answers every unknown-tool call with the available tool names and a
+ * The loop answers every unknown-tool call with the available tool names and a
  * did-you-mean suggestion, warns on the receipt at N (default 3) unknown-tool calls,
- * and ends the run with a classified terminal error at M (default 5) - the
- * non-retryable class, so a broken model is not re-fed the same context.
+ * and at M (default 5) grants one recovery turn instead of ending the run outright:
+ * a resolved call (or a clean stop) closes the episode and resets the counts, while
+ * a single further unknown-tool call inside the recovery turn ends the run with a
+ * classified terminal error - the non-retryable class, so a broken model is not
+ * re-fed the same context. Per-name counts decay by one per resolved call, so C2's
+ * isolated relapse warns instead of ending a long task (wave-40).
  */
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { TOOL_NOT_FOUND_BREAKER_STOP_REASON_RAW } from "@earendil-works/pi-agent-core";
@@ -48,7 +52,7 @@ describe("W11-C tool-not-found breaker", () => {
 		return harness;
 	}
 
-	it("C2 relapse: correction applied to one call does not exempt the same bad name later", async () => {
+	it("C2 relapse: a good call decays the per-name count, so the relapse warns and the run continues", async () => {
 		const harness = await harnessWithTools([echoTool]);
 		harness.setResponses([
 			// The C2 opening: four parallel calls to a tool that does not exist.
@@ -56,16 +60,18 @@ describe("W11-C tool-not-found breaker", () => {
 				[fauxToolCall("rlm", {}), fauxToolCall("rlm", {}), fauxToolCall("rlm", {}), fauxToolCall("rlm", {})],
 				{ stopReason: "toolUse" },
 			),
-			// The model self-corrects and one good call lands...
+			// The model self-corrects and one good call lands, decaying `rlm` 4 -> 3...
 			fauxAssistantMessage([fauxToolCall("echo", { text: "spawned" })], { stopReason: "toolUse" }),
-			// ...then relapses four lines later (C2 verbatim). Fifth `rlm` of the run: the breaker trips.
+			// ...then relapses four lines later (C2 verbatim). The decayed count is the
+			// 4th: a warn, not the cumulative fifth that used to kill the whole task.
 			fauxAssistantMessage([fauxToolCall("rlm", {})], { stopReason: "toolUse" }),
+			fauxAssistantMessage("spawned four subagents"),
 		]);
 
 		await harness.session.prompt("spawn four subagents");
 
-		// The breaker ended the run after the third provider request; nothing re-asked the model.
-		expect(harness.faux.state.callCount).toBe(3);
+		// Nothing stopped the run: the recovery came from the model, not the breaker.
+		expect(harness.faux.state.callCount).toBe(4);
 
 		const receipts = toolResultTexts(harness);
 		expect(receipts).toHaveLength(6);
@@ -79,18 +85,13 @@ describe("W11-C tool-not-found breaker", () => {
 		expect(receipts[0]).not.toContain("tool-not-found breaker");
 		// The good call in between really ran (the relapse did not rewrite history).
 		expect(receipts[4]).toBe("spawned");
-
-		// Terminal shape: a classified, non-retryable error naming the bad tool.
+		// The relapse is a warn, not a trip: the run lived on to answer.
+		expect(receipts[5]).toContain("Tool rlm not found");
+		expect(receipts[5]).toContain("tool-not-found breaker");
+		expect(receipts[5]).not.toContain("final correction");
 		const last = harness.session.messages.at(-1);
-		expect(last?.role).toBe("assistant");
-		if (last?.role !== "assistant") throw new Error("expected the terminal assistant message");
-		expect(last.stopReason).toBe("error");
-		expect(last.stopReasonRaw).toBe(TOOL_NOT_FOUND_BREAKER_STOP_REASON_RAW);
-		expect(last.errorMessage).toContain('"rlm"');
-		expect(last.diagnostics?.some((diagnostic) => diagnostic.type === "tool_not_found_breaker")).toBe(true);
-
-		// Not handed to the quick-retry ladder: the same context would produce the same garbage.
-		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+		if (last?.role !== "assistant") throw new Error("expected the final assistant message");
+		expect(last.stopReason).toBe("stop");
 	});
 
 	it("C3: a typo'd name gets the did-you-mean receipt and the run recovers below the thresholds", async () => {
@@ -118,7 +119,7 @@ describe("W11-C tool-not-found breaker", () => {
 		expect(harness.faux.state.callCount).toBe(3);
 	});
 
-	it("C1: five same-name failures across turns end the run without a fallback chain configured", async () => {
+	it("C1: five same-name failures grant one recovery turn; the relapse inside it ends the run", async () => {
 		const ipythonTool: AgentTool = {
 			name: "ipython",
 			label: "ipython",
@@ -128,22 +129,28 @@ describe("W11-C tool-not-found breaker", () => {
 		};
 		const harness = await harnessWithTools([ipythonTool, echoTool]);
 		harness.setResponses(
-			Array.from({ length: 6 }, () =>
+			Array.from({ length: 7 }, () =>
 				fauxAssistantMessage([fauxToolCall("ipython</arg_value>", {})], { stopReason: "toolUse" }),
 			),
 		);
 
 		await harness.session.prompt("run the analysis");
 
-		// Five turns of garbage, then the breaker - the sixth scripted answer is never consumed.
-		expect(harness.faux.state.callCount).toBe(5);
+		// Five turns of garbage earn the recovery turn; the relapse inside it is the
+		// sixth - the seventh scripted answer is never consumed.
+		expect(harness.faux.state.callCount).toBe(6);
+		const receipts = toolResultTexts(harness);
+		expect(receipts[0]).toContain('Did you mean: "ipython"');
+		// The limit hit granted the recovery turn rather than stopping outright.
+		expect(receipts[4]).toContain("recovery turn");
+		expect(receipts[4]).toContain("final correction");
 		const last = harness.session.messages.at(-1);
 		if (last?.role !== "assistant") throw new Error("expected the terminal assistant message");
 		expect(last.stopReason).toBe("error");
 		expect(last.stopReasonRaw).toBe(TOOL_NOT_FOUND_BREAKER_STOP_REASON_RAW);
 		// The corrupted name is quoted and the corruption still maps back to a real tool.
 		expect(last.errorMessage).toContain("ipython</arg_value>");
-		const receipts = toolResultTexts(harness);
-		expect(receipts[0]).toContain('Did you mean: "ipython"');
+		// Not handed to the quick-retry ladder: the same context would produce the same garbage.
+		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
 	});
 });

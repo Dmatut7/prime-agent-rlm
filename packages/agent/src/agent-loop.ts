@@ -493,6 +493,22 @@ function createStalledAssistantMessage(
 				streamedContent: partialMessage !== null,
 			},
 		});
+	} else {
+		// No Retry-After wait is on record, so nothing the provider said explains the
+		// silence. The failure must still carry the structured kind: an absent one reads
+		// as permanent downstream, which kept the backup model and the fallback chain
+		// from ever engaging on a dead connection. A silent stream is transient
+		// unavailability, so the kind is unknown.
+		appendAssistantMessageDiagnostic(message, {
+			type: "provider_stream_failure",
+			timestamp: Date.now(),
+			details: {
+				kind: "unknown",
+				stallTimeoutMs: timeoutMs,
+				stallAttribution: facts.streamEventCount === 0 ? "no_response" : "mid_stream_interruption",
+				streamedContent: partialMessage !== null,
+			},
+		});
 	}
 	return message;
 }
@@ -546,7 +562,7 @@ function createStreamEofAssistantMessage(
 	config: AgentLoopConfig,
 	partialMessage: AssistantMessage | null,
 ): AssistantMessage {
-	return {
+	const message: AssistantMessage = {
 		role: "assistant",
 		content: partialMessage ? cloneAssistantContent(partialMessage.content) : [{ type: "text", text: "" }],
 		api: partialMessage?.api ?? config.model.api,
@@ -560,6 +576,19 @@ function createStreamEofAssistantMessage(
 			"This usually indicates a dropped connection or a proxy/middleware that closed the stream early; retrying the turn normally succeeds.",
 		timestamp: Date.now(),
 	};
+	// A stream that dies mid-turn without saying why is transient unavailability: the
+	// kind is unknown, not absent - an absent kind reads as permanent downstream, which
+	// kept the backup model and the fallback chain from ever engaging on this shape.
+	appendAssistantMessageDiagnostic(message, {
+		type: "provider_stream_failure",
+		timestamp: Date.now(),
+		details: {
+			kind: "unknown",
+			stopReasonRaw: STREAM_EOF_STOP_REASON_RAW,
+			streamedContent: partialMessage !== null,
+		},
+	});
+	return message;
 }
 
 function endAgentStreamOnError(
@@ -903,6 +932,21 @@ async function runLoop(
 					await emit({ type: "message_end", message: terminalMessage });
 					await emit({ type: "agent_end", messages: newMessages });
 					return;
+				}
+				if (notFoundBreaker.recovery) {
+					if (notFoundBreaker.recovery.pending) {
+						// The turn that granted the recovery just closed with its receipts
+						// delivered; the next turn is the recovery round, in which a single
+						// unknown-tool call trips the breaker (see recordToolNotFound).
+						notFoundBreaker.recovery.pending = false;
+					} else {
+						// A full turn closed without an unknown-tool call: the correction
+						// took, so the episode closes and the counts reset. recoveriesUsed
+						// stays spent - the run grants at most recoveryTurns episodes.
+						notFoundBreaker.nameCounts.clear();
+						notFoundBreaker.consecutive = 0;
+						notFoundBreaker.recovery = undefined;
+					}
 				}
 				lastTurn = {
 					message,
@@ -1955,8 +1999,21 @@ async function prepareToolCall(
 		};
 	}
 	// A call whose name resolves is not part of the unknown-tool streak, whatever its
-	// arguments or execution do next; the per-name counts deliberately survive this.
+	// arguments or execution do next.
 	notFoundBreaker.consecutive = 0;
+	// ...and it forgives past misses: per-name counts decay so an occasional typo in a
+	// long task never accumulates to the limit, while a storm - no resolved calls in
+	// between - still outruns the decay.
+	if (notFoundBreaker.decayPerResolvedCall > 0) {
+		for (const [name, count] of notFoundBreaker.nameCounts) {
+			const next = count - notFoundBreaker.decayPerResolvedCall;
+			if (next <= 0) {
+				notFoundBreaker.nameCounts.delete(name);
+			} else {
+				notFoundBreaker.nameCounts.set(name, next);
+			}
+		}
+	}
 
 	try {
 		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
@@ -2245,7 +2302,12 @@ function createErrorToolResult(message: string): AgentToolResult<any> {
  * purpose: the turn where the fallback chain would switch models is the turn the
  * receipt starts spelling out the correction.
  */
-export const TOOL_NOT_FOUND_BREAKER_DEFAULTS = { warnAfter: 3, terminateAfter: 5 } as const;
+export const TOOL_NOT_FOUND_BREAKER_DEFAULTS = {
+	warnAfter: 3,
+	terminateAfter: 5,
+	decayPerResolvedCall: 1,
+	recoveryTurns: 1,
+} as const;
 
 /**
  * Synthetic `stopReasonRaw` for a run the tool-not-found breaker ended. Not a
@@ -2321,7 +2383,7 @@ function formatAvailableTools(tools: readonly AgentTool<any>[] | undefined): str
 	return `Available tools: ${listed.join(", ")}${suffix}.`;
 }
 
-type ToolNotFoundEscalation = "plain" | "warn" | "trip";
+type ToolNotFoundEscalation = "plain" | "warn" | "recover" | "trip";
 
 interface ToolNotFoundBreakerTrip {
 	toolName: string;
@@ -2330,21 +2392,39 @@ interface ToolNotFoundBreakerTrip {
 	total: number;
 }
 
+interface ToolNotFoundBreakerRecovery {
+	/**
+	 * True until the turn that granted the recovery closes; the turn after it is the
+	 * recovery round, in which a single unknown-tool call trips the breaker.
+	 */
+	pending: boolean;
+}
+
 interface ToolNotFoundBreakerState {
 	readonly enabled: boolean;
 	readonly warnAfter: number;
 	readonly terminateAfter: number;
+	/** Forgiveness subtracted from every per-name count by each resolved call. */
+	readonly decayPerResolvedCall: number;
+	/** Recovery turns granted at the limit before the run ends. */
+	readonly recoveryTurns: number;
 	/** Consecutive unknown-tool calls; any call whose name resolves resets it. */
 	consecutive: number;
-	/** Per-name cumulative counts; never reset within the run (the correct-then-relapse shape). */
+	/** Per-name miss counts, decayed by resolved calls; a storm outruns the decay. */
 	readonly nameCounts: Map<string, number>;
 	total: number;
+	/** Recovery turns granted so far this run; capped at recoveryTurns. */
+	recoveriesUsed: number;
+	/** Set while a granted recovery turn is open. */
+	recovery?: ToolNotFoundBreakerRecovery;
 	trip?: ToolNotFoundBreakerTrip;
 }
 
 function resolveToolNotFoundBreaker(config?: ToolNotFoundBreakerConfig): ToolNotFoundBreakerState {
 	const finitePositive = (value: number | undefined): number | undefined =>
 		typeof value === "number" && Number.isFinite(value) && value >= 1 ? Math.floor(value) : undefined;
+	const finiteNonNegative = (value: number | undefined): number | undefined =>
+		typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined;
 	const warnAfter = finitePositive(config?.warnAfter) ?? TOOL_NOT_FOUND_BREAKER_DEFAULTS.warnAfter;
 	const terminateAfter = Math.max(
 		warnAfter,
@@ -2354,9 +2434,13 @@ function resolveToolNotFoundBreaker(config?: ToolNotFoundBreakerConfig): ToolNot
 		enabled: config?.enabled !== false,
 		warnAfter,
 		terminateAfter,
+		decayPerResolvedCall:
+			finiteNonNegative(config?.decayPerResolvedCall) ?? TOOL_NOT_FOUND_BREAKER_DEFAULTS.decayPerResolvedCall,
+		recoveryTurns: finiteNonNegative(config?.recoveryTurns) ?? TOOL_NOT_FOUND_BREAKER_DEFAULTS.recoveryTurns,
 		consecutive: 0,
 		nameCounts: new Map(),
 		total: 0,
+		recoveriesUsed: 0,
 	};
 }
 
@@ -2366,10 +2450,28 @@ function recordToolNotFound(state: ToolNotFoundBreakerState, name: string): Tool
 	state.consecutive += 1;
 	const nameCount = (state.nameCounts.get(name) ?? 0) + 1;
 	state.nameCounts.set(name, nameCount);
-	if (!state.trip && (nameCount >= state.terminateAfter || state.consecutive >= state.terminateAfter)) {
-		state.trip = { toolName: name, nameCount, consecutive: state.consecutive, total: state.total };
+	if (!state.trip) {
+		if (state.recovery && !state.recovery.pending) {
+			// A granted recovery turn still produced an unknown-tool call: the hard stop
+			// the recovery receipt announced, regardless of which limit was re-hit.
+			state.trip = { toolName: name, nameCount, consecutive: state.consecutive, total: state.total };
+		} else if (nameCount >= state.terminateAfter || state.consecutive >= state.terminateAfter) {
+			if (state.recovery) {
+				// Same batch as the arming call: already granted, receipt only.
+			} else if (state.recoveriesUsed < state.recoveryTurns) {
+				// The limit no longer ends the run outright: grant one recovery turn. The
+				// receipt spells out that a single further unknown-tool call ends the run.
+				state.recoveriesUsed += 1;
+				state.recovery = { pending: true };
+			} else {
+				state.trip = { toolName: name, nameCount, consecutive: state.consecutive, total: state.total };
+			}
+		}
 	}
 	if (state.trip) return "trip";
+	if (state.recovery && (nameCount >= state.terminateAfter || state.consecutive >= state.terminateAfter)) {
+		return "recover";
+	}
 	if (nameCount >= state.warnAfter || state.consecutive >= state.warnAfter) return "warn";
 	return "plain";
 }
@@ -2394,14 +2496,26 @@ function formatToolNotFoundReceipt(
 		suggestions.length > 0 ? ` Did you mean: ${suggestions.map((s) => `"${s}"`).join(", ")}?` : "";
 	lines.push(`${formatAvailableTools(tools)}${suggestionText}`);
 	if (escalation === "warn") {
+		const beyond =
+			state.recoveryTurns > 0
+				? `at ${state.terminateAfter} the run grants one recovery turn, and a miss inside it ends the run`
+				: `the run stops at ${state.terminateAfter}`;
 		lines.push(
-			`[tool-not-found breaker] ${state.total} unknown-tool call(s) this run; the run stops at ${state.terminateAfter}. ` +
+			`[tool-not-found breaker] ${state.total} unknown-tool call(s) this run; ${beyond}. ` +
 				"Stop guessing tool names: before your next tool call, restate which of the available tools you will use, then call only those exact names.",
+		);
+	} else if (escalation === "recover") {
+		lines.push(
+			`[tool-not-found breaker] ${state.total} unknown-tool call(s) this run hit the limit of ${state.terminateAfter}. ` +
+				"The run does not stop yet - this recovery turn is the final correction: call only the exact tool names listed above, " +
+				"or answer without any tool call. A single further unknown-tool call ends the run.",
 		);
 	} else if (escalation === "trip") {
 		lines.push(
-			`[tool-not-found breaker] ${state.total} unknown-tool call(s) this run: the limit of ${state.terminateAfter} is reached, ` +
-				"so the run stops after this batch instead of asking the model again.",
+			state.recoveriesUsed > 0
+				? `[tool-not-found breaker] the recovery turn still produced an unknown-tool call (${state.total} this run), so the run stops after this batch instead of asking the model again.`
+				: `[tool-not-found breaker] ${state.total} unknown-tool call(s) this run: the limit of ${state.terminateAfter} is reached, ` +
+						"so the run stops after this batch instead of asking the model again.",
 		);
 	}
 	return lines.join("\n");
@@ -2417,6 +2531,7 @@ function createToolNotFoundBreakerTerminalMessage(
 	const errorMessage =
 		`Stopped by the tool-not-found breaker: ${trip.total} unknown-tool call(s) in this run ` +
 		`(${trip.nameCount} for "${trip.toolName}"), limit ${state.terminateAfter}. ` +
+		(state.recoveriesUsed > 0 ? "The recovery turn the limit granted still produced an unknown-tool call. " : "") +
 		"The model kept calling tool names that do not exist even though every error receipt listed the available tools, " +
 		"so the run was ended instead of spending more provider requests. " +
 		"This is a model-side failure: switch the session to another model (or fix the tool setup) before resuming.";
@@ -2442,6 +2557,7 @@ function createToolNotFoundBreakerTerminalMessage(
 			total: trip.total,
 			warnAfter: state.warnAfter,
 			terminateAfter: state.terminateAfter,
+			recoveriesUsed: state.recoveriesUsed,
 			availableTools: (tools ?? []).map((tool) => tool.name),
 		},
 	});

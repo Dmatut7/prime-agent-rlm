@@ -47,13 +47,16 @@ type WorktreeFixture = {
 function createPlainReftableRepo(tempDir: string): string {
 	const repoDir = join(tempDir, "repo");
 	mkdirSync(join(repoDir, ".git", "reftable"), { recursive: true });
+	mkdirSync(join(repoDir, ".git", "objects"), { recursive: true });
+	mkdirSync(join(repoDir, ".git", "refs"), { recursive: true });
 	writeFileSync(join(repoDir, ".git", "HEAD"), "ref: refs/heads/.invalid\n");
 	return repoDir;
 }
 
 function createPlainRepo(tempDir: string): string {
 	const repoDir = join(tempDir, "repo");
-	mkdirSync(join(repoDir, ".git"), { recursive: true });
+	mkdirSync(join(repoDir, ".git", "objects"), { recursive: true });
+	mkdirSync(join(repoDir, ".git", "refs"), { recursive: true });
 	writeFileSync(join(repoDir, ".git", "HEAD"), "ref: refs/heads/main\n");
 	return repoDir;
 }
@@ -67,6 +70,8 @@ function createReftableWorktree(tempDir: string): WorktreeFixture {
 
 	mkdirSync(gitDir, { recursive: true });
 	mkdirSync(reftableDir, { recursive: true });
+	mkdirSync(join(commonGitDir, "objects"), { recursive: true });
+	mkdirSync(join(commonGitDir, "refs"), { recursive: true });
 	mkdirSync(worktreeDir, { recursive: true });
 
 	writeFileSync(join(worktreeDir, ".git"), `gitdir: ${gitDir}\n`);

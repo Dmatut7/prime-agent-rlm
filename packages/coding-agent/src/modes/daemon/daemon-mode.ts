@@ -314,7 +314,7 @@ import {
 import { SupervisorLink } from "./supervisor-link.js";
 import { writeUpdateRestartManifestFile } from "./update-restart-manifest.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
-import { findUnconsumedWorkerRecoveryMarker, WORKER_RECOVERY_RESUME_PROMPT } from "./worker-recovery-resume.js";
+import { WORKER_RECOVERY_RESUME_PROMPT, workerRecoveryResumeVerdict } from "./worker-recovery-resume.js";
 
 /**
  * Re-entry ceiling for one subagent hydration (M19). Unrelated to `RLM_MAX_DEPTH` on purpose:
@@ -5668,7 +5668,10 @@ export class AgentDaemon {
 		// a supervising agent) is attending this session, so the chain of
 		// "auto actions without external input" restarts from zero.
 		this.noteExternalSessionInput(state);
-		state.runtime.session.requestAbort();
+		// The abort is a person (or a supervising agent) deliberately stopping the
+		// turn, so it carries the user reason: a quota park whose wake probe is
+		// aborted this way cancels instead of re-arming.
+		state.runtime.session.requestAbort({ reason: "user" });
 		return success(command.id, "abort");
 	}
 
@@ -5679,7 +5682,7 @@ export class AgentDaemon {
 		this.assertAgentOriginAbortReach(command.fromActiveSessionId, state);
 		// C: same external-input rule as the plain abort above.
 		this.noteExternalSessionInput(state);
-		state.runtime.session.abortAndSendQueued();
+		state.runtime.session.abortAndSendQueued({ reason: "user" });
 		return success(command.id, "abort_and_send_queued");
 	}
 
@@ -6093,7 +6096,7 @@ export class AgentDaemon {
 	): Promise<DaemonResponse | undefined> {
 		const state = this.getSessionState(command.activeSessionId);
 		const queue = state.runtime.session.clearQueue();
-		state.runtime.session.requestAbort();
+		state.runtime.session.requestAbort({ reason: "user" });
 		return success(command.id, "abort_and_clear_queue", queue);
 	}
 
@@ -8663,25 +8666,42 @@ export class AgentDaemon {
 	 * this fires once per worker death. See worker-recovery-resume.ts.
 	 */
 	private resumeWorkerInterruptedSession(state: ActiveSessionState): void {
-		let marker: ReturnType<typeof findUnconsumedWorkerRecoveryMarker>;
+		let verdict: ReturnType<typeof workerRecoveryResumeVerdict>;
 		try {
-			marker = findUnconsumedWorkerRecoveryMarker(state.runtime.session.sessionManager.getBranch());
+			verdict = workerRecoveryResumeVerdict(state.runtime.session.sessionManager.getBranch());
 		} catch {
 			return;
 		}
-		if (marker === undefined) {
+		if (verdict.kind === "skip") {
+			if (verdict.reason !== "no-marker") {
+				this.log(
+					`session ${state.activeSessionId} carries an unconsumed worker-recovery marker, but the automatic resume was skipped (${verdict.reason}); the resume briefing still reports the interruption`,
+				);
+			}
 			return;
 		}
 		this.log(
 			`session ${state.activeSessionId} carries an unconsumed worker-recovery marker; queueing the automatic resume`,
 		);
-		void state.runtime.session.followUp(WORKER_RECOVERY_RESUME_PROMPT, undefined, { resumeIfIdle: true }).then(
-			(queued) => {
-				if (!queued) {
-					this.log(`worker-recovery resume for ${state.activeSessionId} was not admitted`);
+		const session = state.runtime.session;
+		void (async () => {
+			// Queued inputs the dead worker never delivered ride ahead of the resume
+			// prompt: they are the user's actual work, and the resume turn must not
+			// start before they are queued. resumeIfIdle stays off for them so the
+			// whole batch turns once, on the resume prompt's own resumeIfIdle.
+			for (const text of verdict.queuedInputs) {
+				try {
+					await session.followUp(text, undefined, { resumeIfIdle: false });
+				} catch (error) {
+					this.log(`could not replay a queued input for ${state.activeSessionId}: ${String(error)}`);
 				}
-			},
-			(error) => this.log(`could not queue worker-recovery resume for ${state.activeSessionId}: ${String(error)}`),
+			}
+			const queued = await session.followUp(WORKER_RECOVERY_RESUME_PROMPT, undefined, { resumeIfIdle: true });
+			if (!queued) {
+				this.log(`worker-recovery resume for ${state.activeSessionId} was not admitted`);
+			}
+		})().catch((error) =>
+			this.log(`could not queue worker-recovery resume for ${state.activeSessionId}: ${String(error)}`),
 		);
 	}
 

@@ -411,6 +411,49 @@ describe("public command routing", () => {
 		});
 	});
 
+	it("keeps a one-word prompt behind -p on the prompt path", async () => {
+		// `prime-agent -p sessions` asks about "sessions"; the word is a prompt, not a
+		// mistyped command.
+		const args = ["-p", "sessions"];
+		await expect(handlePublicCommand(args)).resolves.toEqual({
+			handled: false,
+			args,
+			explicitAgentsView: false,
+		});
+		expect(process.exitCode).toBeUndefined();
+	});
+
+	it("keeps a one-word prompt behind --print and --mode on the prompt path", async () => {
+		for (const args of [
+			["--print", "sessions"],
+			["--mode", "json", "sessions"],
+			["--mode=json", "sessions"],
+		]) {
+			await expect(handlePublicCommand(args)).resolves.toEqual({
+				handled: false,
+				args,
+				explicitAgentsView: false,
+			});
+		}
+		expect(process.exitCode).toBeUndefined();
+	});
+
+	it("inserts a leading --daemon-socket before the message separator instead of corrupting the message", async () => {
+		// Appending the pair at the end puts it behind `--`, where it becomes message
+		// content and the command silently runs against the default service.
+		await handlePublicCommand(["--daemon-socket", "/tmp/w40.sock", "send", "worker", "--", "hi"]);
+
+		expect(mocks.daemonCommands).toEqual([
+			["daemon", "send", "worker", "--daemon-socket", "/tmp/w40.sock", "--", "hi"],
+		]);
+	});
+
+	it("keeps appending a leading --daemon-socket at the end when no separator is present", async () => {
+		await handlePublicCommand(["--daemon-socket", "/tmp/w40.sock", "send", "worker", "hi"]);
+
+		expect(mocks.daemonCommands).toEqual([["daemon", "send", "worker", "hi", "--daemon-socket", "/tmp/w40.sock"]]);
+	});
+
 	it("keeps one-word prompts that match no command on the prompt path", async () => {
 		const args = ["refactor"];
 		await expect(handlePublicCommand(args)).resolves.toEqual({

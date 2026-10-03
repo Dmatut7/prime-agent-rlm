@@ -225,7 +225,7 @@ describe("cross-model thinking replay bounding", () => {
 		expect(assistantAt(out, 3).content.some((block) => block.type === "thinking")).toBe(true);
 	});
 
-	it("bounds an older aborted turn's partial thinking while keeping the folded harvest", () => {
+	it("drops an aborted turn's partial thinking instead of flattening it into the trace", () => {
 		const cause = "Request was aborted (Abort cause: stall_watchdog)";
 		const messages: Message[] = [
 			user,
@@ -246,10 +246,35 @@ describe("cross-model thinking replay bounding", () => {
 
 		expect(out).toHaveLength(4);
 		const trace = assistantAt(out, 1);
-		expect(textOf(trace)).toContain(PLACEHOLDER);
+		expect(textOf(trace)).not.toContain(PLACEHOLDER);
 		expect(textOf(trace)).not.toContain("old partial reasoning");
 		expect(textOf(trace)).toContain("stall_watchdog");
 		expect(textOf(trace)).toContain("partial output");
 		expect(textOf(assistantAt(out, 3))).toContain("recent reasoning");
+	});
+
+	it("skips a trailing aborted turn when picking the most recent turn that keeps its thinking", () => {
+		const cause = "Request was aborted (Abort cause: user pressed Escape)";
+		const messages: Message[] = [
+			user,
+			foreignAssistant([thinking("complete reasoning"), { type: "text", text: "complete answer" }]),
+			user,
+			foreignAssistant([thinking("half-formed reasoning"), { type: "text", text: "wip" }], "aborted", cause),
+		];
+
+		const out = transformMessages(messages, model);
+
+		expect(out).toHaveLength(4);
+		// The last complete turn is the most recent replayable one: it keeps its full
+		// thinking instead of being shadowed into a placeholder by the aborted turn.
+		const complete = assistantAt(out, 1);
+		expect(textOf(complete)).toContain("complete reasoning");
+		expect(textOf(complete)).not.toContain(PLACEHOLDER);
+		// The aborted turn's partial thinking is dropped, not kept as flattened text.
+		const trace = assistantAt(out, 3);
+		expect(textOf(trace)).toContain("wip");
+		expect(textOf(trace)).toContain("Escape");
+		expect(textOf(trace)).not.toContain("half-formed reasoning");
+		expect(textOf(trace)).not.toContain(PLACEHOLDER);
 	});
 });

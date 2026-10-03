@@ -287,4 +287,30 @@ describe("kernel reset notice freshness wording", () => {
 		expect(notice).toContain("gen (TypeError: cannot pickle 'generator' object)");
 		expect(notice).toContain("must be rebuilt: unloadable");
 	});
+
+	it("omits the host bootstrap's internal names from the never-saved list", () => {
+		// Older payloads list the `_prime_agent_*` helpers and `_PrimeAgent*` wrapper
+		// classes as never-saved; the bootstrap re-binds them on every start, so a
+		// "must be rebuilt" notice for them is noise about names the model never owned.
+		const notice = formatKernelResetNotice({
+			...base,
+			restore: {
+				restored: ["kept"],
+				failed: [],
+				notSaved: [
+					{
+						name: "_prime_agent_sys",
+						reason: "private-name convention: leading-underscore names are not persisted",
+					},
+					{ name: "websearch", reason: "TypeError: cannot pickle '_PrimeAgentCallableSkillModule' object" },
+					{ name: "gen", reason: "TypeError: cannot pickle 'generator' object" },
+				],
+				path: "/tmp/kernel-state.dill",
+			},
+			snapshotWrittenBeforeDeathMs: 1_000,
+		});
+		expect(notice).toContain("gen (TypeError: cannot pickle 'generator' object)");
+		expect(notice).not.toContain("_prime_agent_sys");
+		expect(notice).not.toContain("websearch");
+	});
 });

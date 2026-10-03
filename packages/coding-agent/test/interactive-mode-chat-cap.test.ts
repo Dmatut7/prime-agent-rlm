@@ -82,6 +82,7 @@ type CapHarness = {
 		enterFullscreen: (options: unknown) => void;
 		exitFullscreen: () => void;
 		scrollBy: (lines: number) => void;
+		noteTranscriptPrepend: (lines: number) => void;
 		terminal: { columns: number; rows: number };
 	};
 };
@@ -225,6 +226,7 @@ function createCapHarness(overrides: Partial<CapHarness> = {}): CapHarness {
 			enterFullscreen: vi.fn(),
 			exitFullscreen: vi.fn(),
 			scrollBy: vi.fn(),
+			noteTranscriptPrepend: vi.fn(),
 			terminal: { columns: 120, rows: 40 },
 		},
 		...overrides,

@@ -145,4 +145,23 @@ describe("branch summary machine blocks (记忆-4)", () => {
 		expect(summary.indexOf("<fact-appendix")).toBeGreaterThan(summary.indexOf("## Goal"));
 		expect(summary.indexOf("<user-requests")).toBeGreaterThan(summary.indexOf("## Goal"));
 	});
+
+	it("labels the user-requests block as the abandoned branch's words, not live obligations", async () => {
+		// The block's compaction header tells the reader to "treat every unresolved
+		// instruction and reported problem here as a live obligation". Inside a branch
+		// summary that header promotes the abandoned branch's requests to current
+		// instructions: after returning, the model would start finishing work the user
+		// navigated away from.
+		const result = await generateBranchSummary(branchEntries(), {
+			model: testModel(),
+			apiKey: "test-key",
+			signal: new AbortController().signal,
+		});
+		expect(result.error).toBeUndefined();
+		const summary = result.summary ?? "";
+		expect(summary).toContain("<user-requests");
+		expect(summary).toContain(USER_WORDS);
+		expect(summary).not.toContain("live obligation");
+		expect(summary).toContain("left behind");
+	});
 });

@@ -1,0 +1,4 @@
+- Fixed a subagent paused by a provider usage-limit reset (quota park) being reported to its parent as failed: the child's run now stays live while parked and settles when the resumed task actually ends, so the parent no longer re-does work the child was about to finish.
+- Fixed two parallel `rlm.run` spawns both passing the live-children concurrency cap: a spawn now holds a cap slot from the check until its run registers.
+- Fixed `rlm.prune_subagents` retiring a child whose run had reached a terminal status but not settled yet, which froze a `settled: false` lie into its collect record.
+- Fixed a subagent that failed before its session started holding its `name` forever: the failure now settles into the bounded closed records, the name is free again, and a re-spawn gets the numbered successor name.

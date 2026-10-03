@@ -20,10 +20,12 @@ import {
 import { getKeybindings } from "./keybindings.js";
 import { isKeyRelease } from "./keys.js";
 import {
+	isLegacyMouseRelease,
 	isMouseSequence,
 	isWheelDown,
 	isWheelUp,
 	MOUSE_BUTTON_LEFT,
+	MOUSE_BUTTON_NONE,
 	parseMouseEvent,
 	parseMouseHover,
 } from "./mouse.js";
@@ -49,6 +51,11 @@ import {
 } from "./utils.js";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
+
+// The overwide-line crash log is written at most once per this interval: a
+// component stuck emitting an overwide line would otherwise rewrite the whole
+// transcript to disk on every frame and stall the UI it is meant to debug.
+const OVERWIDE_CRASH_LOG_THROTTLE_MS = 1000;
 
 function extractKittyImageIds(line: string): number[] {
 	const sequenceStart = line.indexOf(KITTY_SEQUENCE_PREFIX);
@@ -483,6 +490,10 @@ export class TUI extends Container {
 	// Last known pointer cell, so the hover can follow content that moves under a still pointer.
 	private fullscreenPointer: { row: number; col: number } | null = null;
 	private fullscreenLeftMouseDown = false;
+	// The button of the last real press, so a legacy X10 release (which carries no
+	// button identity) can be mapped back to it for click/hyperlink dispatch.
+	private fullscreenLastMousePressButton: number | undefined = undefined;
+	private lastOverwideCrashLogAt = 0;
 	// Hover changes the frame-by-frame re-check may still make before the next input arrives.
 	private hoverRefreshBudget = 1;
 	private overlaySelectionRegions: FrameSelectionRegion[] = [];
@@ -737,6 +748,7 @@ export class TUI extends Container {
 			this.fullscreenPressedHyperlink = null;
 			this.fullscreenPressedClick = null;
 			this.fullscreenLeftMouseDown = false;
+			this.fullscreenLastMousePressButton = undefined;
 			this.fullscreen?.viewport.clearSelection();
 			this.dropFullscreenHover();
 		} else if (this.isFullscreenOverlayFocused()) {
@@ -988,6 +1000,7 @@ export class TUI extends Container {
 		if (this.fullscreen) return;
 		this.fullscreenLeftMouseDragged = false;
 		this.fullscreenLeftMouseDown = false;
+		this.fullscreenLastMousePressButton = undefined;
 		this.fullscreenPressedHyperlink = null;
 		this.fullscreenPressedClick = null;
 		this.fullscreenPointer = null;
@@ -1062,6 +1075,17 @@ export class TUI extends Container {
 		this.requestRender();
 	}
 
+	/**
+	 * Rows were inserted at the top of the fullscreen transcript (a backfilled
+	 * history page): the paused window keeps its rows and the page never counts
+	 * as new content. Inline mode has no viewport to move, so it is a no-op there.
+	 */
+	noteTranscriptPrepend(lines: number): void {
+		if (!this.fullscreen) return;
+		this.fullscreen.viewport.noteTranscriptPrepend(lines);
+		this.requestRender();
+	}
+
 	scrollToTop(): void {
 		if (!this.fullscreen) return;
 		this.fullscreen.viewport.scrollToTop();
@@ -1128,6 +1152,33 @@ export class TUI extends Container {
 		// fallback: OSC 52 works locally, over SSH, and through tmux (set-clipboard)
 		const base64 = Buffer.from(text, "utf8").toString("base64");
 		this.terminal.write(`\x1b]52;c;${base64}\x07`);
+	}
+
+	/**
+	 * Record the render's clamped overwide lines in pi-crash.log so the offending
+	 * component can be found and fixed. The caller collects one entry per render;
+	 * repeat writes are throttled to OVERWIDE_CRASH_LOG_THROTTLE_MS.
+	 */
+	private logClampedOverwideLines(clamped: number[], lines: string[], width: number): void {
+		const now = Date.now();
+		if (now - this.lastOverwideCrashLogAt < OVERWIDE_CRASH_LOG_THROTTLE_MS) return;
+		this.lastOverwideCrashLogAt = now;
+		try {
+			const crashLogPath = path.join(os.homedir(), ".prime", "agent", "pi-crash.log");
+			const crashData = [
+				`Clamped overwide line at ${new Date(now).toISOString()}`,
+				`Terminal width: ${width}`,
+				...clamped.map((i) => `Line ${i} visible width: ${visibleWidth(lines[i]!)}`),
+				"",
+				"=== All rendered lines ===",
+				...lines.map((l, idx) => `[${idx}] (w=${visibleWidth(l)}) ${l}`),
+				"",
+			].join("\n");
+			fs.mkdirSync(path.dirname(crashLogPath), { recursive: true });
+			fs.writeFileSync(crashLogPath, crashData);
+		} catch {
+			// Crash logging must never take the render down with it.
+		}
 	}
 
 	private updateSelectionAutoScroll(viewport: FullscreenViewport, screenRow: number, screenColumn: number): void {
@@ -1309,7 +1360,19 @@ export class TUI extends Container {
 
 		if (isMouseSequence(data)) {
 			// consumed even when disabled — mouse reports are garbage downstream
-			const event = this.terminal.mouseTrackingActive ? parseMouseEvent(data) : null;
+			let event = this.terminal.mouseTrackingActive ? parseMouseEvent(data) : null;
+			if (event) {
+				// X10 releases carry no button identity (code 3): map the release back
+				// to the last pressed button, or click and hyperlink dispatch below
+				// never fires on terminals without SGR (?1006) reporting.
+				if (isLegacyMouseRelease(event)) {
+					if (this.fullscreenLastMousePressButton !== undefined) {
+						event = { ...event, button: this.fullscreenLastMousePressButton };
+					}
+				} else if (event.press && !event.motion && event.button !== MOUSE_BUTTON_NONE && event.button < 64) {
+					this.fullscreenLastMousePressButton = event.button;
+				}
+			}
 			const leftReleaseWasDrag =
 				event?.button === MOUSE_BUTTON_LEFT && !event.press ? this.fullscreenLeftMouseDragged : false;
 			if (event?.button === MOUSE_BUTTON_LEFT && event.press) {
@@ -2479,6 +2542,7 @@ export class TUI extends Container {
 		// This reduces flicker when only a single line changes (e.g., spinner animation)
 		const renderEnd = Math.min(lastChanged, newLines.length - 1);
 		this.degradeStraddlingImageLines(newLines, firstChanged, renderEnd, viewportTop);
+		const clampedOverwide: number[] = [];
 		for (let i = firstChanged; i <= renderEnd; i++) {
 			if (i > firstChanged) buffer += "\r\n";
 			buffer += "\x1b[2K"; // Clear current line
@@ -2487,24 +2551,16 @@ export class TUI extends Container {
 			if (!isImage && visibleWidth(line) > width) {
 				// An overwide line would wrap and corrupt the row tracking. Clamp it
 				// like the fullscreen renderer does (fullscreen.ts paint) instead of
-				// crashing the process, but keep writing the crash log so the
-				// offending component can still be found and fixed.
-				const crashLogPath = path.join(os.homedir(), ".prime", "agent", "pi-crash.log");
-				const crashData = [
-					`Clamped overwide line at ${new Date().toISOString()}`,
-					`Terminal width: ${width}`,
-					`Line ${i} visible width: ${visibleWidth(line)}`,
-					"",
-					"=== All rendered lines ===",
-					...newLines.map((l, idx) => `[${idx}] (w=${visibleWidth(l)}) ${l}`),
-					"",
-				].join("\n");
-				fs.mkdirSync(path.dirname(crashLogPath), { recursive: true });
-				fs.writeFileSync(crashLogPath, crashData);
+				// crashing the process, and record it once for the whole render so
+				// the offending component can still be found and fixed.
+				clampedOverwide.push(i);
 				buffer += sliceByColumn(line, 0, width, true);
 			} else {
 				buffer += line;
 			}
+		}
+		if (clampedOverwide.length > 0) {
+			this.logClampedOverwideLines(clampedOverwide, newLines, width);
 		}
 
 		// Track where cursor ended up after rendering

@@ -140,6 +140,21 @@ export async function deliverRlmChildTerminalOutcome(
 ): Promise<void> {
 	const { run, child, sessionName, parentReplyCountBeforeRun, deliver } = input;
 	if (run.detachedDeletion || run.suppressTerminalNotice) return;
+	// A quota-parked child is paused, not finished: its wake owns the resume, so a
+	// terminal verdict now would report the pause as the child's death and the
+	// parent would redo work that is about to continue. The run loop waits a park
+	// out before settling; reaching classification still parked means the park
+	// outlived the quiescence barrier's give-up. The park's wake (or its spent
+	// budget, which clears the park first) settles the story later.
+	if (run.status !== "cancelled" && child?.isQuotaParked) {
+		sessionLog.info("rlm child terminal outcome skipped: child is quota-parked and will resume", {
+			sessionId: host.sessionId,
+			childId: run.id,
+			sessionName,
+			runStatus: run.status,
+		});
+		return;
+	}
 	const facts = collectRlmChildTerminalFacts(host, run, child, parentReplyCountBeforeRun);
 	const outcome = classifyRlmChildTerminalOutcomeSafely(facts, (detail) => {
 		// A silent fallback is how a kill goes back to being reported as a

@@ -1,9 +1,11 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { describe, expect, it, vi } from "vitest";
+import { ENV_AGENT_DIR } from "../src/config.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import {
@@ -17,6 +19,7 @@ import {
 	type DaemonAttachResult,
 	type DaemonClientCapability,
 	type DaemonCommand,
+	type DaemonOutbound,
 	type DaemonResponse,
 	type DaemonSessionSnapshot,
 	getDaemonCommandCompatibilities,
@@ -28,8 +31,14 @@ import {
 	success,
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
-import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+import {
+	type ClientCatchupRetryPolicy,
+	DaemonSupervisor,
+	DEFAULT_CLIENT_CATCHUP_RETRY_POLICY,
+} from "../src/modes/daemon/daemon-supervisor.js";
+import type { DaemonWorkerFrameHeader } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { SnapshotTranscriptCache } from "../src/modes/daemon/snapshot-transcript-cache.js";
+import type { PrivateFrame } from "../src/modes/session-worker/private-framing.js";
 import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -688,6 +697,178 @@ describe("supervisor slim attach serve (rev 44)", () => {
 			expect(fixture.worker.client.request).toHaveBeenCalledOnce();
 			expect(attached.result.snapshot.messages).toHaveLength(messages.length);
 			expect("messagesOmitted" in attached.result.snapshot).toBe(false);
+		} finally {
+			fixture.dispose();
+		}
+	});
+});
+
+describe("supervisor slim catch-up drain (rev 44)", () => {
+	// The rev-44 attach paths (handleAttach/handleReattach) gate the chunk stream on
+	// chunked_snapshot && !slim_attach_transcript; the catch-up drain must make the
+	// same cut. A slim client reaches drainClientCatchups with the transfer handoff
+	// already consumed by attachClient (the tail window crossed inline), so the
+	// streamed branch finds no transcript and the drain must serve the window inline
+	// instead of failing into a give-up that parks the client behind
+	// deferredSessionPayloadsDropped.
+	const activeSessionId = "active-slim-catchup";
+
+	function makeCatchupFixture(options: {
+		messageCount: number;
+		/** Register the session in the worker/roster; false leaves the attach target unknown. */
+		knownSession?: boolean;
+	}) {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-slim-catchup-"));
+		// Keep the supervisor's rotating log inside the fixture tree, never the real agent dir.
+		const previousAgentDir = process.env[ENV_AGENT_DIR];
+		process.env[ENV_AGENT_DIR] = tempDir;
+		const knownSession = options.knownSession !== false;
+		const messages = fakeMessages(options.messageCount);
+		const summary: SessionSummary = {
+			id: activeSessionId,
+			activeSessionId,
+			lifecycle: "live",
+			activity: "idle",
+			isSessionActive: false,
+			sessionId: "session-slim-catchup",
+			cwd: "/tmp/project",
+			isStreaming: false,
+			isCompacting: false,
+			attachedClients: 0,
+			messageCount: options.messageCount,
+			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+		};
+		const cached = {
+			activeSessionId,
+			snapshot: { summary, messages },
+			replay: { status: "complete", toSequence: 0 },
+			lastEventSequence: 0,
+		} as unknown as DaemonAttachResult;
+		const worker = {
+			descriptor: {
+				workerId: "worker-slim-catchup",
+				lifecycle: "ready",
+				pid: 4321,
+				// A real descriptor always carries the root ids; the unknown-session
+				// fixture points them at a different session so the selector misses.
+				rootActiveSessionId: "active-slim-catchup-root",
+				rootSessionId: "session-slim-catchup",
+			},
+			client: {
+				isConnected: true,
+				request: vi.fn(async (command: { type: string }) => {
+					throw new Error(`unexpected worker request: ${command.type}`);
+				}),
+			},
+			summaries: new Map(knownSession ? [[activeSessionId, summary]] : []),
+			snapshotCache: new Map(knownSession ? [[activeSessionId, cached]] : []),
+			snapshotTransferFrames: new Map(),
+			snapshotLoads: new Map(),
+			transcriptCaches: new Map(),
+		};
+		const socket = new PassThrough();
+		const written: DaemonOutbound[] = [];
+		socket.on("data", (chunk: Buffer) => written.push(JSON.parse(chunk.toString()) as DaemonOutbound));
+		const client: DaemonSocketClient = {
+			id: "client-slim-catchup",
+			socket: socket as unknown as DaemonSocketClient["socket"],
+			capabilities: new Set<DaemonClientCapability>([
+				"attach_snapshot",
+				"event_sequence",
+				"slim_attach",
+				"chunked_snapshot",
+				"slim_attach_transcript",
+			]),
+			supportsExtensionUi: false,
+			detachInput: () => {},
+			attachedActiveSessionIds: new Set([activeSessionId]),
+			catchupActiveSessionIds: new Set([activeSessionId]),
+			catchupPurposes: new Map([[activeSessionId, "replacement" as const]]),
+		};
+		const catchupRetryPolicy: ClientCatchupRetryPolicy = { ...DEFAULT_CLIENT_CATCHUP_RETRY_POLICY, jitterMs: 0 };
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			clients: new Set([client]),
+			streamReconstructor: { seed: vi.fn(), hasPartial: vi.fn(() => false), clear: vi.fn() },
+			syncWorkerExtensionUi: vi.fn(async () => {}),
+			snapshotCacheRoot: tempDir,
+			socketPath: join(tempDir, "daemon.sock"),
+			catchupRetryPolicy,
+		}) as {
+			drainClientCatchups(socketClient: DaemonSocketClient): Promise<"drained" | "retry-later">;
+			handleWorkerFrame(target: unknown, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+		if (knownSession) {
+			seedSupervisorRoster(supervisor, worker);
+		}
+		return {
+			supervisor,
+			worker,
+			client,
+			written,
+			messages,
+			dispose: () => {
+				socket.destroy();
+				if (previousAgentDir === undefined) {
+					delete process.env[ENV_AGENT_DIR];
+				} else {
+					process.env[ENV_AGENT_DIR] = previousAgentDir;
+				}
+				rmSync(tempDir, { recursive: true, force: true });
+			},
+		};
+	}
+
+	it("serves a replacement catch-up to a slim client as an inline tail window", async () => {
+		const fixture = makeCatchupFixture({ messageCount: DAEMON_SLIM_ATTACH_MESSAGE_TAIL + 50 });
+		try {
+			await fixture.supervisor.drainClientCatchups(fixture.client);
+			const replaced = fixture.written.filter((message) => message.type === "session_replaced");
+			expect(replaced).toHaveLength(1);
+			const frame = replaced[0] as Extract<DaemonOutbound, { type: "session_replaced" }>;
+			expect(frame.snapshotFollows).toBeUndefined();
+			expect(frame.messages).toHaveLength(DAEMON_SLIM_ATTACH_MESSAGE_TAIL);
+			expect(frame.messages[0]).toEqual(fixture.messages[50]);
+			expect(frame.messagesOmitted).toBe(50);
+			// The failure mode this fixes: a give-up frame plus the stuck drop marker.
+			expect(fixture.written.some((message) => message.type === "session_snapshot_failed")).toBe(false);
+			expect(fixture.client.deferredSessionPayloadsDropped?.has(activeSessionId) ?? false).toBe(false);
+			// The queue drained: nothing stays queued behind the delivered replacement.
+			expect(fixture.client.catchupActiveSessionIds?.size ?? 0).toBe(0);
+		} finally {
+			fixture.dispose();
+		}
+	});
+
+	it("clears the dropped-deferral marker when a catch-up gives up, so the client's re-pull heals", async () => {
+		// The attach target is unknown to the supervisor: a permanent failure, so the
+		// bounded retry gives up at once and tells the client to re-pull. The re-pull
+		// (recoverFailedSnapshot) is not an attach, so if the marker survived it would
+		// block every later relayed frame for good.
+		const fixture = makeCatchupFixture({ messageCount: 3, knownSession: false });
+		try {
+			await fixture.supervisor.drainClientCatchups(fixture.client);
+			const failed = fixture.written.filter((message) => message.type === "session_snapshot_failed");
+			expect(failed).toHaveLength(1);
+			expect(fixture.client.deferredSessionPayloadsDropped?.has(activeSessionId) ?? false).toBe(false);
+
+			// Live frames flow again once the client owns the reseed: a relayed
+			// session event must reach the socket instead of hitting the marker.
+			const event: DaemonOutbound = {
+				type: "session_event",
+				activeSessionId,
+				event: { type: "session_info_changed", name: "after-give-up" },
+			};
+			fixture.supervisor.handleWorkerFrame(fixture.worker, {
+				header: {
+					kind: "outbound",
+					outboundType: "session_event",
+					activeSessionId,
+					sessionEventType: "session_info_changed",
+				},
+				payload: Buffer.from(`${JSON.stringify(event)}\n`),
+			});
+			expect(fixture.written.some((message) => message.type === "session_event")).toBe(true);
 		} finally {
 			fixture.dispose();
 		}

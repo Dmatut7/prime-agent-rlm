@@ -149,12 +149,14 @@ export function transformMessages<TApi extends Api>(
 	const toolCallIdMap = new Map<string, string>();
 	const imageAwareMessages = downgradeUnsupportedImages(messages, model);
 
-	// Errored turns are skipped in the pairing pass below and never reach the
-	// provider, so the most recent turn they could shadow is the one before them.
+	// Errored turns are skipped in the pairing pass below and aborted turns replay
+	// as a text-only abort trace; neither reaches the provider with its thinking,
+	// so the most recent turn either could shadow is the one before them.
 	let lastReplayableAssistantIndex = -1;
 	for (let i = 0; i < imageAwareMessages.length; i++) {
 		const candidate = imageAwareMessages[i];
-		if (candidate.role === "assistant" && (candidate as AssistantMessage).stopReason !== "error") {
+		const stopReason = candidate.role === "assistant" ? (candidate as AssistantMessage).stopReason : undefined;
+		if (stopReason !== undefined && stopReason !== "error" && stopReason !== "aborted") {
 			lastReplayableAssistantIndex = i;
 		}
 	}
@@ -183,6 +185,11 @@ export function transformMessages<TApi extends Api>(
 
 			const transformedContent = assistantMsg.content.flatMap((block) => {
 				if (block.type === "thinking") {
+					// An aborted turn replays as a text-only abort trace (the pairing pass
+					// below): its partial thinking is dropped there, so flattening it into
+					// text here would smuggle the half-formed reasoning back in. Drop it
+					// before any same-model or most-recent handling can keep it.
+					if (assistantMsg.stopReason === "aborted") return [];
 					// Redacted thinking is opaque encrypted content, only valid for the same model.
 					// Drop it for cross-model to avoid API errors.
 					if (block.redacted) {

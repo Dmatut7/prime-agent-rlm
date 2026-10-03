@@ -8,6 +8,7 @@ import type {
 import {
 	formatStreamFailureMessage,
 	recordStreamFailure,
+	StreamFailureError,
 	streamFailureFromStopReason,
 } from "../utils/stream-failure.js";
 import {
@@ -474,7 +475,11 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			if (error instanceof CodexApiError && error.usage) {
 				output.usage = usageFromResponsesFrame(error.usage);
 				calculateCost(model, output.usage);
-				applyServiceTierPricing(output.usage, error.serviceTier ?? options?.serviceTier, model);
+				applyServiceTierPricing(
+					output.usage,
+					resolveCodexServiceTier(error.serviceTier, options?.serviceTier),
+					model,
+				);
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			// Classify + redact like every other provider: the session's
@@ -591,6 +596,23 @@ function applyServiceTierPricing(
 	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
 }
 
+/**
+ * The Codex endpoint does not echo the tier it served: the terminal frame reports
+ * service_tier "default" even when a flex/priority request was served at that tier
+ * (badlogic/pi-mono#3188, resolver first added in #3307). Trust the requested tier
+ * when the response says "default"; a response that actually names flex/priority
+ * still wins, and an omitted tier falls back to the request.
+ */
+function resolveCodexServiceTier(
+	responseServiceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
+	requestServiceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
+): ResponseCreateParamsStreaming["service_tier"] | undefined {
+	if (responseServiceTier === "default" && (requestServiceTier === "flex" || requestServiceTier === "priority")) {
+		return requestServiceTier;
+	}
+	return responseServiceTier ?? requestServiceTier;
+}
+
 function resolveCodexUrl(baseUrl?: string): string {
 	const raw = baseUrl && baseUrl.trim().length > 0 ? baseUrl : DEFAULT_CODEX_BASE_URL;
 	const normalized = raw.replace(/\/+$/, "");
@@ -615,6 +637,7 @@ async function processStream(
 ): Promise<void> {
 	await processResponsesStream(mapCodexEvents(parseSSE(response)), output, stream, model, {
 		serviceTier: options?.serviceTier,
+		resolveServiceTier: resolveCodexServiceTier,
 		applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
 	});
 }
@@ -665,7 +688,11 @@ class CodexProtocolError extends Error {
 }
 
 function isCodexNonTransportError(error: unknown): boolean {
-	return error instanceof CodexApiError || error instanceof CodexProtocolError;
+	// A failure derived from the provider's own stop reason (content filter,
+	// refusal, ...) is a model outcome the connection delivered fine: it must
+	// neither trigger an SSE resend of the conversation nor poison the session's
+	// WebSocket fallback bookkeeping.
+	return error instanceof CodexApiError || error instanceof CodexProtocolError || error instanceof StreamFailureError;
 }
 
 const STALE_CONTINUATION_ERROR_CODE = "previous_response_not_found";
@@ -1443,6 +1470,7 @@ async function processWebSocketStream(
 			model,
 			{
 				serviceTier: options?.serviceTier,
+				resolveServiceTier: resolveCodexServiceTier,
 				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
 			},
 		);

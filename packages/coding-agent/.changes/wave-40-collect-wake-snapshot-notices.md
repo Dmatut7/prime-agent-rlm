@@ -1,0 +1,2 @@
+- Fixed `rlm.collect` reporting already-delivered agent messages as newly pending: a wake-capable collect now counts arrivals from its own start, and the kernel's pending counter no longer double-counts an arrival reported by both the admission push and the collect reply.
+- Fixed the post-compaction and kernel-restore state notices listing the host's own internal names (bootstrap `_prime_agent_*` helpers, `_PrimeAgent*` skill wrappers) as variables that failed to save.

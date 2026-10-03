@@ -17,7 +17,6 @@ import {
 	applyRefinementProposal,
 	DEFAULT_HARNESS_INDEX_MAX_BYTES,
 	flattenIndexText,
-	HARNESS_INDEX_TITLE_MAX_CHARS,
 	type HarnessEntry,
 	type HarnessScope,
 	type HarnessState,
@@ -108,9 +107,10 @@ export interface ConsolidationOptions {
 	/** Age-based staleness in days; off by default. */
 	staleDays?: number;
 	staleMinContentChars?: number;
-	/** Title slimming budget in code points; default HARNESS_INDEX_TITLE_MAX_CHARS
-	 * (the digest's index layer already truncates its rendering there, so the
-	 * default costs the face nothing). `<= 0` disables the pass. */
+	/** Title slimming budget in code points; off by default (the digest's index
+	 * layer already truncates its own rendering, so slimming the stored title is
+	 * an explicit choice, not a side effect of a dry-run default). `<= 0` also
+	 * disables the pass. */
 	slimTitleChars?: number;
 	indexMaxBytes?: number;
 	/** ISO-8601 clock injection for the staleness pass; tests pin it. */
@@ -260,13 +260,39 @@ function canonicalOrder(memberIds: readonly string[], byId: Map<string, HarnessE
 	return ordered;
 }
 
-const MERGE_PIECE_SPLIT = /[。！？；!?\n]/;
+const MERGE_PIECE_DELIMITERS = new Set(["。", "！", "？", "；", "!", "?", "\n"]);
+// Spans whose delimiter characters are not sentence boundaries: fenced code
+// blocks (their newlines), inline code, and http(s) URLs (query `?`, `!`).
+// CJK sentence punctuation is excluded from the URL tail so a `！` right after
+// a link still ends the piece. Branch order matters: fenced before inline, or
+// the fence's own backticks would match as inline code. harness.py's
+// `_MERGE_PIECE_PROTECT` uses the identical patterns in the identical order.
+const MERGE_PIECE_PROTECT = /```[\s\S]*?```|`[^`\n]*`|https?:\/\/[^\s。！？；]+/g;
 
+/** Sentence-ish pieces for the merge appendix; URLs and code stay whole. */
 function mergePieces(text: string): string[] {
-	return text
-		.split(MERGE_PIECE_SPLIT)
-		.map((piece) => piece.trim())
-		.filter((piece) => piece.length > 0);
+	const pieces: string[] = [];
+	let current = "";
+	const flush = () => {
+		const piece = current.trim();
+		if (piece.length > 0) pieces.push(piece);
+		current = "";
+	};
+	const feed = (segment: string) => {
+		for (const char of segment) {
+			if (MERGE_PIECE_DELIMITERS.has(char)) flush();
+			else current += char;
+		}
+	};
+	let cursor = 0;
+	for (const match of text.matchAll(MERGE_PIECE_PROTECT)) {
+		feed(text.slice(cursor, match.index));
+		current += match[0];
+		cursor = match.index + match[0].length;
+	}
+	feed(text.slice(cursor));
+	flush();
+	return pieces;
 }
 
 /** Canonical body plus each absorbed entry's unique sentences as a bullet
@@ -331,10 +357,14 @@ function compareOperations(a: ConsolidationOperation, b: ConsolidationOperation)
  * 1. merge: near-duplicate clusters (the write gate's tokenizer/idf/cosine in
  *    batch form) at `mergeMinScore` or better fold into their most recently
  *    updated member; the absorbed entries' unique sentences move into the
- *    canonical body as a bullet appendix.
+ *    canonical body as a bullet appendix. A merge target is itself never a
+ *    delete candidate: the later passes read the pre-merge store, so without
+ *    the shield a containment or age check would delete the entry the merge
+ *    just wrote into.
  * 2. delete: stale entries — either fully contained in a surviving entry's
  *    normalized content, or older than `staleDays` (off by default).
- * 3. rename: titles longer than `slimTitleChars` code points slim to the cap.
+ * 3. rename: titles longer than `slimTitleChars` code points slim to the cap
+ *    (off by default).
  */
 export function planHarnessConsolidation(state: HarnessState, options: ConsolidationOptions = {}): ConsolidationPlan {
 	const kinds = [...(options.kinds ?? (["memory"] as const))];
@@ -348,7 +378,7 @@ export function planHarnessConsolidation(state: HarnessState, options: Consolida
 		throw new Error(`mergeMinScore must be in [0, 1], got ${mergeMinScore}`);
 	}
 	const staleMinContentChars = options.staleMinContentChars ?? CONSOLIDATION_STALE_MIN_CONTENT_CHARS;
-	const slimTitleChars = options.slimTitleChars === undefined ? HARNESS_INDEX_TITLE_MAX_CHARS : options.slimTitleChars;
+	const slimTitleChars = options.slimTitleChars;
 	const indexMaxBytes = options.indexMaxBytes ?? DEFAULT_HARNESS_INDEX_MAX_BYTES;
 	const nowMs = options.now === undefined ? Date.now() : Date.parse(options.now);
 	if (Number.isNaN(nowMs)) {
@@ -362,6 +392,13 @@ export function planHarnessConsolidation(state: HarnessState, options: Consolida
 	// not be targeted again by a later one.
 	const removed = new Map<RefinementKind, Set<string>>();
 	for (const kind of REFINEMENT_KINDS) removed.set(kind, new Set());
+	// Merge targets keep their entries: passes 2-3 read the pre-merge store, so
+	// a containment or age check would otherwise delete the canonical right
+	// after the merge wrote the absorbed content into it. A target still counts
+	// as a containment *container*: its merged body only grows, so what the
+	// original contains stays contained.
+	const mergeTargets = new Map<RefinementKind, Set<string>>();
+	for (const kind of REFINEMENT_KINDS) mergeTargets.set(kind, new Set());
 
 	// Pass 1: near-duplicate merges.
 	for (const kind of kinds) {
@@ -420,6 +457,7 @@ export function planHarnessConsolidation(state: HarnessState, options: Consolida
 				score: clusterScores.get(find(ordered[0])) ?? 0,
 			});
 			for (const entry of absorbed) removed.get(kind)!.add(entry.id);
+			mergeTargets.get(kind)!.add(canonical.id);
 		}
 	}
 
@@ -450,6 +488,7 @@ export function planHarnessConsolidation(state: HarnessState, options: Consolida
 				}
 			}
 			for (const entry of survivors) {
+				if (mergeTargets.get(kind)!.has(entry.id)) continue;
 				const text = texts.get(entry.id)!;
 				if (codePointLength(text) < staleMinContentChars) continue;
 				// Probe with the entry's rarest SHARED term: a contained entry
@@ -473,7 +512,7 @@ export function planHarnessConsolidation(state: HarnessState, options: Consolida
 		}
 		if (options.staleDays !== undefined) {
 			for (const entry of survivors) {
-				if (marked.has(entry.id)) continue;
+				if (marked.has(entry.id) || mergeTargets.get(kind)!.has(entry.id)) continue;
 				const recency = consolidationRecency(entry);
 				const age = recency ? ageInDays(recency, nowMs) : undefined;
 				if (age !== undefined && age > options.staleDays) {

@@ -1,0 +1,1 @@
+- Added `FullscreenViewport.noteTranscriptPrepend` (and `TUI.noteTranscriptPrepend`): rows inserted at the top of the transcript keep a paused window on the rows it shows and never count as new content below, fixing the snap-to-bottom and fake new-content indicator when a history page is prepended.

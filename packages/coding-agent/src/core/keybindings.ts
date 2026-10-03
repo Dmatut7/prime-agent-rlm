@@ -204,18 +204,22 @@ export const KEYBINDINGS = {
 	"app.message.navigateOlder": {
 		defaultKeys: "alt+up",
 		description: "Select older pending message",
+		repeatable: true,
 	},
 	"app.message.navigateNewer": {
 		defaultKeys: "alt+down",
 		description: "Select newer pending message or draft",
+		repeatable: true,
 	},
 	"app.message.moveEarlier": {
 		defaultKeys: "ctrl+alt+up",
 		description: "Move selected pending message earlier",
+		repeatable: true,
 	},
 	"app.message.moveLater": {
 		defaultKeys: "ctrl+alt+down",
 		description: "Move selected pending message later",
+		repeatable: true,
 	},
 	"app.clipboard.pasteImage": {
 		defaultKeys: process.platform === "win32" ? "alt+v" : "ctrl+v",
@@ -232,8 +236,8 @@ export const KEYBINDINGS = {
 	"app.agents.back": { defaultKeys: "left", description: "Return to parent agent scope" },
 	// Block navigation shares Alt+Up/Down with the pending-message browser: with a
 	// queue the keys browse it, without one they walk the conversation blocks.
-	"app.blocks.prev": { defaultKeys: "alt+up", description: "Focus the previous conversation block" },
-	"app.blocks.next": { defaultKeys: "alt+down", description: "Focus the next conversation block" },
+	"app.blocks.prev": { defaultKeys: "alt+up", description: "Focus the previous conversation block", repeatable: true },
+	"app.blocks.next": { defaultKeys: "alt+down", description: "Focus the next conversation block", repeatable: true },
 	"app.blocks.toggle": { defaultKeys: ["enter", "space"], description: "Open or close the focused block" },
 	"app.blocks.copy": { defaultKeys: "y", description: "Copy the focused block" },
 	"app.blocks.exit": { defaultKeys: "escape", description: "Leave block navigation" },
@@ -280,10 +284,12 @@ export const KEYBINDINGS = {
 	"app.models.reorderUp": {
 		defaultKeys: "alt+up",
 		description: "Move model up in order",
+		repeatable: true,
 	},
 	"app.models.reorderDown": {
 		defaultKeys: "alt+down",
 		description: "Move model down in order",
+		repeatable: true,
 	},
 	"app.models.clearSearch": {
 		defaultKeys: "ctrl+c",

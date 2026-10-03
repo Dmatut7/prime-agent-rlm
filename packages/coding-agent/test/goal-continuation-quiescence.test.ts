@@ -10,6 +10,7 @@ type Harness = {
 	_sessionInputPumpSuspended: boolean;
 	_hasUnsettledRlmQuiescenceWork: () => boolean;
 	_stopGoalContinuationForTerminalMessage: () => boolean;
+	_throttlePersistentGoalContinuation: () => boolean;
 	_ensureGoalRuntimeActive: () => void;
 	_goalContinuationBudgetExhausted: () => boolean;
 	_setGoalState: (goal: unknown) => void;
@@ -35,6 +36,7 @@ function harness(overrides: Partial<Harness> = {}): Harness {
 		_sessionInputPumpSuspended: false,
 		_hasUnsettledRlmQuiescenceWork: () => false,
 		_stopGoalContinuationForTerminalMessage: () => false,
+		_throttlePersistentGoalContinuation: () => false,
 		_ensureGoalRuntimeActive: () => {},
 		_goalContinuationBudgetExhausted: () => false,
 		_setGoalState: function (this: Harness, goal: unknown) {

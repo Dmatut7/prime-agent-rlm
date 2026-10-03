@@ -37,7 +37,7 @@ import {
 	SUMMARIZATION_INFLATION_FLOOR,
 	summarizationFrameText,
 } from "./summarization-budget.js";
-import { buildUserRequestLedger, renderUserRequests } from "./user-requests.js";
+import { BRANCH_USER_REQUESTS_HEADER, buildUserRequestLedger, renderUserRequests } from "./user-requests.js";
 import {
 	computeFileLists,
 	createFileOps,
@@ -442,11 +442,23 @@ export async function generateBranchSummary(
 	if (response.stopReason === "error") {
 		return { error: response.errorMessage || "Summarization failed" };
 	}
+	// A response cut at the output cap is a prefix of the summary, and a clean stop
+	// can carry no text at all; completeWithProviderRetry resends a contentless reply
+	// but never a budget signal, and an exhausted chain returns it unchanged. Storing
+	// either would replace the abandoned branch's record with a fragment (the empty
+	// case used to be stored as the literal "No summary generated"), so both are
+	// failures the caller surfaces instead.
+	if (response.stopReason === "length") {
+		return { error: 'Branch summarization failed: the summarizer\'s output hit the token cap (stopReason "length")' };
+	}
 
 	let summary = response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
 		.map((c) => c.text)
 		.join("\n");
+	if (summary.trim().length === 0) {
+		return { error: "Branch summarization failed: the summarizer returned no text" };
+	}
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);
@@ -461,7 +473,7 @@ export async function generateBranchSummary(
 		generation: 1,
 		tokenBudget: BRANCH_USER_REQUESTS_TOKEN_BUDGET,
 	});
-	summary += renderFactAppendix(facts) + renderUserRequests(userRequests);
+	summary += renderFactAppendix(facts) + renderUserRequests(userRequests, { header: BRANCH_USER_REQUESTS_HEADER });
 	// The structured handoff too (W18-D): children admitted on the abandoned branch
 	// keep running after the navigation, and a summary that forgets them strands
 	// them. Slice-scoped: a branch summary is a terminal artifact with no
@@ -469,7 +481,9 @@ export async function generateBranchSummary(
 	summary += renderSessionHandoff(buildSessionHandoff(entries, { generation: 1 }));
 
 	return {
-		summary: summary || "No summary generated",
+		// Non-empty by construction: the guards above return an error for an empty or
+		// truncated narrative, and the preamble alone already carries text.
+		summary,
 		readFiles,
 		modifiedFiles,
 		usage: response.usage,

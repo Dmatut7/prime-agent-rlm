@@ -90,6 +90,24 @@ describe("markdown split-lex streaming identity", () => {
 		assertStreamedIdentity(`${PAD} $x +\ny = z$ tail`, 80);
 	});
 
+	it("math delimiters spanning the cut boundary", () => {
+		// An unterminated \( or \[ lexes as an escape token, not a text token, so
+		// the delimiter scan alone cannot keep the cut ahead of it; a cut inside
+		// the formula would leave the closer unmatched in the tail for good.
+		assertStreamedIdentity(`${PAD} \\(x^2 + y^2 = z^2\\) tail words`, 80);
+		assertStreamedIdentity(`${PAD} \\(x^2 +\ny^2 = z^2\\) tail words`, 80, true);
+		assertStreamedIdentity(`${PAD} \\[x^2 + y^2\\] tail words`, 80);
+		assertStreamedIdentity(`${PAD} price $5 and \\(a\\) and \\[b\\] mixed`, 80, true);
+	});
+
+	it("odd backtick in the tail re-typing prefix emphasis falls back", () => {
+		// marked's codespan masking covers the whole paragraph text, so a dangling
+		// backtick after the cut can un-type an emphasis pair inside the verified
+		// prefix; those frames must fall back to a full lex.
+		assertStreamedIdentity(`${PAD} \`zx\`\`*e\`*e* ghgh\nx\` tail \`end\` done`, 80);
+		assertStreamedIdentity(`${PAD} \`zx\`\`*e\`*e* ghgh\nx\` tail \`end\` done`, 80, true);
+	});
+
 	it("late closer for an early unmatched opener", () => {
 		// The early `*` poisons split advancement past it; identity must hold
 		// through the frame where the closer re-types the whole prefix.

@@ -7,6 +7,12 @@ export interface PromptStash {
 	pasteSnapshot?: EditorPasteSnapshot;
 	images?: readonly (readonly [number, ImageContent])[];
 	restoreOnOpen?: boolean;
+	/**
+	 * The draft was stashed by Esc clearing the editor, not by an explicit Ctrl+S:
+	 * it never pops back into the editor after an unrelated send, only a manual
+	 * Ctrl+S restore brings it back.
+	 */
+	escCleared?: boolean;
 }
 
 export interface PromptStashState {

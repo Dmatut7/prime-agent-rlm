@@ -1,0 +1,3 @@
+- Fixed a branch summary presenting the abandoned branch's user requests as live obligations: the verbatim block now says those words belong to the branch that was left behind, not the current instruction stream.
+- Fixed the compaction handoff listing subagents whose runs had already ended (cancelled or completed without a reply) as still in flight; any terminal record now resolves the child, and owner-directed duty-log questions no longer leak into the model-facing handoff.
+- Fixed an empty or output-truncated summarizer response being saved as a valid compaction or branch summary; it is now treated as a failure and retried with a smaller slice.

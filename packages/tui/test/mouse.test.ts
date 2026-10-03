@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import {
+	isLegacyMouseRelease,
 	isMouseHover,
 	isMouseSequence,
 	isWheelDown,
@@ -133,6 +134,19 @@ describe("parseMouseEvent", () => {
 		assert.strictEqual(parseMouseEvent("\x1b[A"), null);
 		assert.strictEqual(parseMouseEvent("a"), null);
 		assert.strictEqual(parseMouseEvent("\x1b[M"), null);
+	});
+});
+
+describe("isLegacyMouseRelease", () => {
+	it("matches only a motionless X10 release (button code 3)", () => {
+		const legacy = (button: number, x: number, y: number) =>
+			`\x1b[M${String.fromCharCode(32 + button)}${String.fromCharCode(32 + x)}${String.fromCharCode(32 + y)}`;
+		assert.strictEqual(isLegacyMouseRelease(parseMouseEvent(legacy(3, 10, 5))!), true);
+		// SGR releases carry their own button and never report code 3.
+		assert.strictEqual(isLegacyMouseRelease(parseMouseEvent("\x1b[<0;10;5m")!), false);
+		// A legacy press and a legacy hover move are not releases.
+		assert.strictEqual(isLegacyMouseRelease(parseMouseEvent(legacy(0, 10, 5))!), false);
+		assert.strictEqual(isLegacyMouseRelease(parseMouseEvent(legacy(35, 10, 5))!), false);
 	});
 });
 

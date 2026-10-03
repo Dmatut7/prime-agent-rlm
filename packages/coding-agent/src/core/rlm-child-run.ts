@@ -6,6 +6,7 @@
  * {@link RlmChildRunHost} / {@link RlmChildSnapshotHost}, which `AgentSession`
  * satisfies structurally, so the move changes no runtime behavior.
  */
+import { randomUUID } from "node:crypto";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
 	type Api,
@@ -34,6 +35,7 @@ import type {
 	RlmSubagentModelSelection,
 } from "./agent-session.js";
 import { type CustomMessage, createRlmChildFailureMessage, createRlmChildTerminalNoticeMessage } from "./messages.js";
+import type { ClosedRlmChildCollectEntry } from "./rlm-child-collect.js";
 import { notifyRlmChildStall, type RlmChildStallNoticeHost } from "./rlm-child-stall-notice.js";
 import type { RlmChildStallAbortFacts, RlmChildTerminalOutcomeKind } from "./rlm-child-terminal.js";
 import {
@@ -44,6 +46,7 @@ import {
 	type RlmSpawnHandle,
 	type RlmSubagentRegistryEntry,
 	type RlmSubagentRuntime,
+	rlmCollectStallAbort,
 	type SubagentRuntimeHost,
 } from "./rlm-runtime.js";
 import type { SemanticEdgeRecorder } from "./semantic-edges.js";
@@ -327,6 +330,15 @@ export function rlmChildLabel(prompt: string): string {
 const RLM_CHILD_STALE_ACTIVITY_THRESHOLD_MS = 10 * 60_000;
 
 /**
+ * Backstop recheck while a run waits out a child's quota park. Park lifts arrive
+ * with child events (the wake's resume turn), but the teardowns that drop a park
+ * without resuming - a spent wake budget, a user-cancelled wake - emit no session
+ * event, so the wait re-checks on this interval too. Ungrounded waits would
+ * otherwise notice only when the child's next event happens to come.
+ */
+const RLM_CHILD_QUOTA_PARK_LIFT_RECHECK_MS = 30_000;
+
+/**
  * Lazily computed staleness for a running child: how long since the last
  * tracked activity, once past the threshold. Computed at snapshot build time
  * only — no background timers update it.
@@ -604,6 +616,12 @@ export interface RlmChildRunHost extends RlmChildStallNoticeHost {
 	readonly _activeRlmChildRuns: Map<string, RlmChildRun>;
 	readonly _unsettledRlmChildRuns: Set<RlmChildRun>;
 	readonly _pendingRlmSubagentSessionNames: Set<string>;
+	/**
+	 * Cap slots held by spawns between the live-children check and the run's
+	 * registration: the admission round-trip in between is async, so without the
+	 * placeholder two parallel spawns both pass the check on the same count.
+	 */
+	readonly _pendingRlmChildAdmissions: Set<string>;
 	readonly _rlmChildSessions: Map<string, RetainedRlmChild>;
 	readonly _deletedRlmChildIds: Set<string>;
 	readonly _rlmChildUnsubscribes: Map<string, () => void>;
@@ -663,6 +681,7 @@ export interface RlmChildRunHost extends RlmChildStallNoticeHost {
 	_currentActiveSessionId(): Promise<string | undefined>;
 	registerRlmChildSession(childId: string, session: AgentSession, unsubscribe?: () => void): boolean;
 	_removeRlmSubagentTracking(childId: string, run?: RlmChildRun): void;
+	_rememberClosedRlmChild(childId: string, record: ClosedRlmChildCollectEntry): void;
 	_ensureRlmRunDeletionCleanup(run: RlmChildRun, session: AgentSession): Promise<void>;
 	_observeRlmRunDeletionCleanup(
 		run: RlmChildRun,
@@ -714,7 +733,10 @@ export async function startRlmChildRun(
 	// Refusing loudly (instead of queueing) keeps the fleet observable: a queued spawn
 	// looks identical to a running one from the parent's side.
 	if (host._rlmMaxConcurrentChildren > 0) {
-		const liveChildren = host._liveRlmChildRunCount();
+		// Admissions in flight hold a slot: the run joins the live count only after
+		// the async admission round-trip below, and counting only the registered
+		// runs let two parallel spawns both pass this check on the same count.
+		const liveChildren = host._liveRlmChildRunCount() + host._pendingRlmChildAdmissions.size;
 		if (liveChildren >= host._rlmMaxConcurrentChildren) {
 			throw new Error(
 				`RLM subagent limit reached: this session already has ${liveChildren} live children and the concurrency cap is ${host._rlmMaxConcurrentChildren}. ` +
@@ -742,6 +764,11 @@ export async function startRlmChildRun(
 		if (requestedSessionName) host._pendingRlmSubagentSessionNames.delete(requestedSessionName);
 		if (mintedSessionName) host._pendingRlmSubagentSessionNames.delete(mintedSessionName);
 	};
+	// Hold the cap slot from here (still synchronous with the check above) until
+	// the run registers; the admission round-trip in between is where a parallel
+	// spawn would otherwise see a count this spawn never joined.
+	const admissionSlot = randomUUID();
+	host._pendingRlmChildAdmissions.add(admissionSlot);
 	let modelSelection: RlmSubagentModelSelection;
 	let childSessionDir = "";
 	let childNodeId = "";
@@ -778,6 +805,7 @@ export async function startRlmChildRun(
 		sessionName = admitted.sessionName;
 		host._rlmHistoricalChildNamesNow().add(sessionName);
 	} catch (error) {
+		host._pendingRlmChildAdmissions.delete(admissionSlot);
 		releaseReservedSessionName();
 		throw error;
 	}
@@ -808,7 +836,13 @@ export async function startRlmChildRun(
 	const throwIfCancelled = () => {
 		if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
 	};
+	// Read through a closure: `_cancelRlmChildRun` mutates `run.status`
+	// asynchronously, and an inlined comparison would type-narrow to the status
+	// this flow last assigned.
+	const isRunCancelled = () => run.status === "cancelled";
 	host._activeRlmChildRuns.set(run.id, run);
+	// The run itself counts as live from here; the admission placeholder releases.
+	host._pendingRlmChildAdmissions.delete(admissionSlot);
 	host._unsettledRlmChildRuns.add(run);
 	// The kernel host aborts its in-flight requests on teardown; cancel the
 	// admitted run with it so a disposed host never leaves a live child behind.
@@ -821,7 +855,30 @@ export async function startRlmChildRun(
 	} else {
 		signal?.addEventListener("abort", abortFromHost, { once: true });
 	}
+	// Waiters blocked on the child's quota park lifting. Nudged from
+	// emitChildUpdate: every child event funnels through it, and so does
+	// `_cancelRlmChildRun` (it calls `run.emitUpdate`), which is how a delete or
+	// a parent teardown wakes the wait instead of riding out the park.
+	const quotaParkLiftWaiters = new Set<() => void>();
+	const nudgeQuotaParkLiftWaiters = () => {
+		if (quotaParkLiftWaiters.size === 0) return;
+		for (const waiter of [...quotaParkLiftWaiters]) waiter();
+	};
+	const waitForQuotaParkLift = (): Promise<void> =>
+		new Promise<void>((resolve) => {
+			const done = () => {
+				clearTimeout(timer);
+				quotaParkLiftWaiters.delete(done);
+				resolve();
+			};
+			const timer = setTimeout(done, RLM_CHILD_QUOTA_PARK_LIFT_RECHECK_MS);
+			timer.unref?.();
+			quotaParkLiftWaiters.add(done);
+		});
 	const emitChildUpdate = () => {
+		// The park-lift nudge precedes the unchanged-fields early return on purpose:
+		// a cancellation changes no volatile field before it must wake the wait.
+		nudgeQuotaParkLiftWaiters();
 		// Streaming chunks mostly change nothing the wire can see: the preview is
 		// capped after the first ~160 characters and the label is a run-level
 		// constant. Comparing the volatile fields first keeps the per-chunk cost
@@ -1082,6 +1139,16 @@ export async function startRlmChildRun(
 				customMessage: spawnMessage,
 			});
 			await child.waitForRlmQuiescence();
+			// A quota park ends the turn, not the task: the child parked until the
+			// provider's usage reset and its own wake resumes it. Settling here would
+			// read the parked turn's error stop as the child's death, hand the parent a
+			// failure notice for work that is about to continue, and the resumed child
+			// would deliver the same result a second time. A parked child is still
+			// running: wait out the park and the resumed episode before settling.
+			while (!isRunCancelled() && child.isQuotaParked) {
+				await waitForQuotaParkLift();
+				if (!isRunCancelled()) await child.waitForRlmQuiescence();
+			}
 			if (run.error) throw new Error(run.error);
 			run.status = "done";
 			// Only successful completions return; the edge lands on the parent's next commit.
@@ -1208,6 +1275,38 @@ export async function startRlmChildRun(
 						run.session = undefined;
 					} else if (run.status !== "error") {
 						host._removeRlmSubagentTracking(run.id, run);
+					} else if (run.session === undefined) {
+						// A failed run that never bound a session holds no resident work,
+						// so no idle passivation will ever come for it: left in the active
+						// map it would nail its name down forever and grow the map without
+						// bound. It settles into the bounded closed records instead - the
+						// collect/roster audit surfaces keep the failure, and the name is
+						// free for a re-spawn (numbered by the historical-name rule). The
+						// record is re-added after the removal because the removal deletes
+						// closed records. Entry shape mirrors rlmCollectEntryForRun, with
+						// settled forced: the record is written as part of settling.
+						const snapshot = rlmChildSnapshotForRun(host, run);
+						const record: ClosedRlmChildCollectEntry = {
+							entry: {
+								rlm_child_id: snapshot.id,
+								session_name: snapshot.sessionName,
+								session_dir: snapshot.sessionDir,
+								status: snapshot.status,
+								settled: true,
+								answer_preview: snapshot.answerPreview,
+								error: snapshot.error,
+								duration_ms: snapshot.durationMs,
+								tool_use_count: snapshot.toolUseCount,
+								replied_since_task: snapshot.repliedSinceTask,
+								activity_kind: undefined,
+								terminal_kind: run.terminalKind,
+								terminal_reason: run.terminalReason,
+								no_reply_notice_superseded: run.noReplyNoticeSuperseded,
+								stall_abort: rlmCollectStallAbort(run.stallAbort),
+							},
+						};
+						host._removeRlmSubagentTracking(run.id, run);
+						host._rememberClosedRlmChild(run.id, record);
 					} else {
 						run.unsubscribe?.();
 						run.abort = noopRlmChildAbort;

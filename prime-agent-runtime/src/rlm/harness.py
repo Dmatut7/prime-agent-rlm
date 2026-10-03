@@ -49,6 +49,15 @@ _OVERFLOW_CATALOG_MAX = 50
 # borderline. Evidence: docs/fork/evidence/harness-near-duplicate-write-gate.md.
 _NEAR_DUPLICATE_SIMILARITY_MIN = 0.40
 _NEAR_DUPLICATE_MAX_MATCHES = 3
+# Small-corpus band: with fewer than this many memories every term is rare, so
+# idf can no longer tell generic shared bigrams from distinctive ones and the
+# 0.40 band fires on related-but-distinct entries (measured: a session-dir vs
+# session-lease pair scores 0.52 at N=2). Tiny stores move to the
+# consolidation-grade floor; a false "overwrite the old entry" advisory there
+# costs a real memory, while a missed advisory costs little (the digest window
+# already shows every entry of a small store).
+_NEAR_DUPLICATE_SMALL_CORPUS = 10
+_NEAR_DUPLICATE_SMALL_CORPUS_SIMILARITY_MIN = 0.55
 # Stage-2 (memory-recall-design.md) write-side index byte cap: the digest's
 # compact id+title index layer is byte-capped, and a create/update that would
 # grow the index past the cap is refused with consolidation guidance, while
@@ -108,9 +117,9 @@ _ENFORCE_INDEX_CAP_ENV = "PRIME_AGENT_HARNESS_ENFORCE_INDEX_CAP"
 
 
 def _enforce_index_cap() -> bool:
-    """Whether the index cap refuses net-growth writes. Default off: until the
-    consolidation pass exists (memory design stage 3), the cap shapes the digest's
-    display layer only; enforcing it on an over-cap store would freeze all growth."""
+    """Whether the index cap refuses net-growth writes. Default off: the cap
+    shapes the digest's display layer only; enforcing it on an over-cap store
+    would freeze all growth, so refusal stays opt-in."""
     raw = (os.environ.get(_ENFORCE_INDEX_CAP_ENV) or "").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
@@ -765,11 +774,42 @@ def _canonical_order(member_ids: list[str], by_id: Mapping[str, HarnessEntry]) -
     return ordered
 
 
-_MERGE_PIECE_SPLIT = re.compile(r"[。！？；!?\n]")
+_MERGE_PIECE_DELIMITERS = frozenset("。！？；!?\n")
+# Spans whose delimiter characters are not sentence boundaries: fenced code
+# blocks (their newlines), inline code, and http(s) URLs (query `?`, `!`).
+# CJK sentence punctuation is excluded from the URL tail so a `！` right after
+# a link still ends the piece. Branch order matters: fenced before inline, or
+# the fence's own backticks would match as inline code. consolidation.ts uses
+# the identical patterns in the identical order.
+_MERGE_PIECE_PROTECT = re.compile(r"```.*?```|`[^`\n]*`|https?://[^\s。！？；]+", re.DOTALL)
 
 
 def _merge_pieces(text: str) -> list[str]:
-    return [piece for piece in (part.strip() for part in _MERGE_PIECE_SPLIT.split(text)) if piece]
+    """Sentence-ish pieces for the merge appendix; URLs and code stay whole."""
+    pieces: list[str] = []
+    current: list[str] = []
+
+    def flush() -> None:
+        piece = "".join(current).strip()
+        if piece:
+            pieces.append(piece)
+        current.clear()
+
+    def feed(segment: str) -> None:
+        for char in segment:
+            if char in _MERGE_PIECE_DELIMITERS:
+                flush()
+            else:
+                current.append(char)
+
+    cursor = 0
+    for match in _MERGE_PIECE_PROTECT.finditer(text):
+        feed(text[cursor : match.start()])
+        current.append(match.group(0))
+        cursor = match.end()
+    feed(text[cursor:])
+    flush()
+    return pieces
 
 
 def _merged_content(canonical: HarnessEntry, absorbed: Sequence[HarnessEntry]) -> str:
@@ -1566,7 +1606,7 @@ class HarnessState:
         merge_min_score: float = CONSOLIDATION_MERGE_MIN_SCORE,
         stale_days: float | None = None,
         stale_min_content_chars: int = CONSOLIDATION_STALE_MIN_CONTENT_CHARS,
-        slim_title_chars: int | None = _INDEX_TITLE_MAX_CHARS,
+        slim_title_chars: int | None = None,
         index_max_bytes: int = DEFAULT_HARNESS_INDEX_MAX_BYTES,
         now: datetime | str | None = None,
         global_: bool = False,
@@ -1581,15 +1621,18 @@ class HarnessState:
         1. merge: near-duplicate clusters (the write gate's tokenizer/idf/cosine
            in batch form) at ``merge_min_score`` or better fold into their most
            recently updated member; the absorbed entries' unique sentences move
-           into the canonical body as a bullet appendix.
+           into the canonical body as a bullet appendix. A merge target is
+           itself never a delete candidate: the later passes read the pre-merge
+           store, so without the shield a containment or age check would delete
+           the entry the merge just wrote into.
         2. delete: stale entries - either fully contained in a surviving entry's
            normalized content (bodies shorter than ``stale_min_content_chars``
            are not worth the suggestion), or older than ``stale_days`` (off by
            default; ``now`` injects the clock for deterministic runs).
         3. rename: titles longer than ``slim_title_chars`` code points slim to
-           the cap (the digest's index layer already truncates its rendering
-           there, so the default costs the face nothing). ``None`` or ``<= 0``
-           disables the pass.
+           the cap. Off by default (``None`` or ``<= 0``): the digest's index
+           layer already truncates its own rendering, so slimming the stored
+           title is an explicit choice, not a side effect of a dry-run default.
 
         Parity: ``planHarnessConsolidation`` in consolidation.ts builds the
         identical plan for the identical store.
@@ -1629,6 +1672,12 @@ class HarnessState:
         # Ids removed by an earlier pass (merge absorption or a stale delete)
         # must not be targeted again by a later one.
         removed: dict[str, set[str]] = {kind: set() for kind in _KINDS}
+        # Merge targets keep their entries: passes 2-3 read the pre-merge
+        # store, so a containment or age check would otherwise delete the
+        # canonical right after the merge wrote the absorbed content into it.
+        # A target still counts as a containment *container*: its merged body
+        # only grows, so what the original contains stays contained.
+        merge_targets: dict[str, set[str]] = {kind: set() for kind in _KINDS}
 
         # Pass 1: near-duplicate merges.
         for kind in kinds:
@@ -1683,6 +1732,7 @@ class HarnessState:
                     )
                 )
                 removed[kind].update(entry.id for entry in absorbed)
+                merge_targets[kind].add(canonical.id)
 
         # Pass 2: stale deletes - containment first, then age.
         for kind in kinds:
@@ -1706,6 +1756,8 @@ class HarnessState:
                     for term in profiles[entry.id]:
                         inverted.setdefault(term, []).append(entry.id)  # id-sorted survivor order
                 for entry in survivors:
+                    if entry.id in merge_targets[kind]:
+                        continue
                     text = texts[entry.id]
                     if len(text) < stale_min_content_chars:
                         continue
@@ -1726,7 +1778,7 @@ class HarnessState:
                             break
             if stale_days is not None:
                 for entry in survivors:
-                    if entry.id in marked:
+                    if entry.id in marked or entry.id in merge_targets[kind]:
                         continue
                     recency = _consolidation_recency(entry)
                     moment = _parse_iso_timestamp(recency) if recency else None
@@ -2355,13 +2407,21 @@ class HarnessState:
         Reuses ``search``'s tokenizer (``_harness_query_terms``) and idf shape
         (``log(1 + N / df)``) over title+content, with the whole memory kind as
         the document-frequency corpus; the candidate itself is excluded from
-        the match list. Only matches at ``_NEAR_DUPLICATE_SIMILARITY_MIN`` or
-        better survive, best first, capped at ``_NEAR_DUPLICATE_MAX_MATCHES``.
+        the match list. Matches survive at ``_NEAR_DUPLICATE_SIMILARITY_MIN``,
+        best first, capped at ``_NEAR_DUPLICATE_MAX_MATCHES`` - except below
+        ``_NEAR_DUPLICATE_SMALL_CORPUS`` memories, where the coarse idf makes
+        the 0.40 band fire on related-but-distinct entries and the floor rises
+        to ``_NEAR_DUPLICATE_SMALL_CORPUS_SIMILARITY_MIN``.
         """
         terms = frozenset(_harness_query_terms(f"{candidate.title} {candidate.content}"))
         corpus = list(self.entries["memory"].values())
         if not terms or len(corpus) < 2:
             return []
+        min_score = (
+            _NEAR_DUPLICATE_SIMILARITY_MIN
+            if len(corpus) >= _NEAR_DUPLICATE_SMALL_CORPUS
+            else _NEAR_DUPLICATE_SMALL_CORPUS_SIMILARITY_MIN
+        )
         profiles = {
             entry.id: frozenset(_harness_query_terms(f"{entry.title} {entry.content}")) for entry in corpus
         }
@@ -2387,7 +2447,7 @@ class HarnessState:
             if norm == 0:
                 continue
             score = dot / (candidate_norm * norm)
-            if score >= _NEAR_DUPLICATE_SIMILARITY_MIN:
+            if score >= min_score:
                 matches.append((entry.id, score))
         matches.sort(key=lambda match: (-match[1], match[0]))
         return matches[:_NEAR_DUPLICATE_MAX_MATCHES]

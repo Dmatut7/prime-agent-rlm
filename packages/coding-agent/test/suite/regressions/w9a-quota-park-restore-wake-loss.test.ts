@@ -5,8 +5,9 @@
  * wake job - but when that job is gone (artifact store lost, or never persisted),
  * the parked task silently never resumed: no log, no transcript record. The restore
  * now records a provider_quota_resume { outcome: "wake-lost" } entry and warns when
- * the wake is definitely gone. A wake the user cancelled stays quiet (their choice),
- * and a live job still owns the wake with no record.
+ * the wake is definitely gone. A wake the user cancelled stays quiet (their choice).
+ * A live job restores the park with its count, so the wake drives at once and
+ * waitForUsage.maxParks survives the restart (wave-40).
  *
  * The same change persists wakeRetries on re-arm entries, so a restart no longer
  * resets the QUOTA_WAKE_MAX_RETRIES budget.
@@ -110,7 +111,11 @@ describe("W9-A quota park restore with a lost wake", () => {
 		expect(outcomes[0]).toMatchObject({ outcome: "wake-lost", parkCount: 1, provider: "faux" });
 	});
 
-	it("records nothing when the expired park's durable wake job still exists", async () => {
+	it("restores the park with its count when the expired park's durable wake job still exists", async () => {
+		// wave-40: this used to drop the park on the floor (no restore, no
+		// record), which reset waitForUsage.maxParks at every restart. With the
+		// job alive the park now comes back with its count, and the overdue wake
+		// drives at once (the in-process timer races the daemon's job claim).
 		const parked = await parkSession(parkSettings(50));
 		harnesses.push(parked);
 		const sessionFile = parked.session.sessionFile;
@@ -120,10 +125,14 @@ describe("W9-A quota park restore with a lost wake", () => {
 
 		const restarted = await createHarness({ existingSessionFile: sessionFile, settings: parkSettings(50) });
 		harnesses.push(restarted);
-
-		// The job survives, so the daemon still fires it: the restore stays quiet.
-		expect(restarted.session.isQuotaParked).toBe(false);
+		expect(restarted.session.isQuotaParked).toBe(true);
 		expect(resumeOutcomes(restarted)).toHaveLength(0);
+
+		// The wake probe succeeds: the episode closes with a wake record.
+		restarted.setResponses([fauxAssistantMessage("resumed after the restart")]);
+		await waitFor(() => resumeOutcomes(restarted).length > 0, "the restored wake to close the episode");
+		expect(resumeOutcomes(restarted)[0]).toMatchObject({ outcome: "wake" });
+		expect(restarted.session.isQuotaParked).toBe(false);
 	});
 
 	it("persists wakeRetries on a re-arm so a restart cannot reset the wake budget", async () => {

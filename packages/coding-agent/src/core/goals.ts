@@ -8,6 +8,23 @@ import type { CustomMessage } from "./messages.js";
  */
 export const MAX_GOAL_CONTINUATIONS = 3;
 
+/**
+ * The safety-net token budget of a persistent goal started without one. A
+ * persistent goal never ends on the model's word, so without SOME cap a
+ * forgotten keep-going goal burns provider spend until the session dies. The cap
+ * is visible (goal prompts and /goal status show it) and a budget-limited goal
+ * can be resumed, so it bounds accidents without ending intentional long runs.
+ */
+export const DEFAULT_PERSISTENT_GOAL_TOKEN_BUDGET = 10_000_000;
+
+/**
+ * Minimum wall-clock spacing between the automatic continuations of a persistent
+ * goal. The continuation is the goal's heartbeat; when turns end as fast as the
+ * provider answers, an unthrottled heartbeat is a billing spin. Non-persistent
+ * goals are bounded by MAX_GOAL_CONTINUATIONS instead and need no throttle.
+ */
+export const PERSISTENT_GOAL_MIN_CONTINUATION_INTERVAL_MS = 30_000;
+
 export const GOAL_STATE_CUSTOM_TYPE = "thread_goal_state";
 export const GOAL_CONTEXT_CUSTOM_TYPE = "goal_context";
 export const GOAL_CONTEXT_PREVIEW_LABEL = "Goal context";
@@ -81,6 +98,10 @@ export function emptyGoalState(): GoalState {
 export function normalizeGoalState(goal: GoalState): GoalState {
 	return {
 		...goal,
+		// A persistent goal never ends on the model's word; without a budget it is
+		// an unbounded spend. Stamp the safety-net default at creation and on load,
+		// so budget accounting, prompts and resume all see the same cap.
+		tokenBudget: goal.tokenBudget ?? (goal.persistent ? DEFAULT_PERSISTENT_GOAL_TOKEN_BUDGET : undefined),
 		active: goal.status === "active",
 		tokensUsed: Math.max(0, Math.trunc(goal.tokensUsed)),
 		timeUsedSeconds: Math.max(0, Math.trunc(goal.timeUsedSeconds)),

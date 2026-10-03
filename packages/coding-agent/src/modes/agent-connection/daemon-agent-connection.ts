@@ -864,6 +864,15 @@ export class DaemonAgentConnection implements AgentConnection {
 		};
 	}
 
+	/**
+	 * Live capability check for windowed transcript reads: an unrestarted daemon
+	 * never advertised slim_attach_transcript, and a reconnect to a restarted one
+	 * turns this on without a client restart.
+	 */
+	supportsMessagesWindow(): boolean {
+		return this.client.supportsServerCapability("slim_attach_transcript");
+	}
+
 	async getSessionHeader(): Promise<AgentConnectionSessionHeader | undefined> {
 		const data = await this.requestData<{ header?: AgentConnectionSessionHeader | null }>({
 			type: "get_session_header",
@@ -2508,6 +2517,9 @@ export class DaemonAgentConnection implements AgentConnection {
 			const latestSnapshot: AgentConnectionSnapshot = {
 				state: message.state,
 				messages: message.messages,
+				// Rev 46: a slim client's inline replacement catch-up carries the
+				// omission count, the same contract attach and resync already map.
+				...(message.messagesOmitted !== undefined ? { messagesOmitted: message.messagesOmitted } : {}),
 			};
 			if (this.lastEventSequence !== undefined) {
 				latestSnapshot.lastEventSequence = this.lastEventSequence;

@@ -1,10 +1,35 @@
 import { chmodSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { getProcessStartId } from "../src/core/session-lease.js";
-import { getProcessStartIdAsync, isProcessIdentityConfirmedDead } from "../src/modes/daemon/daemon-supervisor.js";
+import {
+	DaemonSupervisor,
+	getProcessStartIdAsync,
+	isProcessIdentityConfirmedDead,
+} from "../src/modes/daemon/daemon-supervisor.js";
 import { processIdExists } from "../src/utils/child-process.js";
 import { disposeSupervisorHarnesses, startSupervisorHarness } from "./fixtures/supervisor-harness.js";
+
+/**
+ * Wave-40 ③: a crashed daemon-owned worker whose work record still has live
+ * obligations (scheduled jobs, in-progress operations) is now relaunched from its
+ * durable create command instead of parking at once. The park-then-re-adopt ladder
+ * under test here is what runs when that relaunch cannot produce a worker, so the
+ * launch boundary fails instead of spawning a real process into the test runner.
+ */
+function failWorkerRelaunches(): void {
+	vi.spyOn(
+		DaemonSupervisor.prototype as unknown as {
+			launchWorker(
+				command: unknown,
+				existing?: unknown,
+				ownerClientId?: string,
+				requestTimeoutMs?: number,
+			): Promise<unknown>;
+		},
+		"launchWorker",
+	).mockRejectedValue(new Error("test boundary: worker relaunch cannot spawn in this harness"));
+}
 
 /**
  * T3-6 / P1-5-L5: a failed worker registration used to survive forever, so every
@@ -81,6 +106,7 @@ describe("T3-6 failed worker reaper", () => {
 	}, 40_000);
 
 	it("keeps a failed worker whose sessions still have a schedule", async () => {
+		failWorkerRelaunches();
 		const harness = await startSupervisorHarness({
 			prefix: "ma-t3-6-scheduled-",
 			deadWorkerPid: true,
@@ -157,6 +183,7 @@ describe("T3-6 failed worker reaper", () => {
 	it.skipIf(runningAsRoot())(
 		"stands down while the supervisor is degraded",
 		async () => {
+			failWorkerRelaunches();
 			const harness = await startSupervisorHarness({
 				prefix: "ma-t3-6-degraded-",
 				deadWorkerPid: true,

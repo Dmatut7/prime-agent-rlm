@@ -296,6 +296,30 @@ const EN_TASK_VERB =
 const VERIFICATION_COMMAND =
 	/(?:^|[\s;&|`"'(])(?:(?:npm|pnpm|yarn|bun|deno|npx|uv|uvx|cargo|go|mvn|gradle|make|xcodebuild|swift|bazel)\s+[^\n;&|]{0,120}?\b(?:tests?|spec|check|build|lint|type-?check|compile|verify|clippy)\b|py\.?test|vitest|jest|mocha|phpunit|rspec|ctest|tsc|tsgo|eslint|biome\s+check|ruff\s+check|mypy|pyright)(?=[\s;'")]|$)/i;
 
+// What "ran green" means depends on the surface the check ran on. A direct shell tool
+// fails a non-zero exit into an error result (tools/bash.ts), so a clean result is
+// exit 0 by construction. A REPL cell instead runs the check inside Python, where
+// `r = await bash('npm test')` leaves the cell clean whether the tests passed or not -
+// the exit code is data, and the transcript carries the proof only when the cell's
+// visible output shows it. A cell whose output shows no verdict is an unknown, not a
+// green: the gate would rather nudge once more than call a red run proof.
+
+// Pass proof in a cell's visible output: a zero exit code or the runner's pass wording.
+const CELL_PASS_TEXT =
+	/\bexit[_ ]?code\b\s*[=:]?\s*0(?!\d)|\bexit(?:ed)?\s+(?:with\s+)?(?:code\s+)?0(?!\d)|\b[1-9]\d*\s+(?:passed|passing)\b|\btest result:\s*ok\b|测试(?:全部|全|都)?通过|全部通过|构建(?:成功|通过)|编译通过/i;
+// Line-anchored runner tokens, in the case the runner prints them (go test, unittest).
+const CELL_PASS_LINE = /^ok\s+\S|^PASS$|^OK$/m;
+// Failure proof in the visible output. Checked before the pass patterns so a mixed
+// summary ("2 failed, 47 passed") reads as the failure it is.
+const CELL_FAIL_TEXT =
+	/\bexit[_ ]?code\b\s*[=:]?\s*[1-9]\d*|\bexit(?:ed)?\s+(?:with\s+)?(?:code\s+)?[1-9]\d*|\b[1-9]\d*\s+(?:failed|errors?)\b|\btest result:\s*failed\b|测试失败|构建失败|编译失败/i;
+const CELL_FAIL_LOUD = /\bFAIL(?:ED)?\b/;
+// The whole output is one integer: the bare `print(r.exit_code)` verdict.
+const BARE_EXIT_CODE = /^\s*(\d+)\s*$/;
+// A cell whose code asserts the command's exit code proves the run by finishing
+// clean: the same assert failing would have errored the cell instead.
+const CELL_ASSERTS_EXIT_CODE = /\bassert\b[^\n;]*\bexit_code\b/;
+
 /** Whether a prompt reads as a task ("修复这个 bug") rather than chat ("这个函数是干什么的"). */
 function promptRequestsWork(promptText: string | undefined): boolean {
 	if (!promptText) return false;
@@ -323,32 +347,91 @@ export function lastUserPromptText(messages: readonly AgentMessage[]): string | 
 
 /**
  * Whether this run already produced its own proof: a verification-shaped command
- * (a test suite, a build, a lint or type check) that ran green after the last user
- * prompt. The claim then stands on the transcript and citing it is courtesy, not a
- * gate-worthy omission. Read tools and failed runs never count.
+ * (a test suite, a build, a lint or type check) whose latest run came back green
+ * after the last user prompt, with no project file changed since. The claim then
+ * stands on the transcript and citing it is courtesy, not a gate-worthy omission.
+ *
+ * "Green" is strict by design: an error result is always red, and so is visible
+ * failure wording in the output; a REPL cell additionally needs the pass visible
+ * in its own output (a zero exit code, the runner's pass wording, or an assert on
+ * the exit code in the cell's code), because a clean cell only proves the Python
+ * ran. A green run is voided by a later red run and by any project file change
+ * after it (an edit result, or a cell whose tracked changes touch the project);
+ * the result that ran the check never voids itself - a coverage write happens
+ * before the verdict it carries.
  */
 export function runHasVerificationEvidence(messages: readonly AgentMessage[]): boolean {
-	const commands = new Map<string, string>();
+	// The run starts after its last user prompt.
+	let start = 0;
 	for (let index = messages.length - 1; index >= 0; index--) {
+		if (messages[index]?.role === "user") {
+			start = index + 1;
+			break;
+		}
+	}
+	const calls = new Map<string, { command: string; cell: boolean }>();
+	for (let index = start; index < messages.length; index++) {
 		const message = messages[index];
-		if (message?.role === "user") break;
 		if (message?.role !== "assistant") continue;
 		for (const block of message.content) {
 			if (block.type !== "toolCall") continue;
 			const args = block.arguments as Record<string, unknown> | undefined;
-			const command = [args?.command, args?.code, args?.cmd].find((value) => typeof value === "string");
-			if (typeof command === "string") commands.set(block.id, command);
+			if (typeof args?.command === "string") calls.set(block.id, { command: args.command, cell: false });
+			else if (typeof args?.code === "string") calls.set(block.id, { command: args.code, cell: true });
+			else if (typeof args?.cmd === "string") calls.set(block.id, { command: args.cmd, cell: false });
 		}
 	}
-	if (commands.size === 0) return false;
-	for (let index = messages.length - 1; index >= 0; index--) {
+	if (calls.size === 0) return false;
+	// Forward, so the latest verdict wins: a later red run and a later project file
+	// change each void an earlier green.
+	let verified = false;
+	for (let index = start; index < messages.length; index++) {
 		const message = messages[index];
-		if (message?.role === "user") break;
-		if (message?.role !== "toolResult" || message.isError) continue;
-		const command = commands.get(message.toolCallId);
-		if (command !== undefined && VERIFICATION_COMMAND.test(command)) return true;
+		if (message?.role !== "toolResult") continue;
+		if (resultChangedProjectFiles(message)) verified = false;
+		const call = calls.get(message.toolCallId);
+		if (call === undefined || !VERIFICATION_COMMAND.test(call.command)) continue;
+		const outcome = verificationOutcome(call, message);
+		if (outcome === "green") verified = true;
+		else if (outcome === "red") verified = false;
 	}
-	return false;
+	return verified;
+}
+
+type VerificationOutcome = "green" | "red" | "unknown";
+
+function verificationOutcome(
+	call: { command: string; cell: boolean },
+	result: Extract<AgentMessage, { role: "toolResult" }>,
+): VerificationOutcome {
+	if (result.isError) return "red";
+	const text = result.content
+		.filter((block): block is TextContent => block.type === "text")
+		.map((block) => block.text)
+		.join("\n");
+	if (CELL_FAIL_TEXT.test(text) || CELL_FAIL_LOUD.test(text)) return "red";
+	// A direct shell tool's clean result is exit 0 by construction.
+	if (!call.cell) return "green";
+	if (CELL_ASSERTS_EXIT_CODE.test(call.command)) return "green";
+	if (CELL_PASS_TEXT.test(text) || CELL_PASS_LINE.test(text)) return "green";
+	const bare = BARE_EXIT_CODE.exec(text);
+	if (bare) return bare[1] === "0" ? "green" : "red";
+	return "unknown";
+}
+
+/** Whether a clean tool result changed project files - the event that voids a green run. */
+function resultChangedProjectFiles(message: Extract<AgentMessage, { role: "toolResult" }>): boolean {
+	if (message.isError) return false;
+	// A clean edit result is a change by construction; a no-op edit is an error result.
+	if (message.toolName === "edit") return true;
+	// A REPL cell's tracked file effects; scratch and harness-memory writes do not
+	// touch what the check verified.
+	const details = message.details as { fileChanges?: unknown } | undefined;
+	const changes = details?.fileChanges;
+	if (!Array.isArray(changes)) return false;
+	return changes.some(
+		(change) => typeof change === "object" && change !== null && (change as { scope?: unknown }).scope === "project",
+	);
 }
 
 export interface FinishGateScanOptions {

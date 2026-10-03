@@ -9,9 +9,10 @@ import { createHarness, type Harness } from "./harness.js";
  * Emission side of the finish gate's release notice (the render side lives in
  * test/finish-gate-notice.test.ts): when the gate lets an unverified completion
  * claim through after FINISH_GATE_MAX_STRIKES nudges, the session writes one
- * display:true `finish_gate_released` custom message into the transcript and the
- * event stream - and convertToLlm must never turn it (or the kernel prune notice,
- * which claimed the same privacy but leaked on resume) into model input.
+ * display:true `finish_gate_released` custom message into the transcript, the
+ * event stream and the live message list - and convertToLlm must never turn it
+ * (or the kernel prune notice, which claimed the same privacy but leaked on
+ * resume) into model input.
  */
 
 const harnesses: Harness[] = [];
@@ -76,15 +77,17 @@ describe("finish-gate release notice (emission side)", () => {
 		}
 	});
 
-	it("keeps the notice out of the live context and out of the rebuilt model input", async () => {
+	it("keeps the notice in the live message list but out of the rebuilt model input", async () => {
 		const harness = await releasedRun();
 
-		// Live: the notice is transcript + events only, not pushed onto agent state.
+		// Live: the notice is transcript + events + the session's message list - a
+		// view rebuilt from live state (switching away and back) must still show the
+		// "unverified completion" reminder; only the event stream would lose it.
 		expect(
 			harness.session.messages.some(
 				(message) => message.role === "custom" && message.customType === "finish_gate_released",
 			),
-		).toBe(false);
+		).toBe(true);
 
 		// Resume: the transcript entry rebuilds into the presented context, but
 		// convertToLlm must drop it there - a user-role copy would read as a new
@@ -97,6 +100,12 @@ describe("finish-gate release notice (emission side)", () => {
 		expect(llmMessages.some((message) => JSON.stringify(message).includes("unverified completion claim"))).toBe(
 			false,
 		);
+		// The live list is equally closed to the model.
+		expect(
+			convertToLlm(harness.session.messages).some((message) =>
+				JSON.stringify(message).includes("unverified completion claim"),
+			),
+		).toBe(false);
 	});
 });
 

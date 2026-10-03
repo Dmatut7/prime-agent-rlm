@@ -499,6 +499,16 @@ const DEFERRED_RECOVERY_RECHECK_MS = 5000;
 // each connect probe 10s instead, so the same ten rounds span ~6 minutes there.
 const MAX_DEFERRED_RECOVERY_ROUNDS = 10;
 /**
+ * Crash-restart budget for a daemon-owned worker whose process died: the daemon
+ * re-launches it from the durable create command only while the work record says
+ * the session still matters (in-progress operations or scheduled jobs), and only
+ * this many times per window, so a crash-looping worker parks instead of
+ * respawning forever. The window doubles as the decay: a worker that stayed up
+ * longer than it earns a fresh budget.
+ */
+const DAEMON_CRASH_RESTART_LIMIT = 3;
+const DAEMON_CRASH_RESTART_WINDOW_MS = 10 * 60 * 1000;
+/**
  * How long a stream-ending snapshot frame waits for a suspended client's socket to
  * drain before the stream gives up and releases what it holds. Mirrors the worker
  * side's WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS; data chunks are never bounded.
@@ -964,6 +974,11 @@ interface ResidentWorker {
 	deferredRecoveryRounds?: number;
 	/** Backoff re-adoption attempts spent on a worker whose sessions have scheduled jobs (L3). */
 	adoptionRetryAttempt?: number;
+	/**
+	 * Daemon-initiated crash relaunches of a daemon-owned worker in the current
+	 * window; the budget keeps a crash loop from respawning forever.
+	 */
+	daemonCrashRestarts?: { count: number; firstAt: number };
 	/** Bumped per applied roster frame; a summaries pull that straddles a frame must not gap-fill. */
 	rosterEpoch?: number;
 	rosterApplyChain?: Promise<void>;
@@ -4942,9 +4957,25 @@ export class DaemonSupervisor {
 		}
 		const recoveryStopRevision = existing?.stopRevision;
 		const launchEnv = command.launchEnv ?? existing?.launchEnv;
+		// A sessionPath launch whose config carries no cwd of its own — a config-less
+		// scheduled wake or send_message open, or a descriptor-only relaunch after a
+		// crash — must run in the session's stored directory: the merge below would
+		// otherwise fill this daemon's cwd, and both the spawn directory and the
+		// warm-pool claim key would land in the wrong place. Reading it here, past
+		// createOrReuseWorker's opening-reservation publish, keeps the
+		// publish-then-validate interleaving the lazy-subagents tests pin; the
+		// resume-path rehydration there (config present, cwd stripped) already set
+		// config.cwd, which this read then skips.
+		let launchCommand = command;
+		if (command.sessionPath !== undefined && command.config?.cwd === undefined) {
+			const storedCwd = (await readSessionInfo(command.sessionPath))?.cwd;
+			if (storedCwd) {
+				launchCommand = { ...command, config: { ...command.config, cwd: storedCwd } };
+			}
+		}
 		const createCommand: DaemonCreateCommand = {
-			...withoutSupervisorCreateFields(command),
-			config: mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config),
+			...withoutSupervisorCreateFields(launchCommand),
+			config: mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, launchCommand.config),
 		};
 		// A fresh create may claim a pooled spare: the spare process is
 		// byte-identical to what the cold spawn below would produce (same cwd, same
@@ -6384,6 +6415,65 @@ export class DaemonSupervisor {
 		}
 	}
 
+	/**
+	 * The relaunch-decision mirror of hasUnconsumedRecoveryJournal: an unreadable
+	 * journal errs toward "busy" when the question is whether deletion loses
+	 * evidence, but toward "idle" when the question is whether to spawn a process —
+	 * a corrupt journal must not respawn a worker that nothing was running on.
+	 */
+	private workerHasBusyRecoveryRecords(worker: ResidentWorker): boolean {
+		try {
+			const journal = new WorkerRecoveryJournal(worker.descriptor.recoveryJournalPath);
+			return journal.getLatest().some((record) => record.busy);
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * The crash recovery a daemon-owned worker can serve itself: while its work
+	 * record shows the session still matters — an in-progress operation in the
+	 * recovery journal, or a registered heartbeat/cron schedule — the daemon
+	 * re-launches the worker from the durable create command (and its own
+	 * environment; the launch env of a resident worker is deliberately dropped
+	 * after launch) instead of parking it dark until a client happens by. The
+	 * durable command carries no cwd of its own, so the launch rehydrates it from
+	 * the session file. A client-owned worker never enters here: its runtime
+	 * context lives with the owner, whose next attach re-drives it.
+	 *
+	 * Rate-capped per worker so a crash loop parks instead of respawning forever;
+	 * the parked reason says so, and the scheduled-job re-adoption ladder (already
+	 * armed by the park path) keeps poking on its own bounded backoff meanwhile.
+	 */
+	private daemonOwnedCrashRecovery(
+		worker: ResidentWorker,
+	): { command?: DaemonCreateCommand; parkedReason?: string } | undefined {
+		const sessionPath = worker.descriptor.createCommand?.sessionPath ?? worker.descriptor.sessionFile;
+		if (sessionPath === undefined) {
+			// A sessionless worker has nothing addressable to relaunch into.
+			return undefined;
+		}
+		if (!this.workerHasBusyRecoveryRecords(worker) && !this.workerHasScheduledJobs(worker)) {
+			return undefined;
+		}
+		const now = Date.now();
+		const restarts = worker.daemonCrashRestarts;
+		const count = restarts && now - restarts.firstAt < DAEMON_CRASH_RESTART_WINDOW_MS ? restarts.count : 0;
+		if (count >= DAEMON_CRASH_RESTART_LIMIT) {
+			return {
+				parkedReason:
+					`Worker crashed ${count} times within ${Math.round(DAEMON_CRASH_RESTART_WINDOW_MS / 60_000)} minutes; ` +
+					`staying parked until a client attaches or retry_worker runs`,
+			};
+		}
+		worker.daemonCrashRestarts = { count: count + 1, firstAt: count === 0 || !restarts ? now : restarts.firstAt };
+		const command: DaemonCreateCommand =
+			worker.descriptor.createCommand?.sessionPath === sessionPath
+				? worker.descriptor.createCommand
+				: { ...worker.descriptor.createCommand, type: "create", sessionPath };
+		return { command };
+	}
+
 	/** C17: the failed descriptor is the only on-disk evidence of an OOM-class accident, so it is archived before deletion. */
 	private archiveAndReapFailedWorker(worker: ResidentWorker, now: number): void {
 		const descriptor = worker.descriptor;
@@ -6948,6 +7038,10 @@ export class DaemonSupervisor {
 		}
 		worker.recovery = (async () => {
 			let keepProbingLiveWorker = false;
+			// Lazy, once per episode: the daemon-owned crash-relaunch decision reads
+			// the recovery journal before the relaunch path's cleanup resolves it.
+			let daemonCrashRecoveryComputed = false;
+			let daemonCrashRecovery: { command?: DaemonCreateCommand; parkedReason?: string } | undefined;
 			for (const retryDelay of WORKER_RETRY_DELAYS_MS) {
 				await sleep(retryDelay);
 				keepProbingLiveWorker = false;
@@ -7004,14 +7098,26 @@ export class DaemonSupervisor {
 							`Cannot safely replace live session worker ${worker.descriptor.workerId} without a verified process identity`,
 						);
 					}
-					const recoveryCommand = worker.descriptor.ownerClientId ? worker.transientCreateCommand : undefined;
-					if (!recoveryCommand || !worker.launchEnv) {
+					// The decision is computed once per recovery episode: a failed
+					// relaunch re-enters this branch after the journal was already
+					// resolved, and re-reading it would flip the answer mid-loop (and
+					// re-spend the crash budget for the same crash).
+					if (!daemonCrashRecoveryComputed) {
+						daemonCrashRecoveryComputed = true;
+						daemonCrashRecovery =
+							worker.descriptor.ownerClientId === undefined ? this.daemonOwnedCrashRecovery(worker) : undefined;
+					}
+					const recoveryCommand = worker.descriptor.ownerClientId
+						? worker.transientCreateCommand
+						: daemonCrashRecovery?.command;
+					if (!recoveryCommand || (worker.descriptor.ownerClientId !== undefined && !worker.launchEnv)) {
 						await this.recoverUncertainWorkerOperations(worker);
 						worker.descriptor.lifecycle = "failed";
 						// Preserve the first failure time: the reaper ages a corpse from it, and a
 						// restart that re-parks the same dead worker must not reset that clock.
 						worker.descriptor.lastFailureAt ??= new Date().toISOString();
-						worker.descriptor.lastError = "Waiting for a client with fresh runtime context";
+						worker.descriptor.lastError =
+							daemonCrashRecovery?.parkedReason ?? "Waiting for a client with fresh runtime context";
 						this.tryPersistWorker(worker, "recovery park");
 						this.markWorkerRosterEntries(worker, "failed");
 						this.armScheduledJobReadoption(worker, worker.descriptor.lastError);
@@ -7040,7 +7146,11 @@ export class DaemonSupervisor {
 					worker.client?.close();
 					worker.client = undefined;
 					worker.descriptor.consecutiveFailures++;
-					worker.descriptor.lastFailureAt = new Date().toISOString();
+					// Preserve the first failure time like every park path does: the
+					// reaper ages a corpse from it, and the per-attempt bookkeeping of
+					// one recovery episode (for example each failed daemon-owned
+					// relaunch) must not reset that clock.
+					worker.descriptor.lastFailureAt ??= new Date().toISOString();
 					worker.descriptor.lastError = error instanceof Error ? error.message : String(error);
 					this.tryPersistWorker(worker, "recovery failure bookkeeping");
 				}
@@ -10332,7 +10442,13 @@ export class DaemonSupervisor {
 					supportsExtensionUi: client.supportsExtensionUi,
 				});
 				releaseTranscript = attached.releaseTranscript;
-				if (client.capabilities.has("chunked_snapshot")) {
+				// The streamed branch needs the chunk transfer handoff, which a
+				// slim_attach_transcript attach already consumed: its tail window
+				// crossed inline in attached.result.snapshot (messagesOmitted set).
+				// Serve that window inline below, the same cut handleAttach and
+				// handleReattach make; looking for a transcript here throws, and the
+				// give-up leaves the client dark behind deferredSessionPayloadsDropped.
+				if (client.capabilities.has("chunked_snapshot") && !client.capabilities.has("slim_attach_transcript")) {
 					const transcript = attached.transcript;
 					if (!transcript) {
 						throw new Error("Session worker did not provide a snapshot transcript");
@@ -10381,6 +10497,12 @@ export class DaemonSupervisor {
 								activeSessionId,
 								state: attached.result.snapshot.state,
 								messages: attached.result.snapshot.messages,
+								// Rev 46: a slim windowed snapshot tells the client how much
+								// older history stayed on the daemon; absence means the
+								// transcript is complete, exactly like the attach path.
+								...(attached.result.snapshot.messagesOmitted !== undefined
+									? { messagesOmitted: attached.result.snapshot.messagesOmitted }
+									: {}),
 								meta,
 							}
 						: {
@@ -10425,6 +10547,11 @@ export class DaemonSupervisor {
 				if (this.handleCatchupFailure(client, activeSessionId, purpose, error) === "give-up") {
 					client.catchupActiveSessionIds?.delete(activeSessionId);
 					client.catchupPurposes?.delete(activeSessionId);
+					// The give-up handed the reseed to the client's own re-pull, which is
+					// not an attach and never arms a fresh reservation — the one place
+					// this marker clears. Keep it and every later live frame is dropped
+					// onto a view the client already rebuilt: dark until the next detach.
+					client.deferredSessionPayloadsDropped?.delete(activeSessionId);
 				}
 				// Keep the batch running (upstream) but remember that it failed, so the queue
 				// drain below stops instead of immediately re-picking the requeued session.

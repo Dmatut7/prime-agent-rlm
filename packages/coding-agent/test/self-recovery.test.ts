@@ -249,6 +249,51 @@ function toolResultMessage(toolCallId: string, isError = false): AgentMessage {
 	};
 }
 
+/** An ipython REPL cell call: the command hides inside Python code, so the cell's own text is the only proof. */
+function cellCallMessage(id: string, code: string): AssistantMessage {
+	return {
+		...reply(""),
+		stopReason: "toolUse",
+		content: [{ type: "toolCall", id, name: "ipython", arguments: { code } }],
+	};
+}
+
+function cellResultMessage(
+	toolCallId: string,
+	text: string,
+	isError = false,
+	fileChanges?: { scope: string }[],
+): AgentMessage {
+	return {
+		role: "toolResult",
+		toolCallId,
+		toolName: "ipython",
+		content: [{ type: "text", text }],
+		details: fileChanges ? { fileChanges } : {},
+		isError,
+		timestamp: 0,
+	};
+}
+
+function editCallMessage(id: string): AssistantMessage {
+	return {
+		...reply(""),
+		stopReason: "toolUse",
+		content: [{ type: "toolCall", id, name: "edit", arguments: { path: "a.ts", oldText: "x", newText: "y" } }],
+	};
+}
+
+function editResultMessage(toolCallId: string, isError = false): AgentMessage {
+	return {
+		role: "toolResult",
+		toolCallId,
+		toolName: "edit",
+		content: [{ type: "text", text: "edited a.ts" }],
+		isError,
+		timestamp: 0,
+	};
+}
+
 function finishGateNudge(): AgentMessage {
 	return {
 		role: "custom",
@@ -356,6 +401,147 @@ describe("runHasVerificationEvidence", () => {
 			]),
 		).toBe(false);
 		expect(runHasVerificationEvidence([userMessage("hi"), reply("hello")])).toBe(false);
+	});
+
+	it("does not count a REPL cell whose check failed - the cell itself finished fine", () => {
+		// The hole: `r = await bash('npm test')` leaves the ipython cell clean whether
+		// the tests passed or not, so a red run used to read as proof.
+		expect(
+			runHasVerificationEvidence([
+				userMessage("fix it"),
+				cellCallMessage("t1", "r = await bash('npm test')\nprint(r.output)"),
+				cellResultMessage("t1", "2 failed, 47 passed"),
+			]),
+		).toBe(false);
+		expect(
+			runHasVerificationEvidence([
+				userMessage("fix it"),
+				cellCallMessage("t1", "r = await bash('npm test')\nprint(r)"),
+				cellResultMessage("t1", "BashResult(exit_code=1, output='...', duration=2.1)"),
+			]),
+		).toBe(false);
+		expect(
+			runHasVerificationEvidence([
+				userMessage("fix it"),
+				cellCallMessage("t1", "r = await bash('npm test')\nprint(r.exit_code)"),
+				cellResultMessage("t1", "1"),
+			]),
+		).toBe(false);
+	});
+
+	it("counts a cell only when its own output carries the proof", () => {
+		const proven: [string, string][] = [
+			["a zero exit code", "exit_code=0"],
+			["the runner's pass wording", "===== 47 passed in 1.2s ====="],
+			["the bare print of r.exit_code", "0"],
+			["a go test package line", "ok  \texample.com/mod\t0.3s"],
+		];
+		expect(proven.length).toBeGreaterThan(0);
+		for (const [name, output] of proven) {
+			expect(
+				runHasVerificationEvidence([
+					userMessage("fix it"),
+					cellCallMessage("t1", "r = await bash('npm test')\nprint(r)"),
+					cellResultMessage("t1", output),
+				]),
+				name,
+			).toBe(true);
+		}
+		// A cell that ran the check but showed nothing proves nothing.
+		expect(
+			runHasVerificationEvidence([
+				userMessage("fix it"),
+				cellCallMessage("t1", "r = await bash('npm test')"),
+				cellResultMessage("t1", ""),
+			]),
+		).toBe(false);
+		// A cell that asserts the exit code proves the run by finishing clean; the
+		// same assert failing would have errored the cell instead.
+		expect(
+			runHasVerificationEvidence([
+				userMessage("fix it"),
+				cellCallMessage("t1", "r = await bash('npm test')\nassert r.exit_code == 0, r.output"),
+				cellResultMessage("t1", ""),
+			]),
+		).toBe(true);
+		expect(
+			runHasVerificationEvidence([
+				userMessage("fix it"),
+				cellCallMessage("t1", "r = await bash('npm test')\nassert r.exit_code == 0, r.output"),
+				cellResultMessage("t1", "AssertionError: ...", true),
+			]),
+		).toBe(false);
+	});
+
+	it("voids the green run when a later check comes back red", () => {
+		expect(
+			runHasVerificationEvidence([
+				userMessage("fix it"),
+				toolCallMessage("t1", "npm test"),
+				toolResultMessage("t1"),
+				toolCallMessage("t2", "npm test"),
+				toolResultMessage("t2", true),
+				reply("还是没过"),
+			]),
+		).toBe(false);
+		// A later green after the red restores the proof.
+		expect(
+			runHasVerificationEvidence([
+				userMessage("fix it"),
+				toolCallMessage("t1", "npm test"),
+				toolResultMessage("t1", true),
+				toolCallMessage("t2", "npm test"),
+				toolResultMessage("t2"),
+			]),
+		).toBe(true);
+	});
+
+	it("voids the green run when files changed afterwards", () => {
+		const green = [userMessage("fix it"), toolCallMessage("t1", "npm test"), toolResultMessage("t1")];
+		// An edit after the pass makes it stale.
+		expect(
+			runHasVerificationEvidence([...green, editCallMessage("e1"), editResultMessage("e1"), reply("改完了")]),
+		).toBe(false);
+		// A failed edit changed nothing - the pass still stands.
+		expect(
+			runHasVerificationEvidence([...green, editCallMessage("e1"), editResultMessage("e1", true), reply("改完了")]),
+		).toBe(true);
+		// A project file change from a later cell voids the pass; a scratch write does not.
+		expect(
+			runHasVerificationEvidence([
+				...green,
+				cellCallMessage("c1", "open('src/a.ts', 'w').write('x')"),
+				cellResultMessage("c1", "", false, [{ scope: "project" }]),
+				reply("改完了"),
+			]),
+		).toBe(false);
+		expect(
+			runHasVerificationEvidence([
+				...green,
+				cellCallMessage("c1", "open('/tmp/note.txt', 'w').write('x')"),
+				cellResultMessage("c1", "", false, [{ scope: "scratch" }]),
+				reply("记完了"),
+			]),
+		).toBe(true);
+		// The cell that runs the check does not void itself when the run writes
+		// project files (a coverage report): the change predates the verdict.
+		expect(
+			runHasVerificationEvidence([
+				userMessage("fix it"),
+				cellCallMessage("t1", "r = await bash('npm test -- --coverage')\nprint(r.exit_code)"),
+				cellResultMessage("t1", "0", false, [{ scope: "project" }]),
+			]),
+		).toBe(true);
+		// Verifying again after the edit restores the proof.
+		expect(
+			runHasVerificationEvidence([
+				...green,
+				editCallMessage("e1"),
+				editResultMessage("e1"),
+				toolCallMessage("t2", "npm test"),
+				toolResultMessage("t2"),
+			]),
+		).toBe(true);
 	});
 });
 

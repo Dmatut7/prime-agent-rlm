@@ -106,6 +106,23 @@ describe("W14-B resume briefing builder", () => {
 		expect(briefing).toContain("bash_exec");
 	});
 
+	it("reports queued inputs recovered from the interruption marker even when the rebuilt queue is empty", () => {
+		// wave-40: a crashed worker takes its in-memory queue with it; the texts it
+		// never delivered ride the recovery marker, and the briefing must not claim
+		// "nothing pending" over them.
+		const briefing = buildResumeBriefing({
+			queuedCount: 0,
+			interruptedOperations: ["turn_end"],
+			queuedInputs: ["把剩下的测试修完", "顺手看下 lint"],
+			orgDocs: [],
+			now: 1_000_000,
+		});
+		expect(briefing).toBeDefined();
+		expect(briefing).toContain("把剩下的测试修完");
+		expect(briefing).toContain("顺手看下 lint");
+		expect(briefing).toContain("replayed");
+	});
+
 	it("carries the duty-log tail: last doing, unfinished, pending decisions", () => {
 		const briefing = buildResumeBriefing({
 			queuedCount: 0,
@@ -235,6 +252,36 @@ describe("W14-B resume briefing injection on the recovery path", () => {
 				.getPendingNextTurnMessageSnapshots()
 				.filter((message) => message.customType === RESUME_BRIEFING_CUSTOM_TYPE),
 		).toHaveLength(0);
+	});
+
+	it("reports queued inputs the crash marker carries, with an empty in-memory queue", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("做到了一半")]);
+		await harness.session.prompt("把设置面板更新一下");
+		// The worker died with queued inputs it never delivered: the supervisor's
+		// interruption marker carries their texts (details.queuedInputs).
+		harness.sessionManager.appendCustomMessageEntry(
+			"prime-agent.worker_recovery",
+			"<prime_agent_worker_interrupted>…</prime_agent_worker_interrupted>",
+			false,
+			{ activeSessionId: "dead", operations: ["turn_end"], queuedInputs: ["把剩下的测试修完"] },
+		);
+		const sessionFile = harness.sessionManager.getSessionFile();
+		expect(sessionFile).toBeDefined();
+		harness.session.dispose();
+
+		const resumed = await createHarness({ existingSessionFile: sessionFile! });
+		harnesses.push(resumed);
+		const injected = await maybeInjectResumeBriefing(resumed.session);
+		expect(injected).toBe(true);
+
+		const briefing = resumed.session
+			.getPendingNextTurnMessageSnapshots()
+			.find((message) => message.customType === RESUME_BRIEFING_CUSTOM_TYPE);
+		const text = typeof briefing?.content === "string" ? briefing.content : "";
+		expect(text).toContain("把剩下的测试修完");
+		expect(text).not.toContain("0 queued input");
 	});
 
 	it("does not inject into a fresh session with no prior work", async () => {

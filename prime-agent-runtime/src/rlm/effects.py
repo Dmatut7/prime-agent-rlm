@@ -28,7 +28,9 @@ Observation paths:
   in an idle gap between turns are caught up in the starting cell. Every record
   carries ``origin``: ``"own"``
   for writes the kernel saw this session make (the wrappers, the edit skill, or a
-  moment inside one of this session's command windows) and ``"ambient"`` for what
+  moment inside one of this session's command windows - the file's mtime or its
+  ctime, the latter covering what keeps the old mtime: ``mv``, ``cp -p``,
+  archive extraction) and ``"ambient"`` for what
   only showed up in the comparison at a moment no command of this session was
   running.
 - ``bash()``, ``rlm.run()``, harness writes and the web skills report their own
@@ -1978,19 +1980,26 @@ class _Tracker:
     def _owns_write(self, path: str, sig: tuple[int, int] | None) -> bool:
         """Whether the change's moment falls inside a command this session ran.
 
-        The moment is the file's own mtime; for a deletion (no file left to stat) it is the
-        mtime of the nearest directory still standing, which the removal bumped. Without
-        timing evidence the change is not claimed as own: over-claiming the session's work
-        is the failure this attribution exists to prevent.
+        The moments are the file's own mtime and ctime; for a deletion (no file left
+        to stat) the mtime of the nearest directory still standing, which the removal
+        bumped. ctime covers what mtime cannot: `mv`, `cp -p` and archive extraction
+        all keep the old mtime but always stamp the inode's ctime, and ctime has no
+        user-space setter to backdate it with. Without timing evidence the change is
+        not claimed as own: over-claiming the session's work is the failure this
+        attribution exists to prevent.
         """
-        when: float | None = None
+        moments: list[float] = []
         if sig is not None:
-            when = sig[1] / 1e9
+            moments.append(sig[1] / 1e9)
+            try:
+                moments.append(os.lstat(path).st_ctime_ns / 1e9)
+            except (OSError, ValueError):
+                pass
         else:
             directory = os.path.dirname(path)
             while True:
                 try:
-                    when = os.lstat(directory).st_mtime_ns / 1e9
+                    moments.append(os.lstat(directory).st_mtime_ns / 1e9)
                     break
                 except (OSError, ValueError):
                     parent = os.path.dirname(directory)
@@ -2000,9 +2009,10 @@ class _Tracker:
         now = time.time()
         with self.lock:
             windows = list(self.cmd_windows)
-        for start, end in windows:
-            if start is not None and start - WINDOW_EPS_S <= when <= (end if end is not None else now) + WINDOW_EPS_S:
-                return True
+        for when in moments:
+            for start, end in windows:
+                if start is not None and start - WINDOW_EPS_S <= when <= (end if end is not None else now) + WINDOW_EPS_S:
+                    return True
         return False
 
     def apply_shell_changes(
@@ -2127,16 +2137,28 @@ class _Tracker:
             need_blob.append(path)
             pending.append((path, None, current))
         need_blob.extend(probe_untracked)
+        unasked_untracked: frozenset[str] = frozenset()
         blobs: dict[str, bytes | None] = {}
         if need_blob:
             wanted = need_blob[:MAX_GIT_BLOBS]
             if len(need_blob) > MAX_GIT_BLOBS:
                 cell.note_incomplete("too many files changed by commands to diff them all")
+                # The before-commit was never asked about the probes past the cap, but the
+                # work-tree evidence still says new: untracked now and unknown to the
+                # before-snapshot. Report them as creations instead of degrading them to
+                # no-baseline edits. (Tracked entries past the cap keep the degrade: the
+                # before-state knew about them.)
+                probed = set(probe_untracked)
+                unasked_untracked = frozenset(path for path in need_blob[MAX_GIT_BLOBS:] if path in probed)
             specs = [f"{before.oid}:{os.path.relpath(path, before.root)}" for path in wanted]
             fetched = self.blobs(before.root, specs, deadline)
             blobs = {path: fetched.get(spec) for path, spec in zip(wanted, specs)}
         for path, baseline, after_sig in pending:
             if baseline is None:
+                if path in unasked_untracked:
+                    baseline = _ABSENT
+                    changes.append((path, baseline, after_sig))
+                    continue
                 data = blobs.get(path)
                 if data is _MISSING:
                     baseline = _ABSENT

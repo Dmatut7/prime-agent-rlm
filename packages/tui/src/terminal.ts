@@ -26,6 +26,15 @@ const MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1002l";
 const KITTY_FLAGS_PUSH = "\x1b[>7u";
 const KITTY_FLAGS_POP = "\x1b[<u";
 
+// Which screen each outstanding kitty stack entry was pushed on. Every pop must
+// target a screen that owns an entry: popping the wrong screen leaks the real
+// entry (kitty mode stays enabled in the shell after exit, and Ctrl+C stops
+// raising SIGINT), while pushing twice on one screen leaves an unpopped extra.
+// Module-level because a preserved alt screen hands its stack state to the next
+// ProcessTerminal instance.
+let kittyMainScreenPushOutstanding = false;
+let kittyAltScreenPushOutstanding = false;
+
 // A preserved alternate screen is adopted by the next ProcessTerminal during in-process handoff.
 let pendingAltScreenHandoff: symbol | undefined;
 
@@ -388,8 +397,19 @@ export class ProcessTerminal implements Terminal {
 		this._kittyProtocolActive = true;
 		setKittyProtocolActive(true);
 
-		// Enable Kitty keyboard protocol (push flags onto the active screen's stack)
-		process.stdout.write(KITTY_FLAGS_PUSH);
+		// Push onto the stack of whichever screen is active right now; the other
+		// screen's stack gets its entry on the next screen switch. A leftover
+		// entry from an unclean previous session (mark still set) is adopted
+		// instead of double-pushed.
+		if (this._altScreenActive) {
+			if (!kittyAltScreenPushOutstanding) {
+				kittyAltScreenPushOutstanding = true;
+				process.stdout.write(KITTY_FLAGS_PUSH);
+			}
+		} else if (!kittyMainScreenPushOutstanding) {
+			kittyMainScreenPushOutstanding = true;
+			process.stdout.write(KITTY_FLAGS_PUSH);
+		}
 	}
 
 	/**
@@ -455,8 +475,12 @@ export class ProcessTerminal implements Terminal {
 		this.mouseTrackingSuspended = true;
 		if (this._kittyProtocolActive) {
 			// Disable Kitty keyboard protocol first so any late key releases
-			// do not generate new Kitty escape sequences.
-			process.stdout.write(KITTY_FLAGS_POP);
+			// do not generate new Kitty escape sequences. Pop only the entry the
+			// currently active screen actually owns; the other screen's entry is
+			// popped by releaseAltScreen()/stop().
+			if (this.popKittyFlagsOnActiveScreen()) {
+				process.stdout.write(KITTY_FLAGS_POP);
+			}
 			this._kittyProtocolActive = false;
 			setKittyProtocolActive(false);
 		}
@@ -519,6 +543,11 @@ export class ProcessTerminal implements Terminal {
 	stop(options: TerminalStopOptions = {}): void {
 		const wasStarted = this.started;
 		this.started = false;
+		// The session is ending: no new per-screen entries from here on, so a
+		// releaseAltScreen() below never re-pushes the main screen mid-teardown.
+		// Outstanding entries are still popped by the mark-driven section below.
+		this._kittyProtocolActive = false;
+		setKittyProtocolActive(false);
 		this._probeBus?.dispose();
 		this._probeBus = undefined;
 
@@ -557,11 +586,13 @@ export class ProcessTerminal implements Terminal {
 			setGrapheme2027Active(false);
 		}
 
-		// Disable Kitty keyboard protocol if not already done by drainInput()
-		if (this._kittyProtocolActive) {
+		// Pop the kitty entry the currently active screen owns. This is mark-driven
+		// rather than flag-driven: drainInput() may already have popped the other
+		// screen and cleared the active flag, and dropping the remaining entry
+		// would leave the protocol enabled in the shell (Ctrl+C arrives as a CSI-u
+		// sequence instead of SIGINT).
+		if (this.popKittyFlagsOnActiveScreen()) {
 			process.stdout.write(KITTY_FLAGS_POP);
-			this._kittyProtocolActive = false;
-			setKittyProtocolActive(false);
 		}
 		if (this._modifyOtherKeysActive) {
 			process.stdout.write("\x1b[>4;0m");
@@ -669,7 +700,8 @@ export class ProcessTerminal implements Terminal {
 		this.write("\x1b[?1049h");
 		// The alt screen's keyboard mode stack is independent of the main screen's,
 		// so the startup push does not reach fullscreen; re-push on the alt stack.
-		if (this._kittyProtocolActive) {
+		if (this._kittyProtocolActive && !kittyAltScreenPushOutstanding) {
+			kittyAltScreenPushOutstanding = true;
 			this.write(KITTY_FLAGS_PUSH);
 		}
 	}
@@ -690,10 +722,34 @@ export class ProcessTerminal implements Terminal {
 		}
 		// Pop while the alt screen is still active; after ?1049l the pop would eat
 		// the main screen stack entry pushed at startup.
-		if (this._kittyProtocolActive) {
+		if (kittyAltScreenPushOutstanding) {
+			kittyAltScreenPushOutstanding = false;
 			this.write(KITTY_FLAGS_POP);
 		}
 		this.write("\x1b[?1049l");
+		// A kitty verdict that arrived while the alt screen was active pushed only
+		// the alt stack; without an entry of its own the main screen keeps the
+		// protocol off and Alt-modified keys stay dead there.
+		if (this._kittyProtocolActive && !kittyMainScreenPushOutstanding) {
+			kittyMainScreenPushOutstanding = true;
+			this.write(KITTY_FLAGS_PUSH);
+		}
+	}
+
+	/**
+	 * Clear the outstanding-entry mark of whichever screen is currently active
+	 * and report whether a pop is owed there. The alt screen counts as active
+	 * while it is live in the terminal, including a preserved handoff.
+	 */
+	private popKittyFlagsOnActiveScreen(): boolean {
+		if (this._altScreenActive || this.ownsPendingAltScreenHandoff()) {
+			if (!kittyAltScreenPushOutstanding) return false;
+			kittyAltScreenPushOutstanding = false;
+			return true;
+		}
+		if (!kittyMainScreenPushOutstanding) return false;
+		kittyMainScreenPushOutstanding = false;
+		return true;
 	}
 
 	get altScreenActive(): boolean {

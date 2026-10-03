@@ -7,12 +7,12 @@
  * current snapshots plus `messages_pending`, and the kernel surfaces that as a
  * note telling the model to end its turn and receive the message.
  *
- * The anti-spin gate: only an arrival newer than the last early answer may end a
- * wait. Without it a model that re-arms a long collect without consuming the
- * message would be answered immediately again, forever.
- *
- * Red at HEAD: `createRlmCollectHostHandler` neither validated `wake_on_message`
- * nor knew a message-wake source, so the wait always ran to its bound.
+ * The anti-spin gate: a collect counts news from its own start, so only an arrival
+ * newer than the collect itself may end its wait. An arrival admitted before the
+ * collect started is not reported: it is either already delivered into the
+ * conversation (the common between-turns case, where answering instantly with
+ * `messages_pending` would send the model to end a turn for a message it already
+ * has) or already visible through the kernel's pending ledger.
  */
 import { describe, expect, it } from "vitest";
 import {
@@ -161,22 +161,45 @@ describe("rlm.collect message wake", () => {
 		expect(reply).toMatchObject({ results: [], timeout_ms: 30_000, messages_pending: 1 });
 	});
 
-	it("answers immediately when news landed between turns", async () => {
-		// An arrival admitted while no collect was parked is still news the waiting cell
-		// has not seen: the first wake-capable collect after it answers at once.
+	it("waits the full bound for arrivals admitted before the collect started", async () => {
+		// The false-report fix: arrivals admitted before this collect started are either
+		// already delivered into the conversation (the common between-turns case) or
+		// already reported by an earlier answer. Answering instantly with
+		// messages_pending sent the model to end a turn for a message it already had -
+		// a wasted round-trip per stale arrival.
 		const wake = createWakeSource(2);
 		const { handler, calls } = createParkingCollect();
 		const collect = createRlmCollectHostHandler(handler, { messageWake: wake.source });
 
-		const reply = await collect({ timeout_ms: 30_000, wake_on_message: true });
+		const reply = await collect({ timeout_ms: 200, wake_on_message: true });
 
+		expect(reply).not.toHaveProperty("messages_pending");
+		expect(calls).toEqual([{ timeoutMs: 200, releasedBy: "timeout" }]);
+	});
+
+	it("reports only arrivals newer than the collect's own start", async () => {
+		// One arrival predates the collect (it is the baseline, not news) and one lands
+		// mid-wait: the answer must carry the delta from this collect's start, never the
+		// session's whole backlog, and the wait must actually park until the new arrival.
+		const wake = createWakeSource(1);
+		const { handler, calls } = createParkingCollect();
+		const collect = createRlmCollectHostHandler(handler, { messageWake: wake.source });
+
+		const startedAt = Date.now();
+		const pending = collect({ timeout_ms: 30_000, wake_on_message: true });
+		await sleep(20);
+		wake.arrive(1);
+		const reply = await pending;
+
+		// An answer in the first few ms means the stale baseline arrival ended the wait.
+		expect(Date.now() - startedAt).toBeGreaterThanOrEqual(15);
 		expect(calls).toEqual([{ timeoutMs: 30_000, releasedBy: "abort" }]);
-		expect(reply).toMatchObject({ messages_pending: 2 });
+		expect(reply).toMatchObject({ messages_pending: 1 });
 	});
 
 	it("does not answer early twice for the same arrival", async () => {
-		// The gate: a re-armed long wait must run its bound when nothing newer than the
-		// last early answer arrived - otherwise the model's natural "collect again" loops
+		// The gate: a re-armed long wait must run its bound when nothing newer than its
+		// own start arrived - otherwise the model's natural "collect again" loops
 		// as an instant-answer spin.
 		const wake = createWakeSource();
 		const { handler, calls } = createParkingCollect();

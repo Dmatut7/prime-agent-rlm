@@ -3673,6 +3673,38 @@ describe("DaemonAgentConnection", () => {
 		await connection.dispose();
 	});
 
+	it("mirrors messagesOmitted from an inline windowed session_replaced (rev 46)", async () => {
+		// The supervisor's catch-up drain serves a slim client's replacement as an
+		// inline tail window; the omission count must survive onto the connection
+		// snapshot or the backfill marker loses how much history stayed behind.
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		const tail: AgentMessage[] = [{ role: "user", content: "replacement tail", timestamp: 300 }];
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-1",
+			state: createConnectionState("active-1", "session-current"),
+			messages: tail,
+			messagesOmitted: 250,
+		});
+
+		const snapshot = await connection.getInitialSnapshot();
+		expect(snapshot.messages).toEqual(tail);
+		expect(snapshot.messagesOmitted).toBe(250);
+
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-1",
+			state: createConnectionState("active-1", "session-current"),
+			messages: tail,
+		});
+		const full = await connection.getInitialSnapshot();
+		expect(full.messagesOmitted).toBeUndefined();
+		expect("messagesOmitted" in full).toBe(false);
+		await connection.dispose();
+	});
+
 	it("declares slim_attach_transcript on reattach after a session switch conflict", async () => {
 		const fakeClient = new FakeDaemonClient();
 		fakeClient.switchSessionAlreadyActive = { sessionPath: "/tmp/other.jsonl", activeSessionId: "active-target" };

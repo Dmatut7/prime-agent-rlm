@@ -203,6 +203,10 @@ describe("buildRlmPrompt", () => {
 		expect(prompt).toContain("Proof is what turns a belief into something you can hand over");
 		expect(prompt).toContain("Prove each fact once, from its canonical source, and stop when the evidence converges");
 		expect(prompt).toContain("re-running a check that passed or proving the same fact a second way");
+		// The convergence rule's bound: a pass covers only what ran, so an edit after the
+		// green check voids it and the check must be re-run.
+		expect(prompt).toContain("an edit after the green check voids it");
+		expect(prompt).toContain("the verification you cite must be newer than the last change it covers");
 	});
 
 	test("gives the user communication contract to root agents only", () => {

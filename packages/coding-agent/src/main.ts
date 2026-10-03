@@ -106,6 +106,7 @@ import {
 	collectDaemonLaunchEnv,
 	DAEMON_FIRST_PARTY_SESSION_CAPABILITIES,
 } from "./modes/daemon/daemon-protocol.js";
+import { readDaemonShutdownTombstone } from "./modes/daemon/daemon-supervisor-ownership.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	daemonWorkerInstanceId,
@@ -225,6 +226,15 @@ export function shouldRejectNonInteractiveAttach(attachAgent: string | undefined
 
 export function shouldRejectNonInteractiveBareResume(resume: true | string | undefined, appMode: AppMode): boolean {
 	return resume === true && appMode !== "interactive";
+}
+
+/**
+ * `prime-agent -v` alone almost always meant "version" (its binding before the
+ * -v/-V swap to the CLI convention, where lowercase is verbose). Any companion
+ * argument (`-v --verbose`, `agents -v`) keeps the verbose meaning.
+ */
+export function shouldTreatLoneVerboseFlagAsVersion(args: readonly string[]): boolean {
+	return args.length === 1 && args[0] === "-v";
 }
 
 function resolveAppMode(parsed: Args, stdinIsTTY: boolean): AppMode {
@@ -449,8 +459,70 @@ async function prepareInitialMessage(
 	});
 }
 
+/** Minimal stdin surface the startup Ctrl+C watcher needs (injectable for tests). */
+interface StartupCtrlCStdin {
+	isTTY?: boolean;
+	on(event: "data", listener: (chunk: Buffer) => void): unknown;
+	removeListener(event: "data", listener: (chunk: Buffer) => void): unknown;
+	pause(): unknown;
+	unshift(chunk: Buffer): unknown;
+}
+
+export interface StartupCtrlCExitOptions {
+	stdin?: StartupCtrlCStdin;
+	exit?: (code: number) => void;
+}
+
+/**
+ * Ctrl+C during the interactive startup window. engageEarlyRawMode made the tty
+ * raw without resuming stdin, so ISIG is off: Ctrl+C arrives as a buffered 0x03
+ * byte that nobody reads until the TUI starts, and a daemon spawn can hold that
+ * window open for the full startup timeout. Watch stdin until the first real
+ * consumer (a startup prompt or the TUI) adopts it; other bytes are put back,
+ * in order, for that consumer.
+ */
+export function installStartupCtrlCExit(options: StartupCtrlCExitOptions = {}): () => void {
+	const stdin = options.stdin ?? process.stdin;
+	const exit = options.exit ?? ((code: number) => process.exit(code));
+	if (!stdin.isTTY) {
+		return () => {};
+	}
+	const buffered: Buffer[] = [];
+	let released = false;
+	const onData = (chunk: Buffer) => {
+		// A bare 0x03 is Ctrl+C: raw mode disabled the ISIG that would have raised
+		// SIGINT, so mirror the signal's exit status instead.
+		if (chunk.includes(0x03)) {
+			exit(130);
+			return;
+		}
+		buffered.push(chunk);
+	};
+	stdin.on("data", onData);
+	return () => {
+		if (released) {
+			return;
+		}
+		released = true;
+		stdin.removeListener("data", onData);
+		stdin.pause();
+		if (buffered.length > 0) {
+			stdin.unshift(Buffer.concat(buffered));
+		}
+	};
+}
+
+let releaseStartupCtrlCWatcher: (() => void) | undefined;
+
+/** The first stdin consumer (a startup prompt, a warning gate, or the TUI) takes over Ctrl+C handling. */
+function releaseStartupCtrlC(): void {
+	releaseStartupCtrlCWatcher?.();
+	releaseStartupCtrlCWatcher = undefined;
+}
+
 /** Prompt user for yes/no confirmation */
 async function promptConfirm(message: string): Promise<boolean> {
+	releaseStartupCtrlC();
 	return new Promise((resolve) => {
 		const rl = createInterface({
 			input: process.stdin,
@@ -1054,6 +1126,7 @@ async function promptForMissingSessionCwd(
 	issue: SessionCwdIssue,
 	settingsManager: SettingsManager,
 ): Promise<string | undefined> {
+	releaseStartupCtrlC();
 	const [{ initTheme }, { ExtensionSelectorComponent }] = await Promise.all([
 		import("./modes/interactive/theme/theme.js"),
 		import("./modes/interactive/components/extension-selector.js"),
@@ -1153,6 +1226,25 @@ export function findActiveDaemonSessionSummaryForSessionFile(
 	);
 }
 
+/**
+ * recoverDaemon for an attached window. A deliberate shutdown leaves a durable
+ * tombstone the worker-side relaunch already honors; an open window must honor
+ * it too, or `prime-agent shutdown --force` is undone by its own clients. A
+ * fresh deliberate start lifts the tombstone, so a later retry recovers on its own.
+ */
+export async function recoverDaemonUnlessShutdownTombstoned(
+	socketPath: string,
+	ensure: (socketPath: string) => Promise<void> = ensureInteractiveDaemonRunning,
+): Promise<void> {
+	if (readDaemonShutdownTombstone(socketPath)) {
+		throw new Error(
+			`The Prime Agent daemon on ${socketPath} was shut down deliberately; ` +
+				"this window will reconnect once the daemon is started again.",
+		);
+	}
+	await ensure(socketPath);
+}
+
 async function createDaemonClientConnection(options: {
 	socketPath: string;
 	config: AgentSessionRuntimeConfig;
@@ -1181,7 +1273,7 @@ async function createDaemonClientConnection(options: {
 				ownedSession: options.clientOwned,
 				ownedSessionRecoveryConfig: options.clientOwned ? options.config : undefined,
 				supportsExtensionUi: options.supportsExtensionUi,
-				recoverDaemon: () => ensureInteractiveDaemonRunning(options.socketPath),
+				recoverDaemon: () => recoverDaemonUnlessShutdownTombstoned(options.socketPath),
 				telemetryDisabled: options.config.telemetryDisabled,
 			});
 			return { connection, summary };
@@ -1412,6 +1504,9 @@ export async function main(args: string[], options?: MainOptions) {
 		// runs never engage, so a backgrounded `-p`/`--mode` job keeps cooked mode and
 		// cannot SIGTTOU-stop on a setRawMode it never needed.
 		engageEarlyRawMode();
+		// Raw mode also disables ISIG, so without a watcher Ctrl+C is a buffered byte
+		// nobody reads until the TUI starts — install the startup handler with it.
+		releaseStartupCtrlCWatcher = installStartupCtrlCExit();
 	} else {
 		// Defensive symmetry for direct main() callers that engaged on their own.
 		releaseEarlyRawMode();
@@ -1423,6 +1518,11 @@ export async function main(args: string[], options?: MainOptions) {
 
 	if (parsed.version) {
 		console.log(VERSION);
+		process.exit(0);
+	}
+	if (shouldTreatLoneVerboseFlagAsVersion(args)) {
+		console.log(VERSION);
+		console.error(wrapForStderr(chalk.dim("-v is the verbose flag; use -V or --version to print the version.")));
 		process.exit(0);
 	}
 	if (parsed.help) {
@@ -1730,6 +1830,8 @@ export async function main(args: string[], options?: MainOptions) {
 		]);
 
 		if (deprecationWarnings.length > 0) {
+			// The warning gate reads a keypress from stdin; it owns Ctrl+C from here.
+			releaseStartupCtrlC();
 			await showDeprecationWarnings(deprecationWarnings);
 		}
 
@@ -1761,11 +1863,12 @@ export async function main(args: string[], options?: MainOptions) {
 			initialOpenActiveSessionId?: string,
 			handoff: Pick<AgentsViewModeOptions, "initialOpenChild" | "initialStatusMessage"> = {},
 		) => {
+			releaseStartupCtrlC();
 			await runAgentsViewMode({
 				socketPath: daemonSocketPath,
 				config: defaultSessionConfig,
 				uiServices: daemonUiServices,
-				recoverDaemon: () => ensureInteractiveDaemonRunning(daemonSocketPath),
+				recoverDaemon: () => recoverDaemonUnlessShutdownTombstoned(daemonSocketPath),
 				createUiServicesForSession: async (summary) => {
 					const attachedSessionManager = createSessionManagerForActiveDaemonSummary(
 						summary,
@@ -1876,6 +1979,8 @@ export async function main(args: string[], options?: MainOptions) {
 
 		await preloadCodeHighlighter();
 		printTimings();
+		// The TUI owns stdin (and Ctrl+C) from here.
+		releaseStartupCtrlC();
 		const interactiveResult = await interactiveMode.run();
 		if (parsed.noSession) {
 			return;
@@ -2067,6 +2172,8 @@ export async function main(args: string[], options?: MainOptions) {
 
 	// Show deprecation warnings in interactive mode
 	if (appMode === "interactive" && deprecationWarnings.length > 0) {
+		// The warning gate reads a keypress from stdin; it owns Ctrl+C from here.
+		releaseStartupCtrlC();
 		await showDeprecationWarnings(deprecationWarnings);
 	}
 
@@ -2134,6 +2241,7 @@ export async function main(args: string[], options?: MainOptions) {
 			verbose: parsed.verbose,
 		});
 		if (startupBenchmark) {
+			releaseStartupCtrlC();
 			try {
 				await interactiveMode.init();
 				time("interactiveMode.init");
@@ -2157,6 +2265,8 @@ export async function main(args: string[], options?: MainOptions) {
 
 		await preloadCodeHighlighter();
 		printTimings();
+		// The TUI owns stdin (and Ctrl+C) from here.
+		releaseStartupCtrlC();
 		await interactiveMode.run();
 	} else {
 		printTimings();

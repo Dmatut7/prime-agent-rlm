@@ -29,7 +29,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.js";
-import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.js";
+import { type AssistantMessageDiagnostic, appendAssistantMessageDiagnostic } from "../utils/diagnostics.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.js";
@@ -624,13 +624,35 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 
 			// Anthropic-compatible proxies (e.g. z.ai) can reorder or interleave block
 			// indexes; a delta or stop matching no open block was previously dropped
-			// without a trace. Persist each miss so the loss stays attributable.
+			// without a trace. Persist each miss so the loss stays attributable - but
+			// only the first miss per event shape: a proxy that mis-indexes every
+			// delta would otherwise append one diagnostic and one log line per event.
+			// Repeats advance `count`/`lastIndex` on the shape's single entry.
+			const unroutedBlockEvents = new Map<string, { diagnostic: AssistantMessageDiagnostic; count: number }>();
 			const recordUnroutedBlockEvent = (eventType: string, eventIndex: number, deltaType?: string): void => {
-				appendAssistantMessageDiagnostic(output, {
+				const shape = `${eventType}${deltaType ?? ""}`;
+				const seen = unroutedBlockEvents.get(shape);
+				if (seen) {
+					seen.count += 1;
+					if (seen.diagnostic.details) {
+						seen.diagnostic.details.count = seen.count;
+						seen.diagnostic.details.lastIndex = eventIndex;
+					}
+					return;
+				}
+				const diagnostic: AssistantMessageDiagnostic = {
 					type: "anthropic_content_block_event_unrouted",
 					timestamp: Date.now(),
-					details: { eventType, index: eventIndex, deltaType, openBlockIndexes: blocks.map((b) => b.index) },
-				});
+					details: {
+						eventType,
+						index: eventIndex,
+						deltaType,
+						openBlockIndexes: blocks.map((b) => b.index),
+						count: 1,
+					},
+				};
+				unroutedBlockEvents.set(shape, { diagnostic, count: 1 });
+				appendAssistantMessageDiagnostic(output, diagnostic);
 				log.warn("anthropic content block event matched no open block", {
 					provider: model.provider,
 					model: model.id,

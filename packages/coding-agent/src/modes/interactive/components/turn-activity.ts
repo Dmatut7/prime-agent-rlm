@@ -14,6 +14,7 @@ import {
 	type BoxRow,
 	buildTimelineView,
 	eventSaysMore,
+	type ReplayRetryPolicy,
 	type RowStep,
 	type TimelineEvent,
 	type TimelineFacts,
@@ -74,6 +75,13 @@ export interface TimelineHost {
 	autoFold(): boolean;
 	/** `hideThinkingBlock`: thinking rows say how long, never what. */
 	hideThinking?(): boolean;
+	/**
+	 * The retry settings a replayed retry row's reason is derived with, from the
+	 * host's long-lived settings manager. Absent or undefined: the row builder
+	 * falls back to reading the settings files from disk - per frame on a live
+	 * box - which only test doubles and host-less embedders should pay.
+	 */
+	retryPolicy?(): ReplayRetryPolicy | undefined;
 	requestRender(): void;
 }
 
@@ -357,7 +365,13 @@ export class TurnActivityState {
 			return { rows: this.viewCache.rows, events: this.viewCache.events, facts: this.viewCache.facts, live };
 		}
 		const ctx = { now, cwd, steps: this.rowSteps(), live, stopped: this.timeline.stopped, hideThinking };
-		const { rows, events } = buildTimelineView(this.timeline, ctx);
+		// The host's policy comes from its long-lived settings manager; without one
+		// the row builder falls back to reading the settings files per build.
+		const retryPolicy = this.host.retryPolicy?.();
+		const { rows, events } = buildTimelineView(
+			this.timeline,
+			retryPolicy === undefined ? ctx : { ...ctx, retryPolicy },
+		);
 		const facts = timelineFacts(this.timeline, rows, ctx);
 		if (!live) this.viewCache = { key: cacheKey, rows, events, facts };
 		return { rows, events, facts, live };

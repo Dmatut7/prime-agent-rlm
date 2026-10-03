@@ -457,7 +457,7 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 		}
 	});
 
-	it("pushes onto the active alt screen when the kitty answer arrives after entering it", () => {
+	it("re-pushes onto the main screen when the kitty answer arrived on the alt screen", () => {
 		const writes: string[] = [];
 		const restore = patchTerminalStdio(writes);
 		try {
@@ -471,9 +471,87 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 			terminal.leaveAltScreen();
 			terminal.stop();
 
+			// The verdict landed on the alt screen, so only the alt stack had an
+			// entry; leaving must pop it there and re-push on the main screen, or
+			// Alt-modified keys stay dead after the fullscreen toggle.
 			assert.deepEqual(writes, [
 				"\x1b[?2004h",
 				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[?2031$p\x1b[c",
+				"\x1b[?1049h",
+				"\x1b[>7u",
+				"\x1b[<u",
+				"\x1b[?1049l",
+				"\x1b[>7u",
+				"\x1b[?2004l",
+				"\x1b[<u",
+			]);
+		} finally {
+			restore();
+		}
+	});
+
+	it("pops the main-screen kitty entry on stop after a drain on the alt screen", async () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes, true);
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?1u");
+			terminal.enterAltScreen();
+			await terminal.drainInput(50, 10);
+			terminal.stop();
+
+			// The drain pops the alt screen's entry to silence late key releases;
+			// the main screen's startup entry must still be popped by stop(), or
+			// the mode stays enabled in the shell and Ctrl+C no longer raises SIGINT.
+			// The awaited drain lets the runner's own stdout frames through the
+			// passthrough patch, so only the escape-sequence writes are ours.
+			const escapeWrites = writes.filter((write) => write.startsWith("\x1b["));
+			assert.deepEqual(escapeWrites, [
+				"\x1b[?2004h",
+				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[?2031$p\x1b[c",
+				"\x1b[>7u",
+				"\x1b[?1049h",
+				"\x1b[>7u",
+				"\x1b[<u",
+				"\x1b[?1049l",
+				"\x1b[?2004l",
+				"\x1b[<u",
+			]);
+		} finally {
+			restore();
+		}
+	});
+
+	it("keeps both screen stacks balanced across repeated alt-screen cycles", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?1u");
+			terminal.enterAltScreen();
+			terminal.leaveAltScreen();
+			terminal.enterAltScreen();
+			terminal.leaveAltScreen();
+			terminal.stop();
+
+			// The main screen keeps its startup entry across cycles (no re-push);
+			// each alt-screen visit gets its own push/pop pair.
+			assert.deepEqual(writes, [
+				"\x1b[?2004h",
+				"\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b[?2031$p\x1b[c",
+				"\x1b[>7u",
+				"\x1b[?1049h",
+				"\x1b[>7u",
+				"\x1b[<u",
+				"\x1b[?1049l",
 				"\x1b[?1049h",
 				"\x1b[>7u",
 				"\x1b[<u",
@@ -798,7 +876,7 @@ describe("ProcessTerminal mode 2031 color-scheme pushes", () => {
 	});
 });
 
-function patchTerminalStdio(writes: string[]): () => void {
+function patchTerminalStdio(writes: string[], passthrough = false): () => void {
 	const originalWrite = process.stdout.write;
 	const originalIsRaw = Object.getOwnPropertyDescriptor(process.stdin, "isRaw");
 	const originalSetRawMode = Object.getOwnPropertyDescriptor(process.stdin, "setRawMode");
@@ -844,6 +922,11 @@ function patchTerminalStdio(writes: string[]): () => void {
 		writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
 		const callback = args.find((arg): arg is (error?: Error | null) => void => typeof arg === "function");
 		callback?.();
+		if (passthrough) {
+			// Async tests must not swallow: while the test awaits, the runner's own
+			// stdout frames would land in `writes` and never reach the parent.
+			return originalWrite.apply(process.stdout, args);
+		}
 		return true;
 	}) as typeof process.stdout.write;
 

@@ -981,11 +981,11 @@ describe("InteractiveMode working timer", () => {
 		expect(harness.workingStartedAt).toBe(starter.timestamp);
 	});
 
-	test.each([
-		["a non-streaming snapshot", false, [userMessage("Old prompt.", 200)]],
-		["a streaming snapshot without a starter", true, [{ ...toolCallMessage("tool-1", "ipython"), timestamp: 200 }]],
-	])("clears a stale anchor for %s and falls back to the loader start", async (_name, isStreaming, messages) => {
-		const harness = createInitialTimerHarness({ state: createConnectionState({ isStreaming }), messages }, 100);
+	test("clears a stale anchor for a non-streaming snapshot and falls back to the loader start", async () => {
+		const harness = createInitialTimerHarness(
+			{ state: createConnectionState({ isStreaming: false }), messages: [userMessage("Old prompt.", 200)] },
+			100,
+		);
 
 		await harness.renderInitialMessages();
 		const now = vi.spyOn(Date, "now").mockReturnValue(500);
@@ -999,6 +999,25 @@ describe("InteractiveMode working timer", () => {
 
 		expect(harness.turnStartedAt).toBeUndefined();
 		expect(harness.workingStartedAt).toBe(500);
+	});
+
+	test("a streaming snapshot whose window holds no starter anchors at the oldest visible message", async () => {
+		// A slim attach into a long turn: the tail holds only mid-turn steps, so the
+		// run's start is not in the window. The clock anchors at the window's first
+		// message - an understatement bounded by the window - instead of restarting
+		// at the attach moment.
+		const harness = createInitialTimerHarness(
+			{
+				state: createConnectionState({ isStreaming: true }),
+				messages: [{ ...toolCallMessage("tool-1", "ipython"), timestamp: 200 }],
+			},
+			100,
+		);
+
+		await harness.renderInitialMessages();
+
+		expect(harness.turnStartedAt).toBe(200);
+		expect(harness.workingStartedAt).toBe(200);
 	});
 
 	test("quiet mode keeps the loader out of the conversation and tells the prompt the turn is running", () => {
@@ -1838,6 +1857,7 @@ describe("InteractiveMode connection events", () => {
 			renderSessionContext: renderSessionContextMock,
 			restoreStreamingMessageFromSnapshot,
 			restoreTurnStartFromMessages: vi.fn(),
+			scheduleEditorHistoryBackfill: vi.fn(),
 			showStatus: vi.fn(),
 			showDutyLog: vi.fn(async () => {}),
 		} as unknown as InteractiveMode;

@@ -1908,4 +1908,50 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 			await expect(capturePromise).resolves.toBe("abc123");
 		});
 	});
+
+	describe("invalid configured sources", () => {
+		it("skips an invalid configured source instead of failing the whole update", async () => {
+			settingsManager.setPackages(["npm:-evil", "npm:good@1.0.0"]);
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+			await expect(packageManager.update()).resolves.toBeUndefined();
+
+			expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("npm:-evil"));
+		});
+
+		it("skips an invalid configured source while matching a requested update target", async () => {
+			settingsManager.setPackages(["npm:-evil", "npm:good@1.0.0"]);
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+			await expect(packageManager.update("npm:good")).resolves.toBeUndefined();
+
+			expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("npm:-evil"));
+		});
+
+		it("keeps the no-match error readable when a stored source is invalid", async () => {
+			settingsManager.setPackages(["npm:-evil"]);
+
+			await expect(packageManager.update("npm:other")).rejects.toThrow("No matching package found for npm:other");
+		});
+
+		it("removes a package even when another configured source is invalid", () => {
+			settingsManager.setPackages(["npm:-evil", "npm:good"]);
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+			expect(packageManager.removeSourceFromSettings("npm:good")).toBe(true);
+
+			expect(settingsManager.getGlobalSettings().packages).toEqual(["npm:-evil"]);
+			expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("npm:-evil"));
+		});
+
+		it("adds a package even when an existing configured source is invalid", () => {
+			settingsManager.setPackages(["npm:-evil"]);
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+			expect(packageManager.addSourceToSettings("npm:good")).toBe(true);
+
+			expect(settingsManager.getGlobalSettings().packages).toEqual(["npm:-evil", "npm:good"]);
+			expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("npm:-evil"));
+		});
+	});
 });

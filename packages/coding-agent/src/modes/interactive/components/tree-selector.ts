@@ -9,6 +9,7 @@ import {
 	TruncatedText,
 	truncateToWidth,
 } from "@earendil-works/pi-tui";
+import { DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT } from "../../../core/autonomous.js";
 import { shortenPathHome } from "../../../utils/shorten-path.js";
 import type { AgentConnectionSessionTreeNode } from "../../agent-connection/index.js";
 import { theme } from "../theme/theme.js";
@@ -41,10 +42,42 @@ interface FlatNode {
 export type FilterMode = "default" | "no-tools" | "user-only" | "labeled-only" | "all";
 
 /**
+ * User-role messages the harness itself sends (autonomous continuations:
+ * keep-alive, gate-failure and the plain continuation prompt) carry no marker on
+ * the message, so they are recognized by their text - the same prefixes the duty
+ * log's isOwnerMessage applies. A custom-configured continuation prompt is only
+ * knowable through the session's duty events, which the tree does not carry.
+ */
+const SYSTEM_USER_PROMPT_PREFIXES = [
+	"[autonomous-continuation",
+	DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT.trim().slice(0, 80),
+];
+
+/** Whether a user-role message came from the harness, not from the human. */
+function isSystemUserMessage(message: { content: unknown }): boolean {
+	const content = message.content;
+	let text: string;
+	if (typeof content === "string") {
+		text = content;
+	} else if (Array.isArray(content)) {
+		text = (content as readonly { type?: unknown; text?: unknown }[])
+			.filter((block) => block.type === "text" && typeof block.text === "string")
+			.map((block) => block.text as string)
+			.join("");
+	} else {
+		return false;
+	}
+	const trimmed = text.trim();
+	return SYSTEM_USER_PROMPT_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+}
+
+/**
  * Walk the active path from the leaf upward and return the closest user message
  * entry - the "edit the last thing I said" target a double-Esc open preselects,
  * so Enter forks it back into the editor regardless of the active filter mode.
- * Undefined when the path holds no user message (or there is no leaf).
+ * Harness-written continuation prompts never qualify: they are the machine
+ * continuing its own run, not something the human said. Undefined when the path
+ * holds no human user message (or there is no leaf).
  */
 export function findLatestUserMessageEntryId(
 	tree: AgentConnectionSessionTreeNode[],
@@ -63,7 +96,7 @@ export function findLatestUserMessageEntryId(
 		const node = nodeById.get(currentId);
 		if (!node) return undefined;
 		const entry = node.entry;
-		if (entry.type === "message" && entry.message.role === "user") {
+		if (entry.type === "message" && entry.message.role === "user" && !isSystemUserMessage(entry.message)) {
 			return entry.id;
 		}
 		currentId = entry.parentId ?? null;

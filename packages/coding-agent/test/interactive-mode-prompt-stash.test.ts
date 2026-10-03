@@ -16,6 +16,7 @@ type PromptStash = {
 	pasteSnapshot?: FakePasteSnapshot;
 	images?: readonly (readonly [number, ImageContent])[];
 	restoreOnOpen?: boolean;
+	escCleared?: boolean;
 };
 
 type FakeEditor = {
@@ -109,12 +110,18 @@ type SubmitHarness = PromptStashHarness & {
 
 type PromptStashMethods = {
 	bindPromptStashSession: (this: SharedPromptStashHarness, sessionId: string) => void;
+	carryPromptStashAcrossFork: (
+		this: SharedPromptStashHarness,
+		priorSessionId: string | undefined,
+		priorState: PromptStashState,
+	) => void;
 	handleFollowUp: (this: SubmitHarness) => Promise<void>;
 	handlePromptStash: (this: PromptStashHarness) => void;
 	hydratePromptStash: (this: SharedPromptStashHarness) => void;
 	resetCurrentSessionRenderState: (this: ResetHarness, options?: { clearPromptStash?: boolean }) => void;
 	restorePromptStashIfEditorEmpty: (this: PromptStashHarness, stash?: PromptStash) => boolean;
 	restorePromptStashOnOpen: (this: PromptStashHarness) => void;
+	stashDraftBeforeEscapeClear: (this: PromptStashHarness) => void;
 	stashDraftForAgentsView: (this: SharedPromptStashHarness) => void;
 	liveImageMarkerIds: (this: PromptStashLiveMarkerHarness) => Set<number>;
 	setupEditorSubmitHandler: (this: SubmitHarness) => void;
@@ -554,6 +561,75 @@ describe("InteractiveMode prompt stash", () => {
 		expect(mode.editor.addToHistory).toHaveBeenCalledWith("temporary prompt");
 		expect(mode.promptStash).toBeUndefined();
 		expect(mode.editor.getText()).toBe("half-written draft");
+	});
+
+	it("marks an Esc-cleared draft and keeps it out of the post-submit restore", async () => {
+		const mode = createSubmitHarness({ text: "draft I changed my mind about" });
+
+		interactiveModeMethods.stashDraftBeforeEscapeClear.call(mode);
+
+		expect(mode.promptStash).toMatchObject({ text: "draft I changed my mind about", escCleared: true });
+
+		await mode.defaultEditor.onSubmit?.("the real prompt");
+
+		// The cleared draft stays stashed instead of popping back into the editor,
+		// where a fast follow-up Enter would send it.
+		expect(mode.editor.getText()).toBe("");
+		expect(mode.promptStash?.text).toBe("draft I changed my mind about");
+	});
+
+	it("still restores an Esc-cleared draft through Ctrl+S", () => {
+		const mode = createPromptStashHarness({ text: "cleared on second thought" });
+
+		interactiveModeMethods.stashDraftBeforeEscapeClear.call(mode);
+		mode.editor.setText("");
+		interactiveModeMethods.handlePromptStash.call(mode);
+
+		expect(mode.editor.getText()).toBe("cleared on second thought");
+		expect(mode.promptStash).toBeUndefined();
+	});
+
+	it("carries the stash across a fork into the forked session", () => {
+		const store = new ClientPromptStashStore();
+		const mode = createSharedPromptStashHarness(store, "session-a");
+		const priorState = mode.promptStashState;
+		priorState.stash = { text: "esc-cleared draft", escCleared: true };
+		priorState.queuedStashes = [{ text: "manual stash" }];
+
+		// A successful fork replaces the session: the rebind moves the view onto the
+		// forked session's (empty) stash state before the fork callback continues.
+		interactiveModeMethods.bindPromptStashSession.call(mode, "session-b");
+		interactiveModeMethods.carryPromptStashAcrossFork.call(mode, "session-a", priorState);
+
+		expect(mode.promptStash).toEqual({ text: "esc-cleared draft", escCleared: true });
+		expect(mode.promptStashState.queuedStashes).toEqual([{ text: "manual stash" }]);
+		expect(priorState.stash).toBeUndefined();
+		expect(priorState.queuedStashes).toBeUndefined();
+	});
+
+	it("never overwrites the forked session's own stash when carrying", () => {
+		const store = new ClientPromptStashStore();
+		const mode = createSharedPromptStashHarness(store, "session-a");
+		const priorState = mode.promptStashState;
+		priorState.stash = { text: "old session draft" };
+		store.forSession("session-b").stash = { text: "fork's own draft" };
+
+		interactiveModeMethods.bindPromptStashSession.call(mode, "session-b");
+		interactiveModeMethods.carryPromptStashAcrossFork.call(mode, "session-a", priorState);
+
+		expect(mode.promptStash?.text).toBe("fork's own draft");
+		expect(priorState.stash?.text).toBe("old session draft");
+	});
+
+	it("carrying across a fork is a no-op when the session was never replaced", () => {
+		const store = new ClientPromptStashStore();
+		const mode = createSharedPromptStashHarness(store, "session-a");
+		const priorState = mode.promptStashState;
+		priorState.stash = { text: "draft" };
+
+		interactiveModeMethods.carryPromptStashAcrossFork.call(mode, "session-a", priorState);
+
+		expect(mode.promptStash?.text).toBe("draft");
 	});
 
 	it("routes session-owned commands through canonical prompt admission", async () => {

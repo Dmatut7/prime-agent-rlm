@@ -117,6 +117,21 @@ export interface WriteFileAtomicAsyncOptions extends Omit<WriteFileAtomicOptions
 }
 
 /**
+ * fsync that tolerates filesystems without it (EINVAL/ENOTSUP/EPERM): the data
+ * was written either way, and the atomic rename still protects readers.
+ */
+async function fsyncToleratingUnsupported(handle: { sync(): Promise<void> }): Promise<void> {
+	try {
+		await handle.sync();
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EPERM") {
+			throw error;
+		}
+	}
+}
+
+/**
  * Async twin of writeFileAtomicSync with the same guarantee set: temp file
  * beside the destination, optional fsync, exact mode past the umask, atomic
  * rename with the Windows transient-lock retry. writeFile writes the payload
@@ -143,9 +158,12 @@ export async function writeFileAtomicAsync(
 			throw new Error("Operation aborted");
 		}
 		if (options.fsync) {
-			const handle = await open(tempPath, "r");
+			// fsync wants a write-capable descriptor: a read-only one fails on some
+			// platforms, and a filesystem without fsync answers EINVAL/ENOTSUP/EPERM,
+			// which must not fail the write (the atomic rename still protects readers).
+			const handle = await open(tempPath, "r+");
 			try {
-				await handle.sync();
+				await fsyncToleratingUnsupported(handle);
 			} finally {
 				await handle.close();
 			}

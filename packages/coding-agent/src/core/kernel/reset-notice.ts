@@ -20,7 +20,7 @@
  */
 
 import type { KernelDeathCause, KernelHostRequestFact } from "./death-cause.js";
-import type { RestoreResult } from "./state-snapshot.js";
+import { isExpectedSnapshotSkip, type RestoreResult } from "./state-snapshot.js";
 
 /** Tag the notice is wrapped in; asserted by tests and recognisable to a model that saw it before. */
 export const KERNEL_RESET_NOTICE_TAG = "<ipython_kernel_reset>";
@@ -109,10 +109,13 @@ function rollbackLine(facts: KernelResetNoticeFacts): string {
 			? ` These came back with reduced semantics (frozen save-time values, not the live namespace) and can silently misbehave: ${restore.degraded.map((entry) => entry.name).join(", ")}.`
 			: "";
 	// A name the snapshot never saved cannot fail to restore, so it would otherwise be absent from
-	// both this line and "must be rebuilt" - the exact silence this notice exists to break.
+	// both this line and "must be rebuilt" - the exact silence this notice exists to break. Routine
+	// skips (leading-underscore internals, host skill wrappers) are filtered like the other
+	// notices: the bootstrap re-binds them on every start, so there is nothing to rebuild.
+	const notSavedEntries = restore.notSaved?.filter((entry) => !isExpectedSnapshotSkip(entry));
 	const notSaved =
-		restore.notSaved && restore.notSaved.length > 0
-			? ` These were live when that snapshot was written but were never saved into it, so they are gone and must be rebuilt: ${restore.notSaved.map((entry) => `${entry.name} (${entry.reason})`).join("; ")}.`
+		notSavedEntries && notSavedEntries.length > 0
+			? ` These were live when that snapshot was written but were never saved into it, so they are gone and must be rebuilt: ${notSavedEntries.map((entry) => `${entry.name} (${entry.reason})`).join("; ")}.`
 			: "";
 	return `1. State was rolled back to the most recent snapshot (${snapshotAgeClause(facts)}). ${revived}${missing}${notSaved}${degraded}${retried}`;
 }

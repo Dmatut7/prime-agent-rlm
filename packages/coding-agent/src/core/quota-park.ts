@@ -140,6 +140,7 @@ export interface QuotaParkHost {
 	_retryAttempt: AgentSession["_retryAttempt"];
 	_retryAuthFailureSources: AgentSession["_retryAuthFailureSources"];
 	readonly _actionStore: AgentSession["_actionStore"];
+	readonly _lastTurnAbortReason: AgentSession["_lastTurnAbortReason"];
 	_canFallbackLongWait(): boolean;
 	_handleFallbackLongWait: AgentSession["_handleFallbackLongWait"];
 	_markProviderAuthStaleForRetryFailure: AgentSession["_markProviderAuthStaleForRetryFailure"];
@@ -285,12 +286,20 @@ function parkForQuotaReset(
 		...(timer !== undefined ? { timer } : {}),
 		...(message.provider === undefined ? {} : { provider: message.provider }),
 	};
-	host.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
-		resumeAt: new Date(resumeAtMs).toISOString(),
-		parkCount,
-		...(jobId !== undefined ? { jobId } : {}),
-		provider: message.provider,
-	});
+	ensureQuotaParkClockCheck(host);
+	try {
+		host.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
+			resumeAt: new Date(resumeAtMs).toISOString(),
+			parkCount,
+			...(jobId !== undefined ? { jobId } : {}),
+			provider: message.provider,
+		});
+	} catch (error) {
+		// A failed persist must not swallow the park: without the catch the throw
+		// escapes before finishQuotaParkedTurn, _resolveRetry never runs, and the
+		// session sits in "retrying" forever with the wake already armed.
+		host._reportSessionPersistFailure(error);
+	}
 	finishQuotaParkedTurn(
 		host,
 		message,
@@ -370,6 +379,32 @@ function scheduleQuotaResumeTimer(host: QuotaParkHost, resumeAtMs: number): Retu
 	return timer;
 }
 
+/**
+ * Wall-clock check cadence behind the wake timer. A host sleep pauses the
+ * timer's countdown, so after the machine wakes the timer still waits out the
+ * full original delay; this interval is what notices the wake is overdue and
+ * drives it. One per parked session, unref'd, self-clearing once the park is
+ * gone: a session that is not parked has nothing to check.
+ */
+const QUOTA_WAKE_CLOCK_CHECK_MS = 60_000;
+const quotaParkClockChecks = new WeakMap<QuotaParkHost, ReturnType<typeof setInterval>>();
+
+function ensureQuotaParkClockCheck(host: QuotaParkHost): void {
+	if (quotaParkClockChecks.has(host)) return;
+	const interval = setInterval(() => {
+		const park = host._quotaPark;
+		if (!park) {
+			clearInterval(interval);
+			quotaParkClockChecks.delete(host);
+			return;
+		}
+		if (park.waking === true || park.resumeAtMs > Date.now()) return;
+		void resumeFromQuotaPark(host);
+	}, QUOTA_WAKE_CLOCK_CHECK_MS);
+	interval.unref();
+	quotaParkClockChecks.set(host, interval);
+}
+
 /** Store over this session's artifact file; undefined for in-memory sessions. */
 function quotaResumeStore(host: QuotaParkHost): AgentCronJobStore | undefined {
 	if (host._quotaResumeJobStore) {
@@ -398,7 +433,16 @@ export function resolveQuotaResumeJob(
 ): "delivered" | "user-cancelled" | "cancelled" | "gone" {
 	const job = findQuotaResumeJob(host, jobId);
 	if (job?.status === "completed") {
-		return "delivered";
+		// Only a run that actually executed without error delivered the wake: a
+		// skipped dispatch is stamped completed without the prompt ever running
+		// (runCount stays 0), and an errored run means the marker never landed
+		// (lastError is set). Both read as "gone" so the in-process wake owns the
+		// resume; the record itself is left untouched, since it is the history of
+		// what actually happened.
+		if (job.lastError === undefined && job.runCount > 0) {
+			return "delivered";
+		}
+		return "gone";
 	}
 	if (job?.status === "cancelled") {
 		return "user-cancelled";
@@ -439,7 +483,16 @@ function cancelQuotaParkWake(
  */
 export async function resumeFromQuotaPark(host: QuotaParkHost): Promise<void> {
 	const park = host._quotaPark;
-	if (!park || park.waking || park.resumeAtMs > Date.now()) {
+	if (!park || park.waking) {
+		return;
+	}
+	if (park.resumeAtMs > Date.now()) {
+		// The wake fired early (the wall clock stepped back after the timer was
+		// armed, e.g. an NTP correction). The fire consumed the timer, so re-arm
+		// for the remainder: returning without one leaves a live park with no
+		// in-process wake at all.
+		if (park.timer) clearTimeout(park.timer);
+		park.timer = scheduleQuotaResumeTimer(host, park.resumeAtMs);
 		return;
 	}
 	if (park.jobId !== undefined) {
@@ -475,10 +528,24 @@ export async function resumeFromQuotaPark(host: QuotaParkHost): Promise<void> {
  * An aborted turn is not evidence the quota is back. A wake whose resume
  * marker is still queued owns the resume, so an abort of some other turn must
  * not re-arm the wake under it; a wake this turn consumed re-arms instead.
+ *
+ * One exception: a user abort is the user taking the session back. Re-arming
+ * the wake under it auto-resumed the task 60s after the user pressed Esc, so a
+ * user-aborted turn cancels the park outright and records the cancellation.
  */
 export function handleAbortedQuotaPark(host: QuotaParkHost): void {
 	const park = host._quotaPark;
 	if (!park || (park.waking === true && hasQueuedQuotaResumeMarker(host))) {
+		return;
+	}
+	if (host._lastTurnAbortReason === "user") {
+		cancelQuotaParkWake(host, park);
+		host._quotaPark = undefined;
+		try {
+			host.sessionManager.appendCustomEntry(QUOTA_RESUME_CUSTOM_ENTRY_TYPE, { outcome: "user-aborted" });
+		} catch (error) {
+			host._reportSessionPersistFailure(error);
+		}
 		return;
 	}
 	park.waking = false;
@@ -527,7 +594,11 @@ function recoverQuotaParkWake(host: QuotaParkHost, outcome: "wake-failed" | "wak
 	if (retries > QUOTA_WAKE_MAX_RETRIES) {
 		cancelQuotaParkWake(host, park);
 		host._quotaPark = undefined;
-		host.sessionManager.appendCustomEntry(QUOTA_RESUME_CUSTOM_ENTRY_TYPE, { outcome });
+		try {
+			host.sessionManager.appendCustomEntry(QUOTA_RESUME_CUSTOM_ENTRY_TYPE, { outcome });
+		} catch (error) {
+			host._reportSessionPersistFailure(error);
+		}
 		return;
 	}
 	park.wakeRetries = retries;
@@ -539,18 +610,25 @@ function recoverQuotaParkWake(host: QuotaParkHost, outcome: "wake-failed" | "wak
 	park.resumeAtMs = Date.now() + QUOTA_WAKE_RETRY_DELAY_MS;
 	park.jobId = createQuotaResumeJob(host, park.resumeAtMs);
 	park.timer = scheduleQuotaResumeTimer(host, park.resumeAtMs);
+	ensureQuotaParkClockCheck(host);
 	// Record the replacement wake, or a restart reads the spent park entry,
 	// drops the park, and leaves this retry job armed with no owner to cancel.
 	// The provider rides along so readQuotaParkStatus keeps it after the re-arm,
 	// and wakeRetries rides along so a restart cannot reset the retry budget.
-	host.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
-		resumeAt: new Date(park.resumeAtMs).toISOString(),
-		quotaResumeAt: new Date(quotaResumeAtMs).toISOString(),
-		parkCount: park.parkCount,
-		wakeRetries: retries,
-		...(park.jobId !== undefined ? { jobId: park.jobId } : {}),
-		...(park.provider !== undefined ? { provider: park.provider } : {}),
-	});
+	// A failed record must not swallow the re-arm: the in-memory park and its
+	// timers are already the live truth.
+	try {
+		host.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
+			resumeAt: new Date(park.resumeAtMs).toISOString(),
+			quotaResumeAt: new Date(quotaResumeAtMs).toISOString(),
+			parkCount: park.parkCount,
+			wakeRetries: retries,
+			...(park.jobId !== undefined ? { jobId: park.jobId } : {}),
+			...(park.provider !== undefined ? { provider: park.provider } : {}),
+		});
+	} catch (error) {
+		host._reportSessionPersistFailure(error);
+	}
 }
 
 function findQuotaResumeJob(host: QuotaParkHost, jobId: string): AgentCronJob | undefined {
@@ -663,7 +741,30 @@ export function restoreQuotaPark(host: QuotaParkHost): void {
 				} catch (error) {
 					host._reportSessionPersistFailure(error);
 				}
+				return;
 			}
+			// The user cancelled the wake while the session was down: their choice
+			// stands, and the episode ends here.
+			if (job.status === "cancelled") {
+				return;
+			}
+			// The job survived: restore the park WITH its count, or every restart
+			// during a quota episode reset parkCount to 1 and waitForUsage.maxParks
+			// never bounded anything. The wake is already due, so the in-process
+			// timer drives it immediately and races the daemon's claim of the
+			// durable job - the same race a live park always runs.
+			host._quotaPark = {
+				parkCount: entry.data.parkCount,
+				resumeAtMs,
+				...(entry.data.quotaResumeAt !== undefined && Number.isFinite(Date.parse(entry.data.quotaResumeAt))
+					? { quotaResumeAtMs: Date.parse(entry.data.quotaResumeAt) }
+					: {}),
+				...(entry.data.jobId !== undefined ? { jobId: entry.data.jobId } : {}),
+				timer: scheduleQuotaResumeTimer(host, resumeAtMs),
+				...(entry.data.provider !== undefined ? { provider: entry.data.provider } : {}),
+				...(entry.data.wakeRetries !== undefined ? { wakeRetries: entry.data.wakeRetries } : {}),
+			};
+			ensureQuotaParkClockCheck(host);
 			return;
 		}
 		const quotaResumeAtMs = entry.data.quotaResumeAt === undefined ? undefined : Date.parse(entry.data.quotaResumeAt);
@@ -675,14 +776,18 @@ export function restoreQuotaPark(host: QuotaParkHost): void {
 			// A rebuilt wake replaces the cancelled one: record it, so the next
 			// restore reuses this job instead of arming another one beside it.
 			// The provider rides along so readQuotaParkStatus keeps it after the rebuild.
-			host.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
-				resumeAt: entry.data.resumeAt,
-				parkCount: entry.data.parkCount,
-				jobId,
-				...(entry.data.quotaResumeAt !== undefined ? { quotaResumeAt: entry.data.quotaResumeAt } : {}),
-				...(entry.data.provider !== undefined ? { provider: entry.data.provider } : {}),
-				...(entry.data.wakeRetries !== undefined ? { wakeRetries: entry.data.wakeRetries } : {}),
-			});
+			try {
+				host.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
+					resumeAt: entry.data.resumeAt,
+					parkCount: entry.data.parkCount,
+					jobId,
+					...(entry.data.quotaResumeAt !== undefined ? { quotaResumeAt: entry.data.quotaResumeAt } : {}),
+					...(entry.data.provider !== undefined ? { provider: entry.data.provider } : {}),
+					...(entry.data.wakeRetries !== undefined ? { wakeRetries: entry.data.wakeRetries } : {}),
+				});
+			} catch (error) {
+				host._reportSessionPersistFailure(error);
+			}
 		}
 		host._quotaPark = {
 			parkCount: entry.data.parkCount,
@@ -693,6 +798,7 @@ export function restoreQuotaPark(host: QuotaParkHost): void {
 			...(entry.data.provider !== undefined ? { provider: entry.data.provider } : {}),
 			...(entry.data.wakeRetries !== undefined ? { wakeRetries: entry.data.wakeRetries } : {}),
 		};
+		ensureQuotaParkClockCheck(host);
 		return;
 	}
 }
@@ -714,10 +820,14 @@ export function completeQuotaParkResume(host: QuotaParkHost): void {
 	const wasWaking = park.waking === true || delivered;
 	const restoredModel = host._restorePrimaryModelAfterBackup();
 	host._quotaPark = undefined;
-	host.sessionManager.appendCustomEntry(QUOTA_RESUME_CUSTOM_ENTRY_TYPE, {
-		outcome: wasWaking ? "wake" : "early",
-		...(restoredModel ? { restoredModel } : {}),
-	});
+	try {
+		host.sessionManager.appendCustomEntry(QUOTA_RESUME_CUSTOM_ENTRY_TYPE, {
+			outcome: wasWaking ? "wake" : "early",
+			...(restoredModel ? { restoredModel } : {}),
+		});
+	} catch (error) {
+		host._reportSessionPersistFailure(error);
+	}
 	if (!wasWaking) {
 		void host
 			._queuePreparedPrompt("followUp", QUOTA_RESUME_MARKER_TEXT, undefined, {

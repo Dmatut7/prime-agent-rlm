@@ -357,6 +357,31 @@ const MIN_SPLIT_LEX_BLOCK_CHARS = 4096;
 const INLINE_DELIM_CHARS = new Set(["*", "_", "`", "[", "<", "$", "~", "\\"]);
 
 /**
+ * Escape tokens whose raw is a math delimiter are potential openers, not closed
+ * constructs: while the formula is unterminated they lex as plain escapes (so
+ * they pass the construct check in findSafeInlineCut), but a closer arriving in
+ * the tail pairs with them across the cut and the spliced stream keeps the
+ * escape while a full re-lex produces inlineMath. Treat them like unmatched
+ * delimiters: no cut at or after them until the formula completes.
+ */
+const MATH_DELIMITER_ESCAPES = new Set(["\\(", "\\[", "\\)", "\\]"]);
+
+/**
+ * Parity of the backtick count: 1 while an unmatched backtick dangles. marked
+ * evaluates emphasis flanking on a codespan-masked copy of the whole inline
+ * text, so a dangling backtick arriving later can re-type an already-lexed
+ * `*...*` pair without any token crossing the point the prefix was verified at
+ * (an even count keeps the masking pair-aligned and the prefix stable).
+ */
+function backtickParity(text: string): number {
+	let parity = 0;
+	for (let i = 0; i < text.length; i++) {
+		if (text.charCodeAt(i) === 96) parity ^= 1;
+	}
+	return parity;
+}
+
+/**
  * Rightmost split offset inside the paragraph's inline token stream where a
  * splice reproduces a full re-lex exactly, or undefined when none qualifies:
  * - the cut sits inside a plain text token (type text, text === raw, no child
@@ -387,6 +412,18 @@ function findSafeInlineCut(tokens: Token[], text: string, minRel: number): numbe
 			continue;
 		}
 		if (token.type !== "text") {
+			// An unmatched math delimiter lexes as an escape token; it can still be
+			// claimed by a closer in the tail, so nothing past it is a safe cut.
+			if (token.type === "escape" && MATH_DELIMITER_ESCAPES.has(raw)) {
+				prefixClean = false;
+				// A cut exactly at the escape start makes the tail lex begin with the
+				// delimiter, and marked's block-math interrupt inserts a paragraph
+				// break before a mid-paragraph \[ that a tail-anchored lex never
+				// reproduces (a "\n" before it suppresses the break on both sides).
+				if (candidate === start && text[start - 1] !== "\n") {
+					candidate = undefined;
+				}
+			}
 			// Closed construct: append-stable, nothing to scan, no cut inside.
 			continue;
 		}
@@ -663,7 +700,25 @@ export class Markdown implements Component {
 		) {
 			return undefined;
 		}
+		// A dangling backtick anywhere in the paragraph can re-type emphasis inside
+		// the verified prefix (see backtickParity); odd frames fall back to a full
+		// lex, which also re-bootstraps this state from the corrected tokens.
+		if (backtickParity(normalizedText.slice(split.paraFrom)) === 1) {
+			return undefined;
+		}
 		const tail = normalizedText.slice(split.cut);
+		// marked's block-math interrupt inserts a paragraph break before a
+		// mid-paragraph $$ or \[, and a tail lex that STARTS with the delimiter
+		// never reproduces that break. The cut may predate the delimiter's arrival,
+		// so re-check every frame; only a newline (or the paragraph start) before
+		// the delimiter suppresses the break on both sides.
+		if (
+			(tail.startsWith("$$") || tail.startsWith("\\[")) &&
+			split.cut > split.paraFrom &&
+			normalizedText[split.cut - 1] !== "\n"
+		) {
+			return undefined;
+		}
 		if (normalizedText[split.cut - 1] === "\n") {
 			const newline = tail.indexOf("\n");
 			const firstLine = newline === -1 ? tail : tail.slice(0, newline);
@@ -1144,6 +1199,13 @@ export class Markdown implements Component {
 		if (typeof text !== "string" || !inlineTokens) {
 			return undefined;
 		}
+		// A dangling backtick can re-type sealed emphasis without any token
+		// crossing the seal boundary (see backtickParity), so seal only while every
+		// backtick in the paragraph is paired.
+		if (backtickParity(text) === 1) {
+			this.finalBlockSeal = undefined;
+			return undefined;
+		}
 		let seal = this.finalBlockSeal;
 		if (
 			seal &&
@@ -1434,18 +1496,25 @@ export class Markdown implements Component {
 			seal.wrapLines = undefined;
 			seal.wrapIneligible = false;
 		}
-		// The tail is exactly the growing line: the hard seal covers every
-		// newline-terminated line, so it never contains "\n".
-		const w = this.renderCodeTextLines(text.slice(seal.tailFrom), lang)[0] ?? "";
-		if (seal.wrapIneligible || w.includes("\x1b")) {
-			if (w.includes("\x1b")) {
+		// The tail is not always just the growing line: the hard seal only covers
+		// newlines that leave a non-empty tail, so text ending with "\n" (indented
+		// code keeps its trailing newline; a fence keeps trailing blank lines)
+		// leaves complete lines here. Render every tail line like the unsealed
+		// render does; the wrap seal covers only the last one.
+		const tailLines = this.renderCodeTextLines(text.slice(seal.tailFrom), lang);
+		const w = tailLines[tailLines.length - 1] ?? "";
+		const tailHasAnsi = tailLines.some((line) => line.includes("\x1b"));
+		if (seal.wrapIneligible || tailHasAnsi) {
+			if (tailHasAnsi) {
 				seal.wrapIneligible = true;
 			}
 			seal.wrapSealedW = undefined;
 			seal.wrapLines = undefined;
-			return [...seal.lines, ...this.renderTokenLinesToBlockLines([w], width, contentWidth)];
+			return [...seal.lines, ...this.renderTokenLinesToBlockLines(tailLines, width, contentWidth)];
 		}
-		return [...seal.lines, ...this.wrapSealGrowingLine(seal, w, width, contentWidth)];
+		const headLines =
+			tailLines.length > 1 ? this.renderTokenLinesToBlockLines(tailLines.slice(0, -1), width, contentWidth) : [];
+		return [...seal.lines, ...headLines, ...this.wrapSealGrowingLine(seal, w, width, contentWidth)];
 	}
 
 	/**

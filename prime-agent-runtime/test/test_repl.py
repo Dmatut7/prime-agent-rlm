@@ -2535,6 +2535,44 @@ class ForkChildProtocolTest(unittest.TestCase):
         events = self.repl.execute("after", "'alive'")
         self.assertEqual(one(events, "result")["text"], "'alive'")
 
+    def test_fork_child_writes_through_a_stale_stdout_reference_reach_the_pipe(self):
+        # A reference to the pre-fork sys.stdout (a saved name, a logging handler)
+        # holds the old _TaggedWriter; in the child its writes must go straight to
+        # the captured pipe - the coalescer it would append to never flushes there.
+        cell = "\n".join(
+            [
+                "import os, sys",
+                "stale = sys.stdout",
+                "stale_err = sys.stderr",
+                "pid = os.fork()",
+                "if pid == 0:",
+                "    stale.write('stale-out\\n')",
+                "    stale.flush()",
+                "    stale_err.write('stale-err\\n')",
+                "    stale_err.flush()",
+                "    os._exit(0)",
+                "_, status = os.waitpid(pid, 0)",
+                "assert os.waitstatus_to_exitcode(status) == 0",
+            ]
+        )
+        events = self.repl.execute("fork-stale", cell)
+        self.assertEqual(one(events, "done")["status"], "ok")
+        out = stream_text(events, "stdout")
+        err = stream_text(events, "stderr")
+        deadline = time.monotonic() + 10
+        while ("stale-out" not in out or "stale-err" not in err) and time.monotonic() < deadline:
+            event = self.repl.read_event(timeout=10)
+            if event.get("event") == "stdout":
+                self.assertIsNone(event["id"])
+                out += event["text"]
+            elif event.get("event") == "stderr":
+                self.assertIsNone(event["id"])
+                err += event["text"]
+        self.assertIn("stale-out", out)
+        self.assertIn("stale-err", err)
+        events = self.repl.execute("after", "'alive'")
+        self.assertEqual(one(events, "result")["text"], "'alive'")
+
 
 class LinecacheHygieneTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -2542,15 +2580,50 @@ class LinecacheHygieneTest(unittest.TestCase):
         self.addCleanup(self.repl.close)
         self.assertEqual(self.repl.ready()[0]["event"], "ready")
 
-    def test_finished_cells_drop_their_linecache_entry(self):
-        # One cached source listing per cell would otherwise grow with the session.
-        self.assertEqual(one(self.repl.execute("c1", "1"), "done")["status"], "ok")
+    def cell_names(self, rid: str = "inspect") -> list[str]:
         events = self.repl.execute(
-            "c2",
-            "import linecache\nsorted(k for k in linecache.cache if k.startswith('<cell-'))",
+            rid,
+            "import linecache\n"
+            "sorted((k for k in linecache.cache if k.startswith('<cell-')), key=lambda k: int(k[6:-1]))",
         )
-        # Only the running cell's own entry may be present.
-        self.assertEqual(one(events, "result")["text"], "['<cell-2>']")
+        return eval(one(events, "result")["text"])  # noqa: S307 - the kernel's own list literal
+
+    def test_recent_cells_keep_their_linecache_entries(self):
+        # An error in a function from an earlier cell must still show its source
+        # line, so finished cells keep their entry; only a bounded backlog is held.
+        for rid in ("c1", "c2"):
+            self.assertEqual(one(self.repl.execute(rid, "1"), "done")["status"], "ok")
+        self.assertEqual(self.cell_names(), ["<cell-1>", "<cell-2>", "<cell-3>"])
+
+    def test_an_error_in_a_function_from_an_earlier_cell_shows_its_source_line(self):
+        define = self.repl.execute("c1", "def boom():\n    marker = 'x'\n    raise ValueError('kaboom-' + marker)")
+        self.assertEqual(one(define, "done")["status"], "ok")
+        error = one(self.repl.execute("c2", "boom()"), "error")
+        assert error is not None
+        text = "".join(error["traceback"])
+        self.assertIn("<cell-1>", text)
+        # The frame's source line, dropped when the finished cell's entry was evicted.
+        self.assertIn("raise ValueError('kaboom-' + marker)", text)
+
+    def test_inspect_getsource_works_for_a_function_from_an_earlier_cell(self):
+        self.assertEqual(one(self.repl.execute("c1", "def f():\n    return 42"), "done")["status"], "ok")
+        events = self.repl.execute("c2", "import inspect\ninspect.getsource(f)")
+        self.assertEqual(one(events, "result")["text"], "'def f():\\n    return 42'")
+
+    def test_linecache_entries_are_capped(self):
+        # A long session must not pin every cell's source: past the keep limit the
+        # oldest entries go.
+        keep = int(one(self.repl.execute("keep", "import rlm.repl as r\nr._CELL_LINECACHE_KEEP"), "result")["text"])
+        self.assertGreater(keep, 0)
+        for index in range(keep + 2):
+            self.assertEqual(one(self.repl.execute(f"c{index}", "1"), "done")["status"], "ok")
+        names = self.cell_names()
+        # keep + 4 cells ran (the keep read, keep + 2 fillers, this inspection). The
+        # inspecting cell's own entry is registered before it runs and evicted only
+        # after, so the newest `keep` finished cells plus this one show.
+        self.assertEqual(len(names), keep + 1)
+        self.assertEqual(names[0], "<cell-4>")  # cells 1..3 (keep read + c0 + c1) evicted
+        self.assertEqual(names[-1], f"<cell-{keep + 4}>")
 
 
 class SnapshotBlobCacheEvictionTest(unittest.TestCase):
@@ -2584,6 +2657,37 @@ class SnapshotBlobCacheEvictionTest(unittest.TestCase):
             result = repl_module._snapshot_state(ns, path, manifest, 1 << 20, 1 << 20, False, blob_cache=cache)
             self.assertNotIn("frozen", cache)
             self.assertTrue(any(skip["name"] == "frozen" for skip in result["skipped"]))
+
+
+class SnapshotInternalNamesTest(unittest.TestCase):
+    """The host bootstrap's `_prime_agent_*`/`_PrimeAgent*` names are skipped silently.
+
+    They are re-bound by the bootstrap on every start, so reporting them as skipped
+    surfaced a "not saved, must be rebuilt" notice for names the model never owned.
+    A user's own private name must still be reported.
+    """
+
+    def test_internal_names_are_neither_saved_nor_reported(self):
+        import rlm.repl as repl_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.dill")
+            manifest = os.path.join(tmp, "state.json")
+            ns: dict = {
+                "_prime_agent_sys": 1,
+                "_PrimeAgentMissingRlm": 2,
+                "_PRIME_AGENT_SKILL_WRAPPERS": {},
+                "_user_private": 3,
+                "public_value": 4,
+            }
+            result = repl_module._snapshot_state(ns, path, manifest, 1 << 20, 1 << 20, False)
+            self.assertNotIn("error", result)
+            skipped_names = [skip["name"] for skip in result["skipped"]]
+            self.assertEqual(skipped_names, ["_user_private"])
+            self.assertEqual(result["saved"], ["public_value"])
+            with open(manifest) as handle:
+                on_disk = json.load(handle)
+            self.assertEqual([skip["name"] for skip in on_disk["skipped"]], ["_user_private"])
 
 
 class ShutdownDrainTest(unittest.TestCase):

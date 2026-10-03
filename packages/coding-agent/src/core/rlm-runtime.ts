@@ -498,14 +498,6 @@ export function createRlmCollectHostHandler(
 	handler: RlmCollectHandler,
 	options?: CreateRlmCollectHostHandlerOptions,
 ): HostRequestHandler {
-	/**
-	 * The anti-spin gate behind `wake_on_message`: only an arrival newer than the
-	 * last early answer may end a wait. Without it a model that re-arms a long
-	 * collect without consuming the reported message would be answered immediately
-	 * again, forever - an instant-answer spin that still burns one model round-trip
-	 * per lap.
-	 */
-	let lastMessageWakeAnsweredCount = 0;
 	return async (payload, signal) => {
 		const rawTargets = payload.targets;
 		if (rawTargets !== undefined && rawTargets !== null && !Array.isArray(rawTargets)) {
@@ -547,7 +539,14 @@ export function createRlmCollectHostHandler(
 			const { results } = await handler(targets, timeoutMs, signal);
 			return { results, timeout_ms: timeoutMs };
 		}
-		const since = lastMessageWakeAnsweredCount;
+		// The anti-spin gate behind `wake_on_message`: this collect counts news from its
+		// own start, so only an arrival admitted during the wait may end it early.
+		// Anything older is not news: it is either already delivered into the
+		// conversation (the common between-turns case - answering instantly with
+		// messages_pending would send the model to end a turn for a message it already
+		// has, a wasted round-trip per stale arrival) or already reported by an earlier
+		// answer (a re-armed collect without a new arrival parks instead of spinning).
+		const since = messageWake.arrivalCount();
 		// The collect and the arrival wait share one derived signal: an arrival aborts it
 		// to end the settlement wait early (the collect's abort path returns the current
 		// snapshots), and the request's own abort - a cell interrupt - propagates through
@@ -564,8 +563,9 @@ export function createRlmCollectHostHandler(
 		const wakePromise = messageWake.waitForArrival(since, timeoutMs, wakeController.signal).then(
 			(arrived) => {
 				// A request abort racing an arrival wins: the cell is gone, so this is not a
-				// reportable wake, and the gate marker must stay put so the next wait still
-				// reports the message that never got announced.
+				// reportable wake. The arrival is not lost - the admission push already
+				// recorded it in the kernel's pending ledger, and the message still enters
+				// the conversation at the next turn boundary.
 				const woken = arrived === true && !signal?.aborted;
 				if (woken) wakeController.abort(new Error("rlm.collect ended early: an agent message arrived"));
 				return woken;
@@ -580,14 +580,13 @@ export function createRlmCollectHostHandler(
 			const woken = await wakePromise;
 			if (!outcome.ok) throw outcome.error;
 			if (!woken) return { results: outcome.value.results, timeout_ms: timeoutMs };
-			const pendingNow = Math.max(since, messageWake.arrivalCount());
-			lastMessageWakeAnsweredCount = pendingNow;
+			const pendingNow = messageWake.arrivalCount();
 			return {
 				results: outcome.value.results,
 				timeout_ms: timeoutMs,
 				// The kernel mirrors this into the cell's output as "N message(s) pending; end
 				// the turn to receive them", so the number is the news this answer carries -
-				// arrivals since the last early answer, never the session's whole backlog.
+				// arrivals since this collect started, never the session's whole backlog.
 				messages_pending: Math.max(1, pendingNow - since),
 			};
 		} finally {

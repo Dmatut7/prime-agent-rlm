@@ -161,6 +161,45 @@ describe("planHarnessConsolidation merges", () => {
 });
 
 describe("planHarnessConsolidation stale deletes", () => {
+	it("never marks the merge target for a containment delete", () => {
+		// The merge canonical's planned body is its original plus the absorbed
+		// appendix, but the containment pass reads the pre-merge store: without
+		// protection it marks the canonical contained in a larger survivor, and
+		// the apply would delete the entry the merge just wrote into.
+		const padding = Array.from({ length: 110 }, (_, i) => `word${i}`).join(" ");
+		const state = makeState([
+			makeEntry("mem_original", { title: DUP_TITLE_A, content: DUP_CONTENT_A }),
+			makeEntry("mem_rewrite", { title: DUP_TITLE_B, content: DUP_CONTENT_B }),
+			makeEntry("mem_handbook", { title: "大杂烩手册", content: `${DUP_CONTENT_B} ${padding}` }),
+		]);
+		const plan = planHarnessConsolidation(state, { now: NOW });
+		expect(plan.operations.map((op) => [op.action, op.action === "merge" ? op.targetId : op.id])).toEqual([
+			["merge", "mem_rewrite"],
+		]);
+	});
+
+	it("never age-deletes the merge target", () => {
+		// Both cluster members are older than the stale window; the canonical is
+		// about to receive the absorbed content, so the plan must not age it out
+		// from under the merge.
+		const state = makeState([
+			makeEntry("mem_original", {
+				title: DUP_TITLE_A,
+				content: DUP_CONTENT_A,
+				updated_at: "2026-08-01T00:00:00.000Z",
+			}),
+			makeEntry("mem_rewrite", {
+				title: DUP_TITLE_B,
+				content: DUP_CONTENT_B,
+				updated_at: "2026-08-02T00:00:00.000Z",
+			}),
+		]);
+		const plan = planHarnessConsolidation(state, { staleDays: 30, now: NOW });
+		expect(plan.operations.map((op) => [op.action, op.action === "merge" ? op.targetId : op.id])).toEqual([
+			["merge", "mem_rewrite"],
+		]);
+	});
+
 	it("merges a contained and similar pair instead of deleting", () => {
 		// A fully contained body is usually also a high-cosine near-duplicate;
 		// the merge pass runs first and claims it.
@@ -240,10 +279,14 @@ describe("planHarnessConsolidation stale deletes", () => {
 });
 
 describe("planHarnessConsolidation renames", () => {
-	it("suggests renames for titles over the slim cap at zero index cost", () => {
+	it("treats title slimming as opt-in", () => {
+		// Off by default: slimming rewrites the stored title, while the digest's
+		// index layer already truncates its own rendering - so the pass runs only
+		// when a caller explicitly asks for it.
 		const longTitle = "这是一条很长的标题".repeat(20); // 180 code points
 		const state = makeState([makeEntry("mem_long", { title: longTitle, content: "正文" })]);
-		const plan = planHarnessConsolidation(state, { now: NOW });
+		expect(planHarnessConsolidation(state, { now: NOW }).operations).toEqual([]);
+		const plan = planHarnessConsolidation(state, { slimTitleChars: 120, now: NOW });
 		expect(plan.operations).toHaveLength(1);
 		const rename = plan.operations[0];
 		if (rename.action !== "rename") throw new Error("expected a rename operation");
@@ -251,8 +294,8 @@ describe("planHarnessConsolidation renames", () => {
 		expect(Array.from(rename.title)).toHaveLength(120);
 		expect(rename.title.endsWith("...")).toBe(true);
 		expect(rename.previousTitleChars).toBe(180);
-		// The default slim cap is the index render cap: the rename renders
-		// byte-identically to the truncated face it replaces.
+		// Slimming to the render cap renders byte-identically to the truncated
+		// face it replaces, so the index byte math is unchanged.
 		expect(plan.indexBytesAfter).toBe(plan.indexBytesBefore);
 	});
 
@@ -278,6 +321,34 @@ describe("planHarnessConsolidation renames", () => {
 		if (rename.action !== "rename") throw new Error("expected a rename operation");
 		expect(rename.title).not.toContain("\n");
 		expect(Array.from(rename.title)).toHaveLength(10);
+	});
+});
+
+describe("planHarnessConsolidation merge content", () => {
+	it("keeps URLs and code whole in the merge appendix", () => {
+		// The sentence splitter must not cut inside a URL (?, !) or a code block
+		// (newlines, ?, !): a split URL is a dead link and split code is garbage
+		// in the appendix. Mirrored verbatim in test_harness_consolidation.py.
+		const canonicalContent =
+			"部署前必须逐路径核对归属判据，别扫整个工作树；提交说明里每个路径都要对着 git show --stat 的数字核一遍。";
+		const absorbedContent =
+			canonicalContent +
+			"排查手册见 https://wiki.example.com/dev?topic=review&lang=zh！" +
+			"命令序列：\n```\ngit status\nmake build? no!\n```\n跑完再收尾。";
+		const expected =
+			`${canonicalContent}\n\n合并补充：\n- 排查手册见 https://wiki.example.com/dev?topic=review&lang=zh` +
+			"\n- 命令序列：\n- ```\ngit status\nmake build? no!\n```\n- 跑完再收尾";
+		const state = makeState([
+			makeEntry("mem_old", { title: "部署核对清单旧版", content: absorbedContent }),
+			makeEntry("mem_new", { title: "部署核对清单", content: canonicalContent }),
+		]);
+		const plan = planHarnessConsolidation(state, { now: NOW });
+		expect(plan.operations).toHaveLength(1);
+		const merge = plan.operations[0];
+		if (merge.action !== "merge") throw new Error("expected a merge operation");
+		expect(merge.targetId).toBe("mem_new");
+		expect(merge.absorbIds).toEqual(["mem_old"]);
+		expect(merge.content).toBe(expected);
 	});
 });
 
@@ -360,7 +431,7 @@ describe("applyHarnessConsolidation", () => {
 	it("rejects a rename whose entry vanished", () => {
 		const longTitle = "这是一条很长的标题".repeat(20);
 		const state = makeState([makeEntry("mem_long", { title: longTitle, content: "正文" })]);
-		const plan = planHarnessConsolidation(state, { now: NOW });
+		const plan = planHarnessConsolidation(state, { slimTitleChars: 120, now: NOW });
 		delete state.entries.memory.mem_long;
 		const result = applyHarnessConsolidation(state, plan, { allowStalePlan: true });
 		expect(result.appliedEdits[0].applied).toBe(false);

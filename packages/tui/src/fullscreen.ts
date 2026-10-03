@@ -156,6 +156,13 @@ export class FullscreenViewport {
 	private lastPinned: PinnedHeader | null = null;
 	private frameClickTargets: FrameClickTarget[] = [];
 	private lastTranscript: string[] = [];
+	/**
+	 * Rows prepended above the window since the last composed frame (a backfilled
+	 * history page), announced through {@link noteTranscriptPrepend}. Consumed by
+	 * the next frame: the paused window shifts down with the page and the page
+	 * never counts as new content below.
+	 */
+	private prependedLines = 0;
 	private lastFrame: string[] = [];
 	private lastFrameVisibleStart = 0;
 	private lastFrameVisibleHeight = 0;
@@ -197,10 +204,17 @@ export class FullscreenViewport {
 		const windowHeight = height - dockLines.length - headerLines.length;
 		const maxScroll = Math.max(0, transcript.length - windowHeight);
 
+		// A page prepended above the window (announced since the last frame) shifts
+		// every row down: the paused window follows its rows. Applied here, where
+		// maxScroll already carries the page - scrollBy() before this frame clamps
+		// against the stale maxScroll and snaps a near-bottom paused window back to
+		// following. A following window stays glued to the end, nothing to do.
+		const prepended = this.prependedLines;
+		this.prependedLines = 0;
 		if (this.following) {
 			this.scrollTop = maxScroll;
 		} else {
-			this.scrollTop = Math.max(0, Math.min(this.scrollTop, maxScroll));
+			this.scrollTop = Math.max(0, Math.min(this.scrollTop + prepended, maxScroll));
 		}
 		const hold = this.clickHold;
 		if (hold) {
@@ -245,11 +259,13 @@ export class FullscreenViewport {
 			// Rows appended while the window was paused are new to whoever scrolled up.
 			// Count transcript growth, not maxScroll growth: a taller dock or header
 			// shrinks the window and pushes already-seen rows below it, and those rows
-			// are not new. Clamp to what is actually below the window: a rebuilt or
-			// compacted transcript re-anchors every row, and a count larger than
-			// linesBelow would claim content that is not there.
+			// are not new. Rows prepended above the window (a backfilled history page)
+			// are not new either: they sit above what the reader already saw. Clamp to
+			// what is actually below the window: a rebuilt or compacted transcript
+			// re-anchors every row, and a count larger than linesBelow would claim
+			// content that is not there.
 			this.unseenLines = Math.min(
-				this.unseenLines + Math.max(0, transcript.length - this.lastTranscript.length),
+				this.unseenLines + Math.max(0, transcript.length - this.lastTranscript.length - prepended),
 				Math.max(0, maxScroll - this.scrollTop),
 			);
 		}
@@ -1142,6 +1158,18 @@ export class FullscreenViewport {
 			// rows that are still below the window.
 			this.unseenLines = Math.min(this.unseenLines, Math.max(0, this.lastMaxScroll - this.scrollTop));
 		}
+	}
+
+	/**
+	 * Announce rows inserted at the TOP of the transcript (a backfilled history
+	 * page). The next composed frame shifts a paused window down with them so the
+	 * rows it shows stay put, and never counts them as new content below; a
+	 * following window stays glued to the end. Deferring to the frame matters:
+	 * scrollBy() runs against the pre-insert maxScroll and would clamp a
+	 * near-bottom paused window into following.
+	 */
+	noteTranscriptPrepend(lines: number): void {
+		if (lines > 0) this.prependedLines += lines;
 	}
 
 	scrollToTop(): void {

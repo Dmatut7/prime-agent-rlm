@@ -260,6 +260,65 @@ class NearDuplicateReceiptPlumbingTest(unittest.TestCase):
         self.assertIsNotNone(second.near_duplicate_warning)
 
 
+class NearDuplicateSmallCorpusTest(unittest.TestCase):
+    """Two-band threshold: below ten memories the idf weights are too coarse
+    for the production-calibrated 0.40 band (every term is rare, so generic
+    shared bigrams score like distinctive ones), and the gate moves to the
+    consolidation-grade 0.55 floor."""
+
+    def test_tiny_corpus_shared_boilerplate_does_not_warn(self) -> None:
+        # Genuinely different rules (a session-directory convention vs a lease
+        # rule) score 0.515 at N=2 - above 0.40, below the small-corpus floor -
+        # so the old gate advised overwriting the old entry on a false positive.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("会话目录", "每个会话一个目录", id="mem_dir")
+            receipt = state.create_memory("会话 lease", "每个会话一个 lease", id="mem_lease")
+            self.assertIsNone(receipt.near_duplicate_warning)
+
+    def test_tiny_corpus_true_duplicate_still_warns(self) -> None:
+        # The production-calibrated rewrite pair scores 0.746 at N=2, above the
+        # small-corpus floor.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory(DUP_TITLE_A, DUP_CONTENT_A, id="mem_original")
+            receipt = state.create_memory(DUP_TITLE_B, DUP_CONTENT_B, id="mem_rewrite")
+            warning = receipt.near_duplicate_warning
+            self.assertIsNotNone(warning)
+            assert warning is not None
+            self.assertIn("mem_original", warning)
+
+    def test_larger_corpus_keeps_the_calibrated_band(self) -> None:
+        # At eleven memories a 0.44 match still advises: the 0.40 band is
+        # production-calibrated, only tiny corpora move off it. The fixture
+        # shares 7 of 12 terms with the target (measured 0.4427 at N=11).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory(
+                "alpha bravo charlie", "delta echo foxtrot golf hotel india juliet kilo lima", id="mem_target"
+            )
+            pads = [
+                ("romeo sierra tango", "uniform victor whiskey xray yankee zulu"),
+                ("cache warmup", "cache warmup runs after every deploy to keep latency flat"),
+                ("queue draining", "queue draining must finish before the workers scale down"),
+                ("secret rotation", "secret rotation happens monthly with dual control approval"),
+                ("index rebuild", "index rebuild runs nightly against the replica cluster"),
+                ("log retention", "log retention keeps thirty days of structured request logs"),
+                ("schema migration", "schema migration requires a dry run against staging first"),
+                ("alert routing", "alert routing pages the oncall for sev1 and tickets sev3"),
+                ("build cache", "build cache invalidation keys on the lockfile digest"),
+            ]
+            for index, (title, content) in enumerate(pads):
+                state.create_memory(title, content, id=f"mem_pad{index}")
+            receipt = state.create_memory(
+                "alpha bravo charlie", "delta echo foxtrot golf mike november oscar papa quebec", id="mem_cand"
+            )
+            warning = receipt.near_duplicate_warning
+            self.assertIsNotNone(warning)
+            assert warning is not None
+            self.assertIn("mem_target", warning)
+
+
 class NearDuplicateScopeTest(unittest.TestCase):
     def test_each_store_compares_against_its_own_memories(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

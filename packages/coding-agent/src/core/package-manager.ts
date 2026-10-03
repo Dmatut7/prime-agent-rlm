@@ -25,6 +25,7 @@ function getEnv(): NodeJS.ProcessEnv {
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
 import { getLogger } from "@earendil-works/pi-ai";
+import chalk from "chalk";
 import { globSync } from "glob";
 import ignore from "ignore";
 import { minimatch } from "minimatch";
@@ -900,6 +901,17 @@ export class DefaultPackageManager implements PackageManager {
 		this.progressCallback?.(event);
 	}
 
+	/**
+	 * One settings entry the source parser rejects (see parseNpmSpec) must not abort
+	 * the whole package command: skip it and say so, like resolve() does through its
+	 * diagnostics. Commands here have no diagnostics channel, so this goes to stderr.
+	 */
+	private warnSkippedInvalidSource(source: string, error: unknown): void {
+		const reason = error instanceof Error ? error.message : String(error);
+		log.warn("skipping invalid configured package source", { source, reason });
+		console.error(chalk.yellow(`Warning: Skipping invalid configured package source "${source}": ${reason}`));
+	}
+
 	private async withProgress(
 		action: ProgressEvent["action"],
 		source: string,
@@ -1069,13 +1081,27 @@ export class DefaultPackageManager implements PackageManager {
 
 		for (const pkg of globalSettings.packages ?? []) {
 			const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
-			if (identity && this.getPackageIdentity(sourceStr, "user") !== identity) continue;
+			let entryIdentity: string;
+			try {
+				entryIdentity = this.getPackageIdentity(sourceStr, "user");
+			} catch (error) {
+				this.warnSkippedInvalidSource(sourceStr, error);
+				continue;
+			}
+			if (identity && entryIdentity !== identity) continue;
 			matched = true;
 			updateSources.push({ source: sourceStr, scope: "user" });
 		}
 		for (const pkg of projectSettings.packages ?? []) {
 			const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
-			if (identity && this.getPackageIdentity(sourceStr, "project") !== identity) continue;
+			let entryIdentity: string;
+			try {
+				entryIdentity = this.getPackageIdentity(sourceStr, "project");
+			} catch (error) {
+				this.warnSkippedInvalidSource(sourceStr, error);
+				continue;
+			}
+			if (identity && entryIdentity !== identity) continue;
 			matched = true;
 			updateSources.push({ source: sourceStr, scope: "project" });
 		}
@@ -1101,7 +1127,13 @@ export class DefaultPackageManager implements PackageManager {
 		const gitCandidates: GitUpdateTarget[] = [];
 
 		for (const entry of sources) {
-			const parsed = this.parseSource(entry.source);
+			let parsed: ParsedSource;
+			try {
+				parsed = this.parseSource(entry.source);
+			} catch (error) {
+				this.warnSkippedInvalidSource(entry.source, error);
+				continue;
+			}
 			if (parsed.type === "local" || parsed.pinned) {
 				continue;
 			}
@@ -1445,7 +1477,14 @@ export class DefaultPackageManager implements PackageManager {
 
 		for (const pkg of configuredPackages) {
 			const sourceStr = this.getPackageSourceString(pkg);
-			const parsed = this.parseSource(sourceStr);
+			let parsed: ParsedSource;
+			try {
+				parsed = this.parseSource(sourceStr);
+			} catch {
+				// An invalid stored entry is skipped by the update/remove paths with a
+				// warning; while building an error message it simply has no suggestion.
+				continue;
+			}
 			if (parsed.type === "npm") {
 				if (trimmedSource === parsed.name || trimmedSource === parsed.spec) {
 					suggestions.add(sourceStr);
@@ -1465,7 +1504,14 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private packageSourcesMatch(existing: PackageSource, inputSource: string, scope: SourceScope): boolean {
-		const left = this.getSourceMatchKeyForSettings(this.getPackageSourceString(existing), scope);
+		let left: string;
+		try {
+			left = this.getSourceMatchKeyForSettings(this.getPackageSourceString(existing), scope);
+		} catch (error) {
+			// One invalid stored entry must not fail every install/remove beside it.
+			this.warnSkippedInvalidSource(this.getPackageSourceString(existing), error);
+			return false;
+		}
 		const right = this.getSourceMatchKeyForInput(inputSource);
 		return left === right;
 	}

@@ -166,6 +166,111 @@ function kernelLivenessFactsFromClient(host: StallWatchdogWiringHost): TurnLiven
 	};
 }
 
+/** Vouch sub-reasons owned by this module (the kernel/host aggregate owns the rest). */
+const STALL_VOUCH_REASON_COLLECT_LIVE_CHILD = "rlm_collect_live_child";
+const STALL_VOUCH_REASON_PROCESS_TREE_CPU = "process_tree_cpu";
+
+/**
+ * Min gap between two real `ps` snapshots behind the CPU vouch. The vouch is sampled
+ * on every touch, and a forked `ps` per event would tax every busy turn; during an
+ * actual silence the only samplers are timer fires and the daemon sweep, both far
+ * slower than this. An injected `_stepCpuProbe` (tests) bypasses the cache: the probe
+ * is cheap by construction, and a cached probe would freeze the movement the test
+ * drives.
+ */
+const STALL_CPU_SAMPLE_MIN_GAP_MS = 10_000;
+
+interface StallCpuVouchCache {
+	sampledAt: number;
+	cpuMs?: number;
+	/** The quantized counter the last fresh sample read; numeric so movement compares as numbers. */
+	quantized?: number;
+	/** The verdict of the last fresh sample: the vouch token while movement held, absent otherwise. */
+	vouchedToken?: string;
+}
+
+/** Per-session CPU vouch state; weak keys so a disposed session drops it. */
+const stallCpuVouchCaches = new WeakMap<StallWatchdogWiringHost, StallCpuVouchCache>();
+
+/**
+ * Process-tree CPU as vouch evidence, the same judgment the silent-step rule already
+ * makes: a quiet cell whose tree keeps burning CPU (a compile, numpy compute) is busy,
+ * not stuck. Movement-only by construction - the vouch activates when the quantized
+ * counter advanced between the two most recent samples, so a frozen process tree (the
+ * wedge case) buys nothing it did not buy before this evidence existed. The quantum is
+ * the silent-step rule's own `silentStuckCpuMs`, and the token is the quantized
+ * counter: while the work keeps moving the token keeps changing, which is what settles
+ * the exempt silence (a healthy multi-hour compute never spends its budget).
+ */
+function sampleStallCpuVouch(host: StallWatchdogWiringHost): { token: string } | undefined {
+	const now = Date.now();
+	const cache = stallCpuVouchCaches.get(host);
+	// A cache hit replays the last fresh sample's verdict: the movement was real when
+	// measured, and only a fresh sample may withdraw it (a frozen counter).
+	if (host._stepCpuProbe === undefined && cache && now - cache.sampledAt < STALL_CPU_SAMPLE_MIN_GAP_MS) {
+		return cache.vouchedToken === undefined ? undefined : { token: cache.vouchedToken };
+	}
+	const cpuMs = host._stepCpuProbe ? host._stepCpuProbe() : sampleStepCpuMs(host);
+	if (cpuMs === undefined) {
+		stallCpuVouchCaches.set(host, { sampledAt: now });
+		return undefined;
+	}
+	const quantum = Math.max(1, host.settingsManager.getSilentStuckCpuMs());
+	const quantized = Math.floor(cpuMs / quantum);
+	const previousQuantized = cache?.quantized;
+	// A baseline (no previous sample) or an unchanged quantum proves nothing about
+	// movement; only an advanced counter does. A counter reset (a replaced kernel) is
+	// a new job's baseline, not this turn's movement.
+	const vouchedToken =
+		previousQuantized !== undefined && quantized > previousQuantized ? `cpu:${quantized}` : undefined;
+	stallCpuVouchCaches.set(host, {
+		sampledAt: now,
+		cpuMs,
+		quantized,
+		...(vouchedToken === undefined ? {} : { vouchedToken }),
+	});
+	return vouchedToken === undefined ? undefined : { token: vouchedToken };
+}
+
+/**
+ * Collect-wait evidence for the vouch: an in-flight `collectRlmChildren` wait blocked
+ * on a child that is verifiably alive. "Alive" is the child's own evidence, same rule
+ * as the per-step deadline: an agent event inside the silent-step window (observable
+ * movement - it also carries the movement token), or the child's own watchdog excusing
+ * its silence (a live, budgeted, re-sampled claim - strictly stronger than existence,
+ * so it buys the full tier rather than the short one). A child still in admission is
+ * the host's own work and buys the short tier only. A child that went quiet with no
+ * excuse stops protecting the wait, so a wedged child cannot hold its parent's turn.
+ */
+function collectWaitVouchFacts(host: StallWatchdogWiringHost): { active: boolean; progress: boolean; token?: string } {
+	if (host._rlmCollectWaits.size === 0) return { active: false, progress: false };
+	const now = Date.now();
+	const quietMs = host.settingsManager.getSilentStuckMs();
+	let active = false;
+	let progress = false;
+	let newestEventAt: number | undefined;
+	for (const run of host._rlmCollectWaits.keys()) {
+		if (run.settled || (run.status !== "running" && run.status !== "queued")) continue;
+		const child = run.session;
+		if (!child) {
+			active = true;
+			continue;
+		}
+		const lastEventAt = child.lastAgentEventAt ?? run.lastActivityAt;
+		if (lastEventAt !== undefined && now - lastEventAt < quietMs) {
+			active = true;
+			progress = true;
+			newestEventAt = Math.max(newestEventAt ?? 0, lastEventAt);
+			continue;
+		}
+		if (child.excusedNow) {
+			active = true;
+			progress = true;
+		}
+	}
+	return { active, progress, ...(newestEventAt === undefined ? {} : { token: `collect:${newestEventAt}` }) };
+}
+
 /**
  * The vouch predicate (T1-3). Sampled at the moment of escalation and on every touch, so it
  * caches nothing and adds no timer of its own.
@@ -174,31 +279,53 @@ function kernelLivenessFactsFromClient(host: StallWatchdogWiringHost): TurnLiven
  * silence belongs to the model stream, which `streamStallTimeoutMs` owns. Without it a live
  * kernel handle would excuse a stuck provider response, which is the one case the judgement
  * table explicitly excludes.
+ *
+ * Three evidence families OR into one verdict, so the watchdog's warn/abort stages, the
+ * daemon sweep's `excusedNow` gate, and the per-step deadline all read the same judgment:
+ * the kernel/host liveness aggregate, an in-flight collect wait on a live child, and a
+ * process tree whose CPU keeps advancing. The last two are exactly the facts the per-step
+ * deadline already recognized; leaving them out is what let the sweep interrupt a parent
+ * ~20 minutes into a healthy child's job and kill busy silent computes at the abort
+ * threshold.
  */
 function sampleStallVouch(host: StallWatchdogWiringHost): StallVouchFacts | undefined {
 	try {
 		if (host.settingsManager.getStallWatchdogSettings().toolLivenessExemption === false) return undefined;
 		if (host._stallInFlightTools.size === 0) return undefined;
 		const facts = host._turnLiveness?.sample();
-		if (!facts?.vouched) return undefined;
+		const collect = collectWaitVouchFacts(host);
+		const cpu = sampleStallCpuVouch(host);
+		if (!facts?.vouched && !collect.active && cpu === undefined) return undefined;
+		const reasons = [...(facts?.reasons ?? [])];
+		if (collect.active) reasons.push(STALL_VOUCH_REASON_COLLECT_LIVE_CHILD);
+		if (cpu !== undefined) reasons.push(STALL_VOUCH_REASON_PROCESS_TREE_CPU);
+		// Movement tokens compose: a change in any of them means the work demonstrably
+		// moved, which is exactly what the watchdog's settle-on-change rule consumes.
+		const movementToken = [facts?.movementToken, collect.token, cpu?.token]
+			.filter((token) => token !== undefined)
+			.join("|");
 		return {
 			active: true,
-			reasons: facts.reasons,
+			reasons,
 			// Two tiers: movement buys the full budget, mere existence buys the short one that
 			// stays near the pre-exemption abort threshold (M3).
-			tier: facts.progress ? "progress" : "liveness",
+			tier: facts?.progress === true || collect.progress || cpu !== undefined ? "progress" : "liveness",
 			// The watchdog settles accrued exempt silence when this changes between two samples,
 			// which is what keeps a long build that never stops producing from being charged for
 			// the wall clock it takes (P1). Existence-only facts carry no token and settle nothing.
-			...(facts.movementToken === undefined ? {} : { movementToken: facts.movementToken }),
-			kernel: {
-				...(facts.protocol === undefined ? {} : { protocol: facts.protocol }),
-				...(facts.livenessAgeMs === undefined ? {} : { livenessAgeMs: facts.livenessAgeMs }),
-				...(facts.liveBashHandles === undefined ? {} : { liveBashHandles: facts.liveBashHandles }),
-				hostRequestCount: facts.hostRequestCount,
-				...(facts.kernelPid === undefined ? {} : { kernelPid: facts.kernelPid }),
-				reasons: facts.kernelReasons,
-			},
+			...(movementToken === "" ? {} : { movementToken }),
+			...(facts === undefined
+				? {}
+				: {
+						kernel: {
+							...(facts.protocol === undefined ? {} : { protocol: facts.protocol }),
+							...(facts.livenessAgeMs === undefined ? {} : { livenessAgeMs: facts.livenessAgeMs }),
+							...(facts.liveBashHandles === undefined ? {} : { liveBashHandles: facts.liveBashHandles }),
+							hostRequestCount: facts.hostRequestCount,
+							...(facts.kernelPid === undefined ? {} : { kernelPid: facts.kernelPid }),
+							reasons: facts.kernelReasons,
+						},
+					}),
 		};
 	} catch (error) {
 		reportStallPredicateFailure(host, "vouch", error);
@@ -290,21 +417,11 @@ function stepSilentMs(
  * healthy child's job. "Alive" is the child's own evidence: an agent event inside the
  * silent-step window, or its watchdog excusing the silence. A child that went quiet with no
  * excuse stops protecting the wait, so a wedged child cannot hold its parent's step forever.
+ * The facts live in collectWaitVouchFacts so this deadline and the turn-level vouch can never
+ * drift apart.
  */
 function rlmCollectWaitsOnLiveChild(host: StallWatchdogWiringHost): boolean {
-	if (host._rlmCollectWaits.size === 0) return false;
-	const now = Date.now();
-	const quietMs = host.settingsManager.getSilentStuckMs();
-	for (const run of host._rlmCollectWaits.keys()) {
-		if (run.settled || (run.status !== "running" && run.status !== "queued")) continue;
-		const child = run.session;
-		// Still starting up: admission and runtime construction are the host's own work.
-		if (!child) return true;
-		const lastEventAt = child.lastAgentEventAt ?? run.lastActivityAt;
-		if (lastEventAt !== undefined && now - lastEventAt < quietMs) return true;
-		if (child.excusedNow) return true;
-	}
-	return false;
+	return collectWaitVouchFacts(host).active;
 }
 
 /** The silent-step threshold for one call: the setting, or the call's own explicit timeout if longer. */

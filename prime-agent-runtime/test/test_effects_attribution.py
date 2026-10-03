@@ -161,6 +161,43 @@ class AmbientAttributionTests(te.TrackerCase):
         record = cell.by_rel()["shared.txt"]
         self.assertEqual(record["origin"], "own")
 
+    def test_a_rename_by_command_attributes_the_target_as_own(self):
+        """`mv` keeps the old mtime, so mtime alone called the target ambient; the inode's
+        ctime is what a rename cannot keep."""
+        cell = self.kernel.run("await bash('mv a.txt renamed.txt')\n")
+        self.assertEqual(cell.status, "ok")
+        files = cell.by_rel()
+        self.assertEqual(files["a.txt"]["kind"], "deleted")
+        self.assertEqual(files["a.txt"]["origin"], "own")
+        self.assertEqual(files["renamed.txt"]["kind"], "created")
+        self.assertEqual(files["renamed.txt"]["origin"], "own")
+
+    def test_a_preserved_mtime_copy_is_own(self):
+        """`cp -p` stamps the copy with the source's old mtime; the copy's ctime is now."""
+        cell = self.kernel.run("await bash('cp -p a.txt copied.txt')\n")
+        self.assertEqual(cell.status, "ok")
+        record = cell.by_rel()["copied.txt"]
+        self.assertEqual(record["kind"], "created")
+        self.assertEqual(record["origin"], "own")
+
+    def test_an_archive_extracted_by_a_command_is_own(self):
+        """Extraction writes the archive's old mtimes into the new files; ctime says now."""
+        import io
+        import tarfile
+
+        old = time.time() - 86400
+        with tarfile.open(self.path("pack.tar"), "w") as archive:
+            data = b"packed\n"
+            info = tarfile.TarInfo("packed/hello.txt")
+            info.size = len(data)
+            info.mtime = int(old)
+            archive.addfile(info, io.BytesIO(data))
+        cell = self.kernel.run("await bash('tar -xf pack.tar')\n")
+        self.assertEqual(cell.status, "ok")
+        record = cell.by_rel()["packed/hello.txt"]
+        self.assertEqual(record["kind"], "created")
+        self.assertEqual(record["origin"], "own")
+
 
 class AmbientNoGitTests(te.TrackerCase):
     use_git = False
@@ -185,6 +222,14 @@ class AmbientNoGitTests(te.TrackerCase):
         record = second.by_rel()["idle-gap.txt"]
         self.assertEqual(record["kind"], "created")
         self.assertEqual(record["origin"], "ambient")
+
+    def test_a_preserved_mtime_copy_is_own_without_git_too(self):
+        # The mtime-scan path shares _owns_write: `cp -p` keeps the old mtime, ctime is now.
+        cell = self.kernel.run("await bash('cp -p a.txt copied.txt')\n")
+        self.assertEqual(cell.status, "ok")
+        record = cell.by_rel()["copied.txt"]
+        self.assertEqual(record["kind"], "created")
+        self.assertEqual(record["origin"], "own")
 
 
 if __name__ == "__main__":

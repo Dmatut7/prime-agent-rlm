@@ -8,6 +8,7 @@
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai";
+import { sleep } from "../../utils/sleep.js";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
@@ -16,7 +17,17 @@ import {
 	HARNESS_DIGEST_CUSTOM_TYPE,
 } from "../messages.js";
 import { effectiveInputLimitTokens } from "../model-input-limits.js";
-import { type ProviderRetryPolicy, providerStreamFailureKind } from "../provider-retry.js";
+import {
+	isAgentLifecycleFailure,
+	isFauxProviderQueueExhausted,
+	isPermanentProviderFailureKind,
+	type ProviderRetryPolicy,
+	providerRetryDelay,
+	providerRetryStreamOptions,
+	providerStreamFailureKind,
+	providerStreamFailureRetryAfterMs,
+	providerStreamFailureStatus,
+} from "../provider-retry.js";
 import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.js";
 import { addAssistantUsage, emptyUsage } from "../usage.js";
 import { ASCII_CHARS_PER_TOKEN, measureContentDensity } from "./content-density.js";
@@ -87,9 +98,9 @@ export interface CompactionDetails {
 	userRequests?: UserRequestLedger;
 	/**
 	 * In-flight work ledger behind the rendered <session-handoff> block (W18-D):
-	 * subagents admitted and never heard dying, background commands still running,
-	 * owner decisions still owed. Carried structurally so a child admitted in a
-	 * since-summarized slice stays named until its death record lands.
+	 * subagents admitted and never heard reaching a terminal record, background
+	 * commands still running. Carried structurally so a child admitted in a
+	 * since-summarized slice stays named until its terminal record lands.
 	 */
 	handoff?: HandoffLedger;
 }
@@ -1548,6 +1559,27 @@ export class SummarizationRefusalError extends Error {
 }
 
 /**
+ * The summarizer returned nothing that can stand in for the compacted slice: a
+ * clean stop with no text at all, or output cut at the token cap (stopReason
+ * "length"), which leaves the summary a fragment. Saving either would replace the
+ * compacted history with it, so the call is a failure - and a retryable one: the
+ * retry loop's smaller slice asks for a shorter summary.
+ */
+export class SummarizationUnusableResultError extends Error {
+	readonly reason: "empty" | "length";
+
+	constructor(errorLabel: string, reason: "empty" | "length") {
+		super(
+			reason === "length"
+				? `${errorLabel}: the summarizer's output hit the token cap (stopReason "length")`
+				: `${errorLabel}: the summarizer returned no text`,
+		);
+		this.name = "SummarizationUnusableResultError";
+		this.reason = reason;
+	}
+}
+
+/**
  * Whether an errored summarization response is a provider refusal: the structured
  * stream-failure diagnostic when one was recorded, else the raw stop reason the
  * provider reported (wave-31 maps both onto the message).
@@ -1574,6 +1606,12 @@ interface SummarizationCallOptions extends SummarizationRequestOptions {
 	errorLabel: string;
 	/** Newest retained assistant text; anchors the summary to kept-tail state. */
 	recentStateAnchor?: string;
+	/**
+	 * The session's shared provider retry policy. When present, a transient
+	 * provider failure is retried with the policy's backoff instead of failing
+	 * the whole compaction on the spot; without it the call stays single-shot.
+	 */
+	retry?: ProviderRetryPolicy;
 }
 
 /**
@@ -1646,20 +1684,64 @@ async function completeSummarizationRequest(options: SummarizationCallOptions): 
 			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
 			: { maxTokens, signal, apiKey, headers };
 
-	const response = await completeSimple(
-		model,
-		{
-			systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
-			messages: [
-				{
-					role: "user" as const,
-					content: [{ type: "text" as const, text: promptText }],
-					timestamp: Date.now(),
-				},
-			],
-		},
-		completionOptions,
-	);
+	// A transient provider failure on this wire call used to fail the whole
+	// compaction on the spot - and an overflow recovery failing is the task ending.
+	// With the session's shared retry policy the call retries like any other
+	// one-shot completion: the provider client makes a single attempt per round
+	// (providerRetryStreamOptions) and this loop owns the count and the backoff.
+	// Deterministic verdicts keep their dedicated paths: an input-length rejection
+	// goes to the shrink retry in compact(), a refusal to the caller's
+	// fallback-model retry, and permanent kinds fail at once. An error with no
+	// structured failure kind cannot be told from a permanent one, so it keeps the
+	// single-shot behavior (production providers always record the diagnostic).
+	const retryPolicy = options.retry;
+	const maxRetries = retryPolicy?.enabled ? retryPolicy.maxRetries : 0;
+	let retriesPerformed = 0;
+	let response: AssistantMessage;
+	for (;;) {
+		response = await completeSimple(
+			model,
+			{
+				systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+				messages: [
+					{
+						role: "user" as const,
+						content: [{ type: "text" as const, text: promptText }],
+						timestamp: Date.now(),
+					},
+				],
+			},
+			retryPolicy ? { ...completionOptions, ...providerRetryStreamOptions(retryPolicy) } : completionOptions,
+		);
+		if (response.stopReason !== "error") break;
+		const errorMessage = response.errorMessage || "Unknown error";
+		if (isInputLengthRejection(errorMessage) || isRefusalResponse(response)) break;
+		const failureKind = providerStreamFailureKind(response);
+		if (
+			failureKind === undefined ||
+			retriesPerformed >= maxRetries ||
+			isAgentLifecycleFailure(response) ||
+			isFauxProviderQueueExhausted(response) ||
+			isPermanentProviderFailureKind(failureKind, retriesPerformed, providerStreamFailureStatus(response))
+		) {
+			break;
+		}
+		const delay = providerRetryDelay(
+			retriesPerformed + 1,
+			providerStreamFailureRetryAfterMs(response),
+			retryPolicy ?? { baseDelayMs: 0, maxRetryDelayMs: 0 },
+		);
+		if (delay.kind === "exceeds-cap") break;
+		try {
+			await sleep(delay.delayMs, signal);
+		} catch (error) {
+			// The wait dying to the signal is a cancellation, not a failed attempt:
+			// settle with the same AbortError shape the pre-flight check throws.
+			if (signal?.aborted) throw new DOMException("This operation was aborted", "AbortError");
+			throw error;
+		}
+		retriesPerformed++;
+	}
 
 	if (response.stopReason === "error") {
 		const errorMessage = response.errorMessage || "Unknown error";
@@ -1679,16 +1761,39 @@ async function completeSummarizationRequest(options: SummarizationCallOptions): 
 		.map((c) => c.text)
 		.join("\n");
 
+	if (response.stopReason === "aborted") {
+		// A server-side abort with no local cancellation is a failure, not a summary
+		// (and not a candidate for the unusable-retry loop: resending the same slice
+		// gets the same abort).
+		if (!signal?.aborted) {
+			throw new Error(`${errorLabel}: the summarizer was aborted`);
+		}
+		// A local abort can leave a partial or empty text: return it as-is and let
+		// the caller's signal.aborted check turn it into "Compaction cancelled" -
+		// the unusable checks below must not fire on a cancellation.
+		return { summary, usage: response.usage, elidedMessages: elided, elidedChars: clamped.droppedChars };
+	}
+	// A truncated or empty result is a failure, not a summary: saved as-is it would
+	// replace the compacted slice with a fragment, or with nothing at all.
+	if (response.stopReason === "length") {
+		throw new SummarizationUnusableResultError(errorLabel, "length");
+	}
+	if (summary.trim().length === 0) {
+		throw new SummarizationUnusableResultError(errorLabel, "empty");
+	}
+
 	return { summary, usage: response.usage, elidedMessages: elided, elidedChars: clamped.droppedChars };
 }
 
 /**
- * Retry a summarization call with a smaller slice while the provider says the
- * input was too long.
+ * Retry a summarization call with a smaller slice while its result stays unusable.
  *
  * The estimator's caliber is the one thing the budget cannot know exactly, so an
  * input-length rejection is treated as a measurement: assume the content is denser
  * than assumed and try again. Bounded, because a rejection can also be permanent.
+ * The same retry covers an empty or output-truncated result: a smaller slice asks
+ * for a shorter summary, and an unsalvageable slice must fail the compaction
+ * rather than be saved as its own replacement.
  * `run` is called once per attempt and must produce a fresh request identity, so
  * two attempts never share an idempotency key. When the rejection announced the
  * provider's cap, the next attempt is budgeted against that exact number.
@@ -1697,7 +1802,8 @@ export async function summarizeWithInputLengthRetry(
 	run: (options: SummarizationRequestOptions) => Promise<SummarySlice>,
 	initialInflation: number,
 	signal?: AbortSignal,
-	isRetryable: (error: unknown) => boolean = (error) => error instanceof SummarizationInputLengthError,
+	isRetryable: (error: unknown) => boolean = (error) =>
+		error instanceof SummarizationInputLengthError || error instanceof SummarizationUnusableResultError,
 ): Promise<SummarySlice> {
 	let inflation = clampSummarizationInflation(initialInflation);
 	let inputLimit: number | undefined;
@@ -1739,6 +1845,7 @@ export async function generateSummary(
 	previousSummary?: string,
 	thinkingLevel?: ThinkingLevel,
 	options?: SummarizationRequestOptions,
+	retry?: ProviderRetryPolicy,
 ): Promise<SummarySlice> {
 	return completeSummarizationRequest({
 		...options,
@@ -1754,6 +1861,7 @@ export async function generateSummary(
 		style: "history",
 		previousSummary,
 		errorLabel: "Summarization failed",
+		retry,
 	});
 }
 export interface CompactionPreparation {
@@ -2031,7 +2139,7 @@ export function prepareCompactionOutcome(
 
 	// The handoff scans the whole branch, not the leaving slice: in-flight work is
 	// a statement about compaction time, so a spawn in the retained tail belongs to
-	// it exactly like one in the summarized slice, and a death notice anywhere in
+	// it exactly like one in the summarized slice, and a terminal record anywhere in
 	// the branch resolves it. Carry-forward comes from the previous entry's ledger.
 	const handoff = buildSessionHandoff(pathEntries, { generation: previousGeneration + 1, previous: previousHandoff });
 
@@ -2163,9 +2271,12 @@ export async function compact(
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 	summaryCall: SummaryCallRunner = (call) => call(headers),
-	// biome-ignore lint/correctness/noUnusedFunctionParameters: upstream #2045 threads a provider retry policy and the session id into compact(); this fork's summarization runner (completeSummarizationRequest) owns the wire call and budgets/ retries on input length itself, so the policy has no consumer yet. Kept in the signature because the call site (agent-session.ts) already passes both.
+	// The session's shared provider retry policy: threaded into the summarization
+	// wire calls so a transient provider failure retries with the policy's backoff
+	// instead of failing the whole compaction (upstream #2045's intent for this
+	// parameter). Undefined keeps the single-shot behavior.
 	retry?: ProviderRetryPolicy,
-	// biome-ignore lint/correctness/noUnusedFunctionParameters: same as retry above - accepted at the boundary, not yet threaded into the fork's summarization runner.
+	// biome-ignore lint/correctness/noUnusedFunctionParameters: accepted at the boundary, not yet threaded into the fork's summarization runner.
 	sessionId?: string,
 ): Promise<CompactionResult> {
 	const {
@@ -2197,6 +2308,7 @@ export async function compact(
 				previousSummary,
 				thinkingLevel,
 				{ ...requestOptions, recentStateAnchor },
+				retry,
 			),
 		);
 	const runTurnPrefixSummary = (requestOptions: SummarizationRequestOptions) =>
@@ -2210,6 +2322,7 @@ export async function compact(
 				signal,
 				thinkingLevel,
 				requestOptions,
+				retry,
 			),
 		);
 
@@ -2347,6 +2460,7 @@ async function generateTurnPrefixSummary(
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 	options?: SummarizationRequestOptions,
+	retry?: ProviderRetryPolicy,
 ): Promise<SummarySlice> {
 	return completeSummarizationRequest({
 		...options,
@@ -2361,5 +2475,6 @@ async function generateTurnPrefixSummary(
 		instructions: TURN_PREFIX_SUMMARIZATION_PROMPT,
 		style: "turn-prefix",
 		errorLabel: "Turn prefix summarization failed",
+		retry,
 	});
 }

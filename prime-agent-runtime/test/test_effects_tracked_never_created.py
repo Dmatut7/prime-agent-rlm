@@ -74,6 +74,20 @@ class TrackedNeverCreatedTests(TrackerCase):
         self.assertEqual(record["kind"], "created", record)
         self.assertEqual((record["added"], record["removed"]), (1, 0))
 
+    def test_new_files_past_the_before_commit_probe_cap_are_still_creations(self):
+        # More new files than MAX_GIT_BLOBS: the before-commit can only be asked about
+        # MAX_GIT_BLOBS of them. The unasked ones used to degrade to "modified"
+        # (no_baseline); the work-tree evidence (untracked now, unknown to the
+        # before-snapshot) still says new, so they must read as creations.
+        count = effects.MAX_GIT_BLOBS + 30
+        cell = self.kernel.run(f"await bash('for i in $(seq 1 {count}); do echo x > new_$i.txt; done')")
+        self.assertEqual(cell.status, "ok")
+        files = cell.by_rel()
+        created = [rel for rel in files if rel.startswith("new_")]
+        self.assertEqual(len(created), count, "every new file must be listed (below MAX_FILES_PER_CELL)")
+        for rel in created:
+            self.assertEqual(files[rel]["kind"], "created", files[rel])
+
     def test_a_large_tracked_file_still_gets_a_real_diff(self):
         # Bigger than the old 1MiB baseline cap: sources this repo edits itself reach that
         # size (packages/coding-agent/src/core/agent-session.ts is ~1MiB), and they deserve

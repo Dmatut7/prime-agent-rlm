@@ -67,6 +67,16 @@ function parseTextSignature(
 
 export interface OpenAIResponsesStreamOptions {
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
+	/**
+	 * Backend-specific reconciliation of the response-reported tier with the
+	 * requested one. The Codex endpoint echoes "default" regardless of the tier
+	 * it served (badlogic/pi-mono#3188), so its caller overrides the default
+	 * response-wins rule. Omit for the Responses API, whose echo is reliable.
+	 */
+	resolveServiceTier?: (
+		responseServiceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
+		requestServiceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
+	) => ResponseCreateParamsStreaming["service_tier"] | undefined;
 	applyServiceTierPricing?: (
 		usage: Usage,
 		serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
@@ -409,8 +419,13 @@ export async function processResponsesStream<TApi extends Api>(
 		calculateCost(model, output.usage);
 		if (options?.applyServiceTierPricing) {
 			// The response's service_tier is the tier actually served; the
-			// requested tier is only the fallback when the response omits it.
-			options.applyServiceTierPricing(output.usage, response?.service_tier ?? options.serviceTier);
+			// requested tier is only the fallback when the response omits it -
+			// unless the backend's echo is known to be unreliable (Codex always
+			// reports "default"), which the provider's resolveServiceTier handles.
+			const serviceTier = options.resolveServiceTier
+				? options.resolveServiceTier(response?.service_tier, options.serviceTier)
+				: (response?.service_tier ?? options.serviceTier);
+			options.applyServiceTierPricing(output.usage, serviceTier);
 		}
 	};
 

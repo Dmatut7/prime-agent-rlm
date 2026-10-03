@@ -53,6 +53,12 @@ type Proto = {
 
 const proto = InteractiveMode.prototype as unknown as Proto;
 
+type TurnStartProto = {
+	restoreTurnStartFromMessages(this: ModeFake, messages: readonly AgentMessage[]): void;
+};
+
+const turnStartProto = InteractiveMode.prototype as unknown as TurnStartProto;
+
 function userMessage(index: number, text?: string): Extract<AgentMessage, { role: "user" }> {
 	return { role: "user", content: text ?? `user message ${index}`, timestamp: index };
 }
@@ -168,6 +174,7 @@ function createHarness(overrides: ModeFake = {}): ModeFake {
 			isFullscreen: () => true,
 			isFullscreenReviewing: () => false,
 			scrollBy: vi.fn(),
+			noteTranscriptPrepend: vi.fn(),
 			terminal: { columns: 120, rows: 40 },
 		},
 		...overrides,
@@ -243,6 +250,7 @@ describe("slim attach transcript marker (rev 44)", () => {
 				isFullscreen: () => false,
 				isFullscreenReviewing: () => false,
 				scrollBy: vi.fn(),
+				noteTranscriptPrepend: vi.fn(),
 				terminal: { columns: 120, rows: 40 },
 			},
 		});
@@ -269,6 +277,40 @@ describe("slim attach transcript marker (rev 44)", () => {
 		expect(text).toContain("更早的 5 条消息未加载");
 		expect(text).not.toContain("点击");
 		expect(text).not.toContain("/backfill");
+	});
+
+	it("a live-cap trim against an old daemon (no slim_attach_transcript capability) gets the static note, not a clickable marker", async () => {
+		// The adapter has getMessagesWindow either way; an unrestarted daemon rejects
+		// the windowed read, so the marker's click would land on an error.
+		const getMessagesWindow = vi.fn(async () => {
+			throw new Error("daemon does not know before/limit");
+		});
+		const mode = createHarness({
+			agentConnection: { getMessagesWindow, supportsMessagesWindow: () => false },
+		});
+
+		await proto.renderSessionContext.call(mode, sessionContext(transcript(210, "full")), { limitTranscript: true });
+
+		expect(mode.slimTranscriptOmitted).toBe(0);
+		expect(mode.slimTranscriptMarker).toBeUndefined();
+		const text = chatText(mode);
+		expect(text).not.toContain("未加载");
+		expect(text).toContain("只显示最近");
+	});
+
+	it("a live-cap trim against a capable daemon keeps the pageable marker", async () => {
+		const mode = createHarness({
+			agentConnection: {
+				getMessagesWindow: vi.fn(async () => ({ messages: [], totalMessages: 0, firstIndex: 0 })),
+				supportsMessagesWindow: () => true,
+			},
+		});
+
+		await proto.renderSessionContext.call(mode, sessionContext(transcript(210, "full")), { limitTranscript: true });
+
+		expect(mode.slimTranscriptOmitted).toBeGreaterThan(0);
+		expect(mode.slimTranscriptMarker).toBeDefined();
+		expect(chatText(mode)).toContain("未加载");
 	});
 });
 
@@ -311,7 +353,7 @@ describe("slim attach transcript backfill (rev 44)", () => {
 		expect(text.indexOf("更早的 246 条消息未加载")).toBeLessThan(text.indexOf("older question 0"));
 		expect(text.indexOf("older question 0")).toBeLessThan(text.indexOf("tail question 0"));
 		// The following view is undisturbed; a scrolled-up view keeps its anchor.
-		expect((mode.ui as { scrollBy: ReturnType<typeof vi.fn> }).scrollBy).toHaveBeenCalled();
+		expect((mode.ui as { noteTranscriptPrepend: ReturnType<typeof vi.fn> }).noteTranscriptPrepend).toHaveBeenCalled();
 	});
 
 	it("wheeling up over the marker loads a page; wheeling down does not", async () => {
@@ -546,6 +588,128 @@ describe("slim attach omission seeding (rev 44)", () => {
 		await proto.renderInitialMessages.call(mode);
 
 		expect(mode.slimTranscriptOmitted).toBe(0);
+	});
+
+	it("backfills the editor history from the omitted prefix after a slim attach", async () => {
+		const older = transcript(3, "older", 0);
+		const tail = transcript(2, "tail", 300);
+		const getMessagesWindow = vi.fn(async (options?: { before?: number; limit?: number }) => {
+			const before = options?.before ?? older.length;
+			const messages = older.slice(Math.max(0, before - 100), before);
+			return { messages, totalMessages: older.length + tail.length, firstIndex: before - messages.length };
+		});
+		const history: string[] = [];
+		const editor = {
+			addToHistory: vi.fn((text: string) => {
+				history.unshift(text);
+			}),
+			getHistory: vi.fn(() => [...history]),
+			clearHistory: vi.fn(() => {
+				history.length = 0;
+			}),
+		};
+		const mode = createHarness({
+			editor,
+			agentConnection: {
+				getMessagesWindow,
+				getInitialSnapshot: vi.fn(async () => ({
+					state: { compactionCount: 0 },
+					messages: tail,
+					messagesOmitted: older.length,
+				})),
+			},
+			getSessionContextFromConnectionSnapshot: vi.fn((snap: { messages: AgentMessage[] }) =>
+				sessionContext(snap.messages),
+			),
+			seedSubagentSummary: vi.fn(),
+			applyConnectionStateSnapshot: vi.fn(),
+			applySnapshotQuotaPark: vi.fn(),
+			restoreTurnStartFromMessages: vi.fn(),
+			restoreStreamingMessageFromSnapshot: vi.fn(async () => {}),
+			showDutyLog: vi.fn(async () => {}),
+		});
+
+		await proto.renderInitialMessages.call(mode);
+
+		// The tail's questions lead (most recent first); the omitted prefix pages in
+		// behind them, oldest questions last.
+		await vi.waitFor(() => expect(history).toHaveLength(5));
+		expect(history).toEqual([
+			"tail question 1",
+			"tail question 0",
+			"older question 2",
+			"older question 1",
+			"older question 0",
+		]);
+		expect(getMessagesWindow).toHaveBeenCalledWith({ before: 6, limit: 100 });
+	});
+
+	it("does not backfill the editor history when nothing was omitted", async () => {
+		const getMessagesWindow = vi.fn(async () => ({ messages: [], totalMessages: 0, firstIndex: 0 }));
+		const mode = createHarness({
+			agentConnection: {
+				getMessagesWindow,
+				getInitialSnapshot: vi.fn(async () => ({ state: { compactionCount: 0 }, messages: transcript(1, "tail") })),
+			},
+			getSessionContextFromConnectionSnapshot: vi.fn((snap: { messages: AgentMessage[] }) =>
+				sessionContext(snap.messages),
+			),
+			seedSubagentSummary: vi.fn(),
+			applyConnectionStateSnapshot: vi.fn(),
+			applySnapshotQuotaPark: vi.fn(),
+			restoreTurnStartFromMessages: vi.fn(),
+			restoreStreamingMessageFromSnapshot: vi.fn(async () => {}),
+			showDutyLog: vi.fn(async () => {}),
+		});
+
+		await proto.renderInitialMessages.call(mode);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+
+		expect(getMessagesWindow).not.toHaveBeenCalled();
+	});
+
+	it("anchors the working clock at the oldest visible message when the attach window starts inside the running turn", () => {
+		// A slim attach into a long turn: the tail holds only mid-turn steps, so the
+		// scan for the run's start walks off the window's front. The clock must anchor
+		// there, not at the attach moment.
+		const mode = createHarness({
+			connectionState: { isStreaming: true, isCompacting: false, isBashRunning: false, retryAttempt: 0 },
+			workingStartedAt: 1_700_000_000_000,
+		});
+
+		turnStartProto.restoreTurnStartFromMessages.call(mode, [
+			assistantToolCall(900, "tool-1"),
+			toolResult(900, "tool-1", "ok"),
+		]);
+
+		expect(mode.turnStartedAt).toBe(900.5);
+		expect(mode.workingStartedAt).toBe(900.5);
+	});
+
+	it("still finds the run's own start when it is inside the window", () => {
+		const mode = createHarness({
+			connectionState: { isStreaming: true, isCompacting: false, isBashRunning: false, retryAttempt: 0 },
+			workingStartedAt: 1_700_000_000_000,
+		});
+
+		turnStartProto.restoreTurnStartFromMessages.call(mode, [
+			userMessage(800, "the real question"),
+			assistantToolCall(801, "tool-1"),
+			toolResult(801, "tool-1", "ok"),
+		]);
+
+		expect(mode.turnStartedAt).toBe(800);
+		expect(mode.workingStartedAt).toBe(800);
+	});
+
+	it("leaves the clock alone when the agent is not streaming", () => {
+		const mode = createHarness({ workingStartedAt: 1234 });
+		mode.turnStartedAt = 5678;
+
+		turnStartProto.restoreTurnStartFromMessages.call(mode, [assistantToolCall(900, "tool-1")]);
+
+		expect(mode.turnStartedAt).toBeUndefined();
+		expect(mode.workingStartedAt).toBe(1234);
 	});
 
 	function resyncHarness(): ModeFake {

@@ -17,7 +17,6 @@ import {
 	type AgentSessionMessageController,
 	createAgentSessionMessage,
 	formatAgentSessionNameReserved,
-	formatAgentSessionNameUnavailable,
 	isAgentSessionMessage,
 } from "../src/core/agent-messages.js";
 import { AgentSession, type RlmChildAgentSnapshot } from "../src/core/agent-session.js";
@@ -26,6 +25,7 @@ import type { LoadExtensionsResult } from "../src/core/extensions/index.js";
 import { type HostRequestHandlers, ReplKernelManager } from "../src/core/kernel/index.js";
 import { convertToLlm, HARNESS_DIGEST_CUSTOM_TYPE } from "../src/core/messages.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
+import { DEFAULT_HARNESS_PATH_VOCABULARY } from "../src/core/refinement/refinement.js";
 import {
 	createDefaultRlmSubagentSessionName,
 	createRlmDeleteSubagentHostHandler,
@@ -636,14 +636,14 @@ describe("AgentSession rlm recursion", () => {
 			return status === undefined || status === "error";
 		});
 
-		// The failed admission released the reservation: the errored run still holds
-		// the name, so the respawn is refused by the retained-child rule and its copy
-		// is the "already registered" one, not the in-flight-reservation one. A
-		// leaked reservation would answer with the reserved copy instead.
-		await expect(root.runRlmChild("respawn after the failed admission", { name: "slow-worker" })).rejects.toThrow(
-			formatAgentSessionNameUnavailable("slow-worker", root.rlmDepth + 1),
-		);
-		expect(admissions).toBe(1);
+		// The failed admission released the reservation, and the session-less errored
+		// run settled into the closed records instead of squatting on the name: the
+		// respawn is admitted and wears the numbered successor because the failed
+		// child's display rows still answer to the plain name. A leaked reservation
+		// would still answer with the reserved copy.
+		const respawned = await root.runRlmChild("respawn after the failed admission", { name: "slow-worker" });
+		expect(respawned.name).toBe("slow-worker-2");
+		expect(admissions).toBe(2);
 	});
 
 	it("makes an externally restored retained child listable and deletable", async () => {
@@ -1634,7 +1634,11 @@ describe("AgentSession rlm recursion", () => {
 		});
 		const spawned = await root.runRlmChild("start failing child", { name: "reusable-worker" });
 		const internals = root as unknown as InspectableRlmSession;
-		await vi.waitFor(() => expect(internals._activeRlmChildRuns.get(spawned.rlm_child_id)?.settled).toBe(true));
+		// A startup failure never binds a session, so the run settles straight into
+		// the bounded closed collect records; collect is the public settlement read.
+		await vi.waitFor(async () =>
+			expect((await root.collectRlmChildren([spawned.rlm_child_id], 0)).results[0]?.settled).toBe(true),
+		);
 
 		await expect(root.deleteRlmSubagent(spawned.rlm_child_id)).resolves.toMatchObject({
 			subagent: { rlm_child_id: spawned.rlm_child_id, session_name: "reusable-worker" },
@@ -4817,6 +4821,77 @@ describe("AgentSession RLM session dir", () => {
 			else process.env.SERPER_API_KEY = previousKey;
 			if (previousRef === undefined) delete process.env.MY_SERPER_REF;
 			else process.env.MY_SERPER_REF = previousRef;
+		}
+	});
+
+	const HARNESS_KERNEL_ENV_VARS = [
+		"PRIME_AGENT_HARNESS_ENFORCE_INDEX_CAP",
+		"PRIME_AGENT_HARNESS_INDEX_MAX_BYTES",
+		"PRIME_AGENT_HARNESS_PATH_VOCABULARY",
+	] as const;
+
+	function withClearedHarnessEnv(run: () => void): void {
+		const saved = new Map<string, string | undefined>();
+		for (const name of HARNESS_KERNEL_ENV_VARS) {
+			saved.set(name, process.env[name]);
+			delete process.env[name];
+		}
+		try {
+			run();
+		} finally {
+			for (const [name, value] of saved) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+		}
+	}
+
+	it("passes the harness index-cap and vocabulary settings to the kernel env", () => {
+		withClearedHarnessEnv(() => {
+			writeFileSync(
+				join(tempDir, "settings.json"),
+				JSON.stringify({
+					harness: { enforceIndexCap: true, digestIndexMaxBytes: 8192, pathVocabulary: ["general", "arch"] },
+				}),
+			);
+			const root = createSession(SessionManager.inMemory(tempDir));
+			// test-hygiene-allow: _rlmKernelEnv has no public surface; reuses this file's frozen InspectableRlmDirSession alias
+			const env = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
+			expect(env.PRIME_AGENT_HARNESS_ENFORCE_INDEX_CAP).toBe("1");
+			expect(env.PRIME_AGENT_HARNESS_INDEX_MAX_BYTES).toBe("8192");
+			expect(env.PRIME_AGENT_HARNESS_PATH_VOCABULARY).toBe("general,arch");
+		});
+	});
+
+	it("defaults the harness kernel env to enforcement off with the stock cap and vocabulary", () => {
+		withClearedHarnessEnv(() => {
+			const root = createSession(SessionManager.inMemory(tempDir));
+			// test-hygiene-allow: _rlmKernelEnv has no public surface; reuses this file's frozen InspectableRlmDirSession alias
+			const env = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
+			expect(env.PRIME_AGENT_HARNESS_ENFORCE_INDEX_CAP).toBe("0");
+			expect(env.PRIME_AGENT_HARNESS_INDEX_MAX_BYTES).toBe("12288");
+			expect(env.PRIME_AGENT_HARNESS_PATH_VOCABULARY).toBe(DEFAULT_HARNESS_PATH_VOCABULARY.join(","));
+		});
+	});
+
+	it("lets an explicit process env export win over the harness settings", () => {
+		// The spawn merges process.env under the kernel env dict, so a key left
+		// out here keeps the user's shell override live.
+		writeFileSync(
+			join(tempDir, "settings.json"),
+			JSON.stringify({ harness: { enforceIndexCap: true, digestIndexMaxBytes: 8192, pathVocabulary: ["general"] } }),
+		);
+		const previous = process.env.PRIME_AGENT_HARNESS_ENFORCE_INDEX_CAP;
+		process.env.PRIME_AGENT_HARNESS_ENFORCE_INDEX_CAP = "0";
+		try {
+			const root = createSession(SessionManager.inMemory(tempDir));
+			// test-hygiene-allow: _rlmKernelEnv has no public surface; reuses this file's frozen InspectableRlmDirSession alias
+			const env = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
+			expect(env.PRIME_AGENT_HARNESS_ENFORCE_INDEX_CAP).toBeUndefined();
+			expect(env.PRIME_AGENT_HARNESS_INDEX_MAX_BYTES).toBe("8192");
+		} finally {
+			if (previous === undefined) delete process.env.PRIME_AGENT_HARNESS_ENFORCE_INDEX_CAP;
+			else process.env.PRIME_AGENT_HARNESS_ENFORCE_INDEX_CAP = previous;
 		}
 	});
 });

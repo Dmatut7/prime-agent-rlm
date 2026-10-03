@@ -73,12 +73,39 @@ vi.mock("node:fs", async (importOriginal) => {
 	};
 });
 
-import { writeFileAtomicSync } from "../src/utils/atomic-file.js";
+const fsyncProbe = vi.hoisted(() => ({
+	openFlags: [] as unknown[],
+	fault: undefined as { code: string } | undefined,
+}));
+vi.mock("fs/promises", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("fs/promises")>();
+	return {
+		...actual,
+		open: (async (path: string, flags?: string | number, mode?: number) => {
+			const handle = await actual.open(path, flags as never, mode as never);
+			// The atomic async writer fsyncs its temp file through a fresh open.
+			if (typeof path === "string" && path.endsWith(".tmp") && (flags === "r" || flags === "r+")) {
+				fsyncProbe.openFlags.push(flags);
+				const fault = fsyncProbe.fault;
+				if (fault) {
+					handle.sync = async () => {
+						throw Object.assign(new Error(`fsync failed: ${fault.code}`), { code: fault.code });
+					};
+				}
+			}
+			return handle;
+		}) as typeof actual.open,
+	};
+});
+
+import { writeFileAtomicAsync, writeFileAtomicSync } from "../src/utils/atomic-file.js";
 import { tryAcquireDirLock } from "../src/utils/dir-lock.js";
 
 const tempDirs: string[] = [];
 
 afterEach(() => {
+	fsyncProbe.openFlags.length = 0;
+	fsyncProbe.fault = undefined;
 	for (const dir of tempDirs.splice(0)) {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -145,6 +172,39 @@ describe("writeFileAtomicSync", () => {
 		).toThrow("validation failed");
 		expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ key: "value".repeat(10) });
 		expect(readdirSync(dir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+	});
+});
+
+describe("writeFileAtomicAsync", () => {
+	it("fsyncs the temp file through a write-capable handle", async () => {
+		const dir = createTempDir();
+		const path = join(dir, "state.json");
+
+		await writeFileAtomicAsync(path, "data", { fsync: true });
+
+		expect(fsyncProbe.openFlags).toEqual(["r+"]);
+		expect(readFileSync(path, "utf8")).toBe("data");
+	});
+
+	it.each(["EINVAL", "ENOTSUP", "EPERM"])(
+		"tolerates an %s fsync failure from a filesystem without fsync",
+		async (code) => {
+			const dir = createTempDir();
+			const path = join(dir, "state.json");
+			fsyncProbe.fault = { code };
+
+			await writeFileAtomicAsync(path, "data", { fsync: true });
+
+			expect(readFileSync(path, "utf8")).toBe("data");
+		},
+	);
+
+	it("propagates a real fsync failure", async () => {
+		const dir = createTempDir();
+		const path = join(dir, "state.json");
+		fsyncProbe.fault = { code: "EIO" };
+
+		await expect(writeFileAtomicAsync(path, "data", { fsync: true })).rejects.toThrow("EIO");
 	});
 });
 

@@ -679,7 +679,7 @@ describe("AgentSession retry and event characterization", () => {
 		});
 	}
 
-	it("keeps retry state active when overflow compaction will retry", async () => {
+	it("closes the retry chain when overflow compaction takes over the continuation", async () => {
 		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
 		harnesses.push(harness);
 		const internals = harness.session as unknown as SessionRetryCompactionInternals;
@@ -697,9 +697,18 @@ describe("AgentSession retry and event characterization", () => {
 		try {
 			await internals._processAgentEvent({ type: "agent_end", messages: [overflowMessage] } as AgentEvent);
 
-			expect(internals._retryAttempt).toBe(1);
-			expect(harness.session.isRetrying).toBe(true);
-			expect(harness.eventsOfType("auto_retry_end")).toEqual([]);
+			// The compaction owns the continuation now, and its scheduled continue
+			// waits on waitForRetry() before it may run: returning with the chain
+			// still open wedged the continuation on a promise nobody resolves
+			// (isRetrying stuck, no auto_retry_end, Esc the only escape). The chain
+			// must close as a failure before the continuation is left to run.
+			expect(internals._retryAttempt).toBe(0);
+			expect(harness.session.isRetrying).toBe(false);
+			expect(harness.eventsOfType("auto_retry_end").at(-1)).toMatchObject({
+				success: false,
+				attempt: 1,
+				finalError: "prompt is too long",
+			});
 		} finally {
 			internals._checkCompaction = originalCheckCompaction;
 			harness.session.abortRetry();

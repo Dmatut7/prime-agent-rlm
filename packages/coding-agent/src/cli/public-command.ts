@@ -177,7 +177,15 @@ function normalizeLeadingDaemonSocketOption(args: string[]): string[] {
 	if (socketPath === undefined || !PUBLIC_COMMAND_NAMES.has(command ?? "")) {
 		return args;
 	}
-	return [command, ...args.slice(3), option, socketPath];
+	const rest = args.slice(3);
+	// The pair must never land behind a "--": everything after the separator is
+	// literal message content, so the socket option would corrupt the content and
+	// be lost itself, silently running the command against the default service.
+	const separatorIndex = rest.indexOf("--");
+	if (separatorIndex === -1) {
+		return [command, ...rest, option, socketPath];
+	}
+	return [command, ...rest.slice(0, separatorIndex), option, socketPath, ...rest.slice(separatorIndex)];
 }
 
 function continueWith(args: string[]): PublicCommandResult {
@@ -196,6 +204,11 @@ function rejectBareCommandTypo(args: string[]): PublicCommandResult {
 	// prompt, even a bare command-shaped word. parseArgs drops the marker, so the
 	// check reads the raw args.
 	if (args.includes("--")) {
+		return continueWith(args);
+	}
+	// A non-interactive flag makes the intent explicit: `prime-agent -p status`
+	// asks about "status"; the word is a prompt, not a mistyped command.
+	if (args.some((arg) => arg === "-p" || arg === "--print" || arg === "--mode" || arg.startsWith("--mode="))) {
 		return continueWith(args);
 	}
 	const parsed = parseArgs(args);

@@ -108,6 +108,8 @@ export interface HarnessOptions {
 	serializedRefine?: boolean;
 	initialGoal?: { objective: string; tokenBudget?: number };
 	stallAbortSettleGraceMs?: number;
+	/** Shrink the persistent-goal continuation throttle in tests instead of waiting it out. */
+	persistentGoalMinContinuationIntervalMs?: number;
 	/** Fake-clock timers injected into the session's stall watchdog (deterministic driving). */
 	stallWatchdogTimers?: StallWatchdogTimers;
 	/** Kernel/host liveness facts behind the stall watchdog vouch (see turn-liveness.ts). */
@@ -268,6 +270,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		serializedRefine: options.serializedRefine,
 		initialGoal: options.initialGoal,
 		stallAbortSettleGraceMs: options.stallAbortSettleGraceMs,
+		persistentGoalMinContinuationIntervalMs: options.persistentGoalMinContinuationIntervalMs,
 		stallWatchdogTimers: options.stallWatchdogTimers,
 		stallKernelLivenessFacts: options.stallKernelLivenessFacts,
 		stallJournaledBashHandles: options.stallJournaledBashHandles,

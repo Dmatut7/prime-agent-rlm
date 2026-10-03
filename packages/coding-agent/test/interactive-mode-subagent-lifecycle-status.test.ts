@@ -182,4 +182,31 @@ describe("subagent lifecycle status lines", () => {
 		expect(text).toContain("派出子代理 worker");
 		expect(text).not.toContain(longLabel);
 	});
+
+	it("keeps every spawn line when several children are dispatched together", () => {
+		const { mode, update } = createLifecycleMode();
+
+		update.call(mode, child("sub-1", "running", { sessionName: "worker-a", label: "第一件事" }));
+		update.call(mode, child("sub-2", "running", { sessionName: "worker-b", label: "第二件事" }));
+		update.call(mode, child("sub-3", "queued", { sessionName: "worker-c", label: "第三件事" }));
+
+		const text = chatText(mode);
+		expect(text).toContain("派出子代理 worker-a");
+		expect(text).toContain("派出子代理 worker-b");
+		expect(text).toContain("派出子代理 worker-c");
+		expect(text.split("派出子代理").length - 1).toBe(3);
+	});
+
+	it("keeps every removal line when several children leave together", () => {
+		const { mode, update } = createLifecycleMode();
+		update.call(mode, child("sub-1", "running", { sessionName: "worker-a", label: "第一件事" }));
+		update.call(mode, child("sub-2", "running", { sessionName: "worker-b", label: "第二件事" }));
+
+		update.call(mode, child("sub-1", "cancelled", { error: "Deleted by parent orchestrator" }));
+		update.call(mode, child("sub-2", "cancelled", { error: "Deleted by parent orchestrator" }));
+
+		const text = chatText(mode);
+		expect(text).toContain("子代理 worker-a 已收编");
+		expect(text).toContain("子代理 worker-b 已收编");
+	});
 });

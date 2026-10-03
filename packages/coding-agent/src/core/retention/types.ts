@@ -116,9 +116,12 @@ export interface ResolvedRetentionSettings {
 	 */
 	bashTempFileMaxCount: number;
 	/**
-	 * Total-byte ceiling for the whole session-artifact tree (0 = off). Over the
-	 * ceiling the `artifact-total-cap` class reclaims the coldest non-live session
-	 * directories until the tree fits again.
+	 * Total-byte ceiling for the reclaimable kernel snapshot payloads of the
+	 * session-artifact tree (0 = off). Over the ceiling the `artifact-total-cap`
+	 * class reclaims cold non-live sessions' `kernel-state.dill` payloads
+	 * largest-first until the counted bytes fit. Bytes the class may not reclaim
+	 * (protected sessions, harness stores, transcripts, images) never count
+	 * toward the ceiling, and a nested session-artifacts root counts once.
 	 */
 	sessionArtifactsMaxBytes: number;
 	/**

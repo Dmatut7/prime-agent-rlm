@@ -191,10 +191,16 @@ export function compactionKernelStateLines(input: {
 				? `Your Python kernel persisted through compaction; its remaining variables, imports, and helpers are still available. Variables above the per-variable snapshot limit were removed: ${pruned.join(", ")}.`
 				: "Your Python kernel persisted through compaction; its remaining variables, imports, and helpers are still available.",
 		);
-		const skipped = input.snapshot.skipped;
-		if (skipped && skipped.length > 0) {
+		const skipped = input.snapshot.skipped ?? [];
+		// Routine skips (leading-underscore internals the bootstrap re-binds on every
+		// start, host skill wrappers that cannot pickle) fire on every healthy write, so
+		// listing them is noise about names the model never defined and cannot act on.
+		// Older runtimes still report them in the payload, so the filter lives here at
+		// render time. A genuinely lost user name is still listed.
+		const unexpectedSkipped = skipped.filter((entry) => !isExpectedSnapshotSkip(entry));
+		if (unexpectedSkipped.length > 0) {
 			lines.push(
-				`These were live but could not be saved into the snapshot, so they will not survive a restart: ${skipped
+				`These were live but could not be saved into the snapshot, so they will not survive a restart: ${unexpectedSkipped
 					.map((entry) => `${entry.name} (${entry.reason})`)
 					.join("; ")}.`,
 			);
@@ -266,13 +272,18 @@ export function restoreNoticeLines(result: RestoreResult): string[] {
 		);
 	}
 	// The other half of "these came back": a name that never entered the payload cannot fail to
-	// restore, so without this line the model hears nothing at all about it.
+	// restore, so without this line the model hears nothing at all about it. Routine skips
+	// (leading-underscore internals, host skill wrappers) are filtered like the write-side
+	// notice: every manifest carries them, and the model can neither rebuild nor avoid them.
 	if (result.notSaved && result.notSaved.length > 0) {
-		lines.push(
-			`These were live when that snapshot was written but were never saved into it, so they are gone and must be recreated: ${result.notSaved
-				.map((entry) => `${entry.name} (${entry.reason})`)
-				.join("; ")}.`,
-		);
+		const notSaved = result.notSaved.filter((entry) => !isExpectedSnapshotSkip(entry));
+		if (notSaved.length > 0) {
+			lines.push(
+				`These were live when that snapshot was written but were never saved into it, so they are gone and must be recreated: ${notSaved
+					.map((entry) => `${entry.name} (${entry.reason})`)
+					.join("; ")}.`,
+			);
+		}
 	}
 	if (result.error) {
 		lines.push(`Restore failure: ${result.error}.`);

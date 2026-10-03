@@ -747,6 +747,71 @@ describe("SubagentSummaryLine", () => {
 		}
 	});
 
+	it("disarms the stop-all confirmation when the session is replaced", async () => {
+		const cancelRlmChild = vi.fn(async (_childId: string) => true);
+		const showStatus = vi.fn();
+		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+		Object.assign(mode, {
+			subagentSnapshots: new Map([["a", child("a", "running", { activeSessionId: "active-a" })]]),
+			rlmNodeId: undefined,
+			agentConnection: { cancelRlmChild },
+			showStatus,
+			// The session-reset seam the replacement runs through, with its fixture needs.
+			queueSelection: { reset: vi.fn() },
+			promptStashState: {},
+			chatContainer: { clear: vi.fn(), children: [] },
+			shortcutGuideContainer: { clear: vi.fn() },
+			pendingMessagesContainer: { clear: vi.fn() },
+			queuedMessagesContainer: { clear: vi.fn() },
+			defaultEditor: { clearHistory: vi.fn(), setText: vi.fn(), getText: () => "" },
+			editor: { clearHistory: vi.fn(), setText: vi.fn(), getText: () => "" },
+			pastedImages: new Map(),
+			pendingBashComponents: [],
+			activityTracker: { reset: vi.fn() },
+			connectionState: { sessionActions: { queuedCount: 0, steering: [], followUps: [] } },
+			agentRunFileChanges: new Map(),
+			recapContainer: { clear: vi.fn() },
+			ui: { requestRender: vi.fn(), terminal: { abortPendingInput: vi.fn() } },
+			ipythonToolComponents: new Map(),
+			lateIpythonSentAgentMessages: new Map(),
+			slimOrphanToolResults: new Map(),
+			pendingTools: new Map(),
+			pendingToolCreations: new Set(),
+			startedToolCalls: new Set(),
+			subagentSummaryLine: new SubagentSummaryLine(),
+			uiServices: spendCellOffUiServices,
+			heartbeatCatalog: [],
+			updateWorkingPulse: vi.fn(),
+			syncWorkingLoader: vi.fn(),
+			updateWorkingLoaderMessage: vi.fn(),
+			setGoalAnnouncementBaseline: vi.fn(),
+			getGoalState: vi.fn(() => undefined),
+			syncGoalTray: vi.fn(),
+		});
+		const request = Reflect.get(InteractiveMode.prototype, "requestStopAllSubagents") as (
+			this: typeof mode,
+		) => Promise<void>;
+		const reset = Reflect.get(InteractiveMode.prototype, "resetCurrentSessionRenderState") as (
+			this: typeof mode,
+		) => void;
+
+		await request.call(mode);
+		expect(showStatus.mock.calls[0]?.[0]).toContain("再按一次");
+		expect(cancelRlmChild).not.toHaveBeenCalled();
+
+		// The session the arming belonged to is replaced (attach elsewhere, /fork, /resume).
+		reset.call(mode);
+		// The replacement session has its own running child.
+		Object.assign(mode, {
+			subagentSnapshots: new Map([["b", child("b", "running", { activeSessionId: "active-b" })]]),
+		});
+
+		await request.call(mode);
+		// Not a confirm of the old arming: the press re-arms for the new session's child.
+		expect(cancelRlmChild).not.toHaveBeenCalled();
+		expect(showStatus.mock.calls[1]?.[0]).toContain("再按一次");
+	});
+
 	it("sends the viewer of a closed subagent back to its parent with a Chinese notice", () => {
 		const returnToAgentsView = vi.fn(async () => undefined);
 		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;

@@ -60,6 +60,16 @@ export const USER_REQUEST_COMPRESSED_CHARS = 160;
 const BLOCK_HEADER =
 	"The user's own words from the compacted transcript - typed messages, user-initiated bash commands, and agent-delivered messages such as RLM task briefs (k=agent_message) - preserved mechanically, oldest first, JSON-encoded so the text is byte-exact (x marks an elided middle). Not a summary: treat every unresolved instruction and reported problem here as a live obligation.";
 
+/**
+ * The header for the same block when it rides a branch summary instead of a
+ * compaction. The requests belong to the branch the conversation came back from,
+ * so the "live obligation" framing would re-enter them as current instructions:
+ * after the return, the model would start finishing work the user navigated away
+ * from.
+ */
+export const BRANCH_USER_REQUESTS_HEADER =
+	"The user's own words from a conversation branch that was left behind - typed messages, user-initiated bash commands, and agent-delivered messages such as RLM task briefs (k=agent_message) - preserved mechanically, oldest first, JSON-encoded so the text is byte-exact (x marks an elided middle). These are NOT current instructions: they belong to the abandoned branch, so act on one only when the user re-states it after the return.";
+
 /** Share of keepRecentTokens the verbatim block may spend when the caller derives its budget. */
 export const USER_REQUESTS_BUDGET_SHARE = 0.3;
 export const USER_REQUESTS_BUDGET_FLOOR = 6000;
@@ -378,18 +388,25 @@ function renderBody(records: readonly UserRequestRecord[]): string {
 }
 
 /** Render the block for a summary; an empty ledger renders nothing. */
-export function renderUserRequests(ledger: {
-	generation: number;
-	records: readonly UserRequestRecord[];
-	elided: number;
-}): string {
+export function renderUserRequests(
+	ledger: {
+		generation: number;
+		records: readonly UserRequestRecord[];
+		elided: number;
+	},
+	options?: { header?: string },
+): string {
 	if (ledger.records.length === 0) return "";
 	const attributes: Record<string, string | number> = {
 		generation: ledger.generation,
 		count: ledger.records.length,
 	};
 	if (ledger.elided > 0) attributes.elided = ledger.elided;
-	return renderMachineBlock("user-requests", attributes, [BLOCK_HEADER, renderBody(ledger.records)].join("\n"));
+	return renderMachineBlock(
+		"user-requests",
+		attributes,
+		[options?.header ?? BLOCK_HEADER, renderBody(ledger.records)].join("\n"),
+	);
 }
 
 /**

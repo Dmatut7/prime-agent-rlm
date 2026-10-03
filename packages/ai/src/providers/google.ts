@@ -108,7 +108,12 @@ export const streamGoogle: StreamFunction<"google-generative-ai", GoogleOptions>
 					// A prompt-level safety block ends the stream with no candidates and no
 					// finish reason; without this check it surfaced as a malformed-stream
 					// truncation and was retried as a transient fault with the same prompt.
-					const info = { kind: "safety" as const, providerErrorType: blockReason };
+					// The block rejects the request's input, so resending the same bytes is
+					// blocked the same way forever: classify it as a permanent request
+					// rejection (the kind the session's never-resend gate honors), not as a
+					// retryable output-side `safety` stop. The provider's blockReason keeps
+					// the safety nature in the diagnostic detail.
+					const info = { kind: "invalid_request" as const, providerErrorType: blockReason };
 					throw new StreamFailureError(
 						streamFailureMessage(info, chunk.promptFeedback?.blockReasonMessage || undefined),
 						info,

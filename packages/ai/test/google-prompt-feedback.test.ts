@@ -32,8 +32,13 @@ import type { AssistantMessage, Context, Model } from "../src/types.js";
  * candidates and no finish reason. Both google providers only read
  * `candidates[0]`, so the block fell through to the "stream ended before a finish
  * reason" malformed-response throw — the blockReason was lost and the session
- * retried the same deterministic block as a transient fault. The blockReason now
- * surfaces as a safety-classified error carrying the provider's reason.
+ * retried the same deterministic block as a transient fault.
+ *
+ * The block is a rejection of the request's input: resending the same bytes is
+ * blocked the same way forever, so it is classified as a permanent request
+ * rejection (the kind the session's never-resend gate honors), keeping the
+ * provider's blockReason and message as the detail. An output-side block
+ * (finishReason SAFETY) stays `safety` — a resend can answer differently.
  */
 
 function makeModel(api: "google-generative-ai", provider: "google"): Model<"google-generative-ai">;
@@ -81,7 +86,7 @@ beforeEach(() => {
 describe("google promptFeedback blockReason", () => {
 	for (const p of providers) {
 		describe(p.name, () => {
-			it("reports a prompt-level safety block as a safety error carrying the blockReason", async () => {
+			it("reports a prompt-level block as a permanent rejection carrying the blockReason", async () => {
 				mockState.chunks = [
 					{
 						promptFeedback: {
@@ -95,11 +100,15 @@ describe("google promptFeedback blockReason", () => {
 				const message = await p.run();
 
 				expect(message.stopReason).toBe("error");
-				expect(message.errorMessage).toContain("safety filters");
+				expect(message.errorMessage).toContain("rejected");
 				expect(message.errorMessage).toContain("PROHIBITED_CONTENT");
+				expect(message.errorMessage).toContain("The prompt was blocked by content filters.");
 				expect(message.errorMessage).not.toContain("finish reason");
 				const failure = message.diagnostics?.find((entry) => entry.type === "provider_stream_failure");
-				expect(failure?.details?.kind).toBe("safety");
+				// The session's never-resend gate reads this kind: a prompt block resends
+				// identical bytes and is blocked the same way forever, so it must be one
+				// of the permanent kinds, not a retryable one.
+				expect(failure?.details?.kind).toBe("invalid_request");
 				expect(failure?.details?.providerErrorType).toBe("PROHIBITED_CONTENT");
 			});
 

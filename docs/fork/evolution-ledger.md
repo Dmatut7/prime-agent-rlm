@@ -14,21 +14,19 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-04 晚，wave-39 已 SHIP）
+## 当前状态（2026-10-04 深夜，wave-40 已 SHIP + 0.11.19 已发版）
 
-- HEAD = 见 git log（三批：第八刀、暖池遥测消费面、FORK_NOTES+账本）。
-- wave-39：agent-session.ts 19738 行（八刀 −3762）；daemon schema rev 44→45 + capability
-  `warm_pool_stats`（status/daemon ps 可见池状态，老 daemon 零输出降级）；持久化收尾裁决：
-  无 agent 可达的切模型路径（OpenHands 坑前提不成立），真缺口=第二客户端 set_model 半静默
-  → wave-40 立项（非交互来源切换发可见通知）。
-- 走查小注：/exit 文本 Enter 未触发命令（wave-40 核查）。
-- 门禁：check EXIT 0、hygiene OK、daemon-protocol 34/34、单测/suite 复扫绿（数字账本末节惯例）。
-- **0.11.19 已发版**（271f35801）：根 CHANGELOG 手写中文更新日志（沿用 fork 格式），四包
-  lockstep 0.11.19，146 个 fragment 全部收编删除；无 v 标无 npm publish（fork 禁令原样）。
-  教训两条：sync-versions 的正确顺序 = 全部 package.json bump → npm install --package-lock-only
-  → check（example 的 lock 条目在根 lock 里，反序会一轮一个地冒红）；我插 FORK_NOTES 新节的
-  Edit 模式曾逐节吃掉上一节标题（old_string 只匹配标题行、new_string 没把旧标题带回去）——
-  11 节标题已复原，以后插节用「新节全文 + 旧标题行」一起当 new_string。
+- HEAD = 见 git log。0.11.19 已发（手写中文更新日志进根 CHANGELOG，146 fragment 收编；
+  无 v 标无 npm publish，fork 闸门原样）。
+- wave-40：外部审查（12 审查员/83 条钉在 09eae8d55）超大集群 16 路处置——11 必修全修
+  （先红后绿），应修主体落地；第 0 条（fd1dd4e4c 提交说明含账号信息）预防半已机制化
+  （pre-push 敏感扫描，全历史回扫零误报），本体（是否改写历史+强推）**等老板拍板**。
+- 流程改进已写进 AGENTS.md：commit 一律 -F、刹车必带恢复、协议改动列全消费路径、
+  inline import 有据例外只限入口性能路径、测试不得替换被测段。
+- 主席自伤两起已记录：FORK_NOTES 插节吃标题（复原 11 节 + 修法入账）；
+   compaction.ts 空摘要闸初版抢了本地中止的「Compaction cancelled」语义（已按
+  signal.aborted 分开两条路）。
+- 门禁：check EXIT 0、hygiene OK、unit/suite/tui/python/ai/agent 全量绿（负载抖动隔离即绿）。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -109,13 +107,15 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
   把在跑会话归档。犯了就是事故，写进 FORK_NOTES 向老板披露。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-40 候选）
+## 下一波主题（wave-41 候选）
 
-1. 【set_model 可见性】非交互来源（第二客户端/扩展）的模型切换发 display:true 通知 +
-   ledger 记 origin（persist-tail 裁决的最小形态）。
-2. 【/autocompact per-model 保存】按裁决落：compaction.perModel Record<provider/id, boolean>，
-   裸 enabled 作默认，零迁移；RPC 快照报对当前模型解析的 effective 值（线形不变）。
-3. 【/exit 文本未触发】走查小注核查（输入框命令派发）。
-4. 【第九刀候选】image-routing（358 行/20 成员）或 harness-digest 叶子（324 行/22 成员）。
-5. 【首请求服务端窗口】≤1.5s 有界等待（per-model 最后一块，已顺延多波——优先动或正式降级）。
-6. 【记忆帽裁决】仍待老板三选一（CC 先例：帽=硬截断+可见诊断，不二次计量）。
+1. 【第 0 条决策】fd1dd4e4c 改写历史（git filter-repo 改说明+force push，150+ 提交编号变）
+   vs 接受现状+扫描器已防复发——等老板一句话。
+2. 【审查「小问题」35 条顺手批】按文件域打包 2-3 路（清单在 wave-40 审查报告）。
+3. 【审查遗留 lane 移交项】汇总各 lane 报告的遗留节（recovery 生产侧三文件契约、
+   settings.md 文档同步、breaker 旋钮 settings 键、refine TS 侧小库频段、agents-view
+   prev/next repeatable 等）。
+4. 【审查流程改进落地】每天一次按流程整体审查（用不同模型）排进循环节奏；
+   test-hygiene 识别非下划线私有访问。
+5. 【第九刀候选】image-routing（358 行/20 成员）。
+6. 【记忆帽裁决】仍待老板。

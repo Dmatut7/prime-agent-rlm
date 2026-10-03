@@ -183,4 +183,43 @@ describe("Anthropic content_block index mismatch diagnostics", () => {
 		expect(message.content).toEqual([{ type: "text", text: "Hello" }]);
 		expect(unroutedDiagnostics(message)).toHaveLength(0);
 	});
+
+	it("records one diagnostic per event shape and counts the repeats", async () => {
+		const strayDelta = (index: number) => ({
+			event: "content_block_delta",
+			data: JSON.stringify({ type: "content_block_delta", index, delta: { type: "text_delta", text: "lost" } }),
+		});
+		const message = await runStream([
+			...textFrames(),
+			// Three repeats of one shape and one of another: a proxy that mis-indexes
+			// every delta must not append one diagnostic per event.
+			strayDelta(2),
+			strayDelta(3),
+			strayDelta(4),
+			{
+				event: "content_block_stop",
+				data: JSON.stringify({ type: "content_block_stop", index: 9 }),
+			},
+			{
+				event: "content_block_stop",
+				data: JSON.stringify({ type: "content_block_stop", index: 0 }),
+			},
+			...tailFrames(),
+		]);
+
+		expect(message.stopReason).toBe("stop");
+		expect(message.content).toEqual([{ type: "text", text: "Hello" }]);
+		const diagnostics = unroutedDiagnostics(message);
+		expect(diagnostics).toHaveLength(2);
+		const deltaEntry = diagnostics.find((entry) => entry.details?.eventType === "content_block_delta");
+		expect(deltaEntry?.details).toMatchObject({
+			eventType: "content_block_delta",
+			index: 2,
+			deltaType: "text_delta",
+			count: 3,
+			lastIndex: 4,
+		});
+		const stopEntry = diagnostics.find((entry) => entry.details?.eventType === "content_block_stop");
+		expect(stopEntry?.details).toMatchObject({ eventType: "content_block_stop", index: 9, count: 1 });
+	});
 });

@@ -29,6 +29,7 @@ import {
 	shouldPrefireDaemonCreateForDaemonInteractive,
 	shouldRejectNonInteractiveAttach,
 	shouldRejectNonInteractiveBareResume,
+	shouldTreatLoneVerboseFlagAsVersion,
 	shouldUseDaemonClient,
 	shouldUseDaemonClientRuntime,
 	shouldUseDaemonInteractive,
@@ -609,6 +610,22 @@ describe("cross-project resume hint", () => {
 		expect(crossProjectResumeHint("fix-123", "/tmp/other-project")).toBe(
 			`Or continue it in that project: cd /tmp/other-project && ${APP_NAME} --resume fix-123`,
 		);
+	});
+});
+
+describe("lone -v version request", () => {
+	test("a lone -v asks for the version", () => {
+		expect(shouldTreatLoneVerboseFlagAsVersion(["-v"])).toBe(true);
+	});
+
+	test.each([
+		{ args: ["-v", "--verbose"] },
+		{ args: ["agents", "-v"] },
+		{ args: ["--verbose"] },
+		{ args: ["-V"] },
+		{ args: [] },
+	])("stays on the normal parse path: $args", ({ args }) => {
+		expect(shouldTreatLoneVerboseFlagAsVersion(args)).toBe(false);
 	});
 });
 

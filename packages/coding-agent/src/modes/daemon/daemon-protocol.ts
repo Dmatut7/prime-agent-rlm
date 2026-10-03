@@ -366,8 +366,20 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   every prior slice (DaemonResponse types its data as unknown), so the new
 //   warmPoolStats slice joins the hashed source and a later field edit to the DTO
 //   cannot ride an unchanged DAEMON_SCHEMA_ID.
-export const DAEMON_SCHEMA_REVISION = 45;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-45-9545da3e4053";
+// Revision 46 adds the optional session_replaced.messagesOmitted field (wave-40
+//   review fix): the supervisor's catch-up drain now serves a
+//   slim_attach_transcript client its tail window inline (the rev-44 window
+//   applied to attach and reattach only; the drain's streamed branch threw on
+//   the consumed transfer handoff and gave the client up), and the windowed
+//   replacement carries the omission count so the client can reconcile
+//   messages.length + messagesOmitted against the summary and offer backfill.
+//   Backward-compatible addition in the rev-43/44 class: the field is written
+//   only for a snapshot the supervisor windowed, which only happens for a
+//   client that declared slim_attach_transcript, so an old client never
+//   receives it, and a new client reading an old daemon's unwindowed
+//   replacement sees the field absent, which already means "full transcript".
+export const DAEMON_SCHEMA_REVISION = 46;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-46-5dc417dfa720";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -1985,6 +1997,16 @@ export type DaemonOutbound =
 			activeSessionId: string;
 			state: AgentConnectionState;
 			messages: AgentMessage[];
+			/**
+			 * Rev 46: set only when a slim_attach_transcript client's replacement
+			 * catch-up served the tail window inline — the count of older messages
+			 * held back, exactly the DaemonSessionSnapshot.messagesOmitted contract
+			 * (rev 44). Absent means `messages` is the complete transcript: old
+			 * daemons never window a replacement, and the supervisor only windows
+			 * for clients that declared the capability, so neither mixed-version
+			 * direction can receive a count it cannot read.
+			 */
+			messagesOmitted?: number;
 			snapshotFollows?: boolean;
 			meta?: DaemonEventMeta;
 	  }

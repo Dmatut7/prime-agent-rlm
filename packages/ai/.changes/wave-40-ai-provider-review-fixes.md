@@ -1,0 +1,5 @@
+- Fixed cross-model replay after an aborted turn with a model switch: the last completed turn now keeps its full thinking, and the aborted turn's half-formed reasoning is dropped instead of being replayed as plain text.
+- Fixed a Codex content-filter or refusal stop permanently disabling the session's WebSocket transport (forcing every later request onto a full-conversation SSE resend); a failure derived from the provider's stop reason no longer counts as a connection failure.
+- Fixed Google and Vertex prompt-level safety blocks being retried with identical bytes up to the retry cap; a blocked prompt now surfaces immediately as a permanent request rejection carrying the provider's block reason.
+- Capped the Anthropic unrouted content-block diagnostics: repeated misses of the same event shape now advance a count on a single diagnostic instead of appending one per event.
+- Fixed Codex flex/priority cost estimates showing the standard rate: the Codex endpoint always reports `service_tier: "default"`, so the requested tier is trusted again when the response echoes default (restores the upstream pi-mono #3307 behavior).

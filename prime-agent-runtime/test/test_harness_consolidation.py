@@ -23,6 +23,7 @@ from rlm.harness import (
     ConsolidationOperation,
     ConsolidationPlan,
     HarnessState,
+    _merge_pieces,
 )
 
 DUP_TITLE_A = "platform_go后台建群与访客群体系是两套不相交的表"
@@ -152,6 +153,39 @@ class PlanMergeTest(unittest.TestCase):
 
 
 class PlanStaleTest(unittest.TestCase):
+    def test_merge_target_is_never_a_containment_delete(self) -> None:
+        # The merge canonical's planned body is its original plus the absorbed
+        # appendix, but the containment pass reads the pre-merge store: without
+        # protection it marks the canonical contained in a larger survivor, and
+        # the apply would delete the entry the merge just wrote into.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = make_state(temp_dir)
+            state.create_memory(DUP_TITLE_A, DUP_CONTENT_A, id="mem_original")
+            state.create_memory(DUP_TITLE_B, DUP_CONTENT_B, id="mem_rewrite")
+            # Much larger than the canonical and not near-duplicate-similar, so
+            # pass 1 leaves it alone and pass 2 sees the canonical inside it.
+            padding = " ".join(f"word{i}" for i in range(110))
+            state.create_memory("大杂烩手册", f"{DUP_CONTENT_B} {padding}", id="mem_handbook")
+            plan = state.plan_consolidation(now=NOW)
+            self.assertEqual([(op.action, op.id) for op in plan.operations], [("merge", "mem_rewrite")])
+
+    def test_merge_target_is_never_an_age_stale_delete(self) -> None:
+        # Both cluster members are older than the stale window; the canonical
+        # is about to receive the absorbed content, so the plan must not age it
+        # out from under the merge.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = make_state(temp_dir)
+            state.create_memory(DUP_TITLE_A, DUP_CONTENT_A, id="mem_original")
+            state.create_memory(DUP_TITLE_B, DUP_CONTENT_B, id="mem_rewrite")
+            original = state.get("memory", "mem_original")
+            rewrite = state.get("memory", "mem_rewrite")
+            assert original is not None and rewrite is not None
+            original.updated_at = "2026-08-01T00:00:00+00:00"
+            rewrite.updated_at = "2026-08-02T00:00:00+00:00"
+            state.save()
+            plan = state.plan_consolidation(stale_days=30, now=NOW)
+            self.assertEqual([(op.action, op.id) for op in plan.operations], [("merge", "mem_rewrite")])
+
     def test_contained_and_similar_pair_merges_instead_of_deleting(self) -> None:
         # A fully contained body is usually also a high-cosine near-duplicate;
         # the merge pass runs first and claims it (absorption keeps the audit
@@ -223,20 +257,24 @@ class PlanStaleTest(unittest.TestCase):
 
 
 class PlanRenameTest(unittest.TestCase):
-    def test_titles_over_the_slim_cap_are_suggested_for_rename(self) -> None:
+    def test_title_slimming_is_opt_in(self) -> None:
+        # Off by default: slimming rewrites the stored title, while the digest's
+        # index layer already truncates its own rendering - so the pass runs
+        # only when a caller explicitly asks for it.
         with tempfile.TemporaryDirectory() as temp_dir:
             state = make_state(temp_dir)
             long_title = "这是一条很长的标题" * 20  # 180 code points
             state.create_memory(long_title, "正文", id="mem_long")
-            plan = state.plan_consolidation(now=NOW)
+            self.assertEqual(state.plan_consolidation(now=NOW).operations, [])
+            plan = state.plan_consolidation(slim_title_chars=120, now=NOW)
             (rename,) = plan.operations
             self.assertEqual(rename.action, "rename")
             self.assertEqual(rename.id, "mem_long")
             assert rename.title is not None
             self.assertEqual(len(rename.title), 120)
             self.assertEqual(rename.previous_title_chars, 180)
-            # The default slim cap is the index render cap: the rename costs the
-            # digest face nothing, so the index byte math is unchanged.
+            # Slimming to the render cap costs the digest face nothing, so the
+            # index byte math is unchanged.
             self.assertEqual(plan.index_bytes_after, plan.index_bytes_before)
 
     def test_slim_cap_below_the_render_cap_saves_index_bytes(self) -> None:
@@ -265,6 +303,65 @@ class PlanRenameTest(unittest.TestCase):
             assert rename.title is not None
             self.assertNotIn("\n", rename.title)
             self.assertEqual(len(rename.title), 10)
+
+
+class MergePiecesTest(unittest.TestCase):
+    def test_ascii_and_cjk_delimiters_still_split(self) -> None:
+        self.assertEqual(
+            _merge_pieces("First! Second? Third\n第四。第五"), ["First", "Second", "Third", "第四", "第五"]
+        )
+
+    def test_url_query_and_bang_are_not_sentence_boundaries(self) -> None:
+        self.assertEqual(
+            _merge_pieces("见 https://a.example/x?y=1&z=2! 好了。下一句。"),
+            ["见 https://a.example/x?y=1&z=2! 好了", "下一句"],
+        )
+
+    def test_cjk_delimiter_after_a_url_still_splits(self) -> None:
+        self.assertEqual(
+            _merge_pieces("见 https://a.example/x?y=1！下一句。"),
+            ["见 https://a.example/x?y=1", "下一句"],
+        )
+
+    def test_fenced_code_block_stays_one_piece(self) -> None:
+        self.assertEqual(
+            _merge_pieces("先跑构建。\n```\nmake build? no!\n```\n再收尾。"),
+            ["先跑构建", "```\nmake build? no!\n```", "再收尾"],
+        )
+
+    def test_inline_code_stays_one_piece(self) -> None:
+        self.assertEqual(_merge_pieces("跑 `make? no!` 再说。下句。"), ["跑 `make? no!` 再说", "下句"])
+
+
+class PlanMergeContentTest(unittest.TestCase):
+    def test_merge_appendix_keeps_urls_and_code_whole(self) -> None:
+        # The sentence splitter must not cut inside a URL (?, !) or a code
+        # block (newlines, ?, !): a split URL is a dead link and split code is
+        # garbage in the appendix. Mirrored verbatim in
+        # refinement-consolidation.test.ts.
+        canonical_content = (
+            "部署前必须逐路径核对归属判据，别扫整个工作树；提交说明里每个路径都要对着 git show --stat 的数字核一遍。"
+        )
+        absorbed_content = (
+            canonical_content
+            + "排查手册见 https://wiki.example.com/dev?topic=review&lang=zh！"
+            + "命令序列：\n```\ngit status\nmake build? no!\n```\n跑完再收尾。"
+        )
+        expected = (
+            canonical_content
+            + "\n\n合并补充：\n- 排查手册见 https://wiki.example.com/dev?topic=review&lang=zh"
+            + "\n- 命令序列：\n- ```\ngit status\nmake build? no!\n```\n- 跑完再收尾"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = make_state(temp_dir)
+            state.create_memory("部署核对清单旧版", absorbed_content, id="mem_old")
+            state.create_memory("部署核对清单", canonical_content, id="mem_new")
+            plan = state.plan_consolidation(now=NOW)
+            (merge,) = plan.operations
+            self.assertEqual(merge.action, "merge")
+            self.assertEqual(merge.id, "mem_new")
+            self.assertEqual(merge.absorb_ids, ("mem_old",))
+            self.assertEqual(merge.content, expected)
 
 
 class ApplyTest(unittest.TestCase):

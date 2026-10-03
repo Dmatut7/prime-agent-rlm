@@ -1,0 +1,8 @@
+- Fixed the stall watchdog and the daemon stall-recovery sweep interrupting healthy long steps: a turn waiting on a live child in `rlm.collect`, or a silent step whose process tree keeps burning CPU, now counts as vouched work (the same judgment the per-step deadline already used).
+- Fixed worker-crash auto-resume looping unattended: after two consecutive crash → auto-resume → crash cycles (or for interruptions older than 24h) the session stops auto-resuming; the interruption stays in the resume briefing for a manual resume.
+- Fixed queued input messages being lost when a session worker crashed: texts carried by the recovery marker are replayed ahead of the automatic resume and reported in the resume briefing.
+- Fixed a user Esc during a quota-park wake probe re-arming the wake (the task auto-resumed 60s later); a user abort now cancels the park.
+- Fixed quota-park wakes counting as delivered when the durable job was skipped or errored without running its prompt; the in-process wake owns the resume instead.
+- Fixed a quota park left asleep forever when its wake timer fired early (clock step-back) or slept past its wake time (host sleep): early fires re-arm, and a periodic clock check catches overdue wakes.
+- Fixed a failed park-record write leaving the session stuck in "retrying".
+- Fixed `retry.provider.waitForUsage.maxParks` resetting on restart: a restored overdue park keeps its park count when the durable wake job survives.

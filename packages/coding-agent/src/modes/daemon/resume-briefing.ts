@@ -4,7 +4,7 @@ import type { AgentSession } from "../../core/agent-session.js";
 import type { DutyLogSummary } from "../../core/duty-log.js";
 import { formatDutyDuration, summarizeDutyLog } from "../../core/duty-log.js";
 import type { GoalState } from "../../core/goals.js";
-import { findUnconsumedWorkerRecoveryMarker } from "./worker-recovery-resume.js";
+import { findUnconsumedWorkerRecoveryMarker, queuedInputsOfWorkerRecoveryMarker } from "./worker-recovery-resume.js";
 
 /**
  * W14-B (C5, /tmp/wave10/model-cases.md): a session reopened after a restart
@@ -35,6 +35,14 @@ export interface ResumeBriefingInput {
 	goal?: GoalState | undefined;
 	/** Queued (not yet delivered) inputs the rebuilt session still holds. */
 	queuedCount: number;
+	/**
+	 * Queued input texts the previous worker never delivered, recovered from the
+	 * interruption marker (details.queuedInputs). The rebuilt in-memory queue starts
+	 * empty after a crash, so without these the briefing read "nothing pending" while
+	 * the user's queued work was silently gone; they are replayed ahead of the
+	 * automatic resume, and the briefing says so.
+	 */
+	queuedInputs?: readonly string[] | undefined;
 	/** Operations the previous worker had in flight when it stopped (worker-recovery marker). */
 	interruptedOperations: readonly string[];
 	/** The duty-log summary over the transcript tail, when the session did anything. */
@@ -91,6 +99,13 @@ export function buildResumeBriefing(input: ResumeBriefingInput): string | undefi
 	}
 	if (input.queuedCount > 0) {
 		lines.push(`- ${input.queuedCount} queued input message(s) wait from before the reopen.`);
+	}
+	const recoveredInputs = input.queuedInputs ?? [];
+	if (recoveredInputs.length > 0) {
+		const previews = recoveredInputs.map((text) => `"${preview(text, 120)}"`).join(", ");
+		lines.push(
+			`- ${recoveredInputs.length} queued input message(s) from before the interruption were recovered from the worker-recovery marker and replayed into the queue: ${previews}.`,
+		);
 	}
 	if (input.duty) lines.push(dutyLine(input.duty, input.now));
 	if (input.orgDocs.length > 0) {
@@ -167,10 +182,12 @@ export async function maybeInjectResumeBriefing(
 	const now = options.now ?? Date.now();
 	const branch = session.sessionManager.getBranch();
 	if (!branch.some((entry) => entry.type === "message")) return false;
+	const recoveryMarker = findUnconsumedWorkerRecoveryMarker(branch);
 	const briefing = buildResumeBriefing({
 		goal: session.goalState,
 		queuedCount: session.getSessionActionSnapshot().queuedCount,
-		interruptedOperations: interruptedOperationsOf(findUnconsumedWorkerRecoveryMarker(branch)),
+		queuedInputs: queuedInputsOfWorkerRecoveryMarker(recoveryMarker),
+		interruptedOperations: interruptedOperationsOf(recoveryMarker),
 		duty: summarizeDutyLog({ entries: branch, now }),
 		orgDocs: await listOrgMemoryDocs(session.sessionManager.getCwd()),
 		now,

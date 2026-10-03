@@ -1003,6 +1003,16 @@ export interface AgentConnection {
 	 * reach for this when a paged read exists.
 	 */
 	getMessagesWindow?(options?: { before?: number; limit?: number }): Promise<AgentConnectionMessagesWindow>;
+	/**
+	 * Whether windowed transcript reads actually work against this connection's
+	 * peer right now (daemon protocol rev 44, capability slim_attach_transcript).
+	 * The daemon adapter has getMessagesWindow either way; a peer that never
+	 * advertised the capability rejects the windowed read, so the UI must not
+	 * offer paging (the load-earlier marker) then. Absent on adapters without a
+	 * paged read; callers default a missing method to "supported" only when
+	 * getMessagesWindow exists (test doubles and adapters that always page).
+	 */
+	supportsMessagesWindow?(): boolean;
 	getSessionHeader(): Promise<AgentConnectionSessionHeader | undefined>;
 	getCommands(): Promise<AgentConnectionSlashCommand[]>;
 	getResourceSnapshot(): Promise<AgentConnectionResourceSnapshot>;

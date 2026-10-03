@@ -87,19 +87,40 @@ function agePath(path: string, ageMs: number, now: number): void {
 }
 
 /**
- * One session's artifact directory with a payload of exactly `bytes` and every
- * entry (files first, then the directory itself) aged to `ageMs`.
+ * One session's artifact directory with a kernel snapshot payload of exactly
+ * `bytes` and every entry (files first, then the directory itself) aged to
+ * `ageMs`. `withMemory` adds the local harness store (`harness/harness_state.json`,
+ * the session's continual memory); `imageBytes` adds a pasted-image payload.
  */
 function makeArtifactDir(
 	roots: RetentionRoots,
 	sessionId: string,
-	options: { bytes: number; ageMs: number; now: number; scheduledJobs?: boolean; childTranscriptId?: string },
+	options: {
+		bytes: number;
+		ageMs: number;
+		now: number;
+		scheduledJobs?: boolean;
+		childTranscriptId?: string;
+		withMemory?: boolean;
+		imageBytes?: number;
+	},
 ): string {
 	const dir = join(roots.artifactRoot, sessionId);
 	mkdirSync(dir, { recursive: true, mode: 0o700 });
 	writeFileSync(join(dir, "kernel-state.dill"), Buffer.alloc(options.bytes, 1));
 	if (options.scheduledJobs === true) {
 		writeFileSync(join(dir, "scheduled-jobs.json"), '{"jobs":[],"dispatches":[]}\n');
+	}
+	if (options.withMemory === true) {
+		const harnessDir = join(dir, "harness");
+		mkdirSync(harnessDir, { recursive: true, mode: 0o700 });
+		writeFileSync(join(harnessDir, "harness_state.json"), '{"entries":{"m1":{"content":"remember the dag"}}}\n');
+		agePath(join(harnessDir, "harness_state.json"), options.ageMs, options.now);
+		agePath(harnessDir, options.ageMs, options.now);
+	}
+	if (options.imageBytes !== undefined) {
+		writeFileSync(join(dir, "image-1.png"), Buffer.alloc(options.imageBytes, 7));
+		agePath(join(dir, "image-1.png"), options.ageMs, options.now);
 	}
 	if (options.childTranscriptId !== undefined) {
 		const childDir = join(dir, "sub-deadbeef");
@@ -274,7 +295,7 @@ describe("artifact-total-cap", () => {
 		expect(existsSync(join(roots.artifactRoot, "aa01"))).toBe(true);
 	});
 
-	it("does nothing while the tree fits under the ceiling", async () => {
+	it("does nothing while the countable snapshot payloads fit under the ceiling", async () => {
 		const { roots } = createSandbox();
 		const now = Date.now();
 		makeArtifactDir(roots, "aa01", { bytes: 100, ageMs: 30 * MS_PER_DAY, now });
@@ -288,12 +309,38 @@ describe("artifact-total-cap", () => {
 		expect(result.skipped).toEqual([]);
 	});
 
-	it("reclaims the coldest directories oldest-first until the tree fits", async () => {
+	it("reclaims only the kernel snapshot and keeps the session's memory and pasted images", async () => {
 		const { roots } = createSandbox();
 		const now = Date.now();
-		const oldest = makeArtifactDir(roots, "aa01", { bytes: 800, ageMs: 30 * MS_PER_DAY, now });
-		const middle = makeArtifactDir(roots, "aa02", { bytes: 600, ageMs: 20 * MS_PER_DAY, now });
-		const newest = makeArtifactDir(roots, "aa03", { bytes: 400, ageMs: 10 * MS_PER_DAY, now });
+		const dir = makeArtifactDir(roots, "aa01", {
+			bytes: 800,
+			ageMs: 30 * MS_PER_DAY,
+			now,
+			withMemory: true,
+			imageBytes: 300,
+		});
+
+		const result = await artifactTotalCapModule.scanAndReclaim(
+			makeContext(roots, { sessionArtifactsMaxBytes: 100 }, { now }),
+		);
+
+		expect(result.reclaimed).toBe(1);
+		expect(result.bytes).toBe(800);
+		// The kernel namespace is the reclaimable payload; the session's own state is not.
+		expect(existsSync(join(dir, "kernel-state.dill"))).toBe(false);
+		expect(existsSync(dir)).toBe(true);
+		expect(existsSync(join(dir, "harness", "harness_state.json"))).toBe(true);
+		expect(existsSync(join(dir, "image-1.png"))).toBe(true);
+	});
+
+	it("reclaims the largest snapshots first until the counted bytes fit", async () => {
+		const { roots } = createSandbox();
+		const now = Date.now();
+		// Oldest-first would take the small one; byte pressure takes the payload that
+		// actually moves the total, costing the fewest sessions their kernel state.
+		const smallOldest = makeArtifactDir(roots, "aa01", { bytes: 400, ageMs: 30 * MS_PER_DAY, now });
+		const large = makeArtifactDir(roots, "aa02", { bytes: 800, ageMs: 20 * MS_PER_DAY, now });
+		const middle = makeArtifactDir(roots, "aa03", { bytes: 600, ageMs: 10 * MS_PER_DAY, now });
 
 		const result = await artifactTotalCapModule.scanAndReclaim(
 			makeContext(roots, { sessionArtifactsMaxBytes: 1000 }, { now }),
@@ -301,45 +348,93 @@ describe("artifact-total-cap", () => {
 
 		expect(result.reclaimed).toBe(1);
 		expect(result.bytes).toBe(800);
-		expect(existsSync(oldest)).toBe(false);
-		expect(existsSync(middle)).toBe(true);
-		expect(existsSync(newest)).toBe(true);
+		expect(existsSync(join(large, "kernel-state.dill"))).toBe(false);
+		expect(existsSync(join(smallOldest, "kernel-state.dill"))).toBe(true);
+		expect(existsSync(join(middle, "kernel-state.dill"))).toBe(true);
 	});
 
-	it("keeps a resident session and moves on to the next coldest", async () => {
+	it("does not count a protected session's bytes toward the ceiling", async () => {
 		const { roots } = createSandbox();
 		const now = Date.now();
 		const resident = makeArtifactDir(roots, "aa01", { bytes: 800, ageMs: 30 * MS_PER_DAY, now });
-		const next = makeArtifactDir(roots, "aa02", { bytes: 600, ageMs: 20 * MS_PER_DAY, now });
+		const cold = makeArtifactDir(roots, "aa02", { bytes: 600, ageMs: 20 * MS_PER_DAY, now });
 
 		const result = await artifactTotalCapModule.scanAndReclaim(
 			makeContext(roots, { sessionArtifactsMaxBytes: 1000 }, { now, residentSessionIds: new Set(["aa01"]) }),
 		);
 
+		// The resident session's 800 bytes are unreachable, so they cannot push the
+		// tree over the ceiling: counted bytes are 600, nothing is reclaimed, and the
+		// report stays silent instead of naming a protection that decided nothing.
+		expect(result.reclaimed).toBe(0);
+		expect(result.skipped).toEqual([]);
+		expect(existsSync(join(resident, "kernel-state.dill"))).toBe(true);
+		expect(existsSync(join(cold, "kernel-state.dill"))).toBe(true);
+	});
+
+	it("does not count harness memory or other irreplaceable payload bytes toward the ceiling", async () => {
+		const { roots } = createSandbox();
+		const now = Date.now();
+		const dir = makeArtifactDir(roots, "aa01", {
+			bytes: 600,
+			ageMs: 30 * MS_PER_DAY,
+			now,
+			withMemory: true,
+			imageBytes: 5000,
+		});
+
+		const result = await artifactTotalCapModule.scanAndReclaim(
+			makeContext(roots, { sessionArtifactsMaxBytes: 1000 }, { now }),
+		);
+
+		// The tree holds 5600+ bytes, but only the 600 snapshot bytes are this class's
+		// to reclaim: the ceiling never fires on bytes no sweep may take.
+		expect(result.reclaimed).toBe(0);
+		expect(existsSync(join(dir, "kernel-state.dill"))).toBe(true);
+		expect(existsSync(join(dir, "harness", "harness_state.json"))).toBe(true);
+	});
+
+	it("keeps a resident session's snapshot while reclaiming the largest eligible one", async () => {
+		const { roots } = createSandbox();
+		const now = Date.now();
+		const resident = makeArtifactDir(roots, "aa01", { bytes: 800, ageMs: 30 * MS_PER_DAY, now });
+		const next = makeArtifactDir(roots, "aa02", { bytes: 600, ageMs: 20 * MS_PER_DAY, now });
+		const last = makeArtifactDir(roots, "aa03", { bytes: 600, ageMs: 10 * MS_PER_DAY, now });
+
+		const result = await artifactTotalCapModule.scanAndReclaim(
+			makeContext(roots, { sessionArtifactsMaxBytes: 1000 }, { now, residentSessionIds: new Set(["aa01"]) }),
+		);
+
+		// Counted bytes are 1200 (the resident's 800 are excluded): one 600-byte
+		// payload brings them under the ceiling, and the tie goes to the first path.
 		expect(result.reclaimed).toBe(1);
-		expect(existsSync(resident)).toBe(true);
-		expect(existsSync(next)).toBe(false);
+		expect(existsSync(join(resident, "kernel-state.dill"))).toBe(true);
+		expect(existsSync(join(next, "kernel-state.dill"))).toBe(false);
+		expect(existsSync(join(last, "kernel-state.dill"))).toBe(true);
 		const kept = result.skipped.find((entry) => entry.path === resident);
 		expect(kept?.reason).toBe("in-use:resident");
 	});
 
-	it("keeps a directory holding scheduled cron jobs", async () => {
+	it("keeps the snapshot of a directory holding scheduled cron jobs", async () => {
 		const { roots } = createSandbox();
 		const now = Date.now();
 		const withJobs = makeArtifactDir(roots, "aa01", { bytes: 800, ageMs: 30 * MS_PER_DAY, now, scheduledJobs: true });
 		const plain = makeArtifactDir(roots, "aa02", { bytes: 600, ageMs: 20 * MS_PER_DAY, now });
 
 		const result = await artifactTotalCapModule.scanAndReclaim(
-			makeContext(roots, { sessionArtifactsMaxBytes: 1000 }, { now }),
+			makeContext(roots, { sessionArtifactsMaxBytes: 500 }, { now }),
 		);
 
-		expect(existsSync(withJobs)).toBe(true);
-		expect(existsSync(plain)).toBe(false);
+		expect(result.reclaimed).toBe(1);
+		expect(existsSync(join(withJobs, "kernel-state.dill"))).toBe(true);
+		expect(existsSync(join(withJobs, "scheduled-jobs.json"))).toBe(true);
+		expect(existsSync(join(plain, "kernel-state.dill"))).toBe(false);
+		expect(existsSync(plain)).toBe(true);
 		const kept = result.skipped.find((entry) => entry.path === withJobs);
 		expect(kept?.reason).toBe("reference:scheduled-jobs.json");
 	});
 
-	it("keeps a directory whose subtree holds another session's transcript", async () => {
+	it("reclaims the parent's snapshot without touching a nested live transcript", async () => {
 		const { roots } = createSandbox();
 		const now = Date.now();
 		const parent = makeArtifactDir(roots, "aa01", {
@@ -348,35 +443,76 @@ describe("artifact-total-cap", () => {
 			now,
 			childTranscriptId: "cc01",
 		});
-		const plain = makeArtifactDir(roots, "aa02", { bytes: 600, ageMs: 20 * MS_PER_DAY, now });
+
+		const result = await artifactTotalCapModule.scanAndReclaim(
+			makeContext(roots, { sessionArtifactsMaxBytes: 100 }, { now }),
+		);
+
+		// The transcript guard exists against recursive directory deletion; a
+		// file-level reclaim cannot reach `sub-*/`, so the payload goes and the
+		// transcript stays.
+		expect(result.reclaimed).toBe(1);
+		expect(existsSync(join(parent, "kernel-state.dill"))).toBe(false);
+		expect(existsSync(parent)).toBe(true);
+		expect(existsSync(join(parent, "sub-deadbeef", "cc01.jsonl"))).toBe(true);
+	});
+
+	it("counts a nested session-artifacts payload once, under its own eligibility", async () => {
+		const { roots } = createSandbox();
+		const now = Date.now();
+		const parent = makeArtifactDir(roots, "aa01", { bytes: 600, ageMs: 30 * MS_PER_DAY, now });
+		const nestedRoot = join(parent, "session-artifacts");
+		mkdirSync(nestedRoot, { recursive: true, mode: 0o700 });
+		const child = join(nestedRoot, "bb01");
+		mkdirSync(child, { recursive: true, mode: 0o700 });
+		writeFileSync(join(child, "kernel-state.dill"), Buffer.alloc(600, 2));
+		agePath(join(child, "kernel-state.dill"), 20 * MS_PER_DAY, now);
+		agePath(child, 20 * MS_PER_DAY, now);
+		agePath(nestedRoot, 20 * MS_PER_DAY, now);
+		// Re-age the parent last: creating the nested root touched its mtime.
+		agePath(parent, 30 * MS_PER_DAY, now);
 
 		const result = await artifactTotalCapModule.scanAndReclaim(
 			makeContext(roots, { sessionArtifactsMaxBytes: 1000 }, { now }),
 		);
 
-		expect(existsSync(parent)).toBe(true);
-		expect(existsSync(plain)).toBe(false);
-		const kept = result.skipped.find((entry) => entry.path === parent);
-		expect(kept?.reason).toBe("reference:descendant-transcript:cc01");
+		// Counted once each, the payloads total 1200; one 600-byte reclaim fits the
+		// ceiling. Double-counted (the parent's tree includes the child's bytes) the
+		// same tree reads 1800+ and the sweep takes both.
+		expect(result.scanned).toBe(2);
+		expect(result.reclaimed).toBe(1);
+		expect(result.bytes).toBe(600);
+		expect(existsSync(join(parent, "kernel-state.dill"))).toBe(false);
+		expect(existsSync(join(child, "kernel-state.dill"))).toBe(true);
 	});
 
-	it("keeps directories written within the age floor however cold the rest", async () => {
+	it("keeps snapshots written within the age floor and excludes them from the count", async () => {
 		const { roots } = createSandbox();
 		const now = Date.now();
 		const warm = makeArtifactDir(roots, "aa01", { bytes: 800, ageMs: 1 * MS_PER_DAY, now });
 		const cold = makeArtifactDir(roots, "aa02", { bytes: 600, ageMs: 40 * MS_PER_DAY, now });
 
+		const silent = await artifactTotalCapModule.scanAndReclaim(
+			makeContext(roots, { sessionArtifactsMaxBytes: 700, sessionArtifactsCapMinAgeDays: 7 }, { now }),
+		);
+		// The warm 800 bytes are floored, so only the cold 600 count: under the
+		// ceiling, nothing is reclaimed and nothing is reported.
+		expect(silent.reclaimed).toBe(0);
+		expect(silent.skipped).toEqual([]);
+		expect(existsSync(join(cold, "kernel-state.dill"))).toBe(true);
+
 		const result = await artifactTotalCapModule.scanAndReclaim(
 			makeContext(roots, { sessionArtifactsMaxBytes: 500, sessionArtifactsCapMinAgeDays: 7 }, { now }),
 		);
 
-		expect(existsSync(warm)).toBe(true);
-		expect(existsSync(cold)).toBe(false);
+		expect(result.reclaimed).toBe(1);
+		expect(existsSync(join(warm, "kernel-state.dill"))).toBe(true);
+		expect(existsSync(join(cold, "kernel-state.dill"))).toBe(false);
 		const kept = result.skipped.find((entry) => entry.path === warm);
 		expect(kept?.reason).toBe("young:artifact-cap-floor");
 	});
 
-	it("skips a directory too large for the per-sweep breaker and still reclaims the rest", async () => {
+	it("skips a snapshot too large for the per-sweep breaker and still reclaims the rest", async () => {
 		const { roots } = createSandbox();
 		const now = Date.now();
 		const huge = makeArtifactDir(roots, "aa01", { bytes: 2000, ageMs: 40 * MS_PER_DAY, now });
@@ -386,18 +522,18 @@ describe("artifact-total-cap", () => {
 			makeContext(roots, { sessionArtifactsMaxBytes: 1200, maxDeleteBytesPerSweep: 1000 }, { now }),
 		);
 
-		expect(existsSync(huge)).toBe(true);
-		expect(existsSync(small)).toBe(false);
-		const oversized = result.skipped.find((entry) => entry.path === huge);
+		expect(existsSync(join(huge, "kernel-state.dill"))).toBe(true);
+		expect(existsSync(join(small, "kernel-state.dill"))).toBe(false);
+		const oversized = result.skipped.find((entry) => entry.path === join(huge, "kernel-state.dill"));
 		expect(oversized?.reason).toBe("cap-hit");
 		expect(oversized?.detail).toContain("maxDeleteBytesPerSweep");
 	});
 
-	it("never spends per-sweep entries on zero-byte directories", async () => {
+	it("never spends per-sweep entries on directories without a snapshot payload", async () => {
 		const { roots } = createSandbox();
 		const now = Date.now();
-		// The empty directory is the oldest, so oldest-first ordering puts it ahead
-		// of the payload directory; with one entry of budget it must not be spent.
+		// The payload-less directory is the oldest, so any age-ordered pass meets it
+		// first; with one entry of budget it must not be spent.
 		const empty = join(roots.artifactRoot, "aa01");
 		mkdirSync(empty, { recursive: true, mode: 0o700 });
 		agePath(empty, 40 * MS_PER_DAY, now);
@@ -407,10 +543,10 @@ describe("artifact-total-cap", () => {
 			makeContext(roots, { sessionArtifactsMaxBytes: 100, maxDeleteEntriesPerSweep: 1 }, { now }),
 		);
 
-		// The single entry goes to the directory that actually holds bytes; the
-		// empty one is the empty-dirs class's to judge by age.
+		// The single entry goes to the session that actually holds reclaimable
+		// bytes; the empty one is the empty-dirs class's to judge by age.
 		expect(result.reclaimed).toBe(1);
-		expect(existsSync(payload)).toBe(false);
+		expect(existsSync(join(payload, "kernel-state.dill"))).toBe(false);
 		expect(existsSync(empty)).toBe(true);
 		expect(result.skipped.filter((entry) => entry.reason === "cap-hit")).toEqual([]);
 	});
@@ -418,7 +554,7 @@ describe("artifact-total-cap", () => {
 	it("reports the same reclaims in a dry run without deleting", async () => {
 		const { roots } = createSandbox();
 		const now = Date.now();
-		const oldest = makeArtifactDir(roots, "aa01", { bytes: 800, ageMs: 30 * MS_PER_DAY, now });
+		const largest = makeArtifactDir(roots, "aa01", { bytes: 800, ageMs: 30 * MS_PER_DAY, now });
 		makeArtifactDir(roots, "aa02", { bytes: 600, ageMs: 20 * MS_PER_DAY, now });
 
 		const result = await artifactTotalCapModule.scanAndReclaim(
@@ -426,7 +562,7 @@ describe("artifact-total-cap", () => {
 		);
 
 		expect(result.reclaimed).toBe(1);
-		expect(existsSync(oldest)).toBe(true);
+		expect(existsSync(join(largest, "kernel-state.dill"))).toBe(true);
 	});
 });
 

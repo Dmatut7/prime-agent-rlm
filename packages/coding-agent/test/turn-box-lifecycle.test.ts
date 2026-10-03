@@ -488,6 +488,25 @@ describe("reopening a session", () => {
 		expect(opened(windowed.boxes()[0]!, { all: true })).not.toContain("没列出");
 	});
 
+	it("a slim attach window starting inside a turn says earlier steps exist (their count is unknowable client-side)", async () => {
+		// The daemon held back the run's beginning (slim attach): the tail the client
+		// renders starts mid-turn, so the local cut detection sees no cut at all.
+		const tail = longTurn(250).slice(201);
+		expect(tail[0]?.role).toBe("assistant");
+		const windowed = createScreen();
+		(windowed.host as Record<string, unknown>).slimTranscriptOmitted = 201;
+		await mode.renderSessionContext.call(
+			windowed.host,
+			{ messages: tail, thinkingLevel: "medium", serviceTier: "default", model: null },
+			{ clearChat: true, limitTranscript: true },
+		);
+
+		expect(windowed.boxes()).toHaveLength(1);
+		const text = opened(windowed.boxes()[0]!, { all: true });
+		expect(text).toContain("更早的步骤没列出");
+		expect(text).not.toMatch(/更早的 \d+ 步没列出/);
+	});
+
 	it("shows a turn the owner stopped mid-command as stopped, as it looked live", async () => {
 		const screen = createScreen();
 		await mode.renderSessionContext.call(

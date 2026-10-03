@@ -1,0 +1,5 @@
+- Fixed Python error tracebacks losing the source line when the raising function was defined in an earlier cell: the kernel keeps the last 200 cells' sources instead of forgetting each cell at its end.
+- Fixed output written through a saved pre-fork `sys.stdout`/`sys.stderr` reference inside a forked child process being silently lost; it now reaches the session's output.
+- Fixed `mv`, `cp -p` copies, and archive extractions done by the session's own commands being labeled as another window's changes: attribution now also reads the inode change time, which those operations cannot preserve.
+- Fixed a command creating more than 200 new files having the overflow reported as "modified" instead of "created".
+- Fixed kernel restart/resume notices listing the host's own `_prime_agent_*` internals as names that "must be rebuilt"; those are re-bound automatically and are no longer mentioned.

@@ -206,9 +206,17 @@ export async function pruneRlmSubagents(
 	const roster = buildRlmSubagentList(host, await host._agentMessageController?.listAgents(), {
 		includeTerminal: true,
 	}).subagents;
+	// A run that reached a terminal status but has not settled yet is still doing
+	// its terminal bookkeeping (notice delivery, retention): pruning it here would
+	// sever that in-flight work and freeze `settled: false` into the closed record
+	// the prune leaves behind.
+	const unsettledRunFor = (entry: RlmSubagentRegistryEntry): RlmChildRun | undefined => {
+		const run = host._activeRlmChildRuns.get(entry.rlm_child_id);
+		return run !== undefined && !run.settled ? run : undefined;
+	};
 	let selected: RlmSubagentRegistryEntry[];
 	if (targets.length === 0) {
-		selected = roster.filter((entry) => entry.status !== "running");
+		selected = roster.filter((entry) => entry.status !== "running" && unsettledRunFor(entry) === undefined);
 	} else {
 		selected = [];
 		const selectedIds = new Set<string>();
@@ -228,6 +236,11 @@ export async function pruneRlmSubagents(
 			if (match.status === "running") {
 				throw new Error(
 					`RLM subagent "${target}" is still running; prune only retires completed or errored children`,
+				);
+			}
+			if (unsettledRunFor(match)) {
+				throw new Error(
+					`RLM subagent "${target}" has not settled yet; prune retires it once its terminal bookkeeping lands`,
 				);
 			}
 			if (!selectedIds.has(match.rlm_child_id)) {

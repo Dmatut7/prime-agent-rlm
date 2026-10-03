@@ -130,6 +130,7 @@ import { resolvePrimeAgentTracesBaseUrl } from "../../core/prime-inference-auth.
 import { resolvePrimeInferencePostLoginModelAction } from "../../core/prime-inference-model-selection.js";
 import { parseCommandArgs } from "../../core/prompt-templates.js";
 import { PROVIDER_FALLBACK_NOTICE_CUSTOM_TYPE } from "../../core/provider-fallback.js";
+import { providerRetryPolicy } from "../../core/provider-retry.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
 import { resolveSessionPath, SessionSelectorError, SessionSelectorNotFoundError } from "../../core/session-resolver.js";
@@ -635,7 +636,8 @@ function turnHasThinking(summary: TurnSummaryComponent): boolean {
 interface WindowCutTurn {
 	prompt?: AgentMessage;
 	startedAt?: number;
-	hiddenSteps: number;
+	/** Steps the window left out; undefined when the count is unknowable (a server-side window). */
+	hiddenSteps?: number;
 }
 
 /**
@@ -2040,6 +2042,26 @@ export class InteractiveMode {
 		this.hydratePromptStash();
 	}
 
+	/**
+	 * A fork (or clone) replaces the session with its own continuation: the stash
+	 * bound to the pre-fork session moves with it, or the draft is orphaned on a
+	 * session the view just left. The forked session's own stash, when it has one,
+	 * always wins. No-op when the session was never actually replaced.
+	 */
+	private carryPromptStashAcrossFork(priorSessionId: string | undefined, priorState: PromptStashState): void {
+		if (priorState === this.promptStashState) return;
+		if (this.promptStash !== undefined || (this.promptStashState.queuedStashes?.length ?? 0) > 0) return;
+		const stash = priorState.stash;
+		const queuedStashes = priorState.queuedStashes;
+		if (stash === undefined && (queuedStashes?.length ?? 0) === 0) return;
+		priorState.stash = undefined;
+		priorState.queuedStashes = undefined;
+		this.promptStashState.stash = stash;
+		this.promptStashState.queuedStashes = queuedStashes;
+		this.hydratePromptStash();
+		if (priorSessionId) this.promptStashStore?.release(priorSessionId, priorState);
+	}
+
 	private releasePromptStashSession(): void {
 		if (this.inputSubmissionsPending > 0) {
 			// Capture the pair: a rebind may repoint the fields before the deferred
@@ -3369,12 +3391,16 @@ export class InteractiveMode {
 					}
 				},
 				fork: async (entryId, options) => {
+					// Same stash carry as /fork: a fork replaces the session with its own continuation.
+					const stashSessionBeforeFork = this.promptStashSessionId;
+					const stashStateBeforeFork = this.promptStashState;
 					try {
 						const result = options?.withSession
 							? await localSessionHost.fork(entryId, options)
 							: await this.agentConnection.fork(entryId, { position: options?.position });
 						if (!result.cancelled) {
 							await this.renderCurrentSessionState();
+							this.carryPromptStashAcrossFork(stashSessionBeforeFork, stashStateBeforeFork);
 							this.editor.setText("selectedText" in result ? (result.selectedText ?? "") : "");
 							this.showStatus("已分叉到新会话");
 						}
@@ -3938,6 +3964,10 @@ export class InteractiveMode {
 		// session's first interrupt key.
 		this.clearCtrlCExitHint({ render: false });
 		this.clearEscapeRepeat();
+		// The stop-all confirmation armed against this session's children: on the
+		// next session it would confirm stale child ids and swallow that session's
+		// first stop-all press.
+		this.stopAllSubagentsArmed = undefined;
 		this.pendingBashComponents = [];
 		this.activityTracker.reset();
 		this.contextUsageTokenBaseline = 0;
@@ -4370,6 +4400,15 @@ export class InteractiveMode {
 			} else if (message.role === "assistant" && message.stopReason !== "toolUse") {
 				break;
 			}
+		}
+		// A windowed view (slim attach, live-cap rebuild) can start inside the running
+		// turn: the scan then walks off the window's front without meeting the run's
+		// start. Anchor the clock at the oldest visible message instead of leaving the
+		// loader to count from the attach moment - an understatement bounded by the
+		// window, instead of one bounded by nothing.
+		if (this.turnStartedAt === undefined) {
+			const oldest = messages[0] ? Number(messages[0].timestamp) : Number.NaN;
+			if (Number.isFinite(oldest) && oldest > 0) this.turnStartedAt = oldest;
 		}
 		if (this.turnStartedAt !== undefined && this.workingStartedAt !== undefined) {
 			this.workingStartedAt = this.turnStartedAt;
@@ -5488,7 +5527,9 @@ export class InteractiveMode {
 	 * Esc clearing an idle draft stashes it first: the clear stays one press, but the
 	 * draft survives in the same stash Ctrl+S restores from. The just-cleared draft takes
 	 * the head slot so the next restore brings it back; an earlier manual stash queues
-	 * behind it unchanged.
+	 * behind it unchanged. Unlike a manual stash it is `escCleared`: the post-submit
+	 * restore skips it, so a draft the user cleared never pops back into the editor
+	 * after an unrelated send - only an explicit Ctrl+S brings it back.
 	 */
 	private stashDraftBeforeEscapeClear(): void {
 		const text = this.editor.getText();
@@ -5496,7 +5537,7 @@ export class InteractiveMode {
 		const existing = [this.promptStashState.stash, ...(this.promptStashState.queuedStashes ?? [])].filter(
 			(stash): stash is PromptStash => stash !== undefined,
 		);
-		this.promptStashState.stash = this.snapshotPromptStash(text);
+		this.promptStashState.stash = { ...this.snapshotPromptStash(text), escCleared: true };
 		this.promptStashState.queuedStashes = existing.length > 0 ? existing : undefined;
 		this.showToast("✓ stashed");
 	}
@@ -6468,6 +6509,10 @@ export class InteractiveMode {
 					submissionOutcome === "admitted" &&
 					restorePromptStashAfterSubmit &&
 					promptStashToRestore !== undefined &&
+					// An Esc-cleared draft is a draft the user dismissed: it waits for an
+					// explicit Ctrl+S instead of popping back after this send, where a fast
+					// follow-up Enter would submit it.
+					!promptStashToRestore.escCleared &&
 					submissionGeneration === this.inputSubmissionGeneration
 				) {
 					this.restorePromptStashIfEditorEmpty(promptStashToRestore);
@@ -7637,10 +7682,14 @@ export class InteractiveMode {
 		const name = child.sessionName ?? child.label;
 		const replaced = this.takeReplacedSubagent(name);
 		const brief = this.formatSubagentStatusDetail(child.label, name);
+		// Appended, not slot-reused: a fan-out dispatches several children in a row,
+		// and each spawn line must survive the next.
 		this.showStatus(
 			replaced !== undefined
 				? `重派子代理 ${name}（接替刚退出的 ${replaced}）${brief}`
 				: `派出子代理 ${name}${brief}`,
+			"dim",
+			{ append: true },
 		);
 	}
 
@@ -7662,13 +7711,15 @@ export class InteractiveMode {
 		const userStopped = !orchestratorDeleted && (error ?? "").startsWith("Cancelled by user");
 		if (userStopped && (this.locallyCancelledSubagentIds?.delete(child.id) ?? false)) return;
 		this.rememberRemovedSubagent(name);
+		// Appended like the spawn lines: several children can leave in one sweep, and
+		// each removal line must survive the next.
 		if (orchestratorDeleted) {
-			this.showStatus(`子代理 ${name} 已收编：父代理删掉了它（记录保留）`);
+			this.showStatus(`子代理 ${name} 已收编：父代理删掉了它（记录保留）`, "dim", { append: true });
 		} else if (userStopped) {
-			this.showStatus(`子代理 ${name} 已被停止（记录保留）`);
+			this.showStatus(`子代理 ${name} 已被停止（记录保留）`, "dim", { append: true });
 		} else {
 			const detail = this.formatSubagentStatusDetail(error, undefined);
-			this.showStatus(`子代理 ${name} 已关闭${detail}（记录保留）`);
+			this.showStatus(`子代理 ${name} 已关闭${detail}（记录保留）`, "dim", { append: true });
 		}
 	}
 
@@ -8659,12 +8710,21 @@ export class InteractiveMode {
 	 * If multiple status messages are emitted back-to-back (without anything else being added to the chat),
 	 * we update the previous status line instead of appending new ones to avoid log spam.
 	 */
-	private showStatus(message: string, tone: "dim" | "warning" = "dim"): void {
+	private showStatus(message: string, tone: "dim" | "warning" = "dim", options?: { append?: boolean }): void {
 		const children = this.chatContainer.children;
 		const last = children.length > 0 ? children[children.length - 1] : undefined;
 		const secondLast = children.length > 1 ? children[children.length - 2] : undefined;
 
-		if (last && secondLast && last === this.lastStatusText && secondLast === this.lastStatusSpacer) {
+		// Lifecycle announcements (a subagent dispatched, a child folded back) are
+		// events, not states: each gets its own line, never overwriting the previous
+		// one. Transient status updates keep reusing the slot.
+		if (
+			options?.append !== true &&
+			last &&
+			secondLast &&
+			last === this.lastStatusText &&
+			secondLast === this.lastStatusSpacer
+		) {
 			this.lastStatusText.setText(theme.fg(tone, message));
 			this.ui.requestRender();
 			return;
@@ -8982,6 +9042,23 @@ export class InteractiveMode {
 			windowed.length < transcriptMessages.length && this.settingsManager.getProcessMode() === "quiet"
 				? windowCutTurn(transcriptMessages, windowed)
 				: undefined;
+		// A slim attach (or resync) windows server-side: transcriptMessages IS the
+		// tail, so the local cut detection above cannot see the cut. When the tail
+		// opens mid-turn (its first message is a reply or a tool result), the turn it
+		// ends in started before the window: anchor its clock at the oldest visible
+		// message and say that earlier steps exist - their count is unknowable
+		// client-side.
+		if (
+			cutTurn === undefined &&
+			this.slimTranscriptOmitted > 0 &&
+			this.settingsManager.getProcessMode() === "quiet"
+		) {
+			const first = windowed[0];
+			if (first && (first.role === "assistant" || first.role === "toolResult")) {
+				const at = Number(first.timestamp);
+				cutTurn = { ...(Number.isFinite(at) && at > 0 ? { startedAt: at } : {}), hiddenSteps: undefined };
+			}
+		}
 		const messagesToRender = cutTurn?.prompt ? [cutTurn.prompt, ...windowed] : windowed;
 		// A failure notice older than the render window was still received by this session.
 		for (const message of transcriptMessages) {
@@ -8994,7 +9071,13 @@ export class InteractiveMode {
 		// rendered message: the window's tail shares object identity with the
 		// transcript, while the pairing copies initialRenderMessages synthesizes
 		// ahead of it do not.
-		const canPageTranscript = typeof this.agentConnection?.getMessagesWindow === "function";
+		const canPageTranscript =
+			typeof this.agentConnection?.getMessagesWindow === "function" &&
+			// The daemon adapter has the method either way; an unrestarted daemon
+			// rejects the windowed read, so the marker's "load earlier" would click
+			// straight into an error. Absent supportsMessagesWindow reads as capable
+			// (test doubles and adapters that always page).
+			(this.agentConnection.supportsMessagesWindow?.() ?? true);
 		if (this.chatTranscriptTrimmed && options.limitTranscript && canPageTranscript) {
 			let visibleCount = 0;
 			while (
@@ -9157,7 +9240,10 @@ export class InteractiveMode {
 					// real start, and a row saying how many of its steps it left out.
 					if (!cutTurn) return;
 					if (cutTurn.startedAt !== undefined) state.startedEarlier(cutTurn.startedAt);
-					if (cutTurn.hiddenSteps > 0) {
+					if (cutTurn.hiddenSteps === undefined) {
+						// A server-side window (slim attach): the cut is known, its size is not.
+						state.timeline.addNotice({ tone: "muted", text: "… 更早的步骤没列出" }, cutTurn.startedAt ?? 0);
+					} else if (cutTurn.hiddenSteps > 0) {
 						state.timeline.earlierSteps = cutTurn.hiddenSteps;
 						state.timeline.addNotice(
 							{ tone: "muted", text: `… 更早的 ${cutTurn.hiddenSteps} 步没列出` },
@@ -9256,6 +9342,7 @@ export class InteractiveMode {
 			limitTranscript: true,
 		});
 		await this.restoreStreamingMessageFromSnapshot(streamingMessage);
+		this.scheduleEditorHistoryBackfill();
 
 		// Show compaction info if session was compacted
 		const compactionCount = state.compactionCount;
@@ -9455,6 +9542,45 @@ export class InteractiveMode {
 	}
 
 	/**
+	 * Slim attach populates the editor history from the tail window only, so
+	 * arrow-up reaches no question older than the window. Page the omitted prefix
+	 * in (the same get_messages windowing the marker uses) and put its questions
+	 * behind what the tail contributed. Fire-and-forget after the initial render;
+	 * a rebuild or session swap mid-read drops the result through the view epoch,
+	 * and a failed read keeps the tail-only history.
+	 */
+	private scheduleEditorHistoryBackfill(): void {
+		const omitted = this.slimTranscriptOmitted;
+		if (omitted <= 0) return;
+		const getMessagesWindow = this.agentConnection.getMessagesWindow?.bind(this.agentConnection);
+		if (!getMessagesWindow) return;
+		const epoch = this.slimTranscriptViewEpoch;
+		void (async () => {
+			const older: string[] = [];
+			let before = omitted;
+			while (before > 0) {
+				const page = await getMessagesWindow({ before, limit: SLIM_TRANSCRIPT_PAGE_SIZE });
+				if (epoch !== this.slimTranscriptViewEpoch) return;
+				const texts: string[] = [];
+				for (const message of page.messages) {
+					if (message.role !== "user") continue;
+					const text = this.getUserMessageText(message);
+					if (text && !this.createLegacyHeartbeatPromptMessage(message, text)) texts.push(text);
+				}
+				older.unshift(...texts);
+				if (page.firstIndex >= before) break; // a peer that cannot page reports no progress
+				before = page.firstIndex;
+			}
+			if (older.length === 0 || epoch !== this.slimTranscriptViewEpoch) return;
+			// History is most-recent-first and the paged questions are all older than
+			// anything already there, so rebuild it oldest-first through addToHistory.
+			const current = [...(this.editor.getHistory?.() ?? [])].reverse();
+			this.editor.clearHistory?.();
+			for (const text of [...older, ...current]) this.editor.addToHistory?.(text);
+		})().catch(() => {});
+	}
+
+	/**
 	 * The slim-attach marker's load-earlier trigger (rev 44): page the previous
 	 * SLIM_TRANSCRIPT_PAGE_SIZE messages in through get_messages before/limit and
 	 * prepend them between the marker and the attach tail. Only the prepended
@@ -9523,9 +9649,12 @@ export class InteractiveMode {
 			}
 			const markerIndex = this.chatContainer.children.indexOf(marker);
 			if (markerIndex === -1) return;
-			// Prepending shifts the transcript down by the page's height; keep the
-			// scrolled-to row where it was (a following view is unaffected: scrollBy
-			// clamps to the bottom there).
+			// Prepending shifts the transcript down by the page's height. The
+			// viewport learns of the prepend and applies the offset on the next
+			// composed frame, where maxScroll already carries the page: the paused
+			// window keeps its rows (a following view is unaffected) and the page
+			// never counts as new content below. A scrollBy here would clamp
+			// against the stale maxScroll and snap a near-bottom view to the end.
 			const pageHeight = pageContainer.render(this.ui.terminal.columns).length;
 			this.chatContainer.children.splice(markerIndex + 1, 0, ...pageContainer.children);
 			this.slimTranscriptOmitted = page.firstIndex;
@@ -9536,7 +9665,7 @@ export class InteractiveMode {
 			} else {
 				marker.invalidate();
 			}
-			this.ui.scrollBy(pageHeight);
+			this.ui.noteTranscriptPrepend(pageHeight);
 			this.ui.requestRender();
 		} catch (error) {
 			if (epoch !== this.slimTranscriptViewEpoch) return;
@@ -11225,6 +11354,19 @@ export class InteractiveMode {
 			openWhileWorking: () => settings()?.getTimelineOpenWhileWorking?.() ?? true,
 			autoFold: () => settings()?.getTimelineAutoFold?.() ?? true,
 			hideThinking: () => this.hideThinkingBlock === true,
+			// The mode's long-lived settings manager answers from memory; the row
+			// builder's own fallback would re-read the settings files on every frame of
+			// a live box that replays a retry.
+			retryPolicy: () => {
+				const manager = settings();
+				if (!manager) return undefined;
+				const retry = providerRetryPolicy(manager);
+				return {
+					maxRetries: retry.maxRetries,
+					maxRetryDelayMs: retry.maxRetryDelayMs,
+					waitForRecovery: manager.getProviderWaitSettings().enabled,
+				};
+			},
 			requestRender: () => this.ui?.requestRender(),
 		};
 	}
@@ -12630,6 +12772,10 @@ export class InteractiveMode {
 	}
 
 	private async showUserMessageSelector(): Promise<void> {
+		// A successful fork rebinds the stash to the forked session; capture the pair
+		// now so the draft the user had stashed crosses over instead of being orphaned.
+		const stashSessionBeforeFork = this.promptStashSessionId;
+		const stashStateBeforeFork = this.promptStashState;
 		let userMessages: Array<{ entryId: string; text: string }>;
 		try {
 			userMessages = await this.agentConnection.getUserMessagesForForking();
@@ -12658,6 +12804,7 @@ export class InteractiveMode {
 						}
 
 						await this.renderCurrentSessionState();
+						this.carryPromptStashAcrossFork(stashSessionBeforeFork, stashStateBeforeFork);
 						this.editor.setText(result.selectedText ?? "");
 						done();
 						this.showStatus("已分叉到新会话");
@@ -12677,6 +12824,9 @@ export class InteractiveMode {
 	}
 
 	private async handleCloneCommand(): Promise<void> {
+		// Same stash carry as /fork: a clone replaces the session with its copy.
+		const stashSessionBeforeClone = this.promptStashSessionId;
+		const stashStateBeforeClone = this.promptStashState;
 		try {
 			const { leafId } = await this.agentConnection.getSessionTree();
 			if (!leafId) {
@@ -12691,6 +12841,7 @@ export class InteractiveMode {
 			}
 
 			await this.renderCurrentSessionState();
+			this.carryPromptStashAcrossFork(stashSessionBeforeClone, stashStateBeforeClone);
 			this.editor.setText("");
 			this.showStatus("已复制到新会话");
 		} catch (error: unknown) {

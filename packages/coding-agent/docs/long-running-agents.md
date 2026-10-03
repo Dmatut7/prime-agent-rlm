@@ -205,7 +205,7 @@ state = await goal.get()
 await goal.complete()
 ```
 
-Goal state records token usage, elapsed time, continuation count, and an optional explicit token budget. The harness keeps prompting an active goal after ordinary assistant turns; only `goal.complete()` marks successful completion. Creating a persistent goal is an explicit user or host action, not something the agent should infer from every task.
+Goal state records token usage, elapsed time, continuation count, and an optional explicit token budget. The harness keeps prompting an active goal after ordinary assistant turns; only `goal.complete()` marks successful completion. Creating a persistent goal is an explicit user or host action, not something the agent should infer from every task. A persistent goal started without an explicit budget still runs under a visible default token budget, and its automatic continuations are spaced by a minimum interval, so a forgotten keep-going goal cannot spin unbounded; resume it with `/goal resume` to keep going past the budget.
 
 ## Autonomous Mode
 

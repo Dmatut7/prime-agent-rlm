@@ -1,0 +1,9 @@
+- Fixed a deadlock where a turn that overflowed the context window while a provider retry was in flight never resumed: the retry chain is now closed before the compaction continuation is scheduled, and the continuation no longer trips over the retained failed attempts.
+- Fixed the model-change notice landing between a tool call and its result when the model switches mid-run (setModel/cycling, backup/fallback switches and restores): the notice is deferred to the end of the current tool batch, and a no-op re-selection no longer writes one.
+- Fixed a restarted session missing the model-change notice for the first switch after a compaction: the rebuild now compares against the last model recorded before the compaction point.
+- Fixed the user-configured backup model being retried with a context that cannot fit its window: the backup is skipped unless the current context (estimated when usage is unknown) fits.
+- Fixed a model-requested compaction (compact.run) retrying forever when summarization keeps failing: attempts are spaced by the branch-growth cooldown and the request is dropped with a visible outcome after three failures.
+- Fixed compaction failing the whole task on a transient provider error during summarization: the summary call now retries transient failures with the shared provider retry policy.
+- Fixed the finish-gate "completion unverified" reminder disappearing when switching away from a session and back: the notice is now part of the session's message list (still never shown to the model).
+- Fixed a rejected session model moving the session and the saved default onto the cheap image-routing model: the configured image model is skipped when reconciling a provider rejection.
+- Fixed persistent goals without a token budget running unbounded and unthrottled: they now carry a visible default budget (10M tokens) and their automatic continuations are spaced by a minimum interval (30s).

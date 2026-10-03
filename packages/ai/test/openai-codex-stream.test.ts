@@ -601,21 +601,23 @@ describe("openai-codex streaming", () => {
 		expect(result.usage.cost.total).toBe(3 * multiplier);
 	});
 
-	// Regression: the response's service_tier is the tier actually served. A request
-	// that exceeds the priority ramp is served at Standard and the response echoes
-	// "default"; billing the requested tier would over-charge 2x/2.5x.
+	// Regression (upstream badlogic/pi-mono#3188, fixed by #3307): the Codex
+	// endpoint does not echo the served tier - it reports service_tier "default"
+	// even when the request asked for flex/priority and was served at that tier.
+	// Trusting the echo bills every flex/priority turn at the standard rate, so
+	// the Codex resolver trusts the requested tier when the response says default.
 	it.each([
-		["gpt-5.1-codex", "flex"],
-		["gpt-5.1-codex", "priority"],
-		["gpt-5.5", "priority"],
+		["gpt-5.1-codex", "flex", 0.5],
+		["gpt-5.1-codex", "priority", 2],
+		["gpt-5.5", "priority", 2.5],
 	] as const)(
-		"does not bill the requested %s service tier for %s when Codex echoes default",
-		async (modelId, serviceTier) => {
+		"bills the requested %s service tier for %s when Codex echoes default",
+		async (modelId, serviceTier, multiplier) => {
 			const result = await runServiceTierRequest(modelId, serviceTier, "default");
 
-			expect(result.usage.cost.input).toBe(1);
-			expect(result.usage.cost.output).toBe(2);
-			expect(result.usage.cost.total).toBe(3);
+			expect(result.usage.cost.input).toBe(1 * multiplier);
+			expect(result.usage.cost.output).toBe(2 * multiplier);
+			expect(result.usage.cost.total).toBe(3 * multiplier);
 		},
 	);
 
@@ -1199,5 +1201,83 @@ describe("openai-codex streaming", () => {
 		expect(sentBodies).toHaveLength(3);
 		const retryBody = sentBodies[2] as { previous_response_id?: string };
 		expect(retryBody.previous_response_id).toBeUndefined();
+	});
+
+	it("does not disable the session's WebSocket after a content-filter stop", async () => {
+		const token = mockToken();
+		const sessionId = "session-content-filter";
+		const sentBodies = installScriptedCodexWebSocket([
+			(socket) => socket.emit(codexResponseEvents({ responseId: "resp_1", messageId: "msg_1", text: "Hello" })),
+			(socket) =>
+				socket.emit([
+					{ type: "response.created", response: { id: "resp_2" } },
+					{
+						type: "response.incomplete",
+						response: {
+							id: "resp_2",
+							status: "incomplete",
+							incomplete_details: { reason: "content_filter" },
+							usage: {
+								input_tokens: 5,
+								output_tokens: 1,
+								total_tokens: 6,
+								input_tokens_details: { cached_tokens: 0 },
+							},
+						},
+					},
+				]),
+			(socket) => socket.emit(codexResponseEvents({ responseId: "resp_3", messageId: "msg_3", text: "Recovered" })),
+		]);
+
+		const model = codexTestModel();
+		const firstContext: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: 1 }],
+		};
+		const first = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: token,
+			sessionId,
+			transport: "websocket-cached",
+		}).result();
+
+		const second = await streamOpenAICodexResponses(
+			model,
+			{
+				systemPrompt: firstContext.systemPrompt,
+				messages: [...firstContext.messages, first, { role: "user", content: "Try again", timestamp: 2 }],
+			},
+			{
+				apiKey: token,
+				sessionId,
+				transport: "websocket-cached",
+			},
+		).result();
+
+		// The content filter is a model-level outcome delivered over a healthy
+		// connection: it surfaces as an error but must not count as a transport
+		// failure that disables the session's WebSocket.
+		expect(second.stopReason).toBe("error");
+		expect(second.errorMessage).toContain("content_filter");
+		const statsAfterBlock = getOpenAICodexWebSocketDebugStats(sessionId);
+		expect(statsAfterBlock?.websocketFailures).toBe(0);
+		expect(statsAfterBlock?.websocketFallbackActive).toBeFalsy();
+
+		const third = await streamOpenAICodexResponses(
+			model,
+			{
+				systemPrompt: firstContext.systemPrompt,
+				messages: [...firstContext.messages, { role: "user", content: "Once more", timestamp: 3 }],
+			},
+			{
+				apiKey: token,
+				sessionId,
+				transport: "websocket-cached",
+			},
+		).result();
+
+		expect(third.stopReason).toBe("stop");
+		// The third turn still ran over the WebSocket: no SSE fallback request fired.
+		expect(sentBodies).toHaveLength(3);
+		expect(global.fetch).not.toHaveBeenCalled();
 	});
 });
