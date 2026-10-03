@@ -99,6 +99,10 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
   PRIME_AGENT_CODING_AGENT_DIR + --daemon-socket 双重隔离（PRIME_AGENT_HOME 不存在；socket 不随 HOME 隔离）。
 - Python 套件用 prime-agent-runtime/.venv/bin/python -m unittest discover -s test；uv run 会捡错解释器。
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
+- 收工重启铁律（wave-35 三犯后的机械化）：`prime-agent shutdown` 之前必须在**同一命令链里**先
+  `prime-agent list` 且仅当输出是 "No active agents" 才继续：`prime-agent list | grep -q "No active agents" || exit 1`。
+  不许「看一眼列表再手动决定」——wave-35 就是列表已经显示 rv-l1 working 还被链子带着走了 shutdown，
+  把在跑会话归档。犯了就是事故，写进 FORK_NOTES 向老板披露。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
 ## 下一波主题（wave-36 候选）
