@@ -264,6 +264,7 @@ import {
 	DAEMON_WORKER_ROSTER_CAPABILITY,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_TOKEN_ENV,
+	DAEMON_WORKER_WARM_SPARE_ENV,
 	type DaemonWorkerCommand,
 	type DaemonWorkerFrameHeader,
 	type DaemonWorkerPeerGrant,
@@ -404,6 +405,24 @@ const DEFAULT_WORKER_SUPERVISOR_LOST_EXIT_MS = 5 * 60_000;
 function workerSupervisorLostExitMs(): number {
 	const raw = Number(process.env[WORKER_SUPERVISOR_LOST_EXIT_MS_ENV]);
 	return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_WORKER_SUPERVISOR_LOST_EXIT_MS;
+}
+
+// Warm-pool spares (DAEMON_WORKER_WARM_SPARE_ENV) own no sessions until claimed,
+// so they get a short orphan exit (the 5min window exists to ride out supervisor
+// successions for sessions worth recovering) and an absolute unclaimed lifetime.
+const WARM_SPARE_ORPHAN_EXIT_MS_ENV = "PRIME_AGENT_INTERNAL_WARM_SPARE_ORPHAN_EXIT_MS";
+const DEFAULT_WARM_SPARE_ORPHAN_EXIT_MS = 10_000;
+const WARM_SPARE_UNCLAIMED_EXIT_MS_ENV = "PRIME_AGENT_INTERNAL_WARM_SPARE_UNCLAIMED_EXIT_MS";
+const DEFAULT_WARM_SPARE_UNCLAIMED_EXIT_MS = 15 * 60_000;
+
+function warmSpareOrphanExitMs(): number {
+	const raw = Number(process.env[WARM_SPARE_ORPHAN_EXIT_MS_ENV]);
+	return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_WARM_SPARE_ORPHAN_EXIT_MS;
+}
+
+function warmSpareUnclaimedExitMs(): number {
+	const raw = Number(process.env[WARM_SPARE_UNCLAIMED_EXIT_MS_ENV]);
+	return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_WARM_SPARE_UNCLAIMED_EXIT_MS;
 }
 
 /**
@@ -850,6 +869,11 @@ export class AgentDaemon {
 	private agentDirectoryFailureLoggedAt = 0;
 	private readonly pendingSessionNames = new Set<string>();
 	private restoreActiveSessionId: string | undefined;
+	/** True once a supervisor authenticated to this worker; a claimed warm spare is a normal worker. */
+	private supervisorEverClaimed = false;
+	/** Spawn-time marker: this process booted as a warm-pool spare (see DAEMON_WORKER_WARM_SPARE_ENV). */
+	private readonly warmSpare: boolean;
+	private warmSpareUnclaimedTimer?: ReturnType<typeof setTimeout>;
 	private supervisorMonitorTimer?: ReturnType<typeof setTimeout>;
 	/**
 	 * Settles when the armed supervisor availability check has run to completion
@@ -929,6 +953,7 @@ export class AgentDaemon {
 			? AgentCronJobStore.forSessionArtifacts()
 			: new AgentCronJobStore(getCronJobsPath(this.agentDir));
 		this.restoreActiveSessionId = options.worker?.restoreActiveSessionId;
+		this.warmSpare = options.worker !== undefined && process.env[DAEMON_WORKER_WARM_SPARE_ENV] !== undefined;
 		const recoveryJournalPath = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 		if (options.worker && recoveryJournalPath) {
 			this.recoveryJournalPath = recoveryJournalPath;
@@ -1148,6 +1173,20 @@ export class AgentDaemon {
 		}, QUOTA_PARK_STATUS_INTERVAL_MS);
 		this.quotaParkStatusTimer.unref();
 		this.startSupervisorMonitor();
+		if (this.warmSpare) {
+			// The supervisor that spawned this spare disposes it at the pool TTL; this
+			// timer is the backstop for a daemon that died (or lost track) first. A
+			// claim makes it a no-op: the check reads the live claim state at fire time.
+			this.warmSpareUnclaimedTimer = setTimeout(() => {
+				this.warmSpareUnclaimedTimer = undefined;
+				if (this.shuttingDown || this.supervisorEverClaimed) {
+					return;
+				}
+				this.log("warm spare was never claimed; exiting");
+				void this.shutdown(0).catch(() => process.exit(0));
+			}, warmSpareUnclaimedExitMs());
+			this.warmSpareUnclaimedTimer.unref();
+		}
 	}
 
 	private supervisorSocketPathFromEnv(): string | undefined {
@@ -1225,6 +1264,9 @@ export class AgentDaemon {
 						this.log(`supervisor probe failed (attempt ${attempt}/${attempts}) on ${socketPath}`),
 				}),
 			launchReplacement: (socketPath) => this.launchReplacementSupervisor(socketPath),
+			// An unclaimed warm spare owns no sessions: resurrection exists to recover
+			// sessions, so the spare never offers a replacement and exits instead.
+			mayLaunchReplacement: () => !this.warmSpare || this.supervisorEverClaimed,
 			isConnected: () => this.hasAuthenticatedSupervisorConnection(),
 			isShuttingDown: () => this.shuttingDown,
 			isShutdownAdmissionActive: () => isDaemonShutdownAdmissionActive(),
@@ -1233,7 +1275,10 @@ export class AgentDaemon {
 			connectAfterLaunch: (socketPath) => this.canConnectToSupervisor(socketPath),
 			isOrphanedLongEnough: () => {
 				const absentSince = this.supervisorAvailabilityState.supervisorAbsentSince;
-				return absentSince !== undefined && Date.now() - absentSince >= workerSupervisorLostExitMs();
+				if (absentSince === undefined) return false;
+				const windowMs =
+					this.warmSpare && !this.supervisorEverClaimed ? warmSpareOrphanExitMs() : workerSupervisorLostExitMs();
+				return Date.now() - absentSince >= windowMs;
 			},
 			onOrphaned: () => this.exitOrphanedSupervisorWorker(supervisorSocketPath),
 		});
@@ -4415,6 +4460,7 @@ export class AgentDaemon {
 				}
 				client.authenticated = true;
 				client.authenticationRole = "supervisor";
+				this.supervisorEverClaimed = true;
 				this.supervisorClaims.set(client, { claim, ownerFingerprint });
 				this.clearSupervisorAvailabilityCheck();
 				this.scheduleSupervisorFenceCheck();
@@ -9887,6 +9933,10 @@ export class AgentDaemon {
 		this.peerGrants.clear();
 		this.supervisorLinkInstance?.close();
 		this.cancelArmedSupervisorAvailabilityCheck();
+		if (this.warmSpareUnclaimedTimer) {
+			clearTimeout(this.warmSpareUnclaimedTimer);
+			this.warmSpareUnclaimedTimer = undefined;
+		}
 		if (this.supervisorFenceTimer) {
 			clearTimeout(this.supervisorFenceTimer);
 			this.supervisorFenceTimer = undefined;

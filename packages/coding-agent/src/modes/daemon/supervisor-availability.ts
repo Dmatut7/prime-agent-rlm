@@ -130,6 +130,13 @@ export interface SupervisorAvailabilityDeps {
 	 * window check and the exit restarts the window instead.
 	 */
 	onOrphaned(): Promise<void>;
+	/**
+	 * Warm-pool gate: a worker that has never been claimed owns no sessions, so it
+	 * must not offer a replacement supervisor (resurrection exists to recover
+	 * sessions). Return false to skip the launch; the orphan exit below still runs.
+	 * Absent means "may launch", the historical behavior.
+	 */
+	mayLaunchReplacement?(): boolean;
 }
 
 /** Rounds that failed in a row; the worker owns it across checks so the backoff can grow. */
@@ -212,20 +219,24 @@ export async function checkSupervisorAvailability(
 			nextDelayMs: supervisorRecheckDelayMs(state.consecutiveFailures),
 		};
 	}
-	await deps.launchReplacement(socketPath);
-	if (await deps.connectAfterLaunch(socketPath)) {
-		// A replacement came up during the launch: the orphan window must restart
-		// instead of exiting the worker. The monitor must stay armed, though — a
-		// replacement can bind and then exit before it ever claims the worker, and
-		// only an authenticated claim (or its later close) re-arms the monitor.
-		// Falling through reschedules the next round below.
-		state.supervisorAbsentSince = undefined;
+	let launchedReplacement = false;
+	if (deps.mayLaunchReplacement?.() !== false) {
+		await deps.launchReplacement(socketPath);
+		launchedReplacement = true;
+		if (await deps.connectAfterLaunch(socketPath)) {
+			// A replacement came up during the launch: the orphan window must restart
+			// instead of exiting the worker. The monitor must stay armed, though — a
+			// replacement can bind and then exit before it ever claims the worker, and
+			// only an authenticated claim (or its later close) re-arms the monitor.
+			// Falling through reschedules the next round below.
+			state.supervisorAbsentSince = undefined;
+		}
 	}
 	if (deps.isOrphanedLongEnough()) {
 		await deps.onOrphaned();
 	}
 	if (deps.isShuttingDown() || deps.isConnected()) {
-		return { probe, launchedReplacement: true };
+		return { probe, launchedReplacement };
 	}
-	return { probe, launchedReplacement: true, nextDelayMs: supervisorRecheckDelayMs(state.consecutiveFailures) };
+	return { probe, launchedReplacement, nextDelayMs: supervisorRecheckDelayMs(state.consecutiveFailures) };
 }

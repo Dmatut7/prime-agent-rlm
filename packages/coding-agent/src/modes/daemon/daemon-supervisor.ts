@@ -7,11 +7,13 @@ import {
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	renameSync,
 	rmSync,
 	statSync,
 } from "node:fs";
-import { createServer, type Server, type Socket } from "node:net";
+import { connect, createServer, type Server, type Socket } from "node:net";
+import { freemem } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -205,6 +207,7 @@ import {
 	DAEMON_WORKER_STARTUP_GATE_FD_ENV,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_TOKEN_ENV,
+	DAEMON_WORKER_WARM_SPARE_ENV,
 	type DaemonCreateCommand,
 	type DaemonWorkerCommandBody,
 	type DaemonWorkerDescriptor,
@@ -246,6 +249,122 @@ const WORKER_CONNECT_TIMEOUT_MS = process.platform === "win32" ? 90_000 : 30_000
 const WORKER_CONNECT_PROBE_MS = process.platform === "win32" ? 2_000 : 500;
 const WORKER_PROBE_BACKOFF_MIN_MS = 25;
 const WORKER_PROBE_BACKOFF_MAX_MS = process.platform === "win32" ? 2_000 : 25;
+
+// Warm spare pool (wave-32): pre-booted, never-claimed workers keyed by cwd. A
+// claim replaces the cold spawn+module-graph segment of a create with a health
+// check; every miss or unhealthy spare falls back to the cold launch path.
+const DEFAULT_WARM_SPARE_TTL_MS = 10 * 60_000;
+const DEFAULT_WARM_POOL_MAX_SPARES = 4;
+const DEFAULT_WARM_SPARE_SPAWN_COOLDOWN_MS = 60_000;
+const DEFAULT_WARM_POOL_SWEEP_INTERVAL_MS = 60_000;
+// A spare holds a full worker RSS while idle; under memory pressure the pool is
+// the first thing to release. macOS overcommits freely, so the floor is absolute.
+const DEFAULT_WARM_POOL_MIN_FREE_MEMORY_BYTES = 768 * 1024 * 1024;
+// A spare is supposed to be already listening: a claim that cannot connect and
+// authenticate within this budget treats the spare as unhealthy and goes cold.
+const DEFAULT_WARM_SPARE_CLAIM_CONNECT_TIMEOUT_MS = 2_000;
+const WARM_SPARE_KILL_GRACE_MS = 1_500;
+/** PRIME_AGENT_WARM_POOL=0|false|no|off disables the pool on daemon startup. */
+export const WARM_POOL_DISABLE_ENV = "PRIME_AGENT_WARM_POOL";
+
+export interface DaemonWarmPoolOptions {
+	/** Idle TTL per spare before disposal; default 10min. */
+	ttlMs?: number;
+	/** Pool-wide spare cap; default 4. */
+	maxSpares?: number;
+	/** Per-cwd cooldown after a spare spawn failure; default 60s. */
+	spawnCooldownMs?: number;
+	/** Pool sweep cadence (dead/expired spares, memory pressure); default 60s. */
+	sweepIntervalMs?: number;
+	/** Free-memory floor: below it the pool releases spares and spawns none; default 768MiB. */
+	minFreeMemoryBytes?: number;
+	/** Claim health-check budget before falling back to a cold launch; default 2s. */
+	claimConnectTimeoutMs?: number;
+}
+
+interface ResolvedDaemonWarmPoolOptions {
+	ttlMs: number;
+	maxSpares: number;
+	spawnCooldownMs: number;
+	sweepIntervalMs: number;
+	minFreeMemoryBytes: number;
+	claimConnectTimeoutMs: number;
+}
+
+/**
+ * Production default: the pool is on unless the environment opts out. Tests
+ * construct DaemonSupervisor directly (pool absent => off) and opt in through
+ * DaemonSupervisorOptions.warmPool.
+ */
+export function resolveWarmPoolOptionsFromEnv(
+	environment: NodeJS.ProcessEnv = process.env,
+): DaemonWarmPoolOptions | undefined {
+	const raw = environment[WARM_POOL_DISABLE_ENV];
+	if (raw !== undefined && /^(?:0|false|no|off)$/i.test(raw.trim())) {
+		return undefined;
+	}
+	return {};
+}
+
+/**
+ * The spawn-time identity of a worker process. The claim check builds the
+ * candidate environment with the spare's own per-incarnation ids (token,
+ * instance, session, journal paths), so those cancel and only the remaining
+ * variables decide; the spare marker is excluded because a claimed spare keeps
+ * it in its (immutable) process environment while the cold build would not set
+ * it. A create whose fingerprint differs from the spare's misses the pool — a
+ * claim must be byte-identical to the cold spawn it replaces, or it does not
+ * happen.
+ */
+function warmWorkerEnvFingerprint(environment: NodeJS.ProcessEnv): string {
+	const hash = createHash("sha256");
+	const keys = Object.keys(environment)
+		.filter((key) => key !== DAEMON_WORKER_WARM_SPARE_ENV)
+		.sort();
+	for (const key of keys) {
+		hash.update(key);
+		hash.update("\0");
+		hash.update(environment[key] ?? "");
+		hash.update("\0");
+	}
+	return hash.digest("hex");
+}
+
+/** Miss diagnostics: the differing env KEYS only — values may carry secrets. */
+function warmWorkerEnvMismatch(candidate: NodeJS.ProcessEnv, pooled: NodeJS.ProcessEnv): string {
+	const differing: string[] = [];
+	const keys = [...new Set([...Object.keys(candidate), ...Object.keys(pooled)])].sort();
+	for (const key of keys) {
+		if (key === DAEMON_WORKER_WARM_SPARE_ENV) {
+			continue;
+		}
+		if ((candidate[key] ?? "") !== (pooled[key] ?? "")) {
+			differing.push(key);
+			if (differing.length >= 3) {
+				break;
+			}
+		}
+	}
+	if (differing.length === 0) {
+		return "environment fingerprint drift with no single differing key";
+	}
+	return `environment differs in ${differing.join(", ")}${keys.length > 0 && differing.length >= 3 ? ", …" : ""}`;
+}
+
+/**
+ * Pool key for a cwd. realpath collapses symlink forms (/tmp vs /private/tmp
+ * on macOS): a daemon spawned with a symlinked cwd and a client that resolves
+ * it must still hit the same spare. Only the key canonicalizes; the spawned
+ * worker keeps the caller's literal cwd, byte-identical to the cold path.
+ */
+function warmPoolKey(cwd: string): string {
+	const resolved = resolve(cwd);
+	try {
+		return realpathSync(resolved);
+	} catch {
+		return resolved;
+	}
+}
 
 /** Per-attempt handshake waits consume the remaining outer connect budget; a smaller fixed clock makes a consistently slow (win32) handshake fail every retry. */
 export function handshakeBudgetMs(deadline: number, now = Date.now()): number {
@@ -838,11 +957,45 @@ interface ResidentWorker {
 	rosterRepairPull?: Promise<void>;
 }
 
+interface SpawnedWorkerProcess {
+	child: ChildProcess;
+	startupGate: Writable;
+	childClosed: Promise<void>;
+	pid: number;
+	processStartId?: string;
+}
+
 /**
- * The peer list a worker has already accepted, tied to the connection that
- * accepted it. A reconnect installs a fresh client whose worker process knows
- * no peers, so identity comparison retires the memo without extra bookkeeping.
+ * A fully booted, never-claimed worker held by the warm pool. Invisible by
+ * construction: no descriptor on disk, no entry in `workers`, no roster row —
+ * the only reference is this record, and the worker process itself idles on its
+ * socket refusing every command until a supervisor claim (worker auth gate).
  */
+interface WarmSpareWorker {
+	/** Pool key: the resolved spawn cwd. */
+	key: string;
+	cwd: string;
+	workerId: string;
+	rootActiveSessionId: string;
+	socketPath: string;
+	token: string;
+	workerInstanceId: string;
+	descriptorPath: string;
+	recoveryJournalPath: string;
+	orphanProcessJournalPath: string;
+	/** Fingerprint of the spawn environment; a claim must reproduce it exactly. */
+	envFingerprint: string;
+	/**
+	 * The environment the spare was spawned with, kept for miss diagnostics only
+	 * (mismatch logging names the differing KEYS, never values — env carries
+	 * secrets). Also the source of truth if a claim needs to re-verify.
+	 */
+	environment: NodeJS.ProcessEnv;
+	spawned: SpawnedWorkerProcess;
+	spawnedAt: number;
+	expiresAt: number;
+	ttlTimer?: ReturnType<typeof setTimeout>;
+}
 
 interface SnapshotDuplicateValidation {
 	promise: Promise<void>;
@@ -886,6 +1039,12 @@ export interface DaemonSupervisorOptions {
 	pendingDeliveryLogThrottleMs?: number;
 	/** Overrides how long update-restart preparation waits for in-flight mutations to drain. */
 	updateRestartDrainTimeoutMs?: number;
+	/**
+	 * Warm spare pool: pre-booted workers a fresh create can claim. Undefined
+	 * disables the pool (the default for in-process supervisors); the production
+	 * entry enables it unless PRIME_AGENT_WARM_POOL opts out.
+	 */
+	warmPool?: DaemonWarmPoolOptions;
 	/**
 	 * This boot is a worker-driven replacement launch (set from
 	 * DAEMON_SUPERVISOR_RELAUNCH_ENV by the mode entry): ownership acquisition
@@ -1375,6 +1534,9 @@ function normalizeCapabilities(
 export async function runDaemonSupervisorMode(options: DaemonSupervisorOptions): Promise<never> {
 	const socketPath = normalizeSocketPath(options.socketPath ?? defaultDaemonSocketPath());
 	const relaunch = process.env[DAEMON_SUPERVISOR_RELAUNCH_ENV] !== undefined;
+	// The warm pool defaults on for real daemon processes; in-process supervisors
+	// (tests, embedders) get it only by passing options.warmPool explicitly.
+	const warmPool = options.warmPool ?? resolveWarmPoolOptionsFromEnv();
 	// A worker-spawned replacement never opens a tombstoned socket: the deliberate
 	// shutdown is the last word on it, and only an explicit start lifts the marker.
 	// Refuse before touching the socket lease so the refusal never lurks on a lock.
@@ -1384,7 +1546,7 @@ export async function runDaemonSupervisorMode(options: DaemonSupervisorOptions):
 		);
 		process.exit(0);
 	}
-	const supervisor = new DaemonSupervisor(socketPath, { ...options, relaunch });
+	const supervisor = new DaemonSupervisor(socketPath, { ...options, warmPool, relaunch });
 	try {
 		await supervisor.start();
 	} catch (error) {
@@ -1505,6 +1667,33 @@ export class DaemonSupervisor {
 	private lastRetentionSweepAtMs = 0;
 	/** True when this process is a worker-driven replacement launch (DAEMON_SUPERVISOR_RELAUNCH_ENV). */
 	private readonly relaunch: boolean;
+	/** Resolved warm-pool config; undefined disables the pool (and is re-set to undefined once drained for good). */
+	private warmPool?: ResolvedDaemonWarmPoolOptions;
+	// Lazy maps: prototype-harness supervisors in tests bypass the constructor, and
+	// the drain paths must read an empty pool there instead of throwing.
+	private warmSparesMap?: Map<string, WarmSpareWorker>;
+	private warmSpareInflightMap?: Map<string, Promise<void>>;
+	private warmSpareFailureAtMap?: Map<string, number>;
+	private get warmSpares(): Map<string, WarmSpareWorker> {
+		if (this.warmSparesMap === undefined) {
+			this.warmSparesMap = new Map();
+		}
+		return this.warmSparesMap;
+	}
+	private get warmSpareInflight(): Map<string, Promise<void>> {
+		if (this.warmSpareInflightMap === undefined) {
+			this.warmSpareInflightMap = new Map();
+		}
+		return this.warmSpareInflightMap;
+	}
+	private get warmSpareFailureAt(): Map<string, number> {
+		if (this.warmSpareFailureAtMap === undefined) {
+			this.warmSpareFailureAtMap = new Map();
+		}
+		return this.warmSpareFailureAtMap;
+	}
+	private warmPoolSweepTimer?: ReturnType<typeof setInterval>;
+	private warmPoolPressureLogAt = 0;
 
 	constructor(
 		private readonly socketPath: string,
@@ -1539,6 +1728,17 @@ export class DaemonSupervisor {
 		this.pendingDeliveryLogThrottleMs = options.pendingDeliveryLogThrottleMs;
 		this.updateRestartDrainTimeoutMs = options.updateRestartDrainTimeoutMs;
 		this.relaunch = options.relaunch === true;
+		this.warmPool = options.warmPool
+			? {
+					ttlMs: options.warmPool.ttlMs ?? DEFAULT_WARM_SPARE_TTL_MS,
+					maxSpares: options.warmPool.maxSpares ?? DEFAULT_WARM_POOL_MAX_SPARES,
+					spawnCooldownMs: options.warmPool.spawnCooldownMs ?? DEFAULT_WARM_SPARE_SPAWN_COOLDOWN_MS,
+					sweepIntervalMs: options.warmPool.sweepIntervalMs ?? DEFAULT_WARM_POOL_SWEEP_INTERVAL_MS,
+					minFreeMemoryBytes: options.warmPool.minFreeMemoryBytes ?? DEFAULT_WARM_POOL_MIN_FREE_MEMORY_BYTES,
+					claimConnectTimeoutMs:
+						options.warmPool.claimConnectTimeoutMs ?? DEFAULT_WARM_SPARE_CLAIM_CONNECT_TIMEOUT_MS,
+				}
+			: undefined;
 	}
 
 	async start(): Promise<void> {
@@ -1630,6 +1830,13 @@ export class DaemonSupervisor {
 			// whose worker is still being adopted answers as recovering (which clients
 			// retry), and daemon_hello.adopting says how many are in flight.
 			this.beginWorkerAdoption(workersToAdopt);
+			if (this.warmPool !== undefined) {
+				this.startWarmPoolSweep();
+				// Prewarm one spare for the daemon's own cwd: the first create from the
+				// project the daemon was launched in hits an already-booted worker.
+				// Failures are pool-local (cooldown + log) and never block readiness.
+				this.ensureWarmSpare(this.defaultSessionConfig.cwd ?? process.cwd(), undefined);
+			}
 		} catch (error) {
 			const startupError = error instanceof Error ? error : new Error(String(error));
 			this.log(`Daemon supervisor startup failed: ${startupError.stack ?? startupError.message}`);
@@ -4673,98 +4880,61 @@ export class DaemonSupervisor {
 			...withoutSupervisorCreateFields(command),
 			config: mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config),
 		};
-		const workerId = existing?.descriptor.workerId ?? createActiveSessionId();
-		const rootActiveSessionId = existing?.descriptor.rootActiveSessionId ?? createActiveSessionId();
-		const socketPath = existing?.descriptor.socketPath ?? workerSocketPath(this.socketPath, workerId);
-		const token = existing?.descriptor.authenticationToken ?? randomBytes(32).toString("base64url");
+		// A fresh create may claim a pooled spare: the spare process is
+		// byte-identical to what the cold spawn below would produce (same cwd, same
+		// environment fingerprint), so claiming it is scheduling, not a semantic
+		// change. Recovery and adoption (existing) always spawn their own process.
+		const spare = existing === undefined ? this.takeWarmSpare(createCommand, launchEnv) : undefined;
+		const workerId = existing?.descriptor.workerId ?? spare?.workerId ?? createActiveSessionId();
+		const rootActiveSessionId =
+			existing?.descriptor.rootActiveSessionId ?? spare?.rootActiveSessionId ?? createActiveSessionId();
+		const socketPath =
+			existing?.descriptor.socketPath ?? spare?.socketPath ?? workerSocketPath(this.socketPath, workerId);
+		const token = existing?.descriptor.authenticationToken ?? spare?.token ?? randomBytes(32).toString("base64url");
 		// Fresh per incarnation: peer transport grants must never survive a worker restart.
-		const workerInstanceId = randomUUID();
+		const workerInstanceId = existing !== undefined ? randomUUID() : (spare?.workerInstanceId ?? randomUUID());
 		const now = new Date().toISOString();
-		const descriptorPath = existing?.descriptorPath ?? join(this.descriptorDir, `${workerId}.json`);
+		const descriptorPath =
+			existing?.descriptorPath ?? spare?.descriptorPath ?? join(this.descriptorDir, `${workerId}.json`);
 		const recoveryJournalPath =
-			existing?.descriptor.recoveryJournalPath ?? join(this.descriptorDir, `${workerId}.recovery.jsonl`);
+			existing?.descriptor.recoveryJournalPath ??
+			spare?.recoveryJournalPath ??
+			join(this.descriptorDir, `${workerId}.recovery.jsonl`);
 		const orphanProcessJournalPath =
-			existing?.descriptor.orphanProcessJournalPath ?? join(this.descriptorDir, `${workerId}.orphans.jsonl`);
-		const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", socketPath]);
-		const workerEnvironment = createCliSubprocessEnv({
-			...process.env,
-			...launchEnv,
-			[DAEMON_WORKER_ROLE_ENV]: "1",
-			[DAEMON_WORKER_TOKEN_ENV]: token,
-			[DAEMON_WORKER_INSTANCE_ID_ENV]: workerInstanceId,
-			[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]: rootActiveSessionId,
-			[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV]: this.socketPath,
-			[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: recoveryJournalPath,
-			[DAEMON_WORKER_STARTUP_GATE_FD_ENV]: String(WORKER_STARTUP_GATE_FD),
-			[ORPHAN_PROCESS_JOURNAL_ENV]: orphanProcessJournalPath,
-			[SESSION_LEASES_ENABLED_ENV]: "1",
-			[SESSION_LEASE_OWNER_ID_ENV]: rootActiveSessionId,
-		});
-		delete workerEnvironment.RLM_DEPTH;
-		// Workers are deliberate launches: the relaunch marker must never leak into a
-		// worker (and from there into session subprocesses), or an explicit daemon
-		// start from inside a session would read as a relaunch and refuse a
-		// tombstoned socket.
-		delete workerEnvironment[DAEMON_SUPERVISOR_RELAUNCH_ENV];
-		await this.assertRecoveryAllowed();
-		const child: ChildProcess = spawnHidden(launch.command, launch.args, {
-			cwd: createCommand.config?.cwd ?? process.cwd(),
-			detached: true,
-			env: workerEnvironment,
-			stdio: ["ignore", "ignore", "pipe", "pipe"],
-		});
-		const detachWorkerStderr = child.stderr
-			? attachJsonlLineReader(child.stderr, (line) => this.log(`Session worker ${workerId} stderr: ${line}`), {
-					maxLineLength: 64 * 1024,
-					onLineOverflow: (prefix) => this.log(`Session worker ${workerId} stderr: ${prefix} [truncated]`),
-				})
-			: () => {};
-		child.once("close", detachWorkerStderr);
-		const childClosed = new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
-		let spawnFailure: Error | undefined;
-		const spawnSettled = new Promise<void>((resolveSpawn) => {
-			child.once("spawn", () => resolveSpawn());
-			child.once("error", (error) => {
-				spawnFailure = error instanceof Error ? error : new Error(String(error));
-				resolveSpawn();
-			});
-		});
-		child.on("error", (error) => {
-			this.log(
-				`Session worker ${workerId} process error: ${error instanceof Error ? error.message : String(error)}`,
-			);
-		});
-		// A failed spawn (e.g. EMFILE) leaves child.stdio undefined.
-		const startupGate = child.stdio?.[WORKER_STARTUP_GATE_FD];
+			existing?.descriptor.orphanProcessJournalPath ??
+			spare?.orphanProcessJournalPath ??
+			join(this.descriptorDir, `${workerId}.orphans.jsonl`);
 		const previousDescriptor = existing?.descriptor;
 		const previousIntentionalStop = existing?.intentionalStop;
 		let descriptorAssigned = false;
-		let childPid: number;
-		let childProcessStartId: string | undefined;
+		let spawned: SpawnedWorkerProcess | undefined;
 		let worker: ResidentWorker;
 		try {
-			await spawnSettled;
-			if (spawnFailure) {
-				throw this.describeWorkerSpawnFailure(spawnFailure);
+			if (spare) {
+				spawned = spare.spawned;
+			} else {
+				const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", socketPath]);
+				const workerEnvironment = this.buildWorkerEnvironment(
+					launchEnv,
+					{ token, workerInstanceId, rootActiveSessionId, recoveryJournalPath, orphanProcessJournalPath },
+					false,
+				);
+				await this.assertRecoveryAllowed();
+				spawned = await this.spawnWorkerProcess(
+					launch.command,
+					launch.args,
+					workerEnvironment,
+					createCommand.config?.cwd ?? process.cwd(),
+					workerId,
+				);
 			}
-			if (!child.pid) {
-				throw new Error("Failed to obtain daemon session worker pid");
-			}
-			if (!(startupGate instanceof Writable)) {
-				throw new Error("Failed to create daemon session worker startup gate");
-			}
-			childPid = child.pid;
-			// R31-14: the identity capture must not fork `ps` synchronously - the supervisor
-			// is single-threaded, so N concurrent launches would queue every client command
-			// behind N helper round trips. The async twin resolves the same identity.
-			childProcessStartId = await getProcessStartIdAsync(childPid);
 			await this.assertRecoveryAllowed();
 
 			const descriptor: DaemonWorkerDescriptor = {
 				version: 2,
 				workerId,
-				pid: childPid,
-				...(childProcessStartId ? { processStartId: childProcessStartId } : {}),
+				pid: spawned.pid,
+				...(spawned.processStartId ? { processStartId: spawned.processStartId } : {}),
 				socketPath,
 				recoveryJournalPath,
 				orphanProcessJournalPath,
@@ -4803,11 +4973,17 @@ export class DaemonSupervisor {
 			worker.intentionalStop = false;
 			this.workers.set(workerId, worker);
 		} catch (error) {
-			if (startupGate instanceof Writable) {
-				startupGate.destroy();
+			if (spawned) {
+				if (spare) {
+					// The spare's startup gate was committed at prebuild, so destroying
+					// it cannot stop the (fully booted) process; kill it instead.
+					await this.terminateSpawnedWorkerProcess(spawned);
+				} else {
+					spawned.startupGate.destroy();
+					await spawned.childClosed;
+					spawned.child.unref();
+				}
 			}
-			await childClosed;
-			child.unref();
 			try {
 				rmSync(`${descriptorPath}.${process.pid}.tmp`, { force: true });
 			} catch (cleanupError) {
@@ -4823,17 +4999,31 @@ export class DaemonSupervisor {
 			throw error;
 		}
 
+		let createRequestSent = false;
 		try {
 			try {
-				await commitWorkerStartupGate(startupGate);
+				// A pooled spare's gate was committed at prebuild: it already booted
+				// all the way to listen, so the claim skips straight to connecting.
+				if (spare === undefined) {
+					await commitWorkerStartupGate(spawned.startupGate);
+				}
 			} catch (error) {
-				startupGate.destroy();
-				await childClosed;
+				spawned.startupGate.destroy();
+				await spawned.childClosed;
 				throw error;
 			} finally {
-				child.unref();
+				spawned.child.unref();
 			}
-			const client = await this.connectWorker(worker, WORKER_CONNECT_TIMEOUT_MS);
+			// The claim health check: a spare must connect and authenticate within
+			// the short claim budget; a cold spawn keeps the full boot budget. A
+			// failed check falls back to a cold launch below.
+			const client = await this.connectWorker(
+				worker,
+				spare === undefined
+					? WORKER_CONNECT_TIMEOUT_MS
+					: (this.warmPool?.claimConnectTimeoutMs ?? DEFAULT_WARM_SPARE_CLAIM_CONNECT_TIMEOUT_MS),
+			);
+			createRequestSent = true;
 			const response = await client.request(withoutCommandId(createCommand), requestTimeoutMs);
 			if (!response.success) {
 				throw deserializeDaemonError(response);
@@ -4864,6 +5054,10 @@ export class DaemonSupervisor {
 				worker.transientCreateCommand = undefined;
 			}
 			this.broadcastHeartbeatsChanged();
+			if (existing === undefined) {
+				// Keep the pool stocked for the next create in this cwd (fire-and-forget).
+				this.ensureWarmSpare(createCommand.config?.cwd ?? process.cwd(), launchEnv);
+			}
 			return worker;
 		} catch (error) {
 			if (isSupervisorGenerationStale(error)) {
@@ -4873,8 +5067,8 @@ export class DaemonSupervisor {
 				let rolledBack = false;
 				try {
 					await this.stopWorker(worker, existing === undefined, true, false, existing !== undefined, {
-						child,
-						closed: childClosed,
+						child: spawned.child,
+						closed: spawned.childClosed,
 					});
 					rolledBack = true;
 				} catch (cleanupError) {
@@ -4923,7 +5117,483 @@ export class DaemonSupervisor {
 				this.workers.set(workerId, worker);
 				this.persistWorker(worker);
 			}
+			if (spare !== undefined && !createRequestSent) {
+				// The claim failed its health check before the create reached the
+				// worker (connect/auth), and the spare was stopped above: fall back
+				// to the cold launch path instead of failing the create. A failure
+				// after the create request was sent keeps the existing semantics —
+				// a cold retry could double-create the session.
+				this.log(
+					`Warm spare ${workerId} failed its claim health check; falling back to a cold launch: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+				return this.launchWorker(command, undefined, ownerClientId, requestTimeoutMs);
+			}
 			throw error;
+		}
+	}
+
+	/**
+	 * The worker-process half of a launch: spawn, stderr plumbing, spawn-failure
+	 * detection, and the async start-identity capture (R31-14). Resolves only on
+	 * success; on failure the child is stopped and unreffed before the throw.
+	 * Used by cold launches and by warm-pool spare prebuilds alike.
+	 */
+	private async spawnWorkerProcess(
+		command: string,
+		args: readonly string[],
+		environment: NodeJS.ProcessEnv,
+		cwd: string,
+		workerId: string,
+	): Promise<SpawnedWorkerProcess> {
+		const child: ChildProcess = spawnHidden(command, args, {
+			cwd,
+			detached: true,
+			env: environment,
+			stdio: ["ignore", "ignore", "pipe", "pipe"],
+		});
+		const detachWorkerStderr = child.stderr
+			? attachJsonlLineReader(child.stderr, (line) => this.log(`Session worker ${workerId} stderr: ${line}`), {
+					maxLineLength: 64 * 1024,
+					onLineOverflow: (prefix) => this.log(`Session worker ${workerId} stderr: ${prefix} [truncated]`),
+				})
+			: () => {};
+		child.once("close", detachWorkerStderr);
+		const childClosed = new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
+		let spawnFailure: Error | undefined;
+		const spawnSettled = new Promise<void>((resolveSpawn) => {
+			child.once("spawn", () => resolveSpawn());
+			child.once("error", (error) => {
+				spawnFailure = error instanceof Error ? error : new Error(String(error));
+				resolveSpawn();
+			});
+		});
+		child.on("error", (error) => {
+			this.log(
+				`Session worker ${workerId} process error: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		});
+		try {
+			await spawnSettled;
+			if (spawnFailure) {
+				throw this.describeWorkerSpawnFailure(spawnFailure);
+			}
+			if (!child.pid) {
+				throw new Error("Failed to obtain daemon session worker pid");
+			}
+			// A failed spawn (e.g. EMFILE) leaves child.stdio undefined.
+			const startupGate = child.stdio?.[WORKER_STARTUP_GATE_FD];
+			if (!(startupGate instanceof Writable)) {
+				throw new Error("Failed to create daemon session worker startup gate");
+			}
+			const pid = child.pid;
+			// R31-14: the identity capture must not fork `ps` synchronously - the supervisor
+			// is single-threaded, so N concurrent launches would queue every client command
+			// behind N helper round trips. The async twin resolves the same identity.
+			const processStartId = await getProcessStartIdAsync(pid);
+			return { child, startupGate, childClosed, pid, ...(processStartId ? { processStartId } : {}) };
+		} catch (error) {
+			// The gate never commits on this path, so a spawned worker exits as soon as
+			// its boot reaches the gate read; the kill below covers a worker wedged
+			// before it, bounding the wait the pre-extraction code ran unbounded.
+			const startupGate = child.stdio?.[WORKER_STARTUP_GATE_FD];
+			if (startupGate instanceof Writable) {
+				startupGate.destroy();
+			}
+			child.unref();
+			await Promise.race([childClosed, sleep(WARM_SPARE_KILL_GRACE_MS, { unref: true })]);
+			if (child.exitCode === null && child.signalCode === null && child.pid && processIdExists(child.pid)) {
+				signalProcessGroupOrProcess(child.pid, "SIGKILL");
+				await Promise.race([childClosed, sleep(500, { unref: true })]);
+			}
+			throw error;
+		}
+	}
+
+	/** The worker process environment, shared by cold launches, spare spawns, and the claim rebind check. */
+	private buildWorkerEnvironment(
+		launchEnv: Record<string, string> | undefined,
+		ids: {
+			token: string;
+			workerInstanceId: string;
+			rootActiveSessionId: string;
+			recoveryJournalPath: string;
+			orphanProcessJournalPath: string;
+		},
+		warmSpare: boolean,
+	): NodeJS.ProcessEnv {
+		const workerEnvironment = createCliSubprocessEnv({
+			...process.env,
+			...launchEnv,
+			[DAEMON_WORKER_ROLE_ENV]: "1",
+			[DAEMON_WORKER_TOKEN_ENV]: ids.token,
+			[DAEMON_WORKER_INSTANCE_ID_ENV]: ids.workerInstanceId,
+			[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]: ids.rootActiveSessionId,
+			[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV]: this.socketPath,
+			[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: ids.recoveryJournalPath,
+			[DAEMON_WORKER_STARTUP_GATE_FD_ENV]: String(WORKER_STARTUP_GATE_FD),
+			[ORPHAN_PROCESS_JOURNAL_ENV]: ids.orphanProcessJournalPath,
+			[SESSION_LEASES_ENABLED_ENV]: "1",
+			[SESSION_LEASE_OWNER_ID_ENV]: ids.rootActiveSessionId,
+			...(warmSpare ? { [DAEMON_WORKER_WARM_SPARE_ENV]: "1" } : {}),
+		});
+		delete workerEnvironment.RLM_DEPTH;
+		// Workers are deliberate launches: the relaunch marker must never leak into a
+		// worker (and from there into session subprocesses), or an explicit daemon
+		// start from inside a session would read as a relaunch and refuse a
+		// tombstoned socket.
+		delete workerEnvironment[DAEMON_SUPERVISOR_RELAUNCH_ENV];
+		return workerEnvironment;
+	}
+
+	/**
+	 * Take the pooled spare for this create, or miss. A claim requires the same
+	 * spawn cwd and a byte-identical environment fingerprint (the rebind rule:
+	 * auth-, project- and client-level variables all live in the fingerprint, so
+	 * a stale or foreign environment can never leak into a claimed session).
+	 * Misses leave the spare pooled for a create that does match; an expired or
+	 * dead spare is dropped and disposed instead.
+	 */
+	private takeWarmSpare(
+		createCommand: DaemonCreateCommand,
+		launchEnv: Record<string, string> | undefined,
+	): WarmSpareWorker | undefined {
+		const pool = this.warmPool;
+		if (pool === undefined || this.shuttingDown || this.updateRestartPhase !== undefined) {
+			return undefined;
+		}
+		const cwd = createCommand.config?.cwd ?? process.cwd();
+		const key = warmPoolKey(cwd);
+		const spare = this.warmSpares.get(key);
+		if (spare === undefined) {
+			return undefined;
+		}
+		if (
+			spare.expiresAt <= Date.now() ||
+			spare.spawned.child.exitCode !== null ||
+			spare.spawned.child.signalCode !== null
+		) {
+			this.warmSpares.delete(key);
+			this.background(this.disposeWarmSpare(spare, "expired or exited before claim"), `warm spare disposal ${key}`);
+			return undefined;
+		}
+		const candidateEnvironment = this.buildWorkerEnvironment(
+			launchEnv,
+			{
+				token: spare.token,
+				workerInstanceId: spare.workerInstanceId,
+				rootActiveSessionId: spare.rootActiveSessionId,
+				recoveryJournalPath: spare.recoveryJournalPath,
+				orphanProcessJournalPath: spare.orphanProcessJournalPath,
+			},
+			false,
+		);
+		if (warmWorkerEnvFingerprint(candidateEnvironment) !== spare.envFingerprint) {
+			this.logInfo(
+				`Warm spare ${spare.workerId} for ${key} missed: ${warmWorkerEnvMismatch(candidateEnvironment, spare.environment)}`,
+			);
+			return undefined;
+		}
+		this.warmSpares.delete(key);
+		if (spare.ttlTimer) {
+			clearTimeout(spare.ttlTimer);
+			spare.ttlTimer = undefined;
+		}
+		return spare;
+	}
+
+	/**
+	 * Stock the pool for a cwd if it is empty and within bounds. All failures are
+	 * pool-local: a cooldown per cwd keeps a broken spawn from looping, and the
+	 * create path never waits on a spare.
+	 */
+	private ensureWarmSpare(cwd: string, launchEnv: Record<string, string> | undefined): void {
+		const pool = this.warmPool;
+		if (pool === undefined || this.shuttingDown || this.updateRestartPhase !== undefined) {
+			return;
+		}
+		const key = warmPoolKey(cwd);
+		if (this.warmSpares.has(key) || this.warmSpareInflight.has(key)) {
+			return;
+		}
+		if (this.warmSpares.size >= pool.maxSpares) {
+			return;
+		}
+		const failedAt = this.warmSpareFailureAt.get(key);
+		if (failedAt !== undefined && Date.now() - failedAt < pool.spawnCooldownMs) {
+			return;
+		}
+		if (freemem() < pool.minFreeMemoryBytes) {
+			const nowMs = Date.now();
+			if (nowMs - this.warmPoolPressureLogAt >= 10 * 60_000) {
+				this.warmPoolPressureLogAt = nowMs;
+				this.logInfo("Warm pool: free memory below the floor; not spawning a spare");
+			}
+			return;
+		}
+		const inflight = this.spawnWarmSpare(key, cwd, launchEnv)
+			.catch((error) => this.log(`Warm spare spawn for ${cwd} failed: ${String(error)}`))
+			.finally(() => {
+				if (this.warmSpareInflight.get(key) === inflight) {
+					this.warmSpareInflight.delete(key);
+				}
+			});
+		this.warmSpareInflight.set(key, inflight);
+	}
+
+	/**
+	 * Spawn one spare and boot it all the way to listen (the startup gate commits
+	 * at prebuild, not at claim). The gate's protected invariant — no session work
+	 * before a persisted descriptor — still holds: the spare serves nothing until
+	 * a claim persists one, and the worker auth gate refuses every other command.
+	 */
+	private async spawnWarmSpare(
+		key: string,
+		cwd: string,
+		launchEnv: Record<string, string> | undefined,
+	): Promise<void> {
+		const pool = this.warmPool;
+		if (pool === undefined) {
+			return;
+		}
+		const workerId = createActiveSessionId();
+		const rootActiveSessionId = createActiveSessionId();
+		const socketPath = workerSocketPath(this.socketPath, workerId);
+		const ids = {
+			token: randomBytes(32).toString("base64url"),
+			workerInstanceId: randomUUID(),
+			rootActiveSessionId,
+			recoveryJournalPath: join(this.descriptorDir, `${workerId}.recovery.jsonl`),
+			orphanProcessJournalPath: join(this.descriptorDir, `${workerId}.orphans.jsonl`),
+		};
+		const descriptorPath = join(this.descriptorDir, `${workerId}.json`);
+		const environment = this.buildWorkerEnvironment(launchEnv, ids, true);
+		const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", socketPath]);
+		let spawned: SpawnedWorkerProcess;
+		try {
+			spawned = await this.spawnWorkerProcess(launch.command, launch.args, environment, cwd, workerId);
+		} catch (error) {
+			this.warmSpareFailureAt.set(key, Date.now());
+			throw error;
+		}
+		try {
+			await commitWorkerStartupGate(spawned.startupGate);
+		} catch (error) {
+			this.warmSpareFailureAt.set(key, Date.now());
+			await this.terminateSpawnedWorkerProcess(spawned);
+			throw error;
+		}
+		// "Ready" must mean the worker actually listens: a claim against a still-
+		// booting spare would pay the boot remainder inside the create window. The
+		// probe is a bare connect (no auth); the worker answers its hello and the
+		// probe hangs up, exactly like a failed connectWorker attempt.
+		const listened = await this.probeWarmSpareListening(spawned, socketPath);
+		if (!listened) {
+			this.warmSpareFailureAt.set(key, Date.now());
+			await this.terminateSpawnedWorkerProcess(spawned);
+			throw new Error(`Warm spare ${workerId} did not start listening within its boot budget`);
+		}
+		spawned.child.unref();
+		spawned.childClosed.then(() => {
+			// A pooled spare that exited on its own: drop the record so the next
+			// create misses cleanly instead of claiming a corpse.
+			const pooled = this.warmSpares.get(key);
+			if (pooled?.spawned === spawned) {
+				this.warmSpares.delete(key);
+				if (pooled.ttlTimer) {
+					clearTimeout(pooled.ttlTimer);
+					pooled.ttlTimer = undefined;
+				}
+				this.log(`Warm spare ${workerId} for ${cwd} exited before claim`);
+				this.cleanWarmSpareFiles(pooled);
+			}
+		});
+		const nowMs = Date.now();
+		const spare: WarmSpareWorker = {
+			key,
+			cwd,
+			workerId,
+			rootActiveSessionId,
+			socketPath,
+			token: ids.token,
+			workerInstanceId: ids.workerInstanceId,
+			descriptorPath,
+			recoveryJournalPath: ids.recoveryJournalPath,
+			orphanProcessJournalPath: ids.orphanProcessJournalPath,
+			envFingerprint: warmWorkerEnvFingerprint(environment),
+			environment: { ...environment },
+			spawned,
+			spawnedAt: nowMs,
+			expiresAt: nowMs + pool.ttlMs,
+		};
+		if (
+			this.shuttingDown ||
+			this.updateRestartPhase !== undefined ||
+			this.warmPool === undefined ||
+			this.warmSpares.has(key)
+		) {
+			// The pool closed (or a racing prebuild won) while this spawn was in flight.
+			await this.disposeWarmSpare(spare, "pool closed or refilled during spawn");
+			return;
+		}
+		spare.ttlTimer = setTimeout(() => {
+			spare.ttlTimer = undefined;
+			if (this.warmSpares.get(key) === spare) {
+				this.warmSpares.delete(key);
+				this.background(this.disposeWarmSpare(spare, "idle TTL expired"), `warm spare TTL disposal ${key}`);
+			}
+		}, pool.ttlMs);
+		spare.ttlTimer.unref();
+		this.warmSpares.set(key, spare);
+		this.logInfo(`Warm spare worker ${workerId} ready for ${cwd}`);
+	}
+
+	/** SIGTERM the process (group), escalating to SIGKILL past the grace window. */
+	private async terminateSpawnedWorkerProcess(spawned: SpawnedWorkerProcess): Promise<void> {
+		spawned.child.unref();
+		if (spawned.child.exitCode !== null || spawned.child.signalCode !== null || !processIdExists(spawned.pid)) {
+			return;
+		}
+		signalProcessGroupOrProcess(spawned.pid, "SIGTERM");
+		await Promise.race([spawned.childClosed, sleep(WARM_SPARE_KILL_GRACE_MS, { unref: true })]);
+		if (spawned.child.exitCode === null && spawned.child.signalCode === null && processIdExists(spawned.pid)) {
+			signalProcessGroupOrProcess(spawned.pid, "SIGKILL");
+			await Promise.race([spawned.childClosed, sleep(500, { unref: true })]);
+		}
+	}
+
+	/**
+	 * Wait until the spare's socket accepts a connection. One probe = a bare
+	 * connect and immediate hang-up; the worker sends its hello to a peer that
+	 * never authenticates, which is the same shape as a failed connectWorker
+	 * attempt. A spare that never listens is a spawn failure (cooldown applies).
+	 */
+	private async probeWarmSpareListening(spawned: SpawnedWorkerProcess, socketPath: string): Promise<boolean> {
+		const budgetMs = process.platform === "win32" ? 30_000 : 8_000;
+		const deadline = Date.now() + budgetMs;
+		while (Date.now() < deadline) {
+			if (spawned.child.exitCode !== null || spawned.child.signalCode !== null) {
+				return false;
+			}
+			const accepted = await new Promise<boolean>((resolveProbe) => {
+				const probe = connect(socketPath);
+				const finish = (ok: boolean) => {
+					probe.removeAllListeners();
+					probe.destroy();
+					resolveProbe(ok);
+				};
+				probe.once("connect", () => finish(true));
+				probe.once("error", () => finish(false));
+			});
+			if (accepted) {
+				return true;
+			}
+			await sleep(25, { unref: true });
+		}
+		return false;
+	}
+
+	/**
+	 * A spare never wrote a descriptor; its journals exist only if the worker
+	 * created them, and its socket file only outlives a worker that could not run
+	 * its own exit cleanup (SIGKILL). Everything here is best-effort.
+	 */
+	private cleanWarmSpareFiles(spare: WarmSpareWorker): void {
+		try {
+			rmSync(spare.recoveryJournalPath, { force: true });
+		} catch (error) {
+			this.reportCleanupFailure(`warm spare recovery journal ${spare.workerId}`, error);
+		}
+		try {
+			rmSync(spare.orphanProcessJournalPath, { force: true });
+		} catch (error) {
+			this.reportCleanupFailure(`warm spare orphan journal ${spare.workerId}`, error);
+		}
+		try {
+			rmSync(`${spare.descriptorPath}.${process.pid}.tmp`, { force: true });
+		} catch (error) {
+			this.reportCleanupFailure(`warm spare descriptor temp ${spare.workerId}`, error);
+		}
+		if (process.platform !== "win32" && !isProcessAlive(spare.spawned.pid)) {
+			try {
+				rmSync(spare.socketPath, { force: true });
+			} catch (error) {
+				this.reportCleanupFailure(`warm spare socket ${spare.workerId}`, error);
+			}
+		}
+	}
+
+	private async disposeWarmSpare(spare: WarmSpareWorker, reason: string): Promise<void> {
+		if (this.warmSpares.get(spare.key) === spare) {
+			this.warmSpares.delete(spare.key);
+		}
+		if (spare.ttlTimer) {
+			clearTimeout(spare.ttlTimer);
+			spare.ttlTimer = undefined;
+		}
+		await this.terminateSpawnedWorkerProcess(spare.spawned);
+		this.cleanWarmSpareFiles(spare);
+		this.logInfo(`Disposed warm spare ${spare.workerId} for ${spare.cwd}: ${reason}`);
+	}
+
+	/**
+	 * Empty the pool: daemon shutdown, supervisor dispose, and update-restart
+	 * preparation all drain (a spare spawned now would run this build while its
+	 * successor runs the next). `disable` is for exits: the pool stays off for
+	 * the rest of this process's life.
+	 */
+	private async drainWarmPool(reason: string, disable: boolean): Promise<void> {
+		if (disable) {
+			this.warmPool = undefined;
+		}
+		if (this.warmPoolSweepTimer) {
+			clearInterval(this.warmPoolSweepTimer);
+			this.warmPoolSweepTimer = undefined;
+		}
+		const spares = [...this.warmSpares.values()];
+		const inflight = [...this.warmSpareInflight.values()];
+		if (spares.length === 0 && inflight.length === 0) {
+			return;
+		}
+		// Inflight spawns re-check the pool/shutdown state at publish and dispose
+		// themselves; awaiting them here keeps the drain complete before exit.
+		await Promise.all([
+			...inflight.map((pending) => pending.catch(() => undefined)),
+			...spares.map((spare) =>
+				this.disposeWarmSpare(spare, reason).catch((error) =>
+					this.reportCleanupFailure(`warm spare ${spare.workerId}`, error),
+				),
+			),
+		]);
+	}
+
+	private startWarmPoolSweep(): void {
+		const pool = this.warmPool;
+		if (pool === undefined || this.warmPoolSweepTimer) {
+			return;
+		}
+		this.warmPoolSweepTimer = setInterval(() => this.sweepWarmPool(), pool.sweepIntervalMs);
+		this.warmPoolSweepTimer.unref();
+	}
+
+	/** Reap dead/expired spares and release the whole pool under memory pressure. */
+	private sweepWarmPool(): void {
+		const pool = this.warmPool;
+		if (pool === undefined) {
+			return;
+		}
+		const nowMs = Date.now();
+		const lowMemory = freemem() < pool.minFreeMemoryBytes;
+		for (const spare of [...this.warmSpares.values()]) {
+			const dead = spare.spawned.child.exitCode !== null || spare.spawned.child.signalCode !== null;
+			const expired = spare.expiresAt <= nowMs;
+			if (!dead && !expired && !lowMemory) {
+				continue;
+			}
+			this.warmSpares.delete(spare.key);
+			const reason = dead ? "process exited" : expired ? "idle TTL expired" : "free memory below the floor";
+			this.background(this.disposeWarmSpare(spare, reason), `warm spare sweep disposal ${spare.key}`);
 		}
 	}
 
@@ -9699,6 +10369,9 @@ export class DaemonSupervisor {
 		// P1-7c/B10: pending deliveries are answered before the fence, not carried
 		// across it. Each sender still waiting gets an explicit terminal receipt.
 		this.drainPendingDeliveries("update_restart");
+		// A pooled spare runs this build; the successor must never inherit one. The
+		// pool itself stays enabled: if the prepare fails, later creates refill it.
+		await this.drainWarmPool("update restart", false);
 		try {
 			const deadline = Date.now() + UPDATE_RESTART_PREPARE_DEADLINE_MS;
 			const abort = AbortSignal.timeout(
@@ -10548,6 +11221,7 @@ export class DaemonSupervisor {
 		this.clearFailedWorkerReaperTimer();
 		this.clearRetentionSweepTimer();
 		this.clearAdoptionRetryTimers();
+		await this.runCleanupStep("warm spare pool", () => this.drainWarmPool("supervisor dispose", true));
 		await this.idleEvictionSweep?.catch(() => undefined);
 		for (const cleanup of this.signalCleanupHandlers.splice(0)) {
 			await this.runCleanupStep("signal handler", cleanup);
@@ -10668,6 +11342,9 @@ export class DaemonSupervisor {
 		// sender still waiting learns the message was not delivered instead of
 		// watching the daemon leave with it.
 		this.drainPendingDeliveries("shutdown");
+		// The warm pool drains on every exit, including update handoffs: a spare
+		// runs this build and the successor must never inherit one.
+		await this.runCleanupStep("warm spare pool", () => this.drainWarmPool("daemon shutdown", true));
 		this.clearIdleEvictionTimer();
 		this.clearScheduledWakeTimer();
 		this.clearRosterWatchdogTimer();

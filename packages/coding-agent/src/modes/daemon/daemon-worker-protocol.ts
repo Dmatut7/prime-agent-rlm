@@ -21,6 +21,14 @@ export const DAEMON_WORKER_RECOVERY_JOURNAL_ENV = "PRIME_AGENT_INTERNAL_DAEMON_W
 export const DAEMON_WORKER_STARTUP_GATE_FD_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_STARTUP_GATE_FD";
 export const DAEMON_WORKER_STARTUP_GATE_COMMIT = "start\n";
 /**
+ * Spawn-time marker on a warm-pool spare: a worker that booted before any create
+ * arrived. An unclaimed spare owns no sessions, so it never resurrects a dead
+ * supervisor and exits on its own instead of waiting to be claimed forever. The
+ * marker stays set after a claim (process env is immutable from outside); every
+ * spare behavior keys off "marker set AND never claimed", not the marker alone.
+ */
+export const DAEMON_WORKER_WARM_SPARE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_WARM_SPARE";
+/**
  * Set on a supervisor process spawned by a worker's replacement launch, so the
  * boot can tell "worker resurrecting a crashed supervisor" from a deliberate
  * start: only the former refuses a socket whose last shutdown was intentional

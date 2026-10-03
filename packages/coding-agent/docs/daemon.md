@@ -40,6 +40,16 @@ Normal interactive sessions use resident workers:
 
 There is no fixed session, worker, client, or workload cap in this layer.
 
+## Warm Spare Pool
+
+To keep session creation off the worker boot path, the supervisor keeps pre-booted spare workers on standby:
+
+- One spare per project directory (pool keyed by cwd), prebuilt at daemon startup and restocked after each successful create; idle spares expire after 10 minutes, and the pool caps at 4 spares.
+- A spare is invisible to session listings, the roster, and recovery: it has no descriptor and no registered worker until a create claims it. Its worker process serves nothing before that claim (the supervisor-auth gate refuses every command).
+- A create claims a spare only when the cold launch would have produced the same process: same spawn cwd (canonicalized for symlinks) and a byte-identical environment fingerprint (client-forwarded `launchEnv`, daemon env, auth-bearing variables). Any mismatch — or a spare that fails the claim-time connect+auth health check — falls back to the normal cold launch.
+- The pool drains on shutdown, on `restart`, and when an update restart starts preparing; a crashed daemon's unclaimed spares never resurrect it and exit on their own within seconds. Under memory pressure (free memory below 768 MiB) the pool releases its spares and pauses spawning.
+- Set `PRIME_AGENT_WARM_POOL=0` to disable the pool.
+
 ## Client-Owned Workers
 
 Headless and ephemeral clients use the same worker runtime as interactive clients but give the worker a client-owned lifecycle:
