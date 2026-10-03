@@ -166,7 +166,11 @@ export interface TurnLivenessKernelFacts {
 /** Result of the degraded journal read: a count, a failure to report, or "not applicable". */
 export type JournaledBashFacts = { liveBashHandles: number } | { error: string };
 
-/** Forensic events; the session routes them to its own log so a degraded path is never silent. */
+/**
+ * Forensic events; the session routes them to its own log so a degraded path is never silent.
+ * `degraded_read` fires only for a read that found live bash handles - the read that can actually
+ * back a vouch; an empty read is bookkeeping and stays at debug (see refreshDegradedFacts).
+ */
 export type TurnLivenessEvent =
 	| { kind: "degraded_read"; kernelPid?: number; liveBashHandles: number; at: number }
 	| { kind: "degraded_read_failed"; kernelPid?: number; reason: string; at: number }
@@ -572,6 +576,21 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 		const readAt = degradedFirstReadAt ?? at;
 		degradedFirstReadAt = readAt;
 		degraded = { liveBashHandles: result.liveBashHandles, readAt, lastAttemptAt: at };
+		if (result.liveBashHandles === 0) {
+			// An empty read is bookkeeping: sample() requires a positive count before the degraded
+			// path vouches, so this read can never back a takeover guarantee. Emitting it anyway
+			// cost one info line per turn in the session log, and the "stall watchdog:" prefix tee
+			// carried it into stall-evidence.jsonl, where the empty reads outnumbered the vouching
+			// ones (137/137 lines in one evidence window) and - through the session's once-per-kind
+			// throttle - could silence a later non-empty read of the same turn. Debug keeps the
+			// read countable in agent.jsonl without claiming evidence it does not carry.
+			livenessLog.debug("turn liveness: degraded_read (no live bash handles)", {
+				...(kernelPid === undefined ? {} : { kernelPid }),
+				liveBashHandles: 0,
+				at: readAt,
+			});
+			return;
+		}
 		emit({
 			kind: "degraded_read",
 			...(kernelPid === undefined ? {} : { kernelPid }),

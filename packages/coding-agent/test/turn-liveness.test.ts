@@ -13,6 +13,7 @@ import { STALL_VOUCH_REASONS } from "../src/core/stall-watchdog.js";
 import {
 	createTurnLiveness,
 	DEFAULT_DEGRADED_FACTS_MAX_AGE_MS,
+	DEFAULT_DEGRADED_REFRESH_MIN_GAP_MS,
 	DEFAULT_HOST_REQUEST_MAX_AGE_MS,
 	DEFAULT_REVIVAL_VOUCH_MAX_AGE_MS,
 	type JournaledBashFacts,
@@ -564,6 +565,45 @@ describe("createTurnLiveness", () => {
 		liveness.refreshDegradedFacts();
 		expect(liveness.sample().vouched).toBe(false);
 		expect(events).toEqual([expect.objectContaining({ kind: "degraded_read_failed", reason: "EACCES" })]);
+	});
+
+	it("keeps an empty degraded read out of the forensic event stream (W25)", () => {
+		// liveBashHandles=0 is bookkeeping: sample() requires a positive count before the degraded
+		// path vouches, so an empty read can never back a takeover guarantee. Emitting it anyway put
+		// one info line per turn into the session log and - via the "stall watchdog:" prefix tee -
+		// into stall-evidence.jsonl, where 137/137 lines of the local evidence window were exactly
+		// this. The read still happens, still counts, still rate-limits, and still anchors the
+		// deadline; only the event is dropped.
+		const { liveness, events } = build({
+			kernel: facts({ latest: undefined, kernelPid: 7 }),
+			journal: () => ({ liveBashHandles: 0 }),
+		});
+		liveness.refreshDegradedFacts();
+		expect(liveness.degradedReads).toBe(1);
+		expect(liveness.sample().vouched).toBe(false);
+		expect(events).toEqual([]);
+		// The minimum re-read gap still applies to empty results.
+		liveness.refreshDegradedFacts();
+		expect(liveness.degradedReads).toBe(1);
+	});
+
+	it("still reports the first non-empty read after empty ones (W25)", () => {
+		// The session throttles liveness events to one line per kind per turn. An empty read that
+		// consumed that slot would silence the single line that announces a real takeover
+		// guarantee, so empty reads must not enter the event stream at all.
+		let handles = 0;
+		const { liveness, events, advance } = build({
+			kernel: facts({ latest: undefined, kernelPid: 7 }),
+			journal: () => ({ liveBashHandles: handles }),
+		});
+		liveness.refreshDegradedFacts();
+		expect(events).toEqual([]);
+
+		handles = 2;
+		advance(DEFAULT_DEGRADED_REFRESH_MIN_GAP_MS + 1);
+		liveness.refreshDegradedFacts();
+		expect(liveness.sample().vouched).toBe(true);
+		expect(events).toEqual([expect.objectContaining({ kind: "degraded_read", kernelPid: 7, liveBashHandles: 2 })]);
 	});
 
 	it("keeps a zero-handle journal read from vouching, and drops state on reset", () => {

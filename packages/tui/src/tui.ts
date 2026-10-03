@@ -2086,14 +2086,25 @@ export class TUI extends Container {
 			// Follow hint on the bottom row of the transcript window, just above
 			// the dock: dim text at the right edge, replacing the row instead of
 			// painting over a text line, and without a rule of its own so it does
-			// not stack on the prompt's top rule.
+			// not stack on the prompt's top rule. Rows appended while the window
+			// was paused get the loud variant (inverse video plus the count): "the
+			// window stopped following while new output streams past below it" is
+			// the state a dim hint alone failed to surface. On a narrow terminal
+			// the count variant falls back to just the count, then to the plain
+			// hint, rather than dropping the signal entirely.
 			const followKey = getKeybindings().getKeys("tui.viewport.follow")[0] ?? "ctrl+shift+down";
-			const label = ` ${formatFollowKey(followKey)} 回到底部 `;
+			const followKeyLabel = formatFollowKey(followKey);
+			const unseen = scrollInfo.unseenBelow;
+			const loud = unseen > 0;
+			let label = loud ? ` ↓ ${unseen} 行新内容 · ${followKeyLabel} 回到底部 ` : ` ${followKeyLabel} 回到底部 `;
+			if (loud && visibleWidth(label) + 2 > width) label = ` ↓ ${unseen} 行新内容 `;
 			const labelWidth = visibleWidth(label);
 			const row = fullscreen.viewport.headerHeight() + fullscreen.viewport.windowHeight() - 1;
 			if (row >= 0 && row < frame.length && labelWidth + 2 <= width) {
 				const padWidth = width - labelWidth - 1;
-				frame[row] = `${" ".repeat(padWidth)}\x1b[2m${label}\x1b[22m `;
+				frame[row] = loud
+					? `${" ".repeat(padWidth)}\x1b[7m${label}\x1b[27m `
+					: `${" ".repeat(padWidth)}\x1b[2m${label}\x1b[22m `;
 				fullscreen.viewport.subtractFrameClickCoverage(row, 0, width);
 			}
 		}

@@ -35,6 +35,8 @@ export interface ScrollInfo {
 	following: boolean;
 	linesBelow: number;
 	linesAbove: number;
+	/** Transcript rows appended while the window was paused and still below it. */
+	unseenBelow: number;
 	/** Transcript rows the window shows. */
 	windowHeight: number;
 }
@@ -128,6 +130,8 @@ type SelectionMode = "transcript" | "table" | "frame";
 export class FullscreenViewport {
 	private scrollTop = 0;
 	private following = true;
+	/** Transcript rows appended since the window paused; reset when following resumes. */
+	private unseenLines = 0;
 	/** A zero-width marker every frame strips; its row is scrolled into view once per request. */
 	private revealMarker: string | undefined;
 	/** Set by {@link setRevealMarker}; cleared once a frame has placed the marked row. */
@@ -234,6 +238,17 @@ export class FullscreenViewport {
 				}
 			}
 			transcript = transcript.map((line) => (line.includes(marker) ? line.split(marker).join("") : line));
+		}
+		if (this.following) {
+			this.unseenLines = 0;
+		} else {
+			// Rows appended while the window was paused are new to whoever scrolled up. Clamp
+			// to what is actually below the window: a rebuilt or compacted transcript re-anchors
+			// every row, and a count larger than linesBelow would claim content that is not there.
+			this.unseenLines = Math.min(
+				this.unseenLines + Math.max(0, maxScroll - this.lastMaxScroll),
+				Math.max(0, maxScroll - this.scrollTop),
+			);
 		}
 		this.lastMaxScroll = maxScroll;
 		this.lastWindowHeight = windowHeight;
@@ -1117,6 +1132,13 @@ export class FullscreenViewport {
 		const base = this.following ? this.lastMaxScroll : this.scrollTop;
 		this.scrollTop = Math.max(0, Math.min(base + delta, this.lastMaxScroll));
 		this.following = this.scrollTop >= this.lastMaxScroll;
+		if (this.following) {
+			this.unseenLines = 0;
+		} else {
+			// Reading part of the backlog does not mark it seen; the count only ever claims
+			// rows that are still below the window.
+			this.unseenLines = Math.min(this.unseenLines, Math.max(0, this.lastMaxScroll - this.scrollTop));
+		}
 	}
 
 	scrollToTop(): void {
@@ -1127,6 +1149,7 @@ export class FullscreenViewport {
 	scrollToBottom(): void {
 		this.scrollTop = this.lastMaxScroll;
 		this.following = true;
+		this.unseenLines = 0;
 	}
 
 	/**
@@ -1165,6 +1188,7 @@ export class FullscreenViewport {
 			following: this.following,
 			linesBelow: Math.max(0, this.lastMaxScroll - this.scrollTop),
 			linesAbove: this.scrollTop,
+			unseenBelow: this.unseenLines,
 			windowHeight: this.lastWindowHeight,
 		};
 	}

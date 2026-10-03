@@ -311,7 +311,9 @@ describe("TUI fullscreen mode", () => {
 		assert.strictEqual(viewport[0], "Line 11", "appended content does not move the window");
 		assert.strictEqual(viewport[8], "> prompt", "dock still visible");
 		assert.strictEqual(tui.getScrollInfo()?.linesBelow, 21);
-		assert.ok(viewport[7]?.includes("Ctrl+Shift+↓ 回到底部"), "follow hint composited above the dock");
+		// Rows appended while paused are called out as new content; at this width the
+		// count variant falls back to the count alone (the key hint needs more room).
+		assert.ok(viewport[7]?.includes("↓ 20 行新内容"), "new-content indicator composited above the dock");
 		assert.ok(!viewport[7]?.includes("─"), "the follow hint row draws no rule of its own");
 
 		tui.stop();
@@ -332,6 +334,72 @@ describe("TUI fullscreen mode", () => {
 		await terminal.waitForRender();
 		assert.ok(!terminal.getViewport().join("\n").includes("回到底部"));
 
+		tui.stop();
+	});
+
+	it("flags rows appended while unfollowed as new content, with a count", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput(WHEEL_UP);
+		await terminal.waitForRender();
+		// Scrolled into quiet history: the return hint shows, but nothing is claimed to be new.
+		assert.ok(terminal.getViewport().join("\n").includes("回到底部"));
+		assert.ok(!terminal.getViewport().join("\n").includes("新内容"));
+
+		terminal.clearWrites();
+		chat.lines = lines(40); // 20 rows appended while paused
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		const viewport = terminal.getViewport();
+		assert.ok(viewport[7]?.includes("↓ 20 行新内容"), "counts the rows appended while paused");
+		assert.ok(viewport[7]?.includes("回到底部"), "the return-to-bottom key is advertised with the count");
+		assert.ok(terminal.getWrites().includes("\x1b[7m"), "the new-content indicator is inverse video, not dim");
+		assert.strictEqual(tui.getScrollInfo()?.unseenBelow, 20);
+		assert.strictEqual(tui.getScrollInfo()?.following, false);
+		tui.stop();
+	});
+
+	it("clears the new-content flag when following resumes", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput(WHEEL_UP);
+		await terminal.waitForRender();
+		chat.lines = lines(40);
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.ok(terminal.getViewport().join("\n").includes("新内容"));
+
+		terminal.sendInput(FOLLOW);
+		await terminal.waitForRender();
+		assert.ok(!terminal.getViewport().join("\n").includes("新内容"));
+		assert.strictEqual(tui.getScrollInfo()?.following, true);
+		assert.strictEqual(tui.getScrollInfo()?.unseenBelow, 0);
+		tui.stop();
+	});
+
+	it("never claims more new rows than are actually below the window", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput(WHEEL_UP);
+		await terminal.waitForRender();
+		chat.lines = lines(40);
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.ok(terminal.getViewport().join("\n").includes("↓ 20 行新内容"));
+
+		// A rebuilt transcript (compaction) re-anchors every row: the count must not
+		// survive past what the new layout actually holds below the window.
+		chat.lines = lines(30);
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.ok(terminal.getViewport().join("\n").includes("↓ 11 行新内容"));
 		tui.stop();
 	});
 

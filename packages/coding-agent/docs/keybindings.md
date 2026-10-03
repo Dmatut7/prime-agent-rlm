@@ -92,6 +92,8 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 | `tui.viewport.top` | `shift+alt+up` | Scroll transcript to top |
 | `tui.viewport.follow` | `ctrl+shift+down` | Scroll to bottom and follow output |
 
+While the transcript is not following (you scrolled up), a hint on the row above the dock shows the follow key; if output arrived while you were away, the hint turns into an inverse-video `↓ N 行新内容` indicator counting the rows you have not seen.
+
 ### Application
 
 | Keybinding id | Default | Description |
