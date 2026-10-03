@@ -1,0 +1,1 @@
+- Fixed the turn title counting another window's changes as this session's work: the collapsed title's 改了 N 个文件 now excludes ambient rows (the box row keeps showing them with the 工作区 marker, matching the change strip's own/ambient split).

@@ -331,6 +331,11 @@ describe("timeline steps from the kernel's records", () => {
 		// strip splits out as 「工作区另有 N 个变动」.
 		expect(lines.some((line) => /^ {9}│ {11}✎ {2}modules\/aichat\/client\.go\s+\+12 −4 {4}$/.test(line))).toBe(true);
 		expect(lines.some((line) => /^ {9}│ {11}✎ {2}notes\.md\s+工作区 \+3 −1 {4}$/.test(line))).toBe(true);
+		// And the title counts only the session's own edit: the ambient change is not
+		// this session's work (the strip's own/ambient split already says so).
+		const out = lines.join("\n");
+		expect(out).toContain("改了 1 个文件");
+		expect(out).not.toContain("改了 2 个文件");
 	});
 });
 

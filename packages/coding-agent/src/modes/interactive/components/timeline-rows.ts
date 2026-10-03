@@ -98,6 +98,8 @@ export interface BoxRow {
 	outputNote?: string;
 	/** `detail` was made from the row's own facts, so it has nothing more to say than the row itself. */
 	factsOnly?: true;
+	/** The change came from another window or process: the row shows it, but counts like the title's 改了 N 个文件 must not claim it as this session's work. */
+	ambient?: true;
 	/** Stays visible when the box folds (failures). */
 	persistent?: boolean;
 	/** Files a merged read row covers. */
@@ -425,6 +427,7 @@ function changeRow(key: string, change: ChangeEntry, status: BoxRowStatus): BoxR
 		textColor: scratch ? "muted" : "activityText",
 		meta,
 		detail: changeDetail(change),
+		...(change.origin === "ambient" ? { ambient: true as const } : {}),
 	};
 }
 
@@ -1249,7 +1252,10 @@ function stepsSummary(steps: readonly BoxRow[], spawned: number): string {
 	if (count("think") > 0) parts.push(`想了 ${count("think")} 次`);
 	if (count("cmd") > 0) parts.push(`跑了 ${count("cmd")} 条命令`);
 	if (reads > 0) parts.push(`读了 ${reads} 个文件`);
-	if (count("edit") > 0) parts.push(`改了 ${count("edit")} 个文件`);
+	// Ambient rows (another window or process changed the file) render in the box
+	// but are not this session's work - the title must not count them.
+	const ownEdits = steps.filter((row) => row.kind === "edit" && !row.ambient).length;
+	if (ownEdits > 0) parts.push(`改了 ${ownEdits} 个文件`);
 	if (count("memory") > 0) parts.push(`记住 ${count("memory")} 条`);
 	if (spawned > 0) parts.push(`派了 ${spawned} 个子代理`);
 	if (parts.length === 0) parts.push(`做了 ${steps.length} 步`);
