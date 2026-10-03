@@ -1,0 +1,1 @@
+- Fixed workspace edits made while the session sat idle (between turns, with no command running) never being listed: each cell now opens with one catch-up comparison against the previous cell's end state, so those changes surface in the next turn's "工作区另有变动" line, attributed ambient unless a session command window covers them.

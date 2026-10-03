@@ -22,7 +22,11 @@ Observation paths:
   workspace while the cell ran. Inside a git work tree it compares ``git status``
   snapshots plus stat and content caches; elsewhere it compares a bounded mtime
   scan. A before-snapshot is taken for every cell, so even a cell that only reads
-  reports concurrent outside changes. Every record carries ``origin``: ``"own"``
+  reports concurrent outside changes. A cell's start also compares once against the
+  state the previous cell's comparison ended on - only when no cell ran for at least
+  ``GAP_CHECK_MIN_GAP_S``, so back-to-back cells pay nothing - so writes that landed
+  in an idle gap between turns are caught up in the starting cell. Every record
+  carries ``origin``: ``"own"``
   for writes the kernel saw this session make (the wrappers, the edit skill, or a
   moment inside one of this session's command windows) and ``"ambient"`` for what
   only showed up in the comparison at a moment no command of this session was
@@ -69,6 +73,10 @@ DEFAULT_CELL_BUDGET_S = 0.5
 BACKGROUND_BUDGET_S = 1.0
 # At most one mid-cell command comparison per interval; the final one at the cell's end always runs.
 LIVE_SHELL_CHECK_INTERVAL_S = 1.0
+# The catch-up comparison at a cell's start runs only when no cell ran for at least this long:
+# shorter gaps go unchecked (a write landing in one is rare enough), and the back-to-back cells
+# of a busy turn pay nothing for the catch-up.
+GAP_CHECK_MIN_GAP_S = 0.5
 # Longest a watcher tick may hold the cell's work lock while publishing live records.
 WATCH_TICK_BUDGET_S = 0.1
 # A file whose size and mtime held still across one interval is reported live.
@@ -508,6 +516,8 @@ _ABSENT = _Content("absent")
 _UNKNOWN = _Content("unknown", why="no_baseline")
 # A path the before-commit does not contain (see _Tracker.blobs).
 _MISSING = b"\0missing"
+# `accounted` lookup miss: the host was never brought to any state of the path.
+_UNACCOUNTED = object()
 
 
 def _link_content(path: str, sig: tuple[int, int]) -> _Content:
@@ -580,6 +590,7 @@ class _FileRec:
         "last_change",
         "published_sig",
         "ignored",
+        "gap",
     )
 
     def __init__(
@@ -599,6 +610,9 @@ class _FileRec:
         self.last_change: dict[str, Any] | None = None
         self.published_sig: tuple[int, int] | None | str = "unset"
         self.ignored = False
+        # Found by the between-cells catch-up (see `_gap_check`), with a baseline older than this
+        # cell's start: the cell's own comparison re-anchors such a record when it meets the path.
+        self.gap = False
 
 
 class _RepoState:
@@ -672,6 +686,28 @@ class _OutOfTime(Exception):
     """A tracker step ran past its deadline; the caller records why its list is partial."""
 
 
+class _GapProbe:
+    """The cell-shaped state a between-cells comparison runs against (see `_gap_check`).
+
+    Not a `_Cell`: nothing the host sees carries its id, it has no locks or budgets of its
+    own, and a probe counting live cells (a command left running must not keep its cell's
+    objects alive) must not mistake it for one.
+    """
+
+    __slots__ = ("files", "id", "incomplete", "repos", "scan")
+
+    def __init__(self) -> None:
+        self.id = ""
+        self.repos: dict[str, _RepoState] = {}
+        self.scan: tuple[str, dict[str, tuple[int, int]], frozenset[str]] | None = None
+        self.files: dict[str, _FileRec] = {}
+        self.incomplete: str | None = None
+
+    def note_incomplete(self, reason: str) -> None:
+        if self.incomplete is None:
+            self.incomplete = reason
+
+
 class _SnapshotJob:
     """One before-state snapshot (git status or mtime scan of some roots) on a worker thread.
 
@@ -698,8 +734,8 @@ _COMPARE_LATE = (
     "so changes made by commands in this cell are not listed"
 )
 _GAP_LATE = (
-    "comparing the files a background command changed after its cell ended took longer than "
-    "the tracking budget, so those changes are not listed"
+    "comparing what changed between cells took longer than the tracking budget, "
+    "so changes made while no cell was running are not listed"
 )
 
 
@@ -953,9 +989,16 @@ class _Tracker:
         # the same contract pending_completions has for background commands.
         self.pending_memory: list[dict[str, Any]] = []
         self.lost_memory = 0
-        # Where the last cell's command comparison ended, kept while it left commands running: a
-        # command that ends before the next cell starts is compared against it (see `_gap_check`).
+        # Where the last cell's comparison ended, and when (wall clock). The next cell's start is
+        # compared against it once the gap was long enough (see `_gap_check`), which catches
+        # everything written while no cell ran; a command that ends in the gap is compared
+        # against it right away instead.
         self.carried: _After | None = None
+        self.carried_at = 0.0
+        # Path -> signature the host was last brought to (every publish, retracts included). A
+        # between-cells finding that only re-describes that state is the previous cell's own
+        # work seen late, not a new change: skipped instead of reported twice.
+        self.accounted: dict[str, tuple[int, int] | None] = {}
         # What those between-cell comparisons found, for the next cell: path -> (baseline, after-sig).
         self.pending_changes: dict[str, tuple[_Content, tuple[int, int] | None]] = {}
         self.pending_note: str | None = None
@@ -1332,8 +1375,6 @@ class _Tracker:
             lost, self.lost_completions = self.lost_completions, 0
             memory_records, self.pending_memory = self.pending_memory, []
             lost_memory, self.lost_memory = self.lost_memory, 0
-            # From here on this cell's own snapshots cover commands still running.
-            self.carried = None
             changes, self.pending_changes = self.pending_changes, {}
             note, self.pending_note = self.pending_note, None
         if lost:
@@ -1355,9 +1396,29 @@ class _Tracker:
         for record in memory_records:
             self.send(cell.id, {MEMORY_CHANGE_MIME: record})
         if changes:
-            self.apply_shell_changes(cell, [(path, baseline, sig) for path, (baseline, sig) in changes.items()])
+            # The findings waited out a cell boundary; the cell that owned a write may have
+            # published it since they were computed. Ask `accounted` again before filing them.
+            drained = [(path, baseline, sig) for path, (baseline, sig) in changes.items()]
             with self.lock:
-                self._wake_watcher()
+                drained = [
+                    (path, baseline, sig)
+                    for path, baseline, sig in drained
+                    if self.accounted.get(path, _UNACCOUNTED) != sig
+                ]
+            if drained:
+                self.apply_shell_changes(cell, drained, gap=True)
+                with self.lock:
+                    self._wake_watcher()
+        # Everything written since the last cell's end - edits from other windows while the
+        # session sat idle, or a background command that ended quietly in the gap - is caught
+        # up by one comparison against that end state, on a worker (see `_gap_check`), and
+        # lands in this cell. Gaps shorter than GAP_CHECK_MIN_GAP_S go unchecked: the cells of
+        # a busy turn are back to back and must not each pay for a comparison. From here on
+        # this cell's own snapshots cover what runs now.
+        with self.lock:
+            gap_long_enough = self.carried is not None and time.time() - self.carried_at >= GAP_CHECK_MIN_GAP_S
+        if gap_long_enough:
+            self._request_gap_check()
         # Every cell gets a before-snapshot, not only cells with commands: the end-of-cell
         # comparison is what catches writes from other windows and processes (reported with
         # origin "ambient", never counted as this session's own), and it needs a state from
@@ -1366,14 +1427,10 @@ class _Tracker:
         # (see request_snapshot).
         self.request_snapshot(cell, os.getcwd(), wait=False)
 
-    def _live_handles(self) -> int:
-        bash_module = sys.modules.get("rlm.bash")
-        if bash_module is None:
-            return 0
-        try:
-            return int(bash_module.live_handle_facts(None).get("handles", 0))
-        except Exception:  # noqa: BLE001
-            return 0
+    def _set_carried(self, state: _After | None) -> None:
+        """The chain anchor for between-cells catch-ups; the caller holds `self.lock`."""
+        self.carried = state
+        self.carried_at = time.time()
 
     def discard_cell(self, cell_id: str) -> None:
         with self.lock:
@@ -1406,9 +1463,13 @@ class _Tracker:
                     for job in list(cell.snapshots):
                         self._await_snapshot(cell, job, deadline)
                     if cell.gave_up is None and (cell.repos or cell.scan is not None):
-                        # Commands left running may still change files after this comparison.
-                        keep = bool(still_running) or self._live_handles() > 0
-                        self._final_shell_compare(cell, deadline, keep)
+                        self._final_shell_compare(cell, deadline)
+                    else:
+                        # No completed comparison: the kept end-state no longer chains to
+                        # now, and the next cell's catch-up against it would mis-attribute
+                        # this cell's own unobserved writes. Break the chain instead.
+                        with self.lock:
+                            self._set_carried(None)
                     if cell.files and not self._cwd_git_resolved.is_set():
                         # Ignore rules and the build-output rule need it; normally it resolved long ago.
                         self._cwd_git_resolved.wait(max(0.0, _left(deadline)))
@@ -1445,13 +1506,14 @@ class _Tracker:
             return None
         return cell
 
-    def _final_shell_compare(self, cell: _Cell, deadline: float, keep: bool = False) -> None:
+    def _final_shell_compare(self, cell: _Cell, deadline: float) -> None:
         """The end-of-cell comparison, computed on a worker so a slow git cannot hold the event
-        loop past the budget; its result is applied here, on the cell's thread. `keep`: the state it
-        ends on is kept for commands that end before the next cell starts."""
+        loop past the budget; its result is applied here, on the cell's thread. The state it ends
+        on is kept as the baseline the next cell's start catches up from (see `_gap_check`); a
+        comparison that never completes breaks that chain instead of leaving it stale."""
         outcome: dict[str, Any] = {}
         done = threading.Event()
-        ended = _After() if keep else None
+        ended = _After()
 
         def work() -> None:
             self.local.busy = True
@@ -1465,19 +1527,18 @@ class _Tracker:
                 done.set()
 
         _spawn_thread(work, "rlm-change-compare")
-        if not done.wait(max(0.0, _left(deadline))):
-            cell.note_incomplete(_COMPARE_LATE)
-            return
-        if outcome.get("late"):
+        if not done.wait(max(0.0, _left(deadline))) or outcome.get("late"):
             cell.note_incomplete(_COMPARE_LATE)
         elif outcome.get("failed"):
             cell.note_incomplete("internal error while comparing command changes")
         else:
             self.apply_shell_changes(cell, outcome["changes"])
-            if ended is not None:
-                ended.roots = set(cell.roots_seen)
-                with self.lock:
-                    self.carried = ended
+            ended.roots = set(cell.roots_seen)
+            with self.lock:
+                self._set_carried(ended)
+            return
+        with self.lock:
+            self._set_carried(None)
 
     def guarded(self, cell: _Cell, work: Callable[[], Any]) -> Any:
         """Run tracker work on the calling thread with the budget charged and failures contained."""
@@ -1839,10 +1900,11 @@ class _Tracker:
                     return
 
     def _gap_check(self, carried: _After) -> None:
-        """A command ended while no cell was running: compare from where the last comparison ended,
-        on this worker and within one cell budget, and hand what changed to the next cell (or to the
-        one that started meanwhile), where the command's end is reported too."""
-        probe = _Cell("", self.budget_s)
+        """Compare from where the last cell's comparison ended, on this worker and within one
+        cell budget, and hand what changed to the running cell (or to the next one). Runs when
+        a command ends while no cell is running and once at every cell's start, so a gap nobody
+        probed - the session idle between turns - is still caught up."""
+        probe = _GapProbe()
         probe.repos = dict(carried.repos)
         probe.scan = carried.scan
         ended = _After()
@@ -1853,9 +1915,20 @@ class _Tracker:
         except _OutOfTime:
             changes = None
             probe.note_incomplete(_GAP_LATE)
+        if changes:
+            # The comparison ran whenever it ran - possibly mid-cell for the cell that ended
+            # since. A finding whose end signature is what the host was last brought to is
+            # that cell's own reported work seen late, not a new change.
+            with self.lock:
+                accounted = dict(self.accounted)
+            changes = [
+                (path, baseline, after_sig)
+                for path, baseline, after_sig in changes
+                if accounted.get(path, _UNACCOUNTED) != after_sig
+            ]
         with self.lock:
             if self.carried is carried:
-                self.carried = ended if changes is not None else None
+                self._set_carried(ended if changes is not None else None)
             target = self.cell if self.cell is not None and not self.cell.closing else None
         if target is not None:
             with target.work_lock:
@@ -1865,7 +1938,7 @@ class _Tracker:
                     if probe.incomplete:
                         target.note_incomplete(probe.incomplete)
                     if changes:
-                        self.apply_shell_changes(target, changes)
+                        self.apply_shell_changes(target, changes, gap=True)
                         with self.lock:
                             self._wake_watcher()
                     return
@@ -1873,7 +1946,11 @@ class _Tracker:
             if probe.incomplete and self.pending_note is None:
                 self.pending_note = probe.incomplete
             for path, baseline, after_sig in changes or []:
-                if path in self.pending_changes:
+                existing = self.pending_changes.get(path)
+                if existing is not None:
+                    # Chained findings for one path merge: the oldest unaccounted baseline
+                    # with the newest end state (the newer signature is what attribution reads).
+                    self.pending_changes[path] = (existing[0], after_sig)
                     continue
                 if len(self.pending_changes) >= MAX_FILES_PER_CELL:
                     self.pending_note = self.pending_note or (
@@ -1883,7 +1960,7 @@ class _Tracker:
                 self.pending_changes[path] = (baseline, after_sig)
 
     def shell_changes(
-        self, cell: _Cell, deadline: float, after: _After | None = None
+        self, cell: _Cell | _GapProbe, deadline: float, after: _After | None = None
     ) -> list[tuple[str, _Content, tuple[int, int] | None]]:
         """What changed since the before-snapshots, as (path, baseline, after-signature) triples
         (the signature is None for a deletion); `_OutOfTime` past the deadline.
@@ -1928,7 +2005,12 @@ class _Tracker:
                 return True
         return False
 
-    def apply_shell_changes(self, cell: _Cell, changes: list[tuple[str, _Content, tuple[int, int] | None]]) -> None:
+    def apply_shell_changes(
+        self, cell: _Cell, changes: list[tuple[str, _Content, tuple[int, int] | None]], gap: bool = False
+    ) -> None:
+        """File the comparison's findings in the cell. `gap`: the findings are the between-cells
+        catch-up's - their baselines predate the cell, so when the cell's own comparison meets the
+        same path it re-anchors the record to the cell-start state (the finding's own baseline)."""
         for path, baseline, after_sig in changes:
             if path in self.harness_files:
                 continue  # the harness's own saves report themselves as memory records
@@ -1939,11 +2021,19 @@ class _Tracker:
                     rec.dirty = True
                     if origin == "own":
                         rec.origin = "own"
+                    if not gap and rec.gap:
+                        # The cell's own account of the path supersedes the catch-up's: the
+                        # record shows what changed since this cell started, not since the
+                        # previous cell ended.
+                        rec.baseline = baseline
+                        rec.gap = False
                     continue
                 if len(cell.files) >= MAX_FILES_PER_CELL:
                     cell.note_incomplete(f"more than {MAX_FILES_PER_CELL} files changed; the rest are not listed")
                     return
-                cell.files[path] = _FileRec(path, baseline, "shell", origin=origin)
+                rec = _FileRec(path, baseline, "shell", origin=origin)
+                rec.gap = gap
+                cell.files[path] = rec
 
     def _prior_content(self, path: str, prior: tuple[int, int]) -> _Content:
         """What a file was before a command, from its old signature: a link, cached bytes, or unknown."""
@@ -1954,7 +2044,7 @@ class _Tracker:
 
     def _compare_repo(
         self,
-        cell: _Cell,
+        cell: _Cell | _GapProbe,
         before: _RepoState,
         deadline: float,
         changes: list[tuple[str, _Content, tuple[int, int] | None]],
@@ -1987,7 +2077,10 @@ class _Tracker:
         pending: list[tuple[str, _Content | None, tuple[int, int] | None]] = []
         for path in sorted(candidates):
             with self.lock:
-                if path in cell.files:
+                known = cell.files.get(path)
+                # A catch-up record for the path rides along: this comparison has the
+                # cell-start baseline for it, so it re-anchors the record (apply_shell_changes).
+                if known is not None and not known.gap:
                     continue
             if self.classify(path) is None:
                 continue
@@ -2048,7 +2141,7 @@ class _Tracker:
 
     def _compare_scan(
         self,
-        cell: _Cell,
+        cell: _Cell | _GapProbe,
         root: str,
         before: dict[str, tuple[int, int]],
         before_lost: frozenset[str],
@@ -2068,7 +2161,8 @@ class _Tracker:
             if prior == after.get(path):
                 continue
             with self.lock:
-                if path in cell.files:
+                known = cell.files.get(path)
+                if known is not None and not known.gap:
                     continue
             if self.classify(path) is None:
                 continue
@@ -2202,6 +2296,12 @@ class _Tracker:
         sig = _entry_sig(rec.path)
         rec.dirty = False
         rec.published_sig = sig
+        with self.lock:
+            # The host now knows this path as of `sig` (a change, no change, or a retract):
+            # a between-cells finding with the same end signature only re-describes it.
+            self.accounted[rec.path] = sig
+            if len(self.accounted) > _PATH_CACHE_LIMIT:
+                self.accounted.clear()
         change = self.build(cell, rec, info, sig)
         if change is None:
             if rec.emitted_key is not None:

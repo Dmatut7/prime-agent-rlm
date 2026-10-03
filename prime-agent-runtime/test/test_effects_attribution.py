@@ -5,7 +5,9 @@ A record carries ``origin``: ``"own"`` when the kernel saw this session make the
 ``"ambient"`` when the change only showed up in the before/after workspace comparison at a
 moment no command of this session was running (another window, another process). The
 comparison runs for every cell, so a pure-read cell still reports what others did to the
-workspace while it ran - labeled, never counted as the session's own.
+workspace while it ran; and each cell's start catches up what was written since the
+previous cell's comparison ended, once no cell ran for `GAP_CHECK_MIN_GAP_S` - labeled,
+never counted as the session's own.
 
 Every case drives a real `python -m rlm.repl` process; the "other window" is the test
 process itself writing mid-cell from a thread.
@@ -118,6 +120,35 @@ class AmbientAttributionTests(te.TrackerCase):
         self.assertEqual(record["kind"], "created")
         self.assertEqual(record["origin"], "own")
 
+    def test_an_ambient_write_while_no_cell_runs_is_caught_up_at_the_next_cell(self):
+        """The idle gap between cells (no command of this session anywhere): the next cell lists it."""
+        first = self.kernel.run("x = 1")
+        self.assertEqual(first.status, "ok")
+        self.write("idle-gap.txt", "written between cells\n")
+        time.sleep(1.2)  # past GAP_CHECK_MIN_GAP_S: the catch-up comparison runs at the next begin
+        second = self.kernel.run("import time\ntime.sleep(0.6)\n")
+        self.assertEqual(second.status, "ok")
+        record = second.by_rel()["idle-gap.txt"]
+        self.assertEqual(record["kind"], "created")
+        self.assertEqual(record["origin"], "ambient")
+        self.assertIn("+written between cells\n", record["diff"])
+
+    def test_a_background_commands_gap_writes_are_listed_when_it_outlives_the_gap(self):
+        """A command that writes between cells and is still running at the next cell's start:
+        its gap writes land in that cell (its own window is still open, so they stay own)."""
+        first = self.kernel.run("h = bash('sleep 0.8; echo late > bg-gap.txt; sleep 5')\nh.pid")
+        self.assertEqual(first.status, "ok")
+        self.assertNotIn("bg-gap.txt", first.by_rel())
+        time.sleep(1.4)  # the write lands while no cell runs; no command ends in the gap
+        try:
+            second = self.kernel.run("import time\ntime.sleep(0.6)\n")
+            self.assertEqual(second.status, "ok")
+            record = second.by_rel()["bg-gap.txt"]
+            self.assertEqual(record["kind"], "created")
+            self.assertEqual(record["origin"], "own")
+        finally:
+            self.kernel.run("h.kill()")
+
     def test_an_ambient_change_then_our_own_write_to_the_same_file_is_own(self):
         """Once this session writes a file itself, its record is own even if another process touched it first."""
         writer = _AmbientWriter()
@@ -143,6 +174,17 @@ class AmbientNoGitTests(te.TrackerCase):
         files = cell.by_rel()
         self.assertEqual(files["ambient.txt"]["kind"], "created")
         self.assertEqual(files["ambient.txt"]["origin"], "ambient")
+
+    def test_an_ambient_write_while_no_cell_runs_is_caught_up_without_git_too(self):
+        first = self.kernel.run("x = 1")
+        self.assertEqual(first.status, "ok")
+        self.write("idle-gap.txt", "between cells\n")
+        time.sleep(1.2)  # past GAP_CHECK_MIN_GAP_S: the catch-up comparison runs at the next begin
+        second = self.kernel.run("import time\ntime.sleep(0.6)\n")
+        self.assertEqual(second.status, "ok")
+        record = second.by_rel()["idle-gap.txt"]
+        self.assertEqual(record["kind"], "created")
+        self.assertEqual(record["origin"], "ambient")
 
 
 if __name__ == "__main__":
