@@ -1,0 +1,1 @@
+- Added a build-generated V8 compile cache shipped next to the bundled CLI (`dist/bundle/compile-cache`), so the first start after `npm run build`/install is already warm (~70ms faster first frame and `--help`); it is used only when the running Node version matches the build-time one and falls back to the default cache otherwise.
