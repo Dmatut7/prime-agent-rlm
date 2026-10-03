@@ -38,6 +38,21 @@ export interface SnapshotDroppedName {
 	reason: string;
 }
 
+/**
+ * Skip classes a healthy snapshot produces every time: leading-underscore names
+ * are never persisted by convention (the bootstrap re-binds the `_prime_agent_*`
+ * internals on every start), and the host-injected callable skill modules
+ * (`_PrimeAgent*` wrapper classes, bound at public names like `websearch`) cannot
+ * pickle and would be re-injected over a restore anyway. A write whose dropped
+ * names are all these is routine, not warning-worthy.
+ */
+export function isExpectedSnapshotSkip(entry: SnapshotDroppedName): boolean {
+	return (
+		entry.reason === "private-name convention: leading-underscore names are not persisted" ||
+		entry.reason.includes("cannot pickle '_PrimeAgent")
+	);
+}
+
 /** One revived name whose semantics are reduced, and the runtime's reason. */
 export interface RestoreDegradedName {
 	name: string;

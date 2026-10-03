@@ -496,7 +496,7 @@ describe("agents view state", () => {
 
 		expect(rows.map((row) => [row.title, row.kind])).toEqual([
 			["Parent", "agent"],
-			["2 subagents running · 1 heartbeat active", "subagent-summary"],
+			["2 个子代理运行中 · 1 个定时任务进行中", "subagent-summary"],
 			["Other", "agent"],
 		]);
 		expect(rows.map((row) => row.runningSubagentCount)).toEqual([2, 2, 0]);
@@ -540,7 +540,7 @@ describe("agents view state", () => {
 		expect(collapsed[1]).toMatchObject({
 			kind: "subagent-summary",
 			section: "idle",
-			title: "1 subagent · 1 heartbeat active",
+			title: "1 个子代理 · 1 个定时任务进行中",
 			runningSubagentCount: 0,
 		});
 		const expanded = buildAgentsViewRows(summaries, new Set([collapsed[0]?.identity ?? ""]));
@@ -590,7 +590,7 @@ describe("agents view state", () => {
 		const collapsed = buildAgentsViewRows(summaries);
 		expect(collapsed[0]).toMatchObject({ kind: "agent", section: "idle", runningSubagentCount: 1 });
 		expect(collapsed[0]?.statusLabel).toBe("completed");
-		expect(collapsed[1]).toMatchObject({ kind: "subagent-summary", section: "idle", title: "1 subagent running" });
+		expect(collapsed[1]).toMatchObject({ kind: "subagent-summary", section: "idle", title: "1 个子代理运行中" });
 
 		const expanded = buildAgentsViewRows(summaries, new Set([collapsed[0]?.identity ?? ""]));
 		const childRow = expanded.find((row) => row.title === "Child");
@@ -632,7 +632,7 @@ describe("agents view state", () => {
 
 		const collapsed = buildAgentsViewRows(summaries);
 		expect(collapsed[0]?.runningSubagentCount).toBe(0);
-		expect(collapsed[1]).toMatchObject({ kind: "subagent-summary", section: "idle", title: "1 subagent" });
+		expect(collapsed[1]).toMatchObject({ kind: "subagent-summary", section: "idle", title: "1 个子代理" });
 		const expanded = buildAgentsViewRows(summaries, new Set([collapsed[0]?.identity ?? ""]));
 		expect(expanded.find((row) => row.title === "Child")?.runningSubagentCount).toBe(0);
 	});
@@ -750,7 +750,7 @@ describe("agents view state", () => {
 		// own top-level session while only the spawned child nests and counts.
 		const rows = buildAgentsViewRows(withChild, new Set(), new Set(), undefined, computeRecursiveRollups(withChild));
 		expect(rows.find((row) => row.summary.sessionId === "branch-session")).toMatchObject({ kind: "agent", depth: 0 });
-		expect(rows.find((row) => row.kind === "subagent-summary")).toMatchObject({ title: "1 subagent" });
+		expect(rows.find((row) => row.kind === "subagent-summary")).toMatchObject({ title: "1 个子代理" });
 	});
 
 	test("tallies a very deep child chain without overflowing the stack", () => {
@@ -876,7 +876,7 @@ describe("agents view state", () => {
 		expect(rows[0]).toMatchObject({ section: "idle", runningSubagentCount: 1 });
 		expect(rows[1]).toMatchObject({
 			kind: "subagent-summary",
-			title: "1 subagent running · 10 heartbeats active",
+			title: "1 个子代理运行中 · 10 个定时任务进行中",
 			runningSubagentCount: 1,
 		});
 	});
@@ -971,14 +971,14 @@ describe("agents view state", () => {
 
 		const collapsed = buildAgentsViewRows(summaries);
 		expect(collapsed.map((row) => row.kind)).toEqual(["agent", "subagent-summary"]);
-		expect(collapsed[1]?.title).toBe("1 subagent running");
+		expect(collapsed[1]?.title).toBe("1 个子代理运行中");
 		expect(collapsed[1]?.expanded).toBe(false);
 
 		const parentIdentity = collapsed[0]?.identity;
 		const expanded = buildAgentsViewRows(summaries, new Set([parentIdentity ?? ""]));
 		expect(expanded.map((row) => [row.title, row.kind, row.depth])).toEqual([
 			["Parent", "agent", 0],
-			["1 subagent running", "subagent-summary", 1],
+			["1 个子代理运行中", "subagent-summary", 1],
 			["Child", "subagent", 1],
 			["Completed child", "subagent", 1],
 		]);
@@ -1025,18 +1025,18 @@ describe("agents view state", () => {
 		const oneLevel = buildAgentsViewRows(summaries, new Set([rootIdentity]));
 		expect(oneLevel.map((row) => [row.title, row.kind])).toEqual([
 			["Root", "agent"],
-			["2 subagents running", "subagent-summary"],
+			["2 个子代理运行中", "subagent-summary"],
 			["Child", "subagent"],
-			["1 subagent running", "subagent-summary"],
+			["1 个子代理运行中", "subagent-summary"],
 		]);
 
 		const childIdentity = oneLevel.find((row) => row.title === "Child")?.identity ?? "";
 		const twoLevel = buildAgentsViewRows(summaries, new Set([rootIdentity, childIdentity]));
 		expect(twoLevel.map((row) => [row.title, row.kind, row.depth])).toEqual([
 			["Root", "agent", 0],
-			["2 subagents running", "subagent-summary", 1],
+			["2 个子代理运行中", "subagent-summary", 1],
 			["Child", "subagent", 1],
-			["1 subagent running", "subagent-summary", 2],
+			["1 个子代理运行中", "subagent-summary", 2],
 			["Grandchild", "subagent", 2],
 		]);
 	});
@@ -1067,7 +1067,7 @@ describe("agents view state", () => {
 
 		expect(rows.map((row) => [row.title, row.kind])).toEqual([
 			["Parent", "agent"],
-			["1 subagent", "subagent-summary"],
+			["1 个子代理", "subagent-summary"],
 		]);
 		expect(rows[1]?.selectable).toBe(true);
 	});
@@ -1104,7 +1104,7 @@ describe("agents view state", () => {
 
 		expect(rows.map((row) => [row.title, row.kind])).toEqual([
 			["Parent", "agent"],
-			["1 subagent running", "subagent-summary"],
+			["1 个子代理运行中", "subagent-summary"],
 			["Legacy rlm child", "agent"],
 		]);
 		expect(rows[0]?.runningSubagentCount).toBe(1);
@@ -1174,7 +1174,7 @@ describe("agents view state", () => {
 		// launched — padded with a blank panel line above and below, no truncation.
 		expect(expanded.map((row) => [row.kind, row.code ?? row.title])).toEqual([
 			["agent", "Parent"],
-			["subagent-summary", "3 subagents"],
+			["subagent-summary", "3 个子代理"],
 			["subagent-code", ""],
 			["subagent-code", "task = sleep(60)"],
 			["subagent-code", "for i in range(2):"],
@@ -1603,7 +1603,7 @@ describe("agents view state", () => {
 		expect(aggregates.get("parent")).toEqual({ activeCount: 2, nextRunAt: "2026-01-01T00:05:00Z" });
 		const rows = buildAgentsViewRows(reconcileUnifiedSessions([parent, child], [], [heartbeat("one")]));
 		expect(rows[0]).toMatchObject({ section: "idle", heartbeat: { activeCount: 1 } });
-		expect(rows[1]).toMatchObject({ title: "1 subagent · 1 heartbeat active" });
+		expect(rows[1]).toMatchObject({ title: "1 个子代理 · 1 个定时任务进行中" });
 		expect(formatHeartbeatBadge(aggregates.get("parent"), Date.parse("2026-01-01T00:00:00Z"))).toBe("♥ 2·5m");
 		expect(
 			formatHeartbeatBadge(

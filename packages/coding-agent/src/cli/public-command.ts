@@ -63,7 +63,7 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 	}
 
 	if (!PUBLIC_COMMAND_NAMES.has(command)) {
-		return continueWith(args);
+		return rejectBareCommandTypo(args);
 	}
 	if (command === "update" && process.env[SELF_UPDATE_INTERACTIVE_CHILD_ENV] === "1") {
 		await handlePackageCommand(args);
@@ -182,6 +182,29 @@ function normalizeLeadingDaemonSocketOption(args: string[]): string[] {
 
 function continueWith(args: string[]): PublicCommandResult {
 	return { handled: false, args, explicitAgentsView: false };
+}
+
+/**
+ * A lone word that almost spells a command (`prime-agent sessions`) is a mistyped
+ * command, not a prompt: it used to sail through to the model, burning a call and
+ * leaving a junk session in the caller's cwd (wave-35 walkthrough F2). Only a
+ * one-word, file-free message gets the typo check — multi-word messages and
+ * prompts with @files stay prompts, so `prime-agent fix the bug` is unaffected.
+ */
+function rejectBareCommandTypo(args: string[]): PublicCommandResult {
+	const parsed = parseArgs(args);
+	if (parsed.fileArgs.length > 0 || parsed.messages.length !== 1) {
+		return continueWith(args);
+	}
+	const word = parsed.messages[0]!;
+	const suggestion = findCommandSuggestion(word, [...PUBLIC_COMMAND_NAMES]);
+	if (suggestion === undefined) {
+		return continueWith(args);
+	}
+	return fail(
+		`Unknown command: ${word}`,
+		`Did you mean "${APP_NAME} ${suggestion}"? Run "${APP_NAME} help" to list commands, or pass a prompt after "--".`,
+	);
 }
 
 function printRequestedHelp(path: string[]): PublicCommandResult {

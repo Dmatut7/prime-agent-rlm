@@ -94,6 +94,7 @@ import {
 import {
 	DEFAULT_SNAPSHOT_MAX_BYTES,
 	DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES,
+	isExpectedSnapshotSkip,
 	isolateCorruptSnapshot,
 	type RestoreResult,
 	readSnapshotManifest,
@@ -3249,10 +3250,20 @@ export class ReplKernelManager {
 						.map((entry) => `${entry.name} (${entry.reason})`)
 						.join("; ")}`,
 				);
-				kernelLog.warn("kernel state snapshot could not save names", {
-					names,
-					sessionId: this.options.sessionId,
-				});
+				// By-convention skips (private names, host skill wrappers) fire on every
+				// healthy snapshot, so they are debug noise; warn only when a name outside
+				// the convention failed to save (wave-36 walkthrough F4).
+				if (this.lastSnapshotNotSaved.some((entry) => !isExpectedSnapshotSkip(entry))) {
+					kernelLog.warn("kernel state snapshot could not save names", {
+						names,
+						sessionId: this.options.sessionId,
+					});
+				} else {
+					kernelLog.debug("kernel state snapshot could not save names", {
+						names,
+						sessionId: this.options.sessionId,
+					});
+				}
 			}
 			return {
 				saved: asStringArray(r.doneFields.saved),

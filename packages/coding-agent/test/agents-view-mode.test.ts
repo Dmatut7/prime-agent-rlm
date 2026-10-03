@@ -1319,14 +1319,14 @@ describe("AgentsViewMode", () => {
 		try {
 			const busyRows = buildAgentsViewRows([parent, busyChild]);
 			const busySummaryRow = busyRows.find((row) => row.kind === "subagent-summary");
-			expect(busySummaryRow).toMatchObject({ section: "idle", title: "1 subagent running" });
+			expect(busySummaryRow).toMatchObject({ section: "idle", title: "1 个子代理运行中" });
 			Reflect.set(view, "rows", busyRows);
-			expect(invoke("renderRow", view, busySummaryRow, 160)).toContain(theme.fg("success", "▸ 1 subagent running"));
+			expect(invoke("renderRow", view, busySummaryRow, 160)).toContain(theme.fg("success", "▸ 1 个子代理运行中"));
 
 			const idleRows = buildAgentsViewRows([parent, idleChild]);
 			const idleSummaryRow = idleRows.find((row) => row.kind === "subagent-summary");
 			Reflect.set(view, "rows", idleRows);
-			expect(invoke("renderRow", view, idleSummaryRow, 160)).toContain(theme.fg("dim", "▸ 1 subagent"));
+			expect(invoke("renderRow", view, idleSummaryRow, 160)).toContain(theme.fg("dim", "▸ 1 个子代理"));
 		} finally {
 			stopThemeWatcher();
 		}

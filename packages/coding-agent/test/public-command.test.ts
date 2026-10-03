@@ -374,7 +374,52 @@ describe("public command routing", () => {
 		expect(mocks.daemonCommands).toEqual([["daemon", "send", "worker", "--", "--help"]]);
 	});
 
-	it("leaves natural-language prompts beginning with help on the prompt path", async () => {
+	it("rejects a lone near-miss of a command instead of running it as a prompt", async () => {
+		await expect(handlePublicCommand(["sessions"])).resolves.toMatchObject({ handled: true });
+
+		expect(process.exitCode).toBe(1);
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("Unknown command: sessions"));
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining('Did you mean "prime-agent session"?'));
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining('"prime-agent help"'));
+	});
+
+	it("rejects a command typo sitting behind global options", async () => {
+		// The wave-35 walkthrough shape: `prime-agent --daemon-socket X sessions`
+		// used to create a junk session with "sessions" as the prompt.
+		await expect(handlePublicCommand(["--daemon-socket", "/tmp/w36.sock", "sessions"])).resolves.toMatchObject({
+			handled: true,
+		});
+
+		expect(process.exitCode).toBe(1);
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("Unknown command: sessions"));
+	});
+
+	it("names the prompt escape hatch in the rejection", async () => {
+		await handlePublicCommand(["statsu"]);
+
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining('Did you mean "prime-agent status"?'));
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining('after "--"'));
+	});
+
+	it("keeps one-word prompts that match no command on the prompt path", async () => {
+		const args = ["refactor"];
+		await expect(handlePublicCommand(args)).resolves.toEqual({
+			handled: false,
+			args,
+			explicitAgentsView: false,
+		});
+	});
+
+	it("keeps multi-word messages on the prompt path even when the first word nearly matches a command", async () => {
+		const args = ["sessions", "are", "great"];
+		await expect(handlePublicCommand(args)).resolves.toEqual({
+			handled: false,
+			args,
+			explicitAgentsView: false,
+		});
+	});
+
+	it("keeps natural-language prompts beginning with help on the prompt path", async () => {
 		const args = ["help", "me", "fix", "this"];
 		await expect(handlePublicCommand(args)).resolves.toEqual({
 			handled: false,

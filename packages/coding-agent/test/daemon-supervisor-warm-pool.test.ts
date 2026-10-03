@@ -696,7 +696,7 @@ describe("daemon supervisor warm spare pool", () => {
 		expect(secondSummary.activeSessionId ?? secondSummary.id).toBe(replenished.env[ACTIVE_SESSION_ENV_LITERAL]!);
 	});
 
-	it("emits spawn telemetry with status, duration, depth sample, and totals", async () => {
+	it("emits spawn telemetry with outcome, duration, depth sample, and totals", async () => {
 		setLogSink((entry) => {
 			logEntries.push(entry);
 		});
@@ -704,7 +704,8 @@ describe("daemon supervisor warm spare pool", () => {
 		await waitForCondition(() => warmPoolEvents("spawn").length === 1, "the spare spawn telemetry");
 
 		const spawn = warmPoolEvents("spawn")[0]!;
-		expect(spawn.status).toBe("ready");
+		// Spawn and claim share the `outcome` result key; reclaim attributes by `reason`.
+		expect(spawn.outcome).toBe("ready");
 		expect(spawn.durationMs).toBeGreaterThanOrEqual(0);
 		// The spare is still mid-publish at its own spawn event: counted as warming.
 		expect(eventDepth(spawn)).toEqual({ ready: 0, warming: 1 });

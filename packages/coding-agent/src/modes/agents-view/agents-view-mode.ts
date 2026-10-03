@@ -1873,7 +1873,7 @@ export class AgentsViewMode implements Component, Focusable {
 		return false;
 	}
 
-	/** True when the selected row exposes the "show program" affordance. */
+	/** True when the selected row exposes the 显示程序 (show program) affordance. */
 	private selectedRowCanShowProgram(): boolean {
 		const row = this.rows[this.selectedIndex];
 		if (!row) {
@@ -3172,7 +3172,7 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		if (row.kind === "subagent-summary") {
 			const indent = "  ".repeat(row.depth);
-			const hint = row.hasSpawnCode ? theme.fg("dim", ` · ${keyText("app.agents.program")} show program`) : "";
+			const hint = row.hasSpawnCode ? theme.fg("dim", ` · ${keyText("app.agents.program")} 显示程序`) : "";
 			const titleColor = row.runningSubagentCount > 0 ? ("success" as const) : ("dim" as const);
 			const label = `${theme.fg(titleColor, `${row.expanded ? "▾" : "▸"} ${row.title}`)}${hint}`;
 			const line = padLine(truncateToWidth(`${indent}${label}`, width, ""), width);

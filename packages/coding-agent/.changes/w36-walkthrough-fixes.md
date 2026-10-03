@@ -1,0 +1,4 @@
+- Fixed a lone mistyped command word (`prime-agent sessions`) being sent to the model as a prompt and leaving a junk session: it now exits with an unknown-command error, a did-you-mean, and the `prime-agent help` pointer; `--` still forces prompt interpretation.
+- Unified warm pool telemetry on one result key: spawn events now report `outcome` (ready|failed) exactly like claim events (hit|miss|expired); reclaim events keep `reason` for attribution.
+- Demoted the per-session "kernel state snapshot could not save names" log line from warn to debug when every dropped name is a by-convention skip (private `_prime_agent_*` internals, host skill wrapper modules); a genuinely unsavable name still warns.
+- Translated the session list's remaining English fragments to Chinese: the subagent summary row ("1 个子代理运行中 · 2 个定时任务进行中") and the spawn-program hint ("Ctrl+O 显示程序").

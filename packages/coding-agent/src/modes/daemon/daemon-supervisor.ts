@@ -5330,12 +5330,18 @@ export class DaemonSupervisor {
 	/**
 	 * One structured metric line per pool lifecycle event ("warm pool
 	 * spawn|claim|reclaim" on the coding-agent.daemon-supervisor component, so
-	 * agent.jsonl stays greppable). `depth` is the pool gauge sampled at event
-	 * time: ready spares plus still-warming spawns (a spare emitting its own
-	 * spawn-ready event still counts as warming; its inflight entry clears after
-	 * publish). `totals` carries the supervisor-lifetime counters so a rotated
-	 * log still reconstructs the tally. The operational log lines are unchanged;
-	 * this stream is structured log only — never the daemon wire.
+	 * agent.jsonl stays greppable). Field convention: `outcome` is the result
+	 * discriminator wherever the event has more than one terminal result —
+	 * spawn reports ready|failed and claim reports hit|miss|expired under the
+	 * same key, so jq reads `(.outcome)` across both. A reclaim's outcome is
+	 * implied by the event itself (the spare left the pool), so it carries
+	 * `reason` + `detail` for attribution instead. `depth` is the pool gauge
+	 * sampled at event time: ready spares plus still-warming spawns (a spare
+	 * emitting its own spawn-ready event still counts as warming; its inflight
+	 * entry clears after publish). `totals` carries the supervisor-lifetime
+	 * counters so a rotated log still reconstructs the tally. The operational
+	 * log lines are unchanged; this stream is structured log only — never the
+	 * daemon wire.
 	 */
 	private logWarmPoolTelemetry(event: "spawn" | "claim" | "reclaim", fields: Record<string, unknown>): void {
 		const totals = this.warmPoolTotals;
@@ -5545,7 +5551,7 @@ export class DaemonSupervisor {
 			this.warmSpareFailures.set(key, { failedAt: Date.now(), reason });
 			this.warmPoolTotals.spawns.failed++;
 			this.logWarmPoolTelemetry("spawn", {
-				status: "failed",
+				outcome: "failed",
 				cwd,
 				workerId,
 				durationMs: Date.now() - spawnStartedAt,
@@ -5578,7 +5584,7 @@ export class DaemonSupervisor {
 		// claimed, or reclaimed shows up in the claim/reclaim events.
 		this.warmPoolTotals.spawns.ready++;
 		this.logWarmPoolTelemetry("spawn", {
-			status: "ready",
+			outcome: "ready",
 			cwd,
 			workerId,
 			durationMs: Date.now() - spawnStartedAt,

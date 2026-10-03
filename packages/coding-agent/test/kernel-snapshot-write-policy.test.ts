@@ -81,7 +81,10 @@ function writeFakeKernel(): string {
 			"      id: req.id,",
 			"      status: 'ok',",
 			"      saved: ['fresh', ...kept],",
-			"      skipped: dropped.map((name) => ({ name, reason: 'exceeds aggregate snapshot size cap' })),",
+			"      skipped: [",
+			"        ...dropped.map((name) => ({ name, reason: 'exceeds aggregate snapshot size cap' })),",
+			"        ...JSON.parse(process.env.FAKE_SKIPPED_JSON || '[]'),",
+			"      ],",
 			"      preserved: kept,",
 			"      bytes: 32,",
 			"    });",
@@ -309,6 +312,54 @@ describe("snapshot writes after a partial restore", () => {
 		},
 		60_000,
 	);
+});
+
+describe("snapshot skip log level", () => {
+	it("logs by-convention skips at debug, not warn", async () => {
+		const fakeKernel = writeFakeKernel();
+		const manager = newManager(fakeKernel, {
+			FAKE_SKIPPED_JSON: JSON.stringify([
+				{ name: "_prime_agent_sys", reason: "private-name convention: leading-underscore names are not persisted" },
+				{ name: "websearch", reason: "TypeError: cannot pickle '_PrimeAgentCallableSkillModule' object" },
+			]),
+		});
+
+		try {
+			await manager.start();
+			const snapshot = await manager.snapshotState();
+			expect(snapshot?.skipped).toHaveLength(2);
+
+			const reports = entries.filter((entry) => entry.msg === "kernel state snapshot could not save names");
+			expect(reports).toHaveLength(1);
+			expect(reports[0]?.level).toBe("debug");
+			expect(reports[0]?.names).toEqual(["_prime_agent_sys", "websearch"]);
+		} finally {
+			await manager.shutdown({});
+		}
+	}, 60_000);
+
+	it("still warns when a name outside the convention fails to save", async () => {
+		const fakeKernel = writeFakeKernel();
+		const manager = newManager(fakeKernel, {
+			FAKE_SKIPPED_JSON: JSON.stringify([
+				{ name: "_prime_agent_sys", reason: "private-name convention: leading-underscore names are not persisted" },
+				{ name: "gen", reason: "TypeError: cannot pickle 'generator' object" },
+			]),
+		});
+
+		try {
+			await manager.start();
+			const snapshot = await manager.snapshotState();
+			expect(snapshot?.skipped).toHaveLength(2);
+
+			const reports = entries.filter((entry) => entry.msg === "kernel state snapshot could not save names");
+			expect(reports).toHaveLength(1);
+			expect(reports[0]?.level).toBe("warn");
+			expect(reports[0]?.names).toEqual(["_prime_agent_sys", "gen"]);
+		} finally {
+			await manager.shutdown({});
+		}
+	}, 60_000);
 });
 
 describe("snapshot write policy", () => {

@@ -78,7 +78,7 @@ describe("refreshAgentsViewRowTimeLabels", () => {
 				kind: "subagent-summary",
 				section: "idle",
 				summary: parent,
-				title: "3 subagents",
+				title: "3 个子代理",
 				subtitle: "",
 				statusLabel: "",
 				depth: 1,

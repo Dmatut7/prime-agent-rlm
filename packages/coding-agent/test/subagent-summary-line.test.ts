@@ -448,7 +448,7 @@ describe("SubagentSummaryLine", () => {
 		// Reader 1: the agents view rolls a busy grandchild up to every idle ancestor.
 		const viewRows = buildAgentsViewRows(summaries);
 		expect(viewRows[0]).toMatchObject({ kind: "agent", runningSubagentCount: 1 });
-		expect(viewRows[1]).toMatchObject({ kind: "subagent-summary", title: "1 subagent running" });
+		expect(viewRows[1]).toMatchObject({ kind: "subagent-summary", title: "1 个子代理运行中" });
 
 		// Reader 2: the tray counts the same subtree, so the two faces cannot disagree.
 		expect(countRosterSubagentStatuses(summaries, { activeSessionId: "parent-active" })).toEqual({
@@ -495,7 +495,7 @@ describe("SubagentSummaryLine", () => {
 		});
 		const viewRows = buildAgentsViewRows(summaries);
 		expect(viewRows[0]).toMatchObject({ kind: "agent", runningSubagentCount: 1 });
-		expect(viewRows[1]).toMatchObject({ kind: "subagent-summary", title: "1 subagent running" });
+		expect(viewRows[1]).toMatchObject({ kind: "subagent-summary", title: "1 个子代理运行中" });
 	});
 
 	it("keeps chat alive with the snapshot-fed bar when the roster subscribe fails", async () => {

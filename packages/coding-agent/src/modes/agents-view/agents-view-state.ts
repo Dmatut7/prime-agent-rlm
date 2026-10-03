@@ -1171,14 +1171,8 @@ function createSubagentSummaryRow(
 	).length;
 	// Finished subagents stay reachable through the summary row even when
 	// nothing is running anymore.
-	const subagentTitle =
-		running > 0
-			? `${running} ${running === 1 ? "subagent" : "subagents"} running`
-			: `${totalCount} ${totalCount === 1 ? "subagent" : "subagents"}`;
-	const title =
-		heartbeatCount > 0
-			? `${subagentTitle} · ${heartbeatCount} ${heartbeatCount === 1 ? "heartbeat" : "heartbeats"} active`
-			: subagentTitle;
+	const subagentTitle = running > 0 ? `${running} 个子代理运行中` : `${totalCount} 个子代理`;
+	const title = heartbeatCount > 0 ? `${subagentTitle} · ${heartbeatCount} 个定时任务进行中` : subagentTitle;
 	return {
 		kind: "subagent-summary",
 		section: parent.section,
@@ -1508,7 +1502,7 @@ export function getAgentsViewSessionTitle(summary: SessionSummary): string {
 			return normalized;
 		}
 	}
-	return "Untitled agent";
+	return "未命名会话";
 }
 
 function getSessionSubtitle(summary: SessionSummary): string {
