@@ -17,7 +17,7 @@ import re
 import stat
 import threading
 import unicodedata
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Generator
@@ -41,6 +41,13 @@ _KINDS: tuple[HarnessKind, ...] = ("prompt", "memory", "skill", "subagent")
 # The overflow catalog in overview() names hidden entries one line each; cap it
 # so a huge store cannot turn the digest into the dump the window was avoiding.
 _OVERFLOW_CATALOG_MAX = 50
+# Advisory near-duplicate gate on memory writes. The threshold was calibrated
+# against the production global store (1576 memories, 2026-10-03): the score
+# band (0.311, 0.405) is empty there, every pair at 0.55+ is a true
+# same-rule rewrite pair, and 0.40-0.55 adds three more true pairs against one
+# borderline. Evidence: docs/fork/evidence/harness-near-duplicate-write-gate.md.
+_NEAR_DUPLICATE_SIMILARITY_MIN = 0.40
+_NEAR_DUPLICATE_MAX_MATCHES = 3
 _state_cache: dict[tuple[Path, HarnessScope], "HarnessState"] = {}
 
 
@@ -413,6 +420,11 @@ class HarnessEntry(_AwaitableResult):
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
     version: int = 1
+    # Write-time feedback set only on the receipt returned by a memory write
+    # that landed near an existing entry; never on the stored entry, never
+    # persisted, and excluded from equality so a warned receipt still compares
+    # equal to the stored entry it describes.
+    near_duplicate_warning: str | None = field(default=None, compare=False)
 
 
 @dataclass
@@ -449,6 +461,14 @@ register_plain_list(AwaitableSearchHits)
 
 _ENTRY_FIELDS = {field.name for field in fields(HarnessEntry)}
 _REFINEMENT_FIELDS = {field.name for field in fields(RefinementEvent)}
+
+
+def _persisted_entry_record(entry: HarnessEntry) -> dict[str, Any]:
+    record = asdict(entry)
+    # Write-time feedback is recomputed per write; persisting it would
+    # fossilize stale advice into the state file the TS host also reads.
+    record.pop("near_duplicate_warning", None)
+    return record
 
 
 def _validate_python_skill_reference(reference: dict[str, Any] | None, entry_name: str = "") -> dict[str, Any]:
@@ -888,7 +908,7 @@ class HarnessState:
             data = {
                 "schema": 1,
                 "entries": {
-                    kind: {entry_id: asdict(entry) for entry_id, entry in records.items()}
+                    kind: {entry_id: _persisted_entry_record(entry) for entry_id, entry in records.items()}
                     for kind, records in self.entries.items()
                 },
                 "refinements": [asdict(event) for event in self.refinements],
@@ -1066,7 +1086,19 @@ class HarnessState:
             before=previous_content,
             after=content,
         )
-        return entry
+        if kind != "memory":
+            return entry
+        try:
+            warning = self._near_duplicate_memory_warning(entry, is_create=existing is None)
+        except Exception:  # noqa: BLE001 - advisory feedback must never fail a persisted write
+            # A reported failure after a successful save invites a retry that
+            # creates the very duplicate this warning exists to prevent.
+            warning = None
+        if warning is None:
+            return entry
+        # The warning rides on a receipt copy; the stored entry stays clean so
+        # later reads and saves never see stale write-time advice.
+        return replace(entry, near_duplicate_warning=warning)
 
     def get(self, kind: HarnessKind, id: str, *, global_: bool = False, **kwargs: Any) -> HarnessEntry | None:
         id, global_, _claimed_scope = _strip_scope_prefix(id, global_)
@@ -1489,6 +1521,70 @@ class HarnessState:
             lines.append("refinements: 0")
         return AwaitableText("\n".join(lines))
 
+    def _near_duplicate_memory_matches(self, candidate: HarnessEntry) -> list[tuple[str, float]]:
+        """Rank the store's other memories by idf-weighted cosine against ``candidate``.
+
+        Reuses ``search``'s tokenizer (``_harness_query_terms``) and idf shape
+        (``log(1 + N / df)``) over title+content, with the whole memory kind as
+        the document-frequency corpus; the candidate itself is excluded from
+        the match list. Only matches at ``_NEAR_DUPLICATE_SIMILARITY_MIN`` or
+        better survive, best first, capped at ``_NEAR_DUPLICATE_MAX_MATCHES``.
+        """
+        terms = frozenset(_harness_query_terms(f"{candidate.title} {candidate.content}"))
+        corpus = list(self.entries["memory"].values())
+        if not terms or len(corpus) < 2:
+            return []
+        profiles = {
+            entry.id: frozenset(_harness_query_terms(f"{entry.title} {entry.content}")) for entry in corpus
+        }
+        document_count = len(corpus)
+        document_frequency: dict[str, int] = {}
+        for profile in profiles.values():
+            for term in profile:
+                document_frequency[term] = document_frequency.get(term, 0) + 1
+        idf = {term: math.log(1 + document_count / count) for term, count in document_frequency.items()}
+        candidate_norm = math.sqrt(sum(idf[term] ** 2 for term in terms))
+        if candidate_norm == 0:
+            return []
+        matches: list[tuple[str, float]] = []
+        for entry in corpus:
+            if entry.id == candidate.id:
+                continue
+            profile = profiles[entry.id]
+            shared = terms & profile
+            if not shared:
+                continue
+            dot = sum(idf[term] ** 2 for term in shared)
+            norm = math.sqrt(sum(idf[term] ** 2 for term in profile))
+            if norm == 0:
+                continue
+            score = dot / (candidate_norm * norm)
+            if score >= _NEAR_DUPLICATE_SIMILARITY_MIN:
+                matches.append((entry.id, score))
+        matches.sort(key=lambda match: (-match[1], match[0]))
+        return matches[:_NEAR_DUPLICATE_MAX_MATCHES]
+
+    def _near_duplicate_memory_warning(self, entry: HarnessEntry, *, is_create: bool) -> str | None:
+        matches = self._near_duplicate_memory_matches(entry)
+        if not matches:
+            return None
+        labels = []
+        for match_id, score in matches:
+            flat = _flatten_inline(match_id)
+            if len(flat) > 120:
+                flat = f"{flat[:117]}..."
+            labels.append(f"'{flat}'（相似度 {score:.2f}）")
+        listed = "、".join(labels)
+        if is_create:
+            return (
+                f"近重复警告：已有相似条目 {listed}，建议 update_memory 更新相似条目而不是新建；"
+                "本次写入已完成，确属独立条目可忽略。"
+            )
+        return (
+            f"近重复警告：已有相似条目 {listed}，"
+            "与本次更新后的内容高度重合，建议合并为一条；本次更新已完成。"
+        )
+
     def search(
         self,
         query: str,
@@ -1574,7 +1670,7 @@ class HarnessState:
             "file_path": str(self.file_path),
             "scope": self.scope,
             "entries": {
-                kind: {entry_id: asdict(entry) for entry_id, entry in records.items()}
+                kind: {entry_id: _persisted_entry_record(entry) for entry_id, entry in records.items()}
                 for kind, records in self.entries.items()
             },
             "refinements": [asdict(event) for event in self.refinements],
