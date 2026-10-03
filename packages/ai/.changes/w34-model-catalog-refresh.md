@@ -1,0 +1,1 @@
+- Refreshed the model catalog from live provider catalogs, picking up upstream price and output-limit updates for DeepSeek and Kimi routes on OpenRouter; verified the Z.AI coding-plan table (GLM-5.3, GLM-5.3-Flash, GLM-5.2, GLM-5-Turbo) against official specs.
