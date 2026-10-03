@@ -1,4 +1,13 @@
-## 2026-10-04 wave-35 七路：per-model 窗口真错配修复、过度自验二期、空会话 cwd 修复、壳评审
+## 2026-10-04 wave-36 五路：第七刀 quota-park、走查四小项、死代码清除
+
+- AgentSession 第七刀：quota-park 生命周期状态机（park→resume→wake→restore，约 550 行/18 方法）搬进 core/quota-park.ts——agent-session.ts 20932→20313 行（七刀累计 23500→20313，−3187），守恒经脚本化逐字节比对（17644 字符 18/18 全等）。顺带销壳评审登记：错位注释归位 stallExempted、反向扫描一行委托去重。
+- 死代码清除（放权行使）：3 个零引用公有 API 删除（autoRetryEnabled getter、hasExtensionHandlers、refreshModelMetadata——全仓含 scripts 零引用，上游带入的遗留）。
+- 走查四小项：①未注册单词子命令（如 `sessions`）不再被当 prompt 发模型留垃圾会话——编辑距离命中注册命令时报错+did-you-mean，`--` 可逃生；②暖池遥测 spawn/claim 统一 `outcome` 字段；③kernel snapshot 的全预期跳过不再 warn 刷屏；④agents-view 子代理/定时任务/程序提示中文化。
+- 实机验证：F1 cwd 修复修复前后对照实证（修复前 bundle 复现跳变、HEAD 正确）；finish gate 安静（0 挑战）；主流程全绿。
+- 调研：Codex god-file（codex.rs）消融四连拆 PR 链取证——我们的「一刀一提交+守恒比对+测试随码」与其惯例一致；OpenHands condenser 常驻非阻塞套件是记忆帽裁决的新参照。
+- 门禁：check EXIT 0、hygiene OK、单测 9552 绿（1 例负载抖动隔离即绿）、suite 1674/1674。需要重新编译并重启后才生效。
+
+
 
 - per-model autocompact 主体：预判的错配（窗口不随模型走）实测不存在（所有触发点本就现读当前模型）；真错配是注册表热重载（live catalog）后运行中会话仍持有选择时刻捕获的 model 对象——网关重报小窗永远到不了触发器。修复：7 处窗口读取点改为按 (provider,id) 现查注册表、回退捕获值。5 例新测试（含网关降窗复现、bailian 实测钳制）。
 - 过度自验二期：proof 段加 early-stop 收敛判据（首次验证照旧，收敛即停）。EX-4 最优 rep 224k tok/12t（对 wave-34 的 261k 再 −14%；post-DONE 46k→25k；对 wave-33 原始基线 post-DONE −91%），判分全过；EX-1..7 全题复核无回退。

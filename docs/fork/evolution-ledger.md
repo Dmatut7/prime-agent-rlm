@@ -14,17 +14,16 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-04 凌晨，wave-35 已 SHIP）
+## 当前状态（2026-10-04，wave-36 已 SHIP）
 
-- HEAD = 见 git log（四批：per-model 窗口错配修复、过度自验二期、F1 cwd 修复、FORK_NOTES+账本）。
-- wave-35 关键数字：EX-4 最优 224k tok（对 wave-34 再 −14%、对 wave-33 基线 post-DONE −91%）；
-  EX-1..7 复核无回退；注册表热重载的窗口错配修复（7 处读取点现查注册表）。
-- 事故与教训：F1 的 cwd 注入初版无闸门，一个 await 挪动 lazy-subagents 的发布-校验交错时序
-  （3 例真红）——修法是收窄闸门到 resume 形态（config 在、cwd 被删），时序零变化。
-  lane 纪律新增：lane 私有 PRIME_AGENT_CODING_AGENT_DIR（wave-35 两起共享 home 污染：
-  mock lane 覆写 models.json 致 EX-6/7 首轮静默回退）。
-- 壳评审在手（/tmp/wave35/shell-review.md）：第七刀 = quota-park（477 行/25 成员）。
-- 门禁：check EXIT 0、hygiene OK、单测绿（修复后 47/47 + 全量复扫）、suite 1674/1674。
+- HEAD = 见 git log（三批：第七刀+死代码、走查四小项、FORK_NOTES+账本）。
+- wave-36：agent-session.ts 20313 行（七刀累计 −3187）；3 个死公有 API 清除（放权行使，
+  全仓零引用证据）；F2/F3/F4/F5 走查小项修掉（F2 未注册子命令报错+逃生口）。
+- 工艺对照：Codex codex.rs 消融四连拆的守恒三件套（re-export 保外观/测试随码/PR 写死验证）
+  与我们既有模式一致；OpenHands condenser 常驻非阻塞套件 = 记忆帽裁决新参照。
+- /tmp 会被系统清理——wave-35 research.md 实体已丢，教训：调研全文只在 /tmp 留不住，
+  关键结论必须进账本/FORK_NOTES（本波起执行）。
+- 门禁：check EXIT 0、hygiene OK、单测 9552 绿（1 例负载抖动隔离即绿）、suite 1674/1674。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -105,17 +104,14 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
   把在跑会话归档。犯了就是事故，写进 FORK_NOTES 向老板披露。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-36 候选）
+## 下一波主题（wave-37 候选）
 
-1. 【模型持久化一致性】证据链闭合（CC 被拒残留 / Gemini 三态 #19891 / OpenHands 静默漂移 /
-   Aider opt-in 对照）：修法共识 = 拒绝判定三态化 + 单一权威写入点 + agent 发起切换默认确认。
-   顺带：未知 --model 静默回退默认模型报 auth 错（EXAM lane 遗留观察）改显式报错。
-2. 【第七刀 quota-park】477 行/25 成员/低 churn（/tmp/wave35/shell-review.md §2）；顺带销
-   壳评审登记的 1 处注释错位 + 1 处重复扫描（一行委托）。
-3. 【走查新立项四条】未注册子命令被当 prompt 执行留垃圾会话（F2）；暖池遥测字段命名统一
-   status/outcome（F3）；kernel snapshot warn 噪音（F4）；会话列表中英混排（F5）。
-4. 【死代码裁决】壳评审登记的 3 个零引用公有 API（autoRetryEnabled/hasExtensionHandlers/
-   refreshModelMetadata）——仓规「删除前先问」，问老板或在 FORK_NOTES 预告一波再删。
-5. 【首请求 ≤1.5s 等服务端窗口】per-model 主体遗留的唯一大项（wave-35 修复后写注册表即生效，
-   手术面在首请求链路）。
-6. 【暖池遥测消费面】capability 演进方案；/model 被拒残留验收测试（等 wave-36 项 1）。
+1. 【模型持久化一致性】证据链闭合（CC 被拒残留 / Gemini 三态 / OpenHands 漂移+连接解析 /
+   Aider opt-in）：拒绝判定三态化 + 单一权威写入点 + agent 发起切换默认确认 + 未知 --model
+   显式报错。本主题需独占 agent-session.ts。
+2. 【第八刀候选】stall 簇（748 行/45 成员/churn 32）或 image-routing（358 行/20 成员）；
+   压缩超簇需两刀设计先出。
+3. 【暖池遥测消费面】capability 演进方案 + provider 归因解析（OpenHands #5332 教训）。
+4. 【首请求服务端窗口】≤1.5s 有界等待拿服务端权威窗口（per-model 主体遗留）。
+5. 【会话状态列词表中文化】wave-36 F5 遗留（342 处 pin、跨 daemon，单独一波做）。
+6. 【记忆帽裁决】仍待老板三选一。
