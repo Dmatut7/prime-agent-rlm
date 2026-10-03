@@ -54,6 +54,7 @@ import {
 	IPYTHON_STATE_PRUNED_CUSTOM_TYPE,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	MCP_CONNECTION_OUTCOME_CUSTOM_TYPE,
+	MODEL_CHANGE_CUSTOM_TYPE,
 	PYTHON_SKILLS_UNAVAILABLE_CUSTOM_TYPE,
 	REFINEMENT_NOTICE_CUSTOM_TYPE,
 	REFINEMENT_OUTCOME_CUSTOM_TYPE,
@@ -177,6 +178,8 @@ const CUSTOM_TYPE_INPUT_CLASSES: ReadonlyMap<string, InputClass> = new Map<strin
 	[THINKING_LEVEL_CLAMPED_CUSTOM_TYPE, "internal_continuation"],
 	[IMAGE_DELIVERY_SUSPICION_CUSTOM_TYPE, "internal_continuation"],
 	[IPYTHON_STATE_RESTORED_CUSTOM_TYPE, "internal_continuation"],
+	// Model-facing record of a mid-session model switch: machine context, never a turn.
+	[MODEL_CHANGE_CUSTOM_TYPE, "internal_continuation"],
 	// Display-only owner-facing notices: kernel variables pruned after compaction,
 	// transcript damage found on load, and a finish-gate release - machine
 	// bookkeeping for the human to read, never a turn input.

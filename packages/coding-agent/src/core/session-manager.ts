@@ -58,6 +58,7 @@ import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	createModelChangeMessage,
 } from "./messages.js";
 import {
 	artifactDirectoryWriteMs,
@@ -1008,15 +1009,38 @@ export function buildSessionContext(
 	// summary records where clients should present it among retained messages.
 	const messages: AgentMessage[] = [];
 
+	// The creation prefix (leading model_change + thinking_level_change +
+	// service_tier_change) is bootstrap bookkeeping, and a later model_change that
+	// repeats the current model is adoption bookkeeping: neither is a switch.
+	let seenContentEntry = false;
+	let lastModelChange: string | undefined;
+
 	const appendMessage = (entry: SessionEntry, target = messages) => {
 		if (entry.type === "message") {
 			target.push(entry.message);
+			seenContentEntry = true;
 		} else if (entry.type === "custom_message") {
 			target.push(
 				createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
 			);
+			seenContentEntry = true;
+		} else if (entry.type === "model_change") {
+			const key = `${entry.provider}/${entry.modelId}`;
+			const isRealSwitch = seenContentEntry && lastModelChange !== undefined && key !== lastModelChange;
+			lastModelChange = key;
+			// The model must know it changed hands: the notice is synthesized at
+			// assembly time from the durable entry, never persisted twice.
+			if (isRealSwitch) {
+				target.push(
+					createModelChangeMessage(
+						{ provider: entry.provider, modelId: entry.modelId },
+						new Date(entry.timestamp).getTime(),
+					),
+				);
+			}
 		} else if (entry.type === "branch_summary" && entry.summary) {
 			target.push(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
+			seenContentEntry = true;
 		}
 	};
 

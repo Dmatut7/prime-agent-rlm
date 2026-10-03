@@ -84,6 +84,14 @@ export const ASYNC_BASH_COMPLETION_PREVIEW_LABEL = "Background command finished"
 
 export const THINKING_LEVEL_CLAMPED_CUSTOM_TYPE = "thinking_level_clamped";
 export const IMAGE_DELIVERY_SUSPICION_CUSTOM_TYPE = "image_delivery_suspicion";
+/**
+ * Model-facing notice that the session switched models at this point in the
+ * conversation. Synthesized from the transcript's `model_change` entry where the
+ * context is assembled - never persisted as its own entry, so the transcript
+ * keeps a single record of the switch. `display: false`: the model is the only
+ * audience (the TUI already shows the switch through its own channels).
+ */
+export const MODEL_CHANGE_CUSTOM_TYPE = "model_change";
 
 /**
  * Framing for a refinement outcome that is rendered back into the model's
@@ -1394,6 +1402,76 @@ function refinementOutcomeToLlmMessage(message: unknown): Message | undefined {
 	return { role: "user", content: [{ type: "text", text }], timestamp: message.timestamp };
 }
 
+export interface ModelChangeNoticeDetails {
+	/** Provider the session switched to. */
+	provider: string;
+	/** Model id the session switched to. */
+	modelId: string;
+}
+
+export interface ModelChangeMessage extends CustomMessage<ModelChangeNoticeDetails> {
+	customType: typeof MODEL_CHANGE_CUSTOM_TYPE;
+	content: string;
+	details: ModelChangeNoticeDetails;
+}
+
+/**
+ * Framing for a model switch rendered into the model's context. Custom messages
+ * reach the provider as user-role messages, so the text has to say out loud that
+ * it is an automatic notice and not a user instruction (the same rule
+ * REFINEMENT_OUTCOME_PREFIX follows). provider/modelId interpolate raw, the same
+ * way createEmptyResponseRecoveryMessage reports its model pair.
+ */
+export function modelChangeNoticeText(details: ModelChangeNoticeDetails): string {
+	const model = `${details.provider}/${details.modelId}`;
+	return [
+		`[model change] Automatic session notice, not a message from the user and not a new instruction: the model serving this session changed to ${model} at this point in the conversation.`,
+		`Assistant turns above this notice were produced by the previous model; you are ${model}. Read earlier self-descriptions, capability claims, and model-specific plans as the previous model's, and continue the work as yourself.`,
+	].join("\n");
+}
+
+/**
+ * The model-change record as a message: built where a `model_change` session
+ * entry is assembled into the live or rebuilt context, so the model learns of
+ * the switch on the next turn instead of acting on the previous model's
+ * self-image.
+ */
+export function createModelChangeMessage(
+	details: ModelChangeNoticeDetails,
+	timestamp = Date.now(),
+): ModelChangeMessage {
+	return {
+		role: "custom",
+		customType: MODEL_CHANGE_CUSTOM_TYPE,
+		content: modelChangeNoticeText(details),
+		display: false,
+		details,
+		timestamp,
+	};
+}
+
+export function isModelChangeMessage(message: unknown): message is ModelChangeMessage {
+	if (!isRecord(message) || !hasValidCustomMessageEnvelope(message, MODEL_CHANGE_CUSTOM_TYPE)) return false;
+	if (!isRecord(message.details)) return false;
+	return typeof message.details.provider === "string" && typeof message.details.modelId === "string";
+}
+
+/**
+ * Renders a model-change record as a model-visible notice. Returns undefined for
+ * malformed records, which are silently dropped exactly as before (the same rule
+ * refinementOutcomeToLlmMessage follows).
+ */
+function modelChangeNoticeToLlmMessage(message: unknown): Message | undefined {
+	if (!isModelChangeMessage(message)) {
+		return undefined;
+	}
+	return {
+		role: "user",
+		content: [{ type: "text", text: modelChangeNoticeText(message.details) }],
+		timestamp: message.timestamp,
+	};
+}
+
 /**
  * Transform AgentMessages (including custom types) to LLM-compatible Messages.
  *
@@ -1422,6 +1500,12 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						// recorded lesson from one that was silently refused. Only outcomes
 						// that actually report something reach the model.
 						return refinementOutcomeToLlmMessage(m);
+					}
+					if (m.customType === MODEL_CHANGE_CUSTOM_TYPE) {
+						// A model switch used to live only in the session ledger, so the
+						// next turn's model kept acting on the previous model's self-image.
+						// The switch record reaches the model as a framed notice instead.
+						return modelChangeNoticeToLlmMessage(m);
 					}
 					if (
 						m.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE ||

@@ -1,0 +1,2 @@
+- Fixed the model never learning it was switched mid-session: `model_change` now reaches the model context as a brief notice (live switches push it into session state; resume/compaction/tree jumps synthesize it from the durable entry), so the model stops acting as its predecessor.
+- Reduced stall-watchdog noise: heartbeat-degraded reads with zero live bash handles (pure bookkeeping) no longer land in stall-evidence.jsonl; only reads that actually vouch for a turn are recorded.

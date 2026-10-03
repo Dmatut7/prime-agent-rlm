@@ -3,7 +3,7 @@ import { fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AgentCronJob } from "../../src/core/cron-jobs.js";
-import { HARNESS_DIGEST_PREFIX } from "../../src/core/messages.js";
+import { HARNESS_DIGEST_PREFIX, isModelChangeMessage } from "../../src/core/messages.js";
 import type { ExtensionAPI } from "../../src/index.js";
 import { conversationMessages, createHarness, getAssistantTexts, getMessageText, type Harness } from "./harness.js";
 
@@ -300,7 +300,9 @@ describe("AgentSession model and extension characterization", () => {
 		const prompt = harness.session.prompt("hi");
 		await flushAsyncWork();
 
-		expect(harness.session.messages).toHaveLength(0);
+		// A model switch legitimately leaves one resident: the model_change
+		// notice the model needs (wave-25). Everything else must still be empty.
+		expect(harness.session.messages.filter((m) => !isModelChangeMessage(m))).toHaveLength(0);
 
 		finishHandler.resolve();
 		await prompt;
@@ -310,9 +312,10 @@ describe("AgentSession model and extension characterization", () => {
 
 		expect(
 			conversationMessages(harness.session)
-				.slice(0, 2)
+				.slice(0, 3)
 				.map((message) => ({ role: message.role, text: getMessageText(message) })),
 		).toEqual([
+			{ role: "custom", text: expect.stringContaining("the model serving this session changed to faux/faux-2") },
 			{ role: "custom", text: "model context" },
 			{ role: "user", text: "hi" },
 		]);
@@ -355,7 +358,9 @@ describe("AgentSession model and extension characterization", () => {
 		});
 		await flushAsyncWork();
 
-		expect(harness.session.messages).toHaveLength(0);
+		// A model switch legitimately leaves one resident: the model_change
+		// notice the model needs (wave-25). Everything else must still be empty.
+		expect(harness.session.messages.filter((m) => !isModelChangeMessage(m))).toHaveLength(0);
 
 		finishHandler.resolve();
 		await accepted;
@@ -363,9 +368,10 @@ describe("AgentSession model and extension characterization", () => {
 
 		expect(
 			conversationMessages(harness.session)
-				.slice(0, 2)
+				.slice(0, 3)
 				.map((message) => ({ role: message.role, text: getMessageText(message) })),
 		).toEqual([
+			{ role: "custom", text: expect.stringContaining("the model serving this session changed to faux/faux-2") },
 			{ role: "custom", text: "accepted model context" },
 			{ role: "user", text: "agent-to-agent payload" },
 		]);
@@ -439,7 +445,9 @@ describe("AgentSession model and extension characterization", () => {
 		const heartbeat = harness.session.promptHeartbeat(createHeartbeat());
 		await flushAsyncWork();
 
-		expect(harness.session.messages).toHaveLength(0);
+		// A model switch legitimately leaves one resident: the model_change
+		// notice the model needs (wave-25). Everything else must still be empty.
+		expect(harness.session.messages.filter((m) => !isModelChangeMessage(m))).toHaveLength(0);
 
 		finishHandler.resolve();
 		await heartbeat;
@@ -447,9 +455,10 @@ describe("AgentSession model and extension characterization", () => {
 
 		expect(
 			conversationMessages(harness.session)
-				.slice(0, 2)
+				.slice(0, 3)
 				.map((message) => ({ role: message.role, text: getMessageText(message) })),
 		).toEqual([
+			{ role: "custom", text: expect.stringContaining("the model serving this session changed to faux/faux-2") },
 			{ role: "custom", text: "heartbeat model context" },
 			{ role: "custom", text: "Check whether the long-running task needs another step." },
 		]);
