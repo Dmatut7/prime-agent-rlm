@@ -1,5 +1,5 @@
 import type { ChildProcess, SpawnOptions } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -454,6 +454,67 @@ describe("daemon supervisor warm spare pool", () => {
 		// The replenish spare targets the create's own cwd.
 		expect(hoisted.spawned[2]!.cwd).toBe(otherProjectDir);
 		expect(hoisted.spawned[2]!.env[DAEMON_WORKER_WARM_SPARE_ENV]).toBe("1");
+	});
+
+	it("resumes a cwd-stripped sessionPath create in the session's stored cwd, claiming that cwd's spare", async () => {
+		setLogSink((entry) => {
+			logEntries.push(entry);
+		});
+		const { agentDir, projectDir, otherProjectDir, client } = await startPoolSupervisor({
+			ttlMs: 30_000,
+			spawnCooldownMs: 0,
+		});
+		await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
+		expect(hoisted.spawned[0]!.cwd).toBe(projectDir);
+
+		// A live session in the other project leaves a stocked spare behind for it.
+		const first = await client.request({ type: "create", config: { cwd: otherProjectDir } }, 10_000);
+		expect(first.success).toBe(true);
+		await waitForCondition(
+			() =>
+				hoisted.spawned.some(
+					(spawn) => spawn.cwd === otherProjectDir && spawn.env[DAEMON_WORKER_WARM_SPARE_ENV] === "1",
+				),
+			"the other-project spare",
+		);
+		const otherSpare = hoisted.spawned.find(
+			(spawn) => spawn.cwd === otherProjectDir && spawn.env[DAEMON_WORKER_WARM_SPARE_ENV] === "1",
+		)!;
+		const otherSpareServer = await otherSpare.server;
+
+		// The agents-view resume shape after an empty-session eviction: sessionPath
+		// set with config.cwd stripped, so the session's own stored directory must
+		// drive both the spawn cwd and the warm-pool claim key.
+		const sessionDir = join(agentDir, "sessions");
+		mkdirSync(sessionDir, { recursive: true });
+		const sessionFile = join(sessionDir, "stored-cwd.jsonl");
+		writeFileSync(
+			sessionFile,
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id: "stored-cwd",
+				timestamp: new Date().toISOString(),
+				cwd: otherProjectDir,
+			})}\n`,
+			{ mode: 0o600 },
+		);
+
+		const resumed = await client.request({ type: "create", sessionPath: sessionFile, config: {} }, 10_000);
+		expect(resumed.success).toBe(true);
+		// The fake worker's summary reports its spawn cwd: the stored cwd's spare
+		// serves the resume, not the daemon-default spare.
+		const summary = responseData(resumed) as { cwd?: string };
+		expect(summary.cwd).toBe(otherProjectDir);
+		expect(otherSpareServer.commands).toContain("create");
+
+		// The claim telemetry pins the key, and the pooled projectDir spare was
+		// never touched by this create.
+		const claims = warmPoolEvents("claim");
+		expect(claims.length).toBeGreaterThan(0);
+		expect(claims.some((entry) => entry.outcome === "hit" && entry.cwd === otherProjectDir)).toBe(true);
+		const projectSpareServer = await hoisted.spawned[0]!.server;
+		expect(projectSpareServer.commands).not.toContain("create");
 	});
 
 	it("misses when the client launch env differs from the spare's spawn environment", async () => {

@@ -4688,6 +4688,20 @@ export class DaemonSupervisor {
 				? resolve(command.sessionPath)
 				: await this.catalog.resolve(command.sessionPath, config.cwd ?? process.cwd(), config.sessionDir);
 			createCommand = { ...createCommand, sessionPath };
+			// A config present with cwd stripped means "open in the session's stored
+			// directory" (createAgentsViewResumeConfig deletes the key; a plain
+			// sessionPath open carries no config at all). Rehydrate it from the
+			// session file, or the launch below falls back to this daemon's cwd and
+			// both the spawn directory and the warm-pool claim key land in the wrong
+			// place. Gated on the config being present at all: a config-less open
+			// must not pay the read (its publish-then-validate interleaving is
+			// pinned by daemon-supervisor-lazy-subagents.test.ts).
+			if (createCommand.config !== undefined && createCommand.config.cwd === undefined) {
+				const storedCwd = (await readSessionInfo(sessionPath))?.cwd;
+				if (storedCwd) {
+					createCommand = { ...createCommand, config: { ...createCommand.config, cwd: storedCwd } };
+				}
+			}
 		}
 		const key = createCommand.sessionPath
 			? canonicalSessionPath(createCommand.sessionPath)
