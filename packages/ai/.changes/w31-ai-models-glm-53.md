@@ -1,0 +1,1 @@
+- Refreshed the model catalog from live provider catalogs: GLM-5.2/GLM-5.3 entries carry the official 1M context window and 128K max output across zai, OpenRouter, and Prime Inference, and Prime Inference now pins `z-ai/glm-5.3` as featured.

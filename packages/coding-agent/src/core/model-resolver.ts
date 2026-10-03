@@ -14,7 +14,7 @@ import { isPrivatePrimeInferenceModel } from "./prime-inference-models.js";
 
 const log = getLogger("coding-agent.model-resolver");
 
-export const PRIME_INFERENCE_DEFAULT_MODEL_ID = "z-ai/glm-5.2";
+export const PRIME_INFERENCE_DEFAULT_MODEL_ID = "z-ai/glm-5.3";
 
 /** Default model IDs for each known provider */
 export const defaultModelPerProvider: Record<KnownProvider, string> = {
@@ -29,7 +29,7 @@ export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	"google-vertex": "gemini-3.1-pro-preview",
 	"github-copilot": "gpt-5.4",
 	openrouter: "moonshotai/kimi-k2.6",
-	"vercel-ai-gateway": "zai/glm-5.1",
+	"vercel-ai-gateway": "zai/glm-5.3",
 	xai: "grok-4.20-0309-reasoning",
 	groq: "openai/gpt-oss-120b",
 	cerebras: "gpt-oss-120b",

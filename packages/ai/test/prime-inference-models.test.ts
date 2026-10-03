@@ -55,6 +55,7 @@ describe("Prime Inference models", () => {
 	it("marks flagship models as featured so pickers can pin them above the long tail", () => {
 		expect(getModel("prime-inference", "openai/gpt-5.5").featured).toBe(true);
 		expect(getModel("prime-inference", "z-ai/glm-5.2").featured).toBe(true);
+		expect(getModel("prime-inference", "z-ai/glm-5.3").featured).toBe(true);
 		expect(getModel("prime-inference", "moonshotai/kimi-k3").featured).toBe(true);
 		expect(getModel("prime-inference", "google/gemini-2.5-pro").featured).toBeUndefined();
 		expect(getModel("prime-inference", "openai/gpt-4o").featured).toBeUndefined();
@@ -96,8 +97,8 @@ describe("Prime Inference models", () => {
 			expect(model.input).toEqual(["text", "image"]);
 			expect(model.contextWindow).toBe(1048576);
 			expect(model.maxTokens).toBe(1048576);
-			expect(model.cost.input).toBe(provider === "prime-inference" ? 3.45 : 0.6635);
-			expect(model.cost.output).toBe(provider === "prime-inference" ? 17.25 : 10);
+			expect(model.cost.input).toBe(provider === "prime-inference" ? 3.45 : 2.7);
+			expect(model.cost.output).toBe(provider === "prime-inference" ? 17.25 : 13.5);
 		}
 	});
 

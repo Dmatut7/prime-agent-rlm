@@ -203,6 +203,7 @@ const PRIME_INFERENCE_FEATURED_MODELS = new Set([
 	"z-ai/glm-5",
 	"z-ai/glm-5.1",
 	"z-ai/glm-5.2",
+	"z-ai/glm-5.3",
 ]);
 
 // Prime ids whose OpenRouter listing uses a different id (e.g. after an

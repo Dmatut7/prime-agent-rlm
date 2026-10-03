@@ -1,0 +1,1 @@
+- Changed the Prime Inference default model to `z-ai/glm-5.3` and the Vercel AI Gateway default to `zai/glm-5.3`, matching Z.AI's current flagship with its 1M context window.

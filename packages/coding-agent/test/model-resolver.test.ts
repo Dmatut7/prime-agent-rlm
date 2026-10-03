@@ -314,7 +314,7 @@ describe("default model selection", () => {
 	test("openai defaults track current models", () => {
 		expect(defaultModelPerProvider.openai).toBe("gpt-5.4");
 		expect(defaultModelPerProvider["openai-codex"]).toBe("gpt-5.5");
-		expect(defaultModelPerProvider["prime-inference"]).toBe("z-ai/glm-5.2");
+		expect(defaultModelPerProvider["prime-inference"]).toBe("z-ai/glm-5.3");
 	});
 
 	test("anthropic default tracks the current flagship", () => {
@@ -329,7 +329,7 @@ describe("default model selection", () => {
 	});
 
 	test("ai-gateway default tracks current model", () => {
-		expect(defaultModelPerProvider["vercel-ai-gateway"]).toBe("zai/glm-5.1");
+		expect(defaultModelPerProvider["vercel-ai-gateway"]).toBe("zai/glm-5.3");
 	});
 
 	test("findInitialModel accepts explicit provider custom model ids", async () => {
@@ -365,15 +365,15 @@ describe("default model selection", () => {
 		expect(result.thinkingLevel).toBe("medium");
 	});
 
-	test("findInitialModel prefers GLM 5.2 when Prime Inference is configured", async () => {
+	test("findInitialModel prefers GLM 5.3 when Prime Inference is configured", async () => {
 		const anthropicModel: Model<"anthropic-messages"> = {
 			...mockModels[0],
 			id: "claude-opus-4-7",
 			name: "Claude Opus 4.7",
 		};
 		const primeModel: Model<"anthropic-messages"> = {
-			id: "z-ai/glm-5.2",
-			name: "GLM 5.2",
+			id: "z-ai/glm-5.3",
+			name: "GLM 5.3",
 			api: "anthropic-messages",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
