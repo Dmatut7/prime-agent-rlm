@@ -1,4 +1,13 @@
-## 2026-10-04 wave-38：模型持久化一致性落地、Z.AI FlashX 入表、CI 测试硬化
+## 2026-10-04 wave-39：第八刀 stall 簇、暖池遥测进 status/ps、持久化收尾裁决
+
+- AgentSession 第八刀：stall 簇（wiring/谓词/诊断采集 22 方法）搬进 core/stall-watchdog-wiring.ts——agent-session.ts 20396→19738 行（八刀累计 23500→19738，−3762），守恒比对 20/22 逐字节全等（2 块仅 biome 行布局），对外诊断 getter 全部留壳。
+- 暖池遥测消费面（capability 正路）：新只读命令 `get_warm_pool_stats` 挂 capability `warm_pool_stats`（schema revision 44→45，ID 重算实测回写）；`prime-agent status`/`daemon ps` 在老 daemon 上逐字节无输出、新 daemon 逐台一行（命中率/spare 年龄/深度/回收归因），--json 自动带字段。双向兼容测试 + 真 supervisor harness 钉住。
+- 持久化收尾裁决（证据导向）：agent 中途自行切模型在本仓无可达路径（OpenHands 坑的前提不成立），不上确认流；真缺口是第二客户端 set_model 对 attach 端半静默——最小形态=非交互来源切换发可见通知，立项 wave-40。/autocompact per-model 三裁决已备（compaction.perModel 覆盖表、裸 enabled 作默认、零迁移）。
+- 走查实证 wave-38 四件全过（预检三形态、失效回落提示显式、FlashX 在表、主流程）；小注：/exit 文本 Enter 未触发命令，立项核查。
+- 调研零版本增量；拿到 Codex capability 协商范本（initialize 声明+真实读探测确认）与 CC tolerant-reader 契约——暖池 capability 正是按这套落的。
+- 门禁：check EXIT 0、hygiene OK、daemon-protocol 34/34（ID 一致性实证）、单测/suite 复扫见账本。需要重新编译并重启后才生效。
+
+
 
 - 模型选择持久化四件套（同族事故四家证据链落地）：①`--model` 解析期预检——未知模型/未知 provider 立即报错点名，provider 无凭证与「不存在」分开说，不再静默回退默认到 API 才炸；②/模型被服务端拒绝后选择回滚到上一个真实服役模型（盘上+设置同步），重启不再残留自称被拒模型；③瞬态/目录不可读永远不改写已存选择（unknown ≠ 否定，Gemini 三态修法）；④持久化的默认失效时显式回落+消息说清原因（headless 也打 stderr），refusal（模型作答但拒绝）不误当拒绝、选择保留。
 - 预检发现即修的真缺陷：扩展注册的模型（如测试 provider）会被预检误杀——预检在扩展在场时让位给 worker 自身的运行时校验（4685 真进程套件先红后绿钉住）。

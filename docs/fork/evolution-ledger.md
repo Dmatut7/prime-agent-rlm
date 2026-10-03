@@ -14,15 +14,15 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-04 晚，wave-38 已 SHIP）
+## 当前状态（2026-10-04 晚，wave-39 已 SHIP）
 
-- HEAD = 见 git log（四批：模型持久化、CI 硬化、Z.AI FlashX、FORK_NOTES+账本）。
-- wave-38：模型持久化四件套落地（预检/被拒不残留/三态/显式回落）；坑：预检误杀扩展注册
-  模型，扩展在场时让位 worker 校验（4685 套件钉住）。CI TS 面归因闭环，两例活 flake 硬化，
-  结论「CI 不需豁免」。Z.AI FlashX 入表。
-- 磁盘事故已处理：/tmp 证据库 6.2GB + 旧 venv 806MB + claude 旧版本 650MB 清除（释放 ~4.1GB）；
-  规则=每波证据随波清。session-artifacts 2.2G 保留策略待老板点头。
-- 门禁：check EXIT 0、hygiene OK、单测 9564 全绿、ai 全绿、suite 复扫为准；CI 盯本波 run。
+- HEAD = 见 git log（三批：第八刀、暖池遥测消费面、FORK_NOTES+账本）。
+- wave-39：agent-session.ts 19738 行（八刀 −3762）；daemon schema rev 44→45 + capability
+  `warm_pool_stats`（status/daemon ps 可见池状态，老 daemon 零输出降级）；持久化收尾裁决：
+  无 agent 可达的切模型路径（OpenHands 坑前提不成立），真缺口=第二客户端 set_model 半静默
+  → wave-40 立项（非交互来源切换发可见通知）。
+- 走查小注：/exit 文本 Enter 未触发命令（wave-40 核查）。
+- 门禁：check EXIT 0、hygiene OK、daemon-protocol 34/34、单测/suite 复扫绿（数字账本末节惯例）。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -103,13 +103,13 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
   把在跑会话归档。犯了就是事故，写进 FORK_NOTES 向老板披露。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-39 候选）
+## 下一波主题（wave-40 候选）
 
-1. 【记忆帽裁决输入齐了】OpenCode reserved=10000 + 帽应按窗占比（GLM 1M vs 128K 输出）+
-   缓存经济学（命中 ×0.26 vs ×1.4）——老板三选一可议；turn 级内存观测可先落。
-2. 【第八刀】stall 簇（748 行/45 成员/churn 32）。
-3. 【暖池遥测消费面】capability 演进方案；provider 归因解析。
-4. 【模型持久化收尾】agent 中途自行切模型的确认流评估（MODEL-PERSIST 报告遗留项）；
-   /autocompact per-model 保存三裁决。
-5. 【CI 绿化保持】每波收工 gh run list 确认已成规则；wave-43 前两处硬化持续绿则关闭 flake 面。
-6. 【首请求服务端窗口】≤1.5s 有界等待（per-model 最后一块）。
+1. 【set_model 可见性】非交互来源（第二客户端/扩展）的模型切换发 display:true 通知 +
+   ledger 记 origin（persist-tail 裁决的最小形态）。
+2. 【/autocompact per-model 保存】按裁决落：compaction.perModel Record<provider/id, boolean>，
+   裸 enabled 作默认，零迁移；RPC 快照报对当前模型解析的 effective 值（线形不变）。
+3. 【/exit 文本未触发】走查小注核查（输入框命令派发）。
+4. 【第九刀候选】image-routing（358 行/20 成员）或 harness-digest 叶子（324 行/22 成员）。
+5. 【首请求服务端窗口】≤1.5s 有界等待（per-model 最后一块，已顺延多波——优先动或正式降级）。
+6. 【记忆帽裁决】仍待老板三选一（CC 先例：帽=硬截断+可见诊断，不二次计量）。
