@@ -22,9 +22,6 @@ import {
 	shutdownDaemonAndWait,
 } from "./cli/daemon-launch.js";
 import { confirmDaemonSessionLoss, type DaemonSessionLossCopy, pluralizeSessions } from "./cli/daemon-stop-confirm.js";
-import { processFileArguments } from "./cli/file-processor.js";
-import { buildInitialMessage } from "./cli/initial-message.js";
-import { listModels } from "./cli/list-models.js";
 import { installOwnedSessionRecoveryTracking, isOwnedSessionWorkerProcess } from "./cli/owned-session-worker.js";
 import { handlePublicCommand } from "./cli/public-command.js";
 import {
@@ -55,7 +52,6 @@ import {
 } from "./core/agent-session-services.js";
 import { formatNoModelsAvailableMessage } from "./core/auth-guidance.js";
 import { AuthStorage } from "./core/auth-storage.js";
-import { exportFromFile } from "./core/export-html/index.js";
 import type { ExtensionFactory } from "./core/extensions/types.js";
 import { KeybindingsManager } from "./core/keybindings.js";
 import { installFileLogSink, setLogContext } from "./core/logging.js";
@@ -88,9 +84,17 @@ import { setStallRuntimeDaemonWorker } from "./core/stall-evidence.js";
 import { isTelemetryEnabled } from "./core/telemetry.js";
 import { printTimings, resetTimings, time } from "./core/timings.js";
 import { runMigrations, showDeprecationWarnings } from "./migrations.js";
+// Only the daemon-mode entries stay static: every CLI process role reaches the
+// appMode dispatch below. Interactive/ACP/RPC/print mode entries, their UI
+// dependencies, and the daemon supervisor load at dispatch instead — a daemon
+// worker returns from main() before any of them run, so they never enter its
+// module graph (wave-32: they were ~28% of the eager bundle).
+import type { DaemonAgentConnection } from "./modes/agent-connection/daemon-agent-connection.js";
 import { resolveDaemonSocketForAgentDir } from "./modes/daemon/daemon-agent-endpoint.js";
 import { isDaemonCatalogProcess, runDaemonCatalogProcess } from "./modes/daemon/daemon-catalog-process.js";
+import type { DaemonClient } from "./modes/daemon/daemon-client.js";
 import { DaemonSessionCreateError, deserializeDaemonCreateError } from "./modes/daemon/daemon-errors.js";
+import { runDaemonMode } from "./modes/daemon/daemon-mode.js";
 import {
 	collectDaemonClientEnv,
 	collectDaemonLaunchEnv,
@@ -103,35 +107,9 @@ import {
 	requireDaemonWorkerAuthenticationToken,
 	waitForDaemonWorkerStartupGate,
 } from "./modes/daemon/daemon-worker-protocol.js";
-import {
-	type AgentConnection,
-	type AgentsViewModeOptions,
-	type AgentsViewScopeKey,
-	ClientPromptStashStore,
-	createInteractiveModeLocalSessionHost,
-	createInteractiveModeUiServicesFromServices,
-	DaemonAgentConnection,
-	DaemonCapabilityUnavailableError,
-	DaemonClient,
-	InProcessAgentConnection,
-	InteractiveMode,
-	normalizeSocketPath,
-	resolveAttachModelFallbackMessage,
-	runAcpMode,
-	runAcpModeWithConnection,
-	runAgentsViewMode,
-	runDaemonMode,
-	runDaemonSupervisorMode,
-	runPrintMode,
-	runPrintModeWithConnection,
-	runRpcMode,
-	runRpcModeWithConnection,
-	type SessionSummary,
-} from "./modes/index.js";
-import { ExtensionSelectorComponent } from "./modes/interactive/components/extension-selector.js";
-import { shouldRunOnboarding } from "./modes/interactive/onboarding.js";
-import { initTheme, preloadCodeHighlighter, stopThemeWatcher } from "./modes/interactive/theme/theme.js";
+import type { AgentConnection, AgentsViewModeOptions, AgentsViewScopeKey, SessionSummary } from "./modes/index.js";
 import { handleConfigCommand } from "./package-manager-cli.js";
+import { normalizeSocketPath } from "./utils/daemon-socket-path.js";
 import { isLocalPath } from "./utils/paths.js";
 import { readPipedStdin } from "./utils/piped-stdin.js";
 
@@ -406,9 +384,14 @@ async function prepareInitialMessage(
 	initialImages?: ImageContent[];
 }> {
 	if (parsed.fileArgs.length === 0) {
+		const { buildInitialMessage } = await import("./cli/initial-message.js");
 		return buildInitialMessage({ parsed, stdinContent });
 	}
 
+	const [{ processFileArguments }, { buildInitialMessage }] = await Promise.all([
+		import("./cli/file-processor.js"),
+		import("./cli/initial-message.js"),
+	]);
 	const { text, images } = await processFileArguments(parsed.fileArgs, { autoResizeImages });
 	return buildInitialMessage({
 		parsed,
@@ -1018,6 +1001,10 @@ async function promptForMissingSessionCwd(
 	issue: SessionCwdIssue,
 	settingsManager: SettingsManager,
 ): Promise<string | undefined> {
+	const [{ initTheme }, { ExtensionSelectorComponent }] = await Promise.all([
+		import("./modes/interactive/theme/theme.js"),
+		import("./modes/interactive/components/extension-selector.js"),
+	]);
 	initTheme(settingsManager.getTheme());
 	setKeybindings(KeybindingsManager.create());
 
@@ -1060,6 +1047,7 @@ async function findActiveDaemonSessionSummary(
 	socketPath: string,
 	selector: string,
 ): Promise<SessionSummary | undefined> {
+	const { DaemonClient } = await import("./modes/daemon/daemon-client.js");
 	const client = new DaemonClient(socketPath, { declaredCapabilities: DAEMON_FIRST_PARTY_SESSION_CAPABILITIES });
 	await client.connect(250);
 
@@ -1123,6 +1111,10 @@ async function createDaemonClientConnection(options: {
 	supportsExtensionUi?: boolean;
 }): Promise<{ connection: DaemonAgentConnection; summary: SessionSummary }> {
 	// Caller must have awaited ensureInteractiveDaemonRunning for this socket.
+	const [{ DaemonClient, DaemonCapabilityUnavailableError }, { DaemonAgentConnection }] = await Promise.all([
+		import("./modes/daemon/daemon-client.js"),
+		import("./modes/agent-connection/daemon-agent-connection.js"),
+	]);
 	const client = new DaemonClient(options.socketPath, {
 		declaredCapabilities: DAEMON_FIRST_PARTY_SESSION_CAPABILITIES,
 	});
@@ -1388,6 +1380,7 @@ export async function main(args: string[], options?: MainOptions) {
 	if (parsed.export) {
 		let result: string;
 		try {
+			const { exportFromFile } = await import("./core/export-html/index.js");
 			const outputPath = parsed.messages.length > 0 ? parsed.messages[0] : undefined;
 			result = await exportFromFile(parsed.export, outputPath);
 		} catch (error: unknown) {
@@ -1591,6 +1584,7 @@ export async function main(args: string[], options?: MainOptions) {
 				},
 			});
 		} else {
+			const { runDaemonSupervisorMode } = await import("./modes/daemon/daemon-supervisor.js");
 			await runDaemonSupervisorMode({
 				socketPath: parsed.daemonSocket,
 				defaultSessionConfig: daemonDefaultSessionConfig,
@@ -1652,6 +1646,7 @@ export async function main(args: string[], options?: MainOptions) {
 				stdinContent,
 			));
 			time("prepareInitialMessage");
+			const { initTheme } = await import("./modes/interactive/theme/theme.js");
 			initTheme(settingsManager.getTheme(), true);
 			time("initTheme");
 		} catch (error) {
@@ -1662,6 +1657,24 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 		const { services, scopedModels } = prepared;
 		const { settingsManager } = services;
+
+		const [
+			{ InteractiveMode },
+			{ createInteractiveModeUiServicesFromServices },
+			{ runAgentsViewMode },
+			{ shouldRunOnboarding },
+			{ preloadCodeHighlighter },
+			{ ClientPromptStashStore },
+			{ resolveAttachModelFallbackMessage },
+		] = await Promise.all([
+			import("./modes/interactive/interactive-mode.js"),
+			import("./modes/interactive/interactive-mode-services.js"),
+			import("./modes/agents-view/agents-view-mode.js"),
+			import("./modes/interactive/onboarding.js"),
+			import("./modes/interactive/theme/theme.js"),
+			import("./modes/interactive/prompt-stash-state.js"),
+			import("./modes/daemon/daemon-session-list.js"),
+		]);
 
 		if (deprecationWarnings.length > 0) {
 			await showDeprecationWarnings(deprecationWarnings);
@@ -1853,6 +1866,7 @@ export async function main(args: string[], options?: MainOptions) {
 			stdinContent,
 		);
 		time("prepareInitialMessage");
+		const { initTheme, stopThemeWatcher } = await import("./modes/interactive/theme/theme.js");
 		initTheme(settingsManager.getTheme(), false);
 		time("initTheme");
 
@@ -1891,11 +1905,14 @@ export async function main(args: string[], options?: MainOptions) {
 
 		printTimings();
 		if (appMode === "rpc") {
+			const { runRpcModeWithConnection } = await import("./modes/rpc/rpc-mode.js");
 			return await runRpcModeWithConnection(connection);
 		}
 		if (appMode === "acp") {
+			const { runAcpModeWithConnection } = await import("./modes/acp/acp-mode.js");
 			return await runAcpModeWithConnection(connection);
 		}
+		const { runPrintModeWithConnection } = await import("./modes/print-mode.js");
 		const exitCode = await runPrintModeWithConnection(connection, {
 			mode: toPrintOutputMode(appMode),
 			messages: parsed.messages,
@@ -1947,6 +1964,7 @@ export async function main(args: string[], options?: MainOptions) {
 	const { settingsManager, modelRegistry } = services;
 
 	if (parsed.listModels !== undefined) {
+		const { listModels } = await import("./cli/list-models.js");
 		const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
 		await listModels(modelRegistry, searchPattern);
 		await exitAfterOrphanJournalFlush(0);
@@ -1965,6 +1983,7 @@ export async function main(args: string[], options?: MainOptions) {
 		stdinContent,
 	);
 	time("prepareInitialMessage");
+	const { initTheme, preloadCodeHighlighter, stopThemeWatcher } = await import("./modes/interactive/theme/theme.js");
 	initTheme(settingsManager.getTheme(), appMode === "interactive");
 	time("initTheme");
 
@@ -1988,9 +2007,11 @@ export async function main(args: string[], options?: MainOptions) {
 
 	if (appMode === "rpc") {
 		printTimings();
+		const { runRpcMode } = await import("./modes/rpc/rpc-mode.js");
 		await runRpcMode(runtime);
 	} else if (appMode === "acp") {
 		printTimings();
+		const { runAcpMode } = await import("./modes/acp/acp-mode.js");
 		await runAcpMode(runtime);
 	} else if (appMode === "interactive") {
 		if (explicitAgentsView || parsed.resume === true) {
@@ -2008,6 +2029,17 @@ export async function main(args: string[], options?: MainOptions) {
 			console.log(wrapForStdout(chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+M to cycle)")}`)));
 		}
 
+		const [
+			{ InProcessAgentConnection },
+			{ InteractiveMode },
+			{ createInteractiveModeLocalSessionHost },
+			{ ClientPromptStashStore },
+		] = await Promise.all([
+			import("./modes/agent-connection/in-process-agent-connection.js"),
+			import("./modes/interactive/interactive-mode.js"),
+			import("./modes/interactive/interactive-mode-services.js"),
+			import("./modes/interactive/prompt-stash-state.js"),
+		]);
 		const agentConnection = new InProcessAgentConnection(runtime);
 		const interactiveMode = new InteractiveMode({
 			agentConnection,
@@ -2050,6 +2082,7 @@ export async function main(args: string[], options?: MainOptions) {
 		await interactiveMode.run();
 	} else {
 		printTimings();
+		const { runPrintMode } = await import("./modes/print-mode.js");
 		const exitCode = await runPrintMode(runtime, {
 			mode: toPrintOutputMode(appMode),
 			messages: parsed.messages,
