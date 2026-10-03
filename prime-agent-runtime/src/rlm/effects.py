@@ -2028,6 +2028,11 @@ class _Tracker:
                         rec.baseline = baseline
                         rec.gap = False
                     continue
+                if after_sig is None and any(other.old_path == path for other in cell.files.values()):
+                    # The cell already reported this path moving away under another name:
+                    # the rename record covers the disappearance, and a second deletion
+                    # record would report one user action twice.
+                    continue
                 if len(cell.files) >= MAX_FILES_PER_CELL:
                     cell.note_incomplete(f"more than {MAX_FILES_PER_CELL} files changed; the rest are not listed")
                     return

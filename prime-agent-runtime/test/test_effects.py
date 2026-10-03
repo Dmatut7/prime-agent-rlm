@@ -261,6 +261,21 @@ class PythonWriteTests(TrackerCase):
         self.assertEqual(files["a.txt"]["kind"], "modified")
         self.assertEqual((files["a.txt"]["added"], files["a.txt"]["removed"]), (1, 0))
 
+    def test_a_rename_after_the_before_snapshot_reports_no_extra_deletion(self):
+        # The cell's before-snapshot may settle before the first write (the norm on
+        # Linux, where a git spawn beats the cell thread): the comparison then meets
+        # the rename's old path as a deletion, and the rename record must swallow it.
+        cell = self.kernel.run(
+            "import os, time\n"
+            "time.sleep(0.8)\n"  # the before-snapshot settles; the comparison then sees the rename
+            "os.rename('b.txt', 'c.txt')\n"
+        )
+        self.assertEqual(cell.status, "ok")
+        files = cell.by_rel()
+        self.assertEqual(sorted(files), ["c.txt"])
+        self.assertEqual(files["c.txt"]["kind"], "renamed")
+        self.assertEqual(files["c.txt"]["oldPath"], self.path("b.txt"))
+
     def test_deletes_through_os_pathlib_and_rmtree(self):
         self.write("tree/x.txt", "x\n")
         self.write("tree/sub/y.txt", "y\ny\n")

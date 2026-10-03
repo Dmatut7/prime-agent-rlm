@@ -1475,8 +1475,9 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
         # (a leak for a never-reaping handle, and a rid no interrupt can target).
         token = bash_module._set_current_cell("rid-dead")
         try:
-            first = bash("true")
-            await first
+            # Registration lives [spawn, group reap], so membership is checked while
+            # the sleeper provably still runs; awaiting first would race the reaper.
+            first = bash("sleep 1")
             self.assertEqual(first._cell_id, "rid-dead")
             self.assertIn("rid-dead", bash_module._cell_handles)
             bash_module._forget_cell("rid-dead")
@@ -1484,6 +1485,7 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
             second = bash("true")
             await second
             self.assertIsNone(second._cell_id)
+            await first
             self.assertNotIn("rid-dead", bash_module._cell_handles)
         finally:
             bash_module._reset_current_cell(token)

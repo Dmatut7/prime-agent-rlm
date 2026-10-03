@@ -1,0 +1,3 @@
+- Fixed a rename being double-reported as a deletion on fast schedulers: when the cell-end git compare beat the rename wrapper's record (the Linux CI timeline), the old path was counted twice - once under the new path, once as a phantom deletion. The compare now skips a deletion that a cell record already carries as a rename source.
+- Fixed the `--` escape hatch in the bare-command-typo guard: `prime-agent -- sessions` now really does send "sessions" as a prompt, as the rejection text promises.
+- Added `scripts/warm-pool-stats.mjs`: a zero-dependency analyzer for the warm-pool telemetry stream in agent.jsonl (hit/miss/expired rates, spare-age and spawn-duration quantiles, reclaim attribution, depth timeline, per-daemon totals cross-check), with an in-file `--self-test`.
