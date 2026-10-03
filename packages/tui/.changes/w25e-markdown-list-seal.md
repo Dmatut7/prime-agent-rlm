@@ -1,0 +1,1 @@
+- Fixed streaming markdown re-lexing and re-rendering a growing list in full on every frame: completed list items now seal (only the growing tail item stays live) and the lexer resumes from the last verified item boundary, cutting a 97k-char single-list stream's tail frames from 3.77ms to 0.33ms. `PI_MARKDOWN_LINE_SEAL=0` / `PI_MARKDOWN_SPLIT_LEX=0` opt out.

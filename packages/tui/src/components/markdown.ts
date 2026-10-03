@@ -162,9 +162,10 @@ interface LexCache {
 
 /**
  * Sealed line prefix of the growing final block. While a single block (one
- * paragraph, one fence) streams in, the block is never blank-line terminated,
- * so the lex cache and the per-block slots never apply and the whole block
- * would be re-rendered every frame (O(n^2) per answer). Completed lines whose
+ * paragraph, one fence, one list) streams in, the block is never blank-line
+ * terminated, so the lex cache and the per-block slots never apply and the
+ * whole block would be re-rendered every frame (O(n^2) per answer). Completed
+ * lines (paragraph/code) or completed items (list, see FinalListSeal) whose
  * rendering later text cannot change are sealed: rendered once, then served
  * from this cache while the per-frame validation holds. Sealing never destroys
  * the source text: width changes, invalidate(), edits and every validation
@@ -193,6 +194,30 @@ interface FinalBlockSeal {
 	wrapLines?: string[];
 	/** Latched when the growing line's rendered string contains ANSI codes. */
 	wrapIneligible?: boolean;
+}
+
+/**
+ * Sealed item prefix of the growing final list. Items [0, count) are rendered
+ * once into lines; the item at count (the growing tail) is re-rendered every
+ * frame. Item rendering is context-free given the item source, so the seal is
+ * valid exactly while the sealed item raws stay byte-identical and bounded by
+ * item starts (listSealIntact): an absorption rewrite (a partial bullet
+ * collapsing into the previous item, a blank/indented block landing inside an
+ * item) shifts an item raw and is caught, and a loose flip (token.loose
+ * changes) re-types every item's block tokens, which also forces a re-seal.
+ */
+interface FinalListSeal {
+	blockType: "list";
+	/** Concatenated raws of the sealed items; a prefix of the list raw. */
+	source: string;
+	/** Number of sealed items; the item at this index is the live tail. */
+	count: number;
+	/** List loose flag when the seal was built. */
+	loose: boolean;
+	/** Fully post-processed block lines (wrap, margins, padding) for the items. */
+	lines: string[];
+	width: number;
+	capsVersion: number;
 }
 
 // Inline constructs whose rendering appends the default style prefix after the
@@ -296,8 +321,33 @@ interface SplitLex {
 	prefix: string;
 }
 
-/** Below this paragraph size a full lex is cheap enough that splitting adds only overhead. */
-const MIN_SPLIT_LEX_PARAGRAPH_CHARS = 4096;
+/**
+ * Split-lex state for a single growing final list. The block-level lex cache
+ * can only cut before the list (a boundary after a kept list is unstable), so
+ * a list that streams item by item would be re-lexed in full on every frame.
+ * Item starts recorded from a full lex are stable cut points: the line at the
+ * cut already begins with a complete marker, so it stays an item start under
+ * any append. While the guards on trySplitListLex hold, only the tail from the
+ * last item boundary is lexed; the prefix item tokens are reused.
+ */
+interface ListSplitLex {
+	/** The block-cache cut this state was built against; any drift invalidates. */
+	baseCut: number;
+	/** Source offset where the growing final list starts. */
+	listFrom: number;
+	/** Source offset of the first non-verified item start; the tail begins here. */
+	cut: number;
+	/** Item tokens tiling [listFrom, cut). */
+	prefixItems: Tokens.ListItem[];
+	ordered: boolean;
+	start: number | "";
+	loose: boolean;
+	/** normalizedText.slice(0, cut), for the per-frame append check. */
+	prefix: string;
+}
+
+/** Below this block size a full lex is cheap enough that splitting adds only overhead. */
+const MIN_SPLIT_LEX_BLOCK_CHARS = 4096;
 
 /**
  * Characters that can open an inline construct spanning the split point. A
@@ -476,8 +526,9 @@ export class Markdown implements Component {
 	// token stream and hit by token identity (see BlockSlot); rebuilt each
 	// render so it stays bounded to the current document's blocks.
 	private blockSlots: BlockSlot[] = [];
-	// Line-level seal for the growing final block; see FinalBlockSeal.
-	private finalBlockSeal?: FinalBlockSeal;
+	// Line/item-level seal for the growing final block; see FinalBlockSeal and
+	// FinalListSeal.
+	private finalBlockSeal?: FinalBlockSeal | FinalListSeal;
 	// Block-token lex cache; see LexCache. Survives setText (streaming) and
 	// invalidate() (tokens do not depend on the theme), but is only reused when
 	// the normalized text is unchanged up to the cached cut offset.
@@ -485,6 +536,9 @@ export class Markdown implements Component {
 	// Inline split of the growing final paragraph; see SplitLex. Same survival
 	// rules as the lex cache; every frame re-validates before reusing.
 	private splitLex?: SplitLex;
+	// Item-level split of the growing final list; see ListSplitLex. Same
+	// survival rules as the lex cache; every frame re-validates before reusing.
+	private listSplitLex?: ListSplitLex;
 
 	constructor(
 		text: string,
@@ -547,6 +601,10 @@ export class Markdown implements Component {
 		if (spliced) {
 			return spliced;
 		}
+		const listSpliced = this.trySplitListLex(normalizedText, base, baseTokens, parser);
+		if (listSpliced) {
+			return listSpliced;
+		}
 		if (cacheHit) {
 			const tailTokens = parser.lexer(normalizedText.slice(cache.cut));
 			if (Object.keys(tailTokens.links ?? {}).length === 0) {
@@ -554,12 +612,14 @@ export class Markdown implements Component {
 				tokens.links = tailTokens.links ?? {};
 				this.lexCache = buildLexCache(normalizedText, tokens);
 				this.splitLex = this.bootstrapSplitLex(normalizedText, tokens);
+				this.listSplitLex = this.bootstrapListSplitLex(normalizedText, tokens);
 				return tokens;
 			}
 		}
 		const tokens = parser.lexer(normalizedText);
 		this.lexCache = buildLexCache(normalizedText, tokens);
 		this.splitLex = this.bootstrapSplitLex(normalizedText, tokens);
+		this.listSplitLex = this.bootstrapListSplitLex(normalizedText, tokens);
 		return tokens;
 	}
 
@@ -679,7 +739,7 @@ export class Markdown implements Component {
 			return undefined;
 		}
 		const paraFrom = normalizedText.length - raw.length;
-		if (paragraph.text.length < MIN_SPLIT_LEX_PARAGRAPH_CHARS) {
+		if (paragraph.text.length < MIN_SPLIT_LEX_BLOCK_CHARS) {
 			return undefined;
 		}
 		// The spliced stream is baseTokens plus the single paragraph, so the
@@ -699,6 +759,175 @@ export class Markdown implements Component {
 		}
 		const cut = paraFrom + cutRel;
 		return { baseCut, paraFrom, cut, prefixTokens, prefix: normalizedText.slice(0, cut) };
+	}
+
+	/**
+	 * Lex only the unverified tail of a single growing final list, splicing the
+	 * fresh tail items onto the verified prefix items. Returns undefined unless
+	 * every guard holds; the caller then falls back to the ordinary
+	 * (cached-prefix or full) lex, so a rejected split never changes behavior,
+	 * only speed:
+	 * - the block-cache context and the whole split prefix are append-stable
+	 *   (baseCut equality + one startsWith);
+	 * - the tail must lex to exactly one list. A partial bullet collapsing into
+	 *   the previous item ("-" gaining "x"), a marker change ("+" after "-",
+	 *   "1)" after "1."), an hr-shaped line, or a blank line ending the list all
+	 *   lex the tail to something else (or to a list plus a space token), which
+	 *   falls back and reproduces the full re-lex exactly. The tail list's raw
+	 *   is deliberately NOT compared to the tail text: marked rewrites a single
+	 *   trailing space/tab at end of text to "\n" inside the raw, and that
+	 *   region is re-lexed fresh on the next frame anyway;
+	 * - ordered and loose must match the verified prefix: the merged token keeps
+	 *   the prefix item objects, and a loose flip re-types every item's block
+	 *   tokens (text -> paragraph), so a flip forces a full re-lex instead of
+	 *   serving a mixed-loose stream no full lex would produce;
+	 * - a reference definition in the tail (links non-empty) could resolve
+	 *   references inside the reused prefix items, so it falls back.
+	 */
+	private trySplitListLex(
+		normalizedText: string,
+		base: number,
+		baseTokens: Token[],
+		parser: Marked,
+	): TokensList | undefined {
+		if (process.env.PI_MARKDOWN_SPLIT_LEX === "0") {
+			return undefined;
+		}
+		const split = this.listSplitLex;
+		if (
+			!split ||
+			split.baseCut !== base ||
+			split.cut >= normalizedText.length ||
+			!normalizedText.startsWith(split.prefix)
+		) {
+			return undefined;
+		}
+		const tail = normalizedText.slice(split.cut);
+		const tailTokens = parser.lexer(tail);
+		if (tailTokens.length !== 1) {
+			return undefined;
+		}
+		const tailList = tailTokens[0];
+		if (tailList?.type !== "list") {
+			return undefined;
+		}
+		if (Object.keys(tailTokens.links ?? {}).length > 0) {
+			return undefined;
+		}
+		const list = tailList as Tokens.List;
+		if (
+			list.ordered !== split.ordered ||
+			list.loose !== split.loose ||
+			!Array.isArray(list.items) ||
+			list.items.length === 0
+		) {
+			return undefined;
+		}
+		const merged: Tokens.List = {
+			type: "list",
+			raw: normalizedText.slice(split.listFrom),
+			ordered: split.ordered,
+			start: split.start,
+			loose: split.loose,
+			items: [...split.prefixItems, ...list.items],
+		};
+		const tokens = baseTokens.concat([merged]) as TokensList;
+		tokens.links = {};
+		this.lexCache = buildLexCache(normalizedText, tokens);
+		// Advance the cut to the merged list's last item start so the next frame's
+		// tail stays one item. The induction holds because prefix items tile
+		// [listFrom, cut) (bootstrap verified) and non-last tail items tile their
+		// span of the tail raw (only a list's final item raw can drop a trailing
+		// newline).
+		const advanced = this.listLastItemStart(split.listFrom, merged.items);
+		if (advanced !== undefined && advanced > split.cut) {
+			this.listSplitLex = {
+				baseCut: base,
+				listFrom: split.listFrom,
+				cut: advanced,
+				prefixItems: merged.items.slice(0, merged.items.length - 1),
+				ordered: split.ordered,
+				start: split.start,
+				loose: split.loose,
+				prefix: normalizedText.slice(0, advanced),
+			};
+		}
+		return tokens;
+	}
+
+	/**
+	 * Build list split-lex state from a freshly lexed stream: the final block
+	 * must be a list with at least two items (so a cut before the growing tail
+	 * item exists), large enough for splitting to pay, starting exactly at the
+	 * block-cache cut (same constraint as the paragraph split). The prefix item
+	 * raws must tile [listFrom, cut) byte-identically - that one-time check is
+	 * what every later reuse stands on. The list raw itself is not required to
+	 * tile the source: marked rewrites a single trailing space/tab at end of
+	 * text to "\n" inside the raw, which lives in the tail region that is
+	 * re-lexed fresh every frame. Any other shape disables the list split until
+	 * a qualifying list streams in.
+	 */
+	private bootstrapListSplitLex(normalizedText: string, tokens: TokensList): ListSplitLex | undefined {
+		if (Object.keys(tokens.links ?? {}).length > 0) {
+			return undefined;
+		}
+		const last = tokens[tokens.length - 1];
+		if (!last || last.type !== "list") {
+			return undefined;
+		}
+		const list = last as Tokens.List;
+		if (typeof list.raw !== "string" || !Array.isArray(list.items) || list.items.length < 2) {
+			return undefined;
+		}
+		if (list.raw.length < MIN_SPLIT_LEX_BLOCK_CHARS) {
+			return undefined;
+		}
+		const baseCut = this.lexCache?.cut ?? 0;
+		// The list must start exactly at the block-cache cut; listFrom derives
+		// from the raw length, which a trailing-whitespace rewrite preserves.
+		const listFrom = normalizedText.length - list.raw.length;
+		if (listFrom !== baseCut) {
+			return undefined;
+		}
+		const cut = this.listLastItemStart(listFrom, list.items);
+		if (cut === undefined || cut >= normalizedText.length) {
+			return undefined;
+		}
+		// Verify once that the prefix items tile [listFrom, cut) exactly before
+		// any reuse is built on them.
+		let tiled = "";
+		for (let i = 0; i < list.items.length - 1; i++) {
+			tiled += list.items[i]?.raw;
+		}
+		if (tiled !== normalizedText.slice(listFrom, cut)) {
+			return undefined;
+		}
+		return {
+			baseCut,
+			listFrom,
+			cut,
+			prefixItems: list.items.slice(0, list.items.length - 1),
+			ordered: list.ordered,
+			start: list.start,
+			loose: list.loose,
+			prefix: normalizedText.slice(0, cut),
+		};
+	}
+
+	/**
+	 * Start offset of the list's last item: item raws tile the list raw from
+	 * its start. Returns undefined when an item raw is not a string.
+	 */
+	private listLastItemStart(listFrom: number, items: Tokens.ListItem[]): number | undefined {
+		let cut = listFrom;
+		for (let i = 0; i < items.length - 1; i++) {
+			const raw = items[i]?.raw;
+			if (typeof raw !== "string") {
+				return undefined;
+			}
+			cut += raw.length;
+		}
+		return cut;
 	}
 
 	render(width: number): string[] {
@@ -746,9 +975,10 @@ export class Markdown implements Component {
 		// served from the cache. The final block is never slot-cached: while
 		// streaming, appended text can reinterpret it (unterminated fences,
 		// growing lists); once a block is no longer last, its raw text is final.
-		// The final block instead seals its completed lines (see FinalBlockSeal),
-		// which bounds per-frame work to the unsealed tail for single-block
-		// documents. PI_MARKDOWN_LINE_SEAL=0 disables sealing.
+		// The final block instead seals its completed lines or list items (see
+		// FinalBlockSeal and FinalListSeal), which bounds per-frame work to the
+		// unsealed tail for single-block documents. PI_MARKDOWN_LINE_SEAL=0
+		// disables sealing.
 		const lineSealing = process.env.PI_MARKDOWN_LINE_SEAL !== "0";
 		const nextSlots: BlockSlot[] = [];
 		const contentLines: string[] = [];
@@ -855,12 +1085,14 @@ export class Markdown implements Component {
 	}
 
 	/**
-	 * Render the final block through the line seal: the sealed prefix comes from
-	 * the cache, only the unsealed tail is rendered. Blocks whose rendering later
-	 * text can re-interpret in ways the seal validation does not cover (tables
-	 * re-flow column widths per row; lists re-absorb separated items; fences are
-	 * highlighted whole-block when the theme provides highlightCode) keep the
-	 * full per-frame re-render.
+	 * Render the final block through the seal: the sealed prefix comes from the
+	 * cache, only the unsealed tail is rendered. Paragraphs seal completed
+	 * lines, fences (without a whole-block highlighter) seal completed code
+	 * lines, and lists seal completed items (renderFinalListSealed). Blocks
+	 * whose rendering later text can re-interpret in ways the seal validation
+	 * does not cover (tables re-flow column widths per row; highlighted fences
+	 * are context-sensitive across the full code text) keep the full per-frame
+	 * re-render.
 	 */
 	private renderFinalBlockSealed(token: Token, width: number, contentWidth: number, capsVersion: number): string[] {
 		if (token.type === "paragraph") {
@@ -870,6 +1102,11 @@ export class Markdown implements Component {
 			}
 		} else if (token.type === "code" && !this.theme.highlightCode) {
 			const sealed = this.renderFinalCodeSealed(token as Tokens.Code, width, contentWidth, capsVersion);
+			if (sealed) {
+				return sealed;
+			}
+		} else if (token.type === "list") {
+			const sealed = this.renderFinalListSealed(token as Tokens.List, width, contentWidth, capsVersion);
 			if (sealed) {
 				return sealed;
 			}
@@ -1212,6 +1449,95 @@ export class Markdown implements Component {
 	}
 
 	/**
+	 * List seal. Every item but the last is complete: appended text lands in or
+	 * after the last item, so a sealed item's source can only change through a
+	 * rewrite of the tail item's bullet line (a partial bullet like "-" or "1."
+	 * collapsing into a lazy continuation of the previous item) or a loose flip
+	 * — both are caught by the per-frame validation (listSealIntact plus the
+	 * loose check) before any sealed line is served. Item rendering is
+	 * context-free given the item source (bullets derive from the absolute
+	 * index, and reference definitions never reach this path: the caller only
+	 * seals when tokens.links is empty), so byte-identical sealed item raws
+	 * imply byte-identical sealed lines. The tail item is re-rendered every
+	 * frame.
+	 */
+	private renderFinalListSealed(
+		token: Tokens.List,
+		width: number,
+		contentWidth: number,
+		capsVersion: number,
+	): string[] | undefined {
+		const items = token.items;
+		if (!Array.isArray(items) || items.length === 0 || typeof token.raw !== "string") {
+			return undefined;
+		}
+		let seal = this.finalBlockSeal;
+		if (
+			seal &&
+			(seal.blockType !== "list" ||
+				seal.width !== width ||
+				seal.capsVersion !== capsVersion ||
+				seal.loose !== token.loose ||
+				!this.listSealIntact(token, seal))
+		) {
+			seal = undefined;
+			this.finalBlockSeal = undefined;
+		}
+		if (!seal) {
+			seal = { blockType: "list", source: "", count: 0, loose: token.loose, lines: [], width, capsVersion };
+			this.finalBlockSeal = seal;
+		}
+		const target = items.length - 1;
+		if (target > seal.count) {
+			const extension = this.renderTokenLinesToBlockLines(
+				this.renderListItems(token, 0, seal.count, target),
+				width,
+				contentWidth,
+			);
+			let source = seal.source;
+			for (let i = seal.count; i < target; i++) {
+				const raw = items[i]?.raw;
+				if (typeof raw !== "string") {
+					this.finalBlockSeal = undefined;
+					return undefined;
+				}
+				source += raw;
+			}
+			seal.lines.push(...extension);
+			seal.source = source;
+			seal.count = target;
+		}
+		const tailLines = this.renderTokenLinesToBlockLines(
+			this.renderListItems(token, 0, seal.count, items.length),
+			width,
+			contentWidth,
+		);
+		return [...seal.lines, ...tailLines];
+	}
+
+	/**
+	 * Whether the sealed item prefix still matches the fresh list token: the
+	 * list raw keeps the sealed source byte-identical (one startsWith), an
+	 * unsealed tail item still exists, and the first seal.count item raws tile
+	 * exactly the sealed source length. An absorption rewrite shifts an item
+	 * boundary and breaks the tiling even when the raw prefix matches.
+	 */
+	private listSealIntact(token: Tokens.List, seal: FinalListSeal): boolean {
+		if (token.items.length <= seal.count || !token.raw.startsWith(seal.source)) {
+			return false;
+		}
+		let pos = 0;
+		for (let i = 0; i < seal.count; i++) {
+			const raw = token.items[i]?.raw;
+			if (typeof raw !== "string") {
+				return false;
+			}
+			pos += raw.length;
+		}
+		return pos === seal.source.length;
+	}
+
+	/**
 	 * Apply default text style to a string.
 	 * This is the base styling applied to all text content.
 	 * NOTE: Background color is NOT applied here - it's applied at the padding stage
@@ -1357,7 +1683,7 @@ export class Markdown implements Component {
 			}
 
 			case "list": {
-				const listLines = this.renderList(token as any, 0, styleContext);
+				const listLines = this.renderList(token as Tokens.List, 0, styleContext);
 				lines.push(...listLines);
 				break;
 			}
@@ -1546,16 +1872,28 @@ export class Markdown implements Component {
 	/**
 	 * Render a list with proper nesting support
 	 */
-	private renderList(
-		token: Token & { items: any[]; ordered: boolean; start?: number },
+	private renderList(token: Tokens.List, depth: number, styleContext?: InlineStyleContext): string[] {
+		return this.renderListItems(token, depth, 0, token.items.length, styleContext);
+	}
+
+	/**
+	 * Render items [fromItem, toItem) of a list. Bullet numbers stay absolute
+	 * (start + index), so a subrange renders exactly the lines the full loop
+	 * would produce for those items.
+	 */
+	private renderListItems(
+		token: Tokens.List,
 		depth: number,
+		fromItem: number,
+		toItem: number,
 		styleContext?: InlineStyleContext,
 	): string[] {
 		const lines: string[] = [];
 		const indent = "  ".repeat(depth);
-		const startNumber = token.start ?? 1;
+		// marked types an unordered list's start as ""; it is never used then.
+		const startNumber = token.start === "" ? 1 : token.start;
 
-		for (let i = 0; i < token.items.length; i++) {
+		for (let i = fromItem; i < toItem; i++) {
 			const item = token.items[i];
 			const bullet = token.ordered ? `${startNumber + i}. ` : "- ";
 
@@ -1601,7 +1939,7 @@ export class Markdown implements Component {
 			if (token.type === "list") {
 				// Nested list - render with one additional indent level
 				// These lines will have their own indent, so we just add them as-is
-				const nestedLines = this.renderList(token as any, parentDepth + 1, styleContext);
+				const nestedLines = this.renderList(token as Tokens.List, parentDepth + 1, styleContext);
 				lines.push(...nestedLines);
 			} else if (token.type === "text") {
 				// Text content (may have inline tokens)
