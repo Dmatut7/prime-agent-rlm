@@ -1,0 +1,1 @@
+- Fixed the module compile cache never applying to the CLI's static import graph: `enableCompileCache()` ran inside `runCli()`, after the ~5MB cli-main chunk graph was already parsed. It now runs before the dynamic import, so the cache actually covers those chunks - warm-daemon first frame 626→560ms median, cold start 888-978→752-814ms, `--help` 184→146ms.
