@@ -10,6 +10,7 @@ Execution still belongs to Prime Agent's TypeScript host and the existing
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -60,6 +61,20 @@ DEFAULT_HARNESS_INDEX_MAX_BYTES = 12 * 1024
 _INDEX_MAX_BYTES_ENV = "PRIME_AGENT_HARNESS_INDEX_MAX_BYTES"
 # Index titles are capped here; the id stays whole because it is the address.
 _INDEX_TITLE_MAX_CHARS = 120
+
+# Consolidation (memory-recall-design.md stage 3): a callable merge pass that
+# shrinks the compact id+title index toward its byte cap. plan_consolidation()
+# proposes merge/delete/rename operations (dry-run, read-only);
+# apply_consolidation() executes an explicit plan. Parity: consolidation.ts.
+# The merge threshold sits above the write-gate advisory (0.40): the 2026-10-03
+# production histogram has an empty (0.40, 0.61) band and every pair at 0.55+
+# is a true same-rule rewrite pair, so a suggested *action* list (not an
+# advisory) takes the high-precision side of the gap.
+# Evidence: docs/fork/evidence/harness-near-duplicate-write-gate.md.
+CONSOLIDATION_MERGE_MIN_SCORE = 0.55
+# Contained bodies shorter than this are not worth a delete suggestion.
+CONSOLIDATION_STALE_MIN_CONTENT_CHARS = 40
+CONSOLIDATION_PLAN_VERSION = 1
 # Controlled first-segment vocabulary for entry paths: the production store
 # collapsed into 602 free-form paths (538 singletons, duplicate clusters like
 # arch/architecture). Writes outside the vocabulary get an advisory receipt -
@@ -566,6 +581,252 @@ class AwaitableSearchHits(list[HarnessSearchHit], _AwaitableResult):
 
 
 register_plain_list(AwaitableSearchHits)
+
+
+@dataclass
+class ConsolidationOperation(_AwaitableResult):
+    """One suggested consolidation action (memory-recall-design.md stage 3).
+
+    merge: keep ``id`` (the near-duplicate cluster's canonical entry), rewrite
+    its title/content (the content is the canonical body plus the absorbed
+    entries' unique sentences as a bullet appendix) and delete ``absorb_ids``.
+    delete: remove ``id``; ``reason`` says why (``contained:<id>`` when a
+    surviving entry's normalized content fully contains it, ``stale:<n>d``
+    when its last write is older than the requested age).
+    rename: retitle ``id`` to ``title`` (title slimming; content untouched).
+    """
+
+    action: str  # "merge" | "delete" | "rename"
+    kind: str
+    id: str
+    absorb_ids: tuple[str, ...] = ()
+    title: str | None = None
+    content: str | None = None
+    path: str | None = None
+    reason: str = ""
+    score: float | None = None
+    previous_title_chars: int | None = None
+
+
+@dataclass
+class ConsolidationPlan(_AwaitableResult):
+    """Dry-run output of ``HarnessState.plan_consolidation``: the suggested
+    operations plus the index byte math. Nothing is written; executing the plan
+    requires an explicit ``apply_consolidation(plan)`` call. ``store_digest``
+    pins the plan to the store it was computed from."""
+
+    store_digest: str
+    options: dict[str, Any]
+    index_bytes_before: int
+    index_bytes_after: int
+    fits_cap: bool
+    operations: list[ConsolidationOperation]
+    stats: dict[str, int]
+    version: int = CONSOLIDATION_PLAN_VERSION
+
+    def __repr__(self) -> str:
+        # Plans carry full entry contents; the REPL prints repr(result), so
+        # summarize instead of dumping every operation's merged body.
+        return (
+            f"<ConsolidationPlan {len(self.operations)} operations "
+            f"({self.stats.get('merges', 0)} merges, {self.stats.get('stale_deletes', 0)} stale deletes, "
+            f"{self.stats.get('renames', 0)} renames); index {self.index_bytes_before} -> "
+            f"{self.index_bytes_after} bytes, fits_cap={self.fits_cap}>"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "store_digest": self.store_digest,
+            "options": dict(self.options),
+            "index_bytes_before": self.index_bytes_before,
+            "index_bytes_after": self.index_bytes_after,
+            "fits_cap": self.fits_cap,
+            "operations": [asdict(operation) for operation in self.operations],
+            "stats": dict(self.stats),
+        }
+
+
+@dataclass
+class ConsolidationAppliedEdit(_AwaitableResult):
+    """Receipt for one edit a consolidation apply attempted."""
+
+    action: str  # "update" | "delete"
+    kind: str
+    id: str
+    applied: bool
+    error: str | None = None
+
+
+@dataclass
+class ConsolidationResult(_AwaitableResult):
+    """Receipt returned by ``HarnessState.apply_consolidation``."""
+
+    consolidation_id: str
+    edits: list[ConsolidationAppliedEdit]
+    index_bytes_before: int
+    index_bytes_after: int
+    fits_cap: bool
+    state_path: str | None
+
+    def __repr__(self) -> str:
+        applied = sum(1 for edit in self.edits if edit.applied)
+        return (
+            f"<ConsolidationResult {self.consolidation_id}: {applied}/{len(self.edits)} edits applied; "
+            f"index {self.index_bytes_before} -> {self.index_bytes_after} bytes, fits_cap={self.fits_cap}>"
+        )
+
+
+def _harness_store_digest(entries: Mapping[str, Mapping[str, HarnessEntry]]) -> str:
+    """Plan-apply freshness token: sha256 over (kind, id, version, updated_at).
+
+    Any create/update/delete moves it, so apply_consolidation can refuse a plan
+    minted against an older store. Kinds iterate in the fixed ``_KINDS`` order
+    and ids in sorted (code-point, i.e. UTF-8 lexicographic) order;
+    ``harnessStoreDigest`` in consolidation.ts computes the identical string.
+    """
+    lines: list[str] = []
+    for kind in _KINDS:
+        records = entries.get(kind, {})
+        for entry_id in sorted(records):
+            entry = records[entry_id]
+            updated = entry.updated_at if isinstance(entry.updated_at, str) else ""
+            version = entry.version if isinstance(entry.version, int) else 0
+            lines.append(f"{kind}\x00{entry_id}\x00{version}\x00{updated}")
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def _similarity_pairs(entries: Sequence[HarnessEntry], min_score: float) -> list[tuple[str, str, float]]:
+    """All entry pairs at ``min_score`` or better, by idf-weighted cosine over title+content.
+
+    Batch twin of ``HarnessState._near_duplicate_memory_matches``: same
+    tokenizer, same idf, same cosine. Term iteration is in sorted (code-point)
+    order so the summation order - and therefore the exact float scores - is
+    reproducible across the Python and TS faces; entries are enumerated in
+    sorted id order and the output sorts by (-score, id_a, id_b).
+    """
+    ordered = sorted(entries, key=lambda entry: entry.id)
+    if len(ordered) < 2:
+        return []
+    profiles = {entry.id: frozenset(_harness_query_terms(f"{entry.title} {entry.content}")) for entry in ordered}
+    document_count = len(ordered)
+    document_frequency: dict[str, int] = {}
+    for profile in profiles.values():
+        for term in profile:
+            document_frequency[term] = document_frequency.get(term, 0) + 1
+    idf = {term: math.log(1 + document_count / count) for term, count in document_frequency.items()}
+    norms: dict[str, float] = {}
+    for entry in ordered:
+        norms[entry.id] = math.sqrt(sum(idf[term] ** 2 for term in sorted(profiles[entry.id])))
+    inverted: dict[str, list[str]] = {}
+    for entry in ordered:
+        for term in profiles[entry.id]:
+            inverted.setdefault(term, []).append(entry.id)  # id-sorted: entries walk in id order
+    dots: dict[tuple[str, str], float] = {}
+    for term in sorted(inverted):
+        ids = inverted[term]
+        if len(ids) < 2:
+            continue
+        weight = idf[term] ** 2
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                key = (ids[i], ids[j])
+                dots[key] = dots.get(key, 0.0) + weight
+    pairs: list[tuple[str, str, float]] = []
+    for (id_a, id_b), dot in dots.items():
+        denominator = norms[id_a] * norms[id_b]
+        if denominator == 0:
+            continue
+        score = dot / denominator
+        if score >= min_score:
+            pairs.append((id_a, id_b, score))
+    pairs.sort(key=lambda pair: (-pair[2], pair[0], pair[1]))
+    return pairs
+
+
+def _consolidation_recency(entry: HarnessEntry) -> str:
+    """Most recent write timestamp; a missing one sorts last."""
+    updated = entry.updated_at
+    if isinstance(updated, str) and updated:
+        return updated
+    created = entry.created_at
+    return created if isinstance(created, str) else ""
+
+
+def _canonical_order(member_ids: list[str], by_id: Mapping[str, HarnessEntry]) -> list[str]:
+    """Cluster members, canonical first: most recently updated, then longest
+    content (code points), then smallest id. Two stable passes keep the tie
+    order exact; consolidation.ts uses the identical key."""
+    ordered = sorted(member_ids)
+    ordered.sort(
+        key=lambda entry_id: (_consolidation_recency(by_id[entry_id]), len(by_id[entry_id].content)),
+        reverse=True,
+    )
+    return ordered
+
+
+_MERGE_PIECE_SPLIT = re.compile(r"[。！？；!?\n]")
+
+
+def _merge_pieces(text: str) -> list[str]:
+    return [piece for piece in (part.strip() for part in _MERGE_PIECE_SPLIT.split(text)) if piece]
+
+
+def _merged_content(canonical: HarnessEntry, absorbed: Sequence[HarnessEntry]) -> str:
+    """Canonical body plus each absorbed entry's unique sentences as a bullet
+    appendix, in recency order. Exact duplicate sentences are dropped, so a
+    pure rewrite merge keeps the canonical body verbatim. Deterministic;
+    consolidation.ts builds the identical string."""
+    seen = set(_merge_pieces(canonical.content))
+    extras: list[str] = []
+    for entry in absorbed:
+        for piece in _merge_pieces(entry.content):
+            if piece not in seen:
+                seen.add(piece)
+                extras.append(piece)
+    if not extras:
+        return canonical.content
+    return canonical.content + "\n\n合并补充：\n" + "\n".join(f"- {piece}" for piece in extras)
+
+
+def _containment_text(text: str) -> str:
+    # Whitespace-collapsed lowercase for the containment check. Uses lower()
+    # (not casefold()) to match the TS face's toLowerCase().
+    return " ".join(text.split()).lower()
+
+
+def _slim_title(flat_title: str, max_chars: int) -> str:
+    """Code-point-capped title in the digest index line's own convention:
+    ``max_chars - 3`` code points plus an ellipsis, so the stored title renders
+    byte-identically to the truncated face it replaces and never grows the
+    line (120 CJK code points would outweigh 117 + "...")."""
+    if len(flat_title) <= max_chars:
+        return flat_title
+    if max_chars <= 3:
+        return flat_title[:max_chars].rstrip()
+    return f"{flat_title[: max_chars - 3].rstrip()}..."
+
+
+def _parse_iso_timestamp(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _consolidation_summary(stats: Mapping[str, int], before: int, after: int, fits_cap: bool, cap: int) -> str:
+    verdict = "fits" if fits_cap else "still over"
+    return (
+        f"Consolidation pass: {stats.get('merges', 0)} merges, {stats.get('stale_deletes', 0)} stale deletes, "
+        f"{stats.get('renames', 0)} renames; index {before} -> {after} bytes ({verdict} the {cap}-byte cap)."
+    )
+
+
+def _generate_consolidation_id() -> str:
+    return "consolidate_" + re.sub(r"[^0-9]", "", datetime.now(timezone.utc).isoformat())[:17]
 
 
 _ENTRY_FIELDS = {field.name for field in fields(HarnessEntry)}
@@ -1298,6 +1559,418 @@ class HarnessState:
                 total += _index_line_bytes(entry)
         return total
 
+    def plan_consolidation(
+        self,
+        *,
+        kinds: Sequence[str] = ("memory",),
+        merge_min_score: float = CONSOLIDATION_MERGE_MIN_SCORE,
+        stale_days: float | None = None,
+        stale_min_content_chars: int = CONSOLIDATION_STALE_MIN_CONTENT_CHARS,
+        slim_title_chars: int | None = _INDEX_TITLE_MAX_CHARS,
+        index_max_bytes: int = DEFAULT_HARNESS_INDEX_MAX_BYTES,
+        now: datetime | str | None = None,
+        global_: bool = False,
+        **kwargs: Any,
+    ) -> ConsolidationPlan:
+        """Propose merge/delete/rename operations that shrink the id+title index.
+
+        Dry-run, read-only: nothing is written, and executing the result needs
+        an explicit ``apply_consolidation(plan)`` call. Three passes run per
+        kind, each skipping entries an earlier pass already removed:
+
+        1. merge: near-duplicate clusters (the write gate's tokenizer/idf/cosine
+           in batch form) at ``merge_min_score`` or better fold into their most
+           recently updated member; the absorbed entries' unique sentences move
+           into the canonical body as a bullet appendix.
+        2. delete: stale entries - either fully contained in a surviving entry's
+           normalized content (bodies shorter than ``stale_min_content_chars``
+           are not worth the suggestion), or older than ``stale_days`` (off by
+           default; ``now`` injects the clock for deterministic runs).
+        3. rename: titles longer than ``slim_title_chars`` code points slim to
+           the cap (the digest's index layer already truncates its rendering
+           there, so the default costs the face nothing). ``None`` or ``<= 0``
+           disables the pass.
+
+        Parity: ``planHarnessConsolidation`` in consolidation.ts builds the
+        identical plan for the identical store.
+        """
+        if target := self._global_target(global_, kwargs):
+            return target.plan_consolidation(
+                kinds=kinds,
+                merge_min_score=merge_min_score,
+                stale_days=stale_days,
+                stale_min_content_chars=stale_min_content_chars,
+                slim_title_chars=slim_title_chars,
+                index_max_bytes=index_max_bytes,
+                now=now,
+            )
+        for kind in kinds:
+            if kind not in _KINDS:
+                raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
+        if not 0 <= merge_min_score <= 1:
+            raise ValueError(f"merge_min_score must be in [0, 1], got {merge_min_score}")
+        self._sync_from_disk()
+        if now is None:
+            resolved_now = datetime.now(timezone.utc)
+        elif isinstance(now, str):
+            parsed_now = _parse_iso_timestamp(now)
+            if parsed_now is None:
+                raise ValueError(f"now must be an ISO-8601 timestamp, got {now!r}")
+            resolved_now = parsed_now
+        elif isinstance(now, datetime):
+            resolved_now = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+        else:
+            raise TypeError(f"now must be a datetime or ISO-8601 string, got {type(now).__name__}")
+
+        operations: list[ConsolidationOperation] = []
+        merge_ops: list[ConsolidationOperation] = []
+        stale_ops: list[ConsolidationOperation] = []
+        rename_ops: list[ConsolidationOperation] = []
+        # Ids removed by an earlier pass (merge absorption or a stale delete)
+        # must not be targeted again by a later one.
+        removed: dict[str, set[str]] = {kind: set() for kind in _KINDS}
+
+        # Pass 1: near-duplicate merges.
+        for kind in kinds:
+            records = self.entries[kind]
+            if len(records) < 2:
+                continue
+            pairs = _similarity_pairs(list(records.values()), merge_min_score)
+            if not pairs:
+                continue
+            parent: dict[str, str] = {}
+
+            def find(entry_id: str) -> str:
+                root = entry_id
+                while parent[root] != root:
+                    root = parent[root]
+                while parent[entry_id] != root:
+                    parent[entry_id], entry_id = root, parent[entry_id]
+                return root
+
+            for id_a, id_b, _score in pairs:
+                parent.setdefault(id_a, id_a)
+                parent.setdefault(id_b, id_b)
+                root_a, root_b = find(id_a), find(id_b)
+                if root_a != root_b:
+                    parent[root_a] = root_b
+            clusters: dict[str, list[str]] = {}
+            for entry_id in parent:
+                clusters.setdefault(find(entry_id), []).append(entry_id)
+            cluster_scores: dict[str, float] = {}
+            for id_a, _id_b, score in pairs:
+                root = find(id_a)
+                cluster_scores[root] = max(cluster_scores.get(root, 0.0), score)
+            for member_ids in clusters.values():
+                if len(member_ids) < 2:
+                    continue
+                ordered = _canonical_order(member_ids, records)
+                canonical = records[ordered[0]]
+                absorbed = [records[entry_id] for entry_id in ordered[1:]]
+                # absorb_ids is sorted for a stable op list; the content union
+                # walks the absorbed entries in recency order instead.
+                merge_ops.append(
+                    ConsolidationOperation(
+                        action="merge",
+                        kind=kind,
+                        id=canonical.id,
+                        absorb_ids=tuple(sorted(entry.id for entry in absorbed)),
+                        title=canonical.title,
+                        content=_merged_content(canonical, absorbed),
+                        path=canonical.path if isinstance(canonical.path, str) else None,
+                        reason="near-duplicate cluster",
+                        score=cluster_scores[find(ordered[0])],
+                    )
+                )
+                removed[kind].update(entry.id for entry in absorbed)
+
+        # Pass 2: stale deletes - containment first, then age.
+        for kind in kinds:
+            survivors = [
+                entry for entry_id, entry in sorted(self.entries[kind].items()) if entry_id not in removed[kind]
+            ]
+            if not survivors:
+                continue
+            marked: dict[str, str] = {}
+            if stale_min_content_chars > 0 and len(survivors) >= 2:
+                texts = {entry.id: _containment_text(entry.content) for entry in survivors}
+                profiles = {
+                    entry.id: frozenset(_harness_query_terms(f"{entry.title} {entry.content}")) for entry in survivors
+                }
+                document_frequency: dict[str, int] = {}
+                for profile in profiles.values():
+                    for term in profile:
+                        document_frequency[term] = document_frequency.get(term, 0) + 1
+                inverted: dict[str, list[str]] = {}
+                for entry in survivors:
+                    for term in profiles[entry.id]:
+                        inverted.setdefault(term, []).append(entry.id)  # id-sorted survivor order
+                for entry in survivors:
+                    text = texts[entry.id]
+                    if len(text) < stale_min_content_chars:
+                        continue
+                    profile = profiles[entry.id]
+                    # Probe with the entry's rarest SHARED term: a contained
+                    # entry shares every content term with its container, while
+                    # a title-only term with df 1 would skip the check entirely.
+                    shared = [term for term in profile if document_frequency[term] >= 2]
+                    if not shared:
+                        continue
+                    rarest = min(shared, key=lambda term: (document_frequency[term], term))
+                    for other_id in inverted[rarest]:
+                        if other_id == entry.id or other_id in marked:
+                            continue
+                        other_text = texts[other_id]
+                        if len(other_text) > len(text) and text in other_text:
+                            marked[entry.id] = f"contained:{other_id}"
+                            break
+            if stale_days is not None:
+                for entry in survivors:
+                    if entry.id in marked:
+                        continue
+                    recency = _consolidation_recency(entry)
+                    moment = _parse_iso_timestamp(recency) if recency else None
+                    if moment is None:
+                        continue
+                    age_days = (resolved_now - moment).total_seconds() / 86400
+                    if age_days > stale_days:
+                        marked[entry.id] = f"stale:{math.floor(age_days)}d"
+            for entry_id, reason in sorted(marked.items()):
+                stale_ops.append(ConsolidationOperation(action="delete", kind=kind, id=entry_id, reason=reason))
+                removed[kind].add(entry_id)
+
+        # Pass 3: title slimming renames.
+        if slim_title_chars is not None and slim_title_chars > 0:
+            for kind in kinds:
+                for entry_id, entry in sorted(self.entries[kind].items()):
+                    if entry_id in removed[kind]:
+                        continue
+                    flat = _flatten_inline(entry.title)
+                    if len(flat) <= slim_title_chars:
+                        continue
+                    slimmed = _slim_title(flat, slim_title_chars)
+                    if not slimmed or slimmed == entry.title:
+                        continue
+                    rename_ops.append(
+                        ConsolidationOperation(
+                            action="rename",
+                            kind=kind,
+                            id=entry_id,
+                            title=slimmed,
+                            reason=f"title over {slim_title_chars} chars",
+                            previous_title_chars=len(flat),
+                        )
+                    )
+
+        kind_order = {kind: index for index, kind in enumerate(_KINDS)}
+        for group in (merge_ops, stale_ops, rename_ops):
+            group.sort(key=lambda op: (kind_order[op.kind], op.id))
+        operations = merge_ops + stale_ops + rename_ops
+
+        before = self.index_bytes()
+        after = before
+        for operation in operations:
+            if operation.action == "merge":
+                for absorb_id in operation.absorb_ids:
+                    after -= _index_line_bytes(self.entries[operation.kind][absorb_id])
+            elif operation.action == "delete":
+                after -= _index_line_bytes(self.entries[operation.kind][operation.id])
+            else:
+                entry = self.entries[operation.kind][operation.id]
+                renamed = _index_line(entry.id, entry.scope, operation.title, entry.path)
+                after += len((renamed + "\n").encode("utf-8")) - _index_line_bytes(entry)
+        fits_cap = after <= index_max_bytes
+        stats = {
+            "merges": len(merge_ops),
+            "absorbed_entries": sum(len(operation.absorb_ids) for operation in merge_ops),
+            "stale_deletes": len(stale_ops),
+            "renames": len(rename_ops),
+        }
+        return ConsolidationPlan(
+            store_digest=_harness_store_digest(self.entries),
+            options={
+                "kinds": list(kinds),
+                "merge_min_score": merge_min_score,
+                "stale_days": stale_days,
+                "stale_min_content_chars": stale_min_content_chars,
+                "slim_title_chars": slim_title_chars,
+                "index_max_bytes": index_max_bytes,
+            },
+            index_bytes_before=before,
+            index_bytes_after=after,
+            fits_cap=fits_cap,
+            operations=operations,
+            stats=stats,
+        )
+
+    def _apply_consolidation_operation(self, operation: ConsolidationOperation) -> list[ConsolidationAppliedEdit]:
+        """Execute one planned operation against the in-memory store.
+
+        Mirrors applyRefinementProposal's per-edit semantics (consolidation.ts):
+        updates bump version, stamp source="refine" and refreshed updated_at;
+        a missing entry fails its edit without failing the batch. Entries are
+        swapped via dataclasses.replace instead of mutated in place, so the
+        caller's pre-apply snapshot of the records dicts stays a valid rollback.
+        """
+        if operation.kind not in _KINDS:
+            return [
+                ConsolidationAppliedEdit(
+                    operation.action, operation.kind, operation.id, False, f"unknown harness kind {operation.kind!r}"
+                )
+            ]
+        records = self.entries[operation.kind]  # type: ignore[index]
+        if operation.action == "merge":
+            target = records.get(operation.id)
+            if target is None:
+                return [ConsolidationAppliedEdit("update", operation.kind, operation.id, False, "entry not found")]
+            if not operation.title or not operation.content:
+                return [
+                    ConsolidationAppliedEdit("update", operation.kind, operation.id, False, "merge requires title and content")
+                ]
+            records[operation.id] = replace(
+                target,
+                title=operation.title,
+                content=operation.content,
+                path=operation.path if operation.path is not None else target.path,
+                source="refine",
+                updated_at=_now(),
+                version=target.version + 1,
+            )
+            edits = [ConsolidationAppliedEdit("update", operation.kind, operation.id, True)]
+            for absorb_id in operation.absorb_ids:
+                if absorb_id == operation.id:
+                    edits.append(
+                        ConsolidationAppliedEdit("delete", operation.kind, absorb_id, False, "cannot absorb the merge target")
+                    )
+                    continue
+                removed = records.pop(absorb_id, None)
+                edits.append(
+                    ConsolidationAppliedEdit(
+                        "delete", operation.kind, absorb_id, removed is not None, None if removed else "entry not found"
+                    )
+                )
+            return edits
+        if operation.action == "delete":
+            removed = records.pop(operation.id, None)
+            return [
+                ConsolidationAppliedEdit(
+                    "delete", operation.kind, operation.id, removed is not None, None if removed else "entry not found"
+                )
+            ]
+        if operation.action == "rename":
+            target = records.get(operation.id)
+            if target is None:
+                return [ConsolidationAppliedEdit("update", operation.kind, operation.id, False, "entry not found")]
+            if not operation.title:
+                return [ConsolidationAppliedEdit("update", operation.kind, operation.id, False, "rename requires title")]
+            records[operation.id] = replace(
+                target, title=operation.title, source="refine", updated_at=_now(), version=target.version + 1
+            )
+            return [ConsolidationAppliedEdit("update", operation.kind, operation.id, True)]
+        return [
+            ConsolidationAppliedEdit(operation.action, operation.kind, operation.id, False, f"unsupported action {operation.action!r}")
+        ]
+
+    def apply_consolidation(
+        self,
+        plan: ConsolidationPlan,
+        *,
+        allow_stale_plan: bool = False,
+        global_: bool = False,
+        **kwargs: Any,
+    ) -> ConsolidationResult:
+        """Execute a plan from ``plan_consolidation``. Explicit by construction:
+        the planner never writes, and this refuses a plan whose store digest no
+        longer matches (``allow_stale_plan=True`` overrides). Mutations land in
+        one locked pass with a single save; a failed save rolls the in-memory
+        store back. The applied edits are recorded as a refinement event, so the
+        pass shows up in the same audit trail as /refine. The index cap never
+        gates this path: consolidation operations only shrink or rewrite index
+        lines, which is exactly how an over-cap store gets back under the cap.
+        """
+        if target := self._global_target(global_, kwargs):
+            return target.apply_consolidation(plan, allow_stale_plan=allow_stale_plan)
+        if not isinstance(plan, ConsolidationPlan):
+            raise TypeError(f"plan must be a ConsolidationPlan, got {type(plan).__name__}")
+        self._ensure_local_writable()
+        with self._write_guard():
+            self._sync_from_disk()
+            if not allow_stale_plan and _harness_store_digest(self.entries) != plan.store_digest:
+                raise ValueError(
+                    "consolidation plan is stale: the store changed since the plan was built; "
+                    "re-run plan_consolidation() (or pass allow_stale_plan=True to apply anyway)"
+                )
+            consolidation_id = _generate_consolidation_id()
+            edits: list[ConsolidationAppliedEdit] = []
+            effect_records: list[tuple[str, str, str, str, str | None, str | None]] = []
+            entries_snapshot = {kind: dict(records) for kind, records in self.entries.items()}
+            refinements_mark = len(self.refinements)
+            try:
+                for operation in plan.operations:
+                    # Snapshot every entry the operation touches before mutating:
+                    # a merge's absorbed deletes need their own pre-delete
+                    # content for the effect record, not the target's.
+                    touched_ids = [operation.id, *operation.absorb_ids]
+                    before_entries = {
+                        entry_id: self.entries[operation.kind].get(entry_id)
+                        for entry_id in touched_ids
+                        if operation.kind in _KINDS
+                    }
+                    operation_edits = self._apply_consolidation_operation(operation)
+                    edits.extend(operation_edits)
+                    for edit in operation_edits:
+                        if not edit.applied:
+                            continue
+                        before_entry = before_entries.get(edit.id)
+                        after_entry = self.entries[edit.kind].get(edit.id)
+                        if edit.action == "delete":
+                            if before_entry is not None:
+                                effect_records.append(
+                                    ("deleted", edit.kind, edit.id, before_entry.title, before_entry.content, None)
+                                )
+                        elif after_entry is not None:
+                            effect_records.append(
+                                (
+                                    "updated",
+                                    edit.kind,
+                                    edit.id,
+                                    after_entry.title,
+                                    before_entry.content if before_entry is not None else None,
+                                    after_entry.content,
+                                )
+                            )
+                applied = [edit for edit in edits if edit.applied]
+                if applied:
+                    cap = int(plan.options.get("index_max_bytes") or 0)
+                    self.refinements.append(
+                        RefinementEvent(
+                            id=consolidation_id,
+                            trigger=_consolidation_summary(
+                                plan.stats, plan.index_bytes_before, plan.index_bytes_after, plan.fits_cap, cap
+                            ),
+                            changes=[f"{edit.action} {edit.kind}:{edit.id}" for edit in applied],
+                            evidence="consolidation plan apply",
+                            outcome=f"index {plan.index_bytes_before} -> {plan.index_bytes_after} bytes",
+                        )
+                    )
+                    self.save()
+            except BaseException:
+                self.entries = entries_snapshot
+                del self.refinements[refinements_mark:]
+                raise
+        after_bytes = self.index_bytes()
+        cap = int(plan.options.get("index_max_bytes") or 0)
+        for action, kind, entry_id, title, before, after in effect_records:
+            effects.memory_change(action, kind, self.scope, entry_id, title, before=before, after=after)
+        return ConsolidationResult(
+            consolidation_id=consolidation_id,
+            edits=edits,
+            index_bytes_before=plan.index_bytes_before,
+            index_bytes_after=after_bytes,
+            fits_cap=cap > 0 and after_bytes <= cap,
+            state_path=str(self.file_path) if self.file_path is not None else None,
+        )
+
     def create(
         self,
         kind: HarnessKind,
@@ -1863,6 +2536,13 @@ def get_harness_state(
 
 
 __all__ = [
+    "CONSOLIDATION_MERGE_MIN_SCORE",
+    "CONSOLIDATION_PLAN_VERSION",
+    "CONSOLIDATION_STALE_MIN_CONTENT_CHARS",
+    "ConsolidationAppliedEdit",
+    "ConsolidationOperation",
+    "ConsolidationPlan",
+    "ConsolidationResult",
     "HarnessEntry",
     "HarnessKind",
     "HarnessScope",

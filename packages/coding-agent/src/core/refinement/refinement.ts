@@ -61,7 +61,7 @@ const DEFAULT_OVERVIEW_CONTENT_LIMIT = 180;
 export const DEFAULT_HARNESS_INDEX_MAX_BYTES = 12 * 1024;
 
 /** Index titles are capped here; the id stays whole because it is the address. */
-const HARNESS_INDEX_TITLE_MAX_CHARS = 120;
+export const HARNESS_INDEX_TITLE_MAX_CHARS = 120;
 
 /**
  * Controlled first-segment vocabulary for entry paths (memory-recall-design.md
@@ -1180,7 +1180,7 @@ export function rankHarnessEntriesForQuery(entries: HarnessEntry[], terms: Harne
  * and one entry must render as exactly one index line, so a value carrying
  * newlines must not forge extra lines in a trusted-state surface.
  */
-function flattenIndexText(text: string): string {
+export function flattenIndexText(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
 }
 
