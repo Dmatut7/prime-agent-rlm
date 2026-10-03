@@ -1,0 +1,1 @@
+- Internal refactor, no behavior change: the quota-park lifecycle (park, durable resume job, wake, bounded re-arms, branch/restart restore) moved out of `agent-session.ts` into `core/quota-park.ts` behind a structural `QuotaParkHost` seam, following the earlier rlm-child cluster extractions.

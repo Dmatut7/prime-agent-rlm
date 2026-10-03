@@ -174,7 +174,7 @@ import {
 } from "./context-tree.js";
 import {
 	type AgentCronJob,
-	AgentCronJobStore,
+	type AgentCronJobStore,
 	type AgentRlmHeartbeatController,
 	type AgentRlmHeartbeatStatusUpdate,
 	normalizeHeartbeatDeliveryMode,
@@ -348,8 +348,6 @@ import {
 	isFauxProviderQueueExhausted,
 	isPermanentProviderFailureKind,
 	type ProviderWaitPolicy,
-	parseProviderResetMs,
-	providerParkDecision,
 	providerRetryDelay,
 	providerRetryPolicy,
 	providerStreamFailureDetails,
@@ -357,8 +355,19 @@ import {
 	providerStreamFailureRetryAfterMs,
 	providerStreamFailureStatus,
 	providerWaitClass,
-	providerWaitDecision,
 } from "./provider-retry.js";
+import {
+	completeQuotaParkResume,
+	createQuotaResumeJob,
+	handleAbortedQuotaPark,
+	handleErroredQuotaParkProbe,
+	handleProviderWait,
+	normalizeMessageContent,
+	primaryDeliveryRecord,
+	reloadQuotaParkFromBranch,
+	resolveQuotaResumeJob,
+	restoreQuotaPark,
+} from "./quota-park.js";
 import {
 	type AutoRefineReason,
 	type AutoRefineReview,
@@ -1159,7 +1168,7 @@ interface PreparedCommandPayload extends SessionCommandPayload {
 	images?: ImageContent[];
 }
 
-type QueuedSessionAction = SessionAction<PreparedTurnPayload | PreparedCommandPayload>;
+export type QueuedSessionAction = SessionAction<PreparedTurnPayload | PreparedCommandPayload>;
 
 interface PreparedPromptPreparation {
 	result: Awaited<ReturnType<ExtensionRunner["emitBeforeAgentStart"]>>;
@@ -1343,26 +1352,6 @@ export function sessionActionPriorityFor(facts: {
 		}),
 	);
 	return sessionActionPriorityForInputClass(classification);
-}
-
-function primaryDeliveryRecord(action: QueuedSessionAction): DeliveryRecord {
-	if (action.payload.kind !== "turn") throw new Error(`Session action ${action.id} is not a turn`);
-	const record = action.payload.records.find((candidate) => candidate.role === "primary");
-	if (!record) throw new Error(`Turn action ${action.id} has no primary delivery record`);
-	return record;
-}
-
-function normalizeMessageContent(content: string | (TextContent | ImageContent)[]): {
-	text: string;
-	images?: ImageContent[];
-} {
-	if (typeof content === "string") return { text: content };
-	const text = content
-		.filter((part): part is TextContent => part.type === "text")
-		.map((part) => part.text)
-		.join("\n");
-	const images = content.filter((part): part is ImageContent => part.type === "image");
-	return { text, ...(images.length > 0 ? { images } : {}) };
 }
 
 /**
@@ -1772,28 +1761,6 @@ function aggregatedFailureWakeText(notices: readonly CustomMessage[]): string {
 	);
 }
 
-/** Session-log entry recorded when a quota-blocked session parks until the provider reset. */
-const QUOTA_PARK_CUSTOM_ENTRY_TYPE = "provider_quota_park";
-/** Session-log entry recorded when a parked session resumes, or when its wake could not resume it. */
-const QUOTA_RESUME_CUSTOM_ENTRY_TYPE = "provider_quota_resume";
-/** Label for the durable one-shot wake that resumes a parked session. */
-const QUOTA_RESUME_CRON_LABEL = "quota-resume";
-/**
- * In-context marker delivered on resume: tells the model the pause happened and
- * that it should continue the interrupted task. The same text is the prompt of
- * the durable wake job, so daemon-delivered resumes read identically.
- */
-const QUOTA_RESUME_MARKER_TEXT =
-	"<provider_quota_resumed>\n" +
-	"The provider usage limit that paused this session has been reported as reset; this resume is automatic (retry.provider.waitForUsage.pauseUntilReset). Continue the interrupted task from where it stopped.\n" +
-	"</provider_quota_resumed>";
-/** Node caps timers at 2^31-1 ms; longer delays overflow setTimeout and fire after ~1ms. */
-const MAX_TIMER_DELAY_MS = 2_147_483_647;
-/** Retry delay for a wake that was consumed without resuming (refused admission, aborted probe). */
-const QUOTA_WAKE_RETRY_DELAY_MS = 60_000;
-/** Cap on those retries: a park that can never wake is dropped instead of parked forever. */
-const QUOTA_WAKE_MAX_RETRIES = 3;
-
 /** Label for the durable one-shot wake that backs a fallback long wait across a restart. */
 const PROVIDER_LONG_WAIT_RESUME_CRON_LABEL = "provider-long-wait-resume";
 /** Service tiers a persisted fallback switch may name (anything else keeps the current tier). */
@@ -1806,44 +1773,6 @@ interface ImageFallbackEpisode {
 	/** The override now serving the run. */
 	override: AgentModelOverride;
 	tried: string[];
-}
-
-/** Data carried by a persisted provider_quota_park entry, used to restore a park after a restart. */
-interface PersistedQuotaParkData {
-	resumeAt: string;
-	/**
-	 * Provider-reported quota reset time. Absent on the initial park entry (where
-	 * resumeAt IS the reset); present on wake re-arm entries, whose resumeAt is the
-	 * retry wake time instead. Read by the quota-park status side for the countdown.
-	 */
-	quotaResumeAt?: string;
-	parkCount: number;
-	jobId?: string;
-	/** Provider whose quota reset the park waits on; kept on re-arm/rebuild entries too. */
-	provider?: string;
-	/**
-	 * Wake re-arms consumed without a resume, carried on re-arm entries so a
-	 * restart does not reset the QUOTA_WAKE_MAX_RETRIES budget (the same
-	 * restart-safety parkCount already had).
-	 */
-	wakeRetries?: number;
-}
-
-function isPersistedQuotaParkData(value: unknown): value is PersistedQuotaParkData {
-	if (!value || typeof value !== "object") {
-		return false;
-	}
-	const record = value as Record<string, unknown>;
-	return (
-		typeof record.resumeAt === "string" &&
-		typeof record.parkCount === "number" &&
-		Number.isFinite(record.parkCount) &&
-		(record.quotaResumeAt === undefined || typeof record.quotaResumeAt === "string") &&
-		(record.jobId === undefined || typeof record.jobId === "string") &&
-		(record.provider === undefined || typeof record.provider === "string") &&
-		(record.wakeRetries === undefined ||
-			(typeof record.wakeRetries === "number" && Number.isFinite(record.wakeRetries)))
-	);
 }
 
 function autoRefineInstructions(reason: AutoRefineReason, review: AutoRefineReview): string {
@@ -2092,7 +2021,7 @@ export class AgentSession {
 	private _agentEventQueue: Promise<void> = Promise.resolve();
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
-	private readonly _actionStore = new ActionStore<QueuedSessionAction>();
+	readonly _actionStore = new ActionStore<QueuedSessionAction>();
 	// One-shot "all" steering batch armed by abortAndSendQueued: read on selection, never
 	// consumed on read, and disarmed once the armed actions leave the steering queue.
 	private _forcedAllSteeringActionIds: ReadonlySet<string> | undefined;
@@ -2212,7 +2141,7 @@ export class AgentSession {
 	private _branchSummaryOperation: Promise<void> | undefined = undefined;
 
 	private _retryAbortController: AbortController | undefined = undefined;
-	private _retryAttempt = 0;
+	_retryAttempt = 0;
 	/**
 	 * Recovery continuations spent in the current empty-response failure episode
 	 * (r4 recovery): reset by any non-error assistant message, spent one per episode,
@@ -2231,21 +2160,21 @@ export class AgentSession {
 	 * the terminal flow while it is pending), or lets the failure go terminal when
 	 * the episode's recovery was already spent.
 	 */
-	private _providerFailureRecoveryPending = false;
+	_providerFailureRecoveryPending = false;
 	/** Bumped by every retry resolution; stale scheduled-continue callbacks check it before touching retry state. */
 	private _retryGeneration = 0;
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
-	private _retryAuthFailureSources: AuthSourceToken[] = [];
+	_retryAuthFailureSources: AuthSourceToken[] = [];
 	/** Ongoing wait-for-recovery state: pings issued and when the wait started. */
-	private _providerWait: { attempts: number; startedAtMs: number } | undefined = undefined;
+	_providerWait: { attempts: number; startedAtMs: number } | undefined = undefined;
 	/**
 	 * Quota park state: the session ended its turn because the provider-reported
 	 * usage reset was beyond the bounded wait, and a wake (in-process timer plus
 	 * a durable one-shot scheduled job) will resume the task automatically. While
 	 * parked the session itself makes no model calls.
 	 */
-	private _quotaPark:
+	_quotaPark:
 		| {
 				/** Parks consumed in this quota episode; bounded by waitForUsage.maxParks. */
 				parkCount: number;
@@ -2270,9 +2199,9 @@ export class AgentSession {
 		  }
 		| undefined = undefined;
 	/** Lazily built session-artifact store for durable quota-resume wake jobs. */
-	private _quotaResumeJobStore: AgentCronJobStore | undefined = undefined;
+	_quotaResumeJobStore: AgentCronJobStore | undefined = undefined;
 	/** Wake jobs branch navigation cancelled, so returning to the parked branch can rebuild one. */
-	private readonly _navigationCancelledWakeJobs = new Set<string>();
+	readonly _navigationCancelledWakeJobs = new Set<string>();
 	/** Set while turns are routed to the user-configured backup model. */
 	private _backupModel:
 		| {
@@ -2481,7 +2410,7 @@ export class AgentSession {
 	 * retries were exhausted or never attempted, even though `_retryAttempt` is
 	 * already reset by the time the notice is composed.
 	 */
-	private _terminalFailureAttemptCount = 0;
+	_terminalFailureAttemptCount = 0;
 	_subagentRuntimeHost?: SubagentRuntimeHost;
 	_activeRlmChildRuns = new Map<string, RlmChildRun>();
 	/**
@@ -3041,7 +2970,7 @@ export class AgentSession {
 	 * implicit: the next successful persist backfills via a full rewrite and
 	 * resets the backoff.
 	 */
-	private _reportSessionPersistFailure(error: unknown): void {
+	_reportSessionPersistFailure(error: unknown): void {
 		const message = error instanceof Error ? error.message : String(error);
 		const now = Date.now();
 		if (now - this._lastSessionPersistFailureAt < this._sessionPersistFailureBackoffMs) {
@@ -6255,15 +6184,6 @@ export class AgentSession {
 		this._agentEventQueue.catch(() => {});
 	};
 
-	/**
-	 * Whether a host-owned phase currently owns this session's silence, so the watchdog snoozes
-	 * instead of escalating (compaction, branch summaries, serialized refinement, a UI dialog).
-	 *
-	 * Deliberately *not* extended by the kernel-liveness vouch: a vouch only defers the abort, and
-	 * B2 requires the warning to keep firing, which merging the two here would suppress. The
-	 * "is this silence excused" question a parent needs for its label (B9/I-13) is answered by the
-	 * exemption segment on the stall event - see `RlmChildStallState.excused` - not by this getter.
-	 */
 	/** Current stall marker, if the watchdog has fired and the turn has not restarted. */
 	get stallState(): RlmChildStallState | undefined {
 		return this._stallState;
@@ -6310,6 +6230,15 @@ export class AgentSession {
 		return this._lastTurnAbortReason;
 	}
 
+	/**
+	 * Whether a host-owned phase currently owns this session's silence, so the watchdog snoozes
+	 * instead of escalating (compaction, branch summaries, serialized refinement, a UI dialog).
+	 *
+	 * Deliberately *not* extended by the kernel-liveness vouch: a vouch only defers the abort, and
+	 * B2 requires the warning to keep firing, which merging the two here would suppress. The
+	 * "is this silence excused" question a parent needs for its label (B9/I-13) is answered by the
+	 * exemption segment on the stall event - see `RlmChildStallState.excused` - not by this getter.
+	 */
 	get stallExempted(): boolean {
 		return (
 			this._disposed ||
@@ -7341,7 +7270,7 @@ export class AgentSession {
 		}
 	}
 
-	private _resolveRetry(): void {
+	_resolveRetry(): void {
 		// The chain is over (answered, exhausted, disabled or cancelled): drop the shared
 		// counter so the pool never outlives the request it accounts for.
 		forgetProviderRequestBudget(this.sessionId);
@@ -7357,14 +7286,7 @@ export class AgentSession {
 	}
 
 	_findLastAssistantMessage(): AssistantMessage | undefined {
-		const messages = this.agent.state.messages;
-		for (let i = messages.length - 1; i >= 0; i--) {
-			const msg = messages[i];
-			if (msg.role === "assistant") {
-				return msg as AssistantMessage;
-			}
-		}
-		return undefined;
+		return this._findLastAssistantInMessages(this.agent.state.messages);
 	}
 
 	private _replaceMessageInPlace(target: AgentMessage, replacement: AgentMessage): void {
@@ -10655,7 +10577,7 @@ export class AgentSession {
 		return { accepted: true, disposition, ticket: controller.ticket };
 	}
 
-	private async _queuePreparedPrompt(
+	async _queuePreparedPrompt(
 		schedule: SessionInputSchedule,
 		text: string,
 		images?: ImageContent[],
@@ -15983,19 +15905,6 @@ export class AgentSession {
 			: undefined;
 	}
 
-	refreshModelMetadata(): void {
-		if (this.model?.provider === "xai") {
-			this.agent.state.model = this._modelRegistry.getModelForCurrentAuth(this.model);
-			this.setThinkingLevel(this.thinkingLevel);
-			this._clampServiceTierForModel();
-		}
-		this._scopedModels = this._scopedModels.map((scoped) =>
-			scoped.model.provider === "xai"
-				? { ...scoped, model: this._modelRegistry.getModelForCurrentAuth(scoped.model) }
-				: scoped,
-		);
-	}
-
 	private _refreshCurrentModelFromRegistry(): void {
 		const currentModel = this.model;
 		if (!currentModel) {
@@ -17702,7 +17611,7 @@ export class AgentSession {
 	}
 
 	/** The next model's ladder starts with a clean request pool: switching models is recovery, not amplification. */
-	private _startFreshRequestLadder(): void {
+	_startFreshRequestLadder(): void {
 		peekProviderRequestBudget(this.sessionId)?.reset();
 	}
 
@@ -17859,7 +17768,7 @@ export class AgentSession {
 		return marked;
 	}
 
-	private _markProviderAuthStaleForRetryFailure(
+	_markProviderAuthStaleForRetryFailure(
 		message: AssistantMessage,
 		options?: {
 			markAuthStaleOnFailure?: boolean;
@@ -18384,7 +18293,7 @@ export class AgentSession {
 	 * Shared retry tail: park the failed turn, surface the retry attempt, wait,
 	 * and re-issue the turn. Returns false when the retry was aborted instead.
 	 */
-	private async _retryAfterDelay(
+	async _retryAfterDelay(
 		message: AssistantMessage,
 		options:
 			| {
@@ -18672,7 +18581,7 @@ export class AgentSession {
 		return this._imageFallback;
 	}
 
-	private _canFallbackLongWait(): boolean {
+	_canFallbackLongWait(): boolean {
 		return (
 			this.settingsManager.getProviderFallbackModels().length > 0 &&
 			this._fallbackLongWaitRound < this.settingsManager.getProviderFallbackLongWait().maxRounds
@@ -19051,7 +18960,7 @@ export class AgentSession {
 	 * dies with the process, so a durable wake job backs it: a restart during the
 	 * wait still resumes the task, a live process cancels the job when it wakes.
 	 */
-	private async _handleFallbackLongWait(
+	async _handleFallbackLongWait(
 		message: AssistantMessage,
 		options:
 			| {
@@ -19296,11 +19205,6 @@ export class AgentSession {
 		this._emit({ type: "auto_retry_end", success: true, attempt: 1 });
 	}
 
-	/**
-	 * One bounded wait-for-recovery ping: exponential backoff with jitter, a
-	 * scheduled resume when the provider reports a reset time, and hard abort
-	 * bounds so the wait can never hang.
-	 */
 	private async _handleProviderWait(
 		message: AssistantMessage,
 		options:
@@ -19312,553 +19216,35 @@ export class AgentSession {
 		policy: ProviderWaitPolicy,
 		reason: "usage" | "unavailable",
 	): Promise<boolean> {
-		const wait = this._providerWait;
-		const startedAtMs = wait?.startedAtMs ?? Date.now();
-		const pingAttempt = (wait?.attempts ?? 0) + 1;
-		this._providerWait = { attempts: pingAttempt, startedAtMs };
-
-		const resetMs = providerStreamFailureRetryAfterMs(message) ?? parseProviderResetMs(message.errorMessage);
-		const decision = providerWaitDecision(pingAttempt, Date.now() - startedAtMs, resetMs, policy);
-		if (decision.kind === "abort" && reason === "unavailable" && this._canFallbackLongWait()) {
-			return this._handleFallbackLongWait(message, options);
-		}
-		if (decision.kind === "abort") {
-			// A quota reset beyond the bounded wait parks the session instead of
-			// dying mid-task: end the turn cleanly and resume at the reset time.
-			if (reason === "usage" && decision.reason === "reset-too-far") {
-				const park = providerParkDecision(this._quotaPark?.parkCount ?? 0, resetMs, policy);
-				if (park.kind === "park") {
-					return this._parkForQuotaReset(message, options, park.delayMs, decision.message, pingAttempt - 1);
-				}
-			}
-			// A quota wait that gives up ends the episode's park: its wake has
-			// already fired (or was never armed), so nothing else would resume it.
-			// Future-scheduled parks survive; only stale post-wake parks clear.
-			const stalePark = this._quotaPark;
-			if (reason === "usage" && stalePark !== undefined && stalePark.resumeAtMs <= Date.now()) {
-				this._cancelQuotaParkWake(stalePark);
-				this._quotaPark = undefined;
-			}
-			// Same terminal shape as a spent ladder: agent_end hands the failure
-			// back to the model as one recovery turn before the episode is
-			// terminal. The wait ran the longest of any failure path; it should
-			// not be the one that ends silently.
-			this._providerFailureRecoveryPending = true;
-			this._markProviderAuthStaleForRetryFailure(message, options);
-			const restoredModel = this._restorePrimaryModelAfterBackup();
-			this._emit({
-				type: "auto_retry_end",
-				success: false,
-				attempt: pingAttempt - 1,
-				finalError: `${decision.message}: ${message.errorMessage || "unknown error"}`,
-				...(restoredModel ? { restoredModel } : {}),
-			});
-			// The pings that just ran are this episode's attempts: a later terminal
-			// notice reports them instead of the "no retries attempted" misreport.
-			this._terminalFailureAttemptCount = pingAttempt - 1;
-			this._retryAttempt = 0;
-			this._providerWait = undefined;
-			this._retryAuthFailureSources = [];
-			this._resolveRetry();
-			return false;
-		}
-
-		// Each recovery ping after a wait is a fresh probe, bounded by the wait's own
-		// attempt and duration limits; counting pings into the failed ladder's pool
-		// ended the wait long before either limit.
-		this._startFreshRequestLadder();
-		return this._retryAfterDelay(
-			message,
-			options,
-			{
-				type: "auto_retry_start",
-				attempt: pingAttempt,
-				maxAttempts: policy.maxAttempts,
-				delayMs: decision.delayMs,
-				errorMessage: message.errorMessage || "Unknown error",
-				reason,
-			},
-			decision.delayMs,
-		);
+		return handleProviderWait(this, message, options, policy, reason);
 	}
 
-	/**
-	 * Park a quota-blocked session: end the failed turn cleanly, record the
-	 * parked transition in the session log, and schedule one wake (a durable
-	 * one-shot scheduled job plus an in-process timer) at the provider-reported
-	 * reset time. While parked the session makes no model calls; the wake
-	 * delivers the resume marker, whose first model call probes the quota.
-	 */
-	private _parkForQuotaReset(
-		message: AssistantMessage,
-		options:
-			| {
-					markAuthStaleOnFailure?: boolean;
-					authSourceTokens?: readonly AuthSourceToken[];
-			  }
-			| undefined,
-		pauseMs: number,
-		abortMessage: string,
-		parkedAttempt: number,
-	): boolean {
-		const existing = this._quotaPark;
-		if (existing !== undefined && existing.resumeAtMs > Date.now()) {
-			// Already parked for this window (e.g. a heartbeat turn failed while
-			// parked): keep the scheduled wake, consume no park, end the turn.
-			this._finishQuotaParkedTurn(
-				message,
-				options,
-				parkedAttempt,
-				`Session is parked until ${new Date(existing.resumeAtMs).toISOString()} waiting for the provider usage reset; this turn ended without a retry: ${message.errorMessage || "unknown error"}`,
-			);
-			return false;
-		}
-		this._cancelQuotaParkWake(existing);
-		const parkCount = (existing?.parkCount ?? 0) + 1;
-		const resumeAtMs = Date.now() + pauseMs;
-		const jobId = this._createQuotaResumeJob(resumeAtMs);
-		const timer = this._scheduleQuotaResumeTimer(resumeAtMs);
-		this._quotaPark = {
-			parkCount,
-			resumeAtMs,
-			quotaResumeAtMs: resumeAtMs,
-			...(jobId !== undefined ? { jobId } : {}),
-			...(timer !== undefined ? { timer } : {}),
-			...(message.provider === undefined ? {} : { provider: message.provider }),
-		};
-		this.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
-			resumeAt: new Date(resumeAtMs).toISOString(),
-			parkCount,
-			...(jobId !== undefined ? { jobId } : {}),
-			provider: message.provider,
-		});
-		this._finishQuotaParkedTurn(
-			message,
-			options,
-			parkedAttempt,
-			`${abortMessage}. Session parked until ${new Date(resumeAtMs).toISOString()} and will resume automatically (retry.provider.waitForUsage.pauseUntilReset): ${message.errorMessage || "unknown error"}`,
-		);
-		return false;
+	private _createQuotaResumeJob(resumeAtMs: number, label?: string, prompt?: string): string | undefined {
+		return createQuotaResumeJob(this, resumeAtMs, label, prompt);
 	}
 
-	/** Shared park tail: mark auth stale, surface the parked status, end the retry and the turn. */
-	private _finishQuotaParkedTurn(
-		message: AssistantMessage,
-		options:
-			| {
-					markAuthStaleOnFailure?: boolean;
-					authSourceTokens?: readonly AuthSourceToken[];
-			  }
-			| undefined,
-		parkedAttempt: number,
-		finalError: string,
-	): void {
-		this._markProviderAuthStaleForRetryFailure(message, options);
-		this._emit({ type: "auto_retry_end", success: false, attempt: parkedAttempt, finalError });
-		// The parked turn's pings are real attempts: a terminal notice after the
-		// park ends (wake budget spent, probe failing) must not report "no retries
-		// attempted". A successful resume resets this at the next message_end.
-		this._terminalFailureAttemptCount = parkedAttempt;
-		this._retryAttempt = 0;
-		this._providerWait = undefined;
-		this._retryAuthFailureSources = [];
-		this._resolveRetry();
-	}
-
-	/**
-	 * Durable wake: a one-shot scheduled job in this session's artifacts, so a
-	 * restart or closed worker still restores the session and delivers the
-	 * resume marker at the reset time. Best-effort: the in-process timer covers
-	 * live sessions when this cannot be persisted (e.g. in-memory sessions).
-	 */
-	private _createQuotaResumeJob(
-		resumeAtMs: number,
-		label = QUOTA_RESUME_CRON_LABEL,
-		prompt = QUOTA_RESUME_MARKER_TEXT,
-	): string | undefined {
-		const sessionFile = this.sessionFile;
-		const store = this._quotaResumeStore();
-		if (!sessionFile || !store) {
-			return undefined;
-		}
-		try {
-			const job = store.create({
-				activeSessionId: this.sessionId,
-				sessionId: this.sessionId,
-				sessionFile,
-				cwd: this.sessionManager.getCwd(),
-				label,
-				prompt,
-				scheduleText: `at ${new Date(resumeAtMs).toISOString()}`,
-				runtimeKind: this._rlmDepth > 0 ? "subagent" : "top-level",
-			});
-			return job.id;
-		} catch {
-			return undefined;
-		}
-	}
-
-	/** In-process wake for live sessions; unref'd so a parked session never holds the process open. */
-	private _scheduleQuotaResumeTimer(resumeAtMs: number): ReturnType<typeof setTimeout> | undefined {
-		const delayMs = Math.min(Math.max(resumeAtMs - Date.now(), 0), MAX_TIMER_DELAY_MS);
-		const timer = setTimeout(() => {
-			void this._resumeFromQuotaPark();
-		}, delayMs);
-		timer.unref();
-		return timer;
-	}
-
-	/** Store over this session's artifact file; undefined for in-memory sessions. */
-	private _quotaResumeStore(): AgentCronJobStore | undefined {
-		if (this._quotaResumeJobStore) {
-			return this._quotaResumeJobStore;
-		}
-		const artifactDir = this.sessionManager.getSessionArtifactDir();
-		if (!this.sessionFile || !artifactDir) {
-			return undefined;
-		}
-		const store = AgentCronJobStore.forSessionArtifacts();
-		store.registerSessionArtifact(this.sessionId, artifactDir);
-		this._quotaResumeJobStore = store;
-		return store;
-	}
-
-	/**
-	 * Settle a park's durable wake: report a job the daemon already ran as
-	 * delivered (its prompt drives the resume) and leave it alone — rewriting a
-	 * completed job to cancelled would hide that the wake landed — cancel one
-	 * that has not run, and report a user cancellation as such. Anything else is
-	 * gone, leaving the in-process timer as the wake.
-	 */
 	private _resolveQuotaResumeJob(jobId: string): "delivered" | "user-cancelled" | "cancelled" | "gone" {
-		const job = this._findQuotaResumeJob(jobId);
-		if (job?.status === "completed") {
-			return "delivered";
-		}
-		if (job?.status === "cancelled") {
-			return "user-cancelled";
-		}
-		const store = this._quotaResumeStore();
-		if (!store) {
-			return "gone";
-		}
-		try {
-			return store.cancel(jobId) === undefined ? "gone" : "cancelled";
-		} catch {
-			return "gone";
-		}
+		return resolveQuotaResumeJob(this, jobId);
 	}
 
-	/** Cancel a park's pending wake: the in-process timer and the durable job. */
-	private _cancelQuotaParkWake(
-		park: { resumeAtMs: number; jobId?: string; timer?: ReturnType<typeof setTimeout> } | undefined,
-	): void {
-		if (!park) return;
-		if (park.timer) {
-			clearTimeout(park.timer);
-			park.timer = undefined;
-		}
-		if (park.jobId !== undefined) {
-			this._resolveQuotaResumeJob(park.jobId);
-		}
-		park.jobId = undefined;
-	}
-
-	/**
-	 * Wake a parked session and deliver the resume marker: its first model call
-	 * probes the quota, resumes the interrupted task on success, and re-parks
-	 * with the newly reported reset on failure. The durable wake job and this
-	 * timer race for live sessions; whoever lands first owns the resume — the
-	 * job's prompt is the same marker text, so both paths read identically.
-	 */
-	private async _resumeFromQuotaPark(): Promise<void> {
-		const park = this._quotaPark;
-		if (!park || park.waking || park.resumeAtMs > Date.now()) {
-			return;
-		}
-		if (park.jobId !== undefined) {
-			const resolved = this._resolveQuotaResumeJob(park.jobId);
-			if (resolved === "delivered") {
-				// The daemon dispatched the durable wake; its prompt drives the resume.
-				park.waking = true;
-				return;
-			}
-			if (resolved === "user-cancelled") {
-				// The user cancelled the wake: honor it and drop the park.
-				this._quotaPark = undefined;
-				return;
-			}
-			// Cancelled by this timer or gone: the timer owns the resume.
-		}
-		park.waking = true;
-		try {
-			await this._queuePreparedPrompt("followUp", QUOTA_RESUME_MARKER_TEXT, undefined, {
-				source: "internal",
-				priority: "background",
-				resumeIfIdle: true,
-			});
-		} catch {
-			// A refused admission must not leave a park whose wake is gone: re-arm
-			// it (bounded) so the session still resumes, or drop the park.
-			park.waking = false;
-			this._recoverQuotaParkWake("wake-failed");
-		}
-	}
-
-	/**
-	 * An aborted turn is not evidence the quota is back. A wake whose resume
-	 * marker is still queued owns the resume, so an abort of some other turn must
-	 * not re-arm the wake under it; a wake this turn consumed re-arms instead.
-	 */
 	private _handleAbortedQuotaPark(): void {
-		const park = this._quotaPark;
-		if (!park || (park.waking === true && this._hasQueuedQuotaResumeMarker())) {
-			return;
-		}
-		park.waking = false;
-		this._recoverQuotaParkWake("wake-aborted");
+		handleAbortedQuotaPark(this);
 	}
 
-	/** Whether the park wake's resume marker is still waiting in the session input queue. */
-	private _hasQueuedQuotaResumeMarker(): boolean {
-		return this._actionStore.unfinishedActions().some((action) => {
-			if (action.payload.kind !== "turn" || action.lifecycle.state !== "queued") {
-				return false;
-			}
-			const { text } = normalizeMessageContent(primaryDeliveryRecord(action).message.content);
-			return text.includes(QUOTA_RESUME_MARKER_TEXT);
-		});
-	}
-
-	/**
-	 * A turn that ended in a plain error after the wake's probe consumed the
-	 * marker is neither a resume nor a re-park: the park would sit `waking` with
-	 * no timer or job left, never resuming. Re-arm the wake (bounded) instead,
-	 * or drop the park once the retries are spent. A marker still queued owns
-	 * the resume, so an error from another turn must not re-arm under it.
-	 */
 	private _handleErroredQuotaParkProbe(message: AssistantMessage): void {
-		const park = this._quotaPark;
-		if (message.stopReason !== "error" || park?.waking !== true || this._hasQueuedQuotaResumeMarker()) {
-			return;
-		}
-		park.waking = false;
-		this._recoverQuotaParkWake("wake-error");
+		handleErroredQuotaParkProbe(this, message);
 	}
 
-	/**
-	 * Wake re-arm for a park whose wake was consumed without resuming (refused
-	 * admission, aborted or errored probe turn). Bounded so a park that can
-	 * never wake ends instead of staying parked with no wake and no way to
-	 * resume.
-	 */
-	private _recoverQuotaParkWake(outcome: "wake-failed" | "wake-aborted" | "wake-error"): void {
-		const park = this._quotaPark;
-		if (!park || park.waking || park.resumeAtMs > Date.now()) {
-			return;
-		}
-		const retries = (park.wakeRetries ?? 0) + 1;
-		if (retries > QUOTA_WAKE_MAX_RETRIES) {
-			this._cancelQuotaParkWake(park);
-			this._quotaPark = undefined;
-			this.sessionManager.appendCustomEntry(QUOTA_RESUME_CUSTOM_ENTRY_TYPE, { outcome });
-			return;
-		}
-		park.wakeRetries = retries;
-		// The wake schedule moves to the retry delay; the provider-reported reset the
-		// park waits on does not. Carry it onto the entry as quotaResumeAt so the
-		// status read side still shows the real reset instead of the retry time.
-		const quotaResumeAtMs = park.quotaResumeAtMs ?? park.resumeAtMs;
-		park.quotaResumeAtMs = quotaResumeAtMs;
-		park.resumeAtMs = Date.now() + QUOTA_WAKE_RETRY_DELAY_MS;
-		park.jobId = this._createQuotaResumeJob(park.resumeAtMs);
-		park.timer = this._scheduleQuotaResumeTimer(park.resumeAtMs);
-		// Record the replacement wake, or a restart reads the spent park entry,
-		// drops the park, and leaves this retry job armed with no owner to cancel.
-		// The provider rides along so readQuotaParkStatus keeps it after the re-arm,
-		// and wakeRetries rides along so a restart cannot reset the retry budget.
-		this.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
-			resumeAt: new Date(park.resumeAtMs).toISOString(),
-			quotaResumeAt: new Date(quotaResumeAtMs).toISOString(),
-			parkCount: park.parkCount,
-			wakeRetries: retries,
-			...(park.jobId !== undefined ? { jobId: park.jobId } : {}),
-			...(park.provider !== undefined ? { provider: park.provider } : {}),
-		});
-	}
-
-	private _findQuotaResumeJob(jobId: string): AgentCronJob | undefined {
-		const store = this._quotaResumeStore();
-		if (!store) {
-			return undefined;
-		}
-		try {
-			return store.list().find((job) => job.id === jobId);
-		} catch {
-			return undefined;
-		}
-	}
-
-	/**
-	 * Durable wake for a restored park: reuse a job that can still fire and
-	 * recreate one that was cancelled (a navigation cancels the left-behind
-	 * leaf's wake) or removed, so a restored park never waits on a dead job.
-	 */
-	private _restoreQuotaWakeJob(jobId: string | undefined, resumeAtMs: number): string | undefined | "user-cancelled" {
-		if (jobId === undefined) {
-			return this._createQuotaResumeJob(resumeAtMs);
-		}
-		const job = this._findQuotaResumeJob(jobId);
-		if (job === undefined || job.status !== "cancelled") {
-			// Not cancelled: still scheduled, or already delivered by the daemon.
-			return jobId;
-		}
-		// A cancelled wake stays cancelled unless navigation cancelled it, which
-		// frees the wake so returning to the parked branch can rebuild it.
-		if (this._navigationCancelledWakeJobs.has(jobId)) {
-			return this._createQuotaResumeJob(resumeAtMs);
-		}
-		return "user-cancelled";
-	}
-
-	/**
-	 * Rebuild the park for the branch this navigation selected. The old leaf's
-	 * wake is cancelled with it, so a parked leaf that was left behind cannot
-	 * resume its task on the selected branch.
-	 */
 	private _reloadQuotaParkFromBranch(): void {
-		const previous = this._quotaPark;
-		this._quotaPark = undefined;
-		if (previous?.timer) {
-			clearTimeout(previous.timer);
-			previous.timer = undefined;
-		}
-		if (previous?.jobId !== undefined) {
-			// Only a wake this navigation actually cancels may be rebuilt on the way
-			// back; a wake the user cancelled in /cron stays cancelled.
-			if (this._resolveQuotaResumeJob(previous.jobId) === "cancelled") {
-				this._navigationCancelledWakeJobs.add(previous.jobId);
-			}
-		}
-		this._restoreQuotaPark();
+		reloadQuotaParkFromBranch(this);
 	}
 
-	/**
-	 * Restore the park this branch ended on: a restart (daemon or worker) leaves
-	 * waitForUsage.maxParks unbounded otherwise, because the park count would
-	 * start over at 1 each time. Parks recorded before the branch's last resume
-	 * entry are spent, and a park whose wake time has passed is left to the
-	 * durable wake job — only one that is still ahead re-arms the timer.
-	 */
 	private _restoreQuotaPark(): void {
-		const branch = this.sessionManager.getBranch();
-		for (let index = branch.length - 1; index >= 0; index -= 1) {
-			const entry = branch[index];
-			if (entry.type !== "custom") {
-				continue;
-			}
-			if (entry.customType === QUOTA_RESUME_CUSTOM_ENTRY_TYPE) {
-				return;
-			}
-			if (entry.customType !== QUOTA_PARK_CUSTOM_ENTRY_TYPE || !isPersistedQuotaParkData(entry.data)) {
-				continue;
-			}
-			const resumeAtMs = Date.parse(entry.data.resumeAt);
-			if (!Number.isFinite(resumeAtMs) || resumeAtMs <= Date.now()) {
-				// The wake time passed while the session was down. The durable wake
-				// job normally still covers it (the daemon claims due jobs on
-				// sight), so only a wake that is definitely gone - never persisted,
-				// or lost with the job store - leaves the parked task with no
-				// resume path at all. Record that loss instead of dropping it
-				// silently; a wake the user cancelled is their choice and stays
-				// quiet, exactly like the live user-cancelled path below.
-				const job = entry.data.jobId === undefined ? undefined : this._findQuotaResumeJob(entry.data.jobId);
-				if (entry.data.jobId === undefined || job === undefined) {
-					sessionLog.warn(
-						"quota park's wake time passed and its durable wake job is gone; the parked task will not resume",
-						{
-							sessionId: this.sessionId,
-							resumeAt: entry.data.resumeAt,
-							parkCount: entry.data.parkCount,
-							jobId: entry.data.jobId ?? null,
-						},
-					);
-					try {
-						this.sessionManager.appendCustomEntry(QUOTA_RESUME_CUSTOM_ENTRY_TYPE, {
-							outcome: "wake-lost",
-							resumeAt: entry.data.resumeAt,
-							parkCount: entry.data.parkCount,
-							...(entry.data.provider !== undefined ? { provider: entry.data.provider } : {}),
-						});
-					} catch (error) {
-						this._reportSessionPersistFailure(error);
-					}
-				}
-				return;
-			}
-			const quotaResumeAtMs =
-				entry.data.quotaResumeAt === undefined ? undefined : Date.parse(entry.data.quotaResumeAt);
-			const jobId = this._restoreQuotaWakeJob(entry.data.jobId, resumeAtMs);
-			if (jobId === "user-cancelled") {
-				return;
-			}
-			if (jobId !== undefined && jobId !== entry.data.jobId) {
-				// A rebuilt wake replaces the cancelled one: record it, so the next
-				// restore reuses this job instead of arming another one beside it.
-				// The provider rides along so readQuotaParkStatus keeps it after the rebuild.
-				this.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
-					resumeAt: entry.data.resumeAt,
-					parkCount: entry.data.parkCount,
-					jobId,
-					...(entry.data.quotaResumeAt !== undefined ? { quotaResumeAt: entry.data.quotaResumeAt } : {}),
-					...(entry.data.provider !== undefined ? { provider: entry.data.provider } : {}),
-					...(entry.data.wakeRetries !== undefined ? { wakeRetries: entry.data.wakeRetries } : {}),
-				});
-			}
-			this._quotaPark = {
-				parkCount: entry.data.parkCount,
-				resumeAtMs,
-				...(quotaResumeAtMs !== undefined && Number.isFinite(quotaResumeAtMs) ? { quotaResumeAtMs } : {}),
-				...(jobId !== undefined ? { jobId } : {}),
-				timer: this._scheduleQuotaResumeTimer(resumeAtMs),
-				...(entry.data.provider !== undefined ? { provider: entry.data.provider } : {}),
-				...(entry.data.wakeRetries !== undefined ? { wakeRetries: entry.data.wakeRetries } : {}),
-			};
-			return;
-		}
+		restoreQuotaPark(this);
 	}
 
-	/**
-	 * A parked session completed a model call successfully: the quota is back.
-	 * Clear the park (cancelling any pending wake), record the resumed
-	 * transition, and — unless this success WAS the wake probe — deliver the
-	 * resume marker so the interrupted task continues right away.
-	 */
 	private _completeQuotaParkResume(): void {
-		const park = this._quotaPark;
-		if (!park) return;
-		// A wake the daemon already delivered owns the resume even when the timer
-		// never observed it: the job's marker prompt is the continuation, so this
-		// success must not queue a second one.
-		const delivered = park.jobId !== undefined && this._resolveQuotaResumeJob(park.jobId) === "delivered";
-		this._cancelQuotaParkWake(park);
-		const wasWaking = park.waking === true || delivered;
-		const restoredModel = this._restorePrimaryModelAfterBackup();
-		this._quotaPark = undefined;
-		this.sessionManager.appendCustomEntry(QUOTA_RESUME_CUSTOM_ENTRY_TYPE, {
-			outcome: wasWaking ? "wake" : "early",
-			...(restoredModel ? { restoredModel } : {}),
-		});
-		if (!wasWaking) {
-			void this._queuePreparedPrompt("followUp", QUOTA_RESUME_MARKER_TEXT, undefined, {
-				source: "internal",
-				priority: "background",
-				resumeIfIdle: true,
-			}).catch(() => {
-				// The early-resume marker could not be queued; the park is cleared,
-				// so a later quota failure parks again with a fresh schedule.
-			});
-		}
+		completeQuotaParkResume(this);
 	}
 
 	/**
@@ -19866,7 +19252,7 @@ export class AgentSession {
 	 * switched models meanwhile. Returns the restored "provider/model-id"
 	 * reference for the retry-end event.
 	 */
-	private _restorePrimaryModelAfterBackup(): string | undefined {
+	_restorePrimaryModelAfterBackup(): string | undefined {
 		const backup = this._backupModel;
 		this._backupModel = undefined;
 		if (!backup || !modelsAreEqual(this.model, backup.backup)) return undefined;
@@ -19934,10 +19320,6 @@ export class AgentSession {
 					!action.payload.queueVisible &&
 					action.payload.acceptedBeforeCompletion,
 			);
-	}
-
-	get autoRetryEnabled(): boolean {
-		return this.settingsManager.getRetryEnabled();
 	}
 
 	setAutoRetryEnabled(enabled: boolean): void {
@@ -20891,10 +20273,6 @@ export class AgentSession {
 		context.sendMessage = (message, options) => this.sendCustomMessage(message, options);
 		context.sendUserMessage = (content, options) => this.sendUserMessage(content, options);
 		return context;
-	}
-
-	hasExtensionHandlers(eventType: string): boolean {
-		return this._extensionRunner.hasHandlers(eventType);
 	}
 
 	get extensionRunner(): ExtensionRunner {

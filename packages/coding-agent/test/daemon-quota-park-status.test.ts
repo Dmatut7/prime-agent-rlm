@@ -161,10 +161,10 @@ describe("quotaParkWireFacts", () => {
 });
 
 describe("quota_park_status wire registration", () => {
-	it("pins the entry type literals against the agent-session source they mirror", () => {
-		// The constants are module-private in agent-session.ts; a rename there must
+	it("pins the entry type literals against the quota-park source they mirror", () => {
+		// The constants are module-private in core/quota-park.ts; a rename there must
 		// fail here instead of silently blind the daemon reader.
-		const source = readFileSync(resolve(__dirname, "../src/core/agent-session.ts"), "utf8");
+		const source = readFileSync(resolve(__dirname, "../src/core/quota-park.ts"), "utf8");
 		expect(source).toContain('QUOTA_PARK_CUSTOM_ENTRY_TYPE = "provider_quota_park"');
 		expect(source).toContain('QUOTA_RESUME_CUSTOM_ENTRY_TYPE = "provider_quota_resume"');
 	});

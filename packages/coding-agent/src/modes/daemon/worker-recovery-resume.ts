@@ -10,7 +10,7 @@ import type { CustomMessageEntry, SessionEntry } from "../../core/session-manage
  * marker: the session reopened clean and the interrupted turn was simply never
  * resumed. On bind, a marker that is still the transcript tail (no message
  * answered it since) queues one resume prompt - the durable resume marker
- * pattern the quota park established (agent-session.ts QUOTA_RESUME_MARKER_TEXT).
+ * pattern the quota park established (core/quota-park.ts QUOTA_RESUME_MARKER_TEXT).
  * The queued prompt lands as a user message, which consumes the marker, so the
  * resume fires once per worker death. A continuation whose prompt landed as a
  * custom message (self-recovery continues, the failure-recovery turns) consumes

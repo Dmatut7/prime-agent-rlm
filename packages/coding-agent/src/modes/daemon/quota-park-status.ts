@@ -7,13 +7,13 @@ import type { DaemonSessionSnapshotQuotaPark } from "./daemon-protocol.js";
  * park out of the live session and broadcasts quota_park_status heartbeats so a
  * client can render a countdown. The park facts live in the persisted
  * provider_quota_park branch entry: every park, re-park and wake re-arm appends
- * one (agent-session.ts _parkForQuotaReset / _recoverQuotaParkWake /
- * _restoreQuotaPark), so the newest entry ahead of any provider_quota_resume is
- * the active park - the same walk _restoreQuotaPark does after a restart.
+ * one (core/quota-park.ts parkForQuotaReset / recoverQuotaParkWake /
+ * restoreQuotaPark), so the newest entry ahead of any provider_quota_resume is
+ * the active park - the same walk restoreQuotaPark does after a restart.
  */
 
 // Mirrors QUOTA_PARK_CUSTOM_ENTRY_TYPE / QUOTA_RESUME_CUSTOM_ENTRY_TYPE in
-// core/agent-session.ts, which are module-private there. The source pin in
+// core/quota-park.ts, which are module-private there. The source pin in
 // test/daemon-quota-park-status.test.ts fails if either side is renamed.
 const QUOTA_PARK_CUSTOM_ENTRY_TYPE = "provider_quota_park";
 const QUOTA_RESUME_CUSTOM_ENTRY_TYPE = "provider_quota_resume";

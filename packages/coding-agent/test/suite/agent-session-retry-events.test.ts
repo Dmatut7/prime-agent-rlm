@@ -22,6 +22,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentCronJobStore } from "../../src/core/cron-jobs.js";
 import { EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE } from "../../src/core/messages.js";
+import { resumeFromQuotaPark } from "../../src/core/quota-park.js";
 import { PROVIDER_FAILURE_RECOVERY_CUSTOM_TYPE } from "../../src/core/self-recovery.js";
 import type { Settings } from "../../src/core/settings-manager.js";
 import { readQuotaParkStatus } from "../../src/modes/daemon/quota-park-status.js";
@@ -1203,7 +1204,6 @@ describe("AgentSession retry and event characterization", () => {
 
 	type QuotaParkInternals = {
 		_quotaPark: { parkCount: number; resumeAtMs: number; jobId?: string; waking?: boolean } | undefined;
-		_resumeFromQuotaPark: () => Promise<void>;
 		_agentEventQueue: Promise<void>;
 	};
 
@@ -1265,7 +1265,7 @@ describe("AgentSession retry and event characterization", () => {
 		const internals = harness.session as unknown as QuotaParkInternals;
 		if (!internals._quotaPark) throw new Error("the session is not parked");
 		internals._quotaPark.resumeAtMs = Date.now() - 1;
-		await internals._resumeFromQuotaPark();
+		await resumeFromQuotaPark(harness.session);
 	};
 	const wakeQuotaProbe = (harness: Harness): (() => Promise<AssistantMessage>) => {
 		const turn = assistantTurns(harness);
