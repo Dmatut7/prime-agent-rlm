@@ -1,0 +1,1 @@
+- Fixed the stop-all-subagents confirm key (`alt+x` by default) intermittently ignoring the confirming second press in an attached window: the confirmation re-read the event-fed roster, which can momentarily read empty mid-resync, and disarmed instead of stopping; the first press now snapshots the children it named and the second press stops exactly those.

@@ -1666,8 +1666,13 @@ export class InteractiveMode {
 	 * Optional because partial-mode harnesses construct the mode without it.
 	 */
 	private recentlyRemovedSubagents: Array<{ name: string; baseName: string; at: number }> | undefined;
-	/** Armed by the first stop-all press; a second press within the window stops them. */
-	private stopAllSubagentsArmedUntil: number | undefined;
+	/**
+	 * Armed by the first stop-all press; a second press within the window stops them.
+	 * The armed press snapshots the child ids: an attached client's roster is event-fed
+	 * and can read empty mid-resync, so the confirming press must not re-derive the
+	 * target set from it.
+	 */
+	private stopAllSubagentsArmed: { childIds: string[]; until: number } | undefined;
 	/** How this session's latest assistant message ended; tells a failed close from a finished one. */
 	private lastAssistantStopReason: AssistantMessage["stopReason"] | undefined;
 	/**
@@ -8048,43 +8053,66 @@ export class InteractiveMode {
 	 * wants keeps working.
 	 */
 	private async requestStopAllSubagents(): Promise<void> {
+		const now = Date.now();
+		const armed = this.stopAllSubagentsArmed;
+		if (armed !== undefined && now <= armed.until) {
+			// Confirming press: stop exactly the children the first press named. The
+			// roster is not re-read here - on an attached client it is event-fed and
+			// can read empty mid-resync, which used to drop the confirmation into the
+			// "没有在跑" branch and silently disarm.
+			this.stopAllSubagentsArmed = undefined;
+			// The summary line below is their explanation; the cancelled events that follow
+			// must not each add a "已被停止" of their own. A stop that did not actually
+			// cancel anything (request rejected, or the run had already settled and the
+			// daemon answered false) un-records its id so a later genuine stop still
+			// explains itself.
+			this.locallyCancelledSubagentIds ??= new Set();
+			const locallyCancelled = this.locallyCancelledSubagentIds;
+			for (const childId of armed.childIds) locallyCancelled.add(childId);
+			const results = await Promise.allSettled(
+				armed.childIds.map((childId) => this.agentConnection.cancelRlmChild(childId)),
+			);
+			let stopped = 0;
+			results.forEach((result, index) => {
+				if (result.status === "fulfilled" && result.value === true) {
+					stopped += 1;
+				} else {
+					locallyCancelled.delete(armed.childIds[index]!);
+				}
+			});
+			const failures = results.filter((result) => result.status === "rejected");
+			if (failures.length > 0) {
+				const first = failures[0];
+				const reason =
+					first?.status === "rejected" && first.reason instanceof Error ? first.reason.message : "未知错误";
+				this.showStatus(`有 ${failures.length} 个子代理没停下：${reason}`, "warning");
+				return;
+			}
+			if (stopped === armed.childIds.length) {
+				this.showStatus(`已停止全部 ${stopped} 个在跑的子代理`);
+			} else if (stopped === 0) {
+				this.showStatus("要停的子代理已经自己结束了");
+			} else {
+				this.showStatus(`已停止 ${stopped} 个子代理（其余 ${armed.childIds.length - stopped} 个已经自己结束）`);
+			}
+			return;
+		}
 		const working = collectSubtreeSubagentSnapshots(this.subagentSnapshots.values(), this.rlmNodeId).filter(
 			(child) => classifySubagentSnapshotStatus(child) === "running",
 		);
 		if (working.length === 0) {
-			this.stopAllSubagentsArmedUntil = undefined;
+			this.stopAllSubagentsArmed = undefined;
 			this.showStatus("现在没有在跑的子代理");
 			return;
 		}
-		const now = Date.now();
-		if (this.stopAllSubagentsArmedUntil === undefined || now > this.stopAllSubagentsArmedUntil) {
-			this.stopAllSubagentsArmedUntil = now + STOP_ALL_SUBAGENTS_CONFIRM_WINDOW_MS;
-			this.showStatus(
-				`再按一次 ${keyText("app.subagents.stopAll")} 停止全部 ${working.length} 个在跑的子代理（做到一半的会停下，记录保留）`,
-				"warning",
-			);
-			return;
-		}
-		this.stopAllSubagentsArmedUntil = undefined;
-		// The summary line below is their explanation; the cancelled events that follow
-		// must not each add a "已被停止" of their own. A failed stop un-records its id
-		// so a later genuine stop still explains itself.
-		this.locallyCancelledSubagentIds ??= new Set();
-		const locallyCancelled = this.locallyCancelledSubagentIds;
-		for (const child of working) locallyCancelled.add(child.id);
-		const results = await Promise.allSettled(working.map((child) => this.agentConnection.cancelRlmChild(child.id)));
-		results.forEach((result, index) => {
-			if (result.status === "rejected") locallyCancelled.delete(working[index]!.id);
-		});
-		const failures = results.filter((result) => result.status === "rejected");
-		if (failures.length > 0) {
-			const first = failures[0];
-			const reason =
-				first?.status === "rejected" && first.reason instanceof Error ? first.reason.message : "未知错误";
-			this.showStatus(`有 ${failures.length} 个子代理没停下：${reason}`, "warning");
-			return;
-		}
-		this.showStatus(`已停止全部 ${working.length} 个在跑的子代理`);
+		this.stopAllSubagentsArmed = {
+			childIds: working.map((child) => child.id),
+			until: now + STOP_ALL_SUBAGENTS_CONFIRM_WINDOW_MS,
+		};
+		this.showStatus(
+			`再按一次 ${keyText("app.subagents.stopAll")} 停止全部 ${working.length} 个在跑的子代理（做到一半的会停下，记录保留）`,
+			"warning",
+		);
 	}
 
 	/**

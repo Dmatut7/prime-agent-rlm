@@ -636,6 +636,117 @@ describe("SubagentSummaryLine", () => {
 		expect(showStatus.mock.calls[1]?.[0]).toBe("已停止全部 2 个在跑的子代理");
 	});
 
+	// Regression for the attach-window double-press that intermittently did not land:
+	// the confirming press re-read the roster, and an attached client's event-fed
+	// roster can read empty mid-resync, which dropped the confirmation into the
+	// "没有在跑" branch and disarmed instead of stopping.
+	it("confirms against the armed children when the roster reads empty mid-window", async () => {
+		const cancelRlmChild = vi.fn(async (_childId: string) => true);
+		const showStatus = vi.fn();
+		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+		Object.assign(mode, {
+			subagentSnapshots: new Map([["a", child("a", "running", { activeSessionId: "active-a" })]]),
+			rlmNodeId: undefined,
+			agentConnection: { cancelRlmChild },
+			showStatus,
+		});
+		const request = Reflect.get(InteractiveMode.prototype, "requestStopAllSubagents") as (
+			this: typeof mode,
+		) => Promise<void>;
+
+		await request.call(mode);
+		expect(showStatus.mock.calls[0]?.[0]).toContain("再按一次");
+		expect(cancelRlmChild).not.toHaveBeenCalled();
+
+		// The attach-side resync gap: the roster momentarily holds nothing.
+		Object.assign(mode, { subagentSnapshots: new Map() });
+		await request.call(mode);
+		expect(cancelRlmChild).toHaveBeenCalledWith("a");
+		expect(showStatus.mock.calls[1]?.[0]).toBe("已停止全部 1 个在跑的子代理");
+	});
+
+	it("still answers 没有在跑 on a first press with an empty roster", async () => {
+		const cancelRlmChild = vi.fn(async (_childId: string) => true);
+		const showStatus = vi.fn();
+		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+		Object.assign(mode, {
+			subagentSnapshots: new Map(),
+			rlmNodeId: undefined,
+			agentConnection: { cancelRlmChild },
+			showStatus,
+		});
+		const request = Reflect.get(InteractiveMode.prototype, "requestStopAllSubagents") as (
+			this: typeof mode,
+		) => Promise<void>;
+
+		await request.call(mode);
+		expect(showStatus).toHaveBeenCalledWith("现在没有在跑的子代理");
+		expect(cancelRlmChild).not.toHaveBeenCalled();
+	});
+
+	it("reports children that settled on their own between the presses, without claiming a stop", async () => {
+		// cancelRlmChild answers false for a run that already settled (agent-session
+		// contract), the way a child that finished inside the confirm window answers.
+		const cancelRlmChild = vi.fn(async (_childId: string) => false);
+		const showStatus = vi.fn();
+		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+		Object.assign(mode, {
+			subagentSnapshots: new Map([["a", child("a", "running", { activeSessionId: "active-a" })]]),
+			rlmNodeId: undefined,
+			agentConnection: { cancelRlmChild },
+			showStatus,
+		});
+		const request = Reflect.get(InteractiveMode.prototype, "requestStopAllSubagents") as (
+			this: typeof mode,
+		) => Promise<void>;
+
+		await request.call(mode);
+		await request.call(mode);
+		expect(showStatus.mock.calls[1]?.[0]).toBe("要停的子代理已经自己结束了");
+
+		// The un-cancelled id must not stay recorded as locally stopped: a later
+		// genuine stop of the same child goes through the full flow again.
+		Object.assign(mode, {
+			subagentSnapshots: new Map([["a", child("a", "running", { activeSessionId: "active-a" })]]),
+		});
+		cancelRlmChild.mockResolvedValue(true);
+		await request.call(mode);
+		await request.call(mode);
+		expect(showStatus.mock.calls[3]?.[0]).toBe("已停止全部 1 个在跑的子代理");
+		expect(cancelRlmChild).toHaveBeenCalledTimes(2);
+	});
+
+	it("re-arms instead of stopping when the confirm window has expired", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(new Date("2026-10-03T00:00:00Z"));
+			const cancelRlmChild = vi.fn(async (_childId: string) => true);
+			const showStatus = vi.fn();
+			const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+			Object.assign(mode, {
+				subagentSnapshots: new Map([["a", child("a", "running", { activeSessionId: "active-a" })]]),
+				rlmNodeId: undefined,
+				agentConnection: { cancelRlmChild },
+				showStatus,
+			});
+			const request = Reflect.get(InteractiveMode.prototype, "requestStopAllSubagents") as (
+				this: typeof mode,
+			) => Promise<void>;
+
+			await request.call(mode);
+			vi.setSystemTime(new Date("2026-10-03T00:00:06Z"));
+			await request.call(mode);
+			expect(cancelRlmChild).not.toHaveBeenCalled();
+			expect(showStatus.mock.calls[1]?.[0]).toContain("再按一次");
+
+			await request.call(mode);
+			expect(cancelRlmChild).toHaveBeenCalledWith("a");
+			expect(showStatus.mock.calls[2]?.[0]).toBe("已停止全部 1 个在跑的子代理");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("sends the viewer of a closed subagent back to its parent with a Chinese notice", () => {
 		const returnToAgentsView = vi.fn(async () => undefined);
 		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
