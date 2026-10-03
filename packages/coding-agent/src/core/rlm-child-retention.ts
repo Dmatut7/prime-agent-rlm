@@ -3,10 +3,11 @@
  * finished child session for the parent lifetime, releasing one to the daemon's idle
  * passivation (publishing the closed record and roster row it leaves behind), removing
  * a child's tracking outright, the retired-run delivery records that late terminal
- * notices are re-validated against, and the live recursive snapshot list built
- * over the retained sessions and active runs. The moved methods keep exactly the
- * same bodies; they read the session through {@link RlmChildRetentionHost}, which
- * `AgentSession` satisfies structurally, so the move changes no runtime behavior.
+ * notices are re-validated against, and the live family-state reads built over the
+ * retained sessions and active runs (the recursive snapshot list, the direct-child
+ * session snapshot, and the running-or-queued judgement). The moved methods keep
+ * exactly the same bodies; they read the session through {@link RlmChildRetentionHost},
+ * which `AgentSession` satisfies structurally, so the move changes no runtime behavior.
  */
 import type { AgentSession, AgentSessionEvent, RlmChildAgentSnapshot } from "./agent-session.js";
 import {
@@ -47,8 +48,8 @@ interface ClosedRlmChildRelease {
  * The seam of `AgentSession` the extracted retention paths read and mutate. Member
  * names mirror the class's own members so the extraction stays a textual
  * `this.` -> `host.` rename; `AgentSession.registerRlmChildSession`,
- * `releaseRlmChildSession`, `_removeRlmSubagentTracking` and
- * `getRlmChildSnapshots` delegate with `this`.
+ * `releaseRlmChildSession`, `_removeRlmSubagentTracking`, `getRlmChildSnapshots`,
+ * `hasRunningRlmChildren` and `_rlmChildSessionSnapshot` delegate with `this`.
  */
 export interface RlmChildRetentionHost extends RlmChildCollectHost {
 	readonly _retiredRlmChildRuns: Map<string, RetiredRlmChildRun>;
@@ -67,6 +68,7 @@ export interface RlmChildRetentionHost extends RlmChildCollectHost {
 	readonly _disposed: boolean;
 	readonly _disposing: boolean;
 	readonly _subagentRuntimeHost?: SubagentRuntimeHost;
+	_rlmSubtreeSessions(): Generator<AgentSession>;
 	_rlmHistoricalChildNamesNow(): Set<string>;
 	_stopRlmChildFollowUpWatch(childId: string): void;
 	_watchRlmChildFollowUps(childId: string, child: AgentSession): void;
@@ -277,4 +279,32 @@ export function getRlmChildSnapshots(host: RlmChildRetentionHost): RlmChildAgent
 		snapshots.push(...child.getRlmChildSnapshots());
 	}
 	return snapshots;
+}
+
+/** True when any direct or nested subagent is still running or queued. */
+export function hasRunningRlmChildren(host: RlmChildRetentionHost): boolean {
+	for (const session of host._rlmSubtreeSessions()) {
+		for (const run of session._activeRlmChildRuns.values()) {
+			if (run.status === "running" || run.status === "queued") {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+/**
+ * The direct-child sessions quiescence waits on: retained sessions plus live runs'
+ * sessions, minus the children abandoned for quiescence (a run whose terminal wait
+ * the parent gave up on must not hold the barrier).
+ */
+export function rlmChildSessionSnapshot(host: RlmChildRetentionHost): AgentSession[] {
+	const sessions = new Set<AgentSession>();
+	for (const [childId, { session }] of host._rlmChildSessions) {
+		if (!host._abandonedRlmQuiescenceChildIds.has(childId)) sessions.add(session);
+	}
+	for (const run of host._activeRlmChildRuns.values()) {
+		if (run.session && !run.abandonedForQuiescence) sessions.add(run.session);
+	}
+	return [...sessions];
 }
