@@ -1,1 +1,0 @@
-- Changed the TUI attach to declare `slim_attach_transcript` (daemon protocol rev 44): attaching to a long session now transfers only the last 100 messages instead of the full transcript, with a marker line at the top of the chat saying how many earlier messages were held back; clicking it (or scrolling up over it in fullscreen) pages the previous 100 in.

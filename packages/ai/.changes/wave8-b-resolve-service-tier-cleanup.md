@@ -1,1 +1,0 @@
-- Removed the dead `resolveServiceTier` hook from `OpenAIResponsesStreamOptions` (no caller remained); service-tier pricing keeps using the response-reported tier with the requested tier as fallback.

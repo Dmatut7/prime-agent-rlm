@@ -1,2 +1,0 @@
-- Fixed an explicit scroll to the top or bottom (Ctrl+Shift+↓, or the submit path's scrollToBottom) being overridden by a click that had just opened rows below itself in the same frame.
-- Fixed the "↓ N 行新内容" indicator counting rows pushed below the window by dock growth (e.g. a wrapping draft) as new while reviewing.

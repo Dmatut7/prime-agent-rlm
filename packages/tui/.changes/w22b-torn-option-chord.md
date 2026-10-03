@@ -1,1 +1,0 @@
-- Fixed legacy Option/Alt chords torn apart when the terminal delivers the ESC prefix and the key byte more than one completion window apart: the bare ESC now waits one extra window so the chord reassembles instead of firing Escape and leaking the letter as text.

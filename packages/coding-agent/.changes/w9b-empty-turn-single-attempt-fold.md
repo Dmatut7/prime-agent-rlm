@@ -1,1 +1,0 @@
-- Fixed `retry.emptyTurn.maxAttempts: 1` leaving the escalated slow tier armed: the resolved settings now collapse to a single attempt with `escalatedAttempts: 0`, matching the documented "1 disables retrying" contract.

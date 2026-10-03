@@ -1,5 +1,0 @@
-- Added the quota-park countdown to the TUI: while a session waits out a provider usage reset, the status bar shows 额度等待 with the time until the automatic resume (consuming the daemon's `quota_park_status` heartbeat; the legacy footer face shows the same as an activity chip), plus a one-line notice when the park begins.
-- Fixed transcript replay silently dropping the kernel-variable prune notice (`ipython_state_pruned`) — the message reporting that the post-compaction snapshot deleted live kernel variables now renders on replay, as it does live.
-- Fixed agent-message receipts for follow-up sends omitting the delivery mode: the receipt now records the effective mode (`"follow_up"` or `"steer"`) directly instead of stamping steer and deleting it.
-- Fixed stale autonomous defaults in `--help`, README, and the usage guide: they now read 20 continuations, 50 turns, 400000 tokens, and 7200000 ms, matching `DEFAULT_AUTONOMOUS_LIMITS`.
-- Fixed the `-v`/`-V` swap leftovers: `-V` is version and `-v` is verbose in the worker flag sets, the top-level help, README, and the usage guide.

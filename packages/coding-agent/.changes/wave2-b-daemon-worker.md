@@ -1,3 +1,0 @@
-- Fixed `send --from <agent> --follow-up` losing its follow-up delivery when the target session lives in another worker: the supervisor's worker forward dropped `deliveryMode`, so the message steered instead of queueing behind the running turn.
-- Fixed a session never resuming after its worker died mid-turn: when a re-opened session's transcript still tails the supervisor's worker-interruption marker, the daemon now queues one automatic resume prompt so the interrupted task continues.
-- Added daemon `quota_park_status` events (schema revision 42, capability `quota_park_status`): a session parked on a provider usage reset announces the park and heartbeats the remaining wait, so clients can render the countdown instead of sitting silent for up to 24h.

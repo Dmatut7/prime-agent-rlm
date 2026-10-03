@@ -1,3 +1,0 @@
-- Converged process liveness onto the shared `utils/child-process` probes: the five local `kill(pid, 0)` copies (which disagreed on zombie and error semantics) are gone, and the hot fence-poll and kernel-venv reference paths use the fork-free `processIdExists` so they never shell out to `ps` per check.
-- Converged the eleven local `delay` helpers onto the shared `sleep`, which now supports `unref` and `resolveOnAbort` options.
-- Removed dead code: the never-wired MCP connection-outcome message family, `computeEditDiff`, `uploadAgentTraceSession`, `kernelSnapshotReferencePath` (with its unreachable retention branch), `isLightTheme`, `resolveHeaders`, and other unreferenced exports.

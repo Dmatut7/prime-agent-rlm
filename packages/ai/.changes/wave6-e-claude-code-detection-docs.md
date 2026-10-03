@@ -1,1 +1,0 @@
-- Documented `PI_DISABLE_CLAUDE_CODE_DETECTION=1` in the Claude Code provider section of the README, keeping an installed `claude` CLI from counting as a credential for deterministic tests and headless automation.

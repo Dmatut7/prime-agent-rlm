@@ -1,2 +1,0 @@
-- Fixed attach or session-switch into a quota-parked session sitting blind for up to 60s: the attach snapshot now carries the park status for clients that declare the `quota_park_status` capability (daemon schema revision 43), and the daemon re-announces the park as soon as the attach lands, so a connecting client renders the wait immediately.
-- Fixed the quota-park countdown targeting the next probe wake instead of the provider's real quota reset when the park entry knows the latter.

@@ -1,1 +1,0 @@
-- Added a "工作区" marker on turn-strip file rows whose change came from another window or process (an ambient workspace edit), matching the change strip's own split, so a row no longer reads as something this session did.

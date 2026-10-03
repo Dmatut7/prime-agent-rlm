@@ -1,3 +1,0 @@
-- Fixed the footer's tool-error badge measuring its width by character count (CJK text counted half), which let the status line overflow the terminal width; the line now always fits.
-- Fixed single-line messages (a quiet one-line question) writing their OSC 133 zone markers in reverse order (B,C,A); they now emit A,B,C so terminals mark the output zone correctly.
-- Added a 4KB length guard to inline Markdown styling: a very long single line renders as plain text instead of parsing quadratically and stalling the frame.

@@ -1,1 +1,0 @@
-- Added `PI_DISABLE_CLAUDE_CODE_DETECTION` to opt out of treating an installed Claude Code CLI as a credential, keeping model availability deterministic on machines with `claude` on PATH.

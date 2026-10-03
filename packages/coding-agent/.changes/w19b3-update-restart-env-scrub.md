@@ -1,1 +1,0 @@
-- Fixed the `update` restart coordinator inheriting the worker-relaunch marker from a relaunched supervisor's subtree, which could make the restarted daemon read as a worker-driven relaunch (refused by a tombstoned socket, never lifting the tombstone).

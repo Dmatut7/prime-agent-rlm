@@ -1,1 +1,0 @@
-- Converged the last inline `kill(pid, 0)` probe in daemon-launch onto the shared fork-free `processIdExists`, and wrapped the remaining bare startup/`console.log` print paths (cross-project resume hints, export identity notice, model scope) in width-aware wrapping.

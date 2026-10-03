@@ -1,2 +1,0 @@
-- Added `/goal --persistent <objective>`: a persistent goal never auto-terminates — `goal.complete()` is rejected with a keep-working instruction and the continuation budget does not apply, so the agent stops only on `/goal clear` (or the token budget). For unattended long-running work.
-- Fixed starting prime-agent right after a shutdown crashing with a full `DaemonShutdownAdmissionError` stack: startup now waits out the shutdown admission (bounded), and the CLI retries once and otherwise exits with one clean line.

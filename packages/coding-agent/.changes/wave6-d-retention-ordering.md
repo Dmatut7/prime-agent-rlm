@@ -1,3 +1,0 @@
-- Changed the retention sweep class order so the age/evidence classes (including child transcripts) run before the destructive `artifact-total-cap` byte-pressure backstop, letting cheap reclaims spend the shared per-sweep budget first.
-- Changed the bash-temp age pass to reclaim oldest-first by mtime instead of filename dictionary order, so a capped per-sweep budget collects the coldest `pi-bash-*.log` files first.
-- Fixed the `artifact-total-cap` class spending per-sweep entry budget on zero-byte directories that free nothing against the byte ceiling; those stay with the empty-dirs class.

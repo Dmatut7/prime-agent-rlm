@@ -1,2 +1,0 @@
-- Added a user-visible transcript notice when the finish gate releases an unverified completion claim: after two unanswered evidence nudges the run now ends with a "已放行（未验证）" line naming the claim and its strike count (previously the release only reached the duty log).
-- Fixed owner-only notices leaking into model context on session resume: `finish_gate_released` and `ipython_state_pruned` custom messages are now excluded from `convertToLlm`.

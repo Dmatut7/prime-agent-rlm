@@ -1,1 +1,0 @@
-- Removed three dead public AgentSession APIs (`autoRetryEnabled` getter, `hasExtensionHandlers`, `refreshModelMetadata`): zero references repo-wide (packages, scripts, profiles), upstream-inherited, call sites long gone.

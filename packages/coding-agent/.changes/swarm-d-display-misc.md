@@ -1,3 +1,0 @@
-- Fixed `/context` garbling on terminals narrower than 62 columns: below that width it renders one truncated line per agent instead of the aligned table, and the price-source list now aligns model names by visible width so wide characters no longer shift the source column.
-- Changed the short flags to match CLI convention: `-v` now selects `--verbose` and `-V` selects `--version` (previously `-v` printed the version and `--verbose` had no short flag).
-- Documented three keybinding traps in `docs/keybindings.md`: Escape both interrupts a running turn and clears the input, `ctrl+y` opens stall diagnostics while the stall action bar is showing, and `ctrl+s` is terminal flow control (XOFF) where IXON is not disabled.

@@ -1,1 +1,0 @@
-- Fixed a session reopened from the session list after its empty worker was evicted running in the daemon's default directory instead of the session's own stored directory.

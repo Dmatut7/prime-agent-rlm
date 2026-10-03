@@ -1,1 +1,0 @@
-- Changed inline-mode rendering of an overwide line from stopping the TUI and throwing (taking the host process down) to clamping the line to the terminal width, matching the fullscreen renderer; the debug crash log is still written.

@@ -9,6 +9,8 @@
 
 
 
+## 2026-10-04 wave-38：模型持久化一致性落地、Z.AI FlashX 入表、CI 测试硬化
+
 - 模型选择持久化四件套（同族事故四家证据链落地）：①`--model` 解析期预检——未知模型/未知 provider 立即报错点名，provider 无凭证与「不存在」分开说，不再静默回退默认到 API 才炸；②/模型被服务端拒绝后选择回滚到上一个真实服役模型（盘上+设置同步），重启不再残留自称被拒模型；③瞬态/目录不可读永远不改写已存选择（unknown ≠ 否定，Gemini 三态修法）；④持久化的默认失效时显式回落+消息说清原因（headless 也打 stderr），refusal（模型作答但拒绝）不误当拒绝、选择保留。
 - 预检发现即修的真缺陷：扩展注册的模型（如测试 provider）会被预检误杀——预检在扩展在场时让位给 worker 自身的运行时校验（4685 真进程套件先红后绿钉住）。
 - Z.AI：GLM-5.3-FlashX 入表（$0.37/$1.25、1M 窗、按量端点）；5-Turbo 保留观察（定价页缺席但无公告，三态原则不删）；自动路由评估=表不动（路由后窗口只放大）。
@@ -17,6 +19,8 @@
 - 门禁：check EXIT 0、hygiene OK、单测 9564 全绿、ai 包全绿、suite 复扫以账本为准。需要重新编译并重启后才生效。
 
 
+
+## 2026-10-04 wave-37：CI 八波连红根治、「--」逃生口真修、暖池遥测分析器
 
 - **CI 连红根治**（wave-26/28 起 8+ 波红，本机 macOS 全绿所以一直没看见——老板点破）：两个独立竞态。①rename 双计：cell 结束的 git 比对与 rename 包装的记录按不同键去重，Linux 上 fork/exec 跑赢 cell 线程时旧路径被重复计成删除——比对现在跳过已被 cell 记录为 rename 来源的删除，并加了强制 Linux 时序的回归测试（无修复必红）。②spawn 归属测试的时序假设（await 与回收线程无序），测试改在子进程可证存活时断言。机理与信心：/tmp/wave37/ci-red.md。
 - 「--」逃生口真修：wave-36 的 typo 闸文案承诺「pass a prompt after "--"」但 parseArgs 吞掉标记——实测 `prime-agent -- sessions` 仍被拒（走查实锤）。已在闸前直查原始参数修复+测试钉住。
@@ -27,6 +31,8 @@
 
 
 
+## 2026-10-04 wave-36 五路：第七刀 quota-park、走查四小项、死代码清除
+
 - AgentSession 第七刀：quota-park 生命周期状态机（park→resume→wake→restore，约 550 行/18 方法）搬进 core/quota-park.ts——agent-session.ts 20932→20313 行（七刀累计 23500→20313，−3187），守恒经脚本化逐字节比对（17644 字符 18/18 全等）。顺带销壳评审登记：错位注释归位 stallExempted、反向扫描一行委托去重。
 - 死代码清除（放权行使）：3 个零引用公有 API 删除（autoRetryEnabled getter、hasExtensionHandlers、refreshModelMetadata——全仓含 scripts 零引用，上游带入的遗留）。
 - 走查四小项：①未注册单词子命令（如 `sessions`）不再被当 prompt 发模型留垃圾会话——编辑距离命中注册命令时报错+did-you-mean，`--` 可逃生；②暖池遥测 spawn/claim 统一 `outcome` 字段；③kernel snapshot 的全预期跳过不再 warn 刷屏；④agents-view 子代理/定时任务/程序提示中文化。
@@ -35,6 +41,8 @@
 - 门禁：check EXIT 0、hygiene OK、单测 9552 绿（1 例负载抖动隔离即绿）、suite 1674/1674。需要重新编译并重启后才生效。
 
 
+
+## 2026-10-04 wave-35 七路：per-model 窗口真错配修复、过度自验二期、空会话 cwd 修复、壳评审
 
 - per-model autocompact 主体：预判的错配（窗口不随模型走）实测不存在（所有触发点本就现读当前模型）；真错配是注册表热重载（live catalog）后运行中会话仍持有选择时刻捕获的 model 对象——网关重报小窗永远到不了触发器。修复：7 处窗口读取点改为按 (provider,id) 现查注册表、回退捕获值。5 例新测试（含网关降窗复现、bailian 实测钳制）。
 - 过度自验二期：proof 段加 early-stop 收敛判据（首次验证照旧，收敛即停）。EX-4 最优 rep 224k tok/12t（对 wave-34 的 261k 再 −14%；post-DONE 46k→25k；对 wave-33 原始基线 post-DONE −91%），判分全过；EX-1..7 全题复核无回退。
@@ -50,6 +58,8 @@
 
 
 
+## 2026-10-03 wave-34 六路：过度自验治理、暖池遥测、模型表核准、/model 销账
+
 - 过度自验根治（考题基线头号失败模式）：根因在编排层 self-recovery finish gate——模型合规引用证据的措辞（"Verification passed" 等）打不中关键词表，nudge 文案又是重跑优先。改为：证据关键词表扩宽 + nudge 改「引用已有输出优先，已过的检查不重跑」+ 判定词契约（引用必须带明文判定词）。EX-4 实测 A/B：答案完成后的开销 −71~84%，总 token 708k→261k（最优 rep），判分 4/4 仍全过。首次验证不受影响。
 - 暖池运行时遥测落地：spawn 耗时{状态}/claim 结果{hit|miss|expired}+spare 年龄/池深度/回收按六类原因分桶，结构化日志进 agent.jsonl（Codex/Lambda/HikariCP 命名惯例），零 wire 变更；顺修 sweep 与 childClosed 双重处置同一 spare 的竞态。
 - Z.AI 模型集复核：GLM-5.3 满血与 5-Turbo 在 wave-31 刷新时已就位，表无需改；重新生成只吸收 8 行 OpenRouter 上游漂移。/model「两次 Enter」复核销账：那是带参命令补全浮层的两段式（第一次采纳补全、第二次提交），有意设计且有测试钉住。
@@ -58,6 +68,8 @@
 - 门禁：check EXIT 0、hygiene OK、单测 9542 绿（2 例负载抖动隔离即绿）、suite 1669/1669、ai 包全绿。tui/python 本波无改动未重跑。需要重新编译并重启后才生效。
 
 
+
+## 2026-10-03 wave-33 七路：暖池二期、ambient 间隙补检、autocompact 两洞、compile cache 随包分发
 
 - 暖 worker 池二期：预热阶段把工具装配/设置读取一并做掉（claim 首建税 60ms 移出受理路径），首个 create 86.4→75.8ms、稳态 90.5→80.4ms；spare 三态一等公民化（warming 中 claim 有界等待 750ms 不丢、failed 显式终态落日志）；审计证实无关生命周期事件（set_model/reload/kill 已认领会话）不波及池内 spare。Windows 代码审查通过。
 - agents-view 的 alt+x 同型缺陷修复（与 wave-32 P2 同构：待命快照点名集合 + 如实回执），4 例回归钉住。
@@ -70,6 +82,8 @@
 
 
 
+## 2026-10-03 wave-32 六路：暖 worker 池、worker 模块图瘦身、alt+x 二击根治、字节稳定不变量
+
 - 暖 worker 池上线（默认开，`PRIME_AGENT_WARM_POOL=0` 关）：daemon 预建 cwd 键控的待命 worker，claim 要求 cwd（realpath 归一）+ 环境指纹逐字节一致、2s 健康检查、失败回退冷启动；spare 对枚举/恢复不可见，10min TTL、内存压力释放、关闭/更新前排空。实测首个 agent 受理 245→89ms（−64%）、稳态 269→106ms（−61%）。CC 暖池九条实践族逐条闭环，零 wire 变更。
 - worker 入口模块图瘦身：eager 图 9.4→6.61MB（−30%），zod 等 20+ 符号改 dispatch 点惰性加载（守恒逐调用点核对），worker create 配对中位再 −35ms。
 - alt+x 二击确认偶发不落根治：旧实现确认击时现算 roster，attach 窗 roster 瞬空会静默解除待命（第三击实为重新待命）；改为待命时快照点名集合，确认击按快照停，回执如实报「全停/已自行结束/部分」。4 例新回归钉住（含 roster 空窗二击）。同型缺陷在 agents-view 的 handleStopAllSubagents 也存在，已立项下波。
@@ -79,6 +93,8 @@
 - 门禁：check EXIT 0、hygiene OK、单测 9511 绿（暖池健康检查例+process-tree-cpu 负载抖动，隔离即绿）、suite 1664/1664 全绿、tui 1262/1262、python 765（2 例负载抖动隔离即绿）。需要重新编译并重启后才生效。
 
 
+
+## 2026-10-03 wave-31 八路：worker create 拆解回收、probe-bus 硬化、模型表刷新、buildId 互杀修复
 
 - worker create 拆出构成（316ms：模块图 147 / spawn 25 / 建连轮询 25 / 握手 15 / create 处理 60-80 / persist 28-32）并回收两刀安全项：daemon 模式跳过被丢弃的 boot SessionManager（-16ms/worker）、内核 prewarm 推迟一个 macrotask（21ms 哈希移出 create 响应路径）——配对中位 −25ms、稳态 ~303→278ms、离群点消失。暖 worker 池提案已出（CC 2.1.136-238 九条实践族当设计清单），下波评审。
 - get_state 复核为阴性结果：处理器本身 2.3ms、attach 握手已携带预聚合快照——预热范式现状即已实现，剩余 823ms 全在 worker spawn 与客户端模块加载。零改动立项关闭。
@@ -91,6 +107,8 @@
 
 
 
+## 2026-10-03 wave-30 七路：启动性能回收两刀、997 丢字段修复、记忆归并工序
+
 - 启动性能两刀（对 wave-29 画像发现的回归动刀）：① `enableCompileCache()` 挪到 cli-main 静态导入图之前——此前它在 runCli() 体内才执行，~5MB 导入图从未吃到编译缓存；暖 daemon 首帧 626→560ms、冷启 888-978→752-814ms、`--help` 184→146ms。② worker 创建链的 git 上下文采集从 3×spawnSync(git) 改为直接读 HEAD/refs 文件（packed-refs/unborn/worktree/GIT_DIR 等非常规一律回退原路径）——RPC get_state 844.2→822.9ms、create 段 −30ms。首帧对基线从 +24% 收到 +15%；最大剩余杠杆是 worker create ~300ms（预热/池化，待立项）。
 - probe-bus 997 推送不再丢 DECRPM 已记的 decrpmValue（推送分支曾整体替换 scheme2031 状态把该字段抹掉）；同值推送的重复噪声通知顺带消掉，DECSET/OSC 重查询行为不变。
 - 记忆阶段 3：consolidation 归并工序落地（`rlm.harness.plan_consolidation`/`apply_consolidation` + TS parity，dry-run 默认，apply 带 store_digest 拒旧闸；merge/delete/rename 三类操作清单）。真库 dry-run：默认方案 491.5→481.7KB（34 merges + 182 renames），激进档 377KB，含陈旧清理 330.8KB。硬结论：12KiB 帽靠归并在真库（1577 条）不可达，需 ~97% 削减——archive 分层 / 放宽帽 / id 重键三选项待裁决。
@@ -101,6 +119,8 @@
 - 门禁：check EXIT 0、hygiene OK、单测 9483 绿（4 例负载抖动隔离即绿）、suite 1664/1664 绿、tui 1252/1252 绿、python 760（1 例负载阈值隔离即绿）、evals 77 绿。需要重新编译并重启后才生效。
 
 
+
+## 2026-10-03 wave-29 十二路：记忆 digest 两层化、第六刀、压缩空转终结
 
 - 记忆 digest 两层化（记忆阶段 2）：相关窗口之外的条目不再是匿名的「+N more」计数，而是紧凑的 id+标题索引（默认 12KiB 字节帽，`harness.digestIndexMaxBytes` 可调），模型可按 id 直接取详情。真库面值 13.8KB→25.8KB（1.87×，红线 2× 内）。写侧索引帽闸已实现但默认关闭（`harness.enforceIndexCap`）——真库索引足迹 491KB 远超帽值，阶段 3 归并工序建好前开启会冻结全部记忆写入；/refine 回执新增近重复与 path 受控词表提醒（与内核 wave-26 parity，同 fixture 双端得分逐位相等）。
 - 压缩「无可总结内容」空转终结：超阈值但保留尾已覆盖全部时，跳过不再是零成本无限循环——跳过在专用连击计数上累积（不碰失败连击：那条计数还驱动下一次压缩的 keepRecent 减半，混用会把切点挪飞），第四次跳过触发紧急 shrink 阀。溢出恢复的三条既有契约原样保持（w9a 逃逸路线、goal 续跑、一次一阀），新增 skip-streak 套件测试钉住。
@@ -116,6 +136,8 @@
 - 门禁：check EXIT 0、hygiene OK、单测 9454 绿（3 例负载抖动隔离即绿）、suite 1664/1664 绿、tui paste 隔离绿、python OK（skipped=3）。需要重新编译并重启后才生效。
 
 
+
+## 2026-10-03 wave-28 四路：变更计数分作者、EX-6 契约修复、停轮收尾、第五刀
 
 - 「改了 N 个文件」的计数继续显示工作区全局变动（你要看），但现在分清了作者：本会话写的和别的窗口/进程动的分开两行显示（「本会话改了 X」+「工作区另有 Y 个变动」），且别的窗口的变动不再混进压缩交接的「本会话改了哪些文件」。那起「审查会话被记了别的 lane 的改动」不会再发生——显示上会明说那不是它改的。
 - EX-6 考题三连失败的契约修复：答案键钉死裸文件名（考题文本写明 + 判分器归一化前缀兜底），五十七个 model-free 测试守住。

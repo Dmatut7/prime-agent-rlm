@@ -1,3 +1,0 @@
-- Added Claude Opus 5.5 and Claude Sonnet 5.5 to the model catalog and refreshed the catalog from the live provider sources.
-- Fixed Anthropic requests to Claude Opus 5.5 / Sonnet 5.5 failing with 400 errors: thinking-off no longer sends `thinking: disabled` (omitted on Opus 5.5, mapped to `between_tools` on Sonnet 5.5, omitted again at xhigh/max effort), forced `tool_choice` (`any`/`tool`) degrades to `auto`, and non-default `temperature` is no longer sent to these models.
-- Fixed OpenAI 503 responses with the `server_is_overloaded` code classifying as generic server errors; they now classify as overloaded, matching Anthropic's 529 handling.

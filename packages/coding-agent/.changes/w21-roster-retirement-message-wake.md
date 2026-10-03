@@ -1,2 +1,0 @@
-- Changed the subagent roster to an active-work list: completed and errored children retire from the default listing (they stay addressable through `rlm.collect` and the audit surfaces), and `rlm.prune_subagents` prunes them explicitly.
-- Added kernel protocol 5 message wake: a child message arriving while the parent is parked in a long `rlm.collect` wait now answers early with a pending-message count (and the cell output nudges the parent to wrap up), instead of starving the fan-in until the turn ends.

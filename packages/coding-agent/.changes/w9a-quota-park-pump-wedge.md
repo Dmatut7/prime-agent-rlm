@@ -1,6 +1,0 @@
-- Fixed a quota-parked session whose durable wake job was lost never waking again after a restart: the restore now records a wake-lost entry and re-arms the wait, and the wake retry budget survives restarts instead of resetting.
-- Fixed a quota-parked session reporting a terminal error to its parent session while merely parked, and a bounded-wait abort now queues one recovery turn that reports the real ping count instead of ending silently.
-- Fixed a preselected turn cancelled while the input pump awaited taking the pass down with it, and fused the pump's self-reschedule after repeated failures (it heals on the next admission).
-- Fixed a failed kernel-state persist during compaction flipping an already-committed compaction to failed, and a compaction check throwing at agent_end no longer skips the turn's terminal flow.
-- Fixed queued user input wedging forever when its in-flight preparation was cancelled: the cancelled pump pass now reschedules itself so surviving messages are delivered instead of waiting for an unrelated event.
-- Changed provider-failure terminal paths (shared request budget exhausted, Retry-After above the cap, bounded quota-wait aborts) to hand the failure back to the model as one recovery turn before the episode ends, matching the spent-ladder path.

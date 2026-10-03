@@ -1,8 +1,0 @@
-- Fixed `emptyTurnRetry.maxAttempts: 1` sliding into the escalated slow tier despite the documented "1 disables retrying" contract; a single-attempt policy now collapses the whole retry ladder.
-- Added `onUndeliveredMessages` to `AgentLoopConfig`/`Agent`: messages a poll produced but the aborted run never consumed are handed back instead of dropped silently; `Agent` re-queues them by default.
-- Changed raw `agentLoop()`/`agentLoopContinue()` failure semantics: a non-abort loop failure now ends the stream with a terminal `agent_end` carrying a synthesized `stopReason: "error"` assistant message instead of resolving `result()` to a silent `[]` (abort behavior unchanged).
-- Fixed a provider stream ending without a terminal done/error event hanging the turn forever; the loop now settles it as a retryable `stopReason: "error"` message (`stream_ended_without_terminal_event`, see `isStreamEofFailure`), and `streamProxy` pushes an explicit error event on a terminal-less EOF.
-- Fixed a failing `tool_execution_end` event sink rejecting the whole parallel tool batch and orphaning the in-flight sibling calls; each started call now always produces exactly one tool result.
-- Changed `Agent.removeQueuedMessages` to remove only the matching messages instead of their whole queue batch.
-- Fixed the run loop mutating the caller's `AgentLoopConfig` on a mid-run model switch, and failure messages sharing the module-level zero-usage object.
-- Fixed a tool result cancelled by the per-call deadline and a cause-less run abort in the same tick being labeled "the turn was not aborted" while the turn was dying.

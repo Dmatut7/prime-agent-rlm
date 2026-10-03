@@ -1,1 +1,0 @@
-- Fixed the bundle CLI and the tsx source entrypoint replacing each other's daemon on every alternating launch: a build-id mismatch across different entrypoints (`dist/bundle/cli.js` vs `src/cli.ts`) now reuses the running daemon with a warning, while a rebuild behind the same entrypoint still replaces it.

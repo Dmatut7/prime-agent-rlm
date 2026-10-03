@@ -1,1 +1,0 @@
-- Added an unseen-content indicator: when the fullscreen transcript is scrolled up (not following), the hint now shows "↓ N 行新内容" in reverse video; Ctrl+Shift+↓ jumps to the bottom.

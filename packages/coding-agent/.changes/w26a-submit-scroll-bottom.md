@@ -1,1 +1,0 @@
-- Submitting a prompt now scrolls the transcript back to the live tail (and a user message materializing does the same), so what you send is always on screen; arriving agent messages no longer yank the scroll position while you read up.

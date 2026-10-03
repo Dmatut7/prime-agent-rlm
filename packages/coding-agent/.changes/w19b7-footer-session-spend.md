@@ -1,1 +1,0 @@
-- Added the opt-in `footer.sessionSpend` setting (default off): the footer watermark line can show the session's own cumulative spend as `本次 ¥…` — the root agent's own usage as priced by the spend pipeline, same 口径 as `/usage`.

@@ -1,1 +1,0 @@
-- Fixed machine-dependent test failures (4620/4649/r43): the suite harness and the r43 stale-auth tests now pin `PI_DISABLE_CLAUDE_CODE_DETECTION`, so a local Claude Code install no longer leaks claude-code catalog models into availability assertions.

@@ -1,1 +1,0 @@
-- Fixed Ctrl+T folding a process box the user had reopened with Ctrl+O, Enter or a click: closing the thoughts now folds only their own rows, and the keybindings doc spells out the double-Esc tree's search and close keys.

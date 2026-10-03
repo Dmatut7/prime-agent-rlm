@@ -1,1 +1,0 @@
-- Fixed a re-dispatched subagent reusing the exact session name of a deleted or idle-closed child: the successor now wears a numbered name (`reviewer-2`, `reviewer-3`), so its timeline lane, dispatch row and return rows no longer merge into the earlier child's rows, live or after a reload.

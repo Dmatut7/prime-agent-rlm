@@ -1,1 +1,0 @@
-- Fixed Enter being swallowed when typed while an interactive client is still starting up (attach/resume window): the tty now enters raw mode before the startup handshakes, so an early Enter buffers as CR instead of being ICRNL-mangled into a newline keystroke that never submits.

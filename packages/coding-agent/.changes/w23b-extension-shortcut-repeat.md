@@ -1,1 +1,0 @@
-- Fixed extension shortcuts re-firing at the key auto-repeat rate when held (Kitty protocol terminals); they now fire on press only. Unbound keys' repeats still fall through to text input.

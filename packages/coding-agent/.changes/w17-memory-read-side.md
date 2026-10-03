@@ -1,4 +1,0 @@
-- Added the read side of harness memory to the model-facing prompt: `rlm.harness.search`/`get` signatures, the local-vs-global scope trap (the digest merges both stores; reads default to local, so `global_=True` for `[global:…]` entries), and the when-to-search discipline (default on, explicit skip list, 2-3 query budget, "zero hits means the words did not match" retry guidance, search before writing).
-- Changed the digest's overflow and routing lines to name the retrieval entry points (search first, overview second), so a large store no longer invites a full 468KB overview dump.
-- Resume briefings now note that harness memories survive a reopen and how to query them.
-- Fixed kernel discoverability: `dir(rlm.harness)` now lists the real public methods, and `rlm.harness.search(...)` results tolerate an habitual `await` (they stay plain lists).

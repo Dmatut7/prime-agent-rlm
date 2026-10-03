@@ -1,2 +1,0 @@
-- Changed the finish-gate nudge to ask for existing proof first: when the transcript already holds the evidence, the model is told to quote it instead of re-running checks that already passed.
-- Fixed the finish gate to accept "verification passed" and "proof complete" as cited evidence, so a challenged claim that was then proven is not challenged again.

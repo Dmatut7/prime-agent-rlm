@@ -1,1 +1,0 @@
-- Fixed the agents-view stop-all-subagents confirmation silently disarming when the confirming press landed in a transient roster gap: the armed press now snapshots the children it named, the confirming press stops exactly those without re-reading the event-fed roster, and children that already finished on their own are reported as such instead of being counted as stopped.

@@ -1,2 +1,0 @@
-- Fixed the changed-files counter misreporting a partially edited tracked file as created (the kernel's change tracker minted a false absent baseline when the old content was briefly unreadable; tracked files now report unknown instead of created, with a regression pin that a tracked file can never be judged created).
-- Stopped showing "+0" when a turn changed nothing measurable.

@@ -1,1 +1,0 @@
-- Fixed the bad-tool-call storm detector counting legitimate zero-argument calls to tools whose schema requires nothing; empty-argument errors now count only when the tool declares required parameters.

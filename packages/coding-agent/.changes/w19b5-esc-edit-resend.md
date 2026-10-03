@@ -1,1 +1,0 @@
-- Changed double-Esc on an empty idle prompt to open the session tree with the latest user message pre-highlighted in any tree filter mode, so Enter forks it back into the editor for edit-and-resend.

@@ -1,4 +1,0 @@
-- Fixed agent-message receipts claiming `deliveryMode: "steer"` for follow-up sends: the receipt type now admits `"steer" | "follow_up"` and `createAgentSessionMessageReceipt` takes the mode as an optional parameter.
-- Added a warn-once log when `SessionManager.getBranch()` truncates a branch at a broken parent link, matching the `buildSessionContext` context-loss warnings.
-- Fixed `<read-files>` compaction blocks never filling: kernel-reported read activities on ipython tool results now feed the read list, symmetric to the diff channel for `<modified-files>`.
-- Added `<fact-appendix>` and `<user-requests>` ledgers to `/tree` branch summaries, built from the branch slice with small fixed budgets.

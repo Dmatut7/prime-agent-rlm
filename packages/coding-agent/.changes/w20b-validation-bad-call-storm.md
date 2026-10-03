@@ -1,1 +1,0 @@
-- Changed the bad-tool-call storm detector to also count schema-validation failures with non-empty arguments (e.g. GLM sending `{"command": ...}` where the tool requires `code`), so a model looping malformed arguments on an existing tool now moves the session down the fallback chain after 3 consecutive failures instead of only when the arguments were empty.

@@ -1,1 +1,0 @@
-- Added the tool-not-found breaker: unknown-tool error receipts now list the available tools with a did-you-mean suggestion, a per-run breaker warns on the receipt after 3 unknown-tool calls and ends the run with a classified, non-retryable error after 5 (configurable via `AgentLoopConfig.toolNotFoundBreaker`).

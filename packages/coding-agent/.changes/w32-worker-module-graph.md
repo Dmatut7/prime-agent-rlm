@@ -1,1 +1,0 @@
-- Sped up daemon worker startup (~30ms per session create): the CLI entry now loads the interactive, ACP, RPC, print, and agents-view mode modules lazily at dispatch instead of eagerly, so a headless session worker never compiles their module graph (zod, ACP SDK, mode UIs were ~28% of its eager bundle).

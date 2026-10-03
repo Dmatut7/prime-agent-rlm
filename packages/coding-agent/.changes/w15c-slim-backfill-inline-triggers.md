@@ -1,1 +1,0 @@
-- Added non-mouse triggers for the slim attach transcript's "earlier messages not loaded" marker: the `app.transcript.loadEarlier` keybinding (default `alt+u`) and the `/backfill` command, both paging the previous 100 messages in inline mode where the marker's click regions do not dispatch, and the inline marker now names both entries.

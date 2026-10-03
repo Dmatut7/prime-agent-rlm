@@ -1,4 +1,0 @@
-- Fixed a run ending silently when the provider retry ladder was spent: the failure shape now goes back to the model as one recovery turn per failure episode, and only a spent recovery budget ends the run.
-- Fixed a transient provider failure with a server-requested wait above `retry.provider.maxRetryDelayMs` ending the run: it now moves into the bounded wait-for-recovery loop.
-- Added `selfRecovery.maxAutoContinues` (default 4) for the per-prompt automatic-continue budget, and a turn cut off by the output limit (`stopReason: "length"`) after tool work now continues from where it stopped within the same budget.
-- Changed auto-continue so a reply that announces more work is no longer exempted from continuation just because it ends in a question or an offer, when the turn already ran tools.

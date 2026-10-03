@@ -1,1 +1,0 @@
-- Fixed streaming markdown re-rendering the whole in-flight block every frame: completed lines and paragraphs now seal, so long single-paragraph or fenced answers render ~16-47x faster (measured 14.2s to 0.9s for an 80k-character stream). `PI_MARKDOWN_LINE_SEAL=0` opts out.

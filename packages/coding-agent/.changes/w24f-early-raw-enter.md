@@ -1,1 +1,0 @@
-- Fixed prompts typed immediately after `prime-agent` / `--resume` / `attach` starts sometimes doing nothing on Enter: the CLI now engages raw mode at startup (released again for non-interactive modes), so keystrokes buffered before the TUI starts are delivered untranslated and the early submit actually submits.

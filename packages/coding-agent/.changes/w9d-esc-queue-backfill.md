@@ -1,6 +1,0 @@
-- Fixed Esc on an idle draft requiring an unprompted 500ms double press: one press now clears the input, as `keybindings.md` documents; on an empty idle prompt a double press still steps back to earlier messages.
-- Fixed an Esc that interrupts running work also arming the double-press session tree, so the habitual second press popped the tree open mid-abort; stop is now just stop, matching the Ctrl+C rule.
-- Fixed Esc during an in-flight queued-message edit interrupting the turn and flushing the queue: it now cancels the edit instead, and re-submitting the in-flight edit's text is deduplicated instead of delivered twice.
-- Fixed an armed Ctrl+C exit hint or Esc repeat surviving a session replacement and firing on the next session's first interrupt key.
-- Fixed slim transcript backfill pages ending on a tool call leaving the turn box running forever: the page now settles the call with its real result from the loaded tail, or marks it missing when no result exists.
-- Fixed the live chat cap rebuild dropping the slim transcript marker: the windowed rebuild keeps the omitted region pageable instead of requiring a fullscreen full reload to reach it.
