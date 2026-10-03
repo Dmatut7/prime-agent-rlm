@@ -1,9 +1,10 @@
 /**
  * RLM child-run cluster extracted from agent-session.ts: the run lifecycle record,
- * the streaming preview/label/derive-counter helpers it leans on, and the spawn path
- * itself. The spawn path was a private method and keeps exactly the same body; it
- * reads the session through {@link RlmChildRunHost}, which `AgentSession` satisfies
- * structurally, so the move changes no runtime behavior.
+ * the streaming preview/label/derive-counter helpers it leans on, the child snapshot
+ * builders the roster and collect paths share, and the spawn path itself. The moved
+ * methods keep exactly the same bodies; they read the session through
+ * {@link RlmChildRunHost} / {@link RlmChildSnapshotHost}, which `AgentSession`
+ * satisfies structurally, so the move changes no runtime behavior.
  */
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
@@ -319,6 +320,160 @@ export function rlmChildLabel(prompt: string): string {
 	return prompt.replace(/\s+/g, " ").trim() || "child agent";
 }
 
+/** A running child with no tracked activity for this long reports activityStaleMs. */
+const RLM_CHILD_STALE_ACTIVITY_THRESHOLD_MS = 10 * 60_000;
+
+/**
+ * Lazily computed staleness for a running child: how long since the last
+ * tracked activity, once past the threshold. Computed at snapshot build time
+ * only — no background timers update it.
+ *
+ * A tool call in flight (activity "executing") is legitimately quiet for its
+ * whole duration — a minutes-long bash() run emits no events while it works —
+ * so an executing child never reports stale. Staleness measures active time:
+ * the wall clock alone would mark every running child stale after a laptop
+ * sleep, so the smaller of the wall and monotonic clock deltas bounds it to
+ * time the host was actually awake.
+ */
+function rlmActivityStaleMs(
+	status: RlmChildAgentStatus,
+	activity: RlmChildAgentActivity | undefined,
+	lastActivityAt: number | undefined,
+	lastActivityMonotonicAt: number | undefined,
+): number | undefined {
+	if (status !== "running" || lastActivityAt === undefined) return undefined;
+	if (activity?.kind === "executing") return undefined;
+	const wallStaleMs = Date.now() - lastActivityAt;
+	const monotonicStaleMs =
+		lastActivityMonotonicAt === undefined ? wallStaleMs : performance.now() - lastActivityMonotonicAt;
+	// Integer ms like every other roster wire field: performance.now() deltas
+	// are fractional, and the kernel parser rejects non-int activity_stale_ms.
+	const staleMs = Math.floor(Math.min(wallStaleMs, monotonicStaleMs));
+	return staleMs >= RLM_CHILD_STALE_ACTIVITY_THRESHOLD_MS ? staleMs : undefined;
+}
+
+/**
+ * The seam of `AgentSession` the child snapshot builders read: the parent node id
+ * stamped on every snapshot, and the retained-child map a run's session falls back
+ * to. `AgentSession` satisfies it structurally; the collect module's host extends it.
+ */
+export interface RlmChildSnapshotHost {
+	readonly _rlmParentNodeId?: string;
+	readonly _rlmChildSessions: Map<string, RetainedRlmChild>;
+}
+
+export function rlmChildSnapshotForRun(
+	host: RlmChildSnapshotHost,
+	run: RlmChildRun,
+	child = run.session ?? host._rlmChildSessions.get(run.id)?.session,
+): RlmChildAgentSnapshot {
+	const model = child?.model ?? run.model;
+	// The brief is a run-level constant; re-regexing it per streaming chunk
+	// was pure per-chunk CPU on a string that never changes.
+	run.label ??= rlmChildLabel(run.prompt);
+	return {
+		id: run.id,
+		parentId: host._rlmParentNodeId,
+		sessionName: child?.sessionName ?? run.sessionName,
+		model: `${model.provider}/${model.id}`,
+		label: run.label,
+		status: run.status,
+		durationMs: run.durationMs,
+		answerPreview: run.answerPreview,
+		toolUseCount: run.toolUseCount > 0 ? run.toolUseCount : undefined,
+		tokenCount: child?._contextTokensForCurrentMessages(),
+		recap: child?.getCurrentRecap(),
+		sessionDir: run.sessionDir,
+		activity: run.activity,
+		repliedSinceTask: child?._repliedToParentSinceTask,
+		progressNote: run.progressNotes?.at(-1),
+		lastActivityAt: run.lastActivityAt,
+		activityStaleMs: rlmActivityStaleMs(run.status, run.activity, run.lastActivityAt, run.lastActivityMonotonicAt),
+		error: run.error,
+		stall: run.stall,
+	};
+}
+
+export function rlmChildSnapshotForSession(
+	host: RlmChildSnapshotHost,
+	childId: string,
+	child: AgentSession,
+): RlmChildAgentSnapshot {
+	let answerPreview: string | undefined;
+	let toolUseCount = 0;
+	const messages =
+		child.state.streamingMessage?.role === "assistant"
+			? [...child.messages, child.state.streamingMessage]
+			: child.messages;
+	for (const message of messages) {
+		if (message.role !== "assistant") continue;
+		const text = compactRlmText(readAssistantText(message));
+		if (text) answerPreview = text;
+		toolUseCount += message.content.filter((block) => block.type === "toolCall").length;
+	}
+	return {
+		id: childId,
+		parentId: host._rlmParentNodeId,
+		sessionName: child.sessionName,
+		model: child.model ? `${child.model.provider}/${child.model.id}` : undefined,
+		label: child.sessionName ?? "child agent",
+		status: "done",
+		answerPreview,
+		toolUseCount: toolUseCount > 0 ? toolUseCount : undefined,
+		tokenCount: child._contextTokensForCurrentMessages(),
+		recap: child.getCurrentRecap(),
+		sessionDir: child._rlmSessionDir ?? child.sessionManager.getSessionDir(),
+		// No run exists (e.g. a child rehydrated after daemon recovery), so live
+		// session state is the only source for in-flight follow-up work. Mirror
+		// the run projection's convention: status stays "done" (the recorded task
+		// finished) and current work surfaces through activity.
+		activity: child.isSessionActive ? { kind: child.isStreaming ? "writing" : "waiting" } : undefined,
+		repliedSinceTask: child._repliedToParentSinceTask,
+	};
+}
+
+/**
+ * Streaming preview for a child's in-flight assistant message. The chunk handler
+ * used to re-join and re-regex the whole message text per chunk - O(text so far)
+ * per chunk, O(text^2) over a long answer - while the preview only depends on the
+ * first collapsed characters; the incremental accumulator folds just the new text.
+ */
+export function rlmChildStreamingPreviewText(
+	run: RlmChildRun,
+	event: Extract<AgentSessionEvent, { type: "message_start" | "message_update" }>,
+): string {
+	// The accumulator tracks one assistant message, not the run: a run folds
+	// several assistant messages (tool-call rounds, agent_message continuation
+	// rounds) and each starts from an empty text. Reading the previous message's
+	// folded lengths as the new message's consumed prefix glued the old answer
+	// onto a mid-word slice of the new one, or froze the preview at the old cap,
+	// for the whole message. message_start is the per-message boundary; reset
+	// there so only message_update folds incrementally.
+	if (event.type === "message_start") run.streamPreview = undefined;
+	run.streamPreview ??= new RlmChildStreamPreview();
+	const preview = run.streamPreview;
+	return preview.update(event.message as AssistantMessage);
+}
+
+/** The volatile snapshot fields as they stand right now. */
+export function rlmChildEmitFields(run: RlmChildRun, child: AgentSession | undefined): RlmChildEmitFields {
+	return {
+		model: child?.model ?? run.model,
+		sessionName: child?.sessionName ?? run.sessionName,
+		status: run.status,
+		durationMs: run.durationMs,
+		answerPreview: run.answerPreview,
+		toolUseCount: run.toolUseCount > 0 ? run.toolUseCount : undefined,
+		tokenCount: child?._contextTokensForCurrentMessages(),
+		recap: child?.getCurrentRecap(),
+		activityKind: run.activity?.kind,
+		activityToolName: run.activity?.toolName,
+		repliedSinceTask: child?._repliedToParentSinceTask,
+		error: run.error,
+		stall: run.stall,
+	};
+}
+
 /**
  * Incremental counterpart of {@link compactRlmText} for a streaming assistant
  * message. The preview only depends on the first ~maxLength collapsed characters, so
@@ -454,6 +609,7 @@ export interface RlmChildRunHost {
 	readonly _rlmDepth: number;
 	readonly _rlmMaxDepth: number;
 	readonly _rlmMaxConcurrentChildren: number;
+	readonly _rlmParentNodeId?: string;
 	readonly _disposed: boolean;
 	readonly _disposing: boolean;
 	_subagentRuntimeHost?: SubagentRuntimeHost;
@@ -470,8 +626,6 @@ export interface RlmChildRunHost {
 	_rlmHistoricalChildNamesNow(): Set<string>;
 	_findLastAssistantMessage(): AssistantMessage | undefined;
 	_cancelRlmChildRun(run: RlmChildRun, reason: string): boolean;
-	_rlmChildEmitFields(run: RlmChildRun, child: AgentSession | undefined): RlmChildEmitFields;
-	_rlmChildSnapshotForRun(run: RlmChildRun, child?: AgentSession): RlmChildAgentSnapshot;
 	_emit(event: AgentSessionEvent): void;
 	_abortRlmChildSessionOnPublish(run: RlmChildRun, child: AgentSession): void;
 	_createRlmSubagentRuntimeOptions(options: {
@@ -508,10 +662,6 @@ export interface RlmChildRunHost {
 	): void;
 	_findAssistantEntryForMessage(message: AssistantMessage): SessionMessageEntry | undefined;
 	_currentActiveSessionId(): Promise<string | undefined>;
-	_rlmChildStreamingPreviewText(
-		run: RlmChildRun,
-		event: Extract<AgentSessionEvent, { type: "message_start" | "message_update" }>,
-	): string;
 	registerRlmChildSession(childId: string, session: AgentSession, unsubscribe?: () => void): boolean;
 	_removeRlmSubagentTracking(childId: string, run?: RlmChildRun): void;
 	_ensureRlmRunDeletionCleanup(run: RlmChildRun, session: AgentSession): Promise<void>;
@@ -678,9 +828,9 @@ export async function startRlmChildRun(
 		// constant. Comparing the volatile fields first keeps the per-chunk cost
 		// off the snapshot build and the JSON.stringify of the full brief.
 		const child = run.session ?? host._rlmChildSessions.get(run.id)?.session;
-		const fields = host._rlmChildEmitFields(run, child);
+		const fields = rlmChildEmitFields(run, child);
 		if (rlmChildEmitFieldsEqual(fields, run.lastEmittedFields)) return;
-		const snapshot = host._rlmChildSnapshotForRun(run, child);
+		const snapshot = rlmChildSnapshotForRun(host, run, child);
 		const serialized = JSON.stringify(snapshot);
 		rlmChildDeriveCounts.snapshotSerialize += 1;
 		run.lastEmittedFields = fields;
@@ -873,7 +1023,7 @@ export async function startRlmChildRun(
 					emitChildUpdate();
 				} else if (event.type === "message_start" || event.type === "message_update") {
 					if (event.message.role === "assistant") {
-						const text = host._rlmChildStreamingPreviewText(run, event);
+						const text = rlmChildStreamingPreviewText(run, event);
 						if (text) run.answerPreview = text;
 						run.activity = { kind: "writing" };
 						touchRlmChildActivity(run);
@@ -982,7 +1132,7 @@ export async function startRlmChildRun(
 				// A pre-bind failure leaves no row: "cancelled" is the wire's removal signal.
 				host._emit({
 					type: "rlm_child_update",
-					child: { ...host._rlmChildSnapshotForRun(run), status: "cancelled" },
+					child: { ...rlmChildSnapshotForRun(host, run), status: "cancelled" },
 				});
 			} else {
 				emitChildUpdate();

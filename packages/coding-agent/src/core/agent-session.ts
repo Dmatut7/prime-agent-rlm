@@ -56,7 +56,7 @@ import {
 	supportsFastMode,
 } from "@earendil-works/pi-ai";
 import { theme } from "../modes/interactive/theme/theme.js";
-import { untilAborted, type WaitTimeoutFacts, withBound } from "../utils/bounded-wait.js";
+import { untilAborted, type WaitTimeoutFacts } from "../utils/bounded-wait.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { ensurePrivateDirectory, writePrivateFileAtomic } from "../utils/private-files.js";
 import { sleep } from "../utils/sleep.js";
@@ -288,6 +288,7 @@ import {
 	createHarnessDigestMessage,
 	createHeartbeatPromptMessage,
 	createImageDeliverySuspicionMessage,
+	createModelChangeMessage,
 	createRefinementFailureMessage,
 	createRefinementOutcomeMessage,
 	createRlmChildFailureMessage,
@@ -395,18 +396,32 @@ import {
 import { resolveConfigValue } from "./resolve-config-value.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
 import {
+	type ClosedRlmChildCollectEntry,
+	collectRlmChildren,
+	rlmCollectEntryForRun,
+	rlmCollectEntryForSession,
+} from "./rlm-child-collect.js";
+import {
+	deleteInactiveRlmSubagent,
+	deleteRlmSubagent,
+	ensureRlmRunDeletionCleanup,
+	finishRlmRunDeletion,
+	observeRlmRunDeletionCleanup,
+	rlmSubagentMatchesTarget,
+} from "./rlm-child-delete.js";
+import {
 	type AgentMessageDeferred,
 	compactRlmText,
 	createAgentMessageDeferred,
 	noopRlmChildAbort,
 	type RlmChildDeriveCounts,
-	type RlmChildEmitFields,
 	type RlmChildRun,
-	RlmChildStreamPreview,
 	readAssistantText,
 	resetRlmChildDeriveCounts,
 	rlmChildDeriveCounts,
 	rlmChildLabel,
+	rlmChildSnapshotForRun,
+	rlmChildSnapshotForSession,
 	startRlmChildRun,
 } from "./rlm-child-run.js";
 
@@ -447,7 +462,6 @@ import {
 	type RlmSpawnHandle,
 	type RlmSubagentRegistryEntry,
 	type RlmSubagentRuntime,
-	rlmCollectStallAbort,
 	type SubagentRuntimeHost,
 } from "./rlm-runtime.js";
 import {
@@ -503,7 +517,6 @@ import {
 	CURRENT_SESSION_VERSION,
 	getLatestCompactionEntry,
 	getTranscriptLineSkips,
-	loadEntriesFromFileAsync,
 	type SessionHeader,
 	SessionManager,
 } from "./session-manager.js";
@@ -1415,31 +1428,9 @@ type RetiredRlmChildRun = Pick<
 /** Closed-after-idle children kept for `rlm.collect`; each entry is a few hundred bytes. */
 const CLOSED_RLM_CHILD_COLLECT_ENTRIES_MAX = 1024;
 
-interface ClosedRlmChildCollectEntry {
-	entry: RlmCollectResultEntry;
-	/** The child's transcript id, so a collect by session id still resolves it. */
-	sessionId?: string;
-}
-
 interface ClosedRlmChildRelease {
 	record: ClosedRlmChildCollectEntry;
 	snapshot: RlmChildAgentSnapshot;
-}
-
-interface RlmCollectRunlessChild {
-	childId: string;
-	child: AgentSession;
-}
-
-interface RlmCollectClosedChild {
-	childId: string;
-	record: ClosedRlmChildCollectEntry;
-}
-
-interface RlmCollectCandidates {
-	runs: Map<string, RlmChildRun>;
-	runlessChildren: RlmCollectRunlessChild[];
-	closed: RlmCollectClosedChild[];
 }
 
 /** Options for {@link AgentSession.listRlmSubagents}. */
@@ -1455,24 +1446,13 @@ export interface RlmListSubagentsOptions {
 }
 
 /** Internal roster view: `includePruned` re-admits children forgotten by `pruneRlmSubagents`. */
-interface RlmSubagentRosterView extends RlmListSubagentsOptions {
+export interface RlmSubagentRosterView extends RlmListSubagentsOptions {
 	includePruned?: boolean;
 }
-
-/** The deletion paths resolve against every tracked child, including pruned ones. */
-const RLM_FULL_ROSTER_VIEW: RlmSubagentRosterView = { includeTerminal: true, includePruned: true };
 
 /** The rows `pruneRlmSubagents` retired from the roster views. */
 export interface RlmPruneSubagentsResult {
 	pruned: RlmSubagentRegistryEntry[];
-}
-
-function rlmRunlessChildMatches({ childId, child }: RlmCollectRunlessChild, target: string): boolean {
-	return childId === target || child.sessionId === target || child.sessionName === target;
-}
-
-function rlmClosedChildMatches({ childId, record }: RlmCollectClosedChild, target: string): boolean {
-	return childId === target || record.sessionId === target || record.entry.session_name === target;
 }
 
 /**
@@ -1750,8 +1730,6 @@ const SESSION_PERSIST_FAILURE_REPORT_MAX_MS = 300_000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 /** Minimum spacing between accepted progress notes from one child session. */
 const RLM_PROGRESS_NOTE_MIN_INTERVAL_MS = 10_000;
-/** A running child with no tracked activity for this long reports activityStaleMs. */
-const RLM_CHILD_STALE_ACTIVITY_THRESHOLD_MS = 10 * 60_000;
 /** How long a deferred RLM terminal notice may wait for delivery before it is abandoned. */
 const RLM_TERMINAL_NOTICE_ABANDON_AFTER_MS = 5 * 60_000;
 
@@ -2103,35 +2081,6 @@ function parseAutonomousBudgetOptions(tokens: string[]): AgentAutonomousConfig {
 	return config;
 }
 
-/**
- * Lazily computed staleness for a running child: how long since the last
- * tracked activity, once past the threshold. Computed at snapshot build time
- * only — no background timers update it.
- *
- * A tool call in flight (activity "executing") is legitimately quiet for its
- * whole duration — a minutes-long bash() run emits no events while it works —
- * so an executing child never reports stale. Staleness measures active time:
- * the wall clock alone would mark every running child stale after a laptop
- * sleep, so the smaller of the wall and monotonic clock deltas bounds it to
- * time the host was actually awake.
- */
-function rlmActivityStaleMs(
-	status: RlmChildAgentStatus,
-	activity: RlmChildAgentActivity | undefined,
-	lastActivityAt: number | undefined,
-	lastActivityMonotonicAt: number | undefined,
-): number | undefined {
-	if (status !== "running" || lastActivityAt === undefined) return undefined;
-	if (activity?.kind === "executing") return undefined;
-	const wallStaleMs = Date.now() - lastActivityAt;
-	const monotonicStaleMs =
-		lastActivityMonotonicAt === undefined ? wallStaleMs : performance.now() - lastActivityMonotonicAt;
-	// Integer ms like every other roster wire field: performance.now() deltas
-	// are fractional, and the kernel parser rejects non-int activity_stale_ms.
-	const staleMs = Math.floor(Math.min(wallStaleMs, monotonicStaleMs));
-	return staleMs >= RLM_CHILD_STALE_ACTIVITY_THRESHOLD_MS ? staleMs : undefined;
-}
-
 function waitForPromiseOrAbort<T>(
 	promise: Promise<T>,
 	signal: AbortSignal | undefined,
@@ -2473,7 +2422,7 @@ export class AgentSession {
 	private _includeGoals: boolean;
 	private _includeCompactSkill: boolean;
 	private _rlmHeartbeatController?: AgentRlmHeartbeatController;
-	private _agentMessageController?: AgentSessionMessageController;
+	_agentMessageController?: AgentSessionMessageController;
 	private _agentObserveController?: AgentObserveController;
 	private _mcpManager?: McpManager;
 	private _baseToolsOverride?: Record<string, AgentTool>;
@@ -2516,20 +2465,20 @@ export class AgentSession {
 	 * the wider value, so a subtree can never get stuck behind an invisible limit.
 	 */
 	private _rlmMaxDepthCeiling: number | undefined;
-	private _rlmSessionDir?: string;
+	_rlmSessionDir?: string;
 	/** True when `_rlmSessionDir` is this session's own `prime-agent-rlm-*` tmpdir (RC-6). */
 	private _rlmSessionDirEphemeral = false;
 	readonly _semanticEdges: SemanticEdgeRecorder;
-	private _rlmParentNodeId?: string;
+	_rlmParentNodeId?: string;
 	private _rlmParentAgent?: string;
-	private _repliedToParentSinceTask: boolean | undefined;
+	_repliedToParentSinceTask: boolean | undefined;
 	_parentReplyCount = 0;
 	/**
 	 * Stall-watchdog abort facts for the turn in flight, if the watchdog fired.
 	 * `settled` flips false when the watchdog reports abort_unsettled, so a run
 	 * that was never stopped is not reported as killed.
 	 */
-	private _lastStallAbort: RlmChildStallAbortFacts | undefined;
+	_lastStallAbort: RlmChildStallAbortFacts | undefined;
 	/**
 	 * Live stall marker for roster rows: set when the watchdog reports a stage,
 	 * cleared by the next agent_start. Published so a daemon can put a wedged
@@ -2619,8 +2568,8 @@ export class AgentSession {
 	private readonly _prunedRlmChildIds = new Set<string>();
 	// Failed explicit deletes stay hidden from listings but retain their original
 	// selector so a later delete can retry cleanup without orphaning the runtime.
-	private _rlmChildCleanupFailures = new Map<string, RlmSubagentRegistryEntry>();
-	private _deletingRlmChildren = new Map<
+	_rlmChildCleanupFailures = new Map<string, RlmSubagentRegistryEntry>();
+	_deletingRlmChildren = new Map<
 		string,
 		{
 			subagent: RlmSubagentRegistryEntry;
@@ -2636,9 +2585,9 @@ export class AgentSession {
 	 * parent's to read: collect promises a completed child keeps its result until it
 	 * is deleted. Bounded, oldest dropped first.
 	 */
-	private readonly _closedRlmChildCollectEntries = new Map<string, ClosedRlmChildCollectEntry>();
+	readonly _closedRlmChildCollectEntries = new Map<string, ClosedRlmChildCollectEntry>();
 	/** A full collect already asked the daemon for children closed before this session object existed. */
-	private _closedRlmChildrenDaemonScanned = false;
+	_closedRlmChildrenDaemonScanned = false;
 	/** Per retained child: watches follow-up turns the parent started for a missing reply. */
 	private readonly _rlmChildFollowUpWatches = new Map<string, RlmChildFollowUpWatch>();
 	/**
@@ -2716,7 +2665,7 @@ export class AgentSession {
 		{ kind: "silent" } | { kind: "time_limit"; budgetMs: number; usedMs: number }
 	>();
 	/** Direct child runs an in-flight `collectRlmChildren` wait is blocked on, with a count per wait. */
-	private readonly _rlmCollectWaits = new Map<RlmChildRun, number>();
+	readonly _rlmCollectWaits = new Map<RlmChildRun, number>();
 	private _compactAutoRefinePending = false;
 	private _turnIntervalAutoRefinePending = false;
 	private _postCompactionContinuationScheduled = false;
@@ -12898,6 +12847,9 @@ export class AgentSession {
 		this.agent.state.model = model;
 		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(model.provider, model.id);
+		this.agent.state.messages.push(
+			createModelChangeMessage({ provider: model.provider, modelId: model.id }, Date.now()),
+		);
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 
 		this.setThinkingLevel(thinkingLevel);
@@ -12968,6 +12920,9 @@ export class AgentSession {
 		this.agent.state.model = next.model;
 		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
+		this.agent.state.messages.push(
+			createModelChangeMessage({ provider: next.model.provider, modelId: next.model.id }, Date.now()),
+		);
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
 		this.setThinkingLevel(thinkingLevel);
@@ -13010,6 +12965,9 @@ export class AgentSession {
 		this.agent.state.model = nextModel;
 		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
+		this.agent.state.messages.push(
+			createModelChangeMessage({ provider: nextModel.provider, modelId: nextModel.id }, Date.now()),
+		);
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 
 		this.setThinkingLevel(thinkingLevel);
@@ -17312,7 +17270,7 @@ export class AgentSession {
 		return this._buildRlmSubagentList(await this._agentMessageController?.listAgents(), options);
 	}
 
-	private _buildRlmSubagentList(
+	_buildRlmSubagentList(
 		listedAgents?: AgentSessionMessageListResult,
 		view?: RlmSubagentRosterView,
 	): RlmListSubagentsResult {
@@ -17496,151 +17454,11 @@ export class AgentSession {
 		return { pruned };
 	}
 
-	/**
-	 * Typed fan-in for direct RLM children: wait (bounded) for the selected runs to
-	 * settle and return result envelopes.
-	 *
-	 * Never steers the parent, and never rejects on a timeout or a cell abort -
-	 * both end the wait and return the snapshots as they are, and nothing behind
-	 * the wait is cancelled, so the caller can end its turn, poll, or retry.
-	 * `timeoutMs` of 0 is a guaranteed non-blocking read. `targets` are child ids,
-	 * child session names, or child session ids; an empty list means every direct
-	 * child that is not being deleted.
-	 */
 	async collectRlmChildren(targets: string[], timeoutMs: number, signal?: AbortSignal): Promise<RlmCollectResult> {
-		let candidates = this._rlmCollectCandidates();
-		// A child the daemon closed before this session object existed (the parent was
-		// itself closed or restarted) is known only to the daemon. Ask it once per
-		// session for a full collect, and again only for a selector nothing local matches.
-		const unmatched = targets.some((target) => this._rlmCollectTargetMatches(candidates, target) === 0);
-		if (unmatched || (targets.length === 0 && !this._closedRlmChildrenDaemonScanned)) {
-			if (targets.length === 0) this._closedRlmChildrenDaemonScanned = true;
-			if (await this._recordClosedRlmChildrenFromDaemon(candidates)) candidates = this._rlmCollectCandidates();
-		}
-		const selected = this._selectRlmChildrenForCollect(targets, candidates);
-		if (timeoutMs > 0) {
-			const deadlineAt = Date.now() + timeoutMs;
-			const awaited = selected.runs.filter((run) => !run.settled);
-			// The cell blocked on this wait is silent by design while the child works; the
-			// silent-step rule reads these to tell that from a hang (see _rlmCollectWaitsOnLiveChild).
-			for (const run of awaited) this._rlmCollectWaits.set(run, (this._rlmCollectWaits.get(run) ?? 0) + 1);
-			try {
-				// allSettled on purpose: one run's timeout or abort must not strand the
-				// other waits, and a settlement rejection is terminal state to report,
-				// not a collect error.
-				await Promise.allSettled(
-					awaited.map((run) => this._awaitRlmChildSettlementForCollect(run, deadlineAt, signal)),
-				);
-			} finally {
-				for (const run of awaited) {
-					const count = (this._rlmCollectWaits.get(run) ?? 1) - 1;
-					if (count > 0) this._rlmCollectWaits.set(run, count);
-					else this._rlmCollectWaits.delete(run);
-				}
-			}
-		}
-		return {
-			results: [
-				...selected.runs.map((run) => this._rlmCollectEntryForRun(run)),
-				...selected.runlessChildren.map(({ childId, child }) => this._rlmCollectEntryForSession(childId, child)),
-				...selected.closed.map(({ record }) => ({ ...record.entry })),
-			],
-		};
+		return collectRlmChildren(this, targets, timeoutMs, signal);
 	}
 
-	/**
-	 * The children one collect call may see.
-	 *
-	 * Four sources, because terminal cleanup, daemon recovery and idle close each
-	 * move a child out of one of them: a run in flight, a settled run retained next
-	 * to its session, a session retained without any run (rehydrated after a daemon
-	 * recovery), and a finished child the daemon closed after it sat idle. The full
-	 * roster view (includeTerminal) shows all of them, so a fan-in that saw less
-	 * would report a finished child as unknown. Children pending deletion - or whose
-	 * deletion cleanup failed - stay out: the delete path owns their selectors.
-	 */
-	private _rlmCollectCandidates(): RlmCollectCandidates {
-		const runs = new Map<string, RlmChildRun>();
-		for (const run of this._activeRlmChildRuns.values()) {
-			if (this._isRlmChildHiddenFromCollect(run.id, run)) continue;
-			runs.set(run.id, run);
-		}
-		const runlessChildren: RlmCollectRunlessChild[] = [];
-		for (const [childId, retained] of this._rlmChildSessions) {
-			if (this._isRlmChildHiddenFromCollect(childId, retained.run)) continue;
-			if (retained.run) {
-				// The retained copy is the same run object the active map held, so this
-				// only adds a run the terminal cleanup already dropped.
-				if (!runs.has(childId)) runs.set(childId, retained.run);
-				continue;
-			}
-			runlessChildren.push({ childId, child: retained.session });
-		}
-		const closed: RlmCollectClosedChild[] = [];
-		for (const [childId, record] of this._closedRlmChildCollectEntries) {
-			if (runs.has(childId) || this._rlmChildSessions.has(childId) || this._isRlmChildHiddenFromCollect(childId)) {
-				continue;
-			}
-			closed.push({ childId, record });
-		}
-		return { runs, runlessChildren, closed };
-	}
-
-	private _rlmCollectTargetMatches(candidates: RlmCollectCandidates, target: string): number {
-		let matches = 0;
-		for (const run of candidates.runs.values()) {
-			if (this._rlmChildRunMatchesCollectTarget(run, target)) matches += 1;
-		}
-		for (const entry of candidates.runlessChildren) {
-			if (rlmRunlessChildMatches(entry, target)) matches += 1;
-		}
-		for (const entry of candidates.closed) {
-			if (rlmClosedChildMatches(entry, target)) matches += 1;
-		}
-		return matches;
-	}
-
-	private _selectRlmChildrenForCollect(
-		targets: string[],
-		candidates: RlmCollectCandidates = this._rlmCollectCandidates(),
-	): { runs: RlmChildRun[]; runlessChildren: RlmCollectRunlessChild[]; closed: RlmCollectClosedChild[] } {
-		const { runs, runlessChildren, closed } = candidates;
-		if (targets.length === 0) {
-			return { runs: [...runs.values()], runlessChildren, closed };
-		}
-		const selectedRuns: RlmChildRun[] = [];
-		const selectedRunless: RlmCollectRunlessChild[] = [];
-		const selectedClosed: RlmCollectClosedChild[] = [];
-		const selectedIds = new Set<string>();
-		for (const target of targets) {
-			const matches = this._rlmCollectTargetMatches(candidates, target);
-			if (matches === 0) {
-				throw new Error(`No direct RLM child matches "${target}" in the current parent session`);
-			}
-			if (matches > 1) {
-				throw new Error(`RLM child selector "${target}" is ambiguous in the current parent session`);
-			}
-			// A repeated selector collects the child once, not twice.
-			for (const run of runs.values()) {
-				if (!this._rlmChildRunMatchesCollectTarget(run, target) || selectedIds.has(run.id)) continue;
-				selectedIds.add(run.id);
-				selectedRuns.push(run);
-			}
-			for (const entry of runlessChildren) {
-				if (!rlmRunlessChildMatches(entry, target) || selectedIds.has(entry.childId)) continue;
-				selectedIds.add(entry.childId);
-				selectedRunless.push(entry);
-			}
-			for (const entry of closed) {
-				if (!rlmClosedChildMatches(entry, target) || selectedIds.has(entry.childId)) continue;
-				selectedIds.add(entry.childId);
-				selectedClosed.push(entry);
-			}
-		}
-		return { runs: selectedRuns, runlessChildren: selectedRunless, closed: selectedClosed };
-	}
-
-	private _rememberClosedRlmChild(childId: string, record: ClosedRlmChildCollectEntry): void {
+	_rememberClosedRlmChild(childId: string, record: ClosedRlmChildCollectEntry): void {
 		this._closedRlmChildCollectEntries.delete(childId);
 		this._closedRlmChildCollectEntries.set(childId, record);
 		while (this._closedRlmChildCollectEntries.size > CLOSED_RLM_CHILD_COLLECT_ENTRIES_MAX) {
@@ -17650,83 +17468,7 @@ export class AgentSession {
 		}
 	}
 
-	/**
-	 * Record the daemon's closed direct children that this session has no live or
-	 * remembered copy of, reading each one's result from its own transcript. Returns
-	 * whether anything was added. Best effort: a listing or transcript failure leaves
-	 * the collect with what it already had.
-	 */
-	private async _recordClosedRlmChildrenFromDaemon(candidates: RlmCollectCandidates): Promise<boolean> {
-		let listed: AgentSessionMessageListResult | undefined;
-		try {
-			listed = await this._agentMessageController?.listAgents();
-		} catch {
-			return false;
-		}
-		const parentActiveSessionId = listed?.current?.activeSessionId;
-		if (!listed || !parentActiveSessionId) return false;
-		let added = false;
-		for (const agent of listed.agents) {
-			const childId = agent.rlmChildId;
-			if (
-				!childId ||
-				agent.runtimeKind !== "subagent" ||
-				agent.parentActiveSessionId !== parentActiveSessionId ||
-				agent.status !== "inactive" ||
-				agent.rlmChildRegistryStatus === "deleted" ||
-				!agent.sessionDir ||
-				candidates.runs.has(childId) ||
-				this._rlmChildSessions.has(childId) ||
-				this._closedRlmChildCollectEntries.has(childId) ||
-				this._isRlmChildHiddenFromCollect(childId)
-			) {
-				continue;
-			}
-			const transcript = agent.sessionPath ? await this._readClosedRlmChildTranscript(agent.sessionPath) : undefined;
-			const completed = agent.rlmChildRegistryStatus === "completed";
-			this._rememberClosedRlmChild(childId, {
-				sessionId: agent.sessionId,
-				entry: {
-					rlm_child_id: childId,
-					session_name: agent.sessionName,
-					session_dir: agent.sessionDir,
-					status: completed ? "done" : "error",
-					settled: true,
-					answer_preview: transcript?.answerPreview,
-					error: completed ? undefined : "The child was closed before it recorded a finished task",
-					duration_ms: undefined,
-					tool_use_count: transcript?.toolUseCount,
-					replied_since_task: undefined,
-					activity_kind: undefined,
-					terminal_kind: undefined,
-					terminal_reason: undefined,
-					stall_abort: undefined,
-				},
-			});
-			added = true;
-		}
-		return added;
-	}
-
-	private async _readClosedRlmChildTranscript(
-		sessionPath: string,
-	): Promise<{ answerPreview?: string; toolUseCount?: number } | undefined> {
-		try {
-			let answerPreview: string | undefined;
-			let toolUseCount = 0;
-			for (const entry of await loadEntriesFromFileAsync(sessionPath)) {
-				if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-				const text = compactRlmText(readAssistantText(entry.message));
-				if (text) answerPreview = text;
-				toolUseCount += entry.message.content.filter((block) => block.type === "toolCall").length;
-			}
-			return { answerPreview, toolUseCount: toolUseCount > 0 ? toolUseCount : undefined };
-		} catch {
-			return undefined;
-		}
-	}
-
-	private _isRlmChildHiddenFromCollect(childId: string, run?: RlmChildRun): boolean {
+	_isRlmChildHiddenFromCollect(childId: string, run?: RlmChildRun): boolean {
 		return (
 			run?.detachedDeletion !== undefined ||
 			this._deletingRlmChildren.has(childId) ||
@@ -17735,311 +17477,35 @@ export class AgentSession {
 		);
 	}
 
-	private _rlmChildRunMatchesCollectTarget(run: RlmChildRun, target: string): boolean {
-		const session = run.session ?? this._rlmChildSessions.get(run.id)?.session;
-		return (
-			run.id === target ||
-			run.sessionName === target ||
-			session?.sessionId === target ||
-			session?.sessionName === target
-		);
-	}
-
-	/**
-	 * Wait for one run to settle, bounded by the collect deadline and by a cell
-	 * abort. Both a timeout and an abort end the wait quietly: collect reports the
-	 * facts it has, and the child keeps running either way.
-	 */
-	private async _awaitRlmChildSettlementForCollect(
-		run: RlmChildRun,
-		deadlineAt: number,
-		signal?: AbortSignal,
-	): Promise<void> {
-		const remainingMs = deadlineAt - Date.now();
-		if (run.settled || remainingMs <= 0) return;
-		try {
-			await withBound(
-				// A settlement rejection is the run's terminal state, not a collect error.
-				run.settlement.promise.then(
-					() => undefined,
-					() => undefined,
-				),
-				{
-					timeoutMs: remainingMs,
-					phase: "rlm_collect",
-					target: run.id,
-					label: "RLM child settlement",
-					signal,
-					targetState: () => run.status,
-				},
-			);
-		} catch {
-			// Timeout or abort: fall through to the snapshot the caller asked for.
-		}
-	}
-
 	private _rlmCollectEntryForRun(run: RlmChildRun): RlmCollectResultEntry {
-		const child = run.session ?? this._rlmChildSessions.get(run.id)?.session;
-		const snapshot = this._rlmChildSnapshotForRun(run, child);
-		return {
-			rlm_child_id: snapshot.id,
-			session_name: snapshot.sessionName,
-			session_dir: snapshot.sessionDir,
-			status: snapshot.status,
-			settled: run.settled,
-			answer_preview: snapshot.answerPreview,
-			error: snapshot.error,
-			duration_ms: snapshot.durationMs,
-			tool_use_count: snapshot.toolUseCount,
-			replied_since_task: snapshot.repliedSinceTask,
-			activity_kind: snapshot.activity?.kind,
-			terminal_kind: run.terminalKind,
-			terminal_reason: run.terminalReason,
-			no_reply_notice_superseded: run.noReplyNoticeSuperseded,
-			// Same two sources the terminal classifier reads: the run's own record
-			// survives a disposed child session, the child's copy is the fallback for
-			// a kill the parent's subscription never observed.
-			stall_abort: rlmCollectStallAbort(run.stallAbort ?? child?._lastStallAbort),
-		};
+		return rlmCollectEntryForRun(this, run);
 	}
 
 	private _rlmCollectEntryForSession(childId: string, child: AgentSession): RlmCollectResultEntry {
-		const snapshot = this._rlmChildSnapshotForSession(childId, child);
-		return {
-			rlm_child_id: childId,
-			session_name: snapshot.sessionName,
-			session_dir: snapshot.sessionDir,
-			status: snapshot.status,
-			// No run exists (the daemon-recovery shape), so there is no settlement to
-			// wait for; `activity_kind` is what says whether it is working again.
-			settled: true,
-			answer_preview: snapshot.answerPreview,
-			error: snapshot.error,
-			duration_ms: snapshot.durationMs,
-			tool_use_count: snapshot.toolUseCount,
-			replied_since_task: snapshot.repliedSinceTask,
-			activity_kind: snapshot.activity?.kind,
-			terminal_kind: undefined,
-			terminal_reason: undefined,
-			stall_abort: rlmCollectStallAbort(child._lastStallAbort),
-		};
+		return rlmCollectEntryForSession(this, childId, child);
 	}
 
 	private _rlmSubagentMatchesTarget(entry: RlmSubagentRegistryEntry, target: string): boolean {
-		return (
-			entry.rlm_child_id === target ||
-			entry.active_session_id === target ||
-			entry.session_id === target ||
-			entry.session_name === target
-		);
-	}
-
-	/**
-	 * The full registry the deletion paths resolve against: terminal and pruned
-	 * children included, so a selector keeps working after either retirement. The
-	 * async hop is load-bearing - two deletes racing a gated daemon listing must
-	 * both finish building their candidate list before either registers its
-	 * reservation, or the second build already sees the first's in-flight deletion
-	 * and reports the child as unknown (the coalescing regression test pins this).
-	 */
-	private async _listAllRlmSubagentsForDeletion(): Promise<RlmListSubagentsResult> {
-		return this._buildRlmSubagentList(await this._agentMessageController?.listAgents(), RLM_FULL_ROSTER_VIEW);
-	}
-
-	private async _resolveDirectRlmSubagent(target: string): Promise<RlmSubagentRegistryEntry> {
-		const candidates = [
-			...(await this._listAllRlmSubagentsForDeletion()).subagents,
-			...this._rlmChildCleanupFailures.values(),
-		];
-		const matches = candidates.filter((entry) => this._rlmSubagentMatchesTarget(entry, target));
-		if (matches.length === 0) {
-			throw new Error(`No direct RLM subagent matches "${target}" in the current parent session`);
-		}
-		if (matches.length > 1) {
-			throw new Error(`RLM subagent selector "${target}" is ambiguous in the current parent session`);
-		}
-		return matches[0]!;
+		return rlmSubagentMatchesTarget(entry, target);
 	}
 
 	async deleteInactiveRlmSubagent(
 		childId: string,
 		isExternallyRunning: () => boolean = () => false,
 	): Promise<"deleted" | "not_found" | "running"> {
-		for (const owner of this._rlmSubtreeSessions()) {
-			const isRunning = (): boolean => {
-				const status = owner._activeRlmChildRuns.get(childId)?.status;
-				return status === "queued" || status === "running" || isExternallyRunning();
-			};
-			if (isRunning()) {
-				return "running";
-			}
-			const subagent = [
-				...(await owner._listAllRlmSubagentsForDeletion()).subagents,
-				...owner._rlmChildCleanupFailures.values(),
-			].find((entry) => entry.rlm_child_id === childId);
-			if (!subagent) continue;
-			if (isRunning()) {
-				return "running";
-			}
-			const result = await owner._trackRlmSubagentDeletion(subagent, () => {
-				if (isRunning()) {
-					return Promise.resolve({ subagent, outcome: "skipped_running" });
-				}
-				return owner._deleteResolvedRlmSubagent(subagent);
-			});
-			return result.outcome === "skipped_running" ? "running" : "deleted";
-		}
-		return "not_found";
+		return deleteInactiveRlmSubagent(this, childId, isExternallyRunning);
 	}
 
 	async deleteRlmSubagent(target: string): Promise<RlmDeleteSubagentResult> {
-		const inFlight = [...this._deletingRlmChildren.values()].filter(({ subagent }) =>
-			this._rlmSubagentMatchesTarget(subagent, target),
-		);
-		if (inFlight.length > 1) {
-			throw new Error(`RLM subagent selector "${target}" is ambiguous in the current parent session`);
-		}
-
-		// Running and retained children can be reserved synchronously. This keeps
-		// them hidden immediately while the async daemon listing checks for a
-		// conflicting passive selector.
-		const localMatches = [
-			...this._buildRlmSubagentList(undefined, RLM_FULL_ROSTER_VIEW).subagents,
-			...this._rlmChildCleanupFailures.values(),
-		].filter((entry) => this._rlmSubagentMatchesTarget(entry, target));
-		const matchingChildIds = new Set([
-			...inFlight.map(({ subagent }) => subagent.rlm_child_id),
-			...localMatches.map((subagent) => subagent.rlm_child_id),
-		]);
-		if (matchingChildIds.size > 1 || localMatches.length > 1) {
-			throw new Error(`RLM subagent selector "${target}" is ambiguous in the current parent session`);
-		}
-		if (inFlight[0]) {
-			return inFlight[0].promise;
-		}
-		if (localMatches[0]) {
-			const subagent = localMatches[0];
-			return this._trackRlmSubagentDeletion(subagent, async () => {
-				const listedAgents = await this._agentMessageController?.listAgents();
-				const listedSubagents = this._buildRlmSubagentList(listedAgents, RLM_FULL_ROSTER_VIEW).subagents;
-				const passiveMatches = listedSubagents.filter(
-					(entry) => entry.rlm_child_id !== subagent.rlm_child_id && this._rlmSubagentMatchesTarget(entry, target),
-				);
-				if (passiveMatches.length > 0) {
-					throw new Error(`RLM subagent selector "${target}" is ambiguous in the current parent session`);
-				}
-				const parentActiveSessionId = listedAgents?.current?.activeSessionId;
-				const daemonChild = listedAgents?.agents.find(
-					(agent) =>
-						agent.rlmChildId === subagent.rlm_child_id && agent.parentActiveSessionId === parentActiveSessionId,
-				);
-				const resolvedSubagent = daemonChild
-					? {
-							...subagent,
-							active_session_id: daemonChild.activeSessionId,
-							session_id: daemonChild.sessionId,
-							session_name: daemonChild.sessionName ?? subagent.session_name,
-						}
-					: subagent;
-				return this._deleteResolvedRlmSubagent(resolvedSubagent);
-			});
-		}
-
-		const directMatches = [
-			...(await this._listAllRlmSubagentsForDeletion()).subagents,
-			...this._rlmChildCleanupFailures.values(),
-		].filter((entry) => this._rlmSubagentMatchesTarget(entry, target));
-		const directChildIds = new Set(directMatches.map((subagent) => subagent.rlm_child_id));
-		if (directChildIds.size > 1) {
-			throw new Error(`RLM subagent selector "${target}" is ambiguous in the current parent session`);
-		}
-		const subagent = directMatches[0] ?? (await this._resolveDirectRlmSubagent(target));
-		return this._trackRlmSubagentDeletion(subagent, () => this._deleteResolvedRlmSubagent(subagent));
-	}
-
-	private async _trackRlmSubagentDeletion(
-		subagent: RlmSubagentRegistryEntry,
-		startDeletion: () => Promise<RlmDeleteSubagentResult>,
-	): Promise<RlmDeleteSubagentResult> {
-		const existing = this._deletingRlmChildren.get(subagent.rlm_child_id);
-		if (existing) return existing.promise;
-		const deletion = Promise.resolve().then(startDeletion);
-		this._deletingRlmChildren.set(subagent.rlm_child_id, {
-			subagent,
-			promise: deletion,
-		});
-		try {
-			return await deletion;
-		} finally {
-			const clearReservation = () => {
-				if (this._deletingRlmChildren.get(subagent.rlm_child_id)?.promise === deletion) {
-					this._deletingRlmChildren.delete(subagent.rlm_child_id);
-				}
-			};
-			const run = this._activeRlmChildRuns.get(subagent.rlm_child_id);
-			if (run?.detachedDeletion) {
-				// Keep every selector reserved until the run settles, or until a failed
-				// cleanup is exposed for an explicit retry. Repeated deletes before that
-				// boundary return the same accepted result.
-				void run.deletionReservation.promise.then(clearReservation, clearReservation);
-			} else {
-				clearReservation();
-			}
-		}
-	}
-
-	private _deleteRlmSubagentSession(childId: string, session?: AgentSession): Promise<void> {
-		if (this._subagentRuntimeHost) {
-			return this._subagentRuntimeHost.deleteRlmSubagentRuntime(childId, session);
-		}
-		return session?.disposeAsync() ?? Promise.resolve();
+		return deleteRlmSubagent(this, target);
 	}
 
 	_ensureRlmRunDeletionCleanup(run: RlmChildRun, session: AgentSession): Promise<void> {
-		if (run.deletionCleanup) return run.deletionCleanup;
-		const cleanup = Promise.resolve().then(() => this._deleteRlmSubagentSession(run.id, session));
-		run.deletionCleanup = cleanup;
-		// Deletion admission is intentionally nonblocking. The detached run owner
-		// joins this exact promise before settlement and records any failure.
-		void cleanup.catch(() => undefined);
-		return cleanup;
-	}
-
-	private async _recordRlmRunDeletionCleanupFailure(
-		run: RlmChildRun,
-		subagent: RlmSubagentRegistryEntry,
-		session: AgentSession,
-		error: unknown,
-	): Promise<void> {
-		if (this._disposed || this._disposing) {
-			run.suppressTerminalNotice = true;
-			await session.disposeAsync().catch(() => undefined);
-			if (!run.settled) await this._finishRlmRunDeletion(run);
-			return;
-		}
-		run.deletionCleanup = undefined;
-		run.deletionCleanupObserver = undefined;
-		run.deletionCleanupFailed = true;
-		run.session = session;
-		this._rlmChildCleanupFailures.set(run.id, subagent);
-		// Make retry admission available before waking the parent model with the
-		// retry-required notice.
-		run.deletionReservation.resolve();
-		await Promise.resolve();
-		await run.reportDeletionCleanupFailure?.(error);
+		return ensureRlmRunDeletionCleanup(this, run, session);
 	}
 
 	async _finishRlmRunDeletion(run: RlmChildRun): Promise<void> {
-		await run.completeDeletion?.();
-		if (this._activeRlmChildRuns.get(run.id) === run) {
-			this._removeRlmSubagentTracking(run.id, run);
-		}
-		run.settled = true;
-		run.settlement.resolve();
-		run.deletionReservation.resolve();
-		this._unsettledRlmChildRuns.delete(run);
-		this._maybeResumeGoalContinuationAfterRlmWork();
-		this._maybeResumeAutonomousContinuationAfterRlmWork();
+		return finishRlmRunDeletion(this, run);
 	}
 
 	_observeRlmRunDeletionCleanup(
@@ -18048,32 +17514,7 @@ export class AgentSession {
 		session: AgentSession,
 		cleanup: Promise<void>,
 	): Promise<boolean> {
-		if (run.deletionCleanupObserver) return run.deletionCleanupObserver;
-		const observer = cleanup.then(
-			() => true,
-			async (error) => {
-				await this._recordRlmRunDeletionCleanupFailure(run, subagent, session, error);
-				return false;
-			},
-		);
-		run.deletionCleanupObserver = observer;
-		void observer.catch(() => undefined);
-		return observer;
-	}
-
-	private _continueFinishedRlmRunDeletion(
-		run: RlmChildRun,
-		subagent: RlmSubagentRegistryEntry,
-		session: AgentSession,
-	): void {
-		const cleanup = this._ensureRlmRunDeletionCleanup(run, session);
-		const observer = this._observeRlmRunDeletionCleanup(run, subagent, session, cleanup);
-		if (!run.deletionRunFinished) return;
-		void observer
-			.then(async (cleanupSucceeded) => {
-				if (cleanupSucceeded) await this._finishRlmRunDeletion(run);
-			})
-			.catch(() => undefined);
+		return observeRlmRunDeletionCleanup(this, run, subagent, session, cleanup);
 	}
 
 	/**
@@ -18130,84 +17571,6 @@ export class AgentSession {
 			run.unsubscribe = undefined;
 			run.session = undefined;
 		}
-	}
-
-	private _emitRlmSubagentRemoval(subagent: RlmSubagentRegistryEntry): void {
-		this._emit({
-			type: "rlm_child_update",
-			child: {
-				id: subagent.rlm_child_id,
-				parentId: this._rlmParentNodeId,
-				activeSessionId: subagent.active_session_id ?? undefined,
-				sessionName: subagent.session_name,
-				label: subagent.session_name,
-				status: "cancelled",
-				sessionDir: subagent.session_dir,
-				error: "Deleted by parent orchestrator",
-			},
-		});
-	}
-
-	private async _deleteResolvedRlmSubagent(subagent: RlmSubagentRegistryEntry): Promise<RlmDeleteSubagentResult> {
-		const childId = subagent.rlm_child_id;
-		// The freed name stays in the name history: a later re-spawn of it is
-		// numbered instead of merging into the deleted child's display rows.
-		if (subagent.session_name) this._rlmHistoricalChildNamesNow().add(subagent.session_name);
-		const run = this._activeRlmChildRuns.get(childId);
-		if (run) {
-			if (run.deletionCleanupFailed) {
-				// Reset retry coordination only after selector preflight reaches the
-				// resolved child. A failed preflight must leave the prior retry boundary
-				// intact so a later call can acquire it.
-				run.deletionCleanupFailed = false;
-				run.deletionFailureNotice = undefined;
-				run.deletionReservation = createAgentMessageDeferred();
-			}
-			// The detached task remains the sole lifecycle owner. Mark deletion before
-			// cancellation so its catch/finally path cannot race a normal release or
-			// terminal notice against the physical delete.
-			run.detachedDeletion = subagent;
-			if (this._cancelRlmChildRun(run, "Deleted by parent orchestrator")) {
-				run.deletionNeedsCompletionNotice = true;
-			} else {
-				this._emitRlmSubagentRemoval(subagent);
-			}
-			const liveSession = run.session;
-			if (run.status === "error" && !liveSession && run.settled) {
-				this._deletedRlmChildIds.add(childId);
-				this._removeRlmSubagentTracking(childId, run);
-				return { subagent };
-			}
-			if (liveSession && run.settled) {
-				run.deletionRunFinished = true;
-				run.settlement = createAgentMessageDeferred();
-				run.settled = false;
-				this._unsettledRlmChildRuns.add(run);
-			}
-			if (liveSession) this._continueFinishedRlmRunDeletion(run, subagent, liveSession);
-
-			// Return once deletion is accepted. The run stays hidden but unsettled until
-			// abort-insensitive model/tool work unwinds and the shared cleanup finishes.
-			this._deletedRlmChildIds.add(childId);
-			return { subagent };
-		}
-
-		this._emitRlmSubagentRemoval(subagent);
-		const retained = this._rlmChildSessions.get(childId)?.session;
-		try {
-			await this._deleteRlmSubagentSession(childId, retained);
-		} catch (error) {
-			if (this._disposed || this._disposing) {
-				this._removeRlmSubagentTracking(childId);
-				void retained?.disposeAsync().catch(() => undefined);
-			} else {
-				this._rlmChildCleanupFailures.set(childId, subagent);
-			}
-			throw error;
-		}
-		this._deletedRlmChildIds.add(childId);
-		this._removeRlmSubagentTracking(childId);
-		return { subagent };
 	}
 
 	/**
@@ -18644,107 +18007,11 @@ export class AgentSession {
 		run: RlmChildRun,
 		child = run.session ?? this._rlmChildSessions.get(run.id)?.session,
 	): RlmChildAgentSnapshot {
-		const model = child?.model ?? run.model;
-		// The brief is a run-level constant; re-regexing it per streaming chunk
-		// was pure per-chunk CPU on a string that never changes.
-		run.label ??= rlmChildLabel(run.prompt);
-		return {
-			id: run.id,
-			parentId: this._rlmParentNodeId,
-			sessionName: child?.sessionName ?? run.sessionName,
-			model: `${model.provider}/${model.id}`,
-			label: run.label,
-			status: run.status,
-			durationMs: run.durationMs,
-			answerPreview: run.answerPreview,
-			toolUseCount: run.toolUseCount > 0 ? run.toolUseCount : undefined,
-			tokenCount: child?._contextTokensForCurrentMessages(),
-			recap: child?.getCurrentRecap(),
-			sessionDir: run.sessionDir,
-			activity: run.activity,
-			repliedSinceTask: child?._repliedToParentSinceTask,
-			progressNote: run.progressNotes?.at(-1),
-			lastActivityAt: run.lastActivityAt,
-			activityStaleMs: rlmActivityStaleMs(run.status, run.activity, run.lastActivityAt, run.lastActivityMonotonicAt),
-			error: run.error,
-			stall: run.stall,
-		};
-	}
-
-	/**
-	 * Streaming preview for a child's in-flight assistant message. The chunk handler
-	 * used to re-join and re-regex the whole message text per chunk - O(text so far)
-	 * per chunk, O(text^2) over a long answer - while the preview only depends on the
-	 * first collapsed characters; the incremental accumulator folds just the new text.
-	 */
-	_rlmChildStreamingPreviewText(
-		run: RlmChildRun,
-		event: Extract<AgentSessionEvent, { type: "message_start" | "message_update" }>,
-	): string {
-		// The accumulator tracks one assistant message, not the run: a run folds
-		// several assistant messages (tool-call rounds, agent_message continuation
-		// rounds) and each starts from an empty text. Reading the previous message's
-		// folded lengths as the new message's consumed prefix glued the old answer
-		// onto a mid-word slice of the new one, or froze the preview at the old cap,
-		// for the whole message. message_start is the per-message boundary; reset
-		// there so only message_update folds incrementally.
-		if (event.type === "message_start") run.streamPreview = undefined;
-		run.streamPreview ??= new RlmChildStreamPreview();
-		const preview = run.streamPreview;
-		return preview.update(event.message as AssistantMessage);
-	}
-
-	/** The volatile snapshot fields as they stand right now. */
-	_rlmChildEmitFields(run: RlmChildRun, child: AgentSession | undefined): RlmChildEmitFields {
-		return {
-			model: child?.model ?? run.model,
-			sessionName: child?.sessionName ?? run.sessionName,
-			status: run.status,
-			durationMs: run.durationMs,
-			answerPreview: run.answerPreview,
-			toolUseCount: run.toolUseCount > 0 ? run.toolUseCount : undefined,
-			tokenCount: child?._contextTokensForCurrentMessages(),
-			recap: child?.getCurrentRecap(),
-			activityKind: run.activity?.kind,
-			activityToolName: run.activity?.toolName,
-			repliedSinceTask: child?._repliedToParentSinceTask,
-			error: run.error,
-			stall: run.stall,
-		};
+		return rlmChildSnapshotForRun(this, run, child);
 	}
 
 	private _rlmChildSnapshotForSession(childId: string, child: AgentSession): RlmChildAgentSnapshot {
-		let answerPreview: string | undefined;
-		let toolUseCount = 0;
-		const messages =
-			child.state.streamingMessage?.role === "assistant"
-				? [...child.messages, child.state.streamingMessage]
-				: child.messages;
-		for (const message of messages) {
-			if (message.role !== "assistant") continue;
-			const text = compactRlmText(readAssistantText(message));
-			if (text) answerPreview = text;
-			toolUseCount += message.content.filter((block) => block.type === "toolCall").length;
-		}
-		return {
-			id: childId,
-			parentId: this._rlmParentNodeId,
-			sessionName: child.sessionName,
-			model: child.model ? `${child.model.provider}/${child.model.id}` : undefined,
-			label: child.sessionName ?? "child agent",
-			status: "done",
-			answerPreview,
-			toolUseCount: toolUseCount > 0 ? toolUseCount : undefined,
-			tokenCount: child._contextTokensForCurrentMessages(),
-			recap: child.getCurrentRecap(),
-			sessionDir: child._rlmSessionDir ?? child.sessionManager.getSessionDir(),
-			// No run exists (e.g. a child rehydrated after daemon recovery), so live
-			// session state is the only source for in-flight follow-up work. Mirror
-			// the run projection's convention: status stays "done" (the recorded task
-			// finished) and current work surfaces through activity.
-			activity: child.isSessionActive ? { kind: child.isStreaming ? "writing" : "waiting" } : undefined,
-			repliedSinceTask: child._repliedToParentSinceTask,
-		};
+		return rlmChildSnapshotForSession(this, childId, child);
 	}
 
 	private _isUnboundTerminalRlmChildRun(run: RlmChildRun): boolean {
@@ -19009,7 +18276,7 @@ export class AgentSession {
 	}
 
 	// A done child sits in BOTH maps until passivation; the visited set keeps that dual membership from doubling the walk.
-	private *_rlmSubtreeSessions(): Generator<AgentSession> {
+	*_rlmSubtreeSessions(): Generator<AgentSession> {
 		const visited = new Set<AgentSession>([this]);
 		const stack: AgentSession[] = [this];
 		while (stack.length > 0) {
@@ -20186,6 +19453,9 @@ export class AgentSession {
 		}
 		// Session-log the switch so primary->backup->primary transitions stay debuggable.
 		this.sessionManager.appendModelChange(backupModel.provider, backupModel.id);
+		this.agent.state.messages.push(
+			createModelChangeMessage({ provider: backupModel.provider, modelId: backupModel.id }, Date.now()),
+		);
 		this._startFreshRequestLadder();
 		this._backupModel = {
 			backup: backupModel,
@@ -20406,6 +19676,9 @@ export class AgentSession {
 		this._fallback.switchedAtMs = Date.now();
 		this._fallback.tried.push(key(next));
 		this.sessionManager.appendModelChange(next.provider, next.id);
+		this.agent.state.messages.push(
+			createModelChangeMessage({ provider: next.provider, modelId: next.id }, Date.now()),
+		);
 		const fromReference = key(from);
 		this._recordFallbackEntry({
 			kind: "switch",
@@ -20804,6 +20077,9 @@ export class AgentSession {
 		this._startFreshRequestLadder();
 		const primary = `${fallback.primary.provider}/${fallback.primary.id}`;
 		this.sessionManager.appendModelChange(fallback.primary.provider, fallback.primary.id);
+		this.agent.state.messages.push(
+			createModelChangeMessage({ provider: fallback.primary.provider, modelId: fallback.primary.id }, Date.now()),
+		);
 		this._recordDutyEvent({ kind: "model_restored", to: primary });
 		this._recordFallbackEntry({
 			kind: "return",
@@ -21531,6 +20807,9 @@ export class AgentSession {
 		// would keep the tier the backup clamped it to.
 		this._clampServiceTierForModel(backup.serviceTier);
 		this.sessionManager.appendModelChange(backup.primary.provider, backup.primary.id);
+		this.agent.state.messages.push(
+			createModelChangeMessage({ provider: backup.primary.provider, modelId: backup.primary.id }, Date.now()),
+		);
 		return `${backup.primary.provider}/${backup.primary.id}`;
 	}
 
