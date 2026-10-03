@@ -23,9 +23,6 @@ import {
 	type ShouldStopAfterTurnContext,
 	type ThinkingLevel,
 	TOOL_CALL_ID_COLLISION_DIAGNOSTIC_TYPE,
-	type ToolTimeoutConfig,
-	type ToolTimeoutVerdict,
-	type ToolTimeoutVouchInfo,
 } from "@earendil-works/pi-agent-core";
 import type {
 	Api,
@@ -181,12 +178,7 @@ import {
 } from "./cron-jobs.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ResourceDiagnostic } from "./diagnostics.js";
-import {
-	autonomousPromptFingerprint,
-	DUTY_EVENT_CUSTOM_TYPE,
-	type DutyEvent,
-	STEP_TIME_LIMIT_MARKER,
-} from "./duty-log.js";
+import { autonomousPromptFingerprint, DUTY_EVENT_CUSTOM_TYPE, type DutyEvent } from "./duty-log.js";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.js";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.js";
 import {
@@ -311,8 +303,6 @@ import {
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { findExactModelReferenceMatch, findPreferredDefaultModel } from "./model-resolver.js";
-import { ORPHAN_PROCESS_JOURNAL_ENV, readActiveOrphanProcesses } from "./orphan-process-journal.js";
-import { explicitTimeoutMs, readProcessTreeCpuMs } from "./process-tree-cpu.js";
 import {
 	SessionInputAdmissionPausedError,
 	SessionInputCoalescingError,
@@ -460,11 +450,7 @@ import { cloneCustomMessage } from "./rlm-child-stall-notice.js";
 export type { RlmChildDeriveCounts };
 export { compactRlmText, resetRlmChildDeriveCounts, rlmChildDeriveCounts, rlmChildLabel };
 
-import {
-	type RlmChildStallAbortFacts,
-	type RlmChildTurnAbortReason,
-	readStallKernelReasons,
-} from "./rlm-child-terminal.js";
+import type { RlmChildStallAbortFacts, RlmChildTurnAbortReason } from "./rlm-child-terminal.js";
 import { deliverRlmChildTerminalOutcome, recordRlmChildStallEvent } from "./rlm-child-terminal-outcome.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
@@ -567,27 +553,18 @@ import {
 	type SlashCommandInfo,
 } from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
+import type { StallWatchdog, StallWatchdogTimers } from "./stall-watchdog.js";
 import {
-	buildStallAbortMessage,
-	buildStallAbortUnsettledMessage,
-	buildStallWarnMessage,
-	formatStallExemptionEventLog,
-	normalizeStallKernelFacts,
-	STALL_VOUCH_REASONS,
-	type StallExemptionEvent,
-	type StallKernelDiagnostics,
-	type StallMessageContext,
-	type StallVouchFacts,
-	StallWatchdog,
-	type StallWatchdogOptions,
-	type StallWatchdogStageInfo,
-	type StallWatchdogTimers,
-} from "./stall-watchdog.js";
+	createSessionStallWatchdog,
+	createSessionTurnLiveness,
+	recordStallWatchdogActivity,
+	resolvedToolTimeoutConfig,
+	trackStallStepOutput,
+} from "./stall-watchdog-wiring.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
 import { THINKING_LEVELS } from "./thinking-levels.js";
 import { acpMcpToolNames, createAcpMcpToolDefinitions } from "./tools/acp-mcp.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
-import { previewIpythonCode } from "./tools/code-preview.js";
 import { createAllToolDefinitions } from "./tools/index.js";
 import {
 	formatIpythonAbortCause,
@@ -596,13 +573,7 @@ import {
 	type UnavailablePythonSkills,
 } from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
-import {
-	createTurnLiveness,
-	type JournaledBashFacts,
-	type TurnLiveness,
-	type TurnLivenessEvent,
-	type TurnLivenessKernelFacts,
-} from "./turn-liveness.js";
+import type { JournaledBashFacts, TurnLiveness, TurnLivenessKernelFacts } from "./turn-liveness.js";
 import { cloneUsage, emptyUsage, type SessionUsageSummary, sessionUsageSummaryFrom } from "./usage.js";
 import { SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME } from "./websearch-credential.js";
 
@@ -2027,9 +1998,9 @@ export class AgentSession {
 	// consumed on read, and disarmed once the armed actions leave the steering queue.
 	private _forcedAllSteeringActionIds: ReadonlySet<string> | undefined;
 	private _sessionInputPump: Promise<void> = Promise.resolve();
-	private _sessionInputPumpRequested = false;
+	_sessionInputPumpRequested = false;
 	// Invalidates preparation when a branch pause starts and finishes before its next await resumes.
-	private _sessionInputPumpEpoch = 0;
+	_sessionInputPumpEpoch = 0;
 	/**
 	 * Consecutive pump passes that escaped with an error; a clean pass resets it.
 	 * At SESSION_INPUT_PUMP_FAILURE_LIMIT the pump stops rescheduling itself
@@ -2038,7 +2009,7 @@ export class AgentSession {
 	private _sessionInputPumpFailureStreak = 0;
 	private _sessionInputArrivalEpoch = 0;
 	// Persists abort/restart suspension after the initiating call returns.
-	private _sessionInputPumpSuspended = false;
+	_sessionInputPumpSuspended = false;
 	private _sessionInputSuspendedForUpdateRestart = false;
 	// Branch mutation pause leases can overlap and must all release before dispatch resumes.
 	private readonly _queuedWorkPauses = new Set<symbol>();
@@ -2328,7 +2299,7 @@ export class AgentSession {
 	// re-populate the retained map after it's been cleared.
 	_disposing = false;
 	private _disposeAsyncPromise?: Promise<void>;
-	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
+	_ipythonKernelProvisioner?: IpythonKernelProvisioner;
 	/** Artifact dir backing the current provisioner's kernel snapshot, if any. */
 	private _ipythonKernelSnapshotDir?: string;
 	/** True once the runtime has been built once; later builds are in-process rebuilds (/reload). */
@@ -2368,7 +2339,7 @@ export class AgentSession {
 	 * session's silence on its summary row even when the parent that spawned it
 	 * lives in another worker.
 	 */
-	private _stallState: RlmChildStallState | undefined;
+	_stallState: RlmChildStallState | undefined;
 	/**
 	 * Turns this session has started (r4 recovery-shell). Incremented on every
 	 * agent_start; the stall-recovery executor uses it to scope "exactly one
@@ -2376,7 +2347,7 @@ export class AgentSession {
 	 * matching the moment a new turn begins, so a recovered session that stalls
 	 * again in a later turn is a new episode, never a skipped or repeated one.
 	 */
-	private _turnLifecycleEpoch = 0;
+	_turnLifecycleEpoch = 0;
 	/** Why the last abort of this session was requested; cleared by the next agent_start. */
 	_lastTurnAbortReason: RlmChildTurnAbortReason | undefined;
 	/** The child already delivered its own terminal-error notice to the parent. */
@@ -2498,35 +2469,33 @@ export class AgentSession {
 	private _autoRefineInProgress = false;
 	private readonly _autoRefineOperations = new Set<Promise<void>>();
 	private readonly _scheduledAutoRefineTimers = new Set<ReturnType<typeof setTimeout>>();
-	private _stallWatchdog: StallWatchdog | undefined;
-	private readonly _stallAbortSettleGraceMs: number | undefined;
+	_stallWatchdog: StallWatchdog | undefined;
+	readonly _stallAbortSettleGraceMs: number | undefined;
 	/** Injected watchdog timers; undefined means real timers (production). */
-	private readonly _stallWatchdogTimers: StallWatchdogTimers | undefined;
+	readonly _stallWatchdogTimers: StallWatchdogTimers | undefined;
 	/** Aggregates the kernel/host facts the watchdog's vouch samples (T1-3). */
-	private _turnLiveness: TurnLiveness | undefined;
-	private readonly _stallKernelLivenessFacts: (() => TurnLivenessKernelFacts | undefined) | undefined;
-	private readonly _stallJournaledBashHandles:
-		| ((kernelPid: number | undefined) => JournaledBashFacts | undefined)
-		| undefined;
-	private readonly _stepCpuProbe: (() => number | undefined) | undefined;
+	_turnLiveness: TurnLiveness | undefined;
+	readonly _stallKernelLivenessFacts: (() => TurnLivenessKernelFacts | undefined) | undefined;
+	readonly _stallJournaledBashHandles: ((kernelPid: number | undefined) => JournaledBashFacts | undefined) | undefined;
+	readonly _stepCpuProbe: (() => number | undefined) | undefined;
 	/** Kernel residency facts override for the eviction-facing activity term; defaults to the kernel client. */
 	private readonly _kernelResidencyFacts: (() => KernelResidencyFacts | undefined) | undefined;
 	/** Predicate names that already logged a failure this turn (one line per turn, not per sample). */
-	private readonly _stallPredicateFailures = new Set<string>();
+	readonly _stallPredicateFailures = new Set<string>();
 	/** Turn-liveness event kinds already logged this turn (the degraded path must stay countable). */
-	private readonly _turnLivenessLogged = new Set<string>();
+	readonly _turnLivenessLogged = new Set<string>();
 	/**
 	 * Why the watchdog aborted the turn, for the ipython tool's aborted-cell report. Cleared by the
 	 * next agent_start so a new turn never inherits an old cause. Distinct from `_lastStallAbort`,
 	 * which is the roster/terminal-classifier record and deliberately outlives the turn.
 	 */
-	private _lastStallAbortCause: IpythonAbortCause | undefined;
+	_lastStallAbortCause: IpythonAbortCause | undefined;
 	private readonly _rlmTerminalNoticeAbandonAfterMs: number;
 	private readonly _failureWakeQuietWindowMs: number;
-	private _stallLastEvent: { type: string; at: number } | undefined;
-	private readonly _stallInFlightTools = new Map<string, { toolName: string; startedAt: number }>();
+	_stallLastEvent: { type: string; at: number } | undefined;
+	readonly _stallInFlightTools = new Map<string, { toolName: string; startedAt: number }>();
 	/** Per in-flight call: its arguments and when it last produced output, for the silent-step rule. */
-	private readonly _stepOutputWatch = new Map<
+	readonly _stepOutputWatch = new Map<
 		string,
 		{
 			toolName: string;
@@ -2538,12 +2507,12 @@ export class AgentSession {
 		}
 	>();
 	/** Steps stopped as stuck in this run, keyed by their description. */
-	private readonly _stuckStepsThisRun = new Map<string, number>();
+	readonly _stuckStepsThisRun = new Map<string, number>();
 	/**
 	 * Why the deadline verdict just stopped a call, read once by the cancellation text: a silent
 	 * step, or a busy one that outran the exemption budget of an owner-armed watchdog abort.
 	 */
-	private readonly _stepStopCauses = new Map<
+	readonly _stepStopCauses = new Map<
 		string,
 		{ kind: "silent" } | { kind: "time_limit"; budgetMs: number; usedMs: number }
 	>();
@@ -2694,8 +2663,8 @@ export class AgentSession {
 			includeAllExtensionTools: true,
 		});
 
-		this._turnLiveness = this._createTurnLiveness();
-		this._stallWatchdog = this._createStallWatchdog();
+		this._turnLiveness = createSessionTurnLiveness(this);
+		this._stallWatchdog = createSessionStallWatchdog(this);
 		// A restart of the same session picks up whatever the previous process could
 		// not deliver (B10: every in-memory queue answers "where is it after a
 		// restart"). No-op when the session dir holds no sidecar.
@@ -2935,7 +2904,7 @@ export class AgentSession {
 	 */
 	private _refreshAgentLoopRuntimeSettings(): void {
 		this.agent.emptyTurnRetry = this.settingsManager.getEmptyTurnRetrySettings();
-		this.agent.toolTimeout = this._resolvedToolTimeoutConfig();
+		this.agent.toolTimeout = resolvedToolTimeoutConfig(this);
 		this._configureCrossLayerRequestBudget();
 	}
 
@@ -6111,8 +6080,8 @@ export class AgentSession {
 	}
 
 	private _handleAgentEvent = (event: AgentEvent): void => {
-		this._trackStepOutput(event);
-		this._recordStallWatchdogActivity(event);
+		trackStallStepOutput(this, event);
+		recordStallWatchdogActivity(this, event);
 		this._recordFallbackActivity(event);
 		this._createRetryPromiseForAgentEnd(event);
 		this._routeImagesOnAgentEvent(event);
@@ -6251,74 +6220,6 @@ export class AgentSession {
 		);
 	}
 
-	private _createStallWatchdog(): StallWatchdog {
-		const options: StallWatchdogOptions = {
-			enabled: () => this.settingsManager.getStallWatchdogSettings().enabled,
-			warnAfterMs: () => this.settingsManager.getStallWatchdogSettings().warnAfterSeconds * 1000,
-			abortAfterMs: () => {
-				const s = this.settingsManager.getStallWatchdogSettings();
-				return s.abortAfterSeconds > 0 ? s.abortAfterSeconds * 1000 : undefined;
-			},
-			// Both predicates are sampled from inside the watchdog's timer callbacks, so an
-			// exception would escape into the timer, leave the watchdog with no timer armed, and
-			// silently end escalation for this arm cycle (F2). The watchdog is the component that
-			// has to survive other components misbehaving, so a throwing predicate degrades to
-			// "no exemption" and is logged instead.
-			isPaused: () => {
-				try {
-					return this.stallExempted;
-				} catch (error) {
-					this._reportStallPredicateFailure("isPaused", error);
-					return false;
-				}
-			},
-			vouch: () => this._sampleStallVouch(),
-			// The default exemption sink logs without a session identity, and a daemon worker
-			// hosts many sessions per process behind one shared stall-evidence file: a line that
-			// cannot be attributed to the session it vouched for is a line a post-mortem cannot
-			// use (JIT-1B). The formatter is shared with the default sink so the fields cannot drift.
-			onExemptionEvent: (event) => this._logStallExemptionEvent(event),
-			onStage: (info) => this._handleStallWatchdogStage(info),
-			...(this._stallAbortSettleGraceMs === undefined ? {} : { abortSettleGraceMs: this._stallAbortSettleGraceMs }),
-			...(this._stallWatchdogTimers === undefined ? {} : { timers: this._stallWatchdogTimers }),
-		};
-		return new StallWatchdog(options);
-	}
-
-	private _createTurnLiveness(): TurnLiveness {
-		return createTurnLiveness({
-			kernel: () =>
-				this._stallKernelLivenessFacts ? this._stallKernelLivenessFacts() : this._kernelLivenessFactsFromClient(),
-			...(this._stallJournaledBashHandles ? { readJournaledBashHandles: this._stallJournaledBashHandles } : {}),
-			// Read live so an operator can widen or disable the bound without a new session (B7).
-			revivalVouchMaxAgeMs: () => this.settingsManager.getKernelRestartSettings().revivalVouchMaxAgeMs,
-			onEvent: (event) => this._handleTurnLivenessEvent(event),
-		});
-	}
-
-	/**
-	 * Kernel facts for the vouch, adapted from this session's kernel client. O(1) and read-only:
-	 * the watchdog samples it on every touch. Returns undefined when the session has no kernel,
-	 * which is "no facts", never "no work in flight".
-	 */
-	private _kernelLivenessFactsFromClient(): TurnLivenessKernelFacts | undefined {
-		const kernel = this._ipythonKernelProvisioner?.manager;
-		if (!kernel) return undefined;
-		const liveness = kernel.kernelLiveness;
-		return {
-			...(liveness?.protocol === undefined ? {} : { protocol: liveness.protocol }),
-			...(liveness?.latest ? { latest: liveness.latest } : {}),
-			...(liveness?.previous ? { previous: liveness.previous } : {}),
-			rejectedFrames: liveness?.rejectedFrames,
-			consecutiveRejectedFrames: liveness?.consecutiveRejectedFrames,
-			hostRequestCount: kernel.hostRequestCount,
-			hostRequestOldestAgeMs: kernel.hostRequestOldestAgeMs,
-			kernelPid: kernel.kernelPid,
-			hasActiveExecution: kernel.hasActiveExecution,
-			...(kernel.revivalVouch ? { revival: kernel.revivalVouch } : {}),
-		};
-	}
-
 	/**
 	 * Kernel-owned work this session is hosting: a cell executing right now, or live bash()
 	 * handles the kernel's newest heartbeat attests. Residency evidence for the eviction-facing
@@ -6349,194 +6250,8 @@ export class AgentSession {
 		};
 	}
 
-	/**
-	 * The vouch predicate (T1-3). Sampled at the moment of escalation and on every touch, so it
-	 * caches nothing and adds no timer of its own.
-	 *
-	 * The first term is a necessary conjunction, not an optimization: with no tool in flight the
-	 * silence belongs to the model stream, which `streamStallTimeoutMs` owns. Without it a live
-	 * kernel handle would excuse a stuck provider response, which is the one case the judgement
-	 * table explicitly excludes.
-	 */
-	private _sampleStallVouch(): StallVouchFacts | undefined {
-		try {
-			if (this.settingsManager.getStallWatchdogSettings().toolLivenessExemption === false) return undefined;
-			if (this._stallInFlightTools.size === 0) return undefined;
-			const facts = this._turnLiveness?.sample();
-			if (!facts?.vouched) return undefined;
-			return {
-				active: true,
-				reasons: facts.reasons,
-				// Two tiers: movement buys the full budget, mere existence buys the short one that
-				// stays near the pre-exemption abort threshold (M3).
-				tier: facts.progress ? "progress" : "liveness",
-				// The watchdog settles accrued exempt silence when this changes between two samples,
-				// which is what keeps a long build that never stops producing from being charged for
-				// the wall clock it takes (P1). Existence-only facts carry no token and settle nothing.
-				...(facts.movementToken === undefined ? {} : { movementToken: facts.movementToken }),
-				kernel: {
-					...(facts.protocol === undefined ? {} : { protocol: facts.protocol }),
-					...(facts.livenessAgeMs === undefined ? {} : { livenessAgeMs: facts.livenessAgeMs }),
-					...(facts.liveBashHandles === undefined ? {} : { liveBashHandles: facts.liveBashHandles }),
-					hostRequestCount: facts.hostRequestCount,
-					...(facts.kernelPid === undefined ? {} : { kernelPid: facts.kernelPid }),
-					reasons: facts.kernelReasons,
-				},
-			};
-		} catch (error) {
-			this._reportStallPredicateFailure("vouch", error);
-			return undefined;
-		}
-	}
-
-	/**
-	 * Loop-level per-tool-call deadline config (r4 recovery). Both rollback handles
-	 * resolve here on every read: `tools.timeout.enabled: false` and
-	 * `tools.timeout.afterMs: 0` both yield no deadline at all, which also disarms the
-	 * per-tool `executionTimeoutMs` budgets - the global handles are the master switch.
-	 */
-	private _resolvedToolTimeoutConfig(): ToolTimeoutConfig | undefined {
-		const settings = this.settingsManager.getToolTimeoutSettings();
-		if (!settings.enabled || settings.afterMs <= 0) return undefined;
-		return {
-			afterMs: settings.afterMs,
-			...(settings.perTool === undefined ? {} : { perTool: settings.perTool }),
-			vouch: (info) => this._toolTimeoutVouch(info),
-			describeCancellation: (info) => this._describeStuckStep(info),
-		};
-	}
-
-	/** Output bookkeeping behind the silent-step rule: start, last output, end. */
-	private _trackStepOutput(event: AgentEvent): void {
-		const now = Date.now();
-		if (event.type === "agent_start") {
-			this._stepOutputWatch.clear();
-			this._stuckStepsThisRun.clear();
-			this._stepStopCauses.clear();
-		} else if (event.type === "tool_execution_start") {
-			this._stepOutputWatch.set(event.toolCallId, {
-				toolName: event.toolName,
-				args: event.args,
-				startedAt: now,
-				lastOutputAt: now,
-			});
-		} else if (event.type === "tool_execution_update") {
-			const watch = this._stepOutputWatch.get(event.toolCallId);
-			if (watch) watch.lastOutputAt = now;
-		} else if (event.type === "tool_execution_end") {
-			this._stepOutputWatch.delete(event.toolCallId);
-			this._stepStopCauses.delete(event.toolCallId);
-		}
-	}
-
-	/**
-	 * How long a call has produced no output (its elapsed time when untracked). A kernel
-	 * output-counter token that changed since the previous check counts as output too;
-	 * the first token seen is only the baseline.
-	 */
-	private _stepSilentMs(
-		info: ToolTimeoutVouchInfo,
-		movementToken?: string,
-		sampleCpu = false,
-		hostRequestInFlight = false,
-	): number {
-		const watch = this._stepOutputWatch.get(info.toolCallId);
-		if (!watch) return info.elapsedMs;
-		const now = Date.now();
-		// The host executing a request for this cell (rlm.collect, an agent_message wait) is
-		// work in motion; the host-request age bound already stops a wedged handler excusing it.
-		if (hostRequestInFlight) watch.lastOutputAt = now;
-		if (movementToken !== undefined) {
-			if (watch.movementToken !== undefined && watch.movementToken !== movementToken) watch.lastOutputAt = now;
-			watch.movementToken = movementToken;
-		}
-		// CPU of the step's process tree is work too: a quiet compile or test run that keeps
-		// computing is busy. Sampled only at a deadline recheck, never on the hot path.
-		if (sampleCpu) {
-			const cpuMs = this._sampleStepCpuMs();
-			if (cpuMs !== undefined) {
-				if (watch.cpuMs !== undefined && cpuMs - watch.cpuMs >= this.settingsManager.getSilentStuckCpuMs()) {
-					watch.lastOutputAt = now;
-				}
-				// Keep the baseline where output was last seen, so slow CPU accumulates across checks.
-				if (watch.cpuMs === undefined || watch.lastOutputAt === now) watch.cpuMs = cpuMs;
-			}
-		}
-		return Math.max(0, now - watch.lastOutputAt);
-	}
-
-	/**
-	 * Whether an in-flight collect wait is blocked on a child that is still alive. Such a cell is
-	 * silent by design for as long as the child works, which is longer than the host-request age
-	 * bound when the wait is unbounded, and the parent was killed about twenty minutes into a
-	 * healthy child's job. "Alive" is the child's own evidence: an agent event inside the
-	 * silent-step window, or its watchdog excusing the silence. A child that went quiet with no
-	 * excuse stops protecting the wait, so a wedged child cannot hold its parent's step forever.
-	 */
-	private _rlmCollectWaitsOnLiveChild(): boolean {
-		if (this._rlmCollectWaits.size === 0) return false;
-		const now = Date.now();
-		const quietMs = this.settingsManager.getSilentStuckMs();
-		for (const run of this._rlmCollectWaits.keys()) {
-			if (run.settled || (run.status !== "running" && run.status !== "queued")) continue;
-			const child = run.session;
-			// Still starting up: admission and runtime construction are the host's own work.
-			if (!child) return true;
-			const lastEventAt = child.lastAgentEventAt ?? run.lastActivityAt;
-			if (lastEventAt !== undefined && now - lastEventAt < quietMs) return true;
-			if (child.excusedNow) return true;
-		}
-		return false;
-	}
-
-	/** The silent-step threshold for one call: the setting, or the call's own explicit timeout if longer. */
-	private _stuckAfterMs(toolCallId: string): number {
-		const configured = this.settingsManager.getSilentStuckMs();
-		const explicit = explicitTimeoutMs(this._stepOutputWatch.get(toolCallId)?.args);
-		return explicit === undefined ? configured : Math.max(configured, explicit);
-	}
-
-	/**
-	 * Cumulative CPU (ms) of the kernel and its bash handles' process trees, or the kernel's
-	 * own heartbeat CPU when `ps` is unavailable. Undefined means no CPU evidence: the rule
-	 * then falls back to output alone.
-	 */
-	private _sampleStepCpuMs(): number | undefined {
-		try {
-			if (this._stepCpuProbe) return this._stepCpuProbe();
-			const facts = this._stallKernelLivenessFacts
-				? this._stallKernelLivenessFacts()
-				: this._kernelLivenessFactsFromClient();
-			const kernelPid = facts?.kernelPid;
-			const roots = kernelPid === undefined ? [] : [kernelPid];
-			const journal = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
-			if (journal && kernelPid !== undefined) {
-				for (const record of readActiveOrphanProcesses(journal, process.pid, { maxBytes: 256 * 1024 })) {
-					if (record.kernelPid === kernelPid && record.pid !== kernelPid) roots.push(record.pid);
-				}
-			}
-			return readProcessTreeCpuMs(roots) ?? facts?.latest?.cpuMs;
-		} catch {
-			return undefined;
-		}
-	}
-
-	/** A plain description of a step for the model and the duty log: the command or cell preview. */
-	private _describeStepForRecovery(toolCallId: string, toolName: string): string {
-		const args = this._stepOutputWatch.get(toolCallId)?.args as Record<string, unknown> | undefined;
-		const pick = (key: string): string | undefined =>
-			typeof args?.[key] === "string" && (args[key] as string).trim() ? (args[key] as string).trim() : undefined;
-		const code = pick("code");
-		const text =
-			code !== undefined
-				? previewIpythonCode(code).text || code.split("\n")[0] || toolName
-				: (pick("command") ?? pick("path") ?? pick("file_path") ?? toolName);
-		const single = text.replace(/\s+/g, " ").trim();
-		return single.length > 120 ? `${single.slice(0, 119)}…` : single;
-	}
-
 	/** Append one self-recovery action (and its duty-log event); bookkeeping must never break the turn. */
-	private _recordSelfRecovery(record: SelfRecoveryRecord): void {
+	_recordSelfRecovery(record: SelfRecoveryRecord): void {
 		try {
 			this.sessionManager.appendCustomEntry(SELF_RECOVERY_CUSTOM_ENTRY, record);
 		} catch (error) {
@@ -6563,384 +6278,11 @@ export class AgentSession {
 	}
 
 	/**
-	 * The detail a stopped call's cancellation carries: which step, how long it was
-	 * silent, that it was stopped, and what to do instead. A step stuck twice in one
-	 * run is called out so the model stops retrying the same path.
-	 */
-	private _describeStuckStep(info: ToolTimeoutVouchInfo): string {
-		const step = this._describeStepForRecovery(info.toolCallId, info.toolName);
-		const silentMs = this._stepSilentMs(info);
-		const cause = this._stepStopCauses.get(info.toolCallId);
-		this._stepStopCauses.delete(info.toolCallId);
-		const seen = (this._stuckStepsThisRun.get(step) ?? 0) + 1;
-		this._stuckStepsThisRun.set(step, seen);
-		this._recordSelfRecovery({
-			kind: "stuck_step_stopped",
-			toolCallId: info.toolCallId,
-			toolName: info.toolName,
-			step,
-			silentMs,
-			repeated: seen > 1,
-			...(cause?.kind === "time_limit" ? { cause: "time_limit" as const } : {}),
-			at: Date.now(),
-		});
-		if (cause?.kind === "time_limit") {
-			// Not a hang: the call may have been busy the whole time. Saying "no output" here would
-			// send the model hunting for a bug that does not exist.
-			const minutes = (ms: number) => Math.max(1, Math.round(ms / 60_000));
-			return [
-				`Step \`${step}\` was stopped after ${minutes(info.elapsedMs)} min: the ${STEP_TIME_LIMIT_MARKER} for this turn (${minutes(cause.budgetMs)} min, armed because stallWatchdog.abortAfterSeconds is set) is spent. Its last output was ${Math.round(silentMs / 1000)}s ago, so it was not necessarily hung.`,
-				"Output that reaches the session is what keeps a long step inside the budget, so rerunning it unchanged will be stopped at the same point: make it report progress as it goes, split it into shorter steps, or run it as a background handle and poll it.",
-			].join(" ");
-		}
-		const lines = [
-			`Stuck step: \`${step}\` produced no output for ${Math.round(silentMs / 1000)}s and showed no progress, so it was stopped.`,
-			seen > 1
-				? "This same step got stuck before in this run: do not run it again. Two identical hangs mean the approach is the problem, not bad luck; take a different path (a smaller input, an explicit timeout, a background handle you poll, or a different tool)."
-				: "Running it again unchanged will most likely hang the same way; change what makes it hang first (a smaller input, an explicit timeout, a background handle you poll, or a different tool).",
-			"If the next cell reports that the kernel is still busy, retry once: a kernel that stays busy is restarted automatically and its saved state restored.",
-		];
-		return lines.join(" ");
-	}
-
-	/**
-	 * Verdict for a fired per-call deadline, with the stall watchdog as the single
-	 * arbiter (r4 recovery): the extension consumes the same exemption budget the abort
-	 * stage defers by - never a second pool. A paused turn boundary defers like the abort
-	 * stage does, and an exhausted budget cancels when the owner armed the abort stage
-	 * (`stallWatchdog.abortAfterSeconds` > 0). Otherwise the silent-step rule decides,
-	 * with or without liveness evidence: the call is busy while it produces output (its own
-	 * updates, the kernel's output counters, its process tree's CPU, an in-flight host
-	 * request) and stuck once it has produced none for the silent-step threshold
-	 * (`tools.timeout.silentStuckSeconds`, or the call's own longer explicit timeout).
-	 *
-	 * Missing evidence is not proof of a hang: a synchronous cell (subprocess.run, a
-	 * download, numpy compute) freezes the kernel loop so the kernel cannot vouch for it,
-	 * and cancelling on missing evidence killed legitimate long work at the first deadline.
-	 */
-	private _toolTimeoutVouch(info: ToolTimeoutVouchInfo): ToolTimeoutVerdict | undefined {
-		try {
-			const exemption = this._stallWatchdog?.deferToolTimeout(info.toolCallId);
-			// A spent budget is a kill only when the owner armed the watchdog's abort: that budget is
-			// what the abort stage defers by, and the per-call deadline must not outlive it. In the
-			// default warn-only mode nothing else is ever killed for spending it, so a quiet but busy
-			// build (CPU moving, or its own longer explicit timeout) stays with the silent-step rule
-			// below instead of dying at the budget's wall-clock mark.
-			const abortArmed = this.settingsManager.getStallWatchdogSettings().abortAfterSeconds > 0;
-			if (exemption?.exhausted === true && abortArmed) {
-				this._stepStopCauses.set(info.toolCallId, {
-					kind: "time_limit",
-					budgetMs: exemption.budgetMs,
-					usedMs: exemption.usedMs,
-				});
-				return { action: "fail" };
-			}
-			const remainingMs = exemption?.exhausted === true ? undefined : exemption?.remainingMs;
-			if (exemption?.reason === "paused") {
-				return {
-					action: "extend",
-					recheckMs: this._boundToolTimeoutRecheck(info.timeoutMs, remainingMs),
-				};
-			}
-			const stuckAfterMs = this._stuckAfterMs(info.toolCallId);
-			const vouch = this._sampleStallVouch();
-			const hostRequestInFlight =
-				vouch?.reasons?.includes(STALL_VOUCH_REASONS.hostRequestInFlight) === true ||
-				this._rlmCollectWaitsOnLiveChild();
-			const silentMs = this._stepSilentMs(info, vouch?.movementToken, true, hostRequestInFlight);
-			if (silentMs >= stuckAfterMs) {
-				this._stepStopCauses.set(info.toolCallId, { kind: "silent" });
-				return { action: "fail" };
-			}
-			const recheckMs = exemption?.tier === "progress" ? info.timeoutMs : Math.round(info.timeoutMs / 2);
-			return {
-				action: "extend",
-				recheckMs: this._boundToolTimeoutRecheck(
-					Math.max(1_000, Math.min(recheckMs, stuckAfterMs - silentMs)),
-					remainingMs,
-				),
-			};
-		} catch (error) {
-			this._reportStallPredicateFailure("toolTimeout", error);
-			// K3 asymmetry: the deadline's judge failing fails towards NOT killing
-			// (the turn-level watchdog still guards the call), the way the loop-side
-			// vouch throw path does.
-			return { action: "extend", recheckMs: info.timeoutMs };
-		}
-	}
-
-	/** Re-arm delay for a granted extension: never past the remaining budget, never sub-second. */
-	private _boundToolTimeoutRecheck(recheckMs: number, remainingMs: number | undefined): number {
-		if (typeof remainingMs !== "number" || !Number.isFinite(remainingMs) || remainingMs <= 0) return recheckMs;
-		return Math.max(1_000, Math.min(recheckMs, remainingMs));
-	}
-
-	private _reportStallPredicateFailure(predicate: string, error: unknown): void {
-		// One line per predicate per turn: the failure has to be loud (a silently dead watchdog is
-		// worse than the bug it was guarding) but sampling happens on every touch.
-		if (this._stallPredicateFailures.has(predicate)) return;
-		this._stallPredicateFailures.add(predicate);
-		sessionLog.warn("stall watchdog predicate failed; treating it as no exemption", {
-			predicate,
-			error: error instanceof Error ? error.message : String(error),
-			sessionId: this.sessionManager.getSessionId(),
-		});
-	}
-
-	private _logStallExemptionEvent(event: StallExemptionEvent): void {
-		const { msg, fields } = formatStallExemptionEventLog(event);
-		sessionLog.info(msg, { ...fields, sessionId: this.sessionManager.getSessionId() });
-	}
-
-	private _handleTurnLivenessEvent(event: TurnLivenessEvent): void {
-		// B4: the degraded path is a fallback, not a silent no-op. One line per kind per turn keeps
-		// it countable in the daemon log without repeating it on every sample.
-		if (this._turnLivenessLogged.has(event.kind)) return;
-		this._turnLivenessLogged.add(event.kind);
-		const fields = { ...event, sessionId: this.sessionManager.getSessionId() };
-		if (event.kind === "degraded_read") {
-			sessionLog.info("stall watchdog: kernel heartbeat unusable, fell back to journaled bash handles", fields);
-			return;
-		}
-		sessionLog.warn(`stall watchdog: kernel liveness ${event.kind.replaceAll("_", " ")}`, fields);
-	}
-
-	/**
-	 * Re-read the degraded facts when the kernel heartbeat cannot vouch. Bounded to one journal
-	 * read per stall stage (a sync file read, tens of ms) and only while a tool is in flight, so
-	 * the fallback cannot become a polling loop. The result lands in time for the next sampling:
-	 * a deferred abort re-checks at most one warn window later.
-	 */
-	private _refreshStallDegradedFacts(): void {
-		try {
-			if (this._stallInFlightTools.size === 0) return;
-			const facts = this._turnLiveness?.sample();
-			if (!facts || facts.state === "fresh") return;
-			this._turnLiveness?.refreshDegradedFacts();
-		} catch (error) {
-			this._reportStallPredicateFailure("degradedFacts", error);
-		}
-	}
-
-	/** Kernel segment for a stall diagnostics payload; undefined when there is no kernel. */
-	private _collectStallKernelDiagnostics(): StallKernelDiagnostics | undefined {
-		try {
-			const facts = this._turnLiveness?.sample();
-			if (!facts || facts.protocol === undefined) return undefined;
-			return normalizeStallKernelFacts({
-				protocol: facts.protocol,
-				...(facts.livenessAgeMs === undefined ? {} : { livenessAgeMs: facts.livenessAgeMs }),
-				...(facts.liveBashHandles === undefined ? {} : { liveBashHandles: facts.liveBashHandles }),
-				hostRequestCount: facts.hostRequestCount,
-				...(facts.kernelPid === undefined ? {} : { kernelPid: facts.kernelPid }),
-				reasons: facts.kernelReasons,
-			});
-		} catch (error) {
-			this._reportStallPredicateFailure("diagnostics", error);
-			return undefined;
-		}
-	}
-
-	/**
 	 * Why the watchdog aborted the current turn, for the ipython tool's aborted-cell report.
 	 * Read-only; undefined until a stall abort fires, and cleared by the next agent_start.
 	 */
 	get lastStallAbortCause(): IpythonAbortCause | undefined {
 		return this._lastStallAbortCause;
-	}
-
-	/**
-	 * Feeds the stall watchdog: every agent event counts as activity. `agent_start`
-	 * arms it, `agent_end` disarms it, so the watchdog only runs while a turn (or a
-	 * multi-turn run) is in flight.
-	 */
-	private _recordStallWatchdogActivity(event: AgentEvent): void {
-		const watchdog = this._stallWatchdog;
-		if (!watchdog) return;
-		const now = Date.now();
-		this._stallLastEvent = { type: event.type, at: now };
-		if (event.type === "tool_execution_start") {
-			this._stallInFlightTools.set(event.toolCallId, { toolName: event.toolName, startedAt: now });
-			// B4 ordering: the degraded read is bounded by its own lifetime, so refreshing here lets
-			// the first warning already see the journaled handles instead of promising an abort that
-			// the next sampling then defers. It only reads at all when the kernel heartbeat cannot
-			// vouch (a protocol-3 kernel, or one whose frames stopped arriving).
-			this._refreshStallDegradedFacts();
-		} else if (event.type === "tool_execution_end") {
-			this._stallInFlightTools.delete(event.toolCallId);
-		}
-		if (event.type === "agent_start") {
-			this._stallInFlightTools.clear();
-			// A new turn means the aborted turn is history: without this reset a
-			// follow-up turn that completes normally would still be classified
-			// against the earlier abort reason, and the roster would keep showing a
-			// stall marker for a session that recovered.
-			this._lastTurnAbortReason = undefined;
-			this._stallState = undefined;
-			// A new turn also closes every stall-recovery claim scoped to the
-			// previous epoch: the episode that claimed it either recovered (this
-			// turn is its evidence) or ended, and neither may act again.
-			this._turnLifecycleEpoch += 1;
-			// Same rule for the vouch's own state: a degraded journal read from the previous turn
-			// must not excuse this one, and the once-per-turn log throttles restart with the turn.
-			this._lastStallAbortCause = undefined;
-			this._turnLiveness?.reset();
-			this._stallPredicateFailures.clear();
-			this._turnLivenessLogged.clear();
-			watchdog.arm();
-			return;
-		}
-		if (event.type === "agent_end") {
-			this._stallInFlightTools.clear();
-			// The abort took effect: the run produced a terminal event after it.
-			if (this._lastStallAbort) this._lastStallAbort = { ...this._lastStallAbort, settled: true };
-			watchdog.disarm();
-			return;
-		}
-		watchdog.touch();
-	}
-
-	private _collectStallDiagnostics(silentMs: number): StallDiagnostics {
-		const now = Date.now();
-		const lastEvent = this._stallLastEvent;
-		// The exemption segment is measured against the clock without re-sampling the predicates,
-		// so collecting diagnostics cannot perturb the watchdog it describes.
-		const exemption = this._stallWatchdog?.collectExemptionDiagnostics();
-		const kernel = this._collectStallKernelDiagnostics();
-		return {
-			silentMs,
-			busy: {
-				streaming: this.isStreaming,
-				compacting: this.isCompacting,
-				retrying: this.isRetrying,
-				bashRunning: this.isBashRunning,
-			},
-			lastEvent: lastEvent ? { ...lastEvent, ageMs: now - lastEvent.at } : undefined,
-			inFlightToolCalls: [...this._stallInFlightTools.entries()].map(([toolCallId, entry]) => ({
-				toolCallId,
-				toolName: entry.toolName,
-				startedAt: entry.startedAt,
-				elapsedMs: now - entry.startedAt,
-			})),
-			pump: {
-				suspended: this._sessionInputPumpSuspended,
-				requested: this._sessionInputPumpRequested,
-				epoch: this._sessionInputPumpEpoch,
-			},
-			unfinishedActions: this._actionStore.unfinishedActions().length,
-			// Only a claimed exemption gets a segment: `collectExemptionDiagnostics` always returns
-			// a shape, and an empty one in the payload would read as "an exemption was considered
-			// and measured" rather than "nothing was ever excused".
-			...(exemption?.reason ? { exemption } : {}),
-			...(kernel ? { kernel } : {}),
-		};
-	}
-
-	private _handleStallWatchdogStage(info: StallWatchdogStageInfo): void {
-		const settings = this.settingsManager.getStallWatchdogSettings();
-		// The watchdog re-checks its own live flag before firing, but a stage can be in
-		// flight when the user disables it. Never warn about, or abort, a live turn the
-		// user just put back under their own control.
-		if (!settings.enabled) return;
-		// B4: when the kernel heartbeat cannot vouch (stale, absent, or all frames rejected), the
-		// journaled bash children are the only remaining fact. Read them once per stage, before
-		// this stage's diagnostics are collected, so the next sampling sees them: a deferred abort
-		// re-checks within one warn window.
-		this._refreshStallDegradedFacts();
-		const diagnostics = this._collectStallDiagnostics(info.silentMs);
-		const logFields = {
-			stage: info.stage,
-			silentMs: info.silentMs,
-			sessionId: this.sessionManager.getSessionId(),
-			diagnostics,
-		};
-		// Roster marker: survives until the next agent_start so a wedged session
-		// keeps reporting its silence instead of reading as healthy progress.
-		// B9: an unspent exemption means the silence is owned work, not a wedge. The label travels
-		// with the facts so every renderer (roster row, agents view, daemon-attached parent) reads
-		// the same verdict instead of re-deriving one from `silentMs`.
-		const stageExemption = info.exemption;
-		const excused = stageExemption !== undefined && !stageExemption.exhausted;
-		this._stallState = {
-			silentMs: info.silentMs,
-			thresholdMs: info.stage === "warn" ? settings.warnAfterSeconds * 1000 : settings.abortAfterSeconds * 1000,
-			inFlightTools: diagnostics.inFlightToolCalls.map((call) => call.toolName),
-			unsettled: info.stage === "abort_unsettled" || this._stallState?.unsettled === true ? true : undefined,
-			...(excused && stageExemption ? { excused: true, excusedReasons: [...stageExemption.reasons] } : {}),
-		};
-		const kernelReasons = readStallKernelReasons(diagnostics);
-		// F3: a warn-only watchdog (abortAfterSeconds 0) has no abort channel, so an exemption
-		// defers nothing and the vouched copy would promise a deferral that cannot happen. Such a
-		// session gets the unexempted text it has always gotten; the exemption is still in the
-		// diagnostics and the log either way.
-		const messageContext: StallMessageContext = {
-			silentMs: info.silentMs,
-			abortAfterSeconds: settings.abortAfterSeconds,
-			...(settings.abortAfterSeconds > 0 && info.exemption ? { exemption: info.exemption } : {}),
-			...(diagnostics.kernel ? { kernel: diagnostics.kernel } : {}),
-		};
-		const exemptionFields = info.exemption ? { exemption: info.exemption } : {};
-		if (info.stage === "warn") {
-			const message = buildStallWarnMessage(messageContext);
-			sessionLog.warn("stall watchdog: no activity while turn running", { ...logFields, ...exemptionFields });
-			// The warning is the only trace a warn-only watchdog leaves: without it a turn that hung for
-			// two days reads as "没出问题" in the duty log. Excused silence is healthy long work, not an
-			// incident, so it stays out.
-			if (!excused) this._recordDutyEvent({ kind: "stall_warning", silentMs: info.silentMs });
-			this._emit({
-				type: "stall_warning",
-				message,
-				silentMs: info.silentMs,
-				thresholdMs: settings.warnAfterSeconds * 1000,
-				diagnostics,
-			});
-			return;
-		}
-		if (info.stage === "abort") {
-			const message = buildStallAbortMessage(messageContext);
-			sessionLog.error("stall watchdog: aborting silent turn", { ...logFields, ...exemptionFields });
-			// Recorded before the abort so the terminal classifier can tell a
-			// watchdog kill from an ordinary completion; `settled` starts true and
-			// only the abort_unsettled stage below revokes it.
-			this._lastStallAbort = {
-				silentMs: info.silentMs,
-				thresholdMs: settings.abortAfterSeconds * 1000,
-				inFlightTools: this._stallState.inFlightTools,
-				kernelReasons: kernelReasons.length > 0 ? kernelReasons : undefined,
-				settled: true,
-			};
-			// Structured cause for the aborted cell's own report (T1-5): what was vouching when the
-			// budget ran out is part of the story, so both reason lists ride along, deduplicated.
-			this._lastStallAbortCause = {
-				silentMs: info.silentMs,
-				reasons: [...new Set(["stall_watchdog", ...(info.exemption?.reasons ?? []), ...kernelReasons])],
-				...(diagnostics.kernel?.kernelPid === undefined ? {} : { kernelPid: diagnostics.kernel.kernelPid }),
-				at: Date.now(),
-			};
-			this._emit({
-				type: "stall_abort",
-				message,
-				silentMs: info.silentMs,
-				thresholdMs: settings.abortAfterSeconds * 1000,
-				diagnostics,
-			});
-			this.requestAbort({ reason: "stall_watchdog" });
-			return;
-		}
-		// abort_unsettled: the abort fired but the run never produced agent_end.
-		// Emitted as its own type (not a second stall_warning) so "killed but still
-		// running" is countable apart from "looks stuck"; a parent that sees it
-		// records the fact on the run and keeps the kill classification.
-		const message = buildStallAbortUnsettledMessage(messageContext);
-		sessionLog.error("stall watchdog: abort did not settle the turn", { ...logFields, ...exemptionFields });
-		if (this._lastStallAbort) this._lastStallAbort = { ...this._lastStallAbort, settled: false };
-		this._emit({
-			type: "stall_unsettled",
-			message,
-			silentMs: info.silentMs,
-			thresholdMs: settings.abortAfterSeconds * 1000,
-			diagnostics,
-		});
 	}
 
 	private _createRetryPromiseForAgentEnd(event: AgentEvent): void {
