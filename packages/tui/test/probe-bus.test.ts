@@ -1,6 +1,6 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { type CapabilityState, ProbeBus, sync2026FrameWrapping } from "../src/probe-bus.js";
+import { type CapabilityState, ProbeBus, type ProbeVerdict, sync2026FrameWrapping } from "../src/probe-bus.js";
 import { QUERY_DEFAULT_BACKGROUND, QUERY_DEFAULT_FOREGROUND } from "../src/terminal-colors.js";
 
 const DA_ANSWER = "\x1b[?64;1;2;6c";
@@ -447,6 +447,54 @@ describe("ProbeBus", () => {
 			try {
 				assert.ok(!writes.join("").includes("\x1b[?2027$p"));
 				assert.deepStrictEqual(bus.query("grapheme2027"), { verdict: "supported", source: "env-override" });
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("passes every DECRPM Pv through to the 2027 state with the verdict mapping", () => {
+			// Pv 1/2/3 mean the terminal knows the mode, 0/4 mean it does not (or
+			// refuses it); the raw Pv must reach the state intact for the per-mode
+			// decision tables (docs/fork/probe-bus-design.md §3.2).
+			const cases: Array<[0 | 1 | 2 | 3 | 4, ProbeVerdict]> = [
+				[0, "unsupported"],
+				[1, "supported"],
+				[2, "supported"],
+				[3, "supported"],
+				[4, "unsupported"],
+			];
+			assert.ok(cases.length > 0);
+			for (const [pv, verdict] of cases) {
+				const { bus } = startBus({ env: {} });
+				try {
+					assert.strictEqual(bus.handleSequence(`\x1b[?2027;${pv}$y`), true);
+					assert.deepStrictEqual(
+						bus.query("grapheme2027"),
+						{ verdict, source: "probe", decrpmValue: pv },
+						`Pv=${pv}`,
+					);
+				} finally {
+					bus.dispose();
+				}
+			}
+		});
+
+		it("keeps the 2027 decrpmValue across the DA fence", () => {
+			// The fence settles only still-pending capabilities; an answered 2027 must
+			// keep its raw Pv (same state-replacement regression class as the 997
+			// push dropping scheme2031's decrpmValue in wave-30).
+			const { bus } = startBus({ env: {} });
+			try {
+				const seen: CapabilityState[] = [];
+				bus.onChange("grapheme2027", (_cap, state) => seen.push(state));
+				bus.handleSequence("\x1b[?2027;2$y");
+				bus.handleSequence(DA_ANSWER);
+				assert.deepStrictEqual(bus.query("grapheme2027"), {
+					verdict: "supported",
+					source: "probe",
+					decrpmValue: 2,
+				});
+				assert.deepStrictEqual(seen, [{ verdict: "supported", source: "probe", decrpmValue: 2 }]);
 			} finally {
 				bus.dispose();
 			}

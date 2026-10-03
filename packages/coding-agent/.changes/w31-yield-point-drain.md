@@ -1,0 +1,1 @@
+- Changed suspend (Ctrl+Z) and the external editor to drain pending capability-probe answers before yielding the tty, so a late probe reply can no longer print into the shell prompt or the editor.

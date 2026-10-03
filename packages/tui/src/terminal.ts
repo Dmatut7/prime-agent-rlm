@@ -149,7 +149,12 @@ export interface Terminal {
 
 	/**
 	 * Drain stdin before exiting to prevent Kitty key release events from
-	 * leaking to the parent shell over slow SSH connections.
+	 * leaking to the parent shell over slow SSH connections. Also waits out the
+	 * capability-probe window (bounded by maxMs): a settled probe bus proves the
+	 * terminal owes no more probe answers, so none can arrive after stop() hands
+	 * the tty to the shell, a suspended session's foreground process, or an
+	 * external editor. Callers that yield the terminal (exit, suspend, $EDITOR)
+	 * should drain first.
 	 * @param maxMs - Maximum time to drain (default: 1000ms)
 	 * @param idleMs - Exit early if no input arrives within this time (default: 50ms)
 	 */
@@ -472,6 +477,31 @@ export class ProcessTerminal implements Terminal {
 		const endTime = Date.now() + maxMs;
 
 		try {
+			// Wait out the capability-probe window before the idle drain: a settled
+			// bus (DA fence, fallback timer, or dispose) proves the terminal owes no
+			// more probe answers, so none can arrive after stop() and leak into the
+			// shell prompt, a suspended session's foreground process, or an external
+			// editor. The wait shares the drain's maxMs budget, and an already-settled
+			// bus resolves immediately, so a long-running session pays nothing here.
+			if (this._probeBus) {
+				const settleBudget = endTime - Date.now();
+				if (settleBudget > 0) {
+					let settleCap: ReturnType<typeof setTimeout> | undefined;
+					try {
+						await Promise.race([
+							this._probeBus.settled,
+							new Promise<void>((resolve) => {
+								settleCap = setTimeout(resolve, settleBudget);
+							}),
+						]);
+					} finally {
+						if (settleCap) {
+							clearTimeout(settleCap);
+						}
+					}
+				}
+			}
+
 			while (true) {
 				const now = Date.now();
 				const timeLeft = endTime - now;

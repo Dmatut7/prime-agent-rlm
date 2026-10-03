@@ -5,6 +5,8 @@ type FakeUi = {
 	start: () => void;
 	stop: () => void;
 	requestRender: (force?: boolean) => void;
+	/** handleCtrlZ drains pending capability-probe answers before yielding the tty. */
+	terminal: { drainInput: (maxMs?: number) => Promise<void> };
 };
 
 /**
@@ -40,7 +42,7 @@ function spendCellSurface(): FakeSpendCellSurface & { setSubagentSpend: ReturnTy
 type ProcessSignalHandler = () => void;
 
 type InteractiveModePrototypeWithHandleCtrlZ = {
-	handleCtrlZ(this: HandleCtrlZThis): void;
+	handleCtrlZ(this: HandleCtrlZThis): Promise<void>;
 };
 
 /**
@@ -52,10 +54,10 @@ function suspendReceiver(fields: HandleCtrlZThis): HandleCtrlZThis {
 	return Object.assign(Object.create(InteractiveMode.prototype), fields);
 }
 
-/** Invoke `handleCtrlZ` on a receiver over `fields`. */
-function callHandleCtrlZ(fields: HandleCtrlZThis): HandleCtrlZThis {
+/** Invoke `handleCtrlZ` on a receiver over `fields`, awaiting the pre-suspend input drain. */
+async function callHandleCtrlZ(fields: HandleCtrlZThis): Promise<HandleCtrlZThis> {
 	const context = suspendReceiver(fields);
-	(interactiveModePrototype as InteractiveModePrototypeWithHandleCtrlZ).handleCtrlZ.call(context);
+	await (interactiveModePrototype as InteractiveModePrototypeWithHandleCtrlZ).handleCtrlZ.call(context);
 	return context;
 }
 
@@ -71,6 +73,7 @@ describe("InteractiveMode.handleCtrlZ", () => {
 			start: vi.fn(),
 			stop: vi.fn(),
 			requestRender: vi.fn(),
+			terminal: { drainInput: vi.fn().mockResolvedValue(undefined) },
 		};
 		const showStatus = vi.fn();
 		const context: HandleCtrlZThis & { showStatus: (message: string) => void } = { ui, showStatus };
@@ -100,11 +103,12 @@ describe("InteractiveMode.handleCtrlZ", () => {
 		expect(processKillSpy).not.toHaveBeenCalled();
 	});
 
-	test("keeps the process alive while suspended and restores the TUI on SIGCONT", () => {
+	test("keeps the process alive while suspended and restores the TUI on SIGCONT", async () => {
 		const ui: FakeUi = {
 			start: vi.fn(),
 			stop: vi.fn(),
 			requestRender: vi.fn(),
+			terminal: { drainInput: vi.fn().mockResolvedValue(undefined) },
 		};
 		const spend = spendCellSurface();
 		// A tick armed before the suspend: it must be torn down with the cell.
@@ -136,7 +140,7 @@ describe("InteractiveMode.handleCtrlZ", () => {
 			.mockImplementation(((_event: string, _listener: () => void) => process) as typeof process.removeListener);
 		const processKillSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
 
-		const context = callHandleCtrlZ(fields);
+		const context = await callHandleCtrlZ(fields);
 
 		expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 2 ** 30);
 		expect(processOnSpy).toHaveBeenCalledWith("SIGINT", expect.any(Function));
@@ -166,11 +170,12 @@ describe("InteractiveMode.handleCtrlZ", () => {
 		expect(spend.setSubagentSpend).toHaveBeenCalledTimes(2);
 	});
 
-	test("cleans up the temporary handlers if suspension fails", () => {
+	test("cleans up the temporary handlers if suspension fails", async () => {
 		const ui: FakeUi = {
 			start: vi.fn(),
 			stop: vi.fn(),
 			requestRender: vi.fn(),
+			terminal: { drainInput: vi.fn().mockResolvedValue(undefined) },
 		};
 		const spend = spendCellSurface();
 		const fields: HandleCtrlZThis = { ui, ...spend };
@@ -195,9 +200,9 @@ describe("InteractiveMode.handleCtrlZ", () => {
 
 		// The receiver is built first so the restored state is observable after the throw.
 		const context = suspendReceiver(fields);
-		expect(() =>
+		await expect(
 			(interactiveModePrototype as InteractiveModePrototypeWithHandleCtrlZ).handleCtrlZ.call(context),
-		).toThrow(suspendError);
+		).rejects.toThrow(suspendError);
 		expect(ui.stop).toHaveBeenCalledTimes(1);
 		expect(setIntervalSpy).toHaveBeenCalledTimes(1);
 		expect(clearIntervalSpy).toHaveBeenCalledWith(keepAliveHandle);

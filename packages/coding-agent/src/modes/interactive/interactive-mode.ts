@@ -5342,7 +5342,13 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.interrupt", () => this.handleInterruptKey());
 		this.defaultEditor.onAction("app.shortcuts", () => this.showShortcutGuide());
 		this.defaultEditor.onCtrlD = () => this.handleCtrlD();
-		this.defaultEditor.onAction("app.suspend", () => this.handleCtrlZ());
+		this.defaultEditor.onAction(
+			"app.suspend",
+			() =>
+				void this.handleCtrlZ().catch((error: unknown) =>
+					this.showError(error instanceof Error ? error.message : String(error)),
+				),
+		);
 
 		// Global debug handler on TUI (works regardless of focus)
 		this.ui.onDebug = () => {
@@ -5370,7 +5376,13 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
 			void this.showHeartbeatManager();
 		});
-		this.defaultEditor.onAction("app.editor.external", () => this.openExternalEditor());
+		this.defaultEditor.onAction(
+			"app.editor.external",
+			() =>
+				void this.openExternalEditor().catch((error: unknown) =>
+					this.showError(error instanceof Error ? error.message : String(error)),
+				),
+		);
 		this.defaultEditor.onAction("app.prompt.stash", () => this.handlePromptStash());
 		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
 		// Alt+Up/Down browse the pending messages when there are any; otherwise they
@@ -10126,11 +10138,17 @@ export class InteractiveMode {
 		this.signalCleanupHandlers = [];
 	}
 
-	private handleCtrlZ(): void {
+	private async handleCtrlZ(): Promise<void> {
 		if (process.platform === "win32") {
 			this.showStatus("Windows 不支持挂到后台");
 			return;
 		}
+
+		// Yield point: drain pending capability-probe answers before the tty goes to
+		// the suspended session's foreground process (drainInput waits out the probe
+		// window; see Terminal.drainInput). Without it a late answer prints into the
+		// shell prompt.
+		await this.ui.terminal.drainInput(1000).catch(() => undefined);
 
 		// Keep the event loop alive while suspended. Without this, stopping the TUI
 		// can leave Node with no ref'ed handles, causing the process to exit on fg
@@ -11340,13 +11358,17 @@ export class InteractiveMode {
 		this.applyChatExpansion();
 	}
 
-	private openExternalEditor(): void {
+	private async openExternalEditor(): Promise<void> {
 		// Determine editor (respect $VISUAL, then $EDITOR)
 		const editorCmd = process.env.VISUAL || process.env.EDITOR;
 		if (!editorCmd) {
 			this.showWarning("没有配置编辑器。请设置 $VISUAL 或 $EDITOR 环境变量。");
 			return;
 		}
+
+		// Yield point: drain pending capability-probe answers before the editor
+		// inherits the tty (see Terminal.drainInput).
+		await this.ui.terminal.drainInput(1000).catch(() => undefined);
 
 		const currentText = this.editor.getExpandedText?.() ?? this.editor.getText();
 		const temp = createPrivateTempFile("pi-editor-", ".pi.md", currentText);
