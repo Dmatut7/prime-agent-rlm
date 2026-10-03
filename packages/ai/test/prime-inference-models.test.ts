@@ -97,8 +97,8 @@ describe("Prime Inference models", () => {
 			expect(model.input).toEqual(["text", "image"]);
 			expect(model.contextWindow).toBe(1048576);
 			expect(model.maxTokens).toBe(1048576);
-			expect(model.cost.input).toBe(provider === "prime-inference" ? 3.45 : 2.7);
-			expect(model.cost.output).toBe(provider === "prime-inference" ? 17.25 : 13.5);
+			expect(model.cost.input).toBeCloseTo(provider === "prime-inference" ? 3.45 : 0.99, 10);
+			expect(model.cost.output).toBe(provider === "prime-inference" ? 17.25 : 13);
 		}
 	});
 
