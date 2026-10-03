@@ -192,6 +192,12 @@ function continueWith(args: string[]): PublicCommandResult {
  * prompts with @files stay prompts, so `prime-agent fix the bug` is unaffected.
  */
 function rejectBareCommandTypo(args: string[]): PublicCommandResult {
+	// An explicit "--" is the escape hatch: everything after it is a literal
+	// prompt, even a bare command-shaped word. parseArgs drops the marker, so the
+	// check reads the raw args.
+	if (args.includes("--")) {
+		return continueWith(args);
+	}
 	const parsed = parseArgs(args);
 	if (parsed.fileArgs.length > 0 || parsed.messages.length !== 1) {
 		return continueWith(args);

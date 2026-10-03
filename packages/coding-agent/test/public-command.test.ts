@@ -401,6 +401,16 @@ describe("public command routing", () => {
 		expect(console.error).toHaveBeenCalledWith(expect.stringContaining('after "--"'));
 	});
 
+	it("lets a bare command-shaped word through as a prompt after the escape hatch", async () => {
+		// `--` is the documented escape in the rejection text; it must actually work.
+		const args = ["--", "sessions"];
+		await expect(handlePublicCommand(args)).resolves.toEqual({
+			handled: false,
+			args,
+			explicitAgentsView: false,
+		});
+	});
+
 	it("keeps one-word prompts that match no command on the prompt path", async () => {
 		const args = ["refactor"];
 		await expect(handlePublicCommand(args)).resolves.toEqual({
