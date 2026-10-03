@@ -277,6 +277,8 @@ describe("completionClaimWithoutEvidence", () => {
 		["a claim that cites the test run", "修好了，测试全部通过。"],
 		["a claim that cites the count", "Fixed - 47 tests passed."],
 		["a claim that cites a clean exit", "构建完成，exit code 0。"],
+		["a claim that cites the finished verification", "Verification passed: all 8 keys match sources. DONE"],
+		["a claim that cites the completed proof", "Proof complete: every value is backed by its source line. DONE"],
 		["a plain result, not a completion claim", "测试通过。"],
 		["an answer with no claim at all", "结论：配置里的端口写错了，改成 8080 即可。"],
 		["a wait for approval", "已全部完成，等你确认后我再推送。"],
@@ -442,6 +444,8 @@ describe("finish-gate message and records", () => {
 		expect(content).toContain("[finish gate]");
 		expect(content).toContain('"修好了"');
 		expect(content).toContain("2 of at most 4");
+		expect(content).toContain("do not re-run a check that already passed");
+		expect(content).toContain("a citation without the verdict reads as no proof");
 	});
 
 	it("maps a gate release to a decision the owner sees", () => {

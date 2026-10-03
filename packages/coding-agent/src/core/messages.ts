@@ -491,7 +491,7 @@ export function createAutoContinueMessage(
 			: details.reason === "finish_gate"
 				? [
 						`[finish gate] Your last reply declares the work done (${JSON.stringify(details.excerpt ?? "")}), but nothing in it shows the proof: no test run, no command output, no checked file state backs the claim. If the owner left this running, a bare claim reads as a finished task whether or not it is one.`,
-						"Back the claim or drop it. Run the check that proves the work (the tests, the build, the command whose output should have changed) and quote its result, or point at the tool output above that already proves it. If the check fails, fix and verify again. If nothing here can prove it (the owner's environment, credentials, production), say exactly what the owner must run: that is a useful stop, and a bare claim is not.",
+						'Back the claim or drop it. If the transcript above already holds the proof - a check that ran green, a test run, the file state you verified - point at it and quote the result; do not re-run a check that already passed. Only when nothing above proves the claim, run the one check that proves the work (the tests, the build, the command whose output should have changed) and quote its result. Either way, state the verdict in plain words - what was verified and that it passed ("verified against <source>", "tests pass", "exit 0"); a citation without the verdict reads as no proof. If the check fails, fix and verify again. If nothing here can prove it (the owner\'s environment, credentials, production), say exactly what the owner must run: that is a useful stop, and a bare claim is not.',
 						`This is an automatic continue (${details.ordinal} of at most ${details.maxOrdinal} for this request).`,
 					].join("\n")
 				: [

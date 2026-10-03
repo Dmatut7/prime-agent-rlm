@@ -282,7 +282,7 @@ const EN_COMPLETION_CLAIM = /\b(?:all done|done|fixed|completed|finished|resolve
 const CN_EVIDENCE =
 	/测试(?:全部|全|都)?通过|全部通过|跑通了|编译通过|构建(?:成功|通过)|已验证|验证(?:通过|过)了?|校验通过|检查(?:通过|完毕)|用例(?:全部|全)?通过|已核对/u;
 const EN_EVIDENCE =
-	/\b\d+\s+tests?\s+pass(?:ed)?\b|\btests?\s+(?:all\s+)?pass(?:es|ed)?\b|\ball tests pass\b|\btest suite is green\b|\bbuild (?:succeeds|succeeded|passes|passed)\b|\bchecks? pass(?:es|ed)?\b|\bexit(?:ed)?(?:\s+with)?(?:\s+code)?\s+0\b|\blint(?:s)? (?:is|are) clean\b|\bverified\b/i;
+	/\b\d+\s+tests?\s+pass(?:ed)?\b|\btests?\s+(?:all\s+)?pass(?:es|ed)?\b|\ball tests pass\b|\btest suite is green\b|\bbuild (?:succeeds|succeeded|passes|passed)\b|\bchecks? pass(?:es|ed)?\b|\bverification pass(?:es|ed)?\b|\bproof complete\b|\bexit(?:ed)?(?:\s+with)?(?:\s+code)?\s+0\b|\blint(?:s)? (?:is|are) clean\b|\bverified\b/i;
 
 // A task-shaped prompt ("修复这个 bug", "fix the footer") makes a completion claim
 // with no tool work suspicious on its own; pure chat never reaches the gate.
