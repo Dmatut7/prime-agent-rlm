@@ -149,14 +149,20 @@ function armedDelays(spy: { mock: { calls: unknown[][] } }): number[] {
 }
 
 async function advanceTimersUntil(condition: () => boolean): Promise<void> {
-	for (let step = 0; step < 200 && !condition(); step += 1) {
+	// Wall-clock bound, not a turn bound: a turn is one real-fs stat, and a few
+	// hundred turns can elapse faster than a loaded CI runner walks the upload
+	// chain's real I/O (CI wave-21 red: the first attempt never landed in 200
+	// turns). Fake time still advances one timer at a time, so the schedule being
+	// asserted stays deterministic; only the give-up criterion stops racing I/O.
+	const deadline = vi.getRealSystemTime() + 20_000;
+	while (!condition()) {
+		if (vi.getRealSystemTime() > deadline) {
+			throw new Error("Timed out advancing fake timers to the expected condition");
+		}
 		await stat(new URL(import.meta.url));
 		if (!condition() && vi.getTimerCount() > 0) {
 			await vi.advanceTimersToNextTimerAsync();
 		}
-	}
-	if (!condition()) {
-		throw new Error("Timed out advancing fake timers to the expected condition");
 	}
 }
 

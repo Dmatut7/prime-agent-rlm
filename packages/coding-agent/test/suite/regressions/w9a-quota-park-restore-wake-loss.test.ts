@@ -66,6 +66,15 @@ async function parkSession(settings: Partial<Settings>): Promise<Harness> {
 	return harness;
 }
 
+async function waitFor(condition: () => boolean, what: string, timeoutMs = 10_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (condition()) return;
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+	throw new Error(`timed out waiting for ${what}`);
+}
+
 describe("W9-A quota park restore with a lost wake", () => {
 	const harnesses: Harness[] = [];
 
@@ -122,16 +131,27 @@ describe("W9-A quota park restore with a lost wake", () => {
 		// paused so the marker is refused and the park re-arms (wakeRetries: 1).
 		const parked = await parkSession(parkSettings(60));
 		harnesses.push(parked);
+		const readParkEntries = (): Array<Record<string, unknown>> =>
+			parked.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === "provider_quota_park")
+				.map((entry) => (entry as { data?: Record<string, unknown> }).data ?? {});
+		// Poll, don't sleep: the wake fires 60ms after the park, so on a loaded CI
+		// runner nothing orders its chain against a fixed 200ms sleep (waves 16/30/33
+		// went red with the re-arm entry landing after the sleep had elapsed). Two
+		// phases cover both timelines: held pause, the refused admission re-arms; a
+		// wake that landed before the pause instead queues the marker, and the
+		// probe then errors on the drained faux queue and re-arms after release.
 		const pause = parked.session.acquireSessionInputPause();
 		try {
-			await new Promise((resolve) => setTimeout(resolve, 200));
+			await waitFor(() => readParkEntries().length >= 2, "the paused wake refusal to re-arm", 5_000).catch(
+				() => undefined,
+			);
 		} finally {
 			pause.release();
 		}
-		const parkEntries = parked.sessionManager
-			.getEntries()
-			.filter((entry) => entry.type === "custom" && entry.customType === "provider_quota_park")
-			.map((entry) => (entry as { data?: Record<string, unknown> }).data ?? {});
+		await waitFor(() => readParkEntries().length >= 2, "the errored wake probe to re-arm", 5_000);
+		const parkEntries = readParkEntries();
 		expect(parkEntries.length).toBe(2);
 		expect(parkEntries[1]).toMatchObject({ parkCount: 1, wakeRetries: 1 });
 
