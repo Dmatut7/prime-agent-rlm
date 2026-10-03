@@ -1,0 +1,1 @@
+- Added an early-stop criterion to the verification guidance: prove each fact once from its canonical source, and when every part of a claim is already backed by output on screen, stop instead of re-running checks that passed or proving the same fact a second way.

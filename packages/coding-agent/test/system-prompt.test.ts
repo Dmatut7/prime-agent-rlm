@@ -192,6 +192,19 @@ describe("buildRlmPrompt", () => {
 		expect(prompt).toContain("Always assign read/search results to named variables");
 	});
 
+	test("pairs the proof mandate with an early-stop criterion for verification", () => {
+		const prompt = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/.pi/sessions/session.jsonl",
+			activeTools: ["ipython"],
+			allowRecursion: false,
+		});
+
+		expect(prompt).toContain("Proof is what turns a belief into something you can hand over");
+		expect(prompt).toContain("Prove each fact once, from its canonical source, and stop when the evidence converges");
+		expect(prompt).toContain("re-running a check that passed or proving the same fact a second way");
+	});
+
 	test("gives the user communication contract to root agents only", () => {
 		const root = buildRlmPrompt({
 			cwd: "/repo",
