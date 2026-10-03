@@ -5375,7 +5375,7 @@ export class AgentSession {
 				const preparationOutcome = prepareCompactionOutcome(
 					this.sessionManager.getBranch(),
 					this.settingsManager.getCompactionSettings(),
-					this.model?.contextWindow,
+					this.model ? this._sessionContextWindow() : undefined,
 					this._compactionWindowLimits(),
 				);
 				if (preparationOutcome.kind === "skip") {
@@ -8597,7 +8597,7 @@ export class AgentSession {
 		if (this.isStreaming) return undefined;
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return undefined;
-		const contextWindow = this.model?.contextWindow ?? 0;
+		const contextWindow = this._sessionContextWindow();
 		if (contextWindow <= 0) return undefined;
 		// Anti-starvation: a failed or skipped compaction arms a cooldown, and inside it
 		// the gate stands down. A family must not be starved by a compaction that will
@@ -13572,7 +13572,7 @@ export class AgentSession {
 		// resulting entry still attaches to the branch it summarized.
 		const compactionLeafId = this.sessionManager.getLeafId();
 
-		const preparationOutcome = prepareCompactionOutcome(pathEntries, settings, model.contextWindow, {
+		const preparationOutcome = prepareCompactionOutcome(pathEntries, settings, this._registryContextWindow(model), {
 			provider: model.provider,
 			modelId: model.id,
 		});
@@ -15202,9 +15202,27 @@ export class AgentSession {
 	 * model's, never a routed image model's. A smaller-window image model reading one
 	 * screenshot must not compact the owner's whole session; its request is trimmed to
 	 * its window instead (_imageRouteRequestContext).
+	 *
+	 * The window is re-resolved from the registry on every read, not taken from the
+	 * model object captured at selection time: the registry reloads in place when the
+	 * live catalog lands or models.json changes (reloadModelsAfterCatalogChange), and
+	 * a provider re-reporting a smaller window for the serving model (a gateway cap)
+	 * must reach the trigger without waiting for a re-pick or a restart. When the
+	 * registry no longer knows the model (a synthetic custom-id model), the captured
+	 * object's window stands.
 	 */
 	private _sessionContextWindow(): number {
-		return this.model?.contextWindow ?? 0;
+		const model = this.model;
+		return model ? this._registryContextWindow(model) : 0;
+	}
+
+	/**
+	 * The registry's current window for a model, falling back to the captured model
+	 * object when the registry no longer knows it (a synthetic custom-id model).
+	 */
+	private _registryContextWindow(model: Model<any>): number {
+		const resolved = this._modelRegistry.find(model.provider, model.id)?.contextWindow;
+		return resolved && resolved > 0 ? resolved : (model.contextWindow ?? 0);
 	}
 
 	/**
@@ -15246,7 +15264,7 @@ export class AgentSession {
 
 		const settings = this.settingsManager.getCompactionSettings();
 		const runModel = this._runModel();
-		const contextWindow = runModel?.contextWindow ?? 0;
+		const contextWindow = runModel ? this._registryContextWindow(runModel) : 0;
 
 		// Skip overflow check if the message came from a different model.
 		// This handles the case where user switched from a smaller-context model (e.g. opus)
@@ -15495,7 +15513,7 @@ export class AgentSession {
 			return { shrunk: false, reachedTarget: false };
 		}
 		const settings = this.settingsManager.getCompactionSettings();
-		const contextWindow = this.model?.contextWindow ?? 0;
+		const contextWindow = this._sessionContextWindow();
 		const threshold = compactionThresholdTokens(contextWindow, settings, this._compactionWindowLimits());
 		if (threshold <= 0) return { shrunk: false, reachedTarget: false };
 		const branch = this.sessionManager.getBranch();
@@ -17599,7 +17617,8 @@ export class AgentSession {
 	private _isRetryableError(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || !message.errorMessage) return false;
 
-		const contextWindow = this._runModel()?.contextWindow ?? 0;
+		const runModel = this._runModel();
+		const contextWindow = runModel ? this._registryContextWindow(runModel) : 0;
 		if (isContextOverflow(message, contextWindow)) return false;
 
 		// The agent loop already retried this in-place; a session-level retry would
@@ -20603,7 +20622,7 @@ export class AgentSession {
 		const model = this.model;
 		if (!model) return undefined;
 
-		const contextWindow = model.contextWindow ?? 0;
+		const contextWindow = this._sessionContextWindow();
 		if (contextWindow <= 0) return undefined;
 
 		// After compaction, the last assistant usage reflects pre-compaction context size.
