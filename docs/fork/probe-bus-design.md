@@ -168,10 +168,19 @@ cd packages/tui && env -u RLM_DEPTH -u RLM_SESSION_DIR node --test --import tsx 
 
 1. **kitty 对未识别 DECRQM 的应答行为：已销账**（2026-10-03，W20-F，kitty master 源码证据，无需真机）。kitty 对 DECRQM **必答**：`vt-parser.c`（`case DECSTR / '$'` 分支）把 `CSI ? Ps $ p` 派发到 `screen.c` 的 `report_mode_status`；该函数 `ans` 初始 0、switch 无 default 分支、应答恒写出——未识别模式（含 2027，kitty#7799 拒做）答 `CSI ? Ps ; 0 $ y`（Pv=0，"not recognized"），**不存在「沉默」路径**；kitty 只产出 Pv∈{0,1,2}（不答 3/4）。§3.2 的双路径对冲简化为单路径：kitty 形终端一律走 Pv=0 判负。旁证（2031 落地依据）：mode 2031 = `COLOR_PREFERENCE_NOTIFICATION`（`modes.h`），997 推送由 `window.py` 的 `report_color_scheme_preference` 发出（暗=`CSI ? 997 ; 1 n`、亮=`CSI ? 997 ; 2 n`），且 DECSET 2031 是 SIMPLE_MODE——**开启瞬间不补发当前值**，初始配色仍靠启动时的 OSC 10/11 首探，推送只在外观变化（或应用显式发 `CSI ? 996 n` 查询，`screen.c` 有该分支）时到达。
 2. **2027 per-screen 语义未复核**（同 F3 先例）——**仍待真机**（2026-10-03 W24-A 复核：此条无仓内或上游文字证据可销，必须在 kitty/ghostty/foot 真机各录一次进/出 alt 屏行为；复核前只在主屏开）。
-3. **2031 在 tmux 3.6 已支持：已销账**（2026-10-03，W24-A，上游原文复核，无需真机）。tmux master CHANGES 的「CHANGES FROM 3.5a TO 3.6」一节含原文「Add mode 2031 support to automatically report dark or light theme…（from Jonathan Slenders, issue 4353）」，版本归属 3.6 确认。语义仍只代表 pane 透传；外层不推 997n 时退回 OSC 10/11 现状，不恶化。
+3. **2031 在 tmux 3.6 已支持：已销账**（2026-10-03，W24-A，上游原文复核，无需真机）。tmux master CHANGES 的「CHANGES FROM 3.5a TO 3.6」一节含原文「Add mode 2031 support to automatically report dark or light theme…（from Jonathan Slenders, issue 4353）」，版本归属 3.6 确认。语义仍只代表 pane 透传；外层不推 997n 时退回 OSC 10/11 现状，不恶化。**本机 tmux 3.6a 实测补强见第 7 条**（DECRQM 答 `?2031;2$y`、DECSET 后即时补推 997、翻转双帧）。
 4. **Windows conhost/裸 pty 不答 DA：已销账**（2026-10-03，W24-A，仓内测试证据，无需真机）。兜底定时器路径已有覆盖并钉死：`probe-bus.test.ts`「marks still-pending capabilities unknown when the fallback timer fires without a DA」+「lets the first settle win: a DA after the timer changes nothing」——栅栏上线后最后保险仍在。
-5. **OSC 10/11 在 tmux 下的可达性**随版本/配置（allow-passthrough）漂移——**设计已接受、仓内兜底复核在案**（2026-10-03，W24-A）：总线不为此做特判，unknown 即退回现状；COLORFGBG 启发式兜底仍在 `terminal-colors.ts:163-178`（经 `getTerminalBackgroundKind` `:193-199` 串接），unknown 判负路径有 `probe-bus.test.ts` 用例钉住。残余仅是被动观察项（可达性矩阵随真机配置漂移），无待办动作。
+5. **OSC 10/11 在 tmux 下的可达性**随版本/配置（allow-passthrough）漂移——**设计已接受、仓内兜底复核在案**（2026-10-03，W24-A）：总线不为此做特判，unknown 即退回现状；COLORFGBG 启发式兜底仍在 `terminal-colors.ts:163-178`（经 `getTerminalBackgroundKind` `:193-199` 串接），unknown 判负路径有 `probe-bus.test.ts` 用例钉住。残余仅是被动观察项（可达性矩阵随真机配置漂移），无待办动作。**本机 tmux 3.6a 实测补强（W29-R05，第 7 条）**：client attached 且外层应答 OSC 时，pane 内 OSC 10/11 由 tmux 用 attach 存值**代答**（非透传，`allow-passthrough=off` 下亦然）——该情形下 oscColors 探测可达；detached 或外层不答时仍沉默 → 栅栏判负 → 兜底，接受域不变。
 6. **daemon wire 协议零改动：已销账**（2026-10-03，W24-A，git 证据，无需真机）。探测总线阶段 1-6 提交（`b547ea5a2`/`1b9eeceac`/`193903eb8`/`4a489d1f2`）触碰面仅 `packages/tui/**` + 本文档 + `cli/args.ts` env 文档；`daemon-protocol.ts` 与命令/事件兼容表零触碰，全部交互发生在 TUI 进程与本机终端之间。
+7. **tmux 3.6a 本机实测台账：已入档**（2026-10-03，W29-R05，真机字节级，原始数据 `/tmp/wave29/tmux-probe.md` 及同目录 JSON）。要点：
+   - **DECRQM 应答矩阵（detached pane）**：鼠标族 `?12/?1004/?1006/?2004` 全答且 Pv 跟踪 pane 模式位（set→1、reset→2）；`?2031` 答 `?2031;2$y`（3.6 支持确认）；**`?2026`/`?2027`/kitty `?u` 沉默**——tmux 对不识别模式不答 Pv=0 而是沉默，恰与 DA 栅栏语义匹配（kitty 的 Pv=0 判负是另一路径，两路径均已闭环）。
+   - **DA 栅栏在 tmux 实测可用**：tmux 代 pane 答 `\x1b[?1;2;4c`（带 `?` 前缀，§3.1 陷阱不触）；总线线束（真实 `ProbeBus`+`StdinBuffer`）在 tmux pane 内 3ms 经栅栏封盘，fallback 1000ms 未动用。
+   - **tmux 3.6a client attach 向外层发 `\x1b[?2031h` + `\x1b[?996n`**（附 OSC 10/11 查询、DA1/DA2、XTVERSION）——主动订阅外层 2031 推送；未观察到任何 2026 相关外发（与「2026 中继 3.7 起」一致，3.7 行为本机不可测）。
+   - **2031 推送行为（异于 kitty，第 1 条的对照）**：pane 内 DECSET 2031 后 tmux **立即补推当前值**（kitty 不补）；pane 内 `CSI ? 996 n` 查询有答（detached 时沉默）；外层翻转（997;2n）→ tmux 重询外层 OSC 10/11 自行推导明暗 → pane 收到**先旧值后新值两帧**——消费方须容忍翻转瞬态旧值（总线把 997 路由成 OSC 重查询，收敛方向正确）。
+   - **怪癖登记：tmux 3.6a 的 DECRPM 2031 恒答 Pv=2**（DECSET 生效、推送流动期间亦然），DECRQM 不可用于验证 2031 是否开启——**推送流即真值**；未来若加「DECSET 后校验」逻辑须豁免 tmux。
+   - **生产 TUI 实测**（chat-simple + pipe-pane 字节级）：burst = `\x1b[?2004h` + 五查询 + OSC 10/11 + `\x1b[c`，随后 `\x1b[?2031h`（2031 判 supported 自动开）+ `\x1b[>4;2m`（kitty 判负 → modifyOtherKeys 兜底）；2026 判负后渲染帧仍按 §3.2 决策表包 `\x1b[?2026h/l`；生产不发 `16t`（images 门控，`terminal.ts:375`）；无 DECSET 2027。
+   - **工具注意**：`PI_TUI_WRITE_LOG` 只钩 TUI 渲染写（`terminal.ts:580`），probe burst 等直写 stdout 的字节不入该日志；抓探测字节用 pipe-pane 或总线线束。
+   - **仍待 kitty/ghostty 真机**：真实外层终端下 attach 订阅握手与翻转双帧模式复现（本条数据来自假外层终端，tmux 侧行为确凿，外层侧为 persona 模拟）；2027 per-screen（第 2 条）；tmux 3.7 的 2026 应答。
 
 ## 8. 证据索引
 
@@ -181,4 +190,5 @@ cd packages/tui && env -u RLM_DEPTH -u RLM_SESSION_DIR node --test --import tsx 
 - tmux CHANGES（3.6 DECRQM 鼠标族+2031；3.7 DECRQM/DECSET 2026）：https://github.com/tmux/tmux/blob/master/CHANGES
 - kitty#7799（拒做 2027）：https://github.com/kovidgoyal/kitty/issues/7799
 - kitty#8574（2031 已完成）：https://github.com/kovidgoyal/kitty/issues/8574
+- W29-R05 tmux 3.6a 本机实测：`/tmp/wave29/tmux-probe.md`（DECRQM 矩阵、总线协商、2031 推送、attach 外发字节、生产 TUI burst；原始 JSON/日志同目录）
 - 本仓行号（`HEAD=788e24897` 实测）：`terminal.ts:29,253,256-273,307-320,330-340,342-356,576-610`；`stdin-buffer.ts:380,383-384,404-411`；`tui.ts:832-840,940-945,1417-1435,2140,2186,2219,2320,2350,2391,2469`；`fullscreen.ts:1031,1048`；`keys.ts:380,425`；`terminal-image.ts:66-126,149-156,178`；`terminal-colors.ts:148-206`；`utils.ts:4,146-195`
