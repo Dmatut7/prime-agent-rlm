@@ -403,6 +403,105 @@ describe("TUI fullscreen mode", () => {
 		tui.stop();
 	});
 
+	it("a submit-style scrollToBottom lands on the newest row and clears the count", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput(WHEEL_UP);
+		await terminal.waitForRender();
+		chat.lines = lines(40);
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.strictEqual(tui.getScrollInfo()?.following, false);
+		assert.ok(terminal.getViewport().join("\n").includes("↓ 20 行新内容"));
+
+		// The call the submit path makes (interactive-mode wires ui.scrollToBottom()).
+		tui.scrollToBottom();
+		await terminal.waitForRender();
+
+		const viewport = terminal.getViewport();
+		assert.strictEqual(viewport[7], "Line 39", "the window shows the newest row");
+		assert.strictEqual(viewport[8], "> prompt");
+		assert.strictEqual(tui.getScrollInfo()?.following, true);
+		assert.strictEqual(tui.getScrollInfo()?.unseenBelow, 0);
+		const screen = viewport.join("\n");
+		assert.ok(!screen.includes("新内容"), "the loud indicator clears with the pause");
+		assert.ok(!screen.includes("回到底部"), "the follow hint clears too");
+		tui.stop();
+	});
+
+	it("scrollToBottom before the submitted content lands still ends on it", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20));
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput(WHEEL_UP);
+		await terminal.waitForRender();
+		assert.strictEqual(tui.getScrollInfo()?.following, false);
+
+		// The submit handler scrolls first; the user message renders a tick later.
+		tui.scrollToBottom();
+		chat.lines = lines(23);
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		assert.strictEqual(terminal.getViewport()[7], "Line 22");
+		assert.strictEqual(tui.getScrollInfo()?.following, true);
+		tui.stop();
+	});
+
+	it("content arriving while paused never moves the window and accumulates the count", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput(WHEEL_UP);
+		await terminal.waitForRender();
+		// Row 7 carries the follow hint; the rows above it are the frozen window.
+		const frozen = terminal.getViewport().slice(0, 7);
+
+		chat.lines = lines(30);
+		tui.requestRender();
+		await terminal.waitForRender();
+		chat.lines = lines(35);
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		const viewport = terminal.getViewport();
+		assert.deepStrictEqual(viewport.slice(0, 7), frozen, "appends while paused never steal the scroll position");
+		assert.strictEqual(viewport[8], "> prompt", "the dock stays pinned");
+		assert.strictEqual(tui.getScrollInfo()?.following, false);
+		assert.strictEqual(tui.getScrollInfo()?.unseenBelow, 15);
+		tui.stop();
+	});
+
+	it("dock growth while paused does not count displaced rows as new content", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput(WHEEL_UP);
+		await terminal.waitForRender();
+		assert.strictEqual(tui.getScrollInfo()?.unseenBelow, 0);
+
+		// The draft wraps and the dock grows; nothing new arrived in the
+		// transcript, so the rows pushed below the window are not "new content".
+		dock.lines = ["> prompt", "draft line 2", "draft line 3", "footer"];
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.strictEqual(tui.getScrollInfo()?.unseenBelow, 0);
+		assert.ok(!terminal.getViewport().join("\n").includes("新内容"));
+
+		// Five transcript rows arrive while the dock stays tall: exactly five are new.
+		chat.lines = lines(25);
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.strictEqual(tui.getScrollInfo()?.unseenBelow, 5);
+		assert.ok(terminal.getViewport().join("\n").includes("↓ 5 行新内容"));
+		tui.stop();
+	});
+
 	it("scrolling back to the bottom resumes following", async () => {
 		const { terminal, tui, chat, dock } = setup(lines(20));
 		tui.enterFullscreen({ scroll: [chat], dock });
@@ -1735,5 +1834,42 @@ describe("FullscreenViewport reveal marker", () => {
 		const frame = viewport.composeFrame(transcript, ["dock"], 11);
 		assert.ok(frame.some((line) => line.includes("row 39")));
 		assert.ok(viewport.isFollowing());
+	});
+});
+
+describe("FullscreenViewport scroll commands vs a pending click hold", () => {
+	// A click that opens rows below itself arms a one-frame hold keeping the
+	// clicked row put. An explicit jump issued before that frame is newer than
+	// the click and must win: the submit path relies on scrollToBottom() being
+	// absolute, and Ctrl+Shift+↓ right after a click must not bounce back.
+	function pausedViewport(): { viewport: FullscreenViewport; transcript: string[] } {
+		const viewport = new FullscreenViewport();
+		const transcript = Array.from({ length: 40 }, (_, index) => `row ${index}`);
+		viewport.composeFrame(transcript, ["dock"], 10);
+		viewport.scrollBy(-20);
+		viewport.composeFrame(transcript, ["dock"], 10);
+		return { viewport, transcript };
+	}
+
+	it("scrollToBottom beats a hold armed by a click", () => {
+		const { viewport, transcript } = pausedViewport();
+		// Screen row 4 is transcript row 15; the click opens three rows below it.
+		viewport.holdForClick(4, 3);
+		transcript.splice(16, 0, "open 0", "open 1", "open 2");
+		viewport.scrollToBottom();
+		const frame = viewport.composeFrame(transcript, ["dock"], 10);
+		assert.strictEqual(viewport.isFollowing(), true);
+		assert.strictEqual(frame[8], "row 39");
+		assert.strictEqual(viewport.scrollInfo().unseenBelow, 0);
+	});
+
+	it("scrollToTop beats a hold armed by a click", () => {
+		const { viewport, transcript } = pausedViewport();
+		viewport.holdForClick(4, 3);
+		transcript.splice(16, 0, "open 0", "open 1", "open 2");
+		viewport.scrollToTop();
+		const frame = viewport.composeFrame(transcript, ["dock"], 10);
+		assert.strictEqual(viewport.scrollInfo().linesAbove, 0);
+		assert.strictEqual(frame[0], "row 0");
 	});
 });

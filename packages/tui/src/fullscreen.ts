@@ -242,11 +242,14 @@ export class FullscreenViewport {
 		if (this.following) {
 			this.unseenLines = 0;
 		} else {
-			// Rows appended while the window was paused are new to whoever scrolled up. Clamp
-			// to what is actually below the window: a rebuilt or compacted transcript re-anchors
-			// every row, and a count larger than linesBelow would claim content that is not there.
+			// Rows appended while the window was paused are new to whoever scrolled up.
+			// Count transcript growth, not maxScroll growth: a taller dock or header
+			// shrinks the window and pushes already-seen rows below it, and those rows
+			// are not new. Clamp to what is actually below the window: a rebuilt or
+			// compacted transcript re-anchors every row, and a count larger than
+			// linesBelow would claim content that is not there.
 			this.unseenLines = Math.min(
-				this.unseenLines + Math.max(0, maxScroll - this.lastMaxScroll),
+				this.unseenLines + Math.max(0, transcript.length - this.lastTranscript.length),
 				Math.max(0, maxScroll - this.scrollTop),
 			);
 		}
@@ -1144,12 +1147,18 @@ export class FullscreenViewport {
 	scrollToTop(): void {
 		this.scrollTop = 0;
 		this.following = this.lastMaxScroll === 0;
+		// An explicit jump is newer than the click that armed the hold; the next
+		// frame must not re-anchor the window to that clicked row.
+		this.clickHold = undefined;
 	}
 
 	scrollToBottom(): void {
 		this.scrollTop = this.lastMaxScroll;
 		this.following = true;
 		this.unseenLines = 0;
+		// Same as scrollToTop: the submit path and the follow key rely on this
+		// being absolute, even right after a click armed a one-frame hold.
+		this.clickHold = undefined;
 	}
 
 	/**

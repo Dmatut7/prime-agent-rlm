@@ -5890,6 +5890,9 @@ export class InteractiveMode {
 
 	private setupEditorSubmitHandler(): void {
 		this.defaultEditor.onSubmit = async (text: string) => {
+			// Submitting returns the viewport to the live tail: the user just sent
+			// something and expects to see it (the wave-25 "not following" gap).
+			this.ui?.scrollToBottom?.();
 			const streamingBehavior = this.submittedInputBehavior;
 			this.submittedInputBehavior = "steer";
 			if (this.queueSelection?.isBrowsing && !this.pendingQueueEdit) {
@@ -6742,6 +6745,12 @@ export class InteractiveMode {
 		// reset with it. (agent_start on auto-retry does not reset the tracker.)
 		if (event.type === "message_start") {
 			this.prepareFeatureHintRun(event.message);
+		}
+		if (event.type === "message_start" && event.message.role === "user") {
+			// The user's own message materializing (typed, queued-drained, or restored)
+			// returns the viewport to the tail; agent messages arriving while the user
+			// reads up must not yank the scroll position.
+			this.ui?.scrollToBottom?.();
 		}
 		if (event.type === "message_start" && (event.message.role === "user" || isAgentSessionMessage(event.message))) {
 			this.contextUsageTokenBaseline = 0;
