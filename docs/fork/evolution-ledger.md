@@ -14,16 +14,15 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-04，wave-37 已 SHIP）
+## 当前状态（2026-10-04 晚，wave-38 已 SHIP）
 
-- HEAD = 见 git log（四批：CI 红根治、逃生口+分析器、FORK_NOTES+账本）。
-- wave-37 首要：CI 八波连红根治——rename 双计（Linux 时序）+ spawn 测试时序假设；
-  机理 /tmp/wave37/ci-red.md。教训入账：**主席每波收工必须看一眼 fork CI**
-  （gh run list -R Dmatut7/prime-agent-rlm --limit 3），本机全绿骗了八波。
-- MODEL-PERSIST lane 被老板打断未交付（探针已清场），主题回 wave-38 首位。
-- 暖池遥测消费面第一步：scripts/warm-pool-stats.mjs（真实首读 hit4/miss4）。
-- 走查抓到 F2 逃生口假承诺（已修+钉）。
-- 门禁：check EXIT 0、hygiene OK、python 769 绿、单测复扫、CI 以本波 push 后 run 为准。
+- HEAD = 见 git log（四批：模型持久化、CI 硬化、Z.AI FlashX、FORK_NOTES+账本）。
+- wave-38：模型持久化四件套落地（预检/被拒不残留/三态/显式回落）；坑：预检误杀扩展注册
+  模型，扩展在场时让位 worker 校验（4685 套件钉住）。CI TS 面归因闭环，两例活 flake 硬化，
+  结论「CI 不需豁免」。Z.AI FlashX 入表。
+- 磁盘事故已处理：/tmp 证据库 6.2GB + 旧 venv 806MB + claude 旧版本 650MB 清除（释放 ~4.1GB）；
+  规则=每波证据随波清。session-artifacts 2.2G 保留策略待老板点头。
+- 门禁：check EXIT 0、hygiene OK、单测 9564 全绿、ai 全绿、suite 复扫为准；CI 盯本波 run。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -104,13 +103,13 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
   把在跑会话归档。犯了就是事故，写进 FORK_NOTES 向老板披露。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-38 候选）
+## 下一波主题（wave-39 候选）
 
-1. 【模型持久化一致性落地】（wave-37 被打断的主题回炉）：三态判定 + Roo/OpenCode/Cline/Continue
-   四家模板（/tmp/wave37/research.md）；含被拒不残留、unknown 不误清、--model 显式报错、
-   失效对账显式回落。需独占 agent-session.ts。
-2. 【Z.AI 表核】FlashX 上架 + 5-Turbo 定价页缺席——跑 generate-models.ts 核准。
-3. 【暖池遥测二期】消费面：status/doctor 展示（capability 演进方案）或分析器接 ci-honesty。
-4. 【第八刀】stall 簇（748 行/45 成员）或 image-routing（358 行/20 成员）。
-5. 【CI 红的 TS 间发】waves 30/33 各有一次 TS shard 红（CI-RED lane 报告末节）——下波拉日志归因。
-6. 【记忆帽裁决】仍待老板三选一（OpenCode reserved=10000 参照在手；帽应按窗占比的证据也在手）。
+1. 【记忆帽裁决输入齐了】OpenCode reserved=10000 + 帽应按窗占比（GLM 1M vs 128K 输出）+
+   缓存经济学（命中 ×0.26 vs ×1.4）——老板三选一可议；turn 级内存观测可先落。
+2. 【第八刀】stall 簇（748 行/45 成员/churn 32）。
+3. 【暖池遥测消费面】capability 演进方案；provider 归因解析。
+4. 【模型持久化收尾】agent 中途自行切模型的确认流评估（MODEL-PERSIST 报告遗留项）；
+   /autocompact per-model 保存三裁决。
+5. 【CI 绿化保持】每波收工 gh run list 确认已成规则；wave-43 前两处硬化持续绿则关闭 flake 面。
+6. 【首请求服务端窗口】≤1.5s 有界等待（per-model 最后一块）。
