@@ -1,0 +1,1 @@
+- Added byte-stability invariant tests pinning the harness digest (`formatHarnessStateForPrompt`) and the compaction-handoff memory segment to render byte-identically across entry insertion order, wall-clock gaps, JSON round-trips, and query-term Map order.
