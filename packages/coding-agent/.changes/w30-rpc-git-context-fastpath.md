@@ -1,0 +1,1 @@
+- Sped up daemon-worker session creation by reading branch/commit from git refs files instead of spawning three `git` processes, cutting warm-daemon RPC startup by ~20ms.

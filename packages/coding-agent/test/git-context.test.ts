@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -80,6 +80,46 @@ describe("captureGitContext", () => {
 	});
 
 	it("returns null outside a git repo", () => {
+		expect(captureGitContext(dir)).toBeNull();
+	});
+
+	it("reads a packed branch ref after pack-refs", () => {
+		initRepo(dir);
+		const sha = commit(dir, "init");
+		git(dir, "pack-refs", "--all");
+
+		expect(captureGitContext(dir)).toEqual({ branch: "main", commit: sha });
+	});
+
+	it("reports an unborn branch with no commit", () => {
+		initRepo(dir);
+
+		expect(captureGitContext(dir)).toEqual({ branch: "main" });
+	});
+
+	it("reads the repo context from a nested subdirectory", () => {
+		initRepo(dir);
+		const sha = commit(dir, "init");
+		const nested = join(dir, "a", "b");
+		mkdirSync(nested, { recursive: true });
+
+		expect(captureGitContext(nested)).toEqual({ branch: "main", commit: sha });
+	});
+
+	it("reads the worktree branch through a .git file", () => {
+		initRepo(dir);
+		commit(dir, "init");
+		const worktreeDir = join(dir, "wt");
+		git(dir, "worktree", "add", "-q", "-b", "wt-branch", worktreeDir);
+
+		expect(captureGitContext(worktreeDir)?.branch).toBe("wt-branch");
+	});
+
+	it("defers to the git CLI when GIT_DIR overrides discovery", () => {
+		initRepo(dir);
+		commit(dir, "init");
+		vi.stubEnv("GIT_DIR", join(dir, "does-not-exist"));
+
 		expect(captureGitContext(dir)).toBeNull();
 	});
 });
