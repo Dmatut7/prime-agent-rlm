@@ -1,4 +1,15 @@
-## 2026-10-03 wave-30 七路：启动性能回收两刀、997 丢字段修复、记忆归并工序
+## 2026-10-03 wave-31 八路：worker create 拆解回收、probe-bus 硬化、模型表刷新、buildId 互杀修复
+
+- worker create 拆出构成（316ms：模块图 147 / spawn 25 / 建连轮询 25 / 握手 15 / create 处理 60-80 / persist 28-32）并回收两刀安全项：daemon 模式跳过被丢弃的 boot SessionManager（-16ms/worker）、内核 prewarm 推迟一个 macrotask（21ms 哈希移出 create 响应路径）——配对中位 −25ms、稳态 ~303→278ms、离群点消失。暖 worker 池提案已出（CC 2.1.136-238 九条实践族当设计清单），下波评审。
+- get_state 复核为阴性结果：处理器本身 2.3ms、attach 握手已携带预聚合快照——预热范式现状即已实现，剩余 823ms 全在 worker spawn 与客户端模块加载。零改动立项关闭。
+- probe-bus 硬化：drainInput 先等探测总线 settled 再排空；suspend 与开 editor 两个让出点补上 drain（探测应答不再可能漏进 shell 提示符或编辑器）；10 例不变量测试钉住「探测回复永不进用户可见流」「detection 后 stdin 必恢复」「997 推送全值传递」。
+- buildId 互杀修复：tsx 入口与 bundle 入口混用不再互相替换 daemon（异入口降级为 reuse+警告），同入口 rebuild 保护不打折（活体 A/B 三场景实证）。
+- Anthropic refusal 复核：stop reason 本就覆盖（映射 error + 诊断），真缺口是 stop_details 的 category/explanation 被丢弃——现带入错误消息。
+- 模型表刷新：GLM-5.2/5.3 确认 1M 窗口（逐型号对照官方页，4.x 仍 200K），吸收上游漂移（gpt-5.2-pro 等新增、openrouter glm-5.3 改价回落），Prime 默认 z-ai/glm-5.2→5.3、vercel 默认 glm-5.1→5.3；anthropic 默认已是 opus-5-5，sonnet 4.5 弃用无需动。autocompact per-model 化出设计提案（compactionPerModel 覆盖表 + 零迁移）待裁决。
+- 走查实证（36 张截图，120x40/80x24 双档）：wave-29/30 新功能全部在役正常；新发现 P1 turn 标题误计 ambient 为本会话改动（本波已修并钉测试）、P2 attach 窗 alt+x 二击确认偶发不落（约 2/3 成功率，已立项 wave-32）。
+- 门禁：check EXIT 0、hygiene OK、单测 9489 全绿、suite 1664/1664（acp-mode 一例负载抖动隔离即绿）、tui 1262/1262、python 760（1 例负载阈值隔离即绿）、ai 触及文件绿、evals 不动。需要重新编译并重启后才生效。
+
+
 
 - 启动性能两刀（对 wave-29 画像发现的回归动刀）：① `enableCompileCache()` 挪到 cli-main 静态导入图之前——此前它在 runCli() 体内才执行，~5MB 导入图从未吃到编译缓存；暖 daemon 首帧 626→560ms、冷启 888-978→752-814ms、`--help` 184→146ms。② worker 创建链的 git 上下文采集从 3×spawnSync(git) 改为直接读 HEAD/refs 文件（packed-refs/unborn/worktree/GIT_DIR 等非常规一律回退原路径）——RPC get_state 844.2→822.9ms、create 段 −30ms。首帧对基线从 +24% 收到 +15%；最大剩余杠杆是 worker create ~300ms（预热/池化，待立项）。
 - probe-bus 997 推送不再丢 DECRPM 已记的 decrpmValue（推送分支曾整体替换 scheme2031 状态把该字段抹掉）；同值推送的重复噪声通知顺带消掉，DECSET/OSC 重查询行为不变。

@@ -14,22 +14,21 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-03 晚，wave-30 已 SHIP）
+## 当前状态（2026-10-03 深夜，wave-31 已 SHIP）
 
-- HEAD = 见 git log（六批：PERF-RPC git 快路径、PERF-TUI compile-cache 前提、probe-bus 997、
-  MEM-3 consolidation、EX-2 parity、FORK_NOTES+账本）。
-- wave-30 关键数字：暖 daemon 首帧 626→560ms（对基线 +24%→+15%）、冷启 888-978→752-814ms；
-  RPC get_state 844.2→822.9ms、create 段 -30ms（git 3×spawnSync→读文件）。
-  剩余最大杠杆：worker create ~300ms（预热/池化）；tsc 模块图双进程串行 ~610ms（结构性）。
-- 记忆阶段 3 交付但带出硬结论：12KiB 帽在真库（1577 条、中位行宽 303B、id 占 40%）靠
-  merge/delete/rename 不可达（需 ~97% 削减）；三选项（archive 分层/放宽帽/id 重键）在
-  /tmp/wave30/mem3-consolidation.md，待老板裁决——裁决前 enforceIndexCap 保持默认关。
-- B07 前缀续跑维持销账（转立项三触发条件：重花账单 >子代理周耗 5% / 供应商链收敛到 prefill /
-  上游公开续跑规范）。
-- 待裁决新增：tsc 入口与 bundle 入口 buildId 互判 stale，混用 prime-agent 与 prime-agent.sh
-  会互相替换 daemon（PERF-RPC lane 实测撞上）。
-- 门禁：check EXIT 0、hygiene OK、单测 9483 绿（4 例负载抖动隔离即绿）、suite 1664/1664、
-  tui 1252/1252、python 760（1 例负载阈值隔离即绿）、evals 77 绿。
+- HEAD = 见 git log（七批：worker create 两刀、probe-bus 硬化+drain 接线、refusal stop_details、
+  模型表刷新、buildId 入口门槛、ambient 标题计数、FORK_NOTES+账本）。
+- wave-31 关键数字：worker create 配对中位 -25ms（稳态 303→278ms）；get_state 复核为阴性
+  （握手已带预聚合快照，立项关闭）；首帧余 +15% 的最大剩余杠杆 = worker 模块图 147ms
+  （瘦入口/结构方案）+ 暖 worker 池（提案在 /tmp/wave31/worker-create.md）。
+- 走查新立项：P2 attach 窗 alt+x 二击确认偶发不落（~2/3，/tmp/wave31/ux-walkthrough.md）。
+- 待裁决：记忆帽三选一（archive 分层/放宽帽/id 重键，wave-30 起挂账）；autocompact
+  per-model 化（compactionPerModel 提案，/tmp/wave31/ai-models.md）；暖 worker 池（CC 九条
+  实践族清单在手）。
+- 调研增量（/tmp/wave31/research.md 由 lane 返回全文，主席落盘 /tmp/wave31/）：CC 暖池九条
+  与 per-model 窗口八条是下波两个直接输入；Sonnet 5.5/Opus 5.5 已 1M 默认。
+- 门禁：check EXIT 0、hygiene OK、单测 9489 全绿、suite 1664/1664（acp-mode 负载抖动隔离即绿）、
+  tui 1262/1262、python 760（1 例负载阈值隔离即绿）。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -106,18 +105,14 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-31 候选）
+## 下一波主题（wave-32 候选）
 
-1. 【首帧预算专项二期】worker create ~300ms（预热/池化）是回 <500ms 最大杠杆；tsc 模块图
-   双进程串行 ~610ms 为结构性主项（需裁决是否动安装形态）；daemon get_state 预热
-   （启动后台预聚合快照，对齐 Codex 连接常驻/openai-node prewarming 范式）。
-2. 【记忆帽裁决落地】老板三选一（archive 分层/放宽帽/id 重键）后实施；Anthropic memory
-   store beta 作为 remote tier 参照跟踪。
-3. 【probe-bus hardening】reply-drain 钩子（suspend/exit/开 editor 前 drain 探测回复）+
-   「探测回复永不进用户可见流」与「capability detection 后 stdin 必恢复」两条不变量测试
-   （CC 2.1.271 / Gemini #29487 同类坑）；mode 2027 探测项注册（DECRQM+超时+值完整传递）。
-4. 【packages/ai】refusal stop reason 覆盖 + 测试矩阵；GLM-5.x models 表刷新 +
-   autocompact 窗口 per-model 化（CC 2.1.288 同改）。
-5. 【构建管线】compile cache portable+readOnly 随 bundle 分发；tsc/bundle buildId 互杀
-   daemon 裁决（附带发现）。
-6. 【EX-2 后续】exams v1.5 剩余 parity 项收尾。
+1. 【暖 worker 池】按 CC 实践族清单实施（/tmp/wave31/worker-create.md 提案 + research.md #1）：
+   daemon 预建 1 个 warm spare（不进枚举）、claim 时 rebind auth/env/项目设置、健康回退冷启动、
+   内存压力释放。验收：首个后台 agent 受理 ~300ms→近 0。
+2. 【worker 模块图瘦身】147ms 结构项（瘦 worker 入口）；tsc 双进程串行 610ms 需安装形态裁决。
+3. 【per-model 窗口/autocompact】服务端权威窗口 + 首请求有界等待（≤1.5s）+ 切模型即时重绑 +
+   zero-usage 不抑制 + compaction refusal 换模型重试（CC 2.1.273-288 八条族；ai-models.md 提案）。
+4. 【P2 修复】attach 窗 alt+x 二击确认偶发不落（~2/3 成功率，走查实证）。
+5. 【记忆层】帽裁决待老板；结构化输出 kill switch + 记忆序列化字节稳定不变量（research #3）。
+6. 【compile cache 随包分发】portable+readOnly 构建期生成（wave-30 立项顺延）。
