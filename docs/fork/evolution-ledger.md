@@ -14,16 +14,23 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-03 午后，wave-28 已 SHIP）
+## 当前状态（2026-10-03 傍晚，wave-29 已 SHIP）
 
-- HEAD = 见 git log（四批：EX-6 契约、spend 停轮、归因标签化、第五刀）。
-- wave-28：老板裁决变更计数继续显示全局变动但分作者（own/ambient 标签化全链路：kernel 观测 →
-  turn-strip/footnote 分行显示 → 压缩交接只带本会话的）；EX-6 键格式契约修复；spend cell 停轮；
-  AgentSession 第五刀（-186 行，累计 23500→21129，-2371）。
-- 遥测：老板今天重度使用且在线；wave-24/25/26 修复全部在役零抱怨；僵尸轮询修复后无 15 秒循环复现；
-  记忆读侧维持有机使用（spawn 后 3 秒即检索的先例）；compaction 生产仍零触发（演练已出数，
-  从积压销账）。
-- 我的流程教训（wave-27）：收工重启也要先查活跃会话（开工仪式已改，收工把老板的活会话归档过一次）。
+- HEAD = 见 git log（十二批：B01 记忆 digest 两层化、B10 压缩空转、第六刀+B01/B10 接线合批
+  （agent-session.ts 单文件三关切，commit message 已披露）、B03 生命周期 status+/model 推荐、
+  B04 ambient 行内标记、B05 重连抖动、B06 bash UTF-8 接缝、B07 空回复重试、B08 考题 v1.5、
+  B09 受理即心跳、docs×2、FORK_NOTES+账本）。
+- wave-29 关键决策：写侧索引帽默认关（真库索引足迹 491KB ≫ 12KiB 帽，阶段 3 归并工序是开启前置）；
+  skip 连击走独立计数器（_consecutiveCompactionSkips）——并入失败连击会触发 keepRecent 减半、
+  把下一次压缩切点挪飞（三例 suite 红的事故链：阈值跳过被记成失败 → 溢出压缩切口错位 →
+  shrink 阀无可切 → 恢复被判终态）。
+- 门禁：check EXIT 0、hygiene OK、单测 9454 绿（compaction-emergency-shrink-linear /
+  daemon-supervisor-process disposal / process-tree-cpu 三例负载抖动，隔离即绿）、
+  suite 1664/1664 绿、tui 1251（8MB paste 一例负载抖动，隔离绿）、python OK（skipped=3）。
+- 修复方法论沉淀（wave-29）：suite 红先对基线（git worktree at HEAD + 软链 node_modules 单测复跑）
+  再动刀；探针打在三处（触发点/阀门内部早退/分支形状）一次定位；scratch 测试文件用完即删。
+- 遥测：wave-24~28 修复在役零抱怨；R05 实测发现 probe-bus 997 推送丢 decrpmValue（wave-30 修）；
+  B11 画像预警 RPC get_state +16% / TUI 首帧 +24%（十波多点累积，wave-30 专项）。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -100,12 +107,13 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-29 候选）
+## 下一波主题（wave-30 候选）
 
-1. AgentSession 第六刀（quiescence 簇 + stall-notice 簇；壳瘦身评审）。
-2. 记忆阶段 2 决策（遥测：检索已有机发生——继续积累）；语义近重复（embedding）待老板拍板。
-3. 真机复核包（2027 per-screen + 占位符 + 2031 深浅色）。
-4. 子代理 spawn/delete 加一行解释性 status（W25-D 遗留）；/model「推荐+理由」。
-5. W28-A′ 遗留：turn-box 完整过程视图加 ambient 行内标记（2 行 hunk）；子代理写入算 own 还是
-   ambient 的产品裁决（现=ambient「别的窗口或进程」）。
-6. 调研转化：Codex #49105 重连不确定提交恢复、#50434 /copy 键盘选块——对照现状立项或销账。
+1. 【性能回归专项】RPC get_state 899.9ms（+16%）/ TUI 首帧 +24%，十波多点累积；用 B11 画像
+   （/tmp/wave29/perf-refresh.md）做 bisect 定位，逐点回收或立项。
+2. 【记忆阶段 3】consolidation 归并工序（写侧索引帽默认开启的前置）：近重复合并、过期条目清理、
+   标题瘦身；做完才允许 harness.enforceIndexCap 默认翻 true。
+3. 【probe-bus 修复】997 推送丢 DECRPM 应答的 decrpmValue（R05 实测），顺带真机复核包
+   （kitty/ghostty，2027 per-screen + 2031 深浅色）。
+4. 【B07 遗留复核】前缀续跑销账为遗留（风险高于收益），wave-30 复核证据是否变化。
+5. 【EX-2 manifest parity】exams v1.5 后续对齐。
