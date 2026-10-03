@@ -159,6 +159,9 @@ _handoff_interrupted = False
 # counters, so the host can tell "the kernel is wedged" from "the kernel is waiting on
 # work it does not own". The tick only advances while the loop runs, so a synchronous
 # cell freezes it: the frames keep arriving and their frozen tick IS the evidence.
+# One frame also ships at request acceptance (see _handle_request_line): the interval
+# sender alone leaves the host's newest sample a whole idle-plus-streaming phase old at
+# cell takeoff, which is the stale read that degraded turn liveness to the journal.
 HEARTBEAT_EVENT = "heartbeat"
 # Single gate for every heartbeat frame (the host treats an unnegotiated kind as
 # protocol corruption and repairs, i.e. kills, the kernel).
@@ -2029,6 +2032,12 @@ def _handle_request_line(raw: bytes, queue: asyncio.Queue[dict[str, Any]]) -> No
         if duplicate:
             _protocol_error(f"duplicate in-flight request id: {req['id']!r}")
             return
+        # Acceptance heartbeat: this is the moment the request becomes in flight, and the
+        # interval sender alone would let the host's newest liveness sample be a whole
+        # idle-plus-streaming phase old at cell takeoff. Ship the first frame now, from the
+        # reader thread, not at the next tick. The frame's own gates still apply: below
+        # protocol 4 nothing is built, and a broken round costs this frame, never the reader.
+        _heartbeat_once()
     if rtype == "shutdown":
         # No host reply follows a shutdown; a cell awaiting host_request
         # must fail now or it would block _serve from ever consuming this.

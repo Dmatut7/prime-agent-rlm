@@ -1,0 +1,1 @@
+- Fixed turn liveness going stale at cell takeoff: the kernel now ships its first heartbeat frame the moment a request is accepted, from the reader thread, instead of waiting for the next interval tick - the host's newest sample used to be a whole idle-plus-streaming phase old, which degraded a live turn to journal replay.

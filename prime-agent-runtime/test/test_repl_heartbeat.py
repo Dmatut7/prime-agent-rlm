@@ -12,15 +12,23 @@ kernel; frames only go out while a request is in flight; a value that cannot be 
 strictly costs one frame instead of tearing the stream; and the tick A/B that makes the frame
 mean something - ``await asyncio.sleep`` advances it, ``time.sleep`` freezes it while the frames
 keep arriving.
+
+W29-B09: one frame also ships the moment a request is accepted (reader thread, at
+``_inflight.add``), not at the next interval tick. An idle kernel sends nothing, so after a
+30-70s LLM streaming phase the host's newest sample at cell takeoff was necessarily a whole
+phase old and the turn-liveness read degraded to the journal; the acceptance frame makes the
+sample fresh at takeoff.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
 import time
 import unittest
+from typing import Any
 from unittest import mock
 
 from rlm import repl
@@ -253,6 +261,106 @@ class HeartbeatGateTest(unittest.TestCase):
         self.fail("a killed handle kept reporting as live")
 
 
+class AcceptanceHeartbeatTest(unittest.TestCase):
+    """W29-B09: accepting a request ships one heartbeat frame immediately.
+
+    The interval sender alone leaves the host's newest liveness sample up to a whole period old
+    at takeoff even for a busy kernel, and a whole idle-plus-streaming phase old for an idle
+    one - the stale read that fed the degraded journal path. The acceptance frame ships from the
+    reader thread at ``_inflight.add``, the single point where an execute/snapshot/restore
+    request becomes in flight, so the host's sample is fresh at takeoff.
+    """
+
+    def setUp(self) -> None:
+        self._saved = {
+            "protocol": repl._negotiated_protocol,
+            "rid": repl._active["rid"],
+            "finishing": repl._finishing_rid,
+            "loop": repl._loop,
+            "fd": repl._protocol_fd,
+        }
+        repl._negotiated_protocol = 4
+        repl._active["rid"] = None
+        repl._finishing_rid = None
+        # The reader-thread entry queues onto the serve loop at the end; a stand-in loop
+        # records that hand-off without running it, so the test exercises acceptance only.
+        repl._loop = mock.Mock()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self._path = os.path.join(self._tmpdir.name, "protocol")
+        self._fd = os.open(self._path, os.O_WRONLY | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, self._fd)
+        repl._protocol_fd = self._fd
+
+    def tearDown(self) -> None:
+        repl._negotiated_protocol = self._saved["protocol"]
+        repl._active["rid"] = self._saved["rid"]
+        repl._finishing_rid = self._saved["finishing"]
+        repl._loop = self._saved["loop"]
+        repl._protocol_fd = self._saved["fd"]
+        with repl._interrupt_lock:
+            repl._inflight.clear()
+
+    def _wire(self) -> list[dict]:
+        os.fsync(self._fd)
+        with open(self._path, "rb") as handle:
+            return [json.loads(line) for line in handle.read().decode().splitlines() if line.strip()]
+
+    def _reset_wire(self) -> None:
+        os.ftruncate(self._fd, 0)
+        os.lseek(self._fd, 0, os.SEEK_SET)
+
+    def test_accepting_a_request_ships_a_frame_before_any_interval_tick(self) -> None:
+        requests: list[dict[str, Any]] = [
+            {"type": "execute", "id": "c1", "code": "pass"},
+            {"type": "snapshot", "id": "s1", "path": "/tmp/x.dill", "manifest_path": "/tmp/x.json"},
+            {"type": "restore", "id": "r1", "path": "/tmp/x.dill"},
+        ]
+        self.assertGreater(len(requests), 0)
+        for req in requests:
+            with self.subTest(rtype=req["type"]):
+                self._reset_wire()
+                with repl._interrupt_lock:
+                    repl._inflight.clear()
+                repl._handle_request_line(json.dumps(req).encode(), asyncio.Queue())
+                frames = heartbeats(self._wire())
+                # Exactly one frame, and it waits for no interval: this call is synchronous.
+                self.assertEqual(len(frames), 1)
+                frame = frames[0]
+                # Acceptance precedes activation, so the frame names nothing yet - the
+                # queued-and-unattributed shape the frame contract already defines.
+                self.assertIsNone(frame["id"])
+                self.assertNotIn("finishing", frame)
+                for field in REQUIRED_INT_FIELDS:
+                    self.assertIsInstance(frame[field], int)
+                json.dumps(frame, allow_nan=False)
+                # Acceptance still happened: the rid is in flight and queued for the loop.
+                with repl._interrupt_lock:
+                    self.assertIn(req["id"], repl._inflight)
+                repl._loop.call_soon_threadsafe.assert_called()
+
+    def test_the_acceptance_frame_respects_the_protocol_gate(self) -> None:
+        # A negotiated-3 host reads the kind as corruption and kills the kernel: acceptance
+        # changes nothing about the gate, so the wire stays empty and the request still queues.
+        repl._negotiated_protocol = 3
+        repl._handle_request_line(json.dumps({"type": "execute", "id": "c1", "code": "pass"}).encode(), asyncio.Queue())
+        self.assertEqual(self._wire(), [])
+        with repl._interrupt_lock:
+            self.assertIn("c1", repl._inflight)
+        repl._loop.call_soon_threadsafe.assert_called()
+
+    def test_a_duplicate_id_is_rejected_without_an_acceptance_frame(self) -> None:
+        with repl._interrupt_lock:
+            repl._inflight.add("c1")
+        repl._handle_request_line(json.dumps({"type": "execute", "id": "c1", "code": "pass"}).encode(), asyncio.Queue())
+        wire = self._wire()
+        # The rejection is the only frame: a refused request is not an acceptance.
+        self.assertEqual(heartbeats(wire), [])
+        errors = [event for event in wire if event.get("event") == "error"]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["ename"], "ProtocolError")
+
+
 class HeartbeatProcessTest(unittest.TestCase):
     """Real `python -m rlm.repl`: the gate on the wire, and the tick A/B."""
 
@@ -278,6 +386,37 @@ class HeartbeatProcessTest(unittest.TestCase):
         self.assertEqual(one(events, "done")["status"], "ok")
         self.assertIn("done sleeping", "".join(e.get("text", "") for e in events))
         self.assertGreater(len(kinds), 2)
+        self.assertEqual(proc.shutdown(), 0)
+
+    def test_acceptance_frame_arrives_long_before_the_first_interval_tick(self) -> None:
+        """W29-B09 on the wire: the takeoff sample does not wait for the interval.
+
+        The interval sender sleeps a whole period before its first frame and an idle kernel
+        sends nothing, so after a 30-70s LLM streaming phase the host's newest sample at cell
+        takeoff was necessarily a whole phase old - the stale read that degraded to the
+        journal. With a 60s period no interval frame can land inside this test at all: the
+        one frame the cell sees is the acceptance frame, shipped by the reader thread at
+        `_inflight.add`.
+        """
+        proc = self.spawn("4", 60_000)
+        events = proc.execute("acc1", "pass")
+        self.assertEqual(one(events, "done")["status"], "ok")
+        frames = heartbeats(events)
+        self.assertEqual(len(frames), 1)
+        frame = frames[0]
+        # Acceptance precedes activation, so the frame names nothing yet: attribution still
+        # belongs to the interval frames once the cell is running.
+        self.assertIsNone(frame["id"])
+        self.assertNotIn("finishing", frame)
+        self.assertEqual(frame["interval_ms"], 60_000)
+        for field in REQUIRED_INT_FIELDS:
+            with self.subTest(field=field):
+                self.assertIsInstance(frame[field], int)
+        # The frame precedes the cell's done (until_done stops at done, so done is last).
+        self.assertLess(events.index(frame), len(events) - 1)
+        # And nothing follows: the interval thread cannot tick inside the test, and an idle
+        # kernel sends nothing.
+        self.assertEqual(drain(proc, 0.3), [])
         self.assertEqual(proc.shutdown(), 0)
 
     def test_an_idle_kernel_sends_no_frames(self) -> None:
