@@ -199,6 +199,8 @@ describe("SubagentSummaryLine", () => {
 			heartbeatCatalog: [],
 			subagentSummaryLine: line,
 			uiServices: spendCellOffUiServices,
+			// Lifecycle announcements route through showStatus; these fixtures assert the panel, not the chat.
+			showStatus: vi.fn(),
 			updateWorkingPulse: vi.fn(),
 			syncWorkingLoader: vi.fn(),
 			updateWorkingLoaderMessage: vi.fn(),
@@ -225,6 +227,8 @@ describe("SubagentSummaryLine", () => {
 			heartbeatCatalog: [],
 			subagentSummaryLine: line,
 			uiServices: spendCellOffUiServices,
+			// Lifecycle announcements route through showStatus; these fixtures assert the panel, not the chat.
+			showStatus: vi.fn(),
 			updateWorkingPulse: vi.fn(),
 			syncWorkingLoader: vi.fn(),
 			updateWorkingLoaderMessage: vi.fn(),
@@ -254,6 +258,8 @@ describe("SubagentSummaryLine", () => {
 			heartbeatCatalog: [],
 			subagentSummaryLine: line,
 			uiServices: spendCellOffUiServices,
+			// Lifecycle announcements route through showStatus; these fixtures assert the panel, not the chat.
+			showStatus: vi.fn(),
 			updateWorkingPulse: vi.fn(),
 			syncWorkingLoader: vi.fn(),
 			updateWorkingLoaderMessage: vi.fn(),
@@ -286,6 +292,8 @@ describe("SubagentSummaryLine", () => {
 			heartbeatCatalog: [],
 			subagentSummaryLine: line,
 			uiServices: spendCellOffUiServices,
+			// Lifecycle announcements route through showStatus; these fixtures assert the panel, not the chat.
+			showStatus: vi.fn(),
 			updateWorkingPulse: vi.fn(),
 			syncWorkingLoader: vi.fn(),
 			updateWorkingLoaderMessage: vi.fn(),
@@ -336,6 +344,8 @@ describe("SubagentSummaryLine", () => {
 			heartbeatCatalog: [],
 			subagentSummaryLine: line,
 			uiServices: spendCellOffUiServices,
+			// Lifecycle announcements route through showStatus; these fixtures assert the panel, not the chat.
+			showStatus: vi.fn(),
 			updateWorkingPulse: vi.fn(),
 			syncWorkingLoader: vi.fn(),
 			updateWorkingLoaderMessage: vi.fn(),
@@ -363,6 +373,8 @@ describe("SubagentSummaryLine", () => {
 			heartbeatCatalog: [],
 			subagentSummaryLine: line,
 			uiServices: spendCellOffUiServices,
+			// Lifecycle announcements route through showStatus; these fixtures assert the panel, not the chat.
+			showStatus: vi.fn(),
 			updateWorkingPulse: vi.fn(),
 			syncWorkingLoader: vi.fn(),
 			updateWorkingLoaderMessage: vi.fn(),
@@ -500,6 +512,8 @@ describe("SubagentSummaryLine", () => {
 			heartbeatCatalog: [],
 			subagentSummaryLine: line,
 			uiServices: spendCellOffUiServices,
+			// Lifecycle announcements route through showStatus; these fixtures assert the panel, not the chat.
+			showStatus: vi.fn(),
 			connectionState: undefined,
 			scheduleHeartbeatManagerRefresh: vi.fn(),
 			updateWorkingPulse: vi.fn(),
@@ -911,6 +925,8 @@ describe("subagent spend cell", () => {
 			updateWorkingPulse: vi.fn(),
 			syncWorkingLoader: vi.fn(),
 			updateWorkingLoaderMessage: vi.fn(),
+			// Lifecycle announcements route through showStatus; this fixture asserts the cell, not the chat.
+			showStatus: vi.fn(),
 			ui: { requestRender: vi.fn() },
 			...(options.stubIdleTick ? { startSubagentSpendIdleTick: vi.fn(), stopSubagentSpendIdleTick: vi.fn() } : {}),
 		});

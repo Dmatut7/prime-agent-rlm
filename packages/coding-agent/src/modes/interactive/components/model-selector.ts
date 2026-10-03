@@ -8,12 +8,15 @@ import {
 	Spacer,
 	Text,
 	type TUI,
+	truncateToWidth,
 } from "@earendil-works/pi-tui";
 import type { ModelRegistry } from "../../../core/model-registry.js";
+import { formatTokenCount } from "../agent-activity.js";
 import { theme } from "../theme/theme.js";
 import { keyHint } from "./keybinding-hints.js";
 import {
 	getMenuListLayout,
+	getMenuPanelInnerWidth,
 	MenuList,
 	MenuPanel,
 	MenuRow,
@@ -43,6 +46,97 @@ enum ModelSearchMatchQuality {
 interface ModelSearchMatch {
 	quality: ModelSearchMatchQuality;
 	score: number;
+}
+
+/**
+ * What the session is currently doing, as far as the /model recommendation can
+ * honestly know it. Every field is optional: an unknown signal simply does not
+ * vote, and a profile that says nothing yields no recommendation at all.
+ */
+export interface ModelSessionProfile {
+	/** Session thinking level ("high" and up reads as an appetite for reasoning models). */
+	thinkingLevel?: string;
+	/** Estimated tokens currently in the session context, when known. */
+	contextTokens?: number;
+	/** Share of the current model's context window already used (0-100), when known. */
+	contextPercent?: number;
+	/** The session has worked with image content. */
+	hasImages?: boolean;
+}
+
+export interface ModelRecommendation {
+	model: Model<any>;
+	/** Plain-language reasons, each a fact from the model's own metadata. */
+	reasons: string[];
+}
+
+/** Thinking levels from which on a reasoning-capable model actually matters. */
+const REASONING_HUNGRY_LEVELS = new Set(["high", "xhigh", "max"]);
+/** The session reads as context-pressured once half the current window is gone. */
+const CONTEXT_PRESSURE_PERCENT = 50;
+
+/**
+ * The /model recommendation: the eligible (already configured, not current)
+ * candidate whose own metadata best fits the session profile, plus the reasons
+ * for the fit. Each reason is a fact derived from the model's fields (image
+ * input, reasoning support, context window size, the featured flag) crossed
+ * with a profile signal - never a hardcoded "this model is good at X" blurb.
+ * Returns undefined when there is nothing honest to say: no candidates, every
+ * fit already served by the current model, or a profile without any signal.
+ */
+export function recommendModelForSession(
+	candidates: ReadonlyArray<Model<any>>,
+	profile: ModelSessionProfile,
+	currentModel?: Model<any>,
+): ModelRecommendation | undefined {
+	const needsVision = profile.hasImages === true;
+	const needsReasoning = profile.thinkingLevel !== undefined && REASONING_HUNGRY_LEVELS.has(profile.thinkingLevel);
+	const contextPressured =
+		typeof profile.contextPercent === "number" && profile.contextPercent >= CONTEXT_PRESSURE_PERCENT;
+	const currentWindow = currentModel?.contextWindow;
+
+	let best: { model: Model<any>; score: number; reasons: string[] } | undefined;
+	for (const candidate of candidates) {
+		if (currentModel && modelsAreEqual(candidate, currentModel)) continue;
+		// A model that cannot see is a bad suggestion for a session working with images.
+		if (needsVision && !candidate.input.includes("image")) continue;
+		let score = 0;
+		const reasons: string[] = [];
+		if (needsVision) {
+			score += 4;
+			reasons.push("这个会话在用图片，它支持图片输入");
+		}
+		if (needsReasoning && candidate.reasoning) {
+			score += 3;
+			reasons.push(`当前思考档位是 ${profile.thinkingLevel}，它支持推理`);
+		}
+		if (contextPressured && currentWindow !== undefined && candidate.contextWindow > currentWindow) {
+			score += 2;
+			reasons.push(
+				`窗口 ${formatTokenCount(candidate.contextWindow)}，比当前模型大（会话已用 ${Math.round(profile.contextPercent ?? 0)}%）`,
+			);
+		}
+		if (candidate.featured === true) score += 1;
+		if (score === 0) continue;
+		if (
+			best === undefined ||
+			score > best.score ||
+			// Ties land on the cheaper model, then on the stable key.
+			(score === best.score &&
+				candidate.cost.input + candidate.cost.output < best.model.cost.input + best.model.cost.output) ||
+			(score === best.score &&
+				candidate.cost.input + candidate.cost.output === best.model.cost.input + best.model.cost.output &&
+				`${candidate.provider}/${candidate.id}` < `${best.model.provider}/${best.model.id}`)
+		) {
+			best = { model: candidate, score, reasons };
+		}
+	}
+	if (best === undefined) return undefined;
+	if (best.reasons.length === 0) {
+		// The featured point alone carried it: the flagship fact is the whole reason.
+		best.reasons.push(`${best.model.provider} 的旗舰模型`);
+	}
+	return { model: best.model, reasons: best.reasons };
 }
 
 function normalizeModelSearchText(value: string): string {
@@ -118,6 +212,11 @@ export interface ModelSelectorOptions {
 	subtitle?: string;
 	getRows?: () => number;
 	recentModels?: ReadonlyArray<string>;
+	/**
+	 * What the session is currently doing; crossed with the models' own metadata
+	 * it yields the "推荐" line and row badge. Absent, nothing is recommended.
+	 */
+	sessionProfile?: ModelSessionProfile;
 }
 
 type ModelScope = "all" | "scoped";
@@ -163,6 +262,9 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private recentRank: Map<string, number>;
 	private errorMessage?: string;
 	private tui: TUI;
+	private sessionProfile?: ModelSessionProfile;
+	private recommendation?: ModelRecommendation;
+	private readonly recommendationText = new Text("", 0, 0);
 	private scopedModels: ReadonlyArray<ScopedModelItem>;
 	private scope: ModelScope = "all";
 	private scopeText?: Text;
@@ -202,6 +304,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.availableModels = options.availableModels;
 		this.configuredProviders = options.configuredProviders;
 		this.unconfiguredProviders = options.unconfiguredProviders;
+		this.sessionProfile = options.sessionProfile;
 		this.recentRank = new Map((options.recentModels ?? []).map((key, i) => [key, i]));
 		this.viewport = { getRows: options.getRows };
 		this.getHeaderRows = options.header ? (options.getHeaderRows ?? (() => 2)) : () => 0;
@@ -353,9 +456,39 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		}));
 		this.activeModels = this.scope === "scoped" ? this.scopedModelItems : this.allModels;
 		this.filteredModels = this.activeModels;
+		this.recomputeRecommendation();
 		const currentIndex = this.filteredModels.findIndex((item) => modelsAreEqual(this.currentModel, item.model));
 		this.selectedIndex =
 			currentIndex >= 0 ? currentIndex : Math.min(this.selectedIndex, Math.max(0, this.getSelectableCount() - 1));
+	}
+
+	/**
+	 * The session profile behind the "推荐" line: crossed with the catalog's own
+	 * metadata it names one model worth switching to and why. Profiles arrive
+	 * after the menu is already open (the mode computes them from live session
+	 * state), so this re-renders in place like the auth probes do.
+	 */
+	setSessionProfile(profile: ModelSessionProfile | undefined): void {
+		this.sessionProfile = profile;
+		this.recomputeRecommendation();
+		this.updateList();
+		this.tui.requestRender();
+	}
+
+	private recomputeRecommendation(): void {
+		if (!this.sessionProfile) {
+			this.recommendation = undefined;
+			return;
+		}
+		// Only a configured provider can be recommended: a suggestion you would
+		// have to log in for first is a login prompt, not a recommendation.
+		const eligible = this.allModels.filter((item) => this.isProviderConfigured(item)).map((item) => item.model);
+		this.recommendation = recommendModelForSession(eligible, this.sessionProfile, this.currentModel);
+	}
+
+	private recommendationLine(): string | undefined {
+		if (!this.recommendation) return undefined;
+		return `推荐：${this.recommendation.model.provider}/${this.recommendation.model.id} — ${this.recommendation.reasons.join("；")}`;
 	}
 
 	private getModelKey(item: ModelItem): string {
@@ -451,6 +584,11 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		if (this.responsiveLayoutKey !== previousLayoutKey) {
 			this.updateList();
 		}
+		// One row, ANSI-safe: truncate the plain text first, then color it.
+		const line = this.recommendationLine();
+		if (line !== undefined) {
+			this.recommendationText.setText(theme.fg("muted", truncateToWidth(line, getMenuPanelInnerWidth(width), "…")));
+		}
 		return super.render(width);
 	}
 
@@ -474,10 +612,14 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			const isSelected = i === this.selectedIndex;
 			const isCurrent = modelsAreEqual(this.currentModel, item.model);
 			const isConfigured = this.isProviderConfigured(item);
+			const isRecommended =
+				this.recommendation !== undefined && modelsAreEqual(this.recommendation.model, item.model);
 			const meta = isConfigured
 				? isCurrent
 					? theme.fg("success", "当前")
-					: undefined
+					: isRecommended
+						? theme.fg("accent", "推荐")
+						: undefined
 				: theme.fg("warning", isCurrent ? "当前 · 需登录" : "需登录");
 
 			this.listContainer.addChild(
@@ -580,6 +722,11 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		let headerHelpRows = 0;
 		this.headerHelpContainer.clear();
 		if (showHeaderHelp) {
+			const line = this.recommendationLine();
+			if (line !== undefined) {
+				this.headerHelpContainer.addChild(this.recommendationText);
+				headerHelpRows += 1;
+			}
 			if (this.scopeText && this.scopeHintText) {
 				this.headerHelpContainer.addChild(this.scopeText);
 				this.headerHelpContainer.addChild(this.scopeHintText);

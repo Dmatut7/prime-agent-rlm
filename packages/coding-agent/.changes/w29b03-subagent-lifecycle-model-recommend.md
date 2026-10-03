@@ -1,0 +1,2 @@
+- Added a one-line chat status when a sub-agent is dispatched ("派出子代理 X：任务"), folded back ("已收编（记录保留）"), stopped from another window, or re-dispatched under a successor name ("接替刚退出的 X"), so a panel row that appears or vanishes always says why.
+- Added a "推荐" line with reasons to the /model menu: the suggestion crosses the live session profile (thinking level, context pressure, image work) with each model's own metadata (reasoning support, image input, context window, featured flag), never recommends the current or an unconfigured model, and badges the recommended row.

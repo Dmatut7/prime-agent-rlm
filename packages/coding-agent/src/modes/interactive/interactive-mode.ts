@@ -105,7 +105,7 @@ import type {
 } from "../../core/extensions/index.js";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.js";
 import { emptyGoalState, formatGoalUsage, GOAL_CONTEXT_PREVIEW_LABEL, type GoalState } from "../../core/goals.js";
-import { resolveImageModelRoute } from "../../core/image-model-routing.js";
+import { messageHasImage, resolveImageModelRoute } from "../../core/image-model-routing.js";
 import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
 import { runMcpManagementCommand } from "../../core/mcp/mcp-command.js";
@@ -280,6 +280,7 @@ import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
 import { formatKeyText, type KeyTextOptions, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
 import { createMermaidMarkdownTransform } from "./components/mermaid.js";
+import { ModelSelectorComponent, type ModelSessionProfile } from "./components/model-selector.js";
 import { setMotionFrameRequester, setMotionReduced } from "./components/motion.js";
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
@@ -443,6 +444,23 @@ const SUBAGENT_SPEND_HEAVY_INTERVAL_MS = 15_000;
 const SUBAGENT_SPEND_IDLE_TICK_MS = 15_000;
 /** How long the first stop-all-subagents press stays armed for the confirming second press. */
 const STOP_ALL_SUBAGENTS_CONFIRM_WINDOW_MS = 5_000;
+/**
+ * A re-spawn pairs with a removal ("接替刚退出的 X") only inside this window: past it
+ * a same-base name is a new dispatch, not a re-dispatch.
+ */
+const SUBAGENT_RESPAWN_PAIR_WINDOW_MS = 60_000;
+/** How many recent removals stay pairable with a re-spawn. */
+const SUBAGENT_RESPAWN_PAIR_HISTORY = 8;
+
+/**
+ * The name family a subagent belongs to: a deleted name is numbered on re-use
+ * (`worker` -> `worker-2`, see AgentSession._mintRlmSuccessorSessionName) and the
+ * orchestrator's own retry convention is `worker-retry`, so the base is the name
+ * without a trailing `-N`/`-retry`.
+ */
+function subagentBaseName(name: string): string {
+	return name.replace(/-(?:\d+|retry)$/i, "");
+}
 
 /**
  * One context-tree scan and who it belongs to. The spend cell and the fullscreen top
@@ -1637,10 +1655,26 @@ export class InteractiveMode {
 	private subagentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
 	/** Children whose failure notice this chat has shown: the parent already knows. */
 	private readonly seenSubagentFailureIds = new Set<string>();
+	/**
+	 * Children this window just asked to stop (stop-all): their cancelled events
+	 * need no explanation line of their own - the stop summary already said it.
+	 * Optional because partial-mode harnesses construct the mode without it.
+	 */
+	private locallyCancelledSubagentIds: Set<string> | undefined;
+	/**
+	 * Recently removed children, for naming a re-dispatch ("接替刚退出的 X").
+	 * Optional because partial-mode harnesses construct the mode without it.
+	 */
+	private recentlyRemovedSubagents: Array<{ name: string; baseName: string; at: number }> | undefined;
 	/** Armed by the first stop-all press; a second press within the window stops them. */
 	private stopAllSubagentsArmedUntil: number | undefined;
 	/** How this session's latest assistant message ended; tells a failed close from a finished one. */
 	private lastAssistantStopReason: AssistantMessage["stopReason"] | undefined;
+	/**
+	 * The session has worked with image content (sent live, or seen in the rendered
+	 * transcript). The /model recommendation reads it to prefer vision-capable models.
+	 */
+	private sessionHasImages = false;
 	private subagentCounts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
 	private subagentSpendTimer: ReturnType<typeof setTimeout> | undefined;
 	/** When the pending spend-refresh timer fires (epoch ms); 0 with no timer. */
@@ -2446,6 +2480,7 @@ export class InteractiveMode {
 				}
 				const prompt = startupPrompts[next]!;
 				try {
+					if (prompt.images && prompt.images.length > 0) this.sessionHasImages = true;
 					await this.agentConnection.prompt(prompt.text, {
 						images: prompt.images,
 						streamingBehavior: next === 0 ? "steer" : "followUp",
@@ -3921,6 +3956,7 @@ export class InteractiveMode {
 		this.currentTurnState = undefined;
 		this.currentTurnSummary = undefined;
 		this.resetSubagentSummary();
+		this.sessionHasImages = false;
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
 	}
@@ -6373,6 +6409,7 @@ export class InteractiveMode {
 					return;
 				}
 				try {
+					if (images !== undefined) this.sessionHasImages = true;
 					await this.agentConnection.prompt(this.pastedImageFiles.annotate(text), {
 						streamingBehavior,
 						queueIfBusy: true,
@@ -7561,12 +7598,93 @@ export class InteractiveMode {
 	private updateSubagentSummary(child: AgentConnectionRlmChildAgentSnapshot): void {
 		// "cancelled" also covers never-bound terminal runs; AgentSession owns that rule.
 		if (child.status === "cancelled") {
+			const previous = this.subagentSnapshots.get(child.id);
 			this.removeSubagentSnapshot(child.id);
+			// A row that was on screen and is now gone gets one line saying why; a
+			// child we never showed needs none.
+			if (previous) this.announceSubagentRemoval(child, previous);
 		} else {
 			const previous = this.subagentSnapshots.get(child.id);
 			this.subagentSnapshots.set(child.id, previous ? mergeSubagentSnapshot(previous, child) : child);
+			// First live sight of a working child: say who was dispatched and what for.
+			// Seeding/resync stay silent on purpose - they replay history, not news.
+			if (!previous && (child.status === "running" || child.status === "queued")) {
+				this.announceSubagentSpawn(child);
+			}
 		}
 		this.refreshSubagentSummary();
+	}
+
+	/** The one-line "派出子代理 X：Y" (or "重派 … 接替刚退出的 X") that a live spawn leaves in the chat. */
+	private announceSubagentSpawn(child: AgentConnectionRlmChildAgentSnapshot): void {
+		const name = child.sessionName ?? child.label;
+		const replaced = this.takeReplacedSubagent(name);
+		const brief = this.formatSubagentStatusDetail(child.label, name);
+		this.showStatus(
+			replaced !== undefined
+				? `重派子代理 ${name}（接替刚退出的 ${replaced}）${brief}`
+				: `派出子代理 ${name}${brief}`,
+		);
+	}
+
+	/**
+	 * The one-line explanation for a row that just left the panel: folded back by
+	 * the orchestrator, stopped by the user, or closed with another reason. A stop
+	 * this window itself asked for stays silent - its summary line already ran.
+	 */
+	private announceSubagentRemoval(
+		child: AgentConnectionRlmChildAgentSnapshot,
+		previous: AgentConnectionRlmChildAgentSnapshot,
+	): void {
+		const name = previous.sessionName ?? child.sessionName ?? previous.label;
+		const error = child.error;
+		// The reason strings are written by rlm-child-delete.ts ("Deleted by parent
+		// orchestrator", pinned by agent-session-recursion.test.ts) and by the
+		// cancelRlmChildRun default ("Cancelled by user", agent-session.ts).
+		const orchestratorDeleted = error === "Deleted by parent orchestrator";
+		const userStopped = !orchestratorDeleted && (error ?? "").startsWith("Cancelled by user");
+		if (userStopped && (this.locallyCancelledSubagentIds?.delete(child.id) ?? false)) return;
+		this.rememberRemovedSubagent(name);
+		if (orchestratorDeleted) {
+			this.showStatus(`子代理 ${name} 已收编：父代理删掉了它（记录保留）`);
+		} else if (userStopped) {
+			this.showStatus(`子代理 ${name} 已被停止（记录保留）`);
+		} else {
+			const detail = this.formatSubagentStatusDetail(error, undefined);
+			this.showStatus(`子代理 ${name} 已关闭${detail}（记录保留）`);
+		}
+	}
+
+	/** The "：task brief" tail of a lifecycle line, truncated so the line stays one line. */
+	private formatSubagentStatusDetail(value: string | undefined, exceptWhen: string | undefined): string {
+		const detail = value?.replace(/\s+/g, " ").trim();
+		if (!detail || detail === exceptWhen) return "";
+		// Partial-mode harnesses carry no terminal; the live one always does.
+		const columns = this.ui.terminal?.columns ?? 80;
+		return `：${truncateToWidth(detail, Math.max(8, Math.min(60, columns - 24)))}`;
+	}
+
+	/** Remember a removal so a same-family re-spawn inside the window can name what it replaces. */
+	private rememberRemovedSubagent(name: string): void {
+		this.recentlyRemovedSubagents ??= [];
+		const recent = this.recentlyRemovedSubagents;
+		recent.push({ name, baseName: subagentBaseName(name), at: Date.now() });
+		if (recent.length > SUBAGENT_RESPAWN_PAIR_HISTORY) recent.shift();
+	}
+
+	/** The name of the just-removed child this spawn succeeds, when it is one. */
+	private takeReplacedSubagent(name: string): string | undefined {
+		const recent = this.recentlyRemovedSubagents;
+		if (!recent) return undefined;
+		const now = Date.now();
+		const baseName = subagentBaseName(name);
+		const index = recent.findIndex(
+			(entry) =>
+				now - entry.at <= SUBAGENT_RESPAWN_PAIR_WINDOW_MS && entry.baseName === baseName && entry.name !== name,
+		);
+		if (index < 0) return undefined;
+		const [entry] = recent.splice(index, 1);
+		return entry?.name;
 	}
 
 	private refreshSubagentSummary(): void {
@@ -7862,6 +7980,8 @@ export class InteractiveMode {
 
 	private resetSubagentSummary(): void {
 		this.subagentSnapshots.clear();
+		this.locallyCancelledSubagentIds?.clear();
+		this.recentlyRemovedSubagents = undefined;
 		this.rlmNodeId = undefined;
 		this.updateSubagentSummaryLine();
 		this.scheduleHeartbeatManagerRefresh();
@@ -7934,7 +8054,16 @@ export class InteractiveMode {
 			return;
 		}
 		this.stopAllSubagentsArmedUntil = undefined;
+		// The summary line below is their explanation; the cancelled events that follow
+		// must not each add a "已被停止" of their own. A failed stop un-records its id
+		// so a later genuine stop still explains itself.
+		this.locallyCancelledSubagentIds ??= new Set();
+		const locallyCancelled = this.locallyCancelledSubagentIds;
+		for (const child of working) locallyCancelled.add(child.id);
 		const results = await Promise.allSettled(working.map((child) => this.agentConnection.cancelRlmChild(child.id)));
+		results.forEach((result, index) => {
+			if (result.status === "rejected") locallyCancelled.delete(working[index]!.id);
+		});
 		const failures = results.filter((result) => result.status === "rejected");
 		if (failures.length > 0) {
 			const first = failures[0];
@@ -8803,6 +8932,9 @@ export class InteractiveMode {
 		this.processBlockOpenOrder = [];
 		this.resetPendingToolState();
 		const transcriptMessages = this.orderMessagesForTranscript(sessionContext.messages);
+		// The /model recommendation reads this to prefer vision-capable models. A slim
+		// attach scans only the tail window here - the right scope for "current task".
+		this.sessionHasImages = transcriptMessages.some((message) => messageHasImage(message));
 		const windowed = options.limitTranscript ? initialRenderMessages(transcriptMessages) : transcriptMessages;
 		// A window that starts inside a long turn keeps the turn's prompt, its real
 		// start, and a row saying how many of its steps it left out.
@@ -12192,6 +12324,35 @@ export class InteractiveMode {
 		void this.showConfigurationMenu("models", initialSearchInput);
 	}
 
+	/**
+	 * The session profile behind the /model menu's "推荐" line: what this session is
+	 * doing right now, in the signals the recommendation crosses with the catalog's
+	 * own model metadata (thinking level, context pressure, image work).
+	 */
+	private currentModelSessionProfile(): ModelSessionProfile {
+		const usage = this.connectionState?.contextUsage;
+		return {
+			thinkingLevel: this.connectionState?.thinkingLevel,
+			contextTokens: typeof usage?.tokens === "number" ? usage.tokens : undefined,
+			contextPercent: typeof usage?.percent === "number" ? usage.percent : undefined,
+			hasImages: this.sessionHasImages,
+		};
+	}
+
+	/**
+	 * Hand the /model menu its session profile. The models tab lives inside
+	 * ConfigurationMenuComponent, so the profile walks the menu's public children
+	 * to the selector - the same instanceof walk the turn flow uses on chat
+	 * children. When the menu opened on another tab the selector is not in the
+	 * tree and the profile simply never lands.
+	 */
+	private applyModelSessionProfile(menu: ConfigurationMenuComponent): void {
+		const selector = menu.children.find(
+			(child): child is ModelSelectorComponent => child instanceof ModelSelectorComponent,
+		);
+		selector?.setSessionProfile(this.currentModelSessionProfile());
+	}
+
 	private showConfigurationMenu(initialTab: ConfigurationMenuTab, initialModelSearch?: string): Promise<void> {
 		const modelCatalog = this.getCachedModelCandidates();
 		const authFlows = this.createAuthFlows();
@@ -12319,6 +12480,7 @@ export class InteractiveMode {
 				},
 				onCancel: finish,
 			});
+			this.applyModelSessionProfile(menu);
 			handle = this.showFullPaneOverlay(menu, 96);
 			// Ambient detection claims claude-code whenever the binary exists; ask the CLI
 			// whether it is actually logged in and re-badge the open menu when it is not.
@@ -14301,6 +14463,7 @@ ${loadEarlier ? `| \`${loadEarlier}\` | 加载对话顶部未加载的更早消�
 			this.chatContainer.addChild(new Text(`${theme.fg("accent", "✓ 已开新会话")}`, 1, 1));
 			this.ui.requestRender();
 			const images = options.prompt ? this.collectImagesFor(options.prompt) : undefined;
+			if (images !== undefined) this.sessionHasImages = true;
 			if (options.name) await this.agentConnection.setSessionName(options.name);
 			if (options.prompt) {
 				this.editor.addToHistory?.(options.prompt);
