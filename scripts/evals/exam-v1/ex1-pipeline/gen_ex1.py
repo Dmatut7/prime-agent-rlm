@@ -2,16 +2,18 @@
 """Generator for EX-1 (multi-step tool task, single agent).
 
 Creates a fixture directory holding a small stdlib-only Python project with
-three seeded bugs, plus a manifest (kept OUTSIDE the fixture dir) with the
-independently computed expected answers. The agent under test receives only
-the fixture dir; the grader consumes the manifest.
+three seeded bugs. The manifest with the independently computed expected
+answers is written straight into the rail dir (--rail-dir), never into the
+agent-writable work dir (D12): the D10 pin stops the agent from rewriting
+the answer key but not from reading it, and a readable manifest lets it
+hardcode the answers into analyze.py without fixing anything.
 
 Deterministic: --seed fixes every byte of the fixture and the manifest.
 
 Usage:
-    python3 gen_ex1.py --out /path/to/ex1-work --seed 20261002
-    # writes: /path/to/ex1-work/fixture/{analyze.py,data/...}
-    #         /path/to/ex1-work/manifest.json
+    python3 gen_ex1.py --out /path/to/ex1-work --rail-dir /path/to/ex1-rail --seed 20261002
+    # writes: /path/to/ex1-work/fixture/{analyze.py,data/...}   (agent-visible)
+    #         /path/to/ex1-rail/manifest.json                   (grader-side)
 """
 from __future__ import annotations
 
@@ -20,7 +22,11 @@ import csv
 import io
 import json
 import random
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import examlib  # noqa: E402
 
 CATEGORIES = ["alpha", "beta", "gamma", "delta"]
 
@@ -118,7 +124,12 @@ def expected_from_rows(q1: list, q2: list) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", required=True, help="Work dir (fixture/ and manifest.json land here)")
+    parser.add_argument("--out", required=True, help="Work dir (the agent-visible fixture/ lands here)")
+    parser.add_argument(
+        "--rail-dir",
+        required=True,
+        help="Dir OUTSIDE --out the manifest is written to; the agent must never reach the answer key",
+    )
     parser.add_argument("--seed", type=int, default=20261002)
     parser.add_argument("--rows", type=int, default=120, help="Rows per quarterly CSV")
     args = parser.parse_args()
@@ -128,6 +139,11 @@ def main() -> int:
     q2 = make_rows(rng, args.rows)
 
     out = Path(args.out)
+    try:
+        rail = examlib.resolve_rail_dir(args.rail_dir, out)
+    except ValueError as exc:
+        parser.error(str(exc))
+    rail.mkdir(parents=True, exist_ok=True)
     fixture = out / "fixture"
     (fixture / "data").mkdir(parents=True, exist_ok=True)
     (fixture / "analyze.py").write_text(ANALYZE_PY)
@@ -141,7 +157,7 @@ def main() -> int:
         "artifact": "report.md",
         "expected": expected_from_rows(q1, q2),
     }
-    (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    (rail / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps(manifest["expected"], indent=2))
     return 0
 

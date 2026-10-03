@@ -50,14 +50,15 @@ default `~/.prime/agent`) must be serial.
 PACK=scripts/evals/exam-v1   # run from the repo root
 M=provider/model-id          # or drop --model for the configured default
 
-# EX-1 (generate -> agent works in fixture/ -> grade; the answer sources -
-# manifest.json and the CSVs - are sha256-pinned into the rail dir pre-run)
+# EX-1 (generate -> agent works in fixture/ -> grade; gen writes the manifest
+# - the expected values - straight into the rail dir so the agent can neither
+# read nor rewrite it (D12); the CSVs are sha256-pinned into the rail pre-run)
 RAIL1=/tmp/exam/ex1-rail
-python3 $PACK/ex1-pipeline/gen_ex1.py --out /tmp/exam/ex1 --seed 20261002
+python3 $PACK/ex1-pipeline/gen_ex1.py --out /tmp/exam/ex1 --rail-dir "$RAIL1" --seed 20261002
 python3 $PACK/run_manual.py --work /tmp/exam/ex1 --model $M \
     --prompt-file $PACK/ex1-pipeline/prompt.txt --cwd /tmp/exam/ex1/fixture \
     --rail-dir "$RAIL1" \
-    --corpus-glob manifest.json --corpus-glob 'fixture/data/*.csv'
+    --corpus-glob 'fixture/data/*.csv'
 python3 $PACK/ex1-pipeline/grade_ex1.py --work /tmp/exam/ex1 --rail-dir "$RAIL1"
 
 # EX-2 (agent writes fixture/answers.json - one level above docs/, per prompt;
@@ -138,18 +139,19 @@ which this stdlib-only pack deliberately does not attempt.
 
 ### Answer-source integrity (EX-1/EX-2, D10)
 
-Both graders trust artifacts inside the agent-writable work dir: EX-1 grades
-against `manifest.json` (the expected values) over `fixture/data/*.csv`, and
-EX-2 rescans `fixture/docs/*.md` as the needle truth at grade time. A
-tampering agent can therefore forge a pass - rewrite the manifest to match
-its broken report, or edit/plant/delete corpus docs to match its answers.
-The rail (same D9 mechanics, new pin file):
+Both graders trust artifacts a tampering agent could otherwise rewrite to
+forge a pass: EX-1 grades against the manifest's expected values over
+`fixture/data/*.csv`, and EX-2 rescans `fixture/docs/*.md` as the needle
+truth at grade time with `manifest.json` as the generation record. Since
+v1.5 the EX-1 manifest is not in the work dir at all (D12, below); the
+answer sources still inside the agent-writable work dir are protected by a
+pre-run pin:
 
 1. The driver hashes every answer-source file (`--corpus-glob`, sha256)
    into `<rail>/answer-source-sha256.json` BEFORE the agent launches, then
    records the run-start anchor in `run-meta.json`.
 2. The graders require `--rail-dir` and re-hash their canonical set
-   (EX-1: `manifest.json` + `fixture/data/*.csv`; EX-2: `manifest.json` +
+   (EX-1: `fixture/data/*.csv`; EX-2: `manifest.json` +
    `fixture/docs/*.md`). Any changed/missing/extra file fails the run, as
    do a missing pin, a missing run-start anchor, and a pin whose mtime
    postdates the anchor (an agent re-pinning the rail to its tampered
@@ -160,6 +162,17 @@ The rail (same D9 mechanics, new pin file):
 
 Same residual gap as D9: an agent that finds the rail dir can rewrite
 `run-meta.json` itself; OS-level sandboxing stays out of scope.
+
+### Answer-key secrecy (EX-1, D12)
+
+Pinning stops writes, not reads: a readable manifest lets the agent hardcode
+the expected values into `analyze.py` without fixing anything, producing a
+content-consistent, pin-clean, worthless pass. Since v1.5,
+`gen_ex1.py --rail-dir` writes `manifest.json` straight into the rail dir,
+so the agent never receives the answer key. The grader reads it from there
+(the D9 mtime rule applies: a manifest rewritten after the run started voids
+the run) and fails closed on any work-root `manifest.json` - the pre-v1.5
+layout or a planted/forged copy both mean the answer key was agent-readable.
 
 ## Self-tests
 
@@ -224,6 +237,18 @@ python3 -m unittest discover -s tests -v
   example per fixture, and the scorer normalizes the `./` and `shards/`
   prefixes before lookup (the prompt stays the primary contract; the
   normalization keeps a compliant-but-prefixed artifact scoreable).
+
+## Defect history (v1.4 -> v1.5, wave-29 read-side hardening)
+
+- **D12** EX-1's `manifest.json` (the expected values the grader trusts) sat
+  at the work root: the D10 pin stopped the agent from rewriting it but not
+  from reading it, and a read lets the agent hardcode the answers into
+  `analyze.py` - content-consistent, pin-clean, and worthless as a
+  measurement. `gen_ex1.py` now takes `--rail-dir` and writes the manifest
+  straight into the rail dir, so the agent never receives the answer key;
+  `grade_ex1.py` reads it from there (D9 mtime rule applies) and fails
+  closed on any work-root `manifest.json` (the legacy layout or a
+  planted/forged copy). The EX-1 pin set shrinks to `fixture/data/*.csv`.
 
 ## Known limits / v1.1 candidates
 

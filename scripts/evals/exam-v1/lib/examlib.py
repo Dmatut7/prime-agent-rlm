@@ -235,11 +235,13 @@ def verify_rail(rail_dir, work, files) -> dict:
 # --- Answer-source pinning (D10) ---------------------------------------------
 #
 # EX-1/EX-2 grade against artifacts that sit inside the agent-writable work
-# dir: EX-1 trusts manifest.json (the expected values) and a run of
-# analyze.py over fixture/data/*.csv; EX-2 rescans fixture/docs/*.md as the
-# needle truth at grade time. A tampering agent can therefore forge a pass
-# (rewrite the manifest to its broken output; edit the corpus to match its
-# answers). The driver pins a sha256 per answer-source file into
+# dir: EX-1 runs analyze.py over fixture/data/*.csv (the manifest holding the
+# expected values is itself a rail file since v1.5 - D12, written there by
+# gen_ex1.py --rail-dir so the agent can neither rewrite nor read it), and
+# EX-2 rescans fixture/docs/*.md as the needle truth at grade time (its
+# manifest.json pins the generation record). A tampering agent can otherwise
+# forge a pass (rewrite the manifest to its broken output; edit the corpus to
+# match its answers). The driver pins a sha256 per answer-source file into
 # answer-source-sha256.json BEFORE the agent launches (same D9 ordering:
 # the pin lands before the started_at anchor); the grader re-hashes its
 # canonical set and fails on any changed/missing/extra file, and the D9
