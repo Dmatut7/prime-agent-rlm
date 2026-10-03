@@ -149,6 +149,7 @@ import {
 	compact,
 	compactionSkipMessage,
 	compactionThresholdTokens,
+	type EmergencyShrinkPlan,
 	estimateContextTokens,
 	generateBranchSummary,
 	isAssistantUsageSource,
@@ -290,7 +291,6 @@ import {
 	createModelChangeMessage,
 	createRefinementFailureMessage,
 	createRefinementOutcomeMessage,
-	createRlmChildStallNoticeMessage,
 	createSessionSlashCommandMessage,
 	createSessionSlashCommandResultMessage,
 	HARNESS_DIGEST_CUSTOM_TYPE,
@@ -407,6 +407,12 @@ import {
 	watchRlmChildFollowUps,
 } from "./rlm-child-followup.js";
 import {
+	abortRlmSubtree,
+	hasUnsettledRlmQuiescenceWork,
+	rlmSubtreeSessions,
+	waitForRlmQuiescence,
+} from "./rlm-child-quiescence.js";
+import {
 	getRlmChildSnapshots,
 	hasRunningRlmChildren,
 	type RetiredRlmChildRun,
@@ -428,7 +434,6 @@ import {
 	type AgentMessageDeferred,
 	compactRlmText,
 	createAgentMessageDeferred,
-	noopRlmChildAbort,
 	type RlmChildDeriveCounts,
 	type RlmChildRun,
 	readAssistantText,
@@ -437,6 +442,7 @@ import {
 	rlmChildLabel,
 	startRlmChildRun,
 } from "./rlm-child-run.js";
+import { cloneCustomMessage } from "./rlm-child-stall-notice.js";
 
 export type { RlmChildDeriveCounts };
 export { compactRlmText, resetRlmChildDeriveCounts, rlmChildDeriveCounts, rlmChildLabel };
@@ -832,7 +838,14 @@ type UserBashEndDetails = {
 	errorMessage?: string;
 };
 
-export class CompactionSkippedError extends Error {}
+export class CompactionSkippedError extends Error {
+	/** When the skip outcome carries a shrink plan (over threshold with nothing
+	 * summarizable outside the kept tail), the plan rides the error and the caller
+	 * decides whether to spend the valve. Running the shrink inside the
+	 * summarization scope would digest a shrink failure into that scope's own
+	 * compaction_end instead of letting it escape to the caller (w9a pin). */
+	emergencyShrink?: EmergencyShrinkPlan | null;
+}
 
 /** Thrown when a session_before_refine extension skips the refinement round. */
 export class RefineSkippedError extends Error {}
@@ -1220,13 +1233,6 @@ export interface SessionActionRecoveryAction {
 export interface SessionActionRecoverySnapshot {
 	formatVersion: typeof SESSION_ACTION_RECOVERY_FORMAT_VERSION;
 	actions: SessionActionRecoveryAction[];
-}
-
-function cloneCustomMessage(message: CustomMessage): CustomMessage {
-	return {
-		...message,
-		content: Array.isArray(message.content) ? message.content.map((block) => ({ ...block })) : message.content,
-	};
 }
 
 function cloneQueuedAgentMessage(message: QueuedAgentMessage): QueuedAgentMessage {
@@ -1687,24 +1693,8 @@ const RLM_PROGRESS_NOTE_MIN_INTERVAL_MS = 10_000;
 /** How long a deferred RLM terminal notice may wait for delivery before it is abandoned. */
 const RLM_TERMINAL_NOTICE_ABANDON_AFTER_MS = 5 * 60_000;
 
-/**
- * Minimum spacing between two parent-facing "this child is still silent" notices for
- * one run. The watchdog's warn stage is already edge-triggered (it fires once per
- * silence episode and re-arms on the child's next event), so this only bounds the
- * case of a child that keeps re-arming the stage with a trickle of events: the
- * parent gets at most one notice per interval instead of one per re-arm.
- */
-const RLM_CHILD_STALL_NOTICE_MIN_INTERVAL_MS = 10 * 60_000;
 /** Consecutive retryable agent-message send failures before the error becomes terminal (M6b). */
 const AGENT_MESSAGE_RETRYABLE_FAILURE_LIMIT = 3;
-
-/**
- * FR-4: how long one quiescence barrier waits before giving up. A descendant
- * that never settles must not park the barrier (and every headless completion
- * behind it) forever; past the deadline the wait warns and reports
- * `{ settled: false }`.
- */
-const RLM_QUIESCENCE_GIVE_UP_MS = 5 * 60_000;
 
 /** O1: how long a recorded agent-message send failure stays "consecutive". */
 const AGENT_MESSAGE_SEND_FAILURE_TTL_MS = 24 * 60 * 60_000;
@@ -2196,6 +2186,14 @@ export class AgentSession {
 	 * notice carries the user's way out instead of only the provider error.
 	 */
 	private _consecutiveCompactionFailures = 0;
+	/**
+	 * Over-threshold nothing-to-summarize skips (W29-B10). A dedicated streak, not
+	 * the failure streak: _consecutiveCompactionFailures also feeds the
+	 * keepRecentTokens halving in _compactionSettingsForAttempt, and a skip must
+	 * not move the next attempt's cut. A successful compaction clears both streaks
+	 * (_clearCompactionFailures).
+	 */
+	private _consecutiveCompactionSkips = 0;
 	private _continueAfterThresholdCompaction = false;
 	/**
 	 * Cooldown after a threshold compaction that skipped or failed, so an
@@ -2494,7 +2492,7 @@ export class AgentSession {
 	private _lastRlmProgressNoteAt: number | undefined;
 	_unsettledRlmChildRuns = new Set<RlmChildRun>();
 	_abandonedRlmQuiescenceChildIds = new Set<string>();
-	private _rlmQuiescenceWaitAborts = new Set<AbortController>();
+	_rlmQuiescenceWaitAborts = new Set<AbortController>();
 	_pendingRlmSubagentSessionNames = new Set<string>();
 	/**
 	 * Every child session name this session has ever admitted or learned of
@@ -9231,7 +9229,7 @@ export class AgentSession {
 	 * driven by its own timer (see _armRlmTerminalNoticeAbandonTimer), not by whoever
 	 * happens to read activity.
 	 */
-	private _hasActionableDeferredRlmTerminalNotices(): boolean {
+	_hasActionableDeferredRlmTerminalNotices(): boolean {
 		return this._hasDeferredRlmTerminalNotices() && !this._isDeferredRlmTerminalNoticeStale();
 	}
 
@@ -9258,7 +9256,7 @@ export class AgentSession {
 		}
 	}
 
-	private _pushPendingNextTurnMessages(...messages: CustomMessage[]): void {
+	_pushPendingNextTurnMessages(...messages: CustomMessage[]): void {
 		this._enqueuePendingNextTurnMessages(messages, false);
 	}
 
@@ -9337,128 +9335,6 @@ export class AgentSession {
 			this._durableRlmTerminalNoticeActionIds.delete(action.id);
 			throw error;
 		}
-	}
-
-	/**
-	 * Admit a stall notice as its own turn, the way a terminal notice reaches the
-	 * parent: the input pump schedules it once the session is free, so a parent that
-	 * is idle when its child goes quiet still gets told instead of finding out
-	 * whenever it happens to run next.
-	 */
-	private _enqueueRlmChildStallNoticeAction(message: CustomMessage): void {
-		const action = this._createPreparedTurnAction("followUp", message.content as string, undefined, {
-			message,
-			suppressAutonomousContinuation: true,
-			resumeIfIdle: false,
-			source: "internal",
-			executionPolicy: this._turnExecutionPolicy("injected"),
-			queueVisible: false,
-		});
-		const result = this._admitSessionInput(action, { wake: false });
-		if (!result.accepted) throw new Error("RLM child stall notice was not admitted.");
-	}
-
-	/**
-	 * Tell the parent (this session) that a direct child has been silent past the
-	 * watchdog's warn stage - without killing anything.
-	 *
-	 * The warn stage used to be roster-only: the sole stall signal a parent model ever
-	 * received was the failure notice that a kill produced, so a warn-only watchdog
-	 * would have traded a false kill for no signal at all. The notice is the signal;
-	 * whether the silence is genuine work or a wedge is the parent's call, and the
-	 * parent holds the lever (`rlm.delete_subagent`) for the wedge case.
-	 */
-	_notifyRlmChildStall(
-		run: RlmChildRun,
-		child: AgentSession,
-		sessionName: string,
-		event: { silentMs: number; thresholdMs: number; diagnostics: StallDiagnostics },
-	): void {
-		// Same two-flag guard the terminal-notice publication gate uses: a run that is
-		// being deleted (detachedDeletion) or whose notices are suppressed must not be
-		// pinged - the parent itself asked for this child to go away.
-		if (this._disposed || this._disposing || run.detachedDeletion || run.suppressTerminalNotice) return;
-		const exemption = event.diagnostics.exemption;
-		if (exemption?.reason !== undefined && exemption.exhausted !== true) {
-			// Excused silence is healthy long work (a live build, a host-owned phase): the notice would
-			// start a paid parent turn only to say "still working", up to every ten minutes per child
-			// for the whole job. The roster already shows it as long-running. The parent is told once
-			// the excuse lapses while the child is still silent.
-			this._armRlmChildStallRecheck(run, child, sessionName, event);
-			return;
-		}
-		const now = Date.now();
-		if (run.lastStallNoticeAt !== undefined && now - run.lastStallNoticeAt < RLM_CHILD_STALL_NOTICE_MIN_INTERVAL_MS) {
-			return;
-		}
-		run.lastStallNoticeAt = now;
-		const inFlightTools = event.diagnostics.inFlightToolCalls.map((call) =>
-			call.elapsedMs > 0 ? `${call.toolName} (${Math.max(1, Math.round(call.elapsedMs / 1000))}s)` : call.toolName,
-		);
-		// The deadline that matters is the child's own watchdog - it is the one that can
-		// abort the turn - so the notice describes the child's configuration, not the
-		// parent's. The two differ whenever a project-scope settings file overrides the
-		// global one for one side only.
-		const abortAfterMs = child.settingsManager.getStallWatchdogSettings().abortAfterSeconds * 1000;
-		const message = createRlmChildStallNoticeMessage({
-			childId: run.id,
-			sessionName,
-			silentMs: event.silentMs,
-			thresholdMs: event.thresholdMs,
-			inFlightTools,
-			...(abortAfterMs > 0 ? { abortAfterMs } : {}),
-		});
-		try {
-			this._enqueueRlmChildStallNoticeAction(message);
-			this._scheduleSessionInputPump();
-		} catch (error) {
-			// A paused pump (a user dialog, compaction) must not drop the only signal the
-			// parent gets; keep the notice for the next turn boundary instead.
-			this._pushPendingNextTurnMessages(cloneCustomMessage(message));
-			sessionLog.warn("child stall notice deferred to the next turn boundary", {
-				sessionId: this.sessionId,
-				childId: run.id,
-				message: this._asError(error).message,
-			});
-		}
-	}
-
-	/**
-	 * Watch a child whose stall notice was held back because its silence was excused. Re-checked
-	 * every child warn window: a child that moved again is back under its own watchdog (the next
-	 * silence warns afresh), one still excused keeps waiting, and one still silent after the excuse
-	 * lapsed is a real stall the parent must hear about.
-	 */
-	private _armRlmChildStallRecheck(
-		run: RlmChildRun,
-		child: AgentSession,
-		sessionName: string,
-		event: { silentMs: number; thresholdMs: number; diagnostics: StallDiagnostics },
-	): void {
-		if (run.stallRecheckTimer !== undefined) return;
-		const warnedAt = Date.now();
-		const lastEventAtWarn = child.lastAgentEventAt;
-		const recheck = () => {
-			run.stallRecheckTimer = undefined;
-			if (this._disposed || this._disposing || run.settled || run.stall === undefined) return;
-			if (child.lastAgentEventAt !== lastEventAtWarn) return;
-			if (child.excusedNow) {
-				schedule();
-				return;
-			}
-			const { exemption: _lapsedExemption, ...diagnostics } = event.diagnostics;
-			this._notifyRlmChildStall(run, child, sessionName, {
-				...event,
-				silentMs: event.silentMs + (Date.now() - warnedAt),
-				diagnostics,
-			});
-		};
-		const schedule = () => {
-			const timer = setTimeout(recheck, Math.max(1_000, event.thresholdMs));
-			timer.unref?.();
-			run.stallRecheckTimer = timer;
-		};
-		schedule();
 	}
 
 	private _flushDeferredRlmTerminalNotices(): void {
@@ -10426,7 +10302,7 @@ export class AgentSession {
 		};
 	}
 
-	private _turnExecutionPolicy(
+	_turnExecutionPolicy(
 		kind: "queued" | "directPrompt" | "injected" | "customTrigger",
 		options: {
 			returnAfterAccepted?: boolean;
@@ -10497,7 +10373,7 @@ export class AgentSession {
 		};
 	}
 
-	private _createPreparedTurnAction(
+	_createPreparedTurnAction(
 		schedule: SessionInputSchedule,
 		text: string,
 		images: ImageContent[] | undefined,
@@ -10645,7 +10521,7 @@ export class AgentSession {
 		}
 	}
 
-	private _admitSessionInput(
+	_admitSessionInput(
 		action: QueuedSessionAction,
 		options: {
 			restore?: boolean;
@@ -10846,7 +10722,7 @@ export class AgentSession {
 		);
 	}
 
-	private _scheduleSessionInputPump(): void {
+	_scheduleSessionInputPump(): void {
 		if (this._sessionInputPumpSuspended || this._queuedWorkPauses.size > 0) return;
 		if (this._disposed || this._disposing || this._sessionInputPumpRequested || !this._hasSelectableSessionInput()) {
 			return;
@@ -11164,7 +11040,7 @@ export class AgentSession {
 		return epoch !== this._sessionInputPumpEpoch || this._isBusyForSessionInput("pump");
 	}
 
-	private _asError(error: unknown): Error {
+	_asError(error: unknown): Error {
 		return error instanceof Error ? error : new Error(String(error));
 	}
 
@@ -12011,7 +11887,7 @@ export class AgentSession {
 		for (const resolve of waiters) resolve();
 	}
 
-	private _waitForSessionActivityChange(signal: AbortSignal): Promise<void> {
+	_waitForSessionActivityChange(signal: AbortSignal): Promise<void> {
 		return new Promise<void>((resolve) => {
 			const finish = () => {
 				this._sessionInputCheckpointWaiters.delete(finish);
@@ -13703,7 +13579,15 @@ export class AgentSession {
 				// escalate to emergency shrink instead of silently skipping forever.
 				throw new Error(compactionSkipMessage(preparationOutcome.reason));
 			}
-			throw new CompactionSkippedError(compactionSkipMessage(preparationOutcome.reason));
+			// Over-threshold with nothing summarizable: the kept tail is one
+			// oversized message, which is not a wall - the plan rides the skip so
+			// the caller can spend the shrink valve instead of skipping forever
+			// (wave-29 W29-B10). The shrink must not run inside this scope: a
+			// shrink failure here would digest into this scope's compaction_end
+			// instead of escaping to the caller (w9a pin).
+			const skipError = new CompactionSkippedError(compactionSkipMessage(preparationOutcome.reason));
+			skipError.emergencyShrink = preparationOutcome.emergencyShrink;
+			throw skipError;
 		}
 		const preparation = preparationOutcome.preparation;
 
@@ -14466,7 +14350,10 @@ export class AgentSession {
 		let rendered: string | undefined;
 		return {
 			state,
-			stateFingerprint: harnessDigestFingerprint(state, renderFlags),
+			stateFingerprint: harnessDigestFingerprint(state, {
+				...renderFlags,
+				indexMaxBytes: this.settingsManager.getHarnessDigestIndexMaxBytes(),
+			}),
 			render: () => {
 				if (rendered === undefined) rendered = this._renderHarnessDigest(state, renderFlags);
 				return rendered;
@@ -14535,6 +14422,7 @@ export class AgentSession {
 	): string {
 		return formatHarnessStateForPrompt(state, {
 			...renderFlags,
+			indexMaxBytes: this.settingsManager.getHarnessDigestIndexMaxBytes(),
 			queryTerms: this._buildHarnessDigestQueryTerms(),
 		});
 	}
@@ -15117,6 +15005,9 @@ export class AgentSession {
 				rollbackOf: plan.rollbackOf,
 				scope: targetScope,
 				baselineState: plan.baselineState,
+				indexMaxBytes: this.settingsManager.getHarnessDigestIndexMaxBytes(),
+				pathVocabulary: this.settingsManager.getHarnessPathVocabulary(),
+				enforceIndexCap: this.settingsManager.getHarnessEnforceIndexCap(),
 			});
 			result.harnessStatePath = getHarnessStatePath(targetHarnessStateDir);
 			let refinementPersistError: { error: unknown } | undefined;
@@ -15453,6 +15344,7 @@ export class AgentSession {
 	/** A compaction that produced a summary ends the failure streak. */
 	private _clearCompactionFailures(): void {
 		this._consecutiveCompactionFailures = 0;
+		this._consecutiveCompactionSkips = 0;
 	}
 
 	/**
@@ -15807,6 +15699,22 @@ export class AgentSession {
 					{ errorSeverity: "warning", customInstructions },
 				);
 				if (reason === "threshold") this._armThresholdCompactionCooldown();
+				// W29-B10: an over-threshold nothing-to-summarize skip is the idle
+				// spin - it repeats at every turn boundary and used to count as
+				// nothing, so the shrink valve never ran. Count it on its own streak
+				// (the failure streak must not move: it also drives the
+				// keepRecentTokens halving for the next attempt), and once the spin
+				// reaches the same count the failure valve uses, spend the shrink.
+				// A transient mid-loop skip stays benign: the next successful
+				// compaction clears the streak. Overflow and requested keep their
+				// own valves (the attempted-branch forced shrink and compact()'s
+				// skip tail); spending the valve here too would collide with them.
+				if (reason === "threshold" && error.emergencyShrink) {
+					this._consecutiveCompactionSkips++;
+					if (this._consecutiveCompactionSkips >= COMPACTION_EMERGENCY_SHRINK_FAILURES) {
+						await this._runEmergencyContextShrink(reason, errorMessage, { force: true });
+					}
+				}
 				restorePendingRequest();
 				resumeAfterFailure();
 				return false;
@@ -16988,72 +16896,8 @@ export class AgentSession {
 		}
 	}
 
-	/**
-	 * Cancel every running or queued RLM run in this session's subtree *and* stop
-	 * the in-flight turn of every retained descendant session.
-	 *
-	 * `_cancelActiveRlmChildRuns` alone only sees this session's own map, so a child
-	 * that had already settled - then been followed up, then spawned a child of its
-	 * own - kept running after the parent was killed, while `hasRunningRlmChildren()`
-	 * (which walks the subtree) reported the family as busy. Walking the same subtree
-	 * here aligns the kill with the judgement.
-	 *
-	 * `requestAbort` deliberately has no cascade semantics, so stopping each
-	 * descendant's own turn costs O(nodes) rather than O(depth^2); the visited set in
-	 * `_rlmSubtreeSessions` keeps a child that sits in both maps from being walked
-	 * twice. This session is excluded from step 2 because the caller already aborted
-	 * it. Cross-worker descendants are out of reach of an in-process walk and are
-	 * covered by the supervisor's kill path instead.
-	 */
 	private _abortRlmSubtree(reason: string): { cancelled: number; failures: number; depth: number } {
-		let cancelled = 0;
-		let failures = 0;
-		let depth = this._rlmDepth;
-		for (const session of this._rlmSubtreeSessions()) {
-			depth = Math.max(depth, session._rlmDepth);
-			for (const run of [...session._activeRlmChildRuns.values()]) {
-				try {
-					if (!session._cancelRlmChildRun(run, reason)) continue;
-					cancelled += 1;
-					// The cancel already fired run.abort(); drop the handle so a second
-					// trigger (a late publication, a repeated cascade) cannot abort the
-					// same child session again.
-					run.abort = noopRlmChildAbort;
-				} catch (error) {
-					failures += 1;
-					sessionLog.warn("rlm abort cascade: cancelling a descendant run failed", {
-						reason,
-						childId: run.id,
-						sessionId: session.sessionId,
-						error: error instanceof Error ? error.message : String(error),
-					});
-				}
-			}
-			if (session === this) continue;
-			try {
-				// A retained descendant can be mid-turn with no run of ours tracking it:
-				// it settled, was followed up, and is now streaming that follow-up.
-				if (session.isStreaming) session.requestAbort({ reason: "user" });
-			} catch (error) {
-				failures += 1;
-				sessionLog.warn("rlm abort cascade: stopping a descendant turn failed", {
-					reason,
-					sessionId: session.sessionId,
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
-		}
-		if (cancelled > 0 || failures > 0) {
-			// Countable answer to "how much work did one Esc actually stop".
-			sessionLog.info("rlm abort cascade", {
-				reason,
-				cancelled,
-				failures,
-				depth,
-				sessionId: this.sessionId,
-			});
-		}
-		return { cancelled, failures, depth };
+		return abortRlmSubtree(this, reason);
 	}
 
 	_cancelRlmChildRun(run: RlmChildRun, reason: string): boolean {
@@ -17364,124 +17208,17 @@ export class AgentSession {
 		return hasRunningRlmChildren(this);
 	}
 
-	private _rlmChildSessionSnapshot(): AgentSession[] {
+	_rlmChildSessionSnapshot(): AgentSession[] {
 		return rlmChildSessionSnapshot(this);
 	}
 
 	_hasUnsettledRlmQuiescenceWork(): boolean {
-		if (this._hasActionableDeferredRlmTerminalNotices()) return true;
-		if ([...this._unsettledRlmChildRuns].some((run) => !run.settled)) return true;
-		return this._rlmChildSessionSnapshot().some(
-			(child) => child.isSessionActive || child._hasUnsettledRlmQuiescenceWork(),
-		);
+		return hasUnsettledRlmQuiescenceWork(this);
 	}
 
-	/**
-	 * Wait for every admitted descendant run to publish its terminal parent
-	 * message and for the resulting parent turns to drain. Re-snapshotting after
-	 * each drain includes descendants spawned while earlier results were consumed.
-	 *
-	 * FR-4: the wait is bounded by a give-up deadline (5 minutes). A descendant
-	 * that never settles used to park this barrier forever - and with it every
-	 * headless completion that asked for quiescence. On the deadline the wait
-	 * warns and returns `{ settled: false }` instead of hanging: the caller can
-	 * proceed with the current state, and the log says descendants may still be
-	 * running.
-	 */
+	/** Bounded barrier: every admitted descendant run settled and the resulting parent turns drained. */
 	async waitForRlmQuiescence(externalSignal?: AbortSignal): Promise<RlmQuiescenceOutcome> {
-		const startedAt = Date.now();
-		const cancellation = new AbortController();
-		const cancelFromParent = () => cancellation.abort();
-		if (externalSignal?.aborted) cancellation.abort();
-		else externalSignal?.addEventListener("abort", cancelFromParent, { once: true });
-		this._rlmQuiescenceWaitAborts.add(cancellation);
-		let rejectCancelled = (_error: Error) => {};
-		const cancelled = new Promise<never>((_resolve, reject) => {
-			rejectCancelled = reject;
-		});
-		const onCancelled = () => rejectCancelled(new Error("RLM quiescence wait cancelled"));
-		cancellation.signal.addEventListener("abort", onCancelled, { once: true });
-		if (cancellation.signal.aborted) onCancelled();
-		const wait = <T>(operation: Promise<T>): Promise<T> => Promise.race([operation, cancelled]);
-		// The give-up timer reuses the cancellation path so the recursive sibling
-		// waits unwind exactly like an external abort; the flag separates "gave
-		// up on the deadline" from a caller-driven cancellation, which still
-		// rejects.
-		let gaveUpAt: number | undefined;
-		const giveUp = () => {
-			gaveUpAt = Date.now();
-			cancellation.abort();
-		};
-		const giveUpTimer = setTimeout(giveUp, RLM_QUIESCENCE_GIVE_UP_MS);
-		if (typeof giveUpTimer === "object" && "unref" in giveUpTimer) giveUpTimer.unref();
-		try {
-			while (true) {
-				await wait(this.waitForHeadlessIdle());
-				// Strong RLM quiescence also owns session-level work (bash, refine,
-				// branch mutation, and manual compaction) that interactive waitForIdle
-				// intentionally ignores. Wake on activity changes (upstream #1859), raced
-				// with a 1s tick so this loop re-checks a deferred terminal notice whose
-				// delivery window closes while idle. The tick only observes: abandonment
-				// itself is driven by its own timer (see
-				// _armRlmTerminalNoticeAbandonTimer), because both predicates below are
-				// pure reads and must not flush or discard anything.
-				if (this.isSessionActive || this._hasActionableDeferredRlmTerminalNotices()) {
-					// The 1s tick can win this race every iteration while bash/refine keep
-					// the session active. Aborting the tick scope on settle removes the
-					// losing activity-change waiter and its signal listener instead of
-					// leaking one per second into MaxListenersExceededWarning spam.
-					const tickAbort = new AbortController();
-					let tickTimer: ReturnType<typeof setTimeout> | undefined;
-					try {
-						await wait(
-							Promise.race([
-								this._waitForSessionActivityChange(tickAbort.signal),
-								new Promise<void>((resolve) => {
-									tickTimer = setTimeout(resolve, 1000);
-								}),
-							]),
-						);
-					} finally {
-						clearTimeout(tickTimer);
-						tickAbort.abort();
-					}
-					continue;
-				}
-				const unsettledRuns = [...this._unsettledRlmChildRuns].filter((run) => !run.settled);
-				const childSessions = this._rlmChildSessionSnapshot();
-				if (unsettledRuns.length === 0 && !this._hasUnsettledRlmQuiescenceWork()) return { settled: true };
-				await wait(
-					Promise.all([
-						...unsettledRuns.map((run) => run.settlement.promise),
-						...childSessions.map((child) => child.waitForRlmQuiescence(cancellation.signal)),
-					]),
-				);
-				// Always loop through the self-active/deferred checks again. Work may
-				// start at the child-settlement boundary.
-			}
-		} catch (error) {
-			// FR-4: the deadline fired and unwound the wait through the cancellation
-			// path. Report the give-up instead of surfacing it as an error: the
-			// caller asked "is everything settled" and the honest answer is "not
-			// yet, and I stopped waiting".
-			if (gaveUpAt !== undefined) {
-				sessionLog.warn("rlm quiescence wait gave up after its deadline; descendants may still be unsettled", {
-					sessionId: this.sessionId,
-					waitedMs: gaveUpAt - startedAt,
-					unsettledChildren: this._rlmChildSessionSnapshot().length,
-				});
-				return { settled: false, timedOut: true };
-			}
-			throw error;
-		} finally {
-			clearTimeout(giveUpTimer);
-			// A local descendant error must cancel sibling recursive waits owned by
-			// this barrier before their propagation listeners are removed.
-			cancellation.abort();
-			externalSignal?.removeEventListener("abort", cancelFromParent);
-			cancellation.signal.removeEventListener("abort", onCancelled);
-			this._rlmQuiescenceWaitAborts.delete(cancellation);
-		}
+		return waitForRlmQuiescence(this, externalSignal);
 	}
 
 	// Inline (non-daemon) mode only; daemon clients attach to the child session directly.
@@ -17541,26 +17278,8 @@ export class AgentSession {
 		return true;
 	}
 
-	// A done child sits in BOTH maps until passivation; the visited set keeps that dual membership from doubling the walk.
 	*_rlmSubtreeSessions(): Generator<AgentSession> {
-		const visited = new Set<AgentSession>([this]);
-		const stack: AgentSession[] = [this];
-		while (stack.length > 0) {
-			const session = stack.pop()!;
-			yield session;
-			for (const run of session._activeRlmChildRuns.values()) {
-				if (run.session && !visited.has(run.session)) {
-					visited.add(run.session);
-					stack.push(run.session);
-				}
-			}
-			for (const { session: retained } of session._rlmChildSessions.values()) {
-				if (!visited.has(retained)) {
-					visited.add(retained);
-					stack.push(retained);
-				}
-			}
-		}
+		yield* rlmSubtreeSessions(this);
 	}
 
 	/** Cancel every running or queued run in this session's subtree. */

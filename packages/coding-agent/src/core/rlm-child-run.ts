@@ -34,6 +34,7 @@ import type {
 	RlmSubagentModelSelection,
 } from "./agent-session.js";
 import { type CustomMessage, createRlmChildFailureMessage, createRlmChildTerminalNoticeMessage } from "./messages.js";
+import { notifyRlmChildStall, type RlmChildStallNoticeHost } from "./rlm-child-stall-notice.js";
 import type { RlmChildStallAbortFacts, RlmChildTerminalOutcomeKind } from "./rlm-child-terminal.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
@@ -593,8 +594,10 @@ function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
  * The seam of `AgentSession` the extracted child-run spawn path reads and mutates.
  * Member names mirror the class's own members so the extraction stays a textual
  * `this.` -> `host.` rename; `AgentSession._startRlmChildRun` delegates with `this`.
+ * The stall-notice pump seam comes from {@link RlmChildStallNoticeHost}: the warn-stage
+ * subscription below calls `notifyRlmChildStall` (rlm-child-stall-notice.ts) directly.
  */
-export interface RlmChildRunHost {
+export interface RlmChildRunHost extends RlmChildStallNoticeHost {
 	readonly _semanticEdges: SemanticEdgeRecorder;
 	readonly settingsManager: SettingsManager;
 	readonly sessionManager: SessionManager;
@@ -654,12 +657,6 @@ export interface RlmChildRunHost {
 		run: RlmChildRun,
 		child: AgentSession,
 		stage: "warn" | "abort" | "unsettled",
-		event: { silentMs: number; thresholdMs: number; diagnostics: StallDiagnostics },
-	): void;
-	_notifyRlmChildStall(
-		run: RlmChildRun,
-		child: AgentSession,
-		sessionName: string,
 		event: { silentMs: number; thresholdMs: number; diagnostics: StallDiagnostics },
 	): void;
 	_findAssistantEntryForMessage(message: AssistantMessage): SessionMessageEntry | undefined;
@@ -949,7 +946,7 @@ export async function startRlmChildRun(
 				}
 				if (event.type === "stall_warning") {
 					host._recordRlmChildStallEvent(run, child, "warn", event);
-					host._notifyRlmChildStall(run, child, sessionName, event);
+					notifyRlmChildStall(host, run, child, sessionName, event);
 					return;
 				}
 				if (event.type === "stall_abort") {

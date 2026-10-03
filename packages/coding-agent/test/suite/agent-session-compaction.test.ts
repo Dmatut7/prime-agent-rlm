@@ -983,6 +983,49 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
+	it("spends the shrink valve once an over-threshold nothing-to-summarize spin reaches the skip streak", async () => {
+		// W29-B10: an over-threshold branch whose kept tail already covers the whole
+		// session skips every threshold compaction. The skip used to count as
+		// nothing, so the spin never ended. The skips now accumulate on their own
+		// streak (the failure streak must not move - it drives the keepRecent
+		// halving for the next attempt) and the streak reaching
+		// COMPACTION_EMERGENCY_SHRINK_FAILURES spends the valve.
+		const harness = await createHarness({
+			models: [{ id: "small-window", contextWindow: 20_000, maxTokens: 200 }],
+			settings: {
+				autoRefine: { enabled: false },
+				// keepRecentTokens far above the branch: every threshold check finds
+				// the kept tail covering the whole session and skips. The window sits
+				// far above the trigger band (9200..20000) so no turn's request is
+				// usage-classified as an overflow.
+				compaction: { enabled: true, reserveTokens: 800, keepRecentTokens: 50_000, triggerRatio: 0.5 },
+			},
+		});
+		harnesses.push(harness);
+		const replies = [fauxAssistantMessage(`first reply ${"r".repeat(18_000)}`)];
+		for (let i = 0; i < 15; i++) replies.push(fauxAssistantMessage(`ok ${i}`));
+		harness.setResponses(replies);
+
+		// ~10000 estimated tokens against the 9200 threshold, all inside the kept
+		// tail: the threshold check skips with a divisible branch.
+		await harness.session.prompt(`start ${"z".repeat(18_000)}`);
+		// A transient skip stays benign: no shrink after the first spin.
+		expect(harness.sessionManager.getBranch().filter((entry) => entry.type === "compaction")).toHaveLength(0);
+		// The cooldown lifts after five new entries, so the spin re-fires every
+		// two to three turns; twelve turns cross the four-skip streak.
+		for (let i = 0; i < 11; i++) {
+			await harness.session.prompt(`next ${i}`);
+		}
+		const shrinkEntries = harness.sessionManager
+			.getBranch()
+			.filter(
+				(entry) =>
+					entry.type === "compaction" &&
+					String((entry as { summary?: unknown }).summary).includes("EMERGENCY CONTEXT SHRINK"),
+			);
+		expect(shrinkEntries).toHaveLength(1);
+	});
+
 	it("ignores stale pre-compaction assistant usage on pre-prompt checks", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
