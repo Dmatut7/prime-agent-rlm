@@ -14,19 +14,16 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-03 深夜，wave-33 已 SHIP）
+## 当前状态（2026-10-04 凌晨，wave-34 已 SHIP）
 
-- HEAD = 见 git log（六批：暖池二期、agents-view 同型修、ambient 间隙补检、autocompact 两洞、
-  compile cache 分发、FORK_NOTES+账本）。
-- wave-33 关键数字：暖池 claim 首建税 60ms 移出受理路径（首 create 86.4→75.8ms）；compile cache
-  随包分发（首装冷启首帧 398→328ms、--help 185→115ms）；ambient 间隙补检（≥0.5s 间隙有界
-  补检一次）；考题基线 7/7（stepfun step-5-preview，$0；2.29M tok；判分器自检 13/13）。
-- 模型智能首条失败模式立项候选：过度自验（EX-4 约 60-70% 花费在答案完成后的冗余验证循环）——
-  提示词/编排侧治，下波。
-- 调研：暖池遥测三件套（Codex 命名可抄：spawn duration / spare age at claim / pool depth）立项
-  wave-34；Z.AI 订阅页标题出现 GLM-5.3 满血/5.2/5-Turbo（下波复核模型集）。
-- 门禁：check EXIT 0、hygiene OK、单测 9533 绿（3 例负载抖动隔离即绿）、suite 1669/1669、
-  tui 1262/1262、python 768（1 例负载阈值隔离即绿）。
+- HEAD = 见 git log（四批：过度自验治理、暖池遥测、模型表核准、FORK_NOTES+账本）。
+- wave-34 关键数字：EX-4 答案完成后开销 −71~84%（总 708k→261k tok 最优 rep，判分仍全过）；
+  暖池遥测三件套落 agent.jsonl（零 wire）；Z.AI 模型集复核=零差额；/model 两次 Enter 销账
+  （带参命令补全两段式，有意设计）。实机验证暖池/compile-cache/ambient 补检三修复全部在役。
+- 过度自验根因记录：编排层 finish gate（self-recovery.ts）证据关键词表太窄 + nudge 重跑优先；
+  治理按归因落在编排，提示词层未动。二期候选：验证调用预算（OpenAI 固定预算式）。
+- 门禁：check EXIT 0、hygiene OK、单测 9542 绿（2 例负载抖动隔离即绿）、suite 1669/1669、
+  ai 全绿；tui/python 本波无改动未重跑。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -103,14 +100,14 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-34 候选）
+## 下一波主题（wave-35 候选）
 
-1. 【过度自验治理】考题基线头号失败模式（EX-4 冗余验证烧 60-70% 花费）：提示词加「答案落盘
-   即交卷」约束 / 编排侧自检次数上限；改完重跑 EX-4 看 token 曲线。
-2. 【暖池遥测三件套】照 Codex 命名：spawn duration{status} / spare age at claim{outcome} /
-   pool depth gauge + 回收归因（/tmp/wave33/research.md §1）。
-3. 【per-model 窗口/autocompact 主体】服务端权威窗口 + 首请求 ≤1.5s 有界等待 + 切模型即时
-   重绑（安全子集 wave-33 已落：zero-usage 兜底 + refusal 换模型重试）。
-4. 【Z.AI 模型集复核】订阅页标题出现 GLM-5.3 满血/5.2/5-Turbo，跑 generate-models.ts 核。
-5. 【/model 两次 Enter】走查观察项复核（wave-32 遗留）。
-6. 【记忆帽裁决】仍待老板三选一；turn 级内存观测（Codex codex.turn.memory 式）可先落。
+1. 【模型选择持久化一致性】CC 2.1.288 漏采条：选新模型被服务端拒绝后，重启不得自称新模型；
+   对照 Codex 四条（#49144/#49161/#49171/#49135）核我们的 resume/fork/历史回放一致性。
+2. 【过度自验二期】验证调用预算（OpenAI 固定预算式）+ 具名单点 verify 惯例评估
+   （/tmp/wave34/research.md §1）。
+3. 【per-model 窗口/autocompact 主体】顺延第四波：服务端权威窗口 + 有界等待 + 切模型即时
+   重绑。注意连续顺延——下波再不动就降级。
+4. 【暖池遥测消费面】指标要进 `status`/UI 需 capability 演进（daemon 协议）——出方案再定。
+5. 【记忆帽裁决】仍待老板三选一；turn 级内存观测可先落。
+6. 【AgentSession 壳评审】六刀后 20848 行，壳里还剩什么该搬的簇（复杂度复扫）。

@@ -1,4 +1,13 @@
-## 2026-10-03 wave-33 七路：暖池二期、ambient 间隙补检、autocompact 两洞、compile cache 随包分发
+## 2026-10-03 wave-34 六路：过度自验治理、暖池遥测、模型表核准、/model 销账
+
+- 过度自验根治（考题基线头号失败模式）：根因在编排层 self-recovery finish gate——模型合规引用证据的措辞（"Verification passed" 等）打不中关键词表，nudge 文案又是重跑优先。改为：证据关键词表扩宽 + nudge 改「引用已有输出优先，已过的检查不重跑」+ 判定词契约（引用必须带明文判定词）。EX-4 实测 A/B：答案完成后的开销 −71~84%，总 token 708k→261k（最优 rep），判分 4/4 仍全过。首次验证不受影响。
+- 暖池运行时遥测落地：spawn 耗时{状态}/claim 结果{hit|miss|expired}+spare 年龄/池深度/回收按六类原因分桶，结构化日志进 agent.jsonl（Codex/Lambda/HikariCP 命名惯例），零 wire 变更；顺修 sweep 与 childClosed 双重处置同一 spare 的竞态。
+- Z.AI 模型集复核：GLM-5.3 满血与 5-Turbo 在 wave-31 刷新时已就位，表无需改；重新生成只吸收 8 行 OpenRouter 上游漂移。/model「两次 Enter」复核销账：那是带参命令补全浮层的两段式（第一次采纳补全、第二次提交），有意设计且有测试钉住。
+- 实机验证（22 张截图）：暖池在役（受理 72-100ms vs 关池 220ms）、compile cache 分发生效（首帧净效应 65-120ms）、ambient 间隙补检生效（纯思考间隙的写入在下一 cell 回合正确标「工作区」）。
+- 调研：过度自验的同行治理惯例归档（OpenAI eagerness 三件套、OpenHands StuckDetector、CC 具名 verify skill）——二期候选=验证预算；新立项：模型选择持久化一致性（CC 2.1.288 漏采条：选模型被拒后重启不得自称新模型）。
+- 门禁：check EXIT 0、hygiene OK、单测 9542 绿（2 例负载抖动隔离即绿）、suite 1669/1669、ai 包全绿。tui/python 本波无改动未重跑。需要重新编译并重启后才生效。
+
+
 
 - 暖 worker 池二期：预热阶段把工具装配/设置读取一并做掉（claim 首建税 60ms 移出受理路径），首个 create 86.4→75.8ms、稳态 90.5→80.4ms；spare 三态一等公民化（warming 中 claim 有界等待 750ms 不丢、failed 显式终态落日志）；审计证实无关生命周期事件（set_model/reload/kill 已认领会话）不波及池内 spare。Windows 代码审查通过。
 - agents-view 的 alt+x 同型缺陷修复（与 wave-32 P2 同构：待命快照点名集合 + 如实回执），4 例回归钉住。
