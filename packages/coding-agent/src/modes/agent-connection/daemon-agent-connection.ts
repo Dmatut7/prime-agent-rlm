@@ -243,6 +243,20 @@ export function isTerminalReconnectError(error: unknown): boolean {
 
 const TERMINAL_RECONNECT_ERROR_PATTERNS: readonly RegExp[] = [/^Unknown active session\b/];
 
+/**
+ * Codex #50465's reconnect-jitter shape: a uniform draw in [base/2, base], so
+ * the configured value stays the cap. A shared outage (a daemon restart knocking
+ * every attached window off at once) would otherwise synchronize the retry
+ * pulses of every window for the life of the outage.
+ */
+export function reconnectDelayWithJitterMs(baseDelayMs: number, random: () => number = Math.random): number {
+	if (baseDelayMs <= 1) {
+		return baseDelayMs;
+	}
+	const half = baseDelayMs / 2;
+	return Math.max(1, Math.round(half + random() * half));
+}
+
 function reconnectDaemonTransportAfterUpdate(client: DaemonTransportClient): Promise<void> {
 	const existing = updateTransportReconnects.get(client);
 	if (existing) {
@@ -2085,8 +2099,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					}
 					const delayMs = Math.min(
 						...(deadline !== undefined ? [deadline - Date.now()] : []),
-						2000,
-						100 * 2 ** Math.min(attempt, 5),
+						reconnectDelayWithJitterMs(Math.min(2000, 100 * 2 ** Math.min(attempt, 5))),
 					);
 					attempt++;
 					await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs));
@@ -2194,7 +2207,13 @@ export class DaemonAgentConnection implements AgentConnection {
 				resolveSleep();
 			};
 			this.backgroundRetryWake = wake;
-			timer = setTimeout(wake, this.options.backgroundReconnectRetryMs ?? DAEMON_BACKGROUND_RECONNECT_RETRY_MS);
+			// Jittered like the fast loop: the spent-budget handoff starts this loop in
+			// every window of a shared outage at once, and a fixed interval would keep
+			// their retry pulses synchronized indefinitely.
+			timer = setTimeout(
+				wake,
+				reconnectDelayWithJitterMs(this.options.backgroundReconnectRetryMs ?? DAEMON_BACKGROUND_RECONNECT_RETRY_MS),
+			);
 		});
 	}
 

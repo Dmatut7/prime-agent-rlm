@@ -1,0 +1,1 @@
+- Fixed reconnect pulses staying synchronized after a shared daemon outage: both the foreground reconnect backoff and the background retry loop now draw a uniform jitter in [base/2, base], so a daemon restart that knocks every attached window off at once no longer makes them retry in lockstep for the life of the outage.

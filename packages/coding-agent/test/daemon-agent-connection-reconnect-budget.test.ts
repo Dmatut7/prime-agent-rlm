@@ -164,10 +164,15 @@ async function advance(ms: number, stepMs = 5_000): Promise<void> {
 describe("P1-7b reconnect budget and background retry", () => {
 	beforeEach(() => {
 		vi.useFakeTimers();
+		// The reconnect loops jitter their delays into [base/2, base]; pinning the
+		// draw to the top of the range restores the fixed-base spacing these exact
+		// attempt counts assert.
+		vi.spyOn(Math, "random").mockReturnValue(1);
 	});
 
 	afterEach(() => {
 		vi.useRealTimers();
+		vi.restoreAllMocks();
 	});
 
 	it("keeps recovering when the daemon returns after 90s and never reports a terminal close", async () => {
