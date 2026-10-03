@@ -6555,6 +6555,9 @@ export class InteractiveMode {
 		this.retryLoader?.stop();
 		this.retryLoader = undefined;
 		this.clearQuotaPark();
+		// The spend cell blanks at render from here on; its cadence (idle tick, pending
+		// refresh, the figure itself) must not keep scanning a connection that is gone.
+		this.syncSubagentSpendCell();
 		this.syncWorkingLoader();
 		this.ui.requestRender();
 	}
@@ -7676,11 +7679,16 @@ export class InteractiveMode {
 
 	/**
 	 * Whether the spend cell is on screen right now: the user left it enabled, the
-	 * session has a sub-agent family to total up, and the terminal is not suspended.
+	 * session has a sub-agent family to total up, the terminal is not suspended, and
+	 * the connection is still live. A lost connection blanks the cell at render, so
+	 * its cadence stops here too - and no late event can re-arm it.
 	 */
 	private isSubagentSpendCellVisible(): boolean {
 		return (
-			!this.terminalSuspended && this.subagentCounts.total > 0 && this.settingsManager.getSubagentSpendCellEnabled()
+			!this.connectionLost &&
+			!this.terminalSuspended &&
+			this.subagentCounts.total > 0 &&
+			this.settingsManager.getSubagentSpendCellEnabled()
 		);
 	}
 
@@ -7688,7 +7696,8 @@ export class InteractiveMode {
 	 * Keep the cell's cadence in step with whether it is on screen.
 	 *
 	 * Called from every path that can change the answer (counts, the setting, the
-	 * terminal moving in and out of suspension), and cheap on purpose: it arms the idle
+	 * terminal moving in and out of suspension, the connection closing), and cheap on
+	 * purpose: it arms the idle
 	 * tick when there is a cell to keep fresh, and tears the tick, the pending refresh
 	 * and the figure down when there is not - a disabled or empty cell must not keep
 	 * scanning, and must not leave a stale figure behind for the next family.

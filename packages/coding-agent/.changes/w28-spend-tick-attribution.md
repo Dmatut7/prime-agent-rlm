@@ -1,0 +1,2 @@
+- Stopped the subagent spend cell's idle ticker when the connection closes for good (it kept polling a dead session every 15s); the figure clears with the session.
+- Changed the change-counter to attribute workspace churn honestly: a turn's tally now separates what this session wrote from what other windows or processes changed ("本会话改了 X" vs "工作区另有 Y 个变动"), and ambient changes stay out of the compaction handoff's file list.

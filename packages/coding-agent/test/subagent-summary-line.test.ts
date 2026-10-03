@@ -992,6 +992,40 @@ describe("subagent spend cell", () => {
 		}
 	});
 
+	it("stops the idle tick and blanks the figure when the connection closes for good", async () => {
+		vi.useFakeTimers();
+		try {
+			const { mode, setSpend, getContextTree, update } = createSpendMode({
+				contextTree: tree(usage(1_000, 500, 0.5), [agent("sub-1", usage(2_000, 1_000, 1.2), undefined)]),
+			});
+			// The terminal-close entry point every dead-connection path lands on (a
+			// session-gone answer, a dropped daemon, a reconnect budget that ran out).
+			const noteConnectionClosed = Reflect.get(InteractiveMode.prototype, "noteConnectionClosed") as (
+				this: typeof mode,
+			) => void;
+
+			// Family on screen: the leading fill lands, then the 15s tick keeps it fresh.
+			update.call(mode, child("worker", "running"));
+			await vi.advanceTimersByTimeAsync(600);
+			expect(getContextTree).toHaveBeenCalledTimes(1);
+			await vi.advanceTimersByTimeAsync(15_000);
+			expect(getContextTree).toHaveBeenCalledTimes(2);
+
+			// The close blanks the cell at render; its cadence must leave with it.
+			noteConnectionClosed.call(mode);
+			expect(setSpend).toHaveBeenLastCalledWith(undefined);
+			await vi.advanceTimersByTimeAsync(120_000);
+			expect(getContextTree).toHaveBeenCalledTimes(2);
+
+			// A late child update (a queued event landing after the close) cannot re-arm it.
+			update.call(mode, child("worker", "running", { activity: { kind: "executing" } }));
+			await vi.advanceTimersByTimeAsync(60_000);
+			expect(getContextTree).toHaveBeenCalledTimes(2);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("does not scan or render a figure while the cell is switched off or the terminal is suspended", async () => {
 		vi.useFakeTimers();
 		try {
