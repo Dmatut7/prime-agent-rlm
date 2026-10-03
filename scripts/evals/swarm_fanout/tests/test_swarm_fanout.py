@@ -273,6 +273,22 @@ class FixtureIntegrity(unittest.TestCase):
             self.assertIn(f"for shards/{first['file']} the child name is {first['worker']}", task)
             self.assertNotIn(f"{other_prefix}-01", task)
 
+    def test_task_txt_pins_bare_shard_file_name_in_artifact(self):
+        # wave-27 EX-6 failed three times in the same shape: the shard
+        # list names shards as "shards/<file>" while the artifact
+        # contract wrote only "<shard-file-name>", and models reasonably
+        # copied the prefixed spelling into combined-index.md, which the
+        # scorer's exact bare-name lookup graded as all-missing. The
+        # prompt must pin the bare file name with a positive and a
+        # negative example for its own fixture.
+        for name in ("json-events", "csv-metrics"):
+            manifest = fixture_manifest(name)
+            task = (FIXTURES / name / "task.txt").read_text()
+            first = manifest["shards"][0]["file"]
+            self.assertIn("bare file name", task, name)
+            self.assertIn(f'"- {first}:', task, name)
+            self.assertIn(f'never "- shards/{first}:', task, name)
+
     def test_task_txt_forbids_harness_access(self):
         # exam-v1 D9 (wave-15): the prompt must outlaw reading or executing
         # the harness/manifest and touching anything outside the repo copy.
@@ -507,6 +523,68 @@ class ScorerTests(unittest.TestCase):
         outcome["artifact_text"] = artifact + "\n" + f"- {first_shard}: {expected}\n"
         result = scorer.score_fixture(self.fixture, outcome)
         self.assertTrue(result["coverage"])
+
+    def test_coverage_normalizes_shard_path_prefixes(self):
+        # wave-27 EX-6 incident shape: every bullet written with the
+        # shards/ prefix (the spelling the task prompt's shard list
+        # uses) must still cover, and so must a mixed artifact using
+        # the bare, shards/, ./, and ./shards/ spellings together.
+        outcome = passing_outcome(self.fixture)
+        outcome["artifact_text"] = (
+            "\n".join(f"- shards/{shard['file']}: {shard['expected']}" for shard in self.fixture["shards"]) + "\n"
+        )
+        result = scorer.score_fixture(self.fixture, outcome)
+        self.assertTrue(result["coverage"])
+        self.assertEqual(result["missing_shards"], [])
+        self.assertTrue(result["resolved"])
+        prefixes = ["", "shards/", "./", "./shards/"]
+        mixed = [
+            f"- {prefixes[index % len(prefixes)]}{shard['file']}: {shard['expected']}"
+            for index, shard in enumerate(self.fixture["shards"])
+        ]
+        outcome["artifact_text"] = "\n".join(mixed) + "\n"
+        result = scorer.score_fixture(self.fixture, outcome)
+        self.assertTrue(result["coverage"])
+        self.assertTrue(result["resolved"])
+
+    def test_prefixed_bullet_with_wrong_answer_scores_wrong_not_missing(self):
+        # A prefixed bullet whose answer is wrong must land in
+        # wrong_answers under the bare file name, not vanish into
+        # missing_shards.
+        outcome = passing_outcome(self.fixture)
+        first = self.fixture["shards"][0]
+        lines = [f"- shards/{shard['file']}: {shard['expected']}" for shard in self.fixture["shards"]]
+        lines[0] = f"- shards/{first['file']}: 999999"
+        outcome["artifact_text"] = "\n".join(lines) + "\n"
+        result = scorer.score_fixture(self.fixture, outcome)
+        self.assertFalse(result["coverage"])
+        self.assertEqual(result["missing_shards"], [])
+        self.assertEqual(list(result["wrong_answers"]), [first["file"]])
+        self.assertEqual(result["wrong_answers"][first["file"]]["found"], ["999999"])
+
+    def test_conflicting_duplicates_across_spellings_block_coverage(self):
+        # Normalization must not launder conflicts: a bare correct
+        # bullet plus a prefixed wrong bullet are two answers to one
+        # shard, and coverage fails.
+        outcome = passing_outcome(self.fixture)
+        first = self.fixture["shards"][0]
+        artifact = outcome["artifact_text"].rstrip()
+        outcome["artifact_text"] = artifact + "\n" + f"- shards/{first['file']}: 999999\n"
+        result = scorer.score_fixture(self.fixture, outcome)
+        self.assertFalse(result["coverage"])
+        self.assertEqual(list(result["wrong_answers"]), [first["file"]])
+
+    def test_coverage_ignores_foreign_directory_prefixes(self):
+        # Only the shards/ and ./ spellings the prompt itself uses are
+        # normalized away; a bullet naming another directory is a wrong
+        # reference, not a spelling variant.
+        outcome = passing_outcome(self.fixture)
+        outcome["artifact_text"] = (
+            "\n".join(f"- data/{shard['file']}: {shard['expected']}" for shard in self.fixture["shards"]) + "\n"
+        )
+        result = scorer.score_fixture(self.fixture, outcome)
+        self.assertFalse(result["coverage"])
+        self.assertEqual(len(result["missing_shards"]), 8)
 
     def test_replay_edges_keyed_by_child_id_and_path(self):
         # Two spawns sharing a childId but naming different child

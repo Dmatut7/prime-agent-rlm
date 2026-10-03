@@ -34,6 +34,9 @@ How to run the fan-out:
    repository root with exactly one bullet line per shard, in this
    exact format:
    - <shard-file-name>: <answer>
+   Here <shard-file-name> is the shard's bare file name with no
+   directory prefix: for shards/metrics-01.csv write
+   "- metrics-01.csv: <answer>", never "- shards/metrics-01.csv: <answer>".
    Copy each answer verbatim from the child's reply. The file must
    cover all 8 shards.
 

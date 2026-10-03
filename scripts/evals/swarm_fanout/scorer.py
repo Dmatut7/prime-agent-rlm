@@ -7,7 +7,10 @@ without a model or network.
 
 Rubric (all four are required for a resolved run):
   - coverage: every shard's answer appears in combined-index.md and
-    matches the machine-computed expected value from the fixture.
+    matches the machine-computed expected value from the fixture. Bullet
+    keys are normalized before lookup: the "./" and "shards/" prefixes
+    the task prompt itself uses are stripped, so a compliant
+    directory-prefixed spelling still names its shard.
   - delegation evidence: at least one depth-1 spawn edge per shard that is
     live or was deleted only after its reply reached the parent (the task
     prompt sanctions rlm.delete_subagent cleanup), each with a distinct
@@ -196,7 +199,11 @@ def parse_answers(artifact_text: str) -> dict[str, list[str]]:
     Duplicate bullets are kept, not overwritten: a shard answered twice
     with conflicting values must not pass coverage just because one of
     the two happens to be right. Coverage requires every occurrence to
-    match the expected answer.
+    match the expected answer. Bullet keys go through
+    _normalize_shard_key first: the task prompt's shard list names
+    shards as "shards/<file>", so a compliant model may carry that
+    spelling (or a "./" prefix) into the artifact, and both spellings
+    name the same shard.
     """
     answers: dict[str, list[str]] = {}
     for line in artifact_text.splitlines():
@@ -204,8 +211,23 @@ def parse_answers(artifact_text: str) -> dict[str, list[str]]:
         if match is None:
             continue
         shard, answer = match.group(1), match.group(2)
-        answers.setdefault(shard, []).append(answer)
+        answers.setdefault(_normalize_shard_key(shard), []).append(answer)
     return answers
+
+
+def _normalize_shard_key(shard: str) -> str:
+    """Strip the directory prefixes the task prompt itself uses.
+
+    Only "./" (repeated) and a single "shards/" prefix are spelling
+    variants of the bare file name; a bullet naming any other directory
+    is a wrong reference and must stay unmatched.
+    """
+    key = shard
+    while key.startswith("./"):
+        key = key[2:]
+    if key.startswith("shards/"):
+        key = key[len("shards/"):]
+    return key
 
 
 def score_coverage(fixture: dict, answers: dict[str, list[str]]) -> dict:

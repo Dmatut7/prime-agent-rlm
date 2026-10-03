@@ -211,6 +211,20 @@ python3 -m unittest discover -s tests -v
   `--corpus-glob`; changed/missing/extra answer-source files, a missing or
   anchor-less run-meta, and a post-launch-rewritten pin all grade red.
 
+## Defect history (v1.3 -> v1.4, wave-27 EX-6 evidence)
+
+- **D11** EX-6 (swarm-fanout): three wave-27 runs failed in the same
+  shape - the model wrote `- shards/events-01.jsonl: 3` bullets (the
+  directory-prefixed spelling the task prompt's shard list uses), while
+  the scorer keyed answers by the literal bullet text and looked up the
+  bare fixture file name, so all eight shards graded missing. Both
+  readings had textual support: the shard list names shards as
+  `shards/<file>`, the artifact contract wrote only `<shard-file-name>`.
+  task.txt now pins the bare file name with a positive and a negative
+  example per fixture, and the scorer normalizes the `./` and `shards/`
+  prefixes before lookup (the prompt stays the primary contract; the
+  normalization keeps a compliant-but-prefixed artifact scoreable).
+
 ## Known limits / v1.1 candidates
 
 - EX-3 uses SIGTERM (determinism first); a SIGKILL variant (orphan worker and
