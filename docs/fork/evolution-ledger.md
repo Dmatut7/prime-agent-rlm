@@ -14,23 +14,22 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-03 傍晚，wave-29 已 SHIP）
+## 当前状态（2026-10-03 晚，wave-30 已 SHIP）
 
-- HEAD = 见 git log（十二批：B01 记忆 digest 两层化、B10 压缩空转、第六刀+B01/B10 接线合批
-  （agent-session.ts 单文件三关切，commit message 已披露）、B03 生命周期 status+/model 推荐、
-  B04 ambient 行内标记、B05 重连抖动、B06 bash UTF-8 接缝、B07 空回复重试、B08 考题 v1.5、
-  B09 受理即心跳、docs×2、FORK_NOTES+账本）。
-- wave-29 关键决策：写侧索引帽默认关（真库索引足迹 491KB ≫ 12KiB 帽，阶段 3 归并工序是开启前置）；
-  skip 连击走独立计数器（_consecutiveCompactionSkips）——并入失败连击会触发 keepRecent 减半、
-  把下一次压缩切点挪飞（三例 suite 红的事故链：阈值跳过被记成失败 → 溢出压缩切口错位 →
-  shrink 阀无可切 → 恢复被判终态）。
-- 门禁：check EXIT 0、hygiene OK、单测 9454 绿（compaction-emergency-shrink-linear /
-  daemon-supervisor-process disposal / process-tree-cpu 三例负载抖动，隔离即绿）、
-  suite 1664/1664 绿、tui 1251（8MB paste 一例负载抖动，隔离绿）、python OK（skipped=3）。
-- 修复方法论沉淀（wave-29）：suite 红先对基线（git worktree at HEAD + 软链 node_modules 单测复跑）
-  再动刀；探针打在三处（触发点/阀门内部早退/分支形状）一次定位；scratch 测试文件用完即删。
-- 遥测：wave-24~28 修复在役零抱怨；R05 实测发现 probe-bus 997 推送丢 decrpmValue（wave-30 修）；
-  B11 画像预警 RPC get_state +16% / TUI 首帧 +24%（十波多点累积，wave-30 专项）。
+- HEAD = 见 git log（六批：PERF-RPC git 快路径、PERF-TUI compile-cache 前提、probe-bus 997、
+  MEM-3 consolidation、EX-2 parity、FORK_NOTES+账本）。
+- wave-30 关键数字：暖 daemon 首帧 626→560ms（对基线 +24%→+15%）、冷启 888-978→752-814ms；
+  RPC get_state 844.2→822.9ms、create 段 -30ms（git 3×spawnSync→读文件）。
+  剩余最大杠杆：worker create ~300ms（预热/池化）；tsc 模块图双进程串行 ~610ms（结构性）。
+- 记忆阶段 3 交付但带出硬结论：12KiB 帽在真库（1577 条、中位行宽 303B、id 占 40%）靠
+  merge/delete/rename 不可达（需 ~97% 削减）；三选项（archive 分层/放宽帽/id 重键）在
+  /tmp/wave30/mem3-consolidation.md，待老板裁决——裁决前 enforceIndexCap 保持默认关。
+- B07 前缀续跑维持销账（转立项三触发条件：重花账单 >子代理周耗 5% / 供应商链收敛到 prefill /
+  上游公开续跑规范）。
+- 待裁决新增：tsc 入口与 bundle 入口 buildId 互判 stale，混用 prime-agent 与 prime-agent.sh
+  会互相替换 daemon（PERF-RPC lane 实测撞上）。
+- 门禁：check EXIT 0、hygiene OK、单测 9483 绿（4 例负载抖动隔离即绿）、suite 1664/1664、
+  tui 1252/1252、python 760（1 例负载阈值隔离即绿）、evals 77 绿。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -107,13 +106,18 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-30 候选）
+## 下一波主题（wave-31 候选）
 
-1. 【性能回归专项】RPC get_state 899.9ms（+16%）/ TUI 首帧 +24%，十波多点累积；用 B11 画像
-   （/tmp/wave29/perf-refresh.md）做 bisect 定位，逐点回收或立项。
-2. 【记忆阶段 3】consolidation 归并工序（写侧索引帽默认开启的前置）：近重复合并、过期条目清理、
-   标题瘦身；做完才允许 harness.enforceIndexCap 默认翻 true。
-3. 【probe-bus 修复】997 推送丢 DECRPM 应答的 decrpmValue（R05 实测），顺带真机复核包
-   （kitty/ghostty，2027 per-screen + 2031 深浅色）。
-4. 【B07 遗留复核】前缀续跑销账为遗留（风险高于收益），wave-30 复核证据是否变化。
-5. 【EX-2 manifest parity】exams v1.5 后续对齐。
+1. 【首帧预算专项二期】worker create ~300ms（预热/池化）是回 <500ms 最大杠杆；tsc 模块图
+   双进程串行 ~610ms 为结构性主项（需裁决是否动安装形态）；daemon get_state 预热
+   （启动后台预聚合快照，对齐 Codex 连接常驻/openai-node prewarming 范式）。
+2. 【记忆帽裁决落地】老板三选一（archive 分层/放宽帽/id 重键）后实施；Anthropic memory
+   store beta 作为 remote tier 参照跟踪。
+3. 【probe-bus hardening】reply-drain 钩子（suspend/exit/开 editor 前 drain 探测回复）+
+   「探测回复永不进用户可见流」与「capability detection 后 stdin 必恢复」两条不变量测试
+   （CC 2.1.271 / Gemini #29487 同类坑）；mode 2027 探测项注册（DECRQM+超时+值完整传递）。
+4. 【packages/ai】refusal stop reason 覆盖 + 测试矩阵；GLM-5.x models 表刷新 +
+   autocompact 窗口 per-model 化（CC 2.1.288 同改）。
+5. 【构建管线】compile cache portable+readOnly 随 bundle 分发；tsc/bundle buildId 互杀
+   daemon 裁决（附带发现）。
+6. 【EX-2 后续】exams v1.5 剩余 parity 项收尾。

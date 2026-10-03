@@ -1,4 +1,15 @@
-## 2026-10-03 wave-29 十二路：记忆 digest 两层化、第六刀、压缩空转终结
+## 2026-10-03 wave-30 七路：启动性能回收两刀、997 丢字段修复、记忆归并工序
+
+- 启动性能两刀（对 wave-29 画像发现的回归动刀）：① `enableCompileCache()` 挪到 cli-main 静态导入图之前——此前它在 runCli() 体内才执行，~5MB 导入图从未吃到编译缓存；暖 daemon 首帧 626→560ms、冷启 888-978→752-814ms、`--help` 184→146ms。② worker 创建链的 git 上下文采集从 3×spawnSync(git) 改为直接读 HEAD/refs 文件（packed-refs/unborn/worktree/GIT_DIR 等非常规一律回退原路径）——RPC get_state 844.2→822.9ms、create 段 −30ms。首帧对基线从 +24% 收到 +15%；最大剩余杠杆是 worker create ~300ms（预热/池化，待立项）。
+- probe-bus 997 推送不再丢 DECRPM 已记的 decrpmValue（推送分支曾整体替换 scheme2031 状态把该字段抹掉）；同值推送的重复噪声通知顺带消掉，DECSET/OSC 重查询行为不变。
+- 记忆阶段 3：consolidation 归并工序落地（`rlm.harness.plan_consolidation`/`apply_consolidation` + TS parity，dry-run 默认，apply 带 store_digest 拒旧闸；merge/delete/rename 三类操作清单）。真库 dry-run：默认方案 491.5→481.7KB（34 merges + 182 renames），激进档 377KB，含陈旧清理 330.8KB。硬结论：12KiB 帽靠归并在真库（1577 条）不可达，需 ~97% 削减——archive 分层 / 放宽帽 / id 重键三选项待裁决。
+- 考题 EX-2 与 v1.5 manifest-rail 契约对齐（manifest 含答案钥直写 rail 目录、work 侧遗留或伪造即判负、rescan 对账门），77 例绿。
+- 调研转化（10 条带 URL，/tmp/wave30/research.md）：CC 首帧预算四连版（2.1.281-284）对照我们的回归立项；Gemini CLI stdin-restore 与 Codex SQLite stall 印证 probe-bus/get_state 方向；Node compile cache portable+readOnly 可随 bundle 分发（构建管线候选）；Anthropic SDK 新增 refusal stop reason（packages/ai 需覆盖）；GLM-5.2 上 1M 上下文 → models 表刷新 + autocompact per-model 化。
+- B07 前缀续跑维持销账（转立项三触发条件记录在 /tmp/wave30/b07-review.md）。
+- 附带发现待裁决：tsc 入口与 bundle 入口 buildId 互判 stale——混用 `prime-agent` 与 `prime-agent.sh` 会互相替换 daemon。
+- 门禁：check EXIT 0、hygiene OK、单测 9483 绿（4 例负载抖动隔离即绿）、suite 1664/1664 绿、tui 1252/1252 绿、python 760（1 例负载阈值隔离即绿）、evals 77 绿。需要重新编译并重启后才生效。
+
+
 
 - 记忆 digest 两层化（记忆阶段 2）：相关窗口之外的条目不再是匿名的「+N more」计数，而是紧凑的 id+标题索引（默认 12KiB 字节帽，`harness.digestIndexMaxBytes` 可调），模型可按 id 直接取详情。真库面值 13.8KB→25.8KB（1.87×，红线 2× 内）。写侧索引帽闸已实现但默认关闭（`harness.enforceIndexCap`）——真库索引足迹 491KB 远超帽值，阶段 3 归并工序建好前开启会冻结全部记忆写入；/refine 回执新增近重复与 path 受控词表提醒（与内核 wave-26 parity，同 fixture 双端得分逐位相等）。
 - 压缩「无可总结内容」空转终结：超阈值但保留尾已覆盖全部时，跳过不再是零成本无限循环——跳过在专用连击计数上累积（不碰失败连击：那条计数还驱动下一次压缩的 keepRecent 减半，混用会把切点挪飞），第四次跳过触发紧急 shrink 阀。溢出恢复的三条既有契约原样保持（w9a 逃逸路线、goal 续跑、一次一阀），新增 skip-streak 套件测试钉住。
