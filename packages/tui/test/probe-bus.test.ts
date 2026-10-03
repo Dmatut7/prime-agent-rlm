@@ -489,6 +489,30 @@ describe("ProbeBus", () => {
 			}
 		});
 
+		it("a 997 push keeps the decrpmValue an earlier DECRPM answer recorded", () => {
+			const { bus, writes } = startBus({ env: {} });
+			try {
+				const seen: CapabilityState[] = [];
+				bus.onChange("scheme2031", (_cap, state) => seen.push(state));
+				bus.handleSequence("\x1b[?2031;2$y");
+				assert.strictEqual(bus.handleSequence("\x1b[?997;1n"), true);
+				assert.deepStrictEqual(bus.query("scheme2031"), {
+					verdict: "supported",
+					source: "probe",
+					decrpmValue: 2,
+				});
+				// The push no longer rewrites the state: one notification (the DECRPM).
+				assert.deepStrictEqual(seen, [{ verdict: "supported", source: "probe", decrpmValue: 2 }]);
+				// ...but the push still drives the DECSET and the OSC re-query.
+				assert.deepStrictEqual(writes.slice(1), [
+					"\x1b[?2031h",
+					QUERY_DEFAULT_FOREGROUND + QUERY_DEFAULT_BACKGROUND,
+				]);
+			} finally {
+				bus.dispose();
+			}
+		});
+
 		it("never enables on a refusal (Pv=0/4), fence silence, or the fallback timer", async () => {
 			const refused = startBus({ env: {} });
 			try {

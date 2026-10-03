@@ -252,8 +252,15 @@ export class ProbeBus {
 			// A 997 push means mode 2031 is live (even if a previous owner set it):
 			// record the capability, make sure the mode is enabled, and route the
 			// push into an oscColors refresh (docs/fork/probe-bus-design.md §4) so
-			// an appearance flip re-themes without waiting for a restart (P8).
-			this.setStateUnlessOverridden("scheme2031", { verdict: "supported", source: "probe" });
+			// an appearance flip re-themes without waiting for a restart (P8). The
+			// push is not a DECRPM answer, so keep the Pv an earlier answer
+			// recorded instead of dropping it.
+			const pushState: CapabilityState = { verdict: "supported", source: "probe" };
+			const recordedPv = this.states.get("scheme2031")!.decrpmValue;
+			if (recordedPv !== undefined) {
+				pushState.decrpmValue = recordedPv;
+			}
+			this.setStateUnlessOverridden("scheme2031", pushState);
 			this.maybeEnableScheme2031();
 			if (this.query("scheme2031").verdict === "supported") {
 				this.refreshOscColors();
