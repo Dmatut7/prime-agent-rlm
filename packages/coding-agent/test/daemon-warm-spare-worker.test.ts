@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ENV_AGENT_DIR, getDaemonLogPath } from "../src/config.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import {
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
@@ -29,6 +30,7 @@ import {
 
 const ORPHAN_EXIT_ENV = "PRIME_AGENT_INTERNAL_WARM_SPARE_ORPHAN_EXIT_MS";
 const UNCLAIMED_EXIT_ENV = "PRIME_AGENT_INTERNAL_WARM_SPARE_UNCLAIMED_EXIT_MS";
+const WARMUP_ENV = "PRIME_AGENT_INTERNAL_WARM_SPARE_WARMUP";
 
 const roots: string[] = [];
 const savedEnv: Array<[string, string | undefined]> = [];
@@ -117,6 +119,17 @@ describe("warm spare availability policy", () => {
 	});
 });
 
+async function socketAccepts(socketPath: string): Promise<boolean> {
+	return new Promise((resolveConnect) => {
+		const socket = createConnection(socketPath);
+		socket.once("connect", () => {
+			socket.destroy();
+			resolveConnect(true);
+		});
+		socket.once("error", () => resolveConnect(false));
+	});
+}
+
 describe("warm spare worker wiring", () => {
 	async function startSpareWorker(root: string): Promise<{ daemon: AgentDaemon; socketPath: string }> {
 		const agentDir = join(root, "agent");
@@ -137,17 +150,6 @@ describe("warm spare worker wiring", () => {
 	function supervisorLaunchLockPath(deadSupervisorSocket: string): string {
 		const key = createHash("sha256").update(deadSupervisorSocket).digest("hex").slice(0, 12);
 		return join(dirname(deadSupervisorSocket), `.supervisor-launch-${key}.lock`);
-	}
-
-	async function socketAccepts(socketPath: string): Promise<boolean> {
-		return new Promise((resolveConnect) => {
-			const socket = createConnection(socketPath);
-			socket.once("connect", () => {
-				socket.destroy();
-				resolveConnect(true);
-			});
-			socket.once("error", () => resolveConnect(false));
-		});
 	}
 
 	it("exits a never-claimed spare on its unclaimed lifetime", async () => {
@@ -207,5 +209,56 @@ describe("warm spare worker wiring", () => {
 		} finally {
 			liveSupervisor.close();
 		}
+	});
+});
+
+describe("warm spare create warmup", () => {
+	async function startWarmedSpare(root: string): Promise<{ daemon: AgentDaemon; socketPath: string }> {
+		setEnv(SUPERVISOR_REGISTRY_DIR_ENV, isolatedSupervisorRegistryEnv(root)[SUPERVISOR_REGISTRY_DIR_ENV]);
+		setEnv(DAEMON_WORKER_SUPERVISOR_SOCKET_ENV, join(root, "dead-supervisor.sock"));
+		setEnv(DAEMON_WORKER_WARM_SPARE_ENV, "1");
+		// Short enough to double as the in-test cleanup path (shutdown is private):
+		// the assertions land first, then the unclaimed self-exit fires, mocked.
+		setEnv(UNCLAIMED_EXIT_ENV, "400");
+		setEnv(ENV_AGENT_DIR, join(root, "agent"));
+		mkdirSync(join(root, "agent"), { recursive: true });
+		const socketPath = join(root, "worker.sock");
+		const daemon = new AgentDaemon(socketPath, {
+			defaultSessionConfig: { agentDir: join(root, "agent"), cwd: root },
+			createRuntime: vi.fn(),
+			worker: { authenticationToken: "spare-token" },
+		});
+		// start() awaits the warmup: a returned spare is already warm and listening.
+		await daemon.start();
+		return { daemon, socketPath };
+	}
+
+	it("warms the create path before listening, and the spare still serves its socket", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-warm-spare-warmup-"));
+		roots.push(root);
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as typeof process.exit);
+		const { socketPath } = await startWarmedSpare(root);
+
+		expect(readFileSync(getDaemonLogPath(socketPath), "utf8")).toContain("warm spare create warmup completed");
+		expect(await socketAccepts(socketPath)).toBe(true);
+		// The warmup created no session and claimed nothing: the spare keeps its
+		// unclaimed lifecycle and exits on it, mocked, inside this test.
+		expect(exit).not.toHaveBeenCalled();
+		await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0), { timeout: 10_000, interval: 25 });
+		expect(await socketAccepts(socketPath)).toBe(false);
+	});
+
+	it("skips the warmup when disabled by env", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-warm-spare-warmup-off-"));
+		roots.push(root);
+		setEnv(WARMUP_ENV, "0");
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as typeof process.exit);
+		const { socketPath } = await startWarmedSpare(root);
+
+		const logText = readFileSync(getDaemonLogPath(socketPath), "utf8");
+		expect(logText).not.toContain("warm spare create warmup");
+		expect(logText).toContain("listening");
+		expect(await socketAccepts(socketPath)).toBe(true);
+		await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0), { timeout: 10_000, interval: 25 });
 	});
 });

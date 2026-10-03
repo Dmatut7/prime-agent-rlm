@@ -20,7 +20,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { stat } from "node:fs/promises";
-import { createServer, type Server, type Socket } from "node:net";
+import { connect, createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
@@ -92,6 +92,7 @@ import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionRuntime,
 } from "../../core/agent-session-runtime.js";
+import { createAgentSessionFromServices, createAgentSessionServices } from "../../core/agent-session-services.js";
 import {
 	type AgentCronJob,
 	type AgentCronJobRunResult,
@@ -414,6 +415,13 @@ const WARM_SPARE_ORPHAN_EXIT_MS_ENV = "PRIME_AGENT_INTERNAL_WARM_SPARE_ORPHAN_EX
 const DEFAULT_WARM_SPARE_ORPHAN_EXIT_MS = 10_000;
 const WARM_SPARE_UNCLAIMED_EXIT_MS_ENV = "PRIME_AGENT_INTERNAL_WARM_SPARE_UNCLAIMED_EXIT_MS";
 const DEFAULT_WARM_SPARE_UNCLAIMED_EXIT_MS = 15 * 60_000;
+/** PRIME_AGENT_INTERNAL_WARM_SPARE_WARMUP=0|false|no|off skips the spare's pre-listen create warmup. */
+const WARM_SPARE_WARMUP_ENV = "PRIME_AGENT_INTERNAL_WARM_SPARE_WARMUP";
+
+function warmSpareWarmupEnabled(): boolean {
+	const raw = process.env[WARM_SPARE_WARMUP_ENV];
+	return raw === undefined || !/^(?:0|false|no|off)$/i.test(raw.trim());
+}
 
 function warmSpareOrphanExitMs(): number {
 	const raw = Number(process.env[WARM_SPARE_ORPHAN_EXIT_MS_ENV]);
@@ -1102,6 +1110,12 @@ export class AgentDaemon {
 			});
 		}
 		this.installCrashHandlers();
+		if (this.warmSpare) {
+			// Run before listen: the supervisor publishes the spare only once its
+			// socket answers, so "ready" then means fully warm — a claim never
+			// lands on a spare still paying its warmup.
+			await this.runWarmSpareCreateWarmup();
+		}
 		await prepareDaemonSocketPath(this.socketPath);
 
 		this.server = createServer((socket) => this.handleConnection(socket));
@@ -1186,6 +1200,100 @@ export class AgentDaemon {
 				void this.shutdown(0).catch(() => process.exit(0));
 			}, warmSpareUnclaimedExitMs());
 			this.warmSpareUnclaimedTimer.unref();
+			this.warmSpareDispatchSelfProbe();
+		}
+	}
+
+	/**
+	 * A spare's first real command is the claim's worker_auth, so a fresh spare
+	 * pays the one-time parse/dispatch/auth-gate warmup inside the claim window.
+	 * Pay it here instead: one self-connection with a deliberately wrong token.
+	 * The gate refuses it silently (no claim state flips, no log), exactly like
+	 * the supervisor's bare listen probe, and the socket is unref'ed so a stuck
+	 * probe can never hold the process open.
+	 */
+	private warmSpareDispatchSelfProbe(): void {
+		let socket: Socket;
+		try {
+			socket = connect(this.socketPath);
+		} catch {
+			return;
+		}
+		socket.unref();
+		const finish = () => {
+			socket.removeAllListeners();
+			socket.destroy();
+		};
+		socket.once("connect", () => {
+			const payload = Buffer.from(
+				serializeJsonLine({ id: "warm-spare-probe", type: "worker_auth", token: "warm-spare-probe" }),
+				"utf8",
+			);
+			socket.write(
+				encodePrivateFrame({ kind: "command", requestId: "warm-spare-probe", commandType: "worker_auth" }, payload),
+			);
+		});
+		// The refusal response or the gate's socket end both mean the dispatch ran.
+		socket.once("data", finish);
+		socket.once("end", finish);
+		socket.once("error", finish);
+		socket.setTimeout(5_000, finish);
+	}
+
+	/**
+	 * Pre-pay the per-process cost of the first session build: module JIT plus
+	 * the settings/auth/models/extension disk reads. Without it the claim's
+	 * create RPC is this process's first build and pays the full cold price
+	 * (measured ~60-80ms vs ~10ms warm). The throwaway session is in-memory,
+	 * telemetry-free (a phantom "agent started" event must never be spent on a
+	 * warmup), and disposed immediately; the claim still builds its own services
+	 * fresh, so settings/auth read at claim time stay authoritative. Failures
+	 * only mean the claim pays the cold path — they must not block listen.
+	 */
+	private async runWarmSpareCreateWarmup(): Promise<void> {
+		if (!warmSpareWarmupEnabled()) {
+			return;
+		}
+		const config = this.options.defaultSessionConfig;
+		const cwd = config.cwd;
+		const agentDir = config.agentDir;
+		if (!cwd || !agentDir) {
+			return;
+		}
+		const startedAt = Date.now();
+		try {
+			const services = await createAgentSessionServices({
+				cwd,
+				agentDir,
+				telemetryDisabled: true,
+				watchSettingsFile: false,
+				extensionFlagValues: new Map(Object.entries(config.extensionFlagValues ?? {})),
+				resourceLoaderOptions: {
+					additionalExtensionPaths: config.extensions,
+					additionalSkillPaths: config.skills,
+					additionalPromptTemplatePaths: config.promptTemplates,
+					additionalThemePaths: config.themes,
+					noExtensions: config.noExtensions,
+					noSkills: config.noSkills,
+					noPromptTemplates: config.noPromptTemplates,
+					noThemes: config.noThemes,
+					noContextFiles: config.noContextFiles,
+					systemPrompt: config.systemPrompt,
+					appendSystemPrompt: config.appendSystemPrompt,
+				},
+			});
+			const sessionManager = SessionManager.inMemory(cwd);
+			// prewarmIpythonKernel stays off: a warmup must not spawn a kernel for a
+			// session that is disposed a microtask later.
+			const created = await createAgentSessionFromServices({
+				services,
+				sessionManager,
+				prewarmIpythonKernel: false,
+			});
+			created.session.dispose();
+			this.log(`warm spare create warmup completed in ${Date.now() - startedAt}ms`);
+		} catch (error) {
+			this.log(`warm spare create warmup failed; a claim pays the cold path instead: ${String(error)}`);
 		}
 	}
 

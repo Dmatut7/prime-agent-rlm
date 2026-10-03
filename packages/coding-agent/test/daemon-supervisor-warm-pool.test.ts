@@ -63,6 +63,11 @@ const hoisted = vi.hoisted(() => ({
 				cwd: string,
 				onShutdownRequest: () => void,
 		  ) => Promise<FakeWorkerServer>),
+	// Test hooks for the warming/failed states: a listen delay keeps a spare in
+	// "warming", and failNextSpawn makes the next spawn a child that exits at
+	// once with no server behind it.
+	listenDelayMs: 0,
+	failNextSpawn: false,
 }));
 
 function encodeFrame(header: object, payload: Buffer): Buffer {
@@ -175,7 +180,14 @@ async function startFakeWorkerServer(
 	});
 	await new Promise<void>((resolveListen, rejectListen) => {
 		server.once("error", rejectListen);
-		server.listen(socketPath, () => resolveListen());
+		const listen = () => server.listen(socketPath, () => resolveListen());
+		// A listen delay keeps the spare in its warming state for the tests that
+		// exercise a claim racing the warm-up.
+		if (hoisted.listenDelayMs > 0) {
+			setTimeout(listen, hoisted.listenDelayMs);
+		} else {
+			listen();
+		}
 	});
 	return {
 		socketPath,
@@ -207,6 +219,24 @@ vi.mock("node:child_process", async (importOriginal) => {
 			const env = (options.env ?? {}) as NodeJS.ProcessEnv;
 			const activeSessionId = env[ACTIVE_SESSION_ENV_LITERAL] ?? "active-unknown";
 			const cwd = options.cwd ? String(options.cwd) : undefined;
+			if (hoisted.failNextSpawn) {
+				hoisted.failNextSpawn = false;
+				// A spare whose process dies right after spawn: no server behind the
+				// socket, so the listen probe observes the exit and fails the warm-up.
+				const child = actual.spawn(process.execPath, ["-e", "process.exit(42)"], { stdio: "ignore" });
+				const stderr = new PassThrough();
+				const gate = new PassThrough();
+				Object.assign(child, { stdio: [null, null, stderr, gate], stderr });
+				const stub: FakeWorkerServer = {
+					socketPath,
+					commands: [],
+					connectionCount: () => 0,
+					failWorkerAuth: () => undefined,
+					close: async () => undefined,
+				};
+				hoisted.spawned.push({ args: [...args], env, cwd, socketPath, child, server: Promise.resolve(stub) });
+				return child;
+			}
 			// A real process backs the fake child so pid liveness and signals are real.
 			const child = actual.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
 			const stderr = new PassThrough();
@@ -230,6 +260,8 @@ const supervisors: DaemonSupervisor[] = [];
 const clients: DaemonClient[] = [];
 
 afterEach(async () => {
+	hoisted.listenDelayMs = 0;
+	hoisted.failNextSpawn = false;
 	for (const client of clients.splice(0)) {
 		client.close();
 	}
@@ -262,6 +294,7 @@ interface PoolFixture {
 async function startPoolSupervisor(warmPool?: {
 	ttlMs?: number;
 	claimConnectTimeoutMs?: number;
+	claimWarmingWaitMs?: number;
 	spawnCooldownMs?: number;
 }): Promise<PoolFixture> {
 	const root = mkdtempSync(join(tmpdir(), "prime-warm-pool-test-"));
@@ -469,5 +502,111 @@ describe("daemon supervisor warm spare pool", () => {
 		// The update fence keeps the pool empty: no replenish while prepared.
 		await new Promise((resolveWait) => setTimeout(resolveWait, 200));
 		expect(hoisted.spawned).toHaveLength(1);
+	});
+
+	it("claims a still-warming spare after a bounded wait instead of launching cold", async () => {
+		hoisted.listenDelayMs = 400;
+		const { projectDir, client } = await startPoolSupervisor({ ttlMs: 30_000, claimWarmingWaitMs: 5_000 });
+		// Fire the create while the spare is still warming (its server has not
+		// listened yet). The claim waits for the warm handoff.
+		const response = await client.request({ type: "create", config: { cwd: projectDir } }, 15_000);
+		expect(response.success).toBe(true);
+		const summary = responseData(response) as { activeSessionId?: string; id: string };
+		// The warming spare itself served the create: the session carries the
+		// spare's pre-seeded id, and the only other spawn is the marked replenish.
+		expect(hoisted.spawned).toHaveLength(2);
+		expect(summary.activeSessionId ?? summary.id).toBe(hoisted.spawned[0]!.env[ACTIVE_SESSION_ENV_LITERAL]!);
+		expect(hoisted.spawned[1]!.env[DAEMON_WORKER_WARM_SPARE_ENV]).toBe("1");
+	});
+
+	it("falls back to a cold launch when the warming spare outlives the wait, without losing the spare", async () => {
+		hoisted.listenDelayMs = 1_500;
+		const { projectDir, client } = await startPoolSupervisor({ ttlMs: 30_000, claimWarmingWaitMs: 100 });
+		const response = await client.request({ type: "create", config: { cwd: projectDir } }, 15_000);
+		expect(response.success).toBe(true);
+		const summary = responseData(response) as { activeSessionId?: string; id: string };
+		// The cold launch served the create; the warming spare was not discarded.
+		expect(hoisted.spawned).toHaveLength(2);
+		expect(summary.activeSessionId ?? summary.id).toBe(hoisted.spawned[1]!.env[ACTIVE_SESSION_ENV_LITERAL]!);
+		expect(hoisted.spawned[1]!.env[DAEMON_WORKER_WARM_SPARE_ENV]).toBeUndefined();
+		const warmingChild = hoisted.spawned[0]!.child;
+		expect(warmingChild.exitCode === null && warmingChild.signalCode === null).toBe(true);
+		// Once the warm-up finishes, the spare publishes and serves the next create.
+		// Wait for its server to listen first so the claim cannot race the publish.
+		await waitForCondition(() => existsSync(hoisted.spawned[0]!.socketPath), "the warming spare listen");
+		await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+		const second = await client.request({ type: "create", config: { cwd: projectDir } }, 15_000);
+		expect(second.success).toBe(true);
+		const secondSummary = responseData(second) as { activeSessionId?: string; id: string };
+		expect(secondSummary.activeSessionId ?? secondSummary.id).toBe(
+			hoisted.spawned[0]!.env[ACTIVE_SESSION_ENV_LITERAL]!,
+		);
+	});
+
+	it("records a terminal warm-up failure and stops spawning for the cooldown window", async () => {
+		hoisted.failNextSpawn = true;
+		const { projectDir, client } = await startPoolSupervisor({ ttlMs: 30_000, spawnCooldownMs: 60_000 });
+		await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
+		await waitForProcessExit(hoisted.spawned[0]!.child);
+		// Let the failed warm-up settle: the failure record is written when the
+		// listen probe observes the exit.
+		await new Promise((resolveWait) => setTimeout(resolveWait, 300));
+
+		const response = await client.request({ type: "create", config: { cwd: projectDir } }, 15_000);
+		expect(response.success).toBe(true);
+		// The failed spare is gone; the create went cold. The cooldown then blocks
+		// the replenish, so no spare spawn storms a broken setup.
+		expect(hoisted.spawned).toHaveLength(2);
+		expect(hoisted.spawned[1]!.env[DAEMON_WORKER_WARM_SPARE_ENV]).toBeUndefined();
+		await new Promise((resolveWait) => setTimeout(resolveWait, 300));
+		expect(hoisted.spawned).toHaveLength(2);
+	});
+
+	it("clears the failed state once a later warm-up succeeds", async () => {
+		hoisted.failNextSpawn = true;
+		const { projectDir, client } = await startPoolSupervisor({ ttlMs: 30_000, spawnCooldownMs: 200 });
+		await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
+		await waitForProcessExit(hoisted.spawned[0]!.child);
+		await new Promise((resolveWait) => setTimeout(resolveWait, 300));
+
+		// Past the cooldown, the create's replenish spawns a healthy spare again.
+		const response = await client.request({ type: "create", config: { cwd: projectDir } }, 15_000);
+		expect(response.success).toBe(true);
+		await waitForCondition(() => hoisted.spawned.length === 3, "the post-cooldown replenish spare");
+		expect(hoisted.spawned[2]!.env[DAEMON_WORKER_WARM_SPARE_ENV]).toBe("1");
+		const replenishedChild = hoisted.spawned[2]!.child;
+		expect(replenishedChild.exitCode === null && replenishedChild.signalCode === null).toBe(true);
+	});
+
+	it("keeps the pooled spare alive across unrelated session lifecycle traffic", async () => {
+		const { projectDir, client } = await startPoolSupervisor({ ttlMs: 30_000, spawnCooldownMs: 0 });
+		await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
+
+		// Claim the spare, then drive session-scoped lifecycle traffic through the
+		// supervisor: a settings-shaped mutation (set_model), a plugin reload, and
+		// finally a kill. None of it touches the pool.
+		const first = await client.request({ type: "create", config: { cwd: projectDir } }, 10_000);
+		expect(first.success).toBe(true);
+		const firstSummary = responseData(first) as { activeSessionId?: string; id: string };
+		const activeSessionId = firstSummary.activeSessionId ?? firstSummary.id;
+		await waitForCondition(() => hoisted.spawned.length === 2, "the replenish spare");
+		const replenished = hoisted.spawned[1]!;
+
+		const setModel = await client.request(
+			{ type: "set_model", activeSessionId, provider: "test", modelId: "model" },
+			5_000,
+		);
+		expect(setModel.success).toBe(true);
+		const reload = await client.request({ type: "reload", activeSessionId }, 5_000);
+		expect(reload.success).toBe(true);
+		const kill = await client.request({ type: "kill", activeSessionId }, 5_000);
+		expect(kill.success).toBe(true);
+
+		// The replenished spare survived all of it and still claims on id parity.
+		expect(replenished.child.exitCode === null && replenished.child.signalCode === null).toBe(true);
+		const second = await client.request({ type: "create", config: { cwd: projectDir } }, 10_000);
+		expect(second.success).toBe(true);
+		const secondSummary = responseData(second) as { activeSessionId?: string; id: string };
+		expect(secondSummary.activeSessionId ?? secondSummary.id).toBe(replenished.env[ACTIVE_SESSION_ENV_LITERAL]!);
 	});
 });

@@ -263,6 +263,10 @@ const DEFAULT_WARM_POOL_MIN_FREE_MEMORY_BYTES = 768 * 1024 * 1024;
 // A spare is supposed to be already listening: a claim that cannot connect and
 // authenticate within this budget treats the spare as unhealthy and goes cold.
 const DEFAULT_WARM_SPARE_CLAIM_CONNECT_TIMEOUT_MS = 2_000;
+// A claim that arrives while its spare is still warming waits this long for the
+// warm handoff before going cold: the spare's remaining boot beats a parallel
+// cold spawn, and the wait is bounded so a wedged warm-up never stalls a create.
+const DEFAULT_WARM_SPARE_CLAIM_WARMING_WAIT_MS = 750;
 const WARM_SPARE_KILL_GRACE_MS = 1_500;
 /** PRIME_AGENT_WARM_POOL=0|false|no|off disables the pool on daemon startup. */
 export const WARM_POOL_DISABLE_ENV = "PRIME_AGENT_WARM_POOL";
@@ -280,6 +284,11 @@ export interface DaemonWarmPoolOptions {
 	minFreeMemoryBytes?: number;
 	/** Claim health-check budget before falling back to a cold launch; default 2s. */
 	claimConnectTimeoutMs?: number;
+	/**
+	 * How long a create waits for a still-warming spare before launching cold;
+	 * default 750ms. 0 disables the warm handoff (claim during warming = miss).
+	 */
+	claimWarmingWaitMs?: number;
 }
 
 interface ResolvedDaemonWarmPoolOptions {
@@ -289,6 +298,7 @@ interface ResolvedDaemonWarmPoolOptions {
 	sweepIntervalMs: number;
 	minFreeMemoryBytes: number;
 	claimConnectTimeoutMs: number;
+	claimWarmingWaitMs: number;
 }
 
 /**
@@ -1673,7 +1683,13 @@ export class DaemonSupervisor {
 	// the drain paths must read an empty pool there instead of throwing.
 	private warmSparesMap?: Map<string, WarmSpareWorker>;
 	private warmSpareInflightMap?: Map<string, Promise<void>>;
-	private warmSpareFailureAtMap?: Map<string, number>;
+	/**
+	 * The failed terminal state, one record per pool key: when the last warm-up
+	 * failed and why. A key in cooldown skips re-spawning until spawnCooldownMs
+	 * has elapsed; a successful publish clears the record. Failure records are
+	 * the pool's only memory of a broken cwd, so the reason is always populated.
+	 */
+	private warmSpareFailuresMap?: Map<string, { failedAt: number; reason: string }>;
 	private get warmSpares(): Map<string, WarmSpareWorker> {
 		if (this.warmSparesMap === undefined) {
 			this.warmSparesMap = new Map();
@@ -1686,11 +1702,11 @@ export class DaemonSupervisor {
 		}
 		return this.warmSpareInflightMap;
 	}
-	private get warmSpareFailureAt(): Map<string, number> {
-		if (this.warmSpareFailureAtMap === undefined) {
-			this.warmSpareFailureAtMap = new Map();
+	private get warmSpareFailures(): Map<string, { failedAt: number; reason: string }> {
+		if (this.warmSpareFailuresMap === undefined) {
+			this.warmSpareFailuresMap = new Map();
 		}
-		return this.warmSpareFailureAtMap;
+		return this.warmSpareFailuresMap;
 	}
 	private warmPoolSweepTimer?: ReturnType<typeof setInterval>;
 	private warmPoolPressureLogAt = 0;
@@ -1737,6 +1753,7 @@ export class DaemonSupervisor {
 					minFreeMemoryBytes: options.warmPool.minFreeMemoryBytes ?? DEFAULT_WARM_POOL_MIN_FREE_MEMORY_BYTES,
 					claimConnectTimeoutMs:
 						options.warmPool.claimConnectTimeoutMs ?? DEFAULT_WARM_SPARE_CLAIM_CONNECT_TIMEOUT_MS,
+					claimWarmingWaitMs: options.warmPool.claimWarmingWaitMs ?? DEFAULT_WARM_SPARE_CLAIM_WARMING_WAIT_MS,
 				}
 			: undefined;
 	}
@@ -4884,7 +4901,7 @@ export class DaemonSupervisor {
 		// byte-identical to what the cold spawn below would produce (same cwd, same
 		// environment fingerprint), so claiming it is scheduling, not a semantic
 		// change. Recovery and adoption (existing) always spawn their own process.
-		const spare = existing === undefined ? this.takeWarmSpare(createCommand, launchEnv) : undefined;
+		const spare = existing === undefined ? await this.takeWarmSpare(createCommand, launchEnv) : undefined;
 		const workerId = existing?.descriptor.workerId ?? spare?.workerId ?? createActiveSessionId();
 		const rootActiveSessionId =
 			existing?.descriptor.rootActiveSessionId ?? spare?.rootActiveSessionId ?? createActiveSessionId();
@@ -5254,20 +5271,38 @@ export class DaemonSupervisor {
 	 * a stale or foreign environment can never leak into a claimed session).
 	 * Misses leave the spare pooled for a create that does match; an expired or
 	 * dead spare is dropped and disposed instead.
+	 *
+	 * Warming is a first-class state, not a miss: when the key's spare is still
+	 * being built, the claim waits up to claimWarmingWaitMs for the handoff
+	 * (its remaining boot beats a parallel cold spawn). A warm-up that fails or
+	 * outlives the wait leaves the create to the cold path — never dropped.
 	 */
-	private takeWarmSpare(
+	private async takeWarmSpare(
 		createCommand: DaemonCreateCommand,
 		launchEnv: Record<string, string> | undefined,
-	): WarmSpareWorker | undefined {
+	): Promise<WarmSpareWorker | undefined> {
 		const pool = this.warmPool;
 		if (pool === undefined || this.shuttingDown || this.updateRestartPhase !== undefined) {
 			return undefined;
 		}
 		const cwd = createCommand.config?.cwd ?? process.cwd();
 		const key = warmPoolKey(cwd);
-		const spare = this.warmSpares.get(key);
+		let spare = this.warmSpares.get(key);
 		if (spare === undefined) {
-			return undefined;
+			const warming = this.warmSpareInflight.get(key);
+			if (warming === undefined || pool.claimWarmingWaitMs <= 0) {
+				return undefined;
+			}
+			await Promise.race([warming, sleep(pool.claimWarmingWaitMs, { unref: true })]);
+			// The wait may have crossed a drain or shutdown; re-read every gate.
+			if (this.warmPool === undefined || this.shuttingDown || this.updateRestartPhase !== undefined) {
+				return undefined;
+			}
+			spare = this.warmSpares.get(key);
+			if (spare === undefined) {
+				// Still warming past the wait, or the warm-up failed: cold launch.
+				return undefined;
+			}
 		}
 		if (
 			spare.expiresAt <= Date.now() ||
@@ -5306,7 +5341,8 @@ export class DaemonSupervisor {
 	/**
 	 * Stock the pool for a cwd if it is empty and within bounds. All failures are
 	 * pool-local: a cooldown per cwd keeps a broken spawn from looping, and the
-	 * create path never waits on a spare.
+	 * only create-side wait on a spare is the bounded warm handoff in
+	 * takeWarmSpare.
 	 */
 	private ensureWarmSpare(cwd: string, launchEnv: Record<string, string> | undefined): void {
 		const pool = this.warmPool;
@@ -5320,8 +5356,8 @@ export class DaemonSupervisor {
 		if (this.warmSpares.size >= pool.maxSpares) {
 			return;
 		}
-		const failedAt = this.warmSpareFailureAt.get(key);
-		if (failedAt !== undefined && Date.now() - failedAt < pool.spawnCooldownMs) {
+		const failed = this.warmSpareFailures.get(key);
+		if (failed !== undefined && Date.now() - failed.failedAt < pool.spawnCooldownMs) {
 			return;
 		}
 		if (freemem() < pool.minFreeMemoryBytes) {
@@ -5333,7 +5369,14 @@ export class DaemonSupervisor {
 			return;
 		}
 		const inflight = this.spawnWarmSpare(key, cwd, launchEnv)
-			.catch((error) => this.log(`Warm spare spawn for ${cwd} failed: ${String(error)}`))
+			.catch((error) => {
+				// The failed state is terminal and visible: until the cooldown
+				// elapses this key neither spawns nor waits, and the reason is on
+				// record. The create path itself never notices — it went cold.
+				this.logInfo(
+					`Warm spare for ${cwd} failed: ${error instanceof Error ? error.message : String(error)} (cooldown ${pool.spawnCooldownMs}ms)`,
+				);
+			})
 			.finally(() => {
 				if (this.warmSpareInflight.get(key) === inflight) {
 					this.warmSpareInflight.delete(key);
@@ -5370,19 +5413,21 @@ export class DaemonSupervisor {
 		const descriptorPath = join(this.descriptorDir, `${workerId}.json`);
 		const environment = this.buildWorkerEnvironment(launchEnv, ids, true);
 		const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", socketPath]);
+		const fail = (reason: string): Error => {
+			this.warmSpareFailures.set(key, { failedAt: Date.now(), reason });
+			return new Error(reason);
+		};
 		let spawned: SpawnedWorkerProcess;
 		try {
 			spawned = await this.spawnWorkerProcess(launch.command, launch.args, environment, cwd, workerId);
 		} catch (error) {
-			this.warmSpareFailureAt.set(key, Date.now());
-			throw error;
+			throw fail(error instanceof Error ? error.message : String(error));
 		}
 		try {
 			await commitWorkerStartupGate(spawned.startupGate);
 		} catch (error) {
-			this.warmSpareFailureAt.set(key, Date.now());
 			await this.terminateSpawnedWorkerProcess(spawned);
-			throw error;
+			throw fail(error instanceof Error ? error.message : String(error));
 		}
 		// "Ready" must mean the worker actually listens: a claim against a still-
 		// booting spare would pay the boot remainder inside the create window. The
@@ -5390,9 +5435,8 @@ export class DaemonSupervisor {
 		// probe hangs up, exactly like a failed connectWorker attempt.
 		const listened = await this.probeWarmSpareListening(spawned, socketPath);
 		if (!listened) {
-			this.warmSpareFailureAt.set(key, Date.now());
 			await this.terminateSpawnedWorkerProcess(spawned);
-			throw new Error(`Warm spare ${workerId} did not start listening within its boot budget`);
+			throw fail(`Warm spare ${workerId} did not start listening within its boot budget`);
 		}
 		spawned.child.unref();
 		spawned.childClosed.then(() => {
@@ -5446,6 +5490,8 @@ export class DaemonSupervisor {
 		}, pool.ttlMs);
 		spare.ttlTimer.unref();
 		this.warmSpares.set(key, spare);
+		// A successful publish ends the key's failed state.
+		this.warmSpareFailures.delete(key);
 		this.logInfo(`Warm spare worker ${workerId} ready for ${cwd}`);
 	}
 
@@ -5546,6 +5592,7 @@ export class DaemonSupervisor {
 	private async drainWarmPool(reason: string, disable: boolean): Promise<void> {
 		if (disable) {
 			this.warmPool = undefined;
+			this.warmSpareFailures.clear();
 		}
 		if (this.warmPoolSweepTimer) {
 			clearInterval(this.warmPoolSweepTimer);
