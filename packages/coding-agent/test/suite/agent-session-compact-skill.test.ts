@@ -91,7 +91,11 @@ describe("AgentSession compact skill host requests", () => {
 		setStreaming(harness, true);
 		const result = harness.session.handleCompactHostRequest("compact.run");
 		setStreaming(harness, false);
-		expect(result).toEqual({ scheduled: false, reason: "session is too short to compact" });
+		expect(result).toEqual({
+			scheduled: false,
+			reason:
+				"Nothing to summarize — the kept tail already covers the whole session, so compacting would not shrink it",
+		});
 		expect(harness.session.handleCompactHostRequest("compact.status").scheduled).toBe(false);
 	});
 

@@ -465,7 +465,7 @@ describe("AgentSession queue characterization", () => {
 		internals._schedulePostCompactionContinue();
 
 		await expect(harness.session.compact(undefined, { skipAbort: true })).rejects.toThrow(
-			"Session is too short to compact",
+			"Nothing to summarize — the kept tail already covers the whole session, so compacting would not shrink it",
 		);
 
 		expect(internals._postCompactionContinuationScheduled).toBe(true);

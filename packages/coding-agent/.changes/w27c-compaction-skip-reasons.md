@@ -1,0 +1,1 @@
+- Split the compaction skip wording: "nothing to summarize" (the kept tail already covers the session) no longer reads as "session is too short", and a session with id-less entries now fails loudly instead of skipping forever.

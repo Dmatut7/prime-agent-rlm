@@ -1770,14 +1770,52 @@ function detailsGeneration(details: unknown): number {
 	return Math.max(fromFacts, fromUsers);
 }
 
-export function prepareCompaction(
+/**
+ * Why a compaction has nothing to do, machine-readable.
+ *
+ * The skip receipt the user reads ("Auto-compaction skipped: ...") is assembled
+ * from this reason, so a benign "nothing to summarize" (the kept tail already
+ * holds the whole session - one oversized message can fill it on its own) no
+ * longer shares one wording with a session that genuinely cannot be compacted.
+ */
+export type CompactionSkipReason =
+	/** The branch head is a compaction boundary; nothing new arrived to summarize. */
+	| "already-compacted"
+	/** The kept tail covers every summarizable message; compacting would shrink nothing. */
+	| "nothing-to-summarize"
+	/** The entry at the cut has no id: the session predates id-stamping and needs migration. */
+	| "missing-entry-ids";
+
+export type PrepareCompactionOutcome =
+	| { kind: "ready"; preparation: CompactionPreparation }
+	| { kind: "skip"; reason: CompactionSkipReason };
+
+/**
+ * The user-facing wording for one skip reason, canonical so every caller (the
+ * auto/manual compaction catch, the compact skill's compact.run) tells the same
+ * story. "nothing-to-summarize" deliberately avoids "too short" and "try again
+ * once it grows": a session whose kept tail is one oversized message is neither,
+ * and growing it changes nothing.
+ */
+export function compactionSkipMessage(reason: CompactionSkipReason): string {
+	switch (reason) {
+		case "already-compacted":
+			return "Already compacted";
+		case "nothing-to-summarize":
+			return "Nothing to summarize — the kept tail already covers the whole session, so compacting would not shrink it";
+		case "missing-entry-ids":
+			return "Compaction cannot run: a session entry has no id — the session may need to be migrated";
+	}
+}
+
+export function prepareCompactionOutcome(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
 	contextWindow?: number,
 	limits?: CompactionWindowLimits,
-): CompactionPreparation | undefined {
+): PrepareCompactionOutcome {
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
-		return undefined;
+		return { kind: "skip", reason: "already-compacted" };
 	}
 
 	let prevCompactionIndex = -1;
@@ -1858,8 +1896,13 @@ export function prepareCompaction(
 	const keepRecentTokens = capKeepRecentTokens(settings, contextWindow, limits);
 	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, keepRecentTokens);
 	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
-	if (!firstKeptEntry?.id) {
-		return undefined; // Session needs migration
+	if (!firstKeptEntry) {
+		// An empty branch keeps no entry at the cut: there is nothing to summarize.
+		return { kind: "skip", reason: "nothing-to-summarize" };
+	}
+	if (!firstKeptEntry.id) {
+		// Session needs migration
+		return { kind: "skip", reason: "missing-entry-ids" };
 	}
 	const firstKeptEntryId = firstKeptEntry.id;
 
@@ -1886,7 +1929,7 @@ export function prepareCompaction(
 	// firstKeptEntryId, so the context it produces is no smaller than the one it
 	// replaces, and a threshold compaction would re-fire every turn.
 	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) {
-		return undefined;
+		return { kind: "skip", reason: "nothing-to-summarize" };
 	}
 	const fileOps = extractFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex);
 	// Split turns retain their suffix, but their prefix file operations still belong in the summary.
@@ -1910,21 +1953,39 @@ export function prepareCompaction(
 	const handoff = buildSessionHandoff(pathEntries, { generation: previousGeneration + 1, previous: previousHandoff });
 
 	return {
-		firstKeptEntryId,
-		messagesToSummarize,
-		turnPrefixMessages,
-		isSplitTurn: cutPoint.isSplitTurn,
-		tokensBefore,
-		previousSummary,
-		previousFacts,
-		previousUserRequests,
-		handoff,
-		generation: previousGeneration + 1,
-		keepRecentTokens,
-		recentStateAnchor,
-		fileOps,
-		settings,
+		kind: "ready",
+		preparation: {
+			firstKeptEntryId,
+			messagesToSummarize,
+			turnPrefixMessages,
+			isSplitTurn: cutPoint.isSplitTurn,
+			tokensBefore,
+			previousSummary,
+			previousFacts,
+			previousUserRequests,
+			handoff,
+			generation: previousGeneration + 1,
+			keepRecentTokens,
+			recentStateAnchor,
+			fileOps,
+			settings,
+		},
 	};
+}
+
+/**
+ * The legacy shape of prepareCompactionOutcome: preparation or undefined, with
+ * the skip reason collapsed away. Callers that only gate on viability keep this;
+ * callers that word a user-facing skip receipt need the outcome's reason.
+ */
+export function prepareCompaction(
+	pathEntries: SessionEntry[],
+	settings: CompactionSettings,
+	contextWindow?: number,
+	limits?: CompactionWindowLimits,
+): CompactionPreparation | undefined {
+	const outcome = prepareCompactionOutcome(pathEntries, settings, contextWindow, limits);
+	return outcome.kind === "ready" ? outcome.preparation : undefined;
 }
 
 /**
