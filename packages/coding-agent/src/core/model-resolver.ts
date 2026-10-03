@@ -170,7 +170,7 @@ function buildFallbackModel(provider: string, modelId: string, availableModels: 
 	};
 }
 
-function findPreferredDefaultModel(availableModels: Model<Api>[]): Model<Api> | undefined {
+export function findPreferredDefaultModel(availableModels: Model<Api>[]): Model<Api> | undefined {
 	const primeInferenceDefault = availableModels.find(
 		(model) => model.provider === "prime-inference" && model.id === PRIME_INFERENCE_DEFAULT_MODEL_ID,
 	);
@@ -577,6 +577,7 @@ export async function findInitialModel(options: {
 		};
 	}
 	const availableModels = await getAvailableModels();
+	let savedDefaultUnavailable: string | undefined;
 	if (defaultProvider && defaultModelId) {
 		// Rebuild from the provider template when the saved id is missing from this
 		// build's snapshot (e.g. prime-inference catalog churn), so it survives updates.
@@ -594,15 +595,57 @@ export async function findInitialModel(options: {
 			}
 			return { model, thinkingLevel, fallbackMessage: undefined };
 		}
+		// The saved default cannot serve now (provider credentials gone, or the
+		// catalog unreadable): the fallback below must say so, not drift silently.
+		// (`getError` is optional-called: SDK consumers may hand a partial registry.)
+		const reason = modelRegistry.getError?.() ? "the model catalog could not be read" : "no auth configured";
+		savedDefaultUnavailable = `Saved default model ${defaultProvider}/${defaultModelId} is not available (${reason})`;
 	}
 	if (availableModels.length > 0) {
-		const defaultModel = findPreferredDefaultModel(availableModels);
-		if (defaultModel) {
-			return { model: defaultModel, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
-		}
-		return { model: availableModels[0], thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
+		const defaultModel = findPreferredDefaultModel(availableModels) ?? availableModels[0];
+		return {
+			model: defaultModel,
+			thinkingLevel: DEFAULT_THINKING_LEVEL,
+			fallbackMessage: savedDefaultUnavailable
+				? `${savedDefaultUnavailable}. Using ${defaultModel.provider}/${defaultModel.id}.`
+				: undefined,
+		};
 	}
-	return { model: undefined, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
+	return { model: undefined, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: savedDefaultUnavailable };
+}
+
+/**
+ * Whether a saved session model can serve right now, with the failure reason
+ * split from the verdict's strength. `verifiedUnavailable` is false when the
+ * catalog itself could not be read: availability is then unknown, and callers
+ * must not rewrite a persisted selection on it - only a verified negative
+ * (model gone from a readable catalog, or credentials verified absent) may.
+ */
+export interface SavedSessionModelRestore {
+	model: Model<Api> | undefined;
+	/** Why the saved model cannot serve; undefined when it can. */
+	reason: string | undefined;
+	verifiedUnavailable: boolean;
+}
+
+export function restoreSavedSessionModel(options: {
+	provider: string;
+	modelId: string;
+	modelRegistry: ModelRegistry;
+}): SavedSessionModelRestore {
+	const { provider, modelId, modelRegistry } = options;
+	const registered = modelRegistry.find(provider, modelId);
+	if (registered && modelRegistry.hasConfiguredAuth(registered)) {
+		return { model: registered, reason: undefined, verifiedUnavailable: true };
+	}
+	if (modelRegistry.getError()) {
+		return { model: undefined, reason: "the model catalog could not be read", verifiedUnavailable: false };
+	}
+	return {
+		model: undefined,
+		reason: !registered ? "model no longer exists" : "no auth configured",
+		verifiedUnavailable: true,
+	};
 }
 
 /**
@@ -627,11 +670,13 @@ export async function restoreModelFromSession(
 		return { model: restoredModel, fallbackMessage: undefined };
 	}
 	const registeredModel = modelRegistry.find(savedProvider, savedModelId);
-	const reason = !registeredModel
-		? "model no longer exists"
-		: !modelRegistry.hasConfiguredAuth(registeredModel)
+	const reason = registeredModel
+		? !modelRegistry.hasConfiguredAuth(registeredModel)
 			? "no auth configured"
-			: "model is not available";
+			: "model is not available"
+		: modelRegistry.getError()
+			? "the model catalog could not be read"
+			: "model no longer exists";
 	log.warn("could not restore model", { provider: savedProvider, model: savedModelId, reason });
 
 	if (shouldPrintMessages) {

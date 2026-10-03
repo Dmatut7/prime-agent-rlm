@@ -12,7 +12,7 @@ import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefi
 import { McpManager } from "./mcp/mcp-manager.js";
 import { convertToLlm } from "./messages.js";
 import { ModelRegistry } from "./model-registry.js";
-import { findInitialModel } from "./model-resolver.js";
+import { findInitialModel, restoreSavedSessionModel } from "./model-resolver.js";
 import { providerRetryPolicy, providerRetryStreamOptions } from "./provider-retry.js";
 import {
 	instrumentConvertToLlm,
@@ -187,14 +187,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	let model = options.model;
 	let modelFallbackMessage: string | undefined;
+	// Set by the restore attempt below: false means availability was unknown (the
+	// catalog could not be read), so the recorded selection must not be rewritten -
+	// the fallback model serves this run in memory only.
+	let savedSelectionVerifiedUnavailable = true;
 
 	if (!model && hasExistingSession && existingSession.model) {
-		const restoredModel = modelRegistry.find(existingSession.model.provider, existingSession.model.modelId);
-		if (restoredModel && modelRegistry.hasConfiguredAuth(restoredModel)) {
-			model = restoredModel;
-		}
-		if (!model) {
-			modelFallbackMessage = `Could not restore model ${existingSession.model.provider}/${existingSession.model.modelId}`;
+		const restore = restoreSavedSessionModel({
+			provider: existingSession.model.provider,
+			modelId: existingSession.model.modelId,
+			modelRegistry,
+		});
+		if (restore.model) {
+			model = restore.model;
+		} else {
+			savedSelectionVerifiedUnavailable = restore.verifiedUnavailable;
+			modelFallbackMessage = `Could not restore model ${existingSession.model.provider}/${existingSession.model.modelId} (${restore.reason})`;
 		}
 	}
 
@@ -211,7 +219,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (!model) {
 			modelFallbackMessage = formatNoModelsAvailableMessage();
 		} else if (modelFallbackMessage) {
-			modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
+			modelFallbackMessage += savedSelectionVerifiedUnavailable
+				? `. Using ${model.provider}/${model.id}`
+				: `. Using ${model.provider}/${model.id} for this run; the saved selection was kept`;
+		} else if (result.fallbackMessage) {
+			modelFallbackMessage = result.fallbackMessage;
 		}
 	}
 
@@ -366,8 +378,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		) {
 			// The session's saved model could not be restored (auth lost, model gone)
 			// and a fallback was picked: the ledger must record what actually runs,
-			// or the transcript claims a model the session is not using.
-			sessionManager.appendModelChange(model.provider, model.id);
+			// or the transcript claims a model the session is not using. The unknown
+			// case (unreadable catalog) is the exception: the recorded selection
+			// stands, and the fallback serves this run only.
+			if (savedSelectionVerifiedUnavailable) {
+				sessionManager.appendModelChange(model.provider, model.id);
+			}
 		}
 		if (!hasThinkingEntry) {
 			sessionManager.appendThinkingLevelChange(thinkingLevel);

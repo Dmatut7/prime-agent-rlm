@@ -55,8 +55,14 @@ import { AuthStorage } from "./core/auth-storage.js";
 import type { ExtensionFactory } from "./core/extensions/types.js";
 import { KeybindingsManager } from "./core/keybindings.js";
 import { installFileLogSink, setLogContext } from "./core/logging.js";
-import type { ModelRegistry } from "./core/model-registry.js";
-import { findInitialModel, resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.js";
+import { ModelRegistry } from "./core/model-registry.js";
+import {
+	findInitialModel,
+	resolveCliModel,
+	resolveModelScope,
+	restoreSavedSessionModel,
+	type ScopedModel,
+} from "./core/model-resolver.js";
 import { flushOrphanProcessJournal } from "./core/orphan-process-journal.js";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.js";
 import type { CreateAgentSessionOptions } from "./core/sdk.js";
@@ -149,6 +155,48 @@ export function reportDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagn
 		const prefix = diagnostic.type === "error" ? "Error: " : diagnostic.type === "warning" ? "Warning: " : "";
 		console.error(wrapForStderr(color(`${prefix}${diagnostic.message}`), { continuationIndent: prefix.length }));
 	}
+}
+
+/**
+ * Client-side parse-time check of an explicit --model before a daemon-client
+ * startup creates anything. The worker runs the same resolution (its error lands
+ * in the session's runtime diagnostics), but the create answer crosses the
+ * supervisor roster, which slims diagnostics away - so without this preflight a
+ * bad --model silently fell back to the default and only the API call failed.
+ * Resolves against the same catalog/auth inputs the worker sees; a stale daemon
+ * running an older build is still caught here because this check is local.
+ */
+export function preflightCliModelDiagnostics(options: {
+	cliProvider?: string;
+	cliModel?: string;
+	allowUnauthenticated?: boolean;
+	agentDir: string;
+	/** Test hook: skip constructing the registry from the agent dir. */
+	modelRegistry?: ModelRegistry;
+}): AgentSessionRuntimeDiagnostic[] {
+	if (!options.cliModel) {
+		return [];
+	}
+	const modelRegistry =
+		options.modelRegistry ??
+		ModelRegistry.create(
+			AuthStorage.create(join(options.agentDir, "auth.json"), { usePrimeCliConfig: true }),
+			join(options.agentDir, "models.json"),
+		);
+	const resolved = resolveCliModel({
+		cliProvider: options.cliProvider,
+		cliModel: options.cliModel,
+		modelRegistry,
+		allowUnauthenticated: options.allowUnauthenticated,
+	});
+	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
+	if (resolved.warning) {
+		diagnostics.push({ type: "warning", message: resolved.warning });
+	}
+	if (resolved.error) {
+		diagnostics.push({ type: "error", message: resolved.error });
+	}
+	return diagnostics;
 }
 
 function isTruthyEnvFlag(value: string | undefined): boolean {
@@ -968,12 +1016,15 @@ async function resolvePreparedStartupModel(options: {
 	let modelFallbackMessage: string | undefined;
 
 	if (!model && hasExistingSession && existingSession.model) {
-		const restoredModel = modelRegistry.find(existingSession.model.provider, existingSession.model.modelId);
-		if (restoredModel && modelRegistry.hasConfiguredAuth(restoredModel)) {
-			model = restoredModel;
-		}
-		if (!model) {
-			modelFallbackMessage = `Could not restore model ${existingSession.model.provider}/${existingSession.model.modelId}`;
+		const restore = restoreSavedSessionModel({
+			provider: existingSession.model.provider,
+			modelId: existingSession.model.modelId,
+			modelRegistry,
+		});
+		if (restore.model) {
+			model = restore.model;
+		} else {
+			modelFallbackMessage = `Could not restore model ${existingSession.model.provider}/${existingSession.model.modelId} (${restore.reason})`;
 		}
 	}
 
@@ -991,6 +1042,8 @@ async function resolvePreparedStartupModel(options: {
 			modelFallbackMessage = formatNoModelsAvailableMessage();
 		} else if (modelFallbackMessage) {
 			modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
+		} else if (result.fallbackMessage) {
+			modelFallbackMessage = result.fallbackMessage;
 		}
 	}
 
@@ -1855,6 +1908,26 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	if (useDaemonClient) {
 		const settingsManager = SettingsManager.create(sessionManager.getCwd(), agentDir);
+		// An explicit --model that names nothing runnable fails here, before any
+		// daemon session is created: the create answer loses the worker's
+		// diagnostics to roster slimming, which used to turn a typo into a silent
+		// fallback to the default model. Skipped when extensions are in play: an
+		// extension can register a provider/model the static catalog does not know
+		// (the faux test provider works this way), so a hard reject here would be
+		// wrong - the worker's own resolution still validates, and a fallback is
+		// now announced on stderr.
+		if (!parsed.extensions?.length) {
+			const cliModelDiagnostics = preflightCliModelDiagnostics({
+				cliProvider: parsed.provider,
+				cliModel: parsed.model,
+				allowUnauthenticated: Boolean(parsed.apiKey),
+				agentDir,
+			});
+			reportDiagnostics(cliModelDiagnostics);
+			if (cliModelDiagnostics.some((diagnostic) => diagnostic.type === "error")) {
+				await exitAfterOrphanJournalFlush(1);
+			}
+		}
 		let stdinContent: string | undefined;
 		if (appMode !== "rpc" && appMode !== "acp") {
 			stdinContent = await readPipedStdin();
@@ -1901,6 +1974,11 @@ export async function main(args: string[], options?: MainOptions) {
 			console.error(wrapForStderr(chalk.red(summary.modelFallbackMessage ?? formatNoModelsAvailableMessage())));
 			await connection.dispose();
 			process.exit(1);
+		}
+		// A restored default that silently moved to another model is a drift the
+		// owner must see in headless output too, not only in the TUI.
+		if (summary.modelFallbackMessage) {
+			console.error(wrapForStderr(chalk.yellow(`Warning: ${summary.modelFallbackMessage}`)));
 		}
 
 		printTimings();
@@ -2082,6 +2160,11 @@ export async function main(args: string[], options?: MainOptions) {
 		await interactiveMode.run();
 	} else {
 		printTimings();
+		// Headless has no TUI warning slot: a restored-then-fallen-back model is
+		// announced on stderr or the drift is invisible.
+		if (runtime.modelFallbackMessage) {
+			console.error(wrapForStderr(chalk.yellow(`Warning: ${runtime.modelFallbackMessage}`)));
+		}
 		const { runPrintMode } = await import("./modes/print-mode.js");
 		const exitCode = await runPrintMode(runtime, {
 			mode: toPrintOutputMode(appMode),

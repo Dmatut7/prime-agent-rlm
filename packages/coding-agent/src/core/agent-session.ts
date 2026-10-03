@@ -310,7 +310,7 @@ import {
 	THINKING_LEVEL_CLAMPED_CUSTOM_TYPE,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
-import { findExactModelReferenceMatch } from "./model-resolver.js";
+import { findExactModelReferenceMatch, findPreferredDefaultModel } from "./model-resolver.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV, readActiveOrphanProcesses } from "./orphan-process-journal.js";
 import { explicitTimeoutMs, readProcessTreeCpuMs } from "./process-tree-cpu.js";
 import {
@@ -347,6 +347,7 @@ import {
 	isAgentLifecycleFailure,
 	isFauxProviderQueueExhausted,
 	isPermanentProviderFailureKind,
+	isProviderModelRejection,
 	type ProviderWaitPolicy,
 	providerRetryDelay,
 	providerRetryPolicy,
@@ -7238,7 +7239,11 @@ export class AgentSession {
 			this._finishActiveRetryWithFailure(msg);
 			if (!compactionWillRetry && msg.stopReason === "error") {
 				// Terminal failure: retries are exhausted, disabled, or the error was
-				// never retryable. A subagent must tell its parent instead of parking
+				// never retryable. A rejection of the model itself first reconciles the
+				// persisted selection (session ledger + saved default) onto a model
+				// that can serve; every other failure shape leaves it standing.
+				this._reconcileRejectedModelSelection(msg);
+				// A subagent must tell its parent instead of parking
 				// silently in needs_input (the synthesized completed_without_reply
 				// notice carries no error context and reads like a normal completion).
 				try {
@@ -18718,6 +18723,87 @@ export class AgentSession {
 			to: key(next),
 			cause,
 		});
+	}
+
+	/**
+	 * A terminal failure that is the provider's deterministic verdict on the serving
+	 * model itself (isProviderModelRejection) must not stay on the books: the session
+	 * model, the session ledger, and a saved default pointing at the rejected model
+	 * all move to a model that can serve, with an owner-visible notice, so a restart
+	 * resumes the serving model instead of looping back onto the rejected one. Only
+	 * positive rejection evidence reaches this point (unknown availability never
+	 * rewrites a stored selection), and the replacement is taken only from what the
+	 * registry can serve right now. A live fallback episode owns its own narrative
+	 * and is left alone.
+	 */
+	private _reconcileRejectedModelSelection(message: AssistantMessage): void {
+		if (!isProviderModelRejection(message)) return;
+		if (this._fallback) return;
+		const current = this.agent.state.model;
+		if (!current) return;
+		// The rejection must name the serving model; a routed image model's failure
+		// is that run's own episode and never moves the session model.
+		if (
+			typeof message.provider === "string" &&
+			typeof message.model === "string" &&
+			(message.provider !== current.provider || message.model !== current.id)
+		) {
+			return;
+		}
+		const candidate = this._lastServingModel(current) ?? this._registryDefaultModel(current);
+		if (!candidate) return;
+		this.agent.state.model = candidate;
+		this._clearModelOverrideWhenIdle();
+		this.sessionManager.appendModelChange(candidate.provider, candidate.id);
+		this.agent.state.messages.push(
+			createModelChangeMessage({ provider: candidate.provider, modelId: candidate.id }, Date.now()),
+		);
+		// A saved default pointing at the rejected model is the same stale selection:
+		// move it with the session. A default naming another model is somebody else's
+		// choice and is left alone.
+		if (
+			this.settingsManager.getDefaultProvider() === current.provider &&
+			this.settingsManager.getDefaultModel() === current.id
+		) {
+			this.settingsManager.setDefaultModelAndProvider(candidate.provider, candidate.id);
+		}
+		this.setThinkingLevel(clampThinkingLevel(candidate, this.thinkingLevel) as ThinkingLevel);
+		this._clampServiceTierForModel();
+		const key = (model: Model<any>) => `${model.provider}/${model.id}`;
+		const from = key(current);
+		const to = key(candidate);
+		this._recordDutyEvent({ kind: "model_fallback", from, to, reason: "provider_rejected" });
+		sessionLog.warn("provider rejected the session model; reconciled the selection", {
+			sessionId: this.sessionId,
+			from,
+			to,
+			errorMessage: message.errorMessage,
+		});
+		const detail = message.errorMessage?.replace(/\s+/g, " ").trim().slice(0, 200);
+		this._emitFallbackNotice(
+			`所选模型 ${current.id} 被 ${current.provider} 拒绝（${detail ?? "无详情"}），本会话改由 ${candidate.id} 服役；会话记录和默认模型已同步，重启后也从 ${candidate.id} 恢复。`,
+			{ kind: "rejected", from, to },
+		);
+		this._trackModelSelectEmitError(this._queueModelSelectEmit(candidate, current, "restore"));
+	}
+
+	/** The last model that actually answered on this branch, when it can still serve. */
+	private _lastServingModel(exclude: Model<any>): Model<any> | undefined {
+		for (let index = this.agent.state.messages.length - 1; index >= 0; index -= 1) {
+			const message = this.agent.state.messages[index];
+			if (message.role !== "assistant") continue;
+			if (message.stopReason === "error" || message.stopReason === "aborted") continue;
+			const found = this._modelRegistry.find(message.provider, message.model);
+			if (found && !modelsAreEqual(found, exclude) && this._modelRegistry.hasConfiguredAuth(found)) return found;
+		}
+		return undefined;
+	}
+
+	/** The registry's preferred default among what can serve right now, never the rejected model. */
+	private _registryDefaultModel(exclude: Model<any>): Model<any> | undefined {
+		const available = this._modelRegistry.getAvailable().filter((model) => !modelsAreEqual(model, exclude));
+		if (available.length === 0) return undefined;
+		return findPreferredDefaultModel(available) ?? available[0];
 	}
 
 	/**

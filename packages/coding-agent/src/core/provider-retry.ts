@@ -141,6 +141,34 @@ export function isPermanentProviderFailureKind(
 	return retriesPerformed > 0 && kind === "auth";
 }
 
+/**
+ * The provider's own words saying this model cannot serve the caller at all:
+ * the model is gone, renamed, or not on the caller's plan. Deliberately tight -
+ * capability complaints ("model does not support images") and quota text are
+ * about the request or the account, not the model's existence.
+ */
+const MODEL_REJECTION_TEXT =
+	/\bmodels?\b[^.!?]{0,160}?\b(?:not found|does not exist|do not exist|no longer exists|unknown|unavailable|not available|disabled|decommissioned|deprecated|isn’t available|isn't available)\b|\b(?:no such|unknown|unsupported) models?\b/i;
+
+/**
+ * Whether a terminal provider failure is deterministic negative evidence about
+ * the serving model itself - the provider answered that this model cannot serve
+ * this caller (403 permission on the resource, or an invalid_request whose own
+ * text says the model does not exist). That is the only failure class allowed to
+ * rewrite a persisted model selection: transient errors, quota exhaustion,
+ * refusals and request-shape rejections all leave the selection standing. A 404
+ * counts only when the provider's text names the model; a bare 404 is a routing
+ * blip (see providerWaitClass).
+ */
+export function isProviderModelRejection(message: AssistantMessage): boolean {
+	if (message.stopReason !== "error") return false;
+	const kind = providerStreamFailureKind(message);
+	const status = providerStreamFailureStatus(message);
+	if (kind === "permission" && providerWaitClass(kind, status, message.errorMessage) === "permanent") return true;
+	if (kind === "invalid_request" && MODEL_REJECTION_TEXT.test(message.errorMessage ?? "")) return true;
+	return false;
+}
+
 export type ProviderRetryDelay = { kind: "wait"; delayMs: number } | { kind: "exceeds-cap"; retryAfterMs: number };
 
 /** Node caps timers at 2^31-1 ms; longer delays overflow setTimeout and fire after ~1ms. */

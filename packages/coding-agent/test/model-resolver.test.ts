@@ -1,8 +1,8 @@
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import {
@@ -10,6 +10,7 @@ import {
 	findInitialModel,
 	resolveCliModel,
 	resolveModelScopeFromModels,
+	restoreSavedSessionModel,
 } from "../src/core/model-resolver.js";
 
 const mockModels: Model<"anthropic-messages">[] = [
@@ -697,5 +698,84 @@ describe("resolveCliModel equivalence corpus (r43 MC-1, probe-fuzzy)", () => {
 		} else {
 			expect(result.error).toBeDefined();
 		}
+	});
+});
+
+describe("restoreSavedSessionModel", () => {
+	afterEach(() => {
+		vi.unstubAllEnvs();
+	});
+
+	function registryWithCustomProvider(dir: string, modelsJson: string): { registry: ModelRegistry } {
+		writeFileSync(join(dir, "models.json"), modelsJson, "utf-8");
+		const authStorage = AuthStorage.create(join(dir, "auth.json"));
+		return { registry: ModelRegistry.create(authStorage, join(dir, "models.json")) };
+	}
+
+	const customProviderModelsJson = JSON.stringify({
+		providers: {
+			myco: {
+				baseUrl: "https://example.invalid/v1",
+				api: "openai-completions",
+				apiKey: "test-key",
+				models: [{ id: "myco-model", name: "MyCo Model", reasoning: false, input: ["text"] }],
+			},
+		},
+	});
+
+	test("restores a saved model that still exists with configured credentials", () => {
+		const dir = mkdtempSync(join(tmpdir(), "wave38-restore-"));
+		const { registry } = registryWithCustomProvider(dir, customProviderModelsJson);
+
+		const result = restoreSavedSessionModel({ provider: "myco", modelId: "myco-model", modelRegistry: registry });
+
+		expect(result.model?.id).toBe("myco-model");
+		expect(result.reason).toBeUndefined();
+		expect(result.verifiedUnavailable).toBe(true);
+	});
+
+	test("a saved model missing from a readable catalog is a verified negative", () => {
+		const dir = mkdtempSync(join(tmpdir(), "wave38-restore-"));
+		const { registry } = registryWithCustomProvider(dir, customProviderModelsJson);
+
+		const result = restoreSavedSessionModel({ provider: "myco", modelId: "myco-gone", modelRegistry: registry });
+
+		expect(result.model).toBeUndefined();
+		expect(result.reason).toBe("model no longer exists");
+		expect(result.verifiedUnavailable).toBe(true);
+	});
+
+	test("a saved model whose provider lost credentials is a verified negative", () => {
+		vi.stubEnv("CEREBRAS_API_KEY", undefined as unknown as string);
+		const dir = mkdtempSync(join(tmpdir(), "wave38-restore-"));
+		// A readable catalog (valid custom provider present) with no cerebras
+		// credential anywhere: the negative is verified, not unknown.
+		const { registry } = registryWithCustomProvider(dir, customProviderModelsJson);
+		expect(registry.find("cerebras", "gpt-oss-120b")).toBeDefined();
+
+		const result = restoreSavedSessionModel({
+			provider: "cerebras",
+			modelId: "gpt-oss-120b",
+			modelRegistry: registry,
+		});
+
+		expect(result.model).toBeUndefined();
+		expect(result.reason).toBe("no auth configured");
+		expect(result.verifiedUnavailable).toBe(true);
+	});
+
+	test("an unreadable catalog makes availability unknown: no verdict, no rewrite mandate", () => {
+		const dir = mkdtempSync(join(tmpdir(), "wave38-restore-"));
+		const { registry } = registryWithCustomProvider(dir, customProviderModelsJson);
+		expect(registry.find("myco", "myco-model")).toBeDefined();
+		writeFileSync(join(dir, "models.json"), "{ this is not json", "utf-8");
+		registry.refresh();
+		expect(registry.getError()).toBeDefined();
+
+		const result = restoreSavedSessionModel({ provider: "myco", modelId: "myco-model", modelRegistry: registry });
+
+		expect(result.model).toBeUndefined();
+		expect(result.verifiedUnavailable).toBe(false);
+		expect(result.reason).toContain("catalog");
 	});
 });
