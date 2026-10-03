@@ -216,6 +216,7 @@ interface ReuseHelloOverrides {
 	/** `null` sends a hello without any runtime identity. */
 	buildId?: string | null;
 	launcherPath?: string;
+	entrypointPath?: string;
 }
 
 function reuseHello(overrides: ReuseHelloOverrides = {}): DaemonHello {
@@ -235,6 +236,7 @@ function reuseHello(overrides: ReuseHelloOverrides = {}): DaemonHello {
 						buildId,
 						executablePath: "/usr/bin/node",
 						...(overrides.launcherPath ? { launcherPath: overrides.launcherPath } : {}),
+						...(overrides.entrypointPath ? { entrypointPath: overrides.entrypointPath } : {}),
 					},
 				}),
 	};
@@ -276,6 +278,25 @@ describe("judgeDaemonReuse", () => {
 			clientIdentity,
 		);
 		expect(verdict.decision).toBe("reuse-with-warning");
+		expect(verdict.reason).toContain("bundle-before-the-build");
+	});
+
+	it("only warns when the different build ids come from different entrypoints (bundle vs tsx source)", () => {
+		const verdict = judgeDaemonReuse(
+			reuseHello({ buildId: "release-tsx-source", entrypointPath: "/repo/packages/coding-agent/src/cli.ts" }),
+			clientIdentity,
+		);
+		expect(verdict.decision).toBe("reuse-with-warning");
+		expect(verdict.reason).toContain("src/cli.ts");
+		expect(verdict.reason).toContain("release-tsx-source");
+	});
+
+	it("replaces a different-build daemon reached through the same entrypoint", () => {
+		const verdict = judgeDaemonReuse(
+			reuseHello({ buildId: "bundle-before-the-build", entrypointPath: clientIdentity.entrypointPath }),
+			clientIdentity,
+		);
+		expect(verdict.decision).toBe("replace");
 		expect(verdict.reason).toContain("bundle-before-the-build");
 	});
 

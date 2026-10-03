@@ -99,10 +99,15 @@ export interface DaemonReuseVerdict {
  * it starts later loads `process.argv[1]` from disk (`subprocess-launch.ts`), so one daemon lifetime
  * can serve two builds. Ignoring the build id makes "the fix I just built is still broken" a silent
  * state; the two ids are only comparable when both processes were launched the same way (the same
- * `PRIME_AGENT_LAUNCHER_PATH`, or neither set). A shell wrapper exports a build id computed at launch
- * time while an installed CLI carries the id baked into its bundle, so treating that difference as
- * staleness would replace a healthy daemon on every launch. A daemon that reports no build id at all
- * is not comparable either: it is kept, with a warning, rather than killed on an unknown.
+ * `PRIME_AGENT_LAUNCHER_PATH`, or neither set) through the same entrypoint. A shell wrapper exports a
+ * build id computed at launch time while an installed CLI carries the id baked into its bundle, and a
+ * tsx source launch falls back to `release-<version>`, so the ids run on different clocks per build
+ * form: a mismatch across entrypoints (`dist/bundle/cli.js` vs `src/cli.ts`) means "different form",
+ * not "stale", and replacing there would make the two entrypoints kill each other's daemon on every
+ * alternating launch. An entrypoint that went unreported (older daemon, bun binary) stays comparable
+ * so the rebuild check keeps its teeth against daemons that predate this field. A daemon that reports
+ * no build id at all is not comparable either: it is kept, with a warning, rather than killed on an
+ * unknown.
  */
 export function judgeDaemonReuse(hello: DaemonReuseHello, clientIdentity: DaemonRuntimeIdentity): DaemonReuseVerdict {
 	const daemonIdentity = `daemon v${hello.appVersion ?? "unknown"}/protocol ${hello.protocol.version}/schema ${hello.schemaId ?? "legacy"}/build ${hello.runtime?.buildId ?? "unknown"}`;
@@ -140,7 +145,13 @@ export function judgeDaemonReuse(hello: DaemonReuseHello, clientIdentity: Daemon
 	}
 	const daemonLauncher = hello.runtime?.launcherPath;
 	const clientLauncher = clientIdentity.launcherPath;
-	if (daemonLauncher === clientLauncher) {
+	const daemonEntrypoint = hello.runtime?.entrypointPath;
+	const clientEntrypoint = clientIdentity.entrypointPath;
+	// An unreported entrypoint (older daemon, bun binary) cannot prove a different build form,
+	// so it stays comparable and the rebuild check below keeps its teeth there.
+	const sameEntrypoint =
+		daemonEntrypoint === undefined || clientEntrypoint === undefined || daemonEntrypoint === clientEntrypoint;
+	if (daemonLauncher === clientLauncher && sameEntrypoint) {
 		return {
 			decision: "replace",
 			reason:
@@ -148,11 +159,15 @@ export function judgeDaemonReuse(hello: DaemonReuseHello, clientIdentity: Daemon
 				`(same launch identity ${daemonLauncher ?? "none"}); replacing it so one daemon serves one build`,
 		};
 	}
+	const formDifference =
+		daemonLauncher === clientLauncher
+			? `daemon entrypoint ${daemonEntrypoint ?? "unknown"} vs client ${clientEntrypoint ?? "unknown"}`
+			: `daemon launcher ${daemonLauncher ?? "none"} vs client ${clientLauncher ?? "none"}`;
 	return {
 		decision: "reuse-with-warning",
 		reason:
-			`reusing a daemon from a different launch identity (daemon launcher ${daemonLauncher ?? "none"} vs ` +
-			`client ${clientLauncher ?? "none"}) although its build differs: ${daemonIdentity} vs ${clientIdentityText}`,
+			`reusing a daemon from a different launch identity (${formDifference}) although its build differs: ` +
+			`${daemonIdentity} vs ${clientIdentityText}`,
 	};
 }
 
