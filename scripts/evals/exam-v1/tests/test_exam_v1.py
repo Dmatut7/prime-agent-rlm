@@ -34,7 +34,12 @@ README.md) plus the wave-15 integrity defect (D9) must stay fixed:
       analyze.py without fixing it. The grader reads the manifest from the
       rail dir (D9 mtime rule applies) and fails closed on a work-root
       manifest.json - the legacy, agent-readable layout, or a planted or
-      forged copy all void the run.
+      forged copy all void the run. The same contract covers EX-2's
+      manifest.json (the expected needle map - a readable copy lets the
+      agent transcribe the answers without reading the corpus):
+      gen_ex2.py --rail-dir, the EX-2 pin set shrinks to fixture/docs/*.md,
+      and grade_ex2.py cross-checks the rail manifest against its corpus
+      rescan.
 
 No agent, model, or network is invoked. Python 3.9 stdlib only.
 
@@ -733,23 +738,38 @@ class Ex1Test(unittest.TestCase):
 
 
 class Ex2Test(unittest.TestCase):
-    # The grader's canonical answer-source set: the corpus it rescans as the
-    # needle truth, plus the manifest that pins the generation record.
-    PATTERNS = ("manifest.json", "fixture/docs/*.md")
+    # The grader's canonical answer-source PIN set: the corpus it rescans as
+    # the needle truth. The manifest (the generation record holding the
+    # expected needle map) is not pinned because it is not in the work dir at
+    # all: since v1.5 parity (D12) gen_ex2.py writes it straight into the rail
+    # dir, same contract as EX-1, so the agent never receives the answer key.
+    PATTERNS = ("fixture/docs/*.md",)
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.work = Path(self.tmp.name) / "ex2"
+        # D9/D12: the rail dir (answer-source pin, run-meta, and the manifest
+        # itself) lives outside the agent-writable work dir.
+        self.rail = Path(self.tmp.name) / "ex2-rail"
         proc = subprocess.run(
-            [sys.executable, str(PACK / "ex2-needles/gen_ex2.py"), "--out", str(self.work), "--seed", "20261002"],
+            [
+                sys.executable,
+                str(PACK / "ex2-needles/gen_ex2.py"),
+                "--out",
+                str(self.work),
+                "--rail-dir",
+                str(self.rail),
+                "--seed",
+                "20261002",
+            ],
             capture_output=True,
             text=True,
             timeout=60,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        # D10: the answer-source pin lives outside the agent-writable work dir.
-        self.rail = Path(self.tmp.name) / "ex2-rail"
-        self.rail.mkdir()
+        # D12: the answer key never enters the agent-writable work dir.
+        self.assertFalse((self.work / "manifest.json").exists())
+        self.assertTrue((self.rail / "manifest.json").is_file())
         self.truth = self.rescan()
         self.assertGreater(len(self.truth["needles"]), 0)
 
@@ -801,6 +821,8 @@ class Ex2Test(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertTrue(verdict["pass"], json.dumps(verdict))
         self.assertTrue(verdict["checks"]["answer_source_ok"], json.dumps(verdict))
+        self.assertTrue(verdict["checks"]["work_manifest_absent"], json.dumps(verdict))
+        self.assertTrue(verdict["checks"]["manifest_matches_corpus"], json.dumps(verdict))
 
     def test_gold_keys_have_no_needle_prefix(self):
         for key in self.truth["needles"]:
@@ -894,10 +916,114 @@ class Ex2Test(unittest.TestCase):
         self.assertFalse(verdict["checks"]["answer_source_ok"])
         self.assertTrue(all(verdict["checks"]["per_needle"].values()), json.dumps(verdict))
 
+    def test_legacy_work_root_manifest_grades_red(self):
+        # D12: a manifest.json the agent can read (the pre-parity layout, or a
+        # copy it managed to plant) voids the run even when every answer is
+        # honestly computed - the answer key was agent-visible, so the run is
+        # unverifiable as a recall measurement.
+        self.record_rail()
+        self.write_answers(self.truth)
+        shutil.copy2(str(self.rail / "manifest.json"), str(self.work / "manifest.json"))
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertFalse(verdict["checks"]["work_manifest_absent"])
+        # Everything else is genuinely green: only the readable key fails it.
+        self.assertTrue(verdict["checks"]["answer_source_ok"], json.dumps(verdict))
+        self.assertTrue(verdict["checks"]["manifest_matches_corpus"], json.dumps(verdict))
+        self.assertTrue(verdict["checks"]["needles_ok"], json.dumps(verdict))
+
+    def test_planted_forged_manifest_grades_red(self):
+        # The write-side forgery shape, replayed against the new layout: the
+        # agent's answers are wrong, so it plants a work-root manifest.json
+        # whose "expected" matches its own answers. The grader's truth is the
+        # corpus rescan and its record is the RAIL manifest, not the planted
+        # one: red on the leak check AND on the needle values.
+        self.record_rail()
+        answers = json.loads(json.dumps(self.truth))
+        key = sorted(answers["needles"])[0]
+        answers["needles"][key] += 1
+        answers["total"] += 1
+        self.write_answers(answers)
+        forged = {"exam": "EX-2", "seed": 20261002, "expected": answers}
+        (self.work / "manifest.json").write_text(json.dumps(forged, indent=2) + "\n")
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertFalse(verdict["checks"]["work_manifest_absent"])
+        self.assertFalse(verdict["checks"]["per_needle"][key])
+        self.assertFalse(verdict["checks"]["needles_ok"])
+        # The planted copy never reaches the generation-record cross-check.
+        self.assertTrue(verdict["checks"]["manifest_matches_corpus"], json.dumps(verdict))
+
+    def test_forged_rail_manifest_grades_red(self):
+        # D12 + the D9 mtime rule: an agent that discovers the rail dir and
+        # rewrites the rail manifest post-launch (re-pointing the generation
+        # record at its own answers). The mtime rule voids the run.
+        self.record_rail()
+        self.write_answers(self.truth)
+        manifest_path = self.rail / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        key = sorted(manifest["expected"]["needles"])[0]
+        manifest["expected"]["needles"][key] += 1
+        manifest["expected"]["total"] += 1
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertFalse(verdict["checks"]["rail_manifest_predates_run"])
+        self.assertFalse(verdict["checks"]["rail_ok"])
+        # The answers themselves are honestly computed from the pinned corpus.
+        self.assertTrue(verdict["checks"]["answer_source_ok"], json.dumps(verdict))
+        self.assertTrue(verdict["checks"]["needles_ok"], json.dumps(verdict))
+
+    def test_stale_rail_manifest_grades_red(self):
+        # The content cross-check, isolated from the mtime rule: a rail
+        # manifest whose recorded needles disagree with the (pinned) corpus
+        # rescan is a corrupt generation record - red even with the mtime
+        # aged behind the run-start anchor and the answers honestly computed.
+        self.record_rail()
+        started = examlib.read_run_meta(self.rail)["started_at"]
+        manifest_path = self.rail / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        key = sorted(manifest["expected"]["needles"])[0]
+        manifest["expected"]["needles"][key] += 1
+        manifest["expected"]["total"] += 1
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        # Age the rewritten manifest behind the anchor so only the content
+        # cross-check, not the mtime rule, may fail the run.
+        old = started - 1
+        os.utime(manifest_path, (old, old))
+        self.write_answers(self.truth)
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertTrue(verdict["checks"]["rail_manifest_predates_run"], json.dumps(verdict))
+        self.assertTrue(verdict["checks"]["manifest_parseable"], json.dumps(verdict))
+        self.assertFalse(verdict["checks"]["manifest_matches_corpus"])
+        self.assertTrue(verdict["checks"]["answer_source_ok"], json.dumps(verdict))
+        self.assertTrue(verdict["checks"]["needles_ok"], json.dumps(verdict))
+
+    def test_missing_rail_manifest_grades_red(self):
+        # Fail closed: no manifest in the rail dir means no generation record.
+        self.record_rail()
+        self.write_answers(self.truth)
+        (self.rail / "manifest.json").unlink()
+        code, verdict, err = self.grade()
+        self.assertEqual(code, 1, err)
+        self.assertFalse(verdict["pass"])
+        self.assertFalse(verdict["checks"]["rail_manifest_present"])
+        self.assertFalse(verdict["checks"]["manifest_parseable"])
+
     def test_forged_answer_source_pin_grades_red(self):
         # The agent re-pins the rail to its tampered corpus: content agrees,
         # the mtime rule voids the run (same shape as the EX-1 pin forgery).
-        self.record_rail(started_at=time.time() - 60)
+        started = time.time() - 60
+        self.record_rail(started_at=started)
+        # The backdated anchor postdates nothing else: age the pristine rail
+        # manifest behind it so only the re-pinned pin file breaks the rule.
+        old = started - 1
+        os.utime(self.rail / "manifest.json", (old, old))
         docs = self.work / "fixture" / "docs"
         target = sorted(docs.glob("*.md"))[0]
         target.write_text(target.read_text() + "\n")  # needle set unchanged
@@ -1647,12 +1773,12 @@ class DocsTest(unittest.TestCase):
         self.assertIn("answer-source-sha256.json", text)
 
     def test_readme_documents_the_manifest_rail(self):
-        # D12: gen_ex1 writes the answer key straight into the rail dir, so
-        # the EX-1 pin set no longer includes a work-root manifest.json (the
-        # one remaining --corpus-glob manifest.json is EX-2's).
+        # D12: gen_ex1 and gen_ex2 write the answer key straight into the rail
+        # dir, so neither pin set includes a work-root manifest.json anymore.
         text = (PACK / "README.md").read_text()
         self.assertRegex(text, r"gen_ex1\.py --out [^\n]*--rail-dir")
-        self.assertEqual(text.count("--corpus-glob manifest.json"), 1)
+        self.assertRegex(text, r"gen_ex2\.py --out [^\n]*--rail-dir")
+        self.assertNotIn("--corpus-glob manifest.json", text)
         self.assertIn("D12", text)
 
     def test_ex1_ex2_prompts_mention_hash_pinning(self):

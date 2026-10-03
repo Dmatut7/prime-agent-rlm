@@ -22,9 +22,9 @@ can neither see nor rewrite them (D9). The prompt never names the rail dir.
 pins the exam's answer sources (D10, EX-1/EX-2): every matched file's
 sha256 is written to <rail-dir>/answer-source-sha256.json BEFORE the agent
 launches, and the graders re-hash their canonical set at grade time. EX-1:
-fixture/data/*.csv (the manifest is a rail file since v1.5 - gen_ex1.py
---rail-dir writes it straight into the rail dir, D12). EX-2: manifest.json +
-fixture/docs/*.md.
+fixture/data/*.csv; EX-2: fixture/docs/*.md (both manifests are rail files
+since v1.5 - gen_ex1.py/gen_ex2.py --rail-dir write them straight into the
+rail dir, D12).
 
 Usage:
     python3 run_manual.py --work /path/to/exN-work --model provider/model \
