@@ -1917,4 +1917,51 @@ describe("AgentSession compaction characterization", () => {
 		expect(ends[0]?.result?.summary).toContain("summarizer answer");
 		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(true);
 	});
+
+	// CC 2.1.288: a provider that reports zeros (GLM-style) leaves a zero-usage reply
+	// at the tail. Anchoring the trigger estimate on it would read the whole session
+	// as nearly empty and skip autocompact until the provider's own prompt-too-long
+	// does the compacting - so zero usage must not be a usage source.
+	it("still triggers threshold compaction when the newest assistant reported zero usage", async () => {
+		const harness = await createOverThresholdHarness({ beforeCompact: "none" });
+		harnesses.push(harness);
+		harness.setResponses([
+			...OVER_THRESHOLD_FILL_RESPONSES,
+			// Two summarizer slots: a split-turn compaction summarizes the turn prefix and
+			// the history in two calls, and which one runs first is the cut point's business.
+			fauxAssistantMessage("summarizer answer"),
+			fauxAssistantMessage("summarizer answer"),
+			fauxAssistantMessage("turn after the compaction"),
+		]);
+		await fillOverThreshold(harness);
+
+		// The faux provider always computes a non-zero usage, so the zero-usage reply
+		// is injected: appended to the branch and to the live context, exactly where a
+		// real one would sit after its turn.
+		const zeroUsageAssistant = createAssistant(harness, { totalTokens: 0 });
+		harness.sessionManager.appendMessage(zeroUsageAssistant);
+		harness.session.agent.state.messages = [...harness.session.agent.state.messages, zeroUsageAssistant];
+
+		await harness.session.prompt("next turn");
+
+		expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toContain("threshold");
+		const ends = harness.eventsOfType("compaction_end");
+		expect(ends.length).toBeGreaterThan(0);
+		expect(ends[0]?.errorMessage).toBeUndefined();
+		// The pre-turn compaction is the run under test: its entry must land BEFORE the
+		// turn's reply. Anchored at the zero-usage tail the pre-turn check reads ~0 and
+		// stays silent, and the compaction only fires at the turn's own agent_end - after
+		// the reply - once that turn reports a non-zero usage.
+		const entries = harness.sessionManager.getEntries();
+		const compactionIndex = entries.findIndex((entry) => entry.type === "compaction");
+		expect(compactionIndex).toBeGreaterThan(-1);
+		const replyIndex = entries.findIndex(
+			(entry) =>
+				entry.type === "message" &&
+				entry.message.role === "assistant" &&
+				getMessageText(entry.message).includes("turn after the compaction"),
+		);
+		expect(replyIndex).toBeGreaterThan(-1);
+		expect(compactionIndex).toBeLessThan(replyIndex);
+	});
 });

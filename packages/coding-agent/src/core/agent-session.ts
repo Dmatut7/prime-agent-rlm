@@ -141,6 +141,7 @@ import {
 	COMPACT_SKILL_NAME,
 	COMPACTION_EMERGENCY_SHRINK_FAILURES,
 	COMPACTION_RECOVERY_HINT_THRESHOLD,
+	type CompactionPreparation,
 	type CompactionResult,
 	type CompactionSettings,
 	type CompactionWindowLimits,
@@ -155,6 +156,8 @@ import {
 	isAssistantUsageSource,
 	planEmergencyShrink,
 	prepareCompactionOutcome,
+	SummarizationRefusalError,
+	type SummaryCallRunner,
 	serializeConversation,
 	shouldCompact,
 	shrunkKeepRecentTokens,
@@ -13655,17 +13658,9 @@ export class AgentSession {
 						throw error;
 					}
 				};
-				({ summary, firstKeptEntryId, tokensBefore, details, usage } = await compact(
+				({ summary, firstKeptEntryId, tokensBefore, details, usage } = await this._compactWithRefusalModelRetry(
 					preparation,
-					model,
-					apiKey,
-					headers,
-					customInstructions,
-					signal,
-					this.thinkingLevel,
-					summaryCall,
-					providerRetryPolicy(this.settingsManager),
-					this.sessionId,
+					{ model, apiKey, headers, customInstructions, signal, summaryCall },
 				));
 			}
 
@@ -13742,6 +13737,64 @@ export class AgentSession {
 		await this._reapDeletedRlmSubagentRuntimesAfterCompaction();
 
 		return { summary, firstKeptEntryId, tokensBefore, details };
+	}
+
+	/**
+	 * The summarization core of _performCompaction, with the one CC 2.1.282 retry:
+	 * a refusal is a verdict of the model that answered, not of the request, so the
+	 * next configured fallback model gets a single attempt at the same summary.
+	 * Only when no fallback can serve, or it fails too, does the refusal reach the
+	 * caller as a compaction failure and count toward the consecutive-failure
+	 * streak. The fallback is one-shot for this summarization only - the session
+	 * model does not switch.
+	 */
+	private async _compactWithRefusalModelRetry(
+		preparation: CompactionPreparation,
+		options: {
+			model: Model<any>;
+			apiKey: string;
+			headers?: Record<string, string>;
+			customInstructions?: string;
+			signal: AbortSignal;
+			summaryCall: SummaryCallRunner;
+		},
+	): Promise<CompactionResult> {
+		const runCompact = (compactModel: Model<any>, compactApiKey: string, compactHeaders?: Record<string, string>) =>
+			compact(
+				preparation,
+				compactModel,
+				compactApiKey,
+				compactHeaders,
+				options.customInstructions,
+				options.signal,
+				this.thinkingLevel,
+				options.summaryCall,
+				providerRetryPolicy(this.settingsManager),
+				this.sessionId,
+			);
+		try {
+			return await runCompact(options.model, options.apiKey, options.headers);
+		} catch (error) {
+			if (!(error instanceof SummarizationRefusalError) || options.signal.aborted) throw error;
+			const fallback = this._resolveNextFallbackModel();
+			if (!fallback) throw error;
+			let fallbackAuth: { apiKey: string; headers?: Record<string, string>; requestModel: Model<Api> };
+			try {
+				fallbackAuth = await this._getRequiredRequestAuth(fallback);
+			} catch {
+				// A chain entry whose auth cannot serve is no retry at all: the original
+				// refusal is the failure the caller should see.
+				throw error;
+			}
+			sessionLog.warn("compaction summarization refused; retrying once on a fallback model", {
+				sessionId: this.sessionId,
+				refusedProvider: options.model.provider,
+				refusedModel: options.model.id,
+				fallbackProvider: fallback.provider,
+				fallbackModel: fallback.id,
+			});
+			return await runCompact(fallbackAuth.requestModel, fallbackAuth.apiKey, fallbackAuth.headers);
+		}
 	}
 
 	private async _reapDeletedRlmSubagentRuntimesAfterCompaction(): Promise<void> {
@@ -15097,7 +15150,12 @@ export class AgentSession {
 		}
 
 		if (assistantMessage.stopReason === "error") return undefined;
-		return calculateContextTokens(assistantMessage.usage);
+		const usageTokens = calculateContextTokens(assistantMessage.usage);
+		if (usageTokens > 0) return usageTokens;
+		// A zero-usage reply must not read as an empty context (CC 2.1.288): with no
+		// usable usage anchor anywhere, price the whole session by content density
+		// instead of reporting zero and skipping the autocompact check.
+		return estimateContextTokens(this.agent.state.messages).tokens;
 	}
 
 	/**
@@ -20556,11 +20614,10 @@ export class AgentSession {
 
 		if (latestCompaction) {
 			// Check if there's a readable assistant usage after the compaction boundary.
-			// Keep scanning past aborted, errored and zero-usage assistants: stopping at
-			// the first non-errored one reported "unknown" whenever a provider sent a
-			// zero-usage response, while the compaction trigger - which reads the same
-			// messages through estimateContextTokens - still had a usage source. Both
-			// calibers now share isAssistantUsageSource.
+			// Keep scanning past aborted, errored and zero-usage assistants: a zero-usage
+			// reply is not a readable count for either caliber (isAssistantUsageSource,
+			// CC 2.1.288), so both stay at "unknown" until a real response arrives
+			// instead of one reporting a number while the other reports "unknown".
 			const compactionIndex = branchEntries.lastIndexOf(latestCompaction);
 			let hasPostCompactionUsage = false;
 			for (let i = branchEntries.length - 1; i > compactionIndex; i--) {

@@ -215,6 +215,42 @@ describe("Token calculation", () => {
 	});
 });
 
+describe("estimateContextTokens with zero-usage replies (CC 2.1.288)", () => {
+	it("anchors on the last non-zero usage instead of a zero-usage tail", () => {
+		const messages: AgentMessage[] = [
+			createUserMessage("start"),
+			createAssistantMessage("counted", createMockUsage(100_000, 500)),
+			createUserMessage("next"),
+			createAssistantMessage("zero usage reply", createMockUsage(0, 0)),
+		];
+
+		const estimate = estimateContextTokens(messages);
+
+		// Anchoring at the zero-usage tail would count only the messages after it and
+		// read a full session as nearly empty, suppressing the autocompact trigger.
+		expect(estimate.lastUsageIndex).toBe(1);
+		expect(estimate.usageTokens).toBe(100_500);
+		expect(estimate.tokens).toBeGreaterThan(100_500);
+	});
+
+	it("prices the whole transcript by content density when every assistant reports zeros", () => {
+		const messages: AgentMessage[] = [
+			createUserMessage("start"),
+			createAssistantMessage("zero one", createMockUsage(0, 0)),
+			createUserMessage("next"),
+			createAssistantMessage("zero two", createMockUsage(0, 0)),
+		];
+
+		const estimate = estimateContextTokens(messages);
+
+		expect(estimate.lastUsageIndex).toBeNull();
+		expect(estimate.usageTokens).toBe(0);
+		// The density estimate is the sum over all four messages, not the zero anchor.
+		expect(estimate.tokens).toBeGreaterThan(0);
+		expect(estimate.tokens).toBe(estimate.trailingTokens);
+	});
+});
+
 describe("getLastAssistantUsage", () => {
 	it("should find the last non-aborted assistant message usage", () => {
 		const entries: SessionEntry[] = [

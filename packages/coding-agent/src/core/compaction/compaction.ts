@@ -16,7 +16,7 @@ import {
 	HARNESS_DIGEST_CUSTOM_TYPE,
 } from "../messages.js";
 import { effectiveInputLimitTokens } from "../model-input-limits.js";
-import type { ProviderRetryPolicy } from "../provider-retry.js";
+import { type ProviderRetryPolicy, providerStreamFailureKind } from "../provider-retry.js";
 import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.js";
 import { addAssistantUsage, emptyUsage } from "../usage.js";
 import { ASCII_CHARS_PER_TOKEN, measureContentDensity } from "./content-density.js";
@@ -278,21 +278,25 @@ export function calculateContextTokens(usage: Usage): number {
  * compaction trigger) and `AgentSession.getContextUsage` (/usage, /context,
  * compact.status) must agree on which assistant usage is readable, or one reports
  * a number while the other reports "unknown". Aborted and errored turns carry no
- * usable usage; a provider that reports zeros is still a source, so the estimate
- * then counts only the messages that follow it.
+ * usable usage. A zero-usage reply is not a source either (CC 2.1.288): anchored
+ * at zero, the estimate would count only the messages that follow it, so a
+ * provider that reports zeros would suppress the autocompact trigger until the
+ * provider's own prompt-too-long does the compacting. Skipping it anchors on the
+ * last real count instead, or prices the whole transcript by content density.
  */
 export function isAssistantUsageSource(message: AgentMessage): message is AssistantMessage {
 	return (
 		message.role === "assistant" &&
 		message.stopReason !== "aborted" &&
 		message.stopReason !== "error" &&
-		Boolean(message.usage)
+		message.usage !== undefined &&
+		calculateContextTokens(message.usage) > 0
 	);
 }
 
 /**
  * Get usage from an assistant message if available.
- * Skips aborted and error messages as they don't have valid usage data.
+ * Skips aborted, errored and zero-usage messages as they don't have valid usage data.
  */
 function getAssistantUsage(msg: AgentMessage): Usage | undefined {
 	return isAssistantUsageSource(msg) ? msg.usage : undefined;
@@ -1527,6 +1531,31 @@ export class SummarizationInputLengthError extends Error {
 	}
 }
 
+/**
+ * The summarizer refused the request outright (provider stop reason "refusal").
+ *
+ * Distinct from a generic failure so the session layer can spend its one
+ * fallback-model retry (CC 2.1.282): a refusal is a verdict of the model that
+ * answered, not of the request, so another model may summarize the same content.
+ * Only when no fallback can serve, or it fails too, does the refusal reach the
+ * caller as an ordinary compaction failure.
+ */
+export class SummarizationRefusalError extends Error {
+	constructor(errorLabel: string, errorMessage: string) {
+		super(`${errorLabel}: ${errorMessage}`);
+		this.name = "SummarizationRefusalError";
+	}
+}
+
+/**
+ * Whether an errored summarization response is a provider refusal: the structured
+ * stream-failure diagnostic when one was recorded, else the raw stop reason the
+ * provider reported (wave-31 maps both onto the message).
+ */
+function isRefusalResponse(response: AssistantMessage): boolean {
+	return providerStreamFailureKind(response) === "refusal" || response.stopReasonRaw === "refusal";
+}
+
 interface SummarizationCallOptions extends SummarizationRequestOptions {
 	currentMessages: AgentMessage[];
 	model: Model<any>;
@@ -1638,6 +1667,9 @@ async function completeSummarizationRequest(options: SummarizationCallOptions): 
 			// Carry the cap the provider announced, so a retry budgets against the
 			// number this provider actually refused instead of a guess.
 			throw new SummarizationInputLengthError(errorLabel, errorMessage, announcedInputLimit(errorMessage));
+		}
+		if (isRefusalResponse(response)) {
+			throw new SummarizationRefusalError(errorLabel, errorMessage);
 		}
 		throw new Error(`${errorLabel}: ${errorMessage}`);
 	}

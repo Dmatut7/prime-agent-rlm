@@ -51,7 +51,7 @@ describe("getContextUsage after a compaction", () => {
 		return harness;
 	}
 
-	it("reads the same usage source as the compaction trigger when the newest assistant reports zeros", async () => {
+	it("zero-usage newest assistant is not a usage source for either caliber (CC 2.1.288)", async () => {
 		const harness = await createCompactedHarness();
 		harness.sessionManager.appendMessage(user("pre-compaction question"));
 		const keptEntryId = harness.sessionManager.appendMessage(assistant(100_000));
@@ -63,12 +63,13 @@ describe("getContextUsage after a compaction", () => {
 		const usage = harness.session.getContextUsage();
 		const triggerCaliber = estimateContextTokens(harness.session.messages);
 
-		// The threshold trigger reads this assistant as its usage source, so /usage
-		// and /context must report a number instead of claiming "unknown".
-		expect(triggerCaliber.lastUsageIndex).not.toBeNull();
-		expect(usage?.tokens).toBe(triggerCaliber.tokens);
-		expect(usage?.contextWindow).toBe(CONTEXT_WINDOW);
-		expect(usage?.percent).toBe((triggerCaliber.tokens / CONTEXT_WINDOW) * 100);
+		// Neither caliber reads zeros as a context size: the trigger prices the whole
+		// context by content density instead of anchoring at zero (which would count
+		// only the messages after the zero-usage reply and suppress autocompact),
+		// and /usage reports "unknown" until a real post-compaction count arrives.
+		expect(triggerCaliber.lastUsageIndex).toBeNull();
+		expect(triggerCaliber.tokens).toBeGreaterThan(0);
+		expect(usage).toEqual({ tokens: null, contextWindow: CONTEXT_WINDOW, percent: null });
 	});
 
 	it("keeps scanning past an aborted assistant to the post-compaction usage before it", async () => {
@@ -118,7 +119,8 @@ describe("getContextUsage after a compaction", () => {
 	});
 
 	it("exposes one usage-source predicate for both calibers", () => {
-		expect(isAssistantUsageSource(assistant(0))).toBe(true);
+		expect(isAssistantUsageSource(assistant(0))).toBe(false);
+		expect(isAssistantUsageSource(assistant(100_000))).toBe(true);
 		expect(isAssistantUsageSource(assistant(100_000, "error"))).toBe(false);
 		expect(isAssistantUsageSource(assistant(100_000, "aborted"))).toBe(false);
 		expect(isAssistantUsageSource(user("x"))).toBe(false);
