@@ -6,7 +6,11 @@
 - AgentSession 壳评审（38 簇普查）：第七刀候选排序出炉——quota-park（477 行/25 成员/低 churn）首选，stall 簇（748 行）次选；登记 3 个死公有 API（全仓零引用，待裁决删）、1 处注释错位、1 处重复扫描。报告 /tmp/wave35/shell-review.md。
 - 走查（14 份证据）：暖池遥测在 agent.jsonl 实证落齐（含内存压力回收实机命中）；finish gate 引用优先文案实机确认。新立项四条：未注册子命令被当 prompt 执行留垃圾会话、暖池遥测字段命名不一（spawn 用 status/claim 用 outcome）、kernel snapshot warn 噪音、会话列表中英混排。
 - 调研：模型持久化同族事故四家补齐（CC 被拒残留 / Gemini 三态修法 #19891 / OpenHands 会话内静默漂移 / Aider opt-in 对照）——wave-36 立项证据链闭合。
-- 门禁：check EXIT 0、hygiene OK、单测 9541+绿（lazy-subagents 3 例真红已修——F1 注入的 await 挪动既有交错时序，收窄闸门后 47/47 绿；其余负载抖动隔离即绿）、suite 1674/1674 绿。需要重新编译并重启后才生效。
+- 门禁：check EXIT 0、hygiene OK、单测绿（修复后 47/47 + 全量复扫）、suite 1674/1674。
+- **事故披露**：本波收工时 `prime-agent list` 已显示 rv-l1 会话 working，收工链仍执行了
+  `shutdown --force`，把在跑会话归档（会话文件完好，`prime-agent attach rv-l1` 可恢复，对不起）。
+  同类第三次。已在账本把规矩机械化：shutdown 前必须同一命令链里 list 且仅当 "No active agents"
+  才继续，否则整链中止。需要重新编译并重启后才生效。
 
 
 
