@@ -1,4 +1,14 @@
-## 2026-10-03 wave-34 六路：过度自验治理、暖池遥测、模型表核准、/model 销账
+## 2026-10-04 wave-35 七路：per-model 窗口真错配修复、过度自验二期、空会话 cwd 修复、壳评审
+
+- per-model autocompact 主体：预判的错配（窗口不随模型走）实测不存在（所有触发点本就现读当前模型）；真错配是注册表热重载（live catalog）后运行中会话仍持有选择时刻捕获的 model 对象——网关重报小窗永远到不了触发器。修复：7 处窗口读取点改为按 (provider,id) 现查注册表、回退捕获值。5 例新测试（含网关降窗复现、bailian 实测钳制）。
+- 过度自验二期：proof 段加 early-stop 收敛判据（首次验证照旧，收敛即停）。EX-4 最优 rep 224k tok/12t（对 wave-34 的 261k 再 −14%；post-DONE 46k→25k；对 wave-33 原始基线 post-DONE −91%），判分全过；EX-1..7 全题复核无回退。
+- 空会话 cwd 修复（走查抓的高危）：空会话 evict 后 resume 时 config.cwd 被剥、daemon 用默认目录顶替——会话在错误目录跑。修复：resume 形态（config 在、cwd 被删）时从会话文件注水 stored cwd；普通 open（无 config）不受影响（闸门收窄保住既有发布-校验时序钉）。变异验证：禁用修复即精确复现错目录。
+- AgentSession 壳评审（38 簇普查）：第七刀候选排序出炉——quota-park（477 行/25 成员/低 churn）首选，stall 簇（748 行）次选；登记 3 个死公有 API（全仓零引用，待裁决删）、1 处注释错位、1 处重复扫描。报告 /tmp/wave35/shell-review.md。
+- 走查（14 份证据）：暖池遥测在 agent.jsonl 实证落齐（含内存压力回收实机命中）；finish gate 引用优先文案实机确认。新立项四条：未注册子命令被当 prompt 执行留垃圾会话、暖池遥测字段命名不一（spawn 用 status/claim 用 outcome）、kernel snapshot warn 噪音、会话列表中英混排。
+- 调研：模型持久化同族事故四家补齐（CC 被拒残留 / Gemini 三态修法 #19891 / OpenHands 会话内静默漂移 / Aider opt-in 对照）——wave-36 立项证据链闭合。
+- 门禁：check EXIT 0、hygiene OK、单测 9541+绿（lazy-subagents 3 例真红已修——F1 注入的 await 挪动既有交错时序，收窄闸门后 47/47 绿；其余负载抖动隔离即绿）、suite 1674/1674 绿。需要重新编译并重启后才生效。
+
+
 
 - 过度自验根治（考题基线头号失败模式）：根因在编排层 self-recovery finish gate——模型合规引用证据的措辞（"Verification passed" 等）打不中关键词表，nudge 文案又是重跑优先。改为：证据关键词表扩宽 + nudge 改「引用已有输出优先，已过的检查不重跑」+ 判定词契约（引用必须带明文判定词）。EX-4 实测 A/B：答案完成后的开销 −71~84%，总 token 708k→261k（最优 rep），判分 4/4 仍全过。首次验证不受影响。
 - 暖池运行时遥测落地：spawn 耗时{状态}/claim 结果{hit|miss|expired}+spare 年龄/池深度/回收按六类原因分桶，结构化日志进 agent.jsonl（Codex/Lambda/HikariCP 命名惯例），零 wire 变更；顺修 sweep 与 childClosed 双重处置同一 spare 的竞态。
