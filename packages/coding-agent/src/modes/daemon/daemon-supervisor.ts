@@ -139,6 +139,8 @@ import {
 	type DaemonResponse,
 	type DaemonServerCapability,
 	type DaemonUpdateRestartManifest,
+	type DaemonWarmPoolReclaimReason,
+	type DaemonWarmPoolStats,
 	failure,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
@@ -825,6 +827,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"list",
 	"list_agent_peers",
 	"get_direct_worker_transport",
+	"get_warm_pool_stats",
 	"roster_subscribe",
 	"roster_unsubscribe",
 	"list_saved_sessions",
@@ -983,14 +986,11 @@ interface SpawnedWorkerProcess {
  */
 /**
  * Reclaim attribution buckets (Go DBStats style): every spare that leaves the
- * pool unclaimed is counted exactly once, by cause. `ttl_expired` — idle TTL;
- * `exited` — the process died on its own; `memory_pressure` — the sweep
- * released it under the free-memory floor; `pool_closed` — the pool drained or
- * refilled while the spawn was in flight; `claim_failed` — claimed but the
- * connect+auth health check (or the launch around it) failed; `drain` —
- * shutdown, supervisor dispose, update restart.
+ * pool unclaimed is counted exactly once, by cause. The wire spelling is
+ * DaemonWarmPoolReclaimReason (rev 45); this alias keeps the pool internals on
+ * the same union so a telemetry bucket and a wire field can never drift apart.
  */
-type WarmPoolReclaimReason = "ttl_expired" | "exited" | "memory_pressure" | "pool_closed" | "claim_failed" | "drain";
+type WarmPoolReclaimReason = DaemonWarmPoolReclaimReason;
 
 /** Supervisor-lifetime warm-pool counters, emitted as a snapshot with every pool event. */
 interface WarmPoolTelemetryTotals {
@@ -3415,6 +3415,7 @@ export class DaemonSupervisor {
 			roster_unsubscribe: (client, command) => this.handleRosterUnsubscribe(client, command),
 			list_agent_peers: (_client, command) => this.handleListAgentPeers(command),
 			get_direct_worker_transport: (client, command) => this.handleGetDirectWorkerTransport(client, command),
+			get_warm_pool_stats: (_client, command) => this.handleGetWarmPoolStats(command),
 			list_saved_sessions: (client, command) => this.handleSavedSessionList(client, command),
 			create: (client, command) => this.handleCreate(client, command),
 			attach: (client, command) => this.handleAttach(client, command),
@@ -5341,7 +5342,8 @@ export class DaemonSupervisor {
 	 * entry clears after publish). `totals` carries the supervisor-lifetime
 	 * counters so a rotated log still reconstructs the tally. The operational
 	 * log lines are unchanged; this stream is structured log only — never the
-	 * daemon wire.
+	 * daemon wire. The wire face of the same facts is get_warm_pool_stats
+	 * (rev 45, capability warm_pool_stats) below.
 	 */
 	private logWarmPoolTelemetry(event: "spawn" | "claim" | "reclaim", fields: Record<string, unknown>): void {
 		const totals = this.warmPoolTotals;
@@ -5354,6 +5356,51 @@ export class DaemonSupervisor {
 				reclaims: { ...totals.reclaims },
 			},
 		});
+	}
+
+	/**
+	 * get_warm_pool_stats (rev 45, capability warm_pool_stats): the wire face of
+	 * the warm-pool telemetry above. Reads only the lazy pool maps, so a
+	 * prototype-harness supervisor that never ran the constructor answers with an
+	 * empty, disabled pool instead of throwing. A cooldown entry joins the
+	 * response only while it still suppresses a respawn; a stale record whose
+	 * cooldown already elapsed has no effect and is left out.
+	 */
+	private async handleGetWarmPoolStats(
+		command: Extract<DaemonCommand, { type: "get_warm_pool_stats" }>,
+	): Promise<DaemonResponse> {
+		const nowMs = Date.now();
+		const pool = this.warmPool;
+		const totals = this.warmPoolTotals;
+		const spares: DaemonWarmPoolStats["spares"] = [...(this.warmSparesMap?.values() ?? [])].map((spare) => ({
+			cwd: spare.cwd,
+			workerId: spare.workerId,
+			ageMs: Math.max(0, nowMs - spare.spawnedAt),
+			expiresInMs: Math.max(0, spare.expiresAt - nowMs),
+		}));
+		const cooldowns: DaemonWarmPoolStats["cooldowns"] =
+			pool === undefined
+				? []
+				: [...(this.warmSpareFailuresMap?.entries() ?? [])]
+						.map(([key, failed]) => ({
+							cwd: key,
+							reason: failed.reason,
+							retryInMs: Math.max(0, pool.spawnCooldownMs - (nowMs - failed.failedAt)),
+						}))
+						.filter((entry) => entry.retryInMs > 0);
+		const stats: DaemonWarmPoolStats = {
+			enabled: pool !== undefined,
+			depth: { ready: this.warmSparesMap?.size ?? 0, warming: this.warmSpareInflightMap?.size ?? 0 },
+			spares,
+			cooldowns,
+			totals: {
+				spawns: { ...totals.spawns },
+				claims: { ...totals.claims },
+				reclaims: { ...totals.reclaims },
+			},
+			...(pool === undefined ? {} : { config: { ttlMs: pool.ttlMs, maxSpares: pool.maxSpares } }),
+		};
+		return success(command.id, command.type, stats);
 	}
 
 	/** A create that left without a spare: no ready spare, the warming wait expired, the env fingerprint differed, or the claim health check failed. */

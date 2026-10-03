@@ -16,6 +16,7 @@ import {
 	DAEMON_PROTOCOL_VERSION,
 	DAEMON_SCHEMA_ID,
 	type DaemonRuntimeIdentity,
+	type DaemonWarmPoolStats,
 } from "../modes/daemon/daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "../modes/daemon/daemon-runtime-identity.js";
 import { defaultDaemonSocketDir, defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
@@ -117,6 +118,13 @@ export interface DaemonInfo {
 	liveness?: DaemonLiveness;
 	/** What `liveness` is based on, in the words shown to the user. */
 	livenessEvidence?: string[];
+	/**
+	 * Warm spare pool snapshot (rev 45, capability warm_pool_stats). Present only
+	 * when the daemon advertised the capability in its hello and answered
+	 * get_warm_pool_stats; an older daemon simply has no field, and the views
+	 * print nothing for it.
+	 */
+	warmPool?: DaemonWarmPoolStats;
 }
 
 /** What a stop report entry names. A worker is its own target: it dies on its own pid. */
@@ -818,7 +826,7 @@ function scanSocketDir(): string[] {
 	return sockets;
 }
 
-interface ProbeResult {
+export interface ProbeResult {
 	version?: string;
 	protocolVersion?: number;
 	schemaId?: string;
@@ -826,12 +834,14 @@ interface ProbeResult {
 	sessionCount?: number;
 	supervisorPid?: number;
 	supervisorProcessStartId?: string;
+	/** Warm pool snapshot; only ever set after the hello advertised warm_pool_stats. */
+	warmPool?: DaemonWarmPoolStats;
 	reachable: boolean;
 	/** The daemon answered hello or the list request; a bare connect is not an answer. */
 	answeredProbe: boolean;
 }
 
-async function probeDaemon(socketPath: string): Promise<ProbeResult> {
+export async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 	const client = new DaemonClient(socketPath, { declaredCapabilities: DAEMON_FIRST_PARTY_CONTROL_CAPABILITIES });
 	try {
 		await client.connect(300);
@@ -847,6 +857,7 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 		let supervisorPid: number | undefined;
 		let supervisorProcessStartId: string | undefined;
 		let greeted = false;
+		let warmPoolCapable = false;
 		try {
 			const hello = await client.waitForHello(1500);
 			version = hello.appVersion;
@@ -855,6 +866,10 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 			runtime = hello.runtime;
 			supervisorPid = hello.supervisorPid;
 			supervisorProcessStartId = hello.supervisorProcessStartId;
+			// The capability is the only gate: a daemon that does not advertise
+			// warm_pool_stats (rev < 45, or a standalone daemon with no pool) is
+			// never sent the command, so the old wire is untouched.
+			warmPoolCapable = hello.serverCapabilities?.includes("warm_pool_stats") === true;
 			greeted = true;
 		} catch {
 			// Connected but no recognizable greeting: an old/foreign daemon.
@@ -871,6 +886,18 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 		} catch {
 			// Leave sessionCount undefined when the daemon will not answer list.
 		}
+		let warmPool: DaemonWarmPoolStats | undefined;
+		if (warmPoolCapable) {
+			try {
+				const response = await client.request({ type: "get_warm_pool_stats" }, 5000);
+				if (response.success) {
+					warmPool = response.data as DaemonWarmPoolStats;
+				}
+			} catch {
+				// A daemon that advertised but will not answer leaves the field absent,
+				// exactly like a daemon that never advertised.
+			}
+		}
 		return {
 			version,
 			protocolVersion,
@@ -879,6 +906,7 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 			sessionCount,
 			supervisorPid,
 			supervisorProcessStartId,
+			...(warmPool === undefined ? {} : { warmPool }),
 			reachable: true,
 			answeredProbe: greeted || sessionCount !== undefined,
 		};
@@ -1047,6 +1075,7 @@ export async function discoverDaemons(): Promise<DaemonInfo[]> {
 				...(hasTrackedWorkers ? { liveWorkerCount } : {}),
 				liveness: liveness.liveness,
 				...(liveness.evidence.length > 0 ? { livenessEvidence: liveness.evidence } : {}),
+				...(probe.warmPool === undefined ? {} : { warmPool: probe.warmPool }),
 			};
 		}),
 	);

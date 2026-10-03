@@ -152,6 +152,15 @@ export function formatDaemonListTable(daemons: readonly DaemonInfo[], client?: C
 		rows,
 		formatDaemonCell,
 	);
+	// Warm pool lines appear only for daemons that actually answered
+	// get_warm_pool_stats (rev 45): a daemon that never advertised the capability
+	// carries no warmPool field and gets no line, so an old daemon's output is
+	// byte-identical to before.
+	const poolLines = daemons.flatMap((daemon) => {
+		const line = formatDaemonWarmPoolLine(daemon);
+		return line === undefined ? [] : [line];
+	});
+	const withPools = poolLines.length === 0 ? table : `${table}\n\n${poolLines.join("\n")}`;
 	const notes = daemons.some((daemon) => daemon.isDefault) ? ["* default background service"] : [];
 	if (client) {
 		notes.push(formatClientBuildSummary(client));
@@ -159,7 +168,58 @@ export function formatDaemonListTable(daemons: readonly DaemonInfo[], client?: C
 	if (daemons.some((daemon) => daemon.status === "outdated" || daemon.status === "stale")) {
 		notes.push(formatDaemonStatusLegend());
 	}
-	return notes.length === 0 ? table : `${table}\n\n${chalk.dim(notes.join("\n"))}`;
+	return notes.length === 0 ? withPools : `${withPools}\n\n${chalk.dim(notes.join("\n"))}`;
+}
+
+/**
+ * One per-daemon warm pool line for the status/ps views, or undefined when the
+ * daemon has no pool facts (an old daemon never carries the field, so nothing
+ * renders for it). Claims/spawns are supervisor-lifetime counters and reset on
+ * daemon restart; the line says so when any of them is nonzero.
+ */
+export function formatDaemonWarmPoolLine(
+	daemon: Pick<DaemonInfo, "socketPath" | "isDefault" | "warmPool">,
+): string | undefined {
+	const pool = daemon.warmPool;
+	if (pool === undefined) {
+		return undefined;
+	}
+	const label = `warm pool ${daemon.isDefault ? `${daemon.socketPath} *` : daemon.socketPath}:`;
+	if (!pool.enabled) {
+		return `${label} disabled`;
+	}
+	const claimsTotal = pool.totals.claims.hit + pool.totals.claims.miss + pool.totals.claims.expired;
+	const hitRate = claimsTotal === 0 ? "-" : `${((pool.totals.claims.hit / claimsTotal) * 100).toFixed(0)}%`;
+	const reclaimBits = Object.entries(pool.totals.reclaims)
+		.filter(([, count]) => count > 0)
+		.map(([reason, count]) => `${reason} ${count}`);
+	const segments = [
+		`depth ready ${pool.depth.ready} warming ${pool.depth.warming}`,
+		`claims hit ${pool.totals.claims.hit} (${hitRate}) miss ${pool.totals.claims.miss} expired ${pool.totals.claims.expired}`,
+		`spawns ready ${pool.totals.spawns.ready} failed ${pool.totals.spawns.failed}`,
+	];
+	if (reclaimBits.length > 0) {
+		segments.push(`reclaims ${reclaimBits.join(", ")}`);
+	}
+	if (pool.spares.length > 0) {
+		segments.push(
+			`spares ${pool.spares.map((spare) => `${spare.cwd} age ${formatUptime(spare.ageMs / 1000)}`).join(", ")}`,
+		);
+	}
+	if (pool.cooldowns.length > 0) {
+		segments.push(
+			`cooldowns ${pool.cooldowns
+				.map(
+					(cooldown) => `${cooldown.cwd} retry in ${formatUptime(cooldown.retryInMs / 1000)} (${cooldown.reason})`,
+				)
+				.join(", ")}`,
+		);
+	}
+	const lifetimeNote =
+		claimsTotal > 0 || pool.totals.spawns.ready > 0 || pool.totals.spawns.failed > 0
+			? " (counters reset on daemon restart)"
+			: "";
+	return `${label} ${segments.join(" · ")}${lifetimeNote}`;
 }
 
 const EXEC_CELL_BUDGET = 44;

@@ -353,8 +353,21 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   the slice markers moved from the case labels to the handler names (same
 //   response keys, byte-moved body). No wire shape moved, so this is another
 //   rev-37-class in-place recomputation, not a new revision window.
-export const DAEMON_SCHEMA_REVISION = 44;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-44-381c9c9e5e17";
+// Revision 45 adds the get_warm_pool_stats command (wave-39 POOL-CONSUME): the
+//   supervisor answers it with a DaemonWarmPoolStats snapshot of the warm spare
+//   pool (depth, per-spare ages, lifetime hit/miss/expired and reclaim-attribution
+//   counters). Capability-gated: the warm_pool_stats capability is supervisor-only
+//   (a worker or standalone daemon has no pool to report, so it neither advertises
+//   the capability nor knows the command), the command carries minSchemaRevision
+//   45, and the client preflight refuses to send it to a daemon whose hello lacks
+//   either - the old daemon's wire is untouched because the command simply never
+//   reaches it. The same revision extends the digest, not the wire, in the
+//   rev32/33/35/37 class: the DaemonWarmPoolStats response family lives outside
+//   every prior slice (DaemonResponse types its data as unknown), so the new
+//   warmPoolStats slice joins the hashed source and a later field edit to the DTO
+//   cannot ride an unchanged DAEMON_SCHEMA_ID.
+export const DAEMON_SCHEMA_REVISION = 45;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-45-9545da3e4053";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -477,7 +490,16 @@ export type DaemonServerCapability =
 	// The daemon honors send_message.deliveryMode ("steer"/"follow_up"). Rev 41;
 	// older daemons accept the field and ignore it (always steering), so a client
 	// that sets it must check this capability first or be refused by the gate.
-	| "send_message_delivery_mode";
+	| "send_message_delivery_mode"
+	// The supervisor serves get_warm_pool_stats (rev 45): a DaemonWarmPoolStats
+	// snapshot of the warm spare pool - depth, per-spare ages and the lifetime
+	// hit/miss/expired + reclaim-attribution counters. Supervisor-only like
+	// agent_roster: a worker or standalone daemon owns no pool, so it must not
+	// advertise the capability (and does not know the command). Clients check the
+	// hello's serverCapabilities before sending; against an older daemon the
+	// client-side preflight refuses instead, so the feature simply disappears
+	// instead of erroring.
+	| "warm_pool_stats";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -568,6 +590,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 export const DAEMON_SUPERVISOR_ONLY_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	"agent_roster",
 	"direct_peer_transport",
+	"warm_pool_stats",
 ];
 
 // normalizeDeclaredCapabilities() drops anything outside this set, so a capability
@@ -967,6 +990,11 @@ export type DaemonCommand =
 	| { id?: string; type: "get_direct_worker_transport"; activeSessionId: string }
 	| { id?: string; type: "roster_subscribe" }
 	| { id?: string; type: "roster_unsubscribe" }
+	// Daemon-global warm spare pool read (rev 45, capability warm_pool_stats):
+	// answered by the supervisor only; a worker has no pool to report. The gate
+	// stops a sender from depending on the response against a rev-44 peer, which
+	// would answer "Unknown daemon command".
+	| { id?: string; type: "get_warm_pool_stats" }
 	| ({
 			id?: string;
 			type: "create";
@@ -1287,6 +1315,71 @@ export type DaemonCommand =
 
 type DaemonCommandName = DaemonCommand["type"];
 
+/**
+ * Reclaim attribution buckets for the warm spare pool (rev 45): every spare that
+ * leaves the pool unclaimed is counted exactly once, by cause. `ttl_expired` -
+ * idle TTL; `exited` - the process died on its own; `memory_pressure` - the sweep
+ * released it under the free-memory floor; `pool_closed` - the pool drained or
+ * refilled while the spawn was in flight; `claim_failed` - claimed but the
+ * connect+auth health check (or the launch around it) failed; `drain` - shutdown,
+ * supervisor dispose, update restart.
+ */
+export type DaemonWarmPoolReclaimReason =
+	| "ttl_expired"
+	| "exited"
+	| "memory_pressure"
+	| "pool_closed"
+	| "claim_failed"
+	| "drain";
+
+/** One ready spare in the pool, as the get_warm_pool_stats response reports it. */
+export interface DaemonWarmPoolSpare {
+	/** Pool cwd the spare is bound to (a claim must reproduce it and its env). */
+	cwd: string;
+	workerId: string;
+	/** Spare age at snapshot time. */
+	ageMs: number;
+	/** Milliseconds until the spare's idle-TTL reclaim fires. */
+	expiresInMs: number;
+}
+
+/** A pool cwd whose last warm-up failed and is still inside its spawn cooldown. */
+export interface DaemonWarmPoolCooldown {
+	/** Pool cwd in cooldown. */
+	cwd: string;
+	/** Why the last warm-up failed (first line only; never env values). */
+	reason: string;
+	/** Milliseconds until a respawn is allowed again. */
+	retryInMs: number;
+}
+
+/**
+ * The get_warm_pool_stats response (rev 45, capability warm_pool_stats): a
+ * point-in-time snapshot of the supervisor's warm spare pool. `totals` are
+ * supervisor-lifetime counters (they reset on daemon restart; the structured
+ * agent.jsonl stream is the cross-restart record). `enabled` is false when the
+ * pool is configured off (PRIME_AGENT_WARM_POOL=0) or drained for good - the
+ * command still answers, so a watcher can tell "off" apart from "old daemon"
+ * (which never answers at all).
+ */
+export interface DaemonWarmPoolStats {
+	enabled: boolean;
+	/** Pool gauge: published ready spares plus still-warming spawns. */
+	depth: { ready: number; warming: number };
+	/** One entry per ready spare. */
+	spares: DaemonWarmPoolSpare[];
+	/** Pool cwds whose failed warm-up still suppresses a respawn. */
+	cooldowns: DaemonWarmPoolCooldown[];
+	/** Supervisor-lifetime counters. */
+	totals: {
+		spawns: { ready: number; failed: number };
+		claims: { hit: number; miss: number; expired: number };
+		reclaims: Record<DaemonWarmPoolReclaimReason, number>;
+	};
+	/** The resolved pool knobs; absent when the pool is disabled. */
+	config?: { ttlMs: number; maxSpares: number };
+}
+
 export interface DaemonCommandCompatibility {
 	minProtocol: number;
 	minSchemaRevision?: number;
@@ -1387,6 +1480,14 @@ const GET_MESSAGES_WINDOW_COMMAND = {
 	minSchemaRevision: 44,
 	capability: "slim_attach_transcript",
 } as const;
+// get_warm_pool_stats is new at rev 45: a rev-44 peer answers "Unknown daemon
+// command", so the capability + revision floor is what keeps a client from ever
+// sending it there. Supervisor-only: the command is in no worker's command set.
+const GET_WARM_POOL_STATS_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 45,
+	capability: "warm_pool_stats",
+} as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
@@ -1394,6 +1495,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	list_saved_sessions: LEGACY_DAEMON_COMMAND,
 	list_agent_peers: AGENT_PEER_LIST_COMMAND,
 	get_direct_worker_transport: DIRECT_PEER_TRANSPORT_COMMAND,
+	get_warm_pool_stats: GET_WARM_POOL_STATS_COMMAND,
 	create: LEGACY_DAEMON_COMMAND,
 	attach: LEGACY_DAEMON_COMMAND,
 	reattach: LEGACY_DAEMON_COMMAND,
@@ -1514,6 +1616,7 @@ export const DAEMON_COMMAND_PLANE = {
 	list_saved_sessions: "control",
 	list_agent_peers: "control",
 	get_direct_worker_transport: "control",
+	get_warm_pool_stats: "control",
 	create: "control",
 	attach: "session",
 	reattach: "control",
@@ -2059,6 +2162,7 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"list_saved_sessions",
 	"list_agent_peers",
 	"get_direct_worker_transport",
+	"get_warm_pool_stats",
 	"attach",
 	"reattach",
 	"roster_subscribe",

@@ -9,7 +9,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
 import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
-import { DAEMON_FIRST_PARTY_CONTROL_CAPABILITIES, type DaemonResponse } from "../src/modes/daemon/daemon-protocol.js";
+import {
+	DAEMON_FIRST_PARTY_CONTROL_CAPABILITIES,
+	type DaemonResponse,
+	type DaemonWarmPoolStats,
+} from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
@@ -820,5 +824,123 @@ describe("daemon supervisor warm spare pool", () => {
 		expect(reclaims[0]!.reason).toBe("drain");
 		expect(reclaims[0]!.detail).toBe("supervisor dispose");
 		expect(eventTotals(reclaims[0]!).reclaims.drain).toBe(1);
+	});
+});
+
+/**
+ * get_warm_pool_stats (rev 45, capability warm_pool_stats): the wire face of the
+ * telemetry stream above. Everything is observed through the client protocol:
+ * the command's DaemonWarmPoolStats payload is the same counters and gauges the
+ * structured log lines carry, sampled at request time.
+ */
+describe("daemon supervisor warm pool stats command (rev 45)", () => {
+	async function requestPoolStats(client: DaemonClient): Promise<DaemonWarmPoolStats> {
+		const response = await client.request({ type: "get_warm_pool_stats" }, 5_000);
+		return responseData(response) as DaemonWarmPoolStats;
+	}
+
+	/** Poll the command itself (the public seam) until the pool reads as expected. */
+	async function pollPoolStats(
+		client: DaemonClient,
+		predicate: (stats: DaemonWarmPoolStats) => boolean,
+		description: string,
+		timeoutMs = 10_000,
+	): Promise<DaemonWarmPoolStats> {
+		const deadline = Date.now() + timeoutMs;
+		let stats = await requestPoolStats(client);
+		while (!predicate(stats)) {
+			if (Date.now() >= deadline) {
+				throw new Error(`Timed out waiting for: ${description} (last stats: ${JSON.stringify(stats)})`);
+			}
+			await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+			stats = await requestPoolStats(client);
+		}
+		return stats;
+	}
+
+	it("serves depth, spare ages and lifetime totals over the wire", async () => {
+		const { projectDir, client } = await startPoolSupervisor({ ttlMs: 30_000, spawnCooldownMs: 0 });
+		await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
+		// The spare is "warming" until its publish lands, then the pool reads ready.
+		let stats = await pollPoolStats(
+			client,
+			(polled) => polled.depth.ready === 1 && polled.depth.warming === 0,
+			"the spare publish",
+		);
+		expect(stats.enabled).toBe(true);
+		// ttlMs is the knob this fixture set; maxSpares stays the production default
+		// and is pinned only as present, not by value.
+		expect(stats.config?.ttlMs).toBe(30_000);
+		expect(typeof stats.config?.maxSpares).toBe("number");
+		expect(stats.spares).toHaveLength(1);
+		expect(stats.spares[0]!.cwd).toBe(projectDir);
+		expect(stats.spares[0]!.ageMs).toBeGreaterThanOrEqual(0);
+		expect(stats.spares[0]!.expiresInMs).toBeGreaterThan(0);
+		expect(stats.spares[0]!.expiresInMs).toBeLessThanOrEqual(30_000);
+		expect(stats.cooldowns).toEqual([]);
+		expect(stats.totals).toEqual({
+			spawns: { ready: 1, failed: 0 },
+			claims: { hit: 0, miss: 0, expired: 0 },
+			reclaims: { ttl_expired: 0, exited: 0, memory_pressure: 0, pool_closed: 0, claim_failed: 0, drain: 0 },
+		});
+
+		// A claim moves the lifetime counters and the replenish restocks the depth.
+		const created = await client.request({ type: "create", config: { cwd: projectDir } }, 10_000);
+		expect(created.success).toBe(true);
+		stats = await pollPoolStats(
+			client,
+			(polled) => polled.totals.claims.hit === 1 && polled.totals.spawns.ready === 2 && polled.depth.ready === 1,
+			"the claim and replenish counters",
+		);
+		expect(stats.totals.claims).toEqual({ hit: 1, miss: 0, expired: 0 });
+	});
+
+	it("reports a disabled pool as enabled:false with zeroed counters", async () => {
+		// In-process supervisors get no pool unless one is passed; the command still
+		// answers, so a watcher can tell "pool off" apart from "old daemon" (which
+		// never answers at all).
+		const { client } = await startPoolSupervisor();
+		const stats = await requestPoolStats(client);
+		expect(stats.enabled).toBe(false);
+		expect(stats.depth).toEqual({ ready: 0, warming: 0 });
+		expect(stats.spares).toEqual([]);
+		expect(stats.cooldowns).toEqual([]);
+		expect(stats.config).toBeUndefined();
+		expect(stats.totals.claims).toEqual({ hit: 0, miss: 0, expired: 0 });
+		expect(stats.totals.spawns).toEqual({ ready: 0, failed: 0 });
+	});
+
+	it("refuses the command for a declared connection that lacks the capability", async () => {
+		const { root, client } = await startPoolSupervisor({ ttlMs: 30_000 });
+		// The first-party client declared the full set including warm_pool_stats and
+		// is served; a connection that declared a set WITHOUT it is refused by the
+		// server-side gate (the hello advertises the capability, so the client-side
+		// preflight passes and the refusal comes from the supervisor).
+		await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
+		const stats = await requestPoolStats(client);
+		expect(stats.enabled).toBe(true);
+
+		const narrow = new DaemonClient(join(root, "daemon.sock"), {
+			declaredCapabilities: ["attach_snapshot", "event_sequence"],
+		});
+		clients.push(narrow);
+		await narrow.connect(5_000);
+		const refused = await narrow.request({ type: "get_warm_pool_stats" }, 5_000);
+		expect(refused.success).toBe(false);
+		if (!refused.success) {
+			expect(refused.error).toContain('requires the connection to declare the "warm_pool_stats" capability');
+		}
+	});
+
+	it("serves an undeclared legacy connection, matching every other capability gate", async () => {
+		const { root } = await startPoolSupervisor({ ttlMs: 30_000 });
+		await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
+		// A connection that never declared a capability set keeps the legacy path:
+		// no capability is demanded server-side.
+		const legacy = new DaemonClient(join(root, "daemon.sock"));
+		clients.push(legacy);
+		await legacy.connect(5_000);
+		const stats = await requestPoolStats(legacy);
+		expect(stats.enabled).toBe(true);
 	});
 });

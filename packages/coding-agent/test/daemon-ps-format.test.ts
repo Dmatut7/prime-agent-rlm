@@ -1,7 +1,12 @@
 import stripAnsi from "strip-ansi";
 import { describe, expect, it } from "vitest";
 import { type DaemonInfo, describeShutdownTarget, formatShutdownReport } from "../src/cli/daemon-ps.js";
-import { type ClientBuildIdentity, formatDaemonListTable, formatUptime } from "../src/cli/daemon-ps-format.js";
+import {
+	type ClientBuildIdentity,
+	formatDaemonListTable,
+	formatDaemonWarmPoolLine,
+	formatUptime,
+} from "../src/cli/daemon-ps-format.js";
 import { resolveStopSelection } from "../src/cli/daemon-stop-scope.js";
 
 describe("formatUptime", () => {
@@ -231,5 +236,93 @@ describe("stop confirmation build judgement", () => {
 		expect(report).toContain("Next:");
 		expect(report).toContain("v0.9.1-601-g2cd3456ef");
 		expect(report).toContain("prime-agent status");
+	});
+});
+
+describe("warm pool lines (rev 45)", () => {
+	const zeroReclaims = {
+		ttl_expired: 0,
+		exited: 0,
+		memory_pressure: 0,
+		pool_closed: 0,
+		claim_failed: 0,
+		drain: 0,
+	};
+
+	it("prints no pool line for a daemon that never advertised the capability", () => {
+		// Old-daemon degrade: warmPool is absent, and the table is byte-identical to
+		// the pre-45 output (no section header, no placeholder).
+		const table = stripAnsi(formatDaemonListTable([makeDaemon({ socketPath: "/tmp/wt-a/daemon.sock" })]));
+		expect(table).not.toContain("warm pool");
+	});
+
+	it("renders depth, claim counters with hit rate, and reclaim attribution", () => {
+		const daemon = makeDaemon({
+			socketPath: "/tmp/wt-a/daemon.sock",
+			isDefault: true,
+			warmPool: {
+				enabled: true,
+				depth: { ready: 1, warming: 0 },
+				spares: [{ cwd: "/repo", workerId: "worker-warm-1", ageMs: 12_000, expiresInMs: 288_000 }],
+				cooldowns: [],
+				totals: {
+					spawns: { ready: 2, failed: 0 },
+					claims: { hit: 3, miss: 1, expired: 0 },
+					reclaims: { ...zeroReclaims, ttl_expired: 1 },
+				},
+				config: { ttlMs: 300_000, maxSpares: 4 },
+			},
+		});
+		const line = formatDaemonWarmPoolLine(daemon);
+		expect(line).toBeDefined();
+		expect(line).toContain("/tmp/wt-a/daemon.sock *");
+		expect(line).toContain("depth ready 1 warming 0");
+		expect(line).toContain("claims hit 3 (75%) miss 1 expired 0");
+		expect(line).toContain("spawns ready 2 failed 0");
+		expect(line).toContain("reclaims ttl_expired 1");
+		expect(line).toContain("spares /repo age 12s");
+		// The table surfaces the line between the rows and the dim notes.
+		const table = stripAnsi(formatDaemonListTable([daemon]));
+		expect(table).toContain("warm pool /tmp/wt-a/daemon.sock *:");
+	});
+
+	it("says disabled for a daemon whose pool is configured off", () => {
+		const line = formatDaemonWarmPoolLine(
+			makeDaemon({
+				socketPath: "/tmp/wt-a/daemon.sock",
+				warmPool: {
+					enabled: false,
+					depth: { ready: 0, warming: 0 },
+					spares: [],
+					cooldowns: [],
+					totals: {
+						spawns: { ready: 0, failed: 0 },
+						claims: { hit: 0, miss: 0, expired: 0 },
+						reclaims: { ...zeroReclaims },
+					},
+				},
+			}),
+		);
+		expect(line).toBe("warm pool /tmp/wt-a/daemon.sock: disabled");
+	});
+
+	it("names a cooldown cwd with its retry wait and failure reason", () => {
+		const line = formatDaemonWarmPoolLine(
+			makeDaemon({
+				socketPath: "/tmp/wt-a/daemon.sock",
+				warmPool: {
+					enabled: true,
+					depth: { ready: 0, warming: 1 },
+					spares: [],
+					cooldowns: [{ cwd: "/repo", reason: "boot budget exceeded", retryInMs: 45_000 }],
+					totals: {
+						spawns: { ready: 0, failed: 1 },
+						claims: { hit: 0, miss: 0, expired: 0 },
+						reclaims: { ...zeroReclaims },
+					},
+				},
+			}),
+		);
+		expect(line).toContain("cooldowns /repo retry in 45s (boot budget exceeded)");
 	});
 });

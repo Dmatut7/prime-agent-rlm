@@ -61,6 +61,7 @@ interface DaemonSchemaSliceSources {
 	headlessResult: string;
 	quiescenceOutcome: string;
 	responseEnvelope: string;
+	warmPoolStats: string;
 }
 
 function readDaemonSchemaSliceSources(): DaemonSchemaSliceSources {
@@ -176,6 +177,17 @@ function readDaemonSchemaSliceSources(): DaemonSchemaSliceSources {
 			daemonProtocolSource.indexOf("export type DaemonResponse ="),
 			daemonProtocolSource.indexOf("export type DaemonSessionClosedReason ="),
 		),
+		// Rev45 (wave-39): the get_warm_pool_stats response family is a wire shape
+		// too, but DaemonResponse types its data as unknown, so without this slice a
+		// field edit to DaemonWarmPoolStats would ride an unchanged DAEMON_SCHEMA_ID -
+		// the same gap rev29's retryAfterMs slipped through before rev37 closed the
+		// envelope. The slice spans the whole DTO family declaration, from the reclaim
+		// reason union through the stats interface, and ends where the command
+		// compatibility metadata begins.
+		warmPoolStats: daemonProtocolSource.slice(
+			daemonProtocolSource.indexOf("export type DaemonWarmPoolReclaimReason"),
+			daemonProtocolSource.indexOf("export interface DaemonCommandCompatibility"),
+		),
 	};
 }
 
@@ -220,6 +232,7 @@ function daemonSchemaDigest(sources: DaemonSchemaSliceSources): string {
 				sources.headlessResult,
 				sources.quiescenceOutcome,
 				sources.responseEnvelope,
+				sources.warmPoolStats,
 			].join("\n"),
 		)
 		.digest("hex")
@@ -333,6 +346,13 @@ describe("daemon protocol helpers", () => {
 		expect(sources.responseEnvelope).toContain("export type DaemonResponse =");
 		expect(sources.responseEnvelope).toContain("export type DaemonErrorInfo =");
 		expect(sources.responseEnvelope).toContain('code: "command_result_uncertain"');
+		// Rev45: pin the warm-pool slice's markers and core members, so a lost or
+		// reordered marker fails loudly here instead of dropping the DTO family out
+		// of the digest.
+		expect(sources.warmPoolStats).toContain("export type DaemonWarmPoolReclaimReason");
+		expect(sources.warmPoolStats).toContain("export interface DaemonWarmPoolStats");
+		expect(sources.warmPoolStats).toContain("reclaims: Record<DaemonWarmPoolReclaimReason, number>;");
+		expect(sources.warmPoolStats).toContain("config?: { ttlMs: number; maxSpares: number };");
 		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);
 	});
 
@@ -435,6 +455,19 @@ describe("daemon protocol helpers", () => {
 					text.replace(
 						"usage?: SessionUsageSummary;",
 						"usage?: SessionUsageSummary;\n\tmodel?: { provider: string; modelId: string };",
+					),
+			},
+			{
+				// rev45: the get_warm_pool_stats response DTO joins the digest. A field
+				// edit to DaemonWarmPoolStats must move the identity, or a mixed
+				// old-daemon/new-client pair passes the handshake on mismatched pool
+				// stats - the same class rev37 closed for the response envelope.
+				name: "warm pool stats response DTO field set (covered since rev45)",
+				key: "warmPoolStats",
+				apply: (text) =>
+					text.replace(
+						"depth: { ready: number; warming: number };",
+						"depth: { ready: number; warming: number; pending: number };",
 					),
 			},
 		];
