@@ -147,12 +147,13 @@ import {
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	compactionSkipMessage,
 	compactionThresholdTokens,
 	estimateContextTokens,
 	generateBranchSummary,
 	isAssistantUsageSource,
 	planEmergencyShrink,
-	prepareCompaction,
+	prepareCompactionOutcome,
 	serializeConversation,
 	shouldCompact,
 	shrunkKeepRecentTokens,
@@ -403,6 +404,13 @@ import {
 	observeRlmRunDeletionCleanup,
 } from "./rlm-child-delete.js";
 import {
+	type RlmChildFollowUpWatch,
+	stopAllRlmChildFollowUpWatches,
+	stopRlmChildFollowUpWatch,
+	watchRlmChildFollowUps,
+} from "./rlm-child-followup.js";
+import {
+	getRlmChildSnapshots,
 	type RetiredRlmChildRun,
 	registerRlmChildSession,
 	releaseRlmChildSession,
@@ -422,15 +430,12 @@ import {
 	compactRlmText,
 	createAgentMessageDeferred,
 	noopRlmChildAbort,
-	noopRlmChildEventUnsubscribe,
 	type RlmChildDeriveCounts,
 	type RlmChildRun,
 	readAssistantText,
 	resetRlmChildDeriveCounts,
 	rlmChildDeriveCounts,
 	rlmChildLabel,
-	rlmChildSnapshotForRun,
-	rlmChildSnapshotForSession,
 	startRlmChildRun,
 } from "./rlm-child-run.js";
 
@@ -1422,23 +1427,6 @@ const RLM_SUCCESSOR_SESSION_NAME_CAP = 64;
 
 /** Closed-after-idle children kept for `rlm.collect`; each entry is a few hundred bytes. */
 const CLOSED_RLM_CHILD_COLLECT_ENTRIES_MAX = 1024;
-
-/**
- * How long a follow-up check keeps re-polling a child that is busy without a turn
- * (compacting, running bash). A new turn ends in its own agent_end, which re-arms
- * the check, so only turn-less work needs the poll.
- */
-const RLM_FOLLOW_UP_CHECK_POLL_MS = 2_000;
-const RLM_FOLLOW_UP_CHECK_MAX_POLLS = 900;
-
-interface RlmChildFollowUpWatch {
-	session: AgentSession;
-	unsubscribe: () => void;
-	/** `_parentFollowUpCount` of the child when this watch last reported (or started). */
-	reportedFollowUpCount: number;
-	timer?: ReturnType<typeof setTimeout>;
-	polls: number;
-}
 
 /**
  * Consecutive progress-free cycles after which waitForIdle stops waiting and reports the
@@ -2461,7 +2449,7 @@ export class AgentSession {
 	 */
 	private _turnLifecycleEpoch = 0;
 	/** Why the last abort of this session was requested; cleared by the next agent_start. */
-	private _lastTurnAbortReason: RlmChildTurnAbortReason | undefined;
+	_lastTurnAbortReason: RlmChildTurnAbortReason | undefined;
 	/** The child already delivered its own terminal-error notice to the parent. */
 	private _terminalErrorNoticeDelivered = false;
 	/**
@@ -2555,13 +2543,13 @@ export class AgentSession {
 	/** A full collect already asked the daemon for children closed before this session object existed. */
 	_closedRlmChildrenDaemonScanned = false;
 	/** Per retained child: watches follow-up turns the parent started for a missing reply. */
-	private readonly _rlmChildFollowUpWatches = new Map<string, RlmChildFollowUpWatch>();
+	readonly _rlmChildFollowUpWatches = new Map<string, RlmChildFollowUpWatch>();
 	/**
 	 * Messages from the parent this session has admitted (spawn task excluded). The
 	 * parent's follow-up watch compares it against the count it last reported on, so
 	 * one follow-up that ends without a reply is reported once, not once per turn.
 	 */
-	private _parentFollowUpCount = 0;
+	_parentFollowUpCount = 0;
 	/** Latest recap for this session, written by the daemon summarizer; read by a parent to label its child snapshots. */
 	private _currentRecap?: string;
 
@@ -5385,17 +5373,16 @@ export class AgentSession {
 						reason: "no active turn; compaction can only be requested while a turn is running",
 					};
 				}
-				const preparation = prepareCompaction(
+				const preparationOutcome = prepareCompactionOutcome(
 					this.sessionManager.getBranch(),
 					this.settingsManager.getCompactionSettings(),
 					this.model?.contextWindow,
 					this._compactionWindowLimits(),
 				);
-				if (!preparation) {
-					const lastEntry = this.sessionManager.getBranch().at(-1);
+				if (preparationOutcome.kind === "skip") {
 					return {
 						scheduled: false,
-						reason: lastEntry?.type === "compaction" ? "already compacted" : "session is too short to compact",
+						reason: compactionSkipMessage(preparationOutcome.reason),
 					};
 				}
 				this._pendingRequestedCompaction = { customInstructions: instructions };
@@ -7051,7 +7038,7 @@ export class AgentSession {
 		});
 	}
 
-	private _findLastAssistantInMessages(messages: AgentMessage[]): AssistantMessage | undefined {
+	_findLastAssistantInMessages(messages: AgentMessage[]): AssistantMessage | undefined {
 		for (let i = messages.length - 1; i >= 0; i--) {
 			const message = messages[i];
 			if (message.role === "assistant") {
@@ -13708,17 +13695,19 @@ export class AgentSession {
 		// resulting entry still attaches to the branch it summarized.
 		const compactionLeafId = this.sessionManager.getLeafId();
 
-		const preparation = prepareCompaction(pathEntries, settings, model.contextWindow, {
+		const preparationOutcome = prepareCompactionOutcome(pathEntries, settings, model.contextWindow, {
 			provider: model.provider,
 			modelId: model.id,
 		});
-		if (!preparation) {
-			const lastEntry = pathEntries[pathEntries.length - 1];
-			if (lastEntry?.type === "compaction") {
-				throw new CompactionSkippedError("Already compacted");
+		if (preparationOutcome.kind === "skip") {
+			if (preparationOutcome.reason === "missing-entry-ids") {
+				// A real failure, not a skip: count it so repeated occurrences still
+				// escalate to emergency shrink instead of silently skipping forever.
+				throw new Error(compactionSkipMessage(preparationOutcome.reason));
 			}
-			throw new CompactionSkippedError("Session is too short to compact — try again once it grows");
+			throw new CompactionSkippedError(compactionSkipMessage(preparationOutcome.reason));
 		}
+		const preparation = preparationOutcome.preparation;
 
 		let extensionCompaction: CompactionResult | undefined;
 		let fromExtension = false;
@@ -17314,149 +17303,16 @@ export class AgentSession {
 		return releaseRlmChildSession(this, childId, session);
 	}
 
-	/**
-	 * Watch a retained child for follow-up turns this session started (an
-	 * agent_message.send to a finished child) that end without a reply. The first
-	 * task has its own terminal notice; a follow-up had nothing, so a parent that
-	 * sent one and ended its turn to wait was never woken - and an unattended parent
-	 * waited for days. A runless child (rehydrated after it was closed) also gets its
-	 * roster row refreshed here, since no run subscription reports its turns.
-	 */
 	_watchRlmChildFollowUps(childId: string, child: AgentSession): void {
-		if (this._rlmChildFollowUpWatches.get(childId)?.session === child) return;
-		this._stopRlmChildFollowUpWatch(childId);
-		const watch: RlmChildFollowUpWatch = {
-			session: child,
-			unsubscribe: noopRlmChildEventUnsubscribe,
-			reportedFollowUpCount: child._parentFollowUpCount,
-			polls: 0,
-		};
-		watch.unsubscribe = child.subscribe((event) => {
-			if (event.type !== "agent_start" && event.type !== "agent_end") return;
-			if (this._rlmChildFollowUpWatches.get(childId) !== watch) return;
-			if (!this._rlmChildSessions.get(childId)?.run && !this._isRlmChildHiddenFromCollect(childId)) {
-				this._emit({ type: "rlm_child_update", child: this._rlmChildSnapshotForSession(childId, child) });
-			}
-			if (event.type === "agent_start") {
-				this._clearRlmChildFollowUpTimer(watch);
-				watch.polls = 0;
-				return;
-			}
-			// After the listeners of this agent_end ran: the session is only idle then.
-			this._armRlmChildFollowUpCheck(childId, watch, 0);
-		});
-		this._rlmChildFollowUpWatches.set(childId, watch);
+		watchRlmChildFollowUps(this, childId, child);
 	}
 
 	_stopRlmChildFollowUpWatch(childId: string): void {
-		const watch = this._rlmChildFollowUpWatches.get(childId);
-		if (!watch) return;
-		this._rlmChildFollowUpWatches.delete(childId);
-		this._clearRlmChildFollowUpTimer(watch);
-		watch.unsubscribe();
+		stopRlmChildFollowUpWatch(this, childId);
 	}
 
 	private _stopAllRlmChildFollowUpWatches(): void {
-		for (const childId of [...this._rlmChildFollowUpWatches.keys()]) this._stopRlmChildFollowUpWatch(childId);
-	}
-
-	private _clearRlmChildFollowUpTimer(watch: RlmChildFollowUpWatch): void {
-		if (watch.timer === undefined) return;
-		clearTimeout(watch.timer);
-		watch.timer = undefined;
-	}
-
-	private _armRlmChildFollowUpCheck(childId: string, watch: RlmChildFollowUpWatch, delayMs: number): void {
-		this._clearRlmChildFollowUpTimer(watch);
-		const timer = setTimeout(() => {
-			watch.timer = undefined;
-			this._checkRlmChildFollowUpReply(childId, watch);
-		}, delayMs);
-		timer.unref?.();
-		watch.timer = timer;
-	}
-
-	/**
-	 * Decide, once the child is idle, whether the follow-up it last received went
-	 * unanswered. Every "not yet" here is either a turn still to come (whose own
-	 * agent_end re-arms the check) or a reply that already exists; only a child that
-	 * is quiet, owes nothing further, and never answered is reported.
-	 */
-	private _checkRlmChildFollowUpReply(childId: string, watch: RlmChildFollowUpWatch): void {
-		if (this._disposed || this._disposing || this._rlmChildFollowUpWatches.get(childId) !== watch) return;
-		const child = watch.session;
-		if (this._rlmChildSessions.get(childId)?.session !== child || this._isRlmChildHiddenFromCollect(childId)) return;
-		const run = this._activeRlmChildRuns.get(childId);
-		if (run && !run.settled) return;
-		const followUps = child._parentFollowUpCount;
-		if (followUps <= watch.reportedFollowUpCount) return;
-		if (child._repliedToParentSinceTask !== false) {
-			watch.reportedFollowUpCount = followUps;
-			return;
-		}
-		// Another turn is coming: queued input, or descendants whose results will wake it.
-		if (child.isStreaming || child.unfinishedActionCount > 0 || child._hasUnsettledRlmQuiescenceWork()) return;
-		if (child.isSessionActive) {
-			// Busy without a turn (compaction, bash): no agent_end will re-arm the check.
-			if (watch.polls < RLM_FOLLOW_UP_CHECK_MAX_POLLS) {
-				watch.polls += 1;
-				this._armRlmChildFollowUpCheck(childId, watch, RLM_FOLLOW_UP_CHECK_POLL_MS);
-			}
-			return;
-		}
-		watch.reportedFollowUpCount = followUps;
-		// A reply that sits in this session's own queue is a reply, just not read yet.
-		if (this._queuedChildReplyBackfills.owedMessageIdsForSender(child.sessionId).length > 0) return;
-		void this._deliverRlmChildFollowUpOutcome(childId, child).catch(() => undefined);
-	}
-
-	private async _deliverRlmChildFollowUpOutcome(childId: string, child: AgentSession): Promise<void> {
-		const sessionName = child.sessionName ?? createDefaultRlmSubagentSessionName("", childId);
-		const lastAssistant = this._findLastAssistantInMessages(child.messages);
-		// Cleared by the next agent_start, so it describes the turn that just ended.
-		const abortReason = child._lastTurnAbortReason;
-		let message: CustomMessage;
-		if (abortReason === "user" || (abortReason === undefined && lastAssistant?.stopReason === "aborted")) {
-			message = createRlmChildTerminalNoticeMessage({
-				kind: "cancelled",
-				childId,
-				sessionName,
-				reason: "the user stopped its follow-up turn before it replied",
-				followUp: true,
-			});
-		} else if (abortReason !== undefined) {
-			message = createRlmChildFailureMessage({
-				childId,
-				sessionName,
-				error: `its follow-up turn was aborted (${abortReason}) before it replied`,
-				kind: abortReason === "stall_watchdog" ? "stall_killed" : "aborted",
-				followUp: true,
-			});
-		} else if (lastAssistant?.stopReason === "error") {
-			message = createRlmChildFailureMessage({
-				childId,
-				sessionName,
-				error: lastAssistant.errorMessage?.trim() || "its follow-up turn ended in a model or provider error",
-				kind: "error",
-				followUp: true,
-			});
-		} else {
-			const lastAssistantText = child.getLastAssistantText();
-			message = createRlmChildTerminalNoticeMessage({
-				kind: "completed_without_reply",
-				childId,
-				sessionName,
-				lastAssistantText: lastAssistantText ? boundRlmChildLastText(lastAssistantText) : undefined,
-				followUp: true,
-			});
-		}
-		sessionLog.info("rlm child follow-up ended without a reply; notifying parent", {
-			sessionId: this.sessionId,
-			childId,
-			childSessionId: child.sessionId,
-			stopReason: lastAssistant?.stopReason,
-		});
-		await this._deferRlmTerminalNotice(message);
+		stopAllRlmChildFollowUpWatches(this);
 	}
 
 	/**
@@ -17648,22 +17504,6 @@ export class AgentSession {
 		this._recordDutyEvent({ kind: "child_auto_delivered", child: sessionName });
 	}
 
-	_rlmChildSnapshotForRun(
-		run: RlmChildRun,
-		child = run.session ?? this._rlmChildSessions.get(run.id)?.session,
-	): RlmChildAgentSnapshot {
-		return rlmChildSnapshotForRun(this, run, child);
-	}
-
-	private _rlmChildSnapshotForSession(childId: string, child: AgentSession): RlmChildAgentSnapshot {
-		return rlmChildSnapshotForSession(this, childId, child);
-	}
-
-	private _isUnboundTerminalRlmChildRun(run: RlmChildRun): boolean {
-		if (run.session !== undefined || this._rlmChildSessions.has(run.id)) return false;
-		return run.status === "done" || run.status === "error" || run.status === "cancelled";
-	}
-
 	/**
 	 * Re-dispatch facts for one live child run (r4 recovery-shell): the original
 	 * task and the model the run used, so the daemon's stall-recovery receipt can
@@ -17688,40 +17528,7 @@ export class AgentSession {
 
 	/** Live recursive child roster from lifecycle state, including nested work under retained parents. */
 	getRlmChildSnapshots(): RlmChildAgentSnapshot[] {
-		const snapshots: RlmChildAgentSnapshot[] = [];
-		const recorded = new Set<string>();
-		const traversed = new Set<string>();
-		for (const run of this._activeRlmChildRuns.values()) {
-			const hidden =
-				run.detachedDeletion ||
-				this._deletingRlmChildren.has(run.id) ||
-				this._deletedRlmChildIds.has(run.id) ||
-				this._isUnboundTerminalRlmChildRun(run);
-			const child = run.session;
-			if (!hidden) {
-				snapshots.push(this._rlmChildSnapshotForRun(run));
-				recorded.add(run.id);
-			}
-			if (child) {
-				traversed.add(run.id);
-				snapshots.push(...child.getRlmChildSnapshots());
-			}
-		}
-		for (const [childId, { session: child, run }] of this._rlmChildSessions) {
-			if (recorded.has(childId) || traversed.has(childId)) continue;
-			const hidden = this._deletingRlmChildren.has(childId) || this._deletedRlmChildIds.has(childId);
-			if (!hidden) {
-				const snapshot = run
-					? this._rlmChildSnapshotForRun(run, child)
-					: this._rlmChildSnapshotForSession(childId, child);
-				snapshots.push({
-					...snapshot,
-					status: this._rlmChildCleanupFailures.has(childId) ? "cancelled" : snapshot.status,
-				});
-			}
-			snapshots.push(...child.getRlmChildSnapshots());
-		}
-		return snapshots;
+		return getRlmChildSnapshots(this);
 	}
 
 	/** True when any direct or nested subagent is still running or queued. */
@@ -17747,7 +17554,7 @@ export class AgentSession {
 		return [...sessions];
 	}
 
-	private _hasUnsettledRlmQuiescenceWork(): boolean {
+	_hasUnsettledRlmQuiescenceWork(): boolean {
 		if (this._hasActionableDeferredRlmTerminalNotices()) return true;
 		if ([...this._unsettledRlmChildRuns].some((run) => !run.settled)) return true;
 		return this._rlmChildSessionSnapshot().some(

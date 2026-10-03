@@ -2,10 +2,11 @@
  * RLM child retention/release cluster extracted from agent-session.ts: retaining a
  * finished child session for the parent lifetime, releasing one to the daemon's idle
  * passivation (publishing the closed record and roster row it leaves behind), removing
- * a child's tracking outright, and the retired-run delivery records that late terminal
- * notices are re-validated against. The moved methods keep exactly the same bodies;
- * they read the session through {@link RlmChildRetentionHost}, which `AgentSession`
- * satisfies structurally, so the move changes no runtime behavior.
+ * a child's tracking outright, the retired-run delivery records that late terminal
+ * notices are re-validated against, and the live recursive snapshot list built
+ * over the retained sessions and active runs. The moved methods keep exactly the
+ * same bodies; they read the session through {@link RlmChildRetentionHost}, which
+ * `AgentSession` satisfies structurally, so the move changes no runtime behavior.
  */
 import type { AgentSession, AgentSessionEvent, RlmChildAgentSnapshot } from "./agent-session.js";
 import {
@@ -46,7 +47,8 @@ interface ClosedRlmChildRelease {
  * The seam of `AgentSession` the extracted retention paths read and mutate. Member
  * names mirror the class's own members so the extraction stays a textual
  * `this.` -> `host.` rename; `AgentSession.registerRlmChildSession`,
- * `releaseRlmChildSession` and `_removeRlmSubagentTracking` delegate with `this`.
+ * `releaseRlmChildSession`, `_removeRlmSubagentTracking` and
+ * `getRlmChildSnapshots` delegate with `this`.
  */
 export interface RlmChildRetentionHost extends RlmChildCollectHost {
 	readonly _retiredRlmChildRuns: Map<string, RetiredRlmChildRun>;
@@ -232,4 +234,47 @@ function publishClosedRlmChild(host: RlmChildRetentionHost, childId: string, clo
 	if (host._disposed || host._disposing || host._isRlmChildHiddenFromCollect(childId)) return;
 	host._rememberClosedRlmChild(childId, closed.record);
 	host._emit({ type: "rlm_child_update", child: closed.snapshot });
+}
+
+function isUnboundTerminalRlmChildRun(host: RlmChildRetentionHost, run: RlmChildRun): boolean {
+	if (run.session !== undefined || host._rlmChildSessions.has(run.id)) return false;
+	return run.status === "done" || run.status === "error" || run.status === "cancelled";
+}
+
+/** Live recursive child roster from lifecycle state, including nested work under retained parents. */
+export function getRlmChildSnapshots(host: RlmChildRetentionHost): RlmChildAgentSnapshot[] {
+	const snapshots: RlmChildAgentSnapshot[] = [];
+	const recorded = new Set<string>();
+	const traversed = new Set<string>();
+	for (const run of host._activeRlmChildRuns.values()) {
+		const hidden =
+			run.detachedDeletion ||
+			host._deletingRlmChildren.has(run.id) ||
+			host._deletedRlmChildIds.has(run.id) ||
+			isUnboundTerminalRlmChildRun(host, run);
+		const child = run.session;
+		if (!hidden) {
+			snapshots.push(rlmChildSnapshotForRun(host, run));
+			recorded.add(run.id);
+		}
+		if (child) {
+			traversed.add(run.id);
+			snapshots.push(...child.getRlmChildSnapshots());
+		}
+	}
+	for (const [childId, { session: child, run }] of host._rlmChildSessions) {
+		if (recorded.has(childId) || traversed.has(childId)) continue;
+		const hidden = host._deletingRlmChildren.has(childId) || host._deletedRlmChildIds.has(childId);
+		if (!hidden) {
+			const snapshot = run
+				? rlmChildSnapshotForRun(host, run, child)
+				: rlmChildSnapshotForSession(host, childId, child);
+			snapshots.push({
+				...snapshot,
+				status: host._rlmChildCleanupFailures.has(childId) ? "cancelled" : snapshot.status,
+			});
+		}
+		snapshots.push(...child.getRlmChildSnapshots());
+	}
+	return snapshots;
 }
