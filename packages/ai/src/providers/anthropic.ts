@@ -617,6 +617,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 			const requestId = response.headers.get("request-id") ?? undefined;
 			stream.push({ type: "start", partial: output });
 			let sseFramesWithoutEvent = 0;
+			let refusalDetail: string | undefined;
 
 			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
 			const blocks = output.content as Block[];
@@ -797,6 +798,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 						output.stopReason = mapStopReason(event.delta.stop_reason);
 						if (output.stopReason === "error") {
 							output.stopReasonRaw = event.delta.stop_reason;
+							const stopDetails = event.delta.stop_details;
+							if (stopDetails?.type === "refusal") {
+								refusalDetail =
+									[stopDetails.category, stopDetails.explanation].filter(Boolean).join(": ") || undefined;
+							}
 						}
 					}
 					// Only positive counts overwrite. message_start already carries the
@@ -838,7 +844,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 			}
 
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
-				throw streamFailureFromStopReason(output.stopReasonRaw, { requestId });
+				throw streamFailureFromStopReason(output.stopReasonRaw, { requestId, detail: refusalDetail });
 			}
 
 			stream.push({ type: "done", reason: output.stopReason, message: output });

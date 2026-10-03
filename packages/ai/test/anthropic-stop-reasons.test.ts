@@ -34,7 +34,10 @@ function createFakeAnthropicClient(response: Response): Anthropic {
 	} as unknown as Anthropic;
 }
 
-function streamWithStopReason(stopReason: string) {
+function streamWithStopReason(
+	stopReason: string,
+	stopDetails?: { type: "refusal"; category: string | null; explanation: string | null },
+) {
 	const response = createSseResponse([
 		{
 			event: "message_start",
@@ -71,7 +74,7 @@ function streamWithStopReason(stopReason: string) {
 			event: "message_delta",
 			data: JSON.stringify({
 				type: "message_delta",
-				delta: { stop_reason: stopReason },
+				delta: { stop_reason: stopReason, stop_details: stopDetails ?? null },
 				usage: { input_tokens: 12, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
 			}),
 		},
@@ -106,5 +109,30 @@ describe("Anthropic stop reason mapping", () => {
 		expect(result.content).toEqual([{ type: "text", text: "partial" }]);
 		const failure = result.diagnostics?.find((entry) => entry.type === "provider_stream_failure");
 		expect(failure?.details?.providerErrorType).toBe("new_turn_reason");
+	});
+
+	it("maps refusal to a classified refusal error and keeps the streamed text", async () => {
+		const result = await streamWithStopReason("refusal");
+
+		expect(result.stopReason).toBe("error");
+		expect(result.stopReasonRaw).toBe("refusal");
+		expect(result.errorMessage).toContain("Model refused to respond");
+		expect(result.content).toEqual([{ type: "text", text: "partial" }]);
+		const failure = result.diagnostics?.find((entry) => entry.type === "provider_stream_failure");
+		expect(failure?.details?.providerErrorType).toBe("refusal");
+	});
+
+	it("carries the refusal stop_details category and explanation into the error message", async () => {
+		const result = await streamWithStopReason("refusal", {
+			type: "refusal",
+			category: "cyber",
+			explanation: "The request could enable cyber harm.",
+		});
+
+		expect(result.stopReason).toBe("error");
+		expect(result.stopReasonRaw).toBe("refusal");
+		expect(result.errorMessage).toContain("Model refused to respond");
+		expect(result.errorMessage).toContain("cyber");
+		expect(result.errorMessage).toContain("The request could enable cyber harm.");
 	});
 });

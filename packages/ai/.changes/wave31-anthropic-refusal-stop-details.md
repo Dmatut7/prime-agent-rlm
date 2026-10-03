@@ -1,0 +1,1 @@
+- Added the Anthropic refusal `stop_details` category and explanation to the refusal error message, so a refused turn reports why the model stopped.

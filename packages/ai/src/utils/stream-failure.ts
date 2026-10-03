@@ -126,7 +126,7 @@ export function classifyStreamFailure(providerErrorType?: string, status?: numbe
  */
 export function streamFailureFromStopReason(
 	rawStopReason: string | undefined,
-	extra?: Pick<StreamFailureInfo, "requestId">,
+	extra?: Pick<StreamFailureInfo, "requestId"> & { detail?: string },
 ): StreamFailureError {
 	const info: StreamFailureInfo = {
 		kind: rawStopReason ? classifyStreamFailure(rawStopReason) : "unknown",
@@ -135,7 +135,7 @@ export function streamFailureFromStopReason(
 	};
 	if (info.kind === "unknown" && /malformed/i.test(rawStopReason ?? "")) info.kind = "malformed_response";
 	const message = rawStopReason
-		? streamFailureMessage(info)
+		? streamFailureMessage(info, extra?.detail)
 		: streamFailureMessage(info, "stream ended with an error and no stop reason");
 	return new StreamFailureError(message, info);
 }
