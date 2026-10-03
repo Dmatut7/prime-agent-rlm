@@ -1,0 +1,1 @@
+- Fixed a client holding a dead session id polling it forever after a daemon restart: the first terminal "Unknown active session" answer for the attached session now closes the connection with a visible notice (subagent viewers return to the parent), and later requests for the dead id are answered locally instead of hitting the daemon every poll interval.

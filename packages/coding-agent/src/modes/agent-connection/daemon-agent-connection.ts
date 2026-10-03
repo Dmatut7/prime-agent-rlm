@@ -415,6 +415,17 @@ export class DaemonAgentConnection implements AgentConnection {
 	private initialAttachPending = false;
 	private initialControlPlaneClose?: Error;
 	private readonly definitiveRequestErrors = new WeakSet<Error>();
+	/**
+	 * W27-A: the active session id this daemon has terminally disowned. The daemon
+	 * already splits its answers by finality: a known-but-unready session fails
+	 * retryable ("session_recovering" / "Session worker is recovering"), while
+	 * "Unknown active session" comes out only when no descriptor claims the id — an
+	 * answer that does not change by being asked again. Once learned, later requests
+	 * for the dead id are answered locally: before this, a spend cell left running
+	 * after a daemon restart re-asked every 15s and each poll hit the wire as a hard
+	 * error (observed for 48 minutes straight on sessions 9808c441bb66/9d127ead57d4).
+	 */
+	private sessionGoneActiveSessionId: string | undefined;
 	private disposing = false;
 	private disposed = false;
 
@@ -599,6 +610,9 @@ export class DaemonAgentConnection implements AgentConnection {
 			options,
 		);
 		this.activeSessionId = getAttachActiveSessionId(result);
+		// A successful attach is proof the daemon has the session (again): any
+		// session-gone verdict a dead-id era learned no longer applies.
+		this.sessionGoneActiveSessionId = undefined;
 		const summary = "snapshot" in result ? result.snapshot.summary : result;
 		this.attachedSessionId = summary.sessionId;
 		this.attachedSessionFile =
@@ -2201,16 +2215,98 @@ export class DaemonAgentConnection implements AgentConnection {
 		timeoutMs?: number,
 		options?: Parameters<DaemonTransportClient["request"]>[2],
 	): Promise<T> {
+		const goneSessionId = this.sessionGoneForWire(command);
+		if (goneSessionId !== undefined) {
+			// Answered locally with the daemon's own terminal answer: the daemon already
+			// said this id is gone, and re-asking cannot change that.
+			const error = new Error(`Unknown active session: ${goneSessionId}`);
+			this.definitiveRequestErrors.add(error);
+			throw error;
+		}
 		const response = await this.client.request(command, timeoutMs, options);
 		if (!response.success) {
 			const error = deserializeDaemonError(response);
 			this.definitiveRequestErrors.add(error);
+			this.observeSessionGoneAnswer(command, error);
 			throw error;
 		}
 		if (invalidatesCachedSnapshot(command.type)) {
 			this.latestSnapshotIsFresh = false;
 		}
 		return response.data as T;
+	}
+
+	/** A recovery/startup loop owns the wire while it runs; its probes must never be short-circuited. */
+	private recoveryInFlight(): boolean {
+		return (
+			this.initialAttachPending ||
+			this.reconnectPromise !== undefined ||
+			this.shutdownReconnectPromise !== undefined ||
+			this.updateRestartPending ||
+			this.backgroundReconnectPromise !== undefined
+		);
+	}
+
+	private static commandActiveSessionId(command: DaemonCommandBody): string | undefined {
+		return "activeSessionId" in command && typeof command.activeSessionId === "string"
+			? command.activeSessionId
+			: undefined;
+	}
+
+	/**
+	 * The dead session id when this command would be re-asking the daemon the
+	 * terminal question it already answered, undefined otherwise. Recovery loops
+	 * exempt: a restart can restore the session under the same id, and a blocked
+	 * probe would keep the loop from ever healing.
+	 */
+	private sessionGoneForWire(command: DaemonCommandBody): string | undefined {
+		const commandSessionId = DaemonAgentConnection.commandActiveSessionId(command);
+		if (commandSessionId === undefined || commandSessionId !== this.sessionGoneActiveSessionId) {
+			return undefined;
+		}
+		if (this.recoveryInFlight()) {
+			return undefined;
+		}
+		return commandSessionId;
+	}
+
+	/**
+	 * Learn the terminal answer for the connection's own session: emit the terminal
+	 * close a missed session_closed would have caused, and arm the local fail-fast
+	 * so pollers stop hitting the wire. Answers about other sessions (send_message
+	 * targets) and retryable states never land here.
+	 */
+	private observeSessionGoneAnswer(command: DaemonCommandBody, error: Error): void {
+		// The error must name this session, not just carry the terminal wording: a
+		// reattach whose *target* is gone fails with the target's id while the
+		// connection's own session is alive.
+		if (error.message !== `Unknown active session: ${this.activeSessionId}`) {
+			return;
+		}
+		const commandSessionId = DaemonAgentConnection.commandActiveSessionId(command);
+		if (commandSessionId !== this.activeSessionId) {
+			return;
+		}
+		if (this.recoveryInFlight()) {
+			return;
+		}
+		if (this.sessionGoneActiveSessionId === commandSessionId) {
+			return;
+		}
+		this.sessionGoneActiveSessionId = commandSessionId;
+		if (this.disposed || this.terminalCloseEmitted) {
+			return;
+		}
+		this.terminalCloseEmitted = true;
+		void this.emit({
+			type: "closed",
+			error: this.formatDaemonSessionGoneError(),
+			sessionClosedReason: "killed",
+		});
+	}
+
+	private formatDaemonSessionGoneError(): string {
+		return `The daemon no longer has this session (it was stopped or not restored after a daemon restart). The session transcript remains saved; reopen it from Agents View. ${this.formatDaemonDiagnosticContext()}`;
 	}
 
 	private async handleDaemonMessage(message: DaemonOutbound): Promise<void> {
@@ -2802,7 +2898,8 @@ export class DaemonAgentConnection implements AgentConnection {
 				recoveryError = error;
 			}
 		}
-		if (this.disposed) {
+		if (this.disposed || this.terminalCloseEmitted) {
+			// A session-gone answer during the retries already delivered the terminal close.
 			return;
 		}
 		this.terminalCloseEmitted = true;
