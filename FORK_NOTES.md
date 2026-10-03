@@ -1,4 +1,13 @@
-## 2026-10-04 wave-36 五路：第七刀 quota-park、走查四小项、死代码清除
+## 2026-10-04 wave-37：CI 八波连红根治、「--」逃生口真修、暖池遥测分析器
+
+- **CI 连红根治**（wave-26/28 起 8+ 波红，本机 macOS 全绿所以一直没看见——老板点破）：两个独立竞态。①rename 双计：cell 结束的 git 比对与 rename 包装的记录按不同键去重，Linux 上 fork/exec 跑赢 cell 线程时旧路径被重复计成删除——比对现在跳过已被 cell 记录为 rename 来源的删除，并加了强制 Linux 时序的回归测试（无修复必红）。②spawn 归属测试的时序假设（await 与回收线程无序），测试改在子进程可证存活时断言。机理与信心：/tmp/wave37/ci-red.md。
+- 「--」逃生口真修：wave-36 的 typo 闸文案承诺「pass a prompt after "--"」但 parseArgs 吞掉标记——实测 `prime-agent -- sessions` 仍被拒（走查实锤）。已在闸前直查原始参数修复+测试钉住。
+- 暖池遥测消费面：`scripts/warm-pool-stats.mjs`（零依赖）——命中率/年龄分位/spawn 耗时分位/回收归因/池深度时间线/totals 交叉校验。真实首读（90 分钟 4 个 daemon 生命周期）：hit 4/miss 4（全 no_ready_spare）、命中 spare 年龄 p50=47ms、spawn p50=232ms。
+- 调研：模型持久化施工模板拼齐（Roo 创建时快照 / OpenCode 解析序+成功才写 / Cline 角色键 opt-in / Continue 对账教训）；Z.AI 上架 GLM-5.3-FlashX、5-Turbo 定价页消失（下波核表）。
+- MODEL-PERSIST lane 被打断未交付（已清场，主题回 wave-38 候选首位）。
+- 门禁：check EXIT 0、hygiene OK、python 769 全绿、单测复扫绿（数字见账本）；CI 转绿以本波 push 后的 run 为准（修复就是冲它来的）。
+
+
 
 - AgentSession 第七刀：quota-park 生命周期状态机（park→resume→wake→restore，约 550 行/18 方法）搬进 core/quota-park.ts——agent-session.ts 20932→20313 行（七刀累计 23500→20313，−3187），守恒经脚本化逐字节比对（17644 字符 18/18 全等）。顺带销壳评审登记：错位注释归位 stallExempted、反向扫描一行委托去重。
 - 死代码清除（放权行使）：3 个零引用公有 API 删除（autoRetryEnabled getter、hasExtensionHandlers、refreshModelMetadata——全仓含 scripts 零引用，上游带入的遗留）。

@@ -14,16 +14,16 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-04，wave-36 已 SHIP）
+## 当前状态（2026-10-04，wave-37 已 SHIP）
 
-- HEAD = 见 git log（三批：第七刀+死代码、走查四小项、FORK_NOTES+账本）。
-- wave-36：agent-session.ts 20313 行（七刀累计 −3187）；3 个死公有 API 清除（放权行使，
-  全仓零引用证据）；F2/F3/F4/F5 走查小项修掉（F2 未注册子命令报错+逃生口）。
-- 工艺对照：Codex codex.rs 消融四连拆的守恒三件套（re-export 保外观/测试随码/PR 写死验证）
-  与我们既有模式一致；OpenHands condenser 常驻非阻塞套件 = 记忆帽裁决新参照。
-- /tmp 会被系统清理——wave-35 research.md 实体已丢，教训：调研全文只在 /tmp 留不住，
-  关键结论必须进账本/FORK_NOTES（本波起执行）。
-- 门禁：check EXIT 0、hygiene OK、单测 9552 绿（1 例负载抖动隔离即绿）、suite 1674/1674。
+- HEAD = 见 git log（四批：CI 红根治、逃生口+分析器、FORK_NOTES+账本）。
+- wave-37 首要：CI 八波连红根治——rename 双计（Linux 时序）+ spawn 测试时序假设；
+  机理 /tmp/wave37/ci-red.md。教训入账：**主席每波收工必须看一眼 fork CI**
+  （gh run list -R Dmatut7/prime-agent-rlm --limit 3），本机全绿骗了八波。
+- MODEL-PERSIST lane 被老板打断未交付（探针已清场），主题回 wave-38 首位。
+- 暖池遥测消费面第一步：scripts/warm-pool-stats.mjs（真实首读 hit4/miss4）。
+- 走查抓到 F2 逃生口假承诺（已修+钉）。
+- 门禁：check EXIT 0、hygiene OK、python 769 绿、单测复扫、CI 以本波 push 后 run 为准。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -104,14 +104,13 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
   把在跑会话归档。犯了就是事故，写进 FORK_NOTES 向老板披露。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-37 候选）
+## 下一波主题（wave-38 候选）
 
-1. 【模型持久化一致性】证据链闭合（CC 被拒残留 / Gemini 三态 / OpenHands 漂移+连接解析 /
-   Aider opt-in）：拒绝判定三态化 + 单一权威写入点 + agent 发起切换默认确认 + 未知 --model
-   显式报错。本主题需独占 agent-session.ts。
-2. 【第八刀候选】stall 簇（748 行/45 成员/churn 32）或 image-routing（358 行/20 成员）；
-   压缩超簇需两刀设计先出。
-3. 【暖池遥测消费面】capability 演进方案 + provider 归因解析（OpenHands #5332 教训）。
-4. 【首请求服务端窗口】≤1.5s 有界等待拿服务端权威窗口（per-model 主体遗留）。
-5. 【会话状态列词表中文化】wave-36 F5 遗留（342 处 pin、跨 daemon，单独一波做）。
-6. 【记忆帽裁决】仍待老板三选一。
+1. 【模型持久化一致性落地】（wave-37 被打断的主题回炉）：三态判定 + Roo/OpenCode/Cline/Continue
+   四家模板（/tmp/wave37/research.md）；含被拒不残留、unknown 不误清、--model 显式报错、
+   失效对账显式回落。需独占 agent-session.ts。
+2. 【Z.AI 表核】FlashX 上架 + 5-Turbo 定价页缺席——跑 generate-models.ts 核准。
+3. 【暖池遥测二期】消费面：status/doctor 展示（capability 演进方案）或分析器接 ci-honesty。
+4. 【第八刀】stall 簇（748 行/45 成员）或 image-routing（358 行/20 成员）。
+5. 【CI 红的 TS 间发】waves 30/33 各有一次 TS shard 红（CI-RED lane 报告末节）——下波拉日志归因。
+6. 【记忆帽裁决】仍待老板三选一（OpenCode reserved=10000 参照在手；帽应按窗占比的证据也在手）。
