@@ -18,11 +18,15 @@ Observation paths:
   Nothing else in the interpreter is hooked, so CPU-bound cell code pays nothing,
   and a host that turns tracking off gets no wrappers at all.
 - A bounded before/after comparison catches what child processes did (``sed -i``,
-  formatters, ``git checkout``). Inside a git work tree it compares ``git status``
+  formatters, ``git checkout``) and what other windows or processes did to the
+  workspace while the cell ran. Inside a git work tree it compares ``git status``
   snapshots plus stat and content caches; elsewhere it compares a bounded mtime
-  scan. It runs only for a cell that starts a process, while ``bash()`` handles
-  from earlier cells are still alive, or when such a handle ends between cells,
-  because nothing else can change a file behind Python's back.
+  scan. A before-snapshot is taken for every cell, so even a cell that only reads
+  reports concurrent outside changes. Every record carries ``origin``: ``"own"``
+  for writes the kernel saw this session make (the wrappers, the edit skill, or a
+  moment inside one of this session's command windows) and ``"ambient"`` for what
+  only showed up in the comparison at a moment no command of this session was
+  running.
 - ``bash()``, ``rlm.run()``, harness writes and the web skills report their own
   steps through the helpers at the bottom of this module.
 
@@ -106,6 +110,10 @@ COMMAND_UPDATE_INTERVAL_S = 0.5
 MAX_PENDING_COMPLETIONS = 64
 # Same bound for harness memory writes buffered while no cell is running.
 MAX_PENDING_MEMORY = 64
+# Command windows remembered for attribution; the oldest closed ones go first, open ones never.
+MAX_COMMAND_WINDOWS = 512
+# Slack on a command window's ends when a file's mtime is compared against it.
+WINDOW_EPS_S = 0.01
 _PATH_CACHE_LIMIT = 4096
 
 RULES_FILE_NAMES = frozenset({"AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"})
@@ -563,6 +571,7 @@ class _FileRec:
         "path",
         "baseline",
         "source",
+        "origin",
         "old_path",
         "sig",
         "dirty",
@@ -573,10 +582,14 @@ class _FileRec:
         "ignored",
     )
 
-    def __init__(self, path: str, baseline: _Content, source: str, old_path: str | None = None) -> None:
+    def __init__(
+        self, path: str, baseline: _Content, source: str, old_path: str | None = None, origin: str = "own"
+    ) -> None:
         self.path = path
         self.baseline = baseline
         self.source = source
+        # "own": this session made the change; "ambient": it only appeared in the workspace comparison.
+        self.origin = origin
         self.old_path = old_path
         # Signature seen by the last watcher tick; "unset" forces one more tick before a live report.
         self.sig: tuple[int, int] | None | str = "unset"
@@ -674,8 +687,8 @@ class _SnapshotJob:
 
 
 _SNAPSHOT_LATE = (
-    "the git snapshot before a command did not finish within the tracking budget, "
-    "so changes made by commands in this cell are not listed"
+    "the workspace snapshot at the cell's start did not finish within the tracking budget, "
+    "so changes made by commands or other processes in this cell are not listed"
 )
 _IGNORE_UNKNOWN = (
     "git did not say in time which files it ignores, so files it ignores may be listed"
@@ -943,11 +956,16 @@ class _Tracker:
         # Where the last cell's command comparison ended, kept while it left commands running: a
         # command that ends before the next cell starts is compared against it (see `_gap_check`).
         self.carried: _After | None = None
-        # What those between-cell comparisons found, for the next cell: path -> baseline.
-        self.pending_changes: dict[str, _Content] = {}
+        # What those between-cell comparisons found, for the next cell: path -> (baseline, after-sig).
+        self.pending_changes: dict[str, tuple[_Content, tuple[int, int] | None]] = {}
         self.pending_note: str | None = None
         self._gap_running = False
         self._gap_again = False
+        # Every bash() command's lifetime as [start, end-or-None-while-running] (time.time()
+        # seconds, the clock file mtimes share): how a comparison finding is told apart as this
+        # session's own work from another window's or process's (ambient). CommandStep owns the
+        # entries; the oldest closed windows are dropped past MAX_COMMAND_WINDOWS.
+        self.cmd_windows: list[list[float | None]] = []
         # Resolved once, off every cell's path: a slow or hung git must not stall a write wrapper.
         self._cwd_git_resolved = threading.Event()
         self._refresh_paths()
@@ -1337,14 +1355,16 @@ class _Tracker:
         for record in memory_records:
             self.send(cell.id, {MEMORY_CHANGE_MIME: record})
         if changes:
-            self.apply_shell_changes(cell, list(changes.items()))
+            self.apply_shell_changes(cell, [(path, baseline, sig) for path, (baseline, sig) in changes.items()])
             with self.lock:
                 self._wake_watcher()
-        if self._live_handles() > 0:
-            # Commands from earlier cells may still be writing; compare from this cell's start. The
-            # snapshot runs on a worker and the cell starts at once; a process the cell starts later
-            # waits for it, bounded by the budget (see request_snapshot).
-            self.request_snapshot(cell, os.getcwd(), wait=False)
+        # Every cell gets a before-snapshot, not only cells with commands: the end-of-cell
+        # comparison is what catches writes from other windows and processes (reported with
+        # origin "ambient", never counted as this session's own), and it needs a state from
+        # the cell's start to compare against. The snapshot runs on a worker and the cell
+        # starts at once; a process the cell starts later waits for it, bounded by the budget
+        # (see request_snapshot).
+        self.request_snapshot(cell, os.getcwd(), wait=False)
 
     def _live_handles(self) -> int:
         bash_module = sys.modules.get("rlm.bash")
@@ -1487,6 +1507,8 @@ class _Tracker:
             if rec is not None:
                 rec.dirty = True
                 rec.sig = "unset"
+                # The interpreter itself is writing: ours, whatever the comparison said earlier.
+                rec.origin = "own"
                 self._wake_watcher()
                 return
             if len(cell.files) >= MAX_FILES_PER_CELL:
@@ -1850,7 +1872,7 @@ class _Tracker:
         with self.lock:
             if probe.incomplete and self.pending_note is None:
                 self.pending_note = probe.incomplete
-            for path, baseline in changes or []:
+            for path, baseline, after_sig in changes or []:
                 if path in self.pending_changes:
                     continue
                 if len(self.pending_changes) >= MAX_FILES_PER_CELL:
@@ -1858,36 +1880,70 @@ class _Tracker:
                         f"more than {MAX_FILES_PER_CELL} files changed; the rest are not listed"
                     )
                     break
-                self.pending_changes[path] = baseline
+                self.pending_changes[path] = (baseline, after_sig)
 
     def shell_changes(
         self, cell: _Cell, deadline: float, after: _After | None = None
-    ) -> list[tuple[str, _Content]]:
-        """What changed since the before-snapshots, as (path, baseline) pairs; `_OutOfTime` past the deadline.
+    ) -> list[tuple[str, _Content, tuple[int, int] | None]]:
+        """What changed since the before-snapshots, as (path, baseline, after-signature) triples
+        (the signature is None for a deletion); `_OutOfTime` past the deadline.
 
         Pure computation, safe on a worker thread: `apply_shell_changes` turns it into records.
         `after`, when given, receives the states the comparison ended on.
         """
-        changes: list[tuple[str, _Content]] = []
+        changes: list[tuple[str, _Content, tuple[int, int] | None]] = []
         for before in list(cell.repos.values()):
             self._compare_repo(cell, before, deadline, changes, after)
         if cell.scan is not None:
             self._compare_scan(cell, cell.scan[0], cell.scan[1], cell.scan[2], deadline, changes, after)
         return changes
 
-    def apply_shell_changes(self, cell: _Cell, changes: list[tuple[str, _Content]]) -> None:
-        for path, baseline in changes:
+    def _owns_write(self, path: str, sig: tuple[int, int] | None) -> bool:
+        """Whether the change's moment falls inside a command this session ran.
+
+        The moment is the file's own mtime; for a deletion (no file left to stat) it is the
+        mtime of the nearest directory still standing, which the removal bumped. Without
+        timing evidence the change is not claimed as own: over-claiming the session's work
+        is the failure this attribution exists to prevent.
+        """
+        when: float | None = None
+        if sig is not None:
+            when = sig[1] / 1e9
+        else:
+            directory = os.path.dirname(path)
+            while True:
+                try:
+                    when = os.lstat(directory).st_mtime_ns / 1e9
+                    break
+                except (OSError, ValueError):
+                    parent = os.path.dirname(directory)
+                    if parent == directory:
+                        return False
+                    directory = parent
+        now = time.time()
+        with self.lock:
+            windows = list(self.cmd_windows)
+        for start, end in windows:
+            if start is not None and start - WINDOW_EPS_S <= when <= (end if end is not None else now) + WINDOW_EPS_S:
+                return True
+        return False
+
+    def apply_shell_changes(self, cell: _Cell, changes: list[tuple[str, _Content, tuple[int, int] | None]]) -> None:
+        for path, baseline, after_sig in changes:
             if path in self.harness_files:
                 continue  # the harness's own saves report themselves as memory records
+            origin = "own" if self._owns_write(path, after_sig) else "ambient"
             with self.lock:
                 rec = cell.files.get(path)
                 if rec is not None:
                     rec.dirty = True
+                    if origin == "own":
+                        rec.origin = "own"
                     continue
                 if len(cell.files) >= MAX_FILES_PER_CELL:
                     cell.note_incomplete(f"more than {MAX_FILES_PER_CELL} files changed; the rest are not listed")
                     return
-                cell.files[path] = _FileRec(path, baseline, "shell")
+                cell.files[path] = _FileRec(path, baseline, "shell", origin=origin)
 
     def _prior_content(self, path: str, prior: tuple[int, int]) -> _Content:
         """What a file was before a command, from its old signature: a link, cached bytes, or unknown."""
@@ -1901,7 +1957,7 @@ class _Tracker:
         cell: _Cell,
         before: _RepoState,
         deadline: float,
-        changes: list[tuple[str, _Content]],
+        changes: list[tuple[str, _Content, tuple[int, int] | None]],
         ended: _After | None = None,
     ) -> None:
         after = self.repo_state(before.root, False, deadline)
@@ -1928,7 +1984,7 @@ class _Tracker:
                     return
         need_blob: list[str] = []
         probe_untracked: list[str] = []
-        pending: list[tuple[str, _Content | None]] = []
+        pending: list[tuple[str, _Content | None, tuple[int, int] | None]] = []
         for path in sorted(candidates):
             with self.lock:
                 if path in cell.files:
@@ -1947,31 +2003,31 @@ class _Tracker:
                     # it was there - a file the before-state knew about degrades to unknown,
                     # never to created.
                     if before.entries[path] in (".D", "D.", "DD"):
-                        pending.append((path, _ABSENT))
+                        pending.append((path, _ABSENT, current))
                     else:
-                        pending.append((path, _UNKNOWN))
+                        pending.append((path, _UNKNOWN, current))
                     continue
-                pending.append((path, self._prior_content(path, prior)))
+                pending.append((path, self._prior_content(path, prior), current))
                 continue
             if after.entries.get(path) == "??":
                 if current is None:
                     # A new file already gone again (a tool's temp file) is no creation.
                     continue
                 if before.oid is None:
-                    pending.append((path, _ABSENT))
+                    pending.append((path, _ABSENT, current))
                     continue
                 # Untracked now is not proof of new: an index change (git rm --cached, a
                 # reset) untracks a file the before-commit still holds. Ask the before-commit
                 # before calling it a creation; probed after the tracked entries so a flood
                 # of new files cannot crowd out real diffs.
                 probe_untracked.append(path)
-                pending.append((path, None))
+                pending.append((path, None, current))
                 continue
             if before.oid is None:
-                pending.append((path, _UNKNOWN))
+                pending.append((path, _UNKNOWN, current))
                 continue
             need_blob.append(path)
-            pending.append((path, None))
+            pending.append((path, None, current))
         need_blob.extend(probe_untracked)
         blobs: dict[str, bytes | None] = {}
         if need_blob:
@@ -1981,14 +2037,14 @@ class _Tracker:
             specs = [f"{before.oid}:{os.path.relpath(path, before.root)}" for path in wanted]
             fetched = self.blobs(before.root, specs, deadline)
             blobs = {path: fetched.get(spec) for path, spec in zip(wanted, specs)}
-        for path, baseline in pending:
+        for path, baseline, after_sig in pending:
             if baseline is None:
                 data = blobs.get(path)
                 if data is _MISSING:
                     baseline = _ABSENT
                 else:
                     baseline = _Content("bytes", data) if data is not None else _UNKNOWN
-            changes.append((path, baseline))
+            changes.append((path, baseline, after_sig))
 
     def _compare_scan(
         self,
@@ -1997,7 +2053,7 @@ class _Tracker:
         before: dict[str, tuple[int, int]],
         before_lost: frozenset[str],
         deadline: float,
-        changes: list[tuple[str, _Content]],
+        changes: list[tuple[str, _Content, tuple[int, int] | None]],
         ended: _After | None = None,
     ) -> None:
         scanned = self.scan(root, deadline)
@@ -2022,9 +2078,9 @@ class _Tracker:
                     # not read back then. Only the gap degrades to unknown - a file the
                     # before-state could not see is not thereby a creation.
                     unseen = any(_under(path, gap) for gap in before_lost)
-                    changes.append((path, _UNKNOWN if unseen else _ABSENT))
+                    changes.append((path, _UNKNOWN if unseen else _ABSENT, after.get(path)))
                 continue
-            changes.append((path, self._prior_content(path, prior)))
+            changes.append((path, self._prior_content(path, prior), after.get(path)))
 
     # --------------------------------------------------------------- records
 
@@ -2074,7 +2130,9 @@ class _Tracker:
         change["scope"] = info.scope
         if link:
             # The link itself changed; its target's lines are not this file's lines.
-            change.update({"added": 0, "removed": 0, "symlink": True, "source": rec.source, "at": _now_ms()})
+            change.update(
+                {"added": 0, "removed": 0, "symlink": True, "source": rec.source, "origin": rec.origin, "at": _now_ms()}
+            )
             return change
         added = removed = 0
         diff_lines: list[str] | None = None
@@ -2133,6 +2191,7 @@ class _Tracker:
         elif omitted is not None and "diff" not in change:
             change["diffOmitted"] = omitted
         change["source"] = rec.source
+        change["origin"] = rec.origin
         change["at"] = _now_ms()
         return change
 
@@ -2158,6 +2217,7 @@ class _Tracker:
             change.get("diff"),
             change.get("binary"),
             change.get("diffOmitted"),
+            change.get("origin"),
         )
         rec.last_change = change
         if key == rec.emitted_key:
@@ -2187,6 +2247,10 @@ class _Tracker:
         change = rec.last_change
         info = self.classify(rec.path)
         if change is None or info is None or info.rules_scope is None or rec.ignored:
+            return
+        if rec.origin == "ambient":
+            # Another window's edit to a rules file is an ambient file change, not a memory
+            # entry this session made.
             return
         op = {"created": "created", "deleted": "deleted"}.get(change["kind"], "updated")
         memory: dict[str, Any] = {
@@ -2812,9 +2876,20 @@ class CommandStep:
         self._finished = False
         tracker = _tracker
         self._cell = tracker.cell if tracker is not None else None
-        if tracker is not None and self._cell is not None:
+        # The command's lifetime as an attribution window: file mtimes inside it are this
+        # session's own work. It stays open while the command runs, background or not.
+        self._window: list[float | None] | None = None
+        if tracker is not None:
             with tracker.lock:
-                self._cell.commands.add(self)
+                self._window = [time.time(), None]
+                tracker.cmd_windows.append(self._window)
+                while len(tracker.cmd_windows) > MAX_COMMAND_WINDOWS:
+                    oldest_closed = next((w for w in tracker.cmd_windows if w[1] is not None), None)
+                    if oldest_closed is None:
+                        break
+                    tracker.cmd_windows.remove(oldest_closed)
+                if self._cell is not None:
+                    self._cell.commands.add(self)
 
     def move_to_background(self, ended_at: int) -> None:
         with self._lock:
@@ -2872,10 +2947,14 @@ class CommandStep:
 
     def finish(self, exit_code: int, output: str) -> None:
         try:
+            tracker = _tracker
+            if tracker is not None and self._window is not None:
+                with tracker.lock:
+                    if self._window[1] is None:
+                        self._window[1] = time.time()
             status = "ok" if exit_code == 0 else "error"
             detail = _command_summary(exit_code, output)
             commit = _commit_id(self._command, exit_code, output)
-            tracker = _tracker
             with self._lock:
                 timer, self._timer = self._timer, None
                 self._finished = True

@@ -160,9 +160,9 @@ class CompareRepoBaselineTests(unittest.TestCase):
     def baseline_for(self, xy: str, sig: tuple[int, int] | None) -> effects._Content:
         before = effects._RepoState(self.root, self.oid, {self.victim: xy}, {self.victim: sig})
         cell = effects._Cell("cell", 5.0)
-        changes: list[tuple[str, effects._Content]] = []
+        changes: list[tuple[str, effects._Content, tuple[int, int] | None]] = []
         self.tracker._compare_repo(cell, before, time.perf_counter() + 5.0, changes)
-        self.assertEqual([path for path, _baseline in changes], [self.victim])
+        self.assertEqual([path for path, _baseline, _after_sig in changes], [self.victim])
         return changes[0][1]
 
     def test_a_listed_entry_without_a_stat_signature_degrades_to_unknown(self):

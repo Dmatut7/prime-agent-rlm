@@ -2,7 +2,7 @@ import { type ClickRegion, type Component, visibleWidth } from "@earendil-works/
 import { shortenPathToWidth } from "../../../utils/shorten-path.js";
 import { formatSpendCost } from "../spend-format.js";
 import { theme } from "../theme/theme.js";
-import { shortMemoryTitle, symlinkVerb } from "./feed-data.js";
+import { type ChangeEntry, shortMemoryTitle, symlinkVerb } from "./feed-data.js";
 import { memoryBodyLines, memoryHeadLabel } from "./memory-detail.js";
 import { slideCount } from "./motion.js";
 import { formatTimelineTime, TIMELINE_CONTENT_COL, type TimelineGutter, timelineRow } from "./timeline-gutter.js";
@@ -17,7 +17,7 @@ import type { TurnTimeline } from "./turn-timeline.js";
  *
  * ```
  *  19:05   ·      ✎ 改了 2 个文件 +20 −7 · 已提交 abc1234           ▸
- *          │
+ *          │      ◇ 工作区另有 1 个变动（别的窗口或进程）
  *  19:06   ✦      记住了   grow 批次审查结论                        ▴
  *          ┃      范围：merge/repl-kernel 的 16 个提交、96 个文件。
  *          │
@@ -25,7 +25,10 @@ import type { TurnTimeline } from "./turn-timeline.js";
  * ```
  *
  * A memory opens with one click straight to its words; a file list opens to
- * the diffs. A compaction after the answer is a main-line row above the last
+ * the diffs. The ambient line counts only what other windows or processes
+ * changed while the turn ran - it never folds into the session's own count,
+ * and with none it is not drawn (the head then reads `改了`, not `本会话改了`).
+ * A compaction after the answer is a main-line row above the last
  * row, which closes the request and toggles the rows the timeline hides by default.
  */
 
@@ -265,7 +268,11 @@ export class TurnStripComponent implements Component {
 		const caretFor = (open: boolean, openColor: "kindEdit" | "timelineMemory"): string =>
 			theme.bold(theme.fg(open ? openColor : "timelineFaint", open ? "▴" : "▸"));
 
-		const hasEditsRow = facts.projectChanges.length > 0 || facts.commitId !== undefined || facts.trackingIncomplete;
+		const hasEditsRow =
+			facts.projectChanges.length > 0 ||
+			(facts.ambientChanges?.length ?? 0) > 0 ||
+			facts.commitId !== undefined ||
+			facts.trackingIncomplete;
 		const afterAnswer = facts.afterAnswer ?? [];
 		const hasSections = hasEditsRow || facts.memories.length > 0 || afterAnswer.length > 0;
 		// The answer above ends with one blank row of its own; a section sits two rows below it.
@@ -321,8 +328,11 @@ export class TurnStripComponent implements Component {
 		caretFor: (open: boolean, openColor: "kindEdit" | "timelineMemory") => string,
 	): void {
 		const ui = this.source.timeline.ui;
+		// Changes another window or process made while the turn ran: shown, but never folded
+		// into the session's own count.
+		const ambient = facts.ambientChanges ?? [];
 		const files = facts.projectChanges.length;
-		const open = ui.stripOpen === "edits" && files > 0;
+		const open = ui.stripOpen === "edits" && (files > 0 || ambient.length > 0);
 		const glyph = theme.fg("kindEdit", "✎");
 		const soft = (text: string) => theme.fg("timelineSoft", text);
 		const dim = (text: string) => theme.fg("timelineTime", text);
@@ -330,36 +340,25 @@ export class TurnStripComponent implements Component {
 		const incomplete = facts.trackingIncomplete ? dim(" （有些改动没记全）") : "";
 		const firstAt = facts.projectChanges.map((change) => change.firstAt).filter(isStamp);
 		const time = stampOf(firstAt.length > 0 ? Math.min(...firstAt) : undefined);
-		if (files === 0) {
-			const head = facts.commitId ? `已提交 ${facts.commitId}` : "";
-			const note = facts.trackingIncomplete ? `${head ? " " : ""}（有些改动没记全）` : "";
-			push({ gutter: gutterAt("note", time), content: dim(`${head}${note}`) });
-			return;
-		}
-		const right = caretFor(open, "kindEdit");
-		const totals = changeTotals(facts.projectChanges);
-		const figures = totals ? ` ${counts(totals.added, totals.removed)}` : "";
-		const room = contentLimit(width, right);
-		const content = fitting(
-			[
-				`${glyph} ${soft(`改了 ${files} 个文件`)}${figures}${commit}${incomplete}`,
-				`${glyph} ${soft(`改了 ${files} 个文件`)}${figures}${commit}`,
-				`${glyph} ${soft(`改了 ${files} 个文件`)}${figures}`,
-				`${glyph} ${soft(`改了 ${files} 个文件`)}`,
-				`${glyph} ${soft(`${files} 个文件`)}`,
-			],
-			room,
-		);
-		push({
-			gutter: gutterAt("note", time),
-			content,
-			right,
-			key: STRIP_EDITS,
-			onClick: () => this.activate(STRIP_EDITS),
-			revealBelow: open ? 0 : 10,
-		});
-		if (!open) return;
-		for (const change of facts.projectChanges) {
+		const ambientText = (count: number) =>
+			fitting(
+				[`工作区另有 ${count} 个变动（别的窗口或进程）`, `工作区另有 ${count} 个变动`, `另有 ${count} 个变动`],
+				contentLimit(width, ""),
+			);
+		const ambientLine = (expandable: boolean): void => {
+			const ambientAt = ambient.map((change) => change.firstAt).filter(isStamp);
+			const right = expandable ? caretFor(open, "kindEdit") : "";
+			const content = `${theme.fg("timelineSoft", "◇")} ${dim(ambientText(ambient.length))}`;
+			push({
+				gutter: gutterAt("note", time ?? stampOf(ambientAt.length > 0 ? Math.min(...ambientAt) : undefined)),
+				content,
+				right,
+				...(expandable
+					? { key: STRIP_EDITS, onClick: () => this.activate(STRIP_EDITS), revealBelow: open ? 0 : 10 }
+					: {}),
+			});
+		};
+		const changeRow = (change: ChangeEntry): void => {
 			const key = `file:${change.key}`;
 			const opened = ui.stripExpanded.has(key);
 			const renamed = change.kind === "renamed" && change.oldPath;
@@ -400,12 +399,59 @@ export class TurnStripComponent implements Component {
 					push({ gutter: { main: "rail" }, content: `    ${detailLine}` });
 				}
 			}
+		};
+		if (files === 0) {
+			if (facts.commitId || facts.trackingIncomplete) {
+				const head = facts.commitId ? `已提交 ${facts.commitId}` : "";
+				const note = facts.trackingIncomplete ? `${head ? " " : ""}（有些改动没记全）` : "";
+				push({ gutter: gutterAt("note", time), content: dim(`${head}${note}`) });
+			}
+			if (ambient.length === 0) return;
+			ambientLine(true);
+			if (!open) return;
+			for (const change of ambient) changeRow(change);
+			return;
 		}
+		const right = caretFor(open, "kindEdit");
+		const totals = changeTotals(facts.projectChanges);
+		const figures = totals ? ` ${counts(totals.added, totals.removed)}` : "";
+		const room = contentLimit(width, right);
+		const verb = ambient.length > 0 ? "本会话改了" : "改了";
+		const content = fitting(
+			[
+				`${glyph} ${soft(`${verb} ${files} 个文件`)}${figures}${commit}${incomplete}`,
+				`${glyph} ${soft(`${verb} ${files} 个文件`)}${figures}${commit}`,
+				`${glyph} ${soft(`${verb} ${files} 个文件`)}${figures}`,
+				`${glyph} ${soft(`${verb} ${files} 个文件`)}`,
+				`${glyph} ${soft(`${files} 个文件`)}`,
+			],
+			room,
+		);
+		push({
+			gutter: gutterAt("note", time),
+			content,
+			right,
+			key: STRIP_EDITS,
+			onClick: () => this.activate(STRIP_EDITS),
+			revealBelow: open ? 0 : 10,
+		});
+		if (!open) {
+			if (ambient.length > 0) ambientLine(false);
+			return;
+		}
+		for (const change of facts.projectChanges) changeRow(change);
 		if (facts.scratchChanges.length > 0) {
 			push({
 				gutter: { main: "rail" },
 				content: dim(`  另有 ${facts.scratchChanges.length} 个临时文件，不算项目改动`),
 			});
+		}
+		if (ambient.length > 0) {
+			push({
+				gutter: { main: "rail" },
+				content: dim(`  另有 ${ambient.length} 个变动来自别的窗口或进程`),
+			});
+			for (const change of ambient) changeRow(change);
 		}
 	}
 

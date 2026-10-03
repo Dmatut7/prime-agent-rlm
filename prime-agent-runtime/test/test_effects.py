@@ -1083,8 +1083,11 @@ class SlowGitTests(TrackerCase):
         self.assertLess(body_started - sent, effects.DEFAULT_CELL_BUDGET_S - 0.05)
         self.assertLess(elapsed, effects.DEFAULT_CELL_BUDGET_S + _BUDGET_SLACK_S)
         reasons = [status["incomplete"] for status in cell.payloads(STATUS) + later.payloads(STATUS)]
-        self.assertEqual(len(reasons), 1, reasons)
-        self.assertIn("background command", reasons[0])
+        # Two losses, two notes: the background command's gap comparison, and the pure cell's
+        # own start-of-cell snapshot (every cell takes one now, for ambient detection).
+        self.assertEqual(len(reasons), 2, reasons)
+        self.assertTrue(any("background command" in reason for reason in reasons), reasons)
+        self.assertTrue(any("snapshot" in reason for reason in reasons), reasons)
 
     def test_a_command_waits_at_most_the_budget_for_its_snapshot(self):
         self.slow(True)

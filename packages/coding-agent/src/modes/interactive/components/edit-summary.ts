@@ -18,6 +18,8 @@ export interface FileChangeSummary {
 	symlink?: boolean;
 	/** True when an edit of the file was withheld because its text looks secret: only the path is known. */
 	omitted?: true;
+	/** `ambient`: another window or process changed the file while the turn ran, not this session. */
+	origin?: KernelFileChange["origin"];
 }
 
 export function countChangedLines(diff: string): { added: number; removed: number } {
@@ -39,6 +41,9 @@ function mergeFileChange(target: Map<string, FileChangeSummary>, change: FileCha
 		existing.removed += change.removed;
 		if (change.symlink) existing.symlink = true;
 		if (change.omitted) existing.omitted = true;
+		// Once this session itself touched the file the summary is own, whatever an earlier record said.
+		if (change.origin === "own") existing.origin = "own";
+		else if (change.origin !== undefined) existing.origin ??= change.origin;
 	} else {
 		target.set(key, { ...change });
 	}
@@ -64,6 +69,7 @@ export function getToolFileChanges(
 						added: Math.max(0, Number(record.added) || 0),
 						removed: Math.max(0, Number(record.removed) || 0),
 						...(record.symlink === true ? { symlink: true } : {}),
+						...(record.origin === "ambient" || record.origin === "own" ? { origin: record.origin } : {}),
 					},
 					cwd,
 				);

@@ -121,6 +121,9 @@ function extractFileOpsFromToolResult(message: ToolResultMessage, fileOps: FileO
 	const fileChanges = Array.isArray(details.fileChanges) ? details.fileChanges : [];
 	for (const change of fileChanges) {
 		if (typeof change !== "object" || change === null || Array.isArray(change)) continue;
+		// Ambient records are another window's or process's work: the handoff lists what this
+		// session changed, so they stay out of it.
+		if ((change as Record<string, unknown>).origin === "ambient") continue;
 		const path = (change as Record<string, unknown>).path;
 		if (typeof path !== "string" || path.length === 0) continue;
 		const kind = (change as Record<string, unknown>).kind;

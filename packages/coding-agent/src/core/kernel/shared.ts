@@ -277,6 +277,14 @@ export interface KernelFileChange {
 	symlink?: boolean;
 	/** How the change was observed. */
 	source: "python" | "shell" | "edit";
+	/**
+	 * Who made the change, by the kernel's timing evidence: `own` = this session (the Python
+	 * wrappers, the edit skill, or a moment inside one of this session's `bash()` command
+	 * windows); `ambient` = it only appeared in the before/after workspace comparison while no
+	 * command of this session was running (another window or process). Absent from older
+	 * kernels: read it as `own`.
+	 */
+	origin?: "own" | "ambient";
 	/** Epoch ms when the kernel observed the change. */
 	at: number;
 }

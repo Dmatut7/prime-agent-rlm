@@ -22,6 +22,7 @@ export interface KernelEffectRetraction {
 const FILE_KINDS = new Set<KernelFileChange["kind"]>(["created", "modified", "deleted", "renamed"]);
 const FILE_SCOPES = new Set<KernelFileChange["scope"]>(["project", "scratch", "memory"]);
 const FILE_SOURCES = new Set<KernelFileChange["source"]>(["python", "shell", "edit"]);
+const FILE_ORIGINS = new Set<NonNullable<KernelFileChange["origin"]>>(["own", "ambient"]);
 const DIFF_OMITTED = new Set<NonNullable<KernelFileChange["diffOmitted"]>>([
 	"too_large",
 	"no_baseline",
@@ -85,6 +86,7 @@ export function parseFileChangeDisplay(payload: unknown): KernelFileChange | Ker
 		...(payload.binary === true ? { binary: true } : {}),
 		...(payload.symlink === true ? { symlink: true } : {}),
 		source: payload.source,
+		...(member(FILE_ORIGINS, payload.origin) ? { origin: payload.origin } : {}),
 		at,
 	};
 }

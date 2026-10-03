@@ -385,7 +385,7 @@ export function changeDetail(change: ChangeEntry): (width: number) => string[] {
 		if (change.binary) return [theme.fg("dim", "二进制文件，没有文字改动可看")];
 		const omitted = omittedDiffText(change.omitted);
 		if (omitted && change.rows.length === 0) return [theme.fg("dim", omitted)];
-		const by = sourceText(change.source);
+		const by = change.origin === "ambient" ? "别的窗口或进程动的，本会话只看到了前后差异" : sourceText(change.source);
 		if (change.rows.length === 0) {
 			return [theme.fg("dim", change.kind === "deleted" ? "文件已删除" : "没有记录到改动内容")];
 		}
@@ -1643,8 +1643,10 @@ export interface TimelineFacts {
 	stepCount: number;
 	subagentCount: number;
 	errorCount: number;
-	/** Files changed inside the project, one per path. */
+	/** Files changed inside the project by this session, one per path. */
 	projectChanges: ChangeEntry[];
+	/** Files changed inside the project by other windows or processes while the turn ran. */
+	ambientChanges?: ChangeEntry[];
 	/** Files changed outside the project (temp files). */
 	scratchChanges: ChangeEntry[];
 	memories: Array<{ key: string; change: KernelMemoryChange }>;
@@ -1704,7 +1706,8 @@ export function timelineFacts(timeline: TurnTimeline, rows: readonly BoxRow[], c
 		stepCount: new Set(steps.map((step) => step.toolCallId)).size + timeline.earlierSteps,
 		subagentCount: rows.filter((row) => row.kind === "subagent").length,
 		errorCount,
-		projectChanges: changes.filter((change) => change.scope !== "scratch"),
+		projectChanges: changes.filter((change) => change.scope !== "scratch" && change.origin !== "ambient"),
+		ambientChanges: changes.filter((change) => change.scope !== "scratch" && change.origin === "ambient"),
 		scratchChanges: changes.filter((change) => change.scope === "scratch"),
 		memories,
 		...(commitId ? { commitId } : {}),

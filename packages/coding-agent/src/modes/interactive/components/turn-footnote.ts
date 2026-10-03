@@ -255,9 +255,13 @@ export class TurnFootNote implements Component {
 		if (changes.length === 0) {
 			return [];
 		}
+		// Changes another window or process made while the turn ran: one dim count row, never
+		// per-file rows, and never eating the own rows' budget.
+		const own = changes.filter((change) => change.origin !== "ambient");
+		const ambientCount = changes.length - own.length;
 		const rows: string[] = [];
-		const shown = changes.length > TURN_FOOT_NOTE_MAX_FILE_ROWS ? TURN_FOOT_NOTE_MAX_FILE_ROWS - 1 : changes.length;
-		for (const change of changes.slice(0, shown)) {
+		const shown = own.length > TURN_FOOT_NOTE_MAX_FILE_ROWS ? TURN_FOOT_NOTE_MAX_FILE_ROWS - 1 : own.length;
+		for (const change of own.slice(0, shown)) {
 			const prefix = `   ${theme.fg("dim", "改动")}  `;
 			const withheld = change.omitted ? omittedDiffText("sensitive") : undefined;
 			const parts: string[] = [];
@@ -272,8 +276,13 @@ export class TurnFootNote implements Component {
 			const path = theme.fg("muted", shortenPath(change.path, available));
 			rows.push(truncateToWidth(`${prefix}${path}${counts}`, cols, ""));
 		}
-		if (shown < changes.length) {
-			rows.push(theme.fg("dim", truncateToWidth(`   … 还有 ${changes.length - shown} 个文件`, cols, "")));
+		if (shown < own.length) {
+			rows.push(theme.fg("dim", truncateToWidth(`   … 还有 ${own.length - shown} 个文件`, cols, "")));
+		}
+		if (ambientCount > 0) {
+			rows.push(
+				theme.fg("dim", truncateToWidth(`   … 工作区另有 ${ambientCount} 个变动（别的窗口或进程）`, cols, "")),
+			);
 		}
 		return rows;
 	}

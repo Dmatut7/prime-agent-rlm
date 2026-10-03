@@ -117,6 +117,7 @@ function readActivity(value: unknown): KernelActivity | undefined {
 const FILE_KINDS = new Set<KernelFileChange["kind"]>(["created", "modified", "deleted", "renamed"]);
 const FILE_SCOPES = new Set<KernelFileChange["scope"]>(["project", "scratch", "memory"]);
 const FILE_SOURCES = new Set<KernelFileChange["source"]>(["python", "shell", "edit"]);
+const FILE_ORIGINS = new Set<NonNullable<KernelFileChange["origin"]>>(["own", "ambient"]);
 
 function readFileChange(value: unknown): KernelFileChange | undefined {
 	if (!isRecord(value)) return undefined;
@@ -125,6 +126,7 @@ function readFileChange(value: unknown): KernelFileChange | undefined {
 	const scope = stringField(value, "scope") as KernelFileChange["scope"] | undefined;
 	if (!path || !kind || !FILE_KINDS.has(kind)) return undefined;
 	const source = stringField(value, "source") as KernelFileChange["source"] | undefined;
+	const origin = stringField(value, "origin") as KernelFileChange["origin"] | undefined;
 	const change: KernelFileChange = {
 		path,
 		kind,
@@ -134,6 +136,7 @@ function readFileChange(value: unknown): KernelFileChange | undefined {
 		source: source && FILE_SOURCES.has(source) ? source : "python",
 		at: numberField(value, "at") ?? 0,
 	};
+	if (origin && FILE_ORIGINS.has(origin)) change.origin = origin;
 	const relPath = stringField(value, "relPath");
 	const oldPath = stringField(value, "oldPath");
 	const diff = stringField(value, "diff");
@@ -365,6 +368,12 @@ export interface ChangeEntry {
 	omitted?: KernelFileChange["diffOmitted"];
 	/** How the kernel saw the change (Python code, a shell command, the edit skill). */
 	source?: KernelFileChange["source"];
+	/**
+	 * Who made it: `ambient` marks changes another window or process made while the turn ran
+	 * (the kernel's command-window timing found no session command at the change's moment);
+	 * `own` or absent (older kernels, host-side tools) reads as the session's own work.
+	 */
+	origin?: KernelFileChange["origin"];
 	/** True when the change is to the link itself: no line counts or diff apply. */
 	symlink?: boolean;
 	/** When the change was first seen (ordering). */
@@ -411,6 +420,9 @@ function addEntry(entries: Map<string, ChangeEntry>, entry: ChangeEntry): void {
 	existing.binary ||= entry.binary;
 	existing.omitted ??= entry.omitted;
 	existing.source ??= entry.source;
+	// Once this session itself touched the file the entry is own, whatever an earlier record said.
+	if (entry.origin === "own") existing.origin = "own";
+	else if (entry.origin !== undefined) existing.origin ??= entry.origin;
 	if (entry.symlink) existing.symlink = true;
 	if (entry.oldPath) existing.oldPath ??= entry.oldPath;
 }
@@ -455,6 +467,7 @@ export function aggregateChanges(
 					binary: change.binary === true,
 					...(change.diffOmitted ? { omitted: change.diffOmitted } : {}),
 					source: change.source,
+					...(change.origin ? { origin: change.origin } : {}),
 					...(change.symlink ? { symlink: true } : {}),
 					firstAt: change.at || order,
 				});
