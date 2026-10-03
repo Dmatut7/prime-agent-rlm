@@ -4,6 +4,7 @@ import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
+import { type LogEntry, setLogSink } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
 import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
@@ -258,10 +259,34 @@ vi.mock("node:child_process", async (importOriginal) => {
 const tempDirs: string[] = [];
 const supervisors: DaemonSupervisor[] = [];
 const clients: DaemonClient[] = [];
+/** Structured-log capture for the warm-pool telemetry stream (the public seam). */
+const logEntries: LogEntry[] = [];
+
+interface WarmPoolTotals {
+	spawns: { ready: number; failed: number };
+	claims: { hit: number; miss: number; expired: number };
+	reclaims: Record<string, number>;
+}
+
+function warmPoolEvents(event: "spawn" | "claim" | "reclaim"): LogEntry[] {
+	return logEntries.filter(
+		(entry) => entry.component === "coding-agent.daemon-supervisor" && entry.msg === `warm pool ${event}`,
+	);
+}
+
+function eventTotals(entry: LogEntry): WarmPoolTotals {
+	return entry.totals as WarmPoolTotals;
+}
+
+function eventDepth(entry: LogEntry): { ready: number; warming: number } {
+	return entry.depth as { ready: number; warming: number };
+}
 
 afterEach(async () => {
 	hoisted.listenDelayMs = 0;
 	hoisted.failNextSpawn = false;
+	setLogSink(undefined);
+	logEntries.length = 0;
 	for (const client of clients.splice(0)) {
 		client.close();
 	}
@@ -608,5 +633,130 @@ describe("daemon supervisor warm spare pool", () => {
 		expect(second.success).toBe(true);
 		const secondSummary = responseData(second) as { activeSessionId?: string; id: string };
 		expect(secondSummary.activeSessionId ?? secondSummary.id).toBe(replenished.env[ACTIVE_SESSION_ENV_LITERAL]!);
+	});
+
+	it("emits spawn telemetry with status, duration, depth sample, and totals", async () => {
+		setLogSink((entry) => {
+			logEntries.push(entry);
+		});
+		await startPoolSupervisor({ ttlMs: 30_000 });
+		await waitForCondition(() => warmPoolEvents("spawn").length === 1, "the spare spawn telemetry");
+
+		const spawn = warmPoolEvents("spawn")[0]!;
+		expect(spawn.status).toBe("ready");
+		expect(spawn.durationMs).toBeGreaterThanOrEqual(0);
+		// The spare is still mid-publish at its own spawn event: counted as warming.
+		expect(eventDepth(spawn)).toEqual({ ready: 0, warming: 1 });
+		expect(eventTotals(spawn).spawns).toEqual({ ready: 1, failed: 0 });
+	});
+
+	it("emits claim hit telemetry with the spare's age", async () => {
+		setLogSink((entry) => {
+			logEntries.push(entry);
+		});
+		const { projectDir, client } = await startPoolSupervisor({ ttlMs: 30_000, spawnCooldownMs: 0 });
+		await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
+
+		const response = await client.request({ type: "create", config: { cwd: projectDir } }, 10_000);
+		expect(response.success).toBe(true);
+
+		const claims = warmPoolEvents("claim");
+		expect(claims).toHaveLength(1);
+		expect(claims[0]!.outcome).toBe("hit");
+		expect(claims[0]!.cwd).toBe(projectDir);
+		expect(claims[0]!.ageMs).toBeGreaterThanOrEqual(0);
+		expect(eventTotals(claims[0]!).claims).toEqual({ hit: 1, miss: 0, expired: 0 });
+	});
+
+	it("emits claim miss telemetry with the mismatch reason and the pooled spare's age", async () => {
+		setLogSink((entry) => {
+			logEntries.push(entry);
+		});
+		const { projectDir, client } = await startPoolSupervisor({ ttlMs: 30_000, spawnCooldownMs: 0 });
+		await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
+
+		const response = await client.request(
+			{ type: "create", config: { cwd: projectDir }, launchEnv: { PRIME_AGENT_WARM_POOL_PROBE: "mismatch" } },
+			10_000,
+		);
+		expect(response.success).toBe(true);
+
+		const claims = warmPoolEvents("claim");
+		expect(claims).toHaveLength(1);
+		expect(claims[0]!.outcome).toBe("miss");
+		expect(claims[0]!.missReason).toBe("env_mismatch");
+		// The spare stayed pooled, so its age at the miss is part of the event.
+		expect(claims[0]!.ageMs).toBeGreaterThanOrEqual(0);
+		expect(eventTotals(claims[0]!).claims).toEqual({ hit: 0, miss: 1, expired: 0 });
+	});
+
+	it("emits reclaim telemetry bucketed by reason when the idle TTL expires", async () => {
+		setLogSink((entry) => {
+			logEntries.push(entry);
+		});
+		await startPoolSupervisor({ ttlMs: 400 });
+		await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
+		await waitForCondition(() => warmPoolEvents("reclaim").length === 1, "the TTL reclaim telemetry");
+
+		const reclaim = warmPoolEvents("reclaim")[0]!;
+		expect(reclaim.reason).toBe("ttl_expired");
+		expect(reclaim.ageMs).toBeGreaterThanOrEqual(0);
+		// The disposal removes the spare before the event: the pool reads empty.
+		expect(eventDepth(reclaim)).toEqual({ ready: 0, warming: 0 });
+		expect(eventTotals(reclaim).reclaims.ttl_expired).toBe(1);
+	});
+
+	it("attributes a failed claim health check as a miss and a claim_failed reclaim", async () => {
+		setLogSink((entry) => {
+			logEntries.push(entry);
+		});
+		const { projectDir, client } = await startPoolSupervisor({
+			ttlMs: 30_000,
+			spawnCooldownMs: 0,
+			claimConnectTimeoutMs: 500,
+		});
+		await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
+		const spareServer = await hoisted.spawned[0]!.server;
+		spareServer.failWorkerAuth("warm spare auth broken");
+
+		const response = await client.request({ type: "create", config: { cwd: projectDir } }, 10_000);
+		expect(response.success).toBe(true);
+
+		const claims = warmPoolEvents("claim");
+		const healthCheckMisses = claims.filter((entry) => entry.missReason === "claim_check_failed");
+		expect(healthCheckMisses).toHaveLength(1);
+		expect(healthCheckMisses[0]!.outcome).toBe("miss");
+		expect(healthCheckMisses[0]!.ageMs).toBeGreaterThanOrEqual(0);
+		// The cold retry inside the create claims nothing: the pool is empty, so a
+		// no_ready_spare miss is the only other claim event.
+		expect(claims.filter((entry) => entry.missReason === "no_ready_spare")).toHaveLength(1);
+		expect(claims.some((entry) => entry.outcome === "hit")).toBe(false);
+
+		const reclaims = warmPoolEvents("reclaim");
+		expect(reclaims.map((entry) => entry.reason)).toEqual(["claim_failed"]);
+		expect(eventTotals(reclaims[0]!).reclaims.claim_failed).toBe(1);
+	});
+
+	it("attributes pooled spares to the drain bucket when the supervisor shuts down", async () => {
+		setLogSink((entry) => {
+			logEntries.push(entry);
+		});
+		const { supervisor } = await startPoolSupervisor({ ttlMs: 30_000 });
+		await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
+		// The spare must be fully published first, or the drain races the publish
+		// and the spare is attributed to pool_closed instead of drain. The
+		// operational "ready" line goes through the same structured sink.
+		await waitForCondition(
+			() => logEntries.some((entry) => entry.msg.startsWith("Warm spare worker") && entry.msg.includes("ready for")),
+			"the spare publish",
+		);
+
+		await supervisor.dispose();
+
+		const reclaims = warmPoolEvents("reclaim");
+		expect(reclaims).toHaveLength(1);
+		expect(reclaims[0]!.reason).toBe("drain");
+		expect(reclaims[0]!.detail).toBe("supervisor dispose");
+		expect(eventTotals(reclaims[0]!).reclaims.drain).toBe(1);
 	});
 });
