@@ -23,6 +23,12 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
   → wave-40 立项（非交互来源切换发可见通知）。
 - 走查小注：/exit 文本 Enter 未触发命令（wave-40 核查）。
 - 门禁：check EXIT 0、hygiene OK、daemon-protocol 34/34、单测/suite 复扫绿（数字账本末节惯例）。
+- **0.11.19 已发版**（271f35801）：根 CHANGELOG 手写中文更新日志（沿用 fork 格式），四包
+  lockstep 0.11.19，146 个 fragment 全部收编删除；无 v 标无 npm publish（fork 禁令原样）。
+  教训两条：sync-versions 的正确顺序 = 全部 package.json bump → npm install --package-lock-only
+  → check（example 的 lock 条目在根 lock 里，反序会一轮一个地冒红）；我插 FORK_NOTES 新节的
+  Edit 模式曾逐节吃掉上一节标题（old_string 只匹配标题行、new_string 没把旧标题带回去）——
+  11 节标题已复原，以后插节用「新节全文 + 旧标题行」一起当 new_string。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
