@@ -1218,6 +1218,37 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 			}
 		}
 
+		// GLM-5.3-FlashX is sold only on the pay-as-you-go API (api.z.ai/api/paas/v4);
+		// the coding plan does not serve it, so the zai-coding-plan section never lists
+		// it. Source it from the models.dev "zai" section until that changes. If the
+		// coding-plan section grows the same id later, that entry wins the
+		// provider+id dedup because it is pushed first.
+		const zaiFlashX = data.zai?.models?.["glm-5.3-flashx"] as ModelsDevModel | undefined;
+		if (zaiFlashX?.tool_call === true && !models.some((m) => m.provider === "zai" && m.id === "glm-5.3-flashx")) {
+			models.push({
+				id: "glm-5.3-flashx",
+				name: zaiFlashX.name || "GLM-5.3-FlashX",
+				api: "openai-completions",
+				provider: "zai",
+				baseUrl: "https://api.z.ai/api/paas/v4",
+				reasoning: zaiFlashX.reasoning === true,
+				input: zaiFlashX.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
+				cost: {
+					input: zaiFlashX.cost?.input || 0,
+					output: zaiFlashX.cost?.output || 0,
+					cacheRead: zaiFlashX.cost?.cache_read || 0,
+					cacheWrite: zaiFlashX.cost?.cache_write || 0,
+				},
+				compat: {
+					supportsDeveloperRole: false,
+					thinkingFormat: ZAI_THINKING_COMPAT.thinkingFormat,
+					zaiToolStream: true,
+				},
+				contextWindow: zaiFlashX.limit?.context || 4096,
+				maxTokens: zaiFlashX.limit?.output || 4096,
+			});
+		}
+
 		// Process Mistral models
 		if (data.mistral?.models) {
 			for (const [modelId, model] of Object.entries(data.mistral.models)) {
