@@ -14,16 +14,16 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-03，wave-26 已 SHIP）
+## 当前状态（2026-10-03 午，wave-27 已 SHIP）
 
-- HEAD = 见 git log。wave-26 五路：提交自动回底闭环（TUI 侧 clickHold 让位 + unseen 计数口径修正 +
-  interactive-mode 两处接线）、AgentSession 第三刀（-355 行，retention/roster 两簇）、compaction
-  交接生产实证（假 HOME 真压缩，三点验证全过）、记忆写侧近重复闸（τ=0.40 真库校准 ~97% 精度）、
-  调研+遥测（老板自 wave-24 后未再用产品，等他回来验证 Enter 修复/指示灯的体感）。
-- 新登记：僵尸轮询（客户端持死会话 id 每 15 秒吃硬错误 48 分钟——应回 session-gone 终态）+
-  重启固定剧目（10/10 次重启打掉 1 个活跃会话 worker，疑似拉起方自挂会话）——wave-27 立项。
-- 压缩演练附带发现：「Session is too short to compact」空转文案易误读；小窗口+大单条下压缩几乎
-  不瘦身（生产 1M 窗口无此问题）。
+- HEAD = 见 git log。wave-27 五路：僵尸轮询停轮（客户端终态学习，零 wire 变更）+ 重启剧目销账
+  （拉起方冒烟会话的 owned 生命周期，无害）；第四刀（-195 行，累计 -2187）；压缩空转措辞分家
+  （missing-entry-ids 走真失败路径）；考题例行 6/7 + EX-6 键格式契约立项；调研全源零新增。
+- 遥测：老板 10:37-10:55 用了产品（wave-24 前的 bundle）——记忆读侧首次真多查询检索（search×3+
+  overview×1，找上一波审查上下文）；新痛点：变更计数跨窗口误归因（审查会话被记了别的 lane 的
+  改动，「我让你做审查 你改代码了吗」——立项 wave-28）；老板 TUI 被我开工仪式的 shutdown --force
+  归档过一次活会话（10:55 事故）——开工仪式从今起先查活跃会话再 shutdown。
+- 孤儿 worker 54434 查清是 wave-21 台架泄漏，已清理。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -100,10 +100,11 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 - 已知豁免：Python 套件 2 条代理环境错误属预期（wave-10 未复现）。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-27 候选）
+## 下一波主题（wave-28 候选）
 
-1. 僵尸轮询修复（未知会话回 session-gone 终态让客户端停轮）+ 重启剧目调查销账。
-2. AgentSession 第四刀（follow-up 簇 rlm-child-followup.ts + 删壳评估）。
-3. 记忆阶段 2 决策（遥测再积累）；语义近重复（embedding）立项待拍板。
-4. 压缩空转文案区分「无可总结」vs「失败」（W26-C 附带发现 A）。
-5. 真机复核包；exam v1.4（manifest 防读侧）。
+1. 【老板痛点】变更计数跨窗口误归因：change tracker 的「前后对比工作区」口径不分作者——审查会话
+   被记上别 lane 的改动。修法：按会话归属过滤或按时间窗收紧。
+2. EX-6 键格式契约修复（task.txt 钉死裸文件名 + scorer 归一化前缀，三连失败趋势）。
+3. spend cell 停轮收尾（W27-A 遗留：noteConnectionClosed 里停 idle tick）。
+4. AgentSession 第五刀（终态分类簇 + snapshot 小件收口）；委托壳瘦身评估。
+5. 记忆阶段 2 决策（遥测已有机检索发生，数据再看一周）；GLM 压缩阈值+安全簇等老板拍板。
