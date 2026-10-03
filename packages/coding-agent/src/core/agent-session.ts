@@ -82,7 +82,6 @@ import {
 	createAgentMessageHostHandlers,
 	DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 	formatAgentMessageRetryExhaustedError,
-	formatAgentSessionNameReserved,
 	formatAgentSessionNameUnavailable,
 	formatSubagentTerminalErrorNotice,
 	isAgentSessionMessage,
@@ -396,10 +395,28 @@ import {
 import { resolveConfigValue } from "./resolve-config-value.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
 import {
+	type AgentMessageDeferred,
+	compactRlmText,
+	createAgentMessageDeferred,
+	noopRlmChildAbort,
+	type RlmChildDeriveCounts,
+	type RlmChildEmitFields,
+	type RlmChildRun,
+	RlmChildStreamPreview,
+	readAssistantText,
+	resetRlmChildDeriveCounts,
+	rlmChildDeriveCounts,
+	rlmChildLabel,
+	startRlmChildRun,
+} from "./rlm-child-run.js";
+
+export type { RlmChildDeriveCounts };
+export { compactRlmText, resetRlmChildDeriveCounts, rlmChildDeriveCounts, rlmChildLabel };
+
+import {
 	classifyRlmChildTerminalOutcomeSafely,
 	type RlmChildStallAbortFacts,
 	type RlmChildTerminalFacts,
-	type RlmChildTerminalOutcomeKind,
 	type RlmChildTurnAbortReason,
 	readStallKernelReasons,
 } from "./rlm-child-terminal.js";
@@ -543,13 +560,7 @@ import {
 	type TurnLivenessEvent,
 	type TurnLivenessKernelFacts,
 } from "./turn-liveness.js";
-import {
-	addAssistantUsage,
-	cloneUsage,
-	emptyUsage,
-	type SessionUsageSummary,
-	sessionUsageSummaryFrom,
-} from "./usage.js";
+import { cloneUsage, emptyUsage, type SessionUsageSummary, sessionUsageSummaryFrom } from "./usage.js";
 import { SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME } from "./websearch-credential.js";
 
 export type { GoalState, GoalStatus } from "./goals.js";
@@ -1644,25 +1655,9 @@ function injectedMessagePreviewLabel(message: CustomMessage): string | undefined
 	}
 }
 
-interface AgentMessageDeferred {
-	promise: Promise<void>;
-	resolve: () => void;
-	reject: (error: Error) => void;
-}
-
 interface AgentMessageOutcome {
 	delivery?: AgentMessageDeferred;
 	completion?: AgentMessageDeferred;
-}
-
-function createAgentMessageDeferred(): AgentMessageDeferred {
-	const deferred = {} as AgentMessageDeferred;
-	deferred.promise = new Promise<void>((resolve, reject) => {
-		deferred.resolve = resolve;
-		deferred.reject = reject;
-	});
-	deferred.promise.catch(() => undefined);
-	return deferred;
 }
 
 /** One-shot settlement for a scheduled post-compaction continuation; a settled failure is never re-exposed to later waiters. */
@@ -1713,203 +1708,12 @@ type AutonomousRuntimeSnapshot = Pick<
 	"continuationsUsed" | "gateAttempts" | "lastGateFailure" | "lastGateFailureSnapshot"
 >;
 
-interface RlmChildRun {
-	id: string;
-	prompt: string;
-	sessionName: string;
-	sessionDir: string;
-	/**
-	 * The parent's own assistant entry the child's usage is attributed to, resolved on first use.
-	 * The lookup scans the whole transcript, so resolving it per child assistant message costs a
-	 * copy-and-scan of every entry written so far; the answer cannot change while the run is live.
-	 */
-	parentUsageEntry?: SessionMessageEntry;
-	model: Model<Api>;
-	status: RlmChildAgentStatus;
-	durationMs?: number;
-	answerPreview?: string;
-	toolUseCount: number;
-	activity?: RlmChildAgentActivity;
-	/**
-	 * Bounded ring of the child's latest progress notes (newest last). Optional:
-	 * admission seeds it, but a lifecycle record built by hand (a test's minimal
-	 * run literal, a restored registry row) carries no ring, and every reader
-	 * treats "no ring" as "no note" rather than throwing.
-	 */
-	progressNotes?: string[];
-	/**
-	 * Wall-clock ms of the last tracked child activity; carried into snapshots.
-	 * Seeded at admission so a child that never emits a tracked event still
-	 * crosses the staleness threshold once running.
-	 */
-	lastActivityAt?: number;
-	/**
-	 * Monotonic counterpart of lastActivityAt (performance.now()), written by
-	 * the same events. Staleness measures this so wall-clock jumps (a host
-	 * sleep freezing the whole session) do not inflate it.
-	 */
-	lastActivityMonotonicAt?: number;
-	error?: string;
-	/**
-	 * Stall-watchdog kill facts recorded while this run was in flight. Set by the
-	 * parent's subscription when the child reports stall_abort/stall_unsettled and
-	 * consumed by the terminal classifier, which must rank a kill above "it
-	 * replied" instead of reporting the kill as a completed-without-reply.
-	 */
-	stallAbort?: RlmChildStallAbortFacts;
-	/** Display/forensic stall state for the roster row; cleared by the next agent_start. */
-	stall?: RlmChildStallState;
-	/**
-	 * Epoch ms of the last parent-facing "this child is still silent" notice. A rate
-	 * limit only - the watchdog's warn stage is edge-triggered per silence episode -
-	 * so a child that keeps re-arming the stage cannot flood the parent transcript.
-	 */
-	lastStallNoticeAt?: number;
-	/**
-	 * Re-check armed after an excused stall warning was held back from the parent. The child's
-	 * watchdog warns once per silence episode, so if the excuse lapses while the child stays silent
-	 * nothing else would ever tell the parent.
-	 */
-	stallRecheckTimer?: ReturnType<typeof setTimeout>;
-	/**
-	 * Terminal classification recorded by the run's own terminal path, with the
-	 * reason text that went with it. Read-only forensics for `collectRlmChildren`:
-	 * a fan-in reader has to tell a watchdog kill from a child that finished
-	 * without replying, and it cannot re-derive the classification later because
-	 * the reply baseline lived in the run loop's closure. Undefined while the run
-	 * is in flight, and for a child whose notice path never ran (suppressed after a
-	 * parent abort, or explicitly deleted).
-	 */
-	terminalKind?: RlmChildTerminalOutcomeKind;
-	terminalReason?: string;
-	/**
-	 * Replies this session still owed this child when the terminal verdict was
-	 * recorded, i.e. replies the parent had accepted into its queue but not read.
-	 * A `completed_without_reply` notice is provisional on them: the verdict is a
-	 * snapshot taken when the child settled, while the notice is published when this
-	 * session's queue drains - in production a median of 19 minutes later.
-	 */
-	provisionalNoReplyReplyIds?: readonly string[];
-	/**
-	 * The provisional reply that was delivered after the verdict. Set by the delivery
-	 * credit, read by the publication gate, and never set for an id a later run
-	 * boundary discarded, so an earlier run's notice cannot be suppressed by a reply
-	 * that run never earned.
-	 */
-	noReplyVerdictSupersededBy?: string;
-	/**
-	 * Set when the publication gate actually withheld this run's no-reply notice, so a
-	 * reader that sees `terminal_kind: "completed_without_reply"` but no notice in the
-	 * parent's transcript can reconcile the two instead of guessing.
-	 */
-	noReplyNoticeSuperseded?: boolean;
-	/**
-	 * The child's own terminal-error report, still queued when this run's failure
-	 * verdict was taken. Per run on purpose: a child session outlives the run that
-	 * failed, so a session-wide flag would swallow the NEXT run's death report - the
-	 * one case where the synthesized notice is the only record.
-	 */
-	provisionalFailureNoticeReplyId?: string;
-	/** That report was delivered after the verdict, so the synthesized one is a duplicate. */
-	failureVerdictSupersededBy?: string;
-	abort: () => void;
-	publication: AgentMessageDeferred;
-	/** Resolves after terminal result publication and detached-run cleanup finish. */
-	settlement: AgentMessageDeferred;
-	/** Child session, once its runtime exists. Used to cancel nested child runs. */
-	session?: AgentSession;
-	settled: boolean;
-	/** Do not inject a late terminal notice after the parent session is aborted. */
-	suppressTerminalNotice?: boolean;
-	/** Excluded from future strong barriers after an authoritative cancellation cut. */
-	abandonedForQuiescence?: boolean;
-	/** Selector snapshot for an admitted explicit delete. */
-	detachedDeletion?: RlmSubagentRegistryEntry;
-	/** Shared physical runtime cleanup owned by the explicit-delete path. */
-	deletionCleanup?: Promise<void>;
-	deletionCleanupObserver?: Promise<boolean>;
-	/** Resolves when a deletion may release its selector reservation. */
-	deletionReservation: AgentMessageDeferred;
-	deletionCleanupFailed?: boolean;
-	deletionRunFinished?: boolean;
-	deletionNotice?: Promise<void>;
-	deletionFailureNotice?: Promise<void>;
-	deletionNeedsCompletionNotice?: boolean;
-	completeDeletion?: () => Promise<void>;
-	reportDeletionCleanupFailure?: (error: unknown) => Promise<void>;
-	emitUpdate?: () => void;
-	lastEmittedUpdate?: string;
-	/**
-	 * Cached rlmChildLabel(prompt): the prompt is a run-level constant, and the
-	 * snapshot builder used to re-regex the whole brief on every streaming chunk.
-	 */
-	label?: string;
-	/**
-	 * Incremental preview accumulator for the child's in-flight assistant message.
-	 * Keeps the per-chunk preview work O(delta) instead of O(text so far).
-	 */
-	streamPreview?: RlmChildStreamPreview;
-	/**
-	 * Volatile snapshot fields as last emitted, for the cheap unchanged check that
-	 * keeps streaming chunks off the snapshot build and JSON.stringify.
-	 */
-	lastEmittedFields?: RlmChildEmitFields;
-	unsubscribe?: () => void;
-}
-
-/**
- * The fields of {@link RlmChildAgentSnapshot} that can change while a run is live.
- * Equal fields (with reference equality for the model and stall objects) imply an
- * identical serialization, so an update whose fields all match the last emission
- * cannot carry anything new on the wire.
- */
-interface RlmChildEmitFields {
-	model: Model<Api> | undefined;
-	sessionName: string | undefined;
-	status: RlmChildAgentStatus;
-	durationMs: number | undefined;
-	answerPreview: string | undefined;
-	toolUseCount: number | undefined;
-	tokenCount: number | undefined;
-	recap: string | undefined;
-	activityKind: RlmChildAgentActivity["kind"] | undefined;
-	activityToolName: string | undefined;
-	repliedSinceTask: boolean | undefined;
-	error: string | undefined;
-	stall: RlmChildStallState | undefined;
-}
-
-/**
- * Reference/strict equality over {@link RlmChildEmitFields}: every field is either a
- * primitive, an immutable model record, or an object that is replaced (never mutated
- * in place) when it changes. Equal fields serialize identically, so an update whose
- * fields all match the last emission cannot carry anything new on the wire.
- */
-function rlmChildEmitFieldsEqual(fields: RlmChildEmitFields, last: RlmChildEmitFields | undefined): boolean {
-	if (last === undefined) return false;
-	return (
-		fields.model === last.model &&
-		fields.sessionName === last.sessionName &&
-		fields.status === last.status &&
-		fields.durationMs === last.durationMs &&
-		fields.answerPreview === last.answerPreview &&
-		fields.toolUseCount === last.toolUseCount &&
-		fields.tokenCount === last.tokenCount &&
-		fields.recap === last.recap &&
-		fields.activityKind === last.activityKind &&
-		fields.activityToolName === last.activityToolName &&
-		fields.repliedSinceTask === last.repliedSinceTask &&
-		fields.error === last.error &&
-		fields.stall === last.stall
-	);
-}
-
-interface RetainedRlmChild {
+export interface RetainedRlmChild {
 	session: AgentSession;
 	run?: RlmChildRun;
 }
 
-interface RlmSubagentModelSelection {
+export interface RlmSubagentModelSelection {
 	model: Model<Api>;
 }
 
@@ -1946,8 +1750,6 @@ const SESSION_PERSIST_FAILURE_REPORT_MAX_MS = 300_000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 /** Minimum spacing between accepted progress notes from one child session. */
 const RLM_PROGRESS_NOTE_MIN_INTERVAL_MS = 10_000;
-/** Bounded ring of progress notes kept per child run; the snapshot exposes the newest. */
-const RLM_CHILD_PROGRESS_NOTE_RING_MAX = 5;
 /** A running child with no tracked activity for this long reports activityStaleMs. */
 const RLM_CHILD_STALE_ACTIVITY_THRESHOLD_MS = 10 * 60_000;
 /** How long a deferred RLM terminal notice may wait for delivery before it is abandoned. */
@@ -2119,7 +1921,6 @@ function isPersistedQuotaParkData(value: unknown): value is PersistedQuotaParkDa
 	);
 }
 
-function noopRlmChildAbort(): void {}
 function noopRlmChildEventUnsubscribe(): void {}
 
 function autoRefineInstructions(reason: AutoRefineReason, review: AutoRefineReview): string {
@@ -2303,154 +2104,6 @@ function parseAutonomousBudgetOptions(tokens: string[]): AgentAutonomousConfig {
 }
 
 /**
- * Derivation counters for the RLM child streaming-scaling needle: the invariant
- * "a streaming chunk pays O(delta), never a re-derive over the full text" is
- * asserted by counting the derivations one run pays instead of timing them, so
- * a loaded CI runner cannot flake the bound. Module-global on purpose: the
- * derivations are module-level functions, so every call site counts - the
- * streaming handler, the snapshot builder, or a regressed re-introduction of
- * the pre-fix per-chunk re-derive. Production never reads or resets these;
- * tests reset before a run and read after (StallFakeClock-style test seam).
- */
-export interface RlmChildDeriveCounts {
-	/** Full-text preview derivations: compactRlmText calls plus the streaming accumulator's structural full-text fallback. */
-	fullTextPreview: number;
-	/** Label derivations: rlmChildLabel calls over a run's task brief. */
-	label: number;
-	/** Snapshot builds that reached the serializer in the child-update emitter. */
-	snapshotSerialize: number;
-	/** Characters the streaming fold actually processed: the consumed-length tracking keeps the run total O(text), never text-per-chunk. */
-	foldedChars: number;
-}
-
-export const rlmChildDeriveCounts: RlmChildDeriveCounts = {
-	fullTextPreview: 0,
-	label: 0,
-	snapshotSerialize: 0,
-	foldedChars: 0,
-};
-
-/** Reset {@link rlmChildDeriveCounts}. Test seam: production never resets it. */
-export function resetRlmChildDeriveCounts(): void {
-	rlmChildDeriveCounts.fullTextPreview = 0;
-	rlmChildDeriveCounts.label = 0;
-	rlmChildDeriveCounts.snapshotSerialize = 0;
-	rlmChildDeriveCounts.foldedChars = 0;
-}
-
-export function compactRlmText(text: string, maxLength = 160): string {
-	rlmChildDeriveCounts.fullTextPreview += 1;
-	const compact = text.replace(/\s+/g, " ").trim();
-	if (compact.length <= maxLength) {
-		return compact;
-	}
-	return `${compact.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
-}
-
-// Child-agent label: collapse to one line but keep the full prompt — the TUI
-// truncates to the visible width and elides shared prefixes, so capping here
-// would only hide the divergence between near-identical sibling prompts.
-export function rlmChildLabel(prompt: string): string {
-	rlmChildDeriveCounts.label += 1;
-	return prompt.replace(/\s+/g, " ").trim() || "child agent";
-}
-
-/**
- * Incremental counterpart of {@link compactRlmText} for a streaming assistant
- * message. The preview only depends on the first ~maxLength collapsed characters, so
- * the window stays bounded and freezes once the cap is crossed; new text is folded in
- * by tracking how much of each text block has been consumed, which keeps the per-chunk
- * work at O(new characters + block count) instead of a full join and regex per chunk.
- * String lengths are O(1) in V8, so the tracking itself never touches the old text.
- * A block structure the length tracking cannot describe (a block shrinking, the text
- * count dropping) pays one exact full-text pass instead.
- *
- * At every point the folded text equals readAssistantText(message) as it stood at the
- * last update, so `update()` returns exactly `compactRlmText(textSoFar, maxLength)`.
- */
-class RlmChildStreamPreview {
-	/** Consumed length per text block, aligned with the message's text-block order. */
-	private foldedTextBlockLengths: number[] = [];
-	private buf = "";
-	private cappedResult: string | undefined;
-
-	constructor(private readonly maxLength: number = 160) {}
-
-	/** Fold the message's new text in and return the compacted preview. */
-	update(message: AssistantMessage): string {
-		const lengths: number[] = [];
-		const deltas: string[] = [];
-		let structural = false;
-		for (const block of message.content) {
-			if (block.type !== "text") continue;
-			const consumed = this.foldedTextBlockLengths[lengths.length] ?? 0;
-			if (block.text.length < consumed) {
-				structural = true;
-				break;
-			}
-			if (block.text.length > consumed) deltas.push(block.text.slice(consumed));
-			lengths.push(block.text.length);
-		}
-		if (structural || lengths.length < this.foldedTextBlockLengths.length) {
-			// One exact full-text pass: counted like a compactRlmText call, with its
-			// length folded in, so a regression that pays this fallback per chunk
-			// re-derives O(text so far) visibly.
-			rlmChildDeriveCounts.fullTextPreview += 1;
-			const fullText = readAssistantText(message);
-			rlmChildDeriveCounts.foldedChars += fullText.length;
-			this.foldedTextBlockLengths = message.content
-				.filter((block) => block.type === "text")
-				.map((block) => (block.type === "text" ? block.text.length : 0));
-			this.buf = fullText.replace(/\s+/g, " ");
-			this.cappedResult = undefined;
-			this.applyCap();
-			return this.preview();
-		}
-		this.foldedTextBlockLengths = lengths;
-		if (this.cappedResult === undefined) {
-			for (const delta of deltas) {
-				if (delta.length === 0) continue;
-				// Count the chars the fold processes: the needle bounds the total over a
-				// run, so a regression that re-folds the accumulated text every chunk
-				// (e.g. a per-chunk accumulator reset) is visible even without a
-				// compactRlmText call.
-				rlmChildDeriveCounts.foldedChars += delta.length;
-				// The window may carry one trailing space so a delta that opens with
-				// whitespace collapses against it, exactly like the full-text regex would.
-				this.buf = `${this.buf}${delta}`.replace(/\s+/g, " ");
-				this.applyCap();
-				if (this.cappedResult !== undefined) break;
-			}
-		}
-		return this.preview();
-	}
-
-	preview(): string {
-		return this.cappedResult ?? this.buf.trim();
-	}
-
-	private applyCap(): void {
-		// Same cap decision as compactRlmText: it caps on the trimmed length, so the
-		// window's optional trailing space must not tip a text under the cap over it.
-		const trimmed = this.buf.trim();
-		if (trimmed.length > this.maxLength) {
-			this.cappedResult = `${trimmed.slice(0, Math.max(0, this.maxLength - 3)).trimEnd()}...`;
-			this.buf = "";
-		}
-	}
-}
-
-/**
- * Record a tracked child activity on both clocks: lastActivityAt stays
- * wall-clock ms for snapshots, and its monotonic twin bounds staleness so a
- * host sleep cannot inflate it.
- */
-function touchRlmChildActivity(run: RlmChildRun): void {
-	run.lastActivityAt = Date.now();
-	run.lastActivityMonotonicAt = performance.now();
-}
-
-/**
  * Lazily computed staleness for a running child: how long since the last
  * tracked activity, once past the threshold. Computed at snapshot build time
  * only — no background timers update it.
@@ -2477,13 +2130,6 @@ function rlmActivityStaleMs(
 	// are fractional, and the kernel parser rejects non-int activity_stale_ms.
 	const staleMs = Math.floor(Math.min(wallStaleMs, monotonicStaleMs));
 	return staleMs >= RLM_CHILD_STALE_ACTIVITY_THRESHOLD_MS ? staleMs : undefined;
-}
-
-function readAssistantText(message: AssistantMessage): string {
-	return message.content
-		.filter((block) => block.type === "text")
-		.map((block) => block.text)
-		.join("");
 }
 
 function waitForPromiseOrAbort<T>(
@@ -2513,17 +2159,6 @@ function waitForPromiseOrAbort<T>(
 			},
 		);
 	});
-}
-
-function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
-	const parentContextTokens =
-		parentUsage.totalTokens ||
-		parentUsage.input + parentUsage.output + parentUsage.cacheRead + parentUsage.cacheWrite;
-	// Recursive children are launched from an assistant tool call, so the parent assistant
-	// message carries their billable usage for session-level cost totals.
-	addAssistantUsage(parentUsage, childUsage);
-	// Child work affects session-level billable totals, not the parent's model-facing context size.
-	parentUsage.totalTokens = parentContextTokens;
 }
 
 /**
@@ -2788,7 +2423,7 @@ export class AgentSession {
 	 * Child replies this session queued but has not delivered yet. Delivery credits
 	 * the sender's reply count, which a `queued` receipt deliberately did not (B1).
 	 */
-	private readonly _queuedChildReplyBackfills = new QueuedParentReplyBackfills();
+	readonly _queuedChildReplyBackfills = new QueuedParentReplyBackfills();
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 	/** Outcome disclosures whose session-file append failed; retained for context rebuilds. */
 	private readonly _unpersistedOutcomes: CustomMessage[] = [];
@@ -2854,12 +2489,12 @@ export class AgentSession {
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
-	private _disposed = false;
+	_disposed = false;
 	private readonly _disposeCallbacks = new Set<() => void | Promise<void>>();
 	private _disposeCallbacksPromise?: Promise<void>;
 	// Set at the start of async teardown so a child finishing mid-disposeAsync doesn't
 	// re-populate the retained map after it's been cleared.
-	private _disposing = false;
+	_disposing = false;
 	private _disposeAsyncPromise?: Promise<void>;
 	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
 	/** Artifact dir backing the current provisioner's kernel snapshot, if any. */
@@ -2867,12 +2502,12 @@ export class AgentSession {
 	/** True once the runtime has been built once; later builds are in-process rebuilds (/reload). */
 	private _ipythonRuntimeBuilt = false;
 	private readonly _prewarmIpythonKernel: boolean;
-	private _rlmDepth: number;
+	_rlmDepth: number;
 	private readonly _configuredRlmMaxDepth: number | undefined;
-	private _rlmMaxDepth: number;
+	_rlmMaxDepth: number;
 	private _rlmMaxDepthSource: RlmMaxDepthSource;
 	/** Cap on simultaneously live children; 0 disables it (SC-1). */
-	private readonly _rlmMaxConcurrentChildren: number;
+	readonly _rlmMaxConcurrentChildren: number;
 	/**
 	 * Ceiling an ancestor imposed on this session *after* it was admitted (SC-2). A child
 	 * snapshots its parent's cap at spawn; a later reduction on the ancestor would otherwise
@@ -2884,11 +2519,11 @@ export class AgentSession {
 	private _rlmSessionDir?: string;
 	/** True when `_rlmSessionDir` is this session's own `prime-agent-rlm-*` tmpdir (RC-6). */
 	private _rlmSessionDirEphemeral = false;
-	private readonly _semanticEdges: SemanticEdgeRecorder;
+	readonly _semanticEdges: SemanticEdgeRecorder;
 	private _rlmParentNodeId?: string;
 	private _rlmParentAgent?: string;
 	private _repliedToParentSinceTask: boolean | undefined;
-	private _parentReplyCount = 0;
+	_parentReplyCount = 0;
 	/**
 	 * Stall-watchdog abort facts for the turn in flight, if the watchdog fired.
 	 * `settled` flips false when the watchdog reports abort_unsettled, so a run
@@ -2945,8 +2580,8 @@ export class AgentSession {
 	 * already reset by the time the notice is composed.
 	 */
 	private _terminalFailureAttemptCount = 0;
-	private _subagentRuntimeHost?: SubagentRuntimeHost;
-	private _activeRlmChildRuns = new Map<string, RlmChildRun>();
+	_subagentRuntimeHost?: SubagentRuntimeHost;
+	_activeRlmChildRuns = new Map<string, RlmChildRun>();
 	/**
 	 * Runs whose child was deleted or released, newest last. A terminal notice about
 	 * such a child is still published after it is gone (the queue drains later), and
@@ -2956,10 +2591,10 @@ export class AgentSession {
 	private readonly _retiredRlmChildRuns = new Map<string, RetiredRlmChildRun>();
 	/** Wall-clock ms of the last accepted progress note; throttles rlm.progress.note. */
 	private _lastRlmProgressNoteAt: number | undefined;
-	private _unsettledRlmChildRuns = new Set<RlmChildRun>();
+	_unsettledRlmChildRuns = new Set<RlmChildRun>();
 	private _abandonedRlmQuiescenceChildIds = new Set<string>();
 	private _rlmQuiescenceWaitAborts = new Set<AbortController>();
-	private _pendingRlmSubagentSessionNames = new Set<string>();
+	_pendingRlmSubagentSessionNames = new Set<string>();
 	/**
 	 * Every child session name this session has ever admitted or learned of
 	 * (deleted and idle-closed bearers included). The timeline keys a child's
@@ -2973,8 +2608,8 @@ export class AgentSession {
 	private _rlmHistoricalChildNamesSeeded = false;
 	// Inline mode keeps finished child sessions so the inspector can still read them;
 	// the daemon does the same by leaving the child session resident in its registry.
-	private _rlmChildSessions = new Map<string, RetainedRlmChild>();
-	private _deletedRlmChildIds = new Set<string>();
+	_rlmChildSessions = new Map<string, RetainedRlmChild>();
+	_deletedRlmChildIds = new Set<string>();
 	/**
 	 * Terminal children `pruneRlmSubagents` retired from every roster view. The mark
 	 * hides the row only: collect keeps the result, deletion still resolves through
@@ -2994,7 +2629,7 @@ export class AgentSession {
 	>();
 	// Kept alive for retained children so nested updates (e.g. a grandchild cancel)
 	// still forward to root; torn down when the retained child is disposed.
-	private _rlmChildUnsubscribes = new Map<string, () => void>();
+	_rlmChildUnsubscribes = new Map<string, () => void>();
 	/**
 	 * What `rlm.collect` reports for a finished child the daemon closed after it sat
 	 * idle. Closing drops the child from both live maps, but its result is still the
@@ -3477,7 +3112,7 @@ export class AgentSession {
 		this.agent.shouldStopAfterTurn = (context) => this._shouldStopAfterTurn(context);
 	}
 
-	private _emit(event: AgentSessionEvent): void {
+	_emit(event: AgentSessionEvent): void {
 		for (const l of this._eventListeners) {
 			try {
 				l(event);
@@ -3666,7 +3301,7 @@ export class AgentSession {
 	 * The cap this session may actually spawn under: its own resolved depth, tightened by any
 	 * ceiling an ancestor pushed after admission (SC-2).
 	 */
-	private _effectiveRlmMaxDepth(): number {
+	_effectiveRlmMaxDepth(): number {
 		return this._rlmMaxDepthCeiling === undefined
 			? this._rlmMaxDepth
 			: Math.min(this._rlmMaxDepth, this._rlmMaxDepthCeiling);
@@ -3677,7 +3312,7 @@ export class AgentSession {
 	 * must lift the ceiling again, or a subtree would stay confined by a limit nobody can see.
 	 * Nothing is rebuilt when the effective cap is unchanged, so idempotent pushes stay cheap.
 	 */
-	private _applyRlmMaxDepthCeiling(maxDepth: number): void {
+	_applyRlmMaxDepthCeiling(maxDepth: number): void {
 		const previousEffective = this._effectiveRlmMaxDepth();
 		this._rlmMaxDepthCeiling = maxDepth;
 		if (this._effectiveRlmMaxDepth() === previousEffective) return;
@@ -3688,7 +3323,7 @@ export class AgentSession {
 	}
 
 	/** Admitted children that have not settled yet - the population SC-1 bounds. */
-	private _liveRlmChildRunCount(): number {
+	_liveRlmChildRunCount(): number {
 		const live = new Set<RlmChildRun>();
 		for (const run of this._unsettledRlmChildRuns) {
 			if (!run.settled) live.add(run);
@@ -4585,7 +4220,7 @@ export class AgentSession {
 		}
 	}
 
-	private _maybeResumeGoalContinuationAfterRlmWork(): void {
+	_maybeResumeGoalContinuationAfterRlmWork(): void {
 		if (!this._goalContinuationAwaitsRlmWork) return;
 		if (this._disposed || this._disposing || this._hasUnsettledRlmQuiescenceWork()) return;
 		if (this._goalState.status !== "active" || !this._goalState.objective) {
@@ -4679,7 +4314,7 @@ export class AgentSession {
 	}
 
 	/** Deliver the owed continuation once descendant work settles. */
-	private _maybeResumeAutonomousContinuationAfterRlmWork(): void {
+	_maybeResumeAutonomousContinuationAfterRlmWork(): void {
 		if (!this._autonomousContinuationAwaitsRlmWork) return;
 		if (this._disposed || this._disposing || this._hasUnsettledRlmQuiescenceWork()) return;
 		if (!this._autonomousState.enabled || this._goalOwnsContinuationWakeup()) {
@@ -7820,7 +7455,7 @@ export class AgentSession {
 		}
 	}
 
-	private _findLastAssistantMessage(): AssistantMessage | undefined {
+	_findLastAssistantMessage(): AssistantMessage | undefined {
 		const messages = this.agent.state.messages;
 		for (let i = messages.length - 1; i >= 0; i--) {
 			const msg = messages[i];
@@ -9833,7 +9468,7 @@ export class AgentSession {
 	 * whether the silence is genuine work or a wedge is the parent's call, and the
 	 * parent holds the lever (`rlm.delete_subagent`) for the wedge case.
 	 */
-	private _notifyRlmChildStall(
+	_notifyRlmChildStall(
 		run: RlmChildRun,
 		child: AgentSession,
 		sessionName: string,
@@ -9986,7 +9621,7 @@ export class AgentSession {
 		return undefined;
 	}
 
-	private async _deferRlmTerminalNotice(message: CustomMessage): Promise<void> {
+	async _deferRlmTerminalNotice(message: CustomMessage): Promise<void> {
 		this._assertRlmTerminalNotice(message);
 		const fence = await this._acquireRlmTerminalNoticeRetentionFence();
 		if (!fence) return;
@@ -17222,7 +16857,7 @@ export class AgentSession {
 	 * its unique basename, so a refusal after creation must remove it again: a refused spawn
 	 * that leaves `sub-xxxxxxxx` behind is a disk leak with no owner.
 	 */
-	private async _admitChildRlmSessionDir(
+	async _admitChildRlmSessionDir(
 		requestedSessionName: string | undefined,
 		prompt: string,
 		signal: AbortSignal | undefined,
@@ -17295,13 +16930,13 @@ export class AgentSession {
 		return this._currentRecap;
 	}
 
-	private _findAssistantEntryForMessage(message: AssistantMessage): SessionMessageEntry | undefined {
+	_findAssistantEntryForMessage(message: AssistantMessage): SessionMessageEntry | undefined {
 		return this.sessionManager
 			.getEntries()
 			.find((entry): entry is SessionMessageEntry => entry.type === "message" && entry.message === message);
 	}
 
-	private _createRlmSubagentRuntimeOptions(options: {
+	_createRlmSubagentRuntimeOptions(options: {
 		id: string;
 		prompt: string;
 		sessionName: string;
@@ -17341,7 +16976,7 @@ export class AgentSession {
 		};
 	}
 
-	private async _createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime> {
+	async _createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime> {
 		if (this._subagentRuntimeHost) {
 			return await this._subagentRuntimeHost.createRlmSubagentRuntime(options);
 		}
@@ -17510,7 +17145,7 @@ export class AgentSession {
 		return { cancelled, failures, depth };
 	}
 
-	private _cancelRlmChildRun(run: RlmChildRun, reason: string): boolean {
+	_cancelRlmChildRun(run: RlmChildRun, reason: string): boolean {
 		// Cancellation is an idempotent terminal transition while the detached
 		// run remains tracked. Concurrent callers must not mistake a previously
 		// accepted cancellation for a completed child and start conflicting cleanup.
@@ -17537,7 +17172,7 @@ export class AgentSession {
 	 * cancelled. Per-session try/catch so a child that cannot be stopped still
 	 * leaves a trace instead of failing the publish path.
 	 */
-	private _abortRlmChildSessionOnPublish(run: RlmChildRun, child: AgentSession): void {
+	_abortRlmChildSessionOnPublish(run: RlmChildRun, child: AgentSession): void {
 		try {
 			void child.abort();
 		} catch (error) {
@@ -17632,7 +17267,7 @@ export class AgentSession {
 		return this._activeRlmChildRuns.get(childId)?.status;
 	}
 
-	private async _currentActiveSessionId(): Promise<string | undefined> {
+	async _currentActiveSessionId(): Promise<string | undefined> {
 		try {
 			return (await this._agentMessageController?.listAgents())?.current?.activeSessionId;
 		} catch {
@@ -18360,7 +17995,7 @@ export class AgentSession {
 		return session?.disposeAsync() ?? Promise.resolve();
 	}
 
-	private _ensureRlmRunDeletionCleanup(run: RlmChildRun, session: AgentSession): Promise<void> {
+	_ensureRlmRunDeletionCleanup(run: RlmChildRun, session: AgentSession): Promise<void> {
 		if (run.deletionCleanup) return run.deletionCleanup;
 		const cleanup = Promise.resolve().then(() => this._deleteRlmSubagentSession(run.id, session));
 		run.deletionCleanup = cleanup;
@@ -18394,7 +18029,7 @@ export class AgentSession {
 		await run.reportDeletionCleanupFailure?.(error);
 	}
 
-	private async _finishRlmRunDeletion(run: RlmChildRun): Promise<void> {
+	async _finishRlmRunDeletion(run: RlmChildRun): Promise<void> {
 		await run.completeDeletion?.();
 		if (this._activeRlmChildRuns.get(run.id) === run) {
 			this._removeRlmSubagentTracking(run.id, run);
@@ -18407,7 +18042,7 @@ export class AgentSession {
 		this._maybeResumeAutonomousContinuationAfterRlmWork();
 	}
 
-	private _observeRlmRunDeletionCleanup(
+	_observeRlmRunDeletionCleanup(
 		run: RlmChildRun,
 		subagent: RlmSubagentRegistryEntry,
 		session: AgentSession,
@@ -18473,7 +18108,7 @@ export class AgentSession {
 		);
 	}
 
-	private _removeRlmSubagentTracking(childId: string, run?: RlmChildRun): void {
+	_removeRlmSubagentTracking(childId: string, run?: RlmChildRun): void {
 		this._retireRlmChildRun(
 			childId,
 			run ?? this._activeRlmChildRuns.get(childId) ?? this._rlmChildSessions.get(childId)?.run,
@@ -18826,7 +18461,7 @@ export class AgentSession {
 	 * `unsettled` stage is the "killed but never stopped" fact: it revokes
 	 * `settled` so a survivor is not reported dead and a non-survivor still is.
 	 */
-	private _recordRlmChildStallEvent(
+	_recordRlmChildStallEvent(
 		run: RlmChildRun,
 		child: AgentSession,
 		stage: "warn" | "abort" | "unsettled",
@@ -18902,7 +18537,7 @@ export class AgentSession {
 	 * still gate everything, so a parent that aborted itself is not woken by its
 	 * own kill and an explicit delete keeps its own notice path.
 	 */
-	private async _deliverRlmChildTerminalOutcome(input: {
+	async _deliverRlmChildTerminalOutcome(input: {
 		run: RlmChildRun;
 		child: AgentSession | undefined;
 		sessionName: string;
@@ -19005,7 +18640,7 @@ export class AgentSession {
 		this._recordDutyEvent({ kind: "child_auto_delivered", child: sessionName });
 	}
 
-	private _rlmChildSnapshotForRun(
+	_rlmChildSnapshotForRun(
 		run: RlmChildRun,
 		child = run.session ?? this._rlmChildSessions.get(run.id)?.session,
 	): RlmChildAgentSnapshot {
@@ -19042,7 +18677,7 @@ export class AgentSession {
 	 * per chunk, O(text^2) over a long answer - while the preview only depends on the
 	 * first collapsed characters; the incremental accumulator folds just the new text.
 	 */
-	private _rlmChildStreamingPreviewText(
+	_rlmChildStreamingPreviewText(
 		run: RlmChildRun,
 		event: Extract<AgentSessionEvent, { type: "message_start" | "message_update" }>,
 	): string {
@@ -19060,7 +18695,7 @@ export class AgentSession {
 	}
 
 	/** The volatile snapshot fields as they stand right now. */
-	private _rlmChildEmitFields(run: RlmChildRun, child: AgentSession | undefined): RlmChildEmitFields {
+	_rlmChildEmitFields(run: RlmChildRun, child: AgentSession | undefined): RlmChildEmitFields {
 		return {
 			model: child?.model ?? run.model,
 			sessionName: child?.sessionName ?? run.sessionName,
@@ -19412,7 +19047,7 @@ export class AgentSession {
 	 * deleted or closed is the spawn record its cell left (an "ok" subagent
 	 * activity's label is the admitted name).
 	 */
-	private _rlmHistoricalChildNamesNow(): Set<string> {
+	_rlmHistoricalChildNamesNow(): Set<string> {
 		if (this._rlmHistoricalChildNamesSeeded) return this._rlmHistoricalChildNames;
 		this._rlmHistoricalChildNamesSeeded = true;
 		for (const entry of this.sessionManager.getBranch()) {
@@ -19441,7 +19076,7 @@ export class AgentSession {
 	 * that fails either check is skipped. The returned name stays reserved until
 	 * the caller's reservation release runs.
 	 */
-	private async _mintRlmSuccessorSessionName(requested: string | undefined): Promise<string | undefined> {
+	async _mintRlmSuccessorSessionName(requested: string | undefined): Promise<string | undefined> {
 		if (requested === undefined) return undefined;
 		const historical = this._rlmHistoricalChildNamesNow();
 		if (!historical.has(requested)) return undefined;
@@ -19461,7 +19096,7 @@ export class AgentSession {
 		return undefined;
 	}
 
-	private async _assertRlmSubagentSessionNameAvailable(name: string, ignorePendingReservation = false): Promise<void> {
+	async _assertRlmSubagentSessionNameAvailable(name: string, ignorePendingReservation = false): Promise<void> {
 		const depth = this._rlmDepth + 1;
 		if (!ignorePendingReservation && this._pendingRlmSubagentSessionNames.has(name)) {
 			// Only reachable for a generated name (the explicit-name path checks the reservation
@@ -19519,7 +19154,7 @@ export class AgentSession {
 		};
 	}
 
-	private async _resolveRlmSubagentModel(
+	async _resolveRlmSubagentModel(
 		reference: string | undefined,
 		target = "subagent",
 	): Promise<RlmSubagentModelSelection> {
@@ -19573,558 +19208,7 @@ export class AgentSession {
 		spawnCode?: string,
 		signal?: AbortSignal,
 	): Promise<RlmSpawnHandle> {
-		signal?.throwIfAborted();
-		// Snapshot before any await: the spawning request is the turn whose tool call is
-		// executing now. A spawn arriving outside an active run (a detached kernel task
-		// firing while the parent is idle) has no such turn; an absent edge beats a wrong one.
-		const spawnedByRequestId = this.isStreaming ? this._semanticEdges.lastTurnRequestId : undefined;
-		const { name: rawName, model: rawModel, thinking: rawThinking, ...unsupported } = kwargs;
-		const unsupportedKwargs = Object.keys(unsupported);
-		if (unsupportedKwargs.length > 0) {
-			throw new Error(`Unsupported rlm.run kwargs: ${unsupportedKwargs.sort().join(", ")}`);
-		}
-		const requestedSessionName = normalizeRequestedRlmSubagentSessionName(rawName);
-		const requestedModel = normalizeRequestedRlmSubagentModel(rawModel);
-		const requestedThinkingLevel = normalizeRequestedRlmSubagentThinkingLevel(rawThinking);
-		if (requestedSessionName) assertDirectAgentMessageTarget(requestedSessionName);
-		// The gate reads the *effective* cap, not the value this session resolved for itself:
-		// an ancestor that lowered its max depth after this session was admitted pushes a
-		// ceiling, and a spawn under that ceiling must be refused now (SC-2).
-		const grantedMaxDepth = this._effectiveRlmMaxDepth();
-		if (this._rlmDepth >= grantedMaxDepth) {
-			const ceilingNote =
-				grantedMaxDepth < this._rlmMaxDepth
-					? `; an ancestor session lowered this subtree's cap to ${grantedMaxDepth} after this session was admitted`
-					: "";
-			throw new Error(
-				`RLM recursion depth limit reached (RLM_DEPTH=${this._rlmDepth}, RLM_MAX_DEPTH=${this._rlmMaxDepth}${ceilingNote})`,
-			);
-		}
-		// Depth bounds how deep the tree goes, never how wide one session fans out: without
-		// this gate a single turn could admit children without limit into an unbounded map.
-		// Refusing loudly (instead of queueing) keeps the fleet observable: a queued spawn
-		// looks identical to a running one from the parent's side.
-		if (this._rlmMaxConcurrentChildren > 0) {
-			const liveChildren = this._liveRlmChildRunCount();
-			if (liveChildren >= this._rlmMaxConcurrentChildren) {
-				throw new Error(
-					`RLM subagent limit reached: this session already has ${liveChildren} live children and the concurrency cap is ${this._rlmMaxConcurrentChildren}. ` +
-						"Fan-out is refused rather than queued, so the family stays observable: wait for one to settle with `await rlm.collect()`, " +
-						'stop one with `await rlm.delete_subagent("<name-or-id>")`, or raise the cap with RLM_MAX_CHILDREN (or the rlmMaxChildren session config); 0 disables the cap.',
-				);
-			}
-		}
-		if (requestedSessionName) {
-			if (this._pendingRlmSubagentSessionNames.has(requestedSessionName)) {
-				throw new Error(formatAgentSessionNameReserved(requestedSessionName, this._rlmDepth + 1));
-			}
-			this._pendingRlmSubagentSessionNames.add(requestedSessionName);
-		}
-		// The name stays reserved until the spawn admission settles: the detached
-		// runtime task releases it when admission completes (success or failure),
-		// and every pre-admission failure path releases it here. Nothing durable
-		// records the checked name in between - the child run is not registered yet
-		// and the ledger spawn edge only lands at daemon admission - so releasing
-		// earlier lets two parallel same-name spawns both pass availability and both
-		// append a durable edge, leaving delete/agent_message selectors ambiguous.
-		// A minted successor name is reserved the same way.
-		let mintedSessionName: string | undefined;
-		const releaseReservedSessionName = () => {
-			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
-			if (mintedSessionName) this._pendingRlmSubagentSessionNames.delete(mintedSessionName);
-		};
-		let modelSelection: RlmSubagentModelSelection;
-		let childSessionDir = "";
-		let childNodeId = "";
-		let sessionName = "";
-		try {
-			if (requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(requestedSessionName, true);
-			// The requested name is free, but a child of this session may have worn it
-			// before (deleted or idle-closed since): the timeline keys a child's
-			// dispatch row, lane and return rows by name, and an exactly recycled
-			// name would merge the new child into the old one's rows. The successor
-			// takes a numbered name instead.
-			mintedSessionName = await this._mintRlmSuccessorSessionName(requestedSessionName);
-			// An unpinned spawn model resolves against the persisted subagent
-			// default; an unavailable default fails the spawn instead of silently
-			// inheriting the parent model.
-			modelSelection = await this._resolveRlmSubagentModel(
-				requestedModel ?? this.settingsManager.getSubagentDefaultModel(),
-			);
-			signal?.throwIfAborted();
-			if (requestedThinkingLevel !== undefined) {
-				const supported = getSupportedThinkingLevels(modelSelection.model) as ThinkingLevel[];
-				if (!supported.includes(requestedThinkingLevel)) {
-					throw new Error(
-						`Requested thinking level "${requestedThinkingLevel}" is not supported by model "${modelSelection.model.provider}/${modelSelection.model.id}"; supported levels: ${supported.join(", ")}`,
-					);
-				}
-			}
-			if (this._disposed || this._disposing) {
-				throw new Error("Cannot spawn a subagent after its parent was disposed");
-			}
-			const admitted = await this._admitChildRlmSessionDir(
-				mintedSessionName ?? requestedSessionName,
-				prompt,
-				signal,
-			);
-			childSessionDir = admitted.childSessionDir;
-			childNodeId = admitted.childNodeId;
-			sessionName = admitted.sessionName;
-			this._rlmHistoricalChildNamesNow().add(sessionName);
-		} catch (error) {
-			releaseReservedSessionName();
-			throw error;
-		}
-		const startedAt = Date.now();
-		const parentAssistantForUsage = this._findLastAssistantMessage();
-		let runningToolCount = 0;
-		let childSession: AgentSession | undefined;
-		const startedMonotonicAt = performance.now();
-		const run: RlmChildRun = {
-			id: childNodeId,
-			prompt,
-			sessionName,
-			sessionDir: childSessionDir,
-			model: modelSelection.model,
-			status: "queued",
-			toolUseCount: 0,
-			progressNotes: [],
-			// Seed the staleness clock at admission: a child hung before its
-			// first tracked event still crosses the threshold once running.
-			lastActivityAt: startedAt,
-			lastActivityMonotonicAt: startedMonotonicAt,
-			settled: false,
-			abort: noopRlmChildAbort,
-			publication: createAgentMessageDeferred(),
-			settlement: createAgentMessageDeferred(),
-			deletionReservation: createAgentMessageDeferred(),
-		};
-		const throwIfCancelled = () => {
-			if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
-		};
-		this._activeRlmChildRuns.set(run.id, run);
-		this._unsettledRlmChildRuns.add(run);
-		// The kernel host aborts its in-flight requests on teardown; cancel the
-		// admitted run with it so a disposed host never leaves a live child behind.
-		const abortFromHost = () => {
-			const reason = signal?.reason;
-			this._cancelRlmChildRun(run, reason instanceof Error ? reason.message : "IPython kernel host request aborted");
-		};
-		if (signal?.aborted) {
-			abortFromHost();
-		} else {
-			signal?.addEventListener("abort", abortFromHost, { once: true });
-		}
-		const emitChildUpdate = () => {
-			// Streaming chunks mostly change nothing the wire can see: the preview is
-			// capped after the first ~160 characters and the label is a run-level
-			// constant. Comparing the volatile fields first keeps the per-chunk cost
-			// off the snapshot build and the JSON.stringify of the full brief.
-			const child = run.session ?? this._rlmChildSessions.get(run.id)?.session;
-			const fields = this._rlmChildEmitFields(run, child);
-			if (rlmChildEmitFieldsEqual(fields, run.lastEmittedFields)) return;
-			const snapshot = this._rlmChildSnapshotForRun(run, child);
-			const serialized = JSON.stringify(snapshot);
-			rlmChildDeriveCounts.snapshotSerialize += 1;
-			run.lastEmittedFields = fields;
-			if (serialized === run.lastEmittedUpdate) return;
-			run.lastEmittedUpdate = serialized;
-			this._emit({ type: "rlm_child_update", child: snapshot });
-		};
-		run.emitUpdate = emitChildUpdate;
-		emitChildUpdate();
-
-		const publishChildSession = (child: AgentSession) => {
-			childSession = child;
-			// The child was granted the cap in force at admission. If an ancestor tightened it
-			// while this run was still starting up, the child must not keep the wider grant
-			// (SC-2); an unchanged cap pushes nothing, so a child that later raises its own
-			// cap is still only limited by whatever its parent actually imposes.
-			const currentCap = this._effectiveRlmMaxDepth();
-			if (currentCap < grantedMaxDepth) child._applyRlmMaxDepthCeiling(currentCap);
-			const tracked = this._activeRlmChildRuns.get(run.id) === run;
-			// Cancellation admitted while runtime construction was blocked must stop
-			// the child even when the run already left _activeRlmChildRuns (a cascade
-			// that settled it, or an abort race): map membership is not evidence that
-			// anything ever reached this child. The wiring below stays behind the
-			// tracked guard, so a late publication cannot revive a settled run's
-			// accounting (session/abort/unsubscribe) and hide a live child session
-			// from its parent.
-			if (run.status === "cancelled") this._abortRlmChildSessionOnPublish(run, child);
-			if (!tracked) return;
-			run.session = child;
-			run.abort = () => void child.abort();
-			run.publication.resolve();
-		};
-		const subagentOptions: CreateRlmSubagentRuntimeOptions = {
-			...this._createRlmSubagentRuntimeOptions({
-				id: childNodeId,
-				prompt,
-				sessionName,
-				spawnCode,
-				sessionDir: childSessionDir,
-				model: modelSelection.model,
-				thinkingLevel: requestedThinkingLevel,
-				spawnedByRequestId,
-			}),
-			onSessionPublished: publishChildSession,
-		};
-
-		const deliverTerminalMessageToParent = async (message: CustomMessage): Promise<void> => {
-			// Synthesized lifecycle notices always use the parent's private durable
-			// path. Explicit child replies continue through agent_message separately.
-			await this._deferRlmTerminalNotice(message);
-		};
-
-		run.completeDeletion = () => {
-			if (!run.deletionNeedsCompletionNotice || run.suppressTerminalNotice || this._disposed || this._disposing) {
-				return Promise.resolve();
-			}
-			if (run.deletionNotice) return run.deletionNotice;
-			const notice = deliverTerminalMessageToParent(
-				createRlmChildTerminalNoticeMessage({
-					kind: "cancelled",
-					childId: run.id,
-					sessionName,
-					reason: run.error ?? "Deleted by parent orchestrator",
-				}),
-			);
-			run.deletionNotice = notice;
-			return notice;
-		};
-
-		run.reportDeletionCleanupFailure = (error) => {
-			if (run.suppressTerminalNotice || this._disposed || this._disposing) return Promise.resolve();
-			if (run.deletionFailureNotice) return run.deletionFailureNotice;
-			const cleanupError = error instanceof Error ? error.message : String(error);
-			const notice = deliverTerminalMessageToParent(
-				createRlmChildFailureMessage({
-					childId: run.id,
-					sessionName,
-					error: `Deletion cleanup failed; retry rlm.delete_subagent("${run.id}") before completion: ${cleanupError}`,
-				}),
-			);
-			run.deletionFailureNotice = notice;
-			return notice;
-		};
-
-		// Runtime startup and the task run are deliberately detached. The public
-		// spawn resolves at admission, while this task owns live tracking, usage,
-		// retention, cancellation, and late-startup cleanup.
-		void (async () => {
-			let childRuntime: RlmSubagentRuntime | undefined;
-			// Hoisted out of the try: the terminal classification runs in both the
-			// success and the failure branch and needs the reply baseline either way.
-			let parentReplyCountBeforeRun = 0;
-			try {
-				try {
-					childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
-				} finally {
-					// Admission settled: in daemon mode the spawn edge is now
-					// durable, so the name transfers from the pending reservation
-					// to the admitted run. A failed admission frees the name.
-					releaseReservedSessionName();
-				}
-				const child = childRuntime.session;
-				if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
-				if (child.sessionName !== sessionName) child.setSessionName(sessionName);
-				this._shareFallbackEpisodeWith(child);
-				publishChildSession(child);
-				throwIfCancelled();
-				run.status = "running";
-				emitChildUpdate();
-				const unsubscribeChildEvents = child.subscribe((event) => {
-					if (event.type === "rlm_child_update") {
-						this._emit(event);
-						return;
-					}
-					if (event.type === "stall_warning") {
-						this._recordRlmChildStallEvent(run, child, "warn", event);
-						this._notifyRlmChildStall(run, child, sessionName, event);
-						return;
-					}
-					if (event.type === "stall_abort") {
-						this._recordRlmChildStallEvent(run, child, "abort", event);
-						return;
-					}
-					if (event.type === "stall_unsettled") {
-						// P1-6: "the abort fired but the run never settled" must leave a
-						// mark on the parent side, or the kill is invisible and the
-						// terminal classifier has nothing to rank above "no reply".
-						run.error ??= "stall watchdog aborted the turn but it did not settle";
-						this._recordRlmChildStallEvent(run, child, "unsettled", event);
-						return;
-					}
-					if (event.type === "agent_start") {
-						run.activity = { kind: "waiting" };
-						// A recovered child is no longer stalled; the forensic record stays
-						// so the terminal classification can still see an unsettled abort.
-						run.stall = undefined;
-						touchRlmChildActivity(run);
-						emitChildUpdate();
-					} else if (event.type === "agent_end") {
-						run.activity = undefined;
-						touchRlmChildActivity(run);
-						emitChildUpdate();
-					} else if (event.type === "rlm_progress_note") {
-						// Guarded init instead of `??=` inside the call expression:
-						// biome's noAssignInExpressions rejects an assignment used as
-						// an expression, and a hand-built run record has no ring yet.
-						if (!run.progressNotes) run.progressNotes = [];
-						run.progressNotes.push(event.message);
-						if (run.progressNotes.length > RLM_CHILD_PROGRESS_NOTE_RING_MAX) {
-							run.progressNotes.shift();
-						}
-						touchRlmChildActivity(run);
-						emitChildUpdate();
-					} else if (event.type === "message_end" && event.message.role === "assistant") {
-						const assistant = event.message as AssistantMessage;
-						if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") {
-							attributeChildUsage(parentAssistantForUsage?.usage ?? emptyUsage(), assistant.usage);
-							if (parentAssistantForUsage) {
-								// Resolved once per run: the parent message is a run-level constant, while
-								// the lookup copies and scans every entry the session has ever written.
-								// A long child run used to pay that scan for every assistant message it
-								// emitted (a session with 56k attributed messages spent minutes here).
-								run.parentUsageEntry ??= this._findAssistantEntryForMessage(parentAssistantForUsage);
-								const parentEntry = run.parentUsageEntry;
-								if (parentEntry) {
-									const messages = child.messages;
-									const assistantIndex = messages.lastIndexOf(assistant);
-									const precedingPrompt = messages
-										.slice(0, assistantIndex)
-										.reverse()
-										.find((message) => message.role === "user" || message.role === "custom");
-									const origin =
-										precedingPrompt?.role === "custom" && isAgentSessionMessage(precedingPrompt)
-											? precedingPrompt.details.id.startsWith("spawn:")
-												? "spawn_task"
-												: "agent_message"
-											: "direct_user";
-									this.sessionManager.appendChildUsageAttribution(
-										parentEntry.id,
-										assistant.usage,
-										parentAssistantForUsage.usage,
-										origin,
-									);
-								}
-							}
-						}
-						const text = compactRlmText(readAssistantText(assistant));
-						if (text) run.answerPreview = text;
-						touchRlmChildActivity(run);
-						emitChildUpdate();
-					} else if (event.type === "message_start" || event.type === "message_update") {
-						if (event.message.role === "assistant") {
-							const text = this._rlmChildStreamingPreviewText(run, event);
-							if (text) run.answerPreview = text;
-							run.activity = { kind: "writing" };
-							touchRlmChildActivity(run);
-							emitChildUpdate();
-						}
-					} else if (event.type === "tool_execution_start") {
-						run.toolUseCount += 1;
-						runningToolCount += 1;
-						run.activity = { kind: "executing", toolName: event.toolName };
-						touchRlmChildActivity(run);
-						emitChildUpdate();
-					} else if (event.type === "tool_execution_end") {
-						runningToolCount = Math.max(0, runningToolCount - 1);
-						if (runningToolCount === 0) run.activity = { kind: "waiting" };
-						touchRlmChildActivity(run);
-						emitChildUpdate();
-					} else if (event.type === "session_info_changed" || event.type === "recap_update") {
-						emitChildUpdate();
-					}
-				});
-				run.unsubscribe = unsubscribeChildEvents;
-				const content = `[task from parent]\n\n${prompt}`;
-				const spawnMessage: AgentSessionMessage = {
-					role: "custom",
-					customType: AGENT_MESSAGE_CUSTOM_TYPE,
-					content,
-					display: true,
-					details: {
-						id: `spawn:${run.id}`,
-						message: prompt,
-						from: {
-							sessionId: this.sessionId,
-							sessionName: this.sessionName,
-							activeSessionId: await this._currentActiveSessionId(),
-						},
-						fromRelationship: "parent",
-					},
-					timestamp: Date.now(),
-				};
-				throwIfCancelled();
-				parentReplyCountBeforeRun = child._parentReplyCount;
-				// The baseline and the credits owed have to describe the same run: a
-				// reply this child left in my queue during an earlier run belongs to
-				// that run's verdict (already delivered), so it must not credit this one.
-				const staleReplyCredits = this._queuedChildReplyBackfills.discardForSender(child.sessionId);
-				if (staleReplyCredits > 0) {
-					sessionLog.info("dropped queued reply credits left over from an earlier run", {
-						sessionId: this.sessionId,
-						childId: run.id,
-						childSessionId: child.sessionId,
-						dropped: staleReplyCredits,
-					});
-				}
-				await child.promptAndWait(content, {
-					expandPromptTemplates: false,
-					source: "extension",
-					customMessage: spawnMessage,
-				});
-				await child.waitForRlmQuiescence();
-				if (run.error) throw new Error(run.error);
-				run.status = "done";
-				// Only successful completions return; the edge lands on the parent's next commit.
-				const childLastCommitted = child.semanticEdges.lastCommittedRequestId;
-				if (childLastCommitted !== undefined) {
-					this._semanticEdges.recordChildReturned(child.sessionId, childLastCommitted);
-				}
-				run.durationMs = Date.now() - startedAt;
-				run.activity = undefined;
-				emitChildUpdate();
-				// A turn that ends with a graceful error message resolves promptAndWait,
-				// and so does a turn the stall watchdog aborted: both must be classified
-				// here or the parent never learns the task failed.
-				await this._deliverRlmChildTerminalOutcome({
-					run,
-					child,
-					sessionName,
-					parentReplyCountBeforeRun,
-					deliver: deliverTerminalMessageToParent,
-				});
-				if (!this.registerRlmChildSession(run.id, child) && !run.detachedDeletion) {
-					if (childRuntime && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
-						await this._subagentRuntimeHost
-							.releaseRlmSubagentRuntime(childRuntime, subagentOptions, "error")
-							.catch(() => void child.disposeAsync().catch(() => undefined));
-					} else {
-						await child.disposeAsync().catch(() => undefined);
-					}
-				}
-			} catch (error) {
-				const runError = error instanceof Error ? error : new Error(String(error));
-				run.publication.reject(runError);
-				if (run.status !== "cancelled") {
-					run.status = "error";
-					run.error = runError.message;
-				}
-				// A failed child still returns an error outcome the parent consumes;
-				// cancelled runs and zero-commit children return nothing.
-				const failedChild = childSession ?? childRuntime?.session;
-				const failedLastCommitted = failedChild?.semanticEdges.lastCommittedRequestId;
-				if (run.status === "error" && failedChild && failedLastCommitted !== undefined) {
-					this._semanticEdges.recordChildReturned(failedChild.sessionId, failedLastCommitted);
-				}
-				run.durationMs = Date.now() - startedAt;
-				run.activity = undefined;
-				if (run.status === "error" && childSession === undefined) {
-					// A pre-bind failure leaves no row: "cancelled" is the wire's removal signal.
-					this._emit({
-						type: "rlm_child_update",
-						child: { ...this._rlmChildSnapshotForRun(run), status: "cancelled" },
-					});
-				} else {
-					emitChildUpdate();
-				}
-				await this._deliverRlmChildTerminalOutcome({
-					run,
-					child: childSession ?? childRuntime?.session,
-					sessionName,
-					parentReplyCountBeforeRun,
-					deliver: deliverTerminalMessageToParent,
-				});
-				if (!run.detachedDeletion && childSession && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
-					try {
-						await this._subagentRuntimeHost.releaseRlmSubagentRuntime(
-							childRuntime ?? { session: childSession },
-							subagentOptions,
-							run.status === "cancelled" ? "cancelled" : "error",
-						);
-						if (run.status === "cancelled" && !this._disposed && !this._disposing) {
-							this._deletedRlmChildIds.add(run.id);
-							this._removeRlmSubagentTracking(run.id);
-						}
-					} catch {
-						await childSession?.disposeAsync().catch(() => undefined);
-					}
-				} else if (!run.detachedDeletion) {
-					try {
-						if (childRuntime && this._subagentRuntimeHost) {
-							await this._subagentRuntimeHost.deleteRlmSubagentRuntime(run.id, childRuntime.session);
-						} else if (childSession) {
-							await childSession.disposeAsync();
-						}
-						if (run.status === "cancelled" && !this._disposed && !this._disposing) {
-							this._deletedRlmChildIds.add(run.id);
-							this._removeRlmSubagentTracking(run.id);
-						}
-					} catch {
-						// A failed best-effort retry remains available through the retained cleanup maps.
-					}
-				}
-			} finally {
-				signal?.removeEventListener("abort", abortFromHost);
-				try {
-					// LAT-3: settle the coalesced child usage ledger so the file
-					// matches what a reload folds once the run is over, instead of
-					// holding deltas back for the next window flush.
-					this.sessionManager.flushChildUsageAttributions();
-				} catch {
-					// Best-effort: the deltas stay in memory and the next persist
-					// rewrites the whole transcript, backfilling them.
-				}
-				if (run.detachedDeletion) {
-					run.deletionRunFinished = true;
-					if (!run.settled) {
-						let cleanupSucceeded = !run.deletionCleanupFailed;
-						if (childRuntime && cleanupSucceeded) {
-							const cleanup =
-								run.deletionCleanup ?? this._ensureRlmRunDeletionCleanup(run, childRuntime.session);
-							cleanupSucceeded = await this._observeRlmRunDeletionCleanup(
-								run,
-								run.detachedDeletion,
-								childRuntime.session,
-								cleanup,
-							);
-						}
-						if (cleanupSucceeded) await this._finishRlmRunDeletion(run);
-					}
-				} else {
-					if (this._activeRlmChildRuns.get(run.id) === run) {
-						if (this._rlmChildSessions.has(run.id)) {
-							this._activeRlmChildRuns.delete(run.id);
-							if (run.unsubscribe) this._rlmChildUnsubscribes.set(run.id, run.unsubscribe);
-							run.abort = noopRlmChildAbort;
-							run.unsubscribe = undefined;
-							run.session = undefined;
-						} else if (run.status !== "error") {
-							this._removeRlmSubagentTracking(run.id, run);
-						} else {
-							run.unsubscribe?.();
-							run.abort = noopRlmChildAbort;
-							run.unsubscribe = undefined;
-						}
-					}
-					run.settled = true;
-					run.settlement.resolve();
-					this._unsettledRlmChildRuns.delete(run);
-					this._maybeResumeGoalContinuationAfterRlmWork();
-					this._maybeResumeAutonomousContinuationAfterRlmWork();
-				}
-			}
-		})().catch(() => undefined);
-
-		return {
-			rlm_child_id: childNodeId,
-			name: sessionName,
-			session_dir: childSessionDir,
-			model: `${modelSelection.model.provider}/${modelSelection.model.id}`,
-		};
+		return startRlmChildRun(this, prompt, kwargs, spawnCode, signal);
 	}
 
 	async createRlmSession(prompt: string, kwargs: Record<string, unknown> = {}): Promise<RlmCreateSessionResult> {
@@ -21782,7 +20866,7 @@ export class AgentSession {
 	 * fallback (the primary is failing right now), but knows the primary, so it
 	 * returns after the same cooldown instead of treating the backup as home.
 	 */
-	private _shareFallbackEpisodeWith(child: AgentSession): void {
+	_shareFallbackEpisodeWith(child: AgentSession): void {
 		const fallback = this._fallback;
 		if (!fallback || child._fallback || !modelsAreEqual(child.agent.state.model, fallback.current)) return;
 		child._fallback = {

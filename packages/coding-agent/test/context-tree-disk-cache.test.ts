@@ -318,7 +318,7 @@ describe("AgentSession.getContextTree with a resident child", () => {
 			// dropped), and there is nothing on disk to fall back to (retention, a
 			// hand-cleaned tree). The cell is best-effort, so the child reports no spend
 			// instead of the whole tree failing on a `scandir` of a directory that is gone.
-			const runs = Reflect.get(session, "_activeRlmChildRuns") as Map<string, Record<string, unknown>>;
+			const runs = Reflect.get(session, "_activeRlmChildRuns") as unknown as Map<string, Record<string, unknown>>;
 			const run = runs.get(spawned.rlm_child_id);
 			expect(run).toBeDefined();
 			Reflect.set(run as Record<string, unknown>, "session", undefined);
