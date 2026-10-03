@@ -1953,10 +1953,11 @@ describe("harness digest relevance ranking (#2241 phase 2 / upstream #2392 IDF /
 			]),
 		});
 		// Rare wins the window; recency order (the no-query path) would have
-		// shown common1 + common0 and dropped rare entirely.
-		expect(ranked).toContain("[global:rare]");
-		expect(ranked).toContain("[global:common0]");
-		expect(ranked).not.toContain("[global:common1]");
+		// shown common1 + common0 and dropped rare entirely. The compact index
+		// layer names every entry (common1 included), so the window assertions
+		// parse only the detail lines (column-0 bullets), not the index lines.
+		const detailIds = [...ranked.matchAll(/^- \[global:([a-z0-9]+)\]/gm)].map((match) => match[1]);
+		expect(detailIds).toEqual(["rare", "common0"]);
 		// The overflow window names the ranking and points at rlm.harness.search.
 		expect(ranked).toContain(
 			"(entries ranked by relevance to the current task; more via `rlm.harness.search(query, kind='memory')`, `global_=True` for the cross-session store)",
@@ -1974,8 +1975,9 @@ describe("harness digest relevance ranking (#2241 phase 2 / upstream #2392 IDF /
 		});
 		// Equal scores render in stable identifier order ([path, title, id]);
 		// updated_at recency must not hoist the newer entry into the window.
-		expect(ranked).toContain("[global:aaa]");
-		expect(ranked).not.toContain("[global:zzz]");
+		// Detail lines only: the compact index names zzz too, below the window.
+		const detailIds = [...ranked.matchAll(/^- \[global:([a-z]+)\]/gm)].map((match) => match[1]);
+		expect(detailIds).toEqual(["aaa"]);
 	});
 
 	it("keeps recency injection order and no ranked marker when no query terms are given", () => {
@@ -1988,9 +1990,9 @@ describe("harness digest relevance ranking (#2241 phase 2 / upstream #2392 IDF /
 			const rendered = formatHarnessStateForPrompt(state, { maxEntriesPerKind: 2, queryTerms });
 			// The default path is the fork's injection order: newest first, so
 			// the stale rare entry falls out of the window and nothing is marked.
-			expect(rendered).toContain("[global:common1]");
-			expect(rendered).toContain("[global:common0]");
-			expect(rendered).not.toContain("[global:rare]");
+			// Detail lines only: the compact index names rare below the window.
+			const detailIds = [...rendered.matchAll(/^- \[global:([a-z0-9]+)\]/gm)].map((match) => match[1]);
+			expect(detailIds).toEqual(["common1", "common0"]);
 			expect(rendered).not.toContain("entries ranked by relevance");
 		}
 	});
@@ -2009,11 +2011,14 @@ describe("harness digest relevance ranking (#2241 phase 2 / upstream #2392 IDF /
 			maxEntriesPerKind: 2,
 			queryTerms: new Map([["quantum", 1]]),
 		});
-		const ids = [...rendered.matchAll(/\[global:(m[123])\]/g)].map((match) => match[1]);
+		// Detail lines only: the compact index below the window names every entry.
+		const ids = [...rendered.matchAll(/^- \[global:(m[123])\]/gm)].map((match) => match[1]);
 		expect(ids).toEqual(["m3", "m2"]);
 		expect(rendered).not.toContain("entries ranked by relevance");
-		// The truncation stays visible: falling back must not hide the gap.
-		expect(rendered).toContain("+1 more memory entries (3 recorded");
+		// The gap stays visible: the index names m1 by id, and the index header
+		// names the kind's full size.
+		expect(rendered).toContain("all 3 memory entries by id + title");
+		expect(rendered).toContain("  - [global:m1] ");
 	});
 
 	it("keeps score order and the marker per kind when only some kinds match (OBS-1)", () => {
@@ -2038,12 +2043,14 @@ describe("harness digest relevance ranking (#2241 phase 2 / upstream #2392 IDF /
 			maxEntriesPerKind: 2,
 			queryTerms: new Map([["quantum", 1]]),
 		});
-		// Memory kind keeps the ranked window: the matching entry leads.
-		const memoryIds = [...rendered.matchAll(/\[global:(zq|a_old|m_new)\]/g)].map((match) => match[1]);
+		// Memory kind keeps the ranked window: the matching entry leads. Detail
+		// lines only (column-0 bullets): the compact index below the window names
+		// every entry, so an unanchored search would meet each id twice.
+		const memoryIds = [...rendered.matchAll(/^- \[global:(zq|a_old|m_new)\]/gm)].map((match) => match[1]);
 		expect(memoryIds).toEqual(["zq", "a_old"]);
 		// The prompt kind matched nothing: recency order (p3, p2) instead of
 		// the identifier tie-break (p1, p2).
-		const promptIds = [...rendered.matchAll(/\[global:(p[123])\]/g)].map((match) => match[1]);
+		const promptIds = [...rendered.matchAll(/^- \[global:(p[123])\]/gm)].map((match) => match[1]);
 		expect(promptIds).toEqual(["p3", "p2"]);
 		// The marker follows the kind it belongs to, not the render as a whole.
 		const lines = rendered.split("\n");

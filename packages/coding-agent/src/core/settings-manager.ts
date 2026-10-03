@@ -22,6 +22,10 @@ import { sleepSync } from "../utils/sleep.js";
 import { clampCompactionTriggerRatio } from "./compaction/compaction.js";
 import { DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS } from "./extensions/timeout.js";
 import { RETIRED_VENV_RETENTION } from "./kernel/venv-in-use.js";
+import { DEFAULT_HARNESS_INDEX_MAX_BYTES, DEFAULT_HARNESS_PATH_VOCABULARY } from "./refinement/refinement.js";
+
+export { DEFAULT_HARNESS_INDEX_MAX_BYTES, DEFAULT_HARNESS_PATH_VOCABULARY };
+
 import {
 	PROVIDER_LONG_WAIT_BASE_MS,
 	PROVIDER_LONG_WAIT_MAX_MS,
@@ -237,6 +241,31 @@ export interface AutoRefineSettings {
 	turnInterval?: number; // default: 25 assistant turns
 	compact?: boolean; // default: true
 	cooldownMs?: number; // default: 20 minutes
+}
+
+export interface HarnessSettings {
+	/**
+	 * Byte cap for the digest's compact id+title index layer and the write-side
+	 * growth gate (memory-recall-design.md stage 2). Default: 12288 (12 KiB) -
+	 * sized so the two-layer digest stays within the design red line (2x the
+	 * pre-stage-2 face) against the Claude Code 25KB / Codex 32KiB references.
+	 * `0` disables the index layer and the write gate.
+	 */
+	digestIndexMaxBytes?: number;
+	/**
+	 * Whether the index byte cap also rejects net-growth memory writes. Default
+	 * false: until the consolidation pass exists (memory design stage 3), the
+	 * cap only shapes the digest's display layer; enforcing it on a store
+	 * already past the cap would freeze all memory growth.
+	 */
+	enforceIndexCap?: boolean;
+	/**
+	 * Controlled first-segment vocabulary for entry paths; writes outside it get
+	 * an advisory receipt (never a block). Default: DEFAULT_HARNESS_PATH_VOCABULARY
+	 * in core/refinement. The Python kernel write path reads
+	 * PRIME_AGENT_HARNESS_PATH_VOCABULARY (comma-separated) instead.
+	 */
+	pathVocabulary?: string[];
 }
 
 export interface ProviderWaitSettings {
@@ -860,6 +889,8 @@ export interface Settings {
 	agentMessage?: AgentMessageSettings;
 	daemon?: DaemonSettings;
 	autoRefine?: AutoRefineSettings;
+	/** Continual-harness digest and write-path policy (memory-recall-design.md stage 2). */
+	harness?: HarnessSettings;
 	agentTraces?: AgentTracesSettings;
 	telemetry?: TelemetrySettings;
 	footer?: FooterSettings;
@@ -1176,6 +1207,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	agentMessage: ["targetWaitSeconds"],
 	daemon: ["eventGapRecovery", "supervisorRejectionExitThreshold", "failedWorkerReapHours", "failedWorkerReapEnabled"],
 	autoRefine: ["enabled", "turnInterval", "compact", "cooldownMs"],
+	harness: ["digestIndexMaxBytes", "enforceIndexCap", "pathVocabulary"],
 	agentTraces: ["enabled"],
 	telemetry: ["enabled", "noticeShown"],
 	footer: ["telemetry", "sessionSpend"],
@@ -2901,6 +2933,40 @@ export class SettingsManager {
 				typeof cooldownMs === "number" && Number.isFinite(cooldownMs) ? cooldownMs : 20 * 60_000,
 			),
 		};
+	}
+
+	/**
+	 * Byte cap for the harness digest's compact index layer and the write-side
+	 * growth gate. `0` is a real value (the kill switch); malformed or negative
+	 * values fall back to the default.
+	 */
+	getHarnessDigestIndexMaxBytes(): number {
+		const raw = this.settings.harness?.digestIndexMaxBytes;
+		if (typeof raw === "number" && Number.isFinite(raw) && raw >= 0) {
+			return Math.floor(raw);
+		}
+		return DEFAULT_HARNESS_INDEX_MAX_BYTES;
+	}
+
+	/** Whether the write-side index cap rejects net-growth memory writes (default false). */
+	getHarnessEnforceIndexCap(): boolean {
+		return this.settings.harness?.enforceIndexCap === true;
+	}
+
+	/**
+	 * Controlled first-segment path vocabulary. Non-string entries are dropped;
+	 * an empty (or absent-after-cleaning) list falls back to the default so the
+	 * advisory can never go silent-by-accident.
+	 */
+	getHarnessPathVocabulary(): string[] {
+		const raw = this.settings.harness?.pathVocabulary;
+		if (!Array.isArray(raw)) {
+			return [...DEFAULT_HARNESS_PATH_VOCABULARY];
+		}
+		const cleaned = [
+			...new Set(raw.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)),
+		];
+		return cleaned.length > 0 ? cleaned : [...DEFAULT_HARNESS_PATH_VOCABULARY];
 	}
 
 	/**

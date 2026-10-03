@@ -342,7 +342,7 @@ describe("verbatim bracketed ids (MV-1)", () => {
 });
 
 describe("overflow hint readability (MV-3)", () => {
-	it("points the overflow line at an entry that renders readably in the REPL", () => {
+	it("names every overflow entry in the compact index and points at a readable fetch path", () => {
 		const state = loadHarnessState(makeTempDir(), "global");
 		for (let i = 0; i < 6; i++) {
 			state.entries.memory[`fact_${i}`] = globalMemoryEntry(`fact_${i}`);
@@ -350,12 +350,13 @@ describe("overflow hint readability (MV-3)", () => {
 
 		const overview = formatHarnessStateForPrompt(state, { maxEntriesPerKind: 2 });
 
-		expect(overview).toContain("+4 more memory entries");
-		// Search is the way into the hidden bulk; overview only lists.
-		expect(overview).toContain("rlm.harness.search('terms', kind='memory', global_=True)");
+		// Stage 2: the overflow is no longer an anonymous count - the compact
+		// index names all six entries by id + title below the two-line window.
+		const catalog = overview.split("\n").filter((line) => line.startsWith("  - [global:fact_"));
+		expect(catalog).toHaveLength(6);
 		// `rlm.get_harness_state()` returns an object whose REPL repr is an
-		// opaque address; the hint must name a readable entry instead.
-		expect(overview).toContain("rlm.harness.overview(max_entries_per_kind=");
+		// opaque address; the index header must name a readable fetch instead.
+		expect(overview).toContain("rlm.harness.get('memory', '<id>')");
 		expect(overview).not.toContain("rlm.get_harness_state()");
 	});
 });

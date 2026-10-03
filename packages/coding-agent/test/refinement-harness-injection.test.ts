@@ -101,10 +101,6 @@ function injectedIds(face: string): string[] {
 	return injectedEntryLines(face).map((line) => line.slice(line.indexOf(":") + 1, line.indexOf("]")));
 }
 
-function overflowLine(face: string, kind: string): string | undefined {
-	return face.split("\n").find((line) => line.startsWith("- +") && line.includes(` more ${kind} entries`));
-}
-
 function refineModel(): Model<"openai-completions"> {
 	return {
 		id: "openai/gpt-5.5",
@@ -254,15 +250,16 @@ describe("which entries reach the prompt", () => {
 
 		expect(injectedIds(face)[0]).toBe(createdId);
 		expect(injectedEntryLines(face)).toHaveLength(6);
-		const overflow = overflowLine(face, "memory") ?? "";
-		expect(overflow).toContain("- +3 more memory entries");
-		expect(overflow).toContain("9 recorded");
-		// The hidden bulk is reached by search, not by paging a wide overview
-		// window into context; overview stays named only as the full-list path.
-		expect(overflow).toContain("rlm.harness.search('terms', kind='memory', global_=True)");
-		// MV-3: the hint must name an entry whose output renders readably in
-		// the REPL; get_harness_state() returns an object with an opaque repr.
-		expect(overflow).toContain("rlm.harness.overview(max_entries_per_kind=");
+		// Stage 2: the anonymous overflow count is gone; the compact index layer
+		// names every entry (id + title, no content), freshest first, and its
+		// header points at the per-entry fetch path. `rlm.harness.get` returns an
+		// entry whose REPL repr is readable - MV-3's criterion - while
+		// `rlm.get_harness_state()` still returns an opaque object.
+		const catalog = face.split("\n").filter((line) => line.startsWith("  - ["));
+		expect(catalog).toHaveLength(9);
+		expect(catalog[0]).toContain(`[local:${createdId}]`);
+		expect(face).toContain("rlm.harness.get('memory', '<id>')");
+		expect(face).not.toContain("rlm.get_harness_state()");
 	});
 
 	it("breaks ties by id so the same state renders the same text every turn", () => {

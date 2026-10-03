@@ -1015,8 +1015,13 @@ describe("#2098 static system prompt with an in-context harness digest", () => {
 		const first = digestMessages(harness.session.messages);
 		expect(first).toHaveLength(1);
 		// The first turn's digest is built before the user message lands, so its
-		// terms are empty and the window is the plain injection order.
-		expect(getMessageText(first[0] as CustomMessage)).not.toContain("[global:zz_distinctive]");
+		// terms are empty and the window is the plain injection order. The window
+		// is the column-0 detail bullets; the stage-2 compact index below it names
+		// every entry (zz_distinctive included) without putting it in the window.
+		const windowIds = (text: string) => [...text.matchAll(/^- \[global:([^\]]+)\]/gm)].map((match) => match[1]);
+		const firstText = getMessageText(first[0] as CustomMessage);
+		expect(windowIds(firstText)).not.toContain("zz_distinctive");
+		expect(firstText).toContain("  - [global:zz_distinctive]");
 
 		// A state change (another seat's write) triggers a material-change delta.
 		// Its terms come from the committed conversation - the current turn's
@@ -1029,12 +1034,12 @@ describe("#2098 static system prompt with an in-context harness digest", () => {
 		const digests = digestMessages(harness.session.messages);
 		expect(digests).toHaveLength(2);
 		const delta = getMessageText(digests[1] as CustomMessage);
-		expect(delta).toContain("[global:zz_distinctive]");
+		expect(windowIds(delta)).toContain("zz_distinctive");
 		expect(delta).toContain(
 			"(entries ranked by relevance to the current task; more via `rlm.harness.search(query, kind='memory')`, `global_=True` for the cross-session store)",
 		);
 		// Append-only still holds: the first carrier is untouched.
-		expect(getMessageText(first[0] as CustomMessage)).not.toContain("[global:zz_distinctive]");
+		expect(getMessageText(first[0] as CustomMessage)).toBe(firstText);
 	});
 
 	it("does not re-deliver on a cold boundary when only the wording drifted, and re-delivers on a real state change", async () => {

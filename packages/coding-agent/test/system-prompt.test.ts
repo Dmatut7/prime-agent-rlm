@@ -506,9 +506,12 @@ describe("buildSystemPrompt", () => {
 		const prompt = formatHarnessStateForPrompt(harnessState);
 
 		expect(prompt).toContain("memory: 8");
-		expect(prompt).toContain("- +2 more memory entries");
-		// The overflow hint leads with search, not with a wide overview window.
-		expect(prompt).toContain("rlm.harness.search('terms', kind='memory', global_=True)");
+		// Stage 2: the two entries beyond the detail window are named in the
+		// compact index (id + title, one line each), not hidden behind a count.
+		const catalog = prompt.split("\n").filter((line) => line.startsWith("  - [global:memory_"));
+		expect(catalog).toHaveLength(8);
+		// The index header names the per-entry fetch path.
+		expect(prompt).toContain("rlm.harness.get('memory', '<id>')");
 		expect(prompt).toContain(`${"x".repeat(177)}...`);
 		expect(prompt).not.toContain(longContent);
 	});

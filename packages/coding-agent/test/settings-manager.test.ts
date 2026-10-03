@@ -5,6 +5,8 @@ import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	collectUnknownSettingsKeys,
+	DEFAULT_HARNESS_INDEX_MAX_BYTES,
+	DEFAULT_HARNESS_PATH_VOCABULARY,
 	DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS,
 	DEFAULT_KERNEL_MAX_RESTARTS,
 	DEFAULT_KERNEL_RESTART_WINDOW_MINUTES,
@@ -286,6 +288,59 @@ describe("SettingsManager", () => {
 			const settings = manager.getAutoRefineSettings();
 			expect(settings.turnInterval).toBe(5);
 			expect(settings.cooldownMs).toBe(1000);
+		});
+	});
+
+	describe("harness", () => {
+		it("defaults the digest index cap and the path vocabulary", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getHarnessDigestIndexMaxBytes()).toBe(DEFAULT_HARNESS_INDEX_MAX_BYTES);
+			expect(manager.getHarnessPathVocabulary()).toEqual([...DEFAULT_HARNESS_PATH_VOCABULARY]);
+		});
+
+		it("preserves valid overrides and keeps the zero kill switch", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ harness: { digestIndexMaxBytes: 8192, pathVocabulary: ["general", "project"] } }),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getHarnessDigestIndexMaxBytes()).toBe(8192);
+			expect(manager.getHarnessPathVocabulary()).toEqual(["general", "project"]);
+
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ harness: { digestIndexMaxBytes: 0 } }));
+			expect(SettingsManager.create(projectDir, agentDir).getHarnessDigestIndexMaxBytes()).toBe(0);
+		});
+
+		it("falls back to defaults for malformed values", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					harness: { digestIndexMaxBytes: "oops", pathVocabulary: ["general", 7, null, "arch"] },
+				}),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getHarnessDigestIndexMaxBytes()).toBe(DEFAULT_HARNESS_INDEX_MAX_BYTES);
+			expect(manager.getHarnessPathVocabulary()).toEqual(["general", "arch"]);
+
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ harness: { digestIndexMaxBytes: -5, pathVocabulary: [] } }),
+			);
+			const negative = SettingsManager.create(projectDir, agentDir);
+			expect(negative.getHarnessDigestIndexMaxBytes()).toBe(DEFAULT_HARNESS_INDEX_MAX_BYTES);
+			expect(negative.getHarnessPathVocabulary()).toEqual([...DEFAULT_HARNESS_PATH_VOCABULARY]);
+		});
+
+		it("knows the harness keys and still flags misspellings", () => {
+			expect(
+				collectUnknownSettingsKeys({ harness: { digestIndexMaxBytes: 8192, pathVocabulary: ["general"] } }),
+			).toEqual([]);
+			expect(collectUnknownSettingsKeys({ harness: { digestIndexMaxBytess: 1 } })).toEqual([
+				"harness.digestIndexMaxBytess",
+			]);
 		});
 	});
 

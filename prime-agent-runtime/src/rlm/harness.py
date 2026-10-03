@@ -48,7 +48,112 @@ _OVERFLOW_CATALOG_MAX = 50
 # borderline. Evidence: docs/fork/evidence/harness-near-duplicate-write-gate.md.
 _NEAR_DUPLICATE_SIMILARITY_MIN = 0.40
 _NEAR_DUPLICATE_MAX_MATCHES = 3
+# Stage-2 (memory-recall-design.md) write-side index byte cap: the digest's
+# compact id+title index layer is byte-capped, and a create/update that would
+# grow the index past the cap is refused with consolidation guidance, while
+# deletes and content-only updates always pass - the Claude Code MEMORY.md
+# hard-cap error loop. Sized so the two-layer digest stays within the design
+# red line (digest face <= 2x the pre-stage-2 face, 13,817 bytes on the
+# 2026-10-03 production store). The TS /refine path enforces the same default
+# (DEFAULT_HARNESS_INDEX_MAX_BYTES in refinement.ts). `0` disables the gate.
+DEFAULT_HARNESS_INDEX_MAX_BYTES = 12 * 1024
+_INDEX_MAX_BYTES_ENV = "PRIME_AGENT_HARNESS_INDEX_MAX_BYTES"
+# Index titles are capped here; the id stays whole because it is the address.
+_INDEX_TITLE_MAX_CHARS = 120
+# Controlled first-segment vocabulary for entry paths: the production store
+# collapsed into 602 free-form paths (538 singletons, duplicate clusters like
+# arch/architecture). Writes outside the vocabulary get an advisory receipt -
+# guidance, never a block. `policy` is the prompt-note default path and
+# `general` the catch-all default, so both must stay. Kept identical to
+# DEFAULT_HARNESS_PATH_VOCABULARY in refinement.ts.
+DEFAULT_HARNESS_PATH_VOCABULARY: tuple[str, ...] = (
+    "general",
+    "policy",
+    "discipline",
+    "arch",
+    "analysis",
+    "project",
+    "tooling",
+    "environment",
+    "governance",
+    "testing",
+    "research",
+    "communication",
+    "process",
+    "delegation",
+    "operations",
+    "review",
+    "preference",
+)
+_PATH_VOCABULARY_ENV = "PRIME_AGENT_HARNESS_PATH_VOCABULARY"
 _state_cache: dict[tuple[Path, HarnessScope], "HarnessState"] = {}
+
+
+_ENFORCE_INDEX_CAP_ENV = "PRIME_AGENT_HARNESS_ENFORCE_INDEX_CAP"
+
+
+def _enforce_index_cap() -> bool:
+    """Whether the index cap refuses net-growth writes. Default off: until the
+    consolidation pass exists (memory design stage 3), the cap shapes the digest's
+    display layer only; enforcing it on an over-cap store would freeze all growth."""
+    raw = (os.environ.get(_ENFORCE_INDEX_CAP_ENV) or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _index_max_bytes() -> int:
+    """The active write-side index cap; an unreadable env override falls back to the default."""
+    if not _enforce_index_cap():
+        return 0
+    raw = (os.environ.get(_INDEX_MAX_BYTES_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_HARNESS_INDEX_MAX_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_HARNESS_INDEX_MAX_BYTES
+    return max(0, value)
+
+
+def _path_vocabulary() -> tuple[str, ...]:
+    """The active first-segment path vocabulary; an empty env override falls back to the default."""
+    raw = (os.environ.get(_PATH_VOCABULARY_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_HARNESS_PATH_VOCABULARY
+    entries = tuple(dict.fromkeys(part.strip() for part in raw.split(",") if part.strip()))
+    return entries or DEFAULT_HARNESS_PATH_VOCABULARY
+
+
+def _index_line(entry_id: str, scope: str, title: Any, path: Any) -> str:
+    """The digest index line for one entry: `  - [scope:id] title (path)`.
+
+    Byte-identical shape to `harnessIndexLine` in refinement.ts so the write
+    caps on both faces measure the same line. Fields are flattened (X-8) and
+    the title is code-point capped like the TS face.
+    """
+    flat_title = _flatten_inline(title) if isinstance(title, str) else ""
+    if len(flat_title) > _INDEX_TITLE_MAX_CHARS:
+        flat_title = f"{flat_title[: _INDEX_TITLE_MAX_CHARS - 3]}..."
+    flat_id = _flatten_inline(entry_id) if isinstance(entry_id, str) else str(entry_id)
+    flat_path = _flatten_inline(path) if isinstance(path, str) else "unknown"
+    return f"  - [{scope}:{flat_id}] {flat_title} ({flat_path})"
+
+
+def _index_line_bytes(entry: HarnessEntry) -> int:
+    return len((_index_line(entry.id, entry.scope, entry.title, entry.path) + "\n").encode("utf-8"))
+
+
+def _path_vocabulary_warning(path: Any) -> str | None:
+    """Advisory receipt text for a path whose first segment is off-vocabulary."""
+    first = path.strip().lower().split("/")[0] if isinstance(path, str) else ""
+    if not first:
+        return None
+    vocabulary = _path_vocabulary()
+    if first in {segment.strip().lower() for segment in vocabulary}:
+        return None
+    return (
+        f"path 词表建议：'{_flatten_inline(first)}' 不在受控词表内（{'、'.join(vocabulary)}）；"
+        "建议复用其一作为首段（可带子路径，如 discipline/code-review），确属新域可忽略。本次写入已完成。"
+    )
 
 
 def _now() -> str:
@@ -425,6 +530,10 @@ class HarnessEntry(_AwaitableResult):
     # persisted, and excluded from equality so a warned receipt still compares
     # equal to the stored entry it describes.
     near_duplicate_warning: str | None = field(default=None, compare=False)
+    # Receipt-only advisory set when a write chose a path whose first segment is
+    # outside the controlled vocabulary; same never-persisted, never-compared
+    # receipt plumbing as near_duplicate_warning.
+    path_vocabulary_warning: str | None = field(default=None, compare=False)
 
 
 @dataclass
@@ -468,6 +577,7 @@ def _persisted_entry_record(entry: HarnessEntry) -> dict[str, Any]:
     # Write-time feedback is recomputed per write; persisting it would
     # fossilize stale advice into the state file the TS host also reads.
     record.pop("near_duplicate_warning", None)
+    record.pop("path_vocabulary_warning", None)
     return record
 
 
@@ -1007,6 +1117,26 @@ class HarnessState:
         )
         previous_title = existing.title if existing else None
         previous_content = existing.content if existing else None
+        # Stage-2 write-side index cap: refuse net growth past the byte cap with
+        # consolidation guidance. Deletes never route through here, and a
+        # content-only update keeps the index line unchanged, so an over-cap
+        # store can always be consolidated back under the cap.
+        cap = _index_max_bytes()
+        if cap > 0:
+            projected_path = path if path is not None else (existing.path if existing else "general")
+            projected_scope = existing.scope if existing else self.scope
+            current_index_bytes = self.index_bytes()
+            projected_index_bytes = (
+                current_index_bytes
+                - (_index_line_bytes(existing) if existing else 0)
+                + len((_index_line(entry_id, projected_scope, title, projected_path) + "\n").encode("utf-8"))
+            )
+            if projected_index_bytes > cap and projected_index_bytes > current_index_bytes:
+                raise ValueError(
+                    f"harness index byte cap exceeded: the id+title index would grow to {projected_index_bytes} bytes "
+                    f"(cap {cap}); consolidate first (merge near-duplicate entries, delete stale ones, "
+                    "or shorten titles), then retry the write"
+                )
         if existing:
             # Snapshot the pre-mutation field values so a failed save can roll the
             # entry back: the replaced dicts are fresh copies, so the originals stay
@@ -1086,19 +1216,30 @@ class HarnessState:
             before=previous_content,
             after=content,
         )
-        if kind != "memory":
+        # Receipt-only advisories, computed after the write landed; advisory
+        # feedback must never fail a persisted write.
+        near_warning: str | None = None
+        if kind == "memory":
+            try:
+                near_warning = self._near_duplicate_memory_warning(entry, is_create=existing is None)
+            except Exception:  # noqa: BLE001
+                # A reported failure after a successful save invites a retry that
+                # creates the very duplicate this warning exists to prevent.
+                near_warning = None
+        path_warning: str | None = None
+        # The path advisory belongs to a path choice: every create makes one
+        # (explicitly or via the default); an update that omits `path` keeps the
+        # existing one and stays silent.
+        if path is not None or existing is None:
+            try:
+                path_warning = _path_vocabulary_warning(entry.path)
+            except Exception:  # noqa: BLE001
+                path_warning = None
+        if near_warning is None and path_warning is None:
             return entry
-        try:
-            warning = self._near_duplicate_memory_warning(entry, is_create=existing is None)
-        except Exception:  # noqa: BLE001 - advisory feedback must never fail a persisted write
-            # A reported failure after a successful save invites a retry that
-            # creates the very duplicate this warning exists to prevent.
-            warning = None
-        if warning is None:
-            return entry
-        # The warning rides on a receipt copy; the stored entry stays clean so
+        # The warnings ride on a receipt copy; the stored entry stays clean so
         # later reads and saves never see stale write-time advice.
-        return replace(entry, near_duplicate_warning=warning)
+        return replace(entry, near_duplicate_warning=near_warning, path_vocabulary_warning=path_warning)
 
     def get(self, kind: HarnessKind, id: str, *, global_: bool = False, **kwargs: Any) -> HarnessEntry | None:
         id, global_, _claimed_scope = _strip_scope_prefix(id, global_)
@@ -1142,6 +1283,20 @@ class HarnessState:
                 raise ValueError(f"unknown harness kind {current_kind!r}; expected one of {_KINDS}")
             records.extend(self.entries[current_kind].values())
         return sorted(records, key=lambda entry: (entry.kind, entry.path, entry.title, entry.id))
+
+    def index_bytes(self) -> int:
+        """Total UTF-8 bytes of the full compact id+title index over all kinds.
+
+        This is the quantity the write-side cap (and the TS digest's index
+        layer) budgets: every entry contributes its one index line, including
+        kinds small enough that the digest renderer skips their index layer -
+        the cap guards store size, not one render's layout.
+        """
+        total = 0
+        for records in self.entries.values():
+            for entry in records.values():
+                total += _index_line_bytes(entry)
+        return total
 
     def create(
         self,

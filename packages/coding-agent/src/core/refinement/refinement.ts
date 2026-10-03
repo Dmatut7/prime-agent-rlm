@@ -46,6 +46,59 @@ const DEFAULT_OVERVIEW_REFINEMENT_LIMIT = 5;
 const DEFAULT_OVERVIEW_CONTENT_LIMIT = 180;
 
 /**
+ * Byte cap for the digest's compact id+title index layer (memory-recall-design.md
+ * stage 2), and for the write-side growth gate that keeps the store small enough
+ * for the index to stay complete: a create/update that would push the index past
+ * the cap is refused with consolidation guidance, while deletes and content-only
+ * updates always pass, so an over-cap store can always be consolidated back under
+ * it. Sized against the design's red line (digest face <= 2x the pre-stage-2
+ * face, 13,817 bytes on the 2026-10-03 production store) with the Claude Code
+ * MEMORY.md 25KB / Codex 32KiB hard caps as the external reference points: the
+ * details window keeps its existing budget and the index gets the remaining
+ * headroom. `0` disables the index layer and the write gate. The Python kernel
+ * write path enforces the same cap (`PRIME_AGENT_HARNESS_INDEX_MAX_BYTES`).
+ */
+export const DEFAULT_HARNESS_INDEX_MAX_BYTES = 12 * 1024;
+
+/** Index titles are capped here; the id stays whole because it is the address. */
+const HARNESS_INDEX_TITLE_MAX_CHARS = 120;
+
+/**
+ * Controlled first-segment vocabulary for entry paths (memory-recall-design.md
+ * stage 2): the production store collapsed into 602 free-form paths (538 of
+ * them singletons, with duplicate clusters like arch/architecture and
+ * project/projects). Writes outside the vocabulary get an advisory receipt -
+ * guidance, never a block - naming this list. Derived from the 2026-10-03
+ * production first-segment distribution; `policy` is the prompt-note default
+ * path and `general` the catch-all default, so both must stay.
+ */
+export const DEFAULT_HARNESS_PATH_VOCABULARY: readonly string[] = [
+	"general",
+	"policy",
+	"discipline",
+	"arch",
+	"analysis",
+	"project",
+	"tooling",
+	"environment",
+	"governance",
+	"testing",
+	"research",
+	"communication",
+	"process",
+	"delegation",
+	"operations",
+	"review",
+	"preference",
+];
+
+// Advisory near-duplicate gate on memory writes, mirroring the Python harness
+// (`_NEAR_DUPLICATE_SIMILARITY_MIN` in harness.py, calibrated there against the
+// production store; evidence docs/fork/evidence/harness-near-duplicate-write-gate.md).
+const NEAR_DUPLICATE_SIMILARITY_MIN = 0.4;
+const NEAR_DUPLICATE_MAX_MATCHES = 3;
+
+/**
  * Bump when the fingerprinted material or its canonical serialization changes,
  * so fingerprints minted under different versions never compare equal.
  * Normalizing a render-ignored flag out of the material does not need a
@@ -53,8 +106,12 @@ const DEFAULT_OVERVIEW_CONTENT_LIMIT = 180;
  * examples off the normalization is a no-op; with them on, equality means
  * the shell flag was already false, i.e. identical renders), so equality
  * across the change is render-safe.
+ *
+ * v2: the digest gained the compact index layer, so the index byte budget (a
+ * render input) joined the material; fingerprints minted without it predate
+ * the two-layer face.
  */
-const HARNESS_DIGEST_FINGERPRINT_VERSION = 1;
+const HARNESS_DIGEST_FINGERPRINT_VERSION = 2;
 /** The refiner's own view is wider than the injected face but still truncated. */
 const REFINER_OVERVIEW_ENTRY_LIMIT = 40;
 /** How to read entries the view had to drop, per session capability. */
@@ -134,6 +191,18 @@ export interface AppliedRefinementEdit extends RefinementEdit {
 	after?: HarnessEntry;
 	applied: boolean;
 	error?: string;
+	/**
+	 * Receipt-only advisory set when a memory create/update landed near an
+	 * existing entry (W26-D parity with the Python harness write path). Never
+	 * stored on the entry itself; rides the applied-edit receipt and the
+	 * refinement notice so the writer learns it should have updated instead.
+	 */
+	nearDuplicateWarning?: string;
+	/**
+	 * Receipt-only advisory set when a create/update chose a path whose first
+	 * segment is outside the controlled vocabulary. Never blocks the write.
+	 */
+	pathVocabularyWarning?: string;
 }
 
 export interface RefinementResult {
@@ -194,6 +263,7 @@ Scope and persistence policy:
 - Project/workspace-specific lessons may be persisted globally only when the title, path, or content explicitly names the project/workspace and the lesson is likely to be reused in future sessions for that project. Prefer local edits when the lesson only belongs in the current conversation.
 - Use memory for declarative facts and preferences, skill for repeatable procedures exposed as Python calls, prompt for narrow behavioral policy addendums, and subagent for reusable delegation roles.
 - Create or update the smallest relevant component: repeated delegation roles should become subagent specs, repeated procedures should become skills, durable facts/preferences should become memories, and narrow behavioral policies should become prompt addendums.
+- The store backs a compact id+title index with a byte cap. When a write is refused for exceeding it, consolidate first: merge near-duplicate entries, delete stale entries, or shorten titles, then retry the edit.
 - When an edit is persisted, include metadata such as \`{"scope":"local"}\` or \`{"scope":"global"}\` when that helps future review understand the intended blast radius.
 
 Use the trajectory, current continual harness state, and prior refinement history. Prefer
@@ -212,7 +282,7 @@ JSON only with this exact shape:
       "id": "stable id for update/delete, optional for create",
       "title": "required for create/update except delete",
       "content": "required for create/update except delete",
-      "path": "optional grouping path",
+      "path": "optional grouping path; prefer a first segment from the controlled vocabulary (general, policy, discipline, arch, analysis, project, tooling, environment, governance, testing, research, communication, process, delegation, operations, review, preference) with an optional subpath such as discipline/code-review; introduce a new first segment only when none fits",
       "reference": {"type": "python", "import": "package.module", "callable": "function_name", "call_pattern": "await function_name(...)"},
       "arguments": {"name": {"type": "string", "required": true, "description": "accepted input"}},
       "metadata": {},
@@ -869,7 +939,7 @@ function compactText(text: string, maxLength: number): string {
 	return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
-/** Notice body in digest notation: trigger line plus applied edits as `action kind [scope:id] title: content`; rollbacks print via their rollback summaries. */
+/** Notice body in digest notation: trigger line plus applied edits as `action kind [scope:id] title: content`; rollbacks print via their rollback summaries. Receipt advisories (near-duplicate, path vocabulary) ride indented lines under the edit they describe. */
 export function formatRefinementNoticeBody(result: RefinementResult): string {
 	const lines = [compactText(result.summary, DEFAULT_OVERVIEW_CONTENT_LIMIT)];
 	for (const edit of result.appliedEdits) {
@@ -883,6 +953,8 @@ export function formatRefinementNoticeBody(result: RefinementResult): string {
 				DEFAULT_OVERVIEW_CONTENT_LIMIT,
 			)}${malformation ? ` (skipped malformed entry: ${malformation})` : ""}`,
 		);
+		if (edit.nearDuplicateWarning) lines.push(`  ${edit.nearDuplicateWarning}`);
+		if (edit.pathVocabularyWarning) lines.push(`  ${edit.pathVocabularyWarning}`);
 	}
 	return lines.join("\n");
 }
@@ -1103,6 +1175,209 @@ export function rankHarnessEntriesForQuery(entries: HarnessEntry[], terms: Harne
 	return rankHarnessEntriesWithRelevance(entries, terms).entries;
 }
 
+/**
+ * Whitespace-collapsed index text (X-8): title/id/path are model-controlled,
+ * and one entry must render as exactly one index line, so a value carrying
+ * newlines must not forge extra lines in a trusted-state surface.
+ */
+function flattenIndexText(text: string): string {
+	return text.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Code-point-capped index title. `String.slice` works in UTF-16 units and could
+ * halve an astral character; the Python write cap slices code points for the
+ * same line, so the two faces count the same bytes for the same entry.
+ */
+function capIndexTitle(title: string): string {
+	const flat = flattenIndexText(title);
+	const chars = Array.from(flat);
+	if (chars.length <= HARNESS_INDEX_TITLE_MAX_CHARS) return flat;
+	return `${chars.slice(0, HARNESS_INDEX_TITLE_MAX_CHARS - 3).join("")}...`;
+}
+
+/**
+ * The digest index line for one entry: `- [scope:id] title (path)`, indented
+ * under the detail window's bullet level. The Python write cap measures the
+ * same line (`_index_line` in harness.py); keep the shapes byte-identical.
+ */
+function harnessIndexLine(entry: HarnessEntry): string {
+	const scope = typeof entry.scope === "string" && entry.scope ? entry.scope : "global";
+	const id = typeof entry.id === "string" ? entry.id : String(entry.id);
+	const title = typeof entry.title === "string" ? entry.title : "";
+	const path = typeof entry.path === "string" ? entry.path : "unknown";
+	return `  - [${scope}:${flattenIndexText(id)}] ${capIndexTitle(title)} (${flattenIndexText(path)})`;
+}
+
+/** UTF-8 bytes of the entry's index line, newline included. */
+export function harnessIndexLineBytes(entry: HarnessEntry): number {
+	return Buffer.byteLength(`${harnessIndexLine(entry)}\n`, "utf8");
+}
+
+/**
+ * Total UTF-8 bytes of the full compact index over all kinds - the quantity the
+ * write-side cap compares against. Deliberately counts every entry, including
+ * kinds small enough that the renderer skips their index layer: the cap guards
+ * store size, not one render's layout.
+ */
+export function harnessIndexBytes(state: HarnessState): number {
+	let total = 0;
+	for (const kind of Object.keys(state.entries) as RefinementKind[]) {
+		for (const entry of Object.values(state.entries[kind])) {
+			total += harnessIndexLineBytes(entry);
+		}
+	}
+	return total;
+}
+
+/**
+ * Port of the Python harness search tokenizer (`_harness_query_terms`), used by
+ * the near-duplicate gate so the TS refine write path and the Python kernel
+ * write path score the same store identically. It is NOT the digest's
+ * `harnessQueryTerms`: explicit-query tokenization keeps shorter terms
+ * (three-letter ASCII like `rlm`, two characters of other scripts, single CJK
+ * characters) that mined-conversation term mining drops as noise.
+ */
+export function harnessSearchQueryTerms(query: string): string[] {
+	const terms: string[] = [];
+	const seen = new Set<string>();
+	for (const run of query.toLowerCase().match(/[\p{L}\p{N}\p{M}]+/gu) ?? []) {
+		// Runs break only at CJK boundaries: accented Latin stays whole
+		// (naïve) while spacing-free CJK is cut from adjacent words.
+		for (const segment of run.match(CJK_TERM_SPLIT) ?? []) {
+			let candidates: string[] = [];
+			if (CJK_TERM_PATTERN.test(segment)) {
+				// Code points, not UTF-16 units, keep astral ideographs whole.
+				const chars = Array.from(segment);
+				candidates = chars.length === 1 ? [segment] : chars.slice(0, -1).map((ch, i) => ch + chars[i + 1]);
+			} else if (/^[\x00-\x7f]*$/.test(segment)) {
+				candidates = segment.length >= 3 ? [segment] : [];
+			} else {
+				// Other scripts space out words: lone characters match too
+				// broadly, so two characters is the floor.
+				candidates = Array.from(segment).length >= 2 ? [segment] : [];
+			}
+			for (const term of candidates) {
+				if (!seen.has(term)) {
+					seen.add(term);
+					terms.push(term);
+				}
+			}
+		}
+	}
+	return terms;
+}
+
+export interface HarnessNearDuplicateMatch {
+	id: string;
+	score: number;
+}
+
+function searchableText(value: unknown): string {
+	return typeof value === "string" ? value : "";
+}
+
+/**
+ * Port of the Python harness `_near_duplicate_memory_matches`: rank the
+ * corpus's other memories by idf-weighted cosine against the candidate over
+ * title+content, keep matches at `_NEAR_DUPLICATE_SIMILARITY_MIN` or better,
+ * best first, capped at `_NEAR_DUPLICATE_MAX_MATCHES`. The candidate is
+ * expected inside the corpus (the write already landed) and is excluded by id.
+ */
+export function nearDuplicateMemoryMatches(
+	corpus: readonly HarnessEntry[],
+	candidate: { id: string; title: string; content: string },
+): HarnessNearDuplicateMatch[] {
+	const terms = new Set(harnessSearchQueryTerms(`${candidate.title} ${candidate.content}`));
+	if (terms.size === 0 || corpus.length < 2) return [];
+	const profiles = new Map<string, Set<string>>();
+	for (const entry of corpus) {
+		profiles.set(
+			entry.id,
+			new Set(harnessSearchQueryTerms(`${searchableText(entry.title)} ${searchableText(entry.content)}`)),
+		);
+	}
+	const documentFrequency = new Map<string, number>();
+	for (const profile of profiles.values()) {
+		for (const term of profile) {
+			documentFrequency.set(term, (documentFrequency.get(term) ?? 0) + 1);
+		}
+	}
+	const idf = new Map<string, number>();
+	for (const [term, count] of documentFrequency) {
+		idf.set(term, Math.log(1 + corpus.length / count));
+	}
+	let candidateNorm = 0;
+	for (const term of terms) {
+		candidateNorm += (idf.get(term) ?? 1) ** 2;
+	}
+	candidateNorm = Math.sqrt(candidateNorm);
+	if (candidateNorm === 0) return [];
+	const matches: HarnessNearDuplicateMatch[] = [];
+	for (const entry of corpus) {
+		if (entry.id === candidate.id) continue;
+		const profile = profiles.get(entry.id) ?? new Set<string>();
+		let dot = 0;
+		for (const term of terms) {
+			if (profile.has(term)) dot += (idf.get(term) ?? 1) ** 2;
+		}
+		if (dot === 0) continue;
+		let norm = 0;
+		for (const term of profile) {
+			norm += (idf.get(term) ?? 1) ** 2;
+		}
+		norm = Math.sqrt(norm);
+		if (norm === 0) continue;
+		const score = dot / (candidateNorm * norm);
+		if (score >= NEAR_DUPLICATE_SIMILARITY_MIN) {
+			matches.push({ id: entry.id, score });
+		}
+	}
+	// Python sorts by (-score, id) in code-point order; compareCodePoints is the
+	// locale-independent code-unit order the digest already standardizes on.
+	matches.sort((a, b) => b.score - a.score || compareCodePoints(a.id, b.id));
+	return matches.slice(0, NEAR_DUPLICATE_MAX_MATCHES);
+}
+
+/**
+ * The receipt warning text, identical to the Python harness's so a store
+ * produces the same advisory no matter which face wrote to it.
+ */
+function nearDuplicateMemoryWarning(matches: readonly HarnessNearDuplicateMatch[], isCreate: boolean): string {
+	const labels = matches.map((match) => {
+		const flat = flattenIndexText(match.id);
+		const chars = Array.from(flat);
+		const bounded =
+			chars.length > HARNESS_INDEX_TITLE_MAX_CHARS
+				? `${chars.slice(0, HARNESS_INDEX_TITLE_MAX_CHARS - 3).join("")}...`
+				: flat;
+		return `'${bounded}'（相似度 ${match.score.toFixed(2)}）`;
+	});
+	const listed = labels.join("、");
+	if (isCreate) {
+		return `近重复警告：已有相似条目 ${listed}，建议 update_memory 更新相似条目而不是新建；本次写入已完成，确属独立条目可忽略。`;
+	}
+	return `近重复警告：已有相似条目 ${listed}，与本次更新后的内容高度重合，建议合并为一条；本次更新已完成。`;
+}
+
+/**
+ * Advisory receipt text for a path whose first segment is outside the
+ * controlled vocabulary, or undefined when the path conforms. Matching is
+ * case-insensitive on the first segment; subpaths are free-form.
+ */
+export function harnessPathVocabularyWarning(
+	path: string,
+	vocabulary: readonly string[] = DEFAULT_HARNESS_PATH_VOCABULARY,
+): string | undefined {
+	const firstSegment = (typeof path === "string" ? path : "").trim().toLowerCase().split("/")[0] ?? "";
+	if (!firstSegment) return undefined;
+	if (vocabulary.some((segment) => segment.trim().toLowerCase() === firstSegment)) return undefined;
+	return (
+		`path 词表建议：'${flattenIndexText(firstSegment)}' 不在受控词表内（${vocabulary.join("、")}）；` +
+		"建议复用其一作为首段（可带子路径，如 discipline/code-review），确属新域可忽略。本次写入已完成。"
+	);
+}
+
 export function formatHarnessStateForPrompt(
 	state: HarnessState,
 	options: {
@@ -1120,11 +1395,29 @@ export function formatHarnessStateForPrompt(
 		 * loses the ranked marker instead of passing an alphabetical slice
 		 * off as relevance. */
 		queryTerms?: HarnessQueryTerms;
+		/**
+		 * Byte budget for the compact id+title index layer that names every
+		 * entry beyond the detail window (memory-recall-design.md stage 2).
+		 * Default DEFAULT_HARNESS_INDEX_MAX_BYTES; `0` disables the layer and
+		 * restores the anonymous overflow line. Entries are emitted in the
+		 * window's own order (relevance-ranked or recency), so a truncated
+		 * index keeps the most relevant or freshest entries.
+		 */
+		indexMaxBytes?: number;
 	} = {},
 ): string {
 	const maxEntriesPerKind = options.maxEntriesPerKind ?? DEFAULT_OVERVIEW_ENTRY_LIMIT;
 	const maxRefinements = options.maxRefinements ?? DEFAULT_OVERVIEW_REFINEMENT_LIMIT;
 	const maxContentLength = options.maxContentLength ?? DEFAULT_OVERVIEW_CONTENT_LIMIT;
+	const indexMaxBytes = Math.max(
+		0,
+		Math.floor(
+			typeof options.indexMaxBytes === "number" && Number.isFinite(options.indexMaxBytes)
+				? options.indexMaxBytes
+				: DEFAULT_HARNESS_INDEX_MAX_BYTES,
+		),
+	);
+	let indexRemaining = indexMaxBytes;
 	const includeIpythonExamples = options.includeIpythonExamples ?? true;
 	const includeRefineExamples = options.includeRefineExamples ?? includeIpythonExamples;
 	const lines = [
@@ -1214,12 +1507,16 @@ export function formatHarnessStateForPrompt(
 				entry.kind === "skill" && Object.keys(entryReference).length > 0
 					? ` ref=${compactText(JSON.stringify(entryReference), maxContentLength)}`
 					: "";
-			const entryTitle = typeof entry.title === "string" ? entry.title : "";
-			const entryPath = typeof entry.path === "string" ? entry.path : "unknown";
+			// X-8 parity with the Python overview: id/title/path are model-controlled
+			// and must be flattened onto the one line this entry owns, or a value
+			// carrying newlines forges extra entry rows in a trusted-state surface.
+			const entryTitle = flattenIndexText(typeof entry.title === "string" ? entry.title : "");
+			const entryPath = flattenIndexText(typeof entry.path === "string" ? entry.path : "unknown");
+			const entryId = flattenIndexText(typeof entry.id === "string" ? entry.id : String(entry.id));
 			const entryVersion = typeof entry.version === "number" ? entry.version : 0;
 			const entryContent = typeof entry.content === "string" ? entry.content : "";
 			lines.push(
-				`- [${entry.scope ?? "global"}:${entry.id}] ${entryTitle} (${entryPath}, v${entryVersion})${referenceText}${argumentsText}: ${compactText(
+				`- [${entry.scope ?? "global"}:${entryId}] ${entryTitle} (${entryPath}, v${entryVersion})${referenceText}${argumentsText}: ${compactText(
 					entryContent,
 					maxContentLength,
 				)}`,
@@ -1227,14 +1524,52 @@ export function formatHarnessStateForPrompt(
 		}
 		const overflow = entries.length - Math.min(entries.length, maxEntriesPerKind);
 		if (overflow > 0) {
-			lines.push(
-				overflowLine(
-					kind,
-					overflow,
-					entries.length,
-					includeIpythonExamples ? kernelFullListHint(kind) : HARNESS_STATE_FILE_HINT,
-				),
-			);
+			const hint = includeIpythonExamples ? kernelFullListHint(kind) : HARNESS_STATE_FILE_HINT;
+			if (indexMaxBytes <= 0) {
+				lines.push(overflowLine(kind, overflow, entries.length, hint));
+			} else {
+				// Stage-2 two-layer face: below the detail window, the full compact
+				// index names every entry one line at a time (`- [scope:id] title
+				// (path)`), byte-capped so a rotten store cannot blow the digest up
+				// (context-rot red line: total face <= 2x the pre-stage-2 face). The
+				// write-side cap in applyRefinementProposal enforces the same budget,
+				// so the store converges to a size whose full index fits.
+				const omittedLine = (omitted: number) =>
+					`  - +${omitted} more ${kind} entries beyond the index byte cap (${indexMaxBytes}-byte cap; ${hint})`;
+				// The reserve guarantees the terminal line fits: a truncated kind
+				// never loses the count of what it hides.
+				const reserve = Buffer.byteLength(`${omittedLine(entries.length)}\n`, "utf8");
+				const header = includeIpythonExamples
+					? `  all ${entries.length} ${kind} entries by id + title (fetch one with \`rlm.harness.get('${kind}', '<id>')\`, \`global_=True\` for \`[global:…]\` ids):`
+					: `  all ${entries.length} ${kind} entries by id + title (${HARNESS_STATE_FILE_HINT}):`;
+				const headerCost = Buffer.byteLength(`${header}\n`, "utf8");
+				if (headerCost + reserve > indexRemaining) {
+					// Even the header does not fit: the anonymous line is smaller than
+					// the reserve, so the hidden bulk still leaves a named trace.
+					lines.push(overflowLine(kind, overflow, entries.length, hint));
+					indexRemaining = 0;
+				} else {
+					lines.push(header);
+					indexRemaining -= headerCost;
+					let indexed = 0;
+					for (const entry of entries) {
+						const line = harnessIndexLine(entry);
+						const cost = Buffer.byteLength(`${line}\n`, "utf8");
+						if (cost > indexRemaining - reserve) break;
+						lines.push(line);
+						indexRemaining -= cost;
+						indexed += 1;
+					}
+					// The index re-lists the detail window's entries (same order), so
+					// the omitted count excludes what the window already named.
+					const unnamed = entries.length - Math.max(indexed, Math.min(entries.length, maxEntriesPerKind));
+					if (unnamed > 0) {
+						const terminal = omittedLine(unnamed);
+						lines.push(terminal);
+						indexRemaining = Math.max(0, indexRemaining - Buffer.byteLength(`${terminal}\n`, "utf8"));
+					}
+				}
+			}
 		}
 		lines.push("");
 	}
@@ -1290,6 +1625,8 @@ export function harnessDigestFingerprint(
 		includeIpythonExamples: boolean;
 		includeShellExamples: boolean;
 		includeRefineExamples: boolean;
+		/** Render input since the v2 material: the compact index layer's byte budget. */
+		indexMaxBytes?: number;
 	},
 ): string {
 	const entries = (Object.keys(state.entries) as RefinementKind[])
@@ -1329,7 +1666,17 @@ export function harnessDigestFingerprint(
 		: renderFlags;
 	const material = JSON.stringify({
 		version: HARNESS_DIGEST_FINGERPRINT_VERSION,
-		renderFlags: effectiveRenderFlags,
+		renderFlags: {
+			...effectiveRenderFlags,
+			indexMaxBytes: Math.max(
+				0,
+				Math.floor(
+					typeof renderFlags.indexMaxBytes === "number" && Number.isFinite(renderFlags.indexMaxBytes)
+						? renderFlags.indexMaxBytes
+						: DEFAULT_HARNESS_INDEX_MAX_BYTES,
+				),
+			),
+		},
 		entries,
 		refinements,
 	});
@@ -1715,10 +2062,45 @@ function validateEdit(edit: RefinementEdit, computedId?: string): string | undef
 export function applyRefinementProposal(
 	state: HarnessState,
 	proposal: RefinementProposal,
-	options: { id: string; rollbackOf?: string; scope?: HarnessScope; baselineState?: HarnessState },
+	options: {
+		id: string;
+		rollbackOf?: string;
+		scope?: HarnessScope;
+		baselineState?: HarnessState;
+		/**
+		 * Write-side half of the digest index cap (memory-recall-design.md stage
+		 * 2): a create/update that would grow the compact id+title index past
+		 * this many bytes is refused with consolidation guidance. Deletes and
+		 * content-only updates always pass, so an over-cap store can always be
+		 * consolidated back under the cap. Default DEFAULT_HARNESS_INDEX_MAX_BYTES;
+		 * `0` disables the gate. Only consulted when `enforceIndexCap` is on.
+		 */
+		indexMaxBytes?: number;
+		/**
+		 * The cap only refuses writes when this is true; otherwise it is display-side
+		 * only. Default false until the consolidation pass exists (memory design
+		 * stage 3): enforcing on an over-cap store would freeze all memory growth.
+		 */
+		enforceIndexCap?: boolean;
+		/** Controlled first-segment vocabulary for the path advisory. */
+		pathVocabulary?: readonly string[];
+	},
 ): RefinementResult {
 	const appliedEdits: AppliedRefinementEdit[] = [];
 	const proposalModifiedKeys = new Set<string>();
+	const indexCap =
+		options.enforceIndexCap === true
+			? Math.max(
+					0,
+					Math.floor(
+						typeof options.indexMaxBytes === "number" && Number.isFinite(options.indexMaxBytes)
+							? options.indexMaxBytes
+							: DEFAULT_HARNESS_INDEX_MAX_BYTES,
+					),
+				)
+			: 0;
+	const pathVocabulary = options.pathVocabulary ?? DEFAULT_HARNESS_PATH_VOCABULARY;
+	let indexBytes = indexCap > 0 ? harnessIndexBytes(state) : 0;
 	for (const edit of proposal.edits) {
 		// The overview shows every id with its store prefix (`[global:foo]`), and a
 		// refiner that copies one is naming the other store, not inventing an id
@@ -1785,6 +2167,9 @@ export function applyRefinementProposal(
 			}
 			delete records[id];
 			proposalModifiedKeys.add(entryKey);
+			// Deletes shrink the index and are never cap-gated: they are how an
+			// over-cap store gets consolidated back under it.
+			if (indexCap > 0) indexBytes -= harnessIndexLineBytes(before);
 			appliedEdits.push({ ...edit, id, before, applied: true });
 			continue;
 		}
@@ -1814,9 +2199,55 @@ export function applyRefinementProposal(
 			updated_at: now(),
 			version,
 		};
+		if (indexCap > 0) {
+			// Refuse only net growth past the cap: an over-cap store keeps
+			// content-only updates (consolidation edits) and deletes, while every
+			// index-growing write bounces back with the way out.
+			const projected = indexBytes - (before ? harnessIndexLineBytes(before) : 0) + harnessIndexLineBytes(after);
+			if (projected > indexCap && projected > indexBytes) {
+				appliedEdits.push({
+					...edit,
+					id,
+					before,
+					applied: false,
+					error:
+						`harness index byte cap exceeded: the id+title index would grow to ${projected} bytes ` +
+						`(cap ${indexCap}); consolidate first (merge near-duplicate entries, delete stale ones, ` +
+						"or shorten titles), then retry the edit",
+				});
+				continue;
+			}
+			indexBytes = projected;
+		}
 		records[id] = after;
 		proposalModifiedKeys.add(entryKey);
-		appliedEdits.push({ ...edit, id, before, after: cloneEntry(after), applied: true });
+		// Receipt-only advisories (W26-D parity): computed after the write landed,
+		// and a warning failure must never fail an applied edit.
+		let nearDuplicateWarning: string | undefined;
+		if (edit.kind === "memory") {
+			try {
+				const matches = nearDuplicateMemoryMatches(Object.values(records), after);
+				if (matches.length > 0) {
+					nearDuplicateWarning = nearDuplicateMemoryWarning(matches, edit.action === "create");
+				}
+			} catch {
+				nearDuplicateWarning = undefined;
+			}
+		}
+		// The path advisory belongs to a path choice: every create makes one
+		// (explicitly or via the "general" default); an update that omits `path`
+		// keeps the existing one and stays silent.
+		const pathVocabularyWarning =
+			!before || edit.path !== undefined ? harnessPathVocabularyWarning(after.path, pathVocabulary) : undefined;
+		appliedEdits.push({
+			...edit,
+			id,
+			before,
+			after: cloneEntry(after),
+			applied: true,
+			...(nearDuplicateWarning ? { nearDuplicateWarning } : {}),
+			...(pathVocabularyWarning ? { pathVocabularyWarning } : {}),
+		});
 	}
 
 	const changes = appliedEdits.filter((edit) => edit.applied).map((edit) => `${edit.action} ${edit.kind}:${edit.id}`);
