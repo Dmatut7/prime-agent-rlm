@@ -14,13 +14,12 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-04，wave-48 已 SHIP）
+## 当前状态（2026-10-04，wave-49 已 SHIP）
 
-- HEAD = 见 git log（四批：refine 去重、rlm-child-run 拆两刀、暖池簇拆出、FORK_NOTES+账本+fragment）。
-- wave-48：refine 语义单点化（16+3+6 站点收编三 helper）；startRlmChildRun 635→460 行；
-  supervisor 首刀 12002→11296（暖池簇 969 行新模块，private 类 live-facade Host-seam 适配模式落地）；
-  EX-3 +47% 判噪声销账；调研 9 条（repeat 不当协议保证 / 召回信号无模型调用红线 / Parameters<> 派生委托）；
-  修饰键复现 F1（恢复会话展开键全灭，高）+ F2 进 wave-49。单测 9812 绿、suite 1729 绿。
+- HEAD = 见 git log（keys fixture 批 + F1 修复批 + 文档批）。
+- wave-49：F1 恢复会话展开键死键修复（reveal marker，先红后绿+实机验证）；keys.ts 四字节 fixture
+  首跑即绿（无 CC #92021 病）+ repeat 非保证注释；记忆红线落档（无模型调用/OpenHands 截断三则）。
+  exec.test.ts 截断测试抖动一例进负载族观察名单。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -101,14 +100,11 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
   把在跑会话归档。犯了就是事故，写进 FORK_NOTES 向老板披露。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-49 候选）
+## 下一波主题（wave-50 候选）
 
-1. 【老板痛点·F1 修复】恢复的旧格式会话 Ctrl+O/Ctrl+T/Ctrl+P/Alt+O/Alt+T 全灭：追
-   latestShownTurnSummary（interactive-mode.ts:11193）对旧格式重建组件树返回 undefined 的 legacy 分支，
-   先写复现测试再修；顺带 F2（Alt+Up 首按 1 格残影）。证据 /tmp/wave48/modkeys/（20 张截图+原始捕获）。
-2. 【调研落地零基建项】keys.ts 字节级 fixture（E3 的 CSI u alternate-key/repeat 三例 + E1 release 带 text
-   不插文本）+ keys.ts 头部「repeat 不当协议保证」注释；记忆设计文档补 E6/E8 红线（召回信号路径无模型
-   调用/截断提示计入预算/截断方向与指令一致）。
-3. 【supervisor 拆刀第二刀】沿用 live-facade 模式挑下一簇（roster-sync 需先收 prototype-harness
-   私有直驱测试债）；委托签名可上 Parameters<>/ReturnType<> 派生（E9）。
-4. 【老板挂账】安全簇勾选、第 0 条历史改写、记忆帽三选一（再降级候选）。
+1. 【supervisor 拆刀第二刀】live-facade 模式已成（wave-48 暖池首刀），挑下一簇；roster-sync 需先收
+   prototype-harness 私有直驱测试债；委托签名上 Parameters<>/ReturnType<> 派生（调研 E9）。
+2. 【体验走查常规化】矩阵 v1 全格过，F  lane 留的尾巴：kitty 原生终端 repeat 激活档对照走查、
+   F2（Alt+Up 首按 1 格残影）根治、isKeyRelease 带 text 节识别。
+3. 【性能画像】backlog #9 流式全量重发 1.14GB 放大仍未动（需设计）；attach 延迟与冷启数字半年没复测。
+4. 【老板挂账】安全簇勾选、第 0 条历史改写、记忆帽三选一。

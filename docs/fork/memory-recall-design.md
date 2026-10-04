@@ -38,10 +38,13 @@
 - 去重闸：同一批条目已亮过相就不再重复亮（防每 N 轮重复骚扰）；
 - 遥测：记录「信号亮了什么、模型随后取没取」——取阅率就是这条机制的唯一判官，低了说明信号质量差，调查询词/阈值/N，而不是反过来加强塞。
 - N、阈值、开关进 settings，默认保守。
+- **红线：召回信号路径保持无模型调用。** 依据（wave-48 调研 E6）：CC 2.1.288 的 memory recall 本身是一次 structured-output 模型调用，在拒绝 structured outputs 的网关/Mantle 后静默失效，官方只能加 `CLAUDE_CODE_DISABLE_STRUCTURED_OUTPUTS` 逃生门（https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md ，2.1.288 节，2026-10-04 实测）。我们 harness.search 是程序侧 tf-idf，不踩此坑；若未来把「信号是否相关」升级为模型裁决，必须带「调用失败/能力缺失 → 本轮无信号」的静默降级，不许阻塞主循环。（来源：wave-48 调研 /tmp/wave48/research.md，2026-10-04）
 
 ### 阶段 2：digest 两层重构
 
 全量紧凑索引（id+title 一行一条，总字节硬上限——参考 Claude 25KB/Codex 32KiB——超限在写入侧报错回环）+ 相关度 top-k 详情保留。红线：digest 总面值 ≤ 现值 2 倍（context-rot 证据）。顺带归并 597 个塌缩 path（写入侧引导归到受控词表）。与阶段 1.5 的分工：索引是「地图」（每轮都在），定期召回是「翻正文」（每 N 轮），互补不重复。
+
+**红线补充**（wave-48 调研 E8，OpenHands V1 跨会话记忆代码级解剖，https://neoneye.github.io/agent-memory-atlas/systems/openhands-sdk/ ，2026-09-17 更新）：① 截断提示（如「earlier memory truncated」）本身计入预算——防模型把截短索引误读为完整索引；② 截断方向必须与维护指令一致（教模型 append 就从头部删）；③ 索引/正文分层、预算只压索引——与我们已定设计互相印证。反向记一笔：OpenHands 缺「截断留痕 + 取阅率度量」，我们 telemetry 已设计，属走在前面的点。（来源：wave-48 调研 /tmp/wave48/research.md，2026-10-04）
 
 ### 阶段 3：写入侧防腐烂
 

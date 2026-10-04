@@ -1,3 +1,11 @@
+## 2026-10-04 wave-49 四路：F1 恢复会话展开键死键修复、keys 字节级 fixture、记忆红线落档
+
+- F1（老板痛点「展开的思考多按几下有 bug」实锤修复）：根因不是首席嫌疑（latestShownTurnSummary 无辜）——fullscreen 窗口粘尾，恢复会话的 turn 头在窗口上方，盒在屏外展开、帧 diff 逐行相同 → 键看起来死了。修复：TURN_KEY_REVEAL_MARKER + armRevealMarker()（turn-activity.ts），C-o/C-t/C-p 及 Alt 全局分支接入 revealTurnAfterKeyToggle；块导航 Enter 传 reveal:false 防窗口被拽离焦点块。先红后绿（pristine 7 红 → 8 绿）+ 实机 tmux 验证 + 波及 400+ 例全绿。
+- keys.ts 字节级 fixture（调研 E3/E1 落地）：四例（shifted-key alternate→!、shifted 标点→:、modifier event-type 子字段不丢弃、release 带 text 不插入）首跑即绿——我们没有 CC #92021 同款病，shiftedKey 消费路径健康；keys.ts 头部补「repeat 只是优化提示不是协议保证」（WezTerm 永不报 repeat / Ghostty release 可能重复带 text，带 issue URL）。待办：isKeyRelease 认不出带 text 节的 release（当前无害）。
+- 记忆设计文档落红线（调研 E6/E8）：阶段 1.5「召回信号路径保持无模型调用」（CC 2.1.288 structured-output 网关坑，未来模型裁决必须静默降级）；阶段 2 OpenHands 截断三则（截断提示计入预算/方向与指令一致/预算只压索引）+ 我们截断留痕走在前面记一笔。
+- EX-3 复测判噪声（wave-48 D lane 结论）已销账；exec.test.ts 截断测试抖动一例（隔离即绿，进负载族观察名单）。
+- 门禁：check EXIT 0、hygiene OK、单测 9819 绿（1 抖动隔离即绿）、suite 1729 绿。需要重新编译并重启后才生效。
+
 ## 2026-10-04 wave-48 六路：refine 去重、rlm-child-run 拆两刀、supervisor 首刀（暖池簇）
 
 - refine 双模块去重（审计 follow-up）：scheduler 内抽 stampAutoRefineCooldown/resetAutoRefineTurns/isAutoRefineUnderCooldown，收编 16 印记 + 3 复位 + 6 冷却检查（review 起点的 at:nowMs 变体逐字保留）；runRefinePlanPhase/withRefineApplyGuard 抽到 execution 导出，scheduler 经既有边 import，单向分层不破。语义单点化：后续改遥测/泵调度不再扫 13 个站点。
