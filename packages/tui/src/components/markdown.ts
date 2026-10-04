@@ -192,6 +192,14 @@ interface FinalBlockSeal {
 	wrapSealedW?: string;
 	/** Padded block lines produced for wrapSealedW. */
 	wrapLines?: string[];
+	/**
+	 * The growing line's whole rendered string as of the previous frame. The
+	 * wrap seal assumes the line is append-only; inline re-typing (a math or
+	 * emphasis opener gaining its closer) can rewrite the rendered tail past
+	 * the sealed prefix while leaving wrapSealedW itself a prefix, so the
+	 * per-frame check compares against this, not against wrapSealedW.
+	 */
+	wrapPrevW?: string;
 	/** Latched when the growing line's rendered string contains ANSI codes. */
 	wrapIneligible?: boolean;
 }
@@ -1246,6 +1254,7 @@ export class Markdown implements Component {
 			// wrap-level seal belongs to the old line.
 			seal.wrapSealedW = undefined;
 			seal.wrapLines = undefined;
+			seal.wrapPrevW = undefined;
 			seal.wrapIneligible = false;
 		}
 		const tailTokens = this.sliceInlineTokens(inlineTokens, seal.tailFrom, text.length);
@@ -1263,6 +1272,7 @@ export class Markdown implements Component {
 			}
 			seal.wrapSealedW = undefined;
 			seal.wrapLines = undefined;
+			seal.wrapPrevW = undefined;
 			return [...seal.lines, ...this.renderTokenLinesToBlockLines([tailText], width, contentWidth)];
 		}
 		// A plain tail has no ANSI state to carry across segments, so the complete
@@ -1277,25 +1287,39 @@ export class Markdown implements Component {
 
 	/**
 	 * Wrap-level seal for the growing tail line. The rendered line w must be
-	 * plain text (no ANSI escapes): then a wrapped piece is a plain substring of
-	 * w, greedy wrapping from a piece boundary reproduces the full wrap's suffix
-	 * exactly (fresh line, clean tracker), and every piece except the last is
-	 * append-stable — the last piece may still grow or re-split when a growing
-	 * word crosses the width, so it is re-wrapped every frame. The per-piece
-	 * verification (piece is a prefix of the remaining text at the walked
-	 * offset, followed by the whitespace run the wrap consumed) pins the
-	 * piece-boundary offsets without reimplementing the wrap; a mismatch just
-	 * skips the extension.
+	 * plain text (no ANSI escapes) and append-only across frames: then a wrapped
+	 * piece is a plain substring of w, greedy wrapping from a piece boundary
+	 * reproduces the full wrap's suffix exactly (fresh line, clean tracker), and
+	 * every piece except the last is append-stable — the last piece may still
+	 * grow or re-split when a growing word crosses the width, so it is
+	 * re-wrapped every frame. Append-only is verified per frame against the
+	 * whole previously rendered line (wrapPrevW), because inline re-typing (a
+	 * math/emphasis opener gaining its closer) can rewrite the rendered tail
+	 * while leaving the sealed prefix intact. The per-piece verification (piece
+	 * is a prefix of the remaining text at the walked offset, followed by the
+	 * whitespace run the wrap consumed) pins the piece-boundary offsets without
+	 * reimplementing the wrap; a mismatch just skips the extension.
 	 */
 	private wrapSealGrowingLine(seal: FinalBlockSeal, w: string, width: number, contentWidth: number): string[] {
 		let sealedW = seal.wrapSealedW ?? "";
 		let sealedLines = seal.wrapLines ?? [];
-		if (!w.startsWith(sealedW)) {
+		const prevW = seal.wrapPrevW;
+		// A sealed piece stays valid only while the line grows by pure appends.
+		// Checking w against prevW (not just sealedW) catches an inline construct
+		// completing mid-line: the re-typed tail no longer extends the previously
+		// rendered string, so every sealed piece is stale.
+		if (prevW !== undefined ? !w.startsWith(prevW) : !w.startsWith(sealedW)) {
 			// The line's rendered prefix changed (e.g. a construct completed and
 			// gained styling before the plain check saw it); re-seal from scratch.
+			// Clear the seal fields, not just the locals: when this frame wraps to
+			// a single line no new seal is written below, and a stale wrapSealedW
+			// that still prefixes w would serve stale lines on the next frame.
 			sealedW = "";
 			sealedLines = [];
+			seal.wrapSealedW = undefined;
+			seal.wrapLines = undefined;
 		}
+		seal.wrapPrevW = w;
 		const tail = w.slice(sealedW.length);
 		const wrapped = wrapTextWithAnsi(tail, contentWidth);
 		if (wrapped.length > 1) {
@@ -1494,6 +1518,7 @@ export class Markdown implements Component {
 			// The growing code line just completed into the sealed prefix.
 			seal.wrapSealedW = undefined;
 			seal.wrapLines = undefined;
+			seal.wrapPrevW = undefined;
 			seal.wrapIneligible = false;
 		}
 		// The tail is not always just the growing line: the hard seal only covers
@@ -1510,6 +1535,7 @@ export class Markdown implements Component {
 			}
 			seal.wrapSealedW = undefined;
 			seal.wrapLines = undefined;
+			seal.wrapPrevW = undefined;
 			return [...seal.lines, ...this.renderTokenLinesToBlockLines(tailLines, width, contentWidth)];
 		}
 		const headLines =
