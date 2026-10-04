@@ -54,6 +54,12 @@ const result = await build({
 		"@mariozechner/clipboard",
 		// Preserve Node's CommonJS interop for the AWS SDK's lazy transport imports.
 		"@earendil-works/pi-ai/bedrock-provider",
+		// Optional observability peers of @mistralai/mistralai (declared optional, not
+		// installed): only reachable when Mistral telemetry is explicitly enabled.
+		"@opentelemetry/api",
+		"@opentelemetry/exporter-trace-otlp-http",
+		"@opentelemetry/resources",
+		"@opentelemetry/sdk-trace-base",
 	],
 	define: { __PI_BUNDLED__: "true", __PI_BUILD_ID__: JSON.stringify(buildId) },
 	banner: {
