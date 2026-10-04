@@ -694,6 +694,225 @@ export interface RlmChildRunHost extends RlmChildStallNoticeHost {
 	_maybeResumeAutonomousContinuationAfterRlmWork(): void;
 }
 
+/**
+ * The child-event subscription switch of a running child: maps the child's session
+ * events onto the run record (activity, previews, usage attribution, stall
+ * forensics) and forwards lifecycle events to the parent. Extracted from
+ * `startRlmChildRun` verbatim; `runningToolCount` moved in with it because only
+ * this switch ever reads it.
+ */
+function subscribeRlmChildRunEvents(input: {
+	host: RlmChildRunHost;
+	run: RlmChildRun;
+	child: AgentSession;
+	sessionName: string;
+	parentAssistantForUsage: AssistantMessage | undefined;
+	emitChildUpdate: () => void;
+}): () => void {
+	const { host, run, child, sessionName, parentAssistantForUsage, emitChildUpdate } = input;
+	let runningToolCount = 0;
+	return child.subscribe((event) => {
+		if (event.type === "rlm_child_update") {
+			host._emit(event);
+			return;
+		}
+		if (event.type === "stall_warning") {
+			host._recordRlmChildStallEvent(run, child, "warn", event);
+			notifyRlmChildStall(host, run, child, sessionName, event);
+			return;
+		}
+		if (event.type === "stall_abort") {
+			host._recordRlmChildStallEvent(run, child, "abort", event);
+			return;
+		}
+		if (event.type === "stall_unsettled") {
+			// P1-6: "the abort fired but the run never settled" must leave a
+			// mark on the parent side, or the kill is invisible and the
+			// terminal classifier has nothing to rank above "no reply".
+			run.error ??= "stall watchdog aborted the turn but it did not settle";
+			host._recordRlmChildStallEvent(run, child, "unsettled", event);
+			return;
+		}
+		if (event.type === "agent_start") {
+			run.activity = { kind: "waiting" };
+			// A recovered child is no longer stalled; the forensic record stays
+			// so the terminal classification can still see an unsettled abort.
+			run.stall = undefined;
+			touchRlmChildActivity(run);
+			emitChildUpdate();
+		} else if (event.type === "agent_end") {
+			run.activity = undefined;
+			touchRlmChildActivity(run);
+			emitChildUpdate();
+		} else if (event.type === "rlm_progress_note") {
+			// Guarded init instead of `??=` inside the call expression:
+			// biome's noAssignInExpressions rejects an assignment used as
+			// an expression, and a hand-built run record has no ring yet.
+			if (!run.progressNotes) run.progressNotes = [];
+			run.progressNotes.push(event.message);
+			if (run.progressNotes.length > RLM_CHILD_PROGRESS_NOTE_RING_MAX) {
+				run.progressNotes.shift();
+			}
+			touchRlmChildActivity(run);
+			emitChildUpdate();
+		} else if (event.type === "message_end" && event.message.role === "assistant") {
+			const assistant = event.message as AssistantMessage;
+			if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") {
+				attributeChildUsage(parentAssistantForUsage?.usage ?? emptyUsage(), assistant.usage);
+				if (parentAssistantForUsage) {
+					// Resolved once per run: the parent message is a run-level constant, while
+					// the lookup copies and scans every entry the session has ever written.
+					// A long child run used to pay that scan for every assistant message it
+					// emitted (a session with 56k attributed messages spent minutes here).
+					run.parentUsageEntry ??= host._findAssistantEntryForMessage(parentAssistantForUsage);
+					const parentEntry = run.parentUsageEntry;
+					if (parentEntry) {
+						const messages = child.messages;
+						const assistantIndex = messages.lastIndexOf(assistant);
+						const precedingPrompt = messages
+							.slice(0, assistantIndex)
+							.reverse()
+							.find((message) => message.role === "user" || message.role === "custom");
+						const origin =
+							precedingPrompt?.role === "custom" && isAgentSessionMessage(precedingPrompt)
+								? precedingPrompt.details.id.startsWith("spawn:")
+									? "spawn_task"
+									: "agent_message"
+								: "direct_user";
+						host.sessionManager.appendChildUsageAttribution(
+							parentEntry.id,
+							assistant.usage,
+							parentAssistantForUsage.usage,
+							origin,
+						);
+					}
+				}
+			}
+			const text = compactRlmText(readAssistantText(assistant));
+			if (text) run.answerPreview = text;
+			touchRlmChildActivity(run);
+			emitChildUpdate();
+		} else if (event.type === "message_start" || event.type === "message_update") {
+			if (event.message.role === "assistant") {
+				const text = rlmChildStreamingPreviewText(run, event);
+				if (text) run.answerPreview = text;
+				run.activity = { kind: "writing" };
+				touchRlmChildActivity(run);
+				emitChildUpdate();
+			}
+		} else if (event.type === "tool_execution_start") {
+			run.toolUseCount += 1;
+			runningToolCount += 1;
+			run.activity = { kind: "executing", toolName: event.toolName };
+			touchRlmChildActivity(run);
+			emitChildUpdate();
+		} else if (event.type === "tool_execution_end") {
+			runningToolCount = Math.max(0, runningToolCount - 1);
+			if (runningToolCount === 0) run.activity = { kind: "waiting" };
+			touchRlmChildActivity(run);
+			emitChildUpdate();
+		} else if (event.type === "session_info_changed" || event.type === "recap_update") {
+			emitChildUpdate();
+		}
+	});
+}
+
+/**
+ * The run's terminal bookkeeping from the detached task's finally: releases the
+ * host-abort listener, flushes the coalesced usage ledger, finishes a detached
+ * deletion (or hands it the cleanup), removes the run from the active map across
+ * the four retention branches, and wakes the goal/autonomous continuation passes.
+ * Extracted from `startRlmChildRun` verbatim.
+ */
+async function settleRlmChildRun(input: {
+	host: RlmChildRunHost;
+	run: RlmChildRun;
+	childRuntime: RlmSubagentRuntime | undefined;
+	signal: AbortSignal | undefined;
+	abortFromHost: () => void;
+}): Promise<void> {
+	const { host, run, childRuntime, signal, abortFromHost } = input;
+	signal?.removeEventListener("abort", abortFromHost);
+	try {
+		// LAT-3: settle the coalesced child usage ledger so the file
+		// matches what a reload folds once the run is over, instead of
+		// holding deltas back for the next window flush.
+		host.sessionManager.flushChildUsageAttributions();
+	} catch {
+		// Best-effort: the deltas stay in memory and the next persist
+		// rewrites the whole transcript, backfilling them.
+	}
+	if (run.detachedDeletion) {
+		run.deletionRunFinished = true;
+		if (!run.settled) {
+			let cleanupSucceeded = !run.deletionCleanupFailed;
+			if (childRuntime && cleanupSucceeded) {
+				const cleanup = run.deletionCleanup ?? host._ensureRlmRunDeletionCleanup(run, childRuntime.session);
+				cleanupSucceeded = await host._observeRlmRunDeletionCleanup(
+					run,
+					run.detachedDeletion,
+					childRuntime.session,
+					cleanup,
+				);
+			}
+			if (cleanupSucceeded) await host._finishRlmRunDeletion(run);
+		}
+	} else {
+		if (host._activeRlmChildRuns.get(run.id) === run) {
+			if (host._rlmChildSessions.has(run.id)) {
+				host._activeRlmChildRuns.delete(run.id);
+				if (run.unsubscribe) host._rlmChildUnsubscribes.set(run.id, run.unsubscribe);
+				run.abort = noopRlmChildAbort;
+				run.unsubscribe = undefined;
+				run.session = undefined;
+			} else if (run.status !== "error") {
+				host._removeRlmSubagentTracking(run.id, run);
+			} else if (run.session === undefined) {
+				// A failed run that never bound a session holds no resident work,
+				// so no idle passivation will ever come for it: left in the active
+				// map it would nail its name down forever and grow the map without
+				// bound. It settles into the bounded closed records instead - the
+				// collect/roster audit surfaces keep the failure, and the name is
+				// free for a re-spawn (numbered by the historical-name rule). The
+				// record is re-added after the removal because the removal deletes
+				// closed records. Entry shape mirrors rlmCollectEntryForRun, with
+				// settled forced: the record is written as part of settling.
+				const snapshot = rlmChildSnapshotForRun(host, run);
+				const record: ClosedRlmChildCollectEntry = {
+					entry: {
+						rlm_child_id: snapshot.id,
+						session_name: snapshot.sessionName,
+						session_dir: snapshot.sessionDir,
+						status: snapshot.status,
+						settled: true,
+						answer_preview: snapshot.answerPreview,
+						error: snapshot.error,
+						duration_ms: snapshot.durationMs,
+						tool_use_count: snapshot.toolUseCount,
+						replied_since_task: snapshot.repliedSinceTask,
+						activity_kind: undefined,
+						terminal_kind: run.terminalKind,
+						terminal_reason: run.terminalReason,
+						no_reply_notice_superseded: run.noReplyNoticeSuperseded,
+						stall_abort: rlmCollectStallAbort(run.stallAbort),
+					},
+				};
+				host._removeRlmSubagentTracking(run.id, run);
+				host._rememberClosedRlmChild(run.id, record);
+			} else {
+				run.unsubscribe?.();
+				run.abort = noopRlmChildAbort;
+				run.unsubscribe = undefined;
+			}
+		}
+		run.settled = true;
+		run.settlement.resolve();
+		host._unsettledRlmChildRuns.delete(run);
+		host._maybeResumeGoalContinuationAfterRlmWork();
+		host._maybeResumeAutonomousContinuationAfterRlmWork();
+	}
+}
+
 export async function startRlmChildRun(
 	host: RlmChildRunHost,
 	prompt: string,
@@ -811,7 +1030,6 @@ export async function startRlmChildRun(
 	}
 	const startedAt = Date.now();
 	const parentAssistantForUsage = host._findLastAssistantMessage();
-	let runningToolCount = 0;
 	let childSession: AgentSession | undefined;
 	const startedMonotonicAt = performance.now();
 	const run: RlmChildRun = {
@@ -996,109 +1214,13 @@ export async function startRlmChildRun(
 			throwIfCancelled();
 			run.status = "running";
 			emitChildUpdate();
-			const unsubscribeChildEvents = child.subscribe((event) => {
-				if (event.type === "rlm_child_update") {
-					host._emit(event);
-					return;
-				}
-				if (event.type === "stall_warning") {
-					host._recordRlmChildStallEvent(run, child, "warn", event);
-					notifyRlmChildStall(host, run, child, sessionName, event);
-					return;
-				}
-				if (event.type === "stall_abort") {
-					host._recordRlmChildStallEvent(run, child, "abort", event);
-					return;
-				}
-				if (event.type === "stall_unsettled") {
-					// P1-6: "the abort fired but the run never settled" must leave a
-					// mark on the parent side, or the kill is invisible and the
-					// terminal classifier has nothing to rank above "no reply".
-					run.error ??= "stall watchdog aborted the turn but it did not settle";
-					host._recordRlmChildStallEvent(run, child, "unsettled", event);
-					return;
-				}
-				if (event.type === "agent_start") {
-					run.activity = { kind: "waiting" };
-					// A recovered child is no longer stalled; the forensic record stays
-					// so the terminal classification can still see an unsettled abort.
-					run.stall = undefined;
-					touchRlmChildActivity(run);
-					emitChildUpdate();
-				} else if (event.type === "agent_end") {
-					run.activity = undefined;
-					touchRlmChildActivity(run);
-					emitChildUpdate();
-				} else if (event.type === "rlm_progress_note") {
-					// Guarded init instead of `??=` inside the call expression:
-					// biome's noAssignInExpressions rejects an assignment used as
-					// an expression, and a hand-built run record has no ring yet.
-					if (!run.progressNotes) run.progressNotes = [];
-					run.progressNotes.push(event.message);
-					if (run.progressNotes.length > RLM_CHILD_PROGRESS_NOTE_RING_MAX) {
-						run.progressNotes.shift();
-					}
-					touchRlmChildActivity(run);
-					emitChildUpdate();
-				} else if (event.type === "message_end" && event.message.role === "assistant") {
-					const assistant = event.message as AssistantMessage;
-					if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") {
-						attributeChildUsage(parentAssistantForUsage?.usage ?? emptyUsage(), assistant.usage);
-						if (parentAssistantForUsage) {
-							// Resolved once per run: the parent message is a run-level constant, while
-							// the lookup copies and scans every entry the session has ever written.
-							// A long child run used to pay that scan for every assistant message it
-							// emitted (a session with 56k attributed messages spent minutes here).
-							run.parentUsageEntry ??= host._findAssistantEntryForMessage(parentAssistantForUsage);
-							const parentEntry = run.parentUsageEntry;
-							if (parentEntry) {
-								const messages = child.messages;
-								const assistantIndex = messages.lastIndexOf(assistant);
-								const precedingPrompt = messages
-									.slice(0, assistantIndex)
-									.reverse()
-									.find((message) => message.role === "user" || message.role === "custom");
-								const origin =
-									precedingPrompt?.role === "custom" && isAgentSessionMessage(precedingPrompt)
-										? precedingPrompt.details.id.startsWith("spawn:")
-											? "spawn_task"
-											: "agent_message"
-										: "direct_user";
-								host.sessionManager.appendChildUsageAttribution(
-									parentEntry.id,
-									assistant.usage,
-									parentAssistantForUsage.usage,
-									origin,
-								);
-							}
-						}
-					}
-					const text = compactRlmText(readAssistantText(assistant));
-					if (text) run.answerPreview = text;
-					touchRlmChildActivity(run);
-					emitChildUpdate();
-				} else if (event.type === "message_start" || event.type === "message_update") {
-					if (event.message.role === "assistant") {
-						const text = rlmChildStreamingPreviewText(run, event);
-						if (text) run.answerPreview = text;
-						run.activity = { kind: "writing" };
-						touchRlmChildActivity(run);
-						emitChildUpdate();
-					}
-				} else if (event.type === "tool_execution_start") {
-					run.toolUseCount += 1;
-					runningToolCount += 1;
-					run.activity = { kind: "executing", toolName: event.toolName };
-					touchRlmChildActivity(run);
-					emitChildUpdate();
-				} else if (event.type === "tool_execution_end") {
-					runningToolCount = Math.max(0, runningToolCount - 1);
-					if (runningToolCount === 0) run.activity = { kind: "waiting" };
-					touchRlmChildActivity(run);
-					emitChildUpdate();
-				} else if (event.type === "session_info_changed" || event.type === "recap_update") {
-					emitChildUpdate();
-				}
+			const unsubscribeChildEvents = subscribeRlmChildRunEvents({
+				host,
+				run,
+				child,
+				sessionName,
+				parentAssistantForUsage,
+				emitChildUpdate,
 			});
 			run.unsubscribe = unsubscribeChildEvents;
 			const content = `[task from parent]\n\n${prompt}`;
@@ -1240,85 +1362,7 @@ export async function startRlmChildRun(
 				}
 			}
 		} finally {
-			signal?.removeEventListener("abort", abortFromHost);
-			try {
-				// LAT-3: settle the coalesced child usage ledger so the file
-				// matches what a reload folds once the run is over, instead of
-				// holding deltas back for the next window flush.
-				host.sessionManager.flushChildUsageAttributions();
-			} catch {
-				// Best-effort: the deltas stay in memory and the next persist
-				// rewrites the whole transcript, backfilling them.
-			}
-			if (run.detachedDeletion) {
-				run.deletionRunFinished = true;
-				if (!run.settled) {
-					let cleanupSucceeded = !run.deletionCleanupFailed;
-					if (childRuntime && cleanupSucceeded) {
-						const cleanup = run.deletionCleanup ?? host._ensureRlmRunDeletionCleanup(run, childRuntime.session);
-						cleanupSucceeded = await host._observeRlmRunDeletionCleanup(
-							run,
-							run.detachedDeletion,
-							childRuntime.session,
-							cleanup,
-						);
-					}
-					if (cleanupSucceeded) await host._finishRlmRunDeletion(run);
-				}
-			} else {
-				if (host._activeRlmChildRuns.get(run.id) === run) {
-					if (host._rlmChildSessions.has(run.id)) {
-						host._activeRlmChildRuns.delete(run.id);
-						if (run.unsubscribe) host._rlmChildUnsubscribes.set(run.id, run.unsubscribe);
-						run.abort = noopRlmChildAbort;
-						run.unsubscribe = undefined;
-						run.session = undefined;
-					} else if (run.status !== "error") {
-						host._removeRlmSubagentTracking(run.id, run);
-					} else if (run.session === undefined) {
-						// A failed run that never bound a session holds no resident work,
-						// so no idle passivation will ever come for it: left in the active
-						// map it would nail its name down forever and grow the map without
-						// bound. It settles into the bounded closed records instead - the
-						// collect/roster audit surfaces keep the failure, and the name is
-						// free for a re-spawn (numbered by the historical-name rule). The
-						// record is re-added after the removal because the removal deletes
-						// closed records. Entry shape mirrors rlmCollectEntryForRun, with
-						// settled forced: the record is written as part of settling.
-						const snapshot = rlmChildSnapshotForRun(host, run);
-						const record: ClosedRlmChildCollectEntry = {
-							entry: {
-								rlm_child_id: snapshot.id,
-								session_name: snapshot.sessionName,
-								session_dir: snapshot.sessionDir,
-								status: snapshot.status,
-								settled: true,
-								answer_preview: snapshot.answerPreview,
-								error: snapshot.error,
-								duration_ms: snapshot.durationMs,
-								tool_use_count: snapshot.toolUseCount,
-								replied_since_task: snapshot.repliedSinceTask,
-								activity_kind: undefined,
-								terminal_kind: run.terminalKind,
-								terminal_reason: run.terminalReason,
-								no_reply_notice_superseded: run.noReplyNoticeSuperseded,
-								stall_abort: rlmCollectStallAbort(run.stallAbort),
-							},
-						};
-						host._removeRlmSubagentTracking(run.id, run);
-						host._rememberClosedRlmChild(run.id, record);
-					} else {
-						run.unsubscribe?.();
-						run.abort = noopRlmChildAbort;
-						run.unsubscribe = undefined;
-					}
-				}
-				run.settled = true;
-				run.settlement.resolve();
-				host._unsettledRlmChildRuns.delete(run);
-				host._maybeResumeGoalContinuationAfterRlmWork();
-				host._maybeResumeAutonomousContinuationAfterRlmWork();
-			}
+			await settleRlmChildRun({ host, run, childRuntime, signal, abortFromHost });
 		}
 	})().catch(() => undefined);
 
