@@ -3581,6 +3581,7 @@ export class AgentDaemon {
 	private async sessionPassivationSnapshot(
 		state: ActiveSessionState,
 		passiveRlmSubagents?: readonly PassiveRlmSubagent[],
+		viewedActiveSessionIds?: ReadonlySet<string>,
 	): Promise<SessionPassivationSnapshot> {
 		const passiveDescendants = passiveRlmSubagents ?? (await this.listPassiveRlmSubagents());
 		const summary = summaryForActiveSession(state);
@@ -3625,9 +3626,14 @@ export class AgentDaemon {
 			// directAttachedClients (daemon-session-list.ts), which already filters by role.
 			// pendingAttaches stays all-inclusive: an in-flight attach is busyness no matter
 			// who asked, and it settles on its own within one snapshot build.
+			// `viewedActiveSessionIds` is the supervisor's relayed-viewer set: a client
+			// attached through the supervisor never joins state.clients (the relay rides
+			// the supervisor-role subscription, excluded above), so the sweep names its
+			// viewed sessions or the child is passivated out from under the window.
 			attachedClients:
 				[...state.clients].filter((client) => client.authenticationRole !== "supervisor").length +
-				state.pendingAttaches,
+				state.pendingAttaches +
+				(viewedActiveSessionIds?.has(state.activeSessionId) ? 1 : 0),
 			hasRegisteredCronJob: jobs.some((job) => !isHeartbeatCronJob(job)),
 			lastActivityAt: Date.parse(summary.lastActivityAt ?? ""),
 			hasParent: state.runtime.metadata.kind === "subagent" && !!state.runtime.metadata.parentActiveSessionId,
@@ -3648,6 +3654,7 @@ export class AgentDaemon {
 		idleEvictionMinutes: IdleEvictionMinutes,
 		now: number,
 		selectedSnapshot?: SessionPassivationSnapshot,
+		viewedActiveSessionIds?: ReadonlySet<string>,
 	): Promise<boolean> {
 		const sessionFile = state.runtime.session.sessionFile;
 		const metadata = state.runtime.metadata;
@@ -3674,7 +3681,11 @@ export class AgentDaemon {
 				this.shuttingDown ||
 				this.updateRestart !== undefined ||
 				this.sessions.get(state.activeSessionId) !== state ||
-				!canPassivateSession(await this.sessionPassivationSnapshot(state), idleEvictionMinutes, now)
+				!canPassivateSession(
+					await this.sessionPassivationSnapshot(state, undefined, viewedActiveSessionIds),
+					idleEvictionMinutes,
+					now,
+				)
 			) {
 				return;
 			}
@@ -3730,6 +3741,7 @@ export class AgentDaemon {
 		idleEvictionMinutes: IdleEvictionMinutes,
 		now: number,
 		limit: number,
+		viewedActiveSessionIds?: ReadonlySet<string>,
 	): Promise<number> {
 		if (this.shuttingDown || this.updateRestart !== undefined || limit <= 0) return 0;
 		// `now` is the supervisor's wall clock while the snapshots' activity timestamps are
@@ -3743,7 +3755,7 @@ export class AgentDaemon {
 		const snapshots = await Promise.all(
 			states.map(async (state) => ({
 				state,
-				snapshot: await this.sessionPassivationSnapshot(state, passiveRlmSubagents),
+				snapshot: await this.sessionPassivationSnapshot(state, passiveRlmSubagents, viewedActiveSessionIds),
 			})),
 		);
 		this.logKernelPinnedResidency(snapshots, idleEvictionMinutes, now);
@@ -3760,7 +3772,9 @@ export class AgentDaemon {
 			);
 		}
 		const results = await Promise.all(
-			candidates.map(({ state, snapshot }) => this.passivateSession(state, idleEvictionMinutes, now, snapshot)),
+			candidates.map(({ state, snapshot }) =>
+				this.passivateSession(state, idleEvictionMinutes, now, snapshot, viewedActiveSessionIds),
+			),
 		);
 		return results.filter(Boolean).length;
 	}
@@ -4835,7 +4849,12 @@ export class AgentDaemon {
 					return;
 				}
 				case "worker_passivate_idle_children": {
-					const count = await this.passivateIdleChildren(command.idleEvictionMinutes, command.now, command.limit);
+					const count = await this.passivateIdleChildren(
+						command.idleEvictionMinutes,
+						command.now,
+						command.limit,
+						command.viewedActiveSessionIds === undefined ? undefined : new Set(command.viewedActiveSessionIds),
+					);
 					this.writeWorkerSuccess(client, command, { count });
 					return;
 				}
@@ -9724,6 +9743,27 @@ export class AgentDaemon {
 		const session = state.runtime.session;
 		const busy =
 			busyOverride ?? (hasLiveSessionWork(state) || session.isRetrying || session.hasAcceptedPromptInFlight);
+		// The queued user inputs exist only in this process's action-store memory;
+		// the journal is their crash-durable copy. Plain user turns only: agent
+		// messages (their sender holds a delivery receipt and can resend), slash
+		// commands (would replay as literal text) and internal nudges (not user
+		// work) stay out. Drain order: the store lists the steering lane first.
+		let queuedInputs: string[] | undefined;
+		try {
+			const queued = session
+				.getSessionActionRecoverySnapshot()
+				.actions.flatMap((action) =>
+					action.payload.kind === "turn" &&
+					action.payload.queueVisible &&
+					!action.payload.acceptedAgentMessage &&
+					action.payload.customMessage === undefined
+						? [action.payload.text]
+						: [],
+				);
+			queuedInputs = queued.length > 0 ? queued : undefined;
+		} catch (error) {
+			this.log(`could not snapshot queued inputs for the worker recovery journal: ${String(error)}`);
+		}
 		try {
 			this.recoveryJournal.record({
 				activeSessionId: state.activeSessionId,
@@ -9731,6 +9771,7 @@ export class AgentDaemon {
 				...(session.sessionFile ? { sessionFile: session.sessionFile } : {}),
 				busy,
 				operation,
+				...(queuedInputs ? { queuedInputs } : {}),
 			});
 		} catch (error) {
 			this.log(`could not checkpoint worker operation state: ${String(error)}`);

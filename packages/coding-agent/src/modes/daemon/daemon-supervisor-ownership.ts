@@ -738,12 +738,13 @@ export async function acquireDaemonSupervisorOwnership(
 								record.agentDir,
 							);
 						}
-					} else if (isProcessAlive(owner.pid) && !isAbandonedOwnerFootprint(owner)) {
+					} else if (processIdExists(owner.pid) && !isAbandonedOwnerFootprint(owner)) {
 						// Somebody else's live daemon on this box: none of our business.
 						// Only the cheap kill(0) is spent here, deliberately: this loop runs
 						// over every owner directory on the machine inside the registry
 						// guard, on the daemon startup path, and the identity check forks
-						// `ps`/`powershell`. Treating a live pid as alive even when it may be
+						// `ps`/`powershell`. A zombie therefore counts as alive — transient
+						// by definition, and treating a live pid as alive even when it may be
 						// a recycled one only postpones reclaiming that directory to whoever
 						// eventually conflicts with it, which is exactly today's behavior.
 						continue;

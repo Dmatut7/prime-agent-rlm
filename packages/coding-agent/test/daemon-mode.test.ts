@@ -6226,6 +6226,55 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("keeps an idle child resident while a supervisor-relayed viewer is attached to it", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-viewed-passivation-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				passivateIdleChildren(
+					threshold: number,
+					now: number,
+					limit: number,
+					viewedActiveSessionIds?: ReadonlySet<string>,
+				): Promise<number>;
+			};
+			const parentState = await internals.createRuntime({
+				type: "create",
+				sessionPath: fixture.parentSessionFile,
+			});
+			const parentSession = parentState.runtime.session as unknown as {
+				releaseRlmChildSession: ReturnType<typeof vi.fn>;
+			};
+			parentSession.releaseRlmChildSession = vi.fn(() => vi.fn());
+			const future = Date.parse("2036-08-01T12:00:00Z");
+
+			// Control: with no viewer, the idle sweep passivates the child.
+			const unwatched = await internals.createRuntime({
+				type: "create",
+				sessionPath: fixture.childSessionFile,
+			});
+			await expect(internals.passivateIdleChildren(90, future, 1)).resolves.toBe(1);
+			expect(internals.sessions.has(unwatched.activeSessionId)).toBe(false);
+			expect(parentSession.releaseRlmChildSession).toHaveBeenCalledTimes(1);
+
+			// A viewer attached through the supervisor relay is invisible to the
+			// worker's own client set; the sweep names it, and the child stays.
+			const watched = await internals.createRuntime({
+				type: "create",
+				sessionPath: fixture.childSessionFile,
+			});
+			await expect(internals.passivateIdleChildren(90, future, 1, new Set([watched.activeSessionId]))).resolves.toBe(
+				0,
+			);
+			expect(internals.sessions.get(watched.activeSessionId)).toBe(watched);
+			expect(parentSession.releaseRlmChildSession).toHaveBeenCalledTimes(1);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("keeps a parent resident while one of its passive descendants is hydrating", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-hydration-passivation-race-"));
 		let releaseHydration!: () => void;

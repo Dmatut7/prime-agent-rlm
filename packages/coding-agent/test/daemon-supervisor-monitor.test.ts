@@ -4537,8 +4537,14 @@ describe("daemon worker supervisor monitoring", () => {
 			await supervisor.recoverUncertainWorkerOperations(worker);
 			expect(kill).not.toHaveBeenCalled();
 			expect(markInterrupted).toHaveBeenCalledTimes(2);
-			expect(markInterrupted).toHaveBeenCalledWith("/tmp/root.jsonl", "root-active", ["model_stream"]);
-			expect(markInterrupted).toHaveBeenCalledWith("/tmp/child.jsonl", "child-active", ["tool_execution"]);
+			// Fourth slot is the dead worker's queued user inputs; these sessions queued none.
+			expect(markInterrupted).toHaveBeenCalledWith("/tmp/root.jsonl", "root-active", ["model_stream"], undefined);
+			expect(markInterrupted).toHaveBeenCalledWith(
+				"/tmp/child.jsonl",
+				"child-active",
+				["tool_execution"],
+				undefined,
+			);
 		} finally {
 			kill.mockRestore();
 			rmSync(root, { recursive: true, force: true });

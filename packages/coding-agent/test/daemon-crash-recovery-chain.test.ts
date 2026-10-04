@@ -8,6 +8,7 @@ import type { CustomMessageEntry, SessionMessageEntry } from "../src/core/sessio
 import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon, flushWorkerRecoveryJournalFile } from "../src/modes/daemon/daemon-mode.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+import { DAEMON_WORKER_RECOVERY_JOURNAL_ENV } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
 import {
 	findUnconsumedWorkerRecoveryMarker,
@@ -69,7 +70,11 @@ function userMessageEntry(): SessionMessageEntry {
 }
 
 /** The entry the supervisor's catalog appends for mark_interrupted (daemon-catalog-process.ts). */
-function interruptionMarkerEntry(activeSessionId: string, operations: string[]): CustomMessageEntry {
+function interruptionMarkerEntry(
+	activeSessionId: string,
+	operations: string[],
+	queuedInputs?: string[],
+): CustomMessageEntry {
 	return {
 		...entryBase(),
 		type: "custom_message",
@@ -77,7 +82,7 @@ function interruptionMarkerEntry(activeSessionId: string, operations: string[]):
 		content:
 			"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
 		display: false,
-		details: { activeSessionId, operations },
+		details: { activeSessionId, operations, ...(queuedInputs ? { queuedInputs } : {}) },
 	};
 }
 
@@ -95,6 +100,7 @@ interface CapturedInterruption {
 	sessionFile: string;
 	activeSessionId: string;
 	operations: string[];
+	queuedInputs?: string[];
 }
 
 function recoverySupervisor(worker: RecoveryWorker): {
@@ -109,9 +115,16 @@ function recoverySupervisor(worker: RecoveryWorker): {
 		shuttingDown: false,
 		catalog: {
 			start: catalogStart,
-			markInterrupted: vi.fn(async (sessionFile: string, activeSessionId: string, operations: string[]) => {
-				interruptions.push({ sessionFile, activeSessionId, operations });
-			}),
+			markInterrupted: vi.fn(
+				async (sessionFile: string, activeSessionId: string, operations: string[], queuedInputs?: string[]) => {
+					interruptions.push({
+						sessionFile,
+						activeSessionId,
+						operations,
+						...(queuedInputs ? { queuedInputs } : {}),
+					});
+				},
+			),
 		},
 		log: vi.fn(),
 		assertRecoveryAllowed: vi.fn(async () => undefined),
@@ -232,6 +245,70 @@ describe("daemon crash recovery chain", () => {
 		expect(followUp).toHaveBeenCalledWith(WORKER_RECOVERY_RESUME_PROMPT, undefined, { resumeIfIdle: true });
 	});
 
+	it("carries the crashed worker's queued inputs from the journal into the marker and replays them before the resume", async () => {
+		const root = tempRoot();
+		const journalPath = join(root, "worker.recovery.jsonl");
+		const orphanJournalPath = join(root, "worker.orphans.jsonl");
+		writeFileSync(orphanJournalPath, "");
+		const sessionFileA = join(root, "session-a.jsonl");
+
+		// The worker died mid-turn with two user inputs still queued: the journal's
+		// busy record is the only place they survived the crash.
+		const workerJournal = new WorkerRecoveryJournal(journalPath);
+		workerJournal.record({
+			activeSessionId: "active-a",
+			sessionId: "session-a",
+			sessionFile: sessionFileA,
+			busy: true,
+			operation: "follow_up_queued",
+			queuedInputs: ["先跑测试", "再修 lint"],
+		});
+		flushWorkerRecoveryJournalFile(journalPath);
+		// The process dies here; a fresh reader still sees the queue.
+		expect(WorkerRecoveryJournal.readLatest(journalPath)[0]?.queuedInputs).toEqual(["先跑测试", "再修 lint"]);
+
+		const worker: RecoveryWorker = {
+			descriptor: {
+				workerId: "worker-crashed-with-queue",
+				pid: 987_652,
+				rootActiveSessionId: "active-a",
+				recoveryJournalPath: journalPath,
+				orphanProcessJournalPath: orphanJournalPath,
+			},
+		};
+		const { supervisor, interruptions } = recoverySupervisor(worker);
+		await supervisor.recoverUncertainWorkerOperations(worker);
+
+		// The marker write carries the queue so the bind side can replay it.
+		expect(interruptions).toEqual([
+			{
+				sessionFile: sessionFileA,
+				activeSessionId: "active-a",
+				operations: ["follow_up_queued"],
+				queuedInputs: ["先跑测试", "再修 lint"],
+			},
+		]);
+
+		// --- Bind side: the queued inputs ride ahead of the resume prompt, in order,
+		// and only the resume prompt itself may wake the session.
+		const marker = interruptionMarkerEntry("active-a", ["follow_up_queued"], ["先跑测试", "再修 lint"]);
+		const branch = [userMessageEntry(), marker];
+		const followUp = vi.fn(async () => true);
+		const session = {
+			sessionManager: { getBranch: () => branch },
+			followUp,
+		} as unknown as AgentSession;
+		const daemon = makeBindingDaemon(root);
+		daemon.resumeWorkerInterruptedSession(makeBoundState("active-a", session));
+		await vi.waitFor(() => expect(followUp).toHaveBeenCalledTimes(3));
+
+		expect(followUp.mock.calls).toEqual([
+			["先跑测试", undefined, { resumeIfIdle: false }],
+			["再修 lint", undefined, { resumeIfIdle: false }],
+			[WORKER_RECOVERY_RESUME_PROMPT, undefined, { resumeIfIdle: true }],
+		]);
+	});
+
 	it("leaves an already-answered interruption alone on the rebind", async () => {
 		const root = tempRoot();
 		const marker = interruptionMarkerEntry("active-a", ["tool_execution_start"]);
@@ -248,6 +325,73 @@ describe("daemon crash recovery chain", () => {
 		await Promise.resolve();
 
 		expect(followUp).not.toHaveBeenCalled();
+	});
+
+	it("records the session's queued user inputs into the busy journal record", () => {
+		const root = tempRoot();
+		const journalPath = join(root, "worker.recovery.jsonl");
+		const previousJournalEnv = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+		process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = journalPath;
+		try {
+			const daemon = new AgentDaemon(join(root, "worker.sock"), {
+				defaultSessionConfig: { agentDir: join(root, "agent"), cwd: root },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+				worker: { authenticationToken: "token" },
+			});
+			// The queue the crash must not lose: plain user inputs in drain order
+			// (steering lane first). Agent messages (their sender can resend), slash
+			// commands (would replay as literal text) and internal nudges stay out.
+			const session = {
+				sessionId: "session-a",
+				sessionFile: join(root, "session-a.jsonl"),
+				getSessionActionRecoverySnapshot: () => ({
+					formatVersion: 1,
+					actions: [
+						{ payload: { kind: "turn", text: "先跑测试", queueVisible: true, acceptedAgentMessage: false } },
+						{ payload: { kind: "turn", text: "再修 lint", queueVisible: true, acceptedAgentMessage: false } },
+						{
+							payload: {
+								kind: "turn",
+								text: "agent note",
+								queueVisible: true,
+								acceptedAgentMessage: true,
+							},
+						},
+						{ payload: { kind: "session_command", text: "/compact" } },
+						{
+							payload: {
+								kind: "turn",
+								text: "<auto-continue>",
+								queueVisible: false,
+								acceptedAgentMessage: false,
+							},
+						},
+					],
+				}),
+			} as unknown as AgentSession;
+			(
+				daemon as unknown as {
+					recordWorkerRecoveryState(state: ActiveSessionState, operation: string, busyOverride?: boolean): void;
+				}
+			).recordWorkerRecoveryState(makeBoundState("active-a", session), "follow_up_queued", true);
+
+			const records = WorkerRecoveryJournal.readLatest(journalPath);
+			expect(records).toHaveLength(1);
+			expect(records[0]).toMatchObject({
+				activeSessionId: "active-a",
+				busy: true,
+				operation: "follow_up_queued",
+				queuedInputs: ["先跑测试", "再修 lint"],
+			});
+		} finally {
+			if (previousJournalEnv === undefined) {
+				delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+			} else {
+				process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournalEnv;
+			}
+		}
 	});
 
 	it("marks nothing for a worker whose journal shows no in-flight work", async () => {

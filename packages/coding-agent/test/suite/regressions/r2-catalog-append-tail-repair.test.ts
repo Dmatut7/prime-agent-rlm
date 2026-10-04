@@ -164,6 +164,30 @@ describe("daemon catalog appends under a session lease", () => {
 		expect(facts.lastEntry?.details).toEqual({ activeSessionId: "active-r2", operations: ["model_stream"] });
 	}, 30_000);
 
+	it("carries the dead worker's queued inputs into the recovery marker's details", async () => {
+		const { client, agentDir } = startCatalog();
+		const assistantEntry = JSON.stringify({
+			type: "message",
+			id: "msg-assistant",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+		});
+		const sessionFile = writeTornTranscript(agentDir, [assistantEntry]);
+
+		// The supervisor forwards the queue the dead worker's journal recorded; the
+		// resume side (worker-recovery-resume.ts) replays details.queuedInputs.
+		await client.markInterrupted(sessionFile, "active-queued", ["follow_up_queued"], ["先跑测试", "再修 lint"]);
+		const facts = readTranscriptFacts(sessionFile);
+
+		expect(facts.lastEntry?.customType).toBe("prime-agent.worker_recovery");
+		expect(facts.lastEntry?.details).toEqual({
+			activeSessionId: "active-queued",
+			operations: ["follow_up_queued"],
+			queuedInputs: ["先跑测试", "再修 lint"],
+		});
+	}, 30_000);
+
 	it("refuses to append while another live process holds the session lease", async () => {
 		const { client, agentDir } = startCatalog();
 		const sessionFile = writeTornTranscript(agentDir);

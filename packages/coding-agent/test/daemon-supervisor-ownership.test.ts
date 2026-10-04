@@ -265,6 +265,81 @@ describe("daemon supervisor ownership registry reclamation", () => {
 		rmSync(liveDirectory, { recursive: true, force: true });
 	});
 
+	it("checks a foreign owner's liveness with kill(0), not a ps fork, inside the registry guard", async () => {
+		const paths = createPaths();
+		const template = await acquire(paths, "template-owner");
+		await template.updatePhase("owner");
+		const shape = { ...template.record };
+		await template.release();
+
+		// Three live foreign daemons on other sockets and other agent dirs, footprints
+		// intact: neither conflict branch applies, so the startup loop's only question
+		// for each is "is this pid alive". That probe used to be isProcessAlive, whose
+		// zombie check forks `ps` once per foreign owner per startup, inside the
+		// registry guard.
+		const standIns = [0, 1, 2].map(() =>
+			spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }),
+		);
+		const standInPids = standIns.map((standIn) => {
+			if (standIn.pid === undefined) throw new Error("Stand-in process did not report a pid");
+			return standIn.pid;
+		});
+		const liveDirectories = standInPids.map((pid, index) => {
+			const otherAgentDir = join(paths.root, `other-agent-live-${index}`);
+			const otherDescriptorDir = join(paths.root, `other-workers-live-${index}`);
+			const otherSocketPath = join(paths.root, `other-live-${index}.sock`);
+			mkdirSync(otherAgentDir, { recursive: true });
+			mkdirSync(otherDescriptorDir, { recursive: true });
+			writeFileSync(otherSocketPath, "");
+			return plantOwner(paths, shape, `live-foreign-owner-${index}`, pid, {
+				socketPath: otherSocketPath,
+				descriptorDir: otherDescriptorDir,
+				agentDir: realpathSync(otherAgentDir),
+				phase: "owner",
+			});
+		});
+
+		// The shim records every `ps` fork that resolves through this PATH. Three
+		// planted owners make the per-owner probe show up as three lines; the one
+		// self-identity read (`getProcessStartId(process.pid)`, once per acquire on
+		// macOS) never names a planted pid. On Linux the zombie probe reads /proc
+		// instead of forking, so this lock is earned where the probe shells out.
+		const shimDir = join(paths.root, "ps-shim");
+		mkdirSync(shimDir);
+		const psLog = join(paths.root, "ps-calls.log");
+		writeFileSync(join(shimDir, "ps"), `#!/bin/sh\necho "ps $*" >> ${JSON.stringify(psLog)}\nexit 1\n`, {
+			mode: 0o755,
+		});
+		const previousPath = process.env.PATH;
+		process.env.PATH = `${shimDir}:${previousPath ?? ""}`;
+		try {
+			const acquired = await acquire(paths, "ps-free-owner");
+			// The live foreign owners are still left alone (the conservative direction is
+			// unchanged); only the price of asking changed.
+			for (const directory of liveDirectories) {
+				expect(existsSync(directory)).toBe(true);
+			}
+			expect(existsSync(ownerDir(paths, "ps-free-owner"))).toBe(true);
+			const psCalls = existsSync(psLog) ? readFileSync(psLog, "utf8").split("\n").filter(Boolean) : [];
+			for (const pid of standInPids) {
+				expect(psCalls.filter((line) => line.includes(String(pid)))).toEqual([]);
+			}
+			await acquired.release();
+		} finally {
+			if (previousPath === undefined) {
+				delete process.env.PATH;
+			} else {
+				process.env.PATH = previousPath;
+			}
+			for (const standInProcess of standIns) {
+				standInProcess.kill("SIGKILL");
+			}
+			for (const directory of liveDirectories) {
+				rmSync(directory, { recursive: true, force: true });
+			}
+		}
+	});
+
 	it("quarantines an unreadable startup fence instead of failing every later start", async () => {
 		const paths = createPaths();
 		const owner = await acquire(paths, "fenced-owner");

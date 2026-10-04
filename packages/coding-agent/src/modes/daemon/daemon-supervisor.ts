@@ -13,7 +13,6 @@ import {
 	statSync,
 } from "node:fs";
 import { connect, createServer, type Server, type Socket } from "node:net";
-import { freemem } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -240,6 +239,7 @@ import {
 } from "./rlm-ledger.js";
 import { serializeSavedSessionInfo } from "./saved-session-info.js";
 import { SNAPSHOT_TARGET_CHUNK_BYTES, SnapshotTranscriptCache } from "./snapshot-transcript-cache.js";
+import { availableMemoryBytes } from "./warm-pool-memory.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
 
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
@@ -282,7 +282,7 @@ export interface DaemonWarmPoolOptions {
 	spawnCooldownMs?: number;
 	/** Pool sweep cadence (dead/expired spares, memory pressure); default 60s. */
 	sweepIntervalMs?: number;
-	/** Free-memory floor: below it the pool releases spares and spawns none; default 768MiB. */
+	/** Available-memory floor (reclaimable pages included; see warm-pool-memory.ts): below it the pool releases spares and spawns none; default 768MiB. */
 	minFreeMemoryBytes?: number;
 	/** Claim health-check budget before falling back to a cold launch; default 2s. */
 	claimConnectTimeoutMs?: number;
@@ -1022,6 +1022,12 @@ function createWarmPoolTelemetryTotals(): WarmPoolTelemetryTotals {
 	};
 }
 
+interface WarmSpareInflight {
+	promise: Promise<void>;
+	/** Stops the boot early: the spawn terminates its process and returns quietly. */
+	cancel: () => void;
+}
+
 interface WarmSpareWorker {
 	/** Pool key: the resolved spawn cwd. */
 	key: string;
@@ -1723,7 +1729,13 @@ export class DaemonSupervisor {
 	// Lazy maps: prototype-harness supervisors in tests bypass the constructor, and
 	// the drain paths must read an empty pool there instead of throwing.
 	private warmSparesMap?: Map<string, WarmSpareWorker>;
-	private warmSpareInflightMap?: Map<string, Promise<void>>;
+	/**
+	 * One in-flight warm-up per pool key. The cancel handle lets a drain stop the
+	 * boot probe early: a spare still warming when the pool drains would publish
+	 * into a dead pool and be disposed at publish, so waiting out its 8s listen
+	 * budget on the shutdown path only ever delays the exit.
+	 */
+	private warmSpareInflightMap?: Map<string, WarmSpareInflight>;
 	/**
 	 * The failed terminal state, one record per pool key: when the last warm-up
 	 * failed and why. A key in cooldown skips re-spawning until spawnCooldownMs
@@ -1737,7 +1749,7 @@ export class DaemonSupervisor {
 		}
 		return this.warmSparesMap;
 	}
-	private get warmSpareInflight(): Map<string, Promise<void>> {
+	private get warmSpareInflight(): Map<string, WarmSpareInflight> {
 		if (this.warmSpareInflightMap === undefined) {
 			this.warmSpareInflightMap = new Map();
 		}
@@ -2400,6 +2412,17 @@ export class DaemonSupervisor {
 			canEvictWorker(this.workerEvictionSnapshot(worker), idleEvictionMinutes, now),
 		);
 		if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
+		// Relayed viewers are invisible to the workers' own client accounting (their
+		// attaches ride the supervisor-role subscription), so the sweep names them:
+		// a viewed idle child must not be passivated out from under its window.
+		const viewedActiveSessionIds = new Set<string>();
+		for (const client of this.clients) {
+			for (const activeSessionId of client.attachedActiveSessionIds) {
+				viewedActiveSessionIds.add(activeSessionId);
+			}
+		}
+		const viewed = viewedActiveSessionIds.size > 0 ? [...viewedActiveSessionIds] : undefined;
+
 		// Whole-tree candidates skip child work because stopWorker releases everything.
 		await Promise.all(
 			[...refreshed]
@@ -2412,6 +2435,7 @@ export class DaemonSupervisor {
 								idleEvictionMinutes: childIdleEvictionMinutes,
 								now,
 								limit: CHILD_PASSIVATION_PER_WORKER_CAP,
+								...(viewed ? { viewedActiveSessionIds: viewed } : {}),
 							},
 							30_000,
 						);
@@ -5487,7 +5511,7 @@ export class DaemonSupervisor {
 				this.recordWarmPoolClaimMiss(cwd, "no_ready_spare");
 				return undefined;
 			}
-			await Promise.race([warming, sleep(pool.claimWarmingWaitMs, { unref: true })]);
+			await Promise.race([warming.promise, sleep(pool.claimWarmingWaitMs, { unref: true })]);
 			// The wait may have crossed a drain or shutdown; re-read every gate. A
 			// create that loses the pool mid-wait is not a miss — the pool stopped
 			// participating, and the drain emits its own reclaim events.
@@ -5564,22 +5588,30 @@ export class DaemonSupervisor {
 		if (this.warmSpares.has(key) || this.warmSpareInflight.has(key)) {
 			return;
 		}
-		if (this.warmSpares.size >= pool.maxSpares) {
+		// Warming spawns hold a pool slot too: counting only published spares let N
+		// racing creates each start a warm-up and publish past the cap.
+		if (this.warmSpares.size + this.warmSpareInflight.size >= pool.maxSpares) {
 			return;
 		}
 		const failed = this.warmSpareFailures.get(key);
 		if (failed !== undefined && Date.now() - failed.failedAt < pool.spawnCooldownMs) {
 			return;
 		}
-		if (freemem() < pool.minFreeMemoryBytes) {
+		if (availableMemoryBytes() < pool.minFreeMemoryBytes) {
 			const nowMs = Date.now();
 			if (nowMs - this.warmPoolPressureLogAt >= 10 * 60_000) {
 				this.warmPoolPressureLogAt = nowMs;
-				this.logInfo("Warm pool: free memory below the floor; not spawning a spare");
+				this.logInfo("Warm pool: available memory below the floor; not spawning a spare");
 			}
 			return;
 		}
-		const inflight = this.spawnWarmSpare(key, cwd, launchEnv)
+		const controller = new AbortController();
+		const entry: WarmSpareInflight = {
+			// Assigned one statement below, before the entry is visible to the map.
+			promise: Promise.resolve(),
+			cancel: () => controller.abort(),
+		};
+		entry.promise = this.spawnWarmSpare(key, cwd, launchEnv, controller.signal)
 			.catch((error) => {
 				// The failed state is terminal and visible: until the cooldown
 				// elapses this key neither spawns nor waits, and the reason is on
@@ -5589,11 +5621,11 @@ export class DaemonSupervisor {
 				);
 			})
 			.finally(() => {
-				if (this.warmSpareInflight.get(key) === inflight) {
+				if (this.warmSpareInflight.get(key) === entry) {
 					this.warmSpareInflight.delete(key);
 				}
 			});
-		this.warmSpareInflight.set(key, inflight);
+		this.warmSpareInflight.set(key, entry);
 	}
 
 	/**
@@ -5601,11 +5633,18 @@ export class DaemonSupervisor {
 	 * at prebuild, not at claim). The gate's protected invariant — no session work
 	 * before a persisted descriptor — still holds: the spare serves nothing until
 	 * a claim persists one, and the worker auth gate refuses every other command.
+	 *
+	 * `signal` is the pool drain's cancel: a spare still warming when the pool
+	 * drains would be disposed at publish anyway, so the boot stops at the next
+	 * stage boundary instead of holding the shutdown path for its full listen
+	 * budget. A cancelled warm-up is not a failure — no cooldown, no spawn-failed
+	 * telemetry.
 	 */
 	private async spawnWarmSpare(
 		key: string,
 		cwd: string,
 		launchEnv: Record<string, string> | undefined,
+		signal: AbortSignal,
 	): Promise<void> {
 		const pool = this.warmPool;
 		if (pool === undefined) {
@@ -5643,6 +5682,18 @@ export class DaemonSupervisor {
 		} catch (error) {
 			throw fail(error instanceof Error ? error.message : String(error));
 		}
+		if (signal.aborted) {
+			await this.terminateSpawnedWorkerProcess(spawned);
+			this.cleanWarmSpareFiles({
+				workerId,
+				recoveryJournalPath: ids.recoveryJournalPath,
+				orphanProcessJournalPath: ids.orphanProcessJournalPath,
+				descriptorPath,
+				socketPath,
+				spawned,
+			});
+			return;
+		}
 		try {
 			await commitWorkerStartupGate(spawned.startupGate);
 		} catch (error) {
@@ -5653,7 +5704,19 @@ export class DaemonSupervisor {
 		// booting spare would pay the boot remainder inside the create window. The
 		// probe is a bare connect (no auth); the worker answers its hello and the
 		// probe hangs up, exactly like a failed connectWorker attempt.
-		const listened = await this.probeWarmSpareListening(spawned, socketPath);
+		const listened = await this.probeWarmSpareListening(spawned, socketPath, signal);
+		if (signal.aborted) {
+			await this.terminateSpawnedWorkerProcess(spawned);
+			this.cleanWarmSpareFiles({
+				workerId,
+				recoveryJournalPath: ids.recoveryJournalPath,
+				orphanProcessJournalPath: ids.orphanProcessJournalPath,
+				descriptorPath,
+				socketPath,
+				spawned,
+			});
+			return;
+		}
 		if (!listened) {
 			await this.terminateSpawnedWorkerProcess(spawned);
 			throw fail(`Warm spare ${workerId} did not start listening within its boot budget`);
@@ -5705,10 +5768,14 @@ export class DaemonSupervisor {
 			this.shuttingDown ||
 			this.updateRestartPhase !== undefined ||
 			this.warmPool === undefined ||
-			this.warmSpares.has(key)
+			this.warmSpares.has(key) ||
+			// The cap is re-checked at publish, not only when the spawn was admitted:
+			// the admission count includes in-flight warm-ups, but a claim that frees
+			// and refills a slot mid-boot can still fill the pool under this one.
+			this.warmSpares.size >= pool.maxSpares
 		) {
-			// The pool closed (or a racing prebuild won) while this spawn was in flight.
-			await this.disposeWarmSpare(spare, "pool closed or refilled during spawn", "pool_closed");
+			// The pool closed, refilled, or filled up while this spawn was in flight.
+			await this.disposeWarmSpare(spare, "pool closed, refilled, or full during spawn", "pool_closed");
 			return;
 		}
 		spare.ttlTimer = setTimeout(() => {
@@ -5747,11 +5814,20 @@ export class DaemonSupervisor {
 	 * connect and immediate hang-up; the worker sends its hello to a peer that
 	 * never authenticates, which is the same shape as a failed connectWorker
 	 * attempt. A spare that never listens is a spawn failure (cooldown applies).
+	 * The drain's cancel signal ends the wait within one poll instead of running
+	 * the budget out: the spare is about to be terminated either way.
 	 */
-	private async probeWarmSpareListening(spawned: SpawnedWorkerProcess, socketPath: string): Promise<boolean> {
+	private async probeWarmSpareListening(
+		spawned: SpawnedWorkerProcess,
+		socketPath: string,
+		signal?: AbortSignal,
+	): Promise<boolean> {
 		const budgetMs = process.platform === "win32" ? 30_000 : 8_000;
 		const deadline = Date.now() + budgetMs;
 		while (Date.now() < deadline) {
+			if (signal?.aborted) {
+				return false;
+			}
 			if (spawned.child.exitCode !== null || spawned.child.signalCode !== null) {
 				return false;
 			}
@@ -5765,6 +5841,9 @@ export class DaemonSupervisor {
 				probe.once("connect", () => finish(true));
 				probe.once("error", () => finish(false));
 			});
+			if (signal?.aborted) {
+				return false;
+			}
 			if (accepted) {
 				return true;
 			}
@@ -5777,8 +5856,16 @@ export class DaemonSupervisor {
 	 * A spare never wrote a descriptor; its journals exist only if the worker
 	 * created them, and its socket file only outlives a worker that could not run
 	 * its own exit cleanup (SIGKILL). Everything here is best-effort.
+	 *
+	 * Takes the path carrier rather than the published spare so a cancelled
+	 * warm-up (terminated before its spare record exists) cleans up identically.
 	 */
-	private cleanWarmSpareFiles(spare: WarmSpareWorker): void {
+	private cleanWarmSpareFiles(
+		spare: Pick<
+			WarmSpareWorker,
+			"recoveryJournalPath" | "orphanProcessJournalPath" | "descriptorPath" | "socketPath" | "spawned" | "workerId"
+		>,
+	): void {
 		try {
 			rmSync(spare.recoveryJournalPath, { force: true });
 		} catch (error) {
@@ -5842,10 +5929,17 @@ export class DaemonSupervisor {
 		if (spares.length === 0 && inflight.length === 0) {
 			return;
 		}
-		// Inflight spawns re-check the pool/shutdown state at publish and dispose
-		// themselves; awaiting them here keeps the drain complete before exit.
+		// A still-warming spawn would publish into the drained pool and be disposed
+		// at publish; cancelling its boot here keeps the drain off its listen probe
+		// budget (up to 8s per spare) — the shutdown path and the update handoff's
+		// admission window cannot pay that.
+		for (const entry of inflight) {
+			entry.cancel();
+		}
+		// Cancelled spawns terminate their process and return; awaiting them here
+		// keeps the drain complete before exit.
 		await Promise.all([
-			...inflight.map((pending) => pending.catch(() => undefined)),
+			...inflight.map((entry) => entry.promise.catch(() => undefined)),
 			...spares.map((spare) =>
 				this.disposeWarmSpare(spare, reason, "drain").catch((error) =>
 					this.reportCleanupFailure(`warm spare ${spare.workerId}`, error),
@@ -5870,7 +5964,7 @@ export class DaemonSupervisor {
 			return;
 		}
 		const nowMs = Date.now();
-		const lowMemory = freemem() < pool.minFreeMemoryBytes;
+		const lowMemory = availableMemoryBytes() < pool.minFreeMemoryBytes;
 		for (const spare of [...this.warmSpares.values()]) {
 			const dead = spare.spawned.child.exitCode !== null || spare.spawned.child.signalCode !== null;
 			const expired = spare.expiresAt <= nowMs;
@@ -5883,7 +5977,7 @@ export class DaemonSupervisor {
 			if (!this.warmSpares.delete(spare.key)) {
 				continue;
 			}
-			const reason = dead ? "process exited" : expired ? "idle TTL expired" : "free memory below the floor";
+			const reason = dead ? "process exited" : expired ? "idle TTL expired" : "available memory below the floor";
 			const reclaim: WarmPoolReclaimReason = dead ? "exited" : expired ? "ttl_expired" : "memory_pressure";
 			this.background(this.disposeWarmSpare(spare, reason, reclaim), `warm spare sweep disposal ${spare.key}`);
 		}
@@ -7224,7 +7318,7 @@ export class DaemonSupervisor {
 
 		const interruptedSessions = new Map<
 			string,
-			{ activeSessionId: string; sessionFile: string; operations: Set<string> }
+			{ activeSessionId: string; sessionFile: string; operations: Set<string>; queuedInputs?: string[] }
 		>();
 		for (const record of uncertain) {
 			const sessionFile =
@@ -7238,7 +7332,14 @@ export class DaemonSupervisor {
 			const key = `${record.activeSessionId}\0${sessionFile}`;
 			let interrupted = interruptedSessions.get(key);
 			if (!interrupted) {
-				interrupted = { activeSessionId: record.activeSessionId, sessionFile, operations: new Set() };
+				interrupted = {
+					activeSessionId: record.activeSessionId,
+					sessionFile,
+					operations: new Set(),
+					...(record.queuedInputs !== undefined && record.queuedInputs.length > 0
+						? { queuedInputs: [...record.queuedInputs] }
+						: {}),
+				};
 				interruptedSessions.set(key, interrupted);
 			}
 			interrupted.operations.add(record.operation);
@@ -7251,9 +7352,15 @@ export class DaemonSupervisor {
 		await Promise.all(
 			[...interruptedSessions.values()].map(async (interrupted) => {
 				try {
-					await this.catalog.markInterrupted(interrupted.sessionFile, interrupted.activeSessionId, [
-						...interrupted.operations,
-					]);
+					// The dead worker's queued user inputs ride along: the marker carries
+					// them in its details and the rebinding worker replays them ahead of
+					// the automatic resume prompt.
+					await this.catalog.markInterrupted(
+						interrupted.sessionFile,
+						interrupted.activeSessionId,
+						[...interrupted.operations],
+						interrupted.queuedInputs,
+					);
 				} catch (error) {
 					// The notice is advisory: an unwritable session file must not abort
 					// the orphan reap, the journal resolution, or the recovery retry.
@@ -10777,6 +10884,10 @@ export class DaemonSupervisor {
 		} catch (error) {
 			this.updateRestartPhase = undefined;
 			this.preparedUpdateRestartManifest = undefined;
+			// The prepare's pool drain stopped the sweep along with the spares; the
+			// pool itself stays enabled after a failed prepare, so the sweep (dead
+			// spares, memory pressure) must come back with it.
+			this.startWarmPoolSweep();
 			this.scheduleScheduledSessionWakeRecompute();
 			throw error;
 		}

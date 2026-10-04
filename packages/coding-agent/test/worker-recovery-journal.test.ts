@@ -65,6 +65,65 @@ describe("WorkerRecoveryJournal", () => {
 		).toEqual(["active-1", "active-2"]);
 	});
 
+	it("round-trips queued inputs and re-records when only the queue changed", () => {
+		const path = createPath();
+		const journal = new WorkerRecoveryJournal(path);
+		journal.record({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			busy: true,
+			operation: "follow_up_queued",
+			queuedInputs: ["先跑测试"],
+		});
+
+		// A queue change alone (same busy flag, same operation, same file) is a new
+		// record: the queue is the cargo a crash recovery replays, so a second
+		// follow-up must not dedup away.
+		journal.record({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			busy: true,
+			operation: "follow_up_queued",
+			queuedInputs: ["先跑测试", "再修 lint"],
+		});
+		// An identical repeat is still deduped.
+		journal.record({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			busy: true,
+			operation: "follow_up_queued",
+			queuedInputs: ["先跑测试", "再修 lint"],
+		});
+		// The queue draining to empty is a change too (undefined and [] are the same
+		// empty queue, not a change).
+		journal.record({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			busy: true,
+			operation: "follow_up_queued",
+		});
+
+		const lines = readFileSync(path, "utf8")
+			.split("\n")
+			.filter((line) => line.length > 0);
+		expect(lines).toHaveLength(3);
+		const latest = journal.getLatest();
+		expect(latest).toHaveLength(1);
+		expect(latest[0]?.queuedInputs).toBeUndefined();
+		// A fresh reader (the supervisor after the crash) sees the same.
+		expect(WorkerRecoveryJournal.readLatest(path)[0]?.queuedInputs).toBeUndefined();
+
+		// And the queued form round-trips through a fresh read.
+		journal.record({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			busy: true,
+			operation: "follow_up_queued",
+			queuedInputs: ["再修 lint"],
+		});
+		expect(WorkerRecoveryJournal.readLatest(path)[0]?.queuedInputs).toEqual(["再修 lint"]);
+	});
+
 	it("cleans stale compaction temp files left by a crash", () => {
 		const path = createPath();
 		writeFileSync(`${path}.4242.tmp`, "stale");

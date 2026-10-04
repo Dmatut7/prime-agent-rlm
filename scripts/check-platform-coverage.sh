@@ -70,6 +70,7 @@ packages/coding-agent/test/command-recovery-journal.test.ts|none|any|skips one t
 packages/coding-agent/test/cron-jobs.test.ts|none|any|runs everywhere but win32
 packages/coding-agent/test/daemon-ps.test.ts|none|any|runs everywhere but win32
 packages/coding-agent/test/daemon-socket.test.ts|none|any|one describe skips on win32
+packages/coding-agent/test/daemon-warm-pool-memory.test.ts|darwin|NONE|one darwin-only test (the real vm_stat read in availableMemoryBytes); the parser tests run on linux so the file itself is not a nothing-file
 packages/coding-agent/test/exec.test.ts|none|any|the execCommand describe skips on win32
 packages/coding-agent/test/interactive-update-relaunch.test.ts|none|any|skips one test on win32
 packages/coding-agent/test/kernel-snapshot-reference-states.test.ts|none|any|skips one test on win32

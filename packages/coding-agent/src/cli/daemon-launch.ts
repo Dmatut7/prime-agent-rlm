@@ -32,6 +32,7 @@ import {
 } from "../modes/daemon/daemon-worker-protocol.js";
 import { processIdExists } from "../utils/child-process.js";
 import { sleep } from "../utils/sleep.js";
+import { expandEqualsFormOptions } from "./args.js";
 import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
 import { createCliSubprocessEnv, formatCurrentCliCommand } from "./subprocess-launch.js";
 
@@ -668,15 +669,31 @@ function findFirstEarlyLaunchPositional(args: readonly string[]): { index: numbe
 	return undefined;
 }
 
-export function shouldStartDaemonEarly(args: readonly string[], startupBenchmark: boolean): boolean {
+export function shouldStartDaemonEarly(rawArgs: readonly string[], startupBenchmark: boolean): boolean {
 	if (startupBenchmark) {
 		return false;
 	}
+	// This scan runs before parseArgs, so the `--flag=value` spellings parseArgs
+	// accepts must be unfolded here too (the same expansion, the same option set):
+	// `--mode=daemon` used to slip past the daemon check and early-start a second
+	// daemon over the socket the real one was about to take.
+	const args = expandEqualsFormOptions([...rawArgs]);
 	const modeIndex = args.indexOf("--mode");
 	if (modeIndex !== -1 && args[modeIndex + 1] === "daemon") {
 		return false;
 	}
-	if (args.some((arg) => EARLY_LAUNCH_EXCLUDED_FLAGS.has(arg))) {
+	if (
+		args.some((arg) => {
+			if (EARLY_LAUNCH_EXCLUDED_FLAGS.has(arg)) {
+				return true;
+			}
+			// Excluded flags whose value rides in the same token (`--export=file`):
+			// the equals expansion covers only value-taking options, so match the
+			// flag head here as well.
+			const eqIndex = arg.startsWith("--") ? arg.indexOf("=") : -1;
+			return eqIndex > 2 && EARLY_LAUNCH_EXCLUDED_FLAGS.has(arg.slice(0, eqIndex));
+		})
+	) {
 		return false;
 	}
 	if (args.includes("--print") || args.includes("-p")) {
@@ -697,29 +714,53 @@ export function shouldStartDaemonEarly(args: readonly string[], startupBenchmark
 	return true;
 }
 
+export interface EarlyDaemonLaunchTarget {
+	/** The socket the early kick answers to; absent = resolve the agent-dir daemon's socket. */
+	socketPath?: string;
+	spawnCwd?: string;
+}
+
+/**
+ * Where the early daemon kick goes, or undefined when it is pointless (a `--cwd`
+ * that does not exist). The `--flag=value` spellings are unfolded with the same
+ * expansion parseArgs applies: this scan runs before parseArgs, and an unfolded
+ * `--daemon-socket=/x` or `--cwd=/y` used to be invisible here, so the kick went
+ * to the agent-dir default daemon while the session then took the explicit one.
+ */
+export function earlyDaemonLaunchTarget(rawArgs: readonly string[]): EarlyDaemonLaunchTarget | undefined {
+	const args = expandEqualsFormOptions([...rawArgs]);
+	const socketIndex = args.indexOf("--daemon-socket");
+	const explicitSocketPath = socketIndex !== -1 ? args[socketIndex + 1] : undefined;
+	const cwdIndex = args.indexOf("--cwd");
+	const cwdArg = cwdIndex !== -1 ? args[cwdIndex + 1] : undefined;
+	const spawnCwd = cwdArg ? resolve(expandTildePath(cwdArg)) : undefined;
+	if (spawnCwd && !existsSync(spawnCwd)) {
+		return undefined;
+	}
+	return {
+		...(explicitSocketPath !== undefined ? { socketPath: normalizeSocketPath(explicitSocketPath, spawnCwd) } : {}),
+		...(spawnCwd !== undefined ? { spawnCwd } : {}),
+	};
+}
+
 export function maybeStartDaemonEarly(args: readonly string[]): void {
 	const benchmarkFlag = (process.env.PI_STARTUP_BENCHMARK ?? "").toLowerCase();
 	const startupBenchmark = benchmarkFlag === "1" || benchmarkFlag === "true" || benchmarkFlag === "yes";
 	if (!shouldStartDaemonEarly(args, startupBenchmark)) {
 		return;
 	}
-	const socketIndex = args.indexOf("--daemon-socket");
-	const explicitSocketPath =
-		socketIndex !== -1 && args[socketIndex + 1] ? (args[socketIndex + 1] as string) : undefined;
-	const cwdIndex = args.indexOf("--cwd");
-	const cwdArg = cwdIndex !== -1 ? args[cwdIndex + 1] : undefined;
-	const spawnCwd = cwdArg ? resolve(expandTildePath(cwdArg)) : undefined;
-	if (spawnCwd && !existsSync(spawnCwd)) {
+	const target = earlyDaemonLaunchTarget(args);
+	if (target === undefined) {
 		return;
 	}
-	if (explicitSocketPath !== undefined) {
-		void ensureInteractiveDaemonRunning(normalizeSocketPath(explicitSocketPath, spawnCwd), spawnCwd);
+	if (target.socketPath !== undefined) {
+		void ensureInteractiveDaemonRunning(target.socketPath, target.spawnCwd);
 		return;
 	}
 	// Resolve agent-dir scoped before spawning: in a foreign $TMPDIR the daemon that
 	// owns this agent dir is already running under a different socket path, and the
 	// kick must reuse it rather than start a second one over the same state.
 	void resolveDaemonSocketForAgentDir()
-		.then((endpoint) => ensureInteractiveDaemonRunning(endpoint.socketPath, spawnCwd))
+		.then((endpoint) => ensureInteractiveDaemonRunning(endpoint.socketPath, target.spawnCwd))
 		.catch(() => undefined);
 }

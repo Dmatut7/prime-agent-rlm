@@ -2,9 +2,10 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+	earlyDaemonLaunchTarget,
 	ensureInteractiveDaemonRunning,
 	judgeDaemonReuse,
 	probeDaemonVersion,
@@ -416,13 +417,51 @@ describe("shouldStartDaemonEarly", () => {
 
 	it.each([
 		["daemon process", ["--mode", "daemon"]],
+		["daemon process in equals form", ["--mode=daemon"]],
 		["help", ["--help"]],
 		["version", ["--version"]],
 		["model listing", ["--list-models"]],
+		["removed export in equals form", ["--export=session.md"]],
 		["management command after global flags", ["--daemon-socket", "/tmp/prime.sock", "status"]],
+		["management command after an equals-form global flag", ["--daemon-socket=/tmp/prime.sock", "status"]],
 		["startup benchmark", []],
 	])("does not start early for %s", (label, args) => {
 		expect(shouldStartDaemonEarly(args, label === "startup benchmark")).toBe(false);
+	});
+});
+
+describe("earlyDaemonLaunchTarget", () => {
+	it("reads --daemon-socket and --cwd in their equals forms", () => {
+		const socketPath = join(tmpdir(), "prime-wave41-equals.sock");
+		expect(earlyDaemonLaunchTarget([`--daemon-socket=${socketPath}`])).toEqual({ socketPath });
+		expect(earlyDaemonLaunchTarget([`--cwd=${process.cwd()}`, "--print", "hi"])).toEqual({
+			spawnCwd: process.cwd(),
+		});
+		expect(earlyDaemonLaunchTarget([`--daemon-socket=${socketPath}`, `--cwd=${process.cwd()}`])).toEqual({
+			socketPath,
+			spawnCwd: process.cwd(),
+		});
+	});
+
+	it("keeps the space-separated forms working", () => {
+		const socketPath = join(tmpdir(), "prime-wave41-spaced.sock");
+		expect(earlyDaemonLaunchTarget(["--daemon-socket", socketPath])).toEqual({ socketPath });
+		expect(earlyDaemonLaunchTarget(["--cwd", process.cwd()])).toEqual({ spawnCwd: process.cwd() });
+	});
+
+	it("skips the kick when the equals-form --cwd does not exist", () => {
+		expect(earlyDaemonLaunchTarget(["--cwd=/definitely/missing/prime-wave41-eq"])).toBeUndefined();
+		expect(
+			earlyDaemonLaunchTarget([`--daemon-socket=${join(tmpdir(), "x.sock")}`, "--cwd=/definitely/missing/w41"]),
+		).toBeUndefined();
+	});
+
+	it("does not mistake an equals-form value for a positional prompt", () => {
+		// `--daemon-socket=x` expands to two tokens; the value must not surface as a
+		// positional, or a management command after it would look like a session run.
+		expect(earlyDaemonLaunchTarget(["--daemon-socket=x.sock", "status"])).toEqual({
+			socketPath: resolve("x.sock"),
+		});
 	});
 });
 

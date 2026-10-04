@@ -1,0 +1,8 @@
+- Fixed the warm spare pool almost never stocking on macOS by measuring available memory (reclaimable pages included, via `vm_stat`/`MemAvailable`) instead of the bare free list.
+- Fixed the warm spare pool exceeding its spare cap when several sessions were created at once, by counting still-warming spawns against the cap.
+- Fixed shutdown and update handoffs waiting up to ~8s for a still-booting spare: the pool drain now cancels in-flight warm-ups.
+- Fixed the warm pool's periodic sweep stopping permanently after a failed update-restart preparation.
+- Fixed daemon startup forking `ps` once per foreign owner record inside the registry lock; the liveness check is kill(0) again.
+- Fixed an idle subagent being passivated while a client was viewing it through the supervisor relay, which showed a misleading "daemon shut down" error; the idle sweep now names relayed-viewed sessions to the worker.
+- Fixed the early daemon kick ignoring `--daemon-socket=…`, `--cwd=…`, and `--mode=daemon` in their equals forms.
+- Fixed a worker crash losing the session's queued user inputs: the recovery journal now carries them and the rebinding worker replays them ahead of the automatic resume prompt.

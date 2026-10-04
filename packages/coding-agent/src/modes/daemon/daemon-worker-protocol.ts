@@ -144,6 +144,15 @@ export type DaemonWorkerCommand =
 			idleEvictionMinutes: IdleEvictionMinutes;
 			now: number;
 			limit: number;
+			/**
+			 * Sessions a client is viewing through the supervisor relay. A relayed
+			 * attach never touches the worker's own client set (the supervisor's
+			 * subscription rides the supervisor-role connection, deliberately not
+			 * counted), so without this list the sweep passivates a child out from
+			 * under its viewer. Additive and optional: an older worker ignores it,
+			 * which is the pre-fix passivation it already performed.
+			 */
+			viewedActiveSessionIds?: readonly string[];
 	  }
 	| {
 			id?: string;

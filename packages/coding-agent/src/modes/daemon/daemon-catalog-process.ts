@@ -57,6 +57,13 @@ type CatalogRequest =
 			sessionPath: string;
 			activeSessionId: string;
 			operations: string[];
+			/**
+			 * Queued-but-undelivered user inputs from the dead worker's journal;
+			 * carried into the marker's details so the rebinding worker can replay
+			 * them ahead of the automatic resume prompt. The catalog is spawned by
+			 * the same build as the supervisor, so the field needs no version gate.
+			 */
+			queuedInputs?: string[];
 	  }
 	| { type: "request"; id: string; command: "shutdown" };
 
@@ -278,7 +285,14 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				});
 				return;
 			}
-			case "mark_interrupted":
+			case "mark_interrupted": {
+				const details: Record<string, unknown> = {
+					activeSessionId: request.activeSessionId,
+					operations: request.operations,
+				};
+				if (request.queuedInputs !== undefined && request.queuedInputs.length > 0) {
+					details.queuedInputs = request.queuedInputs;
+				}
 				await appendOwnedFastEntry(
 					request.sessionPath,
 					() =>
@@ -287,24 +301,19 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 							"prime-agent.worker_recovery",
 							"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
 							false,
-							{
-								activeSessionId: request.activeSessionId,
-								operations: request.operations,
-							},
+							details,
 						),
 					(manager) =>
 						manager.appendCustomMessageEntry(
 							"prime-agent.worker_recovery",
 							"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
 							false,
-							{
-								activeSessionId: request.activeSessionId,
-								operations: request.operations,
-							},
+							details,
 						),
 				);
 				sendCatalogMessage({ type: "response", id: request.id, success: true });
 				return;
+			}
 			case "shutdown":
 				sendCatalogMessage({ type: "response", id: request.id, success: true });
 				setImmediate(() => process.exit(0));
@@ -387,7 +396,12 @@ export class DaemonCatalogClient {
 		return data.archived;
 	}
 
-	async markInterrupted(sessionPath: string, activeSessionId: string, operations: string[]): Promise<void> {
+	async markInterrupted(
+		sessionPath: string,
+		activeSessionId: string,
+		operations: string[],
+		queuedInputs?: string[],
+	): Promise<void> {
 		await this.request({
 			type: "request",
 			id: randomUUID(),
@@ -395,6 +409,7 @@ export class DaemonCatalogClient {
 			sessionPath,
 			activeSessionId,
 			operations,
+			...(queuedInputs !== undefined && queuedInputs.length > 0 ? { queuedInputs } : {}),
 		});
 	}
 

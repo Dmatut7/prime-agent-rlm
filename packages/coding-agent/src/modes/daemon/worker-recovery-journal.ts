@@ -22,6 +22,14 @@ export interface WorkerRecoveryRecord {
 	sessionFile?: string;
 	busy: boolean;
 	operation: string;
+	/**
+	 * The session's queued-but-undelivered user inputs at checkpoint time, in
+	 * drain order (steering lane first, then follow-ups). The action store lives
+	 * only in the worker's memory, so without this a crash loses them; the
+	 * supervisor forwards them into the interruption marker's details and the
+	 * rebinding worker replays them ahead of the automatic resume prompt.
+	 */
+	queuedInputs?: string[];
 	recordedAt: string;
 }
 
@@ -50,6 +58,14 @@ interface ParsedJournal {
 	/** Physical lines on disk, parsable or not: compaction is what removes them. */
 	lineCount: number;
 	byteLength: number;
+}
+
+/** The empty queue and the absent queue are the same fact for dedup purposes. */
+function queuedInputsEqual(left: readonly string[] | undefined, right: readonly string[] | undefined): boolean {
+	if (left === undefined || left.length === 0) {
+		return right === undefined || right.length === 0;
+	}
+	return right !== undefined && left.length === right.length && left.every((item, index) => item === right[index]);
 }
 
 function parseJournal(path: string): ParsedJournal {
@@ -81,7 +97,9 @@ function parseJournal(path: string): ParsedJournal {
 			typeof record.activeSessionId === "string" &&
 			typeof record.sessionId === "string" &&
 			typeof record.busy === "boolean" &&
-			typeof record.operation === "string"
+			typeof record.operation === "string" &&
+			(record.queuedInputs === undefined ||
+				(Array.isArray(record.queuedInputs) && record.queuedInputs.every((item) => typeof item === "string")))
 		) {
 			latest.set(record.activeSessionId, record);
 		}
@@ -153,7 +171,8 @@ export class WorkerRecoveryJournal {
 		if (
 			previous?.busy === input.busy &&
 			previous.operation === input.operation &&
-			previous.sessionFile === input.sessionFile
+			previous.sessionFile === input.sessionFile &&
+			queuedInputsEqual(previous.queuedInputs, input.queuedInputs)
 		) {
 			return;
 		}

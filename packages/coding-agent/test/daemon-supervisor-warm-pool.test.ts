@@ -73,6 +73,12 @@ const hoisted = vi.hoisted(() => ({
 	// once with no server behind it.
 	listenDelayMs: 0,
 	failNextSpawn: false,
+	// Delays every fake worker's "create" response, holding the supervisor's
+	// mutation drain latch so an update-restart prepare can time out.
+	createResponseDelayMs: 0,
+	// The pool's available-memory reading (the warm-pool-memory module is mocked
+	// below): pinned high by default so existing tests never trip the floor.
+	memoryBytes: { value: Number.MAX_SAFE_INTEGER },
 }));
 
 function encodeFrame(header: object, payload: Buffer): Buffer {
@@ -172,7 +178,19 @@ async function startFakeWorkerServer(
 					continue;
 				}
 				if (type === "create") {
-					respond(header.requestId, type, { success: true, data: summary });
+					// The delay hook holds the supervisor's mutation drain latch so an
+					// update-restart prepare can time out behind an in-flight create.
+					// (const capture: the loop guard's narrowing does not flow into the
+					// timer closure.)
+					const requestId = header.requestId;
+					if (hoisted.createResponseDelayMs > 0) {
+						setTimeout(
+							() => respond(requestId, type, { success: true, data: summary }),
+							hoisted.createResponseDelayMs,
+						);
+					} else {
+						respond(requestId, type, { success: true, data: summary });
+					}
 					continue;
 				}
 				if (type === "list") {
@@ -260,6 +278,13 @@ vi.mock("node:child_process", async (importOriginal) => {
 	return { ...actual, spawn: spawn as typeof actual.spawn };
 });
 
+// The pool's memory floor reads the available-memory metric (src module under
+// test here); pin it high by default so the floor never interferes, and let the
+// memory tests drive it down.
+vi.mock("../src/modes/daemon/warm-pool-memory.js", () => ({
+	availableMemoryBytes: () => hoisted.memoryBytes.value,
+}));
+
 const tempDirs: string[] = [];
 const supervisors: DaemonSupervisor[] = [];
 const clients: DaemonClient[] = [];
@@ -289,6 +314,8 @@ function eventDepth(entry: LogEntry): { ready: number; warming: number } {
 afterEach(async () => {
 	hoisted.listenDelayMs = 0;
 	hoisted.failNextSpawn = false;
+	hoisted.createResponseDelayMs = 0;
+	hoisted.memoryBytes.value = Number.MAX_SAFE_INTEGER;
 	setLogSink(undefined);
 	logEntries.length = 0;
 	for (const client of clients.splice(0)) {
@@ -320,12 +347,18 @@ interface PoolFixture {
 	client: DaemonClient;
 }
 
-async function startPoolSupervisor(warmPool?: {
-	ttlMs?: number;
-	claimConnectTimeoutMs?: number;
-	claimWarmingWaitMs?: number;
-	spawnCooldownMs?: number;
-}): Promise<PoolFixture> {
+async function startPoolSupervisor(
+	warmPool?: {
+		ttlMs?: number;
+		claimConnectTimeoutMs?: number;
+		claimWarmingWaitMs?: number;
+		spawnCooldownMs?: number;
+		maxSpares?: number;
+		sweepIntervalMs?: number;
+		minFreeMemoryBytes?: number;
+	},
+	supervisorOptions?: { updateRestartDrainTimeoutMs?: number },
+): Promise<PoolFixture> {
 	const root = mkdtempSync(join(tmpdir(), "prime-warm-pool-test-"));
 	tempDirs.push(root);
 	const agentDir = join(root, "agent");
@@ -343,6 +376,9 @@ async function startPoolSupervisor(warmPool?: {
 	const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
 		defaultSessionConfig: { cwd: projectDir, agentDir },
 		descriptorDir,
+		...(supervisorOptions?.updateRestartDrainTimeoutMs !== undefined
+			? { updateRestartDrainTimeoutMs: supervisorOptions.updateRestartDrainTimeoutMs }
+			: {}),
 		...(warmPool
 			? // Tests opt into spares deterministically: the memory-pressure floor
 				// would otherwise skip the prebuild on a loaded parallel shard.
@@ -651,6 +687,114 @@ describe("daemon supervisor warm spare pool", () => {
 		// The update fence keeps the pool empty: no replenish while prepared.
 		await new Promise((resolveWait) => setTimeout(resolveWait, 200));
 		expect(hoisted.spawned).toHaveLength(1);
+	});
+
+	it("stocks no spare while the available-memory reading is below the floor", async () => {
+		// The metric is mocked below the floor from the start: the startup prebuild
+		// must not spawn at all. freemem() on this host would pass a 1KiB floor, so
+		// a supervisor still reading the bare free list fails here.
+		hoisted.memoryBytes.value = 0;
+		const { projectDir, client } = await startPoolSupervisor({ minFreeMemoryBytes: 1024, ttlMs: 30_000 });
+		await new Promise((resolveWait) => setTimeout(resolveWait, 300));
+		expect(hoisted.spawned).toHaveLength(0);
+
+		// The block is the floor, not a broken pool: once the reading recovers, the
+		// next create's replenish stocks a spare.
+		hoisted.memoryBytes.value = Number.MAX_SAFE_INTEGER;
+		const response = await client.request({ type: "create", config: { cwd: projectDir } }, 15_000);
+		expect(response.success).toBe(true);
+		await waitForCondition(
+			() => hoisted.spawned.some((spawn) => spawn.env[DAEMON_WORKER_WARM_SPARE_ENV] === "1"),
+			"the replenish spare after the memory reading recovered",
+		);
+	});
+
+	it("sweeps the pooled spare when the available-memory reading drops below the floor", async () => {
+		await startPoolSupervisor({ ttlMs: 60_000, sweepIntervalMs: 100, minFreeMemoryBytes: 1024 });
+		await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
+		const spare = hoisted.spawned[0]!;
+
+		hoisted.memoryBytes.value = 0;
+		await waitForProcessExit(spare.child, 5_000);
+	});
+
+	it("counts warming spawns against the pool cap when creates race", async () => {
+		// Slow the warm-up so every replenish is still in flight when the next
+		// create's replenish asks for its own: the cap must count them.
+		hoisted.listenDelayMs = 400;
+		const { client, root } = await startPoolSupervisor({ maxSpares: 3, spawnCooldownMs: 0, ttlMs: 30_000 });
+		const cwds = ["race-a", "race-b", "race-c"].map((name) => {
+			const directory = join(root, name);
+			mkdirSync(directory, { recursive: true });
+			return directory;
+		});
+
+		const responses = await Promise.all(
+			cwds.map((cwd) => client.request({ type: "create", config: { cwd } }, 20_000)),
+		);
+		for (const response of responses) {
+			expect(response.success).toBe(true);
+		}
+		// Let every in-flight warm-up settle (publish or dispose) before counting.
+		await new Promise((resolveWait) => setTimeout(resolveWait, 1_000));
+		const warmSpawns = hoisted.spawned.filter((spawn) => spawn.env[DAEMON_WORKER_WARM_SPARE_ENV] === "1");
+		expect(warmSpawns.length).toBeLessThanOrEqual(3);
+	});
+
+	it("cancels a warming spare at shutdown instead of waiting out its boot probe", async () => {
+		// The spare's server listens only after 6s, so its boot probe would run past
+		// the 5s assertion budget on the shutdown path; the drain must cancel the
+		// warm-up instead. (The delay stays under the 10s afterEach budget, which
+		// awaits the same listen.)
+		hoisted.listenDelayMs = 6_000;
+		const { supervisor } = await startPoolSupervisor({ ttlMs: 60_000 });
+		await waitForCondition(() => hoisted.spawned.length === 1, "the warming startup spare");
+		const warming = hoisted.spawned[0]!;
+
+		const startedAt = Date.now();
+		await supervisor.dispose();
+		expect(Date.now() - startedAt).toBeLessThan(5_000);
+		await waitForProcessExit(warming.child, 5_000);
+	});
+
+	it("restarts the pool sweep when update-restart preparation fails", async () => {
+		hoisted.createResponseDelayMs = 600;
+		const { projectDir, client } = await startPoolSupervisor(
+			{ ttlMs: 60_000, sweepIntervalMs: 100, spawnCooldownMs: 0, minFreeMemoryBytes: 1024 },
+			{ updateRestartDrainTimeoutMs: 150 },
+		);
+		await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
+		const spareServer = await hoisted.spawned[0]!.server;
+
+		// Hold a mutation in flight past the drain timeout so the prepare fails after
+		// its pool drain already cleared the sweep timer. The claimed startup spare
+		// keeps its warm marker in its env, so only post-create spawns count below.
+		const spawnedBeforeCreate = hoisted.spawned.length;
+		const create = client.request({ type: "create", config: { cwd: projectDir } }, 15_000);
+		await waitForCondition(() => spareServer.commands.includes("create"), "the in-flight create");
+		const prepare = await client.request({ type: "prepare_update_restart" }, 15_000);
+		if (prepare.success) {
+			throw new Error("prepare_update_restart unexpectedly succeeded despite the held mutation");
+		}
+		expect(prepare.error).toContain("drain");
+		const createResponse = await create;
+		expect(createResponse.success).toBe(true);
+
+		// The pool restocks after the failed prepare (it stays enabled)...
+		await waitForCondition(
+			() =>
+				hoisted.spawned.slice(spawnedBeforeCreate).some((spawn) => spawn.env[DAEMON_WORKER_WARM_SPARE_ENV] === "1"),
+			"the replenished spare",
+		);
+		const replenished = hoisted.spawned
+			.slice(spawnedBeforeCreate)
+			.find((spawn) => spawn.env[DAEMON_WORKER_WARM_SPARE_ENV] === "1")!;
+		// ...and the sweep must still run: memory pressure releases the replenished
+		// spare. Its own TTL timer would reap it too, so only the pressure path is a
+		// honest witness of the sweep; before the fix the failed prepare's drain had
+		// stopped the sweep for good and the spare idles out its 60s TTL here.
+		hoisted.memoryBytes.value = 0;
+		await waitForProcessExit(replenished.child, 5_000);
 	});
 
 	it("claims a still-warming spare after a bounded wait instead of launching cold", async () => {

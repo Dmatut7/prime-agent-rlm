@@ -253,6 +253,44 @@ describe("daemon supervisor whole-tree eviction", () => {
 		expect(supervisor.stopWorker).toHaveBeenCalledWith(whollyIdle, true);
 	});
 
+	it("tells the worker which idle children a relayed client is viewing", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const viewed = makeWorker("viewed", [
+			makeSummary("viewed-root", now),
+			makeSummary("viewed-child", now, { runtimeKind: "subagent", parentActiveSessionId: "viewed-root" }),
+		]);
+		viewed.client!.requestWorker.mockResolvedValue({
+			type: "response",
+			command: "worker_passivate_idle_children",
+			success: true,
+			data: { count: 0 },
+		});
+		supervisor.workers.set("viewed", viewed);
+		seedSupervisorRoster(supervisor, viewed);
+		// A client attached through the supervisor relay has no direct worker link, so
+		// the worker's own client accounting cannot see it; the supervisor must name it.
+		supervisor.clients.add({ id: "viewer-1", attachedActiveSessionIds: new Set(["viewed-child"]) });
+
+		await supervisor.runIdleEvictionSweep(now);
+
+		// The relayed viewer pins the child against whole-worker eviction...
+		expect(supervisor.stopWorker).not.toHaveBeenCalled();
+		// ...and the child passivation delegation carries the viewed set so the worker
+		// does not close the session out from under the window.
+		expect(viewed.client?.requestWorker).toHaveBeenCalledWith(
+			{
+				type: "worker_passivate_idle_children",
+				// Children run on their own shorter clock (childIdleEvictionMinutes, default 20).
+				idleEvictionMinutes: 20,
+				now,
+				limit: 2,
+				viewedActiveSessionIds: ["viewed-child"],
+			},
+			30_000,
+		);
+	});
+
 	it("keeps a worker resident when a session hosts live kernel bash work", async () => {
 		const now = Date.parse("2026-08-01T12:00:00.000Z");
 		const supervisor = makeSupervisor();

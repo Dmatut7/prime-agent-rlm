@@ -194,7 +194,7 @@ const EQUALS_FORM_OPTIONS: ReadonlySet<string> = new Set([
 ]);
 
 /** Rewrite `--flag=value` for known value-taking options into the two-token form the parser handles. */
-function expandEqualsFormOptions(args: string[]): string[] {
+export function expandEqualsFormOptions(args: string[]): string[] {
 	const expanded: string[] = [];
 	let endOfOptions = false;
 	for (const arg of args) {
