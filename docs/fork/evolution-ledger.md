@@ -14,13 +14,11 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-05，wave-44 已 SHIP）
+## 当前状态（2026-10-05，wave-45 已 SHIP）
 
-- HEAD = 见 git log（四批：env 名单、footer 即刷、安全簇方案、refine 设计稿+FORK_NOTES+账本）。
-- wave-44：env 名单补全（macOS 会话键 ×6，暖池指纹不变有钉）；footer 模型名即刷；
-  安全簇拍板形态备好（待批 11 项带速勾表）；refine 两刀设计稿备好。
-- 老板挂账变成三项：第 0 条历史改写、记忆帽三选一、安全簇 11 项勾选。
-- 门禁：check EXIT 0、hygiene OK、单测/suite/python 复扫（数字见惯例）。
+- HEAD = 见 git log（三批：第十一刀、插话钉测试、FORK_NOTES+账本+AGENTS.md）。
+- wave-45：agent-session.ts 18991 行（十一刀累计 −4509）；插话复核销账（设计如此）；
+  AGENTS.md 有了「Code Review Rules」节（5 条，全从事故来）。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -101,12 +99,10 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
   把在跑会话归档。犯了就是事故，写进 FORK_NOTES 向老板披露。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-45 候选）
+## 下一波主题（wave-46 候选）
 
-1. 【流程改进落地】AGENTS.md「Code Review Rules」节 + walkthrough 矩阵 v1 + P0/P1/P2 分级惯例
-   （research 素材在 /tmp/wave41+42；主席直写）。
-2. 【第十一刀 refine-execution】按设计稿（docs/fork/refine-cluster-split-plan.md）。
-3. 【安全簇】等老板勾方案；勾完按项派 lane。
-4. 【走查新观察复核】UX lane 的自曝事件（误发 clear+resume 进 TUI 成插话）——插话路径
-   健壮性复核。
-5. 【记忆帽/第 0 条】仍待老板。
+1. 【第十二刀 refine-scheduler】按设计稿第二刀（docs/fork/refine-cluster-split-plan.md）：
+   ~890 行/21 方法，单向 import execution。
+2. 【walkthrough 矩阵 v1】install/attach/resume/shutdown × daemon 新旧组合（调研 §3）。
+3. 【脱敏 4 变体】等老板勾安全簇方案后派工；不勾不动。
+4. 【老板挂账】第 0 条历史改写；记忆帽三选一；安全簇 11 项。

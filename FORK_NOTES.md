@@ -1,3 +1,12 @@
+## 2026-10-04 wave-45 四路：第十一刀 refine-execution、插话复核销账、评审规则进 AGENTS.md
+
+- AgentSession 第十一刀：refine 执行核（refine/plan/apply/回执族）搬进 core/refine-execution.ts——agent-session.ts 19520→18991 行（十一刀累计 23500→18991，−4509），守恒 20/20 逐字节全等；一处 spy 绕过被抓后改经 host 分派（这正是流程钉测试存在的意义）。
+- 插话健壮性复核销账：TUI 运行中打字进 steer 是明示特性，空提交/控制序列/粘贴控制字节各有守卫在位；事故是走查工具往 pane 里发文本的机理，不是产品洞。钉了 3 条提交准入契约测试。
+- AGENTS.md 新增「Code Review Rules」节（评审经验的跨波复用面，首批 5 条：测试不得替换被测段、env 跨进程边界显式、fan-out 改形状先列消费方、刹车必带恢复、计时器别信固定时长）。
+- 走查实证 wave-44：精简环境 claude 探测修复生效（`!claude auth status` 出 loggedIn:true）、footer 即刷同帧实证、主流程绿。
+- 调研零增量。
+- 门禁：check EXIT 0、hygiene OK、tui editor 208/208、复扫见账本。需要重新编译并重启后才生效。
+
 ## 2026-10-04 wave-44 六路：env 名单补全、footer 模型名即刷、安全簇拍板方案、refine 拆刀设计稿
 
 - 子进程环境名单补全（macOS 会话键 6 个：SECURITYSESSIONID 等）——精简环境下 claude 钥匙串探测不再失败；暖池环境指纹语义不变（有钉测试）。
