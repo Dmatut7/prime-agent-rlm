@@ -204,7 +204,9 @@ export interface BashToolOptions {
 	 * Whether the tool exposes and honors the `allowDestructiveGit` argument
 	 * (the interactive face). Daemon/SDK faces omit the argument and honor only
 	 * the `PI_BASH_ALLOW_DESTRUCTIVE_GIT` env bypass, so an unsupervised model
-	 * cannot talk the guard open by itself.
+	 * cannot open the guard through tool arguments. The matcher itself stays
+	 * best-effort shell-text heuristics with a documented residual bypass
+	 * surface (wrapper unwrapping is one level deep; see the guard section).
 	 */
 	allowDestructiveGitArgument?: boolean;
 }
@@ -226,6 +228,21 @@ const MAX_DIRTY_PATHS_LISTED = 10;
  * Conservative by design: a false positive costs one `git status` probe and
  * an explicit-bypass retry; a false negative silently loses work. Matching is
  * best-effort shell-text heuristics, not a parse.
+ *
+ * `bash -c`/`sh -c`/`eval`-style wrappers are unwrapped one level before
+ * matching (see findWrappedDestructiveGitDiscardCommands): the wrapper's
+ * payload is shell code that runs, so blanking it as quoted data would let
+ * any wrapper smuggle a discard past the guard. Known residual bypasses,
+ * accepted as out of scope for a text heuristic:
+ * - nesting: only one wrapper level is unwrapped (`bash -c "bash -c '…'"`);
+ * - command substitution is matched where it appears literally but is never
+ *   expanded, so a discard assembled at runtime (`$(echo git) reset --hard`,
+ *   or a payload fetched through `$(curl …)`) is invisible to the guard —
+ *   recursive expansion is shell evaluation, a different magnitude;
+ * - unquoted/escaped single-word payloads (`bash -c git\ reset\ --hard`);
+ * - other execution wrappers (`env bash -c …`, `xargs`, `find -exec`, `ssh`,
+ *   `nohup`, `timeout`), here-docs, and shell functions or aliases defined
+ *   earlier in the command.
  */
 
 /**
@@ -311,8 +328,9 @@ function isForcedCleanSegment(args: string): boolean {
  * Replace characters inside single- or double-quoted spans with spaces so the
  * discard matcher cannot match quoted data (for example `echo 'git reset --hard'`).
  * Character positions stay identical to the original string, so match indices
- * remain valid. Command substitution (`$(...)`, backticks) is left live because
- * it executes.
+ * remain valid — the wrapper unwrapper below relies on that to slice payloads
+ * out of the original text. Command substitution (`$(...)`, backticks) is left
+ * live because it executes.
  */
 function maskQuotedSpans(command: string): string {
 	const chars = command.split("");
@@ -362,7 +380,10 @@ function maskQuotedSpans(command: string): string {
 }
 
 export function findDestructiveGitDiscardCommands(command: string): number[] {
-	const masked = maskQuotedSpans(command);
+	return findDiscardIndicesInMasked(maskQuotedSpans(command)).sort((a, b) => a - b);
+}
+
+function findDiscardIndicesInMasked(masked: string): number[] {
 	const indices: number[] = [];
 	for (const pattern of [DISCARD_CHECKOUT_PATTERN, DISCARD_RESTORE_PATTERN, DISCARD_RESET_PATTERN]) {
 		for (const match of masked.matchAll(pattern)) indices.push(match.index);
@@ -376,11 +397,71 @@ export function findDestructiveGitDiscardCommands(command: string): number[] {
 	for (const match of masked.matchAll(SWEEP_STASH_PATTERN)) {
 		if (isSweepStashSegment(match[1])) indices.push(match.index);
 	}
-	return indices.sort((a, b) => a - b);
+	return indices;
+}
+
+/**
+ * `bash -c`/`sh -c`/`eval`-style wrappers, matched against the MASKED command
+ * so a wrapper spelled out inside quoted data (`echo "bash -c '…'"`) does not
+ * fire. Quoted payload spans survive masking (only their content is blanked,
+ * positions preserved), so the payload text is sliced back out of the original
+ * command by position. The option run before `-c` is best-effort: clusters
+ * ending in `c` (`-ec`) and plain options are covered; options that take
+ * separate arguments (`-o`, `--rcfile`) may end the match early, which fails
+ * open like every other gap documented at the top of this section.
+ */
+const SHELL_WRAPPER_PATTERN =
+	/(?:^|[\s;&|()])(?:\/[^\s;&|()'"]+\/)?(?:bash|sh|dash|zsh|ksh)(?:\s+-{1,2}[^\s;&|()'"]+)*?\s+-[A-Za-z]*c\s*("[^"]*"|'[^']*')/g;
+const EVAL_WRAPPER_PATTERN = /(?:^|[\s;&|()])eval\s+("[^"]*"|'[^']*')/g;
+
+export interface WrappedDiscardMatch {
+	/**
+	 * The original command with everything from the wrapper invocation on
+	 * replaced by the unwrapped payload, so probe resolution sees the payload
+	 * as if it were typed directly after the pre-wrapper text (a `cd sub && `
+	 * prefix or an inline env assignment still applies to it).
+	 */
+	command: string;
+	/** Index of the discard inside `command`. */
+	discardIndex: number;
+	/**
+	 * Start of the wrapper invocation in the original command; a wrapper at or
+	 * before the command-prefix boundary is prefix content, not user input.
+	 */
+	wrapperStart: number;
+}
+
+/**
+ * Find discards hidden inside one level of `bash -c`/`sh -c`/`eval` wrappers.
+ * The payload is matched with the same masking and patterns as a top-level
+ * command; only one level is unwrapped (see the residual-bypass list above).
+ */
+export function findWrappedDestructiveGitDiscardCommands(command: string): WrappedDiscardMatch[] {
+	const masked = maskQuotedSpans(command);
+	const results: WrappedDiscardMatch[] = [];
+	for (const pattern of [SHELL_WRAPPER_PATTERN, EVAL_WRAPPER_PATTERN]) {
+		for (const match of masked.matchAll(pattern)) {
+			const quoted = match[1];
+			const quotedStart = match.index + match[0].length - quoted.length;
+			const payload = command.slice(quotedStart + 1, quotedStart + quoted.length - 1);
+			// The leading alternative is ^ or one boundary character; test the
+			// match text rather than the index (a command may start with a
+			// separator).
+			const wrapperStart = /^[\s;&|()]/.test(match[0]) ? match.index + 1 : match.index;
+			const synthetic = command.slice(0, wrapperStart) + payload;
+			for (const index of findDiscardIndicesInMasked(maskQuotedSpans(payload))) {
+				results.push({ command: synthetic, discardIndex: wrapperStart + index, wrapperStart });
+			}
+		}
+	}
+	return results;
 }
 
 export function isDestructiveGitDiscardCommand(command: string): boolean {
-	return findDestructiveGitDiscardCommands(command).length > 0;
+	return (
+		findDestructiveGitDiscardCommands(command).length > 0 ||
+		findWrappedDestructiveGitDiscardCommands(command).length > 0
+	);
 }
 
 /**
@@ -1032,7 +1113,7 @@ export function createBashToolDefinition(
 	const definition: ToolDefinition<typeof bashSchema, BashToolDetails | undefined, BashRenderState> = {
 		name: "bash",
 		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. ${timeoutHint} Child processes run with a sanitized environment - a fixed child-safe whitelist (PATH, HOME, TZ, locale, agent routing keys), not the full parent env - so set variables inside the command itself (\`VAR=value cmd\`) or have the user export PRIME_AGENT_ENV_PASSTHROUGH=NAME1,NAME2 to forward specific names. Destructive git discard commands (git checkout -- ., git checkout ., git clean -f..., git reset --hard, git restore .) and shared-worktree sweeps (git add -A, git add ., git stash) are refused while uncommitted changes exist; ${bypassHint}.`,
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. ${timeoutHint} Child processes run with a sanitized environment - a fixed child-safe whitelist (PATH, HOME, TZ, locale, agent routing keys), not the full parent env - so set variables inside the command itself (\`VAR=value cmd\`) or have the user export PRIME_AGENT_ENV_PASSTHROUGH=NAME1,NAME2 to forward specific names. Destructive git discard commands (git checkout -- ., git checkout ., git clean -f..., git reset --hard, git restore .) and shared-worktree sweeps (git add -A, git add ., git stash), including inside one level of bash -c/sh -c/eval wrappers, are refused while uncommitted changes exist; ${bypassHint}.`,
 		promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
 		parameters,
 		async execute(
@@ -1057,11 +1138,16 @@ export function createBashToolDefinition(
 			// aligned with the command prefix; the probe itself goes through the
 			// spawn hook like the guarded command does.
 			const discardIndices = findDestructiveGitDiscardCommands(resolvedCommand);
+			// One level of bash -c/sh -c/eval unwrapping: each entry carries the
+			// command rewritten so the payload directly follows the pre-wrapper
+			// text, plus the discard's index into that rewritten command.
+			const wrappedDiscards = findWrappedDestructiveGitDiscardCommands(resolvedCommand);
 			if (
-				discardIndices.length > 0 &&
+				(discardIndices.length > 0 || wrappedDiscards.length > 0) &&
 				// The argument bypass belongs to the interactive face only
 				// (allowDestructiveGitArgument); daemon/SDK faces honor just the env
-				// var so an unsupervised model cannot talk the guard open by itself.
+				// var so an unsupervised model cannot open the guard through tool
+				// arguments.
 				!(allowArgumentBypass && allowDestructiveGit === true) &&
 				// This tree sanitizes shell-child env to a fixed whitelist, so a
 				// user-exported bypass never reaches spawnContext.env; the parent
@@ -1077,8 +1163,20 @@ export function createBashToolDefinition(
 				const probes: Array<{ context: BashSpawnContext; includesIgnoredFiles: boolean }> = [];
 				const seenProbes = new Set<string>();
 				const userCommandStart = commandPrefix ? commandPrefix.length + 1 : 0;
-				for (const index of discardIndices) {
-					const target = resolveDiscardProbeTarget(resolvedCommand, index, userCommandStart);
+				const discardTargets: Array<{ command: string; index: number; userCommandStart: number }> = [
+					...discardIndices.map((index) => ({ command: resolvedCommand, index, userCommandStart })),
+					...wrappedDiscards.map((wrapped) => ({
+						command: wrapped.command,
+						index: wrapped.discardIndex,
+						// A wrapper inside the configured command prefix is prefix
+						// content: refuse like any other prefix discard instead of
+						// probing it.
+						userCommandStart:
+							wrapped.wrapperStart < userCommandStart ? wrapped.command.length + 1 : userCommandStart,
+					})),
+				];
+				for (const { command: discardCommand, index, userCommandStart: boundary } of discardTargets) {
+					const target = resolveDiscardProbeTarget(discardCommand, index, boundary);
 					if (target === UNRESOLVABLE_DISCARD_TARGET) {
 						throw new Error(formatRelocationRefusal(allowArgumentBypass));
 					}

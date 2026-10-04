@@ -205,6 +205,37 @@ SWEEP_DOES_NOT_MATCH = [
     "git commit -m 'git stash push'",
 ]
 
+# One-level shell wrappers (bash -c / sh -c / eval): the payload runs as shell
+# code, so the guard unwraps it once before matching. Mirrors the TS face's
+# "matches shell-wrapped" vectors.
+WRAPPED_MATCHES = [
+    "bash -c 'git reset --hard'",
+    'bash -c "git reset --hard"',
+    "sh -c 'git clean -fd'",
+    "sh -c 'git checkout -- .'",
+    "/bin/bash -c 'git reset --hard'",
+    "bash -ec 'git reset --hard'",
+    "bash -x -c 'git restore .'",
+    "eval 'git reset --hard'",
+    'eval "git clean -fd"',
+    "eval 'git add -A'",
+    "cd sub && bash -c 'git reset --hard'",
+    "sudo bash -c 'git stash'",
+    "bash -c 'git -C sub reset --hard'",
+    "echo ok && bash -c 'git add -A'",
+    "bash -c 'echo before; git reset --hard'",
+]
+
+WRAPPED_DOES_NOT_MATCH = [
+    "bash -c 'echo hi'",
+    "sh -c 'ls -la'",
+    "eval 'echo done'",
+    "bash -c 'git status'",
+    "bash script.sh",
+    "bash -c 'git reset --soft HEAD~1'",
+    "bash -c 'git stash list'",
+]
+
 
 class MatcherVectorTest(unittest.TestCase):
     """1:1 pattern parity with the TS face."""
@@ -224,6 +255,22 @@ class MatcherVectorTest(unittest.TestCase):
         vectors = [*DOES_NOT_MATCH, *SWEEP_DOES_NOT_MATCH]
         self.assertGreater(len(vectors), len(DOES_NOT_MATCH))
         for command in vectors:
+            with self.subTest(command=command):
+                self.assertFalse(bool(find(command)), command)
+
+    def test_wrapped_matches(self):
+        find = getattr(bash_module, "_find_wrapped_destructive_git_discard_commands", None)
+        self.assertIsNotNone(find, "wrapped guard matcher missing")
+        self.assertGreater(len(WRAPPED_MATCHES), 0)
+        for command in WRAPPED_MATCHES:
+            with self.subTest(command=command):
+                self.assertTrue(bool(find(command)), command)
+
+    def test_wrapped_does_not_match(self):
+        find = getattr(bash_module, "_find_wrapped_destructive_git_discard_commands", None)
+        self.assertIsNotNone(find, "wrapped guard matcher missing")
+        self.assertGreater(len(WRAPPED_DOES_NOT_MATCH), 0)
+        for command in WRAPPED_DOES_NOT_MATCH:
             with self.subTest(command=command):
                 self.assertFalse(bool(find(command)), command)
 
@@ -577,6 +624,56 @@ class GuardBehaviorTest(unittest.IsolatedAsyncioTestCase):
                 repo = self.dirty_repo(f"wrap-{abs(hash(command)) % 100000}")
                 await self.assert_refused(command, repo)
                 self.assertEqual(read_tracked(repo), "modified\n")
+
+    async def test_refuses_shell_wrapped_discards_on_dirty_tree(self):
+        for command in [
+            "bash -c 'git reset --hard'",
+            'bash -c "git reset --hard"',
+            "sh -c 'git clean -fd'",
+            "eval 'git checkout -- .'",
+            "/bin/bash -c 'git restore .'",
+        ]:
+            with self.subTest(command=command):
+                repo = self.dirty_repo(f"wc-{abs(hash(command)) % 100000}")
+                message = await self.assert_refused(command, repo)
+                self.assertIn("Refusing to run this destructive git command", message)
+                self.assertEqual(read_tracked(repo), "modified\n")
+                self.assertTrue(os.path.exists(os.path.join(repo, "untracked.txt")))
+
+    async def test_refuses_shell_wrapped_sweep_and_stages_nothing(self):
+        repo = self.dirty_repo()
+        await self.assert_refused("bash -c 'git add -A'", repo)
+        self.assertEqual(git_status_lines(repo), [" M tracked.txt", "?? untracked.txt"])
+
+    async def test_wrapped_git_dash_c_targets_the_nested_repository(self):
+        sub = self.dirty_repo("sub")
+        message = await self.assert_refused("bash -c 'git -C sub reset --hard'", self.tmp)
+        self.assertIn("tracked.txt", message)
+        self.assertEqual(read_tracked(sub), "modified\n")
+
+    async def test_wrapped_cd_chain_fails_open_documented_boundary(self):
+        # Same documented boundary as unwrapped cd chains on this face: the
+        # unwrapped payload still sits behind a cd the probe does not replay.
+        sub = self.dirty_repo("sub")
+        with chdir(self.tmp):
+            result = await bash("cd sub && bash -c 'git reset --hard'")
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(read_tracked(sub), "committed\n")
+
+    async def test_runs_harmless_shell_wrapped_commands(self):
+        repo = self.dirty_repo()
+        with chdir(repo):
+            result = await bash("bash -c 'echo hi'")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("hi", result.output)
+        self.assertEqual(read_tracked(repo), "modified\n")
+
+    async def test_env_bypass_runs_shell_wrapped_discard_intentionally(self):
+        repo = self.dirty_repo()
+        with mock.patch.dict(os.environ, {BYPASS_ENV: "1"}), chdir(repo):
+            result = await bash("bash -c 'git reset --hard'")
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(read_tracked(repo), "committed\n")
 
 
 if __name__ == "__main__":

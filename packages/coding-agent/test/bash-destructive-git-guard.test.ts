@@ -148,6 +148,38 @@ describe("isDestructiveGitDiscardCommand", () => {
 	])("does not match %s", (command) => {
 		expect(isDestructiveGitDiscardCommand(command)).toBe(false);
 	});
+
+	it.each([
+		"bash -c 'git reset --hard'",
+		'bash -c "git reset --hard"',
+		"sh -c 'git clean -fd'",
+		"sh -c 'git checkout -- .'",
+		"/bin/bash -c 'git reset --hard'",
+		"bash -ec 'git reset --hard'",
+		"bash -x -c 'git restore .'",
+		"eval 'git reset --hard'",
+		'eval "git clean -fd"',
+		"eval 'git add -A'",
+		"cd sub && bash -c 'git reset --hard'",
+		"sudo bash -c 'git stash'",
+		"bash -c 'git -C sub reset --hard'",
+		"echo ok && bash -c 'git add -A'",
+		"bash -c 'echo before; git reset --hard'",
+	])("matches shell-wrapped %s", (command) => {
+		expect(isDestructiveGitDiscardCommand(command)).toBe(true);
+	});
+
+	it.each([
+		"bash -c 'echo hi'",
+		"sh -c 'ls -la'",
+		"eval 'echo done'",
+		"bash -c 'git status'",
+		"bash script.sh",
+		"bash -c 'git reset --soft HEAD~1'",
+		"bash -c 'git stash list'",
+	])("does not match shell-wrapped %s", (command) => {
+		expect(isDestructiveGitDiscardCommand(command)).toBe(false);
+	});
 });
 
 describe("bash tool destructive-git dirty-tree guard", () => {
@@ -857,6 +889,96 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 			/Refusing to run this destructive git command/,
 		);
 		expect(readModifiedTracked()).toBe("modified\n");
+	});
+
+	it.each([
+		"bash -c 'git reset --hard'",
+		'bash -c "git reset --hard"',
+		"sh -c 'git clean -fd'",
+		"eval 'git checkout -- .'",
+		"/bin/bash -c 'git restore .'",
+	])("refuses the shell-wrapped discard %s on a dirty tree and preserves the work", async (command) => {
+		initDirtyGitRepo(testDir);
+		const bash = createBashTool(testDir);
+
+		await expect(bash.execute(`guard-wrapped-${command}`, { command })).rejects.toThrow(
+			/Refusing to run this destructive git command/,
+		);
+
+		expect(readModifiedTracked()).toBe("modified\n");
+		expect(existsSync(join(testDir, "untracked.txt"))).toBe(true);
+	});
+
+	it("refuses a bash -c wrapped sweep on a dirty tree and stages nothing", async () => {
+		initDirtyGitRepo(testDir);
+		const bash = createBashTool(testDir);
+
+		await expect(bash.execute("guard-wrapped-sweep", { command: "bash -c 'git add -A'" })).rejects.toThrow(
+			/Refusing to run this destructive git command/,
+		);
+
+		const status = gitStatus(testDir);
+		expect(status).toContain(" M tracked.txt");
+		expect(status).toContain("?? untracked.txt");
+	});
+
+	it("probes the repository a wrapped discard actually targets after a cd", async () => {
+		const sub = join(testDir, "sub");
+		mkdirSync(sub);
+		initDirtyGitRepo(sub);
+		const bash = createBashTool(testDir);
+
+		await expect(
+			bash.execute("guard-wrapped-cd", { command: "cd sub && bash -c 'git reset --hard'" }),
+		).rejects.toThrow(/tracked\.txt/);
+		expect(readFileSync(join(sub, "tracked.txt"), "utf-8")).toBe("modified\n");
+	});
+
+	it("replays git -C from inside a wrapped payload in the probe", async () => {
+		const calls: string[] = [];
+		const operations: BashOperations = {
+			exec: async (command, _cwd, _options) => {
+				calls.push(command);
+				return { exitCode: 0 };
+			},
+		};
+		const bash = createBashTool(testDir, { operations });
+
+		await bash.execute("guard-wrapped-git-c-probe", { command: "bash -c 'git -C sub reset --hard'" });
+
+		expect(calls).toEqual([
+			"git -C sub status --porcelain --untracked-files=all",
+			"bash -c 'git -C sub reset --hard'",
+		]);
+	});
+
+	it("runs harmless bash -c commands without probing", async () => {
+		initDirtyGitRepo(testDir);
+		const calls: string[] = [];
+		const operations: BashOperations = {
+			exec: async (command, _cwd, _options) => {
+				calls.push(command);
+				return { exitCode: 0 };
+			},
+		};
+		const bash = createBashTool(testDir, { operations });
+
+		await bash.execute("guard-wrapped-harmless", { command: "bash -c 'echo hi'" });
+
+		expect(calls).toEqual(["bash -c 'echo hi'"]);
+		expect(readModifiedTracked()).toBe("modified\n");
+	});
+
+	it(`bypasses a wrapped discard with ${BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1`, async () => {
+		initDirtyGitRepo(testDir);
+		process.env[BASH_DESTRUCTIVE_GIT_BYPASS_ENV] = "1";
+		const bash = createBashTool(testDir);
+
+		await expect(
+			bash.execute("guard-wrapped-bypass-env", { command: "bash -c 'git reset --hard'" }),
+		).resolves.toBeDefined();
+
+		expect(readModifiedTracked()).toBe("committed\n");
 	});
 
 	it("conservatively refuses cds joined to the discard by ; or a newline", async () => {

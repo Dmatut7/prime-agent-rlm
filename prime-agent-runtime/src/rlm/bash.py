@@ -865,6 +865,21 @@ class BashHandle:
 # probe carries its own bound instead of the guarded command's effective
 # timeout; a probe that exceeds it fails open like any other probe failure.
 #
+# `bash -c`/`sh -c`/`eval`-style wrappers are unwrapped one level before
+# matching (see _find_wrapped_destructive_git_discard_commands): the payload
+# is shell code that runs, so blanking it as quoted data would let any wrapper
+# smuggle a discard past the guard. Known residual bypasses, accepted as out
+# of scope for a text heuristic (shared with the TS face):
+# - nesting: only one wrapper level is unwrapped (`bash -c "bash -c '…'"`);
+# - command substitution is matched where it appears literally but is never
+#   expanded, so a discard assembled at runtime (`$(echo git) reset --hard`,
+#   or a payload fetched through `$(curl …)`) is invisible to the guard --
+#   recursive expansion is shell evaluation, a different magnitude;
+# - unquoted/escaped single-word payloads (`bash -c git\ reset\ --hard`);
+# - other execution wrappers (`env bash -c …`, `xargs`, `find -exec`, `ssh`,
+#   `nohup`, `timeout`), here-docs, and shell functions or aliases defined
+#   earlier in the command.
+#
 # Bypass: only the kernel process env below. There is no parameter bypass on
 # this face, and an inline `PI_BASH_ALLOW_DESTRUCTIVE_GIT=1 git ...` prefix
 # sets the variable only in the child shell, so it does not bypass either.
@@ -1051,12 +1066,7 @@ def _mask_quoted_spans(command: str) -> str:
     return "".join(chars)
 
 
-def _find_destructive_git_discard_commands(command: str) -> list[int]:
-    """Match starts of every destructive git discard or shared-worktree sweep in
-    `command` (empty when none match). Best-effort shell-text heuristics, not a
-    parse; a false positive costs one `git status` probe, a false negative
-    silently loses work."""
-    masked = _mask_quoted_spans(command)
+def _find_discard_indices_in_masked(masked: str) -> list[int]:
     indices: list[int] = []
     for pattern in (_DISCARD_CHECKOUT_PATTERN, _DISCARD_RESTORE_PATTERN, _DISCARD_RESET_PATTERN):
         indices.extend(match.start() for match in pattern.finditer(masked))
@@ -1069,7 +1079,58 @@ def _find_destructive_git_discard_commands(command: str) -> list[int]:
     for match in _SWEEP_STASH_PATTERN.finditer(masked):
         if _is_sweep_stash_segment(match.group(1)):
             indices.append(match.start())
-    return sorted(indices)
+    return indices
+
+
+def _find_destructive_git_discard_commands(command: str) -> list[int]:
+    """Match starts of every destructive git discard or shared-worktree sweep in
+    `command` (empty when none match). Best-effort shell-text heuristics, not a
+    parse; a false positive costs one `git status` probe, a false negative
+    silently loses work."""
+    return sorted(_find_discard_indices_in_masked(_mask_quoted_spans(command)))
+
+
+# `bash -c`/`sh -c`/`eval`-style wrappers, matched against the MASKED command
+# so a wrapper spelled out inside quoted data (`echo "bash -c '…'"`) does not
+# fire. Quoted payload spans survive masking (only their content is blanked,
+# positions preserved), so the payload text is sliced back out of the original
+# command by position. The option run before `-c` is best-effort: clusters
+# ending in `c` (`-ec`) and plain options are covered; options that take
+# separate arguments (`-o`, `--rcfile`) may end the match early, which fails
+# open like every other documented gap.
+_SHELL_WRAPPER_PATTERN = re.compile(
+    r"(?:^|[\s;&|()])(?:/[^\s;&|()'\"]+/)?(?:bash|sh|dash|zsh|ksh)"
+    r"(?:\s+-{1,2}[^\s;&|()'\"]+)*?\s+-[A-Za-z]*c\s*(\"[^\"]*\"|'[^']*')"
+)
+_EVAL_WRAPPER_PATTERN = re.compile(r"(?:^|[\s;&|()])eval\s+(\"[^\"]*\"|'[^']*')")
+_WRAPPER_BOUNDARY_CHARS = frozenset(" \t\r\n\f\v;&|()")
+
+
+def _find_wrapped_destructive_git_discard_commands(command: str) -> list[tuple[str, int, int]]:
+    """Discards hidden inside one level of `bash -c`/`sh -c`/`eval` wrappers.
+
+    Returns ``(synthetic_command, discard_index, wrapper_start)`` per match:
+    the synthetic command is the original text up to the wrapper invocation
+    plus the unwrapped payload, so _resolve_discard_probe sees the payload as
+    if typed directly after the pre-wrapper text. The payload is matched with
+    the same masking and patterns as a top-level command; only one level is
+    unwrapped (see the residual-bypass list in the guard section comment).
+    """
+    masked = _mask_quoted_spans(command)
+    results: list[tuple[str, int, int]] = []
+    for pattern in (_SHELL_WRAPPER_PATTERN, _EVAL_WRAPPER_PATTERN):
+        for match in pattern.finditer(masked):
+            quoted = match.group(1)
+            quoted_start = match.end(1) - len(quoted)
+            payload = command[quoted_start + 1 : quoted_start + len(quoted) - 1]
+            # The leading alternative is ^ or one boundary character; test the
+            # match text rather than the index (a command may start with a
+            # separator).
+            wrapper_start = match.start() + (1 if match.group(0)[0] in _WRAPPER_BOUNDARY_CHARS else 0)
+            synthetic = command[:wrapper_start] + payload
+            for index in _find_discard_indices_in_masked(_mask_quoted_spans(payload)):
+                results.append((synthetic, wrapper_start + index, wrapper_start))
+    return results
 
 
 def _resolve_discard_probe(command: str, discard_index: int) -> tuple[list[str], bool] | None:
@@ -1199,11 +1260,14 @@ def _guard_destructive_git(command: str) -> None:
     if os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX"):
         return
     indices = _find_destructive_git_discard_commands(command)
-    if not indices:
+    wrapped = _find_wrapped_destructive_git_discard_commands(command)
+    if not indices and not wrapped:
         return
     probed: set[tuple[tuple[str, ...], bool]] = set()
-    for index in indices:
-        spec = _resolve_discard_probe(command, index)
+    targets = [(command, index) for index in indices]
+    targets.extend((synthetic, index) for synthetic, index, _wrapper_start in wrapped)
+    for target_command, index in targets:
+        spec = _resolve_discard_probe(target_command, index)
         if spec is None:
             continue  # out of the covered scope: fail open
         git_args, includes_ignored = spec
@@ -1240,8 +1304,9 @@ def bash(command: str) -> BashHandle:
     through.
     Guard: destructive git discards (git checkout -- ., git clean -f...,
     git reset --hard, git restore .) and shared-worktree sweeps (git add -A,
-    git add ., git stash), with git -C, are refused with the dirty paths while
-    the tree they target has uncommitted changes; scoped forms (git add
+    git add ., git stash), with git -C and inside one level of bash -c/sh -c/
+    eval wrappers, are refused with the dirty paths while the tree they target
+    has uncommitted changes; scoped forms (git add
     docs/, git add <paths>) run, and setting PI_BASH_ALLOW_DESTRUCTIVE_GIT=1
     in the kernel environment bypasses intentionally. Fails open outside a
     repository and beyond the covered probe scope (cd chains, GIT_DIR
