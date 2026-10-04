@@ -14,12 +14,14 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-04，wave-51 已 SHIP）
+## 当前状态（2026-10-04，REVIEW-FIXUP 蜂群已 SHIP）
 
-- HEAD = 见 git log（gate parser 修复、roster 收债、roster 第三刀、R3-P1、文档）。
-- wave-51：CI 门禁 parser 字面 `>` bug 修复；roster-sync 债收编（92→24）+ 第三刀（supervisor 10829 行）；
-  R3 正本清源（1.14GB=R1 wire 旧账已结案；渲染腿三洞定量：高亮 fence 19.6–22.3s@80k 破帧、表格 O(n²)、
-  扫描残留）设计稿入 docs/fork/r3-streaming-render-design.md；P1 扫描增量化 −48%/−41%。
+- HEAD = 见 git log（11 批：R3-P2、supervisor 四刀+J、rlm 域、agent-session 六条、熔断、quota/看门狗、
+  暖池、interactive、完成检查、杂项、恢复简报、文档）。
+- 审查 83 条收官：23 条剩余全修（先红后绿+故障注入），禁区三项未动；test-hygiene 基线重冻结 524。
+- R3：P2 落地（高亮 fence 21.3s→0.43s@80k），剩 P3 表格列宽冻结。
+- supervisor 四刀落地：10664 行（起点 12002，四刀 −1338）。候选队列：update-restart、pending-delivery、
+  catchup、scheduled-wake、idle-eviction、stop-finalization（评分表 /tmp/wave50/supervisor-cut2.md）。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -100,12 +102,10 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
   把在跑会话归档。犯了就是事故，写进 FORK_NOTES 向老板披露。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-52 候选）
+## 下一波主题（wave-53 候选）
 
-1. 【R3-P2 高亮 fence 密封】唯一破帧预算形态（19.6–22.3s@80k、p95 25–40ms）：流式期密封行素渲 +
-   尾部窗口高亮 + 闭合帧一次性全量 reflow；用户可见漂移（流式期暂素）须进 FORK_NOTES；env 关断
-   PI_MARKDOWN_FENCE_STREAM_HL。设计稿 docs/fork/r3-streaming-render-design.md §3。
-2. 【R3-P3 表格列宽冻结】header+首数据行后冻结列宽，完成行密封，闭合帧全量重渲愈合。
-3. 【supervisor 四刀候选】update-restart（缝 13，3 直驱+1 桩先收）或 reaper+retention（缝 16 零直驱）。
-4. 【暖池升级评估】history-aware prewarm（Codex 0.159 手法）。
+1. 【R3-P3 表格列宽冻结】设计稿 docs/fork/r3-streaming-render-design.md §3（40k 2.85s/80k 11.4s O(n²) 实测）。
+2. 【EXAM 复测】FIXUP 动了恢复/重建/压制路径，考题集全量复测确认无回退（尤其 EX-3 恢复链）。
+3. 【走查】F1/F2 修复后 matrix 复跑 + 蜂群改动面的 fresh-eyes（重点：恢复会话、quota 暂停、goal 预算）。
+4. 【暖池 history-aware prewarm 评估】Codex 0.159 手法（调研已备）。
 5. 【老板挂账】安全簇勾选、第 0 条历史改写、记忆帽三选一。

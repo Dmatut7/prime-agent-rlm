@@ -1,3 +1,16 @@
+## 2026-10-04 审查修复蜂群（REVIEW-FIXUP-20261004）：23 条全修，十一路并行
+
+任务单（老板下发，仓库根 REVIEW-FIXUP-20261004.md，不入仓）核对 10/1–3 的 83 条审查发现：65 已修、9 修一半、6 没修、修复带出 10 个新问题——本波 23 条全部落地，禁区三项（Claude 5.5 点号、历史改写、main.ts 内联 import 例外）未动。
+
+- 一·只修一半的三条：①换模型持久化顺序——buildSessionContext 把落进未收齐工具批的 model_change 合成提示挪到批后，种子改 firstKeptEntryId 前（重建路径测试钉住，AI 不再看到「那一步没有结果」）；②fallback/备用模型共用 _estimateCurrentContextTokens（压缩后按内容计价，不再按 0 或旧 usage)，超长分支改发 success+supersededByCompaction（界面假「重试失败」消除）；③工具名熔断每次触发授恢复轮、每运行上限 3 次、tools.notFoundBreaker 五键设置项+热刷新接线、goal 不再直接判死。
+- 二·没动的四条：恢复轮只压自主续跑、自我恢复放行；abortRetry 对齐 abort（goal 中止标志+暂停输入泵）；中止时丢弃未送达续跑并归还 goal 预算；暖池 spare 带构建指纹，认领/清理丢失配（发布前复查）。
+- 三·修一半的六条：完成检查三子条（文案「代码改过则过期」、SHELL_WRITE_COMMAND 认 bash 写命令、changeTrackingIncomplete 不作数）；子代理 replied 落 transcript-only settle 记录（handoff 移出）；近似重复提示改「先确认是不是同一件事」；in-process 中止带 user 原因；崩溃恢复读 busy+空闲/暂停三态排队记录；加载更早偏移扣标记行。
+- 四·修复带出的十个新问题：Esc 只在唤醒轮/过期才取消额度暂停+原因每轮无条件清；恢复简报三态诚实（replayed/skipped+原因/not-replayed）；goal 满预算可 --budget 延长+裸 resume 明确报错+节流钟重置+中止清唤醒；launchWorker 拒删目录（MissingSessionCwdError+pauseJob 记原因停重试）；CPU 豁免 60 分钟总上限+60s 平滑窗；压缩/恢复通知恢复提醒用户 _ 前缀变量（按 bootstrap 前缀清单）；collect 基线改已送达+送达清账（双向降级）；假重试失败与压缩后估算偏大随①②消；vm_stat 缓存 7.5s+异步（purgeable 经 C 实验证实独立无重复计算）。较低优先两条顺带：failed worker 不再算覆盖定时唤醒；24h 门读 crashedAt+计数按 24h 衰减。
+- 五·小问题：--model 预检在可能加载扩展时降为警告；双击 Esc 跳过 worker_resumed/自定义续跑提示；test-hygiene 门禁识别 `as unknown as XInternals`（基线重冻结 474→524 纯新增登记，此后只缩）。
+- 顺带（wave-52 收官）：supervisor 第四刀 reaper 簇拆出（10829→10664）；R3-P2 高亮 fence 密封（80k 21.3s→0.43s、尾 p95 25-40ms→0.9ms；流式期密封行素渲、闭合帧一次性上色；PI_MARKDOWN_FENCE_STREAM_HL=0 可回退）。
+- 蜂群纪律：11 路并行 + 2 路在飞，文件面互斥；每路先红后绿、无人值守条目故障注入；agent-session.ts 混 lane D 的 delivered-ledger hunks 已在提交说明披露。回归两起均已修：lane A 恢复轮放行波及 gate 重试（收窄）、rlm_child_settled 未登记分类（主席补登）。
+- 门禁：check EXIT 0、hygiene OK、单测 9875 绿、suite 1759 绿、tui 1315 绿、agent 170 绿、ai 792 绿、python 804 绿。需要重新编译并重启后才生效。
+
 ## 2026-10-04 wave-51 五路：supervisor 第三刀、R3 渲染腿设计+P0+P1、roster 测试债收编
 
 - CI 门禁自修复（wave-50 红归因）：check-node-test-coverage parser 的属性正则不含引号感知，新病态语料测试名里的字面 `>`（XML 合法）截断标签、误吞后续 testcase，计数与摘要对不上把门自己弄红；修正则（引号感知+懒惰保 `/>` 自闭合优先）+ 自控判例，重推全绿。
