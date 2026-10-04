@@ -155,7 +155,6 @@ import {
 	prepareCompactionOutcome,
 	SummarizationRefusalError,
 	type SummaryCallRunner,
-	serializeConversation,
 	shouldCompact,
 	shrunkKeepRecentTokens,
 } from "./compaction/index.js";
@@ -193,7 +192,6 @@ import {
 	type MessageUpdateEvent,
 	type ReplacedSessionContext,
 	type SessionBeforeCompactResult,
-	type SessionBeforeRefineResult,
 	type SessionBeforeTreeResult,
 	type SessionStartEvent,
 	type ShutdownHandler,
@@ -290,7 +288,6 @@ import {
 	type CompactionOutcome,
 	type CompactionOutcomeReason,
 	type CustomMessage,
-	convertToLlm,
 	createAsyncBashCompletionMessage,
 	createAutoContinueMessage,
 	createCompactionOutcomeMessage,
@@ -298,8 +295,6 @@ import {
 	createHarnessDigestMessage,
 	createHeartbeatPromptMessage,
 	createModelChangeMessage,
-	createRefinementFailureMessage,
-	createRefinementOutcomeMessage,
 	createSessionSlashCommandMessage,
 	createSessionSlashCommandResultMessage,
 	HARNESS_DIGEST_CUSTOM_TYPE,
@@ -376,32 +371,30 @@ import {
 	restoreQuotaPark,
 } from "./quota-park.js";
 import {
+	type AutoRefineReviewer,
+	type AutoRefineReviewRequest,
+	applyRefine,
+	emitRefineFailed,
+	planRefine,
+	RefinePersistScopeError,
+	RefineSkippedError,
+	refine,
+	runAutoRefineReview,
+	waitForRefineIdle,
+} from "./refine-execution.js";
+import {
 	type AutoRefineReason,
 	type AutoRefineReview,
-	applyRefinementProposal,
 	assertHarnessStateWritable,
-	generateRefinementId,
 	getGlobalHarnessStateDir,
-	getHarnessStatePath,
 	getLocalHarnessStateDir,
-	getRefinementHistory,
 	type HarnessScope,
 	type HarnessState,
-	inferRefinementResultScope,
 	isPersistentHarnessStorageSupported,
-	loadGlobalRefinementHistory,
 	loadHarnessState,
-	mergeHarnessStates,
-	mergeRefinementHistory,
-	normalizeRefinementProposal,
-	persistAppliedRefinement,
-	planRefinement,
 	REFINE_SKILL_NAME,
 	type RefinementPlan,
 	type RefinementResult,
-	readHarnessStateStamp,
-	reviewAutoRefine,
-	WINDOWS_HARNESS_PERSISTENCE_UNSUPPORTED_ERROR,
 } from "./refinement/index.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
@@ -840,25 +833,12 @@ export class CompactionSkippedError extends Error {
 	emergencyShrink?: EmergencyShrinkPlan | null;
 }
 
-/** Thrown when a session_before_refine extension skips the refinement round. */
-export class RefineSkippedError extends Error {}
-
 /**
- * A refinement persist failure annotated with the effective target scope (the
- * requested scope can differ: a local request rolling back a global record
- * writes the global store). The message is the underlying persist error's;
- * failure receipts read the scope off this wrapper instead of the request.
+ * Moved to ./refine-execution.js with the refine-execution cluster; re-exported
+ * here so existing import paths (including the test harness) keep working.
  */
-export class RefinePersistScopeError extends Error {
-	constructor(
-		message: string,
-		readonly scope: HarnessScope,
-		options?: { cause?: unknown },
-	) {
-		super(message, options);
-		this.name = "RefinePersistScopeError";
-	}
-}
+export type { AutoRefineReviewer, AutoRefineReviewRequest };
+export { RefinePersistScopeError, RefineSkippedError };
 
 /**
  * Kernel-owned work that must keep a session resident after its turn ends (LIVE-1, r44): a
@@ -1012,11 +992,6 @@ export interface ExtensionBindings {
 	onError?: ExtensionErrorListener;
 }
 
-export interface AutoRefineReviewRequest {
-	reason: AutoRefineReason;
-	turnsSinceLastReview: number;
-}
-
 /**
  * Discriminated result from a serialized-mode background planning pass.
  * - "plan": review approved and planning succeeded; carry the exact plan,
@@ -1041,8 +1016,6 @@ export type SerializedBackgroundPlanResult =
 			options: { instructions?: string; rollbackId?: string; global?: boolean };
 			branchVersion: number;
 	  };
-
-export type AutoRefineReviewer = (request: AutoRefineReviewRequest, signal?: AbortSignal) => Promise<AutoRefineReview>;
 
 export interface PromptOptions {
 	expandPromptTemplates?: boolean;
@@ -1951,7 +1924,7 @@ export class AgentSession {
 		steering: [],
 		followUps: [],
 	};
-	private _agentEventQueue: Promise<void> = Promise.resolve();
+	_agentEventQueue: Promise<void> = Promise.resolve();
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
 	readonly _actionStore = new ActionStore<QueuedSessionAction>();
@@ -2033,7 +2006,7 @@ export class AgentSession {
 	 * continuation) when it settles. Consumed in _compact's finally.
 	 */
 	private _preemptedOverflowRecoveryRetry = false;
-	private _compactionOperation: Promise<void> | undefined = undefined;
+	_compactionOperation: Promise<void> | undefined = undefined;
 	/** Timer that aborts a compaction holding queued input for too long. */
 	// `unknown`, not `ReturnType<typeof setTimeout>`: when `stallWatchdogTimers` is
 	// injected the handle belongs to that clock (a fake-clock id), not to Node.
@@ -2071,7 +2044,7 @@ export class AgentSession {
 	private _pendingRequestedRefine: { instructions?: string; global?: boolean } | undefined;
 
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
-	private _branchSummaryOperation: Promise<void> | undefined = undefined;
+	_branchSummaryOperation: Promise<void> | undefined = undefined;
 
 	private _retryAbortController: AbortController | undefined = undefined;
 	_retryAttempt = 0;
@@ -2190,7 +2163,7 @@ export class AgentSession {
 	readonly _queuedChildReplyBackfills = new QueuedParentReplyBackfills();
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 	/** Outcome disclosures whose session-file append failed; retained for context rebuilds. */
-	private readonly _unpersistedOutcomes: CustomMessage[] = [];
+	readonly _unpersistedOutcomes: CustomMessage[] = [];
 	/**
 	 * Fresh/empty contexts defer digest injection to the first committed turn, so an
 	 * untouched session keeps reading as empty to every raw message-count check
@@ -2228,7 +2201,7 @@ export class AgentSession {
 	 */
 	private _pendingModelChangeMessages: ModelChangeMessage[] = [];
 
-	private _extensionRunner!: ExtensionRunner;
+	_extensionRunner!: ExtensionRunner;
 	private _execEnvProvider?: () => Record<string, string | undefined> | undefined;
 	private _turnIndex = 0;
 	private _modelSelectEmitQueue: Promise<void> = Promise.resolve();
@@ -2516,14 +2489,14 @@ export class AgentSession {
 	private _autoRefineBranchVersion = 0;
 	private _autoRefineReviewAbort?: AbortController;
 	private _autoRefineWritableProbe?: { at: number; allowed: boolean };
-	private _refineAbortController?: AbortController;
-	private readonly _autoRefineReviewer?: AutoRefineReviewer;
+	_refineAbortController?: AbortController;
+	readonly _autoRefineReviewer?: AutoRefineReviewer;
 	private readonly _serializedRefine: boolean;
-	private _refineInFlight?: Promise<void>;
-	private _refinePlanInFlight?: Promise<void>;
-	private _serializedPlanInFlight?: Promise<SerializedBackgroundPlanResult | undefined>;
+	_refineInFlight?: Promise<void>;
+	_refinePlanInFlight?: Promise<void>;
+	_serializedPlanInFlight?: Promise<SerializedBackgroundPlanResult | undefined>;
 	private _serializedPlanClaim?: Promise<void>;
-	private _serializedExplicitRefineOptions?: {
+	_serializedExplicitRefineOptions?: {
 		instructions?: string;
 		global?: boolean;
 	};
@@ -2792,7 +2765,7 @@ export class AgentSession {
 		this._subagentRuntimeHost = host;
 	}
 
-	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
+	async _getRequiredRequestAuth(model: Model<any>): Promise<{
 		apiKey: string;
 		headers?: Record<string, string>;
 		requestModel: Model<Api>;
@@ -6628,7 +6601,7 @@ export class AgentSession {
 	 * User listeners are preserved and will receive events again after resubscribe().
 	 * Used internally during operations that need to pause event processing.
 	 */
-	private _disconnectFromAgent(): void {
+	_disconnectFromAgent(): void {
 		if (this._unsubscribeAgent) {
 			this._unsubscribeAgent();
 			this._unsubscribeAgent = undefined;
@@ -6639,7 +6612,7 @@ export class AgentSession {
 	 * Reconnect to agent events after _disconnectFromAgent().
 	 * Preserves all existing listeners.
 	 */
-	private _reconnectToAgent(): void {
+	_reconnectToAgent(): void {
 		if (this._unsubscribeAgent) return; // Already connected
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
 	}
@@ -11036,7 +11009,7 @@ export class AgentSession {
 		};
 	}
 
-	private _notifySessionInputCheckpointChange(): void {
+	_notifySessionInputCheckpointChange(): void {
 		const waiters = [...this._sessionInputCheckpointWaiters];
 		this._sessionInputCheckpointWaiters.clear();
 		for (const resolve of waiters) resolve();
@@ -13068,66 +13041,9 @@ export class AgentSession {
 	 * at the turn boundary after compaction checks and before auto-refine
 	 * scheduling so the manual request takes priority.
 	 */
-	private _refineFailureReceipts = new WeakSet<object>();
+	_refineFailureReceipts = new WeakSet<object>();
 	private _emitRefineFailed(error: unknown, scope: HarnessScope = "local"): void {
-		// Idempotent per error object: refine() failures are reported by the direct
-		// path AND by queued/auto callers that catch the same rethrown error; the
-		// first receipt wins and later calls on the same error are no-ops.
-		if (error instanceof Object && this._refineFailureReceipts.has(error)) return;
-		const reason = error instanceof Error ? error.message : String(error);
-		// MV-5: the requested scope is the caller's guess; a persist failure
-		// knows the effective target scope (a local request can roll back a
-		// global record) and the receipt must carry that one.
-		const effectiveScope = error instanceof RefinePersistScopeError ? error.scope : scope;
-		this._emit({
-			type: "refine_failed",
-			error: reason,
-		});
-		// MV-5: every refinement failure - plan parse, length guard, provider
-		// error, or the persist rejection above - leaves a model-visible receipt,
-		// the same surface successes use (e6c1af56). Without it the failure was
-		// UI/event-only and the model never learned its refine.run produced
-		// nothing. A skip is a deliberate decline, not a failure: it stays
-		// event-only. K3R-8/F9: the skip early-return comes BEFORE the receipt-set
-		// add - a reused skip sentinel must not be permanently silenced, and only
-		// a value that actually produced a receipt guards later calls.
-		if (error instanceof RefineSkippedError) return;
-		if (error instanceof Object) this._refineFailureReceipts.add(error);
-		this._recordRefinementFailureReceipt(reason, effectiveScope);
-	}
-
-	private _recordRefinementFailureReceipt(reason: string, scope: HarnessScope): void {
-		const message = createRefinementFailureMessage({
-			refinementId: generateRefinementId(),
-			scope,
-			reason,
-		});
-		try {
-			this.sessionManager.appendCustomMessageEntryWithRollback(
-				message.customType,
-				message.content,
-				message.display,
-				message.details,
-			);
-		} catch (error) {
-			const persistenceError = error instanceof Error ? error.message : String(error);
-			// Same disclosure rule as compaction outcomes: the receipt stays
-			// model-visible for this process and says it could not be saved.
-			const unpersisted = createRefinementFailureMessage(
-				{ refinementId: message.details.refinementId, scope, reason },
-				true,
-				message.timestamp,
-			);
-			unpersisted.content = `${message.content}\n\nThis refinement failure receipt could not be saved to session history: ${persistenceError}`;
-			this._unpersistedOutcomes.push(unpersisted);
-			this.agent.state.messages.push(unpersisted);
-			this._emit({ type: "message_start", message: unpersisted });
-			this._emit({ type: "message_end", message: unpersisted });
-			return;
-		}
-		this.agent.state.messages.push(message);
-		this._emit({ type: "message_start", message });
-		this._emit({ type: "message_end", message });
+		emitRefineFailed(this, error, scope);
 	}
 
 	private _consumePendingRequestedRefine(): boolean {
@@ -13491,64 +13407,8 @@ export class AgentSession {
 		}
 	}
 
-	/**
-	 * Refinement passes (review and planning) run with their own prompts, so
-	 * issuing them on the session model evicts the provider's prefix-cache entry
-	 * for the session and forces a full context re-read on the next session
-	 * request. Route them to the configured auxiliary model when it is set and
-	 * usable; fall back to the session model otherwise.
-	 */
-	private async _resolveRefinementModel(): Promise<
-		{ model: Model<Api>; apiKey: string; headers?: Record<string, string> } | undefined
-	> {
-		const sessionModel = this.model;
-		if (!sessionModel) {
-			return undefined;
-		}
-		const selector = this.settingsManager.getAuxiliaryModel()?.trim().toLowerCase();
-		if (!selector || `${sessionModel.provider}/${sessionModel.id}`.toLowerCase() === selector) {
-			const { apiKey, headers, requestModel } = await this._getRequiredRequestAuth(sessionModel);
-			return { model: requestModel, apiKey, headers };
-		}
-		try {
-			const model = (await this._authenticatedRlmModels()).find(
-				(candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === selector,
-			);
-			if (!model) {
-				throw new Error(`model "${selector}" is unavailable, unauthenticated, or expired`);
-			}
-			const { apiKey, headers, requestModel } = await this._getRequiredRequestAuth(model);
-			return { model: requestModel, apiKey, headers };
-		} catch {
-			// Error details from the auth stack can embed credential material, so only
-			// the selector is logged (CodeQL js/clear-text-logging).
-			console.warn(`Warning: auxiliaryModel "${selector}" unusable for refinement; using the session model.`);
-			const { apiKey, headers, requestModel } = await this._getRequiredRequestAuth(sessionModel);
-			return { model: requestModel, apiKey, headers };
-		}
-	}
-
 	private async _reviewAutoRefine(context: AutoRefineReviewRequest, signal?: AbortSignal): Promise<AutoRefineReview> {
-		if (this._autoRefineReviewer) {
-			return this._autoRefineReviewer(context, signal);
-		}
-		const refinementModel = await this._resolveRefinementModel();
-		if (!refinementModel) {
-			return { shouldRefine: false, rationale: "No model selected." };
-		}
-		return reviewAutoRefine(
-			this.agent.state.messages,
-			this._loadMergedHarnessState(),
-			this._loadRefinementHistory(),
-			refinementModel.model,
-			refinementModel.apiKey,
-			context,
-			refinementModel.headers,
-			signal,
-			this.thinkingLevel,
-			providerRetryPolicy(this.settingsManager),
-			this.sessionId,
-		);
+		return runAutoRefineReview(this, context, signal);
 	}
 
 	private _prepareHarnessDigest(): PreparedHarnessDigest {
@@ -13592,25 +13452,10 @@ export class AgentSession {
 		return latestContextHarnessDigestDetails(this);
 	}
 
-	private _loadMergedHarnessState(): HarnessState {
+	_loadMergedHarnessState(): HarnessState {
 		return loadMergedHarnessState(this);
 	}
 
-	private _loadRefinementHistory(): RefinementResult[] {
-		return mergeRefinementHistory(
-			loadGlobalRefinementHistory(getGlobalHarnessStateDir()),
-			getRefinementHistory(this.sessionManager.getEntries().filter((entry) => entry.type === "custom")),
-		);
-	}
-
-	/**
-	 * Refine editable continual harness state: prompt notes, memory, skills, and subagent specs.
-	 * The base system prompt is intentionally not editable through this path.
-	 *
-	 * Planning runs in the background and does NOT block turn entry points
-	 * (`_waitForRefineIdle` only waits for `_refineInFlight`). Only the fast
-	 * application phase (disk I/O + in-memory mutation) blocks turn entry points.
-	 */
 	async refine(
 		options: {
 			instructions?: string;
@@ -13619,401 +13464,27 @@ export class AgentSession {
 		} = {},
 		internal: { skipAbort?: boolean; trigger?: "manual" | "auto" } = {},
 	): Promise<RefinementResult> {
-		if (!isPersistentHarnessStorageSupported()) {
-			throw new Error(WINDOWS_HARNESS_PERSISTENCE_UNSUPPORTED_ERROR);
-		}
-		const preflightDir = options.global ? getGlobalHarnessStateDir() : this._localHarnessStateDir();
-		if (preflightDir) assertHarnessStateWritable(loadHarnessState(preflightDir, options.global ? "global" : "local"));
-		// Queued /refine executes from the session-input pump between turns;
-		// refine never aborts the agent (planning is backgrounded and the apply
-		// phase waits for quiescence), so skipAbort only asserts the pump's
-		// idle invariant instead of changing abort behavior.
-		if (internal.skipAbort && this.isStreaming) {
-			throw new Error("Cannot refine without aborting while the agent is running.");
-		}
-		// Wait for any existing refine (both planning and application) before
-		// starting a new run. This serializes concurrent /refine calls so two
-		// planning phases cannot race into concurrent _applyRefine calls that
-		// overwrite harness state.
-		while (this._refineInFlight || this._refinePlanInFlight || this._serializedPlanInFlight) {
-			if (this._refineInFlight) {
-				await this._refineInFlight;
-			} else if (this._refinePlanInFlight) {
-				await this._refinePlanInFlight;
-			} else {
-				// A serialized background plan is in flight (started during an
-				// active turn at message_end). Wait for planning and for the active
-				// turn to settle so its normal checkpoint can consume the plan.
-				const serializedPlanInFlight = this._serializedPlanInFlight;
-				await serializedPlanInFlight;
-				if (this._refineInFlight || this._refinePlanInFlight) {
-					continue;
-				}
-				await this.agent.waitForIdle();
-				// Aborted turns skip shouldStopAfterTurn. Drop their settled plan
-				// after idle so a later public refine cannot spin on it forever.
-				if (this._serializedPlanInFlight === serializedPlanInFlight) {
-					this._serializedPlanInFlight = undefined;
-					this._serializedExplicitRefineOptions = undefined;
-				}
-			}
-		}
-
-		const refineAbort = new AbortController();
-		this._refineAbortController = refineAbort;
-
-		const planRun = this._planRefine(options, refineAbort.signal, internal.trigger ?? "manual");
-		const planSettled = planRun.then(
-			() => undefined,
-			() => undefined,
-		);
-		this._refinePlanInFlight = planSettled;
-		let plan: RefinementPlan;
-		try {
-			plan = await planRun;
-		} catch (e) {
-			if (this._refineAbortController === refineAbort) {
-				this._refineAbortController = undefined;
-			}
-			this._scheduleSessionInputPump();
-			throw e;
-		} finally {
-			if (this._refinePlanInFlight === planSettled) {
-				this._refinePlanInFlight = undefined;
-			}
-		}
-
-		// Block new turns before waiting for the current turn to finish. One shared
-		// settled promise covers the full transition and apply critical section.
-		let resolveApplySettled: () => void = () => {};
-		const applySettled = new Promise<void>((resolve) => {
-			resolveApplySettled = resolve;
-		});
-		this._refineInFlight = applySettled;
-		try {
-			// Wait for the session to become quiescent before applying. Planning is
-			// allowed to overlap active user work, but application must not disconnect
-			// event handling until that work and its queued events have completed.
-			await this.agent.waitForIdle();
-			while (true) {
-				const eventQueue = this._agentEventQueue;
-				const compactionOp = this._compactionOperation;
-				const branchSummaryOp = this._branchSummaryOperation;
-				await Promise.allSettled([
-					eventQueue,
-					...(compactionOp ? [compactionOp] : []),
-					...(branchSummaryOp ? [branchSummaryOp] : []),
-				]);
-				if (
-					eventQueue === this._agentEventQueue &&
-					compactionOp === this._compactionOperation &&
-					branchSummaryOp === this._branchSummaryOperation
-				) {
-					break;
-				}
-			}
-			if (this._disposed || refineAbort.signal.aborted) {
-				throw new Error("Refinement cancelled because the session was disposed.");
-			}
-			try {
-				return await this._applyRefine(plan, options, refineAbort);
-			} catch (error) {
-				// MV-5 parity for the direct refine() path (kernel skill, auto runs):
-				// a persist/apply failure leaves a model-visible failure receipt the
-				// same way the queued /refine command path does. K3R-8: normalize the
-				// thrown value into one Error object here and rethrow THAT object, so
-				// every downstream catch (queued /refine, pending refine.run) shares a
-				// single idempotency key with _emitRefineFailed's receipt guard - a raw
-				// non-Error value used to defeat the WeakSet dedup and double-report.
-				const normalized = this._asError(error);
-				this._emitRefineFailed(normalized, options?.global ? "global" : "local");
-				throw normalized;
-			}
-		} finally {
-			resolveApplySettled();
-			if (this._refineInFlight === applySettled) {
-				this._refineInFlight = undefined;
-			}
-			this._notifySessionInputCheckpointChange();
-			this._scheduleSessionInputPump();
-		}
+		return refine(this, options, internal);
 	}
 
-	/**
-	 * Block a new agent turn until any in-flight refine application phase has
-	 * reattached event handling; otherwise the turn's messages are never
-	 * persisted or rendered.
-	 *
-	 * The idle-wait and application phase (`_refineInFlight`) block here. The
-	 * background planning phase (`_refinePlanInFlight`) does NOT block turns.
-	 * Refine failures surface to the refine caller, not here.
-	 */
 	private async _waitForRefineIdle(): Promise<void> {
-		while (this._refineInFlight) {
-			await this._refineInFlight;
-		}
+		return waitForRefineIdle(this);
 	}
 
-	/**
-	 * Background planning phase: runs the LLM planning call via `planRefinement`.
-	 * Does not disconnect from or abort the agent. Returns the plan without
-	 * applying anything.
-	 */
-	private async _planRefine(
+	async _planRefine(
 		options: { instructions?: string; rollbackId?: string; global?: boolean },
 		signal: AbortSignal,
 		trigger: "manual" | "auto" = "manual",
 	): Promise<RefinementPlan> {
-		if (this._disposed) {
-			throw new Error("Cannot refine a disposed session.");
-		}
-
-		if (!this.model) {
-			throw new Error(formatNoModelSelectedMessage());
-		}
-
-		const refinementModel = await this._resolveRefinementModel();
-		if (!refinementModel) {
-			throw new Error(formatNoModelSelectedMessage());
-		}
-		const globalHarnessStateDir = getGlobalHarnessStateDir();
-		const localHarnessStateDir = this._localHarnessStateDir();
-		const requestedScope = options.global ? "global" : "local";
-		if (!options.rollbackId && requestedScope === "local" && !localHarnessStateDir) {
-			throw new Error("Local harness refinement requires a persisted session; use global refinement instead.");
-		}
-		const globalPlanningState = loadHarnessState(globalHarnessStateDir, "global");
-		const localPlanningState = localHarnessStateDir ? loadHarnessState(localHarnessStateDir, "local") : undefined;
-		const planningState =
-			requestedScope === "global"
-				? globalPlanningState
-				: mergeHarnessStates(globalPlanningState, localPlanningState);
-		const history = this._loadRefinementHistory();
-		const rollbackTarget = options.rollbackId ? history.find((item) => item.id === options.rollbackId) : undefined;
-		let baselineScope = rollbackTarget
-			? (inferRefinementResultScope(rollbackTarget) ?? requestedScope)
-			: requestedScope;
-		let baselineHarnessStateDir = baselineScope === "global" ? globalHarnessStateDir : localHarnessStateDir;
-		if (rollbackTarget?.harnessStatePath) {
-			baselineHarnessStateDir = dirname(rollbackTarget.harnessStatePath);
-			baselineScope = resolve(baselineHarnessStateDir) === resolve(globalHarnessStateDir) ? "global" : "local";
-		}
-		if (!baselineHarnessStateDir) {
-			throw new Error("Local harness refinement requires a persisted session; use global refinement instead.");
-		}
-		const baselineState = rollbackTarget
-			? loadHarnessState(baselineHarnessStateDir, baselineScope)
-			: baselineScope === "global"
-				? globalPlanningState
-				: localPlanningState!;
-		if (!options.rollbackId && this._extensionRunner.hasHandlers("session_before_refine")) {
-			const result = (await this._extensionRunner.emit({
-				type: "session_before_refine",
-				preparation: {
-					trigger,
-					instructions: options.instructions,
-					scope: requestedScope,
-					planningState,
-					history,
-					conversationText: serializeConversation(convertToLlm(this.agent.state.messages)).slice(-80_000),
-				},
-				signal,
-			})) as SessionBeforeRefineResult | undefined;
-			if (this._disposed || signal.aborted) {
-				throw new Error("Refinement cancelled because the session was disposed.");
-			}
-			if (result?.skip) {
-				throw new RefineSkippedError("Refinement skipped by extension");
-			}
-			if (result?.proposal !== undefined) {
-				return {
-					proposal: normalizeRefinementProposal(result.proposal),
-					id: generateRefinementId(),
-					baselineState,
-				};
-			}
-		}
-		const plan = await planRefinement(
-			this.agent.state.messages,
-			planningState,
-			history,
-			refinementModel.model,
-			refinementModel.apiKey,
-			{ ...options, retry: providerRetryPolicy(this.settingsManager) },
-			refinementModel.headers,
-			signal,
-			this.thinkingLevel,
-			this.sessionId,
-		);
-		if (this._disposed || signal.aborted) {
-			throw new Error("Refinement cancelled because the session was disposed.");
-		}
-		return { ...plan, baselineState };
+		return planRefine(this, options, signal, trigger);
 	}
 
-	private _recordRefinementOutcome(result: RefinementResult): void {
-		// The receipt itemizes every edit it carries, applied and refused alike, so the
-		// material-change gate can tell "the model already heard about this entry" from
-		// "another seat moved the store" (merge doc 14.2: no double delivery).
-		const scope = result.scope ?? "local";
-		for (const edit of result.appliedEdits) {
-			const entry = edit.after ?? edit.before;
-			// Version-aware on purpose: the receipt itemized THIS version, so a later bump
-			// by another writer is fresh news and must still re-inject (merge doc 12.2).
-			if (entry) {
-				this._refinementReportedEntryVersions.set(`${edit.kind}:${entry.scope ?? scope}:${edit.id}`, entry.version);
-			}
-		}
-		this._appendDurableRefineMessage(createRefinementOutcomeMessage(result));
-	}
-
-	private _appendDurableRefineMessage(message: CustomMessage): void {
-		try {
-			this.sessionManager.appendCustomMessageEntryWithRollback(
-				message.customType,
-				message.content,
-				message.display,
-				message.details,
-			);
-		} catch {
-			// Not in the session file, so context rebuilds would drop the outcome.
-			this._unpersistedOutcomes.push(message);
-		}
-		this.agent.state.messages.push(message);
-		this._emit({ type: "message_start", message });
-		this._emit({ type: "message_end", message });
-	}
-
-	/**
-	 * Synchronous application phase: disconnects from the agent, aborts any
-	 * in-flight agent run, applies the refinement plan to disk and memory, then
-	 * reconnects. This is the only phase that blocks turn entry points.
-	 */
-	private async _applyRefine(
+	async _applyRefine(
 		plan: RefinementPlan,
 		options: { instructions?: string; rollbackId?: string; global?: boolean },
 		refineAbort: AbortController,
 	): Promise<RefinementResult> {
-		if (this._disposed) {
-			throw new Error("Cannot refine a disposed session.");
-		}
-		// The caller has already set _refineInFlight and waited for agent idle.
-		// Disconnect only for the brief apply + save + reconnect critical section.
-		this._disconnectFromAgent();
-
-		try {
-			const globalHarnessStateDir = getGlobalHarnessStateDir();
-			const localHarnessStateDir = this._localHarnessStateDir();
-			const requestedScope = options.global ? "global" : "local";
-			const history = this._loadRefinementHistory();
-			const rollbackTarget = options.rollbackId ? history.find((item) => item.id === options.rollbackId) : undefined;
-			let targetScope = plan.rollbackScope ?? requestedScope;
-			let targetHarnessStateDir = targetScope === "global" ? globalHarnessStateDir : localHarnessStateDir;
-			if (targetScope === "local" && rollbackTarget?.harnessStatePath) {
-				targetHarnessStateDir = dirname(rollbackTarget.harnessStatePath);
-				// Legacy records predate scope fields and default to "local" but may point
-				// at the global store; honor the recorded path so its entries stay global.
-				if (resolve(targetHarnessStateDir) === resolve(globalHarnessStateDir)) {
-					targetScope = "global";
-				}
-			}
-			if (!targetHarnessStateDir) {
-				throw new Error("Local harness refinement requires a persisted session; use global refinement instead.");
-			}
-			// Re-read the target state immediately before applying so concurrent kernel
-			// (`rlm.harness`) writes during the LLM pass are not clobbered. Capture
-			// stamp so save refuses to overwrite a write that lands after this load.
-			const expectedStamp = readHarnessStateStamp(targetHarnessStateDir);
-			const state = loadHarnessState(targetHarnessStateDir, targetScope);
-			const proposal = {
-				...plan.proposal,
-				edits: plan.proposal.edits.map((edit) => {
-					const localPrefix = "local:";
-					const globalPrefix = "global:";
-					return {
-						...edit,
-						id: edit.id?.startsWith(localPrefix)
-							? edit.id.slice(localPrefix.length)
-							: edit.id?.startsWith(globalPrefix)
-								? edit.id.slice(globalPrefix.length)
-								: edit.id,
-					};
-				}),
-			};
-			if (this._disposed || refineAbort.signal.aborted) {
-				throw new Error("Refinement cancelled because the session was disposed.");
-			}
-			const result = applyRefinementProposal(state, proposal, {
-				id: plan.id,
-				rollbackOf: plan.rollbackOf,
-				scope: targetScope,
-				baselineState: plan.baselineState,
-				indexMaxBytes: this.settingsManager.getHarnessDigestIndexMaxBytes(),
-				pathVocabulary: this.settingsManager.getHarnessPathVocabulary(),
-				enforceIndexCap: this.settingsManager.getHarnessEnforceIndexCap(),
-			});
-			result.harnessStatePath = getHarnessStatePath(targetHarnessStateDir);
-			let refinementPersistError: { error: unknown } | undefined;
-			try {
-				persistAppliedRefinement({
-					harnessStateDir: targetHarnessStateDir,
-					state,
-					result,
-					expectedStamp,
-					appendSessionAudit: (entry) => {
-						this.sessionManager.appendCustomEntry("prime-agent.refinement", entry);
-					},
-					globalHarnessStateDir: targetScope === "global" ? globalHarnessStateDir : undefined,
-				});
-			} catch (error) {
-				refinementPersistError = { error };
-			}
-			// MV-6: the completion receipt only lands on the success path. The
-			// pre-fix order recorded it before the persist error was thrown, so a
-			// concurrent-write rejection left a "Refinement complete" receipt in the
-			// message flow while nothing landed on disk; the failure path now
-			// reports through `_emitRefineFailed` at the caller's catch instead.
-			// The wrapper carries the *effective* target scope (MV-5): a local
-			// request rolling back a global record must not be reported with the
-			// requested scope.
-			if (refinementPersistError) {
-				const cause = refinementPersistError.error;
-				throw cause instanceof Error
-					? new RefinePersistScopeError(cause.message, targetScope, { cause })
-					: new RefinePersistScopeError(String(cause), targetScope, { cause });
-			}
-			this._recordRefinementOutcome(result);
-			// No rebuild and no swap here (#2098): the prompt stays byte-identical so the
-			// provider's cached prefix survives the apply. The applied and refused edits
-			// reach the model through the outcome receipt above; a harness menu that moved
-			// reaches it through the next committed turn's material-change digest delta.
-			try {
-				this._emit({ type: "refine_complete", result });
-			} catch {
-				// Listener failures must not flip a successful refinement into
-				// a reported failure — the refinement is already persisted.
-			}
-			try {
-				await this._extensionRunner.emit({
-					type: "refine_complete",
-					id: result.id,
-					summary: result.summary,
-					appliedEdits: result.appliedEdits.filter((edit) => edit.applied).length,
-					scope: result.scope ?? "local",
-				});
-			} catch {
-				// Extension emit failures must not flip a successful refinement
-				// into a reported failure — the refinement is already persisted.
-			}
-			return result;
-		} finally {
-			if (this._refineAbortController === refineAbort) {
-				this._refineAbortController = undefined;
-			}
-			if (!this._disposed) {
-				this._reconnectToAgent();
-			}
-		}
+		return applyRefine(this, plan, options, refineAbort);
 	}
 
 	abortBranchSummary(): void {
@@ -16412,7 +15883,7 @@ export class AgentSession {
 		assertAgentSessionNameAvailable(catalog, input);
 	}
 
-	private async _authenticatedRlmModels(): Promise<Model<Api>[]> {
+	async _authenticatedRlmModels(): Promise<Model<Api>[]> {
 		return (await this._modelRegistry.getExecutableModels()).filter((model) => {
 			const status = this._modelRegistry.getProviderAuthStatus(model.provider);
 			return status.source !== "stale" && status.label !== "expired";
