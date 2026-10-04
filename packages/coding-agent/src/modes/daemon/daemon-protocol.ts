@@ -378,8 +378,21 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   client that declared slim_attach_transcript, so an old client never
 //   receives it, and a new client reading an old daemon's unwindowed
 //   replacement sees the field absent, which already means "full transcript".
-export const DAEMON_SCHEMA_REVISION = 46;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-46-5dc417dfa720";
+// Revision 47 adds the optional changeNoticeToken field to the set_model and
+//   cycle_model command arms (wave-42 SETMODEL-VIS): a non-interactive model
+//   switch now emits a visible model_change_origin_notice chat message
+//   (display:true custom message over the existing message_start/message_end
+//   session events, so no event-union growth), and the token lets the
+//   forwarding supervisor exempt exactly the initiating client from that
+//   broadcast while every other attached client learns of the switch. An old
+//   worker ignores the field and emits no notice, which degrades to the pre-47
+//   behavior (the switch still applies; witnesses find out on the next lazy
+//   refresh) instead of misdelivering anything, so no capability gate; a
+//   direct session-plane peer never sets the field and the worker exempts the
+//   issuing peer itself. The digest recomputation covers the command-union
+//   growth.
+export const DAEMON_SCHEMA_REVISION = 47;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-47-6ccd4033fcaa";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -1255,8 +1268,29 @@ export type DaemonCommand =
 			promoteOwnedSession?: boolean;
 	  }
 	| { id?: string; type: "heartbeat_update"; activeSessionId: string; action: AgentHeartbeatUpdateAction }
-	| { id?: string; type: "set_model"; activeSessionId: string; provider: string; modelId: string }
-	| { id?: string; type: "cycle_model"; activeSessionId: string; direction?: "forward" | "backward" }
+	| {
+			id?: string;
+			type: "set_model";
+			activeSessionId: string;
+			provider: string;
+			modelId: string;
+			/**
+			 * Rev 47 (wave-42 SETMODEL-VIS): opaque correlator the supervisor stamps on the
+			 * forward so its relay can exempt exactly the initiating client from the
+			 * model_change_origin_notice broadcast. Absent on a direct worker link (the
+			 * worker exempts the issuing session-plane peer itself); never set by end
+			 * clients.
+			 */
+			changeNoticeToken?: string;
+	  }
+	| {
+			id?: string;
+			type: "cycle_model";
+			activeSessionId: string;
+			direction?: "forward" | "backward";
+			/** See set_model.changeNoticeToken. */
+			changeNoticeToken?: string;
+	  }
 	| { id?: string; type: "set_scoped_models"; activeSessionId: string; scopedModels: AgentConnectionScopedModel[] }
 	| { id?: string; type: "set_thinking_level"; activeSessionId: string; level: ThinkingLevel }
 	| { id?: string; type: "set_service_tier"; activeSessionId: string; serviceTier: ServiceTier }

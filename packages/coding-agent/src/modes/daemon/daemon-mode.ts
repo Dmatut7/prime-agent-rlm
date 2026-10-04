@@ -83,7 +83,12 @@ import {
 	normalizeObserveLimit,
 	normalizeObserveMaxChars,
 } from "../../core/agent-observe.js";
-import { type PromptOptions, type RlmChildStallState, rlmChildLabel } from "../../core/agent-session.js";
+import {
+	MODEL_CHANGE_ORIGIN_NOTICE_CUSTOM_TYPE,
+	type PromptOptions,
+	type RlmChildStallState,
+	rlmChildLabel,
+} from "../../core/agent-session.js";
 import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import {
 	type AgentSessionRuntime,
@@ -899,6 +904,17 @@ export class AgentDaemon {
 	private readonly supervisorClaims = new Map<DaemonSocketClient, BoundSupervisorGenerationClaim>();
 	private readonly peerGrants = new Map<string, DaemonWorkerPeerGrant>();
 	private readonly peerClaims = new Map<DaemonSocketClient, DaemonWorkerPeerGrant>();
+	/**
+	 * wave-42 SETMODEL-VIS: token -> worker-local client to exempt from the visible
+	 * model-change notice broadcast, registered for the duration of a
+	 * set_model/cycle_model command. Only self-minted tokens register here (a
+	 * direct session-plane peer issued the command); a supervisor-stamped
+	 * changeNoticeToken is exempted one layer up, at the supervisor relay -
+	 * exempting the supervisor link at this broadcast would silence every real
+	 * client. Registration ends in a finally when the command settles, so the map
+	 * cannot leak.
+	 */
+	private readonly modelChangeNoticeInitiators = new Map<string, DaemonSocketClient>();
 	private peerAdmissionsFenced = false;
 	private agentMessagesPaused = false;
 	private readonly summarizer = new DaemonSessionSummarizer(
@@ -5009,8 +5025,8 @@ export class AgentDaemon {
 			heartbeat_get: (_client, command) => this.handleHeartbeatGet(command),
 			heartbeat_set: (_client, command) => this.handleHeartbeatSet(command),
 			heartbeat_update: (_client, command) => this.handleHeartbeatUpdate(command),
-			set_model: (_client, command) => this.handleSetModel(command),
-			cycle_model: (_client, command) => this.handleCycleModel(command),
+			set_model: (client, command) => this.handleSetModel(client, command),
+			cycle_model: (client, command) => this.handleCycleModel(client, command),
 			set_scoped_models: (_client, command) => this.handleSetScopedModels(command),
 			set_thinking_level: (_client, command) => this.handleSetThinkingLevel(command),
 			set_service_tier: (_client, command) => this.handleSetServiceTier(command),
@@ -6207,6 +6223,7 @@ export class AgentDaemon {
 	}
 
 	private async handleSetModel(
+		client: DaemonSocketClient,
 		command: Extract<DaemonCommand, { type: "set_model" }>,
 	): Promise<DaemonResponse | undefined> {
 		const state = this.getSessionState(command.activeSessionId);
@@ -6218,23 +6235,47 @@ export class AgentDaemon {
 		if (!model) {
 			throw new Error(`Model not found: ${command.provider}/${command.modelId}`);
 		}
-		await session.setModel(model, {
-			waitForExtensions: !(session.isStreaming || session.isCompacting),
-		});
+		// wave-42 SETMODEL-VIS: attached witnesses get a visible chat notice of the
+		// switch. A supervisor-stamped token is exempted at the supervisor's relay
+		// (exempting the supervisor link here would silence every real client); only
+		// a token this worker minted - a direct session-plane peer's command -
+		// exempts the issuing client at this broadcast.
+		const noticeToken = command.changeNoticeToken ?? randomUUID();
+		const exemptClient =
+			command.changeNoticeToken === undefined && client.authenticationRole !== "supervisor" ? client : undefined;
+		if (exemptClient) this.modelChangeNoticeInitiators.set(noticeToken, exemptClient);
+		try {
+			await session.setModel(model, {
+				waitForExtensions: !(session.isStreaming || session.isCompacting),
+				changeNotice: { origin: "daemon_command", token: noticeToken },
+			});
+		} finally {
+			if (exemptClient) this.modelChangeNoticeInitiators.delete(noticeToken);
+		}
 		this.scheduleRosterFlush();
 		return success(command.id, "set_model", model);
 	}
 
 	private async handleCycleModel(
+		client: DaemonSocketClient,
 		command: Extract<DaemonCommand, { type: "cycle_model" }>,
 	): Promise<DaemonResponse | undefined> {
 		const state = this.getSessionState(command.activeSessionId);
 		const session = state.runtime.session;
-		const result = await session.cycleModel(command.direction, {
-			waitForExtensions: !(session.isStreaming || session.isCompacting),
-		});
-		this.scheduleRosterFlush();
-		return success(command.id, "cycle_model", result ?? null);
+		const noticeToken = command.changeNoticeToken ?? randomUUID();
+		const exemptClient =
+			command.changeNoticeToken === undefined && client.authenticationRole !== "supervisor" ? client : undefined;
+		if (exemptClient) this.modelChangeNoticeInitiators.set(noticeToken, exemptClient);
+		try {
+			const result = await session.cycleModel(command.direction, {
+				waitForExtensions: !(session.isStreaming || session.isCompacting),
+				changeNotice: { origin: "daemon_command", token: noticeToken },
+			});
+			this.scheduleRosterFlush();
+			return success(command.id, "cycle_model", result ?? null);
+		} finally {
+			if (exemptClient) this.modelChangeNoticeInitiators.delete(noticeToken);
+		}
 	}
 
 	private async handleSetScopedModels(
@@ -6298,7 +6339,12 @@ export class AgentDaemon {
 		command: Extract<DaemonCommand, { type: "set_auto_compaction" }>,
 	): Promise<DaemonResponse | undefined> {
 		const state = this.getSessionState(command.activeSessionId);
-		state.runtime.session.setAutoCompactionEnabled(command.enabled);
+		const session = state.runtime.session;
+		const model = session.model;
+		session.settingsManager.setCompactionEnabledForModel(
+			model ? `${model.provider}/${model.id}` : undefined,
+			command.enabled,
+		);
 		return success(command.id, "set_auto_compaction");
 	}
 
@@ -8488,6 +8534,22 @@ export class AgentDaemon {
 		return cascadeError;
 	}
 
+	/**
+	 * The client whose in-flight set_model/cycle_model command emitted this notice,
+	 * or undefined when the message is not a token-stamped model-change origin
+	 * notice. The token lives only for the command's duration, so a notice without
+	 * a live registration (extension-driven switches carry no token) exempts nobody.
+	 */
+	private modelChangeNoticeInitiatorFor(message: DaemonOutbound): DaemonSocketClient | undefined {
+		if (message.type !== "session_event") return undefined;
+		const event = message.event;
+		if (event.type !== "message_start" && event.type !== "message_end") return undefined;
+		const notice = event.message;
+		if (notice.role !== "custom" || notice.customType !== MODEL_CHANGE_ORIGIN_NOTICE_CUSTOM_TYPE) return undefined;
+		const token = (notice.details as { token?: unknown } | undefined)?.token;
+		return typeof token === "string" ? this.modelChangeNoticeInitiators.get(token) : undefined;
+	}
+
 	private broadcastToSession(state: ActiveSessionState, inboundMessage: DaemonOutbound): void {
 		// r4 recovery-shell: stall_warning may be enriched with the actions field
 		// below; the parameter stays const and the enriched copy flows on from
@@ -8531,9 +8593,15 @@ export class AgentDaemon {
 		this.stampRlmChildActiveSessionId(message);
 		this.observeRosterEvent(state, message);
 		const sequencedMessage = this.addSessionEventMeta(state, message);
+		// wave-42 SETMODEL-VIS: the model-change origin notice goes to every attached
+		// client except the one whose set_model/cycle_model command caused it.
+		const noticeInitiator = this.modelChangeNoticeInitiatorFor(sequencedMessage);
 		let serialized: string | undefined;
 		for (const client of state.clients) {
 			if (!shouldSendDaemonOutboundToClient(client, sequencedMessage)) {
+				continue;
+			}
+			if (noticeInitiator === client) {
 				continue;
 			}
 			if (sequencedMessage.type === "session_closed") {

@@ -112,6 +112,9 @@ function supervisorRelay(writableLength: number) {
 		streamReconstructor: { observe: vi.fn(), hasPartial: vi.fn(() => false) },
 		catchUpClient: vi.fn(async () => undefined),
 		invalidateWorkerSnapshot: vi.fn(),
+		// The catch-up trigger log writes through the supervisor's file-log path,
+		// which needs a socket path to name the log file after.
+		socketPath: `/tmp/w42-false-backpressure-${process.pid}.sock`,
 	}) as {
 		handleWorkerFrame(residentWorker: typeof worker, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
 		flushDeferredSessionPayloads(client: DaemonSocketClient, activeSessionId: string): void;

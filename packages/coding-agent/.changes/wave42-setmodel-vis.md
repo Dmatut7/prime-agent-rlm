@@ -1,0 +1,1 @@
+- Added a visible chat notice when the session model is switched from another attached window or an extension (`模型已切换为「provider/model」（由…发起）`): every attached client except the initiator now sees the switch immediately instead of finding out on a lazy footer refresh, and the origin is recorded in the session ledger.

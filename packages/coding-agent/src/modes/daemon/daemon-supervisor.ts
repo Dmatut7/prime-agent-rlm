@@ -36,6 +36,7 @@ import {
 	formatAgentSessionNameUnavailable,
 	sessionNameReservationKey,
 } from "../../core/agent-messages.js";
+import { MODEL_CHANGE_ORIGIN_NOTICE_CUSTOM_TYPE } from "../../core/agent-session.js";
 import {
 	type AgentSessionRuntimeConfig,
 	type DurableAgentSessionRuntimeConfig,
@@ -1651,6 +1652,15 @@ export class DaemonSupervisor {
 	private readonly sessionInputPauseEpochs = new WeakMap<DaemonSocketClient, number>();
 	private readonly detachingInputPauseSessions = new WeakMap<DaemonSocketClient, Set<string>>();
 	private readonly protocolClientIds = new WeakMap<DaemonSocketClient, string>();
+	/**
+	 * wave-42 SETMODEL-VIS: token -> real client whose set_model/cycle_model forward
+	 * stamped that token (changeNoticeToken), registered for the duration of the
+	 * forward. relayWorkerOutboundFrame exempts exactly that client from the
+	 * model_change_origin_notice pair; every other attached client gets the visible
+	 * chat line. Direct session-plane peers never cross this map - the worker
+	 * exempts them itself. Registration ends in a finally, so the map cannot leak.
+	 */
+	private readonly modelChangeNoticeInitiators = new Map<string, DaemonSocketClient>();
 	private readonly workers = new Map<string, ResidentWorker>();
 	private workerStopCounts?: Map<ResidentWorker, number>;
 	private readonly openingWorkers = new Map<string, Promise<ResidentWorker>>();
@@ -3481,6 +3491,8 @@ export class DaemonSupervisor {
 			heartbeat_update: (client, command) => this.handleHeartbeatUpdate(client, command),
 			rename_saved_session: (client, command) => this.handleRenameSavedSession(client, command),
 			delete_saved_session: (client, command) => this.handleDeleteSavedSession(client, command),
+			set_model: (client, command) => this.handleModelChangeCommand(client, command),
+			cycle_model: (client, command) => this.handleModelChangeCommand(client, command),
 		};
 		return this.commandHandlersCache;
 	}
@@ -4428,6 +4440,27 @@ export class DaemonSupervisor {
 			return await this.deliverAgentMessage(client, command, source, target, targetActiveSessionId);
 		}
 		return this.forwardToWorker(target.worker, { ...command, targetActiveSessionId });
+	}
+
+	/**
+	 * wave-42 SETMODEL-VIS: stamp the worker forward with a notice correlator so the
+	 * relay can exempt exactly this initiating client from the witness-facing
+	 * model_change_origin_notice. The token is registered for the forward's
+	 * duration: the worker emits the notice inside its set_model/cycle_model
+	 * handling, whose frames precede the command response on the same ordered
+	 * worker stream, so the registration is always live when the notice relays.
+	 */
+	private async handleModelChangeCommand(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "set_model" }> | Extract<DaemonCommand, { type: "cycle_model" }>,
+	): Promise<DaemonResponse | undefined> {
+		const changeNoticeToken = randomUUID();
+		this.modelChangeNoticeInitiators.set(changeNoticeToken, client);
+		try {
+			return await this.forwardRoutedCommand(client, { ...command, changeNoticeToken });
+		} finally {
+			this.modelChangeNoticeInitiators.delete(changeNoticeToken);
+		}
 	}
 
 	private async forwardRoutedCommand(
@@ -10210,6 +10243,23 @@ export class DaemonSupervisor {
 		}
 	}
 
+	/**
+	 * The real client whose in-flight set_model/cycle_model forward emitted this
+	 * notice, or undefined when the frame is not a token-stamped
+	 * model_change_origin_notice. The token lives only for the forward's duration,
+	 * so a notice without a live registration (an extension-driven switch carries
+	 * no token; a direct peer's notice is exempted at the worker) exempts nobody.
+	 */
+	private modelChangeNoticeInitiatorFor(message: DaemonOutbound | undefined): DaemonSocketClient | undefined {
+		if (message?.type !== "session_event") return undefined;
+		const event = message.event;
+		if (event.type !== "message_start" && event.type !== "message_end") return undefined;
+		const notice = event.message;
+		if (notice.role !== "custom" || notice.customType !== MODEL_CHANGE_ORIGIN_NOTICE_CUSTOM_TYPE) return undefined;
+		const token = (notice.details as { token?: unknown } | undefined)?.token;
+		return typeof token === "string" ? this.modelChangeNoticeInitiators.get(token) : undefined;
+	}
+
 	private relayWorkerOutboundFrame(
 		worker: ResidentWorker,
 		frame: PrivateFrame<DaemonWorkerFrameHeader>,
@@ -10286,8 +10336,15 @@ export class DaemonSupervisor {
 				outboundType === "session_closed" ||
 				isFinalizedTranscriptEvent(sessionEventType),
 		);
+		// wave-42 SETMODEL-VIS: the model-change origin notice relays to every
+		// attached client except the one whose set_model/cycle_model forward carried
+		// the notice's token (registered in handleModelChangeCommand).
+		const modelChangeNoticeInitiator = this.modelChangeNoticeInitiatorFor(decodedOutbound);
 		for (const client of this.clients) {
 			if (!client.attachedActiveSessionIds.has(activeSessionId)) {
+				continue;
+			}
+			if (modelChangeNoticeInitiator === client) {
 				continue;
 			}
 			if (replacementSnapshotFollows && !client.capabilities.has("chunked_snapshot")) {

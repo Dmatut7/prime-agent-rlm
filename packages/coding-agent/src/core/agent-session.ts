@@ -1564,8 +1564,40 @@ export interface ModelCycleResult {
 	isScoped: boolean;
 }
 
+/**
+ * customType of the visible chat notice emitted when a non-interactive caller (a
+ * daemon set_model/cycle_model command from another attached client, or the
+ * extension API) switches the session model: every attached window except the
+ * initiator gets a chat line instead of finding out on the next lazy footer
+ * refresh. The notice rides message_start/message_end and is deliberately kept
+ * out of the live context and out of the custom_message transcript form -
+ * convertToLlm passes an unknown customType through to the model, so the only
+ * safe homes are the event stream and a ledger-only custom entry.
+ */
+export const MODEL_CHANGE_ORIGIN_NOTICE_CUSTOM_TYPE = "model_change_origin_notice";
+
+/** Who drove a non-interactive model switch; recorded on the notice and its ledger entry. */
+export type ModelChangeOriginNoticeSource = "daemon_command" | "extension";
+
+export interface ModelChangeOriginNoticeDetails {
+	provider: string;
+	modelId: string;
+	previousProvider?: string;
+	previousModelId?: string;
+	origin: ModelChangeOriginNoticeSource;
+	/** Per-switch correlator the daemon uses to exempt the initiating client; wire-only, never persisted. */
+	token?: string;
+}
+
 interface ModelSelectOptions {
 	waitForExtensions?: boolean;
+	/**
+	 * Non-interactive callers (daemon set_model/cycle_model, extension API) set this
+	 * so attached witnesses get the visible notice. The interactive window's own
+	 * /model leaves it unset: its local status line and footer update already
+	 * answered the user, and a notice would double-report.
+	 */
+	changeNotice?: { origin: ModelChangeOriginNoticeSource; token?: string };
 }
 
 interface ToolDefinitionEntry {
@@ -4759,9 +4791,17 @@ export class AgentSession {
 		}
 	}
 
+	/** Automatic compaction triggers read the per-model switch (the bare enabled
+	 * flag is the default for models without an entry). Manual /compact is
+	 * unaffected: it flows through the pending-request clause, not this gate. */
+	private _compactionEnabledForCurrentModel(): boolean {
+		const model = this.model;
+		return this.settingsManager.getCompactionEnabledForModel(model ? `${model.provider}/${model.id}` : undefined);
+	}
+
 	private async _thresholdCompactionNeeded(context: ShouldStopAfterTurnContext): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
-		if (!settings.enabled) return false;
+		if (!this._compactionEnabledForCurrentModel()) return false;
 
 		const contextWindow = this._sessionContextWindow();
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
@@ -7762,7 +7802,7 @@ export class AgentSession {
 		// here would race it.
 		if (this.isStreaming) return undefined;
 		const settings = this.settingsManager.getCompactionSettings();
-		if (!settings.enabled) return undefined;
+		if (!this._compactionEnabledForCurrentModel()) return undefined;
 		const contextWindow = this._sessionContextWindow();
 		if (contextWindow <= 0) return undefined;
 		// Anti-starvation: a failed or skipped compaction arms a cooldown, and inside it
@@ -11849,6 +11889,9 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(model.provider, model.id);
 		if (!modelsAreEqual(model, previousModel)) {
 			this._pushModelChangeNotice({ provider: model.provider, modelId: model.id });
+			if (options.changeNotice) {
+				this._emitModelChangeOriginNotice(model, previousModel, options.changeNotice);
+			}
 		}
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 
@@ -11920,6 +11963,9 @@ export class AgentSession {
 		this.agent.state.model = next.model;
 		this._clearModelOverrideWhenIdle();
 		this._recordModelChangeForContext({ provider: next.model.provider, modelId: next.model.id });
+		if (options.changeNotice) {
+			this._emitModelChangeOriginNotice(next.model, currentModel, options.changeNotice);
+		}
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
 		this.setThinkingLevel(thinkingLevel);
@@ -11962,6 +12008,9 @@ export class AgentSession {
 		this.agent.state.model = nextModel;
 		this._clearModelOverrideWhenIdle();
 		this._recordModelChangeForContext({ provider: nextModel.provider, modelId: nextModel.id });
+		if (options.changeNotice) {
+			this._emitModelChangeOriginNotice(nextModel, currentModel, options.changeNotice);
+		}
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 
 		this.setThinkingLevel(thinkingLevel);
@@ -14459,7 +14508,7 @@ export class AgentSession {
 		// strip + retry still happen; the compaction it runs consumes the request.
 		if (
 			!assistantIsFromBeforeCompaction &&
-			(settings.enabled || this._pendingRequestedCompaction !== undefined) &&
+			(this._compactionEnabledForCurrentModel() || this._pendingRequestedCompaction !== undefined) &&
 			sameModel &&
 			isContextOverflow(assistantMessage, contextWindow) &&
 			!this._routedOverflowFitsSession(compactionTimestamp, settings)
@@ -14523,7 +14572,7 @@ export class AgentSession {
 			return await this._runAutoCompaction("requested", false);
 		}
 
-		if (!settings.enabled || assistantIsFromBeforeCompaction) return false;
+		if (!this._compactionEnabledForCurrentModel() || assistantIsFromBeforeCompaction) return false;
 
 		// Case 3: Threshold - context is getting large.
 		// Use the full-session estimate so messages appended after the last successful
@@ -15279,7 +15328,9 @@ export class AgentSession {
 				getCommands,
 				setModel: async (model) => {
 					if (!this.modelRegistry.hasConfiguredAuth(model)) return false;
-					await this.setModel(model);
+					// An extension switch has no initiating window to exempt: every attached
+					// client is a witness and gets the visible notice.
+					await this.setModel(model, { changeNotice: { origin: "extension" } });
 					return true;
 				},
 				getThinkingLevel: () => this.thinkingLevel,
@@ -19024,6 +19075,48 @@ export class AgentSession {
 			return;
 		}
 		this.agent.state.messages.push(message);
+	}
+
+	/**
+	 * The witness-facing half of a non-interactive switch (wave-42 SETMODEL-VIS): a
+	 * visible chat line for every attached client except the initiator. Unlike the
+	 * model-facing notice above this never enters the context - it is not pushed to
+	 * state.messages and not persisted as a custom_message, because convertToLlm
+	 * passes an unknown customType through to the model. The origin record lands in
+	 * the ledger as a plain custom entry (never rebuilt into messages); the token
+	 * stays wire-only so the daemon's exemption window cannot leak into the
+	 * transcript. No deferral while streaming: with no context seat there is no
+	 * tool-batch ordering to corrupt, and the witness wants the line now.
+	 */
+	private _emitModelChangeOriginNotice(
+		model: Model<any>,
+		previousModel: Model<any> | undefined,
+		notice: { origin: ModelChangeOriginNoticeSource; token?: string },
+	): void {
+		const details: ModelChangeOriginNoticeDetails = {
+			provider: model.provider,
+			modelId: model.id,
+			...(previousModel ? { previousProvider: previousModel.provider, previousModelId: previousModel.id } : {}),
+			origin: notice.origin,
+			...(notice.token ? { token: notice.token } : {}),
+		};
+		const originText = notice.origin === "extension" ? "扩展" : "另一个窗口或客户端";
+		const message: CustomMessage<ModelChangeOriginNoticeDetails> = {
+			role: "custom",
+			customType: MODEL_CHANGE_ORIGIN_NOTICE_CUSTOM_TYPE,
+			content: `模型已切换为「${model.provider}/${model.id}」（由${originText}发起）。`,
+			display: true,
+			details,
+			timestamp: Date.now(),
+		};
+		try {
+			const { token: _wireOnly, ...ledgerDetails } = details;
+			this.sessionManager.appendCustomEntry(MODEL_CHANGE_ORIGIN_NOTICE_CUSTOM_TYPE, ledgerDetails);
+		} catch (error) {
+			this._reportSessionPersistFailure(error);
+		}
+		this._emit({ type: "message_start", message });
+		this._emit({ type: "message_end", message });
 	}
 
 	/**
