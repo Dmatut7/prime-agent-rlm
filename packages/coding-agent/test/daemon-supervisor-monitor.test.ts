@@ -1950,8 +1950,8 @@ describe("daemon worker supervisor monitoring", () => {
 			persistWorker: vi.fn(),
 			assertRecoveryAllowed: vi.fn(async () => {}),
 			// The park path now offers a scheduled-job re-adoption; this worker has no
-			// roster rows and no session file, so the offer is declined.
-			workerRosterEntries: vi.fn(() => []),
+			// roster rows (the real roster seat starts empty) and no session file, so
+			// the offer is declined.
 		}) as RecoveryHarness;
 
 		const recovery = supervisor.recoverWorker(worker);
@@ -2543,11 +2543,10 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			persistWorker,
-			markWorkerRosterEntries: vi.fn(),
 			log: vi.fn(),
 			// The park path now offers a scheduled-job re-adoption; this worker has no
-			// roster rows and no session file, so the offer is declined.
-			workerRosterEntries: vi.fn(() => []),
+			// roster rows (the real roster seat starts empty) and no session file, so
+			// the offer is declined.
 		}) as { deferWorkerRecovery(target: typeof worker, error: Error): void };
 
 		supervisor.deferWorkerRecovery(worker, new Error("still silent"));

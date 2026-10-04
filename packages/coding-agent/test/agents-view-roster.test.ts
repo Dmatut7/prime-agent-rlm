@@ -441,8 +441,8 @@ describe("subscriber push transitions", () => {
 			...extra,
 		}) as {
 			workers: Map<string, unknown>;
+			handleWorkerFrame(worker: unknown, frame: unknown): void;
 			writeRosterEntry(entry: unknown, worker?: unknown): AgentRosterEntry;
-			workerRosterEntries(worker: unknown): AgentRosterEntry[];
 			sweepRosterStaleness(now?: number): void;
 			promoteOwnedWorker(client: object, worker: unknown): Promise<void>;
 			roster(): { delete(agentId: string): void };
@@ -451,6 +451,14 @@ describe("subscriber push transitions", () => {
 			await new Promise((resolve) => setImmediate(resolve));
 		};
 		return { supervisor, pushes, settle, subscriber };
+	}
+
+	/** A worker's roster push as it arrives off the socket, fed through the frame dispatcher. */
+	function rosterDeltaFrame(entries: WorkerRosterEntry[], snapshot?: true) {
+		return {
+			header: { kind: "outbound", outboundType: "roster_delta" },
+			payload: Buffer.from(JSON.stringify({ type: "roster_delta", entries, ...(snapshot ? { snapshot } : {}) })),
+		};
 	}
 
 	function pushWorker(workerId: string, ownerClientId?: string) {
@@ -505,7 +513,7 @@ describe("subscriber push transitions", () => {
 		const bornOwned = workerRosterEntryFromSummary(
 			summary({ id: "p-active", sessionId: "p", activeSessionId: "p-active", sessionFile: "/tmp/p.jsonl" }),
 		);
-		supervisor.writeRosterEntry(bornOwned, owned);
+		supervisor.handleWorkerFrame(owned, rosterDeltaFrame([bornOwned]));
 		await settle();
 		expect(pushes).toEqual([]);
 
@@ -516,14 +524,14 @@ describe("subscriber push transitions", () => {
 		await settle();
 		pushes.length = 0;
 
-		supervisor.writeRosterEntry(entry, owned);
+		supervisor.handleWorkerFrame(owned, rosterDeltaFrame([entry]));
 		await settle();
 		expect(pushes.at(-1)?.removed).toEqual([entry.agentId]);
 		expect(pushes.at(-1)?.changed).toEqual([]);
 
 		pushes.length = 0;
-		supervisor.writeRosterEntry(entry, owned);
-		supervisor.writeRosterEntry(bornOwned, owned);
+		supervisor.handleWorkerFrame(owned, rosterDeltaFrame([entry]));
+		supervisor.handleWorkerFrame(owned, rosterDeltaFrame([bornOwned]));
 		await settle();
 		expect(pushes).toEqual([]);
 
@@ -566,17 +574,11 @@ describe("subscriber push transitions", () => {
 				parentSessionPath: parentPath,
 			}),
 		);
-		supervisor.writeRosterEntry(childEntry, worker);
+		supervisor.handleWorkerFrame(worker, rosterDeltaFrame([childEntry]));
 		await settle();
 		pushes.length = 0;
 
-		const internals = supervisor as unknown as {
-			consumeWorkerRosterDelta(worker: object, payload: Buffer): void;
-		};
-		internals.consumeWorkerRosterDelta(
-			worker,
-			Buffer.from(JSON.stringify({ type: "roster_delta", entries: [], snapshot: true })),
-		);
+		supervisor.handleWorkerFrame(worker, rosterDeltaFrame([], true));
 		await vi.waitFor(() => expect(pushes.length).toBeGreaterThan(0));
 		await settle();
 

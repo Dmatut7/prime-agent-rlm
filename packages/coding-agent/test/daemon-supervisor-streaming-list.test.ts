@@ -86,7 +86,12 @@ function createHarness(options: {
 		isWorkerStopping: () => false,
 		persistWorker: vi.fn(),
 		assertRecoveryAllowed: async () => {},
-		syncRosterFromWorkerSummaries: vi.fn(),
+		// The real roster sync runs: its writes feed the push plumbing, which has no
+		// subscribed clients here.
+		pendingRosterChanged: new Set(),
+		pendingRosterRemoved: new Set(),
+		publishedRosterIds: new Set(),
+		rosterPushScheduled: false,
 		// The roster apply chain only runs while its own worker and connection are current.
 		workers: new Map([[worker.descriptor.workerId, worker]]),
 		clients: new Set(),

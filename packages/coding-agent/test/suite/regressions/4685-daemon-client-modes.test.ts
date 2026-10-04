@@ -319,14 +319,9 @@ describe("ENG-4685 daemon-backed client modes", () => {
 		vi.useFakeTimers();
 		try {
 			const worker = {
-				descriptor: { ownerClientId: "owner-1", workerId: "worker-1" },
+				descriptor: { ownerClientId: "owner-1", workerId: "worker-1", rootActiveSessionId: "root-1" },
+				client: {},
 				ownerCleanupTimer: undefined,
-			};
-			const busyEntry = {
-				agentId: "agent-1",
-				workerId: "worker-1",
-				queuedChild: false,
-				summary: { sessionId: "session-1", isSessionActive: true, hasRunningRlmChildren: false },
 			};
 			const stopWorker = vi.fn(async () => {});
 			const log = vi.fn();
@@ -334,13 +329,38 @@ describe("ENG-4685 daemon-backed client modes", () => {
 				clients: new Set(),
 				workers: new Map([[worker.descriptor.workerId, worker]]),
 				protocolClientId: () => "nobody-here",
-				workerRosterEntries: () => [busyEntry],
+				pendingRosterChanged: new Set(),
+				pendingRosterRemoved: new Set(),
+				publishedRosterIds: new Set(),
+				rosterPushScheduled: false,
 				stopWorker,
 				log,
 			}) as unknown as {
 				scheduleOwnedWorkerCleanup(resident: typeof worker): void;
+				handleWorkerFrame(resident: unknown, frame: unknown): void;
 			};
 
+			// The worker's own roster frame reports the busy row the cleanup attributes.
+			supervisor.handleWorkerFrame(worker, {
+				header: { kind: "outbound", outboundType: "roster_delta" },
+				payload: Buffer.from(
+					JSON.stringify({
+						type: "roster_delta",
+						entries: [
+							{
+								agentId: "agent-1",
+								summary: {
+									id: "session-1",
+									sessionId: "session-1",
+									cwd: "/tmp/project",
+									isSessionActive: true,
+									hasRunningRlmChildren: false,
+								},
+							},
+						],
+					}),
+				),
+			});
 			supervisor.scheduleOwnedWorkerCleanup(worker);
 			await vi.advanceTimersByTimeAsync(30_000);
 
@@ -361,14 +381,9 @@ describe("ENG-4685 daemon-backed client modes", () => {
 		vi.useFakeTimers();
 		try {
 			const worker = {
-				descriptor: { ownerClientId: "owner-1", workerId: "worker-1" },
+				descriptor: { ownerClientId: "owner-1", workerId: "worker-1", rootActiveSessionId: "root-1" },
+				client: {},
 				ownerCleanupTimer: undefined,
-			};
-			const idleEntry = {
-				agentId: "agent-1",
-				workerId: "worker-1",
-				queuedChild: false,
-				summary: { sessionId: "session-1", isSessionActive: false, hasRunningRlmChildren: false },
 			};
 			const stopWorker = vi.fn(async () => {});
 			const log = vi.fn();
@@ -376,13 +391,38 @@ describe("ENG-4685 daemon-backed client modes", () => {
 				clients: new Set(),
 				workers: new Map([[worker.descriptor.workerId, worker]]),
 				protocolClientId: () => "nobody-here",
-				workerRosterEntries: () => [idleEntry],
+				pendingRosterChanged: new Set(),
+				pendingRosterRemoved: new Set(),
+				publishedRosterIds: new Set(),
+				rosterPushScheduled: false,
 				stopWorker,
 				log,
 			}) as unknown as {
 				scheduleOwnedWorkerCleanup(resident: typeof worker): void;
+				handleWorkerFrame(resident: unknown, frame: unknown): void;
 			};
 
+			// The worker's own roster frame reports the idle row the cleanup stays quiet about.
+			supervisor.handleWorkerFrame(worker, {
+				header: { kind: "outbound", outboundType: "roster_delta" },
+				payload: Buffer.from(
+					JSON.stringify({
+						type: "roster_delta",
+						entries: [
+							{
+								agentId: "agent-1",
+								summary: {
+									id: "session-1",
+									sessionId: "session-1",
+									cwd: "/tmp/project",
+									isSessionActive: false,
+									hasRunningRlmChildren: false,
+								},
+							},
+						],
+					}),
+				),
+			});
 			supervisor.scheduleOwnedWorkerCleanup(worker);
 			await vi.advanceTimersByTimeAsync(30_000);
 

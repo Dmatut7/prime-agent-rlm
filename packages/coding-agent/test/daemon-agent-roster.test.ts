@@ -617,22 +617,22 @@ function makeWorker(workerId: string, overrides: Partial<WorkerFixture> = {}): W
 
 interface SupervisorFixture {
 	workers: Map<string, WorkerFixture>;
-	consumeWorkerRosterDelta(worker: WorkerFixture, payload: Buffer): void;
 	handleList(
 		client: object,
 		command: { id?: string; type: "list"; all?: boolean; includeClientOwned?: boolean; sessionDir?: string },
 	): { success: boolean; data?: { sessions: SessionSummary[]; busyClientOwnedSessionCount?: number } };
 	handleWorkerClose(worker: WorkerFixture, client: object, error: Error): Promise<void>;
 	handleWorkerFrame(worker: WorkerFixture, frame: unknown): void;
+	// The wire read model behind the `roster` command / roster_update pushes: every
+	// roster-content assertion reads through it instead of the store accessor.
+	rosterEntriesForClient(): AgentRosterEntry[];
+	// Workerless rows have no frame-level seam (a roster_delta frame requires a
+	// registered worker and would claim the row for it), so offline/cross-worker
+	// fixtures still write through this entry point directly.
 	writeRosterEntry(entry: WorkerRosterEntry, worker?: WorkerFixture): AgentRosterEntry;
-	workerRosterEntries(worker: WorkerFixture): AgentRosterEntry[];
-	flipWorkerRosterEntriesInactive(worker: WorkerFixture): void;
+	// Boot seeding has no lightweight public trigger on a prototype harness (its
+	// only caller is start()); the two drives below ride the post-split shell.
 	seedRosterLedger(): Promise<void>;
-	roster(): {
-		get(agentId: string): AgentRosterEntry | undefined;
-		has(agentId: string): boolean;
-		values(): IterableIterator<AgentRosterEntry>;
-	};
 	refreshWorkerSummaries: ReturnType<typeof vi.fn>;
 	log: ReturnType<typeof vi.fn>;
 }
@@ -656,6 +656,8 @@ function makeSupervisor(workers: WorkerFixture[], extra: Record<string, unknown>
 		}),
 		// handleList consults the spawn ledger; the unit fixture defaults to an empty one.
 		rlmSpawnLedger: () => ({ liveEdges: async () => [] }),
+		// Worker session frames (e.g. the root-shutdown relay) observe through the reconstructor.
+		streamReconstructor: { observe: vi.fn(), seed: vi.fn(), clear: vi.fn() },
 		log: vi.fn(),
 		...extra,
 	}) as SupervisorFixture;
@@ -692,6 +694,28 @@ function rosterDelta(entries: WorkerRosterEntry[], removedAgentIds?: string[], s
 	);
 }
 
+/** The roster_delta as it arrives off the worker socket, fed through the frame dispatcher. */
+function rosterFrame(entries: WorkerRosterEntry[], removedAgentIds?: string[], snapshot?: true) {
+	return {
+		header: { kind: "outbound", outboundType: "roster_delta" },
+		payload: rosterDelta(entries, removedAgentIds, snapshot),
+	};
+}
+
+/**
+ * The worker's root session shutting down over the wire: the relay unregisters the
+ * worker and flips its roster rows (client-owned rows die with the registration,
+ * resident rows passivate, queued rows drop).
+ */
+function rootShutdownFrame(rootActiveSessionId: string) {
+	return {
+		header: { kind: "outbound", outboundType: "session_closed", activeSessionId: rootActiveSessionId },
+		payload: Buffer.from(
+			JSON.stringify({ type: "session_closed", activeSessionId: rootActiveSessionId, reason: "shutdown" }),
+		),
+	};
+}
+
 describe("supervisor roster ledger", () => {
 	it("skips a malformed roster entry instead of throwing into the frame dispatcher", () => {
 		const worker = makeWorker("worker-malformed-entry");
@@ -705,12 +729,14 @@ describe("supervisor roster ledger", () => {
 		// which destroys the stream: one bad frame took the whole worker channel down.
 		const malformed = { agentId: "child-broken" } as unknown as WorkerRosterEntry;
 
-		supervisor.consumeWorkerRosterDelta(worker, rosterDelta([malformed, good]));
+		supervisor.handleWorkerFrame(worker, rosterFrame([malformed, good]));
 
 		expect(supervisor.log).toHaveBeenCalledWith(expect.stringContaining("Skipped 1 malformed roster entry"));
 		// The well-formed entry in the same frame still landed, and the skip asks for a
 		// repair snapshot instead of leaving the ledger silently short.
-		expect(supervisor.roster().get(good.agentId)?.summary.sessionId).toBe("m-session");
+		expect(
+			supervisor.rosterEntriesForClient().find((entry) => entry.agentId === good.agentId)?.summary.sessionId,
+		).toBe("m-session");
 		expect(supervisor.refreshWorkerSummaries).toHaveBeenCalledWith(worker, false, true);
 	});
 
@@ -728,15 +754,19 @@ describe("supervisor roster ledger", () => {
 		const supervisor = makeSupervisor([visible, owned], {
 			protocolClientIds: new WeakMap(),
 		});
-		supervisor.writeRosterEntry(
-			workerRosterEntryFromSummary(summary({ id: "v-active", sessionId: "v", activeSessionId: "v-active" })),
+		supervisor.handleWorkerFrame(
 			visible,
+			rosterFrame([
+				workerRosterEntryFromSummary(summary({ id: "v-active", sessionId: "v", activeSessionId: "v-active" })),
+			]),
 		);
-		supervisor.writeRosterEntry(
-			workerRosterEntryFromSummary(
-				summary({ id: "o-active", sessionId: "o", activeSessionId: "o-active", isSessionActive: true }),
-			),
+		supervisor.handleWorkerFrame(
 			owned,
+			rosterFrame([
+				workerRosterEntryFromSummary(
+					summary({ id: "o-active", sessionId: "o", activeSessionId: "o-active", isSessionActive: true }),
+				),
+			]),
 		);
 
 		const listed = await supervisor.handleList({}, { type: "list", includeClientOwned: true });
@@ -753,9 +783,9 @@ describe("supervisor roster ledger", () => {
 		{
 			const queuedWorker = makeWorker("worker-q");
 			const queuedSupervisor = makeSupervisor([queuedWorker]);
-			queuedSupervisor.consumeWorkerRosterDelta(
+			queuedSupervisor.handleWorkerFrame(
 				queuedWorker,
-				rosterDelta([
+				rosterFrame([
 					{
 						agentId: "child-1",
 						queuedChild: true,
@@ -770,7 +800,7 @@ describe("supervisor roster ledger", () => {
 			);
 			expect((await queuedSupervisor.handleList({}, { type: "list" })).data?.sessions).toEqual([]);
 			expect((await queuedSupervisor.handleList({}, { type: "list", all: true })).data?.sessions).toEqual([]);
-			expect(queuedSupervisor.workerRosterEntries(queuedWorker)[0]).toMatchObject({
+			expect(queuedSupervisor.rosterEntriesForClient()[0]).toMatchObject({
 				status: "running",
 				statusLabel: "queued",
 			});
@@ -820,33 +850,32 @@ describe("supervisor roster ledger", () => {
 		const worker = makeWorker("worker-1");
 		Object.assign(worker.descriptor, { sessionFile: parentPath });
 		const supervisor = makeSupervisor([worker], { rlmSpawnLedger: () => ledger });
-		supervisor.writeRosterEntry(
-			workerRosterEntryFromSummary(
-				summary({
-					id: "kept-active",
-					sessionId: "kept",
-					activeSessionId: "kept-active",
-					sessionFile: "/tmp/kept.jsonl",
-				}),
-			),
+		supervisor.handleWorkerFrame(
 			worker,
+			rosterFrame([
+				workerRosterEntryFromSummary(
+					summary({
+						id: "kept-active",
+						sessionId: "kept",
+						activeSessionId: "kept-active",
+						sessionFile: "/tmp/kept.jsonl",
+					}),
+				),
+				workerRosterEntryFromSummary(
+					summary({
+						id: "passivated-child",
+						sessionId: "passivated-child",
+						sessionFile: passivatedPath,
+						runtimeKind: "subagent",
+						rlmChildId: "passivated-child",
+						parentSessionPath: parentPath,
+					}),
+				),
+			]),
 		);
-		supervisor.writeRosterEntry(
-			workerRosterEntryFromSummary(
-				summary({
-					id: "passivated-child",
-					sessionId: "passivated-child",
-					sessionFile: passivatedPath,
-					runtimeKind: "subagent",
-					rlmChildId: "passivated-child",
-					parentSessionPath: parentPath,
-				}),
-			),
+		supervisor.handleWorkerFrame(
 			worker,
-		);
-		supervisor.consumeWorkerRosterDelta(
-			worker,
-			rosterDelta([
+			rosterFrame([
 				{
 					agentId: "sessionless",
 					queuedChild: true,
@@ -856,9 +885,9 @@ describe("supervisor roster ledger", () => {
 		);
 
 		// The restarted worker's replacing snapshot names only the row it still holds.
-		supervisor.consumeWorkerRosterDelta(
+		supervisor.handleWorkerFrame(
 			worker,
-			rosterDelta(
+			rosterFrame(
 				[
 					workerRosterEntryFromSummary(
 						summary({
@@ -874,10 +903,13 @@ describe("supervisor roster ledger", () => {
 				true,
 			),
 		);
-		await vi.waitFor(() => expect(supervisor.roster().get("kept")).toMatchObject({ status: "running" }));
-		expect(supervisor.roster().has("sessionless")).toBe(false);
+		const rosterEntries = () => supervisor.rosterEntriesForClient();
+		await vi.waitFor(() =>
+			expect(rosterEntries().find((entry) => entry.agentId === "kept")).toMatchObject({ status: "running" }),
+		);
+		expect(rosterEntries().some((entry) => entry.agentId === "sessionless")).toBe(false);
 		// The deleted-while-disconnected child stays out; the surviving one reseeds from its live edge.
-		const entries = [...supervisor.roster().values()];
+		const entries = rosterEntries();
 		const reseeded = entries.find((entry) => entry.summary.rlmChildId === "passivated-child");
 		expect(reseeded).toBeDefined();
 		expect(reseeded?.summary.activeSessionId).toBeUndefined();
@@ -889,35 +921,33 @@ describe("supervisor roster ledger", () => {
 		const owned = makeWorker("w-owned");
 		Object.assign(owned.descriptor, { ownerClientId: "owner-client" });
 		const supervisor = makeSupervisor([owned], { catalog: { list: vi.fn(async () => []) } });
-		supervisor.writeRosterEntry(
-			workerRosterEntryFromSummary(
-				summary({
-					id: "o-active",
-					sessionId: "o",
-					activeSessionId: "o-active",
-					sessionFile: "/tmp/sessions/owned.jsonl",
-				}),
-			),
+		supervisor.handleWorkerFrame(
 			owned,
-		);
-		supervisor.writeRosterEntry(
-			workerRosterEntryFromSummary(
-				summary({
-					id: "oc",
-					sessionId: "oc",
-					sessionFile: "/tmp/artifacts/oc.jsonl",
-					runtimeKind: "subagent",
-					rlmChildId: "oc",
-					parentSessionPath: "/tmp/sessions/owned.jsonl",
-				}),
-			),
-			owned,
+			rosterFrame([
+				workerRosterEntryFromSummary(
+					summary({
+						id: "o-active",
+						sessionId: "o",
+						activeSessionId: "o-active",
+						sessionFile: "/tmp/sessions/owned.jsonl",
+					}),
+				),
+				workerRosterEntryFromSummary(
+					summary({
+						id: "oc",
+						sessionId: "oc",
+						sessionFile: "/tmp/artifacts/oc.jsonl",
+						runtimeKind: "subagent",
+						rlmChildId: "oc",
+						parentSessionPath: "/tmp/sessions/owned.jsonl",
+					}),
+				),
+			]),
 		);
 
-		supervisor.flipWorkerRosterEntriesInactive(owned);
-		supervisor.workers.delete("w-owned");
+		supervisor.handleWorkerFrame(owned, rootShutdownFrame(owned.descriptor.rootActiveSessionId));
 
-		expect([...supervisor.roster().values()]).toHaveLength(0);
+		expect(supervisor.rosterEntriesForClient()).toHaveLength(0);
 		const listed = await supervisor.handleList(
 			{ id: "intruder", attachedActiveSessionIds: new Set<string>() },
 			{ type: "list", all: true },
@@ -928,13 +958,15 @@ describe("supervisor roster ledger", () => {
 		{
 			const worker = makeWorker("worker-1");
 			const supervisor = makeSupervisor([worker]);
-			supervisor.writeRosterEntry(
-				workerRosterEntryFromSummary(summary({ id: "r-active", sessionId: "r", activeSessionId: "r-active" })),
+			supervisor.handleWorkerFrame(
 				worker,
+				rosterFrame([
+					workerRosterEntryFromSummary(summary({ id: "r-active", sessionId: "r", activeSessionId: "r-active" })),
+				]),
 			);
-			supervisor.consumeWorkerRosterDelta(
+			supervisor.handleWorkerFrame(
 				worker,
-				rosterDelta([
+				rosterFrame([
 					{
 						agentId: "queued-child",
 						queuedChild: true,
@@ -942,14 +974,15 @@ describe("supervisor roster ledger", () => {
 					},
 				]),
 			);
-			expect(supervisor.roster().has("queued-child")).toBe(true);
+			expect(supervisor.rosterEntriesForClient().some((entry) => entry.agentId === "queued-child")).toBe(true);
 
-			supervisor.flipWorkerRosterEntriesInactive(worker);
+			supervisor.handleWorkerFrame(worker, rootShutdownFrame(worker.descriptor.rootActiveSessionId));
 
 			// A terminal unbound child run owns no transcript: removal, never a fileless inactive ghost.
-			expect(supervisor.roster().has("queued-child")).toBe(false);
-			expect(supervisor.roster().get("r")).toMatchObject({ status: "inactive" });
-			expect(supervisor.roster().get("r")?.workerId).toBeUndefined();
+			const entries = supervisor.rosterEntriesForClient();
+			expect(entries.some((entry) => entry.agentId === "queued-child")).toBe(false);
+			expect(entries.find((entry) => entry.agentId === "r")).toMatchObject({ status: "inactive" });
+			expect(entries.find((entry) => entry.agentId === "r")?.workerId).toBeUndefined();
 		}
 	});
 
@@ -1064,8 +1097,8 @@ describe("supervisor roster ledger", () => {
 		await supervisor.seedRosterLedger();
 
 		// Only registered workers' descendants seed; the saved corpus is served by the catalog scan alone.
-		expect(supervisor.roster().has("saved-root")).toBe(false);
-		const seededChildIds = new Set([...supervisor.roster().values()].map((entry) => entry.summary.rlmChildId));
+		expect(supervisor.rosterEntriesForClient().some((entry) => entry.agentId === "saved-root")).toBe(false);
+		const seededChildIds = new Set(supervisor.rosterEntriesForClient().map((entry) => entry.summary.rlmChildId));
 		// The mid-tree worker seeds its descendant, never its own transcript's siblings or ancestors.
 		expect(seededChildIds.has("foreign-grand")).toBe(true);
 		expect(seededChildIds.has("foreign-child")).toBe(false);
@@ -1095,29 +1128,28 @@ describe("supervisor roster ledger", () => {
 		expect((await supervisor.handleList({}, { type: "list" })).data?.sessions).toEqual([]);
 
 		// A live worker's rows: the active root and its passivated child are resident; seeded rows stay list-all-only.
-		supervisor.writeRosterEntry(
-			workerRosterEntryFromSummary(
-				summary({
-					id: "e-active",
-					sessionId: "evicted",
-					activeSessionId: "e-active",
-					sessionFile: join(sessionsDir, "evicted.jsonl"),
-					isSessionActive: true,
-				}),
-			),
+		supervisor.handleWorkerFrame(
 			worker,
-		);
-		supervisor.writeRosterEntry(
-			workerRosterEntryFromSummary(
-				summary({
-					id: "child-session",
-					sessionId: "child-session",
-					sessionFile: join(directory, "artifacts", "passive-child.jsonl"),
-					runtimeKind: "subagent",
-					rlmChildId: "passive-child",
-				}),
-			),
-			worker,
+			rosterFrame([
+				workerRosterEntryFromSummary(
+					summary({
+						id: "e-active",
+						sessionId: "evicted",
+						activeSessionId: "e-active",
+						sessionFile: join(sessionsDir, "evicted.jsonl"),
+						isSessionActive: true,
+					}),
+				),
+				workerRosterEntryFromSummary(
+					summary({
+						id: "child-session",
+						sessionId: "child-session",
+						sessionFile: join(directory, "artifacts", "passive-child.jsonl"),
+						runtimeKind: "subagent",
+						rlmChildId: "passive-child",
+					}),
+				),
+			]),
 		);
 		const resident = await supervisor.handleList({}, { type: "list" });
 		expect(resident.data?.sessions.map((session) => session.sessionId).sort()).toEqual(["child-session", "evicted"]);
@@ -1141,8 +1173,7 @@ describe("supervisor roster ledger", () => {
 		expect(liveAll.data?.sessions.some((session) => session.sessionId === "deleted-child")).toBe(false);
 
 		// Eviction leaves the worker's rows behind as inactive instead of dropping them.
-		supervisor.workers.delete("worker-1");
-		supervisor.flipWorkerRosterEntriesInactive(worker);
+		supervisor.handleWorkerFrame(worker, rootShutdownFrame(worker.descriptor.rootActiveSessionId));
 
 		const afterEvict = await supervisor.handleList({}, { type: "list", all: true });
 		const evicted = afterEvict.data?.sessions.find((session) => session.sessionId === "evicted");
@@ -1187,7 +1218,7 @@ describe("supervisor roster ledger", () => {
 
 		await supervisor.handleCommand(offlineClient(), { type: "delete_saved_session", sessionPath: childPath });
 
-		expect(supervisor.roster().has(childEntry.agentId)).toBe(false);
+		expect(supervisor.rosterEntriesForClient().some((entry) => entry.agentId === childEntry.agentId)).toBe(false);
 		await expect(supervisor.rlmSpawnLedger().edges()).resolves.toEqual([]);
 
 		// A fresh supervisor over the same agent dir must not reseed the tombstoned child.
@@ -1196,7 +1227,7 @@ describe("supervisor roster ledger", () => {
 			catalog: { list: vi.fn(async () => []) },
 		});
 		await reseeded.seedRosterLedger();
-		expect([...reseeded.roster().values()]).toEqual([]);
+		expect(reseeded.rosterEntriesForClient()).toEqual([]);
 
 		// An offline rename updates the row in place.
 		{
@@ -1229,7 +1260,9 @@ describe("supervisor roster ledger", () => {
 				name: "new-name",
 			});
 
-			expect(supervisor.roster().get("saved-1")?.summary.sessionName).toBe("new-name");
+			expect(
+				supervisor.rosterEntriesForClient().find((entry) => entry.agentId === "saved-1")?.summary.sessionName,
+			).toBe("new-name");
 		}
 
 		// A delete that fails on disk keeps the row.
@@ -1244,7 +1277,7 @@ describe("supervisor roster ledger", () => {
 
 			await supervisor.handleCommand(offlineClient(), { type: "delete_saved_session", sessionPath });
 
-			expect(supervisor.roster().has("saved-1")).toBe(true);
+			expect(supervisor.rosterEntriesForClient().some((entry) => entry.agentId === "saved-1")).toBe(true);
 		}
 	});
 });
@@ -1284,17 +1317,19 @@ describe("saved-session delete paths", () => {
 			reclaimStaleWorkerRegistration,
 			rlmSpawnLedger: () => ({ edges: vi.fn(async () => []) }),
 		});
-		supervisor.writeRosterEntry(
-			workerRosterEntryFromSummary(
-				summary({
-					id: "roster-owned",
-					sessionId: "roster-owned",
-					sessionFile: "/tmp/owned-roster.jsonl",
-					runtimeKind: "subagent",
-					rlmChildId: "child-1",
-				}),
-			),
+		supervisor.handleWorkerFrame(
 			reachableRoster,
+			rosterFrame([
+				workerRosterEntryFromSummary(
+					summary({
+						id: "roster-owned",
+						sessionId: "roster-owned",
+						sessionFile: "/tmp/owned-roster.jsonl",
+						runtimeKind: "subagent",
+						rlmChildId: "child-1",
+					}),
+				),
+			]),
 		);
 		const internals = supervisor as unknown as { handleCommand(client: object, command: object): Promise<unknown> };
 		const client = { id: "client", attachedActiveSessionIds: new Set<string>() };
@@ -1376,16 +1411,18 @@ describe("saved-session delete paths", () => {
 		// The roster removed the row (e.g. an archived close); the old pull cache must not resurrect ownership.
 		expect(internals.findWorkerBySessionFile("/tmp/f.jsonl")).toBeUndefined();
 
-		supervisor.writeRosterEntry(
-			workerRosterEntryFromSummary(
-				summary({
-					id: "live-active",
-					sessionId: "live",
-					activeSessionId: "live-active",
-					sessionFile: "/tmp/f.jsonl",
-				}),
-			),
+		supervisor.handleWorkerFrame(
 			worker,
+			rosterFrame([
+				workerRosterEntryFromSummary(
+					summary({
+						id: "live-active",
+						sessionId: "live",
+						activeSessionId: "live-active",
+						sessionFile: "/tmp/f.jsonl",
+					}),
+				),
+			]),
 		);
 		expect(internals.findWorkerBySessionFile("/tmp/f.jsonl")).toBe(worker);
 	});
@@ -1413,8 +1450,9 @@ describe("saved-session delete paths", () => {
 
 		await supervisor.handleCommand(offlineClient(), { type: "delete_saved_session", sessionPath });
 
-		expect(supervisor.roster().get("saved-1")).toBeDefined();
-		expect(supervisor.roster().get("saved-1")).not.toBe(stale);
+		const rewritten = supervisor.rosterEntriesForClient().find((entry) => entry.agentId === "saved-1");
+		expect(rewritten).toBeDefined();
+		expect(rewritten).not.toBe(stale);
 	});
 
 	it("aborts a saved-child delete when the tombstone append fails", async () => {
@@ -1449,7 +1487,7 @@ describe("saved-session delete paths", () => {
 			supervisor.handleCommand(offlineClient(), { type: "delete_saved_session", sessionPath: childPath }),
 		).rejects.toThrow("ledger unwritable");
 		expect(catalogDelete).not.toHaveBeenCalled();
-		expect(supervisor.roster().has(childEntry.agentId)).toBe(true);
+		expect(supervisor.rosterEntriesForClient().some((entry) => entry.agentId === childEntry.agentId)).toBe(true);
 	});
 });
 
@@ -1492,16 +1530,18 @@ describe("review-round regressions", () => {
 				}),
 			),
 		);
-		supervisor.writeRosterEntry(
-			workerRosterEntryFromSummary(
-				summary({
-					id: "res-active",
-					sessionId: "resident",
-					sessionFile: "/tmp/external.jsonl",
-					activeSessionId: "res-active",
-				}),
-			),
+		supervisor.handleWorkerFrame(
 			worker,
+			rosterFrame([
+				workerRosterEntryFromSummary(
+					summary({
+						id: "res-active",
+						sessionId: "resident",
+						sessionFile: "/tmp/external.jsonl",
+						activeSessionId: "res-active",
+					}),
+				),
+			]),
 		);
 
 		const listed = await supervisor.handleList({}, { type: "list", all: true });
@@ -1532,17 +1572,19 @@ describe("review-round regressions", () => {
 					]),
 				},
 			});
-			supervisor.writeRosterEntry(
-				workerRosterEntryFromSummary(
-					summary({
-						id: "owned-active",
-						sessionId: "owned-session",
-						activeSessionId: "owned-active",
-						sessionFile: ownedPath,
-						isSessionActive: true,
-					}),
-				),
+			supervisor.handleWorkerFrame(
 				owned,
+				rosterFrame([
+					workerRosterEntryFromSummary(
+						summary({
+							id: "owned-active",
+							sessionId: "owned-session",
+							activeSessionId: "owned-active",
+							sessionFile: ownedPath,
+							isSessionActive: true,
+						}),
+					),
+				]),
 			);
 
 			const listed = await supervisor.handleList(
@@ -1582,7 +1624,7 @@ describe("review-round regressions", () => {
 			streamReconstructor: { seed: vi.fn(), clear: vi.fn() },
 			rlmSpawnLedger: () => ({ liveEdges: () => edgesPromise }),
 		});
-		supervisor.writeRosterEntry(childEntry, worker);
+		supervisor.handleWorkerFrame(worker, rosterFrame([childEntry]));
 		const root = summary({ id: "worker-1-root-active", sessionId: "root", activeSessionId: "worker-1-root-active" });
 		worker.client = {
 			isConnected: true,
@@ -1595,7 +1637,7 @@ describe("review-round regressions", () => {
 		};
 
 		// A snapshot without the child arrives while its spawn-ledger pre-read is still in flight.
-		supervisor.consumeWorkerRosterDelta(worker, rosterDelta([workerRosterEntryFromSummary(root)], undefined, true));
+		supervisor.handleWorkerFrame(worker, rosterFrame([workerRosterEntryFromSummary(root)], undefined, true));
 		const refresh = (
 			supervisor as unknown as {
 				refreshWorkerSummaries(worker: WorkerFixture, recovery: boolean, fillGaps: boolean): Promise<void>;
@@ -1608,7 +1650,7 @@ describe("review-round regressions", () => {
 		// Settle any apply work a broken serialization would leave dangling past the pull.
 		await new Promise((resolveSettle) => setImmediate(resolveSettle));
 
-		const restored = supervisor.roster().get(childEntry.agentId);
+		const restored = supervisor.rosterEntriesForClient().find((entry) => entry.agentId === childEntry.agentId);
 		expect(restored?.workerId).toBe("worker-1");
 		// The reseed and queued fill keep the hydrated summary: no synthetic seed, no NaN eviction pin.
 		expect(restored?.summary.cwd).toBe("/tmp/project");
@@ -1629,33 +1671,37 @@ describe("review-round regressions", () => {
 				}),
 			}),
 		});
-		supervisor.writeRosterEntry(
-			workerRosterEntryFromSummary(
-				summary({
-					id: "p-session",
-					sessionId: "p-session",
-					sessionFile: "/tmp/artifacts/p.jsonl",
-					runtimeKind: "subagent",
-					rlmChildId: "p",
-					parentSessionPath: "/tmp/sessions/root.jsonl",
-				}),
-			),
+		supervisor.handleWorkerFrame(
 			worker,
+			rosterFrame([
+				workerRosterEntryFromSummary(
+					summary({
+						id: "p-session",
+						sessionId: "p-session",
+						sessionFile: "/tmp/artifacts/p.jsonl",
+						runtimeKind: "subagent",
+						rlmChildId: "p",
+						parentSessionPath: "/tmp/sessions/root.jsonl",
+					}),
+				),
+			]),
 		);
 		const root = summary({ id: "worker-1-root-active", sessionId: "root", activeSessionId: "worker-1-root-active" });
 
-		supervisor.consumeWorkerRosterDelta(worker, rosterDelta([workerRosterEntryFromSummary(root)], undefined, true));
+		supervisor.handleWorkerFrame(worker, rosterFrame([workerRosterEntryFromSummary(root)], undefined, true));
 		await new Promise((resolveSettle) => setImmediate(resolveSettle));
 
 		// Without readable edges the absentee sweep cannot run; the passive child survives, claimed.
-		const passiveRow = [...supervisor.roster().values()].find((entry) => entry.summary.rlmChildId === "p");
+		const rows = supervisor.rosterEntriesForClient();
+		const passiveRow = rows.find((entry) => entry.summary.rlmChildId === "p");
 		expect(passiveRow?.workerId).toBe("worker-1");
-		expect(supervisor.roster().get("root")?.workerId).toBe("worker-1");
+		expect(rows.find((entry) => entry.agentId === "root")?.workerId).toBe("worker-1");
 		expect(refreshWorkerSummaries).toHaveBeenCalledTimes(1);
 	});
 
 	it("aborts queued roster applies when the worker stops during the snapshot ledger pre-read", async () => {
 		const worker = makeWorker("worker-1");
+		Object.assign(worker.descriptor, { createCommand: { type: "create" } });
 		const root = summary({
 			id: "worker-1-root-active",
 			sessionId: "root",
@@ -1668,24 +1714,24 @@ describe("review-round regressions", () => {
 			releaseEdges = resolveEdges;
 		});
 		const supervisor = makeSupervisor([worker], { rlmSpawnLedger: () => ({ liveEdges: () => edgesPromise }) });
-		supervisor.writeRosterEntry(rootEntry, worker);
+		supervisor.handleWorkerFrame(worker, rosterFrame([rootEntry]));
 
 		// The snapshot apply starts and blocks on the ledger pre-read; a delta queues behind it.
-		supervisor.consumeWorkerRosterDelta(worker, rosterDelta([rootEntry], undefined, true));
+		supervisor.handleWorkerFrame(worker, rosterFrame([rootEntry], undefined, true));
 		await Promise.resolve();
-		supervisor.consumeWorkerRosterDelta(worker, rosterDelta([rootEntry]));
+		supervisor.handleWorkerFrame(worker, rosterFrame([rootEntry]));
 		// The stop lands mid pre-read: registration gone, rows flipped inactive.
-		supervisor.workers.delete("worker-1");
-		supervisor.flipWorkerRosterEntriesInactive(worker);
+		supervisor.handleWorkerFrame(worker, rootShutdownFrame(worker.descriptor.rootActiveSessionId));
 		releaseEdges([]);
 		await new Promise((resolveSettle) => setImmediate(resolveSettle));
 
-		const entry = supervisor.roster().get(rootEntry.agentId);
+		const entry = supervisor.rosterEntriesForClient().find((row) => row.agentId === rootEntry.agentId);
 		expect(entry?.workerId).toBeUndefined();
 		expect(entry?.summary.activeSessionId).toBeUndefined();
 
 		// A socket close (registration intact) equally stales queued applies: recovering labels survive.
 		const closed = makeWorker("worker-2");
+		Object.assign(closed.descriptor, { createCommand: { type: "create" } });
 		const closedEntry = workerRosterEntryFromSummary(
 			summary({ id: "worker-2-root-active", sessionId: "root-2", activeSessionId: "worker-2-root-active" }),
 		);
@@ -1698,29 +1744,29 @@ describe("review-round regressions", () => {
 					}),
 			}),
 		});
-		closedSupervisor.writeRosterEntry(closedEntry, closed);
-		closedSupervisor.consumeWorkerRosterDelta(closed, rosterDelta([closedEntry], undefined, true));
+		closedSupervisor.handleWorkerFrame(closed, rosterFrame([closedEntry]));
+		closedSupervisor.handleWorkerFrame(closed, rosterFrame([closedEntry], undefined, true));
 		await closedSupervisor.handleWorkerClose(closed, closed.client as object, new Error("worker died"));
 		// A reconnect starts authenticating before the parked apply resumes; the apply's source is dead.
 		(closed as unknown as { pendingClient: object }).pendingClient = {};
 		releaseClosedEdges([]);
 		await new Promise((resolveSettle) => setImmediate(resolveSettle));
 
-		expect(closedSupervisor.workerRosterEntries(closed)[0]).toMatchObject({ statusLabel: "recovering" });
+		expect(closedSupervisor.rosterEntriesForClient()[0]).toMatchObject({ statusLabel: "recovering" });
 
 		// Unchained (fast-path) deltas obey the same currency rule.
 		{
 			const worker = makeWorker("worker-1");
 			const supervisor = makeSupervisor([]);
 
-			supervisor.consumeWorkerRosterDelta(
+			supervisor.handleWorkerFrame(
 				worker,
-				rosterDelta([
+				rosterFrame([
 					workerRosterEntryFromSummary(summary({ id: "z-active", sessionId: "z", activeSessionId: "z-active" })),
 				]),
 			);
 
-			expect(supervisor.roster().has("z")).toBe(false);
+			expect(supervisor.rosterEntriesForClient().some((row) => row.agentId === "z")).toBe(false);
 		}
 	});
 
