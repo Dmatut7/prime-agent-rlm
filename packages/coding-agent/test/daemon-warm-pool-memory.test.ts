@@ -2,8 +2,10 @@ import { freemem } from "node:os";
 import { describe, expect, it } from "vitest";
 import {
 	availableMemoryBytes,
+	createAvailableMemoryProbe,
 	parseMeminfoAvailableBytes,
 	parseVmStatAvailableBytes,
+	sampleAvailableMemoryBytes,
 } from "../src/modes/daemon/warm-pool-memory.js";
 
 /**
@@ -105,11 +107,41 @@ describe("availableMemoryBytes", () => {
 		}
 	});
 
-	it.runIf(process.platform === "darwin")("reads reclaimable memory on macOS, above the bare free list", () => {
+	it.runIf(process.platform === "darwin")("reads reclaimable memory on macOS, above the bare free list", async () => {
 		// The whole point of the metric: inactive+speculative+purgeable pages count.
 		// freemem() alone stays under a few hundred MiB on any healthy macOS host that
 		// has been up long enough to fill its caches; the available reading must not
-		// be smaller than the free list it includes.
-		expect(availableMemoryBytes("darwin")).toBeGreaterThanOrEqual(freemem());
+		// be smaller than the free list it includes. sampleAvailableMemoryBytes forces
+		// a fresh probe so the comparison is not against a seconds-old cached value.
+		expect(await sampleAvailableMemoryBytes("darwin")).toBeGreaterThanOrEqual(freemem());
+	});
+});
+
+describe("createAvailableMemoryProbe", () => {
+	it("serves the first reading synchronously, then the cached reading inside the TTL", () => {
+		// Explicit darwin: the cache wraps the vm_stat probe (on hosts without
+		// vm_stat the probe fails over to freemem, which the cache covers the same).
+		const probe = createAvailableMemoryProbe({ platform: "darwin", ttlMs: 60_000 });
+		const first = probe.availableMemoryBytes();
+		expect(first).toBeGreaterThan(0);
+		// A second read inside the TTL answers from the cache: byte-identical, and
+		// no second vm_stat spawn runs on the hot path.
+		expect(probe.availableMemoryBytes()).toBe(first);
+	});
+
+	it("answers a stale reading past the TTL and refreshes it asynchronously", async () => {
+		let nowMs = 1_000_000;
+		const probe = createAvailableMemoryProbe({ platform: "darwin", ttlMs: 5_000, now: () => nowMs });
+		const first = probe.availableMemoryBytes();
+		expect(first).toBeGreaterThan(0);
+
+		nowMs += 6_000;
+		// Past the TTL the previous reading still answers synchronously (the pool
+		// never blocks on vm_stat) while the refresh runs in the background.
+		expect(probe.availableMemoryBytes()).toBe(first);
+		const refreshed = await probe.sampleAvailableMemoryBytes();
+		expect(refreshed).toBeGreaterThan(0);
+		// The refreshed reading is what later calls serve.
+		expect(probe.availableMemoryBytes()).toBe(refreshed);
 	});
 });

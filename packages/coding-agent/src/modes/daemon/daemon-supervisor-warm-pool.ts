@@ -33,9 +33,9 @@
  */
 
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { realpathSync, rmSync } from "node:fs";
+import { readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { connect } from "node:net";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { Writable } from "node:stream";
 import { getLogger } from "@earendil-works/pi-ai";
 import { createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
@@ -49,6 +49,7 @@ import {
 	type DaemonWarmPoolStats,
 	success,
 } from "./daemon-protocol.js";
+import { getDaemonRuntimeIdentity } from "./daemon-runtime-identity.js";
 import type { DaemonSupervisor, SpawnedWorkerProcess } from "./daemon-supervisor.js";
 import { DAEMON_WORKER_WARM_SPARE_ENV, type DaemonCreateCommand } from "./daemon-worker-protocol.js";
 import { availableMemoryBytes } from "./warm-pool-memory.js";
@@ -197,6 +198,49 @@ function warmPoolKey(cwd: string): string {
 }
 
 /**
+ * Identity of the build a spare runs. A spare executes whatever the entrypoint
+ * held on disk when it was spawned, and bundle.mjs rebuilds in place under a
+ * long-lived daemon (rmSync(outdir) first — a spare that outlives a rebuild
+ * sits on deleted chunks even when its in-memory code still runs). The daemon's
+ * own runtime buildId is fixed when the daemon process loaded, so alone it can
+ * never notice such a rebuild; the fingerprint therefore mixes it with the
+ * entrypoint directory's *.js name/size/mtime listing. Any rebuild rewrites
+ * those files, so a same-commit rebuild whose git-describe buildId did not move
+ * still flips the fingerprint, and the pool drops the spare instead of claiming
+ * it (takeWarmSpare, ensureWarmSpare, sweepWarmPool all check).
+ */
+export function warmPoolBuildFingerprint(entrypoint: string | undefined = process.argv[1]): string {
+	const hash = createHash("sha256");
+	hash.update(getDaemonRuntimeIdentity().buildId);
+	if (entrypoint !== undefined) {
+		let directory: string;
+		try {
+			directory = dirname(realpathSync(entrypoint));
+		} catch {
+			directory = dirname(resolve(entrypoint));
+		}
+		try {
+			for (const name of readdirSync(directory)
+				.filter((entry) => entry.endsWith(".js"))
+				.sort()) {
+				const stats = statSync(join(directory, name));
+				hash.update("\0");
+				hash.update(name);
+				hash.update("\0");
+				hash.update(String(stats.size));
+				hash.update("\0");
+				hash.update(String(stats.mtimeMs));
+			}
+		} catch {
+			// Unreadable directory (the rmSync window of an in-flight rebuild): the
+			// buildId alone still fingerprints, and a listing-less fingerprint never
+			// equals one a spare recorded while the directory was readable.
+		}
+	}
+	return hash.digest("hex");
+}
+
+/**
  * Reclaim attribution buckets (Go DBStats style): every spare that leaves the
  * pool unclaimed is counted exactly once, by cause. The wire spelling is
  * DaemonWarmPoolReclaimReason (rev 45); this alias keeps the pool internals on
@@ -245,6 +289,12 @@ export interface WarmSpareWorker {
 	orphanProcessJournalPath: string;
 	/** Fingerprint of the spawn environment; a claim must reproduce it exactly. */
 	envFingerprint: string;
+	/**
+	 * The on-disk build fingerprint at spawn time (warmPoolBuildFingerprint). A
+	 * rebuild under a live daemon moves the fingerprint, and every spare pinned
+	 * to the old one is dropped instead of claimed: it runs deleted chunks.
+	 */
+	buildId: string;
 	/**
 	 * The environment the spare was spawned with, kept for miss diagnostics only
 	 * (mismatch logging names the differing KEYS, never values — env carries
@@ -463,11 +513,13 @@ export function recordWarmSpareReclaim(
 
 /**
  * Take the pooled spare for this create, or miss. A claim requires the same
- * spawn cwd and a byte-identical environment fingerprint (the rebind rule:
+ * spawn cwd, a byte-identical environment fingerprint (the rebind rule:
  * auth-, project- and client-level variables all live in the fingerprint, so
- * a stale or foreign environment can never leak into a claimed session).
- * Misses leave the spare pooled for a create that does match; an expired or
- * dead spare is dropped and disposed instead.
+ * a stale or foreign environment can never leak into a claimed session), and
+ * the current build: a spare pinned to a build the disk no longer holds
+ * (rebuilt under a live daemon) is dropped, never claimed. Misses leave the
+ * spare pooled for a create that does match; an expired, dead, or stale-build
+ * spare is dropped and disposed instead.
  *
  * Warming is a first-class state, not a miss: when the key's spare is still
  * being built, the claim waits up to claimWarmingWaitMs for the handoff
@@ -486,8 +538,18 @@ export async function takeWarmSpare(
 	}
 	const cwd = createCommand.config?.cwd ?? process.cwd();
 	const key = warmPoolKey(cwd);
+	const droppedForKey = (dropped: WarmSpareWorker[]): WarmSpareWorker | undefined =>
+		dropped.find((spare) => spare.key === key);
+	let dropped = dropStaleBuildSpares(host, warmPoolBuildFingerprint());
 	let spare = state.spares.get(key);
 	if (spare === undefined) {
+		const droppedStale = droppedForKey(dropped);
+		if (droppedStale !== undefined) {
+			// The key's spare belonged to a previous build; claiming it would hand
+			// the create stale code on deleted chunks.
+			host.recordWarmPoolClaimMiss(cwd, "build_mismatch", droppedStale);
+			return undefined;
+		}
 		const warming = state.inflight.get(key);
 		if (warming === undefined || pool.claimWarmingWaitMs <= 0) {
 			host.recordWarmPoolClaimMiss(cwd, "no_ready_spare");
@@ -500,8 +562,16 @@ export async function takeWarmSpare(
 		if (state.options === undefined || host.shuttingDown || host.updateRestartPhase !== undefined) {
 			return undefined;
 		}
+		// A rebuild may also have landed mid-wait; the publish path rejects a
+		// stale warm-up, but a spare published just before it is dropped here.
+		dropped = dropStaleBuildSpares(host, warmPoolBuildFingerprint());
 		spare = state.spares.get(key);
 		if (spare === undefined) {
+			const droppedStale = droppedForKey(dropped);
+			if (droppedStale !== undefined) {
+				host.recordWarmPoolClaimMiss(cwd, "build_mismatch", droppedStale);
+				return undefined;
+			}
 			// Still warming past the wait, or the warm-up failed: cold launch.
 			host.recordWarmPoolClaimMiss(cwd, "warming_timeout");
 			return undefined;
@@ -572,6 +642,8 @@ export function ensureWarmSpare(
 		return;
 	}
 	const key = warmPoolKey(cwd);
+	// A stale-build spare must not block restocking this key with a current one.
+	dropStaleBuildSpares(host, warmPoolBuildFingerprint());
 	if (state.spares.has(key) || state.inflight.has(key)) {
 		return;
 	}
@@ -642,6 +714,10 @@ async function spawnWarmSpare(
 	const workerId = createActiveSessionId();
 	const rootActiveSessionId = createActiveSessionId();
 	const spawnStartedAt = Date.now();
+	// Pin the on-disk build before the process starts: the spare runs whatever
+	// the entrypoint holds right now, and a rebuild during its boot must keep
+	// this spare from ever being claimed.
+	const buildId = warmPoolBuildFingerprint();
 	const socketPath = host.workerSocketPath(host.socketPath, workerId);
 	const ids = {
 		token: randomBytes(32).toString("base64url"),
@@ -748,6 +824,7 @@ async function spawnWarmSpare(
 		recoveryJournalPath: ids.recoveryJournalPath,
 		orphanProcessJournalPath: ids.orphanProcessJournalPath,
 		envFingerprint: warmWorkerEnvFingerprint(environment),
+		buildId,
 		environment: { ...environment },
 		spawned,
 		spawnedAt: nowMs,
@@ -765,6 +842,11 @@ async function spawnWarmSpare(
 	) {
 		// The pool closed, refilled, or filled up while this spawn was in flight.
 		await disposeWarmSpare(host, spare, "pool closed, refilled, or full during spawn", "pool_closed");
+		return;
+	}
+	if (warmPoolBuildFingerprint() !== buildId) {
+		// A rebuild landed mid-boot: this spare already runs deleted chunks.
+		await disposeWarmSpare(host, spare, "build changed while the spawn was in flight", "pool_closed");
 		return;
 	}
 	spare.ttlTimer = setTimeout(() => {
@@ -866,6 +948,38 @@ function cleanWarmSpareFiles(
 	}
 }
 
+/**
+ * Drop every spare pinned to a build the disk no longer holds. Spares share
+ * the daemon's entrypoint, so a rebuild invalidates them as a set; dropping by
+ * per-spare fingerprint still lets a spare published after the rebuild stay.
+ * Disposals are backgrounded like the sweep's — the claim path must not pay a
+ * process kill. Returns the dropped spares so takeWarmSpare can attribute the
+ * miss (build_mismatch) when its own key's spare was among them.
+ */
+function dropStaleBuildSpares(host: DaemonSupervisorWarmPoolHost, currentBuildId: string): WarmSpareWorker[] {
+	const state = host.warmPoolState;
+	const dropped: WarmSpareWorker[] = [];
+	for (const spare of [...state.spares.values()]) {
+		if (spare.buildId === currentBuildId) {
+			continue;
+		}
+		// The snapshot may name a spare the childClosed handler already dropped;
+		// only the delete that actually removes it earns the disposal.
+		if (!state.spares.delete(spare.key)) {
+			continue;
+		}
+		dropped.push(spare);
+		host.background(
+			disposeWarmSpare(host, spare, "spawned under a previous build", "pool_closed"),
+			`warm spare build-mismatch disposal ${spare.key}`,
+		);
+	}
+	if (dropped.length > 0) {
+		host.logInfo(`Warm pool: dropped ${dropped.length} spare(s) spawned under a previous build`);
+	}
+	return dropped;
+}
+
 async function disposeWarmSpare(
 	host: DaemonSupervisorWarmPoolHost,
 	spare: WarmSpareWorker,
@@ -941,7 +1055,7 @@ export function startWarmPoolSweep(host: DaemonSupervisorWarmPoolHost): void {
 	state.sweepTimer.unref();
 }
 
-/** Reap dead/expired spares and release the whole pool under memory pressure. */
+/** Reap dead/expired/stale-build spares and release the whole pool under memory pressure. */
 function sweepWarmPool(host: DaemonSupervisorWarmPoolHost): void {
 	const state = host.warmPoolState;
 	const pool = state.options;
@@ -949,6 +1063,7 @@ function sweepWarmPool(host: DaemonSupervisorWarmPoolHost): void {
 		return;
 	}
 	const nowMs = Date.now();
+	dropStaleBuildSpares(host, warmPoolBuildFingerprint());
 	const lowMemory = availableMemoryBytes() < pool.minFreeMemoryBytes;
 	for (const spare of [...state.spares.values()]) {
 		const dead = spare.spawned.child.exitCode !== null || spare.spawned.child.signalCode !== null;

@@ -15,6 +15,7 @@ import {
 	type DaemonWarmPoolStats,
 } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+import { warmPoolBuildFingerprint } from "../src/modes/daemon/daemon-supervisor-warm-pool.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_WARM_SPARE_ENV,
@@ -1067,6 +1068,119 @@ describe("daemon supervisor warm spare pool", () => {
 		expect(reclaims[0]!.reason).toBe("drain");
 		expect(reclaims[0]!.detail).toBe("supervisor dispose");
 		expect(eventTotals(reclaims[0]!).reclaims.drain).toBe(1);
+	});
+});
+
+/**
+ * Build pinning: a spare runs whatever the entrypoint held on disk when it was
+ * spawned, but bundle.mjs rebuilds in place (rmSync(outdir) first) under a
+ * long-lived daemon. A spare that outlives a rebuild must never be claimed:
+ * the pool pins every spare to the build fingerprint at spawn time and drops
+ * it once the fingerprint moves on.
+ */
+describe("warm pool build identity", () => {
+	it("keeps the fingerprint stable while the entrypoint directory is unchanged", () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-warm-pool-build-"));
+		tempDirs.push(directory);
+		writeFileSync(join(directory, "cli.js"), "entry v1");
+		writeFileSync(join(directory, "chunk-AAAA.js"), "x".repeat(64));
+		const before = warmPoolBuildFingerprint(join(directory, "cli.js"));
+		expect(warmPoolBuildFingerprint(join(directory, "cli.js"))).toBe(before);
+	});
+
+	it("changes the fingerprint when the bundle's chunks change", () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-warm-pool-build-"));
+		tempDirs.push(directory);
+		writeFileSync(join(directory, "cli.js"), "entry v1");
+		writeFileSync(join(directory, "chunk-AAAA.js"), "x".repeat(64));
+		const before = warmPoolBuildFingerprint(join(directory, "cli.js"));
+		// A rebuild rewrites the bundle: new content-hashed chunk names and sizes.
+		writeFileSync(join(directory, "chunk-BBBB.js"), "y".repeat(128));
+		writeFileSync(join(directory, "cli.js"), "entry v2, longer");
+		expect(warmPoolBuildFingerprint(join(directory, "cli.js"))).not.toBe(before);
+	});
+
+	it("tracks the runtime build id override (PRIME_AGENT_BUILD_ID)", () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-warm-pool-build-"));
+		tempDirs.push(directory);
+		writeFileSync(join(directory, "cli.js"), "entry");
+		const before = warmPoolBuildFingerprint(join(directory, "cli.js"));
+		process.env.PRIME_AGENT_BUILD_ID = "warm-pool-fingerprint-test";
+		try {
+			expect(warmPoolBuildFingerprint(join(directory, "cli.js"))).not.toBe(before);
+		} finally {
+			delete process.env.PRIME_AGENT_BUILD_ID;
+		}
+	});
+
+	it("drops a pooled spare built before a rebuild and cold-launches the create", async () => {
+		setLogSink((entry) => {
+			logEntries.push(entry);
+		});
+		const { projectDir, client } = await startPoolSupervisor({ ttlMs: 30_000, spawnCooldownMs: 0 });
+		await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
+		// Wait for the publish so the spare is claimable (the operational "ready"
+		// line goes through the same structured sink).
+		await waitForCondition(
+			() => logEntries.some((entry) => entry.msg.startsWith("Warm spare worker") && entry.msg.includes("ready for")),
+			"the spare publish",
+		);
+		const spare = hoisted.spawned[0]!;
+
+		// A rebuild under a live daemon, simulated through the runtime build id
+		// override (the disk half of the fingerprint is pinned by the unit tests
+		// above): the spare must be dropped, never claimed.
+		process.env.PRIME_AGENT_BUILD_ID = "warm-pool-rebuild";
+		try {
+			const response = await client.request({ type: "create", config: { cwd: projectDir } }, 10_000);
+			expect(response.success).toBe(true);
+			const summary = responseData(response) as { activeSessionId?: string; id: string };
+
+			// The stale spare's process is disposed; the create is served by a cold
+			// worker (no spare marker) followed by its replenish spare.
+			await waitForProcessExit(spare.child);
+			expect(hoisted.spawned).toHaveLength(3);
+			expect(hoisted.spawned[1]!.env[DAEMON_WORKER_WARM_SPARE_ENV]).toBeUndefined();
+			expect(summary.activeSessionId ?? summary.id).toBe(hoisted.spawned[1]!.env[ACTIVE_SESSION_ENV_LITERAL]!);
+
+			// The miss is attributed to the build, and the disposal is bucketed as
+			// the pool closing for the previous build.
+			const claims = warmPoolEvents("claim");
+			expect(claims.some((entry) => entry.outcome === "miss" && entry.missReason === "build_mismatch")).toBe(true);
+			expect(warmPoolEvents("reclaim").some((entry) => entry.reason === "pool_closed")).toBe(true);
+
+			// The pool restocks on the current build: the replenish spare publishes
+			// and the next create claims it.
+			await waitForCondition(
+				() =>
+					logEntries.filter(
+						(entry) => entry.msg.startsWith("Warm spare worker") && entry.msg.includes("ready for"),
+					).length === 2,
+				"the replenish publish",
+			);
+			const second = await client.request({ type: "create", config: { cwd: projectDir } }, 10_000);
+			expect(second.success).toBe(true);
+			const secondSummary = responseData(second) as { activeSessionId?: string; id: string };
+			expect(secondSummary.activeSessionId ?? secondSummary.id).toBe(
+				hoisted.spawned[2]!.env[ACTIVE_SESSION_ENV_LITERAL]!,
+			);
+		} finally {
+			delete process.env.PRIME_AGENT_BUILD_ID;
+		}
+	});
+
+	it("sweeps a spare built before a rebuild without waiting for a create", async () => {
+		await startPoolSupervisor({ ttlMs: 60_000, sweepIntervalMs: 100 });
+		await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
+		const spare = hoisted.spawned[0]!;
+
+		process.env.PRIME_AGENT_BUILD_ID = "warm-pool-sweep-rebuild";
+		try {
+			// No create involved: the sweep itself reaps the stale spare.
+			await waitForProcessExit(spare.child, 5_000);
+		} finally {
+			delete process.env.PRIME_AGENT_BUILD_ID;
+		}
 	});
 });
 

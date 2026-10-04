@@ -1,0 +1,2 @@
+- Fixed warm-pool claims handing out pre-rebuild spare workers after an in-place rebuild: spares are pinned to the on-disk build fingerprint and dropped once it moves on, so the create goes cold instead.
+- Changed the warm pool's macOS memory-pressure probe to cache the `vm_stat` reading for 7.5s and refresh it asynchronously instead of spawning a subprocess on every check.
