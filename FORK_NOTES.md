@@ -1,3 +1,12 @@
+## 2026-10-04 wave-44 六路：env 名单补全、footer 模型名即刷、安全簇拍板方案、refine 拆刀设计稿
+
+- 子进程环境名单补全（macOS 会话键 6 个：SECURITYSESSIONID 等）——精简环境下 claude 钥匙串探测不再失败；暖池环境指纹语义不变（有钉测试）。
+- footer 模型名现在随「另一个窗口切了模型」的通知立即刷新，不再等下次动作。
+- 安全簇方案收口成可拍板形态（docs/fork/security-cluster-plan.md）：已落地 9 件备案、待批 11 项各带推荐+一句话理由+速勾表，等你一次勾完。
+- refine 系两刀拆分设计稿备好（docs/fork/refine-cluster-split-plan.md）：第十一刀执行核 ~542 行、第十二刀调度 ~890 行，守恒验证照前十刀先例；最大风险点（共享 reportedEntryVersions）已点名。
+- 走查实证 wave-43：bash 守卫不误拦正常命令、resume 有界等待不卡、主流程全绿。
+- 门禁：check EXIT 0、hygiene OK、复扫见账本。需要重新编译并重启后才生效。
+
 ## 2026-10-04 wave-43 六路：bash 守卫包装壳封堵、服务端窗口有界等待、第十刀
 
 - 破坏性 git 守卫不再被包装壳绕过：`bash -c 'git reset --hard'` / `sh -c` / `eval` 包裹的命令现在会剥开一层再判定（TS 和内核 Python 两面同改）；仍绕得开的面（嵌套包裹、$(...) 命令替换、env/xargs 等执行器）已写进守卫注释，不装没看见。
