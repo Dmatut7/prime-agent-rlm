@@ -1,3 +1,13 @@
+## 2026-10-04 wave-47 五路：fresh-eyes 三修、注释腐化清扫、EXAM 复测全线更省
+
+- fresh-eyes 走查三发现全修：①/refine 完成后 transcript 有可见结果行（根因 RefinementOutcomeMessageComponent 对干净结果 return []；outcome 带 details.source，用户触发的永不隐藏，auto 干净仍隐藏；回归钉 test/suite/refine-outcome-source.test.ts）；②退出提示 --resume 带上 --daemon-socket/--session-dir 旗标（shell 引号转义，main.ts 两路径 + agents-view 接线）；③未定价模型 footer 统一「(未定价)」不再裸 ?。
+- 注释腐化三处：refine-execution.ts 两处「until the twelfth cut」残留（随功能批）、rlm-child-terminal{,-outcome}.ts 三处「once it lands」（kernel vouch 已落地）、harness-digest.ts 孤儿 docblock 合并。
+- EXAM 复测 7/7 pass 无回退且普遍更省（EX-1 −21%、EX-2 −52%、EX-4 −49%、EX-5 −54%）；EX-3 +47% 列观察项。
+- walkthrough 矩阵 v1 P0 六格全过；矩阵摩擦点（Enter 竞态、窄档折行干扰计数断言）记档 /tmp/wave47/ux-verify.md，进矩阵 v2 修订。
+- 调研零增量（八源逐字同基线）。
+- 审计 follow-up 进 wave-48：refine 双模块去重（cooldown 印记 helper、applySettled/planSettled 脚手架）、rlm-child-run.ts startRlmChildRun 635 行单函数再拆、daemon-supervisor.ts 八个拆刀候选（首推 supervisor-warm-pool、roster-sync）。
+- 门禁：check EXIT 0、hygiene OK、单测 9812 绿（103 skip）、suite 1729 绿。需要重新编译并重启后才生效。
+
 ## 2026-10-04 wave-46 四路：第十二刀 refine-scheduler、负载抖动测试族加固
 
 - AgentSession 第十二刀：refine 调度+入口簇（serialized checkpoint 族 8、kernel host 入口、dispose 排空、交互式调度族 11，共 21 方法 + SerializedBackgroundPlanResult + autoRefineInstructions + writable-probe TTL）搬进 core/refine-scheduler.ts——agent-session.ts 18991→18111 行（十二刀累计 23500→18111，−5389），新模块 1133 行含 RefineSchedulerHost seam；守恒 66/66 逐字节全等（21 体+21 注释+3 模块项+21 壳，biome 同版同格双边归一后 diff）。
