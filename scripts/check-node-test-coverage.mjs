@@ -130,7 +130,16 @@ function inspectReport(report, label) {
 	const suites = [];
 	const topLevelCases = [];
 	const open = [];
-	const tags = /<testsuite\b([^>]*?)(\/?)>|<\/testsuite>|<testcase\b([^>]*?)(?:\/>|>([\s\S]*?)<\/testcase>)/g;
+	// Attribute spans are quote-aware: a literal `>` inside a quoted attribute value
+	// (xml-legal — only `<` and `&` need escaping, and node emits test names verbatim)
+	// must not terminate the tag. The spans stay lazy so a self-closing `/>` wins
+	// over the open-tag alternative — greedy spans eat the `/` and the match falls
+	// into the `>...</testcase>` branch, swallowing siblings whole.
+	const attrs = String.raw`(?:[^>"']|"[^"]*"|'[^']*')*?`;
+	const tags = new RegExp(
+		`<testsuite\\b(${attrs})(\\/?)>|<\\/testsuite>|<testcase\\b(${attrs})(?:\\/>|>([\\s\\S]*?)<\\/testcase>)`,
+		"g",
+	);
 	for (const match of text.matchAll(tags)) {
 		if (match[0] === "</testsuite>") {
 			open.pop();
@@ -374,6 +383,20 @@ function skippedDescribeReport() {
 	);
 }
 
+/** Test names with a literal `>` (xml-legal, node emits them verbatim) must not truncate the tag. */
+function literalGtNamesReport() {
+	return rawReport(
+		[
+			openSuite("corpus"),
+			passLine("unclosed &lt;script> tags inside a short fence"),
+			passLine("unclosed &lt;script> tags as a raw html stream"),
+			skipLine("a &lt;b> skipped case"),
+			closeSuite(),
+		],
+		{ tests: 3, skipped: 1 },
+	);
+}
+
 /** An `it.skip` is counted by the runner in both `tests` and `skipped`. */
 function countedSkipReport() {
 	return rawReport(
@@ -515,6 +538,11 @@ function runSelfTest() {
 			name: "a skipped describe the runner does not count",
 			expectPass: true,
 			run: () => planted(skippedDescribeReport(), "skipped-describe", { minTests: 2, minRanTests: 2 }),
+		});
+		controls.push({
+			name: "testcase names carrying a literal > are not truncated mid-tag",
+			expectPass: true,
+			run: () => planted(literalGtNamesReport(), "literal-gt", { minTests: 3, minRanTests: 2 }),
 		});
 		controls.push({
 			name: "an it.skip the runner does count is not discounted",
