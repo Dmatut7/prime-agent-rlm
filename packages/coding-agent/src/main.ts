@@ -1819,6 +1819,7 @@ export async function main(args: string[], options?: MainOptions) {
 			{ preloadCodeHighlighter },
 			{ ClientPromptStashStore },
 			{ resolveAttachModelFallbackMessage },
+			{ resumeHintConnectionFromArgs },
 		] = await Promise.all([
 			import("./modes/interactive/interactive-mode.js"),
 			import("./modes/interactive/interactive-mode-services.js"),
@@ -1827,6 +1828,7 @@ export async function main(args: string[], options?: MainOptions) {
 			import("./modes/interactive/theme/theme.js"),
 			import("./modes/interactive/prompt-stash-state.js"),
 			import("./modes/daemon/daemon-session-list.js"),
+			import("./modes/interactive/resume-hint.js"),
 		]);
 
 		if (deprecationWarnings.length > 0) {
@@ -1868,6 +1870,7 @@ export async function main(args: string[], options?: MainOptions) {
 				socketPath: daemonSocketPath,
 				config: defaultSessionConfig,
 				uiServices: daemonUiServices,
+				resumeHintConnection: resumeHintConnectionFromArgs(parsed),
 				recoverDaemon: () => recoverDaemonUnlessShutdownTombstoned(daemonSocketPath),
 				createUiServicesForSession: async (summary) => {
 					const attachedSessionManager = createSessionManagerForActiveDaemonSummary(
@@ -1954,6 +1957,7 @@ export async function main(args: string[], options?: MainOptions) {
 		const interactiveMode = new InteractiveMode({
 			agentConnection,
 			daemonSocketPath,
+			resumeHintConnection: resumeHintConnectionFromArgs(parsed),
 			uiServices: daemonUiServices,
 			startupNotice: takeInteractiveTelemetryNotice(services),
 			promptStashStore,
@@ -2219,11 +2223,13 @@ export async function main(args: string[], options?: MainOptions) {
 			{ InteractiveMode },
 			{ createInteractiveModeLocalSessionHost },
 			{ ClientPromptStashStore },
+			{ resumeHintConnectionFromArgs },
 		] = await Promise.all([
 			import("./modes/agent-connection/in-process-agent-connection.js"),
 			import("./modes/interactive/interactive-mode.js"),
 			import("./modes/interactive/interactive-mode-services.js"),
 			import("./modes/interactive/prompt-stash-state.js"),
+			import("./modes/interactive/resume-hint.js"),
 		]);
 		const agentConnection = new InProcessAgentConnection(runtime);
 		const interactiveMode = new InteractiveMode({
@@ -2232,6 +2238,7 @@ export async function main(args: string[], options?: MainOptions) {
 			startupNotice: takeInteractiveTelemetryNotice(runtime.services),
 			promptStashStore: new ClientPromptStashStore(),
 			promptStashSessionId: session.sessionId,
+			resumeHintConnection: resumeHintConnectionFromArgs(parsed),
 			bindLocalSessionExtensions: true,
 			migratedProviders,
 			modelFallbackMessage,

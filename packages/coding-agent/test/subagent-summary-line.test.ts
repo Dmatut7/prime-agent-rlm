@@ -985,6 +985,8 @@ describe("subagent spend cell", () => {
 		const body = plain(forms[0]);
 		expect(body).toContain("8.1M tok (kimi-k3 8.1M tok 未定价)");
 		expect(body).not.toContain("¥");
+		// wave-47 C: the tightest form keeps the warning word instead of gluing a bare `?` to the tokens.
+		expect(plain(forms.at(-1) ?? "")).toBe("子代理 8.1M tok (未定价)");
 	});
 
 	it("marks partial-tree figures as lower bounds and warns in the theme warning color", () => {
@@ -1019,10 +1021,11 @@ describe("subagent spend cell", () => {
 			"子代理 ¥4.56 (kimi-k3 8.1M tok 未定价)",
 			// then the annotation's token counts
 			"子代理 ¥4.56 (kimi-k3 未定价)",
-			// then the annotation, leaving only the warning mark
-			"子代理 ¥4.56?",
+			// then the annotation's model names, leaving the bare warning word (wave-47 C)
+			"子代理 ¥4.56 (未定价)",
 		]);
 		for (const form of forms) expect(form).not.toMatch(/¥[0-9.]*…/);
+		for (const form of forms) expect(form).not.toContain("?");
 	});
 
 	it("does not move the strip when the figures grow", () => {

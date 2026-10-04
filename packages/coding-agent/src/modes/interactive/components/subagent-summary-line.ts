@@ -1075,15 +1075,15 @@ export class SubagentSummaryLine implements Component, Focusable {
 /**
  * The spend cell for the status line, in the widest form first and each next
  * form losing exactly one thing: the `全部` figure (the least valuable by
- * design), the annotations' token counts, the annotations, then the
- * annotation down to a bare `?` - a truncated money figure would read as a
- * wrong number, so the caller drops the whole cell instead of ellipsizing it.
- * All-zero figures give no forms (no ¥0.00 noise), and an all-unpriced family
- * shows tokens plus the warning instead of ¥0.00.
+ * design), the annotations' token counts, the annotations' model names, then
+ * the annotation down to a bare `(未定价)` - a truncated money figure would read
+ * as a wrong number, so the caller drops the whole cell instead of ellipsizing
+ * it. All-zero figures give no forms (no ¥0.00 noise), and an all-unpriced
+ * family shows tokens plus the warning instead of ¥0.00.
  *
  * With `color` the plain words and figures all take that one color, so the cell
  * sits inside a line painted in it; the `≈` lower-bound mark and the warning
- * annotations (`未定价`, `已改价`, `?`) keep their own colors either way.
+ * annotations (`未定价`, `已改价`) keep their own colors either way.
  */
 export function renderSubagentSpendCell(spend: SubagentSpendSummary | undefined, color?: ThemeColor): string[] {
 	if (!spend || (spend.cost === 0 && spend.tokens === 0)) return [];
@@ -1115,12 +1115,14 @@ export function renderSubagentSpendCell(spend: SubagentSpendSummary | undefined,
 		}
 		return parts.length > 0 ? ` ${parts.join(" ")}` : "";
 	};
-	const mark = spend.unpriced.length > 0 ? theme.fg("warning", "?") : "";
+	// The minimal form keeps the warning word: a bare `?` glued to the figure
+	// read as a leftover character and doubted the number itself (wave-47 C).
+	const minimal = spend.unpriced.length > 0 ? ` ${theme.fg("warning", "(未定价)")}` : "";
 	const forms = [
 		primary + secondary + annotate(true),
 		primary + annotate(true),
 		primary + annotate(false),
-		primary + mark,
+		primary + minimal,
 	];
 	return forms.filter((form, index) => index === 0 || form !== forms[index - 1]);
 }

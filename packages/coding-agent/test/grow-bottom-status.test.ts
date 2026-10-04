@@ -60,7 +60,7 @@ describe("the spend cell for the status line", () => {
 		expect(plain(forms.join("\n"))).not.toContain("¥");
 	});
 
-	it("loses one thing per form, in a fixed order, and ends on the figure alone", () => {
+	it("loses one thing per form, in a fixed order, and ends on the figure with the bare warning", () => {
 		const forms = renderSubagentSpendCell(
 			spend({
 				unpriced: [{ model: "kimi-k3", tokens: 8_100_000 }],
@@ -71,7 +71,9 @@ describe("the spend cell for the status line", () => {
 			"子代理 ¥4.56 · 全部 ¥5.10 (kimi-k3 8.1M tok 未定价) (qwen3.8-flash 2.0M tok 已改价)",
 			"子代理 ¥4.56 (kimi-k3 8.1M tok 未定价) (qwen3.8-flash 2.0M tok 已改价)",
 			"子代理 ¥4.56 (kimi-k3 未定价) (qwen3.8-flash 已改价)",
-			"子代理 ¥4.56?",
+			// wave-47 C: the minimal form keeps the warning word; a bare `?` glued to
+			// the figure read as a leftover character and doubted the number itself.
+			"子代理 ¥4.56 (未定价)",
 		]);
 	});
 

@@ -28,7 +28,10 @@ import { timelineShowAll } from "./timeline-lane.js";
  * default; with the closing row's `完整过程 ▸` on it is one dim note,
  * `19:07 · 回合后整理记忆：新记 1 条（本会话）   展开 ▸`, that opens to the
  * memories in full. A refiner that failed, or refused an edit, says so in amber
- * and is never hidden, like a failed subagent or compaction.
+ * and is never hidden, like a failed subagent or compaction. An outcome the user
+ * asked for (`details.source === "user"`, the /refine command) is never hidden
+ * either: an explicit request must leave a visible answer, even when the answer
+ * is "nothing to change".
  */
 
 const KIND_MAP: Record<AppliedRefinementEdit["kind"], KernelMemoryChange["kind"]> = {
@@ -127,10 +130,11 @@ export class RefinementOutcomeMessageComponent implements Component, FocusableBl
 
 	private renderLines(width: number, forceShown: boolean): string[] {
 		this.regions = [];
-		const { edits, scope, failed, error } = this.message.details;
+		const { edits, scope, failed, error, source } = this.message.details;
 		// Only a tidy that kept everything hides; one that failed or refused an edit is never out of sight.
+		// Neither is one the user asked for: /refine owes a visible answer, even a no-op.
 		const wentWrong = failed === true || edits.some((edit) => !edit.applied);
-		if (!forceShown && !timelineShowAll.value && !wentWrong) return [];
+		if (!forceShown && source !== "user" && !timelineShowAll.value && !wentWrong) return [];
 		const safeWidth = Math.max(1, width);
 		const dim = (text: string) => theme.fg("timelineTime", text);
 		const row = (gutter: TimelineGutter, content: string, right = "") =>
@@ -139,6 +143,12 @@ export class RefinementOutcomeMessageComponent implements Component, FocusableBl
 		const noteGutter: TimelineGutter = time ? { main: "note", time } : { main: "note" };
 		const lines: string[] = [row({ main: "rail" }, "")];
 		if (failed || edits.length === 0) {
+			if (!failed && source === "user") {
+				// A deliberate no-op answers the /refine, plainly; the failed-tidy wording
+				// below (amber, "下一轮会再试") belongs to a refiner that produced nothing.
+				lines.push(row(noteGutter, dim(`回合后整理记忆：这次没有要改的记忆（${scopeWord(scope)}）`)));
+				return lines;
+			}
 			const reason = error ? sanitizeDisplayText(error).split("\n")[0] : undefined;
 			const why = reason ? `整理器这次没给出结果（${reason}），下一轮会再试` : "整理器这次没给出结果，下一轮会再试";
 			lines.push(row(noteGutter, `${theme.fg("timelineFix", "回合后整理记忆：没写进去")}${dim(` · ${why}`)}`));

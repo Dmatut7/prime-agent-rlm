@@ -12,7 +12,7 @@
  * working, and this module never imports an agent-session value, so the
  * layering stays acyclic. The serialized-refine scheduling cluster
  * (checkpoint family, auto-refine scheduling, host-request entry) stays on
- * AgentSession until the twelfth cut and calls these functions through the
+ * AgentSession through the twelfth cut and calls these functions through the
  * shells.
  */
 
@@ -119,7 +119,7 @@ export interface RefineExecutionHost {
 	_refineInFlight?: AgentSession["_refineInFlight"];
 	_refinePlanInFlight?: AgentSession["_refinePlanInFlight"];
 	// Cross-cluster ownership: both fields belong to the serialized-refine
-	// scheduling cluster (which stays on AgentSession until the twelfth cut).
+	// scheduling cluster (moved out in the twelfth cut, wave-46).
 	// refine() reads them to wait out a background plan started during an active
 	// turn, and clears them when the aborted turn that owned the plan will never
 	// consume it.
@@ -389,7 +389,7 @@ export async function refine(
 			throw new Error("Refinement cancelled because the session was disposed.");
 		}
 		try {
-			return await host._applyRefine(plan, options, refineAbort);
+			return await host._applyRefine(plan, options, refineAbort, internal.trigger ?? "manual");
 		} catch (error) {
 			// MV-5 parity for the direct refine() path (kernel skill, auto runs):
 			// a persist/apply failure leaves a model-visible failure receipt the
@@ -521,7 +521,11 @@ export async function planRefine(
 	return { ...plan, baselineState };
 }
 
-export function recordRefinementOutcome(host: RefineExecutionHost, result: RefinementResult): void {
+export function recordRefinementOutcome(
+	host: RefineExecutionHost,
+	result: RefinementResult,
+	trigger: "manual" | "auto" = "manual",
+): void {
 	// The receipt itemizes every edit it carries, applied and refused alike, so the
 	// material-change gate can tell "the model already heard about this entry" from
 	// "another seat moved the store" (merge doc 14.2: no double delivery).
@@ -534,7 +538,13 @@ export function recordRefinementOutcome(host: RefineExecutionHost, result: Refin
 			host._refinementReportedEntryVersions.set(`${edit.kind}:${entry.scope ?? scope}:${edit.id}`, entry.version);
 		}
 	}
-	appendDurableRefineMessage(host, createRefinementOutcomeMessage(result));
+	// wave-47 A: the TUI hides a clean background tidy but must always answer an
+	// explicit /refine, so the receipt carries how the refinement was initiated.
+	// refine.run lands on "manual" here: an explicit request, shown like /refine.
+	appendDurableRefineMessage(
+		host,
+		createRefinementOutcomeMessage(result, true, Date.now(), trigger === "auto" ? "auto" : "user"),
+	);
 }
 
 export function appendDurableRefineMessage(host: RefineExecutionHost, message: CustomMessage): void {
@@ -564,6 +574,7 @@ export async function applyRefine(
 	plan: RefinementPlan,
 	options: { instructions?: string; rollbackId?: string; global?: boolean },
 	refineAbort: AbortController,
+	trigger: "manual" | "auto" = "manual",
 ): Promise<RefinementResult> {
 	if (host._disposed) {
 		throw new Error("Cannot refine a disposed session.");
@@ -653,7 +664,7 @@ export async function applyRefine(
 				? new RefinePersistScopeError(cause.message, targetScope, { cause })
 				: new RefinePersistScopeError(String(cause), targetScope, { cause });
 		}
-		recordRefinementOutcome(host, result);
+		recordRefinementOutcome(host, result, trigger);
 		// No rebuild and no swap here (#2098): the prompt stays byte-identical so the
 		// provider's cached prefix survives the apply. The applied and refused edits
 		// reach the model through the outcome receipt above; a harness menu that moved

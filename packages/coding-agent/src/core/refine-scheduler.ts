@@ -57,6 +57,8 @@ export type SerializedBackgroundPlanResult =
 			options: { instructions?: string; rollbackId?: string; global?: boolean };
 			abort: AbortController;
 			branchVersion: number;
+			/** How the planned round was initiated; the outcome receipt carries it (wave-47 A). */
+			trigger: "manual" | "auto";
 	  }
 	| { status: "skip"; explicit?: boolean }
 	| { status: "invalidated"; branchVersion: number }
@@ -413,7 +415,7 @@ export async function applySerializedPlan(
 	});
 	host._refineInFlight = applySettled;
 	try {
-		await host._applyRefine(bgResult.plan, bgResult.options, bgResult.abort);
+		await host._applyRefine(bgResult.plan, bgResult.options, bgResult.abort, bgResult.trigger);
 	} finally {
 		resolveApplySettled();
 		if (host._refineInFlight === applySettled) {
@@ -516,7 +518,8 @@ export async function runBackgroundPlan(
 		}
 		// For explicit refine.run (skipReview=true), plan directly with
 		// the user-provided options — no auto-review gate.
-		const plan = await host._planRefine(planOptions, refineAbort.signal, skipReview ? "manual" : "auto");
+		const trigger = skipReview ? "manual" : "auto";
+		const plan = await host._planRefine(planOptions, refineAbort.signal, trigger);
 		if (host._disposed || host._disposing || branchVersion !== host._autoRefineBranchVersion) {
 			return { status: "invalidated", branchVersion };
 		}
@@ -526,6 +529,7 @@ export async function runBackgroundPlan(
 			options: planOptions,
 			abort: refineAbort,
 			branchVersion,
+			trigger,
 		};
 	} catch (error) {
 		if (host._disposed || host._disposing || branchVersion !== host._autoRefineBranchVersion) {
@@ -623,7 +627,7 @@ export async function runSerializedRefine(
 	});
 	host._refineInFlight = applySettled;
 	try {
-		await host._applyRefine(plan, options, refineAbort);
+		await host._applyRefine(plan, options, refineAbort, trigger);
 	} finally {
 		resolveApplySettled();
 		if (host._refineInFlight === applySettled) {

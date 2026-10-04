@@ -239,6 +239,12 @@ export interface RefinementOutcomeDetails {
 	failed?: true;
 	/** Short failure reason; model-visible alongside `failed`. */
 	error?: string;
+	/**
+	 * How the refinement was initiated. Absent on receipts written before the
+	 * stamp existed; the TUI reads those as background (auto) outcomes and keeps
+	 * a clean one hidden, while a user-invoked /refine always leaves a result row.
+	 */
+	source?: RefinementSource;
 }
 
 export interface RefinementOutcomeMessage extends CustomMessage<RefinementOutcomeDetails> {
@@ -1151,6 +1157,7 @@ export function createRefinementOutcomeMessage(
 	result: RefinementResult,
 	display = true,
 	timestamp = Date.now(),
+	source?: RefinementSource,
 ): RefinementOutcomeMessage {
 	return {
 		role: "custom",
@@ -1163,6 +1170,7 @@ export function createRefinementOutcomeMessage(
 			scope: result.scope ?? "local",
 			...(result.rollbackOf ? { rollbackOf: result.rollbackOf } : {}),
 			edits: result.appliedEdits,
+			...(source ? { source } : {}),
 		},
 		timestamp,
 	};

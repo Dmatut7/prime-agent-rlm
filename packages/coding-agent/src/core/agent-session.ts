@@ -12600,8 +12600,9 @@ export class AgentSession {
 		plan: RefinementPlan,
 		options: { instructions?: string; rollbackId?: string; global?: boolean },
 		refineAbort: AbortController,
+		trigger: "manual" | "auto" = "manual",
 	): Promise<RefinementResult> {
-		return applyRefine(this, plan, options, refineAbort);
+		return applyRefine(this, plan, options, refineAbort, trigger);
 	}
 
 	abortBranchSummary(): void {

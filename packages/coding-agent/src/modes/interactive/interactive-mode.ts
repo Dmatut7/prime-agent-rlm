@@ -368,7 +368,7 @@ import { imageFilesInPaste } from "./pasted-image-paths.js";
 import type { ClientPromptStashStore, PromptStash, PromptStashState } from "./prompt-stash-state.js";
 import { QueueSelection, type QueueSelectionItem } from "./queue-selection.js";
 import { findRecentSession, formatAgo, type RecentSession } from "./recent-session.js";
-import { formatResumeHint } from "./resume-hint.js";
+import { formatResumeHint, type ResumeHintConnection } from "./resume-hint.js";
 import {
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
@@ -1374,6 +1374,8 @@ export interface InteractiveModeOptions {
 	agentConnection: AgentConnection;
 	/** Exact daemon socket to preserve across an interactive self-update restart. */
 	daemonSocketPath?: string;
+	/** Explicit connection flags the exit resume hint replays, so the printed command reattaches here. */
+	resumeHintConnection?: ResumeHintConnection;
 	/**
 	 * Local-only host for in-process extension binding and callback-bearing session operations.
 	 * This must remain optional adapter glue, not a generic execution dependency.
@@ -10152,7 +10154,7 @@ export class InteractiveMode {
 		} finally {
 			await this.options.onShutdown?.();
 		}
-		const resumeHint = formatResumeHint(sessionStats);
+		const resumeHint = formatResumeHint(sessionStats, this.options.resumeHintConnection);
 		if (resumeHint) {
 			console.log(resumeHint);
 		}

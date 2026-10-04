@@ -53,6 +53,7 @@ import { keyText } from "../interactive/components/keybinding-hints.js";
 import { BrandSplashHeader, InteractiveMode } from "../interactive/interactive-mode.js";
 import type { InteractiveModeUiServices } from "../interactive/interactive-mode-services.js";
 import { ClientPromptStashStore } from "../interactive/prompt-stash-state.js";
+import type { ResumeHintConnection } from "../interactive/resume-hint.js";
 import {
 	getEditorTheme,
 	initTheme,
@@ -160,6 +161,8 @@ export interface AgentsViewModeOptions {
 	initialOpenChild?: AgentsViewPendingChildOpen;
 	/** A line to show when the view opens (why the chat that launched it ended). */
 	initialStatusMessage?: string;
+	/** Explicit connection flags a session's exit resume hint replays (wave-47 B). */
+	resumeHintConnection?: ResumeHintConnection;
 }
 
 export type AgentsViewRunResult =
@@ -752,6 +755,7 @@ async function runAgentsViewLoop(
 			const interactiveMode = new InteractiveMode({
 				agentConnection: opened.connection,
 				daemonSocketPath: options.socketPath,
+				resumeHintConnection: options.resumeHintConnection,
 				uiServices,
 				promptStashStore,
 				promptStashSessionId: opened.summary.sessionId,

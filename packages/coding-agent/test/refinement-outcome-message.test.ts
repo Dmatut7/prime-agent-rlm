@@ -119,6 +119,43 @@ describe("RefinementOutcomeMessageComponent", () => {
 		expect(expanded).not.toContain('"content"');
 	});
 
+	test("a user-invoked /refine that changed nothing still lands one dim line (wave-47 A)", () => {
+		timelineShowAll.set(false);
+		const message = createRefinementOutcomeMessage(
+			{ ...result(), appliedEdits: [], summary: "No refinement needed: nothing reusable." },
+			true,
+			Date.now(),
+			"user",
+		);
+		const component = new RefinementOutcomeMessageComponent(message);
+		const lines = component.render(120).map((line) => stripAnsi(line));
+		const head = lines.find((line) => line.includes("回合后整理记忆"));
+		expect(head).toBeDefined();
+		// A deliberate no-op is an answer, not a failure: none of the failed-tidy wording.
+		expect(head).not.toContain("没写进去");
+		expect(head).not.toContain("下一轮会再试");
+	});
+
+	test("a user-invoked /refine with edits shows its row without 完整过程 (wave-47 A)", () => {
+		timelineShowAll.set(false);
+		const message = createRefinementOutcomeMessage(result(), true, Date.now(), "user");
+		const text = stripAnsi(new RefinementOutcomeMessageComponent(message).render(120).join("\n"));
+		expect(text).toContain("回合后整理记忆：新记 1 条（本会话）");
+	});
+
+	test("auto and legacy (sourceless) clean tidies stay hidden (wave-47 A)", () => {
+		timelineShowAll.set(false);
+		const sources = ["auto", undefined] as const;
+		expect(sources.length).toBeGreaterThan(0);
+		for (const source of sources) {
+			const message =
+				source === undefined
+					? createRefinementOutcomeMessage({ ...result(), appliedEdits: [] })
+					: createRefinementOutcomeMessage({ ...result(), appliedEdits: [] }, true, Date.now(), source);
+			expect(new RefinementOutcomeMessageComponent(message).render(120)).toEqual([]);
+		}
+	});
+
 	test("opens with its own click, never with the process key", () => {
 		const component = new RefinementOutcomeMessageComponent(createRefinementOutcomeMessage(result()));
 		component.render(120);
