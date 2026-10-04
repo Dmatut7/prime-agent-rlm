@@ -343,6 +343,46 @@ describe("Editor component", () => {
 		});
 	});
 
+	describe("submit admission contract", () => {
+		// The interactive-mode admission gate (empty/whitespace text never reaches the
+		// session) depends on submitValue always firing onSubmit with the trimmed
+		// text: swallowing an empty submit here would also swallow the parked-queue
+		// resume that an empty Enter triggers downstream.
+		it("fires onSubmit with empty text on a bare Enter", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const submitted: string[] = [];
+			editor.onSubmit = (text) => submitted.push(text);
+
+			editor.handleInput("\r");
+
+			assert.deepStrictEqual(submitted, [""]);
+		});
+
+		it("fires onSubmit with trimmed empty text for whitespace-only content", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const submitted: string[] = [];
+			editor.onSubmit = (text) => submitted.push(text);
+
+			for (const ch of "   ") editor.handleInput(ch);
+			editor.handleInput("\r");
+
+			assert.deepStrictEqual(submitted, [""]);
+		});
+
+		it("never inserts unmatched control or escape sequences as text", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			// BEL, focus in/out, an unknown CSI, NUL: none of these are text.
+			const sequences = ["\x07", "\x1b[I", "\x1b[O", "\x1b[999~", "\x00"];
+			assert.ok(sequences.length > 0);
+
+			for (const sequence of sequences) editor.handleInput(sequence);
+
+			assert.strictEqual(editor.getText(), "");
+			editor.handleInput("\r");
+			assert.strictEqual(editor.getText(), "");
+		});
+	});
+
 	describe("Kitty CSI-u handling", () => {
 		it("ignores printable CSI-u sequences with unsupported modifiers", () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
