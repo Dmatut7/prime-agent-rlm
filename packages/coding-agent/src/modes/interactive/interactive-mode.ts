@@ -335,6 +335,7 @@ import { findLatestUserMessageEntryId, TreeSelectorComponent } from "./component
 import {
 	PROCESS_FOLD_THRESHOLD,
 	type TimelineHost,
+	TURN_KEY_REVEAL_MARKER,
 	type TurnActivityState,
 	TurnSummaryComponent,
 } from "./components/turn-activity.js";
@@ -10549,13 +10550,14 @@ export class InteractiveMode {
 			if (this.hideThinkingBlock || !block.hasThinkingTrace()) return undefined;
 			return {
 				label: summary.state.thinkingExpanded ? "收起思考" : "展开思考",
-				run: () => this.toggleTurnThinking(summary),
+				// The block walk already holds the focused block in view; the key-toggle reveal would pull the window away from it.
+				run: () => this.toggleTurnThinking(summary, { reveal: false }),
 			};
 		}
 		if (summary.state.stepCount === 0) return undefined;
 		const state = summary.state;
 		const label = state.isCollapsed ? "展开" : state.processKeyStepsView ? "展开全部" : "收起";
-		return { label, run: () => this.cycleTurnProcess(summary) };
+		return { label, run: () => this.cycleTurnProcess(summary, { reveal: false }) };
 	}
 
 	/** Enter/Space on the focused block. */
@@ -11258,10 +11260,14 @@ export class InteractiveMode {
 		this.editDiffsExpanded = !this.toolOutputExpanded;
 		this.syncAllTurnLanes(!this.toolOutputExpanded, "tools");
 		this.setToolsExpanded(!this.toolOutputExpanded);
+		// Every turn flipped; show the newest one's head when the growth happened off-screen.
+		const latest = this.latestShownTurnSummary();
+		if (latest) this.revealTurnAfterKeyToggle(latest);
 	}
 
 	/** One Ctrl+O press on one turn's process block (also Enter on a focused process line). */
-	private cycleTurnProcess(summary: TurnSummaryComponent): void {
+	private cycleTurnProcess(summary: TurnSummaryComponent, options: { reveal?: boolean } = {}): void {
+		const reveal = options.reveal !== false;
 		if (summary.state.boxMode) {
 			// The box opens or closes as a whole; its rows open one by one.
 			summary.toggleBox();
@@ -11270,6 +11276,7 @@ export class InteractiveMode {
 			} else {
 				this.forgetProcessBlock(summary, "process");
 			}
+			if (reveal) this.revealTurnAfterKeyToggle(summary);
 			return;
 		}
 		if (this.settingsManager.getProcessMode() === "quiet") {
@@ -11293,11 +11300,13 @@ export class InteractiveMode {
 			const next = summary.state.isCollapsed;
 			summary.setExpanded(next);
 		}
+		if (reveal) this.revealTurnAfterKeyToggle(summary);
 		this.applyTurnExpansion(summary);
 	}
 
 	/** One Ctrl+T press on one turn's traces (also Enter on a focused answer). */
-	private toggleTurnThinking(summary: TurnSummaryComponent): void {
+	private toggleTurnThinking(summary: TurnSummaryComponent, options: { reveal?: boolean } = {}): void {
+		const reveal = options.reveal !== false;
 		if (summary.state.boxMode) {
 			// The box keeps the turn's thinking as its own rows: open them all, or close them.
 			summary.toggleThinkingRows();
@@ -11306,6 +11315,7 @@ export class InteractiveMode {
 			} else {
 				this.forgetProcessBlock(summary, "thinking");
 			}
+			if (reveal) this.revealTurnAfterKeyToggle(summary);
 			this.requestExpansionRender();
 			return;
 		}
@@ -11319,6 +11329,7 @@ export class InteractiveMode {
 		}
 		// The opened or folded trace is the feedback; a status row per
 		// press would pile up in the chat.
+		if (reveal) this.revealTurnAfterKeyToggle(summary);
 		this.applyTurnExpansion(summary);
 	}
 
@@ -11418,6 +11429,7 @@ export class InteractiveMode {
 				} else {
 					this.forgetProcessBlock(summary, "comms");
 				}
+				this.revealTurnAfterKeyToggle(summary);
 				this.applyTurnExpansion(summary);
 				return;
 			}
@@ -11429,6 +11441,9 @@ export class InteractiveMode {
 		this.agentMessagesExpanded = !this.agentMessagesExpanded;
 		this.syncAllTurnLanes(this.agentMessagesExpanded, "agentMessages");
 		this.applyChatExpansion();
+		// Every turn flipped; show the newest one's head when the growth happened off-screen.
+		const latest = this.latestShownTurnSummary();
+		if (latest) this.revealTurnAfterKeyToggle(latest);
 	}
 
 	private toggleEditDiffExpansion(): void {
@@ -11508,6 +11523,21 @@ export class InteractiveMode {
 		}
 	}
 
+	/**
+	 * A key just toggled one of this turn's blocks. The fullscreen window stays
+	 * glued to the transcript's end, so a toggle whose turn head sits above the
+	 * window changes nothing the owner sees - no expansion, no toast, the key
+	 * looks dead (wave-49 F1, every --resume of a tall session). Arm the
+	 * one-shot reveal so the next frame scrolls the head into view; a head
+	 * already on screen does not move. Inline mode repaints the shifted rows in
+	 * place and needs no marker - and must never see one (nothing strips it).
+	 */
+	private revealTurnAfterKeyToggle(summary: TurnSummaryComponent): void {
+		if (!this.ui.isFullscreen()) return;
+		summary.armRevealMarker();
+		this.ui.setFullscreenRevealMarker(TURN_KEY_REVEAL_MARKER);
+	}
+
 	private toggleThinkingBlockVisibility(global = false): void {
 		// U6 (boss's two-key model): Ctrl+T owns the thinking block — it
 		// expands/collapses the turn's thinking traces. The turn header stays
@@ -11537,6 +11567,9 @@ export class InteractiveMode {
 		this.thinkingExpanded = !this.thinkingExpanded;
 		this.syncAllTurnLanes(this.thinkingExpanded, "thinking");
 		this.applyChatExpansion();
+		// Every turn flipped; show the newest one's head when the growth happened off-screen.
+		const latest = this.latestShownTurnSummary();
+		if (latest) this.revealTurnAfterKeyToggle(latest);
 	}
 
 	private async openExternalEditor(): Promise<void> {

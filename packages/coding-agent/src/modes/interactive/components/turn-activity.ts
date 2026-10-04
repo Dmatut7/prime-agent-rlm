@@ -701,6 +701,14 @@ export class TurnActivityState {
 	}
 }
 
+/**
+ * A zero-width marker the fullscreen window reveals once: the head row of a
+ * turn a key just toggled. Without it a toggle whose turn head sits above the
+ * bottom-glued window changes nothing the owner sees (the window keeps showing
+ * the same tail rows) - the key looks dead (wave-49 F1).
+ */
+export const TURN_KEY_REVEAL_MARKER = "\x1b_pi:turn-key-reveal\x07";
+
 /** A component that lists the click regions of the lines it drew. */
 interface HasClickRegions {
 	getClickRegions(): ReadonlyArray<ClickRegion>;
@@ -728,8 +736,15 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	private laneTracker: TimelineLaneTracker | undefined;
 	/** Rows that landed while the turn's run went on (a subagent's report), drawn among its lines by their time. */
 	private readonly inlineRows: Array<{ component: Component; at: number }> = [];
+	/** One-shot: the next render carries the reveal marker on the first line. */
+	private revealArmed = false;
 
 	constructor(private readonly turnState: TurnActivityState) {}
+
+	/** The next frame reveals this turn's head; arm it when a key toggled the turn while it could sit off-screen. */
+	armRevealMarker(): void {
+		this.revealArmed = true;
+	}
 
 	setOnLanesChange(callback: (() => void) | undefined): void {
 		this.onLanesChange = callback;
@@ -947,7 +962,11 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 
 	render(width: number): string[] {
 		const lines = this.renderTurnHead(width);
-		return this.blockFocus && lines.length > 0 ? decorateFocusedBlock(lines, width, this.blockFocus) : lines;
+		const focused = this.blockFocus && lines.length > 0 ? decorateFocusedBlock(lines, width, this.blockFocus) : lines;
+		if (!this.revealArmed) return focused;
+		this.revealArmed = false;
+		// A copy: `focused` may be the cached lines array, which must not change.
+		return focused.length > 0 ? [TURN_KEY_REVEAL_MARKER + focused[0], ...focused.slice(1)] : focused;
 	}
 
 	setBlockFocus(state: BlockFocusState | undefined): void {
