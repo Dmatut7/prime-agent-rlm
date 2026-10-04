@@ -1368,7 +1368,7 @@ function nearDuplicateMemoryWarning(matches: readonly HarnessNearDuplicateMatch[
 	});
 	const listed = labels.join("、");
 	if (isCreate) {
-		return `近重复警告：已有相似条目 ${listed}，建议 update_memory 更新相似条目而不是新建；本次写入已完成，确属独立条目可忽略。`;
+		return `近重复警告：已有相似条目 ${listed}；先确认是不是同一件事：是同一件事才用 update_memory 更新旧条目（update 会整条覆盖它），不是同一件事就保持这条新建不变；本次写入已完成。`;
 	}
 	return `近重复警告：已有相似条目 ${listed}，与本次更新后的内容高度重合，建议合并为一条；本次更新已完成。`;
 }

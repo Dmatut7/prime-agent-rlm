@@ -660,6 +660,12 @@ export interface KernelClient {
 	readonly supportsMessageNotify?: boolean;
 	/** Best-effort protocol-5 `notify` frame for an admitted agent message; resolves false when unsupported/undeliverable; never throws. */
 	notifyAgentMessageArrived?(): Promise<boolean>;
+	/**
+	 * Best-effort protocol-5 `notify` frame reporting how many admitted agent messages are
+	 * still undelivered; the kernel clamps its pending ledger down to the count. Resolves
+	 * false when unsupported/undeliverable; never throws.
+	 */
+	notifyAgentMessageDelivered?(pending: number): Promise<boolean>;
 	/** Kernel process id while the child is alive. */
 	readonly kernelPid?: number;
 	/** Whether the newest heartbeat reports live bash handles; false when it reports none. */

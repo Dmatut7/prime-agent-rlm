@@ -133,8 +133,15 @@ const KERNEL_PROTOCOL_V5 = 5;
  * frame; the kernel side names it CAPABILITY_MESSAGE_NOTIFY.
  */
 const KERNEL_CAPABILITY_MESSAGE_NOTIFY = "message_notify";
-/** The one notify kind this host sends; a kind the runtime does not wait on is ignored. */
+/** The arrival notify kind; a kind the runtime does not wait on is ignored. */
 const KERNEL_NOTIFY_KIND_AGENT_MESSAGE = "agent_message";
+/**
+ * The delivery half of the arrival notify: reports how many admitted messages are
+ * still undelivered so the kernel can clamp its pending ledger down to it. A runtime
+ * that predates the kind ignores the frame, so an updated host degrades instead of
+ * erroring.
+ */
+const KERNEL_NOTIFY_KIND_AGENT_MESSAGE_DELIVERED = "agent_message_delivered";
 /**
  * Negotiation variable. The host only sets it when nobody else did, so
  * `export PRIME_AGENT_KERNEL_PROTOCOL=3` stays a working rollback for every gated
@@ -2804,6 +2811,29 @@ export class ReplKernelManager {
 			// The frame is a hint, so its loss is not a warning on its own: a dying kernel
 			// already reports itself, and the admission it announced is durable regardless.
 			kernelLog.debug("kernel message-wake notify frame was not delivered", {
+				error: errorMessage(error),
+				sessionId: this.options.sessionId,
+			});
+			return false;
+		}
+	}
+
+	/**
+	 * Tell the kernel how many admitted agent messages are still undelivered
+	 * (protocol-5 `notify` frame, `agent_message_delivered` kind). Sent when an
+	 * admitted message enters the conversation (or is settled as undeliverable), so
+	 * the kernel's pending ledger stops counting what the model already has.
+	 * Fire-and-forget like the arrival frame: the kernel never replies, a kernel
+	 * that predates the kind ignores it, and a lost frame costs one stale peek.
+	 * Never throws into the delivery path.
+	 */
+	async notifyAgentMessageDelivered(pending: number): Promise<boolean> {
+		if (!this.messageNotifySupported) return false;
+		try {
+			await this.writeLine({ type: "notify", kind: KERNEL_NOTIFY_KIND_AGENT_MESSAGE_DELIVERED, pending });
+			return true;
+		} catch (error) {
+			kernelLog.debug("kernel message-delivered notify frame was not delivered", {
 				error: errorMessage(error),
 				sessionId: this.options.sessionId,
 			});

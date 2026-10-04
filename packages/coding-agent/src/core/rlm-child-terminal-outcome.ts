@@ -20,7 +20,11 @@ import {
 	createRlmChildTerminalNoticeMessage,
 } from "./messages.js";
 import type { RlmChildRun } from "./rlm-child-run.js";
-import { classifyRlmChildTerminalOutcomeSafely, type RlmChildTerminalFacts } from "./rlm-child-terminal.js";
+import {
+	classifyRlmChildTerminalOutcomeSafely,
+	type RlmChildSettledDetails,
+	type RlmChildTerminalFacts,
+} from "./rlm-child-terminal.js";
 import type { StallDiagnostics } from "./stall-diagnostics.js";
 
 // Same logger name as agent-session.ts: the terminal-outcome delivery moved here
@@ -39,6 +43,12 @@ export interface RlmChildTerminalOutcomeHost {
 	readonly _queuedChildReplyBackfills: QueuedParentReplyBackfills;
 	_findLastAssistantInMessages(messages: AgentMessage[]): AssistantMessage | undefined;
 	_recordDutyEvent(event: DutyEvent): void;
+	/**
+	 * Append the transcript-only settle record for a run that ended by replying.
+	 * Not a notice: nothing is delivered and nobody is woken - the compaction
+	 * handoff scanner is the only reader.
+	 */
+	_recordRlmChildSettled(details: RlmChildSettledDetails): void;
 }
 
 /**
@@ -172,7 +182,17 @@ export async function deliverRlmChildTerminalOutcome(
 	// baseline this classification used is gone.
 	run.terminalKind = outcome.kind;
 	run.terminalReason = outcome.reason;
-	if (outcome.channel === "none") return;
+	if (outcome.channel === "none") {
+		// A replied run publishes nothing by design - the parent already has the
+		// answer. The transcript still needs the settle record: the compaction
+		// handoff delists a child on a terminal record later in the branch, and a
+		// replied child would otherwise be listed as in flight by every compaction
+		// forever.
+		if (facts.repliedDuringRun) {
+			host._recordRlmChildSettled({ childId: run.id, sessionName, settledAs: "replied" });
+		}
+		return;
+	}
 	if (outcome.kind === "completed_without_reply" && child) {
 		// The verdict is right about the moment it was taken and wrong about the
 		// moment it is read: this session may already be holding a reply from this

@@ -132,12 +132,20 @@ export interface RlmCollectResult {
 
 /**
  * The session's agent-message arrival ledger, exposed to a wake-capable collect
- * (kernel protocol 5 `wake_on_message`). The count is monotonic for the session's
- * lifetime; a parked wait resolves once the count advances past the caller's marker.
+ * (kernel protocol 5 `wake_on_message`). Both counts are monotonic for the session's
+ * lifetime; a parked wait resolves once the arrival count advances past the caller's
+ * marker.
  */
 export interface RlmCollectMessageWakeSource {
 	/** Agent messages admitted for this session so far. */
 	arrivalCount(): number;
+	/**
+	 * Admitted messages that are no longer pending: delivered into the conversation,
+	 * or settled as undeliverable (cleared before their turn ever ran). This is the
+	 * wake baseline: `arrivalCount() - deliveredCount()` is the number of messages
+	 * the model has not seen yet, and those - not arrivals as such - are news.
+	 */
+	deliveredCount(): number;
 	/**
 	 * Resolve true once the arrival count exceeds `since`; false on timeout or abort.
 	 * An abort is the collect ending for its own reason (deadline, cell interrupt, or a
@@ -539,14 +547,18 @@ export function createRlmCollectHostHandler(
 			const { results } = await handler(targets, timeoutMs, signal);
 			return { results, timeout_ms: timeoutMs };
 		}
-		// The anti-spin gate behind `wake_on_message`: this collect counts news from its
-		// own start, so only an arrival admitted during the wait may end it early.
-		// Anything older is not news: it is either already delivered into the
-		// conversation (the common between-turns case - answering instantly with
-		// messages_pending would send the model to end a turn for a message it already
-		// has, a wasted round-trip per stale arrival) or already reported by an earlier
-		// answer (a re-armed collect without a new arrival parks instead of spinning).
-		const since = messageWake.arrivalCount();
+		// The anti-spin gate behind `wake_on_message`: this collect counts news against
+		// the session's delivered count, so exactly the admitted-but-undelivered
+		// messages may end its wait early. An arrival already delivered into the
+		// conversation (the common between-turns case) is not news: answering with
+		// messages_pending for it would send the model to end a turn for a message it
+		// already has, a wasted round-trip per stale arrival. An arrival admitted
+		// earlier in this same turn but not yet delivered IS news - delivery only
+		// happens at the turn boundary, and the wake is the only thing telling the
+		// model to stop waiting and end the turn so the message can land. An
+		// arrival-count baseline could not tell the two apart: it parked the wait on
+		// every same-turn reply until the timeout, and the fan-in starved.
+		const since = messageWake.deliveredCount();
 		// The collect and the arrival wait share one derived signal: an arrival aborts it
 		// to end the settlement wait early (the collect's abort path returns the current
 		// snapshots), and the request's own abort - a cell interrupt - propagates through
@@ -586,7 +598,8 @@ export function createRlmCollectHostHandler(
 				timeout_ms: timeoutMs,
 				// The kernel mirrors this into the cell's output as "N message(s) pending; end
 				// the turn to receive them", so the number is the news this answer carries -
-				// arrivals since this collect started, never the session's whole backlog.
+				// arrivals not yet delivered into the conversation, never the session's whole
+				// backlog.
 				messages_pending: Math.max(1, pendingNow - since),
 			};
 		} finally {

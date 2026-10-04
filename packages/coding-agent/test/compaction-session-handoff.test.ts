@@ -12,6 +12,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Model, ToolResultMessage, Usage } from "@earendil-works/pi-ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { AGENT_MESSAGE_CUSTOM_TYPE } from "../src/core/agent-messages.js";
 import {
 	buildSessionHandoff,
 	type CompactionDetails,
@@ -28,6 +29,7 @@ import {
 } from "../src/core/compaction/index.js";
 import { DUTY_EVENT_CUSTOM_TYPE } from "../src/core/duty-log.js";
 import { RLM_CHILD_FAILURE_CUSTOM_TYPE, RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE } from "../src/core/messages.js";
+import { RLM_CHILD_SETTLED_CUSTOM_TYPE } from "../src/core/rlm-child-terminal.js";
 import type {
 	CompactionEntry,
 	CustomEntry,
@@ -155,6 +157,17 @@ function dutyEntry(question: string): CustomEntry {
 		timestamp: new Date().toISOString(),
 		customType: DUTY_EVENT_CUSTOM_TYPE,
 		data: { kind: "decision_needed", question },
+	});
+}
+
+function customEntry(customType: string, data: unknown): CustomEntry {
+	return link({
+		type: "custom",
+		id: `entry-${entryCounter++}`,
+		parentId: null,
+		timestamp: new Date().toISOString(),
+		customType,
+		data,
 	});
 }
 
@@ -348,6 +361,68 @@ describe("buildSessionHandoff (W18-D)", () => {
 			{ generation: 1 },
 		);
 		expect(silent.subagents).toEqual([]);
+	});
+
+	it("a settle record resolves a child whose run ended by replying", () => {
+		// A child that ends by answering (its agent_message reply was delivered)
+		// classifies as "none" by design: the parent already has the answer, so no
+		// notice is published. Without a transcript record for that settle, every
+		// later compaction kept listing the replied child as in flight forever.
+		const ledger = buildSessionHandoff(
+			[
+				messageEntry(ipythonResult({ activities: [subagentActivity("s1", "worker-a", "ok")] })),
+				customEntry(RLM_CHILD_SETTLED_CUSTOM_TYPE, {
+					childId: "c1",
+					sessionName: "worker-a",
+					settledAs: "replied",
+				}),
+			],
+			{ generation: 1 },
+		);
+		expect(ledger.subagents).toEqual([]);
+	});
+
+	it("a settle record in the new slice resolves a carried-forward child", () => {
+		const previous = buildSessionHandoff(
+			[messageEntry(ipythonResult({ activities: [subagentActivity("s1", "worker-a", "ok")] }))],
+			{ generation: 1 },
+		);
+		const ledger = buildSessionHandoff(
+			[customEntry(RLM_CHILD_SETTLED_CUSTOM_TYPE, { childId: "c1", sessionName: "worker-a", settledAs: "replied" })],
+			{ generation: 2, previous },
+		);
+		expect(ledger.subagents).toEqual([]);
+	});
+
+	it("a bare child reply does not delist the child: a mid-run message is not a settlement", () => {
+		// Listing is conservative on purpose: a child that messages its parent
+		// mid-run (a question, a status note) is still working, and the handoff must
+		// not drop live work. Only the settle record resolves a replied run.
+		const ledger = buildSessionHandoff(
+			[
+				messageEntry(ipythonResult({ activities: [subagentActivity("s1", "worker-a", "ok")] })),
+				customMessageEntry(AGENT_MESSAGE_CUSTOM_TYPE, "question from the child", {
+					id: "am-1",
+					message: "question from the child",
+					from: { sessionId: "child-session-1", sessionName: "worker-a" },
+					fromRelationship: "child",
+				}),
+			],
+			{ generation: 1 },
+		);
+		expect(ledger.subagents.map((subagent) => subagent.name)).toEqual(["worker-a"]);
+	});
+
+	it("a settle record without a session name resolves nothing", () => {
+		const ledger = buildSessionHandoff(
+			[
+				messageEntry(ipythonResult({ activities: [subagentActivity("s1", "worker-a", "ok")] })),
+				customEntry(RLM_CHILD_SETTLED_CUSTOM_TYPE, { childId: "c1", settledAs: "replied" }),
+				customEntry(RLM_CHILD_SETTLED_CUSTOM_TYPE, "not-a-record"),
+			],
+			{ generation: 1 },
+		);
+		expect(ledger.subagents.map((subagent) => subagent.name)).toEqual(["worker-a"]);
 	});
 
 	it("tracks background commands by activity id until their outcome lands", () => {

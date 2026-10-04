@@ -243,13 +243,19 @@ kernel *that* a message arrived, so a waiting cell can stop waiting:
 thread like `host_reply`, never queued behind the in-flight execute it must
 wake. A host sends the frame only when the kernel announced the
 `message_notify` capability; one that arrives anyway is still honored (a
-recorded wake is harmless). The frame carries a kind, never message content.
+recorded wake is harmless). The arrival frame carries a kind, never message
+content. Its delivery half, `{"type":"notify","kind":"agent_message_delivered",
+"pending":N}`, reports how many admitted messages are still undelivered; the
+kernel clamps the pending ledger down to N (never up, and a frame without a
+valid count is ignored), so a message the model already received stops counting
+as pending instead of lingering until some wait happens to drain it.
 
 The kernel records arrivals in a loop-thread ledger and wakes every parked
 `rlm.wait_messages` wait. The cell-facing surface (see the `rlm` package
 docstrings):
 
-- `rlm.messages_pending()` peeks at the unconsumed arrival count.
+- `rlm.messages_pending()` peeks at the unconsumed, still-undelivered arrival
+  count.
 - `await rlm.wait_messages(timeout_ms)` drains the ledger: it returns the
   number of arrivals consumed as soon as one is pending, or `0` on timeout
   (`timeout_ms=0` is a non-blocking drain). The wake lands at the await point -

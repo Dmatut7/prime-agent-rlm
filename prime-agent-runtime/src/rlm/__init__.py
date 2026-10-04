@@ -465,9 +465,10 @@ def _note_collect_message_wake(messages_pending: Any) -> None:
 
 
 def messages_pending() -> int:
-    """Agent-message arrivals the host pushed (or reported) that no wait has consumed yet.
+    """Agent-message arrivals the host pushed (or reported) that are still undelivered.
 
-    A peek: reading the count never drains it. ``wait_messages`` drains.
+    A peek: reading the count never drains it. ``wait_messages`` drains, and the host's
+    delivery report clears what already entered the conversation.
     """
     from . import repl
 

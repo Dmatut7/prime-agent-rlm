@@ -10,9 +10,10 @@
  *
  * So the handoff is assembled by program from the session timeline itself:
  * the kernel's per-cell activity records on ipython tool results (subagent
- * admissions, background commands) and the parent-facing child lifecycle notices
- * (failure and terminal). The ledger is carried forward structurally in the
- * compaction entry's details (the rendered block is the fallback, same contract
+ * admissions, background commands) and the parent-facing child lifecycle records
+ * (failure and terminal notices, and the transcript-only settle record a replied
+ * run leaves). The ledger is carried forward structurally in the compaction
+ * entry's details (the rendered block is the fallback, same contract
  * as the fact appendix), so a child admitted three compactions ago is still
  * named after the cell that spawned it has been summarized away.
  *
@@ -23,13 +24,15 @@
  * surface.
  *
  * Listing is conservative on purpose: a record is removed only by a terminal
- * record later in the branch (failure, cancellation, or completion notice), so
- * the block may name work that has since finished *quietly* - never the reverse.
+ * record later in the branch (failure, cancellation, completion notice, or the
+ * settle record of a run that ended by replying), so the block may name work
+ * that has since finished *quietly* - never the reverse.
  * The header tells the reader that rlm.list_subagents(include_terminal=True) is
  * the ground truth.
  */
 
 import { RLM_CHILD_FAILURE_CUSTOM_TYPE, RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE } from "../messages.js";
+import { RLM_CHILD_SETTLED_CUSTOM_TYPE } from "../rlm-child-terminal.js";
 import type { SessionEntry } from "../session-manager.js";
 import { checkMachineBlockSelfCount, findMachineBlock, renderMachineBlock } from "./machine-blocks.js";
 
@@ -114,6 +117,12 @@ function noticeSessionName(details: unknown): string | undefined {
 	return typeof details.sessionName === "string" && details.sessionName.length > 0 ? details.sessionName : undefined;
 }
 
+/** The sessionName a child settle record resolves against; `data`, not `details` - it is a custom entry. */
+function settledSessionName(data: unknown): string | undefined {
+	if (!isRecord(data)) return undefined;
+	return typeof data.sessionName === "string" && data.sessionName.length > 0 ? data.sessionName : undefined;
+}
+
 interface HandoffScan {
 	/** In-flight children by their current name (admission re-keys the prompt label to it). */
 	subagents: Map<string, HandoffSubagent>;
@@ -196,6 +205,16 @@ function applyEntry(scan: HandoffScan, entry: SessionEntry): void {
 		}
 		return;
 	}
+	// A run that ended by replying publishes no notice (the parent already has the
+	// answer), so the terminal path writes this transcript-only record instead -
+	// without it a replied child was listed as in flight by every compaction
+	// forever. A bare child message is NOT a resolution: a mid-run question keeps
+	// the child listed, since it is still working.
+	if (entry.type === "custom" && entry.customType === RLM_CHILD_SETTLED_CUSTOM_TYPE) {
+		const name = settledSessionName(entry.data);
+		if (name !== undefined) scan.subagents.delete(name);
+		return;
+	}
 }
 
 function capList<T>(items: T[], max: number): { kept: T[]; elided: number } {
@@ -237,7 +256,7 @@ export function buildSessionHandoff(
 /* -------------------------------------------------------------------------- */
 
 const HANDOFF_HEADER =
-	"Machine-assembled from the session timeline at compaction time, no model involved: work still in flight when this summary was written. k=subagent: a child this session admitted, with no terminal record (failure, cancellation or completion notice) later in this transcript (it may still have finished quietly or been deleted - rlm.list_subagents(include_terminal=True) is the ground truth; admitting=true means the spawn call itself had not returned). k=background: a bash() command the kernel still had running. Refer to entries by their exact name/id; do not restate them as fact without checking.";
+	"Machine-assembled from the session timeline at compaction time, no model involved: work still in flight when this summary was written. k=subagent: a child this session admitted, with no terminal record (failure, cancellation, completion notice, or the settle record of a run that ended by replying) later in this transcript (it may still have finished quietly or been deleted - rlm.list_subagents(include_terminal=True) is the ground truth; admitting=true means the spawn call itself had not returned). k=background: a bash() command the kernel still had running. Refer to entries by their exact name/id; do not restate them as fact without checking.";
 
 type WireHandoff =
 	| { k: "subagent"; n: string; s?: number; m?: string; a?: 1 }

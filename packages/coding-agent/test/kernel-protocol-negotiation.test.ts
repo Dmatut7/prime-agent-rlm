@@ -328,6 +328,49 @@ describe("kernel protocol negotiation", () => {
 		}
 	});
 
+	it("pushes a delivered notify frame carrying the pending count to a kernel that announced message_notify", async () => {
+		// The delivered half of the message-wake contract: the kernel's pending
+		// ledger must be cleared when the message enters the conversation, or
+		// `messages_pending()` keeps reporting messages the model already has.
+		const { manager, requestLogPath } = newManager({ announce: ["message_notify"] });
+
+		try {
+			await manager.start();
+			expect(manager.supportsMessageNotify).toBe(true);
+
+			await expect(manager.notifyAgentMessageDelivered?.(0)).resolves.toBe(true);
+
+			// The write resolves when the OS accepted the bytes; the fake's log line lands
+			// when its reader loop turns, so poll instead of reading at once.
+			await vi.waitFor(() => {
+				expect(requestLines(requestLogPath).filter((line) => JSON.parse(line).type === "notify")).toEqual([
+					JSON.stringify({ type: "notify", kind: "agent_message_delivered", pending: 0 }),
+				]);
+			});
+		} finally {
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+		}
+	});
+
+	it("never sends a delivered notify frame without the kernel's message_notify token", async () => {
+		const { manager, requestLogPath } = newManager();
+
+		try {
+			await manager.start();
+			expect(manager.supportsMessageNotify).toBe(false);
+
+			await expect(manager.notifyAgentMessageDelivered?.(0)).resolves.toBe(false);
+
+			expect((await manager.execute("say-hi")).stdout).toContain("hi");
+			await vi.waitFor(() => {
+				expect(requestLines(requestLogPath).some((line) => JSON.parse(line).type === "execute")).toBe(true);
+			});
+			expect(requestLines(requestLogPath).filter((line) => JSON.parse(line).type === "notify")).toEqual([]);
+		} finally {
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+		}
+	});
+
 	it("never sends a notify frame without the kernel's message_notify token", async () => {
 		// A runtime that announced protocol 5 but no token predates the notify frame; the
 		// version number alone must not authorize one.

@@ -84,7 +84,9 @@ class NearDuplicateCreateTest(unittest.TestCase):
             assert warning is not None
             self.assertIn("近重复警告", warning)
             self.assertIn("mem_original", warning)
-            self.assertIn("而不是新建", warning)
+            # 先确认是不是同一件事：同一件事才更新（update 会整条覆盖旧条目），不同就保持新建。
+            self.assertIn("先确认是不是同一件事", warning)
+            self.assertNotIn("而不是新建", warning)
             self.assertNotIn("mem_rewrite", warning)
             # 写入自由：the gate never blocks; the duplicate lands in the store.
             self.assertIsNotNone(state.get("memory", "mem_rewrite"))

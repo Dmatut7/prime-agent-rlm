@@ -2465,8 +2465,9 @@ class HarnessState:
         listed = "、".join(labels)
         if is_create:
             return (
-                f"近重复警告：已有相似条目 {listed}，建议 update_memory 更新相似条目而不是新建；"
-                "本次写入已完成，确属独立条目可忽略。"
+                f"近重复警告：已有相似条目 {listed}；先确认是不是同一件事："
+                "是同一件事才用 update_memory 更新旧条目（update 会整条覆盖它），"
+                "不是同一件事就保持这条新建不变；本次写入已完成。"
             )
         return (
             f"近重复警告：已有相似条目 {listed}，"

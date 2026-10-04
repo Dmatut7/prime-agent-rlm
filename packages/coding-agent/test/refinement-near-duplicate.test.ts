@@ -98,7 +98,11 @@ describe("near-duplicate memory advisory on the refine write path", () => {
 		expect(edit.nearDuplicateWarning).toBeDefined();
 		expect(edit.nearDuplicateWarning).toContain("近重复警告");
 		expect(edit.nearDuplicateWarning).toContain("mem_original");
-		expect(edit.nearDuplicateWarning).toContain("而不是新建");
+		// The advisory must ask the writer to confirm sameness first: update_memory
+		// overwrites the whole entry, so "update instead of create" is only right
+		// when both entries are the same fact.
+		expect(edit.nearDuplicateWarning).toContain("先确认是不是同一件事");
+		expect(edit.nearDuplicateWarning).not.toContain("而不是新建");
 		expect(edit.nearDuplicateWarning).not.toContain("mem_rewrite");
 		// Advisory only: the duplicate landed in the store.
 		expect(state.entries.memory.mem_rewrite?.content).toBe(DUP_CONTENT_B);

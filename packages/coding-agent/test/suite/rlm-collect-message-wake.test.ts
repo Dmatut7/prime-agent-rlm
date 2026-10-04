@@ -7,12 +7,11 @@
  * current snapshots plus `messages_pending`, and the kernel surfaces that as a
  * note telling the model to end its turn and receive the message.
  *
- * The anti-spin gate: a collect counts news from its own start, so only an arrival
- * newer than the collect itself may end its wait. An arrival admitted before the
- * collect started is not reported: it is either already delivered into the
- * conversation (the common between-turns case, where answering instantly with
- * `messages_pending` would send the model to end a turn for a message it already
- * has) or already visible through the kernel's pending ledger.
+ * The anti-spin gate: a collect counts news against the session's *delivered*
+ * count, so an arrival already delivered into the conversation (the common
+ * between-turns case) never ends a wait early, while an admitted-but-undelivered
+ * arrival - even one that predates the collect inside the same turn - does:
+ * the model has not seen it yet, and the wake is what tells it to end the turn.
  */
 import { describe, expect, it } from "vitest";
 import {
@@ -25,15 +24,24 @@ import {
 type ReleaseKind = "timeout" | "abort";
 
 /**
- * A session-side arrival ledger stand-in: a monotonic count plus waiters that
- * resolve once the count advances past the caller's marker.
+ * A session-side arrival ledger stand-in: a monotonic arrival count plus a
+ * delivered count (arrivals that reached the conversation - or were settled as
+ * undeliverable), plus waiters that resolve once the arrival count advances
+ * past the caller's marker. `arrive` models an admission mid-turn (not yet
+ * delivered); `deliver` models the turn boundary the message is delivered at.
  */
-function createWakeSource(initialCount = 0): {
+function createWakeSource(
+	initialCount = 0,
+	initialDelivered = initialCount,
+): {
 	source: RlmCollectMessageWakeSource;
 	arrive: (n?: number) => void;
+	deliver: (n?: number) => void;
 	count: () => number;
+	delivered: () => number;
 } {
 	let count = initialCount;
+	let delivered = initialDelivered;
 	const waiters = new Set<{
 		since: number;
 		resolve: (arrived: boolean) => void;
@@ -41,6 +49,7 @@ function createWakeSource(initialCount = 0): {
 	}>();
 	const source: RlmCollectMessageWakeSource = {
 		arrivalCount: () => count,
+		deliveredCount: () => delivered,
 		waitForArrival: (since, timeoutMs, signal) =>
 			new Promise<boolean>((resolve) => {
 				if (count > since) {
@@ -68,11 +77,15 @@ function createWakeSource(initialCount = 0): {
 	return {
 		source,
 		count: () => count,
+		delivered: () => delivered,
 		arrive: (n = 1) => {
 			count += n;
 			for (const waiter of [...waiters]) {
 				if (count > waiter.since) waiter.finish(true);
 			}
+		},
+		deliver: (n = 1) => {
+			delivered += n;
 		},
 	};
 }
@@ -161,13 +174,12 @@ describe("rlm.collect message wake", () => {
 		expect(reply).toMatchObject({ results: [], timeout_ms: 30_000, messages_pending: 1 });
 	});
 
-	it("waits the full bound for arrivals admitted before the collect started", async () => {
-		// The false-report fix: arrivals admitted before this collect started are either
-		// already delivered into the conversation (the common between-turns case) or
-		// already reported by an earlier answer. Answering instantly with
-		// messages_pending sent the model to end a turn for a message it already had -
-		// a wasted round-trip per stale arrival.
-		const wake = createWakeSource(2);
+	it("waits the full bound for arrivals admitted before the collect started and delivered since", async () => {
+		// The false-report fix: arrivals admitted before this collect started and
+		// delivered into the conversation since (the common between-turns case) are
+		// not news. Answering instantly with messages_pending sent the model to end a
+		// turn for a message it already had - a wasted round-trip per stale arrival.
+		const wake = createWakeSource(2, 2);
 		const { handler, calls } = createParkingCollect();
 		const collect = createRlmCollectHostHandler(handler, { messageWake: wake.source });
 
@@ -177,11 +189,29 @@ describe("rlm.collect message wake", () => {
 		expect(calls).toEqual([{ timeoutMs: 200, releasedBy: "timeout" }]);
 	});
 
-	it("reports only arrivals newer than the collect's own start", async () => {
-		// One arrival predates the collect (it is the baseline, not news) and one lands
-		// mid-wait: the answer must carry the delta from this collect's start, never the
-		// session's whole backlog, and the wait must actually park until the new arrival.
-		const wake = createWakeSource(1);
+	it("answers early for a same-turn arrival that has not been delivered yet", async () => {
+		// The delivered baseline: an arrival admitted earlier in this same turn is
+		// still undelivered (delivery happens at the turn boundary), so it IS news.
+		// The arrival-count baseline parked the wait until its timeout, and the
+		// parent never learned a reply was sitting in its queue.
+		const wake = createWakeSource(1, 0);
+		const { handler, calls } = createParkingCollect();
+		const collect = createRlmCollectHostHandler(handler, { messageWake: wake.source });
+
+		const reply = await collect({ timeout_ms: 30_000, wake_on_message: true });
+
+		// releasedBy "abort" is the crisp signal: the undelivered arrival cut the
+		// settlement wait short instead of timing the full bound out.
+		expect(calls).toEqual([{ timeoutMs: 30_000, releasedBy: "abort" }]);
+		expect(reply).toMatchObject({ messages_pending: 1 });
+	});
+
+	it("reports only undelivered arrivals, however they ordered around the collect's start", async () => {
+		// One arrival predates the collect but is already delivered (it is the
+		// baseline, not news) and one lands mid-wait: the answer must carry the
+		// undelivered delta, never the session's whole backlog, and the wait must
+		// actually park until the new arrival.
+		const wake = createWakeSource(1, 1);
 		const { handler, calls } = createParkingCollect();
 		const collect = createRlmCollectHostHandler(handler, { messageWake: wake.source });
 
@@ -200,7 +230,8 @@ describe("rlm.collect message wake", () => {
 	it("does not answer early twice for the same arrival", async () => {
 		// The gate: a re-armed long wait must run its bound when nothing newer than its
 		// own start arrived - otherwise the model's natural "collect again" loops
-		// as an instant-answer spin.
+		// as an instant-answer spin. The first answer told the model to end its turn;
+		// ending the turn delivers the arrival, which is what re-arms the gate.
 		const wake = createWakeSource();
 		const { handler, calls } = createParkingCollect();
 		const collect = createRlmCollectHostHandler(handler, { messageWake: wake.source });
@@ -209,6 +240,8 @@ describe("rlm.collect message wake", () => {
 		await sleep(20);
 		wake.arrive(1);
 		await first;
+		// The turn boundary the note asked for: the arrival entered the conversation.
+		wake.deliver(1);
 
 		const second = await collect({ timeout_ms: 200, wake_on_message: true });
 		expect(second).not.toHaveProperty("messages_pending");
@@ -221,6 +254,25 @@ describe("rlm.collect message wake", () => {
 		const thirdReply = await third;
 		expect(thirdReply).toMatchObject({ messages_pending: 2 });
 		expect(calls[2]).toEqual({ timeoutMs: 30_000, releasedBy: "abort" });
+	});
+
+	it("wakes a same-turn re-arm again while the arrival stays undelivered", async () => {
+		// The other half of the gate: a model that re-arms a collect without ending
+		// its turn has NOT received the arrival yet, so the wait must keep reporting
+		// it - the reminder is the only thing pushing the model toward the boundary
+		// where the message lands.
+		const wake = createWakeSource();
+		const { handler, calls } = createParkingCollect();
+		const collect = createRlmCollectHostHandler(handler, { messageWake: wake.source });
+
+		const first = collect({ timeout_ms: 30_000, wake_on_message: true });
+		await sleep(20);
+		wake.arrive(1);
+		await first;
+
+		const second = await collect({ timeout_ms: 30_000, wake_on_message: true });
+		expect(second).toMatchObject({ messages_pending: 1 });
+		expect(calls[1]).toEqual({ timeoutMs: 30_000, releasedBy: "abort" });
 	});
 
 	it("ends the wait on a cell abort without reporting a wake", async () => {

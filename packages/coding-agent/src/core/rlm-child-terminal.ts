@@ -87,6 +87,24 @@ export type RlmChildTerminalOutcome =
 	| { kind: RlmChildFailureKind; channel: "failure"; reason: string };
 
 const DEFAULT_ABORTED_REASON = "turn aborted before completion";
+
+/**
+ * The transcript record for a run that settled with its reply delivered
+ * (classification `none`): the parent already has the answer, so nothing is
+ * delivered - but the compaction handoff scanner resolves a listed child only on
+ * a terminal record later in the branch, and without one a replied child was
+ * listed as in flight by every compaction forever. Written as a `custom` entry
+ * (never a message): it never enters the model's context, never renders, and
+ * only the handoff scanner reads it.
+ */
+export const RLM_CHILD_SETTLED_CUSTOM_TYPE = "rlm_child_settled";
+
+export interface RlmChildSettledDetails {
+	childId: string;
+	sessionName: string;
+	/** How the run settled quietly; today always "replied". */
+	settledAs: "replied";
+}
 /**
  * The no-facts form of an automatic stall-recovery interrupt: the parent saw no
  * watchdog kill facts, only the abort reason. "auto-recovered" is the load-
@@ -170,7 +188,10 @@ function legacyTwoStateOutcome(facts: RlmChildTerminalFacts): RlmChildTerminalOu
  *    child was kept alive to retry.
  * 3. `aborted` - a user Esc or an aborted stop reason.
  * 4. `error` - provider/model failure.
- * 5. replied => nothing to synthesize.
+ * 5. replied => nothing to synthesize. The terminal path still writes the
+ *    transcript-only settle record ({@link RLM_CHILD_SETTLED_CUSTOM_TYPE}): the
+ *    compaction handoff delists a child on a terminal record, and a replied run
+ *    must leave one even though the parent needs no notice.
  * 6. otherwise the legacy `completed_without_reply` notice.
  *
  * F7: an abort that never settled is not a kill once the run recovered and

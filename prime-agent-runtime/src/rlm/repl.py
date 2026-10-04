@@ -88,6 +88,10 @@ CAPABILITY_PRESERVE_NAMES = "preserve_names"
 MESSAGE_NOTIFY_MIN_PROTOCOL = 5
 CAPABILITY_MESSAGE_NOTIFY = "message_notify"
 NOTIFY_KIND_AGENT_MESSAGE = "agent_message"
+# Same frame, delivery half: the host reports how many admitted messages are still
+# undelivered, and the kernel clamps its pending ledger down to it (送达时清账本).
+# An old runtime ignores the kind (see _handle_notify), a new one never errors.
+NOTIFY_KIND_AGENT_MESSAGE_DELIVERED = "agent_message_delivered"
 
 
 def kernel_capabilities() -> list[str]:
@@ -154,6 +158,8 @@ _host_closed = False
 # Message-wake ledger (protocol 5): agent-message arrivals the host pushed through `notify`
 # requests, not yet consumed by a cell through wait_message_wake. Loop-thread only state:
 # writes arrive via call_soon_threadsafe, reads come from cell code running on the loop.
+# An `agent_message_delivered` notify clamps the ledger down to the host's undelivered
+# count: a delivered message is no longer pending, so a peek never reports it again.
 _messages_pending = 0
 _message_waiters: set["asyncio.Future[None]"] = set()
 
@@ -428,6 +434,20 @@ def note_message_wake(count: int = 1) -> None:
     for waiter in list(_message_waiters):
         if not waiter.done():
             waiter.set_result(None)
+
+
+def note_message_delivered(pending: int) -> None:
+    """Clamp the pending ledger down to the host's undelivered count. Loop thread only.
+
+    The host pushes this when an admitted message enters the conversation: what was
+    delivered is no longer pending, and a peek must not report it again. The clamp
+    never raises the ledger - a wait may already have consumed news the host has not
+    delivered yet, and resurrecting it would report the same arrival twice. No waiter
+    is woken: a delivery is not an arrival, and there is nothing new to receive.
+    """
+    global _messages_pending
+    if pending < _messages_pending:
+        _messages_pending = pending
 
 
 def _expire_message_wait(waiter: "asyncio.Future[None]") -> None:
@@ -2011,21 +2031,29 @@ def _handle_notify(req: dict[str, Any]) -> None:
     """Reader-thread entry for a message-wake push (protocol 5 `message_notify`).
 
     Like `host_reply` this never touches the request queue: the cell it must wake IS the
-    in-flight execute. The frame carries a kind, never message content - the message enters
-    the parent's conversation as an ordinary queued prompt at the next turn boundary, so all
-    the kernel records is the arrival. A conforming host gates the frame on the announced
-    capability; one that arrives anyway is still honored (a recorded wake is harmless), and
-    kinds this runtime does not wait on are ignored so a newer host degrades instead of
-    erroring.
+    in-flight execute. The arrival frame carries a kind, never message content - the
+    message enters the parent's conversation as an ordinary queued prompt at the next
+    turn boundary, so all the kernel records is the arrival; the delivered frame carries
+    the host's undelivered count, and the ledger clamps down to it. A conforming host
+    gates the frame on the announced capability; one that arrives anyway is still
+    honored (a recorded wake is harmless), and kinds this runtime does not wait on are
+    ignored so a newer host degrades instead of erroring.
     """
     assert _loop is not None
     kind = req.get("kind")
     if not isinstance(kind, str) or not kind:
         _protocol_error("notify request needs a non-empty string kind")
         return
-    if kind != NOTIFY_KIND_AGENT_MESSAGE:
+    if kind == NOTIFY_KIND_AGENT_MESSAGE:
+        _loop.call_soon_threadsafe(note_message_wake)
         return
-    _loop.call_soon_threadsafe(note_message_wake)
+    if kind == NOTIFY_KIND_AGENT_MESSAGE_DELIVERED:
+        # The host's undelivered count rides along; a frame without a valid count is
+        # ignored rather than faking a clear.
+        pending = req.get("pending")
+        if isinstance(pending, int) and not isinstance(pending, bool) and pending >= 0:
+            _loop.call_soon_threadsafe(note_message_delivered, pending)
+        return
 
 
 def _handle_request_line(raw: bytes, queue: asyncio.Queue[dict[str, Any]]) -> None:

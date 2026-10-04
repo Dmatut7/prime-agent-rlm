@@ -208,6 +208,78 @@ class WaitMessagesTest(unittest.TestCase):
         self.assertFalse([e for e in events if e.get("ename") == "ProtocolError"])
 
 
+class DeliveredNotifyTest(unittest.TestCase):
+    """送达时清账本: a message delivered into the conversation must leave the ledger.
+
+    Without the clear, an arrival the model already received (it ended its turn and
+    the message entered the conversation) stayed pending forever: `messages_pending()`
+    kept reporting it and the next `wait_messages` drained a stale count. The host
+    pushes `agent_message_delivered` with the count still undelivered; the kernel
+    clamps the ledger down to it (never up - a wait may already have consumed news
+    the host has not delivered yet).
+    """
+
+    def setUp(self):
+        self.proc = spawn("5")
+        self.addCleanup(self.proc.close)
+        ready, _ = self.proc.ready()
+        self.assertEqual(ready["protocol"], 5)
+
+    def test_delivered_notify_clears_pending(self):
+        self.proc.send({"type": "notify", "kind": "agent_message"})
+        self.proc.send({"type": "notify", "kind": "agent_message"})
+        self.proc.send({"type": "notify", "kind": "agent_message_delivered", "pending": 0})
+        events = self.proc.execute("x1", "import rlm\nprint(f'PENDING {rlm.messages_pending()}')")
+        self.assertEqual(one(events, "done")["status"], "ok")
+        self.assertIn("PENDING 0", stream_text(events, "stdout"))
+
+    def test_delivered_notify_clamps_down_but_never_up(self):
+        # Two arrivals, one delivered: the ledger keeps the one still undelivered,
+        # and a wait drains exactly that one.
+        self.proc.send({"type": "notify", "kind": "agent_message"})
+        self.proc.send({"type": "notify", "kind": "agent_message"})
+        self.proc.send({"type": "notify", "kind": "agent_message_delivered", "pending": 1})
+        events = self.proc.execute("x2", "import rlm\nprint(f'PENDING {rlm.messages_pending()}')")
+        self.assertIn("PENDING 1", stream_text(events, "stdout"))
+        events = self.proc.execute("x3", "import rlm\nn = await rlm.wait_messages(timeout_ms=0)\nprint(f'DRAIN {n}')")
+        self.assertIn("DRAIN 1", stream_text(events, "stdout"))
+        # A drained ledger is below the host's undelivered count: a delivered frame
+        # reporting more must not resurrect what a wait already consumed.
+        self.proc.send({"type": "notify", "kind": "agent_message"})
+        events = self.proc.execute("x4", "import rlm\nn = await rlm.wait_messages(timeout_ms=0)\nprint(f'DRAIN {n}')")
+        self.assertIn("DRAIN 1", stream_text(events, "stdout"))
+        self.proc.send({"type": "notify", "kind": "agent_message_delivered", "pending": 3})
+        events = self.proc.execute("x5", "import rlm\nprint(f'PENDING {rlm.messages_pending()}')")
+        self.assertIn("PENDING 0", stream_text(events, "stdout"))
+
+    def test_delivered_notify_never_wakes_a_parked_wait(self):
+        # A delivery is not news for a parked wait: the message entered the
+        # conversation, so there is nothing to receive - the wait runs its bound.
+        code = "\n".join(
+            [
+                "import rlm",
+                "print('WAITING')",
+                "n = await rlm.wait_messages(timeout_ms=400)",
+                "print(f'DONE {n}')",
+            ]
+        )
+        self.proc.send({"type": "execute", "id": "d1", "code": code})
+        read_until(self.proc, lambda e: e.get("event") == "stdout" and "WAITING" in e.get("text", ""))
+        self.proc.send({"type": "notify", "kind": "agent_message_delivered", "pending": 0})
+        events = self.proc.until_done("d1")
+        self.assertEqual(one(events, "done")["status"], "ok")
+        self.assertIn("DONE 0", stream_text(events, "stdout"))
+
+    def test_delivered_notify_without_a_count_is_ignored(self):
+        # A malformed delivered frame must not fake a clear: the ledger keeps its count.
+        self.proc.send({"type": "notify", "kind": "agent_message"})
+        self.proc.send({"type": "notify", "kind": "agent_message_delivered"})
+        self.proc.send({"type": "notify", "kind": "agent_message_delivered", "pending": "none"})
+        events = self.proc.execute("x6", "import rlm\nprint(f'PENDING {rlm.messages_pending()}')")
+        self.assertEqual(one(events, "done")["status"], "ok")
+        self.assertIn("PENDING 1", stream_text(events, "stdout"))
+
+
 class CollectMessageWakeTest(unittest.TestCase):
     """rlm.collect asks for the early wake and surfaces a messages_pending reply."""
 

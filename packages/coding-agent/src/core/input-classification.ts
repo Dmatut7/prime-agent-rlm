@@ -71,6 +71,7 @@ import {
 	THINKING_LEVEL_CLAMPED_CUSTOM_TYPE,
 } from "./messages.js";
 import { REFINEMENT_CUSTOM_TYPE } from "./refinement/refinement.js";
+import { RLM_CHILD_SETTLED_CUSTOM_TYPE } from "./rlm-child-terminal.js";
 
 export const INPUT_CLASSES = [
 	"human_interactive",
@@ -148,6 +149,9 @@ const CUSTOM_TYPE_INPUT_CLASSES: ReadonlyMap<string, InputClass> = new Map<strin
 	[AGENT_MESSAGE_CUSTOM_TYPE, "agent_peer_or_parent"],
 	// Agent lifecycle notices aimed at this session's parent role.
 	[RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE, "agent_notice"],
+	// Transcript-only settle record for a replied child run: never an input, never
+	// rendered, only the compaction handoff scanner reads it.
+	[RLM_CHILD_SETTLED_CUSTOM_TYPE, "internal_continuation"],
 	[RLM_CHILD_FAILURE_CUSTOM_TYPE, "agent_notice"],
 	[RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE, "agent_notice"],
 	// r4 recovery-shell: the daemon's action receipt for a child's parent.
