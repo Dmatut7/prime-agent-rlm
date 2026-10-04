@@ -12,9 +12,11 @@ import { join } from "node:path";
 import { type Context, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { GOAL_STATE_CUSTOM_TYPE } from "../../../src/core/goals.js";
+import type { CustomMessageEntry } from "../../../src/core/session-manager.js";
 import {
 	buildResumeBriefing,
 	maybeInjectResumeBriefing,
+	queuedInputsReplayOfVerdict,
 	RESUME_BRIEFING_CUSTOM_TYPE,
 } from "../../../src/modes/daemon/resume-briefing.js";
 import { createHarness, type Harness } from "../harness.js";
@@ -113,14 +115,85 @@ describe("W14-B resume briefing builder", () => {
 		const briefing = buildResumeBriefing({
 			queuedCount: 0,
 			interruptedOperations: ["turn_end"],
-			queuedInputs: ["把剩下的测试修完", "顺手看下 lint"],
+			queuedInputs: { texts: ["把剩下的测试修完", "顺手看下 lint"], replay: { kind: "replayed" } },
 			orgDocs: [],
 			now: 1_000_000,
 		});
 		expect(briefing).toBeDefined();
 		expect(briefing).toContain("把剩下的测试修完");
 		expect(briefing).toContain("顺手看下 lint");
-		expect(briefing).toContain("replayed");
+		expect(briefing).toContain("replayed into the queue");
+	});
+
+	it("says the recovered queued inputs were not replayed when the automatic resume is skipped as stale", () => {
+		// The stale guard skips the whole automatic resume, so the recovered texts
+		// stay in the marker; the briefing listing them must not read as a replay.
+		const briefing = buildResumeBriefing({
+			queuedCount: 0,
+			interruptedOperations: ["turn_end"],
+			queuedInputs: { texts: ["把剩下的测试修完"], replay: { kind: "skipped", reason: "stale" } },
+			orgDocs: [],
+			now: 1_000_000,
+		});
+		expect(briefing).toBeDefined();
+		expect(briefing).toContain("把剩下的测试修完");
+		expect(briefing).toContain("but were not replayed");
+		expect(briefing).toContain("too old");
+		expect(briefing).not.toContain("replayed into the queue");
+	});
+
+	it("says the recovered queued inputs were not replayed when the crash-loop guard skips the resume", () => {
+		const briefing = buildResumeBriefing({
+			queuedCount: 0,
+			interruptedOperations: ["turn_end"],
+			queuedInputs: { texts: ["把剩下的测试修完"], replay: { kind: "skipped", reason: "resume-loop" } },
+			orgDocs: [],
+			now: 1_000_000,
+		});
+		expect(briefing).toBeDefined();
+		expect(briefing).toContain("把剩下的测试修完");
+		expect(briefing).toContain("but were not replayed");
+		expect(briefing).toContain("crash-resume");
+		expect(briefing).not.toContain("replayed into the queue");
+	});
+
+	it("says the recovered queued inputs were not replayed on the /resume replacement path", () => {
+		// refreshReplacedSessionState injects the briefing without going through
+		// resumeWorkerInterruptedSession, so nothing replays the marker's texts.
+		const briefing = buildResumeBriefing({
+			queuedCount: 0,
+			interruptedOperations: ["turn_end"],
+			queuedInputs: { texts: ["把剩下的测试修完"], replay: { kind: "not-replayed" } },
+			orgDocs: [],
+			now: 1_000_000,
+		});
+		expect(briefing).toBeDefined();
+		expect(briefing).toContain("把剩下的测试修完");
+		expect(briefing).toContain("but were not replayed");
+		expect(briefing).toContain("replaced in place");
+		expect(briefing).not.toContain("replayed into the queue");
+	});
+
+	it("maps the resume verdict to the briefing's replay claim", () => {
+		expect(queuedInputsReplayOfVerdict({ kind: "skip", reason: "no-marker" })).toEqual({ kind: "not-replayed" });
+		expect(queuedInputsReplayOfVerdict({ kind: "skip", reason: "stale" })).toEqual({
+			kind: "skipped",
+			reason: "stale",
+		});
+		expect(queuedInputsReplayOfVerdict({ kind: "skip", reason: "resume-loop" })).toEqual({
+			kind: "skipped",
+			reason: "resume-loop",
+		});
+		const marker: CustomMessageEntry = {
+			id: "m1",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			type: "custom_message",
+			customType: "prime-agent.worker_recovery",
+			content: "<prime_agent_worker_interrupted>…</prime_agent_worker_interrupted>",
+			display: false,
+		};
+		expect(queuedInputsReplayOfVerdict({ kind: "resume", marker, queuedInputs: [] })).toEqual({ kind: "replayed" });
 	});
 
 	it("carries the duty-log tail: last doing, unfinished, pending decisions", () => {
@@ -273,7 +346,9 @@ describe("W14-B resume briefing injection on the recovery path", () => {
 
 		const resumed = await createHarness({ existingSessionFile: sessionFile! });
 		harnesses.push(resumed);
-		const injected = await maybeInjectResumeBriefing(resumed.session);
+		const injected = await maybeInjectResumeBriefing(resumed.session, {
+			queuedInputsReplay: { kind: "replayed" },
+		});
 		expect(injected).toBe(true);
 
 		const briefing = resumed.session
@@ -281,7 +356,41 @@ describe("W14-B resume briefing injection on the recovery path", () => {
 			.find((message) => message.customType === RESUME_BRIEFING_CUSTOM_TYPE);
 		const text = typeof briefing?.content === "string" ? briefing.content : "";
 		expect(text).toContain("把剩下的测试修完");
+		expect(text).toContain("replayed into the queue");
 		expect(text).not.toContain("0 queued input");
+	});
+
+	it("does not claim a replay when the caller reports the resume was skipped", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("做到了一半")]);
+		await harness.session.prompt("把设置面板更新一下");
+		harness.sessionManager.appendCustomMessageEntry(
+			"prime-agent.worker_recovery",
+			"<prime_agent_worker_interrupted>…</prime_agent_worker_interrupted>",
+			false,
+			{ activeSessionId: "dead", operations: ["turn_end"], queuedInputs: ["把剩下的测试修完"] },
+		);
+		const sessionFile = harness.sessionManager.getSessionFile();
+		expect(sessionFile).toBeDefined();
+		harness.session.dispose();
+
+		const resumed = await createHarness({ existingSessionFile: sessionFile! });
+		harnesses.push(resumed);
+		const injected = await maybeInjectResumeBriefing(resumed.session, {
+			queuedInputsReplay: { kind: "skipped", reason: "resume-loop" },
+		});
+		expect(injected).toBe(true);
+
+		const briefing = resumed.session
+			.getPendingNextTurnMessageSnapshots()
+			.find((message) => message.customType === RESUME_BRIEFING_CUSTOM_TYPE);
+		const text = typeof briefing?.content === "string" ? briefing.content : "";
+		// The texts still surface (they are the user's lost work), but the wording
+		// must follow the actual outcome: skipped resume, no replay.
+		expect(text).toContain("把剩下的测试修完");
+		expect(text).toContain("but were not replayed");
+		expect(text).not.toContain("replayed into the queue");
 	});
 
 	it("does not inject into a fresh session with no prior work", async () => {

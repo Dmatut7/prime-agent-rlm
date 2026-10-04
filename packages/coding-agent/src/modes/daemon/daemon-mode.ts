@@ -282,7 +282,7 @@ import {
 } from "./daemon-worker-protocol.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import { type QuotaParkStatus, quotaParkWireFacts, readQuotaParkStatus } from "./quota-park-status.js";
-import { maybeInjectResumeBriefing } from "./resume-briefing.js";
+import { maybeInjectResumeBriefing, queuedInputsReplayOfVerdict } from "./resume-briefing.js";
 import {
 	createRlmLedgerRegistrySeedSource,
 	type LegacyRlmSubagentRegistryEntry,
@@ -319,7 +319,11 @@ import {
 import { SupervisorLink } from "./supervisor-link.js";
 import { writeUpdateRestartManifestFile } from "./update-restart-manifest.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
-import { WORKER_RECOVERY_RESUME_PROMPT, workerRecoveryResumeVerdict } from "./worker-recovery-resume.js";
+import {
+	WORKER_RECOVERY_RESUME_PROMPT,
+	type WorkerRecoveryResumeVerdict,
+	workerRecoveryResumeVerdict,
+} from "./worker-recovery-resume.js";
 
 /**
  * Re-entry ceiling for one subagent hydration (M19). Unrelated to `RLM_MAX_DEPTH` on purpose:
@@ -2338,13 +2342,25 @@ export class AgentDaemon {
 		// W14-B (C5): a freshly bound persisted session gets its in-flight state back
 		// (active goal, queued inputs, interrupted operations, duty-log tail, org-memory
 		// doc index) as next-turn context. Awaited so the briefing is already pending
-		// when the worker-recovery resume below queues its turn-starting prompt.
+		// when the worker-recovery resume below queues its turn-starting prompt. The
+		// briefing's replay claim comes from the same verdict the resume below acts
+		// on, so a skipped resume never reads as "replayed".
+		let recoveryVerdict: WorkerRecoveryResumeVerdict | undefined;
 		if (runtime.metadata.kind !== "subagent") {
-			await maybeInjectResumeBriefing(state.runtime.session).catch((error) =>
+			try {
+				recoveryVerdict = workerRecoveryResumeVerdict(state.runtime.session.sessionManager.getBranch());
+			} catch {
+				recoveryVerdict = undefined;
+			}
+			await maybeInjectResumeBriefing(state.runtime.session, {
+				queuedInputsReplay: recoveryVerdict
+					? queuedInputsReplayOfVerdict(recoveryVerdict)
+					: { kind: "not-replayed" },
+			}).catch((error) =>
 				this.log(`could not inject resume briefing for ${state.activeSessionId}: ${String(error)}`),
 			);
 		}
-		this.resumeWorkerInterruptedSession(state);
+		this.resumeWorkerInterruptedSession(state, recoveryVerdict);
 		this.registerCronStoreForState(state);
 		this.rebindCronJobsToState(state);
 		if (runtime.metadata.kind !== "subagent") {
@@ -2381,9 +2397,12 @@ export class AgentDaemon {
 		// W14-B (C5): /resume, /new-then-resume and fork replace the session under a
 		// live runtime without going through addRuntime - the same in-flight briefing
 		// the bind path injects. A message-less replacement (plain /new) is skipped
-		// by the builder before any filesystem read.
+		// by the builder before any filesystem read. This path never replays the
+		// marker's recovered queued inputs, so the briefing must not claim it did.
 		if (state.runtime.metadata.kind !== "subagent") {
-			void maybeInjectResumeBriefing(state.runtime.session).catch((error) =>
+			void maybeInjectResumeBriefing(state.runtime.session, {
+				queuedInputsReplay: { kind: "not-replayed" },
+			}).catch((error) =>
 				this.log(`could not inject resume briefing for ${state.activeSessionId}: ${String(error)}`),
 			);
 		}
@@ -8752,12 +8771,22 @@ export class AgentDaemon {
 	 * prompt; the prompt lands as a user message, which consumes the marker, so
 	 * this fires once per worker death. See worker-recovery-resume.ts.
 	 */
-	private resumeWorkerInterruptedSession(state: ActiveSessionState): void {
+	private resumeWorkerInterruptedSession(
+		state: ActiveSessionState,
+		precomputedVerdict?: WorkerRecoveryResumeVerdict,
+	): void {
 		let verdict: ReturnType<typeof workerRecoveryResumeVerdict>;
-		try {
-			verdict = workerRecoveryResumeVerdict(state.runtime.session.sessionManager.getBranch());
-		} catch {
-			return;
+		if (precomputedVerdict !== undefined) {
+			// The bind path already computed the verdict for the resume briefing;
+			// acting on the same value keeps the briefing's replay claim and this
+			// replay from diverging.
+			verdict = precomputedVerdict;
+		} else {
+			try {
+				verdict = workerRecoveryResumeVerdict(state.runtime.session.sessionManager.getBranch());
+			} catch {
+				return;
+			}
 		}
 		if (verdict.kind === "skip") {
 			if (verdict.reason !== "no-marker") {
