@@ -14,19 +14,18 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-04 深夜，wave-40 已 SHIP + 0.11.19 已发版）
+## 当前状态（2026-10-04 深夜，wave-41 已 SHIP）
 
-- HEAD = 见 git log。0.11.19 已发（手写中文更新日志进根 CHANGELOG，146 fragment 收编；
-  无 v 标无 npm publish，fork 闸门原样）。
-- wave-40：外部审查（12 审查员/83 条钉在 09eae8d55）超大集群 16 路处置——11 必修全修
-  （先红后绿），应修主体落地；第 0 条（fd1dd4e4c 提交说明含账号信息）预防半已机制化
-  （pre-push 敏感扫描，全历史回扫零误报），本体（是否改写历史+强推）**等老板拍板**。
-- 流程改进已写进 AGENTS.md：commit 一律 -F、刹车必带恢复、协议改动列全消费路径、
-  inline import 有据例外只限入口性能路径、测试不得替换被测段。
-- 主席自伤两起已记录：FORK_NOTES 插节吃标题（复原 11 节 + 修法入账）；
-   compaction.ts 空摘要闸初版抢了本地中止的「Compaction cancelled」语义（已按
-  signal.aborted 分开两条路）。
-- 门禁：check EXIT 0、hygiene OK、unit/suite/tui/python/ai/agent 全量绿（负载抖动隔离即绿）。
+- HEAD = 见 git log（五批：daemon 小批、S2、S3、第九刀、FORK_NOTES+账本）。
+- wave-41：审查「小问题」主体落地 + 第九刀（agent-session.ts 19738→19756 行口径内，
+  image-routing 出）；走查实机验证 wave-40 四件全过。
+- TAIL 汇总在手（/tmp/wave41/tail-ledger.md）：4 条账本滞后已销账；新立项里
+  「set_model 第二客户端可见性」与「/autocompact per-model 落地」是两波连续漏认领的
+  真立项，wave-42 必须认领或正式降级。
+- 调研：CC 2.1.289（沙箱权限修复族）；方法论四件进 wave-42（P0/P1/P2 分级、评审线程门、
+  walkthrough 矩阵、Code Review Rules 节）。
+- 门禁：check EXIT 0、hygiene OK、单测 9743（1 例已知负载抖动隔离即绿）、suite 1715/1715、
+  ai 792。python/tui 本波无改动未重跑。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -65,9 +64,9 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
    （现仅 loop 级可配）。
 5. ~~画像基建~~ 销账（wave-11：profile:tui 修复 + bench 重写）。残余：kernel venv 硬编码 ~/.prime
    参数化（bootstrap.ts:585）、worker socket 不认 --daemon-socket。
-6. 【UX 插队候选·部分销账】wave-12 已修：Esc stash、徽标诚实、截断统一、CLI 换行。残余：
-   双击 Esc 落点=编辑重发最近用户消息（/tree 选择器默认高亮+Enter fork）；watermark 可选花费段
-   （默认关）；claude-code 菜单内登录流仍是通用 API-key 对话框（应外链 `claude auth login`）；
+6. 【UX 插队候选·部分销账】wave-12 已修：Esc stash、徽标诚实、截断统一、CLI 换行。残余销账
+   （wave-41 TAIL 实证：双击 Esc 改稿 wave-19 已落地、footer 花费段 wave-19 已落地）；
+   仍余：claude-code 菜单内登录流仍是通用 API-key 对话框（应外链 `claude auth login`）；
    CLAUDE_CODE_OAUTH_TOKEN 单设时 daemon 侧不认（packages/ai env-api-keys）。
 7. 【终端】kitty 键盘模式栈疑似活 bug（terminal.ts:266 主屏 push 一次，enterAltScreen 不重推）先真机
    复核；探测总线改 DA 栅栏+分版本 DECRQM（消盲发 2026/双定时器/粘贴内应答，是 2027/2031/图片占位前置）。
@@ -107,15 +106,14 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
   把在跑会话归档。犯了就是事故，写进 FORK_NOTES 向老板披露。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-41 候选）
+## 下一波主题（wave-42 候选）
 
-1. 【第 0 条决策】fd1dd4e4c 改写历史（git filter-repo 改说明+force push，150+ 提交编号变）
-   vs 接受现状+扫描器已防复发——等老板一句话。
-2. 【审查「小问题」35 条顺手批】按文件域打包 2-3 路（清单在 wave-40 审查报告）。
-3. 【审查遗留 lane 移交项】汇总各 lane 报告的遗留节（recovery 生产侧三文件契约、
-   settings.md 文档同步、breaker 旋钮 settings 键、refine TS 侧小库频段、agents-view
-   prev/next repeatable 等）。
-4. 【审查流程改进落地】每天一次按流程整体审查（用不同模型）排进循环节奏；
-   test-hygiene 识别非下划线私有访问。
-5. 【第九刀候选】image-routing（358 行/20 成员）。
-6. 【记忆帽裁决】仍待老板。
+1. 【set_model 可见性】非交互来源切换发 display:true 通知 + ledger 记 origin（连续两波
+   漏认领，本波必做或降级）。
+2. 【/autocompact per-model 落地】按 wave-39 裁决（compaction.perModel 表 + 零迁移 +
+   RPC 快照报 effective 值）。
+3. 【流程改进落地】审查输出 P0/P1/P2 分级进主席派发；AGENTS.md 开「Code Review Rules」
+   节（首批：测试替换被测段、env 泄漏、fan-out 漏消费路径）；walkthrough 矩阵 v1。
+4. 【首请求服务端窗口】≤1.5s 有界等待（per-model 最后一块，已顺延多波）。
+5. 【第十刀候选】harness-digest 叶子（324 行/22 成员）。
+6. 【记忆帽裁决】仍待老板三选一；第 0 条历史改写也还等老板。
