@@ -486,6 +486,34 @@ describe("decodePrintableKey", () => {
 	});
 });
 
+describe("Kitty protocol byte-level regressions", () => {
+	// Byte-level repros from Claude Code #92021: after enabling kitty flag 4
+	// (alternate keys), CC's parser read the shifted-key subfield but never used
+	// it (Shift+1 inserted "1" instead of "!"), and dropped sequences whose
+	// modifier carried an event-type subfield. We push >7u, so both subfields
+	// reach our parser.
+	// https://claudeissues.com/issue/92021-bug-shifted-keys-lost-in-wezterm-since-2-1-247-kitty-report-alternate-keys-flag
+	it("inserts the shifted key for shifted symbol keys (shiftedKey, not toUpperCase of unshifted)", () => {
+		assert.strictEqual(decodeKittyPrintable("\x1b[49:33;2u"), "!"); // shift+1
+		assert.strictEqual(decodeKittyPrintable("\x1b[59:58;2u"), ":"); // shift+;
+	});
+
+	it("does not drop sequences whose modifier carries an event-type subfield", () => {
+		assert.strictEqual(decodeKittyPrintable("\x1b[97:65;2:1u"), "A"); // shift+a, event=press
+		setKittyProtocolActive(true);
+		assert.strictEqual(parseKey("\x1b[97:65;2:1u"), "shift+a");
+		setKittyProtocolActive(false);
+	});
+
+	// Ghostty can send release events carrying a text-as-codepoints payload on
+	// latched-modifier layouts; the release must not produce text insertion.
+	// https://github.com/ghostty-org/ghostty/discussions/12192
+	it("does not insert text from release events carrying text codepoints", () => {
+		assert.strictEqual(decodePrintableKey("\x1b[97;2:3;97u"), undefined);
+		assert.strictEqual(decodeKittyPrintable("\x1b[97;2:3;97u"), undefined);
+	});
+});
+
 describe("parseKey", () => {
 	describe("Kitty protocol with alternate keys", () => {
 		it("should return Latin key name when base layout key is present", () => {

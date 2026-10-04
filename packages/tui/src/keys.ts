@@ -10,6 +10,17 @@
  * See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/#legacy-ctrl-mapping-of-ascii-keys
  * Those can still be * used for ctrl+shift combos
  *
+ * Terminal deviations from the spec observed in the wild:
+ * - WezTerm never reports repeat events (a held key arrives as N presses):
+ *   https://github.com/wezterm/wezterm/issues/5139 and
+ *   https://github.com/wezterm/wezterm/issues/7145 (both open).
+ * - Ghostty can send release events carrying a text payload (duplicated text
+ *   on latched-modifier layouts):
+ *   https://github.com/ghostty-org/ghostty/discussions/12192
+ * Repeat/release event types are therefore an optimization hint, never a
+ * protocol guarantee: behavior must stay correct when every event arrives as
+ * a press, and release events must never produce text.
+ *
  * API:
  * - matchesKey(data, keyId) - Check if input matches a key identifier
  * - parseKey(data) - Parse input and return the key identifier
