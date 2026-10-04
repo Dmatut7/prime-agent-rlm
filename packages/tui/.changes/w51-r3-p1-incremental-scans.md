@@ -1,0 +1,1 @@
+- Faster streaming markdown on long single blocks: the seal-path validation scans (backtick parity, seal integrity, last-sealable offset, inline splice) are incremental now — an 80k-char single paragraph renders the full stream in 0.23s instead of 0.44s, and 100k in 0.44s instead of 0.75s, with byte-identical output.

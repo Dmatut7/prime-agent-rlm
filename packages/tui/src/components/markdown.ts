@@ -202,6 +202,30 @@ interface FinalBlockSeal {
 	wrapPrevW?: string;
 	/** Latched when the growing line's rendered string contains ANSI codes. */
 	wrapIneligible?: boolean;
+	/**
+	 * Paragraph seals only: incremental state for the per-frame validation
+	 * scans. parity is the backtick parity of the sealed prefix text
+	 * [0, tailFrom) (startsWith-verified each frame). The scan* fields fold
+	 * lastSealableParagraphOffset results covering offsets <= scanFrom, and the
+	 * boundary* fields record the token covering the seal boundary so
+	 * paragraphSealIntact is O(1). Both are trusted only while the split-lex
+	 * epoch matches, which guarantees the covered region's bytes and token
+	 * identities are unchanged.
+	 */
+	parity?: number;
+	scanEpoch?: number;
+	scanFrom?: number;
+	scanBest?: number;
+	scanBestIndex?: number;
+	scanBestStart?: number;
+	scanBestEnd?: number;
+	scanBestToken?: Token;
+	boundaryEpoch?: number;
+	boundaryTailFrom?: number;
+	boundaryIndex?: number;
+	boundaryStart?: number;
+	boundaryEnd?: number;
+	boundaryToken?: Token;
 }
 
 /**
@@ -327,6 +351,33 @@ interface SplitLex {
 	prefixTokens: Token[];
 	/** normalizedText.slice(0, cut), for the per-frame append check. */
 	prefix: string;
+	/** Bootstrap generation; a re-bootstrap bumps it, dropping incremental seal state keyed on a previous generation's byte/token stability. */
+	epoch: number;
+	/** Backtick parity of normalizedText[paraFrom, cut); extended incrementally at each advance. */
+	parity: number;
+	/** Last splice result built from prefixTokens; reused in place while prefixTokens is unchanged (see spliceInlineTokens). */
+	spliced?: Token[];
+	/** The prefixTokens array spliced was built from. */
+	splicedPrefix?: Token[];
+}
+
+/**
+ * Facts about the inline token stream trySplitLex produced for the current
+ * frame. Inline tokens below cutRel are byte- and object-stable across frames
+ * of the same epoch (the split prefix invariant), which lets the paragraph
+ * seal resume its per-frame validation scans at the junction instead of
+ * re-walking the verified prefix.
+ */
+interface SplitLexFrame {
+	epoch: number;
+	/** split.cut - split.paraFrom: verified prefix length in paragraph-text offsets. */
+	cutRel: number;
+	/** Backtick parity of the verified prefix (== split.parity at splice time, pre-advance). */
+	parity: number;
+	/** Index of the first non-verified token (the merged junction token when the splice merged). */
+	junctionIndex: number;
+	/** Text offset where inlineTokens[junctionIndex] starts. */
+	junctionStart: number;
 }
 
 /**
@@ -380,10 +431,12 @@ const MATH_DELIMITER_ESCAPES = new Set(["\\(", "\\[", "\\)", "\\]"]);
  * text, so a dangling backtick arriving later can re-type an already-lexed
  * `*...*` pair without any token crossing the point the prefix was verified at
  * (an even count keeps the masking pair-aligned and the prefix stable).
+ * [from, to) bounds the scan: streaming callers cache the parity of a
+ * byte-verified prefix and scan only the unverified tail per frame.
  */
-function backtickParity(text: string): number {
+function backtickParity(text: string, from = 0, to = text.length): number {
 	let parity = 0;
-	for (let i = 0; i < text.length; i++) {
+	for (let i = from; i < to; i++) {
 		if (text.charCodeAt(i) === 96) parity ^= 1;
 	}
 	return parity;
@@ -468,11 +521,16 @@ function findSafeInlineCut(tokens: Token[], text: string, minRel: number): numbe
  * When both sides of the junction are text tokens they must merge into one: a
  * full lex produces a single text token across the junction, and two adjacent
  * tokens render differently from one once a default text style wraps each in
- * its own ANSI pair.
+ * its own ANSI pair. `reused` is the previous frame's result, built from the
+ * same prefix array (caller-verified by identity): the junction is re-merged
+ * and the new tail appended in place instead of spreading the whole prefix
+ * every frame. The previous frame is done with the array then, and no token
+ * objects are mutated.
  */
-function spliceInlineTokens(prefix: Token[], tail: Token[]): Token[] | undefined {
+function spliceInlineTokens(prefix: Token[], tail: Token[], reused?: Token[]): Token[] | undefined {
 	const last = prefix[prefix.length - 1];
 	const first = tail[0];
+	let merged: Token | undefined;
 	if (last?.type === "text" && first?.type === "text") {
 		const lastRaw = (last as { raw?: unknown }).raw;
 		const firstRaw = (first as { raw?: unknown }).raw;
@@ -486,7 +544,25 @@ function spliceInlineTokens(prefix: Token[], tail: Token[]): Token[] | undefined
 		) {
 			return undefined;
 		}
-		const merged = { type: "text", raw: lastRaw + firstRaw, text: lastText + firstText } as Token;
+		merged = { type: "text", raw: lastRaw + firstRaw, text: lastText + firstText } as Token;
+	}
+	if (reused !== undefined && prefix.length > 0) {
+		// Everything below prefix.length - 1 is the unchanged shared prefix.
+		reused.length = prefix.length - 1;
+		if (merged) {
+			reused.push(merged);
+			for (let i = 1; i < tail.length; i++) {
+				reused.push(tail[i]);
+			}
+		} else {
+			reused.push(last);
+			for (const token of tail) {
+				reused.push(token);
+			}
+		}
+		return reused;
+	}
+	if (merged) {
 		return [...prefix.slice(0, -1), merged, ...tail.slice(1)];
 	}
 	return [...prefix, ...tail];
@@ -581,6 +657,10 @@ export class Markdown implements Component {
 	// Inline split of the growing final paragraph; see SplitLex. Same survival
 	// rules as the lex cache; every frame re-validates before reusing.
 	private splitLex?: SplitLex;
+	// Bootstrap generation counter for splitLex; see SplitLex.epoch.
+	private splitLexEpoch = 0;
+	// Set when this frame's token stream came from trySplitLex; see SplitLexFrame.
+	private splitLexEngaged?: SplitLexFrame;
 	// Item-level split of the growing final list; see ListSplitLex. Same
 	// survival rules as the lex cache; every frame re-validates before reusing.
 	private listSplitLex?: ListSplitLex;
@@ -637,6 +717,7 @@ export class Markdown implements Component {
 	 *   re-lex, because it could resolve references inside reused blocks.
 	 */
 	private lex(normalizedText: string): TokensList {
+		this.splitLexEngaged = undefined;
 		const cache = this.lexCache;
 		const cacheHit = cache !== undefined && cache.cut > 0 && normalizedText.startsWith(cache.prefix);
 		const base = cacheHit ? cache.cut : 0;
@@ -710,8 +791,10 @@ export class Markdown implements Component {
 		}
 		// A dangling backtick anywhere in the paragraph can re-type emphasis inside
 		// the verified prefix (see backtickParity); odd frames fall back to a full
-		// lex, which also re-bootstraps this state from the corrected tokens.
-		if (backtickParity(normalizedText.slice(split.paraFrom)) === 1) {
+		// lex, which also re-bootstraps this state from the corrected tokens. The
+		// prefix parity is cached (the startsWith above verified those bytes), so
+		// only [cut, end) is scanned per frame.
+		if ((split.parity ^ backtickParity(normalizedText, split.cut)) === 1) {
 			return undefined;
 		}
 		const tail = normalizedText.slice(split.cut);
@@ -745,9 +828,29 @@ export class Markdown implements Component {
 		if (!Array.isArray(tailParagraph.tokens)) {
 			return undefined;
 		}
-		const inlineTokens = spliceInlineTokens(split.prefixTokens, tailParagraph.tokens);
+		const reusable =
+			split.spliced !== undefined && split.splicedPrefix === split.prefixTokens ? split.spliced : undefined;
+		const inlineTokens = spliceInlineTokens(split.prefixTokens, tailParagraph.tokens, reusable);
 		if (!inlineTokens) {
 			return undefined;
+		}
+		split.spliced = inlineTokens;
+		split.splicedPrefix = split.prefixTokens;
+		// Record where the verified prefix ends in this frame's stream so the
+		// paragraph seal can resume its scans at the junction (see SplitLexFrame).
+		const cutRel = split.cut - split.paraFrom;
+		const lastPrefixRaw = (split.prefixTokens[split.prefixTokens.length - 1] as { raw?: unknown }).raw;
+		const junctionMerged =
+			split.prefixTokens[split.prefixTokens.length - 1]?.type === "text" && tailParagraph.tokens[0]?.type === "text";
+		const junctionIndex = junctionMerged ? split.prefixTokens.length - 1 : split.prefixTokens.length;
+		const junctionStart =
+			junctionMerged && typeof lastPrefixRaw === "string" ? cutRel - lastPrefixRaw.length : cutRel;
+		if (
+			junctionStart >= 0 &&
+			junctionIndex <= inlineTokens.length &&
+			(!junctionMerged || typeof lastPrefixRaw === "string")
+		) {
+			this.splitLexEngaged = { epoch: split.epoch, cutRel, parity: split.parity, junctionIndex, junctionStart };
 		}
 		// marked strips exactly one trailing "\n" from a paragraph's text (probe
 		// P1); the prefix tiles the source exactly (induction), so the merged
@@ -776,6 +879,8 @@ export class Markdown implements Component {
 					cut,
 					prefixTokens,
 					prefix: normalizedText.slice(0, cut),
+					epoch: split.epoch,
+					parity: split.parity ^ backtickParity(normalizedText, split.cut, cut),
 				};
 			}
 		}
@@ -789,6 +894,9 @@ export class Markdown implements Component {
 	 * splitting until a qualifying paragraph streams in.
 	 */
 	private bootstrapSplitLex(normalizedText: string, tokens: TokensList): SplitLex | undefined {
+		// Every bootstrap replaces the split state, breaking the byte/token
+		// continuity incremental seal scans key on (SplitLex.epoch).
+		this.splitLexEpoch += 1;
 		if (Object.keys(tokens.links ?? {}).length > 0) {
 			return undefined;
 		}
@@ -821,7 +929,15 @@ export class Markdown implements Component {
 			return undefined;
 		}
 		const cut = paraFrom + cutRel;
-		return { baseCut, paraFrom, cut, prefixTokens, prefix: normalizedText.slice(0, cut) };
+		return {
+			baseCut,
+			paraFrom,
+			cut,
+			prefixTokens,
+			prefix: normalizedText.slice(0, cut),
+			epoch: this.splitLexEpoch,
+			parity: backtickParity(normalizedText, paraFrom, cut),
+		};
 	}
 
 	/**
@@ -1207,30 +1323,39 @@ export class Markdown implements Component {
 		if (typeof text !== "string" || !inlineTokens) {
 			return undefined;
 		}
-		// A dangling backtick can re-type sealed emphasis without any token
-		// crossing the seal boundary (see backtickParity), so seal only while every
-		// backtick in the paragraph is paired.
-		if (backtickParity(text) === 1) {
-			this.finalBlockSeal = undefined;
-			return undefined;
-		}
 		let seal = this.finalBlockSeal;
 		if (
 			seal &&
 			(seal.blockType !== "paragraph" ||
 				seal.width !== width ||
 				seal.capsVersion !== capsVersion ||
-				!text.startsWith(seal.source) ||
-				(seal.tailFrom > 0 && !this.paragraphSealIntact(inlineTokens, seal.tailFrom)))
+				!text.startsWith(seal.source))
 		) {
 			seal = undefined;
 			this.finalBlockSeal = undefined;
 		}
 		if (!seal) {
-			seal = { blockType: "paragraph", source: "", tailFrom: 0, lines: [], width, capsVersion };
+			seal = { blockType: "paragraph", source: "", tailFrom: 0, lines: [], width, capsVersion, parity: 0 };
 			this.finalBlockSeal = seal;
 		}
-		const target = this.lastSealableParagraphOffset(inlineTokens, text);
+		// A dangling backtick can re-type sealed emphasis without any token
+		// crossing the seal boundary (see backtickParity), so seal only while every
+		// backtick in the paragraph is paired. The prefix parity is cached: the
+		// split-lex frame carries the parity of its verified prefix [0, cutRel);
+		// otherwise the seal's own prefix [0, tailFrom) is startsWith-verified.
+		// Either way only the unverified tail is scanned per frame.
+		const engaged = this.splitLexEngaged;
+		const prefixParity = engaged !== undefined ? engaged.parity : (seal.parity ?? 0);
+		const parityFrom = engaged !== undefined ? engaged.cutRel : seal.tailFrom;
+		if ((prefixParity ^ backtickParity(text, parityFrom)) === 1) {
+			this.finalBlockSeal = undefined;
+			return undefined;
+		}
+		if (seal.tailFrom > 0 && !this.paragraphSealIntact(inlineTokens, seal.tailFrom)) {
+			seal = { blockType: "paragraph", source: "", tailFrom: 0, lines: [], width, capsVersion, parity: 0 };
+			this.finalBlockSeal = seal;
+		}
+		const target = this.lastSealableParagraphOffset(inlineTokens, text, seal);
 		if (target === -1) {
 			this.finalBlockSeal = undefined;
 			return undefined;
@@ -1247,6 +1372,7 @@ export class Markdown implements Component {
 				this.finalBlockSeal = undefined;
 				return undefined;
 			}
+			seal.parity = (seal.parity ?? 0) ^ backtickParity(text, seal.tailFrom, target);
 			seal.lines.push(...extension);
 			seal.source = text.slice(0, target);
 			seal.tailFrom = target;
@@ -1351,10 +1477,38 @@ export class Markdown implements Component {
 	 * Whether the sealed boundary still sits inside a plain text token of the
 	 * fresh token stream (plus the style-prefix rule from the paragraph seal
 	 * comment). The seal source prefix itself is verified by the caller.
+	 * When this frame's stream came from the split lex (SplitLexFrame), the
+	 * boundary facts recorded when the seal last advanced answer in O(1) while
+	 * the boundary token stays inside the verified prefix (same epoch, token
+	 * object identity, boundaryEnd <= cutRel); otherwise the walk resumes at
+	 * the junction, or from the start when the boundary precedes it.
 	 */
 	private paragraphSealIntact(inlineTokens: Token[], tailFrom: number): boolean {
+		const engaged = this.splitLexEngaged;
+		const seal = this.finalBlockSeal;
+		if (
+			engaged !== undefined &&
+			seal?.blockType === "paragraph" &&
+			seal.boundaryEpoch === engaged.epoch &&
+			seal.boundaryTailFrom === tailFrom &&
+			seal.boundaryIndex !== undefined &&
+			seal.boundaryStart !== undefined &&
+			seal.boundaryEnd !== undefined &&
+			seal.boundaryStart <= tailFrom - 1 &&
+			tailFrom - 1 < seal.boundaryEnd &&
+			seal.boundaryEnd <= engaged.cutRel &&
+			seal.boundaryIndex < inlineTokens.length &&
+			inlineTokens[seal.boundaryIndex] === seal.boundaryToken
+		) {
+			return true;
+		}
 		let pos = 0;
-		for (let i = 0; i < inlineTokens.length; i++) {
+		let i = 0;
+		if (engaged !== undefined && tailFrom - 1 >= engaged.junctionStart) {
+			i = engaged.junctionIndex;
+			pos = engaged.junctionStart;
+		}
+		for (; i < inlineTokens.length; i++) {
 			const token = inlineTokens[i];
 			const raw = (token as { raw?: unknown }).raw;
 			if (typeof raw !== "string") {
@@ -1385,12 +1539,69 @@ export class Markdown implements Component {
 	 * Largest sealable offset (right after a "\n", leaving a non-empty tail) in
 	 * the paragraph text, or 0 when none qualifies. Returns -1 when the inline
 	 * tokens do not tile the text exactly, meaning region slicing is unsafe.
+	 * While the stream comes from the split lex (SplitLexFrame), candidates up
+	 * to the verified prefix end are folded into the seal across frames: the
+	 * scan resumes from the token containing the last folded offset (walked
+	 * back from the junction, a region bounded by one frame's cut advance), and
+	 * the newline search inside that token resumes at the folded offset. The
+	 * boundary facts of the winning candidate are recorded for
+	 * paragraphSealIntact whenever the returned offset advances the seal.
 	 */
-	private lastSealableParagraphOffset(inlineTokens: Token[], text: string): number {
+	private lastSealableParagraphOffset(inlineTokens: Token[], text: string, seal: FinalBlockSeal): number {
 		const stylePrefix = this.getDefaultStylePrefix();
-		let pos = 0;
+		const engaged = this.splitLexEngaged;
+		const resume =
+			engaged !== undefined &&
+			seal.scanEpoch === engaged.epoch &&
+			seal.scanFrom !== undefined &&
+			seal.scanBest !== undefined &&
+			seal.scanFrom <= engaged.cutRel;
 		let best = 0;
-		for (let i = 0; i < inlineTokens.length; i++) {
+		let bestIndex = -1;
+		let bestStart = 0;
+		let bestEnd = 0;
+		let bestToken: Token | undefined;
+		let i = 0;
+		let pos = 0;
+		let rawFrom = 0;
+		const foldLimit = engaged !== undefined ? engaged.cutRel : -1;
+		if (engaged !== undefined) {
+			if (resume) {
+				best = seal.scanBest as number;
+				bestIndex = seal.scanBestIndex ?? -1;
+				bestStart = seal.scanBestStart ?? 0;
+				bestEnd = seal.scanBestEnd ?? 0;
+				bestToken = seal.scanBestToken;
+				i = engaged.junctionIndex;
+				pos = engaged.junctionStart;
+				// The junction token can start before the folded offset; walk back
+				// to the token containing scanFrom so no candidate is skipped.
+				let resumeFrom = seal.scanFrom as number;
+				while (i > 0 && pos > resumeFrom) {
+					const prevRaw = (inlineTokens[i - 1] as { raw?: unknown }).raw;
+					if (typeof prevRaw !== "string") {
+						i = 0;
+						pos = 0;
+						resumeFrom = 0;
+						break;
+					}
+					i -= 1;
+					pos -= prevRaw.length;
+				}
+				rawFrom = Math.max(0, resumeFrom - pos);
+			}
+		} else {
+			// Without the split-lex prefix invariant the folded state says
+			// nothing about this stream; drop it.
+			seal.scanEpoch = undefined;
+		}
+		const startIndex = i;
+		let foldBest = -1;
+		let foldIndex = -1;
+		let foldStart = 0;
+		let foldEnd = 0;
+		let foldToken: Token | undefined;
+		for (; i < inlineTokens.length; i++) {
 			const token = inlineTokens[i];
 			const raw = (token as { raw?: unknown }).raw;
 			if (typeof raw !== "string") {
@@ -1400,20 +1611,60 @@ export class Markdown implements Component {
 				if ((token as { text?: unknown }).text !== raw) {
 					return -1;
 				}
-				let idx = raw.indexOf("\n");
+				let idx = raw.indexOf("\n", i === startIndex ? rawFrom : 0);
 				while (idx !== -1) {
 					const k = pos + idx + 1;
 					const trimsStylePrefix =
 						idx === 0 && i > 0 && stylePrefix !== "" && STYLE_PREFIX_CONSTRUCTS.has(inlineTokens[i - 1].type);
 					if (k < text.length && !trimsStylePrefix) {
 						best = k;
+						bestIndex = i;
+						bestStart = pos;
+						bestEnd = pos + raw.length;
+						bestToken = token;
+						if (k <= foldLimit) {
+							foldBest = k;
+							foldIndex = i;
+							foldStart = pos;
+							foldEnd = pos + raw.length;
+							foldToken = token;
+						}
 					}
 					idx = raw.indexOf("\n", idx + 1);
 				}
 			}
 			pos += raw.length;
 		}
-		return pos === text.length ? best : -1;
+		if (pos !== text.length) {
+			return -1;
+		}
+		if (engaged !== undefined) {
+			const base = resume ? (seal.scanBest as number) : 0;
+			if (foldBest > base) {
+				seal.scanBest = foldBest;
+				seal.scanBestIndex = foldIndex;
+				seal.scanBestStart = foldStart;
+				seal.scanBestEnd = foldEnd;
+				seal.scanBestToken = foldToken;
+			} else if (!resume) {
+				seal.scanBest = 0;
+				seal.scanBestIndex = -1;
+				seal.scanBestStart = 0;
+				seal.scanBestEnd = 0;
+				seal.scanBestToken = undefined;
+			}
+			seal.scanFrom = foldLimit;
+			seal.scanEpoch = engaged.epoch;
+		}
+		if (best > seal.tailFrom && bestToken !== undefined) {
+			seal.boundaryEpoch = engaged?.epoch;
+			seal.boundaryTailFrom = best;
+			seal.boundaryIndex = bestIndex;
+			seal.boundaryStart = bestStart;
+			seal.boundaryEnd = bestEnd;
+			seal.boundaryToken = bestToken;
+		}
+		return best;
 	}
 
 	/**
