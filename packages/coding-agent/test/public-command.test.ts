@@ -235,6 +235,26 @@ describe("public command routing", () => {
 		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("separately"));
 	});
 
+	it("forwards a leading daemon socket on a forced update", async () => {
+		await handlePublicCommand(["--daemon-socket", "/tmp/w41.sock", "update", "--force"]);
+
+		expect(mocks.packageCommands).toEqual([["update", "--self", "--force", "--daemon-socket", "/tmp/w41.sock"]]);
+	});
+
+	it("accepts the update daemon socket written inline", async () => {
+		await handlePublicCommand(["update", "--force", "--daemon-socket", "/tmp/w41.sock"]);
+
+		expect(mocks.packageCommands).toEqual([["update", "--self", "--force", "--daemon-socket", "/tmp/w41.sock"]]);
+	});
+
+	it("requires a value for the update daemon socket", async () => {
+		await handlePublicCommand(["update", "--force", "--daemon-socket"]);
+
+		expect(mocks.packageCommands).toEqual([]);
+		expect(process.exitCode).toBe(1);
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("--daemon-socket requires a value"));
+	});
+
 	it("rejects self-update aliases on the package update path", async () => {
 		for (const source of ["self", "pi", "prime-agent"]) {
 			await handlePublicCommand(["package", "update", source]);
@@ -367,6 +387,44 @@ describe("public command routing", () => {
 		await handlePublicCommand(["schedule", "cancell", "job-1"]);
 		expect(mocks.daemonCommands).toEqual([]);
 		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("schedule cancel"));
+	});
+
+	it("forwards a leading daemon socket when listing scheduled prompts", async () => {
+		await handlePublicCommand(["--daemon-socket", "/tmp/w41.sock", "schedule", "list"]);
+
+		expect(mocks.daemonCommands).toEqual([["daemon", "cron", "list", "--daemon-socket", "/tmp/w41.sock"]]);
+	});
+
+	it("forwards a leading daemon socket when cancelling a scheduled prompt", async () => {
+		await handlePublicCommand(["--daemon-socket", "/tmp/w41.sock", "schedule", "cancel", "job-1"]);
+
+		expect(mocks.daemonCommands).toEqual([["daemon", "cron", "cancel", "job-1", "--daemon-socket", "/tmp/w41.sock"]]);
+	});
+
+	it("accepts the schedule daemon socket written inline in either position", async () => {
+		await handlePublicCommand(["schedule", "list", "--all", "--daemon-socket", "/tmp/w41.sock"]);
+		await handlePublicCommand(["schedule", "cancel", "--daemon-socket", "/tmp/w41.sock", "job-1"]);
+
+		expect(mocks.daemonCommands).toEqual([
+			["daemon", "cron", "list", "--all", "--daemon-socket", "/tmp/w41.sock"],
+			["daemon", "cron", "cancel", "--daemon-socket", "/tmp/w41.sock", "job-1"],
+		]);
+	});
+
+	it("still rejects extra schedule list operands when a daemon socket is present", async () => {
+		await handlePublicCommand(["schedule", "list", "worker", "extra", "--daemon-socket", "/tmp/w41.sock"]);
+
+		expect(mocks.daemonCommands).toEqual([]);
+		expect(process.exitCode).toBe(1);
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("prime-agent schedule list [--all] [agent]"));
+	});
+
+	it("requires a value for the schedule daemon socket", async () => {
+		await handlePublicCommand(["schedule", "cancel", "job-1", "--daemon-socket"]);
+
+		expect(mocks.daemonCommands).toEqual([]);
+		expect(process.exitCode).toBe(1);
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("schedule cancel <job-id>"));
 	});
 
 	it("treats help-like message text after the separator literally", async () => {

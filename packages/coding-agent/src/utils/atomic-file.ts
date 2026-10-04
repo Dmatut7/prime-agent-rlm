@@ -70,6 +70,22 @@ export interface WriteFileAtomicOptions {
 	beforeRename?: (tempPath: string) => void;
 }
 
+/**
+ * Sync twin of fsyncToleratingUnsupported: a filesystem without fsync answers
+ * EINVAL/ENOTSUP/EPERM, which must not fail the write — the data was written
+ * either way, and the atomic rename still protects readers.
+ */
+function fsyncSyncToleratingUnsupported(descriptor: number): void {
+	try {
+		fsyncSync(descriptor);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EPERM") {
+			throw error;
+		}
+	}
+}
+
 /** Durable-write owner: temp file beside the destination, then an atomic rename. */
 export function writeFileAtomicSync(path: string, data: string, options: WriteFileAtomicOptions = {}): void {
 	const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
@@ -84,7 +100,7 @@ export function writeFileAtomicSync(path: string, data: string, options: WriteFi
 				if (written <= 0) throw new Error(`Short write persisting ${path}`);
 				offset += written;
 			}
-			if (options.fsync) fsyncSync(descriptor);
+			if (options.fsync) fsyncSyncToleratingUnsupported(descriptor);
 		} finally {
 			closeSync(descriptor);
 		}

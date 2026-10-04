@@ -1,0 +1,2 @@
+- Fixed `prime-agent --daemon-socket <path> schedule list|cancel` and `prime-agent --daemon-socket <path> update --force` being wrongly rejected with a Usage error; the socket scope now reaches the scheduled-prompt and self-update paths.
+- Fixed `writeFileAtomicSync` failing outright on filesystems without fsync: EINVAL/ENOTSUP/EPERM from fsync are now tolerated like the async variant (the atomic rename still protects readers), while real fsync errors still propagate.

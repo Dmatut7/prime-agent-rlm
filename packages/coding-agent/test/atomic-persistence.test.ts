@@ -70,11 +70,21 @@ vi.mock("node:fs", async (importOriginal) => {
 			}
 			return (actual.writeSync as WriteSync)(fd, data as never, offset as never, length as never);
 		}) as WriteSync,
+		fsyncSync: ((fd: number) => {
+			const fault = syncFsyncProbe.fault;
+			if (fault) {
+				throw Object.assign(new Error(`fsync failed: ${fault.code}`), { code: fault.code });
+			}
+			return actual.fsyncSync(fd);
+		}) as typeof actual.fsyncSync,
 	};
 });
 
 const fsyncProbe = vi.hoisted(() => ({
 	openFlags: [] as unknown[],
+	fault: undefined as { code: string } | undefined,
+}));
+const syncFsyncProbe = vi.hoisted(() => ({
 	fault: undefined as { code: string } | undefined,
 }));
 vi.mock("fs/promises", async (importOriginal) => {
@@ -106,6 +116,7 @@ const tempDirs: string[] = [];
 afterEach(() => {
 	fsyncProbe.openFlags.length = 0;
 	fsyncProbe.fault = undefined;
+	syncFsyncProbe.fault = undefined;
 	for (const dir of tempDirs.splice(0)) {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -171,6 +182,27 @@ describe("writeFileAtomicSync", () => {
 			}),
 		).toThrow("validation failed");
 		expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ key: "value".repeat(10) });
+		expect(readdirSync(dir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+	});
+
+	it.each(["EINVAL", "ENOTSUP", "EPERM"])("tolerates an %s fsync failure from a filesystem without fsync", (code) => {
+		const dir = createTempDir();
+		const path = join(dir, "state.json");
+		syncFsyncProbe.fault = { code };
+
+		writeFileAtomicSync(path, "data", { fsync: true });
+
+		expect(readFileSync(path, "utf8")).toBe("data");
+	});
+
+	it("propagates a real fsync failure and keeps the previous state", () => {
+		const dir = createTempDir();
+		const path = join(dir, "state.json");
+		writeFileSync(path, "old");
+		syncFsyncProbe.fault = { code: "EIO" };
+
+		expect(() => writeFileAtomicSync(path, "new", { fsync: true })).toThrow("EIO");
+		expect(readFileSync(path, "utf8")).toBe("old");
 		expect(readdirSync(dir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
 	});
 });

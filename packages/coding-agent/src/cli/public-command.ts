@@ -128,9 +128,27 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 		case "mcp":
 			return runMcp(args.slice(1));
 		case "update": {
+			// `--daemon-socket <path>` scopes the post-update daemon restart
+			// (package-manager-cli.ts parses it for "update"); lift the pair out
+			// first so the socket path is never read as a legacy package target.
 			const rest = args.slice(1);
-			const hasLegacySelfTarget = rest.some((arg) => arg === "--self" || isSelfUpdateSource(arg));
-			const hasLegacyPackageTarget = rest.some(
+			const socketOptions: string[] = [];
+			const updateArgs: string[] = [];
+			for (let index = 0; index < rest.length; index++) {
+				const arg = rest[index]!;
+				if (arg === "--daemon-socket") {
+					const value = rest[index + 1];
+					if (value === undefined || value.startsWith("-")) {
+						return fail("--daemon-socket requires a value.", `Run "${APP_NAME} help update" for usage.`);
+					}
+					socketOptions.push(arg, value);
+					index++;
+					continue;
+				}
+				updateArgs.push(arg);
+			}
+			const hasLegacySelfTarget = updateArgs.some((arg) => arg === "--self" || isSelfUpdateSource(arg));
+			const hasLegacyPackageTarget = updateArgs.some(
 				(arg) =>
 					arg === "--extensions" || arg === "--extension" || (!arg.startsWith("-") && !isSelfUpdateSource(arg)),
 			);
@@ -146,9 +164,9 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 			if (hasLegacyPackageTarget) {
 				return fail("Package updates moved to the package command.", `Use "${APP_NAME} package update [source]".`);
 			}
-			const options = parseBooleanOptions(rest, new Set(["--force", "--allow-official"]), "update");
+			const options = parseBooleanOptions(updateArgs, new Set(["--force", "--allow-official"]), "update");
 			if (!options) return HANDLED;
-			await handlePackageCommand(["update", "--self", ...options]);
+			await handlePackageCommand(["update", "--self", ...options, ...socketOptions]);
 			return HANDLED;
 		}
 		case "model":
@@ -647,10 +665,25 @@ function requireOperandCount(args: string[], minimum: number, maximum: number | 
 
 function validateScheduleArgs(args: string[]): boolean {
 	const subcommand = args[0];
+	// The daemon client parser accepts the scope selectors anywhere before "--"
+	// (daemon-command.ts), so the public usage check must skip their value pairs
+	// instead of reading the path as an operand or an unknown option.
+	const isScopeFlag = (arg: string) => arg === "--socket" || arg === "--daemon-socket";
 	if (subcommand === "list") {
 		let agentCount = 0;
-		for (const arg of args.slice(1)) {
+		const rest = args.slice(1);
+		for (let index = 0; index < rest.length; index++) {
+			const arg = rest[index]!;
 			if (arg === "--all" || arg === "-a" || arg === "--json") {
+				continue;
+			}
+			if (isScopeFlag(arg)) {
+				const value = rest[index + 1];
+				if (value === undefined || value.startsWith("-")) {
+					fail(`Usage: ${APP_NAME} schedule list [--all] [agent] [--json]`);
+					return false;
+				}
+				index++;
 				continue;
 			}
 			if (arg.startsWith("-") || ++agentCount > 1) {
@@ -661,7 +694,24 @@ function validateScheduleArgs(args: string[]): boolean {
 		return true;
 	}
 	if (subcommand === "cancel") {
-		const operands = args.slice(1).filter((arg) => arg !== "--json");
+		const operands: string[] = [];
+		const rest = args.slice(1);
+		for (let index = 0; index < rest.length; index++) {
+			const arg = rest[index]!;
+			if (arg === "--json") {
+				continue;
+			}
+			if (isScopeFlag(arg)) {
+				const value = rest[index + 1];
+				if (value === undefined || value.startsWith("-")) {
+					fail(`Usage: ${APP_NAME} ${getCommandSpec(["schedule", "cancel"])!.usage}`);
+					return false;
+				}
+				index++;
+				continue;
+			}
+			operands.push(arg);
+		}
 		if (operands.length === 1 && !operands[0]!.startsWith("-")) {
 			return true;
 		}
