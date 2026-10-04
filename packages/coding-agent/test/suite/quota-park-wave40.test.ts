@@ -14,11 +14,19 @@
  * - a failed park-record write no longer wedges the session in "retrying";
  * - a restart with the wake overdue and the durable job alive restores the
  *   park with its parkCount, so waitForUsage.maxParks survives restarts.
+ *
+ * Follow-up pins (audit F1 + domain-7):
+ * - a restart after the in-process timer took the wake over (durable job
+ *   cancelled by the timer, probe in flight) must not read the takeover as a
+ *   user cancellation: the park is restored with its count and re-woken;
+ * - the update-restart abort cascade is not a user abort: a parked child whose
+ *   wake probe is aborted by it keeps the park (wake re-armed), with no
+ *   "user-aborted" record.
  */
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AgentCronJobStore } from "../../src/core/cron-jobs.js";
+import { AgentCronJobStore, QUOTA_WAKE_TIMER_CANCEL_ORIGIN } from "../../src/core/cron-jobs.js";
 import { createQuotaResumeJob, resolveQuotaResumeJob } from "../../src/core/quota-park.js";
 import type { Settings } from "../../src/core/settings-manager.js";
 import { createHarness, type Harness } from "./harness.js";
@@ -76,6 +84,15 @@ async function parkSession(settings: Partial<Settings>): Promise<Harness> {
 	await harness.session.prompt("do the work");
 	await harness.session.waitForIdle();
 	return harness;
+}
+
+/** Store over the harness session's artifact file, mirroring the session's own. */
+function sessionStore(harness: Harness): AgentCronJobStore {
+	const artifactDir = harness.sessionManager.getSessionArtifactDir();
+	if (!artifactDir) throw new Error("expected an artifact dir");
+	const store = AgentCronJobStore.forSessionArtifacts();
+	store.registerSessionArtifact(harness.session.sessionId, artifactDir);
+	return store;
 }
 
 async function waitFor(condition: () => boolean, what: string, timeoutMs = 10_000): Promise<void> {
@@ -196,14 +213,6 @@ describe("a user abort of an unrelated turn keeps a future-scheduled park", () =
 });
 
 describe("a skipped or errored durable wake is not a delivery", () => {
-	function sessionStore(harness: Harness): AgentCronJobStore {
-		const artifactDir = harness.sessionManager.getSessionArtifactDir();
-		if (!artifactDir) throw new Error("expected an artifact dir");
-		const store = AgentCronJobStore.forSessionArtifacts();
-		store.registerSessionArtifact(harness.session.sessionId, artifactDir);
-		return store;
-	}
-
 	it("a skipped once job does not count as delivered", async () => {
 		const harness = await parkSession(parkSettings(3_600_000));
 		const jobId = createQuotaResumeJob(harness.session, Date.now() + 60_000);
@@ -284,5 +293,122 @@ describe("restart restores the park with its count when the durable wake survive
 			() => parkEntries(restarted).some((entry) => entry.parkCount === 2),
 			"the re-park with parkCount 2",
 		);
+	});
+});
+
+describe("restart after the in-process timer took the wake over", () => {
+	it("restores the park with its count instead of reading the takeover as a user cancellation", async () => {
+		const parked = await parkSession(parkSettings(60));
+		expect(parked.session.isQuotaParked).toBe(true);
+		const jobId = parkEntries(parked).at(-1)?.jobId;
+		if (typeof jobId !== "string") throw new Error("expected a durable wake job on the park entry");
+		// The wake fires while the probe turn hangs: the in-process timer cancels the
+		// durable job and owns the resume. A restart in this window must not read the
+		// timer's takeover as the user cancelling the wake.
+		parked.setResponses([() => new Promise<never>(() => {})]);
+		await waitFor(() => parked.eventsOfType("agent_start").length >= 2, "the wake probe turn to start");
+		const takenOver = sessionStore(parked)
+			.list()
+			.find((job) => job.id === jobId);
+		if (takenOver?.status !== "cancelled") throw new Error("the wake timer did not take over the durable job");
+		expect(takenOver.cancelledBy).toBe(QUOTA_WAKE_TIMER_CANCEL_ORIGIN);
+		const sessionFile = parked.session.sessionFile;
+		if (!sessionFile) throw new Error("expected a persisted session");
+		parked.session.dispose();
+		await new Promise((resolve) => setTimeout(resolve, 80));
+
+		const restarted = await createHarness({ existingSessionFile: sessionFile, settings: parkSettings(60) });
+		harnesses.push(restarted);
+
+		expect(restarted.session.isQuotaParked).toBe(true);
+		// The restored wake drives at once; the probe hits the still-exhausted quota
+		// and re-parks with the episode count continued, not reset.
+		restarted.setResponses([quotaFailure({ retryAfterMs: 3_600_000 })]);
+		await waitFor(
+			() => parkEntries(restarted).some((entry) => entry.parkCount === 2),
+			"the re-park with parkCount 2",
+		);
+	});
+
+	it("a wake the user cancelled before the restart still ends the episode (due-past branch)", async () => {
+		const parked = await parkSession(parkSettings(60));
+		expect(parked.session.isQuotaParked).toBe(true);
+		const jobId = parkEntries(parked).at(-1)?.jobId;
+		if (typeof jobId !== "string") throw new Error("expected a durable wake job on the park entry");
+		// The user cancels the wake (a plain cancel, no machine origin) before the
+		// timer fires; the live session honors it, then the wake time passes while
+		// the session is down.
+		sessionStore(parked).cancel(jobId);
+		await waitFor(() => !parked.session.isQuotaParked, "the live session to honor the user cancellation");
+		const sessionFile = parked.session.sessionFile;
+		if (!sessionFile) throw new Error("expected a persisted session");
+		parked.session.dispose();
+
+		const restarted = await createHarness({ existingSessionFile: sessionFile, settings: parkSettings(60) });
+		harnesses.push(restarted);
+
+		expect(restarted.session.isQuotaParked).toBe(false);
+		expect(parkEntries(restarted)).toHaveLength(1);
+		expect(resumeOutcomes(restarted)).toEqual([]);
+	});
+
+	it("a wake the user cancelled while parked still ends the episode (future branch)", async () => {
+		const parked = await parkSession(parkSettings(3_600_000));
+		expect(parked.session.isQuotaParked).toBe(true);
+		const jobId = parkEntries(parked).at(-1)?.jobId;
+		if (typeof jobId !== "string") throw new Error("expected a durable wake job on the park entry");
+		sessionStore(parked).cancel(jobId);
+		const sessionFile = parked.session.sessionFile;
+		if (!sessionFile) throw new Error("expected a persisted session");
+		parked.session.dispose();
+
+		const restarted = await createHarness({ existingSessionFile: sessionFile, settings: parkSettings(60) });
+		harnesses.push(restarted);
+
+		expect(restarted.session.isQuotaParked).toBe(false);
+		expect(parkEntries(restarted)).toHaveLength(1);
+		expect(resumeOutcomes(restarted)).toEqual([]);
+	});
+});
+
+describe("an update-restart cascade abort of a parked child's wake probe", () => {
+	it("is not a user abort: the park survives with its wake re-armed, and no user-aborted record lands", async () => {
+		const child = await createHarness({ persistSession: true, settings: parkSettings(60) });
+		harnesses.push(child);
+		child.sessionManager.materializeSessionFile();
+		child.setResponses([quotaFailure({ retryAfterMs: 3_600_000 })]);
+		await child.session.prompt("child task work");
+		await child.session.waitForIdle();
+		expect(child.session.isQuotaParked).toBe(true);
+		const parksBefore = parkEntries(child).length;
+
+		// The wake probe turn hangs so the cascade has something to abort.
+		child.setResponses([() => new Promise<never>(() => {})]);
+		await waitFor(() => child.eventsOfType("agent_start").length >= 2, "the child wake probe turn to start");
+
+		const parent = await createHarness({
+			rlmDepth: 0,
+			rlmMaxDepth: 1,
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child.session }),
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+		harnesses.push(parent);
+		await parent.session.runRlmChild("more work", { name: "worker" });
+
+		parent.session.abortForUpdateRestart();
+		// The cascade is synchronous: the reason stamp is visible before the aborted
+		// turn's message_end (and before any later agent_start clears it).
+		expect(child.session.lastTurnAbortReason).toBe("update_restart");
+		await waitFor(() => !child.session.isStreaming, "the cascade to stop the child probe turn");
+
+		// Not the user taking the session back: the park survives and the wake is
+		// re-armed (one more park entry carrying the retry budget), with no
+		// user-aborted record that a restart would read as the end of the episode.
+		expect(child.session.isQuotaParked).toBe(true);
+		expect(resumeOutcomes(child)).toEqual([]);
+		expect(parkEntries(child).length).toBe(parksBefore + 1);
+		expect(parkEntries(child).at(-1)).toEqual(expect.objectContaining({ parkCount: 1, wakeRetries: 1 }));
 	});
 });

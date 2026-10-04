@@ -17,7 +17,12 @@ import type { AssistantMessage, ImageContent, TextContent } from "@earendil-work
 import { getLogger } from "@earendil-works/pi-ai";
 import type { AgentSession, QueuedSessionAction } from "./agent-session.js";
 import type { AuthSourceToken } from "./auth-storage.js";
-import { type AgentCronJob, AgentCronJobStore } from "./cron-jobs.js";
+import {
+	type AgentCronJob,
+	type AgentCronJobCancelOrigin,
+	AgentCronJobStore,
+	QUOTA_WAKE_TIMER_CANCEL_ORIGIN,
+} from "./cron-jobs.js";
 import {
 	type ProviderWaitPolicy,
 	parseProviderResetMs,
@@ -426,10 +431,17 @@ function quotaResumeStore(host: QuotaParkHost): AgentCronJobStore | undefined {
  * completed job to cancelled would hide that the wake landed — cancel one
  * that has not run, and report a user cancellation as such. Anything else is
  * gone, leaving the in-process timer as the wake.
+ *
+ * `cancelOrigin` stamps the cancel the call itself performs. Only the wake
+ * timer's takeover (resumeFromQuotaPark) stamps itself: a restart must read
+ * that cancel as "the timer owns the resume", not as a user cancellation.
+ * Teardown cancels (cancelQuotaParkWake) stamp nothing, so a park dropped or
+ * replaced while the session was up stays dropped across a restart.
  */
 export function resolveQuotaResumeJob(
 	host: QuotaParkHost,
 	jobId: string,
+	options?: { cancelOrigin?: AgentCronJobCancelOrigin },
 ): "delivered" | "user-cancelled" | "cancelled" | "gone" {
 	const job = findQuotaResumeJob(host, jobId);
 	if (job?.status === "completed") {
@@ -445,14 +457,21 @@ export function resolveQuotaResumeJob(
 		return "gone";
 	}
 	if (job?.status === "cancelled") {
-		return "user-cancelled";
+		// A wake the in-process timer cancelled is a takeover, not a user
+		// cancellation: the timer owns the resume. Only a cancel without that
+		// origin is the user's (/cron, the daemon's cron_cancel, session
+		// teardown - none of them stamp an origin).
+		return job.cancelledBy === QUOTA_WAKE_TIMER_CANCEL_ORIGIN ? "cancelled" : "user-cancelled";
 	}
 	const store = quotaResumeStore(host);
 	if (!store) {
 		return "gone";
 	}
 	try {
-		return store.cancel(jobId) === undefined ? "gone" : "cancelled";
+		return store.cancel(jobId, undefined, options?.cancelOrigin ? { origin: options.cancelOrigin } : undefined) ===
+			undefined
+			? "gone"
+			: "cancelled";
 	} catch {
 		return "gone";
 	}
@@ -496,7 +515,11 @@ export async function resumeFromQuotaPark(host: QuotaParkHost): Promise<void> {
 		return;
 	}
 	if (park.jobId !== undefined) {
-		const resolved = resolveQuotaResumeJob(host, park.jobId);
+		// The timer cancelling the still-pending job IS the takeover: stamp it, so
+		// a restart while the probe below is queued or in flight reads the cancel
+		// as "the timer owns the resume" and re-drives the wake instead of ending
+		// the episode as a user cancellation.
+		const resolved = resolveQuotaResumeJob(host, park.jobId, { cancelOrigin: QUOTA_WAKE_TIMER_CANCEL_ORIGIN });
 		if (resolved === "delivered") {
 			// The daemon dispatched the durable wake; its prompt drives the resume.
 			park.waking = true;
@@ -651,6 +674,14 @@ function findQuotaResumeJob(host: QuotaParkHost, jobId: string): AgentCronJob | 
  * Durable wake for a restored park: reuse a job that can still fire and
  * recreate one that was cancelled (a navigation cancels the left-behind
  * leaf's wake) or removed, so a restored park never waits on a dead job.
+ *
+ * A cancelled future wake stays a user cancellation even when it carries the
+ * timer's takeover stamp: on a future-scheduled entry the stamp only survives
+ * when the branch was rewound past the takeover (the stamp's episode continued
+ * on the branch that was left), and there the user cancel of the successor
+ * wake is the intent to honor. The takeover stamp is honored on the due-past
+ * branch instead, where a restart after the takeover is the only way a
+ * cancelled job can sit under an overdue entry (see restoreQuotaPark).
  */
 function restoreQuotaWakeJob(
 	host: QuotaParkHost,
@@ -748,8 +779,10 @@ export function restoreQuotaPark(host: QuotaParkHost): void {
 				return;
 			}
 			// The user cancelled the wake while the session was down: their choice
-			// stands, and the episode ends here.
-			if (job.status === "cancelled") {
+			// stands, and the episode ends here. A cancellation the in-process wake
+			// timer stamped is a takeover, not a choice - the probe it queued died
+			// with the process, so the park is restored below and its wake re-fires.
+			if (job.status === "cancelled" && job.cancelledBy !== QUOTA_WAKE_TIMER_CANCEL_ORIGIN) {
 				return;
 			}
 			// The job survived: restore the park WITH its count, or every restart

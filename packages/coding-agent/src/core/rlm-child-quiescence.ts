@@ -11,6 +11,7 @@
 import { getLogger } from "@earendil-works/pi-ai";
 import type { AgentSession, RlmQuiescenceOutcome } from "./agent-session.js";
 import { noopRlmChildAbort, type RlmChildRun } from "./rlm-child-run.js";
+import type { RlmChildTurnAbortReason } from "./rlm-child-terminal.js";
 
 // Same logger name as agent-session.ts: the quiescence wait and the abort
 // cascade moved here verbatim and their log lines keep the namespace they have
@@ -204,11 +205,19 @@ export function* rlmSubtreeSessions(root: AgentSession): Generator<AgentSession>
  * twice. This session is excluded from step 2 because the caller already aborted
  * it. Cross-worker descendants are out of reach of an in-process walk and are
  * covered by the supervisor's kill path instead.
+ *
+ * `turnAbortReason` is the reason stamped on each aborted descendant turn. It
+ * defaults to "user" (abort() is user semantics); a machine cascade passes its
+ * own (abortForUpdateRestart passes "update_restart") so consumers that key on
+ * a user abort - the quota park's user-cancel branch above all - do not eat a
+ * restart.
  */
 export function abortRlmSubtree(
 	host: RlmChildQuiescenceHost,
 	reason: string,
+	options?: { turnAbortReason?: RlmChildTurnAbortReason },
 ): { cancelled: number; failures: number; depth: number } {
+	const turnAbortReason = options?.turnAbortReason ?? "user";
 	let cancelled = 0;
 	let failures = 0;
 	let depth = host._rlmDepth;
@@ -236,7 +245,7 @@ export function abortRlmSubtree(
 		try {
 			// A retained descendant can be mid-turn with no run of ours tracking it:
 			// it settled, was followed up, and is now streaming that follow-up.
-			if (session.isStreaming) session.requestAbort({ reason: "user" });
+			if (session.isStreaming) session.requestAbort({ reason: turnAbortReason });
 		} catch (error) {
 			failures += 1;
 			sessionLog.warn("rlm abort cascade: stopping a descendant turn failed", {

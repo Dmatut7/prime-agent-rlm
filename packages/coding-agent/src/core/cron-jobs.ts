@@ -28,6 +28,22 @@ export type AgentCronJobStatus = "active" | "paused" | "completed" | "cancelled"
 export type AgentCronScheduleKind = "once" | "cron" | "interval";
 export type AgentCronJobSource = "cron" | "heartbeat" | "rlm_heartbeat";
 export type AgentCronJobRuntimeKind = "top-level" | "subagent";
+/**
+ * Machine-originated cancellations that must be distinguishable from a user's
+ * cancel on the cancelled job record. Absent on user cancels (/cron, the
+ * daemon's cron_cancel, session teardown) and on every cancellation recorded
+ * before this field existed, so an absent origin reads as a user cancel -
+ * exactly what those paths always meant.
+ */
+export type AgentCronJobCancelOrigin = "quota_wake_timer";
+/**
+ * Stamped by the quota park's in-process wake timer when it takes the resume
+ * over from the durable job: the timer fired, cancelled the job, and queued
+ * the resume marker itself. A restart that finds the job cancelled with this
+ * origin must rebuild the wake (the probe the timer queued died with the
+ * process), not honor it as a user cancellation.
+ */
+export const QUOTA_WAKE_TIMER_CANCEL_ORIGIN: AgentCronJobCancelOrigin = "quota_wake_timer";
 export type AgentHeartbeatUpdateAction = "pause" | "resume" | "clear";
 export type AgentHeartbeatManagementAction = "pause" | "resume" | "stop";
 export type AgentRlmHeartbeatStatusUpdate = "pause" | "resume";
@@ -70,6 +86,13 @@ export interface AgentCronJob {
 	deferredSince?: string;
 	lastError?: string;
 	runCount: number;
+	/**
+	 * Set only when a machine owner cancelled the job (see
+	 * AgentCronJobCancelOrigin); user cancels leave it absent. Survives on the
+	 * cancelled record so a session restore can tell a wake takeover apart from
+	 * a user cancellation.
+	 */
+	cancelledBy?: AgentCronJobCancelOrigin;
 }
 
 export interface CreateAgentCronJobInput {
@@ -815,13 +838,19 @@ export class AgentCronJobStore {
 		return updated ? this.persistedMutation(this.writeJobs(jobs), updated, `Heartbeat ${action}`) : updated;
 	}
 
-	cancel(id: string, now = new Date()): AgentCronJob | undefined {
+	cancel(id: string, now = new Date(), options?: { origin?: AgentCronJobCancelOrigin }): AgentCronJob | undefined {
 		let cancelled: AgentCronJob | undefined;
 		const jobs = this.readJobs().map((job) => {
 			if (job.id !== id || job.status === "cancelled") {
 				return job;
 			}
-			cancelled = { ...job, status: "cancelled", nextRunAt: undefined, updatedAt: updatedAtForMutation(now, job) };
+			cancelled = {
+				...job,
+				status: "cancelled",
+				nextRunAt: undefined,
+				...(options?.origin !== undefined ? { cancelledBy: options.origin } : {}),
+				updatedAt: updatedAtForMutation(now, job),
+			};
 			return cancelled;
 		});
 		return cancelled ? this.persistedMutation(this.writeJobs(jobs), cancelled, "Cron job cancellation") : cancelled;
@@ -2665,6 +2694,7 @@ function isAgentCronJob(value: unknown): value is AgentCronJob {
 		typeof candidate.createdAt === "string" &&
 		typeof candidate.updatedAt === "string" &&
 		typeof candidate.runCount === "number" &&
+		(candidate.cancelledBy === undefined || candidate.cancelledBy === QUOTA_WAKE_TIMER_CANCEL_ORIGIN) &&
 		(candidate.lastDeferredAt === undefined || typeof candidate.lastDeferredAt === "string") &&
 		(candidate.deferCount === undefined || typeof candidate.deferCount === "number") &&
 		(candidate.deferredSince === undefined || typeof candidate.deferredSince === "string")
