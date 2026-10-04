@@ -231,6 +231,20 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
+import {
+	ensureHarnessDigestContext,
+	type HarnessStoreStamps,
+	harnessDigestIsFresh,
+	harnessDigestWithFingerprint,
+	invalidateHarnessDigestBaselines,
+	latestContextHarnessDigestDetails,
+	loadMergedHarnessState,
+	noteHarnessDigestToolFaceChange,
+	type PreparedHarnessDigest,
+	prepareHarnessDigest,
+	recordHarnessDigestBaselines,
+	refreshHarnessDigestIfMateriallyChanged,
+} from "./harness-digest.js";
 import { type ImageModelRoutingInputs, resolveImageModelRoute } from "./image-model-routing.js";
 import {
 	batchCarriesImages,
@@ -289,7 +303,6 @@ import {
 	createSessionSlashCommandMessage,
 	createSessionSlashCommandResultMessage,
 	HARNESS_DIGEST_CUSTOM_TYPE,
-	type HarnessDigestDetails,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
@@ -366,19 +379,13 @@ import {
 	type AutoRefineReview,
 	applyRefinementProposal,
 	assertHarnessStateWritable,
-	formatHarnessStateForPrompt,
 	generateRefinementId,
 	getGlobalHarnessStateDir,
 	getHarnessStatePath,
 	getLocalHarnessStateDir,
 	getRefinementHistory,
-	type HarnessQueryTerms,
 	type HarnessScope,
 	type HarnessState,
-	type HarnessStateStamp,
-	harnessDigestFingerprint,
-	harnessQueryTerms,
-	harnessStateStampsEqual,
 	inferRefinementResultScope,
 	isPersistentHarnessStorageSupported,
 	loadGlobalRefinementHistory,
@@ -441,7 +448,6 @@ import {
 	createAgentMessageDeferred,
 	type RlmChildDeriveCounts,
 	type RlmChildRun,
-	readAssistantText,
 	resetRlmChildDeriveCounts,
 	rlmChildDeriveCounts,
 	rlmChildLabel,
@@ -1236,67 +1242,6 @@ function cloneQueuedAgentMessage(message: QueuedAgentMessage): QueuedAgentMessag
 }
 
 /**
- * The two harness stores a session's digest renders from: the machine-wide global
- * store and this session's own local store. `null` means "no state file", which is a
- * stamp like any other (its appearance and disappearance are both material changes).
- */
-interface HarnessStoreStamps {
-	global: HarnessStateStamp | null;
-	local: HarnessStateStamp | null;
-}
-
-function harnessStoreStampsEqual(left: HarnessStoreStamps, right: HarnessStoreStamps): boolean {
-	return harnessStateStampsEqual(left.global, right.global) && harnessStateStampsEqual(left.local, right.local);
-}
-
-/**
- * Harness state plus the fingerprint of the material a digest would render, with
- * the render itself deferred. Delivery decisions compare fingerprints (and the
- * per-entry version map), so the common "a store stamp moved but nothing the
- * digest prints moved" turn pays the state load and the fingerprint only - the
- * ranked render (~0.155 s mean at the 48-term cap on the 1266-entry fixture
- * since a5f4868c0, and 0.66-0.70 s before that score-once rewrite; perf seats B/C
- * 2026-09-18) is bought only by a turn that actually appends a carrier. The
- * render is memoized: the legacy text-comparison branch and the append both read
- * the same string.
- */
-interface PreparedHarnessDigest {
-	readonly state: HarnessState;
-	readonly stateFingerprint: string;
-	render(): string;
-}
-
-/**
- * Identity of the three digest render flags. A rebuild that leaves them alone (an
- * rlm depth cap, a reloaded agents file) must not invalidate a delivered digest, so
- * the tool-face seam compares a key instead of a fresh object.
- */
-function harnessDigestRenderFlagsKey(flags: {
-	includeIpythonExamples: boolean;
-	includeShellExamples: boolean;
-	includeRefineExamples: boolean;
-}): string {
-	return [flags.includeIpythonExamples, flags.includeShellExamples, flags.includeRefineExamples]
-		.map((flag) => (flag ? "1" : "0"))
-		.join("");
-}
-
-/**
- * Entry keys whose presence or version differs between two fingerprints: the
- * added / removed / version-bumped set the material-change gate judges.
- */
-function changedHarnessEntryKeys(previous: Map<string, number>, next: Map<string, number>): Set<string> {
-	const changed = new Set<string>();
-	for (const [key, version] of next) {
-		if (previous.get(key) !== version) changed.add(key);
-	}
-	for (const key of previous.keys()) {
-		if (!next.has(key)) changed.add(key);
-	}
-	return changed;
-}
-
-/**
  * Queue priority is derived from the fork's single input-classification point instead of
  * carrying its own heuristic (#2334 reconciliation). `classifyIncomingInput` reads structure
  * only - never the message text - so a child reply cannot forge its way to the front of the
@@ -2052,7 +1997,7 @@ export class AgentSession {
 	private readonly _sessionInputCheckpointWaiters = new Set<() => void>();
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 
-	private _goalState: GoalState = emptyGoalState();
+	_goalState: GoalState = emptyGoalState();
 	private _goalAccountingStartedAt: number | undefined = undefined;
 	private _goalContinuationAwaitsRlmWork = false;
 	private _goalAccountedAssistantMessages = new WeakSet<AssistantMessage>();
@@ -2250,23 +2195,23 @@ export class AgentSession {
 	 * untouched session keeps reading as empty to every raw message-count check
 	 * (draft cleanup, daemon session list, branch seedability, hasExistingSession).
 	 */
-	private _harnessDigestPending = false;
+	_harnessDigestPending = false;
 	/** Store stamps as of the last digest render; unchanged stamps skip the render entirely. */
-	private _harnessDigestStamps: HarnessStoreStamps | undefined;
+	_harnessDigestStamps: HarnessStoreStamps | undefined;
 	/** Entry identity as of the last digest render, for the material-change difference. */
-	private _harnessDigestFingerprint: Map<string, number> | undefined;
+	_harnessDigestFingerprint: Map<string, number> | undefined;
 	/**
 	 * Tool-face identity as of the last system-prompt rebuild (OBS-2). The digest's
 	 * call-contract wording follows the render flags, and a mid-session tool change
 	 * rebuilds the prompt without moving either store stamp, so the material-change
 	 * gate on its own would never notice.
 	 */
-	private _harnessDigestRenderFlagsKey: string | undefined;
+	_harnessDigestRenderFlagsKey: string | undefined;
 	/**
 	 * Entry keys this session already itemized for the model in a refinement receipt
 	 * (applied and refused), so a digest delta does not deliver the same news twice.
 	 */
-	private readonly _refinementReportedEntryVersions = new Map<string, number>();
+	readonly _refinementReportedEntryVersions = new Map<string, number>();
 	private _bashAbortControllers = new Set<AbortController>();
 	private _userBashRunning = false;
 	private _userBashAbortRequested = false;
@@ -2487,7 +2432,7 @@ export class AgentSession {
 
 	_modelRegistry: ModelRegistry;
 
-	private _toolRegistry: Map<string, AgentTool> = new Map();
+	_toolRegistry: Map<string, AgentTool> = new Map();
 	private readonly _warnedToolNameConflicts = new Set<string>();
 	private readonly _notifiedToolNameConflicts = new Set<string>();
 	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
@@ -13025,7 +12970,7 @@ export class AgentSession {
 		this._autoCompactionAbortController?.abort();
 	}
 
-	private _localHarnessStateDir(): string | undefined {
+	_localHarnessStateDir(): string | undefined {
 		return (
 			getLocalHarnessStateDir(this.sessionManager.ensureSessionArtifactDir()) ??
 			(this._rlmSessionDir ? getLocalHarnessStateDir(this._rlmSessionDir) : undefined)
@@ -13605,324 +13550,49 @@ export class AgentSession {
 		);
 	}
 
-	/** Global harness state overlaid with this session's local state, when persisted. */
-	/**
-	 * The compact harness digest delivered at cold context boundaries (session start,
-	 * resume, tree navigation, compaction head) and as a material-change delta.
-	 */
-	/**
-	 * Digest plus the fingerprint of the state that produced it. Delivery decisions
-	 * compare fingerprints, not rendered text (#2400): relevance query terms drift
-	 * per turn, so a rendered-text comparison would re-deliver an unchanged digest
-	 * at every boundary and stack near-duplicates into the context.
-	 */
 	private _prepareHarnessDigest(): PreparedHarnessDigest {
-		const state = this._loadMergedHarnessState();
-		const renderFlags = this._harnessDigestRenderFlags();
-		let rendered: string | undefined;
-		return {
-			state,
-			stateFingerprint: harnessDigestFingerprint(state, {
-				...renderFlags,
-				indexMaxBytes: this.settingsManager.getHarnessDigestIndexMaxBytes(),
-			}),
-			render: () => {
-				if (rendered === undefined) rendered = this._renderHarnessDigest(state, renderFlags);
-				return rendered;
-			},
-		};
+		return prepareHarnessDigest(this);
 	}
 
-	/** Digest plus fingerprint for the callers that always carry the text (compaction heads). */
 	private _harnessDigestWithFingerprint(): { digest: string; stateFingerprint: string; state: HarnessState } {
-		const prepared = this._prepareHarnessDigest();
-		return {
-			digest: prepared.render(),
-			stateFingerprint: prepared.stateFingerprint,
-			state: prepared.state,
-		};
+		return harnessDigestWithFingerprint(this);
 	}
 
-	private _harnessDigestRenderFlags(): {
-		includeIpythonExamples: boolean;
-		includeShellExamples: boolean;
-		includeRefineExamples: boolean;
-	} {
-		// Same validation `_rebuildSystemPrompt` applies before handing tool names to
-		// the prompt: an unregistered name must not flip the example sections.
-		const tools = this.getActiveToolNames().filter((name) => this._toolRegistry.has(name));
-		const hasIpython = tools.includes("ipython");
-		const visibleSkills = this._modelVisibleSkills().filter((skill) => !skill.disableModelInvocation);
-		const hasRefineSkill = visibleSkills.some((skill) => skill.name === REFINE_SKILL_NAME);
-		return {
-			includeIpythonExamples: hasIpython,
-			includeShellExamples: tools.includes("bash"),
-			includeRefineExamples: hasIpython && hasRefineSkill,
-		};
-	}
-
-	/**
-	 * OBS-2: drop the "already delivered" baselines when the tool face behind the
-	 * render flags moved. Hooked into `_rebuildSystemPrompt` - the single seam every
-	 * tool and skill change already goes through (nine call sites: construction, tool
-	 * add/remove, `setActiveToolsByName`, two rlm-depth paths, extension resources) -
-	 * so nothing has to be enumerated per call site and no turn pays for it. The next
-	 * turn then re-renders and gate A rejects or delivers on the fingerprint, which
-	 * already covers these flags. The first observation is construction, not a change:
-	 * nothing has been delivered yet.
-	 */
 	private _noteHarnessDigestToolFaceChange(): void {
-		const key = harnessDigestRenderFlagsKey(this._harnessDigestRenderFlags());
-		const previous = this._harnessDigestRenderFlagsKey;
-		this._harnessDigestRenderFlagsKey = key;
-		if (previous !== undefined && previous !== key) {
-			this._invalidateHarnessDigestBaselines();
-		}
+		noteHarnessDigestToolFaceChange(this);
 	}
 
-	/**
-	 * Rendered from the same inputs `buildSystemPrompt` used, so the text the model
-	 * reads is byte-for-byte the menu it read when the digest still lived in the prompt.
-	 */
-	private _renderHarnessDigest(
-		state: HarnessState,
-		renderFlags: {
-			includeIpythonExamples: boolean;
-			includeShellExamples: boolean;
-			includeRefineExamples: boolean;
-		},
-	): string {
-		return formatHarnessStateForPrompt(state, {
-			...renderFlags,
-			indexMaxBytes: this.settingsManager.getHarnessDigestIndexMaxBytes(),
-			queryTerms: this._buildHarnessDigestQueryTerms(),
-		});
-	}
-
-	/**
-	 * Relevance signal for the harness digest: terms from the active goal
-	 * objective (strongest) and the last few user/assistant messages,
-	 * newest first. Scores are precomputed once per render and the sort compares
-	 * numbers (rankHarnessEntriesForQuery), so the ranked window stays cheap even
-	 * on a large shared store; the 48-term cap bounds the per-entry sweep.
-	 * A digest render happens before the current turn's message is committed,
-	 * so the terms lag one turn behind the wording (same tradeoff upstream
-	 * #2241 accepted); the next delivery picks the new wording up.
-	 */
-	private _buildHarnessDigestQueryTerms(): HarnessQueryTerms {
-		const terms = new Map<string, number>();
-		const addText = (text: string | undefined, weight: number) => {
-			if (!text) return;
-			for (const raw of harnessQueryTerms(text)) {
-				if (terms.size >= 48 && !terms.has(raw)) return;
-				if (!terms.has(raw)) terms.set(raw, weight);
-			}
-		};
-		addText(this._goalState.objective, 3);
-		const recent = this.agent.state.messages
-			.filter(
-				(message): message is UserMessage | AssistantMessage =>
-					message.role === "user" || message.role === "assistant",
-			)
-			.slice(-4)
-			.reverse();
-		let recencyWeight = 2;
-		for (const message of recent) {
-			const text =
-				message.role === "assistant"
-					? readAssistantText(message)
-					: typeof message.content === "string"
-						? message.content
-						: message.content
-								.filter((block): block is TextContent => block.type === "text")
-								.map((block) => block.text)
-								.join(" ");
-			addText(text, recencyWeight);
-			recencyWeight = Math.max(1, recencyWeight - 0.5);
-		}
-		return terms;
-	}
-
-	/**
-	 * Cold-boundary digest delivery. An empty context defers to the first committed
-	 * turn (an untouched session must keep reading as empty); a non-empty context
-	 * appends only when the newest in-context digest no longer matches disk.
-	 */
 	private _ensureHarnessDigestContext(): void {
-		if (this.agent.state.messages.length === 0) {
-			this._harnessDigestPending = true;
-			return;
-		}
-		this._harnessDigestPending = false;
-		this._appendHarnessDigestIfStale();
+		ensureHarnessDigestContext(this);
 	}
 
-	private _appendHarnessDigestIfStale(): void {
-		const prepared = this._prepareHarnessDigest();
-		this._recordHarnessDigestBaselines(prepared.state);
-		const latest = this._latestContextHarnessDigestDetails();
-		if (latest && this._harnessDigestIsFresh(latest, prepared)) return;
-		this._appendHarnessDigest(prepared.render(), prepared.stateFingerprint);
-	}
-
-	/**
-	 * Whether the newest in-context digest already reflects the current harness
-	 * state. A digest is fresh when its state fingerprint matches the current
-	 * one; a carrier written before fingerprints existed is compared by rendered
-	 * text instead, so it can be superseded once and then carries a fingerprint.
-	 */
 	private _harnessDigestIsFresh(
 		latest: { digest: string; stateFingerprint?: string },
 		prepared: PreparedHarnessDigest,
 	): boolean {
-		// A fingerprinted carrier is judged without rendering; only a carrier written
-		// before fingerprints existed forces the render (it has nothing else to
-		// compare), and it is superseded once, after which it carries a fingerprint.
-		return latest.stateFingerprint !== undefined
-			? latest.stateFingerprint === prepared.stateFingerprint
-			: latest.digest === prepared.render();
+		return harnessDigestIsFresh(latest, prepared);
 	}
 
-	/**
-	 * Material-change re-injection (merge doc 12.2, boss constraint: a long session
-	 * must never freeze the harness menu). Runs at turn preparation, so an entry
-	 * another seat wrote is model-visible on the next turn instead of at the next
-	 * cold boundary. Append-only: it adds a message at the tail and never rewrites a
-	 * byte that precedes it, so the provider's cached prefix survives.
-	 *
-	 * Cost discipline: every mutation path persists through `writePrivateFileAtomic`
-	 * (a rename, so a new inode), which makes the two store stamps a complete change
-	 * signal. When nothing moved the turn pays two `lstat` calls and reads no state
-	 * file; a moved stamp buys the parse plus the state fingerprint, and only a turn
-	 * that actually appends a carrier buys the ranked render (perf seats B/C
-	 * 2026-09-18: on the 1266-entry fixture the render alone is ~0.155 s mean of
-	 * synchronous event-loop time at the 48-term cap - 0.66-0.70 s before the
-	 * score-once rewrite - and every moved stamp used to pay it whether or not
-	 * anything was delivered).
-	 */
 	private _refreshHarnessDigestIfMateriallyChanged(): void {
-		const stamps = this._harnessStoreStamps();
-		if (this._harnessDigestStamps !== undefined && harnessStoreStampsEqual(this._harnessDigestStamps, stamps)) {
-			return;
-		}
-		const prepared = this._prepareHarnessDigest();
-		this._harnessDigestStamps = stamps;
-		const fingerprint = this._harnessEntryFingerprint(prepared.state);
-		const previous = this._harnessDigestFingerprint;
-		this._harnessDigestFingerprint = fingerprint;
-		// The harness state is the criterion, not the file's mtime or the rendered
-		// text: a touch, or a write that restored identical content, moves the stamp
-		// and changes nothing; query-term drift moves the text and changes nothing.
-		const latest = this._latestContextHarnessDigestDetails();
-		if (latest && this._harnessDigestIsFresh(latest, prepared)) return;
-		if (previous !== undefined) {
-			const changed = changedHarnessEntryKeys(previous, fingerprint);
-			// Every moved entry was already itemized for the model by this session's own
-			// refinement receipt (applied and refused alike), so a digest delta would
-			// deliver the same news twice (merge doc 14.2).
-			if (
-				changed.size > 0 &&
-				[...changed].every((key) => this._refinementReportedEntryVersions.get(key) === fingerprint.get(key))
-			) {
-				return;
-			}
-		}
-		this._appendHarnessDigest(prepared.render(), prepared.stateFingerprint);
+		refreshHarnessDigestIfMateriallyChanged(this);
 	}
 
-	private _appendHarnessDigest(digest: string, stateFingerprint?: string): void {
-		const message = createHarnessDigestMessage(digest, Date.now(), stateFingerprint);
-		try {
-			this.sessionManager.appendCustomMessageEntryWithRollback(
-				message.customType,
-				message.content,
-				message.display,
-				message.details,
-			);
-		} catch (error) {
-			if (this.sessionManager.getSessionFile()) {
-				// A persisted session that cannot record the digest loses it at the next
-				// context rebuild: report it instead of swallowing the failure.
-				sessionLog.warn("harness digest could not be persisted", {
-					sessionId: this.sessionId,
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
-			// An in-memory session has nothing to persist; context-only is the design.
-		}
-		this.agent.state.messages.push(message);
-	}
-
-	/** Store stamps behind the material-change gate: the global store and this session's local one. */
-	private _harnessStoreStamps(): HarnessStoreStamps {
-		const localDir = this._localHarnessStateDir();
-		return {
-			global: readHarnessStateStamp(getGlobalHarnessStateDir()),
-			local: localDir ? readHarnessStateStamp(localDir) : null,
-		};
-	}
-
-	/** Drop the "already delivered" baselines so the next turn re-renders and re-checks. */
 	private _invalidateHarnessDigestBaselines(): void {
-		this._harnessDigestStamps = undefined;
-		this._harnessDigestFingerprint = undefined;
+		invalidateHarnessDigestBaselines(this);
 	}
 
 	private _recordHarnessDigestBaselines(state: HarnessState): void {
-		this._harnessDigestStamps = this._harnessStoreStamps();
-		this._harnessDigestFingerprint = this._harnessEntryFingerprint(state);
+		recordHarnessDigestBaselines(this, state);
 	}
 
-	/** Identity of every harness entry (kind, store, id) to its version: additions, deletions and version bumps all move it. */
-	private _harnessEntryFingerprint(state: HarnessState): Map<string, number> {
-		const fingerprint = new Map<string, number>();
-		for (const kind of Object.keys(state.entries) as Array<keyof HarnessState["entries"]>) {
-			for (const [id, entry] of Object.entries(state.entries[kind] ?? {})) {
-				fingerprint.set(`${kind}:${entry.scope ?? "unscoped"}:${id}`, entry.version);
-			}
-		}
-		return fingerprint;
-	}
-
-	/**
-	 * Recency is the greatest timestamp among all in-context digest carriers, not the
-	 * last array position: retained pre-compaction messages are presented after the
-	 * compaction head while being chronologically older, and an old retained digest
-	 * must not defeat dedupe.
-	 */
 	private _latestContextHarnessDigestDetails():
 		| { timestamp: number; digest: string; stateFingerprint?: string }
 		| undefined {
-		let latest: { timestamp: number; digest: string; stateFingerprint?: string } | undefined;
-		for (const message of this.agent.state.messages) {
-			if (message.role === "custom" && message.customType === HARNESS_DIGEST_CUSTOM_TYPE) {
-				const details = message.details as HarnessDigestDetails | undefined;
-				if (details?.digest !== undefined && (!latest || message.timestamp >= latest.timestamp)) {
-					latest = {
-						timestamp: message.timestamp,
-						digest: details.digest,
-						stateFingerprint: details.stateFingerprint,
-					};
-				}
-			} else if (message.role === "compactionSummary") {
-				if (message.harnessDigest !== undefined && (!latest || message.timestamp >= latest.timestamp)) {
-					latest = {
-						timestamp: message.timestamp,
-						digest: message.harnessDigest,
-						stateFingerprint: message.harnessStateFingerprint,
-					};
-				}
-			}
-		}
-		return latest;
+		return latestContextHarnessDigestDetails(this);
 	}
 
 	private _loadMergedHarnessState(): HarnessState {
-		const localHarnessStateDir = this._localHarnessStateDir();
-		return mergeHarnessStates(
-			loadHarnessState(getGlobalHarnessStateDir(), "global"),
-			localHarnessStateDir ? loadHarnessState(localHarnessStateDir, "local") : undefined,
-		);
+		return loadMergedHarnessState(this);
 	}
 
 	private _loadRefinementHistory(): RefinementResult[] {
@@ -15633,7 +15303,7 @@ export class AgentSession {
 	 * Skills exposed to the model (system prompt + kernel). The bundled goal
 	 * and compact skills are withheld when disabled for this session.
 	 */
-	private _modelVisibleSkills(): Skill[] {
+	_modelVisibleSkills(): Skill[] {
 		let skills = this._resourceLoader.getSkills().skills;
 		if (!this._includeGoals) {
 			skills = skills.filter((skill) => skill.name !== GOAL_SKILL_NAME);
