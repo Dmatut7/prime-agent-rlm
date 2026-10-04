@@ -14,11 +14,14 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-05，wave-45 已 SHIP）
+## 当前状态（2026-10-05，wave-46 已 SHIP）
 
-- HEAD = 见 git log（三批：第十一刀、插话钉测试、FORK_NOTES+账本+AGENTS.md）。
-- wave-45：agent-session.ts 18991 行（十一刀累计 −4509）；插话复核销账（设计如此）；
-  AGENTS.md 有了「Code Review Rules」节（5 条，全从事故来）。
+- HEAD = 见 git log（三批：第十二刀、flake 加固、FORK_NOTES+账本）。
+- wave-46：agent-session.ts 18111 行（十二刀累计 −5389）；负载抖动族六例加固成负载免疫
+  形态（状态屏障/交错取最小/CPU 阈值重校准），5 连跑+12 忙循环压测全绿。
+- 走查 fresh-eyes 三发现进 wave-47：/refine 完成零可见反馈行、--resume 提示丢旗标、
+  未定价模型 footer 双形态。
+- walkthrough 矩阵 v1 落地（docs/fork/walkthrough-matrix.md，走查 lane 的固定格子）。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -99,10 +102,9 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
   把在跑会话归档。犯了就是事故，写进 FORK_NOTES 向老板披露。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-46 候选）
+## 下一波主题（wave-47 候选）
 
-1. 【第十二刀 refine-scheduler】按设计稿第二刀（docs/fork/refine-cluster-split-plan.md）：
-   ~890 行/21 方法，单向 import execution。
-2. 【walkthrough 矩阵 v1】install/attach/resume/shutdown × daemon 新旧组合（调研 §3）。
-3. 【脱敏 4 变体】等老板勾安全簇方案后派工；不勾不动。
-4. 【老板挂账】第 0 条历史改写；记忆帽三选一；安全簇 11 项。
+1. 【走查 fresh-eyes 三件】/refine 完成零可见反馈行（display:true 却没渲染行）；
+   退出提示 --resume 丢 --daemon-socket 等旗标；未定价模型 footer 双形态不一致。
+2. 【暖池 memory 测试持续观察】flake 加固后若再抖才进一步处理（已换形态，等证据）。
+3. 【老板挂账】安全簇勾选、第 0 条历史改写、记忆帽三选一。

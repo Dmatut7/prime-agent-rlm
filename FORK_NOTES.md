@@ -1,3 +1,13 @@
+## 2026-10-04 wave-46 四路：第十二刀 refine-scheduler、负载抖动测试族加固
+
+- AgentSession 第十二刀：refine 调度+入口簇（serialized checkpoint 族 8、kernel host 入口、dispose 排空、交互式调度族 11，共 21 方法 + SerializedBackgroundPlanResult + autoRefineInstructions + writable-probe TTL）搬进 core/refine-scheduler.ts——agent-session.ts 18991→18111 行（十二刀累计 23500→18111，−5389），新模块 1133 行含 RefineSchedulerHost seam；守恒 66/66 逐字节全等（21 体+21 注释+3 模块项+21 壳，biome 同版同格双边归一后 diff）。
+- 单向分层：scheduler→execution 仅 import RefineSkippedError，execution 是叶无回边；21 个一层壳全留（spy 钩子点太多），簇内调用全走 host 分派，spy 拦截面逐字保留。
+- 门禁：check EXIT 0、hygiene OK、波及测试 692 绿（31 文件，含 serialized-refine/auto-refine-probe/daemon-serialized-refine/2098）。需要重新编译并重启后才生效。
+- 负载抖动测试族加固（三波连抖的六例）：全部改成负载免疫形态——状态屏障替代裸 sleep（footer watcher 的 debounce 断言改测「相邻 refresh 间隔」不变量）、计时断言改 tier 交错取最小值消漂移、CPU 阈值按 CI 共享机重校准（回归仍 3.3x 被抓，阳性对照验证）；每例 5 连跑 + 4/12 忙循环压测全绿。
+- 走查：主流程 + 记忆/refine 路径全绿；fresh-eyes 三发现进 wave-47（/refine 完成零可见反馈行、--resume 提示丢旗标、未定价模型 footer 两种文案不一致）。
+- 调研零增量（八源逐字同基线）。
+- 门禁：check EXIT 0、hygiene OK、复扫见账本。需要重新编译并重启后才生效。
+
 ## 2026-10-04 wave-45 四路：第十一刀 refine-execution、插话复核销账、评审规则进 AGENTS.md
 
 - AgentSession 第十一刀：refine 执行核（refine/plan/apply/回执族）搬进 core/refine-execution.ts——agent-session.ts 19520→18991 行（十一刀累计 23500→18991，−4509），守恒 20/20 逐字节全等；一处 spy 绕过被抓后改经 host 分派（这正是流程钉测试存在的意义）。
