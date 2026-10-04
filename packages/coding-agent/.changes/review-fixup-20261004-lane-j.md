@@ -1,0 +1,4 @@
+- Fixed a worker crash losing user inputs queued behind an idle, Esc-paused, or quota-parked session: the interruption marker now carries them from the dead worker's journal and replays them on the next open.
+- Fixed a scheduled wake retrying every minute forever after the session's project directory was deleted: the launch now refuses a missing directory up front, and the affected jobs are paused with the reason recorded (restore the directory and resume the job to re-arm it).
+- Fixed a worker that exhausted its crash-restart budget still covering its session's scheduled jobs, leaving them dark forever; the wake scan now treats a dormant failed worker as uncovered and re-drives the schedule through the normal reclaim path.
+- Fixed the crash auto-resume staleness gate reading the interruption marker's detection time, so a crash found after a long downtime no longer looks fresh, and made the consecutive crash-resume loop guard decay over 24 hours.

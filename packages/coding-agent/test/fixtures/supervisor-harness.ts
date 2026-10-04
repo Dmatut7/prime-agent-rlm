@@ -58,6 +58,13 @@ export interface SupervisorHarnessOptions {
 	scheduledJobsArtifact?: boolean;
 	/** Extra files to drop into the descriptor directory before startup. */
 	descriptorFiles?: Record<string, string>;
+	/**
+	 * Recovery-journal records the (dead) worker left on disk, written before the
+	 * supervisor starts. Receives the root fixture session so records can name its
+	 * ids; entries are serialized one JSON line each, exactly as a crashed worker's
+	 * journal would read back.
+	 */
+	recoveryJournalRecords?: (session: FakeWorkerSession) => readonly Record<string, unknown>[];
 }
 
 export interface SupervisorHarness {
@@ -209,6 +216,10 @@ export async function startSupervisorHarness(options: SupervisorHarnessOptions):
 	writeWorkerDescriptor(descriptor, descriptorPath);
 	for (const [name, contents] of Object.entries(options.descriptorFiles ?? {})) {
 		writeFileSync(join(descriptorDir, name), contents);
+	}
+	if (options.recoveryJournalRecords) {
+		const records = options.recoveryJournalRecords(session);
+		writeFileSync(descriptor.recoveryJournalPath, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
 	}
 
 	// The catalog subprocess is out of scope for supervisor tests: stub the two

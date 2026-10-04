@@ -58,12 +58,12 @@ import {
 	shouldReapOrphanProcess,
 } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
-import { runRetentionSweepOnce } from "../../core/retention/runner.js";
 import {
 	canEvictWorker,
 	type IdleEvictionMinutes,
 	type WorkerEvictionSnapshot,
 } from "../../core/session-action-store.js";
+import { MissingSessionCwdError } from "../../core/session-cwd.js";
 import {
 	canonicalSessionPath,
 	getProcessStartId,
@@ -187,6 +187,14 @@ import {
 	waitForDaemonStartupFence,
 	writeJsonAtomically,
 } from "./daemon-supervisor-ownership.js";
+import {
+	clearFailedWorkerReaperTimer,
+	clearRetentionSweepTimer,
+	DaemonReaperState,
+	type DaemonSupervisorReaperHost,
+	startFailedWorkerReaper,
+	startRetentionSweepTimer,
+} from "./daemon-supervisor-reaper.js";
 import {
 	applyWorkerRosterSnapshot,
 	chainWorkerRosterApply,
@@ -999,6 +1007,15 @@ function activeScheduledJobs(rows: PassiveScheduledJob[]): PassiveScheduledJob[]
 	return rows.filter((row) => row.job.status === "active" || row.job.status === "paused");
 }
 
+/** Missing is an error; a regular file at the path fails the spawn the same way, so both read as unusable. */
+function isExistingDirectory(path: string): boolean {
+	try {
+		return statSync(path).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
 interface WorkerAttachData {
 	result: DaemonAttachResult;
 	worker: ResidentWorker;
@@ -1549,11 +1566,7 @@ export class DaemonSupervisor {
 	private readonly degradedCounts = new Map<string, number>();
 	private readonly degradedLogState = new Map<string, { at: number; suppressed: number }>();
 	private uninstallCrashHandlers?: () => void;
-	private failedWorkerReaperTimer?: NodeJS.Timeout;
-	private failedWorkerReapSweep?: Promise<void>;
 	private readonly retentionSweepCheckIntervalMs: number;
-	private retentionSweepTimer?: NodeJS.Timeout;
-	private lastRetentionSweepAtMs = 0;
 	/** True when this process is a worker-driven replacement launch (DAEMON_SUPERVISOR_RELAUNCH_ENV). */
 	private readonly relaunch: boolean;
 	/**
@@ -1750,6 +1763,76 @@ export class DaemonSupervisor {
 			};
 		}
 		return this.rosterSyncHostValue;
+	}
+
+	/**
+	 * Reaper/retention state, owned by ./daemon-supervisor-reaper.js (wave-52,
+	 * the fourth Host-seam cut on this class). Lazy like the warm-pool, adoption
+	 * and roster-sync seats: prototype-harness supervisors in tests bypass the
+	 * constructor, and the timer/sweep readers must see an empty seat there
+	 * instead of throwing.
+	 */
+	private reaperStateValue?: DaemonReaperState;
+	private get reaperState(): DaemonReaperState {
+		if (this.reaperStateValue === undefined) {
+			this.reaperStateValue = new DaemonReaperState();
+		}
+		return this.reaperStateValue;
+	}
+	private reaperHostValue?: DaemonSupervisorReaperHost;
+	/**
+	 * The seam the extracted reaper+retention cluster operates on. Same
+	 * construction as `warmPoolHost`, `adoptionHost` and `rosterSyncHost`: a
+	 * facade of live getters and arrows built inside the class (no casts, no
+	 * visibility changes), so the memoized facade never goes stale and
+	 * instance-level dispatch is preserved exactly.
+	 * `workerHasScheduledJobs` / `workerHasAttachedClient` /
+	 * `flipWorkerRosterEntriesInactive` route back through the class shells so
+	 * an own-property stub of those names keeps intercepting.
+	 */
+	private get reaperHost(): DaemonSupervisorReaperHost {
+		if (this.reaperHostValue === undefined) {
+			const supervisor = this;
+			this.reaperHostValue = {
+				get reaperState() {
+					return supervisor.reaperState;
+				},
+				get workers() {
+					return supervisor.workers;
+				},
+				get shuttingDown() {
+					return supervisor.shuttingDown;
+				},
+				get degraded() {
+					return supervisor.degraded;
+				},
+				get settingsManager() {
+					return supervisor.settingsManager;
+				},
+				get defaultSessionConfig() {
+					return supervisor.defaultSessionConfig;
+				},
+				get failedWorkerReapIntervalMs() {
+					return supervisor.failedWorkerReapIntervalMs;
+				},
+				get retentionSweepCheckIntervalMs() {
+					return supervisor.retentionSweepCheckIntervalMs;
+				},
+				get adoptionState() {
+					return supervisor.adoptionState;
+				},
+				background: <T>(operation: Promise<T>, context: string): void => supervisor.background(operation, context),
+				log: (message) => supervisor.log(message),
+				logDegraded: (cause, message) => supervisor.logDegraded(cause, message),
+				isWorkerStopping: (worker) => supervisor.isWorkerStopping(worker),
+				workerHasScheduledJobs: (worker) => supervisor.workerHasScheduledJobs(worker),
+				workerHasAttachedClient: (worker) => supervisor.workerHasAttachedClient(worker),
+				flipWorkerRosterEntriesInactive: (worker) => supervisor.flipWorkerRosterEntriesInactive(worker),
+				deleteWorkerDescriptor: (worker) => supervisor.deleteWorkerDescriptor(worker),
+				broadcastHeartbeatsChanged: () => supervisor.broadcastHeartbeatsChanged(),
+			};
+		}
+		return this.reaperHostValue;
 	}
 
 	constructor(
@@ -2157,6 +2240,23 @@ export class DaemonSupervisor {
 		this.passiveScheduledJobsScan = undefined;
 	}
 
+	/**
+	 * Whether a resident registration still covers its tree's scheduled wakes. A
+	 * worker parked failed with nothing left driving it - no in-flight recovery, no
+	 * armed re-adoption retry - never fires the schedule again; counting it as
+	 * covered used to park the tree dark forever once the crash-restart budget ran
+	 * out. The wake's createOrReuseWorker then reclaims (dead process) or retries
+	 * (live process) the registration through the usual path. A client-owned worker
+	 * keeps covering even when failed: only its owner's reattach re-drives it, and
+	 * the wake cannot.
+	 */
+	private workerCoversPassiveScheduledJobs(worker: ResidentWorker): boolean {
+		if (worker.descriptor.lifecycle !== "failed") return true;
+		if (worker.descriptor.ownerClientId !== undefined) return true;
+		if (worker.recovery !== undefined || worker.deferredRecovery !== undefined) return true;
+		return this.adoptionState.retryTimers.has(worker);
+	}
+
 	/** The uncached disk scan; all statuses load so one row set serves every caller's filter. */
 	private async scanPassiveScheduledJobs(): Promise<PassiveScheduledJob[]> {
 		const pendingCancelRoots = new Set<string>();
@@ -2190,7 +2290,8 @@ export class DaemonSupervisor {
 			const visited = new Set([canonicalSessionPath(current.path)]);
 			while (true) {
 				try {
-					if (this.findWorkerBySessionFile(current.path)) return undefined;
+					const covering = this.findWorkerBySessionFile(current.path);
+					if (covering && this.workerCoversPassiveScheduledJobs(covering)) return undefined;
 				} catch {
 					return undefined;
 				}
@@ -2260,20 +2361,42 @@ export class DaemonSupervisor {
 			return;
 		}
 		try {
-			const due = new Map<string, string>();
-			for (const { rootSessionFile, job } of await this.collectPassiveScheduledJobs()) {
+			const due = new Map<string, { sessionPath: string; rows: PassiveScheduledJob[] }>();
+			for (const row of await this.collectPassiveScheduledJobs()) {
+				const { rootSessionFile, job } = row;
 				if (job.status !== "active" || job.nextRunAt === undefined) continue;
 				const runAt = Date.parse(job.nextRunAt);
 				if (!Number.isFinite(runAt) || runAt > now) continue;
-				due.set(canonicalSessionPath(rootSessionFile), rootSessionFile);
+				const key = canonicalSessionPath(rootSessionFile);
+				const entry = due.get(key);
+				if (entry) {
+					entry.rows.push(row);
+				} else {
+					due.set(key, { sessionPath: rootSessionFile, rows: [row] });
+				}
 			}
-			for (const [rootKey, sessionPath] of due) {
+			for (const [rootKey, { sessionPath, rows }] of due) {
 				if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
 				try {
 					await this.createOrReuseWorker(SCHEDULED_WAKE_CLIENT_ID, { type: "create", sessionPath });
 					this.scheduledWakeFailures.delete(rootKey);
 					this.log(`Woke session worker for a due scheduled job: ${sessionPath}`);
 				} catch (error) {
+					if (error instanceof MissingSessionCwdError) {
+						// The session's project directory is gone, so every later wake fails
+						// the same launch: park the tree's due jobs with the reason on them
+						// instead of retrying the failure at every wake. Recovery: restore
+						// the directory and resume the job (heartbeat/rlm_heartbeat resume,
+						// or cancel + re-add).
+						const paused = this.pausePassiveScheduledJobsForMissingCwd(rows, error.issue.sessionCwd);
+						this.scheduledWakeFailures.delete(rootKey);
+						this.log(
+							paused > 0
+								? `Scheduled wake paused ${paused} job(s) for ${sessionPath}: the session working directory no longer exists: ${error.issue.sessionCwd}`
+								: `Scheduled wake cannot launch for ${sessionPath}: the session working directory no longer exists: ${error.issue.sessionCwd}`,
+						);
+						continue;
+					}
 					this.scheduledWakeFailures.set(rootKey, Date.now());
 					this.log(`Scheduled wake failed for ${sessionPath}: ${String(error)}`);
 				}
@@ -2281,6 +2404,38 @@ export class DaemonSupervisor {
 		} finally {
 			this.scheduleScheduledSessionWakeRecompute();
 		}
+	}
+
+	/**
+	 * Parks the due jobs of a tree whose wake can no longer launch, with the reason
+	 * on each job's lastError, and drops the cached listing so the pause shows at
+	 * once. Returns how many jobs actually moved to paused.
+	 */
+	private pausePassiveScheduledJobsForMissingCwd(rows: readonly PassiveScheduledJob[], missingCwd: string): number {
+		const reason =
+			`Scheduled wake paused: the session working directory no longer exists: ${missingCwd}. ` +
+			`Restore the directory and resume the job to re-arm it.`;
+		const store = AgentCronJobStore.forSessionArtifacts();
+		const registered = new Set<string>();
+		let paused = 0;
+		for (const row of rows) {
+			if (!registered.has(row.info.id)) {
+				store.registerSessionArtifact(
+					row.info.id,
+					getSessionArtifactPathForFile(resolve(row.info.path), row.info.id),
+				);
+				registered.add(row.info.id);
+			}
+			try {
+				if (store.pauseJob(row.job.id, { reason })) paused += 1;
+			} catch (error) {
+				this.log(
+					`Could not pause scheduled job ${row.job.id} after its wake became unlaunchable: ${String(error)}`,
+				);
+			}
+		}
+		if (paused > 0) this.invalidatePassiveScheduledJobs();
+		return paused;
 	}
 
 	private scheduleIdleEvictionSweep(): void {
@@ -4988,6 +5143,19 @@ export class DaemonSupervisor {
 			...withoutSupervisorCreateFields(launchCommand),
 			config: mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, launchCommand.config),
 		};
+		// Refuse a launch into a directory that is not there: the spawn would fail
+		// with an opaque ENOENT, and a scheduled wake would retry that failure at
+		// every wake. The typed error lets the wake path park the session's jobs
+		// with the reason on them. There is deliberately no fallback to another
+		// directory - running in the wrong project is the failure this replaces.
+		const launchCwd = createCommand.config?.cwd ?? process.cwd();
+		if (!isExistingDirectory(launchCwd)) {
+			throw new MissingSessionCwdError({
+				...(command.sessionPath !== undefined ? { sessionFile: command.sessionPath } : {}),
+				sessionCwd: launchCwd,
+				fallbackCwd: process.cwd(),
+			});
+		}
 		// A fresh create may claim a pooled spare: the spare process is
 		// byte-identical to what the cold spawn below would produce (same cwd, same
 		// environment fingerprint), so claiming it is scheduling, not a semantic
@@ -5531,207 +5699,24 @@ export class DaemonSupervisor {
 		return workerHasAttachedClient(this.adoptionHost, worker);
 	}
 
+	// The reaper and retention-sweep method bodies moved to
+	// ./daemon-supervisor-reaper.js (wave-52); these shells keep every call site
+	// and the instance-level dispatch unchanged. The doc comments live with the
+	// bodies there.
 	private startFailedWorkerReaper(): void {
-		if (this.failedWorkerReaperTimer) {
-			return;
-		}
-		this.failedWorkerReaperTimer = setInterval(() => {
-			this.background(this.reapFailedWorkers(), "failed worker reaper");
-		}, this.failedWorkerReapIntervalMs);
-		this.failedWorkerReaperTimer.unref();
+		startFailedWorkerReaper(this.reaperHost);
 	}
 
 	private clearFailedWorkerReaperTimer(): void {
-		if (!this.failedWorkerReaperTimer) {
-			return;
-		}
-		clearInterval(this.failedWorkerReaperTimer);
-		this.failedWorkerReaperTimer = undefined;
+		clearFailedWorkerReaperTimer(this.reaperHost);
 	}
 
 	private startRetentionSweepTimer(): void {
-		if (this.retentionSweepTimer) {
-			return;
-		}
-		this.retentionSweepTimer = setInterval(() => {
-			this.background(this.runRetentionSweepIfDue(), "retention sweep");
-		}, this.retentionSweepCheckIntervalMs);
-		this.retentionSweepTimer.unref();
+		startRetentionSweepTimer(this.reaperHost);
 	}
 
 	private clearRetentionSweepTimer(): void {
-		if (!this.retentionSweepTimer) {
-			return;
-		}
-		clearInterval(this.retentionSweepTimer);
-		this.retentionSweepTimer = undefined;
-	}
-
-	/**
-	 * The disk-retention sweep, on the cadence `retention.sweepIntervalMinutes`
-	 * asks for. Only the daemon runs it on a timer: a short-lived CLI process must
-	 * not perform a large delete while it is exiting. `retention.enabled: false`
-	 * and the per-class zero knobs keep the sweep report-only, the runner has its
-	 * own in-flight guard so a slow sweep cannot stack, and the runner's sweep guard
-	 * keeps a second process on the same agent dir out of the same accounts.
-	 *
-	 * The cadence clock moves only after a sweep that actually ran. A trigger that
-	 * found the guard held by another process did no work, so it is not a sweep at
-	 * this timestamp: the next check tick tries again instead of waiting out a full
-	 * interval for nothing.
-	 */
-	private async runRetentionSweepIfDue(now = Date.now()): Promise<void> {
-		if (this.shuttingDown) {
-			return;
-		}
-		const settings = this.settingsManager.getRetentionSettings();
-		const intervalMs = settings.sweepIntervalMinutes * 60_000;
-		if (intervalMs <= 0) {
-			return;
-		}
-		if (this.lastRetentionSweepAtMs !== 0 && now - this.lastRetentionSweepAtMs < intervalMs) {
-			return;
-		}
-		const outcome = await runRetentionSweepOnce({
-			settings,
-			...(this.defaultSessionConfig.agentDir ? { agentDir: this.defaultSessionConfig.agentDir } : {}),
-			residentSessionIds: this.residentSessionIds(),
-		});
-		if (outcome.lockHeld) {
-			this.log(
-				`retention sweep skipped: another sweep holds the guard${outcome.holder ? ` (${outcome.holder})` : ""}`,
-			);
-			return;
-		}
-		this.lastRetentionSweepAtMs = now;
-		const report = outcome.report;
-		if (!report) {
-			return;
-		}
-		this.log(
-			`retention sweep: reclaimed ${report.totals.reclaimed} entries / ${report.totals.bytes} bytes` +
-				`${report.capped ? " (per-sweep cap reached)" : ""}${report.dryRun ? " (dry run)" : ""}` +
-				`${outcome.lockUnavailable ? " (no sweep guard)" : ""}`,
-		);
-	}
-
-	/** Session ids this supervisor has resident, so a sweep never touches them. */
-	private residentSessionIds(): ReadonlySet<string> {
-		const ids = new Set<string>();
-		for (const worker of this.workers.values()) {
-			for (const summary of worker.summaries.values()) {
-				ids.add(summary.id);
-				if (summary.activeSessionId) {
-					ids.add(summary.activeSessionId);
-				}
-			}
-		}
-		return ids;
-	}
-
-	/**
-	 * L5: a failed worker whose process is verifiably gone is archived into the log
-	 * and removed, so restarts stop replaying the same corpses and the agents view
-	 * stops carrying rows nobody can act on. Low frequency by design: this is
-	 * cleanup, not liveness detection.
-	 */
-	private async reapFailedWorkers(now = Date.now()): Promise<void> {
-		if (this.failedWorkerReapSweep || this.shuttingDown) {
-			return this.failedWorkerReapSweep;
-		}
-		this.failedWorkerReapSweep = this.reapFailedWorkersOnce(now).finally(() => {
-			this.failedWorkerReapSweep = undefined;
-		});
-		return this.failedWorkerReapSweep;
-	}
-
-	private async reapFailedWorkersOnce(now: number): Promise<void> {
-		const thresholdHours = this.settingsManager.getDaemonSupervisorSettings().failedWorkerReapHours;
-		if (thresholdHours === undefined) {
-			return;
-		}
-		const thresholdMs = thresholdHours * 60 * 60 * 1000;
-		const candidates = [...this.workers.values()].filter((worker) =>
-			this.isFailedWorkerReapCandidate(worker, now, thresholdMs),
-		);
-		if (candidates.length === 0) {
-			return;
-		}
-		for (const worker of candidates) {
-			if (this.shuttingDown) {
-				return;
-			}
-			// I-7: the identity check may spawn `ps`, so it is awaited (never
-			// execFileSync) and the loop yields between candidates.
-			if (!(await this.isWorkerProcessConfirmedDead(worker))) {
-				continue;
-			}
-			if (this.hasUnconsumedRecoveryJournal(worker)) {
-				this.log(
-					`Keeping failed worker ${worker.descriptor.workerId}: its recovery journal still has unconsumed busy operations`,
-				);
-				continue;
-			}
-			if (this.degraded) {
-				// M16: the reaper's inputs are bookkeeping. While the supervisor runs on
-				// state it could not persist, only the reversible half runs — the roster
-				// row goes inactive, the descriptor (an irreversible delete) is kept.
-				this.logDegraded(
-					"failed worker reaper deferred",
-					`Failed-worker reaper deferred while degraded: kept ${worker.descriptor.workerId} on disk and only flipped its roster rows inactive`,
-				);
-				this.flipWorkerRosterEntriesInactive(worker);
-				continue;
-			}
-			this.archiveAndReapFailedWorker(worker, now);
-			await new Promise<void>((resolveYield) => setImmediate(resolveYield));
-		}
-	}
-
-	private isFailedWorkerReapCandidate(worker: ResidentWorker, now: number, thresholdMs: number): boolean {
-		if (worker.descriptor.lifecycle !== "failed") {
-			return false;
-		}
-		// An intentional or in-flight stop owns the registration until it finishes.
-		if (worker.descriptor.stopRequestedAt !== undefined || this.isWorkerStopping(worker)) {
-			return false;
-		}
-		if (worker.recovery || worker.deferredRecovery || worker.stopFinalization) {
-			return false;
-		}
-		if (this.adoptionState.retryTimers.has(worker)) {
-			return false;
-		}
-		// Exemptions: a schedule that still needs the tree, and anybody watching it.
-		if (this.workerHasScheduledJobs(worker) || this.workerHasAttachedClient(worker)) {
-			return false;
-		}
-		const failedAt = Date.parse(worker.descriptor.lastFailureAt ?? worker.descriptor.updatedAt);
-		if (!Number.isFinite(failedAt)) {
-			return false;
-		}
-		return now - failedAt >= thresholdMs;
-	}
-
-	/**
-	 * Death has to be proven twice before an irreversible delete: the pid must be
-	 * gone, and a pid that is alive must demonstrably belong to somebody else. An
-	 * unobservable identity counts as alive, so a transient `ps` failure can never
-	 * authorise deleting a registration.
-	 */
-	private async isWorkerProcessConfirmedDead(worker: ResidentWorker): Promise<boolean> {
-		return isProcessIdentityConfirmedDead(worker.descriptor.pid, worker.descriptor.processStartId);
-	}
-
-	private hasUnconsumedRecoveryJournal(worker: ResidentWorker): boolean {
-		try {
-			const journal = new WorkerRecoveryJournal(worker.descriptor.recoveryJournalPath);
-			return journal.getLatest().some((record) => record.busy);
-		} catch {
-			// An unreadable journal is treated as unconsumed: deleting the descriptor
-			// would drop the only record of operations that may need interruption.
-			return true;
-		}
+		clearRetentionSweepTimer(this.reaperHost);
 	}
 
 	/**
@@ -5791,61 +5776,6 @@ export class DaemonSupervisor {
 				? worker.descriptor.createCommand
 				: { ...worker.descriptor.createCommand, type: "create", sessionPath };
 		return { command };
-	}
-
-	/** C17: the failed descriptor is the only on-disk evidence of an OOM-class accident, so it is archived before deletion. */
-	private archiveAndReapFailedWorker(worker: ResidentWorker, now: number): void {
-		const descriptor = worker.descriptor;
-		const failedAt = Date.parse(descriptor.lastFailureAt ?? descriptor.updatedAt);
-		const failedForMinutes = Number.isFinite(failedAt) ? Math.round((now - failedAt) / 60_000) : undefined;
-		this.log(
-			`Reaped failed worker ${descriptor.workerId} (reaped failed worker: pid ${descriptor.pid}, ` +
-				`processStartId ${descriptor.processStartId ?? "unknown"}, ` +
-				`failedForMinutes ${failedForMinutes ?? "unknown"}, ` +
-				`lastFailureAt ${descriptor.lastFailureAt ?? "unknown"}, ` +
-				`lastError ${descriptor.lastError ?? "unknown"}, ` +
-				`rootActiveSessionId ${descriptor.rootActiveSessionId}, ` +
-				`rootSessionId ${descriptor.rootSessionId ?? "unknown"}, ` +
-				`sessionFile ${descriptor.sessionFile ?? "unknown"}, ` +
-				`descriptorPath ${worker.descriptorPath}, ` +
-				`consecutiveFailures ${descriptor.consecutiveFailures})`,
-		);
-		this.workers.delete(descriptor.workerId);
-		this.flipWorkerRosterEntriesInactive(worker);
-		// L9F-1 / audit F2: this path used to delete the orphan journal without
-		// reaping it (reclaimStaleWorkerRegistration reaps first), leaking the dead
-		// worker's still-running bash children and leaving foreign dead records
-		// active until the file went. Reap both halves before the delete.
-		this.reapFailedWorkerOrphanJournal(worker);
-		this.deleteWorkerDescriptor(worker);
-		if (!this.shuttingDown) {
-			this.broadcastHeartbeatsChanged();
-		}
-	}
-
-	/**
-	 * L9F-1: the failed-worker reap path's journal cleanup. The owner half mirrors
-	 * `recoverUncertainWorkerOperations` (kill the dead worker's still-active bash
-	 * children, guarded by the same identity checks); the foreign half only retires
-	 * records whose pid is already gone, never killing anything a foreign writer
-	 * still owns. The journal itself still goes with the descriptor right after.
-	 */
-	private reapFailedWorkerOrphanJournal(worker: ResidentWorker): void {
-		const path = worker.descriptor.orphanProcessJournalPath;
-		if (!path) {
-			return;
-		}
-		try {
-			for (const orphan of readActiveOrphanProcesses(path, worker.descriptor.pid)) {
-				if (!shouldReapOrphanProcess(orphan)) {
-					continue;
-				}
-				killOrphanProcess(orphan.pid);
-			}
-			reapForeignOrphanProcessRecords(path, worker.descriptor.pid);
-		} catch (error) {
-			this.log(`Could not reap orphan journal of failed worker ${worker.descriptor.workerId}: ${String(error)}`);
-		}
 	}
 
 	private async adoptOrRecoverWorker(worker: ResidentWorker): Promise<void> {
@@ -6539,7 +6469,13 @@ export class DaemonSupervisor {
 		await this.assertRecoveryAllowed();
 		const journal = new WorkerRecoveryJournal(worker.descriptor.recoveryJournalPath);
 		const latest = journal.getLatest();
-		const uncertain = latest.filter((record) => record.busy);
+		// Busy records mark the interrupted turn; a non-busy record carrying
+		// queuedInputs marks an idle, Esc-paused or quota-parked session whose parked
+		// queue the crash would otherwise lose - the queue lives only in the dead
+		// worker's memory, and the journal copy is its whole recovery story.
+		const uncertain = latest.filter(
+			(record) => record.busy || (record.queuedInputs !== undefined && record.queuedInputs.length > 0),
+		);
 		if (uncertain.length > 0) await this.catalog.start();
 		await this.assertRecoveryAllowed();
 		if (this.isWorkerCleanupCancelled(worker)) {
@@ -6548,7 +6484,13 @@ export class DaemonSupervisor {
 
 		const interruptedSessions = new Map<
 			string,
-			{ activeSessionId: string; sessionFile: string; operations: Set<string>; queuedInputs?: string[] }
+			{
+				activeSessionId: string;
+				sessionFile: string;
+				operations: Set<string>;
+				queuedInputs?: string[];
+				crashedAt?: string;
+			}
 		>();
 		for (const record of uncertain) {
 			const sessionFile =
@@ -6573,6 +6515,16 @@ export class DaemonSupervisor {
 				interruptedSessions.set(key, interrupted);
 			}
 			interrupted.operations.add(record.operation);
+			// The last checkpoint before the death is a lower bound for the crash
+			// time; the marker carries it so the resume staleness gate reads the
+			// interruption's age instead of its discovery time.
+			const recordedAt = Date.parse(record.recordedAt);
+			if (Number.isFinite(recordedAt)) {
+				const current = interrupted.crashedAt !== undefined ? Date.parse(interrupted.crashedAt) : undefined;
+				if (current === undefined || recordedAt > current) {
+					interrupted.crashedAt = record.recordedAt;
+				}
+			}
 		}
 
 		await this.assertRecoveryAllowed();
@@ -6590,6 +6542,7 @@ export class DaemonSupervisor {
 						interrupted.activeSessionId,
 						[...interrupted.operations],
 						interrupted.queuedInputs,
+						interrupted.crashedAt,
 					);
 				} catch (error) {
 					// The notice is advisory: an unwritable session file must not abort

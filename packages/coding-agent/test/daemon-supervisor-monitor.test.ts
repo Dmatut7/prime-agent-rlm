@@ -4537,12 +4537,20 @@ describe("daemon worker supervisor monitoring", () => {
 			expect(kill).not.toHaveBeenCalled();
 			expect(markInterrupted).toHaveBeenCalledTimes(2);
 			// Fourth slot is the dead worker's queued user inputs; these sessions queued none.
-			expect(markInterrupted).toHaveBeenCalledWith("/tmp/root.jsonl", "root-active", ["model_stream"], undefined);
+			// Fifth is the crash-time lower bound (the records' last journal checkpoint).
+			expect(markInterrupted).toHaveBeenCalledWith(
+				"/tmp/root.jsonl",
+				"root-active",
+				["model_stream"],
+				undefined,
+				expect.any(String),
+			);
 			expect(markInterrupted).toHaveBeenCalledWith(
 				"/tmp/child.jsonl",
 				"child-active",
 				["tool_execution"],
 				undefined,
+				expect.any(String),
 			);
 		} finally {
 			kill.mockRestore();

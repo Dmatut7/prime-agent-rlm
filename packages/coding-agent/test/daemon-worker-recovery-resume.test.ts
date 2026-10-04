@@ -34,7 +34,11 @@ function entryBase(): { id: string; parentId: string | null; timestamp: string }
 	};
 }
 
-function markerEntry(options?: { queuedInputs?: string[]; timestamp?: string }): CustomMessageEntry {
+function markerEntry(options?: {
+	queuedInputs?: string[];
+	timestamp?: string;
+	crashedAt?: string;
+}): CustomMessageEntry {
 	const base = entryBase();
 	return {
 		...base,
@@ -47,6 +51,7 @@ function markerEntry(options?: { queuedInputs?: string[]; timestamp?: string }):
 			activeSessionId: "dead-worker-session",
 			operations: ["turn_end"],
 			...(options?.queuedInputs === undefined ? {} : { queuedInputs: options.queuedInputs }),
+			...(options?.crashedAt === undefined ? {} : { crashedAt: options.crashedAt }),
 		},
 	};
 }
@@ -61,17 +66,17 @@ function customMessageEntry(customType: string): CustomMessageEntry {
 	};
 }
 
-function messageEntry(role: "user" | "assistant", text = "text"): SessionMessageEntry {
+function messageEntry(role: "user" | "assistant", text = "text", timestamp = Date.now()): SessionMessageEntry {
 	return {
 		...entryBase(),
 		type: "message",
-		message: { role, content: text, timestamp: Date.now() } as SessionMessageEntry["message"],
+		message: { role, content: text, timestamp } as SessionMessageEntry["message"],
 	};
 }
 
 /** The resume prompt as it lands in the transcript: a user message carrying it. */
-function resumePromptEntry(): SessionMessageEntry {
-	return messageEntry("user", WORKER_RECOVERY_RESUME_PROMPT);
+function resumePromptEntry(timestamp = Date.now()): SessionMessageEntry {
+	return messageEntry("user", WORKER_RECOVERY_RESUME_PROMPT, timestamp);
 }
 
 function stateEntry(): SessionEntry {
@@ -303,6 +308,57 @@ describe("workerRecoveryResumeVerdict: the crash loop guard", () => {
 		expect(verdict.kind).toBe("skip");
 		if (verdict.kind !== "skip") throw new Error("expected skip");
 		expect(verdict.reason).toBe("stale");
+	});
+
+	it("judges staleness by the recorded crash time, not the marker's detection time", () => {
+		// A crash found only when the daemon came back after a long downtime stamps
+		// the marker "now"; the dead worker's last journal checkpoint (crashedAt) is
+		// the honest age. Without it the verdict reads a day-old crash as fresh and
+		// auto-resumes work nobody is watching anymore.
+		const marker = markerEntry({
+			timestamp: new Date().toISOString(),
+			crashedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+		});
+		const verdict = workerRecoveryResumeVerdict([messageEntry("user"), marker]);
+		expect(verdict).toEqual({ kind: "skip", reason: "stale" });
+	});
+
+	it("still resumes a fresh crash whose marker carries a recent crash time", () => {
+		const marker = markerEntry({
+			timestamp: new Date().toISOString(),
+			crashedAt: new Date(Date.now() - 60 * 1000).toISOString(),
+		});
+		expect(workerRecoveryResumeVerdict([messageEntry("user"), marker]).kind).toBe("resume");
+	});
+
+	it("crash-resume cycles older than a day decay out of the loop-guard count", () => {
+		const old = Date.now() - 26 * 60 * 60 * 1000;
+		const branch = [
+			markerEntry(),
+			resumePromptEntry(old),
+			messageEntry("assistant", "text", old),
+			markerEntry(),
+			resumePromptEntry(old),
+			messageEntry("assistant", "text", old),
+			markerEntry(),
+		];
+		// Two cycles, both ancient: an unattended session that crashes once in a long
+		// while is not in a loop, and must not lose its automatic resume forever.
+		expect(workerRecoveryResumeVerdict(branch).kind).toBe("resume");
+	});
+
+	it("a decayed cycle plus a recent cycle still leaves budget for one more resume", () => {
+		const old = Date.now() - 26 * 60 * 60 * 1000;
+		const branch = [
+			markerEntry(),
+			resumePromptEntry(old),
+			messageEntry("assistant", "text", old),
+			markerEntry(),
+			resumePromptEntry(),
+			messageEntry("assistant"),
+			markerEntry(),
+		];
+		expect(workerRecoveryResumeVerdict(branch).kind).toBe("resume");
 	});
 });
 

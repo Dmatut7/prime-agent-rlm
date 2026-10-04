@@ -101,6 +101,7 @@ interface CapturedInterruption {
 	activeSessionId: string;
 	operations: string[];
 	queuedInputs?: string[];
+	crashedAt?: string;
 }
 
 function recoverySupervisor(worker: RecoveryWorker): {
@@ -116,12 +117,19 @@ function recoverySupervisor(worker: RecoveryWorker): {
 		catalog: {
 			start: catalogStart,
 			markInterrupted: vi.fn(
-				async (sessionFile: string, activeSessionId: string, operations: string[], queuedInputs?: string[]) => {
+				async (
+					sessionFile: string,
+					activeSessionId: string,
+					operations: string[],
+					queuedInputs?: string[],
+					crashedAt?: string,
+				) => {
 					interruptions.push({
 						sessionFile,
 						activeSessionId,
 						operations,
 						...(queuedInputs ? { queuedInputs } : {}),
+						...(crashedAt ? { crashedAt } : {}),
 					});
 				},
 			),
@@ -217,7 +225,12 @@ describe("daemon crash recovery chain", () => {
 		// Exactly the busy session is marked, with the operation it died in.
 		expect(catalogStart).toHaveBeenCalledOnce();
 		expect(interruptions).toEqual([
-			{ sessionFile: sessionFileA, activeSessionId: "active-a", operations: ["tool_execution_start"] },
+			{
+				sessionFile: sessionFileA,
+				activeSessionId: "active-a",
+				operations: ["tool_execution_start"],
+				crashedAt: expect.any(String),
+			},
 		]);
 		// The journal is resolved, so the corpse is not kept for its unconsumed records.
 		for (const record of WorkerRecoveryJournal.readLatest(journalPath)) {
@@ -286,6 +299,7 @@ describe("daemon crash recovery chain", () => {
 				activeSessionId: "active-a",
 				operations: ["follow_up_queued"],
 				queuedInputs: ["先跑测试", "再修 lint"],
+				crashedAt: expect.any(String),
 			},
 		]);
 
@@ -305,6 +319,102 @@ describe("daemon crash recovery chain", () => {
 		expect(followUp.mock.calls).toEqual([
 			["先跑测试", undefined, { resumeIfIdle: false }],
 			["再修 lint", undefined, { resumeIfIdle: false }],
+			[WORKER_RECOVERY_RESUME_PROMPT, undefined, { resumeIfIdle: true }],
+		]);
+	});
+
+	it("carries a non-busy session's parked queue into the marker (Esc- or quota-paused at the crash)", async () => {
+		const root = tempRoot();
+		const journalPath = join(root, "worker.recovery.jsonl");
+		const orphanJournalPath = join(root, "worker.orphans.jsonl");
+		writeFileSync(orphanJournalPath, "");
+		const sessionFileA = join(root, "session-a.jsonl");
+		const sessionFileB = join(root, "session-b.jsonl");
+		const sessionFileC = join(root, "session-c.jsonl");
+
+		// Session A died mid-turn. Session B's last checkpoint is a turn_end (idle,
+		// Esc-paused or quota-parked) with user inputs still parked in the queue: the
+		// busy-only filter used to drop them, so the crash lost the user's work even
+		// though the journal held it. Session C is the negative control: idle with an
+		// empty queue, so no marker is owed.
+		const workerJournal = new WorkerRecoveryJournal(journalPath);
+		workerJournal.record({
+			activeSessionId: "active-a",
+			sessionId: "session-a",
+			sessionFile: sessionFileA,
+			busy: true,
+			operation: "tool_execution_start",
+		});
+		workerJournal.record({
+			activeSessionId: "active-b",
+			sessionId: "session-b",
+			sessionFile: sessionFileB,
+			busy: false,
+			operation: "turn_end",
+			queuedInputs: ["额度恢复后继续", "顺手看下 lint"],
+		});
+		workerJournal.record({
+			activeSessionId: "active-c",
+			sessionId: "session-c",
+			sessionFile: sessionFileC,
+			busy: false,
+			operation: "turn_end",
+		});
+		flushWorkerRecoveryJournalFile(journalPath);
+		// The process dies here.
+
+		const worker: RecoveryWorker = {
+			descriptor: {
+				workerId: "worker-crashed-parked-queue",
+				pid: 987_651,
+				rootActiveSessionId: "active-a",
+				recoveryJournalPath: journalPath,
+				orphanProcessJournalPath: orphanJournalPath,
+			},
+		};
+		const { supervisor, interruptions, catalogStart } = recoverySupervisor(worker);
+		await supervisor.recoverUncertainWorkerOperations(worker);
+
+		// The busy session is marked, and the parked queue rides its own marker; the
+		// quiet idle session stays unmarked.
+		expect(catalogStart).toHaveBeenCalledOnce();
+		expect(interruptions).toEqual([
+			{
+				sessionFile: sessionFileA,
+				activeSessionId: "active-a",
+				operations: ["tool_execution_start"],
+				crashedAt: expect.any(String),
+			},
+			{
+				sessionFile: sessionFileB,
+				activeSessionId: "active-b",
+				operations: ["turn_end"],
+				queuedInputs: ["额度恢复后继续", "顺手看下 lint"],
+				crashedAt: expect.any(String),
+			},
+		]);
+		// The journal is resolved, so the corpse is not kept for its unconsumed records.
+		for (const record of WorkerRecoveryJournal.readLatest(journalPath)) {
+			expect(record.busy).toBe(false);
+			expect(record.operation).toBe("recovery_hold");
+		}
+
+		// --- Bind side: the parked queue replays ahead of the resume prompt, so the
+		// paused session's queued work runs instead of vanishing with the crash.
+		const marker = interruptionMarkerEntry("active-b", ["turn_end"], ["额度恢复后继续", "顺手看下 lint"]);
+		const branch = [userMessageEntry(), marker];
+		const followUp = vi.fn(async () => true);
+		const session = {
+			sessionManager: { getBranch: () => branch },
+			followUp,
+		} as unknown as AgentSession;
+		const daemon = makeBindingDaemon(root);
+		daemon.resumeWorkerInterruptedSession(makeBoundState("active-b", session));
+		await vi.waitFor(() => expect(followUp).toHaveBeenCalledTimes(3));
+
+		expect(followUp.mock.calls).toEqual([
+			["额度恢复后继续", undefined, { resumeIfIdle: false }],
+			["顺手看下 lint", undefined, { resumeIfIdle: false }],
 			[WORKER_RECOVERY_RESUME_PROMPT, undefined, { resumeIfIdle: true }],
 		]);
 	});

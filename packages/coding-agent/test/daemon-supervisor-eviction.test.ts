@@ -4,11 +4,15 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getSessionsDir } from "../src/config.js";
 import { type AgentCronJob, AgentCronJobStore, SESSION_SCHEDULED_JOBS_FILENAME } from "../src/core/cron-jobs.js";
-import { getSessionArtifactPathForFile, type SessionInfo } from "../src/core/session-manager.js";
+import { getSessionArtifactPathForFile, type SessionInfo, SessionManager } from "../src/core/session-manager.js";
 import { workerRosterEntryFromSummary } from "../src/modes/daemon/agent-roster.js";
 import { success } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
-import { DaemonSupervisor, idleEvictionSweepIntervalMs } from "../src/modes/daemon/daemon-supervisor.js";
+import {
+	DaemonSupervisor,
+	type DaemonSupervisorOptions,
+	idleEvictionSweepIntervalMs,
+} from "../src/modes/daemon/daemon-supervisor.js";
 import { WORKER_REQUEST_TIMEOUT_TIERS } from "../src/modes/daemon/daemon-timeouts.js";
 import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
 
@@ -36,6 +40,7 @@ interface WorkerFixture {
 	transcriptCaches?: Map<string, unknown>;
 	snapshotCache?: Map<string, unknown>;
 	stopRevision?: number;
+	recovery?: Promise<unknown>;
 	client?: {
 		request: ReturnType<typeof vi.fn>;
 		requestWorker: ReturnType<typeof vi.fn>;
@@ -63,6 +68,9 @@ interface SupervisorInternals {
 	runIdleEvictionSweep(now?: number): Promise<void>;
 	recomputeScheduledSessionWake(): Promise<void>;
 	wakeDueScheduledSessions(now?: number): Promise<void>;
+	armScheduledJobReadoption(worker: WorkerFixture, reason: string): boolean;
+	clearAdoptionRetryTimers(): void;
+	spawnWorkerProcess: ReturnType<typeof vi.fn>;
 	shutdown(exitCode: number, stopWorkers: boolean): Promise<never>;
 	handleCommand(client: object, command: object): Promise<unknown>;
 	writeRosterEntry(entry: object, worker?: object): unknown;
@@ -128,7 +136,10 @@ function makeWorker(id: string, summaries: SessionSummary[]): WorkerFixture {
 	};
 }
 
-function makeSupervisor(idleEvictionMinutes: number | "off" = 90): SupervisorInternals {
+function makeSupervisor(
+	idleEvictionMinutes: number | "off" = 90,
+	supervisorOptions?: Partial<DaemonSupervisorOptions>,
+): SupervisorInternals {
 	const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-eviction-"));
 	tempDirs.push(directory);
 	mkdirSync(directory, { recursive: true });
@@ -136,6 +147,7 @@ function makeSupervisor(idleEvictionMinutes: number | "off" = 90): SupervisorInt
 	const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
 		defaultSessionConfig: { agentDir: directory, cwd: directory },
 		descriptorDir: join(directory, "workers"),
+		...supervisorOptions,
 	}) as unknown as SupervisorInternals;
 	supervisor.stopWorker = vi.fn(async (worker: WorkerFixture) => {
 		supervisor.workers.delete(worker.descriptor.workerId);
@@ -1516,5 +1528,169 @@ describe("daemon supervisor scheduled-session wake", () => {
 		expect(response).toMatchObject({ success: true });
 		expect(store.list().map((job) => job.status)).toEqual(["active"]);
 		expect(existsSync(stopped.descriptorPath)).toBe(false);
+	});
+});
+
+describe("daemon supervisor scheduled wake against unlaunchable sessions", () => {
+	const now = Date.parse("2026-08-01T12:00:00.000Z");
+
+	function makeSavedInfo(path: string, id: string, overrides: Partial<SessionInfo> = {}): SessionInfo {
+		return {
+			path,
+			id,
+			cwd: "/tmp/project",
+			rlmDepth: 0,
+			created: new Date(now - 12 * 60 * 60_000),
+			modified: new Date(now - 12 * 60 * 60_000),
+			messageCount: 1,
+			...overrides,
+		} as SessionInfo;
+	}
+
+	/** A real session file whose stored cwd lives in `projectDir`, plus its due heartbeat artifact. */
+	function makeSessionWithDueHeartbeat(projectDir: string): {
+		sessionFile: string;
+		sessionId: string;
+		store: AgentCronJobStore;
+	} {
+		const sessionHome = mkdtempSync(join(tmpdir(), "prime-supervisor-wake-home-"));
+		tempDirs.push(sessionHome);
+		const manager = SessionManager.create(projectDir, join(sessionHome, "sessions"));
+		manager.appendMessage({ role: "user", content: "supervisor wake fixture", timestamp: 1 });
+		manager.flushNow();
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Fixture session did not persist");
+		const sessionId = manager.getSessionId();
+		const store = AgentCronJobStore.forSessionArtifacts();
+		store.registerSessionArtifact(sessionId, getSessionArtifactPathForFile(sessionFile, sessionId));
+		store.createHeartbeat({
+			activeSessionId: "stale-active",
+			sessionId,
+			sessionFile,
+			cwd: projectDir,
+			scheduleText: "every 5m",
+			prompt: "tick",
+			now: new Date(now - 10 * 60_000),
+		});
+		return { sessionFile, sessionId, store };
+	}
+
+	function failedWorkerCovering(sessionFile: string, rootSessionId: string): WorkerFixture {
+		const worker = makeWorker("crashed", []);
+		worker.descriptor.lifecycle = "failed";
+		worker.descriptor.sessionFile = sessionFile;
+		worker.descriptor.rootSessionId = rootSessionId;
+		worker.client = undefined;
+		return worker;
+	}
+
+	it("a dormant failed worker no longer covers its session's due scheduled wake", async () => {
+		const supervisor = makeSupervisor();
+		const projectDir = mkdtempSync(join(tmpdir(), "prime-supervisor-wake-project-"));
+		tempDirs.push(projectDir);
+		const { sessionFile, sessionId } = makeSessionWithDueHeartbeat(projectDir);
+		supervisor.rlmSpawnLedgerInstance = {
+			family: vi.fn(async () => [makeSavedInfo(sessionFile, sessionId, { cwd: projectDir })]),
+			liveEdges: vi.fn(async () => []),
+		};
+		// The crash-restart budget parked this worker failed and the re-adoption ladder
+		// has run out: nothing will ever drive it again, but its registration used to
+		// keep the tree "covered", so the schedule stayed dark forever.
+		supervisor.workers.set("crashed", failedWorkerCovering(sessionFile, sessionId));
+		const woken = makeWorker("woken", []);
+		supervisor.createOrReuseWorker = vi.fn(async () => woken);
+
+		await supervisor.wakeDueScheduledSessions(now);
+
+		expect(supervisor.createOrReuseWorker).toHaveBeenCalledTimes(1);
+		expect(supervisor.createOrReuseWorker).toHaveBeenCalledWith("scheduled-wake", {
+			type: "create",
+			sessionPath: sessionFile,
+		});
+	});
+
+	it("a failed worker with its own recovery still in flight keeps covering the tree", async () => {
+		const supervisor = makeSupervisor();
+		const projectDir = mkdtempSync(join(tmpdir(), "prime-supervisor-wake-project-"));
+		tempDirs.push(projectDir);
+		const { sessionFile, sessionId } = makeSessionWithDueHeartbeat(projectDir);
+		supervisor.rlmSpawnLedgerInstance = {
+			family: vi.fn(async () => [makeSavedInfo(sessionFile, sessionId, { cwd: projectDir })]),
+			liveEdges: vi.fn(async () => []),
+		};
+		const recovering = failedWorkerCovering(sessionFile, sessionId);
+		// Never settles: the wake decision only needs to see that a driver exists.
+		recovering.recovery = new Promise(() => {});
+		supervisor.workers.set("crashed", recovering);
+		supervisor.createOrReuseWorker = vi.fn();
+
+		await supervisor.wakeDueScheduledSessions(now);
+
+		expect(supervisor.createOrReuseWorker).not.toHaveBeenCalled();
+	});
+
+	it("a failed worker with a re-adoption retry armed keeps covering the tree", async () => {
+		// An hour-long first backoff: the armed timer is inert for the test's lifetime.
+		const supervisor = makeSupervisor(90, { adoptionRetryDelaysMs: [3_600_000] });
+		const projectDir = mkdtempSync(join(tmpdir(), "prime-supervisor-wake-project-"));
+		tempDirs.push(projectDir);
+		const { sessionFile, sessionId } = makeSessionWithDueHeartbeat(projectDir);
+		supervisor.rlmSpawnLedgerInstance = {
+			family: vi.fn(async () => [makeSavedInfo(sessionFile, sessionId, { cwd: projectDir })]),
+			liveEdges: vi.fn(async () => []),
+		};
+		const parked = failedWorkerCovering(sessionFile, sessionId);
+		supervisor.workers.set("crashed", parked);
+		supervisor.createOrReuseWorker = vi.fn();
+		try {
+			expect(supervisor.armScheduledJobReadoption(parked, "crash budget exhausted")).toBe(true);
+
+			await supervisor.wakeDueScheduledSessions(now);
+
+			expect(supervisor.createOrReuseWorker).not.toHaveBeenCalled();
+		} finally {
+			supervisor.clearAdoptionRetryTimers();
+		}
+	});
+
+	it("pauses the due jobs with the reason instead of retrying the launch every minute when the directory is gone", async () => {
+		const supervisor = makeSupervisor();
+		// The registry-ownership gate needs a started supervisor; it is orthogonal to
+		// the launch decision under test, and the durable-cancel test above stubs it
+		// the same way.
+		supervisor.assertRecoveryAllowed = vi.fn(async () => {});
+		const projectDir = mkdtempSync(join(tmpdir(), "prime-supervisor-wake-project-"));
+		tempDirs.push(projectDir);
+		const { sessionFile, sessionId, store } = makeSessionWithDueHeartbeat(projectDir);
+		supervisor.rlmSpawnLedgerInstance = {
+			family: vi.fn(async () => [makeSavedInfo(sessionFile, sessionId, { cwd: projectDir })]),
+			liveEdges: vi.fn(async () => []),
+		};
+		// Fault injection: the project directory the session ran in is deleted, so the
+		// stored cwd cannot be spawned into. The launch must refuse before any spawn.
+		rmSync(projectDir, { recursive: true, force: true });
+		const spawnWorkerProcess = vi.fn(async () => {
+			throw new Error("spawn must not be attempted for a missing directory");
+		});
+		Object.assign(supervisor, { spawnWorkerProcess });
+
+		await supervisor.wakeDueScheduledSessions(now);
+		await supervisor.scheduledWakeRecompute;
+
+		// The job is parked with the reason on it, no process was spawned, and no
+		// 60s failure floor re-arms the wake.
+		const jobs = store.list();
+		expect(jobs).toHaveLength(1);
+		expect(jobs[0]).toMatchObject({ status: "paused" });
+		expect(jobs[0]?.lastError).toContain(projectDir);
+		expect(jobs[0]).not.toHaveProperty("nextRunAt");
+		expect(spawnWorkerProcess).not.toHaveBeenCalled();
+		expect(supervisor.scheduledWakeTimer).toBeUndefined();
+		expect(supervisor.log).toHaveBeenCalledWith(expect.stringContaining(projectDir));
+
+		// The brake holds: a later wake pass finds nothing due and launches nothing.
+		supervisor.createOrReuseWorker = vi.fn();
+		await supervisor.wakeDueScheduledSessions(now + 5 * 60_000);
+		expect(supervisor.createOrReuseWorker).not.toHaveBeenCalled();
 	});
 });

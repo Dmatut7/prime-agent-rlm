@@ -64,6 +64,13 @@ type CatalogRequest =
 			 * the same build as the supervisor, so the field needs no version gate.
 			 */
 			queuedInputs?: string[];
+			/**
+			 * The dead worker's last journal checkpoint (ISO) - a lower bound for
+			 * the crash time, written into details.crashedAt. The resume staleness
+			 * gate reads it so a crash discovered after a long downtime is not
+			 * mistaken for a fresh one (the marker's own timestamp is detection time).
+			 */
+			crashedAt?: string;
 	  }
 	| { type: "request"; id: string; command: "shutdown" };
 
@@ -293,6 +300,9 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				if (request.queuedInputs !== undefined && request.queuedInputs.length > 0) {
 					details.queuedInputs = request.queuedInputs;
 				}
+				if (request.crashedAt !== undefined) {
+					details.crashedAt = request.crashedAt;
+				}
 				await appendOwnedFastEntry(
 					request.sessionPath,
 					() =>
@@ -401,6 +411,7 @@ export class DaemonCatalogClient {
 		activeSessionId: string,
 		operations: string[],
 		queuedInputs?: string[],
+		crashedAt?: string,
 	): Promise<void> {
 		await this.request({
 			type: "request",
@@ -410,6 +421,7 @@ export class DaemonCatalogClient {
 			activeSessionId,
 			operations,
 			...(queuedInputs !== undefined && queuedInputs.length > 0 ? { queuedInputs } : {}),
+			...(crashedAt !== undefined ? { crashedAt } : {}),
 		});
 	}
 

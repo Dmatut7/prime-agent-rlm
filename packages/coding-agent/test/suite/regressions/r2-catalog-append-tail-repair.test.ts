@@ -188,6 +188,32 @@ describe("daemon catalog appends under a session lease", () => {
 		});
 	}, 30_000);
 
+	it("carries the crash time into the recovery marker's details when the supervisor supplies it", async () => {
+		const { client, agentDir } = startCatalog();
+		const assistantEntry = JSON.stringify({
+			type: "message",
+			id: "msg-assistant",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+		});
+		const sessionFile = writeTornTranscript(agentDir, [assistantEntry]);
+
+		// The marker's own timestamp is detection time; crashedAt is the dead worker's
+		// last journal checkpoint, so a crash found after a long downtime still ages
+		// correctly against the resume staleness gate.
+		const crashedAt = new Date(Date.now() - 26 * 60 * 60 * 1000).toISOString();
+		await client.markInterrupted(sessionFile, "active-r2c", ["turn_end"], undefined, crashedAt);
+		const facts = readTranscriptFacts(sessionFile);
+
+		expect(facts.lastEntry?.customType).toBe("prime-agent.worker_recovery");
+		expect(facts.lastEntry?.details).toEqual({
+			activeSessionId: "active-r2c",
+			operations: ["turn_end"],
+			crashedAt,
+		});
+	}, 30_000);
+
 	it("refuses to append while another live process holds the session lease", async () => {
 		const { client, agentDir } = startCatalog();
 		const sessionFile = writeTornTranscript(agentDir);

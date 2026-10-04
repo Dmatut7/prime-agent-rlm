@@ -882,6 +882,32 @@ export class AgentCronJobStore {
 		return updated ? this.persistedJob(this.writeJobs(jobs), updated, "Skip result record") : updated;
 	}
 
+	/**
+	 * Park an active job whose scheduled wake cannot run as-is — the daemon's wake
+	 * path uses this when the session's working directory is gone, so the job stops
+	 * retrying instead of failing every wake. The reason lands on lastError (job
+	 * listings show it), and the job stays recoverable: restore the directory and
+	 * resume it (heartbeat resume / rlm_heartbeat resume, or cancel + re-add) to
+	 * re-arm the schedule. Terminal or unknown jobs are left alone.
+	 */
+	pauseJob(id: string, input: { reason: string; now?: Date }): AgentCronJob | undefined {
+		const now = input.now ?? new Date();
+		let updated: AgentCronJob | undefined;
+		const jobs = this.readJobs().map((job) => {
+			if (job.id !== id || job.status !== "active") {
+				return job;
+			}
+			updated = withoutNextRunAt({
+				...job,
+				status: "paused",
+				lastError: input.reason,
+				updatedAt: updatedAtForMutation(now, job),
+			});
+			return updated;
+		});
+		return updated ? this.persistedJob(this.writeJobs(jobs), updated, "Cron job pause") : undefined;
+	}
+
 	due(now = new Date()): AgentCronJob[] {
 		return this.readJobs().filter((job) => isDueJob(job, now));
 	}

@@ -21,8 +21,12 @@ import type { CustomMessageEntry, SessionEntry, SessionMessageEntry } from "../.
  * WORKER_RECOVERY_MAX_CONSECUTIVE_AUTO_RESUMES back-to-back crash-resume cycles
  * (a resume whose turn crashes again would otherwise loop unattended, burning a
  * turn per cycle), and it skips interruptions older than
- * WORKER_RECOVERY_AUTO_RESUME_MAX_AGE_MS. And a marker that carries the queued
- * inputs the dead worker never delivered (details.queuedInputs) has them
+ * WORKER_RECOVERY_AUTO_RESUME_MAX_AGE_MS. The cycle count decays over the same
+ * window, so a session that crashes once in a long while is never mistaken for a
+ * loop; and the age is read from details.crashedAt (the dead worker's last
+ * journal checkpoint) when the marker carries it, so a crash discovered after a
+ * long downtime is not mistaken for a fresh one. And a marker that carries the
+ * queued inputs the dead worker never delivered (details.queuedInputs) has them
  * replayed ahead of the resume prompt, so the user's queued work is not lost
  * with the crash.
  */
@@ -135,8 +139,11 @@ function userMessageText(message: SessionMessageEntry["message"]): string {
  * A replayed queued input (a user message whose text a marker recorded) is the
  * resume's own cargo, not attendance: it neither counts as a cycle nor breaks the
  * chain. Assistant messages ride between cycles without breaking it either.
+ * Cycles older than the staleness window decay out: a session that crashes once
+ * in a long while is not in a crash loop, so only cycles the window still covers
+ * count against the guard.
  */
-function countConsecutiveAutoResumes(branch: readonly SessionEntry[], beforeIndex: number): number {
+function countConsecutiveAutoResumes(branch: readonly SessionEntry[], beforeIndex: number, now: number): number {
 	const replayedTexts = new Set<string>();
 	for (const entry of branch) {
 		if (entry.type === "custom_message" && entry.customType === WORKER_RECOVERY_MARKER_CUSTOM_TYPE) {
@@ -149,6 +156,10 @@ function countConsecutiveAutoResumes(branch: readonly SessionEntry[], beforeInde
 		if (entry.type !== "message" || entry.message.role !== "user") continue;
 		const text = userMessageText(entry.message);
 		if (text.includes(WORKER_RECOVERY_RESUME_TOKEN)) {
+			const at = typeof entry.message.timestamp === "number" ? entry.message.timestamp : undefined;
+			// An untimed resume prompt still counts: a malformed transcript must not
+			// disarm the loop guard.
+			if (at !== undefined && now - at > WORKER_RECOVERY_AUTO_RESUME_MAX_AGE_MS) break;
 			count++;
 			continue;
 		}
@@ -156,6 +167,26 @@ function countConsecutiveAutoResumes(branch: readonly SessionEntry[], beforeInde
 		break;
 	}
 	return count;
+}
+
+/**
+ * When the interruption actually happened, in epoch ms: the marker carries the
+ * dead worker's last journal checkpoint (details.crashedAt), which predates the
+ * marker write. The write-time fallback covers markers written before the field
+ * existed - for a crash discovered after a long downtime, the fallback is what
+ * makes an old crash look fresh, so the carried time always wins when present.
+ */
+function workerRecoveryInterruptedAtMs(marker: CustomMessageEntry): number | undefined {
+	const details = marker.details;
+	if (details && typeof details === "object") {
+		const crashedAt = (details as Record<string, unknown>).crashedAt;
+		if (typeof crashedAt === "string") {
+			const parsed = Date.parse(crashedAt);
+			if (Number.isFinite(parsed)) return parsed;
+		}
+	}
+	const parsed = Date.parse(marker.timestamp);
+	return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 /**
@@ -173,11 +204,11 @@ export function workerRecoveryResumeVerdict(
 	const marker = findUnconsumedWorkerRecoveryMarker(branch);
 	if (marker === undefined) return { kind: "skip", reason: "no-marker" };
 	const markerIndex = branch.indexOf(marker);
-	const markerAt = Date.parse(marker.timestamp);
-	if (Number.isFinite(markerAt) && now - markerAt > WORKER_RECOVERY_AUTO_RESUME_MAX_AGE_MS) {
+	const interruptedAt = workerRecoveryInterruptedAtMs(marker);
+	if (interruptedAt !== undefined && now - interruptedAt > WORKER_RECOVERY_AUTO_RESUME_MAX_AGE_MS) {
 		return { kind: "skip", reason: "stale" };
 	}
-	if (countConsecutiveAutoResumes(branch, markerIndex) >= WORKER_RECOVERY_MAX_CONSECUTIVE_AUTO_RESUMES) {
+	if (countConsecutiveAutoResumes(branch, markerIndex, now) >= WORKER_RECOVERY_MAX_CONSECUTIVE_AUTO_RESUMES) {
 		return { kind: "skip", reason: "resume-loop" };
 	}
 	return { kind: "resume", marker, queuedInputs: queuedInputsOfWorkerRecoveryMarker(marker) };
