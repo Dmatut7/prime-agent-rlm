@@ -377,8 +377,10 @@ export function mapStopReason(reason: FinishReason): StopReason {
 		case FinishReason.STOP:
 			return "stop";
 		case FinishReason.MAX_TOKENS:
-		// Per-request token limit with a continuation token: a token-limit truncation.
-		case FinishReason.CONTINUATION:
+		// @google/genai ≥2.27 adds CONTINUATION (per-request token limit carrying a
+		// continuation token); the lockfile pins 2.21 until the 7-day floor passes, so
+		// the member is matched via Extract to keep both type shapes compiling.
+		case "CONTINUATION" as Extract<FinishReason, "CONTINUATION">:
 			return "length";
 		case FinishReason.BLOCKLIST:
 		case FinishReason.PROHIBITED_CONTENT:
