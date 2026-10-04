@@ -130,11 +130,9 @@ export interface HarnessDigestHost {
 }
 
 /**
- * The compact harness digest delivered at cold context boundaries (session start,
+ * Digest plus the fingerprint of the state that produced it. The digest is the
+ * compact harness face delivered at cold context boundaries (session start,
  * resume, tree navigation, compaction head) and as a material-change delta.
- */
-/**
- * Digest plus the fingerprint of the state that produced it. Delivery decisions
  * compare fingerprints, not rendered text (#2400): relevance query terms drift
  * per turn, so a rendered-text comparison would re-deliver an unchanged digest
  * at every boundary and stack near-duplicates into the context.

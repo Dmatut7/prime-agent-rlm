@@ -38,7 +38,7 @@ export interface RlmChildStallAbortFacts {
 	thresholdMs: number;
 	/** Names of the tools still in flight when the watchdog aborted the turn. */
 	inFlightTools: readonly string[];
-	/** Kernel liveness reasons recorded with the abort, once the kernel reports them. */
+	/** Kernel liveness reasons recorded with the abort (the kernel reports them today). */
 	kernelReasons?: readonly string[];
 	/**
 	 * False once the watchdog reported `abort_unsettled`: the abort fired but the
@@ -102,7 +102,7 @@ const COMPLETED_WITHOUT_REPLY_REASON = "completed without sending a reply";
 export interface RlmChildStallDiagnosticsInput {
 	silentMs: number;
 	inFlightToolCalls: readonly { toolName: string; elapsedMs: number }[];
-	/** Kernel liveness segment, present only once the kernel heartbeat lands. */
+	/** Kernel liveness segment, present when the kernel heartbeat supplies one. */
 	kernel?: { reasons?: readonly string[] };
 }
 

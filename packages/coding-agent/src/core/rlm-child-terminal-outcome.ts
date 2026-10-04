@@ -45,7 +45,7 @@ export interface RlmChildTerminalOutcomeHost {
  * Record a child's stall-watchdog stage on the parent side.
  *
  * Label and facts are deliberately separate (B9/I-13): a child whose silence is
- * exempted - a host-owned phase today, the kernel-liveness vouch once it lands -
+ * exempted - a host-owned phase, or the kernel-liveness vouch (live since the wiring landed) -
  * is healthy long work and keeps its real activity label, while the forensic
  * record still reaches the roster row and the terminal classifier. The
  * `unsettled` stage is the "killed but never stopped" fact: it revokes
