@@ -1,0 +1,1 @@
+- Hardened the 8MB-paste editor test against CI load flakes by asserting on best-of-3 process CPU time instead of a single wall-clock measurement.
