@@ -628,12 +628,80 @@ export interface SavedSessionModelRestore {
 	verifiedUnavailable: boolean;
 }
 
-export function restoreSavedSessionModel(options: {
+/**
+ * Bound on how long session-model restore waits for the live catalog refresh it
+ * kicks. This is CC 2.1.288's first-request rule (use the server-reported
+ * window/output limit once known, wait at most ~1.5s for it) mapped onto this
+ * fork's channel: server-reported windows arrive through the Prime Inference
+ * catalog fetch and its disk cache, not through a response header - pi-ai's
+ * Usage carries no window field and no provider parses one. The compaction
+ * trigger re-reads the registry live at every evaluation, so a refresh that
+ * lands after the budget still self-corrects the next turn; the wait only
+ * decides which value the FIRST pre-prompt trigger evaluation (and the restore
+ * verdict itself) sees. The overflow-recovery path remains the net under a
+ * first-request misfire.
+ */
+export const SESSION_RESTORE_CATALOG_WAIT_MS = 1_500;
+
+/**
+ * Kick the registry's background catalog/private-authorization refresh and wait
+ * for it to settle, bounded by timeoutMs in total. True when everything settled
+ * inside the budget; on timeout the refresh keeps running in the background and
+ * reloads the registry in place when it lands.
+ */
+async function settleModelRefreshes(modelRegistry: ModelRegistry, timeoutMs: number): Promise<boolean> {
+	const startedAt = Date.now();
+	const settled = modelRegistry
+		.refreshAvailableModels()
+		.then(() => {
+			// refreshAvailableModels() tracks the catalog fetch without awaiting it;
+			// the pending handle is assigned before it resolves, so the remaining
+			// budget can go to the catalog itself.
+			const remaining = timeoutMs - (Date.now() - startedAt);
+			return remaining > 0 ? modelRegistry.waitForPendingModelRefreshes(remaining) : undefined;
+		})
+		.then(
+			() => true,
+			// A failed refresh already degraded to the cached/bundled state; there
+			// is nothing further to wait for.
+			() => true,
+		);
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const expired = new Promise<false>((resolve) => {
+		timer = setTimeout(() => resolve(false), timeoutMs);
+		// The bounded wait must never keep the process alive on its own.
+		if (typeof timer.unref === "function") timer.unref();
+	});
+	try {
+		return await Promise.race([settled, expired]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+export async function restoreSavedSessionModel(options: {
 	provider: string;
 	modelId: string;
 	modelRegistry: ModelRegistry;
-}): SavedSessionModelRestore {
+	/**
+	 * Bound on the catalog-readiness wait before the lookup; default
+	 * SESSION_RESTORE_CATALOG_WAIT_MS. 0 restores the pre-wait behavior (no
+	 * refresh kick, no wait) for callers that must stay latency-free.
+	 */
+	catalogReadyWaitMs?: number;
+}): Promise<SavedSessionModelRestore> {
 	const { provider, modelId, modelRegistry } = options;
+	const waitMs = options.catalogReadyWaitMs ?? SESSION_RESTORE_CATALOG_WAIT_MS;
+	if (waitMs > 0) {
+		const settled = await settleModelRefreshes(modelRegistry, waitMs);
+		if (!settled) {
+			log.warn("catalog refresh did not settle before session-model restore; using cached/bundled model data", {
+				provider,
+				modelId,
+				waitMs,
+			});
+		}
+	}
 	const registered = modelRegistry.find(provider, modelId);
 	if (registered && modelRegistry.hasConfiguredAuth(registered)) {
 		return { model: registered, reason: undefined, verifiedUnavailable: true };

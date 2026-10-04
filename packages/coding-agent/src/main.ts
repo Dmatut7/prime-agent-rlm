@@ -1088,7 +1088,7 @@ async function resolvePreparedStartupModel(options: {
 	let modelFallbackMessage: string | undefined;
 
 	if (!model && hasExistingSession && existingSession.model) {
-		const restore = restoreSavedSessionModel({
+		const restore = await restoreSavedSessionModel({
 			provider: existingSession.model.provider,
 			modelId: existingSession.model.modelId,
 			modelRegistry,

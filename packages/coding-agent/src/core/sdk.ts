@@ -193,7 +193,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let savedSelectionVerifiedUnavailable = true;
 
 	if (!model && hasExistingSession && existingSession.model) {
-		const restore = restoreSavedSessionModel({
+		const restore = await restoreSavedSessionModel({
 			provider: existingSession.model.provider,
 			modelId: existingSession.model.modelId,
 			modelRegistry,

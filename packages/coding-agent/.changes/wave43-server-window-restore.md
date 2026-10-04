@@ -1,0 +1,1 @@
+- Changed session-model restore on resume to kick the live Prime Inference catalog refresh and wait up to 1.5s for it, so the first request's auto-compaction trigger sees a gateway-reported context window (e.g. a model re-routed to a smaller context) instead of the bundled value; on timeout the session starts on cached/bundled values and self-corrects when the refresh lands.

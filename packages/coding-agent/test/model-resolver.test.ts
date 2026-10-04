@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import {
@@ -702,8 +702,19 @@ describe("resolveCliModel equivalence corpus (r43 MC-1, probe-fuzzy)", () => {
 });
 
 describe("restoreSavedSessionModel", () => {
+	beforeEach(() => {
+		// Restore now kicks the registry's catalog refresh; keep the network out of
+		// these unit tests. A rejecting fetch degrades the refresh to the
+		// cached/bundled state immediately, which is what these cases assert on.
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => Promise.reject(new Error("network disabled in restoreSavedSessionModel tests"))),
+		);
+	});
+
 	afterEach(() => {
 		vi.unstubAllEnvs();
+		vi.unstubAllGlobals();
 	});
 
 	function registryWithCustomProvider(dir: string, modelsJson: string): { registry: ModelRegistry } {
@@ -723,29 +734,37 @@ describe("restoreSavedSessionModel", () => {
 		},
 	});
 
-	test("restores a saved model that still exists with configured credentials", () => {
+	test("restores a saved model that still exists with configured credentials", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "wave38-restore-"));
 		const { registry } = registryWithCustomProvider(dir, customProviderModelsJson);
 
-		const result = restoreSavedSessionModel({ provider: "myco", modelId: "myco-model", modelRegistry: registry });
+		const result = await restoreSavedSessionModel({
+			provider: "myco",
+			modelId: "myco-model",
+			modelRegistry: registry,
+		});
 
 		expect(result.model?.id).toBe("myco-model");
 		expect(result.reason).toBeUndefined();
 		expect(result.verifiedUnavailable).toBe(true);
 	});
 
-	test("a saved model missing from a readable catalog is a verified negative", () => {
+	test("a saved model missing from a readable catalog is a verified negative", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "wave38-restore-"));
 		const { registry } = registryWithCustomProvider(dir, customProviderModelsJson);
 
-		const result = restoreSavedSessionModel({ provider: "myco", modelId: "myco-gone", modelRegistry: registry });
+		const result = await restoreSavedSessionModel({
+			provider: "myco",
+			modelId: "myco-gone",
+			modelRegistry: registry,
+		});
 
 		expect(result.model).toBeUndefined();
 		expect(result.reason).toBe("model no longer exists");
 		expect(result.verifiedUnavailable).toBe(true);
 	});
 
-	test("a saved model whose provider lost credentials is a verified negative", () => {
+	test("a saved model whose provider lost credentials is a verified negative", async () => {
 		vi.stubEnv("CEREBRAS_API_KEY", undefined as unknown as string);
 		const dir = mkdtempSync(join(tmpdir(), "wave38-restore-"));
 		// A readable catalog (valid custom provider present) with no cerebras
@@ -753,7 +772,7 @@ describe("restoreSavedSessionModel", () => {
 		const { registry } = registryWithCustomProvider(dir, customProviderModelsJson);
 		expect(registry.find("cerebras", "gpt-oss-120b")).toBeDefined();
 
-		const result = restoreSavedSessionModel({
+		const result = await restoreSavedSessionModel({
 			provider: "cerebras",
 			modelId: "gpt-oss-120b",
 			modelRegistry: registry,
@@ -764,7 +783,7 @@ describe("restoreSavedSessionModel", () => {
 		expect(result.verifiedUnavailable).toBe(true);
 	});
 
-	test("an unreadable catalog makes availability unknown: no verdict, no rewrite mandate", () => {
+	test("an unreadable catalog makes availability unknown: no verdict, no rewrite mandate", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "wave38-restore-"));
 		const { registry } = registryWithCustomProvider(dir, customProviderModelsJson);
 		expect(registry.find("myco", "myco-model")).toBeDefined();
@@ -772,7 +791,11 @@ describe("restoreSavedSessionModel", () => {
 		registry.refresh();
 		expect(registry.getError()).toBeDefined();
 
-		const result = restoreSavedSessionModel({ provider: "myco", modelId: "myco-model", modelRegistry: registry });
+		const result = await restoreSavedSessionModel({
+			provider: "myco",
+			modelId: "myco-model",
+			modelRegistry: registry,
+		});
 
 		expect(result.model).toBeUndefined();
 		expect(result.verifiedUnavailable).toBe(false);
