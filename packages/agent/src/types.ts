@@ -456,9 +456,13 @@ export interface ToolTimeoutConfig {
  * unknown-tool calls (reset by any call whose name resolves), and the per-name
  * count (decayed by resolved calls, so an occasional miss in a long task does not
  * accumulate to the limit, while a storm with no resolved calls in between outruns
- * the decay). Every trigger - the limit hit, or a relapse inside an open recovery
- * turn - grants another recovery turn until the per-run `recoveryTurns` budget is
- * spent; only the spent budget ends the run.
+ * the decay). Per-name counts are attributed to the model that made the miss: a
+ * resolved call decays only the counts its own model earned, so a healthy stint on
+ * a fallback model never forgives the tally of the model the run switched away
+ * from - switching back keeps accumulating where that model left off. Every
+ * trigger - the limit hit, or a relapse inside an open recovery turn - grants
+ * another recovery turn until the per-run `recoveryTurns` budget is spent; only
+ * the spent budget ends the run.
  */
 export interface ToolNotFoundBreakerConfig {
 	/** Master switch. Defaults to true; `false` keeps the enriched receipts only. */
@@ -469,17 +473,18 @@ export interface ToolNotFoundBreakerConfig {
 	terminateAfter?: number;
 	/**
 	 * Forgiveness per resolved tool call: every call whose name resolves subtracts this
-	 * from every per-name miss count (floored at zero). Default 1; 0 keeps the per-name
-	 * counts cumulative for the whole run (the pre-decay behavior).
+	 * from every per-name miss count earned by the same model (floored at zero).
+	 * Default 1; 0 keeps the per-name counts cumulative for the whole run (the
+	 * pre-decay behavior).
 	 */
 	decayPerResolvedCall?: number;
 	/**
 	 * Per-run budget of recovery turns granted at the limit. Default 3: every trigger
 	 * opens one turn in which a resolved call (or a clean stop) closes the episode and
-	 * resets the counts, and a relapse inside an open recovery turn is the next
-	 * trigger - it spends another grant while the budget lasts, and ends the run once
-	 * the budget is spent. A clean close never refunds a spent grant. 0 ends the run
-	 * at the first limit hit (the pre-recovery behavior).
+	 * resets the closing model's counts, and a relapse inside an open recovery turn is
+	 * the next trigger - it spends another grant while the budget lasts, and ends the
+	 * run once the budget is spent. A clean close never refunds a spent grant. 0 ends
+	 * the run at the first limit hit (the pre-recovery behavior).
 	 */
 	recoveryTurns?: number;
 }

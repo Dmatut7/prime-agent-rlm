@@ -800,8 +800,9 @@ async function runLoop(
 	let lastTurn: Parameters<NonNullable<AgentLoopConfig["getContinuationMessages"]>>[0] | undefined;
 	// Per-run breaker for unknown-tool calls: the in-run backstop below the
 	// session-side bad-call storm detector (which needs a configured fallback chain
-	// to act). Counts survive model switches within the run on purpose - a storm is
-	// a property of the run, and the storm detector is what resets per agent_start.
+	// to act). Counts survive model switches within the run on purpose - each model's
+	// tally is its own, so a stormy model switched away from and back to keeps
+	// accumulating instead of being forgiven by the fallback's healthy work.
 	const notFoundBreaker = resolveToolNotFoundBreaker(config.toolNotFoundBreaker);
 
 	// Products a poll already produced but this run will not consume (the abort won
@@ -941,9 +942,15 @@ async function runLoop(
 						notFoundBreaker.recovery.pending = false;
 					} else {
 						// A full turn closed without an unknown-tool call: the correction
-						// took, so the episode closes and the counts reset. recoveriesUsed
-						// stays spent - the run grants at most recoveryTurns episodes.
-						notFoundBreaker.nameCounts.clear();
+						// took, so the episode closes and the closing model's counts reset
+						// (another model's tally is not this turn's to forgive).
+						// recoveriesUsed stays spent - the run grants at most
+						// recoveryTurns episodes.
+						const modelKey = toolNotFoundBreakerModelKey(message);
+						for (const [name, perModel] of notFoundBreaker.nameCounts) {
+							perModel.delete(modelKey);
+							if (perModel.size === 0) notFoundBreaker.nameCounts.delete(name);
+						}
 						notFoundBreaker.consecutive = 0;
 						notFoundBreaker.recovery = undefined;
 					}
@@ -1989,7 +1996,9 @@ async function prepareToolCall(
 ): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
 	const tool = currentContext.tools?.find((t) => t.name === toolCall.name);
 	if (!tool) {
-		const escalation = notFoundBreaker.enabled ? recordToolNotFound(notFoundBreaker, toolCall.name) : "plain";
+		const escalation = notFoundBreaker.enabled
+			? recordToolNotFound(notFoundBreaker, toolCall.name, toolNotFoundBreakerModelKey(assistantMessage))
+			: "plain";
 		return {
 			kind: "immediate",
 			result: createErrorToolResult(
@@ -2001,16 +2010,24 @@ async function prepareToolCall(
 	// A call whose name resolves is not part of the unknown-tool streak, whatever its
 	// arguments or execution do next.
 	notFoundBreaker.consecutive = 0;
-	// ...and it forgives past misses: per-name counts decay so an occasional typo in a
-	// long task never accumulates to the limit, while a storm - no resolved calls in
-	// between - still outruns the decay.
+	// ...and it forgives past misses *by the same model*: per-name counts decay so an
+	// occasional typo in a long task never accumulates to the limit, while a storm -
+	// no resolved calls in between - still outruns the decay. Counts earned by another
+	// model (the primary a bad-call storm was switched away from) are not this model's
+	// to forgive: they survive a healthy fallback stint intact, so switching back and
+	// relapsing on the same name keeps accumulating toward the limit instead of
+	// restarting the ping-pong from zero.
 	if (notFoundBreaker.decayPerResolvedCall > 0) {
-		for (const [name, count] of notFoundBreaker.nameCounts) {
+		const modelKey = toolNotFoundBreakerModelKey(assistantMessage);
+		for (const [name, perModel] of notFoundBreaker.nameCounts) {
+			const count = perModel.get(modelKey);
+			if (count === undefined) continue;
 			const next = count - notFoundBreaker.decayPerResolvedCall;
 			if (next <= 0) {
-				notFoundBreaker.nameCounts.delete(name);
+				perModel.delete(modelKey);
+				if (perModel.size === 0) notFoundBreaker.nameCounts.delete(name);
 			} else {
-				notFoundBreaker.nameCounts.set(name, next);
+				perModel.set(modelKey, next);
 			}
 		}
 	}
@@ -2387,6 +2404,15 @@ function formatAvailableTools(tools: readonly AgentTool<any>[] | undefined): str
 
 type ToolNotFoundEscalation = "plain" | "warn" | "recover" | "trip";
 
+/**
+ * The identity a breaker miss (and a resolved call's forgiveness) is attributed to:
+ * the model whose assistant message carried the call, not the run's current config
+ * model, so attribution holds even as the run retargets models between turns.
+ */
+function toolNotFoundBreakerModelKey(message: AssistantMessage): string {
+	return `${message.provider}\n${message.model}`;
+}
+
 interface ToolNotFoundBreakerTrip {
 	toolName: string;
 	nameCount: number;
@@ -2413,8 +2439,13 @@ interface ToolNotFoundBreakerState {
 	readonly recoveryTurns: number;
 	/** Consecutive unknown-tool calls; any call whose name resolves resets it. */
 	consecutive: number;
-	/** Per-name miss counts, decayed by resolved calls; a storm outruns the decay. */
-	readonly nameCounts: Map<string, number>;
+	/**
+	 * Per-name miss counts attributed to the model that produced the miss. A resolved
+	 * call decays only the counts its own model earned, so a healthy stint on a
+	 * fallback model never forgives the tally of the model the storm was switched
+	 * away from - switching back keeps accumulating where that model left off.
+	 */
+	readonly nameCounts: Map<string, Map<string, number>>;
 	total: number;
 	/** Recovery turns granted so far this run; capped at recoveryTurns. */
 	recoveriesUsed: number;
@@ -2448,11 +2479,16 @@ function resolveToolNotFoundBreaker(config?: ToolNotFoundBreakerConfig): ToolNot
 }
 
 /** Records one unknown-tool call and reports the receipt level it earns. */
-function recordToolNotFound(state: ToolNotFoundBreakerState, name: string): ToolNotFoundEscalation {
+function recordToolNotFound(state: ToolNotFoundBreakerState, name: string, modelKey: string): ToolNotFoundEscalation {
 	state.total += 1;
 	state.consecutive += 1;
-	const nameCount = (state.nameCounts.get(name) ?? 0) + 1;
-	state.nameCounts.set(name, nameCount);
+	let perModel = state.nameCounts.get(name);
+	if (!perModel) {
+		perModel = new Map();
+		state.nameCounts.set(name, perModel);
+	}
+	const nameCount = (perModel.get(modelKey) ?? 0) + 1;
+	perModel.set(modelKey, nameCount);
 	const limitHit = nameCount >= state.terminateAfter || state.consecutive >= state.terminateAfter;
 	if (!state.trip && !state.recovery?.pending && (state.recovery !== undefined || limitHit)) {
 		// Every trigger - the limit hit, or a relapse inside an open recovery turn -

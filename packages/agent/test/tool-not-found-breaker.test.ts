@@ -91,6 +91,15 @@ function assistantWith(content: AssistantMessage["content"]): AssistantMessage {
 	};
 }
 
+/** An assistant message produced by a different model (the fallback chain's). */
+function assistantWithModel(
+	content: AssistantMessage["content"],
+	model: string,
+	provider = "fallback",
+): AssistantMessage {
+	return { ...assistantWith(content), provider, model };
+}
+
 const echoTool: AgentTool<any> = {
 	name: "echo",
 	label: "echo",
@@ -475,6 +484,85 @@ describe("tool-not-found breaker", () => {
 			(diagnostic) => diagnostic.type === TOOL_NOT_FOUND_BREAKER_DIAGNOSTIC_TYPE,
 		);
 		expect((breakerDiagnostic?.details ?? {}) as { recoveriesUsed?: number }).toMatchObject({ recoveriesUsed: 3 });
+	});
+
+	it("a healthy fallback stint does not decay the switched-away model's counts: the relapse after switching back trips the breaker", async () => {
+		const steps = [
+			// The primary model's opening storm: three `rlm` misses (the session-side
+			// storm detector switches the run to the fallback chain at this point).
+			assistantWith([toolCall("c1", "rlm")]),
+			assistantWith([toolCall("c2", "rlm")]),
+			assistantWith([toolCall("c3", "rlm")]),
+			// The fallback model works healthily: enough resolved calls that a decay not
+			// attributed to the model that missed would wash the primary's 3 to zero.
+			assistantWithModel([toolCall("c4", "ipython", { code: "1" })], "fallback-model"),
+			assistantWithModel([toolCall("c5", "ipython", { code: "2" })], "fallback-model"),
+			assistantWithModel([toolCall("c6", "ipython", { code: "3" })], "fallback-model"),
+			assistantWithModel([toolCall("c7", "ipython", { code: "4" })], "fallback-model"),
+			// The cooldown expires and the run returns to the primary, which relapses on
+			// the same invented name. The count continues from 3 - the warn, then the
+			// limit grants recovery turn 1, and relapses inside the open episode spend
+			// the per-run budget until it is gone.
+			assistantWith([toolCall("c8", "rlm")]),
+			assistantWith([toolCall("c9", "rlm")]),
+			assistantWith([toolCall("c10", "rlm")]),
+			assistantWith([toolCall("c11", "rlm")]),
+			assistantWith([toolCall("c12", "rlm")]),
+			assistantWith([{ type: "text", text: "should never be requested" }]),
+		];
+		const { messages, streamCalls } = await runScripted({ tools: [ipythonTool, echoTool], steps });
+
+		expect(streamCalls()).toBe(12);
+		const receipts = toolResultTexts(messages);
+		// The fallback's calls really ran (their outputs, not receipts, are on record).
+		expect(receipts[3]).toBe("1");
+		expect(receipts[6]).toBe("4");
+		// The first relapse after the switch-back is the primary's 4th cumulative miss
+		// on this name: a warn, not a fresh plain receipt.
+		expect(receipts[7]).toContain("Tool rlm not found");
+		expect(receipts[7]).toContain("tool-not-found breaker");
+		// The second reaches the limit and grants recovery turn 1 of 3...
+		expect(receipts[8]).toContain("recovery turn 1 of 3");
+		// ...and the relapses inside the open recovery turn spend the budget.
+		expect(receipts[9]).toContain("recovery turn 2 of 3");
+		expect(receipts[10]).toContain("recovery turn 3 of 3");
+		expect(receipts[11]).toContain("the run stops");
+		const terminal = lastAssistant(messages);
+		expect(isToolNotFoundBreakerFailure(terminal)).toBe(true);
+		// The primary missed `rlm` 8 times across the two stints; the fallback's good
+		// work never entered that tally.
+		expect(terminal.errorMessage).toContain('(8 for "rlm")');
+	});
+
+	it("a clean recovery close by the fallback model does not clear the switched-away model's counts", async () => {
+		const steps = [
+			// Five primary misses on `rlm`: the limit grants recovery turn 1 of 3 while
+			// the storm detector switches the run to the fallback model.
+			...Array.from({ length: 5 }, (_unused, index) => assistantWith([toolCall(`c${index}`, "rlm")])),
+			// The fallback answers the recovery round with one resolved call. The clean
+			// close ends the episode, but the primary's five misses are not the
+			// fallback's to forgive.
+			assistantWithModel([toolCall("c5", "echo", { text: "fallback ok" })], "fallback-model"),
+			// The cooldown expires and the run returns to the primary. Its first relapse
+			// is the 6th cumulative miss on the name: the episode closed, so the limit
+			// hit grants recovery turn 2 of 3 straight away...
+			assistantWith([toolCall("c6", "rlm")]),
+			// ...and the relapses inside the open episode spend the remaining budget.
+			assistantWith([toolCall("c7", "rlm")]),
+			assistantWith([toolCall("c8", "rlm")]),
+			assistantWith([{ type: "text", text: "should never be requested" }]),
+		];
+		const { messages, streamCalls } = await runScripted({ tools: [echoTool], steps });
+
+		expect(streamCalls()).toBe(9);
+		const receipts = toolResultTexts(messages);
+		expect(receipts[4]).toContain("recovery turn 1 of 3");
+		expect(receipts[5]).toBe("fallback ok");
+		expect(receipts[6]).toContain("Tool rlm not found");
+		expect(receipts[6]).toContain("recovery turn 2 of 3");
+		expect(receipts[7]).toContain("recovery turn 3 of 3");
+		expect(receipts[8]).toContain("the run stops");
+		expect(isToolNotFoundBreakerFailure(lastAssistant(messages))).toBe(true);
 	});
 
 	it("disabled keeps the enriched receipts but never counts and never terminates", async () => {

@@ -1,0 +1,1 @@
+- Fixed the tool-not-found breaker never tripping behind a fallback chain: per-name miss counts are now attributed to the model that made the miss, and a resolved call decays only its own model's counts, so a healthy fallback stint no longer washes the tally of a primary model that keeps hallucinating the same tool name after every cooldown return.
