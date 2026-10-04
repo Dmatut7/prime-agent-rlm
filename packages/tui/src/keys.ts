@@ -536,6 +536,9 @@ export function isKeyRelease(data: string): boolean {
 		return false;
 	}
 
+	// `:3u`/`:3~`/… match event-type directly before the terminator; `:3;` matches
+	// event-type followed by a text-as-codepoints section (Ghostty release events
+	// on latched-modifier layouts), which is still a release.
 	if (
 		data.includes(":3u") ||
 		data.includes(":3~") ||
@@ -544,7 +547,8 @@ export function isKeyRelease(data: string): boolean {
 		data.includes(":3C") ||
 		data.includes(":3D") ||
 		data.includes(":3H") ||
-		data.includes(":3F")
+		data.includes(":3F") ||
+		data.includes(":3;")
 	) {
 		return true;
 	}
@@ -567,6 +571,8 @@ export function isKeyRepeat(data: string): boolean {
 		return false;
 	}
 
+	// `:2;` covers repeat events followed by a text-as-codepoints section. See
+	// isKeyRelease().
 	if (
 		data.includes(":2u") ||
 		data.includes(":2~") ||
@@ -575,7 +581,8 @@ export function isKeyRepeat(data: string): boolean {
 		data.includes(":2C") ||
 		data.includes(":2D") ||
 		data.includes(":2H") ||
-		data.includes(":2F")
+		data.includes(":2F") ||
+		data.includes(":2;")
 	) {
 		return true;
 	}

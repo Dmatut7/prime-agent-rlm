@@ -512,6 +512,18 @@ describe("Kitty protocol byte-level regressions", () => {
 		assert.strictEqual(decodePrintableKey("\x1b[97;2:3;97u"), undefined);
 		assert.strictEqual(decodeKittyPrintable("\x1b[97;2:3;97u"), undefined);
 	});
+
+	// Same Ghostty release-with-text shape at the event-type layer: when the
+	// event-type subfield is followed by a text section (`:3;<text>u`), the
+	// substring patterns must still recognize it as a release/repeat, otherwise
+	// tui.ts's release filter silently stops applying to these events.
+	it("recognizes release/repeat events carrying a text-as-codepoints section", () => {
+		assert.equal(isKeyRelease("\x1b[97;2:3;97u"), true); // shift+a release, text "a"
+		assert.equal(isKeyRelease("\x1b[97;2:3;97:98u"), true); // multi-codepoint text section
+		assert.equal(isKeyRepeat("\x1b[97;2:2;97u"), true); // shift+a repeat, text "a"
+		assert.equal(isKeyRelease("\x1b[97;2:1;97u"), false); // press with text is not a release
+		assert.equal(isKeyRepeat("\x1b[97;2:1;97u"), false); // press with text is not a repeat
+	});
 });
 
 describe("parseKey", () => {
