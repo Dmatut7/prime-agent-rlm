@@ -263,13 +263,17 @@ function cellResultMessage(
 	text: string,
 	isError = false,
 	fileChanges?: { scope: string }[],
+	changeTrackingIncomplete?: string,
 ): AgentMessage {
 	return {
 		role: "toolResult",
 		toolCallId,
 		toolName: "ipython",
 		content: [{ type: "text", text }],
-		details: fileChanges ? { fileChanges } : {},
+		details: {
+			...(fileChanges ? { fileChanges } : {}),
+			...(changeTrackingIncomplete ? { changeTrackingIncomplete } : {}),
+		},
 		isError,
 		timestamp: 0,
 	};
@@ -573,6 +577,123 @@ describe("runHasVerificationEvidence", () => {
 			]),
 		).toBe(true);
 	});
+
+	it("voids the green run when a shell command writes files afterwards", () => {
+		// A classic shell tool's result carries no tracked change list (tracking lives
+		// in the REPL kernel), so the command text is the only evidence of the write.
+		const green = [userMessage("fix it"), toolCallMessage("t1", "npm test"), toolResultMessage("t1")];
+		const writes = [
+			"sed -i '' 's/a/b/' src/a.ts",
+			"sed -i.bak 's/a/b/' src/a.ts",
+			"echo patch >> src/a.ts",
+			"cat patch.diff > src/a.ts",
+			"cp src/a.ts src/b.ts",
+			"mv src/a.ts src/b.ts",
+			"rm src/old.ts",
+			"tee src/a.ts",
+			"touch src/new.ts",
+			"git checkout -- src/a.ts",
+			"git apply fix.diff",
+		];
+		expect(writes.length).toBeGreaterThan(0);
+		for (const command of writes) {
+			expect(
+				runHasVerificationEvidence([
+					...green,
+					toolCallMessage("w1", command),
+					toolResultMessage("w1"),
+					reply("改完了"),
+				]),
+				command,
+			).toBe(false);
+		}
+		// Read-only commands leave the pass standing.
+		const reads = ["grep -r foo src/", "cat src/a.ts", "git status", "git diff --stat", "npm test 2>&1 | tail -5"];
+		expect(reads.length).toBeGreaterThan(0);
+		for (const command of reads) {
+			expect(
+				runHasVerificationEvidence([
+					...green,
+					toolCallMessage("w1", command),
+					toolResultMessage("w1"),
+					reply("改完了"),
+				]),
+				command,
+			).toBe(true);
+		}
+		// A failed write command proves nothing either way; the pass stands.
+		expect(
+			runHasVerificationEvidence([
+				...green,
+				toolCallMessage("w1", "sed -i '' 's/a/b/' src/a.ts"),
+				toolResultMessage("w1", true),
+				reply("改完了"),
+			]),
+		).toBe(true);
+	});
+
+	it("does not read a cell's code as a shell command - the tracked changes are its ground truth", () => {
+		// `>` in Python is a comparison, not a redirect: a cell with no tracked
+		// project change keeps the pass.
+		expect(
+			runHasVerificationEvidence([
+				userMessage("fix it"),
+				toolCallMessage("t1", "npm test"),
+				toolResultMessage("t1"),
+				cellCallMessage("c1", "x = 1 > 2\nprint(x)"),
+				cellResultMessage("c1", "False"),
+				reply("改完了"),
+			]),
+		).toBe(true);
+	});
+
+	it("counts a cell's tracked writes even when the cell errored after writing", () => {
+		// The write landed before the error did; an error result only means the edit
+		// tool's no-op case, never a cell's.
+		expect(
+			runHasVerificationEvidence([
+				userMessage("fix it"),
+				toolCallMessage("t1", "npm test"),
+				toolResultMessage("t1"),
+				cellCallMessage("c1", "open('src/a.ts', 'w').write('x')\n1/0"),
+				cellResultMessage("c1", "ZeroDivisionError", true, [{ scope: "project" }]),
+				reply("改完了"),
+			]),
+		).toBe(false);
+	});
+
+	it("does not trust the green run when change tracking says it is incomplete", () => {
+		const green = [userMessage("fix it"), toolCallMessage("t1", "npm test"), toolResultMessage("t1")];
+		// A later cell whose change list is partial may hold the write that voids the
+		// pass; the gate reads incomplete as a change.
+		expect(
+			runHasVerificationEvidence([
+				...green,
+				cellCallMessage("c1", "x = 1"),
+				cellResultMessage("c1", "", false, undefined, "time budget used up"),
+				reply("改完了"),
+			]),
+		).toBe(false);
+		// The cell that ran the check re-proves itself: the verdict comes from its own
+		// output, and its own writes are forgiven by the coverage rule either way.
+		expect(
+			runHasVerificationEvidence([
+				userMessage("fix it"),
+				cellCallMessage("t1", "r = await bash('npm test')\nprint(r.exit_code)"),
+				cellResultMessage("t1", "0", false, undefined, "time budget used up"),
+			]),
+		).toBe(true);
+		// Incomplete tracking before the green run says nothing about what came after.
+		expect(
+			runHasVerificationEvidence([
+				userMessage("fix it"),
+				cellCallMessage("c1", "x = 1"),
+				cellResultMessage("c1", "", false, undefined, "time budget used up"),
+				toolCallMessage("t1", "npm test"),
+				toolResultMessage("t1"),
+			]),
+		).toBe(true);
+	});
 });
 
 describe("finishGateStrikesInRun", () => {
@@ -661,6 +782,7 @@ describe("finish-gate message and records", () => {
 		expect(content).toContain('"修好了"');
 		expect(content).toContain("2 of at most 4");
 		expect(content).toContain("do not re-run a check that already passed");
+		expect(content).toContain("a check only stays passed while the code it covered stays unchanged");
 		expect(content).toContain("a citation without the verdict reads as no proof");
 	});
 

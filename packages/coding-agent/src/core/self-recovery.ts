@@ -296,6 +296,17 @@ const EN_TASK_VERB =
 const VERIFICATION_COMMAND =
 	/(?:^|[\s;&|`"'(])(?:(?:npm|pnpm|yarn|bun|deno|npx|uv|uvx|cargo|go|mvn|gradle|make|xcodebuild|swift|bazel)\s+[^\n;&|]{0,120}?\b(?:tests?|spec|check|build|lint|type-?check|compile|verify|clippy)\b|py\.?test|vitest|jest|mocha|phpunit|rspec|ctest|tsc|tsgo|eslint|biome\s+check|ruff\s+check|mypy|pyright)(?=[\s;'")]|$)/i;
 
+// A shell command that can change project files. A classic shell tool's result
+// carries no tracked change list (change tracking lives in the REPL kernel), so
+// the command text is the transcript's only evidence of the write: a clean result
+// of one of these voids an earlier green the same way a tracked edit does. The
+// redirect alternative is meant for command lines only - cell code never takes
+// this branch, where `>` is a comparison - and it excludes fd duplication
+// (`2>&1`) and `>=`. A `>` inside quoted data over-voids; the cost of a false
+// void is one re-run, the cost of a missed one is a stale pass standing.
+const SHELL_WRITE_COMMAND =
+	/(?:^|[\s;&|`(])(?:sed\s+[^;&|\n]*?-i\b|perl\s+[^;&|\n]*?-i\b|tee\b|mv\b|cp\b|rm\b|touch\b|patch\b|truncate\b|dd\b|install\b|rsync\b|git\s+(?:apply|checkout|restore|clean|reset|merge|rebase|cherry-pick|revert|am|stash)\b|(?:\d+)?>>?(?![&=]))/i;
+
 // What "ran green" means depends on the surface the check ran on. A direct shell tool
 // fails a non-zero exit into an error result (tools/bash.ts), so a clean result is
 // exit 0 by construction. A REPL cell instead runs the check inside Python, where
@@ -356,7 +367,9 @@ export function lastUserPromptText(messages: readonly AgentMessage[]): string | 
  * in its own output (a zero exit code, the runner's pass wording, or an assert on
  * the exit code in the cell's code), because a clean cell only proves the Python
  * ran. A green run is voided by a later red run and by any project file change
- * after it (an edit result, or a cell whose tracked changes touch the project);
+ * after it (an edit result, a cell whose tracked changes touch the project, a
+ * shell command whose text writes files, or a cell whose change tracking says it
+ * is incomplete - an unseen write voids the pass the same way a seen one does);
  * the result that ran the check never voids itself - a coverage write happens
  * before the verdict it carries.
  */
@@ -388,8 +401,9 @@ export function runHasVerificationEvidence(messages: readonly AgentMessage[]): b
 	for (let index = start; index < messages.length; index++) {
 		const message = messages[index];
 		if (message?.role !== "toolResult") continue;
-		if (resultChangedProjectFiles(message)) verified = false;
 		const call = calls.get(message.toolCallId);
+		if (resultChangedProjectFiles(message, call)) verified = false;
+		if (resultHasIncompleteChangeTracking(message)) verified = false;
 		if (call === undefined || !VERIFICATION_COMMAND.test(call.command)) continue;
 		const outcome = verificationOutcome(call, message);
 		if (outcome === "green") verified = true;
@@ -420,18 +434,42 @@ function verificationOutcome(
 }
 
 /** Whether a clean tool result changed project files - the event that voids a green run. */
-function resultChangedProjectFiles(message: Extract<AgentMessage, { role: "toolResult" }>): boolean {
-	if (message.isError) return false;
+function resultChangedProjectFiles(
+	message: Extract<AgentMessage, { role: "toolResult" }>,
+	call: { command: string; cell: boolean } | undefined,
+): boolean {
 	// A clean edit result is a change by construction; a no-op edit is an error result.
-	if (message.toolName === "edit") return true;
+	if (message.toolName === "edit") return !message.isError;
 	// A REPL cell's tracked file effects; scratch and harness-memory writes do not
-	// touch what the check verified.
+	// touch what the check verified. The write landed before any error the cell
+	// raised afterwards, so an errored cell's tracked changes still count.
 	const details = message.details as { fileChanges?: unknown } | undefined;
 	const changes = details?.fileChanges;
-	if (!Array.isArray(changes)) return false;
-	return changes.some(
-		(change) => typeof change === "object" && change !== null && (change as { scope?: unknown }).scope === "project",
-	);
+	if (
+		Array.isArray(changes) &&
+		changes.some(
+			(change) =>
+				typeof change === "object" && change !== null && (change as { scope?: unknown }).scope === "project",
+		)
+	) {
+		return true;
+	}
+	if (message.isError) return false;
+	// A classic shell tool has no tracked change list; the command text is the only
+	// evidence of the write (see SHELL_WRITE_COMMAND).
+	return call !== undefined && !call.cell && SHELL_WRITE_COMMAND.test(call.command);
+}
+
+/**
+ * Whether a result's change tracking says it is partial (a snapshot that ran out of
+ * budget, too many files to list, ...). An incomplete list may be missing the write
+ * that voids a green run, so the gate reads incomplete as a change: "不完整则不作数".
+ * The result that ran the check re-proves itself - the verdict comes from its own
+ * output, and its own writes are forgiven by the coverage rule either way.
+ */
+function resultHasIncompleteChangeTracking(message: Extract<AgentMessage, { role: "toolResult" }>): boolean {
+	const details = message.details as { changeTrackingIncomplete?: unknown } | undefined;
+	return typeof details?.changeTrackingIncomplete === "string" && details.changeTrackingIncomplete.length > 0;
 }
 
 export interface FinishGateScanOptions {

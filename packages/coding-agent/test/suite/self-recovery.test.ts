@@ -701,6 +701,59 @@ describe("self-recovery: finish gate", () => {
 		expect(harness.faux.state.callCount).toBe(2);
 	});
 
+	it("gates the claim when a shell write after the green check voided it", async () => {
+		// The classic shell tool carries no tracked change list; the sed in the
+		// command text is the only evidence that the code moved after the pass.
+		const harness = await harnessWith({}, [commandTool()]);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("run_command", { command: "npm test" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage(fauxToolCall("run_command", { command: "sed -i '' 's/a/b/' src/a.ts" }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("修好了。"),
+			fauxAssistantMessage("修好了，验证过：第一次 npm test 之后用 sed 又改了代码，重跑后通过。"),
+		]);
+		await harness.session.promptAndWait("fix it");
+
+		expect(autoContinues(harness)).toHaveLength(1);
+		expect(String((autoContinues(harness)[0] as { content: unknown }).content)).toContain("[finish gate]");
+		expect(harness.faux.state.callCount).toBe(4);
+	});
+
+	it("gates the claim when a later cell's change tracking is incomplete", async () => {
+		// An incomplete change list may be missing the write that voids the pass, so
+		// the gate does not trust the green either way.
+		const incompleteCellTool = (): AgentTool => ({
+			name: "ipython",
+			label: "IPython",
+			description: "Runs a cell",
+			parameters: Type.Object({ code: Type.String() }),
+			execute: async (_toolCallId, params) => {
+				const code = String((params as { code?: unknown }).code ?? "");
+				if (code.includes("npm test")) {
+					return { content: [{ type: "text", text: "0" }], details: {} };
+				}
+				return {
+					content: [{ type: "text", text: "" }],
+					details: { changeTrackingIncomplete: "time budget used up" },
+				};
+			},
+		});
+		const harness = await harnessWith({}, [incompleteCellTool()]);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("ipython", { code: "r = await bash('npm test')\nprint(r.exit_code)" }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage(fauxToolCall("ipython", { code: "x = 1" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("修好了。"),
+			fauxAssistantMessage("修好了，测试全部通过。"),
+		]);
+		await harness.session.promptAndWait("fix it");
+
+		expect(autoContinues(harness)).toHaveLength(1);
+		expect(harness.faux.state.callCount).toBe(4);
+	});
+
 	it("gates a claim made with no tool work at all when the prompt asked for work", async () => {
 		const harness = await harnessWith();
 		harness.setResponses([
