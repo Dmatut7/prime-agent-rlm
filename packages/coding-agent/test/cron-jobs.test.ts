@@ -778,6 +778,56 @@ describe("AgentCronJobStore", () => {
 		expect(store.getLatestHeartbeat("active-1")).toMatchObject({ id: job.id, status: "cancelled" });
 	});
 
+	it("pauseJob parks an active job with the reason recorded and the next run cleared", () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		const job = store.create({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 5m",
+			prompt: "tick",
+			now: start,
+		});
+
+		const reason = "the session working directory no longer exists: /tmp/project";
+		const paused = store.pauseJob(job.id, { reason, now: new Date("2026-01-01T12:35:00.000Z") });
+
+		expect(paused).toMatchObject({
+			id: job.id,
+			status: "paused",
+			lastError: reason,
+			updatedAt: "2026-01-01T12:35:00.000Z",
+		});
+		expect(paused).not.toHaveProperty("nextRunAt");
+		// A fresh read serves the parked copy: the pause reached disk, not just the snapshot.
+		expect(store.list().find((candidate) => candidate.id === job.id)).toMatchObject({
+			status: "paused",
+			lastError: reason,
+		});
+	});
+
+	it("pauseJob leaves terminal jobs and unknown ids alone", () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		const cancelled = store.create({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 5m",
+			prompt: "tick",
+			now: start,
+		});
+		store.cancel(cancelled.id, new Date("2026-01-01T12:34:30.000Z"));
+
+		expect(store.pauseJob("missing-id", { reason: "gone" })).toBeUndefined();
+		expect(store.pauseJob(cancelled.id, { reason: "gone" })).toBeUndefined();
+		expect(store.list().find((candidate) => candidate.id === cancelled.id)).toMatchObject({
+			status: "cancelled",
+		});
+		expect(store.list().find((candidate) => candidate.id === cancelled.id)).not.toHaveProperty("lastError");
+	});
+
 	it("rejects one-shot heartbeat schedules", () => {
 		const store = new AgentCronJobStore(makeStorePath(tempDirs));
 
