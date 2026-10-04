@@ -86,6 +86,46 @@ describe("tool name conflicts are loud", () => {
 		expect(runner.getToolDiagnostics()).toHaveLength(0);
 	});
 
+	it("lets a project-local extension win a tool name over a global one (load order plus first-wins)", async () => {
+		// Trust-domain precedence is load order: discoverAndLoadExtensions scans
+		// <cwd>/.prime/agent/extensions before <agentDir>/extensions, and the runner keeps the
+		// first registration per name. Extensions run in-process with full privileges, so the
+		// shadowed global tool losing the name grants the local one nothing it could not already
+		// do - the guard is the loud diagnostic, not the resolution.
+		const projectDir = join(tempDir, "project");
+		const localExtDir = join(projectDir, ".prime", "agent", "extensions");
+		const globalExtDir = join(agentDir, "extensions");
+		mkdirSync(localExtDir, { recursive: true });
+		mkdirSync(globalExtDir, { recursive: true });
+		writeFileSync(join(localExtDir, "local.ts"), toolCode("shared", "project-local"));
+		writeFileSync(join(globalExtDir, "global.ts"), toolCode("shared", "user-global"));
+
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const result = await discoverAndLoadExtensions([], projectDir, agentDir);
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			projectDir,
+			SessionManager.inMemory(),
+			ModelRegistry.create(AuthStorage.create(join(tempDir, "auth-local-first.json"))),
+		);
+		const tools = runner.getAllRegisteredTools();
+
+		expect(tools).toHaveLength(1);
+		expect(tools[0]?.definition.description).toBe("project-local");
+
+		const message = runner
+			.getToolDiagnostics()
+			.map((d) => d.message)
+			.join("\n");
+		expect(message).toContain("local.ts");
+		expect(message).toContain("global.ts");
+		expect(message).toContain("unreachable");
+		expect(warnSpy).toHaveBeenCalled();
+
+		warnSpy.mockRestore();
+	});
+
 	it("notifies the UI instead of stderr when an extension-runner UI context is bound", async () => {
 		writeFileSync(join(extensionsDir, "a-first.ts"), toolCode("shared", "first"));
 		writeFileSync(join(extensionsDir, "b-second.ts"), toolCode("shared", "second"));

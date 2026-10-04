@@ -932,6 +932,76 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("tool_call failure modes", () => {
+		// tool_call is the extension veto hook over tool execution, so every failure mode must
+		// fail closed. A throw rethrows out of emitToolCall (isolateErrors=false); the caller is
+		// AgentSession's beforeToolCall hook, and the agent loop converts that throw into an error
+		// tool result - the tool never executes. The end-to-end half is pinned in
+		// test/suite/agent-session-model-extension.test.ts.
+		it("rethrows a throwing tool_call handler so the agent loop blocks the tool (fail-closed)", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", () => {
+						throw new Error("policy boom");
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "throw-tool.ts"), extCode);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const errors: Array<{ event: string; error: string }> = [];
+			runner.onError((err) => {
+				errors.push({ event: err.event, error: err.error });
+			});
+
+			await expect(
+				runner.emitToolCall({ type: "tool_call", toolName: "custom", toolCallId: "call-throw", input: {} }),
+			).rejects.toThrow("policy boom");
+			expect(errors).toHaveLength(1);
+			expect(errors[0].event).toBe("tool_call");
+			expect(errors[0].error).toContain("policy boom");
+			expect(errors[0].error).not.toContain("skipped");
+		});
+
+		it("fail-safe blocks an aborted tool_call handler without reporting an error", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async () => {
+						await new Promise(() => {});
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "abort-tool.ts"), extCode);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry, {
+				handlerTimeoutMs: 5_000,
+			});
+			const controller = new AbortController();
+			runner.bindCore(extensionActions, {
+				...extensionContextActions,
+				getSignal: () => controller.signal,
+			});
+			const errors: string[] = [];
+			runner.onError((err) => errors.push(err.error));
+
+			const started = Date.now();
+			const emitPromise = runner.emitToolCall({
+				type: "tool_call",
+				toolName: "custom",
+				toolCallId: "call-abort",
+				input: {},
+			});
+			setTimeout(() => controller.abort(), 20);
+			const blocked = await emitPromise;
+			expect(Date.now() - started).toBeLessThan(1000);
+			expect(blocked).toEqual({ block: true, reason: "tool_call handler aborted" });
+			// Interrupt stays quiet by design: an abort is not a handler failure.
+			expect(errors).toEqual([]);
+		});
+	});
+
 	describe("hasHandlers", () => {
 		it("returns true when handlers exist for event type", async () => {
 			const extCode = `

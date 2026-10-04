@@ -614,6 +614,53 @@ describe("AgentSession model and extension characterization", () => {
 		).toBeDefined();
 	});
 
+	it("blocks tool execution when an extension tool_call handler throws (fail-closed)", async () => {
+		let executed = false;
+		const echoTool: AgentTool = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo text back",
+			parameters: Type.Object({ text: Type.String() }),
+			execute: async () => {
+				executed = true;
+				return { content: [{ type: "text", text: "should never run" }], details: {} };
+			},
+		};
+		const harness = await createHarness({
+			tools: [echoTool],
+			extensionFactories: [
+				(pi) => {
+					pi.on("tool_call", async () => {
+						throw new Error("extension policy failure");
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("echo", { text: "hello" })], { stopReason: "toolUse" }),
+			(context) => {
+				const toolResult = context.messages.find((message) => message.role === "toolResult");
+				const errorText =
+					toolResult?.role === "toolResult"
+						? toolResult.content
+								.filter((part): part is { type: "text"; text: string } => part.type === "text")
+								.map((part) => part.text)
+								.join("\n")
+						: "";
+				return fauxAssistantMessage(errorText);
+			},
+		]);
+
+		await harness.session.prompt("hi");
+
+		expect(executed).toBe(false);
+		expect(getAssistantTexts(harness)).toContain("extension policy failure");
+		expect(
+			harness.session.messages.find((message) => message.role === "toolResult" && message.isError),
+		).toBeDefined();
+	});
+
 	it("allows extension tool_result handlers to modify tool results", async () => {
 		const echoTool: AgentTool = {
 			name: "echo",

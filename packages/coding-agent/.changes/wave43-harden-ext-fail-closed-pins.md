@@ -1,0 +1,2 @@
+- Added regression tests pinning that `tool_call` extension handlers fail closed in every failure mode: a throwing, timing-out, or aborted handler blocks the tool call instead of letting it execute.
+- Added a regression test pinning tool-name conflict precedence across trust domains: project-local extensions load before global ones and the first registration wins the shared name, with a loud diagnostic for the shadowed tool.
