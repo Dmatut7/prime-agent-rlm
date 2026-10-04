@@ -14,14 +14,11 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-04，REVIEW-FIXUP 蜂群已 SHIP）
+## 当前状态（2026-10-05，审查②+修复蜂群已 SHIP）
 
-- HEAD = 见 git log（11 批：R3-P2、supervisor 四刀+J、rlm 域、agent-session 六条、熔断、quota/看门狗、
-  暖池、interactive、完成检查、杂项、恢复简报、文档）。
-- 审查 83 条收官：23 条剩余全修（先红后绿+故障注入），禁区三项未动；test-hygiene 基线重冻结 524。
-- R3：P2 落地（高亮 fence 21.3s→0.43s@80k），剩 P3 表格列宽冻结。
-- supervisor 四刀落地：10664 行（起点 12002，四刀 −1338）。候选队列：update-restart、pending-delivery、
-  catchup、scheduled-wake、idle-eviction、stop-finalization（评分表 /tmp/wave50/supervisor-cut2.md）。
+- HEAD = 见 git log（5 批：mask-seal、wake-ledger、quota-takeover、breaker 归属、reveal marker）。
+- 12 路静态审查（60 提交）→ 必修 4 全修 + 应修 5 顺带；剩余应修 ~13 + 小 ~25 在 /tmp/audit-20261004/，
+  进 Backlog。门禁全绿（9881/1767/1319/172）。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）

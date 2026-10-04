@@ -1,3 +1,14 @@
+## 2026-10-05 审查②+修复蜂群：必修 4 + 应修 5 落地（12 路审查 + 5 路工兵）
+
+- 审查（12 路并行，范围 c9937500b..HEAD 60 提交，产物 /tmp/audit-20261004/）：必修 4、应修 18、小 ~25；每份报告带「查过但没问题」清单（四刀 facade 逐成员、双向降级矩阵、P1 缓存键等确认无恙）。
+- 必修 1：rlm 送达账本时序颠倒——starts_when_admitted 路径 delivered 先记成 no-op、admitted 后记永不结清，wake_on_message collect 永久幻影 pending；改为 accept 守卫处记 admission、coalesce 不重复计、取消结清兜底。rlm-runtime 零改动（修的是账本源头）。
+- 必修 2：密封判据从「反引号字符偶对」升级为 marked 精确 emphasis 掩码（Lexer.rules 无未掩码反引 run）——尾部补完 codespan 不再让已密封粗体脱配；顺带堵 link 补完击穿 split-lex、startBlock 截断藏 opener 两面。fuzz40 0 命中。
+- 必修 3：cron cancel 带 cancelledBy origin + 计时器接管落 quota_wake_timer 戳，restoreQuotaPark 区分接管与用户取消——park 跨重启延续，parkCount/wakeRetries 不再归零。
+- 必修 4：blockMath 跨空行吞并不再击穿 lexCache 切点（paragraph-contains/他类-start 拒绝）。
+- 应修 5 条顺带：熔断计数按 (工具名, 模型) 归属（fallback 健康 stint 不再洗坏主模型的账，ping-pong 终结）；handoff 不再谎报重试次数；goal 节流唤醒补三重守卫；update-restart 级联改盖 update_restart 章（park 不再误吃）；reveal marker 不被测量 render 消耗 + 单槽切换清理（F1 间歇复活根治）+ 两个漏 arm 的全局翻动补上。
+- 门禁：check EXIT 0、hygiene OK、单测 9881 绿、suite 1767 绿、tui 1319 绿、agent 172 绿。需要重新编译并重启后才生效。
+- 剩余：应修 ~13 条 + 小 ~25 条在 /tmp/audit-20261004/ 各报告里，进账本 backlog 排队。
+
 ## 2026-10-04 审查修复蜂群（REVIEW-FIXUP-20261004）：23 条全修，十一路并行
 
 任务单（老板下发，仓库根 REVIEW-FIXUP-20261004.md，不入仓）核对 10/1–3 的 83 条审查发现：65 已修、9 修一半、6 没修、修复带出 10 个新问题——本波 23 条全部落地，禁区三项（Claude 5.5 点号、历史改写、main.ts 内联 import 例外）未动。
