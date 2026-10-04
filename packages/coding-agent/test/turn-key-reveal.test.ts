@@ -1,7 +1,16 @@
 import { FullscreenViewport } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it } from "vitest";
+import { BLOCK_REVEAL_MARKER } from "../src/modes/interactive/components/block-focus.js";
+import {
+	anyBudgetTruncatable,
+	reportBudgetTruncatable,
+	resetBudgetTruncatableTracking,
+	setToolOutputFull,
+	toolOutputFull,
+} from "../src/modes/interactive/components/tool-output-budget.js";
 import { TURN_KEY_REVEAL_MARKER, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
+import { BOX_FOCUS_MARKER } from "../src/modes/interactive/components/turn-box.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 import { createReplayHost, modeMethod, type ReplayHost, replayInto } from "./tl-fix-host.js";
 import { assistant, T0 } from "./ui-blocks-helpers.js";
@@ -26,6 +35,11 @@ const WINDOW = 12;
 const toggleTools = modeMethod<(this: ReplayHost, global?: boolean) => void>("toggleToolOutputExpansion");
 const toggleThinking = modeMethod<(this: ReplayHost, global?: boolean) => void>("toggleThinkingBlockVisibility");
 const toggleMessages = modeMethod<(this: ReplayHost, global?: boolean) => void>("toggleAgentMessageExpansion");
+const toggleEditDiffs = modeMethod<(this: ReplayHost) => void>("toggleEditDiffExpansion");
+const toggleOutputFull = modeMethod<(this: ReplayHost) => void>("toggleToolOutputFull");
+const navigableBlocks = modeMethod<(this: ReplayHost) => unknown[]>("navigableBlocks");
+const startBlockNavigation = modeMethod<(this: ReplayHost, direction: -1 | 1) => void>("startBlockNavigation");
+const focusLatestTurnBox = modeMethod<(this: ReplayHost) => boolean>("focusLatestTurnBox");
 
 interface UiProbe {
 	ui: ReplayHost["ui"];
@@ -44,6 +58,9 @@ function fullscreenUi(): UiProbe {
 			requestRender: () => {},
 			requestRenderPreservingViewport: () => {},
 			isFullscreen: () => true,
+			isFullscreenReviewing: () => false,
+			setFocus: () => {},
+			scrollToBottom: () => {},
 			setFullscreenRevealMarker: (marker: string | undefined) => {
 				markers.push(marker);
 			},
@@ -316,5 +333,134 @@ describe("turn key reveal (wave-49 F1)", () => {
 
 		expect(ui.markers).toEqual([TURN_KEY_REVEAL_MARKER]);
 		expect(transcriptLines(host).some((line) => line.includes(TURN_KEY_REVEAL_MARKER))).toBe(true);
+	});
+});
+
+/**
+ * Audit 2026-10-04 (M5): the arm and the frame are a throttle interval apart,
+ * and two interleavings inside that window used to break the reveal.
+ * (a) Block navigation sizes every chat child to pick its focus target; that
+ * measurement render spent the one-shot armed flag, so the frame that followed
+ * carried no marker and the toggle's reveal was silently lost.
+ * (b) Starting block navigation (or box focus, or leaving either) moves the
+ * viewport's single reveal slot to another marker; the armed turn head still
+ * embedded the TURN marker into the frame, and composeFrame strips only the
+ * marker the slot currently holds - the raw APC bytes reached the screen.
+ * Two key handlers that flip every turn (app.edits.expand, app.tools.expandFull)
+ * never armed a reveal at all.
+ */
+describe("turn key reveal lifecycle (audit M5)", () => {
+	it("block navigation's measurement between arm and frame does not spend the reveal", async () => {
+		const ui = fullscreenUi();
+		const host = await replayedOldFormatTurn(ui);
+
+		const viewport = new FullscreenViewport();
+		viewport.composeFrame(transcriptLines(host), [], WINDOW);
+
+		toggleTools.call(host);
+		expect(ui.markers).toEqual([TURN_KEY_REVEAL_MARKER]);
+
+		// Alt+Up's walk sizes every chat child before the throttled frame runs.
+		navigableBlocks.call(host);
+
+		const lines = transcriptLines(host);
+		expect(lines.some((line) => line.includes(TURN_KEY_REVEAL_MARKER))).toBe(true);
+		viewport.setRevealMarker(ui.markers.at(-1));
+		const after = viewport.composeFrame(lines, [], WINDOW);
+		expect(plainText(after)).toContain("TURNHEAD_WORD");
+		expect(after.some((line) => line.includes(TURN_KEY_REVEAL_MARKER))).toBe(false);
+	});
+
+	it("moving the viewport reveal slot disarms the armed turn marker instead of leaking it raw", async () => {
+		const ui = fullscreenUi();
+		const host = await replayedOldFormatTurn(ui);
+
+		toggleTools.call(host);
+		expect(ui.markers).toEqual([TURN_KEY_REVEAL_MARKER]);
+
+		// Alt+Up before the frame: block navigation takes the reveal slot over.
+		startBlockNavigation.call(host, -1);
+		expect(ui.markers).toEqual([TURN_KEY_REVEAL_MARKER, BLOCK_REVEAL_MARKER]);
+
+		// The turn marker was never spent by a frame; it must not leak into one now.
+		expect(transcriptLines(host).some((line) => line.includes(TURN_KEY_REVEAL_MARKER))).toBe(false);
+	});
+
+	it("clearing the viewport reveal slot disarms the armed turn marker", async () => {
+		const ui = fullscreenUi();
+		const host = await replayedOldFormatTurn(ui);
+
+		toggleTools.call(host);
+		startBlockNavigation.call(host, -1);
+		// Esc leaves block navigation: the slot clears before any frame spent the markers.
+		modeMethod<(this: ReplayHost) => void>("endBlockNavigation").call(host);
+		expect(ui.markers).toEqual([TURN_KEY_REVEAL_MARKER, BLOCK_REVEAL_MARKER, undefined]);
+		expect(transcriptLines(host).some((line) => line.includes(TURN_KEY_REVEAL_MARKER))).toBe(false);
+	});
+
+	it("switching to the box-focus reveal slot disarms the armed turn marker instead of leaking it raw", async () => {
+		const ui = fullscreenUi();
+		const host = await replayedOldFormatTurn(ui);
+
+		toggleTools.call(host);
+		expect(ui.markers).toEqual([TURN_KEY_REVEAL_MARKER]);
+
+		// Ctrl+J (app.turn.focus) before the frame: the box walk takes the reveal
+		// slot without rendering the chat in between, so the armed flag survives
+		// until the slot moves.
+		focusLatestTurnBox.call(host);
+		expect(ui.markers).toEqual([TURN_KEY_REVEAL_MARKER, BOX_FOCUS_MARKER]);
+
+		// The turn marker was never spent by a frame; it must not leak into one now.
+		expect(transcriptLines(host).some((line) => line.includes(TURN_KEY_REVEAL_MARKER))).toBe(false);
+	});
+
+	it("app.edits.expand (every turn's edit diffs) arms the same reveal", async () => {
+		const ui = fullscreenUi();
+		const host = await replayedOldFormatTurn(ui);
+		// The key's global flip lives in the legacy layout, where the tool blocks are chat children.
+		const settings = host.settingsManager as { getProcessMode: () => string };
+		settings.getProcessMode = () => "verbose";
+		await replayInto(host, [
+			{ role: "user", content: "老会话的问题", timestamp: T0 },
+			assistant(T0 + 1000, [
+				{ type: "text", text: "TURNHEAD_WORD 先查引用" },
+				{ type: "toolCall", id: "c1", name: "ipython", arguments: { code: "print(1)" } },
+			]),
+			{
+				role: "toolResult",
+				toolCallId: "c1",
+				toolName: "ipython",
+				content: [{ type: "text", text: "1" }],
+				isError: false,
+				timestamp: T0 + 2000,
+			},
+			assistant(T0 + 3000, [{ type: "text", text: "答完了" }], "stop"),
+		]);
+		expect(latestSummary(host).state.boxMode).toBe(false);
+
+		toggleEditDiffs.call(host);
+
+		expect(ui.toasts).toEqual([]);
+		expect(host.editDiffsExpanded).toBe(true);
+		expect(ui.markers).toEqual([TURN_KEY_REVEAL_MARKER]);
+	});
+
+	it("app.tools.expandFull (lifting the expanded-output budget) arms the same reveal", async () => {
+		const ui = fullscreenUi();
+		const host = await replayedOldFormatTurn(ui);
+		// A block that last rendered holding rows back: the key has something to flip.
+		reportBudgetTruncatable({}, true);
+		expect(anyBudgetTruncatable()).toBe(true);
+		try {
+			toggleOutputFull.call(host);
+
+			expect(ui.toasts).toEqual([]);
+			expect(toolOutputFull()).toBe(true);
+			expect(ui.markers).toEqual([TURN_KEY_REVEAL_MARKER]);
+		} finally {
+			setToolOutputFull(false);
+			resetBudgetTruncatableTracking();
+		}
 	});
 });

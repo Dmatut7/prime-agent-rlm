@@ -627,6 +627,14 @@ function chatHasLane(children: readonly Component[], lane: "setExpanded" | "setE
 	);
 }
 
+/**
+ * Sizing a block for the navigation walk must not spend a turn head's armed
+ * reveal marker: that one-shot belongs to the next frame, not to a measurement.
+ */
+function measureBlockRows(block: Component, width: number): string[] {
+	return block instanceof TurnSummaryComponent ? block.renderForMeasurement(width) : block.render(width);
+}
+
 /** Whether a turn has any thinking to open: its box's thinking rows, or the thinking of its answers. */
 function turnHasThinking(summary: TurnSummaryComponent): boolean {
 	const state = summary.state;
@@ -1512,6 +1520,8 @@ export class InteractiveMode {
 				resumeFollow: boolean;
 		  }
 		| undefined;
+	/** The turn head armed for the TURN reveal; disarmed when the viewport's reveal slot moves on before a frame spends it. */
+	private revealArmedSummary: TurnSummaryComponent | undefined;
 	private recentSession: RecentSession | undefined;
 	/** When the current agent run started (agent_start), the floor for its turn clock. */
 	private agentRunStartedAt: number | undefined;
@@ -10427,7 +10437,7 @@ export class InteractiveMode {
 		const width = Math.max(1, this.ui.terminal.columns);
 		return this.chatContainer.children.filter(
 			(child): child is FocusableBlock & Component =>
-				isFocusableBlock(child) && child.render(width).some(isVisibleRow),
+				isFocusableBlock(child) && measureBlockRows(child, width).some(isVisibleRow),
 		);
 	}
 
@@ -10462,7 +10472,7 @@ export class InteractiveMode {
 		};
 		this.applyBlockFocus();
 		this.ui.setFocus(navigator);
-		this.ui.setFullscreenRevealMarker(BLOCK_REVEAL_MARKER);
+		this.setViewportRevealMarker(BLOCK_REVEAL_MARKER);
 		this.ui.requestRender();
 	}
 
@@ -10489,7 +10499,7 @@ export class InteractiveMode {
 		let covering: (FocusableBlock & Component) | undefined;
 		let inView: (FocusableBlock & Component) | undefined;
 		for (const child of this.chatContainer.children) {
-			const lines = child.render(width);
+			const lines = measureBlockRows(child, width);
 			if (blocks.includes(child as FocusableBlock & Component)) {
 				const block = child as FocusableBlock & Component;
 				const top = row + Math.max(0, lines.findIndex(isVisibleRow));
@@ -10525,7 +10535,7 @@ export class InteractiveMode {
 		navigation.focused = next;
 		this.applyBlockFocus();
 		// One scroll per move: between moves the wheel and page keys read freely.
-		this.ui.setFullscreenRevealMarker(BLOCK_REVEAL_MARKER);
+		this.setViewportRevealMarker(BLOCK_REVEAL_MARKER);
 		this.ui.requestRender();
 	}
 
@@ -10612,7 +10622,7 @@ export class InteractiveMode {
 		navigation.navigator.deactivate();
 		navigation.focused.setBlockFocus(undefined);
 		this.applyBlockFocus();
-		this.ui.setFullscreenRevealMarker(undefined);
+		this.setViewportRevealMarker(undefined);
 		if (navigation.resumeFollow) this.ui.scrollToBottom();
 		this.ui.requestRender();
 	}
@@ -10682,7 +10692,7 @@ export class InteractiveMode {
 			resumeFollow: this.ui.isFullscreen() && !this.ui.isFullscreenReviewing(),
 		};
 		this.ui.setFocus(navigator);
-		this.ui.setFullscreenRevealMarker(BOX_FOCUS_MARKER);
+		this.setViewportRevealMarker(BOX_FOCUS_MARKER);
 		this.ui.requestRender();
 		return true;
 	}
@@ -10719,7 +10729,7 @@ export class InteractiveMode {
 		}
 		ui.bump();
 		focus.summary.invalidate();
-		this.ui.setFullscreenRevealMarker(BOX_FOCUS_MARKER);
+		this.setViewportRevealMarker(BOX_FOCUS_MARKER);
 		this.ui.requestRender();
 	}
 
@@ -10731,7 +10741,7 @@ export class InteractiveMode {
 		if (key.startsWith("strip:")) strip?.activate(key);
 		else focus.summary.activate(key);
 		focus.summary.invalidate();
-		this.ui.setFullscreenRevealMarker(BOX_FOCUS_MARKER);
+		this.setViewportRevealMarker(BOX_FOCUS_MARKER);
 		this.ui.requestRender();
 	}
 
@@ -10746,7 +10756,7 @@ export class InteractiveMode {
 		ui.focusKey = undefined;
 		ui.bump();
 		focus.summary.invalidate();
-		this.ui.setFullscreenRevealMarker(undefined);
+		this.setViewportRevealMarker(undefined);
 		if (focus.resumeFollow) this.ui.scrollToBottom();
 		this.ui.requestRender();
 	}
@@ -11425,6 +11435,12 @@ export class InteractiveMode {
 		}
 		// The held-back rows appearing or folding are the feedback.
 		this.applyChatExpansion();
+		// Every expanded block flipped; show the newest turn's head when the growth happened off-screen.
+		// Inline mode repaints in place and has no reveal marker (nothing strips it there).
+		if (this.ui.isFullscreen()) {
+			const latest = this.latestShownTurnSummary();
+			if (latest) this.revealTurnAfterKeyToggle(latest);
+		}
 	}
 
 	private toggleAgentMessageExpansion(global = false): void {
@@ -11468,6 +11484,12 @@ export class InteractiveMode {
 		}
 		this.editDiffsExpanded = !this.editDiffsExpanded;
 		this.applyChatExpansion();
+		// Every turn flipped; show the newest one's head when the growth happened
+		// off-screen. Inline mode repaints in place and has no reveal marker.
+		if (this.ui.isFullscreen()) {
+			const latest = this.latestShownTurnSummary();
+			if (latest) this.revealTurnAfterKeyToggle(latest);
+		}
 	}
 
 	private setToolsExpanded(expanded: boolean): void {
@@ -11547,10 +11569,30 @@ export class InteractiveMode {
 	 * already on screen does not move. Inline mode repaints the shifted rows in
 	 * place and needs no marker - and must never see one (nothing strips it).
 	 */
+	/**
+	 * The viewport's reveal slot holds one marker. A turn head armed for the TURN
+	 * marker still embeds it into the next frame's transcript; if the slot moves
+	 * on (block walk, box focus, or cleared) before that frame, the viewport
+	 * strips only the marker it currently holds and the armed turn's bytes would
+	 * reach the screen raw. Moving the slot therefore disarms the armed turn head.
+	 */
+	private setViewportRevealMarker(marker: string | undefined): void {
+		if (marker !== TURN_KEY_REVEAL_MARKER) {
+			this.revealArmedSummary?.disarmRevealMarker();
+			this.revealArmedSummary = undefined;
+		}
+		this.ui.setFullscreenRevealMarker(marker);
+	}
+
 	private revealTurnAfterKeyToggle(summary: TurnSummaryComponent): void {
 		if (!this.ui.isFullscreen()) return;
+		// One reveal at a time: an earlier armed head the frame never spent leaves the slot now.
+		if (this.revealArmedSummary && this.revealArmedSummary !== summary) {
+			this.revealArmedSummary.disarmRevealMarker();
+		}
+		this.revealArmedSummary = summary;
 		summary.armRevealMarker();
-		this.ui.setFullscreenRevealMarker(TURN_KEY_REVEAL_MARKER);
+		this.setViewportRevealMarker(TURN_KEY_REVEAL_MARKER);
 	}
 
 	private toggleThinkingBlockVisibility(global = false): void {

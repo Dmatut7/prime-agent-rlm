@@ -746,6 +746,31 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		this.revealArmed = true;
 	}
 
+	/**
+	 * Cancel an armed reveal no frame will spend: the viewport's single reveal
+	 * slot moved to another marker (or cleared) before the armed frame ran, and a
+	 * marker the slot no longer holds would reach the screen unstripped.
+	 */
+	disarmRevealMarker(): void {
+		this.revealArmed = false;
+	}
+
+	/**
+	 * render() without spending the armed reveal marker. Block navigation sizes
+	 * every block to pick its focus target; that measurement runs between the
+	 * arm and the throttled frame, and spending the one-shot marker there drops
+	 * the reveal the frame owes (the key then looks dead).
+	 */
+	renderForMeasurement(width: number): string[] {
+		const armed = this.revealArmed;
+		this.revealArmed = false;
+		try {
+			return this.render(width);
+		} finally {
+			this.revealArmed = armed;
+		}
+	}
+
 	setOnLanesChange(callback: (() => void) | undefined): void {
 		this.onLanesChange = callback;
 	}
