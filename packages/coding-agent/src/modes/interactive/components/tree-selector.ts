@@ -10,8 +10,10 @@ import {
 	truncateToWidth,
 } from "@earendil-works/pi-tui";
 import { DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT } from "../../../core/autonomous.js";
+import { autonomousPromptFingerprint, DUTY_EVENT_CUSTOM_TYPE, parseDutyEvent } from "../../../core/duty-log.js";
 import { shortenPathHome } from "../../../utils/shorten-path.js";
 import type { AgentConnectionSessionTreeNode } from "../../agent-connection/index.js";
+import { WORKER_RECOVERY_RESUME_PROMPT } from "../../daemon/worker-recovery-resume.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { keyHint, keyText } from "./keybinding-hints.js";
@@ -42,19 +44,45 @@ interface FlatNode {
 export type FilterMode = "default" | "no-tools" | "user-only" | "labeled-only" | "all";
 
 /**
- * User-role messages the harness itself sends (autonomous continuations:
- * keep-alive, gate-failure and the plain continuation prompt) carry no marker on
- * the message, so they are recognized by their text - the same prefixes the duty
- * log's isOwnerMessage applies. A custom-configured continuation prompt is only
- * knowable through the session's duty events, which the tree does not carry.
+ * User-role messages the harness itself sends carry no marker on the message, so
+ * they are recognized by their text - the same prefixes the duty log's
+ * isOwnerMessage applies: the autonomous continuations (keep-alive, gate-failure
+ * and the default continuation prompt) and the worker-recovery resume prompt. A
+ * custom-configured continuation prompt is only knowable through the session's
+ * duty events, which the tree carries as custom entries
+ * (findLatestUserMessageEntryId collects them into continuationFingerprints).
  */
 const SYSTEM_USER_PROMPT_PREFIXES = [
 	"[autonomous-continuation",
-	DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT.trim().slice(0, 80),
+	autonomousPromptFingerprint(DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT),
+	autonomousPromptFingerprint(WORKER_RECOVERY_RESUME_PROMPT),
 ];
 
+/**
+ * Fingerprints of the continuation prompts this session sent, read off the duty
+ * events the tree carries: /autonomous records each prompt it sends, which is how
+ * a custom-configured prompt is recognizable here. Idempotent re-fingerprinting
+ * covers duty events written with the raw prompt instead of its fingerprint.
+ */
+function continuationPromptFingerprints(tree: readonly AgentConnectionSessionTreeNode[]): Set<string> {
+	const fingerprints = new Set<string>();
+	const stack = [...tree];
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		const entry = node.entry;
+		if (entry.type === "custom" && entry.customType === DUTY_EVENT_CUSTOM_TYPE) {
+			const event = parseDutyEvent(entry.data);
+			if (event?.kind === "autonomous_continue" && typeof event.prompt === "string" && event.prompt.trim()) {
+				fingerprints.add(autonomousPromptFingerprint(event.prompt));
+			}
+		}
+		for (const child of node.children) stack.push(child);
+	}
+	return fingerprints;
+}
+
 /** Whether a user-role message came from the harness, not from the human. */
-function isSystemUserMessage(message: { content: unknown }): boolean {
+function isSystemUserMessage(message: { content: unknown }, continuationFingerprints: ReadonlySet<string>): boolean {
 	const content = message.content;
 	let text: string;
 	if (typeof content === "string") {
@@ -68,16 +96,17 @@ function isSystemUserMessage(message: { content: unknown }): boolean {
 		return false;
 	}
 	const trimmed = text.trim();
-	return SYSTEM_USER_PROMPT_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+	if (SYSTEM_USER_PROMPT_PREFIXES.some((prefix) => trimmed.startsWith(prefix))) return true;
+	return continuationFingerprints.has(autonomousPromptFingerprint(trimmed));
 }
 
 /**
  * Walk the active path from the leaf upward and return the closest user message
  * entry - the "edit the last thing I said" target a double-Esc open preselects,
  * so Enter forks it back into the editor regardless of the active filter mode.
- * Harness-written continuation prompts never qualify: they are the machine
- * continuing its own run, not something the human said. Undefined when the path
- * holds no human user message (or there is no leaf).
+ * Harness-written continuation and resume prompts never qualify: they are the
+ * machine continuing its own run, not something the human said. Undefined when
+ * the path holds no human user message (or there is no leaf).
  */
 export function findLatestUserMessageEntryId(
 	tree: AgentConnectionSessionTreeNode[],
@@ -91,12 +120,17 @@ export function findLatestUserMessageEntryId(
 		nodeById.set(node.entry.id, node);
 		for (const child of node.children) stack.push(child);
 	}
+	const continuationFingerprints = continuationPromptFingerprints(tree);
 	let currentId: string | null = leafId;
 	while (currentId !== null) {
 		const node = nodeById.get(currentId);
 		if (!node) return undefined;
 		const entry = node.entry;
-		if (entry.type === "message" && entry.message.role === "user" && !isSystemUserMessage(entry.message)) {
+		if (
+			entry.type === "message" &&
+			entry.message.role === "user" &&
+			!isSystemUserMessage(entry.message, continuationFingerprints)
+		) {
 			return entry.id;
 		}
 		currentId = entry.parentId ?? null;

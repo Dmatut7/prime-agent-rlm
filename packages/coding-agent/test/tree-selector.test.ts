@@ -1,14 +1,17 @@
 import { setKeybindings } from "@earendil-works/pi-tui";
 import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT } from "../src/core/autonomous.js";
+import { autonomousPromptFingerprint, DUTY_EVENT_CUSTOM_TYPE } from "../src/core/duty-log.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type {
+	AgentConnectionCustomEntry,
 	AgentConnectionModelChangeEntry,
 	AgentConnectionSessionEntry,
 	AgentConnectionSessionMessageEntry,
 	AgentConnectionSessionTreeNode,
 } from "../src/modes/agent-connection/index.js";
+import { WORKER_RECOVERY_RESUME_PROMPT } from "../src/modes/daemon/worker-recovery-resume.js";
 import {
 	findLatestUserMessageEntryId,
 	TreeSelectorComponent,
@@ -114,6 +117,18 @@ function serviceTierChange(
 		parentId,
 		timestamp: new Date().toISOString(),
 		serviceTier,
+	};
+}
+
+// Helper to create a duty-event custom entry (the recovery lanes' transcript record)
+function dutyEvent(id: string, parentId: string | null, data: unknown): AgentConnectionCustomEntry {
+	return {
+		type: "custom",
+		id,
+		parentId,
+		timestamp: new Date().toISOString(),
+		customType: DUTY_EVENT_CUSTOM_TYPE,
+		data,
 	};
 }
 
@@ -808,5 +823,46 @@ describe("findLatestUserMessageEntryId", () => {
 		]);
 
 		expect(findLatestUserMessageEntryId(tree, "asst-1")).toBeUndefined();
+	});
+
+	test("skips the worker-recovery resume prompt", () => {
+		const tree = buildTree([
+			userMessage("user-1", null, "do the refactor"),
+			assistantMessage("asst-1", "user-1", "working"),
+			userMessage("resume-1", "asst-1", WORKER_RECOVERY_RESUME_PROMPT),
+			assistantMessage("asst-2", "resume-1", "resumed"),
+		]);
+
+		expect(findLatestUserMessageEntryId(tree, "asst-2")).toBe("user-1");
+	});
+
+	test("skips a custom continuation prompt the session's duty events recorded", () => {
+		const customPrompt = "继续：按 PLAN.md 的下一步走，不要等我回来。";
+		const tree = buildTree([
+			userMessage("user-1", null, "do the refactor"),
+			assistantMessage("asst-1", "user-1", "working"),
+			dutyEvent("duty-1", "asst-1", {
+				kind: "autonomous_continue",
+				prompt: autonomousPromptFingerprint(customPrompt),
+			}),
+			userMessage("auto-1", "duty-1", customPrompt),
+			assistantMessage("asst-2", "auto-1", "still working"),
+		]);
+
+		expect(findLatestUserMessageEntryId(tree, "asst-2")).toBe("user-1");
+	});
+
+	test("a prompt text no duty event recorded stays the owner's message", () => {
+		// The same text without the autonomous_continue duty event is not
+		// machine-attributable: the preselect must keep it.
+		const customPrompt = "继续：按 PLAN.md 的下一步走，不要等我回来。";
+		const tree = buildTree([
+			userMessage("user-1", null, "do the refactor"),
+			assistantMessage("asst-1", "user-1", "working"),
+			userMessage("auto-1", "asst-1", customPrompt),
+			assistantMessage("asst-2", "auto-1", "still working"),
+		]);
+
+		expect(findLatestUserMessageEntryId(tree, "asst-2")).toBe("auto-1");
 	});
 });

@@ -447,6 +447,50 @@ describe("InteractiveMode live chat component cap", () => {
 		expect(harness.chatContainer.render(120).join("\n")).toContain("更早的 401 条消息未加载");
 	});
 
+	test("the last backfill page shifts the view by the page minus the removed marker rows", async () => {
+		const transcript = longTranscript(); // 900 messages
+		const getMessagesWindow = vi.fn(async (options?: { before?: number; limit?: number }) => {
+			// Mirror the daemon's get_messages window semantics (daemon-protocol.ts).
+			const end = Math.min(options?.before ?? transcript.length, transcript.length);
+			const count = Math.min(options?.limit ?? end, end);
+			const firstIndex = end - count;
+			return { messages: transcript.slice(firstIndex, end), totalMessages: transcript.length, firstIndex };
+		});
+		const harness = createCapHarness({
+			agentConnection: {
+				getSessionContext: vi.fn(async () => sessionContext(transcript)),
+				getMessagesWindow,
+			},
+		});
+		fillOverCap(harness.chatContainer);
+
+		await proto.enforceChatComponentCap.call(harness);
+		expect(harness.slimTranscriptOmitted).toBe(501);
+		expect(harness.slimTranscriptMarker).toBeDefined();
+
+		const prepends = harness.ui.noteTranscriptPrepend as ReturnType<typeof vi.fn>;
+		let pages = 0;
+		while (harness.slimTranscriptMarker !== undefined && pages < 20) {
+			pages++;
+			prepends.mockClear();
+			const rowsBefore = harness.chatContainer.render(120).length;
+			await proto.loadEarlierTranscriptPage.call(harness);
+			const rowsAfter = harness.chatContainer.render(120).length;
+			expect(harness.showError).not.toHaveBeenCalled();
+			// The paused window follows its rows by exactly the net rows added above
+			// them: the page alone while the marker stays, the page minus the marker
+			// rows when the last page removes it.
+			expect(prepends).toHaveBeenCalledTimes(1);
+			expect(prepends).toHaveBeenCalledWith(rowsAfter - rowsBefore);
+		}
+
+		// Six pages page the whole 501-message prefix in; the marker is gone and no
+		// history remains on the daemon.
+		expect(pages).toBe(6);
+		expect(harness.slimTranscriptMarker).toBeUndefined();
+		expect(harness.slimTranscriptOmitted).toBe(0);
+	});
+
 	test("expansion toggles still reach every rebuilt component after the cap trim", async () => {
 		const harness = createCapHarness();
 		fillOverCap(harness.chatContainer);

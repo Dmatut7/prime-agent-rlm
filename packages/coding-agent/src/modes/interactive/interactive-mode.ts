@@ -9671,13 +9671,18 @@ export class InteractiveMode {
 			this.chatContainer.children.splice(markerIndex + 1, 0, ...pageContainer.children);
 			this.slimTranscriptOmitted = page.firstIndex;
 			if (page.firstIndex === 0) {
-				// The whole transcript is loaded now: the marker leaves the chat.
+				// The whole transcript is loaded now: the marker leaves the chat,
+				// taking its rows with it. The rows the window shows shift down by
+				// the page minus the marker - announcing the full page would leave
+				// the view a marker-height too low.
+				const markerHeight = marker.render(this.ui.terminal.columns).length;
 				this.chatContainer.removeChild(marker);
 				this.slimTranscriptMarker = undefined;
+				this.ui.noteTranscriptPrepend(pageHeight - markerHeight);
 			} else {
 				marker.invalidate();
+				this.ui.noteTranscriptPrepend(pageHeight);
 			}
-			this.ui.noteTranscriptPrepend(pageHeight);
 			this.ui.requestRender();
 		} catch (error) {
 			if (epoch !== this.slimTranscriptViewEpoch) return;
