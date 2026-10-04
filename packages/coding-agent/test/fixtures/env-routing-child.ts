@@ -14,5 +14,7 @@ const report = {
 	supervisorRegistryDir: process.env.PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR ?? null,
 	workerToken: process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN ?? null,
 	serperApiKey: process.env.SERPER_API_KEY ?? null,
+	securitySessionId: process.env.SECURITYSESSIONID ?? null,
+	termProgram: process.env.TERM_PROGRAM ?? null,
 };
 process.stdout.write(`${JSON.stringify(report)}\n`);

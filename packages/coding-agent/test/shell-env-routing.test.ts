@@ -47,6 +47,8 @@ describe("shell child env keeps routing and opt-out names", () => {
 		supervisorRegistryDir: string | null;
 		workerToken: string | null;
 		serperApiKey: string | null;
+		securitySessionId: string | null;
+		termProgram: string | null;
 	}
 
 	/** Run the fixture through the production bash-tool spawn path (getShellEnv). */
@@ -107,6 +109,16 @@ describe("shell child env keeps routing and opt-out names", () => {
 		expect(report.supervisorSocket).toBe("/tmp/bsh-supervisor.sock");
 	});
 
+	it("bash-tool children keep the macOS session context keychain-aware CLIs probe", async () => {
+		vi.stubEnv("SECURITYSESSIONID", "0x68656c6c6f");
+		vi.stubEnv("TERM_PROGRAM", "Apple_Terminal");
+		const report = await runChildThroughBashTool();
+		// Stripping these made `claude` keychain credential probes fail inside
+		// bash-tool children; both are non-secret session identity.
+		expect(report.securitySessionId).toBe("0x68656c6c6f");
+		expect(report.termProgram).toBe("Apple_Terminal");
+	});
+
 	it("getShellEnv forwards the same names without the secrets", () => {
 		vi.stubEnv("DO_NOT_TRACK", "1");
 		vi.stubEnv("PI_OFFLINE", "1");
@@ -128,6 +140,26 @@ describe("shell child env keeps routing and opt-out names", () => {
 		expect(env.PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR).toBe("/tmp/bsh-registry");
 		expect(env.PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN).toBeUndefined();
 		expect(env.PATH).toBeTruthy();
+	});
+
+	it("getShellEnv forwards the macOS session context keys", () => {
+		vi.stubEnv("SECURITYSESSIONID", "0x68656c6c6f");
+		vi.stubEnv("__CF_USER_TEXT_ENCODING", "0x1F5:0x8000100:0x8000100");
+		vi.stubEnv("XPC_FLAGS", "0x0");
+		vi.stubEnv("TERM_PROGRAM", "Apple_Terminal");
+		vi.stubEnv("TERM_PROGRAM_VERSION", "455.1");
+		vi.stubEnv("TERM_SESSION_ID", "w0t0p0:01234567-89AB-CDEF-0123-456789ABCDEF");
+		vi.stubEnv("SERPER_API_KEY", "serper-secret-xyz");
+
+		const env = getShellEnv();
+
+		expect(env.SECURITYSESSIONID).toBe("0x68656c6c6f");
+		expect(env.__CF_USER_TEXT_ENCODING).toBe("0x1F5:0x8000100:0x8000100");
+		expect(env.XPC_FLAGS).toBe("0x0");
+		expect(env.TERM_PROGRAM).toBe("Apple_Terminal");
+		expect(env.TERM_PROGRAM_VERSION).toBe("455.1");
+		expect(env.TERM_SESSION_ID).toBe("w0t0p0:01234567-89AB-CDEF-0123-456789ABCDEF");
+		expect(env.SERPER_API_KEY).toBeUndefined();
 	});
 });
 

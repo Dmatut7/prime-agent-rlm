@@ -167,6 +167,15 @@ const SHELL_CHILD_SAFE_ENV_KEYS = [
 	"TMPDIR",
 	"TEMP",
 	"TMP",
+	// macOS GUI-session context (non-secret identity): keychain-aware CLIs
+	// (claude) probe SECURITYSESSIONID, CoreFoundation/XPC read the rest.
+	// Stripping them silently breaks credential probes in shell children.
+	"SECURITYSESSIONID",
+	"__CF_USER_TEXT_ENCODING",
+	"XPC_FLAGS",
+	"TERM_PROGRAM",
+	"TERM_PROGRAM_VERSION",
+	"TERM_SESSION_ID",
 	"SystemRoot",
 	"WINDIR",
 	"COMSPEC",

@@ -38,6 +38,29 @@ class BashChildEnvTest(unittest.IsolatedAsyncioTestCase):
         if "TMPDIR" in os.environ:
             self.assertIn(f"TMPDIR={os.environ['TMPDIR']}", result.output)
 
+    async def test_bash_children_keep_macos_session_context(self):
+        # macOS session context is non-secret identity: keychain-aware CLIs
+        # (claude) probe SECURITYSESSIONID, CoreFoundation/XPC read the rest.
+        # Stripping them silently breaks credential probes in bash() children.
+        session = {
+            "SECURITYSESSIONID": "0x68656c6c6f",
+            "__CF_USER_TEXT_ENCODING": "0x1F5:0x8000100:0x8000100",
+            "XPC_FLAGS": "0x0",
+            "TERM_PROGRAM": "Apple_Terminal",
+            "TERM_PROGRAM_VERSION": "455.1",
+            "TERM_SESSION_ID": "w0t0p0:01234567-89AB-CDEF-0123-456789ABCDEF",
+            # Negative control in the same child: a secret stays out.
+            "SERPER_API_KEY": "serper-secret-xyz",
+        }
+        with mock.patch.dict(os.environ, session):
+            result = await bash("env | sort")
+        self.assertEqual(result.exit_code, 0)
+        for key, value in session.items():
+            if key == "SERPER_API_KEY":
+                continue
+            self.assertIn(f"{key}={value}", result.output, f"{key} dropped from bash() child")
+        self.assertNotIn("serper-secret-xyz", result.output)
+
     async def test_bash_children_honor_explicit_passthrough(self):
         # The opt-in hatch: names listed in PRIME_AGENT_ENV_PASSTHROUGH (comma
         # separated) are forwarded to bash() children on request.

@@ -477,6 +477,46 @@ describe("daemon supervisor warm spare pool", () => {
 		expect((responseData(replenished) as { sessions?: unknown[] }).sessions ?? []).toHaveLength(1);
 	});
 
+	it("claim fingerprint treats newly shell-allowlisted env keys like any other (full-env identity unchanged)", async () => {
+		// The shell-child allowlist (SHELL_CHILD_SAFE_ENV_KEYS) grew macOS session
+		// keys; the warm-pool fingerprint must stay byte-exact over the whole
+		// spawn environment: a matching SECURITYSESSIONID claims, a differing one
+		// misses with env_mismatch, and no allowlist edit punches a hole in that.
+		setLogSink((entry) => {
+			logEntries.push(entry);
+		});
+		const previous = process.env.SECURITYSESSIONID;
+		process.env.SECURITYSESSIONID = "warm-pool-session-a";
+		try {
+			const { projectDir, client } = await startPoolSupervisor({ ttlMs: 30_000, spawnCooldownMs: 0 });
+			await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
+			expect(hoisted.spawned[0]!.env.SECURITYSESSIONID).toBe("warm-pool-session-a");
+
+			const hit = await client.request(
+				{ type: "create", config: { cwd: projectDir }, launchEnv: { SECURITYSESSIONID: "warm-pool-session-a" } },
+				10_000,
+			);
+			expect(hit.success).toBe(true);
+			expect(warmPoolEvents("claim").map((entry) => entry.outcome)).toEqual(["hit"]);
+
+			const miss = await client.request(
+				{ type: "create", config: { cwd: projectDir }, launchEnv: { SECURITYSESSIONID: "warm-pool-session-b" } },
+				10_000,
+			);
+			expect(miss.success).toBe(true);
+			const claims = warmPoolEvents("claim");
+			expect(claims).toHaveLength(2);
+			expect(claims[1]!.outcome).toBe("miss");
+			expect(claims[1]!.missReason).toBe("env_mismatch");
+		} finally {
+			if (previous === undefined) {
+				delete process.env.SECURITYSESSIONID;
+			} else {
+				process.env.SECURITYSESSIONID = previous;
+			}
+		}
+	});
+
 	it("misses on a different cwd and cold-launches without the spare marker", async () => {
 		const { otherProjectDir, client } = await startPoolSupervisor({ ttlMs: 30_000, spawnCooldownMs: 0 });
 		await waitForCondition(() => hoisted.spawned.length === 1, "the startup spare spawn");
