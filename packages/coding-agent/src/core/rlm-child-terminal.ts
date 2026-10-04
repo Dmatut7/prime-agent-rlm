@@ -53,8 +53,15 @@ export interface RlmChildStallAbortFacts {
  * "someone took over", not "the child failed on its own" - the classifier
  * ranks it with the stall kills so a reply cannot swallow it, and the reason
  * text says the child was auto-recovered, not merely killed.
+ *
+ * "update_restart": the daemon's self-update restart cascade aborted the turn
+ * (abortForUpdateRestart). It is not a user cancel - the quota park's user-abort
+ * branch must not eat it, or a parked child whose wake probe was in flight
+ * during the restart would be permanently cancelled and recorded as
+ * user-aborted. The classifier never sees it as a stall kill either; the
+ * cascade already cancelled the run, which ranks first.
  */
-export type RlmChildTurnAbortReason = "user" | "stall_watchdog" | "stall_recovery";
+export type RlmChildTurnAbortReason = "user" | "stall_watchdog" | "stall_recovery" | "update_restart";
 
 export interface RlmChildTerminalFacts {
 	runStatus: RlmChildRunStatus;

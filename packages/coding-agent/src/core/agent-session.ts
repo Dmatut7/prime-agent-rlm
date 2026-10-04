@@ -1053,6 +1053,17 @@ interface InternalPromptOptions extends PromptOptions {
 	skipPrePromptWork?: boolean;
 	returnAfterAccepted?: boolean;
 	agentMessageId?: string;
+	/**
+	 * Fires once, the moment an agent message's admission is accepted - before any
+	 * `await ticket.delivered` below. The arrival ledger must note the admission
+	 * here rather than after `_prompt` returns: a direct (starts_when_admitted)
+	 * admission awaits its own delivery, and a delivered note that runs before the
+	 * admission note finds no pending id, never pairs, and leaks the gap between
+	 * the arrival and delivered counts forever (the wake_on_message collect reads
+	 * that gap as phantom news). A coalesced duplicate (accepted: false) returns
+	 * before this fires and is correctly not an arrival.
+	 */
+	agentMessageAdmissionAccepted?: () => void;
 }
 
 type SubmissionExtensionCommandPolicy = "execute" | "reject" | "ignore";
@@ -3306,6 +3317,14 @@ export class AgentSession {
 			const dispatched = previousStates.get(action.id) === "committing" && action.payload.kind === "turn";
 			if (action.payload.kind === "turn") {
 				const payload = action.payload;
+				// A cancelled turn never delivers its prompt: settle the delivered
+				// ledger the same way the clear path does, or an admitted agent
+				// message would linger as pending news for every later collect
+				// (idempotent - an already-delivered message left the set at
+				// message_start).
+				this._noteAgentMessageDelivered(
+					this._agentMessageDeliveryId(action, primaryDeliveryRecord(action).message),
+				);
 				const restorable = payload.records
 					.filter(
 						(record): record is DeliveryRecord & { message: CustomMessage } =>
@@ -5056,9 +5075,40 @@ export class AgentSession {
 	/**
 	 * Queue the continuation a throttle held back, once the interval has elapsed.
 	 * Mirrors the threshold-compaction goal continuation: counted at queue time,
-	 * rolled back when admission rejects it.
+	 * rolled back when admission rejects it. The deferral guards mirror the poll
+	 * path's (`_getGoalContinuationMessages`) and the resume path's
+	 * (`_maybeResumeGoalContinuationAfterRlmWork`): the wake fires on a timer, not
+	 * on fresh state, so it re-checks everything they do before spending a turn.
 	 */
 	private _queueThrottledGoalContinuation(): void {
+		// Delegating and ending the turn is correct behavior; the wake must not
+		// pull a waiting parent out of its wait. The settle path's
+		// _maybeResumeGoalContinuationAfterRlmWork delivers the owed continuation.
+		if (this._hasUnsettledRlmQuiescenceWork()) {
+			this._goalContinuationAwaitsRlmWork = true;
+			return;
+		}
+		// K3R-11: a goal continuation already queued is the owed continuation; the
+		// wake must not stack a second one on top of it.
+		if (
+			this._actionStore
+				?.unfinishedActions()
+				.some(
+					(action) =>
+						action.payload.kind === "turn" &&
+						action.payload.customMessage?.customType === GOAL_CONTEXT_CUSTOM_TYPE,
+				)
+		) {
+			return;
+		}
+		// A wake landing in an admission pause or a suspended pump used to die on
+		// the admission throw below: rolled back and never re-armed until the next
+		// natural stop. Defer instead - the pause release and resumeQueuedWork both
+		// retry through _maybeResumeGoalContinuationAfterRlmWork.
+		if (this._sessionInputAdmissionPauses.size > 0 || this._sessionInputPumpSuspended) {
+			this._goalContinuationAwaitsRlmWork = true;
+			return;
+		}
 		if (this._goalContinuationBudgetExhausted()) {
 			return;
 		}
@@ -7167,8 +7217,8 @@ export class AgentSession {
 			customMessage,
 			admissionCommitted,
 			preflightResult: reportPreflight,
+			agentMessageAdmissionAccepted: () => this._noteAgentMessageAdmitted(admissionMessageId),
 		});
-		this._noteAgentMessageAdmitted(admissionMessageId);
 		if (customMessage?.details.fromRelationship === "parent") this._noteParentFollowUpAdmitted();
 	}
 
@@ -8563,6 +8613,11 @@ export class AgentSession {
 					reportPreflight(false, false);
 					return;
 				}
+				// Accepted, and synchronously so: the arrival ledger notes the admission
+				// now, before any delivery await below, so a direct admission's
+				// message_start delivery note always finds its pending id (see the
+				// option's contract on InternalPromptOptions).
+				options?.agentMessageAdmissionAccepted?.();
 				if (result.disposition === "queued") {
 					reportPreflight(true, true);
 				} else {
@@ -11311,7 +11366,10 @@ export class AgentSession {
 		this._cancelPostCompactionContinue();
 		this.abortRetry();
 		for (const controller of this._rlmQuiescenceWaitAborts) controller.abort();
-		this._abortRlmSubtree("Parent session aborted for update restart");
+		// The cascade is not the user: stamping "user" on descendant aborts would
+		// let a parked child's user-abort branch (quota-park handleAbortedQuotaPark)
+		// eat an update restart as a user cancellation and kill the parked task.
+		this._abortRlmSubtree("Parent session aborted for update restart", { turnAbortReason: "update_restart" });
 		this._goalAbortInProgress = this._goalState.status === "active";
 		this.agent.abort();
 		if (this._goalAbortInProgress) {
@@ -14755,8 +14813,11 @@ export class AgentSession {
 		}
 	}
 
-	private _abortRlmSubtree(reason: string): { cancelled: number; failures: number; depth: number } {
-		return abortRlmSubtree(this, reason);
+	private _abortRlmSubtree(
+		reason: string,
+		options?: { turnAbortReason?: RlmChildTurnAbortReason },
+	): { cancelled: number; failures: number; depth: number } {
+		return abortRlmSubtree(this, reason, options);
 	}
 
 	_cancelRlmChildRun(run: RlmChildRun, reason: string): boolean {
@@ -15677,6 +15738,11 @@ export class AgentSession {
 	 * backup restore, counter reset), but the end event is not a failure: the
 	 * task continues through the compaction, and a success:false here painted
 	 * one fake "retry failed" per overflow (review 2026-10-04, new issue 8).
+	 * The terminal-failure count is cleared rather than carried: the only
+	 * clear-on-success path requires a live chain the handoff just zeroed, so a
+	 * stale count here would credit a later non-retryable terminal error with
+	 * this chain's attempts (review 2026-10-04, should-1). The auto_retry_end
+	 * event above carries the count for anyone who needs it.
 	 */
 	private _finishActiveRetryForCompactionHandoff(message: AssistantMessage): void {
 		if (this._retryAttempt === 0) {
@@ -15693,7 +15759,7 @@ export class AgentSession {
 			supersededByCompaction: true,
 			...(restoredModel ? { restoredModel } : {}),
 		});
-		this._terminalFailureAttemptCount = this._retryAttempt;
+		this._terminalFailureAttemptCount = 0;
 		this._retryAttempt = 0;
 		this._providerWait = undefined;
 		this._retryAuthFailureSources = [];
