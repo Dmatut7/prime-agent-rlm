@@ -1,3 +1,11 @@
+## 2026-10-04 wave-51 五路：supervisor 第三刀、R3 渲染腿设计+P0+P1、roster 测试债收编
+
+- CI 门禁自修复（wave-50 红归因）：check-node-test-coverage parser 的属性正则不含引号感知，新病态语料测试名里的字面 `>`（XML 合法）截断标签、误吞后续 testcase，计数与摘要对不上把门自己弄红；修正则（引号感知+懒惰保 `/>` 自闭合优先）+ 自控判例，重推全绿。
+- roster-sync 测试债收编（第三刀前置）：直驱 92→24 站，consume/flip/roster() 全改走 handleWorkerFrame 帧与 rosterEntriesForClient；6 处桩删净跑真实路径；保留 24 站逐条备案（拆后必有壳成员）。方案修正一处：flip 不走 handleWorkerClose 而经 session_closed/shutdown 帧中继。172/172 前后一致。
+- supervisor 第三刀：roster-sync 簇 28 方法/477 行拆入 daemon-supervisor-roster-sync.ts（651 行），supervisor 11135→10829 留 19 壳；Host 17 成员索引单源化；测试零改动（391+30 绿逐名一致）。三刀累计 12002→10829。
+- R3 渲染腿（backlog #9 正本清源）：1.14GB 是 wire 腿旧账（R1 已结案）；渲染腿设计稿落 docs/fork/r3-streaming-render-design.md。P0 实测基线：单段 80k 0.40s、无高亮 fence 0.26s、100k 单帧 p95 ~1ms（已达标）；高亮 fence 80k = 19.6–22.3s、尾部 p95 25–40ms（唯一破帧预算形态）；生长表格 40k 2.85s/80k 11.4s（O(n²) 确认）。P1 落地：四处校验扫描增量化，单段 80k 0.44→0.23s（−48%）、100k 0.75→0.44s（−41%），零输出变化。P2（高亮 fence 密封）/P3（表格列宽冻结）进 wave-52。
+- 门禁：check EXIT 0、hygiene OK、单测 9822 绿、suite 1729 绿、tui 1288 绿。需要重新编译并重启后才生效。
+
 ## 2026-10-04 wave-50 八路：supervisor 第二刀、F2 根治、病态语料抓真 bug、画像全面变快
 
 - daemon-supervisor.ts 第二刀：adoption 收编簇 12 方法/234 行拆入 daemon-supervisor-adoption.ts（336 行，DaemonAdoptionState 状态座 + 13 成员只读 Host），supervisor 11296→11135 留 5 壳；死 API adoptingSessionWorkers 删，2 测试文件 8 处夹具机械改，211 测试前后逐名一致。九簇评分表落 /tmp/wave50/supervisor-cut2.md；roster-sync 债具体化（9 私有成员 ~95 站 5 文件，收债方案 A=改走 handleWorkerFrame/handleList 公开缝）。
