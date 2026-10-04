@@ -1,0 +1,1 @@
+- Refactored internals with no behavior change: deduplicated the refine scheduler/execution scaffolding (16 cooldown stamp sites, 3 reset sites and 6 cooldown checks now go through three single helpers), split rlm-child-run's 635-line start function, and extracted the daemon warm-pool cluster into daemon-supervisor-warm-pool.ts (daemon-supervisor.ts 12002→11296 lines).

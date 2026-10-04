@@ -1,3 +1,13 @@
+## 2026-10-04 wave-48 六路：refine 去重、rlm-child-run 拆两刀、supervisor 首刀（暖池簇）
+
+- refine 双模块去重（审计 follow-up）：scheduler 内抽 stampAutoRefineCooldown/resetAutoRefineTurns/isAutoRefineUnderCooldown，收编 16 印记 + 3 复位 + 6 冷却检查（review 起点的 at:nowMs 变体逐字保留）；runRefinePlanPhase/withRefineApplyGuard 抽到 execution 导出，scheduler 经既有边 import，单向分层不破。语义单点化：后续改遥测/泵调度不再扫 13 个站点。
+- rlm-child-run.ts：startRlmChildRun 635→460 行——子事件订阅 switch 抽 subscribeRlmChildRunEvents（runningToolCount 随体迁入）、finally 落定簿记抽 settleRlmChildRun；模块内私有、导出面不变、基线测试改前后一致。
+- daemon-supervisor.ts 首刀：暖池簇 ~1000 行拆入 daemon-supervisor-warm-pool.ts（969 行，状态座 WarmPoolState），supervisor 12002→11296 留 8 壳。Host-seam 首用于本类：成员是 private 关键字、this 不能结构满足 Host，改用类内 memoized live facade（17 成员，live getter + 箭头派发；类型经 DaemonSupervisor["x"] 索引单源化，私有重命名编译期炸）——后续 supervisor 拆刀沿用的适配模式。线缆面 DaemonWarmPoolStats（rev 45）未动一字段。
+- EX-3 +47% 判噪声销账：同代码三次复测散布 ±65%（59,970/75,801/98,727 tok），run1 贴回 wave-35 基线；历史 zigzag、负载不相关、恢复链考古零嫌疑。考题集运营建议入 backlog：EX-3 改宽告警带（>2× 基线或判分转红才立案），turns/形状作稳定信号。
+- 调研 9 条带 URL（WebSearch 403 走 DDG lite + 一手源）：键盘侧——Ghostty flag2 下 release 重复带 text、WezTerm 永不报 repeat（repeat 只能当优化提示不能当协议保证）、CC #92021 同形坑（我们方向已对，缺字节级 fixture）、2027 边角；记忆侧——Anthropic memory tool 同构背书（方向之争终结）、CC recall=structured-output 网关坑（召回信号路径保持无模型调用/模型裁决必须静默降级）、OpenAI 服务端 compaction 成原语、OpenHands 6K 预算索引三条可抄（截断提示计入预算等）；拆分侧——Nestor 三手法独立验证 Host-seam，增量 Parameters<>/ReturnType<> 派生委托签名。
+- 修饰键连按实机复现（老板痛点，20 张截图 + 原始捕获落 /tmp/wave48/modkeys/）：F1 高——恢复的旧格式会话里 Ctrl+O/Ctrl+T/Ctrl+P/Alt+O/Alt+T 全灭（无展开无 toast，fresh 会话正常），嫌疑 latestShownTurnSummary 对旧格式重建树返回 undefined；F2 低——Alt+Up 首按仅 1 格残影。两条旧嫌疑（repeatable 过滤、alt-screen 重推）均已修不成立。修复进 wave-49。
+- 门禁：check EXIT 0、hygiene OK、单测 9812 绿（103 skip）、suite 1729 绿、波及基线前后逐名一致（refine 241、rlm-child 5、暖池 92+61）。需要重新编译并重启后才生效。
+
 ## 2026-10-04 wave-47 五路：fresh-eyes 三修、注释腐化清扫、EXAM 复测全线更省
 
 - fresh-eyes 走查三发现全修：①/refine 完成后 transcript 有可见结果行（根因 RefinementOutcomeMessageComponent 对干净结果 return []；outcome 带 details.source，用户触发的永不隐藏，auto 干净仍隐藏；回归钉 test/suite/refine-outcome-source.test.ts）；②退出提示 --resume 带上 --daemon-socket/--session-dir 旗标（shell 引号转义，main.ts 两路径 + agents-view 接线）；③未定价模型 footer 统一「(未定价)」不再裸 ?。
