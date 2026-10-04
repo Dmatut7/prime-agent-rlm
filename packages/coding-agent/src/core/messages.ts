@@ -45,6 +45,17 @@ export const PYTHON_SKILLS_UNAVAILABLE_CUSTOM_TYPE = "python_skills_unavailable"
 export const SESSION_SLASH_COMMAND_CUSTOM_TYPE = "session_slash_command";
 export const SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE = "session_slash_command_result";
 export const COMPACTION_OUTCOME_CUSTOM_TYPE = "compaction_outcome";
+/**
+ * customType of the visible chat notice emitted when a non-interactive caller (a
+ * daemon set_model/cycle_model command from another attached client, or the
+ * extension API) switches the session model: every attached window except the
+ * initiator gets a chat line instead of finding out on the next lazy footer
+ * refresh. The notice rides message_start/message_end and is deliberately kept
+ * out of the live context and out of the custom_message transcript form -
+ * convertToLlm passes an unknown customType through to the model, so the only
+ * safe homes are the event stream and a ledger-only custom entry.
+ */
+export const MODEL_CHANGE_ORIGIN_NOTICE_CUSTOM_TYPE = "model_change_origin_notice";
 export const MCP_CONNECTION_OUTCOME_CUSTOM_TYPE = "mcp_connection_outcome";
 export const REFINEMENT_OUTCOME_CUSTOM_TYPE = "refinement_outcome";
 export const REFINEMENT_NOTICE_CUSTOM_TYPE = "refinement_notice";

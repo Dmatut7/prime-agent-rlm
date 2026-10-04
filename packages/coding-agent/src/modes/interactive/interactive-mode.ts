@@ -119,6 +119,7 @@ import {
 	isRefinementOutcomeMessage,
 	isSessionSlashCommandMessage,
 	isSessionSlashCommandResultMessage,
+	MODEL_CHANGE_ORIGIN_NOTICE_CUSTOM_TYPE,
 	REFINEMENT_OUTCOME_CUSTOM_TYPE,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
@@ -7033,6 +7034,10 @@ export class InteractiveMode {
 					// A fallback transition (a return to the primary, a routed image handed
 					// back) moved the serving model without a model_select: repaint the footer.
 					if (event.message.customType === PROVIDER_FALLBACK_NOTICE_CUSTOM_TYPE) void this.refreshServingModel();
+					// wave-44 FOOTER-MODEL: a daemon/extension-driven switch (the wave-42
+					// origin notice) moved the serving model too - without the re-read the
+					// witness's footer kept naming the old model until some later lazy refresh.
+					if (event.message.customType === MODEL_CHANGE_ORIGIN_NOTICE_CUSTOM_TYPE) void this.refreshServingModel();
 					// The /refine result row is the user refine's settle edge; refine_complete
 					// alone can belong to an agent/auto refinement the queued /refine waited on.
 					if (

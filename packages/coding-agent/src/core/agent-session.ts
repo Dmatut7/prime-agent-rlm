@@ -307,6 +307,7 @@ import {
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	isSessionSlashCommandMessage,
+	MODEL_CHANGE_ORIGIN_NOTICE_CUSTOM_TYPE,
 	type ModelChangeMessage,
 	type ModelChangeNoticeDetails,
 	PYTHON_SKILLS_UNAVAILABLE_CUSTOM_TYPE,
@@ -1519,7 +1520,7 @@ export interface ModelCycleResult {
  * convertToLlm passes an unknown customType through to the model, so the only
  * safe homes are the event stream and a ledger-only custom entry.
  */
-export const MODEL_CHANGE_ORIGIN_NOTICE_CUSTOM_TYPE = "model_change_origin_notice";
+export { MODEL_CHANGE_ORIGIN_NOTICE_CUSTOM_TYPE } from "./messages.js";
 
 /** Who drove a non-interactive model switch; recorded on the notice and its ledger entry. */
 export type ModelChangeOriginNoticeSource = "daemon_command" | "extension";

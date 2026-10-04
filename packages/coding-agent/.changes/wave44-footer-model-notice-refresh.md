@@ -1,0 +1,1 @@
+- Fixed the footer model name on witness windows: when the wave-42 chat notice (`模型已切换为「…」`) arrives, the footer now re-reads the serving model immediately and shows the new one on the same frame, instead of keeping the old name until the next lazy refresh.
