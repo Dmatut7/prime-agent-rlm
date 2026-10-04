@@ -14,15 +14,15 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-05 凌晨，wave-42 已 SHIP）
+## 当前状态（2026-10-05 凌晨，wave-43 已 SHIP）
 
-- HEAD = 见 git log（三批：set_model 可见性、autocompact per-model、FORK_NOTES+账本）。
-- wave-42：两个连续漏认领的主题清零——set_model 非交互来源全客户端可见（rev 46→47）；
-  /autocompact 按模型各自保存（零迁移，触发闸读当前模型键，双向钉测试；CC 2.1.288 同款实证）。
-  暖池 Mac 内存口径实证复活（受理 86-87ms）。
-- 调研缺口进 wave-43：bash -c/eval 包装绕过 git 守卫（CC #96300 同类）、扩展 ToolCallEvent
-  抛错 fail-open/closed 未确证、脱敏缺 4 个 CC 变体（安全面，先方案）。
-- 门禁：check EXIT 0、hygiene OK、复扫数字见下节惯例。
+- HEAD = 见 git log（五批：bash 守卫、ext 语义钉、服务端窗口、第十刀、FORK_NOTES+账本）。
+- wave-43：安全硬化两件（包装壳解包 TS+Py 双面、扩展钩子 fail-closed 实证钉住）；
+  首请求服务端窗口按 CC 同数值落地（resume 路径 kick+≤1.5s 有界等）；
+  agent-session.ts 19519 行（十刀累计 −3981）；走查 wave-42 两件全过。
+- 走查新观察（wave-44 立项）：env -i 精简环境剥 SECURITYSESSIONID 导致 claude 钥匙串
+  探测失败（env 转发名单陈旧）；见证端 footer 模型名懒刷新滞后。
+- 调研零增量（八源逐字同基线）。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -103,13 +103,14 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
   把在跑会话归档。犯了就是事故，写进 FORK_NOTES 向老板披露。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-43 候选）
+## 下一波主题（wave-44 候选）
 
-1. 【安全面自查三缺口】（先方案后动）：bash -c/eval 包装解包一层再匹配（git 守卫）；
-   扩展 ToolCallEvent 抛错的 fail-open/closed 确证；脱敏 4 变体（百分号 Bearer、零宽键名、
-   URL 密码、bracket IPv6）。
-2. 【首请求服务端窗口】≤1.5s 有界等待（CC 2.1.288 已官方同数值落地，可直接引用）。
-3. 【流程改进落地】AGENTS.md 开「Code Review Rules」节 + 审查输出 P0/P1/P2 分级 +
-   walkthrough 矩阵 v1（install/attach/resume/shutdown × daemon 新旧组合）。
-4. 【第十刀】harness-digest 叶子（324 行/22 成员）。
-5. 【老板挂账】第 0 条历史改写；记忆帽三选一。
+1. 【流程改进落地】AGENTS.md「Code Review Rules」节（首批：测试替换被测段、env 泄漏、
+   fan-out 漏消费路径）+ walkthrough 矩阵 v1 + 审查输出 P0/P1/P2 分级惯例。
+2. 【env 转发名单复核】精简环境剥 SECURITYSESSIONID 等导致 claude 钥匙串探测失败——
+   名单跟上 macOS 现状（走查实测）。
+3. 【footer 模型名懒刷新滞后】见证端 set_model 通知到达后 footer 应立即刷新（走查发现）。
+4. 【脱敏 4 变体】（安全面，先方案并入 security-cluster-plan 让老板一次看完）：
+   百分号 Bearer、零宽键名、URL 密码、bracket IPv6。
+5. 【refine 系拆刀评估】harness-digest 已出，refine 主块（1332 行/100 成员）拆刀设计先出稿。
+6. 【老板挂账】第 0 条历史改写；记忆帽三选一。
