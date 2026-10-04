@@ -92,9 +92,17 @@ describe("availableMemoryBytes", () => {
 
 	it("falls back to freemem() where the platform probes cannot read", () => {
 		// linux on this macOS host: no /proc/meminfo, so the conservative fallback
-		// answers; win32 has no probe at all.
-		expect(availableMemoryBytes("linux")).toBe(freemem());
-		expect(availableMemoryBytes("win32")).toBe(freemem());
+		// answers; win32 has no probe at all. freemem() moves between two adjacent
+		// reads under parallel load, so strict equality against a second sample
+		// flakes; the fallback contract is "exactly freemem() at call time", which
+		// a bracket of samples taken immediately around the call pins down.
+		for (const platform of ["linux", "win32"] as const) {
+			const before = freemem();
+			const reading = availableMemoryBytes(platform);
+			const after = freemem();
+			expect(reading, platform).toBeGreaterThanOrEqual(Math.min(before, after));
+			expect(reading, platform).toBeLessThanOrEqual(Math.max(before, after));
+		}
 	});
 
 	it.runIf(process.platform === "darwin")("reads reclaimable memory on macOS, above the bare free list", () => {

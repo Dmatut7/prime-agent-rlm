@@ -2,9 +2,13 @@ import { execFile, spawnSync } from "child_process";
 import { existsSync, type FSWatcher, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { performance } from "perf_hooks";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 let resolvedBranch = "main";
+
+/** Start time (performance.now()) of every mocked execFile call, for debounce-gap assertions. */
+let execFileCallTimes: number[] = [];
 
 vi.mock("child_process", () => ({
 	execFile: vi.fn(
@@ -14,6 +18,7 @@ vi.mock("child_process", () => ({
 			_options: unknown,
 			callback: (error: Error | null, stdout: string, stderr: string) => void,
 		) => {
+			execFileCallTimes.push(performance.now());
 			if (args[1] === "symbolic-ref") {
 				setTimeout(
 					() =>
@@ -92,6 +97,56 @@ async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void
 	}
 }
 
+/**
+ * State barrier: wait until the watched value stops changing for `quietMs`.
+ * Watcher events delayed past a debounce window by load legitimately start one
+ * more refresh, so "the burst has fully landed" is only decidable by observing
+ * silence, never by sleeping a fixed duration.
+ */
+async function waitForQuiescence(count: () => number, quietMs = 1500, timeoutMs = 15_000): Promise<number> {
+	const startedAt = Date.now();
+	let lastCount = count();
+	let lastChangeAt = startedAt;
+	for (;;) {
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		const now = count();
+		if (now !== lastCount) {
+			lastCount = now;
+			lastChangeAt = Date.now();
+			continue;
+		}
+		if (Date.now() - lastChangeAt >= quietMs) {
+			return lastCount;
+		}
+		if (Date.now() - startedAt > timeoutMs) {
+			throw new Error(`Timed out waiting for quiescence (count still changing: ${lastCount})`);
+		}
+	}
+}
+
+/**
+ * The two load-immune properties of the debounce (WATCH_DEBOUNCE_MS = 500 in
+ * footer-data-provider.ts): every refresh after the first starts at least one
+ * debounce window after the previous one, and three rapid writes never produce
+ * more refreshes than writes. An undebounced refresh-per-event implementation
+ * violates both. A burst that load split across windows yields 2-3 spaced
+ * refreshes, which is correct behaviour, not a debounce failure.
+ */
+function expectDebouncedRefreshes(callTimes: readonly number[], maxCalls: number): void {
+	expect(callTimes.length, "at least one refresh happened").toBeGreaterThanOrEqual(1);
+	expect(
+		callTimes.length,
+		`refreshes outnumbered the writes: ${callTimes.length} calls at ${callTimes.map((t) => t.toFixed(0)).join(", ")}`,
+	).toBeLessThanOrEqual(maxCalls);
+	for (let i = 1; i < callTimes.length; i++) {
+		const gap = callTimes[i] - callTimes[i - 1];
+		expect(
+			gap,
+			`refresh ${i + 1} started ${gap.toFixed(0)}ms after refresh ${i} (< one debounce window)`,
+		).toBeGreaterThanOrEqual(495);
+	}
+}
+
 describe("FooterDataProvider reftable branch detection", () => {
 	let originalCwd: string;
 	let tempDir: string;
@@ -100,6 +155,7 @@ describe("FooterDataProvider reftable branch detection", () => {
 		originalCwd = process.cwd();
 		tempDir = mkdtempSync(join(tmpdir(), "footer-data-provider-"));
 		resolvedBranch = "main";
+		execFileCallTimes = [];
 		vi.mocked(spawnSync).mockClear();
 		vi.mocked(execFile).mockClear();
 	});
@@ -184,9 +240,10 @@ describe("FooterDataProvider reftable branch detection", () => {
 			provider.onBranchChange(onBranchChange);
 
 			writeFileSync(join(reftableDir, "tables.list"), "1\n");
-			await waitFor(() => vi.mocked(execFile).mock.calls.length === 1);
+			await waitFor(() => vi.mocked(execFile).mock.calls.length >= 1);
+			await waitForQuiescence(() => execFileCallTimes.length);
 
-			expect(vi.mocked(execFile)).toHaveBeenCalledTimes(1);
+			expect(vi.mocked(execFile)).toHaveBeenCalled();
 			expect(vi.mocked(spawnSync)).not.toHaveBeenCalled();
 			expect(provider.getGitBranch()).toBe("main");
 			expect(onBranchChange).not.toHaveBeenCalled();
@@ -195,7 +252,7 @@ describe("FooterDataProvider reftable branch detection", () => {
 		}
 	});
 
-	it("debounces rapid reftable updates into a single async refresh", async () => {
+	it("debounces rapid reftable updates instead of refreshing per event", async () => {
 		const { worktreeDir, reftableDir } = createReftableWorktree(tempDir);
 		process.chdir(worktreeDir);
 
@@ -203,14 +260,15 @@ describe("FooterDataProvider reftable branch detection", () => {
 		try {
 			expect(provider.getGitBranch()).toBe("main");
 			vi.mocked(execFile).mockClear();
+			execFileCallTimes = [];
 
 			writeFileSync(join(reftableDir, "tables.list"), "1\n");
 			writeFileSync(join(reftableDir, "tables.list"), "2\n");
 			writeFileSync(join(reftableDir, "tables.list"), "3\n");
-			await waitFor(() => vi.mocked(execFile).mock.calls.length === 1);
-			await new Promise((resolve) => setTimeout(resolve, 650));
+			await waitFor(() => vi.mocked(execFile).mock.calls.length >= 1);
+			await waitForQuiescence(() => execFileCallTimes.length);
 
-			expect(vi.mocked(execFile)).toHaveBeenCalledTimes(1);
+			expectDebouncedRefreshes([...execFileCallTimes], 3);
 		} finally {
 			provider.dispose();
 		}
@@ -228,10 +286,13 @@ describe("FooterDataProvider reftable branch detection", () => {
 			provider.onBranchChange(onBranchChange);
 
 			writeFileSync(join(reftableDir, "tables.list"), "1\n");
-			await waitFor(() => vi.mocked(execFile).mock.calls.length === 1);
+			await waitFor(() => vi.mocked(execFile).mock.calls.length >= 1);
 			await waitFor(() => provider.getGitBranch() === "foo");
+			await waitForQuiescence(() => execFileCallTimes.length);
 
-			expect(vi.mocked(execFile)).toHaveBeenCalledTimes(1);
+			// One write, three watcher sources (dir watch, file watch, poll): load
+			// can split them across two debounce windows, hence the cap of two.
+			expectDebouncedRefreshes([...execFileCallTimes], 2);
 			expect(provider.getGitBranch()).toBe("foo");
 			expect(onBranchChange).toHaveBeenCalledTimes(1);
 		} finally {

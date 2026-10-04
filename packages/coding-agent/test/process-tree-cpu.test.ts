@@ -57,22 +57,58 @@ describe("readProcessTreeCpuMs", () => {
 	it.skipIf(!hasPython)(
 		"sees a silent busy loop burning CPU",
 		async () => {
-			const child = spawn("python3", ["-c", "import time\nend=time.time()+3\nwhile time.time()<end: pass"], {
-				stdio: "ignore",
+			// The child burns a fixed budget of *process* CPU, not wall time: under a
+			// starved CI runner the burn stretches in wall time instead of shrinking
+			// the reading, which is what made a fixed sleep + accrued-CPU threshold
+			// flake. The reader only has to keep up with 2s of burn.
+			const child = spawn(
+				"python3",
+				["-c", "import time\nend=time.process_time()+2\nwhile time.process_time()<end: pass"],
+				{
+					stdio: "ignore",
+				},
+			);
+			let childExited = false;
+			child.once("exit", () => {
+				childExited = true;
 			});
 			try {
-				await new Promise((resolve) => setTimeout(resolve, 300));
-				const first = readProcessTreeCpuMs([child.pid as number]);
-				await new Promise((resolve) => setTimeout(resolve, 1_500));
-				const second = readProcessTreeCpuMs([child.pid as number]);
-				expect(first).toBeDefined();
-				expect(second).toBeDefined();
-				expect((second as number) - (first as number)).toBeGreaterThanOrEqual(700);
+				const pid = child.pid as number;
+				let baseline: number | undefined;
+				// State barrier: the child is alive and visible in a ps snapshot.
+				const startedAt = Date.now();
+				while (baseline === undefined) {
+					if (Date.now() - startedAt > 10_000) {
+						throw new Error("Timed out waiting for the busy-loop child to appear in ps");
+					}
+					baseline = readProcessTreeCpuMs([pid]);
+					if (baseline === undefined) {
+						await new Promise((resolve) => setTimeout(resolve, 50));
+					}
+				}
+				// State barrier: the reading advances with the burn. 700ms of accrued
+				// CPU is far below what the child accrues before exiting (~2s), so a
+				// working reader reaches it no matter how the scheduler slices.
+				let gained = 0;
+				while (gained < 700 && !childExited) {
+					const reading = readProcessTreeCpuMs([pid]);
+					if (reading !== undefined) {
+						gained = reading - baseline;
+					}
+					if (gained < 700) {
+						await new Promise((resolve) => setTimeout(resolve, 100));
+					}
+				}
+				expect(
+					childExited,
+					`reader kept up with the burn: only ${gained}ms CPU seen before the 2s burn ended`,
+				).toBe(false);
+				expect(gained).toBeGreaterThanOrEqual(700);
 			} finally {
 				child.kill("SIGKILL");
 			}
 		},
-		10_000,
+		60_000,
 	);
 });
 

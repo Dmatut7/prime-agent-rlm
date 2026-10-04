@@ -418,21 +418,34 @@ describe("planEmergencyShrink equivalence with the pre-linearization walk", () =
 });
 
 /**
- * Smallest of the runs in CPU time (user+system), converted to ms: the least
- * contaminated by GC, and immune to preemption by whatever else is on the
- * machine. Wall-clock made the decade ratio load-sensitive - the small tiers
- * best-of'd a clean scheduler slice while the 100k tier could not, inflating
- * growthOverLinear past 2 on a fully loaded host (measured 0.91/2.21 under
- * 10-core saturation); the planner itself stayed linear. The judge's budget
- * (at most 2x per decade on top of linear) is unchanged - only the clock is.
+ * Smallest per-tier CPU time (user+system, ms) sampled one round per tier in
+ * rotation. Two load hazards shaped this:
+ *
+ * - Wall-clock made the decade ratio load-sensitive (small tiers best-of'd a
+ *   clean scheduler slice while the 100k tier could not), so the clock is
+ *   process CPU, which preemption cannot inflate.
+ * - Tier-at-a-time sampling lets load drift between windows masquerade as
+ *   growth: the 100k tier runs last, and when parallel lanes spin up mid-test
+ *   its window sees more memory-bandwidth contention than the 1k window did
+ *   (measured: growthOverLinear 0.56/1.13 idle vs 0.66/1.64 under 4 busy
+ *   loops, sequential sampling, 10-core host). Interleaving makes every tier
+ *   see the same average load across the whole measurement, and the per-tier
+ *   min discards the rounds that lost the scheduler.
+ *
+ * What remains is sustained contention inflation of the largest tier's working
+ * set (~1.5x on this host's 100k tier under 4 busy loops, worse on smaller CI
+ * runners). The judge's budget below absorbs that; it only has to stay far
+ * under the ~10x-per-decade a quadratic planner scores.
  */
-function timeBestOf(fn: () => unknown, iters: number): number {
-	let best = Number.POSITIVE_INFINITY;
-	for (let i = 0; i < iters; i++) {
-		const started = process.cpuUsage();
-		fn();
-		const spent = process.cpuUsage(started);
-		best = Math.min(best, (spent.user + spent.system) / 1000);
+function timeTiersInterleaved(runners: ReadonlyArray<() => unknown>, rounds: number): number[] {
+	const best = runners.map(() => Number.POSITIVE_INFINITY);
+	for (let round = 0; round < rounds; round++) {
+		for (let tier = 0; tier < runners.length; tier++) {
+			const started = process.cpuUsage();
+			runners[tier]();
+			const spent = process.cpuUsage(started);
+			best[tier] = Math.min(best[tier], (spent.user + spent.system) / 1000);
+		}
 	}
 	return best;
 }
@@ -458,8 +471,8 @@ function shrinkFixture(count: number, seed: number, payload: number): { entries:
 describe("planEmergencyShrink cost", () => {
 	it("grows linearly over three decades of branch size", { timeout: 180_000 }, () => {
 		const tiers = [1_000, 10_000, 100_000];
-		const times: number[] = [];
 		const plans: Array<ReturnType<typeof planEmergencyShrink>> = [];
+		const runners: Array<() => unknown> = [];
 		for (const count of tiers) {
 			const { entries, threshold } = shrinkFixture(count, 5, 200);
 			const warm = planEmergencyShrink(entries, threshold);
@@ -471,8 +484,9 @@ describe("planEmergencyShrink cost", () => {
 			expect(warm?.span.droppedEntries ?? 0, `count=${count}`).toBeGreaterThan(count * 0.2);
 			expect(warm?.firstKeptEntryIndex ?? 0, `count=${count}`).toBeGreaterThan(count * 0.2);
 			plans.push(warm);
-			times.push(timeBestOf(() => planEmergencyShrink(entries, threshold), count >= 100_000 ? 2 : 3));
+			runners.push(() => planEmergencyShrink(entries, threshold));
 		}
+		const times = timeTiersInterleaved(runners, 4);
 		expect(times.length).toBe(tiers.length);
 		const growths = [
 			growthOverLinear(times[0], times[1], tiers[1] / tiers[0]),
@@ -481,10 +495,13 @@ describe("planEmergencyShrink cost", () => {
 		const detail = `tiers=${tiers.join("/")} cpuMs=${times.map((t) => t.toFixed(1)).join("/")} growthOverLinear=${growths
 			.map((g) => g.toFixed(2))
 			.join("/")}`;
-		// The judge: per decade of entries, time may at most double on top of the
-		// decade itself. The quadratic walk this replaced scored ~100 per decade.
-		expect(growths[0], detail).toBeLessThanOrEqual(2);
-		expect(growths[1], detail).toBeLessThanOrEqual(2);
+		// The judge: per decade of entries, time may at most triple on top of the
+		// decade itself. Measured on a 10-core host: 0.56/1.13 idle, 0.66/1.64
+		// under 4 busy loops (see timeTiersInterleaved); 3 absorbs the sustained
+		// contention inflation a shared CI runner adds, while the quadratic walk
+		// this replaced scores ~10 per decade and fails it outright.
+		expect(growths[0], detail).toBeLessThanOrEqual(3);
+		expect(growths[1], detail).toBeLessThanOrEqual(3);
 		expect(plans[2]?.span.droppedEntries ?? 0).toBeGreaterThan(plans[0]?.span.droppedEntries ?? 0);
 	});
 
@@ -497,17 +514,22 @@ describe("planEmergencyShrink cost", () => {
 		// under the >3 pin), and bigger tiers put the O(cuts x entries) term in
 		// charge so the growth lands near the theoretical 4 with headroom.
 		const tiers = [1_000, 2_000, 4_000];
-		const reference: number[] = [];
-		const linearized: number[] = [];
+		const referenceRunners: Array<() => unknown> = [];
+		const linearizedRunners: Array<() => unknown> = [];
 		for (const count of tiers) {
 			const { entries, threshold } = shrinkFixture(count, 9, 60);
 			const oldPlan = planEmergencyShrinkReference(entries, threshold);
 			const newPlan = planEmergencyShrink(entries, threshold);
 			expect(oldPlan?.reachedTarget, `count=${count}`).toBe(true);
 			expect(newPlan).toEqual(oldPlan);
-			reference.push(timeBestOf(() => planEmergencyShrinkReference(entries, threshold), 2));
-			linearized.push(timeBestOf(() => planEmergencyShrink(entries, threshold), 2));
+			referenceRunners.push(() => planEmergencyShrinkReference(entries, threshold));
+			linearizedRunners.push(() => planEmergencyShrink(entries, threshold));
 		}
+		// All six runners interleave in one rotation, so the reference and the
+		// linearized planner see identical load in every round.
+		const times = timeTiersInterleaved([...referenceRunners, ...linearizedRunners], 3);
+		const reference = times.slice(0, tiers.length);
+		const linearized = times.slice(tiers.length);
 		const refGrowth = growthOverLinear(reference[0], reference[2], tiers[2] / tiers[0]);
 		const newGrowth = growthOverLinear(linearized[0], linearized[2], tiers[2] / tiers[0]);
 		const detail = `reference cpuMs=${reference.map((t) => t.toFixed(1)).join("/")} linearized cpuMs=${linearized
@@ -519,6 +541,6 @@ describe("planEmergencyShrink cost", () => {
 		// The same judge the three-decade test uses, applied where the old walk is
 		// still affordable: the linearized planner has to pass it on this fixture
 		// shape too, or the pass above could be a fixture that never walks far.
-		expect(newGrowth, detail).toBeLessThanOrEqual(2);
+		expect(newGrowth, detail).toBeLessThanOrEqual(3);
 	});
 });
