@@ -1218,34 +1218,39 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 			}
 		}
 
-		// GLM-5.3-FlashX is sold only on the pay-as-you-go API (api.z.ai/api/paas/v4);
-		// the coding plan does not serve it, so the zai-coding-plan section never lists
-		// it. Source it from the models.dev "zai" section until that changes. If the
-		// coding-plan section grows the same id later, that entry wins the
+		// Some GLM models are sold only on the pay-as-you-go API
+		// (api.z.ai/api/paas/v4); the coding plan does not serve them, so the
+		// zai-coding-plan section never lists them. Source them from the
+		// models.dev "zai" section until that changes. If the coding-plan
+		// section grows the same id later, that entry wins the
 		// provider+id dedup because it is pushed first.
-		const zaiFlashX = data.zai?.models?.["glm-5.3-flashx"] as ModelsDevModel | undefined;
-		if (zaiFlashX?.tool_call === true && !models.some((m) => m.provider === "zai" && m.id === "glm-5.3-flashx")) {
+		const ZAI_PAY_AS_YOU_GO_ONLY_MODELS = ["glm-5.1", "glm-5.3-flashx"];
+		for (const modelId of ZAI_PAY_AS_YOU_GO_ONLY_MODELS) {
+			const m = data.zai?.models?.[modelId] as ModelsDevModel | undefined;
+			if (m?.tool_call !== true || models.some((existing) => existing.provider === "zai" && existing.id === modelId)) {
+				continue;
+			}
 			models.push({
-				id: "glm-5.3-flashx",
-				name: zaiFlashX.name || "GLM-5.3-FlashX",
+				id: modelId,
+				name: m.name || modelId,
 				api: "openai-completions",
 				provider: "zai",
 				baseUrl: "https://api.z.ai/api/paas/v4",
-				reasoning: zaiFlashX.reasoning === true,
-				input: zaiFlashX.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
+				reasoning: m.reasoning === true,
+				input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 				cost: {
-					input: zaiFlashX.cost?.input || 0,
-					output: zaiFlashX.cost?.output || 0,
-					cacheRead: zaiFlashX.cost?.cache_read || 0,
-					cacheWrite: zaiFlashX.cost?.cache_write || 0,
+					input: m.cost?.input || 0,
+					output: m.cost?.output || 0,
+					cacheRead: m.cost?.cache_read || 0,
+					cacheWrite: m.cost?.cache_write || 0,
 				},
 				compat: {
 					supportsDeveloperRole: false,
 					thinkingFormat: ZAI_THINKING_COMPAT.thinkingFormat,
 					zaiToolStream: true,
 				},
-				contextWindow: zaiFlashX.limit?.context || 4096,
-				maxTokens: zaiFlashX.limit?.output || 4096,
+				contextWindow: m.limit?.context || 4096,
+				maxTokens: m.limit?.output || 4096,
 			});
 		}
 

@@ -1,0 +1,2 @@
+- Added zai `glm-5.1` to the model catalog via the pay-as-you-go endpoint (the coding plan does not serve it).
+- Refreshed the model catalog with upstream drift: Bedrock Claude Sonnet 5.5 EU/US routes and OpenRouter repricing (kimi-k3 input 0.99 -> 0.72).
