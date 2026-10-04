@@ -4329,11 +4329,13 @@ describe("daemon worker supervisor monitoring", () => {
 			snapshotTransferFrames: new Map(),
 		};
 		const catchUpClient = vi.fn(async () => undefined);
+		const log = vi.fn();
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			clients: new Set([client]),
 			streamReconstructor: { observe: vi.fn(), hasPartial: vi.fn(() => false) },
 			catchUpClient,
 			invalidateWorkerSnapshot: vi.fn(),
+			log,
 		}) as {
 			handleWorkerFrame(residentWorker: typeof worker, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
 		};
@@ -4356,6 +4358,10 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(writes).toHaveLength(1);
 		expect(client.catchupActiveSessionIds).toEqual(new Set([activeSessionId]));
 		expect(catchUpClient).not.toHaveBeenCalled();
+		// The wave-40 boss incident: a catch-up firing used to be invisible until the
+		// downstream transcript error. The queue now logs its trigger at queue time.
+		expect(log).toHaveBeenCalledWith(expect.stringContaining("catch-up queued"));
+		expect(log).toHaveBeenCalledWith(expect.stringContaining("trigger="));
 	});
 
 	it("subscribes to worker updates with chunked snapshots", async () => {

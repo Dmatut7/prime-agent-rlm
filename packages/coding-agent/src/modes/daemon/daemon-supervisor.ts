@@ -6973,7 +6973,12 @@ export class DaemonSupervisor {
 	private queueSnapshotResync(activeSessionId: string, snapshotPurpose: "replacement" | "catchup"): void {
 		for (const client of this.clients) {
 			if (!client.attachedActiveSessionIds.has(activeSessionId)) continue;
-			this.queueCatchup(client, activeSessionId, snapshotPurpose === "replacement" ? "replacement" : "resync");
+			this.queueCatchup(
+				client,
+				activeSessionId,
+				snapshotPurpose === "replacement" ? "replacement" : "resync",
+				"snapshot-cache-failed",
+			);
 			void this.catchUpClient(client).catch((error) =>
 				this.log(`Failed to catch up client ${client.id}: ${String(error)}`),
 			);
@@ -9674,7 +9679,7 @@ export class DaemonSupervisor {
 				client.attachedActiveSessionIds.has(result.activeSessionId) &&
 				client.deferredSessionPayloads?.get(result.activeSessionId)?.payloads.length
 			) {
-				this.queueCatchup(client, result.activeSessionId, "resync");
+				this.queueCatchup(client, result.activeSessionId, "resync", "snapshot-stream-undelivered");
 			}
 			releaseSnapshotReservation();
 			releaseTranscript();
@@ -10312,19 +10317,24 @@ export class DaemonSupervisor {
 					this.discardDeferredSessionPayloads(client, activeSessionId);
 					client.deferredSessionPayloadsDropped ??= new Set();
 					client.deferredSessionPayloadsDropped.add(activeSessionId);
-					this.queueCatchup(client, activeSessionId, "replacement");
+					this.queueCatchup(client, activeSessionId, "replacement", "deferral-overflow");
 					continue;
 				}
 				if (this.deferSessionPayload(client, activeSessionId, publicPayload)) {
 					continue;
 				}
 				// The deferral buffer overflowed: fall back to a full resync.
-				this.queueCatchup(client, activeSessionId, "resync");
+				this.queueCatchup(client, activeSessionId, "resync", "deferral-overflow");
 				continue;
 			}
 			if (client.deferredSessionPayloadsDropped?.has(activeSessionId)) continue;
 			if (client.backpressured === true) {
-				this.queueCatchup(client, activeSessionId, outboundType === "session_replaced" ? "replacement" : "resync");
+				this.queueCatchup(
+					client,
+					activeSessionId,
+					outboundType === "session_replaced" ? "replacement" : "resync",
+					"backpressured",
+				);
 				continue;
 			}
 			const payload =
@@ -10395,7 +10405,7 @@ export class DaemonSupervisor {
 		this.invalidateWorkerSnapshot(worker, activeSessionId);
 		const clients = [...this.clients].filter((client) => client.attachedActiveSessionIds.has(activeSessionId));
 		for (const client of clients) {
-			this.queueCatchup(client, activeSessionId);
+			this.queueCatchup(client, activeSessionId, "resync", "compaction");
 		}
 		void Promise.all(clients.map((client) => this.catchUpClient(client)))
 			.catch((error) => this.log(`Failed compact catch-up for ${activeSessionId}: ${String(error)}`))
@@ -10408,6 +10418,7 @@ export class DaemonSupervisor {
 		client: DaemonSocketClient,
 		activeSessionId: string,
 		purpose: "replacement" | "resync" = "resync",
+		trigger?: string,
 	): void {
 		if (!client.catchupActiveSessionIds) {
 			client.catchupActiveSessionIds = new Set();
@@ -10416,6 +10427,13 @@ export class DaemonSupervisor {
 		client.catchupPurposes ??= new Map();
 		if (purpose === "replacement" || !client.catchupPurposes.has(activeSessionId)) {
 			client.catchupPurposes.set(activeSessionId, purpose);
+		}
+		// The wave-40 boss incident: this path firing used to be invisible until the
+		// transcript error surfaced downstream. Log the trigger at queue time so the
+		// daemon log says which pressure point (overflow, backpressure, failed
+		// snapshot transfer, replacement) drove the client into a catch-up.
+		if (trigger !== undefined) {
+			this.log(`catch-up queued for ${activeSessionId}: trigger=${trigger} purpose=${purpose}`);
 		}
 	}
 
@@ -10455,7 +10473,7 @@ export class DaemonSupervisor {
 				return;
 			}
 			if (client.backpressured || !this.writeSerialized(client, payload)) {
-				this.queueCatchup(client, activeSessionId, "resync");
+				this.queueCatchup(client, activeSessionId, "resync", "deferral-drain-write-failed");
 				return;
 			}
 		}

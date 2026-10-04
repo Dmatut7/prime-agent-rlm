@@ -1,0 +1,1 @@
+- Added trigger logging to the client catch-up queue: when the daemon drives a client into a snapshot catch-up, the log now names the pressure point (deferral-overflow, backpressured, deferral-drain-write-failed, snapshot-cache-failed, snapshot-stream-undelivered, replace-fallback, compaction), so the wave-40 incident class is diagnosable from the daemon log alone.
