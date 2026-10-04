@@ -1,1 +1,0 @@
-- Fixed expansion keys (Ctrl+O / Ctrl+T / Ctrl+P and the Alt+O / Alt+T / Alt+P globals) looking dead after `--resume` of a taller-than-screen session: the toggle now scrolls the turn's head into view when the expansion would otherwise happen above the bottom-glued fullscreen window.

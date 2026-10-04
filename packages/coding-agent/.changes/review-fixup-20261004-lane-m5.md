@@ -1,2 +1,0 @@
-- Fixed the F1 turn-reveal marker being lost when block navigation measured blocks between the key toggle and the next frame, and leaking raw marker bytes to the screen when the viewport's reveal slot moved on first.
-- Added the off-screen turn reveal to the edit-diff expansion key and the full tool-output key, matching the other global expansion toggles.

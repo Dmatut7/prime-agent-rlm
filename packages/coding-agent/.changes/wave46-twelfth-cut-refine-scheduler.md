@@ -1,1 +1,0 @@
-- Changed the refine-scheduler cluster (serialized-refine checkpoint family, kernel host-request entry, disposal drain, and auto-refine scheduling) to live in `core/refine-scheduler.ts` behind a `RefineSchedulerHost` seam; `AgentSession` keeps delegating shells and the `SerializedBackgroundPlanResult` re-export, with no behavior change.

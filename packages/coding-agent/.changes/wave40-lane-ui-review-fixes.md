@@ -1,9 +1,0 @@
-- Fixed an Esc-cleared draft popping back into the input after the next send (a fast follow-up Enter could submit it): it now stays stashed and only Ctrl+S brings it back, and /fork and /clone carry stashed drafts into the new session instead of losing them.
-- Fixed loading earlier transcript pages snapping a scrolled-up view to the bottom and raising a fake "N 行新内容" indicator: the window keeps its rows and prepended history no longer counts as new.
-- Fixed a fan-out of several sub-agents showing only the last "派出子代理" line: spawn and removal notices now each get their own line.
-- Fixed the up-arrow prompt history after re-attaching to a long session reaching only the attach window's questions: the omitted prefix now pages in behind them.
-- Fixed the "加载更早" marker showing against an unrestarted old daemon and erroring on click: it is now gated on the daemon's advertised slim_attach_transcript capability, with the static window note as the fallback.
-- Fixed an armed "stop all subagents" confirmation surviving a session switch and consuming the new session's first stop-all press against the old session's children.
-- Fixed the working clock restarting from the attach moment when attaching mid-way into a long running turn: it now anchors at the oldest visible message, and a quiet-mode turn box whose window starts mid-turn says earlier steps exist.
-- Fixed the double-Esc session tree preselecting an automatic continuation prompt instead of the last thing you actually typed.
-- Stopped the retry-reason replay in a live turn box from re-reading the settings files on every frame: the retry policy now comes from the mode's long-lived settings manager.

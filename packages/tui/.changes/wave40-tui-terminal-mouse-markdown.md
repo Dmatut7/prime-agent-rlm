@@ -1,4 +1,0 @@
-- Fixed Kitty keyboard protocol stack tracking across the alternate screen: Alt-modified keys (e.g. Alt+Enter) keep working after leaving fullscreen, and exiting no longer leaves the protocol enabled in the shell (which broke Ctrl+C there).
-- Fixed mouse clicks and hyperlink opens on terminals without SGR mouse reporting by mapping legacy X10 release events back to the last pressed button.
-- Fixed a UI stall where an overwide line rewrote the crash log with the whole transcript on every frame; the log is now written once per render and throttled.
-- Fixed streamed markdown rendering: a trailing code block ending in a newline no longer loses a blank line, a dangling backtick no longer leaves stale emphasis on screen, and math formulas spanning a streaming split point no longer stay raw text.

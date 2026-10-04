@@ -1,8 +1,0 @@
-- Fixed one-word prompts behind `-p`/`--print`/`--mode` being rejected as mistyped commands (e.g. `prime-agent -p status` now asks about "status").
-- Fixed a leading `--daemon-socket` landing behind the `--` separator in commands like `send`/`schedule`, which corrupted the message content and silently ran the command against the default daemon.
-- Fixed Ctrl+C doing nothing during interactive startup (raw mode disabled SIGINT until the TUI started; a slow daemon spawn could hold that window for the full startup timeout).
-- Fixed an open window respawning the background daemon after `prime-agent shutdown --force`; reconnect recovery now respects the deliberate-shutdown tombstone.
-- Fixed a lone `-v` silently starting a verbose session; it now prints the version with a pointer to `-V`/`--version` (`-v` with any other argument stays verbose).
-- Fixed one invalid package entry in settings failing `package install`/`remove`/`update` for every other package; the invalid entry is now skipped with a warning.
-- Fixed atomic file writes fsyncing the temp file through a read-only handle; the fsync now uses a writable handle and tolerates filesystems without fsync (EINVAL/ENOTSUP/EPERM).
-- Fixed session git context detection reading wrong data in reftable repositories (branch showed as `.invalid`, commit missing) and reporting no repository below an embedded empty `.git` directory.

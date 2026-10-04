@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.20] - 2026-10-04
+
+- Fixed cross-model replay after an aborted turn with a model switch: the last completed turn now keeps its full thinking, and the aborted turn's half-formed reasoning is dropped instead of being replayed as plain text.
+- Fixed a Codex content-filter or refusal stop permanently disabling the session's WebSocket transport (forcing every later request onto a full-conversation SSE resend); a failure derived from the provider's stop reason no longer counts as a connection failure.
+- Fixed Google and Vertex prompt-level safety blocks being retried with identical bytes up to the retry cap; a blocked prompt now surfaces immediately as a permanent request rejection carrying the provider's block reason.
+- Capped the Anthropic unrouted content-block diagnostics: repeated misses of the same event shape now advance a count on a single diagnostic instead of appending one per event.
+- Fixed Codex flex/priority cost estimates showing the standard rate: the Codex endpoint always reports `service_tier: "default"`, so the requested tier is trusted again when the response echoes default (restores the upstream pi-mono #3307 behavior).
+- Fixed openai-codex-responses treating a WebSocket protocol failure (unparseable frame, close before the terminal event) as a provider outcome: it now takes the WebSocket→SSE fallback like a dropped connection instead of failing the request.
+- Fixed the WebSocket attempt notice stamping `networkError: true` on failures the provider actually answered (error frames, model stop reasons); the flag now marks only attempts that failed without any response.
+- Added zai `glm-5.1` to the model catalog via the pay-as-you-go endpoint (the coding plan does not serve it).
+- Refreshed the model catalog with upstream drift: Bedrock Claude Sonnet 5.5 EU/US routes and OpenRouter repricing (kimi-k3 input 0.99 -> 0.72).
+
 ## [0.11.15] - 2026-09-29
 
 - Fixed bare `</think>` lines showing up in replies between tool calls on OpenAI-compatible endpoints; reasoning that a provider streams inline between tags keeps its tags ([#41](https://github.com/Dmatut7/prime-agent-rlm/pull/41) by [@Lansyue](https://github.com/Lansyue)).

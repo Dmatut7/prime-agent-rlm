@@ -1,1 +1,0 @@
-- Fixed shell-tool, `exec`, extension, and kernel `bash()` children losing the macOS GUI-session context (`SECURITYSESSIONID`, `__CF_USER_TEXT_ENCODING`, `XPC_FLAGS`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`, `TERM_SESSION_ID`), which broke keychain credential probes such as `claude` inside agent-run commands.

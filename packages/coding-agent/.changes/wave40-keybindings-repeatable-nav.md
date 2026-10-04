@@ -1,1 +1,0 @@
-- Fixed Alt+Up/Down and Ctrl+Alt+Up/Down navigation bindings (pending-message browser, conversation blocks, model reorder) to repeat while held on kitty-protocol terminals.

@@ -1,3 +1,0 @@
-- Fixed the finish gate counting a failed test run as proof when the check ran inside an ipython cell: a cell now counts as green only when its visible output carries the verdict (exit code 0 or the runner's pass wording), and a later red re-check voids an earlier green.
-- Fixed the finish gate trusting a green check that predates later edits: a project file change after the verification run voids the evidence until the check runs again.
-- Updated the "Doing the work" prompt: a pass covers only what ran, so the verification cited for a change must be newer than the last edit, and a verification run should leave its exit code or pass line visible.

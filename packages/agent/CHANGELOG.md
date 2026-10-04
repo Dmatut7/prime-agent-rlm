@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.20] - 2026-10-04
+
+- Changed the tool-not-found breaker: per-name miss counts now decay by one per resolved tool call (new `toolNotFoundBreaker.decayPerResolvedCall`, default 1), so an occasional wrong tool name in a long task no longer accumulates into a run-ending trip; hitting the limit now grants one recovery turn (new `toolNotFoundBreaker.recoveryTurns`, default 1) that a resolved call or clean stop closes with counts reset, and only a relapse inside that turn ends the run. `0` on either knob restores the previous behavior.
+- Fixed stream-stall and terminal-less-EOF errors carrying no `provider_stream_failure` diagnostic: both now classify as kind `unknown` (transient), so the session's quick retries, backup model, and fallback model chain engage on a dead connection instead of reading the failure as permanent.
+- Changed the tool-not-found breaker: every trigger - the limit hit or a relapse inside an open recovery turn - now grants another recovery turn until the per-run budget is spent (`toolNotFoundBreaker.recoveryTurns` default raised 1 -> 3), so a second storm in the same run no longer ends it outright; the classified terminal error's diagnostic details gained `recoveryTurns` alongside `recoveriesUsed`.
+- Fixed the tool-not-found breaker never tripping behind a fallback chain: per-name miss counts are now attributed to the model that made the miss, and a resolved call decays only its own model's counts, so a healthy fallback stint no longer washes the tally of a primary model that keeps hallucinating the same tool name after every cooldown return.
+
 ## [0.11.3] - 2026-09-24
 
 - Added `Agent.pendingTurnModel`, a one-shot switch that moves a running loop to another model at its next request.

@@ -1,1 +1,0 @@
-- Changed the refine-execution cluster (refine() planning/application, model resolution, review, and receipt family) to live in `core/refine-execution.ts` behind a `RefineExecutionHost` seam; `AgentSession` keeps delegating shells and re-exports, with no behavior change.

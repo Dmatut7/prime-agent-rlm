@@ -377,6 +377,8 @@ export function mapStopReason(reason: FinishReason): StopReason {
 		case FinishReason.STOP:
 			return "stop";
 		case FinishReason.MAX_TOKENS:
+		// Per-request token limit with a continuation token: a token-limit truncation.
+		case FinishReason.CONTINUATION:
 			return "length";
 		case FinishReason.BLOCKLIST:
 		case FinishReason.PROHIBITED_CONTENT:

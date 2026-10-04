@@ -1,2 +1,0 @@
-- Fixed the first Alt+Up looking dead when a startup warning line sits at the end of the chat container: block navigation now skips notification lines as entry targets (error lines still enter normally).
-- Refactored internals with no behavior change: extracted the daemon adoption cluster into daemon-supervisor-adoption.ts (daemon-supervisor.ts 11296→11135 lines).

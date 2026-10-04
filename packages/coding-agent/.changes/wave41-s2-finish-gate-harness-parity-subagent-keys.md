@@ -1,3 +1,0 @@
-- Fixed the finish gate re-probing replies that merely mention "fixed"/"implemented"/"修好了" mid-text: the completion claim is now read off the sentence the reply ends on, while evidence cited anywhere in the reply still backs it.
-- Changed the /refine near-duplicate memory advisory to the Python harness's two-band threshold: below ten memories the floor rises from 0.40 to 0.55, so tiny stores no longer false-positive on related-but-distinct entries.
-- Fixed the subagent strip's left/right navigation not repeating when the key is held on kitty-protocol terminals.

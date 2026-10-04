@@ -1,1 +1,0 @@
-- Moved the harness-digest delivery cluster (render, fingerprint, and the material-change gate) out of `AgentSession` into `core/harness-digest.ts`; behavior is unchanged.

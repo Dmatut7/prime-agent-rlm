@@ -1,2 +1,0 @@
-- Fixed openai-codex-responses treating a WebSocket protocol failure (unparseable frame, close before the terminal event) as a provider outcome: it now takes the WebSocket→SSE fallback like a dropped connection instead of failing the request.
-- Fixed the WebSocket attempt notice stamping `networkError: true` on failures the provider actually answered (error frames, model stop reasons); the flag now marks only attempts that failed without any response.

@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.11.20] - 2026-10-04
+
+- Added `FullscreenViewport.noteTranscriptPrepend` (and `TUI.noteTranscriptPrepend`): rows inserted at the top of the transcript keep a paused window on the rows it shows and never count as new content below, fixing the snap-to-bottom and fake new-content indicator when a history page is prepended.
+- Fixed Kitty keyboard protocol stack tracking across the alternate screen: Alt-modified keys (e.g. Alt+Enter) keep working after leaving fullscreen, and exiting no longer leaves the protocol enabled in the shell (which broke Ctrl+C there).
+- Fixed mouse clicks and hyperlink opens on terminals without SGR mouse reporting by mapping legacy X10 release events back to the last pressed button.
+- Fixed a UI stall where an overwide line rewrote the crash log with the whole transcript on every frame; the log is now written once per render and throttled.
+- Fixed streamed markdown rendering: a trailing code block ending in a newline no longer loses a blank line, a dangling backtick no longer leaves stale emphasis on screen, and math formulas spanning a streaming split point no longer stay raw text.
+- Hardened the 8MB-paste editor test against CI load flakes by asserting on best-of-3 process CPU time instead of a single wall-clock measurement.
+- Faster streaming markdown on long single blocks: the seal-path validation scans (backtick parity, seal integrity, last-sealable offset, inline splice) are incremental now — an 80k-char single paragraph renders the full stream in 0.23s instead of 0.44s, and 100k in 0.44s instead of 0.75s, with byte-identical output.
+- Streaming code fences no longer re-highlight the whole block every frame: sealed rows render plain while only the tail window (≤50 lines / 4096 chars) is highlighted, and a closed fence gets one full-highlight reflow. An 80k highlighted fence streams in 0.43s instead of 21.3s (tail p95 25–40ms → 0.9ms). Sealed rows render plain during streaming and gain color once the fence closes; set PI_MARKDOWN_FENCE_STREAM_HL=0 to restore the old path.
+- Fixed stale sealed lines when a codespan or link completed at the stream tail re-paired already-sealed emphasis through marked's global emphasis mask.
+- Fixed the incremental lex cache keeping paragraphs that a display-math opener (`$$` or `\[`) could re-type once its closer streamed in across blank lines.
+
 ## [0.11.18] - 2026-09-30
 
 - Fixed dragging to copy in the fullscreen view: a selection now copies only the words, without the time column or the timeline lines.

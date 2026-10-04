@@ -133,6 +133,10 @@ function buildOptions(outfile, overrides = {}) {
 		logLevel: "silent",
 		absWorkingDir: repoRoot,
 		outfile,
+		// Optional observability peers (declared optional by @mistralai/mistralai) are not
+		// installed and must never enter a browser bundle; mark them external rather than
+		// letting a hoisted transitive copy decide whether the gate is green.
+		external: ["@opentelemetry/*"],
 		...overrides,
 	};
 }
