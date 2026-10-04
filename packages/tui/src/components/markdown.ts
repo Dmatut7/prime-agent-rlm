@@ -1,4 +1,4 @@
-import { Marked, type Token, Tokenizer, type TokenizerExtension, type Tokens, type TokensList } from "marked";
+import { Lexer, Marked, type Token, Tokenizer, type TokenizerExtension, type Tokens, type TokensList } from "marked";
 import { latexToUnicode } from "../latex.js";
 import {
 	extractTableCellSelectionRegions,
@@ -204,15 +204,12 @@ interface FinalBlockSeal {
 	wrapIneligible?: boolean;
 	/**
 	 * Paragraph seals only: incremental state for the per-frame validation
-	 * scans. parity is the backtick parity of the sealed prefix text
-	 * [0, tailFrom) (startsWith-verified each frame). The scan* fields fold
-	 * lastSealableParagraphOffset results covering offsets <= scanFrom, and the
-	 * boundary* fields record the token covering the seal boundary so
-	 * paragraphSealIntact is O(1). Both are trusted only while the split-lex
-	 * epoch matches, which guarantees the covered region's bytes and token
-	 * identities are unchanged.
+	 * scans. The scan* fields fold lastSealableParagraphOffset results covering
+	 * offsets <= scanFrom, and the boundary* fields record the token covering
+	 * the seal boundary so paragraphSealIntact is O(1). Both are trusted only
+	 * while the split-lex epoch matches, which guarantees the covered region's
+	 * bytes and token identities are unchanged.
 	 */
-	parity?: number;
 	scanEpoch?: number;
 	scanFrom?: number;
 	scanBest?: number;
@@ -264,7 +261,44 @@ const STYLE_PREFIX_CONSTRUCTS = new Set(["strong", "em", "codespan", "link", "de
  * pass isStableLexBoundary. Returns 0 when no boundary qualifies or the tokens
  * do not tile the text exactly.
  */
+/** A block start opening display math: optional indent, then "$$" or "\[". */
+const BLOCK_MATH_OPEN_REGEX = /^[ \t]*(?:\$\$|\\\[)/;
+
+/**
+ * Whether a kept token can still be re-typed by display math once a closer
+ * streams in. The math parser's BLOCK_MATH_REGEX allows any indent (the
+ * extension preempts indented code) and spans blank lines (`[\s\S]+?` content),
+ * so an opener lexed as plain content pairs with the first valid closer
+ * anywhere after it. marked's startBlock clipping splits paragraphs at every
+ * "$$"/"\[" its start() sees, and when blockMath does not (yet) match the two
+ * halves merge back into one paragraph token — so in a kept paragraph/text raw
+ * an opener can hide ANYWHERE, while every other token type can only be
+ * re-typed by a match starting at its raw start. A token lexed AS blockMath is
+ * final (its closer is in) and never suspect.
+ */
+function hasDanglingBlockMathOpener(token: Token, raw: string): boolean {
+	if (token.type === "blockMath") {
+		return false;
+	}
+	if (token.type === "paragraph" || token.type === "text") {
+		return raw.includes("$$") || raw.includes("\\[");
+	}
+	return BLOCK_MATH_OPEN_REGEX.test(raw);
+}
+
 function computeLexCut(tokens: Token[], text: string): { cut: number; kept: number } {
+	// First token holding an unmatched blockMath opener: cuts at or after it are
+	// unstable (see hasDanglingBlockMathOpener), so boundaries past it never
+	// qualify.
+	let mathOpen = -1;
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i];
+		const raw = token?.raw;
+		if (token !== undefined && typeof raw === "string" && hasDanglingBlockMathOpener(token, raw)) {
+			mathOpen = i;
+			break;
+		}
+	}
 	let pos = 0;
 	let cut = 0;
 	let kept = 0;
@@ -273,7 +307,7 @@ function computeLexCut(tokens: Token[], text: string): { cut: number; kept: numb
 		if (typeof raw !== "string") {
 			return { cut: 0, kept: 0 };
 		}
-		if (i > 0 && isStableLexBoundary(tokens, i, text, pos)) {
+		if (i > 0 && (mathOpen === -1 || i <= mathOpen) && isStableLexBoundary(tokens, i, text, pos)) {
 			cut = pos;
 			kept = i;
 		}
@@ -353,8 +387,6 @@ interface SplitLex {
 	prefix: string;
 	/** Bootstrap generation; a re-bootstrap bumps it, dropping incremental seal state keyed on a previous generation's byte/token stability. */
 	epoch: number;
-	/** Backtick parity of normalizedText[paraFrom, cut); extended incrementally at each advance. */
-	parity: number;
 	/** Last splice result built from prefixTokens; reused in place while prefixTokens is unchanged (see spliceInlineTokens). */
 	spliced?: Token[];
 	/** The prefixTokens array spliced was built from. */
@@ -372,8 +404,6 @@ interface SplitLexFrame {
 	epoch: number;
 	/** split.cut - split.paraFrom: verified prefix length in paragraph-text offsets. */
 	cutRel: number;
-	/** Backtick parity of the verified prefix (== split.parity at splice time, pre-advance). */
-	parity: number;
 	/** Index of the first non-verified token (the merged junction token when the splice merged). */
 	junctionIndex: number;
 	/** Text offset where inlineTokens[junctionIndex] starts. */
@@ -426,20 +456,74 @@ const INLINE_DELIM_CHARS = new Set(["*", "_", "`", "[", "<", "$", "~", "\\"]);
 const MATH_DELIMITER_ESCAPES = new Set(["\\(", "\\[", "\\)", "\\]"]);
 
 /**
- * Parity of the backtick count: 1 while an unmatched backtick dangles. marked
- * evaluates emphasis flanking on a codespan-masked copy of the whole inline
- * text, so a dangling backtick arriving later can re-type an already-lexed
- * `*...*` pair without any token crossing the point the prefix was verified at
- * (an even count keeps the masking pair-aligned and the prefix stable).
- * [from, to) bounds the scan: streaming callers cache the parity of a
- * byte-verified prefix and scan only the unverified tail per frame.
+ * marked's emStrong/del tokenizers scan a masked copy of the whole inline text
+ * (Lexer.inlineTokens): escape pairs become "++" and every link/codespan/html
+ * span becomes a same-length "[aa...]" placeholder, so emphasis delimiters
+ * inside those spans never pair. The masked spans are decided by a global
+ * left-to-right scan, so later text can pair a backtick run that is unmasked
+ * today, extending a mask span over earlier content and re-typing emphasis
+ * there while no token crosses the affected region. Reusing earlier inline
+ * tokens (line seal, split lex) is sound only while no such unmasked run
+ * exists; once the run pairs, the mask is whole again and those paths
+ * re-engage from the corrected tokens. The masking uses marked's own rules so
+ * the check cannot drift from the tokenizer (the gfm ruleset the parsers here
+ * run with; blockSkip/anyPunctuation are shared with the normal ruleset).
  */
-function backtickParity(text: string, from = 0, to = text.length): number {
-	let parity = 0;
-	for (let i = from; i < to; i++) {
-		if (text.charCodeAt(i) === 96) parity ^= 1;
+const EMPHASIS_MASK_PUNCTUATION = Lexer.rules.inline.gfm.anyPunctuation;
+const EMPHASIS_MASK_BLOCK_SKIP = Lexer.rules.inline.gfm.blockSkip;
+
+function emphasisMask(text: string): string {
+	return text
+		.replace(EMPHASIS_MASK_PUNCTUATION, "++")
+		.replace(
+			EMPHASIS_MASK_BLOCK_SKIP,
+			(match: string, _labelGroup: string | undefined, precodeGroup: string | undefined) => {
+				const pre = precodeGroup === undefined ? 0 : precodeGroup.length;
+				return `${match.slice(0, pre)}[${"a".repeat(match.length - pre - 2)}]`;
+			},
+		);
+}
+
+/** Whether the emphasis mask of `text` leaves a backtick run unpaired. */
+function hasUnmaskedBacktick(text: string): boolean {
+	if (!text.includes("`")) {
+		return false;
 	}
-	return parity;
+	return emphasisMask(text).includes("`");
+}
+
+/**
+ * Whether an emphasis construct's content holds a link or tag opener that
+ * later text can still claim. strong/em tokens exist only because marked's
+ * emphasis mask left their delimiters visible; a "[" or "<" in their plain
+ * content starts a mask span the moment the tail completes the link or tag,
+ * hiding those delimiters again — the construct un-types without any token
+ * crossing the point the prefix was verified at. Closed child constructs
+ * (links, codespans, math) are stable shells that never expose their
+ * internals, so only nested emphasis and plain text are examined.
+ */
+function emphasisContentHasOpenBracket(tokens: Token[] | undefined): boolean {
+	if (!tokens) {
+		return false;
+	}
+	for (const token of tokens) {
+		if (token.type === "strong" || token.type === "em" || token.type === "del") {
+			if (emphasisContentHasOpenBracket((token as { tokens?: Token[] }).tokens)) {
+				return true;
+			}
+			continue;
+		}
+		if (token.type === "text") {
+			const text = (token as { text?: unknown }).text;
+			if (typeof text === "string" && (text.includes("[") || text.includes("<"))) {
+				return true;
+			}
+			if (emphasisContentHasOpenBracket((token as { tokens?: Token[] }).tokens)) {
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 /**
@@ -452,8 +536,9 @@ function backtickParity(text: string, from = 0, to = text.length): number {
  *   P4 (marked 18.0.7) shows start-of-tail is flank-equivalent to a space for
  *   emphasis/codespan/link/del openers;
  * - every text token in [minRel, cut) is plain and free of INLINE_DELIM_CHARS,
- *   so no unmatched opener waits in the prefix for a closer in the tail
- *   (construct tokens are closed by definition and append-stable);
+ *   so no unmatched opener waits in the prefix for a closer in the tail, and
+ *   every strong/em/del token is free of nested link/tag openers, so no mask
+ *   span completed in the tail can un-type it (emphasisContentHasOpenBracket);
  * - minRel onward is the only region examined: [0, minRel) was verified when
  *   the cut last advanced, and the check there is inductive.
  */
@@ -485,7 +570,23 @@ function findSafeInlineCut(tokens: Token[], text: string, minRel: number): numbe
 					candidate = undefined;
 				}
 			}
-			// Closed construct: append-stable, nothing to scan, no cut inside.
+			// Closed construct: append-stable unless the tail can still re-type it
+			// through the emphasis mask (emphasisContentHasOpenBracket); no cut
+			// inside either way.
+			if (
+				(token.type === "strong" || token.type === "em" || token.type === "del") &&
+				emphasisContentHasOpenBracket((token as { tokens?: Token[] }).tokens)
+			) {
+				prefixClean = false;
+			}
+			// A "$$" or "\[" inside ANY prefix token (inlineMath, codespan, ...)
+			// is a block-level opener the spliced single-paragraph stream hides
+			// from marked's startBlock interruption; a closer in the tail would
+			// re-type the block from that opener. Text tokens are already covered
+			// by INLINE_DELIM_CHARS ("$" and "\").
+			if (raw.includes("$$") || raw.includes("\\[")) {
+				prefixClean = false;
+			}
 			continue;
 		}
 		const plain = (token as { text?: unknown }).text === raw;
@@ -843,12 +944,11 @@ export class Markdown implements Component {
 		) {
 			return undefined;
 		}
-		// A dangling backtick anywhere in the paragraph can re-type emphasis inside
-		// the verified prefix (see backtickParity); odd frames fall back to a full
-		// lex, which also re-bootstraps this state from the corrected tokens. The
-		// prefix parity is cached (the startsWith above verified those bytes), so
-		// only [cut, end) is scanned per frame.
-		if ((split.parity ^ backtickParity(normalizedText, split.cut)) === 1) {
+		// A backtick run the emphasis mask has not absorbed can still be paired by
+		// later text, re-typing emphasis inside the verified prefix without any
+		// token crossing the cut (see emphasisMask); such frames fall back to a
+		// full lex, which also re-bootstraps this state from the corrected tokens.
+		if (hasUnmaskedBacktick(normalizedText.slice(split.paraFrom))) {
 			return undefined;
 		}
 		const tail = normalizedText.slice(split.cut);
@@ -904,7 +1004,7 @@ export class Markdown implements Component {
 			junctionIndex <= inlineTokens.length &&
 			(!junctionMerged || typeof lastPrefixRaw === "string")
 		) {
-			this.splitLexEngaged = { epoch: split.epoch, cutRel, parity: split.parity, junctionIndex, junctionStart };
+			this.splitLexEngaged = { epoch: split.epoch, cutRel, junctionIndex, junctionStart };
 		}
 		// marked strips exactly one trailing "\n" from a paragraph's text (probe
 		// P1); the prefix tiles the source exactly (induction), so the merged
@@ -934,7 +1034,6 @@ export class Markdown implements Component {
 					prefixTokens,
 					prefix: normalizedText.slice(0, cut),
 					epoch: split.epoch,
-					parity: split.parity ^ backtickParity(normalizedText, split.cut, cut),
 				};
 			}
 		}
@@ -990,7 +1089,6 @@ export class Markdown implements Component {
 			prefixTokens,
 			prefix: normalizedText.slice(0, cut),
 			epoch: this.splitLexEpoch,
-			parity: backtickParity(normalizedText, paraFrom, cut),
 		};
 	}
 
@@ -1394,24 +1492,22 @@ export class Markdown implements Component {
 			this.finalBlockSeal = undefined;
 		}
 		if (!seal) {
-			seal = { blockType: "paragraph", source: "", tailFrom: 0, lines: [], width, capsVersion, parity: 0 };
+			seal = { blockType: "paragraph", source: "", tailFrom: 0, lines: [], width, capsVersion };
 			this.finalBlockSeal = seal;
 		}
-		// A dangling backtick can re-type sealed emphasis without any token
-		// crossing the seal boundary (see backtickParity), so seal only while every
-		// backtick in the paragraph is paired. The prefix parity is cached: the
-		// split-lex frame carries the parity of its verified prefix [0, cutRel);
-		// otherwise the seal's own prefix [0, tailFrom) is startsWith-verified.
-		// Either way only the unverified tail is scanned per frame.
+		// A backtick run the emphasis mask has not absorbed can still be paired by
+		// later text, re-typing sealed emphasis without any token crossing the
+		// seal boundary (see emphasisMask), so the seal is served only while no
+		// such run exists; the seal rebuilds itself from the corrected tokens on
+		// the next clean frame. A split-lex frame already ran this check on the
+		// same paragraph text.
 		const engaged = this.splitLexEngaged;
-		const prefixParity = engaged !== undefined ? engaged.parity : (seal.parity ?? 0);
-		const parityFrom = engaged !== undefined ? engaged.cutRel : seal.tailFrom;
-		if ((prefixParity ^ backtickParity(text, parityFrom)) === 1) {
+		if (engaged === undefined && hasUnmaskedBacktick(text)) {
 			this.finalBlockSeal = undefined;
 			return undefined;
 		}
 		if (seal.tailFrom > 0 && !this.paragraphSealIntact(inlineTokens, seal.tailFrom)) {
-			seal = { blockType: "paragraph", source: "", tailFrom: 0, lines: [], width, capsVersion, parity: 0 };
+			seal = { blockType: "paragraph", source: "", tailFrom: 0, lines: [], width, capsVersion };
 			this.finalBlockSeal = seal;
 		}
 		const target = this.lastSealableParagraphOffset(inlineTokens, text, seal);
@@ -1431,7 +1527,6 @@ export class Markdown implements Component {
 				this.finalBlockSeal = undefined;
 				return undefined;
 			}
-			seal.parity = (seal.parity ?? 0) ^ backtickParity(text, seal.tailFrom, target);
 			seal.lines.push(...extension);
 			seal.source = text.slice(0, target);
 			seal.tailFrom = target;

@@ -136,6 +136,47 @@ describe("markdown incremental lex equivalence", () => {
 		assert.strictEqual(streamed.render(80).join("\n"), renderLines(doc, 80).join("\n"));
 	});
 
+	it("a blockMath opener in the kept prefix keeps the lex cache from cutting", () => {
+		// BLOCK_MATH_REGEX content spans blank lines, so a closer arriving after
+		// the cache cut re-types the kept prefix from the opener onward (the
+		// whole document becomes one blockMath); a cached cut after the opener
+		// would serve the stale paragraph split forever.
+		const doc =
+			"\\[z\\] [a link](https://example.com) \n\nescaped \\` backtick www.autolink.example \\(x+y\\) math \\[z\\] ";
+		const streamed = new Markdown("", 1, 0, defaultMarkdownTheme);
+		for (let pos = 1; pos <= doc.length; pos += 5) {
+			const text = doc.slice(0, pos);
+			streamed.setText(text);
+			assert.strictEqual(streamed.render(80).join("\n"), renderLines(text, 80).join("\n"), `frame at ${pos}`);
+		}
+		streamed.setText(doc);
+		assert.strictEqual(streamed.render(80).join("\n"), renderLines(doc, 80).join("\n"), "final frame");
+		// Same shape with both kill switches: the block-level cache alone must
+		// refuse the cut (no seal or split state involved).
+		const previousSeal = process.env.PI_MARKDOWN_LINE_SEAL;
+		const previousSplit = process.env.PI_MARKDOWN_SPLIT_LEX;
+		process.env.PI_MARKDOWN_LINE_SEAL = "0";
+		process.env.PI_MARKDOWN_SPLIT_LEX = "0";
+		try {
+			const plain = new Markdown("", 1, 0, defaultMarkdownTheme);
+			plain.setText(doc.slice(0, 39));
+			plain.render(80);
+			plain.setText(doc);
+			assert.strictEqual(plain.render(80).join("\n"), renderLines(doc, 80).join("\n"), "kill-switch frame");
+		} finally {
+			if (previousSeal === undefined) {
+				delete process.env.PI_MARKDOWN_LINE_SEAL;
+			} else {
+				process.env.PI_MARKDOWN_LINE_SEAL = previousSeal;
+			}
+			if (previousSplit === undefined) {
+				delete process.env.PI_MARKDOWN_SPLIT_LEX;
+			} else {
+				process.env.PI_MARKDOWN_SPLIT_LEX = previousSplit;
+			}
+		}
+	});
+
 	it("width changes invalidate cleanly against a full re-lex", () => {
 		const doc = buildDoc(prng(0x51d7), 14);
 		const streamed = new Markdown("", 1, 0, defaultMarkdownTheme);

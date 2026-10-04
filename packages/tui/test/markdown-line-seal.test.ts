@@ -207,6 +207,25 @@ describe("markdown final-block line sealing identity", () => {
 		assertStreamedIdentity("b `*ex``f*`*y*gh\n x`*y** ``` gh", 86, 1);
 	});
 
+	it("a codespan completed at the tail un-pairing sealed emphasis drops the seal", () => {
+		// marked evaluates emphasis on a codespan-masked copy of the whole
+		// paragraph, and the mask's pairing (blockSkip) differs from the real
+		// codespan rule, so a codespan completed at the tail can flip the mask
+		// over emphasis already sealed as bold - with an even backtick count, no
+		// token crossing the seal boundary, and a byte-stable prefix. Frame A
+		// seals "**b**" as bold; frame B's true rendering has it plain.
+		const frameA = "`**a**\n`` `\n**b**\n**b*";
+		const frameB = "`**a**\n`` `\n**b**\n**b**\n`c`";
+		const streamed = new Markdown("", 1, 0, defaultMarkdownTheme);
+		streamed.setText(frameA);
+		assert.strictEqual(streamed.render(80).join("\n"), full(frameA, 80));
+		streamed.setText(frameB);
+		assert.strictEqual(streamed.render(80).join("\n"), full(frameB, 80));
+		// Multi-character chunks skip the intermediate frames whose odd backtick
+		// count used to force a seal rebuild; identity must hold at step 3 too.
+		assertStreamedIdentity(frameB, 80, 3);
+	});
+
 	it("narrow width stress on a mixed document", () => {
 		const doc = `${PROSE_LINE}\n\n- list item one\n- list item two\n\n${PROSE_LINE.slice(0, 90)}`;
 		assertStreamedIdentity(doc, 24, 3);

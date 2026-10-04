@@ -1,0 +1,2 @@
+- Fixed stale sealed lines when a codespan or link completed at the stream tail re-paired already-sealed emphasis through marked's global emphasis mask.
+- Fixed the incremental lex cache keeping paragraphs that a display-math opener (`$$` or `\[`) could re-type once its closer streamed in across blank lines.

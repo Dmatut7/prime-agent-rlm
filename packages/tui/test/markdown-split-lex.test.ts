@@ -108,6 +108,42 @@ describe("markdown split-lex streaming identity", () => {
 		assertStreamedIdentity(`${PAD} \`zx\`\`*e\`*e* ghgh\nx\` tail \`end\` done`, 80, true);
 	});
 
+	it("codespan completed in the tail un-pairing a verified-prefix strong falls back", () => {
+		// Even-parity variant of the mask flip: the blockSkip mask pairs the trap
+		// runs differently from the real codespan rule, so both frames have an
+		// even backtick count while the strong inside the verified prefix still
+		// re-types. The split must refuse to serve the stale prefix tokens.
+		const trapA = `${PAD} \`**a**\n\`\` \`\n**b**\n${"clean prose words here and more ".repeat(4)}**b*`;
+		const trapB = `${trapA}**\n\`c\``;
+		const streamed = new Markdown("", 1, 0, defaultMarkdownTheme);
+		for (let pos = 2000; pos < trapA.length; pos += 211) {
+			streamed.setText(trapA.slice(0, pos));
+			streamed.render(80);
+		}
+		streamed.setText(trapA);
+		assert.strictEqual(streamed.render(80).join("\n"), full(trapA, 80, false));
+		streamed.setText(trapB);
+		assert.strictEqual(streamed.render(80).join("\n"), full(trapB, 80, false));
+	});
+
+	it("link completed in the tail re-typing a verified-prefix strong falls back", () => {
+		// The emphasis mask also hides link spans: a `[` inside a prefix strong
+		// starts a mask span once the tail completes the link, hiding the
+		// strong's own delimiters - the strong un-types with no token crossing
+		// the cut and no backtick involved.
+		const trapA = `${PAD} x **a [ b** c`;
+		const trapB = `${trapA}](u)`;
+		const streamed = new Markdown("", 1, 0, defaultMarkdownTheme);
+		for (let pos = 2000; pos < trapA.length; pos += 211) {
+			streamed.setText(trapA.slice(0, pos));
+			streamed.render(80);
+		}
+		streamed.setText(trapA);
+		assert.strictEqual(streamed.render(80).join("\n"), full(trapA, 80, false));
+		streamed.setText(trapB);
+		assert.strictEqual(streamed.render(80).join("\n"), full(trapB, 80, false));
+	});
+
 	it("late closer for an early unmatched opener", () => {
 		// The early `*` poisons split advancement past it; identity must hold
 		// through the frame where the closer re-types the whole prefix.
