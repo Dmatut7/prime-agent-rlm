@@ -143,6 +143,31 @@ describe("compaction window follows the session model", () => {
 		expect(harness.eventsOfType("compaction_start")).toEqual([]);
 	});
 
+	it("a per-model off entry suppresses the trigger while the bare enabled switch stays on", async () => {
+		const harness = await createWindowHarness();
+		seedContext(harness);
+		const narrow = harness.getModel("faux-narrow");
+		await harness.session.setModel(narrow!);
+		// Over the narrow model's trigger, but this model's own entry says off.
+		harness.session.settingsManager.setCompactionEnabledForModel("faux/faux-narrow", false);
+		harness.setResponses([fauxAssistantMessage("plain answer")]);
+
+		await harness.session.prompt("next question");
+		await harness.session.waitForIdle();
+
+		expect(harness.eventsOfType("compaction_start")).toEqual([]);
+
+		// Flipping the entry back on re-arms the trigger on the next turn.
+		harness.session.settingsManager.setCompactionEnabledForModel("faux/faux-narrow", true);
+		// Turn 1's small reply moved the usage anchor; re-seed so the next
+		// admission reads an over-threshold context again.
+		seedContext(harness);
+		harness.setResponses([seededAssistant()]);
+		await harness.session.prompt("again");
+		await harness.session.waitForIdle();
+		expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toContain("threshold");
+	});
+
 	it("follows the registry when the provider re-reports a smaller window mid-session", async () => {
 		const harness = await createWindowHarness();
 		seedContext(harness);

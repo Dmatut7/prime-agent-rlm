@@ -241,7 +241,7 @@ export class SettingsSelectorComponent extends Container {
 			{
 				id: "autocompact",
 				label: "自动压缩",
-				description: "上下文太长时自动压缩",
+				description: "上下文太长时自动压缩（按当前模型保存；无条目的模型跟随全局默认）",
 				currentValue: config.autoCompact ? "true" : "false",
 				values: ["true", "false"],
 			},

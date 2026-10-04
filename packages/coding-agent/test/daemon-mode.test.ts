@@ -9895,7 +9895,10 @@ describe("daemon mode helpers", () => {
 			modelId: "faux-2",
 		});
 
-		expect(setModel).toHaveBeenCalledWith(model, { waitForExtensions: false });
+		expect(setModel).toHaveBeenCalledWith(model, {
+			waitForExtensions: false,
+			changeNotice: { origin: "daemon_command", token: expect.any(String) },
+		});
 	});
 
 	it("waits for model_select extension handlers when setting models while idle", async () => {
@@ -9952,7 +9955,10 @@ describe("daemon mode helpers", () => {
 			modelId: "faux-2",
 		});
 
-		expect(setModel).toHaveBeenCalledWith(model, { waitForExtensions: true });
+		expect(setModel).toHaveBeenCalledWith(model, {
+			waitForExtensions: true,
+			changeNotice: { origin: "daemon_command", token: expect.any(String) },
+		});
 	});
 
 	it("cycles models without waiting for model_select extension handlers while running", async () => {
@@ -10006,7 +10012,10 @@ describe("daemon mode helpers", () => {
 			direction: "backward",
 		});
 
-		expect(cycleModel).toHaveBeenCalledWith("backward", { waitForExtensions: false });
+		expect(cycleModel).toHaveBeenCalledWith("backward", {
+			waitForExtensions: false,
+			changeNotice: { origin: "daemon_command", token: expect.any(String) },
+		});
 	});
 
 	it("waits for model_select extension handlers when cycling models while idle", async () => {
@@ -10059,7 +10068,10 @@ describe("daemon mode helpers", () => {
 			activeSessionId: state.activeSessionId,
 		});
 
-		expect(cycleModel).toHaveBeenCalledWith(undefined, { waitForExtensions: true });
+		expect(cycleModel).toHaveBeenCalledWith(undefined, {
+			waitForExtensions: true,
+			changeNotice: { origin: "daemon_command", token: expect.any(String) },
+		});
 	});
 
 	it("validates active sessions before reading a heartbeat", async () => {
@@ -10370,6 +10382,9 @@ function makePersistedRlmDaemonFixture(
 			hasRunningRlmChildren: () => false,
 			getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
 			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+			// The snapshot reads the per-model compaction switch through the
+			// settings side now (wave-42); the stub answers "on" like a bare config.
+			settingsManager: { getCompactionEnabledForModel: () => true },
 			acceptAgentMessagePrompt,
 		});
 		return {

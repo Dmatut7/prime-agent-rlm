@@ -43,7 +43,9 @@ export function createAgentConnectionState(
 		sessionName: session.sessionName,
 		sessionDir: sessionManager.getSessionDir(),
 		leafId: sessionManager.getLeafId(),
-		autoCompactionEnabled: session.autoCompactionEnabled,
+		autoCompactionEnabled: session.settingsManager.getCompactionEnabledForModel(
+			session.model ? `${session.model.provider}/${session.model.id}` : undefined,
+		),
 		messageCount: session.messages.length,
 		sessionActions: session.getSessionActionSnapshot(),
 		compactionCount: sessionManager.getEntries().filter((entry) => entry.type === "compaction").length,

@@ -545,7 +545,11 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async setAutoCompactionEnabled(enabled: boolean): Promise<void> {
-		this.session.setAutoCompactionEnabled(enabled);
+		const model = this.session.model;
+		this.session.settingsManager.setCompactionEnabledForModel(
+			model ? `${model.provider}/${model.id}` : undefined,
+			enabled,
+		);
 	}
 
 	async setAutoRetryEnabled(enabled: boolean): Promise<void> {

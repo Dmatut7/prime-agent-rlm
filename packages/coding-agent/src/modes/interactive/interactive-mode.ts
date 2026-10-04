@@ -3616,10 +3616,14 @@ export class InteractiveMode {
 		// ratio over the model's effective input limit, minus the reserve
 		// ceiling. A disabled threshold (settings off, or the reserve consuming
 		// the whole base) renders neither; the 80% default is just the default.
+		// The on/off follows the per-model resolution, same as the state snapshot.
 		const compactionSettings = settingsManager?.getCompactionSettings?.();
+		const compactionEnabled = settingsManager?.getCompactionEnabledForModel?.(
+			model ? `${model.provider}/${model.id}` : undefined,
+		);
 		const windowTokens = usage?.contextWindow ?? 0;
 		const thresholdTokens =
-			compactionSettings && (compactionSettings.enabled ?? true) && windowTokens > 0
+			compactionSettings && (compactionEnabled ?? true) && windowTokens > 0
 				? compactionThresholdTokens(
 						windowTokens,
 						compactionSettings,

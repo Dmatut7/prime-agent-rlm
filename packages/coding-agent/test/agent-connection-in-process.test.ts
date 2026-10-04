@@ -19,6 +19,9 @@ type RuntimeBeforeInvalidateCallback = Parameters<AgentSessionRuntime["setBefore
 
 interface FakeSessionControl {
 	session: RuntimeSession;
+	compactionPerModel: Map<string, boolean>;
+	compactionPerModelWrites: Array<[string | undefined, boolean]>;
+	compactionGlobalWrites: boolean[];
 	listenerCount(): number;
 	unsubscribeCount(): number;
 	emit(event: AgentSessionEvent): void;
@@ -72,9 +75,16 @@ function userMessage(text: string, timestamp: number): AgentMessage {
 	};
 }
 
-function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionControl {
+function createFakeSession(
+	id: string,
+	messages: AgentMessage[],
+	options: { model?: { provider: string; id: string } } = {},
+): FakeSessionControl {
 	const listeners = new Set<AgentSessionEventListener>();
 	let unsubscriptions = 0;
+	const compactionPerModel = new Map<string, boolean>();
+	const compactionPerModelWrites: Array<[string | undefined, boolean]> = [];
+	const compactionGlobalWrites: boolean[] = [];
 	const thinkingLevel: AgentConnectionState["thinkingLevel"] = "medium";
 	const buildSessionContext = () => ({
 		messages,
@@ -123,7 +133,7 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 			buildSessionContext,
 		},
 		buildSessionContext,
-		model: undefined,
+		model: options.model,
 		thinkingLevel,
 		getAvailableThinkingLevels: () => ["minimal", "low", "medium", "high", "xhigh"],
 		isStreaming: false,
@@ -135,6 +145,23 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 		sessionId: id,
 		sessionName: `${id} name`,
 		autoCompactionEnabled: true,
+		// Settings-side collaborator: the connection resolves and writes the
+		// auto-compaction switch through the settings manager (per serving model),
+		// never through the session's own flag.
+		settingsManager: {
+			getCompactionEnabled: () => true,
+			getCompactionEnabledForModel: (modelKey: string | undefined) =>
+				(modelKey !== undefined ? compactionPerModel.get(modelKey) : undefined) ?? true,
+			setCompactionEnabled: (enabled: boolean) => {
+				compactionGlobalWrites.push(enabled);
+			},
+			setCompactionEnabledForModel: (modelKey: string | undefined, enabled: boolean) => {
+				compactionPerModelWrites.push([modelKey, enabled]);
+				if (modelKey !== undefined) {
+					compactionPerModel.set(modelKey, enabled);
+				}
+			},
+		},
 		messages,
 		getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
 		goalState: emptyGoalState(),
@@ -169,6 +196,9 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 
 	return {
 		session,
+		compactionPerModel,
+		compactionPerModelWrites,
+		compactionGlobalWrites,
 		listenerCount: () => listeners.size,
 		unsubscribeCount: () => unsubscriptions,
 		emit(event: AgentSessionEvent) {
@@ -528,5 +558,31 @@ describe("initial snapshot quotaPark", () => {
 		expect(snapshot.quotaPark).toBeUndefined();
 		expect("quotaPark" in snapshot).toBe(false);
 		expect(snapshot.messages).toEqual([userMessage("teardown", 1)]);
+	});
+
+	it("writes the serving model's per-model entry when auto-compaction is toggled", async () => {
+		const session = createFakeSession("per-model", [userMessage("hi", 1)], {
+			model: { provider: "openai", id: "gpt-5.1" },
+		});
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+
+		await connection.setAutoCompactionEnabled(false);
+
+		expect(session.compactionGlobalWrites).toEqual([]);
+		expect(session.compactionPerModelWrites).toEqual([["openai/gpt-5.1", false]]);
+
+		const state = await connection.getState();
+		expect(state.autoCompactionEnabled).toBe(false);
+	});
+
+	it("defers to the settings side's bare default when the toggle fires with no model in service", async () => {
+		const session = createFakeSession("no-model", [userMessage("hi", 1)]);
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+
+		await connection.setAutoCompactionEnabled(false);
+
+		// No model, no key: the settings manager owns the fallback to the bare default.
+		expect(session.compactionPerModelWrites).toEqual([[undefined, false]]);
+		expect(session.compactionGlobalWrites).toEqual([]);
 	});
 });

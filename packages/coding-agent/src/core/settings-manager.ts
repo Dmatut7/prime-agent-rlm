@@ -215,6 +215,13 @@ export const DEFAULT_AGENT_MESSAGE_TARGET_WAIT_SECONDS = 120;
 
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
+	/**
+	 * Per-model overrides keyed "provider/id" (the recentModels convention): the
+	 * toggle writes the serving model's entry, and models without an entry keep
+	 * following the bare `enabled` default, so older settings files need no
+	 * migration.
+	 */
+	perModel?: Record<string, boolean>;
 	reserveTokens?: number; // default: 16384
 	keepRecentTokens?: number; // default: 20000
 	agentCallable?: boolean; // default: true - expose the compact skill so the model can request compaction
@@ -1189,6 +1196,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	theme: null,
 	compaction: [
 		"enabled",
+		"perModel",
 		"reserveTokens",
 		"keepRecentTokens",
 		"agentCallable",
@@ -2809,6 +2817,40 @@ export class SettingsManager {
 		}
 		this.globalSettings.compaction.enabled = enabled;
 		this.markModified("compaction", "enabled");
+		this.save();
+	}
+
+	/**
+	 * The on/off value for one serving model: its per-model entry wins, models
+	 * without an entry follow the bare `compaction.enabled` default. A hand-edited
+	 * entry is still read through `readBooleanSetting`; an entry that says nothing
+	 * usable defers to the default instead of forcing the switch on.
+	 */
+	getCompactionEnabledForModel(modelKey: string | undefined): boolean {
+		if (modelKey !== undefined) {
+			const entry = this.settings.compaction?.perModel?.[modelKey];
+			if (entry !== undefined) {
+				return readBooleanSetting(entry, this.getCompactionEnabled()).value;
+			}
+		}
+		return this.getCompactionEnabled();
+	}
+
+	/**
+	 * The toggle writes the serving model's entry; the bare `enabled` key stays
+	 * the default for models without one. With no model in service there is no
+	 * key to write, so the default itself is set.
+	 */
+	setCompactionEnabledForModel(modelKey: string | undefined, enabled: boolean): void {
+		if (modelKey === undefined) {
+			this.setCompactionEnabled(enabled);
+			return;
+		}
+		if (!this.globalSettings.compaction) {
+			this.globalSettings.compaction = {};
+		}
+		this.globalSettings.compaction.perModel = { ...this.globalSettings.compaction.perModel, [modelKey]: enabled };
+		this.markModified("compaction", "perModel");
 		this.save();
 	}
 

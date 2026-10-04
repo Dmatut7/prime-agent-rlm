@@ -50,6 +50,10 @@ function makeSession() {
 		isCompacting: false,
 		isBashRunning: false,
 		autoCompactionEnabled: false,
+		settingsManager: {
+			getCompactionEnabled: () => false,
+			getCompactionEnabledForModel: () => false,
+		},
 		goalState: undefined,
 		scopedModels: [],
 		getActiveToolNames: () => [] as string[],

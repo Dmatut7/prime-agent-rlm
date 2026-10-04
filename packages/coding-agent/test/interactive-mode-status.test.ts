@@ -3479,6 +3479,10 @@ function createFakeConnectionSession(commandName: string): AgentSessionRuntime["
 		followUpMode: "all",
 		sessionId: commandName,
 		autoCompactionEnabled: true,
+		settingsManager: {
+			getCompactionEnabled: () => true,
+			getCompactionEnabledForModel: () => true,
+		},
 		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 		getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
 		goalState: emptyGoalState(),
