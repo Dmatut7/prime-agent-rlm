@@ -1,3 +1,14 @@
+## 2026-10-04 wave-50 八路：supervisor 第二刀、F2 根治、病态语料抓真 bug、画像全面变快
+
+- daemon-supervisor.ts 第二刀：adoption 收编簇 12 方法/234 行拆入 daemon-supervisor-adoption.ts（336 行，DaemonAdoptionState 状态座 + 13 成员只读 Host），supervisor 11296→11135 留 5 壳；死 API adoptingSessionWorkers 删，2 测试文件 8 处夹具机械改，211 测试前后逐名一致。九簇评分表落 /tmp/wave50/supervisor-cut2.md；roster-sync 债具体化（9 私有成员 ~95 站 5 文件，收债方案 A=改走 handleWorkerFrame/handleList 公开缝）。
+- F2 根治：Alt+Up 首按假死——入口落在 chatContainer 末尾的启动警告行（hint 无形）；FocusableTextBlock 新增 navigationEntryTarget，showWarning 行不作入口（出错行行为不变，锁定测试拦下初版一刀切）。keys.ts：isKeyRelease/isKeyRepeat 认出带 text 节的 `:3;`/`:2;` 事件（Ghostty release-带-text 形态，原靠 tui.ts 单层防御）。
+- 病态语料 fixture 抓真 bug：F6 三类语料（未闭合 <script>/深嵌 ${/tab+C1+CRLF）× 1/3/7/16 切块逐帧对拍，抓出 wrap seal 只校验前缀、math 重类型后 sealed 行陈旧（帧 296 等 4 处漂移）——markdown.ts +46/−11 加整行 append 校验，先红后绿，tui 1288/1288。
+- zai 目录：真缺口仅 glm-5.1（调研说缺 5.1~5.3 有误，工兵纠正——5.2/5.3 本就在）；generate-models.ts flashx 特例泛化为 paas 专属列表，zai 8→9，顺带吸收上游漂移 + kimi-k3 价 pin 0.99→0.72（live 核价）。
+- 性能画像复测（对照 wave-10 基线，5 次中位）：daemon 冷启 149ms（−40%，compile cache 落地）；RPC 暖 357ms（−54%）；TUI 首帧暖 343ms（−29%）；每会话边际内存 ~145MB（−27%）；slim attach −88.3% 持平。冷隔离口径 +40%/+101% 系方法学成本非用户面。
+- 走查：F1 修复实机回归通过（两档 + 连按 5 次稳定）；矩阵 P0 六格全过；resume 提示带旗标差异确认为 wave-47 修复生效。发现 alt+x 停止语义特性（首击状态→二击武装→窗口期补击；慢连击不落停），记档。
+- 调研 9 条带 URL：Opus 5.5 缓存三件套（子代理继承父 cache）；Codex v0.145 渲染管线解剖 + deepseek 增量 mdast「冻结到倒数第二块」位置判据（直接喂 R3 流式放大方案，finalize reflow 愈合点三方互证）；Codex 0.159/0.160 history-aware 暖池预暖（我们裸暖池的升级方向）+ Guardian 召回同构；kitty 小帧直通；2027 框架层采纳扩大（tamboui/æsh/libghostty-vt）+「意愿非保证」校正表论证。
+- 门禁：check EXIT 0、hygiene OK、单测 9822 绿、suite 1729 绿、tui 1288 绿、ai 792 绿。需要重新编译并重启后才生效。
+
 ## 2026-10-04 wave-49 四路：F1 恢复会话展开键死键修复、keys 字节级 fixture、记忆红线落档
 
 - F1（老板痛点「展开的思考多按几下有 bug」实锤修复）：根因不是首席嫌疑（latestShownTurnSummary 无辜）——fullscreen 窗口粘尾，恢复会话的 turn 头在窗口上方，盒在屏外展开、帧 diff 逐行相同 → 键看起来死了。修复：TURN_KEY_REVEAL_MARKER + armRevealMarker()（turn-activity.ts），C-o/C-t/C-p 及 Alt 全局分支接入 revealTurnAfterKeyToggle；块导航 Enter 传 reveal:false 防窗口被拽离焦点块。先红后绿（pristine 7 红 → 8 绿）+ 实机 tmux 验证 + 波及 400+ 例全绿。

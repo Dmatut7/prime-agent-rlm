@@ -14,12 +14,13 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
 超大集群：活大就放开派，产物落盘 /tmp 归档。
 重构门槛：触发证据 + 研究清楚现状为什么是这样（git 历史/决策文档/上游对照）+ A/B 对照 + 全量门禁。
 
-## 当前状态（2026-10-04，wave-49 已 SHIP）
+## 当前状态（2026-10-04，wave-50 已 SHIP）
 
-- HEAD = 见 git log（keys fixture 批 + F1 修复批 + 文档批）。
-- wave-49：F1 恢复会话展开键死键修复（reveal marker，先红后绿+实机验证）；keys.ts 四字节 fixture
-  首跑即绿（无 CC #92021 病）+ repeat 非保证注释；记忆红线落档（无模型调用/OpenHands 截断三则）。
-  exec.test.ts 截断测试抖动一例进负载族观察名单。
+- HEAD = 见 git log（六批：keys release 识别、F2 根治、wrap seal 修复+病态语料、zai glm-5.1、
+  adoption 拆刀、文档）。
+- wave-50：supervisor 二刀 11296→11135（adoption 簇）；F2 根治；markdown wrap seal 真 bug 修复
+  （病态语料对拍抓出）；zai+glm-5.1；画像对照 wave-10 全面变快（冷启 −40%/RPC −54%/首帧 −29%/内存 −27%）。
+- 画像基线更新：冷启 149ms、RPC 357ms、首帧 343ms、每会话 ~145MB（wave-50 中位）。
 - 恢复指令：读 Backlog + 下一波主题。
 
 ## 波次日志（0~8 详见 swarm-loop-plan-20261001.md）
@@ -100,11 +101,12 @@ AUDIT → RESEARCH → PLAN → BUILD → VERIFY → REVIEW → SHIP → NEXT，
   把在跑会话归档。犯了就是事故，写进 FORK_NOTES 向老板披露。
 - 并行纪律实证：wave-10 期间 3 席各自报告 ledger 被「别人」改——都是主席在写；lane 一律不写仓内文件。
 
-## 下一波主题（wave-50 候选）
+## 下一波主题（wave-51 候选）
 
-1. 【supervisor 拆刀第二刀】live-facade 模式已成（wave-48 暖池首刀），挑下一簇；roster-sync 需先收
-   prototype-harness 私有直驱测试债；委托签名上 Parameters<>/ReturnType<> 派生（调研 E9）。
-2. 【体验走查常规化】矩阵 v1 全格过，F  lane 留的尾巴：kitty 原生终端 repeat 激活档对照走查、
-   F2（Alt+Up 首按 1 格残影）根治、isKeyRelease 带 text 节识别。
-3. 【性能画像】backlog #9 流式全量重发 1.14GB 放大仍未动（需设计）；attach 延迟与冷启数字半年没复测。
-4. 【老板挂账】安全簇勾选、第 0 条历史改写、记忆帽三选一。
+1. 【R3 流式放大方案设计】backlog #9（10 万字符→1.14GB）：调研已备料——「冻结到倒数第二块」位置判据
+   （deepseek mdast 解剖）、内容哈希替 startsWith、finalize reflow 愈合点三方互证；出设计稿再动工。
+2. 【roster-sync 收债】95 站 5 文件改走 handleWorkerFrame/handleList 公开缝（方案 A），收完拆第三刀；
+   顺带 supervisor 候选队列：update-restart、reaper+retention。
+3. 【暖池升级】history-aware prewarm（Codex 0.159 手法）评估：按历史使用模式给空闲线程预暖。
+4. 【考题集运营】EX-3 改宽告警带（>2× 基线或判分转红才立案），turns/形状作稳定信号（wave-48 D 建议）。
+5. 【老板挂账】安全簇勾选、第 0 条历史改写、记忆帽三选一。
