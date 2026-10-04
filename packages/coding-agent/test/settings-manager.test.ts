@@ -1010,6 +1010,75 @@ describe("SettingsManager", () => {
 			}
 		});
 
+		it("resolves the tool-not-found breaker settings, passing unset fields through to the loop defaults", () => {
+			// Unset block: the loop owns every default (warn 3, terminate 5, decay 1,
+			// recovery budget 3), so the resolved object carries nothing.
+			expect(SettingsManager.create(projectDir, agentDir).getToolNotFoundBreakerSettings()).toEqual({});
+
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					tools: {
+						notFoundBreaker: {
+							enabled: false,
+							warnAfter: 2,
+							terminateAfter: 4,
+							decayPerResolvedCall: 0,
+							recoveryTurns: 5,
+						},
+					},
+				}),
+			);
+			expect(SettingsManager.create(projectDir, agentDir).getToolNotFoundBreakerSettings()).toEqual({
+				enabled: false,
+				warnAfter: 2,
+				terminateAfter: 4,
+				decayPerResolvedCall: 0,
+				recoveryTurns: 5,
+			});
+		});
+
+		it("registers every tools.notFoundBreaker key so none reads as unknown", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					tools: {
+						notFoundBreaker: {
+							enabled: true,
+							warnAfter: 3,
+							terminateAfter: 5,
+							decayPerResolvedCall: 1,
+							recoveryTurns: 3,
+						},
+					},
+				}),
+			);
+			expect(collectUnknownSettingsKeys(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf8")))).toEqual(
+				[],
+			);
+			// Misspelled keys stay visible instead of silently doing nothing.
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ tools: { notFoundBreaker: { warnAfterX: 1 } } }),
+			);
+			expect(collectUnknownSettingsKeys(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf8")))).toEqual([
+				"tools.notFoundBreaker.warnAfterX",
+			]);
+		});
+
+		it("warns on a non-boolean tools.notFoundBreaker.enabled like every other on/off setting", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ tools: { notFoundBreaker: { enabled: "yes" } } }),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+			const messages = manager
+				.drainWarnings()
+				.map((warning) => warning.message)
+				.join("\n");
+			expect(messages).toContain("tools.notFoundBreaker.enabled");
+		});
+
 		it("registers every r4 key so none reads as unknown", () => {
 			writeFileSync(
 				join(agentDir, "settings.json"),

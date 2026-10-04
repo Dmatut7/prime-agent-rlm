@@ -9,12 +9,14 @@
  *
  * The loop answers every unknown-tool call with the available tool names and a
  * did-you-mean suggestion, warns on the receipt at N (default 3) unknown-tool calls,
- * and at M (default 5) grants one recovery turn instead of ending the run outright:
- * a resolved call (or a clean stop) closes the episode and resets the counts, while
- * a single further unknown-tool call inside the recovery turn ends the run with a
- * classified terminal error - the non-retryable class, so a broken model is not
- * re-fed the same context. Per-name counts decay by one per resolved call, so C2's
- * isolated relapse warns instead of ending a long task (wave-40).
+ * and at M (default 5) grants a recovery turn instead of ending the run outright:
+ * a resolved call (or a clean stop) closes the episode and resets the counts. Every
+ * trigger - the limit hit or a relapse inside an open recovery turn - spends one of
+ * the per-run recovery budget (default 3), and the run ends with a classified
+ * terminal error - the non-retryable class, so a broken model is not re-fed the
+ * same context - only once that budget is spent. Per-name counts decay by one per
+ * resolved call, so C2's isolated relapse warns instead of ending a long task
+ * (wave-40; per-run recovery budget added 2026-10).
  */
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { TOOL_NOT_FOUND_BREAKER_STOP_REASON_RAW } from "@earendil-works/pi-agent-core";
@@ -119,7 +121,7 @@ describe("W11-C tool-not-found breaker", () => {
 		expect(harness.faux.state.callCount).toBe(3);
 	});
 
-	it("C1: five same-name failures grant one recovery turn; the relapse inside it ends the run", async () => {
+	it("C1: five same-name failures grant a recovery turn; relapses spend the per-run budget (3) before the run ends", async () => {
 		const ipythonTool: AgentTool = {
 			name: "ipython",
 			label: "ipython",
@@ -129,21 +131,24 @@ describe("W11-C tool-not-found breaker", () => {
 		};
 		const harness = await harnessWithTools([ipythonTool, echoTool]);
 		harness.setResponses(
-			Array.from({ length: 7 }, () =>
+			Array.from({ length: 9 }, () =>
 				fauxAssistantMessage([fauxToolCall("ipython</arg_value>", {})], { stopReason: "toolUse" }),
 			),
 		);
 
 		await harness.session.prompt("run the analysis");
 
-		// Five turns of garbage earn the recovery turn; the relapse inside it is the
-		// sixth - the seventh scripted answer is never consumed.
-		expect(harness.faux.state.callCount).toBe(6);
+		// Five turns of garbage earn recovery turn 1; each relapse inside an open
+		// recovery turn spends the next grant, and the fourth trigger - budget spent -
+		// ends the run. The ninth scripted answer is never consumed.
+		expect(harness.faux.state.callCount).toBe(8);
 		const receipts = toolResultTexts(harness);
 		expect(receipts[0]).toContain('Did you mean: "ipython"');
-		// The limit hit granted the recovery turn rather than stopping outright.
-		expect(receipts[4]).toContain("recovery turn");
-		expect(receipts[4]).toContain("final correction");
+		// Every limit hit granted a recovery turn rather than stopping outright.
+		expect(receipts[4]).toContain("recovery turn 1 of 3");
+		expect(receipts[5]).toContain("recovery turn 2 of 3");
+		expect(receipts[6]).toContain("recovery turn 3 of 3");
+		expect(receipts[7]).toContain("the run stops");
 		const last = harness.session.messages.at(-1);
 		if (last?.role !== "assistant") throw new Error("expected the terminal assistant message");
 		expect(last.stopReason).toBe("error");

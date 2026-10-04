@@ -1,0 +1,1 @@
+- Added `tools.notFoundBreaker` settings (`enabled`, `warnAfter`, `terminateAfter`, `decayPerResolvedCall`, `recoveryTurns`) exposing the per-run unknown-tool-call breaker policy documented in docs/settings.md.

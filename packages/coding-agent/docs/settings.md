@@ -664,10 +664,33 @@ Unknown-tool calls ("Tool X not found") are self-correcting by default: every su
 error receipt lists the available tool names and suggests the closest match. A
 per-run breaker bounds a model that keeps inventing names anyway - at 3 unknown-tool
 calls (the same count the fallback chain's bad-call storm detector uses) the receipt
-becomes a forced-correction warning, and at 5 the run ends with a classified,
-non-retryable error instead of spending more provider requests. Both thresholds are
-host-configurable through the agent loop's `toolNotFoundBreaker` option
-(`{ enabled, warnAfter, terminateAfter }`); there is no per-session settings key yet.
+becomes a forced-correction warning, and at 5 the run grants a recovery turn instead
+of ending: a resolved call or a clean answer closes the episode and resets the
+counts, while a relapse inside an open recovery turn is the next trigger. Every
+trigger spends one of the run's recovery budget (3 per run by default); only when
+the budget is spent does the run end with a classified error instead of spending
+more provider requests. A clean close never refunds a spent grant, so a model that
+oscillates between storm and recovery cannot run forever.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `tools.notFoundBreaker.enabled` | boolean | `true` | Master switch; `false` keeps the enriched receipts but never counts or terminates |
+| `tools.notFoundBreaker.warnAfter` | number | `3` | Unknown-tool calls before the receipt becomes a forced-correction warning |
+| `tools.notFoundBreaker.terminateAfter` | number | `5` | Unknown-tool calls before the breaker triggers (clamped to >= `warnAfter`) |
+| `tools.notFoundBreaker.decayPerResolvedCall` | number | `1` | Forgiveness each resolved call subtracts from every per-name miss count; `0` keeps counts cumulative for the run |
+| `tools.notFoundBreaker.recoveryTurns` | number | `3` | Recovery turns a run grants at the limit before ending; `0` ends the run at the first limit hit |
+
+```json
+{
+  "tools": {
+    "notFoundBreaker": { "warnAfter": 3, "terminateAfter": 5, "recoveryTurns": 3 }
+  }
+}
+```
+
+SDK consumers can set the same policy per agent through the agent loop's
+`toolNotFoundBreaker` option; the session refreshes it from these settings before
+every run, so edits take effect without a restart.
 
 ### Shell
 

@@ -937,7 +937,7 @@ async function runLoop(
 					if (notFoundBreaker.recovery.pending) {
 						// The turn that granted the recovery just closed with its receipts
 						// delivered; the next turn is the recovery round, in which a single
-						// unknown-tool call trips the breaker (see recordToolNotFound).
+						// unknown-tool call is the next trigger (see recordToolNotFound).
 						notFoundBreaker.recovery.pending = false;
 					} else {
 						// A full turn closed without an unknown-tool call: the correction
@@ -2306,7 +2306,9 @@ export const TOOL_NOT_FOUND_BREAKER_DEFAULTS = {
 	warnAfter: 3,
 	terminateAfter: 5,
 	decayPerResolvedCall: 1,
-	recoveryTurns: 1,
+	// Per-run budget of granted recovery turns: every trigger (the limit hit, or a
+	// relapse inside an open recovery turn) grants another one until these are spent.
+	recoveryTurns: 3,
 } as const;
 
 /**
@@ -2395,7 +2397,8 @@ interface ToolNotFoundBreakerTrip {
 interface ToolNotFoundBreakerRecovery {
 	/**
 	 * True until the turn that granted the recovery closes; the turn after it is the
-	 * recovery round, in which a single unknown-tool call trips the breaker.
+	 * recovery round, in which a single unknown-tool call is the next trigger (it
+	 * spends the next grant while the per-run budget lasts, and trips it when spent).
 	 */
 	pending: boolean;
 }
@@ -2406,7 +2409,7 @@ interface ToolNotFoundBreakerState {
 	readonly terminateAfter: number;
 	/** Forgiveness subtracted from every per-name count by each resolved call. */
 	readonly decayPerResolvedCall: number;
-	/** Recovery turns granted at the limit before the run ends. */
+	/** Recovery turns a run grants at the limit before it ends (the per-run budget). */
 	readonly recoveryTurns: number;
 	/** Consecutive unknown-tool calls; any call whose name resolves resets it. */
 	consecutive: number;
@@ -2450,28 +2453,24 @@ function recordToolNotFound(state: ToolNotFoundBreakerState, name: string): Tool
 	state.consecutive += 1;
 	const nameCount = (state.nameCounts.get(name) ?? 0) + 1;
 	state.nameCounts.set(name, nameCount);
-	if (!state.trip) {
-		if (state.recovery && !state.recovery.pending) {
-			// A granted recovery turn still produced an unknown-tool call: the hard stop
-			// the recovery receipt announced, regardless of which limit was re-hit.
+	const limitHit = nameCount >= state.terminateAfter || state.consecutive >= state.terminateAfter;
+	if (!state.trip && !state.recovery?.pending && (state.recovery !== undefined || limitHit)) {
+		// Every trigger - the limit hit, or a relapse inside an open recovery turn -
+		// grants another recovery turn until the per-run budget is spent; only the
+		// spent budget is the hard stop the recovery receipts announce. A `pending`
+		// recovery means this batch already armed the grant, so those further calls
+		// are receipt-only.
+		if (state.recoveriesUsed < state.recoveryTurns) {
+			state.recoveriesUsed += 1;
+			state.recovery = { pending: true };
+		} else {
 			state.trip = { toolName: name, nameCount, consecutive: state.consecutive, total: state.total };
-		} else if (nameCount >= state.terminateAfter || state.consecutive >= state.terminateAfter) {
-			if (state.recovery) {
-				// Same batch as the arming call: already granted, receipt only.
-			} else if (state.recoveriesUsed < state.recoveryTurns) {
-				// The limit no longer ends the run outright: grant one recovery turn. The
-				// receipt spells out that a single further unknown-tool call ends the run.
-				state.recoveriesUsed += 1;
-				state.recovery = { pending: true };
-			} else {
-				state.trip = { toolName: name, nameCount, consecutive: state.consecutive, total: state.total };
-			}
 		}
 	}
 	if (state.trip) return "trip";
-	if (state.recovery && (nameCount >= state.terminateAfter || state.consecutive >= state.terminateAfter)) {
-		return "recover";
-	}
+	// While a recovery is open every unknown-tool receipt restates the correction,
+	// including a relapse that decayed back below the numeric limit.
+	if (state.recovery) return "recover";
 	if (nameCount >= state.warnAfter || state.consecutive >= state.warnAfter) return "warn";
 	return "plain";
 }
@@ -2498,7 +2497,7 @@ function formatToolNotFoundReceipt(
 	if (escalation === "warn") {
 		const beyond =
 			state.recoveryTurns > 0
-				? `at ${state.terminateAfter} the run grants one recovery turn, and a miss inside it ends the run`
+				? `at ${state.terminateAfter} the run grants a recovery turn (up to ${state.recoveryTurns} per run), and the run ends when they are spent`
 				: `the run stops at ${state.terminateAfter}`;
 		lines.push(
 			`[tool-not-found breaker] ${state.total} unknown-tool call(s) this run; ${beyond}. ` +
@@ -2506,14 +2505,15 @@ function formatToolNotFoundReceipt(
 		);
 	} else if (escalation === "recover") {
 		lines.push(
-			`[tool-not-found breaker] ${state.total} unknown-tool call(s) this run hit the limit of ${state.terminateAfter}. ` +
-				"The run does not stop yet - this recovery turn is the final correction: call only the exact tool names listed above, " +
-				"or answer without any tool call. A single further unknown-tool call ends the run.",
+			`[tool-not-found breaker] ${state.total} unknown-tool call(s) this run; ` +
+				`recovery turn ${state.recoveriesUsed} of ${state.recoveryTurns} opens now. ` +
+				"The run does not stop yet - call only the exact tool names listed above, or answer without any tool call. " +
+				"A relapse while a recovery turn is open spends the next one; the run ends when none remain.",
 		);
 	} else if (escalation === "trip") {
 		lines.push(
 			state.recoveriesUsed > 0
-				? `[tool-not-found breaker] the recovery turn still produced an unknown-tool call (${state.total} this run), so the run stops after this batch instead of asking the model again.`
+				? `[tool-not-found breaker] all ${state.recoveryTurns} recovery turn(s) this run are spent and unknown-tool calls continue (${state.total} total), so the run stops after this batch instead of asking the model again.`
 				: `[tool-not-found breaker] ${state.total} unknown-tool call(s) this run: the limit of ${state.terminateAfter} is reached, ` +
 						"so the run stops after this batch instead of asking the model again.",
 		);
@@ -2531,7 +2531,9 @@ function createToolNotFoundBreakerTerminalMessage(
 	const errorMessage =
 		`Stopped by the tool-not-found breaker: ${trip.total} unknown-tool call(s) in this run ` +
 		`(${trip.nameCount} for "${trip.toolName}"), limit ${state.terminateAfter}. ` +
-		(state.recoveriesUsed > 0 ? "The recovery turn the limit granted still produced an unknown-tool call. " : "") +
+		(state.recoveriesUsed > 0
+			? `All ${state.recoveryTurns} recovery turn(s) this run grants were spent and the model relapsed again. `
+			: "") +
 		"The model kept calling tool names that do not exist even though every error receipt listed the available tools, " +
 		"so the run was ended instead of spending more provider requests. " +
 		"This is a model-side failure: switch the session to another model (or fix the tool setup) before resuming.";
@@ -2558,6 +2560,7 @@ function createToolNotFoundBreakerTerminalMessage(
 			warnAfter: state.warnAfter,
 			terminateAfter: state.terminateAfter,
 			recoveriesUsed: state.recoveriesUsed,
+			recoveryTurns: state.recoveryTurns,
 			availableTools: (tools ?? []).map((tool) => tool.name),
 		},
 	});

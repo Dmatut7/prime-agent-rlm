@@ -345,10 +345,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * already gets an enriched receipt (the available tool names plus a did-you-mean
 	 * suggestion); the breaker adds the bounds: at `warnAfter` unknown-tool calls the
 	 * receipt becomes a forced-correction warning, and at `terminateAfter` the run
-	 * ends with a classified terminal error (`stopReasonRaw:
-	 * "tool_not_found_breaker_tripped"`) instead of asking the model again. Unset
-	 * fields use `TOOL_NOT_FOUND_BREAKER_DEFAULTS` from the loop; `enabled: false`
-	 * disables counting and termination but keeps the enriched receipts.
+	 * grants a recovery turn instead of ending - every trigger spends one of the
+	 * per-run `recoveryTurns` budget, and the run ends with a classified terminal
+	 * error (`stopReasonRaw: "tool_not_found_breaker_tripped"`) only once that budget
+	 * is spent. Unset fields use `TOOL_NOT_FOUND_BREAKER_DEFAULTS` from the loop;
+	 * `enabled: false` disables counting and termination but keeps the enriched
+	 * receipts.
 	 */
 	toolNotFoundBreaker?: ToolNotFoundBreakerConfig;
 }
@@ -454,15 +456,16 @@ export interface ToolTimeoutConfig {
  * unknown-tool calls (reset by any call whose name resolves), and the per-name
  * count (decayed by resolved calls, so an occasional miss in a long task does not
  * accumulate to the limit, while a storm with no resolved calls in between outruns
- * the decay). Hitting the limit grants a recovery turn instead of ending the run
- * outright; a relapse inside that turn is what terminates.
+ * the decay). Every trigger - the limit hit, or a relapse inside an open recovery
+ * turn - grants another recovery turn until the per-run `recoveryTurns` budget is
+ * spent; only the spent budget ends the run.
  */
 export interface ToolNotFoundBreakerConfig {
 	/** Master switch. Defaults to true; `false` keeps the enriched receipts only. */
 	enabled?: boolean;
 	/** Unknown-tool calls before the receipt becomes a forced-correction warning. Default 3. */
 	warnAfter?: number;
-	/** Unknown-tool calls before the breaker trips. Default 5, clamped to >= warnAfter. */
+	/** Unknown-tool calls before the breaker triggers. Default 5, clamped to >= warnAfter. */
 	terminateAfter?: number;
 	/**
 	 * Forgiveness per resolved tool call: every call whose name resolves subtracts this
@@ -471,10 +474,12 @@ export interface ToolNotFoundBreakerConfig {
 	 */
 	decayPerResolvedCall?: number;
 	/**
-	 * Recovery turns granted at the limit before the run ends. Default 1: hitting the
-	 * limit opens one turn in which a resolved call (or a clean stop) closes the
-	 * episode and resets the counts, and a single further unknown-tool call ends the
-	 * run. 0 ends the run at the limit (the pre-recovery behavior).
+	 * Per-run budget of recovery turns granted at the limit. Default 3: every trigger
+	 * opens one turn in which a resolved call (or a clean stop) closes the episode and
+	 * resets the counts, and a relapse inside an open recovery turn is the next
+	 * trigger - it spends another grant while the budget lasts, and ends the run once
+	 * the budget is spent. A clean close never refunds a spent grant. 0 ends the run
+	 * at the first limit hit (the pre-recovery behavior).
 	 */
 	recoveryTurns?: number;
 }

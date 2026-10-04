@@ -732,6 +732,32 @@ export interface ToolsSettings {
 	 * itself is never aborted by this deadline.
 	 */
 	timeout?: ToolTimeoutSettings;
+	/** Per-run breaker for unknown-tool calls; see ToolNotFoundBreakerSettings. */
+	notFoundBreaker?: ToolNotFoundBreakerSettings;
+}
+
+/**
+ * Per-run breaker policy for unknown-tool calls ("Tool X not found"), resolved by
+ * the agent loop's `toolNotFoundBreaker` option: every miss already gets the
+ * available-tools receipt with a did-you-mean suggestion; the breaker escalates the
+ * receipt to a forced-correction warning at `warnAfter`, and at `terminateAfter`
+ * the run grants a recovery turn instead of ending. Every trigger - the limit hit
+ * or a relapse inside an open recovery turn - spends one of the per-run
+ * `recoveryTurns` budget, and the run ends with a classified, non-retryable error
+ * only once that budget is spent. Omitted fields fall back to the loop's
+ * `TOOL_NOT_FOUND_BREAKER_DEFAULTS`.
+ */
+export interface ToolNotFoundBreakerSettings {
+	/** Default true. The rollback handle: false keeps the enriched receipts but never counts or terminates. */
+	enabled?: boolean;
+	/** Default 3 (matches the fallback chain's bad-call storm threshold). */
+	warnAfter?: number;
+	/** Default 5; the loop clamps it to >= warnAfter. */
+	terminateAfter?: number;
+	/** Default 1: each resolved call forgives every per-name miss count by this much; 0 keeps counts cumulative. */
+	decayPerResolvedCall?: number;
+	/** Default 3 recovery turns per run; 0 ends the run at the first limit hit. */
+	recoveryTurns?: number;
 }
 
 export interface ToolTimeoutSettings {
@@ -1270,7 +1296,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	themes: null,
 	enableSkillCommands: null,
 	bundledSkills: ["websearch"],
-	tools: ["timeout"],
+	tools: ["timeout", "notFoundBreaker"],
 	enableBuiltinSkills: null,
 	terminal: ["showImages", "clearOnShrink", "showTerminalProgress", "fullscreen", "fullscreenMouse"],
 	images: ["autoResize", "blockImages"],
@@ -1323,6 +1349,7 @@ const KNOWN_NESTED_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	],
 	"retry.emptyTurn.recovery": ["enabled", "maxContinuations", "useBackupModel"],
 	"tools.timeout": ["enabled", "afterMs", "perTool", "silentStuckSeconds", "silentStuckCpuMs"],
+	"tools.notFoundBreaker": ["enabled", "warnAfter", "terminateAfter", "decayPerResolvedCall", "recoveryTurns"],
 	"subagents.stallRecovery": ["enabled", "graceSeconds", "maxPerSession"],
 	"stallWatchdog.rootRecovery": ["enabled", "humanWindowSeconds", "maxPerSession"],
 };
@@ -1501,6 +1528,7 @@ const BOOLEAN_SWITCHES: ReadonlyArray<{ path: string; raw: (settings: Settings) 
 	{ path: "selfRecovery.childReplyNudge", raw: (s) => s.selfRecovery?.childReplyNudge },
 	{ path: "selfRecovery.finishGate", raw: (s) => s.selfRecovery?.finishGate },
 	{ path: "tools.timeout.enabled", raw: (s) => s.tools?.timeout?.enabled },
+	{ path: "tools.notFoundBreaker.enabled", raw: (s) => s.tools?.notFoundBreaker?.enabled },
 	{ path: "ui.timelineOpenWhileWorking", raw: (s) => s.ui?.timelineOpenWhileWorking },
 	{ path: "ui.timelineAutoFold", raw: (s) => s.ui?.timelineAutoFold },
 	{ path: "ui.reduceMotion", raw: (s) => s.ui?.reduceMotion },
@@ -3320,6 +3348,17 @@ export class SettingsManager {
 		// Per-tool entries pass through unclamped: an operator budgeting a specific
 		// long-running tool past the shared window is the documented exemption use.
 		return { enabled, afterMs, ...(timeout?.perTool === undefined ? {} : { perTool: timeout.perTool }) };
+	}
+
+	/**
+	 * Per-run breaker policy for unknown-tool calls, handed to the agent loop's
+	 * `toolNotFoundBreaker` as-is: the loop owns the defaults and the coercions
+	 * (`terminateAfter` clamped to >= `warnAfter`, non-finite counts ignored), so the
+	 * resolved object is the stored block verbatim. `enabled: false` is the rollback
+	 * handle - the enriched receipts stay, counting and termination stop.
+	 */
+	getToolNotFoundBreakerSettings(): ToolNotFoundBreakerSettings {
+		return { ...(this.settings.tools?.notFoundBreaker ?? {}) };
 	}
 
 	getProviderRetrySettings(): {
