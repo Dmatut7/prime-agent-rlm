@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+import { DaemonAdoptionState } from "../src/modes/daemon/daemon-supervisor-adoption.js";
 
 /**
  * Block-7 union (案A): a descriptor-known but unhydrated root reports a *typed*
@@ -32,10 +33,14 @@ function fakeWorker(workerId: string, rootActiveSessionId: string): FakeWorker {
 }
 
 function supervisorWith(workers: FakeWorker[], adoptionPendingCount = 0) {
+	// The adoption bookkeeping lives in the state seat since wave-50; the lazy
+	// `adoptionState` getter has no setter, so inject the backing field.
+	const adoptionStateValue = new DaemonAdoptionState();
+	adoptionStateValue.pendingCount = adoptionPendingCount;
 	return Object.assign(Object.create(DaemonSupervisor.prototype), {
 		workers: new Map(workers.map((worker) => [worker.descriptor.workerId, worker])),
 		shuttingDown: false,
-		adoptionPendingCount,
+		adoptionStateValue,
 		matchWorkers: () => [],
 		refreshWorkerSummaries: vi.fn(async () => {}),
 		// The roster is exercised elsewhere; here the claim check is the unit under test.
@@ -86,7 +91,7 @@ describe("daemon supervisor recovering contract", () => {
 		const supervisor2 = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map(),
 			shuttingDown: false,
-			adoptionPendingCount: 0,
+			adoptionStateValue: new DaemonAdoptionState(),
 			matchWorkers: () => [{ descriptor: { rootActiveSessionId: "active-root" } }],
 			refreshWorkerSummaries: vi.fn(async () => {}),
 		}) as { findWorker(selector: string): Promise<unknown> };

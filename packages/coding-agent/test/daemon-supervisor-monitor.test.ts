@@ -1067,7 +1067,6 @@ describe("daemon worker supervisor monitoring", () => {
 			signalCleanupHandlers: [],
 			workers: new Map(),
 			clients: new Set(),
-			adoptionRetryTimers: new Map(),
 			catalog: { stop: vi.fn(async () => undefined) },
 			cleanupSocket,
 			snapshotCacheRoot: "\0",
@@ -1128,7 +1127,6 @@ describe("daemon worker supervisor monitoring", () => {
 			signalCleanupHandlers: [],
 			workers,
 			clients: new Set(),
-			adoptionRetryTimers: new Map(),
 			persistWorkerStopTombstone: vi.fn(),
 			hasPersistedWorkerDescriptors: vi.fn(() => true),
 			catalog: { stop: catalogStop },
@@ -1953,7 +1951,6 @@ describe("daemon worker supervisor monitoring", () => {
 			assertRecoveryAllowed: vi.fn(async () => {}),
 			// The park path now offers a scheduled-job re-adoption; this worker has no
 			// roster rows and no session file, so the offer is declined.
-			adoptionRetryTimers: new Map(),
 			workerRosterEntries: vi.fn(() => []),
 		}) as RecoveryHarness;
 
@@ -2008,7 +2005,6 @@ describe("daemon worker supervisor monitoring", () => {
 			launchWorker: ReturnType<typeof vi.fn>;
 			persistWorker: ReturnType<typeof vi.fn>;
 			assertRecoveryAllowed: ReturnType<typeof vi.fn>;
-			adoptionRetryTimers: Map<CrashWorker, unknown>;
 			adoptionRetryDelaysMs: readonly number[];
 			adoptionRequestTimeoutMs: number;
 			recoverWorker(target: CrashWorker): Promise<void>;
@@ -2059,7 +2055,6 @@ describe("daemon worker supervisor monitoring", () => {
 				launchWorker: vi.fn(async () => worker),
 				persistWorker: vi.fn(),
 				assertRecoveryAllowed: vi.fn(async () => {}),
-				adoptionRetryTimers: new Map(),
 				adoptionRetryDelaysMs: [60_000],
 				adoptionRequestTimeoutMs: 12_345,
 			}) as CrashHarness;
@@ -2552,7 +2547,6 @@ describe("daemon worker supervisor monitoring", () => {
 			log: vi.fn(),
 			// The park path now offers a scheduled-job re-adoption; this worker has no
 			// roster rows and no session file, so the offer is declined.
-			adoptionRetryTimers: new Map(),
 			workerRosterEntries: vi.fn(() => []),
 		}) as { deferWorkerRecovery(target: typeof worker, error: Error): void };
 

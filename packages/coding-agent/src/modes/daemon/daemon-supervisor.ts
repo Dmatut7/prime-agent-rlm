@@ -172,6 +172,15 @@ import {
 	restrictDaemonSocketPath,
 } from "./daemon-socket.js";
 import {
+	armScheduledJobReadoption,
+	beginWorkerAdoption,
+	clearAdoptionRetryTimers,
+	DaemonAdoptionState,
+	type DaemonSupervisorAdoptionHost,
+	workerHasAttachedClient,
+	workerHasScheduledJobs,
+} from "./daemon-supervisor-adoption.js";
+import {
 	acquireDaemonSupervisorOwnership,
 	DaemonShutdownTombstonedError,
 	isDaemonShutdownAdmissionActive,
@@ -326,8 +335,6 @@ const FAILED_WORKER_REAP_INTERVAL_MS = 5 * 60_000;
  * settings change is honoured without a restart.
  */
 const RETENTION_SWEEP_CHECK_INTERVAL_MS = 5 * 60_000;
-// L3: how many workers are adopted concurrently once the socket is already open.
-const ADOPTION_CONCURRENCY = 4;
 // L3/amend: a session with scheduled jobs is re-adopted on a backoff instead of being
 // parked failed, so an unattended heartbeat does not silently stop at startup.
 const ADOPTION_RETRY_DELAYS_MS: readonly number[] = [30_000, 120_000, 600_000];
@@ -843,7 +850,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"shutdown",
 ]);
 
-interface ResidentWorker {
+export interface ResidentWorker {
 	descriptor: DaemonWorkerDescriptor;
 	descriptorPath: string;
 	client?: DaemonWorkerClient;
@@ -1049,7 +1056,7 @@ function isSupervisorGenerationStale(error: unknown): boolean {
 	);
 }
 
-function isSupervisorRecoveryCancelled(error: unknown): boolean {
+export function isSupervisorRecoveryCancelled(error: unknown): boolean {
 	return isSupervisorShutdownAdmissionCancelled(error) || isSupervisorGenerationStale(error);
 }
 
@@ -1553,13 +1560,6 @@ export class DaemonSupervisor {
 	private readonly adoptionRequestTimeoutMs: number;
 	private readonly failedWorkerReapIntervalMs: number;
 	private readonly adoptionRetryDelaysMs: readonly number[];
-	/** Workers still being adopted; published as daemon_hello.adopting so a partial startup is visible. */
-	private adoptionPendingCount = 0;
-	/** The workers the startup count was opened for, so a runtime re-adoption cannot skew it. */
-	private readonly adoptionCountedWorkers = new Set<ResidentWorker>();
-	private readonly adoptionRetryTimers = new Map<ResidentWorker, NodeJS.Timeout>();
-	private readonly adoptionFailures: Array<{ workerId: string; session: string; reason: string }> = [];
-	private adoptionReported = false;
 	/** Set once the supervisor keeps running on state it could not persist or on an isolated rejection (L6/F16). */
 	private degraded = false;
 	private readonly degradedCounts = new Map<string, number>();
@@ -1631,6 +1631,64 @@ export class DaemonSupervisor {
 			};
 		}
 		return this.warmPoolHostValue;
+	}
+
+	/**
+	 * Adoption state, owned by ./daemon-supervisor-adoption.js (wave-50, the
+	 * second Host-seam cut on this class). Lazy like the warm-pool seat:
+	 * prototype-harness supervisors in tests bypass the constructor, and every
+	 * reader (daemon_hello's `adopting` count, the reap-candidate check,
+	 * findWorker's recovering window) must see an empty, zeroed seat there
+	 * instead of throwing.
+	 */
+	private adoptionStateValue?: DaemonAdoptionState;
+	private get adoptionState(): DaemonAdoptionState {
+		if (this.adoptionStateValue === undefined) {
+			this.adoptionStateValue = new DaemonAdoptionState();
+		}
+		return this.adoptionStateValue;
+	}
+	private adoptionHostValue?: DaemonSupervisorAdoptionHost;
+	/**
+	 * The seam the extracted adoption cluster operates on. Same construction as
+	 * `warmPoolHost`: a facade of live getters and arrows built inside the class
+	 * (no casts, no visibility changes), so the memoized facade never goes stale
+	 * and instance-level dispatch is preserved exactly. The seam is
+	 * read-only/call-only — the cluster mutates only its own state seat and its
+	 * argument's worker record.
+	 */
+	private get adoptionHost(): DaemonSupervisorAdoptionHost {
+		if (this.adoptionHostValue === undefined) {
+			const supervisor = this;
+			this.adoptionHostValue = {
+				get adoptionState() {
+					return supervisor.adoptionState;
+				},
+				get workers() {
+					return supervisor.workers;
+				},
+				get clients() {
+					return supervisor.clients;
+				},
+				get shuttingDown() {
+					return supervisor.shuttingDown;
+				},
+				get adoptionRequestTimeoutMs() {
+					return supervisor.adoptionRequestTimeoutMs;
+				},
+				get adoptionRetryDelaysMs() {
+					return supervisor.adoptionRetryDelaysMs;
+				},
+				background: <T>(operation: Promise<T>, context: string): void => supervisor.background(operation, context),
+				log: (message) => supervisor.log(message),
+				recordDegraded: (cause) => supervisor.recordDegraded(cause),
+				tryPersistWorker: (worker, context) => supervisor.tryPersistWorker(worker, context),
+				markWorkerRosterEntries: (worker, statusLabel) => supervisor.markWorkerRosterEntries(worker, statusLabel),
+				workerRosterEntries: (worker) => supervisor.workerRosterEntries(worker),
+				adoptOrRecoverWorker: (worker) => supervisor.adoptOrRecoverWorker(worker),
+			};
+		}
+		return this.adoptionHostValue;
 	}
 
 	constructor(
@@ -1913,10 +1971,7 @@ export class DaemonSupervisor {
 	}
 
 	private clearAdoptionRetryTimers(): void {
-		for (const timer of this.adoptionRetryTimers.values()) {
-			clearTimeout(timer);
-		}
-		this.adoptionRetryTimers.clear();
+		clearAdoptionRetryTimers(this.adoptionHost);
 	}
 
 	private clearScheduledWakeTimer(): void {
@@ -2734,7 +2789,7 @@ export class DaemonSupervisor {
 						serverCapabilities: SUPERVISOR_SERVER_CAPABILITIES,
 						// Both fields are optional and absent in the healthy case, so a
 						// client that never learned them simply sees today's hello.
-						...(this.adoptionPendingCount > 0 ? { adopting: this.adoptionPendingCount } : {}),
+						...(this.adoptionState.pendingCount > 0 ? { adopting: this.adoptionState.pendingCount } : {}),
 						...(this.degraded ? { degraded: true } : {}),
 					});
 				}
@@ -5401,236 +5456,20 @@ export class DaemonSupervisor {
 		}
 	}
 
-	/**
-	 * L3: adoption runs off the ready critical path. The socket is already open and
-	 * `markReady()` has run, so a worker that never answers cannot keep the whole
-	 * daemon from serving; its sessions answer as recovering until it lands.
-	 */
 	private beginWorkerAdoption(workers: readonly ResidentWorker[]): void {
-		if (workers.length === 0) {
-			return;
-		}
-		this.adoptionPendingCount = workers.length;
-		for (const worker of workers) {
-			this.adoptionCountedWorkers.add(worker);
-		}
-		this.background(this.runWorkerAdoption(workers), "worker adoption");
-	}
-
-	private async runWorkerAdoption(workers: readonly ResidentWorker[]): Promise<void> {
-		const queue = [...workers];
-		const lanes: Array<Promise<void>> = [];
-		const concurrency = Math.max(1, Math.min(ADOPTION_CONCURRENCY, queue.length));
-		for (let lane = 0; lane < concurrency; lane++) {
-			lanes.push(
-				(async () => {
-					while (queue.length > 0 && !this.shuttingDown) {
-						const worker = queue.shift();
-						if (!worker) {
-							return;
-						}
-						const retryArmed = await this.adoptWorkerContained(worker);
-						if (!retryArmed) {
-							this.finishAdoptionAttempt(worker);
-						}
-					}
-				})(),
-			);
-		}
-		await Promise.all(lanes);
-		this.reportAdoptionOutcome();
-	}
-
-	/**
-	 * Adopts one worker and contains every outcome: startup must not fail because a
-	 * single worker cannot be adopted (L3). Returns true when a backoff re-adoption
-	 * was armed for a session that has scheduled jobs behind it.
-	 */
-	private async adoptWorkerContained(worker: ResidentWorker): Promise<boolean> {
-		let reason: string | undefined;
-		try {
-			await this.adoptOrRecoverWorker(worker);
-			// "recovering" is not a failure: the recovery machinery owns the worker from
-			// here and re-parks or retries it itself. An intentional stop is a completed
-			// adoption of a tombstone.
-			if (
-				worker.descriptor.lifecycle !== "ready" &&
-				worker.descriptor.lifecycle !== "recovering" &&
-				worker.descriptor.stopRequestedAt === undefined
-			) {
-				reason = worker.descriptor.lastError ?? `Worker stayed ${worker.descriptor.lifecycle}`;
-			}
-		} catch (error) {
-			if (this.shuttingDown || isSupervisorRecoveryCancelled(error)) {
-				return false;
-			}
-			reason = error instanceof Error ? error.message : String(error);
-		}
-		if (reason === undefined) {
-			return false;
-		}
-		return this.containAdoptionFailure(worker, reason);
-	}
-
-	/**
-	 * One unadoptable worker parks failed on its own instead of taking the daemon
-	 * down with it. A worker whose sessions have a heartbeat or cron registration is
-	 * re-adopted on a backoff first: parking it would silently stop an unattended
-	 * schedule, which nobody would notice because the daemon itself looks healthy.
-	 */
-	private containAdoptionFailure(worker: ResidentWorker, reason: string): boolean {
-		this.recordAdoptionFailure(worker, reason);
-		if (/\bTimed out\b/.test(reason)) {
-			// Production signature for a bounded adoption that hit its ceiling (F14).
-			this.log(
-				`Worker adoption timed out for ${worker.descriptor.workerId} after ${this.adoptionRequestTimeoutMs}ms: ${reason}`,
-			);
-		}
-		if (worker.descriptor.lifecycle !== "failed") {
-			worker.descriptor.lifecycle = "failed";
-			worker.descriptor.lastError = reason;
-			// Preserve the first failure time: the reaper ages a corpse from it, and a
-			// restart that re-parks the same dead worker must not reset that clock.
-			worker.descriptor.lastFailureAt ??= new Date().toISOString();
-			this.tryPersistWorker(worker, "adoption failure");
-			this.markWorkerRosterEntries(worker, "failed");
-		}
-		return this.armScheduledJobReadoption(worker, reason);
-	}
-
-	private recordAdoptionFailure(worker: ResidentWorker, reason: string): void {
-		const workerId = worker.descriptor.workerId;
-		if (this.adoptionFailures.some((failure) => failure.workerId === workerId)) {
-			return;
-		}
-		this.adoptionFailures.push({
-			workerId,
-			session: worker.descriptor.rootSessionId ?? worker.descriptor.rootActiveSessionId,
-			reason,
-		});
+		beginWorkerAdoption(this.adoptionHost, workers);
 	}
 
 	private armScheduledJobReadoption(worker: ResidentWorker, reason: string): boolean {
-		if (this.shuttingDown || this.adoptionRetryTimers.has(worker)) {
-			return false;
-		}
-		// An intentional stop must stay stopped; only unexpected failures are retried.
-		if (worker.descriptor.stopRequestedAt !== undefined || worker.intentionalStop) {
-			return false;
-		}
-		// A client-owned worker is re-driven by its owner's next attach; re-adopting it
-		// here would only re-park it until that client shows up.
-		if (worker.descriptor.ownerClientId !== undefined) {
-			return false;
-		}
-		if (!this.workerHasScheduledJobs(worker)) {
-			return false;
-		}
-		const attempt = worker.adoptionRetryAttempt ?? 0;
-		const delayMs = this.adoptionRetryDelaysMs[attempt];
-		if (delayMs === undefined) {
-			this.recordDegraded("scheduled session not re-adopted");
-			this.log(
-				`Worker ${worker.descriptor.workerId} stayed failed after ${this.adoptionRetryDelaysMs.length} re-adoption attempts (${reason}); ` +
-					`its scheduled sessions stay dark until a client attaches or retry_worker runs`,
-			);
-			return false;
-		}
-		worker.adoptionRetryAttempt = attempt + 1;
-		this.log(
-			`Re-adopting worker ${worker.descriptor.workerId} in ${Math.round(delayMs / 1000)}s because its sessions have scheduled jobs ` +
-				`(attempt ${attempt + 1}/${this.adoptionRetryDelaysMs.length}): ${reason}`,
-		);
-		const timer = setTimeout(() => {
-			this.adoptionRetryTimers.delete(worker);
-			this.background(this.retryWorkerAdoption(worker), `worker re-adoption for ${worker.descriptor.workerId}`);
-		}, delayMs);
-		timer.unref();
-		this.adoptionRetryTimers.set(worker, timer);
-		return true;
+		return armScheduledJobReadoption(this.adoptionHost, worker, reason);
 	}
 
-	private async retryWorkerAdoption(worker: ResidentWorker): Promise<void> {
-		if (this.shuttingDown || this.workers.get(worker.descriptor.workerId) !== worker) {
-			this.finishAdoptionAttempt(worker);
-			return;
-		}
-		// A re-adoption starts from the parked state, so recovery is allowed to run again.
-		worker.deferredRecoveryRounds = 0;
-		const retryArmed = await this.adoptWorkerContained(worker);
-		if (!retryArmed) {
-			this.finishAdoptionAttempt(worker);
-		}
-	}
-
-	private finishAdoptionAttempt(worker: ResidentWorker): void {
-		if (this.adoptionCountedWorkers.delete(worker)) {
-			this.adoptionPendingCount = Math.max(0, this.adoptionPendingCount - 1);
-		}
-	}
-
-	/** How many registered workers are still being adopted; published in daemon_hello. */
-	get adoptingSessionWorkers(): number {
-		return this.adoptionPendingCount;
-	}
-
-	/**
-	 * M12①: a startup that no longer fails loudly has to report what it could not
-	 * restore, with the reason and the action that brings a session back.
-	 */
-	private reportAdoptionOutcome(): void {
-		if (this.adoptionReported) {
-			return;
-		}
-		this.adoptionReported = true;
-		const failures = this.adoptionFailures;
-		if (failures.length === 0) {
-			return;
-		}
-		const detail = failures.map((failure) => `${failure.session} (worker ${failure.workerId}): ${failure.reason}`);
-		this.log(
-			`Daemon started with ${failures.length} session${failures.length === 1 ? "" : "s"} unrestored: ${detail.join("; ")}. ` +
-				`Each stays registered as failed; attach the session or run retry_worker to bring it back, ` +
-				`and the failed-worker reaper archives it once it is old enough.`,
-		);
-	}
-
-	/** Whether a heartbeat or cron registration behind this worker's sessions still needs it. */
 	private workerHasScheduledJobs(worker: ResidentWorker): boolean {
-		for (const entry of this.workerRosterEntries(worker)) {
-			if (entry.summary.hasRegisteredHeartbeat === true || entry.summary.hasRegisteredCronJob === true) {
-				return true;
-			}
-		}
-		const sessionFile = worker.descriptor.sessionFile;
-		const sessionId = worker.descriptor.rootSessionId;
-		if (!sessionFile || !sessionId) {
-			return false;
-		}
-		try {
-			const artifactDir = getSessionArtifactPathForFile(resolve(sessionFile), sessionId);
-			return existsSync(join(artifactDir, SESSION_SCHEDULED_JOBS_FILENAME));
-		} catch {
-			// An unreadable artifact directory must not decide the policy either way.
-			return false;
-		}
+		return workerHasScheduledJobs(this.adoptionHost, worker);
 	}
 
 	private workerHasAttachedClient(worker: ResidentWorker): boolean {
-		const activeSessionIds = new Set(
-			this.workerRosterEntries(worker).map((entry) => entry.summary.activeSessionId ?? entry.summary.id),
-		);
-		if (activeSessionIds.size === 0) {
-			return false;
-		}
-		for (const client of this.clients) {
-			for (const activeSessionId of client.attachedActiveSessionIds) {
-				if (activeSessionIds.has(activeSessionId)) {
-					return true;
-				}
-			}
-		}
-		return false;
+		return workerHasAttachedClient(this.adoptionHost, worker);
 	}
 
 	private startFailedWorkerReaper(): void {
@@ -5801,7 +5640,7 @@ export class DaemonSupervisor {
 		if (worker.recovery || worker.deferredRecovery || worker.stopFinalization) {
 			return false;
 		}
-		if (this.adoptionRetryTimers.has(worker)) {
+		if (this.adoptionState.retryTimers.has(worker)) {
 			return false;
 		}
 		// Exemptions: a schedule that still needs the tree, and anybody watching it.
@@ -7804,7 +7643,7 @@ export class DaemonSupervisor {
 		// sessions can be missing their roster rows for a moment. Report the real,
 		// retryable state instead of claiming the session never existed — callers
 		// retry a recovering worker, and a "never existed" answer is terminal.
-		if (this.adoptionPendingCount > 0 && this.residentWorkerClaimsSelector(selector)) {
+		if (this.adoptionState.pendingCount > 0 && this.residentWorkerClaimsSelector(selector)) {
 			throw new Error("Session worker is recovering");
 		}
 		throw new Error(`Unknown active session: ${selector}`);
