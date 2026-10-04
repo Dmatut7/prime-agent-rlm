@@ -1015,11 +1015,45 @@ export function buildSessionContext(
 	let seenContentEntry = false;
 	let lastModelChange: string | undefined;
 
+	// A switch recorded mid-tool-batch (a fallback episode starts at
+	// tool_execution_end, before the batch's results are appended) must not
+	// interleave its synthesized notice between the calls and their results: the
+	// provider-side pairing pass matches a call with the results that follow it,
+	// so a user-role notice in between would replace the real results with
+	// synthetic "No result provided" errors. Hold the notice until the batch
+	// closes; a batch that never closes flushes ahead of the next non-result
+	// entry, where the pairing pass synthesizes the genuinely missing results
+	// exactly as it does without a switch.
+	const openToolCallIds = new Set<string>();
+	let heldModelChangeNotices: AgentMessage[] = [];
+	const flushHeldModelChangeNotices = (target: AgentMessage[]) => {
+		if (heldModelChangeNotices.length === 0) return;
+		target.push(...heldModelChangeNotices);
+		heldModelChangeNotices = [];
+	};
+
 	const appendMessage = (entry: SessionEntry, target = messages) => {
 		if (entry.type === "message") {
-			target.push(entry.message);
+			const message = entry.message;
+			if (message.role === "toolResult") {
+				target.push(message);
+				openToolCallIds.delete(message.toolCallId);
+				if (openToolCallIds.size === 0) flushHeldModelChangeNotices(target);
+			} else {
+				flushHeldModelChangeNotices(target);
+				target.push(message);
+				if (message.role === "assistant" && Array.isArray(message.content)) {
+					// A new assistant message closes the previous batch's window: its
+					// results either arrived or never will.
+					openToolCallIds.clear();
+					for (const block of message.content) {
+						if (block.type === "toolCall") openToolCallIds.add(block.id);
+					}
+				}
+			}
 			seenContentEntry = true;
 		} else if (entry.type === "custom_message") {
+			flushHeldModelChangeNotices(target);
 			target.push(
 				createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
 			);
@@ -1031,14 +1065,15 @@ export function buildSessionContext(
 			// The model must know it changed hands: the notice is synthesized at
 			// assembly time from the durable entry, never persisted twice.
 			if (isRealSwitch) {
-				target.push(
-					createModelChangeMessage(
-						{ provider: entry.provider, modelId: entry.modelId },
-						new Date(entry.timestamp).getTime(),
-					),
+				const notice = createModelChangeMessage(
+					{ provider: entry.provider, modelId: entry.modelId },
+					new Date(entry.timestamp).getTime(),
 				);
+				if (openToolCallIds.size > 0) heldModelChangeNotices.push(notice);
+				else target.push(notice);
 			}
 		} else if (entry.type === "branch_summary" && entry.summary) {
+			flushHeldModelChangeNotices(target);
 			target.push(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
 			seenContentEntry = true;
 		}
@@ -1050,10 +1085,21 @@ export function buildSessionContext(
 		// The pre-compaction ledger is summarized away, but a post-compaction
 		// model_change is only a real switch against what ran before the
 		// compaction: seed the comparison from the last model_change ahead of the
-		// compaction point, or the switch back (fallback episode ending, restored
+		// retained window, or the switch back (fallback episode ending, restored
 		// primary) would synthesize no notice and the rebuilt context would carry
-		// one model's messages into another model's requests without a word.
-		for (let i = compactionIdx - 1; i >= 0; i--) {
+		// one model's messages into another model's requests without a word. The
+		// bound is firstKeptEntryId, not the compaction point: a model_change
+		// inside the retained window is assembled by the loop below, and seeding
+		// from it would adopt the switch as the baseline and suppress its notice.
+		let firstKeptIdx = -1;
+		for (let i = 0; i < compactionIdx; i++) {
+			if (path[i].id === compaction.firstKeptEntryId) {
+				firstKeptIdx = i;
+				break;
+			}
+		}
+		const seedBound = firstKeptIdx >= 0 ? firstKeptIdx : compactionIdx;
+		for (let i = seedBound - 1; i >= 0; i--) {
 			const entry = path[i];
 			if (entry.type === "model_change") {
 				lastModelChange = `${entry.provider}/${entry.modelId}`;
@@ -1096,6 +1142,10 @@ export function buildSessionContext(
 			);
 		}
 
+		// A notice held for a batch that is still open at the retained-window end
+		// belongs inside the retained region, not after the summary that will be
+		// pushed ahead of it.
+		flushHeldModelChangeNotices(retainedMessages);
 		messages.push(
 			createCompactionSummaryMessage(
 				compaction.summary,
@@ -1121,6 +1171,10 @@ export function buildSessionContext(
 			appendMessage(entry);
 		}
 	}
+	// A path that ends mid-batch (a crash between the switch and the results)
+	// still releases the held notice; the missing results are synthesized
+	// downstream exactly as they are without a switch.
+	flushHeldModelChangeNotices(messages);
 
 	return { messages, thinkingLevel, serviceTier, model };
 }

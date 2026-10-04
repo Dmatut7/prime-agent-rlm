@@ -109,3 +109,54 @@ describe("persistent goal without an explicit budget", () => {
 		expect(harness.session.goalState.status).toBe("idle");
 	});
 });
+
+describe("persistent goal throttle lifecycle", () => {
+	it("starts a new goal without the previous goal's throttle clock", async () => {
+		// Review 2026-10-04 new issue 3: _startGoal never reset
+		// _goalContinuationLastAt, so a goal started right after another inherited
+		// the old clock and its first continuation was throttled by up to the full
+		// interval.
+		const harness = await createHarness({ persistentGoalMinContinuationIntervalMs: 60_000 });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+
+		await harness.session.prompt("/goal --persistent first goal");
+		await waitForCondition(() => getAssistantTexts(harness).length >= 2, "the first goal's two turns");
+		await waitForCondition(() => !harness.session.isStreaming, "the first goal to pause on the throttle");
+		expect(getAssistantTexts(harness)).toEqual(["one", "two"]);
+
+		await harness.session.prompt("/goal clear");
+		harness.setResponses([fauxAssistantMessage("three"), fauxAssistantMessage("four")]);
+		await harness.session.prompt("/goal --persistent second goal");
+
+		// The second goal's first continuation fires immediately: with the stale
+		// clock it would sit out the whole 60s interval.
+		await waitForCondition(() => getAssistantTexts(harness).length >= 4, "the second goal's first continuation");
+		expect(getAssistantTexts(harness)).toEqual(["one", "two", "three", "four"]);
+	});
+
+	it("Esc disarms the armed throttle wake instead of letting it continue the goal", async () => {
+		// Review 2026-10-04 new issue 3: the throttled continuation's wake timer was
+		// only cleared in dispose(), so after Esc the wake still fired and the
+		// parked goal continuation ran behind the owner's back.
+		const harness = await createHarness({ persistentGoalMinContinuationIntervalMs: 400 });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("work 1"),
+			fauxAssistantMessage("work 2"),
+			fauxAssistantMessage("work 3 - must not run after Esc"),
+		]);
+
+		await harness.session.prompt("/goal --persistent keep going");
+		await waitForCondition(() => getAssistantTexts(harness).length >= 2, "the first two goal turns");
+		await waitForCondition(() => !harness.session.isStreaming, "the run to pause on the throttle");
+		expect(getAssistantTexts(harness)).toHaveLength(2);
+
+		// Esc while the wake is armed.
+		harness.session.requestAbort({ reason: "user" });
+
+		// Well past the interval: the armed wake must not fire the held continuation.
+		await new Promise((resolve) => setTimeout(resolve, 900));
+		expect(getAssistantTexts(harness)).toHaveLength(2);
+	});
+});

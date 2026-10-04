@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../../src/core/agent-session.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
 import type { ExtensionFactory } from "../../src/core/extensions/types.js";
-import { GOAL_STATE_CUSTOM_TYPE, type GoalHostResponse } from "../../src/core/goals.js";
+import { GOAL_CONTEXT_CUSTOM_TYPE, GOAL_STATE_CUSTOM_TYPE, type GoalHostResponse } from "../../src/core/goals.js";
 import { ModelRegistry } from "../../src/core/model-registry.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import { SettingsManager } from "../../src/core/settings-manager.js";
@@ -163,7 +163,7 @@ describe("AgentSession goals", () => {
 
 	async function createGoalHarness(
 		extraTools: AgentTool[] = [],
-		options: Pick<HarnessOptions, "settings" | "extensionFactories" | "persistSession"> = {},
+		options: Pick<HarnessOptions, "settings" | "extensionFactories" | "persistSession" | "existingSessionFile"> = {},
 	): Promise<Harness> {
 		const sessionRef: { current?: AgentSession } = {};
 		const harness = await createHarness({
@@ -967,6 +967,199 @@ describe("AgentSession goals", () => {
 			status: "error",
 		});
 		expect(harness.getPendingResponseCount()).toBe(1);
+	});
+
+	it("Esc during the retry countdown neither fails the goal nor restarts queued work", async () => {
+		// Review 2026-10-04 item 5: Esc in a retry countdown only reaches abortRetry,
+		// which used to leave _goalAbortInProgress unset and the input pump running -
+		// the cancelled chain's terminal error then read as the goal's own failure,
+		// and queued follow-ups started right back up behind the owner's back.
+		const harness = await createGoalHarness([], {
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 60_000 } },
+		});
+		harness.session.handleGoalHostRequest("goal.create", { objective: "finish the task" });
+		expect(harness.session.goalState.status).toBe("active");
+
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("queued work answer"),
+		]);
+		const prompting = harness.session.prompt("work on it");
+		// The failure parked the chain in its (long) countdown.
+		await vi.waitFor(() => expect(harness.session.isRetrying).toBe(true), { timeout: 5_000, interval: 20 });
+
+		// Queued behind the countdown: must still be queued after the Esc.
+		const queued = harness.session.prompt("queued follow-up");
+		void queued.catch(() => undefined);
+
+		// Esc during the countdown.
+		harness.session.abortRetry();
+		await prompting.catch(() => undefined);
+		await harness.session.waitForIdle();
+
+		// The cancellation is the owner's stop, not the goal's failure.
+		expect(harness.session.goalState.status).not.toBe("error");
+		// Queued work stays queued: nothing ran after the abort.
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(getAssistantTexts(harness)).not.toContain("queued work answer");
+	});
+
+	it("drops a goal continuation handed back from the aborted run and repays its spend", async () => {
+		// Review 2026-10-04 item 6: when the abort wins the race against the
+		// continuation poll, the loop hands the polled products back. The Agent
+		// default re-queues them into the follow-up queue, so the stale goal
+		// continuation resurfaced after the owner's next prompt - and its
+		// continuationsUsed spend was never repaid.
+		const harness = await createGoalHarness();
+		harness.session.handleGoalHostRequest("goal.create", { objective: "finish the task" });
+
+		let releaseSecond!: () => void;
+		const secondGate = new Promise<void>((resolve) => {
+			releaseSecond = resolve;
+		});
+		harness.setResponses([
+			fauxAssistantMessage("first answer"),
+			async () => {
+				await secondGate;
+				return fauxAssistantMessage("second answer");
+			},
+		]);
+		const prompting = harness.session.prompt("work on it");
+		// Turn 1 answered; its goal continuation opened turn 2, which now hangs on
+		// the gate. The continuation poll already ran on this run's signal.
+		await vi.waitFor(() => expect(harness.faux.state.callCount).toBe(2), { timeout: 5_000, interval: 20 });
+
+		// Esc: the run (and with it the captured poll signal) aborts.
+		const aborting = harness.session.abort();
+		releaseSecond();
+		await aborting;
+		await prompting;
+		await harness.session.waitForIdle();
+
+		const usedAfterAbort = harness.session.goalState.continuationsUsed;
+		expect(usedAfterAbort).toBeGreaterThan(0);
+
+		// The continuation the poll produced for this run is in the transcript; the
+		// handback of that same product is what the loop does when the abort wins.
+		const continuation = [...harness.session.messages]
+			.reverse()
+			.find(
+				(message) =>
+					message.role === "custom" &&
+					(message as { customType?: string }).customType === GOAL_CONTEXT_CUSTOM_TYPE &&
+					(message as { details?: { kind?: string } }).details?.kind === "continuation",
+			);
+		expect(continuation).toBeDefined();
+
+		const agent = harness.session.agent;
+		expect(typeof agent.onUndeliveredMessages).toBe("function");
+		await agent.onUndeliveredMessages?.([continuation!], "continuation");
+
+		// Dropped, not re-queued, and the spend the model never saw is repaid.
+		expect(agent.hasQueuedMessages()).toBe(false);
+		expect(harness.session.goalState.continuationsUsed).toBe(usedAfterAbort - 1);
+	});
+
+	it("still re-queues handed-back steering and follow-up products", async () => {
+		// The drop is scoped to continuation products of an aborted run: the owner's
+		// own words (steering/follow-up) keep the Agent's re-queue default.
+		const harness = await createGoalHarness();
+		harness.setResponses([fauxAssistantMessage("answer")]);
+		await harness.session.prompt("work on it");
+
+		const agent = harness.session.agent;
+		expect(typeof agent.onUndeliveredMessages).toBe("function");
+		const followUpProduct = {
+			role: "custom" as const,
+			customType: "test_handback",
+			content: "handed back",
+			display: false,
+			timestamp: Date.now(),
+		};
+		await agent.onUndeliveredMessages?.([followUpProduct], "followUp");
+		expect(agent.hasQueuedMessages()).toBe(true);
+		expect(agent.removeQueuedMessages((message) => message === followUpProduct)).toEqual([followUpProduct]);
+	});
+
+	it("says how to extend the budget when resuming a budget-spent goal", async () => {
+		// Review 2026-10-04 new issue 3: a goal that spent its token budget could not
+		// be resumed at all - _resumeGoal re-observed the spent budget and silently
+		// stayed budget_limited, contradicting the "can be resumed" contract. Bare
+		// resume now fails loudly with the extension spelled out.
+		const harness = await createGoalHarness();
+		harness.setResponses([
+			assistantWithUsage("Spent the budget.", { input: 6, output: 5, totalTokens: 11 }),
+			fauxAssistantMessage("Wrapping up."),
+		]);
+		await harness.session.prompt("/goal --budget 10 do work");
+		expect(harness.session.goalState.status).toBe("budget_limited");
+
+		await harness.session.prompt("/goal resume");
+
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "custom",
+			customType: "session_slash_command_result",
+			details: { success: false },
+		});
+		const error = (harness.session.messages.at(-1) as { details?: { error?: string } }).details?.error ?? "";
+		expect(error).toContain("--budget");
+		expect(harness.session.goalState.status).toBe("budget_limited");
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it("extends the token budget with /goal resume --budget and continues the goal", async () => {
+		const harness = await createGoalHarness();
+		// The second answer serves the budget_limit steer turn the limit queues.
+		harness.setResponses([
+			assistantWithUsage("Spent the budget.", { input: 6, output: 5, totalTokens: 11 }),
+			fauxAssistantMessage("Wrapping up."),
+		]);
+		await harness.session.prompt("/goal --budget 10 do work");
+		expect(harness.session.goalState.status).toBe("budget_limited");
+
+		harness.setResponses([
+			fauxAssistantMessage("resumed work"),
+			fauxAssistantMessage(fauxToolCall("ipython", COMPLETE_GOAL_CELL), { stopReason: "toolUse" }),
+			fauxAssistantMessage("Goal complete."),
+		]);
+		await harness.session.prompt("/goal resume --budget 100000");
+
+		expect(harness.session.goalState).toMatchObject({ status: "complete", tokenBudget: 100000 });
+		expect(visibleAssistantTexts(harness)).toContain("resumed work");
+	});
+
+	it("extends the budget of a budget-spent goal after a restart", async () => {
+		// Fault injection for the same fix: the persisted budget_limited goal must
+		// survive the process swap with its spend intact, or the extension check
+		// would read a fresh 0 and resume into an instantly re-limiting goal.
+		const first = await createGoalHarness([], { persistSession: true });
+		first.setResponses([
+			assistantWithUsage("Spent the budget.", { input: 6, output: 5, totalTokens: 11 }),
+			fauxAssistantMessage("Wrapping up."),
+		]);
+		await first.session.prompt("/goal --budget 10 do work");
+		expect(first.session.goalState.status).toBe("budget_limited");
+		const sessionFile = first.session.sessionFile;
+		expect(sessionFile).toBeDefined();
+		first.session.dispose();
+
+		const second = await createGoalHarness([], { existingSessionFile: sessionFile! });
+		expect(second.session.goalState.status).toBe("budget_limited");
+		expect(second.session.goalState.tokensUsed).toBeGreaterThanOrEqual(11);
+
+		// Bare resume still refuses loudly after the restart.
+		await second.session.prompt("/goal resume");
+		expect(second.session.goalState.status).toBe("budget_limited");
+
+		second.setResponses([
+			fauxAssistantMessage("resumed after restart"),
+			fauxAssistantMessage(fauxToolCall("ipython", COMPLETE_GOAL_CELL), { stopReason: "toolUse" }),
+			fauxAssistantMessage("Goal complete."),
+		]);
+		await second.session.prompt("/goal resume --budget 100000");
+
+		expect(second.session.goalState).toMatchObject({ status: "complete", tokenBudget: 100000 });
+		expect(visibleAssistantTexts(second)).toContain("resumed after restart");
 	});
 
 	it("reports active goal elapsed time on status reads and goal.get", async () => {

@@ -23,6 +23,7 @@ import {
 	type ShouldStopAfterTurnContext,
 	type ThinkingLevel,
 	TOOL_CALL_ID_COLLISION_DIAGNOSTIC_TYPE,
+	type UndeliveredMessageSource,
 } from "@earendil-works/pi-agent-core";
 import type {
 	Api,
@@ -149,6 +150,7 @@ import {
 	compactionThresholdTokens,
 	type EmergencyShrinkPlan,
 	estimateContextTokens,
+	estimateTokensByContent,
 	generateBranchSummary,
 	isAssistantUsageSource,
 	planEmergencyShrink,
@@ -216,7 +218,6 @@ import {
 	type GoalContextDetails,
 	type GoalHostResponse,
 	type GoalState,
-	type GoalStatus,
 	goalContinuationLimit,
 	goalHostResponse,
 	goalTokenDeltaForUsage,
@@ -297,6 +298,7 @@ import {
 	createModelChangeMessage,
 	createSessionSlashCommandMessage,
 	createSessionSlashCommandResultMessage,
+	EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE,
 	HARNESS_DIGEST_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
@@ -473,7 +475,12 @@ import { cloneCustomMessage } from "./rlm-child-stall-notice.js";
 export type { RlmChildDeriveCounts };
 export { compactRlmText, resetRlmChildDeriveCounts, rlmChildDeriveCounts, rlmChildLabel };
 
-import type { RlmChildStallAbortFacts, RlmChildTurnAbortReason } from "./rlm-child-terminal.js";
+import {
+	RLM_CHILD_SETTLED_CUSTOM_TYPE,
+	type RlmChildSettledDetails,
+	type RlmChildStallAbortFacts,
+	type RlmChildTurnAbortReason,
+} from "./rlm-child-terminal.js";
 import { deliverRlmChildTerminalOutcome, recordRlmChildStallEvent } from "./rlm-child-terminal-outcome.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
@@ -513,6 +520,7 @@ import {
 	FINISH_GATE_MAX_STRIKES,
 	finishGateStrikesInRun,
 	lastUserPromptText,
+	PROVIDER_FAILURE_RECOVERY_CUSTOM_TYPE,
 	ranToolsSinceLastPrompt,
 	runHasVerificationEvidence,
 	SELF_RECOVERY_CUSTOM_ENTRY,
@@ -722,6 +730,12 @@ export type AgentSessionEvent =
 			finalError?: string;
 			/** "provider/model-id" restored after a backup-model retry succeeded. */
 			restoredModel?: string;
+			/**
+			 * The chain closed because an overflow compaction took over the
+			 * continuation: the task is still running, so this end is not a failure
+			 * (success stays true) and the marker lets a client render the handoff.
+			 */
+			supersededByCompaction?: boolean;
 	  }
 	| {
 			type: "auth_stale";
@@ -1525,7 +1539,7 @@ type GoalSlashCommand =
 	| { kind: "status" }
 	| { kind: "clear" }
 	| { kind: "pause" }
-	| { kind: "resume" }
+	| { kind: "resume"; tokenBudget?: number }
 	| { kind: "start"; objective: string; tokenBudget?: number; persistent?: boolean };
 
 type AutonomousSlashCommand = { kind: "status" } | { kind: "on"; config?: AgentAutonomousConfig } | { kind: "off" };
@@ -2410,6 +2424,26 @@ export class AgentSession {
 	private _goalContinuationLastAt: number | undefined;
 	/** The one pending wake a throttled persistent-goal continuation may hold. */
 	private _goalContinuationWakeTimer: ReturnType<typeof setTimeout> | undefined;
+	/**
+	 * The abort signal of the run the last continuation poll served. The loop hands
+	 * back the products of a poll its abort beat; `aborted` on this signal is how
+	 * the handback knows the run was stopped rather than merely outraced.
+	 */
+	private _continuationPollSignal: AbortSignal | undefined;
+	/**
+	 * The spend behind the most recently produced goal continuation, for repaying
+	 * it when the run's abort keeps the continuation from ever being delivered.
+	 * Overwritten by each production; identity-matched on handback, and a
+	 * delivered continuation is never handed back, so a stale record cannot match.
+	 */
+	private _goalContinuationHandout:
+		| {
+				messages: readonly AgentMessage[];
+				previousGoal: GoalState;
+				previousAccountingStartedAt: number | undefined;
+				previousContinuationLastAt: number | undefined;
+		  }
+		| undefined;
 	/** Injected watchdog timers; undefined means real timers (production). */
 	readonly _stallWatchdogTimers: StallWatchdogTimers | undefined;
 	/** Aggregates the kernel/host facts the watchdog's vouch samples (T1-3). */
@@ -2832,6 +2866,36 @@ export class AgentSession {
 
 	private _installAgentContinuationHook(): void {
 		this.agent.getContinuationMessages = (context, signal) => this._getContinuationMessages(context, signal);
+		this.agent.onUndeliveredMessages = (messages, source) => this._handBackUndeliveredMessages(messages, source);
+	}
+
+	/**
+	 * The loop hands back products a poll already spent but the run never consumed
+	 * (the abort won the race, or the run died first). The Agent default re-queues
+	 * everything; here, continuation products of an aborted run are regenerable -
+	 * the next turn's poll re-derives them from live state - so re-queueing only
+	 * resurfaces a stale continuation after the owner's next prompt. Drop them and
+	 * repay the goal continuation spend that produced them. Steering and follow-up
+	 * products are the owner's words: keep the default.
+	 */
+	private _handBackUndeliveredMessages(messages: AgentMessage[], source: UndeliveredMessageSource): void {
+		if (source === "continuation" && this._continuationPollSignal?.aborted === true) {
+			this._repayUndeliveredGoalContinuation(messages);
+			return;
+		}
+		if (source === "steering") this.agent.steer(messages);
+		else this.agent.followUp(messages);
+	}
+
+	/** Repay the continuation spend when the handed-back batch is the one the goal poll produced. */
+	private _repayUndeliveredGoalContinuation(messages: AgentMessage[]): void {
+		const handout = this._goalContinuationHandout;
+		if (!handout) return;
+		if (!handout.messages.some((message) => messages.includes(message))) return;
+		this._goalContinuationHandout = undefined;
+		this._setGoalState(handout.previousGoal);
+		this._goalAccountingStartedAt = handout.previousAccountingStartedAt;
+		this._goalContinuationLastAt = handout.previousContinuationLastAt;
 	}
 
 	/**
@@ -2846,6 +2910,7 @@ export class AgentSession {
 	private _refreshAgentLoopRuntimeSettings(): void {
 		this.agent.emptyTurnRetry = this.settingsManager.getEmptyTurnRetrySettings();
 		this.agent.toolTimeout = resolvedToolTimeoutConfig(this);
+		this.agent.toolNotFoundBreaker = this.settingsManager.getToolNotFoundBreakerSettings();
 		this._configureCrossLayerRequestBudget();
 	}
 
@@ -3337,8 +3402,22 @@ export class AgentSession {
 		if (persistent) goal.persistent = true;
 		this._goalAccountingStartedAt = now;
 		this._goalContinuationAwaitsRlmWork = false;
+		// A new goal starts with a clean throttle clock: inheriting the previous
+		// goal's last-continuation timestamp would throttle this goal's first
+		// continuation by however much of the interval is left, and a wake armed
+		// for the old goal would fire into this one.
+		this._goalContinuationLastAt = undefined;
+		this._clearGoalContinuationWake();
 		this._setGoalState(goal);
 		return this._goalState;
+	}
+
+	/** Disarm the throttled persistent-goal continuation's pending wake, if any. */
+	private _clearGoalContinuationWake(): void {
+		if (this._goalContinuationWakeTimer !== undefined) {
+			clearTimeout(this._goalContinuationWakeTimer);
+			this._goalContinuationWakeTimer = undefined;
+		}
 	}
 
 	private _clearGoal(): void {
@@ -3362,7 +3441,7 @@ export class AgentSession {
 		});
 	}
 
-	private async _resumeGoal(): Promise<void> {
+	private async _resumeGoal(tokenBudget?: number): Promise<void> {
 		if (!this._goalState.objective) {
 			this._emitGoalUpdate();
 			return;
@@ -3373,17 +3452,28 @@ export class AgentSession {
 		}
 		const exhausted =
 			this._goalState.tokenBudget !== undefined && this._goalState.tokensUsed >= this._goalState.tokenBudget;
-		const nextStatus: GoalStatus = exhausted ? "budget_limited" : "active";
+		// A spent token budget cannot be resumed into: the goal would re-limit on
+		// the first continuation and the "resumed" promise would be a lie. The owner
+		// extends the budget explicitly, or clears the goal.
+		if (exhausted && tokenBudget === undefined) {
+			throw new Error(
+				`Goal token budget already reached (${this._goalState.tokensUsed}/${this._goalState.tokenBudget} tokens). Extend it with /goal resume --budget <tokens>, or clear the goal with /goal clear.`,
+			);
+		}
+		if (tokenBudget !== undefined && tokenBudget <= this._goalState.tokensUsed) {
+			throw new Error(
+				`Goal token budget must exceed the tokens already used (${this._goalState.tokensUsed}); got ${tokenBudget}.`,
+			);
+		}
 		this._setGoalState({
 			...this._goalState,
-			active: nextStatus === "active",
-			status: nextStatus,
-			lastReason: exhausted ? "Goal token budget already reached" : undefined,
+			active: true,
+			status: "active",
+			tokenBudget: tokenBudget ?? this._goalState.tokenBudget,
+			lastReason: undefined,
 			lastError: undefined,
 		});
-		if (nextStatus === "active") {
-			await this._runOrQueueGoalContext("continuation");
-		}
+		await this._runOrQueueGoalContext("continuation");
 	}
 
 	private _finishGoalWithError(errorMessage: string): void {
@@ -3454,6 +3544,22 @@ export class AgentSession {
 		}
 		if (normalized === "resume") {
 			return { kind: "resume" };
+		}
+		if (normalized.startsWith("resume ")) {
+			// The one resume parameter: a new token budget, for a goal that stopped at
+			// its old one. Anything else is a usage error, not a silent ignore.
+			const args = rest.slice("resume ".length).trim();
+			const separator = args.indexOf("=");
+			let valueText: string | undefined;
+			if (separator > 0 && (args.startsWith("--budget=") || args.startsWith("--token-budget="))) {
+				valueText = args.slice(separator + 1);
+			} else if (args.startsWith("--budget ") || args.startsWith("--token-budget ")) {
+				valueText = args.slice(args.indexOf(" ") + 1).trim();
+			}
+			if (valueText === undefined) {
+				throw new Error("Usage: /goal resume [--budget <tokens>]");
+			}
+			return { kind: "resume", tokenBudget: parseGoalBudgetValue(valueText) };
 		}
 
 		const persistentParse = parseGoalPersistentFlag(rest);
@@ -4091,7 +4197,7 @@ export class AgentSession {
 		}
 
 		if (command.kind === "resume") {
-			await this._resumeGoal();
+			await this._resumeGoal(command.tokenBudget);
 			return true;
 		}
 
@@ -4887,6 +4993,9 @@ export class AgentSession {
 		}
 		try {
 			this._ensureGoalRuntimeActive(context.context);
+			const previousGoal = this._goalState;
+			const previousAccountingStartedAt = this._goalAccountingStartedAt;
+			const previousContinuationLastAt = this._goalContinuationLastAt;
 			const nextGoal = {
 				...this._goalState,
 				continuationsUsed: this._goalState.continuationsUsed + 1,
@@ -4895,7 +5004,17 @@ export class AgentSession {
 			};
 			this._setGoalState(nextGoal);
 			this._goalContinuationLastAt = Date.now();
-			return [createGoalContextMessage(this._goalState, "continuation")];
+			const produced = [createGoalContextMessage(this._goalState, "continuation")];
+			// The spend rides with the handout: if the run's abort keeps the
+			// continuation from ever being delivered, the loop hands it back and
+			// _repayUndeliveredGoalContinuation puts the budget back.
+			this._goalContinuationHandout = {
+				messages: produced,
+				previousGoal,
+				previousAccountingStartedAt,
+				previousContinuationLastAt,
+			};
+			return produced;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			try {
@@ -4973,6 +5092,7 @@ export class AgentSession {
 		context: GetContinuationMessagesContext,
 		signal?: AbortSignal,
 	): Promise<AgentMessage[]> {
+		this._continuationPollSignal = signal;
 		if (this.queuedActionCount > 0) {
 			return [];
 		}
@@ -4982,40 +5102,64 @@ export class AgentSession {
 		const goalMessages = await this._getGoalContinuationMessages(context, signal);
 		if (goalMessages.length > 0 || signal?.aborted) {
 			if (goalMessages.length > 0 && this._sessionInputArrivalEpoch !== arrivalEpoch) {
+				this._goalContinuationHandout = undefined;
 				this._setGoalState(goalSnapshot);
 				this._goalAccountingStartedAt = goalAccountingStartedAt;
 				return [];
 			}
 			return goalMessages;
 		}
-		if (
+		// The suppression belongs to the autonomous loop only on a recovery turn: a
+		// provider-failure or empty-turn recovery turn is admitted with it so the
+		// /autonomous machinery cannot re-loop the run, but a recovery turn that
+		// stops mid-task still gets its self-recovery continue - otherwise an
+		// unattended task parks at the announcement the recovery itself produced.
+		// Every other suppressed prompt (gate retries, heartbeats, terminal
+		// notices) keeps the full suppression: their own drivers own continuation.
+		const suppressAutonomous =
 			this._autonomousContinuationSuppressionDepth > 0 ||
-			context.newMessages.some((message) => this._autonomousContinuationSuppressedMessages.has(message))
-		) {
+			context.newMessages.some((message) => this._autonomousContinuationSuppressedMessages.has(message));
+		if (suppressAutonomous && !this._isRecoveryTurnContinuation(context.newMessages)) {
 			return [];
 		}
-		// Delegating and ending the turn is correct behavior; hold the
-		// continuation until descendants settle instead of re-prompting a
-		// waiting parent, mirroring the goal gate above.
-		if (this._holdAutonomousContinuationForRlmWork(context.message)) {
-			return [];
-		}
-		const autonomousSnapshot = this._snapshotAutonomousRuntimeState();
-		const autonomousMessage = await nextAutonomousContinuation(this._autonomousState, context.message, {
-			cwd: this._cwd,
-			signal,
-		});
-		if (autonomousMessage && this._sessionInputArrivalEpoch !== arrivalEpoch) {
-			this._restoreAutonomousRuntimeSnapshot(autonomousSnapshot);
-			return [];
-		}
-		if (autonomousMessage) {
-			this._recordAutonomousContinuationDutyEvent(autonomousMessage);
-			return [autonomousMessage];
+		if (!suppressAutonomous) {
+			// Delegating and ending the turn is correct behavior; hold the
+			// continuation until descendants settle instead of re-prompting a
+			// waiting parent, mirroring the goal gate above.
+			if (this._holdAutonomousContinuationForRlmWork(context.message)) {
+				return [];
+			}
+			const autonomousSnapshot = this._snapshotAutonomousRuntimeState();
+			const autonomousMessage = await nextAutonomousContinuation(this._autonomousState, context.message, {
+				cwd: this._cwd,
+				signal,
+			});
+			if (autonomousMessage && this._sessionInputArrivalEpoch !== arrivalEpoch) {
+				this._restoreAutonomousRuntimeSnapshot(autonomousSnapshot);
+				return [];
+			}
+			if (autonomousMessage) {
+				this._recordAutonomousContinuationDutyEvent(autonomousMessage);
+				return [autonomousMessage];
+			}
 		}
 		if (signal?.aborted || this._sessionInputArrivalEpoch !== arrivalEpoch) return [];
 		const selfRecovery = this._selfRecoveryContinuation(context);
 		return selfRecovery ? [selfRecovery] : [];
+	}
+
+	/**
+	 * Whether this run's prompt is a provider-failure or empty-response recovery
+	 * continuation - the one suppressed prompt class whose turn still gets
+	 * self-recovery (review 2026-10-04 item 4).
+	 */
+	private _isRecoveryTurnContinuation(newMessages: readonly AgentMessage[]): boolean {
+		return newMessages.some(
+			(message) =>
+				message.role === "custom" &&
+				(message.customType === PROVIDER_FAILURE_RECOVERY_CUSTOM_TYPE ||
+					message.customType === EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE),
+		);
 	}
 
 	/**
@@ -5395,6 +5539,12 @@ export class AgentSession {
 	}
 
 	private _handleAgentEvent = (event: AgentEvent): void => {
+		if (event.type === "agent_start") {
+			// The abortRetry half of _goalAbortInProgress: a new run means the
+			// cancelled chain's terminal error was already consumed (or is never
+			// coming), so a failure of this run must fail the goal again.
+			this._goalAbortInProgress = false;
+		}
 		trackStallStepOutput(this, event);
 		recordStallWatchdogActivity(this, event);
 		this._recordFallbackActivity(event);
@@ -5449,12 +5599,15 @@ export class AgentSession {
 					this._actionStore.ticketFor(action).settleDelivered({ status: "delivered" });
 					this._settleAgentMessage(action.agentMessageId, "delivery");
 					this._creditQueuedChildReplyDelivery(event.message);
+					this._noteAgentMessageDelivered(this._agentMessageDeliveryId(action, event.message));
 				} else if (record) {
 					// A child reply can also ride in as prefix/next-turn context (a restart
 					// reflow, an aggregated wake): it reaches this session's context all the
 					// same, so the credit is owed. `take` hands an id out once, so a message
 					// delivered on both routes cannot be counted twice.
 					this._creditQueuedChildReplyDelivery(event.message);
+					// Same for the delivered ledger: a reflowed delivery is a delivery.
+					this._noteAgentMessageDelivered(this._agentMessageDeliveryId(action, event.message));
 				}
 			}
 		} else if (event.type === "message_end" && (event.message.role === "user" || event.message.role === "custom")) {
@@ -5599,6 +5752,24 @@ export class AgentSession {
 			sessionLog.warn("could not record a duty event", {
 				sessionId: this.sessionId,
 				kind: event.kind,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	/**
+	 * Append the transcript-only settle record for a run that ended by replying
+	 * (rlm-child-terminal-outcome). A `custom` entry: never a message, so it never
+	 * enters the model's context or renders - the compaction handoff scanner is the
+	 * only reader.
+	 */
+	_recordRlmChildSettled(details: RlmChildSettledDetails): void {
+		try {
+			this.sessionManager.appendCustomEntry(RLM_CHILD_SETTLED_CUSTOM_TYPE, details);
+		} catch (error) {
+			sessionLog.warn("could not record an rlm child settle marker", {
+				sessionId: this.sessionId,
+				childId: details.childId,
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
@@ -5907,11 +6078,10 @@ export class AgentSession {
 				// (its scheduled continue waits on waitForRetry() first), so returning
 				// with the chain still open wedges the continuation on a promise
 				// nobody will resolve - isRetrying sticks and only Esc unwedges the
-				// session. Close it exactly like the empty-ladder recovery above:
-				// _finishActiveRetryWithFailure is idempotent (no-op without a live
-				// chain) and keeps the retry ledger honest (auto_retry_end
-				// success:false, backup restore, counter reset).
-				this._finishActiveRetryWithFailure(msg);
+				// session. The handoff is not a failure - the task continues through
+				// the compaction - so the chain closes with a non-failure end event;
+				// a success:false here painted one fake "retry failed" per overflow.
+				this._finishActiveRetryForCompactionHandoff(msg);
 				this._resolveRetry();
 				return;
 			}
@@ -6254,10 +6424,7 @@ export class AgentSession {
 		// a disposed session must not keep a live timer (or a fake-clock registration).
 		this._clearCompactionGateWatchdog();
 		this._clearRlmTerminalNoticeAbandonTimer();
-		if (this._goalContinuationWakeTimer !== undefined) {
-			clearTimeout(this._goalContinuationWakeTimer);
-			this._goalContinuationWakeTimer = undefined;
-		}
+		this._clearGoalContinuationWake();
 		for (const run of this._unsettledRlmChildRuns) run.suppressTerminalNotice = true;
 		for (const controller of this._rlmQuiescenceWaitAborts) controller.abort();
 		this._sessionActionCommitDisposeAbortController.abort();
@@ -6844,13 +7011,55 @@ export class AgentSession {
 
 	/** Monotonic count of agent messages admitted for this session; backs the protocol-5 message wake. */
 	private _agentMessageArrivalCount = 0;
+	/**
+	 * Monotonic count of admitted agent messages that are no longer pending: delivered
+	 * into the conversation, or settled as undeliverable (cleared before their turn
+	 * ever ran). This - not the arrival count - is the wake baseline a collect counts
+	 * news against: an admitted-but-undelivered message is still news the model has
+	 * not seen, and the wake is what pushes it to end the turn so the message lands.
+	 */
+	private _agentMessageDeliveredCount = 0;
+	/**
+	 * Arrival-counted message ids still awaiting delivery; `arrival - delivered` in
+	 * set form. The set (not a bare counter) is what keeps the delivered count exact:
+	 * an id enters once at admission and leaves once at delivery or drop, so a
+	 * reflowed message delivered twice still counts once.
+	 */
+	private readonly _pendingAgentMessageDeliveryIds = new Set<string>();
 	/** Parked wake_on_message collect waits to nudge when the count advances; each re-checks the count. */
 	private readonly _agentMessageArrivalWaiters = new Set<() => void>();
 
-	private _noteAgentMessageAdmitted(): void {
+	private _noteAgentMessageAdmitted(admissionMessageId?: string): void {
 		this._agentMessageArrivalCount += 1;
+		if (admissionMessageId !== undefined) this._pendingAgentMessageDeliveryIds.add(admissionMessageId);
 		for (const waiter of [...this._agentMessageArrivalWaiters]) waiter();
 		void this._ipythonKernelProvisioner?.manager?.notifyAgentMessageArrived?.();
+	}
+
+	/**
+	 * An admitted agent message left the pending set: delivered into the
+	 * conversation, or dropped before its turn ever ran. Unknown or repeat ids are
+	 * no-ops, so the delivered count advances exactly once per admission. The kernel
+	 * learns the remaining pending count so its own ledger can clamp down to it (a
+	 * delivered message must not stay "pending" for the model).
+	 */
+	private _noteAgentMessageDelivered(messageId: string | undefined): void {
+		if (messageId === undefined || !this._pendingAgentMessageDeliveryIds.delete(messageId)) return;
+		this._agentMessageDeliveredCount += 1;
+		void this._ipythonKernelProvisioner?.manager?.notifyAgentMessageDelivered?.(
+			this._pendingAgentMessageDeliveryIds.size,
+		);
+	}
+
+	/**
+	 * The id an admission was tracked under, recovered at delivery: the custom
+	 * envelope's own id, or the legacy text-encoded one for a text-only admission
+	 * (the same expression the admission sites compute).
+	 */
+	private _agentMessageDeliveryId(action: QueuedSessionAction, message: AgentMessage): string | undefined {
+		if (isAgentSessionMessage(message)) return message.details.id;
+		if (action.payload.kind === "turn") return parseAgentSessionMessagePromptId(action.payload.text);
+		return undefined;
 	}
 
 	private _waitForAgentMessageArrival(since: number, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
@@ -6878,6 +7087,10 @@ export class AgentSession {
 	async acceptAgentMessagePrompt(text: string, options?: PromptOptions): Promise<void> {
 		const customMessage =
 			options?.customMessage && isAgentSessionMessage(options.customMessage) ? options.customMessage : undefined;
+		// The id the pending-delivery ledger tracks this admission under: the custom
+		// envelope's own id, or the legacy text-encoded one. Keyed by the message, never
+		// by options.agentMessageId (a caller-supplied tracking id that may differ).
+		const admissionMessageId = customMessage?.details.id ?? parseAgentSessionMessagePromptId(text);
 		const clearEpoch = this._agentMessageClearEpoch;
 		const admissionCommitted = () => {
 			options?.admissionCommitted?.();
@@ -6898,7 +7111,7 @@ export class AgentSession {
 			}
 			admissionCommitted();
 			const queued = await this.queueAgentMessagePrompt(text, options.streamingBehavior, customMessage);
-			if (queued) this._noteAgentMessageAdmitted();
+			if (queued) this._noteAgentMessageAdmitted(admissionMessageId);
 			options.preflightResult?.(queued, queued, "target_suspended");
 			return;
 		}
@@ -6922,7 +7135,7 @@ export class AgentSession {
 			if (compactionGate === "compaction_pending") this._startThresholdCompactionForIncomingInput();
 			else this._armCompactionGateWatchdog();
 			const queued = await this.queueAgentMessagePrompt(text, options.streamingBehavior, customMessage);
-			if (queued) this._noteAgentMessageAdmitted();
+			if (queued) this._noteAgentMessageAdmitted(admissionMessageId);
 			options.preflightResult?.(queued, queued, "compaction_pending");
 			sessionLog.info("agent message queued behind compaction", {
 				sessionId: this.sessionId,
@@ -6955,7 +7168,7 @@ export class AgentSession {
 			admissionCommitted,
 			preflightResult: reportPreflight,
 		});
-		this._noteAgentMessageAdmitted();
+		this._noteAgentMessageAdmitted(admissionMessageId);
 		if (customMessage?.details.fromRelationship === "parent") this._noteParentFollowUpAdmitted();
 	}
 
@@ -10079,6 +10292,16 @@ export class AgentSession {
 			// A cleared reply is never delivered, so the credit owed for it dies here:
 			// B1 keeps an undelivered reply from counting.
 			if (action.agentMessageId !== undefined) this._queuedChildReplyBackfills.take(action.agentMessageId);
+			// The delivered ledger settles the same way: a cleared message must not
+			// stay "pending" forever, or every later collect would wake for it.
+			if (action.payload.kind === "turn") {
+				const custom = action.payload.customMessage;
+				this._noteAgentMessageDelivered(
+					custom && isAgentSessionMessage(custom)
+						? custom.details.id
+						: parseAgentSessionMessagePromptId(action.payload.text),
+				);
+			}
 		}
 		for (const [accepted, error] of [
 			[true, acceptedError],
@@ -12663,6 +12886,33 @@ export class AgentSession {
 	}
 
 	/**
+	 * The context size a model-switch window check reads (fallback chain, backup
+	 * model). `getContextUsage()` is the fresh caliber, but right after a
+	 * compaction it reports `tokens: null` - the only usage anchors are
+	 * pre-compaction - and a bare `estimateContextTokens` anchors on that stale
+	 * usage, over-reporting by the summarized-away span. Both failure modes are
+	 * the one the threshold caliber (`_estimateThresholdContextTokens`) exists
+	 * for: a stale anchor is discarded and the whole current context is priced by
+	 * content, the same fallback the estimator uses when no anchor exists.
+	 */
+	private _estimateCurrentContextTokens(): number {
+		const fromUsage = this.getContextUsage()?.tokens;
+		if (typeof fromUsage === "number") return fromUsage;
+		const messages = this.agent.state.messages;
+		const estimate = estimateContextTokens(messages);
+		if (estimate.lastUsageIndex === null) return estimate.tokens;
+		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const compactionTimestamp = compactionEntry ? new Date(compactionEntry.timestamp).getTime() : undefined;
+		const anchor = messages[estimate.lastUsageIndex];
+		const anchorIsStale =
+			compactionTimestamp !== undefined && anchor?.role === "assistant" && anchor.timestamp <= compactionTimestamp;
+		if (!anchorIsStale) return estimate.tokens;
+		let total = 0;
+		for (const message of messages) total += estimateTokensByContent(message);
+		return total;
+	}
+
+	/**
 	 * A routed image model overflowed although the owner's session is within the session
 	 * model's threshold. Its request was already cut to its window
 	 * (imageRouteRequestContext in image-routing.ts), so what is left is the image turn
@@ -13976,6 +14226,7 @@ export class AgentSession {
 				{
 					messageWake: {
 						arrivalCount: () => this._agentMessageArrivalCount,
+						deliveredCount: () => this._agentMessageDeliveredCount,
 						waitForArrival: (since, waitMs, signal) => this._waitForAgentMessageArrival(since, waitMs, signal),
 					},
 					// The same live value the kernel bounds a read-only host request with
@@ -15421,6 +15672,34 @@ export class AgentSession {
 	}
 
 	/**
+	 * Close the live retry chain when an overflow compaction takes over the turn.
+	 * Same ledger cleanup as a failure close (idempotent without a live chain,
+	 * backup restore, counter reset), but the end event is not a failure: the
+	 * task continues through the compaction, and a success:false here painted
+	 * one fake "retry failed" per overflow (review 2026-10-04, new issue 8).
+	 */
+	private _finishActiveRetryForCompactionHandoff(message: AssistantMessage): void {
+		if (this._retryAttempt === 0) {
+			return;
+		}
+		// Same auth-stale bookkeeping a failure close performs: the chain's
+		// captured sources still describe a provider that rejected this episode.
+		this._markProviderAuthStaleForRetryFailure(message);
+		const restoredModel = this._restorePrimaryModelAfterBackup();
+		this._emit({
+			type: "auto_retry_end",
+			success: true,
+			attempt: this._retryAttempt,
+			supersededByCompaction: true,
+			...(restoredModel ? { restoredModel } : {}),
+		});
+		this._terminalFailureAttemptCount = this._retryAttempt;
+		this._retryAttempt = 0;
+		this._providerWait = undefined;
+		this._retryAuthFailureSources = [];
+	}
+
+	/**
 	 * Queue the one-shot recovery continuation for an exhausted empty-response ladder
 	 * (r4 recovery): the failure shape goes back to the model as a custom message that
 	 * wakes an idle session, so the task gets a turn to recover itself instead of a
@@ -16022,8 +16301,7 @@ export class AgentSession {
 		// Same 0.9 headroom as the fallback chain; when the measured usage is
 		// unknowable (right after a compaction), price the context by content.
 		if (backupModel.contextWindow > 0) {
-			const contextTokens =
-				this.getContextUsage()?.tokens ?? estimateContextTokens(this.agent.state.messages).tokens;
+			const contextTokens = this._estimateCurrentContextTokens();
 			if (contextTokens > backupModel.contextWindow * 0.9) {
 				return undefined;
 			}
@@ -16116,7 +16394,11 @@ export class AgentSession {
 		}
 		const serving = this._runModel();
 		if (serving) excluded.add(key(serving));
-		const contextTokens = this.getContextUsage()?.tokens ?? 0;
+		// Post-compaction the measured usage is unknowable (getContextUsage reports
+		// tokens: null): the shared estimator prices the current context by content
+		// instead of letting every chain entry pass the window check on a 0, or
+		// anchoring on a stale pre-compaction usage and skipping models that fit.
+		const contextTokens = this._estimateCurrentContextTokens();
 		const available = this._modelRegistry.getAvailable();
 		// A run routed for images, or a vision model already reading images in this
 		// context, must not move to a model that would silently drop them.
@@ -16985,6 +17267,26 @@ export class AgentSession {
 	}
 
 	abortRetry(): void {
+		// An abort disarms the throttled persistent-goal continuation's wake: it was
+		// armed for the run the owner just stopped, and firing it later would
+		// continue the goal behind the owner's back (it only died with dispose()).
+		this._clearGoalContinuationWake();
+		// Esc during a retry countdown lands here rather than in abort(): align the
+		// two. An active goal must not read the cancelled chain's terminal error as
+		// the goal's own failure (the in-flight agent_end resumes when the sleep
+		// rejects, and reaches _finishGoalForTerminalAssistantMessage), and queued
+		// work must not restart behind the owner's back - the pump suspends exactly
+		// as requestAbort suspends it, and the next admission lifts it again. The
+		// update-restart fence fields are untouched: abortForUpdateRestart owns
+		// those and calls into here after arming them.
+		if (this._retryAbortController || this._retryAttempt > 0) {
+			this._goalAbortInProgress = this._goalState.status === "active";
+			this._sessionInputPumpRequested = false;
+			this._sessionInputPumpEpoch++;
+			this._sessionInputPumpSuspended = true;
+			this._sessionInputSuspendedSince = Date.now();
+			this._failureWakeUsedForSuspension = false;
+		}
 		if (this._retryAbortController) {
 			this._retryAbortController.abort();
 			return;

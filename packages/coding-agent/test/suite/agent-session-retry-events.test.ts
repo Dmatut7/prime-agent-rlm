@@ -461,6 +461,45 @@ describe("AgentSession retry and event characterization", () => {
 		) as Array<Extract<AssistantMessage, { role: "custom" }>>;
 	}
 
+	const echoTool: AgentTool = {
+		name: "echo",
+		label: "echo",
+		description: "echo",
+		parameters: Type.Object({ text: Type.String() }),
+		execute: async (_id, params) => ({
+			content: [{ type: "text", text: String((params as { text: string }).text) }],
+			details: {},
+		}),
+	};
+
+	it("a provider-failure recovery turn still gets its self-recovery continue when it stops mid-task", async () => {
+		// Review 2026-10-04 item 4: the recovery turn is admitted with
+		// suppressAutonomousContinuation, which used to blanket-suppress the whole
+		// continuation hook - self-recovery included - so a recovery turn that ended
+		// with "接下来我会…" left the unattended task parked at the announcement.
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 } },
+			tools: [echoTool],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			// The recovery turn does tool work, then ends by announcing the next step.
+			fauxAssistantMessage(fauxToolCall("echo", { text: "ping" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("服务商已恢复，连接正常。接下来我会整理结果并给出结论。"),
+			fauxAssistantMessage("结果：ping。"),
+		]);
+
+		await harness.session.prompt("test");
+		await harness.session.waitForIdle();
+
+		expect(providerFailureRecoveries(harness)).toHaveLength(1);
+		// The announced next step got its self-recovery continue instead of parking.
+		expect(harness.faux.state.callCount).toBe(5);
+		expect(getAssistantTexts(harness).at(-1)).toBe("结果：ping。");
+	});
+
 	it("retry.enabled false means a single attempt with zero slow-tier resends (wiring pin)", async () => {
 		const harness = await createHarness({
 			settings: { retry: { enabled: false, emptyTurn: { escalatedBaseDelayMs: 50, escalatedMaxDelayMs: 50 } } },
@@ -701,13 +740,14 @@ describe("AgentSession retry and event characterization", () => {
 			// waits on waitForRetry() before it may run: returning with the chain
 			// still open wedged the continuation on a promise nobody resolves
 			// (isRetrying stuck, no auto_retry_end, Esc the only escape). The chain
-			// must close as a failure before the continuation is left to run.
+			// must close before the continuation is left to run - and the close is
+			// not a failure, because the task continues through the compaction.
 			expect(internals._retryAttempt).toBe(0);
 			expect(harness.session.isRetrying).toBe(false);
 			expect(harness.eventsOfType("auto_retry_end").at(-1)).toMatchObject({
-				success: false,
+				success: true,
 				attempt: 1,
-				finalError: "prompt is too long",
+				supersededByCompaction: true,
 			});
 		} finally {
 			internals._checkCompaction = originalCheckCompaction;

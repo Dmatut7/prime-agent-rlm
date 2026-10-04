@@ -641,7 +641,13 @@ describe("ENG-4685 daemon-backed client modes", () => {
 			},
 		);
 
-		expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+		// The --model preflight now downgrades to a warning when extensions may load
+		// (faux/faux is extension-registered, invisible to the static catalog): the
+		// drain-before-EOF behavior this test pins is orthogonal to that warning.
+		expect(result).toMatchObject({ code: 0, signal: null });
+		expect(result.stderr).toContain(
+			"Extensions are configured; one of them may still register this model at startup.",
+		);
 		expect(result.stdout).toContain('{"id":"prompt","type":"response","command":"prompt","success":true}');
 		expect(result.stdout).toContain("rpc eof response");
 		expect(result.stdout).toContain('"type":"agent_end"');

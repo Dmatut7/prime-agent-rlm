@@ -177,6 +177,15 @@ describe("provider fallback chain (unattended self-recovery)", () => {
 		expect(harness.session.model?.id).toBe("faux-kimi");
 	});
 
+	it("passes the toolNotFoundBreaker setting through to the agent loop", async () => {
+		// Review 2026-10-04 item 3 seam: the loop-side breaker mechanism got its
+		// settings surface as `tools.notFoundBreaker` (settings-manager); AgentSession
+		// reads it and hands it to the Agent at construction and on every dispatch
+		// refresh.
+		const harness = await harnessWith({ tools: { notFoundBreaker: { terminateAfter: 2, recoveryTurns: 0 } } });
+		expect(harness.session.agent.toolNotFoundBreaker).toEqual({ terminateAfter: 2, recoveryTurns: 0 });
+	});
+
 	it("moves a run off a model that keeps calling tools that do not exist", async () => {
 		const harness = await harnessWith({}, [echoTool]);
 		const served: string[] = [];
