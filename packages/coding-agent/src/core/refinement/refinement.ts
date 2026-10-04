@@ -97,6 +97,12 @@ export const DEFAULT_HARNESS_PATH_VOCABULARY: readonly string[] = [
 // production store; evidence docs/fork/evidence/harness-near-duplicate-write-gate.md).
 const NEAR_DUPLICATE_SIMILARITY_MIN = 0.4;
 const NEAR_DUPLICATE_MAX_MATCHES = 3;
+// Two-band threshold (harness.py `_NEAR_DUPLICATE_SMALL_CORPUS*`): below ten
+// memories the idf weights are too coarse for the 0.40 band - every term is
+// rare, so generic shared bigrams score like distinctive ones - and the floor
+// rises to the consolidation-grade 0.55.
+const NEAR_DUPLICATE_SMALL_CORPUS = 10;
+const NEAR_DUPLICATE_SMALL_CORPUS_SIMILARITY_MIN = 0.55;
 
 /**
  * Bump when the fingerprinted material or its canonical serialization changes,
@@ -1281,8 +1287,11 @@ function searchableText(value: unknown): string {
  * Port of the Python harness `_near_duplicate_memory_matches`: rank the
  * corpus's other memories by idf-weighted cosine against the candidate over
  * title+content, keep matches at `_NEAR_DUPLICATE_SIMILARITY_MIN` or better,
- * best first, capped at `_NEAR_DUPLICATE_MAX_MATCHES`. The candidate is
- * expected inside the corpus (the write already landed) and is excluded by id.
+ * best first, capped at `_NEAR_DUPLICATE_MAX_MATCHES` - except below
+ * `_NEAR_DUPLICATE_SMALL_CORPUS` memories, where the coarse idf makes the
+ * 0.40 band fire on related-but-distinct entries and the floor rises to
+ * `_NEAR_DUPLICATE_SMALL_CORPUS_SIMILARITY_MIN`. The candidate is expected
+ * inside the corpus (the write already landed) and is excluded by id.
  */
 export function nearDuplicateMemoryMatches(
 	corpus: readonly HarnessEntry[],
@@ -1290,6 +1299,10 @@ export function nearDuplicateMemoryMatches(
 ): HarnessNearDuplicateMatch[] {
 	const terms = new Set(harnessSearchQueryTerms(`${candidate.title} ${candidate.content}`));
 	if (terms.size === 0 || corpus.length < 2) return [];
+	const minScore =
+		corpus.length >= NEAR_DUPLICATE_SMALL_CORPUS
+			? NEAR_DUPLICATE_SIMILARITY_MIN
+			: NEAR_DUPLICATE_SMALL_CORPUS_SIMILARITY_MIN;
 	const profiles = new Map<string, Set<string>>();
 	for (const entry of corpus) {
 		profiles.set(
@@ -1329,7 +1342,7 @@ export function nearDuplicateMemoryMatches(
 		norm = Math.sqrt(norm);
 		if (norm === 0) continue;
 		const score = dot / (candidateNorm * norm);
-		if (score >= NEAR_DUPLICATE_SIMILARITY_MIN) {
+		if (score >= minScore) {
 			matches.push({ id: entry.id, score });
 		}
 	}

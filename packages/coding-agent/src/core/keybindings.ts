@@ -176,10 +176,12 @@ export const KEYBINDINGS = {
 	"app.subagents.prev": {
 		defaultKeys: "left",
 		description: "Select the previous subagent in the strip below the prompt",
+		repeatable: true,
 	},
 	"app.subagents.next": {
 		defaultKeys: "right",
 		description: "Select the next subagent in the strip below the prompt",
+		repeatable: true,
 	},
 	"app.heartbeats.open": {
 		defaultKeys: "ctrl+r",

@@ -301,14 +301,18 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						return;
 					} catch (error) {
 						const aborted = options?.signal?.aborted;
+						const nonTransport = isCodexNonTransportError(error);
 						// Only reset the chain before visible output starts; retrying after
 						// content events would duplicate streamed assistant output.
 						const canChainReset =
 							!aborted && !websocketStarted && !chainResetRetried && isStaleCodexContinuationError(error);
-						const canSseFallback = !aborted && !websocketStarted && !isCodexNonTransportError(error);
+						const canSseFallback = !aborted && !websocketStarted && !nonTransport;
 						const budgetBlocked = recordedAttempt !== undefined && !recordedAttempt.allowRetry;
 						reportRequestAttempt(recordedAttempt, {
-							networkError: true,
+							// networkError documents "failed without any response"
+							// (request-budget.ts): a provider outcome the connection
+							// delivered fine is not one.
+							networkError: nonTransport ? undefined : true,
 							retrySuppressedBy:
 								budgetBlocked && (canChainReset || canSseFallback) ? "request_budget" : undefined,
 						});
@@ -319,7 +323,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 							delete output.responseId;
 							continue;
 						}
-						if (aborted || isCodexNonTransportError(error)) {
+						if (aborted || nonTransport) {
 							throw error;
 						}
 						appendAssistantMessageDiagnostic(
@@ -688,11 +692,14 @@ class CodexProtocolError extends Error {
 }
 
 function isCodexNonTransportError(error: unknown): boolean {
-	// A failure derived from the provider's own stop reason (content filter,
-	// refusal, ...) is a model outcome the connection delivered fine: it must
-	// neither trigger an SSE resend of the conversation nor poison the session's
-	// WebSocket fallback bookkeeping.
-	return error instanceof CodexApiError || error instanceof CodexProtocolError || error instanceof StreamFailureError;
+	// A failure derived from the provider's own answer (an error frame, or a stop
+	// reason like a content filter) is a model outcome the connection delivered
+	// fine: it must neither trigger an SSE resend of the conversation nor poison
+	// the session's WebSocket fallback bookkeeping. CodexProtocolError is the
+	// opposite case - the stream never delivered a usable answer (an unparseable
+	// frame, a close before the terminal event) - so it stays transport-class and
+	// takes the SSE fallback like a dropped connection.
+	return error instanceof CodexApiError || error instanceof StreamFailureError;
 }
 
 const STALE_CONTINUATION_ERROR_CODE = "previous_response_not_found";

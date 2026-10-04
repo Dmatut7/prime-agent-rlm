@@ -14,8 +14,9 @@ import {
  * (prime-agent-runtime/test/test_harness_near_duplicate.py). The fixtures
  * below mirror the Python ones verbatim so both faces are pinned against the
  * same store content: same tokenizer (harnessSearchQueryTerms is the port of
- * Python's `_harness_query_terms`), same idf-weighted cosine, same 0.40
- * threshold, same top-3 naming, same warning text.
+ * Python's `_harness_query_terms`), same idf-weighted cosine, same two-band
+ * threshold (0.40, rising to 0.55 below ten memories), same top-3 naming,
+ * same warning text.
  */
 
 const DUP_TITLE_A = "platform_go后台建群与访客群体系是两套不相交的表";
@@ -283,5 +284,65 @@ describe("near-duplicate memory advisory on the refine write path", () => {
 		// tokenizer or weighting drift on either side fails loudly.
 		expect(matches[0].score).toBeGreaterThan(0.7);
 		expect(matches[0].score).toBeLessThan(0.8);
+	});
+});
+
+// Two-band threshold parity (python NearDuplicateSmallCorpusTest): below ten
+// memories the idf weights are too coarse for the production-calibrated 0.40
+// band (every term is rare, so generic shared bigrams score like distinctive
+// ones), and the gate moves to the consolidation-grade 0.55 floor. Fixtures
+// mirror the Python ones verbatim.
+describe("near-duplicate small-corpus band (python parity)", () => {
+	it("does not warn for shared boilerplate in a tiny corpus", () => {
+		// Genuinely different rules (a session-directory convention vs a lease
+		// rule) score 0.515 at N=2 - above 0.40, below the small-corpus floor -
+		// so the old single band advised overwriting the old entry on a false
+		// positive.
+		const state = emptyState();
+		applyEdits(state, [createEdit("mem_dir", "会话目录", "每个会话一个目录")], "refine_a");
+		const result = applyEdits(state, [createEdit("mem_lease", "会话 lease", "每个会话一个 lease")], "refine_b");
+		expect(result.appliedEdits[0].applied).toBe(true);
+		expect(result.appliedEdits[0].nearDuplicateWarning).toBeUndefined();
+	});
+
+	it("still warns for a true duplicate in a tiny corpus", () => {
+		// The production-calibrated rewrite pair scores 0.746 at N=2, above the
+		// small-corpus floor.
+		const state = emptyState();
+		applyEdits(state, [createEdit("mem_original", DUP_TITLE_A, DUP_CONTENT_A)], "refine_a");
+		const result = applyEdits(state, [createEdit("mem_rewrite", DUP_TITLE_B, DUP_CONTENT_B)], "refine_b");
+		expect(result.appliedEdits[0].nearDuplicateWarning).toContain("mem_original");
+	});
+
+	it("keeps the calibrated 0.40 band at ten memories and above", () => {
+		// At eleven memories a 0.44 match still advises: the 0.40 band is
+		// production-calibrated, only tiny corpora move off it. The fixture
+		// shares 7 of 12 terms with the target (measured 0.4427 at N=11).
+		const state = emptyState();
+		applyEdits(
+			state,
+			[createEdit("mem_target", "alpha bravo charlie", "delta echo foxtrot golf hotel india juliet kilo lima")],
+			"refine_a",
+		);
+		const pads: [string, string][] = [
+			["romeo sierra tango", "uniform victor whiskey xray yankee zulu"],
+			["cache warmup", "cache warmup runs after every deploy to keep latency flat"],
+			["queue draining", "queue draining must finish before the workers scale down"],
+			["secret rotation", "secret rotation happens monthly with dual control approval"],
+			["index rebuild", "index rebuild runs nightly against the replica cluster"],
+			["log retention", "log retention keeps thirty days of structured request logs"],
+			["schema migration", "schema migration requires a dry run against staging first"],
+			["alert routing", "alert routing pages the oncall for sev1 and tickets sev3"],
+			["build cache", "build cache invalidation keys on the lockfile digest"],
+		];
+		for (const [index, [title, content]] of pads.entries()) {
+			applyEdits(state, [createEdit(`mem_pad${index}`, title, content)], `refine_pad${index}`);
+		}
+		const result = applyEdits(
+			state,
+			[createEdit("mem_cand", "alpha bravo charlie", "delta echo foxtrot golf mike november oscar papa quebec")],
+			"refine_b",
+		);
+		expect(result.appliedEdits[0].nearDuplicateWarning).toContain("mem_target");
 	});
 });

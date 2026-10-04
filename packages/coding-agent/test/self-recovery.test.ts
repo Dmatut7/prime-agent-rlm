@@ -363,6 +363,36 @@ describe("completionClaimWithoutEvidence", () => {
 		expect(completionClaimWithoutEvidence(reply("修好了。"), { ranTools: true, verifiedWork: true })).toBeUndefined();
 	});
 
+	// The claim scan reads the sentence the reply ends on, not the whole text: an
+	// analysis answer that mentions "fixed"/"implemented" mid-reply is reporting
+	// history, not declaring the task done.
+	it.each([
+		[
+			"a Chinese history report that mentions 修好了 mid-text",
+			"查了一下历史：这个 bug 上个版本有人修好了，后来又被回滚。根因是配置覆盖顺序。",
+		],
+		[
+			"an English analysis that mentions fixed/implemented mid-text",
+			"I traced the history: the parser was fixed in March and the fix was reverted. The actual cause is the option merge order.",
+		],
+		[
+			"a report whose closing sentence is a plain conclusion",
+			"这轮改动 implemented the cache layer in cache.ts, without touching the interface. 结论是行为完全不变。",
+		],
+	])("leaves %s alone", (_name, text) => {
+		expect(completionClaimWithoutEvidence(reply(text), { ranTools: true })).toBeUndefined();
+	});
+
+	it("still gates a bare claim that closes the reply", () => {
+		expect(
+			completionClaimWithoutEvidence(reply("查了三个文件，都核对过一遍。修好了。"), { ranTools: true }),
+		).toBeDefined();
+	});
+
+	it("lets evidence cited earlier in the reply back the closing claim", () => {
+		expect(completionClaimWithoutEvidence(reply("47 tests passed.\n\nDone."), { ranTools: true })).toBeUndefined();
+	});
+
 	it("only looks at a clean stop with no pending tool call", () => {
 		expect(completionClaimWithoutEvidence(reply("修好了。", "length"), { ranTools: true })).toBeUndefined();
 		expect(completionClaimWithoutEvidence(toolCallMessage("t1", "npm test"), { ranTools: true })).toBeUndefined();

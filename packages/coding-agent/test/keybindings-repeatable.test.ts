@@ -14,10 +14,13 @@ describe("navigation keybindings repeat when held", () => {
 		{ binding: "app.blocks.next", press: "\x1b[1;3B", repeat: "\x1b[1;3:2B" },
 		{ binding: "app.models.reorderUp", press: "\x1b[1;3A", repeat: "\x1b[1;3:2A" },
 		{ binding: "app.models.reorderDown", press: "\x1b[1;3B", repeat: "\x1b[1;3:2B" },
+		// The subagent strip walks on plain arrows; kitty repeats arrive as event 2.
+		{ binding: "app.subagents.prev", press: "\x1b[D", repeat: "\x1b[1;1:2D" },
+		{ binding: "app.subagents.next", press: "\x1b[C", repeat: "\x1b[1;1:2C" },
 	];
 
-	it("covers the alt/ctrl-alt arrow navigation bindings", () => {
-		expect(cases.length).toBe(8);
+	it("covers the alt/ctrl-alt arrow navigation bindings and the subagent strip arrows", () => {
+		expect(cases.length).toBe(10);
 	});
 
 	for (const { binding, press, repeat } of cases) {

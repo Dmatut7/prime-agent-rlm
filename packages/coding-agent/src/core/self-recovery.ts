@@ -449,6 +449,11 @@ export interface FinishGateScanOptions {
  * approval gates and - for a tool-free turn - questions and offers stay final
  * answers; a claim that cites its evidence (or follows a green verification command)
  * is a finished answer, not a bare one.
+ *
+ * The claim itself is read off the sentence the reply ends on: a reply that
+ * mentions "fixed"/"implemented"/"修好了" mid-text is reporting what happened,
+ * and gating it asks a paid turn to re-prove work nobody claimed. The evidence
+ * scan still covers the whole reply, so a proof cited earlier backs the claim.
  */
 function textClaimsCompletionWithoutEvidence(text: string, options: FinishGateScanOptions): boolean {
 	if (!text) return false;
@@ -457,7 +462,8 @@ function textClaimsCompletionWithoutEvidence(text: string, options: FinishGateSc
 	const tail = text.slice(-240);
 	if (FINAL_REPLY_PATTERNS.some((pattern) => pattern.test(tail))) return false;
 	if (!options.ranTools && QUESTION_OR_OFFER_PATTERNS.some((pattern) => pattern.test(tail))) return false;
-	if (!CN_COMPLETION_CLAIM.test(text) && !EN_COMPLETION_CLAIM.test(text)) return false;
+	const closing = closingSentence(text);
+	if (!CN_COMPLETION_CLAIM.test(closing) && !EN_COMPLETION_CLAIM.test(closing)) return false;
 	return !CN_EVIDENCE.test(text) && !EN_EVIDENCE.test(text);
 }
 
