@@ -11,12 +11,14 @@
  * the class (the spy/override hook points are too numerous to relocate), and
  * every intra-cluster call routes through the host so instance-level spies keep
  * intercepting exactly as they did when the bodies lived on the class. This
- * module imports ./refine-execution.js (a leaf) only for RefineSkippedError; the
- * execution cluster never imports this module, so the layering stays acyclic.
+ * module imports ./refine-execution.js (a leaf) for RefineSkippedError and
+ * the shared plan/apply guard helpers (runRefinePlanPhase,
+ * withRefineApplyGuard); the execution cluster never imports this module, so
+ * the layering stays acyclic.
  */
 
 import type { AgentSession } from "./agent-session.js";
-import { RefineSkippedError } from "./refine-execution.js";
+import { RefineSkippedError, runRefinePlanPhase, withRefineApplyGuard } from "./refine-execution.js";
 import {
 	type AutoRefineReason,
 	type AutoRefineReview,
@@ -40,6 +42,30 @@ function autoRefineInstructions(reason: AutoRefineReason, review: AutoRefineRevi
 Reviewer instructions: ${review.instructions}`
 		: "";
 	return `Automatic refine review triggered by ${reason}. Only create/update/delete local harness entries if there is clear evidence that should help this session continue. Prefer an empty edits array over speculative or one-off memories. Do not promote anything global unless explicitly requested. Reviewer rationale: ${review.rationale}${detail}`;
+}
+
+/**
+ * Stamp the auto-refine cooldown and (by default) reset the turn counter.
+ * Reads/writes the same `_lastAutoRefineReviewAt` /
+ * `_assistantTurnsSinceAutoRefine` fields the tests drive directly, stamp
+ * always before reset. `at` pins the stamp to a previously captured timestamp
+ * (the review-start `nowMs`: the cooldown window opens when the review began,
+ * not when it settled); `resetTurns: false` is for failure paths that must not
+ * clear the interval counter.
+ */
+function stampAutoRefineCooldown(host: RefineSchedulerHost, opts: { resetTurns?: boolean; at?: number } = {}): void {
+	host._lastAutoRefineReviewAt = opts.at ?? Date.now();
+	if (opts.resetTurns ?? true) {
+		host._assistantTurnsSinceAutoRefine = 0;
+	}
+}
+
+function resetAutoRefineTurns(host: RefineSchedulerHost): void {
+	host._assistantTurnsSinceAutoRefine = 0;
+}
+
+function isAutoRefineUnderCooldown(host: RefineSchedulerHost, cooldownMs: number, nowMs = Date.now()): boolean {
+	return host._lastAutoRefineReviewAt > 0 && nowMs - host._lastAutoRefineReviewAt < cooldownMs;
 }
 
 /**
@@ -182,8 +208,7 @@ export async function runSerializedRefineCheckpoint(host: RefineSchedulerHost): 
 		if (bgResult?.status === "plan") {
 			if (bgResult.branchVersion !== host._autoRefineBranchVersion) {
 				if (!host._pendingRequestedRefine) {
-					host._lastAutoRefineReviewAt = Date.now();
-					host._assistantTurnsSinceAutoRefine = 0;
+					stampAutoRefineCooldown(host);
 					return true;
 				}
 			} else {
@@ -194,8 +219,7 @@ export async function runSerializedRefineCheckpoint(host: RefineSchedulerHost): 
 				} catch (error) {
 					host._emitRefineFailed(error, bgResult.options.global ? "global" : "local");
 				}
-				host._lastAutoRefineReviewAt = Date.now();
-				host._assistantTurnsSinceAutoRefine = 0;
+				stampAutoRefineCooldown(host);
 				if (!host._pendingRequestedRefine) {
 					return true;
 				}
@@ -208,8 +232,7 @@ export async function runSerializedRefineCheckpoint(host: RefineSchedulerHost): 
 			if (bgResult.explicit) {
 				host._emitRefineFailed(new RefineSkippedError("Refinement skipped by extension"));
 			}
-			host._lastAutoRefineReviewAt = Date.now();
-			host._assistantTurnsSinceAutoRefine = 0;
+			stampAutoRefineCooldown(host);
 			if (!host._pendingRequestedRefine) {
 				return true;
 			}
@@ -219,7 +242,7 @@ export async function runSerializedRefineCheckpoint(host: RefineSchedulerHost): 
 			// Background review or planning failure stamps cooldown without a synchronous retry.
 			// A separately queued refine.run may still be serviced below.
 			if (branchVersion === host._autoRefineBranchVersion) {
-				host._lastAutoRefineReviewAt = Date.now();
+				stampAutoRefineCooldown(host, { resetTurns: false });
 			}
 			// Re-queue an explicit refine.run whose background plan failed,
 			// but only when branchVersion is still current and no newer
@@ -239,8 +262,7 @@ export async function runSerializedRefineCheckpoint(host: RefineSchedulerHost): 
 		}
 
 		if (bgResult?.status === "invalidated" && !host._pendingRequestedRefine) {
-			host._lastAutoRefineReviewAt = Date.now();
-			host._assistantTurnsSinceAutoRefine = 0;
+			stampAutoRefineCooldown(host);
 			return true;
 		}
 
@@ -271,8 +293,7 @@ export async function runSerializedRefineCheckpointAfterBackground(
 		} catch (error) {
 			host._emitRefineFailed(error, pending.global ? "global" : "local");
 		}
-		host._lastAutoRefineReviewAt = Date.now();
-		host._assistantTurnsSinceAutoRefine = 0;
+		stampAutoRefineCooldown(host);
 		return;
 	}
 
@@ -292,9 +313,7 @@ export async function runSerializedRefineCheckpointAfterBackground(
 		if (!settings.compact) {
 			host._compactAutoRefinePending = false;
 		} else {
-			const nowMs = Date.now();
-			const underCooldown =
-				host._lastAutoRefineReviewAt > 0 && nowMs - host._lastAutoRefineReviewAt < settings.cooldownMs;
+			const underCooldown = isAutoRefineUnderCooldown(host, settings.cooldownMs);
 			if (underCooldown) {
 				// Preserve the compact trigger for a later boundary, matching the
 				// interactive path's pending behavior while the cooldown is active.
@@ -310,8 +329,7 @@ export async function runSerializedRefineCheckpointAfterBackground(
 	if (host._assistantTurnsSinceAutoRefine < settings.turnInterval) {
 		return;
 	}
-	const nowMs = Date.now();
-	const underCooldown = host._lastAutoRefineReviewAt > 0 && nowMs - host._lastAutoRefineReviewAt < settings.cooldownMs;
+	const underCooldown = isAutoRefineUnderCooldown(host, settings.cooldownMs);
 	if (underCooldown) {
 		return;
 	}
@@ -335,22 +353,20 @@ export async function runSerializedAutoRefineReview(
 			return;
 		}
 		if (!review.shouldRefine) {
-			host._lastAutoRefineReviewAt = Date.now();
-			host._assistantTurnsSinceAutoRefine = 0;
+			stampAutoRefineCooldown(host);
 			return;
 		}
 		await host._runSerializedRefine({ instructions: autoRefineInstructions(reason, review) }, "auto");
 		if (host._disposed || host._disposing || branchVersion !== host._autoRefineBranchVersion) {
 			return;
 		}
-		host._lastAutoRefineReviewAt = Date.now();
-		host._assistantTurnsSinceAutoRefine = 0;
+		stampAutoRefineCooldown(host);
 	} catch (error) {
 		if (branchVersion === host._autoRefineBranchVersion) {
-			host._lastAutoRefineReviewAt = Date.now();
+			stampAutoRefineCooldown(host, { resetTurns: false });
 			// An extension skip is an intentional non-round, not a failure.
 			if (error instanceof RefineSkippedError) {
-				host._assistantTurnsSinceAutoRefine = 0;
+				resetAutoRefineTurns(host);
 			} else {
 				host._emitRefineFailed(error);
 			}
@@ -409,21 +425,9 @@ export async function applySerializedPlan(
 	host: RefineSchedulerHost,
 	bgResult: Extract<SerializedBackgroundPlanResult, { status: "plan" }>,
 ): Promise<void> {
-	let resolveApplySettled: () => void = () => {};
-	const applySettled = new Promise<void>((resolve) => {
-		resolveApplySettled = resolve;
-	});
-	host._refineInFlight = applySettled;
-	try {
-		await host._applyRefine(bgResult.plan, bgResult.options, bgResult.abort, bgResult.trigger);
-	} finally {
-		resolveApplySettled();
-		if (host._refineInFlight === applySettled) {
-			host._refineInFlight = undefined;
-		}
-		host._notifySessionInputCheckpointChange();
-		host._scheduleSessionInputPump();
-	}
+	await withRefineApplyGuard(host, () =>
+		host._applyRefine(bgResult.plan, bgResult.options, bgResult.abort, bgResult.trigger),
+	);
 }
 
 /**
@@ -467,8 +471,7 @@ export function maybeStartSerializedBackgroundPlan(host: RefineSchedulerHost): v
 	if (host._assistantTurnsSinceAutoRefine < settings.turnInterval) {
 		return;
 	}
-	const nowMs = Date.now();
-	const underCooldown = host._lastAutoRefineReviewAt > 0 && nowMs - host._lastAutoRefineReviewAt < settings.cooldownMs;
+	const underCooldown = isAutoRefineUnderCooldown(host, settings.cooldownMs);
 	if (underCooldown) {
 		return;
 	}
@@ -587,29 +590,7 @@ export async function runSerializedRefine(
 		return;
 	}
 
-	const refineAbort = new AbortController();
-	host._refineAbortController = refineAbort;
-
-	const planRun = host._planRefine(options, refineAbort.signal, trigger);
-	const planSettled = planRun.then(
-		() => undefined,
-		() => undefined,
-	);
-	host._refinePlanInFlight = planSettled;
-	let plan: RefinementPlan;
-	try {
-		plan = await planRun;
-	} catch (error) {
-		if (host._refineAbortController === refineAbort) {
-			host._refineAbortController = undefined;
-		}
-		host._scheduleSessionInputPump();
-		throw error;
-	} finally {
-		if (host._refinePlanInFlight === planSettled) {
-			host._refinePlanInFlight = undefined;
-		}
-	}
+	const { plan, refineAbort } = await runRefinePlanPhase(host, options, trigger);
 
 	if (host._disposed || refineAbort.signal.aborted) {
 		if (host._refineAbortController === refineAbort) {
@@ -621,21 +602,7 @@ export async function runSerializedRefine(
 
 	// Do NOT call agent.waitForIdle() — we are at the quiescent boundary
 	// already (shouldStopAfterTurn). _applyRefine handles disconnect/reconnect internally.
-	let resolveApplySettled: () => void = () => {};
-	const applySettled = new Promise<void>((resolve) => {
-		resolveApplySettled = resolve;
-	});
-	host._refineInFlight = applySettled;
-	try {
-		await host._applyRefine(plan, options, refineAbort, trigger);
-	} finally {
-		resolveApplySettled();
-		if (host._refineInFlight === applySettled) {
-			host._refineInFlight = undefined;
-		}
-		host._notifySessionInputCheckpointChange();
-		host._scheduleSessionInputPump();
-	}
+	await withRefineApplyGuard(host, () => host._applyRefine(plan, options, refineAbort, trigger));
 }
 
 /**
@@ -742,8 +709,7 @@ export async function drainPendingRefinementForDisposal(host: RefineSchedulerHos
 					}
 					// Stamp cooldown and reset counter so the interval
 					// check below does not trigger a duplicate refine.
-					host._lastAutoRefineReviewAt = Date.now();
-					host._assistantTurnsSinceAutoRefine = 0;
+					stampAutoRefineCooldown(host);
 				}
 				// Preserve a consumed explicit request when its background plan failed,
 				// matching the turn-boundary recovery path. The pending drain below
@@ -763,8 +729,7 @@ export async function drainPendingRefinementForDisposal(host: RefineSchedulerHos
 				// so the interval check below does not trigger a duplicate
 				// terminal retry.
 				if (bgResult?.status === "skip" || bgResult?.status === "failure" || bgResult?.status === "invalidated") {
-					host._lastAutoRefineReviewAt = Date.now();
-					host._assistantTurnsSinceAutoRefine = 0;
+					stampAutoRefineCooldown(host);
 				}
 				return false;
 			});
@@ -785,8 +750,7 @@ export async function drainPendingRefinementForDisposal(host: RefineSchedulerHos
 		}
 		// Stamp cooldown and reset counter so the interval check below
 		// does not trigger a duplicate refine after the explicit drain.
-		host._lastAutoRefineReviewAt = Date.now();
-		host._assistantTurnsSinceAutoRefine = 0;
+		stampAutoRefineCooldown(host);
 	}
 	// A serialized compaction can finish without another model turn. Drain its
 	// pending review here so disposal does not silently lose the trigger.
@@ -795,9 +759,7 @@ export async function drainPendingRefinementForDisposal(host: RefineSchedulerHos
 		if (!compactSettings.enabled || !compactSettings.compact) {
 			host._compactAutoRefinePending = false;
 		} else {
-			const nowMs = Date.now();
-			const underCooldown =
-				host._lastAutoRefineReviewAt > 0 && nowMs - host._lastAutoRefineReviewAt < compactSettings.cooldownMs;
+			const underCooldown = isAutoRefineUnderCooldown(host, compactSettings.cooldownMs);
 			host._compactAutoRefinePending = false;
 			if (!underCooldown) {
 				try {
@@ -824,8 +786,7 @@ export async function drainPendingRefinementForDisposal(host: RefineSchedulerHos
 	if (host._assistantTurnsSinceAutoRefine < settings.turnInterval) {
 		return;
 	}
-	const nowMs = Date.now();
-	const underCooldown = host._lastAutoRefineReviewAt > 0 && nowMs - host._lastAutoRefineReviewAt < settings.cooldownMs;
+	const underCooldown = isAutoRefineUnderCooldown(host, settings.cooldownMs);
 	if (underCooldown) {
 		return;
 	}
@@ -880,7 +841,7 @@ export function discardPendingAutoRefine(
 export async function invalidatePendingAutoRefineForBranchChange(host: RefineSchedulerHost): Promise<void> {
 	host._autoRefineReviewAbort?.abort();
 	host._discardPendingAutoRefine({ cancelPostCompactionContinue: true });
-	host._assistantTurnsSinceAutoRefine = 0;
+	resetAutoRefineTurns(host);
 	// Drop the cached verdict so the next refine re-probes. The branch change does
 	// not move the session directory, so this is not about a new target: the probe
 	// is only advisory. What actually stops a write to an unwritable harness state
@@ -1016,7 +977,7 @@ export async function maybeAutoRefine(host: RefineSchedulerHost, reason: AutoRef
 	}
 
 	const nowMs = Date.now();
-	const underCooldown = host._lastAutoRefineReviewAt > 0 && nowMs - host._lastAutoRefineReviewAt < settings.cooldownMs;
+	const underCooldown = isAutoRefineUnderCooldown(host, settings.cooldownMs, nowMs);
 
 	const pendingReview = host._pendingAutoRefineReview;
 	if (pendingReview) {
@@ -1069,8 +1030,7 @@ export async function maybeAutoRefine(host: RefineSchedulerHost, reason: AutoRef
 			if (preserveTurnIntervalReview) {
 				host._turnIntervalAutoRefinePending = true;
 			} else {
-				host._lastAutoRefineReviewAt = nowMs;
-				host._assistantTurnsSinceAutoRefine = 0;
+				stampAutoRefineCooldown(host, { at: nowMs });
 			}
 			if (reason === "compact") {
 				host._compactAutoRefinePending = false;
@@ -1086,7 +1046,7 @@ export async function maybeAutoRefine(host: RefineSchedulerHost, reason: AutoRef
 		// Failed review: stamp the cooldown so a persistent failure (bad auth,
 		// unparseable output) doesn't retry a full review on every agent end.
 		if (branchVersion === host._autoRefineBranchVersion) {
-			host._lastAutoRefineReviewAt = Date.now();
+			stampAutoRefineCooldown(host, { resetTurns: false });
 		}
 	} finally {
 		if (host._autoRefineReviewAbort === reviewAbort) {
@@ -1113,8 +1073,7 @@ export async function runApprovedRefine(
 		await host.refine({ instructions: autoRefineInstructions(reason, review) }, { trigger: "auto" });
 		host._pendingAutoRefineReview = undefined;
 		host._turnIntervalAutoRefinePending = false;
-		host._lastAutoRefineReviewAt = Date.now();
-		host._assistantTurnsSinceAutoRefine = 0;
+		stampAutoRefineCooldown(host);
 		if (reason === "compact") {
 			host._compactAutoRefinePending = false;
 		}
@@ -1122,12 +1081,12 @@ export async function runApprovedRefine(
 		// Auto-refine is opportunistic; manual /refine remains available.
 		// Stamp the cooldown so a persistently failing refine doesn't retry
 		// (via a retained pending review) on every agent end.
-		host._lastAutoRefineReviewAt = Date.now();
+		stampAutoRefineCooldown(host, { resetTurns: false });
 		if (error instanceof RefineSkippedError) {
 			// A skipped round is consumed like a reviewer decline, not retained for retry.
 			host._pendingAutoRefineReview = undefined;
 			host._turnIntervalAutoRefinePending = false;
-			host._assistantTurnsSinceAutoRefine = 0;
+			resetAutoRefineTurns(host);
 			if (reason === "compact") host._compactAutoRefinePending = false;
 		}
 	} finally {

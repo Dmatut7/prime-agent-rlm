@@ -13,7 +13,9 @@
  * layering stays acyclic. The serialized-refine scheduling cluster
  * (checkpoint family, auto-refine scheduling, host-request entry) stays on
  * AgentSession through the twelfth cut and calls these functions through the
- * shells.
+ * shells. The plan/apply guard helpers ({@link runRefinePlanPhase},
+ * {@link withRefineApplyGuard}) are shared with ./refine-scheduler.js (the
+ * serialized cluster) via the existing scheduler->execution import edge.
  */
 
 import { dirname, resolve } from "node:path";
@@ -141,6 +143,93 @@ export interface RefineExecutionHost {
 	_authenticatedRlmModels: AgentSession["_authenticatedRlmModels"];
 	_scheduleSessionInputPump: AgentSession["_scheduleSessionInputPump"];
 	_notifySessionInputCheckpointChange: AgentSession["_notifySessionInputCheckpointChange"];
+}
+
+/**
+ * Narrow seam for {@link runRefinePlanPhase}: both RefineExecutionHost and
+ * RefineSchedulerHost (./refine-scheduler.js) satisfy it structurally.
+ */
+export interface RefinePlanGuardHost {
+	_refineAbortController?: AgentSession["_refineAbortController"];
+	_refinePlanInFlight?: AgentSession["_refinePlanInFlight"];
+	_planRefine: AgentSession["_planRefine"];
+	_scheduleSessionInputPump: AgentSession["_scheduleSessionInputPump"];
+}
+
+/**
+ * Planning-phase guard shared by refine() and the serialized scheduler:
+ * create the abort controller, run one planning pass under
+ * `_refinePlanInFlight`, and on failure clear the controller and kick the
+ * input pump before rethrowing. The trigger is resolved by the caller.
+ * Planning dispatches through `host._planRefine` so instance-level spies keep
+ * intercepting.
+ */
+export async function runRefinePlanPhase(
+	host: RefinePlanGuardHost,
+	options: { instructions?: string; rollbackId?: string; global?: boolean },
+	trigger: "manual" | "auto",
+): Promise<{ plan: RefinementPlan; refineAbort: AbortController }> {
+	const refineAbort = new AbortController();
+	host._refineAbortController = refineAbort;
+
+	const planRun = host._planRefine(options, refineAbort.signal, trigger);
+	const planSettled = planRun.then(
+		() => undefined,
+		() => undefined,
+	);
+	host._refinePlanInFlight = planSettled;
+	let plan: RefinementPlan;
+	try {
+		plan = await planRun;
+	} catch (error) {
+		if (host._refineAbortController === refineAbort) {
+			host._refineAbortController = undefined;
+		}
+		host._scheduleSessionInputPump();
+		throw error;
+	} finally {
+		if (host._refinePlanInFlight === planSettled) {
+			host._refinePlanInFlight = undefined;
+		}
+	}
+	return { plan, refineAbort };
+}
+
+/**
+ * Narrow seam for {@link withRefineApplyGuard}: both RefineExecutionHost and
+ * RefineSchedulerHost (./refine-scheduler.js) satisfy it structurally.
+ */
+export interface RefineApplyGuardHost {
+	_refineInFlight?: AgentSession["_refineInFlight"];
+	_notifySessionInputCheckpointChange: AgentSession["_notifySessionInputCheckpointChange"];
+	_scheduleSessionInputPump: AgentSession["_scheduleSessionInputPump"];
+}
+
+/**
+ * Apply-phase guard shared by refine() and the serialized scheduler: block new
+ * turns on one shared settled promise covering the body's critical section.
+ * The finally order is part of the contract: resolve the promise first
+ * (waiters wake with `_refineInFlight` still set and re-check it), then clear
+ * the field by identity, then notify and pump. The body dispatches through
+ * `host._applyRefine` at the call site so instance-level spies keep
+ * intercepting.
+ */
+export async function withRefineApplyGuard<T>(host: RefineApplyGuardHost, body: () => Promise<T>): Promise<T> {
+	let resolveApplySettled: () => void = () => {};
+	const applySettled = new Promise<void>((resolve) => {
+		resolveApplySettled = resolve;
+	});
+	host._refineInFlight = applySettled;
+	try {
+		return await body();
+	} finally {
+		resolveApplySettled();
+		if (host._refineInFlight === applySettled) {
+			host._refineInFlight = undefined;
+		}
+		host._notifySessionInputCheckpointChange();
+		host._scheduleSessionInputPump();
+	}
 }
 
 export function emitRefineFailed(host: RefineExecutionHost, error: unknown, scope: HarnessScope = "local"): void {
@@ -332,38 +421,11 @@ export async function refine(
 		}
 	}
 
-	const refineAbort = new AbortController();
-	host._refineAbortController = refineAbort;
-
-	const planRun = host._planRefine(options, refineAbort.signal, internal.trigger ?? "manual");
-	const planSettled = planRun.then(
-		() => undefined,
-		() => undefined,
-	);
-	host._refinePlanInFlight = planSettled;
-	let plan: RefinementPlan;
-	try {
-		plan = await planRun;
-	} catch (e) {
-		if (host._refineAbortController === refineAbort) {
-			host._refineAbortController = undefined;
-		}
-		host._scheduleSessionInputPump();
-		throw e;
-	} finally {
-		if (host._refinePlanInFlight === planSettled) {
-			host._refinePlanInFlight = undefined;
-		}
-	}
+	const { plan, refineAbort } = await runRefinePlanPhase(host, options, internal.trigger ?? "manual");
 
 	// Block new turns before waiting for the current turn to finish. One shared
 	// settled promise covers the full transition and apply critical section.
-	let resolveApplySettled: () => void = () => {};
-	const applySettled = new Promise<void>((resolve) => {
-		resolveApplySettled = resolve;
-	});
-	host._refineInFlight = applySettled;
-	try {
+	return withRefineApplyGuard(host, async () => {
 		// Wait for the session to become quiescent before applying. Planning is
 		// allowed to overlap active user work, but application must not disconnect
 		// event handling until that work and its queued events have completed.
@@ -402,14 +464,7 @@ export async function refine(
 			emitRefineFailed(host, normalized, options?.global ? "global" : "local");
 			throw normalized;
 		}
-	} finally {
-		resolveApplySettled();
-		if (host._refineInFlight === applySettled) {
-			host._refineInFlight = undefined;
-		}
-		host._notifySessionInputCheckpointChange();
-		host._scheduleSessionInputPump();
-	}
+	});
 }
 
 /**
