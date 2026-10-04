@@ -180,13 +180,37 @@ const STALL_VOUCH_REASON_PROCESS_TREE_CPU = "process_tree_cpu";
  */
 const STALL_CPU_SAMPLE_MIN_GAP_MS = 10_000;
 
+/**
+ * Grace window behind the movement test: the vouch holds while the quantized
+ * counter advanced within the last window, instead of demanding an advance
+ * between the two most recent samples. A step burning less than one quantum per
+ * sample gap (under ~10% CPU at the 10s minimum gap) advances only every few
+ * samples; the window keeps its vouch steady instead of flickering, while a
+ * frozen counter still loses the vouch one window after its last movement.
+ */
+const STALL_CPU_VOUCH_WINDOW_MS = 60_000;
+
+/**
+ * Total no-output span CPU evidence may stand in for. A busy-loop wedge burns
+ * CPU forever without producing anything, so the evidence cannot renew the
+ * exemption forever: past the cap the vouch withdraws and the ordinary stall
+ * rules decide. Observed session activity resets the span
+ * (recordStallWatchdogActivity): the cap measures silence, not busy wall time.
+ */
+const STALL_CPU_EVIDENCE_CAP_MS = 60 * 60 * 1000;
+
 interface StallCpuVouchCache {
 	sampledAt: number;
-	cpuMs?: number;
 	/** The quantized counter the last fresh sample read; numeric so movement compares as numbers. */
 	quantized?: number;
+	/** Wall time of the newest fresh sample whose counter advanced past its predecessor. */
+	lastAdvanceAt?: number;
 	/** The verdict of the last fresh sample: the vouch token while movement held, absent otherwise. */
 	vouchedToken?: string;
+	/** No-output span the CPU evidence has stood in for since the last observed activity. */
+	silentMs: number;
+	/** Once the cap is spent the evidence stays withdrawn until observed activity resets it. */
+	capReached: boolean;
 }
 
 /** Per-session CPU vouch state; weak keys so a disposed session drops it. */
@@ -195,12 +219,13 @@ const stallCpuVouchCaches = new WeakMap<StallWatchdogWiringHost, StallCpuVouchCa
 /**
  * Process-tree CPU as vouch evidence, the same judgment the silent-step rule already
  * makes: a quiet cell whose tree keeps burning CPU (a compile, numpy compute) is busy,
- * not stuck. Movement-only by construction - the vouch activates when the quantized
- * counter advanced between the two most recent samples, so a frozen process tree (the
- * wedge case) buys nothing it did not buy before this evidence existed. The quantum is
- * the silent-step rule's own `silentStuckCpuMs`, and the token is the quantized
- * counter: while the work keeps moving the token keeps changing, which is what settles
- * the exempt silence (a healthy multi-hour compute never spends its budget).
+ * not stuck. The vouch holds while the quantized counter advanced within the last
+ * {@link STALL_CPU_VOUCH_WINDOW_MS}, and only until the evidence has stood in for
+ * {@link STALL_CPU_EVIDENCE_CAP_MS} of output-free silence. The quantum is the
+ * silent-step rule's own `silentStuckCpuMs`, and the token is the quantized counter:
+ * while the work keeps moving the token keeps changing, which is what settles the
+ * exempt silence (a frozen counter claims progress forever, so an unchanged token
+ * settles nothing).
  */
 function sampleStallCpuVouch(host: StallWatchdogWiringHost): { token: string } | undefined {
 	const now = Date.now();
@@ -208,28 +233,65 @@ function sampleStallCpuVouch(host: StallWatchdogWiringHost): { token: string } |
 	// A cache hit replays the last fresh sample's verdict: the movement was real when
 	// measured, and only a fresh sample may withdraw it (a frozen counter).
 	if (host._stepCpuProbe === undefined && cache && now - cache.sampledAt < STALL_CPU_SAMPLE_MIN_GAP_MS) {
-		return cache.vouchedToken === undefined ? undefined : { token: cache.vouchedToken };
+		return cache.capReached || cache.vouchedToken === undefined ? undefined : { token: cache.vouchedToken };
 	}
 	const cpuMs = host._stepCpuProbe ? host._stepCpuProbe() : sampleStepCpuMs(host);
 	if (cpuMs === undefined) {
-		stallCpuVouchCaches.set(host, { sampledAt: now });
+		// No reading: the movement baseline is void, but a spent cap and the silence
+		// it measured survive a transient read failure.
+		stallCpuVouchCaches.set(host, {
+			sampledAt: now,
+			silentMs: cache?.silentMs ?? 0,
+			capReached: cache?.capReached ?? false,
+		});
 		return undefined;
 	}
 	const quantum = Math.max(1, host.settingsManager.getSilentStuckCpuMs());
 	const quantized = Math.floor(cpuMs / quantum);
-	const previousQuantized = cache?.quantized;
-	// A baseline (no previous sample) or an unchanged quantum proves nothing about
-	// movement; only an advanced counter does. A counter reset (a replaced kernel) is
-	// a new job's baseline, not this turn's movement.
-	const vouchedToken =
-		previousQuantized !== undefined && quantized > previousQuantized ? `cpu:${quantized}` : undefined;
+	const previous = cache?.quantized;
+	// A baseline (no previous sample) or a counter reset (a replaced kernel) proves
+	// nothing about movement; only an advanced counter does.
+	let lastAdvanceAt: number | undefined;
+	if (previous === undefined || quantized < previous) {
+		lastAdvanceAt = undefined;
+	} else if (quantized > previous) {
+		lastAdvanceAt = now;
+	} else {
+		lastAdvanceAt = cache?.lastAdvanceAt;
+	}
+	const moving = lastAdvanceAt !== undefined && now - lastAdvanceAt <= STALL_CPU_VOUCH_WINDOW_MS;
+	let silentMs = cache?.silentMs ?? 0;
+	let capReached = cache?.capReached ?? false;
+	if (moving && !capReached) {
+		silentMs += Math.max(0, now - (cache?.sampledAt ?? now));
+		if (silentMs >= STALL_CPU_EVIDENCE_CAP_MS) capReached = true;
+	}
+	const vouchedToken = moving && !capReached ? `cpu:${quantized}` : undefined;
 	stallCpuVouchCaches.set(host, {
 		sampledAt: now,
-		cpuMs,
 		quantized,
+		...(lastAdvanceAt === undefined ? {} : { lastAdvanceAt }),
 		...(vouchedToken === undefined ? {} : { vouchedToken }),
+		silentMs,
+		capReached,
 	});
 	return vouchedToken === undefined ? undefined : { token: vouchedToken };
+}
+
+/** Whether the CPU evidence has spent its no-output cap (read by the silent-step rule). */
+function stallCpuEvidenceSpent(host: StallWatchdogWiringHost): boolean {
+	return stallCpuVouchCaches.get(host)?.capReached === true;
+}
+
+/**
+ * Observed session activity ends the no-output span the CPU evidence cap measures:
+ * the cap bounds silence the evidence excused, not wall time the session spent busy.
+ */
+function noteStallCpuVouchActivity(host: StallWatchdogWiringHost): void {
+	const cache = stallCpuVouchCaches.get(host);
+	if (!cache || (cache.silentMs === 0 && !cache.capReached)) return;
+	cache.silentMs = 0;
+	cache.capReached = false;
 }
 
 /**
@@ -396,11 +458,17 @@ function stepSilentMs(
 		watch.movementToken = movementToken;
 	}
 	// CPU of the step's process tree is work too: a quiet compile or test run that keeps
-	// computing is busy. Sampled only at a deadline recheck, never on the hot path.
+	// computing is busy. Sampled only at a deadline recheck, never on the hot path. The
+	// same total cap as the turn-level vouch applies (STALL_CPU_EVIDENCE_CAP_MS): past
+	// it, burning CPU no longer stands in for output and the silence clock runs out.
 	if (sampleCpu) {
 		const cpuMs = sampleStepCpuMs(host);
 		if (cpuMs !== undefined) {
-			if (watch.cpuMs !== undefined && cpuMs - watch.cpuMs >= host.settingsManager.getSilentStuckCpuMs()) {
+			if (
+				watch.cpuMs !== undefined &&
+				cpuMs - watch.cpuMs >= host.settingsManager.getSilentStuckCpuMs() &&
+				!stallCpuEvidenceSpent(host)
+			) {
 				watch.lastOutputAt = now;
 			}
 			// Keep the baseline where output was last seen, so slow CPU accumulates across checks.
@@ -651,6 +719,15 @@ function collectStallKernelDiagnostics(host: StallWatchdogWiringHost): StallKern
  * multi-turn run) is in flight.
  */
 export function recordStallWatchdogActivity(host: StallWatchdogWiringHost, event: AgentEvent): void {
+	// These two hold with or without a live watchdog, so they run before its gate:
+	// an observed event ends the no-output span the CPU evidence cap measures, and a
+	// new turn closes the previous turn's abort reason. Without the reset a
+	// follow-up turn would still be classified against the earlier abort reason —
+	// and a quota park would read a stale "user" as the user cancelling its wake.
+	noteStallCpuVouchActivity(host);
+	if (event.type === "agent_start") {
+		host._lastTurnAbortReason = undefined;
+	}
 	const watchdog = host._stallWatchdog;
 	if (!watchdog) return;
 	const now = Date.now();
@@ -667,11 +744,9 @@ export function recordStallWatchdogActivity(host: StallWatchdogWiringHost, event
 	}
 	if (event.type === "agent_start") {
 		host._stallInFlightTools.clear();
-		// A new turn means the aborted turn is history: without this reset a
-		// follow-up turn that completes normally would still be classified
-		// against the earlier abort reason, and the roster would keep showing a
-		// stall marker for a session that recovered.
-		host._lastTurnAbortReason = undefined;
+		// The roster marker from the aborted turn is history too: without this reset a
+		// follow-up turn that completes normally would keep showing a stall marker for
+		// a session that recovered.
 		host._stallState = undefined;
 		// A new turn also closes every stall-recovery claim scoped to the
 		// previous epoch: the episode that claimed it either recovered (this

@@ -2,7 +2,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { TOOL_TIMEOUT_CAUSE_PREFIX } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { DUTY_EVENT_CUSTOM_TYPE, STEP_TIME_LIMIT_MARKER } from "../../src/core/duty-log.js";
 import type { KernelLivenessSample } from "../../src/core/kernel/shared.js";
 import type { StallWatchdogTimers } from "../../src/core/stall-watchdog.js";
@@ -114,6 +114,7 @@ describe("per-tool-call deadline vouch wiring", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
@@ -276,6 +277,45 @@ describe("per-tool-call deadline vouch wiring", () => {
 		// The watchdog is the single arbiter of the exemption budget (r4 ruling): turning it
 		// off turns off that channel. The silent-step rule still runs, and this call is silent.
 		expect(textOfLastToolResult(harness)).toContain(TOOL_TIMEOUT_CAUSE_PREFIX);
+		expect(harness.faux.state.callCount).toBe(2);
+	});
+
+	it("CPU evidence stops renewing the silent-step deadline past the no-output cap", async () => {
+		// A step whose tree keeps burning CPU but never prints used to renew the
+		// deadline forever; the evidence cap ends that so a busy-loop wedge dies.
+		// The wall clock jumps past the cap: the cap is measured in wall time and a
+		// test cannot wait out the hour.
+		const realNow = Date.now;
+		let offset = 0;
+		vi.spyOn(Date, "now").mockImplementation(() => realNow() + offset);
+		let cpuMs = 0;
+		const harness = await createHarness({
+			tools: [slowVouchedTool(3_000)],
+			settings: { tools: { timeout: { silentStuckSeconds: 1 } } },
+			stallKernelLivenessFacts: () => undefined,
+			stepCpuProbe: () => {
+				cpuMs += 5_000;
+				return cpuMs;
+			},
+		});
+		harnesses.push(harness);
+
+		const turn = runSlowToolTurn(harness);
+		await vi.waitFor(() => expect(harness.eventsOfType("tool_execution_start")).toHaveLength(1), {
+			timeout: 10_000,
+			interval: 10,
+		});
+		// Let the deadline renew on CPU evidence once (checks fire at 30ms and then at
+		// ~1s) so the jump below lands on an established renewal: the next check must
+		// refuse to renew, where the old code renewed forever and the tool completed.
+		await new Promise((resolve) => setTimeout(resolve, 1_500));
+		offset += 61 * 60_000;
+		await turn;
+
+		const resultText = textOfLastToolResult(harness);
+		expect(resultText).toContain(TOOL_TIMEOUT_CAUSE_PREFIX);
+		expect(resultText).toContain("slow_cell");
+		// The model saw the cancellation and answered in a second request.
 		expect(harness.faux.state.callCount).toBe(2);
 	});
 

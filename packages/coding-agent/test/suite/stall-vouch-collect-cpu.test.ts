@@ -20,11 +20,13 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../../src/core/agent-session.js";
-import { createHarness, type Harness } from "./harness.js";
+import { StallFakeClock } from "../fixtures/stall-fake-clock.js";
+import { createHarness, type Harness, type HarnessOptions } from "./harness.js";
 
 const harnesses: Harness[] = [];
 
 afterEach(() => {
+	vi.restoreAllMocks();
 	while (harnesses.length > 0) {
 		harnesses.pop()?.cleanup();
 	}
@@ -151,11 +153,14 @@ describe("turn-level vouch: a silent step whose process tree keeps burning CPU i
 		};
 	}
 
-	async function silentToolSession(cpu: () => number | undefined): Promise<Harness> {
+	async function silentToolSession(
+		cpu: () => number | undefined,
+		settings?: HarnessOptions["settings"],
+	): Promise<Harness> {
 		const harness = track(
 			await createHarness({
 				tools: [hangTool()],
-				settings: { retry: { enabled: false } },
+				settings: { retry: { enabled: false }, ...settings },
 				// The synchronous-cell shape: no usable kernel heartbeat at all.
 				stallKernelLivenessFacts: () => undefined,
 				stepCpuProbe: cpu,
@@ -192,6 +197,126 @@ describe("turn-level vouch: a silent step whose process tree keeps burning CPU i
 		const harness = await silentToolSession(() => undefined);
 		expect(harness.session.excusedNow).toBe(false);
 		await harness.session.abort();
+		await harness.session.waitForIdle();
+	});
+
+	/**
+	 * The wall clock, jumped forward on demand: the CPU vouch measures the no-output
+	 * span it excuses in wall time, and a test cannot wait out its cap.
+	 */
+	function jumpableWallClock(): { jump(ms: number): void } {
+		const realNow = Date.now;
+		let offset = 0;
+		vi.spyOn(Date, "now").mockImplementation(() => realNow() + offset);
+		return {
+			jump: (ms: number) => {
+				offset += ms;
+			},
+		};
+	}
+
+	it("a step advancing less than one quantum per sample keeps a steady vouch instead of flickering", async () => {
+		let cpuMs = 0;
+		// 500ms of CPU per sample is half the 1000ms quantum: the quantized counter
+		// crosses only every other sample, which used to blink the vouch off and on.
+		const harness = await silentToolSession(() => (cpuMs += 500));
+		for (let i = 0; i < 12; i++) {
+			expect(harness.session.excusedNow).toBe(true);
+		}
+		await harness.session.abort();
+		await harness.session.waitForIdle();
+	});
+
+	it("stops excusing once CPU evidence alone has stood in for output past its cap", async () => {
+		const wall = jumpableWallClock();
+		let cpuMs = 0;
+		// warnAfter 400s widens the exemption budget past the evidence cap, so the
+		// cap — not the budget — is what ends the excuse.
+		const harness = await silentToolSession(() => (cpuMs += 5_000), { stallWatchdog: { warnAfterSeconds: 400 } });
+		expect(harness.session.excusedNow).toBe(true);
+		// The counter keeps advancing the whole time; a busy-loop wedge looks exactly
+		// like this, so the evidence may not renew the exemption forever.
+		wall.jump(30 * 60_000);
+		expect(harness.session.excusedNow).toBe(true);
+		wall.jump(31 * 60_000);
+		expect(harness.session.excusedNow).toBe(false);
+		await harness.session.abort();
+		await harness.session.waitForIdle();
+	});
+
+	it("observed output restarts the no-output span the CPU cap measures", async () => {
+		const wall = jumpableWallClock();
+		let cpuMs = 0;
+		let emitUpdate: (() => void) | undefined;
+		const speakableHangTool: AgentTool = {
+			name: "hang_forever",
+			label: "Hang Forever",
+			description: "A tool that never returns, but can print on demand",
+			parameters: Type.Object({}),
+			execute: (_id, _args, _signal, onUpdate) => {
+				emitUpdate = () => onUpdate?.({ content: [{ type: "text", text: "still computing" }], details: {} });
+				return new Promise<never>(() => {});
+			},
+		};
+		const harness = track(
+			await createHarness({
+				tools: [speakableHangTool],
+				settings: { retry: { enabled: false }, stallWatchdog: { warnAfterSeconds: 400 } },
+				stallKernelLivenessFacts: () => undefined,
+				stepCpuProbe: () => (cpuMs += 5_000),
+			}),
+		);
+		harness.setResponses([fauxAssistantMessage(fauxToolCall("hang_forever", {}), { stopReason: "toolUse" })]);
+		void harness.session.prompt("run the quiet compute");
+		await vi.waitFor(() => expect(harness.eventsOfType("tool_execution_start")).toHaveLength(1), {
+			timeout: 10_000,
+			interval: 10,
+		});
+
+		wall.jump(50 * 60_000);
+		expect(harness.session.excusedNow).toBe(true);
+		// The step produced output: the no-output span starts over from here.
+		emitUpdate?.();
+		wall.jump(50 * 60_000);
+		expect(harness.session.excusedNow).toBe(true);
+		wall.jump(11 * 60_000);
+		expect(harness.session.excusedNow).toBe(false);
+		await harness.session.abort();
+		await harness.session.waitForIdle();
+	});
+
+	it("a step whose tree keeps burning CPU is aborted once the CPU evidence cap is spent", async () => {
+		const clock = new StallFakeClock();
+		const wall = jumpableWallClock();
+		let cpuMs = 0;
+		const harness = track(
+			await createHarness({
+				tools: [hangTool()],
+				settings: {
+					retry: { enabled: false },
+					stallWatchdog: { enabled: true, warnAfterSeconds: 60, abortAfterSeconds: 120 },
+				},
+				stallWatchdogTimers: clock.timersImpl,
+				stallKernelLivenessFacts: () => undefined,
+				stepCpuProbe: () => (cpuMs += 5_000),
+			}),
+		);
+		harness.setResponses([fauxAssistantMessage(fauxToolCall("hang_forever", {}), { stopReason: "toolUse" })]);
+		void harness.session.prompt("run the quiet compute");
+		await vi.waitFor(() => expect(harness.eventsOfType("tool_execution_start")).toHaveLength(1), {
+			timeout: 10_000,
+			interval: 10,
+		});
+
+		// The warning fires on schedule even while the CPU vouch defers the abort.
+		clock.advance(60_000);
+		expect(harness.eventsOfType("stall_warning")).toHaveLength(1);
+		expect(harness.eventsOfType("stall_abort")).toHaveLength(0);
+
+		// Past the cap the vouch withdraws, and the next escalation fire aborts the turn.
+		wall.jump(62 * 60_000);
+		clock.advance(61_000);
+		expect(harness.eventsOfType("stall_abort")).toHaveLength(1);
 		await harness.session.waitForIdle();
 	});
 });

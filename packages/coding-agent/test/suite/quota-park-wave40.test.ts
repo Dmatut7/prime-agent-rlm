@@ -177,6 +177,24 @@ describe("a user abort during the wake probe cancels the park", () => {
 	});
 });
 
+describe("a user abort of an unrelated turn keeps a future-scheduled park", () => {
+	it("Esc while parked for hours does not cancel the pending wake", async () => {
+		const parked = await parkSession(parkSettings(3_600_000));
+		expect(parked.session.isQuotaParked).toBe(true);
+		// The user keeps driving the parked session; the wake is an hour out and the
+		// turn they abort is theirs, not the wake probe.
+		parked.setResponses([() => new Promise<never>(() => {})]);
+		void parked.session.prompt("a question while parked");
+		await waitFor(() => parked.eventsOfType("agent_start").length >= 2, "the new turn to start");
+
+		parked.session.requestAbort({ reason: "user" });
+		await parked.session.waitForIdle();
+
+		expect(parked.session.isQuotaParked).toBe(true);
+		expect(resumeOutcomes(parked)).toEqual([]);
+	});
+});
+
 describe("a skipped or errored durable wake is not a delivery", () => {
 	function sessionStore(harness: Harness): AgentCronJobStore {
 		const artifactDir = harness.sessionManager.getSessionArtifactDir();

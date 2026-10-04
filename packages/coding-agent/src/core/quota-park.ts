@@ -531,14 +531,18 @@ export async function resumeFromQuotaPark(host: QuotaParkHost): Promise<void> {
  *
  * One exception: a user abort is the user taking the session back. Re-arming
  * the wake under it auto-resumed the task 60s after the user pressed Esc, so a
- * user-aborted turn cancels the park outright and records the cancellation.
+ * user-aborted turn cancels the park outright and records the cancellation —
+ * but only when the aborted turn is the wake's own probe (the park is waking)
+ * or the wake is already due. A user abort of any other turn leaves a
+ * future-scheduled park alone: the wake hours from now is not that turn's to
+ * cancel.
  */
 export function handleAbortedQuotaPark(host: QuotaParkHost): void {
 	const park = host._quotaPark;
 	if (!park || (park.waking === true && hasQueuedQuotaResumeMarker(host))) {
 		return;
 	}
-	if (host._lastTurnAbortReason === "user") {
+	if (host._lastTurnAbortReason === "user" && (park.waking === true || park.resumeAtMs <= Date.now())) {
 		cancelQuotaParkWake(host, park);
 		host._quotaPark = undefined;
 		try {
