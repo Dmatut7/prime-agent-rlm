@@ -1,10 +1,12 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { CONFIG_DIR_NAME } from "../src/config.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
-import { preflightCliModelDiagnostics } from "../src/main.js";
+import { SettingsManager } from "../src/core/settings-manager.js";
+import { cliExtensionsMayLoad, preflightCliModelDiagnostics } from "../src/main.js";
 
 /**
  * wave-38 MODEL-PERSIST (T1): a --model that names nothing, or names a model whose
@@ -111,5 +113,91 @@ describe("preflightCliModelDiagnostics", () => {
 		});
 
 		expect(diagnostics.filter((diagnostic) => diagnostic.type === "error")).toEqual([]);
+	});
+
+	it("downgrades the unknown-model error to a warning when extensions may register the model", () => {
+		const agentDir = agentDirWith(MODELS_JSON);
+		const diagnostics = preflightCliModelDiagnostics({
+			cliModel: "totally-nonexistent-model-xyz",
+			agentDir,
+			modelRegistry: registryFor(agentDir),
+			extensionsMayLoad: true,
+		});
+
+		expect(diagnostics.filter((diagnostic) => diagnostic.type === "error")).toEqual([]);
+		const warnings = diagnostics.filter((diagnostic) => diagnostic.type === "warning");
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]!.message).toContain("totally-nonexistent-model-xyz");
+	});
+
+	it("keeps the hard error when extensions cannot load", () => {
+		const agentDir = agentDirWith(MODELS_JSON);
+		const diagnostics = preflightCliModelDiagnostics({
+			cliModel: "totally-nonexistent-model-xyz",
+			agentDir,
+			modelRegistry: registryFor(agentDir),
+			extensionsMayLoad: false,
+		});
+
+		expect(diagnostics.filter((diagnostic) => diagnostic.type === "error")).toHaveLength(1);
+	});
+});
+
+describe("cliExtensionsMayLoad", () => {
+	function tempRoot(): { cwd: string; agentDir: string } {
+		const root = mkdtempSync(join(tmpdir(), "wave-preflight-ext-"));
+		return { cwd: join(root, "project"), agentDir: join(root, "agent") };
+	}
+
+	it("is false when no extension source exists", () => {
+		const { cwd, agentDir } = tempRoot();
+		expect(cliExtensionsMayLoad({ settingsManager: SettingsManager.inMemory(), cwd, agentDir })).toBe(false);
+	});
+
+	it("is true when --extension paths were passed on the command line", () => {
+		const { cwd, agentDir } = tempRoot();
+		expect(
+			cliExtensionsMayLoad({
+				cliExtensions: ["./my-extension.ts"],
+				settingsManager: SettingsManager.inMemory(),
+				cwd,
+				agentDir,
+			}),
+		).toBe(true);
+	});
+
+	it("is true when settings name extension paths", () => {
+		const { cwd, agentDir } = tempRoot();
+		const settingsManager = SettingsManager.inMemory({ extensions: ["./settings-extension.ts"] });
+		expect(cliExtensionsMayLoad({ settingsManager, cwd, agentDir })).toBe(true);
+	});
+
+	it("is true when settings name packages, which may declare extensions", () => {
+		const { cwd, agentDir } = tempRoot();
+		const settingsManager = SettingsManager.inMemory({ packages: ["npm:some-extension-pack"] });
+		expect(cliExtensionsMayLoad({ settingsManager, cwd, agentDir })).toBe(true);
+	});
+
+	it("is true when the project extensions directory has entries", () => {
+		const { cwd, agentDir } = tempRoot();
+		const projectExtensions = join(cwd, CONFIG_DIR_NAME, "extensions");
+		mkdirSync(projectExtensions, { recursive: true });
+		writeFileSync(join(projectExtensions, "project-ext.ts"), "export default function () {}\n", "utf-8");
+		expect(cliExtensionsMayLoad({ settingsManager: SettingsManager.inMemory(), cwd, agentDir })).toBe(true);
+	});
+
+	it("is true when the user-level extensions directory has entries", () => {
+		const { cwd, agentDir } = tempRoot();
+		const userExtensions = join(agentDir, "extensions");
+		mkdirSync(userExtensions, { recursive: true });
+		writeFileSync(join(userExtensions, "user-ext.ts"), "export default function () {}\n", "utf-8");
+		expect(cliExtensionsMayLoad({ settingsManager: SettingsManager.inMemory(), cwd, agentDir })).toBe(true);
+	});
+
+	it("ignores empty extensions directories", () => {
+		const { cwd, agentDir } = tempRoot();
+		mkdirSync(join(cwd, CONFIG_DIR_NAME, "extensions"), { recursive: true });
+		mkdirSync(join(agentDir, "extensions"), { recursive: true });
+		expect(cliExtensionsMayLoad({ settingsManager: SettingsManager.inMemory(), cwd, agentDir })).toBe(false);
 	});
 });

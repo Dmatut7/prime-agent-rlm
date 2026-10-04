@@ -29,7 +29,10 @@
  *   - Not wired into `npm run check` / the pre-commit hook: that would block every lane (including
  *     upstream merge-backs) on frozen stock. It runs in CI and on demand.
  *   - Cross-file alias resolution: `as unknown as SomeInternals` is only flagged when
- *     `SomeInternals` is declared as a brace-form `type`/`interface` in the same file.
+ *     `SomeInternals` is declared as a brace-form `type`/`interface` in the same file, and the
+ *     body either declares a `_`-prefixed member or the name follows the `XInternals` shadow
+ *     convention (a class whose private members use the `private` keyword has no underscore
+ *     member for the body test to find).
  *   - Computed probe targets (`vi.spyOn(obj, name)` where `name` is a variable) cannot be seen
  *     statically and are not flagged.
  *
@@ -82,7 +85,7 @@ const RULE_HELP = {
 	[RULE_PRIVATE_CAST]:
 		"`as unknown as { _member: ... }` probes a private member through a cast. Use a public seam (an exported helper, an injectable option, or an observable event) instead.",
 	[RULE_PRIVATE_CAST_ALIAS]:
-		"`as unknown as <Shadow>` casts to a locally declared shadow type that describes private members. Give the class a real, narrow interface (or a test-only seam) instead of re-declaring its internals.",
+		"`as unknown as <Shadow>` casts to a locally declared shadow type that describes private members (a `_` member, or the `XInternals` naming convention). Give the class a real, narrow interface (or a test-only seam) instead of re-declaring its internals.",
 	[RULE_PRIVATE_SPY]:
 		'`vi.spyOn(target, "_member")` spies on a private member. Drive the public entry point and assert on observable output instead.',
 };
@@ -280,6 +283,11 @@ function matchBracket(source, openIndex) {
 // ---------------------------------------------------------------------------
 
 const PRIVATE_MEMBER_RE = /(?:^|[\s{;,])_[A-Za-z0-9$]+\s*\??\s*[:;(]/;
+// The codebase marks private members with a leading underscore OR with the `private`
+// keyword. Shadow types for the second form have no underscore member to match, so
+// the alias name is the signal: `XInternals` is the hygiene rule's own name for a
+// same-file shadow of a class's private surface.
+const SHADOW_ALIAS_NAME_RE = /Internals$/;
 const CAST_HEAD_RE = /as\s+unknown\s+as\s+/g;
 const SPY_HEAD_RE = /(^|[^A-Za-z0-9_$])spyOn\s*\(/g;
 const IDENTIFIER_RE = /^[A-Za-z0-9_$]+/;
@@ -301,7 +309,8 @@ function normalize(text) {
 
 /**
  * Map every same-file `type X = { ... }` / `interface X { ... }` declaration to whether its body
- * declares a `_`-prefixed member. Union/intersection aliases are not resolved (documented gap).
+ * declares a `_`-prefixed member or its name follows the `XInternals` shadow convention. Union/
+ * intersection aliases are not resolved (documented gap).
  */
 function collectShadowAliases(masked) {
 	const aliases = new Map();
@@ -315,7 +324,7 @@ function collectShadowAliases(masked) {
 			if (brace !== -1) {
 				const close = matchBracket(masked, brace);
 				if (close !== -1) {
-					aliases.set(name, PRIVATE_MEMBER_RE.test(masked.slice(brace, close + 1)));
+					aliases.set(name, SHADOW_ALIAS_NAME_RE.test(name) || PRIVATE_MEMBER_RE.test(masked.slice(brace, close + 1)));
 				}
 			}
 		}
@@ -635,6 +644,20 @@ const SCANNER_CONTROLS = [
 			"type SupervisorInternals = { _pendingFlush: number };\nconst internals = supervisor as unknown as SupervisorInternals;\n",
 	},
 	{
+		// daemon-supervisor-lazy-subagents.test.ts shaped its SupervisorInternals after the
+		// class's `private` keyword members, which carry no underscore: the member-shape test
+		// alone misses that form, so the *Internals name itself is the signal.
+		name: "cast to a same-file *Internals shadow interface without underscore members",
+		expect: [{ rule: RULE_PRIVATE_CAST_ALIAS, line: 4 }],
+		source:
+			"interface SupervisorInternals {\n\tworkers: Map<string, unknown>;\n}\nconst internals = supervisor as unknown as SupervisorInternals;\n",
+	},
+	{
+		name: "cast to a same-file *Internals type alias without underscore members",
+		expect: [{ rule: RULE_PRIVATE_CAST_ALIAS, line: 2 }],
+		source: "type KernelInternals = { shutdown(): void };\nconst internals = kernel as unknown as KernelInternals;\n",
+	},
+	{
 		name: "cast to a same-file shadow interface",
 		expect: [{ rule: RULE_PRIVATE_CAST_ALIAS, line: 4 }],
 		source:
@@ -692,6 +715,14 @@ const SCANNER_NEGATIVE_CONTROLS = [
 	{
 		name: "shadow alias declared but never cast to is not a probe",
 		source: "type UnusedInternals = { _pending: number };\nconst value = 1;\n",
+	},
+	{
+		name: "an Internals-suffixed alias from another file is not a probe (cross-file resolution is a non-goal)",
+		source: "const internals = supervisor as unknown as ForeignInternals;\n",
+	},
+	{
+		name: "an alias not suffixed Internals and without underscore members is not a probe",
+		source: "type SessionInternal = { id: string };\nconst value = session as unknown as SessionInternal;\n",
 	},
 	{
 		name: "pattern inside a comment is not a probe",

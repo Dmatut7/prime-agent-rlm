@@ -46,10 +46,97 @@
 				"spyOn( session as unknown as { _rebuildRuntimeForAcpMcpServers(): void }, \"_rebuildRuntimeForAcpMcpServers\", )": 1
 			}
 		},
+		"packages/coding-agent/test/daemon-crash-handlers.test.ts": {
+			"private-cast-alias": {
+				"as unknown as DaemonCrashInternals": 1
+			}
+		},
+		"packages/coding-agent/test/daemon-crash-recovery-chain.test.ts": {
+			"private-cast-alias": {
+				"as unknown as BindInternals": 1
+			}
+		},
 		"packages/coding-agent/test/daemon-mode.test.ts": {
 			"private-cast": {
 				"as unknown as { _session: typeof originalSession }": 1,
 				"as unknown as { _session: typeof replacementSession }": 1
+			}
+		},
+		"packages/coding-agent/test/daemon-peer-transport.test.ts": {
+			"private-cast-alias": {
+				"as unknown as SupervisorInternals": 2,
+				"as unknown as WorkerInternals": 2
+			}
+		},
+		"packages/coding-agent/test/daemon-quota-park-status.test.ts": {
+			"private-cast-alias": {
+				"as unknown as DaemonInternals": 1
+			}
+		},
+		"packages/coding-agent/test/daemon-slim-attach-transcript.test.ts": {
+			"private-cast-alias": {
+				"as unknown as WorkerInternals": 1
+			}
+		},
+		"packages/coding-agent/test/daemon-supervisor-attach-preregistration.test.ts": {
+			"private-cast-alias": {
+				"as unknown as SupervisorInternals": 1
+			}
+		},
+		"packages/coding-agent/test/daemon-supervisor-command-dispatch.test.ts": {
+			"private-cast-alias": {
+				"as unknown as SupervisorInternals": 1
+			}
+		},
+		"packages/coding-agent/test/daemon-supervisor-eviction.test.ts": {
+			"private-cast-alias": {
+				"as unknown as SupervisorInternals": 2
+			}
+		},
+		"packages/coding-agent/test/daemon-supervisor-input-pause.test.ts": {
+			"private-cast-alias": {
+				"as unknown as SupervisorInternals": 1
+			}
+		},
+		"packages/coding-agent/test/daemon-supervisor-launch-startid-async.test.ts": {
+			"private-cast-alias": {
+				"as unknown as SupervisorInternals": 1
+			}
+		},
+		"packages/coding-agent/test/daemon-supervisor-lazy-subagents.test.ts": {
+			"private-cast-alias": {
+				"as unknown as SupervisorInternals": 17
+			}
+		},
+		"packages/coding-agent/test/daemon-worker-recovery-resume.test.ts": {
+			"private-cast-alias": {
+				"as unknown as DaemonInternals": 2
+			}
+		},
+		"packages/coding-agent/test/daemon-worker-shared-snapshot-encoding.test.ts": {
+			"private-cast-alias": {
+				"as unknown as DaemonInternals": 1
+			}
+		},
+		"packages/coding-agent/test/repl-kernel-abort.test.ts": {
+			"private-cast-alias": {
+				"as unknown as ExitReportingInternals": 1,
+				"as unknown as ReplInternals": 1
+			}
+		},
+		"packages/coding-agent/test/repl-kernel-host-request-abort.test.ts": {
+			"private-cast-alias": {
+				"as unknown as AbortInternals": 1
+			}
+		},
+		"packages/coding-agent/test/repl-kernel-shutdown.test.ts": {
+			"private-cast-alias": {
+				"as unknown as ShutdownInternals": 1
+			}
+		},
+		"packages/coding-agent/test/rlm-ledger.test.ts": {
+			"private-cast-alias": {
+				"as unknown as SupervisorLedgerInternals": 5
 			}
 		},
 		"packages/coding-agent/test/session-manager-flush.test.ts": {
@@ -239,6 +326,9 @@
 			}
 		},
 		"packages/coding-agent/test/suite/regressions/4257-update-restart-resume.test.ts": {
+			"private-cast-alias": {
+				"as unknown as AgentDaemonUpdateInternals": 2
+			},
 			"private-cast": {
 				"as unknown as { _goalAbortInProgress: boolean }": 1
 			}
@@ -260,6 +350,11 @@
 				"as unknown as { _retryAttempt: number; _createRetryPromiseForAgentEnd(event: AgentEvent): void; }": 1
 			}
 		},
+		"packages/coding-agent/test/suite/regressions/4519-heartbeat-rebirth.test.ts": {
+			"private-cast-alias": {
+				"as unknown as AgentDaemonCronInternals": 4
+			}
+		},
 		"packages/coding-agent/test/suite/regressions/4530-ipython-state-restore-message.test.ts": {
 			"private-cast-alias": {
 				"as unknown as StateRestoreHost": 1
@@ -273,6 +368,11 @@
 		"packages/coding-agent/test/suite/regressions/4649-subagent-model-selection.test.ts": {
 			"private-cast": {
 				"as unknown as { _createKernelHostHandlers(): HostRequestHandlers }": 1
+			}
+		},
+		"packages/coding-agent/test/suite/regressions/4657-update-heartbeat-recovery.test.ts": {
+			"private-cast-alias": {
+				"as unknown as AgentDaemonCronInternals": 1
 			}
 		},
 		"packages/coding-agent/test/suite/regressions/4685-daemon-client-modes.test.ts": {

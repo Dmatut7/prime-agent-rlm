@@ -5,6 +5,7 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
+import { readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { type Api, type ImageContent, type Model, modelsAreEqual } from "@earendil-works/pi-ai";
@@ -31,7 +32,14 @@ import {
 	SessionSelectorNotFoundError,
 } from "./cli/session-resolver.js";
 import { getStdoutWidth, wrapForStderr, wrapForStdout } from "./cli/stdout-wrap.js";
-import { APP_NAME, expandTildePath, getAgentDir, getSessionDirEnvOverride, VERSION } from "./config.js";
+import {
+	APP_NAME,
+	CONFIG_DIR_NAME,
+	expandTildePath,
+	getAgentDir,
+	getSessionDirEnvOverride,
+	VERSION,
+} from "./config.js";
 import {
 	type AgentExecutionMode,
 	type AgentSessionRuntimeConfig,
@@ -172,6 +180,13 @@ export function preflightCliModelDiagnostics(options: {
 	cliModel?: string;
 	allowUnauthenticated?: boolean;
 	agentDir: string;
+	/**
+	 * True when any extension source is in play (cliExtensionsMayLoad). An
+	 * extension can register a provider/model the static catalog does not know, so
+	 * the parse-time verdict then degrades from a hard error to a warning; the
+	 * worker's own resolution still validates and announces a fallback on stderr.
+	 */
+	extensionsMayLoad?: boolean;
 	/** Test hook: skip constructing the registry from the agent dir. */
 	modelRegistry?: ModelRegistry;
 }): AgentSessionRuntimeDiagnostic[] {
@@ -195,9 +210,54 @@ export function preflightCliModelDiagnostics(options: {
 		diagnostics.push({ type: "warning", message: resolved.warning });
 	}
 	if (resolved.error) {
-		diagnostics.push({ type: "error", message: resolved.error });
+		if (options.extensionsMayLoad === true) {
+			diagnostics.push({
+				type: "warning",
+				message: `${resolved.error} Extensions are configured; one of them may still register this model at startup.`,
+			});
+		} else {
+			diagnostics.push({ type: "error", message: resolved.error });
+		}
 	}
 	return diagnostics;
+}
+
+function directoryHasEntries(dir: string): boolean {
+	try {
+		return readdirSync(dir).length > 0;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Whether this startup may load extensions from any source: `--extension` paths,
+ * settings `extensions`, settings `packages` (a package can declare extensions in
+ * its manifest), or the auto-discovered extensions directories of the project
+ * (`<cwd>/.prime/agent/extensions`) and the user (`<agentDir>/extensions`). The
+ * directory checks are deliberately coarse (any entry counts): a false positive
+ * only downgrades the --model preflight to a warning, while a false negative
+ * would reject an extension-registered model outright.
+ */
+export function cliExtensionsMayLoad(options: {
+	cliExtensions?: string[];
+	settingsManager: SettingsManager;
+	cwd: string;
+	agentDir: string;
+}): boolean {
+	if (options.cliExtensions !== undefined && options.cliExtensions.length > 0) {
+		return true;
+	}
+	if (options.settingsManager.getExtensionPaths().length > 0) {
+		return true;
+	}
+	if (options.settingsManager.getPackages().length > 0) {
+		return true;
+	}
+	if (directoryHasEntries(join(options.cwd, CONFIG_DIR_NAME, "extensions"))) {
+		return true;
+	}
+	return directoryHasEntries(join(options.agentDir, "extensions"));
 }
 
 function isTruthyEnvFlag(value: string | undefined): boolean {
@@ -2020,22 +2080,27 @@ export async function main(args: string[], options?: MainOptions) {
 		// An explicit --model that names nothing runnable fails here, before any
 		// daemon session is created: the create answer loses the worker's
 		// diagnostics to roster slimming, which used to turn a typo into a silent
-		// fallback to the default model. Skipped when extensions are in play: an
-		// extension can register a provider/model the static catalog does not know
-		// (the faux test provider works this way), so a hard reject here would be
-		// wrong - the worker's own resolution still validates, and a fallback is
-		// now announced on stderr.
-		if (!parsed.extensions?.length) {
-			const cliModelDiagnostics = preflightCliModelDiagnostics({
-				cliProvider: parsed.provider,
-				cliModel: parsed.model,
-				allowUnauthenticated: Boolean(parsed.apiKey),
-				agentDir,
-			});
-			reportDiagnostics(cliModelDiagnostics);
-			if (cliModelDiagnostics.some((diagnostic) => diagnostic.type === "error")) {
-				await exitAfterOrphanJournalFlush(1);
-			}
+		// fallback to the default model. When extensions are in play the verdict
+		// degrades to a warning: an extension can register a provider/model the
+		// static catalog does not know (the faux test provider works this way), so
+		// a hard reject would be wrong - the worker's own resolution still
+		// validates, and a fallback is now announced on stderr.
+		const extensionsMayLoad = cliExtensionsMayLoad({
+			cliExtensions: parsed.extensions,
+			settingsManager,
+			cwd: sessionManager.getCwd(),
+			agentDir,
+		});
+		const cliModelDiagnostics = preflightCliModelDiagnostics({
+			cliProvider: parsed.provider,
+			cliModel: parsed.model,
+			allowUnauthenticated: Boolean(parsed.apiKey),
+			agentDir,
+			extensionsMayLoad,
+		});
+		reportDiagnostics(cliModelDiagnostics);
+		if (cliModelDiagnostics.some((diagnostic) => diagnostic.type === "error")) {
+			await exitAfterOrphanJournalFlush(1);
 		}
 		let stdinContent: string | undefined;
 		if (appMode !== "rpc" && appMode !== "acp") {

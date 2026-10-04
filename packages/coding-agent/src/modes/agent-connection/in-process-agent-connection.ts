@@ -263,7 +263,10 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async abortAndClearQueue(): Promise<AgentConnectionQueueState> {
 		const queue = this.session.clearQueue();
-		this.session.requestAbort();
+		// Same reason the daemon's abort_and_clear_queue handler records: this abort is
+		// the user taking the session back, so a quota park whose wake probe it stops
+		// cancels instead of re-arming.
+		this.session.requestAbort({ reason: "user" });
 		return queue;
 	}
 
@@ -460,14 +463,18 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async abort(): Promise<void> {
-		this.session.requestAbort();
+		// Same reason the daemon's abort handler records: a client abort is a person
+		// deliberately stopping the turn (Esc, an RPC/ACP cancel), which a quota park
+		// reads as cancelling the wake outright.
+		this.session.requestAbort({ reason: "user" });
 	}
 
 	async abortAndSendQueued(): Promise<AgentConnectionAbortAndSendQueuedResult> {
 		// In-process there is no peer that could be too old for the command: the session either
 		// carries the queued steering out with the interrupt or the queue was empty, and an empty
-		// queue is the documented abort-only case, not a degradation.
-		this.session.abortAndSendQueued();
+		// queue is the documented abort-only case, not a degradation. The reason mirrors the
+		// daemon's abort_and_send_queued handler: this interrupt is the user's Esc.
+		this.session.abortAndSendQueued({ reason: "user" });
 		return {};
 	}
 

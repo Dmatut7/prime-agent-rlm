@@ -1,7 +1,12 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { getModel } from "@earendil-works/pi-ai";
-import { describe, expect, it, vi } from "vitest";
-import type { AgentSessionEvent, AgentSessionEventListener, PromptOptions } from "../src/core/agent-session.js";
+import { type AssistantMessage, fauxAssistantMessage, getModel } from "@earendil-works/pi-ai";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type {
+	AgentSession,
+	AgentSessionEvent,
+	AgentSessionEventListener,
+	PromptOptions,
+} from "../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { emptyGoalState } from "../src/core/goals.js";
 import {
@@ -10,8 +15,10 @@ import {
 	SESSION_TREE_MAX_WIRE_NODES,
 	type SessionEntry,
 } from "../src/core/session-manager.js";
+import type { Settings } from "../src/core/settings-manager.js";
 import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
 import type { AgentConnectionEvent, AgentConnectionState } from "../src/modes/agent-connection/types.js";
+import { createHarness, type Harness } from "./suite/harness.js";
 
 type RuntimeSession = AgentSessionRuntime["session"];
 type RuntimeRebindCallback = Parameters<AgentSessionRuntime["setRebindSession"]>[0];
@@ -585,4 +592,101 @@ describe("initial snapshot quotaPark", () => {
 		expect(session.compactionPerModelWrites).toEqual([[undefined, false]]);
 		expect(session.compactionGlobalWrites).toEqual([]);
 	});
+});
+
+/**
+ * REVIEW-FIXUP 2026-10-04: a connection abort is the user's Esc - the daemon-mode
+ * twins (handleAbort, handleAbortAndSendQueued, handleAbortAndClearQueue) all record
+ * reason "user", and quota-park.ts cancels the park on exactly that reason. An
+ * in-process abort without the reason re-armed the wake instead, so the task
+ * auto-resumed a minute after the user stopped it. These tests drive the real
+ * session through the connection boundary, because the reason only becomes
+ * observable in what the park does next.
+ */
+describe("a connection abort during the quota-park wake probe", () => {
+	const harnesses: Harness[] = [];
+
+	afterEach(() => {
+		while (harnesses.length > 0) {
+			harnesses.pop()?.cleanup();
+		}
+	});
+
+	function quotaFailure(): AssistantMessage {
+		return {
+			...fauxAssistantMessage("", {
+				stopReason: "error",
+				errorMessage: "429 You have hit your ChatGPT usage limit",
+			}),
+			diagnostics: [
+				{
+					type: "provider_stream_failure",
+					timestamp: Date.now(),
+					details: { kind: "rate_limit", status: 429, retryAfterMs: 3_600_000 },
+				},
+			],
+		};
+	}
+
+	const parkSettings: Partial<Settings> = {
+		retry: {
+			enabled: true,
+			maxRetries: 3,
+			baseDelayMs: 1,
+			provider: {
+				waitForUsage: { baseDelayMs: 1, maxDelayMs: 2, maxAttempts: 5, maxWaitMs: 1_000, maxPauseMs: 60 },
+			},
+		},
+	};
+
+	function runtimeHostFor(session: AgentSession): AgentSessionRuntime {
+		return {
+			session,
+			setRebindSession() {},
+			setBeforeSessionInvalidate() {},
+			async dispose() {},
+		} as unknown as AgentSessionRuntime;
+	}
+
+	async function waitFor(condition: () => boolean, what: string, timeoutMs = 10_000): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if (condition()) return;
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+		throw new Error(`timed out waiting for ${what}`);
+	}
+
+	function resumeOutcomes(harness: Harness): Array<Record<string, unknown>> {
+		return harness.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "custom" && entry.customType === "provider_quota_resume")
+			.map((entry) => (entry as { data?: Record<string, unknown> }).data ?? {});
+	}
+
+	it.each([{ method: "abort" }, { method: "abortAndClearQueue" }, { method: "abortAndSendQueued" }] as const)(
+		"connection.$method() cancels the park instead of re-arming the wake",
+		async ({ method }) => {
+			const harness = await createHarness({ persistSession: true, settings: parkSettings });
+			harnesses.push(harness);
+			harness.sessionManager.materializeSessionFile();
+			harness.setResponses([quotaFailure()]);
+			await harness.session.prompt("do the work");
+			await harness.session.waitForIdle();
+			expect(harness.session.isQuotaParked).toBe(true);
+
+			const connection = new InProcessAgentConnection(runtimeHostFor(harness.session));
+			// The wake probe turn hangs so there is something to abort.
+			harness.setResponses([() => new Promise<never>(() => {})]);
+			await waitFor(() => harness.eventsOfType("agent_start").length >= 2, "the wake probe turn to start");
+
+			if (method === "abort") await connection.abort();
+			else if (method === "abortAndClearQueue") await connection.abortAndClearQueue();
+			else await connection.abortAndSendQueued();
+			await harness.session.waitForIdle();
+
+			expect(harness.session.isQuotaParked).toBe(false);
+			expect(resumeOutcomes(harness)).toEqual([expect.objectContaining({ outcome: "user-aborted" })]);
+		},
+	);
 });
