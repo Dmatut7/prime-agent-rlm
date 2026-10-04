@@ -204,6 +204,14 @@ export class BlockNavigator implements Component, Focusable {
 export class FocusableTextBlock extends Text implements FocusableBlock {
 	private blockFocus?: BlockFocusState;
 
+	/**
+	 * False for transient notices (a startup warning): block navigation can
+	 * still walk onto the row, but entering navigation never starts on it — a
+	 * one-row notice often has no room for the key hint, so landing there reads
+	 * as a dead keypress.
+	 */
+	navigationEntryTarget = true;
+
 	constructor(
 		text: string,
 		private readonly copyText: string,

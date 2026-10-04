@@ -7,6 +7,7 @@ import {
 	BlockNavigator,
 	blockFocusHint,
 	decorateFocusedBlock,
+	FocusableTextBlock,
 	isVisibleRow,
 } from "../src/modes/interactive/components/block-focus.js";
 import { TurnActivityState, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
@@ -160,6 +161,29 @@ describe("InteractiveMode block navigation", () => {
 		const mode = createMode([new UserMessageComponent("数一下"), summary, answer, toolOnly]);
 		mode.startBlockNavigation(-1);
 		expect(mode.blockNavigation.focused).toBe(answer);
+	});
+
+	// F2 (wave-48): a restored session ends on the model-fallback warning, a
+	// one-row notice whose focus paint carries no key hint (no room) — the first
+	// Alt+Up looked dead. Enter on the last conversation block instead; notices
+	// stay in the walk.
+	it("enters on the last conversation block when a notice sits at the bottom", () => {
+		const answer = assistant("回答。");
+		const warning = new FocusableTextBlock("⚠ Could not restore model a/b (gone). Using c/d.", "⚠ notice");
+		warning.navigationEntryTarget = false;
+		const mode = createMode([new UserMessageComponent("问题"), answer, warning]);
+		mode.startBlockNavigation(-1);
+		expect(mode.blockNavigation.focused).toBe(answer);
+		mode.moveBlockFocus(1);
+		expect(mode.blockNavigation.focused).toBe(warning);
+	});
+
+	it("still enters on the notice when it is the only block", () => {
+		const warning = new FocusableTextBlock("⚠ 只有一条警告", "⚠ 只有一条警告");
+		warning.navigationEntryTarget = false;
+		const mode = createMode([warning]);
+		mode.startBlockNavigation(-1);
+		expect(mode.blockNavigation.focused).toBe(warning);
 	});
 
 	it("toggles an answer's Thinking and copies its markdown source", async () => {

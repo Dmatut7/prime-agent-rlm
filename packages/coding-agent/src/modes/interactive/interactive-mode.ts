@@ -10428,8 +10428,9 @@ export class InteractiveMode {
 
 	/**
 	 * Enter block navigation (Alt+Up from the prompt) on the newest block in
-	 * view: the bottom block while following, otherwise the lowest block whose
-	 * top row is on screen, so a scrolled-up fullscreen view stays put.
+	 * view: the bottom conversation block while following (trailing notices
+	 * excluded), otherwise the lowest block whose top row is on screen, so a
+	 * scrolled-up fullscreen view stays put.
 	 */
 	private startBlockNavigation(direction: -1 | 1): void {
 		if (this.blockNavigation) {
@@ -10463,7 +10464,16 @@ export class InteractiveMode {
 	private blockNearestView(blocks: readonly (FocusableBlock & Component)[]): (FocusableBlock & Component) | undefined {
 		const last = blocks.at(-1);
 		const scroll = this.ui.isFullscreenReviewing() ? this.ui.getScrollInfo() : null;
-		if (!scroll) return last;
+		if (!scroll) {
+			// Enter on the last conversation block: a trailing notice (a startup
+			// warning) is one row with no room for the key hint, so landing there
+			// reads as a dead keypress. Notices stay in the walk.
+			for (let i = blocks.length - 1; i >= 0; i--) {
+				const block = blocks[i];
+				if (block && (!(block instanceof FocusableTextBlock) || block.navigationEntryTarget)) return block;
+			}
+			return last;
+		}
 		const width = Math.max(1, this.ui.terminal.columns);
 		const chatTop = componentRowOffset(this.getFullscreenScrollComponents(), this.chatContainer, width);
 		if (chatTop === undefined) return last;
@@ -11718,9 +11728,9 @@ export class InteractiveMode {
 
 	showWarning(warningMessage: string): void {
 		if (this.chatContainer.children.length > 0) this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(
-			new FocusableTextBlock(theme.fg("warning", `⚠ ${warningMessage}`), `⚠ ${warningMessage}`),
-		);
+		const notice = new FocusableTextBlock(theme.fg("warning", `⚠ ${warningMessage}`), `⚠ ${warningMessage}`);
+		notice.navigationEntryTarget = false;
+		this.chatContainer.addChild(notice);
 		this.ui.requestRender();
 	}
 
