@@ -626,6 +626,60 @@ interface InlineStyleContext {
 	stylePrefix: string;
 }
 
+/**
+ * Whether a fenced code token's raw contains its closing fence. marked ends a
+ * fenced code token at the closing fence line, so the closer can only be the
+ * raw's final line: up to 3 leading spaces, a run of the opener's fence
+ * character at least as long as the opener's, and nothing but spaces after it
+ * (a "```" gaining more characters stops being a closer and the fence re-opens
+ * — the raw then fails this check again). Indented code has no fence opener
+ * and never closes here; it keeps the streaming seal while it is the final
+ * block. Checking only the final line keeps this O(line) per frame.
+ */
+function fenceRawClosed(raw: string): boolean {
+	const open = /^ {0,3}(`{3,}|~{3,})/.exec(raw);
+	if (!open) {
+		return false;
+	}
+	const fence = open[1];
+	let end = raw.length;
+	if (end > 0 && raw.charCodeAt(end - 1) === 10) {
+		end -= 1;
+	}
+	const lineStart = raw.lastIndexOf("\n", end - 1);
+	if (lineStart === -1) {
+		return false;
+	}
+	const closer = /^ {0,3}(`{3,}|~{3,}) *$/.exec(raw.slice(lineStart + 1, end));
+	return closer !== null && closer[1].charCodeAt(0) === fence.charCodeAt(0) && closer[1].length >= fence.length;
+}
+
+/**
+ * Cap on the per-frame streaming highlight of a growing fence's unsealed tail:
+ * about one screen of code. A tail beyond the cap renders plain (the wrap seal
+ * still bounds its re-render) until the fence closes and is highlighted in
+ * full once; the cap is what bounds the per-frame highlighter input instead of
+ * re-highlighting the whole accumulated block every frame.
+ */
+const FENCE_STREAM_HL_MAX_LINES = 50;
+const FENCE_STREAM_HL_MAX_CHARS = 4096;
+
+function fenceTailFitsHighlight(tail: string): boolean {
+	if (tail.length > FENCE_STREAM_HL_MAX_CHARS) {
+		return false;
+	}
+	let lines = 1;
+	for (let i = 0; i < tail.length; i++) {
+		if (tail.charCodeAt(i) === 10) {
+			lines += 1;
+			if (lines > FENCE_STREAM_HL_MAX_LINES) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
 export class Markdown implements Component {
 	private text: string;
 	private paddingX: number; // Left/right padding
@@ -1266,12 +1320,12 @@ export class Markdown implements Component {
 	/**
 	 * Render the final block through the seal: the sealed prefix comes from the
 	 * cache, only the unsealed tail is rendered. Paragraphs seal completed
-	 * lines, fences (without a whole-block highlighter) seal completed code
-	 * lines, and lists seal completed items (renderFinalListSealed). Blocks
-	 * whose rendering later text can re-interpret in ways the seal validation
-	 * does not cover (tables re-flow column widths per row; highlighted fences
-	 * are context-sensitive across the full code text) keep the full per-frame
-	 * re-render.
+	 * lines, fences seal completed code lines (with a whole-block highlighter
+	 * the sealed prefix renders plain and only the capped tail is highlighted
+	 * per frame — see renderFinalCodeSealed), and lists seal completed items
+	 * (renderFinalListSealed). Blocks whose rendering later text can
+	 * re-interpret in ways the seal validation does not cover (tables re-flow
+	 * column widths per row) keep the full per-frame re-render.
 	 */
 	private renderFinalBlockSealed(token: Token, width: number, contentWidth: number, capsVersion: number): string[] {
 		if (token.type === "paragraph") {
@@ -1279,7 +1333,12 @@ export class Markdown implements Component {
 			if (sealed) {
 				return sealed;
 			}
-		} else if (token.type === "code" && !this.theme.highlightCode) {
+		} else if (
+			token.type === "code" &&
+			// PI_MARKDOWN_FENCE_STREAM_HL=0 opts highlighted fences out of the
+			// seal, restoring the pre-seal full highlighted re-render every frame.
+			(!this.theme.highlightCode || process.env.PI_MARKDOWN_FENCE_STREAM_HL !== "0")
+		) {
 			const sealed = this.renderFinalCodeSealed(token as Tokens.Code, width, contentWidth, capsVersion);
 			if (sealed) {
 				return sealed;
@@ -1718,9 +1777,20 @@ export class Markdown implements Component {
 	/**
 	 * Fence/indented-code seal. Code lines render independently of each other
 	 * (no inline constructs), so every hard-newline-terminated line of the block
-	 * text is sealed as soon as it completes. Only used when the theme has no
-	 * highlightCode: a whole-block highlighter is context-sensitive across the
-	 * full code text, so a growing fence with one keeps the full re-render.
+	 * text is sealed as soon as it completes.
+	 *
+	 * With a whole-block highlighter (theme.highlightCode) the highlighter is
+	 * context-sensitive across the full code text, so the sealed prefix cannot
+	 * be highlighted incrementally: sealed lines render plain (codeBlock style)
+	 * and only the unsealed tail goes through highlightCode, capped at about
+	 * one screen of code (fenceTailFitsHighlight) to bound the per-frame
+	 * highlight input; a tail beyond the cap renders plain as well. The whole
+	 * fence is highlighted exactly once, when it closes (fenceRawClosed) — or
+	 * when it stops being the final block, which the caller already full-renders
+	 * through the per-block cache path. The visible drift: the streaming sealed
+	 * region is temporarily plain and the fence colors all at once at closure.
+	 * A fence whose stream is truncated before the closing fence never closes,
+	 * so it keeps the plain seal + highlighted tail even in its final render.
 	 */
 	private renderFinalCodeSealed(
 		token: Tokens.Code,
@@ -1733,6 +1803,12 @@ export class Markdown implements Component {
 			return undefined;
 		}
 		const lang = typeof token.lang === "string" ? token.lang : undefined;
+		const highlighting = this.theme.highlightCode !== undefined;
+		if (highlighting && fenceRawClosed(token.raw)) {
+			// Closure reflow: the caller drops the seal and full-renders the
+			// block, highlighting the whole fence in one pass.
+			return undefined;
+		}
 		let seal = this.finalBlockSeal;
 		if (
 			seal &&
@@ -1759,7 +1835,7 @@ export class Markdown implements Component {
 		}
 		if (target > seal.tailFrom) {
 			const extension = this.renderTokenLinesToBlockLines(
-				this.renderCodeTextLines(text.slice(seal.tailFrom, target - 1), lang),
+				this.renderCodeTextLines(text.slice(seal.tailFrom, target - 1), lang, !highlighting),
 				width,
 				contentWidth,
 			);
@@ -1772,12 +1848,26 @@ export class Markdown implements Component {
 			seal.wrapPrevW = undefined;
 			seal.wrapIneligible = false;
 		}
+		const tailText = text.slice(seal.tailFrom);
+		if (highlighting && fenceTailFitsHighlight(tailText)) {
+			// The capped highlighted tail is small, so it renders whole each
+			// frame; the wrap seal's plain-text precondition does not hold under
+			// highlighting. Resetting the wrap fields makes a later over-cap
+			// tail re-seal from scratch instead of comparing against a
+			// highlighted wrapPrevW.
+			const tailLines = this.renderCodeTextLines(tailText, lang);
+			seal.wrapSealedW = undefined;
+			seal.wrapLines = undefined;
+			seal.wrapPrevW = undefined;
+			return [...seal.lines, ...this.renderTokenLinesToBlockLines(tailLines, width, contentWidth)];
+		}
 		// The tail is not always just the growing line: the hard seal only covers
 		// newlines that leave a non-empty tail, so text ending with "\n" (indented
 		// code keeps its trailing newline; a fence keeps trailing blank lines)
 		// leaves complete lines here. Render every tail line like the unsealed
-		// render does; the wrap seal covers only the last one.
-		const tailLines = this.renderCodeTextLines(text.slice(seal.tailFrom), lang);
+		// render does; the wrap seal covers only the last one. A fenced tail
+		// beyond the streaming-highlight cap renders plain until closure.
+		const tailLines = this.renderCodeTextLines(tailText, lang, !highlighting);
 		const w = tailLines[tailLines.length - 1] ?? "";
 		const tailHasAnsi = tailLines.some((line) => line.includes("\x1b"));
 		if (seal.wrapIneligible || tailHasAnsi) {
@@ -2324,11 +2414,12 @@ export class Markdown implements Component {
 		return this.renderCodeTextLines(token.text, lang);
 	}
 
-	/** Render code text to indented, optionally highlighted lines. */
-	private renderCodeTextLines(codeText: string, lang: string | undefined): string[] {
+	/** Render code text to indented lines, highlighted unless highlight=false. */
+	private renderCodeTextLines(codeText: string, lang: string | undefined, highlight: boolean = true): string[] {
 		const indent = this.theme.codeBlockIndent ?? "  ";
-		const renderedCodeLines = this.theme.highlightCode
-			? this.theme.highlightCode(codeText, lang)
+		const highlightCode = highlight ? this.theme.highlightCode : undefined;
+		const renderedCodeLines = highlightCode
+			? highlightCode(codeText, lang)
 			: codeText.split("\n").map((codeLine) => this.theme.codeBlock(codeLine));
 		const codeLines = renderedCodeLines.length > 0 ? renderedCodeLines : [this.theme.codeBlock("")];
 
