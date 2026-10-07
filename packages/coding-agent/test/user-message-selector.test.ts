@@ -14,7 +14,7 @@ describe("UserMessageSelectorComponent height budget", () => {
 		}));
 
 		// A 24-row terminal leaves little room after the dock's other members:
-		// with three lines per entry, only two entries fit.
+		// three lines per entry plus the scroll indicator — one entry fits.
 		const selector = new UserMessageSelectorComponent(
 			messages,
 			() => {},
@@ -24,7 +24,10 @@ describe("UserMessageSelectorComponent height budget", () => {
 		);
 		const messageLines = selector.render(100).filter((line) => line.includes("第 ") && line.includes(" 条"));
 
-		expect(messageLines.length).toBe(2);
+		expect(messageLines.length).toBe(1);
+		// The whole render (chrome + entries + scroll info) stays inside the
+		// budget the dock actually has.
+		expect(selector.render(100).length).toBeLessThanOrEqual(14);
 	});
 
 	it("keeps the default entry count on tall terminals", () => {
@@ -43,6 +46,7 @@ describe("UserMessageSelectorComponent height budget", () => {
 		const messageLines = selector.render(100).filter((line) => line.includes("第 ") && line.includes(" 条"));
 
 		expect(messageLines.length).toBe(10);
+		expect(selector.render(100).length).toBeLessThanOrEqual(60);
 	});
 
 	it("always keeps at least one entry visible on tiny terminals", () => {

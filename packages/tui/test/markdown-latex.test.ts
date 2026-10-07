@@ -100,6 +100,17 @@ describe("latexToUnicode", () => {
 		assert.strictEqual(latexToUnicode("a = b \\\\[5pt] c = d").trim(), "a = b \n c = d");
 	});
 
+	it("keeps a bracket after \\begin as content for environments without a [pos] argument", () => {
+		// [0,1] is an interval, the matrix's first cell — consuming it as a
+		// layout parameter silently deleted the content.
+		assert.strictEqual(latexToUnicode("\\begin{pmatrix}[0,1] & x \\\\ y & z\\end{pmatrix}"), "[0,1] x \n y z");
+		assert.strictEqual(latexToUnicode("\\begin{gather}[a,b] = c\\end{gather}"), "[a,b] = c");
+	});
+
+	it("handles starred environments like their base form", () => {
+		assert.strictEqual(latexToUnicode("\\begin{alignat*}{2} x &= 1 \\end{alignat*}").trim(), "x = 1");
+	});
+
 	it("renders matrix environments as rows", () => {
 		assert.strictEqual(latexToUnicode("\\begin{pmatrix}\n1 & 2 \\\\\n3 & 4\n\\end{pmatrix}").trim(), "1 2 \n3 4");
 	});

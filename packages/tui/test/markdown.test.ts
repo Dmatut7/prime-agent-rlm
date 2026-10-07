@@ -5,7 +5,7 @@ import { Chalk } from "chalk";
 import { Markdown } from "../src/components/markdown.js";
 import { resetCapabilitiesCache, setCapabilities } from "../src/terminal-image.js";
 import { type Component, TUI } from "../src/tui.js";
-import { hyperlinkAtColumn, stripAnsi } from "../src/utils.js";
+import { hyperlinkAtColumn, stripAnsi, visibleWidth } from "../src/utils.js";
 import { defaultMarkdownTheme } from "./test-themes.js";
 import { VirtualTerminal } from "./virtual-terminal.js";
 
@@ -255,6 +255,55 @@ describe("Markdown component", () => {
 				!plainLines.some((line) => line.includes("##")),
 				`heading markers must be parsed, not echoed raw, got ${JSON.stringify(plainLines)}`,
 			);
+		});
+
+		it("renders a wide table inside a list item without tearing at the right edge", () => {
+			// The block content is rendered first and indented afterwards; its
+			// width budget must pay for the indent, or a table that fits its own
+			// box overflows once the prefix lands (borders split mid-row).
+			const markdown = new Markdown(
+				"- item:\n  | header a | header b |\n  | --- | --- |\n  | aaaaaaaaaaaaaaaa | bbbbbbbbbbbbbbbb |\n",
+				1,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const lines = markdown.render(40);
+			for (const [index, line] of lines.entries()) {
+				assert.ok(
+					visibleWidth(line) <= 40,
+					`line ${index} exceeds 40 columns (${visibleWidth(line)}): ${JSON.stringify(line)}`,
+				);
+			}
+			// The table box survives: full borders top and bottom, the cell content
+			// wrapped inside its column instead of tearing the row.
+			const plain = lines.map((line) => stripAnsi(line));
+			assert.ok(
+				plain.some((line) => line.trim().startsWith("┌") && line.includes("┬")),
+				JSON.stringify(plain),
+			);
+			assert.ok(
+				plain.some((line) => line.trim().startsWith("└")),
+				JSON.stringify(plain),
+			);
+			assert.ok(
+				plain.some((line) => line.includes("aaaaaaaaaaaaaaa")),
+				JSON.stringify(plain),
+			);
+		});
+
+		it("renders the sealed and unsealed list identically, block content included", () => {
+			// The final-block seal renders with a different width than the plain
+			// path when one passes the terminal width and the other the content
+			// width: the same document must not reflow when a block follows the
+			// list (which unseals it).
+			const sealed =
+				"- item:\n  | header a | header b |\n  | --- | --- |\n  | aaaaaaaaaaaaaaaa | bbbbbbbbbbbbbbbb |\n";
+			const unsealed = `${sealed}\nafter\n`;
+			const sealedLines = new Markdown(sealed, 1, 0, defaultMarkdownTheme).render(40);
+			const unsealedLines = new Markdown(unsealed, 1, 0, defaultMarkdownTheme).render(40);
+
+			assert.deepEqual(unsealedLines.slice(0, sealedLines.length), sealedLines);
 		});
 	});
 

@@ -210,11 +210,11 @@ describe("subagent lifecycle status lines", () => {
 		expect(text).toContain("子代理 worker-b 已收编");
 	});
 
-	it("reconciles settled children into the turn timelines when seeding from a snapshot", () => {
-		// Attach/resync seeds the chip bar from snapshot.children; the timeline
-		// entries replay creates say "running". The snapshot is the authority:
-		// settled children must be pushed into the timelines (which then close
-		// their lanes) instead of waiting for a report that may be queued.
+	it("reconciles settled children into the turn timelines after the replay", () => {
+		// Attach/resync replays the transcript first (seeding "running" entries),
+		// then reconciles from the snapshot: settled and cancelled children are
+		// pushed into the timelines (which then settle their lanes) instead of
+		// waiting for a report that may never arrive; running ones are left alone.
 		const quietUiServices = {
 			settingsManager: {
 				getSubagentSpendCellEnabled: () => false,
@@ -222,14 +222,13 @@ describe("subagent lifecycle status lines", () => {
 			},
 		};
 		const subagentUpdate = vi.fn();
-		const chatContainer = new Container();
 		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
 		Object.assign(mode, {
 			subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
 			rlmNodeId: "me",
 			heartbeatCatalog: [],
 			subagentSummaryLine: new SubagentSummaryLine(),
-			chatContainer,
+			chatContainer: new Container(),
 			uiServices: quietUiServices,
 			liveTurnFlowStore: { subagentUpdate },
 			updateWorkingPulse: vi.fn(),
@@ -237,20 +236,37 @@ describe("subagent lifecycle status lines", () => {
 			updateWorkingLoaderMessage: vi.fn(),
 			ui: { requestRender: vi.fn(), terminal: { rows: 40, columns: 120 } },
 		});
-		const seed = Reflect.get(InteractiveMode.prototype, "seedSubagentSummary") as (
+		const reconcile = Reflect.get(InteractiveMode.prototype, "reconcileSubagentTimeline") as (
 			this: typeof mode,
 			children: readonly AgentConnectionRlmChildAgentSnapshot[],
 		) => void;
 
-		seed.call(mode, [
+		reconcile.call(mode, [
 			child("sub-1", "done", { sessionName: "worker-a", label: "第一件事" }),
 			child("sub-2", "running", { sessionName: "worker-b", label: "第二件事" }),
 			child("sub-3", "cancelled", { sessionName: "worker-c", label: "第三件事" }),
 		]);
 
-		expect(subagentUpdate).toHaveBeenCalledTimes(1);
+		expect(subagentUpdate).toHaveBeenCalledTimes(2);
 		expect(subagentUpdate).toHaveBeenCalledWith(
 			expect.objectContaining({ id: "sub-1", sessionName: "worker-a", status: "done" }),
+			expect.objectContaining({ fromReconcile: true }),
 		);
+		expect(subagentUpdate).toHaveBeenCalledWith(
+			expect.objectContaining({ id: "sub-3", sessionName: "worker-c", status: "cancelled" }),
+			expect.objectContaining({ fromReconcile: true }),
+		);
+		expect(subagentUpdate).not.toHaveBeenCalledWith(expect.objectContaining({ id: "sub-2" }), expect.anything());
+
+		// The legacy surface has no turn boxes to reconcile.
+		subagentUpdate.mockClear();
+		const legacyMode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+		Object.assign(legacyMode, {
+			...mode,
+			uiServices: { settingsManager: {} },
+			liveTurnFlowStore: { subagentUpdate },
+		});
+		reconcile.call(legacyMode, [child("sub-1", "done")]);
+		expect(subagentUpdate).not.toHaveBeenCalled();
 	});
 });

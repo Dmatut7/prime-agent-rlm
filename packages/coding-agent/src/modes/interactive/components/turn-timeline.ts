@@ -698,9 +698,10 @@ export class TurnTimeline implements LaneOwner {
 			// chat is not the only way a subagent finishes: on resync/replay the
 			// parent can learn "done" from the snapshot while the queued report has
 			// not been delivered yet, and the "还在干活" lane tail must not outlive
-			// the timeline entry it describes.
+			// the timeline entry it describes. `settle` keeps a ledger entry so the
+			// report row that follows still draws the closing line and the tally.
 			if (wasRunning && existing.sub.status !== "running" && nowLane) {
-				this.laneTracker?.reported(nowLane, now);
+				this.laneTracker?.settle(nowLane, now, existing.sub.status === "failed" ? "failed" : "silent");
 			}
 		} else {
 			this.entries.push({

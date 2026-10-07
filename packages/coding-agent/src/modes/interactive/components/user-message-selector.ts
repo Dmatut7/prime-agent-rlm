@@ -31,9 +31,10 @@ class UserMessageList implements Component {
 
 	private effectiveMaxVisible(): number {
 		const rows = this.getAvailableRows?.() ?? 30;
-		// Title + hint + spacers + borders (chromeRows) plus three lines per entry;
-		// always keep at least one entry visible.
-		return Math.max(1, Math.min(10, Math.floor((rows - this.chromeRows) / 3)));
+		// Title + hint + spacers + borders (chromeRows) plus three lines per entry,
+		// plus the one-line scroll indicator the renderer appends while the list
+		// is scrollable; always keep at least one entry visible.
+		return Math.max(1, Math.min(10, Math.floor((rows - this.chromeRows - 1) / 3)));
 	}
 
 	invalidate(): void {}

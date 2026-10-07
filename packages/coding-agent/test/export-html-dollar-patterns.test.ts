@@ -46,11 +46,18 @@ function collectMessageTexts(sessionData: DecodedSessionData): string[] {
 	return texts;
 }
 
+// The template's verbatim cost line: a literal `${...}` in a plain string
+// trips the template-placeholder lint, so it is assembled from parts.
+const COST_ANCHOR = "¥" + "$" + "{totalCost.toFixed(3)}";
+
 describe("export HTML $-pattern embedding integrity", () => {
 	it("embedded assets contain $ sequences that are hazardous to string replacement", () => {
 		// Guards the export assertions below: if these sequences ever disappear from
 		// the assets, the verbatim-embedding checks would silently prove nothing.
-		expect(templateJs).toContain("$${totalCost.toFixed(3)}");
+		// (The cost line used to anchor a `$$` hazard here; the currency follows
+		// the TUI-wide ¥ formatter now, so the verbatim anchor is the literal it
+		// embeds and the `$$` hazards live in hljs.)
+		expect(templateJs).toContain(COST_ANCHOR);
 		expect(hljsJs).toContain("$&");
 		expect(hljsJs).toContain("$$");
 	});
@@ -74,7 +81,7 @@ describe("export HTML $-pattern embedding integrity", () => {
 			expect(html).toContain(templateJs);
 			expect(html).toContain(markedJs);
 			expect(html).toContain(hljsJs);
-			expect(html).toContain("$${totalCost.toFixed(3)}");
+			expect(html).toContain(COST_ANCHOR);
 
 			expect(PLACEHOLDERS.length).toBe(9);
 			for (const placeholder of PLACEHOLDERS) {

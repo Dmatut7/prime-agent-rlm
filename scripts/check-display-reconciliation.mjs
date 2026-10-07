@@ -415,9 +415,15 @@ function isInside(child, parent) {
  * One entry per path, counts summed across the session's edits — what every
  * turn's strip added up to. Legacy/edit records carry no scope: paths inside
  * the session cwd are project, the rest scratch (displayPath's rule).
+ *
+ * Ambient records merge with own records per path first (the display layer's
+ * `addEntry` sums the counts and lets an own record win the origin), and only
+ * the merged-ambient paths drop out of the session's own displayed counts.
+ * Splitting before the merge would report a file this session also edited as
+ * under-reported by exactly the other window's contribution.
  */
 function aggregateRecords(records, sessionCwd) {
-	const entries = new Map();
+	const merged = new Map();
 	const coverage = { scratch: 0, ambient: 0 };
 	for (const record of records) {
 		const abs = realish(resolve(sessionCwd, record.relPath ?? record.path));
@@ -426,18 +432,9 @@ function aggregateRecords(records, sessionCwd) {
 			coverage.scratch += 1;
 			continue;
 		}
-		// Ambient changes (another window's edits, reported through this
-		// session's kernel) are not part of the session's own displayed counts —
-		// the strip renders them on a separate line. Skip them like scratch so
-		// the "displayed" side mirrors the screen and cannot mask the session's
-		// own under-reporting.
-		if (record.ambient === true) {
-			coverage.ambient += 1;
-			continue;
-		}
-		const existing = entries.get(abs);
+		const existing = merged.get(abs);
 		if (!existing) {
-			entries.set(abs, {
+			merged.set(abs, {
 				absPath: abs,
 				displayPath: isInside(abs, sessionCwd) ? relative(sessionCwd, abs) : abs,
 				kind: record.kind,
@@ -452,6 +449,7 @@ function aggregateRecords(records, sessionCwd) {
 				countsUnknown: record.countsUnknown === true,
 				approximate: record.approximate === true,
 				recordCount: 1,
+				ambient: record.ambient === true,
 			});
 			continue;
 		}
@@ -466,8 +464,22 @@ function aggregateRecords(records, sessionCwd) {
 		existing.countsUnknown ||= record.countsUnknown === true;
 		existing.approximate ||= record.approximate === true;
 		existing.recordCount += 1;
+		// Once this session itself touched the file the entry is own, whatever
+		// an earlier record said (addEntry's rule).
+		if (record.ambient !== true) existing.ambient = false;
 	}
-	return { entries: [...entries.values()], coverage };
+	const entries = [];
+	// Ambient-only paths are displayed on their own strip line and never folded
+	// into the session's own counts; the gate counts them the same way.
+	for (const entry of merged.values()) {
+		if (entry.ambient === true) {
+			coverage.ambient += 1;
+			continue;
+		}
+		delete entry.ambient;
+		entries.push(entry);
+	}
+	return { entries, coverage, ambientPaths: [...merged.values()].filter((entry) => entry.ambient === true).map((entry) => entry.displayPath) };
 }
 
 /** The strip's totals (changeTotals): symlinks and omitted-with-zero-counts say nothing. */
@@ -799,9 +811,14 @@ function reconcileSession(options) {
 
 	// The reverse direction of 改了 N 个文件: git changes the session never claimed.
 	const prefix = relative(truth.repoRoot, sessionCwd);
+	// Ambient paths were recorded (and displayed on their own strip line), so
+	// they are claimed — a warning here would call a displayed change unknown.
+	const ambientRels = new Set(
+		aggregated.ambientPaths.map((displayPath) => (prefix ? `${prefix}${sep}${displayPath}` : displayPath)),
+	);
 	let unclaimedOutside = 0;
 	for (const rel of [...truth.numstat.keys(), ...truth.untracked]) {
-		if (claimedRels.has(rel)) continue;
+		if (claimedRels.has(rel) || ambientRels.has(rel)) continue;
 		if (prefix && !rel.startsWith(prefix + sep)) {
 			unclaimedOutside += 1;
 			continue;
@@ -1194,6 +1211,27 @@ function stageA(failures) {
 	expectEqual(failures, "ambient counted", ambientAggregated.coverage.ambient, 1);
 	const ambientTotals = displayedTotals(ambientAggregated.entries);
 	expectEqual(failures, "ambient stays out of totals", ambientTotals?.added, 5);
+	// A path this session also touched merges first (addEntry's rule: counts
+	// summed, an own record wins the origin): it stays an own entry carrying
+	// both windows' counts — splitting before the merge would have dropped the
+	// file from the session's side and under-reported it by the other window's
+	// contribution.
+	const mixedRead = extractChanges(
+		parseSessionText(
+			sessionText("/p", [
+				kernelResult([
+					{ path: "/p/shared.ts", kind: "modified", scope: "project", added: 2, removed: 0, origin: "ambient" },
+					{ path: "/p/shared.ts", kind: "modified", scope: "project", added: 10, removed: 4 },
+				]),
+			]),
+		),
+	);
+	const mixedAggregated = aggregateRecords(mixedRead.records, "/p");
+	expectEqual(failures, "own wins the merged path", mixedAggregated.entries.length, 1);
+	expectEqual(failures, "own wins the merged counts", mixedAggregated.entries[0]?.added, 12);
+	expectEqual(failures, "own wins the merged removed", mixedAggregated.entries[0]?.removed, 4);
+	expectEqual(failures, "merged path not ambient", mixedAggregated.coverage.ambient, 0);
+	expectTrue(failures, "ambient-only path listed", JSON.stringify(ambientAggregated.ambientPaths) === JSON.stringify(["other-window.ts"]));
 	expectEqual(failures, "ambient stays out of totals removed", ambientTotals?.removed, 2);
 
 	// judgeEntry: one control per verdict code, fabricated truth, no git needed.

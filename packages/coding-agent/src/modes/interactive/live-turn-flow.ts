@@ -683,9 +683,13 @@ export class LiveTurnFlow {
 	/**
 	 * A direct child's snapshot becomes a row in the turn that started it: the
 	 * live turn for a child first seen now, else whichever turn already has it.
+	 * `fromReconcile` lets the attach/resync pass settle cancelled children
+	 * (their notice never reached this transcript); the live event path keeps
+	 * skipping them — the cancellation notice owns that display.
 	 */
-	subagentUpdate(child: AgentConnectionRlmChildAgentSnapshot): void {
-		if (!this.host.quiet() || child.parentId !== this.host.rlmNodeId() || child.status === "cancelled") return;
+	subagentUpdate(child: AgentConnectionRlmChildAgentSnapshot, options?: { fromReconcile?: boolean }): void {
+		if (!this.host.quiet() || child.parentId !== this.host.rlmNodeId()) return;
+		if (child.status === "cancelled" && options?.fromReconcile !== true) return;
 		let timeline: TurnActivityState["timeline"] | undefined;
 		for (const component of this.host.chat().children) {
 			if (

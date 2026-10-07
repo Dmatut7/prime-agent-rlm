@@ -569,12 +569,17 @@ function quietConversation(mode: object): boolean {
 /**
  * Chat-level status and error text comes from provider/daemon/child-session
  * failures whose raw messages can embed terminal escapes (a full SSE frame, an
- * OAuth response body). It lands in single-row components: strip control
- * characters and collapse to one line at this central door instead of relying
- * on every call site to pre-clean its text.
+ * OAuth response body). Strip control characters per line at this central door
+ * instead of relying on every call site to pre-clean its text; line breaks are
+ * intentional structure (multi-line schema errors, hints under a summary) and
+ * stay.
  */
 function sanitizeDisplayLine(text: string): string {
-	return sanitizeDisplayText(text).replace(/\s+/g, " ").trim();
+	return sanitizeDisplayText(text)
+		.split("\n")
+		.map((line) => line.replace(/\s+/g, " ").trim())
+		.filter((line) => line.length > 0)
+		.join("\n");
 }
 
 function isExpandable(obj: unknown): obj is Expandable {
@@ -4079,6 +4084,9 @@ export class InteractiveMode {
 			clearChat: true,
 			updateFooter: true,
 		});
+		// Same ordering as attach: reconcile the rebuilt timelines, not the ones
+		// the clearChat below just tore down.
+		this.reconcileSubagentTimeline(snapshot.children);
 		await this.restoreStreamingMessageFromSnapshot(snapshot.streamingMessage);
 		this.updatePendingMessagesDisplay();
 		if (bashFinished) {
@@ -7682,7 +7690,6 @@ export class InteractiveMode {
 			}
 		}
 		this.refreshSubagentSummary();
-		this.reconcileSubagentTimeline(children);
 	}
 
 	private replaceSubagentSummary(children: readonly AgentConnectionRlmChildAgentSnapshot[] | undefined): void {
@@ -7694,7 +7701,6 @@ export class InteractiveMode {
 		}
 		this.subagentSnapshots = next;
 		this.refreshSubagentSummary();
-		this.reconcileSubagentTimeline(children);
 	}
 
 	/**
@@ -7707,8 +7713,12 @@ export class InteractiveMode {
 	private reconcileSubagentTimeline(children: readonly AgentConnectionRlmChildAgentSnapshot[] | undefined): void {
 		if (!quietConversation(this)) return;
 		for (const child of children ?? []) {
-			if (child.status === "cancelled" || child.status === "running" || child.status === "queued") continue;
-			this.turnFlow.subagentUpdate(child);
+			// Cancelled children settle their replay-seeded entries too: their
+			// cancellation notice never reached this transcript, so waiting for
+			// it would leave "还在干活" up forever — the exact symptom this
+			// reconcile exists to end.
+			if (child.status === "running" || child.status === "queued") continue;
+			this.turnFlow.subagentUpdate(child, { fromReconcile: true });
 		}
 	}
 
@@ -9397,6 +9407,10 @@ export class InteractiveMode {
 			populateHistory: true,
 			limitTranscript: true,
 		});
+		// Reconcile after the replay: the timelines it seeds (noteSpawns hardcodes
+		// "running") only exist once the chat is rebuilt, so running it before the
+		// rebuild was a no-op on this path.
+		this.reconcileSubagentTimeline(snapshot.children);
 		await this.restoreStreamingMessageFromSnapshot(streamingMessage);
 		this.scheduleEditorHistoryBackfill();
 

@@ -1206,6 +1206,25 @@ export function preloadCodeHighlighter(): Promise<void> {
 	return codeHighlighterPromise;
 }
 
+/**
+ * Load the first theme that works from the candidate list, skipping the one
+ * that just failed: a fallback that retries the very same load rethrows into
+ * whoever called us. Returns the name that loaded, or undefined when every
+ * candidate failed (the caller rethrows the original error then).
+ */
+function loadFallbackTheme(failedName: string): string | undefined {
+	const candidates = [getDefaultTheme(), "prime", "dark", "light"].filter((candidate) => candidate !== failedName);
+	for (const candidate of new Set(candidates)) {
+		try {
+			setGlobalTheme(loadTheme(candidate));
+			return candidate;
+		} catch {
+			// Try the next candidate.
+		}
+	}
+	return undefined;
+}
+
 export function initTheme(themeName?: string, enableWatcher: boolean = false): void {
 	void preloadCodeHighlighter();
 	void preloadThemeValidator();
@@ -1217,13 +1236,16 @@ export function initTheme(themeName?: string, enableWatcher: boolean = false): v
 		if (enableWatcher) {
 			startThemeWatcher();
 		}
-	} catch (_error) {
-		// Theme is invalid - fall back to the terminal-appropriate default (a
+	} catch (error) {
+		// Theme is invalid - fall back to the first built-in that loads (a
 		// hardcoded dark makes every foreground token unreadable on a light
-		// terminal). Don't start the watcher for the fallback theme.
-		const fallback = getDefaultTheme();
+		// terminal, and the default itself may be the broken one). Don't start
+		// the watcher for the fallback theme.
+		const fallback = loadFallbackTheme(name);
+		if (fallback === undefined) {
+			throw error;
+		}
 		currentThemeName = fallback;
-		setGlobalTheme(loadTheme(fallback));
 	}
 }
 
@@ -1240,12 +1262,20 @@ export function setTheme(name: string, enableWatcher: boolean = false): { succes
 		}
 		return { success: true };
 	} catch (error) {
-		// Theme is invalid - fall back to the terminal-appropriate default (a
+		// Theme is invalid - fall back to the first built-in that loads (a
 		// hardcoded dark makes every foreground token unreadable on a light
-		// terminal). Don't start the watcher for the fallback theme.
-		const fallback = getDefaultTheme();
+		// terminal, and the default itself may be the broken one). Don't start
+		// the watcher for the fallback theme. When every built-in is broken the
+		// previous global theme stands and the failure reports normally.
+		const fallback = loadFallbackTheme(name);
+		if (fallback === undefined) {
+			currentThemeName = name;
+			return {
+				success: false,
+				error: error instanceof Error ? error.message : String(error),
+			};
+		}
 		currentThemeName = fallback;
-		setGlobalTheme(loadTheme(fallback));
 		return {
 			success: false,
 			error: error instanceof Error ? error.message : String(error),

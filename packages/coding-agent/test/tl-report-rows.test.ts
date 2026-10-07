@@ -190,6 +190,35 @@ describe("the lane the returns are drawn in", () => {
 		expect(lane.comeBack("review-grow-C-strip")).toEqual({ before: "off", after: "off" });
 	});
 
+	it("still counts the round and draws the join when the lane settled out of band before the report", () => {
+		// A terminal snapshot (upsertSubagent settle) closes the span before the
+		// queued report row exists; the report that arrives after must still
+		// close the round with the right count and tally, and a late report
+		// after the round closed joins nothing.
+		const lane = new SubagentLane();
+		lane.tracker.spawned(["A", "B"]);
+		lane.tracker.settle("A", Date.now(), "failed");
+
+		const joined = lane.comeBack("B");
+		// A settled out of band (failed), B's report is the row that reads the
+		// round: two returns, one of them a failure.
+		expect(joined).toMatchObject({ joined: 2, tally: { failed: 1, silent: 0, cancelled: 0 } });
+
+		// A's own report arriving after the round closed joins nothing (the
+		// settle was consumed by B's return).
+		expect(lane.comeBack("A")).toEqual({ before: "off", after: "off" });
+	});
+
+	it("draws the join on the report row when the settle itself emptied the lane", () => {
+		const lane = new SubagentLane();
+		lane.tracker.spawned(["solo"]);
+		lane.tracker.settle("solo", Date.now(), "silent");
+
+		// The span closed at the settle, but the round's closing line reads
+		// where the report row lands.
+		expect(lane.comeBack("solo", undefined, undefined, "silent")).toMatchObject({ joined: 1 });
+	});
+
 	it("counts a new round from zero and forgets everyone on a new question", () => {
 		const lane = new SubagentLane();
 		lane.tracker.spawned(["A"]);

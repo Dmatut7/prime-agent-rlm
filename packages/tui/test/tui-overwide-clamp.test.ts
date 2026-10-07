@@ -112,28 +112,42 @@ describe("overwide line handling in full render paths", () => {
 	});
 
 	it("clamps an overwide line after a resize (width-change full render)", async () => {
-		const terminal = new VirtualTerminal(60, 10);
-		const tui = new TUI(terminal);
-		const component = new TestComponent();
-		component.lines = ["first", `${"x".repeat(50)}`, "third"];
-		tui.addChild(component);
-		tui.start();
-		await terminal.waitForRender();
-		await terminal.flushAndGetViewport();
+		// The crash log lives under ~/.prime/agent - point HOME at a temp dir or
+		// this test overwrites the developer's real log with its fixture.
+		const home = mkdtempSync(join(tmpdir(), "pi-tui-overwide-resize-"));
+		const previousHome = process.env.HOME;
+		process.env.HOME = home;
+		try {
+			const terminal = new VirtualTerminal(60, 10);
+			const tui = new TUI(terminal);
+			const component = new TestComponent();
+			component.lines = ["first", `${"x".repeat(50)}`, "third"];
+			tui.addChild(component);
+			tui.start();
+			await terminal.waitForRender();
+			await terminal.flushAndGetViewport();
 
-		// Shrink the terminal so the previously-fitting line is now overwide and
-		// the width change forces the full render path.
-		terminal.resize(40, 10);
-		tui.requestRender();
-		await terminal.waitForRender();
+			// Shrink the terminal so the previously-fitting line is now overwide and
+			// the width change forces the full render path.
+			terminal.resize(40, 10);
+			tui.requestRender();
+			await terminal.waitForRender();
 
-		const viewport = await terminal.flushAndGetViewport();
-		assert.ok(
-			viewport.some((line) => line === "x".repeat(40)),
-			`expected a 40-column clamped row after resize, got ${JSON.stringify(viewport)}`,
-		);
+			const viewport = await terminal.flushAndGetViewport();
+			assert.ok(
+				viewport.some((line) => line === "x".repeat(40)),
+				`expected a 40-column clamped row after resize, got ${JSON.stringify(viewport)}`,
+			);
 
-		tui.stop();
+			tui.stop();
+		} finally {
+			if (previousHome === undefined) {
+				delete process.env.HOME;
+			} else {
+				process.env.HOME = previousHome;
+			}
+			rmSync(home, { recursive: true, force: true });
+		}
 	});
 });
 

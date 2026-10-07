@@ -301,6 +301,14 @@ const SPACING_SENTINEL = "\uE000";
 /** Environments whose {cols} argument is layout-only and must not leak as text. */
 const COLUMN_SPEC_ENVIRONMENTS = new Set(["array", "tabular", "tabularx", "subarray", "alignat", "alignedat"]);
 
+/**
+ * Environments that genuinely accept an optional [pos] argument (vertical
+ * placement). Everything else — pmatrix, gather, align, cases, … — treats a
+ * bracket right after \begin{env} as content (an interval, a commutator); only
+ * these may consume it.
+ */
+const OPTIONAL_POSITION_ENVIRONMENTS = new Set(["aligned", "gathered", "subarray", "alignat", "alignedat"]);
+
 /** Accent commands → combining character appended to each character. */
 const ACCENTS: Record<string, string> = {
 	hat: "̂",
@@ -673,10 +681,17 @@ class LatexParser {
 	 * leak into the rendered text as literal "cc" / "2" / "[t]" prefixes.
 	 */
 	private consumeEnvironmentOptions(environment: string): void {
-		this.parseOptionalBracket();
-		if (COLUMN_SPEC_ENVIRONMENTS.has(environment)) {
+		// Strip the starred variant (alignat* has the same arguments as alignat).
+		const base = environment.endsWith("*") ? environment.slice(0, -1) : environment;
+		// Only environments that accept a vertical placement consume [pos]; a
+		// bracket anywhere else is content (an interval like [0,1] as a matrix's
+		// first cell).
+		if (OPTIONAL_POSITION_ENVIRONMENTS.has(base)) {
+			this.parseOptionalBracket();
+		}
+		if (COLUMN_SPEC_ENVIRONMENTS.has(base)) {
 			this.parseArgument();
-			if (environment === "tabularx") {
+			if (base === "tabularx") {
 				this.parseArgument();
 			}
 		}

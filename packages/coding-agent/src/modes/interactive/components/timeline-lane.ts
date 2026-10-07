@@ -7,6 +7,14 @@ export interface LaneOwner {
 	spawnedAt?(name: string): number | undefined;
 }
 
+/** An out-of-band close's best guess at how the subagent left, for the round count. */
+export type LaneSettleKind = "failed" | "silent" | "cancelled";
+
+interface LaneSettle {
+	at: number;
+	kind: LaneSettleKind;
+}
+
 /** One subagent's time away: out from `from`, back at `to` (still out while `to` is absent). */
 export interface LaneSpan {
 	name: string;
@@ -107,6 +115,8 @@ export interface LaneSnapshot {
 export class TimelineLaneTracker {
 	private store = new LaneSpans();
 	private readonly owners = new Map<string, LaneOwner>();
+	/** Spans a terminal snapshot closed without a report row yet; the next return consumes them into the round count. */
+	private settled = new Map<string, LaneSettle>();
 
 	/** The record of this question's dispatches and returns; a timeline keeps the one it was given. */
 	get spans(): LaneSpans {
@@ -138,6 +148,29 @@ export class TimelineLaneTracker {
 	/** A subagent that was not known to be out came back: its return is kept, the lane is untouched. */
 	noteReturned(name: string, at: number = Date.now()): void {
 		this.store.close(name, at);
+	}
+
+	/**
+	 * A terminal snapshot closed `name`'s span out of band: the report row that
+	 * follows (minutes later, after the parent's turn boundary) must still count
+	 * as the round's return — record it for the next `comeBack`-style return to
+	 * consume. Closes the span and notifies the owner exactly like `reported`.
+	 */
+	settle(name: string, at: number, kind: LaneSettleKind): void {
+		const wasOut = this.store.close(name, at);
+		if (wasOut) {
+			this.owners.get(name)?.subagentReturned(name, at);
+			this.settled.set(name, { at, kind });
+		}
+		this.owners.delete(name);
+	}
+
+	/** Outstanding out-of-band settles, emptied by the call. */
+	takeSettles(): Array<{ name: string; at: number; kind: LaneSettleKind }> {
+		if (this.settled.size === 0) return [];
+		const out = [...this.settled.entries()].map(([name, settle]) => ({ name, ...settle }));
+		this.settled.clear();
+		return out;
 	}
 
 	/** The lane for a row stamped `at` (as now when it has no stamp): on when some subagent was out then. */
@@ -190,6 +223,7 @@ export class TimelineLaneTracker {
 	reset(): void {
 		this.store = new LaneSpans();
 		this.owners.clear();
+		this.settled.clear();
 	}
 }
 

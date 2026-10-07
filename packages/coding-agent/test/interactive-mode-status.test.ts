@@ -1852,6 +1852,7 @@ describe("InteractiveMode connection events", () => {
 				model: null,
 			})),
 			seedSubagentSummary: vi.fn(),
+			reconcileSubagentTimeline: vi.fn(),
 			applyConnectionStateSnapshot: vi.fn(),
 			applySnapshotQuotaPark: vi.fn(),
 			renderSessionContext: renderSessionContextMock,
@@ -2057,6 +2058,7 @@ describe("InteractiveMode connection events", () => {
 			applyConnectionStateSnapshot: vi.fn(),
 			restoreTurnStartFromMessages: vi.fn(),
 			replaceSubagentSummary: vi.fn(),
+			reconcileSubagentTimeline: vi.fn(),
 			getSessionContextFromConnectionSnapshot: vi.fn(() => ({
 				messages: [],
 				thinkingLevel: "medium",
@@ -2122,6 +2124,7 @@ describe("InteractiveMode connection events", () => {
 			refreshQueueSelectionFromState: vi.fn(),
 			updateWorkingLoaderMessage: vi.fn(),
 			replaceSubagentSummary: vi.fn(),
+			reconcileSubagentTimeline: vi.fn(),
 			getSessionContextFromConnectionSnapshot: vi.fn(() => ({
 				messages: snapshot.messages,
 				thinkingLevel: "medium",
@@ -2179,6 +2182,7 @@ describe("InteractiveMode connection events", () => {
 			refreshQueueSelectionFromState: vi.fn(),
 			restoreTurnStartFromMessages: vi.fn(),
 			replaceSubagentSummary: vi.fn(),
+			reconcileSubagentTimeline: vi.fn(),
 			getSessionContextFromConnectionSnapshot: vi.fn(() => ({
 				messages: [],
 				thinkingLevel: "medium",
@@ -6523,7 +6527,7 @@ describe("InteractiveMode.showStatus / showError sanitize untrusted text", () =>
 		initTheme("dark");
 	});
 
-	test("showStatus strips control characters and collapses to one line", () => {
+	test("showStatus strips control characters and keeps intentional line breaks", () => {
 		const fakeThis: any = {
 			chatContainer: new Container(),
 			ui: { requestRender: vi.fn() },
@@ -6532,11 +6536,19 @@ describe("InteractiveMode.showStatus / showError sanitize untrusted text", () =>
 		};
 
 		(InteractiveMode as any).prototype.showStatus.call(fakeThis, "provider failed\r\nretry\x1b[2J\x07");
-		const line = stripAnsi(renderLastLine(fakeThis.chatContainer));
-		expect(line).toContain("provider failed retry");
-		// Theme color codes are stripped first; no injected escape must remain.
-		expect(line).not.toContain("\x1b");
-		expect(line).not.toContain("\x07");
+		// Assert on the raw rendered output: stripAnsi would eat the very escape
+		// sequences this test is about, making a "no ESC" check vacuous.
+		const raw = renderLastLine(fakeThis.chatContainer);
+		expect(stripAnsi(raw)).toContain("provider failed");
+		// The \r is gone (C0), the \n is intentional structure and survives, the
+		// injected clear-screen escape does not.
+		expect(
+			stripAnsi(raw)
+				.split("\n")
+				.map((line) => line.trim()),
+		).toEqual(["provider failed", "retry[2J"]);
+		expect(raw).not.toContain("\x1b[2J");
+		expect(raw).not.toContain("\x07");
 	});
 
 	test("showError strips escape sequences before the error row renders", () => {
@@ -6549,11 +6561,29 @@ describe("InteractiveMode.showStatus / showError sanitize untrusted text", () =>
 			fakeThis,
 			"Could not parse SSE\x1b[2J raw=\x1b]52;c;cGFzdGU=\x07",
 		);
-		const line = stripAnsi(renderLastLine(fakeThis.chatContainer));
-		expect(line).toContain("Could not parse SSE");
-		expect(line).not.toContain("\x1b");
-		expect(line).not.toContain("\x07");
-		// A single row must carry a single line: no newline survives.
-		expect(line.split("\n").length).toBe(1);
+		const raw = renderLastLine(fakeThis.chatContainer);
+		expect(stripAnsi(raw)).toContain("Could not parse SSE");
+		expect(raw).not.toContain("\x1b[2J");
+		expect(raw).not.toContain("\x1b]52;");
+		expect(raw).not.toContain("\x07");
+	});
+
+	test("showError keeps a multi-line error message's structure", () => {
+		const fakeThis: any = {
+			chatContainer: new Container(),
+			ui: { requestRender: vi.fn() },
+		};
+
+		(InteractiveMode as any).prototype.showError.call(
+			fakeThis,
+			'主题 "broken" 加载失败：\nMissing required color tokens:\n  - accent',
+		);
+		const raw = renderLastLine(fakeThis.chatContainer);
+		const plain = stripAnsi(raw);
+		expect(plain).toContain("加载失败：");
+		expect(plain).toContain("Missing required color tokens:");
+		expect(plain).toContain("- accent");
+		// The \n the caller wrote is structure, not noise.
+		expect(plain.split("\n").length).toBeGreaterThan(1);
 	});
 });

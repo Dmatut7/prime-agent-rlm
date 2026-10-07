@@ -182,7 +182,9 @@ export class SubagentLane {
 
 	/**
 	 * A subagent handed back a report, failed or finished without a word (`kind`), named the way
-	 * {@link laneKey} reads. A name that was not out has its return kept and joins nothing.
+	 * {@link laneKey} reads. A name that was not out has its return kept and joins nothing — unless
+	 * a terminal snapshot closed it out of band: that settle then counts as this round's return,
+	 * so the closing row and the failure tally survive the report arriving late.
 	 */
 	comeBack(
 		sessionName: string | undefined,
@@ -192,14 +194,30 @@ export class SubagentLane {
 	): TimelineReturn {
 		const name = laneKey(sessionName, fallback);
 		const wasOut = name !== "" && this.tracker.pending.includes(name);
+		// Out-of-band settles belong to this round: count the ones that are not
+		// this very return now (this return counts itself below), with the kind
+		// the settle guessed (a report that arrives after the round closed is
+		// not re-counted).
+		const settled = this.tracker.takeSettles();
+		const selfSettled = settled.some((entry) => entry.name === name);
+		for (const entry of settled) {
+			if (entry.name === name) continue;
+			this.back += 1;
+			this.tally[entry.kind] += 1;
+		}
+		const counted = wasOut || selfSettled;
 		const before = this.tracker.lane;
-		if (name !== "" && !wasOut) this.tracker.noteReturned(name, at);
+		if (name !== "" && !wasOut && !selfSettled) this.tracker.noteReturned(name, at);
 		const result = wasOut ? this.tracker.reported(name, at) : this.tracker.lane;
-		if (wasOut) {
+		if (counted) {
 			this.back += 1;
 			if (kind !== "report") this.tally[kind] += 1;
 		}
-		const joined = wasOut && result === "join" ? this.back : undefined;
+		// The closing row belongs to the return that empties the lane: normally
+		// `reported`'s "join", or — when the settle already emptied it — this
+		// report row is where the round's count is finally read.
+		const closedLane = wasOut ? result === "join" : !this.tracker.active;
+		const joined = counted && closedLane ? this.back : undefined;
 		const tally = joined !== undefined && hasTally(this.tally) ? { ...this.tally } : undefined;
 		if (joined !== undefined) {
 			this.back = 0;

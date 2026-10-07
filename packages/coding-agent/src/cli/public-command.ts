@@ -234,8 +234,22 @@ function rejectBareCommandTypo(args: string[]): PublicCommandResult {
 		return continueWith(args);
 	}
 	// A non-interactive flag makes the intent explicit: `prime-agent -p status`
-	// asks about "status"; the word is a prompt, not a mistyped command.
-	if (args.some((arg) => arg === "-p" || arg === "--print" || arg === "--mode" || arg.startsWith("--mode="))) {
+	// asks about "status"; the word is a prompt, not a mistyped command. The
+	// continuation and resume flags carry the same intent.
+	if (
+		args.some(
+			(arg) =>
+				arg === "-p" ||
+				arg === "--print" ||
+				arg === "--mode" ||
+				arg.startsWith("--mode=") ||
+				arg === "-c" ||
+				arg === "--continue" ||
+				arg === "-r" ||
+				arg === "--resume" ||
+				arg === "--fork",
+		)
+	) {
 		return continueWith(args);
 	}
 	const parsed = parseArgs(args);
@@ -271,7 +285,20 @@ function redirectFlagLeadingCommand(args: string[]): string[] | undefined {
 	if (!args[0]!.startsWith("-") || args.includes("--")) {
 		return undefined;
 	}
-	if (args.some((arg) => arg === "-p" || arg === "--print" || arg === "--mode" || arg.startsWith("--mode="))) {
+	if (
+		args.some(
+			(arg) =>
+				arg === "-p" ||
+				arg === "--print" ||
+				arg === "--mode" ||
+				arg.startsWith("--mode=") ||
+				arg === "-c" ||
+				arg === "--continue" ||
+				arg === "-r" ||
+				arg === "--resume" ||
+				arg === "--fork",
+		)
+	) {
 		return undefined;
 	}
 	const parsed = parseArgs(args);
@@ -287,7 +314,11 @@ function redirectFlagLeadingCommand(args: string[]): string[] | undefined {
 	if (!PUBLIC_COMMAND_NAMES.has(word)) {
 		return undefined;
 	}
-	return [word, ...args.filter((arg) => arg !== word)];
+	// Remove the message word by position, not by value: a flag's value can
+	// legitimately equal the command word (`--cwd list status`), and a value
+	// filter would silently strip it.
+	const wordIndex = args.indexOf(word);
+	return [word, ...args.slice(0, wordIndex), ...args.slice(wordIndex + 1)];
 }
 
 function printRequestedHelp(path: string[]): PublicCommandResult {

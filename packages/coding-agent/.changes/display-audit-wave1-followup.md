@@ -1,0 +1,8 @@
+- Fixed attach/resync leaving subagents stuck as "还在干活" after a rebuild: the snapshot reconciliation now runs after the transcript replay (it ran before, against an empty chat), covers cancelled children, and an out-of-band settle keeps a ledger entry so the closing line and failure tally still render when the report arrives.
+- Fixed the display reconciliation gate mis-failing when another window also touched a file this session edited: per-path records now merge before the ambient split, and ambient-only paths no longer trigger unclaimed-change warnings.
+- Fixed tables and blockquotes inside list items tearing at the right edge on narrow terminals, and the sealed/unsealed render paths disagreeing about width.
+- Fixed LaTeX consuming a bracket right after `\begin{...}` as a layout parameter: intervals like `[0,1]` in matrix cells render again, and starred environments (`alignat*`) consume their arguments like the base form.
+- Fixed theme fallback retrying the theme that just failed (crashing when the default itself is broken): fallbacks now walk a candidate list.
+- Fixed chat error and status rows losing intentional line breaks to overzealous sanitization.
+- Fixed the HTML export header still showing costs in `$` while the TUI shows `¥`.
+- Fixed `prime-agent --cwd list status`-style invocations dropping a flag's value, and `-c/-r/--fork`-led prompts being routed as commands.

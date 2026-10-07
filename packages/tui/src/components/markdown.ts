@@ -2029,7 +2029,7 @@ export class Markdown implements Component {
 		const target = items.length - 1;
 		if (target > seal.count) {
 			const extension = this.renderTokenLinesToBlockLines(
-				this.renderListItems(token, 0, seal.count, target, undefined, width),
+				this.renderListItems(token, 0, seal.count, target, undefined, contentWidth),
 				width,
 				contentWidth,
 			);
@@ -2047,7 +2047,7 @@ export class Markdown implements Component {
 			seal.count = target;
 		}
 		const tailLines = this.renderTokenLinesToBlockLines(
-			this.renderListItems(token, 0, seal.count, items.length, undefined, width),
+			this.renderListItems(token, 0, seal.count, items.length, undefined, contentWidth),
 			width,
 			contentWidth,
 		);
@@ -2517,8 +2517,12 @@ export class Markdown implements Component {
 				// Other block content (tables, blockquotes, headings, hr, …) used to
 				// fall through renderInlineTokens, which only reads `token.text` —
 				// table tokens carry none, so entire tables silently vanished. Render
-				// them with the regular token renderer instead.
-				const blockLines = this.renderToken(token, width, undefined, styleContext);
+				// them with the regular token renderer instead. The caller indents
+				// every line by (parentDepth + 1) levels of two columns: pay that
+				// budget up front, or a table that fits its own box tears at the
+				// right edge once the prefix lands.
+				const blockWidth = Math.max(1, width - (parentDepth + 1) * 2);
+				const blockLines = this.renderToken(token, blockWidth, undefined, styleContext);
 				while (blockLines.length > 0 && blockLines[blockLines.length - 1] === "") {
 					blockLines.pop();
 				}
