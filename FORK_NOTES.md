@@ -1,3 +1,11 @@
+## 2026-10-06 显示审计六轮 + 两批修复 + 复审集群闭环
+
+- 六轮审查蜂群（78 路总投入）产出 docs/audits/2026-10-06-display-audit.md：9 High + 1 实锤截图 bug + ~100 Medium + ~185 Low/观察，全部带文件:行号与修法；独立复核抽样 40+ 条零误报、tmux 实机复验 CLI 四条全实锤。
+- 第一批修复（619a413cb，47 文件）：fullRender 超宽钳制+闭合码、嵌套列表结构化检测、列表项内表格/引用、LaTeX 间距/环境参数、S1 子代理状态对账、agents-view 共享列宽+¥、/context 预算、CLI meta 出口流+typo 守卫、主题启动守卫+持久化门控、showError/showStatus 清洗、sessionName 四层防御、登录框去重、选择器高度、--no-env 清单、对账门 ambient。用户可感知：attach 后子代理状态不再三处打架、agents 表格跨分区对齐、嵌套列表缩进正常、`--version` 管道不再空串。
+- 12 路复审集群抓出 8 个必修复项（S1 attach 路径空转、对账门误红、列表宽表格撕裂、LaTeX 吞区间、主题恒等回退、清洗吞换行、changelog 谎报 export ¥、测试污染真实 crash log），第二批（4cb46c22c，22 文件）全部闭环：settle 账本恢复收口行与 tally、对账先合并再拆 ambient、块内容宽度预算+sealed 一致、[pos] 白名单+星号变体、候选回退链、按行清洗保换行、template.js 真 ¥、HOME 隔离。
+- 门禁：两批各过 check EXIT 0（biome 0 警告）、tui 330 + coding-agent 817 测试绿、pristine tree tsgo exit 0。需要重新编译并重启后才生效（npm run build && prime-agent shutdown）。
+- 剩余 backlog：审计文档 ~60 条 Medium/Low、假功能批（daemon 扩展渲染全灭、/mcp get 空壳、死设置键、docs/tui.md 假 API）、三个 High 未修（R2-H2 登录框高度、R4-H2 Markdown 层清洗需契约决策、R6-H1 update 重launch 竞态）。
+
 ## 2026-10-05 审查②+修复蜂群：必修 4 + 应修 5 落地（12 路审查 + 5 路工兵）
 
 - 审查（12 路并行，范围 c9937500b..HEAD 60 提交，产物 /tmp/audit-20261004/）：必修 4、应修 18、小 ~25；每份报告带「查过但没问题」清单（四刀 facade 逐成员、双向降级矩阵、P1 缓存键等确认无恙）。
