@@ -1,3 +1,9 @@
+## 2026-10-07 CI 红修复：meta 输出分流 + 两个钉死测试跟进
+
+- 推送后 CI（run 37647168899）`Test (coding-agent 3/3)` 红 3 例：stdout-cleanliness ×2（`--mode json --help`、`-p -h` 要求 stdout 保持空——显式机器模式的 stdout 属于协议流）与 502 回归 ×1（钉着旧 `$`）。
+- 修复：main.ts 的 version/help 输出按「显式机器声明」分流——`--mode json/rpc/acp/daemon` 或 `-p` 时走 stderr 保持 stdout 干净，隐式 print（stdin 非 TTY）时仍走真实 stdout（`v=$(prime-agent --version)` 可捕获）。实机验证三种形态。
+- 502 断言更新为 ¥ + 响应式截断形态。
+
 ## 2026-10-06 显示审计六轮 + 两批修复 + 复审集群闭环
 
 - 六轮审查蜂群（78 路总投入）产出 docs/audits/2026-10-06-display-audit.md：9 High + 1 实锤截图 bug + ~100 Medium + ~185 Low/观察，全部带文件:行号与修法；独立复核抽样 40+ 条零误报、tmux 实机复验 CLI 四条全实锤。

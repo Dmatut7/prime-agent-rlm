@@ -1576,20 +1576,33 @@ export async function main(args: string[], options?: MainOptions) {
 		takeOverStdout();
 	}
 
+	// Meta output (version, help) answers before any machine stream exists.
+	// With an explicitly requested machine mode (--mode json/rpc/acp, -p) stdout
+	// belongs to that stream and the meta text stays on stderr; with an implicit
+	// print mode (stdin not a TTY) `v=$(prime-agent --version)` must capture the
+	// version, so it goes to the real stdout past the takeover.
+	const explicitMachineMode =
+		parsed.print === true ||
+		parsed.mode === "json" ||
+		parsed.mode === "rpc" ||
+		parsed.mode === "acp" ||
+		parsed.mode === "daemon";
+	const metaToStdout = !explicitMachineMode;
+	const metaWrite = (text: string) => {
+		if (metaToStdout) writeRawStdout(text);
+		else console.error(text.trimEnd());
+	};
 	if (parsed.version) {
-		// Human-readable meta output must land on the real stdout even after the
-		// print-mode takeover redirected console output to stderr: `v=$(prime-agent
-		// --version)` in a script must not capture an empty string.
-		writeRawStdout(`${VERSION}\n`);
+		metaWrite(`${VERSION}\n`);
 		process.exit(0);
 	}
 	if (shouldTreatLoneVerboseFlagAsVersion(args)) {
-		writeRawStdout(`${VERSION}\n`);
+		metaWrite(`${VERSION}\n`);
 		console.error(wrapForStderr(chalk.dim("-v is the verbose flag; use -V or --version to print the version.")));
 		process.exit(0);
 	}
 	if (parsed.help) {
-		writeRawStdout(`${formatTopLevelHelp(getStdoutWidth())}\n`);
+		metaWrite(`${formatTopLevelHelp(getStdoutWidth())}\n`);
 		process.exit(0);
 	}
 
