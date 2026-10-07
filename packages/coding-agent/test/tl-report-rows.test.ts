@@ -219,6 +219,65 @@ describe("the lane the returns are drawn in", () => {
 		expect(lane.comeBack("solo", undefined, undefined, "silent")).toMatchObject({ joined: 1 });
 	});
 
+	it("keeps the settle counts across a rebuild that resets and restores the lane", () => {
+		// A resync/compaction rebuild resets the lane and replays the transcript;
+		// the replay cannot see the out-of-band settle. The snapshot it restores
+		// from must carry the ledger, or the round's count silently halves.
+		const live = new SubagentLane();
+		live.tracker.spawned(["A", "B"], undefined, 1000);
+		live.tracker.settle("A", 2000, "failed");
+		const snapshot = live.snapshot();
+
+		const rebuilt = new SubagentLane();
+		rebuilt.tracker.spawned(["B"], undefined, 1500); // the replay re-opens B only
+		rebuilt.restore(snapshot, 1000);
+
+		const joined = rebuilt.comeBack("B", undefined, 3000);
+		expect(joined).toMatchObject({ joined: 2, tally: { failed: 1, silent: 0, cancelled: 0 } });
+	});
+
+	it("does not refill a settle the rebuild's replay already counted as a report", () => {
+		const live = new SubagentLane();
+		live.tracker.spawned(["A"], undefined, 1000);
+		live.tracker.settle("A", 2000, "silent");
+		const snapshot = live.snapshot();
+
+		const rebuilt = new SubagentLane();
+		rebuilt.tracker.spawned(["A"], undefined, 1000);
+		// The replay saw A's report: it closed the span and counted the return.
+		rebuilt.comeBack("A", undefined, 2500);
+		rebuilt.restore(snapshot, 1000);
+
+		// A second report-shaped event for A joins nothing and double-counts
+		// nobody: the settle was not refilled next to the replay's count.
+		expect(rebuilt.comeBack("A", undefined, 3000)).toEqual({ before: "off", after: "off" });
+		expect(rebuilt.tracker.takeSettles()).toEqual([]);
+	});
+
+	it("counts a cancelled settle as 已取消, not as a silent return", () => {
+		const lane = new SubagentLane();
+		lane.tracker.spawned(["A", "B"], undefined, 1000);
+		lane.tracker.settle("A", 2000, "cancelled");
+
+		const joined = lane.comeBack("B", undefined, 3000);
+		expect(joined).toMatchObject({ joined: 2, tally: { failed: 0, silent: 0, cancelled: 1 } });
+	});
+
+	it("supersedes a stale settle when the same name is re-dispatched and reports", () => {
+		const lane = new SubagentLane();
+		lane.tracker.spawned(["A"], undefined, 1000);
+		lane.tracker.settle("A", 2000, "silent");
+		// Same question, re-dispatched under the same name; it comes back on the
+		// lane with a real report.
+		lane.tracker.spawned(["A"], undefined, 3000);
+
+		const joined = lane.comeBack("A", undefined, 4000);
+		// One return, not two (the stale settle from the earlier dispatch is
+		// discarded, not drained into the count).
+		expect(joined).toMatchObject({ joined: 1 });
+		expect(lane.tracker.takeSettles()).toEqual([]);
+	});
+
 	it("counts a new round from zero and forgets everyone on a new question", () => {
 		const lane = new SubagentLane();
 		lane.tracker.spawned(["A"]);

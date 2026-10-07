@@ -101,6 +101,8 @@ export class LaneSpans {
 export interface LaneSnapshot {
 	spans: LaneSpan[];
 	returns: Array<[string, number]>;
+	/** Out-of-band settles the rebuild's replay could not have seen (name, at, kind). */
+	settled?: Array<[string, number, LaneSettleKind]>;
 }
 
 /**
@@ -121,6 +123,12 @@ export class TimelineLaneTracker {
 	/** The record of this question's dispatches and returns; a timeline keeps the one it was given. */
 	get spans(): LaneSpans {
 		return this.store;
+	}
+
+	/** A settle learned out of band, without a report row: closes the span and keeps the ledger entry. */
+	private noteSettled(name: string, at: number, kind: LaneSettleKind): void {
+		this.store.close(name, at);
+		if (!this.settled.has(name)) this.settled.set(name, { at, kind });
 	}
 
 	/** Subagents dispatched; returns the lane for the dispatching row (`split`). `owner` is told when one comes back. */
@@ -165,6 +173,11 @@ export class TimelineLaneTracker {
 		this.owners.delete(name);
 	}
 
+	/** The outstanding settles, for a snapshot the rebuild will replay. */
+	settlesSnapshot(): Array<[string, number, LaneSettleKind]> {
+		return [...this.settled.entries()].map(([name, settle]) => [name, settle.at, settle.kind]);
+	}
+
 	/** Outstanding out-of-band settles, emptied by the call. */
 	takeSettles(): Array<{ name: string; at: number; kind: LaneSettleKind }> {
 		if (this.settled.size === 0) return [];
@@ -195,7 +208,7 @@ export class TimelineLaneTracker {
 
 	/** What the lane knows now, taken before a rebuild forgets it. */
 	snapshot(): LaneSnapshot {
-		return this.store.snapshot();
+		return { ...this.store.snapshot(), settled: this.settlesSnapshot() };
 	}
 
 	/**
@@ -205,6 +218,15 @@ export class TimelineLaneTracker {
 	 * `since` is when the question the replay ends in began: an earlier dispatch is another question's.
 	 */
 	restore(previous: LaneSnapshot, since?: number): void {
+		// Out-of-band settles the replay could not have seen: refill the ledger
+		// (and close a span the replay re-opened) BEFORE the returns loop below
+		// marks these names returned — a late report then still counts. A name
+		// the replay itself saw come back keeps the replay's count.
+		for (const [name, at, kind] of previous.settled ?? []) {
+			if (this.store.returnedAt(name) !== undefined) continue;
+			if (since !== undefined && at < since) continue;
+			this.noteSettled(name, at, kind);
+		}
 		// A child that came back without ever being on the lane leaves only its return: without it a rebuild sees it out again.
 		for (const [name, at] of previous.returns) {
 			if (since === undefined || at >= since) this.store.noteBack(name, at);

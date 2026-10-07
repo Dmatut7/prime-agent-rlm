@@ -18,6 +18,7 @@ import { providerRetryPolicy } from "../../core/provider-retry.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/session-file-actions.js";
 import { appendOwnedSessionLineAsync, SessionManager } from "../../core/session-manager.js";
+import { sanitizeSessionName } from "../../core/session-names.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
 import { type QuotaParkStatus, quotaParkWireFacts, readQuotaParkStatus } from "../daemon/quota-park-status.js";
@@ -627,11 +628,13 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async setSessionName(name: string): Promise<void> {
-		const trimmedName = name.trim();
-		if (!trimmedName) {
+		// Same boundary the daemon rename path sanitizes: a persisted name
+		// reaches the terminal title and single-row chips.
+		const sanitized = sanitizeSessionName(name).trim();
+		if (!sanitized) {
 			throw new Error("Session name cannot be empty");
 		}
-		this.session.setSessionName(trimmedName);
+		this.session.setSessionName(sanitized);
 	}
 
 	async getRlmMaxDepthStatus() {

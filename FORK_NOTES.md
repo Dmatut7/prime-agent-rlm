@@ -1,3 +1,11 @@
+## 2026-10-07 推送闭环 + 持续审查集群的第三批修复
+
+- 推送链路：pre-push 钩子拦下审计文档里的文件名探针误报（secret-scan 误判邮箱）→ 重写该行为带 marker 的写法 → history 重建（cherry-pick 重放，tree 逐字节一致）→ 推送。CI 第一轮红 3 例（`--mode json --help` stdout 清洁契约 + 502 钉旧 $）→ f4e701186 修复：meta 输出按「显式机器声明」分流——`--mode json/rpc/acp/daemon`/`-p` 走 stderr 保协议流干净，隐式 print（stdin 非 TTY）走真 stdout（`v=$(prime-agent --version)` 可捕获）。CI 重跑 11/11 全绿。
+- 推送后 8 路持续审查集群：总判「健康可留」，抓出第三批修复项（本波全部落地）——settle 账本进 LaneSnapshot（重建不再丢轮次计数/收口行）、cancelled 子代理 settle 错标 silent（「已取消」文案与死枚举激活）、endedAt 用快照 durationMs 推导（attach 后时长不再虚增到 attach 时刻）、redirect 值碰撞放弃（flag 值等于命令词时不再误删）、latex array/tabularx 的 [pos] 顺序、login 重入静态 chrome 去重、in-process rename 消毒、test.sh AZURE key。
+- 测试钉补齐：隐式 print stdout 正向契约、attach 路径 reconcile 晚于 replay 的时序断言、502 正则收紧回精确形态、settle 重建/cancelled/同名重派 5 个新用例。
+- CI 稳定性：测试 job timeout 15→30 分钟（apt 抖动曾吞 14 分钟取消绿 run）、runner 固定 ubuntu-24.04（10/19 ubuntu-latest 迁 Ubuntu 26 预警）、floors 重导到 run 37649262888（原 floors 已稀释到 53-66%，shard3 丢 1600 测试仍绿）。
+- 环境：gh 默认仓指向本 fork（原解析到上游）、vulnerability alerts 已开启。
+
 ## 2026-10-07 CI 红修复：meta 输出分流 + 两个钉死测试跟进
 
 - 推送后 CI（run 37647168899）`Test (coding-agent 3/3)` 红 3 例：stdout-cleanliness ×2（`--mode json --help`、`-p -h` 要求 stdout 保持空——显式机器模式的 stdout 属于协议流）与 502 回归 ×1（钉着旧 `$`）。
@@ -7,8 +15,8 @@
 ## 2026-10-06 显示审计六轮 + 两批修复 + 复审集群闭环
 
 - 六轮审查蜂群（78 路总投入）产出 docs/audits/2026-10-06-display-audit.md：9 High + 1 实锤截图 bug + ~100 Medium + ~185 Low/观察，全部带文件:行号与修法；独立复核抽样 40+ 条零误报、tmux 实机复验 CLI 四条全实锤。
-- 第一批修复（619a413cb，47 文件）：fullRender 超宽钳制+闭合码、嵌套列表结构化检测、列表项内表格/引用、LaTeX 间距/环境参数、S1 子代理状态对账、agents-view 共享列宽+¥、/context 预算、CLI meta 出口流+typo 守卫、主题启动守卫+持久化门控、showError/showStatus 清洗、sessionName 四层防御、登录框去重、选择器高度、--no-env 清单、对账门 ambient。用户可感知：attach 后子代理状态不再三处打架、agents 表格跨分区对齐、嵌套列表缩进正常、`--version` 管道不再空串。
-- 12 路复审集群抓出 8 个必修复项（S1 attach 路径空转、对账门误红、列表宽表格撕裂、LaTeX 吞区间、主题恒等回退、清洗吞换行、changelog 谎报 export ¥、测试污染真实 crash log），第二批（4cb46c22c，22 文件）全部闭环：settle 账本恢复收口行与 tally、对账先合并再拆 ambient、块内容宽度预算+sealed 一致、[pos] 白名单+星号变体、候选回退链、按行清洗保换行、template.js 真 ¥、HOME 隔离。
+- 第一批修复（68ed41031，47 文件）：fullRender 超宽钳制+闭合码、嵌套列表结构化检测、列表项内表格/引用、LaTeX 间距/环境参数、S1 子代理状态对账、agents-view 共享列宽+¥、/context 预算、CLI meta 出口流+typo 守卫、主题启动守卫+持久化门控、showError/showStatus 清洗、sessionName 四层防御、登录框去重、选择器高度、--no-env 清单、对账门 ambient。用户可感知：attach 后子代理状态不再三处打架、agents 表格跨分区对齐、嵌套列表缩进正常、`--version` 管道不再空串。
+- 12 路复审集群抓出 8 个必修复项（S1 attach 路径空转、对账门误红、列表宽表格撕裂、LaTeX 吞区间、主题恒等回退、清洗吞换行、changelog 谎报 export ¥、测试污染真实 crash log），第二批（e5532068d，22 文件）全部闭环：settle 账本恢复收口行与 tally、对账先合并再拆 ambient、块内容宽度预算+sealed 一致、[pos] 白名单+星号变体、候选回退链、按行清洗保换行、template.js 真 ¥、HOME 隔离。
 - 门禁：两批各过 check EXIT 0（biome 0 警告）、tui 330 + coding-agent 817 测试绿、pristine tree tsgo exit 0。需要重新编译并重启后才生效（npm run build && prime-agent shutdown）。
 - 剩余 backlog：审计文档 ~60 条 Medium/Low、假功能批（daemon 扩展渲染全灭、/mcp get 空壳、死设置键、docs/tui.md 假 API）、三个 High 未修（R2-H2 登录框高度、R4-H2 Markdown 层清洗需契约决策、R6-H1 update 重launch 竞态）。
 

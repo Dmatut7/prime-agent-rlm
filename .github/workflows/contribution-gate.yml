@@ -12,7 +12,7 @@ jobs:
   issue:
     name: Check issue author
     if: github.event_name == 'issues'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       issues: write
@@ -27,7 +27,7 @@ jobs:
   pull-request:
     name: Check pull request author
     if: github.event_name == 'pull_request_target'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pull-requests: write

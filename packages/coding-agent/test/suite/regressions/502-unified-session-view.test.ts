@@ -464,9 +464,10 @@ describe("#502 unified session view regressions", () => {
 				50,
 			),
 		);
-		// Money follows the TUI-wide ¥ formatter; the trailing elipsis is the
-		// responsive cut (the row no longer pretends a bare cut is data).
-		expect(rendered).toMatch(/↑0\s+↓0 ·\s+¥0\.00 ·\s+0 ·\s+¥0\.00[ ·…]*2h?\s*$/);
+		// Money follows the TUI-wide ¥ formatter. At width 50 the details cell
+		// fits whole: both ¥0.00 columns, the count, and the age (CI's actual
+		// rendering, byte for byte).
+		expect(rendered).toMatch(/↑0\s+↓0 ·\s+¥0\.00 ·\s+0 ·\s+¥0\.00 ·\s+2h\s*$/);
 	});
 
 	test("scoped subagent rows keep model and effort ahead of summaries", () => {

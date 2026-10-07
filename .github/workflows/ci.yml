@@ -18,7 +18,7 @@ permissions:
 jobs:
   trust:
     name: Contributor trust
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       allowed: ${{ github.event_name == 'push' || steps.vouch.outputs.vouched == 'true' }}
     steps:
@@ -36,8 +36,10 @@ jobs:
     name: Build and check
     needs: trust
     if: needs.trust.outputs.allowed == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    # 30 minutes: apt mirror stalls have eaten 14+ minutes of install inside the
+    # old 15-minute budget and cancelled an otherwise green run (37649262888).
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -99,8 +101,10 @@ jobs:
     name: Test (${{ matrix.name }})
     needs: trust
     if: needs.trust.outputs.allowed == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    # 30 minutes: apt mirror stalls have eaten 14+ minutes of install inside the
+    # old 15-minute budget and cancelled an otherwise green run (37649262888).
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -150,21 +154,19 @@ jobs:
             package: packages/agent
             command: npm test --
             report: coverage/ci-agent-core.json
-            # run 35341768020: collected=108 ran=108 files=9 nothing-files=0 -> ceil(0.9*x) = 98/98.
-            min_tests: 98
-            min_ran_tests: 98
+            # run 37649262888: collected=172 ran=172 files=12 nothing-files=0 -> ceil(0.9*x) = 155/155.
+            min_tests: 155
+            min_ran_tests: 155
             max_nothing_files: 0
             install_uv: false
           - name: ai
             package: packages/ai
             command: npm test --
             report: coverage/ci-ai.json
-            # run 35341768020: collected=1365 ran=643 files=112 nothing-files=19 -> 1229/579. The
-            # ran floor was 412, i.e. 64% of what the job runs: 167 tests (a third of this job's
-            # running face) could have stopped running and the gate would still have said green.
+            # run 37649262888: collected=1537 ran=791 files=136 nothing-files=19 -> 1384/712.
             # The gap between collected and ran is the 19 nothing-files below, not hidden skips.
-            min_tests: 1229
-            min_ran_tests: 579
+            min_tests: 1384
+            min_ran_tests: 712
             # 19 files are the live-provider suites, which need credentials this job has none of.
             max_nothing_files: 19
             install_uv: false
@@ -179,20 +181,20 @@ jobs:
             command: node --test --import tsx --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=coverage/ci-tui.xml test/*.test.ts
             report: ""
             node_test_report: coverage/ci-tui.xml
-            # run 35341768020: tests=863 ran=863 suites=134 nothing-suites=0 -> 777/777. The
+            # run 37649262888: tests=1353 ran=1353 suites=229 nothing-suites=0 -> 1218/1218. The
             # floors here are derived from the CI reading, not from a local run: this row used to
             # quote "831 tests on a full local run", a number no gate reads and no runner produces.
-            min_tests: 777
-            min_ran_tests: 777
+            min_tests: 1218
+            min_ran_tests: 1218
             max_nothing_suites: 0
             install_uv: false
           - name: coding-agent 1/3
             package: packages/coding-agent
             command: npm run test:ci -- --shard=1/3
             report: coverage/ci-shard-1.json
-            # run 35341768020: collected=2720 ran=2695 files=240 nothing-files=3 -> 2448/2426.
-            min_tests: 2448
-            min_ran_tests: 2426
+            # run 37649262888: collected=3944 ran=3918 files=336 nothing-files=3 -> 3550/3527.
+            min_tests: 3550
+            min_ran_tests: 3527
             # compaction-extensions, rpc (both opt-in), bash-close-hang-windows (win32-only).
             max_nothing_files: 3
             install_uv: true
@@ -200,11 +202,11 @@ jobs:
             package: packages/coding-agent
             command: npm run test:ci -- --shard=2/3
             report: coverage/ci-shard-2.json
-            # run 35341768020: collected=3117 ran=3107 files=240 nothing-files=1 -> 2806/2797.
-            # This row's budget says six kernel-heavy files but the run produced one nothing-file;
+            # run 37649262888: collected=4286 ran=4275 files=336 nothing-files=0 -> 3858/3848.
+            # This row's budget says six kernel-heavy files but the run produced none;
             # the budget is left as authored and the gap is recorded in scripts/ci-floor-readings.json.
-            min_tests: 2806
-            min_ran_tests: 2797
+            min_tests: 3858
+            min_ran_tests: 3848
             # Six `kernel-heavy` files (tag-filtered here, run by the kernel job).
             max_nothing_files: 6
             install_uv: true
@@ -212,11 +214,11 @@ jobs:
             package: packages/coding-agent
             command: npm run test:ci -- --shard=3/3
             report: coverage/ci-shard-3.json
-            # run 35341768020: collected=2058 ran=2022 files=239 nothing-files=5 -> 1853/1820.
-            # The previous green run collected 2176 here, so this row is the one most exposed to
-            # re-sharding; 205 collected tests of slack absorb one more move of that size.
-            min_tests: 1853
-            min_ran_tests: 1820
+            # run 37649262888: collected=3495 ran=3457 files=335 nothing-files=6 -> 3146/3112.
+            # The shard rows move whenever vitest re-shards; a floor going stale is that
+            # churn, not a regression - recompute it.
+            min_tests: 3146
+            min_ran_tests: 3112
             # Six `kernel-heavy` files (run by the kernel job) and agent-session-tree-navigation
             # (describe.skipIf(!API_KEY)). test/repl-kernel-execute.test.ts was the eighth until its
             # interpreter resolution was fixed; it runs here now, so this budget is what catches it
@@ -227,7 +229,7 @@ jobs:
             package: packages/coding-agent
             command: npm run test:process --
             report: coverage/ci-process-smoke.json
-            # run 35341768020: collected=24 ran=12 files=2 nothing-files=1 -> 22/11. This row is
+            # run 37649262888: collected=24 ran=12 files=2 nothing-files=1 -> 22/11. This row is
             # the only carrier of these four values and of the ledger string below:
             # scripts/check-process-smoke.sh (the local mirror of this job) reads them out of this
             # row at run time through scripts/lib/ci-matrix-row.mjs, and refuses when the row or one
@@ -257,11 +259,11 @@ jobs:
             package: packages/coding-agent
             command: npm run test:machine-wide --
             report: coverage/ci-machine-wide.json
-            # run 35341768020: collected=6 ran=6 files=1 nothing-files=0 -> 6/6. ceil(0.9*6) is 6,
-            # so this row has zero slack: it is one file with six tests that drive the machine-wide
+            # run 37649262888: collected=7 ran=7 files=1 nothing-files=0 -> 7/7. ceil(0.9*7) is 7,
+            # so this row has zero slack: it is one file with seven tests that drive the machine-wide
             # discovery commands, and losing any of them must be loud rather than absorbed.
-            min_tests: 6
-            min_ran_tests: 6
+            min_tests: 7
+            min_ran_tests: 7
             max_nothing_files: 0
             install_uv: true
           - name: coding-agent kernel
@@ -427,7 +429,7 @@ jobs:
     name: Test hygiene
     needs: trust
     if: needs.trust.outputs.allowed == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -536,7 +538,7 @@ jobs:
     name: build-check-test
     if: always() && needs.trust.outputs.allowed == 'true'
     needs: [trust, build-check, test, test-hygiene]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Verify CI results
         env:

@@ -199,9 +199,16 @@ export class SubagentLane {
 		// the settle guessed (a report that arrives after the round closed is
 		// not re-counted).
 		const settled = this.tracker.takeSettles();
-		const selfSettled = settled.some((entry) => entry.name === name);
+		let selfSettled = false;
 		for (const entry of settled) {
-			if (entry.name === name) continue;
+			if (entry.name === name) {
+				// A real report supersedes its own stale settle (the name was
+				// re-dispatched in this round and came back on the lane): the
+				// wasOut count below stands and the settle is discarded. Without
+				// a report the settle is this return's count.
+				if (!wasOut) selfSettled = true;
+				continue;
+			}
 			this.back += 1;
 			this.tally[entry.kind] += 1;
 		}

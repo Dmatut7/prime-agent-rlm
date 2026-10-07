@@ -732,6 +732,10 @@ export class LiveTurnFlow {
 			laneName: laneKey(child.sessionName, child.activeSessionId),
 			...(child.sessionName ? { label: child.label } : {}),
 			status: running ? "running" : child.status === "error" ? "failed" : "done",
+			// A cancelled child is neither "failed" nor "silent": the closing row
+			// says 已取消, and the snapshot's duration keeps the row's real span.
+			...(child.status === "cancelled" ? { settleKind: "cancelled" as const } : {}),
+			...(child.durationMs !== undefined ? { durationMs: child.durationMs } : {}),
 			line,
 			...(child.status === "error"
 				? { result: firstLine(child.error) ?? "出错" }

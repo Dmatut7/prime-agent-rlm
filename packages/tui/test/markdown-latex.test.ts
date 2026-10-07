@@ -111,6 +111,15 @@ describe("latexToUnicode", () => {
 		assert.strictEqual(latexToUnicode("\\begin{alignat*}{2} x &= 1 \\end{alignat*}").trim(), "x = 1");
 	});
 
+	it("consumes the [pos] of array-family environments in TeX's order", () => {
+		// \\begin{array}[t]{cc} is a legal layout form; the bracket used to leak
+		// as "t]cc" next to the cells.
+		assert.strictEqual(latexToUnicode("\\begin{array}[t]{cc} a & b \\end{array}").trim(), "a b");
+		assert.strictEqual(latexToUnicode("\\begin{tabular}[b]{l|r} a & b \\end{tabular}").trim(), "a b");
+		// tabularx takes {width}[pos]{cols} in that order.
+		assert.strictEqual(latexToUnicode("\\begin{tabularx}{\\textwidth}[t]{cc} a & b \\end{tabularx}").trim(), "a b");
+	});
+
 	it("renders matrix environments as rows", () => {
 		assert.strictEqual(latexToUnicode("\\begin{pmatrix}\n1 & 2 \\\\\n3 & 4\n\\end{pmatrix}").trim(), "1 2 \n3 4");
 	});

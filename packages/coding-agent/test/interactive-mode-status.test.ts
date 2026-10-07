@@ -1843,6 +1843,9 @@ describe("InteractiveMode connection events", () => {
 			{ state: createConnectionState({ isStreaming: true }), messages: [], streamingMessage },
 		];
 		const renderSessionContextMock = vi.fn(async () => {});
+		// The attach path's core claim: reconcile runs AFTER the replay (before
+		// it, the chat was empty and the reconcile was a no-op).
+		const reconcileMock = vi.fn();
 		const restoreStreamingMessageFromSnapshot = vi.fn(async () => {});
 		const fakeThis = {
 			agentConnection: { getInitialSnapshot: vi.fn(async () => snapshots.shift()!) },
@@ -1852,7 +1855,7 @@ describe("InteractiveMode connection events", () => {
 				model: null,
 			})),
 			seedSubagentSummary: vi.fn(),
-			reconcileSubagentTimeline: vi.fn(),
+			reconcileSubagentTimeline: reconcileMock,
 			applyConnectionStateSnapshot: vi.fn(),
 			applySnapshotQuotaPark: vi.fn(),
 			renderSessionContext: renderSessionContextMock,
@@ -1874,6 +1877,12 @@ describe("InteractiveMode connection events", () => {
 				.getInitialSnapshot,
 		).toHaveBeenCalledTimes(2);
 		expect(renderSessionContextMock).toHaveBeenCalledTimes(2);
+		expect(reconcileMock).toHaveBeenCalledTimes(2);
+		for (let index = 0; index < reconcileMock.mock.calls.length; index++) {
+			expect(reconcileMock.mock.invocationCallOrder[index]!).toBeGreaterThan(
+				renderSessionContextMock.mock.invocationCallOrder[index]!,
+			);
+		}
 		expect(renderSessionContextMock).toHaveBeenNthCalledWith(1, expect.anything(), {
 			updateFooter: true,
 			populateHistory: true,

@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   release-context:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     outputs:
@@ -116,7 +116,7 @@ jobs:
           echo "Beta: $publish_beta ${beta_version:+v${beta_version}}"
 
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: release-context
     permissions:
       contents: read
@@ -225,7 +225,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [release-context, build]
     permissions:
       contents: write

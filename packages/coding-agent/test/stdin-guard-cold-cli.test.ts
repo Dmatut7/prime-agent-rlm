@@ -141,7 +141,7 @@ describe("cold CLI stdin guard", () => {
 		const result = await runColdCli(["--version"], { timeoutMs: 20_000 });
 		expect(result.signal).toBeNull();
 		expect(result.code).toBe(0);
-		// Non-interactive mode takes over stdout, so console output lands on stderr.
+		// Non-interactive mode takes over stdout; meta output (version) goes to the real stdout, model output to stderr.
 		expect(`${result.stdout}${result.stderr}`).toMatch(/\d+\.\d+\.\d+/);
 		expect(result.elapsedMs).toBeLessThan(20_000);
 	}, 30_000);

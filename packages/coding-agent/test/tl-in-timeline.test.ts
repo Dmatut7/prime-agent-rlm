@@ -747,6 +747,28 @@ describe("a line's lane comes from where it sits relative to the dispatch", () =
 		expect(lines.some((line) => line.includes("还在干活"))).toBe(false);
 	});
 
+	it("counts a cancelled child as cancelled, and derives its endedAt from the snapshot duration", () => {
+		const turn = quietTurn(false);
+		const tracker = new TimelineLaneTracker();
+		turn.summary.setLaneTracker(tracker);
+		say(turn, T0, "派一个代理。", [{ id: "c1", command: "git branch" }]);
+		turn.timeline.upsertSubagent({ childId: "a", name: "A", label: "A 任务", status: "running" }, T0 + MINUTE);
+
+		// The reconcile path: a cancelled child that ran for two minutes, whose
+		// cancellation notice never reached this transcript.
+		turn.timeline.upsertSubagent(
+			{ childId: "a", name: "A", status: "done", settleKind: "cancelled", durationMs: 2 * MINUTE },
+			T0 + 60 * MINUTE,
+		);
+
+		const settle = tracker.takeSettles();
+		expect(settle).toEqual([{ name: "A", at: T0 + 3 * MINUTE, kind: "cancelled" }]);
+		// The row's duration is the child's real run (2 minutes from spawn), not
+		// the hour between spawn and attach.
+		const entry = turn.timeline.entries.find((item) => item.kind === "subagent");
+		expect(entry && entry.kind === "subagent" ? entry.sub.endedAt : undefined).toBe(T0 + 3 * MINUTE);
+	});
+
 	it("starts a woken turn in the lane its tracker was in when the turn began", () => {
 		const tracker = new TimelineLaneTracker();
 		tracker.spawned(["Z"], undefined, T0 - MINUTE);

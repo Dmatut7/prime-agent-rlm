@@ -22,7 +22,7 @@ import {
 } from "./feed-data.js";
 import { stripInlineMarkdown } from "./inline-markdown.js";
 import type { TimelineLane } from "./timeline-gutter.js";
-import type { LaneOwner, LaneSpans, TimelineLaneTracker } from "./timeline-lane.js";
+import type { LaneOwner, LaneSettleKind, LaneSpans, TimelineLaneTracker } from "./timeline-lane.js";
 
 /**
  * Everything one assistant turn's box shows, in the order it happened: the
@@ -674,7 +674,16 @@ export class TurnTimeline implements LaneOwner {
 	}
 
 	/** Insert or update the row of one subagent this turn started. */
-	upsertSubagent(update: Omit<TimelineSubagent, "startedAt"> & { startedAt?: number }, now = Date.now()): void {
+	upsertSubagent(
+		update: Omit<TimelineSubagent, "startedAt"> & {
+			startedAt?: number;
+			/** The child run's duration, when the snapshot knows it: the endedAt an attach-side flip records. */
+			durationMs?: number;
+			/** How the lane ledger should count this settle (a cancelled child is not "silent"). */
+			settleKind?: LaneSettleKind;
+		},
+		now = Date.now(),
+	): void {
 		const key = `sub:${update.childId}`;
 		const lane = update.laneName ?? update.name;
 		// The same subagent may be told twice (its spawn record, then its snapshot): one entry.
@@ -685,11 +694,18 @@ export class TurnTimeline implements LaneOwner {
 		if (existing && existing.kind === "subagent") {
 			const wasRunning = existing.sub.status === "running";
 			const wasOffLane = !(existing.sub.laneName ?? existing.sub.name);
+			// An attach-side flip records when the child actually ended (its
+			// snapshot duration from the spawn), not when the parent happened to
+			// attach: the row's "用了 N 秒" otherwise counts the whole gap.
+			const endedAt =
+				update.durationMs !== undefined && Number.isFinite(update.durationMs) && update.durationMs >= 0
+					? existing.sub.startedAt + update.durationMs
+					: now;
 			existing.sub = {
 				...existing.sub,
 				...update,
 				startedAt: existing.sub.startedAt,
-				...(wasRunning && update.status !== "running" ? { endedAt: now } : {}),
+				...(wasRunning && update.status !== "running" ? { endedAt } : {}),
 			};
 			// A key that only shows up after the first sight puts the running subagent on the lane then.
 			const nowLane = existing.sub.laneName ?? existing.sub.name;
@@ -701,7 +717,8 @@ export class TurnTimeline implements LaneOwner {
 			// the timeline entry it describes. `settle` keeps a ledger entry so the
 			// report row that follows still draws the closing line and the tally.
 			if (wasRunning && existing.sub.status !== "running" && nowLane) {
-				this.laneTracker?.settle(nowLane, now, existing.sub.status === "failed" ? "failed" : "silent");
+				const kind: LaneSettleKind = update.settleKind ?? (existing.sub.status === "failed" ? "failed" : "silent");
+				this.laneTracker?.settle(nowLane, endedAt, kind);
 			}
 		} else {
 			this.entries.push({

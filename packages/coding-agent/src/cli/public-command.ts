@@ -314,9 +314,14 @@ function redirectFlagLeadingCommand(args: string[]): string[] | undefined {
 	if (!PUBLIC_COMMAND_NAMES.has(word)) {
 		return undefined;
 	}
-	// Remove the message word by position, not by value: a flag's value can
-	// legitimately equal the command word (`--cwd list status`), and a value
-	// filter would silently strip it.
+	// The message word must be unambiguous: a flag's value can legitimately
+	// equal the command word (`--cwd agents --offline agents`), and picking an
+	// occurrence by value can delete the flag's value instead of the message.
+	// More than one occurrence means the shapes overlap — give the redirect up
+	// and let the word stay a prompt.
+	if (args.indexOf(word) !== args.lastIndexOf(word)) {
+		return undefined;
+	}
 	const wordIndex = args.indexOf(word);
 	return [word, ...args.slice(0, wordIndex), ...args.slice(wordIndex + 1)];
 }

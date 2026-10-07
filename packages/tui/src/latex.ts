@@ -307,7 +307,16 @@ const COLUMN_SPEC_ENVIRONMENTS = new Set(["array", "tabular", "tabularx", "subar
  * bracket right after \begin{env} as content (an interval, a commutator); only
  * these may consume it.
  */
-const OPTIONAL_POSITION_ENVIRONMENTS = new Set(["aligned", "gathered", "subarray", "alignat", "alignedat"]);
+const OPTIONAL_POSITION_ENVIRONMENTS = new Set([
+	"aligned",
+	"gathered",
+	"subarray",
+	"alignat",
+	"alignedat",
+	"array",
+	"tabular",
+	"tabularx",
+]);
 
 /** Accent commands → combining character appended to each character. */
 const ACCENTS: Record<string, string> = {
@@ -683,6 +692,14 @@ class LatexParser {
 	private consumeEnvironmentOptions(environment: string): void {
 		// Strip the starred variant (alignat* has the same arguments as alignat).
 		const base = environment.endsWith("*") ? environment.slice(0, -1) : environment;
+		// tabularx's argument order is {width}[pos]{cols}, every other
+		// column-spec environment takes [pos]{cols} (or just {cols}).
+		if (base === "tabularx") {
+			this.parseArgument();
+			this.parseOptionalBracket();
+			this.parseArgument();
+			return;
+		}
 		// Only environments that accept a vertical placement consume [pos]; a
 		// bracket anywhere else is content (an interval like [0,1] as a matrix's
 		// first cell).
@@ -691,9 +708,6 @@ class LatexParser {
 		}
 		if (COLUMN_SPEC_ENVIRONMENTS.has(base)) {
 			this.parseArgument();
-			if (base === "tabularx") {
-				this.parseArgument();
-			}
 		}
 	}
 

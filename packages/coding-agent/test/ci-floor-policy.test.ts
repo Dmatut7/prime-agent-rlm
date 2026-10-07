@@ -478,7 +478,7 @@ describe("the ci.yml floors are derived from the recorded CI reading, not from m
 	it("records which run the floors came from, and a sha this repository has", () => {
 		const reading = readings();
 		expect(reading.floor_ratio).toBe(0.9);
-		expect(reading.source.run_id).toBe(35341768020);
+		expect(reading.source.run_id).toBe(37649262888);
 		expect(reading.source.run_url).toContain(String(reading.source.run_id));
 		// The reading and the tree it gates must be the same tree: the sha is the base of this work.
 		// CI checks out at depth one, so this pin reads its own checkout and keeps the sha leg only
@@ -607,14 +607,14 @@ describe("the floor pin can go red (planted mutations, same comparison functions
 		const mutant = plantedRow(rows, "ai", "min_tests", Number(baseline?.min_tests) - 1);
 		const mismatches = floorMismatches(mutant, reading);
 		expect(mismatches.length).toBeGreaterThan(0);
-		expect(mismatches.join("\n")).toContain("min_tests=1228");
+		expect(mismatches.join("\n")).toContain("min_tests=1383");
 	});
 
 	it("is red when a ran floor is one below the reading", () => {
-		const rows = plantedRow(workflowRows(), "coding-agent 2/3", "min_ran_tests", 2796);
+		const rows = plantedRow(workflowRows(), "coding-agent 2/3", "min_ran_tests", 3847);
 		const mismatches = floorMismatches(rows, readings());
 		expect(mismatches.length).toBeGreaterThan(0);
-		expect(mismatches.join("\n")).toContain("min_ran_tests=2796");
+		expect(mismatches.join("\n")).toContain("min_ran_tests=3847");
 	});
 
 	it("is red when the reading grows and the floor does not follow", () => {
@@ -626,7 +626,7 @@ describe("the floor pin can go red (planted mutations, same comparison functions
 		row.ran += 100;
 		const mismatches = floorMismatches(workflowRows(), mutant);
 		expect(mismatches.length).toBeGreaterThan(0);
-		expect(mismatches.join("\n")).toContain("ceil(0.9 * 208) = 188");
+		expect(mismatches.join("\n")).toContain("ceil(0.9 * 272) = 245");
 	});
 
 	it("is red when a matrix row loses its reading", () => {
@@ -685,8 +685,8 @@ describe("the floor pin can go red (planted mutations, same comparison functions
 		const drifted = asMutable(readings());
 		const ai = drifted.rows.find((row) => row.name === "ai");
 		if (ai === undefined) throw new Error("no ai reading");
-		ai.log_line = ai.log_line.replace("numTotalTests=1365", "numTotalTests=1366");
-		expect(logLineMismatches(drifted).join("\n")).toContain("the log_line says collected=1366");
+		ai.log_line = ai.log_line.replace("numTotalTests=1537", "numTotalTests=1538");
+		expect(logLineMismatches(drifted).join("\n")).toContain("the log_line says collected=1538");
 
 		const moved = asMutable(readings());
 		const tui = moved.rows.find((row) => row.name === "tui");

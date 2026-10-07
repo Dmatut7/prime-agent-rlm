@@ -11,7 +11,7 @@ permissions:
 jobs:
   changelog-fragment:
     name: Check changelog fragment
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Upstream's PR-time convention, scoped to the repository whose release path consumes it.
     # A fragment is only ever read by `scripts/release.mjs`, which folds fragments into a release
     # section; on this fork checkout that script refuses to run (fork gate: no `npm publish`, no

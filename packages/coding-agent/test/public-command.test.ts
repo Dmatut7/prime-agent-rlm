@@ -476,6 +476,14 @@ describe("public command routing", () => {
 		expect(console.error).not.toHaveBeenCalledWith(expect.stringContaining("Unknown command: status"));
 	});
 
+	it("gives the redirect up when a flag value equals the command word", async () => {
+		// `--cwd agents --offline agents`: the "agents" after --cwd is a value;
+		// deleting an occurrence of the word by value can eat that value and
+		// leave a broken command behind. The word stays a prompt instead.
+		const ambiguous = await handlePublicCommand(["--cwd", "agents", "--offline", "agents"]);
+		expect(ambiguous.handled).toBe(false);
+	});
+
 	it("names the prompt escape hatch in the rejection", async () => {
 		await handlePublicCommand(["statsu"]);
 

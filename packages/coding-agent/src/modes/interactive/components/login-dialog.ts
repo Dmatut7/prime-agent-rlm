@@ -227,6 +227,10 @@ export class LoginDialogComponent extends Container implements Focusable {
 	 * Note: Does NOT clear content, appends to existing (preserves URL from showAuth)
 	 */
 	showPrompt(message: string, placeholder?: string): Promise<string> {
+		// A re-entry after a failed manual submission only adds the new prompt
+		// section; the input and its confirm hint are already on screen from
+		// the earlier arm.
+		const reEntry = this.inputVisible === true;
 		this.addSectionSpacer();
 		this.addSectionTitle(message);
 		if (placeholder) {
@@ -235,12 +239,14 @@ export class LoginDialogComponent extends Container implements Focusable {
 		this.addInputOnce();
 		this.inputVisible = true;
 		this.authActions?.setText(this.getAuthActionsText());
-		this.contentContainer.addChild(
-			new Text(
-				theme.fg("muted", `${keyHint("tui.select.confirm", "提交")}  ${keyHint("tui.select.cancel", "取消")}`),
-				0,
-			),
-		);
+		if (!reEntry) {
+			this.contentContainer.addChild(
+				new Text(
+					theme.fg("muted", `${keyHint("tui.select.confirm", "提交")}  ${keyHint("tui.select.cancel", "取消")}`),
+					0,
+				),
+			);
+		}
 
 		this.input.setValue("");
 		this.tui.requestRender();

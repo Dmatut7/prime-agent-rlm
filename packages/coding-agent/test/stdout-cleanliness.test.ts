@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { ENV_AGENT_DIR } from "../src/config.js";
+import { ENV_AGENT_DIR, VERSION } from "../src/config.js";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const tsxPath = resolve(__dirname, "../../../node_modules/tsx/dist/cli.mjs");
@@ -104,5 +104,16 @@ describe("stdout cleanliness in non-interactive modes", () => {
 		expect(result.stderr).toContain("Usage:");
 		expect(result.stderr).not.toContain("Examples:");
 		expect(result.stderr).not.toContain("Built-in Tool Names:");
+	});
+
+	it("sends --version to the real stdout in an implicit print mode (stdin not a TTY)", async () => {
+		// The positive half of the contract: `v=$(prime-agent --version)` must
+		// capture the version when no machine mode was requested. runCli spawns
+		// with stdin ignored, which is exactly the implicit print shape.
+		const result = await runCli(["--version"]);
+
+		expect(result.code).toBe(0);
+		expect(result.stdout).toContain(VERSION);
+		expect(result.stderr).toBe("");
 	});
 });

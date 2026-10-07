@@ -1,0 +1,6 @@
+- Fixed subagent round counts and the closing line disappearing after a chat rebuild (resync, compaction): the out-of-band settle ledger now travels with the lane snapshot.
+- Fixed cancelled subagents being tallied as "finished without a reply" on the closing line; they now count as cancelled, and an attach-side flip records the child's real end time (its snapshot duration) instead of the attach moment.
+- Fixed `--cwd <command> --flag <command>` invocations mangling the flag's value: a flag-leading command redirect now gives up when the command word is ambiguous.
+- Fixed `\begin{array}[t]{…}` / `tabularx` consuming their arguments in the wrong order (the position leaked as "t]cc").
+- Fixed the login dialog re-arming its confirm-hint rows after a failed manual submission, and the in-process rename path persisting unsanitized session names.
+- Version and help output now stays on stderr for explicitly requested machine modes (`--mode json/rpc/acp/daemon`, `-p`) so the protocol stream stays clean, while an implicit print mode (stdin not a TTY) still writes them to the real stdout.
