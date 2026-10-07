@@ -191,13 +191,25 @@ export class LoginDialogComponent extends Container implements Focusable {
 		this.addSectionSpacer();
 		this.addSectionTitle("手动方式");
 		this.addMutedText(prompt);
-		this.contentContainer.addChild(this.input);
+		this.addInputOnce();
 		this.inputVisible = true;
 		this.authActions?.setText(this.getAuthActionsText());
 		this.contentContainer.addChild(new Text(theme.fg("muted", keyHint("tui.select.cancel", "取消")), 0, 0));
 		this.tui.requestRender();
 
 		return this.waitForInput();
+	}
+
+	/**
+	 * Attach the manual input exactly once. A failed manual submission can fall
+	 * back to showPrompt on the same dialog (e.g. an OAuth redirect without a
+	 * code), and addChild is a plain push — a second add rendered two copies of
+	 * the input line.
+	 */
+	private addInputOnce(): void {
+		if (!this.contentContainer.children.includes(this.input)) {
+			this.contentContainer.addChild(this.input);
+		}
 	}
 
 	/**
@@ -220,7 +232,7 @@ export class LoginDialogComponent extends Container implements Focusable {
 		if (placeholder) {
 			this.contentContainer.addChild(new Text(theme.fg("muted", `例如：${placeholder}`), 0, 0));
 		}
-		this.contentContainer.addChild(this.input);
+		this.addInputOnce();
 		this.inputVisible = true;
 		this.authActions?.setText(this.getAuthActionsText());
 		this.contentContainer.addChild(

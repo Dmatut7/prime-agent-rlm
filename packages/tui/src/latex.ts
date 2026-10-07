@@ -291,6 +291,16 @@ const SPACING_COMMANDS: Record<string, string> = {
 	thickspace: " ",
 };
 
+/**
+ * Carries the deliberate multi-space gaps of quad/qquad through the
+ * source-whitespace collapse in latexToUnicode: a private-use char is not
+ * matched by `[^\S\n]`, and each sentinel expands back to one space afterwards.
+ */
+const SPACING_SENTINEL = "\uE000";
+
+/** Environments whose {cols} argument is layout-only and must not leak as text. */
+const COLUMN_SPEC_ENVIRONMENTS = new Set(["array", "tabular", "tabularx", "subarray", "alignat", "alignedat"]);
+
 /** Accent commands → combining character appended to each character. */
 const ACCENTS: Record<string, string> = {
 	hat: "̂",
@@ -656,6 +666,22 @@ class LatexParser {
 		return content;
 	}
 
+	/**
+	 * Environment layout arguments the unicode renderer has no use for: an
+	 * optional [pos] (aligned, gathered) and the {cols}/{n} group of
+	 * column-spec environments (array, tabular, alignedat, …). They used to
+	 * leak into the rendered text as literal "cc" / "2" / "[t]" prefixes.
+	 */
+	private consumeEnvironmentOptions(environment: string): void {
+		this.parseOptionalBracket();
+		if (COLUMN_SPEC_ENVIRONMENTS.has(environment)) {
+			this.parseArgument();
+			if (environment === "tabularx") {
+				this.parseArgument();
+			}
+		}
+	}
+
 	/** Render the next required argument: a braced group, or a single atom (TeX allows \frac12). */
 	private parseArgument(): string {
 		while (this.pos < this.src.length && /\s/.test(this.src[this.pos])) {
@@ -688,6 +714,11 @@ class LatexParser {
 		const ch = this.src[this.pos];
 		if (!/[a-zA-Z]/.test(ch)) {
 			this.pos++;
+			if (ch === "\\") {
+				// \\[5pt] spacing argument on the row break: drop it instead of
+				// rendering "[5pt]" after the newline.
+				this.parseOptionalBracket();
+			}
 			return ESCAPES[ch] ?? ch;
 		}
 
@@ -709,7 +740,7 @@ class LatexParser {
 		}
 		const spacing = SPACING_COMMANDS[name];
 		if (spacing !== undefined) {
-			return spacing;
+			return spacing.length > 1 ? SPACING_SENTINEL.repeat(spacing.length) : spacing;
 		}
 		if (IGNORED_COMMANDS.has(name)) {
 			if (name === "left" || name === "right") {
@@ -775,7 +806,10 @@ class LatexParser {
 			}
 			case "begin":
 			case "end": {
-				this.parseArgument(); // environment name
+				const environment = this.parseArgument(); // environment name
+				if (name === "begin") {
+					this.consumeEnvironmentOptions(environment);
+				}
 				return "";
 			}
 			case "stackrel":
@@ -824,11 +858,13 @@ class LatexParser {
  * Newlines in the source are preserved and "\\" becomes a newline, so
  * multi-line display math (aligned environments) renders on multiple lines.
  * Runs of spaces collapse to one — TeX treats source whitespace as
- * insignificant, and spacing commands otherwise leave double gaps.
+ * insignificant — while the deliberate gaps of \quad/\qquad are carried
+ * through a sentinel and re-expanded after the collapse.
  */
 export function latexToUnicode(tex: string): string {
 	return new LatexParser(tex)
 		.parse()
 		.replace(/[^\S\n]{2,}/g, " ")
-		.replace(/\n\s*\n/g, "\n");
+		.replace(/\n\s*\n/g, "\n")
+		.replace(/\uE000/g, " ");
 }

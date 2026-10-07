@@ -3,6 +3,7 @@ import { fuzzyFilter } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { formatNoModelsAvailableMessage } from "../core/auth-guidance.js";
 import type { ModelRegistry } from "../core/model-registry.js";
+import { writeRawStdout } from "../core/output-guard.js";
 
 function formatTokenCount(count: number): string {
 	if (count >= 1_000_000) {
@@ -25,7 +26,7 @@ export async function listModels(modelRegistry: ModelRegistry, searchPattern?: s
 	const models = await modelRegistry.refreshAvailableModels();
 
 	if (models.length === 0) {
-		console.log(formatNoModelsAvailableMessage());
+		writeRawStdout(`${formatNoModelsAvailableMessage()}\n`);
 		return;
 	}
 
@@ -35,7 +36,7 @@ export async function listModels(modelRegistry: ModelRegistry, searchPattern?: s
 	}
 
 	if (filteredModels.length === 0) {
-		console.log(`No models matching "${searchPattern}"`);
+		writeRawStdout(`No models matching "${searchPattern}"\n`);
 		return;
 	}
 
@@ -80,8 +81,7 @@ export async function listModels(modelRegistry: ModelRegistry, searchPattern?: s
 		headers.thinking.padEnd(widths.thinking),
 		headers.images.padEnd(widths.images),
 	].join("  ");
-	console.log(headerLine);
-
+	writeRawStdout(`${headerLine}\n`);
 	for (const row of rows) {
 		const line = [
 			row.provider.padEnd(widths.provider),
@@ -91,6 +91,6 @@ export async function listModels(modelRegistry: ModelRegistry, searchPattern?: s
 			row.thinking.padEnd(widths.thinking),
 			row.images.padEnd(widths.images),
 		].join("  ");
-		console.log(line);
+		writeRawStdout(`${line}\n`);
 	}
 }

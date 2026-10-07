@@ -81,6 +81,18 @@ describe("turn strip change attribution", () => {
 		expect(text).not.toContain("改了 1 个文件");
 	});
 
+	it("fits a complete short ambient wording at narrow widths instead of an ellipsis", () => {
+		// The fitting budget used to ignore the "◇ " glyph and the expand
+		// caret, so the short form "另有 1 个变动" (which fits) was replaced
+		// by "工作区另有 1…" at width 36.
+		const { component } = strip(
+			facts({ ambientChanges: [file({ key: "/w/ext.ts", path: "ext.ts", origin: "ambient" })] }),
+		);
+		const text = plain(component.render(36)).join("\n");
+		expect(text).toContain("另有 1 个变动");
+		expect(text).not.toContain("…");
+	});
+
 	it("counts only this session's files in the head when both kinds are present", () => {
 		const { component } = strip(
 			facts({

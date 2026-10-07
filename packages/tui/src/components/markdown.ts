@@ -728,6 +728,14 @@ interface InlineStyleContext {
 }
 
 /**
+ * How a rendered list-item line relates to its parent bullet:
+ * - "text": plain item content, gets the bullet and the parent indent
+ * - "nested": produced by a nested list, already carries its own indent/bullet
+ * - "block": block content (table, blockquote, code, …) rendered under the item
+ */
+type ListItemLineKind = "text" | "nested" | "block";
+
+/**
  * Whether a fenced code token's raw contains its closing fence. marked ends a
  * fenced code token at the closing fence line, so the closer can only be the
  * raw's final line: up to 3 leading spaces, a run of the opener's fence
@@ -2021,7 +2029,7 @@ export class Markdown implements Component {
 		const target = items.length - 1;
 		if (target > seal.count) {
 			const extension = this.renderTokenLinesToBlockLines(
-				this.renderListItems(token, 0, seal.count, target),
+				this.renderListItems(token, 0, seal.count, target, undefined, width),
 				width,
 				contentWidth,
 			);
@@ -2039,7 +2047,7 @@ export class Markdown implements Component {
 			seal.count = target;
 		}
 		const tailLines = this.renderTokenLinesToBlockLines(
-			this.renderListItems(token, 0, seal.count, items.length),
+			this.renderListItems(token, 0, seal.count, items.length, undefined, width),
 			width,
 			contentWidth,
 		);
@@ -2214,7 +2222,7 @@ export class Markdown implements Component {
 			}
 
 			case "list": {
-				const listLines = this.renderList(token as Tokens.List, 0, styleContext);
+				const listLines = this.renderList(token as Tokens.List, 0, styleContext, width);
 				lines.push(...listLines);
 				break;
 			}
@@ -2403,8 +2411,8 @@ export class Markdown implements Component {
 	/**
 	 * Render a list with proper nesting support
 	 */
-	private renderList(token: Tokens.List, depth: number, styleContext?: InlineStyleContext): string[] {
-		return this.renderListItems(token, depth, 0, token.items.length, styleContext);
+	private renderList(token: Tokens.List, depth: number, styleContext?: InlineStyleContext, width = 80): string[] {
+		return this.renderListItems(token, depth, 0, token.items.length, styleContext, width);
 	}
 
 	/**
@@ -2418,6 +2426,7 @@ export class Markdown implements Component {
 		fromItem: number,
 		toItem: number,
 		styleContext?: InlineStyleContext,
+		width = 80,
 	): string[] {
 		const lines: string[] = [];
 		const indent = "  ".repeat(depth);
@@ -2428,25 +2437,20 @@ export class Markdown implements Component {
 			const item = token.items[i];
 			const bullet = token.ordered ? `${startNumber + i}. ` : "- ";
 
-			const itemLines = this.renderListItem(item.tokens || [], depth, styleContext);
+			const { lines: itemLines, kinds } = this.renderListItem(item.tokens || [], depth, width, styleContext);
 
 			if (itemLines.length > 0) {
-				// A nested list will start with indent (spaces) followed by cyan bullet
-				const firstLine = itemLines[0];
-				const isNestedList = /^\s+\x1b\[36m[-\d]/.test(firstLine); // starts with spaces + cyan + bullet char
-
-				if (isNestedList) {
-					lines.push(firstLine);
-				} else {
-					lines.push(indent + this.theme.listBullet(bullet) + firstLine);
-				}
-
-				for (let j = 1; j < itemLines.length; j++) {
-					const line = itemLines[j];
-					const isNestedListLine = /^\s+\x1b\[36m[-\d]/.test(line); // starts with spaces + cyan + bullet char
-
-					if (isNestedListLine) {
+				for (const [j, line] of itemLines.entries()) {
+					if (kinds[j] === "nested") {
+						// A nested list line already carries its own indent and bullet.
 						lines.push(line);
+					} else if (j === 0 && kinds[j] !== "block") {
+						lines.push(indent + this.theme.listBullet(bullet) + line);
+					} else if (j === 0) {
+						// Block content opening the item: keep the bullet visible on its own
+						// line, then render the block indented under it.
+						lines.push(indent + this.theme.listBullet(bullet.trimEnd()));
+						lines.push(`${indent}  ${line}`);
 					} else {
 						lines.push(`${indent}  ${line}`);
 					}
@@ -2461,17 +2465,29 @@ export class Markdown implements Component {
 
 	/**
 	 * Render list item tokens, handling nested lists
-	 * Returns lines WITHOUT the parent indent (renderList will add it)
+	 * Returns lines WITHOUT the parent indent (renderList will add it), plus the
+	 * kind of each line so the caller can tell nested-list lines (which already
+	 * carry their own indent and bullet) and block content (indented without a
+	 * bullet) apart from plain text.
 	 */
-	private renderListItem(tokens: Token[], parentDepth: number, styleContext?: InlineStyleContext): string[] {
+	private renderListItem(
+		tokens: Token[],
+		parentDepth: number,
+		width = 80,
+		styleContext?: InlineStyleContext,
+	): { lines: string[]; kinds: ListItemLineKind[] } {
 		const lines: string[] = [];
+		const kinds: ListItemLineKind[] = [];
 
 		for (const token of tokens) {
 			if (token.type === "list") {
 				// Nested list - render with one additional indent level
 				// These lines will have their own indent, so we just add them as-is
-				const nestedLines = this.renderList(token as Tokens.List, parentDepth + 1, styleContext);
-				lines.push(...nestedLines);
+				const nestedLines = this.renderList(token as Tokens.List, parentDepth + 1, styleContext, width);
+				for (const line of nestedLines) {
+					lines.push(line);
+					kinds.push("nested");
+				}
 			} else if (token.type === "text") {
 				// Text content (may have inline tokens)
 				const text =
@@ -2479,26 +2495,41 @@ export class Markdown implements Component {
 						? this.renderInlineTokens(token.tokens, styleContext)
 						: token.text || "";
 				lines.push(text);
+				kinds.push("text");
 			} else if (token.type === "paragraph") {
 				// Paragraph in list item
 				const text = this.renderInlineTokens(token.tokens || [], styleContext);
 				lines.push(text);
+				kinds.push("text");
 			} else if (token.type === "code") {
 				// Code block in list item
-				lines.push(...this.renderCodeBlock(token));
+				for (const line of this.renderCodeBlock(token)) {
+					lines.push(line);
+					kinds.push("block");
+				}
 			} else if (token.type === "blockMath") {
 				// Display math in list item
-				lines.push(...this.renderMathBlock(token as unknown as MathToken));
+				for (const line of this.renderMathBlock(token as unknown as MathToken)) {
+					lines.push(line);
+					kinds.push("block");
+				}
 			} else {
-				// Other token types - try to render as inline
-				const text = this.renderInlineTokens([token], styleContext);
-				if (text) {
-					lines.push(text);
+				// Other block content (tables, blockquotes, headings, hr, …) used to
+				// fall through renderInlineTokens, which only reads `token.text` —
+				// table tokens carry none, so entire tables silently vanished. Render
+				// them with the regular token renderer instead.
+				const blockLines = this.renderToken(token, width, undefined, styleContext);
+				while (blockLines.length > 0 && blockLines[blockLines.length - 1] === "") {
+					blockLines.pop();
+				}
+				for (const line of blockLines) {
+					lines.push(line);
+					kinds.push("block");
 				}
 			}
 		}
 
-		return lines;
+		return { lines, kinds };
 	}
 
 	private renderCodeBlock(token: Token): string[] {

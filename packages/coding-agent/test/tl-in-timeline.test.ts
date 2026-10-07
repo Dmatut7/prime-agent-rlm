@@ -723,6 +723,30 @@ describe("a line's lane comes from where it sits relative to the dispatch", () =
 		expect(laneOf(second, "都回来了")).toBe(" ");
 	});
 
+	it("settles the lane when a terminal snapshot flips the entry, without the report row", () => {
+		// Resync/replay learns "done" from the snapshot while the queued report
+		// has not been delivered; the "还在干活" lane tail used to outlive the
+		// entry it describes until the report finally rendered.
+		const turn = quietTurn(false);
+		const tracker = new TimelineLaneTracker();
+		turn.summary.setLaneTracker(tracker);
+		say(turn, T0, "派两个代理。", [{ id: "c1", command: "git branch" }]);
+		turn.timeline.upsertSubagent({ childId: "a", name: "A", label: "A 任务", status: "running" }, T0 + MINUTE);
+		turn.timeline.upsertSubagent({ childId: "b", name: "B", label: "B 任务", status: "running" }, T0 + MINUTE);
+		say(turn, T0 + 2 * MINUTE, "趁它们干活，我自己检查。", [{ id: "c3", command: "npx tsgo" }]);
+		expect(tracker.active).toBe(true);
+		expect(tracker.pending).toEqual(["A", "B"]);
+
+		// No tracker.reported call: the snapshot flip alone must settle the lane.
+		turn.timeline.upsertSubagent({ childId: "a", name: "A", status: "done" }, T0 + 4 * MINUTE);
+		turn.timeline.upsertSubagent({ childId: "b", name: "B", status: "done" }, T0 + 5 * MINUTE);
+
+		expect(tracker.active).toBe(false);
+		expect(tracker.pending).toEqual([]);
+		const lines = plain(turn.summary.render(WIDTH));
+		expect(lines.some((line) => line.includes("还在干活"))).toBe(false);
+	});
+
 	it("starts a woken turn in the lane its tracker was in when the turn began", () => {
 		const tracker = new TimelineLaneTracker();
 		tracker.spawned(["Z"], undefined, T0 - MINUTE);

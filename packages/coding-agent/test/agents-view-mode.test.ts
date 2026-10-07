@@ -1125,12 +1125,15 @@ describe("AgentsViewMode", () => {
 			const byId = (sessionId: string, kind?: string) =>
 				rows.find((row) => row.summary.sessionId === sessionId && (!kind || row.kind === kind));
 
-			// Shared per-section layout: every column right-aligned to
-			// max(widest section value, legend label width).
-			expect(line(byId("spender-session"))).toContain("↑12k ↓1.2k · $0.42 ·      1 · $1.10 ·");
-			expect(line(byId("spender-child-session", "subagent"))).toContain("↑500   ↓50 · $0.68 ·      0 · $0.68 ·");
+			// Shared layout across sections: every column right-aligned to
+			// max(widest value in any section, legend label width), so the separators
+			// line up down the whole list, not just inside one section.
+			expect(line(byId("spender-session"))).toContain("↑12k ↓1.2k · ¥0.42 ·      1 · ¥1.10 ·");
+			expect(line(byId("spender-child-session", "subagent"))).toContain("↑500   ↓50 · ¥0.68 ·      0 · ¥0.68 ·");
 			const inactiveLine = line(byId("saved-only-session"));
-			expect(inactiveLine).toContain("↑0  ↓0 · $0.00 ·      0 · $0.00 ·");
+			// Shared widths: the token columns pad against the idle section's
+			// wider values, so the separators line up down the whole list.
+			expect(inactiveLine).toContain("↑0    ↓0 · ¥0.00 ·      0 · ¥0.00 ·");
 			expect(inactiveLine).not.toContain("7 ·");
 			// The ` · ` separators land in the same column for the legend and every
 			// row of its section.
@@ -1155,12 +1158,13 @@ describe("AgentsViewMode", () => {
 			// Empty sessions keep the age but drop the whole usage segment.
 			const emptyLine = line(byId("empty-draft-session"));
 			expect(emptyLine).not.toContain("↑");
+			expect(emptyLine).not.toContain("¥");
 			expect(emptyLine).not.toContain("$");
 			expect(emptyLine).toMatch(/\d+[smhd]\s*$/);
 			// Without a shared layout the row pads only against its own section of one.
 			const bare = { ...byId("spender-session")!, summary: { ...parent, usage: undefined } };
 			expect(stripAnsi(invoke("renderRow", view, bare, 200) as string)).toContain(
-				" ↑0  ↓0 · $0.00 ·      1 · $1.10 ·",
+				" ↑0  ↓0 · ¥0.00 ·      1 · ¥1.10 ·",
 			);
 		} finally {
 			stopThemeWatcher();

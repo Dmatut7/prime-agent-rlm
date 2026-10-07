@@ -63,6 +63,15 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 	}
 
 	if (!PUBLIC_COMMAND_NAMES.has(command)) {
+		// Flags can lead a command invocation (`prime-agent --help list`): when
+		// the first word is a flag and the one message word names a command
+		// exactly, treat that word as the command — the typo guard below used
+		// to kill these as "Unknown command" even though the word is spelled
+		// perfectly.
+		const redirect = redirectFlagLeadingCommand(args);
+		if (redirect) {
+			return await runPublicCommand(redirect);
+		}
 		return rejectBareCommandTypo(args);
 	}
 	if (command === "update" && process.env[SELF_UPDATE_INTERACTIVE_CHILD_ENV] === "1") {
@@ -230,18 +239,55 @@ function rejectBareCommandTypo(args: string[]): PublicCommandResult {
 		return continueWith(args);
 	}
 	const parsed = parseArgs(args);
+	// A meta flag answers before any prompt does (main.ts prints the version or
+	// help); a lone trailing word must not turn that into "Unknown command".
+	if (parsed.help || parsed.version) {
+		return continueWith(args);
+	}
 	if (parsed.fileArgs.length > 0 || parsed.messages.length !== 1) {
 		return continueWith(args);
 	}
 	const word = parsed.messages[0]!;
 	const suggestion = findCommandSuggestion(word, [...PUBLIC_COMMAND_NAMES]);
-	if (suggestion === undefined) {
+	if (suggestion === undefined || suggestion === word) {
+		// An exact hit means the word is a legal command that simply follows a
+		// flag; it stays a prompt (or the redirect above already handled it),
+		// never an "Unknown command".
 		return continueWith(args);
 	}
 	return fail(
 		`Unknown command: ${word}`,
 		`Did you mean "${APP_NAME} ${suggestion}"? Run "${APP_NAME} help" to list commands, or pass a prompt after "--".`,
 	);
+}
+
+/**
+ * `prime-agent --help list` and friends: flags led the invocation and the single
+ * message word names a command exactly. Return the args reordered so the command
+ * word leads and the flags follow it, or undefined when the shape does not match
+ * (multi-word messages, file args, prompt-intent flags, or a literal `--`).
+ */
+function redirectFlagLeadingCommand(args: string[]): string[] | undefined {
+	if (!args[0]!.startsWith("-") || args.includes("--")) {
+		return undefined;
+	}
+	if (args.some((arg) => arg === "-p" || arg === "--print" || arg === "--mode" || arg.startsWith("--mode="))) {
+		return undefined;
+	}
+	const parsed = parseArgs(args);
+	if (parsed.fileArgs.length > 0 || parsed.messages.length !== 1) {
+		return undefined;
+	}
+	// `--version list` prints the version (main.ts answers meta flags before
+	// dispatching commands); only help benefits from the command-word redirect.
+	if (parsed.version) {
+		return undefined;
+	}
+	const word = parsed.messages[0]!;
+	if (!PUBLIC_COMMAND_NAMES.has(word)) {
+		return undefined;
+	}
+	return [word, ...args.filter((arg) => arg !== word)];
 }
 
 function printRequestedHelp(path: string[]): PublicCommandResult {

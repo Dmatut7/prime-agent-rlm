@@ -694,6 +694,14 @@ export class TurnTimeline implements LaneOwner {
 			// A key that only shows up after the first sight puts the running subagent on the lane then.
 			const nowLane = existing.sub.laneName ?? existing.sub.name;
 			if (wasOffLane && nowLane && existing.sub.status === "running") this.laneTracker?.spawned([nowLane], this);
+			// A terminal snapshot settles the lane too. The report row reaching the
+			// chat is not the only way a subagent finishes: on resync/replay the
+			// parent can learn "done" from the snapshot while the queued report has
+			// not been delivered yet, and the "还在干活" lane tail must not outlive
+			// the timeline entry it describes.
+			if (wasRunning && existing.sub.status !== "running" && nowLane) {
+				this.laneTracker?.reported(nowLane, now);
+			}
 		} else {
 			this.entries.push({
 				seq: this.nextSeq(),

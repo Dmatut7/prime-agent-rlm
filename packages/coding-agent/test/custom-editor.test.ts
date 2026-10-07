@@ -245,6 +245,24 @@ describe("CustomEditor", () => {
 		}
 	});
 
+	it("follows setPaddingX for the placeholder row after a runtime padding change", () => {
+		// The placeholder row used to read a constructor-time snapshot, so a
+		// runtime setPaddingX moved the body's left edge but not the placeholder's.
+		const runtime = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager(), {
+			placeholder: "type to start",
+		});
+		runtime.focused = true;
+		runtime.setPaddingX(2);
+
+		const reference = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager(), {
+			paddingX: 2,
+			placeholder: "type to start",
+		});
+		reference.focused = true;
+
+		expect(runtime.render(40)[1]).toBe(reference.render(40)[1]);
+	});
+
 	it("keeps the placeholder caret on the input row below a header", () => {
 		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager(), {
 			placeholder: "reply to agent",

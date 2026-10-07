@@ -188,6 +188,18 @@ const ThemeJsonSchema = Type.Object({
 
 type ThemeJson = Static<typeof ThemeJsonSchema>;
 
+/**
+ * The color keys a theme cannot omit, derived from the schema (everything the
+ * builder does not mark `~optional`). The lazy validator cannot run during
+ * startup's first parse, so the minimal structural check leans on this list to
+ * refuse a broken theme before its first render crashes on a missing token.
+ */
+const REQUIRED_THEME_COLOR_KEYS: readonly string[] = Object.entries(
+	(ThemeJsonSchema.properties as { colors: { properties: Record<string, unknown> } }).colors.properties,
+)
+	.filter(([, schema]) => !Object.hasOwn(schema as object, "~optional"))
+	.map(([key]) => key);
+
 // typebox/compile costs ~300ms to import, so the theme validator loads lazily.
 // Built-in themes never validate; custom themes get a minimal structural check
 // until the validator is ready (preloaded from initTheme), after which full
@@ -828,10 +840,24 @@ function parseThemeJson(label: string, json: unknown): ThemeJson {
 	if (!validateThemeJson) {
 		// Validator not loaded yet (first custom-theme parse during startup):
 		// apply a minimal structural check now and report full schema errors
-		// asynchronously once the validator is ready.
+		// asynchronously once the validator is ready. The minimal check must
+		// still refuse a theme whose first render would crash: every required
+		// color present, every value a string or a 0-255 integer.
 		const colors = (json as Partial<ThemeJson> | null)?.colors;
 		if (!json || typeof json !== "object" || !colors || typeof colors !== "object") {
 			throw new Error(`Invalid theme "${label}": expected a JSON object with a "colors" object`);
+		}
+		const missing = REQUIRED_THEME_COLOR_KEYS.filter((key) => !(key in colors));
+		if (missing.length > 0) {
+			throw new Error(`Invalid theme "${label}": missing required color tokens: ${missing.join(", ")}`);
+		}
+		for (const [key, value] of Object.entries(colors)) {
+			if (
+				typeof value !== "string" &&
+				!(typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 255)
+			) {
+				throw new Error(`Invalid theme "${label}": color "${key}" must be a hex string or a 0-255 index`);
+			}
 		}
 		void preloadThemeValidator().then(() => {
 			try {
@@ -1143,8 +1169,9 @@ onDefaultTerminalColorsChange(() => {
 			try {
 				setGlobalTheme(loadTheme(name));
 			} catch {
-				currentThemeName = "dark";
-				setGlobalTheme(loadTheme("dark"));
+				const fallback = getDefaultTheme();
+				currentThemeName = fallback;
+				setGlobalTheme(loadTheme(fallback));
 			}
 		}
 	}
@@ -1191,10 +1218,12 @@ export function initTheme(themeName?: string, enableWatcher: boolean = false): v
 			startThemeWatcher();
 		}
 	} catch (_error) {
-		// Theme is invalid - fall back to dark theme silently
-		currentThemeName = "dark";
-		setGlobalTheme(loadTheme("dark"));
-		// Don't start watcher for fallback theme
+		// Theme is invalid - fall back to the terminal-appropriate default (a
+		// hardcoded dark makes every foreground token unreadable on a light
+		// terminal). Don't start the watcher for the fallback theme.
+		const fallback = getDefaultTheme();
+		currentThemeName = fallback;
+		setGlobalTheme(loadTheme(fallback));
 	}
 }
 
@@ -1211,10 +1240,12 @@ export function setTheme(name: string, enableWatcher: boolean = false): { succes
 		}
 		return { success: true };
 	} catch (error) {
-		// Theme is invalid - fall back to dark theme
-		currentThemeName = "dark";
-		setGlobalTheme(loadTheme("dark"));
-		// Don't start watcher for fallback theme
+		// Theme is invalid - fall back to the terminal-appropriate default (a
+		// hardcoded dark makes every foreground token unreadable on a light
+		// terminal). Don't start the watcher for the fallback theme.
+		const fallback = getDefaultTheme();
+		currentThemeName = fallback;
+		setGlobalTheme(loadTheme(fallback));
 		return {
 			success: false,
 			error: error instanceof Error ? error.message : String(error),

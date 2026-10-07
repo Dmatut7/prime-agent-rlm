@@ -79,6 +79,27 @@ describe("latexToUnicode", () => {
 		assert.strictEqual(latexToUnicode("\\int_0^1 x^2 \\, dx = \\frac{1}{3}"), "∫₀¹ x² dx = ⅓");
 	});
 
+	it("preserves the deliberate gap of \\quad and \\qquad", () => {
+		// The source-whitespace collapse used to eat these too, making
+		// \quad and \qquad indistinguishable from \,.
+		assert.strictEqual(latexToUnicode("a \\quad b"), "a    b");
+		assert.strictEqual(latexToUnicode("a \\qquad b"), "a      b");
+		assert.strictEqual(latexToUnicode("a \\, b"), "a b");
+	});
+
+	it("swallows environment column specs instead of rendering them", () => {
+		// {cc}/{l|r}/{2} are layout arguments; they used to leak as literal
+		// text in front of the first row.
+		assert.strictEqual(latexToUnicode("\\begin{array}{cc} a & b \\\\ c & d \\end{array}").trim(), "a b \n c d");
+		assert.strictEqual(latexToUnicode("\\begin{tabular}{l|r} a & b \\end{tabular}").trim(), "a b");
+		assert.strictEqual(latexToUnicode("\\begin{alignedat}{2} x &= 1 \\end{alignedat}").trim(), "x = 1");
+	});
+
+	it("swallows the optional position of aligned and the row-spacing argument of \\\\", () => {
+		assert.strictEqual(latexToUnicode("\\begin{aligned}[t] x &= 1 \\end{aligned}").trim(), "x = 1");
+		assert.strictEqual(latexToUnicode("a = b \\\\[5pt] c = d").trim(), "a = b \n c = d");
+	});
+
 	it("renders matrix environments as rows", () => {
 		assert.strictEqual(latexToUnicode("\\begin{pmatrix}\n1 & 2 \\\\\n3 & 4\n\\end{pmatrix}").trim(), "1 2 \n3 4");
 	});

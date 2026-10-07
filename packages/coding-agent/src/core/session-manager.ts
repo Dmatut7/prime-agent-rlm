@@ -75,6 +75,7 @@ import {
 	writeCachedSessionInfo,
 } from "./session-info-disk-cache.js";
 import { acquireSessionLeaseAsync, SESSION_LEASES_ENABLED_ENV } from "./session-lease.js";
+import { sanitizeSessionName } from "./session-names.js";
 import { resolveCompleteToolPairLeaf } from "./session-tool-pair.js";
 import {
 	addAssistantUsage,
@@ -3975,7 +3976,9 @@ export class SessionManager {
 		for (let i = this.fileEntries.length - 1; i >= 0; i--) {
 			const entry = this.fileEntries[i];
 			if (entry.type === "session_info") {
-				return entry.name?.trim() || undefined;
+				// The name persisted before this guard existed can still carry
+				// control characters; strip them on the way out too.
+				return sanitizeSessionName(entry.name ?? "").trim() || undefined;
 			}
 		}
 		return undefined;

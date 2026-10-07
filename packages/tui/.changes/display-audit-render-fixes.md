@@ -1,0 +1,5 @@
+- Fixed overwide lines wrapping and corrupting the whole frame on full renders (first frame, resize, viewport-preserving redraw): they are now clamped and logged like the diff path always did, and every clamp re-attaches the trailing style/link reset so a clamped row can no longer bleed its background color or hyperlink into the row below.
+- Fixed nested markdown lists rendering with compounding indentation (4, 10, 22… columns per level) under production themes: nesting is now detected structurally instead of by a chalk-specific cyan escape code.
+- Fixed GFM tables, blockquotes, and headings inside list items vanishing or echoing raw markdown: they render as block content under the item.
+- Fixed `\quad`/`\qquad` LaTeX spacing collapsing to a single space, and environment layout arguments (`{cc}`, `{2}`, `[t]`, `\\[5pt]`) leaking as visible text.
+- Fixed the terminal title sequence accepting control characters: names carrying BEL/ESC can no longer splice escape sequences (including clipboard writes) into the terminal.

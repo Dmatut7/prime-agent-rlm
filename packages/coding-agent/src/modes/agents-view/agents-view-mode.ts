@@ -54,6 +54,7 @@ import { BrandSplashHeader, InteractiveMode } from "../interactive/interactive-m
 import type { InteractiveModeUiServices } from "../interactive/interactive-mode-services.js";
 import { ClientPromptStashStore } from "../interactive/prompt-stash-state.js";
 import type { ResumeHintConnection } from "../interactive/resume-hint.js";
+import { formatSpendCost } from "../interactive/spend-format.js";
 import {
 	getEditorTheme,
 	initTheme,
@@ -3263,7 +3264,9 @@ export class AgentsViewMode implements Component, Focusable {
 			formatRightTableCell(details, detailsWidth),
 		];
 		const base = `${indent}${cells[0]} ${heartbeatCell ? `${heartbeatCell} ` : ""}${cells[1]} ${cells[2]}`;
-		const line = padLine(truncateToWidth(base, width, ""), width);
+		// Truncate with an ellipsis: a bare cut made a half number ("$12", "13h")
+		// look like data, and the "更新" column vanish with no signal.
+		const line = padLine(truncateToWidth(base, width, "…"), width);
 		return markRow(line);
 	}
 
@@ -3576,16 +3579,17 @@ const AGENTS_VIEW_USAGE_COLUMNS = Object.keys(AGENTS_VIEW_USAGE_LABELS) as (keyo
 export interface AgentsViewUsageLayout {
 	/** Legend line per section, padded to that section's column widths. */
 	legends: ReadonlyMap<AgentsViewSection, string>;
-	/** Details string per row identity, padded to its section's column widths. */
+	/** Details string per row identity, padded to the shared column widths. */
 	details: ReadonlyMap<string, string>;
 }
 
 /**
- * One shared column layout per section for the header legend and every row:
- * each column is as wide as the section's widest value or its legend label,
- * everything right-aligned, so the ` · ` separators land in the same terminal
- * column for the legend and every row. Empty sessions render only the age,
- * aligned to the age column.
+ * One shared column layout for the header legend and every row in every
+ * section: each column is as wide as the widest value across all sections or
+ * its legend label, everything right-aligned, so the ` · ` separators land in
+ * the same terminal column for the legends and every row — including across
+ * section blocks. Empty sessions render only the age, aligned to the age
+ * column.
  */
 export function buildAgentsViewUsageLayout(rows: readonly AgentsViewRow[]): AgentsViewUsageLayout {
 	const rowsBySection = new Map<AgentsViewSection, AgentsViewRow[]>();
@@ -3610,6 +3614,10 @@ export function buildAgentsViewUsageLayout(rows: readonly AgentsViewRow[]): Agen
 					formatAgentsViewDurationMs(resolveAgentsViewSessionDurationMs(row.summary)) !== ""),
 		),
 	);
+	const sectionEntries = new Map<
+		AgentsViewSection,
+		{ identity: string; empty: boolean; parts: AgentsViewUsageParts }[]
+	>();
 	for (const section of ["running", "idle", "inactive"] as const) {
 		const entries = (rowsBySection.get(section) ?? []).map((row) => {
 			const usage = row.summary.usage;
@@ -3618,40 +3626,43 @@ export function buildAgentsViewUsageLayout(rows: readonly AgentsViewRow[]): Agen
 				dur: formatAgentsViewDurationMs(resolveAgentsViewSessionDurationMs(row.summary)),
 				inTokens: `↑${formatTokenCount(usage?.inputTokens ?? 0)}`,
 				outTokens: `↓${formatTokenCount(usage?.outputTokens ?? 0)}`,
-				agentCost: `$${(usage?.cost ?? 0).toFixed(2)}`,
+				agentCost: formatSpendCost(usage?.cost ?? 0),
 				count: String(row.descendantCount),
-				totalCost: `$${row.recursiveCost.toFixed(2)}`,
+				totalCost: formatSpendCost(row.recursiveCost),
 				age: formatSessionDuration(row.summary),
 			};
 			return { identity: row.identity, empty: isEmptyAgentsViewSession(row.summary), parts };
 		});
-		// U3 degradation: when no row in the section carries settled/duration facts
-		// (an older daemon, or a summary without the optional fields), the state
-		// columns collapse entirely instead of spending width on blank cells - the
-		// responsive tail (model/effort ahead of summaries, age last) keeps the
-		// column budget the 502 pins expect.
-		const widths = {} as Record<keyof AgentsViewUsageParts, number>;
-		for (const column of AGENTS_VIEW_USAGE_COLUMNS) {
-			if (!hasStateColumns && (column === "set" || column === "dur")) continue;
-			let width = visibleWidth(AGENTS_VIEW_USAGE_LABELS[column]);
+		sectionEntries.set(section, entries);
+	}
+	// The column widths are shared across sections: per-section widths made the
+	// separators drift between blocks (up to 8 columns), so a value lined up
+	// under the wrong header when reading down the list.
+	const widths = {} as Record<keyof AgentsViewUsageParts, number>;
+	for (const column of AGENTS_VIEW_USAGE_COLUMNS) {
+		if (!hasStateColumns && (column === "set" || column === "dur")) continue;
+		let width = visibleWidth(AGENTS_VIEW_USAGE_LABELS[column]);
+		for (const entries of sectionEntries.values()) {
 			for (const entry of entries) {
 				// Empty sessions render no usage segment; only their age takes space.
 				if (entry.empty && column !== "age") continue;
 				width = Math.max(width, visibleWidth(entry.parts[column]));
 			}
-			widths[column] = width;
 		}
-		const pad = (parts: AgentsViewUsageParts, column: keyof AgentsViewUsageParts): string =>
-			padCellStart(parts[column], widths[column]);
-		const formatLine = (parts: AgentsViewUsageParts): string =>
-			[
-				...(hasStateColumns ? [pad(parts, "set"), pad(parts, "dur")] : []),
-				`${pad(parts, "inTokens")} ${pad(parts, "outTokens")}`,
-				pad(parts, "agentCost"),
-				pad(parts, "count"),
-				pad(parts, "totalCost"),
-				pad(parts, "age"),
-			].join(" · ");
+		widths[column] = width;
+	}
+	const pad = (parts: AgentsViewUsageParts, column: keyof AgentsViewUsageParts): string =>
+		padCellStart(parts[column], widths[column]);
+	const formatLine = (parts: AgentsViewUsageParts): string =>
+		[
+			...(hasStateColumns ? [pad(parts, "set"), pad(parts, "dur")] : []),
+			`${pad(parts, "inTokens")} ${pad(parts, "outTokens")}`,
+			pad(parts, "agentCost"),
+			pad(parts, "count"),
+			pad(parts, "totalCost"),
+			pad(parts, "age"),
+		].join(" · ");
+	for (const [section, entries] of sectionEntries) {
 		legends.set(section, formatLine(AGENTS_VIEW_USAGE_LABELS));
 		for (const entry of entries) {
 			details.set(entry.identity, entry.empty ? pad(entry.parts, "age") : formatLine(entry.parts));

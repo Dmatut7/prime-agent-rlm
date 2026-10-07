@@ -259,6 +259,7 @@ import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
 import { CustomMessageComponent } from "./components/custom-message.js";
 import { DaxnutsComponent } from "./components/daxnuts.js";
+import { sanitizeDisplayText } from "./components/diff-rows.js";
 import { DutyLogBlock } from "./components/duty-log-block.js";
 import { DynamicBorder } from "./components/dynamic-border.js";
 import { EarendilAnnouncementComponent } from "./components/earendil-announcement.js";
@@ -524,9 +525,12 @@ const QUEUED_MESSAGE_LABELS = { Steering: "插话", "Follow-up": "稍后发送" 
 
 export function formatQueuedMessagePreview(message: string, label: "Steering" | "Follow-up"): string {
 	for (const [prefix, display] of LABELED_QUEUED_PREVIEWS) {
-		if (message.startsWith(prefix)) return `${display}${message.slice(prefix.length)}`;
+		if (message.startsWith(prefix)) return `${display}${sanitizeDisplayLine(message.slice(prefix.length))}`;
 	}
-	return `${QUEUED_MESSAGE_LABELS[label]}：${message}`;
+	// The preview renders other sessions' and child agents' raw text (a queued
+	// message can quote ANSI-bearing command output); strip control characters
+	// before it reaches the single-row TruncatedText.
+	return `${QUEUED_MESSAGE_LABELS[label]}：${sanitizeDisplayLine(message)}`;
 }
 
 export function styleQueuedMessagePreview(
@@ -534,11 +538,12 @@ export function styleQueuedMessagePreview(
 	label: "Steering" | "Follow-up",
 	isRecognizedSlashCommand: (name: string) => boolean,
 ): string {
-	const preview = formatQueuedMessagePreview(message, label);
+	const clean = sanitizeDisplayLine(message);
+	const preview = formatQueuedMessagePreview(clean, label);
 	const styleDim = (segment: string) => theme.fg("dim", segment);
-	if (!isLeadingSlashCommand(message, isRecognizedSlashCommand)) return styleArgumentTokens(preview, styleDim);
-	const prefix = preview.slice(0, preview.length - message.length);
-	return `${theme.fg("dim", prefix)}${styleSlashCommandText(message, (rest, includeBareSeparator) =>
+	if (!isLeadingSlashCommand(clean, isRecognizedSlashCommand)) return styleArgumentTokens(preview, styleDim);
+	const prefix = preview.slice(0, preview.length - clean.length);
+	return `${theme.fg("dim", prefix)}${styleSlashCommandText(clean, (rest, includeBareSeparator) =>
 		styleArgumentTokens(rest, styleDim, includeBareSeparator),
 	)}`;
 }
@@ -559,6 +564,17 @@ function quietConversation(mode: object): boolean {
 		? (mode as { settingsManager?: ProcessModeReader }).settingsManager
 		: undefined;
 	return (services?.settingsManager ?? own)?.getProcessMode?.() === "quiet";
+}
+
+/**
+ * Chat-level status and error text comes from provider/daemon/child-session
+ * failures whose raw messages can embed terminal escapes (a full SSE frame, an
+ * OAuth response body). It lands in single-row components: strip control
+ * characters and collapse to one line at this central door instead of relying
+ * on every call site to pre-clean its text.
+ */
+function sanitizeDisplayLine(text: string): string {
+	return sanitizeDisplayText(text).replace(/\s+/g, " ").trim();
 }
 
 function isExpandable(obj: unknown): obj is Expandable {
@@ -7666,6 +7682,7 @@ export class InteractiveMode {
 			}
 		}
 		this.refreshSubagentSummary();
+		this.reconcileSubagentTimeline(children);
 	}
 
 	private replaceSubagentSummary(children: readonly AgentConnectionRlmChildAgentSnapshot[] | undefined): void {
@@ -7677,6 +7694,22 @@ export class InteractiveMode {
 		}
 		this.subagentSnapshots = next;
 		this.refreshSubagentSummary();
+		this.reconcileSubagentTimeline(children);
+	}
+
+	/**
+	 * The snapshot is the authority on whether a subagent is still out. The chip
+	 * bar used to be the only surface it reached: replay seeds timeline entries
+	 * as "running" and the lane tail kept saying "还在干活" for a child that had
+	 * long since settled, until its report was delivered. Reconcile the turn
+	 * timelines (and, through them, the lanes) from the same snapshot.
+	 */
+	private reconcileSubagentTimeline(children: readonly AgentConnectionRlmChildAgentSnapshot[] | undefined): void {
+		if (!quietConversation(this)) return;
+		for (const child of children ?? []) {
+			if (child.status === "cancelled" || child.status === "running" || child.status === "queued") continue;
+			this.turnFlow.subagentUpdate(child);
+		}
 	}
 
 	private updateSubagentSummary(child: AgentConnectionRlmChildAgentSnapshot): void {
@@ -8733,6 +8766,7 @@ export class InteractiveMode {
 	 * we update the previous status line instead of appending new ones to avoid log spam.
 	 */
 	private showStatus(message: string, tone: "dim" | "warning" = "dim", options?: { append?: boolean }): void {
+		const clean = sanitizeDisplayLine(message);
 		const children = this.chatContainer.children;
 		const last = children.length > 0 ? children[children.length - 1] : undefined;
 		const secondLast = children.length > 1 ? children[children.length - 2] : undefined;
@@ -8747,13 +8781,13 @@ export class InteractiveMode {
 			last === this.lastStatusText &&
 			secondLast === this.lastStatusSpacer
 		) {
-			this.lastStatusText.setText(theme.fg(tone, message));
+			this.lastStatusText.setText(theme.fg(tone, clean));
 			this.ui.requestRender();
 			return;
 		}
 
 		const spacer = new Spacer(children.length > 0 ? 1 : 0);
-		const text = new Text(theme.fg(tone, message), 1, 0);
+		const text = new Text(theme.fg(tone, clean), 1, 0);
 		this.chatContainer.addChild(spacer);
 		this.chatContainer.addChild(text);
 		this.lastStatusSpacer = spacer;
@@ -11692,10 +11726,9 @@ export class InteractiveMode {
 
 	showError(errorMessage: string): void {
 		// One blank line between chat blocks; the first block follows the header's own spacing.
+		const message = sanitizeDisplayLine(errorMessage);
 		if (this.chatContainer.children.length > 0) this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(
-			new FocusableTextBlock(theme.fg("error", `出错：${errorMessage}`), `出错：${errorMessage}`),
-		);
+		this.chatContainer.addChild(new FocusableTextBlock(theme.fg("error", `出错：${message}`), `出错：${message}`));
 		this.ui.requestRender();
 	}
 
@@ -12021,10 +12054,16 @@ export class InteractiveMode {
 					},
 					onThemeChange: (themeName) => {
 						const result = setTheme(themeName, true);
-						this.applySetting(() => this.settingsManager.setTheme(themeName));
+						// Only persist a theme that actually loaded: a failed load
+						// must not write the broken name to settings.json, where the
+						// next startup would trip over it before the validator is
+						// warm.
+						if (result.success) {
+							this.applySetting(() => this.settingsManager.setTheme(themeName));
+						}
 						this.ui.invalidate();
 						if (!result.success) {
-							this.showError(`主题 "${themeName}" 加载失败：${result.error}\n已换回深色主题。`);
+							this.showError(`主题 "${themeName}" 加载失败：${result.error}\n已回退默认主题。`);
 						}
 					},
 					onThemePreview: (themeName) => {
@@ -12919,6 +12958,9 @@ export class InteractiveMode {
 					this.ui.requestRender();
 				},
 				initialSelectedId,
+				// The selector renders inside the dock: its budget is the terminal
+				// height minus the dock's other members (tray, editor, footer).
+				() => Math.max(12, this.ui.terminal.rows - 4),
 			);
 			return { component: selector, focus: selector.getMessageList() };
 		});
@@ -12991,7 +13033,7 @@ export class InteractiveMode {
 			const selector = new TreeSelectorComponent(
 				tree,
 				realLeafId,
-				this.ui.terminal.rows,
+				() => this.ui.terminal.rows,
 				async (entryId) => {
 					// Selecting the current leaf is a no-op (already there)
 					if (entryId === realLeafId) {
@@ -13544,7 +13586,7 @@ export class InteractiveMode {
 			const themeName = this.settingsManager.getTheme();
 			const themeResult = themeName ? setTheme(themeName, true) : { success: true };
 			if (!themeResult.success) {
-				this.showError(`主题 "${themeName}" 加载失败：${themeResult.error}\n已换回深色主题。`);
+				this.showError(`主题 "${themeName}" 加载失败：${themeResult.error}\n已回退默认主题。`);
 			}
 			const editorPaddingX = this.settingsManager.getEditorPaddingX();
 			const autocompleteMaxVisible = this.settingsManager.getAutocompleteMaxVisible();

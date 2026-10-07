@@ -1021,3 +1021,30 @@ describe("ProcessTerminal kitty placeholder transmits", () => {
 		}
 	});
 });
+
+describe("ProcessTerminal title", () => {
+	it("strips control characters so a name cannot terminate the OSC sequence early", () => {
+		const writes: string[] = [];
+		const originalWrite = process.stdout.write.bind(process.stdout);
+		const spyWrite = ((chunk: string | Uint8Array): boolean => {
+			writes.push(String(chunk));
+			return true;
+		}) as typeof process.stdout.write;
+		process.stdout.write = spyWrite;
+		try {
+			const terminal = new ProcessTerminal();
+			// A model-controlled session name carrying BEL (OSC terminator) and ESC
+			// would splice an OSC 52 clipboard write into the byte stream.
+			terminal.setTitle("worker\x07\x1b]52;c;cGFzdGU=\x07 evil");
+		} finally {
+			process.stdout.write = originalWrite;
+		}
+		const payload = writes.join("");
+		assert.ok(payload.startsWith("\x1b]0;"), payload);
+		assert.ok(payload.endsWith("\x07"), payload);
+		// The only BEL is the terminator we appended; no injected escapes survive.
+		assert.equal((payload.match(/\x07/g) ?? []).length, 1, payload);
+		assert.ok(!payload.includes("\x1b]52;"), payload);
+		assert.ok(!payload.includes("\x1b["), payload);
+	});
+});

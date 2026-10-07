@@ -141,6 +141,7 @@ import {
 	type SessionInfo,
 	SessionManager,
 } from "../../core/session-manager.js";
+import { sanitizeSessionName } from "../../core/session-names.js";
 import { resolveSessionPath } from "../../core/session-resolver.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import {
@@ -5340,7 +5341,7 @@ export class AgentDaemon {
 		command: Extract<DaemonCommand, { type: "rename" }>,
 	): Promise<DaemonResponse | undefined> {
 		const state = this.getSessionState(command.activeSessionId);
-		const name = command.name.trim();
+		const name = sanitizeSessionName(command.name).trim();
 		if (!name) {
 			throw new Error("Session name cannot be empty");
 		}

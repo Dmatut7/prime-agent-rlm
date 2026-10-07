@@ -799,8 +799,11 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	setTitle(title: string): void {
-		// OSC 0;title BEL - set terminal window title
-		process.stdout.write(`\x1b]0;${title}\x07`);
+		// OSC 0;title BEL - set terminal window title. A title carrying BEL or ESC
+		// (a persisted session name is untrusted text) would terminate the sequence
+		// early and inject escapes into the terminal; replace control characters.
+		const safeTitle = title.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+		process.stdout.write(`\x1b]0;${safeTitle}\x07`);
 	}
 
 	setProgress(active: boolean): void {

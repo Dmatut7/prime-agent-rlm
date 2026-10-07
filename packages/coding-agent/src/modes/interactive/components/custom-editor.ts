@@ -34,7 +34,6 @@ export const DECLINE_KEY = Symbol("decline key");
 export class CustomEditor extends Editor {
 	private keybindings: KeybindingsManager;
 	private defaultPromptPrefix: string;
-	private readonly configuredPaddingX: number;
 	private placeholder: string | undefined;
 	private readonly placeholderColor: (text: string) => string;
 	private readonly isArgumentCommand: (name: string) => boolean;
@@ -66,7 +65,6 @@ export class CustomEditor extends Editor {
 		super(tui, theme, { ...options, promptPrefix });
 		this.keybindings = keybindings;
 		this.defaultPromptPrefix = promptPrefix;
-		this.configuredPaddingX = options?.paddingX ?? 0;
 		this.placeholder = options?.placeholder;
 		this.placeholderColor = options?.placeholderColor ?? ((text) => text);
 		this.isArgumentCommand = options?.isArgumentCommand ?? (() => false);
@@ -350,10 +348,11 @@ export class CustomEditor extends Editor {
 
 	private getEffectivePaddingX(width: number): number {
 		const maxPadding = Math.max(0, Math.floor((width - 1) / 2));
-		const configuredPaddingX = Math.min(this.configuredPaddingX, maxPadding);
-		return this.backgroundColor !== undefined
-			? Math.min(Math.max(configuredPaddingX, 2), maxPadding)
-			: configuredPaddingX;
+		// Read the live base-class value, not the constructor-time snapshot:
+		// setPaddingX updates it at runtime, and the placeholder/header lines
+		// must follow so their left edge matches the body's.
+		const paddingX = Math.min(this.getPaddingX(), maxPadding);
+		return this.backgroundColor !== undefined ? Math.min(Math.max(paddingX, 2), maxPadding) : paddingX;
 	}
 
 	private renderHeaderContentLine(content: string, width: number): string {

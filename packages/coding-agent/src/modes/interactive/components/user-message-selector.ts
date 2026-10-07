@@ -13,13 +13,27 @@ class UserMessageList implements Component {
 	private selectedIndex: number = 0;
 	public onSelect?: (entryId: string) => void;
 	public onCancel?: () => void;
-	private maxVisible: number = 10;
+	/**
+	 * Rows the whole selector may occupy (terminal height minus the dock's other
+	 * members). Each entry renders three lines, so the count must shrink on short
+	 * terminals instead of scrolling the selection out of the clipped dock.
+	 */
+	public getAvailableRows?: () => number;
 
 	constructor(messages: UserMessageItem[], initialSelectedId?: string) {
 		// Session history is chronological; default to the latest fork point.
 		this.messages = messages;
 		const initialIndex = initialSelectedId ? messages.findIndex((message) => message.id === initialSelectedId) : -1;
 		this.selectedIndex = initialIndex >= 0 ? initialIndex : Math.max(0, messages.length - 1);
+	}
+
+	private readonly chromeRows = 8;
+
+	private effectiveMaxVisible(): number {
+		const rows = this.getAvailableRows?.() ?? 30;
+		// Title + hint + spacers + borders (chromeRows) plus three lines per entry;
+		// always keep at least one entry visible.
+		return Math.max(1, Math.min(10, Math.floor((rows - this.chromeRows) / 3)));
 	}
 
 	invalidate(): void {}
@@ -32,11 +46,12 @@ class UserMessageList implements Component {
 			return lines;
 		}
 
+		const maxVisible = this.effectiveMaxVisible();
 		const startIndex = Math.max(
 			0,
-			Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.messages.length - this.maxVisible),
+			Math.min(this.selectedIndex - Math.floor(maxVisible / 2), this.messages.length - maxVisible),
 		);
-		const endIndex = Math.min(startIndex + this.maxVisible, this.messages.length);
+		const endIndex = Math.min(startIndex + maxVisible, this.messages.length);
 
 		for (let i = startIndex; i < endIndex; i++) {
 			const message = this.messages[i];
@@ -93,6 +108,7 @@ export class UserMessageSelectorComponent extends Container {
 		onSelect: (entryId: string) => void,
 		onCancel: () => void,
 		initialSelectedId?: string,
+		getAvailableRows?: () => number,
 	) {
 		super();
 
@@ -106,6 +122,7 @@ export class UserMessageSelectorComponent extends Container {
 		this.messageList = new UserMessageList(messages, initialSelectedId);
 		this.messageList.onSelect = onSelect;
 		this.messageList.onCancel = onCancel;
+		this.messageList.getAvailableRows = getAvailableRows;
 
 		this.addChild(this.messageList);
 

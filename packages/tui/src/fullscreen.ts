@@ -14,7 +14,7 @@ import {
 	KITTY_PLACEHOLDER_CHAR,
 	KITTY_PLACEHOLDER_COPY_MARKER,
 } from "./terminal-image.js";
-import { sliceByColumn, stripAnsi, urlAtColumn, visibleWidth } from "./utils.js";
+import { clampOverwideLine, sliceByColumn, stripAnsi, urlAtColumn, visibleWidth } from "./utils.js";
 
 export const FULLSCREEN_MIN_TRANSCRIPT_ROWS = 3;
 
@@ -336,8 +336,7 @@ export class FullscreenViewport {
 				.render(top - header.line)
 				.slice(0, maxRows)
 				.map((row) => {
-					if (isImageSequenceLine(row)) return IMAGE_PLACEHOLDER;
-					return visibleWidth(row) > width ? sliceByColumn(row, 0, width, true) : row;
+					return isImageSequenceLine(row) ? IMAGE_PLACEHOLDER : clampOverwideLine(row, width);
 				});
 			if (rows.length > 0 && top + rows.length <= header.endLine) return { header, rows };
 		}
@@ -1114,7 +1113,7 @@ export class FullscreenViewport {
 			if (this.prevFrame[row] === line) continue;
 			buffer += `\x1b[${row + 1};1H\x1b[2K`;
 			// an overwide line would wrap and shear the grid; clamp instead of crash
-			buffer += visibleWidth(line) > width ? sliceByColumn(line, 0, width, true) : line;
+			buffer += clampOverwideLine(line, width);
 		}
 		if (cursorPos) {
 			const cursorRow = Math.max(0, Math.min(cursorPos.row, height - 1));

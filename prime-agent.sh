@@ -36,6 +36,16 @@ if [[ "$NO_ENV" == "true" ]]; then
   unset MISTRAL_API_KEY
   unset MINIMAX_API_KEY
   unset MINIMAX_CN_API_KEY
+  unset DEEPSEEK_API_KEY
+  unset MOONSHOT_API_KEY
+  unset KIMI_API_KEY
+  unset FIREWORKS_API_KEY
+  unset CLOUDFLARE_API_KEY
+  unset GOOGLE_CLOUD_API_KEY
+  unset XIAOMI_API_KEY
+  unset XIAOMI_TOKEN_PLAN_CN_API_KEY
+  unset XIAOMI_TOKEN_PLAN_AMS_API_KEY
+  unset XIAOMI_TOKEN_PLAN_SGP_API_KEY
   unset AI_GATEWAY_API_KEY
   unset OPENCODE_API_KEY
   unset COPILOT_GITHUB_TOKEN
@@ -59,7 +69,9 @@ if [[ "$NO_ENV" == "true" ]]; then
   unset AZURE_OPENAI_API_KEY
   unset AZURE_OPENAI_BASE_URL
   unset AZURE_OPENAI_RESOURCE_NAME
-  echo "Running Prime Agent without API keys..."
+  # The banner goes to stderr: stdout stays machine-readable for -p/--mode rpc
+  # and command substitution.
+  echo "Running Prime Agent without API keys..." >&2
 fi
 
 # --dist runs the bundled build (what users get; ~3x faster startup than tsx).

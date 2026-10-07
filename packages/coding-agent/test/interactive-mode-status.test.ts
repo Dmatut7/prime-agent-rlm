@@ -6517,3 +6517,43 @@ test("session teardown removes a running refine loader without remounting anythi
 	expect((fakeThis as unknown as { refineLoader?: unknown }).refineLoader).toBeUndefined();
 	expect((fakeThis as unknown as { syncWorkingLoader: () => void }).syncWorkingLoader).not.toHaveBeenCalled();
 });
+
+describe("InteractiveMode.showStatus / showError sanitize untrusted text", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+
+	test("showStatus strips control characters and collapses to one line", () => {
+		const fakeThis: any = {
+			chatContainer: new Container(),
+			ui: { requestRender: vi.fn() },
+			lastStatusSpacer: undefined,
+			lastStatusText: undefined,
+		};
+
+		(InteractiveMode as any).prototype.showStatus.call(fakeThis, "provider failed\r\nretry\x1b[2J\x07");
+		const line = stripAnsi(renderLastLine(fakeThis.chatContainer));
+		expect(line).toContain("provider failed retry");
+		// Theme color codes are stripped first; no injected escape must remain.
+		expect(line).not.toContain("\x1b");
+		expect(line).not.toContain("\x07");
+	});
+
+	test("showError strips escape sequences before the error row renders", () => {
+		const fakeThis: any = {
+			chatContainer: new Container(),
+			ui: { requestRender: vi.fn() },
+		};
+
+		(InteractiveMode as any).prototype.showError.call(
+			fakeThis,
+			"Could not parse SSE\x1b[2J raw=\x1b]52;c;cGFzdGU=\x07",
+		);
+		const line = stripAnsi(renderLastLine(fakeThis.chatContainer));
+		expect(line).toContain("Could not parse SSE");
+		expect(line).not.toContain("\x1b");
+		expect(line).not.toContain("\x07");
+		// A single row must carry a single line: no newline survives.
+		expect(line.split("\n").length).toBe(1);
+	});
+});

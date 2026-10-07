@@ -4,6 +4,7 @@ import type { AgentSession, RlmChildAgentActivity, RlmChildAgentStatus } from ".
 import type { ToolDefinition } from "./extensions/index.js";
 import type { HostRequestHandler } from "./kernel/index.js";
 import type { RlmChildStallAbortFacts, RlmChildTerminalOutcomeKind } from "./rlm-child-terminal.js";
+import { sanitizeSessionName } from "./session-names.js";
 import { THINKING_LEVELS } from "./thinking-levels.js";
 
 /** Request emitted by `rlm.run`; cellSourceCode preserves the spawning cell for display. */
@@ -193,7 +194,11 @@ export function normalizeRequestedRlmSubagentSessionName(value: unknown, operati
 	if (typeof value !== "string") {
 		throw new Error(`${operation} name must be a string`);
 	}
-	const name = value.trim();
+	// The model controls this name and it reaches the terminal title OSC
+	// sequence and single-row chips: strip control characters (BEL would
+	// terminate the OSC early and let ESC inject escapes; a newline breaks the
+	// one-row contract).
+	const name = sanitizeSessionName(value).trim();
 	if (!name) {
 		throw new Error(`${operation} name must not be empty`);
 	}

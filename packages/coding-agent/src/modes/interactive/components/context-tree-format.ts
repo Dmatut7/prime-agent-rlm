@@ -11,6 +11,7 @@ import {
 } from "../../../core/spend-pricing.js";
 import { addAssistantUsage, emptyUsage } from "../../../core/usage.js";
 import { formatTokenCount } from "../agent-activity.js";
+import { formatSpendCost } from "../spend-format.js";
 import { theme } from "../theme/theme.js";
 
 const CONTEXT_BAR_WIDTH = 10;
@@ -59,10 +60,6 @@ function flattenContextTree(root: ContextTreeNode): ContextTreeRow[] {
 	};
 	walk(root.children, "");
 	return rows;
-}
-
-function formatCost(cost: number): string {
-	return `$${cost.toFixed(2)}`;
 }
 
 function formatContextColumn(contextUsage: ContextUsage | undefined, withBar: boolean): string {
@@ -231,18 +228,23 @@ export function formatContextTree(root: ContextTreeNode, width: number, pricing?
 	const rows = flattenContextTree(root);
 
 	const tokenCells = rows.map((row) => formatTokenCount(spendRelevantTokens(row.node.ownUsage)));
-	const costCells = rows.map((row) => formatCost(nodeSpendMoney(row.node, pricing)));
+	const costCells = rows.map((row) => formatSpendCost(nodeSpendMoney(row.node, pricing)));
+	const contextCells = rows.map((row) => formatContextColumn(row.node.contextUsage, row.node.id === "root"));
 	const totalCost = sumPricedOwnCost(root, pricing);
 	const tokenHeader = "tokens";
 	const costHeader = "cost";
 	const contextHeader = "context";
 	const tokenWidth = Math.max(tokenHeader.length, ...tokenCells.map((cell) => cell.length));
 	const costWidth = Math.max(costHeader.length, ...costCells.map((cell) => cell.length));
+	// The root's context cell carries a 10-column bar plus "52% (518k/1.0M)";
+	// budget the label against its actual width (a flat "- 28" assumed 20 and
+	// overflowed every aligned row by up to 6 columns).
+	const contextWidth = Math.max(contextHeader.length, ...contextCells.map((cell) => visibleWidth(cell)));
 	const labelWidth = Math.max(
 		MIN_LABEL_WIDTH,
 		Math.min(
 			Math.max(...rows.map((row) => row.prefix.length + 2 + visibleWidth(row.node.label))),
-			width - tokenWidth - costWidth - 28,
+			width - tokenWidth - costWidth - contextWidth - 8,
 		),
 	);
 
@@ -288,7 +290,7 @@ export function formatContextTree(root: ContextTreeNode, width: number, pricing?
 			);
 			const tokenCell = padStartAnsi(tokenCells[index], tokenWidth);
 			const costCell = padStartAnsi(theme.fg("dim", costCells[index]), costWidth);
-			const contextCell = formatContextColumn(row.node.contextUsage, row.node.id === "root");
+			const contextCell = contextCells[index];
 			lines.push(`${labelCell}  ${tokenCell}  ${costCell}  ${contextCell}`);
 		}
 	}
@@ -306,7 +308,7 @@ export function formatContextTree(root: ContextTreeNode, width: number, pricing?
 	const agentCount = countNodes(root);
 	lines.push("");
 	lines.push(
-		`${theme.fg("dim", "Total:")} ${formatTokenCount(spendRelevantTokens(totals))} tokens ${theme.fg("dim", "·")} ${formatCost(
+		`${theme.fg("dim", "Total:")} ${formatTokenCount(spendRelevantTokens(totals))} tokens ${theme.fg("dim", "·")} ${formatSpendCost(
 			totalCost,
 		)}${agentCount > 1 ? theme.fg("dim", ` across ${agentCount} agents`) : ""}`,
 	);
@@ -326,7 +328,7 @@ export function formatContextTree(root: ContextTreeNode, width: number, pricing?
 	if (totalCost > 0) {
 		lines.push("");
 		lines.push("Cost");
-		lines.push(`${theme.fg("dim", "Total:")} $${totalCost.toFixed(4)}`);
+		lines.push(`${theme.fg("dim", "Total:")} ¥${totalCost.toFixed(4)}`);
 	}
 
 	lines.push(...formatPriceSources(root, pricing));

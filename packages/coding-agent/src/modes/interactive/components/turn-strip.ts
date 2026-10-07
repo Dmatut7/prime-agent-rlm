@@ -340,15 +340,19 @@ export class TurnStripComponent implements Component {
 		const incomplete = facts.trackingIncomplete ? dim(" （有些改动没记全）") : "";
 		const firstAt = facts.projectChanges.map((change) => change.firstAt).filter(isStamp);
 		const time = stampOf(firstAt.length > 0 ? Math.min(...firstAt) : undefined);
-		const ambientText = (count: number) =>
-			fitting(
-				[`工作区另有 ${count} 个变动（别的窗口或进程）`, `工作区另有 ${count} 个变动`, `另有 ${count} 个变动`],
-				contentLimit(width, ""),
-			);
+		const ambientForms = (count: number) => [
+			`工作区另有 ${count} 个变动（别的窗口或进程）`,
+			`工作区另有 ${count} 个变动`,
+			`另有 ${count} 个变动`,
+		];
 		const ambientLine = (expandable: boolean): void => {
 			const ambientAt = ambient.map((change) => change.firstAt).filter(isStamp);
 			const right = expandable ? caretFor(open, "kindEdit") : "";
-			const content = `${theme.fg("timelineSoft", "◇")} ${dim(ambientText(ambient.length))}`;
+			// The row carries the "◇ " glyph and, when expandable, the right-side
+			// caret: the fitting budget must pay for both, or a complete short
+			// form gets needlessly replaced by an ellipsis.
+			const budget = Math.max(0, contentLimit(width, right) - 2);
+			const content = `${theme.fg("timelineSoft", "◇")} ${dim(fitting(ambientForms(ambient.length), budget))}`;
 			push({
 				gutter: gutterAt("note", time ?? stampOf(ambientAt.length > 0 ? Math.min(...ambientAt) : undefined)),
 				content,

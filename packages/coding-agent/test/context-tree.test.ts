@@ -431,15 +431,15 @@ describe("formatContextTree", () => {
 		expect(output).toContain("└─ ◆ refactor tests");
 		// Own usage per row: 45200 -> 45k, 12850 -> 13k, 8700 -> 8.7k.
 		expect(output).toContain("45k");
-		expect(output).toContain("$0.84");
+		expect(output).toContain("¥0.84");
 		expect(output).toContain("31% (62k/200k)");
-		// Totals sum own usage across all agents: 66750 -> 67k, $1.18.
-		expect(output).toContain("Total: 67k tokens · $1.18 across 3 agents");
+		// Totals sum own usage across all agents: 66750 -> 67k, ¥1.18.
+		expect(output).toContain("Total: 67k tokens · ¥1.18 across 3 agents");
 		// Detail sections carry the precise numbers /usage used to show.
 		expect(output).toContain("Input: 60,100");
 		expect(output).toContain("Output: 6,650");
 		expect(output).toContain("Total: 66,750");
-		expect(output).toContain("Cost\nTotal: $1.1800");
+		expect(output).toContain("Cost\nTotal: ¥1.1800");
 		expect(output).toContain("Context\nCurrent: 62,300 / 200,000 (31.2%)");
 	});
 
@@ -458,7 +458,7 @@ describe("formatContextTree", () => {
 		const output = stripAnsi(formatContextTree(root, 100));
 		expect(output).toContain("● main agent");
 		expect(output).not.toContain("├");
-		expect(output).toContain("Total: 1.0k tokens · $0.01");
+		expect(output).toContain("Total: 1.0k tokens · ¥0.01");
 		expect(output).not.toContain("across");
 	});
 });
@@ -540,12 +540,12 @@ describe("formatContextTree with price overrides", () => {
 		const recorded = stripAnsi(formatContextTree(sessionTree(), 100, pricing({})));
 
 		// The child's row: 1M input at the corrected 7 instead of the recorded 1.
-		expect(corrected).toContain("$7.00");
-		expect(recorded).toContain("$1.00");
+		expect(corrected).toContain("¥7.00");
+		expect(recorded).toContain("¥1.00");
 		// Row money and the grand total move together (0.01 root + 7.00 child).
-		expect(corrected).toContain("$7.01");
-		expect(corrected).toContain("Cost\nTotal: $7.0100");
-		expect(recorded).toContain("Total: 1.0M tokens · $1.01");
+		expect(corrected).toContain("¥7.01");
+		expect(corrected).toContain("Cost\nTotal: ¥7.0100");
+		expect(recorded).toContain("Total: 1.0M tokens · ¥1.01");
 	});
 
 	it("says nothing about prices while the user has configured no override", () => {
@@ -639,12 +639,44 @@ describe("formatContextTree compact layout", () => {
 		const output = formatContextTree(busyTree(), width);
 		const plain = stripAnsi(output);
 		expect(plain).toContain("tokens · cost · context");
-		expect(plain).toContain("$0.84");
+		expect(plain).toContain("¥0.84");
 		expect(plain).toContain("31%");
 		// The aligned table with its column header is gone.
 		expect(plain).not.toContain("spend: whole session, every branch");
 		for (const line of output.split("\n")) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+	});
+
+	it("keeps aligned rows inside the width even when the label budget caps out", () => {
+		// The root's context cell is the widest in the table (bar + "31% (62k/200k)")
+		// and a long CJK label pushes the label column to its budget cap. A flat
+		// "- 28" constant assumed a 20-column context cell and overflowed every
+		// aligned row by up to 6 columns, wrapping the table mid-cell.
+		const root = node({
+			model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+			label: "首条用户消息很长，把标签列推到宽度预算的上限，检查对齐行不超宽",
+			ownUsage: createUsage(40000, 5200, 0.84),
+			totalUsage: createUsage(52100, 5950, 1.1),
+			contextUsage: { tokens: 62300, contextWindow: 200000, percent: 31.15 },
+			children: [
+				node({
+					id: "sub-aaaa1111",
+					label: "summarize the authentication module in detail and keep going past the budget",
+					status: "done",
+					ownUsage: createUsage(12100, 750, 0.21),
+					totalUsage: createUsage(12100, 750, 0.21),
+					contextUsage: { tokens: 18000, contextWindow: 200000, percent: 9 },
+				}),
+			],
+		});
+		for (const width of [62, 70, 80, 100]) {
+			const output = formatContextTree(root, width);
+			const plain = stripAnsi(output);
+			expect(plain).toContain("spend: whole session, every branch");
+			for (const row of output.split("\n").filter((line) => /[●◇◆✓✗]/.test(stripAnsi(line)))) {
+				expect(visibleWidth(row)).toBeLessThanOrEqual(width);
+			}
 		}
 	});
 

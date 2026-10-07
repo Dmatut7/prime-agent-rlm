@@ -209,4 +209,48 @@ describe("subagent lifecycle status lines", () => {
 		expect(text).toContain("子代理 worker-a 已收编");
 		expect(text).toContain("子代理 worker-b 已收编");
 	});
+
+	it("reconciles settled children into the turn timelines when seeding from a snapshot", () => {
+		// Attach/resync seeds the chip bar from snapshot.children; the timeline
+		// entries replay creates say "running". The snapshot is the authority:
+		// settled children must be pushed into the timelines (which then close
+		// their lanes) instead of waiting for a report that may be queued.
+		const quietUiServices = {
+			settingsManager: {
+				getSubagentSpendCellEnabled: () => false,
+				getProcessMode: () => "quiet",
+			},
+		};
+		const subagentUpdate = vi.fn();
+		const chatContainer = new Container();
+		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+		Object.assign(mode, {
+			subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
+			rlmNodeId: "me",
+			heartbeatCatalog: [],
+			subagentSummaryLine: new SubagentSummaryLine(),
+			chatContainer,
+			uiServices: quietUiServices,
+			liveTurnFlowStore: { subagentUpdate },
+			updateWorkingPulse: vi.fn(),
+			syncWorkingLoader: vi.fn(),
+			updateWorkingLoaderMessage: vi.fn(),
+			ui: { requestRender: vi.fn(), terminal: { rows: 40, columns: 120 } },
+		});
+		const seed = Reflect.get(InteractiveMode.prototype, "seedSubagentSummary") as (
+			this: typeof mode,
+			children: readonly AgentConnectionRlmChildAgentSnapshot[],
+		) => void;
+
+		seed.call(mode, [
+			child("sub-1", "done", { sessionName: "worker-a", label: "第一件事" }),
+			child("sub-2", "running", { sessionName: "worker-b", label: "第二件事" }),
+			child("sub-3", "cancelled", { sessionName: "worker-c", label: "第三件事" }),
+		]);
+
+		expect(subagentUpdate).toHaveBeenCalledTimes(1);
+		expect(subagentUpdate).toHaveBeenCalledWith(
+			expect.objectContaining({ id: "sub-1", sessionName: "worker-a", status: "done" }),
+		);
+	});
 });

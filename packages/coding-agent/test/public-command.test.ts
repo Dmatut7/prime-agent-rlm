@@ -452,6 +452,30 @@ describe("public command routing", () => {
 		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("Unknown command: sessions"));
 	});
 
+	it("routes `--help <command>` to that command's help instead of a typo rejection", async () => {
+		// `--help list` used to die as "Unknown command: list" (the guard treated
+		// the flag-leading shape as a mistyped bare command); it must print the
+		// list command's help.
+		await expect(handlePublicCommand(["--help", "list"])).resolves.toMatchObject({ handled: true });
+
+		expect(console.log).toHaveBeenCalledWith(expect.stringContaining("prime-agent list"));
+		expect(process.exitCode).toBe(undefined);
+	});
+
+	it("lets a meta flag pass through with a trailing command word", async () => {
+		// `--version list` is answered by the version branch in main, never by a
+		// typo rejection.
+		const passThrough = await handlePublicCommand(["--version", "list"]);
+		expect(passThrough.handled).toBe(false);
+
+		// A global flag leading a correctly spelled command routes to that
+		// command (the flag stays in place) instead of dying as
+		// "Unknown command: status".
+		const routed = await handlePublicCommand(["--offline", "status"]);
+		expect(routed.handled).toBe(true);
+		expect(console.error).not.toHaveBeenCalledWith(expect.stringContaining("Unknown command: status"));
+	});
+
 	it("names the prompt escape hatch in the rejection", async () => {
 		await handlePublicCommand(["statsu"]);
 

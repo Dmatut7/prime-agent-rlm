@@ -89,8 +89,9 @@ describe("agents view settled/duration/answer columns (U3)", () => {
 			// Three new facts per row: settled, duration, and the answer line below.
 			expect(doneLine).toContain("✓");
 			expect(doneLine).toContain("1h10m");
-			// The usage columns keep landing where they always did.
-			expect(doneLine).toContain("↑12k ↓1.2k · $0.42 ·      0 · $0.42 ·");
+			// The usage columns keep landing where they always did (the currency
+			// follows the TUI-wide ¥ formatter).
+			expect(doneLine).toContain("↑12k ↓1.2k · ¥0.42 ·      0 · ¥0.42 ·");
 			const busyLine = render(rows.find((row) => row.summary.sessionId === "busy-session")!);
 			// Explicitly not settled reads as in flight, never as a settled check.
 			expect(busyLine).toContain("…");
@@ -280,7 +281,7 @@ describe("agents view settled/duration/answer columns (U3)", () => {
 		// The legend leads with the usage block: no set/dur labels, no blank cells.
 		expect(legend).toMatch(/^↑入 +↓出 · +自身 · +子代理 · +合计 · +更新$/);
 		const detail = stripAnsi(layout.details.get(rows[0]!.identity)!);
-		expect(detail).toMatch(/^ +↑0 +↓0 · +\$0\.00 · +0 · +\$0\.00 · *$/);
+		expect(detail).toMatch(/^ +↑0 +↓0 · +¥0\.00 · +0 · +¥0\.00 · *$/);
 		// Display columns, not string indexes: the CJK labels are two columns wide.
 		const dotColumns = (text: string) => {
 			const columns: number[] = [];
@@ -512,6 +513,53 @@ describe("agents view settled/duration/answer columns (U3)", () => {
 		expect(formatAgentsViewDurationMs(3_600_000)).toBe("1h");
 		expect(formatAgentsViewDurationMs((24 + 4) * 3_600_000)).toBe("1d4h");
 		expect(formatAgentsViewDurationMs(3 * 24 * 3_600_000)).toBe("3d");
+	});
+
+	it("keeps the ` · ` separators in the same columns across sections", () => {
+		// Per-section column widths let the separators drift between blocks (up
+		// to 8 columns), so a value read as sitting under the wrong header when
+		// scanning down the list. Shared widths keep every block aligned.
+		const runningRow = summary({
+			id: "run-agent",
+			activeSessionId: "run-agent",
+			sessionId: "run-session",
+			sessionName: "run-agent",
+			activity: "working",
+			isStreaming: true,
+			isSessionActive: true,
+			usage: { inputTokens: 10_000_000, outputTokens: 900_000, cost: 123.45 },
+		});
+		const idleRow = summary({
+			id: "idle-agent",
+			activeSessionId: "idle-agent",
+			sessionId: "idle-session",
+			sessionName: "idle-agent",
+			usage: { inputTokens: 42, outputTokens: 7, cost: 0.03 },
+		});
+		const rows = buildAgentsViewRows([runningRow, idleRow]);
+		const layout = buildAgentsViewUsageLayout(rows);
+
+		const dotColumns = (text: string): number[] => {
+			const columns: number[] = [];
+			let column = 0;
+			for (const ch of text) {
+				if (ch === "·") columns.push(column);
+				column += visibleWidth(ch);
+			}
+			return columns;
+		};
+		const detailOf = (sessionId: string): string => {
+			const row = rows.find((candidate) => candidate.summary.sessionId === sessionId)!;
+			return stripAnsi(layout.details.get(row.identity)!);
+		};
+
+		// Cross-section: the running row's separators must sit exactly where the
+		// idle section's legend puts them (and vice versa).
+		expect(dotColumns(detailOf("run-session"))).toEqual(dotColumns(stripAnsi(layout.legends.get("idle")!)));
+		expect(dotColumns(detailOf("idle-session"))).toEqual(dotColumns(stripAnsi(layout.legends.get("running")!)));
+		// The wide running-section values widened the shared token columns for the
+		// idle row too — that is the alignment working, not a regression.
+		expect(detailOf("idle-session")).toContain("↑42    ↓7");
 	});
 });
 

@@ -278,6 +278,10 @@ function readKernelChange(value) {
 		binary: value.binary === true,
 		...(typeof value.oldPath === "string" && value.oldPath ? { oldPath: value.oldPath } : {}),
 	};
+	// The kernel attributes workspace changes made by another window/process to
+	// `ambient`: the strip renders them on their own line and never folds them
+	// into the session's own counts.
+	if (value.origin === "ambient") change.ambient = true;
 	if (DIFF_OMITTED.has(value.diffOmitted)) change.omitted = value.diffOmitted;
 	// The kernel says the counts were not knowable (no baseline, out of budget): 0/0 with a reason.
 	if (change.omitted && change.added === 0 && change.removed === 0) change.countsUnknown = true;
@@ -414,12 +418,21 @@ function isInside(child, parent) {
  */
 function aggregateRecords(records, sessionCwd) {
 	const entries = new Map();
-	const coverage = { scratch: 0 };
+	const coverage = { scratch: 0, ambient: 0 };
 	for (const record of records) {
 		const abs = realish(resolve(sessionCwd, record.relPath ?? record.path));
 		const scope = record.channel === "kernel" ? record.scope : isInside(abs, sessionCwd) ? "project" : "scratch";
 		if (scope === "scratch") {
 			coverage.scratch += 1;
+			continue;
+		}
+		// Ambient changes (another window's edits, reported through this
+		// session's kernel) are not part of the session's own displayed counts —
+		// the strip renders them on a separate line. Skip them like scratch so
+		// the "displayed" side mirrors the screen and cannot mask the session's
+		// own under-reporting.
+		if (record.ambient === true) {
+			coverage.ambient += 1;
 			continue;
 		}
 		const existing = entries.get(abs);
@@ -885,7 +898,7 @@ function renderText(report) {
 	);
 	lines.push(
 		`覆盖：kernel ${report.coverage.kernel} 条 · edit ${report.coverage.edit} 条 · legacy ${report.coverage.legacy} 条` +
-			` · scratch ${report.coverage.scratch} 条（不进显示数） · 坏行 ${report.coverage.malformedLines}`,
+			` · scratch ${report.coverage.scratch} 条（不进显示数） · ambient ${report.coverage.ambient} 条（别的窗口的改动，不进显示数） · 坏行 ${report.coverage.malformedLines}`,
 	);
 	for (const entry of report.entries) {
 		const marks = { fail: "✗", warn: "!", info: "·" };
@@ -1163,6 +1176,25 @@ function stageA(failures) {
 	expectEqual(failures, "totals skip symlink removed", totals?.removed, 6);
 	expectEqual(failures, "headline", headlineText(aggregated.entries.length, totals), "改了 3 个文件 +8 −6");
 	expectEqual(failures, "headline no +0", headlineText(1, { added: 0, removed: 2 }), "改了 1 个文件 −2");
+
+	// Ambient records stay out of the session's own counts, exactly like the
+	// strip renders them (own counts on one line, ambient on its own).
+	const ambientRead = extractChanges(
+		parseSessionText(
+			sessionText("/p", [
+				kernelResult([
+					{ path: "/p/own.ts", kind: "modified", scope: "project", added: 5, removed: 2 },
+					{ path: "/p/other-window.ts", kind: "modified", scope: "project", added: 500, removed: 400, origin: "ambient" },
+				]),
+			]),
+		),
+	);
+	const ambientAggregated = aggregateRecords(ambientRead.records, "/p");
+	expectEqual(failures, "ambient excluded from entries", ambientAggregated.entries.length, 1);
+	expectEqual(failures, "ambient counted", ambientAggregated.coverage.ambient, 1);
+	const ambientTotals = displayedTotals(ambientAggregated.entries);
+	expectEqual(failures, "ambient stays out of totals", ambientTotals?.added, 5);
+	expectEqual(failures, "ambient stays out of totals removed", ambientTotals?.removed, 2);
 
 	// judgeEntry: one control per verdict code, fabricated truth, no git needed.
 	const judgeCases = [

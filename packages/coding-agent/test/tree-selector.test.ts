@@ -866,3 +866,37 @@ describe("findLatestUserMessageEntryId", () => {
 		expect(findLatestUserMessageEntryId(tree, "asst-2")).toBe("auto-1");
 	});
 });
+
+describe("tree selector terminal height budget", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+
+	test("follows a live rows getter across resizes instead of a frozen snapshot", () => {
+		const entries: Array<AgentConnectionSessionEntry> = [];
+		for (let i = 0; i < 20; i++) {
+			entries.push(userMessage(`user-${i}`, i === 0 ? null : `user-${i - 1}`, `message ${i}`));
+		}
+		const tree = buildTree(entries);
+
+		let rows = 40;
+		const selector = new TreeSelectorComponent(
+			tree,
+			"user-19",
+			() => rows,
+			() => {},
+			() => {},
+		);
+		const list = selector.getTreeList();
+		const entryLines = () => list.render(200).filter((line) => line.includes("message ")).length;
+
+		const atTall = entryLines();
+		rows = 24;
+		const atShort = entryLines();
+
+		// The window must shrink when the terminal does (the construction-time
+		// snapshot used to ignore the resize entirely).
+		expect(atShort).toBeLessThan(atTall);
+		expect(atShort).toBeGreaterThanOrEqual(5);
+	});
+});

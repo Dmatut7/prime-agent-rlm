@@ -41,9 +41,9 @@ import {
 	setCellDimensions,
 } from "./terminal-image.js";
 import {
+	clampOverwideLine,
 	extractSegments,
 	normalizeTerminalOutput,
-	sliceByColumn,
 	sliceWithWidth,
 	stripAnsi,
 	visibleContentSpan,
@@ -1751,8 +1751,7 @@ export class TUI extends Container {
 				if (idx >= 0 && idx < result.length) {
 					// Defensive: truncate overlay line to declared width before compositing
 					// (components should already respect width, but this ensures it)
-					const truncatedOverlayLine =
-						visibleWidth(overlayLines[i]) > w ? sliceByColumn(overlayLines[i], 0, w, true) : overlayLines[i];
+					const truncatedOverlayLine = clampOverwideLine(overlayLines[i], w);
 					result[idx] = this.compositeLineAt(result[idx], truncatedOverlayLine, col, w, termWidth);
 					this.subtractSelectionCoverage(overlaySelectionRegions, idx, col, col + w);
 					const span = component === this.focusedComponent ? this.selectableSpan(truncatedOverlayLine, w) : null;
@@ -2041,7 +2040,7 @@ export class TUI extends Container {
 			return result;
 		}
 		// Truncate with strict=true to ensure we don't exceed totalWidth
-		return sliceByColumn(result, 0, totalWidth, true);
+		return clampOverwideLine(result, totalWidth);
 	}
 
 	/**
@@ -2289,10 +2288,24 @@ export class TUI extends Container {
 				// loop never runs and the leftover-clear moves down before clearing,
 				// which would leave row 0 stale.
 				if (visibleCount === 0) buffer += "\x1b[2K";
+				const clampedOverwidePreserve: number[] = [];
 				for (let i = 0; i < visibleCount; i++) {
 					if (i > 0) buffer += "\r\n";
 					buffer += "\x1b[2K"; // Clear current line
-					buffer += newLines[windowStart + i];
+					const line = newLines[windowStart + i];
+					if (isImageLine(line)) {
+						buffer += line;
+					} else if (visibleWidth(line) > width) {
+						// Same overwide clamp the diff path applies: a wrapping line would
+						// desynchronize physical rows from the line bookkeeping below it.
+						clampedOverwidePreserve.push(windowStart + i);
+						buffer += clampOverwideLine(line, width);
+					} else {
+						buffer += line;
+					}
+				}
+				if (clampedOverwidePreserve.length > 0) {
+					this.logClampedOverwideLines(clampedOverwidePreserve, newLines, width);
 				}
 				// Clear any rows the previous frame used below the new content.
 				// Row 0 is already occupied (by content, or by the visibleCount === 0
@@ -2335,9 +2348,23 @@ export class TUI extends Container {
 				buffer += this.deleteChangedKittyImages(previousVisibleTop, previousVisibleBottom, newLines);
 				buffer += "\x1b[2J\x1b[H"; // Clear screen and home while preserving scrollback
 			}
+			const clampedOverwideFull: number[] = [];
 			for (let i = renderStart; i < newLines.length; i++) {
 				if (i > renderStart) buffer += "\r\n";
-				buffer += newLines[i];
+				const line = newLines[i];
+				if (isImageLine(line)) {
+					buffer += line;
+				} else if (visibleWidth(line) > width) {
+					// Same overwide clamp the diff path applies: a wrapping line would
+					// desynchronize physical rows from the line bookkeeping below it.
+					clampedOverwideFull.push(i);
+					buffer += clampOverwideLine(line, width);
+				} else {
+					buffer += line;
+				}
+			}
+			if (clampedOverwideFull.length > 0) {
+				this.logClampedOverwideLines(clampedOverwideFull, newLines, width);
 			}
 			if (sync2026) buffer += "\x1b[?2026l"; // End synchronized output
 			this.terminal.write(buffer);
@@ -2554,7 +2581,7 @@ export class TUI extends Container {
 				// crashing the process, and record it once for the whole render so
 				// the offending component can still be found and fixed.
 				clampedOverwide.push(i);
-				buffer += sliceByColumn(line, 0, width, true);
+				buffer += clampOverwideLine(line, width);
 			} else {
 				buffer += line;
 			}

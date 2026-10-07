@@ -152,7 +152,7 @@ class TreeList implements Component {
 	private filteredNodes: FlatNode[] = [];
 	private selectedIndex = 0;
 	private currentLeafId: string | null;
-	private maxVisibleLines: number;
+	private readonly getMaxVisibleLines: () => number;
 	private filterMode: FilterMode = "default";
 	private searchQuery = "";
 	private toolCallMap: Map<string, ToolCallInfo> = new Map();
@@ -188,12 +188,12 @@ class TreeList implements Component {
 	constructor(
 		tree: AgentConnectionSessionTreeNode[],
 		currentLeafId: string | null,
-		maxVisibleLines: number,
+		maxVisibleLines: number | (() => number),
 		initialSelectedId?: string,
 		initialFilterMode?: FilterMode,
 	) {
 		this.currentLeafId = currentLeafId;
-		this.maxVisibleLines = maxVisibleLines;
+		this.getMaxVisibleLines = typeof maxVisibleLines === "function" ? maxVisibleLines : () => maxVisibleLines;
 		this.filterMode = initialFilterMode ?? "default";
 		this.multipleRoots = tree.length > 1;
 		this.flatNodes = this.flattenTree(tree);
@@ -758,11 +758,11 @@ class TreeList implements Component {
 		const startIndex = Math.max(
 			0,
 			Math.min(
-				this.selectedIndex - Math.floor(this.maxVisibleLines / 2),
-				this.filteredNodes.length - this.maxVisibleLines,
+				this.selectedIndex - Math.floor(this.getMaxVisibleLines() / 2),
+				this.filteredNodes.length - this.getMaxVisibleLines(),
 			),
 		);
-		const endIndex = Math.min(startIndex + this.maxVisibleLines, this.filteredNodes.length);
+		const endIndex = Math.min(startIndex + this.getMaxVisibleLines(), this.filteredNodes.length);
 
 		for (let i = startIndex; i < endIndex; i++) {
 			const flatNode = this.filteredNodes[i];
@@ -1051,10 +1051,10 @@ class TreeList implements Component {
 			}
 		} else if (kb.matches(keyData, "tui.editor.cursorLeft") || kb.matches(keyData, "tui.select.pageUp")) {
 			// Page up
-			this.selectedIndex = Math.max(0, this.selectedIndex - this.maxVisibleLines);
+			this.selectedIndex = Math.max(0, this.selectedIndex - this.getMaxVisibleLines());
 		} else if (kb.matches(keyData, "tui.editor.cursorRight") || kb.matches(keyData, "tui.select.pageDown")) {
 			// Page down
-			this.selectedIndex = Math.min(this.filteredNodes.length - 1, this.selectedIndex + this.maxVisibleLines);
+			this.selectedIndex = Math.min(this.filteredNodes.length - 1, this.selectedIndex + this.getMaxVisibleLines());
 		} else if (kb.matches(keyData, "tui.select.confirm")) {
 			const selected = this.filteredNodes[this.selectedIndex];
 			if (selected && this.onSelect) {
@@ -1266,6 +1266,17 @@ export class TreeSelectorComponent extends Container implements Focusable {
 	private labelInputContainer: Container;
 	private treeContainer: Container;
 	private onLabelChangeCallback?: (entryId: string, label: string | undefined) => void;
+	private readonly getTerminalRows: () => number;
+
+	/**
+	 * Rows the tree list may show. The selector renders inside the dock (tray,
+	 * editor, and footer sit below it), so the budget is the terminal height
+	 * minus those members; the header block takes the other half. Read per
+	 * render so a resize takes effect immediately.
+	 */
+	private effectiveMaxVisibleLines(): number {
+		return Math.max(5, Math.floor((this.getTerminalRows() - 7) / 2));
+	}
 
 	// Focusable implementation - propagate to labelInput when active for IME cursor positioning
 	private _focused = false;
@@ -1283,7 +1294,7 @@ export class TreeSelectorComponent extends Container implements Focusable {
 	constructor(
 		tree: AgentConnectionSessionTreeNode[],
 		currentLeafId: string | null,
-		terminalHeight: number,
+		terminalHeight: number | (() => number),
 		onSelect: (entryId: string) => void,
 		onCancel: () => void,
 		onLabelChange?: (entryId: string, label: string | undefined) => void,
@@ -1295,9 +1306,17 @@ export class TreeSelectorComponent extends Container implements Focusable {
 		super();
 
 		this.onLabelChangeCallback = onLabelChange;
-		const maxVisibleLines = Math.max(5, Math.floor(terminalHeight / 2));
+		// A getter keeps the budget live across resizes; a plain number is the
+		// old construction-time snapshot (tests and older call sites).
+		this.getTerminalRows = typeof terminalHeight === "function" ? terminalHeight : () => terminalHeight;
 
-		this.treeList = new TreeList(tree, currentLeafId, maxVisibleLines, initialSelectedId, initialFilterMode);
+		this.treeList = new TreeList(
+			tree,
+			currentLeafId,
+			() => this.effectiveMaxVisibleLines(),
+			initialSelectedId,
+			initialFilterMode,
+		);
 		this.treeList.onSelect = onSelect;
 		this.treeList.onCancel = onCancel;
 		this.treeList.onLabelEdit = (entryId, currentLabel) => this.showLabelInput(entryId, currentLabel);

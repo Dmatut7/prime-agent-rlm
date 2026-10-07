@@ -163,6 +163,99 @@ describe("Markdown component", () => {
 			assert.ok(numberedLines[1].startsWith("2."), `Second item should be "2.", got: ${numberedLines[1]}`);
 			assert.ok(numberedLines[2].startsWith("3."), `Third item should be "3.", got: ${numberedLines[2]}`);
 		});
+
+		it("indents nested levels by two columns with production-theme bullet colors", () => {
+			// Production themes emit 38;5/38;2 codes; the old nested-list detection
+			// hardcoded chalk's 36m cyan, so every nested list misindented (and the
+			// error compounded per level: 4, 10, 22 … columns).
+			const productionTheme = {
+				...defaultMarkdownTheme,
+				listBullet: (text: string) => `\x1b[38;5;75m${text}\x1b[39m`,
+			};
+			const markdown = new Markdown("- parent\n  - child\n    - grandchild", 0, 0, productionTheme);
+
+			const plainLines = markdown.render(80).map((line) => stripAnsi(line).trimEnd());
+
+			assert.equal(plainLines[0], "- parent");
+			assert.equal(plainLines[1], "  - child");
+			assert.equal(plainLines[2], "    - grandchild");
+		});
+
+		it("does not double-bullet a parent item that has no text", () => {
+			const productionTheme = {
+				...defaultMarkdownTheme,
+				listBullet: (text: string) => `\x1b[38;5;75m${text}\x1b[39m`,
+			};
+			const markdown = new Markdown("-\n  - child of empty parent", 0, 0, productionTheme);
+
+			const plainLines = markdown.render(80).map((line) => stripAnsi(line).trimEnd());
+
+			assert.equal(
+				plainLines.filter((line) => line.includes("child of empty parent")).length,
+				1,
+				`the child must appear exactly once, got ${JSON.stringify(plainLines)}`,
+			);
+			assert.ok(
+				plainLines.some((line) => line === "  - child of empty parent"),
+				`the child line must carry exactly one bullet, got ${JSON.stringify(plainLines)}`,
+			);
+		});
+	});
+
+	describe("Block content inside list items", () => {
+		it("renders a GFM table inside a list item instead of dropping it", () => {
+			const markdown = new Markdown(
+				"- item:\n\n  | a | b |\n  | --- | --- |\n  | 1 | 2 |\n",
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const plainLines = markdown.render(80).map((line) => stripAnsi(line));
+
+			assert.ok(
+				plainLines.some((line) => line.includes("item")),
+				`the list item must render, got ${JSON.stringify(plainLines)}`,
+			);
+			assert.ok(
+				plainLines.some((line) => line.includes("a") && line.includes("b")),
+				`table headers must render, got ${JSON.stringify(plainLines)}`,
+			);
+			assert.ok(
+				plainLines.some((line) => line.includes("1") && line.includes("2")),
+				`table cells must render, got ${JSON.stringify(plainLines)}`,
+			);
+		});
+
+		it("renders a blockquote inside a list item with parsed inline markdown", () => {
+			const markdown = new Markdown("- item:\n\n  > quoted **bold** text\n", 0, 0, defaultMarkdownTheme);
+
+			const plainLines = markdown.render(80).map((line) => stripAnsi(line));
+
+			assert.ok(
+				plainLines.some((line) => line.includes("quoted") && line.includes("bold")),
+				`the quoted text must render, got ${JSON.stringify(plainLines)}`,
+			);
+			assert.ok(
+				!plainLines.some((line) => line.includes("**")),
+				`markdown markers must be parsed, not echoed raw, got ${JSON.stringify(plainLines)}`,
+			);
+		});
+
+		it("renders a heading inside a list item", () => {
+			const markdown = new Markdown("- item:\n\n  ## Heading in item\n", 0, 0, defaultMarkdownTheme);
+
+			const plainLines = markdown.render(80).map((line) => stripAnsi(line));
+
+			assert.ok(
+				plainLines.some((line) => line.includes("Heading in item")),
+				`the heading text must render, got ${JSON.stringify(plainLines)}`,
+			);
+			assert.ok(
+				!plainLines.some((line) => line.includes("##")),
+				`heading markers must be parsed, not echoed raw, got ${JSON.stringify(plainLines)}`,
+			);
+		});
 	});
 
 	describe("Tables", () => {

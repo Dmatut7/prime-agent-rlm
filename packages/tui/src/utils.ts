@@ -1380,6 +1380,19 @@ export function sliceByColumn(line: string, startCol: number, length: number, st
 	return sliceWithWidth(line, startCol, length, strict).text;
 }
 
+/**
+ * Clamp a line to `width` visible columns, or return it unchanged if it fits.
+ *
+ * sliceWithWidth only carries ANSI codes whose column falls inside the range,
+ * so a plain slice of an overwide line drops the trailing SGR/OSC8 reset the
+ * renderer appends to every line. Re-attach it here: otherwise the clamped
+ * line leaks its background color or an open hyperlink into the row below.
+ */
+export function clampOverwideLine(line: string, width: number): string {
+	if (visibleWidth(line) <= width) return line;
+	return `${sliceByColumn(line, 0, width, true)}\x1b[0m\x1b]8;;\x07`;
+}
+
 /** Like sliceByColumn but also returns the actual visible width of the result. */
 export function sliceWithWidth(
 	line: string,

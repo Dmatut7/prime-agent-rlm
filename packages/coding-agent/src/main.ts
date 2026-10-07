@@ -72,7 +72,7 @@ import {
 	type ScopedModel,
 } from "./core/model-resolver.js";
 import { flushOrphanProcessJournal } from "./core/orphan-process-journal.js";
-import { restoreStdout, takeOverStdout } from "./core/output-guard.js";
+import { restoreStdout, takeOverStdout, writeRawStdout } from "./core/output-guard.js";
 import type { CreateAgentSessionOptions } from "./core/sdk.js";
 import {
 	formatMissingSessionCwdPrompt,
@@ -1577,16 +1577,19 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	if (parsed.version) {
-		console.log(VERSION);
+		// Human-readable meta output must land on the real stdout even after the
+		// print-mode takeover redirected console output to stderr: `v=$(prime-agent
+		// --version)` in a script must not capture an empty string.
+		writeRawStdout(`${VERSION}\n`);
 		process.exit(0);
 	}
 	if (shouldTreatLoneVerboseFlagAsVersion(args)) {
-		console.log(VERSION);
+		writeRawStdout(`${VERSION}\n`);
 		console.error(wrapForStderr(chalk.dim("-v is the verbose flag; use -V or --version to print the version.")));
 		process.exit(0);
 	}
 	if (parsed.help) {
-		console.log(formatTopLevelHelp(getStdoutWidth()));
+		writeRawStdout(`${formatTopLevelHelp(getStdoutWidth())}\n`);
 		process.exit(0);
 	}
 
@@ -1601,14 +1604,14 @@ export async function main(args: string[], options?: MainOptions) {
 			console.error(wrapForStderr(chalk.red(`Error: ${message}`)));
 			process.exit(1);
 		}
-		console.log(`Exported to: ${result}`);
+		writeRawStdout(`Exported to: ${result}\n`);
 		// The HTML export embeds the full session (cwd, usernames, emails) as base64,
 		// invisible at a plain-text glance at the file: say what it carries next to the
 		// path that was just printed (round-27 SEC-5). A read that fails does not
 		// invalidate the export, it just drops the notice.
 		const identityHint = shareExportIdentityHintFromFile(result);
 		if (identityHint !== undefined) {
-			console.log(wrapForStdout(chalk.yellow(identityHint)));
+			writeRawStdout(`${wrapForStdout(chalk.yellow(identityHint))}\n`);
 		}
 		process.exit(0);
 	}

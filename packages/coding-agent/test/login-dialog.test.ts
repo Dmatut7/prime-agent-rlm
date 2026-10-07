@@ -217,4 +217,25 @@ describe("LoginDialogComponent", () => {
 		expect(output).not.toContain("─");
 		expect(output).not.toContain("> ");
 	});
+
+	it("renders exactly one manual input when a failed submission falls back to showPrompt", async () => {
+		// A paste that parses to no code (e.g. an error redirect) makes the OAuth
+		// flow call onPrompt after showManualInput already attached the input;
+		// addChild is a plain push, so the second call used to render two copies.
+		const dialog = new LoginDialogComponent(createFakeTui(), "anthropic", () => {}, "Anthropic");
+		dialog.showAuth("https://example.com/oauth", "Code: abc-123");
+
+		const manual = dialog.showManualInput("粘贴到这里");
+		dialog.handleInput("\r");
+		await expect(manual).resolves.toBe("");
+
+		void dialog.showPrompt("Login failed, paste the redirect URL instead");
+
+		const output = stripAnsi(dialog.render(88).join("\n"));
+		// One line is the section's muted prompt text; the remaining matches are
+		// the input row itself, which must appear exactly once (it used to be
+		// pushed into the container twice by the fallback).
+		const matches = output.split("\n").filter((line) => line.includes("粘贴到这里"));
+		expect(matches).toHaveLength(2);
+	});
 });
