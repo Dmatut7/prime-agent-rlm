@@ -67,6 +67,7 @@ import {
 	formatAgentMessageQueuedNotice,
 	formatAgentSessionNameUnavailable,
 	normalizeAgentSessionMessage,
+	openRunStartedAt,
 	selectAgentFamilyDirectory,
 	sessionNameReservationKey,
 } from "../../core/agent-messages.js";
@@ -131,6 +132,7 @@ import {
 	type SessionPassivationSnapshot,
 } from "../../core/session-action-store.js";
 import { deleteSessionArtifacts, deleteSessionFile } from "../../core/session-file-actions.js";
+import { matchesSessionIdSuffix } from "../../core/session-id.js";
 import { acquireSessionLeaseAsync, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
 import {
 	appendOwnedSessionLineAsync,
@@ -2266,7 +2268,12 @@ export class AgentDaemon {
 				entry.childId === target ||
 				resolve(entry.sessionFile) === resolve(target) ||
 				info.id === target ||
-				(info.name ?? entry.sessionName) === target,
+				(info.name ?? entry.sessionName) === target ||
+				// The supervisor matched this row by id suffix and forwarded the
+				// selector verbatim (its preservesSelector branch); a passive row must
+				// answer the same selector its roster row was picked with, the way the
+				// resident resolver (resolveActiveSessionState) answers suffixes.
+				matchesSessionIdSuffix(info.id, target),
 		);
 		if (matches.length > 1) {
 			throw new Error(`Session selector "${target}" is ambiguous`);
@@ -6751,6 +6758,10 @@ export class AgentDaemon {
 		const transcriptWindow = capabilities.has("slim_attach_transcript")
 			? slimAttachTranscriptWindow(session.messages)
 			: undefined;
+		// Rev 50: the run in flight started before whatever window a snapshot
+		// carries, and a windowed client cannot scan back to it - report the exact
+		// start from the full transcript. An idle session has no run to report.
+		const turnStartedAt = session.isStreaming ? openRunStartedAt(session.messages) : undefined;
 		return {
 			activeSessionId: state.activeSessionId,
 			summary: summaryForActiveSession(state),
@@ -6770,6 +6781,7 @@ export class AgentDaemon {
 			...(transcriptWindow && transcriptWindow.omittedMessages > 0
 				? { messagesOmitted: transcriptWindow.omittedMessages }
 				: {}),
+			...(turnStartedAt !== undefined ? { turnStartedAt } : {}),
 		};
 	}
 

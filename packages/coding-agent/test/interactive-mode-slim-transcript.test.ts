@@ -16,6 +16,7 @@ import { CustomEditor } from "../src/modes/interactive/components/custom-editor.
 import { InjectedPromptMessageComponent } from "../src/modes/interactive/components/injected-prompt-message.js";
 import { formatKeyText } from "../src/modes/interactive/components/keybinding-hints.js";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
+import { TURN_KEY_REVEAL_MARKER, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { TurnStripComponent } from "../src/modes/interactive/components/turn-strip.js";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
 import { InteractiveMode, SLIM_TRANSCRIPT_PAGE_SIZE } from "../src/modes/interactive/interactive-mode.js";
@@ -544,6 +545,41 @@ describe("slim attach transcript backfill (rev 44)", () => {
 		expect(mode.showError).not.toHaveBeenCalled();
 		expect(chatText(mode)).toContain("older question");
 	});
+
+	it("a page load's row measurement does not spend an armed turn reveal marker", async () => {
+		// The splice's before/after row counts render the whole chat; that render
+		// lands between an expansion key arming the turn head's one-shot reveal and
+		// the frame that owes it, so it must cascade through renderForMeasurement.
+		const page = transcript(2, "older", 0);
+		const getMessagesWindow = vi.fn(async () => ({ messages: page, totalMessages: 254, firstIndex: 246 }));
+		// A turn with a tool step renders rows its head can carry the marker on.
+		const tail: AgentMessage[] = [
+			userMessage(500, "tail question"),
+			assistantToolCall(500, "tc-tail"),
+			toolResult(500, "tc-tail", "ok"),
+			assistantMessage(501, "tail answer"),
+		];
+		const mode = createHarness({
+			slimTranscriptOmitted: 250,
+			agentConnection: { getMessagesWindow },
+		});
+		await proto.renderSessionContext.call(mode, sessionContext(tail), {});
+		const chat = mode.chatContainer as Container;
+		const summaries = chat.children.filter(
+			(child): child is TurnSummaryComponent => child instanceof TurnSummaryComponent,
+		);
+		expect(summaries.length).toBeGreaterThan(0);
+		const summary = summaries.at(-1);
+		expect(summary?.render(120).length).toBeGreaterThan(0);
+		summary?.armRevealMarker();
+
+		await proto.loadEarlierTranscriptPage.call(mode);
+
+		expect(mode.showError).not.toHaveBeenCalled();
+		expect(mode.slimTranscriptOmitted).toBe(246);
+		const lines = chat.children.flatMap((child) => child.render(120));
+		expect(lines.some((line) => line.includes(TURN_KEY_REVEAL_MARKER))).toBe(true);
+	});
 });
 
 describe("slim attach omission seeding (rev 44)", () => {
@@ -713,6 +749,80 @@ describe("slim attach omission seeding (rev 44)", () => {
 
 		expect(mode.turnStartedAt).toBeUndefined();
 		expect(mode.workingStartedAt).toBe(1234);
+	});
+
+	it("anchors the working clock at the snapshot's turn start when the attach window starts mid-run", async () => {
+		// The slim tail holds only mid-turn steps, so the window scan cannot see the
+		// run's own start; the snapshot's turnStartedAt (rev 50, computed daemon-side
+		// from the full transcript) is the authoritative anchor, not the window's
+		// oldest visible message.
+		const mode = createHarness({
+			connectionState: { isStreaming: true, isCompacting: false, isBashRunning: false, retryAttempt: 0 },
+			workingStartedAt: 1_700_000_000_000,
+			agentConnection: {
+				getInitialSnapshot: vi.fn(async () => ({
+					state: { compactionCount: 0, isStreaming: true, isBashRunning: false },
+					messages: [assistantToolCall(900, "tool-1"), toolResult(900, "tool-1", "ok")],
+					messagesOmitted: 2,
+					turnStartedAt: 800,
+				})),
+			},
+			getSessionContextFromConnectionSnapshot: vi.fn((snap: { messages: AgentMessage[] }) => ({
+				messages: snap.messages,
+				thinkingLevel: "medium",
+				serviceTier: "default",
+				model: null,
+			})),
+			seedSubagentSummary: vi.fn(),
+			applyConnectionStateSnapshot: vi.fn(),
+			applySnapshotQuotaPark: vi.fn(),
+			renderSessionContext: vi.fn(async () => {}),
+			restoreStreamingMessageFromSnapshot: vi.fn(async () => {}),
+			showDutyLog: vi.fn(async () => {}),
+			scheduleEditorHistoryBackfill: vi.fn(),
+			rlmNodeId: undefined,
+		});
+
+		await proto.renderInitialMessages.call(mode);
+
+		expect(mode.turnStartedAt).toBe(800);
+		expect(mode.workingStartedAt).toBe(800);
+	});
+
+	it("anchors the working clock at the resync snapshot's turn start when the window starts mid-run", async () => {
+		const mode = createHarness({
+			connectionState: { isStreaming: true, isCompacting: false, isBashRunning: false, retryAttempt: 0 },
+			workingStartedAt: 1_700_000_000_000,
+			applyConnectionStateSnapshot: vi.fn(),
+			refreshQueueSelectionFromState: vi.fn(),
+			getSessionContextFromConnectionSnapshot: vi.fn((snap: { messages: AgentMessage[] }) => ({
+				messages: snap.messages,
+				thinkingLevel: "medium",
+				serviceTier: "default",
+				model: null,
+			})),
+			replaceSubagentSummary: vi.fn(),
+			renderSessionContext: vi.fn(async () => {}),
+			restoreStreamingMessageFromSnapshot: vi.fn(async () => {}),
+			updatePendingMessagesDisplay: vi.fn(),
+			updateTerminalTitle: vi.fn(),
+			setGoalAnnouncementBaseline: vi.fn(),
+			getGoalState: vi.fn(() => ({ active: false })),
+			syncGoalTray: vi.fn(),
+			syncWorkingLoader: vi.fn(),
+			reconcileSubagentTimeline: vi.fn(),
+			rlmNodeId: undefined,
+		});
+
+		await proto.renderResyncedSession.call(mode, {
+			state: { isStreaming: true, isBashRunning: false },
+			messages: [assistantToolCall(900, "tool-1"), toolResult(900, "tool-1", "ok")],
+			messagesOmitted: 2,
+			turnStartedAt: 800,
+		});
+
+		expect(mode.turnStartedAt).toBe(800);
+		expect(mode.workingStartedAt).toBe(800);
 	});
 
 	function resyncHarness(): ModeFake {

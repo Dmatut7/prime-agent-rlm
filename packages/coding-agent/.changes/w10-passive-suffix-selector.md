@@ -1,0 +1,1 @@
+- Fixed rename and cron_add failing on a passivated subagent row picked by session-id suffix: the worker now resolves the suffix the roster matched, and reports an unambiguous error when the suffix names two rows.

@@ -321,6 +321,8 @@ describe("daemon protocol helpers", () => {
 		expect(sources.stallExemption).toContain("export interface StallExemptionDiagnostics");
 		expect(sources.snapshotWrapper).toContain("export interface DaemonSessionSnapshot");
 		expect(sources.snapshotWrapper).toContain("bound?: SessionTreeDepthStats");
+		// Rev 50: the run-in-flight start rides the snapshot wrapper.
+		expect(sources.snapshotWrapper).toContain("turnStartedAt?: number;");
 		expect(sources.treeAssembly).toContain("private async handleGetSessionTree(");
 		// The assembly slice must carry the actual response keys, not just the handler
 		// name: a renamed key with a stale marker would otherwise hash unrelated text.

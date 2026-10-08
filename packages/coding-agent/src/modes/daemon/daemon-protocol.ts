@@ -425,8 +425,26 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 49 unifies the two lane-local 48 bumps: ext and snap each raised the
 //   same baseline revision from parallel worktrees, so the merged protocol takes
 //   49 with both additions above landing together and one recomputed digest.
-export const DAEMON_SCHEMA_REVISION = 49;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-49-cdf62eb50de6";
+// Revision 50 adds the optional DaemonSessionSnapshot.turnStartedAt field and
+//   the optional session_replaced.turnStartedAt field (wave-10 mid-run attach
+//   clock): a snapshot built while the session is streaming carries the epoch-ms
+//   start of the run still in flight, computed from the full transcript, so a
+//   slim mid-run attach no longer anchors its "working for X" clock at the tail
+//   window's oldest visible message (an understatement that could reach hours in
+//   a long tool turn). Backward-compatible addition in the rev-43/44/46/48
+//   class: the field is plain optional metadata an old client ignores, a new
+//   client reading an old daemon's absent field falls back to scanning the
+//   messages it has exactly as before, and no capability gate is needed because
+//   no shape the client depends on changed - the window itself is unchanged.
+//   The worker fills it from the full transcript in createSessionSnapshot
+//   (attach, replacement, resync all build through it), the supervisor's inline
+//   replacement catch-up copies it from the attach-time snapshot the way rev 48
+//   copied children/parent/quotaPark, and the chunked replacement branch is
+//   untouched because its snapshotFollows transfer already carries the full
+//   snapshot. The digest recomputation covers the snapshot-wrapper and
+//   outbound-union growth.
+export const DAEMON_SCHEMA_REVISION = 50;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-50-6e033641088e";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -877,6 +895,17 @@ export interface DaemonSessionSnapshot {
 	 * the full transcript, so messages.length + messagesOmitted equals it.
 	 */
 	messagesOmitted?: number;
+	/**
+	 * Rev 50: the epoch-ms start of the run still in flight at snapshot build
+	 * time, computed from the full transcript the window was cut from. Present
+	 * only while the session is streaming; absence means "no run in flight, or
+	 * an old daemon" - a new client then anchors the working clock by scanning
+	 * the (possibly windowed) messages it has, exactly as before. Carried on
+	 * every snapshot built for the client (attach, replacement, resync), so a
+	 * mid-run slim attach no longer anchors its clock at the tail window's
+	 * oldest message.
+	 */
+	turnStartedAt?: number;
 }
 
 /**
@@ -2119,6 +2148,14 @@ export type DaemonOutbound =
 			 * heartbeat heals it", never "clear".
 			 */
 			quotaPark?: DaemonSessionSnapshotQuotaPark;
+			/**
+			 * Rev 50: the run-in-flight start copied from the attach-time snapshot
+			 * (DaemonSessionSnapshot.turnStartedAt), so a windowed replacement
+			 * rebuild keeps the working clock anchored at the run's real start.
+			 * Absent means the run's start is not known - the client falls back to
+			 * scanning the tail it holds.
+			 */
+			turnStartedAt?: number;
 			snapshotFollows?: boolean;
 			meta?: DaemonEventMeta;
 	  }

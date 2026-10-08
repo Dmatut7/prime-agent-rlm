@@ -431,6 +431,15 @@ export interface AgentConnectionSnapshot {
 	 * {@link AgentConnection.getMessagesWindow}.
 	 */
 	messagesOmitted?: number;
+	/**
+	 * Epoch-ms start of the run still in flight at snapshot build time (daemon
+	 * protocol rev 50), read from the full transcript the window was cut from.
+	 * Absent means no run is in flight, or the snapshot came from an old daemon
+	 * or the in-process adapter (which serve the full transcript, so a local
+	 * scan finds the same answer); the mode then anchors the working clock by
+	 * scanning `messages` itself.
+	 */
+	turnStartedAt?: number;
 	/** In-flight assistant message, separate from finalized transcript messages. */
 	streamingMessage?: AgentMessage;
 	/**

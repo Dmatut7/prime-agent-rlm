@@ -9508,6 +9508,11 @@ export class DaemonSupervisor {
 								...(attached.result.snapshot.quotaPark !== undefined
 									? { quotaPark: attached.result.snapshot.quotaPark }
 									: {}),
+								// Rev 50: the run-in-flight start, so a windowed replacement
+								// rebuild keeps the working clock at the run's real start.
+								...(attached.result.snapshot.turnStartedAt !== undefined
+									? { turnStartedAt: attached.result.snapshot.turnStartedAt }
+									: {}),
 								meta,
 							}
 						: {

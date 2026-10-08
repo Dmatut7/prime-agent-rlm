@@ -4223,7 +4223,10 @@ export class InteractiveMode {
 		const bashFinished = this.isBashRunning() && !snapshot.state.isBashRunning;
 		this.applyConnectionStateSnapshot(snapshot.state);
 		this.refreshQueueSelectionFromState();
-		this.restoreTurnStartFromMessages(this.getSessionContextFromConnectionSnapshot(snapshot).messages);
+		this.restoreTurnStartFromMessages(
+			this.getSessionContextFromConnectionSnapshot(snapshot).messages,
+			snapshot.turnStartedAt,
+		);
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
 		this.rlmNodeId = snapshot.parent?.childId;
@@ -4590,25 +4593,32 @@ export class InteractiveMode {
 	}
 
 	// Recover the in-flight run's start from a restored transcript so the elapsed timer survives re-attach.
-	private restoreTurnStartFromMessages(messages: readonly AgentMessage[]): void {
+	// `turnStartedAt` (snapshot rev 50) is the daemon's answer from the full transcript; the message
+	// scan is the fallback for paths that only have the messages (an old daemon, or a window whose
+	// run start the scan then bounds at its own front).
+	private restoreTurnStartFromMessages(messages: readonly AgentMessage[], turnStartedAt?: number): void {
 		this.turnStartedAt = undefined;
 		if (!this.isAgentStreaming()) return;
-		for (let i = messages.length - 1; i >= 0; i--) {
-			const message = messages[i]!;
-			if (startsAgentRun(message)) {
-				this.turnStartedAt = message.timestamp;
-			} else if (message.role === "assistant" && message.stopReason !== "toolUse") {
-				break;
+		if (turnStartedAt !== undefined && Number.isFinite(turnStartedAt) && turnStartedAt > 0) {
+			this.turnStartedAt = turnStartedAt;
+		} else {
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const message = messages[i]!;
+				if (startsAgentRun(message)) {
+					this.turnStartedAt = message.timestamp;
+				} else if (message.role === "assistant" && message.stopReason !== "toolUse") {
+					break;
+				}
 			}
-		}
-		// A windowed view (slim attach, live-cap rebuild) can start inside the running
-		// turn: the scan then walks off the window's front without meeting the run's
-		// start. Anchor the clock at the oldest visible message instead of leaving the
-		// loader to count from the attach moment - an understatement bounded by the
-		// window, instead of one bounded by nothing.
-		if (this.turnStartedAt === undefined) {
-			const oldest = messages[0] ? Number(messages[0].timestamp) : Number.NaN;
-			if (Number.isFinite(oldest) && oldest > 0) this.turnStartedAt = oldest;
+			// A windowed view (slim attach, live-cap rebuild) can start inside the running
+			// turn: the scan then walks off the window's front without meeting the run's
+			// start. Anchor the clock at the oldest visible message instead of leaving the
+			// loader to count from the attach moment - an understatement bounded by the
+			// window, instead of one bounded by nothing.
+			if (this.turnStartedAt === undefined) {
+				const oldest = messages[0] ? Number(messages[0].timestamp) : Number.NaN;
+				if (Number.isFinite(oldest) && oldest > 0) this.turnStartedAt = oldest;
+			}
 		}
 		if (this.turnStartedAt !== undefined && this.workingStartedAt !== undefined) {
 			this.workingStartedAt = this.turnStartedAt;
@@ -9640,7 +9650,7 @@ export class InteractiveMode {
 		// Slim attach (rev 44): the tail window carries the count of older messages
 		// left on the daemon; absence means the full transcript is here.
 		this.slimTranscriptOmitted = snapshot.messagesOmitted ?? 0;
-		this.restoreTurnStartFromMessages(context.messages);
+		this.restoreTurnStartFromMessages(context.messages, snapshot.turnStartedAt);
 		await this.renderSessionContext(context, {
 			updateFooter: true,
 			populateHistory: true,
@@ -9921,6 +9931,23 @@ export class InteractiveMode {
 	}
 
 	/**
+	 * Row count of the chat for the backfill splice's measurement. Aggregation is
+	 * a flat concat of child lines, so this matches chatContainer.render() row
+	 * for row; each child renders through renderForMeasurement when it has one,
+	 * because a plain render() spends a turn head's armed reveal marker - a
+	 * one-shot the next frame owes - on output this measurement discards.
+	 */
+	private measureChatRows(width: number): number {
+		let rows = 0;
+		for (const child of this.chatContainer.children) {
+			const measurable = child as { renderForMeasurement?: (width: number) => string[] };
+			const lines = measurable.renderForMeasurement ? measurable.renderForMeasurement(width) : child.render(width);
+			rows += lines.length;
+		}
+		return rows;
+	}
+
+	/**
 	 * The slim-attach marker's load-earlier trigger (rev 44): page the previous
 	 * SLIM_TRANSCRIPT_PAGE_SIZE messages in through get_messages before/limit and
 	 * prepend them between the marker and the attach tail. Only the prepended
@@ -10018,7 +10045,7 @@ export class InteractiveMode {
 			// page render: page components read their neighbors (a turn strip's
 			// closing row draws only when the chat after its turn is visible), and
 			// the last page also removes the marker - the delta covers both.
-			const rowsBefore = this.chatContainer.render(this.ui.terminal.columns).length;
+			const rowsBefore = this.measureChatRows(this.ui.terminal.columns);
 			this.chatContainer.children.splice(markerIndex + 1, 0, ...pageContainer.children);
 			this.slimTranscriptOmitted = page.firstIndex;
 			if (page.firstIndex === 0) {
@@ -10029,7 +10056,7 @@ export class InteractiveMode {
 			} else {
 				marker.invalidate();
 			}
-			const rowsAdded = this.chatContainer.render(this.ui.terminal.columns).length - rowsBefore;
+			const rowsAdded = this.measureChatRows(this.ui.terminal.columns) - rowsBefore;
 			this.ui.noteTranscriptPrepend(rowsAdded);
 			this.ui.requestRender();
 		} catch (error) {

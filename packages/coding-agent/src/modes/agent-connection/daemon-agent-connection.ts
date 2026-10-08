@@ -2540,6 +2540,10 @@ export class DaemonAgentConnection implements AgentConnection {
 				// Rev 46: a slim client's inline replacement catch-up carries the
 				// omission count, the same contract attach and resync already map.
 				...(message.messagesOmitted !== undefined ? { messagesOmitted: message.messagesOmitted } : {}),
+				// Rev 50: the run-in-flight start, so the rebuilt view's working clock
+				// keeps the run's real anchor. A replacement swaps the session wholesale,
+				// so the previous snapshot's start is never carried over.
+				...(message.turnStartedAt !== undefined ? { turnStartedAt: message.turnStartedAt } : {}),
 			};
 			const parent = message.parent ?? previousSnapshot?.parent;
 			if (parent) {
@@ -3475,6 +3479,10 @@ function mapDaemonSessionSnapshot(snapshot: DaemonSessionSnapshot, replay?: Daem
 	// absence means `messages` is the complete transcript.
 	if (snapshot.messagesOmitted !== undefined) {
 		connectionSnapshot.messagesOmitted = snapshot.messagesOmitted;
+	}
+	// Rev 50: the run-in-flight start as the daemon's full transcript sees it.
+	if (snapshot.turnStartedAt !== undefined) {
+		connectionSnapshot.turnStartedAt = snapshot.turnStartedAt;
 	}
 	if (replay) {
 		connectionSnapshot.replay = replay;

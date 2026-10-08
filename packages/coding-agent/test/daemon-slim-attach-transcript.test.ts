@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
+import { emptyUsage } from "../src/core/usage.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import {
@@ -329,7 +330,7 @@ interface WorkerInternals {
 	handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<DaemonResponse | undefined>;
 }
 
-function makeWorkerState(activeSessionId: string, messages: AgentMessage[]): ActiveSessionState {
+function makeWorkerState(activeSessionId: string, messages: AgentMessage[], isStreaming = false): ActiveSessionState {
 	return {
 		activeSessionId,
 		clients: new Set<DaemonSocketClient>(),
@@ -352,7 +353,7 @@ function makeWorkerState(activeSessionId: string, messages: AgentMessage[]): Act
 				state: { streamingMessage: undefined, pendingToolCalls: new Set() },
 				unfinishedActionCount: 0,
 				getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
-				isStreaming: false,
+				isStreaming,
 				isCompacting: false,
 				isBashRunning: false,
 				isSessionActive: false,
@@ -413,6 +414,70 @@ describe("worker slim attach snapshot (rev 44)", () => {
 			const snapshot = await internals.createSessionSnapshot(state, new Set(["slim_attach_transcript"]));
 			expect(snapshot.messages).toHaveLength(3);
 			expect("messagesOmitted" in snapshot).toBe(false);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("carries the in-flight run's start from the full transcript, beyond the slim window (rev 50)", async () => {
+		// A mid-run slim attach anchors its working clock at the oldest message the
+		// window shows, which can under-report by hours in a long tool turn. The
+		// snapshot now carries the run's real start, computed from the transcript the
+		// window was cut from.
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-slim-attach-worker-"));
+		try {
+			const { internals } = makeWorkerDaemon(tempDir);
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "settled question", timestamp: 1 },
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "settled answer" }],
+					api: "openai-responses",
+					provider: "openai",
+					model: "test-model",
+					usage: emptyUsage(),
+					stopReason: "stop",
+					timestamp: 2,
+				},
+				{ role: "user", content: "the running question", timestamp: 800 },
+			];
+			for (let index = 0; index < 60; index++) {
+				messages.push(
+					{
+						role: "assistant",
+						content: [{ type: "toolCall", name: "wait", id: `tc-${index}`, arguments: {} }],
+						api: "openai-responses",
+						provider: "openai",
+						model: "test-model",
+						usage: emptyUsage(),
+						stopReason: "toolUse",
+						timestamp: 801 + index,
+					},
+					{
+						role: "toolResult",
+						toolCallId: `tc-${index}`,
+						toolName: "wait",
+						content: [{ type: "text", text: "ok" }],
+						isError: false,
+						timestamp: 801.5 + index,
+					},
+				);
+			}
+			const state = makeWorkerState("active-clock", messages, true);
+
+			const snapshot = await internals.createSessionSnapshot(state, new Set(["slim_attach_transcript"]));
+			// The window starts inside the running turn, but the field names the
+			// turn's own start, which the window never sees.
+			expect(snapshot.messages.length).toBe(DAEMON_SLIM_ATTACH_MESSAGE_TAIL);
+			expect(Number(snapshot.messages[0]?.timestamp)).toBeGreaterThan(800);
+			expect(snapshot.turnStartedAt).toBe(800);
+
+			// An idle session has no run in flight: the field stays absent, which a
+			// client reads as "scan the transcript" exactly as before.
+			const idle = makeWorkerState("active-clock-idle", messages);
+			const idleSnapshot = await internals.createSessionSnapshot(idle, new Set(["slim_attach_transcript"]));
+			expect(idleSnapshot.turnStartedAt).toBeUndefined();
+			expect("turnStartedAt" in idleSnapshot).toBe(false);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -724,6 +789,7 @@ describe("supervisor slim catch-up drain (rev 44)", () => {
 			parent?: DaemonSessionSnapshot["parent"];
 			children?: DaemonSessionSnapshot["children"];
 			quotaPark?: DaemonSessionSnapshot["quotaPark"];
+			turnStartedAt?: DaemonSessionSnapshot["turnStartedAt"];
 		};
 	}) {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-slim-catchup-"));
@@ -890,6 +956,25 @@ describe("supervisor slim catch-up drain (rev 44)", () => {
 			expect(frame.parent).toEqual(parent);
 			expect(frame.children).toEqual(children);
 			expect(frame.quotaPark).toEqual(quotaPark);
+		} finally {
+			fixture.dispose();
+		}
+	});
+
+	it("carries the run's start on the inline replacement catch-up (rev 50)", async () => {
+		// Same class as rev 48: the inline windowed replacement rebuilt the client's
+		// view from the tail alone, so the working clock re-anchored at the window's
+		// oldest message instead of the run's real start.
+		const fixture = makeCatchupFixture({
+			messageCount: DAEMON_SLIM_ATTACH_MESSAGE_TAIL + 50,
+			snapshotExtras: { turnStartedAt: 800 },
+		});
+		try {
+			await fixture.supervisor.drainClientCatchups(fixture.client);
+			const replaced = fixture.written.filter((message) => message.type === "session_replaced");
+			expect(replaced).toHaveLength(1);
+			const frame = replaced[0] as Extract<DaemonOutbound, { type: "session_replaced" }>;
+			expect(frame.turnStartedAt).toBe(800);
 		} finally {
 			fixture.dispose();
 		}

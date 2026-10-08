@@ -3674,6 +3674,45 @@ describe("DaemonAgentConnection", () => {
 		await connection.dispose();
 	});
 
+	it("mirrors turnStartedAt from the attach snapshot (rev 50)", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const tail: AgentMessage[] = [{ role: "user", content: "tail prompt", timestamp: 100 }];
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12, {
+				messages: tail,
+			});
+			return { ...result, snapshot: { ...result.snapshot, messagesOmitted: 250, turnStartedAt: 42 } };
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		const snapshot = await connection.getInitialSnapshot();
+		expect(snapshot.messages).toEqual(tail);
+		expect(snapshot.turnStartedAt).toBe(42);
+		await connection.dispose();
+	});
+
+	it("mirrors turnStartedAt from an inline windowed session_replaced (rev 50)", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		const tail: AgentMessage[] = [{ role: "user", content: "replacement tail", timestamp: 300 }];
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-1",
+			state: createConnectionState("active-1", "session-current"),
+			messages: tail,
+			messagesOmitted: 250,
+			turnStartedAt: 42,
+		});
+
+		const snapshot = await connection.getInitialSnapshot();
+		expect(snapshot.messages).toEqual(tail);
+		expect(snapshot.messagesOmitted).toBe(250);
+		expect(snapshot.turnStartedAt).toBe(42);
+		await connection.dispose();
+	});
+
 	it("mirrors messagesOmitted from an inline windowed session_replaced (rev 46)", async () => {
 		// The supervisor's catch-up drain serves a slim client's replacement as an
 		// inline tail window; the omission count must survive onto the connection

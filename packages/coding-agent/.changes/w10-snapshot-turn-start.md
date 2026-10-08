@@ -1,0 +1,1 @@
+- Fixed a mid-run reattach understating the "working" clock: the snapshot now carries the in-flight run's real start time, so a slim attach no longer counts from the oldest message the window shows.

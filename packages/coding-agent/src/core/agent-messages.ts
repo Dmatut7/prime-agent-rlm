@@ -861,6 +861,28 @@ export function startsAgentRun(message: AgentMessage): boolean {
 	);
 }
 
+/**
+ * The start of the run still open at the transcript's end, when one is: the
+ * oldest run-starter of the tail that has no settled assistant reply (an
+ * assistant that ended on anything but "toolUse" closes its run) between it and
+ * the end. A windowed view of the transcript cannot see past its own front, so
+ * callers that only hold a window get undefined here and must fall back to an
+ * anchor of their own; the daemon holds the full transcript and reports the
+ * exact start through the snapshot's turnStartedAt.
+ */
+export function openRunStartedAt(messages: readonly AgentMessage[]): number | undefined {
+	let startedAt: number | undefined;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index]!;
+		if (startsAgentRun(message)) {
+			startedAt = message.timestamp;
+		} else if (message.role === "assistant" && message.stopReason !== "toolUse") {
+			break;
+		}
+	}
+	return startedAt;
+}
+
 export interface AgentSessionMessageQueuedFacts {
 	reason?: AgentMessageQueuedReason;
 	position?: number;

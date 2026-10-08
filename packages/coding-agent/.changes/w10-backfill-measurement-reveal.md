@@ -1,0 +1,1 @@
+- Fixed an expansion key's screen reveal being lost when a backfill page loaded in between: the load's row measurement no longer spends the turn head's one-shot reveal marker on discarded output.

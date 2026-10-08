@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
+	appendFileSync,
 	chmodSync,
 	existsSync,
 	mkdirSync,
@@ -6079,6 +6080,100 @@ describe("daemon mode helpers", () => {
 				runtimeKind: "subagent",
 			});
 			expect(internals.cronStore.list().map((candidate) => candidate.id)).toContain(job?.id);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("renames a passivated child addressed by an id suffix through hydration", async () => {
+		// The supervisor's matchWorkers resolves an id-suffix selector to the
+		// passivated roster row and forwards the selector verbatim
+		// (preservesSelector); the worker must answer the same suffix its row was
+		// picked with, or the rename fails on a row the user can see.
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passive-rename-suffix-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			const parentState = await internals.createRuntime({
+				type: "create",
+				sessionPath: fixture.parentSessionFile,
+			});
+			const childInfo = await readSessionInfo(fixture.childSessionFile);
+			if (!childInfo) throw new Error("Missing child session info");
+			const suffix = childInfo.id.replaceAll("-", "").slice(-8);
+
+			const response = (await internals.handleCommand(makeClient("client-1", parentState.activeSessionId), {
+				id: "rename-suffix-1",
+				type: "rename",
+				activeSessionId: suffix,
+				name: "awakened-by-suffix",
+			})) as { success: boolean; data?: { sessionName?: string } };
+
+			expect(response.success).toBe(true);
+			expect(response.data?.sessionName).toBe("awakened-by-suffix");
+			expect((await readSessionInfo(fixture.childSessionFile))?.name).toBe("awakened-by-suffix");
+			const hydratedChildren = [...internals.sessions.values()].filter(
+				(state) => state.runtime.session.sessionFile === fixture.childSessionFile,
+			);
+			expect(hydratedChildren).toHaveLength(1);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects an id suffix that matches two passive children instead of picking one", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passive-suffix-ambiguous-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				getOrHydrateBoundSessionState(id: string): Promise<ActiveSessionState>;
+			};
+			const childInfo = await readSessionInfo(fixture.childSessionFile);
+			if (!childInfo) throw new Error("Missing child session info");
+			// A second passive child whose session id differs from the first only in
+			// its leading digit, so the shared suffix cannot name one row.
+			const digits = childInfo.id.replaceAll("-", "");
+			const flipped = digits[0] === "0" ? "1" : "0";
+			const secondId = `${flipped}${childInfo.id.slice(1)}`;
+			const secondSessionDir = join(fixture.parentArtifactDir, "sub-5678ffff");
+			const secondManager = SessionManager.create(tempDir, secondSessionDir);
+			secondManager.newSession({ parentSession: fixture.parentSessionFile, id: secondId });
+			secondManager.appendSessionInfo("second-worker");
+			secondManager.appendMessage({ role: "user", content: "complete the second task", timestamp: 1 });
+			secondManager.flushNow();
+			const secondSessionFile = secondManager.getSessionFile();
+			if (!secondSessionFile) throw new Error("Missing second child session file");
+			appendFileSync(
+				join(fixture.parentArtifactDir, "rlm-subagents.jsonl"),
+				`${JSON.stringify({
+					type: "rlm_subagent",
+					childId: "child-2",
+					sessionName: "second-worker",
+					sessionDir: secondSessionDir,
+					sessionFile: secondSessionFile,
+					parentSessionId: fixture.parentSessionId,
+					parentSessionFile: fixture.parentSessionFile,
+					rlmDepth: 1,
+					rlmMaxDepth: 4,
+					rlmParentNodeId: "child-2",
+					status: "completed",
+					createdAt: 1,
+					updatedAt: "2026-01-01T00:00:00.000Z",
+				})}
+`,
+			);
+
+			await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const suffix = digits.slice(-8);
+
+			await expect(internals.getOrHydrateBoundSessionState(suffix)).rejects.toThrow(
+				`Session selector "${suffix}" is ambiguous`,
+			);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
