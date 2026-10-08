@@ -730,6 +730,11 @@ type BashRenderState = {
 	 * 1s tick rewrites it in place instead of rebuilding the whole block.
 	 */
 	elapsedComponent: Text | undefined;
+	/**
+	 * Releases the 1s tick. The final render clears it too, but a row dropped
+	 * mid-run (session swap, chat rebuild) never gets that render.
+	 */
+	dispose?: () => void;
 };
 
 /** The assembled collapsed frame, while nothing that shapes it has moved. */
@@ -1354,15 +1359,18 @@ export function createBashToolDefinition(
 		},
 		renderResult(result, options, _theme, context) {
 			const state = context.state;
+			state.dispose ??= () => {
+				if (state.interval) {
+					clearInterval(state.interval);
+					state.interval = undefined;
+				}
+			};
 			if (state.startedAt !== undefined && options.isPartial && !state.interval) {
 				state.interval = setInterval(() => refreshRunningElapsed(context, state), 1000);
 			}
 			if (!options.isPartial || context.isError) {
 				state.endedAt ??= Date.now();
-				if (state.interval) {
-					clearInterval(state.interval);
-					state.interval = undefined;
-				}
+				state.dispose();
 			}
 			const component =
 				(context.lastComponent as BashResultRenderComponent | undefined) ?? new BashResultRenderComponent();

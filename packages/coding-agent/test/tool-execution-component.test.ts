@@ -1087,3 +1087,65 @@ describe("key-steps fold outranks the per-tool expanded flag (TUI v4 T6 regressi
 		expect(edge.join("").includes("out call_0")).toBe(true); // edge stays
 	});
 });
+
+describe("bash elapsed tick lifecycle", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+
+	test("stops the 1s elapsed tick when the running component is dropped", () => {
+		// A session swap or chat rebuild drops the component before the final render
+		// that would clear the tick: dropping it must release the timer, or it keeps
+		// requesting a frame every second for the rest of the process.
+		vi.useFakeTimers();
+		try {
+			const requestRender = vi.fn();
+			const tui = { requestRender } as unknown as TUI;
+			const component = new ToolExecutionComponent(
+				"bash",
+				"bash-drop",
+				{ command: "sleep 60" },
+				{},
+				undefined,
+				tui,
+				process.cwd(),
+			);
+			component.markExecutionStarted();
+			component.updateResult({ content: [{ type: "text", text: "partial output" }], isError: false }, true);
+			component.render(120);
+			requestRender.mockClear();
+			vi.advanceTimersByTime(1_000);
+			expect(requestRender).toHaveBeenCalled();
+			component.dispose();
+			requestRender.mockClear();
+			vi.advanceTimersByTime(10_000);
+			expect(requestRender).not.toHaveBeenCalled();
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("dispose releases what a renderer stored on its render state", () => {
+		const release = vi.fn();
+		const toolDefinition: ToolDefinition = {
+			...createBaseToolDefinition(),
+			renderResult: (_result, _options, _theme, context) => {
+				context.state.dispose = release;
+				return new Text("result", 0, 0);
+			},
+		};
+		const component = new ToolExecutionComponent(
+			"custom_tool",
+			"tool-release",
+			{},
+			{},
+			toolDefinition,
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.updateResult({ content: [{ type: "text", text: "done" }], details: {}, isError: false }, true);
+		component.dispose();
+		expect(release).toHaveBeenCalledTimes(1);
+	});
+});

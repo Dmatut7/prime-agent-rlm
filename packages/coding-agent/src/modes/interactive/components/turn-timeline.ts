@@ -117,14 +117,7 @@ export interface ThinkingTiming {
 	usageAtEnd?: number;
 }
 
-/** A text shown in steps that only change at sentence boundaries or after a pause. */
-interface SteadyText {
-	shown: number;
-	shownAt: number;
-}
-
 /** Where a sentence or clause ends. */
-const CLAUSE_END = /[。！？!?；;：:，,…]|\.(?=\s|$)|\n/g;
 const SENTENCE_END = /[。！？!?；;…]|\.(?=\s|$)|\n/g;
 
 /** The last complete sentence of a trace; "" while the first one is still being written. */
@@ -370,8 +363,6 @@ export class TurnTimeline implements LaneOwner {
 	readonly stepHandleContext = new Map<string, ReadonlyMap<string, string>>();
 	private seq = 0;
 	private tokenPeak = 0;
-	private readonly steady = new Map<string, SteadyText>();
-	private readonly steadyLines = new Map<string, { text: string; at: number }>();
 
 	private nextSeq(): number {
 		this.seq += 1;
@@ -765,36 +756,6 @@ export class TurnTimeline implements LaneOwner {
 		}
 		this.tokenPeak = Math.max(this.tokenPeak, total);
 		return this.tokenPeak;
-	}
-
-	/**
-	 * A text that grows while it streams, shown in calm steps: it moves forward
-	 * at clause boundaries, and otherwise at most once a second.
-	 */
-	steadyPrefix(key: string, text: string, now = Date.now(), intervalMs = 1000): string {
-		const state = this.steady.get(key) ?? { shown: 0, shownAt: 0 };
-		if (text.length < state.shown) state.shown = 0;
-		const ends = [...text.matchAll(CLAUSE_END)].map((match) => (match.index ?? 0) + match[0].length);
-		const cut = ends.at(-1) ?? 0;
-		if (cut > state.shown) {
-			state.shown = cut;
-			state.shownAt = now;
-		} else if (text.length > state.shown && now - state.shownAt >= intervalMs) {
-			state.shown = text.length;
-			state.shownAt = now;
-		}
-		this.steady.set(key, state);
-		return text.slice(0, state.shown);
-	}
-
-	/** A replaced line (a command's latest output) that changes at most every `intervalMs`. */
-	steadyLine(key: string, text: string, now = Date.now(), intervalMs = 500): string {
-		const state = this.steadyLines.get(key);
-		if (!state || (state.text !== text && now - state.at >= intervalMs)) {
-			this.steadyLines.set(key, { text, at: now });
-			return text;
-		}
-		return state.text;
 	}
 
 	/**

@@ -4166,6 +4166,10 @@ export class InteractiveMode {
 
 	private resetPendingToolState(): void {
 		this.pendingToolGeneration++;
+		// A dropped component's streaming timers (the bash 1s "Elapsed" tick) get no
+		// final render from here; without this they keep repainting once a second
+		// for the rest of the process (the loader cleanup above covers the others).
+		for (const component of this.pendingTools.values()) component.dispose();
 		this.pendingTools.clear();
 		this.pendingToolCreations.clear();
 		this.startedToolCalls.clear();

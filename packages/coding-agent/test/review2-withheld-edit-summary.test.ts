@@ -7,9 +7,7 @@ import {
 	getToolFileChanges,
 	mergeTurnFileChanges,
 } from "../src/modes/interactive/components/edit-summary.js";
-import { omittedDiffText } from "../src/modes/interactive/components/timeline-rows.js";
 import { TurnActivityState } from "../src/modes/interactive/components/turn-activity.js";
-import { TurnFootNote } from "../src/modes/interactive/components/turn-footnote.js";
 import { recordStepFileChanges } from "../src/modes/interactive/live-turn-flow.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -20,8 +18,6 @@ import { initTheme } from "../src/modes/interactive/theme/theme.js";
  * line and the recap, and "改动 N 个文件" left it out. It is now listed like the strip
  * lists it: the path and the same words, no "+0 −0", counted as a file.
  */
-
-const SENSITIVE = omittedDiffText("sensitive") ?? "";
 
 const usage: Usage = {
 	input: 0,
@@ -146,40 +142,5 @@ describe("a withheld edit in the turn's file list (review2-6)", () => {
 		const state = new TurnActivityState(1_000);
 		state.addFileChanges([{ path: "src/b.ts", added: 0, removed: 0 }]);
 		expect(state.fileChanges).toEqual([]);
-	});
-
-	it("shows the path and the same words as the change strip, and no counts, in the footnote rows", () => {
-		const note = new TurnFootNote({
-			steps: 2,
-			thinkSegments: 0,
-			commMessages: 0,
-			durationMs: 1_000,
-			cols: 120,
-			fileChanges: [
-				{ path: "src/a.ts", added: 3, removed: 1 },
-				{ path: "config/.env", added: 0, removed: 0, omitted: true },
-			],
-		});
-		const rows = note.render(120).map((line) => stripAnsi(line));
-		expect(rows).toHaveLength(3);
-		expect(rows[1]).toBe("   改动  src/a.ts  +3 −1");
-		expect(rows[2]).toBe(`   改动  config/.env  ${SENSITIVE}`);
-		expect(rows[2]).not.toContain("+0");
-	});
-
-	it("keeps the words in the footnote row when the path has to be shortened", () => {
-		const note = new TurnFootNote({
-			steps: 1,
-			thinkSegments: 0,
-			commMessages: 0,
-			durationMs: 1_000,
-			cols: 60,
-			fileChanges: [
-				{ path: "packages/coding-agent/src/very/long/directory/name/.env", added: 0, removed: 0, omitted: true },
-			],
-		});
-		const row = stripAnsi(note.render(60)[1] ?? "");
-		expect(row.endsWith(SENSITIVE)).toBe(true);
-		expect(row).toContain("…");
 	});
 });

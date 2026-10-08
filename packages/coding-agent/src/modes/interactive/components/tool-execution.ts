@@ -451,6 +451,15 @@ export class ToolExecutionComponent extends Container implements FocusableBlock 
 		this.blockFocus = state;
 	}
 
+	/**
+	 * The row is going away without a final render (session swap, chat rebuild):
+	 * release what its renderers parked on the render state (a running command's
+	 * 1s "Elapsed" tick), or the timer outlives the row and repaints every second.
+	 */
+	dispose(): void {
+		(this.rendererState as { dispose?: () => void }).dispose?.();
+	}
+
 	/** The step's text output (what it printed), not its rendered decoration. */
 	getBlockCopyText(): string {
 		const details = this.result?.details as { stdout?: unknown; stderr?: unknown; result?: unknown } | undefined;

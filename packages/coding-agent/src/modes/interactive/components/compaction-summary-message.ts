@@ -1,10 +1,20 @@
 import { Clickable, Container, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
+import { stripMachineBlocks } from "../../../core/compaction/machine-blocks.js";
 import type { CompactionSummaryMessage } from "../../../core/messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import { copyFromSource } from "./block-focus.js";
 import { customMessageLabel, ExpandableCustomMessageBox } from "./expandable-custom-message.js";
 import { SystemNoticeLine } from "./system-notice.js";
 import { formatBoxTokens } from "./turn-timeline.js";
+
+/**
+ * The summary as the card shows it: the model's narrative, without the machine
+ * ledger tail (`<fact-appendix>`/`<user-requests>`/`<session-handoff>`) the
+ * compaction renderer bolts on for the next summarizer.
+ */
+function displaySummary(summary: string): string {
+	return stripMachineBlocks(summary);
+}
 
 /** Compaction summary card: full markdown summary when expanded. */
 export class CompactionSummaryMessageComponent extends ExpandableCustomMessageBox {
@@ -45,7 +55,7 @@ export class CompactionSummaryMessageComponent extends ExpandableCustomMessageBo
 				header += `**Focus:** ${instructions}\n\n`;
 			}
 			this.addChild(
-				new Markdown(header + this.message.summary, 0, 0, this.markdownTheme, {
+				new Markdown(header + displaySummary(this.message.summary), 0, 0, this.markdownTheme, {
 					color: (text: string) => theme.fg("customMessageText", text),
 				}),
 			);
@@ -88,7 +98,7 @@ export class QuietCompactionNoticeComponent extends Container {
 		const focus = this.message.customInstructions ? `**重点：** ${this.message.customInstructions}\n\n` : "";
 		this.addChild(new Spacer(1));
 		this.addChild(
-			new Markdown(focus + this.message.summary, 1, 0, this.markdownTheme, {
+			new Markdown(focus + displaySummary(this.message.summary), 1, 0, this.markdownTheme, {
 				color: (text: string) => theme.fg("customMessageText", text),
 			}),
 		);

@@ -17,7 +17,7 @@
  * ------------------
  * The numbers come from the session file's toolResult records — the same records the
  * display layer reads (components/feed-data.ts → turn-strip.ts, timeline-rows.ts
- * countsMeta/changeTotals, turn-footnote.ts):
+ * countsMeta/changeTotals):
  *
  *   - ipython tool results: `details.fileChanges` (the kernel's own change records;
  *     the primary channel on the repl-kernel line),

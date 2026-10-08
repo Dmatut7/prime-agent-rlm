@@ -11,7 +11,7 @@ import { Type } from "typebox";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent } from "../src/core/agent-session.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
-import { RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE } from "../src/core/messages.js";
+import { createCompactionOutcomeMessage, RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE } from "../src/core/messages.js";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import {
 	buildConversationComponents,
@@ -676,6 +676,46 @@ describe("a quiet turn, live", () => {
 		expect(screen.screen().match(/^ \d\d:\d\d {3}◆ {6}整理完成：[\d.]+k → [\d.]+k tokens/gm)).toHaveLength(1);
 		expect(screen.screen()).not.toContain("前面的对话整理过了");
 		expect(screen.screen()).toContain("日志看完了。");
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("settles the live compaction row when its outcome message lands before compaction_end", async () => {
+		// The session persists the skip/failure notice (message_start) ahead of compaction_end:
+		// the live "正在整理" row settles with it instead of spinning on as a ghost.
+		const screen = startScreen([]);
+		const flow = screen.flow;
+		const t0 = Date.now();
+		expect(flow.userMessage("看看日志", t0)).toBe("prompt");
+		const message = fauxAssistantMessage("看完了。", { timestamp: t0 + 1 });
+		flow.assistantStart(message);
+		flow.assistantEnd(message);
+		flow.agentEnd();
+		expect(flow.compactionStart("threshold")).toBe(true);
+		const outcome = createCompactionOutcomeMessage(
+			"Auto-compaction skipped: conversation too short",
+			{ reason: "threshold", outcome: "skipped" },
+			true,
+			t0 + 2,
+		);
+		expect(flow.customMessage(outcome)).toBe(true);
+		flow.compactionEnd({
+			reason: "threshold",
+			result: undefined,
+			aborted: false,
+			errorMessage: "Auto-compaction skipped: conversation too short",
+			errorSeverity: "warning",
+		});
+		vi.advanceTimersByTime(SETTLE_MS);
+		const box = screen.boxes()[0]!;
+		const compactions = box.state.timeline.entries.filter((entry) => entry.kind === "compact");
+		expect(compactions).toHaveLength(1);
+		const row = compactions[0]!;
+		expect(row.kind === "compact" && row.compaction.skipped).toBe(true);
+		expect(row.kind === "compact" ? row.compaction.endedAt : undefined).toBe(t0 + 2);
+		expect(box.state.timeline.activeCompaction()).toBeUndefined();
+		// The settled skip is the closing part's own line; nothing keeps saying 正在整理.
+		expect(screen.screen()).toContain("暂不整理");
+		expect(screen.screen()).not.toContain("正在整理");
 		expect(vi.getTimerCount()).toBe(0);
 	});
 

@@ -1,4 +1,5 @@
 import { Box, Clickable, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
+import { stripMachineBlocks } from "../../../core/compaction/machine-blocks.js";
 import type { BranchSummaryMessage } from "../../../core/messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 
@@ -38,7 +39,8 @@ export class BranchSummaryMessageComponent extends Box {
 		if (this.expanded) {
 			const header = "**Branch Summary**\n\n";
 			this.addChild(
-				new Markdown(header + this.message.summary, 0, 0, this.markdownTheme, {
+				// Same strip as the compaction card: the ledger tail is for the next summarizer.
+				new Markdown(header + stripMachineBlocks(this.message.summary), 0, 0, this.markdownTheme, {
 					color: (text: string) => theme.fg("customMessageText", text),
 				}),
 			);

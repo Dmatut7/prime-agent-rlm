@@ -1,4 +1,4 @@
-import { setKeybindings, type TUI } from "@earendil-works/pi-tui";
+import { setKeybindings, Text, type TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
@@ -384,5 +384,91 @@ describe("ModelSelectorComponent", () => {
 
 		expect(lines.length).toBeLessThanOrEqual(16);
 		expect(output).toContain("(1/12)");
+	});
+
+	// R3-M8: inside the config menu the selector sits under a 3-row tab header; the
+	// help/detail thresholds must spend the rows left below that header, not the
+	// terminal's total - otherwise a 12-17 row terminal crops the list itself.
+	it("keeps the list on screen under the config menu header on a short terminal", async () => {
+		const harness = await createHarness({
+			models: Array.from({ length: 12 }, (_, index) => ({
+				id: `faux-${index + 1}`,
+				name: `Faux Model ${index + 1}`,
+				reasoning: true,
+			})),
+		});
+		harnesses.push(harness);
+
+		const selector = new ModelSelectorComponent(
+			createFakeTui(),
+			harness.getModel("faux-1"),
+			harness.session.modelRegistry,
+			[],
+			() => {},
+			() => {},
+			undefined,
+			{
+				availableModels: getFauxModels(harness, 12),
+				getRows: () => 14,
+				header: new Text("模型服务  模型  MCP 连接", 0, 0),
+				getHeaderRows: () => 3,
+			},
+		);
+
+		await waitForAsyncRender();
+
+		const lines = selector.render(120);
+		const output = stripAnsi(lines.join("\n"));
+		expect(lines.length).toBeLessThanOrEqual(14);
+		expect(output).toContain("faux-1");
+		// Help and the detail line yield their rows before the list does.
+		expect(output).not.toContain("已登录的服务商排在前面");
+		expect(output).not.toContain("Faux Model 1");
+	});
+
+	it("spends help and detail rows below the header only when they fit", async () => {
+		const harness = await createHarness({
+			models: Array.from({ length: 12 }, (_, index) => ({
+				id: `faux-${index + 1}`,
+				name: `Faux Model ${index + 1}`,
+				reasoning: true,
+			})),
+		});
+		harnesses.push(harness);
+
+		const withRows = (rows: number) =>
+			new ModelSelectorComponent(
+				createFakeTui(),
+				harness.getModel("faux-1"),
+				harness.session.modelRegistry,
+				[],
+				() => {},
+				() => {},
+				undefined,
+				{
+					availableModels: getFauxModels(harness, 12),
+					getRows: () => rows,
+					header: new Text("模型服务  模型  MCP 连接", 0, 0),
+					getHeaderRows: () => 3,
+				},
+			);
+
+		await waitForAsyncRender();
+
+		// 15 rows: the help line fits below the header, the detail line does not.
+		const helped = withRows(15);
+		const helpedLines = helped.render(120);
+		const helpedOutput = stripAnsi(helpedLines.join("\n"));
+		expect(helpedLines.length).toBeLessThanOrEqual(15);
+		expect(helpedOutput).toContain("已登录的服务商排在前面");
+		expect(helpedOutput).not.toContain("Faux Model 1 ·");
+
+		// 17 rows: the detail line fits too.
+		const detailed = withRows(17);
+		const detailedLines = detailed.render(120);
+		const detailedOutput = stripAnsi(detailedLines.join("\n"));
+		expect(detailedLines.length).toBeLessThanOrEqual(17);
+		expect(detailedOutput).toContain("已登录的服务商排在前面");
+		expect(detailedOutput).toContain("Faux Model 1");
 	});
 });

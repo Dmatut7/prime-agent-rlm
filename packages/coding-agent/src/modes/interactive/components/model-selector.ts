@@ -765,15 +765,20 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private shouldShowHeaderHelp(): boolean {
-		return this.hasRows(MODEL_HELP_MIN_ROWS);
+		return this.hasRowsBelowHeader(MODEL_HELP_MIN_ROWS);
 	}
 
 	private shouldShowSelectedDetails(): boolean {
-		return this.hasRows(MODEL_DETAIL_MIN_ROWS);
+		return this.hasRowsBelowHeader(MODEL_DETAIL_MIN_ROWS);
 	}
 
-	private hasRows(minRows: number): boolean {
+	/**
+	 * The absolute row thresholds were calibrated for the standalone menu; inside
+	 * the config menu they must spend the rows left below its header, or a short
+	 * terminal pays for help/detail rows with the list itself.
+	 */
+	private hasRowsBelowHeader(minRows: number): boolean {
 		const rows = this.viewport.getRows?.();
-		return rows === undefined || !Number.isFinite(rows) || rows >= minRows;
+		return rows === undefined || !Number.isFinite(rows) || rows - this.getHeaderRows() >= minRows;
 	}
 }

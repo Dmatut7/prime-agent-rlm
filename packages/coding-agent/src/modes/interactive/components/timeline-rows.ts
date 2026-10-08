@@ -84,10 +84,6 @@ export interface BoxRow {
 	meta: MetaPart[];
 	/** When the running row started: its own clock. */
 	startedAt?: number;
-	/** One live line under the row (`└ …`): a command's latest output, a subagent's current step. */
-	sub?: string;
-	/** Live thinking text for the fixed three-line window under the row. */
-	window?: string;
 	/** Lines the row shows once opened; absent when it has nothing more to show. */
 	detail?: (width: number) => string[];
 	/** A note's whole text: when it fits in a few lines the box shows it as plain text instead of a block. */
@@ -339,8 +335,6 @@ function stoppedRow(row: BoxRow): BoxRow {
 		textColor: "muted",
 		meta: [],
 		persistent: false,
-		sub: undefined,
-		window: undefined,
 	};
 }
 
@@ -467,7 +461,7 @@ function memoryRow(key: string, change: KernelMemoryChange): BoxRow {
 	};
 }
 
-function activityRow(stepId: string, activity: KernelActivity, timeline: TurnTimeline, ctx: RowBuildContext): BoxRow {
+function activityRow(stepId: string, activity: KernelActivity): BoxRow {
 	const key = `act:${stepId}:${activity.id}`;
 	const label = sanitizeDisplayText(activity.label).replace(/\s+/g, " ").trim();
 	const result = activity.detail ? localizeResultDetail(activity.detail) : undefined;
@@ -479,7 +473,6 @@ function activityRow(stepId: string, activity: KernelActivity, timeline: TurnTim
 	};
 	switch (activity.kind) {
 		case "command": {
-			const tail = running && activity.detail ? sanitizeDisplayText(activity.detail).trim() : undefined;
 			return {
 				...base,
 				kind: "cmd",
@@ -497,7 +490,6 @@ function activityRow(stepId: string, activity: KernelActivity, timeline: TurnTim
 									? `提交 ${activity.commit.slice(0, 7)}`
 									: commandResultText(activity.detail, true),
 							),
-				...(tail ? { sub: timeline.steadyLine(`${key}:tail`, tail, ctx.now) } : {}),
 			};
 		}
 		case "read":
@@ -530,22 +522,13 @@ function activityRow(stepId: string, activity: KernelActivity, timeline: TurnTim
 				text: `${verb} ${label}`.trim(),
 				textColor: "activityText",
 				meta: running ? [] : activity.status === "error" ? failMeta(result) : okMeta(result),
-				...(running && activity.detail
-					? { sub: timeline.steadyLine(`${key}:tail`, sanitizeDisplayText(activity.detail).trim(), ctx.now) }
-					: {}),
 			};
 		}
 	}
 }
 
 /** What a step's label says when the kernel reported no records for it. */
-function fallbackRows(
-	step: RowStep,
-	data: StepFeedData,
-	timeline: TurnTimeline,
-	ctx: RowBuildContext,
-	withPrimaryOutput: boolean,
-): BoxRow[] {
+function fallbackRows(step: RowStep, data: StepFeedData, timeline: TurnTimeline, withPrimaryOutput: boolean): BoxRow[] {
 	const key = `step:${step.toolCallId}`;
 	// A cell still streaming in is being written, not run.
 	if (step.streaming && step.status === "queued" && step.toolName === "ipython") {
@@ -588,8 +571,7 @@ function fallbackRows(
 	const outputDetail =
 		withPrimaryOutput && output?.trim() ? (width: number) => preformatted(output, width) : undefined;
 	if (COMMAND_VERBS.has(action.verb) && action.recognized) {
-		const tail =
-			running && data.outputTail ? timeline.steadyLine(`${key}:tail`, data.outputTail, ctx.now) : undefined;
+		const hasLiveOutput = running && !!data.outputTail;
 		const outcome = commandOutcome(output);
 		const result = truncateToWidth(outcome.result, 32, "…");
 		return [
@@ -603,9 +585,8 @@ function fallbackRows(
 				textColor: "activityText",
 				meta: running ? [] : outcome.ok ? okMeta(result) : failMeta(result),
 				...(startedAt !== undefined ? { startedAt } : {}),
-				...(tail ? { sub: tail } : {}),
 				...(outputDetail ? { detail: outputDetail } : {}),
-				...(outputDetail || tail ? {} : { outputNote: running ? "还没有输出" : "没有输出" }),
+				...(outputDetail || hasLiveOutput ? {} : { outputNote: running ? "还没有输出" : "没有输出" }),
 			},
 		];
 	}
@@ -674,7 +655,7 @@ function fallbackRows(
 
 /** What an opened command with no output of its own says: it printed nothing (yet). */
 function withOutputNote(row: BoxRow): BoxRow {
-	if (row.kind !== "cmd" || row.sub) return row;
+	if (row.kind !== "cmd") return row;
 	return { ...row, outputNote: row.status === "running" ? "还没有输出" : "没有输出" };
 }
 
@@ -758,13 +739,12 @@ const BACKGROUND_SUFFIX = " · 转到后台继续跑";
 
 /** A background command's outcome: it finished after its cell, said on its own row. */
 function finishedInBackground(row: BoxRow, activity: KernelActivity): BoxRow {
-	const { sub: _sub, ...rest } = row;
-	return { ...rest, text: `${row.text} · ${activity.status === "ok" ? "后台跑完了" : "后台出错了"}` };
+	return { ...row, text: `${row.text} · ${activity.status === "ok" ? "后台跑完了" : "后台出错了"}` };
 }
 
 /** A step that went on after its cell (or its turn) ended: said once, no spinner, no clock. */
 function backgroundRow(row: BoxRow): BoxRow {
-	const { startedAt: _startedAt, sub: _sub, ...rest } = row;
+	const { startedAt: _startedAt, ...rest } = row;
 	return { ...rest, status: "plain", text: `${row.text}${BACKGROUND_SUFFIX}`, textColor: "muted", meta: [] };
 }
 
@@ -778,7 +758,7 @@ function stepRows(step: RowStep, timeline: TurnTimeline, ctx: RowBuildContext, o
 		const settled = ctx.settledActivities?.get(activity.id);
 		if (unfinished && settled !== undefined && settled.stepId !== step.toolCallId) {
 			// It finished in the background while a later step ran: its own row settles in place.
-			const row = activityRow(step.toolCallId, settled.activity, timeline, ctx);
+			const row = activityRow(step.toolCallId, settled.activity);
 			items.push({ time: activity.startedAt, order: index++, rows: [finishedInBackground(row, settled.activity)] });
 			continue;
 		}
@@ -786,11 +766,11 @@ function stepRows(step: RowStep, timeline: TurnTimeline, ctx: RowBuildContext, o
 			// The step that started it already shows its outcome.
 			const origin = ctx.activityOrigins?.get(activity.id);
 			if (origin !== undefined && origin !== step.toolCallId) continue;
-			const row = activityRow(step.toolCallId, activity, timeline, ctx);
+			const row = activityRow(step.toolCallId, activity);
 			items.push({ time: activity.startedAt, order: index++, rows: [finishedInBackground(row, activity)] });
 			continue;
 		}
-		const row = activityRow(step.toolCallId, activity, timeline, ctx);
+		const row = activityRow(step.toolCallId, activity);
 		// Still running although the cell (or the turn) is over: it runs on in the background.
 		const background = unfinished && (activity.background === true || !running || !ctx.live);
 		const printedNothing = !data.outputText?.trim() && !activity.detail?.trim();
@@ -823,9 +803,9 @@ function stepRows(step: RowStep, timeline: TurnTimeline, ctx: RowBuildContext, o
 			isInterrupt(data.error) ||
 			(ctx.stopped && (data.error === undefined || isTurnAbortStub(data.error))));
 	if (items.length === 0) {
-		if (interrupted) return fallbackRows({ ...step, status: "done" }, data, timeline, ctx, true).map(stoppedRow);
+		if (interrupted) return fallbackRows({ ...step, status: "done" }, data, timeline, true).map(stoppedRow);
 		if (failed) return [errorRow(step, data, timeline)];
-		return fallbackRows(step, data, timeline, ctx, true);
+		return fallbackRows(step, data, timeline, true);
 	}
 	items.sort((a, b) => a.time - b.time || a.order - b.order);
 	const rows = items.flatMap((item) => item.rows);
@@ -860,9 +840,6 @@ function stepRows(step: RowStep, timeline: TurnTimeline, ctx: RowBuildContext, o
 			textColor: "muted",
 			meta: [],
 			...(step.startedAt !== undefined ? { startedAt: step.startedAt } : {}),
-			...(data.outputTail
-				? { sub: timeline.steadyLine(`step:${step.toolCallId}:tail`, data.outputTail, ctx.now) }
-				: {}),
 		});
 	} else if (interrupted) {
 		// The steps it reported that did not finish were cut short with it.
@@ -918,7 +895,6 @@ function thinkRows(
 					textColor: "thinkingText",
 					meta: [],
 					startedAt: timing?.startedAt ?? ctx.now,
-					...(ctx.hideThinking ? {} : { window: timeline.steadyPrefix(rowKey, text, ctx.now) }),
 					...(text ? { detail: (width: number) => wrapped(text, width, "thinkingText") } : {}),
 				});
 				return;
@@ -1068,7 +1044,6 @@ function eventRow(entry: TimelineEntry, ctx: RowBuildContext): BoxRow | undefine
 						: okMeta(sub.result ? truncateToWidth(sub.result, 36, "…") : undefined),
 				startedAt: sub.startedAt,
 				...(sub.endedAt ? { endedAt: sub.endedAt } : {}),
-				...(running && sub.line ? { sub: sub.line } : {}),
 				...(report?.trim() ? { detail: (width: number) => wrapped(report, width, "muted") } : {}),
 			};
 		}

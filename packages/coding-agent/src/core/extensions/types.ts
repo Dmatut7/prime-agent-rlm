@@ -401,7 +401,7 @@ export interface ToolRenderContext<TState = any, TArgs = any> {
 	requestRender?: () => void;
 	/** Previously returned component for this render slot, if any. */
 	lastComponent: Component | undefined;
-	/** Shared renderer state for this tool row. Initialized by tool-execution.ts. */
+	/** Shared renderer state for this tool row. Initialized by tool-execution.ts. A renderer that parks a resource here (the bash 1s "Elapsed" tick) must also store a `dispose(): void` that releases it: a row dropped mid-run (session swap, chat rebuild) gets no final render, and dropping the component calls it. */
 	state: TState;
 	/** Working directory for this tool execution. */
 	cwd: string;

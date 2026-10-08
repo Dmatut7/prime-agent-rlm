@@ -259,8 +259,13 @@ export class LiveTurnFlow {
 		if (record?.kind !== "compaction") return false;
 		const timeline = turn.state.timeline;
 		const at = Number(message.timestamp) || Date.now();
-		if (timeline.latestCompaction()?.endedAt === undefined) {
-			// A skipped or failed compaction the live row has not settled yet.
+		if (timeline.activeCompaction()) {
+			// The outcome settles the live row it belongs to; adding a settled replay
+			// row after it would shadow it from activeCompaction() forever (its
+			// "正在整理" line would never settle, and transferTo would carry the ghost).
+			timeline.endCompaction(at, record.facts);
+		} else if (!timeline.latestCompaction()) {
+			// No row of its own (the compaction ran outside this view): show it as one.
 			timeline.addReplayCompaction(at, record.facts);
 		}
 		this.host.requestRender();
