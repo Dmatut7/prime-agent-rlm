@@ -728,6 +728,33 @@ describe("TUI fullscreen mode", () => {
 		tui.stop();
 	});
 
+	it("composites overlays onto kitty placeholder image rows instead of skipping them", async () => {
+		const placeholderRows = encodeKittyPlaceholderRows({ imageId: 42, columns: 8, rows: 3 });
+		const { terminal, tui, chat, dock } = setup(["before", ...placeholderRows, "after"], 40, 12);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		// Row 2 of the frame is one of the image's placeholder rows.
+		const overlay = new TestComponent();
+		overlay.lines = ["OVERLAY"];
+		const handle = tui.showOverlay(overlay, { row: 2, col: 4, width: 20 });
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		assert.ok(writes.includes("OVERLAY"), "overlay text lands on the placeholder row");
+		assert.ok(
+			writes.includes(KITTY_PLACEHOLDER_CHAR),
+			"placeholder cells survive beside the overlay instead of the row being punched through or blanked",
+		);
+
+		handle.hide();
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes(KITTY_PLACEHOLDER_CHAR), "the placeholder row is restored on hide");
+
+		tui.stop();
+	});
+
 	it("repaints only changed rows when navigating a focused overlay", async () => {
 		const { terminal, tui, chat, dock } = setup(lines(20));
 		tui.enterFullscreen({ scroll: [chat], dock });
@@ -1187,6 +1214,88 @@ describe("TUI fullscreen mode", () => {
 		terminal.sendInput("\x1b[<0;6;2m");
 		await terminal.waitForRender();
 		assert.deepStrictEqual(copies, ["Line 12\nLine"]);
+
+		tui.stop();
+	});
+
+	it("keeps the selection when the drag sweeps into the blank fill below a short transcript", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(3), 40, 10);
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+		// Three content rows sit on frame rows 0-2; rows 3-7 are blank fill above the dock.
+		terminal.clearWrites();
+
+		terminal.sendInput("\x1b[<0;1;2M"); // press on "Line 1"
+		terminal.sendInput("\x1b[<32;6;7M"); // drag into the blank fill
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes("\x1b[7m"), "selection stays highlighted after entering the blank fill");
+
+		terminal.sendInput("\x1b[<0;6;7m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, ["Line 1\nLine"]);
+
+		tui.stop();
+	});
+
+	it("anchors a selection started in the blank fill to the nearest content row", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(3), 40, 10);
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;2;7M"); // press in the blank fill
+		terminal.sendInput("\x1b[<32;2;2M"); // drag back up onto "Line 1"
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;2;2m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, ["ine 1\nL"]);
+
+		tui.stop();
+	});
+
+	it("drag-selecting across a literal tab copies the painted columns", async () => {
+		const { terminal, tui, chat, dock } = setup(["a\tb"], 40, 10);
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		// The tab paints as three spaces ("a   b"): select the first two painted columns.
+		terminal.sendInput("\x1b[<0;1;1M");
+		terminal.sendInput("\x1b[<32;3;1M");
+		await terminal.waitForRender();
+		assert.ok(
+			terminal.getWrites().includes("\x1b[7ma \x1b[27m"),
+			"highlight covers exactly the two painted columns before the tab's expansion",
+		);
+
+		terminal.sendInput("\x1b[<0;3;1m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, ["a"]);
+
+		tui.stop();
+	});
+
+	it("selecting past a literal tab copies only the covered painted cells", async () => {
+		const { terminal, tui, chat, dock } = setup(["a\tb"], 40, 10);
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		// Painted as "a   b": select columns 2-4 (the expansion's tail and "b").
+		terminal.sendInput("\x1b[<0;3;1M");
+		terminal.sendInput("\x1b[<32;6;1M");
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;6;1m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, ["  b"]);
 
 		tui.stop();
 	});

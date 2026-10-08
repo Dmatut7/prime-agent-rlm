@@ -95,8 +95,73 @@ describe("editor autocomplete overlay", () => {
 		await terminal.waitForRender();
 
 		const viewport = terminal.getViewport();
-		assert.ok(viewport[0]?.includes("hotkeys"));
+		// One row of budget: the selected suggestion survives, not the tail of the list.
+		assert.ok(viewport[0]?.includes("help"));
 		assert.ok(viewport[1]?.includes("/"));
+		tui.stop();
+	});
+
+	it("keeps the selected suggestion visible when the popup is clipped to fewer rows than the list", async () => {
+		const manyItemsProvider: AutocompleteProvider = {
+			async getSuggestions() {
+				return {
+					prefix: "/",
+					kind: "slash-command",
+					items: Array.from({ length: 8 }, (_, i) => ({
+						value: `/cmd${i}`,
+						label: `cmd${i}`,
+						description: "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod",
+					})),
+				};
+			},
+			applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+				const nextLines = [...lines];
+				const line = nextLines[cursorLine] ?? "";
+				const before = line.slice(0, cursorCol - prefix.length);
+				nextLines[cursorLine] = before + item.value + line.slice(cursorCol);
+				return { lines: nextLines, cursorLine, cursorCol: before.length + item.value.length };
+			},
+		};
+
+		class StaticContent {
+			lines = ["s0", "s1"];
+			render(_width: number): string[] {
+				return this.lines;
+			}
+			invalidate(): void {}
+		}
+
+		const terminal = new VirtualTerminal(40, 6);
+		const tui = new TUI(terminal);
+		const editor = new Editor(tui, defaultEditorTheme);
+		tui.addChild(new StaticContent());
+		tui.addChild(editor);
+		tui.setFocus(editor);
+		editor.setAutocompleteProvider(manyItemsProvider);
+		tui.start();
+
+		editor.handleInput("/");
+		await Promise.resolve();
+		await new Promise((resolve) => setImmediate(resolve));
+		// Move the selection off the first item: clipping must follow it.
+		editor.handleInput("\x1b[B");
+		editor.handleInput("\x1b[B");
+		tui.requestRender(true);
+		await terminal.waitForRender();
+
+		// Two rows of budget above the input: the selected item and its neighbor
+		// survive; the scroll info and the multi-line description drop first.
+		const viewport = terminal.getViewport();
+		assert.ok(
+			viewport[0]?.includes("cmd1"),
+			`row 0 should show the candidate above the selection, got: ${viewport[0]}`,
+		);
+		assert.ok(viewport[1]?.includes("cmd2"), `row 1 should show the selected candidate, got: ${viewport[1]}`);
+		assert.ok(
+			viewport.every((line) => !line.includes("lorem")),
+			"the description block is dropped before any candidate row",
+		);
+		assert.ok(viewport[3]?.includes("/"), "the input row stays put below the popup");
 		tui.stop();
 	});
 });

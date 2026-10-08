@@ -205,6 +205,40 @@ describe("TUI Kitty image cleanup", () => {
 		tui.stop();
 	});
 
+	it("keeps a placeholder image alive while an overlay covers every one of its rows", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui = new TUI(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+
+		component.lines = encodeKittyPlaceholderRows({ imageId: 42, columns: 4, rows: 2 });
+		tui.start();
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		// A full-width overlay covers both placeholder rows entirely: no cell of
+		// the image survives compositing, yet the rows still reference the image —
+		// freeing its id would blank it when the overlay closes.
+		const overlay = new TestComponent();
+		overlay.lines = ["OVERLAY A", "OVERLAY B"];
+		const handle = tui.showOverlay(overlay, { row: 0, col: 0, width: "100%" });
+		await terminal.waitForRender();
+
+		const viewport = terminal.getViewport();
+		assert.ok(viewport[0]?.includes("OVERLAY A"), "overlay composites over the first placeholder row");
+		assert.ok(viewport[1]?.includes("OVERLAY B"), "overlay composites over the second placeholder row");
+		assert.ok(
+			!terminal.getWrites().includes(deleteKittyImage(42)),
+			"a fully covered placeholder image must not be freed while covered",
+		);
+
+		handle.hide();
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes("\u{10EEEE}"), "placeholder rows come back once the overlay closes");
+
+		tui.stop();
+	});
+
 	it("deletes a replaced placeholder image id without touching its successor", async () => {
 		const terminal = new LoggingVirtualTerminal(40, 10);
 		const tui = new TUI(terminal);

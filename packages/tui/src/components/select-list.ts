@@ -52,6 +52,8 @@ export class SelectList implements Component {
 	private maxVisible: number = 5;
 	private theme: SelectListTheme;
 	private layout: SelectListLayoutOptions;
+	/** Line of the selected item in the last render() output. */
+	private focusLine: number = 0;
 
 	public onSelect?: (item: SelectItem) => void;
 	public onCancel?: () => void;
@@ -80,6 +82,7 @@ export class SelectList implements Component {
 		const lines: string[] = [];
 
 		if (this.filteredItems.length === 0) {
+			this.focusLine = 0;
 			lines.push(this.theme.noMatch("  No matching commands"));
 			return lines;
 		}
@@ -91,6 +94,7 @@ export class SelectList implements Component {
 			Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.filteredItems.length - this.maxVisible),
 		);
 		const endIndex = Math.min(startIndex + this.maxVisible, this.filteredItems.length);
+		this.focusLine = this.selectedIndex - startIndex;
 
 		for (let i = startIndex; i < endIndex; i++) {
 			const item = this.filteredItems[i];
@@ -280,6 +284,10 @@ export class SelectList implements Component {
 		for (const line of wrapTextWithAnsi(description, contentWidth)) {
 			lines.push(this.theme.description(indent + line));
 		}
+	}
+
+	getFocusLine(): number {
+		return this.focusLine;
 	}
 
 	private notifySelectionChange(): void {

@@ -14,7 +14,14 @@ import {
 	KITTY_PLACEHOLDER_CHAR,
 	KITTY_PLACEHOLDER_COPY_MARKER,
 } from "./terminal-image.js";
-import { clampOverwideLine, sliceByColumn, stripAnsi, urlAtColumn, visibleWidth } from "./utils.js";
+import {
+	clampOverwideLine,
+	normalizeTerminalOutput,
+	sliceByColumn,
+	stripAnsi,
+	urlAtColumn,
+	visibleWidth,
+} from "./utils.js";
 
 export const FULLSCREEN_MIN_TRANSCRIPT_ROWS = 3;
 
@@ -727,6 +734,10 @@ export class FullscreenViewport {
 	}
 
 	private highlightLine(line: string, span: ColumnSpan): string {
+		// Selection columns are painted columns: apply the same tab/AM
+		// normalization the paint pass applies before slicing, or a literal tab
+		// (0 columns here, 3 on screen) shifts every span after it.
+		line = normalizeTerminalOutput(line);
 		const width = visibleWidth(line);
 		const from = Math.min(span.from, width);
 		const to = Math.min(span.to, width);
@@ -759,6 +770,7 @@ export class FullscreenViewport {
 		visibleHeight: number;
 		transcriptStart: number;
 		transcriptEnd: number;
+		windowEnd: number;
 	} | null {
 		if (this.lastWindowHeight <= 0) return null;
 		const visibleHeight = this.lastFrameVisibleHeight > 0 ? this.lastFrameVisibleHeight : this.lastWindowHeight;
@@ -770,8 +782,13 @@ export class FullscreenViewport {
 		// Sticky rows painted over the top of the window are not selectable: selection starts below them.
 		const windowStart = this.lastHeaderHeight + (this.lastPinned?.rows.length ?? 0);
 		const windowEnd = this.lastHeaderHeight + this.lastWindowHeight - 1;
+		// A transcript shorter than the window leaves blank fill rows below the
+		// content: those rows map to line indexes past the transcript end, which the
+		// stale-selection check then discards. Clamp the selectable range to the
+		// last content row instead.
+		const contentEnd = this.lastHeaderHeight + Math.max(0, this.lastTranscript.length - this.scrollTop) - 1;
 		const transcriptStart = Math.max(windowStart, visibleStart);
-		const transcriptEnd = Math.min(windowEnd, visibleEnd);
+		const transcriptEnd = Math.min(windowEnd, visibleEnd, contentEnd);
 		if (transcriptStart > transcriptEnd) return null;
 		return {
 			firstRow: transcriptStart - visibleStart,
@@ -780,6 +797,7 @@ export class FullscreenViewport {
 			visibleHeight,
 			transcriptStart,
 			transcriptEnd,
+			windowEnd,
 		};
 	}
 
@@ -789,7 +807,10 @@ export class FullscreenViewport {
 		if (!clamp && (screenRow < 0 || screenRow >= bounds.visibleHeight)) return null;
 		const row = clamp ? Math.max(0, Math.min(screenRow, bounds.visibleHeight - 1)) : screenRow;
 		const frameLine = bounds.visibleStart + row;
-		if (!clamp && (frameLine < bounds.transcriptStart || frameLine > bounds.transcriptEnd)) return null;
+		// Outside the transcript window (header above, dock below) is not
+		// selectable. Blank fill rows inside the window map to the nearest content
+		// row, so a drag sweeping the fill extends the selection to the content end.
+		if (!clamp && (frameLine < bounds.transcriptStart || frameLine > bounds.windowEnd)) return null;
 		const clampedFrameLine = Math.max(bounds.transcriptStart, Math.min(frameLine, bounds.transcriptEnd));
 		return this.scrollTop + clampedFrameLine - this.lastHeaderHeight;
 	}
@@ -934,7 +955,7 @@ export class FullscreenViewport {
 		const lines: string[] = [];
 		let lastImageMarker: number | null = null;
 		for (let lineIndex = sel.start.line; lineIndex <= sel.end.line; lineIndex++) {
-			const line = sourceLines[lineIndex] ?? "";
+			const line = normalizeTerminalOutput(sourceLines[lineIndex] ?? "");
 			const spans = this.selectedFrameSpans(lineIndex, sel, regions);
 			if (spans.length === 0) continue;
 			const parts: string[] = [];
@@ -977,7 +998,9 @@ export class FullscreenViewport {
 		const gutterOnly = new Set<number>();
 		let lastImageMarker: number | null = null;
 		for (let lineIndex = sel.start.line; lineIndex <= sel.end.line; lineIndex++) {
-			const line = sourceLines[lineIndex] ?? "";
+			// Normalize to the painted representation (tabs expand to three
+			// spaces) so selection columns match what was on screen.
+			const line = normalizeTerminalOutput(sourceLines[lineIndex] ?? "");
 			const span = this.selectionSpan(lineIndex, sel);
 			if (!span) continue;
 			const width = visibleWidth(line);
@@ -1053,7 +1076,7 @@ export class FullscreenViewport {
 
 		const lines: string[] = [];
 		for (let lineIndex = sel.start.line; lineIndex <= sel.end.line; lineIndex++) {
-			const line = sourceLines[lineIndex] ?? "";
+			const line = normalizeTerminalOutput(sourceLines[lineIndex] ?? "");
 			const spans = this.selectedTableSpans(lineIndex, sel);
 			if (spans.length === 0) continue;
 			const parts = spans.map((span) => stripAnsi(sliceByColumn(line, span.from, Math.max(0, span.to - span.from))));

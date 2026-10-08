@@ -363,6 +363,8 @@ export class Editor implements Component, Focusable {
 	private readonly autocompleteOverlayComponent: Component = {
 		render: (width) => this.renderAutocompleteOverlay(width),
 		invalidate: () => this.autocompleteList?.invalidate(),
+		// renderAutocompleteOverlay pads the list output with a blank line on top.
+		getFocusLine: () => (this.autocompleteList ? this.autocompleteList.getFocusLine() + 1 : undefined),
 	};
 
 	private pastes: Map<number, string> = new Map();

@@ -38,6 +38,8 @@ import {
 	IMAGE_LINE_PLACEHOLDER,
 	imageLineRowOffset,
 	isImageLine,
+	isImageSequenceLine,
+	KITTY_PLACEHOLDER_CHAR,
 	setCellDimensions,
 } from "./terminal-image.js";
 import {
@@ -106,6 +108,15 @@ export interface Component {
 	 * render-output coordinates. Only the fullscreen transcript window pins them.
 	 */
 	getStickyHeaders?(): ReadonlyArray<StickyHeader>;
+
+	/**
+	 * Index into the lines of the last render() output that height clipping must
+	 * keep visible — the focused element of the component (the selected item of a
+	 * list). Consulted when an aboveMarker overlay has more lines than the rows
+	 * above its marker: clipping drops tail lines first and never cuts this line.
+	 * Components without a focus line fall back to keeping the bottom lines.
+	 */
+	getFocusLine?(): number | undefined;
 
 	/**
 	 * Optional handler for keyboard input when component has focus
@@ -456,6 +467,10 @@ export class TUI extends Container {
 	// Occurrence counts behind previousKittyImageIds, so the set can be
 	// maintained incrementally over just the changed region of the frame.
 	private kittyImageIdCounts = new Map<number, number>();
+	// Placeholder image ids whose rows an overlay fully covered in this frame.
+	// The frame diff would otherwise read the covered rows as "image gone" and
+	// free a payload the rows reference again once the overlay closes.
+	private occludedKittyPlaceholderIds = new Set<number>();
 	private previousWidth = 0;
 	private previousHeight = 0;
 	private readonly transcriptAggregator = new LineAggregator();
@@ -1653,6 +1668,7 @@ export class TUI extends Container {
 
 	/** Composite all overlays into content lines (sorted by focusOrder, higher = on top). */
 	private compositeOverlays(lines: string[], termWidth: number, termHeight: number): string[] {
+		this.occludedKittyPlaceholderIds.clear();
 		if (this.overlayStack.length === 0) return lines;
 		const result = [...lines];
 		const overlaySelectionRegions: FrameSelectionRegion[] = [...this.overlaySelectionRegions];
@@ -1731,14 +1747,25 @@ export class TUI extends Container {
 			if (aboveMarker) {
 				const markerRow = Math.max(1, aboveMarker.line - viewportStart + aboveMarker.offsetY);
 				if (markerRow >= termHeight) continue;
+				let focusLine = component.getFocusLine?.();
 				while (overlayLines.length > markerRow && stripAnsi(overlayLines[0] ?? "").trim().length === 0) {
 					overlayLines = overlayLines.slice(1);
+					if (focusLine !== undefined) focusLine--;
 				}
 				while (overlayLines.length > markerRow && stripAnsi(overlayLines.at(-1) ?? "").trim().length === 0) {
 					overlayLines = overlayLines.slice(0, -1);
 				}
 				if (overlayLines.length > markerRow) {
-					overlayLines = overlayLines.slice(overlayLines.length - markerRow);
+					if (focusLine === undefined) {
+						overlayLines = overlayLines.slice(overlayLines.length - markerRow);
+					} else {
+						// Keep the focus line visible: drop tail lines (descriptions,
+						// scroll info) first, head lines only when the focus is deeper
+						// than the whole budget.
+						const focus = Math.max(0, Math.min(focusLine, overlayLines.length - 1));
+						const start = Math.max(0, focus - (markerRow - 1));
+						overlayLines = overlayLines.slice(start, start + markerRow);
+					}
 				}
 				row = markerRow - overlayLines.length;
 				col = Math.max(0, Math.min(aboveMarker.col, termWidth - w));
@@ -1952,6 +1979,11 @@ export class TUI extends Container {
 		// longer references. Inline sequences re-upload on repaint, so their
 		// delete-then-redraw contract applies unconditionally.
 		if (placeholderIds.size > 0) {
+			// Rows an overlay covered this frame still reference their image; the
+			// cover removed every cell, so the line-level scan cannot see the id.
+			for (const id of this.occludedKittyPlaceholderIds) {
+				placeholderIds.delete(id);
+			}
 			for (const line of newLines) {
 				const surviving = extractKittyPlaceholderImageId(line);
 				if (surviving !== null) {
@@ -1992,7 +2024,15 @@ export class TUI extends Container {
 		overlayWidth: number,
 		totalWidth: number,
 	): string {
-		if (isImageLine(baseLine)) return baseLine;
+		// Inline graphics sequences span rows and cannot be clipped: leave them
+		// alone. Kitty placeholder rows are plain text cells with per-cell
+		// row/column diacritics, built for exactly this clipping — composite
+		// normally so an overlay paints over the image instead of the image
+		// striping through the overlay.
+		if (isImageSequenceLine(baseLine)) return baseLine;
+		const placeholderImageId = baseLine.includes(KITTY_PLACEHOLDER_CHAR)
+			? extractKittyPlaceholderImageId(baseLine)
+			: null;
 
 		// Single pass through baseLine extracts both before and after segments
 		const afterStart = startCol + overlayWidth;
@@ -2019,7 +2059,7 @@ export class TUI extends Container {
 
 		// Compose result
 		const r = TUI.SEGMENT_RESET;
-		const result =
+		let result =
 			before.text +
 			" ".repeat(beforePad) +
 			r +
@@ -2036,11 +2076,25 @@ export class TUI extends Container {
 		// - Wide characters at segment boundaries
 		// - Edge cases in segment extraction
 		const resultWidth = visibleWidth(result);
-		if (resultWidth <= totalWidth) {
-			return result;
+		if (resultWidth > totalWidth) {
+			// Truncate with strict=true to ensure we don't exceed totalWidth
+			result = clampOverwideLine(result, totalWidth);
 		}
-		// Truncate with strict=true to ensure we don't exceed totalWidth
-		return clampOverwideLine(result, totalWidth);
+
+		if (placeholderImageId !== null) {
+			if (!result.includes(KITTY_PLACEHOLDER_CHAR)) {
+				// The overlay covered every cell of the row: nothing on the row
+				// references the image anymore, but the payload must survive —
+				// placeholder rows carry no transmit of their own, so freeing the
+				// id now would blank the image when the overlay closes.
+				this.occludedKittyPlaceholderIds.add(placeholderImageId);
+			}
+			// applyLineResets skips image rows, so terminate the row here: a
+			// composited row can otherwise end with the placeholder id color (or a
+			// clamp-dropped `\x1b[39m`) and leak it into the next row.
+			result += TUI.SEGMENT_RESET;
+		}
+		return result;
 	}
 
 	/**
@@ -2201,6 +2255,10 @@ export class TUI extends Container {
 		}
 		// One-shot: consume here so it never leaks into a later render.
 		this.overlaySelectionRegions = [];
+		// Same one-shot discipline: compositeOverlays only repopulates this when
+		// the overlay stack is non-empty, so an id left by a since-closed overlay
+		// must not suppress a later deletion.
+		this.occludedKittyPlaceholderIds.clear();
 		const preserveViewport = this.preserveViewportOnNextRender;
 		this.preserveViewportOnNextRender = false;
 		const width = this.terminal.columns;
