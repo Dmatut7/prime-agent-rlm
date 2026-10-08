@@ -674,6 +674,7 @@
               if (window.getSelection().toString()) return;
               const leafId = findNewestLeaf(entry.id);
               navigateTo(leafId, 'target', entry.id);
+              if (isMobileLayout()) closeSidebar();
             });
 
             container.appendChild(div);
@@ -749,67 +750,102 @@
         return extToLang[ext];
       }
 
-      function findToolResult(toolCallId) {
-        for (const entry of entries) {
-          if (entry.type === 'message' && entry.message.role === 'toolResult') {
-            if (entry.message.toolCallId === toolCallId) {
-              return entry.message;
-            }
-          }
-        }
-        return null;
+      /**
+       * Strip ANSI escape sequences (OSC, CSI/SGR, charset and single-char escapes).
+       * Exported documents are static HTML; raw escape bytes render as visible "[31m" garbage.
+       */
+      function stripAnsi(text) {
+        return text
+          .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+          .replace(/[\x1b\x9b]\[[0-9;?]*[ -/]*[@-~]/g, '')
+          .replace(/\x1b[()#%][0-9A-Za-z]/g, '')
+          .replace(/\x1b[@-Z\\-_]/g, '');
       }
 
+      /**
+       * Tool results for the entries on the current conversation path, keyed by toolCallId.
+       * Rebuilt on every navigateTo so a forked branch never shows another branch's result.
+       */
+      let currentPathToolResults = new Map();
+
+      function findToolResult(toolCallId) {
+        return currentPathToolResults.get(toolCallId) || null;
+      }
+
+      /**
+       * Lazily-built tool output bodies, keyed by data-lazy-id. The full DOM and
+       * highlight pass for a collapsed output are only constructed on first expand,
+       * so a session with 100k-line outputs no longer freezes the page on open.
+       */
+      const lazyToolOutputs = new Map();
+      let lazyToolOutputSeq = 0;
+
+      function highlightCode(text, lang) {
+        try {
+          return hljs.highlight(text, { language: lang }).value;
+        } catch {
+          return escapeHtml(text);
+        }
+      }
+
+      function buildLazyToolOutput(el) {
+        const lazyId = el.dataset ? el.dataset.lazyId : undefined;
+        if (!lazyId) return;
+        const record = lazyToolOutputs.get(lazyId);
+        if (!record) return;
+        const full = el.querySelector('.output-full');
+        if (!full) return;
+        if (record.lang) {
+          full.innerHTML = `<pre><code class="hljs">${highlightCode(record.text, record.lang)}</code></pre>`;
+        } else {
+          let out = '';
+          for (const line of record.text.split('\n')) {
+            out += `<div>${escapeHtml(line)}</div>`;
+          }
+          full.innerHTML = out;
+        }
+      }
+
+      window.__toggleToolOutput = function(el) {
+        el.classList.toggle('expanded');
+        if (el.classList.contains('expanded')) buildLazyToolOutput(el);
+      };
+
       function formatExpandableOutput(text, maxLines, lang) {
-        text = replaceTabs(text);
+        text = replaceTabs(stripAnsi(text));
         const lines = text.split('\n');
         const displayLines = lines.slice(0, maxLines);
         const remaining = lines.length - maxLines;
 
         if (lang) {
-          let highlighted;
-          try {
-            highlighted = hljs.highlight(text, { language: lang }).value;
-          } catch {
-            highlighted = escapeHtml(text);
-          }
-
           if (remaining > 0) {
-            const previewCode = displayLines.join('\n');
-            let previewHighlighted;
-            try {
-              previewHighlighted = hljs.highlight(previewCode, { language: lang }).value;
-            } catch {
-              previewHighlighted = escapeHtml(previewCode);
-            }
-
-            return `<div class="tool-output expandable" onclick="if(window.getSelection().toString())return;this.classList.toggle('expanded')">
-              <div class="output-preview"><pre><code class="hljs">${previewHighlighted}</code></pre>
+            const lazyId = `lo-${++lazyToolOutputSeq}`;
+            lazyToolOutputs.set(lazyId, { text, lang });
+            return `<div class="tool-output expandable" data-lazy-id="${lazyId}" onclick="if(window.getSelection().toString())return;window.__toggleToolOutput(this)">
+              <div class="output-preview"><pre><code class="hljs">${highlightCode(displayLines.join('\n'), lang)}</code></pre>
               <div class="expand-hint">... (${remaining} more lines)</div></div>
-              <div class="output-full"><pre><code class="hljs">${highlighted}</code></pre></div></div>`;
+              <div class="output-full"></div></div>`;
           }
 
-          return `<div class="tool-output"><pre><code class="hljs">${highlighted}</code></pre></div>`;
+          return `<div class="tool-output"><pre><code class="hljs">${highlightCode(text, lang)}</code></pre></div>`;
         }
 
         if (remaining > 0) {
-          let out = '<div class="tool-output expandable" onclick="if(window.getSelection().toString())return;this.classList.toggle(\'expanded\')">';
+          const lazyId = `lo-${++lazyToolOutputSeq}`;
+          lazyToolOutputs.set(lazyId, { text, lang: null });
+          let out = `<div class="tool-output expandable" data-lazy-id="${lazyId}" onclick="if(window.getSelection().toString())return;window.__toggleToolOutput(this)">`;
           out += '<div class="output-preview">';
           for (const line of displayLines) {
-            out += `<div>${escapeHtml(replaceTabs(line))}</div>`;
+            out += `<div>${escapeHtml(line)}</div>`;
           }
           out += `<div class="expand-hint">... (${remaining} more lines)</div></div>`;
-          out += '<div class="output-full">';
-          for (const line of lines) {
-            out += `<div>${escapeHtml(replaceTabs(line))}</div>`;
-          }
-          out += '</div></div>';
+          out += '<div class="output-full"></div></div>';
           return out;
         }
 
         let out = '<div class="tool-output">';
         for (const line of displayLines) {
-          out += `<div>${escapeHtml(replaceTabs(line))}</div>`;
+          out += `<div>${escapeHtml(line)}</div>`;
         }
         out += '</div>';
         return out;
@@ -823,7 +859,7 @@
         const getResultText = () => {
           if (!result) return '';
           const textBlocks = result.content.filter(c => c.type === 'text');
-          return textBlocks.map(c => c.text).join('\n');
+          return stripAnsi(textBlocks.map(c => c.text).join('\n'));
         };
 
         const getResultImages = () => {
@@ -962,6 +998,7 @@
                 if (output) html += formatExpandableOutput(output, 10);
               }
             }
+            if (result) html += renderResultImages();
           }
         }
 
@@ -1366,6 +1403,13 @@
         currentTargetId = scrollToEntryId || targetId;
         const path = getPath(targetId);
 
+        currentPathToolResults = new Map();
+        for (const entry of path) {
+          if (entry.type === 'message' && entry.message.role === 'toolResult' && entry.message.toolCallId) {
+            currentPathToolResults.set(entry.message.toolCallId, entry.message);
+          }
+        }
+
         renderTree();
 
         document.getElementById('header-container').innerHTML = renderHeader();
@@ -1394,9 +1438,8 @@
         });
 
         setTimeout(() => {
-          const content = document.getElementById('content');
           if (scrollMode === 'bottom') {
-            content.scrollTop = content.scrollHeight;
+            window.scrollTo(0, document.documentElement.scrollHeight);
           } else if (scrollMode === 'target') {
             const scrollTargetId = scrollToEntryId || targetId;
             const targetEl = document.getElementById(`entry-${scrollTargetId}`);
@@ -1627,30 +1670,18 @@
       overlay.addEventListener('click', closeSidebar);
       document.getElementById('sidebar-close').addEventListener('click', closeSidebar);
 
-      let thinkingExpanded = true;
-      let toolOutputsExpanded = false;
-
+      // Toggle state lives on the persistent #messages container (styled via CSS), so it
+      // survives branch navigation; per-entry DOM nodes are re-rendered from cache on navigate.
       const toggleThinking = () => {
-        thinkingExpanded = !thinkingExpanded;
-        document.querySelectorAll('.thinking-text').forEach(el => {
-          el.style.display = thinkingExpanded ? '' : 'none';
-        });
-        document.querySelectorAll('.thinking-collapsed').forEach(el => {
-          el.style.display = thinkingExpanded ? 'none' : 'block';
-        });
+        document.getElementById('messages').classList.toggle('no-thinking');
       };
 
       const toggleToolOutputs = () => {
-        toolOutputsExpanded = !toolOutputsExpanded;
-        document.querySelectorAll('.tool-output.expandable').forEach(el => {
-          el.classList.toggle('expanded', toolOutputsExpanded);
-        });
-        document.querySelectorAll('.compaction').forEach(el => {
-          el.classList.toggle('expanded', toolOutputsExpanded);
-        });
-        document.querySelectorAll('.skill-invocation').forEach(el => {
-          el.classList.toggle('expanded', toolOutputsExpanded);
-        });
+        const messagesEl = document.getElementById('messages');
+        if (!messagesEl.classList.contains('tools-expanded')) {
+          messagesEl.querySelectorAll('.tool-output.expandable').forEach(el => buildLazyToolOutput(el));
+        }
+        messagesEl.classList.toggle('tools-expanded');
       };
 
       const attachHeaderHandlers = () => {
@@ -1669,9 +1700,11 @@
 
       document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
-          searchInput.value = '';
-          searchQuery = '';
-          navigateTo(leafId, 'bottom');
+          if (searchQuery || searchInput.value) {
+            searchInput.value = '';
+            searchQuery = '';
+            forceTreeRerender();
+          }
         }
 
         if (isEditableTarget(document.activeElement)) {

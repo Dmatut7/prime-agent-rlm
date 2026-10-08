@@ -1,0 +1,8 @@
+- Fixed exported session HTML showing raw ANSI escape codes (e.g. `[31m`) in tool and bash output; escape sequences are now stripped during export rendering.
+- Fixed exported HTML dropping tool result images for every tool except `read`, so MCP screenshot tools no longer lose their images.
+- Fixed forked branches in exported HTML showing another branch's tool result when a toolCallId exists on multiple branches; results now resolve within the current conversation path.
+- Fixed Escape in exported HTML clearing the tree search without rebuilding the tree and silently jumping back to the initial branch; Escape now only clears the search filter.
+- Fixed the T/O thinking/tools toggles in exported HTML losing (and inverting) their state after switching branches; toggle state now lives on the messages container.
+- Fixed exported HTML with large collapsed tool outputs freezing on open; full output DOM and syntax highlighting now build lazily on first expand.
+- Fixed the full-width mobile sidebar staying open after tapping a tree node in exported HTML.
+- Fixed long URLs and tokens in exported HTML forcing page-wide horizontal scrolling; markdown content now wraps anywhere.
