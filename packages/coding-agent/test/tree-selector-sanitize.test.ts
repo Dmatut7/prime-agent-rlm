@@ -181,6 +181,14 @@ function dirtyTree(): { tree: AgentConnectionSessionTreeNode[]; leafId: string; 
 			fromId: "user-1",
 			summary: `from branch${CLEAR}`,
 		},
+		// A role outside the four the selector names is wire bytes from a session
+		// file an older or hostile writer left behind: its bracket fallback is a
+		// face the row paints itself.
+		messageEntry("role-1", "branch-1", {
+			role: `we${OSC52}ird${CLEAR}` as "user",
+			content: "payload",
+			timestamp: Date.now(),
+		}),
 	];
 	return { tree: buildChain(entries), leafId: "branch-1", visibleRows: entries.length - 2 };
 }
@@ -222,6 +230,7 @@ describe("tree selector sanitization", () => {
 			"[label: 交回]",
 			"[title: lane C: 交回]",
 			"[branch summary]: from branch",
+			"[weird]",
 		]) {
 			expect(plain).toContain(fragment);
 		}

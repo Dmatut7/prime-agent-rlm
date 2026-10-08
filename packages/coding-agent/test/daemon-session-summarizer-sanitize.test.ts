@@ -180,4 +180,18 @@ describe("daemon session summarizer recap sanitize", () => {
 		expect(state.summaryState?.taskState).toBe("needs_input");
 		expect(state.summaryState?.basedOnMessageCount).toBe(3);
 	});
+
+	test("seeds a journal whose status entry lost its summary instead of throwing", () => {
+		// A hand-edited or externally written journal can carry an agent_status
+		// entry with no summary at all: the seed degrades to an empty recap, it
+		// must not take the whole session down with a TypeError.
+		const { state } = makeState({
+			messages: [],
+			persisted: { taskState: "needs_input", basedOnMessageCount: 3 } as unknown as AgentStatus,
+		});
+
+		expect(() => new DaemonSessionSummarizer(() => [state]).seed(state)).not.toThrow();
+		expect(state.summaryState?.summary).toBe("");
+		expect(state.summaryState?.taskState).toBe("needs_input");
+	});
 });

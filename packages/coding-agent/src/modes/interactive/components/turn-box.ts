@@ -776,9 +776,12 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 				content: `${theme.bold(theme.fg("timelineSub", "◇"))}  ${theme.fg(
 					"timelineSoft",
 					event.spawned
-						.map((sub) =>
-							sub.tag ? `${shortAgentName(sub.name)} ${sanitizeRowText(sub.tag)}` : shortAgentName(sub.name),
-						)
+						.map((sub) => {
+							// A name that washes to nothing still names the child: the row
+							// must not show a nameless dispatch.
+							const name = shortAgentName(sub.name) || "子代理";
+							return sub.tag ? `${name} ${sanitizeRowText(sub.tag)}` : name;
+						})
 						.join("   "),
 				)}`,
 			});
@@ -829,7 +832,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 				gutter: { main: "blank", lane },
 				content: theme.fg(
 					"timelineLane",
-					`${pending.map((key) => shortAgentName(shown.get(key) ?? key)).join("、")} 还在干活`,
+					`${pending.map((key) => shortAgentName(shown.get(key) ?? key) || "子代理").join("、")} 还在干活`,
 				),
 			});
 		}

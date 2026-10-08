@@ -1,7 +1,33 @@
+import { setKeybindings } from "@earendil-works/pi-tui";
+import stripAnsi from "strip-ansi";
 import { describe, expect, test } from "vitest";
-import { createAgentsViewReplyHeadline } from "../src/modes/agents-view/agents-view-mode.js";
+import { KeybindingsManager } from "../src/core/keybindings.js";
+import type { ModelRegistry } from "../src/core/model-registry.js";
+import { SettingsManager } from "../src/core/settings-manager.js";
+import {
+	AgentsViewMode,
+	createAgentsViewReplyHeadline,
+	formatAgentsViewStatusLine,
+} from "../src/modes/agents-view/agents-view-mode.js";
 import { agentsViewRowRecap } from "../src/modes/agents-view/agents-view-state.js";
 import { buildAgentsViewRows, type SessionSummary } from "../src/modes/index.js";
+import { stopThemeWatcher } from "../src/modes/interactive/theme/theme.js";
+
+function createUiServices() {
+	return {
+		settingsManager: SettingsManager.inMemory({ theme: "dark" }),
+		modelRegistry: {} as ModelRegistry,
+		getInitialCwd: () => process.cwd(),
+		getInitialSessionName: () => undefined,
+		getThemes: () => [],
+	};
+}
+
+function invoke(method: string, self: object, ...args: unknown[]): unknown {
+	const member = Reflect.get(AgentsViewMode.prototype, method) as ((...a: unknown[]) => unknown) | undefined;
+	if (typeof member !== "function") throw new Error(`AgentsViewMode.${method} no longer exists`);
+	return member.call(self, ...args);
+}
 
 /**
  * The agents view paints its own rows: `renderRow`, `renderAnswerRow` and
@@ -204,5 +230,82 @@ describe("agents view row sanitization", () => {
 		expectByteClean(headline ?? "");
 		expect(headline).toBe("都跑完了 绿");
 		expect(createAgentsViewReplyHeadline(`   \n${CLEAR}\n  `)).toBeUndefined();
+	});
+
+	test("washes the status line the view shows below its rows", () => {
+		// The single-row hint slot: a daemon error message or a session's cwd lands
+		// here, and the line renders through theme.fg, not Text.
+		const line = formatAgentsViewStatusLine(`opened ${OSC52}/tmp/pro${CLEAR}ject\r done`);
+		expectByteClean(line);
+		expect(line).toBe("opened /tmp/project done");
+	});
+
+	test("washes the action kind the status label falls back to", () => {
+		// `label` is empty, so the label falls back to the action kind - wire bytes
+		// from the same closed union the roster label above defends against.
+		const rows = buildAgentsViewRows([
+			makeSummary({
+				sessionActions: {
+					queuedCount: 0,
+					steering: [],
+					followUps: [],
+					active: { kind: `tur${OSC52}n_now\u0007` as "turn", phase: "running", label: "" },
+				},
+			}),
+		]);
+		const statusLabel = rows[0]?.statusLabel ?? "";
+		expectByteClean(statusLabel);
+		expect(statusLabel).toBe("turn now");
+	});
+
+	test("drops an answer row whose preview is only escape sequences", () => {
+		// The preview washes to nothing, so no empty `↳` row sits under its parent.
+		const rows = buildAgentsViewRows([
+			makeSummary({ sessionName: "clean", answerPreview: `${OSC52}${CLEAR}\u0007` }),
+		]);
+		expect(rows.filter((row) => row.kind === "answer")).toHaveLength(0);
+	});
+});
+
+describe("the row line the view renders itself", () => {
+	test("washes the model label a subagent row's title carries", () => {
+		setKeybindings(new KeybindingsManager());
+		const summaries = [
+			makeSummary({
+				id: "child-active",
+				activeSessionId: "child-active",
+				sessionId: "child-session",
+				sessionName: "child",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "parent-active",
+				model: { provider: `an${OSC52}thropic`, id: `cl${CLEAR}aude` } as SessionSummary["model"],
+				thinkingLevel: `hi\u0007gh` as SessionSummary["thinkingLevel"],
+			}),
+			makeSummary({
+				id: "parent-active",
+				activeSessionId: "parent-active",
+				sessionId: "parent-session",
+				sessionName: "parent",
+				isStreaming: true,
+				activity: "working",
+			}),
+		];
+		const parentIdentity = buildAgentsViewRows(summaries)[0]?.identity ?? "";
+		const expanded = buildAgentsViewRows(summaries, new Set([parentIdentity]), new Set([parentIdentity]));
+		const childRow = expanded.find((row) => row.summary.sessionId === "child-session");
+		expect(childRow).toBeDefined();
+		const view = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, {});
+		try {
+			const line = invoke("renderRow", view, childRow, 200) as string;
+			// The row line is theme-painted (its own SGR stays); the model label's
+			// injected bytes do not.
+			expect(line).not.toContain("\u001b]52");
+			expect(line).not.toContain("cGFzdGU=");
+			expect(line).not.toContain("\u0007");
+			expect(line).not.toContain("\u001b[2J");
+			expect(stripAnsi(line)).toContain("anthropic/claude:high");
+		} finally {
+			stopThemeWatcher();
+		}
 	});
 });

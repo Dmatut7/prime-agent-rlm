@@ -15,12 +15,14 @@ import {
 	shortAgentName,
 } from "../src/modes/interactive/components/agent-message.js";
 import { sanitizeDisplayText } from "../src/modes/interactive/components/diff-rows.js";
+import { recapLineText } from "../src/modes/interactive/components/recap-line.js";
 import {
 	SystemNoticeLine,
 	subagentNoticeRow,
 	TimelineNoticeRow,
 } from "../src/modes/interactive/components/system-notice.js";
 import type { BoxRow, TimelineFacts } from "../src/modes/interactive/components/timeline-rows.js";
+import { TurnActivityState } from "../src/modes/interactive/components/turn-activity.js";
 import { BOX_FOCUS_MARKER, computeBoxHeader } from "../src/modes/interactive/components/turn-box.js";
 import { addCommand, plain, quietTurn, text, useTruecolorTheme } from "./ui-blocks-helpers.js";
 
@@ -176,6 +178,13 @@ describe("R4-M2: a subagent's report is washed on every face that draws it", () 
 		expect(agentMessagePreview(10, `结论：没问题。${OSC52}`)).toBe("结论：没问题。");
 	});
 
+	it("falls through to the next identity when a sender name is only escape sequences", () => {
+		// A name that washes to nothing must not win the fallback chain and blank
+		// the row: the next identity names the sender instead.
+		expect(agentMessageSenderName({ sessionName: `${OSC52}${CLEAR}`, activeSessionId: "act-9" })).toBe("act-9");
+		expect(agentMessageSenderName({ sessionName: `${OSC52}${PAINT}` })).toBe("unknown");
+	});
+
 	it("washes the summary line and the received-message line", () => {
 		expect(ownEscapes(agentMessageSummaryLine(dirty("子代理"), dirty("worker"), dirty("好了")))).not.toContain(
 			"\u001b",
@@ -291,5 +300,36 @@ describe("the shared display washer drops whole sequences, not just the ESC that
 		expect(sanitizeDisplayText(`worker${OSC52}`)).toBe("worker");
 		expect(sanitizeDisplayText(`a${CLEAR}b`)).toBe("ab");
 		expect(sanitizeDisplayText("keep\nthis line break")).toBe("keep\nthis line break");
+	});
+});
+
+describe("R4-M14 read side: the recap line washes whatever source it replays", () => {
+	it("washes a poisoned journal recap before it reaches the TruncatedText row", () => {
+		// The recap line renders through TruncatedText, a component the Text gate
+		// never sees, and the snapshot's baseline recap comes straight from a journal
+		// a pre-wash build could have written.
+		const line = recapLineText(`修好了${OSC52}登录${CLEAR}的回归`, false);
+		expect(line).toBe("回顾：修好了登录的回归");
+	});
+
+	it("drops a recap that was nothing but escape sequences", () => {
+		expect(recapLineText(`${OSC52}${CLEAR}${PAINT}`, false)).toBeUndefined();
+	});
+
+	it("still reads a clean recap the way it always did", () => {
+		expect(recapLineText("干净的一条回顾", false)).toBe("回顾：干净的一条回顾");
+	});
+});
+
+describe("R3-M22 residual: the legacy process line washes its tool verbs", () => {
+	it("washes a malformed tool name where the aggregate verb line joins it", () => {
+		const state = new TurnActivityState(Date.now() - 5_000);
+		state.addStep({ toolCallId: "t1", toolName: `ba${OSC52}sh`, args: {}, status: "done" });
+		state.addStep({ toolCallId: "t2", toolName: `ba\u0007sh${CLEAR}`, args: {}, status: "done" });
+		const text = state.summaryText();
+		expect(text).not.toContain("\u001b");
+		expect(text).not.toContain("\u0007");
+		// Two dirty names that wash to the same verb count as one verb, twice.
+		expect(text).toContain("bash×2");
 	});
 });

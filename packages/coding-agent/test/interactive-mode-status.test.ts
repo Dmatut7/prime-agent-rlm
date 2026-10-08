@@ -6549,13 +6549,14 @@ describe("InteractiveMode.showStatus / showError sanitize untrusted text", () =>
 		// sequences this test is about, making a "no ESC" check vacuous.
 		const raw = renderLastLine(fakeThis.chatContainer);
 		expect(stripAnsi(raw)).toContain("provider failed");
-		// The \r is gone (C0), the \n is intentional structure and survives, the
-		// injected clear-screen escape does not.
+		// The \r is gone (C0), the \n is intentional structure and survives, and the
+		// whole injected clear-screen sequence goes - parameter bytes included, not
+		// just the ESC that starts it.
 		expect(
 			stripAnsi(raw)
 				.split("\n")
 				.map((line) => line.trim()),
-		).toEqual(["provider failed", "retry[2J"]);
+		).toEqual(["provider failed", "retry"]);
 		expect(raw).not.toContain("\x1b[2J");
 		expect(raw).not.toContain("\x07");
 	});

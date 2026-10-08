@@ -5,7 +5,6 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import {
 	type SubagentPanelRow,
-	type SubagentStallMarker,
 	SubagentSummaryLine,
 } from "../src/modes/interactive/components/subagent-summary-line.js";
 import { theme } from "../src/modes/interactive/theme/theme.js";
@@ -24,11 +23,10 @@ const CLEAR = "\u001b[2J\u001b[H";
 const BEL = "\u0007";
 const HYPERLINK = "\u001b]8;;http://evil.example\u0007";
 
-function strip(rows: readonly SubagentPanelRow[], markers: readonly SubagentStallMarker[] = []): SubagentSummaryLine {
+function strip(rows: readonly SubagentPanelRow[]): SubagentSummaryLine {
 	const line = new SubagentSummaryLine();
 	line.setSubagentCounts({ total: rows.length, running: rows.length, idle: 0, inactive: 0 });
 	line.setSubagentRows(rows);
-	line.setStallMarkers(markers);
 	line.setOpenable(true);
 	return line;
 }
@@ -56,35 +54,15 @@ describe("the subagent strip's one row", () => {
 	});
 
 	it("keeps one block for a stalled child whose name carries ': '", () => {
-		const line = strip(
-			[{ id: "c1", name: "lane: review", state: "stalled" }],
-			[{ name: "lane: review", text: "stalled 70s, in-flight: bash" }],
-		);
+		const line = strip([{ id: "c1", name: "lane: review", state: "stalled" }]);
 		const rendered = line.render(120);
 		expect(rendered).toHaveLength(1);
 		const text = plain(rendered);
-		// One child, one block, one 卡住: no phantom block naming the truncated half of its name.
+		// One child, one block, one 卡住: the state word says the stall on the block itself.
 		expect(text).toContain(" ◇ lane: review ⚠ 卡住 ");
 		expect(count(text, "lane")).toBe(1);
 		expect(count(text, "卡住")).toBe(1);
 		expect(count(rendered[0] ?? "", bgOpen("kindErrorBg"))).toBe(0);
-	});
-
-	it("still draws a stall without a row of its own as one red block", () => {
-		const line = strip(
-			[{ id: "w", name: "worker", state: "running" }],
-			[
-				{ name: "worker", text: "stalled 70s" },
-				{ name: "roster-only", text: "stalled 90s, in-flight: bash" },
-			],
-		);
-		const rendered = line.render(120);
-		const text = plain(rendered);
-		expect(text).toContain(" ⚠ roster-only 卡住 ");
-		expect(text).toContain(" ◇ worker 回答中 ");
-		expect(count(rendered[0] ?? "", bgOpen("kindErrorBg"))).toBe(1);
-		// The stall detail is the panel row's business, not the strip's: it never leaks into the chip.
-		expect(text).not.toContain("stalled");
 	});
 
 	it("keeps one physical row when a task tag carries a newline", () => {
@@ -109,39 +87,36 @@ describe("the subagent strip's one row", () => {
 	});
 
 	it("never lets a clipboard write, a screen clear, a bell or a hyperlink reach the dock", () => {
-		const line = strip(
-			[
-				{ id: "c1", name: `rev-A-one${OSC52}${CLEAR}${BEL}`, state: "running", tag: `${HYPERLINK}审查` },
-				{ id: "c2", name: "rev-A-two", state: "running" },
-			],
-			[{ name: `ghost${OSC52}`, text: `stalled 70s${CLEAR}` }],
-		);
+		const line = strip([
+			{ id: "c1", name: `rev-A-one${OSC52}${CLEAR}${BEL}`, state: "running", tag: `${HYPERLINK}审查` },
+			{ id: "c2", name: "rev-A-two", state: "running" },
+		]);
 		const rendered = line.render(120);
 		const raw = rendered.join("\n");
 		expect(raw).not.toContain("\u001b]52");
 		expect(raw).not.toContain("\u001b[2J");
 		expect(raw).not.toContain("\u0007");
 		expect(raw).not.toContain("\u001b]8;");
-		const text = plain(rendered);
-		expect(text).toContain(" ◇ rev-A-one 审查 回答中 ");
-		expect(text).toContain(" ⚠ ghost 卡住 ");
+		expect(plain(rendered)).toContain(" ◇ rev-A-one 审查 回答中 ");
 	});
 
 	it("names a child whose name was nothing but escapes instead of drawing a nameless block", () => {
 		const line = new SubagentSummaryLine();
 		line.setSubagentCounts({ total: 2, running: 2, idle: 0, inactive: 0 });
-		line.setSubagentRows([{ id: "c1", name: `${OSC52}${CLEAR}`, state: "running" }]);
-		line.setStallMarkers([{ name: BEL, text: "stalled 70s" }]);
+		line.setSubagentRows([
+			{ id: "c1", name: `${OSC52}${CLEAR}`, state: "running" },
+			{ id: "c2", name: "helper", state: "stalled" },
+		]);
 		const rendered = line.render(120);
 		const raw = rendered.join("\n");
 		expect(raw).not.toContain("\u001b]52");
 		expect(raw).not.toContain("\u0007");
 		const text = plain(rendered);
 		expect(text).toContain(" ◇ 子代理 回答中 ");
-		expect(text).toContain(" ⚠ 子代理 卡住 ");
+		expect(text).toContain(" ◇ helper ⚠ 卡住 ");
 		// Neither block is drawn as an empty name between its glyph and its state word.
 		expect(text).not.toContain("◇  回答中");
-		expect(text).not.toContain("⚠  卡住");
+		expect(text).not.toContain("◇  卡住");
 	});
 
 	it("draws an ordinary name, a CJK one and the short-name rule exactly as before", () => {
@@ -174,7 +149,6 @@ describe("the subagent strip's one row", () => {
 					state: "running" as const,
 					...(index === 1 ? { tag: `${CLEAR}tag` } : {}),
 				})),
-				[{ name: `ghost${BEL}`, text: "stalled 70s" }],
 			);
 			for (const focused of [false, true]) {
 				line.focused = focused;

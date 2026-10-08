@@ -1,0 +1,1 @@
+- Hardened `sanitizeRenderText` after the review cluster: an unterminated OSC 8 is dropped instead of kept half-open (the terminal would keep eating the rows after it), a `CSI > … m` keyboard-mode set no longer passes as an SGR, and CSI intermediate bytes and DCS/APC/SOS/PM sequences are dropped whole instead of leaving their parameter bytes on screen as visible debris.

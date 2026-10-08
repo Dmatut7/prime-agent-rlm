@@ -1382,11 +1382,14 @@ export function sliceByColumn(line: string, startCol: number, length: number, st
 
 /**
  * The render-side wash for text a component did not color itself: keep theme
- * SGR codes and OSC 8 hyperlinks (a row's legitimate escapes), drop every other
- * escape sequence (an OSC 52 in model text writes the user's clipboard; a CSI
- * J/K/H moves the cursor) and every bare control character (a BEL rings, a CR
- * rewinds the row). Newlines and tabs survive - the callers normalize those
- * with their own width math.
+ * SGR codes and terminated OSC 8 hyperlinks (a row's legitimate escapes), drop
+ * every other escape sequence whole (an OSC 52 in model text writes the user's
+ * clipboard; a CSI J/K/H moves the cursor; a `CSI > … m` keyboard-mode set must
+ * not pass as an SGR) and every bare control character (a BEL rings, a CR
+ * rewinds the row). An unterminated sequence loses everything after its
+ * introducer - the alternative is a half-open OSC 8 the terminal keeps eating.
+ * Newlines and tabs survive - the callers normalize those with their own width
+ * math.
  */
 export function sanitizeRenderText(text: string): string {
 	let out = "";
@@ -1397,22 +1400,37 @@ export function sanitizeRenderText(text: string): string {
 		if (ch === "\x1b") {
 			if (text[i + 1] === "[") {
 				let j = i + 2;
-				while (j < n && /[0-9;:?<=>!]/.test(text[j]!)) j++;
+				let plainParams = true;
+				while (j < n && /[0-9;:?<=>!]/.test(text[j]!)) {
+					if (!/[0-9;:]/.test(text[j]!)) plainParams = false;
+					j++;
+				}
+				const paramEnd = j;
+				while (j < n && /[\x20-\x2f]/.test(text[j]!)) j++;
 				const final = text[j];
 				if (final !== undefined && /[A-Za-z]/.test(final)) {
-					if (final === "m") out += text.slice(i, j + 1);
+					// Only a plain parameter run ending in `m` is an SGR; an intermediate
+					// byte or a private/mode parameter (`>`, `?`) makes it another sequence.
+					if (final === "m" && plainParams && paramEnd === j) out += text.slice(i, j + 1);
 					i = j + 1;
 					continue;
 				}
 				i = j;
 				continue;
 			}
-			if (text[i + 1] === "]") {
+			if (
+				text[i + 1] === "]" ||
+				text[i + 1] === "P" ||
+				text[i + 1] === "_" ||
+				text[i + 1] === "^" ||
+				text[i + 1] === "X"
+			) {
+				// A string sequence (OSC/DCS/APC/SOS/PM): scan to its BEL or ST terminator.
 				let j = i + 2;
 				while (j < n && text[j] !== "\x07" && !(text[j] === "\x1b" && text[j + 1] === "\\")) j++;
 				const terminated = text[j] === "\x07" || (text[j] === "\x1b" && text[j + 1] === "\\");
 				const end = terminated ? (text[j] === "\x07" ? j + 1 : j + 2) : j;
-				if (text.slice(i + 2, j).startsWith("8;")) out += text.slice(i, end);
+				if (text[i + 1] === "]" && terminated && text.slice(i + 2, j).startsWith("8;")) out += text.slice(i, end);
 				i = end;
 				continue;
 			}

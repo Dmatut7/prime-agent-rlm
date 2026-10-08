@@ -382,8 +382,13 @@ export class DaemonSessionSummarizer {
 		const persisted = state.runtime.session.sessionManager.getLatestAgentStatus();
 		if (persisted) {
 			// A journal a pre-wash build wrote can still carry escape bytes, and the
-			// roster replays a seeded recap on every restart: wash on the read side.
-			state.summaryState = { ...persisted, summary: sanitizeRowText(persisted.summary) };
+			// roster replays a seeded recap on every restart: wash on the read side. A
+			// hand-edited journal can also miss the summary field - that degrades to an
+			// empty recap instead of taking the whole session down with a TypeError.
+			state.summaryState = {
+				...persisted,
+				summary: typeof persisted.summary === "string" ? sanitizeRowText(persisted.summary) : "",
+			};
 		}
 	}
 

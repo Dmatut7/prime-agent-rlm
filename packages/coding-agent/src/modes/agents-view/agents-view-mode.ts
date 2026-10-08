@@ -319,9 +319,10 @@ export function resolveAgentsViewActiveSummaryForPath(
 
 // Status messages render in a single-row hint slot below the editor; embedded
 // newlines would make that row taller than the layout accounts for and overlap
-// the input, so flatten all whitespace runs to single spaces.
+// the input. The text can carry a daemon error message or a session's cwd, so
+// the wash runs here too - one point every status entry flows through.
 export function formatAgentsViewStatusLine(text: string): string {
-	return text.replace(/\s+/g, " ").trim();
+	return sanitizeRowText(text);
 }
 
 export function combineAgentsViewStartupNotices(...notices: readonly (string | undefined)[]): string | undefined {
@@ -3226,7 +3227,9 @@ export class AgentsViewMode implements Component, Focusable {
 		const rowModel = rowSessionModel(row);
 		const modelLabel =
 			!pendingDelete && !pendingKill && rowModel && (isSubagentSummary(row.summary) || row.section === "inactive")
-				? `${rowModel.provider}/${rowModel.modelId}${row.summary.thinkingLevel && row.summary.thinkingLevel !== "off" ? `:${row.summary.thinkingLevel}` : ""}`
+				? sanitizeRowText(
+						`${rowModel.provider}/${rowModel.modelId}${row.summary.thinkingLevel && row.summary.thinkingLevel !== "off" ? `:${row.summary.thinkingLevel}` : ""}`,
+					)
 				: undefined;
 		const statusLabel =
 			!pendingDelete &&
@@ -3686,7 +3689,9 @@ function padCellStart(value: string, width: number): string {
 // Explicit session names read bold so they stand out from fallback titles
 // (first prompt, cwd, ids); the "(no messages)" placeholder reads italic.
 function styleRowTitle(row: AgentsViewRow): string {
-	if (row.summary.sessionName?.replace(/\s+/g, " ").trim()) {
+	// Judged on the washed name: a name that was nothing but escape sequences
+	// washes to the fallback title, and a fallback title must not read bold.
+	if (sanitizeRowText(row.summary.sessionName ?? "")) {
 		return theme.bold(row.title);
 	}
 	if (row.title === "(no messages)") {

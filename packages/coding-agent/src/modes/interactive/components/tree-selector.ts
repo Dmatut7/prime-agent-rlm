@@ -883,7 +883,7 @@ class TreeList implements Component {
 					const bashMsg = msg as { command?: string };
 					result = theme.fg("dim", `[bash]: ${sanitizeRowText(bashMsg.command ?? "")}`);
 				} else {
-					result = theme.fg("dim", `[${role}]`);
+					result = theme.fg("dim", `[${sanitizeRowText(role)}]`);
 				}
 				break;
 			}

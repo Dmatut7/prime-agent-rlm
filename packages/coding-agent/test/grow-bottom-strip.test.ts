@@ -92,12 +92,6 @@ describe("the subagent strip", () => {
 				expect(line.render(width), `${size} agents focused at ${width}`).toHaveLength(1);
 			}
 		}
-		const withOrphans = strip(agents(10));
-		withOrphans.setStallMarkers([
-			{ name: "ghost-a", text: "stalled 70s" },
-			{ name: "ghost-b", text: "stalled 80s" },
-		]);
-		expect(withOrphans.render(60)).toHaveLength(1);
 	});
 
 	it("renders nothing without children", () => {
@@ -110,7 +104,6 @@ describe("the subagent strip", () => {
 	it("never draws past the width", () => {
 		for (const width of [120, 80, 60, 40, 24, 12, 8, 6, 3, 2, 1]) {
 			const line = strip(agents(10));
-			line.setStallMarkers([{ name: "ghost", text: "stalled 70s" }]);
 			for (const focused of [false, true]) {
 				line.focused = focused;
 				for (const rendered of line.render(width)) {
@@ -523,39 +516,6 @@ describe("the subagent strip", () => {
 
 			line.setSubagentRows([row("a", "done", "one"), row("b", "idle", "two")]);
 			expect(plain(line.render(120))).toContain("闲置一阵后会自动关闭");
-		});
-	});
-
-	describe("a stalled descendant without a block of its own", () => {
-		it("becomes a red block in the same row instead of a line of its own", () => {
-			const line = strip([row("w", "stalled", "worker")]);
-			line.setStallMarkers([
-				{ name: "worker", text: "stalled 70s" },
-				{ name: "ghost", text: "stalled 90s, in-flight: bash" },
-			]);
-			const rendered = line.render(120);
-			expect(rendered).toHaveLength(1);
-			const text = plain(rendered);
-			expect(text).toContain(" ⚠ ghost 卡住 ");
-			// The worker already says 卡住 on its own block: no second block for it.
-			expect(text).not.toContain("worker: stalled");
-			expect(count(text, "worker")).toBe(1);
-			expect(count(rendered[0] ?? "", bgOpen("kindErrorBg"))).toBe(1);
-			expect(rendered[0]).toContain(theme.fg("kindError", "⚠"));
-			expect(text.indexOf("ghost")).toBeLessThan(text.indexOf("worker"));
-		});
-
-		it("can be reached with the arrow keys and opens the family view", () => {
-			const line = strip([row("w", "running", "worker")]);
-			line.setStallMarkers([{ name: "ghost", text: "stalled 90s" }]);
-			const onOpen = vi.fn();
-			line.onOpen = onOpen;
-			line.focused = true;
-			line.handleInput(ENTER);
-			expect(onOpen).toHaveBeenLastCalledWith(undefined);
-			line.handleInput(RIGHT);
-			line.handleInput(ENTER);
-			expect(onOpen).toHaveBeenLastCalledWith(expect.objectContaining({ id: "w" }));
 		});
 	});
 

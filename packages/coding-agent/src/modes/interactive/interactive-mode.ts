@@ -312,10 +312,8 @@ import {
 	collectSubtreeSubagentSnapshots,
 	countRosterSubagentStatuses,
 	countSubtreeSubagentStatuses,
-	formatSubagentStallMarker,
 	renderSubagentSpendCell,
 	type SubagentPanelRow,
-	type SubagentStallMarker,
 	type SubagentSummaryCounts,
 	SubagentSummaryLine,
 	summarizeSubagentSpend,
@@ -7972,17 +7970,8 @@ export class InteractiveMode {
 		// the figure moves when an assistant message lands, when the turn ends, and on the
 		// idle tick.
 		this.syncSubagentSpendCell();
-		// A stalled child still counts as running, so the stall has to be visible on
-		// its own line or a wedged subagent reads as progress. Same subtree as the
-		// counts: a wedge anywhere in the family must not need a direct-child slot.
-		const stallMarkers: SubagentStallMarker[] = [];
-		for (const child of collectSubtreeSubagentSnapshots(this.subagentSnapshots.values(), this.rlmNodeId)) {
-			const text = formatSubagentStallMarker(child);
-			// Named exactly as buildSubagentPanelRows names the row below: that is how the
-			// strip tells a stall that already has a block of its own from one that needs one.
-			if (text) stallMarkers.push({ name: child.sessionName ?? child.label, text });
-		}
-		this.subagentSummaryLine.setStallMarkers(stallMarkers);
+		// A stalled child still counts as running, so the stall is visible on its own
+		// block (the row's `⚠ 卡住` state word) or a wedged subagent reads as progress.
 		this.subagentSummaryLine.setSubagentRows(
 			buildSubagentPanelRows(this.subagentSnapshots.values(), this.rlmNodeId, this.seenSubagentFailureIds),
 		);

@@ -323,21 +323,6 @@ describe("SubagentSummaryLine", () => {
 		expect(lines[0]).toContain("grandchild ⚠ 卡住");
 	});
 
-	it("keeps the stall marker of a stalled session that has no row of its own", () => {
-		const line = new SubagentSummaryLine();
-		line.setSubagentCounts({ total: 2, running: 2, idle: 0, inactive: 0 });
-		line.setSubagentRows([{ id: "w", name: "worker", state: "running" }]);
-		line.setStallMarkers([
-			{ name: "worker", text: "stalled 70s" },
-			{ name: "roster-only", text: "stalled 90s, in-flight: bash" },
-		]);
-		const lines = line.render(160).map(stripAnsi);
-		// The session without a row becomes a red block in the same row; the one with a row says it there.
-		expect(lines).toHaveLength(1);
-		expect(lines[0]).toContain(" ⚠ roster-only 卡住 ");
-		expect(lines[0]).not.toContain("worker: stalled 70s");
-	});
-
 	it("clears a resident session id when a terminal update reports an evicted child", () => {
 		const line = new SubagentSummaryLine();
 		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
@@ -1546,17 +1531,15 @@ describe("subagent panel rows (design board 06)", () => {
 		expect(onCancel).toHaveBeenCalledTimes(1);
 	});
 
-	it("pages a crowd of children sideways in one row and drops stall marker lines while rows carry the state", () => {
+	it("pages a crowd of children sideways in one row, and running rows never say 卡住", () => {
 		const line = new SubagentSummaryLine();
 		line.setSubagentCounts({ total: 6, running: 6, idle: 0, inactive: 0 });
 		line.setSubagentRows(
 			Array.from({ length: 6 }, (_, index) => ({ id: `c${index}`, name: `w${index}`, state: "running" as const })),
 		);
-		line.setStallMarkers([{ name: "w0", text: "stalled 30s" }]);
 		const lines = line.render(60).map(stripAnsi);
 		expect(lines).toHaveLength(1);
 		expect(lines[0]).toMatch(/还有 \d+ 个 ›/);
-		// w0 has a block of its own: its marker adds nothing.
 		expect(lines.join("\n")).not.toContain("⚠");
 	});
 

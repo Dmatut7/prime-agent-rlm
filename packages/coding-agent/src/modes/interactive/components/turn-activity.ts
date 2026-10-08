@@ -5,6 +5,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
+import { sanitizeRowText } from "../../../utils/display-text.js";
 import { theme } from "../theme/theme.js";
 import { getSpinnerTick } from "../theme/working-icon.js";
 import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock, renderedCopyText } from "./block-focus.js";
@@ -650,7 +651,10 @@ export class TurnActivityState {
 	private verbSummary(): string {
 		const counts = new Map<string, number>();
 		for (const step of this.steps) {
-			const verb = turnStepVerb(step.toolName);
+			// The legacy aggregate line builds its own row, and a tool name is
+			// model-controlled (R3-M22): the verb is washed where it is joined.
+			const verb = sanitizeRowText(turnStepVerb(step.toolName));
+			if (!verb) continue;
 			counts.set(verb, (counts.get(verb) ?? 0) + 1);
 		}
 		return [...counts.entries()].map(([verb, count]) => (count > 1 ? `${verb}×${count}` : verb)).join(" · ");

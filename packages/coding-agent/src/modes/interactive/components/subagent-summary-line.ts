@@ -186,35 +186,6 @@ export function isStalledSubagentSnapshot(child: AgentConnectionRlmChildAgentSna
 	return child.activity?.kind === "stalled" || child.stall !== undefined;
 }
 
-/** One-line stall marker for a subagent row: silence duration plus the tools still in flight. */
-export function formatSubagentStallMarker(child: AgentConnectionRlmChildAgentSnapshot): string | undefined {
-	const stall = child.stall;
-	if (!stall && child.activity?.kind !== "stalled") return undefined;
-	// The marker renders as a red warning line, which is the wrong thing to shout about a healthy
-	// long command; the agents-view row still states the neutral fact ("long-running 12m").
-	if (stall?.excused === true && child.activity?.kind !== "stalled") return undefined;
-	const silentSeconds = Math.max(1, Math.round((stall?.silentMs ?? 0) / 1000));
-	const tools = stall?.inFlightTools ?? [];
-	const toolText = tools.length > 0 ? `, in-flight: ${tools.join(", ")}` : "";
-	const unsettled = stall?.unsettled ? ", abort did not settle" : "";
-	return `stalled ${silentSeconds}s${toolText}${unsettled}`;
-}
-
-/**
- * A stalled child the strip has to account for: the child's name plus its stall
- * detail, as two fields. Never one `name: text` string - a real name carries
- * `": "` (`lane: review`), and a consumer that cuts the marker at the first one
- * invents a second, truncated child beside the real block. The strip draws the
- * name (the detail is the panel row's own `activity`); it rides along so no
- * consumer ever has to parse it back out of a name.
- */
-export interface SubagentStallMarker {
-	/** The child's display name, spelled exactly as its panel row spells it (see buildSubagentPanelRows). */
-	name: string;
-	/** The stall detail from formatSubagentStallMarker (`stalled 70s, in-flight: bash`). */
-	text: string;
-}
-
 /** One child row of the subagent panel. */
 export type SubagentPanelRowState = "running" | "idle" | "done" | "failed" | "stalled";
 
@@ -508,10 +479,10 @@ export class TrayInfoLine implements Component {
 	}
 }
 
-/** One block of the strip: a child, a stalled descendant without a row of its own, or the family counts. */
+/** One block of the strip: a child, or the family counts. */
 interface StripItem {
 	key: string;
-	kind: "row" | "orphan" | "counts";
+	kind: "row" | "counts";
 	/** What Enter or a click opens; absent for the blocks that open the family view. */
 	row?: SubagentPanelRow;
 	name: string;
@@ -555,7 +526,6 @@ export class SubagentSummaryLine implements Component, Focusable {
 	focused = false;
 	private counts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
 	private spend: SubagentSpendSummary | undefined;
-	private stallMarkers: readonly SubagentStallMarker[] = [];
 	private rows: readonly SubagentPanelRow[] = [];
 	private items: readonly StripItem[] = [];
 	private itemsDirty = true;
@@ -597,16 +567,6 @@ export class SubagentSummaryLine implements Component, Focusable {
 
 	getSubagentSpend(): SubagentSpendSummary | undefined {
 		return this.spend;
-	}
-
-	/**
-	 * Per-child stall markers (see formatSubagentStallMarker). A marker whose
-	 * child has a block of its own is already said there (`⚠ 卡住`); one without
-	 * (a roster-only descendant) becomes a red block in the same row.
-	 */
-	setStallMarkers(markers: readonly SubagentStallMarker[]): void {
-		this.stallMarkers = markers;
-		this.itemsDirty = true;
 	}
 
 	/** Per-child rows (see buildSubagentPanelRows): one block each, in the order the children were dispatched. */
@@ -709,27 +669,16 @@ export class SubagentSummaryLine implements Component, Focusable {
 		].join("\u0001");
 	}
 
-	/** The blocks in row order: red stall blocks first, then the children, or the counts block when no child is known. */
+	/** The blocks in row order: the children, or the counts block when no child is known. */
 	private getItems(): readonly StripItem[] {
 		if (!this.itemsDirty) return this.items;
 		this.itemsDirty = false;
 		const items: StripItem[] = [];
 		if (this.counts.total > 0) {
-			const named = new Set(this.rows.map((row) => row.name));
-			const seen = new Set<string>();
-			// Matched on the name as the snapshot spells it, not on the washed one: two
-			// children whose names wash to the same word are still two children, and a
-			// stall that dedups against the wrong row would go unsaid.
-			const shown = shortNames([
-				...this.rows.map((row) => row.name),
-				...this.stallMarkers.map((marker) => marker.name).filter((name) => !named.has(name)),
-			]);
-			for (const marker of this.stallMarkers) {
-				const { name } = marker;
-				if (named.has(name) || seen.has(name)) continue;
-				seen.add(name);
-				items.push({ key: `orphan:${name}`, kind: "orphan", name: chipName(shown.get(name) ?? name) });
-			}
+			// Short names are keyed by the name as the snapshot spells it, not by the
+			// washed one: two children whose names wash to the same word are still two
+			// children. The display wash happens in chipName.
+			const shown = shortNames(this.rows.map((row) => row.name));
 			if (this.rows.length > 0) {
 				for (const row of this.dispatchOrder()) {
 					const tag = chipTag(row.tag);
@@ -1019,15 +968,8 @@ export class SubagentSummaryLine implements Component, Focusable {
 		withTag = false,
 	): { text: string; width: number } {
 		const lit = selected || hovered;
-		const orphan = item.kind === "orphan";
-		const bg: ThemeBg = orphan
-			? lit
-				? "kindErrorHoverBg"
-				: "kindErrorBg"
-			: lit
-				? "kindSubagentHoverBg"
-				: "kindSubagentBg";
-		const glyph = orphan ? theme.fg("kindError", "⚠") : theme.bold(theme.fg("timelineSub", "◇"));
+		const bg: ThemeBg = lit ? "kindSubagentHoverBg" : "kindSubagentBg";
+		const glyph = theme.bold(theme.fg("timelineSub", "◇"));
 		const paint = (body: string): { text: string; width: number } => {
 			// A truncation inside the body ends with a full reset, which also clears the background: put it back.
 			const open = theme.bg(bg, "").replace(/\x1b\[49m$/, "");
@@ -1042,8 +984,8 @@ export class SubagentSummaryLine implements Component, Focusable {
 			// " ◇ " and the closing space are 4 columns around the body.
 			return paint(truncateToWidth(body, Math.max(1, maxWidth - 4), "…"));
 		}
-		const stateWord = orphan ? "卡住" : CHIP_STATE_WORDS[item.state ?? "running"];
-		const stateColor: ThemeColor = orphan ? "kindError" : CHIP_STATE_COLORS[item.state ?? "running"];
+		const stateWord = CHIP_STATE_WORDS[item.state ?? "running"];
+		const stateColor: ThemeColor = CHIP_STATE_COLORS[item.state ?? "running"];
 		const style = (name: string): string => {
 			const shown = selected ? theme.underline(theme.bold(name)) : name;
 			return theme.fg("text", shown);
@@ -1056,7 +998,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 		if (chip.width > maxWidth) {
 			// Name width first, down to its first character; the state word goes only when that is not enough.
 			const floor = minCutWidth(item.name);
-			const frame = visibleWidth(` ${orphan ? "⚠" : "◇"}  `);
+			const frame = visibleWidth(" ◇  ");
 			const withState = maxWidth - frame - visibleWidth(` ${stateWord}`);
 			const bare = maxWidth - frame;
 			if (withState >= floor) chip = build(Math.min(nameMax, withState), true);
@@ -1077,9 +1019,8 @@ export class SubagentSummaryLine implements Component, Focusable {
 
 	/** The least a block can be cut to and still name its child. */
 	private minChipWidth(item: StripItem): number {
-		const glyph = item.kind === "orphan" ? "⚠" : "◇";
 		const label = item.kind === "counts" ? `子代理 ${this.counts.total}` : item.name;
-		return visibleWidth(` ${glyph}  `) + minCutWidth(label);
+		return visibleWidth(` ◇  `) + minCutWidth(label);
 	}
 
 	/** A block's width, from its plain text: the layout needs it without touching the theme. */
@@ -1090,10 +1031,9 @@ export class SubagentSummaryLine implements Component, Focusable {
 				.join(" · ");
 			return visibleWidth(` ◇ 子代理 ${this.counts.total}${counts ? `  ${counts}` : ""} `);
 		}
-		const glyph = item.kind === "orphan" ? "⚠" : "◇";
-		const word = item.kind === "orphan" ? "卡住" : CHIP_STATE_WORDS[item.state ?? "running"];
+		const word = CHIP_STATE_WORDS[item.state ?? "running"];
 		const tag = withTag && item.tag ? ` ${item.tag}` : "";
-		return visibleWidth(` ${glyph} ${truncateToWidth(item.name, CHIP_NAME_MAX_WIDTH, "…")}${tag} ${word} `);
+		return visibleWidth(` ◇ ${truncateToWidth(item.name, CHIP_NAME_MAX_WIDTH, "…")}${tag} ${word} `);
 	}
 
 	invalidate(): void {

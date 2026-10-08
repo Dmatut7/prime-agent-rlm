@@ -3,10 +3,7 @@ import type { RlmChildStallState } from "../src/core/agent-session.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../src/modes/agent-connection/types.js";
 import { buildAgentsViewRows } from "../src/modes/agents-view/agents-view-state.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
-import {
-	formatSubagentStallMarker,
-	isStalledSubagentSnapshot,
-} from "../src/modes/interactive/components/subagent-summary-line.js";
+import { isStalledSubagentSnapshot } from "../src/modes/interactive/components/subagent-summary-line.js";
 
 /**
  * B9 / I-13: a stall the watchdog is excusing is healthy long work, and the roster must not say
@@ -55,22 +52,18 @@ function summary(overrides: Partial<SessionSummary> = {}): SessionSummary {
 }
 
 describe("an excused stall is not rendered as a stalled child", () => {
-	it("keeps the row out of the stalled set and drops the red marker", () => {
+	it("keeps the row out of the stalled set, so no alarm is drawn about healthy long work", () => {
 		const excused = child({ stall: stall({ excused: true, excusedReasons: ["live_bash_handles"] }) });
 		expect(isStalledSubagentSnapshot(excused)).toBe(false);
-		// The marker renders as a red "⚠ stalled ..." line; healthy long work gets no alarm line.
-		expect(formatSubagentStallMarker(excused)).toBeUndefined();
 
 		// Positive control: the same facts without the exemption still read as a stall.
 		const wedged = child({ stall: stall() });
 		expect(isStalledSubagentSnapshot(wedged)).toBe(true);
-		expect(formatSubagentStallMarker(wedged)).toBe("stalled 720s, in-flight: ipython");
 
 		// An explicit stalled activity outranks the excuse: the label decision is the producer's,
 		// and a renderer must not silently overrule it.
 		const labelled = child({ activity: { kind: "stalled" }, stall: stall({ excused: true }) });
 		expect(isStalledSubagentSnapshot(labelled)).toBe(true);
-		expect(formatSubagentStallMarker(labelled)).toContain("stalled");
 	});
 
 	it("says long-running in the agents view instead of stalled, and keeps the duration honest", () => {

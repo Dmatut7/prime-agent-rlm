@@ -1,8 +1,8 @@
 import stripAnsi from "strip-ansi";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { IPythonCellComponent } from "../src/modes/interactive/components/ipython-cell.js";
 import { setToolOutputFull } from "../src/modes/interactive/components/tool-output-budget.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { useTruecolorTheme } from "./ui-blocks-helpers.js";
 
 /**
  * R4-M7: the cell builds its own rows - it never hands its text to `Text`, so the
@@ -33,8 +33,16 @@ function expectNoInjection(rows: string[]): void {
 }
 
 describe("IPythonCellComponent sanitize", () => {
+	let restoreTheme: () => void;
 	beforeAll(() => {
-		initTheme("dark");
+		// The assertion below reads the theme's own color escape, whose shape
+		// depends on the detected color mode: pin truecolor so the test is green
+		// on every machine, not only on 256-color terminals.
+		restoreTheme = useTruecolorTheme("dark");
+	});
+
+	afterAll(() => {
+		restoreTheme();
 	});
 
 	afterEach(() => {
@@ -96,8 +104,9 @@ describe("IPythonCellComponent sanitize", () => {
 		// diff rows use, so the row's width no longer depends on the terminal's
 		// tab stops.
 		expect(visible).toContain(" │     tabbed = 2");
-		// The wash takes the escapes out of the code, not the highlighter's paint.
-		expect(rows.some((row) => row.includes("\u001b[38;5;"))).toBe(true);
+		// The wash takes the escapes out of the code, not the cell's own paint: the
+		// theme's truecolor foreground on the code rows proves the coloring survived.
+		expect(rows.some((row) => row.includes("\u001b[38;2;"))).toBe(true);
 	});
 
 	it("renders a clean cell exactly as it did before the wash", () => {

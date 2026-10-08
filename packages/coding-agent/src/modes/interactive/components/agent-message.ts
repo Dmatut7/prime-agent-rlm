@@ -43,16 +43,16 @@ export function receivedAgentMessageLine(name: string, verb: "交回" | "发来"
 /**
  * Who sent a message, as its row names them; the same fallbacks the participant
  * label uses. A sender names itself, so the name is washed on the way out: every
- * face below interpolates it into a row it builds itself.
+ * face below interpolates it into a row it builds itself. A candidate that is
+ * nothing but escape sequences washes to nothing, so the chain falls through to
+ * the next identity instead of naming the row with a blank.
  */
 export function agentMessageSenderName(from: AgentSessionMessage["details"]["from"]): string {
-	return sanitizeRowText(
-		from?.sessionName?.trim() ||
-			from?.activeSessionId?.trim() ||
-			from?.clientId?.trim() ||
-			from?.sessionId?.trim() ||
-			"unknown",
-	);
+	for (const candidate of [from?.sessionName, from?.activeSessionId, from?.clientId, from?.sessionId]) {
+		const washed = sanitizeRowText(candidate ?? "");
+		if (washed) return washed;
+	}
+	return "unknown";
 }
 
 /** Single-line message preview sized to fit after the summary-line prefix. */

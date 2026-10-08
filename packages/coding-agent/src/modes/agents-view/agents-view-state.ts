@@ -1095,7 +1095,10 @@ export function buildAgentsViewRows(
 		// U3: the row's last answer, one muted preview line directly under it
 		// (before its subagent list, so the row's own reply reads as its own).
 		if (row.summary.answerPreview) {
-			flattened.push(createAnswerRow(row, row.summary.answerPreview, depth));
+			const answerRow = createAnswerRow(row, row.summary.answerPreview, depth);
+			// A preview that was nothing but escape sequences washes to nothing:
+			// no empty `↳` row under its parent.
+			if (answerRow.title.length > 0) flattened.push(answerRow);
 		}
 		const children = childrenByParent.get(row) ?? [];
 		if (children.length === 0) {
@@ -1500,15 +1503,6 @@ export function formatAgentsViewDurationMs(durationMs: number | undefined): stri
 }
 
 /**
- * The row title is model-controlled: a session name comes from `/name` or from
- * `rlm.run(name=...)`, and the write side only started stripping control
- * characters with R4-H1, so the session files already on disk still carry the
- * older names. The agents view paints its rows itself (`renderRow` interpolates
- * the title into a `theme.fg` string), so this is the last wash before the
- * terminal: an OSC 52 in a name would write the user's clipboard every time the
- * row is drawn.
- */
-/**
  * The recap a row shows beside its title. It is written to the session journal by
  * the daemon summarizer and read back for as long as the row lives, so a journal an
  * older build left behind is replayed on every redraw: washed here, on the way out,
@@ -1519,6 +1513,15 @@ export function agentsViewRowRecap(summary: SessionSummary): string | undefined 
 	return washed.length > 0 ? washed : undefined;
 }
 
+/**
+ * The row title is model-controlled: a session name comes from `/name` or from
+ * `rlm.run(name=...)`, and the write side only started stripping control
+ * characters with R4-H1, so the session files already on disk still carry the
+ * older names. The agents view paints its rows itself (`renderRow` interpolates
+ * the title into a `theme.fg` string), so this is the last wash before the
+ * terminal: an OSC 52 in a name would write the user's clipboard every time the
+ * row is drawn.
+ */
 export function getAgentsViewSessionTitle(summary: SessionSummary): string {
 	const candidates = [summary.sessionName, summary.firstMessage, basename(summary.cwd), summary.sessionId, summary.id];
 	for (const candidate of candidates) {
@@ -1587,9 +1590,11 @@ function getSessionStatusLabel(summary: SessionSummary, heartbeat?: UnifiedSessi
 	}
 	if (summary.sessionActions.active) {
 		// The label is the running action's own text (an RLM child's task prompt,
-		// written by the parent model), collapsed to one line but never stripped.
+		// written by the parent model), collapsed to one line. The fallback kind is
+		// wire bytes too - a closed union in today's schema, but the row shows
+		// whatever the wire carried.
 		const label = sanitizeRowText(summary.sessionActions.active.label ?? "");
-		return label.length > 0 ? label : summary.sessionActions.active.kind.replace("_", " ");
+		return label.length > 0 ? label : sanitizeRowText(summary.sessionActions.active.kind.replace("_", " "));
 	}
 	if (summary.sessionActions.queuedCount > 0) {
 		return `${summary.sessionActions.queuedCount} queued`;

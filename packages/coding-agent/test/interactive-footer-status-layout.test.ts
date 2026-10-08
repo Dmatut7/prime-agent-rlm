@@ -300,14 +300,16 @@ describe("U6 status area layout", () => {
 		expect(speedLines).toHaveLength(2);
 		expect(speedLines[1]).toBe("88 tok/s · avg 66");
 
-		// A stall with no row of its own is a red block in ③'s one row - which is exactly when subagents exist.
+		// A stalled child is a red-worded block in ③'s one row - which is exactly when subagents exist.
 		const stalled = new SubagentSummaryLine();
 		stalled.setSubagentCounts({ total: 2, running: 2, idle: 0, inactive: 0 });
-		stalled.setStallMarkers([{ name: "worker", text: "stalled 214s, in-flight: ipython" }]);
+		stalled.setSubagentRows([
+			{ id: "w", name: "worker", state: "stalled" },
+			{ id: "x", name: "helper", state: "running" },
+		]);
 		const stallLines = stalled.render(110).map(stripAnsi);
 		expect(stallLines).toHaveLength(1);
-		expect(stallLines[0]).toContain("运行 2");
-		expect(stallLines[0]).toContain("⚠ worker 卡住");
+		expect(stallLines[0]).toContain("worker ⚠ 卡住");
 	});
 
 	it("drops hints whole from the end when the hint line is too narrow", () => {
