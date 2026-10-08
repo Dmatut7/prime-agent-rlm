@@ -977,7 +977,12 @@ export function boxRecordFromMessage(
 			const reason = details.reason ? `：${sanitizeDisplayText(details.reason).split("\n")[0]}` : "";
 			return { kind: "notice", notice: { tone: "muted", text: `子代理 ${name} 已取消${reason}` } };
 		}
-		const lastText = details?.kind === "completed_without_reply" ? details.lastAssistantText?.trim() : undefined;
+		const lastText =
+			details?.kind === "completed_without_reply"
+				? // Pre-4b51ff170 transcripts stored the preview under the old field
+					// name; a notice from one still shows the answer it stored.
+					(details.lastAssistantText ?? details.lastAssistantTextPreview)?.trim()
+				: undefined;
 		const what = details?.followUp ? "做完了你追加的那步" : "做完了";
 		return {
 			kind: "notice",

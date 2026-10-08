@@ -41,6 +41,7 @@ import {
 } from "./compaction-outcome-message.js";
 import { CompactionSummaryMessageComponent, QuietCompactionNoticeComponent } from "./compaction-summary-message.js";
 import { CustomMessageComponent } from "./custom-message.js";
+import { sanitizeDisplayText } from "./diff-rows.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./injected-prompt-message.js";
 import { IPythonCellComponent } from "./ipython-cell.js";
 import type { MermaidMarkdownTransform } from "./mermaid.js";
@@ -795,304 +796,318 @@ export function replayConversation(
 	};
 
 	for (const message of messages) {
-		// A message that wakes the AI after its turn ended starts the next turn: the answer the turn
-		// ended on stays its own, and the woken turn never folds it away (a live run does the same).
-		// The wake machinery is quiet-only; the legacy face never splits a turn on a wake.
-		if (quiet && isWakeMessage(message) && insideRound()) noteWakeInRound(turnState, message);
-		if (quiet && isWakeMessage(message) && !insideRound() && !promptOpened) {
-			pendingCause ??= new WakeCause(reports);
-			pendingCause.add(message);
-			endTurn(roundEndedAt ?? (Number(message.timestamp) || Date.now()));
-			nextStartedByUser = false;
-		}
-		reports.note(message);
-		if (message.role === "user") {
-			const text = readUserText(message.content);
-			// A message typed while the AI was between its steps: an interjection row in
-			// the quiet turn's box, not a new turn (the live view does the same).
-			if (turnState && insideToolLoop()) {
-				turnState.timeline.addSteer(text.trim() || "[图片]", Number(message.timestamp) || Date.now());
-				noteRoundAt(message);
-				continue;
+		// A stored message with missing fields used to abort the whole replay with
+		// a bare TypeError - one bad line made the session impossible to open
+		// again. Skip it with a visible warning instead and render the rest.
+		try {
+			// A message that wakes the AI after its turn ended starts the next turn: the answer the turn
+			// ended on stays its own, and the woken turn never folds it away (a live run does the same).
+			// The wake machinery is quiet-only; the legacy face never splits a turn on a wake.
+			if (quiet && isWakeMessage(message) && insideRound()) noteWakeInRound(turnState, message);
+			if (quiet && isWakeMessage(message) && !insideRound() && !promptOpened) {
+				pendingCause ??= new WakeCause(reports);
+				pendingCause.add(message);
+				endTurn(roundEndedAt ?? (Number(message.timestamp) || Date.now()));
+				nextStartedByUser = false;
 			}
-			// A stored heartbeat prompt renders as an injected notice and never opens an owner turn.
-			const special = text ? hooks?.renderUserPrompt?.(message, text) : undefined;
-			const ownerOpened = special?.ownerOpened ?? true;
-			// A user prompt starts a new turn; the previous group is settled by
-			// then, so freeze its clock (thinking-only turns have no steps to
-			// settle) and reset the grouping from here on.
-			endTurn(roundEndedAt ?? (Number(message.timestamp) || Date.now()));
-			// A new question: nobody is out, and the turn is the owner's own.
-			if (ownerOpened) {
-				lane.reset();
-				hooks?.onOwnerPrompt?.(message, Number(message.timestamp) || undefined);
-			}
-			nextStartedByUser = ownerOpened;
-			promptOpened = ownerOpened;
-			pendingCause = undefined;
-			if (!text) continue;
-			if (target.children.length > 0) target.addChild(new Spacer(1));
-			if (special) {
-				for (const component of special.components) target.addChild(component);
-				continue;
-			}
-			const skillBlock = parseSkillBlock(text);
-			if (skillBlock) {
-				const skill = new SkillInvocationMessageComponent(skillBlock, options.markdownTheme);
-				skill.setExpanded(expanded);
-				target.addChild(skill);
-				if (skillBlock.userMessage) {
-					target.addChild(
-						createUserMessage(skillBlock.userMessage, {
-							markdownTheme: options.markdownTheme,
-							isRecognizedSlashCommand: options.isRecognizedSlashCommand,
-							sentAt: Number(message.timestamp) || undefined,
-							quiet,
-							lane: hooks?.userLane?.(Number(message.timestamp) || undefined) ?? lane.tracker.lane,
-						}),
-					);
-				}
-				continue;
-			}
-			target.addChild(
-				createUserMessage(text, {
-					markdownTheme: options.markdownTheme,
-					isRecognizedSlashCommand: options.isRecognizedSlashCommand,
-					sentAt: Number(message.timestamp) || undefined,
-					quiet,
-					lane: hooks?.userLane?.(Number(message.timestamp) || undefined) ?? lane.tracker.lane,
-				}),
-			);
-			continue;
-		}
-		if (message.role === "assistant") {
-			hooks?.onAssistantMessage?.(message);
-			// The turn summary is created at the turn head, before the first
-			// assistant component; it renders nothing until the turn has steps
-			// or thinking to aggregate.
-			if (!turnState) {
-				turnState = new TurnActivityState(Number(message.timestamp) || Date.now());
-				roundEndedAt = undefined;
-				turnState.startedByUser = nextStartedByUser;
-				promptOpened = false;
-				if (pendingCause) assignWakeCause(turnState, pendingCause);
-				pendingCause = undefined;
-				if (options.timelineHost) turnState.host = options.timelineHost;
-				turnSummary = hooks?.createTurnSummary?.(turnState) ?? new QuietTurnSummary(turnState);
-				if (options.timelineHost) turnSummary.setTimelineHost(options.timelineHost);
-				turnSummary.setExpanded(expanded);
-				// TUI v4: quiet turns carry the one-line footnote at their head.
-				turnSummary.setQuiet(quiet);
-				giveLaneTracker(turnSummary, lane.tracker);
-				target.addChild(turnSummary);
-				hooks?.onTurnCreated?.(turnState, turnSummary);
-			}
-			turnState.addThinkingSegments(countThinkingSegments(message));
-			turnState.latestThinking = latestThinkingText(message) || turnState.latestThinking;
-			turnState.modelId = message.model || turnState.modelId;
-			turnState.timeline.noteMessage(message, true, true);
-			turnState.noteReplyAt(Number(message.timestamp));
-			noteRoundAt(message);
-			lastAssistant = message;
-			resultsArrived = false;
-			resultStop = NO_STEP_STOP;
-			const answer = new QuietAssistantMessage(
-				turnState,
-				message,
-				options.hideThinkingBlock ?? false,
-				options.markdownTheme,
-				options.hiddenThinkingLabel ?? "Thinking",
-				{
-					cwd: options.cwd,
-					expanded,
-					thinkingExpanded,
-					precededByToolActivity:
-						target.children.at(-1) instanceof ToolExecutionComponent ||
-						target.children.at(-1) instanceof AgentMessageComponent,
-					// TUI v4: the replay path folds intermediate narration in quiet mode.
-					quiet,
-					...(options.mermaidTransform ? { mermaidTransform: options.mermaidTransform } : {}),
-				} satisfies AssistantMessageComponentOptions,
-			);
-			giveLane(answer, lane.tracker.lane);
-			target.addChild(answer);
-			for (const content of message.content) {
-				if (content.type !== "toolCall") {
+			reports.note(message);
+			if (message.role === "user") {
+				const text = readUserText(message.content);
+				// A message typed while the AI was between its steps: an interjection row in
+				// the quiet turn's box, not a new turn (the live view does the same).
+				if (turnState && insideToolLoop()) {
+					turnState.timeline.addSteer(text.trim() || "[图片]", Number(message.timestamp) || Date.now());
+					noteRoundAt(message);
 					continue;
 				}
-				const step: TurnStep = {
-					toolCallId: content.id,
-					toolName: content.name,
-					args: content.arguments,
-					status: "running",
-				};
-				turnState.addStep(step);
-				hooks?.onToolStep?.(turnState, turnSummary, content);
-				const tool = new ToolExecutionComponent(
-					content.name,
-					content.id,
-					content.arguments,
-					{ ...options.toolOptions, includeImageDimensions: false },
-					options.getToolDefinition(content.name),
-					options.ui,
-					options.cwd,
-				);
-				tool.setTurnActivity(turnState);
-				tool.setExpanded(expanded || !turnState.isCollapsed);
-				tool.setAgentMessagesExpanded(agentMessagesExpanded || turnState.agentMessagesExpanded);
-				tool.setEditDiffsExpanded(editDiffsExpanded);
-				selectLatestToolExpandHint(target.children, tool);
-				target.addChild(tool);
-				hooks?.onToolComponent?.(tool, content, turnState);
-				if (message.stopReason === "aborted" || message.stopReason === "error") {
-					const errorText = interruptedToolErrorText(message);
-					tool.updateResult({
-						content: [{ type: "text", text: errorText }],
-						isError: true,
-					});
-					turnState.timeline.mergeStep(
-						content.id,
-						content.name,
-						content.arguments,
-						{ content: [{ type: "text", text: errorText }], isError: true },
-						false,
-					);
-					// Batch1 review P1-2: settle the step like the live path
-					// (message_end) does - without this the aborted turn's steps stay
-					// "running" forever, the footnote's duration becomes
-					// Date.now()-startedAt and never freezes.
-					turnState.setStepStatus(content.id, "error", Number(message.timestamp) || Date.now());
-					fabricatedTools.set(content.id, tool);
-				} else {
-					pendingTools.set(content.id, tool);
+				// A stored heartbeat prompt renders as an injected notice and never opens an owner turn.
+				const special = text ? hooks?.renderUserPrompt?.(message, text) : undefined;
+				const ownerOpened = special?.ownerOpened ?? true;
+				// A user prompt starts a new turn; the previous group is settled by
+				// then, so freeze its clock (thinking-only turns have no steps to
+				// settle) and reset the grouping from here on.
+				endTurn(roundEndedAt ?? (Number(message.timestamp) || Date.now()));
+				// A new question: nobody is out, and the turn is the owner's own.
+				if (ownerOpened) {
+					lane.reset();
+					hooks?.onOwnerPrompt?.(message, Number(message.timestamp) || undefined);
 				}
+				nextStartedByUser = ownerOpened;
+				promptOpened = ownerOpened;
+				pendingCause = undefined;
+				if (!text) continue;
+				if (target.children.length > 0) target.addChild(new Spacer(1));
+				if (special) {
+					for (const component of special.components) target.addChild(component);
+					continue;
+				}
+				const skillBlock = parseSkillBlock(text);
+				if (skillBlock) {
+					const skill = new SkillInvocationMessageComponent(skillBlock, options.markdownTheme);
+					skill.setExpanded(expanded);
+					target.addChild(skill);
+					if (skillBlock.userMessage) {
+						target.addChild(
+							createUserMessage(skillBlock.userMessage, {
+								markdownTheme: options.markdownTheme,
+								isRecognizedSlashCommand: options.isRecognizedSlashCommand,
+								sentAt: Number(message.timestamp) || undefined,
+								quiet,
+								lane: hooks?.userLane?.(Number(message.timestamp) || undefined) ?? lane.tracker.lane,
+							}),
+						);
+					}
+					continue;
+				}
+				target.addChild(
+					createUserMessage(text, {
+						markdownTheme: options.markdownTheme,
+						isRecognizedSlashCommand: options.isRecognizedSlashCommand,
+						sentAt: Number(message.timestamp) || undefined,
+						quiet,
+						lane: hooks?.userLane?.(Number(message.timestamp) || undefined) ?? lane.tracker.lane,
+					}),
+				);
+				continue;
 			}
-			continue;
-		}
-		if (message.role === "toolResult") {
-			resultsArrived = true;
-			resultStop = stepResultStop(message);
-			noteRoundAt(message);
-			// Match tool results to pending tool components, then to the ones this replay
-			// settled as interrupted: a real result beats the `已中断` made up for it, and
-			// is not an orphan (nothing is left to re-pair it with).
-			const component = pendingTools.get(message.toolCallId) ?? fabricatedTools.get(message.toolCallId);
-			if (component) {
-				component.updateResult(message);
-				pendingTools.delete(message.toolCallId);
-				fabricatedTools.delete(message.toolCallId);
-			} else {
-				// The call is outside this replay's window: keep the result for a backfill
-				// page to re-pair.
-				orphanToolResults.set(message.toolCallId, message);
-			}
-			turnState?.setStepStatus(
-				message.toolCallId,
-				message.isError ? "error" : "done",
-				Number(message.timestamp) || Date.now(),
-			);
-			turnState?.timeline.mergeStep(
-				message.toolCallId,
-				message.toolName,
-				turnState.steps.find((step) => step.toolCallId === message.toolCallId)?.args,
-				message,
-				false,
-			);
-			hooks?.onToolResult?.(message, turnState);
-			// TUI v4: sent agent messages riding this tool result count as comms.
-			const details =
-				typeof message.details === "object" && message.details !== null
-					? (message.details as Record<string, unknown>)
-					: {};
-			if (Array.isArray(details.sentAgentMessages)) {
-				for (const entry of details.sentAgentMessages) {
-					const id =
-						typeof entry === "object" && entry !== null && "id" in entry
-							? String((entry as Record<string, unknown>).id)
-							: undefined;
-					if (id === undefined || sentCommIds.has(id)) {
+			if (message.role === "assistant") {
+				hooks?.onAssistantMessage?.(message);
+				// The turn summary is created at the turn head, before the first
+				// assistant component; it renders nothing until the turn has steps
+				// or thinking to aggregate.
+				if (!turnState) {
+					turnState = new TurnActivityState(Number(message.timestamp) || Date.now());
+					roundEndedAt = undefined;
+					turnState.startedByUser = nextStartedByUser;
+					promptOpened = false;
+					if (pendingCause) assignWakeCause(turnState, pendingCause);
+					pendingCause = undefined;
+					if (options.timelineHost) turnState.host = options.timelineHost;
+					turnSummary = hooks?.createTurnSummary?.(turnState) ?? new QuietTurnSummary(turnState);
+					if (options.timelineHost) turnSummary.setTimelineHost(options.timelineHost);
+					turnSummary.setExpanded(expanded);
+					// TUI v4: quiet turns carry the one-line footnote at their head.
+					turnSummary.setQuiet(quiet);
+					giveLaneTracker(turnSummary, lane.tracker);
+					target.addChild(turnSummary);
+					hooks?.onTurnCreated?.(turnState, turnSummary);
+				}
+				turnState.addThinkingSegments(countThinkingSegments(message));
+				turnState.latestThinking = latestThinkingText(message) || turnState.latestThinking;
+				turnState.modelId = message.model || turnState.modelId;
+				turnState.timeline.noteMessage(message, true, true);
+				turnState.noteReplyAt(Number(message.timestamp));
+				noteRoundAt(message);
+				lastAssistant = message;
+				resultsArrived = false;
+				resultStop = NO_STEP_STOP;
+				const answer = new QuietAssistantMessage(
+					turnState,
+					message,
+					options.hideThinkingBlock ?? false,
+					options.markdownTheme,
+					options.hiddenThinkingLabel ?? "Thinking",
+					{
+						cwd: options.cwd,
+						expanded,
+						thinkingExpanded,
+						precededByToolActivity:
+							target.children.at(-1) instanceof ToolExecutionComponent ||
+							target.children.at(-1) instanceof AgentMessageComponent,
+						// TUI v4: the replay path folds intermediate narration in quiet mode.
+						quiet,
+						...(options.mermaidTransform ? { mermaidTransform: options.mermaidTransform } : {}),
+					} satisfies AssistantMessageComponentOptions,
+				);
+				giveLane(answer, lane.tracker.lane);
+				target.addChild(answer);
+				for (const content of message.content) {
+					if (content.type !== "toolCall") {
 						continue;
 					}
-					sentCommIds.add(id);
-					turnSummary?.addCommMessage();
+					const step: TurnStep = {
+						toolCallId: content.id,
+						toolName: content.name,
+						args: content.arguments,
+						status: "running",
+					};
+					turnState.addStep(step);
+					hooks?.onToolStep?.(turnState, turnSummary, content);
+					const tool = new ToolExecutionComponent(
+						content.name,
+						content.id,
+						content.arguments,
+						{ ...options.toolOptions, includeImageDimensions: false },
+						options.getToolDefinition(content.name),
+						options.ui,
+						options.cwd,
+					);
+					tool.setTurnActivity(turnState);
+					tool.setExpanded(expanded || !turnState.isCollapsed);
+					tool.setAgentMessagesExpanded(agentMessagesExpanded || turnState.agentMessagesExpanded);
+					tool.setEditDiffsExpanded(editDiffsExpanded);
+					selectLatestToolExpandHint(target.children, tool);
+					target.addChild(tool);
+					hooks?.onToolComponent?.(tool, content, turnState);
+					if (message.stopReason === "aborted" || message.stopReason === "error") {
+						const errorText = interruptedToolErrorText(message);
+						tool.updateResult({
+							content: [{ type: "text", text: errorText }],
+							isError: true,
+						});
+						turnState.timeline.mergeStep(
+							content.id,
+							content.name,
+							content.arguments,
+							{ content: [{ type: "text", text: errorText }], isError: true },
+							false,
+						);
+						// Batch1 review P1-2: settle the step like the live path
+						// (message_end) does - without this the aborted turn's steps stay
+						// "running" forever, the footnote's duration becomes
+						// Date.now()-startedAt and never freezes.
+						turnState.setStepStatus(content.id, "error", Number(message.timestamp) || Date.now());
+						fabricatedTools.set(content.id, tool);
+					} else {
+						pendingTools.set(content.id, tool);
+					}
 				}
+				continue;
 			}
-			continue;
-		}
-		if (
-			quiet &&
-			turnState &&
-			message.role === "custom" &&
-			!isSubagentNoticeMessage(message) &&
-			isBoxNoticeMessage(message)
-		) {
-			// The box says it as its own row (a compaction that waited). A subagent
-			// notice that is also a box notice never lands here: it dispatches as a
-			// timeline row below, like the mode's replay orders it.
-			const record = boxRecordFromMessage(message);
-			if (record?.kind === "compaction") {
-				turnState.timeline.addReplayCompaction(Number(message.timestamp) || 0, record.facts);
-			}
-			continue;
-		}
-		if (message.role === "compactionSummary") {
-			if (quiet && turnState) {
-				// Inside a turn the compaction is a row of its box.
-				turnState.timeline.addReplayCompaction(Number(message.timestamp) || 0, { before: message.tokensBefore });
-			} else if (quiet) {
-				// The quiet conversation says it in one faint line; the summary opens on a click.
-				target.addChild(new QuietCompactionNoticeComponent(message, options.markdownTheme));
-			} else {
-				target.addChild(new Spacer(1));
-				const component = new CompactionSummaryMessageComponent(message, options.markdownTheme);
-				component.setExpanded(expanded);
-				target.addChild(component);
-			}
-			continue;
-		}
-		if (message.role === "bashExecution") {
-			const component = new BashExecutionComponent(message.command, options.ui, message.excludeFromContext, {
-				suppressLeadingSpace: target.children.at(-1) instanceof AgentMessageComponent,
-			});
-			if (message.output) {
-				component.appendOutput(message.output);
-			}
-			component.setComplete(
-				message.exitCode,
-				message.cancelled,
-				message.truncated ? ({ truncated: true } as TruncationResult) : undefined,
-				message.fullOutputPath,
-			);
-			target.addChild(component);
-			continue;
-		}
-		if (message.role === "branchSummary") {
-			target.addChild(new Spacer(1));
-			const component = new BranchSummaryMessageComponent(message, options.markdownTheme);
-			component.setExpanded(expanded);
-			target.addChild(component);
-			continue;
-		}
-		if (message.role === "custom") {
-			if (!message.display) continue;
-			// TUI v4: a received agent-message row is one comm in this turn.
-			if (isAgentSessionMessage(message)) turnSummary?.addCommMessage();
-			if (isSessionSlashCommandMessage(message) && target.children.length > 0) target.addChild(new Spacer(1));
-			const component = customRow(message);
-			applyExpansionLanes(component, expansionLanes);
-			const at = Number(message.timestamp) || Date.now();
-			// A report that joined the running round is a row of that turn, not of the chat's end.
-			const into = quiet && isWakeMessage(message) && insideRound() ? turnSummary : undefined;
-			if (!placeRow(component, at, into)) {
-				// A memory line after a finished request goes above its closing row, which stays the last line.
-				if (message.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE) {
-					addRowAboveClosingRow(component);
+			if (message.role === "toolResult") {
+				resultsArrived = true;
+				resultStop = stepResultStop(message);
+				noteRoundAt(message);
+				// Match tool results to pending tool components, then to the ones this replay
+				// settled as interrupted: a real result beats the `已中断` made up for it, and
+				// is not an orphan (nothing is left to re-pair it with).
+				const component = pendingTools.get(message.toolCallId) ?? fabricatedTools.get(message.toolCallId);
+				if (component) {
+					component.updateResult(message);
+					pendingTools.delete(message.toolCallId);
+					fabricatedTools.delete(message.toolCallId);
 				} else {
+					// The call is outside this replay's window: keep the result for a backfill
+					// page to re-pair.
+					orphanToolResults.set(message.toolCallId, message);
+				}
+				turnState?.setStepStatus(
+					message.toolCallId,
+					message.isError ? "error" : "done",
+					Number(message.timestamp) || Date.now(),
+				);
+				turnState?.timeline.mergeStep(
+					message.toolCallId,
+					message.toolName,
+					turnState.steps.find((step) => step.toolCallId === message.toolCallId)?.args,
+					message,
+					false,
+				);
+				hooks?.onToolResult?.(message, turnState);
+				// TUI v4: sent agent messages riding this tool result count as comms.
+				const details =
+					typeof message.details === "object" && message.details !== null
+						? (message.details as Record<string, unknown>)
+						: {};
+				if (Array.isArray(details.sentAgentMessages)) {
+					for (const entry of details.sentAgentMessages) {
+						const id =
+							typeof entry === "object" && entry !== null && "id" in entry
+								? String((entry as Record<string, unknown>).id)
+								: undefined;
+						if (id === undefined || sentCommIds.has(id)) {
+							continue;
+						}
+						sentCommIds.add(id);
+						turnSummary?.addCommMessage();
+					}
+				}
+				continue;
+			}
+			if (
+				quiet &&
+				turnState &&
+				message.role === "custom" &&
+				!isSubagentNoticeMessage(message) &&
+				isBoxNoticeMessage(message)
+			) {
+				// The box says it as its own row (a compaction that waited). A subagent
+				// notice that is also a box notice never lands here: it dispatches as a
+				// timeline row below, like the mode's replay orders it.
+				const record = boxRecordFromMessage(message);
+				if (record?.kind === "compaction") {
+					turnState.timeline.addReplayCompaction(Number(message.timestamp) || 0, record.facts);
+				}
+				continue;
+			}
+			if (message.role === "compactionSummary") {
+				if (quiet && turnState) {
+					// Inside a turn the compaction is a row of its box.
+					turnState.timeline.addReplayCompaction(Number(message.timestamp) || 0, { before: message.tokensBefore });
+				} else if (quiet) {
+					// The quiet conversation says it in one faint line; the summary opens on a click.
+					target.addChild(new QuietCompactionNoticeComponent(message, options.markdownTheme));
+				} else {
+					target.addChild(new Spacer(1));
+					const component = new CompactionSummaryMessageComponent(message, options.markdownTheme);
+					component.setExpanded(expanded);
 					target.addChild(component);
 				}
+				continue;
 			}
+			if (message.role === "bashExecution") {
+				const component = new BashExecutionComponent(message.command, options.ui, message.excludeFromContext, {
+					suppressLeadingSpace: target.children.at(-1) instanceof AgentMessageComponent,
+				});
+				if (message.output) {
+					component.appendOutput(message.output);
+				}
+				component.setComplete(
+					message.exitCode,
+					message.cancelled,
+					message.truncated ? ({ truncated: true } as TruncationResult) : undefined,
+					message.fullOutputPath,
+				);
+				target.addChild(component);
+				continue;
+			}
+			if (message.role === "branchSummary") {
+				target.addChild(new Spacer(1));
+				const component = new BranchSummaryMessageComponent(message, options.markdownTheme);
+				component.setExpanded(expanded);
+				target.addChild(component);
+				continue;
+			}
+			if (message.role === "custom") {
+				if (!message.display) continue;
+				// TUI v4: a received agent-message row is one comm in this turn.
+				if (isAgentSessionMessage(message)) turnSummary?.addCommMessage();
+				if (isSessionSlashCommandMessage(message) && target.children.length > 0) target.addChild(new Spacer(1));
+				const component = customRow(message);
+				applyExpansionLanes(component, expansionLanes);
+				const at = Number(message.timestamp) || Date.now();
+				// A report that joined the running round is a row of that turn, not of the chat's end.
+				const into = quiet && isWakeMessage(message) && insideRound() ? turnSummary : undefined;
+				if (!placeRow(component, at, into)) {
+					// A memory line after a finished request goes above its closing row, which stays the last line.
+					if (message.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE) {
+						addRowAboveClosingRow(component);
+					} else {
+						target.addChild(component);
+					}
+				}
+			}
+			// display:false customs aren't shown.
+		} catch {
+			const role =
+				typeof (message as { role?: unknown })?.role === "string" ? (message as { role: string }).role : "unknown";
+			const customType = (message as { customType?: unknown }).customType;
+			const what =
+				typeof customType === "string"
+					? `${role}/${sanitizeDisplayText(customType).replace(/\s+/g, " ").slice(0, 60)}`
+					: role;
+			target.addChild(new Text(theme.fg("warning", `⚠ 一条损坏的会话记录已跳过（${what}）`), 1, 0));
 		}
-		// display:false customs aren't shown.
 	}
 	// The last turn has no following user prompt; freeze its clock at the last
 	// message so a thinking-only line stops ticking - unless the run is still

@@ -72,11 +72,16 @@ export class CustomMessageComponent extends Container {
 		let text: string;
 		if (typeof this.message.content === "string") {
 			text = this.message.content;
-		} else {
+		} else if (Array.isArray(this.message.content)) {
 			text = this.message.content
 				.filter((c): c is TextContent => c.type === "text")
 				.map((c) => c.text)
 				.join("\n");
+		} else {
+			// A transcript written before the write-side shape check (or by a tool
+			// that bypassed it) can hold a message with no usable content. The row
+			// says so instead of taking the whole replay down with a TypeError.
+			text = "[malformed message: no readable content]";
 		}
 
 		this.box.addChild(

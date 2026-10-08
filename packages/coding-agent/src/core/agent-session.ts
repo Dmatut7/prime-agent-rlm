@@ -298,6 +298,7 @@ import {
 	createModelChangeMessage,
 	createSessionSlashCommandMessage,
 	createSessionSlashCommandResultMessage,
+	customMessageShapeError,
 	EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE,
 	HARNESS_DIGEST_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
@@ -10167,6 +10168,13 @@ export class AgentSession {
 			deliverAs?: "steer" | "followUp" | "nextTurn";
 		},
 	): Promise<void> {
+		// The daemon RPC and extension callers cross an untyped boundary: a message
+		// persisted without a valid content used to crash every later replay of the
+		// session, so the write side refuses it before anything is stored.
+		const shapeError = customMessageShapeError(message);
+		if (shapeError) {
+			throw new TypeError(`Refusing to write a malformed custom message: ${shapeError}`);
+		}
 		const appMessage = {
 			role: "custom" as const,
 			customType: message.customType,

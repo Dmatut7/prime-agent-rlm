@@ -357,6 +357,13 @@ export type RlmChildTerminalNoticeDetails =
 			 * this came from.
 			 */
 			lastAssistantText?: string;
+			/**
+			 * Legacy name of `lastAssistantText` in transcripts written before the
+			 * 4b51ff170 rename (the field held a 160-character preview then). New
+			 * notices never carry it; replay reads it as a fallback so an old
+			 * notice still shows the answer it stored.
+			 */
+			lastAssistantTextPreview?: string;
 	  };
 
 /**
@@ -980,6 +987,40 @@ export interface CustomMessage<T = unknown> {
 	display: boolean;
 	details?: T;
 	timestamp: number;
+}
+
+/**
+ * Why a custom message cannot be written to the transcript, or undefined when
+ * it can. The daemon's append_custom_message RPC and extension sendMessage both
+ * cross an untyped boundary (wire JSON, runtime JS), and a message persisted
+ * without a valid `content` used to crash every later replay of the session
+ * with a bare TypeError - the session could never be opened again.
+ */
+export function customMessageShapeError(message: unknown): string | undefined {
+	if (typeof message !== "object" || message === null || Array.isArray(message)) {
+		return "message is not an object";
+	}
+	const candidate = message as { customType?: unknown; content?: unknown; display?: unknown };
+	if (typeof candidate.customType !== "string" || candidate.customType.length === 0) {
+		return "customType is missing or not a non-empty string";
+	}
+	const content = candidate.content;
+	if (typeof content === "string") return undefined;
+	if (!Array.isArray(content)) return "content is neither a string nor a content block array";
+	for (const block of content) {
+		if (typeof block !== "object" || block === null) return "content block is not an object";
+		const part = block as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
+		if (part.type === "text") {
+			if (typeof part.text !== "string") return "text content block without a string text";
+		} else if (part.type === "image") {
+			if (typeof part.data !== "string" || typeof part.mimeType !== "string") {
+				return "image content block without string data/mimeType";
+			}
+		} else {
+			return "content block is neither text nor image";
+		}
+	}
+	return undefined;
 }
 
 export interface HeartbeatPromptDetails {

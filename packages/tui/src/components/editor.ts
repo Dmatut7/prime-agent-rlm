@@ -1677,7 +1677,17 @@ export class Editor implements Component, Focusable {
 						next++;
 					}
 					if (next < visualLines.length) {
-						this.moveToVisualLine(visualLines, currentVisualLine, next);
+						// Continue the skip from where the cursor already landed: the
+						// state above holds the intermediate target's coordinates, so
+						// the recursion must name it as the source. Passing the
+						// original source here mixed the two visual lines' coordinate
+						// systems (cursorCol already in the intermediate's frame, its
+						// startCol from the original's), which flung the cursor to a
+						// wrong line end and polluted preferredVisualCol. The
+						// intermediate landing is a real, unsnapped position - the
+						// pre-snap bookkeeping belongs to the old source position.
+						this.snappedFromCursorCol = null;
+						this.moveToVisualLine(visualLines, targetVisualLine, next);
 						return;
 					}
 				}
@@ -2319,7 +2329,13 @@ export class Editor implements Component, Focusable {
 
 			if (idx !== -1) {
 				this.state.cursorLine = lineIdx;
-				this.setCursorCol(idx);
+				// The match can sit inside an atomic paste/image marker or in a
+				// hidden prompt prefix; landing there lets the next edit corrupt
+				// the marker (a backspace eats one of its chars and the pasted
+				// content is lost at submit). Land on a real boundary instead.
+				const snapped = this.snapCursorOffset(line, idx);
+				const lineStartCol = this.getLineHiddenTextPrefixLength(lineIdx, line);
+				this.setCursorCol(Math.max(snapped, lineStartCol));
 				return;
 			}
 		}
