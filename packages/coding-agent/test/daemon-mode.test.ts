@@ -489,6 +489,60 @@ describe("daemon mode helpers", () => {
 		expect(resolve).toHaveBeenCalledWith({ cancelled: true });
 	});
 
+	it("answers a late extension_ui_response as a logged no-op instead of throwing (R3-M2)", async () => {
+		// A dialog with a timeout settles daemon-side when the timeout fires; the
+		// client's late answer then names a request id that is already gone. That
+		// race must not fail the command: the error used to surface in the
+		// answering client's chat as a ghost "Unknown extension UI request".
+		const daemon = new AgentDaemon("/tmp/prime-agent-ext-ui-late.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<DaemonOutbound | undefined>;
+		};
+		const answered = vi.fn();
+		const state = {
+			...makeState("active"),
+			extensionUiRequests: new Map([["request-live", { resolve: answered }]]),
+			emitExtensionUiDismiss: vi.fn(),
+		};
+		internals.sessions.set("active", state);
+		const client = makeClient("client-1", "active");
+		const logSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			// The live request resolves and announces the dismissal as answered (R3-M3).
+			const live = await internals.handleCommand(client, {
+				id: "resp-1",
+				type: "extension_ui_response",
+				activeSessionId: "active",
+				requestId: "request-live",
+				response: { value: "yes" },
+			});
+			expect(live).toMatchObject({ id: "resp-1", command: "extension_ui_response", success: true });
+			expect(answered).toHaveBeenCalledWith({ value: "yes" });
+
+			// The late answer for the same (now deleted) request id is a success no-op.
+			const late = await internals.handleCommand(client, {
+				id: "resp-2",
+				type: "extension_ui_response",
+				activeSessionId: "active",
+				requestId: "request-live",
+				response: { value: "yes" },
+			});
+			expect(late).toMatchObject({ id: "resp-2", command: "extension_ui_response", success: true });
+			expect(answered).toHaveBeenCalledTimes(1);
+			expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("request-live"));
+
+			// Only the live resolution announces a dismissal; the no-op does not.
+			expect(state.emitExtensionUiDismiss).toHaveBeenCalledTimes(1);
+			expect(state.emitExtensionUiDismiss).toHaveBeenCalledWith("request-live", "answered");
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
 	it("acknowledges agent messages after target prompt preflight succeeds", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },

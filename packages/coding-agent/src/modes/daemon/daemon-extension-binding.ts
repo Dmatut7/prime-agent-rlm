@@ -59,6 +59,16 @@ export async function bindActiveSessionState(
 
 	state.unsubscribe?.();
 	state.runtime.setSubagentRuntimeHost(callbacks.subagentRuntimeHost);
+	// R3-M3: settled extension dialogs announce their dismissal (rev 48). The
+	// per-client capability gate lives in broadcastToSession; this just emits.
+	state.emitExtensionUiDismiss = (requestId, reason) => {
+		callbacks.broadcast(state, {
+			type: "extension_ui_dismiss",
+			activeSessionId: state.activeSessionId,
+			id: requestId,
+			reason,
+		});
+	};
 	state.unsubscribe = session.subscribe((event) => {
 		callbacks.broadcast(state, {
 			type: "session_event",
@@ -167,13 +177,21 @@ function createExtensionUIContext(
 				cleanup();
 				resolveDialog(value);
 			};
-			const onAbort = () => finish(fallback);
+			const onAbort = () => {
+				// R3-M3: the request is dead from here on; clients still showing the
+				// dialog close it instead of answering into the void.
+				state.emitExtensionUiDismiss?.(requestId, "aborted");
+				finish(fallback);
+			};
 			state.extensionUiRequests.set(requestId, {
 				resolve: (response) => finish(resolveResponse(response)),
 			});
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
 			if (opts?.timeout !== undefined) {
-				timeoutId = setTimeout(() => finish(fallback), opts.timeout);
+				timeoutId = setTimeout(() => {
+					state.emitExtensionUiDismiss?.(requestId, "timeout");
+					finish(fallback);
+				}, opts.timeout);
 			}
 		});
 	};

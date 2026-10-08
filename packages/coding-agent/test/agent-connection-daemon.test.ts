@@ -3071,6 +3071,7 @@ describe("DaemonAgentConnection", () => {
 				"attach_snapshot",
 				"event_sequence",
 				"extension_ui",
+				"extension_ui_dismiss",
 				"slim_attach",
 				"chunked_snapshot",
 				"streaming_deltas",
@@ -4157,6 +4158,7 @@ describe("DaemonAgentConnection", () => {
 				"attach_snapshot",
 				"event_sequence",
 				"extension_ui",
+				"extension_ui_dismiss",
 				"slim_attach",
 				"chunked_snapshot",
 				"streaming_deltas",
@@ -4179,6 +4181,7 @@ describe("DaemonAgentConnection", () => {
 				"attach_snapshot",
 				"event_sequence",
 				"extension_ui",
+				"extension_ui_dismiss",
 				"slim_attach",
 				"chunked_snapshot",
 				"streaming_deltas",
@@ -4248,6 +4251,7 @@ describe("DaemonAgentConnection", () => {
 				"attach_snapshot",
 				"event_sequence",
 				"extension_ui",
+				"extension_ui_dismiss",
 				"slim_attach",
 				"chunked_snapshot",
 				"streaming_deltas",
@@ -4290,6 +4294,31 @@ describe("DaemonAgentConnection", () => {
 			requestId: "request-1",
 			response: { confirmed: true },
 		});
+	});
+
+	it("translates extension_ui_dismiss for the attached session only (rev 48)", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		await connection.attach();
+
+		fakeClient.emitMessage({
+			type: "extension_ui_dismiss",
+			activeSessionId: "active-1",
+			id: "request-1",
+			reason: "timeout",
+		});
+		fakeClient.emitMessage({
+			type: "extension_ui_dismiss",
+			activeSessionId: "other",
+			id: "request-2",
+			reason: "closed",
+		});
+
+		expect(events).toEqual([{ type: "extension_ui_dismiss", id: "request-1", reason: "timeout" }]);
 	});
 
 	it("uses an extended timeout for refine requests through the daemon protocol", async () => {

@@ -6612,10 +6612,17 @@ export class AgentDaemon {
 		const state = this.getSessionState(command.activeSessionId);
 		const pending = state.extensionUiRequests.get(command.requestId);
 		if (!pending) {
-			throw new Error(`Unknown extension UI request: ${command.requestId}`);
+			// The request already settled daemon-side (timeout, abort, or a session
+			// close that cancelled it), so this answer raced its own dismissal. A
+			// failure here would surface in the answering client's chat as a ghost
+			// "Unknown extension UI request" (R3-M2); log it and succeed instead.
+			this.log(`Ignoring extension UI response for already-settled request ${command.requestId}`);
+			return success(command.id, "extension_ui_response");
 		}
 		state.extensionUiRequests.delete(command.requestId);
 		pending.resolve(command.response);
+		// R3-M3: every other client still showing this dialog closes it now.
+		state.emitExtensionUiDismiss?.(command.requestId, "answered");
 		return success(command.id, "extension_ui_response");
 	}
 
@@ -10390,9 +10397,12 @@ export function finishClientSnapshotStreaming(client: DaemonSocketClient, active
 }
 
 export function cancelPendingExtensionUiRequests(state: ActiveSessionState): void {
-	const pendingRequests = [...state.extensionUiRequests.values()];
+	const pendingRequests = [...state.extensionUiRequests.entries()];
 	state.extensionUiRequests.clear();
-	for (const pending of pendingRequests) {
+	for (const [requestId, pending] of pendingRequests) {
+		// R3-M3: clients still showing the dialog close it instead of answering a
+		// request that is already gone.
+		state.emitExtensionUiDismiss?.(requestId, "closed");
 		pending.resolve({ cancelled: true });
 	}
 }
@@ -10423,7 +10433,8 @@ type SequencedDaemonOutbound = Extract<
 			| "session_resynced"
 			| "session_closed"
 			| "extension_ui_request"
-			| "extension_error";
+			| "extension_error"
+			| "extension_ui_dismiss";
 	}
 >;
 
@@ -10435,11 +10446,17 @@ function isSequencedSessionOutbound(message: DaemonOutbound): message is Sequenc
 		message.type === "session_resynced" ||
 		message.type === "session_closed" ||
 		message.type === "extension_ui_request" ||
-		message.type === "extension_error"
+		message.type === "extension_error" ||
+		message.type === "extension_ui_dismiss"
 	);
 }
 
 export function shouldSendDaemonOutboundToClient(client: DaemonSocketClient, message: DaemonOutbound): boolean {
+	if (message.type === "extension_ui_dismiss") {
+		// Rev 48: dismissals go only to clients that declared the capability for
+		// this session; everyone else keeps their pre-48 dialog behavior.
+		return daemonClientCapabilitiesForSession(client, message.activeSessionId).has("extension_ui_dismiss");
+	}
 	return (
 		message.type !== "extension_ui_request" ||
 		!isDaemonDialogExtensionUiRequest(message.method) ||

@@ -587,7 +587,9 @@ export class DaemonAgentConnection implements AgentConnection {
 				capabilities: [
 					"attach_snapshot",
 					"event_sequence",
-					...(supportsExtensionUi ? (["extension_ui"] as const) : []),
+					// rev 48: dismissals close dialogs this client is showing; they only
+					// exist where dialogs do, so the declaration follows extension_ui.
+					...(supportsExtensionUi ? (["extension_ui", "extension_ui_dismiss"] as const) : []),
 					"slim_attach",
 					"chunked_snapshot",
 					"streaming_deltas",
@@ -1767,7 +1769,8 @@ export class DaemonAgentConnection implements AgentConnection {
 				capabilities: [
 					"attach_snapshot",
 					"event_sequence",
-					...(supportsExtensionUi ? (["extension_ui"] as const) : []),
+					// rev 48: see attach(); dismissals follow the extension_ui leg.
+					...(supportsExtensionUi ? (["extension_ui", "extension_ui_dismiss"] as const) : []),
 					"slim_attach",
 					"chunked_snapshot",
 					"streaming_deltas",
@@ -2543,6 +2546,14 @@ export class DaemonAgentConnection implements AgentConnection {
 					method: message.method,
 					payload: message.payload,
 				},
+			});
+			return;
+		}
+		if (message.type === "extension_ui_dismiss") {
+			await this.emit({
+				type: "extension_ui_dismiss",
+				id: message.id,
+				...(message.reason !== undefined ? { reason: message.reason } : {}),
 			});
 			return;
 		}

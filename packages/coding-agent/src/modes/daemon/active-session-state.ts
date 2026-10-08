@@ -7,6 +7,7 @@ import type {
 	DaemonDeclaredCapability,
 	DaemonEventSequence,
 	DaemonExtensionUIResponse,
+	DaemonExtensionUiDismissReason,
 } from "./daemon-protocol.js";
 import { formatSessionDisplayId, matchesSessionIdSuffix } from "./daemon-session-id.js";
 import type { RlmChildStallRecoveryMarker } from "./daemon-session-list.js";
@@ -106,6 +107,12 @@ export interface ActiveSessionState {
 	/** Attach snapshots in flight: reserved for passivation busyness, but not yet event recipients. */
 	pendingAttaches: number;
 	extensionUiRequests: Map<string, ActiveSessionExtensionUiRequest>;
+	/**
+	 * Broadcasts an extension_ui_dismiss for a settled dialog request (rev 48,
+	 * R3-M3). Wired by bindActiveSessionState; unset on states that never bound
+	 * extensions, where no dialog could have been shown anyway.
+	 */
+	emitExtensionUiDismiss?: (requestId: string, reason: DaemonExtensionUiDismissReason) => void;
 	eventGeneration: string;
 	lastEventSequence: DaemonEventSequence;
 	/** Counts snapshot transfers so each one gets an id of its own. */

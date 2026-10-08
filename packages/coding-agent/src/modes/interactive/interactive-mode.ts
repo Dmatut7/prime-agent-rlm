@@ -401,6 +401,16 @@ interface Expandable {
 	setExpanded(expanded: boolean): void;
 }
 
+/**
+ * The dialog currently owning the editor-container slot (R3-M4). Opening a
+ * dialog evicts the previous holder through its cancel path, so the previous
+ * dialog's promise resolves (as cancelled) instead of hanging, and a stale
+ * hide/timeout from the evicted dialog can no longer clear its replacement.
+ */
+interface ExtensionDialogHandle {
+	cancel: () => void;
+}
+
 interface PendingToolCallRenderInput {
 	id: string;
 	name: string;
@@ -1951,9 +1961,13 @@ export class InteractiveMode {
 
 	private extensionSelector: ExtensionSelectorComponent | undefined = undefined;
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
-	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
 	private extensionTerminalInputUnsubscribers = new Set<() => void>();
-	private activeConnectionExtensionUiRequests = new Map<string, { cancelLocal: () => void }>();
+	/** The extension dialog currently owning the editor container; see ExtensionDialogHandle. */
+	private activeExtensionDialog: ExtensionDialogHandle | undefined;
+	private activeConnectionExtensionUiRequests = new Map<
+		string,
+		{ cancelLocal: () => void; dialogHandle?: ExtensionDialogHandle }
+	>();
 
 	private extensionWidgetsAbove = new Map<string, Component & { dispose?(): void }>();
 	private extensionWidgetsBelow = new Map<string, Component & { dispose?(): void }>();
@@ -4965,15 +4979,9 @@ export class InteractiveMode {
 	private resetExtensionUI(): void {
 		this.cancelActiveConnectionExtensionUiRequests();
 		this.closeHeartbeatManager();
-		if (this.extensionSelector) {
-			this.hideExtensionSelector();
-		}
-		if (this.extensionInput) {
-			this.hideExtensionInput();
-		}
-		if (this.extensionEditor) {
-			this.hideExtensionEditor();
-		}
+		// One cancel path resolves any pending dialog promise and restores the
+		// editor; the per-kind hide* calls stay for the dialogs' own callbacks.
+		this.cancelActiveExtensionDialog();
 		// Only the extension's own overlays: the stack's top can be a foreign dialog.
 		for (const handle of this.extensionCustomOverlays) handle.hide();
 		this.extensionCustomOverlays.clear();
@@ -5192,6 +5200,19 @@ export class InteractiveMode {
 		};
 	}
 
+	/**
+	 * Evict the dialog currently owning the editor container, resolving its
+	 * promise as cancelled. Every show* runs this first, so concurrent dialogs
+	 * serialize instead of stacking on the same container (R3-M4). The eviction
+	 * lands as a cancelled extension_ui_response on the daemon, which is
+	 * idempotent there (R3-M2).
+	 */
+	private cancelActiveExtensionDialog(): void {
+		const active = this.activeExtensionDialog;
+		this.activeExtensionDialog = undefined;
+		active?.cancel();
+	}
+
 	private showExtensionSelector(
 		title: string,
 		options: string[],
@@ -5202,37 +5223,53 @@ export class InteractiveMode {
 				resolve(undefined);
 				return;
 			}
+			this.cancelActiveExtensionDialog();
 
-			const onAbort = () => {
-				this.hideExtensionSelector();
-				resolve(undefined);
-			};
+			let handle: ExtensionDialogHandle;
+			const onAbort = () => handle.cancel();
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
 
-			this.extensionSelector = new ExtensionSelectorComponent(
+			const component = new ExtensionSelectorComponent(
 				title,
 				options,
 				(option) => {
 					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionSelector();
+					this.hideExtensionSelector(handle);
 					resolve(option);
 				},
 				() => {
 					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionSelector();
+					this.hideExtensionSelector(handle);
 					resolve(undefined);
 				},
 				{ tui: this.ui, timeout: opts?.timeout },
 			);
+			handle = {
+				cancel: () => {
+					opts?.signal?.removeEventListener("abort", onAbort);
+					this.hideExtensionSelector(handle);
+					resolve(undefined);
+				},
+			};
 
+			this.extensionSelector = component;
+			this.activeExtensionDialog = handle;
 			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionSelector);
-			this.ui.setFocus(this.extensionSelector);
+			this.editorContainer.addChild(component);
+			this.ui.setFocus(component);
 			this.ui.requestRender();
 		});
 	}
 
-	private hideExtensionSelector(): void {
+	private hideExtensionSelector(handle?: ExtensionDialogHandle): void {
+		if (handle !== undefined) {
+			if (this.activeExtensionDialog !== handle) {
+				// Stale hide from an evicted dialog: the eviction already disposed it
+				// and resolved its promise; the container belongs to its replacement.
+				return;
+			}
+			this.activeExtensionDialog = undefined;
+		}
 		this.extensionSelector?.dispose();
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
@@ -5268,37 +5305,51 @@ export class InteractiveMode {
 				resolve(undefined);
 				return;
 			}
+			this.cancelActiveExtensionDialog();
 
-			const onAbort = () => {
-				this.hideExtensionInput();
-				resolve(undefined);
-			};
+			let handle: ExtensionDialogHandle;
+			const onAbort = () => handle.cancel();
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
 
-			this.extensionInput = new ExtensionInputComponent(
+			const component = new ExtensionInputComponent(
 				title,
 				placeholder,
 				(value) => {
 					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionInput();
+					this.hideExtensionInput(handle);
 					resolve(value);
 				},
 				() => {
 					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionInput();
+					this.hideExtensionInput(handle);
 					resolve(undefined);
 				},
 				{ tui: this.ui, timeout: opts?.timeout },
 			);
+			handle = {
+				cancel: () => {
+					opts?.signal?.removeEventListener("abort", onAbort);
+					this.hideExtensionInput(handle);
+					resolve(undefined);
+				},
+			};
 
+			this.extensionInput = component;
+			this.activeExtensionDialog = handle;
 			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionInput);
-			this.ui.setFocus(this.extensionInput);
+			this.editorContainer.addChild(component);
+			this.ui.setFocus(component);
 			this.ui.requestRender();
 		});
 	}
 
-	private hideExtensionInput(): void {
+	private hideExtensionInput(handle?: ExtensionDialogHandle): void {
+		if (handle !== undefined) {
+			if (this.activeExtensionDialog !== handle) {
+				return;
+			}
+			this.activeExtensionDialog = undefined;
+		}
 		this.extensionInput?.dispose();
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
@@ -5309,32 +5360,46 @@ export class InteractiveMode {
 
 	private showExtensionEditor(title: string, prefill?: string): Promise<string | undefined> {
 		return new Promise((resolve) => {
-			this.extensionEditor = new ExtensionEditorComponent(
+			this.cancelActiveExtensionDialog();
+
+			const component = new ExtensionEditorComponent(
 				this.ui,
 				this.keybindings,
 				title,
 				prefill,
 				(value) => {
-					this.hideExtensionEditor();
+					this.hideExtensionEditor(handle);
 					resolve(value);
 				},
 				() => {
-					this.hideExtensionEditor();
+					this.hideExtensionEditor(handle);
 					resolve(undefined);
 				},
 			);
+			const handle: ExtensionDialogHandle = {
+				cancel: () => {
+					this.hideExtensionEditor(handle);
+					resolve(undefined);
+				},
+			};
 
+			this.activeExtensionDialog = handle;
 			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionEditor);
-			this.ui.setFocus(this.extensionEditor);
+			this.editorContainer.addChild(component);
+			this.ui.setFocus(component);
 			this.ui.requestRender();
 		});
 	}
 
-	private hideExtensionEditor(): void {
+	private hideExtensionEditor(handle?: ExtensionDialogHandle): void {
+		if (handle !== undefined) {
+			if (this.activeExtensionDialog !== handle) {
+				return;
+			}
+			this.activeExtensionDialog = undefined;
+		}
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
-		this.extensionEditor = undefined;
 		this.ui.setFocus(this.editor);
 		this.ui.requestRender();
 	}
@@ -5474,10 +5539,14 @@ export class InteractiveMode {
 			let component: Component & { dispose?(): void };
 			let overlayHandle: OverlayHandle | undefined;
 			let closed = false;
+			let dialogHandle: ExtensionDialogHandle | undefined;
 
 			const close = (result: T) => {
 				if (closed) return;
 				closed = true;
+				if (dialogHandle !== undefined && this.activeExtensionDialog === dialogHandle) {
+					this.activeExtensionDialog = undefined;
+				}
 				if (isOverlay) {
 					if (overlayHandle) this.extensionCustomOverlays.delete(overlayHandle);
 					overlayHandle?.hide();
@@ -5492,6 +5561,16 @@ export class InteractiveMode {
 					/* ignore dispose errors */
 				}
 			};
+
+			if (!isOverlay) {
+				// The editor container is a single slot (R3-M4): a custom component
+				// evicts the dialog holding it, and a later dialog evicts this one
+				// back. Eviction resolves undefined, matching the daemon-side custom
+				// fallback.
+				this.cancelActiveExtensionDialog();
+				dialogHandle = { cancel: () => close(undefined as T) };
+				this.activeExtensionDialog = dialogHandle;
+			}
 
 			Promise.resolve(factory(this.ui, theme, this.keybindings, close))
 				.then((c) => {
@@ -6796,6 +6875,21 @@ export class InteractiveMode {
 					this.handleSideQuestionEvent(event.event);
 				} else if (event.type === "extension_ui_request") {
 					await this.handleConnectionExtensionUiRequest(event.request);
+				} else if (event.type === "extension_ui_dismiss") {
+					// The daemon settled the dialog (timeout/abort/close/another client
+					// answered): close the local copy without answering the dead
+					// request. Connection-scoped like the request itself, never queued.
+					this.handleConnectionExtensionUiDismiss(event.id);
+				} else if (event.type === "extension_error") {
+					// Connection-scoped diagnostic, not a session event: show it directly,
+					// never through the session event queue. The wire arm carries no
+					// stack (daemon-protocol.ts drops it before broadcast). Interactive
+					// mode has exactly one extension-error reporter per setup — a daemon
+					// connection hosts extensions daemon-side, and the in-process
+					// connection binds them only for headless modes
+					// (bindHeadlessExtensions) — so this cannot double-report against
+					// the local-session onError path above.
+					this.showExtensionError(event.extensionPath, event.error);
 				} else if (event.type === "connection_status") {
 					if (event.status === "connected") {
 						this.connectionLost = false;
@@ -6862,10 +6956,16 @@ export class InteractiveMode {
 				const cancelled = new Promise<AgentConnectionExtensionUiResponse>((resolve) => {
 					cancelLocal = resolve;
 				});
+				// The show* call inside runs synchronously up to its first await, so
+				// by the time the promise exists the dialog holds the container slot.
+				const dialogBefore = this.activeExtensionDialog;
+				const resolved = this.resolveConnectionExtensionUiRequest(request);
+				const dialogHandle = this.activeExtensionDialog === dialogBefore ? undefined : this.activeExtensionDialog;
 				this.activeConnectionExtensionUiRequests.set(request.id, {
 					cancelLocal: () => cancelLocal({ cancelled: true }),
+					dialogHandle,
 				});
-				response = await Promise.race([this.resolveConnectionExtensionUiRequest(request), cancelled]);
+				response = await Promise.race([resolved, cancelled]);
 			} else {
 				response = await this.resolveConnectionExtensionUiRequest(request);
 			}
@@ -6912,6 +7012,25 @@ export class InteractiveMode {
 				this.showError(error instanceof Error ? error.message : String(error));
 			});
 		}
+	}
+
+	/**
+	 * A daemon-settled dialog closes locally without an answer (R3-M3): the
+	 * request is already gone daemon-side, so the response race is settled
+	 * locally and the deleted map entry keeps handleConnectionExtensionUiRequest
+	 * from sending anything back. The dialog's own cancel path runs only while
+	 * it still owns the editor container.
+	 */
+	private handleConnectionExtensionUiDismiss(requestId: string): void {
+		const activeRequest = this.activeConnectionExtensionUiRequests.get(requestId);
+		if (!activeRequest) {
+			return;
+		}
+		this.activeConnectionExtensionUiRequests.delete(requestId);
+		if (activeRequest.dialogHandle && this.activeExtensionDialog === activeRequest.dialogHandle) {
+			activeRequest.dialogHandle.cancel();
+		}
+		activeRequest.cancelLocal();
 	}
 
 	private async resolveConnectionExtensionUiRequest(

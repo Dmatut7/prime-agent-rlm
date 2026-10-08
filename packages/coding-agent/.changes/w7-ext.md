@@ -1,0 +1,4 @@
+- Fixed daemon-hosted extension errors never appearing in the interactive chat; they now render as a chat error line like in print/ACP/RPC modes.
+- Fixed a ghost "Unknown extension UI request" error shown to a client whose dialog answer arrived after the dialog had already timed out or been closed.
+- Fixed a second extension dialog leaving the first one's promise hanging and the first one's expired countdown dismissing the replacement; opening a dialog now cancels the previous one cleanly.
+- Fixed an extension dialog staying open in the other attached clients after it timed out, was aborted, or was answered elsewhere; the daemon now broadcasts the dismissal to clients that declare the extension_ui_dismiss capability.

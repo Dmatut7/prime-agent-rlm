@@ -14,6 +14,7 @@ export type {
 	AgentConnectionCustomMessageEntry,
 	AgentConnectionEvent,
 	AgentConnectionEventListener,
+	AgentConnectionExtensionUiDismissReason,
 	AgentConnectionExtensionUiRequest,
 	AgentConnectionExtensionUiResponse,
 	AgentConnectionForkOptions,

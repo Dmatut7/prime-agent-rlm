@@ -5669,6 +5669,9 @@ export class DaemonSupervisor {
 							"attach_snapshot",
 							"event_sequence",
 							"extension_ui",
+							// rev 48: dialog dismissals ride the same channel as the requests
+							// they close; without this name the worker gates them away.
+							"extension_ui_dismiss",
 							"slim_attach",
 							"chunked_snapshot",
 							"streaming_delta_fragments",
@@ -9135,6 +9138,16 @@ export class DaemonSupervisor {
 			}
 			// Snapshots cannot recover extension requests, so never defer or drop them.
 			if (outboundType === "extension_ui_request") {
+				this.writeSerialized(client, publicPayload);
+				continue;
+			}
+			// Rev 48: dismissals close a dialog the client may be showing, so they
+			// get the same never-defer treatment as the requests they settle, gated
+			// on the declared extension_ui_dismiss capability.
+			if (outboundType === "extension_ui_dismiss" && !client.capabilities.has("extension_ui_dismiss")) {
+				continue;
+			}
+			if (outboundType === "extension_ui_dismiss") {
 				this.writeSerialized(client, publicPayload);
 				continue;
 			}

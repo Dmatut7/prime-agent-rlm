@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.js";
 import {
 	type CreateAgentSessionRuntimeFactory,
@@ -15,7 +15,7 @@ import type { AgentCronJob } from "../src/core/cron-jobs.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import type { ExtensionAPI, ExtensionFactory } from "../src/index.js";
 import { createAgentConnectionState } from "../src/modes/agent-connection/snapshot.js";
-import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
+import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { bindActiveSessionState } from "../src/modes/daemon/daemon-extension-binding.js";
 import type { DaemonOutbound } from "../src/modes/daemon/daemon-protocol.js";
 import { conversationMessages } from "./suite/harness.js";
@@ -299,5 +299,137 @@ describe("daemon extension binding", () => {
 		expect(notifies).toHaveLength(1);
 		expect(String(notifies[0]!.payload.message)).toContain("ctx.ui.custom");
 		expect(notifies[0]!.payload.notifyType).toBe("warning");
+	});
+
+	function bindDialogState(
+		runtime: Awaited<ReturnType<typeof createRuntimeForTest>>,
+		activeSessionId: string,
+	): { state: ActiveSessionState; outbound: DaemonOutbound[] } {
+		const outbound: DaemonOutbound[] = [];
+		// Dialog methods only reach the wire when a UI-capable client is attached.
+		const uiClient = { supportsExtensionUi: true } as unknown as DaemonSocketClient;
+		const state: ActiveSessionState = {
+			activeSessionId,
+			runtime,
+			clients: new Set([uiClient]),
+			pendingAttaches: 0,
+			extensionUiRequests: new Map(),
+			eventGeneration: `generation-${activeSessionId}`,
+			lastEventSequence: 0,
+		};
+		return { state, outbound };
+	}
+
+	function dismissalsOf(outbound: DaemonOutbound[]): Extract<DaemonOutbound, { type: "extension_ui_dismiss" }>[] {
+		return outbound.filter(
+			(message): message is Extract<DaemonOutbound, { type: "extension_ui_dismiss" }> =>
+				message.type === "extension_ui_dismiss",
+		);
+	}
+
+	it("broadcasts extension_ui_dismiss with reason timeout when a dialog times out (R3-M3)", async () => {
+		const runtime = await createRuntimeForTest(
+			(pi) => {
+				pi.registerCommand("timeout-dialog", {
+					description: "dialog nobody answers",
+					handler: async (_args, ctx) => {
+						await ctx.ui.select("Pick one", ["a", "b"], { timeout: 30 });
+					},
+				});
+			},
+			["done"],
+		);
+		const { state, outbound } = bindDialogState(runtime, "active-timeout");
+		await bindActiveSessionState(state, {
+			broadcast: (_state, message) => {
+				outbound.push(message);
+			},
+			shutdown: () => {},
+		});
+
+		await runtime.session.prompt("/timeout-dialog");
+
+		const request = outbound.find(
+			(message) => message.type === "extension_ui_request" && message.method === "select",
+		);
+		expect(request).toBeDefined();
+		expect(dismissalsOf(outbound)).toEqual([
+			{
+				type: "extension_ui_dismiss",
+				activeSessionId: "active-timeout",
+				id: request && "id" in request ? request.id : "never",
+				reason: "timeout",
+			},
+		]);
+	});
+
+	it("broadcasts extension_ui_dismiss with reason aborted when the dialog's signal aborts", async () => {
+		const controller = new AbortController();
+		const runtime = await createRuntimeForTest(
+			(pi) => {
+				pi.registerCommand("abort-dialog", {
+					description: "dialog aborted mid-flight",
+					handler: async (_args, ctx) => {
+						await ctx.ui.select("Pick one", ["a", "b"], { signal: controller.signal });
+					},
+				});
+			},
+			["done"],
+		);
+		const { state, outbound } = bindDialogState(runtime, "active-abort");
+		await bindActiveSessionState(state, {
+			broadcast: (_state, message) => {
+				outbound.push(message);
+			},
+			shutdown: () => {},
+		});
+
+		const prompting = runtime.session.prompt("/abort-dialog");
+		// State barrier: abort only once the request is actually on the wire.
+		await vi.waitFor(() => {
+			expect(outbound.some((message) => message.type === "extension_ui_request")).toBe(true);
+		});
+		controller.abort();
+		await prompting;
+
+		const dismissals = dismissalsOf(outbound);
+		expect(dismissals).toHaveLength(1);
+		expect(dismissals[0]).toMatchObject({
+			type: "extension_ui_dismiss",
+			activeSessionId: "active-abort",
+			reason: "aborted",
+		});
+	});
+
+	it("emits no dismissal when the request is answered through its pending entry (the answered announce belongs to handleExtensionUiResponse)", async () => {
+		const runtime = await createRuntimeForTest(
+			(pi) => {
+				pi.registerCommand("answered-dialog", {
+					description: "dialog answered in time",
+					handler: async (_args, ctx) => {
+						await ctx.ui.select("Pick one", ["a", "b"], { timeout: 10_000 });
+					},
+				});
+			},
+			["done"],
+		);
+		const { state, outbound } = bindDialogState(runtime, "active-answered");
+		await bindActiveSessionState(state, {
+			broadcast: (_state, message) => {
+				outbound.push(message);
+			},
+			shutdown: () => {},
+		});
+
+		const prompting = runtime.session.prompt("/answered-dialog");
+		await vi.waitFor(() => {
+			expect(state.extensionUiRequests.size).toBe(1);
+		});
+		const entry = [...state.extensionUiRequests.entries()][0];
+		if (!entry) throw new Error("dialog request never registered");
+		entry[1].resolve({ value: "a" });
+		await prompting;
+
+		expect(dismissalsOf(outbound)).toHaveLength(0);
 	});
 });

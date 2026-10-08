@@ -679,6 +679,14 @@ export interface AgentConnectionHeartbeat {
 
 export type AgentConnectionExtensionUiResponse = { value: string } | { confirmed: boolean } | { cancelled: true };
 
+/**
+ * Why the daemon dismissed an extension UI dialog (daemon rev 48). Mirrors
+ * DaemonExtensionUiDismissReason on the wire; the connection layer keeps its
+ * own literal union the way AgentConnectionExtensionUiResponse mirrors
+ * DaemonExtensionUIResponse.
+ */
+export type AgentConnectionExtensionUiDismissReason = "timeout" | "aborted" | "answered" | "closed";
+
 export interface AgentConnectionExtensionUiRequest {
 	id: string;
 	method: string;
@@ -898,6 +906,14 @@ export type AgentConnectionEvent =
 			provider?: string;
 	  }
 	| { type: "extension_ui_request"; request: AgentConnectionExtensionUiRequest }
+	| {
+			// Daemon rev 48, only emitted to clients that declared the
+			// extension_ui_dismiss capability: the dialog request with this id
+			// settled daemon-side, so close the local dialog without answering it.
+			type: "extension_ui_dismiss";
+			id: string;
+			reason?: AgentConnectionExtensionUiDismissReason;
+	  }
 	| { type: "extension_error"; extensionPath: string; event: string; error: string }
 	| {
 			type: "connection_status";

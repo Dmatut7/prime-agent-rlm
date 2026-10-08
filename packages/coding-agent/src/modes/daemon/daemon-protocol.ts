@@ -391,8 +391,20 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   direct session-plane peer never sets the field and the worker exempts the
 //   issuing peer itself. The digest recomputation covers the command-union
 //   growth.
-export const DAEMON_SCHEMA_REVISION = 47;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-47-6ccd4033fcaa";
+// Revision 48 adds the extension_ui_dismiss outbound event (wave-7 R3-M3): when
+//   a daemon-hosted extension dialog settles without a client answer (its
+//   timeout fires, its abort signal trips, the session closes, or another
+//   client answered first), the daemon broadcasts the dismissal so every other
+//   attached client closes its copy of the dialog instead of leaving it up to
+//   answer a dead request. Capability-gated on the client-declared
+//   "extension_ui_dismiss" capability at every hop (worker per-session gate,
+//   supervisor relay, and the subscribeWorker declaration), so an old daemon
+//   never emits it and an undeclared client never receives it; those clients
+//   keep the pre-48 behavior (their dialog closes on its own timeout or local
+//   cancel). The event rides the sequenced session channel like
+//   extension_ui_request, and the digest recomputation covers the union growth.
+export const DAEMON_SCHEMA_REVISION = 48;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-48-7dabe5fc0aec";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -440,7 +452,13 @@ export type DaemonClientCapability =
 	// the daemon additionally emits quota_park_status events for parked sessions
 	// (rev 42) - an immediate announce, a periodic heartbeat with the remaining
 	// wait, and one terminal parked:false.
-	| "quota_park_status";
+	| "quota_park_status"
+	// The daemon broadcasts extension_ui_dismiss when an extension dialog
+	// settles without this client's answer - timeout, abort, session close, or
+	// another client answering first (rev 48). Declaring clients close their
+	// local copy of the dialog without answering the dead request; undeclared
+	// clients keep the pre-48 behavior and the daemon sends them nothing.
+	| "extension_ui_dismiss";
 export type DaemonPromptAdmissionCancellationStatus = "cancelled" | "owned" | "unknown";
 export interface DaemonPromptAdmissionCancellationResult {
 	status: DaemonPromptAdmissionCancellationStatus;
@@ -554,6 +572,7 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"streaming_deltas",
 	"streaming_delta_fragments",
 	"quota_park_status",
+	"extension_ui_dismiss",
 ];
 
 /**
@@ -1879,6 +1898,14 @@ export type DaemonClosingReason = "shutdown" | "update";
 
 export type DaemonExtensionUIResponse = { value: string } | { confirmed: boolean } | { cancelled: true };
 
+/**
+ * Why the daemon dismissed an extension UI dialog (rev 48): the request's own
+ * timeout fired, its abort signal tripped, the session closed the request
+ * (session teardown or the last client detaching), or another client answered
+ * it first. Omitted only by peers that predate the reason field.
+ */
+export type DaemonExtensionUiDismissReason = "timeout" | "aborted" | "answered" | "closed";
+
 export function isDaemonDialogExtensionUiRequest(method: string): boolean {
 	return method === "select" || method === "confirm" || method === "input" || method === "editor";
 }
@@ -2119,6 +2146,16 @@ export type DaemonOutbound =
 			error: string;
 			meta?: DaemonEventMeta;
 	  }
+	| {
+			// Rev 48, capability-gated on extension_ui_dismiss: an extension dialog
+			// settled daemon-side without this client's answer, so the client closes
+			// its local copy of the dialog instead of answering a dead request.
+			type: "extension_ui_dismiss";
+			activeSessionId: string;
+			id: string;
+			reason?: DaemonExtensionUiDismissReason;
+			meta?: DaemonEventMeta;
+	  }
 	| CompactAssistantDelta;
 
 export const DAEMON_OUTBOUND_COMPATIBILITY = {
@@ -2150,6 +2187,7 @@ export const DAEMON_OUTBOUND_COMPATIBILITY = {
 	session_closed: LEGACY_DAEMON_COMMAND,
 	extension_ui_request: LEGACY_DAEMON_COMMAND,
 	extension_error: LEGACY_DAEMON_COMMAND,
+	extension_ui_dismiss: { minProtocol: 7, minSchemaRevision: 48, capability: "extension_ui_dismiss" },
 	assistant_stream_delta: { minProtocol: 7, minSchemaRevision: 25, capability: "streaming_deltas" },
 } as const satisfies Record<DaemonOutbound["type"], DaemonCommandCompatibility>;
 
