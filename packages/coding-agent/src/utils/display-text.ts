@@ -63,13 +63,14 @@ export function truncateGraphemes(text: string, maxGraphemes: number, ellipsis =
 export function sliceGraphemes(text: string, maxChars: number): string {
 	if (maxChars <= 0) return "";
 	if (text.length <= maxChars) return text;
-	let end = 0;
-	for (const { segment, index } of graphemeSegmenter.segment(text)) {
-		const next = index + segment.length;
-		if (next > maxChars) break;
-		end = next;
-	}
-	return text.slice(0, end);
+	// The grapheme that holds unit `maxChars` starts at the last boundary not
+	// after it (`maxChars` itself when that unit begins a grapheme), so cutting
+	// at its index is the same boundary the walk-from-zero loop found. `containing`
+	// seeks straight to the unit instead of walking every grapheme: a turn of a
+	// hundred long notes re-cuts its rows every bumped frame, and the walk made
+	// that ~40ms a frame.
+	const at = graphemeSegmenter.segment(text).containing(maxChars);
+	return text.slice(0, at ? at.index : maxChars);
 }
 
 /**
