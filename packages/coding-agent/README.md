@@ -123,7 +123,7 @@ The interface from top to bottom:
 - **Startup header** - Shows a compact brand and runtime summary; use `--verbose` to list loaded AGENTS.md files, prompt templates, skills, and extensions
 - **Messages** - Your messages, assistant responses, tool calls and results, notifications, errors, and extension UI
 - **Editor** - Where you type
-- **Footer** - Empty by default; use `/usage` for token, cost, and context details
+- **Footer** - One persistent watermark line (`footer.telemetry: "on"`, the default): model and thinking level on the left, cwd and git branch in the middle, context figures (`518k/1M · 49%`) on the right, with a `●` level bar and `│` auto-compaction notch joining once context nears the threshold. Extension statuses from `ctx.ui.setStatus()` render on their own line, `/speed` adds a tok/sec readout, and `/usage` reports the full token, cost, and context details
 
 The editor can be temporarily replaced by other UI, like built-in `/settings` or custom UI from extensions (e.g., a Q&A tool that lets the user answer model questions in a structured format). [Extensions](#extensions) can also replace the editor, add widgets above/below it, a status line, custom footer, or overlays.
 
@@ -180,8 +180,8 @@ See `/hotkeys` for the full list. Customize via `~/.prime/agent/keybindings.json
 |-----|--------|
 | Ctrl+C | Interrupt active work, or show the exit hint when idle |
 | Ctrl+C twice | Exit while the exit hint is visible |
-| Escape | Clear the input without interrupting active work |
-| Escape twice | Open `/tree` |
+| Escape | Interrupt active work; when idle with a draft, clear the input (the draft is stashed - Ctrl+S restores it) |
+| Escape twice | Open `/tree` from an empty idle prompt |
 | Ctrl+L | Open model selector |
 | Ctrl+P | Collapse/expand agent message blocks |
 | Ctrl+O | Collapse/expand tool output |
@@ -194,7 +194,7 @@ Submit messages while the agent is working:
 - **Enter** queues a *steering* message, delivered after the current assistant turn finishes executing its tool calls
 - **Alt+Enter** queues a *follow-up* message, delivered only after the agent finishes all work
 - **Ctrl+C** interrupts active work; queued messages are kept and resume after your next submit or edit
-- **Escape** clears the input without interrupting active work
+- **Escape** interrupts active work; with no work running it clears the input instead (the cleared draft is stashed - Ctrl+S restores it)
 - **Alt+Up / Alt+Down** browse queued messages individually and return to the editor draft
 - While browsing, **Enter** applies the edit as steering input and **Alt+Enter** applies it as a follow-up; submitting an empty edit deletes the item
 - **Ctrl+Alt+Up / Ctrl+Alt+Down** move the selected item earlier or later within its queue

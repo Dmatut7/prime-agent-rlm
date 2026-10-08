@@ -86,23 +86,27 @@ Without this propagation, typing with an IME (Chinese, Japanese, Korean, etc.) w
 
 ## Using Components
 
-**In extensions** via `ctx.ui.custom()`:
+**In extensions** via `ctx.ui.custom()`. You pass a factory that receives `(tui, theme, keybindings, done)` and returns your component; the call resolves with whatever you pass to `done()` (`undefined` when the user cancels):
 
 ```typescript
 pi.on("session_start", async (_event, ctx) => {
-  const handle = ctx.ui.custom(myComponent);
-  // handle.requestRender() - trigger re-render
-  // handle.close() - restore normal UI
+  const confirmed = await ctx.ui.custom<boolean>((tui, theme, keybindings, done) => {
+    return new MyConfirmDialog(theme, done);
+  });
+  // confirmed === undefined when the user cancelled
 });
 ```
 
-**In custom tools** via `pi.ui.custom()`:
+**Daemon sessions:** in daemon-backed sessions (the default `prime-agent` flow) `ctx.ui.custom()` resolves `undefined` and the component never mounts - the client shows a one-time warning. Custom components work in in-process interactive sessions (an SDK embedding that passes `extensionFactories`, or `--no-session`). See [Custom Components in extensions.md](extensions.md#custom-components).
+
+**In custom tools** via the execute context's `ctx.ui.custom()`. Note the `execute` parameter order - `signal` and `onUpdate` come before `ctx`:
 
 ```typescript
-async execute(toolCallId, params, onUpdate, ctx, signal) {
-  const handle = pi.ui.custom(myComponent);
+async execute(toolCallId, params, signal, onUpdate, ctx) {
+  const answer = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+    return new MyDialog(theme, done);
+  });
   // ...
-  handle.close();
 }
 ```
 
@@ -367,22 +371,17 @@ pi.registerCommand("pick", {
   description: "Pick an item",
   handler: async (args, ctx) => {
     const items = ["Option A", "Option B", "Option C"];
-    const selector = new MySelector(items);
-    
-    let handle: { close: () => void; requestRender: () => void };
-    
-    await new Promise<void>((resolve) => {
-      selector.onSelect = (item) => {
-        ctx.ui.notify(`Selected: ${item}`, "info");
-        handle.close();
-        resolve();
-      };
-      selector.onCancel = () => {
-        handle.close();
-        resolve();
-      };
-      handle = ctx.ui.custom(selector);
+
+    const selected = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+      const selector = new MySelector(items);
+      selector.onSelect = (item) => done(item);
+      selector.onCancel = () => done(null);
+      return selector;
     });
+
+    if (selected !== null) {
+      ctx.ui.notify(`Selected: ${selected}`, "info");
+    }
   }
 });
 ```
@@ -477,7 +476,7 @@ class CachedComponent {
 }
 ```
 
-Call `invalidate()` when state changes, then `handle.requestRender()` to trigger re-render.
+Call `invalidate()` when state changes, then `tui.requestRender()` (the `tui` the factory received) to trigger re-render.
 
 ## Invalidation and Theme Changes
 

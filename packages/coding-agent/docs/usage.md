@@ -71,7 +71,7 @@ You can submit messages while the agent is still working:
 - **Enter** queues a steering message, delivered after the current assistant turn finishes executing its tool calls.
 - **Alt+Enter** queues a follow-up message, delivered after the agent finishes all work.
 - **Ctrl+C** interrupts the current operation and briefly shows the exit hint; press it again while the hint is visible to exit. Queued messages are kept and resume after your next submit or edit.
-- **Escape** clears the input bar without interrupting the agent.
+- **Escape** interrupts the current operation; with no work running it clears the input bar instead (the cleared draft is stashed - Ctrl+S restores it).
 - **Alt+Up / Alt+Down** browse queued messages one at a time and return to the untouched draft.
 - While browsing, **Enter** applies the edit as steering input and **Alt+Enter** applies it as a follow-up; submitting an empty edit deletes the item.
 - **Ctrl+Option+Up / Ctrl+Option+Down** move the selected item earlier or later within its queue.

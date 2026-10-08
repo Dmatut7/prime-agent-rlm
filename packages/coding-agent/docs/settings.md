@@ -23,7 +23,7 @@ Unknown keys are reported: a misspelled or removed setting (for example `compact
 | `imageModel` | string | none | Model (`"provider/model-id"` or a bare id) that serves turns attaching images when the session model does not accept image input |
 | `defaultThinkingLevel` | string | `"medium"` | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
 | `hideThinkingBlock` | boolean | `false` | Hide thinking traces entirely (the turn's 思考 header still renders; Ctrl+T then shows guidance instead of expanding) |
-| `footer.telemetry` | string | `"on"` | Persistent footer watermark line: `"off"` hides it, `"on"` shows `glm-5.3-prime · max    ──────●───────│──    518k/1M · 49%` (● = context level, │ = auto-compaction notch; reaching the notch brightens it and appends `压缩在即`). Legacy `"compact"`/`"full"` values read as `"on"`. `/usage` stays a one-shot report regardless |
+| `footer.telemetry` | string | `"on"` | Persistent footer watermark line: `"off"` hides it, `"on"` shows `glm-5.3-prime · max    ──────●───────│──    518k/1M · 49%` (● = context level, │ = auto-compaction notch; reaching the threshold brightens the notch, turns the figures warning-colored, and appends `即将压缩`). Legacy `"compact"`/`"full"` values read as `"on"`. `/usage` stays a one-shot report regardless |
 | `footer.sessionSpend` | boolean | `false` | Adds the session's own cumulative spend to the watermark line as `本次 ¥4.20`, ahead of the bar: the root agent's own usage as priced by the spend pipeline (the money recorded on the session's messages at the models.json rates, same 口径 as `/usage`). Off keeps cost out of the persistent UI; `/usage` reports it on demand either way |
 | `thinkingBudgets` | object | - | Custom token budgets per thinking level |
 

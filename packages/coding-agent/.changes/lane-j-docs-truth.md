@@ -1,0 +1,5 @@
+- Fixed the TUI components doc (`docs/tui.md`) which documented a non-existent `ctx.ui.custom()` handle API and a wrong custom-tool `execute` parameter order; it now shows the real `(tui, theme, keybindings, done)` factory signature and the daemon-session limitation.
+- Corrected the Escape key description in README and `docs/usage.md`: Escape interrupts active work, and only clears the (stashed, Ctrl+S-restorable) input when idle.
+- Updated the README footer description to the real U6 watermark line (`footer.telemetry`, on by default) instead of "empty by default".
+- Aligned `docs/settings.md` with the implemented compaction marker text `即将压缩`.
+- Fixed `examples/extensions/README.md` and five extension examples: real `execute(toolCallId, params, signal, onUpdate, ctx)` order and `~/.prime/agent/extensions/` install paths instead of legacy `~/.pi`.
