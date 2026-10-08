@@ -464,7 +464,9 @@ function anthropicSseError(data: string, requestId?: string): StreamFailureError
 		// Proxies may strip the request-id header; the error body carries it too.
 		requestId ??= typeof parsed.request_id === "string" ? parsed.request_id : undefined;
 	} catch {
-		detail = data;
+		// The message is user-facing (becomes errorMessage), so the same cap as
+		// info.raw applies; the full frame survives only there.
+		detail = truncateRawPayload(data);
 	}
 	const info = {
 		kind: classifyStreamFailure(errorType),

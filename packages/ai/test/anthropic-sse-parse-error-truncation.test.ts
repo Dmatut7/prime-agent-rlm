@@ -80,4 +80,30 @@ describe("Anthropic SSE parse failure reporting", () => {
 		expect((raw as string).length).toBeLessThanOrEqual(2_001);
 		expect(raw as string).toContain("garbage-");
 	});
+
+	it("bounds an unparseable error-event frame the same way (anthropicSseError catch path)", async () => {
+		const model = getModel("anthropic", "claude-haiku-4-5");
+		// A proxy answering `event: error` with a 50KB non-JSON body (an HTML
+		// error page, the R3-M25 scenario) must not land unbounded in the
+		// user-facing message.
+		const payload = `proxy-error-${"y".repeat(50_000)}-ERROR_TAIL`;
+		const response = createSseResponse([{ event: "error", data: payload }]);
+
+		const result = await streamAnthropic(model, createContext(), {
+			client: createFakeAnthropicClient(response),
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBeDefined();
+		expect(result.errorMessage!.length).toBeLessThan(3_000);
+		expect(result.errorMessage).not.toContain("ERROR_TAIL");
+		expect(result.errorMessage).toContain("proxy-error-");
+
+		const failure = result.diagnostics?.find((entry) => entry.type === "provider_stream_failure");
+		expect(failure, "an error-event frame must record a provider_stream_failure diagnostic").toBeDefined();
+		const raw = failure?.details?.raw;
+		expect(typeof raw).toBe("string");
+		expect((raw as string).length).toBeLessThanOrEqual(2_001);
+		expect(raw as string).toContain("proxy-error-");
+	});
 });

@@ -1,0 +1,1 @@
+- Fixed Anthropic SSE `error` frames with unparseable bodies pasting the full frame (up to the whole proxy error page) into the error message; the message now carries a truncated excerpt and the full frame stays on the structured diagnostic.
