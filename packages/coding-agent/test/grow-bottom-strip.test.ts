@@ -93,7 +93,10 @@ describe("the subagent strip", () => {
 			}
 		}
 		const withOrphans = strip(agents(10));
-		withOrphans.setStallMarkers(["ghost-a: stalled 70s", "ghost-b: stalled 80s"]);
+		withOrphans.setStallMarkers([
+			{ name: "ghost-a", text: "stalled 70s" },
+			{ name: "ghost-b", text: "stalled 80s" },
+		]);
 		expect(withOrphans.render(60)).toHaveLength(1);
 	});
 
@@ -107,7 +110,7 @@ describe("the subagent strip", () => {
 	it("never draws past the width", () => {
 		for (const width of [120, 80, 60, 40, 24, 12, 8, 6, 3, 2, 1]) {
 			const line = strip(agents(10));
-			line.setStallMarkers(["ghost: stalled 70s"]);
+			line.setStallMarkers([{ name: "ghost", text: "stalled 70s" }]);
 			for (const focused of [false, true]) {
 				line.focused = focused;
 				for (const rendered of line.render(width)) {
@@ -526,7 +529,10 @@ describe("the subagent strip", () => {
 	describe("a stalled descendant without a block of its own", () => {
 		it("becomes a red block in the same row instead of a line of its own", () => {
 			const line = strip([row("w", "stalled", "worker")]);
-			line.setStallMarkers(["worker: stalled 70s", "ghost: stalled 90s, in-flight: bash"]);
+			line.setStallMarkers([
+				{ name: "worker", text: "stalled 70s" },
+				{ name: "ghost", text: "stalled 90s, in-flight: bash" },
+			]);
 			const rendered = line.render(120);
 			expect(rendered).toHaveLength(1);
 			const text = plain(rendered);
@@ -541,7 +547,7 @@ describe("the subagent strip", () => {
 
 		it("can be reached with the arrow keys and opens the family view", () => {
 			const line = strip([row("w", "running", "worker")]);
-			line.setStallMarkers(["ghost: stalled 90s"]);
+			line.setStallMarkers([{ name: "ghost", text: "stalled 90s" }]);
 			const onOpen = vi.fn();
 			line.onOpen = onOpen;
 			line.focused = true;

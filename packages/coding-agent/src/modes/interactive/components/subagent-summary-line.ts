@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-tui";
 import type { ContextTreeNode } from "../../../core/context-tree.js";
 import { nodeSpendMoney, type SpendPricing, spendRelevantTokens } from "../../../core/spend-pricing.js";
+import { sanitizeRowText } from "../../../utils/display-text.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../../agent-connection/index.js";
 import { collectSubagentDescendantSummaries } from "../../agents-view/agents-view-state.js";
 import { type AgentRosterStatus, classifyAgentStatus } from "../../daemon/agent-roster.js";
@@ -199,6 +200,21 @@ export function formatSubagentStallMarker(child: AgentConnectionRlmChildAgentSna
 	return `stalled ${silentSeconds}s${toolText}${unsettled}`;
 }
 
+/**
+ * A stalled child the strip has to account for: the child's name plus its stall
+ * detail, as two fields. Never one `name: text` string - a real name carries
+ * `": "` (`lane: review`), and a consumer that cuts the marker at the first one
+ * invents a second, truncated child beside the real block. The strip draws the
+ * name (the detail is the panel row's own `activity`); it rides along so no
+ * consumer ever has to parse it back out of a name.
+ */
+export interface SubagentStallMarker {
+	/** The child's display name, spelled exactly as its panel row spells it (see buildSubagentPanelRows). */
+	name: string;
+	/** The stall detail from formatSubagentStallMarker (`stalled 70s, in-flight: bash`). */
+	text: string;
+}
+
 /** One child row of the subagent panel. */
 export type SubagentPanelRowState = "running" | "idle" | "done" | "failed" | "stalled";
 
@@ -367,10 +383,22 @@ function shortNames(names: readonly string[]): Map<string, string> {
 	return shown;
 }
 
-/** The session a stall marker names: the text before its first `: `. */
-function stallMarkerName(marker: string): string {
-	const at = marker.indexOf(": ");
-	return at === -1 ? marker : marker.slice(0, at);
+/**
+ * A block's name as the row draws it: one physical row of one row-high strip, so
+ * a name carrying a newline cannot turn the strip's single line into two, and no
+ * escape sequence survives into a dock that repaints every second (an OSC 52
+ * would rewrite the clipboard on each repaint, a CSI J clear the screen). A name
+ * that washes away to nothing - one that was only ever escape sequences - still
+ * says what the block is instead of drawing a nameless one.
+ */
+function chipName(name: string): string {
+	return sanitizeRowText(name) || "子代理";
+}
+
+/** A block's task tag, washed the same way; a tag that washes away is dropped rather than drawn as a blank. */
+function chipTag(tag: string | undefined): string | undefined {
+	const washed = tag === undefined ? "" : sanitizeRowText(tag);
+	return washed === "" ? undefined : washed;
 }
 
 /** `2:14`, `1:02:03`. */
@@ -527,7 +555,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 	focused = false;
 	private counts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
 	private spend: SubagentSpendSummary | undefined;
-	private stallMarkers: readonly string[] = [];
+	private stallMarkers: readonly SubagentStallMarker[] = [];
 	private rows: readonly SubagentPanelRow[] = [];
 	private items: readonly StripItem[] = [];
 	private itemsDirty = true;
@@ -576,7 +604,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 	 * child has a block of its own is already said there (`⚠ 卡住`); one without
 	 * (a roster-only descendant) becomes a red block in the same row.
 	 */
-	setStallMarkers(markers: readonly string[]): void {
+	setStallMarkers(markers: readonly SubagentStallMarker[]): void {
 		this.stallMarkers = markers;
 		this.itemsDirty = true;
 	}
@@ -689,25 +717,29 @@ export class SubagentSummaryLine implements Component, Focusable {
 		if (this.counts.total > 0) {
 			const named = new Set(this.rows.map((row) => row.name));
 			const seen = new Set<string>();
+			// Matched on the name as the snapshot spells it, not on the washed one: two
+			// children whose names wash to the same word are still two children, and a
+			// stall that dedups against the wrong row would go unsaid.
 			const shown = shortNames([
 				...this.rows.map((row) => row.name),
-				...this.stallMarkers.map(stallMarkerName).filter((name) => !named.has(name)),
+				...this.stallMarkers.map((marker) => marker.name).filter((name) => !named.has(name)),
 			]);
 			for (const marker of this.stallMarkers) {
-				const name = stallMarkerName(marker);
+				const { name } = marker;
 				if (named.has(name) || seen.has(name)) continue;
 				seen.add(name);
-				items.push({ key: `orphan:${name}`, kind: "orphan", name: shown.get(name) ?? name });
+				items.push({ key: `orphan:${name}`, kind: "orphan", name: chipName(shown.get(name) ?? name) });
 			}
 			if (this.rows.length > 0) {
 				for (const row of this.dispatchOrder()) {
+					const tag = chipTag(row.tag);
 					items.push({
 						key: `row:${row.id}`,
 						kind: "row",
 						row,
 						// The short name the timeline's return rows use: `review-grow-B-box` reads `B`.
-						name: shown.get(row.name) ?? row.name,
-						...(row.tag ? { tag: row.tag } : {}),
+						name: chipName(shown.get(row.name) ?? row.name),
+						...(tag ? { tag } : {}),
 						state: row.state,
 					});
 				}

@@ -327,7 +327,10 @@ describe("SubagentSummaryLine", () => {
 		const line = new SubagentSummaryLine();
 		line.setSubagentCounts({ total: 2, running: 2, idle: 0, inactive: 0 });
 		line.setSubagentRows([{ id: "w", name: "worker", state: "running" }]);
-		line.setStallMarkers(["worker: stalled 70s", "roster-only: stalled 90s, in-flight: bash"]);
+		line.setStallMarkers([
+			{ name: "worker", text: "stalled 70s" },
+			{ name: "roster-only", text: "stalled 90s, in-flight: bash" },
+		]);
 		const lines = line.render(160).map(stripAnsi);
 		// The session without a row becomes a red block in the same row; the one with a row says it there.
 		expect(lines).toHaveLength(1);
@@ -1549,7 +1552,7 @@ describe("subagent panel rows (design board 06)", () => {
 		line.setSubagentRows(
 			Array.from({ length: 6 }, (_, index) => ({ id: `c${index}`, name: `w${index}`, state: "running" as const })),
 		);
-		line.setStallMarkers(["w0: stalled 30s"]);
+		line.setStallMarkers([{ name: "w0", text: "stalled 30s" }]);
 		const lines = line.render(60).map(stripAnsi);
 		expect(lines).toHaveLength(1);
 		expect(lines[0]).toMatch(/还有 \d+ 个 ›/);
