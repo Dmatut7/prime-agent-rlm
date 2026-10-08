@@ -444,18 +444,20 @@ describe("InteractiveMode streaming events", () => {
 			const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
 			const first = createAssistantMessage("first", { ...EMPTY_USAGE, output: 100, totalTokens: 100 });
 			now.mockReturnValue(3_000);
+			// The /speed line carries one leading column in both faces since the w7-panel
+			// merge (one /speed face: the status-bar and telemetry indents no longer differ).
 			await speedPrototype.handleEvent.call(fakeThis, { type: "message_end", message: first });
-			expect(speedLine(footer)).toBe("50.0 tok/s");
+			expect(speedLine(footer)).toBe(" 50.0 tok/s");
 			const second = createAssistantMessage("second", { ...EMPTY_USAGE, output: 300, totalTokens: 300 });
 			now.mockReturnValue(5_500);
 			await speedPrototype.handleEvent.call(fakeThis, { type: "message_end", message: second });
-			expect(speedLine(footer)).toBe("120 tok/s · avg 88.9");
+			expect(speedLine(footer)).toBe(" 120 tok/s · avg 88.9");
 		});
 		test.each<[string, boolean, number, number, string, Record<string, unknown>]>([
-			["zero output tokens", true, 0, 2_000, "9.9 tok/s", { timestamp: 1_000 }],
-			["zero duration", true, 100, 0, "9.9 tok/s", {}],
-			["aborted message", true, 50, 2_000, "9.9 tok/s", { stopReason: "aborted", timestamp: 1_000 }],
-			["stripped usage and timestamp", true, 100, 2_000, "9.9 tok/s", { usage: undefined, timestamp: undefined }],
+			["zero output tokens", true, 0, 2_000, " 9.9 tok/s", { timestamp: 1_000 }],
+			["zero duration", true, 100, 0, " 9.9 tok/s", {}],
+			["aborted message", true, 50, 2_000, " 9.9 tok/s", { stopReason: "aborted", timestamp: 1_000 }],
+			["stripped usage and timestamp", true, 100, 2_000, " 9.9 tok/s", { usage: undefined, timestamp: undefined }],
 			["display disabled", false, 100, 2_000, "", {}],
 		])("skips the sample when %s", (_label, enabled, output, durationMs, expected, overrides) => {
 			const { fakeThis, footer } = makeSpeedThis(enabled);
