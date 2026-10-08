@@ -258,14 +258,15 @@ describe("interactive-mode /model profile wiring", () => {
 		});
 		const apply = Reflect.get(InteractiveMode.prototype, "applyModelSessionProfile") as (
 			this: typeof mode,
-			menu: { children: readonly unknown[] },
+			menu: { getModelsBody(): ModelSelectorComponent },
 		) => void;
 
-		// A menu that opened on another tab has no selector in its tree: no profile lands.
-		apply.call(mode, { children: [new Container()] });
 		expect(stripAnsi(selector.render(120).join("\n"))).not.toContain("推荐");
-
-		apply.call(mode, { children: [selector] });
+		// The models body exists from construction regardless of the active tab, so the
+		// profile lands through it even when the menu's mounted children are another
+		// tab's (w7-ui: the 推荐 line used to vanish whenever the menu opened on the
+		// providers tab, because the old code walked the mounted children).
+		apply.call(mode, { getModelsBody: () => selector, children: [new Container()] });
 		const output = stripAnsi(selector.render(120).join("\n"));
 		expect(output).toContain("推荐");
 		expect(output).toContain("vision");
