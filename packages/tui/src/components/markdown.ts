@@ -9,7 +9,7 @@ import {
 } from "../selection-metadata.js";
 import { getCapabilities, getCapabilitiesVersion, hyperlink, isImageLine } from "../terminal-image.js";
 import type { Component } from "../tui.js";
-import { applyBackgroundToLine, stripAnsi, visibleWidth, wrapTextWithAnsi } from "../utils.js";
+import { applyBackgroundToLine, sanitizeRenderText, stripAnsi, visibleWidth, wrapTextWithAnsi } from "../utils.js";
 
 const STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
 
@@ -2289,7 +2289,7 @@ export class Markdown implements Component {
 
 			case "html":
 				if ("raw" in token && typeof token.raw === "string") {
-					lines.push(this.applyDefaultStyle(token.raw.trim()));
+					lines.push(this.applyDefaultStyle(sanitizeRenderText(token.raw.trim())));
 				}
 				break;
 
@@ -2299,7 +2299,7 @@ export class Markdown implements Component {
 
 			default:
 				if ("text" in token && typeof token.text === "string") {
-					lines.push(token.text);
+					lines.push(sanitizeRenderText(token.text));
 				}
 		}
 
@@ -2310,8 +2310,12 @@ export class Markdown implements Component {
 		let result = "";
 		const resolvedStyleContext = styleContext ?? this.getDefaultInlineStyleContext();
 		const { applyText, stylePrefix } = resolvedStyleContext;
+		// Model text passes sanitizeRenderText at every leaf below (the same gate
+		// Text.render uses): theme SGR and terminated OSC 8 links survive, every
+		// other escape sequence and bare control byte is dropped before the
+		// component's own styling wraps go on.
 		const applyTextWithNewlines = (text: string): string => {
-			const segments: string[] = text.split("\n");
+			const segments: string[] = sanitizeRenderText(text).split("\n");
 			return segments.map((segment: string) => applyText(segment)).join("\n");
 		};
 
@@ -2342,12 +2346,15 @@ export class Markdown implements Component {
 				}
 
 				case "codespan":
-					result += this.theme.code(token.text) + stylePrefix;
+					result += this.theme.code(sanitizeRenderText(token.text)) + stylePrefix;
 					break;
 
 				case "inlineMath": {
 					const mathStyle = this.theme.math ?? this.theme.code;
-					const converted = latexToUnicode((token as unknown as MathToken).text).replace(/\s*\n\s*/g, " ");
+					const converted = latexToUnicode(sanitizeRenderText((token as unknown as MathToken).text)).replace(
+						/\s*\n\s*/g,
+						" ",
+					);
 					result += mathStyle(converted) + stylePrefix;
 					break;
 				}
@@ -2355,11 +2362,15 @@ export class Markdown implements Component {
 				case "link": {
 					const linkText = this.renderInlineTokens(token.tokens || [], resolvedStyleContext);
 					const styledLink = this.theme.link(this.theme.underline(linkText));
+					// The destination is model text too: it lands in the OSC 8 parameter
+					// and in the visible (href) fallback, where a raw BEL or escape would
+					// break out of the sequence the component wraps around it.
+					const rawHref = sanitizeRenderText(token.href);
 					// A Windows drive letter is a file path, not a URL scheme.
-					const target = token.href.replace(/^([a-z]:[\\/])/i, "file:///$1");
+					const target = rawHref.replace(/^([a-z]:[\\/])/i, "file:///$1");
 					const href =
 						!target.startsWith("#") &&
-						(this.options.baseUrl || target !== token.href) &&
+						(this.options.baseUrl || target !== rawHref) &&
 						URL.canParse(target, this.options.baseUrl)
 							? new URL(target, this.options.baseUrl).href
 							: target;
@@ -2368,11 +2379,11 @@ export class Markdown implements Component {
 						result += linkedText + stylePrefix;
 					} else {
 						// Keep the visible URL fallback while letting fullscreen hit testing open the label.
-						const hrefForComparison = token.href.startsWith("mailto:") ? token.href.slice(7) : token.href;
-						if (token.text === token.href || token.text === hrefForComparison) {
+						const hrefForComparison = rawHref.startsWith("mailto:") ? rawHref.slice(7) : rawHref;
+						if (token.text === rawHref || token.text === hrefForComparison) {
 							result += linkedText + stylePrefix;
 						} else {
-							result += linkedText + this.theme.linkUrl(` (${token.href})`) + stylePrefix;
+							result += linkedText + this.theme.linkUrl(` (${rawHref})`) + stylePrefix;
 						}
 					}
 					break;
@@ -2548,9 +2559,12 @@ export class Markdown implements Component {
 	private renderCodeTextLines(codeText: string, lang: string | undefined, highlight: boolean = true): string[] {
 		const indent = this.theme.codeBlockIndent ?? "  ";
 		const highlightCode = highlight ? this.theme.highlightCode : undefined;
+		// The wash runs before the highlighter so a fence of raw escape bytes
+		// reaches neither the terminal nor the theme's highlighter.
+		const cleanText = sanitizeRenderText(codeText);
 		const renderedCodeLines = highlightCode
-			? highlightCode(codeText, lang)
-			: codeText.split("\n").map((codeLine) => this.theme.codeBlock(codeLine));
+			? highlightCode(cleanText, lang)
+			: cleanText.split("\n").map((codeLine) => this.theme.codeBlock(codeLine));
 		const codeLines = renderedCodeLines.length > 0 ? renderedCodeLines : [this.theme.codeBlock("")];
 
 		return codeLines.map((codeLine) => `${indent}${codeLine}`);
@@ -2560,7 +2574,7 @@ export class Markdown implements Component {
 	private renderMathBlock(token: MathToken): string[] {
 		const indent = this.theme.codeBlockIndent ?? "  ";
 		const style = this.theme.mathBlock ?? this.theme.codeBlock;
-		const mathLines = latexToUnicode(token.text)
+		const mathLines = latexToUnicode(sanitizeRenderText(token.text))
 			.split("\n")
 			.map((line) => line.trim())
 			.filter((line) => line.length > 0);
@@ -2614,7 +2628,7 @@ export class Markdown implements Component {
 		const availableForCells = availableWidth - borderOverhead;
 		if (availableForCells < numCols) {
 			// Too narrow to render a stable table. Fall back to raw markdown.
-			const fallbackLines = token.raw ? wrapTextWithAnsi(token.raw, availableWidth) : [];
+			const fallbackLines = token.raw ? wrapTextWithAnsi(sanitizeRenderText(token.raw), availableWidth) : [];
 			if (nextTokenType && nextTokenType !== "space") {
 				fallbackLines.push("");
 			}

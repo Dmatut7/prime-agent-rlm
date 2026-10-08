@@ -1,0 +1,1 @@
+- Fixed Markdown-rendered assistant output passing model text to the terminal unwashed: escape sequences and control bytes (OSC 52 clipboard writes, screen clears, BEL) in answers, code blocks, links, and math are now stripped before display.
