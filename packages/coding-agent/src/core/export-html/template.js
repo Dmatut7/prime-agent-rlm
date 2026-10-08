@@ -521,9 +521,8 @@
           case 'edit':
             return `[edit: ${shortenPath(String(args.path || args.file_path || ''))}]`;
           case 'bash': {
-            const rawCmd = String(args.command || '');
-            const cmd = rawCmd.replace(/[\n\t]/g, ' ').trim().slice(0, 50);
-            return `[bash: ${cmd}${rawCmd.length > 50 ? '...' : ''}]`;
+            const cmd = String(args.command || '').replace(/[\n\t]/g, ' ').trim();
+            return `[bash: ${truncate(cmd, 50)}]`;
           }
           case 'grep':
             return `[grep: /${args.pattern || ''}/ in ${shortenPath(String(args.path || '.'))}]`;
@@ -532,8 +531,8 @@
           case 'ls':
             return `[ls: ${shortenPath(String(args.path || '.'))}]`;
           default: {
-            const argsStr = JSON.stringify(args).slice(0, 40);
-            return `[${name}: ${argsStr}${JSON.stringify(args).length > 40 ? '...' : ''}]`;
+            const argsJson = JSON.stringify(args);
+            return `[${name}: ${truncate(argsJson, 40)}]`;
           }
         }
       }
@@ -552,12 +551,27 @@
           .replace(/'/g, '&#039;');
       }
 
+      // Grapheme-aware splitting: a code-unit slice can halve a surrogate pair or
+      // a ZWJ sequence and leave a replacement-char stump on screen.
+      const graphemeSegmenter =
+        typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function'
+          ? new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+          : null;
+      function graphemesOf(s) {
+        if (graphemeSegmenter) {
+          return Array.from(graphemeSegmenter.segment(s), (part) => part.segment);
+        }
+        return Array.from(s);
+      }
+
       /**
-       * Truncate string to maxLen chars, append "..." if truncated.
+       * Truncate string to maxLen graphemes, append "..." if truncated.
        */
       function truncate(s, maxLen = 100) {
         if (s.length <= maxLen) return s;
-        return s.slice(0, maxLen) + '...';
+        const parts = graphemesOf(s);
+        if (parts.length <= maxLen) return s;
+        return parts.slice(0, maxLen).join('') + '...';
       }
 
       /**
@@ -1398,6 +1412,20 @@
         return node;
       }
 
+      let treeStatusTimer = null;
+      function flashTreeStatus(text) {
+        const statusEl = document.getElementById('tree-status');
+        if (!statusEl) return;
+        statusEl.textContent = text;
+        statusEl.classList.add('tree-status-flash');
+        if (treeStatusTimer !== null) clearTimeout(treeStatusTimer);
+        treeStatusTimer = setTimeout(() => {
+          treeStatusTimer = null;
+          statusEl.classList.remove('tree-status-flash');
+          renderTree(); // restores the entry-count status line
+        }, 2400);
+      }
+
       function navigateTo(targetId, scrollMode = 'target', scrollToEntryId = null) {
         currentLeafId = targetId;
         currentTargetId = scrollToEntryId || targetId;
@@ -1449,6 +1477,11 @@
                 targetEl.classList.add('highlight');
                 setTimeout(() => targetEl.classList.remove('highlight'), 2000);
               }
+            } else if (scrollToEntryId) {
+              // The tree lists every entry, but some types (model/thinking-level
+              // changes, hidden tool results, …) render no block of their own;
+              // say so instead of swallowing the click.
+              flashTreeStatus('This entry has no rendered content');
             }
           }
         }, 0);
@@ -1494,6 +1527,13 @@
             if (/^\s*(javascript|vbscript|data):/i.test(href)) {
               return escapeHtml(token.text || '');
             }
+            // Remote images would auto-load the moment someone opens the export,
+            // telling an arbitrary host (session text is model-controlled) that
+            // the file was opened and from where. Degrade them to plain links.
+            if (/^(?:[a-z][a-z0-9+.-]*:)?\/\//i.test(href)) {
+              const label = token.text || href;
+              return '<a class="image-link" href="' + escapeHtml(href) + '">' + escapeHtml(label) + '</a>';
+            }
             let out = '<img src="' + escapeHtml(href) + '" alt="' + escapeHtml(token.text || '') + '"';
             if (token.title) {
               out += ' title="' + escapeHtml(token.title) + '"';
@@ -1512,11 +1552,10 @@
                 highlighted = escapeHtml(code);
               }
             } else {
-              try {
-                highlighted = hljs.highlightAuto(code).value;
-              } catch {
-                highlighted = escapeHtml(code);
-              }
+              // No (known) language: highlightAuto misdetects prose as random
+              // languages (keywords light up in English sentences), so render
+              // the block plainly instead.
+              highlighted = escapeHtml(code);
             }
             return `<pre><code class="hljs">${highlighted}</code></pre>`;
           },
@@ -1531,9 +1570,19 @@
       }
 
       const searchInput = document.getElementById('tree-search');
-      searchInput.addEventListener('input', (e) => {
-        searchQuery = e.target.value;
+      // Debounce: a full tree rebuild per keystroke lags badly on large sessions.
+      let searchDebounceTimer = null;
+      const applySearchQuery = (value) => {
+        searchQuery = value;
         forceTreeRerender();
+      };
+      searchInput.addEventListener('input', (e) => {
+        const value = e.target.value;
+        if (searchDebounceTimer !== null) clearTimeout(searchDebounceTimer);
+        searchDebounceTimer = setTimeout(() => {
+          searchDebounceTimer = null;
+          applySearchQuery(value);
+        }, 150);
       });
 
       document.querySelectorAll('.filter-btn').forEach(btn => {
@@ -1701,9 +1750,12 @@
       document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
           if (searchQuery || searchInput.value) {
+            if (searchDebounceTimer !== null) {
+              clearTimeout(searchDebounceTimer);
+              searchDebounceTimer = null;
+            }
             searchInput.value = '';
-            searchQuery = '';
-            forceTreeRerender();
+            applySearchQuery('');
           }
         }
 

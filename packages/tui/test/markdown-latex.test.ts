@@ -75,6 +75,11 @@ describe("latexToUnicode", () => {
 		assert.strictEqual(latexToUnicode("x \\in \\{1, \\dots, K\\}"), "x ∈ {1, …, K}");
 	});
 
+	it("renders a stray top-level closing brace literally instead of truncating the formula", () => {
+		assert.strictEqual(latexToUnicode("x } y"), "x } y");
+		assert.strictEqual(latexToUnicode("\\frac{a}{b}} + c"), "a/b} + c");
+	});
+
 	it("collapses insignificant whitespace from spacing commands", () => {
 		assert.strictEqual(latexToUnicode("\\int_0^1 x^2 \\, dx = \\frac{1}{3}"), "∫₀¹ x² dx = ⅓");
 	});

@@ -3,7 +3,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
-import { getThemeExportColors } from "../src/modes/interactive/theme/theme.js";
+import { getResolvedThemeColors, getThemeExportColors } from "../src/modes/interactive/theme/theme.js";
 
 type ThemeFile = {
 	name: string;
@@ -97,5 +97,21 @@ describe("getThemeExportColors", () => {
 			cardBg: "#005f87",
 			infoBg: undefined,
 		});
+	});
+
+	it("falls back by the theme's actual brightness, not its name, for empty colors", () => {
+		// A custom light theme named anything but "light" used to get the dark
+		// fallback (#e5e5e7) for empty (terminal-default) colors — near-white text
+		// on the light export background.
+		const lightTheme = JSON.parse(
+			readFileSync(new URL("../src/modes/interactive/theme/light.json", import.meta.url), "utf-8"),
+		) as ThemeFile;
+		const customTheme: ThemeFile = { ...lightTheme, name: "paper-custom" };
+		writeFileSync(join(agentDir, "themes", "paper-custom.json"), JSON.stringify(customTheme, null, 2));
+
+		expect(lightTheme.colors.text).toBe("");
+		expect(getResolvedThemeColors("paper-custom").text).toBe("#000000");
+		expect(getResolvedThemeColors("light").text).toBe("#000000");
+		expect(getResolvedThemeColors("dark").text).toBe("#e5e5e7");
 	});
 });

@@ -24,12 +24,39 @@ function closingBackticks(text: string, from: number, count: number): number {
 	return -1;
 }
 
+/** The end of a link title starting at `from` (a quote or paren index), or -1. CommonMark titles: "…", '…' or (…). */
+function titleEnd(text: string, from: number): number {
+	const open = text.charAt(from);
+	if (open !== '"' && open !== "'" && open !== "(") return -1;
+	const close = open === "(" ? ")" : open;
+	for (let index = from + 1; index < text.length; index++) {
+		const char = text.charAt(index);
+		if (char === "\\") index += 1;
+		else if (char === "\n") return -1;
+		else if (open === "(" && char === "(") return -1;
+		else if (char === close) return index;
+	}
+	return -1;
+}
+
 /** Where a link's address ends (the index of its closing parenthesis), parentheses inside it balanced; -1 when it never closes. */
 function addressEnd(text: string, from: number): number {
 	let depth = 1;
 	for (let index = from; index < text.length; index++) {
 		const char = text.charAt(index);
-		if (/\s/.test(char)) return -1;
+		if (/\s/.test(char)) {
+			// Whitespace ends the address; what follows may be an optional title
+			// ([text](url "title")) and trailing whitespace before the closing paren.
+			if (depth !== 1) return -1;
+			let cursor = index;
+			while (cursor < text.length && /\s/.test(text.charAt(cursor))) cursor += 1;
+			if (text.charAt(cursor) === ")") return cursor;
+			const end = titleEnd(text, cursor);
+			if (end === -1) return -1;
+			cursor = end + 1;
+			while (cursor < text.length && /\s/.test(text.charAt(cursor))) cursor += 1;
+			return text.charAt(cursor) === ")" ? cursor : -1;
+		}
 		if (char === "(") depth += 1;
 		if (char === ")") {
 			depth -= 1;

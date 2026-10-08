@@ -614,16 +614,23 @@ class LatexParser {
 	}
 
 	parse(): string {
-		return this.parseSequence();
+		return this.parseSequence(true);
 	}
 
 	/** Render atoms (with attached scripts) until a closing brace or end of input. */
-	private parseSequence(): string {
+	private parseSequence(topLevel = false): string {
 		let result = "";
 		while (this.pos < this.src.length) {
 			const ch = this.src[this.pos];
 			if (ch === "}") {
-				break;
+				if (!topLevel) {
+					break;
+				}
+				// A stray "}" at the top level closes nothing; rendering it literally
+				// keeps the rest of the formula instead of silently truncating it.
+				this.pos++;
+				result += "}";
+				continue;
 			}
 			if ((ch === "^" || ch === "_") && !this.textMode) {
 				this.pos++;

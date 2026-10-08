@@ -1298,8 +1298,10 @@ export class Markdown implements Component {
 
 		// Carriage returns are normalized here as well: the lexer replaces them
 		// internally, and leaving them in would desynchronize the offset-based
-		// lex cache (token raws would no longer tile the input string).
-		const normalizedText = text.replace(/\t/g, "   ").replace(/\r\n|\r/g, "\n");
+		// lex cache (token raws would no longer tile the input string). Tabs expand
+		// to the CommonMark width (4 columns): at 3 a tab-indented line never
+		// reaches the 4-column code-block indent and renders as a plain paragraph.
+		const normalizedText = text.replace(/\t/g, "    ").replace(/\r\n|\r/g, "\n");
 
 		// Parse markdown to HTML-like tokens. Streaming appends re-lex only the
 		// tail after the last merge-safe block boundary; prefix blocks are reused
@@ -1938,7 +1940,7 @@ export class Markdown implements Component {
 		}
 		if (target > seal.tailFrom) {
 			const extension = this.renderTokenLinesToBlockLines(
-				this.renderCodeTextLines(text.slice(seal.tailFrom, target - 1), lang, !highlighting),
+				this.renderCodeTextLines(text.slice(seal.tailFrom, target - 1), lang, !highlighting, contentWidth),
 				width,
 				contentWidth,
 			);
@@ -1958,7 +1960,7 @@ export class Markdown implements Component {
 			// highlighting. Resetting the wrap fields makes a later over-cap
 			// tail re-seal from scratch instead of comparing against a
 			// highlighted wrapPrevW.
-			const tailLines = this.renderCodeTextLines(tailText, lang);
+			const tailLines = this.renderCodeTextLines(tailText, lang, true, contentWidth);
 			seal.wrapSealedW = undefined;
 			seal.wrapLines = undefined;
 			seal.wrapPrevW = undefined;
@@ -1970,7 +1972,7 @@ export class Markdown implements Component {
 		// leaves complete lines here. Render every tail line like the unsealed
 		// render does; the wrap seal covers only the last one. A fenced tail
 		// beyond the streaming-highlight cap renders plain until closure.
-		const tailLines = this.renderCodeTextLines(tailText, lang, !highlighting);
+		const tailLines = this.renderCodeTextLines(tailText, lang, !highlighting, contentWidth);
 		const w = tailLines[tailLines.length - 1] ?? "";
 		const tailHasAnsi = tailLines.some((line) => line.includes("\x1b"));
 		if (seal.wrapIneligible || tailHasAnsi) {
@@ -2206,7 +2208,7 @@ export class Markdown implements Component {
 			}
 
 			case "code": {
-				lines.push(...this.renderCodeBlock(token));
+				lines.push(...this.renderCodeBlock(token, width));
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(""); // Add spacing after code blocks (unless space token follows)
 				}
@@ -2240,7 +2242,13 @@ export class Markdown implements Component {
 					if (!quoteStylePrefix) {
 						return quoteStyle(line);
 					}
-					const lineWithReappliedStyle = line.replace(/\x1b\[0m/g, `\x1b[0m${quoteStylePrefix}`);
+					// Re-apply the quote style after full resets (\x1b[0m) and after the
+					// foreground-only resets (\x1b[39m) that theme.fg and the code
+					// highlighter close their spans with.
+					const lineWithReappliedStyle = line.replace(
+						/\x1b\[(?:0|39)m/g,
+						(reset) => `${reset}${quoteStylePrefix}`,
+					);
 					return quoteStyle(lineWithReappliedStyle);
 				};
 
@@ -2513,8 +2521,9 @@ export class Markdown implements Component {
 				lines.push(text);
 				kinds.push("text");
 			} else if (token.type === "code") {
-				// Code block in list item
-				for (const line of this.renderCodeBlock(token)) {
+				// Code block in list item; the caller indents every line by
+				// (parentDepth + 1) levels of two columns, so pay that budget here.
+				for (const line of this.renderCodeBlock(token, Math.max(1, width - (parentDepth + 1) * 2))) {
 					lines.push(line);
 					kinds.push("block");
 				}
@@ -2547,16 +2556,21 @@ export class Markdown implements Component {
 		return { lines, kinds };
 	}
 
-	private renderCodeBlock(token: Token): string[] {
+	private renderCodeBlock(token: Token, width?: number): string[] {
 		if (!("text" in token) || typeof token.text !== "string") {
 			return [];
 		}
 		const lang = "lang" in token && typeof token.lang === "string" ? token.lang : undefined;
-		return this.renderCodeTextLines(token.text, lang);
+		return this.renderCodeTextLines(token.text, lang, true, width);
 	}
 
 	/** Render code text to indented lines, highlighted unless highlight=false. */
-	private renderCodeTextLines(codeText: string, lang: string | undefined, highlight: boolean = true): string[] {
+	private renderCodeTextLines(
+		codeText: string,
+		lang: string | undefined,
+		highlight: boolean = true,
+		wrapWidth?: number,
+	): string[] {
 		const indent = this.theme.codeBlockIndent ?? "  ";
 		const highlightCode = highlight ? this.theme.highlightCode : undefined;
 		// The wash runs before the highlighter so a fence of raw escape bytes
@@ -2567,7 +2581,21 @@ export class Markdown implements Component {
 			: cleanText.split("\n").map((codeLine) => this.theme.codeBlock(codeLine));
 		const codeLines = renderedCodeLines.length > 0 ? renderedCodeLines : [this.theme.codeBlock("")];
 
-		return codeLines.map((codeLine) => `${indent}${codeLine}`);
+		if (wrapWidth === undefined) {
+			return codeLines.map((codeLine) => `${indent}${codeLine}`);
+		}
+		// Wrap at the budget the caller handed down and re-apply the indent to the
+		// continuation lines: the generic block wrap would otherwise spill them at
+		// column 0, outside the code block. The wrapped pieces fit the budget, so
+		// the outer wrap leaves them alone.
+		const textWidth = Math.max(1, wrapWidth - visibleWidth(indent));
+		const lines: string[] = [];
+		for (const codeLine of codeLines) {
+			for (const piece of wrapTextWithAnsi(codeLine, textWidth)) {
+				lines.push(`${indent}${piece}`);
+			}
+		}
+		return lines;
 	}
 
 	/** Render display math: converted to Unicode, indented like a code block. */

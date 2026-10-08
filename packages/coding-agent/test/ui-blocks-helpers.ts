@@ -119,14 +119,29 @@ export const text = (lines: readonly string[]): string => plain(lines).join("\n"
 /**
  * Truecolor, so two neighbouring background colors never collapse into one 256-color step and a
  * test reads the same on a truecolor terminal and on a CI runner that sets no COLORTERM.
+ * NO_COLOR/FORCE_COLOR/TERM=dumb in the developer's shell are neutralized too: theme
+ * emphasis (bold/italic SGR) honors them by contract, and paint assertions must not
+ * flip with the calling environment.
  */
 export function useTruecolorTheme(name = "prime"): () => void {
 	const previous = process.env.COLORTERM;
+	const previousNoColor = process.env.NO_COLOR;
+	const previousForceColor = process.env.FORCE_COLOR;
+	const previousTerm = process.env.TERM;
 	process.env.COLORTERM = "truecolor";
+	delete process.env.NO_COLOR;
+	delete process.env.FORCE_COLOR;
+	if (process.env.TERM === "dumb") process.env.TERM = "xterm-256color";
 	initTheme(name);
 	return () => {
 		if (previous === undefined) delete process.env.COLORTERM;
 		else process.env.COLORTERM = previous;
+		if (previousNoColor === undefined) delete process.env.NO_COLOR;
+		else process.env.NO_COLOR = previousNoColor;
+		if (previousForceColor === undefined) delete process.env.FORCE_COLOR;
+		else process.env.FORCE_COLOR = previousForceColor;
+		if (previousTerm === undefined) delete process.env.TERM;
+		else process.env.TERM = previousTerm;
 	};
 }
 

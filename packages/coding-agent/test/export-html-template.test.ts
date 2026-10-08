@@ -7,7 +7,7 @@
  */
 
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 const templateJs = readFileSync(new URL("../src/core/export-html/template.js", import.meta.url), "utf-8");
 const templateCss = readFileSync(new URL("../src/core/export-html/template.css", import.meta.url), "utf-8");
@@ -514,12 +514,26 @@ interface Harness {
 	sidebar: MiniElement;
 	searchInput: MiniElement;
 	hljsHighlightCalls: number;
+	hljsAutoCalls: number;
 	keydown: (key: string) => void;
 	clickTreeNode: (entryId: string) => void;
 	click: (el: MiniElement) => void;
 }
 
-function buildHarness(entries: SessionEntrySpec[], leafId: string, opts: { mobile?: boolean } = {}): Harness {
+/** The vendored marked build, fresh instance per harness so use() never leaks across tests. */
+function loadRealMarked(): { use: (opts: unknown) => void; parse: (text: string) => string } {
+	const markedJs = readFileSync(new URL("../src/core/export-html/vendor/marked.min.js", import.meta.url), "utf-8");
+	const exports: Record<string, unknown> = {};
+	new Function("exports", "module", markedJs)(exports, { exports });
+	const MarkedCtor = exports.Marked as new () => { use: (opts: unknown) => void; parse: (text: string) => string };
+	return new MarkedCtor();
+}
+
+function buildHarness(
+	entries: SessionEntrySpec[],
+	leafId: string,
+	opts: { mobile?: boolean; realMarked?: boolean } = {},
+): Harness {
 	const document = new MiniDocument();
 	const treeContainer = document.registerStatic("tree-container");
 	document.registerStatic("tree-status");
@@ -550,15 +564,16 @@ function buildHarness(entries: SessionEntrySpec[], leafId: string, opts: { mobil
 	};
 	document.windowStub = windowStub;
 
-	const marked = { use: () => {}, parse: (text: string) => text };
+	const marked = opts.realMarked ? loadRealMarked() : { use: () => {}, parse: (text: string) => text };
 	let hljsHighlightCalls = 0;
+	let hljsAutoCalls = 0;
 	const hljs = {
 		highlight: (text: string) => {
 			hljsHighlightCalls++;
 			return { value: escapeForHighlight(text) };
 		},
 		highlightAuto: (text: string) => {
-			hljsHighlightCalls++;
+			hljsAutoCalls++;
 			return { value: escapeForHighlight(text) };
 		},
 		getLanguage: () => true,
@@ -588,6 +603,9 @@ function buildHarness(entries: SessionEntrySpec[], leafId: string, opts: { mobil
 		searchInput,
 		get hljsHighlightCalls() {
 			return hljsHighlightCalls;
+		},
+		get hljsAutoCalls() {
+			return hljsAutoCalls;
 		},
 		keydown: (key: string) => document.dispatch("keydown", { key }),
 		clickTreeNode: (entryId: string) => {
@@ -755,7 +773,13 @@ describe("R5-M9: Escape only clears the tree search", () => {
 		expect(h.messages.textContent).not.toContain("ALPHA-BRANCH-ANSWER");
 
 		h.searchInput.value = "zzz-no-match";
-		h.searchInput.dispatch("input", { target: h.searchInput });
+		vi.useFakeTimers();
+		try {
+			h.searchInput.dispatch("input", { target: h.searchInput });
+			vi.advanceTimersByTime(200); // search input is debounced
+		} finally {
+			vi.useRealTimers();
+		}
 		const filteredCount = h.treeContainer.querySelectorAll(".tree-node").length;
 		expect(filteredCount).toBe(1); // only the current leaf survives a no-match query
 
@@ -899,5 +923,169 @@ describe("R5-M12: tree navigation closes the sidebar on mobile", () => {
 describe("R5-M13: markdown content wraps long unbreakable text", () => {
 	it("template.css sets overflow-wrap on .markdown-content", () => {
 		expect(templateCss).toMatch(/\.markdown-content\s*\{[^}]*overflow-wrap:\s*anywhere/);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// w7-render: Low-tier export batch (truncation graphemes, theme vars, dead
+// image modal, highlightAuto, search debounce, empty-node feedback, remote
+// images, class-name fork)
+// ---------------------------------------------------------------------------
+
+describe("w7-render: tree previews cut at grapheme boundaries", () => {
+	it("does not halve an astral character at the truncation boundary", () => {
+		const text = `${"a".repeat(99)}🙂 tail`;
+		const h = buildHarness([userEntry("u1", null, text)], "u1");
+		const node = h.treeContainer.querySelectorAll(".tree-node").find((n) => n.dataset.id === "u1");
+		const preview = node?.textContent ?? "";
+		expect(preview).toContain("🙂");
+		expect(preview).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/u);
+	});
+
+	it("cuts a bash tool call's command at a grapheme boundary", () => {
+		// "run " (4 units) + 45 letters puts the emoji astride the 50-unit cut.
+		const command = `run ${"a".repeat(45)}🙂 --force`;
+		const entries = [
+			userEntry("u1", null, "run it"),
+			assistantEntry("a1", "u1", [toolCallBlock("tc1", "bash", { command })]),
+			toolResultEntry("r1", "a1", "tc1", [textBlock("done")]),
+		];
+		const h = buildHarness(entries, "r1");
+		const toolNode = h.treeContainer
+			.querySelectorAll(".tree-node")
+			.find((n) => (n.textContent ?? "").includes("[bash:"));
+		const preview = toolNode?.textContent ?? "";
+		expect(preview).toContain("🙂");
+		expect(preview).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/u);
+	});
+});
+
+describe("w7-render: template.css variable and class wiring", () => {
+	it("references no undefined --hover variable", () => {
+		expect(templateCss).not.toContain("--hover");
+	});
+
+	it("styles the tree-custom class the JS emits for custom_message entries", () => {
+		expect(templateCss).toMatch(/\.tree-custom[\s,{]/);
+		const entries = [
+			userEntry("u1", null, "q"),
+			{
+				id: "c1",
+				parentId: "u1",
+				timestamp: ts(),
+				type: "custom_message",
+				customType: "hook",
+				display: true,
+				content: "did a thing",
+			},
+		];
+		const h = buildHarness(entries, "c1");
+		expect(h.treeContainer.querySelector(".tree-custom")).not.toBeNull();
+	});
+
+	it("ships no dead image-modal markup or references", () => {
+		const templateHtml = readFileSync(new URL("../src/core/export-html/template.html", import.meta.url), "utf-8");
+		expect(templateHtml).not.toContain("image-modal");
+		expect(templateJs).not.toContain("image-modal");
+		expect(templateCss).not.toContain("image-modal");
+	});
+});
+
+describe("w7-render: markdown rendering in the export", () => {
+	it("degrades remote images to links so opening the export does not phone home", () => {
+		const entries = [
+			userEntry("u1", null, "show me"),
+			assistantEntry("a1", "u1", [textBlock("look: ![cat](https://tracker.example/pixel.png) done")]),
+		];
+		const h = buildHarness(entries, "a1", { realMarked: true });
+		const remote = h.messages
+			.querySelectorAll("img")
+			.filter((img) => /^(?:https?:)?\/\//.test(img.getAttribute("src") ?? ""));
+		expect(remote).toHaveLength(0);
+		const link = h.messages.querySelector("a.image-link");
+		expect(link?.getAttribute("href")).toBe("https://tracker.example/pixel.png");
+		expect(link?.textContent).toBe("cat");
+	});
+
+	it("keeps local images as images", () => {
+		const entries = [
+			userEntry("u1", null, "show me"),
+			assistantEntry("a1", "u1", [textBlock("![diagram](images/arch.png)")]),
+		];
+		const h = buildHarness(entries, "a1", { realMarked: true });
+		const img = h.messages.querySelector("img");
+		expect(img?.getAttribute("src")).toBe("images/arch.png");
+	});
+
+	it("does not run highlightAuto on code blocks without a language", () => {
+		const entries = [
+			userEntry("u1", null, "q"),
+			assistantEntry("a1", "u1", [textBlock("```\nplain prose block\n```")]),
+		];
+		const h = buildHarness(entries, "a1", { realMarked: true });
+		expect(h.hljsAutoCalls).toBe(0);
+		expect(h.messages.textContent).toContain("plain prose block");
+	});
+
+	it("still highlights code blocks that name a language", () => {
+		const entries = [userEntry("u1", null, "q"), assistantEntry("a1", "u1", [textBlock("```js\nlet x = 1\n```")])];
+		const h = buildHarness(entries, "a1", { realMarked: true });
+		expect(h.hljsHighlightCalls).toBeGreaterThan(0);
+	});
+});
+
+describe("w7-render: tree search debounce and empty-node feedback", () => {
+	it("debounces tree search input into one rebuild", () => {
+		const entries = [userEntry("u1", null, "shared question"), assistantEntry("a1", "u1", [textBlock("answer")])];
+		const h = buildHarness(entries, "a1");
+		let appended = 0;
+		const container = h.treeContainer;
+		const originalAppend = container.appendChild.bind(container);
+		container.appendChild = (node) => {
+			appended++;
+			return originalAppend(node);
+		};
+
+		vi.useFakeTimers();
+		try {
+			h.searchInput.value = "zzz";
+			h.searchInput.dispatch("input", { target: h.searchInput });
+			h.searchInput.value = "zzz-n";
+			h.searchInput.dispatch("input", { target: h.searchInput });
+			// Two keystrokes, no synchronous rebuild.
+			expect(appended).toBe(0);
+			expect(h.treeContainer.querySelectorAll(".tree-node")).toHaveLength(2);
+
+			vi.advanceTimersByTime(200);
+			expect(h.treeContainer.querySelectorAll(".tree-node")).toHaveLength(1);
+			// Exactly one rebuild for the collapsed keystrokes (one node survives).
+			expect(appended).toBe(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("says when a clicked tree node has no rendered content", () => {
+		// Tool results show in the default tree filter but render no block of their
+		// own (they fold into the tool execution), so clicking one used to be silent.
+		const entries = [
+			userEntry("u1", null, "q"),
+			assistantEntry("a1", "u1", [toolCallBlock("tc1", "bash", { command: "ls" })]),
+			toolResultEntry("r1", "a1", "tc1", [textBlock("output")]),
+		];
+		const h = buildHarness(entries, "r1");
+		const status = h.document.getElementById("tree-status");
+		expect(status?.textContent).not.toContain("no rendered content");
+
+		vi.useFakeTimers();
+		try {
+			h.clickTreeNode("r1");
+			vi.advanceTimersByTime(0); // the scroll/feedback step is deferred
+			expect(status?.textContent).toContain("no rendered content");
+			vi.advanceTimersByTime(3000); // feedback restores the entry count
+			expect(status?.textContent).not.toContain("no rendered content");
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });

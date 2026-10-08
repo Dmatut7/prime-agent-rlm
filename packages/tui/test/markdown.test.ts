@@ -3,6 +3,7 @@ import { afterEach, describe, it } from "node:test";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import { Chalk } from "chalk";
 import { Markdown } from "../src/components/markdown.js";
+import type { MarkdownTheme } from "../src/index.js";
 import { resetCapabilitiesCache, setCapabilities } from "../src/terminal-image.js";
 import { type Component, TUI } from "../src/tui.js";
 import { hyperlinkAtColumn, stripAnsi, visibleWidth } from "../src/utils.js";
@@ -1115,6 +1116,79 @@ bar`,
 			assert.ok(allOutput.includes("\x1b[33m"), "Should have code styling (yellow)");
 
 			assert.ok(allOutput.includes("\x1b[3m"), "Should have italic from quote styling");
+		});
+
+		it("re-applies the quote color after a foreground reset inside a quoted code block", () => {
+			// The highlighter resets the foreground with \x1b[39m mid-line; text after
+			// that reset must fall back to the quote color, not the terminal default.
+			// The quote style below is hand-rolled like production's theme.fg (chalk
+			// re-opens its own close code and would mask the bug).
+			const theme: MarkdownTheme = {
+				...defaultMarkdownTheme,
+				quote: (text) => `\x1b[35m\x1b[3m${text}\x1b[23m\x1b[39m`,
+				highlightCode: (code: string) => code.split("\n").map((line) => line.replace("let", "\x1b[31mlet\x1b[39m")),
+			};
+			const markdown = new Markdown("> ```js\n> let x\n> ```", 0, 0, theme);
+
+			const line = markdown.render(80).find((l) => l.includes("let"));
+			assert.ok(line, "code line should render");
+			const tailIndex = line.indexOf(" x");
+			assert.ok(tailIndex > 0, "plain code text after the highlighted span should render");
+			const beforeTail = line.slice(0, tailIndex);
+			assert.ok(
+				beforeTail.lastIndexOf("\x1b[35m") > beforeTail.lastIndexOf("\x1b[39m"),
+				`quote color should be re-applied after the highlighter's \\x1b[39m: ${JSON.stringify(line)}`,
+			);
+		});
+	});
+
+	describe("Tabs and code block wrapping", () => {
+		it("treats a leading tab as a 4-column indent so tab-indented code renders as a code block", () => {
+			// CommonMark: a tab advances to the next multiple-of-4 column, so a leading
+			// tab opens an indented code block. Normalizing to 3 spaces turned it into
+			// a plain paragraph instead.
+			const lines = new Markdown("\tcode()", 0, 0, defaultMarkdownTheme).render(80);
+			const plainLines = lines.map((line) => stripAnsi(line).trimEnd());
+
+			assert.ok(
+				plainLines.some((line) => line === "  code()"),
+				`tab-indented line should render as an indented code block, got ${JSON.stringify(plainLines)}`,
+			);
+		});
+
+		it("expands a tab inside text to 4 columns", () => {
+			const lines = new Markdown("a\tb", 0, 0, defaultMarkdownTheme).render(80);
+			const plain = lines.map((line) => stripAnsi(line).trimEnd()).join("\n");
+
+			assert.ok(plain.includes("a    b"), `tab should expand to 4 spaces, got ${JSON.stringify(plain)}`);
+		});
+
+		it("keeps the code-block indent on wrapped continuation lines", () => {
+			const markdown = new Markdown(`\`\`\`\n${"x".repeat(30)}\n\`\`\``, 0, 0, defaultMarkdownTheme);
+			const plainLines = markdown.render(20).map((line) => stripAnsi(line).trimEnd());
+			const codeLines = plainLines.filter((line) => line.length > 0);
+
+			assert.ok(codeLines.length >= 2, `long code line should wrap, got ${JSON.stringify(plainLines)}`);
+			for (const line of codeLines) {
+				assert.ok(
+					line.startsWith("  "),
+					`continuation should keep the code-block indent: ${JSON.stringify(codeLines)}`,
+				);
+			}
+		});
+
+		it("keeps the indent for wrapped lines in a streaming (unterminated) code block", () => {
+			const markdown = new Markdown(`\`\`\`\n${"y".repeat(30)}`, 0, 0, defaultMarkdownTheme);
+			const plainLines = markdown.render(20).map((line) => stripAnsi(line).trimEnd());
+			const codeLines = plainLines.filter((line) => line.length > 0);
+
+			assert.ok(codeLines.length >= 2, `long code line should wrap, got ${JSON.stringify(plainLines)}`);
+			for (const line of codeLines) {
+				assert.ok(
+					line.startsWith("  "),
+					`continuation should keep the code-block indent: ${JSON.stringify(codeLines)}`,
+				);
+			}
 		});
 	});
 

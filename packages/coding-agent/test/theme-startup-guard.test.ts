@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { initTheme, loadThemeFromPath, setTheme, theme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, loadThemeFromPath, onThemeChange, setTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 /**
  * A custom theme missing required color tokens used to pass the startup
@@ -67,6 +67,22 @@ describe("theme startup guard", () => {
 			expect(() => theme.fg("text", "hello")).not.toThrow();
 		} finally {
 			errorSpy.mockRestore();
+		}
+	});
+
+	it("notifies theme-change listeners when a failed setTheme installs the fallback", () => {
+		// The fallback swaps the global theme object; without the notification the UI
+		// keeps painting with tokens sampled from the theme that is no longer active.
+		let notified = 0;
+		onThemeChange(() => {
+			notified += 1;
+		});
+		try {
+			const result = setTheme("no-such-theme");
+			expect(result.success).toBe(false);
+			expect(notified).toBeGreaterThan(0);
+		} finally {
+			onThemeChange(() => {});
 		}
 	});
 });

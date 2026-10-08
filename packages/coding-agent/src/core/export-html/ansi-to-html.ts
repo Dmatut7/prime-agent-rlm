@@ -7,8 +7,12 @@
  * - Standard background colors (40-47) and bright variants (100-107)
  * - 256-color palette (38;5;N and 48;5;N)
  * - RGB true color (38;2;R;G;B and 48;2;R;G;B)
- * - Text styles: bold (1), dim (2), italic (3), underline (4)
+ * - Text styles: bold (1), dim (2), italic (3), underline (4), inverse (7), strikethrough (9)
  * - Reset (0)
+ *
+ * Non-SGR sequences (OSC 8 links, erase/cursor CSI, charset designators, …)
+ * carry no meaning in static HTML and are stripped rather than leaked as
+ * visible garbage.
  */
 
 const ANSI_COLORS = [
@@ -72,6 +76,8 @@ interface TextStyle {
 	dim: boolean;
 	italic: boolean;
 	underline: boolean;
+	inverse: boolean;
+	strikethrough: boolean;
 }
 
 function createEmptyStyle(): TextStyle {
@@ -82,22 +88,46 @@ function createEmptyStyle(): TextStyle {
 		dim: false,
 		italic: false,
 		underline: false,
+		inverse: false,
+		strikethrough: false,
 	};
 }
 
 function styleToInlineCSS(style: TextStyle): string {
 	const parts: string[] = [];
-	if (style.fg) parts.push(`color:${style.fg}`);
-	if (style.bg) parts.push(`background-color:${style.bg}`);
+	// Inverse swaps the effective colors; unresolved sides fall back to the
+	// page's defaults so a bare \x1b[7m still inverts visibly.
+	let fg = style.fg;
+	let bg = style.bg;
+	if (style.inverse) {
+		const effectiveFg = fg ?? "var(--text)";
+		const effectiveBg = bg ?? "var(--body-bg)";
+		fg = effectiveBg;
+		bg = effectiveFg;
+	}
+	if (fg) parts.push(`color:${fg}`);
+	if (bg) parts.push(`background-color:${bg}`);
 	if (style.bold) parts.push("font-weight:bold");
 	if (style.dim) parts.push("opacity:0.6");
 	if (style.italic) parts.push("font-style:italic");
-	if (style.underline) parts.push("text-decoration:underline");
+	const decorations: string[] = [];
+	if (style.underline) decorations.push("underline");
+	if (style.strikethrough) decorations.push("line-through");
+	if (decorations.length > 0) parts.push(`text-decoration:${decorations.join(" ")}`);
 	return parts.join(";");
 }
 
 function hasStyle(style: TextStyle): boolean {
-	return style.fg !== null || style.bg !== null || style.bold || style.dim || style.italic || style.underline;
+	return (
+		style.fg !== null ||
+		style.bg !== null ||
+		style.bold ||
+		style.dim ||
+		style.italic ||
+		style.underline ||
+		style.inverse ||
+		style.strikethrough
+	);
 }
 
 /**
@@ -115,6 +145,8 @@ function applySgrCode(params: number[], style: TextStyle): void {
 			style.dim = false;
 			style.italic = false;
 			style.underline = false;
+			style.inverse = false;
+			style.strikethrough = false;
 		} else if (code === 1) {
 			style.bold = true;
 		} else if (code === 2) {
@@ -123,6 +155,10 @@ function applySgrCode(params: number[], style: TextStyle): void {
 			style.italic = true;
 		} else if (code === 4) {
 			style.underline = true;
+		} else if (code === 7) {
+			style.inverse = true;
+		} else if (code === 9) {
+			style.strikethrough = true;
 		} else if (code === 22) {
 			style.bold = false;
 			style.dim = false;
@@ -130,6 +166,10 @@ function applySgrCode(params: number[], style: TextStyle): void {
 			style.italic = false;
 		} else if (code === 24) {
 			style.underline = false;
+		} else if (code === 27) {
+			style.inverse = false;
+		} else if (code === 29) {
+			style.strikethrough = false;
 		} else if (code >= 30 && code <= 37) {
 			style.fg = ANSI_COLORS[code - 30];
 		} else if (code === 38) {
@@ -173,9 +213,20 @@ function applySgrCode(params: number[], style: TextStyle): void {
 const ANSI_REGEX = /\x1b\[([\d;]*)m/g;
 
 /**
+ * Every escape sequence that is not an SGR style: OSC/DCS/SOS/PM/APC string
+ * sequences (OSC 8 links, window titles, clipboard writes), CSI sequences with
+ * a non-`m` final byte (erase, cursor, scroll), charset designators, and plain
+ * two-byte escapes. None of them have a static-HTML meaning; left in place
+ * their bytes render as visible `]8;;…` garbage.
+ */
+const NON_SGR_ESCAPE_REGEX =
+	/\x1b[\]P_X^][^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c|$)|\x9b[0-?]*[ -/]*[@-Za-ln-~]|\x1b\[[0-?]*[ -/]*[@-Za-ln-~]|\x1b[()#%][0-9A-Za-z]|\x1b[0-?@-Z\\-_]/g;
+
+/**
  * Convert ANSI-escaped text to HTML with inline styles.
  */
 export function ansiToHtml(text: string): string {
+	const cleaned = text.replace(NON_SGR_ESCAPE_REGEX, "");
 	const style = createEmptyStyle();
 	let result = "";
 	let lastIndex = 0;
@@ -183,9 +234,9 @@ export function ansiToHtml(text: string): string {
 
 	ANSI_REGEX.lastIndex = 0;
 
-	let match = ANSI_REGEX.exec(text);
+	let match = ANSI_REGEX.exec(cleaned);
 	while (match !== null) {
-		const beforeText = text.slice(lastIndex, match.index);
+		const beforeText = cleaned.slice(lastIndex, match.index);
 		if (beforeText) {
 			result += escapeHtml(beforeText);
 		}
@@ -206,10 +257,10 @@ export function ansiToHtml(text: string): string {
 		}
 
 		lastIndex = match.index + match[0].length;
-		match = ANSI_REGEX.exec(text);
+		match = ANSI_REGEX.exec(cleaned);
 	}
 
-	const remainingText = text.slice(lastIndex);
+	const remainingText = cleaned.slice(lastIndex);
 	if (remainingText) {
 		result += escapeHtml(remainingText);
 	}

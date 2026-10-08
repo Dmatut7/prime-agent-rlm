@@ -110,7 +110,7 @@ function deriveExportColors(baseColor: string): { pageBg: string; cardBg: string
  * Generate CSS custom property declarations from theme colors.
  */
 function generateThemeVars(themeName?: string): string {
-	const colors = getResolvedThemeColors(themeName);
+	const colors = resolveThemeColorsForExport(themeName);
 	const lines: string[] = [];
 	for (const [key, value] of Object.entries(colors)) {
 		lines.push(`--${key}: ${value};`);
@@ -124,6 +124,16 @@ function generateThemeVars(themeName?: string): string {
 	lines.push(`--exportInfoBg: ${themeExport.infoBg ?? derivedColors.infoBg};`);
 
 	return lines.join("\n      ");
+}
+
+/** A configured-but-broken custom theme must not kill the export; fall back to the default. */
+function resolveThemeColorsForExport(themeName?: string): Record<string, string> {
+	try {
+		return getResolvedThemeColors(themeName);
+	} catch (error) {
+		if (themeName === undefined) throw error;
+		return getResolvedThemeColors(undefined);
+	}
 }
 
 interface SessionData {
@@ -148,7 +158,7 @@ function generateHtml(sessionData: SessionData, themeName?: string): string {
 	const hljsJs = readFileSync(join(templateDir, "vendor", "highlight.min.js"), "utf-8");
 
 	const themeVars = generateThemeVars(themeName);
-	const colors = getResolvedThemeColors(themeName);
+	const colors = resolveThemeColorsForExport(themeName);
 	const themeExport = getThemeExportColors(themeName);
 	const derivedExportColors = deriveExportColors(colors.userMessageBg || "#343541");
 	const bodyBg = themeExport.pageBg ?? derivedExportColors.pageBg;

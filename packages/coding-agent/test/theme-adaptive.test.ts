@@ -1,4 +1,5 @@
 import { clearDefaultTerminalColors, setDefaultTerminalColors } from "@earendil-works/pi-tui";
+import chalk from "chalk";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getEditorTheme, initTheme, setThemeInstance, Theme, theme } from "../src/modes/interactive/theme/theme.js";
 
@@ -323,5 +324,85 @@ describe("adaptive TUI theme colors", () => {
 		initTheme(undefined);
 
 		expect(theme.name).toBe("prime");
+	});
+
+	it("strengthens the surface blend when the small fixed blend undershoots the minimum delta", () => {
+		setThemeInstance(
+			new Theme(
+				{} as ConstructorParameters<typeof Theme>[0],
+				{ userMessageBg: "#1c1c22" } as ConstructorParameters<typeof Theme>[1],
+				"truecolor",
+			),
+		);
+		// Surface luminance 28.7 vs terminal 38: raw delta 9.3 < 12 triggers the
+		// blend, but a single 0.08 blend lands at luminance ~46.8 — still only 8.8
+		// away, leaving the panel indistinguishable from the terminal background.
+		setDefaultTerminalColors({
+			foreground: { r: 255, g: 255, b: 255 },
+			background: { r: 38, g: 38, b: 38 },
+		});
+
+		const rendered = theme.getEditorBackgroundColor()?.("x");
+		expect(rendered).not.toBe(theme.bg("userMessageBg", "x"));
+		if (rendered === undefined) throw new Error("editor background color missing");
+		expect(Math.abs(extractRgbLuminance(rendered) - 38)).toBeGreaterThanOrEqual(11);
+
+		initTheme("prime");
+	});
+});
+
+describe("emphasis styling", () => {
+	let savedEnv: Record<"NO_COLOR" | "TERM" | "FORCE_COLOR", string | undefined>;
+
+	beforeEach(() => {
+		savedEnv = { NO_COLOR: process.env.NO_COLOR, TERM: process.env.TERM, FORCE_COLOR: process.env.FORCE_COLOR };
+		delete process.env.NO_COLOR;
+		delete process.env.FORCE_COLOR;
+		process.env.TERM = "xterm-256color";
+		initTheme("dark");
+	});
+
+	afterEach(() => {
+		for (const [key, value] of Object.entries(savedEnv)) {
+			if (value === undefined) {
+				delete process.env[key];
+			} else {
+				process.env[key] = value;
+			}
+		}
+		clearDefaultTerminalColors();
+	});
+
+	it("emits SGR emphasis even when chalk's TTY sniffing would disable it", () => {
+		// theme.fg emits colors unconditionally; emphasis used to vanish under
+		// piped stdout (chalk.level = 0) while the colors still flowed.
+		const previousLevel = chalk.level;
+		chalk.level = 0;
+		try {
+			expect(theme.bold("x")).toBe("\x1b[1mx\x1b[22m");
+			expect(theme.italic("x")).toBe("\x1b[3mx\x1b[23m");
+		} finally {
+			chalk.level = previousLevel;
+		}
+	});
+
+	it("drops emphasis under NO_COLOR", () => {
+		process.env.NO_COLOR = "1";
+		expect(theme.bold("x")).toBe("x");
+		expect(theme.italic("x")).toBe("x");
+		expect(theme.underline("x")).toBe("x");
+		expect(theme.strikethrough("x")).toBe("x");
+	});
+
+	it("drops emphasis when TERM=dumb", () => {
+		process.env.TERM = "dumb";
+		expect(theme.bold("x")).toBe("x");
+		expect(theme.inverse("x")).toBe("x");
+	});
+
+	it("FORCE_COLOR overrides TERM=dumb", () => {
+		process.env.TERM = "dumb";
+		process.env.FORCE_COLOR = "1";
+		expect(theme.bold("x")).toBe("\x1b[1mx\x1b[22m");
 	});
 });

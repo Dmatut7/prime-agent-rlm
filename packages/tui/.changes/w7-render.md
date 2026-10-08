@@ -1,0 +1,4 @@
+- Fixed the quote color dropping after inline code and syntax-highlight spans inside blockquotes: the quote style is now re-applied after `\x1b[39m` foreground resets, not only after full resets.
+- Changed Markdown tab expansion to the CommonMark 4-column width, so tab-indented code blocks render as code instead of plain paragraphs.
+- Fixed wrapped code-block continuation lines losing their indent and spilling out of the block; continuations now carry the code-block indent.
+- Fixed LaTeX rendering silently truncating a formula at a stray top-level `}`; the brace now renders literally and the rest of the formula is kept.

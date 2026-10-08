@@ -13,7 +13,6 @@ import {
 	rgbTo256,
 	type SelectListTheme,
 } from "@earendil-works/pi-tui";
-import chalk from "chalk";
 import { type Static, type TProperties, Type } from "typebox";
 import type { Validator } from "typebox/compile";
 import { getCustomThemesDir, getThemesDir } from "../../../config.js";
@@ -352,6 +351,11 @@ type ColorMode = "truecolor" | "256color";
 const ADAPTIVE_LIGHT_BG_ACCENT: Rgb = { r: 0, g: 95, b: 135 };
 const SURFACE_MIN_LUMINANCE_DELTA = 12;
 const SURFACE_CONTRAST_ALPHA = 0.08;
+// Surface blends step up from SURFACE_CONTRAST_ALPHA until the quantized result
+// actually clears the minimum delta (see getSelectionBackgroundColor); the cap
+// keeps panels subtle when even the strongest blend cannot stand out.
+const SURFACE_MAX_BLEND_ALPHA = 0.5;
+const SURFACE_BLEND_STEP = 0.05;
 // Selection rows must stand out clearly, much more than passive surfaces.
 const SELECTION_MIN_LUMINANCE_DELTA = 28;
 const SELECTION_MAX_BLEND_ALPHA = 0.5;
@@ -359,6 +363,28 @@ const SELECTION_BLEND_STEP = 0.05;
 const BLACK: Rgb = { r: 0, g: 0, b: 0 };
 const WHITE: Rgb = { r: 255, g: 255, b: 255 };
 const CUBE_VALUES = [0, 95, 135, 175, 215, 255] as const;
+
+/**
+ * SGR emphasis (bold/italic/…) with the explicit opt-outs chalk honors, but
+ * without chalk's import-time TTY sniffing: theme.fg emits its colors
+ * unconditionally, and emphasis going through chalk vanished whenever stdout
+ * was piped while the colors still flowed. Evaluated per call so tests and
+ * embedders can flip the env at runtime.
+ */
+function emphasisEnabled(): boolean {
+	const forceColor = process.env.FORCE_COLOR;
+	if (forceColor !== undefined) {
+		return forceColor !== "false" && forceColor !== "0";
+	}
+	if (process.env.NO_COLOR !== undefined && process.env.NO_COLOR !== "") {
+		return false;
+	}
+	return process.env.TERM !== "dumb";
+}
+
+function emphasis(open: string, close: string, text: string): string {
+	return emphasisEnabled() ? `${open}${text}${close}` : text;
+}
 
 // ============================================================================
 // Color Utilities
@@ -674,17 +700,39 @@ export class Theme {
 			return (str: string) => this.bg(color, str);
 		}
 
-		const delta = Math.abs(luminance(surfaceRgb) - luminance(terminalBg));
+		const terminalLuminance = luminance(terminalBg);
+		const delta = Math.abs(luminance(surfaceRgb) - terminalLuminance);
 		if (delta >= SURFACE_MIN_LUMINANCE_DELTA) {
 			return (str: string) => this.bg(color, str);
 		}
 
+		// Recheck what the blend actually renders (worst case after 256-color
+		// quantization) and step the alpha up until the surface clears the minimum
+		// delta — a fixed small blend can undershoot and leave the panel
+		// indistinguishable from the terminal background (e.g. mid-gray terminals).
 		const top = isLightColor(terminalBg) ? BLACK : WHITE;
-		const adjustedColor = bestAnsiColor(blendColor(top, surfaceRgb, SURFACE_CONTRAST_ALPHA), this.mode);
-		if (adjustedColor === "") {
+		let bestColor: string | number | undefined;
+		let bestDelta = delta;
+		for (let alpha = SURFACE_CONTRAST_ALPHA; alpha <= SURFACE_MAX_BLEND_ALPHA; alpha += SURFACE_BLEND_STEP) {
+			const adjustedColor = bestAnsiColor(blendColor(top, surfaceRgb, alpha), this.mode);
+			const adjustedRgb = colorValueToRgb(adjustedColor);
+			if (adjustedColor === "" || !adjustedRgb) {
+				continue;
+			}
+			const resultDelta = Math.abs(luminance(adjustedRgb) - terminalLuminance);
+			if (resultDelta >= SURFACE_MIN_LUMINANCE_DELTA - 1) {
+				bestColor = adjustedColor;
+				break;
+			}
+			if (resultDelta > bestDelta) {
+				bestColor = adjustedColor;
+				bestDelta = resultDelta;
+			}
+		}
+		if (bestColor === undefined) {
 			return (str: string) => this.bg(color, str);
 		}
-		const ansi = bgAnsi(adjustedColor, this.mode);
+		const ansi = bgAnsi(bestColor, this.mode);
 		return (str: string) => `${ansi}${str}\x1b[49m`;
 	}
 
@@ -697,23 +745,23 @@ export class Theme {
 	}
 
 	bold(text: string): string {
-		return chalk.bold(text);
+		return emphasis("\x1b[1m", "\x1b[22m", text);
 	}
 
 	italic(text: string): string {
-		return chalk.italic(text);
+		return emphasis("\x1b[3m", "\x1b[23m", text);
 	}
 
 	underline(text: string): string {
-		return chalk.underline(text);
+		return emphasis("\x1b[4m", "\x1b[24m", text);
 	}
 
 	inverse(text: string): string {
-		return chalk.inverse(text);
+		return emphasis("\x1b[7m", "\x1b[27m", text);
 	}
 
 	strikethrough(text: string): string {
-		return chalk.strikethrough(text);
+		return emphasis("\x1b[9m", "\x1b[29m", text);
 	}
 
 	getFgAnsi(color: ThemeColor): string {
@@ -1276,6 +1324,11 @@ export function setTheme(name: string, enableWatcher: boolean = false): { succes
 			};
 		}
 		currentThemeName = fallback;
+		// The fallback swapped the active theme; listeners re-render from stale
+		// tokens unless told (extension API callers go through this path too).
+		if (onThemeChangeCallback) {
+			onThemeChangeCallback();
+		}
 		return {
 			success: false,
 			error: error instanceof Error ? error.message : String(error),
@@ -1443,11 +1496,14 @@ function ansi256ToHex(index: number): string {
  */
 export function getResolvedThemeColors(themeName?: string): Record<string, string> {
 	const name = themeName ?? currentThemeName ?? getDefaultTheme();
-	const isLight = name === "light";
 	const themeJson = loadThemeJson(name);
 	const resolved = resolveThemeColors(themeJson.colors, themeJson.vars);
 
-	// Default text color for empty values (terminal uses default fg color)
+	// Default text color for empty values (terminal uses default fg color). Judge
+	// the theme by its actual surface brightness, not its name: a custom light
+	// theme named anything but "light" used to get the dark fallback here.
+	const surfaceRgb = colorValueToRgb(resolved.userMessageBg);
+	const isLight = surfaceRgb ? isLightColor(surfaceRgb) : name === "light";
 	const defaultText = isLight ? "#000000" : "#e5e5e7";
 
 	const cssColors: Record<string, string> = {};
@@ -1648,7 +1704,7 @@ export function getMarkdownTheme(): MarkdownTheme {
 		bold: (text: string) => theme.bold(text),
 		italic: (text: string) => theme.italic(text),
 		underline: (text: string) => theme.underline(text),
-		strikethrough: (text: string) => chalk.strikethrough(text),
+		strikethrough: (text: string) => theme.strikethrough(text),
 		math: (text: string) => theme.fg("mdCode", text),
 		mathBlock: (text: string) => theme.fg("mdCodeBlock", text),
 		highlightCode: (code: string, lang?: string): string[] => {

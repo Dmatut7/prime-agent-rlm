@@ -1622,7 +1622,19 @@ export async function main(args: string[], options?: MainOptions) {
 		try {
 			const { exportFromFile } = await import("./core/export-html/index.js");
 			const outputPath = parsed.messages.length > 0 ? parsed.messages[0] : undefined;
-			result = await exportFromFile(parsed.export, outputPath);
+			// Honor the configured theme: without this the export always renders in
+			// the auto-detected default, so a light-terminal user with theme=light
+			// gets a dark export. A broken configured theme must not kill the export.
+			let themeName: string | undefined;
+			try {
+				themeName = SettingsManager.create(
+					parsed.cwd ? resolve(expandTildePath(parsed.cwd)) : process.cwd(),
+					getAgentDir(),
+				).getTheme();
+			} catch {
+				themeName = undefined;
+			}
+			result = await exportFromFile(parsed.export, { outputPath, themeName });
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : "Failed to export session";
 			console.error(wrapForStderr(chalk.red(`Error: ${message}`)));
