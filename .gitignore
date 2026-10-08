@@ -47,3 +47,6 @@ collect.sh
 __pycache__/
 *.pyc
 .playwright-mcp/
+
+# check-gate-cache.mjs local gate cache (delete to force every cached gate to re-run)
+.gates-cache.json
