@@ -1,3 +1,14 @@
+## 2026-10-09 第二批：W9-b 收尾 + 四问分拣 + W10 先修 12 条 + 工具链提速
+
+> 前一批（同日 05:00 前推送的 98bbdf22f）收口后循环继续：另一窗口 W7 的剩余条目清尾（W9-b 三车道）、88 条低优先积压按老板四问（会再改/具体后果/正在发生/机会成本——作排序直觉不作硬门）分拣出 12 条先修（W10 三车道）、两条性能车道把「每次提交/每次门禁」的固定开销砍掉 86%。
+
+- **W9-b（W7 尾巴清零）**：panel T 组残留的搜索退格半代理对改字素边界（三处点名的硬切此前已修）；Q 组三条——删除确认挂起时 Esc 先清确认不再连带退出视图、roster 种子行按会话文件消息数分类（命名草稿不再闪现为 live）、rlm 子代理快照改按子会话目录为键（裸 childId 跨父会话误归属）；ui 的 /fork/thinking/show-images 三处选择器补 ← 返回键。两条诚实跳过：transferTo 焦点携带不复现（两条半边均已关）；backend D5（X10 鼠标 UTF-8 坍缩）属输入管线字节化重构级设计拍板——工单要的字节抽取与 StdinBuffer 粘贴契约冲突，string 层补丁会误吃用户输入。backend 37 条的判定依据与 D3 观察记录见车道报告。
+- **四问分拣（账本第九节）**：88 条低优先 → 12 条 GO（先修）/ 76 条缓修。GO 共性：路径确定走错 + 日常用户/运维操作触发 + 半小时内修。缓修不弃置（理论路径/罕见配置/复合触发），碰到文件时捎带。
+- **W10（12 条 GO 全修，每条先红后绿）**：诚实簇——Esc 取消重试的残留计数不再带入后续失败通报（clear-don't-carry）、missing-cwd 刹车的 resume 路径清 lastError（按文档恢复不再留假 Error 行）、park 解除随终态心跳清快照缓存（无字段 session_replaced 不再复活过期 park）、degraded-only 部分恢复折号新增警示标签、快照 skip 分类改按名字+reboundNames（删除了 reason 字串兜底——账本点名的假话面，主机绑定别名的真实丢失现在会报）；扫描/refine 簇——patch walker 按 @@ 行数消费 hunk 体（`++ ` 开头的新增行不再被当文件头关掉整文件扫描，自测 50/50）、手动 /refine 失败行不再承诺永不发生的自动重试（收据带 source）、refine 删除写哨兵版本抑制重投、SHELL_WRITE_COMMAND 补 unzip/tar -x/curl -o 等归档下载族；时钟/标记簇——回填测量渲染经 renderForMeasurement 级联（不再消耗 armed reveal marker）、快照与 session_replaced 带 turnStartedAt（**rev 49→50 additive wire**：epoch ms、仅运行中在场、缺席=保持现行锚点行为，消费方清单在车道提交说明、digest 测试钉住）、passivated 行的 id 后缀选择器匹配。
+- **工具链提速（两条性能车道，前后实测）**：**check 门缓存**——`scripts/check-gate-cache.mjs` 包五个自测门（installer/push-guard/secret-scan/browser-smoke/ci-honesty），输入指纹全字节匹配且上次绿才跳过；任何缺失/损坏/变更/红/信号死/清单编辑/平台漂移都全量重跑（fail-closed），缓存自身的 21 个故障注入自测在每次 check 里先跑（刹车带恢复），缓存文件 gitignored 故 CI 不受影响。实测：`npm run check` ~55s → **~4.7s 热**（-86%），每提交钩子同享。**vitest 转换缓存**——三包 vitest 配置开 fsModuleCache（内容/配置变更自动失效，五次全量计数一致）；「transform 35%」经 14 次复测不成立（1-3%，冷缓存伪象），收益在冷跑；isolate/worker 复用评估后否决（38+ 测试文件装信号处理器/起受管 daemon，不安全）。每提交/每门禁的固定开销从这波起永久下降。
+- **门禁**：check 双跑 EXIT 0（热 4.7s）；三包全量（真退出码+计数落文件 /tmp/full-*3.txt）见推送前记录；test-hygiene 无新探针。
+- **剩余**：缓修 76 条（账本第九节）碰到文件时捎带；GitHub 42 条 dependabot 依赖告警（默认分支、非本 fork 引入，受 7 天龄规则约束）待专项波；D5 输入管线字节化重构留设计拍板。
+
 ## 2026-10-09 第七波合流 + 第八波 16 修 + 全量三波复审闭环
 
 > 本日流水线：三波复审蜂群（26 车道 / 46 代理）→ 账本 docs/audits/2026-10-09-iteration-review.md（17 confirmed，其中 1.7/1.10 同根 → 16 修）→ 另一窗口的第七波九车道甄别合流 → 第八波五车道修复 → 全量门禁 → 合并后对抗复审（推送前最后一关）。全程无人值守自主推进。
