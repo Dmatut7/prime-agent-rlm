@@ -119,7 +119,7 @@ describe("a mistake the turn corrected itself", () => {
 		const opened = turn.summary.render(WIDTH);
 		const at = plain(opened).findIndex((line) => line.includes(ERROR_TEXT));
 		expect(at).toBeGreaterThan(0);
-		expect(plain(opened)[at]).toMatch(/^ {9}│ {11}✗ {2}Python 出错：ModuleNotFoundError.* +下一格改好了 {4}$/);
+		expect(plain(opened)[at]).toMatch(/^ {9}│ {11}✗ {2}Python 出错：ModuleNotFoundError.* +下一格改好了 {2}$/);
 		const line = opened[at] ?? "";
 		expect(line).toContain(theme.bold(theme.fg("timelineFix", "✗")));
 		expect(line).toContain(theme.fg("timelineFix", "下一格改好了"));
@@ -185,7 +185,7 @@ describe("a mistake nobody corrected keeps its alarm", () => {
 		const opened = turn.summary.render(WIDTH);
 		const at = plain(opened).findIndex((line) => line.includes(ERROR_TEXT));
 		expect(at).toBe(1);
-		expect(plain(opened)[at]).toMatch(/^ {9}│ {11}✗ {2}Python 出错：ModuleNotFoundError.* +出错了 {4}$/);
+		expect(plain(opened)[at]).toMatch(/^ {9}│ {11}✗ {2}Python 出错：ModuleNotFoundError.* +出错了 {2}$/);
 		expect(opened[at]).toContain(theme.bold(theme.fg("timelineMust", "✗")));
 		expect(opened[at]).toContain(theme.fg("timelineMust", "出错了"));
 		expect(hasBg(opened[at] ?? "", "kindErrorBg")).toBe(false);
@@ -298,7 +298,7 @@ describe("a turn cut off after a failed step corrected nothing", () => {
 		summary.toggleBox();
 		const opened = plain(summary.render(WIDTH));
 		expect(
-			opened.some((line) => /^ {9}│ {11}✗ {2}运行 false 出错：command failed exit 1 +下一格改好了 {4}$/.test(line)),
+			opened.some((line) => /^ {9}│ {11}✗ {2}运行 false 出错：command failed exit 1 +下一格改好了 {2}$/.test(line)),
 		).toBe(true);
 	});
 

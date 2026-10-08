@@ -152,9 +152,9 @@ describe("timeline steps from the kernel's records", () => {
 			true,
 		);
 		const live = openEvents(turn);
-		expect(live.some((line) => /^ {9}│ {11}[⠀-⣿] {2}go test \.\/\.\.\. +[23]秒 {4}$/.test(line))).toBe(true);
+		expect(live.some((line) => /^ {9}│ {11}[⠀-⣿] {2}go test \.\/\.\.\. +[23]秒 {2}$/.test(line))).toBe(true);
 		expect(spinnerLine(live)).toContain("正在运行命令");
-		expect(live.some((line) => /^ {9}╎ {11}在跑 {2}go test \.\/\.\.\. +[23]秒 {4}$/.test(line))).toBe(true);
+		expect(live.some((line) => /^ {9}╎ {11}在跑 {2}go test \.\/\.\.\. +[23]秒 {2}$/.test(line))).toBe(true);
 
 		turn.timeline.mergeStep(
 			"c1",
@@ -180,7 +180,7 @@ describe("timeline steps from the kernel's records", () => {
 		);
 		turn.state.setStepStatus("c1", "done");
 		const done = openEvents(turn);
-		expect(done.some((line) => /^ {9}│ {11}\$ {2}go test \.\/\.\.\. +54 通过 · 2 失败 {2}3秒 {4}$/.test(line))).toBe(
+		expect(done.some((line) => /^ {9}│ {11}\$ {2}go test \.\/\.\.\. +54 通过 · 2 失败 {2}3秒 {2}$/.test(line))).toBe(
 			true,
 		);
 		expect(done.join("\n")).not.toContain("=== RUN");
@@ -283,8 +283,8 @@ describe("timeline steps from the kernel's records", () => {
 			false,
 		);
 		const lines = openEvents(turn);
-		expect(lines.some((line) => /^ {9}│ {11}✎ {2}modules\/aichat\/client\.go\s+\+12 −4 {4}$/.test(line))).toBe(true);
-		expect(lines.some((line) => /^ {9}│ {11}✎ {2}\/tmp\/probe\.py\s+临时 \+9 {4}$/.test(line))).toBe(true);
+		expect(lines.some((line) => /^ {9}│ {11}✎ {2}modules\/aichat\/client\.go\s+\+12 −4 {2}$/.test(line))).toBe(true);
+		expect(lines.some((line) => /^ {9}│ {11}✎ {2}\/tmp\/probe\.py\s+临时 \+9 {2}$/.test(line))).toBe(true);
 		const out = lines.join("\n");
 		expect(out).toContain("✦  记住：go http 请求要带 context");
 		expect(out).not.toContain("_2026");
@@ -329,8 +329,8 @@ describe("timeline steps from the kernel's records", () => {
 		const lines = openEvents(turn);
 		// The session's own row stays bare; the ambient one carries the marker the change
 		// strip splits out as 「工作区另有 N 个变动」.
-		expect(lines.some((line) => /^ {9}│ {11}✎ {2}modules\/aichat\/client\.go\s+\+12 −4 {4}$/.test(line))).toBe(true);
-		expect(lines.some((line) => /^ {9}│ {11}✎ {2}notes\.md\s+工作区 \+3 −1 {4}$/.test(line))).toBe(true);
+		expect(lines.some((line) => /^ {9}│ {11}✎ {2}modules\/aichat\/client\.go\s+\+12 −4 {2}$/.test(line))).toBe(true);
+		expect(lines.some((line) => /^ {9}│ {11}✎ {2}notes\.md\s+工作区 \+3 −1 {2}$/.test(line))).toBe(true);
 		// And the title counts only the session's own edit: the ambient change is not
 		// this session's work (the strip's own/ambient split already says so).
 		const out = lines.join("\n");
@@ -397,7 +397,7 @@ describe("timeline rows without kernel records (today's data)", () => {
 		);
 		const lines = openEvents(turn);
 		const step = lines.find((line) => line.includes("读取 config.toml")) ?? "";
-		expect(step).toMatch(/^ {9}│ {11}✗ {2}读取 config\.toml 出错：FileNotFoundError.* 出错了 {4}$/);
+		expect(step).toMatch(/^ {9}│ {11}✗ {2}读取 config\.toml 出错：FileNotFoundError.* 出错了 {2}$/);
 		expect(lines.join("\n")).not.toContain("✓  读取 config.toml");
 		const raw = turn.summary.render(120).find((line) => stripAnsi(line).includes("读取 config.toml")) ?? "";
 		expect(raw).toContain(theme.fg("timelineMust", "✗"));
@@ -446,8 +446,8 @@ describe("timeline rows without kernel records (today's data)", () => {
 			false,
 		);
 		const lines = openEvents(turn);
-		expect(lines.some((line) => /^ {9}│ {11}✎ {2}src\/b\.ts\s+\+1 −1 {4}$/.test(line))).toBe(true);
-		expect(lines.some((line) => /^ {9}│ {11}✎ {2}src\/c\.ts\s+\+2 −1 {4}$/.test(line))).toBe(true);
+		expect(lines.some((line) => /^ {9}│ {11}✎ {2}src\/b\.ts\s+\+1 −1 {2}$/.test(line))).toBe(true);
+		expect(lines.some((line) => /^ {9}│ {11}✎ {2}src\/c\.ts\s+\+2 −1 {2}$/.test(line))).toBe(true);
 	});
 });
 
@@ -478,7 +478,7 @@ describe("events on the timeline", () => {
 		turn.timeline.upsertSubagent({ childId: "c1", name: "审查员·Go", status: "running", line: "在读 client.go" });
 		const running = openEvents(turn);
 		expect(
-			running.some((line) => /^ {9}│ {11}⇣ {2}整理完成：182k → 41k tokens，重要的结论都留着 +2秒 {4}$/.test(line)),
+			running.some((line) => /^ {9}│ {11}⇣ {2}整理完成：182k → 41k tokens，重要的结论都留着 +2秒 {2}$/.test(line)),
 		).toBe(true);
 		// The dispatch is one line under its event, and the spinner line says who is being waited for.
 		const dispatch = running.find((line) => line.includes("◇")) ?? "";
@@ -938,12 +938,13 @@ describe("layout", () => {
 				expect(lines.length).toBeGreaterThan(0);
 				for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 				const shown = plain(lines);
-				// Lines with words on their right edge are as wide as the screen, and those words end two columns
-				// before the edge (four for a step's result), whatever the CJK text in front of them is.
+				// Lines with words on their right edge are as wide as the screen, and those words
+				// end two columns before the edge (the step rows' own margin matches the event
+				// rows' now), whatever the CJK text in front of them is.
 				const edged = [
 					{ name: "event", line: shown.find((line) => line.includes("◆")), trailing: 2 },
 					{ name: "spinner", line: spinnerLine(shown), trailing: 2 },
-					...(open ? [{ name: "step", line: shown.find((line) => line.includes("git log")), trailing: 4 }] : []),
+					...(open ? [{ name: "step", line: shown.find((line) => line.includes("git log")), trailing: 2 }] : []),
 				];
 				expect(edged.length).toBeGreaterThan(0);
 				for (const { name, line, trailing } of edged) {
@@ -1037,7 +1038,7 @@ describe("the change strip", () => {
 		const list = text(strip.render(120));
 		expect(list).toContain("✎ a.go");
 		expect(list).toContain("另有 1 个临时文件，不算项目改动");
-		strip.activate("strip:item:file:/work/app/a.go");
+		strip.activate("strip:item:file:a.go");
 		const diff = text(strip.render(120));
 		expect(diff).toContain("− old()");
 		expect(diff).toContain("+ new()");
@@ -1206,7 +1207,7 @@ describe("replay groups a transcript the way the live view does", () => {
 		expect(lines.find((line) => line.includes("你插话"))?.trimEnd()).toBe(
 			` ${formatTimelineTime(1_300)}   ●      你插话   先别动安卓的`,
 		);
-		expect(lines.some((line) => /^ {9}│ {11}\$ {2}go list -m -u all +✓ 14 个可升级 {4}$/.test(line))).toBe(true);
+		expect(lines.some((line) => /^ {9}│ {11}\$ {2}go list -m -u all +✓ 14 个可升级 {2}$/.test(line))).toBe(true);
 	});
 
 	it("clocks a replayed turn up to its last reply, not just its last step", () => {

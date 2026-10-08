@@ -301,7 +301,7 @@ describe("every step is a line in its kind's color", () => {
 		const lines = openAll(turn);
 		const at = lineOf(lines, "$  git log --stat -100");
 		const shown = plain(lines)[at] ?? "";
-		expect(shown).toMatch(/^ {9}│ {11}\$ {2}git log --stat -100 +✓ 100 次提交 {4}$/);
+		expect(shown).toMatch(/^ {9}│ {11}\$ {2}git log --stat -100 +✓ 100 次提交 {2}$/);
 		expect(widthOf(shown)).toBe(WIDTH);
 		expect(cell(shown, "$")).toBe(21);
 		expect(lines[at]).toContain(theme.bold(theme.fg("kindCommand", "$")));
@@ -337,7 +337,7 @@ describe("every step is a line in its kind's color", () => {
 		);
 		const lines = openAll(turn);
 		const at = lineOf(lines, "npm test");
-		expect(plain(lines)[at]).toMatch(/^ {9}│ {11}[⠀-⣿] {2}npm test +\d+秒 {4}$/);
+		expect(plain(lines)[at]).toMatch(/^ {9}│ {11}[⠀-⣿] {2}npm test +\d+秒 {2}$/);
 		expect(hasFg(lines[at] ?? "", "timelineLive")).toBe(true);
 		expect(hasFg(lines[at] ?? "", "kindCommand")).toBe(false);
 		expect(hasBg(lines[at] ?? "", "kindCommandBg")).toBe(false);
@@ -469,8 +469,8 @@ describe("what hangs under a step", () => {
 		turn.summary.activate("act:c1:a");
 		const shown = plain(turn.summary.render(WIDTH));
 		const at = shown.findIndex((line, index) => index > 0 && line.includes("go test"));
-		expect(shown[at]).toMatch(/^ {9}│ {11}[⠀-⣿] {2}go test +\d+秒 {4}$/);
-		expect(shown.some((line) => /^ {9}╎ {11}在跑 {2}go test +\d+秒 {4}$/.test(line))).toBe(true);
+		expect(shown[at]).toMatch(/^ {9}│ {11}[⠀-⣿] {2}go test +\d+秒 {2}$/);
+		expect(shown.some((line) => /^ {9}╎ {11}在跑 {2}go test +\d+秒 {2}$/.test(line))).toBe(true);
 		// What an opened step says about a run in progress is its command and how long it has run.
 		expect(shown[at + 1]).toMatch(/^ {9}│ {14}go test$/);
 		expect(shown[at + 2]).toMatch(/^ {9}│ {14}时间 {2}\d\d:\d\d:\d\d · 已跑 \d+秒$/);
