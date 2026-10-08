@@ -21,6 +21,7 @@ import {
 	type AgentCronJob,
 	type AgentCronJobCancelOrigin,
 	AgentCronJobStore,
+	QUOTA_WAKE_NAVIGATION_CANCEL_ORIGIN,
 	QUOTA_WAKE_TIMER_CANCEL_ORIGIN,
 } from "./cron-jobs.js";
 import {
@@ -697,8 +698,10 @@ function restoreQuotaWakeJob(
 		return jobId;
 	}
 	// A cancelled wake stays cancelled unless navigation cancelled it, which
-	// frees the wake so returning to the parked branch can rebuild it.
-	if (host._navigationCancelledWakeJobs.has(jobId)) {
+	// frees the wake so returning to the parked branch can rebuild it. The
+	// navigation stamp is durable on the job record, so a restart reads it too;
+	// the in-memory set covers jobs cancelled before the stamp existed.
+	if (host._navigationCancelledWakeJobs.has(jobId) || job.cancelledBy === QUOTA_WAKE_NAVIGATION_CANCEL_ORIGIN) {
 		return createQuotaResumeJob(host, resumeAtMs);
 	}
 	return "user-cancelled";
@@ -718,8 +721,15 @@ export function reloadQuotaParkFromBranch(host: QuotaParkHost): void {
 	}
 	if (previous?.jobId !== undefined) {
 		// Only a wake this navigation actually cancels may be rebuilt on the way
-		// back; a wake the user cancelled in /cron stays cancelled.
-		if (resolveQuotaResumeJob(host, previous.jobId) === "cancelled") {
+		// back; a wake the user cancelled in /cron stays cancelled. The cancel the
+		// navigation performs is stamped as navigation bookkeeping, so a restore -
+		// in this process or after a restart - can tell it apart from the user's
+		// choice instead of reading an unlabelled cancel as one.
+		if (
+			resolveQuotaResumeJob(host, previous.jobId, {
+				cancelOrigin: QUOTA_WAKE_NAVIGATION_CANCEL_ORIGIN,
+			}) === "cancelled"
+		) {
 			host._navigationCancelledWakeJobs.add(previous.jobId);
 		}
 	}
@@ -782,7 +792,55 @@ export function restoreQuotaPark(host: QuotaParkHost): void {
 			// stands, and the episode ends here. A cancellation the in-process wake
 			// timer stamped is a takeover, not a choice - the probe it queued died
 			// with the process, so the park is restored below and its wake re-fires.
+			// A cancellation the navigation stamped (or that the in-memory
+			// navigation set knows) freed the wake: returning to this branch
+			// rebuilds it, the same treatment the future-scheduled branch gives,
+			// instead of reading the unlabelled cancel as the user's choice and
+			// dropping the parked task with no record at all.
+			const jobId = entry.data.jobId;
 			if (job.status === "cancelled" && job.cancelledBy !== QUOTA_WAKE_TIMER_CANCEL_ORIGIN) {
+				if (
+					job.cancelledBy !== QUOTA_WAKE_NAVIGATION_CANCEL_ORIGIN &&
+					!host._navigationCancelledWakeJobs.has(jobId)
+				) {
+					return;
+				}
+				// The store rejects a one-shot scheduled at or before now, so the
+				// rebuilt durable wake is armed a second out; the in-process timer
+				// below (already due) drives the resume immediately either way.
+				const rebuiltJobId = createQuotaResumeJob(host, Date.now() + 1_000);
+				if (rebuiltJobId !== undefined) {
+					// A rebuilt wake replaces the cancelled one: record it, so the
+					// next restore reuses this job instead of arming another one
+					// beside it.
+					try {
+						host.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
+							resumeAt: entry.data.resumeAt,
+							parkCount: entry.data.parkCount,
+							jobId: rebuiltJobId,
+							...(entry.data.quotaResumeAt !== undefined ? { quotaResumeAt: entry.data.quotaResumeAt } : {}),
+							...(entry.data.provider !== undefined ? { provider: entry.data.provider } : {}),
+							...(entry.data.wakeRetries !== undefined ? { wakeRetries: entry.data.wakeRetries } : {}),
+						});
+					} catch (error) {
+						host._reportSessionPersistFailure(error);
+					}
+				}
+				// The wake is already due, so the in-process timer drives it
+				// immediately and races the daemon's claim of the rebuilt job -
+				// the same race a live park always runs.
+				host._quotaPark = {
+					parkCount: entry.data.parkCount,
+					resumeAtMs,
+					...(entry.data.quotaResumeAt !== undefined && Number.isFinite(Date.parse(entry.data.quotaResumeAt))
+						? { quotaResumeAtMs: Date.parse(entry.data.quotaResumeAt) }
+						: {}),
+					...(rebuiltJobId !== undefined ? { jobId: rebuiltJobId } : {}),
+					timer: scheduleQuotaResumeTimer(host, resumeAtMs),
+					...(entry.data.provider !== undefined ? { provider: entry.data.provider } : {}),
+					...(entry.data.wakeRetries !== undefined ? { wakeRetries: entry.data.wakeRetries } : {}),
+				};
+				ensureQuotaParkClockCheck(host);
 				return;
 			}
 			// The job survived: restore the park WITH its count, or every restart

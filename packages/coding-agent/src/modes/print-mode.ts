@@ -145,10 +145,20 @@ async function runPrintModeWithConnectionInternal(
 			exitCode = 1;
 			leaveSessionRunning = true;
 		}
+		// R5-M25 (W8 3.1): a run that ends on a subagent failure is not a success in
+		// either output mode. The notice is diagnostics on stderr (stdout stays
+		// machine-clean); the exit code is what a CI consumer keys on, so it must not
+		// live inside the text-only branch.
+		const { primary, compactionOutcomes, rlmChildFailures } = selectHeadlessTerminalResult(
+			await connection.getMessages(),
+		);
+		if (rlmChildFailures.length > 0) {
+			for (const failure of rlmChildFailures) {
+				console.error(failure.content);
+			}
+			exitCode = 1;
+		}
 		if (mode === "text") {
-			const { primary, compactionOutcomes, rlmChildFailures } = selectHeadlessTerminalResult(
-				await connection.getMessages(),
-			);
 			if (primary?.role === "assistant") {
 				if (primary.stopReason === "error" || primary.stopReason === "aborted") {
 					console.error(primary.errorMessage || `Request ${primary.stopReason}`);
@@ -168,13 +178,19 @@ async function runPrintModeWithConnectionInternal(
 				console.error(outcome.content);
 				if (outcome.details.outcome === "failed") exitCode = 1;
 			}
-			// R5-M25: a run that ends on a subagent failure is not a success. The
-			// notice is diagnostics on stderr (stdout stays machine-clean); the exit
-			// code is what a CI consumer keys on.
-			for (const failure of rlmChildFailures) {
-				console.error(failure.content);
-				exitCode = 1;
-			}
+		} else if (rlmChildFailures.length > 0) {
+			// W8 3.1: json mode is a machine surface; the subagent failure needs a
+			// structured terminal event there (same shape family as the K3R-2
+			// rlm_quiescence_give_up run_outcome), so a CI consumer can tell it apart
+			// from a gate failure without scraping stderr.
+			writeRawStdout(
+				`${JSON.stringify({
+					type: "run_outcome",
+					reason: "rlm_child_failure",
+					failures: rlmChildFailures.map((failure) => failure.details),
+					exitCode: 1,
+				})}\n`,
+			);
 		}
 
 		const autonomousLimit = autonomousLimitReason(autonomousStatus);

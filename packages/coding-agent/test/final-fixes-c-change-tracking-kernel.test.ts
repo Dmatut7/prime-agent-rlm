@@ -37,12 +37,15 @@ describe.skipIf(python === null)("changeTracking.enabled written as a string rea
 	}
 
 	it.each([
-		'{"changeTracking":{"enabled":"false"}}',
-		'{"changeTracking":{"enabled":"off"}}',
-		'{"changeTracking":{"enabled":0}}',
+		'{"changeTracking":{"enabled":"false"},"selfRecovery":{"finishGate":false}}',
+		'{"changeTracking":{"enabled":"off"},"selfRecovery":{"finishGate":false}}',
+		'{"changeTracking":{"enabled":0},"selfRecovery":{"finishGate":false}}',
 	])(
 		"turns tracking off in the kernel for %s",
 		async (settingsJson) => {
+			// finishGate:false because a live finish gate keeps the kernel tracker
+			// installed regardless of the display setting (W8 3.2); these cases pin
+			// the string coercion, so they disable the gate to observe it.
 			expect(await trackingInKernel(settingsJson)).toContain("tracking-off");
 		},
 		120_000,

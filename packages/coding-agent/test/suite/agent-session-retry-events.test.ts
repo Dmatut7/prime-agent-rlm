@@ -1529,6 +1529,44 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.session.isQuotaParked).toBe(false);
 	});
 
+	it("restores a navigation-cancelled overdue park instead of dropping it silently", async () => {
+		const settings = parkSettings({ maxPauseMs: 2_000 });
+		const harness = await parkHarness(settings, true);
+		harness.setResponses([farReset(), fauxAssistantMessage("recovered")]);
+		await promptParked(harness, "do the work");
+		const parkedLeaf = harness.sessionManager.getLeafId()!;
+		const parkedUntil = quotaPark(harness)?.resumeAtMs ?? 0;
+
+		// Leave the parked branch: the navigation cancels the left-behind wake (no
+		// user cancel anywhere), then stay away past the wake time.
+		await harness.session.navigateTree(lastUserEntryId(harness));
+		expect(harness.session.isQuotaParked).toBe(false);
+		await vi.waitFor(
+			() => {
+				expect(Date.now()).toBeGreaterThan(parkedUntil);
+			},
+			{ timeout: 5_000 },
+		);
+
+		// Coming back after the wake time is due must restore the park (the
+		// due-past branch used to read the navigation's unlabelled cancel as the
+		// user's choice and drop the park with no record at all - quieter than
+		// wake-lost).
+		await harness.session.navigateTree(parkedLeaf);
+		expect(harness.session.isQuotaParked).toBe(true);
+		const wakeJob = readQuotaWakeJob(harness, quotaPark(harness)?.jobId);
+		expect(wakeJob?.status).toBe("active");
+
+		// The rebuilt wake drives the resume: the parked task continues instead of
+		// dying silently.
+		await vi.waitFor(() => {
+			expect([harness.session.isQuotaParked, harness.faux.state.callCount]).toEqual([false, 2]);
+		});
+		expect(getUserTexts(harness).join("\n")).toContain("<provider_quota_resumed>");
+		const outcomes = quotaEntries(harness, "provider_quota_resume").map((entry) => entry.outcome);
+		expect(outcomes).toEqual(["wake"]);
+	});
+
 	it("preserves an active goal across a quota park and resumes its continuation", async () => {
 		const harness = await parkHarness(parkSettings({ maxPauseMs: 2_000 }));
 		const completeGoal = (): AssistantMessage => {

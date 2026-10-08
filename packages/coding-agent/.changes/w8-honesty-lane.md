@@ -1,0 +1,5 @@
+- Fixed snapshot notices hiding a user's own underscore-prefixed variables (`_cache` and friends) from the compaction/restore "not saved" warnings, so a name that will silently vanish on restart is now reported.
+- Fixed json-mode print runs that ended on a subagent failure exiting 0: they now exit 1 and emit a structured `run_outcome` event with reason `rlm_child_failure`.
+- Fixed the tool-not-found breaker's terminal failure killing an active goal as an unrecoverable error: the goal is now parked with the breaker's explanation and `/goal resume` works after switching models.
+- Fixed the self-recovery finish gate losing its cell write-signal when the display-only changeTracking.enabled setting was off: a live finish gate now keeps the kernel change tracker installed regardless of the display setting.
+- Fixed a quota-parked task being silently dropped (no wake, no record) when branch navigation cancelled its wake and the wake time had already passed by the time the user returned: the park is now restored and its wake rebuilt.

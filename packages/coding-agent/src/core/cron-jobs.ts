@@ -36,7 +36,7 @@ export type AgentCronJobRuntimeKind = "top-level" | "subagent";
  * before this field existed, so an absent origin reads as a user cancel -
  * exactly what those paths always meant.
  */
-export type AgentCronJobCancelOrigin = "quota_wake_timer";
+export type AgentCronJobCancelOrigin = "quota_wake_timer" | "quota_wake_navigation";
 /**
  * Stamped by the quota park's in-process wake timer when it takes the resume
  * over from the durable job: the timer fired, cancelled the job, and queued
@@ -45,6 +45,13 @@ export type AgentCronJobCancelOrigin = "quota_wake_timer";
  * process), not honor it as a user cancellation.
  */
 export const QUOTA_WAKE_TIMER_CANCEL_ORIGIN: AgentCronJobCancelOrigin = "quota_wake_timer";
+/**
+ * Stamped by branch navigation when it cancels the left-behind leaf's wake: the
+ * cancel is bookkeeping for the branch switch, not a choice about the parked
+ * task. Returning to the parked branch (or restoring it after a restart) must
+ * rebuild the wake, not read the cancel as the user's and drop the park.
+ */
+export const QUOTA_WAKE_NAVIGATION_CANCEL_ORIGIN: AgentCronJobCancelOrigin = "quota_wake_navigation";
 export type AgentHeartbeatUpdateAction = "pause" | "resume" | "clear";
 export type AgentHeartbeatManagementAction = "pause" | "resume" | "stop";
 export type AgentRlmHeartbeatStatusUpdate = "pause" | "resume";
@@ -2699,7 +2706,9 @@ function isAgentCronJob(value: unknown): value is AgentCronJob {
 		typeof candidate.createdAt === "string" &&
 		typeof candidate.updatedAt === "string" &&
 		typeof candidate.runCount === "number" &&
-		(candidate.cancelledBy === undefined || candidate.cancelledBy === QUOTA_WAKE_TIMER_CANCEL_ORIGIN) &&
+		(candidate.cancelledBy === undefined ||
+			candidate.cancelledBy === QUOTA_WAKE_TIMER_CANCEL_ORIGIN ||
+			candidate.cancelledBy === QUOTA_WAKE_NAVIGATION_CANCEL_ORIGIN) &&
 		(candidate.lastDeferredAt === undefined || typeof candidate.lastDeferredAt === "string") &&
 		(candidate.deferCount === undefined || typeof candidate.deferCount === "number") &&
 		(candidate.deferredSince === undefined || typeof candidate.deferredSince === "string")

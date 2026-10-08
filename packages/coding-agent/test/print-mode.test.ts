@@ -438,6 +438,37 @@ describe("runPrintMode", () => {
 		expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("RLM child builder (child-2) failed"));
 	});
 
+	it("json mode exits non-zero and emits a run_outcome event on a subagent failure", async () => {
+		const failure = createRlmChildFailureMessage(
+			{ childId: "child-3", sessionName: "builder", error: "stall killed the run" },
+			456,
+		);
+		const runtimeHost = createRuntimeHost(failure);
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		output.write.mockClear();
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "json",
+		});
+
+		// W8 3.1: a run that ends on rlm_child_failure is not a success on the json
+		// surface either. A CI consumer keying on the exit code used to read it as
+		// one, and the only structured terminal event covered quiescence give-up.
+		expect(exitCode).toBe(1);
+		const outcome = output.write.mock.calls
+			.map((call) => String(call[0]))
+			.map((line) => {
+				try {
+					return JSON.parse(line) as { type?: string; reason?: string };
+				} catch {
+					return undefined;
+				}
+			})
+			.find((parsed) => parsed?.type === "run_outcome");
+		expect(outcome?.reason).toBe("rlm_child_failure");
+		expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("RLM child builder (child-3) failed"));
+	});
+
 	it("stops host-driven gate retries once gate maxRetries is exhausted", async () => {
 		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "still failing" }), {
 			enabled: true,

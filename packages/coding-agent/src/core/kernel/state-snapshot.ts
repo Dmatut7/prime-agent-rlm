@@ -39,18 +39,28 @@ export interface SnapshotDroppedName {
 }
 
 /**
- * Skip classes a healthy snapshot produces every time: leading-underscore names
- * are never persisted by convention (the bootstrap re-binds the `_prime_agent_*`
- * internals on every start), and the host-injected callable skill modules
- * (`_PrimeAgent*` wrapper classes, bound at public names like `websearch`) cannot
- * pickle and would be re-injected over a restore anyway. A write whose dropped
- * names are all these is routine, not warning-worthy.
+ * Skip classes a healthy snapshot produces every time: the bootstrap re-binds the
+ * `_prime_agent_*` internals and `_PrimeAgent*` wrapper classes on every start (and
+ * re-injects the public wrapper bindings over a restore anyway), and module-dunder
+ * names are bookkeeping present in every namespace. A write whose dropped names are
+ * all these is routine, not warning-worthy.
+ *
+ * The classification is by name, never by the drop reason: the runtime reports a
+ * user-bound leading-underscore name (`_cache = …`) with the same "private-name
+ * convention" reason the internals used to carry, and a reason-string match would
+ * hide a genuinely lost user name from every notice.
  */
-export function isExpectedSnapshotSkip(entry: SnapshotDroppedName): boolean {
+const SNAPSHOT_INTERNAL_NAME_PREFIXES = ["_prime_agent_", "_PrimeAgent", "_PRIME_AGENT_"];
+
+function isInternalSnapshotName(name: string): boolean {
 	return (
-		entry.reason === "private-name convention: leading-underscore names are not persisted" ||
-		entry.reason.includes("cannot pickle '_PrimeAgent")
+		(name.startsWith("__") && name.endsWith("__")) ||
+		SNAPSHOT_INTERNAL_NAME_PREFIXES.some((prefix) => name.startsWith(prefix))
 	);
+}
+
+export function isExpectedSnapshotSkip(entry: SnapshotDroppedName): boolean {
+	return isInternalSnapshotName(entry.name) || entry.reason.includes("cannot pickle '_PrimeAgent");
 }
 
 /** One revived name whose semantics are reduced, and the runtime's reason. */

@@ -19,6 +19,7 @@ import {
 	type GetContinuationMessagesContext,
 	isEmptyTurnRetryExhausted,
 	isServerDirectedRetryStall,
+	isToolNotFoundBreakerFailure,
 	readToolCallIdCollisions,
 	type ShouldStopAfterTurnContext,
 	type ThinkingLevel,
@@ -3533,6 +3534,16 @@ export class AgentSession {
 			// pause, not the goal's death, so the goal survives until the wake
 			// (or a spent park budget, which clears the park first) ends it.
 			if (this._quotaPark !== undefined) {
+				return;
+			}
+			// The tool-not-found breaker's terminal failure is a recoverable
+			// pause, not the goal's death: the run ended because the model kept
+			// hallucinating tool names, which switching the session to another
+			// model (or fixing the tool setup) repairs. The terminal message says
+			// exactly that, so parking the goal keeps /goal resume executable
+			// instead of leaving an error state only /goal clear can leave.
+			if (isToolNotFoundBreakerFailure(message)) {
+				this._pauseGoal(message.errorMessage || "Stopped by the tool-not-found breaker");
 				return;
 			}
 			this._finishGoalWithError(message.errorMessage || "Assistant response failed");
@@ -14524,8 +14535,17 @@ export class AgentSession {
 			// an ancestor has already lowered the subtree cap only finds out by being refused.
 			RLM_MAX_DEPTH: String(this._effectiveRlmMaxDepth()),
 			RLM_GLOBAL_HARNESS_STATE_DIR: getGlobalHarnessStateDir(),
-			// Display-only change tracking for the UI; always set, so the kernel never guesses.
-			[CHANGE_TRACKING_ENV_VAR]: this.settingsManager.getChangeTrackingEnabled() ? "1" : "0",
+			// Change tracking primarily feeds the UI, but the self-recovery finish
+			// gate also consumes it as a correctness signal: a cell's tracked
+			// fileChanges void a stale green result, and without the tracker that
+			// write-signal silently disappears (W8 3.2). A live finish gate
+			// therefore keeps the kernel tracker installed even when the display
+			// setting is off, so the gate never depends on a display-only switch.
+			// Always set, so the kernel never guesses.
+			[CHANGE_TRACKING_ENV_VAR]:
+				this.settingsManager.getChangeTrackingEnabled() || this.settingsManager.getSelfRecoverySettings().finishGate
+					? "1"
+					: "0",
 		};
 		// The kernel's harness write path reads these three at write time; settings.json is the
 		// user-facing surface, so forward the resolved values. An explicit shell export wins over

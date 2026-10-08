@@ -15,6 +15,33 @@ import { compactionKernelStateLines, restoreNoticeLines } from "../src/core/kern
 const PRIVATE_SKIP = "private-name convention: leading-underscore names are not persisted";
 
 describe("snapshot notices filter routine internal names", () => {
+	it("a user's own underscore name is reported, not filtered as routine", () => {
+		// W8 1.9: the runtime reports user-bound leading-underscore names with the
+		// same "private-name convention" reason the internals used to carry, so a
+		// reason-string filter hid them from every notice. The filter must classify
+		// by name (bootstrap prefixes, dunders), so a user's `_cache` stays visible.
+		const lines = compactionKernelStateLines({
+			snapshot: {
+				saved: ["df"],
+				skipped: [{ name: "_cache", reason: PRIVATE_SKIP }],
+				bytes: 10,
+				path: "/tmp/kernel-state.dill",
+			},
+			names: ["df"],
+		});
+		const text = lines.join("\n");
+		expect(text).toContain("_cache");
+		expect(text).toContain("private-name convention");
+
+		const restoreLines = restoreNoticeLines({
+			restored: ["kept"],
+			failed: [],
+			notSaved: [{ name: "_cache", reason: PRIVATE_SKIP }],
+			path: "/tmp/kernel-state.dill",
+		});
+		expect(restoreLines.join("\n")).toContain("_cache");
+	});
+
 	it("compaction notice omits internal skips but keeps real losses", () => {
 		const lines = compactionKernelStateLines({
 			snapshot: {

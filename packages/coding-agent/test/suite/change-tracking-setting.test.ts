@@ -17,9 +17,12 @@ describe.skipIf(python === null)("changeTracking.enabled reaches the session's k
 		vi.unstubAllEnvs();
 	});
 
-	async function trackingInKernel(enabled: boolean | undefined): Promise<string> {
+	async function trackingInKernel(settings: {
+		changeTracking?: { enabled?: boolean };
+		selfRecovery?: { finishGate?: boolean };
+	}): Promise<string> {
 		vi.stubEnv("PRIME_AGENT_KERNEL_PYTHON", python as string);
-		harness = await createHarness(enabled === undefined ? {} : { settings: { changeTracking: { enabled } } });
+		harness = await createHarness({ settings });
 		harness.setResponses([
 			fauxAssistantMessage(
 				fauxToolCall("ipython", {
@@ -35,11 +38,23 @@ describe.skipIf(python === null)("changeTracking.enabled reaches the session's k
 		return getMessageText(results[0]);
 	}
 
-	it("turns tracking off in the kernel when the setting is false", async () => {
-		expect(await trackingInKernel(false)).toContain("tracking-off");
+	it("keeps the kernel tracker installed for the finish gate when the display setting is off", async () => {
+		// W8 3.2: the finish gate reads a cell's tracked fileChanges to void stale
+		// green results. changeTracking.enabled is a display-only switch, so when
+		// the gate is on (its default) the kernel tracker must stay installed even
+		// with the display off - otherwise an unattended run's completion check
+		// silently loses its main write-signal (the cell path) and stale greens
+		// pass as evidence.
+		expect(await trackingInKernel({ changeTracking: { enabled: false } })).toContain("tracking-on");
+	}, 120_000);
+
+	it("turns tracking off in the kernel when the setting is false and no gate needs it", async () => {
+		expect(
+			await trackingInKernel({ changeTracking: { enabled: false }, selfRecovery: { finishGate: false } }),
+		).toContain("tracking-off");
 	}, 120_000);
 
 	it("leaves tracking on by default", async () => {
-		expect(await trackingInKernel(undefined)).toContain("tracking-on");
+		expect(await trackingInKernel({})).toContain("tracking-on");
 	}, 120_000);
 });
