@@ -147,6 +147,10 @@ describe("ENG-4530 IPython state restore message", () => {
 			notSaved: [
 				{ name: "cache", reason: "cannot pickle 'module' object" },
 				{ name: "_scratch", reason: "private-name convention: leading-underscore names are not persisted" },
+				{
+					name: "_prime_agent_shell",
+					reason: "private-name convention: leading-underscore names are not persisted",
+				},
 			],
 			path: "/tmp/kernel-state.dill",
 			snapshotPolicy: "preserve-names",
@@ -160,13 +164,18 @@ describe("ENG-4530 IPython state restore message", () => {
 		if (!message) {
 			throw new Error("Expected an injected IPython restore message");
 		}
-		// The routine leading-underscore skip is filtered: it fires on every healthy write and
-		// the owner can neither rebuild nor avoid it.
+		// Routine skips are classified by name, not reason (w8): the bootstrap's own
+		// internals fire on every healthy write and the owner can neither rebuild nor
+		// avoid them, so they are filtered - but a user-bound `_scratch` is a real
+		// lost name and stays in the roster (a reason-string match hid those).
 		expect(message.details).toEqual({
 			restored: true,
 			failed: ["big_df"],
 			degraded: [{ name: "helper", reason: "by-value function" }],
-			notSaved: [{ name: "cache", reason: "cannot pickle 'module' object" }],
+			notSaved: [
+				{ name: "cache", reason: "cannot pickle 'module' object" },
+				{ name: "_scratch", reason: "private-name convention: leading-underscore names are not persisted" },
+			],
 		});
 		// The model-facing content keeps its machine-block wrapper and prose unchanged.
 		const content = typeof message.content === "string" ? message.content : "";
