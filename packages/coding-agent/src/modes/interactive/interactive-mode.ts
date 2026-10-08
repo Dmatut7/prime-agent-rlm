@@ -12317,8 +12317,12 @@ export class InteractiveMode {
 					warnings: this.settingsManager.getWarnings(),
 					// The panel shows merged values but writes the global layer; mark
 					// the rows the project settings.json pins so a switch is not
-					// swallowed in silence (R4-M20).
-					projectPinnedItems: projectPinnedSettingItems(this.settingsManager.getProjectSettings()),
+					// swallowed in silence (R4-M20). Auto-compact is pinned by the
+					// compaction key its toggle would write for the serving model.
+					projectPinnedItems: projectPinnedSettingItems(
+						this.settingsManager.getProjectSettings(),
+						state.model ? `${state.model.provider}/${state.model.id}` : undefined,
+					),
 					getRows: () => this.ui.terminal.rows,
 				},
 				{

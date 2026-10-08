@@ -497,7 +497,12 @@ export class TurnTimeline implements LaneOwner {
 				this.spawnTasks.set(activity.id, activity.label);
 				continue;
 			}
-			const name = activity.status === "ok" ? activity.label.trim() : "";
+			// Key the row by the child's exact session name when the record carries
+			// one: the label is display text (blanks collapsed, secrets redacted),
+			// and a report arriving under the real name would never match a row
+			// keyed by the collapsed label - it stayed running forever (R5-M7).
+			// Records from before the kernel sent the field keep the label fallback.
+			const name = activity.status === "ok" ? (activity.name ?? activity.label).trim() : "";
 			if (!name || this.entries.some((entry) => entry.kind === "subagent" && subagentLane(entry.sub) === name)) {
 				continue;
 			}

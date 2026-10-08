@@ -1,0 +1,1 @@
+- Fixed the duty log's "last doing", "possibly unfinished" and "needs your decision" lines replaying escape sequences the model's final answer carried; the model text is now washed at the source, for the pinned block and the resume briefing alike.

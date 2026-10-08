@@ -94,6 +94,38 @@ describe("IPythonCellComponent sanitize", () => {
 		expect(stripAnsi(rows[0] ?? "")).toContain("ValueError");
 	});
 
+	it("keeps injected escapes out of the expanded error traceback rows", () => {
+		// The kernel's traceback lines carry whatever the raised exception (or the
+		// file content it echoes) contains; every other output face of the cell
+		// washes through normalizeErrorDetails, and the traceback used to be the
+		// one path that did not.
+		setToolOutputFull(true);
+		const rows = render({
+			code: "print(1)",
+			executionStarted: true,
+			argsComplete: true,
+			isError: true,
+			expanded: true,
+			details: {
+				status: "error",
+				error: {
+					ename: "SystemError",
+					evalue: "boom",
+					traceback: [
+						"Traceback (most recent call last):",
+						`  File "<cell-1>", line 1, in <module>${CLEAR}`,
+						`SystemError: boom${OSC52}${BEL}${CR}`,
+					],
+				},
+			},
+		});
+		expectNoInjection(rows);
+		const visible = rows.map((row) => stripAnsi(row)).join("\n");
+		expect(visible).toContain("Traceback (most recent call last):");
+		expect(visible).toContain('File "<cell-1>", line 1, in <module>');
+		expect(visible).toContain("SystemError: boom");
+	});
+
 	it("keeps the top row one physical row when the error name carries a newline", () => {
 		const rows = render({
 			code: "print(1)",

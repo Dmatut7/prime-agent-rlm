@@ -386,6 +386,42 @@ describe("summarizeDutyLog", () => {
 		expect(summarizeDutyLog({ entries, now: T0 + HOUR })?.lastDoing).toBe("在改 footer 第二行");
 	});
 
+	it("strips escapes the model's final answer carried from every recap line (W8 1.5)", () => {
+		// The three model-text exits the agent_status path never covers: the
+		// "last doing" fallback, the "possibly unfinished" line and the two
+		// "needs your decision" sources. A final answer echoing escape-laden
+		// file or web content must not put raw OSC 52 / BEL bytes into the
+		// block pinned above the input, which repaints on every redraw.
+		const OSC52 = `${String.fromCharCode(0x1b)}]52;c;cGFzdGU=${String.fromCharCode(0x07)}`;
+		const BEL = String.fromCharCode(0x07);
+		const CLEAR = `${String.fromCharCode(0x1b)}[2J`;
+
+		const doing = summarizeDutyLog({
+			entries: [user(0), assistant(60_000, { text: `第一步${OSC52}${BEL}好了。` })],
+			now: T0 + HOUR,
+		});
+		expect(doing?.lastDoing).toBe("第一步好了。");
+
+		const unfinished = summarizeDutyLog({
+			entries: [user(0), assistant(60_000, { text: `测试都过了${OSC52}。接下来我把文档也更新一下。` })],
+			now: T0 + HOUR,
+		});
+		expect(unfinished?.unfinished).toBe("测试都过了。接下来我把文档也更新一下。");
+
+		const pending = summarizeDutyLog({
+			entries: [
+				user(0),
+				assistant(60_000, { text: `清理做完了。旧分支 feat/x 还留着${OSC52}${CLEAR}，要不要删掉？` }),
+				dutyEvent(70_000, { kind: "decision_needed", question: `是否把结果推到远程${BEL}` }),
+			],
+			now: T0 + HOUR,
+		});
+		expect(pending?.pending.map((item) => item.question)).toEqual([
+			"旧分支 feat/x 还留着，要不要删掉？",
+			"是否把结果推到远程",
+		]);
+	});
+
 	it("ignores unknown and malformed duty entries", () => {
 		expect(parseDutyEvent({ kind: "nope" })).toBeUndefined();
 		expect(parseDutyEvent({ kind: "model_fallback" })).toBeUndefined();

@@ -120,6 +120,31 @@ describe("SettingsSelectorComponent", () => {
 		expect(rendered).toContain("项目 settings.json 固定了此项");
 	});
 
+	test("marks the auto-compact row when the project pins the key the toggle writes (W8 2.2)", () => {
+		// The /settings toggle writes compaction.perModel for the serving model
+		// (the bare compaction.enabled when none is) into the GLOBAL file, while
+		// the panel and the compaction gate read the deep-merged value: a project
+		// entry for the same key swallows the switch in silence, so the row must
+		// carry the same pinned hint as every other project-pinned item.
+		const project = { compaction: { perModel: { "anthropic/claude-x": false } } };
+		expect(projectPinnedSettingItems(project, "anthropic/claude-x").has("autocompact")).toBe(true);
+		// A different model's entry does not pin this model's switch.
+		expect(projectPinnedSettingItems(project, "openai/gpt-y").has("autocompact")).toBe(false);
+		// Without the serving model the toggle writes the bare enabled key.
+		expect(projectPinnedSettingItems({ compaction: { enabled: false } }).has("autocompact")).toBe(true);
+		expect(projectPinnedSettingItems({}).has("autocompact")).toBe(false);
+
+		const component = new SettingsSelectorComponent(
+			{ ...config, projectPinnedItems: new Set(["autocompact"]) },
+			callbacks,
+		);
+		const list = component.getSettingsList();
+		for (const character of "auto") list.handleInput(character);
+		const rendered = stripAnsi(component.render(120).join("\n"));
+		expect(rendered).toContain("自动压缩");
+		expect(rendered).toContain("项目 settings.json 固定了此项");
+	});
+
 	test("shows values in Chinese while the stored values stay unchanged", () => {
 		const onProcessModeChange = vi.fn();
 		const component = new SettingsSelectorComponent(config, { ...callbacks, onProcessModeChange });

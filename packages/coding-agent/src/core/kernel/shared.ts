@@ -335,6 +335,12 @@ export interface KernelActivity {
 	background?: boolean;
 	/** Commit id a successful `git commit` (or cherry-pick, revert) command reported. */
 	commit?: string;
+	/**
+	 * The child's exact session name on a settled `subagent` record, when the kernel recorded
+	 * one: the label is display text (blanks collapsed, secrets redacted), while lifecycle
+	 * rows key by the real name. Older records without it keep the label.
+	 */
+	name?: string;
 }
 
 /**

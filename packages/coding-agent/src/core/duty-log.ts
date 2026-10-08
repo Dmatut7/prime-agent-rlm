@@ -1,5 +1,5 @@
 import { open, stat } from "node:fs/promises";
-import { sanitizeRowText } from "../utils/display-text.js";
+import { sanitizeBlockText, sanitizeRowText } from "../utils/display-text.js";
 import { DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT } from "./autonomous.js";
 import { textAnnouncesNextStep } from "./self-recovery.js";
 
@@ -426,8 +426,13 @@ export function summarizeDutyLog(input: DutyLogInput): DutyLogSummary | undefine
 			}
 			if (stopReason === "stop" && !hasToolCall(message.content)) {
 				finishedTurns += 1;
-				const text = textOf(message.content);
-				if (text) {
+				// The final answer is provider-written text: whatever it echoed
+				// (file or web content) can carry escape sequences, and this text
+				// feeds the pending, unfinished and last-doing recaps, whose block
+				// builds its own rows. Newlines stay: the recaps below pick their
+				// line and sentence from them.
+				const text = sanitizeBlockText(textOf(message.content));
+				if (text.trim()) {
 					lastFinalText = text;
 					const question = decisionSentence(text);
 					if (question) addPending(question, at);
@@ -532,7 +537,7 @@ export function summarizeDutyLog(input: DutyLogInput): DutyLogSummary | undefine
 					incidents.add("child_silent", true);
 					break;
 				case "decision_needed":
-					addPending(preview(event.question), at);
+					addPending(preview(sanitizeRowText(event.question)), at);
 					break;
 			}
 			continue;

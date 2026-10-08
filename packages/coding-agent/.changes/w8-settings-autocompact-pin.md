@@ -1,0 +1,1 @@
+- Fixed the /settings auto-compact toggle silently not sticking when the project's settings.json pinned the same compaction key: the row now carries the same "pinned by project settings.json" hint as every other project-pinned item.

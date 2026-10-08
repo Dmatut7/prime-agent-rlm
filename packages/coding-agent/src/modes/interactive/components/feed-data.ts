@@ -101,6 +101,7 @@ function readActivity(value: unknown): KernelActivity | undefined {
 	const detail = stringField(value, "detail");
 	const endedAt = numberField(value, "endedAt");
 	const commit = stringField(value, "commit");
+	const name = stringField(value, "name");
 	return {
 		id,
 		kind,
@@ -111,6 +112,7 @@ function readActivity(value: unknown): KernelActivity | undefined {
 		...(endedAt !== undefined ? { endedAt } : {}),
 		...(value.background === true ? { background: true as const } : {}),
 		...(commit !== undefined && /^[0-9a-f]{7,40}$/i.test(commit) ? { commit } : {}),
+		...(name !== undefined && name.length > 0 ? { name } : {}),
 	};
 }
 

@@ -137,6 +137,7 @@ export function parseActivityDisplay(payload: unknown): KernelActivity | undefin
 	const detail = optionalString(payload.detail);
 	const endedAt = count(payload.endedAt);
 	const commit = typeof payload.commit === "string" && COMMIT_ID.test(payload.commit) ? payload.commit : undefined;
+	const name = typeof payload.name === "string" && payload.name.length > 0 ? payload.name : undefined;
 	return {
 		id: payload.id,
 		kind: payload.kind,
@@ -147,6 +148,7 @@ export function parseActivityDisplay(payload: unknown): KernelActivity | undefin
 		...(endedAt !== undefined ? { endedAt } : {}),
 		...(payload.background === true ? { background: true } : {}),
 		...(commit !== undefined ? { commit } : {}),
+		...(name !== undefined ? { name } : {}),
 	};
 }
 

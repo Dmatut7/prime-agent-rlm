@@ -118,6 +118,18 @@ describe("change-tracking display payloads", () => {
 		expect(parseActivityDisplay(background)).toEqual(background);
 		// Only a real flag and a real commit id survive.
 		expect(parseActivityDisplay({ ...command, background: "yes", commit: "not-a-sha" })).toEqual(command);
+		// A settled subagent record keeps the child's exact session name (R5-M7):
+		// the label is display text, lifecycle rows key by the real name.
+		const spawn: KernelActivity = {
+			...command,
+			kind: "subagent",
+			status: "ok",
+			label: "build checker",
+			name: "build  checker",
+		};
+		expect(parseActivityDisplay(spawn)).toEqual(spawn);
+		expect(parseActivityDisplay({ ...spawn, name: 7 })).toEqual({ ...spawn, name: undefined });
+		expect(parseActivityDisplay({ ...spawn, name: "" })).toEqual({ ...spawn, name: undefined });
 	});
 
 	it("keeps the withheld-secret markers through to a cell's result fields, and never a withheld text", () => {

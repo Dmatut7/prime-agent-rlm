@@ -71,10 +71,11 @@ export function formatSettingValue(value: string): string {
  * key used to swallow the switch in silence: the write succeeded, the row
  * changed colour, and the next launch showed the project value again. The
  * panel marks these items so the user can see why a switch does not stick.
- * Session-state items (auto-compact, thinking level) have no settings.json
- * key and are never in this set.
+ * The auto-compact switch is pinned by the compaction key its toggle would
+ * write for the serving model (`modelKey`, "provider/id"): the per-model
+ * entry, or the bare `compaction.enabled` when no model is in service.
  */
-export function projectPinnedSettingItems(projectSettings: Settings): Set<string> {
+export function projectPinnedSettingItems(projectSettings: Settings, modelKey?: string): Set<string> {
 	const pinned = new Set<string>();
 	const pin = (id: string, value: unknown) => {
 		if (value !== undefined) pinned.add(id);
@@ -104,6 +105,10 @@ export function projectPinnedSettingItems(projectSettings: Settings): Set<string
 	pin("clear-on-shrink", projectSettings.terminal?.clearOnShrink);
 	pin("terminal-progress", projectSettings.terminal?.showTerminalProgress);
 	pin("fullscreen", projectSettings.terminal?.fullscreen);
+	pin(
+		"autocompact",
+		modelKey !== undefined ? projectSettings.compaction?.perModel?.[modelKey] : projectSettings.compaction?.enabled,
+	);
 	return pinned;
 }
 

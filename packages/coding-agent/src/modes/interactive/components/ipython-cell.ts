@@ -721,7 +721,9 @@ export class IPythonCellComponent implements Component {
 			this.renderTraceback(
 				lines,
 				width,
-				details.error.traceback.join("\n") || formatIpythonErrorSummary(details.error),
+				// The kernel's traceback lines are unwashed text (whatever the raised
+				// exception echoed), like every other face this cell washes.
+				normalizeErrorDetails(details.error.traceback.join("\n")) || formatIpythonErrorSummary(details.error),
 			);
 		} else if (traceback) {
 			startOutput();
