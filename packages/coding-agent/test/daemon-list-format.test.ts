@@ -1,4 +1,5 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { describe, expect, it } from "vitest";
 import { formatSessionListTable } from "../src/cli/daemon-list-format.js";
@@ -79,3 +80,72 @@ function makeSummary(options: {
 		modified: "2026-05-29T10:00:00.000Z",
 	};
 }
+
+describe("formatSessionListTable width budget", () => {
+	const nowMs = Date.parse("2026-05-29T12:00:00.000Z");
+
+	it("keeps the full column set when no width is given", () => {
+		const table = stripAnsi(
+			formatSessionListTable(
+				[makeSummary({ name: "s", id: "aaaabbbbcccc", lifecycle: "live", activity: "idle" })],
+				nowMs,
+			),
+		);
+		expect(table.split("\n")[0]!.trim().split(/\s+/)).toEqual([
+			"name",
+			"id",
+			"status",
+			"age",
+			"model",
+			"messages",
+			"clients",
+		]);
+	});
+
+	it("drops low-priority columns to fit the terminal width, keeping name and status", () => {
+		const sessions = [
+			makeSummary({
+				name: "中文会话名",
+				id: "aaaabbbbcccc",
+				lifecycle: "live",
+				activity: "working",
+				clients: 2,
+				model: { provider: "openai-codex", id: "gpt-5.5" } as Model<Api>,
+			}),
+		];
+		const width = 40;
+		const table = stripAnsi(formatSessionListTable(sessions, nowMs, { width }));
+		const lines = table.split("\n");
+		expect(lines.length).toBeGreaterThan(1);
+		for (const line of lines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+		const header = lines[0]!.trim().split(/\s+/);
+		expect(header).toContain("name");
+		expect(header).toContain("status");
+		// Sacrificed in drop order: clients, messages, model, age, id.
+		expect(header).not.toContain("clients");
+		expect(header).not.toContain("messages");
+		expect(header).not.toContain("model");
+		expect(lines[1]).toContain("working");
+	});
+
+	it("truncates the name with an ellipsis when even the kept columns overflow", () => {
+		const sessions = [
+			makeSummary({
+				name: "a-very-long-session-name-that-cannot-fit",
+				id: "aaaabbbbcccc",
+				lifecycle: "live",
+				activity: "idle",
+			}),
+		];
+		const width = 24;
+		const table = stripAnsi(formatSessionListTable(sessions, nowMs, { width }));
+		const lines = table.split("\n");
+		for (const line of lines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+		expect(lines[1]).toContain("…");
+		expect(lines[1]).toContain("idle");
+	});
+});

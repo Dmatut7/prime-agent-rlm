@@ -1,0 +1,7 @@
+- Fixed the agents view never showing locally computed status labels (stalled, no-activity, non-ready worker), so a wedged session now reads as stalled instead of looking healthy.
+- Fixed Left in an agents-view reply discarding a typed draft: with a non-empty draft it now moves the cursor, and only an empty draft disarms the reply.
+- Fixed the agents-view reply key staying dead on a row after its delete confirmation was cancelled or expired.
+- Fixed `status` and `list` overflowing the terminal (240+ columns): both tables now drop lower-priority columns and truncate to the terminal width.
+- Fixed the block-navigation selection highlight being invisible on blocks with their own background (tool panels, user bubbles).
+- Fixed the legacy recap's changed-files total counting edits made by other windows or processes as this session's.
+- Removed the agents view row subtitle, which was computed for every row but never rendered.

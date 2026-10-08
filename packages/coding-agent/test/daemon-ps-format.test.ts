@@ -1,3 +1,4 @@
+import { visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { describe, expect, it } from "vitest";
 import { type DaemonInfo, describeShutdownTarget, formatShutdownReport } from "../src/cli/daemon-ps.js";
@@ -62,6 +63,59 @@ describe("formatDaemonListTable", () => {
 		expect(table).toContain("current");
 		expect(table).toContain("orphan-file");
 		expect(table).toContain("2h");
+	});
+
+	it("drops low-priority columns to fit the terminal width, keeping socket and status", () => {
+		// R2-M7: the padded table ran to 240+ columns on real data (socket path,
+		// buildId and executable alone exceed 80), so every terminal hard-folded it.
+		const daemons: DaemonInfo[] = [
+			{
+				socketPath: "/Users/operator/.prime/agent/daemon.sock.9f8e7d6c",
+				pid: 4242,
+				uptimeSeconds: 7200,
+				version: "0.9.1",
+				buildId: "v0.9.1-601-g2cd3456ef",
+				sessionCount: 3,
+				liveness: "live",
+				livenessEvidence: ["pid 4242", "3 sessions"],
+				status: "current",
+				isDefault: true,
+				executablePath: "/Users/operator/.local/share/prime-agent/bin/prime-agent",
+			},
+		];
+
+		const width = 80;
+		const table = stripAnsi(formatDaemonListTable(daemons, undefined, { width }));
+		const lines = table.split("\n");
+		for (const line of lines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+		const header = lines[0]!.trim().split(/\s+/);
+		expect(header).toContain("socket");
+		expect(header).toContain("status");
+		// Sacrificed in drop order: live, executable, buildId, uptime, sessions, ...
+		expect(header).not.toContain("executable");
+		expect(header).not.toContain("live");
+		expect(lines[1]).toContain("current");
+		expect(lines[1]).toContain("daemon.sock.9f8e7d6c");
+	});
+
+	it("truncates the socket with an ellipsis when even the kept columns overflow", () => {
+		const daemons: DaemonInfo[] = [
+			{
+				socketPath: "/Users/operator/.prime/agent/daemon.sock.9f8e7d6c",
+				status: "unreachable",
+				isDefault: false,
+			},
+		];
+		const width = 24;
+		const table = stripAnsi(formatDaemonListTable(daemons, undefined, { width }));
+		const lines = table.split("\n");
+		for (const line of lines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+		expect(lines[1]).toContain("…");
+		expect(lines[1]).toContain("unreachable");
 	});
 });
 

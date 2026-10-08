@@ -159,11 +159,20 @@ function extractStreamFailureParts(error: unknown): { info: StreamFailureInfo; d
 		headers?: unknown;
 		error?: unknown;
 		retryAfterMs?: unknown;
-		$metadata?: { requestId?: unknown };
+		$metadata?: { requestId?: unknown; httpStatusCode?: unknown };
 	};
 
+	// AWS SDK exceptions (Bedrock) carry the HTTP status only in
+	// $metadata.httpStatusCode; without reading it their 4xx permanent errors
+	// classified as unknown and were retried as transient.
 	const status =
-		typeof err.status === "number" ? err.status : typeof err.statusCode === "number" ? err.statusCode : undefined;
+		typeof err.status === "number"
+			? err.status
+			: typeof err.statusCode === "number"
+				? err.statusCode
+				: typeof err.$metadata?.httpStatusCode === "number"
+					? err.$metadata.httpStatusCode
+					: undefined;
 
 	// Error bodies come nested differently per SDK: Anthropic/OpenAI expose
 	// `error.error = {type|code, message}` (sometimes doubly nested).

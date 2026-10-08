@@ -1,6 +1,7 @@
 import chalk from "chalk";
 import { formatSessionDisplayId } from "../modes/daemon/daemon-session-id.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
+import { formatTable } from "./format-table.js";
 
 // Display status derived from the lifecycle + activity axes.
 type ListStatus = "working" | "idle" | "archived";
@@ -28,7 +29,11 @@ type ListRow = {
 	clients: string;
 };
 
-export function formatSessionListTable(sessions: readonly SessionSummary[], nowMs = Date.now()): string {
+export function formatSessionListTable(
+	sessions: readonly SessionSummary[],
+	nowMs = Date.now(),
+	options: { width?: number } = {},
+): string {
 	const rows = sortSessionsForList(sessions).map((session) => ({
 		name: session.sessionName ?? "",
 		id: formatSessionDisplayId(session.id),
@@ -38,7 +43,12 @@ export function formatSessionListTable(sessions: readonly SessionSummary[], nowM
 		messages: String(session.messageCount),
 		clients: String(session.attachedClients),
 	}));
-	return formatTable(["name", "id", "status", "age", "model", "messages", "clients"], rows, formatListCell);
+	return formatTable(["name", "id", "status", "age", "model", "messages", "clients"], rows, formatListCell, {
+		// Name and status are what the operator scans for; the counters go first,
+		// the resume handle (id) last.
+		width: options.width,
+		dropOrder: ["clients", "messages", "model", "age", "id"],
+	});
 }
 
 function sortSessionsForList(sessions: readonly SessionSummary[]): SessionSummary[] {
@@ -101,25 +111,4 @@ function formatSessionAge(modified: string | undefined, nowMs: number): string {
 
 function formatModelSelector(model: SessionSummary["model"]): string {
 	return model ? `${model.provider}/${model.id}` : "";
-}
-
-function formatTable<T extends Record<string, string>>(
-	columns: Array<keyof T>,
-	rows: T[],
-	formatCell?: (row: T, column: keyof T, value: string) => string,
-): string {
-	const widths = columns.map((column) =>
-		Math.max(String(column).length, ...rows.map((row) => String(row[column]).length)),
-	);
-	const lines = [columns.map((column, index) => String(column).padEnd(widths[index])).join("  ")];
-	for (const row of rows) {
-		const line = columns
-			.map((column, index) => {
-				const value = String(row[column]).padEnd(widths[index]);
-				return formatCell ? formatCell(row, column, value) : value;
-			})
-			.join("  ");
-		lines.push(line);
-	}
-	return lines.join("\n");
 }

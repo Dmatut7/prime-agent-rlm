@@ -158,13 +158,6 @@ describe("agents view row sanitization", () => {
 		expect(statusLabel).toBe("recovering");
 	});
 
-	test("washes the subtitle without dropping its separators", () => {
-		const rows = buildAgentsViewRows([makeSummary({ cwd: `/tmp/proj${CLEAR}ect\u0007` })]);
-		const subtitle = rows[0]?.subtitle ?? "";
-		expectByteClean(subtitle);
-		expect(subtitle).toBe("/tmp/project  active-1");
-	});
-
 	test("washes spawn-code rows and keeps the indentation a program reads by", () => {
 		const spawnCode = [
 			`task = sleep(60)${OSC52}`,

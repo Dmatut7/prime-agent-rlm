@@ -81,7 +81,6 @@ export interface AgentsViewRow {
 	section: AgentsViewSection;
 	summary: SessionSummary;
 	title: string;
-	subtitle: string;
 	statusLabel: string;
 	depth: number;
 	selectable: boolean;
@@ -965,15 +964,14 @@ export function resolveAgentsViewSelectionState(
 interface AgentsViewRowText {
 	summary: SessionSummary;
 	title: string;
-	subtitle: string;
 }
 
 const rowTextByRecord = new WeakMap<UnifiedSessionRecord, AgentsViewRowText>();
 
 /**
- * Row text for one record: the merged summary, its title and its subtitle.
+ * Row text for one record: the merged summary and its title.
  *
- * All three are pure functions of the record, and a record the daemon did not
+ * Both are pure functions of the record, and a record the daemon did not
  * change is carried across rebuilds, so memoizing here means only dirty rows
  * re-derive their text -- `basename(cwd)` and the title normalizing regex used to
  * run for every row of every catalog pass. Clock-dependent text stays out of the
@@ -987,7 +985,6 @@ function agentsViewRowText(record: UnifiedSessionRecord): AgentsViewRowText {
 	const text: AgentsViewRowText = {
 		summary,
 		title: getAgentsViewSessionTitle(summary),
-		subtitle: getSessionSubtitle(summary),
 	};
 	rowTextByRecord.set(record, text);
 	return text;
@@ -1001,12 +998,12 @@ export function buildAgentsViewRows(
 	recursiveRollups?: ReadonlyMap<UnifiedSessionRecord, AgentsViewRecursiveRollup>,
 	anchorSessionId?: string,
 ): AgentsViewRow[] {
-	const inputs: { summary: SessionSummary; title: string; subtitle: string; record?: UnifiedSessionRecord }[] =
-		summariesOrRecords.map((input) =>
+	const inputs: { summary: SessionSummary; title: string; record?: UnifiedSessionRecord }[] = summariesOrRecords.map(
+		(input) =>
 			isUnifiedSessionRecord(input)
 				? { ...agentsViewRowText(input), record: input }
-				: { summary: input, title: getAgentsViewSessionTitle(input), subtitle: getSessionSubtitle(input) },
-		);
+				: { summary: input, title: getAgentsViewSessionTitle(input) },
+	);
 	const scopeRoot = scope
 		? inputs.find(
 				({ summary }) =>
@@ -1020,12 +1017,11 @@ export function buildAgentsViewRows(
 	const isDirectScopeChild = (summary: SessionSummary): boolean =>
 		scopeRoot !== undefined && getParentKeys(summary).some((key) => scopeRootKeys.has(key));
 	const baseRows = inputs.map(
-		({ summary, title, subtitle, record }): MutableAgentsViewRow => ({
+		({ summary, title, record }): MutableAgentsViewRow => ({
 			kind: isSubagentSummary(summary) && !isDirectScopeChild(summary) ? "subagent" : "agent",
 			section: record?.section ?? classifyAgentsViewSession(summary),
 			summary,
 			title,
-			subtitle,
 			statusLabel: getSessionStatusLabel(summary, record?.heartbeat) + getQuietDurationLabel(summary),
 			depth: 0,
 			selectable: true,
@@ -1151,7 +1147,6 @@ function createAnswerRow(parent: AgentsViewRow, preview: string, depth: number):
 		// The preview is the subagent's last answer, verbatim model text on a row
 		// the view paints itself: one washed physical line, no escape sequences.
 		title: sanitizeRowText(preview),
-		subtitle: "",
 		statusLabel: "",
 		depth,
 		selectable: false,
@@ -1184,7 +1179,6 @@ function createSubagentSummaryRow(
 		section: parent.section,
 		summary: parent.summary,
 		title,
-		subtitle: "",
 		statusLabel: "",
 		depth,
 		selectable: true,
@@ -1265,7 +1259,6 @@ function buildSpawnCodeRows(
 		section: parent.section,
 		summary: parent.summary,
 		title: "",
-		subtitle: "",
 		statusLabel: "",
 		depth,
 		// Code rows are read-only context; selection skips over them.
@@ -1531,20 +1524,6 @@ export function getAgentsViewSessionTitle(summary: SessionSummary): string {
 		}
 	}
 	return "未命名会话";
-}
-
-function getSessionSubtitle(summary: SessionSummary): string {
-	const parts = [
-		summary.model ? `${summary.model.provider}/${summary.model.id}` : undefined,
-		summary.cwd,
-		summary.activeSessionId ?? summary.id,
-	]
-		.filter((part): part is string => part !== undefined && part.length > 0)
-		// A model id or a working directory can carry the same bytes a name can;
-		// each part is washed on its own so the two-space separators survive.
-		.map((part) => sanitizeRowText(part))
-		.filter((part) => part.length > 0);
-	return parts.join("  ");
 }
 
 function getSessionStatusLabel(summary: SessionSummary, heartbeat?: UnifiedSessionHeartbeat): string {

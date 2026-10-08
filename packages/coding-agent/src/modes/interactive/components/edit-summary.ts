@@ -159,14 +159,21 @@ export function formatFileChangeSummaryLine(
 	return truncateToWidth(`${prefix}${theme.fg("muted", path)}${suffix}`, safeWidth, "");
 }
 
+/** True when this session made the change; an `ambient` one is another window or process's work. */
+export function isSessionOwnedChange(change: Pick<FileChangeSummary, "origin">): boolean {
+	return change.origin !== "ambient";
+}
+
 export function formatTotalChangeSummary(changes: readonly FileChangeSummary[]): string {
-	const totals = changes.reduce(
+	// The recap answers "what did this session change": ambient file movements are
+	// another window's work and would inflate the counts (R2-M20).
+	const own = changes.filter(isSessionOwnedChange);
+	const totals = own.reduce(
 		(sum, change) => ({ added: sum.added + change.added, removed: sum.removed + change.removed }),
 		{ added: 0, removed: 0 },
 	);
-	const files = `改动 ${changes.length} 个文件`;
-	const onlyWithheld =
-		changes.length > 0 && changes.every((change) => change.omitted && !change.added && !change.removed);
+	const files = `改动 ${own.length} 个文件`;
+	const onlyWithheld = own.length > 0 && own.every((change) => change.omitted && !change.added && !change.removed);
 	if (onlyWithheld) return theme.fg("muted", files);
 	return `${theme.fg("muted", files)}${theme.fg("dim", " · ")}${formatChangeCounts(totals)}`;
 }

@@ -44,7 +44,6 @@ function pendingSelf(options: { pendingForMs: number; refreshInFlight: boolean }
 				section: "idle",
 				summary: rowSummary,
 				title: "fallback",
-				subtitle: "",
 				statusLabel: "",
 				depth: 0,
 				selectable: true,

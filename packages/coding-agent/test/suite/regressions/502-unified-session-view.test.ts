@@ -428,6 +428,7 @@ describe("#502 unified session view regressions", () => {
 	});
 
 	test("inactive rows give usage and age their full responsive cell", () => {
+		initTheme("dark");
 		const inactive = {
 			kind: "agent" as const,
 			section: "inactive" as const,
@@ -439,7 +440,6 @@ describe("#502 unified session view regressions", () => {
 				modified: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
 			},
 			title: "archived",
-			subtitle: "",
 			statusLabel: "inactive",
 			depth: 0,
 			selectable: true,
@@ -485,7 +485,6 @@ describe("#502 unified session view regressions", () => {
 				thinkingLevel: "high" as SessionSummary["thinkingLevel"],
 			} as SessionSummary,
 			title: "Inspect agents view",
-			subtitle: "",
 			statusLabel: "idle",
 			depth: 1,
 			selectable: true,
@@ -514,23 +513,23 @@ describe("#502 unified session view regressions", () => {
 
 		const full = render(160);
 		expect(full).toContain(
-			"Inspect agents view · prime-inference/gpt-5.6-terra:high · Investigate a variable background status",
+			"Inspect agents view · idle · prime-inference/gpt-5.6-terra:high · Investigate a variable background status",
 		);
-		const narrow = render(100);
+		const narrow = render(110);
 		expect(narrow).toContain("prime-inference/gpt-5.6-terra:high");
 		expect(narrow).not.toContain("Investigate a variable background status");
 
 		subagent.summary.summary = "";
-		expect(render(100)).toContain("Inspect agents view · prime-inference/gpt-5.6-terra:high");
+		expect(render(110)).toContain("Inspect agents view · idle · prime-inference/gpt-5.6-terra:high");
 
 		// Older daemons identify subagents through persisted linkage instead of runtimeKind.
 		subagent.summary.runtimeKind = undefined;
 		subagent.summary.rlmChildId = "effort-child";
-		expect(render(100)).toContain("Inspect agents view · prime-inference/gpt-5.6-terra:high");
+		expect(render(110)).toContain("Inspect agents view · idle · prime-inference/gpt-5.6-terra:high");
 
 		subagent.summary.thinkingLevel = "off";
 		subagent.summary.summary = "A later summary";
-		expect(render(120)).toContain("Inspect agents view · prime-inference/gpt-5.6-terra · A later summary");
+		expect(render(120)).toContain("Inspect agents view · idle · prime-inference/gpt-5.6-terra · A later summary");
 		expect(render(120)).not.toContain(":off");
 
 		expect(render(20)).toHaveLength(20);

@@ -9,6 +9,7 @@ import { matchesSessionIdSuffix } from "../modes/daemon/daemon-session-id.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import { formatSessionListTable } from "./daemon-list-format.js";
+import { getStdoutWidth } from "./stdout-wrap.js";
 
 interface ParsedDaemonClientCommand {
 	command: string;
@@ -195,7 +196,7 @@ async function runList(client: DaemonClient, args: string[], json: boolean): Pro
 		return;
 	}
 
-	console.log(formatSessionListTable(sessions));
+	console.log(formatSessionListTable(sessions, Date.now(), { width: getStdoutWidth() }));
 }
 
 function parseListArgs(args: string[]): { all: boolean } {

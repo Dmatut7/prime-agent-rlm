@@ -1077,6 +1077,47 @@ describe("AgentsViewMode", () => {
 		}
 	});
 
+	it("renders the status labels the state layer computes locally, not only wire-carried ones", () => {
+		// R2-M12: the render gate keyed on the wire fields (statusLabel /
+		// lastHeardFromAt), so a label computed from local signals - the stall
+		// watchdog, the quiet-activity marker, a non-ready worker - never painted,
+		// and a wedged session read exactly like a healthy one.
+		const rows = buildAgentsViewRows([
+			summary({
+				id: "wedged",
+				sessionId: "wedged",
+				stall: { silentMs: 125_000, thresholdMs: 60_000, inFlightTools: [] },
+			}),
+			summary({
+				id: "quiet",
+				sessionId: "quiet",
+				isStreaming: true,
+				isRunningTools: true,
+				lastActivityAt: new Date(Date.now() - 12 * 60_000).toISOString(),
+			}),
+			summary({ id: "booting", sessionId: "booting", workerState: "starting" }),
+		]);
+		const view = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, {});
+		Reflect.set(view, "rows", rows);
+
+		try {
+			const line = (sessionId: string) =>
+				stripAnsi(
+					invoke(
+						"renderRow",
+						view,
+						rows.find((row) => row.summary.sessionId === sessionId),
+						200,
+					) as string,
+				);
+			expect(line("wedged")).toContain("stalled 2m");
+			expect(line("quiet")).toContain("running tools (no activity 12m)");
+			expect(line("booting")).toContain("starting");
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
 	it("renders aligned usage columns with an explicit subagent count and drops the message count", () => {
 		const parent = summary({
 			id: "spender",
@@ -1386,6 +1427,101 @@ describe("AgentsViewMode", () => {
 			expect(confirmLine(plainRow!)).not.toContain("armed heartbeat");
 			expect(confirmLine(plainRow!)).toContain("移除");
 		} finally {
+			stopThemeWatcher();
+		}
+	});
+});
+
+describe("agents view reply draft guard and delete confirmation cleanup", () => {
+	// The mode owns the editor wiring, so these drive the real instance end to
+	// end: handleInput with the real key bytes, assertions on what the user sees.
+	const LEFT = "\x1b[D";
+	const REPLY = " ";
+	const DELETE = "\x18"; // ctrl+x
+
+	function savedRowView(): AgentsViewMode {
+		const view = new AgentsViewMode(
+			{ config: {}, uiServices: createUiServices() },
+			// A loaded-but-empty saved catalog keeps the search path from fetching.
+			{ savedCatalogLoaded: true, savedSessions: [] },
+		);
+		const saved = summary({
+			id: "saved-1",
+			activeSessionId: undefined,
+			sessionId: "saved-1-session",
+			sessionFile: "/tmp/sessions/saved-1.jsonl",
+			rosterStatus: "inactive",
+		});
+		Reflect.set(view, "rows", buildAgentsViewRows([saved]));
+		Reflect.set(view, "selectedIndex", 0);
+		return view;
+	}
+
+	function editorText(view: AgentsViewMode): string {
+		return (Reflect.get(view, "editor") as { getText(): string }).getText();
+	}
+
+	it("keeps a non-empty reply draft when Left is pressed and disarms only an empty draft", async () => {
+		const view = savedRowView();
+		try {
+			await invoke("toggleReplyTarget", view);
+			expect(Reflect.get(view, "replyTarget")).toBeDefined();
+
+			for (const ch of "draft") view.handleInput(ch);
+			expect(editorText(view)).toBe("draft");
+			view.handleInput(LEFT);
+			// The draft is the user's typed work: Left moves the cursor, it must not
+			// throw the draft away with the reply target.
+			expect(Reflect.get(view, "replyTarget")).toBeDefined();
+			expect(editorText(view)).toBe("draft");
+			const rendered = stripAnsi(view.render(160).join("\n")).replace(/\x1b_[^\x07]*\x07/g, "");
+			expect(rendered).toContain("draft");
+		} finally {
+			stopThemeWatcher();
+		}
+
+		const fresh = savedRowView();
+		try {
+			await invoke("toggleReplyTarget", fresh);
+			expect(Reflect.get(fresh, "replyTarget")).toBeDefined();
+			fresh.handleInput(LEFT);
+			expect(Reflect.get(fresh, "replyTarget")).toBeUndefined();
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
+	it("releases the row's reply key when another key cancels the delete confirmation", () => {
+		const view = savedRowView();
+		try {
+			view.handleInput(DELETE);
+			expect(Reflect.get(view, "pendingDeleteAgent")).toBeDefined();
+
+			// Left is any other key here: it cancels the confirmation without typing
+			// into the composer, and must release the pending-delete marker with it.
+			view.handleInput(LEFT);
+			expect(Reflect.get(view, "pendingDeleteAgent")).toBeUndefined();
+
+			view.handleInput(REPLY);
+			expect(Reflect.get(view, "replyTarget")).toBeDefined();
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
+	it("releases the row's reply key when the delete confirmation lapses", async () => {
+		vi.useFakeTimers();
+		try {
+			const view = savedRowView();
+			view.handleInput(DELETE);
+			expect(Reflect.get(view, "pendingDeleteAgent")).toBeDefined();
+			// State barrier: run the confirmation window's timer instead of sleeping.
+			await vi.advanceTimersByTimeAsync(2_001);
+			expect(Reflect.get(view, "pendingDeleteAgent")).toBeUndefined();
+			view.handleInput(REPLY);
+			expect(Reflect.get(view, "replyTarget")).toBeDefined();
+		} finally {
+			vi.useRealTimers();
 			stopThemeWatcher();
 		}
 	});

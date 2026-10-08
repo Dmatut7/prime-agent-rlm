@@ -266,7 +266,12 @@ import { sanitizeDisplayText } from "./components/diff-rows.js";
 import { DutyLogBlock } from "./components/duty-log-block.js";
 import { DynamicBorder } from "./components/dynamic-border.js";
 import { EarendilAnnouncementComponent } from "./components/earendil-announcement.js";
-import { type FileChangeSummary, formatTotalChangeSummary, mergeTurnFileChanges } from "./components/edit-summary.js";
+import {
+	type FileChangeSummary,
+	formatTotalChangeSummary,
+	isSessionOwnedChange,
+	mergeTurnFileChanges,
+} from "./components/edit-summary.js";
 import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
@@ -5002,11 +5007,12 @@ export class InteractiveMode {
 		this.recapContainer.clear();
 		const recap = recapLineText(this.sessionRecap, quietConversation(this));
 		// The quiet conversation's change strip under each answer already says it.
-		const showChanges = !this.isAgentStreaming() && this.agentRunFileChanges.size > 0 && !quietConversation(this);
+		// Ambient changes (another window's edits the kernel observed) are not this
+		// session's work: they never raise the line, and never enter its counts.
+		const ownChanges = [...this.agentRunFileChanges.values()].filter(isSessionOwnedChange);
+		const showChanges = !this.isAgentStreaming() && ownChanges.length > 0 && !quietConversation(this);
 		if (showChanges) {
-			this.recapContainer.addChild(
-				new TruncatedText(formatTotalChangeSummary([...this.agentRunFileChanges.values()]), 1, 0),
-			);
+			this.recapContainer.addChild(new TruncatedText(formatTotalChangeSummary(ownChanges), 1, 0));
 		}
 		if (recap) {
 			this.recapContainer.addChild(new TruncatedText(theme.fg("dim", recap), 1, 0));

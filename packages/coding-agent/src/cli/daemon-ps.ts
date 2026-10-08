@@ -1103,7 +1103,7 @@ export async function runPs(json: boolean, selection?: StopSelection): Promise<v
 		console.log("No background services found.");
 		return;
 	}
-	console.log(formatDaemonListTable(daemons, currentClientBuildIdentity()));
+	console.log(formatDaemonListTable(daemons, currentClientBuildIdentity(), { width: getStdoutWidth() }));
 	// `status` is machine-wide, but the stop commands are not. Say which rows a
 	// plain `prime-agent shutdown` would actually touch, so the two views of the
 	// machine cannot disagree about what is next on the destroy list.

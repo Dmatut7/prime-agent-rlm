@@ -111,6 +111,47 @@ describe("extractStreamFailureInfo", () => {
 		expect(extractStreamFailureInfo(awsError)).toMatchObject({ requestId: "aws_req" });
 	});
 
+	test("extracts the HTTP status from AWS SDK $metadata and classifies a 4xx as permanent", () => {
+		// R6-M1: Bedrock SDK exceptions carry the status only in
+		// $metadata.httpStatusCode; without it a ValidationException classified as
+		// "unknown" and routed into the 15-minute transient recovery wait.
+		const awsError = Object.assign(new Error("The provided model identifier is invalid"), {
+			name: "ValidationException",
+			$metadata: { requestId: "aws_req", httpStatusCode: 400 },
+		});
+		expect(extractStreamFailureInfo(awsError)).toMatchObject({
+			kind: "invalid_request",
+			providerErrorType: "ValidationException",
+			status: 400,
+			requestId: "aws_req",
+		});
+	});
+
+	test("AWS SDK $metadata status drives the classification", () => {
+		const aws = (name: string, httpStatusCode: number) =>
+			Object.assign(new Error(name), { name, $metadata: { httpStatusCode } });
+		expect(extractStreamFailureInfo(aws("AccessDeniedException", 403))).toMatchObject({
+			kind: "permission",
+			status: 403,
+		});
+		expect(extractStreamFailureInfo(aws("InternalServerException", 500))).toMatchObject({
+			kind: "server_error",
+			status: 500,
+		});
+		expect(extractStreamFailureInfo(aws("ThrottlingException", 429))).toMatchObject({
+			kind: "rate_limit",
+			status: 429,
+		});
+	});
+
+	test("an explicit status property still wins over $metadata", () => {
+		const awsError = Object.assign(new Error("conflict"), {
+			status: 409,
+			$metadata: { httpStatusCode: 500 },
+		});
+		expect(extractStreamFailureInfo(awsError).status).toBe(409);
+	});
+
 	test("falls back to classifying the message text", () => {
 		expect(extractStreamFailureInfo(new Error("provider overloaded, retry later")).kind).toBe("overloaded");
 		expect(extractStreamFailureInfo("not an error").kind).toBe("unknown");

@@ -1110,6 +1110,10 @@ export class AgentsViewMode implements Component, Focusable {
 		};
 		this.editor.onAgentsBack = () => {
 			if (this.replyTarget) {
+				// A non-empty draft is typed work: Left moves the cursor inside it
+				// instead of discarding it with the reply target. An empty draft has
+				// nothing to lose, so Left disarms the reply as before.
+				if (this.editor.getText().length > 0) return false;
 				this.setReplyTarget(undefined);
 				return true;
 			}
@@ -1550,7 +1554,9 @@ export class AgentsViewMode implements Component, Focusable {
 		this.deleteConfirmTimer = setTimeout(() => {
 			this.deleteConfirmTimer = undefined;
 			if (!this.isDeleteConfirmationVisible()) {
-				this.deleteConfirmExpiresAt = 0;
+				// A lapsed window is a cancelled one: the pending markers gate the
+				// row's reply key, so they must leave with the prompt.
+				this.clearDeleteConfirmation({ render: false });
 				this.ui.requestRender();
 			}
 		}, DELETE_CONFIRM_DURATION_MS);
@@ -1559,6 +1565,10 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private clearDeleteConfirmation(options: { render?: boolean } = {}): void {
+		// Both pending markers, always: clearing only pendingKillSubagent left
+		// pendingDeleteAgent behind, and toggleReplyTarget reads it - the row's
+		// reply key stayed dead after the confirmation was already gone.
+		this.pendingDeleteAgent = undefined;
 		this.pendingKillSubagent = undefined;
 		if (!this.deleteConfirmTimer && this.deleteConfirmExpiresAt === 0) {
 			return;
@@ -3231,12 +3241,7 @@ export class AgentsViewMode implements Component, Focusable {
 						`${rowModel.provider}/${rowModel.modelId}${row.summary.thinkingLevel && row.summary.thinkingLevel !== "off" ? `:${row.summary.thinkingLevel}` : ""}`,
 					)
 				: undefined;
-		const statusLabel =
-			!pendingDelete &&
-			!pendingKill &&
-			(row.summary.statusLabel !== undefined || row.summary.lastHeardFromAt !== undefined)
-				? row.statusLabel
-				: undefined;
+		const statusLabel = !pendingDelete && !pendingKill && row.statusLabel.length > 0 ? row.statusLabel : undefined;
 		const suffixes = [statusLabel, modelLabel, summaryText].filter(
 			(suffix): suffix is string => suffix !== undefined && suffix.length > 0,
 		);

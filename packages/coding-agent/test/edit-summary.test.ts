@@ -69,6 +69,23 @@ describe("edit summaries", () => {
 		expect(stripAnsi(line)).toBe("改动 2 个文件 · +5 −5");
 	});
 
+	test("counts only the session's own changes, not ambient ones from other windows", () => {
+		// R2-M20: the kernel reports files another window or process touched while
+		// the turn ran with origin "ambient"; the legacy recap folded their counts
+		// into this session's total (+10−2 own + +500−400 ambient read as +510−402).
+		const line = formatTotalChangeSummary([
+			{ path: "own.ts", added: 10, removed: 2 },
+			{ path: "ambient.ts", added: 500, removed: 400, origin: "ambient" },
+		]);
+		expect(stripAnsi(line)).toBe("改动 1 个文件 · +10 −2");
+		// A file this session also touched stays own even if it changed ambiently too.
+		const merged = formatTotalChangeSummary([
+			{ path: "own.ts", added: 10, removed: 2, origin: "own" },
+			{ path: "ambient.ts", added: 500, removed: 400, origin: "ambient" },
+		]);
+		expect(stripAnsi(merged)).toBe("改动 1 个文件 · +10 −2");
+	});
+
 	test("coalesces direct and IPython edits by file", () => {
 		const message = assistant([
 			{ type: "toolCall", id: "one", name: "edit", arguments: { path: "a.ts" } },

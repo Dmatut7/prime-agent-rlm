@@ -7,6 +7,7 @@ import {
 	isVisibleRow,
 } from "../src/modes/interactive/components/block-focus.js";
 import { timelineRow } from "../src/modes/interactive/components/timeline-gutter.js";
+import { theme } from "../src/modes/interactive/theme/theme.js";
 import { addCommand, addSay, plain, quietTurn, useTruecolorTheme } from "./ui-blocks-helpers.js";
 
 /**
@@ -122,5 +123,37 @@ describe("what a rendered row shows", () => {
 		// The two leading rail rows are gutter only; the event rows carry words.
 		expect(rows.slice(0, 2).every((row) => !isVisibleRow(row))).toBe(true);
 		expect(rows.slice(2).some((row) => isVisibleRow(row))).toBe(true);
+	});
+});
+
+describe("the selection background on a block that carries its own", () => {
+	// R2-M19: a focused tool panel or user bubble painted its inline `\x1b[48;…m`
+	// over the selection color and its `\x1b[49m` back to the terminal default, so
+	// the focused look covered zero cells of exactly the blocks that need it most.
+	it("keeps the selection background across the whole row", () => {
+		const paint = theme.getSelectionBackgroundColor();
+		const probe = paint("X");
+		const selectionOpen = probe.slice(0, probe.indexOf("X"));
+		const row = `\x1b[48;2;10;20;30mpanel text\x1b[49m`;
+
+		const [out] = decorateFocusedBlock([row], 30, { reveal: false });
+		expect(out).toBeDefined();
+		// The block's own background is gone: it would hide the selection.
+		expect(out).not.toContain("48;2;10;20;30");
+		// The only background reset left is the paint's own, closing the row.
+		expect(out!.indexOf("\x1b[49m")).toBe(out!.length - "\x1b[49m".length);
+		// The selection background opens the row and is restated at both spots
+		// where the block's own codes used to sit.
+		expect(out!.split(selectionOpen).length - 1).toBe(3);
+		expect(visibleWidth(out!)).toBe(30);
+		// The row's own text survives the neutralization untouched.
+		expect(plain([out!])[0]).toContain("panel text");
+	});
+
+	it("leaves rows without inline backgrounds byte-identical apart from the paint", () => {
+		const row = "plain text";
+		const [out] = decorateFocusedBlock([row], 20, { reveal: false });
+		const paint = theme.getSelectionBackgroundColor();
+		expect(out).toBe(paint(`plain text${" ".repeat(10)}`));
 	});
 });

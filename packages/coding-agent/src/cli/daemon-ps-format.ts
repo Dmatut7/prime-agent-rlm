@@ -1,6 +1,7 @@
 import chalk from "chalk";
 import { APP_NAME } from "../config.js";
 import type { DaemonInfo, DaemonStatus } from "./daemon-ps.js";
+import { formatTable } from "./format-table.js";
 
 /**
  * What this CLI knows about its own build. The human views use it to turn
@@ -132,7 +133,11 @@ type DaemonRow = {
 	executable: string;
 };
 
-export function formatDaemonListTable(daemons: readonly DaemonInfo[], client?: ClientBuildIdentity): string {
+export function formatDaemonListTable(
+	daemons: readonly DaemonInfo[],
+	client?: ClientBuildIdentity,
+	options: { width?: number } = {},
+): string {
 	const execCells = formatExecutableCells(daemons.map((daemon) => daemon.executablePath));
 	const rows = daemons.map(
 		(daemon, index): DaemonRow => ({
@@ -151,6 +156,12 @@ export function formatDaemonListTable(daemons: readonly DaemonInfo[], client?: C
 		["socket", "pid", "version", "buildId", "status", "sessions", "live", "uptime", "executable"],
 		rows,
 		formatDaemonCell,
+		// The operator reads socket+status first; everything else is sacrificed
+		// before they are, the verbose evidence columns first.
+		{
+			width: options.width,
+			dropOrder: ["live", "executable", "buildId", "uptime", "sessions", "pid", "version"],
+		},
 	);
 	// Warm pool lines appear only for daemons that actually answered
 	// get_warm_pool_stats (rev 45): a daemon that never advertised the capability
@@ -311,25 +322,4 @@ export function formatUptime(uptimeSeconds: number | undefined): string {
 		return `${days}d`;
 	}
 	return `${Math.floor(days / 7)}w`;
-}
-
-function formatTable<T extends Record<string, string>>(
-	columns: Array<keyof T>,
-	rows: T[],
-	formatCell?: (row: T, column: keyof T, value: string) => string,
-): string {
-	const widths = columns.map((column) =>
-		Math.max(String(column).length, ...rows.map((row) => String(row[column]).length)),
-	);
-	const lines = [columns.map((column, index) => String(column).padEnd(widths[index])).join("  ")];
-	for (const row of rows) {
-		const line = columns
-			.map((column, index) => {
-				const value = String(row[column]).padEnd(widths[index]);
-				return formatCell ? formatCell(row, column, value) : value;
-			})
-			.join("  ");
-		lines.push(line);
-	}
-	return lines.join("\n");
 }

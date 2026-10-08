@@ -82,6 +82,13 @@ export function blockNavigationKeysText(): string {
 /** Trailing spaces, with any styling escapes that follow them kept. */
 const TRAILING_PADDING = / +((?:\x1b\[[0-9;]*m)*)$/;
 
+/**
+ * The inline background codes a rendered block row can carry: an SGR background
+ * set (`\x1b[48;…m`, 256-color or truecolor) and the background reset (`\x1b[49m`).
+ */
+const INLINE_BG_SET = /\x1b\[48;[0-9;]*m/g;
+const INLINE_BG_RESET = /\x1b\[49m/g;
+
 /** Least columns of its own a row keeps when the hint takes the rest; a narrower terminal keeps the row whole. */
 const HINT_CUT_MIN_COLS = 4;
 
@@ -92,6 +99,13 @@ const HINT_CUT_MIN_COLS = 4;
  */
 export function decorateFocusedBlock(lines: readonly string[], width: number, state: BlockFocusState): string[] {
 	const paint = theme.getSelectionBackgroundColor();
+	// The selection background must win the whole row. A block with its own
+	// background (a tool panel, a user bubble) otherwise keeps it: an inline
+	// `48;…` set paints over the selection, and an inline `49` reset drops to the
+	// terminal default for the rest of the row. Restate the selection background
+	// where those codes sat.
+	const paintedEmpty = paint("");
+	const selectionOpen = paintedEmpty.endsWith("\x1b[49m") ? paintedEmpty.slice(0, -"\x1b[49m".length) : paintedEmpty;
 	const hint = blockFocusHint(state.toggleLabel);
 	const firstContent = lines.findIndex(isVisibleRow);
 	return lines.map((line, index) => {
@@ -110,7 +124,7 @@ export function decorateFocusedBlock(lines: readonly string[], width: number, st
 			}
 		}
 		const padded = row + " ".repeat(Math.max(0, width - visibleWidth(row)));
-		const painted = paint(padded);
+		const painted = paint(padded.replace(INLINE_BG_SET, selectionOpen).replace(INLINE_BG_RESET, selectionOpen));
 		return index === Math.max(0, firstContent) && state.reveal ? `${BLOCK_REVEAL_MARKER}${painted}` : painted;
 	});
 }

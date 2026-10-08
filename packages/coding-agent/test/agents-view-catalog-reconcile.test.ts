@@ -92,7 +92,6 @@ function rowsShape(records: readonly state.UnifiedSessionRecord[]) {
 		kind: row.kind,
 		section: row.section,
 		title: row.title,
-		subtitle: row.subtitle,
 		statusLabel: row.statusLabel,
 		depth: row.depth,
 		parentIdentity: row.parentIdentity,
