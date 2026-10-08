@@ -2,11 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
 	type AcpEventMappingState,
 	acpToolKind,
+	acpUpdatesForConnectionEvent,
 	acpUpdatesForSessionEvent,
 	bashToolCallId,
 } from "../src/modes/acp/acp-events.js";
 import { PRIME_AGENT_META_NAMESPACE } from "../src/modes/acp/acp-meta.js";
-import type { AgentConnectionSessionEvent } from "../src/modes/agent-connection/types.js";
+import type { AgentConnectionEvent, AgentConnectionSessionEvent } from "../src/modes/agent-connection/types.js";
 
 /** Real streaming shape: the discriminator is on the event, delta is a string. */
 function assistantDelta(type: "text_delta" | "thinking_delta", delta: string): AgentConnectionSessionEvent {
@@ -124,6 +125,48 @@ describe("ACP session event mapping", () => {
 		});
 	});
 
+	it("delivers ipython image output as ACP image content blocks", () => {
+		// R5-M26: the text-only mapping stripped the image payload; ACP has a
+		// native image content block, and the tool result's content array carries
+		// the bytes the kernel produced.
+		const updates = acpUpdatesForSessionEvent({
+			type: "tool_execution_end",
+			toolCallId: "call-img",
+			toolName: "ipython",
+			result: {
+				content: [
+					{ type: "text", text: "plotted" },
+					{ type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+				],
+				details: {
+					attachments: [{ mimeType: "image/png", path: "/tmp/plot.png", data: "aGVsbG8=" }],
+				},
+			},
+			isError: false,
+		} as AgentConnectionSessionEvent);
+		expect(updates[0]?.content).toEqual([
+			{ type: "content", content: { type: "text", text: "plotted" } },
+			{ type: "content", content: { type: "image", data: "aGVsbG8=", mimeType: "image/png" } },
+		]);
+		// The meta entry stays the size/path index, not a second copy of the bytes.
+		expect(updates[0]?._meta).toMatchObject({
+			[PRIME_AGENT_META_NAMESPACE]: {
+				ipython: { attachments: [{ mimeType: "image/png", path: "/tmp/plot.png", bytes: 5 }] },
+			},
+		});
+	});
+
+	it("keeps the text-only result shape when an ipython cell produced no media", () => {
+		const updates = acpUpdatesForSessionEvent({
+			type: "tool_execution_end",
+			toolCallId: "call-plain",
+			toolName: "ipython",
+			result: { content: [{ type: "text", text: "42" }] },
+			isError: false,
+		} as AgentConnectionSessionEvent);
+		expect(updates[0]?.content).toEqual([{ type: "content", content: { type: "text", text: "42" } }]);
+	});
+
 	it("omits IPython rich metadata when the cell produced none", () => {
 		const updates = acpUpdatesForSessionEvent({
 			type: "tool_execution_end",
@@ -205,6 +248,30 @@ describe("ACP session event mapping", () => {
 		} as AgentConnectionSessionEvent);
 		expect(updates[0]?._meta).toMatchObject({
 			[PRIME_AGENT_META_NAMESPACE]: { compaction: { tokensBefore: 1234, summary: "compacted" } },
+		});
+	});
+
+	it("carries compaction failure fields instead of an empty success payload", () => {
+		// R5-M24: an aborted or failed compaction used to serialize as
+		// compaction: {} - indistinguishable from success.
+		const updates = acpUpdatesForSessionEvent({
+			type: "compaction_end",
+			reason: "overflow",
+			result: undefined,
+			aborted: true,
+			willRetry: true,
+			errorMessage: "summarizer failed",
+			errorSeverity: "error",
+		} as AgentConnectionSessionEvent);
+		expect(updates[0]?._meta).toEqual({
+			[PRIME_AGENT_META_NAMESPACE]: {
+				compaction: {
+					aborted: true,
+					willRetry: true,
+					errorMessage: "summarizer failed",
+					errorSeverity: "error",
+				},
+			},
 		});
 	});
 
@@ -312,5 +379,128 @@ describe("ACP session event mapping", () => {
 		expect(acpUpdatesForSessionEvent({ type: "recap_update", recap: "x" } as AgentConnectionSessionEvent)).toEqual(
 			[],
 		);
+	});
+});
+
+describe("ACP connection event mapping", () => {
+	it("maps a quota park heartbeat so a hung prompt is visible", () => {
+		const updates = acpUpdatesForConnectionEvent({
+			type: "quota_park_status",
+			parked: true,
+			resumeAt: "2026-10-08T12:00:00.000Z",
+			remainingMs: 86_400_000,
+			parkCount: 2,
+			provider: "anthropic",
+		});
+		expect(updates[0]?.sessionUpdate).toBe("session_info_update");
+		expect(updates[0]?._meta).toEqual({
+			[PRIME_AGENT_META_NAMESPACE]: {
+				quotaPark: {
+					parked: true,
+					resumeAt: "2026-10-08T12:00:00.000Z",
+					remainingMs: 86_400_000,
+					parkCount: 2,
+					provider: "anthropic",
+				},
+			},
+		});
+	});
+
+	it("maps a park lift without optional facts", () => {
+		const updates = acpUpdatesForConnectionEvent({ type: "quota_park_status", parked: false });
+		expect(updates[0]?._meta).toEqual({
+			[PRIME_AGENT_META_NAMESPACE]: { quotaPark: { parked: false } },
+		});
+	});
+
+	it("maps daemon reconnect status including the background attempt", () => {
+		const reconnecting = acpUpdatesForConnectionEvent({
+			type: "connection_status",
+			status: "reconnecting",
+			error: "socket hang up",
+			backgroundAttempt: 3,
+		});
+		expect(reconnecting[0]?._meta).toMatchObject({
+			[PRIME_AGENT_META_NAMESPACE]: {
+				connectionStatus: { status: "reconnecting", error: "socket hang up", backgroundAttempt: 3 },
+			},
+		});
+
+		const connected = acpUpdatesForConnectionEvent({
+			type: "connection_status",
+			status: "connected",
+			daemonVersion: "0.11.20",
+		});
+		expect(connected[0]?._meta).toEqual({
+			[PRIME_AGENT_META_NAMESPACE]: { connectionStatus: { status: "connected", daemonVersion: "0.11.20" } },
+		});
+	});
+
+	it("maps session replacement and resync as staleness markers", () => {
+		// The mapper reads sessionId, sessionFile, and the message count, so the
+		// fixture state narrows to those fields (the full AgentConnectionState is
+		// irrelevant to this mapping).
+		const state = {
+			cwd: process.cwd(),
+			sessionId: "s-2",
+			sessionFile: "/tmp/s-2.jsonl",
+			messageCount: 9,
+		};
+		const replaced = acpUpdatesForConnectionEvent({
+			type: "session_replaced",
+			state,
+			messages: new Array(9).fill({ role: "user", content: "x", timestamp: 1 }),
+		} as unknown as AgentConnectionEvent);
+		expect(replaced[0]?._meta).toEqual({
+			[PRIME_AGENT_META_NAMESPACE]: {
+				sessionSync: { kind: "replaced", sessionId: "s-2", sessionFile: "/tmp/s-2.jsonl", messageCount: 9 },
+			},
+		});
+
+		const resynced = acpUpdatesForConnectionEvent({
+			type: "session_resynced",
+			snapshot: { state, messages: [] },
+		} as unknown as AgentConnectionEvent);
+		expect(resynced[0]?._meta).toEqual({
+			[PRIME_AGENT_META_NAMESPACE]: {
+				sessionSync: { kind: "resynced", sessionId: "s-2", sessionFile: "/tmp/s-2.jsonl", messageCount: 0 },
+			},
+		});
+	});
+
+	it("maps a closed connection and a daemon recap push", () => {
+		const closed = acpUpdatesForConnectionEvent({
+			type: "closed",
+			error: "Daemon reconnection failed: timeout",
+			sessionClosedReason: "killed",
+		});
+		expect(closed[0]?._meta).toEqual({
+			[PRIME_AGENT_META_NAMESPACE]: {
+				connectionClosed: { error: "Daemon reconnection failed: timeout", sessionClosedReason: "killed" },
+			},
+		});
+
+		const recap = acpUpdatesForConnectionEvent({ type: "session_status", recap: "did the thing" });
+		expect(recap[0]?._meta).toEqual({
+			[PRIME_AGENT_META_NAMESPACE]: { recap: "did the thing" },
+		});
+	});
+
+	it("returns nothing for events the mode layer already handles", () => {
+		expect(acpUpdatesForConnectionEvent({ type: "heartbeats_changed" })).toEqual([]);
+		expect(
+			acpUpdatesForConnectionEvent({
+				type: "extension_error",
+				extensionPath: "/e.ts",
+				event: "tool_call",
+				error: "boom",
+			}),
+		).toEqual([]);
+		expect(
+			acpUpdatesForConnectionEvent({
+				type: "session_event",
+				event: { type: "agent_start" } as never,
+			}),
+		).toEqual([]);
 	});
 });

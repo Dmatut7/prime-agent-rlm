@@ -6,6 +6,8 @@ import {
 	createCompactionOutcomeMessage,
 	createCustomMessage,
 	createRefinementOutcomeMessage,
+	createRlmChildFailureMessage,
+	createSessionSlashCommandMessage,
 	createSessionSlashCommandResultMessage,
 } from "../src/core/messages.js";
 import type { SessionShutdownEvent } from "../src/index.js";
@@ -235,6 +237,7 @@ describe("runPrintMode", () => {
 		expect(selectHeadlessTerminalResult([assistant, failed, malformed])).toEqual({
 			primary: assistant,
 			compactionOutcomes: [failed],
+			rlmChildFailures: [],
 		});
 	});
 
@@ -243,17 +246,50 @@ describe("runPrintMode", () => {
 			reason: "requested",
 			outcome: "skipped",
 		});
+		// Only a message that starts a new conversation unit is a barrier: a real
+		// user message, or a slash-command request. A display notice riding on the
+		// tail must not hide the answer behind it (R5-M25).
 		const barriers: AgentMessage[] = [
 			{ role: "user", content: "next request", timestamp: Date.now() },
-			createCustomMessage("extension.notice", "unrelated", true, undefined, new Date().toISOString()),
+			createSessionSlashCommandMessage({ name: "goal", args: "status", text: "/goal status" }),
 		];
 
 		for (const barrier of barriers) {
 			expect(selectHeadlessTerminalResult([createAssistantMessage({ text: "stale" }), barrier, outcome])).toEqual({
 				primary: undefined,
 				compactionOutcomes: [outcome],
+				rlmChildFailures: [],
 			});
 		}
+	});
+
+	it("selects the answer behind a trailing display notice instead of reporting none", () => {
+		const outcome = createCompactionOutcomeMessage("Requested compaction skipped", {
+			reason: "requested",
+			outcome: "skipped",
+		});
+		const notice = createCustomMessage("extension.notice", "unrelated", true, undefined, new Date().toISOString());
+		const assistant = createAssistantMessage({ text: "done" });
+
+		expect(selectHeadlessTerminalResult([assistant, notice, outcome])).toEqual({
+			primary: assistant,
+			compactionOutcomes: [outcome],
+			rlmChildFailures: [],
+		});
+	});
+
+	it("keeps a trailing subagent failure as a failure, not a hidden answer", () => {
+		const assistant = createAssistantMessage({ text: "done" });
+		const failure = createRlmChildFailureMessage(
+			{ childId: "child-1", sessionName: "reviewer", error: "tool loop" },
+			123,
+		);
+
+		expect(selectHeadlessTerminalResult([assistant, failure])).toEqual({
+			primary: assistant,
+			compactionOutcomes: [],
+			rlmChildFailures: [failure],
+		});
 	});
 
 	it("returns non-zero for failed session command results in text mode", async () => {
@@ -361,6 +397,45 @@ describe("runPrintMode", () => {
 		expect(exitCode).toBe(1);
 		expect(output.write).not.toHaveBeenCalled();
 		expect(errorSpy).toHaveBeenCalledWith("Context overflow recovery failed");
+	});
+
+	it("prints the answer behind a trailing subagent failure and exits non-zero", async () => {
+		const failure = createRlmChildFailureMessage(
+			{ childId: "child-1", sessionName: "reviewer", error: "tool loop" },
+			123,
+		);
+		const runtimeHost = createRuntimeHost([createAssistantMessage({ text: "the answer" }), failure]);
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		output.write.mockClear();
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+		});
+
+		// R5-M25: a tail notice used to swallow the answer into an empty stdout with
+		// exit 0. Now the answer prints, the failure is visible on stderr, and the
+		// run is not a success.
+		expect(exitCode).toBe(1);
+		expect(output.write).toHaveBeenCalledWith("the answer\n");
+		expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("RLM child reviewer (child-1) failed: tool loop"));
+	});
+
+	it("exits non-zero when a subagent failure is the only terminal message", async () => {
+		const failure = createRlmChildFailureMessage(
+			{ childId: "child-2", sessionName: "builder", error: "stall killed the run" },
+			456,
+		);
+		const runtimeHost = createRuntimeHost(failure);
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		output.write.mockClear();
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+		});
+
+		expect(exitCode).toBe(1);
+		expect(output.write).not.toHaveBeenCalled();
+		expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("RLM child builder (child-2) failed"));
 	});
 
 	it("stops host-driven gate retries once gate maxRetries is exhausted", async () => {

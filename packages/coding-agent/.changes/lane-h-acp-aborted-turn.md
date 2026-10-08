@@ -1,0 +1,1 @@
+- Fixed ACP mode reporting a turn killed by the stall watchdog as a normal `end_turn`; the prompt request now fails with the abort reason, matching print and headless mode.

@@ -1,0 +1,1 @@
+- Fixed `prime-agent -p` silently printing an empty answer and exiting 0 when a subagent failure or other trailing notice sat at the end of the transcript; the answer behind the notice now prints, the failure goes to stderr, and the exit code is non-zero.

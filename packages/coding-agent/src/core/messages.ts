@@ -547,6 +547,21 @@ export function createRlmChildFailureMessage(
 }
 
 /**
+ * Recognizes an RLM child failure report (R5-M25). The tail-scan that picks the
+ * headless terminal result skips these messages, so a transcript written before
+ * the guard existed (or by a foreign tool) still classifies by envelope alone.
+ */
+export function isRlmChildFailureMessage(message: unknown): message is CustomMessage<RlmChildFailureDetails> {
+	if (!isRecord(message) || !hasValidCustomMessageEnvelope(message, RLM_CHILD_FAILURE_CUSTOM_TYPE)) return false;
+	if (!isRecord(message.details)) return false;
+	return (
+		typeof message.details.childId === "string" &&
+		typeof message.details.sessionName === "string" &&
+		typeof message.details.error === "string"
+	);
+}
+
+/**
  * Facts behind a parent-facing "this child is still silent" notice. The notice is
  * informational: it exists so a long silence reaches the parent as a signal, and
  * the parent - not the watchdog - decides whether the work is genuine or wedged.

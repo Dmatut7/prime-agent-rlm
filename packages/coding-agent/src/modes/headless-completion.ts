@@ -7,13 +7,13 @@ import {
 	buildAutonomousGateFailureContinuation,
 } from "../core/autonomous.js";
 import {
-	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CompactionOutcomeMessage,
-	HARNESS_DIGEST_CUSTOM_TYPE,
+	type CustomMessage,
 	isCompactionOutcomeMessage,
+	isRlmChildFailureMessage,
+	isSessionSlashCommandMessage,
 	isSessionSlashCommandResultMessage,
-	REFINEMENT_NOTICE_CUSTOM_TYPE,
-	REFINEMENT_OUTCOME_CUSTOM_TYPE,
+	type RlmChildFailureDetails,
 	type SessionSlashCommandResultMessage,
 } from "../core/messages.js";
 
@@ -26,11 +26,18 @@ export type HeadlessTerminalResultMessage = AssistantMessage | SessionSlashComma
 export interface HeadlessTerminalResult {
 	primary?: HeadlessTerminalResultMessage;
 	compactionOutcomes: CompactionOutcomeMessage[];
+	/**
+	 * Subagent failure reports in the terminal suffix (R5-M25): such a notice is
+	 * never the saved final output, but a run that ends on one is not a success
+	 * either, so callers fail the run instead of reporting an empty answer.
+	 */
+	rlmChildFailures: CustomMessage<RlmChildFailureDetails>[];
 }
 
 export function selectHeadlessTerminalResult(messages: readonly AgentMessage[]): HeadlessTerminalResult {
 	let index = messages.length - 1;
 	const compactionOutcomes: CompactionOutcomeMessage[] = [];
+	const rlmChildFailures: CustomMessage<RlmChildFailureDetails>[] = [];
 	while (index >= 0) {
 		const message = messages[index];
 		if (isCompactionOutcomeMessage(message)) {
@@ -38,20 +45,20 @@ export function selectHeadlessTerminalResult(messages: readonly AgentMessage[]):
 			index--;
 			continue;
 		}
-		// A corrupt outcome is still part of the terminal outcome suffix. Skip it
-		// without letting it hide earlier valid outcomes or their failure status.
-		// The boundary-injected harness digest is skipped for the same reason: a
-		// resume appends it at the tail, and it is never the saved final output.
-		// The refinement-notice vocabulary is skipped as defense in depth: this
-		// fork has no producer for it, but a journal written by an upstream build
-		// could carry one, and a notice is never the saved final output either.
-		if (
-			message.role === "custom" &&
-			(message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE ||
-				message.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE ||
-				message.customType === HARNESS_DIGEST_CUSTOM_TYPE ||
-				message.customType === REFINEMENT_NOTICE_CUSTOM_TYPE)
-		) {
+		if (message.role === "custom") {
+			// A slash-command request starts a new conversation unit the way a user
+			// message does, so the answer behind it is stale; its result, by
+			// contrast, is itself a possible primary and must stop the scan.
+			if (isSessionSlashCommandMessage(message) || isSessionSlashCommandResultMessage(message)) break;
+			// Any other custom message is a notice riding on the tail: a subagent
+			// failure or terminal notice, an extension notice, the boundary-injected
+			// harness digest, a refinement outcome, or a corrupt outcome record.
+			// None of them is ever the saved final output, so skipping them cannot
+			// fabricate output - it only stops them from hiding the answer behind
+			// them. Letting an unknown custom type break the scan instead was the
+			// R5-M25 bug: an empty stdout read as success. Subagent failures are
+			// collected so the run can fail on them.
+			if (isRlmChildFailureMessage(message)) rlmChildFailures.unshift(message);
 			index--;
 			continue;
 		}
@@ -62,7 +69,7 @@ export function selectHeadlessTerminalResult(messages: readonly AgentMessage[]):
 		precedingMessage?.role === "assistant" || isSessionSlashCommandResultMessage(precedingMessage)
 			? precedingMessage
 			: undefined;
-	return { primary, compactionOutcomes };
+	return { primary, compactionOutcomes, rlmChildFailures };
 }
 
 function shouldContinueAutonomousGates(status: AgentAutonomousStatus): boolean {

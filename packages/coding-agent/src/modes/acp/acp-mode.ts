@@ -17,7 +17,7 @@ import type {
 	AgentConnectionSessionInputPause,
 } from "../agent-connection/types.js";
 import { latestAutonomousGateAttempt } from "../headless-completion.js";
-import { type AcpEventMappingState, acpUpdatesForSessionEvent } from "./acp-events.js";
+import { type AcpEventMappingState, acpUpdatesForConnectionEvent, acpUpdatesForSessionEvent } from "./acp-events.js";
 import { resolveAcpMcpServers } from "./acp-mcp.js";
 import { PRIME_AGENT_META_NAMESPACE, type PrimeAgentAutonomousMeta, primeAgentMeta } from "./acp-meta.js";
 import { type AcpStopReason, acpStopReason } from "./acp-stop-reason.js";
@@ -448,8 +448,13 @@ async function turnFailure(connection: AgentConnection, boundary: TurnBoundary):
 		// The newest assistant message predates the turn, so the turn appended none.
 		if (isPreTurn(message, boundary)) return undefined;
 		const assistant = message as { stopReason?: string; errorMessage?: string };
-		if (assistant.stopReason !== "error") return undefined;
-		return assistant.errorMessage || "the model request failed";
+		// An aborted turn (stall watchdog, host-initiated kill) is a failure here
+		// the same way an errored one is - headless and print mode already treat
+		// both (R5-M23), and reporting a watchdog kill as a normal end_turn was
+		// the bug. Client-requested cancels never reach this read: the prompt
+		// handler returns "cancelled" before consulting the transcript.
+		if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") return undefined;
+		return assistant.errorMessage || `Request ${assistant.stopReason}`;
 	}
 	return undefined;
 }
@@ -807,7 +812,17 @@ export async function runAcpModeWithConnection(
 						);
 						return;
 					}
-					if (event.type !== "session_event") return;
+					if (event.type !== "session_event") {
+						// Connection-level events are connection-scoped, like heartbeats,
+						// so they also use origin turn 0. They used to be dropped
+						// wholesale: a quota park (up to 24h) left an in-flight prompt
+						// hanging with zero signal, and a daemon restart left the
+						// client's state stale forever (R5-M22).
+						for (const update of acpUpdatesForConnectionEvent(event)) {
+							void producer.publish(update, 0, "event");
+						}
+						return;
+					}
 					if (event.event.type === "rlm_child_update") {
 						observedChildren.set(event.event.child.id, event.event.child);
 					}

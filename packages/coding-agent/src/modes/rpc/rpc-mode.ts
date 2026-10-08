@@ -172,7 +172,17 @@ async function runRpcModeWithConnectionInternal(
 		}
 		if (event.type === "closed") {
 			void shutdown(event.error ? 1 : 0);
+			return;
 		}
+		// Every other connection-level event (quota-park heartbeats, daemon
+		// reconnect status, session replacement/resync, recap, heartbeat catalog
+		// changes) is forwarded verbatim as a JSON line instead of being dropped
+		// (R5-M22): without it a parked quota (up to 24h) or a daemon restart
+		// leaves the RPC consumer holding stale state with no signal. The `type`
+		// field discriminates these from session events the same way the daemon
+		// wire does, and unknown future event types pass through for the same
+		// reason.
+		outputConnectionEvent(event);
 	});
 
 	const cancelPendingExtensionUi = async () => {

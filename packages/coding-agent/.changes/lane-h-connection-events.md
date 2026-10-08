@@ -1,0 +1,1 @@
+- Fixed RPC and ACP modes silently dropping all connection-level events; quota-park heartbeats, daemon reconnect status, and session replacement/resync markers now reach the consumer instead of leaving a hung prompt or stale state with no signal.

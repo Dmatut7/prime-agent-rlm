@@ -101,6 +101,52 @@ export interface PrimeAgentStallWatchdogMeta {
 	diagnostics?: string[];
 }
 
+/**
+ * Quota-park heartbeat (R5-M22). Mirrors the daemon snapshot's quotaPark field
+ * names exactly, so one client-side shape reads both the attach snapshot and
+ * the live heartbeat stream.
+ */
+export interface PrimeAgentQuotaParkMeta {
+	/** True while the session is parked on a provider usage reset. */
+	parked: boolean;
+	/** ISO wake time of the active park. */
+	resumeAt?: string;
+	/** Milliseconds until resumeAt, clamped at 0 while the wake is firing. */
+	remainingMs?: number;
+	/** How many times this session has parked in the current episode. */
+	parkCount?: number;
+	/** Provider whose usage limit caused the park. */
+	provider?: string;
+}
+
+/** Daemon connection recovery status, as the connection layer reports it. */
+export interface PrimeAgentConnectionStatusMeta {
+	status: "reconnecting" | "connected";
+	error?: string;
+	/** 1-based attempt count while the low-speed background retry runs. */
+	backgroundAttempt?: number;
+	/** App version of the restarted daemon once recovery re-attached. */
+	daemonVersion?: string;
+}
+
+/**
+ * The backing session changed underneath the client: replaced by request, or
+ * re-synced after a daemon restart. Any local view built from earlier events is
+ * stale from this point; the counts say how big the replacement is.
+ */
+export interface PrimeAgentSessionSyncMeta {
+	kind: "replaced" | "resynced";
+	sessionId: string;
+	sessionFile?: string;
+	messageCount: number;
+}
+
+/** The connection to the daemon is gone (reconnect budget spent, session closed). */
+export interface PrimeAgentConnectionClosedMeta {
+	error?: string;
+	sessionClosedReason?: string;
+}
+
 export interface PrimeAgentQuiescenceMeta {
 	/** Subagents that have not reached a terminal state at the observation point. */
 	outstandingSubagents: number;
@@ -166,7 +212,27 @@ export interface PrimeAgentSessionMeta {
 	sessionId?: string;
 	rlmDepth?: number;
 	rlmMaxDepth?: number;
-	compaction?: { tokensBefore?: number; summary?: string };
+	compaction?: {
+		tokensBefore?: number;
+		summary?: string;
+		/** Compaction ended without applying a summary (aborted or failed). */
+		aborted?: boolean;
+		/** The daemon will retry the compaction (reason "overflow"). */
+		willRetry?: boolean;
+		/** Why the compaction failed; present on failed/errored outcomes. */
+		errorMessage?: string;
+		errorSeverity?: "warning" | "error";
+	};
+	/** Live quota-park heartbeat; field names mirror the attach snapshot's quotaPark. */
+	quotaPark?: PrimeAgentQuotaParkMeta;
+	/** Daemon connection recovery in progress or re-established. */
+	connectionStatus?: PrimeAgentConnectionStatusMeta;
+	/** The backing session was replaced or re-synced; local views are stale. */
+	sessionSync?: PrimeAgentSessionSyncMeta;
+	/** The daemon connection closed (reconnect budget spent or session closed). */
+	connectionClosed?: PrimeAgentConnectionClosedMeta;
+	/** Session recap, as the daemon pushes it outside session events. */
+	recap?: string;
 	subagents?: PrimeAgentSubagentMeta[];
 	autonomous?: PrimeAgentAutonomousMeta;
 	/** Observed subagent and autonomous-continuation counts at completion. */

@@ -1,6 +1,6 @@
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 import { formatStallDiagnosticsLines } from "../../core/stall-diagnostics-render.js";
-import type { AgentConnectionSessionEvent } from "../agent-connection/types.js";
+import type { AgentConnectionEvent, AgentConnectionSessionEvent } from "../agent-connection/types.js";
 import type { PrimeAgentIpythonMeta, PrimeAgentSessionMeta } from "./acp-meta.js";
 import { primeAgentMeta } from "./acp-meta.js";
 
@@ -92,11 +92,13 @@ function toolResultText(result: unknown): string | undefined {
 }
 
 /**
- * Rich kernel output that ACP has no content type for.
+ * Rich kernel output that ACP has no native update kind for.
  *
- * The ipython tool reports media and diffs under `details` (images additionally
- * ride along as ACP image content blocks); mirror those exact fields rather than
- * inventing a MIME bundle the tool never produces.
+ * The ipython tool reports media and diffs under `details`; this mapping mirrors
+ * those fields (media as decoded byte sizes and paths, diffs as a count) rather
+ * than inventing a MIME bundle the tool never produces. The image bytes
+ * themselves travel as ACP image content blocks - see ipythonImageBlocks, which
+ * is the only place a client can actually see them.
  */
 function ipythonRichOutput(result: unknown): PrimeAgentIpythonMeta | undefined {
 	if (!result || typeof result !== "object") return undefined;
@@ -108,8 +110,9 @@ function ipythonRichOutput(result: unknown): PrimeAgentIpythonMeta | undefined {
 		meta.attachments = attachments.map((attachment) => {
 			// KernelAttachment exposes mimeType, base64 `data`, and an optional path.
 			// Report the decoded size rather than a `bytes` field the kernel never
-			// sends, and never inline the payload: ACP already carries images as
-			// content blocks, so duplicating them here would bloat every update.
+			// sends, and keep the payload out of this list: the bytes ride along as
+			// image content blocks on the same update (ipythonImageBlocks), so this
+			// entry is the size/path index, not the delivery channel.
 			const typed = (attachment ?? {}) as { mimeType?: unknown; path?: unknown; data?: unknown };
 			return {
 				...(typeof typed.mimeType === "string" ? { mimeType: typed.mimeType } : {}),
@@ -120,6 +123,32 @@ function ipythonRichOutput(result: unknown): PrimeAgentIpythonMeta | undefined {
 	}
 	if (Array.isArray(diffs) && diffs.length > 0) meta.diffCount = diffs.length;
 	return meta.attachments || meta.diffCount !== undefined ? meta : undefined;
+}
+
+/**
+ * Image content blocks for the media an ipython cell produced.
+ *
+ * The tool result's `content` array is the authoritative carrier (the tool
+ * assembles `[text, ...images]` from the kernel attachments); dropping the
+ * image blocks - which the old text-only mapping did - stripped the payload
+ * with no way to recover it. ACP carries images as content blocks, so they are
+ * forwarded here 1:1 (R5-M26).
+ */
+function ipythonImageBlocks(
+	result: unknown,
+): Array<{ type: "content"; content: { type: "image"; data: string; mimeType: string } }> {
+	if (!result || typeof result !== "object") return [];
+	const content = (result as { content?: unknown }).content;
+	if (!Array.isArray(content)) return [];
+	const blocks: Array<{ type: "content"; content: { type: "image"; data: string; mimeType: string } }> = [];
+	for (const block of content) {
+		if (!block || typeof block !== "object") continue;
+		const typed = block as { type?: unknown; data?: unknown; mimeType?: unknown };
+		if (typed.type === "image" && typeof typed.data === "string" && typeof typed.mimeType === "string") {
+			blocks.push({ type: "content", content: { type: "image", data: typed.data, mimeType: typed.mimeType } });
+		}
+	}
+	return blocks;
 }
 
 /** Correlates streamed bash output and assistant chunks with their owning run or message. */
@@ -134,6 +163,113 @@ function startAssistantMessage(state: AcpEventMappingState): string {
 	state.nextAssistantMessageSequence = sequence;
 	state.activeAssistantMessageId = `prime-agent-assistant-${sequence}`;
 	return state.activeAssistantMessageId;
+}
+
+/**
+ * Translate prime-agent *connection-level* events into ACP `session/update`
+ * payloads (R5-M22).
+ *
+ * These events used to be dropped wholesale by the ACP subscription, which
+ * left a client blind to a quota park (up to 24h) while its prompt hung, and
+ * holding stale state after a daemon restart. They are connection-scoped like
+ * heartbeat changes, so the mode layer publishes them at origin turn 0.
+ */
+export function acpUpdatesForConnectionEvent(event: AgentConnectionEvent): AcpSessionUpdate[] {
+	switch (event.type) {
+		case "quota_park_status":
+			return [
+				{
+					sessionUpdate: "session_info_update",
+					_meta: primeAgentMeta({
+						quotaPark: {
+							parked: event.parked,
+							...(event.resumeAt !== undefined ? { resumeAt: event.resumeAt } : {}),
+							...(event.remainingMs !== undefined ? { remainingMs: event.remainingMs } : {}),
+							...(event.parkCount !== undefined ? { parkCount: event.parkCount } : {}),
+							...(event.provider !== undefined ? { provider: event.provider } : {}),
+						},
+					}),
+				},
+			];
+
+		case "connection_status":
+			return [
+				{
+					sessionUpdate: "session_info_update",
+					_meta: primeAgentMeta({
+						connectionStatus: {
+							status: event.status,
+							...(event.error !== undefined ? { error: event.error } : {}),
+							...(event.backgroundAttempt !== undefined ? { backgroundAttempt: event.backgroundAttempt } : {}),
+							...(event.daemonVersion !== undefined ? { daemonVersion: event.daemonVersion } : {}),
+						},
+					}),
+				},
+			];
+
+		case "session_status":
+			return [
+				{
+					sessionUpdate: "session_info_update",
+					_meta: primeAgentMeta({ ...(event.recap !== undefined ? { recap: event.recap } : {}) }),
+				},
+			];
+
+		case "session_replaced":
+			return [
+				{
+					sessionUpdate: "session_info_update",
+					_meta: primeAgentMeta({
+						sessionSync: {
+							kind: "replaced",
+							sessionId: event.state.sessionId,
+							...(event.state.sessionFile !== undefined ? { sessionFile: event.state.sessionFile } : {}),
+							messageCount: event.messages.length,
+						},
+					}),
+				},
+			];
+
+		case "session_resynced":
+			return [
+				{
+					sessionUpdate: "session_info_update",
+					_meta: primeAgentMeta({
+						sessionSync: {
+							kind: "resynced",
+							sessionId: event.snapshot.state.sessionId,
+							...(event.snapshot.state.sessionFile !== undefined
+								? { sessionFile: event.snapshot.state.sessionFile }
+								: {}),
+							messageCount: event.snapshot.messages.length,
+						},
+					}),
+				},
+			];
+
+		case "closed":
+			return [
+				{
+					sessionUpdate: "session_info_update",
+					_meta: primeAgentMeta({
+						connectionClosed: {
+							...(event.error !== undefined ? { error: event.error } : {}),
+							...(event.sessionClosedReason !== undefined
+								? { sessionClosedReason: event.sessionClosedReason }
+								: {}),
+						},
+					}),
+				},
+			];
+
+		default:
+			// session_event has a dedicated mapper; heartbeats_changed,
+			// extension_error, and extension_ui_request have dedicated handlers in
+			// the mode layer; side_question_event cannot fire on an ACP connection
+			// (ACP exposes no side-question API, and the daemon routes side
+			// questions only to the client that started them).
+			return [];
+	}
 }
 
 export function acpUpdatesForSessionEvent(
@@ -172,13 +308,19 @@ export function acpUpdatesForSessionEvent(
 
 		case "tool_execution_end": {
 			const text = toolResultText(event.result);
-			const rich = event.toolName === IPYTHON_TOOL_NAME ? ipythonRichOutput(event.result) : undefined;
+			const isIpython = event.toolName === IPYTHON_TOOL_NAME;
+			const images = isIpython ? ipythonImageBlocks(event.result) : [];
+			const rich = isIpython ? ipythonRichOutput(event.result) : undefined;
 			return [
 				{
 					sessionUpdate: "tool_call_update",
 					toolCallId: event.toolCallId,
 					status: (event.isError ? "failed" : "completed") satisfies AcpToolStatus,
-					...(text ? { content: [{ type: "content", content: textContent(text) }] } : {}),
+					...(text || images.length > 0
+						? {
+								content: [...(text ? [{ type: "content", content: textContent(text) }] : []), ...images],
+							}
+						: {}),
 					...(rich ? { _meta: primeAgentMeta({ ipython: rich }) } : {}),
 				},
 			];
@@ -222,6 +364,9 @@ export function acpUpdatesForSessionEvent(
 		// Compaction, subagents, goals and recaps have no ACP equivalent: surface
 		// them as namespaced metadata rather than distorting a standard update.
 		case "compaction_end":
+			// R5-M24: aborted/willRetry/errorMessage/errorSeverity travel with the
+			// outcome - a failed compaction reported as an empty success payload
+			// was indistinguishable from a completed one.
 			return [
 				{
 					sessionUpdate: "session_info_update",
@@ -229,6 +374,10 @@ export function acpUpdatesForSessionEvent(
 						compaction: {
 							tokensBefore: event.result?.tokensBefore,
 							summary: event.result?.summary,
+							aborted: event.aborted,
+							willRetry: event.willRetry,
+							...(event.errorMessage !== undefined ? { errorMessage: event.errorMessage } : {}),
+							...(event.errorSeverity !== undefined ? { errorSeverity: event.errorSeverity } : {}),
 						},
 					}),
 				},

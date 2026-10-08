@@ -64,7 +64,7 @@ Session activity arrives as `session/update` notifications:
 | tool finishes | `tool_call_update` (`completed` / `failed`) |
 | shell output | `tool_call` plus incremental `tool_call_update` |
 
-The Python REPL is Prime Agent's model-facing tool, so a cell is a `tool_call` of kind `execute` whose `rawInput` carries the cell source.
+The Python REPL is Prime Agent's model-facing tool, so a cell is a `tool_call` of kind `execute` whose `rawInput` carries the cell source. Media a cell produces (plots, screenshots) is delivered as standard image content blocks on the cell's `tool_call_update`, so any ACP client can render it; the `_meta` entry additionally reports decoded byte sizes and source paths.
 
 ## Prime Agent extensions
 
@@ -82,6 +82,8 @@ Prime Agent has capabilities ACP has no field for: subagents, autonomous quality
 ```
 
 A standard ACP client ignores `_meta` entirely and still works. A Prime Agent-aware client, or a harness that cares about subagent trees and gate attempts, reads it. Nothing non-standard is ever added to an ACP object root, which the protocol reserves for future fields.
+
+Connection-level facts also arrive as `_meta` on `session_info_update` (origin turn 0): `quotaPark` (park heartbeats while a prompt is parked on a provider usage reset, field names mirroring the attach snapshot), `connectionStatus` (daemon reconnect in progress or re-established), `sessionSync` (the backing session was replaced or re-synced, so an event-built view is stale), `connectionClosed` (the daemon connection is gone), and `recap`.
 
 ## Stop reasons
 

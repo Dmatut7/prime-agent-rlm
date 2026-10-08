@@ -146,7 +146,9 @@ async function runPrintModeWithConnectionInternal(
 			leaveSessionRunning = true;
 		}
 		if (mode === "text") {
-			const { primary, compactionOutcomes } = selectHeadlessTerminalResult(await connection.getMessages());
+			const { primary, compactionOutcomes, rlmChildFailures } = selectHeadlessTerminalResult(
+				await connection.getMessages(),
+			);
 			if (primary?.role === "assistant") {
 				if (primary.stopReason === "error" || primary.stopReason === "aborted") {
 					console.error(primary.errorMessage || `Request ${primary.stopReason}`);
@@ -165,6 +167,13 @@ async function runPrintModeWithConnectionInternal(
 			for (const outcome of compactionOutcomes) {
 				console.error(outcome.content);
 				if (outcome.details.outcome === "failed") exitCode = 1;
+			}
+			// R5-M25: a run that ends on a subagent failure is not a success. The
+			// notice is diagnostics on stderr (stdout stays machine-clean); the exit
+			// code is what a CI consumer keys on.
+			for (const failure of rlmChildFailures) {
+				console.error(failure.content);
+				exitCode = 1;
 			}
 		}
 

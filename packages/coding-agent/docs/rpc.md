@@ -806,6 +806,14 @@ Events are streamed to stdout as JSON lines during agent operation. Events do NO
 | `auto_retry_start` | Auto-retry begins (after transient error) |
 | `auto_retry_end` | Auto-retry completes (success or final failure) |
 | `extension_error` | Extension threw an error |
+| `quota_park_status` | Quota-park heartbeat: the session is parked on a provider usage reset (`parked`, `resumeAt`, `remainingMs`, `parkCount`, `provider`) |
+| `connection_status` | Daemon connection lost/recovered (`status` `"reconnecting"`/`"connected"`, optional `error`, `backgroundAttempt`, `daemonVersion`) |
+| `session_resynced` | Daemon re-attached and resent state; a locally cached view is stale (`snapshot`) |
+| `session_replaced` | The backing session was replaced (`state`, `messages`) |
+| `session_status` | Session recap changed (`recap`) |
+| `heartbeats_changed` | Heartbeat/cron schedule catalog changed |
+
+Connection-level events use the same `type` discriminator as session events and are forwarded verbatim; unknown future event types pass through unchanged. `closed` still terminates the process (exit 1 with an error, 0 without).
 
 ### agent_start
 
