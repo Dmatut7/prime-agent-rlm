@@ -1007,6 +1007,36 @@ describe("w7-render: markdown rendering in the export", () => {
 		expect(link?.textContent).toBe("cat");
 	});
 
+	it("degrades single-slash and colon-only scheme image URLs that browsers normalize to https://", () => {
+		// WHATWG URL parsing accepts 0-N slashes (and backslashes) after a special
+		// scheme: https:/host, https:host and https:/\host all load https://host.
+		// A shape regex cannot see those forms, so the verdict must come from
+		// actually parsing the src - not from a regex isomorphic to the guard
+		// (the test above shares the guard's blind spot on purpose).
+		const entries = [
+			userEntry("u1", null, "show me"),
+			assistantEntry("a1", "u1", [
+				textBlock("![a](https:/tracker.example/pixel.png) ![b](https:tracker.example/x.png)"),
+			]),
+		];
+		const h = buildHarness(entries, "a1", { realMarked: true });
+		const remote = h.messages.querySelectorAll("img").filter((img) => {
+			const src = img.getAttribute("src") ?? "";
+			try {
+				const parsed = new URL(src);
+				return parsed.protocol === "http:" || parsed.protocol === "https:" || parsed.protocol === "ftp:";
+			} catch {
+				return false;
+			}
+		});
+		expect(remote).toHaveLength(0);
+		const links = h.messages.querySelectorAll("a.image-link");
+		expect(links.map((l) => l.getAttribute("href"))).toEqual([
+			"https:/tracker.example/pixel.png",
+			"https:tracker.example/x.png",
+		]);
+	});
+
 	it("keeps local images as images", () => {
 		const entries = [
 			userEntry("u1", null, "show me"),

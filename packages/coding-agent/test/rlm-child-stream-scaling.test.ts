@@ -24,6 +24,7 @@ import {
 } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
+import { RlmChildStreamPreview } from "../src/core/rlm-child-run.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { createTestResourceLoader } from "./utilities.js";
@@ -502,5 +503,43 @@ describe("RLM child streaming parent-side cost", () => {
 		expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(preview)).toBe(false);
 		// The whole grapheme fits the budget, so it survives whole.
 		expect(preview).toContain("💥");
+	});
+
+	it("caps the streaming accumulator on a grapheme boundary, identical to compactRlmText", () => {
+		// The class contract (its doc): update() returns exactly
+		// compactRlmText(textSoFar, maxLength). The accumulator's cap was still a
+		// code-unit slice, so a streaming answer whose 157th code unit sat inside a
+		// surrogate pair published a lone high surrogate (U+FFFD in agents-view)
+		// until the settled message replaced it.
+		const text = `${"a".repeat(156)}💥 ${"b".repeat(20)}`;
+		const block: TextContent = { type: "text", text: "" };
+		const message: AssistantMessage = { ...assistantMessage(""), content: [block] };
+		const preview = new RlmChildStreamPreview();
+		let out = "";
+		for (const chunk of [text.slice(0, 100), text.slice(100, 140), text.slice(140)]) {
+			block.text += chunk;
+			out = preview.update(message);
+		}
+		expect(out).toBe(compactRlmText(text));
+		expect(out.endsWith("...")).toBe(true);
+		expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(out)).toBe(false);
+		expect(out).toContain("💥");
+	});
+
+	it("keeps the frozen streaming preview equal to compactRlmText for emoji-heavy text", () => {
+		// All-surrogate text: the cap freezes early and stays frozen, so the frozen
+		// value must be exactly what compactRlmText returns, grapheme by grapheme.
+		const text = "👍".repeat(200);
+		const block: TextContent = { type: "text", text: "" };
+		const message: AssistantMessage = { ...assistantMessage(""), content: [block] };
+		const preview = new RlmChildStreamPreview();
+		let out = "";
+		for (let offset = 0; offset < text.length; offset += 40) {
+			block.text = text.slice(0, Math.min(offset + 40, text.length));
+			out = preview.update(message);
+		}
+		expect(out).toBe(compactRlmText(text));
+		expect(out.endsWith("...")).toBe(true);
+		expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(out)).toBe(false);
 	});
 });

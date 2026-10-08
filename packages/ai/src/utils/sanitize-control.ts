@@ -7,8 +7,14 @@
  * (they are payload shape, not control).
  */
 
-/** CSI/OSC-with-BEL-or-ST, the shapes a CLI's progress and color output takes. */
-const ANSI_SEQUENCE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)?)/g;
+/**
+ * CSI/OSC-with-BEL-or-ST, the shapes a CLI's progress and color output takes.
+ * The OSC content class excludes ESC as well as BEL: `[^\x07]*` would swallow
+ * the ST terminator and everything after it. Same shape as the Python washer
+ * (prime-agent-runtime src/rlm/effects.py), which made this exact fix in
+ * 046682ba9; keep the two sides in sync.
+ */
+const ANSI_SEQUENCE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?)/g;
 
 /** C0 (minus \n \t), DEL, and the C1 range. */
 const CONTROL_CHARACTER = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g;

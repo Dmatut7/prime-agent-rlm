@@ -1488,6 +1488,21 @@
       }
       const strictStrikethroughRegex = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
 
+      // A browser normalizes special-scheme slashes (https:/host, https:host,
+      // https:/\host all load https://host), so a shape regex cannot tell which
+      // hrefs auto-load. Parse the href instead: absolute URLs are remote when
+      // their protocol is one a browser fetches; parse failures are relative.
+      function isRemoteImageHref(href) {
+        // Protocol-relative: no scheme, resolved against the page's scheme.
+        // '\' counts as '/' here the way WHATWG treats it in special URLs.
+        if (/^[/\\][/\\]/.test(href)) return true;
+        try {
+          const parsed = new URL(href);
+          return parsed.protocol === 'http:' || parsed.protocol === 'https:' || parsed.protocol === 'ftp:';
+        } catch (e) {
+          return false;
+        }
+      }
       marked.use({
         breaks: true,
         gfm: true,
@@ -1530,7 +1545,7 @@
             // Remote images would auto-load the moment someone opens the export,
             // telling an arbitrary host (session text is model-controlled) that
             // the file was opened and from where. Degrade them to plain links.
-            if (/^(?:[a-z][a-z0-9+.-]*:)?\/\//i.test(href)) {
+            if (isRemoteImageHref(href)) {
               const label = token.text || href;
               return '<a class="image-link" href="' + escapeHtml(href) + '">' + escapeHtml(label) + '</a>';
             }

@@ -1,0 +1,1 @@
+- Fixed streaming child-answer previews cutting emoji and other multi-unit characters in half and diverging from the settled preview.

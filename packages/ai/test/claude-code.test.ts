@@ -350,6 +350,12 @@ async function run(turn) {
 		process.stderr.write("progress \x1b[2J\x07 clearing\r\n");
 		process.exit(1);
 	}
+	if (scenario === "stderr-osc-st") {
+		// OSC 8 hyperlink closed with ST, then the real diagnostic: the washer
+		// must stop at the terminator, not swallow the whole tail.
+		process.stderr.write("\x1b]8;;file:///log\x1b\\auth failed: invalid token\n");
+		process.exit(1);
+	}
 	if (scenario === "text") {
 		if (process.env.FAKE_CLAUDE_DELAY_MS) await new Promise((resolve) => setTimeout(resolve, Number(process.env.FAKE_CLAUDE_DELAY_MS)));
 		message("msg_text_" + turn, [{ type: "text", text: "plain answer " + turn }], "end_turn");
@@ -825,6 +831,22 @@ describe("claude-code provider against a fake CLI", () => {
 		expect(text).not.toContain("\x1b");
 		expect(text).not.toContain("\x07");
 		expect(text).not.toContain("\r");
+	});
+
+	it("keeps the diagnostic after an ST-terminated OSC 8 hyperlink in the stderr tail", async () => {
+		setEnv("FAKE_CLAUDE_SCENARIO", "stderr-osc-st");
+		const reply = await streamSimple(
+			model,
+			{ systemPrompt: "s", messages: [{ role: "user", content: "hi", timestamp: 0 }], tools: [ipythonTool] },
+			{ sessionId: "session-stderr-osc-st", cwd },
+		).result();
+
+		expect(reply.stopReason).toBe("error");
+		const text = reply.errorMessage ?? "";
+		expect(text).toContain("exited with code 1");
+		// The diagnostic line must survive the hyperlink's ST terminator.
+		expect(text).toContain("auth failed: invalid token");
+		expect(text).not.toContain("\x1b");
 	});
 	// Last in this block: it switches the flag off for the rest of the module.
 	it("drops the thinking-display flag once a CLI rejects it, and retries the same request", async () => {

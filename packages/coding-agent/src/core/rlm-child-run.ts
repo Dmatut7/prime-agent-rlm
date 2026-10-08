@@ -569,10 +569,17 @@ export class RlmChildStreamPreview {
 	private applyCap(): void {
 		// Same cap decision as compactRlmText: it caps on the trimmed length, so the
 		// window's optional trailing space must not tip a text under the cap over it.
+		// Freezing only when the grapheme cut actually happens (an emoji-dense text
+		// can exceed the cap in code units while still fitting the grapheme budget,
+		// which compactRlmText returns whole) keeps update() exactly equal to
+		// compactRlmText(textSoFar, maxLength) as the class doc promises.
 		const trimmed = this.buf.trim();
 		if (trimmed.length > this.maxLength) {
-			this.cappedResult = `${trimmed.slice(0, Math.max(0, this.maxLength - 3)).trimEnd()}...`;
-			this.buf = "";
+			const capped = truncateGraphemes(trimmed, Math.max(0, this.maxLength - 3));
+			if (capped !== trimmed) {
+				this.cappedResult = capped;
+				this.buf = "";
+			}
 		}
 	}
 }
