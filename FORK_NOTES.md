@@ -1,3 +1,13 @@
+## 2026-10-09 第三批：依赖安全刷锁（PyJWT 升级 + npm 锁龄门重解析）
+
+> 42 条 dependabot 告警（3 critical / 15 high / 21 medium / 3 low）先做只读评估再动手。评估结论：35 条属「刷锁」级（提交的锁钉漏洞版、本机 node_modules 已是修复版——fresh clone/CI 的 npm ci 仍装漏洞版）；6 条不可达可弃（extract-zip 有 SHA-256 pin 门、basic-ftp 仅 ftp PAC 场景、node-forge 不进 bundle、pytest 是 dev 钉）；1 条待定（#1 对本仓自身的告警：官方 0.79.0 的项目信任门未移植，`<cwd>/.prime/agent/extensions` 无提示自动加载——唯一判真风险的条目，需单独波且要顾及无人值守语义，留老板拍板）。
+
+- **PyJWT 2.13.0 → 2.15.1**（prime-agent-runtime/uv.lock，python 无龄门；kernel 只直传 Bearer token、不调受影响 API，升级属纵深防御）。kernel venv 用户侧经 pyproject 现解已拿 2.15.1，本次只修 dev/CI 复现面。
+- **npm 锁全量重解析**（npx npm@12.2.0，龄门真实生效）：undici 7.29.0→**7.30.0**、shell-quote 1.10.0→**1.11.0**（1.12.0 差 ~9 小时过龄，龄门正确拦下，次新修复版顶上）、brace-expansion 5.0.9→**5.0.12**、ip-address 10.4.0→**10.7.2**（10.7.3 同理拦下）、protobufjs→**7.6.6**；锁顺带剪掉 ~90 条陈旧孤儿条目，锁内 lockstep 链接 0.11.19→0.11.20 漂移一并修正。lockfileVersion 保持 3（CI 的 npm 兼容）。
+- **过程坑（记档）**：本机默认 npm 10.9.4 **静默忽略 min-release-age**（AGENTS.md 已警告）；npm 12 对「删条目后重装」会写出缺条目的坏锁——最终走「删锁全量重解析 + npm ci 实装验证」才收敛。下次刷锁直接用这套，别再试 install/update 逐包抬。
+- **验证**：npm ci 实装 EXIT 0（新克隆路径等价验证）；check EXIT 0；四套件双证——coding-agent **12093/0**、tui **1538/0**、ai **824/0**、python **810 OK**（真退出码落文件）。过程坑+1：python 套件首次跑出 2 error 是 shell 的 http_proxy 让 httpx 走 SOCKS 缺 socksio——测试消毒清单须加 `env -u http_proxy -u https_proxy -u all_proxy` 系（与 RLM_/PI_ 同级）；预期告警降幅：undici 10→1（仅压缩解压 DoS 理论项）、shell-quote 2→0、brace-expansion 3→0、ip-address 4→0、protobufjs 1→0、PyJWT 14→0——合计 42→~7（余 6 条不可达 + 1 条本仓自身）。
+- **留老板的清单**：GitHub 上 6 条 dismiss（理由都在 /tmp/dependabot-assessment.md：extract-zip×2、basic-ftp、node-forge×2、pytest）；#1 信任门移植是否开波；shell-quote 1.12.0 / ip-address 10.7.3 过龄后（10-10）巡逻心跳自动补刷。
+
 ## 2026-10-09 第二批：W9-b 收尾 + 四问分拣 + W10 先修 12 条 + 工具链提速
 
 > 前一批（同日 05:00 前推送的 98bbdf22f）收口后循环继续：另一窗口 W7 的剩余条目清尾（W9-b 三车道）、88 条低优先积压按老板四问（会再改/具体后果/正在发生/机会成本——作排序直觉不作硬门）分拣出 12 条先修（W10 三车道）、两条性能车道把「每次提交/每次门禁」的固定开销砍掉 86%。
