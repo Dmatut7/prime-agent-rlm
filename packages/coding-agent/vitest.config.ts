@@ -54,6 +54,10 @@ export default defineConfig({
 		// booting real kernels in one shard starve the neighbouring kernel tests that
 		// rely on the 30s default timeout. `test:kernel` runs them on their own.
 		tagsFilter: ["!process-stress", "!kernel-heavy"],
+		// Persist transformed modules on disk so later runs skip re-transforming the
+		// whole suite. Vitest invalidates entries on content/config change, so a stale
+		// cache falls back to a fresh transform (fail-closed), never a stale module.
+		fsModuleCache: true,
 		server: {
 			deps: {
 				external: [/@silvia-odwyer\/photon-node/],
