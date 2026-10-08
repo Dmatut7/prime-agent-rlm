@@ -11,6 +11,7 @@ import {
 	RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE,
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 } from "../../../core/messages.js";
+import { sanitizeBlockText, sanitizeRowText } from "../../../utils/display-text.js";
 import { theme } from "../theme/theme.js";
 import {
 	hoverRow,
@@ -48,12 +49,17 @@ export class SystemNoticeLine implements Component {
 			return this.cachedLines;
 		}
 		const safeWidth = Math.max(1, width);
+		// One centered row this component builds itself: a summary or a memory title
+		// in it carries whatever a tool wrote, so it is washed before it is measured.
+		const label = sanitizeRowText(this.label);
+		const hint = sanitizeRowText(this.hint);
+		const detailText = sanitizeRowText(this.detail);
 		const frame = "·  ";
-		const tail = this.hint ? `  ·  ${this.hint}  ·` : "  ·";
-		const fixed = visibleWidth(frame) + visibleWidth(this.label) + visibleWidth(tail);
+		const tail = hint ? `  ·  ${hint}  ·` : "  ·";
+		const fixed = visibleWidth(frame) + visibleWidth(label) + visibleWidth(tail);
 		const room = safeWidth - fixed - 2;
-		const detail = this.detail && room >= 8 ? `  ${truncateToWidth(this.detail, room, "…")}` : "";
-		const plain = truncateToWidth(`${frame}${this.label}${detail}${tail}`, safeWidth, "…");
+		const detail = detailText && room >= 8 ? `  ${truncateToWidth(detailText, room, "…")}` : "";
+		const plain = truncateToWidth(`${frame}${label}${detail}${tail}`, safeWidth, "…");
 		const left = Math.max(0, Math.floor((safeWidth - visibleWidth(plain)) / 2));
 		const lines = [" ".repeat(left) + theme.fg(this.tone === "error" ? "error" : "systemNotice", plain)];
 		this.cachedWidth = width;
@@ -101,19 +107,24 @@ export class TimelineNoticeRow implements Component {
 			: failed
 				? theme.bold(theme.fg(open ? "timelineSub" : "timelineFaint", open ? "▴" : "›"))
 				: theme.fg("timelineFaint", open ? "▴" : "▸");
+		// The twin of the turn-box row that washes its words: this face builds the
+		// row itself, so the same notice text is washed here too.
+		const words = sanitizeRowText(this.notice.text);
 		const text = failed
-			? theme.fg("timelineMust", this.notice.text)
-			: theme.fg(this.notice.tone === "warn" ? "timelineFix" : "timelineTime", this.notice.text);
+			? theme.fg("timelineMust", words)
+			: theme.fg(this.notice.tone === "warn" ? "timelineFix" : "timelineTime", words);
 		const head = failed
 			? timelineRow({ time, main: "rail", lane: "sub" }, text, mark, safeWidth)
 			: timelineRow({ time, main: "note", lane: back.after }, text, mark, safeWidth);
 		const rows = [this.hovered && hasDetail ? hoverRow(head, safeWidth) : head];
 		if (open) {
 			const room = Math.max(1, safeWidth - TIMELINE_CONTENT_COL - 4);
-			const lines = (this.notice.detail ?? "").split("\n").flatMap((line) => {
-				const wrapped = wrapTextWithAnsi(styleInlineMarkdown(line.trimEnd(), "timelineSoft"), room);
-				return wrapped.length > 0 ? wrapped : [""];
-			});
+			const lines = sanitizeBlockText(this.notice.detail ?? "")
+				.split("\n")
+				.flatMap((line) => {
+					const wrapped = wrapTextWithAnsi(styleInlineMarkdown(line.trimEnd(), "timelineSoft"), room);
+					return wrapped.length > 0 ? wrapped : [""];
+				});
 			for (const line of lines) {
 				const content = line ? `  ${line}` : "";
 				rows.push(timelineRow({ main: "rail", lane: back.after }, content, "", safeWidth));

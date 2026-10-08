@@ -1,0 +1,3 @@
+- Washed the render faces that build their own rows instead of handing their text to `Text`: the turn box's header and step meta, a subagent's report row and its opened body, a timeline notice and its opened detail, and the centered system-notice line - a subagent name, report, error or file path can no longer write the clipboard (OSC 52), clear the screen, ring the bell or break a row in two.
+- Made the shared display washer drop whole escape sequences instead of only the `\x1b` that starts them, so an injected sequence no longer leaves its payload on screen as visible garbage.
+- Fixed `y` on a turn box dropping the blank rows between the paragraphs of an opened event, so the copy keeps the shape the block showed.

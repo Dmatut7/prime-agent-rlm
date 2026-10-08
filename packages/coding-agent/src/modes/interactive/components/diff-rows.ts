@@ -1,5 +1,6 @@
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { generateDiffString } from "../../../core/tools/edit-diff.js";
+import { sanitizeBlockText } from "../../../utils/display-text.js";
 import { theme } from "../theme/theme.js";
 
 /**
@@ -22,9 +23,15 @@ const HUNK_HEADER = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@ ?(.*)$/;
 const NUMBERED_LINE = /^([+\- ])\s*(\d+) (.*)$/;
 const NUMBERED_GAP = /^ \s*\.\.\.$/;
 
-/** Terminal control characters in file content must never reach the screen raw. */
+/**
+ * Terminal control characters in file content must never reach the screen raw -
+ * and neither must the escape sequences they start: deleting a lone ESC left the
+ * rest of the sequence on the screen as visible garbage (`]52;c;cGFzdGU=` for a
+ * clipboard write). The block wash drops whole sequences and every control
+ * character but the newlines the caller splits on.
+ */
 export function sanitizeDisplayText(text: string): string {
-	return text.replace(/\t/g, "    ").replace(/[\u0000-\u0008\u000b-\u001f\u007f\u009b]/g, "");
+	return sanitizeBlockText(text);
 }
 
 /** A standard unified diff (`--- a/x`, `+++ b/x`, `@@ -1,3 +1,4 @@`) as rows. */

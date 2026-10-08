@@ -14,6 +14,7 @@ import { RefinementOutcomeMessageComponent } from "../src/modes/interactive/comp
 import { SkillInvocationMessageComponent } from "../src/modes/interactive/components/skill-invocation-message.js";
 import { timelineShowAll } from "../src/modes/interactive/components/timeline-lane.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { addSay, quietTurn, T0 } from "./ui-blocks-helpers.js";
 
 /**
  * R3-M19: `y` on an expanded card copied its *rendered rows*, and the copy helper trimmed every row
@@ -118,5 +119,22 @@ describe("a block copy keeps the source's shape", () => {
 		} finally {
 			timelineShowAll.set(false);
 		}
+	});
+
+	it("keeps the blank rows between the paragraphs of an opened turn-box event", () => {
+		const turn = quietTurn({ live: false, startedAt: T0 });
+		addSay(turn, "第一段说完了。\n\n    第二段带缩进。", "s1", T0 + 1_000);
+		turn.state.markTurnEnded(T0 + 2_000);
+		turn.state.finishBox(T0 + 2_000);
+		turn.summary.render(100);
+		const event = turn.summary.getFocusOrder().find((key) => key.startsWith("ev:"));
+		expect(event).toBeDefined();
+		if (event !== undefined) turn.summary.activate(event);
+		const copied = turn.summary.getBlockCopyText();
+		expect(copied).toContain("第一段说完了。");
+		expect(copied).toContain("第二段带缩进。");
+		// The paragraph break and the second paragraph's own indentation survive the copy.
+		expect(copied).toContain("\n\n");
+		expect(copied.split("\n").some((line) => /^\s+第二段带缩进。/.test(line))).toBe(true);
 	});
 });

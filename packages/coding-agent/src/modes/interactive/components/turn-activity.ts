@@ -7,7 +7,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
 import { getSpinnerTick } from "../theme/working-icon.js";
-import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock, withoutGutter } from "./block-focus.js";
+import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock, renderedCopyText } from "./block-focus.js";
 import type { FileChangeSummary } from "./edit-summary.js";
 import { type TimelineLaneTracker, timelineShowAll } from "./timeline-lane.js";
 import {
@@ -1000,16 +1000,14 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		if (changed) this.invalidate();
 	}
 
-	/** The process line and its rows as plain text. */
+	/**
+	 * The process line and its rows as plain text. A turn box holds no source
+	 * text, so its copy is its rendered rows - read the way every other block
+	 * reads them, which keeps a row's own indentation and the blank rows between
+	 * the paragraphs of an opened event.
+	 */
 	getBlockCopyText(): string {
-		return this.renderTurnHead(120)
-			.map((line) =>
-				withoutGutter(line)
-					.replace(/\x1b\[[0-9;]*m/g, "")
-					.trimEnd(),
-			)
-			.filter((line) => line.trim().length > 0)
-			.join("\n");
+		return renderedCopyText(this.renderTurnHead(120));
 	}
 
 	private renderTurnHead(width: number): string[] {

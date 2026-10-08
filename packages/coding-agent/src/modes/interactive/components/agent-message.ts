@@ -9,20 +9,20 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { AgentSessionMessage } from "../../../core/agent-messages.js";
+import { sanitizeBlockText, sanitizeRowText } from "../../../utils/display-text.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import { stripInlineMarkdown, styleInlineMarkdown } from "./inline-markdown.js";
 import { formatTimelineTime, TIMELINE_CONTENT_COL, type TimelineLane, timelineRow } from "./timeline-gutter.js";
 import { type LaneSnapshot, TimelineLaneTracker } from "./timeline-lane.js";
 
-function collapseText(text: string): string {
-	return text.replace(/\s+/g, " ").trim();
-}
-
 /** `◆ <label> · <participant>[ · <preview>]` summary line shared by received and sent agent-message UI. */
 export function agentMessageSummaryLine(label: string, participant: string, preview?: string): string {
-	const parts = [`${theme.fg("accent", "◆")} ${theme.fg("muted", label)}`, theme.fg("muted", participant)];
+	const parts = [
+		`${theme.fg("accent", "◆")} ${theme.fg("muted", sanitizeRowText(label))}`,
+		theme.fg("muted", sanitizeRowText(participant)),
+	];
 	if (preview) {
-		parts.push(theme.fg("muted", preview));
+		parts.push(theme.fg("muted", sanitizeRowText(preview)));
 	}
 	return parts.join(theme.fg("dim", " · "));
 }
@@ -33,34 +33,43 @@ export function agentMessageSummaryLine(label: string, participant: string, prev
  * else (`◆` is prime's own mark). Without a preview the row is just the head.
  */
 export function receivedAgentMessageLine(name: string, verb: "交回" | "发来", preview?: string): string {
-	const head = `${theme.fg("kindSubagent", "◇")} ${theme.fg("kindSubagent", name)} ${theme.fg("muted", verb)}`;
-	return preview ? `${head}${theme.fg("muted", `：${preview}`)}` : head;
+	const head = `${theme.fg("kindSubagent", "◇")} ${theme.fg("kindSubagent", sanitizeRowText(name))} ${theme.fg(
+		"muted",
+		verb,
+	)}`;
+	return preview ? `${head}${theme.fg("muted", `：${sanitizeRowText(preview)}`)}` : head;
 }
 
-/** Who sent a message, as its row names them; the same fallbacks the participant label uses. */
+/**
+ * Who sent a message, as its row names them; the same fallbacks the participant
+ * label uses. A sender names itself, so the name is washed on the way out: every
+ * face below interpolates it into a row it builds itself.
+ */
 export function agentMessageSenderName(from: AgentSessionMessage["details"]["from"]): string {
-	return (
+	return sanitizeRowText(
 		from?.sessionName?.trim() ||
-		from?.activeSessionId?.trim() ||
-		from?.clientId?.trim() ||
-		from?.sessionId?.trim() ||
-		"unknown"
+			from?.activeSessionId?.trim() ||
+			from?.clientId?.trim() ||
+			from?.sessionId?.trim() ||
+			"unknown",
 	);
 }
 
 /** Single-line message preview sized to fit after the summary-line prefix. */
 export function agentMessagePreview(prefixWidth: number, message: string): string {
-	return truncateToWidth(collapseText(message), Math.max(20, 100 - prefixWidth));
+	return truncateToWidth(sanitizeRowText(message), Math.max(20, 100 - prefixWidth));
 }
 
 /** `╰─`-guttered message body lines shared by received and sent agent-message UI. */
 export function agentMessageBodyLines(message: string, width: number): string[] {
 	const safeWidth = Math.max(1, width);
 	const textWidth = Math.max(1, safeWidth - 4);
-	const bodyLines = message.split("\n").flatMap((line) => {
-		const wrapped = wrapTextWithAnsi(line, textWidth);
-		return wrapped.length > 0 ? wrapped : [""];
-	});
+	const bodyLines = sanitizeBlockText(message)
+		.split("\n")
+		.flatMap((line) => {
+			const wrapped = wrapTextWithAnsi(line, textWidth);
+			return wrapped.length > 0 ? wrapped : [""];
+		});
 	return bodyLines.map((line, index) => {
 		const prefix = index === 0 ? theme.fg("dim", "╰─ ") : "   ";
 		return truncateToWidth(` ${prefix}${theme.fg("customMessageText", line)}`, safeWidth, "");
@@ -72,9 +81,10 @@ export function agentMessageBodyLines(message: string, width: number): string[] 
  * way a dispatch row names it; any other name stays whole.
  */
 export function shortAgentName(name: string): string {
-	const letters = name.split(/[-_ .]+/).filter((part) => /^[A-Za-z]$/.test(part));
+	const washed = sanitizeRowText(name);
+	const letters = washed.split(/[-_ .]+/).filter((part) => /^[A-Za-z]$/.test(part));
 	const only = letters.length === 1 ? letters[0] : undefined;
-	return only ? only.toUpperCase() : name;
+	return only ? only.toUpperCase() : washed;
 }
 
 const NEGATED_LEVEL =
@@ -126,7 +136,7 @@ export function reportParts(message: string): { label?: string; conclusion: stri
 		const rest = labelMatch ? first.slice(labelMatch[0].length).trim() : first;
 		conclusion = firstSentence(rest) || firstSentence(first);
 	}
-	return { ...(label ? { label } : {}), conclusion: collapseText(conclusion) };
+	return { ...(label ? { label: sanitizeRowText(label) } : {}), conclusion: sanitizeRowText(conclusion) };
 }
 
 /**
@@ -444,7 +454,7 @@ export class AgentMessageComponent extends Container {
 		const indent = 2;
 		const room = Math.max(1, width - TIMELINE_CONTENT_COL - indent - 2);
 		let inFence = false;
-		return this.message.details.message
+		return sanitizeBlockText(this.message.details.message)
 			.replace(/\s+$/, "")
 			.split("\n")
 			.flatMap((line) => {

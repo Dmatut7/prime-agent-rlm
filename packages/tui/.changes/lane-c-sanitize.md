@@ -1,0 +1,1 @@
+- Exported `sanitizeRenderText` from the package entry, so the faces that render their own rows can wash model-controlled text with the same contract `Text.render` applies.

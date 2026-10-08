@@ -5,11 +5,11 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { sanitizeBlockText, sanitizeRowText } from "../../../utils/display-text.js";
 import { type ThemeColor, theme } from "../theme/theme.js";
 import { spinnerFrame } from "../theme/working-icon.js";
 import { shortAgentName } from "./agent-message.js";
 import { isVisibleRow } from "./block-focus.js";
-import { sanitizeDisplayText } from "./diff-rows.js";
 import { styleInlineMarkdown } from "./inline-markdown.js";
 import {
 	formatTimelineTime,
@@ -215,8 +215,27 @@ export interface BoxHeaderInput {
 	now: number;
 }
 
+/**
+ * One label part of the box header. The header is a row the box builds itself
+ * (no `Text`, so no central wash) and it interpolates what a step, a file name,
+ * a subagent or the model's own thinking said, so the words are washed here -
+ * the same wash the step rows below already got, on the other path of the same
+ * data. A part that is padding (`" · "` between two summary groups, the space
+ * between `+2` and `−1`) keeps the one space it washes down to: the parts are
+ * joined with nothing between them.
+ */
 function part(text: string, color: ThemeColor = "activityText"): MetaPart {
-	return { text, color };
+	return { text: paddedWords(text), color };
+}
+
+/**
+ * Washed words that keep the padding they were authored with: the header joins
+ * its parts with nothing between them, so `" · "` between two summary groups and
+ * the single space between `+2` and `−1` are content, not whitespace to trim.
+ */
+function paddedWords(text: string): string {
+	if (!/\S/.test(text)) return text.length > 0 ? " " : "";
+	return `${/^\s/.test(text) ? " " : ""}${sanitizeRowText(text)}${/\s$/.test(text) ? " " : ""}`;
 }
 
 /** What the turn is doing now (the live tail's fallback words), or what it did once done. */
@@ -247,7 +266,8 @@ export function computeBoxHeader(input: BoxHeaderInput): BoxHeader {
 		const summary: MetaPart[] = [];
 		summaryParts(facts).forEach((group, index) => {
 			if (index > 0) summary.push(part(" · ", "muted"));
-			summary.push(...group);
+			// The summary's parts are built by the row feed, not by `part`: wash them the same way.
+			summary.push(...group.map((entry) => part(entry.text, entry.color)));
 		});
 		return timeline.errorEnded ? done("error", "✗", "error", summary) : done("done", "✓", "diffAddedText", summary);
 	}
@@ -286,7 +306,9 @@ export function computeBoxHeader(input: BoxHeaderInput): BoxHeader {
 	}
 	const thinkingLive = input.rows.some((row) => row.kind === "think" && row.status === "running");
 	if (input.phase === "thinking" || thinkingLive) {
-		const sentence = lastCompletedSentence(input.currentThinking);
+		// Washed before its sentences are cut: a `;` inside an escape sequence is a
+		// sentence end, and the fragment after it would be quoted as the thought.
+		const sentence = lastCompletedSentence(sanitizeBlockText(input.currentThinking));
 		return live(sentence ? [part("思考中 · "), part(sentence)] : [part("思考中…")]);
 	}
 	if (input.phase === "writing") return live([part("正在写回答")]);
@@ -335,7 +357,8 @@ function newestThought(timeline: TurnTimeline, hideThinking: boolean): string | 
 		for (let block = content.length - 1; block >= 0; block--) {
 			const item = content[block];
 			if (item?.type === "text" && (item.text ?? "").trim()) return undefined;
-			if (item?.type === "thinking" && (item.thinking ?? "").trim()) return thoughtSentence(item.thinking ?? "");
+			if (item?.type === "thinking" && (item.thinking ?? "").trim())
+				return thoughtSentence(sanitizeBlockText(item.thinking ?? ""));
 		}
 	}
 	return undefined;
@@ -448,9 +471,7 @@ const STEP_GLYPH_COLORS: Record<BoxRowKind, ThemeColor> = {
 /** A step's words on one line. */
 function stepWords(row: BoxRow): string {
 	const gap = row.text && row.keyword && !row.keyword.endsWith("：") ? " " : "";
-	return sanitizeDisplayText(`${row.keyword ?? ""}${gap}${row.text}`)
-		.replace(/\s+/g, " ")
-		.trim();
+	return sanitizeRowText(`${row.keyword ?? ""}${gap}${row.text}`);
 }
 
 /** A row's own meta color as the timeline's color for its status. */
@@ -479,15 +500,17 @@ function stepStatus(row: BoxRow, now: number): string {
 			: undefined;
 	if (row.status === "failed") {
 		// `4 个失败  38秒`: the result and the time in one red, no mark.
-		const words = row.meta
-			.map((entry) => entry.text)
-			.join("")
-			.replace(/^✗\s*/, "");
+		const words = sanitizeRowText(
+			row.meta
+				.map((entry) => entry.text)
+				.join("")
+				.replace(/^✗\s*/, ""),
+		);
 		return theme.fg("timelineMust", [words, took].filter((part) => part).join("  "));
 	}
 	const onlyDone = row.meta.length === 1 && row.meta[0]?.text === "✓ 完成";
 	const parts = onlyDone && took ? [{ text: "✓", color: row.meta[0]?.color ?? "diffAddedText" }] : row.meta;
-	const meta = parts.map((entry) => theme.fg(statusColor(entry), entry.text)).join("");
+	const meta = parts.map((entry) => theme.fg(statusColor(entry), paddedWords(entry.text))).join("");
 	if (!took) return meta;
 	return `${meta}${meta ? " " : ""}${theme.fg("timelineFaint", took)}`;
 }
@@ -662,7 +685,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		const open = openable && ui.expanded.has(event.key);
 		const fullLines =
 			open && more && event.full
-				? wrapTextWithAnsi(styleInlineMarkdown(sanitizeDisplayText(event.full), "timelineSoft"), bodyWidth)
+				? wrapTextWithAnsi(styleInlineMarkdown(sanitizeBlockText(event.full), "timelineSoft"), bodyWidth)
 				: [];
 		if (event.kind === "steer") {
 			specs.push({
@@ -750,7 +773,14 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		if (event.spawned.length > 0) {
 			specs.push({
 				gutter: { main: "split", lane: tracker ? "split" : "off" },
-				content: `${theme.bold(theme.fg("timelineSub", "◇"))}  ${theme.fg("timelineSoft", event.spawned.map((sub) => (sub.tag ? `${shortAgentName(sub.name)} ${sub.tag}` : shortAgentName(sub.name))).join("   "))}`,
+				content: `${theme.bold(theme.fg("timelineSub", "◇"))}  ${theme.fg(
+					"timelineSoft",
+					event.spawned
+						.map((sub) =>
+							sub.tag ? `${shortAgentName(sub.name)} ${sanitizeRowText(sub.tag)}` : shortAgentName(sub.name),
+						)
+						.join("   "),
+				)}`,
 			});
 			gap(event.spawned.some((sub) => laneAt(sub.startedAt, true) === "on") ? "on" : "off");
 		}
