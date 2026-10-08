@@ -1107,7 +1107,10 @@ class TreeList implements Component {
 			this.applyFilter();
 		} else if (kb.matches(keyData, "tui.editor.deleteCharBackward")) {
 			if (this.searchQuery.length > 0) {
-				this.searchQuery = this.searchQuery.slice(0, -1);
+				// Delete the last grapheme, not the last code unit: a query that ends
+				// in an emoji halved by a plain slice shows the U+FFFD glyph on the
+				// search line.
+				this.searchQuery = sliceGraphemes(this.searchQuery, this.searchQuery.length - 1);
 				this.foldedNodes.clear();
 				this.applyFilter();
 			}

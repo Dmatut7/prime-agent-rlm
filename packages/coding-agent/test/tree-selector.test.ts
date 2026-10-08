@@ -900,3 +900,43 @@ describe("tree selector terminal height budget", () => {
 		expect(atShort).toBeGreaterThanOrEqual(5);
 	});
 });
+
+describe("tree selector search backspace", () => {
+	const build = () => {
+		const tree = buildTree([userMessage("user-1", null, "hello world")]);
+		const selector = new TreeSelectorComponent(
+			tree,
+			"user-1",
+			24,
+			() => {},
+			() => {},
+		);
+		return { selector, list: selector.getTreeList() };
+	};
+
+	test("backspace removes an astral query character whole, not half of its surrogate pair", () => {
+		const { selector, list } = build();
+
+		selector.handleInput("😀");
+		expect(list.getSearchQuery()).toBe("😀");
+
+		selector.handleInput("\x7f");
+
+		// A plain code-unit slice leaves the lone high surrogate behind: the
+		// search line then shows the U+FFFD glyph where the emoji was.
+		expect(list.getSearchQuery()).toBe("");
+		const searchLine = selector.render(120).find((line) => line.includes("输入以搜索"));
+		expect(searchLine).toBeDefined();
+		expect(searchLine).not.toContain("\uD83D");
+	});
+
+	test("backspace after plain text keeps the text before an astral character", () => {
+		const { selector, list } = build();
+
+		selector.handleInput("ab");
+		selector.handleInput("😀");
+		selector.handleInput("\x7f");
+
+		expect(list.getSearchQuery()).toBe("ab");
+	});
+});

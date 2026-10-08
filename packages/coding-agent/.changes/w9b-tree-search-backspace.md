@@ -1,0 +1,1 @@
+- Fixed the session-tree search backspace deleting half of an emoji query character, which left the U+FFFD glyph on the search line.
