@@ -314,6 +314,17 @@ describe("a turn still running (Tl2Live)", () => {
 		expect(pending.startsWith("            ┆   A、C、D 还在干活")).toBe(true);
 	});
 
+	it("names a pending cross-turn child without a name 子代理, never its bare session id", () => {
+		const { turn, tracker } = liveTurn();
+		// Dispatched by an earlier turn, so this turn's events never named it: its
+		// lane key is the raw session id.
+		tracker.spawned(["a1b2c3d4"]);
+		const lines = plain(turn.summary.render(WIDTH));
+		const pending = lines.find((line) => line.includes("还在干活")) ?? "";
+		expect(pending).not.toContain("a1b2c3d4");
+		expect(pending).toContain("子代理");
+	});
+
 	it("puts one blank rail line before the spinner", () => {
 		const { turn } = liveTurn();
 		const lines = plain(turn.summary.render(WIDTH));
@@ -821,7 +832,7 @@ describe("a failing step's status reads like the design's `4 个失败  38秒`",
 		const turn = failingTurn(38_000);
 		const raw = turn.summary.render(WIDTH).find((line) => line.includes("npx vitest --run")) ?? "";
 		const text = stripAnsi(raw);
-		expect(text.endsWith("10 通过 · 4 失败  38秒    ")).toBe(true);
+		expect(text.endsWith("10 通过 · 4 失败  38秒  ")).toBe(true);
 		expect(text).not.toContain("✗");
 		expect(raw).toContain(`${theme.getFgAnsi("timelineMust")}10 通过 · 4 失败  38秒`);
 	});
@@ -829,7 +840,7 @@ describe("a failing step's status reads like the design's `4 个失败  38秒`",
 	it("leaves the time out when the step took less than a second", () => {
 		const turn = failingTurn(400);
 		const text = plain(turn.summary.render(WIDTH)).find((line) => line.includes("npx vitest --run")) ?? "";
-		expect(text.endsWith("10 通过 · 4 失败    ")).toBe(true);
+		expect(text.endsWith("10 通过 · 4 失败  ")).toBe(true);
 	});
 });
 
@@ -864,5 +875,31 @@ describe("a row's one-line summary is looked for in the first 400 characters", (
 		const event = turn.state.boxView().events[0];
 		expect(event?.full?.length).toBe(note.length);
 		expect(event?.more).toBe(true);
+	});
+});
+
+describe("the output token counter", () => {
+	it("never ticks down when a dropped attempt's entry is removed", () => {
+		const turn = quietTurn(false);
+		const withUsage = (timestamp: number, output: number): AssistantMessage => ({
+			...assistant(timestamp, [], "stop"),
+			usage: {
+				input: 0,
+				output,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: output,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		});
+		turn.timeline.noteMessage(withUsage(T0, 3_000), true);
+		turn.timeline.noteMessage(withUsage(T0 + 1_000, 2_000), true);
+		expect(turn.timeline.outputTokens()).toBe(5_000);
+
+		// The session drops the second attempt before it ends: its row and its
+		// tokens leave the sum, but the counter already showed 5,000 and the
+		// contract is that it never decreases.
+		turn.timeline.dropEntry(`m:${T0 + 1_000}`);
+		expect(turn.timeline.outputTokens()).toBe(5_000);
 	});
 });

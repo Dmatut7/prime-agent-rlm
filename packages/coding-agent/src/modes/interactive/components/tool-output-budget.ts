@@ -17,6 +17,8 @@
  * and replay path that sets expansion state.
  */
 
+import { sliceGraphemes } from "../../../utils/display-text.js";
+
 /** Logical lines an expanded block renders before it holds the rest back. */
 export const EXPANDED_TOOL_OUTPUT_MAX_LINES = 40;
 /** Characters an expanded block renders before it holds the rest back. */
@@ -154,7 +156,7 @@ export function expandedOutputWindow(lines: string[]): ExpandedOutputWindow {
 			// it instead of showing nothing. The held-back tail of that line is only
 			// reported when no whole line follows it.
 			return {
-				lines: [line.slice(0, charRoom)],
+				lines: [sliceGraphemes(line, charRoom)],
 				skippedLines: lines.length - 1,
 				skippedChars: line.length - charRoom,
 				truncated: true,

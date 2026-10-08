@@ -1,5 +1,9 @@
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { previewIpythonCode, redactNoise } from "../../../core/tools/code-preview.js";
 import { parseIpythonBashCell } from "../../../core/tools/ipython-cell-code.js";
+
+/** Grapheme walking for the word-boundary cuts in shortenCommand. */
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 /** What a step label needs: the tool and its (possibly still streaming) arguments. */
 export interface StepLabelInput {
@@ -125,27 +129,33 @@ const QUIET_COMMANDS = new Set(["echo", "printf", "true", ":", "sleep", "wait"])
 
 /**
  * Shorten a command to the budget at a word boundary, never inside quotes:
- * `git log --format=… --date=iso` rather than `git log --format="%H`.
+ * `git log --format=… --date=iso` rather than `git log --format="%H`. The
+ * budget counts display columns (a CJK command of 44 code units is 80+
+ * columns wide), and every cut lands on a grapheme boundary.
  */
 export function shortenCommand(command: string, max = COMMAND_LABEL_MAX): string {
 	const text = command.replace(/\s+/g, " ").trim();
-	if (text.length <= max) {
+	if (visibleWidth(text) <= max) {
 		return text;
 	}
 	const cuts: number[] = [];
 	let quote: string | undefined;
-	for (let index = 0; index < text.length && index <= max; index++) {
-		const char = text[index];
-		if (quote) {
-			if (char === quote) quote = undefined;
-		} else if (char === '"' || char === "'") {
-			quote = char;
-		} else if (char === " ") {
+	let columns = 0;
+	for (const { segment, index } of graphemeSegmenter.segment(text)) {
+		if (columns > max) break;
+		if (quote !== undefined) {
+			if (segment === quote) quote = undefined;
+		} else if (segment === '"' || segment === "'") {
+			quote = segment;
+		} else if (segment === " ") {
 			cuts.push(index);
 		}
+		columns += visibleWidth(segment);
 	}
 	const cut = cuts.at(-1);
-	return cut !== undefined && cut > 0 ? `${text.slice(0, cut)} …` : `${(text.split(" ")[0] ?? text).slice(0, max)} …`;
+	return cut !== undefined && cut > 0
+		? `${text.slice(0, cut)} …`
+		: `${truncateToWidth(text.split(" ")[0] ?? text, max, "")} …`;
 }
 
 /**

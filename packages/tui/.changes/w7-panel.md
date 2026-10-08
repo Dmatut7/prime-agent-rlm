@@ -1,0 +1,1 @@
+- Fixed in-band `_pi:` APC reveal markers leaking to the terminal raw on the inline render path (fullscreen already consumed them).

@@ -114,7 +114,7 @@ import {
 	type UnifiedSessionRecord,
 } from "./agents-view-state.js";
 import { type AgentsViewRosterChange, AgentsViewRosterStore, STALE_ROSTER_DAEMON_MESSAGE } from "./roster-store.js";
-import { createSearchTextMatcher } from "./session-view-search.js";
+import { createSearchTextMatcher, parseSearchQuery } from "./session-view-search.js";
 
 const HEARTBEAT_POLL_INTERVAL_MS = 15000;
 const SAVED_CATALOG_RECONCILE_THROTTLE_MS = 50;
@@ -3377,6 +3377,12 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		if (this.statusMessage) {
 			return truncateToWidth(theme.fg(this.statusMessageTone, this.statusMessage), width);
+		}
+		// A bad re: pattern rejects every row; say so where the search box's hints live.
+		if (!this.renameTarget && !this.replyTarget) {
+			const editor: CustomEditor | undefined = this.editor;
+			const error = editor ? parseSearchQuery(editor.getText()).error : undefined;
+			if (error) return truncateToWidth(theme.fg("error", `正则无效：${error}`), width);
 		}
 		if (this.renameTarget) {
 			const hint = `${keyText("tui.select.confirm")} 保存   ${keyText("tui.select.cancel")} 取消`;

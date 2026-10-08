@@ -1,14 +1,15 @@
 import { type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
 
-/** Rows the block may take above the prompt, title included. */
+/** Content rows the block may take above the prompt, title included (one trailing blank row follows them). */
 export const DUTY_LOG_MAX_ROWS = 6;
 
 /**
  * The duty log shown above the prompt: an accent title row, then dim fact
  * rows indented one column. The incidents row may wrap onto a second row;
- * every other row truncates, and the block never exceeds
- * {@link DUTY_LOG_MAX_ROWS} rows (the last fact rows drop first).
+ * every other row truncates, and the block holds at most
+ * {@link DUTY_LOG_MAX_ROWS} content rows (the last fact rows drop first), plus
+ * the one trailing blank row it always ends on - seven rendered lines in all.
  */
 export class DutyLogBlock implements Component {
 	constructor(private readonly lines: readonly string[]) {}

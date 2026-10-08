@@ -200,10 +200,6 @@ export interface SubagentPanelRow {
 	/** Where the child came in the order it was dispatched; the strip's blocks follow it, the list is sorted by state. */
 	dispatchIndex?: number;
 	state: SubagentPanelRowState;
-	/** Run time so far, when the snapshot reports it. */
-	elapsedMs?: number;
-	/** What the child is doing or how it ended, in plain words. */
-	activity?: string;
 	/** The child's session directory: how a closed child is found again to reopen it. */
 	sessionDir?: string;
 	/**
@@ -220,34 +216,6 @@ const ROW_STATE_ORDER: Record<SubagentPanelRowState, number> = {
 	idle: 3,
 	done: 4,
 };
-
-function firstLine(text: string | undefined): string | undefined {
-	const line = text
-		?.split("\n")
-		.map((part) => part.trim())
-		.find((part) => part.length > 0);
-	return line || undefined;
-}
-
-function rowActivity(child: AgentConnectionRlmChildAgentSnapshot, state: SubagentPanelRowState): string | undefined {
-	if (state === "stalled") {
-		const silent = Math.max(1, Math.round((child.stall?.silentMs ?? 0) / 1000));
-		const tools = child.stall?.inFlightTools ?? [];
-		return `${silent}s 没有动静${tools.length > 0 ? ` · 在跑 ${tools.join(", ")}` : ""}`;
-	}
-	if (state === "failed") return firstLine(child.error) ?? "出错";
-	if (state === "done") return firstLine(child.answerPreview) ?? firstLine(child.recap);
-	switch (child.activity?.kind) {
-		case "executing":
-			return child.activity.toolName ? `执行 ${child.activity.toolName}` : "执行中";
-		case "writing":
-			return "回答中";
-		case "waiting":
-			return "等待模型";
-		default:
-			return firstLine(child.recap);
-	}
-}
 
 /**
  * The panel rows for this session's subtree (see collectSubtreeSubagentSnapshots),
@@ -277,10 +245,7 @@ export function buildSubagentPanelRows(
 		if (tag) row.tag = tag;
 		if (child.activeSessionId) row.activeSessionId = child.activeSessionId;
 		if (child.sessionDir) row.sessionDir = child.sessionDir;
-		if (child.durationMs !== undefined) row.elapsedMs = child.durationMs;
 		if (state === "failed" && seenFailureChildIds.has(child.id)) row.acknowledged = true;
-		const activity = rowActivity(child, state);
-		if (activity) row.activity = activity;
 		return row;
 	});
 	// A tag several children share tells none of them apart; leave it off all of them.
@@ -370,15 +335,6 @@ function chipName(name: string): string {
 function chipTag(tag: string | undefined): string | undefined {
 	const washed = tag === undefined ? "" : sanitizeRowText(tag);
 	return washed === "" ? undefined : washed;
-}
-
-/** `2:14`, `1:02:03`. */
-export function formatSubagentElapsed(ms: number): string {
-	const total = Math.max(0, Math.floor(ms / 1000));
-	const seconds = String(total % 60).padStart(2, "0");
-	const minutes = Math.floor(total / 60);
-	if (minutes < 60) return `${minutes}:${seconds}`;
-	return `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, "0")}:${seconds}`;
 }
 
 /**
@@ -749,15 +705,13 @@ export class SubagentSummaryLine implements Component, Focusable {
 			const rightWidth = end < total ? CHIP_GAP + visibleWidth(rightMarkerText(total - end)) : 0;
 			return STRIP_INDENT + leftWidth + blocks + rightWidth <= width;
 		};
-		// The needed width only grows with the count, so the largest count that fits is found by bisection.
-		let low = 1;
-		let high = Math.max(1, total - start);
-		while (low < high) {
-			const middle = Math.ceil((low + high) / 2);
-			if (fits(middle)) low = middle;
-			else high = middle - 1;
+		// fits() is not monotone: the "还有 N 个" marker vanishes on the last page, so
+		// showing everything can fit where one block less cannot. Scan; do not bisect.
+		let best = 1;
+		for (let count = 1; count <= Math.max(1, total - start); count++) {
+			if (fits(count)) best = count;
 		}
-		return low;
+		return best;
 	}
 
 	/** The furthest the row scrolls: the first start from which every remaining block is on screen. */

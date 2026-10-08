@@ -13,7 +13,6 @@ import {
 	collectSubtreeSubagentSnapshots,
 	countRosterSubagentStatuses,
 	countSubtreeSubagentStatuses,
-	formatSubagentElapsed,
 	renderSubagentSpendCell,
 	type SubagentSpendSummary,
 	SubagentSummaryLine,
@@ -58,6 +57,23 @@ describe("SubagentSummaryLine", () => {
 	beforeAll(() => {
 		initTheme("dark");
 		setKeybindings(new KeybindingsManager());
+	});
+
+	it("shows every block that fits: the last page drops the marker instead of hiding a block behind it", () => {
+		// Four one-letter blocks at 44 columns: all four exactly fit, but the
+		// bisection over the non-monotone fits() (the "还有 N 个" marker vanishes
+		// on the last page) answered 2 and claimed two more.
+		const line = new SubagentSummaryLine();
+		line.setSubagentCounts({ total: 4, running: 0, idle: 4, inactive: 0 });
+		line.setSubagentRows([
+			{ id: "1", name: "a", state: "idle" },
+			{ id: "2", name: "b", state: "idle" },
+			{ id: "3", name: "c", state: "idle" },
+			{ id: "4", name: "d", state: "idle" },
+		]);
+		const rendered = stripAnsi(line.render(44)[0] ?? "");
+		expect(rendered).not.toContain("还有");
+		expect(rendered.match(/◇/g)).toHaveLength(4);
 	});
 
 	it("renders nothing without children and one block with the counts when no child is described", () => {
@@ -1491,9 +1507,9 @@ describe("subagent panel rows (design board 06)", () => {
 	});
 
 	const rows = [
-		{ id: "a", name: "review", state: "running" as const, elapsedMs: 134_000, activity: "读取 footer.ts" },
-		{ id: "b", name: "docs", state: "running" as const, elapsedMs: 41_000, activity: "编辑 FORK_NOTES.md" },
-		{ id: "c", name: "lint", state: "done" as const, elapsedMs: 62_000, activity: "无问题" },
+		{ id: "a", name: "review", state: "running" as const },
+		{ id: "b", name: "docs", state: "running" as const },
+		{ id: "c", name: "lint", state: "done" as const },
 	];
 
 	function panel(): SubagentSummaryLine {
@@ -1695,15 +1711,5 @@ describe("subagent panel rows (design board 06)", () => {
 			["review", "running"],
 			["lint", "done"],
 		]);
-		expect(built[0]?.activity).toBe("95s 没有动静 · 在跑 ipython");
-		expect(built[1]?.activity).toBe("boom");
-		expect(built[2]?.activity).toBe("执行 ipython");
-		expect(built[3]?.activity).toBe("无问题");
-	});
-
-	it("formats elapsed time as m:ss and h:mm:ss", () => {
-		expect(formatSubagentElapsed(41_000)).toBe("0:41");
-		expect(formatSubagentElapsed(134_000)).toBe("2:14");
-		expect(formatSubagentElapsed(3_723_000)).toBe("1:02:03");
 	});
 });

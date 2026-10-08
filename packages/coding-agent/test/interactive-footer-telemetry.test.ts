@@ -221,7 +221,7 @@ describe("footer telemetry watermark (U6)", () => {
 		const lines = footer.render(120).map(stripAnsi);
 		expect(lines).toHaveLength(2);
 		expect(lines[0]).toContain("312k/1M");
-		expect(lines[1]).toBe("88 tok/s · avg 66");
+		expect(lines[1]).toBe(" 88 tok/s · avg 66");
 		const narrow = footer.render(24).map(stripAnsi);
 		expect(narrow).toHaveLength(2);
 		for (const line of narrow) {

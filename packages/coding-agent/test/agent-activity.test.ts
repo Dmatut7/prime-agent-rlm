@@ -152,6 +152,35 @@ describe("AgentActivityTracker", () => {
 		tracker.handleEvent({ type: "message_start", message: createUserMessage() });
 		expect(tracker.getStatus()).toEqual({ activity: "waiting", direction: "up", tokens: 0 });
 	});
+
+	test("a heartbeat or a background command's wake starts a new count too", () => {
+		// Neither is a user message nor an agent session message, but both start a
+		// run of their own: without a reset the loader shows the last run's total.
+		const heartbeat = {
+			role: "custom" as const,
+			customType: "heartbeat_prompt",
+			content: "check the inbox",
+			display: true,
+			timestamp: 0,
+		};
+		const bashDone = {
+			role: "custom" as const,
+			customType: "async_bash_completion",
+			content: "done",
+			display: true,
+			timestamp: 0,
+		};
+		for (const wake of [heartbeat, bashDone]) {
+			const tracker = new AgentActivityTracker();
+			const message = createAssistantMessage(500);
+			tracker.handleEvent({ type: "message_start", message });
+			tracker.handleEvent({ type: "message_end", message });
+			expect(tracker.getStatus().tokens).toBe(500);
+
+			tracker.handleEvent({ type: "message_start", message: wake });
+			expect(tracker.getStatus().tokens, `wake by ${wake.customType}`).toBe(0);
+		}
+	});
 });
 
 describe("formatTokenCount", () => {

@@ -1,0 +1,21 @@
+- Fixed near-million token readouts printing "1000k" next to a "1M" window - they now promote to the M form everywhere.
+- Fixed Ctrl+O expand-all skipping failed events, whose detail is why the turn failed.
+- Fixed keyboard focus vanishing from the timeline when a fold took its row away.
+- Fixed the legacy ⚙ step line counting a re-sent tool call twice.
+- Fixed the right side of a timeline row losing the last word's styling in its short form.
+- Fixed the turn's output counter ticking down when entries drop out of the timeline.
+- Fixed a wake report that lands after its turn closed counting its comm into the wrong turn, live and replay alike.
+- Fixed heartbeat and background-bash wakes not resetting the turn's token counter.
+- Fixed one file's kernel record and edit diff showing as two entries in the changes table.
+- Fixed command shortening budgeting code units instead of display columns.
+- Fixed queued background-command completions showing as plain follow-ups - they are now labeled 后台命令：.
+- Fixed the pinned quota-park row hard-cutting its longest form on a narrow terminal; it now picks the widest form that fits.
+- Fixed subagent chips keeping stale activity wording after an update that carries none.
+- Fixed an invalid re: search silently filtering every session row; the agents view now shows the regex error in the hint line.
+- Fixed step rows' right margins sitting two columns left of the event rows'.
+- Fixed the pending lane showing a bare session id for an unnamed cross-turn child; it now says 子代理.
+- Fixed the key-steps fold row overrunning a narrow terminal.
+- Fixed the footer re-adding dropped segments (chip/badge, spend cell/session figure) as the terminal narrows.
+- Fixed the /speed line indent differing by one column between the status-bar and telemetry faces.
+- Fixed the subagent strip hiding blocks that fit behind a 还有 N 个 marker.
+- Removed unread run-time and activity fields from the subagent panel data, and the dead elapsed-time formatter with them.

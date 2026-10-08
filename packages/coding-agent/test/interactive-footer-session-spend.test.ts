@@ -159,3 +159,51 @@ describe("footer.sessionSpend setting", () => {
 		expect(collectUnknownSettingsKeys({ footer: { sessionSpendd: true } })).toEqual(["footer.sessionSpendd"]);
 	});
 });
+
+describe("the telemetry ladder is monotone (each dropped segment stays dropped)", () => {
+	it("the spend cell never reappears once the width took it, and 本次 never reappears either", () => {
+		const footer = new FooterComponent(provider);
+		// A long session figure next to a short cell: the ladder used to drop the
+		// cell for the session-only rung, then re-add the cell one column narrower.
+		footer.setTelemetrySource(sourceWith({ ...SNAPSHOT, sessionCost: 1234.56 }));
+		footer.setSpendSource(() => ["子代理 ¥4"]);
+		let cellGone = false;
+		let sessionGone = false;
+		for (let width = 160; width >= 24; width -= 1) {
+			const line = footerLine(footer, width);
+			const hasCell = line.includes("子代理 ¥");
+			const hasSession = line.includes("本次");
+			if (hasCell) {
+				expect(cellGone, `the spend cell came back at width ${width}`).toBe(false);
+			} else {
+				cellGone = true;
+			}
+			if (hasSession) {
+				expect(sessionGone, `本次 came back at width ${width}`).toBe(false);
+			} else {
+				sessionGone = true;
+			}
+		}
+		expect(cellGone).toBe(true);
+		expect(sessionGone).toBe(true);
+	});
+});
+
+describe("the /speed line", () => {
+	it("keeps the same one-column indent in the status-bar face and the telemetry face", () => {
+		const withBar = new FooterComponent(provider);
+		withBar.setStatusBarSource(() => ({ model: "glm-5.3-prime", subagents: 0, right: [] }));
+		withBar.setSpeedEnabled(true);
+		withBar.setSpeedText("88 tok/s · avg 66");
+		const barLine = stripAnsi(withBar.render(110).at(-1) ?? "");
+
+		const withTelemetry = new FooterComponent(provider);
+		withTelemetry.setTelemetrySource(sourceWith(SNAPSHOT));
+		withTelemetry.setSpeedEnabled(true);
+		withTelemetry.setSpeedText("88 tok/s · avg 66");
+		const telemetryLine = stripAnsi(withTelemetry.render(110).at(-1) ?? "");
+
+		expect(barLine).toBe(" 88 tok/s · avg 66");
+		expect(telemetryLine).toBe(barLine);
+	});
+});

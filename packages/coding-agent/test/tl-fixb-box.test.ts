@@ -240,7 +240,7 @@ describe("a row with nothing on its right", () => {
 	it("still keeps the columns of a right side that says something", () => {
 		const row = stripAnsi(timelineRow({ main: "rail" }, content, "✓ 21秒  ", 80));
 		expect(visibleWidth(row)).toBe(80);
-		expect(row.slice(16)).toMatch(/^x+…? +✓ 21秒 {4}$/u);
+		expect(row.slice(16)).toMatch(/^x+…? +✓ 21秒 {2}$/u);
 	});
 
 	it("draws a step with no result, such as a file read, out to the last column", () => {

@@ -151,8 +151,10 @@ export function renderStatusBar(state: StatusBarState, width: number, badge?: st
 		[join(model, meterShort, chip, badgeText), plain(1)],
 		[join(model, meterShort, chip, badgeText), plain(2)],
 		[join(model, meterShort, chip, badgeText), plain(3)],
+		// The chip drops once, before the badge (an alarm outlives a counter);
+		// neither returns further down the ladder.
 		[join(model, meterShort, badgeText), plain(3)],
-		[join(model, chip), plain(3)],
+		[join(model, badgeText), plain(3)],
 		[model, plain(3)],
 		[model, right(rights.length - 1)],
 		[model, ""],
@@ -492,21 +494,24 @@ export class FooterComponent implements Component {
 				? `${theme.fg("muted", "本次")} ${theme.fg("accent", formatSpendCost(sessionCost))}${GROUP_GAP}`
 				: "";
 		const spend = this.spendSource?.() ?? [];
+		// The session figure is the first segment dropped at narrow widths (the
+		// spend cell outlives it), and a segment once dropped never returns further
+		// down: with cells the ladder goes full → cell-only → neither; without a
+		// cell the session figure gets its one rung before neither.
 		const layouts: Array<[string, string]> = [
 			...spend.map((form): [string, string] => [
 				`${model}${locationGroup}`,
 				`${activity}${form}${GROUP_GAP}${sessionSpend}${bar}${figures}`,
 			]),
-			[`${model}${locationGroup}`, `${activity}${sessionSpend}${bar}${figures}`],
 			...(sessionSpend
-				? [
-						...spend.map((form): [string, string] => [
+				? spend.length === 0
+					? [[`${model}${locationGroup}`, `${activity}${sessionSpend}${bar}${figures}`] as [string, string]]
+					: spend.map((form): [string, string] => [
 							`${model}${locationGroup}`,
 							`${activity}${form}${GROUP_GAP}${bar}${figures}`,
-						]),
-						[`${model}${locationGroup}`, `${activity}${bar}${figures}`] as [string, string],
-					]
+						])
 				: []),
+			[`${model}${locationGroup}`, `${activity}${bar}${figures}`],
 			[model, `${activity}${bar}${figures}`],
 			[model, `${activity}${figures}`],
 			[model, figures],
@@ -571,7 +576,7 @@ export class FooterComponent implements Component {
 		if (statusBar) {
 			const lines = [renderStatusBar(statusBar, safeWidth, toolErrorBadge)];
 			if (this.speedEnabled && this.speedText) {
-				lines.push(theme.fg("dim", truncateToWidth(` ${this.speedText}`, safeWidth, "")));
+				lines.push(this.speedLine(safeWidth));
 			}
 			if (extensionLine) {
 				lines.push(extensionLine);
@@ -601,13 +606,16 @@ export class FooterComponent implements Component {
 			lines.push(theme.fg("warning", truncateToWidth(` ${toolErrorBadge}`, safeWidth, "")));
 		}
 		if (this.speedEnabled && this.speedText) {
-			const text =
-				visibleWidth(this.speedText) > safeWidth ? truncateToWidth(this.speedText, safeWidth, "") : this.speedText;
-			lines.push(theme.fg("dim", text));
+			lines.push(this.speedLine(safeWidth));
 		}
 		if (extensionLine) {
 			lines.push(extensionLine);
 		}
 		return lines;
+	}
+
+	/** The /speed line, the same in both faces: one leading column, dim, cut to width. */
+	private speedLine(safeWidth: number): string {
+		return theme.fg("dim", truncateToWidth(` ${this.speedText}`, safeWidth, ""));
 	}
 }

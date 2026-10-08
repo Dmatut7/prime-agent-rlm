@@ -145,6 +145,37 @@ describe("the status line's layout with a spend cell", () => {
 		expect(bar).not.toContain("¥");
 		expect(plain(renderStatusBar(plainState, 80))).toContain("工作中 1分");
 	});
+
+	it("drops the chip once, before the badge, and never brings either back", () => {
+		// The chip-only rung used to sit below the chip-less one: as the width
+		// narrowed the subagent count vanished and then reappeared, and the
+		// tool-error badge went before it.
+		const withChipAndBadge: StatusBarState = { ...state, subagents: 3 };
+		const badge = "⚠ 工具错误×4";
+		let chipGone = false;
+		let badgeGone = false;
+		for (let width = 160; width >= 12; width -= 1) {
+			const bar = plain(renderStatusBar(withChipAndBadge, width, badge));
+			const hasChip = bar.includes("个子代理在跑");
+			const hasBadge = bar.includes("工具错误");
+			if (hasChip) {
+				expect(chipGone, `the chip came back at width ${width}`).toBe(false);
+			} else {
+				chipGone = true;
+			}
+			if (hasBadge) {
+				expect(badgeGone, `the badge came back at width ${width}`).toBe(false);
+			} else {
+				badgeGone = true;
+			}
+			if (hasChip && !hasBadge) {
+				// The badge is the alarm; it outlives the informational chip.
+				throw new Error(`badge dropped before the chip at width ${width}`);
+			}
+		}
+		expect(chipGone).toBe(true);
+		expect(badgeGone).toBe(true);
+	});
 });
 
 /** An interactive mode with just what the status line reads; the rest is not touched by it. */

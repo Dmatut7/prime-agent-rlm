@@ -12,6 +12,7 @@ import { ToolExecutionComponent } from "../src/modes/interactive/components/tool
 import { TurnActivityState, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { getEditorTheme, initTheme } from "../src/modes/interactive/theme/theme.js";
+import { modeMethod } from "./tl-fix-host.js";
 
 /**
  * FIX-19: Ctrl+P / Alt+P said "还没有代理消息可以展开" only in a chat that holds
@@ -363,6 +364,68 @@ describe.each(["quiet", "legacy"] as const)("Alt+P in the %s face", (processMode
 
 		expect(rig.toasts).toEqual([]);
 		expect(summary.state.agentMessagesExpanded).toBe(true);
+	});
+	it("counts a wake report into the turn it woke, in replay", () => {
+		// The report lands after the first turn closed: live holds it pending for
+		// the turn it wakes; the replay must group it the same way instead of
+		// dropping it (a `?.` on a turn summary that no longer exists).
+		const rig = createRig("quiet");
+		addAll(
+			rig,
+			conversation(
+				[
+					prompt(1_000),
+					toolCall("t1", "bash", { command: "ls" }, 1_100),
+					toolResult("t1", "bash", 1_200),
+					finalAnswer(1_300),
+					receivedAgentMessage("agentmsg_wake_report", 1_400),
+					assistant([{ type: "text", text: "on it" }], "stop", 1_500),
+				],
+				"quiet",
+			),
+		);
+		const summaries = turnSummaries(rig) as TurnSummaryComponent[];
+		expect(summaries).toHaveLength(2);
+		expect(summaries.map((summary) => summary.state.commMessageCount)).toEqual([0, 1]);
+	});
+
+	it("does not count a report that lands after its turn closed into that closed turn, live", async () => {
+		// The live handler held the report's comm into the still-current (but
+		// ended) turn; the replay counts it into the turn the report wakes.
+		const state = new TurnActivityState(1_000);
+		state.live = true;
+		const summary = new TurnSummaryComponent(state);
+		summary.setQuiet(true);
+		state.markTurnEnded();
+		const rig = createRig("quiet");
+		rig.chat.addChild(summary);
+		const fake = {
+			isInitialized: true,
+			footer: { invalidate: () => {} },
+			updateConnectionStateFromEvent: () => {},
+			prepareFeatureHintRun: () => {},
+			shortcutGuideContainer: { children: [] },
+			agentRunFileChanges: new Map(),
+			renderRecap: () => {},
+			activityTracker: { handleEvent: () => {} },
+			chatContainer: rig.chat,
+			ui: { requestRender: () => {} },
+			currentTurnSummary: summary as TurnSummaryComponent | undefined,
+			turnFlow: { customMessage: () => false },
+			addMessageToChat: () => {},
+			turnStartedAt: 1_000,
+			workingStartedAt: undefined,
+		};
+		Object.setPrototypeOf(fake, InteractiveMode.prototype);
+		const handleEvent =
+			modeMethod<(this: InteractiveMode, event: { type: "message_start"; message: AgentMessage }) => Promise<void>>(
+				"handleEvent",
+			);
+		await handleEvent.call(fake as unknown as InteractiveMode, {
+			type: "message_start",
+			message: receivedAgentMessage("agentmsg_late", 2_000),
+		});
+		expect(summary.state.commMessageCount).toBe(0);
 	});
 });
 

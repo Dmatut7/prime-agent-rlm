@@ -235,6 +235,15 @@ describe("the blank row a woken round keeps above itself", () => {
 		return summary;
 	}
 
+	it("renders nothing as the same empty array every time, not a fresh []", () => {
+		// A fresh [] per render defeats the aggregator's identity memo and rebuilds
+		// the transcript lines every frame.
+		const summary = hiddenRound();
+		const first = summary.render(80);
+		expect(first).toHaveLength(0);
+		expect(summary.render(80)).toBe(first);
+	});
+
 	it("looks past a round the timeline leaves out to what is really above", () => {
 		const stopped = new AssistantMessageComponent(
 			assistant(

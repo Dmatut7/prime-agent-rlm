@@ -11,7 +11,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT } from "../../../core/autonomous.js";
 import { autonomousPromptFingerprint, DUTY_EVENT_CUSTOM_TYPE, parseDutyEvent } from "../../../core/duty-log.js";
-import { sanitizeRowText } from "../../../utils/display-text.js";
+import { sanitizeRowText, sliceGraphemes } from "../../../utils/display-text.js";
 import { shortenPathHome } from "../../../utils/shorten-path.js";
 import type { AgentConnectionSessionTreeNode } from "../../agent-connection/index.js";
 import { WORKER_RECOVERY_RESUME_PROMPT } from "../../daemon/worker-recovery-resume.js";
@@ -866,7 +866,7 @@ class TreeList implements Component {
 					} else if (msgWithContent.stopReason === "aborted") {
 						result = theme.fg("success", "AI：") + theme.fg("muted", "（已中断）");
 					} else if (msgWithContent.errorMessage) {
-						const errMsg = sanitizeRowText(msgWithContent.errorMessage).slice(0, 80);
+						const errMsg = sliceGraphemes(sanitizeRowText(msgWithContent.errorMessage), 80);
 						result = theme.fg("success", "AI：") + theme.fg("error", errMsg);
 					} else {
 						result = theme.fg("success", "AI：") + theme.fg("muted", "（无内容）");
@@ -972,13 +972,13 @@ class TreeList implements Component {
 
 	private extractContent(content: unknown): string {
 		const maxLen = 200;
-		if (typeof content === "string") return content.slice(0, maxLen);
+		if (typeof content === "string") return sliceGraphemes(content, maxLen);
 		if (Array.isArray(content)) {
 			let result = "";
 			for (const c of content) {
 				if (typeof c === "object" && c !== null && "type" in c && c.type === "text") {
 					result += (c as { text: string }).text;
-					if (result.length >= maxLen) return result.slice(0, maxLen);
+					if (result.length >= maxLen) return sliceGraphemes(result, maxLen);
 				}
 			}
 			return result;
@@ -1009,18 +1009,18 @@ class TreeList implements Component {
 				// Washed before the cut: escape sequences used to eat the 50-column
 				// budget, and the length check that reports "..." counted them too.
 				const cmd = sanitizeRowText(String(args.command || ""));
-				return `[bash: ${cmd.slice(0, 50)}${cmd.length > 50 ? "..." : ""}]`;
+				return `[bash: ${sliceGraphemes(cmd, 50)}${cmd.length > 50 ? "..." : ""}]`;
 			}
 			case "ipython": {
 				const code = sanitizeRowText(String(args.code || ""));
-				return `[ipython: ${code.slice(0, 50)}${code.length > 50 ? "..." : ""}]`;
+				return `[ipython: ${sliceGraphemes(code, 50)}${code.length > 50 ? "..." : ""}]`;
 			}
 			default: {
 				// Custom tool - show name and truncated JSON args. `JSON.stringify`
 				// escapes the C0 range but not C1, so the args are washed like every
 				// other model-written text on this face.
 				const argsStr = sanitizeRowText(JSON.stringify(args));
-				return `[${sanitizeRowText(name)}: ${argsStr.slice(0, 40)}${argsStr.length > 40 ? "..." : ""}]`;
+				return `[${sanitizeRowText(name)}: ${sliceGraphemes(argsStr, 40)}${argsStr.length > 40 ? "..." : ""}]`;
 			}
 		}
 	}

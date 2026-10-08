@@ -298,7 +298,7 @@ describe("U6 status area layout", () => {
 		badgeWithTelemetry.setSpeedText("88 tok/s · avg 66");
 		const speedLines = badgeWithTelemetry.render(110).map(stripAnsi);
 		expect(speedLines).toHaveLength(2);
-		expect(speedLines[1]).toBe("88 tok/s · avg 66");
+		expect(speedLines[1]).toBe(" 88 tok/s · avg 66");
 
 		// A stalled child is a red-worded block in ③'s one row - which is exactly when subagents exist.
 		const stalled = new SubagentSummaryLine();

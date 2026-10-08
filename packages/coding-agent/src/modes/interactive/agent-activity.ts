@@ -1,4 +1,4 @@
-import { isAgentSessionMessage } from "../../core/agent-messages.js";
+import { startsAgentRun } from "../../core/agent-messages.js";
 import type { AgentConnectionSessionEvent } from "../agent-connection/index.js";
 import { estimateTokenUnits } from "./components/feed-data.js";
 
@@ -37,7 +37,10 @@ export class AgentActivityTracker {
 				break;
 
 			case "message_start":
-				if (event.message.role === "user" || isAgentSessionMessage(event.message)) {
+				// Every run starter resets the count: the owner's prompt, an agent
+				// message, a heartbeat, a background command's completion - the
+				// loader's tokens belong to the run that is starting, not the last.
+				if (startsAgentRun(event.message)) {
 					this.reset();
 				} else if (event.message.role === "assistant") {
 					this.activity = "waiting";
@@ -128,7 +131,8 @@ export class AgentActivityTracker {
 export function formatTokenCount(count: number): string {
 	if (count < 1000) return count.toString();
 	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-	if (count < 1000000) return `${Math.round(count / 1000)}k`;
+	// Same near-million promotion the footer and the turn box use: never "1000k".
+	if (count < 999_500) return `${Math.round(count / 1000)}k`;
 	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
 	return `${Math.round(count / 1000000)}M`;
 }

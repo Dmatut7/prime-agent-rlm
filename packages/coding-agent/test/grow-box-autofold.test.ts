@@ -1,3 +1,4 @@
+import type { Component } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { setMotionReduced } from "../src/modes/interactive/components/motion.js";
 import type { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
@@ -233,7 +234,75 @@ describe("a replayed box", () => {
 	});
 });
 
+describe("expand-all (Ctrl+O) on a failed turn", () => {
+	it("opens the fail event's detail, not just step lists", () => {
+		// A turn that ended on a model error: its fail event has no steps and no
+		// `more`, only the failed row's detail (why it failed). The event line
+		// shows the error's first line; the rest only shows when the row is open.
+		const turn = quietTurn({ live: false });
+		turn.timeline.noteMessage(
+			{
+				...assistant(T0 + 1_000, [], "error"),
+				errorMessage: "boom: model exploded\nstack line two\nstack line three",
+			},
+			true,
+		);
+		turn.state.markTurnEnded();
+		const events = turn.state.boxView().events;
+		const fail = events.find((event) => event.kind === "fail");
+		expect(fail, "the failed turn shows its failure as an event").toBeDefined();
+		expect(fail?.row?.detail, "the fail row carries its reason").toBeDefined();
+
+		const closed = plain(turn.summary.render(100)).join("\n");
+		expect(closed).toContain("boom: model exploded");
+		expect(closed).not.toContain("stack line two");
+
+		turn.summary.toggleBox();
+		const shown = plain(turn.summary.render(100)).join("\n");
+		expect(shown).toContain("stack line two");
+	});
+});
+
+describe("a wake report's join to the row above it", () => {
+	it("a steer (or any timeline entry) between two reports blocks the join", () => {
+		const turn = quietTurn();
+		const row: Component = { render: () => ["report"], invalidate: () => {} };
+		turn.summary.addInlineRow(row, T0 + 1_000);
+		// Nothing between them: the next report joins the row above.
+		expect(turn.summary.inlineRowBefore(T0 + 3_000)).toBe(row);
+		// An interjection at T0+2_000 sits between them: no join across it.
+		turn.timeline.addSteer("等等", T0 + 2_000);
+		expect(turn.summary.inlineRowBefore(T0 + 3_000)).toBeUndefined();
+	});
+});
+
 describe("the turn-end fold", () => {
+	it("re-anchors the keyboard focus a fold took away, instead of stranding it on a vanished row", () => {
+		const turn = quietTurn();
+		addCommand(turn, "c1", "npm test");
+		// Open the event so its step rows are focusable, then focus a step row.
+		turn.summary.render(100);
+		const event = turn.summary.getFocusOrder().find((key) => key.startsWith("ev:"));
+		if (!event) throw new Error("the turn has no event");
+		turn.summary.activate(event);
+		turn.summary.render(100);
+		const stepKey = turn.summary
+			.getFocusOrder()
+			.find((key) => !key.startsWith("ev:") && !key.startsWith("all:") && key !== "header");
+		expect(stepKey, "an open event lists its step rows").toBeDefined();
+		turn.timeline.ui.focused = true;
+		turn.timeline.ui.focusKey = stepKey;
+
+		turn.state.markTurnEnded();
+		turn.state.finishBox();
+		turn.summary.render(100);
+
+		const order = turn.summary.getFocusOrder();
+		expect(order, "focus re-anchors to a row the box still shows").toContain(turn.timeline.ui.focusKey);
+		expect(turn.summary.activate(turn.timeline.ui.focusKey ?? "header"), "Enter works on the re-anchored row").toBe(
+			true,
+		);
+	});
 	it("folds a long body at once instead of line by line", () => {
 		vi.useFakeTimers({ now: T0 });
 		const turn = quietTurn({ host: host({ viewportRows: () => 200 }) });

@@ -22,7 +22,7 @@ import {
 	timelineFacts,
 } from "./timeline-rows.js";
 import { computeBoxHeader, computeLiveTail, EVENT_STEPS_SHOWN, type InlineRow, renderTurnBox } from "./turn-box.js";
-import { TurnTimeline } from "./turn-timeline.js";
+import { TurnTimeline, timelineEntryAt } from "./turn-timeline.js";
 
 export type TurnStepStatus = "queued" | "running" | "done" | "error";
 
@@ -280,7 +280,12 @@ export class TurnActivityState {
 				return;
 			}
 			for (const event of this.boxView().events) {
-				const opensToSomething = event.steps.length > 0 || eventSaysMore(event);
+				// A fail event opens to why the turn failed (its row's detail): the
+				// line Ctrl+O must not skip, even without steps or more text.
+				const opensToSomething =
+					event.steps.length > 0 ||
+					eventSaysMore(event) ||
+					(event.kind === "fail" && event.row?.detail !== undefined);
 				if (opensToSomething) ui.expanded.add(event.key);
 			}
 			ui.bump();
@@ -503,7 +508,7 @@ export class TurnActivityState {
 		return this.dedupedStepCount();
 	}
 	private dedupedStepCount(): number {
-		return new Set(this.steps.map((step) => step.toolCallId)).size;
+		return this.dedupedSteps().length;
 	}
 	private stepIndexOf(toolCallId: string): number {
 		return this.steps.findIndex((step) => step.toolCallId === toolCallId);
@@ -645,12 +650,28 @@ export class TurnActivityState {
 
 	/** Failed steps in this turn; the aggregate line reports the count. */
 	get errorStepCount(): number {
-		return this.steps.filter((step) => step.status === "error").length;
+		return this.dedupedSteps().filter((step) => step.status === "error").length;
+	}
+
+	/**
+	 * One entry per tool call: a retried attempt re-sends the same toolCall id,
+	 * and the replay path adds a step per content block without dedup, so the
+	 * raw list can carry a call twice (the box's `stepCount` already dedups).
+	 * Status updates land on the first occurrence (see stepIndexOf), so the
+	 * first occurrence is the one kept here too.
+	 */
+	private dedupedSteps(): TurnStep[] {
+		const seen = new Set<string>();
+		return this.steps.filter((step) => {
+			if (seen.has(step.toolCallId)) return false;
+			seen.add(step.toolCallId);
+			return true;
+		});
 	}
 
 	private verbSummary(): string {
 		const counts = new Map<string, number>();
-		for (const step of this.steps) {
+		for (const step of this.dedupedSteps()) {
 			// The legacy aggregate line builds its own row, and a tool name is
 			// model-controlled (R3-M22): the verb is washed where it is joined.
 			const verb = sanitizeRowText(turnStepVerb(step.toolName));
@@ -686,7 +707,7 @@ export class TurnActivityState {
 
 	/** U6 ②: the process line — steps, duration, verb summary, error count. */
 	summaryText(): string {
-		const count = this.steps.length;
+		const count = this.stepCount;
 		if (count === 0) {
 			return "";
 		}
@@ -816,17 +837,16 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 
 	/**
 	 * The row that is drawn straight above a row landing at `at`, when nothing else of the turn sits
-	 * between them (two reports in a row share one blank line above).
+	 * between them (two reports in a row share one blank line above). Anything on the timeline - a
+	 * message, a steer, a dispatch, a notice - sits between, not only messages.
 	 */
 	inlineRowBefore(at: number): Component | undefined {
 		const last = this.inlineRows.at(-1);
 		if (!last) return undefined;
-		const later = this.turnState.timeline.entries.some(
-			(entry) =>
-				entry.kind === "message" &&
-				(entry.message.timestamp ?? 0) > last.at &&
-				(entry.message.timestamp ?? 0) <= at,
-		);
+		const later = this.turnState.timeline.entries.some((entry) => {
+			const entryAt = timelineEntryAt(entry);
+			return entryAt > last.at && entryAt <= at;
+		});
 		return later ? undefined : last.component;
 	}
 
@@ -926,12 +946,10 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	/** Open every thinking row of this turn (and the box, to show them), or close them all. */
 	setThinkingRows(open: boolean): void {
 		const ui = this.turnState.timeline.ui;
-		const now = Date.now();
 		for (const row of this.turnState.boxView().rows) {
 			if (row.kind !== "think" || !row.detail || row.factsOnly) continue;
 			if (open) {
 				ui.expanded.add(row.key);
-				ui.expandedAt.set(row.key, now);
 			} else {
 				ui.expanded.delete(row.key);
 			}
@@ -993,9 +1011,13 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		const lines = this.renderTurnHead(width);
 		const focused = this.blockFocus && lines.length > 0 ? decorateFocusedBlock(lines, width, this.blockFocus) : lines;
 		if (!this.revealArmed) return focused;
+		// A turn with no rows yet (a replayed empty turn) has nothing to carry
+		// the marker: spending it here loses the reveal and leaves the viewport
+		// slot pending on a marker no frame will ever show. Keep it armed.
+		if (focused.length === 0) return focused;
 		this.revealArmed = false;
 		// A copy: `focused` may be the cached lines array, which must not change.
-		return focused.length > 0 ? [TURN_KEY_REVEAL_MARKER + focused[0], ...focused.slice(1)] : focused;
+		return [TURN_KEY_REVEAL_MARKER + focused[0], ...focused.slice(1)];
 	}
 
 	setBlockFocus(state: BlockFocusState | undefined): void {

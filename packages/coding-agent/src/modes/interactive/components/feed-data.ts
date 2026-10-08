@@ -455,7 +455,9 @@ export function aggregateChanges(
 				const path = displayPath(change, cwd);
 				const rows = change.diff ? memoRows(change, () => parseUnifiedDiff(change.diff ?? "")) : [];
 				addEntry(entries, {
-					key: change.path,
+					// The merge key is the display path: the legacy channels key by it
+					// too, and one file must not become two entries per channel mix.
+					key: path,
 					path,
 					kind: change.kind,
 					...(change.oldPath ? { oldPath: displayPath({ path: change.oldPath }, cwd) } : {}),

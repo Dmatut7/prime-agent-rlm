@@ -194,6 +194,14 @@ export function isFocusable(component: Component | null): component is Component
  */
 export const CURSOR_MARKER = "\x1b_pi:c\x07";
 
+/**
+ * Every in-band `_pi:` APC marker a component can leave on a rendered row
+ * (focus/reveal markers like {@link CURSOR_MARKER}). The inline render path
+ * strips them before the lines reach the terminal; the fullscreen viewport
+ * consumes its reveal marker before this runs.
+ */
+const INLINE_PI_MARKER = /\x1b_pi:[^\x07]*\x07/g;
+
 export { visibleWidth };
 
 /**
@@ -2309,6 +2317,18 @@ export class TUI extends Container {
 
 		// Extract cursor position before applying line resets (marker must be found first)
 		const cursorPos = this.extractCursorPosition(newLines, height);
+
+		// In-band reveal markers (`\x1b_pi:…\x07` APC: box/block focus, turn-key
+		// reveal) are consumed by the fullscreen viewport, which strips them
+		// itself. Inline mode has no viewport, so without this pass the raw APC
+		// bytes would be written to the terminal (script/tmux record them as
+		// garbage). The cursor marker is already extracted above.
+		for (let i = 0; i < newLines.length; i++) {
+			const line = newLines[i];
+			if (line !== undefined && line.includes("\x1b_pi:")) {
+				newLines[i] = line.replace(INLINE_PI_MARKER, "");
+			}
+		}
 
 		// Snapshot the raw (marker-stripped, pre-normalization) lines: this is
 		// the identity basis the next frame compares its raw lines against.

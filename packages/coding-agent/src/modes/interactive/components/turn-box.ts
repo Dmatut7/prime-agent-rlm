@@ -515,11 +515,14 @@ function stepStatus(row: BoxRow, now: number): string {
 	return `${meta}${meta ? " " : ""}${theme.fg("timelineFaint", took)}`;
 }
 
+/** A lane key that is a bare session id (an unnamed child): hex and dashes only, no word a person picked. */
+const BARE_LANE_ID = /^[0-9a-f][0-9a-f-]{5,}$/i;
+
 /** What stays of a step's right side on a narrow line: its ✓ or ✗ when it has one, nothing otherwise. */
 function stepMark(row: BoxRow): string {
 	if (row.kind === "error" || row.status === "running") return "";
-	if (row.status === "failed") return `${theme.fg("timelineMust", "✗")}  `;
-	return row.meta[0]?.text.startsWith("✓") ? `${theme.fg("timelineFaint", "✓")}  ` : "";
+	if (row.status === "failed") return theme.fg("timelineMust", "✗");
+	return row.meta[0]?.text.startsWith("✓") ? theme.fg("timelineFaint", "✓") : "";
 }
 
 /**
@@ -632,6 +635,8 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 			);
 	const runStart = new Map<number, number>();
 	for (const run of folds) for (const index of run) runStart.set(index, run[0] ?? index);
+	/** A listed step row's (or its `全部` row's) owning event: where a dangling focus re-anchors. */
+	const parentOf = new Map<string, string>();
 	input.events.forEach((event, index) => {
 		flushInline(event.at);
 		const lane = laneOfEvent(index);
@@ -727,6 +732,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 			const allOpen = ui.expanded.has(`all:${event.key}`);
 			const listed = allOpen ? event.steps : event.steps.slice(0, EVENT_STEPS_SHOWN);
 			for (const step of listed) {
+				parentOf.set(step.key, event.key);
 				const stepOpen = ui.expanded.has(step.key);
 				const running = step.status === "running";
 				const glyphColor: ThemeColor = running
@@ -742,7 +748,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 				specs.push({
 					gutter: { main: "rail", lane },
 					content: `${" ".repeat(STEP_INDENT)}${theme.bold(theme.fg(glyphColor, glyph))}  ${theme.fg("timelineTime", stepWords(step))}`,
-					right: `${stepStatus(step, now)}  `,
+					right: stepStatus(step, now),
 					fit: { minContent: STEP_INDENT + STEP_GLYPH_COLS + STEP_WORDS_MIN, short: stepMark(step) },
 					key: step.key,
 					onClick: toggle(step.key),
@@ -760,10 +766,11 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 			const hidden = event.steps.length - listed.length;
 			// Once every step is listed the same line stays, saying how many there are, and folds the list back.
 			if (hidden > 0 || (allOpen && event.steps.length > EVENT_STEPS_SHOWN)) {
+				parentOf.set(`all:${event.key}`, event.key);
 				specs.push({
 					gutter: { main: "rail", lane },
 					content: `${" ".repeat(STEP_INDENT)}${theme.bold(theme.fg("timelineFaint", "⋯"))}  ${theme.fg("timelineTime", hidden > 0 ? `另外 ${hidden} 步` : `共 ${event.steps.length} 步`)}`,
-					right: `${theme.fg("timelineFaint", hidden > 0 ? "全部 ›" : "▴ 收起")}  `,
+					right: theme.fg("timelineFaint", hidden > 0 ? "全部 ›" : "▴ 收起"),
 					key: `all:${event.key}`,
 					onClick: toggle(`all:${event.key}`),
 					reveal: Math.min(hidden, STEP_REVEAL),
@@ -817,7 +824,7 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 					"timelineTime",
 					`${" ".repeat(STEP_INDENT)}${tail.running ? `${TIP_LABEL}${tail.running.text}` : (tail.waiting ?? "")}`,
 				),
-				...(elapsed ? { right: `${theme.fg("timelineFaint", elapsed)}  ` } : {}),
+				...(elapsed ? { right: theme.fg("timelineFaint", elapsed) } : {}),
 				// Its clock goes before the command is cut below what a step line keeps.
 				fit: { minContent: STEP_INDENT + visibleWidth(TIP_LABEL) + STEP_WORDS_MIN, short: "" },
 			});
@@ -832,18 +839,29 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 				gutter: { main: "blank", lane },
 				content: theme.fg(
 					"timelineLane",
-					`${pending.map((key) => shortAgentName(shown.get(key) ?? key) || "子代理").join("、")} 还在干活`,
+					// A child another turn dispatched is not in `shown`; its lane key is a
+					// bare session id then, and an id is not a name - say 子代理 instead.
+					`${pending.map((key) => shortAgentName(shown.get(key) ?? (BARE_LANE_ID.test(key) ? "" : key)) || "子代理").join("、")} 还在干活`,
 				),
 			});
 		}
 	}
 
 	const focusOrder = specs.flatMap((spec) => (spec.key !== undefined ? [spec.key] : []));
-	const focusKey = ui.focused
+	// A fold (the turn-end one, or the user's) can take the focused row with it —
+	// a step under an event that just closed. Re-anchor the focus on the row's
+	// event, which stays: a dangling key makes Enter dead and the next arrow jump
+	// to the first row. Strip keys (`strip:…`) belong to the change strip's own
+	// order, not this one.
+	let focusKey = ui.focused
 		? ui.focusKey === "header" || ui.focusKey === undefined
 			? focusOrder[0]
 			: ui.focusKey
 		: undefined;
+	if (focusKey !== undefined && !focusKey.startsWith("strip:") && !focusOrder.includes(focusKey)) {
+		focusKey = parentOf.get(focusKey) ?? focusOrder[0];
+		ui.focusKey = focusKey;
+	}
 	const lines: string[] = [];
 	const regions: ClickRegion[] = [];
 	// The row that leaves its right side out is the row block navigation puts its key hint on, so it is

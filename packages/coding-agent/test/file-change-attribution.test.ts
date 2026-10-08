@@ -102,6 +102,30 @@ describe("file-change attribution pipeline", () => {
 		expect(legacy[0]?.origin).toBeUndefined();
 	});
 
+	it("merges the kernel's file-change record and the edit tool's own diff for the same file", () => {
+		// The kernel channel keyed entries by the raw path while the edit channels
+		// keyed by the display path: one file showed as two entries with split counts.
+		const steps = [
+			{
+				order: 0,
+				toolName: "ipython",
+				data: { ...emptyStepFeedData(), fileChanges: [kernelChange("/work/app/a.ts")] },
+			},
+			{
+				order: 1,
+				toolName: "edit",
+				data: {
+					...emptyStepFeedData(),
+					editDiff: { path: "a.ts", diff: "- 1 x\n+ 1 y" },
+				},
+			},
+		];
+		const entries = aggregateChanges(steps, "/work/app");
+		expect(entries.map((entry) => entry.path)).toEqual(["a.ts"]);
+		expect(entries[0]?.added).toBe(2);
+		expect(entries[0]?.removed).toBe(1);
+	});
+
 	it("getToolFileChanges passes the kernel record's origin into the footnote summaries", () => {
 		const changes = getToolFileChanges(
 			"ipython",

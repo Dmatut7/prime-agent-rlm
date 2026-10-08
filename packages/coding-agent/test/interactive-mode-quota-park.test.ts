@@ -29,9 +29,12 @@ type HandleQuotaParkStatus = (this: ModeFake, event: QuotaParkStatusEvent) => vo
 
 type SubscribeToAgent = (this: ModeFake) => void;
 
+type UpdateSubagentSummary = (this: ModeFake, child: unknown) => void;
+
 const proto = InteractiveMode.prototype as unknown as {
 	handleQuotaParkStatus: HandleQuotaParkStatus;
 	subscribeToAgent: SubscribeToAgent;
+	updateSubagentSummary: UpdateSubagentSummary;
 };
 
 const T0 = 1_700_000_000_000;
@@ -219,6 +222,35 @@ describe("legacy park status row (R3-7)", () => {
 		proto.handleQuotaParkStatus.call(quiet, { type: "quota_park_status", parked: false });
 	});
 
+	it("drops a child's stale activity when the next update carries none (absent means cleared)", () => {
+		// Every producer (rlmChildSnapshotForRun/ForSession) computes activity
+		// fresh, so an update without it says the child has none now; keeping the
+		// previous one pinned the chip's text forever.
+		const mode = parkFake({
+			subagentSnapshots: new Map([
+				[
+					"c1",
+					{
+						id: "c1",
+						label: "worker",
+						status: "running",
+						sessionDir: "/tmp/c1",
+						activity: { kind: "executing", toolName: "bash" },
+					},
+				],
+			]),
+			refreshSubagentSummary: () => {},
+		});
+		proto.updateSubagentSummary.call(mode, {
+			id: "c1",
+			label: "worker",
+			status: "running",
+			sessionDir: "/tmp/c1",
+		} as never);
+		const merged = (mode.subagentSnapshots as Map<string, { activity?: unknown }>).get("c1");
+		expect(merged?.activity).toBeUndefined();
+	});
+
 	it("re-pins the row on the park tick after another status-container owner cleared it", () => {
 		const mode = parkFake();
 		proto.handleQuotaParkStatus.call(mode, { type: "quota_park_status", parked: true, resumeAt: isoIn(3_600_000) });
@@ -234,6 +266,27 @@ describe("legacy park status row (R3-7)", () => {
 		expect(statusText(mode)).toContain("额度等待");
 
 		proto.handleQuotaParkStatus.call(mode, { type: "quota_park_status", parked: false });
+	});
+
+	it("picks the widest form that fits instead of hard-cutting the longest one", () => {
+		const mode = parkFake();
+		proto.handleQuotaParkStatus.call(mode, {
+			type: "quota_park_status",
+			parked: true,
+			resumeAt: isoIn(3_600_000),
+			provider: "anthropic",
+			parkCount: 3,
+		});
+		const statusContainer = mode.statusContainer as Container;
+		// The longest form (provider + countdown + count) does not fit 24 columns;
+		// a shorter form does, and must not lose its tail to a hard cut.
+		const at24 = stripAnsi(statusContainer.render(24).join("\n"));
+		expect(at24).toContain("额度等待");
+		expect(at24).not.toContain("anthropic");
+		expect(at24.endsWith("…") || at24.endsWith("恢复") || at24.endsWith("）") || at24.endsWith("第 3 次")).toBe(true);
+		// Narrower than every form: the cut carries the ellipsis.
+		const at8 = stripAnsi(statusContainer.render(8).join("\n"));
+		expect(at8.endsWith("…")).toBe(true);
 	});
 });
 

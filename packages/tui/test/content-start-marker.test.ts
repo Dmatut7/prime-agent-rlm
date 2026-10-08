@@ -99,4 +99,44 @@ describe("content-start marker", () => {
 		assert.ok(written.includes("inline text"));
 		assert.strictEqual(written.includes("pi:content"), false);
 	});
+
+	it("an inline screen strips in-band _pi: reveal markers (box focus, block focus, turn key)", async () => {
+		const terminal = new Recorder(60, 12);
+		const tui = new TUI(terminal);
+		// The fullscreen viewport consumes and strips these; inline mode has no
+		// viewport, so without a strip the raw APC bytes reach the terminal.
+		tui.addChild(
+			new Lines([
+				"\x1b_pi:box-focus\x07focused box row",
+				"\x1b_pi:block-focus\x07focused block row",
+				"\x1b_pi:turn-key-reveal\x07revealed turn row",
+			]),
+		);
+		tui.start();
+		await terminal.waitForRender();
+		const written = terminal.written;
+		tui.stop();
+		assert.ok(written.includes("focused box row"));
+		assert.ok(written.includes("focused block row"));
+		assert.ok(written.includes("revealed turn row"));
+		assert.strictEqual(written.includes("\x1b_pi:"), false, "no _pi: APC bytes on the wire");
+	});
+
+	it("fullscreen keeps consuming the reveal marker (scroll target found, bytes still stripped)", async () => {
+		const terminal = new Recorder(60, 8);
+		const tui = new TUI(terminal);
+		const chat = new Lines(Array.from({ length: 40 }, (_, i) => `row ${i}`));
+		tui.addChild(chat);
+		tui.start();
+		tui.enterFullscreen({ scroll: [chat], dock: new Lines(["> prompt"]) });
+		await terminal.waitForRender();
+		chat.lines = [...chat.lines.slice(0, 5), "\x1b_pi:box-focus\x07focused deep row", ...chat.lines.slice(5)];
+		tui.setFullscreenRevealMarker("\x1b_pi:box-focus\x07");
+		tui.requestRender();
+		await terminal.waitForRender();
+		const written = terminal.written;
+		tui.stop();
+		assert.ok(written.includes("focused deep row"));
+		assert.strictEqual(written.includes("\x1b_pi:"), false);
+	});
 });

@@ -347,22 +347,30 @@ export function latestShownTurn(children: readonly Component[]): TurnSummaryComp
 	return undefined;
 }
 
+/**
+ * One shared empty answer for a component that draws nothing. A fresh `[]` per
+ * call defeats the aggregator's identity memo (a Spacer did the same), so every
+ * frame rebuilt the transcript lines array.
+ */
+const NO_LINES: string[] = [];
+const NO_ROWS: readonly never[] = [];
+
 /** The turn head of a round that is only an acknowledgement: nothing of it is drawn. */
 export class QuietTurnSummary extends TurnSummaryComponent {
 	override render(width: number): string[] {
-		return isAckRound(this.state) ? [] : super.render(width);
+		return isAckRound(this.state) ? NO_LINES : super.render(width);
 	}
 
 	override getClickRegions(): ReadonlyArray<ClickRegion> {
-		return isAckRound(this.state) ? [] : super.getClickRegions();
+		return isAckRound(this.state) ? NO_ROWS : super.getClickRegions();
 	}
 
 	override getStickyHeaders(): ReadonlyArray<StickyHeader> {
-		return isAckRound(this.state) ? [] : super.getStickyHeaders();
+		return isAckRound(this.state) ? NO_ROWS : super.getStickyHeaders();
 	}
 
 	override getFocusOrder(): readonly string[] {
-		return isAckRound(this.state) ? [] : super.getFocusOrder();
+		return isAckRound(this.state) ? NO_ROWS : super.getFocusOrder();
 	}
 }
 
@@ -380,15 +388,15 @@ export class QuietAssistantMessage extends AssistantMessageComponent {
 	}
 
 	override render(width: number): string[] {
-		return this.hidden ? [] : super.render(width);
+		return this.hidden ? NO_LINES : super.render(width);
 	}
 
 	override getClickRegions(): ReadonlyArray<ClickRegion> {
-		return this.hidden ? [] : super.getClickRegions();
+		return this.hidden ? NO_ROWS : super.getClickRegions();
 	}
 
 	override getSelectionRegions(): ReadonlyArray<TableCellSelectionRegion> {
-		return this.hidden ? [] : super.getSelectionRegions();
+		return this.hidden ? NO_ROWS : super.getSelectionRegions();
 	}
 }
 
@@ -635,6 +643,9 @@ export function replayConversation(
 	// TUI v4: comms counted per turn (received agent-message rows + sent
 	// agent messages inside ipython tool details), deduped by message id.
 	const sentCommIds = new Set<string>();
+	// A report that lands between turns (it wakes the next one) holds its comm
+	// for that turn: the live path holds the same report pending the same way.
+	let pendingWakeComms = 0;
 	// Which subagents of the current question are still out: the lane the rows are drawn in.
 	const lane = hooks?.subagentLane ?? new SubagentLane();
 	// A turn a message woke (a subagent's report, a notice) is not the owner's own.
@@ -690,13 +701,13 @@ export function replayConversation(
 	/** The error text of a tool call left open by an aborted/error reply. */
 	const interruptedToolErrorText = (message: AgentMessage): string => {
 		if (message.role === "assistant" && message.stopReason === "aborted") {
+			// The live path bakes the count into the message at message_end; a replay
+			// reads that snapshot, not the session's retry counter of right now.
+			const own = message.errorMessage;
+			if (own && own !== "Request was aborted" && own !== "Operation aborted") return own;
 			const retryAttempt = hooks?.retryAttempt?.() ?? 0;
 			if (retryAttempt > 0) return `重试 ${retryAttempt} 次后已中断`;
-			return message.errorMessage &&
-				message.errorMessage !== "Request was aborted" &&
-				message.errorMessage !== "Operation aborted"
-				? message.errorMessage
-				: "已中断";
+			return "已中断";
 		}
 		return (message.role === "assistant" ? message.errorMessage : undefined) || "Error";
 	};
@@ -888,6 +899,11 @@ export function replayConversation(
 					turnSummary.setExpanded(expanded);
 					// TUI v4: quiet turns carry the one-line footnote at their head.
 					turnSummary.setQuiet(quiet);
+					// The comms of the reports that woke this turn count into it.
+					while (pendingWakeComms > 0) {
+						turnSummary.addCommMessage();
+						pendingWakeComms -= 1;
+					}
 					giveLaneTracker(turnSummary, lane.tracker);
 					target.addChild(turnSummary);
 					hooks?.onTurnCreated?.(turnState, turnSummary);
@@ -1080,8 +1096,12 @@ export function replayConversation(
 			}
 			if (message.role === "custom") {
 				if (!message.display) continue;
-				// TUI v4: a received agent-message row is one comm in this turn.
-				if (isAgentSessionMessage(message)) turnSummary?.addCommMessage();
+				// TUI v4: a received agent-message row is one comm in this turn; a
+				// report that landed between turns holds its comm for the turn it wakes.
+				if (isAgentSessionMessage(message)) {
+					if (turnSummary) turnSummary.addCommMessage();
+					else pendingWakeComms += 1;
+				}
 				if (isSessionSlashCommandMessage(message) && target.children.length > 0) target.addChild(new Spacer(1));
 				const component = customRow(message);
 				applyExpansionLanes(component, expansionLanes);

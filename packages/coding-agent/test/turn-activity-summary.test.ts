@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai";
-import type { TUI } from "@earendil-works/pi-tui";
+import { type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
@@ -160,6 +160,22 @@ describe("turn activity summary (U4)", () => {
 		expect(nonEmpty[0]).toMatch(USER_BUBBLE_HEADER);
 		expect(nonEmpty[1]).toContain("run the checks");
 		expect(nonEmpty[2]).toContain("⚙ 6 步");
+	});
+
+	it("counts a re-sent tool call once in the ⚙ N 步 line", () => {
+		// A retried attempt re-sends the same toolCall id; the box's stepCount
+		// dedups it, the legacy aggregate line must agree.
+		const messages: AgentMessage[] = [
+			{ role: "user", content: "run the checks", timestamp: 900 },
+			assistant([{ type: "toolCall", id: "bash-1", name: "bash", arguments: { command: "npm test" } }], 1_000),
+			toolResult("bash-1", "bash", "output line 1", 1_100),
+			assistant([{ type: "toolCall", id: "bash-1", name: "bash", arguments: { command: "npm test" } }], 1_200),
+			toolResult("bash-1", "bash", "output line 1 again", 1_300),
+			assistant([{ type: "text", text: "done" }], 2_000),
+		];
+		const collapsed = renderAll(messages, false);
+		expect(collapsed).toContain("⚙ 1 步");
+		expect(collapsed).not.toContain("⚙ 2 步");
 	});
 
 	it("failed steps never fold: the ✗ row stays visible and the aggregate counts it (第五批)", () => {
@@ -438,6 +454,31 @@ describe("process block key-steps fold (TUI v4 T6)", () => {
 		expect(big.processFoldHiddenCount()).toBe(0);
 	});
 
+	it("cuts the fold row to the width instead of overrunning a narrow terminal", () => {
+		const state = foldableState(14);
+		state.setCollapsed(false);
+		const tool = new ToolExecutionComponent(
+			"bash",
+			"t4",
+			{},
+			{},
+			undefined,
+			{ requestRender: vi.fn() } as unknown as TUI,
+			"/tmp",
+		);
+		tool.setTurnActivity(state);
+		tool.setExpanded(false);
+		setQuietConversationBudget(true);
+		try {
+			for (const width of [8, 6, 12]) {
+				const line = stripAnsi(tool.render(width).join("\n"));
+				expect(visibleWidth(line), `width ${width}`).toBeLessThanOrEqual(width);
+			}
+		} finally {
+			setQuietConversationBudget(false);
+		}
+	});
+
 	it("the fold row renders from the carrying tool component", () => {
 		const state = foldableState(14);
 		state.setCollapsed(false);
@@ -576,5 +617,33 @@ describe("turn state for the process line", () => {
 		state.latestThinking = "plan: read the file first";
 		state.latestThinking = "done, now answer";
 		expect(state.latestThinking).toBe("plan: read the file first");
+	});
+});
+
+describe("an interrupted tool's error text in replay", () => {
+	it("uses the message's own baked retry count, not the session's current one", () => {
+		const messages: AgentMessage[] = [
+			{ role: "user", content: "run it", timestamp: 900 },
+			{
+				...assistant([{ type: "toolCall", id: "c1", name: "bash", arguments: { command: "npm test" } }], 1_000),
+				stopReason: "aborted",
+				errorMessage: "重试 3 次后已中断",
+			},
+		];
+		// The attached session happens to be mid-retry at attempt 7 right now; the
+		// recorded turn was interrupted after 3.
+		const components = buildConversationComponents(messages, {
+			ui,
+			cwd: "/tmp",
+			toolOptions: {},
+			getToolDefinition: () => undefined,
+			hooks: { retryAttempt: () => 7 },
+		});
+		const rendered = components
+			.flatMap((component) => component.render(120))
+			.map(stripAnsi)
+			.join("\n");
+		expect(rendered).toContain("重试 3 次后已中断");
+		expect(rendered).not.toContain("重试 7 次后已中断");
 	});
 });

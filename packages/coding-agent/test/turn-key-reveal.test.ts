@@ -9,11 +9,15 @@ import {
 	setToolOutputFull,
 	toolOutputFull,
 } from "../src/modes/interactive/components/tool-output-budget.js";
-import { TURN_KEY_REVEAL_MARKER, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
+import {
+	TURN_KEY_REVEAL_MARKER,
+	TurnActivityState,
+	TurnSummaryComponent,
+} from "../src/modes/interactive/components/turn-activity.js";
 import { BOX_FOCUS_MARKER } from "../src/modes/interactive/components/turn-box.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 import { createReplayHost, modeMethod, type ReplayHost, replayInto } from "./tl-fix-host.js";
-import { assistant, T0 } from "./ui-blocks-helpers.js";
+import { addCommand, assistant, host, T0 } from "./ui-blocks-helpers.js";
 
 /**
  * wave-49 F1: a --resume'd old-format session is taller than the fullscreen
@@ -350,6 +354,27 @@ describe("turn key reveal (wave-49 F1)", () => {
  * never armed a reveal at all.
  */
 describe("turn key reveal lifecycle (audit M5)", () => {
+	it("a render with zero rows does not spend the armed reveal: the next render with rows carries it", () => {
+		// A replayed turn with nothing visible renders zero rows; spending the
+		// one-shot marker on that render loses the reveal (the key looks dead and
+		// the viewport slot stays pending).
+		const state = new TurnActivityState(T0);
+		const summary = new TurnSummaryComponent(state);
+		summary.setTimelineHost(host());
+		summary.setQuiet(true);
+		state.markTurnEnded();
+		expect(summary.render(100)).toHaveLength(0);
+
+		summary.armRevealMarker();
+		expect(summary.render(100)).toHaveLength(0);
+
+		addCommand({ state, summary, timeline: state.timeline }, "c1", "npm test");
+		summary.invalidate();
+		const lines = summary.render(100);
+		expect(lines.length).toBeGreaterThan(0);
+		expect(lines.some((line) => line.includes(TURN_KEY_REVEAL_MARKER))).toBe(true);
+	});
+
 	it("block navigation's measurement between arm and frame does not spend the reveal", async () => {
 		const ui = fullscreenUi();
 		const host = await replayedOldFormatTurn(ui);

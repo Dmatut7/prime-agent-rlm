@@ -109,6 +109,23 @@ export type TimelineEntry =
 	| { seq: number; kind: "subagent"; key: string; sub: TimelineSubagent }
 	| { seq: number; kind: "notice"; key: string; notice: TimelineNotice; at: number };
 
+/** When an entry happened, whatever its kind (0 when unknown). */
+export function timelineEntryAt(entry: TimelineEntry): number {
+	switch (entry.kind) {
+		case "message":
+			return entry.message.timestamp ?? 0;
+		case "steer":
+		case "notice":
+			return entry.at;
+		case "retry":
+			return entry.retry.startedAt;
+		case "compact":
+			return entry.compaction.startedAt;
+		case "subagent":
+			return entry.sub.startedAt;
+	}
+}
+
 /** Live timing of one thinking block; absent for a replayed turn. */
 export interface ThinkingTiming {
 	startedAt: number;
@@ -220,9 +237,6 @@ export class TimelineUiState {
 	/** First body line and body height the last render showed (clicks and the wheel act on these). */
 	lastTop = 0;
 	lastVisible = 0;
-	/** Bring this row into the body's view on the next render (its opened lines too, when `revealDetail`). */
-	revealKey: string | undefined;
-	revealDetail = false;
 	/**
 	 * Event keys (`ev:`, `all:`) the thinking lane opened itself: closing the
 	 * thoughts closes them again. A key leaves the ledger the moment anything
@@ -231,7 +245,6 @@ export class TimelineUiState {
 	readonly thinkingOpenedKeys = new Set<string>();
 	/** Open rows and events (`ev:` keys), and events listing every step (`all:` keys). */
 	readonly expanded = new ExpandedKeys((key) => this.thinkingOpenedKeys.delete(key));
-	readonly expandedAt = new Map<string, number>();
 	/** The lane the turn started in (subagents of earlier turns still out), taken when the lane tracker was first given. */
 	startLane: TimelineLane | undefined;
 	readonly enteredAt = new Map<string, number>();
@@ -265,18 +278,14 @@ export class TimelineUiState {
 	 * the row where it is: what opens slides in below it, and the view scrolls
 	 * only as far as needed to show it, never past the row itself.
 	 */
-	toggleRow(key: string, now = Date.now()): boolean {
+	toggleRow(key: string): boolean {
 		const open = !this.expanded.has(key);
 		if (open) {
 			this.expanded.add(key);
-			this.expandedAt.set(key, now);
 		} else {
 			this.expanded.delete(key);
-			this.expandedAt.delete(key);
 		}
 		this.holdView();
-		this.revealKey = key;
-		this.revealDetail = open;
 		this.bump();
 		return open;
 	}
@@ -328,13 +337,6 @@ export class TimelineUiState {
 		for (const key of [...this.expanded]) {
 			if (key.startsWith("ev:") || key.startsWith("all:")) this.expanded.delete(key);
 		}
-		this.bump();
-	}
-
-	/** Back to following the newest line. */
-	followNewest(): void {
-		this.follow = true;
-		this.unseen = false;
 		this.bump();
 	}
 }
@@ -408,6 +410,8 @@ export class TurnTimeline implements LaneOwner {
 	/**
 	 * Remove one entry: an attempt the session dropped before it ended (an
 	 * empty-turn retry starts over) was never kept, so its row and its tokens go.
+	 * The token peak stays: the counter already showed those tokens, and its
+	 * contract is that it never decreases.
 	 */
 	dropEntry(key: string): void {
 		const index = this.entries.findIndex((entry) => entry.key === key);
@@ -417,7 +421,6 @@ export class TurnTimeline implements LaneOwner {
 			for (const timingKey of [...this.thinkingTiming.keys()]) {
 				if (timingKey.startsWith(`${key}:`)) this.thinkingTiming.delete(timingKey);
 			}
-			this.tokenPeak = 0;
 		}
 		this.ui.bump();
 	}
@@ -875,7 +878,9 @@ export function formatBoxTokens(tokens: number): string {
 	const value = Math.max(0, Math.round(tokens));
 	if (value < 1000) return String(value);
 	if (value < 100_000) return `${(value / 1000).toFixed(1)}k`;
-	if (value < 1_000_000) return `${Math.round(value / 1000)}k`;
+	// The footer's context readout promotes a near-million (999,600) to 1M;
+	// "1000k" next to the window's "1M" reads like an overflow. Same rule here.
+	if (value < 999_500) return `${Math.round(value / 1000)}k`;
 	return `${(value / 1_000_000).toFixed(1)}M`;
 }
 

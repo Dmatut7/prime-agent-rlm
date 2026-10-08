@@ -100,6 +100,80 @@ export interface TimelineRowOptions {
 }
 
 /**
+ * The right side's last word with the styling active where the word starts.
+ * A plain slice from the last space drops the run's opening codes, and the
+ * word then shows in whatever color the row left active. Right sides carry
+ * only SGR (theme.fg/bold produce nothing else), so a per-attribute replay
+ * of the SGR codes up to the word is exact.
+ */
+function styledLastWord(trimmed: string): string {
+	const active = new Map<string, string>();
+	let lastSpace = -1;
+	let activeAtLastSpace: string[] = [];
+	let i = 0;
+	while (i < trimmed.length) {
+		if (trimmed[i] === "\x1b" && trimmed[i + 1] === "[") {
+			const end = trimmed.indexOf("m", i + 2);
+			if (end === -1) break;
+			applySgr(active, trimmed.slice(i + 2, end), trimmed.slice(i, end + 1));
+			i = end + 1;
+			continue;
+		}
+		if (trimmed[i] === " ") {
+			lastSpace = i;
+			activeAtLastSpace = [...active.values()];
+		}
+		i++;
+	}
+	if (lastSpace === -1) return trimmed;
+	return activeAtLastSpace.join("") + trimmed.slice(lastSpace + 1);
+}
+
+/** The attribute group an SGR parameter sets (or clears); the group key is what a later code overrides. */
+function applySgr(active: Map<string, string>, params: string, sequence: string): void {
+	if (params === "" || params === "0") {
+		active.clear();
+		return;
+	}
+	const parts = params.split(";");
+	for (let index = 0; index < parts.length; index++) {
+		const code = Number.parseInt(parts[index] ?? "", 10);
+		if (code === 38 || code === 48) {
+			const group = code === 38 ? "fg" : "bg";
+			active.set(group, sequence);
+			// 256-color and truecolor forms consume their arguments.
+			const step = parts[index + 1] === "5" ? 2 : parts[index + 1] === "2" ? 4 : 0;
+			index += step;
+			continue;
+		}
+		const group = SGR_GROUP.get(code);
+		if (group === undefined) continue;
+		if (SGR_CLEAR.has(code)) active.delete(group);
+		else active.set(group, sequence);
+	}
+}
+
+/** Attribute group per SGR parameter: 1/22 share bold, 38/39 share fg, and so on. */
+const SGR_GROUP = new Map<number, string>([
+	[1, "bold"],
+	[2, "dim"],
+	[3, "italic"],
+	[4, "underline"],
+	[7, "inverse"],
+	[9, "strike"],
+	[22, "bold"],
+	[23, "italic"],
+	[24, "underline"],
+	[27, "inverse"],
+	[29, "strike"],
+	[38, "fg"],
+	[39, "fg"],
+	[48, "bg"],
+	[49, "bg"],
+]);
+const SGR_CLEAR = new Set([22, 23, 24, 27, 29, 39, 49]);
+
+/**
  * One timeline row fitted to `width`: the gutter, the content, and `right`
  * pushed to the right edge with two trailing spaces. The content gives way
  * first, down to `minContent` columns; then the right side gives way to its
@@ -115,10 +189,11 @@ export function timelineRow(
 ): string {
 	const head = timelineGutter(gutter);
 	const room = Math.max(0, width - TIMELINE_CONTENT_COL);
+	// The two trailing columns are this row's own: a right side arrives without them
+	// (a producer that pads anyway gets trimmed, not doubled).
 	const trimmed = right.replace(/\s+$/, "");
 	// A right side with nothing visible in it (blanks, an empty colored run) takes no columns.
-	const forms =
-		visibleWidth(trimmed) > 0 ? [right, options.short ?? trimmed.slice(trimmed.lastIndexOf(" ") + 1)] : [""];
+	const forms = visibleWidth(trimmed) > 0 ? [trimmed, options.short ?? styledLastWord(trimmed)] : [""];
 	const keep = Math.min(options.minContent ?? 0, visibleWidth(content));
 	for (const form of forms) {
 		const tail = form ? `${form}  ` : "";

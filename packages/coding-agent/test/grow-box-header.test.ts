@@ -201,7 +201,7 @@ describe("how the turn stands", () => {
 		expect(at).toBeGreaterThan(0);
 		expect(shown[at]).toMatch(/^ \d\d:\d\d {3}[⠀-⣿] {6}正在运行命令 +第 1 步 {2}$/);
 		expect(lines[at]).toContain(theme.getFgAnsi("timelineLive"));
-		expect(shown[at + 1]).toMatch(/^ {9}╎ {11}在跑 {2}sleep 5 +\d+秒 {4}$/);
+		expect(shown[at + 1]).toMatch(/^ {9}╎ {11}在跑 {2}sleep 5 +\d+秒 {2}$/);
 	});
 
 	it("says the stop once, by the step it cut short, and keeps no status word beside it", () => {

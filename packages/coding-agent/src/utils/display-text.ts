@@ -54,3 +54,20 @@ export function truncateGraphemes(text: string, maxGraphemes: number, ellipsis =
 	if (end >= text.length) return text;
 	return `${text.slice(0, end)}${ellipsis}`;
 }
+
+/**
+ * `text` cut to at most `maxChars` code units, at a grapheme boundary. A plain
+ * `slice(0, n)` can leave half a surrogate pair, and the terminal shows the
+ * U+FFFD replacement glyph where the cut was.
+ */
+export function sliceGraphemes(text: string, maxChars: number): string {
+	if (maxChars <= 0) return "";
+	if (text.length <= maxChars) return text;
+	let end = 0;
+	for (const { segment, index } of graphemeSegmenter.segment(text)) {
+		const next = index + segment.length;
+		if (next > maxChars) break;
+		end = next;
+	}
+	return text.slice(0, end);
+}

@@ -13,6 +13,7 @@ import {
 } from "../../../core/provider-retry.js";
 import { SettingsManager } from "../../../core/settings-manager.js";
 import { previewIpythonCode } from "../../../core/tools/code-preview.js";
+import { sliceGraphemes } from "../../../utils/display-text.js";
 import { type ThemeColor, theme } from "../theme/theme.js";
 import { shortAgentName } from "./agent-message.js";
 import { renderDiffRows, sanitizeDisplayText } from "./diff-rows.js";
@@ -904,7 +905,7 @@ function thinkRows(
 					? formatBoxDuration(Math.max(1000, timing.endedAt - timing.startedAt))
 					: undefined;
 			const tokens = formatBoxTokens(timeline.thinkingTokens(key, raw));
-			const summary = text ? firstSentence(text.slice(0, SUMMARY_INPUT_MAX_CHARS)) : "";
+			const summary = text ? firstSentence(sliceGraphemes(text, SUMMARY_INPUT_MAX_CHARS)) : "";
 			rows.push({
 				key: rowKey,
 				kind: "think",
@@ -929,7 +930,7 @@ function thinkRows(
 				status: "plain",
 				glyph: "·",
 				glyphColor: "dim",
-				text: firstSentence(text.slice(0, SUMMARY_INPUT_MAX_CHARS)),
+				text: firstSentence(sliceGraphemes(text, SUMMARY_INPUT_MAX_CHARS)),
 				textColor: "muted",
 				meta: [],
 				fullText: text,
@@ -1214,9 +1215,12 @@ function firstParagraph(text: string): { line: string; more: boolean } {
 	const boundary = /\n\s*\n/.exec(text);
 	const paragraph = boundary ? text.slice(0, boundary.index) : text;
 	const rest = boundary ? text.slice(boundary.index + boundary[0].length) : "";
-	const kept = paragraph.slice(0, EVENT_TEXT_MAX_CHARS * 2);
-	const line = sanitizeDisplayText(kept).replace(/\s+/g, " ").trim().slice(0, EVENT_TEXT_MAX_CHARS);
-	return { line, more: rest.trim().length > 0 || paragraph.length > kept.length || line.length < kept.trim().length };
+	const kept = sliceGraphemes(paragraph, EVENT_TEXT_MAX_CHARS * 2);
+	// Collapse first, then cut: the `more` flag compares against the collapsed
+	// paragraph, so a run of spaces alone never claims the line left words out.
+	const normalized = sanitizeDisplayText(kept).replace(/\s+/g, " ").trim();
+	const line = sliceGraphemes(normalized, EVENT_TEXT_MAX_CHARS);
+	return { line, more: rest.trim().length > 0 || paragraph.length > kept.length || line.length < normalized.length };
 }
 
 /** What an event says when the AI said nothing: its steps in a few words. */

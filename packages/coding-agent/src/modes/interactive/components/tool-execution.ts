@@ -486,7 +486,9 @@ export class ToolExecutionComponent extends Container implements FocusableBlock 
 			if (state?.isProcessFoldRowCarrier(this.toolCallId)) {
 				// Level with the step markers under the process line.
 				const indent = quietConversationBudget() ? " ".repeat(STEP_INSET + 1) : " ";
-				return [theme.fg("dim", `${indent}⋯ 中间 ${state.processFoldHiddenCount()} 步`)];
+				return [
+					truncateToWidth(theme.fg("dim", `${indent}⋯ 中间 ${state.processFoldHiddenCount()} 步`), width, "…"),
+				];
 			}
 			return this.hiddenLines;
 		}

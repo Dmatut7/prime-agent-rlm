@@ -1,6 +1,8 @@
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 import {
 	collectBashHandleCommands,
+	shortenCommand,
 	turnStepLabel,
 	turnStepsSummary,
 } from "../src/modes/interactive/components/step-label.js";
@@ -275,5 +277,23 @@ describe("shell and helper labels (QA M3)", () => {
 			);
 			expect(turnStepsSummary([step("a", "seq 1 30")])).toBe("运行 seq 1 30");
 		});
+	});
+});
+
+describe("shortenCommand", () => {
+	it("measures the budget in display columns: 44 code units of CJK is 80+ columns wide", () => {
+		const command = `echo ${"汉".repeat(39)}`;
+		expect(command.length).toBe(44);
+		const shortened = shortenCommand(command);
+		expect(shortened).not.toBe(command);
+		expect(visibleWidth(shortened)).toBeLessThanOrEqual(44 + 2);
+	});
+
+	it("cuts a long first word at a grapheme boundary, never inside a surrogate pair", () => {
+		const shortened = shortenCommand(`cmd--${"🎉".repeat(50)}`);
+		expect(shortened).toContain("…");
+		// No lone surrogate half survives the cut.
+		expect(shortened.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, "")).not.toMatch(/[\uD800-\uDFFF]/);
+		expect(visibleWidth(shortened)).toBeLessThanOrEqual(44 + 2);
 	});
 });

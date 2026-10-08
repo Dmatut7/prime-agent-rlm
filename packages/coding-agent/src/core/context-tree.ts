@@ -2,6 +2,7 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import { BoundedCache } from "../utils/bounded-cache.js";
+import { sliceGraphemes } from "../utils/display-text.js";
 import { readBytesSync, readFirstLineSync } from "../utils/file-lines.js";
 import type { RlmChildAgentStatus } from "./agent-session.js";
 import { calculateContextTokens, estimateContextTokens } from "./compaction/index.js";
@@ -72,7 +73,7 @@ function compactLabel(text: string, maxLength = 80): string {
 	if (compact.length <= maxLength) {
 		return compact;
 	}
-	return `${compact.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+	return `${sliceGraphemes(compact, Math.max(0, maxLength - 1)).trimEnd()}…`;
 }
 
 /**

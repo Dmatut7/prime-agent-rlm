@@ -21,9 +21,9 @@ describe("subagent panel matches design board 06", () => {
 		const line = new SubagentSummaryLine();
 		line.setSubagentCounts({ total: 3, running: 2, idle: 0, inactive: 1 });
 		line.setSubagentRows([
-			{ id: "c1", name: "review", state: "running", elapsedMs: 134_000, activity: "读取 footer.ts" },
-			{ id: "c2", name: "docs", state: "running", elapsedMs: 41_000, activity: "编辑 FORK_NOTES.md" },
-			{ id: "c3", name: "lint", state: "done", elapsedMs: 62_000, activity: "无问题" },
+			{ id: "c1", name: "review", state: "running" },
+			{ id: "c2", name: "docs", state: "running" },
+			{ id: "c3", name: "lint", state: "done" },
 		]);
 		const rows = line
 			.render(100)

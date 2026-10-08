@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { sanitizeBlockText, sanitizeRowText } from "../src/utils/display-text.js";
+import { sanitizeBlockText, sanitizeRowText, sliceGraphemes } from "../src/utils/display-text.js";
 
 /**
  * The vectors a model (or a page it read) puts into a subagent name, a report, a
@@ -63,5 +63,33 @@ describe("sanitizeBlockText", () => {
 
 	it("drops a DEL and a C1 control the older display washer kept", () => {
 		expect(sanitizeBlockText("a\u007fb\u009bc")).toBe("abc");
+	});
+});
+
+describe("sliceGraphemes", () => {
+	it("never leaves half a surrogate pair at the cut", () => {
+		// "ab🎉🎉" is 6 code units; a plain slice(0, 5) ends inside the second emoji.
+		const text = "ab🎉🎉";
+		expect(text.slice(0, 5)).not.toBe("ab🎉🎉");
+		expect(sliceGraphemes(text, 5)).toBe("ab🎉");
+		expect(sliceGraphemes(text, 6)).toBe("ab🎉🎉");
+	});
+
+	it("keeps a combining mark with its base and a ZWJ sequence whole", () => {
+		// e + a combining acute is one grapheme of two code units: it fits a
+		// budget of 2, and a budget of 1 leaves nothing rather than half of it.
+		const decomposed = "é";
+		expect(decomposed.length).toBe(2);
+		expect(sliceGraphemes(`${decomposed}x`, 2)).toBe(decomposed);
+		expect(sliceGraphemes(`${decomposed}x`, 1)).toBe("");
+		// The family emoji is one grapheme of 11 code units (4 emoji + 3 ZWJ).
+		expect(sliceGraphemes("👨‍👩‍👧‍👦!", 11)).toBe("👨‍👩‍👧‍👦");
+		expect(sliceGraphemes("👨‍👩‍👧‍👦!", 12)).toBe("👨‍👩‍👧‍👦!");
+		expect(sliceGraphemes("👨‍👩‍👧‍👦!", 10)).toBe("");
+	});
+
+	it("returns the text whole when it fits, and nothing for a zero budget", () => {
+		expect(sliceGraphemes("abc", 3)).toBe("abc");
+		expect(sliceGraphemes("abc", 0)).toBe("");
 	});
 });

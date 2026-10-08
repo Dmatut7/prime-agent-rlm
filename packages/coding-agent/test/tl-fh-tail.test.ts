@@ -58,7 +58,7 @@ function tipAt(width: number, command = COMMAND): { tip: string; shown: string[]
 describe("the `在跑` line of a running turn on a narrow screen", () => {
 	it("shows the command and its clock at full width", () => {
 		const { tip } = tipAt(100);
-		expect(tip).toMatch(/^ {9}╎ {11}在跑 {2}npx vitest --run test\/grow-bottom-tui\.test\.ts +30秒 {4}$/);
+		expect(tip).toMatch(/^ {9}╎ {11}在跑 {2}npx vitest --run test\/grow-bottom-tui\.test\.ts +30秒 {2}$/);
 	});
 
 	it("drops the clock before it cuts the words below the room a step line keeps", () => {
@@ -96,6 +96,6 @@ describe("the `在跑` line of a running turn on a narrow screen", () => {
 
 	it("keeps the clock of a short command while its words fit whole", () => {
 		const { tip } = tipAt(60, "sleep 5");
-		expect(tip).toMatch(/^ {9}╎ {11}在跑 {2}sleep 5 +30秒 {4}$/);
+		expect(tip).toMatch(/^ {9}╎ {11}在跑 {2}sleep 5 +30秒 {2}$/);
 	});
 });

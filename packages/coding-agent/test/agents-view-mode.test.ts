@@ -1509,6 +1509,30 @@ describe("agents view reply draft guard and delete confirmation cleanup", () => 
 		}
 	});
 
+	it("shows a bad re: pattern as an error line instead of silently filtering every row out", () => {
+		const view = savedRowView();
+		try {
+			for (const ch of "re:(a") view.handleInput(ch);
+			// The hints (this fix's surface) live in the dock below the view's rows.
+			const rendered = stripAnsi((invoke("renderDock", view, 120) as string[]).join("\n")).replace(
+				/\x1b_[^\x07]*\x07/g,
+				"",
+			);
+			expect(rendered).toContain("正则无效");
+			// Fixing the pattern clears the error on the same render path.
+			view.handleInput("");
+			view.handleInput("");
+			for (const ch of "b") view.handleInput(ch);
+			const fixed = stripAnsi((invoke("renderDock", view, 120) as string[]).join("\n")).replace(
+				/\x1b_[^\x07]*\x07/g,
+				"",
+			);
+			expect(fixed).not.toContain("正则无效");
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
 	it("releases the row's reply key when the delete confirmation lapses", async () => {
 		vi.useFakeTimers();
 		try {

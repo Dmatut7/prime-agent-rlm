@@ -165,6 +165,11 @@ describe("ENG-4531 agent message UI", () => {
 		expect(formatQueuedMessagePreview("Run the remaining checks.", "Steering")).toBe(
 			"插话：Run the remaining checks.",
 		);
+		// The fourth labeled kind: a background command's completion is not a
+		// follow-up the owner typed.
+		expect(formatQueuedMessagePreview("Background command finished: npm run build", "Follow-up")).toBe(
+			"后台命令：npm run build",
+		);
 	});
 
 	it("persists sent messages that arrive after their Python cell completes", async () => {
@@ -437,9 +442,8 @@ describe("ENG-4531 agent message UI", () => {
 		expect(stripAnsi(chatContainer.children[0]?.render(120)[0] ?? "").trimEnd()).toBe("         │");
 		expect(stripAnsi(chatContainer.children[1]?.render(120)[0] ?? "")).toMatch(/^ \d\d:\d\d {3}│ {2}◇ /);
 
-		addMessage(fauxAssistantMessage(fauxToolCall("ipython", { code: "print('live')" }), { stopReason: "toolUse" }));
-		expect(chatContainer.children[2]?.render(120)[0]).not.toBe("");
-
+		// Live tool activity joins the chat as its own component (the assistant
+		// carrier is routed through turnFlow.assistantStart, not this path).
 		const toolComponents = buildConversationComponents(
 			[fauxAssistantMessage(fauxToolCall("ipython", { code: "print('ready')" }), { stopReason: "toolUse" })],
 			{
@@ -452,13 +456,17 @@ describe("ENG-4531 agent message UI", () => {
 		const toolComponent = toolComponents.at(-1);
 		if (!toolComponent) throw new Error("Missing tool component");
 		chatContainer.addChild(toolComponent);
+		expect(chatContainer.children[2]?.render(120)[0]).not.toBe("");
+
 		addMessage(second);
-		expect(chatContainer.children[4]?.render(120)[0]).not.toBe("");
+		// A tool component is not an agent-message neighbor, so the agent row
+		// below it opens its own block with the blank main-line row.
+		expect(stripAnsi(chatContainer.children[3]?.render(120)[0] ?? "").trimEnd()).toBe("         │");
 
 		chatContainer.addChild(new Container());
 		addMessage(second);
 		// An empty component above draws nothing, so the block still opens with its blank main-line row.
-		expect(stripAnsi(chatContainer.children[6]?.render(120)[0] ?? "").trimEnd()).toBe("         │");
+		expect(stripAnsi(chatContainer.children[5]?.render(120)[0] ?? "").trimEnd()).toBe("         │");
 	});
 
 	it("renders persisted agent messages with a null sender", () => {

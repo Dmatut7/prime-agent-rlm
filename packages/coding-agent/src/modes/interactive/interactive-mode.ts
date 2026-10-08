@@ -111,6 +111,7 @@ import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
 import { runMcpManagementCommand } from "../../core/mcp/mcp-command.js";
 import {
+	ASYNC_BASH_COMPLETION_PREVIEW_LABEL,
 	bashOutputToText,
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CustomMessage,
@@ -530,6 +531,7 @@ const LABELED_QUEUED_PREVIEWS: ReadonlyArray<[prefix: string, display: string]> 
 	[`${HEARTBEAT_PROMPT_PREVIEW_LABEL}: `, "定时任务："],
 	[`${GOAL_CONTEXT_PREVIEW_LABEL}: `, "目标："],
 	[`${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: `, "收到消息："],
+	[`${ASYNC_BASH_COMPLETION_PREVIEW_LABEL}: `, "后台命令："],
 ];
 
 /** The queued-message row labels: a steer lands in the running turn, a follow-up after it. */
@@ -793,8 +795,10 @@ function mergeSubagentSnapshot(
 		activeSessionId: active ? (incoming.activeSessionId ?? previous.activeSessionId) : incoming.activeSessionId,
 		// A completed retained child can become active again when it receives a
 		// follow-up. Its RLM run status stays terminal, so activity must remain an
-		// independent projection of the live session state.
-		activity: active ? (incoming.activity ?? previous.activity) : incoming.activity,
+		// independent projection of the live session state. Every producer computes
+		// it fresh, so an update without it means the child has none now - keeping
+		// the previous one would pin stale wording on the chip forever.
+		activity: incoming.activity,
 	};
 }
 
@@ -1855,6 +1859,8 @@ export class InteractiveMode {
 	// U4 turn aggregation for the live run: one aggregate line per agent turn.
 	private currentTurnState: TurnActivityState | undefined;
 	private currentTurnSummary: TurnSummaryComponent | undefined;
+	/** Comms of reports that landed between turns, counted into the turn they wake (the replay path groups them the same way). */
+	private pendingWakeComms = 0;
 	private liveTurnFlowStore: LiveTurnFlow | undefined;
 	/** The connection to the background session closed and has not come back. */
 	private connectionLost = false;
@@ -4310,6 +4316,12 @@ export class InteractiveMode {
 			setCurrent: (summary) => {
 				this.currentTurnSummary = summary;
 				this.currentTurnState = summary?.state;
+				if (summary && this.pendingWakeComms > 0) {
+					while (this.pendingWakeComms > 0) {
+						summary.addCommMessage();
+						this.pendingWakeComms -= 1;
+					}
+				}
 			},
 			foldEarlierAnswers: (summary) => foldEarlierAnswers(this.chatContainer.children, summary),
 			requestRender: () => this.ui.requestRender(),
@@ -7346,13 +7358,15 @@ export class InteractiveMode {
 					) {
 						this.stopRefineLoader();
 					}
-					// TUI v4: a received agent-message row is one comm in this turn.
-					// A steering comm resets the turn group before the new summary
-					// exists (lazy creation), so fall back to the latest turn - the
-					// rebuild path counts the same row into the same turn span,
-					// keeping the live and replay comm counts equal (T6).
+					// TUI v4: a received agent-message row is one comm in the turn it
+					// belongs to. A report that lands after its turn closed (or before
+					// the first) wakes the next one: hold its comm until that turn's
+					// summary exists. The replay path groups the same message into the
+					// same turn, keeping the live and replay comm counts equal.
 					if (isAgentSessionMessage(event.message) && event.message.display) {
-						(this.currentTurnSummary ?? this.latestTurnSummary())?.addCommMessage();
+						const current = this.currentTurnSummary;
+						if (current && !current.state.isTurnEnded) current.addCommMessage();
+						else this.pendingWakeComms += 1;
 					}
 					if (!inBox) this.addMessageToChat(event.message);
 					this.ui.requestRender();
@@ -8709,12 +8723,17 @@ export class InteractiveMode {
 				render: (width: number) => {
 					const park = this.quotaPark;
 					if (park === undefined) return [];
-					const [fullest] = quotaParkForms({
+					// The forms run fullest-first; take the widest that fits whole,
+					// and cut with an ellipsis only when even the shortest is over.
+					const forms = quotaParkForms({
 						...(park.resumeAtMs !== undefined ? { remainingMs: park.resumeAtMs - Date.now() } : {}),
 						...(park.provider !== undefined ? { provider: park.provider } : {}),
 						...(park.parkCount !== undefined ? { parkCount: park.parkCount } : {}),
 					});
-					return [truncateToWidth(fullest ?? "额度等待", Math.max(1, width), "")];
+					const safeWidth = Math.max(1, width);
+					const fitting = forms.find((form) => visibleWidth(form) <= safeWidth);
+					if (fitting) return [fitting];
+					return [truncateToWidth(forms.at(-1) ?? "额度等待", safeWidth, "…")];
 				},
 				invalidate: () => {},
 			};
@@ -11007,10 +11026,8 @@ export class InteractiveMode {
 		const next = order[Math.max(0, Math.min(order.length - 1, index + direction))] ?? "header";
 		ui.focusKey = next;
 		if (next !== "header" && !next.startsWith("strip:")) {
-			// The body stops following and scrolls just enough to show the focused row.
+			// The body stops following the newest line so the focused row stays put.
 			ui.holdView();
-			ui.revealKey = next;
-			ui.revealDetail = false;
 		}
 		ui.bump();
 		focus.summary.invalidate();
@@ -11494,17 +11511,6 @@ export class InteractiveMode {
 		}
 		this.applyTurnExpansion(entry.summary);
 		return true;
-	}
-
-	private latestTurnSummary(): TurnSummaryComponent | undefined {
-		const children = this.chatContainer.children;
-		for (let i = children.length - 1; i >= 0; i--) {
-			const child = children[i];
-			if (child instanceof TurnSummaryComponent) {
-				return child;
-			}
-		}
-		return undefined;
 	}
 
 	/** The newest turn the chat draws: the keys act on what the owner sees, not on a round that is left out. */
