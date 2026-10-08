@@ -45,6 +45,7 @@ import {
 	PACKAGE_NAME,
 	readInstalledSelfVersion,
 	registryUpdateLaneRefusal,
+	SELF_UPDATE_HELP_EXIT_CODE,
 	SELF_UPDATE_INTERACTIVE_CHILD_ENV,
 	SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE,
 	type SelfUpdateCommand,
@@ -1651,6 +1652,15 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 
 	if (options.help) {
 		printPackageCommandHelp(options.command);
+		// R6-M10: the interactive /update child must not exit 0 on a help run - the parent
+		// reads exit 0 as "the update installed" and would restart the daemon and relaunch
+		// the TUI over a printed usage text. Plain CLI help keeps the conventional exit 0;
+		// only the child run signals the difference. Recovery lives in the parent
+		// (interactive-mode handleUpdateCommand): the code reads as "nothing happened",
+		// the UI comes back up, and no teardown or relaunch runs.
+		if (options.command === "update" && process.env[SELF_UPDATE_INTERACTIVE_CHILD_ENV] === "1") {
+			process.exitCode = SELF_UPDATE_HELP_EXIT_CODE;
+		}
 		return true;
 	}
 

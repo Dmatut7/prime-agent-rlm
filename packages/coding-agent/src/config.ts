@@ -40,6 +40,15 @@ export const isBunRuntime = !!process.versions.bun;
 
 export const SELF_UPDATE_INTERACTIVE_CHILD_ENV = "PRIME_AGENT_INTERACTIVE_SELF_UPDATE";
 export const SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE = 75;
+/**
+ * The interactive self-update child's exit code for a help run (`update --help`). Distinct
+ * from 0 because the interactive parent reads exit 0 as "the update installed" and would
+ * restart the daemon and relaunch the TUI over a printed usage text (R6-M10). Set only when
+ * {@link SELF_UPDATE_INTERACTIVE_CHILD_ENV} is "1"; plain CLI help keeps the conventional 0.
+ * Recovery: the parent treats this code as "nothing happened" - it restores the UI and
+ * reports that no update ran, instead of tearing anything down.
+ */
+export const SELF_UPDATE_HELP_EXIT_CODE = 76;
 
 // =============================================================================
 // Install Method Detection

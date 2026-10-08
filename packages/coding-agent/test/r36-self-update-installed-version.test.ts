@@ -75,9 +75,12 @@ fs.writeFileSync(${JSON.stringify(join(tempDir, "install-args.json"))},JSON.stri
 			value: join(selfPackageDir, "dist", "cli.js"),
 			configurable: true,
 		});
+		// Real pack-script shape: the digest is pinned per-tarball in tarballs[], not at the
+		// top level (R6-M11). A top-level-only reader leaves the spec unpinned and the whole
+		// artifact channel - including the installed-version receipt under test - never runs.
 		const fetchMock = stubReleaseFetch({
 			tarball: "prime-agent-current.tgz",
-			sha256: UPDATE_ARTIFACT_SHA256,
+			tarballs: [{ package: "prime-agent", file: "prime-agent-current.tgz", sha256: UPDATE_ARTIFACT_SHA256 }],
 			version: TARGET_VERSION,
 		});
 		vi.stubGlobal("fetch", fetchMock);

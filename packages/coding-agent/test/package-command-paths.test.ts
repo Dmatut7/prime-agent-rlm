@@ -3,7 +3,14 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { APP_NAME, ENV_AGENT_DIR, PACKAGE_NAME, SELF_UPDATE_INTERACTIVE_CHILD_ENV, VERSION } from "../src/config.js";
+import {
+	APP_NAME,
+	ENV_AGENT_DIR,
+	PACKAGE_NAME,
+	SELF_UPDATE_HELP_EXIT_CODE,
+	SELF_UPDATE_INTERACTIVE_CHILD_ENV,
+	VERSION,
+} from "../src/config.js";
 import { main } from "../src/main.js";
 
 // A self-update artifact is only installable from a copy whose bytes match the digest the release
@@ -140,6 +147,40 @@ describe("package commands", () => {
 		}
 	});
 
+	it("exits update --help with the help exit code when run as the interactive self-update child", async () => {
+		// R6-M10: the interactive parent reads exit 0 as "the update installed" and would
+		// restart the daemon and relaunch the TUI over a printed usage text, so the child
+		// announces a help run with a distinct code instead.
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		try {
+			await expect(runSelfUpdateInstallChild(["update", "--help"])).resolves.toBeUndefined();
+
+			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
+			expect(stdout).toContain("Usage:");
+			expect(stdout).toContain("update");
+			expect(process.exitCode).toBe(SELF_UPDATE_HELP_EXIT_CODE);
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
+	it("keeps the conventional exit 0 for update help outside the interactive child", async () => {
+		// The distinct code is a parent/child signal, not a CLI contract change: a user running
+		// `prime-agent update --help` in a terminal keeps the conventional success exit.
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		try {
+			await expect(main(["update", "--help"])).resolves.toBeUndefined();
+
+			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
+			expect(stdout).toContain("update");
+			expect(process.exitCode).toBeUndefined();
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
 	it("shows a friendly error for unknown install options", async () => {
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -233,9 +274,13 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 			value: join(selfPackageDir, "dist", "cli.js"),
 			configurable: true,
 		});
+		// The manifest is served in the shape the pack script actually writes: the digest is
+		// pinned per-tarball in tarballs[], not at the top level. A reader that only consults
+		// the top level leaves the spec unpinned and the artifact channel never activates
+		// (R6-M11).
 		const fetchMock = stubReleaseFetch({
 			tarball: "prime-agent-current.tgz",
-			sha256: UPDATE_ARTIFACT_SHA256,
+			tarballs: [{ package: "prime-agent", file: "prime-agent-current.tgz", sha256: UPDATE_ARTIFACT_SHA256 }],
 			version: VERSION,
 		});
 		vi.stubGlobal("fetch", fetchMock);
@@ -401,7 +446,8 @@ else {
 			stubReleaseFetch({
 				package: "prime-agent",
 				tarball: "releases/v0.73.0/prime-agent-0.73.0.tgz",
-				sha256: UPDATE_ARTIFACT_SHA256,
+				// Real pack-script shape: the digest is pinned in tarballs[], not top-level (R6-M11).
+				tarballs: [{ package: "prime-agent", file: "prime-agent-0.73.0.tgz", sha256: UPDATE_ARTIFACT_SHA256 }],
 				version: "0.73.0",
 			}),
 		);

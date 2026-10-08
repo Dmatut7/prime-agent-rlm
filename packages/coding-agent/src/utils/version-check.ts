@@ -116,12 +116,13 @@ function resolveReleaseUrl(baseUrl: string, pathOrUrl: string): string | undefin
 
 const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
 
-/**
- * The digest a release manifest pins its artifact with, as hex. Accepts `sha256: "<hex>"` or the
- * subresource-integrity spelling `integrity: "sha256-<base64>"`. Anything else reads as "no pin",
- * and a spec without a pin is refused by `config.ts` rather than installed unverified.
- */
-function readManifestArtifactSha256(data: { sha256?: unknown; integrity?: unknown }): string | undefined {
+interface ManifestSha256Pin {
+	sha256?: unknown;
+	integrity?: unknown;
+}
+
+/** Reads one pin carrier: `sha256: "<hex>"` or the subresource-integrity spelling `integrity: "sha256-<base64>"`. */
+function readSha256Pin(data: ManifestSha256Pin): string | undefined {
 	if (typeof data.sha256 === "string") {
 		const hex = data.sha256.trim().toLowerCase();
 		if (SHA256_HEX_PATTERN.test(hex)) return hex;
@@ -132,6 +133,44 @@ function readManifestArtifactSha256(data: { sha256?: unknown; integrity?: unknow
 			const hex = Buffer.from(match[1], "base64").toString("hex");
 			if (SHA256_HEX_PATTERN.test(hex)) return hex;
 		}
+	}
+	return undefined;
+}
+
+/** The last path segment of a tarball reference (path or URL), without query or fragment. */
+function tarballBasename(tarballRef: string): string | undefined {
+	const withoutQuery = tarballRef.trim().split(/[?#]/, 1)[0] ?? "";
+	const base = withoutQuery.split("/").pop()?.trim();
+	return base || undefined;
+}
+
+/**
+ * The digest a release manifest pins its artifact with, as hex.
+ *
+ * The pack script (scripts/pack-prime-agent-release.mjs) pins the per-tarball digests in
+ * `tarballs[]` (mirrored in the SHA256SUMS file); a top-level `sha256`/`integrity` is the
+ * other spelling, written by the pack script for older readers and accepted here first.
+ * The `tarballs[]` entry is matched by the artifact file's basename - the entry's `package`
+ * name is not a reliable key, because the public package was renamed across lines.
+ *
+ * Anything else reads as "no pin", and a spec without a pin is refused by `config.ts`
+ * rather than installed unverified.
+ */
+function readManifestArtifactSha256(
+	data: ManifestSha256Pin & { tarballs?: unknown },
+	tarballRef?: string,
+): string | undefined {
+	const topLevel = readSha256Pin(data);
+	if (topLevel) return topLevel;
+	if (!Array.isArray(data.tarballs) || tarballRef === undefined) return undefined;
+	const wanted = tarballBasename(tarballRef);
+	if (!wanted) return undefined;
+	for (const entry of data.tarballs) {
+		if (typeof entry !== "object" || entry === null) continue;
+		const file = (entry as { file?: unknown }).file;
+		if (typeof file !== "string" || tarballBasename(file) !== wanted) continue;
+		const pin = readSha256Pin(entry as ManifestSha256Pin);
+		if (pin) return pin;
 	}
 	return undefined;
 }
@@ -156,6 +195,7 @@ export async function getLatestPiRelease(
 		package?: unknown;
 		packageName?: unknown;
 		tarball?: unknown;
+		tarballs?: unknown;
 		sha256?: unknown;
 		integrity?: unknown;
 		version?: unknown;
@@ -172,7 +212,10 @@ export async function getLatestPiRelease(
 	const resolvedInstallSpec = typeof data.tarball === "string" ? resolveReleaseUrl(baseUrl, data.tarball) : undefined;
 	// A manifest artifact carries its digest: config.ts refuses an unpinned URL outright, so the
 	// pin travels with the spec instead of being re-derived later from the same untrusted source.
-	const artifactSha256 = readManifestArtifactSha256(data);
+	// The pin lives in tarballs[] on manifests from the pack script, so the lookup keys off the
+	// tarball file name - without it the artifact channel never activated and the refusal read
+	// as "the manifest pins no sha256" while the digest sat one object deeper (R6-M11).
+	const artifactSha256 = readManifestArtifactSha256(data, typeof data.tarball === "string" ? data.tarball : undefined);
 	const installSpec =
 		resolvedInstallSpec && artifactSha256 && !resolvedInstallSpec.includes("#sha256=")
 			? `${resolvedInstallSpec}#sha256=${artifactSha256}`

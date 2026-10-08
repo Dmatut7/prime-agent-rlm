@@ -64,6 +64,7 @@ import {
 	getLogsDir,
 	getSessionsDir,
 	getShareViewerUrl,
+	SELF_UPDATE_HELP_EXIT_CODE,
 	SELF_UPDATE_INTERACTIVE_CHILD_ENV,
 	SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE,
 	VERSION,
@@ -167,6 +168,7 @@ import {
 	type TelemetryOnboardingOutcome,
 } from "../../core/telemetry.js";
 import { type TruncationResult, truncateTail } from "../../core/tools/truncate.js";
+import { detectForkInstall, forkSelfUpdateRefusalLines } from "../../fork-self-update.js";
 import { getChangelogPath, parseChangelog } from "../../utils/changelog.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { readClipboardImage } from "../../utils/clipboard-image.js";
@@ -1270,6 +1272,12 @@ function hasPrereleaseSuffix(version: string): boolean {
 	return prefixLength > 0 && prefixLength < segments.length;
 }
 
+/** The bare positional update targets that mean "Prime Agent itself". */
+function isSelfUpdatePositionalArg(arg: string): boolean {
+	const normalized = arg.toLowerCase();
+	return normalized === "self" || normalized === "pi" || normalized === APP_NAME.toLowerCase();
+}
+
 export function updateArgsIncludeSelf(args: readonly string[]): boolean {
 	let selfFlag = false;
 	let extensionsOnlyFlag = false;
@@ -1298,8 +1306,85 @@ export function updateArgsIncludeSelf(args: readonly string[]): boolean {
 	if (!positional) {
 		return true;
 	}
-	const normalized = positional.toLowerCase();
-	return normalized === "self" || normalized === "pi" || normalized === APP_NAME.toLowerCase();
+	return isSelfUpdatePositionalArg(positional);
+}
+
+/** Whether the parsed /update args ask for help (`--help`/`-h`) rather than an update. */
+export function updateArgsRequestHelp(args: readonly string[]): boolean {
+	return args.includes("--help") || args.includes("-h");
+}
+
+/**
+ * Whether the update target includes installed packages alongside (or instead of) the
+ * self-update, mirroring package-manager-cli's updateTargetIncludesExtensions over the
+ * raw args: bare `/update` is "all", `--self` alone is self-only, a non-self positional
+ * is one package.
+ */
+export function updateArgsIncludeExtensions(args: readonly string[]): boolean {
+	let selfFlag = false;
+	let extensionsFlag = false;
+	let positional: string | undefined;
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index];
+		if (arg === "--self") {
+			selfFlag = true;
+		} else if (arg === "--extensions") {
+			extensionsFlag = true;
+		} else if (arg === "--extension") {
+			extensionsFlag = true;
+			index++;
+		} else if (arg === "--daemon-socket") {
+			index++;
+		} else if (arg && !arg.startsWith("-") && positional === undefined) {
+			positional = arg;
+		}
+	}
+	if (extensionsFlag) {
+		return true;
+	}
+	if (selfFlag) {
+		return false;
+	}
+	if (!positional) {
+		return true;
+	}
+	return !isSelfUpdatePositionalArg(positional);
+}
+
+/**
+ * The args for the extensions half of a refused fork self-update: `--self` and a self
+ * positional are dropped, `--extensions` is guaranteed. The fork gate refuses only the
+ * self half, so a bare `/update` on a fork build still updates packages through these.
+ */
+export function buildExtensionsOnlyUpdateArgs(args: readonly string[]): string[] {
+	const result: string[] = [];
+	let hasExtensionsFlag = false;
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index];
+		if (arg === "--self") {
+			continue;
+		}
+		if (arg === "--extensions") {
+			hasExtensionsFlag = true;
+			result.push(arg);
+			continue;
+		}
+		if (arg === "--extension" || arg === "--daemon-socket") {
+			result.push(arg);
+			if (index + 1 < args.length) {
+				result.push(args[++index]!);
+			}
+			continue;
+		}
+		if (arg && !arg.startsWith("-") && isSelfUpdatePositionalArg(arg)) {
+			continue;
+		}
+		result.push(arg);
+	}
+	if (!hasExtensionsFlag) {
+		result.push("--extensions");
+	}
+	return result;
 }
 
 function argsIncludeSessionSelection(args: readonly string[]): boolean {
@@ -11848,6 +11933,22 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	/**
+	 * Multi-line /update notices (the fork self-update refusal, the --help text) as one
+	 * focusable block, so the text stays in the chat instead of flashing in the alt-screen
+	 * gap while the update child owns the terminal. Structure (indentation, blank lines) is
+	 * kept: the refusal lines are command instructions the user is meant to copy.
+	 */
+	private showUpdateNoticeBlock(lines: readonly string[], tone: "dim" | "warning"): void {
+		if (this.chatContainer.children.length > 0) this.chatContainer.addChild(new Spacer(1));
+		const text = sanitizeDisplayText(lines.join("\n"));
+		const prefixed = tone === "warning" ? `⚠ ${text}` : text;
+		const notice = new FocusableTextBlock(theme.fg(tone, prefixed), prefixed);
+		notice.navigationEntryTarget = false;
+		this.chatContainer.addChild(notice);
+		this.ui.requestRender();
+	}
+
 	showNewVersionNotification(newVersion: string): void {
 		this.chatContainer.addChild(new Text(formatUpdateAvailableNotice(newVersion), 1, 0));
 		this.ui.requestRender();
@@ -13449,8 +13550,88 @@ export class InteractiveMode {
 		}
 
 		const updateArgs = parseCommandArgs(args);
+
+		// --help asks a question; it is not an update, so answer it in-session. The update
+		// child used to inherit the terminal (its help text flashed in the alt-screen gap)
+		// and exit 0, which the relaunch branch below read as "the update installed" -
+		// /update --help restarted the daemon and relaunched the TUI (R6-M10). The child
+		// additionally exits with SELF_UPDATE_HELP_EXIT_CODE as the brake; this branch is
+		// the recovery: nothing is torn down, and a help run never reaches the relaunch path.
+		if (updateArgsRequestHelp(updateArgs)) {
+			const helpResult = spawnSync(process.execPath, [...process.execArgv, entrypoint, "update", ...updateArgs], {
+				stdio: ["ignore", "pipe", "pipe"],
+				encoding: "utf-8",
+				cwd: this.getCurrentCwd(),
+				env: process.env,
+			});
+			if (helpResult.error) {
+				this.showError(`显示更新帮助失败：${helpResult.error.message}`);
+				return;
+			}
+			const helpText = (helpResult.stdout ?? "").trimEnd();
+			this.showUpdateNoticeBlock(
+				helpText ? helpText.split("\n") : [`Run "${APP_NAME} update --help" in a terminal for usage.`],
+				"dim",
+			);
+			return;
+		}
+
 		const includesSelf = updateArgsIncludeSelf(updateArgs);
 		const updateCwd = this.getCurrentCwd();
+
+		// Fork self-keep gate, decided here instead of by the child: the child prints the
+		// refusal to stderr between the alt-screen leave/enter below, where a fullscreen
+		// user never sees it, and its exit 1 then read as a failure and relaunched the
+		// whole TUI over an intentional refusal (R6-M9). The refusal is shown in-session
+		// instead, the relaunch is skipped, and the extensions half of a bare /update still
+		// runs. --allow-official keeps the child's override path.
+		if (includesSelf && !updateArgs.includes("--allow-official")) {
+			const forkInstall = detectForkInstall();
+			if (forkInstall) {
+				if (!updateArgsIncludeExtensions(updateArgs)) {
+					this.showUpdateNoticeBlock(forkSelfUpdateRefusalLines(forkInstall), "warning");
+					return;
+				}
+				const extensionsArgs = buildExtensionsOnlyUpdateArgs(updateArgs);
+				this.stopWorkingLoader();
+				await this.ui.terminal.drainInput(1000).catch(() => undefined);
+				this.ui.stop();
+				const extensionsResult = spawnSync(
+					process.execPath,
+					[...process.execArgv, entrypoint, "update", ...extensionsArgs],
+					{
+						stdio: "inherit",
+						cwd: updateCwd,
+						env: process.env,
+					},
+				);
+				this.ui.start();
+				if (this.fullscreenEnabled) {
+					this.applyFullscreen(true);
+				}
+				this.ui.requestRender(true);
+				const extensionsExitCode =
+					extensionsResult.status ?? (extensionsResult.error || extensionsResult.signal ? 1 : 0);
+				const extensionsUpdated = !extensionsResult.error && extensionsExitCode === 0;
+				this.showUpdateNoticeBlock(forkSelfUpdateRefusalLines(forkInstall, { extensionsUpdated }), "warning");
+				if (extensionsResult.error) {
+					this.showError(`更新失败：${extensionsResult.error.message}`);
+					return;
+				}
+				if (extensionsExitCode !== 0) {
+					this.showError(
+						extensionsResult.signal
+							? `Update terminated by signal ${extensionsResult.signal}`
+							: `Update exited with code ${extensionsExitCode}`,
+					);
+					return;
+				}
+				this.showStatus("已更新，正在重新加载…");
+				await this.handleReloadCommand();
+				return;
+			}
+		}
+
 		const daemonSocketPath = resolveInteractiveUpdateDaemonSocketPath(
 			updateArgs,
 			resolveDaemonUpdateRestartSocketPath(this.options.daemonSocketPath),
@@ -13473,8 +13654,13 @@ export class InteractiveMode {
 		const updateExitCode = updateResult.status ?? (updateResult.signal ? 1 : 0);
 		const selfUpdateNotAttempted =
 			includesSelf && !updateResult.error && updateExitCode === SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE;
+		// The brake half of R6-M10: a help run that still reached the update child (a path
+		// the branch above missed) announces itself with this exit code, and must never be
+		// read as "the update installed" - the relaunch would restart the daemon over a
+		// printed usage text.
+		const selfUpdateHelpShown = includesSelf && !updateResult.error && updateExitCode === SELF_UPDATE_HELP_EXIT_CODE;
 
-		if (includesSelf && !selfUpdateNotAttempted) {
+		if (includesSelf && !selfUpdateNotAttempted && !selfUpdateHelpShown) {
 			const relaunchArgs = buildUpdateRelaunchArgs(process.argv.slice(2), this.connectionState?.sessionFile);
 			if (updateResult.error) {
 				console.error(`更新失败：${updateResult.error.message}`);
@@ -13554,6 +13740,13 @@ export class InteractiveMode {
 		}
 		this.ui.requestRender(true);
 
+		if (selfUpdateHelpShown) {
+			// Only reachable if the help branch above missed a help run: the child printed
+			// the usage text to the terminal while the UI was stopped. Say in-session that
+			// no update ran instead of reporting one.
+			this.showStatus("更新帮助已显示；没有执行更新。");
+			return;
+		}
 		if (selfUpdateNotAttempted) {
 			this.showStatus(`${APP_NAME} 没有变化，正在重新加载…`);
 			await this.handleReloadCommand();

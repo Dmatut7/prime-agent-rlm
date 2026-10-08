@@ -325,10 +325,16 @@ function main() {
 	);
 	writeFileSync(join(artifactsDir, args.channel), `v${releaseVersion}\n`);
 	const manifestName = args.channel === "stable" ? "latest.json" : "beta.json";
+	// The digest is pinned twice on purpose: per-tarball in tarballs[] (mirroring SHA256SUMS)
+	// and once at the top level for the tarball the `tarball` field points at. Readers before
+	// the tarballs[] lookup (R6-M11) only consult the top level, so without it they never
+	// activated the artifact channel and reported the manifest as pinning no sha256 at all.
+	const primaryTarball = tarballs.find((tarball) => tarball.file === artifactFiles.get("coding-agent"));
 	writeJson(join(artifactsDir, manifestName), {
 		version: `v${releaseVersion}`,
 		package: publicPackageName,
 		tarball: `releases/v${releaseVersion}/${artifactFiles.get("coding-agent")}`,
+		sha256: primaryTarball?.sha256,
 		tarballs: tarballs.map((tarball) => ({
 			package: tarball.name,
 			file: tarball.file,

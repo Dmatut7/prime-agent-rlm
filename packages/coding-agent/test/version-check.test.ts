@@ -105,6 +105,66 @@ describe("version checks", () => {
 		});
 	});
 
+	it("resolves the artifact sha256 from the manifest tarballs list (the pack script's real shape)", async () => {
+		// R6-M11: pack-prime-agent-release.mjs pins the digest per-tarball in tarballs[] and
+		// (since the fix) once at the top level; a manifest shaped like the pre-fix pack output
+		// has no top-level pin at all. A reader that only consults the top level leaves the
+		// install spec unpinned, config.ts refuses it, and the artifact channel never activates.
+		const pinnedSha256 = "a".repeat(64);
+		const fetchMock = vi.fn(async () =>
+			Response.json({
+				package: "prime-agent",
+				tarball: "releases/v1.2.4/prime-agent-1.2.4.tgz",
+				tarballs: [
+					{ package: "@earendil-works/pi-ai", file: "pi-ai-1.2.4.tgz", sha256: "b".repeat(64) },
+					{ package: "prime-agent", file: "prime-agent-1.2.4.tgz", sha256: pinnedSha256 },
+				],
+				version: "v1.2.4",
+			}),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(getLatestPiRelease("1.2.3")).resolves.toEqual({
+			installSpec: `${defaultPrimeAgentDownloadBaseUrl}/releases/v1.2.4/prime-agent-1.2.4.tgz#sha256=${pinnedSha256}`,
+			packageName: "prime-agent",
+			version: "1.2.4",
+		});
+	});
+
+	it("prefers the top-level pin and ignores tarballs entries that do not name the artifact", async () => {
+		const topLevelSha256 = "c".repeat(64);
+		const fetchMock = vi.fn(async () =>
+			Response.json({
+				tarball: "releases/v1.2.4/prime-agent-1.2.4.tgz",
+				sha256: topLevelSha256,
+				tarballs: [{ package: "prime-agent", file: "other-package-1.2.4.tgz", sha256: "d".repeat(64) }],
+				version: "v1.2.4",
+			}),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+
+		const release = await getLatestPiRelease("1.2.3");
+		expect(release?.installSpec).toBe(
+			`${defaultPrimeAgentDownloadBaseUrl}/releases/v1.2.4/prime-agent-1.2.4.tgz#sha256=${topLevelSha256}`,
+		);
+	});
+
+	it("leaves the spec unpinned when no tarballs entry names the artifact", async () => {
+		// The refusal side of the contract: a wrong lookup must fail closed (unpinned spec,
+		// refused by config.ts), never guess a digest from a different package's tarball.
+		const fetchMock = vi.fn(async () =>
+			Response.json({
+				tarball: "releases/v1.2.4/prime-agent-1.2.4.tgz",
+				tarballs: [{ package: "@earendil-works/pi-ai", file: "pi-ai-1.2.4.tgz", sha256: "b".repeat(64) }],
+				version: "v1.2.4",
+			}),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+
+		const release = await getLatestPiRelease("1.2.3");
+		expect(release?.installSpec).toBe(`${defaultPrimeAgentDownloadBaseUrl}/releases/v1.2.4/prime-agent-1.2.4.tgz`);
+	});
+
 	it("skips api calls when version checks are disabled", async () => {
 		process.env.PI_SKIP_VERSION_CHECK = "1";
 		const fetchMock = vi.fn();
