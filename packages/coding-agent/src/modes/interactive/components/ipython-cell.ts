@@ -9,6 +9,7 @@ import {
 import { formatAgentMessageParticipant } from "../../../core/agent-messages.js";
 import { generateDiffString } from "../../../core/tools/edit-diff.js";
 import { parseIpythonBashCell } from "../../../core/tools/ipython-cell-code.js";
+import { sanitizeBlockText, sanitizeRowText } from "../../../utils/display-text.js";
 import { getLanguageFromPath, highlightCode, theme } from "../theme/theme.js";
 import { getWorkingPulseFrame, WORKING_ICON_FRAMES, workingIconFrame } from "../theme/working-icon.js";
 import { agentMessageBodyLines, agentMessagePreview, agentMessageSummaryLine } from "./agent-message.js";
@@ -445,7 +446,12 @@ export class IPythonCellComponent implements Component {
 	 */
 	private topLine(details: IpythonDetails, width: number): string {
 		const code = this.state.code.trimEnd();
-		const label = this.stepLabel();
+		// The label is read off the cell's code and the error name off the kernel's
+		// reply. Neither is text this component painted, and this row is built here
+		// rather than handed to `Text`, so the central render gate never sees it: an
+		// OSC 52 in either would write the owner's clipboard on every repaint, and a
+		// newline in either would make one accounted row into two physical ones.
+		const label = sanitizeRowText(this.stepLabel());
 		let left = ` ${this.marker(details)} ${theme.fg("text", label)}`;
 		if (!code && !this.state.executionStarted) {
 			left += ` ${theme.fg("muted", "等待代码")}`;
@@ -460,7 +466,8 @@ export class IPythonCellComponent implements Component {
 		if (duration) {
 			facts.push(theme.fg("muted", duration));
 		}
-		const errorName = !this.state.isPartial ? (details.error?.ename ?? details.errorEname) : undefined;
+		const reportedErrorName = !this.state.isPartial ? (details.error?.ename ?? details.errorEname) : undefined;
+		const errorName = reportedErrorName === undefined ? undefined : sanitizeRowText(reportedErrorName);
 		if (!this.state.isPartial && isInterruptedCell(details, textFromBlocks(this.state.content))) {
 			facts.push(theme.fg("dim", "已中断"));
 		} else if (errorName) {
@@ -582,7 +589,11 @@ export class IPythonCellComponent implements Component {
 
 	// Only runs when expanded — shows the full source below the fixed top line.
 	private renderCode(lines: string[], width: number): boolean {
-		const code = this.state.code.trimEnd();
+		// Every source line is one physical row, so the cell's code is washed before
+		// it is highlighted: escapes and control characters out, the line breaks and
+		// the runs of spaces the code is shaped by kept, a tab widened to the four
+		// spaces the diff rows use instead of the terminal's tab stops.
+		const code = sanitizeBlockText(this.state.code.trimEnd());
 		if (!code) {
 			this.addBlank(lines, width);
 			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", "等待代码"), width);
