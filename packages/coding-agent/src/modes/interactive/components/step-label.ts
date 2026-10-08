@@ -1,4 +1,4 @@
-import { previewIpythonCode } from "../../../core/tools/code-preview.js";
+import { previewIpythonCode, redactNoise } from "../../../core/tools/code-preview.js";
 import { parseIpythonBashCell } from "../../../core/tools/ipython-cell-code.js";
 
 /** What a step label needs: the tool and its (possibly still streaming) arguments. */
@@ -148,6 +148,16 @@ export function shortenCommand(command: string, max = COMMAND_LABEL_MAX): string
 	return cut !== undefined && cut > 0 ? `${text.slice(0, cut)} …` : `${(text.split(" ")[0] ?? text).slice(0, max)} …`;
 }
 
+/**
+ * A command a label shows verbatim, because nothing in it was worth naming: the
+ * setup-only chain, the quiet tail, the command a handle waits for. Redacted like
+ * a preview's descriptor redacts, then shortened - redact first, since shortening
+ * can cut a secret in half and half a secret still leaks.
+ */
+function commandLabel(command: string, max = COMMAND_LABEL_MAX): string {
+	return shortenCommand(redactNoise(command), max);
+}
+
 function commandToolName(segment: string): string {
 	const words = shellWords(segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, ""));
 	return pathTail(words[0] ?? "");
@@ -171,7 +181,7 @@ export function describeShellCommand(command: string): string {
 		.map((segment) => segment.trim())
 		.filter((segment) => segment && !/^(?:cd|export|source)\b/.test(segment));
 	if (segments.length === 0) {
-		return `运行 ${shortenCommand(source)}`;
+		return `运行 ${commandLabel(source)}`;
 	}
 	const informative = segments.filter((segment) => !QUIET_COMMANDS.has(commandToolName(segment)));
 	const main = informative[0] ?? segments.at(-1) ?? source;
@@ -208,9 +218,9 @@ export function describeShellCommand(command: string): string {
 			break;
 	}
 	if (informative.length === 0 && segments.length > 1) {
-		return `运行 ${shortenCommand(segments.map((segment) => shortenCommand(segment, 20)).join(" → "))}`;
+		return `运行 ${commandLabel(segments.map((segment) => commandLabel(segment, 20)).join(" → "))}`;
 	}
-	return `运行 ${shortenCommand(main)}`;
+	return `运行 ${commandLabel(main)}`;
 }
 
 /** Effects a single step label joins at most. */
@@ -384,7 +394,7 @@ function handleWaitLabel(name: string | undefined, context: StepLabelContext): s
 	const command = name ? context.handleCommands?.get(name) : undefined;
 	if (command) {
 		const firstLine = command.split("\n").find((line) => line.trim()) ?? command;
-		return `等待 ${shortenCommand(firstLine)}`;
+		return `等待 ${commandLabel(firstLine)}`;
 	}
 	return name ? `等待 ${name} 的结果` : "等待命令结果";
 }

@@ -50,7 +50,14 @@ function truncateDescriptor(text: string): string {
 	return `${text.slice(0, DESCRIPTOR_MAX_WIDTH - 1).trimEnd()}…`;
 }
 
-function redactNoise(text: string): string {
+/**
+ * Credentials in a command or a code line: an assignment to a token/key/secret/password
+ * name, an `Authorization:` header, a quoted `sk-` key, and a blob or a literal too long
+ * to carry information. A preview's descriptor applies it, so any face that shows the
+ * raw text instead owes the same wash - or `export API_KEY=secret`, a command every
+ * heuristic skips as setup, puts the secret on screen verbatim.
+ */
+export function redactNoise(text: string): string {
 	return text
 		.replace(/[A-Za-z0-9+/]{80,}={0,2}/g, "<blob>")
 		.replace(/\b((?=\w*(?:token|key|secret|password))[A-Za-z_]\w*)\s*=\s*(["'])[^"']*\2/gi, "$1=<redacted>")

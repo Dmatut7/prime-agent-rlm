@@ -22,6 +22,7 @@ import {
 import type { VisualTruncateResult } from "../../modes/interactive/components/visual-truncate.js";
 import { theme, themeToken } from "../../modes/interactive/theme/theme.js";
 import { waitForChildProcess } from "../../utils/child-process.js";
+import { sanitizeRowText } from "../../utils/display-text.js";
 import {
 	getShellConfig,
 	getShellEnv,
@@ -30,7 +31,7 @@ import {
 	untrackDetachedChildPid,
 } from "../../utils/shell.js";
 import type { ToolDefinition, ToolRenderContext, ToolRenderResultOptions } from "../extensions/types.js";
-import { previewBashCommand } from "./code-preview.js";
+import { previewBashCommand, redactNoise } from "./code-preview.js";
 import { OutputAccumulator } from "./output-accumulator.js";
 import { getTextOutput, invalidArgText, replaceTabs, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
@@ -793,8 +794,15 @@ function formatBashCall(args: { command?: string; timeout?: number } | undefined
 		commandDisplay = invalidArgText(theme);
 	} else if (command) {
 		const preview = previewBashCommand(command);
-		const label = preview.language === "bash" ? "" : `${preview.language}: `;
-		commandDisplay = preview.text ? `${label}${preview.text}` : command;
+		// The header is one physical row, so the command text is washed before the
+		// theme paints it: `Text` drops a screen clear but keeps the newline that
+		// would split the row and the SGR a command could paint itself with.
+		const previewed = sanitizeRowText(preview.text);
+		// The raw text an empty preview falls back to never went through the
+		// descriptor, so it owes the descriptor's redaction as well as the wash.
+		const body = previewed || sanitizeRowText(redactNoise(command));
+		const label = previewed && preview.language !== "bash" ? `${preview.language}: ` : "";
+		commandDisplay = body ? `${label}${body}` : theme.fg("toolOutput", "...");
 	} else {
 		commandDisplay = theme.fg("toolOutput", "...");
 	}
