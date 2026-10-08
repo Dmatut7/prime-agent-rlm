@@ -281,11 +281,13 @@ export class TurnActivityState {
 			}
 			for (const event of this.boxView().events) {
 				// A fail event opens to why the turn failed (its row's detail): the
-				// line Ctrl+O must not skip, even without steps or more text.
+				// line Ctrl+O must not skip, even without steps or more text. A detail
+				// built from the row's own facts (factsOnly) repeats the line's words:
+				// auto-opening it draws the same sentence twice, so it does not count.
 				const opensToSomething =
 					event.steps.length > 0 ||
 					eventSaysMore(event) ||
-					(event.kind === "fail" && event.row?.detail !== undefined);
+					(event.kind === "fail" && event.row?.detail !== undefined && event.row.factsOnly !== true);
 				if (opensToSomething) ui.expanded.add(event.key);
 			}
 			ui.bump();

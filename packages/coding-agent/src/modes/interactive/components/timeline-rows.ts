@@ -715,7 +715,12 @@ function errorRow(step: RowStep, data: StepFeedData, timeline: TurnTimeline): Bo
 	const action = stepAction({ toolName: step.toolName, args: step.args }, context);
 	const what = action.recognized ? `${action.verb} ${action.target}`.trim() : action.target || "Python";
 	const error = sanitizeDisplayText(data.error ?? "出错了");
-	const detail = data.errorDetail ?? [];
+	// A tail that is just the error's own line (the whole output was that one line)
+	// says nothing the row itself does not; keeping it would draw the same sentence
+	// twice once the row opens. The row then falls back to its facts, which say no
+	// more. A longer tail keeps every line, the error's own line included.
+	const tail = data.errorDetail ?? [];
+	const detail = tail.length === 1 && tail[0]?.trim() === error ? [] : tail;
 	return {
 		key: `err:${step.toolCallId}`,
 		kind: "error",

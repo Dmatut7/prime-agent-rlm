@@ -626,7 +626,7 @@ describe("a quiet turn, live", () => {
 		const waiting = plainLines(box);
 		expect(waiting.at(-1)).toMatch(/^ \d\d:\d\d {3}[⠀-⣿] {6}模型服务繁忙，正在重试\s+第 2 步 {2}$/);
 		// A step that still runs wears the spinner and its own clock.
-		expect(screen.opened(box)).toMatch(/^ {9}│ {11}[⠀-⣿] {2}模型服务繁忙，正在重试 +\d+秒 {4}$/m);
+		expect(screen.opened(box)).toMatch(/^ {9}│ {11}[⠀-⣿] {2}模型服务繁忙，正在重试 +\d+秒 {2}$/m);
 		feed(screen, steps.slice(indexAfter(steps, "auto_retry_start")));
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(screen.boxes()).toHaveLength(1);
@@ -1065,7 +1065,7 @@ describe("a quiet turn across a chat rebuild", () => {
 		expect(twin!.state.boxLive).toBe(true);
 		// The twin still waits on its retry: the spinner line says it and the retry is a step.
 		expect(plainLines(twin!).at(-1)).toMatch(/^ \d\d:\d\d {3}[⠀-⣿] {6}模型服务繁忙，正在重试\s+第 \d+ 步 {2}$/);
-		expect(screen.opened(twin!)).toMatch(/^ {9}│ {11}[⠀-⣿] {2}模型服务繁忙，正在重试 +\d+秒 {4}$/m);
+		expect(screen.opened(twin!)).toMatch(/^ {9}│ {11}[⠀-⣿] {2}模型服务繁忙，正在重试 +\d+秒 {2}$/m);
 		feed(screen, steps.slice(retrying));
 		vi.advanceTimersByTime(SETTLE_MS);
 		expect(screen.boxes()).toHaveLength(1);
