@@ -1,3 +1,11 @@
+## 2026-10-08 显示审计第五波·续：车道 J（文档假话批）+ 车道 K（编辑器深水区+replay 容错）合入
+
+> 第二波车道开始合入，C（清洗残余）在途，合入后另记。本批两车道均以 cherry-pick 落主线（车道基线含被 rebase 改写的旧提交，squash merge 会在 test_subagent_identity.py 上撞 add/add 冲突——marker 已折进主线版）。
+
+- **车道 J（文档假话批，commits 32cf4ae56 + 346c0009c，haiku-4-5）**：docs/tui.md「Using Components」整节重写——原文档的 `ctx.ui.custom(组件)` handle 形态、`handle.requestRender()`、`pi.ui`、execute 参数序全是假的，照抄即 TypeError；现对齐 types.ts 真实工厂签名并与 extensions.md 的 daemon 限制口径一致。README/usage.md 的「Escape 不打断在跑的工作」改为真实语义（有活时 Esc 就是中断键，空闲清草稿可 Ctrl+S 恢复）。README「Footer 默认为空」按 U6 现状重写。tui README 两处「超宽行会报错」改为真实的钳断+pi-crash.log 节流记录。settings.md「压缩在即」对齐实现文案「即将压缩」。examples 扩展示例 5 处 legacy `~/.pi` 路径改真实 `~/.prime/agent`；追加批再修 examples/sdk 6 文件同款路径、themes.md「无可选颜色」假话（实证 55 必需+74 可选并全部具名）、terminal-setup.md 的 Option-as-Meta 假话（改为明确不支持警告）。全部改动带文本对账测试 lane-j-docs-truth.test.ts（19 例，D6/D7 直接对源码数 token/钉现状，代码漂移即红）。
+- **车道 K（编辑器深水区+replay 容错 4 条，commit 0e0a085bf，claude-fable-5-1）**：编辑器垂直移动越过折行 paste marker 不再光标瞬移/污染 preferredVisualCol（递归传中间目标 VL+清旧 snap 痕）；Ctrl+] jumpToChar 落点过 snapCursorOffset+clamp 隐藏前缀之外——退格不再腐蚀原子 marker、提交不再静默丢粘贴内容；turn-timeline 对 108 条存量 `lastAssistantTextPreview` 旧字段回退读（quiet replay 子代理最后答案恢复可见）；replay 三层容错——单条坏行跳过+可见告警行（一条坏记录不再让整个会话永远打不开）、custom-message 缺 content 渲染 malformed 行而非 TypeError、写入侧 customMessageShapeError 校验接进 sendCustomMessage 咽喉（daemon append_custom_message 投毒面关闭，坏形状落盘前拒收）。tui 全套件 1351/1351、coding-agent 全量 11758 绿（6006 环境性除外，基线同样红）、新增测试全部先红后绿；conversation-components 大 diff 经 git diff -w 核实语义改动仅容错边界+告警行，合并树上与车道 B 的分组/中断工具测试交叉验证 16/16 绿。
+- **CI flake 记录**：tranche2（B+I）首跑 coding-agent 3/3 分片红 2 例（2336-trace-upload 假计时器超时、daemon-supervisor-crash-handlers 抑制窗口计数），同 revision 本地三连跑全绿，按仓规判 flake，`gh run rerun --failed` 转绿（run 37746459805）。
+
 ## 2026-10-08 显示审计第五波·下：车道 B（时间线）+ 车道 I（终端底层+Python 内核）合入
 
 > 上节六车道之后，B、I 两条在途车道完成并合入，主树每合一条 `npm run check` EXIT 0。第二波（C 清洗残余 / K 编辑器深水区+replay 容错 / J 文档假话批）已基于 6148fd172 开三条独立 worktree 车道并行推进中。
