@@ -11,6 +11,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT } from "../../../core/autonomous.js";
 import { autonomousPromptFingerprint, DUTY_EVENT_CUSTOM_TYPE, parseDutyEvent } from "../../../core/duty-log.js";
+import { sanitizeRowText } from "../../../utils/display-text.js";
 import { shortenPathHome } from "../../../utils/shorten-path.js";
 import type { AgentConnectionSessionTreeNode } from "../../agent-connection/index.js";
 import { WORKER_RECOVERY_RESUME_PROMPT } from "../../daemon/worker-recovery-resume.js";
@@ -821,7 +822,7 @@ class TreeList implements Component {
 			const isOnActivePath = this.activePathIds.has(entry.id);
 			const pathMarker = isOnActivePath ? theme.fg("accent", "• ") : "";
 
-			const label = flatNode.node.label ? theme.fg("warning", `[${flatNode.node.label}] `) : "";
+			const label = flatNode.node.label ? theme.fg("warning", `[${sanitizeRowText(flatNode.node.label)}] `) : "";
 			const labelTimestamp =
 				this.showLabelTimestamps && flatNode.node.label && flatNode.node.labelTimestamp
 					? theme.fg("muted", `${this.formatLabelTimestamp(flatNode.node.labelTimestamp)} `)
@@ -849,25 +850,23 @@ class TreeList implements Component {
 		const entry = node.entry;
 		let result: string;
 
-		const normalize = (s: string) => s.replace(/[\n\t]/g, " ").trim();
-
 		switch (entry.type) {
 			case "message": {
 				const msg = entry.message;
 				const role = msg.role;
 				if (role === "user") {
 					const msgWithContent = msg as { content?: unknown };
-					const content = normalize(this.extractContent(msgWithContent.content));
+					const content = sanitizeRowText(this.extractContent(msgWithContent.content));
 					result = theme.fg("accent", "你：") + content;
 				} else if (role === "assistant") {
 					const msgWithContent = msg as { content?: unknown; stopReason?: string; errorMessage?: string };
-					const textContent = normalize(this.extractContent(msgWithContent.content));
+					const textContent = sanitizeRowText(this.extractContent(msgWithContent.content));
 					if (textContent) {
 						result = theme.fg("success", "AI：") + textContent;
 					} else if (msgWithContent.stopReason === "aborted") {
 						result = theme.fg("success", "AI：") + theme.fg("muted", "（已中断）");
 					} else if (msgWithContent.errorMessage) {
-						const errMsg = normalize(msgWithContent.errorMessage).slice(0, 80);
+						const errMsg = sanitizeRowText(msgWithContent.errorMessage).slice(0, 80);
 						result = theme.fg("success", "AI：") + theme.fg("error", errMsg);
 					} else {
 						result = theme.fg("success", "AI：") + theme.fg("muted", "（无内容）");
@@ -878,11 +877,11 @@ class TreeList implements Component {
 					if (toolCall) {
 						result = theme.fg("muted", this.formatToolCall(toolCall.name, toolCall.arguments));
 					} else {
-						result = theme.fg("muted", `[${toolMsg.toolName ?? "tool"}]`);
+						result = theme.fg("muted", `[${sanitizeRowText(toolMsg.toolName ?? "tool")}]`);
 					}
 				} else if (role === "bashExecution") {
 					const bashMsg = msg as { command?: string };
-					result = theme.fg("dim", `[bash]: ${normalize(bashMsg.command ?? "")}`);
+					result = theme.fg("dim", `[bash]: ${sanitizeRowText(bashMsg.command ?? "")}`);
 				} else {
 					result = theme.fg("dim", `[${role}]`);
 				}
@@ -896,7 +895,8 @@ class TreeList implements Component {
 								.filter((c): c is { type: "text"; text: string } => c.type === "text")
 								.map((c) => c.text)
 								.join("");
-				result = theme.fg("customMessageLabel", `[${entry.customType}]: `) + normalize(content);
+				result =
+					theme.fg("customMessageLabel", `[${sanitizeRowText(entry.customType)}]: `) + sanitizeRowText(content);
 				break;
 			}
 			case "compaction": {
@@ -905,19 +905,19 @@ class TreeList implements Component {
 				break;
 			}
 			case "branch_summary":
-				result = theme.fg("warning", `[branch summary]: `) + normalize(entry.summary);
+				result = theme.fg("warning", `[branch summary]: `) + sanitizeRowText(entry.summary);
 				break;
 			case "model_change":
-				result = theme.fg("dim", `[model: ${entry.modelId}]`);
+				result = theme.fg("dim", `[model: ${sanitizeRowText(entry.modelId)}]`);
 				break;
 			case "thinking_level_change":
-				result = theme.fg("dim", `[thinking: ${entry.thinkingLevel}]`);
+				result = theme.fg("dim", `[thinking: ${sanitizeRowText(entry.thinkingLevel)}]`);
 				break;
 			case "service_tier_change":
-				result = theme.fg("dim", `[service tier: ${entry.serviceTier ?? "default"}]`);
+				result = theme.fg("dim", `[service tier: ${sanitizeRowText(entry.serviceTier ?? "default")}]`);
 				break;
 			case "custom":
-				result = theme.fg("dim", `[custom: ${entry.customType}]`);
+				result = theme.fg("dim", `[custom: ${sanitizeRowText(entry.customType)}]`);
 				break;
 			case "child_usage_attributed": {
 				const input = entry.childUsage.input + entry.childUsage.cacheRead + entry.childUsage.cacheWrite;
@@ -926,11 +926,13 @@ class TreeList implements Component {
 				break;
 			}
 			case "label":
-				result = theme.fg("dim", `[label: ${entry.label ?? "(cleared)"}]`);
+				result = theme.fg("dim", `[label: ${sanitizeRowText(entry.label ?? "(cleared)")}]`);
 				break;
 			case "session_info":
 				result = entry.name
-					? [theme.fg("dim", "[title: "), theme.fg("dim", entry.name), theme.fg("dim", "]")].join("")
+					? [theme.fg("dim", "[title: "), theme.fg("dim", sanitizeRowText(entry.name)), theme.fg("dim", "]")].join(
+							"",
+						)
 					: [theme.fg("dim", "[title: "), theme.italic(theme.fg("dim", "empty")), theme.fg("dim", "]")].join("");
 				break;
 			case "leaf_position":
@@ -1000,29 +1002,25 @@ class TreeList implements Component {
 	private formatToolCall(name: string, args: Record<string, unknown>): string {
 		switch (name) {
 			case "edit": {
-				const path = shortenPathHome(String(args.path || args.file_path || ""));
+				const path = shortenPathHome(sanitizeRowText(String(args.path || args.file_path || "")));
 				return `[edit: ${path}]`;
 			}
 			case "bash": {
-				const rawCmd = String(args.command || "");
-				const cmd = rawCmd
-					.replace(/[\n\t]/g, " ")
-					.trim()
-					.slice(0, 50);
-				return `[bash: ${cmd}${rawCmd.length > 50 ? "..." : ""}]`;
+				// Washed before the cut: escape sequences used to eat the 50-column
+				// budget, and the length check that reports "..." counted them too.
+				const cmd = sanitizeRowText(String(args.command || ""));
+				return `[bash: ${cmd.slice(0, 50)}${cmd.length > 50 ? "..." : ""}]`;
 			}
 			case "ipython": {
-				const rawCode = String(args.code || "");
-				const code = rawCode
-					.replace(/[\n\t]/g, " ")
-					.trim()
-					.slice(0, 50);
-				return `[ipython: ${code}${rawCode.length > 50 ? "..." : ""}]`;
+				const code = sanitizeRowText(String(args.code || ""));
+				return `[ipython: ${code.slice(0, 50)}${code.length > 50 ? "..." : ""}]`;
 			}
 			default: {
-				// Custom tool - show name and truncated JSON args
-				const argsStr = JSON.stringify(args).slice(0, 40);
-				return `[${name}: ${argsStr}${JSON.stringify(args).length > 40 ? "..." : ""}]`;
+				// Custom tool - show name and truncated JSON args. `JSON.stringify`
+				// escapes the C0 range but not C1, so the args are washed like every
+				// other model-written text on this face.
+				const argsStr = sanitizeRowText(JSON.stringify(args));
+				return `[${sanitizeRowText(name)}: ${argsStr.slice(0, 40)}${argsStr.length > 40 ? "..." : ""}]`;
 			}
 		}
 	}

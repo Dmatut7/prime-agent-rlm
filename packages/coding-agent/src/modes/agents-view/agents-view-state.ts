@@ -1,5 +1,6 @@
 import { realpathSync } from "node:fs";
 import { basename, resolve } from "node:path";
+import { sanitizeBlockText, sanitizeRowText } from "../../utils/display-text.js";
 import { canonicalizePath } from "../../utils/paths.js";
 import type { AgentConnectionHeartbeat, AgentConnectionSavedSessionInfo } from "../agent-connection/index.js";
 import { rosterAgentIdForSummary } from "../daemon/agent-roster.js";
@@ -1144,7 +1145,9 @@ function createAnswerRow(parent: AgentsViewRow, preview: string, depth: number):
 		kind: "answer",
 		section: parent.section,
 		summary: parent.summary,
-		title: preview,
+		// The preview is the subagent's last answer, verbatim model text on a row
+		// the view paints itself: one washed physical line, no escape sequences.
+		title: sanitizeRowText(preview),
 		subtitle: "",
 		statusLabel: "",
 		depth,
@@ -1269,7 +1272,9 @@ function buildSpawnCodeRows(
 		descendantCount: 0,
 		identity: `code:${parent.identity}:${groupIndex}:${lineIndex}`,
 		parentIdentity: parent.identity,
-		code,
+		// The cell source is model-written Python on a row the view paints itself;
+		// the block wash keeps the indentation the program reads by.
+		code: sanitizeBlockText(code),
 	});
 	const allLines = spawnCode.replace(/\s+$/, "").split("\n");
 	// Cap the body so a long program can't flood the view; note the remainder.
@@ -1494,10 +1499,19 @@ export function formatAgentsViewDurationMs(durationMs: number | undefined): stri
 	return rest > 0 ? `${days}d${rest}h` : `${days}d`;
 }
 
+/**
+ * The row title is model-controlled: a session name comes from `/name` or from
+ * `rlm.run(name=...)`, and the write side only started stripping control
+ * characters with R4-H1, so the session files already on disk still carry the
+ * older names. The agents view paints its rows itself (`renderRow` interpolates
+ * the title into a `theme.fg` string), so this is the last wash before the
+ * terminal: an OSC 52 in a name would write the user's clipboard every time the
+ * row is drawn.
+ */
 export function getAgentsViewSessionTitle(summary: SessionSummary): string {
 	const candidates = [summary.sessionName, summary.firstMessage, basename(summary.cwd), summary.sessionId, summary.id];
 	for (const candidate of candidates) {
-		const normalized = candidate?.replace(/\s+/g, " ").trim();
+		const normalized = candidate ? sanitizeRowText(candidate) : "";
 		if (normalized) {
 			return normalized;
 		}
@@ -1510,20 +1524,27 @@ function getSessionSubtitle(summary: SessionSummary): string {
 		summary.model ? `${summary.model.provider}/${summary.model.id}` : undefined,
 		summary.cwd,
 		summary.activeSessionId ?? summary.id,
-	].filter((part): part is string => part !== undefined && part.length > 0);
+	]
+		.filter((part): part is string => part !== undefined && part.length > 0)
+		// A model id or a working directory can carry the same bytes a name can;
+		// each part is washed on its own so the two-space separators survive.
+		.map((part) => sanitizeRowText(part))
+		.filter((part) => part.length > 0);
 	return parts.join("  ");
 }
 
 function getSessionStatusLabel(summary: SessionSummary, heartbeat?: UnifiedSessionHeartbeat): string {
 	if (summary.statusLabel !== undefined) {
-		return summary.statusLabel;
+		// A closed union in today's schema, but the row shows whatever the wire
+		// carried: an older or hostile daemon writes bytes, not union members.
+		return sanitizeRowText(summary.statusLabel);
 	}
 	if (summary.lastHeardFromAt !== undefined) {
 		return `last heard ${formatAgeLabel(summary.lastHeardFromAt)}`;
 	}
 	// A non-ready worker cannot report fresh runtime flags; its state is the row's story.
 	if (summary.workerState !== undefined && summary.workerState !== "ready") {
-		return summary.workerState;
+		return sanitizeRowText(summary.workerState);
 	}
 	// A stall marker outranks the busy labels: the row is silent rather than
 	// progressing, and "thinking" would hide exactly the wedge the watchdog
@@ -1554,7 +1575,10 @@ function getSessionStatusLabel(summary: SessionSummary, heartbeat?: UnifiedSessi
 		return "running bash";
 	}
 	if (summary.sessionActions.active) {
-		return summary.sessionActions.active.label ?? summary.sessionActions.active.kind.replace("_", " ");
+		// The label is the running action's own text (an RLM child's task prompt,
+		// written by the parent model), collapsed to one line but never stripped.
+		const label = sanitizeRowText(summary.sessionActions.active.label ?? "");
+		return label.length > 0 ? label : summary.sessionActions.active.kind.replace("_", " ");
 	}
 	if (summary.sessionActions.queuedCount > 0) {
 		return `${summary.sessionActions.queuedCount} queued`;
