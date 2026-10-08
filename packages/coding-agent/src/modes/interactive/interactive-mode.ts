@@ -2017,12 +2017,18 @@ export class InteractiveMode {
 			// status bar, so this chip only ever renders on the legacy watermark line.
 			const park = this.quotaPark;
 			if (park) {
-				const [fullest] = quotaParkForms({
+				// The forms run fullest-first; the widest one that fits half the
+				// terminal wins. The old always-fullest pick made the whole chip
+				// vanish below ~90 columns while an 18-column form would have fit,
+				// leaving a up-to-24h park with no persistent indicator.
+				const forms = quotaParkForms({
 					...(park.resumeAtMs !== undefined ? { remainingMs: park.resumeAtMs - Date.now() } : {}),
 					...(park.provider !== undefined ? { provider: park.provider } : {}),
 					...(park.parkCount !== undefined ? { parkCount: park.parkCount } : {}),
 				});
-				if (fullest) chips.push(fullest);
+				const budget = Math.floor((this.ui.terminal.columns || 80) / 2);
+				const fitting = forms.find((form) => visibleWidth(form) <= budget) ?? forms.at(-1);
+				if (fitting) chips.push(fitting);
 			}
 			return chips.length > 0 ? chips.join(" ") : undefined;
 		});
@@ -3568,6 +3574,11 @@ export class InteractiveMode {
 		this.bindPromptStashSession(state.sessionId);
 		this.connectionState = state;
 		this.scheduleHeartbeatManagerRefresh();
+		// A resync/replaced snapshot can change model, context usage or
+		// compaction state while the footer's telemetry memo holds the old
+		// values; this single funnel covers resync, settings and reload paths
+		// that all miss rebindCurrentSession's invalidation.
+		this.invalidateFooterTelemetry();
 		// Don't touch contextUsageTokenBaseline: a mid-stream snapshot reflects only completed
 		// turns (the in-flight message isn't persisted yet), so the in-flight delta must keep
 		// accumulating. The baseline is managed at turn end (refreshConnectionContextUsage) and

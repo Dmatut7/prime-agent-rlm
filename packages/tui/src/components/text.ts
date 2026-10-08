@@ -1,5 +1,5 @@
 import type { Component } from "../tui.js";
-import { applyBackgroundToLine, visibleWidth, wrapTextWithAnsi } from "../utils.js";
+import { applyBackgroundToLine, sanitizeRenderText, visibleWidth, wrapTextWithAnsi } from "../utils.js";
 
 /**
  * Text component - displays multi-line text with word wrapping
@@ -54,7 +54,12 @@ export class Text implements Component {
 			return result;
 		}
 
-		const normalizedText = this.text.replace(/\t/g, "   ");
+		// Model-controlled text reaches Text pre-colored (theme wrappers around
+		// raw content): the wash keeps those SGR codes and hyperlinks but drops
+		// anything else the content smuggled in - an OSC 52 clipboard write, a
+		// clear-screen CSI, a bare BEL. This is the render-side door the audit's
+		// point-cleanups could never fully close.
+		const normalizedText = sanitizeRenderText(this.text).replace(/\t/g, "   ");
 
 		const contentWidth = Math.max(1, width - this.paddingX * 2);
 

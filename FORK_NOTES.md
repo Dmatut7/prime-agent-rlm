@@ -1,3 +1,11 @@
+## 2026-10-08 第四批：剩余三个 High 收口 + 六条 Medium
+
+- R2-H2：登录框 24 行终端溢出裁掉粘贴输入框——Prime 登录头 13 行 logo 块在 <30 行终端退化为标题对（80×24 全流程 21 行装得下，含手动粘贴+回退重提示）；mock 无 terminal 的旧测试默认 40 行不受影响。
+- R6-H1：/update 重 launch 撞空会话逐出竞态崩栈——attach 的「Unknown active session」按 TOCTOU 处理回落 create 路径（谓词导出+测试）。
+- R4-H2（渲染侧收口，审计 C4 的契约落地）：新增 sanitizeRenderText 状态机——保留主题 SGR 与 OSC8 超链接，剥 OSC52 剪贴板写、非 SGR CSI、裸 C0/C1/DEL；接进 Text.render。这是「模型文本→终端」的中央门，逐点清洗从此只兜底不再当主力。
+- Medium 六条：M9 测量探针不再消耗 reveal marker（两处 blankAt 走 renderForMeasurement）；M13 diff 入口过 sanitizeDisplayText（\r 不再回卷）；M8 ipython legacy 展开接 expandedOutputWindow（不再一次按键渲几千行）；R2-M10 applyConnectionStateSnapshot 漏斗失效 footer 遥测 memo；R2-M9 配额 chip 按终端宽选最宽可容纳形；R3-M12 补全列表在光标移动时关闭（不再用过期 prefix 拼坏文本）。
+- 门禁：check EXIT 0；tui 358 + coding-agent 347/318 触及套件全绿。
+
 ## 2026-10-07 推送闭环 + 持续审查集群的第三批修复
 
 - 推送链路：pre-push 钩子拦下审计文档里的文件名探针误报（secret-scan 误判邮箱）→ 重写该行为带 marker 的写法 → history 重建（cherry-pick 重放，tree 逐字节一致）→ 推送。CI 第一轮红 3 例（`--mode json --help` stdout 清洁契约 + 502 钉旧 $）→ f4e701186 修复：meta 输出按「显式机器声明」分流——`--mode json/rpc/acp/daemon`/`-p` 走 stderr 保协议流干净，隐式 print（stdin 非 TTY）走真 stdout（`v=$(prime-agent --version)` 可捕获）。CI 重跑 11/11 全绿。

@@ -43,23 +43,34 @@ function isPrintableInput(data: string): boolean {
 }
 
 class PrimeLoginHeader implements Component {
+	/**
+	 * Terminal rows the header competes with. The full logo block is 13 lines;
+	 * below this budget the brand degrades to the title pair so the dialog's
+	 * input field - which the overlay clips from the bottom first - stays
+	 * visible on a stock 24-row terminal.
+	 */
+	constructor(private readonly getRows: () => number) {}
+
 	invalidate(): void {
 		// Header render is derived from the current theme.
 	}
 
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
+		const titleLines = [
+			centeredLine(theme.bold(theme.fg("text", "登录 Prime Inference")), safeWidth),
+			centeredLine(theme.fg("muted", "连接你的 Prime Intellect 账号，启用 Prime Inference 模型。"), safeWidth),
+		];
+		const rows = this.getRows();
+		if (!Number.isFinite(rows) || rows < 30) {
+			return titleLines;
+		}
 		const logoWidth = Math.min(PRIME_LOGO_WIDTH, safeWidth);
 		const logoLines = PRIME_LOGO_LINES.map((line) => {
 			const paddedLogoLine = line + " ".repeat(Math.max(0, PRIME_LOGO_WIDTH - visibleWidth(line)));
 			return centeredLine(theme.fg("text", truncateToWidth(paddedLogoLine, logoWidth, "")), safeWidth);
 		});
-		return [
-			...logoLines,
-			centeredLine("", safeWidth),
-			centeredLine(theme.bold(theme.fg("text", "登录 Prime Inference")), safeWidth),
-			centeredLine(theme.fg("muted", "连接你的 Prime Intellect 账号，启用 Prime Inference 模型。"), safeWidth),
-		];
+		return [...logoLines, centeredLine("", safeWidth), ...titleLines];
 	}
 }
 
@@ -317,7 +328,7 @@ export class LoginDialogComponent extends Container implements Focusable {
 		// The cleared panel no longer shows the paste field.
 		this.inputVisible = false;
 		if (this.isPrimeInference) {
-			this.contentContainer.addChild(new PrimeLoginHeader());
+			this.contentContainer.addChild(new PrimeLoginHeader(() => this.tui.terminal?.rows ?? 40));
 			this.contentContainer.addChild(new Spacer(1));
 			return;
 		}

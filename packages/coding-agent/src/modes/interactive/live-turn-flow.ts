@@ -106,6 +106,20 @@ const FINISH_SETTLE_MS = 400;
 /** Width at which a component is probed for whether it draws anything at all. */
 const BLANK_PROBE_WIDTH = 80;
 
+/**
+ * Whether a child draws anything at BLANK_PROBE_WIDTH, measured without side
+ * effects: render() alone spends one-shot markers (the turn reveal), and this
+ * probe runs between the arm and the frame that owes it.
+ */
+function blankAt(child: Component | undefined): boolean {
+	if (!child) return true;
+	const measurable = child as { renderForMeasurement?: (width: number) => string[] };
+	const lines = measurable.renderForMeasurement
+		? measurable.renderForMeasurement(BLANK_PROBE_WIDTH)
+		: child.render(BLANK_PROBE_WIDTH);
+	return lines.length === 0;
+}
+
 export class LiveTurnFlow {
 	/** Each settling box has its own finish timer: a rebuild can settle several at once. */
 	private readonly finishTimers = new Map<TurnActivityState, ReturnType<typeof setTimeout>>();
@@ -272,7 +286,7 @@ export class LiveTurnFlow {
 	addRowAboveClosingRow(row: Component): void {
 		const chat = this.host.chat();
 		let index = chat.children.length - 1;
-		while (index >= 0 && chat.children[index]?.render(BLANK_PROBE_WIDTH).length === 0) index--;
+		while (index >= 0 && blankAt(chat.children[index])) index--;
 		const closing = chat.children[index];
 		if (!(closing instanceof TurnStripComponent) || !closing.drawsClosingRow()) {
 			chat.addChild(row);

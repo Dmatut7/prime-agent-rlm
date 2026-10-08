@@ -329,3 +329,17 @@ describe("buildDaemonUpdateRestartReport", () => {
 		]);
 	});
 });
+
+describe("opportunistic attach fallback", () => {
+	it("recognizes the supervisor's unknown-session error (the relaunch TOCTOU)", async () => {
+		const { isUnknownActiveSessionError } = await import("../src/main.js");
+		// The update relaunch detaches, the supervisor evicts the empty session,
+		// and the relaunched child's opportunistic by-file attach then races the
+		// eviction: the daemon answers exactly this text. Falling through to
+		// create (instead of crashing with a stack trace) keys on this predicate.
+		expect(isUnknownActiveSessionError("Unknown active session: 4f6b0cda6887")).toBe(true);
+		expect(isUnknownActiveSessionError("Unknown active session:abc")).toBe(true);
+		expect(isUnknownActiveSessionError("daemon handshake failed")).toBe(false);
+		expect(isUnknownActiveSessionError("")).toBe(false);
+	});
+});

@@ -714,7 +714,9 @@ export function replayConversation(
 	 */
 	const addRowAboveClosingRow = (row: Component): void => {
 		let index = target.children.length - 1;
-		while (index >= 0 && target.children[index]?.render(BLANK_PROBE_WIDTH).length === 0) index--;
+		// Measurement render: a plain render() spends the turn reveal's one-shot
+		// marker, and this probe runs between the arm and the frame that owes it.
+		while (index >= 0 && blankAt(target.children[index])) index--;
 		const closing = target.children[index];
 		if (!(closing instanceof TurnStripComponent) || !closing.drawsClosingRow()) {
 			target.addChild(row);
@@ -1170,6 +1172,15 @@ function isTitleBoundary(child: Component): boolean {
 
 /** Width at which a component above is asked what it draws; only whether its last line is blank matters. */
 const BLANK_PROBE_WIDTH = 80;
+
+function blankAt(child: Component | undefined): boolean {
+	if (!child) return true;
+	const measurable = child as { renderForMeasurement?: (width: number) => string[] };
+	const lines = measurable.renderForMeasurement
+		? measurable.renderForMeasurement(BLANK_PROBE_WIDTH)
+		: child.render(BLANK_PROBE_WIDTH);
+	return lines.length === 0;
+}
 const TERMINAL_ESCAPES = /\x1b\[[0-9;?]*[A-Za-z]|\x1b[\]_][^\x07]*\x07/g;
 
 /**

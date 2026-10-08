@@ -19,7 +19,7 @@ import { keyText } from "./keybinding-hints.js";
 import { isFallbackPythonLabel, turnStepLabel } from "./step-label.js";
 import { omittedDiffText } from "./timeline-rows.js";
 import {
-	QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES,
+	expandedOutputWindow,
 	quietConversationBudget,
 	reportBudgetTruncatable,
 	toolOutputFull,
@@ -807,16 +807,15 @@ export class IPythonCellComponent implements Component {
 	private renderOutputText(lines: string[], width: number, text: string, label: "out" | "err"): boolean {
 		const color = label === "err" ? "muted" : "toolOutput";
 		const all = text.split("\n");
-		// TUI v4 T7: quiet 模式 pins a per-step window (same dozen-line budget as
-		// the bash blocks); alt+shift+O lifts it. Without this the ipython lane
-		// floods the quiet face with full output.
-		const wouldClip = quietConversationBudget() && all.length > QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES;
-		let shown = all;
-		let heldBack = 0;
-		if (wouldClip && !toolOutputFull()) {
-			shown = all.slice(0, QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES);
-			heldBack = all.length - QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES;
-		}
+		// TUI v4 T7: every non-full face pins a window - quiet the same
+		// dozen-line budget as the bash blocks, legacy the wider expanded budget
+		// (a legacy expand used to render the whole body: one keystroke re-laid
+		// thousands of rows and froze the UI for seconds, the exact failure
+		// tool-output-budget exists to end). Alt+shift+O lifts it.
+		const window = expandedOutputWindow(all);
+		const shown = window.lines;
+		const heldBack = window.skippedLines;
+		const wouldClip = window.truncated;
 		// The quiet window shows each output line on one row; the full view wraps.
 		const clip = quietConversationBudget() && !toolOutputFull();
 		for (const line of shown) {

@@ -1,0 +1,1 @@
+- Fixed the editor's completion list staying open while the caret moves (accepting then spliced the completion at a stale prefix, corrupting the text), and added a render-side wash to Text: theme colors and hyperlinks survive, clipboard writes (OSC 52), cursor/screen control and bare control characters from model text do not.

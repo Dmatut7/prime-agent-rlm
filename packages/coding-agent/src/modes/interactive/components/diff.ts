@@ -1,6 +1,7 @@
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import * as Diff from "diff";
 import { highlightCode, theme } from "../theme/theme.js";
+import { sanitizeDisplayText } from "./diff-rows.js";
 
 /**
  * Parse diff line to extract prefix, line number, and content.
@@ -13,10 +14,13 @@ function parseDiffLine(line: string): { prefix: string; lineNum: string; content
 }
 
 /**
- * Replace tabs with spaces for consistent rendering.
+ * Prepare diff text for rendering: tabs become spaces (the width math assumes
+ * no tabs) and control characters are stripped - an old/new string from a
+ * kernel edit skill can carry a bare \r (a CRLF file), which rewinds the
+ * cursor mid-row and garbles everything below it.
  */
 function replaceTabs(text: string): string {
-	return text.replace(/\t/g, "   ");
+	return sanitizeDisplayText(text).replace(/\t/g, "   ");
 }
 
 /**

@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { Chalk } from "chalk";
+import { Text } from "../src/components/text.js";
 import { TruncatedText } from "../src/components/truncated-text.js";
 import { visibleWidth } from "../src/utils.js";
 
@@ -127,5 +128,29 @@ describe("TruncatedText component", () => {
 		const stripped = lines[0].replace(/\x1b\[[0-9;]*m/g, "");
 		assert.ok(stripped.includes("..."));
 		assert.ok(!stripped.includes("Second line"));
+	});
+});
+
+describe("Text render-side control-character wash", () => {
+	it("keeps theme SGR codes and hyperlinks, drops everything else the content smuggled in", () => {
+		const dirty = "\x1b[38;5;75mcolored\x1b[39m plain \x1b[2Jclear \x1b]52;c;cGFzdGU=\x07clip \x07bell \x00nul \rcr";
+		const text = new Text(dirty, 1, 0);
+		const joined = text.render(60).join("\n");
+
+		assert.ok(joined.includes("colored"), JSON.stringify(joined));
+		assert.ok(joined.includes("\x1b[38;5;75m"), "theme SGR survives");
+		assert.ok(!joined.includes("\x1b[2J"), "clear-screen CSI dropped");
+		assert.ok(!joined.includes("]52;"), "clipboard OSC dropped");
+		assert.ok(!joined.includes("\x07"), "bare BEL dropped");
+		assert.ok(!joined.includes("\x00"), "NUL dropped");
+		assert.ok(!joined.includes("\r"), "CR dropped");
+	});
+
+	it("keeps OSC 8 hyperlinks intact", () => {
+		const linked = "\x1b]8;;https://example.com\x07sign in\x1b]8;;\x07 done";
+		const text = new Text(linked, 1, 0);
+		const joined = text.render(60).join("\n");
+		assert.ok(joined.includes("\x1b]8;;https://example.com\x07"), JSON.stringify(joined));
+		assert.ok(joined.includes("sign in"));
 	});
 });

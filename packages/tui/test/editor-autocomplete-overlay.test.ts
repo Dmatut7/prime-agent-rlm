@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import type { AutocompleteProvider } from "../src/autocomplete.js";
 import { Editor } from "../src/components/editor.js";
 import { TUI } from "../src/tui.js";
+import { stripAnsi } from "../src/utils.js";
 import { defaultEditorTheme } from "./test-themes.js";
 import { VirtualTerminal } from "./virtual-terminal.js";
 
@@ -97,5 +98,26 @@ describe("editor autocomplete overlay", () => {
 		assert.ok(viewport[0]?.includes("hotkeys"));
 		assert.ok(viewport[1]?.includes("/"));
 		tui.stop();
+	});
+});
+
+describe("editor autocomplete list and caret moves", () => {
+	it("closes the list on a caret move, so accepting cannot splice at a stale prefix", async () => {
+		// With the list open, moving the caret and then accepting used to apply
+		// the completion against the OLD prefix position: "@doc" + ← + Tab
+		// produced "@do" + the completion spliced mid-word.
+		const editor = await createOpenAutocomplete();
+		assert.equal(editor.isShowingAutocomplete(), true);
+
+		editor.handleInput("\x1b[D"); // cursorLeft
+		assert.equal(editor.isShowingAutocomplete(), false);
+
+		// Tab with the list closed is the indent/autocomplete key, not a splice:
+		// whatever it does, the line must not contain the completion wedged
+		// into the middle of the typed text.
+		editor.handleInput("\t");
+		await new Promise((resolve) => setImmediate(resolve));
+		const line = editor.render(40)[1] ?? "";
+		assert.ok(!stripAnsi(line).includes("@do@"), `no mid-word splice, got ${JSON.stringify(line)}`);
 	});
 });

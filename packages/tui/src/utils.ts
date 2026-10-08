@@ -1381,6 +1381,56 @@ export function sliceByColumn(line: string, startCol: number, length: number, st
 }
 
 /**
+ * The render-side wash for text a component did not color itself: keep theme
+ * SGR codes and OSC 8 hyperlinks (a row's legitimate escapes), drop every other
+ * escape sequence (an OSC 52 in model text writes the user's clipboard; a CSI
+ * J/K/H moves the cursor) and every bare control character (a BEL rings, a CR
+ * rewinds the row). Newlines and tabs survive - the callers normalize those
+ * with their own width math.
+ */
+export function sanitizeRenderText(text: string): string {
+	let out = "";
+	let i = 0;
+	const n = text.length;
+	while (i < n) {
+		const ch = text[i]!;
+		if (ch === "\x1b") {
+			if (text[i + 1] === "[") {
+				let j = i + 2;
+				while (j < n && /[0-9;:?<=>!]/.test(text[j]!)) j++;
+				const final = text[j];
+				if (final !== undefined && /[A-Za-z]/.test(final)) {
+					if (final === "m") out += text.slice(i, j + 1);
+					i = j + 1;
+					continue;
+				}
+				i = j;
+				continue;
+			}
+			if (text[i + 1] === "]") {
+				let j = i + 2;
+				while (j < n && text[j] !== "\x07" && !(text[j] === "\x1b" && text[j + 1] === "\\")) j++;
+				const terminated = text[j] === "\x07" || (text[j] === "\x1b" && text[j + 1] === "\\");
+				const end = terminated ? (text[j] === "\x07" ? j + 1 : j + 2) : j;
+				if (text.slice(i + 2, j).startsWith("8;")) out += text.slice(i, end);
+				i = end;
+				continue;
+			}
+			i += 2;
+			continue;
+		}
+		const code = ch.codePointAt(0)!;
+		if ((code < 0x20 && ch !== "\n" && ch !== "\t") || code === 0x7f || (code >= 0x80 && code <= 0x9f)) {
+			i += 1;
+			continue;
+		}
+		out += ch;
+		i += 1;
+	}
+	return out;
+}
+
+/**
  * Clamp a line to `width` visible columns, or return it unchanged if it fits.
  *
  * sliceWithWidth only carries ANSI codes whose column falls inside the range,

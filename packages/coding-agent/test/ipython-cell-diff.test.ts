@@ -574,3 +574,19 @@ describe("renderRichDiff syntax highlighting", () => {
 		}
 	});
 });
+
+describe("renderRichDiff control-character sanitation", () => {
+	it("strips carriage returns and escape bytes instead of rewinding the row", () => {
+		// A kernel edit skill can record old/new strings from a CRLF file: a
+		// bare \r in the padded row rewinds the cursor and garbles everything
+		// below it; an ESC byte injects sequences.
+		const rows = renderRichDiff("-1 const a = 1;\r\n+1 const a = 2;\x1b[2J", 72, {
+			language: "typescript",
+		});
+		const joined = rows.join("\n");
+		expect(joined).not.toContain("\r");
+		expect(joined).not.toContain("\x1b[2J");
+		// The second row survived the wash (its opening keyword is enough).
+		expect(stripAnsi(joined)).toContain("const a = 2;");
+	});
+});

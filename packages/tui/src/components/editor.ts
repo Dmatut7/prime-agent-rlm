@@ -793,6 +793,7 @@ export class Editor implements Component, Focusable {
 
 	/** Focus the editor and place the cursor at the clicked cell of the last layout. */
 	private placeCursorFromClick(position: ClickPosition): void {
+		this.cancelAutocomplete();
 		const layout = this.clickLayout;
 		if (!layout) return;
 		const layoutLine = layout.layoutLines[layout.scrollOffset + position.row];
@@ -2024,6 +2025,10 @@ export class Editor implements Component, Focusable {
 	}
 
 	private moveCursor(deltaLine: number, deltaCol: number): void {
+		// The completion's accept math reads the cursor position: a stale prefix
+		// (the caret moved with the list open) splices the replacement into the
+		// wrong place. Close the list on any caret move.
+		this.cancelAutocomplete();
 		this.lastAction = null;
 		const visualLines = this.buildVisualLineMap(this.lastWidth);
 		const currentVisualLine = this.findCurrentVisualLine(visualLines);
@@ -2078,6 +2083,7 @@ export class Editor implements Component, Focusable {
 	 * Moves cursor by the page size while keeping it in bounds.
 	 */
 	private pageScroll(direction: -1 | 1): void {
+		this.cancelAutocomplete();
 		this.lastAction = null;
 		const terminalRows = this.tui.terminal.rows;
 		const pageSize = Math.max(5, Math.floor(terminalRows * 0.3));
@@ -2291,6 +2297,7 @@ export class Editor implements Component, Focusable {
 	 * Multi-line search. Case-sensitive. Skips the current cursor position.
 	 */
 	private jumpToChar(char: string, direction: "forward" | "backward"): void {
+		this.cancelAutocomplete();
 		this.lastAction = null;
 		const isForward = direction === "forward";
 		const lines = this.state.lines;

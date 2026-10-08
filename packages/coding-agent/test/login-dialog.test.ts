@@ -239,3 +239,42 @@ describe("LoginDialogComponent", () => {
 		expect(matches).toHaveLength(2);
 	});
 });
+
+describe("LoginDialogComponent height budget", () => {
+	it("drops the logo block on short terminals so the paste field stays visible", async () => {
+		// 80x24 is the stock terminal: the full logo header (13 lines) plus the
+		// auth screen and the manual paste section overflowed it, and the overlay
+		// clips from the bottom first - exactly where the input lives.
+		const dialog = new LoginDialogComponent(
+			{ ...createFakeTui(), terminal: { rows: 24, columns: 80 } } as unknown as TUI,
+			"prime-inference",
+			() => {},
+			"Prime Inference",
+		);
+		dialog.showAuth("https://example.com/oauth", "Code: abc-123");
+
+		const manual = dialog.showManualInput("粘贴到这里");
+		dialog.handleInput("\r");
+		await expect(manual).resolves.toBe("");
+		void dialog.showPrompt("Login failed, paste the redirect URL instead");
+
+		const lines = dialog.render(80);
+		expect(lines.length).toBeLessThanOrEqual(24);
+		const plain = stripAnsi(lines.join("\n"));
+		// The bottom-most interactive element is the paste row: it must survive.
+		expect(plain).toContain("粘贴到这里");
+		expect(plain).not.toContain("████");
+	});
+
+	it("keeps the full logo on tall terminals", () => {
+		const dialog = new LoginDialogComponent(
+			{ ...createFakeTui(), terminal: { rows: 40, columns: 80 } } as unknown as TUI,
+			"prime-inference",
+			() => {},
+			"Prime Inference",
+		);
+		dialog.showAuth("https://example.com/oauth");
+		const plain = stripAnsi(dialog.render(80).join("\n"));
+		expect(plain).toContain("登录 Prime Inference");
+	});
+});

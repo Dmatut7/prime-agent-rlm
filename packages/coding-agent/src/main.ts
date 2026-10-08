@@ -1225,7 +1225,7 @@ function getDaemonSummaryActiveSessionId(summary: SessionSummary): string {
 	return summary.activeSessionId ?? summary.id;
 }
 
-function isUnknownActiveSessionError(message: string): boolean {
+export function isUnknownActiveSessionError(message: string): boolean {
 	return message.startsWith("Unknown active session:");
 }
 
@@ -1350,7 +1350,18 @@ async function createDaemonClientConnection(options: {
 				options.sessionPath,
 			);
 			if (activeSummary && activeSummary.workerState !== "failed") {
-				return await attach(activeSummary);
+				try {
+					return await attach(activeSummary);
+				} catch (error) {
+					// The list->attach window is a TOCTOU against the supervisor's
+					// empty-session eviction (an update relaunch detaches and the
+					// worker shuts down between our list and our attach). The
+					// session file is still on disk: fall through to the create
+					// path instead of crashing the relaunch with a stack trace.
+					if (!isUnknownActiveSessionError(error instanceof Error ? error.message : String(error))) {
+						throw error;
+					}
+				}
 			}
 		}
 		if (options.clientOwned) {
