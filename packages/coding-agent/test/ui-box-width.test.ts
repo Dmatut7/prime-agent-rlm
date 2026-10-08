@@ -56,14 +56,14 @@ describe("the timeline fills the terminal's width", () => {
 		}
 	});
 
-	it("keeps a step's result four columns from the right edge on a wide screen", () => {
+	it("keeps a step's result two columns from the right edge on a wide screen", () => {
 		const turn = boxedTurn();
 		turn.state.setCollapsed(false);
 		const lines = turn.summary.render(200);
 		const rows = plain(lines).filter((line) => line.includes("git log --stat -100"));
 		expect(rows.length).toBeGreaterThan(0);
 		for (const row of rows) {
-			expect(row).toMatch(/^ {9}│ {11}\$ {2}git log --stat -100 +✓ 100 次提交 {4}$/);
+			expect(row).toMatch(/^ {9}│ {11}\$ {2}git log --stat -100 +✓ 100 次提交 {2}$/);
 			expect(visibleWidth(row)).toBe(200);
 		}
 	});

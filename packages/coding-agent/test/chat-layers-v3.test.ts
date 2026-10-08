@@ -67,7 +67,7 @@ describe("the ◆ prime header and the gutter", () => {
 		const opened = plain(summary.render(100));
 		expect(opened).toHaveLength(2);
 		expect(opened[0]).toMatch(/1 步 ▴ {2}$/);
-		expect(opened[1]).toMatch(/^ {9}│ {11}\$ {2}npm test +✓ 完成 {4}$/);
+		expect(opened[1]).toMatch(/^ {9}│ {11}\$ {2}npm test +✓ 完成 {2}$/);
 		expect(state.boxOpen).toBe(true);
 	});
 

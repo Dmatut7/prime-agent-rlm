@@ -414,7 +414,7 @@ describe("the kernel's step records", () => {
 			false,
 		);
 		const row = openEvents(turn).find((line) => line.includes("git commit")) ?? "";
-		expect(row).toMatch(/\$ {2}git commit -am fix\s+✓ 提交 a1b2c3d {4}$/);
+		expect(row).toMatch(/\$ {2}git commit -am fix\s+✓ 提交 a1b2c3d {2}$/);
 		expect(visibleWidth(row)).toBe(100);
 	});
 

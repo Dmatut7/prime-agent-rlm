@@ -420,7 +420,7 @@ describe("attaching to a running session", () => {
 		expect(screen.boxes()).toHaveLength(1);
 		expect(box.state.steps.map((step) => [step.toolCallId, step.status])).toEqual([["live-1", "done"]]);
 		const lines = opened(box).split("\n");
-		expect(lines.find((line) => line.includes("sleep 5"))).toMatch(/\$ {2}sleep 5\s+✓ slept {4}$/);
+		expect(lines.find((line) => line.includes("sleep 5"))).toMatch(/\$ {2}sleep 5\s+✓ slept {2}$/);
 		// The step handed back its result: the tail no longer names it as the command running now.
 		expect(lines.join("\n")).not.toContain("在跑");
 		expect(lines.join("\n")).toContain("等待模型回应…");

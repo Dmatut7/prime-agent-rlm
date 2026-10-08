@@ -141,7 +141,7 @@ function cell(line: string, needle: string): number {
 /** A step line's start: the rail at column 9, then five columns of indent, so the glyph sits at column 21. */
 const STEP_PREFIX = `         │${" ".repeat(11)}`;
 /** Columns between a step's status and the right edge. */
-const STEP_RIGHT = " ".repeat(4);
+const STEP_RIGHT = " ".repeat(2);
 
 /** The one line that has `needle`. */
 function lineWith(lines: readonly string[], needle: string): string {
@@ -617,7 +617,7 @@ describe("opened change and memory rows", () => {
 		strip.render(120);
 		strip.activate(STRIP_EDITS);
 		strip.render(120);
-		strip.activate("strip:item:file:/work/app/a.go");
+		strip.activate("strip:item:file:a.go");
 		const lines = plain(strip.render(120));
 		const by = lines.findIndex((line) => line.includes("edit 技能改的"));
 		const minus = lines.findIndex((line) => line.includes("− old()"));

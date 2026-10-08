@@ -207,14 +207,14 @@ describe("the line under the pointer lights up", () => {
 		const long = `git log --stat --format=%H ${"very-long-argument ".repeat(8)}`.trim();
 		const { turn, at } = boxWithCommand({ text: long });
 		const calm = plain(turn.summary.render(60))[at] ?? "";
-		expect(calm).toMatch(/^ {9}│ {11}\$ {2}git log .*…\s+✓ done {4}$/);
+		expect(calm).toMatch(/^ {9}│ {11}\$ {2}git log .*…\s+✓ done {2}$/);
 		regionOn(turn, at)?.onHover?.(true);
 		const lit = turn.summary.render(60);
 		expect(lit[at]).toContain(hoverBg());
 		const line = plain(lit)[at] ?? "";
 		expect(line).toBe(calm);
 		expect(line).toContain("…");
-		expect(line).toMatch(/…\s+✓ done {4}$/);
+		expect(line).toMatch(/…\s+✓ done {2}$/);
 		expect(widthOf(line)).toBe(60);
 	});
 

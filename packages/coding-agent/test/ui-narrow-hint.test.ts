@@ -98,7 +98,7 @@ describe("a hovered line on a narrow terminal keeps its arrow", () => {
 			.find((entry) => entry.line === at && !entry.passive)
 			?.onHover?.(true);
 		const litRaw = turn.summary.render(80)[at] ?? "";
-		expect(plain([litRaw])[0]).toMatch(/^ {9}│ {11}\$ {2}git status +✓ 完成 {4}$/);
+		expect(plain([litRaw])[0]).toMatch(/^ {9}│ {11}\$ {2}git status +✓ 完成 {2}$/);
 		expect(visibleWidth(litRaw)).toBe(80);
 		expect(litRaw.startsWith(theme.getBgAnsi("timelineHoverBg"))).toBe(true);
 	});

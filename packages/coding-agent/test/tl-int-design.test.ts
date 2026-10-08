@@ -56,9 +56,9 @@ function drow(time: string, main: string, lane: Lane, content = "", right = ""):
 	return `${head}${content}${pad}${tail}`;
 }
 const gap = (lane: Lane) => drow("", "│", lane);
-/** A step of an opened event: the glyph at column 21, the words, its status four columns from the edge. */
+/** A step of an opened event: the glyph at column 21, the words, its status two columns from the edge (drow appends the two). */
 const step = (lane: Lane, glyph: string, words: string, status: string) =>
-	drow("", "│", lane, `     ${glyph}  ${words}`, `${status}  `);
+	drow("", "│", lane, `     ${glyph}  ${words}`, `${status}`);
 const verdict = (time: string, who: string, what: string, text: string) =>
 	drow(time, "│", "sub", `${who} 交回   ${what}：${text}`, "›");
 
@@ -433,7 +433,7 @@ describe("Tl2Live: the review, one subagent back, the AI at its checks", () => {
 			verdict("18:54", "B", "框的长高和折叠", "没问题（7 条小建议）"),
 			gap("on"),
 			drow("18:57", "⠹", "on", "正在查：那 4 个测试失败是不是颜色的问题", "第 16 步"),
-			drow("", "╎", "on", "     在跑  npx vitest --run test/grow-bottom-tui.test.ts", "12秒  "),
+			drow("", "╎", "on", "     在跑  npx vitest --run test/grow-bottom-tui.test.ts", "12秒"),
 			drow("", "╎", "on"),
 			drow("", " ", "on", "A、C、D 还在干活"),
 		];
