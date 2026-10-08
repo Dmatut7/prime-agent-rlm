@@ -138,6 +138,8 @@ function createExtensionUIContext(
 		return id;
 	};
 
+	let customUnavailableNotified = false;
+
 	const dialogRequest = <T>(
 		method: string,
 		payload: Record<string, unknown>,
@@ -217,7 +219,18 @@ function createExtensionUIContext(
 		setFooter: () => {},
 		setHeader: () => {},
 		setTitle: (title) => emitUiRequest("setTitle", { title }),
+		// Daemon sessions have no host for a custom focused component: resolve as
+		// cancelled, but tell the user once per binding instead of letting the
+		// extension report a phantom "user cancelled" (R3-M6).
 		async custom<T>(): Promise<T> {
+			if (!customUnavailableNotified) {
+				customUnavailableNotified = true;
+				emitUiRequest("notify", {
+					message:
+						"An extension tried to open a custom UI component (ctx.ui.custom), which daemon sessions do not support; the call was treated as cancelled.",
+					notifyType: "warning",
+				});
+			}
 			return undefined as T;
 		},
 		pasteToEditor: (text) => emitUiRequest("setEditorText", { text }),

@@ -445,9 +445,64 @@ describe("ExtensionRunner", () => {
 			expect(commands.map((command) => command.name)).toEqual(["shared-cmd", "shared-cmd"]);
 			expect(commands.map((command) => command.invocationName)).toEqual(["shared-cmd:1", "shared-cmd:2"]);
 			expect(commands.map((command) => command.description)).toEqual(["First command", "Second command"]);
-			expect(diagnostics).toEqual([]);
 			expect(runner.getCommand("shared-cmd:1")?.description).toBe("First command");
 			expect(runner.getCommand("shared-cmd:2")?.description).toBe("Second command");
+
+			// R6-M5: the rename must surface as a diagnostic - the bare
+			// '/shared-cmd' binds nothing, and silence hid exactly that.
+			expect(diagnostics).toHaveLength(1);
+			expect(diagnostics[0]!.type).toBe("warning");
+			expect(diagnostics[0]!.message).toContain("'/shared-cmd'");
+			expect(diagnostics[0]!.message).toContain("cmd-a.ts");
+			expect(diagnostics[0]!.message).toContain("cmd-b.ts");
+			expect(diagnostics[0]!.message).toContain("/shared-cmd:1");
+			expect(diagnostics[0]!.message).toContain("/shared-cmd:2");
+		});
+
+		it("reports no command diagnostics when no names collide", async () => {
+			const cmdCode = `
+				export default function(pi) {
+					pi.registerCommand("solo-cmd", {
+						description: "Solo command",
+						handler: async () => {},
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "cmd-solo.ts"), cmdCode);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			runner.getRegisteredCommands();
+
+			expect(runner.getCommandDiagnostics()).toEqual([]);
+		});
+
+		it("warns once per colliding command name on the console when there is no UI", async () => {
+			const cmdCode = `
+				export default function(pi) {
+					pi.registerCommand("shared-cmd", {
+						description: "dup",
+						handler: async () => {},
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "cmd-a.ts"), cmdCode);
+			fs.writeFileSync(path.join(extensionsDir, "cmd-b.ts"), cmdCode);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+			try {
+				runner.getRegisteredCommands();
+				runner.getRegisteredCommands();
+
+				const conflictWarnings = warnSpy.mock.calls.filter(([message]) =>
+					String(message).includes("'/shared-cmd'"),
+				);
+				expect(conflictWarnings).toHaveLength(1);
+			} finally {
+				warnSpy.mockRestore();
+			}
 		});
 	});
 

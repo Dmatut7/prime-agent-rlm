@@ -188,7 +188,7 @@ function statusHost(options: {
 	const getState = Reflect.get(InteractiveMode.prototype, "getStatusBarState") as (
 		this: typeof host,
 	) => StatusBarState | undefined;
-	const footer = new FooterComponent({ getGitBranch: () => null } as never);
+	const footer = new FooterComponent({ getGitBranch: () => null, getExtensionStatuses: () => new Map() } as never);
 	footer.setStatusBarSource(() => getState.call(host));
 	return { host, footer, bar: (width: number) => plain(footer.render(width)) };
 }
@@ -296,7 +296,7 @@ describe("the legacy watermark line", () => {
 	};
 
 	function watermark(withSpend: boolean): FooterComponent {
-		const footer = new FooterComponent({ getGitBranch: () => null } as never);
+		const footer = new FooterComponent({ getGitBranch: () => null, getExtensionStatuses: () => new Map() } as never);
 		footer.setTelemetrySource(() => ({ mode: "on", snapshot }));
 		footer.setLocationSource(() => ({ cwd: "/work/app", branch: "main" }));
 		if (withSpend) footer.setSpendSource(() => renderSubagentSpendCell(spend()));

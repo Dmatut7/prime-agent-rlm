@@ -479,7 +479,7 @@ describe("the context meter after a compaction", () => {
 		);
 		expect(bar).toContain("上下文 刚整理过");
 
-		const footer = new FooterComponent({ getGitBranch: () => null } as never);
+		const footer = new FooterComponent({ getGitBranch: () => null, getExtensionStatuses: () => new Map() } as never);
 		let snapshot: FooterTelemetrySnapshot = {
 			modelName: "glm-5.3-prime",
 			contextTokens: null,

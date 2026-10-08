@@ -274,6 +274,8 @@ export class ExtensionRunner {
 	private commandDiagnostics: ResourceDiagnostic[] = [];
 	private readonly warnedToolDiagnostics = new Set<string>();
 	private readonly notifiedToolDiagnostics = new Set<string>();
+	private readonly warnedCommandDiagnostics = new Set<string>();
+	private readonly notifiedCommandDiagnostics = new Set<string>();
 	private staleMessage: string | undefined;
 	private readonly handlerTimeoutMs: number;
 	// WeakRefs let GC drop globally cleared timers; pending timers stay reachable via Node's active-timer list.
@@ -742,7 +744,7 @@ export class ExtensionRunner {
 		return undefined;
 	}
 
-	private resolveRegisteredCommands(): ResolvedCommand[] {
+	private resolveRegisteredCommands(): { commands: ResolvedCommand[]; diagnostics: ResourceDiagnostic[] } {
 		const commands: RegisteredCommand[] = [];
 		const counts = new Map<string, number>();
 
@@ -756,7 +758,7 @@ export class ExtensionRunner {
 		const seen = new Map<string, number>();
 		const takenInvocationNames = new Set<string>();
 
-		return commands.map((command) => {
+		const resolved = commands.map((command) => {
 			const occurrence = (seen.get(command.name) ?? 0) + 1;
 			seen.set(command.name, occurrence);
 
@@ -776,11 +778,46 @@ export class ExtensionRunner {
 				invocationName,
 			};
 		});
+
+		// A name shared by several extensions is renamed for every registration
+		// (`name:1`, `name:2`, ...) so the bare `/name` binds nothing - say so,
+		// or the rename is invisible outside a source read.
+		const diagnostics: ResourceDiagnostic[] = [];
+		for (const [name, count] of counts) {
+			if (count <= 1) continue;
+			const owners = commands.filter((command) => command.name === name).map((command) => command.sourceInfo.path);
+			const invocationNames = resolved
+				.filter((command) => command.name === name)
+				.map((command) => `/${command.invocationName}`);
+			diagnostics.push({
+				type: "warning",
+				message: `Extension command '/${name}' is registered by ${count} extensions (${owners.join(", ")}); the bare command is unbound, use ${invocationNames.join(" or ")}.`,
+				path: owners[0],
+			});
+		}
+
+		return { commands: resolved, diagnostics };
+	}
+
+	private reportCommandNameConflicts(diagnostics: ResourceDiagnostic[]): void {
+		for (const diagnostic of diagnostics) {
+			if (this.hasUI()) {
+				if (this.notifiedCommandDiagnostics.has(diagnostic.message)) continue;
+				this.notifiedCommandDiagnostics.add(diagnostic.message);
+				this.uiContext.notify(diagnostic.message, "warning");
+			} else {
+				if (this.warnedCommandDiagnostics.has(diagnostic.message)) continue;
+				this.warnedCommandDiagnostics.add(diagnostic.message);
+				console.warn(diagnostic.message);
+			}
+		}
 	}
 
 	getRegisteredCommands(): ResolvedCommand[] {
-		this.commandDiagnostics = [];
-		return this.resolveRegisteredCommands();
+		const { commands, diagnostics } = this.resolveRegisteredCommands();
+		this.commandDiagnostics = diagnostics;
+		this.reportCommandNameConflicts(diagnostics);
+		return commands;
 	}
 
 	getCommandDiagnostics(): ResourceDiagnostic[] {
@@ -788,7 +825,7 @@ export class ExtensionRunner {
 	}
 
 	getCommand(name: string): ResolvedCommand | undefined {
-		return this.resolveRegisteredCommands().find((command) => command.invocationName === name);
+		return this.resolveRegisteredCommands().commands.find((command) => command.invocationName === name);
 	}
 
 	/**

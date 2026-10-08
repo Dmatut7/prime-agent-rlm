@@ -80,7 +80,7 @@ describe("quotaParkForms", () => {
 	});
 
 	it("rides the footer status bar through the pull source", () => {
-		const footer = new FooterComponent({ getGitBranch: () => null } as never);
+		const footer = new FooterComponent({ getGitBranch: () => null, getExtensionStatuses: () => new Map() } as never);
 		footer.setStatusBarSource(() => ({
 			model: "glm-5.3-prime",
 			subagents: 0,

@@ -1,7 +1,6 @@
 import { setKeybindings } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, test } from "vitest";
 import { AGENT_MESSAGE_SOURCE, createAgentSessionMessage } from "../src/core/agent-messages.js";
-import type { ReadonlyFooterDataProvider } from "../src/core/footer-data-provider.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { createRefinementOutcomeMessage } from "../src/core/messages.js";
 import type { RefinementResult } from "../src/core/refinement/refinement.js";
@@ -126,7 +125,7 @@ describe("component render caching", () => {
 	});
 
 	test("FooterComponent returns a stable empty array", () => {
-		const footer = new FooterComponent({} as ReadonlyFooterDataProvider);
+		const footer = new FooterComponent({ getExtensionStatuses: () => new Map() } as never);
 		const first = footer.render(80);
 		expect(first).toEqual([]);
 		expect(footer.render(80)).toBe(first);

@@ -254,4 +254,50 @@ describe("daemon extension binding", () => {
 			"assistant:replacement reply",
 		]);
 	});
+
+	it("notifies once when an extension calls ctx.ui.custom, which daemon sessions cannot host (R3-M6)", async () => {
+		const customResults: unknown[] = [];
+		const runtime = await createRuntimeForTest(
+			(pi) => {
+				pi.registerCommand("custom-ui", {
+					description: "custom ui probe",
+					handler: async (_args, ctx) => {
+						customResults.push(await ctx.ui.custom(async () => ({ render: () => [], invalidate: () => {} })));
+						customResults.push(await ctx.ui.custom(async () => ({ render: () => [], invalidate: () => {} })));
+					},
+				});
+			},
+			["done"],
+		);
+
+		const outbound: DaemonOutbound[] = [];
+		const state: ActiveSessionState = {
+			activeSessionId: "active-custom",
+			runtime,
+			clients: new Set(),
+			pendingAttaches: 0,
+			extensionUiRequests: new Map(),
+			eventGeneration: "generation-custom",
+			lastEventSequence: 0,
+		};
+		await bindActiveSessionState(state, {
+			broadcast: (_state, message) => {
+				outbound.push(message);
+			},
+			shutdown: () => {},
+		});
+
+		await runtime.session.prompt("/custom-ui");
+
+		// The call still resolves undefined (no UI host), but the user is told why
+		// instead of the extension reporting a silent "cancelled".
+		expect(customResults).toEqual([undefined, undefined]);
+		const notifies = outbound.filter(
+			(message): message is Extract<DaemonOutbound, { type: "extension_ui_request" }> =>
+				message.type === "extension_ui_request" && message.method === "notify",
+		);
+		expect(notifies).toHaveLength(1);
+		expect(String(notifies[0]!.payload.message)).toContain("ctx.ui.custom");
+		expect(notifies[0]!.payload.notifyType).toBe("warning");
+	});
 });

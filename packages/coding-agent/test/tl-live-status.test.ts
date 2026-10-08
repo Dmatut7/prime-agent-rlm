@@ -68,7 +68,7 @@ const WARNED: Partial<SubagentSpendSummary> = {
 };
 
 function bar(state: Partial<StatusBarState> & Pick<StatusBarState, "right">, width = WIDTH): string {
-	const footer = new FooterComponent({ getGitBranch: () => null } as never);
+	const footer = new FooterComponent({ getGitBranch: () => null, getExtensionStatuses: () => new Map() } as never);
 	footer.setStatusBarSource(() => ({ model: "glm-5.3-prime", level: "最高", subagents: 0, ...state }));
 	return footer.render(width)[0] ?? "";
 }

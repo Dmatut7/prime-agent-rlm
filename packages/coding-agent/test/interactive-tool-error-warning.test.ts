@@ -70,7 +70,7 @@ describe("footer tool-error badge (U2)", () => {
 	});
 
 	it("hides below the threshold, shows ⚠ 工具错误×N at and above it, and clears on reset", () => {
-		const footer = new FooterComponent({ getGitBranch: () => null } as never);
+		const footer = new FooterComponent({ getGitBranch: () => null, getExtensionStatuses: () => new Map() } as never);
 		expect(TOOL_ERROR_WARN_THRESHOLD).toBe(3);
 
 		for (let count = 0; count < TOOL_ERROR_WARN_THRESHOLD; count++) {
@@ -87,7 +87,7 @@ describe("footer tool-error badge (U2)", () => {
 	});
 
 	it("rides on the telemetry line when both are present", () => {
-		const footer = new FooterComponent({ getGitBranch: () => null } as never);
+		const footer = new FooterComponent({ getGitBranch: () => null, getExtensionStatuses: () => new Map() } as never);
 		footer.setTelemetrySource(() => ({
 			mode: "on",
 			snapshot: {

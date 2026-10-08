@@ -1,13 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+// This module is the internal client behind the public agent commands
+// (`prime-agent list|stop|rename|send|schedule`), which public-command.ts routes
+// here with a synthesized "daemon" prefix. The user-facing `prime-agent daemon ...`
+// surface was removed upstream; subcommands no public command routes to are rejected.
 const daemonClientMock = vi.hoisted(() => {
-	type Listener = (message: {
-		type: string;
-		activeSessionId?: string;
-		event?: { type: string };
-		assistantMessageEvent?: { type: string; toolCall?: { name?: string } };
-	}) => void;
-	type CloseListener = (error: Error) => void;
 	type Command = {
 		type: string;
 		name?: string;
@@ -20,12 +17,6 @@ const daemonClientMock = vi.hoisted(() => {
 		prompt?: string;
 		includeInactive?: boolean;
 		all?: boolean;
-		sessionPath?: string;
-		capabilities?: readonly string[];
-		config?: {
-			extensionFlagValues?: Record<string, boolean | string>;
-			initialGoal?: { objective: string; tokenBudget?: number };
-		};
 	};
 	type Response =
 		| { type: "response"; command: string; success: true; data?: unknown }
@@ -33,30 +24,19 @@ const daemonClientMock = vi.hoisted(() => {
 
 	const instances: MockDaemonClient[] = [];
 	const behavior = {
-		promptSucceeds: false,
-		emitStaleAgentEndOnAttach: false,
-		connectFails: false,
 		sessions: [] as Array<Record<string, unknown>>,
-		/** Optional live-session summary returned by the mocked create request. */
-		createdSession: undefined as Record<string, unknown> | undefined,
 		/** Server capabilities the mocked daemon hello advertises. */
 		serverCapabilities: ["send_message_delivery_mode"] as string[],
 	};
 
 	class MockDaemonClient {
-		readonly messageListeners = new Set<Listener>();
-		readonly closeListeners = new Set<CloseListener>();
 		readonly requests: Command[] = [];
-		messageListenerCountAtClose: number | undefined;
-		closeListenerCountAtClose: number | undefined;
 
 		constructor(readonly socketPath: string) {
 			instances.push(this);
 		}
 
-		async connect(): Promise<void> {
-			if (behavior.connectFails) throw new Error("mock connect failed");
-		}
+		async connect(): Promise<void> {}
 
 		async waitForHello(): Promise<void> {}
 
@@ -69,48 +49,10 @@ const daemonClientMock = vi.hoisted(() => {
 			if (command.type === "list") {
 				return { type: "response", command: command.type, success: true, data: { sessions: behavior.sessions } };
 			}
-			if (command.type === "create" && behavior.createdSession !== undefined) {
-				return { type: "response", command: command.type, success: true, data: behavior.createdSession };
-			}
-			if (command.type === "attach" && behavior.emitStaleAgentEndOnAttach) {
-				this.emitMessage({ type: "session_event", activeSessionId: "active-1", event: { type: "agent_end" } });
-			}
-			if (command.type === "prompt") {
-				if (behavior.promptSucceeds) {
-					return { type: "response", command: command.type, success: true };
-				}
-				return { type: "response", command: command.type, success: false, error: "prompt failed" };
-			}
 			return { type: "response", command: command.type, success: true };
 		}
 
-		onMessage(listener: Listener): () => void {
-			this.messageListeners.add(listener);
-			return () => {
-				this.messageListeners.delete(listener);
-			};
-		}
-
-		onClose(listener: CloseListener): () => void {
-			this.closeListeners.add(listener);
-			return () => {
-				this.closeListeners.delete(listener);
-			};
-		}
-
-		emitMessage(message: Parameters<Listener>[0]): void {
-			for (const listener of [...this.messageListeners]) {
-				listener(message);
-			}
-		}
-
-		close(): void {
-			this.messageListenerCountAtClose = this.messageListeners.size;
-			this.closeListenerCountAtClose = this.closeListeners.size;
-			for (const listener of [...this.closeListeners]) {
-				listener(new Error("closed"));
-			}
-		}
+		close(): void {}
 	}
 
 	return { MockDaemonClient, behavior, instances };
@@ -120,56 +62,6 @@ vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 	DaemonClient: daemonClientMock.MockDaemonClient,
 }));
 
-const spawnMock = vi.hoisted(() => {
-	const calls: string[][] = [];
-	return {
-		calls,
-		mockSpawn: (...args: unknown[]) => {
-			calls.push(args[1] as string[]);
-			return {
-				unref: () => {},
-				kill: () => {},
-				pid: 99999,
-				stdout: null,
-				stderr: null,
-				stdin: null,
-				on: () => {},
-				once: () => {},
-			};
-		},
-	};
-});
-
-vi.mock("node:child_process", async (importOriginal) => {
-	const original = (await importOriginal()) as Record<string, unknown>;
-	return { ...original, spawn: spawnMock.mockSpawn as never };
-});
-
-const readlineMock = vi.hoisted(() => {
-	const instances: { close(): void }[] = [];
-	return { instances };
-});
-
-vi.mock("node:readline", async (importOriginal) => {
-	const original = (await importOriginal()) as Record<string, unknown>;
-	const { EventEmitter } = await import("node:events");
-	class FakeInterface extends EventEmitter {
-		setPrompt(): void {}
-		prompt(): void {}
-		close(): void {
-			this.emit("close");
-		}
-	}
-	return {
-		...original,
-		createInterface: () => {
-			const rl = new FakeInterface();
-			readlineMock.instances.push(rl);
-			return rl;
-		},
-	};
-});
-
 import { handleDaemonCommand } from "../src/cli/daemon-command.js";
 
 describe("daemon command", () => {
@@ -178,13 +70,8 @@ describe("daemon command", () => {
 	beforeEach(() => {
 		process.exitCode = undefined;
 		daemonClientMock.instances.length = 0;
-		daemonClientMock.behavior.promptSucceeds = false;
-		daemonClientMock.behavior.emitStaleAgentEndOnAttach = false;
-		daemonClientMock.behavior.connectFails = false;
 		daemonClientMock.behavior.sessions = [];
-		daemonClientMock.behavior.createdSession = undefined;
 		daemonClientMock.behavior.serverCapabilities = ["send_message_delivery_mode"];
-		readlineMock.instances.length = 0;
 		consoleErrorMessages = [];
 		vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null | undefined) => {
 			throw new Error(`exit ${code}`);
@@ -200,133 +87,45 @@ describe("daemon command", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("cleans prompt listeners when the prompt request fails", async () => {
+	it("rejects removed daemon subcommands with the remediation instead of running them (R6-M3)", async () => {
 		await expect(
-			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "prompt", "active-1", "hello"]),
+			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "attach", "active-1"]),
 		).resolves.toBe(true);
 
-		const client = daemonClientMock.instances[0];
-		expect(client?.messageListenerCountAtClose).toBe(0);
-		expect(client?.closeListenerCountAtClose).toBe(0);
+		expect(daemonClientMock.instances).toHaveLength(0);
+		expect(process.exitCode).toBe(1);
 		expect(
-			consoleErrorMessages.some((message) => typeof message === "string" && message.includes("prompt failed")),
+			consoleErrorMessages.some(
+				(message) => typeof message === "string" && message.includes("Unknown daemon command: attach"),
+			),
 		).toBe(true);
 	});
 
-	it("ignores stale agent_end events before a daemon prompt starts", async () => {
-		daemonClientMock.behavior.promptSucceeds = true;
-		daemonClientMock.behavior.emitStaleAgentEndOnAttach = true;
-		const command = handleDaemonCommand([
-			"daemon",
-			"--socket",
-			"/tmp/prime-agent.sock",
-			"prompt",
-			"active-1",
-			"hello",
+	it("lists sessions through the public list alias path", async () => {
+		await expect(handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "list"])).resolves.toBe(true);
+
+		expect(daemonClientMock.instances[0]?.requests).toEqual([{ type: "list", all: false }]);
+		expect(process.exitCode).toBeUndefined();
+	});
+
+	it("kills a session through the public stop alias path", async () => {
+		await expect(
+			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "kill", "active-1"]),
+		).resolves.toBe(true);
+
+		expect(daemonClientMock.instances[0]?.requests).toEqual([{ type: "kill", activeSessionId: "active-1" }]);
+		expect(process.exitCode).toBeUndefined();
+	});
+
+	it("renames a session through the public rename alias path", async () => {
+		await expect(
+			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "rename", "active-1", "new name"]),
+		).resolves.toBe(true);
+
+		expect(daemonClientMock.instances[0]?.requests).toEqual([
+			{ type: "rename", activeSessionId: "active-1", name: "new name" },
 		]);
-
-		await flushPromises();
-
-		const client = daemonClientMock.instances[0];
-		expect(client?.requests.map((request) => request.type)).toEqual(["attach", "prompt"]);
-
-		let resolved = false;
-		void command.then(() => {
-			resolved = true;
-		});
-		await flushPromises();
-		expect(resolved).toBe(false);
-
-		client?.emitMessage({ type: "session_event", activeSessionId: "active-1", event: { type: "agent_start" } });
-		client?.emitMessage({ type: "session_event", activeSessionId: "active-1", event: { type: "agent_end" } });
-
-		await expect(command).resolves.toBe(true);
-		expect(client?.messageListenerCountAtClose).toBe(0);
-		expect(client?.closeListenerCountAtClose).toBe(0);
-	});
-
-	it("ends json attach when the session closes", async () => {
-		const command = handleDaemonCommand([
-			"daemon",
-			"--socket",
-			"/tmp/prime-agent.sock",
-			"--json",
-			"attach",
-			"active-1",
-		]);
-
-		await flushPromises();
-
-		const client = daemonClientMock.instances[0];
-		expect(client?.requests.map((request) => request.type)).toEqual(["attach"]);
-
-		client?.emitMessage({ type: "session_closed", activeSessionId: "active-1" });
-
-		await expect(command).resolves.toBe(true);
-		expect(client?.messageListenerCountAtClose).toBe(0);
-		expect(client?.closeListenerCountAtClose).toBe(0);
-	});
-
-	it("chooses a terminating non-colliding default name past the safe-integer range", async () => {
-		const unsafeIntegerName = "9007199254740992";
-		daemonClientMock.behavior.sessions = [makeSessionSummary("active-1", "session-1", unsafeIntegerName)];
-
-		await expect(handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock"])).resolves.toBe(true);
-
-		const client = daemonClientMock.instances[1];
-		expect(client?.requests[0]).toEqual({ type: "list", all: true });
-		expect(client?.requests[1]).toMatchObject({ type: "create", name: "1" });
-		expect(client?.requests[1]?.name).not.toBe(unsafeIntegerName);
-	});
-
-	it("keeps create session name after an unknown boolean extension flag", async () => {
-		await expect(
-			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "create", "--unknown-typo", "my-session"]),
-		).resolves.toBe(true);
-
-		const client = daemonClientMock.instances[0];
-		expect(client?.requests[0]).toEqual({
-			type: "create",
-			name: "my-session",
-			config: {
-				extensionFlagValues: {
-					"unknown-typo": true,
-				},
-			},
-			sessionPath: undefined,
-			continueRecent: undefined,
-		});
-	});
-
-	it("parses extension flag values with equals without consuming the create name", async () => {
-		await expect(
-			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "create", "--ticket=123", "my-session"]),
-		).resolves.toBe(true);
-
-		const client = daemonClientMock.instances[0];
-		expect(client?.requests[0]).toEqual({
-			type: "create",
-			name: "my-session",
-			config: {
-				extensionFlagValues: {
-					ticket: "123",
-				},
-			},
-			sessionPath: undefined,
-			continueRecent: undefined,
-		});
-	});
-
-	it("keeps bare --resume values as session id selectors", async () => {
-		await expect(
-			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "create", "--resume", "abc123"]),
-		).resolves.toBe(true);
-
-		const client = daemonClientMock.instances[0];
-		expect(client?.requests[0]).toMatchObject({
-			type: "create",
-			sessionPath: "abc123",
-		});
+		expect(process.exitCode).toBeUndefined();
 	});
 
 	it("rejects unknown send options instead of folding them into the message", async () => {
@@ -386,19 +185,6 @@ describe("daemon command", () => {
 			targetActiveSessionId: "--target-like",
 			message: "--from literal",
 		});
-	});
-
-	it("rejects extra agent-messages status arguments", async () => {
-		await expect(
-			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "agent-messages", "pause", "active-1"]),
-		).resolves.toBe(true);
-
-		expect(daemonClientMock.instances[0]?.requests).toEqual([]);
-		expect(
-			consoleErrorMessages.some(
-				(message) => typeof message === "string" && message.includes("Usage: daemon agent-messages pause"),
-			),
-		).toBe(true);
 	});
 
 	it("parses send message text from an explicit --message value", async () => {
@@ -553,194 +339,6 @@ describe("daemon command", () => {
 			{ type: "cron_list", activeSessionId: "active-1", includeInactive: false },
 		]);
 	});
-
-	it("passes --goal and --goal-token-budget to the create config", async () => {
-		await expect(
-			handleDaemonCommand([
-				"daemon",
-				"--socket",
-				"/tmp/prime-agent.sock",
-				"create",
-				"--goal",
-				"Write tests",
-				"--goal-token-budget",
-				"50000",
-				"my-session",
-			]),
-		).resolves.toBe(true);
-
-		expect(daemonClientMock.instances[0]?.requests[0]).toMatchObject({
-			type: "create",
-			name: "my-session",
-			config: {
-				initialGoal: { objective: "Write tests", tokenBudget: 50000 },
-			},
-		});
-	});
-
-	it("rejects empty --goal in daemon create", async () => {
-		await handleDaemonCommand([
-			"daemon",
-			"--socket",
-			"/tmp/prime-agent.sock",
-			"create",
-			"--goal",
-			"  ",
-			"my-session",
-		]);
-		expect(process.exitCode).toBe(1);
-		expect(
-			consoleErrorMessages.some((m) => typeof m === "string" && m.includes("--goal requires a non-empty objective")),
-		).toBe(true);
-	});
-
-	it("rejects --goal-token-budget without --goal in daemon create", async () => {
-		await handleDaemonCommand([
-			"daemon",
-			"--socket",
-			"/tmp/prime-agent.sock",
-			"create",
-			"--goal-token-budget",
-			"50000",
-			"my-session",
-		]);
-		expect(process.exitCode).toBe(1);
-		expect(
-			consoleErrorMessages.some((m) => typeof m === "string" && m.includes("--goal-token-budget requires --goal")),
-		).toBe(true);
-		// DaemonClient is constructed before runCreate parses session args
-		expect(daemonClientMock.instances.length).toBe(1);
-		expect(daemonClientMock.instances[0]?.requests.length).toBe(0);
-	});
-
-	it("does not leak --goal/--goal-token-budget into daemon startup args", async () => {
-		// Force canConnectToDaemon to fail so runStart is exercised.
-		daemonClientMock.behavior.connectFails = true;
-		spawnMock.calls.length = 0;
-
-		await handleDaemonCommand([
-			"daemon",
-			"--socket",
-			"/tmp/prime-agent-goal-leak-test.sock",
-			"start",
-			"--goal",
-			"Leak test goal",
-			"--goal-token-budget",
-			"100",
-		]);
-
-		expect(spawnMock.calls.length).toBe(1);
-		const spawnArgs = spawnMock.calls[0]!;
-		// The goal flags must NOT appear in the daemon startup args.
-		expect(spawnArgs).not.toContain("--goal");
-		expect(spawnArgs).not.toContain("Leak test goal");
-		expect(spawnArgs).not.toContain("--goal-token-budget");
-		expect(spawnArgs).not.toContain("100");
-	});
-
-	it("does not leak goal into default config for a subsequent no-goal create", async () => {
-		// First create with goal — config has initialGoal.
-		await handleDaemonCommand([
-			"daemon",
-			"--socket",
-			"/tmp/prime-agent.sock",
-			"create",
-			"--goal",
-			"Write tests",
-			"--goal-token-budget",
-			"50000",
-			"first",
-		]);
-		expect(daemonClientMock.instances.at(-1)?.requests[0]).toMatchObject({
-			type: "create",
-			config: { initialGoal: { objective: "Write tests", tokenBudget: 50000 } },
-		});
-
-		// Second create without goal — config must NOT have initialGoal.
-		await handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "create", "second"]);
-		const secondConfig = daemonClientMock.instances.at(-1)?.requests[0]?.config;
-		expect(secondConfig?.initialGoal).toBeUndefined();
-	});
-
-	it("errors on non-interactive daemon attach with the json remediation instead of hanging", async () => {
-		// The test runner's stdin is not a TTY, so the attach terminal guard must
-		// fail fast rather than block on a readline that can never be answered.
-		await expect(
-			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "attach", "active-1"]),
-		).resolves.toBe(true);
-
-		expect(process.exitCode).toBe(1);
-		expect(consoleErrorMessages.join(" ")).toContain("attach requires an interactive terminal");
-	});
-
-	it("monitor attach declares compact streaming capabilities and keeps tool-call notices from deltas", async () => {
-		// The attach terminal requires a TTY for stdin; fake it and drive the
-		// terminal through the mocked readline interface.
-		const stdinTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
-		Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
-		const written: string[] = [];
-		vi.spyOn(process.stdout, "write").mockImplementation(((chunk: unknown) => {
-			written.push(String(chunk));
-			return true;
-		}) as typeof process.stdout.write);
-		try {
-			const command = handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "attach", "active-1"]);
-			for (let i = 0; i < 5; i++) {
-				await flushPromises();
-			}
-
-			const client = daemonClientMock.instances[0];
-			// Without streaming_deltas the supervisor rebuilds and serializes a full
-			// message_update per delta for this client; with them the monitor gets
-			// the worker's compact deltas verbatim.
-			expect(client?.requests[0]).toEqual({
-				type: "attach",
-				activeSessionId: "active-1",
-				capabilities: ["attach_snapshot", "event_sequence", "streaming_deltas", "streaming_delta_fragments"],
-			});
-
-			client?.emitMessage({
-				type: "assistant_stream_delta",
-				activeSessionId: "active-1",
-				assistantMessageEvent: { type: "toolcall_end", toolCall: { name: "bash" } },
-			});
-			client?.emitMessage({
-				type: "assistant_stream_delta",
-				activeSessionId: "active-1",
-				assistantMessageEvent: { type: "text_delta" },
-			});
-			expect(written.join("")).toContain("Tool call: bash");
-			expect(written.join("")).not.toContain("text_delta");
-
-			readlineMock.instances[0]?.close();
-			await expect(command).resolves.toBe(true);
-			expect(client?.requests.map((request) => request.type)).toEqual(["attach", "detach"]);
-		} finally {
-			if (stdinTTY) {
-				Object.defineProperty(process.stdin, "isTTY", stdinTTY);
-			} else {
-				delete (process.stdin as { isTTY?: boolean }).isTTY;
-			}
-		}
-	});
-
-	it("prints the created session for non-interactive --json open instead of attaching", async () => {
-		daemonClientMock.behavior.createdSession = makeSessionSummary("active-open-1", "session-open-1", "open-1");
-		const logCalls: unknown[][] = [];
-		vi.spyOn(console, "log").mockImplementation((...messages: unknown[]) => {
-			logCalls.push(messages);
-		});
-
-		await expect(handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "--json"])).resolves.toBe(true);
-
-		// No attach-guard error: the machine-readable path prints the summary and exits.
-		expect(process.exitCode).toBeUndefined();
-		expect(consoleErrorMessages).toEqual([]);
-		const client = daemonClientMock.instances.at(-1);
-		expect(client?.requests.some((request) => request.type === "attach")).toBe(false);
-		expect(logCalls.length).toBe(1);
-		expect(() => JSON.parse(String(logCalls[0]?.[0]))).not.toThrow();
-	});
 });
 
 function makeSessionSummary(activeSessionId: string, sessionId: string, sessionName: string): Record<string, unknown> {
@@ -759,9 +357,4 @@ function makeSessionSummary(activeSessionId: string, sessionId: string, sessionN
 		messageCount: 0,
 		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 	};
-}
-
-async function flushPromises(): Promise<void> {
-	await Promise.resolve();
-	await Promise.resolve();
 }

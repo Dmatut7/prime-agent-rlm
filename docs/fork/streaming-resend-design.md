@@ -17,7 +17,7 @@ HEAD 上的真实状态：
 
 **仍然全量/二次方的三条腿（本文实测，§二）**
 
-- R1 · legacy 客户端腿：attach 不带 `streaming_deltas` 的客户端 ⇒ supervisor 每 delta 重建+序列化全量 `message_update` 写给它。**本仓一方实例：`prime-agent daemon attach` 监控 REPL**（`daemon-command.ts:1347` attach 不带 capabilities → `daemon-supervisor.ts:1353` 落默认集 {attach_snapshot, event_sequence}）。它连正文都不渲染（`daemon-command.ts:1495-1499` 只看 toolcall_end），却全额买单。三方 jsonl 客户端同理。
+- R1 · legacy 客户端腿：attach 不带 `streaming_deltas` 的客户端 ⇒ supervisor 每 delta 重建+序列化全量 `message_update` 写给它。三方 jsonl 客户端是此腿的实例。（2026-10 更新：本文成文时用作一方实例的 `prime-agent daemon attach` 监控 REPL 已随 daemon 前缀命令面一并删除——该前缀上游早已由 REMOVED_COMMAND_NAMES 拒绝，CLI 侧只是清掉死代码；协议腿本身保留。）
 - R2 · 半新客户端腿：有 `streaming_deltas` 无 `streaming_delta_fragments` ⇒ `toolcall_delta` 带全量已解析参数快照（`compact-session-stream.ts:85-94`）。HEAD 上一方消费者全部声明了 fragments，此腿仅为协议地板存在，但放大系数与 legacy 同阶（实测 6274×）。
 - R3 · 渲染腿（TUI 进程内，与 wire 无关）：流中的**最后一个 markdown 块**永不进缓存、每帧全量重 lex+渲染（`markdown.ts:421-424` 注释明示原因：未闭合 fence/生长中 list 会被追加文本重解释）。单块答案（一整段、一个未闭合 ```fence、一张大表格）⇒ 每帧 O(已累积) ⇒ 整答 O(n²)。多块答案靠前缀 lex 缓存 + per-block slots（`markdown.ts:364-378`、:421-452）接近线性。
 - R4 · 帧成本随会话总长线性涨：每帧 `render(width)` 走全组件树 + raw 前缀指针扫描 O(总行数)（`tui.ts:2120`、:2143-2150 已把 normalize/diff 收敛到变化区）。9-14 实测空帧 0.004ms→5.45ms（0→36000 行）。已落盘的轮次永远不释放出活树。

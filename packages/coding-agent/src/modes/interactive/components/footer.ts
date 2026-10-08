@@ -333,6 +333,19 @@ function watermarkBar(tokens: number, windowTokens: number, thresholdTokens: num
 }
 
 /**
+ * Extension statuses (`ctx.ui.setStatus`) render on one footer line. Newlines and
+ * control characters collapse to spaces so a status can never break the single-line
+ * contract; ANSI color sequences pass through so extensions can colorize.
+ */
+function sanitizeStatusText(text: string): string {
+	return text
+		.replace(/[\r\n\t]/g, " ")
+		.replace(/[\u0000-\u0008\u000b\u000e-\u001a\u001c-\u001f\u007f\u009b]/g, "")
+		.replace(/ +/g, " ")
+		.trim();
+}
+
+/**
  * Footer component for the prime brand TUI.
  *
  * Renders nothing by default — token counters, cost, model name, cwd, and context %
@@ -344,6 +357,9 @@ function watermarkBar(tokens: number, windowTokens: number, thresholdTokens: num
  * one-liner driven by a pull source (评审②): the mode and the snapshot are read
  * at render time from the same getter the tray fallback reads, so the two lines
  * can never disagree — one frame, one value.
+ *
+ * Extension statuses are the one segment that renders even when everything else is
+ * off: they are the only screen estate `ctx.ui.setStatus()` has.
  */
 export class FooterComponent implements Component {
 	// Stable reference so the parent aggregator's identity check can hit while the footer is empty.
@@ -357,9 +373,7 @@ export class FooterComponent implements Component {
 	private spendSource: (() => readonly string[]) | undefined;
 	private toolErrorCount = 0;
 
-	constructor(private footerData: ReadonlyFooterDataProvider) {
-		void this.footerData;
-	}
+	constructor(private footerData: ReadonlyFooterDataProvider) {}
 
 	setAutoCompactEnabled(_enabled: boolean): void {
 		// no-op while the footer is empty
@@ -524,6 +538,27 @@ export class FooterComponent implements Component {
 		// Git watcher cleanup handled by provider
 	}
 
+	/**
+	 * The extension status line (`ctx.ui.setStatus`), sorted by key, or undefined
+	 * when no extension has a status up. This is the only footer segment that
+	 * renders regardless of the telemetry/status-bar faces.
+	 */
+	private extensionStatusLine(safeWidth: number): string | undefined {
+		const statuses = this.footerData.getExtensionStatuses();
+		if (statuses.size === 0) {
+			return undefined;
+		}
+		const text = Array.from(statuses.entries())
+			.sort(([a], [b]) => a.localeCompare(b))
+			.map(([, value]) => sanitizeStatusText(value))
+			.filter((value) => value.length > 0)
+			.join(" ");
+		if (!text) {
+			return undefined;
+		}
+		return truncateToWidth(text, safeWidth, theme.fg("dim", "..."));
+	}
+
 	render(width: number): string[] {
 		// Telemetry (U6 watermark) is one persistent line; /speed appends its own
 		// line when enabled. The stable empty reference keeps the parent
@@ -532,10 +567,14 @@ export class FooterComponent implements Component {
 		const toolErrorBadge =
 			this.toolErrorCount >= TOOL_ERROR_WARN_THRESHOLD ? `⚠ 工具错误×${this.toolErrorCount}` : undefined;
 		const statusBar = this.statusBarSource?.();
+		const extensionLine = this.extensionStatusLine(safeWidth);
 		if (statusBar) {
 			const lines = [renderStatusBar(statusBar, safeWidth, toolErrorBadge)];
 			if (this.speedEnabled && this.speedText) {
 				lines.push(theme.fg("dim", truncateToWidth(` ${this.speedText}`, safeWidth, "")));
+			}
+			if (extensionLine) {
+				lines.push(extensionLine);
 			}
 			return lines;
 		}
@@ -547,7 +586,7 @@ export class FooterComponent implements Component {
 		const telemetry = this.telemetryText(
 			toolErrorBadge ? Math.max(1, safeWidth - visibleWidth(toolErrorBadge) - 1) : safeWidth,
 		);
-		if (!telemetry && !toolErrorBadge && (!this.speedEnabled || !this.speedText)) {
+		if (!telemetry && !toolErrorBadge && (!this.speedEnabled || !this.speedText) && !extensionLine) {
 			return this.emptyLines;
 		}
 		const lines: string[] = [];
@@ -565,6 +604,9 @@ export class FooterComponent implements Component {
 			const text =
 				visibleWidth(this.speedText) > safeWidth ? truncateToWidth(this.speedText, safeWidth, "") : this.speedText;
 			lines.push(theme.fg("dim", text));
+		}
+		if (extensionLine) {
+			lines.push(extensionLine);
 		}
 		return lines;
 	}

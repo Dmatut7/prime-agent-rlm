@@ -50,7 +50,7 @@ function workingStatusLine(): string {
 		liveTurnFlowStore: { hasLiveBox: () => false, lastFinished: undefined },
 	});
 	const state = method<StatusBarState | undefined>("getStatusBarState").call(mode);
-	const footer = new FooterComponent({ getGitBranch: () => null } as never);
+	const footer = new FooterComponent({ getGitBranch: () => null, getExtensionStatuses: () => new Map() } as never);
 	footer.setStatusBarSource(() => state);
 	return stripAnsi(footer.render(160).join("\n"));
 }

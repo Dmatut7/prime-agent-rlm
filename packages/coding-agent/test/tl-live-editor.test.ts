@@ -38,7 +38,7 @@ function stripWith(children: readonly SubagentPanelRow[]): SubagentSummaryLine {
 }
 
 function statusLine(): FooterComponent {
-	const footer = new FooterComponent({ getGitBranch: () => null } as never);
+	const footer = new FooterComponent({ getGitBranch: () => null, getExtensionStatuses: () => new Map() } as never);
 	footer.setStatusBarSource(() => ({ model: "glm-5.3-prime", subagents: 0, right: [] }));
 	return footer;
 }

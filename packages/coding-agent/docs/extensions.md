@@ -2025,6 +2025,8 @@ export default function (pi: ExtensionAPI) {
 
 Tools can provide `renderCall` and `renderResult` for custom TUI display. See [tui.md](tui.md) for the full component API and [tool-execution.ts](../src/modes/interactive/components/tool-execution.ts) for how tool rows are composed.
 
+**Daemon sessions:** custom tool renderers only apply in in-process interactive sessions (an SDK embedding that passes `extensionFactories`, or `--no-session`). In daemon-backed sessions — the default `prime-agent` flow — `renderCall`, `renderResult`, and `renderShell` never run; tool output always uses the default rendering, with no indication that a custom renderer was registered.
+
 By default, tool output is wrapped in a tool panel: a `label · status` header line (e.g. `my_tool · running`) followed by the slot components, every line indented and drawn on the `toolPanelBg` background so the block reads as one unit. A defined `renderCall` or `renderResult` must return a `Component`. If a slot renderer is not defined, `tool-execution.ts` uses fallback rendering for that slot.
 
 Set `renderShell: "self"` when the tool should render its own shell instead of the default tool panel. This is useful for tools that need complete control over framing or background behavior, for example large previews that must stay visually stable after the tool settles.
@@ -2374,7 +2376,9 @@ See [github-issue-autocomplete.ts](../examples/extensions/github-issue-autocompl
 
 ### Custom Components
 
-For complex UI, use `ctx.ui.custom()`. This temporarily replaces the editor with your component until `done()` is called:
+For complex UI, use `ctx.ui.custom()`. This temporarily replaces the editor with your component until `done()` is called.
+
+**Daemon sessions:** there is no editor host for a custom component when the session runs under the daemon (the default `prime-agent` flow). `ctx.ui.custom()` resolves `undefined` — indistinguishable from the user cancelling — and the client shows a one-time warning so the silent path is at least visible. Custom components work in in-process interactive sessions (an SDK embedding that passes `extensionFactories`, or `--no-session`).
 
 ```typescript
 import { Text, Component } from "@earendil-works/pi-tui";
@@ -2483,7 +2487,7 @@ See [tui.md](tui.md) Pattern 7 for a complete example with mode indicator.
 
 ### Message Rendering
 
-Register a custom renderer for messages with your `customType`:
+Register a custom renderer for messages with your `customType`. As with custom tool renderers, message renderers only apply in in-process interactive sessions; in daemon-backed sessions (the default) messages with a custom `customType` render with the built-in fallback and the registered renderer never runs:
 
 ```typescript
 import { Text } from "@earendil-works/pi-tui";
@@ -2563,6 +2567,8 @@ const highlighted = highlightCode(code, lang, theme);
 | Print (`-p`) | No-op | Extensions run but can't prompt |
 
 In non-interactive modes, check `ctx.hasUI` before using UI methods.
+
+Interactive sessions are daemon-backed by default, which limits three TUI surfaces: `ctx.ui.custom()` resolves `undefined` (the client shows a one-time warning), and `registerMessageRenderer` plus tool `renderCall`/`renderResult` never run — rendering always falls back to the built-in defaults. The full surface works in in-process interactive sessions (an SDK embedding that passes `extensionFactories`, or `--no-session`). Note that `ctx.hasUI` is `true` in daemon sessions: it reports that dialogs and notifications reach a client, not that every TUI surface is hostable.
 
 ## Examples Reference
 

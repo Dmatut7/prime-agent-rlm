@@ -36,7 +36,7 @@ const SNAPSHOT: FooterTelemetrySnapshot = {
 	compactionThresholdTokens: 838_861,
 };
 
-const provider = { getGitBranch: () => null } as never;
+const provider = { getGitBranch: () => null, getExtensionStatuses: () => new Map() } as never;
 
 const spendFigures = { cost: 961.72, tokens: 592_000_000, parentCost: 273.44, unpriced: [], partial: false };
 

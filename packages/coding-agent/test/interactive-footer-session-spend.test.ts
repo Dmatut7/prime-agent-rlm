@@ -13,7 +13,7 @@ import {
 } from "../src/modes/interactive/components/footer.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
-const provider = { getGitBranch: () => null } as never;
+const provider = { getGitBranch: () => null, getExtensionStatuses: () => new Map() } as never;
 
 function footerLine(component: FooterComponent, width = 120): string {
 	return stripAnsi(component.render(width).join("\n"));

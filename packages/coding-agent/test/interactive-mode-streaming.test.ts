@@ -2,7 +2,6 @@ import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import { Container, type MarkdownTheme, type TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
-import type { ReadonlyFooterDataProvider } from "../src/core/footer-data-provider.js";
 import type { AgentConnectionSessionEvent } from "../src/modes/agent-connection/index.js";
 import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
 import type { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
@@ -427,7 +426,10 @@ describe("InteractiveMode streaming events", () => {
 		const speedLine = (footer: FooterComponent) => stripAnsi(footer.render(200).join("\n"));
 		const makeSpeedThis = (enabled = true) => {
 			const fakeThis = createFakeInteractiveModeThis();
-			const footer = new FooterComponent({ getGitBranch: () => null } as ReadonlyFooterDataProvider);
+			const footer = new FooterComponent({
+				getGitBranch: () => null,
+				getExtensionStatuses: () => new Map(),
+			} as never);
 			footer.setSpeedEnabled(enabled);
 			Object.assign(fakeThis as Record<string, unknown>, { footer, speedDisplayEnabled: enabled });
 			return { fakeThis, footer };

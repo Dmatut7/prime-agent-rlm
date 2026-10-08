@@ -1,3 +1,12 @@
+## 2026-10-08 假功能批（车道 D，审计 R3-M5/R3-M6/R6-M5/R6-M6/R6-M3）
+
+- R3-M5：`ctx.ui.setStatus()` 恢复可见——品牌化提交 813b847b4 删掉了 footer 的扩展状态行，现按新 quiet footer 形态恢复为独立一行（按 key 排序、控制字符清洗、超宽截断），in-process 与 daemon 会话同路。9 个测试文件里「footer 故意不理 provider」的老桩补齐 `getExtensionStatuses`。
+- R6-M5：扩展命令重名不再静默改名——`resolveRegisteredCommands` 产出 warning 诊断（`/extensions` 面板的诊断端口不再是死端口），并按 tool 冲突同款通道 notify/console.warn 一次。钉死 bug 的 `expect(diagnostics).toEqual([])` 测试已改为钉新行为。
+- R3-M6：daemon 会话 `ctx.ui.custom()` 每次返回 undefined 前，首次调用向客户端发一条 warning 通知（此前示例扩展按「用户取消」误报模型）。
+- R6-M6（短期面）：docs/extensions.md 三处注明 daemon 会话下 registerMessageRenderer 与工具 renderCall/renderResult/renderShell 不生效（仅 in-process：SDK extensionFactories 或 --no-session）；Mode Behavior 节补 daemon 行。协议能力面（渲染器随工具定义过 wire）留作长期项。
+- R6-M3：`prime-agent daemon <子命令>` 死面删除——上游 ebb240e5a 已用 REMOVED_COMMAND_NAMES 拒掉前缀，公共命令（list/stop/rename/send/schedule/status）才是活面；daemon-command.ts 从 1825 行删到 556 行（砍掉 open/start/ps/create/attach/detach/prompt/agent-messages/steer/follow-up/state/messages/stats/commands/retry/restart/shutdown 及独占 helper、DaemonAttachTerminal 监控 REPL），daemon-command.test.ts 从 767 行删到 361 行并补 list/kill/rename 冒烟与「死子命令被拒」回归。usage.md 与 streaming-resend-design.md 同步；CHANGELOG 属已发布历史不动（wave-41 条目里的 `daemon ps` 提法以本节为准更正）。
+- 门禁：check EXIT 0；触及套件 173+169 测试全绿；四条新/改测试均先红后绿。
+
 ## 2026-10-08 第四批：剩余三个 High 收口 + 六条 Medium
 
 - R2-H2：登录框 24 行终端溢出裁掉粘贴输入框——Prime 登录头 13 行 logo 块在 <30 行终端退化为标题对（80×24 全流程 21 行装得下，含手动粘贴+回退重提示）；mock 无 terminal 的旧测试默认 40 行不受影响。

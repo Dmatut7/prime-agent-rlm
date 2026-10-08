@@ -219,7 +219,7 @@ In print mode, Prime Agent also reads piped stdin and merges it into the initial
 cat README.md | prime-agent -p "Summarize this text"
 ```
 
-The piped-stdin read is bounded by a short idle window (default 250ms, `PI_STDIN_TIMEOUT_MS`, `0` skips, capped at 30s): a non-interactive parent that holds the pipe open without writing or closing it no longer hangs the boot. Related non-interactive guards: resuming another project's session without a TTY fails fast with a `--fork` hint instead of waiting for a fork confirmation, `daemon attach` without a TTY reports an error (use `--json`), and the deprecation-warning keypress wait is skipped without a TTY.
+The piped-stdin read is bounded by a short idle window (default 250ms, `PI_STDIN_TIMEOUT_MS`, `0` skips, capped at 30s): a non-interactive parent that holds the pipe open without writing or closing it no longer hangs the boot. Related non-interactive guards: resuming another project's session without a TTY fails fast with a `--fork` hint instead of waiting for a fork confirmation, and the deprecation-warning keypress wait is skipped without a TTY.
 
 Print and JSON mode wait for in-flight subagents to settle before exiting, so the
 run does not abort subagents whose results the root has not consumed yet. A
