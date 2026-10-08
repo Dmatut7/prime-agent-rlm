@@ -1,0 +1,7 @@
+- Fixed feature hints never appearing in the default quiet mode (the hint gate required the working loader in the status container, which quiet mode never mounts).
+- Fixed a "派出子代理 X" lifecycle line being silently overwritten by the next transient status update.
+- Fixed /settings face toggles and /reload tearing down in-flight tool cards mid-turn; the chat rebuild they need now waits for the turn to settle.
+- Fixed toggling "内置技能" in /settings silently closing the settings panel; the required reload now runs when the panel closes.
+- Fixed paged-up history (slim attach backfill) rendering without lane lines, change strips, heartbeat prompt notices, and extension message renderers.
+- Fixed extension UI teardown popping an unrelated top overlay (for example the login dialog) instead of only the extension's own overlay.
+- Fixed pasted images after attach/resume reusing `[image #N]` ids present in session history, which made a recalled old message silently attach the new image.

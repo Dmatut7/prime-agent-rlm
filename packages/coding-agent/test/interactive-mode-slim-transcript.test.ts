@@ -13,8 +13,11 @@ import { emptyUsage } from "../src/core/usage.js";
 import type { AgentConnectionSessionContext } from "../src/modes/agent-connection/index.js";
 import { DAEMON_SLIM_ATTACH_MESSAGE_TAIL } from "../src/modes/daemon/daemon-protocol.js";
 import { CustomEditor } from "../src/modes/interactive/components/custom-editor.js";
+import { InjectedPromptMessageComponent } from "../src/modes/interactive/components/injected-prompt-message.js";
 import { formatKeyText } from "../src/modes/interactive/components/keybinding-hints.js";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
+import { TurnStripComponent } from "../src/modes/interactive/components/turn-strip.js";
+import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
 import { InteractiveMode, SLIM_TRANSCRIPT_PAGE_SIZE } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -962,5 +965,168 @@ describe("slim attach backfill non-mouse triggers", () => {
 		expect(getMessagesWindow).toHaveBeenCalledTimes(1);
 		resolveRead?.({ messages: transcript(2, "older", 0), totalMessages: 254, firstIndex: 246 });
 		await vi.waitFor(() => expect(mode.slimTranscriptOmitted).toBe(246));
+	});
+});
+
+describe("slim backfill page live wiring (R4-M13)", () => {
+	beforeAll(() => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	async function loadPage(mode: ModeFake, page: AgentMessage[], firstIndex: number): Promise<void> {
+		const getMessagesWindow = vi.fn(async () => ({ messages: page, totalMessages: 300, firstIndex }));
+		(mode.agentConnection as { getMessagesWindow: unknown }).getMessagesWindow = getMessagesWindow;
+		await proto.loadEarlierTranscriptPage.call(mode);
+	}
+
+	it("a stored heartbeat prompt in a backfilled page renders as an injected notice, not a plain bubble", async () => {
+		const heartbeat = {
+			id: "hb-1",
+			status: "active",
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp",
+			prompt: "心跳巡检提示词",
+			schedule: { expression: "*/5 * * * *" },
+			createdAt: new Date(0).toISOString(),
+			updatedAt: new Date(0).toISOString(),
+			lastRunAt: new Date(1_000).toISOString(),
+			runCount: 1,
+		};
+		const mode = createHarness({ slimTranscriptOmitted: 10 });
+		(mode.connectionState as { heartbeat?: unknown }).heartbeat = heartbeat;
+		await proto.renderSessionContext.call(mode, sessionContext(transcript(1, "tail", 500)), {});
+
+		const page: AgentMessage[] = [userMessage(2, "心跳巡检提示词"), assistantMessage(2, "巡检完成")];
+		await loadPage(mode, page, 8);
+
+		const chat = mode.chatContainer as Container;
+		const injected = chat.children.filter((child) => child instanceof InjectedPromptMessageComponent);
+		expect(injected).toHaveLength(1);
+		// The plain bubble face would render the raw prompt text as a user row instead.
+		expect(chatText(mode)).not.toContain("› 心跳巡检提示词");
+	});
+
+	it("a backfilled turn records its file changes and gets its closing strip inside the page (above the tail)", async () => {
+		const mode = createHarness({ slimTranscriptOmitted: 10 });
+		await proto.renderSessionContext.call(mode, sessionContext(transcript(1, "tail", 500)), {});
+
+		const page: AgentMessage[] = [
+			userMessage(2, "改一下 x.ts"),
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", name: "ipython", id: "tc-1", arguments: { code: "write x.ts" } }],
+				api: "openai-responses",
+				provider: "openai",
+				model: "test-model",
+				usage: emptyUsage(),
+				stopReason: "toolUse",
+				timestamp: 2.5,
+			},
+			{
+				role: "toolResult",
+				toolCallId: "tc-1",
+				toolName: "ipython",
+				content: [{ type: "text", text: "ok" }],
+				details: { fileChanges: [{ path: "/tmp/x.ts", added: 3, removed: 1 }] },
+				isError: false,
+				timestamp: 2.75,
+			},
+			assistantMessage(3, "改好了"),
+		];
+		await loadPage(mode, page, 6);
+
+		const chat = mode.chatContainer as Container;
+		const text = chatText(mode);
+		// The page turn's head carries the change summary, like a live turn's.
+		expect(text).toContain("改了 1 个文件");
+		expect(text.indexOf("改好了")).toBeLessThan(text.indexOf("tail question 0"));
+		// The page's closing strip lands with the page's turn: the first strip in the
+		// chat sits above the tail's first question row (the tail's own strip is later).
+		const firstStripIndex = chat.children.findIndex((child) => child instanceof TurnStripComponent);
+		const tailQuestionIndex = chat.children.findIndex(
+			(child) =>
+				child instanceof UserMessageComponent &&
+				stripAnsi(child.render(120).join("\n")).includes("tail question 0"),
+		);
+		expect(firstStripIndex).toBeGreaterThanOrEqual(0);
+		expect(tailQuestionIndex).toBeGreaterThanOrEqual(0);
+		expect(firstStripIndex).toBeLessThan(tailQuestionIndex);
+	});
+
+	it("a notice that repeats a report the session already received stays bookkeeping in a backfilled page", async () => {
+		const mode = createHarness({ slimTranscriptOmitted: 10 });
+		await proto.renderSessionContext.call(mode, sessionContext(transcript(1, "tail", 500)), {});
+		// The report arrived before the page (the main replay pre-notes messages above
+		// its window the same way): the page's notice only repeats it.
+		(
+			mode as unknown as {
+				turnFlow: { reports: { note(message: AgentMessage): void } };
+			}
+		).turnFlow.reports.note({
+			role: "custom",
+			customType: "agent_message",
+			content: "child-x 的报告",
+			display: true,
+			details: {
+				id: "agentmsg_1",
+				message: "child-x 的报告",
+				fromRelationship: "child",
+				from: { sessionName: "child-x" },
+			},
+			timestamp: 1,
+		});
+
+		const page: AgentMessage[] = [
+			{
+				role: "custom",
+				customType: "rlm_child_terminal_notice",
+				content: "子代理 child-x 已结束",
+				display: true,
+				details: { sessionName: "child-x" },
+				timestamp: 2,
+			} as AgentMessage,
+			assistantMessage(3, "收到，继续"),
+		];
+		await loadPage(mode, page, 8);
+
+		// A bookkeeping round is not drawn: the answer it produced stays out of sight,
+		// exactly like the same round in the attach tail.
+		expect(chatText(mode)).not.toContain("收到，继续");
+	});
+
+	it("a backfilled page renders custom messages through the session's extension renderers", async () => {
+		const mode = createHarness({
+			slimTranscriptOmitted: 10,
+			bindLocalSessionExtensions: true,
+			getLocalSessionHost: () => ({
+				getExtensionRunner: () => ({
+					getMessageRenderer: (customType: string) =>
+						customType === "x_w6_probe"
+							? () => ({ render: () => ["EXT-PROBE-RENDERED"], invalidate: () => {} })
+							: undefined,
+				}),
+			}),
+		});
+		await proto.renderSessionContext.call(mode, sessionContext(transcript(1, "tail", 500)), {});
+
+		const page: AgentMessage[] = [
+			{
+				role: "custom",
+				customType: "x_w6_probe",
+				content: "probe payload",
+				display: true,
+				timestamp: 2,
+			} as AgentMessage,
+		];
+		await loadPage(mode, page, 9);
+
+		expect(chatText(mode)).toContain("EXT-PROBE-RENDERED");
 	});
 });

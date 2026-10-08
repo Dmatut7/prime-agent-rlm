@@ -60,6 +60,77 @@ describe("InteractiveMode paste of an image file path", () => {
 	});
 });
 
+describe("InteractiveMode replayed image markers (R2-M16)", () => {
+	type MarkerProto = {
+		addMessageToEditorHistory(this: never, message: unknown): void;
+		collectImagesFor(this: never, text: string): ImageContent[] | undefined;
+		scheduleEditorHistoryBackfill(this: never): void;
+	};
+	const proto = InteractiveMode.prototype as unknown as MarkerProto;
+
+	function markerHarness(nextImageMarkerId = 1) {
+		const pastedImages = new Map<number, ImageContent>();
+		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			nextImageMarkerId,
+			pastedImages,
+			editor: { addToHistory: vi.fn() },
+			connectionState: undefined,
+		});
+		return { fakeThis, pastedImages };
+	}
+
+	test("a replayed history message moves the next paste's marker id above its markers", () => {
+		const { fakeThis } = markerHarness();
+
+		proto.addMessageToEditorHistory.call(fakeThis as never, {
+			role: "user",
+			content: "[image #3] 看这张图",
+			timestamp: 1,
+		});
+
+		expect(fakeThis.nextImageMarkerId).toBe(4);
+	});
+
+	test("a recalled pre-attach message never picks up a post-attach paste's image", () => {
+		const { fakeThis, pastedImages } = markerHarness();
+		const oldText = "[image #1] 旧图（/old.png）";
+		proto.addMessageToEditorHistory.call(fakeThis as never, { role: "user", content: oldText, timestamp: 1 });
+
+		// The new paste takes the counter's next id, exactly like handleClipboardImagePaste.
+		const newImage: ImageContent = { type: "image", data: "TkVX", mimeType: "image/png" };
+		const markerId = fakeThis.nextImageMarkerId++;
+		pastedImages.set(markerId, newImage);
+
+		// Recalling the old message must not attach the new paste's bytes to the old marker.
+		expect(proto.collectImagesFor.call(fakeThis as never, oldText)).toBeUndefined();
+		expect(proto.collectImagesFor.call(fakeThis as never, `[image #${markerId}]`)).toEqual([newImage]);
+	});
+
+	test("the slim history backfill reconciles the marker id upper bound too", async () => {
+		const pastedImages = new Map<number, ImageContent>();
+		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			nextImageMarkerId: 1,
+			pastedImages,
+			slimTranscriptOmitted: 2,
+			slimTranscriptViewEpoch: 0,
+			editor: { getHistory: () => [], clearHistory: vi.fn(), addToHistory: vi.fn() },
+			connectionState: undefined,
+			agentConnection: {
+				getMessagesWindow: vi.fn(async () => ({
+					messages: [{ role: "user", content: "[image #7] 更早的图", timestamp: 1 }],
+					totalMessages: 2,
+					firstIndex: 0,
+				})),
+			},
+		});
+
+		proto.scheduleEditorHistoryBackfill.call(fakeThis as never);
+		await vi.waitFor(() => expect(fakeThis.editor.addToHistory).toHaveBeenCalledWith("[image #7] 更早的图"));
+
+		expect(fakeThis.nextImageMarkerId).toBe(8);
+	});
+});
+
 describe("InteractiveMode notices about who reads a pasted image", () => {
 	const textOnly = { ...getModel("anthropic", "claude-opus-4-7"), id: "glm-text", input: ["text" as const] };
 	const vision = getModel("anthropic", "claude-haiku-4-5");

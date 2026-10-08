@@ -806,13 +806,12 @@ export class LiveTurnFlow {
 	}
 
 	/** The strip goes at the chat's end, which is where the finished turn's answer is. */
-	attachStrip(summary: TurnSummaryComponent): void {
+	attachStrip(summary: TurnSummaryComponent, chat: Container = this.host.chat()): void {
 		let strip = this.strips.get(summary);
 		if (!strip) {
 			strip = new TurnStripComponent(this.stripSource(summary));
 			this.strips.set(summary, strip);
 		}
-		const chat = this.host.chat();
 		chat.removeChild(strip);
 		chat.addChild(strip);
 	}

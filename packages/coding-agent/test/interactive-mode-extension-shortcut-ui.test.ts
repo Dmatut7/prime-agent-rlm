@@ -1,6 +1,137 @@
 import { describe, expect, test, vi } from "vitest";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 
+function createOverlayStackUi() {
+	const stack: Array<{ component: unknown }> = [];
+	return {
+		stack,
+		requestRender: vi.fn(),
+		setFocus: vi.fn(),
+		terminal: { setTitle: vi.fn(), columns: 120, rows: 40 },
+		showOverlay: vi.fn((component: unknown) => {
+			const entry = { component };
+			stack.push(entry);
+			return {
+				hide: () => {
+					const index = stack.indexOf(entry);
+					if (index >= 0) stack.splice(index, 1);
+				},
+				setHidden: vi.fn(),
+				isHidden: () => false,
+				focus: vi.fn(),
+				unfocus: vi.fn(),
+				isFocused: () => false,
+			};
+		}),
+		hideOverlay: vi.fn(() => {
+			stack.pop();
+		}),
+	};
+}
+
+type ExtensionUiProto = {
+	showExtensionCustom<T>(
+		this: Record<string, unknown>,
+		factory: (
+			tui: unknown,
+			theme: unknown,
+			keybindings: unknown,
+			done: (result: T) => void,
+		) => { render(width: number): string[]; invalidate(): void },
+		options?: { overlay?: boolean },
+	): Promise<T>;
+	resetExtensionUI(this: Record<string, unknown>): void;
+};
+
+const extensionUiProto = InteractiveMode.prototype as unknown as ExtensionUiProto;
+
+function createResetHarness(ui: ReturnType<typeof createOverlayStackUi>) {
+	const editor = { getText: () => "", setText: vi.fn() };
+	const defaultEditor = { setText: vi.fn(), onExtensionShortcut: undefined };
+	const harness: Record<string, unknown> = {
+		ui,
+		editor,
+		defaultEditor,
+		editorContainer: { clear: vi.fn(), addChild: vi.fn() },
+		chatContainer: { children: [] },
+		keybindings: undefined,
+		activeConnectionExtensionUiRequests: new Map(),
+		extensionCustomOverlays: new Set(),
+		extensionSelector: undefined,
+		extensionInput: undefined,
+		extensionEditor: undefined,
+		heartbeatManager: undefined,
+		heartbeatManagerHandle: undefined,
+		heartbeatManagerRefreshTimer: undefined,
+		extensionTerminalInputUnsubscribers: new Set(),
+		extensionWidgetsAbove: new Map(),
+		extensionWidgetsBelow: new Map(),
+		widgetContainerAbove: undefined,
+		widgetContainerBelow: undefined,
+		customFooter: undefined,
+		footerSlot: { removeChild: vi.fn(), addChild: vi.fn() },
+		footer: { invalidate: vi.fn() },
+		footerDataProvider: { clearExtensionStatuses: vi.fn() },
+		pastedImages: new Map(),
+		hiddenThinkingLabel: "Thinking...",
+		defaultHiddenThinkingLabel: "Thinking...",
+		streamingComponent: undefined,
+		loadingAnimation: undefined,
+		workingMessage: undefined,
+		workingVisible: true,
+		workingIndicatorOptions: undefined,
+		// Collaborators with no bearing on overlay ownership.
+		setupAutocompleteProvider: vi.fn(),
+		updateTerminalTitle: vi.fn(),
+		showError: vi.fn(),
+	};
+	Object.setPrototypeOf(harness, InteractiveMode.prototype);
+	return harness;
+}
+
+describe("InteractiveMode extension overlay teardown (R5-M28)", () => {
+	test("resetExtensionUI removes only the extension's own overlay, never a foreign one on top", async () => {
+		const ui = createOverlayStackUi();
+		const harness = createResetHarness(ui);
+		const extensionOverlayComponent = { render: () => ["ext"], invalidate: () => {} };
+		void extensionUiProto.showExtensionCustom.call(harness, () => extensionOverlayComponent, { overlay: true });
+		await vi.waitFor(() => expect(ui.stack).toHaveLength(1));
+
+		// A login dialog (OAuth polling in the background) lands on top.
+		const loginDialog = { render: () => ["login"], invalidate: () => {} };
+		ui.showOverlay(loginDialog);
+		expect(ui.stack).toHaveLength(2);
+
+		extensionUiProto.resetExtensionUI.call(harness);
+
+		expect(ui.stack).toHaveLength(1);
+		expect(ui.stack[0]?.component).toBe(loginDialog);
+	});
+
+	test("an extension overlay closing itself never pops a foreign overlay on top", async () => {
+		const ui = createOverlayStackUi();
+		const harness = createResetHarness(ui);
+		let done: ((result: string) => void) | undefined;
+		const result = extensionUiProto.showExtensionCustom.call(
+			harness,
+			(_tui, _theme, _keybindings, resolve) => {
+				done = resolve;
+				return { render: () => ["ext"], invalidate: () => {} };
+			},
+			{ overlay: true },
+		);
+		await vi.waitFor(() => expect(ui.stack).toHaveLength(1));
+		const loginDialog = { render: () => ["login"], invalidate: () => {} };
+		ui.showOverlay(loginDialog);
+
+		done?.("picked");
+		await result;
+
+		expect(ui.stack).toHaveLength(1);
+		expect(ui.stack[0]?.component).toBe(loginDialog);
+	});
+});
+
 /**
  * The shortcut path builds its own ExtensionContext instead of using the runner's, so its `ui`
  * has to come from the runner: bindExtensions installs the dialog-tracking wrapper there, and a

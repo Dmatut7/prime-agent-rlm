@@ -222,6 +222,33 @@ describe("InteractiveMode.showStatus", () => {
 		expect(fakeThis.chatContainer.children).toHaveLength(5);
 		expect(renderLastLine(fakeThis.chatContainer)).toContain("STATUS_TWO");
 	});
+
+	test("an appended lifecycle line survives the next transient status (R4-M10)", () => {
+		const fakeThis: any = {
+			chatContainer: new Container(),
+			ui: { requestRender: vi.fn() },
+			lastStatusSpacer: undefined,
+			lastStatusText: undefined,
+		};
+
+		(InteractiveMode as any).prototype.showStatus.call(fakeThis, "STATUS_ONE");
+		// A lifecycle announcement (a subagent dispatched) appends its own line.
+		(InteractiveMode as any).prototype.showStatus.call(fakeThis, "派出子代理 scout：查一下", "dim", {
+			append: true,
+		});
+		expect(fakeThis.chatContainer.children).toHaveLength(4);
+
+		// The next transient status must take a new line, never rewrite the announcement.
+		(InteractiveMode as any).prototype.showStatus.call(fakeThis, "STATUS_TWO");
+		expect(fakeThis.chatContainer.children).toHaveLength(6);
+		const output = normalizeRenderedOutput(fakeThis.chatContainer);
+		expect(output).toContain("派出子代理 scout：查一下");
+		expect(output).toContain("STATUS_TWO");
+		// And the slot coalesces again from the new line on.
+		(InteractiveMode as any).prototype.showStatus.call(fakeThis, "STATUS_THREE");
+		expect(fakeThis.chatContainer.children).toHaveLength(6);
+		expect(normalizeRenderedOutput(fakeThis.chatContainer)).toContain("STATUS_THREE");
+	});
 });
 
 type RenderSessionContextHarness = {

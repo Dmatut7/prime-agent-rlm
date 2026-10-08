@@ -1771,6 +1771,13 @@ export class InteractiveMode {
 	 */
 	private chatCapRebuildFloor = 0;
 	private chatCapRebuildInFlight = false;
+	/**
+	 * A settings/reload rebuild requested while interruptible work owned components:
+	 * it runs at the next settle point instead of tearing down in-flight tool cards
+	 * (and the stall bar's row, whose key route would outlive it) mid-stream.
+	 */
+	private pendingChatRebuild = false;
+	private chatRebuildDrainInFlight = false;
 	private toolDefinitionCache = new Map<string, ToolExecutionDefinition | undefined>();
 	private agentRunFileChanges = new Map<string, FileChangeSummary>();
 
@@ -1875,6 +1882,13 @@ export class InteractiveMode {
 	private heartbeatRefreshRequested = false;
 	private heartbeatManager: HeartbeatManagerComponent | undefined;
 	private heartbeatManagerHandle: OverlayHandle | undefined;
+	/**
+	 * Extension custom UI currently shown as overlays. Teardown (resetExtensionUI,
+	 * the request's own close) hides these by handle: a bare hideOverlay() pops the
+	 * stack's top whatever it is, and the top can be a foreign dialog (login) whose
+	 * background flow (OAuth polling) keeps running after its dialog is gone.
+	 */
+	private readonly extensionCustomOverlays = new Set<OverlayHandle>();
 	private heartbeatManagerRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 	private heartbeatManagerRefreshAt: number | undefined;
 
@@ -4618,12 +4632,10 @@ export class InteractiveMode {
 	}
 
 	private showFeatureHint(): void {
-		if (
-			this.shouldSuppressFeatureHint() ||
-			!this.loadingAnimation ||
-			!this.shouldShowWorkingLoader() ||
-			!this.statusContainer.children.includes(this.loadingAnimation)
-		) {
+		// The loader is live while startWorkingLoader's run is: the quiet face never
+		// mounts it on the status container (the status line carries the activity),
+		// so container membership cannot be the gate.
+		if (this.shouldSuppressFeatureHint() || !this.loadingAnimation || !this.shouldShowWorkingLoader()) {
 			return;
 		}
 		if (!this.currentFeatureHint) {
@@ -4667,12 +4679,7 @@ export class InteractiveMode {
 	}
 
 	private resumeFeatureHintPresentation(): void {
-		if (
-			!this.shouldSuppressFeatureHint() &&
-			this.loadingAnimation &&
-			this.shouldShowWorkingLoader() &&
-			this.statusContainer.children.includes(this.loadingAnimation)
-		) {
+		if (!this.shouldSuppressFeatureHint() && this.loadingAnimation && this.shouldShowWorkingLoader()) {
 			this.startFeatureHintPresentation();
 		}
 	}
@@ -4958,7 +4965,9 @@ export class InteractiveMode {
 		if (this.extensionEditor) {
 			this.hideExtensionEditor();
 		}
-		this.ui.hideOverlay();
+		// Only the extension's own overlays: the stack's top can be a foreign dialog.
+		for (const handle of this.extensionCustomOverlays) handle.hide();
+		this.extensionCustomOverlays.clear();
 		this.clearExtensionTerminalInputListeners();
 		this.setExtensionFooter(undefined);
 		this.setExtensionHeader(undefined);
@@ -5453,13 +5462,18 @@ export class InteractiveMode {
 
 		return new Promise((resolve, reject) => {
 			let component: Component & { dispose?(): void };
+			let overlayHandle: OverlayHandle | undefined;
 			let closed = false;
 
 			const close = (result: T) => {
 				if (closed) return;
 				closed = true;
-				if (isOverlay) this.ui.hideOverlay();
-				else restoreEditor();
+				if (isOverlay) {
+					if (overlayHandle) this.extensionCustomOverlays.delete(overlayHandle);
+					overlayHandle?.hide();
+				} else {
+					restoreEditor();
+				}
 				// Note: both branches above already call requestRender
 				resolve(result);
 				try {
@@ -5488,6 +5502,8 @@ export class InteractiveMode {
 							return w ? { width: w } : undefined;
 						};
 						const handle = this.ui.showOverlay(component, resolveOptions());
+						overlayHandle = handle;
+						this.extensionCustomOverlays.add(handle);
 						// Expose handle to caller for visibility control
 						options?.onHandle?.(handle);
 					} else {
@@ -5978,6 +5994,19 @@ export class InteractiveMode {
 
 	private hasPastedImagesFor(text: string): boolean {
 		return imageMarkerIds(text).some((id) => this.pastedImages.has(id));
+	}
+
+	/**
+	 * A transcript text replayed into the session (history on attach, a paged
+	 * backfill) carries [image #N] markers from before the attach. Keep the counter
+	 * above them: a fresh paste reusing one of those ids would make a recalled
+	 * message attach the new image to the old marker, sending the model the wrong
+	 * bytes next to the old path note.
+	 */
+	private reconcileImageMarkerUpperBound(text: string): void {
+		for (const markerId of imageMarkerIds(text)) {
+			this.nextImageMarkerId = Math.max(this.nextImageMarkerId, markerId + 1);
+		}
 	}
 
 	private async handleSideQuestion(question: string): Promise<void> {
@@ -7619,6 +7648,9 @@ export class InteractiveMode {
 		// A long session must not grow the component tree without bound; at settle
 		// points over the cap this rebuilds through the initial-render window.
 		await this.enforceChatComponentCap();
+		// A settings/reload rebuild deferred while work was interruptible runs here,
+		// at the same settle point and under the same guard as the cap rebuild.
+		if (this.pendingChatRebuild) await this.drainPendingChatRebuild();
 	}
 
 	private startAssistantStreamingMessage(message: AssistantMessage): void {
@@ -8908,8 +8940,15 @@ export class InteractiveMode {
 		const text = new Text(theme.fg(tone, clean), 1, 0);
 		this.chatContainer.addChild(spacer);
 		this.chatContainer.addChild(text);
-		this.lastStatusSpacer = spacer;
-		this.lastStatusText = text;
+		if (options?.append === true) {
+			// An appended lifecycle line is not the transient slot: the next status
+			// update appends below it instead of rewriting it in place.
+			this.lastStatusSpacer = undefined;
+			this.lastStatusText = undefined;
+		} else {
+			this.lastStatusSpacer = spacer;
+			this.lastStatusText = text;
+		}
 		this.ui.requestRender();
 	}
 
@@ -8947,6 +8986,7 @@ export class InteractiveMode {
 		}
 		const textContent = this.getUserMessageText(message);
 		if (textContent && !this.createLegacyHeartbeatPromptMessage(message, textContent)) {
+			this.reconcileImageMarkerUpperBound(textContent);
 			this.editor.addToHistory?.(textContent);
 		}
 	}
@@ -9397,17 +9437,7 @@ export class InteractiveMode {
 				subagentLane: this.turnFlow.subagentLane,
 				reports: this.turnFlow.reports,
 				userLane: (at) => this.turnFlow.subagentLane.tracker.laneAt(at),
-				renderUserPrompt: (message, text) => {
-					// A stored heartbeat prompt renders as an injected notice and never opens an owner turn.
-					const heartbeatMessage = this.createLegacyHeartbeatPromptMessage(message, text);
-					if (!heartbeatMessage) return undefined;
-					const component = new InjectedPromptMessageComponent(
-						heartbeatMessage,
-						this.getMarkdownThemeWithSettings(),
-					);
-					component.setExpanded(this.toolOutputExpanded);
-					return { components: [component], ownerOpened: false };
-				},
+				renderUserPrompt: (message, text) => this.renderReplayUserPrompt(message, text),
 				createTurnSummary: (state) => this.createTurnSummary(state),
 				onTurnCreated: (state) => {
 					// A window that starts inside a long turn keeps the turn's prompt, its
@@ -9648,6 +9678,34 @@ export class InteractiveMode {
 	}
 
 	/**
+	 * A settings/reload rebuild re-faces existing components, so it cannot be
+	 * dropped; but run mid-flight it detaches the components interruptible work
+	 * owns (an in-flight tool card settles into a replayed twin its live result
+	 * never finds; the stall bar's row goes while its key route stays). Defer to
+	 * the next settle point - the same guard the live-cap rebuild uses.
+	 */
+	private requestChatRebuild(): void {
+		this.pendingChatRebuild = true;
+		void this.drainPendingChatRebuild();
+	}
+
+	private async drainPendingChatRebuild(): Promise<void> {
+		if (!this.pendingChatRebuild || this.chatRebuildDrainInFlight) return;
+		if (this.liveChatCapBlocked()) return;
+		this.chatRebuildDrainInFlight = true;
+		this.pendingChatRebuild = false;
+		try {
+			await this.rebuildChatFromMessages();
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		} finally {
+			this.chatRebuildDrainInFlight = false;
+		}
+		// A toggle that landed mid-rebuild re-pends through the flag.
+		if (this.pendingChatRebuild) void this.drainPendingChatRebuild();
+	}
+
+	/**
 	 * Live appends only ever grow the chat tree, so a long session accumulates
 	 * components without bound. Once the settled tree passes the live cap, trigger
 	 * a windowed rebuild: the same initialRenderMessages path used on session open,
@@ -9743,7 +9801,10 @@ export class InteractiveMode {
 				for (const message of page.messages) {
 					if (message.role !== "user") continue;
 					const text = this.getUserMessageText(message);
-					if (text && !this.createLegacyHeartbeatPromptMessage(message, text)) texts.push(text);
+					if (text && !this.createLegacyHeartbeatPromptMessage(message, text)) {
+						this.reconcileImageMarkerUpperBound(text);
+						texts.push(text);
+					}
 				}
 				older.unshift(...texts);
 				if (page.firstIndex >= before) break; // a peer that cannot page reports no progress
@@ -9801,8 +9862,13 @@ export class InteractiveMode {
 			await this.preloadToolDefinitions(toolNames);
 			if (epoch !== this.slimTranscriptViewEpoch || this.slimTranscriptMarker !== marker) return;
 			const pageContainer = new Container();
-			// A backfilled page is closed history: no live wiring, and a turn the
-			// page cuts into keeps its body in the already-rendered tail below.
+			// A backfilled page is closed history: a turn the page cuts into keeps its
+			// body in the already-rendered tail below, and the page must not rewind the
+			// live lane (an owner prompt resets it, a report comeBack mutates it), so
+			// the replay draws in a fresh lane. The rest of the live wiring the main
+			// replay has - report memory, time-aware user lanes, heartbeat prompts,
+			// turn heads, change strips, extension renderers - applies to the page too,
+			// or paged-up history loses the face the tail has.
 			const pageReplay = replayConversation(pageMessages, pageContainer, {
 				ui: this.ui,
 				cwd: this.getCurrentCwd(),
@@ -9820,6 +9886,20 @@ export class InteractiveMode {
 				timelineHost: this.timelineHost(),
 				mermaidTransform: this.mermaidMarkdownTransform,
 				keepFinalTurnOpen: () => false,
+				hooks: {
+					reports: this.turnFlow.reports,
+					userLane: (at) => this.turnFlow.subagentLane.tracker.laneAt(at),
+					renderUserPrompt: (message, text) => this.renderReplayUserPrompt(message, text),
+					createTurnSummary: (state) => this.createTurnSummary(state),
+					onToolResult: (message, state) =>
+						recordStepFileChanges(state, message.toolCallId, message, this.getCurrentCwd()),
+					// The strip belongs under the page's own turn, not at the live chat's end.
+					onTurnClose: (_state, summary) => this.turnFlow.attachStrip(summary, pageContainer),
+					extensionMessageRenderer: (customType) =>
+						this.bindLocalSessionExtensions
+							? this.getLocalSessionHost().getExtensionRunner().getMessageRenderer(customType)
+							: undefined,
+				},
 			});
 			// Results in this page whose calls are older still wait for the next page.
 			for (const [toolCallId, result] of pageReplay.orphanToolResults) {
@@ -9827,28 +9907,29 @@ export class InteractiveMode {
 			}
 			const markerIndex = this.chatContainer.children.indexOf(marker);
 			if (markerIndex === -1) return;
-			// Prepending shifts the transcript down by the page's height. The
+			// Prepending shifts the transcript down by the rows actually added. The
 			// viewport learns of the prepend and applies the offset on the next
 			// composed frame, where maxScroll already carries the page: the paused
 			// window keeps its rows (a following view is unaffected) and the page
 			// never counts as new content below. A scrollBy here would clamp
 			// against the stale maxScroll and snap a near-bottom view to the end.
-			const pageHeight = pageContainer.render(this.ui.terminal.columns).length;
+			// Measure the splice's true in-place delta rather than the standalone
+			// page render: page components read their neighbors (a turn strip's
+			// closing row draws only when the chat after its turn is visible), and
+			// the last page also removes the marker - the delta covers both.
+			const rowsBefore = this.chatContainer.render(this.ui.terminal.columns).length;
 			this.chatContainer.children.splice(markerIndex + 1, 0, ...pageContainer.children);
 			this.slimTranscriptOmitted = page.firstIndex;
 			if (page.firstIndex === 0) {
 				// The whole transcript is loaded now: the marker leaves the chat,
-				// taking its rows with it. The rows the window shows shift down by
-				// the page minus the marker - announcing the full page would leave
-				// the view a marker-height too low.
-				const markerHeight = marker.render(this.ui.terminal.columns).length;
+				// taking its rows with it.
 				this.chatContainer.removeChild(marker);
 				this.slimTranscriptMarker = undefined;
-				this.ui.noteTranscriptPrepend(pageHeight - markerHeight);
 			} else {
 				marker.invalidate();
-				this.ui.noteTranscriptPrepend(pageHeight);
 			}
+			const rowsAdded = this.chatContainer.render(this.ui.terminal.columns).length - rowsBefore;
+			this.ui.noteTranscriptPrepend(rowsAdded);
 			this.ui.requestRender();
 		} catch (error) {
 			if (epoch !== this.slimTranscriptViewEpoch) return;
@@ -11222,11 +11303,17 @@ export class InteractiveMode {
 			if (enabled && this.chatTranscriptTrimmed) {
 				// Fullscreen pageUp/top scroll the whole transcript; restore the tail
 				// trimmed by the live component cap before entering.
-				try {
-					await this.rebuildChatFromMessages();
-				} catch (error) {
-					this.showError(error instanceof Error ? error.message : String(error));
-					return;
+				if (this.liveChatCapBlocked()) {
+					// Mid-flight the rebuild would detach the in-flight tool cards; it
+					// lands at the next settle point instead, already in fullscreen.
+					this.requestChatRebuild();
+				} else {
+					try {
+						await this.rebuildChatFromMessages();
+					} catch (error) {
+						this.showError(error instanceof Error ? error.message : String(error));
+						return;
+					}
 				}
 			}
 			this.applyFullscreen(enabled);
@@ -11543,6 +11630,18 @@ export class InteractiveMode {
 		summary.setOnLanesChange(() => this.handleTurnLanesClicked(summary));
 		summary.setTimelineHost(this.timelineHost());
 		return summary;
+	}
+
+	/** A stored heartbeat prompt renders as an injected notice and never opens an owner turn. */
+	private renderReplayUserPrompt(
+		message: Extract<AgentMessage, { role: "user" }>,
+		text: string,
+	): { components: Component[]; ownerOpened: boolean } | undefined {
+		const heartbeatMessage = this.createLegacyHeartbeatPromptMessage(message, text);
+		if (!heartbeatMessage) return undefined;
+		const component = new InjectedPromptMessageComponent(heartbeatMessage, this.getMarkdownThemeWithSettings());
+		component.setExpanded(this.toolOutputExpanded);
+		return { components: [component], ownerOpened: false };
 	}
 
 	/** What every turn box reads: the settings, the screen height, the working directory. */
@@ -12095,7 +12194,17 @@ export class InteractiveMode {
 			this.showError(error instanceof Error ? error.message : String(error));
 			return;
 		}
+		// Toggling built-in skills takes a reload, and the reload swaps the editor
+		// container this panel lives in: run it when the panel closes, not mid-toggle.
+		let reloadOnClose = false;
 		this.showSelector((done) => {
+			const close = () => {
+				done();
+				if (reloadOnClose) {
+					reloadOnClose = false;
+					void this.handleReloadCommand();
+				}
+			};
 			const selector = new SettingsSelectorComponent(
 				{
 					autoCompact: state.autoCompactionEnabled,
@@ -12163,7 +12272,7 @@ export class InteractiveMode {
 					},
 					onEnableBuiltinSkillsChange: (enabled) => {
 						this.applySetting(() => this.settingsManager.setEnableBuiltinSkills(enabled));
-						void this.handleReloadCommand();
+						reloadOnClose = true;
 					},
 					onSteeringModeChange: (mode) => {
 						this.patchConnectionState({ steeringMode: mode });
@@ -12223,9 +12332,7 @@ export class InteractiveMode {
 								child.setHideThinkingBlock(hidden);
 							}
 						}
-						void this.rebuildChatFromMessages().catch((error) => {
-							this.showError(error instanceof Error ? error.message : String(error));
-						});
+						this.requestChatRebuild();
 					},
 					onMermaidRenderingModeChange: (mode) => {
 						this.applySetting(() => this.settingsManager.setMermaidRenderingMode(mode));
@@ -12238,9 +12345,7 @@ export class InteractiveMode {
 						setQuietConversationBudget(mode === "quiet");
 						// The gate lives in the assistant components' render, so
 						// the new face needs one rebuild (same as hide-thinking).
-						void this.rebuildChatFromMessages().catch((error) => {
-							this.showError(error instanceof Error ? error.message : String(error));
-						});
+						this.requestChatRebuild();
 					},
 					onTimelineOpenWhileWorkingChange: (open) => {
 						this.applySetting(() => this.settingsManager.setTimelineOpenWhileWorking(open));
@@ -12296,7 +12401,7 @@ export class InteractiveMode {
 						this.applySetting(() => this.settingsManager.setWarnings(warnings));
 					},
 					onCancel: () => {
-						done();
+						close();
 						this.ui.requestRender();
 					},
 				},
@@ -13838,7 +13943,14 @@ export class InteractiveMode {
 				const runner = this.getLocalSessionHost().getExtensionRunner();
 				this.setupExtensionShortcuts(runner);
 			}
-			await this.rebuildChatFromMessages();
+			// The entry check ran before the reload's awaits; a heartbeat or a report
+			// can have woken the session since. Rebuilding now would detach the new
+			// turn's in-flight cards, so it waits for the settle point.
+			if (this.liveChatCapBlocked()) {
+				this.requestChatRebuild();
+			} else {
+				await this.rebuildChatFromMessages();
+			}
 			dismissReloadBox(this.editor as Component);
 			this.showLoadedResources({
 				force: false,

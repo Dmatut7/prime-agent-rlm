@@ -3,6 +3,7 @@ import { type Component, Container } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import { emptyUsage } from "../src/core/usage.js";
 import type { AgentConnectionSessionContext } from "../src/modes/agent-connection/index.js";
+import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
@@ -35,11 +36,16 @@ type CapHarness = {
 		isCompacting: boolean;
 		isBashRunning: boolean;
 		retryAttempt: number;
+		messageCount?: number;
 		sessionActions: { active?: { kind: string } };
 	};
 	chatTranscriptTrimmed: boolean;
 	chatCapRebuildFloor: number;
 	chatCapRebuildInFlight: boolean;
+	pendingChatRebuild: boolean;
+	chatRebuildDrainInFlight: boolean;
+	/** Set by a test to stub the rebuild; absent, the prototype's real method runs. */
+	rebuildChatFromMessages?: () => Promise<void>;
 	slimTranscriptOmitted: number;
 	slimTranscriptBackfillInFlight: boolean;
 	slimTranscriptMarker: unknown;
@@ -104,6 +110,9 @@ type Proto = {
 		message: Extract<AgentMessage, { role: "assistant" }>,
 	): AssistantMessageComponent;
 	reattachLiveChatComponents(this: CapHarness): void;
+	requestChatRebuild(this: CapHarness): void;
+	drainPendingChatRebuild(this: CapHarness): Promise<void>;
+	handleEvent(this: CapHarness, event: { type: string }): Promise<void>;
 };
 
 const proto = InteractiveMode.prototype as unknown as Proto;
@@ -192,6 +201,8 @@ function createCapHarness(overrides: Partial<CapHarness> = {}): CapHarness {
 		chatTranscriptTrimmed: false,
 		chatCapRebuildFloor: 0,
 		chatCapRebuildInFlight: false,
+		pendingChatRebuild: false,
+		chatRebuildDrainInFlight: false,
 		slimTranscriptOmitted: 0,
 		slimTranscriptBackfillInFlight: false,
 		slimTranscriptMarker: undefined,
@@ -615,5 +626,111 @@ describe("InteractiveMode live chat component cap", () => {
 		} finally {
 			(process.stdout as { isTTY?: boolean }).isTTY = originalIsTTY;
 		}
+	});
+});
+
+describe("settings/reload chat rebuild deferral (R4-M11)", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	test("a rebuild requested while interruptible work owns components waits for the settle point", async () => {
+		const rebuild = vi.fn(async () => {});
+		const harness = createCapHarness({
+			rebuildChatFromMessages: rebuild,
+			connectionState: {
+				isStreaming: true,
+				isCompacting: false,
+				isBashRunning: false,
+				retryAttempt: 0,
+				sessionActions: {},
+			},
+		});
+
+		proto.requestChatRebuild.call(harness);
+		await vi.waitFor(() => expect(harness.pendingChatRebuild).toBe(true));
+		expect(rebuild).not.toHaveBeenCalled();
+
+		// The turn settles: the drain now runs the queued rebuild exactly once.
+		harness.connectionState.isStreaming = false;
+		await proto.drainPendingChatRebuild.call(harness);
+		expect(rebuild).toHaveBeenCalledTimes(1);
+		expect(harness.pendingChatRebuild).toBe(false);
+	});
+
+	test("a rebuild requested while idle runs right away", async () => {
+		const rebuild = vi.fn(async () => {});
+		const harness = createCapHarness({ rebuildChatFromMessages: rebuild });
+
+		proto.requestChatRebuild.call(harness);
+		await vi.waitFor(() => expect(rebuild).toHaveBeenCalledTimes(1));
+		expect(harness.pendingChatRebuild).toBe(false);
+	});
+
+	test("a rebuild re-requested mid-drain runs again after it", async () => {
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const rebuild = vi.fn(async () => {
+			await gate;
+		});
+		const harness = createCapHarness({ rebuildChatFromMessages: rebuild });
+
+		proto.requestChatRebuild.call(harness);
+		await vi.waitFor(() => expect(rebuild).toHaveBeenCalledTimes(1));
+		// The first drain holds the rebuild open; a second toggle re-pends.
+		proto.requestChatRebuild.call(harness);
+		expect(harness.pendingChatRebuild).toBe(true);
+		release?.();
+		await vi.waitFor(() => expect(rebuild).toHaveBeenCalledTimes(2));
+		expect(harness.pendingChatRebuild).toBe(false);
+	});
+
+	test("the deferred rebuild lands at agent_end, not mid-stream", async () => {
+		const rebuild = vi.fn(async () => {});
+		const harness = createCapHarness({
+			rebuildChatFromMessages: rebuild,
+			connectionState: {
+				isStreaming: true,
+				isCompacting: false,
+				isBashRunning: false,
+				retryAttempt: 0,
+				messageCount: 3,
+				sessionActions: {},
+			},
+			isInitialized: true,
+			activityTracker: new AgentActivityTracker(),
+			statusContainer: new Container(),
+			pendingMessagesContainer: new Container(),
+			queuedMessagesContainer: new Container(),
+			pendingBashComponents: [],
+			workingVisible: false,
+			contextUsageRefresh: { generation: 0, lastSuccessGeneration: 0 },
+			subagentCounts: { total: 0 },
+			subagentSummaryLine: { setSubagentSpend: vi.fn(), getSubagentSpend: () => undefined },
+			settingsManager: {
+				getShowImages: () => true,
+				setShowImages: vi.fn(),
+				setFullscreen: vi.fn(),
+				getFullscreenMouse: () => false,
+				getProcessMode: () => "quiet" as const,
+				getCodeBlockIndent: () => "  ",
+				getShowTerminalProgress: () => false,
+			},
+		} as Partial<CapHarness>);
+
+		proto.requestChatRebuild.call(harness);
+		expect(rebuild).not.toHaveBeenCalled();
+
+		await proto.handleEvent.call(harness, { type: "agent_end" });
+
+		expect(harness.connectionState.isStreaming).toBe(false);
+		expect(rebuild).toHaveBeenCalledTimes(1);
+		expect(harness.pendingChatRebuild).toBe(false);
 	});
 });

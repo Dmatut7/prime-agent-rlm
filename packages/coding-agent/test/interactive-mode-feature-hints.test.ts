@@ -135,6 +135,29 @@ describe("InteractiveMode feature hints", () => {
 		expect(requestRender).toHaveBeenCalledTimes(4);
 	});
 
+	it("shows the hint in quiet mode, where the loader is never mounted on the status container (R4-M9)", () => {
+		const { mode, statusContainer, featureHintContainer, featureHintDeck } = createMode();
+		// The quiet face shows the live activity in the status line: startWorkingLoader
+		// creates the loader but never adds it to the status container.
+		statusContainer.clear();
+
+		callPrivate(mode, "startFeatureHintPresentation");
+		vi.advanceTimersByTime(5_000);
+
+		expect(featureHintDeck.next).toHaveBeenCalledTimes(1);
+		expect(featureHintContainer.children).toHaveLength(1);
+	});
+
+	it("resumes a queue-suppressed hint in quiet mode (R4-M9)", () => {
+		const { mode, statusContainer, featureHintContainer } = createMode();
+		statusContainer.clear();
+
+		callPrivate(mode, "resumeFeatureHintPresentation");
+		vi.advanceTimersByTime(5_000);
+
+		expect(featureHintContainer.children).toHaveLength(1);
+	});
+
 	it("cancels a pending hint when the loader stops", () => {
 		const { mode, statusContainer, featureHintContainer, featureHintDeck, requestRender } = createMode();
 
