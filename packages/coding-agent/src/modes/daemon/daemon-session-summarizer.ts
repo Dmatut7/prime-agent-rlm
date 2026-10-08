@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "../../core/model-registry.js";
 import type { AgentStatus, AgentTaskState } from "../../core/session-manager.js";
+import { sanitizeRowText } from "../../utils/display-text.js";
 import { mapConcurrent } from "../../utils/map-concurrent.js";
 import type { ActiveSessionState } from "./active-session-state.js";
 
@@ -174,8 +175,10 @@ const COUNTING_ARTIFACT = /\(\d+\)|=\s*\d+\s*words?\b/i;
 const MAX_RECAP_WORDS = 16;
 
 function cleanRecap(raw: string): string | undefined {
-	const value = raw
-		.trim()
+	// Washed before the shape checks: a recap is one row of the roster and is
+	// persisted, so no escape or newline may survive it - and an escape left in
+	// place would also hide the reasoning trailer from the regex that cuts it.
+	const value = sanitizeRowText(raw)
 		.replace(REASONING_TRAILER, "")
 		.replace(/^["“']+|["”']+$/g, "")
 		.replace(/[.\s]+$/, "")
@@ -288,7 +291,9 @@ function terminalTurnError(messages: readonly AgentMessage[]): string | undefine
 		if (message.stopReason !== "error") {
 			return undefined;
 		}
-		const detail = typeof message.errorMessage === "string" ? message.errorMessage.trim() : "";
+		// Upstream text on its way into a persisted row: washed before the cap, so
+		// the budget is spent on visible words rather than on escape bytes.
+		const detail = typeof message.errorMessage === "string" ? sanitizeRowText(message.errorMessage) : "";
 		return detail ? `${ERROR_RECAP_PREFIX}: ${clamp(detail, ERROR_RECAP_MAX_CHARS)}` : ERROR_RECAP_PREFIX;
 	}
 	return undefined;
@@ -376,7 +381,9 @@ export class DaemonSessionSummarizer {
 		}
 		const persisted = state.runtime.session.sessionManager.getLatestAgentStatus();
 		if (persisted) {
-			state.summaryState = persisted;
+			// A journal a pre-wash build wrote can still carry escape bytes, and the
+			// roster replays a seeded recap on every restart: wash on the read side.
+			state.summaryState = { ...persisted, summary: sanitizeRowText(persisted.summary) };
 		}
 	}
 
@@ -519,7 +526,10 @@ export class DaemonSessionSummarizer {
 			const taskState =
 				result.taskState ?? (previous?.basedOnMessageCount === messageCount ? previous?.taskState : undefined);
 			const status: AgentStatus = {
-				summary: result.summary,
+				// Persisted, then replayed by every later attach: wash the recap at
+				// the point it becomes a verdict, whatever produced it - the
+				// classifier, or a previous verdict seeded from an older journal.
+				summary: sanitizeRowText(result.summary),
 				taskState,
 				basedOnMessageCount: messageCount,
 			};
