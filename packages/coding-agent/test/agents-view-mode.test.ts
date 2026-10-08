@@ -1560,6 +1560,32 @@ describe("agents view reply draft guard and delete confirmation cleanup", () => 
 		}
 	});
 
+	it("clears a pending delete confirmation on Esc before the exit path", () => {
+		const view = savedRowView();
+		// Record instead of executing the exit: finish() tears down a TUI this
+		// headless harness never started, and the recorded call IS the exit signal.
+		const finishes: unknown[] = [];
+		Reflect.set(view, "finish", (result: unknown) => {
+			finishes.push(result);
+		});
+		try {
+			view.handleInput(DELETE);
+			expect(rendered(view)).toContain("再按一次");
+
+			// Esc's first job with an armed confirmation is to cancel that prompt
+			// and be consumed by it; the view must survive for the next keypress.
+			view.handleInput("\x1b");
+			expect(rendered(view)).not.toContain("再按一次");
+			expect(finishes).toEqual([]);
+
+			// With nothing pending, the next Esc takes the usual exit path.
+			view.handleInput("\x1b");
+			expect(finishes).toEqual([expect.objectContaining({ type: "exit" })]);
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
 	it("releases the row's reply key when the delete confirmation lapses", async () => {
 		vi.useFakeTimers();
 		try {

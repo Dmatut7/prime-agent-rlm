@@ -943,15 +943,24 @@ export function buildRlmChildSnapshots(
 ): AgentConnectionRlmChildAgentSnapshot[] {
 	const root = activeSessions.find((candidate) => candidate.activeSessionId === rootActiveSessionId);
 	if (!root) return [];
+	// The child id is only unique within its parent: it is the basename of the
+	// child's own session dir, so two trees under different agent dirs can mint
+	// the same id, and a daemon hosting both would hand the other parent's
+	// resident child to this root's snapshot. The session dir is the child's
+	// durable identity, so the resident map keys on it; a session dir with no
+	// resident candidate (a queued run, a passive child) simply finds no id.
 	const activeSessionIds = new Map(
 		activeSessions.flatMap((candidate) => {
 			const childId = candidate.runtime.metadata.rlmChildId;
-			return childId ? [[childId, candidate.activeSessionId] as const] : [];
+			if (!childId) return [];
+			const sessionDir =
+				candidate.runtime.metadata.sessionDir ?? candidate.runtime.session.sessionManager.getSessionDir();
+			return [[sessionDir, candidate.activeSessionId] as const];
 		}),
 	);
 	return root.runtime.session.getRlmChildSnapshots().map((snapshot) => ({
 		...snapshot,
-		activeSessionId: activeSessionIds.get(snapshot.id),
+		activeSessionId: activeSessionIds.get(snapshot.sessionDir),
 	}));
 }
 

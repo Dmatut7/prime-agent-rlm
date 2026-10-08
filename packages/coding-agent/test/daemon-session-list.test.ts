@@ -907,12 +907,51 @@ describe("buildRlmChildSnapshots", () => {
 				createdAt: 1,
 				parentActiveSessionId: "parent",
 				rlmChildId: "sub-running",
+				sessionDir: "/tmp/artifacts/sub-running",
 			},
 		});
 
 		expect(buildRlmChildSnapshots("parent", [parent, residentChild])).toEqual([
 			{ ...queued, activeSessionId: undefined },
 			{ ...executing, activeSessionId: "running-child" },
+		]);
+	});
+
+	it("does not attribute another parent's resident child that minted the same id", () => {
+		// The child id is the basename of the child's own session dir, so two trees
+		// under different agent dirs can mint the same id; only the session dir
+		// tells them apart. Insertion order puts the other tree's child last,
+		// which is exactly what the old bare-id lookup handed to this root.
+		const snapshot = {
+			id: "abc",
+			label: "Same id, other tree",
+			status: "running" as const,
+			sessionDir: "/tmp/tree-a/children/abc",
+		};
+		const rootA = makeState({ activeSessionId: "root-a", childSnapshots: [snapshot] });
+		const childOfRootA = makeState({
+			activeSessionId: "a-child-active",
+			metadata: {
+				kind: "subagent",
+				createdAt: 1,
+				parentActiveSessionId: "root-a",
+				rlmChildId: "abc",
+				sessionDir: "/tmp/tree-a/children/abc",
+			},
+		});
+		const childOfRootB = makeState({
+			activeSessionId: "b-child-active",
+			metadata: {
+				kind: "subagent",
+				createdAt: 1,
+				parentActiveSessionId: "root-b",
+				rlmChildId: "abc",
+				sessionDir: "/tmp/tree-b/children/abc",
+			},
+		});
+
+		expect(buildRlmChildSnapshots("root-a", [childOfRootA, childOfRootB, rootA])).toEqual([
+			{ ...snapshot, activeSessionId: "a-child-active" },
 		]);
 	});
 

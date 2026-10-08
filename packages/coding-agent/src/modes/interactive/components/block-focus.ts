@@ -308,6 +308,17 @@ export function renderedCopyText(lines: readonly string[]): string {
 /**
  * The row `target` starts on when `components` render one after another,
  * descending into plain containers; undefined when it is not among them.
+ *
+ * Render-safety of the measurement probe (display audit item 39, judged an
+ * observation record): the walk returns at the target before rendering it, so it
+ * only ever renders the target's older siblings. Its sole caller passes the
+ * fullscreen scroll components, where the chat container is the first child of
+ * the main view — so the probe renders only the header chrome, never the chat
+ * blocks, and cannot spend a one-shot marker (an armed reveal marker) the next
+ * frame owns. The same render-to-measure pattern over chat children lives in
+ * `measureBlockRows` (interactive-mode), which routes turn summaries through
+ * `renderForMeasurement` for exactly that marker; extend that pattern, not this
+ * probe, if a one-shot ever moves into the header chrome.
  */
 export function componentRowOffset(
 	components: readonly Component[],

@@ -1939,7 +1939,7 @@ export class DaemonSupervisor {
 			}
 			this.assertSocketLeaseHeld();
 			await this.seedRosterLedger();
-			this.seedAdoptingWorkerRosterRows();
+			await this.seedAdoptingWorkerRosterRows();
 			for (const worker of this.workers.values()) {
 				this.scheduleOwnedWorkerCleanup(worker);
 			}
@@ -6782,8 +6782,8 @@ export class DaemonSupervisor {
 		return seedRosterLedger(this.rosterSyncHost);
 	}
 
-	private seedAdoptingWorkerRosterRows(): void {
-		seedAdoptingWorkerRosterRows(this.rosterSyncHost);
+	private async seedAdoptingWorkerRosterRows(): Promise<void> {
+		await seedAdoptingWorkerRosterRows(this.rosterSyncHost);
 	}
 
 	private consumeWorkerRosterDelta(worker: ResidentWorker, payload: Buffer, source?: DaemonWorkerClient): void {

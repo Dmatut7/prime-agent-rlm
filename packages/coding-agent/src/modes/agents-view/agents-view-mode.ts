@@ -1345,6 +1345,18 @@ export class AgentsViewMode implements Component, Focusable {
 			void this.handleStopAllSubagents();
 			return;
 		}
+		if (
+			(this.pendingDeleteAgent !== undefined || this.pendingKillSubagent !== undefined) &&
+			this.keybindings.matches(data, "app.input.clear")
+		) {
+			// An armed delete confirmation owns the first Esc: it cancels the prompt
+			// and consumes the key, instead of falling through to the composer's
+			// escape path (clear search / disarm reply / leave the view) behind the
+			// user's back. Any other key keeps its existing cancel-on-any-key behavior.
+			this.clearCtrlCExitHint({ render: false });
+			this.clearDeleteConfirmation();
+			return;
+		}
 		this.clearCtrlCExitHint({ render: false });
 		this.clearDeleteConfirmation({ render: false });
 		if (this.keybindings.matches(data, "app.agents.reply") && this.editor.getText().length === 0) {

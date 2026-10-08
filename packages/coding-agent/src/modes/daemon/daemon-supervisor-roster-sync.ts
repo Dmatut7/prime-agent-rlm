@@ -41,6 +41,7 @@
 
 import { basename, dirname } from "node:path";
 import { canonicalSessionPath } from "../../core/session-lease.js";
+import { readSessionInfo } from "../../core/session-manager.js";
 import type { PrivateFrame } from "../session-worker/private-framing.js";
 import type { DaemonSocketClient } from "./active-session-state.js";
 import {
@@ -248,8 +249,16 @@ export async function seedRosterLedger(host: DaemonSupervisorRosterSyncHost): Pr
  * durable descriptor and let adoption upgrade it in place: the roster keys on
  * sessionId and de-duplicates on sessionFile, so no second row can appear, and a
  * worker that never comes back still has a row for the park path to flip.
+ *
+ * The durable lifecycle comes from the transcript on disk, not a hardcoded
+ * "live": a named, zero-message draft seeded as live flashed into the agents view
+ * for the adoption window and vanished once the real (draft) summary landed. A
+ * session that cannot be read stays live — the L3 visibility intent is about
+ * recovering workers, and an unreadable transcript must not read as a lost
+ * session. Stale on-disk archived markers never apply to a registered worker,
+ * so only the message count decides, matching `activeLifecycleForSession`.
  */
-export function seedAdoptingWorkerRosterRows(host: DaemonSupervisorRosterSyncHost): void {
+export async function seedAdoptingWorkerRosterRows(host: DaemonSupervisorRosterSyncHost): Promise<void> {
 	for (const worker of host.workers.values()) {
 		const descriptor = worker.descriptor;
 		const sessionId = descriptor.rootSessionId;
@@ -267,9 +276,13 @@ export function seedAdoptingWorkerRosterRows(host: DaemonSupervisorRosterSyncHos
 		if (workerRosterEntries(host, worker).length > 0) {
 			continue;
 		}
+		const info =
+			descriptor.sessionFile !== undefined
+				? await readSessionInfo(descriptor.sessionFile).catch(() => undefined)
+				: undefined;
 		const summary: SessionSummary = {
 			id: descriptor.rootActiveSessionId ?? sessionId,
-			lifecycle: "live",
+			lifecycle: info === undefined || info === null || info.messageCount > 0 ? "live" : "draft",
 			activity: "idle",
 			isSessionActive: false,
 			sessionId,
@@ -279,7 +292,7 @@ export function seedAdoptingWorkerRosterRows(host: DaemonSupervisorRosterSyncHos
 			isStreaming: false,
 			isCompacting: false,
 			attachedClients: 0,
-			messageCount: 0,
+			messageCount: info?.messageCount ?? 0,
 			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 		};
 		writeRosterEntry(host, workerRosterEntryFromSummary(summary), worker, "recovering");
