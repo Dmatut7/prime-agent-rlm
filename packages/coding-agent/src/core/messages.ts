@@ -1252,7 +1252,7 @@ export function createRefinementOutcomeMessage(
  * attempt produced nothing.
  */
 export function createRefinementFailureMessage(
-	failure: { refinementId: string; scope: HarnessScope; reason: string },
+	failure: { refinementId: string; scope: HarnessScope; reason: string; source?: RefinementSource },
 	display = true,
 	timestamp = Date.now(),
 ): RefinementOutcomeMessage {
@@ -1268,6 +1268,7 @@ export function createRefinementFailureMessage(
 			edits: [],
 			failed: true,
 			error: failure.reason,
+			...(failure.source ? { source: failure.source } : {}),
 		},
 		timestamp,
 	};

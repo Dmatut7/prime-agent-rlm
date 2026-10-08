@@ -1,0 +1,1 @@
+- Extended the finish gate's shell-write detection to archive extraction and downloads: unzip, tar extract, gunzip, zip -d, 7z, curl -o and wget -O now void an earlier green test run the same way an edit does.

@@ -29,6 +29,7 @@ import {
 	convertToLlm,
 	createRefinementFailureMessage,
 	createRefinementOutcomeMessage,
+	type RefinementSource,
 } from "./messages.js";
 import { providerRetryPolicy } from "./provider-retry.js";
 import {
@@ -50,6 +51,7 @@ import {
 	normalizeRefinementProposal,
 	persistAppliedRefinement,
 	planRefinement,
+	REFINE_REPORTED_DELETED,
 	type RefinementPlan,
 	type RefinementResult,
 	readHarnessStateStamp,
@@ -232,7 +234,12 @@ export async function withRefineApplyGuard<T>(host: RefineApplyGuardHost, body: 
 	}
 }
 
-export function emitRefineFailed(host: RefineExecutionHost, error: unknown, scope: HarnessScope = "local"): void {
+export function emitRefineFailed(
+	host: RefineExecutionHost,
+	error: unknown,
+	scope: HarnessScope = "local",
+	source?: RefinementSource,
+): void {
 	// Idempotent per error object: refine() failures are reported by the direct
 	// path AND by queued/auto callers that catch the same rethrown error; the
 	// first receipt wins and later calls on the same error are no-ops.
@@ -256,14 +263,20 @@ export function emitRefineFailed(host: RefineExecutionHost, error: unknown, scop
 	// a value that actually produced a receipt guards later calls.
 	if (error instanceof RefineSkippedError) return;
 	if (error instanceof Object) host._refineFailureReceipts.add(error);
-	recordRefinementFailureReceipt(host, reason, effectiveScope);
+	recordRefinementFailureReceipt(host, reason, effectiveScope, source);
 }
 
-export function recordRefinementFailureReceipt(host: RefineExecutionHost, reason: string, scope: HarnessScope): void {
+export function recordRefinementFailureReceipt(
+	host: RefineExecutionHost,
+	reason: string,
+	scope: HarnessScope,
+	source?: RefinementSource,
+): void {
 	const message = createRefinementFailureMessage({
 		refinementId: generateRefinementId(),
 		scope,
 		reason,
+		source,
 	});
 	try {
 		host.sessionManager.appendCustomMessageEntryWithRollback(
@@ -277,7 +290,7 @@ export function recordRefinementFailureReceipt(host: RefineExecutionHost, reason
 		// Same disclosure rule as compaction outcomes: the receipt stays
 		// model-visible for this process and says it could not be saved.
 		const unpersisted = createRefinementFailureMessage(
-			{ refinementId: message.details.refinementId, scope, reason },
+			{ refinementId: message.details.refinementId, scope, reason, source },
 			true,
 			message.timestamp,
 		);
@@ -461,7 +474,16 @@ export async function refine(
 			// single idempotency key with _emitRefineFailed's receipt guard - a raw
 			// non-Error value used to defeat the WeakSet dedup and double-report.
 			const normalized = host._asError(error);
-			emitRefineFailed(host, normalized, options?.global ? "global" : "local");
+			// Same source stamping as recordRefinementOutcome: a manual trigger
+			// (/refine, refine.run) is "user", an interval auto trigger is "auto",
+			// so a failed manual refine does not render the background row's
+			// "下一轮会再试" promise the scheduler's no-retry semantics break.
+			emitRefineFailed(
+				host,
+				normalized,
+				options?.global ? "global" : "local",
+				internal.trigger === "auto" ? "auto" : "user",
+			);
 			throw normalized;
 		}
 	});
@@ -587,6 +609,17 @@ export function recordRefinementOutcome(
 	const scope = result.scope ?? "local";
 	for (const edit of result.appliedEdits) {
 		const entry = edit.after ?? edit.before;
+		if (edit.action === "delete" && edit.applied) {
+			// An applied delete leaves the store with no version for this key; the
+			// "before" version it was recorded as would never match the post-delete
+			// fingerprint, so the deletion receipt could never suppress the digest
+			// re-delivering its own removal. The sentinel compares equal to absence.
+			host._refinementReportedEntryVersions.set(
+				`${edit.kind}:${entry?.scope ?? scope}:${edit.id}`,
+				REFINE_REPORTED_DELETED,
+			);
+			continue;
+		}
 		// Version-aware on purpose: the receipt itemized THIS version, so a later bump
 		// by another writer is fresh news and must still re-inject (merge doc 12.2).
 		if (entry) {

@@ -594,6 +594,24 @@ describe("runHasVerificationEvidence", () => {
 			"touch src/new.ts",
 			"git checkout -- src/a.ts",
 			"git apply fix.diff",
+			// Archives and downloads are the model's other high-frequency write paths
+			// (iteration review 58): unpacking or downloading into cwd overwrites
+			// project files the earlier green run never saw.
+			"unzip bundle.zip",
+			"tar -xzf bundle.tar.gz",
+			"tar -Jxf bundle.tar.xz",
+			"tar xzf bundle.tar.gz",
+			"tar xf bundle.tar",
+			"tar x bundle.tar",
+			"tar --extract -f bundle.tar",
+			"gunzip data.json.gz",
+			"gzip -d data.json.gz",
+			"zip -d bundle.zip stale.js",
+			"7z x bundle.7z",
+			"curl -o config.json https://example.com/config.json",
+			"curl -sL https://example.com/x -O",
+			"wget -O data.csv https://example.com/data.csv",
+			"wget --output-document=data.csv https://example.com/data.csv",
 		];
 		expect(writes.length).toBeGreaterThan(0);
 		for (const command of writes) {
@@ -608,7 +626,21 @@ describe("runHasVerificationEvidence", () => {
 			).toBe(false);
 		}
 		// Read-only commands leave the pass standing.
-		const reads = ["grep -r foo src/", "cat src/a.ts", "git status", "git diff --stat", "npm test 2>&1 | tail -5"];
+		const reads = [
+			"grep -r foo src/",
+			"cat src/a.ts",
+			"git status",
+			"git diff --stat",
+			"npm test 2>&1 | tail -5",
+			// Listing an archive or streaming one to stdout writes nothing; neither
+			// does archive creation or a download kept off disk.
+			"tar -tf bundle.tar",
+			"tar -tvf bundle.tar",
+			"tar -cf out.tar src/",
+			"gzip -l data.json.gz",
+			"curl -s https://example.com/config.json",
+			"wget -q -O- https://example.com/data.csv",
+		];
 		expect(reads.length).toBeGreaterThan(0);
 		for (const command of reads) {
 			expect(

@@ -610,6 +610,34 @@ describe("#2098 static system prompt with an in-context harness digest", () => {
 		expect(digestMessages(harness.session.messages)).toHaveLength(carriersBefore);
 	});
 
+	it("does not double-deliver a deletion its own receipt already itemized (iteration review 42)", async () => {
+		seedEntry("memory", "del_seed", "Del seed", "Menu fixture.");
+		seedEntry("memory", "del_entry", "Del entry", "Stale lesson to remove.");
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("reply one")]);
+		await harness.session.prompt("round one");
+		const carriersBefore = digestMessages(harness.session.messages).length;
+
+		harness.setResponses([
+			fauxAssistantMessage(
+				refinePlanJson("Drop the stale lesson", [{ action: "delete", kind: "memory", id: "del_entry" }]),
+			),
+		]);
+		const refined = await harness.session.refine({ instructions: "drop the stale lesson", global: true });
+		expect(refined.appliedEdits.some((edit) => edit.action === "delete" && edit.applied)).toBe(true);
+		// The store really dropped it: the pin below cannot pass against a refused delete.
+		expect(loadHarnessState(getGlobalHarnessStateDir(), "global").entries.memory.del_entry).toBeUndefined();
+
+		harness.setResponses([fauxAssistantMessage("reply two")]);
+		await harness.session.prompt("round two");
+		// The receipt itemized the deletion, so the digest owes the model no re-delivery of
+		// the removal (merge doc 14.2). The pre-fix skip recorded the pre-delete version
+		// while the post-delete fingerprint holds no version at all, so the every()
+		// comparison failed and the digest re-injected anyway.
+		expect(digestMessages(harness.session.messages)).toHaveLength(carriersBefore);
+	});
+
 	it("re-arms injection when a failed delivery parks the digest it just rendered", async () => {
 		seedEntry("memory", "park_seed", "Park seed", "Re-arm fixture.");
 		const harness = await createHarness({ persistSession: true });

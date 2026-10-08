@@ -203,6 +203,26 @@ describe("RefinementOutcomeMessageComponent", () => {
 		expect(line).not.toContain("记住了");
 	});
 
+	test("a failed manual /refine receipt never promises an automatic retry (iteration review 35)", () => {
+		// The scheduler's failure semantics do not retry a failed refinement, so the
+		// background row's "下一轮会再试" wording would be a false promise on a receipt
+		// the user asked for; a user-sourced failure states the outcome and that a
+		// retry is available on demand, nothing more.
+		const message = createRefinementFailureMessage({
+			refinementId: "r",
+			scope: "local",
+			reason: "Refiner did not return a JSON object",
+			source: "user",
+		});
+		const component = new RefinementOutcomeMessageComponent(message);
+		const line = rendered(component);
+		expect(line).toContain("回合后整理记忆：没写进去");
+		expect(line).toContain("Refiner did not return a JSON object");
+		expect(line).not.toContain("下一轮会再试");
+		expect(component.getBlockCopyText()).not.toContain("下一轮会再试");
+		expect(component.getBlockCopyText()).toContain("回合后整理记忆：没写进去");
+	});
+
 	test("truncates a rejected edit's reason at its first line (R3-M23)", () => {
 		// The failure row is one accounted timeline row; a reason with a bare \n
 		// used to make it two physical ones. The :94 sibling (`missedNoteText`)

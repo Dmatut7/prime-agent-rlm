@@ -217,7 +217,11 @@ export async function runSerializedRefineCheckpoint(host: RefineSchedulerHost): 
 				try {
 					await host._applySerializedPlan(bgResult);
 				} catch (error) {
-					host._emitRefineFailed(error, bgResult.options.global ? "global" : "local");
+					host._emitRefineFailed(
+						error,
+						bgResult.options.global ? "global" : "local",
+						bgResult.trigger === "auto" ? "auto" : "user",
+					);
 				}
 				stampAutoRefineCooldown(host);
 				if (!host._pendingRequestedRefine) {
@@ -291,7 +295,7 @@ export async function runSerializedRefineCheckpointAfterBackground(
 		try {
 			await host._runSerializedRefine(pending);
 		} catch (error) {
-			host._emitRefineFailed(error, pending.global ? "global" : "local");
+			host._emitRefineFailed(error, pending.global ? "global" : "local", "user");
 		}
 		stampAutoRefineCooldown(host);
 		return;
@@ -705,7 +709,11 @@ export async function drainPendingRefinementForDisposal(host: RefineSchedulerHos
 					try {
 						await host._applySerializedPlan(bgResult);
 					} catch (error) {
-						host._emitRefineFailed(error, bgResult.options.global ? "global" : "local");
+						host._emitRefineFailed(
+							error,
+							bgResult.options.global ? "global" : "local",
+							bgResult.trigger === "auto" ? "auto" : "user",
+						);
 					}
 					// Stamp cooldown and reset counter so the interval
 					// check below does not trigger a duplicate refine.
@@ -877,7 +885,9 @@ export function consumePendingRequestedRefine(host: RefineSchedulerHost): boolea
 	const pending = host._pendingRequestedRefine;
 	if (!pending) return false;
 	host._pendingRequestedRefine = undefined;
-	void host.refine(pending).catch((error) => host._emitRefineFailed(error, pending.global ? "global" : "local"));
+	void host
+		.refine(pending)
+		.catch((error) => host._emitRefineFailed(error, pending.global ? "global" : "local", "user"));
 	return true;
 }
 

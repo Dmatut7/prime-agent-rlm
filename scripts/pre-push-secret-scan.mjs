@@ -212,11 +212,46 @@ function scanMessagesText(text, findings) {
 // Walk `git log -p --format=commit %H` output, tracking the current commit, file and
 // new-side line number so a finding can be reported as file:line. Only added lines are
 // scanned; a deleted key is history's problem, not this push's.
+//
+// A hunk body is consumed by line count: while the hunk still owes lines on either
+// side, every line is content. An added line whose text begins with `++ ` arrives as
+// a diff line `+++ …` and is indistinguishable from a file header by prefix alone -
+// read as metadata it used to re-point (or, for `+++ /dev/null`, null) the file, and
+// every later added line of that file silently skipped the scan. Header lines are
+// only metadata between hunks, where no content is owed.
 function scanPatchText(text, findings) {
 	let commit = "unknown";
 	let file = null;
 	let lineNo = 0;
+	let oldLeft = 0;
+	let newLeft = 0;
 	for (const line of text.split("\n")) {
+		if (oldLeft > 0 || newLeft > 0) {
+			if (line.startsWith("+")) {
+				newLeft -= 1;
+				if (file !== null) {
+					for (const hit of scanLine(line.slice(1))) {
+						findings.push({ ...hit, location: `${file}:${lineNo} (commit ${commit})` });
+					}
+				}
+				lineNo += 1;
+				continue;
+			}
+			if (line.startsWith("-")) {
+				oldLeft -= 1;
+				continue;
+			}
+			if (line.startsWith(" ")) {
+				oldLeft -= 1;
+				newLeft -= 1;
+				lineNo += 1;
+				continue;
+			}
+			// `\ No newline at end of file` or a malformed line: nothing a hunk body
+			// can contain, so drop the hunk state and re-read the line as metadata.
+			oldLeft = 0;
+			newLeft = 0;
+		}
 		if (line.startsWith("commit ")) {
 			commit = line.slice(7).trim().slice(0, 12);
 			file = null;
@@ -233,8 +268,18 @@ function scanPatchText(text, findings) {
 		}
 		if (file === null) continue;
 		if (line.startsWith("@@ ")) {
-			const hunk = /@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
-			lineNo = hunk ? Number(hunk[1]) : 0;
+			const hunk = /@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+			if (hunk) {
+				lineNo = Number(hunk[3]);
+				oldLeft = hunk[2] === undefined ? 1 : Number(hunk[2]);
+				newLeft = hunk[4] === undefined ? 1 : Number(hunk[4]);
+			} else {
+				// Unparsed hunk header: keep the prefix-only fallback (added lines are
+				// still scanned below), just as the pre-count walker did.
+				lineNo = 0;
+				oldLeft = 0;
+				newLeft = 0;
+			}
 			continue;
 		}
 		if (line.startsWith("+")) {
@@ -474,6 +519,39 @@ function selfTest() {
 		"patch walk finds the added key at f.ts:2 only",
 		patchFindings.map((finding) => `${finding.type} @ ${finding.location}`),
 		["API key (sk-) @ f.ts:2 (commit 111111111111)"],
+	);
+
+	// A hunk body is consumed by line count, so while the hunk still owes lines every
+	// line is content: an added line whose text begins with `++ ` arrives as a diff
+	// line `+++ …` and must not be misread as the next file's header - `+++ /dev/null`
+	// used to null the file and silently skip every later added line of that file.
+	const inHunkPatch = [
+		"commit 2222222222222222222222222222222222222222",
+		"",
+		"diff --git a/f.md b/f.md",
+		"index 0000000..3333333 100644",
+		"--- a/f.md",
+		"+++ b/f.md",
+		"@@ -0,0 +1,2 @@",
+		"+++ /dev/null",
+		`+const k = "${SK_POISON}";`,
+		"diff --git a/g.md b/g.md",
+		"index 0000000..4444444 100644",
+		"--- /dev/null",
+		"+++ b/g.md",
+		"@@ -0,0 +1,2 @@",
+		"+++ b/elsewhere.md",
+		`+id ${AWS_POISON}`,
+	].join("\n");
+	const inHunkFindings = [];
+	scanPatchText(inHunkPatch, inHunkFindings);
+	check(
+		"patch walk scans added lines that look like file headers inside a hunk",
+		inHunkFindings.map((finding) => `${finding.type} @ ${finding.location}`),
+		[
+			"API key (sk-) @ f.md:2 (commit 222222222222)",
+			"AWS access key (AKIA) @ g.md:2 (commit 222222222222)",
+		],
 	);
 
 	const total = passes + failures;

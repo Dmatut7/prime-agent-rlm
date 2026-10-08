@@ -303,9 +303,14 @@ const VERIFICATION_COMMAND =
 // redirect alternative is meant for command lines only - cell code never takes
 // this branch, where `>` is a comparison - and it excludes fd duplication
 // (`2>&1`) and `>=`. A `>` inside quoted data over-voids; the cost of a false
-// void is one re-run, the cost of a missed one is a stale pass standing.
+// void is one re-run, the cost of a missed one is a stale pass standing. The
+// archive/download family (unzip, tar extract, gunzip, zip -d, 7z, curl -o,
+// wget -O) unpacks or downloads into cwd, the model's other high-frequency way
+// to overwrite project files: tar scans sed-style for an extract token (the
+// same accepted over-void trade), `-o-`-style stdout streams stay reads, and a
+// bare listing or creation stays a read because those flags never carry an x.
 const SHELL_WRITE_COMMAND =
-	/(?:^|[\s;&|`(])(?:sed\s+[^;&|\n]*?-i\b|perl\s+[^;&|\n]*?-i\b|tee\b|mv\b|cp\b|rm\b|touch\b|patch\b|truncate\b|dd\b|install\b|rsync\b|git\s+(?:apply|checkout|restore|clean|reset|merge|rebase|cherry-pick|revert|am|stash)\b|(?:\d+)?>>?(?![&=]))/i;
+	/(?:^|[\s;&|`(])(?:sed\s+[^;&|\n]*?-i\b|perl\s+[^;&|\n]*?-i\b|tee\b|mv\b|cp\b|rm\b|touch\b|patch\b|truncate\b|dd\b|install\b|rsync\b|unzip\b|gunzip\b|g?zip\s+[^;&|\n]*?-d\b|7z[a-z]?\b|git\s+(?:apply|checkout|restore|clean|reset|merge|rebase|cherry-pick|revert|am|stash)\b|(?:bsd|g)?tar\s+[^;&|\n]*?(?:--extract\b|x[a-z]*f\b|\bx\b|-[a-z]*x[a-z]*)|(?:curl|wget)\s+[^;&|\n]*?(?:-o(?!-)|--output[a-z-]*)|(?:\d+)?>>?(?![&=]))/i;
 
 // What "ran green" means depends on the surface the check ran on. A direct shell tool
 // fails a non-zero exit into an error result (tools/bash.ts), so a clean result is

@@ -27,6 +27,7 @@ import {
 	harnessStateStampsEqual,
 	loadHarnessState,
 	mergeHarnessStates,
+	REFINE_REPORTED_DELETED,
 	REFINE_SKILL_NAME,
 	readHarnessStateStamp,
 } from "./refinement/index.js";
@@ -345,10 +346,15 @@ export function refreshHarnessDigestIfMateriallyChanged(host: HarnessDigestHost)
 		const changed = changedHarnessEntryKeys(previous, fingerprint);
 		// Every moved entry was already itemized for the model by this session's own
 		// refinement receipt (applied and refused alike), so a digest delta would
-		// deliver the same news twice (merge doc 14.2).
+		// deliver the same news twice (merge doc 14.2). A deletion receipt carries the
+		// REFINE_REPORTED_DELETED sentinel, which matches the key's absence from the
+		// fingerprint - a pre-delete version number never would.
 		if (
 			changed.size > 0 &&
-			[...changed].every((key) => host._refinementReportedEntryVersions.get(key) === fingerprint.get(key))
+			[...changed].every((key) => {
+				const reported = host._refinementReportedEntryVersions.get(key);
+				return reported === REFINE_REPORTED_DELETED ? !fingerprint.has(key) : reported === fingerprint.get(key);
+			})
 		) {
 			return;
 		}

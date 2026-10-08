@@ -1,0 +1,1 @@
+- Fixed the failed /refine receipt: a user-invoked refinement that failed no longer promises an automatic retry that never happens; it states the outcome and that a retry is available on demand.

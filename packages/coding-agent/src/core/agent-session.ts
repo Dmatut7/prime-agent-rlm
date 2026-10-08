@@ -314,6 +314,7 @@ import {
 	type ModelChangeMessage,
 	type ModelChangeNoticeDetails,
 	PYTHON_SKILLS_UNAVAILABLE_CUSTOM_TYPE,
+	type RefinementSource,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 	type RlmChildFailureDetails,
@@ -10082,7 +10083,10 @@ export class AgentSession {
 					} catch (error) {
 						// Only a failure of the refinement itself is a refine failure; a later
 						// result-row persist error must not report a completed refinement as failed.
-						this._emitRefineFailed(this._asError(error), options?.global ? "global" : "local");
+						// Source "user": a receipt the owner asked for must not carry the
+						// background row's automatic-retry promise (the first receipt wins, so
+						// this stamp also covers apply-phase failures refine() already reported).
+						this._emitRefineFailed(this._asError(error), options?.global ? "global" : "local", "user");
 						throw error;
 					}
 					const applied = result.appliedEdits.filter((edit) => edit.applied).length;
@@ -12675,8 +12679,8 @@ export class AgentSession {
 	}
 
 	_refineFailureReceipts = new WeakSet<object>();
-	_emitRefineFailed(error: unknown, scope: HarnessScope = "local"): void {
-		emitRefineFailed(this, error, scope);
+	_emitRefineFailed(error: unknown, scope: HarnessScope = "local", source?: RefinementSource): void {
+		emitRefineFailed(this, error, scope, source);
 	}
 
 	_consumePendingRequestedRefine(): boolean {

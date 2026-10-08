@@ -6,7 +6,7 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { KernelMemoryChange } from "../../../core/kernel/shared.js";
-import type { RefinementOutcomeMessage } from "../../../core/messages.js";
+import type { RefinementOutcomeMessage, RefinementSource } from "../../../core/messages.js";
 import type { AppliedRefinementEdit, HarnessScope } from "../../../core/refinement/refinement.js";
 import { theme } from "../theme/theme.js";
 import {
@@ -90,8 +90,23 @@ function keptNoteText(edits: readonly AppliedRefinementEdit[], scope: HarnessSco
 }
 
 /** What the note says when the tidy wrote nothing: its head, and the reason it gives for itself. */
-function missedNoteText(error: string | undefined): { head: string; why: string } {
+function missedNoteText(
+	error: string | undefined,
+	source: RefinementSource | undefined,
+): { head: string; why: string } {
 	const reason = error ? sanitizeDisplayText(error).split("\n")[0] : undefined;
+	// A failure the user asked for (/refine, refine.run) carries no automatic-retry
+	// promise - the scheduler's failure semantics do not retry - only the fact that a
+	// retry is available on demand; the background row keeps the "下一轮会再试" wording
+	// an interval auto-refine actually honors.
+	if (source === "user") {
+		return {
+			head: "回合后整理记忆：没写进去",
+			why: reason
+				? `整理器这次没给出结果（${reason}），需要的话可以再试一次`
+				: "整理器这次没给出结果，需要的话可以再试一次",
+		};
+	}
 	return {
 		head: "回合后整理记忆：没写进去",
 		why: reason ? `整理器这次没给出结果（${reason}），下一轮会再试` : "整理器这次没给出结果，下一轮会再试",
@@ -141,7 +156,7 @@ export class RefinementOutcomeMessageComponent implements Component, FocusableBl
 		const { edits, scope, failed, error, source, summary } = this.message.details;
 		if (failed || edits.length === 0) {
 			if (!failed && source === "user") return nothingToChangeNoteText(scope);
-			const missed = missedNoteText(error);
+			const missed = missedNoteText(error, source);
 			return `${missed.head} · ${missed.why}`;
 		}
 		const parts: string[] = [keptNoteText(edits, scope)];
@@ -213,7 +228,7 @@ export class RefinementOutcomeMessageComponent implements Component, FocusableBl
 				lines.push(row(noteGutter, dim(nothingToChangeNoteText(scope))));
 				return lines;
 			}
-			const missed = missedNoteText(error);
+			const missed = missedNoteText(error, source);
 			lines.push(row(noteGutter, `${theme.fg("timelineFix", missed.head)}${dim(` · ${missed.why}`)}`));
 			return lines;
 		}
