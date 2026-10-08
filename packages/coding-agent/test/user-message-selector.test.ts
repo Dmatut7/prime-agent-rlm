@@ -1,3 +1,4 @@
+import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it } from "vitest";
 import { UserMessageSelectorComponent } from "../src/modes/interactive/components/user-message-selector.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
@@ -28,6 +29,23 @@ describe("UserMessageSelectorComponent height budget", () => {
 		// The whole render (chrome + entries + scroll info) stays inside the
 		// budget the dock actually has.
 		expect(selector.render(100).length).toBeLessThanOrEqual(14);
+	});
+
+	it("washes control characters out of the message text", () => {
+		// /fork lists the messages' raw text; the selector paints its own rows.
+		const selector = new UserMessageSelectorComponent(
+			[{ id: "m-1", text: "deploy \x1b[2Jnow\x07" }],
+			() => {},
+			() => {},
+			undefined,
+			() => 24,
+		);
+
+		const output = selector.render(100).join("\n");
+
+		expect(output).not.toContain("\x1b[2J");
+		expect(output).not.toContain("\x07");
+		expect(stripAnsi(output)).toContain("deploy now");
 	});
 
 	it("keeps the default entry count on tall terminals", () => {

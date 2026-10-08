@@ -223,4 +223,71 @@ describe("ConfigurationMenuComponent", () => {
 			expect(rendered).not.toBe(stripAnsi(rendered));
 		}
 	});
+
+	it("delivers the session profile to the models tab even when the menu opened on providers", async () => {
+		const harness = await createHarness({
+			models: [
+				{ id: "faux-1", name: "Faux One", reasoning: true },
+				{ id: "faux-2", name: "Faux Two", reasoning: true },
+			],
+		});
+		harnesses.push(harness);
+		const current = harness.getModel("faux-1")!;
+		const candidate = harness.getModel("faux-2")!;
+		const menu = new ConfigurationMenuComponent({
+			initialTab: "providers",
+			tui: createFakeTui(),
+			authStorage: harness.session.modelRegistry.authStorage,
+			providerOptions: [],
+			modelRegistry: harness.session.modelRegistry,
+			currentModel: current,
+			scopedModels: [],
+			availableModels: [current, candidate],
+			configuredProviders: new Set([current.provider]),
+			requestRender: () => {},
+			onSelectProvider: () => {},
+			onSelectMcpConnection: () => {},
+			onSelectModel: () => {},
+			onCancel: () => {},
+		});
+
+		// The profile used to walk the mounted children, and the models body is not
+		// mounted while the providers tab is active - the 推荐 line never appeared.
+		menu.getModelsBody().setSessionProfile({ thinkingLevel: "high" });
+		menu.setActiveTab("models");
+
+		expect(stripAnsi(menu.render(120).join("\n"))).toContain("推荐");
+	});
+
+	it("badges a disabled MCP connection as off in the MCP tab", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1", name: "Faux One", reasoning: true }],
+		});
+		harnesses.push(harness);
+		const model = harness.getModel("faux-1")!;
+		harness.session.modelRegistry.authStorage.setVerified("mcp:linear", { type: "oauth", access: "x" } as never);
+		const menu = new ConfigurationMenuComponent({
+			initialTab: "mcp-connections",
+			tui: createFakeTui(),
+			authStorage: harness.session.modelRegistry.authStorage,
+			providerOptions: [{ id: "mcp:linear", name: "Linear", authType: "oauth", category: "service" }],
+			modelRegistry: harness.session.modelRegistry,
+			currentModel: model,
+			scopedModels: [],
+			availableModels: [model],
+			configuredProviders: new Set([model.provider]),
+			isMcpConnectionDisabled: () => true,
+			requestRender: () => {},
+			onSelectProvider: () => {},
+			onSelectMcpConnection: () => {},
+			onSelectModel: () => {},
+			onCancel: () => {},
+		});
+
+		const output = stripAnsi(menu.render(120).join("\n"));
+
+		expect(output).toContain("Linear");
+		expect(output).toContain("已停用");
+		expect(output).not.toContain("已配置");
+	});
 });

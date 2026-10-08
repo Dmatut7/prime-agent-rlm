@@ -774,31 +774,56 @@ export class ProviderAuthFlows {
 		}
 	}
 
-	private showOAuthLoginSelect(dialogHandle: OverlayHandle, prompt: OAuthSelectPrompt): Promise<string | undefined> {
+	private showOAuthLoginSelect(
+		dialogHandle: OverlayHandle,
+		prompt: OAuthSelectPrompt,
+		opts?: { signal?: AbortSignal; onHandle?: (handle: OverlayHandle | undefined) => void },
+	): Promise<string | undefined> {
 		return new Promise((resolve) => {
 			dialogHandle.setHidden(true);
 			let selectorHandle: OverlayHandle | undefined;
+			let settled = false;
 			const restoreDialog = () => {
 				selectorHandle?.hide();
+				selectorHandle = undefined;
+				opts?.onHandle?.(undefined);
 				dialogHandle.setHidden(false);
 				dialogHandle.focus();
 				this.host.ui.requestRender();
 			};
+			const finish = (value: string | undefined) => {
+				if (settled) return;
+				settled = true;
+				opts?.signal?.removeEventListener("abort", onAbort);
+				restoreDialog();
+				resolve(value);
+			};
+			const onAbort = () => finish(undefined);
+			opts?.signal?.addEventListener("abort", onAbort, { once: true });
+			if (opts?.signal?.aborted) {
+				finish(undefined);
+				return;
+			}
 			const labels = prompt.options.map((option) => option.label);
 			const selector = new ExtensionSelectorComponent(
 				prompt.message,
 				labels,
 				(optionLabel) => {
-					restoreDialog();
-					resolve(prompt.options.find((option) => option.label === optionLabel)?.id);
+					finish(prompt.options.find((option) => option.label === optionLabel)?.id);
 				},
 				() => {
-					restoreDialog();
-					resolve(undefined);
+					finish(undefined);
 				},
 				{ getRows: () => this.host.ui.terminal.rows },
 			);
-			selectorHandle = showFullPaneOverlay(this.host.ui, selector, 76);
+			try {
+				selectorHandle = showFullPaneOverlay(this.host.ui, selector, 76);
+				opts?.onHandle?.(selectorHandle);
+			} catch {
+				// The nested selector never opened: hand the dialog back its focus and
+				// resolve as cancelled instead of leaving the dialog hidden forever.
+				finish(undefined);
+			}
 		});
 	}
 
@@ -827,7 +852,13 @@ export class ProviderAuthFlows {
 			manualCodeReject = reject;
 		});
 
+		// A select prompt nests a selector overlay on top of this dialog; a failure
+		// mid-select must take that overlay down with the dialog, not leak it.
+		let nestedSelectHandle: OverlayHandle | undefined;
+
 		const closeDialog = () => {
+			nestedSelectHandle?.hide();
+			nestedSelectHandle = undefined;
 			dialogHandle.hide();
 			this.host.ui.requestRender();
 		};
@@ -865,7 +896,13 @@ export class ProviderAuthFlows {
 					dialog.showProgress(message);
 				},
 
-				onSelect: (prompt: OAuthSelectPrompt) => this.showOAuthLoginSelect(dialogHandle, prompt),
+				onSelect: (prompt: OAuthSelectPrompt) =>
+					this.showOAuthLoginSelect(dialogHandle, prompt, {
+						signal: dialog.signal,
+						onHandle: (handle) => {
+							nestedSelectHandle = handle;
+						},
+					}),
 
 				onManualCodeInput: () => manualCodePromise,
 

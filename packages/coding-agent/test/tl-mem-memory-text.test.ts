@@ -185,4 +185,13 @@ describe("an opened memory shows its words in full", () => {
 		expect(memoryHeadLabel(change({ kind: "skill" }))).toBe("记住了技能");
 		expect(memoryHeadLabel(change({ kind: "rules_file", scope: "project", op: "updated" }))).toBe("改了项目规则");
 	});
+
+	it("washes a deleted memory's held text before rendering", () => {
+		// The deleted branch used to skip the wash the created/updated paths get.
+		const lines = memoryBodyLines(change({ op: "deleted", before: "记住\x1b[2J这个\x07" }), 80);
+		const joined = lines.join("\n");
+		expect(joined).not.toContain("\x1b[2J");
+		expect(joined).not.toContain("");
+		expect(plain(lines).join("\n")).toContain("记住这个");
+	});
 });

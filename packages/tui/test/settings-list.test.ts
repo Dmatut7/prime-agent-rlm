@@ -78,3 +78,50 @@ describe("SettingsList search", () => {
 		assert.deepStrictEqual(changes, [{ id: "autocompact", value: "false" }]);
 	});
 });
+
+describe("SettingsList row layout", () => {
+	it("keeps the value visible when the label is wider than the row budget", () => {
+		const items: SettingItem[] = [
+			{
+				id: "wide",
+				label: "这是一个特别特别长的设置标签名字",
+				currentValue: "on",
+				values: ["on", "off"],
+			},
+		];
+		const list = new SettingsList(
+			items,
+			5,
+			testTheme,
+			() => {},
+			() => {},
+		);
+
+		const lines = list.render(28).map(stripAnsi);
+		const row = lines.find((line) => line.includes("这是"));
+		assert.ok(row, "the setting row should render");
+		assert.ok(
+			row.includes("on"),
+			`the value must survive an over-wide label (label side truncates), got: ${JSON.stringify(lines)}`,
+		);
+	});
+
+	it("bounds the selected item's description to a fixed row budget", () => {
+		const items: SettingItem[] = [{ id: "x", label: "x", currentValue: "1", description: "很长的描述。".repeat(60) }];
+		const list = new SettingsList(
+			items,
+			5,
+			testTheme,
+			() => {},
+			() => {},
+		);
+
+		const lines = list.render(40);
+		// 1 item row + 1 blank + description rows + 1 blank + 1 hint; the
+		// description must not wrap into an unbounded block under the list.
+		assert.ok(
+			lines.length <= 8,
+			`description wrap should be capped, got ${lines.length} rows: ${JSON.stringify(lines.map(stripAnsi))}`,
+		);
+	});
+});

@@ -367,6 +367,51 @@ describe("herdrAgentStateExtension", () => {
 		expect(requests.at(-1)?.params.message).toContain("rate limit");
 	});
 
+	it("washes and bounds the error message sent to the pane", async () => {
+		const tempDir = join(tmpdir(), `hrd-${Math.random().toString(36).slice(2, 8)}`);
+		mkdirSync(tempDir, { recursive: true });
+		cleanupPaths.push(tempDir);
+		const socketPath = join(tempDir, "h.sock");
+
+		const { server, requests, waitForRequests } = await startFakeHerdrServer(socketPath);
+		cleanupServers.push(server);
+
+		process.env.HERDR_ENV = "1";
+		process.env.HERDR_SOCKET_PATH = socketPath;
+		process.env.HERDR_PANE_ID = "w1:p1";
+		process.env.HERDR_PI_IDLE_DEBOUNCE_MS = "10";
+		process.env.HERDR_PI_RETRY_GRACE_MS = "10";
+
+		const { pi, handlers } = createMockPi();
+		herdrAgentStateExtension(pi);
+
+		const ctx = { sessionManager: { getSessionFile: () => undefined, getSessionId: () => "s" } };
+		handlers.get("session_start")?.[0]?.({ type: "session_start", reason: "startup" }, ctx);
+		handlers.get("agent_start")?.[0]?.({ type: "agent_start" }, ctx);
+		handlers.get("agent_end")?.[0]?.(
+			{
+				type: "agent_end",
+				messages: [
+					{
+						role: "assistant",
+						stopReason: "error",
+						errorMessage: `bad \x1b[2J\x07${"x".repeat(500)}`,
+					},
+				],
+			},
+			ctx,
+		);
+
+		await waitForRequests(2);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		const message = String(requests.at(-1)?.params.message ?? "");
+		expect(message).not.toContain("\x1b[2J");
+		expect(message).not.toContain("\x07");
+		expect(message).toContain("bad");
+		// Bounded: a kilobyte-class error body does not flood the pane.
+		expect(message.length).toBeLessThanOrEqual(210);
+	});
+
 	it("holds working through any error end until the retry grace settles", async () => {
 		const tempDir = join(tmpdir(), `hrd-${Math.random().toString(36).slice(2, 8)}`);
 		mkdirSync(tempDir, { recursive: true });

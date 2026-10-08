@@ -128,7 +128,7 @@ describe("searchable selector navigation", () => {
 				onChange: (ids) => {
 					enabledModelIds = ids;
 				},
-				onPersist: () => {},
+				onPersist: () => undefined,
 				onCancel: () => {},
 			},
 		);

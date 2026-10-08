@@ -40,6 +40,8 @@ export interface ConfigurationMenuOptions {
 	recentModels?: ReadonlyArray<string>;
 	initialModelSearch?: string;
 	getRows?: () => number;
+	/** A user MCP server declared with `enabled: false` shows as off, not as its stored credential. */
+	isMcpConnectionDisabled?: (server: string) => boolean;
 	requestRender: () => void;
 	onSelectProvider: (provider: AuthSelectorProvider) => void;
 	onSelectMcpConnection: (provider: AuthSelectorProvider) => void;
@@ -123,6 +125,7 @@ export class ConfigurationMenuComponent extends Container implements Focusable {
 			(provider) => (provider.category ?? "provider") === "provider",
 		);
 		const mcpOptions = options.providerOptions.filter((provider) => provider.category === "service");
+		const isMcpConnectionDisabled = options.isMcpConnectionDisabled;
 
 		const providers = new OAuthSelectorComponent(
 			"login",
@@ -172,6 +175,12 @@ export class ConfigurationMenuComponent extends Container implements Focusable {
 				title: "MCP 连接",
 				subtitle: "连接 MCP 集成和服务凭据。",
 				searchPlaceholder: "搜索 MCP 连接",
+				...(isMcpConnectionDisabled
+					? {
+							isEntryDisabled: (provider: AuthSelectorProvider) =>
+								provider.id.startsWith("mcp:") && isMcpConnectionDisabled(provider.id.slice(4)),
+						}
+					: {}),
 			},
 		);
 
@@ -199,6 +208,14 @@ export class ConfigurationMenuComponent extends Container implements Focusable {
 
 	getActiveTab(): ConfigurationMenuTab {
 		return this.activeTab;
+	}
+
+	/**
+	 * The models body, mounted or not: the session profile (the 推荐 line) must
+	 * reach it even while another tab is on screen.
+	 */
+	getModelsBody(): ModelSelectorComponent {
+		return this.bodies.models;
 	}
 
 	getSearchValue(tab: ConfigurationMenuTab = this.activeTab): string {

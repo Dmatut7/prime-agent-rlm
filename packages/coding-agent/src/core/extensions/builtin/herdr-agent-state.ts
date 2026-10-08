@@ -18,6 +18,8 @@
 
 import { createConnection } from "node:net";
 import { basename, win32 } from "node:path";
+import { truncateToWidth } from "@earendil-works/pi-tui";
+import { sanitizeRowText } from "../../../utils/display-text.js";
 import type { ExtensionAPI, ExtensionFactory } from "../types.js";
 
 type AgentState = "working" | "blocked" | "idle";
@@ -96,7 +98,11 @@ function errorHoldMessage(event: any): string | undefined {
 	if (assistant?.stopReason !== "error") {
 		return undefined;
 	}
-	return String(assistant.errorMessage ?? "") || "provider error";
+	const raw = String(assistant.errorMessage ?? "");
+	if (!raw) return "provider error";
+	// The pane is somebody else's terminal: wash the control bytes, and bound the
+	// length - a provider error body can run to kilobytes.
+	return truncateToWidth(sanitizeRowText(raw), 200, "…");
 }
 
 // Monotonic across all extension instances in this process. Herdr guards

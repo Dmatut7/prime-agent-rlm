@@ -138,4 +138,29 @@ describe("ipython_state_pruned replay", () => {
 		});
 		expect(components).toHaveLength(0);
 	});
+
+	it("strips the notice's own wrapper tags from the rendered body", () => {
+		// The producer wraps the content in <ipython_bootstrap_failed> for the
+		// model; the box already labels itself [ipython_bootstrap_failed], so the
+		// tags are pure noise on screen.
+		const notice = {
+			role: "custom" as const,
+			customType: "ipython_bootstrap_failed",
+			content: "<ipython_bootstrap_failed>\nPython kernel failed to start: boom\n</ipython_bootstrap_failed>",
+			display: true,
+			timestamp: Date.now(),
+		};
+		const components = buildConversationComponents([notice], {
+			ui: {} as TUI,
+			cwd: "/tmp",
+			toolOptions: {},
+			getToolDefinition: () => undefined,
+		});
+
+		expect(components).toHaveLength(1);
+		const rendered = stripAnsi(components[0]!.render(100).join("\n"));
+		expect(rendered).toContain("Python kernel failed to start: boom");
+		expect(rendered).not.toContain("<ipython_bootstrap_failed>");
+		expect(rendered).not.toContain("</ipython_bootstrap_failed>");
+	});
 });

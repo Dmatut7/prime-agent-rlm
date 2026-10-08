@@ -152,6 +152,16 @@ function validateName(name: string, parentDirName: string): string[] {
 }
 
 /**
+ * A name with whitespace or control bytes cannot be addressed: `/skill:<name>`
+ * tokenizes on whitespace, and the <skill> block's name would never match what
+ * the model was told to invoke. Such a skill is refused, not warned-and-loaded
+ * (charset/hyphen/length deviations stay warnings - they still address fine).
+ */
+function nameIsUnaddressable(name: string): boolean {
+	return /[\s\u0000-\u001f\u007f-\u009f]/.test(name);
+}
+
+/**
  * Validate description per Agent Skills spec.
  */
 function validateDescription(description: string | undefined): string[] {
@@ -434,6 +444,15 @@ function loadSkillFromFile(
 		}
 
 		const name = frontmatter.name || parentDirName;
+
+		if (nameIsUnaddressable(name)) {
+			diagnostics.push({
+				type: "error",
+				message: `name ${JSON.stringify(name)} contains whitespace or control characters and cannot be invoked`,
+				path: filePath,
+			});
+			return { skill: null, diagnostics };
+		}
 
 		const nameErrors = validateName(name, parentDirName);
 		for (const error of nameErrors) {

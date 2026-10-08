@@ -129,6 +129,17 @@ describe("UserMessageComponent", () => {
 		expect(plainLines).toEqual(expectedLines);
 	});
 
+	test("washes control characters out of the rendered bubble", () => {
+		initTheme("dark");
+		// Queued/injected text lands here too; the bubble paints its own lines.
+		const lines = new UserMessageComponent("send \x1b[2Jthis\x07").render(40);
+		const body = lines.join("\n").replace(/\x1b\[[0-9;]*m|\x1b\]133;[ABC]\x07/g, "");
+
+		expect(body).toContain("send this");
+		expect(body).not.toContain("\x1b");
+		expect(body).not.toContain("\x07");
+	});
+
 	test("preserves mask-like argument text across narrow wraps", () => {
 		initTheme("dark");
 		const command = "/averyveryverylongcommand";

@@ -613,4 +613,28 @@ describe("Input component", () => {
 			assert.strictEqual(input.getCursor(), "ababctail".length);
 		});
 	});
+
+	describe("placeholder", () => {
+		it("shows the placeholder only while the value is empty", () => {
+			const input = new Input();
+			input.setPlaceholder("model name");
+
+			const empty = input.render(40)[0] ?? "";
+			assert.ok(empty.includes("model name"), `placeholder should render, got: ${JSON.stringify(empty)}`);
+			assert.ok(visibleWidth(empty) <= 40, "placeholder line must not overflow");
+
+			input.handleInput("a");
+			const filled = input.render(40)[0] ?? "";
+			assert.ok(!filled.includes("model name"), "placeholder must disappear once a value exists");
+			assert.ok(filled.includes("a"));
+		});
+
+		it("truncates a placeholder wider than the input", () => {
+			const input = new Input();
+			input.setPlaceholder("x".repeat(100));
+
+			const line = input.render(24)[0] ?? "";
+			assert.ok(visibleWidth(line) <= 24, `placeholder line must fit, width=${visibleWidth(line)}`);
+		});
+	});
 });

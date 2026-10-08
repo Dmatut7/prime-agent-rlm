@@ -251,7 +251,11 @@ function createExtensionUIContext(
 			}
 			return undefined as T;
 		},
-		pasteToEditor: (text) => emitUiRequest("setEditorText", { text }),
+		// pasteToEditor pastes at the cursor; setEditorText replaces the draft. The
+		// wire method is shared, so the insert intent rides as a payload flag: new
+		// clients insert (bracketed paste), old clients keep replacing — the status
+		// quo before this flag existed.
+		pasteToEditor: (text) => emitUiRequest("setEditorText", { text, insert: true }),
 		setEditorText: (text) => emitUiRequest("setEditorText", { text }),
 		getEditorText: () => "",
 		editor: (title, prefill) => {

@@ -1,9 +1,11 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import stripAnsi from "strip-ansi";
 import { afterEach, describe, expect, it } from "vitest";
-import type { ExtensionContext } from "../src/core/extensions/types.js";
+import type { ExtensionContext, ToolRenderContext } from "../src/core/extensions/types.js";
 import { createEditToolDefinition } from "../src/core/tools/edit.js";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 const tempDirs: string[] = [];
 
@@ -117,5 +119,52 @@ describe("edit tool stringified edits", () => {
 			path: "file.txt",
 			edits: "not json",
 		});
+	});
+});
+
+describe("edit tool display washing", () => {
+	function renderContext(overrides: Partial<ToolRenderContext> = {}): ToolRenderContext {
+		return {
+			args: {},
+			toolCallId: "t1",
+			invalidate: () => {},
+			lastComponent: undefined,
+			state: {},
+			cwd: process.cwd(),
+			executionStarted: true,
+			argsComplete: true,
+			isPartial: false,
+			expanded: false,
+			showImages: false,
+			includeImageDimensions: false,
+			isError: false,
+			...overrides,
+		};
+	}
+
+	it("washes the path in the call header and the error text in the result", () => {
+		initTheme("dark");
+		const definition = createEditToolDefinition(process.cwd());
+		const dirtyPath = "src/\x1b[2Jfile.ts";
+
+		const call = definition.renderCall!(
+			{ path: dirtyPath, edits: [{ oldText: "a", newText: "b" }] },
+			theme,
+			renderContext({ args: { path: dirtyPath, edits: [{ oldText: "a", newText: "b" }] }, argsComplete: false }),
+		);
+		const header = call.render(80).join("\n");
+		expect(header).not.toContain("\x1b[2J");
+		expect(stripAnsi(header)).toContain("src/");
+
+		const result = definition.renderResult!(
+			{ content: [{ type: "text", text: "edit failed \x1b]52;c;eA==\x07here" }] } as never,
+			{ expanded: false, isPartial: false },
+			theme,
+			renderContext({ isError: true }),
+		);
+		const output = result.render(80).join("\n");
+		expect(output).not.toContain("]52;");
+		expect(output).not.toContain("\x07");
+		expect(stripAnsi(output)).toContain("edit failed");
 	});
 });

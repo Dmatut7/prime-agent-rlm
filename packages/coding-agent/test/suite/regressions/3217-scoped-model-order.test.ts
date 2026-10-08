@@ -3,7 +3,10 @@ import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { KeybindingsManager } from "../../../src/core/keybindings.js";
 import { ModelSelectorComponent } from "../../../src/modes/interactive/components/model-selector.js";
-import { ScopedModelsSelectorComponent } from "../../../src/modes/interactive/components/scoped-models-selector.js";
+import {
+	type ModelsConfig,
+	ScopedModelsSelectorComponent,
+} from "../../../src/modes/interactive/components/scoped-models-selector.js";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
 import { createHarness, type Harness } from "../harness.js";
 
@@ -56,7 +59,7 @@ describe("issue #3217 scoped model ordering", () => {
 				onChange: (enabledModelIds) => {
 					changes.push(enabledModelIds);
 				},
-				onPersist: () => {},
+				onPersist: () => undefined,
 				onCancel: () => {},
 			},
 		);
@@ -102,5 +105,109 @@ describe("issue #3217 scoped model ordering", () => {
 			.slice(0, 3);
 
 		expect(orderedIds).toEqual([modelTwo.id, modelOne.id, modelThree.id]);
+	});
+});
+
+describe("ScopedModelsSelectorComponent", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+
+	beforeEach(() => {
+		setKeybindings(new KeybindingsManager());
+	});
+
+	const fakeModels = (...ids: string[]) =>
+		ids.map((id) => ({ provider: "p", id, name: id })) as unknown as ModelsConfig["allModels"];
+
+	it("keeps the highlight on the reordered model when the filter hides the swapped neighbor", () => {
+		// Filtered view [alpha, beta] hides "mid"; moving beta up swaps it with mid
+		// in the enabled order, which leaves beta's filtered position unchanged. The
+		// highlight must follow beta by identity, not drift by one row.
+		const selector = new ScopedModelsSelectorComponent(
+			{
+				allModels: fakeModels("alpha", "mid", "beta"),
+				enabledModelIds: ["p/alpha", "p/mid", "p/beta"],
+			},
+			{ onChange: () => {}, onPersist: () => undefined, onCancel: () => {} },
+		);
+
+		selector.handleInput("a"); // filter: alpha + beta, mid hidden
+		selector.handleInput("\x1b[B"); // down: select beta
+		selector.handleInput("\x1b[1;3A"); // alt+up: reorder beta up over the hidden mid
+
+		const selectedLine = stripAnsi(selector.render(100).join("\n"))
+			.split("\n")
+			.find((line) => line.includes("›"));
+		expect(selectedLine).toBeDefined();
+		expect(selectedLine).toContain("beta");
+	});
+
+	it("keeps the (unsaved) marker until the persist actually lands", async () => {
+		let resolvePersist: ((value?: boolean) => void) | undefined;
+		const selector = new ScopedModelsSelectorComponent(
+			{
+				allModels: fakeModels("alpha", "beta"),
+				enabledModelIds: ["p/alpha", "p/beta"],
+			},
+			{
+				onChange: () => {},
+				onPersist: () => new Promise<boolean | undefined>((resolve) => (resolvePersist = resolve)),
+				onCancel: () => {},
+			},
+		);
+		const footer = () => stripAnsi(selector.render(100).join("\n"));
+
+		selector.handleInput("\r"); // toggle alpha off → dirty
+		expect(footer()).toContain("(unsaved)");
+
+		selector.handleInput("\x13"); // ctrl+s: persist starts but has not landed
+		expect(footer()).toContain("(unsaved)");
+
+		resolvePersist?.();
+		await waitForAsyncRender();
+		expect(footer()).not.toContain("(unsaved)");
+	});
+
+	it("keeps the (unsaved) marker when the persist reports failure", async () => {
+		const selector = new ScopedModelsSelectorComponent(
+			{
+				allModels: fakeModels("alpha", "beta"),
+				enabledModelIds: ["p/alpha", "p/beta"],
+			},
+			{
+				onChange: () => {},
+				onPersist: () => false,
+				onCancel: () => {},
+			},
+		);
+		const footer = () => stripAnsi(selector.render(100).join("\n"));
+
+		selector.handleInput("\r");
+		selector.handleInput("\x13");
+		await waitForAsyncRender();
+
+		expect(footer()).toContain("(unsaved)");
+	});
+
+	it("treats left as back while the search field is empty", () => {
+		let cancelled = 0;
+		const selector = new ScopedModelsSelectorComponent(
+			{
+				allModels: fakeModels("alpha", "beta"),
+				enabledModelIds: null,
+			},
+			{
+				onChange: () => {},
+				onPersist: () => undefined,
+				onCancel: () => {
+					cancelled++;
+				},
+			},
+		);
+
+		selector.handleInput("\x1b[D");
+
+		expect(cancelled).toBe(1);
 	});
 });

@@ -203,6 +203,20 @@ describe("skills", () => {
 			expect(diagnostics.some((d: ResourceDiagnostic) => d.message.includes("consecutive hyphens"))).toBe(true);
 		});
 
+		it("refuses a skill whose name cannot be addressed", () => {
+			// `/skill:<name>` tokenizes on whitespace: a name with a space can never
+			// be invoked, so the skill is refused with an error, not warned-and-loaded.
+			const { skills, diagnostics } = loadSkillsFromDir({
+				dir: join(fixturesDir, "whitespace-name"),
+				source: "test",
+			});
+
+			expect(skills).toHaveLength(0);
+			expect(
+				diagnostics.some((d: ResourceDiagnostic) => d.type === "error" && d.message.includes("cannot be invoked")),
+			).toBe(true);
+		});
+
 		it("should load all skills from fixture directory", () => {
 			const { skills } = loadSkillsFromDir({
 				dir: fixturesDir,
@@ -211,7 +225,7 @@ describe("skills", () => {
 
 			// Should load all skills that have descriptions (even with warnings)
 			// valid-skill, name-mismatch, invalid-name-chars, long-name, unknown-field, nested/child-skill, consecutive-hyphens
-			// NOT: missing-description, no-frontmatter (both missing descriptions)
+			// NOT: missing-description, no-frontmatter (both missing descriptions), whitespace-name (unaddressable name)
 			expect(skills.length).toBeGreaterThanOrEqual(6);
 		});
 

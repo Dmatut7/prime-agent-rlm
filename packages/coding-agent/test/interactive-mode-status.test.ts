@@ -1484,6 +1484,26 @@ describe("InteractiveMode MCP command", () => {
 		expect(normalizeRenderedOutput(fakeThis.chatContainer)).toContain("Run /mcp login remote to connect.");
 	});
 
+	test("refuses a fake-success login when settings shadow a builtin integration name", async () => {
+		// A hand-declared settings server named like a builtin (e.g. "linear") is
+		// rejected by isAuthed forever; logging in anyway would succeed against the
+		// builtin and never enable the user's server.
+		const manager = SettingsManager.inMemory({
+			mcpServers: { linear: { type: "http", url: "https://linear.example/mcp" } },
+		});
+		const fakeThis = createRenderedMcpHarness(manager);
+		const showError = vi.fn();
+		fakeThis.showError = showError;
+		const createAuthFlows = vi.fn();
+		(fakeThis as unknown as { createAuthFlows: unknown }).createAuthFlows = createAuthFlows;
+
+		await handleMcpCommand.call(fakeThis, "login linear");
+
+		expect(createAuthFlows).not.toHaveBeenCalled();
+		expect(showError).toHaveBeenCalledWith(expect.stringContaining("linear"));
+		expect(showError).toHaveBeenCalledWith(expect.stringContaining("永不生效"));
+	});
+
 	test("keeps OAuth guidance accurate for legacy UI service hosts", async () => {
 		const manager = SettingsManager.inMemory({});
 		const fakeThis = createRenderedMcpHarness(manager);
@@ -1524,6 +1544,59 @@ describe("InteractiveMode MCP command", () => {
 			expect(output).not.toContain("secret-argument");
 			expect(output).not.toContain("SECRET_TOKEN");
 		}
+	});
+});
+
+describe("InteractiveMode extension editor writes", () => {
+	// test-hygiene-allow: prototype dispatch drive, this file's frozen-stock
+	// pattern (handleMcpCommand above); no public entry exists for
+	// extension_ui_request resolution and the wire side is covered in
+	// daemon-extension-binding.test.ts.
+	const resolveRequest = (
+		InteractiveMode.prototype as unknown as {
+			resolveConnectionExtensionUiRequest(
+				this: unknown,
+				request: {
+					id: string;
+					method: string;
+					payload: Record<string, unknown>;
+				},
+			): Promise<unknown>;
+		}
+	).resolveConnectionExtensionUiRequest;
+
+	test("insert flag pastes at the cursor instead of replacing the draft", async () => {
+		const editor = {
+			setText: vi.fn(),
+			handleInput: vi.fn(),
+		};
+		const fakeThis = { editor } as unknown as InteractiveMode;
+
+		await resolveRequest.call(fakeThis, {
+			id: "r-insert",
+			method: "setEditorText",
+			payload: { text: "pasted text", insert: true },
+		});
+
+		expect(editor.handleInput).toHaveBeenCalledWith("\x1b[200~pasted text\x1b[201~");
+		expect(editor.setText).not.toHaveBeenCalled();
+	});
+
+	test("absent insert flag keeps wholesale replacement", async () => {
+		const editor = {
+			setText: vi.fn(),
+			handleInput: vi.fn(),
+		};
+		const fakeThis = { editor } as unknown as InteractiveMode;
+
+		await resolveRequest.call(fakeThis, {
+			id: "r-replace",
+			method: "setEditorText",
+			payload: { text: "replacement" },
+		});
+
+		expect(editor.setText).toHaveBeenCalledWith("replacement");
+		expect(editor.handleInput).not.toHaveBeenCalled();
 	});
 });
 

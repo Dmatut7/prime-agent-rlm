@@ -1,5 +1,6 @@
 import { open, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
+import { sanitizeRowText } from "../../utils/display-text.js";
 
 /** The session a fresh start offers to continue. */
 export interface RecentSession {
@@ -13,6 +14,8 @@ const MAX_CANDIDATES = 40;
 /** Bytes read from the head of each candidate: the header and the first prompt live there. */
 const HEAD_BYTES = 64 * 1024;
 const TITLE_MAX_CHARS = 28;
+/** Grapheme segmentation for the title cut: a code-unit cut can split a flag or family emoji. */
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 async function readHead(path: string): Promise<string> {
 	const handle = await open(path, "r");
@@ -54,14 +57,16 @@ function titleFromHead(head: string, cwd: string): string | undefined {
 		} catch {
 			continue;
 		}
-		if (entry.type === "session_info" && entry.name) name = entry.name;
+		if (entry.type === "session_info" && entry.name) name = sanitizeRowText(entry.name);
 		if (!firstPrompt && entry.type === "message" && entry.message?.role === "user") {
-			firstPrompt = userText(entry.message.content).replace(/\s+/g, " ").trim();
+			firstPrompt = sanitizeRowText(userText(entry.message.content));
 		}
 	}
 	const title = name ?? firstPrompt;
 	if (!title) return undefined;
-	return title.length > TITLE_MAX_CHARS ? `${title.slice(0, TITLE_MAX_CHARS - 1)}…` : title;
+	// The cut counts graphemes, not UTF-16 units, so it never halves an emoji.
+	const graphemes = [...graphemeSegmenter.segment(title)].map((part) => part.segment);
+	return graphemes.length > TITLE_MAX_CHARS ? `${graphemes.slice(0, TITLE_MAX_CHARS - 1).join("")}…` : title;
 }
 
 /**

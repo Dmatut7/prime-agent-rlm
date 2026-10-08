@@ -85,4 +85,62 @@ describe("PrimeTeamSelectorComponent", () => {
 
 		expect(cancelled).toBe(true);
 	});
+
+	it("counts the wrapped subtitle against the list row budget", () => {
+		const teams = Array.from({ length: 6 }, (_, index) => ({
+			teamId: `team-${index}`,
+			name: `Team ${index}`,
+		}));
+		const selector = new PrimeTeamSelectorComponent(
+			teams,
+			undefined,
+			() => {},
+			() => {},
+			{
+				getRows: () => 12,
+			},
+		);
+
+		// The fixed English subtitle wraps to 2 rows at this width; the budget must
+		// pay for both or the list overflows and the overlay clips it away.
+		const lines = selector.render(30);
+
+		expect(lines.length).toBeLessThanOrEqual(12);
+		expect(stripAnsi(lines.join("\n"))).toContain("Personal");
+	});
+
+	it("treats left as back while the search field is empty", () => {
+		let cancelled = 0;
+		const selector = new PrimeTeamSelectorComponent(
+			[{ teamId: "team-1", name: "Research" }],
+			undefined,
+			() => {},
+			() => {
+				cancelled++;
+			},
+		);
+
+		selector.handleInput("\x1b[D");
+
+		expect(cancelled).toBe(1);
+	});
+
+	it("keeps one option visible on an 8-row terminal by collapsing decoration", () => {
+		const teams = Array.from({ length: 6 }, (_, index) => ({ teamId: `team-${index}`, name: `Team ${index}` }));
+		const selector = new PrimeTeamSelectorComponent(
+			teams,
+			undefined,
+			() => {},
+			() => {},
+			{ getRows: () => 8 },
+		);
+
+		const lines = selector.render(80);
+
+		const visible = lines.slice(0, 8);
+		expect(stripAnsi(visible.join("\n"))).toContain("Personal");
+		for (const extra of lines.slice(8)) {
+			expect(stripAnsi(extra).trim()).toBe("");
+		}
+	});
 });

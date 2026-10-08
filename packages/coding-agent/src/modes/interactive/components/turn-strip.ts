@@ -1,4 +1,5 @@
 import { type ClickRegion, type Component, visibleWidth } from "@earendil-works/pi-tui";
+import { sanitizeRowText } from "../../../utils/display-text.js";
 import { shortenPathToWidth } from "../../../utils/shorten-path.js";
 import { formatSpendCost } from "../spend-format.js";
 import { theme } from "../theme/theme.js";
@@ -366,7 +367,8 @@ export class TurnStripComponent implements Component {
 			const key = `file:${change.key}`;
 			const opened = ui.stripExpanded.has(key);
 			const renamed = change.kind === "renamed" && change.oldPath;
-			const path = renamed ? `${change.oldPath} → ${change.path}` : change.path;
+			// The path paints into the timeline with no Text gate; wash it first.
+			const path = sanitizeRowText(renamed ? `${change.oldPath} → ${change.path}` : change.path);
 			const verbs: Record<typeof change.kind, string> = {
 				created: "新增 ",
 				modified: "",

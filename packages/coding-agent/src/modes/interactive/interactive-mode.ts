@@ -13,7 +13,7 @@ import {
 	supportsFastMode,
 	type ToolCall,
 } from "@earendil-works/pi-ai";
-import { BUILTIN_MCP_CATALOG } from "@earendil-works/pi-ai/mcp";
+import { BUILTIN_MCP_CATALOG, getCatalogEntry } from "@earendil-works/pi-ai/mcp";
 import type {
 	AutocompleteItem,
 	AutocompleteProvider,
@@ -179,7 +179,7 @@ import { getCwdRelativePath } from "../../utils/paths.js";
 import { backgroundNetworkOptOut } from "../../utils/privacy-opt-out.js";
 import { createPrivateTempFile, readPrivateFile, writePrivateFileAtomic } from "../../utils/private-files.js";
 import { formatScheduleTimestamp } from "../../utils/schedule-timestamp.js";
-import { killTrackedDetachedChildren } from "../../utils/shell.js";
+import { killTrackedDetachedChildren, splitShellWords } from "../../utils/shell.js";
 import { ensureTool, ensureToolWithStatus, formatMissingRipgrepMessage } from "../../utils/tools-manager.js";
 import { checkForNewPiVersion } from "../../utils/version-check.js";
 import type {
@@ -287,7 +287,7 @@ import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
 import { formatKeyText, type KeyTextOptions, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
 import { createMermaidMarkdownTransform } from "./components/mermaid.js";
-import { ModelSelectorComponent, type ModelSessionProfile } from "./components/model-selector.js";
+import type { ModelSessionProfile } from "./components/model-selector.js";
 import { setMotionFrameRequester, setMotionReduced } from "./components/motion.js";
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
@@ -5584,7 +5584,10 @@ export class InteractiveMode {
 					if (closed) return;
 					component = c;
 					if (isOverlay) {
-						// Resolve overlay options - can be static or dynamic function
+						// Overlay options may be a function for dynamic updates; the TUI
+						// re-evaluates a function on every render, so hand the resolver
+						// over instead of freezing the first answer (the extension API
+						// documents the function form as live).
 						const resolveOptions = (): OverlayOptions | undefined => {
 							if (options?.overlayOptions) {
 								const opts =
@@ -5597,7 +5600,7 @@ export class InteractiveMode {
 							const w = (component as { width?: number }).width;
 							return w ? { width: w } : undefined;
 						};
-						const handle = this.ui.showOverlay(component, resolveOptions());
+						const handle = this.ui.showOverlay(component, resolveOptions);
 						overlayHandle = handle;
 						this.extensionCustomOverlays.add(handle);
 						// Expose handle to caller for visibility control
@@ -7143,7 +7146,14 @@ export class InteractiveMode {
 			case "setEditorText": {
 				const text = getPayloadString(payload, "text");
 				if (text !== undefined) {
-					this.editor.setText(text);
+					if (payload.insert === true) {
+						// pasteToEditor: insert at the cursor with the editor's paste
+						// handling (collapse for large content), matching the in-process
+						// binding. Absent the flag the draft is replaced wholesale.
+						this.editor.handleInput(`\x1b[200~${text}\x1b[201~`);
+					} else {
+						this.editor.setText(text);
+					}
 				}
 				return undefined;
 			}
@@ -11946,6 +11956,16 @@ export class InteractiveMode {
 			return;
 		}
 
+		// Shell words, not a raw space split: a quoted path with spaces
+		// ("/Applications/My Editor.app/bin/edit") is one argv word.
+		const editorWords = splitShellWords(editorCmd);
+		const editor = editorWords[0];
+		if (!editor) {
+			this.showWarning("编辑器命令为空。请检查 $VISUAL 或 $EDITOR 环境变量。");
+			return;
+		}
+		const editorArgs = editorWords.slice(1);
+
 		// Yield point: drain pending capability-probe answers before the editor
 		// inherits the tty (see Terminal.drainInput).
 		await this.ui.terminal.drainInput(1000).catch(() => undefined);
@@ -11953,13 +11973,11 @@ export class InteractiveMode {
 		const currentText = this.editor.getExpandedText?.() ?? this.editor.getText();
 		const temp = createPrivateTempFile("pi-editor-", ".pi.md", currentText);
 		const tmpFile = temp.path;
+		let spawnFailure: string | undefined;
 
 		try {
 			// Stop TUI to release terminal
 			this.ui.stop();
-
-			// Split by space to support editor arguments (e.g., "code --wait")
-			const [editor, ...editorArgs] = editorCmd.split(" ");
 
 			// Spawn editor synchronously with inherited stdio for interactive editing
 			const result = spawnSync(editor, [...editorArgs, tmpFile], {
@@ -11971,8 +11989,11 @@ export class InteractiveMode {
 			if (result.status === 0) {
 				const newContent = readPrivateFile(tmpFile, "utf-8").replace(/\n$/, "");
 				this.editor.setText(newContent);
+			} else if (result.error) {
+				// The editor never ran (bad path, ENOENT): say so instead of failing
+				// silently. A non-zero exit is the editor's own "abort" and stays quiet.
+				spawnFailure = `外部编辑器没能启动：${result.error.message}`;
 			}
-			// On non-zero exit, keep original text (no action needed)
 		} finally {
 			try {
 				// Cleanup failures must not leave the terminal UI stopped.
@@ -11987,6 +12008,10 @@ export class InteractiveMode {
 				// Force full re-render since external editor uses alternate screen
 				this.ui.requestRender(true);
 			}
+		}
+
+		if (spawnFailure) {
+			this.showWarning(spawnFailure);
 		}
 	}
 
@@ -12294,6 +12319,7 @@ export class InteractiveMode {
 					// the rows the project settings.json pins so a switch is not
 					// swallowed in silence (R4-M20).
 					projectPinnedItems: projectPinnedSettingItems(this.settingsManager.getProjectSettings()),
+					getRows: () => this.ui.terminal.rows,
 				},
 				{
 					onAutoCompactChange: (enabled) => {
@@ -12973,17 +12999,13 @@ export class InteractiveMode {
 	}
 
 	/**
-	 * Hand the /model menu its session profile. The models tab lives inside
-	 * ConfigurationMenuComponent, so the profile walks the menu's public children
-	 * to the selector - the same instanceof walk the turn flow uses on chat
-	 * children. When the menu opened on another tab the selector is not in the
-	 * tree and the profile simply never lands.
+	 * Hand the /model menu its session profile. The models body exists from
+	 * construction regardless of the active tab, so the profile always lands;
+	 * walking the menu's mounted children used to drop it whenever the menu had
+	 * opened on the providers tab.
 	 */
 	private applyModelSessionProfile(menu: ConfigurationMenuComponent): void {
-		const selector = menu.children.find(
-			(child): child is ModelSelectorComponent => child instanceof ModelSelectorComponent,
-		);
-		selector?.setSessionProfile(this.currentModelSessionProfile());
+		menu.getModelsBody().setSessionProfile(this.currentModelSessionProfile());
 	}
 
 	private showConfigurationMenu(initialTab: ConfigurationMenuTab, initialModelSearch?: string): Promise<void> {
@@ -13084,6 +13106,8 @@ export class InteractiveMode {
 				recentModels: this.settingsManager.getRecentModels(),
 				initialModelSearch,
 				getRows: () => this.ui.terminal.rows,
+				isMcpConnectionDisabled: (server) =>
+					this.settingsManager.getGlobalMcpServers()?.[server]?.enabled === false,
 				requestRender: () => this.ui.requestRender(),
 				onSelectProvider: (provider) => authenticate(provider, "providers"),
 				onSelectMcpConnection: (provider) => authenticate(provider, "mcp-connections"),
@@ -13198,9 +13222,10 @@ export class InteractiveMode {
 							this.showError(
 								`Model selection not saved: ${saveFailure} It applies to this session only and is lost when the session ends.`,
 							);
-							return;
+							return false;
 						}
 						this.showStatus("模型选择已保存");
+						return true;
 					},
 					onCancel: () => {
 						done();
@@ -13628,6 +13653,15 @@ export class InteractiveMode {
 		if (sub === "login") {
 			if (!server || argv.length !== 2) {
 				this.showError("用法：/mcp login <名称>（例如 /mcp login linear）");
+				return;
+			}
+			// A settings.json server reusing a builtin's name shadows the builtin:
+			// the login would land on the builtin's provider and report success, yet
+			// the shadowed integration never enables (isAuthed rejects it).
+			if (getCatalogEntry(server) && this.settingsManager.getGlobalMcpServers()?.[server]) {
+				this.showError(
+					`"${server}" 是内置 MCP 集成的名字，settings.json 里声明的同名 server 会让登录永不生效。把自定义 server 改名（例如 ${server}-custom）或删掉该声明后再登录。`,
+				);
 				return;
 			}
 			const result = await this.createAuthFlows().runMcpLogin(server);

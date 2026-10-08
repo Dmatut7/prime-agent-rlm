@@ -88,7 +88,9 @@ export function memoryBodyLines(change: KernelMemoryChange, width: number): stri
 		lines.push(...plainLines(after, room));
 	} else if (change.op === "deleted" || (before && !after)) {
 		lines.push(...wrapped(label("删掉的"), room));
-		lines.push(...paint(before.split("\n").map((text) => ({ kind: "del" as const, text }))));
+		lines.push(
+			...paint(before.split("\n").map((text) => ({ kind: "del" as const, text: sanitizeDisplayText(text) }))),
+		);
 	} else if (before || after) {
 		const rows = diffRowsFromEdit(before, after).filter((row) => row.kind !== "ctx");
 		const removed = rows.filter((row) => row.kind === "del");

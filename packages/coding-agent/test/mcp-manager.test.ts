@@ -41,9 +41,6 @@ describe("McpManager", () => {
 		const overrides = manager.getDisabledBuiltinSkillOverrides();
 		expect(overrides).not.toContain("-linear/SKILL.md");
 		expect(overrides).toContain("-notion/SKILL.md");
-
-		const status = manager.listStatus().find((s) => s.server === "linear");
-		expect(status?.enabled).toBe(true);
 	});
 
 	it("registers an OAuth provider per built-in integration", () => {
@@ -119,7 +116,7 @@ describe("McpManager", () => {
 			authStorage,
 			getUserServers: () => ({ linear: { type: "http", url: "https://proxy.test/mcp", oauth: true } }),
 		});
-		expect(manager.listStatus().find((s) => s.server === "linear")?.enabled).toBe(false);
+		expect(manager.getEnabledPersistentGenericServers()).toEqual([]);
 	});
 
 	it("does not enable a server from a credential bound to a different endpoint or unbound", () => {
@@ -143,8 +140,6 @@ describe("McpManager", () => {
 				unbound: { type: "http", url: "https://srv.test/mcp", oauth: true },
 			}),
 		});
-		expect(manager.listStatus().find((s) => s.server === "remote")?.enabled).toBe(false);
-		expect(manager.listStatus().find((s) => s.server === "unbound")?.enabled).toBe(false);
 		expect(manager.getEnabledPersistentGenericServers()).toEqual([]);
 	});
 
@@ -157,8 +152,7 @@ describe("McpManager", () => {
 					custom: { type: "http", url: "https://example.test/mcp", bearerTokenEnvVar: "MY_MCP_TOKEN" },
 				}),
 			});
-			const status = manager.listStatus().find((s) => s.server === "custom");
-			expect(status?.enabled).toBe(true);
+			expect(manager.getEnabledPersistentGenericServers()).toEqual(["custom"]);
 		} finally {
 			delete process.env.MY_MCP_TOKEN;
 		}
@@ -181,11 +175,10 @@ describe("McpManager", () => {
 	it("picks up mcpServers added after construction on refresh()", () => {
 		let servers: Record<string, McpServerConfig> = {};
 		const manager = new McpManager({ authStorage, getUserServers: () => servers });
-		expect(manager.listStatus().find((s) => s.server === "acme")).toBeUndefined();
+		expect(getOAuthProvider("mcp:acme")).toBeUndefined();
 
 		servers = { acme: { type: "http", url: "https://mcp.acme.test/mcp", oauth: true } };
 		manager.refresh();
-		expect(manager.listStatus().find((s) => s.server === "acme")).toBeDefined();
 		expect(getOAuthProvider("mcp:acme")).toBeDefined();
 	});
 
@@ -240,7 +233,7 @@ describe("McpManager", () => {
 		};
 		const manager = new McpManager({ authStorage, getUserServers: () => ({ local: config }) });
 		expect(await manager.hostHandlers()["mcp.config"]({ server: "local" })).toEqual(config);
-		expect(manager.listStatus().find((status) => status.server === "local")?.enabled).toBe(true);
+		expect(manager.getEnabledPersistentGenericServers()).toEqual(["local"]);
 	});
 
 	it("does not enable an authored catalog skill when a generic server shadows its name", () => {

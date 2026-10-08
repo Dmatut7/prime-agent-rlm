@@ -1,6 +1,7 @@
-import { resetCapabilitiesCache, setCapabilities } from "@earendil-works/pi-tui";
+import { resetCapabilitiesCache, setCapabilities, setKeybindings } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, test, vi } from "vitest";
+import { KeybindingsManager } from "../src/core/keybindings.js";
 import {
 	formatSettingValue,
 	projectPinnedSettingItems,
@@ -176,5 +177,30 @@ describe("SettingsSelectorComponent", () => {
 
 		expect(onIdleEvictionMinutesChange).toHaveBeenLastCalledWith(value);
 		expect(stripAnsi(component.render(120).join("\n"))).toContain(String(value));
+	});
+
+	test("shrinks the visible item count on a short terminal", () => {
+		// 10 was hardcoded: on a short terminal the panel overflowed and the dock
+		// clipped the search field off the top.
+		const tall = new SettingsSelectorComponent(config, callbacks);
+		const short = new SettingsSelectorComponent({ ...config, getRows: () => 16 }, callbacks);
+
+		const tallRows = tall.render(120).length;
+		const shortRows = short.render(120).length;
+
+		expect(shortRows).toBeLessThan(tallRows);
+	});
+
+	test("left arrow closes a submenu", () => {
+		setKeybindings(new KeybindingsManager());
+		const component = new SettingsSelectorComponent(config, callbacks);
+		const list = component.getSettingsList();
+		for (const character of "主题") list.handleInput(character);
+		list.handleInput("\r"); // open the theme submenu
+		expect(stripAnsi(component.render(120).join("\n"))).toContain("选择配色");
+
+		list.handleInput("\x1b[D");
+
+		expect(stripAnsi(component.render(120).join("\n"))).not.toContain("选择配色");
 	});
 });

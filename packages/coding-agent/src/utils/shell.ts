@@ -257,6 +257,65 @@ export function getShellEnv(): NodeJS.ProcessEnv {
 }
 
 /**
+ * Split a command line into words, POSIX-shell style for the subset an
+ * EDITOR/VISUAL value needs: unquoted whitespace separates, single quotes are
+ * literal, double quotes allow `\"` and `\\`, and a backslash outside quotes
+ * escapes the next character. An unterminated quote takes the rest of the
+ * input. `split(" ")` on the value used to break quoted paths containing
+ * spaces (`"/Applications/My Editor.app/..."`).
+ */
+export function splitShellWords(command: string): string[] {
+	const words: string[] = [];
+	let current = "";
+	let hasWord = false;
+	let quote: "'" | '"' | undefined;
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i]!;
+		if (quote === "'") {
+			if (ch === "'") quote = undefined;
+			else current += ch;
+			continue;
+		}
+		if (quote === '"') {
+			if (ch === '"') {
+				quote = undefined;
+			} else if (ch === "\\" && (command[i + 1] === '"' || command[i + 1] === "\\")) {
+				current += command[i + 1];
+				i++;
+			} else {
+				current += ch;
+			}
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			hasWord = true;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < command.length) {
+			current += command[i + 1];
+			i++;
+			hasWord = true;
+			continue;
+		}
+		if (/\s/.test(ch)) {
+			if (hasWord) {
+				words.push(current);
+				current = "";
+				hasWord = false;
+			}
+			continue;
+		}
+		current += ch;
+		hasWord = true;
+	}
+	if (hasWord) {
+		words.push(current);
+	}
+	return words;
+}
+
+/**
  * Sanitize binary output for display/storage.
  * Removes characters that crash string-width or cause display issues:
  * - Control characters (except tab, newline, carriage return)

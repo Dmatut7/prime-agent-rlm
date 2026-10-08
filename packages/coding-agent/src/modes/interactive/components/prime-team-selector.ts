@@ -2,13 +2,17 @@ import { Container, type Focusable, fuzzyFilter, getKeybindings, Spacer, Truncat
 import type { PrimeTeam } from "../../../core/prime-inference-auth.js";
 import { theme } from "../theme/theme.js";
 import {
+	CollapsibleMenuArea,
+	countWrappedSubtitleRows,
 	getMenuListLayout,
 	MenuList,
 	MenuPanel,
 	MenuRow,
 	MenuSearchInput,
 	type MenuViewportProvider,
+	menuViewportRows,
 } from "./menu-panel.js";
+import { shouldTreatAsBack } from "./modal-back.js";
 
 type PrimeTeamOption = {
 	type: "personal" | "team";
@@ -18,6 +22,7 @@ type PrimeTeamOption = {
 const PREFERRED_VISIBLE_TEAMS = 8;
 const TEAM_LIST_RESERVED_ROWS = 7;
 const TEAM_SCROLL_INDICATOR_ROWS = 1;
+const TEAM_SUBTITLE = "Choose which account pays for Prime Inference usage.";
 
 export class PrimeTeamSelectorComponent extends Container implements Focusable {
 	private readonly searchInput: MenuSearchInput;
@@ -27,6 +32,11 @@ export class PrimeTeamSelectorComponent extends Container implements Focusable {
 	private selectedIndex = 0;
 	private searchQuery = "";
 	private _focused = false;
+	/** Width of the latest render, so the subtitle's wrapped rows can be budgeted. */
+	private lastWidth = 0;
+	private readonly searchArea = new CollapsibleMenuArea();
+	/** True when the terminal is too short for the full chrome; the search area and subtitle drop out. */
+	private criticalShortage = false;
 	private listLayout = getMenuListLayout({
 		preferredVisibleItems: PREFERRED_VISIBLE_TEAMS,
 		reservedRows: TEAM_LIST_RESERVED_ROWS,
@@ -48,7 +58,7 @@ export class PrimeTeamSelectorComponent extends Container implements Focusable {
 
 		const panel = new MenuPanel({
 			title: "Prime Team",
-			subtitle: "Choose which account pays for Prime Inference usage.",
+			subtitle: () => (this.criticalShortage ? undefined : TEAM_SUBTITLE),
 		});
 		this.addChild(panel);
 
@@ -59,8 +69,9 @@ export class PrimeTeamSelectorComponent extends Container implements Focusable {
 				this.onSelect(selected.team);
 			}
 		};
-		panel.addChild(this.searchInput);
-		panel.addChild(new Spacer(1));
+		this.searchArea.addChild(this.searchInput);
+		this.searchArea.addChild(new Spacer(1));
+		panel.addChild(this.searchArea);
 
 		this.listContainer = new MenuList({ compact: () => this.listLayout.compact });
 		panel.addChild(this.listContainer);
@@ -97,6 +108,8 @@ export class PrimeTeamSelectorComponent extends Container implements Focusable {
 	}
 
 	override render(width: number): string[] {
+		this.lastWidth = width;
+		this.updateCriticalShortage(width);
 		const previousLayout = this.listLayout;
 		this.updateLayout();
 		if (
@@ -181,9 +194,10 @@ export class PrimeTeamSelectorComponent extends Container implements Focusable {
 			if (selected) {
 				this.onSelect(selected.team);
 			}
-		} else if (kb.matches(keyData, "tui.select.cancel")) {
+		} else if (kb.matches(keyData, "tui.select.cancel") || shouldTreatAsBack(keyData, this.searchInput)) {
 			this.onCancel();
-		} else {
+		} else if (!this.criticalShortage) {
+			// The search field is hidden at critical shortage; don't type into it blind.
 			this.searchInput.handleInput(keyData);
 			this.filterOptions(this.searchInput.getValue());
 		}
@@ -194,10 +208,36 @@ export class PrimeTeamSelectorComponent extends Container implements Focusable {
 			getRows: this.viewport.getRows,
 			preferredVisibleItems: PREFERRED_VISIBLE_TEAMS,
 			totalItems: this.filteredOptions.length,
-			reservedRows: TEAM_LIST_RESERVED_ROWS,
+			reservedRows: this.reservedRows,
 			comfortableItemRows: 3,
 			compactItemRows: 2,
-			scrollIndicatorRows: TEAM_SCROLL_INDICATOR_ROWS,
+			scrollIndicatorRows: this.criticalShortage ? 0 : TEAM_SCROLL_INDICATOR_ROWS,
 		});
+	}
+
+	private get reservedRows(): number {
+		// The base budget prices the subtitle as one row; pay for the rows it
+		// actually wraps to at the current width instead.
+		if (this.criticalShortage) {
+			return TEAM_LIST_RESERVED_ROWS - 3;
+		}
+		return TEAM_LIST_RESERVED_ROWS - 1 + countWrappedSubtitleRows(TEAM_SUBTITLE, this.lastWidth);
+	}
+
+	/**
+	 * When even one compact item cannot fit under the full chrome, the overlay's
+	 * top-anchored clip would cut the list away entirely; drop the decoration
+	 * (subtitle, search area) and the scroll indicator so one option survives.
+	 */
+	private updateCriticalShortage(width: number): void {
+		const rows = menuViewportRows(this.viewport.getRows);
+		if (rows === undefined) {
+			this.criticalShortage = false;
+			return;
+		}
+		const fullChrome = TEAM_LIST_RESERVED_ROWS - 3 + countWrappedSubtitleRows(TEAM_SUBTITLE, width) + 2;
+		// +2: one compact item (primary + secondary) must fit, or the clip eats the list.
+		this.criticalShortage = rows < fullChrome + 2;
+		this.searchArea.hidden = this.criticalShortage;
 	}
 }

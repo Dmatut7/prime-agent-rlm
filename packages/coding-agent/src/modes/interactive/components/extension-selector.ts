@@ -3,11 +3,19 @@
  * Displays a list of string options with keyboard navigation.
  */
 
-import { Container, getKeybindings, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
+import { Container, getKeybindings, Spacer, Text, TruncatedText, type TUI } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
 import { CountdownTimer } from "./countdown-timer.js";
 import { keyHint, rawKeyHint } from "./keybinding-hints.js";
-import { getMenuListLayout, MenuList, MenuPanel, MenuRow, type MenuViewportProvider } from "./menu-panel.js";
+import {
+	countWrappedSubtitleRows,
+	getMenuListLayout,
+	MenuList,
+	MenuPanel,
+	MenuRow,
+	type MenuViewportProvider,
+} from "./menu-panel.js";
+import { shouldTreatAsBack } from "./modal-back.js";
 
 export interface ExtensionSelectorOptions {
 	tui?: TUI;
@@ -16,10 +24,13 @@ export interface ExtensionSelectorOptions {
 }
 
 const PREFERRED_VISIBLE_OPTIONS = 8;
-const OPTION_LIST_RESERVED_BASE_ROWS = 5;
+// Padding top+bottom, title, the blank under the header, the spacer and the
+// hints line: six fixed rows around the list. (Used to say 5; the panel grew a
+// row while the budget did not, and short terminals lost the last option.)
+const OPTION_LIST_RESERVED_BASE_ROWS = 6;
 const OPTION_SCROLL_INDICATOR_ROWS = 1;
 
-function splitTitleAndDescription(value: string): { title: string; description?: string; descriptionRows: number } {
+function splitTitleAndDescription(value: string): { title: string; description?: string } {
 	const lines = value
 		.split(/\r?\n/)
 		.map((line) => line.trim())
@@ -28,7 +39,6 @@ function splitTitleAndDescription(value: string): { title: string; description?:
 	return {
 		title,
 		description: descriptionLines.length > 0 ? descriptionLines.join("\n") : undefined,
-		descriptionRows: descriptionLines.length,
 	};
 }
 
@@ -39,9 +49,9 @@ export class ExtensionSelectorComponent extends Container {
 	private onSelectCallback: (option: string) => void;
 	private onCancelCallback: () => void;
 	private baseTitle: string;
+	private readonly subtitle: string | undefined;
 	private countdown: CountdownTimer | undefined;
 	private panel: MenuPanel;
-	private readonly reservedRows: number;
 	private listLayout = getMenuListLayout({
 		preferredVisibleItems: PREFERRED_VISIBLE_OPTIONS,
 		reservedRows: OPTION_LIST_RESERVED_BASE_ROWS,
@@ -49,6 +59,8 @@ export class ExtensionSelectorComponent extends Container {
 		compactItemRows: 1,
 	});
 	private readonly viewport: MenuViewportProvider;
+	/** Width of the latest render, so the subtitle's wrapped rows can be budgeted. */
+	private lastWidth = 0;
 
 	constructor(
 		title: string,
@@ -64,7 +76,7 @@ export class ExtensionSelectorComponent extends Container {
 		this.onCancelCallback = onCancel;
 		const header = splitTitleAndDescription(title);
 		this.baseTitle = header.title;
-		this.reservedRows = OPTION_LIST_RESERVED_BASE_ROWS + header.descriptionRows;
+		this.subtitle = header.description;
 		const tui = opts?.tui;
 		this.viewport = { getRows: opts?.getRows ?? (tui ? () => tui.terminal.rows : undefined) };
 
@@ -87,7 +99,9 @@ export class ExtensionSelectorComponent extends Container {
 		this.panel.addChild(this.listContainer);
 		this.panel.addChild(new Spacer(1));
 		this.panel.addChild(
-			new Text(
+			// Truncated, never wrapped: the hints stay one row so the row budget
+			// holds at narrow widths (a wrapping footer used to break it).
+			new TruncatedText(
 				rawKeyHint("↑↓", "移动") +
 					"  " +
 					keyHint("tui.select.confirm", "选择") +
@@ -102,6 +116,7 @@ export class ExtensionSelectorComponent extends Container {
 	}
 
 	override render(width: number): string[] {
+		this.lastWidth = width;
 		const previousLayout = this.listLayout;
 		this.updateLayout();
 		if (
@@ -149,7 +164,7 @@ export class ExtensionSelectorComponent extends Container {
 		} else if (kb.matches(keyData, "tui.select.confirm") || kb.matches(keyData, "tui.input.newLine")) {
 			const selected = this.options[this.selectedIndex];
 			if (selected) this.onSelectCallback(selected);
-		} else if (kb.matches(keyData, "tui.select.cancel")) {
+		} else if (kb.matches(keyData, "tui.select.cancel") || shouldTreatAsBack(keyData)) {
 			this.onCancelCallback();
 		}
 	}
@@ -159,11 +174,13 @@ export class ExtensionSelectorComponent extends Container {
 	}
 
 	private updateLayout(): void {
+		// The subtitle's wrapped rows follow the render width; the list pays for them.
+		const subtitleRows = this.subtitle ? countWrappedSubtitleRows(this.subtitle, this.lastWidth) : 0;
 		this.listLayout = getMenuListLayout({
 			getRows: this.viewport.getRows,
 			preferredVisibleItems: PREFERRED_VISIBLE_OPTIONS,
 			totalItems: this.options.length,
-			reservedRows: this.reservedRows,
+			reservedRows: OPTION_LIST_RESERVED_BASE_ROWS + subtitleRows,
 			comfortableItemRows: 1,
 			compactItemRows: 1,
 			scrollIndicatorRows: OPTION_SCROLL_INDICATOR_ROWS,

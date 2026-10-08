@@ -1,6 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/oauth";
+import { registerOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import type { Component, OverlayHandle, TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -238,5 +240,42 @@ describe("ProviderAuthFlows", () => {
 		expect(output).not.toContain("Anthropic");
 		overlays[0]?.handleInput?.("\x1b");
 		await expect(loginResult).resolves.toEqual({ status: "cancelled" });
+	});
+
+	it("cleans up the nested select overlay when the OAuth flow fails mid-select", async () => {
+		const providerId = `test-select-${Date.now()}`;
+		registerOAuthProvider({
+			id: providerId,
+			name: "Test Select",
+			async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+				// Open the nested selector, then die while it is on screen.
+				void callbacks.onSelect?.({ message: "Pick one", options: [{ id: "a", label: "A" }] });
+				throw new Error("IdP exploded");
+			},
+			async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+				return credentials;
+			},
+			getApiKey: () => "key",
+		});
+		const authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
+		const { host, overlays } = createHost(authStorage);
+		const handles: OverlayHandle[] = [];
+		const originalShowOverlay = host.ui.showOverlay.bind(host.ui);
+		host.ui.showOverlay = vi.fn((component: Component) => {
+			const handle = originalShowOverlay(component);
+			handles.push(handle);
+			return handle;
+		});
+
+		const result = await new ProviderAuthFlows(host).loginProvider({
+			id: providerId,
+			name: "Test Select",
+			authType: "oauth",
+		});
+
+		expect(result.status).toBe("failed");
+		// [0] is the login dialog, [1] the nested selector: both must be gone.
+		expect(overlays).toHaveLength(2);
+		expect(handles[1]?.hide).toHaveBeenCalled();
 	});
 });

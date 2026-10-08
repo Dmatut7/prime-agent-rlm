@@ -84,6 +84,16 @@ export class CustomMessageComponent extends Container {
 			text = "[malformed message: no readable content]";
 		}
 
+		// Producers wrap the content in <customType>…</customType> for the model;
+		// the box already labels itself [customType], so the tags are noise here.
+		const customType = this.message.customType;
+		const openTag = `<${customType}>`;
+		const closeTag = `</${customType}>`;
+		const trimmed = text.trim();
+		if (trimmed.startsWith(openTag) && trimmed.endsWith(closeTag)) {
+			text = trimmed.slice(openTag.length, trimmed.length - closeTag.length).trim();
+		}
+
 		this.box.addChild(
 			new Markdown(text, 0, 0, this.markdownTheme, {
 				color: (text: string) => theme.fg("customMessageText", text),

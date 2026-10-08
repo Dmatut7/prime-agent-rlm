@@ -176,6 +176,13 @@ describe("slash command aliases", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((c) => c.name === "speed")?.takesArgument).toBe(true);
 	});
 
+	test("marks /compact and /refine as argument commands so the popup does not bare-execute them", () => {
+		// Both take free-form instructions (and /refine a rollback subcommand);
+		// without takesArgument, Enter in the autocomplete popup ran them bare.
+		expect(builtinSlashCommandTakesArgument("compact")).toBe(true);
+		expect(builtinSlashCommandTakesArgument("refine")).toBe(true);
+	});
+
 	test("resolves /clear to /new through the alias path", () => {
 		const parsed = parseSlashCommand("/clear");
 

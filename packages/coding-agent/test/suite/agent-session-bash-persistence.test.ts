@@ -20,6 +20,32 @@ describe("AgentSession bash and persistence characterization", () => {
 		}
 	});
 
+	it("washes extension-provided user_bash output before emitting it", async () => {
+		// The executor washes its own chunks; an extension returning a full result
+		// used to bypass that and push raw control bytes into every attached pane.
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("user_bash", async () => ({
+						result: { output: "done \x1b[2J\x07 ok", exitCode: 0, cancelled: false, truncated: false },
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		const chunks: string[] = [];
+		harness.session.subscribe((event) => {
+			if (event.type === "bash_output") chunks.push(event.chunk);
+		});
+
+		await harness.session.runUserBash("anything");
+
+		const output = chunks.join("");
+		expect(output).not.toContain("\x1b[2J");
+		expect(output).not.toContain("\x07");
+		expect(output).toContain("done  ok");
+	});
+
 	it("records bash results immediately while idle", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

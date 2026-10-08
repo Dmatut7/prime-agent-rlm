@@ -19,6 +19,7 @@ import type {
 } from "../../../core/settings-manager.js";
 import { getSelectListTheme, getSettingsListTheme, theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
+import { shouldTreatAsBack } from "./modal-back.js";
 
 const SETTINGS_SUBMENU_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 	minPrimaryColumnWidth: 12,
@@ -140,6 +141,8 @@ export interface SettingsConfig {
 	warnings: WarningSettings;
 	/** Panel item ids pinned by the project layer (see projectPinnedSettingItems); their rows carry a hint. */
 	projectPinnedItems?: ReadonlySet<string>;
+	/** Terminal row count source; the list length adapts to short terminals instead of hardcoding 10. */
+	getRows?: () => number;
 }
 
 export interface SettingsCallbacks {
@@ -178,7 +181,11 @@ class WarningSettingsSubmenu extends Container {
 	private settingsList: SettingsList;
 	private state: WarningSettings;
 
-	constructor(warnings: WarningSettings, onChange: (warnings: WarningSettings) => void, onCancel: () => void) {
+	constructor(
+		warnings: WarningSettings,
+		onChange: (warnings: WarningSettings) => void,
+		private readonly onCancel: () => void,
+	) {
 		super();
 
 		this.state = { ...warnings };
@@ -213,6 +220,11 @@ class WarningSettingsSubmenu extends Container {
 	}
 
 	handleInput(data: string): void {
+		// No text field here: left is back, like every other submenu.
+		if (shouldTreatAsBack(data)) {
+			this.onCancel();
+			return;
+		}
 		this.settingsList.handleInput(data);
 	}
 }
@@ -271,6 +283,11 @@ class SelectSubmenu extends Container {
 	}
 
 	handleInput(data: string): void {
+		// No text field here: left is back, like every other submenu.
+		if (shouldTreatAsBack(data)) {
+			this.selectList.onCancel?.();
+			return;
+		}
 		this.selectList.handleInput(data);
 	}
 }
@@ -567,9 +584,19 @@ export class SettingsSelectorComponent extends Container {
 
 		this.addChild(new DynamicBorder());
 
+		// Chrome around the list: search field + blank, scroll indicator, the
+		// description block (blank + capped rows), blank + hint, both borders.
+		// The list length adapts to the terminal instead of forcing a crop.
+		const SETTINGS_LIST_CHROME_ROWS = 12;
+		const terminalRows = config.getRows?.();
+		const maxVisible =
+			terminalRows !== undefined && Number.isFinite(terminalRows) && terminalRows > 0
+				? Math.max(3, Math.min(10, Math.floor(terminalRows) - SETTINGS_LIST_CHROME_ROWS))
+				: 10;
+
 		this.settingsList = new SettingsList(
 			items,
-			10,
+			maxVisible,
 			getSettingsListTheme(),
 			(id, newValue) => {
 				switch (id) {

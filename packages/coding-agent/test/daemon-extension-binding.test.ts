@@ -432,4 +432,50 @@ describe("daemon extension binding", () => {
 
 		expect(dismissalsOf(outbound)).toHaveLength(0);
 	});
+
+	it("marks daemon pasteToEditor as an insert, keeping setEditorText a replace", async () => {
+		const runtime = await createRuntimeForTest(
+			(pi) => {
+				pi.registerCommand("paste-probe", {
+					description: "paste probe",
+					handler: async (_args, ctx) => {
+						ctx.ui.pasteToEditor("insert me");
+						ctx.ui.setEditorText("replace all");
+					},
+				});
+			},
+			["done"],
+		);
+
+		const outbound: DaemonOutbound[] = [];
+		const state: ActiveSessionState = {
+			activeSessionId: "active-paste",
+			runtime,
+			clients: new Set(),
+			pendingAttaches: 0,
+			extensionUiRequests: new Map(),
+			eventGeneration: "generation-paste",
+			lastEventSequence: 0,
+		};
+		await bindActiveSessionState(state, {
+			broadcast: (_state, message) => {
+				outbound.push(message);
+			},
+			shutdown: () => {},
+		});
+
+		await runtime.session.prompt("/paste-probe");
+
+		// pasteToEditor mapped to a wholesale draft replace: a paste must insert at
+		// the cursor (the in-process binding pastes through the editor's bracketed
+		// path); the wire flag carries that intent and old clients keep replacing.
+		const writes = outbound.filter(
+			(message): message is Extract<DaemonOutbound, { type: "extension_ui_request" }> =>
+				message.type === "extension_ui_request" && message.method === "setEditorText",
+		);
+		expect(writes).toHaveLength(2);
+		expect(writes[0]!.payload).toMatchObject({ text: "insert me", insert: true });
+		expect(writes[1]!.payload).toMatchObject({ text: "replace all" });
+		expect(writes[1]!.payload).not.toHaveProperty("insert");
+	});
 });

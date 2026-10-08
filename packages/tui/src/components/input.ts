@@ -4,7 +4,15 @@ import { KillRing } from "../kill-ring.js";
 import { BULK_TEXT_MIN_RUN } from "../stdin-buffer.js";
 import { type Component, CURSOR_MARKER, type Focusable } from "../tui.js";
 import { UndoStack } from "../undo-stack.js";
-import { getSegmenter, isPunctuationChar, isWhitespaceChar, sliceByColumn, stripAnsi, visibleWidth } from "../utils.js";
+import {
+	getSegmenter,
+	isPunctuationChar,
+	isWhitespaceChar,
+	sliceByColumn,
+	stripAnsi,
+	truncateToWidth,
+	visibleWidth,
+} from "../utils.js";
 
 const segmenter = getSegmenter();
 
@@ -25,6 +33,8 @@ interface InputState {
 export class Input implements Component, Focusable {
 	private value: string = "";
 	private cursor: number = 0; // Cursor position in the value
+	private placeholder: string | undefined;
+
 	public onSubmit?: (value: string) => void;
 	public onEscape?: () => void;
 
@@ -49,6 +59,11 @@ export class Input implements Component, Focusable {
 	setValue(value: string): void {
 		this.value = value;
 		this.cursor = Math.min(this.cursor, value.length);
+	}
+
+	/** Hint shown in dim while the value is empty; the cursor still leads the row. */
+	setPlaceholder(placeholder: string | undefined): void {
+		this.placeholder = placeholder;
 	}
 
 	handleInput(data: string): void {
@@ -486,7 +501,15 @@ export class Input implements Component, Focusable {
 		const marker = this.focused ? CURSOR_MARKER : "";
 
 		const cursorChar = `\x1b[7m${atCursor}\x1b[27m`; // ESC[7m = reverse video, ESC[27m = normal
-		const textWithCursor = beforeCursor + marker + cursorChar + afterCursor;
+		let textWithCursor = beforeCursor + marker + cursorChar + afterCursor;
+
+		if (this.value === "" && this.placeholder) {
+			const placeholderBudget = Math.max(0, availableWidth - visibleWidth(textWithCursor));
+			const hint = truncateToWidth(this.placeholder, placeholderBudget, "");
+			if (hint) {
+				textWithCursor += `\x1b[2m${hint}\x1b[22m`;
+			}
+		}
 
 		const visualLength = visibleWidth(textWithCursor);
 		const padding = " ".repeat(Math.max(0, availableWidth - visualLength));

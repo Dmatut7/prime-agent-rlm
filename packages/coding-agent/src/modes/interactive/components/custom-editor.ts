@@ -226,8 +226,11 @@ export class CustomEditor extends Editor {
 	}
 
 	setPlaceholder(placeholder: string | undefined): void {
+		if (this.placeholder === placeholder) return;
 		this.placeholder = placeholder;
-		this.invalidate();
+		// The base invalidate() is a no-op; the hint must repaint now, not on the
+		// next unrelated tick.
+		this.tui.requestRender();
 	}
 
 	handleInput(data: string): void {
@@ -384,13 +387,16 @@ export class CustomEditor extends Editor {
 		const promptLeadingPadding = " ".repeat(promptPrefixInset);
 		const promptTrailingPadding = " ".repeat(Math.max(0, paddingX - promptPrefixInset));
 		const rightPadding = " ".repeat(paddingX);
-		const placeholderWidth = Math.max(0, inputWidth - 1);
+		// Same rule as the body line: with padding the caret overflows into it, so
+		// the text gets the full input width; without padding we reserve a column.
+		const placeholderWidth = Math.max(0, inputWidth - (paddingX > 0 ? 0 : 1));
 		const placeholderText = truncateToWidth(this.placeholder ?? "", placeholderWidth, "");
 		const cursorMarker = this.focused && !this.isShowingAutocomplete() ? CURSOR_MARKER : "";
 		const cursorReset = this.backgroundColor ? "\x1b[27m" : "\x1b[0m";
 		const displayText = `${cursorMarker}\x1b[7m ${cursorReset}${this.placeholderColor(placeholderText)}`;
 		const padding = " ".repeat(Math.max(0, placeholderWidth - visibleWidth(placeholderText)));
-		const line = `${promptLeadingPadding}${promptPrefix}${promptTrailingPadding}${displayText}${padding}${rightPadding}`;
+		const lineRightPadding = paddingX > 0 ? rightPadding.slice(1) : rightPadding;
+		const line = `${promptLeadingPadding}${promptPrefix}${promptTrailingPadding}${displayText}${padding}${lineRightPadding}`;
 		const padded = line + " ".repeat(Math.max(0, width - visibleWidth(line)));
 		return this.getAutocompleteAnchorMarker() + (this.backgroundColor ? this.backgroundColor(padded) : padded);
 	}

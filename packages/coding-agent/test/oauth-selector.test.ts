@@ -1,4 +1,4 @@
-import { setKeybindings } from "@earendil-works/pi-tui";
+import { type Component, setKeybindings } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { type AuthStatus, AuthStorage } from "../src/core/auth-storage.js";
@@ -486,5 +486,104 @@ describe("OAuthSelectorComponent", () => {
 
 		const output = stripAnsi(selector.render(120).join("\n"));
 		expect(output).not.toContain("←/→ 切换");
+	});
+
+	it("counts a wrapped subtitle against the list row budget", () => {
+		const providers = Array.from({ length: 8 }, (_, index) => ({
+			id: `p${index}`,
+			name: `Provider ${index}`,
+			authType: "api_key" as const,
+		}));
+		const selector = new OAuthSelectorComponent(
+			"login",
+			AuthStorage.inMemory(),
+			providers,
+			() => {},
+			() => {},
+			undefined,
+			{ getRows: () => 14, title: "连接", subtitle: "x".repeat(60) },
+		);
+
+		const lines = selector.render(30);
+
+		// The subtitle wraps to 3 rows at this width; paying for only the one
+		// logical line overflows the terminal and the overlay clips the list.
+		expect(lines.length).toBeLessThanOrEqual(14);
+		expect(stripAnsi(lines.join("\n"))).toContain("Provider 0");
+	});
+
+	it("treats left as back while the search field is empty, and as cursor movement with text", () => {
+		let cancelled = 0;
+		const selector = new OAuthSelectorComponent(
+			"login",
+			AuthStorage.inMemory(),
+			[{ id: "anthropic", name: "Anthropic", authType: "oauth" }],
+			() => {},
+			() => {
+				cancelled++;
+			},
+			undefined,
+			{ getRows: () => 24 },
+		);
+
+		selector.handleInput("a");
+		const cursorBefore = selector.getSearchInput().getCursor();
+		selector.handleInput("\x1b[D"); // left with text: cursor moves, no cancel
+		expect(cancelled).toBe(0);
+		expect(selector.getSearchInput().getCursor()).toBe(cursorBefore - 1);
+
+		selector.getSearchInput().setValue("");
+		selector.handleInput("\x1b[D"); // empty search: left is back
+		expect(cancelled).toBe(1);
+	});
+
+	it("keeps one option visible on an 8-row terminal by collapsing decoration", () => {
+		// With the tab bar the chrome alone used to eat the whole viewport and the
+		// overlay's top-anchored clip cut the list entirely.
+		const tabBar: Component = {
+			render: (width: number) => ["[模型服务] [模型] [MCP 连接]".slice(0, width)],
+			invalidate: () => {},
+		};
+		const providers = Array.from({ length: 6 }, (_, index) => ({
+			id: `p${index}`,
+			name: `Provider ${index}`,
+			authType: "api_key" as const,
+		}));
+		const selector = new OAuthSelectorComponent(
+			"login",
+			AuthStorage.inMemory(),
+			providers,
+			() => {},
+			() => {},
+			undefined,
+			{ getRows: () => 8, header: tabBar, getHeaderRows: () => 2 },
+		);
+
+		const lines = selector.render(80);
+
+		// The overlay clips from the bottom: the option must be inside the visible
+		// rows, and anything past the viewport is the panel's blank padding.
+		const visible = lines.slice(0, 8);
+		expect(stripAnsi(visible.join("\n"))).toContain("Provider 0");
+		for (const extra of lines.slice(8)) {
+			expect(stripAnsi(extra).trim()).toBe("");
+		}
+	});
+
+	it("badges a disabled entry as off even when a credential exists", () => {
+		const selector = new OAuthSelectorComponent(
+			"login",
+			AuthStorage.inMemory(),
+			[{ id: "mcp:linear", name: "Linear", authType: "oauth", category: "service" }],
+			() => {},
+			() => {},
+			() => ({ configured: true, source: "stored" }),
+			{ getRows: () => 24, isEntryDisabled: () => true },
+		);
+
+		const output = stripAnsi(selector.render(100).join("\n"));
+
+		expect(output).toContain("已停用");
+		expect(output).not.toContain("已配置");
 	});
 });

@@ -12,6 +12,7 @@ import {
 } from "@earendil-works/pi-tui";
 import type { KeybindingsManager } from "../../../core/keybindings.js";
 import { createPrivateTempFile, readPrivateFile } from "../../../utils/private-files.js";
+import { splitShellWords } from "../../../utils/shell.js";
 import { getEditorTheme, theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { keyHint } from "./keybinding-hints.js";
@@ -101,15 +102,24 @@ export class ExtensionEditorComponent extends Container implements Focusable {
 			return;
 		}
 
+		// Shell words, not a raw space split: a quoted path with spaces
+		// ("/Applications/My Editor.app/bin/edit") is one argv word.
+		const editorWords = splitShellWords(editorCmd);
+		const editor = editorWords[0];
+		if (!editor) {
+			this.showErrorLine("编辑器命令为空。请检查 $VISUAL 或 $EDITOR 环境变量。");
+			return;
+		}
+
 		const currentText = this.editor.getText();
 		const temp = createPrivateTempFile("pi-extension-editor-", ".md", currentText);
 		const tmpFile = temp.path;
+		let spawnFailure: string | undefined;
 
 		try {
 			this.tui.stop();
 
-			const [editor, ...editorArgs] = editorCmd.split(" ");
-			const result = spawnSync(editor, [...editorArgs, tmpFile], {
+			const result = spawnSync(editor, [...editorWords.slice(1), tmpFile], {
 				stdio: "inherit",
 				shell: process.platform === "win32",
 			});
@@ -117,6 +127,10 @@ export class ExtensionEditorComponent extends Container implements Focusable {
 			if (result.status === 0) {
 				const newContent = readPrivateFile(tmpFile, "utf-8").replace(/\n$/, "");
 				this.editor.setText(newContent);
+			} else if (result.error) {
+				// The editor never ran (bad path, ENOENT): say so instead of failing
+				// silently. A non-zero exit is the editor's own "abort" and stays quiet.
+				spawnFailure = `外部编辑器没能启动：${result.error.message}`;
 			}
 		} finally {
 			try {
@@ -127,5 +141,18 @@ export class ExtensionEditorComponent extends Container implements Focusable {
 				this.tui.requestRender(true);
 			}
 		}
+
+		if (spawnFailure) {
+			this.showErrorLine(spawnFailure);
+		}
+	}
+
+	/** An error row above the bottom border; the dialog stays open with the draft intact. */
+	private showErrorLine(message: string): void {
+		const bottom = this.children.at(-1);
+		if (bottom) this.removeChild(bottom);
+		this.addChild(new Text(theme.fg("error", message), 1, 0));
+		if (bottom) this.addChild(bottom);
+		this.tui.requestRender();
 	}
 }

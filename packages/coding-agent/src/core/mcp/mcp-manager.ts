@@ -251,14 +251,4 @@ export class McpManager {
 			.map((integration) => integration.server)
 			.sort((left, right) => left.localeCompare(right));
 	}
-
-	/** Status for the /mcp list command. */
-	listStatus(): Array<{ server: string; label: string; enabled: boolean; usesOAuth: boolean }> {
-		return Array.from(this.integrations.values()).map((integration) => ({
-			server: integration.server,
-			label: integration.label,
-			enabled: this.isAuthed(integration),
-			usesOAuth: integration.usesOAuth,
-		}));
-	}
 }

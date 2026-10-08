@@ -625,6 +625,35 @@ describe("CombinedAutocompleteProvider", () => {
 			const values = result?.items.map((item) => item.value);
 			assert.ok(values?.includes("./src/"), `Expected ./src/ in ${JSON.stringify(values)}`);
 		});
+
+		test("skips file names carrying control characters", async () => {
+			// A name with a BEL or ESC in it is legal on the filesystem; its bytes
+			// would be re-emitted into the popup (and into the draft) on every render.
+			setupFolder(baseDir, {
+				files: {
+					"evil\x07name.txt": "x",
+					"esc\x1b[2Jape.txt": "x",
+					"even.ts": "x",
+				},
+			});
+
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "./ev";
+			const result = await getSuggestions(provider, [line], 0, line.length, true);
+
+			assert.notEqual(result, null, "Should return suggestions for ./ path");
+			const flat = (result?.items ?? []).flatMap((item) => [item.value, item.label]);
+			assert.ok(
+				flat.some((text) => text.includes("even.ts")),
+				`expected ./even.ts in ${JSON.stringify(flat)}`,
+			);
+			for (const text of flat) {
+				assert.ok(
+					!/[\x00-\x1f\x7f-\x9f]/.test(text),
+					`completion candidate must not carry control characters, got ${JSON.stringify(text)}`,
+				);
+			}
+		});
 	});
 
 	describe("quoted path completion", () => {

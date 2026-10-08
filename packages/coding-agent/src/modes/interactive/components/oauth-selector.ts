@@ -11,13 +11,17 @@ import type { AuthStatus, AuthStorage } from "../../../core/auth-storage.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "../../../core/prime-inference-auth.js";
 import { theme } from "../theme/theme.js";
 import {
+	CollapsibleMenuArea,
+	countWrappedSubtitleRows,
 	getMenuListLayout,
 	MenuList,
 	MenuPanel,
 	MenuRow,
 	MenuSearchInput,
 	type MenuViewportProvider,
+	menuViewportRows,
 } from "./menu-panel.js";
+import { shouldTreatAsBack } from "./modal-back.js";
 
 export type AuthSelectorCategory = "provider" | "service";
 
@@ -36,6 +40,8 @@ export interface OAuthSelectorOptions extends MenuViewportProvider {
 	title?: string;
 	subtitle?: string;
 	searchPlaceholder?: string;
+	/** Entries this predicate marks are badged as switched off, whatever their credential state. */
+	isEntryDisabled?: (provider: AuthSelectorProvider) => boolean;
 }
 
 export function compareAuthSelectorProviders(a: AuthSelectorProvider, b: AuthSelectorProvider): number {
@@ -66,6 +72,9 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 
 	private listContainer: Container;
 	private tabBar?: TruncatedText;
+	private readonly searchArea: CollapsibleMenuArea;
+	/** True when the terminal is too short for the full chrome; the search area and subtitle drop out. */
+	private criticalShortage = false;
 	private allProviders: AuthSelectorProvider[];
 	private filteredProviders: AuthSelectorProvider[];
 	private selectedIndex: number = 0;
@@ -85,7 +94,11 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		compactItemRows: 2,
 	});
 	private readonly viewport: MenuViewportProvider;
+	private readonly options: OAuthSelectorOptions;
 	private readonly getHeaderRows: () => number;
+	private readonly subtitle: string;
+	/** Width of the latest render, so the subtitle's wrapped rows can be budgeted. */
+	private lastWidth = 0;
 
 	constructor(
 		mode: "login" | "logout",
@@ -102,6 +115,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		this.authStorage = authStorage;
 		this.getAuthStatus = getAuthStatus ?? ((providerId) => this.authStorage.getAuthStatus(providerId));
 		this.viewport = options;
+		this.options = options;
 		this.getHeaderRows = options.header ? (options.getHeaderRows ?? (() => TAB_BAR_RESERVED_ROWS)) : () => 0;
 		this.allProviders = this.sortProviders(providers);
 		this.filteredProviders = this.allProviders;
@@ -115,9 +129,10 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 				? options.initialCategory
 				: (this.categories[0] ?? "provider");
 
+		this.subtitle = options.subtitle ?? (mode === "login" ? "用订阅账号或 API key 连接。" : "选择要移除的凭据。");
 		const panel = new MenuPanel({
 			title: options.title ?? (mode === "login" ? "模型服务" : "已保存的凭据"),
-			subtitle: options.subtitle ?? (mode === "login" ? "用订阅账号或 API key 连接。" : "选择要移除的凭据。"),
+			subtitle: () => (this.criticalShortage ? undefined : this.subtitle),
 		});
 		this.addChild(panel);
 		if (options.header) {
@@ -138,8 +153,10 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 				this.onSelectCallback(selectedProvider);
 			}
 		};
-		panel.addChild(this.searchInput);
-		panel.addChild(new Spacer(1));
+		this.searchArea = new CollapsibleMenuArea();
+		this.searchArea.addChild(this.searchInput);
+		this.searchArea.addChild(new Spacer(1));
+		panel.addChild(this.searchArea);
 
 		this.listContainer = new MenuList({ compact: () => this.listLayout.compact });
 		panel.addChild(this.listContainer);
@@ -262,6 +279,8 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 	}
 
 	override render(width: number): string[] {
+		this.lastWidth = width;
+		this.updateCriticalShortage(width);
 		const previousLayout = this.listLayout;
 		this.updateLayout();
 		if (
@@ -290,11 +309,12 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 
 			const isSelected = i === this.selectedIndex;
 
+			const disabled = this.options.isEntryDisabled?.(provider) === true;
 			this.listContainer.addChild(
 				new MenuRow({
 					primary: provider.name,
 					secondary: provider.authType === "oauth" ? "订阅" : "API key",
-					meta: this.formatStatusIndicator(provider),
+					meta: disabled ? theme.fg("muted", "已停用") : this.formatStatusIndicator(provider),
 					selected: isSelected,
 				}),
 			);
@@ -388,16 +408,43 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			if (selectedProvider) {
 				this.onSelectCallback(selectedProvider);
 			}
-		} else if (kb.matches(keyData, "tui.select.cancel")) {
+		} else if (kb.matches(keyData, "tui.select.cancel") || shouldTreatAsBack(keyData, this.searchInput)) {
 			this.onCancelCallback();
-		} else {
+		} else if (!this.criticalShortage) {
+			// The search field is hidden at critical shortage; don't type into it blind.
 			this.searchInput.handleInput(keyData);
 			this.filterProviders(this.searchInput.getValue());
 		}
 	}
 
 	private get reservedRows(): number {
-		return PROVIDER_LIST_RESERVED_ROWS + this.getHeaderRows() + (this.tabBar ? TAB_BAR_RESERVED_ROWS : 0);
+		// PROVIDER_LIST_RESERVED_ROWS prices the subtitle as one row and the search
+		// area as two; pay for what is actually on screen at the current width.
+		const headerRows = this.getHeaderRows() + (this.tabBar ? TAB_BAR_RESERVED_ROWS : 0);
+		if (this.criticalShortage) {
+			return PROVIDER_LIST_RESERVED_ROWS - 3 + headerRows;
+		}
+		const subtitleRows = countWrappedSubtitleRows(this.subtitle, this.lastWidth);
+		return PROVIDER_LIST_RESERVED_ROWS - 1 + subtitleRows + headerRows;
+	}
+
+	/**
+	 * When even one compact item cannot fit under the full chrome, the overlay's
+	 * top-anchored clip would cut the list away entirely; drop the decoration
+	 * (subtitle, search area) and the scroll indicator so one option survives.
+	 */
+	private updateCriticalShortage(width: number): void {
+		const rows = menuViewportRows(this.viewport.getRows);
+		if (rows === undefined) {
+			this.criticalShortage = false;
+			return;
+		}
+		const headerRows = this.getHeaderRows() + (this.tabBar ? TAB_BAR_RESERVED_ROWS : 0);
+		const baseChrome = PROVIDER_LIST_RESERVED_ROWS - 3 + headerRows; // without the subtitle row and the 2-row search area
+		const fullChrome = baseChrome + countWrappedSubtitleRows(this.subtitle, width) + 2;
+		// +2: one compact item (primary + secondary) must fit, or the clip eats the list.
+		this.criticalShortage = rows < fullChrome + 2;
+		this.searchArea.hidden = this.criticalShortage;
 	}
 
 	private updateLayout(): void {
@@ -408,7 +455,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			reservedRows: this.reservedRows,
 			comfortableItemRows: 3,
 			compactItemRows: 2,
-			scrollIndicatorRows: PROVIDER_SCROLL_INDICATOR_ROWS,
+			scrollIndicatorRows: this.criticalShortage ? 0 : PROVIDER_SCROLL_INDICATOR_ROWS,
 		});
 	}
 }

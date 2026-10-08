@@ -53,11 +53,13 @@ import {
 	resetProviderRequestBudget,
 	supportsFastMode,
 } from "@earendil-works/pi-ai";
+import stripAnsi from "strip-ansi";
 import { theme } from "../modes/interactive/theme/theme.js";
 import { untilAborted, type WaitTimeoutFacts } from "../utils/bounded-wait.js";
 import { sanitizeRowText } from "../utils/display-text.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { ensurePrivateDirectory, writePrivateFileAtomic } from "../utils/private-files.js";
+import { sanitizeBinaryOutput } from "../utils/shell.js";
 import { sleep } from "../utils/sleep.js";
 import {
 	AGENT_MESSAGE_CUSTOM_TYPE,
@@ -17564,7 +17566,15 @@ export class AgentSession {
 		try {
 			// If an extension returned a full result, surface it without executing
 			if (eventResult?.result) {
-				const result = eventResult.result;
+				const extensionResult = eventResult.result;
+				// The executor washes its own stream (stripAnsi + sanitizeBinaryOutput);
+				// extension-supplied output must meet the same bar before emit or persist.
+				const result = extensionResult.output
+					? {
+							...extensionResult,
+							output: sanitizeBinaryOutput(stripAnsi(extensionResult.output)).replace(/\r/g, ""),
+						}
+					: extensionResult;
 				if (result.output) {
 					this._emit({ type: "bash_output", chunk: result.output });
 				}

@@ -557,7 +557,7 @@ export class TUI extends Container {
 	private focusOrderCounter = 0;
 	private overlayStack: {
 		component: Component;
-		options?: OverlayOptions;
+		options?: OverlayOptions | (() => OverlayOptions | undefined);
 		preFocus: Component | null;
 		hidden: boolean;
 		focusOrder: number;
@@ -628,8 +628,10 @@ export class TUI extends Container {
 	/**
 	 * Show an overlay component with configurable positioning and sizing.
 	 * Returns a handle to control the overlay's visibility.
+	 * A function is re-evaluated on every render, so geometry and visibility can
+	 * follow live state.
 	 */
-	showOverlay(component: Component, options?: OverlayOptions): OverlayHandle {
+	showOverlay(component: Component, options?: OverlayOptions | (() => OverlayOptions | undefined)): OverlayHandle {
 		const entry = {
 			component,
 			options,
@@ -642,7 +644,7 @@ export class TUI extends Container {
 		};
 		this.overlayStack.push(entry);
 		// Only focus if overlay is actually visible
-		if (!options?.nonCapturing && this.isOverlayVisible(entry)) {
+		if (!this.resolveOverlayOptions(options)?.nonCapturing && this.isOverlayVisible(entry)) {
 			this.setFocus(component);
 		}
 		this.syncFullscreenMouseTracking();
@@ -677,7 +679,7 @@ export class TUI extends Container {
 					}
 				} else {
 					// Restore focus to this overlay when showing (if it's actually visible)
-					if (!options?.nonCapturing && this.isOverlayVisible(entry)) {
+					if (!this.resolveOverlayOptions(options)?.nonCapturing && this.isOverlayVisible(entry)) {
 						entry.focusOrder = ++this.focusOrderCounter;
 						this.setFocus(component);
 					}
@@ -734,11 +736,19 @@ export class TUI extends Container {
 		return this.focusedComponent;
 	}
 
+	/** Resolve static or per-frame overlay options to a current snapshot. */
+	private resolveOverlayOptions(
+		options: OverlayOptions | (() => OverlayOptions | undefined) | undefined,
+	): OverlayOptions | undefined {
+		return typeof options === "function" ? options() : options;
+	}
+
 	/** Check if an overlay entry is currently visible */
 	private isOverlayVisible(entry: (typeof this.overlayStack)[number]): boolean {
 		if (entry.hidden) return false;
-		if (entry.options?.visible) {
-			return entry.options.visible(this.terminal.columns, this.terminal.rows);
+		const options = this.resolveOverlayOptions(entry.options);
+		if (options?.visible) {
+			return options.visible(this.terminal.columns, this.terminal.rows);
 		}
 		return true;
 	}
@@ -746,7 +756,7 @@ export class TUI extends Container {
 	/** Find the topmost visible capturing overlay, if any */
 	private getTopmostVisibleOverlay(): (typeof this.overlayStack)[number] | undefined {
 		for (let i = this.overlayStack.length - 1; i >= 0; i--) {
-			if (this.overlayStack[i].options?.nonCapturing) continue;
+			if (this.resolveOverlayOptions(this.overlayStack[i].options)?.nonCapturing) continue;
 			if (this.isOverlayVisible(this.overlayStack[i])) {
 				return this.overlayStack[i];
 			}
@@ -757,7 +767,8 @@ export class TUI extends Container {
 	private shouldEnableFullscreenMouseTracking(): boolean {
 		if (!this.fullscreen?.mouse) return false;
 		return !this.overlayStack.some(
-			(entry) => entry.options?.suspendFullscreenMouse === true && this.isOverlayVisible(entry),
+			(entry) =>
+				this.resolveOverlayOptions(entry.options)?.suspendFullscreenMouse === true && this.isOverlayVisible(entry),
 		);
 	}
 
@@ -1712,7 +1723,8 @@ export class TUI extends Container {
 		const visibleEntries = this.overlayStack.filter((e) => this.isOverlayVisible(e));
 		visibleEntries.sort((a, b) => a.focusOrder - b.focusOrder);
 		for (const entry of visibleEntries) {
-			const { component, options } = entry;
+			const { component } = entry;
+			const options = this.resolveOverlayOptions(entry.options);
 			const scrollback = options?.scrollback === true;
 			let aboveMarker: { line: number; col: number; offsetY: number } | undefined;
 			if (options?.aboveMarker) {

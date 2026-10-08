@@ -144,4 +144,39 @@ describe("ConfigSelectorComponent", () => {
 		const onDisk = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
 		expect(onDisk.skills).toEqual(["+skills/alpha/SKILL.md"]);
 	});
+
+	it("header hints follow the keybinding registry instead of hardcoded keys", () => {
+		setKeybindings(new KeybindingsManager({ "tui.select.confirm": "f6" }));
+		const component = createSelector();
+
+		const output = renderText(component);
+
+		expect(output).toContain("F6 toggle");
+		expect(output).not.toContain("Enter toggle");
+	});
+
+	it("treats left as back while the filter is empty, and as cursor movement with text", () => {
+		let closed = 0;
+		manager = SettingsManager.create(projectDir, agentDir);
+		const component = new ConfigSelectorComponent(
+			resolvedPaths,
+			manager,
+			projectDir,
+			agentDir,
+			() => closed++,
+			() => {},
+			() => {},
+		);
+		const list = component.getResourceList();
+
+		list.handleInput("a");
+		const cursorWithText = list.getSearchInput().getCursor();
+		list.handleInput("\x1b[D"); // left with filter text: cursor moves, no close
+		expect(closed).toBe(0);
+		expect(list.getSearchInput().getCursor()).toBe(cursorWithText - 1);
+
+		list.getSearchInput().setValue("");
+		list.handleInput("\x1b[D"); // empty filter: left is back
+		expect(closed).toBe(1);
+	});
 });

@@ -18,7 +18,8 @@ import type { PathMetadata, ResolvedPaths, ResolvedResource } from "../../../cor
 import type { PackageSource, SettingsManager } from "../../../core/settings-manager.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
-import { rawKeyHint } from "./keybinding-hints.js";
+import { keyHint } from "./keybinding-hints.js";
+import { shouldTreatAsBack } from "./modal-back.js";
 
 type ResourceType = "extensions" | "skills" | "prompts" | "themes";
 
@@ -162,7 +163,7 @@ class ConfigSelectorHeader implements Component {
 	render(width: number): string[] {
 		const title = "Resource Configuration";
 		const sep = theme.fg("muted", " · ");
-		const hint = rawKeyHint("enter", "toggle") + sep + rawKeyHint("esc", "close");
+		const hint = keyHint("tui.select.confirm", "toggle") + sep + keyHint("tui.select.cancel", "close");
 		const hintWidth = visibleWidth(hint);
 		const titleWidth = visibleWidth(title);
 		const spacing = Math.max(1, width - titleWidth - hintWidth);
@@ -308,6 +309,10 @@ class ResourceList implements Component, Focusable {
 		}
 	}
 
+	getSearchInput(): Input {
+		return this.searchInput;
+	}
+
 	invalidate(): void {}
 
 	render(width: number): string[] {
@@ -399,7 +404,7 @@ class ResourceList implements Component, Focusable {
 			}
 			return;
 		}
-		if (kb.matches(data, "tui.select.cancel")) {
+		if (kb.matches(data, "tui.select.cancel") || shouldTreatAsBack(data, this.searchInput)) {
 			this.onCancel?.();
 			return;
 		}

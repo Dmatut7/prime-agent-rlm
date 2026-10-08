@@ -1,0 +1,6 @@
+- Fixed the settings list squeezing the value out on over-wide labels (the label now truncates) and capped the selected item's wrapped description so it cannot push the list past the dock's row budget.
+- Added placeholder support to the single-line `Input` (dim hint behind the cursor while empty); selector search fields now show their placeholder while focused instead of never.
+- Fixed slash-command completion context to split on the same whitespace class as the executor, so an NBSP between command and argument no longer kills completion.
+- Fixed file-name completions with control characters (a legal-but-hostile filename no longer lands in the popup or the draft).
+- Fixed `showOverlay` to re-evaluate function-valued options on every render, as the extension API documents.
+- Removed the dead `SettingsList.updateValue` API (no callers).

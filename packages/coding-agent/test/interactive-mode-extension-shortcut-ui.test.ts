@@ -8,7 +8,7 @@ function createOverlayStackUi() {
 		requestRender: vi.fn(),
 		setFocus: vi.fn(),
 		terminal: { setTitle: vi.fn(), columns: 120, rows: 40 },
-		showOverlay: vi.fn((component: unknown) => {
+		showOverlay: vi.fn((component: unknown, _options?: unknown) => {
 			const entry = { component };
 			stack.push(entry);
 			return {
@@ -38,7 +38,7 @@ type ExtensionUiProto = {
 			keybindings: unknown,
 			done: (result: T) => void,
 		) => { render(width: number): string[]; invalidate(): void },
-		options?: { overlay?: boolean },
+		options?: { overlay?: boolean; overlayOptions?: () => { width: number } },
 	): Promise<T>;
 	resetExtensionUI(this: Record<string, unknown>): void;
 };
@@ -129,6 +129,26 @@ describe("InteractiveMode extension overlay teardown (R5-M28)", () => {
 
 		expect(ui.stack).toHaveLength(1);
 		expect(ui.stack[0]?.component).toBe(loginDialog);
+	});
+
+	test("hands a function-valued overlayOptions to the TUI for per-frame evaluation", async () => {
+		// The extension API documents `overlayOptions` as live ("dynamic updates");
+		// resolving it once froze the first answer for the overlay's whole life.
+		const ui = createOverlayStackUi();
+		const harness = createResetHarness(ui);
+		let width = 30;
+		void extensionUiProto.showExtensionCustom.call(harness, () => ({ render: () => ["ext"], invalidate: () => {} }), {
+			overlay: true,
+			overlayOptions: () => ({ width }),
+		});
+		await vi.waitFor(() => expect(ui.stack).toHaveLength(1));
+
+		const passed = ui.showOverlay.mock.calls[0]?.[1] as unknown;
+		expect(typeof passed).toBe("function");
+		const resolve = passed as () => { width: number };
+		expect(resolve()).toEqual({ width: 30 });
+		width = 60;
+		expect(resolve()).toEqual({ width: 60 });
 	});
 });
 

@@ -643,4 +643,26 @@ describe("TUI overlay options", () => {
 			tui.stop();
 		});
 	});
+
+	describe("function-valued options", () => {
+		it("re-evaluates function options on every render", async () => {
+			const terminal = new VirtualTerminal(80, 24);
+			const tui = new TUI(terminal);
+			let width = 20;
+			const overlay = new StaticOverlay(["AB"]);
+
+			tui.addChild(new EmptyContent());
+			// The extension UI contract allows a function for dynamic updates; the
+			// geometry must follow the latest return value, not the first one.
+			tui.showOverlay(overlay, () => ({ width }));
+			tui.start();
+			await renderAndFlush(tui, terminal);
+			assert.strictEqual(overlay.requestedWidth, 20);
+
+			width = 30;
+			await renderAndFlush(tui, terminal);
+			assert.strictEqual(overlay.requestedWidth, 30);
+			tui.stop();
+		});
+	});
 });

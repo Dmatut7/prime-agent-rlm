@@ -17,7 +17,7 @@ vi.mock("child_process", async (importOriginal) => {
 	return { ...actual, spawnSync: mocks.spawnSync };
 });
 
-import { resolveKernelBashShell } from "../src/utils/shell.js";
+import { resolveKernelBashShell, splitShellWords } from "../src/utils/shell.js";
 
 const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 
@@ -59,5 +59,34 @@ describe("resolveKernelBashShell on win32", () => {
 
 		expect(resolveKernelBashShell("D:\\tools\\bash.exe")).toBe("D:\\tools\\bash.exe");
 		expect(mocks.existsSync).not.toHaveBeenCalled();
+	});
+});
+
+describe("splitShellWords", () => {
+	it("splits a command line on unquoted whitespace", () => {
+		expect(splitShellWords("code --wait")).toEqual(["code", "--wait"]);
+	});
+
+	it("keeps quoted paths with spaces as one word", () => {
+		expect(splitShellWords('"/Applications/My Editor.app/bin/edit" --wait')).toEqual([
+			"/Applications/My Editor.app/bin/edit",
+			"--wait",
+		]);
+		expect(splitShellWords("'/Applications/My Editor.app/bin/edit'")).toEqual([
+			"/Applications/My Editor.app/bin/edit",
+		]);
+	});
+
+	it("keeps single-quoted content literal", () => {
+		expect(splitShellWords("vim '+call cursor(1,1)'")).toEqual(["vim", "+call cursor(1,1)"]);
+	});
+
+	it("unescapes backslash-escaped spaces", () => {
+		expect(splitShellWords("/path/my\\ editor --wait")).toEqual(["/path/my editor", "--wait"]);
+	});
+
+	it("returns no words for blank input", () => {
+		expect(splitShellWords("")).toEqual([]);
+		expect(splitShellWords("   ")).toEqual([]);
 	});
 });

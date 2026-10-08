@@ -496,7 +496,6 @@ const settings = new SettingsList(
   (id, newValue) => console.log(`${id} changed to ${newValue}`),
   () => console.log("Cancelled")
 );
-settings.updateValue("theme", "light");
 ```
 
 **Controls:**

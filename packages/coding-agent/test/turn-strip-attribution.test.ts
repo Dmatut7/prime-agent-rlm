@@ -128,6 +128,23 @@ describe("turn strip change attribution", () => {
 		expect(text).toContain("ext.ts");
 	});
 
+	it("washes control characters out of change-row paths", () => {
+		// The row paints `shortenPath(path)` into the timeline with no Text gate.
+		const { component } = strip(
+			facts({ projectChanges: [file({ key: "/w/evil.ts", path: "src/evil\x1b[2J\x07.ts" })] }),
+		);
+		component.activate(STRIP_EDITS);
+		const row = component
+			.render(100)
+			.find((line) => line.includes("evil"))
+			// The timeline's own row markers carry a BEL terminator; they are not the payload.
+			?.replace(/\x1b\][^\x07]*\x07/g, "");
+		expect(row).toBeDefined();
+		expect(row).not.toContain("\x1b[2J");
+		expect(row).not.toContain("\x07");
+		expect(stripAnsi(row!)).toContain("src/evil.ts");
+	});
+
 	it("keeps the commit note working when only ambient changes exist", () => {
 		const { component } = strip(
 			facts({

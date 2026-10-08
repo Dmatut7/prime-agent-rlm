@@ -156,10 +156,13 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		name: "compact",
 		description: "压缩会话上下文；可附说明指定摘要重点",
 		argumentHint: "[instructions]",
+		takesArgument: true,
 	},
 	{
 		name: "refine",
 		description: "整理沉淀提示、技能、子代理与记忆",
+		argumentHint: "[--global] [instructions|rollback <id>]",
+		takesArgument: true,
 	},
 	{
 		name: "goal",
@@ -275,8 +278,8 @@ export function builtinSlashCommandTakesArgument(name: string): boolean {
  * Canonical names of built-in commands that take no argument. An argument after one of
  * these is a usage error, never a prompt: interactive mode intercepts them before the
  * dispatch chain, where e.g. "/share extra" used to fall through to the model verbatim.
- * Commands that accept an optional argument (effort, traces, compact, ...) are not
- * listed even though they leave takesArgument unset.
+ * Commands that accept an optional argument (effort, traces, ...) are not listed even
+ * though they leave takesArgument unset.
  */
 export const NO_ARGUMENT_BUILTIN_SLASH_COMMANDS: ReadonlySet<string> = new Set([
 	"settings",

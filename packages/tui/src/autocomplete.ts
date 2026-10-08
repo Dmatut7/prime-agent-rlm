@@ -7,6 +7,9 @@ import { getSlashCommandContext } from "./slash-command-context.js";
 
 const PATH_DELIMITERS = new Set([" ", "\t", '"', "'", "="]);
 
+/** C0/C1/DEL bytes: never legal in a completion that is re-rendered every frame. */
+const CONTROL_CHARS = /[\x00-\x1f\x7f-\x9f]/;
+
 function toDisplayPath(value: string): string {
 	return value.replace(/\\/g, "/");
 }
@@ -597,6 +600,12 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			const suggestions: AutocompleteItem[] = [];
 
 			for (const entry of entries) {
+				// The candidate's name is re-emitted into the popup and, once accepted,
+				// into the draft on every render: a name carrying control bytes (legal
+				// on the filesystem, e.g. `evil\x07.txt`) must not complete.
+				if (CONTROL_CHARS.test(entry.name)) {
+					continue;
+				}
 				if (!entry.name.toLowerCase().startsWith(searchPrefix.toLowerCase())) {
 					continue;
 				}

@@ -217,4 +217,33 @@ describe("MenuPanel", () => {
 			expect(visibleWidth(line)).toBe(40);
 		}
 	});
+
+	it("keeps row content on one physical line when it carries a newline", () => {
+		const row = new MenuRow({
+			primary: "first line\nsecond line",
+			secondary: "alpha\nbeta",
+			meta: "x\ny",
+			selected: false,
+		});
+
+		const lines = row.render(40);
+		// A raw newline inside a row reads as one array entry but two physical
+		// lines, and every row-height budget above this component miscounts.
+		expect(lines.every((line) => !line.includes("\n"))).toBe(true);
+		expect(lines).toHaveLength(4);
+		const output = stripAnsi(lines.join("\n"));
+		expect(output).toContain("first line second line");
+		expect(output).toContain("alpha beta");
+	});
+
+	it("shows the search placeholder behind the cursor while focused and empty", () => {
+		const field = new MenuSearchInput("Search models");
+		field.focused = true;
+
+		const output = stripAnsi(field.render(24).join("\n"));
+
+		// The placeholder used to hide behind `!focused`, and the field is always
+		// focused in production - so the hint never showed.
+		expect(output).toContain("Search models");
+	});
 });

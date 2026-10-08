@@ -1,6 +1,7 @@
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { KeybindingsManager } from "../src/core/keybindings.js";
 import { ExtensionSelectorComponent } from "../src/modes/interactive/components/extension-selector.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -16,6 +17,10 @@ function expectTrailingBackground(line: string | undefined, text: string): void 
 describe("ExtensionSelectorComponent", () => {
 	beforeAll(() => {
 		initTheme("dark");
+	});
+
+	beforeEach(() => {
+		setKeybindings(new KeybindingsManager());
 	});
 
 	it("renders a multiline prompt with compact option rows", () => {
@@ -51,5 +56,47 @@ describe("ExtensionSelectorComponent", () => {
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBe(88);
 		}
+	});
+
+	it("never renders taller than the row budget, options included", () => {
+		// The fixed chrome (padding, title, blank, spacer, hints) is 6 rows, not 5:
+		// undercounting by one lets the panel overflow a short terminal.
+		const selector = new ExtensionSelectorComponent("Pick one", ["alpha", "beta", "gamma"], vi.fn(), vi.fn(), {
+			getRows: () => 8,
+		});
+
+		const lines = selector.render(88);
+		const output = lines.map((line) => stripAnsi(line)).join("\n");
+
+		expect(lines.length).toBeLessThanOrEqual(8);
+		expect(output).toContain("alpha");
+	});
+
+	it("counts a wrapped subtitle against the row budget", () => {
+		// The subtitle wraps to 3 physical rows at this width; the list must pay
+		// for all three, not the one logical line the description arrived as.
+		const selector = new ExtensionSelectorComponent(
+			`标题\n${"x".repeat(60)}`,
+			["alpha", "beta", "gamma", "delta", "epsilon", "zeta"],
+			vi.fn(),
+			vi.fn(),
+			{ getRows: () => 12 },
+		);
+
+		const lines = selector.render(30);
+
+		expect(lines.length).toBeLessThanOrEqual(12);
+		expect(stripAnsi(lines.join("\n"))).toContain("alpha");
+	});
+
+	it("treats the back key as cancel", () => {
+		const onCancel = vi.fn();
+		const selector = new ExtensionSelectorComponent("Pick one", ["alpha"], vi.fn(), onCancel, {
+			getRows: () => 24,
+		});
+
+		selector.handleInput("\x1b[D"); // left arrow
+
+		expect(onCancel).toHaveBeenCalledTimes(1);
 	});
 });

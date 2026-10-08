@@ -11,7 +11,8 @@ import { theme } from "../theme/theme.js";
 
 interface MenuPanelOptions {
 	title: string;
-	subtitle?: string;
+	/** Static text, or a function evaluated per render (a selector can drop the subtitle at critical row shortage). */
+	subtitle?: string | (() => string | undefined);
 }
 
 export interface MenuViewportProvider {
@@ -59,12 +60,17 @@ function fillsMenuPanel(component: Component): component is Component & FullWidt
 	return (component as { fillsMenuPanel?: unknown }).fillsMenuPanel === true;
 }
 
-function getViewportRows(getRows: (() => number) | undefined): number | undefined {
+/** The viewport's row count, or undefined when the provider cannot say. */
+export function menuViewportRows(getRows: (() => number) | undefined): number | undefined {
 	const rows = getRows?.();
 	if (rows === undefined || !Number.isFinite(rows) || rows <= 0) {
 		return undefined;
 	}
 	return Math.floor(rows);
+}
+
+function getViewportRows(getRows: (() => number) | undefined): number | undefined {
+	return menuViewportRows(getRows);
 }
 
 function visibleItemCount(
@@ -222,6 +228,17 @@ function surfaceWrappedLines(text: string, width: number, paddingX = PANEL_PADDI
 	return wrapTextWithAnsi(text, innerWidth).map((content) => surfaceLine(content, width, paddingX));
 }
 
+/**
+ * Physical rows a panel subtitle occupies at the given outer width. Selectors
+ * size their lists from this: a subtitle that wraps must shrink the list, not
+ * overflow the terminal.
+ */
+export function countWrappedSubtitleRows(text: string, width: number): number {
+	const trimmed = text.trim();
+	if (!trimmed) return 0;
+	return wrapTextWithAnsi(trimmed, getMenuPanelInnerWidth(width)).length;
+}
+
 export class MenuPanel extends Container {
 	private title: string;
 
@@ -243,7 +260,9 @@ export class MenuPanel extends Container {
 			lines.push(surfaceLine("", safeWidth));
 		}
 		const hasTitle = this.title.trim().length > 0;
-		const subtitle = this.options.subtitle?.trim();
+		const subtitleOption = this.options.subtitle;
+		const subtitleText = typeof subtitleOption === "function" ? subtitleOption() : subtitleOption;
+		const subtitle = subtitleText?.trim();
 		const hasSubtitle = subtitle !== undefined && subtitle.length > 0;
 		const hasHeader = hasTitle || hasSubtitle;
 		if (hasTitle) {
@@ -274,7 +293,9 @@ export class MenuSearchInput implements Component, Focusable, FullWidthMenuCompo
 	readonly fillsMenuPanel = true;
 	private readonly input = new Input();
 
-	constructor(private readonly placeholder: string) {}
+	constructor(placeholder: string) {
+		this.input.setPlaceholder(placeholder);
+	}
 
 	get focused(): boolean {
 		return this.input.focused;
@@ -311,10 +332,9 @@ export class MenuSearchInput implements Component, Focusable, FullWidthMenuCompo
 	render(width: number): string[] {
 		const safeWidth = Math.max(FIELD_PADDING_X * 2 + 1, width);
 		const innerWidth = Math.max(1, safeWidth - FIELD_PADDING_X * 2);
-		const content =
-			this.getValue() === "" && !this.focused
-				? theme.fg("dim", this.placeholder)
-				: this.stripInputPrompt(this.input.render(innerWidth + 2)[0] ?? "");
+		// The placeholder lives in the Input itself: it shows while the value is
+		// empty, focused or not, with the cursor still leading the row.
+		const content = this.stripInputPrompt(this.input.render(innerWidth + 2)[0] ?? "");
 		return [paddedBackgroundLine(content, safeWidth, FIELD_PADDING_X, theme.getEditorBackgroundColor())];
 	}
 
@@ -354,11 +374,13 @@ export class MenuRow implements Component, FullWidthMenuComponent {
 
 	renderContent(width: number): string[] {
 		const safeWidth = Math.max(ROW_PADDING_X * 2 + 1, width);
-		const meta = this.options.meta ? theme.fg("muted", this.options.meta) : "";
-		const secondary = this.options.secondary ? theme.fg("muted", this.options.secondary) : "";
-		const primary = this.options.selected
-			? theme.bold(theme.fg("text", this.options.primary))
-			: theme.fg("text", this.options.primary);
+		// A row is one physical line per field: a newline inside an option reads as
+		// one array entry but two painted lines, breaking every row budget above.
+		const singleLine = (text: string) => text.replace(/[\r\n]+/g, " ");
+		const meta = this.options.meta ? theme.fg("muted", singleLine(this.options.meta)) : "";
+		const secondary = this.options.secondary ? theme.fg("muted", singleLine(this.options.secondary)) : "";
+		const primaryRaw = singleLine(this.options.primary);
+		const primary = this.options.selected ? theme.bold(theme.fg("text", primaryRaw)) : theme.fg("text", primaryRaw);
 		const innerWidth = Math.max(1, safeWidth - ROW_PADDING_X * 2);
 		const metaWidth = visibleWidth(meta);
 		const gap = meta ? 2 : 0;
@@ -429,5 +451,14 @@ export class MenuList extends Container implements FullWidthMenuComponent {
 	private isCompact(): boolean {
 		const compact = this.options.compact;
 		return typeof compact === "function" ? compact() : compact === true;
+	}
+}
+
+/** A menu area that drops out of the layout at critical row shortage. */
+export class CollapsibleMenuArea extends Container {
+	hidden = false;
+
+	override render(width: number): string[] {
+		return this.hidden ? [] : super.render(width);
 	}
 }

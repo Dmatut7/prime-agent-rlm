@@ -63,14 +63,23 @@ describe("MCP management commands", () => {
 		}
 	});
 
-	it("shows only the server name and transport at the public output boundary", () => {
+	it("keeps the secrecy boundary while showing operational detail in get", () => {
 		const output = formatMcpServer("remote", {
 			type: "http",
 			url: "https://user.example/private/path",
 			bearerTokenEnvVar: "SECRET_TOKEN",
 			headers: { Authorization: "Bearer secret", "X-Api-Key": "also-secret" },
 		});
-		expect(output).toBe("remote: http");
+		// The boundary: no URL (paths can carry tokens), no env var names, no header
+		// names or values.
+		expect(output).not.toContain("user.example");
+		expect(output).not.toContain("SECRET_TOKEN");
+		expect(output).not.toContain("Authorization");
+		expect(output).not.toContain("X-Api-Key");
+		// The detail `list` does not carry:
+		expect(output).toContain("remote: http");
+		expect(output).toContain("bearer token from env");
+		expect(output).toContain("headers: 2");
 	});
 
 	it("persists global-only entries and replaces them wholesale with --force", async () => {
@@ -165,15 +174,60 @@ describe("MCP management commands", () => {
 		expect(() => readFileSync(`${join(agentDir, "settings.json")}.tmp`, "utf8")).toThrow();
 	});
 
+	it("does not attribute an earlier unrelated write failure to a later mcp command", async () => {
+		const agentDir = join(testDir, "agent");
+		const projectDir = join(testDir, "project");
+		mkdirSync(agentDir, { recursive: true });
+		const manager = SettingsManager.create(projectDir, agentDir);
+		try {
+			// Record an unrelated global-write failure: a directory sits where the
+			// settings file belongs, so the queued write can never land.
+			mkdirSync(join(agentDir, "settings.json"));
+			manager.setExtensionPaths(["-skills/alpha/SKILL.md"]);
+			await manager.flush();
+			rmSync(join(agentDir, "settings.json"), { recursive: true });
+
+			// The mcp write succeeds; the earlier failure belongs to the toggle that
+			// caused it, not to this command.
+			const result = await runMcpManagementCommand(["add", "fetch", "--", "uvx", "mcp-server-fetch"], manager);
+			expect(result.message).toContain('Added MCP server "fetch"');
+		} finally {
+			manager.stopWatchingExternalSettings();
+		}
+	});
+
 	it("allows inspecting and removing hand-edited reserved entries", async () => {
 		const manager = SettingsManager.inMemory({
 			mcpServers: { linear: { type: "http", url: "https://proxy.example/mcp" } },
 		});
-		await expect(runMcpManagementCommand(["get", "linear"], manager)).resolves.toMatchObject({
-			message: "linear: http",
-		});
+		const get = await runMcpManagementCommand(["get", "linear"], manager);
+		expect(get.message).toContain("linear: http");
+		expect(get.message).not.toContain("proxy.example");
 		await runMcpManagementCommand(["remove", "linear"], manager);
 		expect(manager.getGlobalMcpServers()).toEqual({});
+	});
+
+	it("shows connection details in get that list omits", async () => {
+		const manager = SettingsManager.inMemory({
+			mcpServers: {
+				remote: { type: "http", url: "https://example.test/mcp", oauth: true },
+				local: { type: "stdio", command: "node", args: ["server.js"], cwd: "/tmp/work" },
+			},
+		});
+
+		const getRemote = await runMcpManagementCommand(["get", "remote"], manager);
+		expect(getRemote.message).toContain("oauth");
+
+		const getLocal = await runMcpManagementCommand(["get", "local"], manager);
+		expect(getLocal.message).toContain("custom cwd");
+
+		// `list` stays a one-line summary; `get` adds the operational flags. Both
+		// keep secrets (URL paths, argv) out.
+		const list = await runMcpManagementCommand(["list"], manager);
+		expect(list.message).not.toContain("oauth");
+		expect(list.message).not.toContain("custom cwd");
+		expect(getRemote.message).not.toContain("example.test");
+		expect(getLocal.message).not.toContain("server.js");
 	});
 
 	it("reports get/remove not found and removes live entries", async () => {

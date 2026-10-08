@@ -263,6 +263,39 @@ describe("CustomEditor", () => {
 		expect(runtime.render(40)[1]).toBe(reference.render(40)[1]);
 	});
 
+	it("requests a render when the placeholder changes", () => {
+		// The base Editor's invalidate() is a no-op, so setPlaceholder used to
+		// leave the old hint on screen until some unrelated tick repainted.
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager(), {
+			placeholder: "one",
+		});
+		editor.render(40);
+		vi.mocked(fakeTui.requestRender).mockClear();
+
+		editor.setPlaceholder("two");
+
+		expect(fakeTui.requestRender).toHaveBeenCalled();
+		expect(editor.render(40)[1]).toContain("two");
+	});
+
+	it("gives the placeholder the full input width when padding covers the caret", () => {
+		// The body rule: with paddingX the caret overflows into the padding, so the
+		// text gets the full input width; the placeholder used to always reserve
+		// one column and came out a column short.
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager(), {
+			paddingX: 2,
+			placeholder: "x".repeat(100),
+		});
+		editor.focused = true;
+
+		const line = editor.render(40)[1]!;
+		const visible = line.replace(/\x1b\[[0-9;]*m/g, "");
+
+		// width 40, paddingX 2, prompt " › ": inputWidth = 40 - 4 - 3 = 33
+		expect(visible.match(/x/g)?.length).toBe(33);
+		expect(visibleWidth(line)).toBe(40);
+	});
+
 	it("keeps the placeholder caret on the input row below a header", () => {
 		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager(), {
 			placeholder: "reply to agent",

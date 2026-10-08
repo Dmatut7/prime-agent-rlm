@@ -8,6 +8,7 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { builtinSlashCommandTakesArgument, parseSlashCommand } from "../../../core/slash-commands.js";
+import { sanitizeUserText } from "../../../utils/display-text.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock } from "./block-focus.js";
 import { PromptTokenMask } from "./prompt-highlight.js";
@@ -18,7 +19,10 @@ const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
 
 function promptSource(text: string): string {
-	return text.replace(/\r\n?/g, "\n").replace(/\s+$/, "");
+	// Not every bubble is keystrokes: queued and injected messages land here too,
+	// and this component paints its own lines (no Text gate). Wash the control
+	// bytes, keep the words exactly as they were.
+	return sanitizeUserText(text).replace(/\r\n?/g, "\n").replace(/\s+$/, "");
 }
 
 /**

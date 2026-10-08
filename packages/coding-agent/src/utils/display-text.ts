@@ -71,3 +71,12 @@ export function sliceGraphemes(text: string, maxChars: number): string {
 	}
 	return text.slice(0, end);
 }
+
+/**
+ * The wash for text rendered as the user's own words (queued or injected
+ * messages land in user bubbles): escapes and control characters gone,
+ * newlines and tabs kept for the renderer's own expansion.
+ */
+export function sanitizeUserText(text: string): string {
+	return stripEscapesAndControls(text);
+}

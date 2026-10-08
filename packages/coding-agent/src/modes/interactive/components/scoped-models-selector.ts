@@ -3,6 +3,7 @@ import { Container, type Focusable, fuzzyFilter, getKeybindings, Input, Spacer, 
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { keyText } from "./keybinding-hints.js";
+import { shouldTreatAsBack } from "./modal-back.js";
 
 type EnabledIds = string[] | null;
 
@@ -67,8 +68,12 @@ export interface ModelsConfig {
 export interface ModelsCallbacks {
 	/** Called whenever the enabled model set or order changes (session-only, no persist) */
 	onChange: (enabledModelIds: string[] | null) => void | Promise<void>;
-	/** Called when user wants to persist current selection to settings */
-	onPersist: (enabledModelIds: string[] | null) => void | Promise<void>;
+	/**
+	 * Called when user wants to persist current selection to settings. The
+	 * (unsaved) marker clears once the returned promise settles; return `false`
+	 * (or reject) when the write did not land so the marker stays.
+	 */
+	onPersist: (enabledModelIds: string[] | null) => boolean | undefined | Promise<boolean | undefined>;
 	onCancel: () => void;
 }
 
@@ -241,8 +246,14 @@ export class ScopedModelsSelectorComponent extends Container implements Focusabl
 				if (newIndex >= 0 && newIndex < this.enabledIds.length) {
 					this.enabledIds = move(this.enabledIds, item.fullId, delta);
 					this.isDirty = true;
-					this.selectedIndex += delta;
 					this.refresh();
+					// Re-anchor by identity: under a filter the swapped neighbor may be
+					// hidden, so the item's filtered position does not move by delta.
+					const anchored = this.filteredItems.findIndex((entry) => entry.fullId === item.fullId);
+					if (anchored >= 0) {
+						this.selectedIndex = anchored;
+						this.updateList();
+					}
 					this.notifyChange();
 				}
 			}
@@ -295,9 +306,18 @@ export class ScopedModelsSelectorComponent extends Container implements Focusabl
 		}
 
 		if (kb.matches(data, "app.models.save")) {
-			this.callbacks.onPersist(this.enabledIds === null ? null : [...this.enabledIds]);
-			this.isDirty = false;
-			this.footerText.setText(this.getFooterText());
+			// Clear the (unsaved) marker only once the write has actually landed; an
+			// in-flight or failed persist (false) keeps it visible.
+			void Promise.resolve(this.callbacks.onPersist(this.enabledIds === null ? null : [...this.enabledIds])).then(
+				(result) => {
+					if (result === false) return;
+					this.isDirty = false;
+					this.footerText.setText(this.getFooterText());
+				},
+				() => {
+					// A rejected persist keeps the (unsaved) marker.
+				},
+			);
 			return;
 		}
 
@@ -311,7 +331,7 @@ export class ScopedModelsSelectorComponent extends Container implements Focusabl
 			return;
 		}
 
-		if (kb.matches(data, "tui.select.cancel")) {
+		if (kb.matches(data, "tui.select.cancel") || shouldTreatAsBack(data, this.searchInput)) {
 			this.callbacks.onCancel();
 			return;
 		}

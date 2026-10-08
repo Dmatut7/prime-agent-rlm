@@ -59,6 +59,27 @@ describe("findRecentSession", () => {
 		expect(fallback?.title.endsWith("…")).toBe(true);
 	});
 
+	it("strips control characters from stored names and prompt titles", async () => {
+		// The title lands on the splash screen raw: an ESC in a stored name would
+		// replay into the terminal on every start.
+		const dir = sessionDir();
+		write(dir, "a.jsonl", transcript("/work", "clean task"), 1_000);
+		write(dir, "b.jsonl", transcript("/work", "p", [{ type: "session_info", name: "bad\x1b[2Jname\x07" }]), 2_000);
+		expect((await findRecentSession(dir, "/work"))?.title).toBe("badname");
+	});
+
+	it("cuts long titles at a grapheme boundary", async () => {
+		// A code-unit cut can leave half a flag or family emoji at the cut point.
+		const dir = sessionDir();
+		const prompt = "👨‍👩‍👧‍👦".repeat(30);
+		write(dir, "a.jsonl", transcript("/work", prompt), 1_000);
+		const graphemes = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(prompt)].map(
+			(part) => part.segment,
+		);
+		const title = (await findRecentSession(dir, "/work"))?.title;
+		expect(title).toBe(`${graphemes.slice(0, 27).join("")}…`);
+	});
+
 	it("is undefined for a missing directory", async () => {
 		expect(await findRecentSession(join(tmpdir(), "does-not-exist-recent-session"), "/work")).toBeUndefined();
 	});

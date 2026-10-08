@@ -177,11 +177,39 @@ export function formatMcpServerList(servers: Record<string, McpServerConfig> | u
 }
 
 export function formatMcpServer(name: string, config: McpServerConfig): string {
-	return `${name}: ${config.type}`;
+	// `get` is the detail view; `list` stays one line per server (see formatMcpServerSummary).
+	// The detail stays inside the secrecy boundary: no URL (paths can carry
+	// tokens), no env var or header names, no stdio argv (`--token secret` shows
+	// up there). Counts and on/off flags only.
+	const flags: string[] = [];
+	if (config.enabled === false) flags.push("disabled");
+	if (config.type === "http" && config.oauth === true) flags.push("oauth");
+	if (config.type === "http" && config.bearerTokenEnvVar) flags.push("bearer token from env");
+	if (config.type === "http" && config.headers && Object.keys(config.headers).length > 0) {
+		flags.push(`headers: ${Object.keys(config.headers).length}`);
+	}
+	if (config.type === "stdio" && config.cwd) flags.push("custom cwd");
+	if (config.type === "stdio" && config.env && Object.keys(config.env).length > 0) {
+		flags.push(`env: ${Object.keys(config.env).length} mapped`);
+	}
+	if (config.enabledTools?.length) flags.push(`tools: ${config.enabledTools.join(", ")}`);
+	if (config.disabledTools?.length) flags.push(`disabled tools: ${config.disabledTools.join(", ")}`);
+	const lines = [`${name}: ${config.type}`];
+	if (flags.length > 0) lines.push(`  ${flags.join(" · ")}`);
+	return lines.join("\n");
 }
 
 function formatMcpServerSummary(name: string, config: McpServerConfig): string {
-	return formatMcpServer(name, config);
+	return `${name}: ${config.type}`;
+}
+
+async function flushGlobalSettings(settingsManager: SettingsManager): Promise<void> {
+	// Drop the backlog before the write this command owns: an error recorded by an
+	// earlier, unrelated write would otherwise be thrown as if THIS flush failed.
+	settingsManager.drainErrors("global");
+	await settingsManager.flush();
+	const error = settingsManager.drainErrors("global")[0];
+	if (error) throw error.error;
 }
 
 function validateName(name: string): string {
@@ -209,12 +237,6 @@ function validateHttpUrl(value: string): string {
 		throw new Error("MCP URL must be an http(s) URL without embedded credentials.");
 	}
 	return url.toString();
-}
-
-async function flushGlobalSettings(settingsManager: SettingsManager): Promise<void> {
-	await settingsManager.flush();
-	const error = settingsManager.drainErrors("global")[0];
-	if (error) throw error.error;
 }
 
 function dropServerCredentials(name: string, authStorage: McpCredentialStore | undefined): void {

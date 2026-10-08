@@ -33,6 +33,11 @@ export interface SettingsListOptions {
 	formatValue?: (value: string) => string;
 }
 
+/** The value column never shrinks below this; labels truncate instead. */
+const VALUE_MIN_WIDTH = 8;
+/** Wrapped description rows shown under the list before an ellipsis takes over. */
+const MAX_DESCRIPTION_ROWS = 3;
+
 export class SettingsList implements Component {
 	private items: SettingItem[];
 	private filteredItems: SettingItem[];
@@ -66,13 +71,6 @@ export class SettingsList implements Component {
 		this.searchEnabled = options.enableSearch ?? false;
 		if (this.searchEnabled) {
 			this.searchInput = new Input();
-		}
-	}
-
-	updateValue(id: string, newValue: string): void {
-		const item = this.items.find((i) => i.id === id);
-		if (item) {
-			item.currentValue = newValue;
 		}
 	}
 
@@ -117,7 +115,10 @@ export class SettingsList implements Component {
 		);
 		const endIndex = Math.min(startIndex + this.maxVisible, displayItems.length);
 
-		const maxLabelWidth = Math.min(30, Math.max(...this.items.map((item) => visibleWidth(item.label))));
+		// The label column yields before the value column does: below the floor the
+		// label truncates, so an over-wide label can never squeeze the value out.
+		const widestLabel = Math.max(...this.items.map((item) => visibleWidth(item.label)));
+		const maxLabelWidth = Math.max(4, Math.min(30, widestLabel, width - 2 - 2 - VALUE_MIN_WIDTH));
 
 		for (let i = startIndex; i < endIndex; i++) {
 			const item = displayItems[i];
@@ -127,7 +128,8 @@ export class SettingsList implements Component {
 			const prefix = isSelected ? this.theme.cursor : "  ";
 			const prefixWidth = visibleWidth(prefix);
 
-			const labelPadded = item.label + " ".repeat(Math.max(0, maxLabelWidth - visibleWidth(item.label)));
+			const labelCell = truncateToWidth(item.label, maxLabelWidth, "…");
+			const labelPadded = labelCell + " ".repeat(Math.max(0, maxLabelWidth - visibleWidth(labelCell)));
 			const labelText = this.theme.label(labelPadded, isSelected);
 
 			const separator = "  ";
@@ -151,8 +153,13 @@ export class SettingsList implements Component {
 		if (selectedItem?.description) {
 			lines.push("");
 			const wrappedDesc = wrapTextWithAnsi(selectedItem.description, width - 4);
-			for (const line of wrappedDesc) {
-				lines.push(this.theme.description(`  ${line}`));
+			// The description lives under the list without a window of its own: cap
+			// it so a long one cannot push the list past the host's row budget.
+			const shown = wrappedDesc.slice(0, MAX_DESCRIPTION_ROWS);
+			for (let i = 0; i < shown.length; i++) {
+				const line = shown[i]!;
+				const cut = i === shown.length - 1 && wrappedDesc.length > shown.length;
+				lines.push(this.theme.description(`  ${line}${cut ? " …" : ""}`));
 			}
 		}
 

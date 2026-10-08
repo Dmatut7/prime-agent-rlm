@@ -1,4 +1,5 @@
 import { type Component, Container, getKeybindings, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { sanitizeRowText } from "../../../utils/display-text.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 
@@ -58,7 +59,7 @@ class UserMessageList implements Component {
 			const message = this.messages[i];
 			const isSelected = i === this.selectedIndex;
 
-			const normalizedMessage = message.text.replace(/\n/g, " ").trim();
+			const normalizedMessage = sanitizeRowText(message.text);
 
 			const cursor = isSelected ? theme.fg("accent", "› ") : "  ";
 			const maxMsgWidth = width - 2;
