@@ -109,4 +109,6 @@ Consider using a dedicated terminal emulator for the best experience.
 
 ### macOS Control+Option+Arrow shortcuts
 
-Pending-message reordering defaults to `Control+Option+Up` and `Control+Option+Down`. Prime Agent accepts modern modified-arrow sequences and legacy Option-as-Meta wrapped Control+Arrow sequences. macOS VoiceOver uses Control+Option as its modifier, and system or terminal shortcuts can intercept these chords before they reach Prime Agent. If that happens, remap `app.message.moveEarlier` and `app.message.moveLater` in `~/.prime/agent/keybindings.json`.
+Pending-message reordering defaults to `Control+Option+Up` and `Control+Option+Down`. Prime Agent accepts the modern modified-arrow sequences (CSI `1;5`-style and Kitty protocol). It does **not** support the legacy Option-as-Meta form: on terminals where Meta sends Escape (xterm `metaSendsEscape`, Terminal.app's "Use Option as Meta key"), an Option+Arrow chord arrives as a bare `Escape` byte followed by the arrow sequence, and Prime Agent reads that `Escape` as the interrupt/clear key - pressing Option+Arrow would interrupt the running turn or clear your draft. Keep Option-as-Meta off for the terminal running Prime Agent, or remap the affected chords away from Option.
+
+macOS VoiceOver uses Control+Option as its modifier, and system or terminal shortcuts can intercept these chords before they reach Prime Agent. If that happens, remap `app.message.moveEarlier` and `app.message.moveLater` in `~/.prime/agent/keybindings.json`.

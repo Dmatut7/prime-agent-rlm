@@ -146,7 +146,7 @@ The `$schema` field enables editor auto-completion and validation.
 
 ## Color Tokens
 
-Every theme must define all 55 color tokens. There are no optional colors.
+Every theme must define the 55 required tokens below. Beyond those, the schema accepts 74 optional tokens (listed after the required tables); each optional token falls back to a core color when omitted, so a theme with only the 55 required tokens is valid.
 
 ### Core UI (11 colors)
 
@@ -239,6 +239,18 @@ Editor border colors indicating thinking level (visual hierarchy from subtle to 
 | Token | Purpose |
 |-------|---------|
 | `bashMode` | Editor border in bash mode (`!` prefix) |
+
+### Optional Tokens (74 colors)
+
+These tokens may be omitted; each falls back to a core color when unset. Grouped as in the theme schema:
+
+**Conversation layers (13):** `userLabel`, `assistantLabel`, `assistantGutter`, `runCardBar`, `runCardWarn`, `systemNotice`, `chipText`, `toastText`, `userBubbleBg`, `runCardBg`, `runCardWarnBg`, `chipBg`, `toastBg`
+
+**Activity feed, timeline, and cards (27):** `activityText`, `activityAccent`, `memoryAccent`, `timelineRail`, `timelineTime`, `timelineFaint`, `timelineSoft`, `timelineUser`, `timelineAi`, `timelineLane`, `timelineSub`, `timelineMemory`, `timelineLive`, `timelineMust`, `timelineFix`, `timelineOk`, `timelineHoverBg`, `churnBar`, `diffAddedText`, `diffRemovedText`, `diffAddedLineBg`, `diffRemovedLineBg`, `rowFlashBg`, `rowFlashFadeBg`, `cardFocusBg`, `boxBorder`, `boxBorderLive`
+
+**Box header and status pills (11):** `boxHeadBg`, `boxHeadLiveBg`, `boxHeadHoverBg`, `boxPillLive`, `boxPillLiveBg`, `boxPillDone`, `boxPillDoneBg`, `boxPillStopped`, `boxPillStoppedBg`, `boxPillError`, `boxPillErrorBg`
+
+**Per-kind timeline colors (23):** `kindThink`, `kindCommand`, `kindRead`, `kindSubagent`, `kindError`, `kindEdit`, `kindMemory`, `kindRecovered`, `kindThinkBg`, `kindThinkHoverBg`, `kindCommandBg`, `kindCommandHoverBg`, `kindReadBg`, `kindReadHoverBg`, `kindSubagentBg`, `kindSubagentHoverBg`, `kindErrorBg`, `kindErrorHoverBg`, `kindEditBg`, `kindEditHoverBg`, `kindMemoryBg`, `kindMemoryHoverBg`, `kindPanelBg`
 
 ### HTML Export (optional)
 

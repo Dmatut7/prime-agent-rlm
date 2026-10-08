@@ -120,3 +120,66 @@ describe("examples: real execute order and install paths", () => {
 		}
 	});
 });
+
+describe("D6: themes.md tells the truth about optional color tokens", () => {
+	const themeSource = readDoc("../src/modes/interactive/theme/theme.ts");
+	const themesDoc = readDoc("../docs/themes.md");
+	const colorsBlock = themeSource.slice(
+		themeSource.indexOf("colors: Type.Object"),
+		themeSource.indexOf("export: Type.Optional"),
+	);
+	const requiredTokens = [...colorsBlock.matchAll(/(\w+): ColorValueSchema,/g)].map((m) => m[1]!);
+	const optionalTokens = [...colorsBlock.matchAll(/(\w+): Type\.Optional\(ColorValueSchema\)/g)].map((m) => m[1]!);
+
+	it("schema keeps the 55 required / 74 optional split the doc cites", () => {
+		expect(requiredTokens.length).toBe(55);
+		expect(optionalTokens.length).toBe(74);
+	});
+
+	it("doc no longer claims there are no optional colors", () => {
+		expect(themesDoc).not.toContain("There are no optional colors");
+		expect(themesDoc).toContain("74 optional tokens");
+	});
+
+	it("every optional token the schema accepts is named in the doc", () => {
+		expect(optionalTokens.length).toBeGreaterThan(0);
+		for (const token of optionalTokens) {
+			expect(themesDoc, `optional token ${token}`).toContain("`" + token + "`");
+		}
+	});
+});
+
+describe("D7: terminal-setup.md does not promise the legacy Option-as-Meta form", () => {
+	const stdinBufferSource = readDoc("../../tui/src/stdin-buffer.ts");
+	const terminalSetupDoc = readDoc("../docs/terminal-setup.md");
+
+	it("stdin-buffer still splits a doubled ESC into Escape + sequence (the M3 reality)", () => {
+		// While this split exists, Option-as-Meta terminals deliver Escape + arrow.
+		expect(stdinBufferSource).toContain("Two ESC bytes in a row are two Escape keys");
+	});
+
+	it("doc warns about Meta-sends-Escape instead of claiming support", () => {
+		expect(terminalSetupDoc).not.toContain("legacy Option-as-Meta wrapped Control+Arrow sequences");
+		expect(terminalSetupDoc).toMatch(/does \*\*not\*\* support the legacy Option-as-Meta form/);
+		expect(terminalSetupDoc).toContain("metaSendsEscape");
+	});
+});
+
+describe("sdk examples: no legacy ~/.pi paths", () => {
+	it("the six sdk examples reference ~/.prime/agent and <cwd>/.prime/agent only", () => {
+		for (const f of [
+			"01-minimal.ts",
+			"03-custom-prompt.ts",
+			"04-skills.ts",
+			"06-extensions.ts",
+			"08-prompt-templates.ts",
+			"09-api-keys-and-oauth.ts",
+		]) {
+			const src = readDoc(`../examples/sdk/${f}`);
+			expect(src, f).not.toContain("~/.pi/");
+			expect(src, f).not.toContain("cwd/.pi/");
+			expect(src, f).not.toContain("<cwd>/.pi/");
+			expect(src, f).toContain(".prime/agent");
+		}
+	});
+});
