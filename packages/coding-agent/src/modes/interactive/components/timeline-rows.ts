@@ -1609,8 +1609,24 @@ export function buildTimelineView(
 		stepsByGroup.set(row.groupKey, list);
 	}
 	const events = items.flatMap((item): TimelineEvent[] => {
-		if (item.type === "steer")
-			return [{ key: item.key, kind: "steer", at: item.at, text: item.text, steps: [], spawned: [] }];
+		if (item.type === "steer") {
+			// The interjection's row carries its whole text (`fullText`/`detail`), so a long one the
+			// row cut opens to all of it - the channel a failed event already uses.
+			const row = stepsByGroup.get(item.key)?.[0];
+			const first = firstParagraph(item.text);
+			return [
+				{
+					key: item.key,
+					kind: "steer",
+					at: item.at,
+					text: first.line,
+					...(first.more ? { more: true as const } : {}),
+					steps: [],
+					spawned: [],
+					...(row ? { row } : {}),
+				},
+			];
+		}
 		if (item.type === "fail") {
 			const row = stepsByGroup.get(item.key)?.[0];
 			if (!row) return [];

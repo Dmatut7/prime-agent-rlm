@@ -8,6 +8,7 @@ import {
 import { type ThemeColor, theme } from "../theme/theme.js";
 import { spinnerFrame } from "../theme/working-icon.js";
 import { shortAgentName } from "./agent-message.js";
+import { isVisibleRow } from "./block-focus.js";
 import { sanitizeDisplayText } from "./diff-rows.js";
 import { styleInlineMarkdown } from "./inline-markdown.js";
 import {
@@ -173,6 +174,8 @@ const STEP_GLYPH_COLS = 3;
 const STEP_WORDS_MIN = 12;
 /** What the tail's running line says before the command. */
 const TIP_LABEL = "在跑  ";
+/** What an interjection's row says in front of the owner's words. */
+const STEER_LABEL = "你插话";
 
 /** A row that is only the main line and its lane: what a return keeps above itself. */
 const RAIL_GAP_ROW = /^(?:\x1b\[[0-9;]*m| )*│(?:\x1b\[[0-9;]*m| |┆)*$/;
@@ -496,6 +499,15 @@ function stepMark(row: BoxRow): string {
 	return row.meta[0]?.text.startsWith("✓") ? `${theme.fg("timelineFaint", "✓")}  ` : "";
 }
 
+/**
+ * Whether a spec's row shows anything, judged on the row as it renders - the same eye
+ * `decorateFocusedBlock` uses when it looks for the row to put the key hint on.
+ */
+function rowShowsContent(spec: LineSpec, width: number): boolean {
+	if (spec.raw) return spec.raw.lines.some(isVisibleRow);
+	return isVisibleRow(timelineRow(spec.gutter, spec.content, spec.right ?? "", width, spec.fit));
+}
+
 /** A color that resets the background (or everything) inside a painted line. */
 const BG_RESET = /\x1b\[(?:0|49)?m/g;
 
@@ -621,21 +633,32 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		}
 		const time = event.at > 0 ? formatTimelineTime(event.at) : undefined;
 		const detailRow = event.row;
+		// An interjection's own label takes columns the row cuts its words to.
+		const steerLabel = event.kind === "steer" ? `${STEER_LABEL}   ` : "";
 		// Words the line cuts (or paragraphs it leaves out) open to the whole text.
 		const textRoom =
-			event.steps.length > 0
+			(event.steps.length > 0
 				? width - TIMELINE_CONTENT_COL - visibleWidth(eventRight(event.steps.length, false)) - 4
-				: width - TIMELINE_CONTENT_COL;
+				: width - TIMELINE_CONTENT_COL) - visibleWidth(steerLabel);
 		// The AI's own words keep their bold and drop their backticks; an error line is plain text.
 		const color: ThemeColor = event.kind === "fail" ? "timelineMust" : "text";
-		const words = truncateToWidth(
-			event.kind === "fail" ? theme.fg(color, event.text) : styleInlineMarkdown(event.text, color),
-			Math.max(1, width),
-			"",
-		);
-		const more = event.full !== undefined && (eventSaysMore(event) || visibleWidth(words) > textRoom);
+		const words =
+			event.kind === "steer"
+				? event.text
+				: truncateToWidth(
+						event.kind === "fail" ? theme.fg(color, event.text) : styleInlineMarkdown(event.text, color),
+						Math.max(1, width),
+						"",
+					);
+		// An interjection has no `full` of its own: its row carries the whole text, and what says the
+		// row left words out is the same cut the row shows.
+		const more =
+			(event.full !== undefined || event.kind === "steer") &&
+			(eventSaysMore(event) || visibleWidth(words) > textRoom);
 		const failDetail = event.kind === "fail" && detailRow?.detail !== undefined;
-		const openable = event.steps.length > 0 || more || failDetail;
+		// A long interjection opens to its whole text through its row, like a failure opens to why.
+		const steerDetail = event.kind === "steer" && more && detailRow?.detail !== undefined;
+		const openable = event.steps.length > 0 || failDetail || steerDetail || (more && event.kind !== "steer");
 		const open = openable && ui.expanded.has(event.key);
 		const fullLines =
 			open && more && event.full
@@ -644,8 +667,20 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		if (event.kind === "steer") {
 			specs.push({
 				gutter: { ...(time ? { time } : {}), main: "user", lane },
-				content: `${theme.bold(theme.fg("timelineUser", "你插话"))}   ${theme.fg("text", event.text)}`,
+				content: `${theme.bold(theme.fg("timelineUser", STEER_LABEL))}   ${theme.fg("text", event.text)}`,
+				...(openable
+					? {
+							right: eventRight(0, open),
+							key: event.key,
+							onClick: toggle(event.key),
+							reveal: open ? 0 : EVENT_REVEAL,
+						}
+					: {}),
 			});
+			if (open && detailRow?.detail) {
+				for (const line of detailRow.detail(bodyWidth))
+					specs.push({ gutter: { main: "rail", lane }, content: line });
+			}
 			return;
 		}
 		specs.push({
@@ -778,7 +813,11 @@ export function renderTurnBox(input: BoxRenderInput): BoxRenderResult {
 		: undefined;
 	const lines: string[] = [];
 	const regions: ClickRegion[] = [];
-	const firstVisible = specs.findIndex((spec) => spec.content !== "" || spec.raw !== undefined);
+	// The row that leaves its right side out is the row block navigation puts its key hint on, so it is
+	// found the way the hint finds it: the first row that shows anything once its gutter is left out (a
+	// leading rail row shows nothing). Two readings of "the first row" that disagree lose both the hint
+	// and the `N 步 ▸` it made room for.
+	const firstVisible = input.dropFirstRight ? specs.findIndex((spec) => rowShowsContent(spec, width)) : -1;
 	specs.forEach((spec, index) => {
 		const line = lines.length;
 		if (spec.raw) {

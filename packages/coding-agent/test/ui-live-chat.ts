@@ -1,3 +1,4 @@
+import { TOOL_ABORT_FALLBACK_MESSAGE } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { Container, Spacer } from "@earendil-works/pi-tui";
 import {
@@ -20,6 +21,10 @@ import {
 	QuietAssistantMessage,
 	QuietTurnSummary,
 } from "../src/modes/interactive/components/conversation-components.js";
+import {
+	InjectedPromptMessageComponent,
+	isInjectedPromptMessage,
+} from "../src/modes/interactive/components/injected-prompt-message.js";
 import { subagentNoticeRow } from "../src/modes/interactive/components/system-notice.js";
 import {
 	type TimelineHost,
@@ -348,6 +353,35 @@ export class LiveChat {
 				call.isError === true,
 			);
 		}
+	}
+
+	/**
+	 * A stored heartbeat prompt: the session hands it over as a plain user message and the mode says
+	 * what it stands for, so the flow groups it as a wake and not as the owner's question.
+	 */
+	heartbeatPrompt(message: CustomMessage, options: { model?: string; answer?: string } = {}): void {
+		this.streaming = true;
+		this.flow.agentStart();
+		const text = typeof message.content === "string" ? message.content : "";
+		if (this.flow.userMessage(text, this.tick(), message) === "prompt") {
+			if (isInjectedPromptMessage(message)) this.chat.addChild(new InjectedPromptMessageComponent(message));
+		}
+		this.reply(options.model ?? "glm-5.3-prime", options.answer);
+	}
+
+	/**
+	 * The owner stopped the run from *another* view while a step was in flight: the reply that
+	 * called the step ended on its calls, the step came back with the loop's bare abort stub, and
+	 * the run ended there - no key press of this view's own to say why.
+	 */
+	stoppedInAnotherView(messageAt: number, call: { id: string; code: string }, options: { words?: string } = {}): void {
+		this.streaming = true;
+		this.flow.agentStart();
+		this.say(messageAt, {
+			...(options.words ? { words: options.words } : {}),
+			calls: [{ id: call.id, code: call.code, isError: true, text: TOOL_ABORT_FALLBACK_MESSAGE }],
+		});
+		this.endRun();
 	}
 
 	/** A subagent's message reaches the parent while its run goes on: its row lands in the chat. */

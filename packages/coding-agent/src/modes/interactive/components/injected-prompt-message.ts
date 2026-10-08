@@ -9,6 +9,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
+import stripAnsi from "strip-ansi";
 import { GOAL_CONTEXT_CUSTOM_TYPE, type GoalContextDetails } from "../../../core/goals.js";
 import {
 	AUTO_CONTINUE_CUSTOM_TYPE,
@@ -30,10 +31,10 @@ import {
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import {
 	type BlockFocusState,
+	copyFromSource,
 	decorateFocusedBlock,
 	type ExpandableBlock,
 	type FocusableBlock,
-	renderedCopyText,
 } from "./block-focus.js";
 import { SystemNoticeLine } from "./system-notice.js";
 import { boxRecordFromMessage } from "./turn-timeline.js";
@@ -172,8 +173,20 @@ export class InjectedPromptMessageComponent extends Container implements Focusab
 		this.blockFocus = state;
 	}
 
+	/**
+	 * What `y` copies: the card's headline and the prompt text the message holds. The rendered rows
+	 * wrap both to the width, so a long prompt (a heartbeat's, a goal's) copied from them came back
+	 * as one line per row with its paragraphs gone.
+	 */
 	getBlockCopyText(): string {
-		return renderedCopyText(super.render(100));
+		return copyFromSource(this.headline(), readCustomText(this.message));
+	}
+
+	/** The card's own first line in plain words, whichever face it shows. */
+	private headline(): string {
+		const notice = this.noticeParts();
+		const words = notice ? [notice.label, notice.detail].filter((part) => part !== "").join("  ") : this.headerText();
+		return stripAnsi(words).replace(/\s+/g, " ").trim();
 	}
 
 	private updateDisplay(): void {

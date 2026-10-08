@@ -82,9 +82,13 @@ export function blockNavigationKeysText(): string {
 /** Trailing spaces, with any styling escapes that follow them kept. */
 const TRAILING_PADDING = / +((?:\x1b\[[0-9;]*m)*)$/;
 
+/** Least columns of its own a row keeps when the hint takes the rest; a narrower terminal keeps the row whole. */
+const HINT_CUT_MIN_COLS = 4;
+
 /**
  * The focused look: every row on the selection background, the key hint
- * right-aligned on the first non-empty row, and the reveal marker in front.
+ * right-aligned on the first row that shows content (a row of timeline gutter
+ * alone does not), and the reveal marker in front.
  */
 export function decorateFocusedBlock(lines: readonly string[], width: number, state: BlockFocusState): string[] {
 	const paint = theme.getSelectionBackgroundColor();
@@ -98,6 +102,11 @@ export function decorateFocusedBlock(lines: readonly string[], width: number, st
 			const room = width - visibleWidth(row) - visibleWidth(hint) - 1;
 			if (room >= 2) {
 				row = `${row}${" ".repeat(room)}${theme.fg("dim", hint)} `;
+			} else if (width - visibleWidth(hint) - 2 >= HINT_CUT_MIN_COLS) {
+				// A row that already fills the terminal gives its last columns to the hint: a hint
+				// nobody can see tells the owner less than a row cut short does, and the block's own
+				// text is one key press away. A terminal too narrow for both keeps the row.
+				row = `${truncateToWidth(row, width - visibleWidth(hint) - 2, "…")}${theme.fg("dim", hint)} `;
 			}
 		}
 		const padded = row + " ".repeat(Math.max(0, width - visibleWidth(row)));
@@ -106,9 +115,21 @@ export function decorateFocusedBlock(lines: readonly string[], width: number, st
 	});
 }
 
-/** Whether a rendered row shows anything: styling escapes and spaces alone do not count. */
+/** Zero-width markers a row can carry (the content mark, a reveal mark): never content. */
+const ZERO_WIDTH_MARKS = /\x1b_[^\x07]*\x07/g;
+
+/**
+ * A rendered row's own words: its timeline gutter (the time, the rails), its styling escapes, its
+ * zero-width markers and nothing else. Every caller that asks what a row *shows* reads it this way,
+ * so a row that is only gutter never counts as content.
+ */
+export function rowWords(line: string): string {
+	return stripAnsi(withoutGutter(line)).replace(ZERO_WIDTH_MARKS, "");
+}
+
+/** Whether a rendered row shows anything: gutter, styling escapes, markers and spaces alone do not count. */
 export function isVisibleRow(line: string): boolean {
-	return stripAnsi(line).trim().length > 0;
+	return rowWords(line).trim().length > 0;
 }
 
 export interface BlockNavigatorHandlers {
@@ -241,18 +262,33 @@ export function withoutGutter(line: string): string {
 	return at === -1 ? line : line.slice(at + CONTENT_START_MARKER.length);
 }
 
-/** Plain text of rendered rows: styling, markers and the timeline gutter stripped, blank rows dropped. */
+/** Blank lines at the two ends of a text, which carry nothing; the ones inside are paragraph breaks. */
+function tidyBlock(text: string): string {
+	const lines = text.split("\n");
+	while (lines.length > 0 && (lines[0] ?? "").trim() === "") lines.shift();
+	while (lines.length > 0 && (lines.at(-1) ?? "").trim() === "") lines.pop();
+	return lines.join("\n");
+}
+
+/**
+ * What `y` copies: the parts of the block's own source, blank line apart. A card that holds the text
+ * it renders (a skill body, a compaction summary, a memory) copies that text, so its indentation and
+ * its paragraph breaks survive; only a card with no source falls back to its rendered rows.
+ */
+export function copyFromSource(...parts: ReadonlyArray<string | undefined>): string {
+	return parts
+		.map((part) => (part === undefined ? "" : tidyBlock(part.replace(/\r\n/g, "\n"))))
+		.filter((part) => part.length > 0)
+		.join("\n\n");
+}
+
+/**
+ * Plain text of rendered rows: styling, markers and the timeline gutter stripped. A row keeps its own
+ * indentation and the blank rows between paragraphs stay - a copy that trims every row flattens the
+ * code and the paragraphs of what it copied.
+ */
 export function renderedCopyText(lines: readonly string[]): string {
-	return lines
-		.map(withoutGutter)
-		.map((line) =>
-			stripAnsi(line)
-				.replace(/\x1b_[^\x07]*\x07/g, "")
-				.trimEnd(),
-		)
-		.filter((line) => line.trim().length > 0)
-		.map((line) => line.trim())
-		.join("\n");
+	return tidyBlock(lines.map((line) => rowWords(line).trimEnd()).join("\n"));
 }
 
 /**

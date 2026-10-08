@@ -1113,24 +1113,26 @@ describe("a quiet turn across a chat rebuild", () => {
 		harness.setResponses([bashCall("npm run e2e"), bashCall("npm run e2e -- --bail"), reply("e2e 过了。")]);
 		const prompt = run(harness, "跑一下 e2e");
 		await e2e.started;
-		// The session stops the run itself (no key press): live, the next message
-		// carries the same turn on, while the replay only sees the stop's stub.
+		// The stop comes from outside this view (another window's Escape, a `stop` command): all it
+		// leaves here is the loop's bare abort stub, which is what says the owner stopped the run.
 		await harness.session.abort();
 		await prompt;
 		await run(harness, "失败了就只跑出错的那个");
 
 		const screen = startScreen(steps);
 		feed(screen, steps);
-		expect(screen.boxes()).toHaveLength(1);
-		expectSteerLine(screen.screen(), "失败了就只跑出错的那个");
+		// The run ended on that stop, so the next prompt opens a box of its own - the grouping a
+		// replay of the same transcript gives. Live used to carry the prompt into the stopped box
+		// (`你插话`) and the rebuild below then re-grouped the chat into two boxes (R3-M18).
+		expect(screen.boxes()).toHaveLength(2);
+		expect(screen.prompts()).toBe(2);
+		expect(screen.screen()).not.toContain("你插话");
 		vi.advanceTimersByTime(100);
 		screen.rebuild(transcriptAt(steps, steps.length));
 		const replayed = screen.boxes();
-		// Fixture integrity: the replay starts a turn at the message after the
-		// stopped step, so the live box has two replayed twins settling at the same time.
-		expect(replayed.length).toBeGreaterThanOrEqual(2);
+		expect(replayed).toHaveLength(2);
 		vi.advanceTimersByTime(SETTLE_MS);
-		expect(replayed.map((box) => box.state.boxLive)).toEqual(replayed.map(() => false));
+		expect(replayed.map((box) => box.state.boxLive)).toEqual([false, false]);
 		expect(vi.getTimerCount()).toBe(0);
 	});
 });

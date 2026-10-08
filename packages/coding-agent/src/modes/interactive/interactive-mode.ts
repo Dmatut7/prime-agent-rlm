@@ -7202,7 +7202,12 @@ export class InteractiveMode {
 					// Typed while the AI was mid-way through its steps: the interjection is
 					// a row in the running turn's box (`› 你插话：…`), not a new turn.
 					const text = this.getUserMessageText(event.message);
-					if (this.turnFlow.userMessage(text, Number(event.message.timestamp)) === "interjection") {
+					// A stored heartbeat prompt arrives as a plain user message but is not the
+					// owner's question: say so before the flow groups it, or the round it wakes
+					// resets the lane of the question still running and reads as the owner's own
+					// (the replay reads the same prompt through renderUserPrompt's ownerOpened).
+					const heartbeat = text ? this.createLegacyHeartbeatPromptMessage(event.message, text) : undefined;
+					if (this.turnFlow.userMessage(text, Number(event.message.timestamp), heartbeat) === "interjection") {
 						this.ui.requestRender();
 						break;
 					}

@@ -603,6 +603,13 @@ export function replayConversation(
 ): ConversationReplayResult {
 	const hooks = options.hooks;
 	const pendingTools = new Map<string, ToolExecutionComponent>();
+	/**
+	 * Calls of a reply that died (aborted, error), whose result this replay made up - the `已中断`
+	 * the live view only shows for a call that never reported back. The transcript can still carry
+	 * the call's real result (the owner's Escape lands after the tool settled, and the live view
+	 * keeps that output), so the made-up row is kept here and the real result replaces it.
+	 */
+	const fabricatedTools = new Map<string, ToolExecutionComponent>();
 	// Results that arrived without their call in this replay (the call is above
 	// the window). Returned to the caller; a backfill page re-pairs them.
 	const orphanToolResults = new Map<string, Extract<AgentMessage, { role: "toolResult" }>>();
@@ -955,6 +962,7 @@ export function replayConversation(
 					// "running" forever, the footnote's duration becomes
 					// Date.now()-startedAt and never freezes.
 					turnState.setStepStatus(content.id, "error", Number(message.timestamp) || Date.now());
+					fabricatedTools.set(content.id, tool);
 				} else {
 					pendingTools.set(content.id, tool);
 				}
@@ -965,14 +973,17 @@ export function replayConversation(
 			resultsArrived = true;
 			resultStop = stepResultStop(message);
 			noteRoundAt(message);
-			// Match tool results to pending tool components
-			const component = pendingTools.get(message.toolCallId);
+			// Match tool results to pending tool components, then to the ones this replay
+			// settled as interrupted: a real result beats the `已中断` made up for it, and
+			// is not an orphan (nothing is left to re-pair it with).
+			const component = pendingTools.get(message.toolCallId) ?? fabricatedTools.get(message.toolCallId);
 			if (component) {
 				component.updateResult(message);
 				pendingTools.delete(message.toolCallId);
+				fabricatedTools.delete(message.toolCallId);
 			} else {
-				// The call is outside this replay's window (or was already settled
-				// as interrupted): keep the result for a backfill page to re-pair.
+				// The call is outside this replay's window: keep the result for a backfill
+				// page to re-pair.
 				orphanToolResults.set(message.toolCallId, message);
 			}
 			turnState?.setStepStatus(

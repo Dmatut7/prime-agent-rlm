@@ -1,0 +1,6 @@
+- Fixed the block-navigation key hint landing on a turn box's empty top rail row while the first event row lost its `N 步 ▸`: the hint now sits on the row that made room for it, and a first row too full to fit the hint gives up its last columns instead of losing it.
+- Fixed `y` on an expanded card (a skill, a compaction summary, an injected prompt, a refinement memory) flattening what it copied - every row trimmed and the blank rows dropped - so a block copy now carries the card's own source text, indentation and paragraph breaks included.
+- Fixed a long interjection (`你插话`) being cut to its row with no way to read the rest of it: it now opens to the whole text, by click, by Enter and by the keyboard walk, like any other event row.
+- Fixed a replayed turn whose reply was interrupted stamping a made-up `已中断` over a step whose real result the transcript kept, dropping that output and an edit's diff.
+- Fixed a heartbeat prompt being taken for the owner's question in the live view, which reset the lane of the question still running (its `还在干活` row and the `──╯` that closes it disappeared) and stamped the round it woke as the owner's own.
+- Fixed a stop from another view pulling the next prompt into the stopped box live (as `你插话`) while a replay of the same transcript opened a turn of its own, so a rebuild re-grouped the chat.

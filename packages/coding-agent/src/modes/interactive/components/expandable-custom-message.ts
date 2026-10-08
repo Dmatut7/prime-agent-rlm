@@ -45,8 +45,17 @@ export abstract class ExpandableCustomMessageBox extends Box implements Focusabl
 		this.blockFocus = state;
 	}
 
+	/**
+	 * What `y` copies: the card's own source text when it holds any, so the copy keeps the
+	 * indentation and the paragraph breaks its rendered rows do not; those rows otherwise.
+	 */
 	getBlockCopyText(): string {
-		return renderedCopyText(super.render(100));
+		return this.sourceCopyText() ?? renderedCopyText(super.render(100));
+	}
+
+	/** This card's own source text (see `copyFromSource`), or undefined when it holds none. */
+	protected sourceCopyText(): string | undefined {
+		return undefined;
 	}
 
 	protected abstract updateDisplay(): void;

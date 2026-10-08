@@ -205,8 +205,14 @@ export class LiveTurnFlow {
 		this.runCutMidTask =
 			this.host.quiet() &&
 			(this.lastStop ?? this.replayedStop(state)) === "toolUse" &&
-			state?.boxMode === true &&
-			!state.timeline.stopped;
+			state !== undefined &&
+			state.boxMode === true &&
+			!state.timeline.stopped &&
+			// A stop from another view leaves only its abort stub on the step it caught: that run
+			// ended there, so what comes next opens a turn of its own - the grouping a replay of the
+			// same transcript gives. Its box has not said 已停止 yet (that lands when the settle
+			// timer fires), so the stub ledger is what names the case here.
+			!this.stubStopped.has(state);
 		this.lastStop = undefined;
 		this.userStopped = false;
 		if (!this.host.quiet()) this.host.setCurrent(undefined);
@@ -298,8 +304,16 @@ export class LiveTurnFlow {
 		for (const child of tail) chat.addChild(child);
 	}
 
-	/** A user message arrived: an interjection in the running turn's box, or a new prompt. */
-	userMessage(text: string, timestamp: number): "interjection" | "prompt" {
+	/**
+	 * A user message arrived: an interjection in the running turn's box, or a new prompt.
+	 *
+	 * `wokenBy` is what the message really is when it is not the owner's question - the notice a
+	 * stored heartbeat prompt stands for. Such a message opens a round of its own the way any other
+	 * wake does, so the lane of the question still running survives it and the round is not stamped
+	 * as the owner's; a replay reads the same prompt the same way (`renderUserPrompt`'s
+	 * `ownerOpened: false`). Typed while a step runs it is still an interjection, as in a replay.
+	 */
+	userMessage(text: string, timestamp: number, wokenBy?: CustomMessage): "interjection" | "prompt" {
 		this.joinedRound = false;
 		const quiet = this.host.quiet();
 		const state = this.host.currentState();
@@ -313,6 +327,7 @@ export class LiveTurnFlow {
 			this.host.requestRender();
 			return "interjection";
 		}
+		if (wokenBy) return this.customMessage(wokenBy) ? "interjection" : "prompt";
 		this.starterSinceRunStart = true;
 		this.starterKind = "user";
 		this.pendingCause = undefined;

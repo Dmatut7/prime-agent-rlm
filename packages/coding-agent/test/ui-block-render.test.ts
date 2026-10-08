@@ -550,7 +550,7 @@ describe("a short note is the event's own line", () => {
 		expect(openedLines.join("\n")).not.toContain("▎");
 	});
 
-	it("shows a short interjection and a long one as one `你插话` line each, with nothing to click", () => {
+	it("shows a short interjection as one `你插话` line, with nothing to click", () => {
 		const turn = quietTurn();
 		turn.timeline.addSteer("先别动安卓的，只升级 Go", Date.now());
 		const short = turn.summary.render(WIDTH);
@@ -562,19 +562,35 @@ describe("a short note is the event's own line", () => {
 		expect(shortShown[0]).not.toContain("▸");
 		expect(regionsOn(turn, 0)).toHaveLength(0);
 		expect(turn.summary.getFocusOrder()).toHaveLength(0);
+	});
 
-		const longTurn = quietTurn();
-		longTurn.timeline.addSteer(
-			"这一条插话很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长",
-			Date.now(),
-		);
-		const long = longTurn.summary.render(60);
-		const longShown = plain(long);
-		expect(longShown[0]).toMatch(/^ \d\d:\d\d {3}● {6}你插话 {3}这一条插话很长.*…$/);
-		expect(widthOf(longShown[0] ?? "")).toBeLessThanOrEqual(60);
-		expect(long[0]?.includes(ANY_BG)).toBe(false);
-		expect(regionsOn(longTurn, 0)).toHaveLength(0);
-		expect(longTurn.summary.getFocusOrder()).toHaveLength(0);
+	/**
+	 * R5-M17: an interjection the row cut used to be cut for good - no arrow, no click area and no
+	 * key to walk to, so what the owner had typed past the first screenful was unreachable.
+	 */
+	it("opens a long interjection to the whole of what the owner typed", () => {
+		const words = "这一条插话很长，".repeat(14);
+		const turn = quietTurn();
+		turn.timeline.addSteer(words, Date.now());
+		const closed = turn.summary.render(60);
+		const closedShown = plain(closed);
+		expect(closedShown[0]).toMatch(/^ \d\d:\d\d {3}● {6}你插话 {3}这一条插话很长.*… +▸ {2}$/);
+		expect(widthOf(closedShown[0] ?? "")).toBeLessThanOrEqual(60);
+		expect(closed[0]?.includes(ANY_BG)).toBe(false);
+		expect(closedShown.join("\n")).not.toContain(words);
+		expect(regionsOn(turn, 0)).toHaveLength(1);
+		const order = turn.summary.getFocusOrder();
+		expect(order).toHaveLength(1);
+		expect(order[0]?.startsWith("ev:steer:")).toBe(true);
+
+		regionsOn(turn, 0)[0]?.onClick({ row: 0, col: 0 });
+		const opened = plain(turn.summary.render(60));
+		expect(opened[0]).toMatch(/▴ {2}$/);
+		const whole = opened
+			.filter((line) => /^ {9}│ {6}\S/.test(line))
+			.map((line) => line.replace(/^ {9}│ {6}/, ""))
+			.join("");
+		expect(whole).toBe(words);
 	});
 
 	it("walks events and their steps with the keyboard, never a note or an interjection on its own", () => {

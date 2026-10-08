@@ -11,10 +11,10 @@ import type { AppliedRefinementEdit, HarnessScope } from "../../../core/refineme
 import { theme } from "../theme/theme.js";
 import {
 	type BlockFocusState,
+	copyFromSource,
 	decorateFocusedBlock,
 	type ExpandableBlock,
 	type FocusableBlock,
-	renderedCopyText,
 } from "./block-focus.js";
 import { sanitizeDisplayText } from "./diff-rows.js";
 import { shortMemoryTitle } from "./feed-data.js";
@@ -74,6 +74,35 @@ function scopeWord(scope: HarnessScope): string {
 	return scope === "global" ? "全局" : "本会话";
 }
 
+/** What the note says when the tidy kept edits: how many of each kind, and where they live. */
+function keptNoteText(edits: readonly AppliedRefinementEdit[], scope: HarnessScope): string {
+	const applied = edits.filter((edit) => edit.applied);
+	const failedEdits = edits.filter((edit) => !edit.applied);
+	const said = [
+		["新记", applied.filter((edit) => edit.action === "create").length],
+		["改了", applied.filter((edit) => edit.action === "update").length],
+		["删了", applied.filter((edit) => edit.action === "delete").length],
+	]
+		.filter(([, count]) => count !== 0)
+		.map(([word, count]) => `${word} ${count} 条`);
+	if (failedEdits.length > 0) said.push(`${failedEdits.length} 条没写进去`);
+	return `回合后整理记忆：${said.join("，")}（${scopeWord(scope)}）`;
+}
+
+/** What the note says when the tidy wrote nothing: its head, and the reason it gives for itself. */
+function missedNoteText(error: string | undefined): { head: string; why: string } {
+	const reason = error ? sanitizeDisplayText(error).split("\n")[0] : undefined;
+	return {
+		head: "回合后整理记忆：没写进去",
+		why: reason ? `整理器这次没给出结果（${reason}），下一轮会再试` : "整理器这次没给出结果，下一轮会再试",
+	};
+}
+
+/** What the note says when a /refine the owner asked for found nothing to change. */
+function nothingToChangeNoteText(scope: HarnessScope): string {
+	return `回合后整理记忆：这次没有要改的记忆（${scopeWord(scope)}）`;
+}
+
 let hoverIds = 0;
 
 /** Durable refinement outcome: one note row, opened by its own click or Enter (never the process key). */
@@ -103,8 +132,43 @@ export class RefinementOutcomeMessageComponent implements Component, FocusableBl
 		this.blockFocus = state;
 	}
 
+	/**
+	 * What `y` copies: the note's own words and every entry's source text. The rendered rows wrap a
+	 * memory to the width and trim each row, so a memory copied from them lost its indentation and
+	 * its blank lines; a card that is not open showed one row and copied only that.
+	 */
 	getBlockCopyText(): string {
-		return renderedCopyText(this.renderLines(100, true));
+		const { edits, scope, failed, error, source, summary } = this.message.details;
+		if (failed || edits.length === 0) {
+			if (!failed && source === "user") return nothingToChangeNoteText(scope);
+			const missed = missedNoteText(error);
+			return `${missed.head} · ${missed.why}`;
+		}
+		const parts: string[] = [keptNoteText(edits, scope)];
+		const why = sanitizeDisplayText(summary ?? "").trim();
+		if (why) parts.push(why);
+		for (const edit of edits) {
+			const change = refinementEditAsMemoryChange(edit, scope, this.message.timestamp);
+			const title = sanitizeDisplayText(change.title);
+			if (!edit.applied) {
+				const reason = edit.error ? `：${sanitizeDisplayText(edit.error)}` : "";
+				parts.push(`✗ ${title}  没写进去${reason}`);
+				continue;
+			}
+			const rename =
+				change.previousTitle !== undefined && change.previousTitle !== change.title
+					? `改名  ${sanitizeDisplayText(change.previousTitle)} → ${title}`
+					: undefined;
+			parts.push(
+				copyFromSource(
+					`${memoryHeadLabel(change)}   ${title}`,
+					rename,
+					// A delete copies what it removed; anything else copies what it left behind.
+					sanitizeDisplayText(edit.action === "delete" ? (change.before ?? "") : (change.after ?? "")),
+				),
+			);
+		}
+		return copyFromSource(...parts);
 	}
 
 	getClickRegions(): ReadonlyArray<ClickRegion> {
@@ -146,25 +210,15 @@ export class RefinementOutcomeMessageComponent implements Component, FocusableBl
 			if (!failed && source === "user") {
 				// A deliberate no-op answers the /refine, plainly; the failed-tidy wording
 				// below (amber, "下一轮会再试") belongs to a refiner that produced nothing.
-				lines.push(row(noteGutter, dim(`回合后整理记忆：这次没有要改的记忆（${scopeWord(scope)}）`)));
+				lines.push(row(noteGutter, dim(nothingToChangeNoteText(scope))));
 				return lines;
 			}
-			const reason = error ? sanitizeDisplayText(error).split("\n")[0] : undefined;
-			const why = reason ? `整理器这次没给出结果（${reason}），下一轮会再试` : "整理器这次没给出结果，下一轮会再试";
-			lines.push(row(noteGutter, `${theme.fg("timelineFix", "回合后整理记忆：没写进去")}${dim(` · ${why}`)}`));
+			const missed = missedNoteText(error);
+			lines.push(row(noteGutter, `${theme.fg("timelineFix", missed.head)}${dim(` · ${missed.why}`)}`));
 			return lines;
 		}
-		const applied = edits.filter((edit) => edit.applied);
 		const failedEdits = edits.filter((edit) => !edit.applied);
-		const said = [
-			["新记", applied.filter((edit) => edit.action === "create").length],
-			["改了", applied.filter((edit) => edit.action === "update").length],
-			["删了", applied.filter((edit) => edit.action === "delete").length],
-		]
-			.filter(([, count]) => count !== 0)
-			.map(([word, count]) => `${word} ${count} 条`);
-		if (failedEdits.length > 0) said.push(`${failedEdits.length} 条没写进去`);
-		const text = `回合后整理记忆：${said.join("，")}（${scopeWord(scope)}）`;
+		const text = keptNoteText(edits, scope);
 		const right = dim(this.expanded ? "收起 ▴" : "展开 ▸");
 		const head = row(noteGutter, failedEdits.length > 0 ? theme.fg("timelineFix", text) : dim(text), right);
 		lines.push(

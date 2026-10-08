@@ -1,6 +1,7 @@
 import { Clickable, Container, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
 import type { CompactionSummaryMessage } from "../../../core/messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
+import { copyFromSource } from "./block-focus.js";
 import { customMessageLabel, ExpandableCustomMessageBox } from "./expandable-custom-message.js";
 import { SystemNoticeLine } from "./system-notice.js";
 import { formatBoxTokens } from "./turn-timeline.js";
@@ -13,6 +14,19 @@ export class CompactionSummaryMessageComponent extends ExpandableCustomMessageBo
 	) {
 		super();
 		this.updateDisplay();
+	}
+
+	/** The summary's own markdown under the line the card shows: the copy keeps its paragraphs and code. */
+	protected override sourceCopyText(): string {
+		return copyFromSource(this.headline(), this.message.summary);
+	}
+
+	/** `Compacted from 12,345 tokens · focus: …` - the card's own line, in plain words. */
+	private headline(): string {
+		const instructions = this.message.customInstructions;
+		return `Compacted from ${this.message.tokensBefore.toLocaleString()} tokens${
+			instructions ? ` · focus: ${instructions}` : ""
+		}`;
 	}
 
 	protected updateDisplay(): void {
@@ -36,14 +50,8 @@ export class CompactionSummaryMessageComponent extends ExpandableCustomMessageBo
 				}),
 			);
 		} else {
-			const focus = instructions ? ` · focus: ${instructions}` : "";
 			// U6: no per-line expand hint — the global tail line states the keys.
-			this.addChild(
-				new Clickable(
-					new Text(theme.fg("customMessageText", `Compacted from ${tokenStr} tokens${focus}`), 0, 0),
-					toggle,
-				),
-			);
+			this.addChild(new Clickable(new Text(theme.fg("customMessageText", this.headline()), 0, 0), toggle));
 		}
 	}
 }

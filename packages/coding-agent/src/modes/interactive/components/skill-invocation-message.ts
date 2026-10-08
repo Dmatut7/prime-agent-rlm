@@ -1,6 +1,7 @@
 import { Clickable, Markdown, type MarkdownTheme, Text } from "@earendil-works/pi-tui";
 import type { ParsedSkillBlock } from "../../../core/skill-blocks.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
+import { copyFromSource } from "./block-focus.js";
 import { customMessageLabel, ExpandableCustomMessageBox } from "./expandable-custom-message.js";
 
 /** Skill invocation card; the user message is rendered separately. */
@@ -11,6 +12,11 @@ export class SkillInvocationMessageComponent extends ExpandableCustomMessageBox 
 	) {
 		super();
 		this.updateDisplay();
+	}
+
+	/** The skill's own markdown: the copy keeps the code blocks and the lists as the skill wrote them. */
+	protected override sourceCopyText(): string {
+		return copyFromSource(this.skillBlock.name, this.skillBlock.content);
 	}
 
 	protected updateDisplay(): void {
