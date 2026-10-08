@@ -11,7 +11,12 @@ import {
 	Text,
 } from "@earendil-works/pi-tui";
 import type { IdleEvictionMinutes } from "../../../core/session-action-store.js";
-import type { MermaidRenderingMode, ProcessModeSetting, WarningSettings } from "../../../core/settings-manager.js";
+import type {
+	MermaidRenderingMode,
+	ProcessModeSetting,
+	Settings,
+	WarningSettings,
+} from "../../../core/settings-manager.js";
 import { getSelectListTheme, getSettingsListTheme, theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 
@@ -59,6 +64,50 @@ export function formatSettingValue(value: string): string {
 	return SETTING_VALUE_LABELS[value] ?? value;
 }
 
+/**
+ * Panel item ids whose setting the project layer pins. The panel shows the
+ * merged value but every toggle writes the global file, so a project-pinned
+ * key used to swallow the switch in silence: the write succeeded, the row
+ * changed colour, and the next launch showed the project value again. The
+ * panel marks these items so the user can see why a switch does not stick.
+ * Session-state items (auto-compact, thinking level) have no settings.json
+ * key and are never in this set.
+ */
+export function projectPinnedSettingItems(projectSettings: Settings): Set<string> {
+	const pinned = new Set<string>();
+	const pin = (id: string, value: unknown) => {
+		if (value !== undefined) pinned.add(id);
+	};
+	pin("idle-eviction-minutes", projectSettings.idleEvictionMinutes);
+	pin("steering-mode", projectSettings.steeringMode);
+	pin("follow-up-mode", projectSettings.followUpMode);
+	pin("transport", projectSettings.transport);
+	pin("hide-thinking", projectSettings.hideThinkingBlock);
+	pin("mermaid-rendering", projectSettings.markdown?.mermaid);
+	pin("process-mode", projectSettings.ui?.processMode);
+	pin("timeline-open", projectSettings.ui?.timelineOpenWhileWorking);
+	pin("timeline-fold", projectSettings.ui?.timelineAutoFold);
+	pin("reduce-motion", projectSettings.ui?.reduceMotion);
+	pin("quiet-startup", projectSettings.quietStartup);
+	pin("tree-filter-mode", projectSettings.treeFilterMode);
+	pin("warnings", projectSettings.warnings);
+	pin("theme", projectSettings.theme);
+	pin("show-images", projectSettings.terminal?.showImages);
+	pin("auto-resize-images", projectSettings.images?.autoResize);
+	pin("block-images", projectSettings.images?.blockImages);
+	pin("skill-commands", projectSettings.enableSkillCommands);
+	pin("builtin-skills", projectSettings.enableBuiltinSkills);
+	pin("show-hardware-cursor", projectSettings.showHardwareCursor);
+	pin("editor-padding", projectSettings.editorPaddingX);
+	pin("autocomplete-max-visible", projectSettings.autocompleteMaxVisible);
+	pin("clear-on-shrink", projectSettings.terminal?.clearOnShrink);
+	pin("terminal-progress", projectSettings.terminal?.showTerminalProgress);
+	pin("fullscreen", projectSettings.terminal?.fullscreen);
+	return pinned;
+}
+
+const PROJECT_PINNED_HINT = "项目 settings.json 固定了此项：切换只写进全局配置，本项目里不生效";
+
 export interface SettingsConfig {
 	autoCompact: boolean;
 	idleEvictionMinutes: IdleEvictionMinutes;
@@ -89,6 +138,8 @@ export interface SettingsConfig {
 	showTerminalProgress: boolean;
 	fullscreen: boolean;
 	warnings: WarningSettings;
+	/** Panel item ids pinned by the project layer (see projectPinnedSettingItems); their rows carry a hint. */
+	projectPinnedItems?: ReadonlySet<string>;
 }
 
 export interface SettingsCallbacks {
@@ -503,6 +554,16 @@ export class SettingsSelectorComponent extends Container {
 			currentValue: config.fullscreen ? "true" : "false",
 			values: ["true", "false"],
 		});
+
+		if (config.projectPinnedItems && config.projectPinnedItems.size > 0) {
+			for (const item of items) {
+				if (config.projectPinnedItems.has(item.id)) {
+					item.description = item.description
+						? `${item.description}。${PROJECT_PINNED_HINT}`
+						: PROJECT_PINNED_HINT;
+				}
+			}
+		}
 
 		this.addChild(new DynamicBorder());
 

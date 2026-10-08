@@ -3,6 +3,7 @@ import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import {
 	formatSettingValue,
+	projectPinnedSettingItems,
 	type SettingsCallbacks,
 	type SettingsConfig,
 	SettingsSelectorComponent,
@@ -90,6 +91,32 @@ describe("SettingsSelectorComponent", () => {
 		} finally {
 			resetCapabilitiesCache();
 		}
+	});
+
+	test("marks a project-pinned row so a swallowed toggle is visible (R4-M20)", () => {
+		expect(projectPinnedSettingItems({ theme: "dark" }).has("theme")).toBe(true);
+		expect(
+			projectPinnedSettingItems({
+				ui: { processMode: "legacy" },
+				terminal: { showImages: false },
+			}).has("process-mode"),
+		).toBe(true);
+		expect(
+			projectPinnedSettingItems({
+				ui: { processMode: "legacy" },
+				terminal: { showImages: false },
+			}).has("show-images"),
+		).toBe(true);
+		expect(projectPinnedSettingItems({ theme: "dark" }).has("show-images")).toBe(false);
+		expect(projectPinnedSettingItems({}).size).toBe(0);
+
+		const component = new SettingsSelectorComponent({ ...config, projectPinnedItems: new Set(["theme"]) }, callbacks);
+		const list = component.getSettingsList();
+		for (const character of "theme") list.handleInput(character);
+
+		const rendered = stripAnsi(component.render(120).join("\n"));
+		expect(rendered).toContain("主题");
+		expect(rendered).toContain("项目 settings.json 固定了此项");
 	});
 
 	test("shows values in Chinese while the stored values stay unchanged", () => {

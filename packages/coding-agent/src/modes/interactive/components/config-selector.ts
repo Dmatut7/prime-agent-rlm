@@ -162,7 +162,7 @@ class ConfigSelectorHeader implements Component {
 	render(width: number): string[] {
 		const title = "Resource Configuration";
 		const sep = theme.fg("muted", " · ");
-		const hint = rawKeyHint("space", "toggle") + sep + rawKeyHint("esc", "close");
+		const hint = rawKeyHint("enter", "toggle") + sep + rawKeyHint("esc", "close");
 		const hintWidth = visibleWidth(hint);
 		const titleWidth = visibleWidth(title);
 		const spacing = Math.max(1, width - titleWidth - hintWidth);
@@ -188,6 +188,9 @@ class ResourceList implements Component, Focusable {
 	public onCancel?: () => void;
 	public onExit?: () => void;
 	public onToggle?: (item: ResourceItem, newEnabled: boolean) => void;
+	/** Fired when an asynchronous state change (a persistence-failure verdict) needs a repaint. */
+	public onRenderRequest?: () => void;
+	private persistenceError: string | undefined;
 
 	private _focused = false;
 	get focused(): boolean {
@@ -314,6 +317,10 @@ class ResourceList implements Component, Focusable {
 		lines.push(...this.searchInput.render(width));
 		lines.push("");
 
+		if (this.persistenceError) {
+			lines.push(theme.fg("error", `  保存失败：${this.persistenceError}（改动没有写入磁盘。）`));
+		}
+
 		if (this.filteredItems.length === 0) {
 			lines.push(theme.fg("muted", "  No resources found"));
 			return lines;
@@ -400,16 +407,28 @@ class ResourceList implements Component, Focusable {
 			this.onExit?.();
 			return;
 		}
-		if (kb.matches(data, "tui.select.toggle") || kb.matches(data, "tui.select.confirm")) {
+		if (kb.matches(data, "tui.select.confirm")) {
 			const entry = this.filteredItems[this.selectedIndex];
 			if (entry?.type === "item") {
 				const newEnabled = !entry.item.enabled;
 				this.toggleResource(entry.item, newEnabled);
 				this.updateItem(entry.item, newEnabled);
 				this.onToggle?.(entry.item, newEnabled);
+				// The write is queued and its failure is recorded, not thrown, so a
+				// failed toggle used to flip the checkbox while the disk never
+				// moved and say nothing. Surface the recorded reason instead (H-2).
+				void this.settingsManager.persistenceFailure().then((reason) => {
+					this.persistenceError = reason;
+					this.onRenderRequest?.();
+				});
 			}
 			return;
 		}
+		// The filter field owns printable characters: a space is filter text, not
+		// "toggle the selected resource" - otherwise every typed space silently
+		// flips whichever resource the filter happens to have selected and writes
+		// it to disk. Same gate as SettingsList (settings-list.ts); Enter still
+		// toggles, so `tui.select.toggle` deliberately falls through to the input.
 
 		// Pass to search input
 		this.searchInput.handleInput(data);
@@ -589,6 +608,7 @@ export class ConfigSelectorComponent extends Container implements Focusable {
 		this.resourceList.onCancel = onClose;
 		this.resourceList.onExit = onExit;
 		this.resourceList.onToggle = () => requestRender();
+		this.resourceList.onRenderRequest = requestRender;
 		this.addChild(this.resourceList);
 
 		// Bottom border

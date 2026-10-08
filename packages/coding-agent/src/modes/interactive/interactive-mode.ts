@@ -294,7 +294,7 @@ import {
 	RefinementOutcomeMessageComponent,
 } from "./components/refinement-outcome-message.js";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.js";
-import { SettingsSelectorComponent } from "./components/settings-selector.js";
+import { projectPinnedSettingItems, SettingsSelectorComponent } from "./components/settings-selector.js";
 import { SideQuestionComponent } from "./components/side-question.js";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.js";
 import {
@@ -2050,6 +2050,15 @@ export class InteractiveMode {
 
 		setRegisteredThemes(this.uiServices.getThemes());
 		initTheme(this.settingsManager.getTheme(), true);
+
+		// A hand edit of settings.json reloads into this process but used to say
+		// nothing: the recorded warnings had no consumer while the session ran.
+		// Show each one as it lands.
+		this.settingsManager.onExternalSettingsReload(() => {
+			for (const { message } of this.settingsManager.drainWarnings()) {
+				this.showWarning(message);
+			}
+		});
 	}
 
 	private get promptStash(): PromptStash | undefined {
@@ -12014,6 +12023,10 @@ export class InteractiveMode {
 					showTerminalProgress: this.settingsManager.getShowTerminalProgress(),
 					fullscreen: this.fullscreenEnabled,
 					warnings: this.settingsManager.getWarnings(),
+					// The panel shows merged values but writes the global layer; mark
+					// the rows the project settings.json pins so a switch is not
+					// swallowed in silence (R4-M20).
+					projectPinnedItems: projectPinnedSettingItems(this.settingsManager.getProjectSettings()),
 				},
 				{
 					onAutoCompactChange: (enabled) => {

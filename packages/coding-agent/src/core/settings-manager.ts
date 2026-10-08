@@ -1789,6 +1789,7 @@ export class SettingsManager {
 	 */
 	private ancestorStamps = new Map<string, string | undefined>();
 	private externalWatchers: Array<{ path: string; listener: () => void }> = [];
+	private externalReloadListeners: Array<() => void> = [];
 	private externalWatchSettleTimer: ReturnType<typeof setTimeout> | undefined;
 	private externalEditReload: Promise<void> | undefined;
 
@@ -2188,6 +2189,31 @@ export class SettingsManager {
 		return this.externalWatchers.length > 0;
 	}
 
+	/**
+	 * Listen for a direct settings.json edit having been reloaded into the
+	 * running session. The reload only records a warning, and nothing called
+	 * drainWarnings while the session ran, so a hand edit applied (or failed to
+	 * parse) in complete silence and the warnings array grew without bound in a
+	 * long-lived process. A UI listener is the consumer: drain and show.
+	 * Returns an unsubscribe function.
+	 */
+	onExternalSettingsReload(listener: () => void): () => void {
+		this.externalReloadListeners.push(listener);
+		return () => {
+			this.externalReloadListeners = this.externalReloadListeners.filter((l) => l !== listener);
+		};
+	}
+
+	private notifyExternalSettingsReload(): void {
+		for (const listener of this.externalReloadListeners) {
+			try {
+				listener();
+			} catch {
+				// A listener must not break the reload chain or fellow listeners.
+			}
+		}
+	}
+
 	/** Stop watching for external settings edits. Safe to call when not watching. */
 	stopWatchingExternalSettings(): void {
 		if (this.externalWatchSettleTimer !== undefined) {
@@ -2226,15 +2252,16 @@ export class SettingsManager {
 							"Consent gates (agent traces, telemetry) treat the unparseable scope as withdrawn " +
 							`until the file parses again. Parse error: ${loadError.message}`,
 					);
-					return;
+				} else {
+					this.recordWarning(
+						scope,
+						`external-edit:${scope}:${stamp ?? "removed"}`,
+						"settings.json changed on disk while the session was running: it was reloaded into this session. " +
+							"Settings already read earlier in the session (theme, tool or resource lists, model defaults) still " +
+							"need /reload or a restart to change.",
+					);
 				}
-				this.recordWarning(
-					scope,
-					`external-edit:${scope}:${stamp ?? "removed"}`,
-					"settings.json changed on disk while the session was running: it was reloaded into this session. " +
-						"Settings already read earlier in the session (theme, tool or resource lists, model defaults) still " +
-						"need /reload or a restart to change.",
-				);
+				this.notifyExternalSettingsReload();
 			})
 			.catch((error) => {
 				this.recordError(scope, error);
@@ -2645,7 +2672,10 @@ export class SettingsManager {
 	}
 
 	getSteeringMode(): "all" | "one-at-a-time" {
-		return this.settings.steeringMode || "one-at-a-time";
+		// Parsed settings are only cast to Settings; a non-string JSON value
+		// (e.g. 42) must behave as the default, never leak into the /settings
+		// panel render, where it crashed the process with a TypeError.
+		return this.settings.steeringMode === "all" ? "all" : "one-at-a-time";
 	}
 
 	setSteeringMode(mode: "all" | "one-at-a-time"): void {
@@ -2655,7 +2685,8 @@ export class SettingsManager {
 	}
 
 	getFollowUpMode(): "all" | "one-at-a-time" {
-		return this.settings.followUpMode || "one-at-a-time";
+		// Same guard as getSteeringMode: malformed values read as the default.
+		return this.settings.followUpMode === "all" ? "all" : "one-at-a-time";
 	}
 
 	setFollowUpMode(mode: "all" | "one-at-a-time"): void {
@@ -2665,7 +2696,12 @@ export class SettingsManager {
 	}
 
 	getTheme(): string | undefined {
-		return this.settings.theme;
+		// Hand-edited or corrupt settings files can persist non-string values
+		// (e.g. `theme: 42`); treat anything malformed as unset so the /settings
+		// panel and theme init fall back instead of throwing (same guard as
+		// getAuxiliaryModel).
+		const value = this.settings.theme;
+		return typeof value === "string" ? value : undefined;
 	}
 
 	setTheme(theme: string): void {
@@ -2749,7 +2785,10 @@ export class SettingsManager {
 	}
 
 	getTransport(): TransportSetting {
-		return this.settings.transport ?? "auto";
+		// Same guard as getProcessMode: unknown or non-string values land on the
+		// default, never throw into the /settings panel render.
+		const value = this.settings.transport;
+		return value === "sse" || value === "websocket" || value === "websocket-cached" ? value : "auto";
 	}
 
 	getProcessMode(): ProcessModeSetting {
