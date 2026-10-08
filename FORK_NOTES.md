@@ -1,3 +1,14 @@
+## 2026-10-08 显示审计第五波·上：六车道并行合入（A/E/G/H/F + D）
+
+> 交接文档 docs/audits/2026-10-08-fix-backlog.md 的批次 A/E/G/H/F/D 由六个独立 worktree 车道并行完成，主会话逐条 merge --squash 合入，每合一条主树 `npm run check` EXIT 0。车道 B（时间线）与 I（终端底层+Python 内核）在途，合入后另开节。D 车道详情见下一节（其自带 FORK_NOTES）。
+
+- **车道 A（HTML 导出 8 条，commit f972dd094）**：bash 输出 ANSI 剥离不再乱码；MCP 工具结果图片导出不再丢；fork 分支各显各的工具结果（按当前 path 建映射）；Escape 三重损坏修复（清搜索+树重建、不跳回初始分支、滚底真正生效）；T/O 展开状态写容器 class 分支切换不丢不反相；折叠输出惰性构建（10 万行打开不再冻结）；移动端点树节点自动收侧栏；长 URL `overflow-wrap: anywhere`。新增 13 条迷你 DOM 行为测试，全部先红后绿。
+- **车道 E（packages/ai 4 条，commit f83f9a9e8）**：anthropic SSE 坏帧 errorMessage 有界化（完整帧留 info.raw）；Codex 限额 429 的 resets_at 转 retryAfterMs、friendlyMessage 保留进 detail；OAuth 错误去 stack、六处响应体 redactSecrets+定长截断；openai-completions 识别 delta.refusal（stopReasonRaw="refusal" 永久失败，不再当空响应白烧重试梯子）。新测试 4 文件 10 例，密钥脱敏带语料。
+- **车道 G（settings/config 5 条，commit 377191179）**：settings-manager 四个 getter 加 typeof/白名单守卫（theme:42 脏值不崩面板）；手改 settings.json 后通知有消费方（交互模式 drain+showWarning，parse 失败分支同样通知）；项目层钉住的键在面板显示「项目 settings.json 固定了此项」提示；config 过滤框空格不再误切换写盘（对齐 settings-list 搜索态门）；config 写盘失败渲染错误行。触及 4 测试文件 15 例，相邻套件 128 例全绿。
+- **车道 H（RPC/ACP 5 条，commit c40ec6f0a）**：headless 尾部通知不再吞最终答案——`prime-agent -p` 空输出 exit 0 的 CI 陷阱关闭，子代理失败通知上 stderr 且 exit 1；ACP turnFailure 把 aborted 计为失败（stall 击杀不再报正常 end_turn）；compaction_end 失败字段进 _meta 不再空 {} 假成功；ipython 图片按 ACP image content block 1:1 转发（两处撒谎注释改真）；RPC/ACP 连接级事件（quota park/connection status/session replaced/resynced/closed）不再静默丢弃。纯 additive wire 改动，按仓规分类 backward-compatible，协议版本未动；docs/rpc.md、docs/acp.md 同步。新测试 58 例，stdout-cleanliness 复验无回归。
+- **车道 F（/update 链 3 条，commit 4735168df）**：fork 拒绝文案会话内显示（warning 口吻，不再 alt-screen 一闪+失败口吻）；`/update --help` 会话内应答+退出码 76 刹车——不再重启 daemon 打断全部在跑会话（含伪造 76/伪造错误码故障注入验证，恢复路径明确）；manifest sha256 按 tarball basename 回查 tarballs[]（自更新通道激活），pack 脚本补写顶层 sha256 兼容旧读取方。触及测试 64 例全绿。
+- **合并与验证纪律**：八车道各持独立 git worktree（wt-a/b/d/e/f/g/h/i）与 lane/* 分支，物理隔离并行；子代理禁 push/merge/碰主树。主会话对每条已交付车道亲自复跑 `npm run check`（EXIT 0）+ 关键测试（E 10/10、G 15/15、A 13/13、H 61/61、D 173/173、F 62/62），F/G 的 interactive-mode.ts 跨车道自动合并在主树做语义复验（32/32 绿）。GLM 5.3 系车道出现「静默停走不报告」病症两次，靠消息督促恢复，交付质量经同门槛复核。
+
 ## 2026-10-08 假功能批（车道 D，审计 R3-M5/R3-M6/R6-M5/R6-M6/R6-M3）
 
 - R3-M5：`ctx.ui.setStatus()` 恢复可见——品牌化提交 813b847b4 删掉了 footer 的扩展状态行，现按新 quiet footer 形态恢复为独立一行（按 key 排序、控制字符清洗、超宽截断），in-process 与 daemon 会话同路。9 个测试文件里「footer 故意不理 provider」的老桩补齐 `getExtensionStatuses`。
