@@ -1,0 +1,1 @@
+- Fixed a session replacement dropping the subagent panel, the parent link and the quota-park countdown until the next heartbeat for slim clients: the supervisor's replacement catch-up now carries the snapshot's children/parent/quotaPark fields (daemon protocol rev 48), and a daemon that never sends them leaves the current view intact instead of clearing it.

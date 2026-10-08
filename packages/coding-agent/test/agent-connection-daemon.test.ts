@@ -3706,6 +3706,108 @@ describe("DaemonAgentConnection", () => {
 		await connection.dispose();
 	});
 
+	it("mirrors children, parent and quotaPark from an inline session_replaced (rev 48)", async () => {
+		// R2-M11: the supervisor's catch-up drain copies the snapshot's RLM roster,
+		// parent link and park facts onto the replacement frame; the rebuilt
+		// connection snapshot must surface them or the interactive re-render drops
+		// the subagent panel, rlmNodeId and the park countdown.
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		const parent = {
+			activeSessionId: "parent-active",
+			sessionId: "parent-session",
+			nodeId: "parent-node",
+			childId: "child-1",
+		};
+		const children: AgentConnectionRlmChildAgentSnapshot[] = [
+			{ id: "child-1", label: "child one", status: "running", sessionDir: "/tmp/child-1" },
+		];
+		const quotaPark = {
+			parked: true as const,
+			resumeAt: "2026-01-01T00:00:00.000Z",
+			remainingMs: 60_000,
+			parkCount: 2,
+			provider: "anthropic",
+		};
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-1",
+			state: createConnectionState("active-1", "session-current"),
+			messages: [],
+			parent,
+			children,
+			quotaPark,
+		});
+
+		const snapshot = await connection.getInitialSnapshot();
+		expect(snapshot.parent).toEqual(parent);
+		expect(snapshot.children).toEqual(children);
+		expect(snapshot.quotaPark).toEqual(quotaPark);
+		await connection.dispose();
+	});
+
+	it("preserves children, parent and quotaPark across an old-daemon session_replaced (rev 48)", async () => {
+		// Absence on the wire means "keep the current view; the roster and
+		// quota_park_status heartbeats heal it", never "clear" - this is what keeps
+		// a new client on an old daemon (or on a live worker broadcast, which never
+		// carries the fields) from losing the subagent panel, the parent link and
+		// the park countdown on every replacement.
+		const parent = {
+			activeSessionId: "parent-active",
+			sessionId: "parent-session",
+			nodeId: "parent-node",
+			childId: "child-1",
+		};
+		const children: AgentConnectionRlmChildAgentSnapshot[] = [
+			{ id: "child-1", label: "child one", status: "running", sessionDir: "/tmp/child-1" },
+		];
+		const quotaPark = {
+			parked: true as const,
+			resumeAt: "2026-01-01T00:00:00.000Z",
+			remainingMs: 60_000,
+			parkCount: 2,
+			provider: "anthropic",
+		};
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12, {
+				parent,
+				children,
+			});
+			return { ...result, snapshot: { ...result.snapshot, quotaPark } };
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		const before = await connection.getInitialSnapshot();
+		expect(before.parent).toEqual(parent);
+		expect(before.children).toEqual(children);
+		expect(before.quotaPark).toEqual(quotaPark);
+
+		const events: AgentConnectionEvent[] = [];
+		const unsubscribe = connection.subscribe(async (event) => {
+			events.push(event);
+		});
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-1",
+			state: createConnectionState("active-1", "session-current"),
+			messages: [],
+		});
+
+		const snapshot = await connection.getInitialSnapshot();
+		expect(snapshot.parent).toEqual(parent);
+		expect(snapshot.children).toEqual(children);
+		expect(snapshot.quotaPark).toEqual(quotaPark);
+		// The connection-level event arm deliberately did not grow the fields: the
+		// interactive re-render re-reads them from the snapshot (getInitialSnapshot).
+		const replaced = events.filter((event) => event.type === "session_replaced");
+		expect(replaced).toHaveLength(1);
+		expect(Object.keys(replaced[0]!).sort()).toEqual(["messages", "state", "type"]);
+		unsubscribe();
+		await connection.dispose();
+	});
+
 	it("declares slim_attach_transcript on reattach after a session switch conflict", async () => {
 		const fakeClient = new FakeDaemonClient();
 		fakeClient.switchSessionAlreadyActive = { sessionPath: "/tmp/other.jsonl", activeSessionId: "active-target" };

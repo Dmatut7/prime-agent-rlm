@@ -9478,6 +9478,20 @@ export class DaemonSupervisor {
 								...(attached.result.snapshot.messagesOmitted !== undefined
 									? { messagesOmitted: attached.result.snapshot.messagesOmitted }
 									: {}),
+								// Rev 48 (R2-M11): carry the rest of the reseed snapshot the
+								// client rebuilds its view from. The fields ride the attach
+								// snapshot's own gates - quotaPark reaches attached.result only
+								// for a client that declared quota_park_status (rev 43 strip
+								// above), children and parent are ungated snapshot metadata.
+								...(attached.result.snapshot.parent !== undefined
+									? { parent: attached.result.snapshot.parent }
+									: {}),
+								...(attached.result.snapshot.children !== undefined
+									? { children: attached.result.snapshot.children }
+									: {}),
+								...(attached.result.snapshot.quotaPark !== undefined
+									? { quotaPark: attached.result.snapshot.quotaPark }
+									: {}),
 								meta,
 							}
 						: {

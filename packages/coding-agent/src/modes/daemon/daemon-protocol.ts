@@ -403,8 +403,30 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   keep the pre-48 behavior (their dialog closes on its own timeout or local
 //   cancel). The event rides the sequenced session channel like
 //   extension_ui_request, and the digest recomputation covers the union growth.
-export const DAEMON_SCHEMA_REVISION = 48;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-48-7dabe5fc0aec";
+// Revision 48 adds the optional children, parent and quotaPark fields to the
+//   session_replaced event arm (wave-7 R2-M11): the supervisor's catch-up
+//   drain serves a slim_attach_transcript client's replacement inline, and
+//   rev 46 windowed the transcript without carrying the rest of the snapshot,
+//   so the client's rebuilt view dropped the RLM child roster (subagent panel,
+//   stall markers), the parent link (rlmNodeId) and the park countdown until
+//   the next roster/quota_park_status heartbeat. The drain now copies the
+//   three fields from the attach-time snapshot it already built.
+//   Backward-compatible addition in the rev-43/44/46 class: an old daemon
+//   never sends the fields and a new client reads their absence as "keep the
+//   current view; the roster and quota_park_status heartbeats heal it", never
+//   "clear", so the mixed pair degrades exactly to today's behavior, and an
+//   old client simply ignores the fields. quotaPark rides the existing
+//   quota_park_status capability gate it inherits from the snapshot build
+//   (the worker fills it only for declaring clients and the supervisor strips
+//   it for the rest), so no new capability joins the wire. The chunked
+//   replacement branch is untouched: its snapshotFollows transfer already
+//   carries the full snapshot. The digest recomputation covers the
+//   outbound-union growth.
+// Revision 49 unifies the two lane-local 48 bumps: ext and snap each raised the
+//   same baseline revision from parallel worktrees, so the merged protocol takes
+//   49 with both additions above landing together and one recomputed digest.
+export const DAEMON_SCHEMA_REVISION = 49;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-49-cdf62eb50de6";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -2068,6 +2090,35 @@ export type DaemonOutbound =
 			 * direction can receive a count it cannot read.
 			 */
 			messagesOmitted?: number;
+			/**
+			 * Rev 48: the snapshot's live RLM children at replacement time, copied
+			 * by the supervisor's inline catch-up from the attach-time snapshot.
+			 * Absent means "keep the current view; the roster heartbeat heals it",
+			 * never "clear" — old daemons and live worker broadcasts never carry
+			 * the field, so clearing on absence would drop the subagent panel and
+			 * stall markers on every replacement.
+			 */
+			children?: AgentConnectionRlmChildAgentSnapshot[];
+			/**
+			 * Rev 48: the snapshot's RLM parent link at replacement time. Absent
+			 * means "keep the current view", never "clear" — same contract as
+			 * `children`; the parent of a hosted session does not change across a
+			 * runtime rebind.
+			 */
+			parent?: {
+				activeSessionId?: string;
+				sessionId?: string;
+				nodeId?: string;
+				childId?: string;
+			};
+			/**
+			 * Rev 48: the snapshot's quota-park facts at replacement time, gated
+			 * by the quota_park_status capability exactly like the attach snapshot
+			 * (rev 43): the supervisor's drain inherits the already-gated snapshot
+			 * field. Absent means "keep the current view; the quota_park_status
+			 * heartbeat heals it", never "clear".
+			 */
+			quotaPark?: DaemonSessionSnapshotQuotaPark;
 			snapshotFollows?: boolean;
 			meta?: DaemonEventMeta;
 	  }

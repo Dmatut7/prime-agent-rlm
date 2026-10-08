@@ -2517,6 +2517,14 @@ export class DaemonAgentConnection implements AgentConnection {
 				this.latestSnapshotIsFresh = false;
 				return;
 			}
+			// Rev 48 (R2-M11): the supervisor's inline replacement catch-up carries
+			// the reseed snapshot's RLM roster, parent link and park facts. Absence
+			// means "keep the current view; the roster and quota_park_status
+			// heartbeats heal it", never "clear" - an old daemon or a live worker
+			// broadcast never sends the fields, and clearing dropped the subagent
+			// panel, the stall markers and the park countdown until the next
+			// heartbeat.
+			const previousSnapshot = this.latestSnapshot;
 			const latestSnapshot: AgentConnectionSnapshot = {
 				state: message.state,
 				messages: message.messages,
@@ -2524,6 +2532,21 @@ export class DaemonAgentConnection implements AgentConnection {
 				// omission count, the same contract attach and resync already map.
 				...(message.messagesOmitted !== undefined ? { messagesOmitted: message.messagesOmitted } : {}),
 			};
+			const parent = message.parent ?? previousSnapshot?.parent;
+			if (parent) {
+				latestSnapshot.parent = parent;
+			}
+			const children =
+				message.children !== undefined
+					? message.children.map((child) => this.downgradeChildStallState(child))
+					: previousSnapshot?.children;
+			if (children) {
+				latestSnapshot.children = children;
+			}
+			const quotaPark = message.quotaPark ?? previousSnapshot?.quotaPark;
+			if (quotaPark) {
+				latestSnapshot.quotaPark = quotaPark;
+			}
 			if (this.lastEventSequence !== undefined) {
 				latestSnapshot.lastEventSequence = this.lastEventSequence;
 			}
@@ -2532,7 +2555,11 @@ export class DaemonAgentConnection implements AgentConnection {
 			}
 			this.latestSnapshot = latestSnapshot;
 			this.reseedStreamReconstructor();
-			this.childRosterSequence = undefined;
+			// A roster carried on the frame is as fresh as the frame's own sequence,
+			// the same anchor the chunked replacement path uses; an absent roster
+			// keeps the "unknown freshness" marker so the next roster fetch wins.
+			this.childRosterSequence =
+				message.children !== undefined ? (getDaemonMessageSequence(message) ?? this.lastEventSequence) : undefined;
 			this.latestSnapshotIsFresh = true;
 			this.sessionRevision++;
 			await this.emit({ type: "session_replaced", state: message.state, messages: message.messages });

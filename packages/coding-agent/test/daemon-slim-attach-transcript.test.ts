@@ -717,6 +717,14 @@ describe("supervisor slim catch-up drain (rev 44)", () => {
 		messageCount: number;
 		/** Register the session in the worker/roster; false leaves the attach target unknown. */
 		knownSession?: boolean;
+		/** Overrides the served client's declared capabilities (the drain re-attaches with these). */
+		clientCapabilities?: DaemonClientCapability[];
+		/** Extra DaemonSessionSnapshot fields the cached worker snapshot carries. */
+		snapshotExtras?: {
+			parent?: DaemonSessionSnapshot["parent"];
+			children?: DaemonSessionSnapshot["children"];
+			quotaPark?: DaemonSessionSnapshot["quotaPark"];
+		};
 	}) {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-slim-catchup-"));
 		// Keep the supervisor's rotating log inside the fixture tree, never the real agent dir.
@@ -740,7 +748,7 @@ describe("supervisor slim catch-up drain (rev 44)", () => {
 		};
 		const cached = {
 			activeSessionId,
-			snapshot: { summary, messages },
+			snapshot: { summary, messages, ...(options.snapshotExtras ?? {}) },
 			replay: { status: "complete", toSequence: 0 },
 			lastEventSequence: 0,
 		} as unknown as DaemonAttachResult;
@@ -772,13 +780,15 @@ describe("supervisor slim catch-up drain (rev 44)", () => {
 		const client: DaemonSocketClient = {
 			id: "client-slim-catchup",
 			socket: socket as unknown as DaemonSocketClient["socket"],
-			capabilities: new Set<DaemonClientCapability>([
-				"attach_snapshot",
-				"event_sequence",
-				"slim_attach",
-				"chunked_snapshot",
-				"slim_attach_transcript",
-			]),
+			capabilities: new Set<DaemonClientCapability>(
+				options.clientCapabilities ?? [
+					"attach_snapshot",
+					"event_sequence",
+					"slim_attach",
+					"chunked_snapshot",
+					"slim_attach_transcript",
+				],
+			),
 			supportsExtensionUi: false,
 			detachInput: () => {},
 			attachedActiveSessionIds: new Set([activeSessionId]),
@@ -835,6 +845,82 @@ describe("supervisor slim catch-up drain (rev 44)", () => {
 			expect(fixture.client.deferredSessionPayloadsDropped?.has(activeSessionId) ?? false).toBe(false);
 			// The queue drained: nothing stays queued behind the delivered replacement.
 			expect(fixture.client.catchupActiveSessionIds?.size ?? 0).toBe(0);
+		} finally {
+			fixture.dispose();
+		}
+	});
+
+	it("carries children, parent and quotaPark on the inline replacement catch-up (rev 48)", async () => {
+		// R2-M11: rev 46 windowed the transcript inline but dropped the rest of the
+		// snapshot, so the client's rebuilt view lost the subagent roster, the parent
+		// link and the park countdown until the next roster/quota heartbeat.
+		const parent = {
+			activeSessionId: "parent-active",
+			sessionId: "parent-session",
+			nodeId: "parent-node",
+			childId: "child-1",
+		};
+		const children: NonNullable<DaemonSessionSnapshot["children"]> = [
+			{ id: "child-1", label: "child one", status: "running", sessionDir: "/tmp/child-1" },
+		];
+		const quotaPark: NonNullable<DaemonSessionSnapshot["quotaPark"]> = {
+			parked: true,
+			resumeAt: "2026-01-01T00:00:00.000Z",
+			remainingMs: 60_000,
+			parkCount: 2,
+			provider: "anthropic",
+		};
+		const fixture = makeCatchupFixture({
+			messageCount: 5,
+			clientCapabilities: [
+				"attach_snapshot",
+				"event_sequence",
+				"slim_attach",
+				"chunked_snapshot",
+				"slim_attach_transcript",
+				"quota_park_status",
+			],
+			snapshotExtras: { parent, children, quotaPark },
+		});
+		try {
+			await fixture.supervisor.drainClientCatchups(fixture.client);
+			const replaced = fixture.written.filter((message) => message.type === "session_replaced");
+			expect(replaced).toHaveLength(1);
+			const frame = replaced[0] as Extract<DaemonOutbound, { type: "session_replaced" }>;
+			expect(frame.parent).toEqual(parent);
+			expect(frame.children).toEqual(children);
+			expect(frame.quotaPark).toEqual(quotaPark);
+		} finally {
+			fixture.dispose();
+		}
+	});
+
+	it("omits quotaPark on the inline replacement catch-up when the client never declared quota_park_status", async () => {
+		// The rev-43 gate is inherited from the attach snapshot build: the supervisor
+		// strips quotaPark for non-declaring clients before the drain reads the
+		// snapshot, so the field must not leak onto the frame. children/parent carry
+		// no capability gate.
+		const parent = { activeSessionId: "parent-active", childId: "child-1" };
+		const children: NonNullable<DaemonSessionSnapshot["children"]> = [
+			{ id: "child-1", label: "child one", status: "running", sessionDir: "/tmp/child-1" },
+		];
+		const fixture = makeCatchupFixture({
+			messageCount: 5,
+			snapshotExtras: {
+				parent,
+				children,
+				quotaPark: { parked: true, resumeAt: "2026-01-01T00:00:00.000Z", provider: "anthropic" },
+			},
+		});
+		try {
+			await fixture.supervisor.drainClientCatchups(fixture.client);
+			const replaced = fixture.written.filter((message) => message.type === "session_replaced");
+			expect(replaced).toHaveLength(1);
+			const frame = replaced[0] as Extract<DaemonOutbound, { type: "session_replaced" }>;
+			expect(frame.parent).toEqual(parent);
+			expect(frame.children).toEqual(children);
+			expect(frame.quotaPark).toBeUndefined();
+			expect("quotaPark" in frame).toBe(false);
 		} finally {
 			fixture.dispose();
 		}

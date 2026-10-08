@@ -465,3 +465,87 @@ describe("snapshot quotaPark seeding (rev 43)", () => {
 		expect(chatText(mode)).toContain("额度已用完，会话挂起等额度恢复");
 	});
 });
+
+describe("session_replaced snapshot re-read (R2-M11, rev 48)", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+
+	beforeEach(() => {
+		vi.useFakeTimers({ now: T0 });
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	const replaceProto = InteractiveMode.prototype as unknown as {
+		subscribeToAgent(this: ModeFake): void;
+	};
+
+	it("keeps the subagent panel seed, rlmNodeId and park through a replacement's snapshot re-read", async () => {
+		// The connection-level session_replaced event arm deliberately carries only
+		// state+messages; renderInitialMessages re-reads the rest from
+		// getInitialSnapshot(), where the connection preserved (old daemon) or
+		// mirrored (rev-48 daemon) children/parent/quotaPark. Pin the consumption
+		// half of that contract: after the replacement's re-read the panel seed,
+		// the parent link and the park countdown are still there.
+		const listeners: Array<(event: AgentConnectionEvent) => Promise<void>> = [];
+		const child = { id: "child-1", label: "child one", status: "running" as const, sessionDir: "/tmp/child-1" };
+		const resumeAt = isoIn(3_600_000);
+		const snapshot = {
+			state: {},
+			messages: [],
+			parent: {
+				activeSessionId: "parent-active",
+				sessionId: "parent-session",
+				nodeId: "parent-node",
+				childId: "child-1",
+			},
+			children: [child],
+			quotaPark: { parked: true as const, resumeAt, remainingMs: 3_599_000, parkCount: 2, provider: "anthropic" },
+		};
+		const seedSubagentSummary = vi.fn();
+		const mode = parkFake({
+			agentConnection: {
+				subscribe: vi.fn((callback: (event: AgentConnectionEvent) => Promise<void>) => {
+					listeners.push(callback);
+					return () => {};
+				}),
+				getInitialSnapshot: vi.fn(async () => snapshot),
+			},
+			sessionEventQueue: Promise.resolve(),
+			sessionEventGeneration: 0,
+			resetSideQuestion: vi.fn(),
+			resetExtensionUI: vi.fn(),
+			applyConnectionStateSnapshot: vi.fn(),
+			resetCurrentSessionRenderState: vi.fn(),
+			rebindCurrentSession: vi.fn(async () => {}),
+			getSessionContextFromConnectionSnapshot: vi.fn((snap: { messages: unknown }) => ({
+				messages: snap.messages,
+				thinkingLevel: "medium",
+				serviceTier: "default",
+				model: null,
+			})),
+			seedSubagentSummary,
+			restoreTurnStartFromMessages: vi.fn(),
+			renderSessionContext: vi.fn(async () => {}),
+			restoreStreamingMessageFromSnapshot: vi.fn(async () => {}),
+			showDutyLog: vi.fn(async () => {}),
+			rlmNodeId: undefined,
+		});
+		replaceProto.subscribeToAgent.call(mode);
+		const listener = listeners[0];
+		if (!listener) throw new Error("subscribeToAgent registered no listener");
+
+		await listener({ type: "session_replaced", state: {} as never, messages: [] });
+
+		expect(mode.rlmNodeId).toBe("child-1");
+		expect(seedSubagentSummary).toHaveBeenCalledWith([child]);
+		const park = mode.quotaPark as { resumeAtMs?: number; parkCount?: number } | undefined;
+		expect(park?.resumeAtMs).toBe(Date.parse(resumeAt));
+		expect(park?.parkCount).toBe(2);
+		expect(chatText(mode)).toContain("额度已用完，会话挂起等额度恢复");
+	});
+});
