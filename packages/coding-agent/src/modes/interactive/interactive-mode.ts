@@ -4173,6 +4173,10 @@ export class InteractiveMode {
 		this.liveTurnFlowStore?.reset();
 		this.currentTurnState = undefined;
 		this.currentTurnSummary = undefined;
+		// A report held for the turn it would wake belongs to the session being
+		// replaced: its comm must not land in the next session's first turn, whose
+		// replay derives its count from that session's own transcript.
+		this.pendingWakeComms = 0;
 		this.resetSubagentSummary();
 		this.sessionHasImages = false;
 		this.setGoalAnnouncementBaseline(this.getGoalState());
@@ -5585,16 +5589,36 @@ export class InteractiveMode {
 					component = c;
 					if (isOverlay) {
 						// Overlay options may be a function for dynamic updates; the TUI
-						// re-evaluates a function on every render, so hand the resolver
-						// over instead of freezing the first answer (the extension API
-						// documents the function form as live).
+						// re-evaluates a function on every render, key routing, and mouse
+						// check, so hand the resolver over instead of freezing the first
+						// answer (the extension API documents the function form as live).
+						// The factory is extension code running inside the render/input
+						// chain: a throw would land in doRender's process.nextTick and
+						// kill the process, so contain it, degrade to the last good
+						// snapshot, and report once per open (not once per frame).
+						let lastOverlayOptions: OverlayOptions | undefined;
+						let overlayOptionsErrorShown = false;
 						const resolveOptions = (): OverlayOptions | undefined => {
 							if (options?.overlayOptions) {
-								const opts =
-									typeof options.overlayOptions === "function"
-										? options.overlayOptions()
-										: options.overlayOptions;
-								return opts;
+								if (typeof options.overlayOptions === "function") {
+									try {
+										lastOverlayOptions = options.overlayOptions();
+										return lastOverlayOptions;
+									} catch (err) {
+										if (!closed && !overlayOptionsErrorShown) {
+											overlayOptionsErrorShown = true;
+											// The owning extension's path is not plumbed through the
+											// shared ui context, so the error names the API surface.
+											this.showExtensionError(
+												"ui.custom overlayOptions",
+												err instanceof Error ? err.message : String(err),
+												err instanceof Error ? err.stack : undefined,
+											);
+										}
+										return lastOverlayOptions;
+									}
+								}
+								return options.overlayOptions;
 							}
 							// Fallback: use component's width property if available
 							const w = (component as { width?: number }).width;
