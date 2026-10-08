@@ -1,3 +1,4 @@
+import { sanitizeRowText } from "../../utils/display-text.js";
 import { parseIpythonBashCell } from "./ipython-cell-code.js";
 
 const DESCRIPTOR_MAX_WIDTH = 64;
@@ -39,10 +40,6 @@ interface PreviewCandidate {
 	index: number;
 }
 
-function collapseWhitespace(text: string): string {
-	return text.replace(/\s+/g, " ").trim();
-}
-
 function truncateDescriptor(text: string): string {
 	if (text.length <= DESCRIPTOR_MAX_WIDTH) {
 		return text;
@@ -70,8 +67,15 @@ export function redactNoise(text: string): string {
 		.replace(/(["']).{160,}\1/g, "$1…$1");
 }
 
+/**
+ * One line of a preview: redacted, then washed, then cut. Every face that shows a
+ * preview interpolates it into a row it builds itself - a bash call header, a step
+ * label, a dispatch row's opened `代码` line, the /tree selector's tool line - so
+ * the escape sequences a command or a cell carries are dropped here, at the one
+ * point they all read.
+ */
 function descriptor(text: string): string {
-	return truncateDescriptor(collapseWhitespace(redactNoise(text)));
+	return truncateDescriptor(sanitizeRowText(redactNoise(text)));
 }
 
 function stripBashPrefix(line: string): string {

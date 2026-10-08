@@ -1,4 +1,6 @@
 import { describe, expect, test } from "vitest";
+import { createAgentsViewReplyHeadline } from "../src/modes/agents-view/agents-view-mode.js";
+import { agentsViewRowRecap } from "../src/modes/agents-view/agents-view-state.js";
 import { buildAgentsViewRows, type SessionSummary } from "../src/modes/index.js";
 
 /**
@@ -180,5 +182,27 @@ describe("agents view row sanitization", () => {
 			'    print("xy")',
 			"",
 		]);
+	});
+
+	test("washes the recap a row shows beside its title, however old the journal it came from", () => {
+		// The summarizer washes a recap before it persists one now; a journal an
+		// older build wrote is still on disk, and the roster replays it on every
+		// redraw. This is the read side of the same row.
+		const recap = agentsViewRowRecap(
+			makeSummary({ summary: `Fixing the parser${OSC52}${CLEAR}\u0007done\r\nsecond line` }),
+		);
+		expect(recap).toBeDefined();
+		expectByteClean(recap ?? "");
+		expect(recap).toBe("Fixing the parserdone second line");
+		expect(agentsViewRowRecap(makeSummary({ summary: `${OSC52}${CLEAR}` }))).toBeUndefined();
+		expect(agentsViewRowRecap(makeSummary({}))).toBeUndefined();
+	});
+
+	test("washes the reply headline the view names a session by", () => {
+		const headline = createAgentsViewReplyHeadline(`\n\n  都跑完了${OSC52} ${SGR}绿${RESET}  \n第二行`);
+		expect(headline).toBeDefined();
+		expectByteClean(headline ?? "");
+		expect(headline).toBe("都跑完了 绿");
+		expect(createAgentsViewReplyHeadline(`   \n${CLEAR}\n  `)).toBeUndefined();
 	});
 });

@@ -1508,6 +1508,17 @@ export function formatAgentsViewDurationMs(durationMs: number | undefined): stri
  * terminal: an OSC 52 in a name would write the user's clipboard every time the
  * row is drawn.
  */
+/**
+ * The recap a row shows beside its title. It is written to the session journal by
+ * the daemon summarizer and read back for as long as the row lives, so a journal an
+ * older build left behind is replayed on every redraw: washed here, on the way out,
+ * as well as on the way in.
+ */
+export function agentsViewRowRecap(summary: SessionSummary): string | undefined {
+	const washed = sanitizeRowText(summary.summary ?? "");
+	return washed.length > 0 ? washed : undefined;
+}
+
 export function getAgentsViewSessionTitle(summary: SessionSummary): string {
 	const candidates = [summary.sessionName, summary.firstMessage, basename(summary.cwd), summary.sessionId, summary.id];
 	for (const candidate of candidates) {

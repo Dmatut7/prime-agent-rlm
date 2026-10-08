@@ -24,6 +24,7 @@ import {
 	parseSlashCommand,
 	resolveBuiltinSlashCommandName,
 } from "../../core/slash-commands.js";
+import { sanitizeRowText } from "../../utils/display-text.js";
 import { canonicalizePath } from "../../utils/paths.js";
 import { ensureTool } from "../../utils/tools-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
@@ -77,6 +78,7 @@ import {
 	type AgentsViewScopeKey,
 	type AgentsViewSection,
 	type AgentsViewSelectionKey,
+	agentsViewRowRecap,
 	buildAgentsViewRows,
 	buildUnifiedSessionIndex,
 	collectSubagentDescendantSummaries,
@@ -347,10 +349,16 @@ export function shouldReconnectAgentsViewDaemon(reason: DaemonClosingReason | un
 	return reason !== "shutdown";
 }
 
+/**
+ * The first line of a reply, for the header that names it. The text is the
+ * subagent's own (a last assistant message, or what the daemon's
+ * `get_last_assistant_text` handed back) and the header is a row this view paints
+ * itself, so the line is washed: one physical row, no escape sequences.
+ */
 export function createAgentsViewReplyHeadline(text: string | undefined): string | undefined {
 	return text
 		?.split("\n")
-		.map((line) => line.replace(/\s+/g, " ").trim())
+		.map((line) => sanitizeRowText(line))
 		.find((line) => line.length > 0);
 }
 
@@ -3211,7 +3219,7 @@ export class AgentsViewMode implements Component, Focusable {
 				? `${heartbeatWarning}再按一次 ${keyText("app.agents.delete")} ${hasLiveWork(row) ? "停止" : "删除"}`
 				: styleRowTitle(row);
 		// Keep stable model information ahead of the variable summary so narrow rows truncate the summary first.
-		const summaryText = !pendingDelete && !pendingKill ? row.summary.summary : undefined;
+		const summaryText = !pendingDelete && !pendingKill ? agentsViewRowRecap(row.summary) : undefined;
 		// An inactive row has no live summary to read a model from, so its last recorded model
 		// (the saved-session catalog) is the only one it has: the row read as if the session
 		// never ran a model (#2148). Live rows keep the subagent-only suffix they always had.

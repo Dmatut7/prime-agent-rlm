@@ -2,6 +2,20 @@ import { describe, expect, it } from "vitest";
 import { previewBashCommand, previewIpythonCode, previewPythonCode } from "../src/core/tools/code-preview.js";
 
 describe("code preview", () => {
+	it("drops the escape sequences a command carries, so no face that shows a preview relays them", () => {
+		// A preview is interpolated into rows the callers build themselves - a bash
+		// call header, a step label, a dispatch row's opened `代码` line, the /tree
+		// selector's tool line - none of which go through the central render gate.
+		const osc52 = "\u001b]52;c;cGFzdGU=\u0007";
+		const clear = "\u001b[2J\u001b[H";
+		const bash = previewBashCommand(`set -e\nnpm run check${osc52}${clear}`);
+		expect(bash.text).toBe("npm check");
+		const python = previewIpythonCode(`import json\nprint(json.dumps({"a": 1}))${osc52}`);
+		expect(python.text).not.toContain("\u001b");
+		expect(python.text).not.toContain("cGFzdGU=");
+		expect(python.text).toContain("print");
+	});
+
 	it("skips bash setup and previews the real command", () => {
 		expect(previewBashCommand("set -e\nnpm run check")).toEqual({ language: "bash", text: "npm check" });
 	});
