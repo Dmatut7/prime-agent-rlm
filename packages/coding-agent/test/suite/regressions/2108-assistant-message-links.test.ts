@@ -71,34 +71,34 @@ describe("assistant Markdown file links", () => {
 		expect(stripAnsi(lines.join("\n")).trim()).toBe("Audit report");
 	});
 
-	test.each(["addMessageToChat", "startAssistantStreamingMessage"] as const)(
-		"%s uses the attached session cwd and produces an openable target",
-		(method) => {
-			const chatContainer = new Container();
-			const mode = Object.assign(Object.create(InteractiveMode.prototype), {
-				chatContainer,
-				connectionState: { cwd },
-				// TUI v4: both render paths read the process mode off the settings manager.
-				uiServices: {
-					getInitialCwd: () => resolve("/tmp/different-launch-directory"),
-					settingsManager: { getProcessMode: () => "quiet" },
-				},
-				getMarkdownThemeWithSettings: getMarkdownTheme,
-			}) as {
-				addMessageToChat(message: AssistantMessage): void;
-				startAssistantStreamingMessage(message: AssistantMessage): void;
-			};
-			mode[method](message);
-			const targets = linkTargets(chatContainer.render(80));
-			expect(targets).toEqual([reportUrl]);
-			const onOpenUrl = vi.fn();
-			const ui = Object.assign(Object.create(TUI.prototype), { onOpenUrl }) as {
-				openHyperlink(url: string): void;
-			};
-			ui.openHyperlink(targets[0]);
-			expect(onOpenUrl).toHaveBeenCalledExactlyOnceWith(reportUrl);
-		},
-	);
+	// addMessageToChat's assistant arm is gone (ENG-4531 dead-arm removal: production
+	// routes assistant rows through turnFlow.assistantStart + startAssistantStreamingMessage,
+	// and the replay face is pinned by the conversation-replay test below), so the live
+	// entry this drives is the streaming mount.
+	test("startAssistantStreamingMessage uses the attached session cwd and produces an openable target", () => {
+		const chatContainer = new Container();
+		const mode = Object.assign(Object.create(InteractiveMode.prototype), {
+			chatContainer,
+			connectionState: { cwd },
+			// TUI v4: both render paths read the process mode off the settings manager.
+			uiServices: {
+				getInitialCwd: () => resolve("/tmp/different-launch-directory"),
+				settingsManager: { getProcessMode: () => "quiet" },
+			},
+			getMarkdownThemeWithSettings: getMarkdownTheme,
+		}) as {
+			startAssistantStreamingMessage(message: AssistantMessage): void;
+		};
+		mode.startAssistantStreamingMessage(message);
+		const targets = linkTargets(chatContainer.render(80));
+		expect(targets).toEqual([reportUrl]);
+		const onOpenUrl = vi.fn();
+		const ui = Object.assign(Object.create(TUI.prototype), { onOpenUrl }) as {
+			openHyperlink(url: string): void;
+		};
+		ui.openHyperlink(targets[0]);
+		expect(onOpenUrl).toHaveBeenCalledExactlyOnceWith(reportUrl);
+	});
 
 	test("conversation replay carries the session cwd", () => {
 		const components = buildConversationComponents([message], {
