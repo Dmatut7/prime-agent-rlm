@@ -177,6 +177,7 @@ import { resizeImage } from "../../utils/image-resize.js";
 import { getCwdRelativePath } from "../../utils/paths.js";
 import { backgroundNetworkOptOut } from "../../utils/privacy-opt-out.js";
 import { createPrivateTempFile, readPrivateFile, writePrivateFileAtomic } from "../../utils/private-files.js";
+import { formatScheduleTimestamp } from "../../utils/schedule-timestamp.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import { ensureTool, ensureToolWithStatus, formatMissingRipgrepMessage } from "../../utils/tools-manager.js";
 import { checkForNewPiVersion } from "../../utils/version-check.js";
@@ -1548,6 +1549,11 @@ export function formatAgentDepthLabel(depth: number | undefined, hasChildren: bo
 	void hasChildren;
 	if (depth === undefined || depth < 1) return undefined;
 	return `深度 ${depth}`;
+}
+
+/** One clock face for a heartbeat timestamp: local time, "-" when unset (R3-M9). */
+function formatHeartbeatTime(value: string | undefined): string {
+	return value ? formatScheduleTimestamp(value) : "-";
 }
 
 export class InteractiveMode {
@@ -14605,7 +14611,7 @@ export class InteractiveMode {
 					this.patchConnectionState({ heartbeat });
 					await this.refreshHeartbeatCatalog();
 					this.showStatus(
-						`Heartbeat set\nDelivery: ${heartbeat.deliveryMode ?? DEFAULT_HEARTBEAT_DELIVERY_MODE}\nNext run: ${heartbeat.nextRunAt ?? "-"}`,
+						`Heartbeat set\nDelivery: ${heartbeat.deliveryMode ?? DEFAULT_HEARTBEAT_DELIVERY_MODE}\nNext run: ${formatHeartbeatTime(heartbeat.nextRunAt)}`,
 					);
 					return;
 				}
@@ -14628,7 +14634,7 @@ export class InteractiveMode {
 					}
 					this.patchConnectionState({ heartbeat });
 					await this.refreshHeartbeatCatalog();
-					this.showStatus(`定时任务已恢复\n下次运行：${heartbeat.nextRunAt ?? "-"}`);
+					this.showStatus(`定时任务已恢复\n下次运行：${formatHeartbeatTime(heartbeat.nextRunAt)}`);
 					return;
 				}
 				case "clear": {
@@ -14756,8 +14762,8 @@ export class InteractiveMode {
 			this.showStatus("没有进行中的定时任务");
 			return;
 		}
-		const next = job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : "-";
-		const last = job.lastRunAt ? new Date(job.lastRunAt).toLocaleString() : "-";
+		const next = formatHeartbeatTime(job.nextRunAt);
+		const last = formatHeartbeatTime(job.lastRunAt);
 		const lines = [
 			theme.bold("Heartbeat"),
 			"",

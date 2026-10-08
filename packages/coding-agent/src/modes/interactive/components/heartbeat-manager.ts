@@ -1,5 +1,6 @@
 import { type Component, type Focusable, getKeybindings, Spacer, TruncatedText } from "@earendil-works/pi-tui";
 import type { AgentHeartbeatManagementAction } from "../../../core/cron-jobs.js";
+import { formatScheduleTimestamp } from "../../../utils/schedule-timestamp.js";
 import type { AgentConnectionHeartbeat } from "../../agent-connection/types.js";
 import { theme } from "../theme/theme.js";
 import { keyHint } from "./keybinding-hints.js";
@@ -324,8 +325,6 @@ export class HeartbeatManagerComponent implements Component, Focusable {
 	}
 
 	private formatTimestamp(value: string): string {
-		const parsed = new Date(value);
-		if (!Number.isFinite(parsed.getTime())) return value;
-		return parsed.toISOString().slice(0, 16).replace("T", " ");
+		return formatScheduleTimestamp(value);
 	}
 }

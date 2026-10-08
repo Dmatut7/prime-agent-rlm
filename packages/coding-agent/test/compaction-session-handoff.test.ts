@@ -183,6 +183,11 @@ function subagentActivity(id: string, label: string, status: string, detail?: st
 	};
 }
 
+/** A finished spawn record as the post-R5-M7 kernel sends it: display label plus the exact session name. */
+function namedSubagentActivity(id: string, label: string, name: string, detail?: string): Record<string, unknown> {
+	return { ...subagentActivity(id, label, "ok", detail), name };
+}
+
 function backgroundCommand(id: string, label: string, status: string): Record<string, unknown> {
 	return { id, kind: "command", label, status, background: true, startedAt: 3_000 };
 }
@@ -314,6 +319,51 @@ describe("buildSessionHandoff (W18-D)", () => {
 		expect(ledger.subagents).toHaveLength(1);
 		expect(ledger.subagents[0].name).toBe("调查压缩丢文件");
 		expect(ledger.subagents[0].admitting).toBe(true);
+	});
+
+	it("keys the row by the record's exact name, so a collapsed-blank label no longer ghosts the child (R6-M8)", () => {
+		// The kernel's display label collapses the blanks in "wide   spaced   worker",
+		// while the lifecycle notice resolves against the exact session name. Keying the
+		// row by the label left the notice naming a key that was never stored, and the
+		// child was listed as in flight by every later compaction.
+		const ledger = buildSessionHandoff(
+			[
+				messageEntry(
+					ipythonResult({
+						activities: [namedSubagentActivity("s1", "wide spaced worker", "wide   spaced   worker", "faux-1")],
+					}),
+				),
+				customMessageEntry(RLM_CHILD_FAILURE_CUSTOM_TYPE, "RLM child wide   spaced   worker (c1) failed: boom", {
+					childId: "c1",
+					sessionName: "wide   spaced   worker",
+					error: "boom",
+					kind: "error",
+				}),
+			],
+			{ generation: 1 },
+		);
+		expect(ledger.subagents).toEqual([]);
+	});
+
+	it("resolves an exact-named child through a settle record, and falls back to the label when no name was recorded", () => {
+		const settled = buildSessionHandoff(
+			[
+				messageEntry(ipythonResult({ activities: [namedSubagentActivity("s1", "worker-a", "worker-a")] })),
+				customEntry(RLM_CHILD_SETTLED_CUSTOM_TYPE, {
+					childId: "c1",
+					sessionName: "worker-a",
+					settledAs: "replied",
+				}),
+			],
+			{ generation: 1 },
+		);
+		expect(settled.subagents).toEqual([]);
+		// A record from before the kernel sent the field keeps the label as its key.
+		const legacy = buildSessionHandoff(
+			[messageEntry(ipythonResult({ activities: [subagentActivity("s1", "worker-b", "ok", "faux-1")] }))],
+			{ generation: 1 },
+		);
+		expect(legacy.subagents).toEqual([{ name: "worker-b", since: 1_000, model: "faux-1" }]);
 	});
 
 	it("resolves a child when its failure notice lands later in the branch", () => {

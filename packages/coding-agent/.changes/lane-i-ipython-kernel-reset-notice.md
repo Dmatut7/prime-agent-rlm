@@ -1,0 +1,1 @@
+- Added a visible kernel-reset notice line to ipython cells that ran on a replacement kernel, shown even when collapsed, reading the previously-ignored kernelRestarted/kernelReset result fields.

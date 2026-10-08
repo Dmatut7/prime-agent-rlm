@@ -180,7 +180,7 @@ describe("probe-bus invariant: probe answers never enter the user-visible stream
 			process.stdin.emit(
 				"data",
 				"a" +
-					"\x1b[?1u" + // Kitty keyboard flags
+					"\x1b[?0u" + // Kitty keyboard flags
 					"\x1b[?2026;2$y" + // DECRPM sync
 					"\x1b[?2027;1$y" + // DECRPM grapheme
 					"\x1b[?2031;2$y" + // DECRPM scheme

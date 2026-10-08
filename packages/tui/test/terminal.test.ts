@@ -89,7 +89,7 @@ describe("ProcessTerminal alternate screen handoff", () => {
 				(data) => firstInputs.push(data),
 				() => {},
 			);
-			process.stdin.emit("data", "\x1b[?1u");
+			process.stdin.emit("data", "\x1b[?0u");
 			first.enterAltScreen();
 			first.stop({ preserveAltScreen: true });
 
@@ -102,7 +102,7 @@ describe("ProcessTerminal alternate screen handoff", () => {
 				(data) => secondInputs.push(data),
 				() => {},
 			);
-			process.stdin.emit("data", "\x1b[?1u");
+			process.stdin.emit("data", "\x1b[?0u");
 			process.stdin.emit("data", "x");
 
 			assert.equal(isRaw, true);
@@ -366,7 +366,7 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 				() => {},
 				() => {},
 			);
-			process.stdin.emit("data", "\x1b[?1u");
+			process.stdin.emit("data", "\x1b[?0u");
 			terminal.enterAltScreen();
 			terminal.leaveAltScreen();
 			terminal.stop();
@@ -424,7 +424,7 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 				() => {},
 				() => {},
 			);
-			process.stdin.emit("data", "\x1b[?1u");
+			process.stdin.emit("data", "\x1b[?0u");
 			first.enterAltScreen();
 			first.stop({ preserveAltScreen: true });
 
@@ -433,7 +433,7 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 				() => {},
 				() => {},
 			);
-			process.stdin.emit("data", "\x1b[?1u");
+			process.stdin.emit("data", "\x1b[?0u");
 			second.stop();
 
 			assert.deepEqual(writes, [
@@ -467,7 +467,7 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 				() => {},
 			);
 			terminal.enterAltScreen();
-			process.stdin.emit("data", "\x1b[?1u");
+			process.stdin.emit("data", "\x1b[?0u");
 			terminal.leaveAltScreen();
 			terminal.stop();
 
@@ -499,7 +499,7 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 				() => {},
 				() => {},
 			);
-			process.stdin.emit("data", "\x1b[?1u");
+			process.stdin.emit("data", "\x1b[?0u");
 			terminal.enterAltScreen();
 			await terminal.drainInput(50, 10);
 			terminal.stop();
@@ -535,7 +535,7 @@ describe("ProcessTerminal kitty keyboard mode stack", () => {
 				() => {},
 				() => {},
 			);
-			process.stdin.emit("data", "\x1b[?1u");
+			process.stdin.emit("data", "\x1b[?0u");
 			terminal.enterAltScreen();
 			terminal.leaveAltScreen();
 			terminal.enterAltScreen();
@@ -575,7 +575,7 @@ describe("ProcessTerminal probe bus wiring", () => {
 				() => {},
 				() => {},
 			);
-			process.stdin.emit("data", "\x1b[?1u");
+			process.stdin.emit("data", "\x1b[?0u");
 			process.stdin.emit("data", "\x1b[?64;1;2;6c");
 			terminal.stop();
 
@@ -793,6 +793,196 @@ describe("ProcessTerminal grapheme 2027 mode", () => {
 			if (cleanup.altScreenActive) {
 				cleanup.stop();
 			}
+			restore();
+		}
+	});
+});
+
+describe("ProcessTerminal crash exit guard (R5-M5)", () => {
+	// Fault injection for the crash paths (R2-H1/R4-M19/R5-M1): the process dies
+	// without stop(), so the exit event fires with the tty still configured. The
+	// guard is the process's "exit" listener armed by start(); tests locate it by
+	// diffing the public listener list, never by probing the instance.
+	function armedExitGuard(baseline: ReadonlySet<unknown>): () => void {
+		const guard = process.listeners("exit").find((listener) => !baseline.has(listener));
+		assert.ok(guard, "start() arms the exit guard");
+		return guard as () => void;
+	}
+
+	function recordRawMode(): boolean[] {
+		const rawCalls: boolean[] = [];
+		Object.defineProperty(process.stdin, "setRawMode", {
+			configurable: true,
+			value: (enabled: boolean) => {
+				rawCalls.push(enabled);
+				return process.stdin;
+			},
+		});
+		return rawCalls;
+	}
+
+	it("restores raw/alt/kitty/2027/bracketed-paste/mouse when the process exits without stop()", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		const rawCalls = recordRawMode();
+		// Every path out stops the terminal: a failed assertion must not leak a
+		// live probe bus (its listeners would keep consuming later tests' input).
+		let terminal: ProcessTerminal | undefined;
+		try {
+			terminal = new ProcessTerminal();
+			const baseline: ReadonlySet<unknown> = new Set(process.listeners("exit"));
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?0u"); // kitty supported -> pushed on the main screen
+			process.stdin.emit("data", "\x1b[?2027;1$y"); // 2027 supported (main screen)
+			terminal.enterAltScreen(); // kitty pushed on the alt stack too
+			terminal.setMouseTracking(true);
+
+			const guard = armedExitGuard(baseline);
+			writes.length = 0;
+			guard(); // the process dies without stop()
+
+			assert.deepEqual(writes, [
+				"\x1b[<u", // the alt-screen kitty entry, popped while its screen is still live
+				"\x1b[?1049l", // the alt screen released
+				"\x1b[<u", // the main-screen kitty entry
+				"\x1b[?1006l\x1b[?1003l\x1b[?1002l", // mouse reporting off
+				"\x1b[?2027l", // grapheme mode reset
+				"\x1b[?2004l", // bracketed paste off
+			]);
+			assert.deepEqual(rawCalls, [true, false], "raw mode engaged at start, restored by the guard");
+			assert.equal(isGrapheme2027Active(), false);
+		} finally {
+			terminal?.stop();
+			restore();
+		}
+	});
+
+	it("a clean stop() disarms the guard so exit after stop restores nothing twice", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		let terminal: ProcessTerminal | undefined;
+		try {
+			const baseline = process.listenerCount("exit");
+			terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			assert.equal(process.listenerCount("exit"), baseline + 1, "start() arms one guard");
+			terminal.stop();
+			assert.equal(process.listenerCount("exit"), baseline, "stop() leaves no guard behind");
+		} finally {
+			terminal?.stop();
+			restore();
+		}
+	});
+
+	it("keeps the guard armed through a preserved handoff, and the next start() replaces it", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		recordRawMode();
+		let first: ProcessTerminal | undefined;
+		let second: ProcessTerminal | undefined;
+		try {
+			const baseline = process.listenerCount("exit");
+			first = new ProcessTerminal();
+			first.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?0u");
+			first.enterAltScreen();
+			first.stop({ preserveAltScreen: true });
+			assert.equal(process.listenerCount("exit"), baseline + 1, "a crash in the handoff gap is still covered");
+
+			// The successor adopts the tty: its start() replaces the guard, never stacks.
+			second = new ProcessTerminal();
+			second.start(
+				() => {},
+				() => {},
+			);
+			assert.equal(process.listenerCount("exit"), baseline + 1, "one guard, not two");
+			process.stdin.emit("data", "\x1b[?0u");
+			second.stop();
+			assert.equal(process.listenerCount("exit"), baseline);
+		} finally {
+			second?.stop();
+			first?.stop();
+			restore();
+		}
+	});
+
+	it("a crash in the handoff gap restores the alt screen and the pre-session raw state", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		const rawCalls = recordRawMode();
+		let first: ProcessTerminal | undefined;
+		try {
+			const baseline: ReadonlySet<unknown> = new Set(process.listeners("exit"));
+			first = new ProcessTerminal();
+			first.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?0u");
+			first.enterAltScreen();
+			first.stop({ preserveAltScreen: true });
+
+			const guard = armedExitGuard(baseline);
+			writes.length = 0;
+			guard(); // the process dies while the next TUI has not started yet
+
+			assert.deepEqual(writes, [
+				// stop(preserveAltScreen) already popped the alt stack's entry; the
+				// main screen's entry is what the crash would have leaked.
+				"\x1b[?1049l", // the preserved alt screen released
+				"\x1b[<u", // the main-screen kitty entry
+				"\x1b[?2004l", // bracketed paste off
+			]);
+			assert.equal(rawCalls[rawCalls.length - 1], false, "raw mode restored from the handoff record");
+		} finally {
+			// The fired guard stays armed; a fresh start/stop replaces and disarms it.
+			const cleanup = new ProcessTerminal();
+			cleanup.start(
+				() => {},
+				() => {},
+			);
+			cleanup.stop();
+			first?.stop();
+			restore();
+		}
+	});
+});
+
+describe("ProcessTerminal grapheme 2027 deferred mode-set (R5-M6)", () => {
+	it("sends the deferred 2027 mode-set when leaving the alt screen", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		let terminal: ProcessTerminal | undefined;
+		try {
+			terminal = new ProcessTerminal();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			terminal.enterAltScreen();
+			// The probe answer lands while the alt screen is active (the fullscreen default).
+			process.stdin.emit("data", "\x1b[?2027;1$y");
+			assert.ok(!writes.includes("\x1b[?2027h"), "no mode-set may land on the wrong screen");
+			assert.equal(isGrapheme2027Active(), false);
+
+			terminal.leaveAltScreen();
+			assert.ok(writes.includes("\x1b[?2027h"), "the main screen is owed the mode-set");
+			assert.equal(isGrapheme2027Active(), true);
+
+			terminal.stop();
+			assert.ok(writes.includes("\x1b[?2027l"), "stop still resets the mode");
+			assert.equal(isGrapheme2027Active(), false);
+		} finally {
+			terminal?.stop();
 			restore();
 		}
 	});

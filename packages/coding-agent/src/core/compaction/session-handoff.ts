@@ -86,6 +86,8 @@ interface ActivityRecord {
 	kind: string;
 	label: string;
 	status: "running" | "ok" | "error";
+	/** The child's exact session name on a finished spawn record, untouched by the label pipeline (R5-M7). */
+	name?: string;
 	detail?: string;
 	startedAt?: number;
 	background?: boolean;
@@ -105,6 +107,7 @@ function parseActivity(value: unknown): ActivityRecord | undefined {
 		kind: value.kind,
 		label: value.label,
 		status: value.status,
+		name: typeof value.name === "string" && value.name.length > 0 ? value.name : undefined,
 		detail: typeof value.detail === "string" ? value.detail : undefined,
 		startedAt: typeof value.startedAt === "number" && Number.isFinite(value.startedAt) ? value.startedAt : undefined,
 		background: value.background === true ? true : undefined,
@@ -151,7 +154,13 @@ function applySubagentActivity(scan: HandoffScan, activity: ActivityRecord): voi
 		scan.subagentKeys.delete(activity.id);
 		return;
 	}
-	const name = clip(activity.label, HANDOFF_LABEL_MAX_CHARS);
+	// Key by the child's exact session name when the record carries one (R6-M8):
+	// the label is display text (blanks collapsed, clipped, secrets redacted), so
+	// keying on it left the lifecycle notices below - which resolve against the
+	// real session name - naming a key that was never stored, and the child
+	// stayed "in flight" across every later compaction. Records from before the
+	// kernel sent the field (or whose name was withheld) keep the label fallback.
+	const name = activity.name ?? clip(activity.label, HANDOFF_LABEL_MAX_CHARS);
 	if (name.length === 0) return;
 	// Admission completion renames the step from the task brief to the child name.
 	if (previousKey !== undefined && previousKey !== name) scan.subagents.delete(previousKey);

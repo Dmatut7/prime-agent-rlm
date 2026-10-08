@@ -49,11 +49,46 @@ describe("ProbeBus", () => {
 			try {
 				const seen: CapabilityState[] = [];
 				bus.onChange("kittyKeyboard", (_cap, state) => seen.push(state));
-				assert.strictEqual(bus.handleSequence("\x1b[?1u"), true);
+				assert.strictEqual(bus.handleSequence("\x1b[?0u"), true);
 				assert.deepStrictEqual(bus.query("kittyKeyboard"), { verdict: "supported", source: "probe" });
 				assert.deepStrictEqual(seen, [{ verdict: "supported", source: "probe" }]);
 			} finally {
 				bus.dispose();
+			}
+		});
+
+		it("pops one leaked kitty stack entry when the answer reports nonzero flags (R5-M5)", () => {
+			const { bus, writes } = startBus({ env: {} });
+			try {
+				// A previous process crashed after pushing flags 7: the stack top is
+				// its leaked entry, and leaving it breaks Ctrl+C in the shell.
+				assert.strictEqual(bus.handleSequence("\x1b[?7u"), true);
+				assert.strictEqual(writes[writes.length - 1], "\x1b[<u");
+				assert.strictEqual(bus.query("kittyKeyboard").verdict, "supported");
+			} finally {
+				bus.dispose();
+			}
+		});
+
+		it("does not pop on a clean flags-0 answer, a post-verdict answer, or under an env override", () => {
+			const clean = startBus({ env: {} });
+			try {
+				const before = clean.writes.length;
+				clean.bus.handleSequence("\x1b[?0u");
+				assert.strictEqual(clean.writes.length, before, "no pop for a clean stack");
+				// After the verdict a nonzero answer describes the app's own entry.
+				clean.bus.handleSequence("\x1b[?7u");
+				assert.strictEqual(clean.writes.length, before, "no pop once the verdict landed");
+			} finally {
+				clean.bus.dispose();
+			}
+			const forced = startBus({ env: { PI_TERMINAL_KITTY_KEYBOARD: "1" } });
+			try {
+				const before = forced.writes.length;
+				forced.bus.handleSequence("\x1b[?7u");
+				assert.strictEqual(forced.writes.length, before, "an override is final: no pop");
+			} finally {
+				forced.bus.dispose();
 			}
 		});
 
@@ -219,7 +254,7 @@ describe("ProbeBus", () => {
 		it("consumes a second DA answer without side effects", async () => {
 			const { bus } = startBus({ env: {} });
 			try {
-				bus.handleSequence("\x1b[?1u");
+				bus.handleSequence("\x1b[?0u");
 				bus.handleSequence(DA_ANSWER);
 				await bus.settled;
 				assert.strictEqual(bus.handleSequence(DA_ANSWER), true);
@@ -236,7 +271,7 @@ describe("ProbeBus", () => {
 				await bus.settled;
 
 				// A Kitty answer that outran the fence still enables the protocol.
-				assert.strictEqual(bus.handleSequence("\x1b[?1u"), true);
+				assert.strictEqual(bus.handleSequence("\x1b[?0u"), true);
 				assert.strictEqual(bus.query("kittyKeyboard").verdict, "supported");
 
 				// Cell size has no fence semantics today: answers apply whenever they land.
@@ -307,7 +342,7 @@ describe("ProbeBus", () => {
 		it("an env override is final: answers are consumed but change nothing", () => {
 			const { bus } = startBus({ env: { PI_TERMINAL_KITTY_KEYBOARD: "0" } });
 			try {
-				assert.strictEqual(bus.handleSequence("\x1b[?1u"), true);
+				assert.strictEqual(bus.handleSequence("\x1b[?0u"), true);
 				assert.strictEqual(bus.query("kittyKeyboard").verdict, "unsupported");
 			} finally {
 				bus.dispose();
@@ -805,7 +840,7 @@ describe("ProbeBus", () => {
 				const seen: CapabilityState[] = [];
 				const off = bus.onChange("kittyKeyboard", (_cap, state) => seen.push(state));
 				off();
-				bus.handleSequence("\x1b[?1u");
+				bus.handleSequence("\x1b[?0u");
 				assert.deepStrictEqual(seen, []);
 
 				const snapshot = bus.query("kittyKeyboard");
@@ -820,7 +855,7 @@ describe("ProbeBus", () => {
 			const { bus } = startBus({ env: {}, fallbackMs: 60_000 });
 			bus.dispose();
 			await bus.settled;
-			assert.strictEqual(bus.handleSequence("\x1b[?1u"), false);
+			assert.strictEqual(bus.handleSequence("\x1b[?0u"), false);
 		});
 
 		it("start is idempotent", () => {

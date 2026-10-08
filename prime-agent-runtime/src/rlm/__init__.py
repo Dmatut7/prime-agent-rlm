@@ -181,7 +181,14 @@ async def run(prompt: str, **kwargs: Any) -> RLMSpawnHandle:
     except BaseException as exc:
         step.finish("error", f"{type(exc).__name__}: {exc}")
         raise
-    step.finish("ok", handle.model, label=handle.name)
+    # `name` is the child's exact session name, untouched by the display-only
+    # label pipeline (blank collapse, clip): the host's timeline and handoff
+    # ledger key subagent rows by the session name, and a rewritten label left
+    # them matching against a name that never existed. A name the secret scan
+    # would redact stays off the record (name_safe_to_record) rather than
+    # persisting what it looked like; those rows keep today's label fallback.
+    extra = {"name": handle.name} if _effects.name_safe_to_record(handle.name) else {}
+    step.finish("ok", handle.model, label=handle.name, extra=extra)
     return handle
 
 

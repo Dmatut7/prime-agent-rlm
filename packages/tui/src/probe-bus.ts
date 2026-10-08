@@ -95,7 +95,10 @@ const PRIMARY_DA_QUERY = "\x1b[c";
 const SCHEME_2031_ENABLE = "\x1b[?2031h";
 const SCHEME_2031_DISABLE = "\x1b[?2031l";
 
-const KITTY_ANSWER_REGEX = /^\x1b\[\?\d+u$/;
+const KITTY_ANSWER_REGEX = /^\x1b\[\?(\d+)u$/;
+// Pop one kitty keyboard stack entry; the answer's flags are the probe for
+// leaked entries (see the kitty branch of handleSequence).
+const KITTY_KEYBOARD_POP = "\x1b[<u";
 const DECRPM_ANSWER_REGEX = /^\x1b\[\?(\d+);(\d+)\$y$/;
 // The `?` prefix is load-bearing: a bare `\x1b[c` is the shift+right key.
 const DA_ANSWER_REGEX = /^\x1b\[\?[\d;]*c$/;
@@ -224,7 +227,25 @@ export class ProbeBus {
 			return false;
 		}
 
-		if (KITTY_ANSWER_REGEX.test(sequence)) {
+		const kitty = sequence.match(KITTY_ANSWER_REGEX);
+		if (kitty) {
+			// A nonzero flags answer before any verdict means a process that died
+			// without popping left the protocol on the stack (R5-M5): each crash
+			// added one entry and a clean exit pops only its own, so the leak
+			// compounded across runs and Ctrl+C stopped raising SIGINT. Pop one
+			// leaked entry per startup - the answer itself proves support, and
+			// with crashes no longer leaking (the exit guard), the stack drains
+			// across runs. The pop precedes this session's own push, which only
+			// happens once the verdict below lands. After the verdict a nonzero
+			// answer would describe the app's own entry, so it is never drained.
+			if (
+				Number(kitty[1]) !== 0 &&
+				this.states.get("kittyKeyboard")!.verdict === "pending" &&
+				this.states.get("kittyKeyboard")!.source !== "env-override" &&
+				this.write
+			) {
+				this.write(KITTY_KEYBOARD_POP);
+			}
 			// Honored whenever it arrives: on a slow link the answer can outrun the
 			// fallback timer, and enabling late beats never enabling.
 			this.setStateUnlessOverridden("kittyKeyboard", { verdict: "supported", source: "probe" });

@@ -390,6 +390,12 @@ _untracked: contextvars.ContextVar[bool] = contextvars.ContextVar("_prime_agent_
 
 _tracker: _Tracker | None = None
 _ids = itertools.count(1)
+# Activity ids must stay unique across kernel restarts: the host keeps records
+# keyed by id (background commands resolved by a later record under the same
+# id), and a restarted kernel's counter starting at 1 again would attach a new
+# command's records to a pre-restart id. A random per-boot nonce keeps the two
+# namespaces apart.
+_ids_nonce = os.urandom(6).hex()
 # The real functions, captured when this module loads (before any wrapper exists). The
 # tracker's own reads and stats go through these, so it never observes itself.
 _real_open = io.open
@@ -2821,6 +2827,17 @@ class untracked:  # noqa: N801 - used as a context manager, reads like a functio
 _LABEL_SCAN_CHARS = MAX_LABEL + 1024
 
 
+def name_safe_to_record(text: str) -> bool:
+    """Whether `text` may ride along on a record as an identity field (R5-M7).
+
+    The identity field bypasses the display pipeline, so it must satisfy the
+    same secret scan that guards every display label: a name that would be
+    redacted stays off the record entirely (the display label still names the
+    step, as before) rather than persisting the credential it looked like.
+    """
+    return not _looks_secret(" ".join(text.split())[:_LABEL_SCAN_CHARS])
+
+
 def _safe_label(text: str, kind: str) -> str:
     """`text` one-lined and capped for a step's label, or `kind` when it looks like it holds a credential.
 
@@ -2841,7 +2858,7 @@ class Step:
 
     def __init__(self, kind: str, label: str) -> None:
         self.kind = kind
-        self.id = f"{kind}-{next(_ids)}"
+        self.id = f"{kind}-{_ids_nonce}-{next(_ids)}"
         self.label = _safe_label(label, kind) or kind
         self.started_at = _now_ms()
         self.done = False

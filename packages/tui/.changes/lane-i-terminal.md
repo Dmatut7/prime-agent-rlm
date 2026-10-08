@@ -1,0 +1,3 @@
+- Fixed a crash leaving the tty half-configured: the exit guard now restores raw mode, the alt screen, both kitty keyboard stack entries, grapheme 2027, bracketed paste and mouse reporting, not only mouse tracking (R5-M5).
+- Fixed the kitty keyboard stack leak compounding across processes: a startup probe answer reporting nonzero flags (a previous process crashed after pushing) now pops one leaked entry per launch, so Ctrl+C keeps raising SIGINT (R5-M5).
+- Fixed fullscreen sessions never enabling grapheme cluster mode (DECSET 2027): a supported probe verdict that arrives while the alt screen is active is now sent when the main screen returns, instead of being dropped (R5-M6).

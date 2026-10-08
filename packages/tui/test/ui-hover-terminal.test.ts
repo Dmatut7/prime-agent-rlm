@@ -124,48 +124,89 @@ describe("ProcessTerminal mouse tracking around exit", () => {
 	});
 
 	describe("exit safety net", () => {
+		// The exit guard is armed by start() and covers every mode the terminal
+		// configures, not only mouse tracking (R5-M5). start() needs stdin stubs:
+		// the runner's stdin is not a tty it will let us flip into raw mode.
+		function patchStdinForStart(): () => void {
+			const descriptors = ["isRaw", "setRawMode", "resume", "pause"].map(
+				(key) => [key, Object.getOwnPropertyDescriptor(process.stdin, key)] as const,
+			);
+			Object.defineProperty(process.stdin, "isRaw", { configurable: true, get: () => false });
+			Object.defineProperty(process.stdin, "setRawMode", { configurable: true, value: () => process.stdin });
+			Object.defineProperty(process.stdin, "resume", { configurable: true, value: () => process.stdin });
+			Object.defineProperty(process.stdin, "pause", { configurable: true, value: () => process.stdin });
+			return () => {
+				for (const [key, descriptor] of descriptors) {
+					if (descriptor) {
+						Object.defineProperty(process.stdin, key, descriptor);
+					} else {
+						Reflect.deleteProperty(process.stdin, key);
+					}
+				}
+			};
+		}
+
 		const registeredSince = (before: ReadonlyArray<unknown>) =>
 			process.listeners("exit").filter((listener) => !before.includes(listener));
 
-		it("registers one exit handler while tracking is on and removes it when tracking goes off", async () => {
+		it("start() arms one exit guard and stop() removes it; tracking toggles do not touch it", async () => {
 			const before = process.listeners("exit");
+			const unpatch = patchStdinForStart();
 			const terminal = new ProcessTerminal();
-			await withCapturedStdout(async () => {
-				terminal.setMouseTracking(true);
-				terminal.setMouseTracking(true);
-				assert.strictEqual(registeredSince(before).length, 1);
-				terminal.setMouseTracking(false);
-				assert.strictEqual(registeredSince(before).length, 0);
-				terminal.setMouseTracking(true);
-				assert.strictEqual(registeredSince(before).length, 1);
+			try {
+				await withCapturedStdout(async () => {
+					terminal.start(
+						() => {},
+						() => {},
+					);
+					assert.strictEqual(registeredSince(before).length, 1, "armed at start");
+					terminal.setMouseTracking(true);
+					terminal.setMouseTracking(false);
+					assert.strictEqual(registeredSince(before).length, 1, "the guard outlives a tracking toggle");
+					terminal.stop();
+					assert.strictEqual(registeredSince(before).length, 0, "stop() removes it");
+				});
+			} finally {
 				terminal.stop();
-				assert.strictEqual(registeredSince(before).length, 0, "stop() removes it");
-				terminal.setMouseTracking(true);
-				await terminal.drainInput(20, 5);
-				assert.strictEqual(registeredSince(before).length, 0, "closing reporting for the drain removes it");
-			});
+				unpatch();
+			}
 		});
 
-		it("restores the terminal from the exit handler when the process dies with tracking on", async () => {
+		it("restores mouse reporting from the exit handler when the process dies with tracking on", async () => {
 			const before = process.listeners("exit");
+			const unpatch = patchStdinForStart();
 			const terminal = new ProcessTerminal();
-			await withCapturedStdout(async (writes) => {
-				terminal.setMouseTracking(true);
-				const [handler] = registeredSince(before);
-				assert.ok(handler);
-				writes.length = 0;
-				handler(0);
-				assert.deepStrictEqual(writes, [DISABLE]);
-				terminal.setMouseTracking(false);
-			});
+			try {
+				await withCapturedStdout(async (writes) => {
+					terminal.start(
+						() => {},
+						() => {},
+					);
+					terminal.setMouseTracking(true);
+					const [handler] = registeredSince(before);
+					assert.ok(handler);
+					writes.length = 0;
+					handler(0);
+					assert.ok(writes.includes(DISABLE), "mouse reporting is restored off");
+					assert.ok(writes.includes("\x1b[?2004l"), "bracketed paste is restored off");
+				});
+			} finally {
+				terminal.stop();
+				unpatch();
+			}
 		});
 
 		it("stays silent when the terminal is already gone", async () => {
 			const before = process.listeners("exit");
+			const unpatch = patchStdinForStart();
 			const terminal = new ProcessTerminal();
 			const originalWrite = process.stdout.write;
 			try {
 				await withCapturedStdout(async () => {
+					terminal.start(
+						() => {},
+						() => {},
+					);
 					terminal.setMouseTracking(true);
 				});
 				const [handler] = registeredSince(before);
@@ -176,7 +217,8 @@ describe("ProcessTerminal mouse tracking around exit", () => {
 				assert.doesNotThrow(() => handler(0));
 			} finally {
 				process.stdout.write = originalWrite;
-				await withCapturedStdout(async () => terminal.setMouseTracking(false));
+				terminal.stop();
+				unpatch();
 			}
 		});
 	});

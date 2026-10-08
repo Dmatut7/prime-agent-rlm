@@ -1249,7 +1249,9 @@ ended.add("c2")
 """,
         )
         records = _activities(sent)
-        started = sorted({r["id"] for r in records if r["cell"] == "c1"}, key=lambda i: int(i.split("-")[1]))
+        started = sorted(
+            {r["id"] for r in records if r["cell"] == "c1"}, key=lambda i: int(i.rsplit("-", 1)[1])
+        )
         self.assertEqual(len(started), effects.MAX_PENDING_COMPLETIONS + extra)
         reported = [r["id"] for r in records if r["cell"] == "c2" and r["status"] == "ok"]
         self.assertEqual(reported, started[extra:])

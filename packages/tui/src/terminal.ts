@@ -92,6 +92,12 @@ function cancelInputHandoff(token: symbol): void {
 	}
 }
 
+// The exit guard armed by the running ProcessTerminal (R5-M5). Module-level so
+// a preserved handoff keeps exactly one guard armed: the next instance's
+// start() replaces the predecessor's guard instead of stacking a second one,
+// and a crash in the handoff gap is still covered by the old one.
+let armedExitGuard: (() => void) | undefined;
+
 // Early raw mode: the interactive CLI engages raw mode as soon as it knows the
 // TUI will run, long before ProcessTerminal.start() (daemon handshake, session
 // load and theme setup sit between). A tty still in cooked mode ICRNL-mangles a
@@ -243,7 +249,12 @@ export class ProcessTerminal implements Terminal {
 	private _mouseTrackingActive = false;
 	// Set once the terminal is being drained for exit: reporting stays off however the UI asks.
 	private mouseTrackingSuspended = false;
-	private mouseExitGuard?: () => void;
+	// A supported 2027 verdict that arrived while the alt screen was active: the
+	// mode-set is main-screen-only, so leaveAltScreen owes it a re-send (R5-M6).
+	private grapheme2027PendingMainScreen = false;
+	// The exit guard this instance armed (armExitGuard); the module slot may
+	// already point at a successor's guard.
+	private ownExitGuard?: () => void;
 	private stdinBuffer?: StdinBuffer;
 	private stdinDataHandler?: (data: string) => void;
 	private _probeBus?: ProbeBus;
@@ -286,6 +297,9 @@ export class ProcessTerminal implements Terminal {
 		}
 		process.stdin.setEncoding("utf8");
 		process.stdin.resume();
+		// From here the tty is this process's to restore: a crash must not leave
+		// raw/alt/kitty/2027/bracketed-paste/mouse behind (R5-M5).
+		this.armExitGuard();
 
 		// Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
 		process.stdout.write("\x1b[?2004h");
@@ -419,13 +433,20 @@ export class ProcessTerminal implements Terminal {
 	 * not enabling (docs/fork/probe-bus-design.md §3.2). Main screen only: the
 	 * mode's per-screen semantics are unverified (same caveat as the kitty
 	 * keyboard stack once had), so while the alt screen is active the mode-set
-	 * could land on the wrong screen and stays off.
+	 * could land on the wrong screen. Fullscreen sessions are on the alt screen
+	 * by the time the probe answer arrives, so the send is not dropped but owed
+	 * to the return to the main screen (R5-M6).
 	 */
 	private enableGrapheme2027(): void {
-		if (this._grapheme2027Active || this._altScreenActive) {
+		if (this._grapheme2027Active) {
+			return;
+		}
+		if (this._altScreenActive) {
+			this.grapheme2027PendingMainScreen = true;
 			return;
 		}
 		this._grapheme2027Active = true;
+		this.grapheme2027PendingMainScreen = false;
 		setGrapheme2027Active(true);
 		process.stdout.write("\x1b[?2027h");
 	}
@@ -470,7 +491,6 @@ export class ProcessTerminal implements Terminal {
 		if (this._mouseTrackingActive) {
 			process.stdout.write(MOUSE_TRACKING_OFF);
 			this._mouseTrackingActive = false;
-			this.disarmMouseExitGuard();
 		}
 		this.mouseTrackingSuspended = true;
 		if (this._kittyProtocolActive) {
@@ -559,8 +579,16 @@ export class ProcessTerminal implements Terminal {
 			process.stdout.write(MOUSE_TRACKING_OFF);
 			this._mouseTrackingActive = false;
 		}
-		this.disarmMouseExitGuard();
+		// A preserved handoff keeps the tty configured for the next in-process
+		// TUI, so its guard stays armed (the next start() replaces it); every
+		// other stop restores below, making the guard dead weight at exit.
+		if (!(options.preserveAltScreen && wasStarted)) {
+			this.disarmExitGuard();
+		}
 		this.mouseTrackingSuspended = false;
+		// The session is ending: a 2027 verdict still owed to the main screen
+		// would only be reset again a few lines below.
+		this.grapheme2027PendingMainScreen = false;
 		if (this._altScreenActive) {
 			if (options.preserveAltScreen) {
 				pendingAltScreenHandoff = this.altScreenHandoffToken;
@@ -734,6 +762,12 @@ export class ProcessTerminal implements Terminal {
 			kittyMainScreenPushOutstanding = true;
 			this.write(KITTY_FLAGS_PUSH);
 		}
+		// Same shape for grapheme 2027 (R5-M6): a supported verdict that arrived
+		// on the alt screen was deferred, and the main screen is owed the
+		// mode-set now that it is active again.
+		if (this.grapheme2027PendingMainScreen) {
+			this.enableGrapheme2027();
+		}
 	}
 
 	/**
@@ -767,31 +801,75 @@ export class ProcessTerminal implements Terminal {
 		// ?1003 (any-event tracking) reports drags for in-app selection and, since
 		// hover, plain moves too. Off also clears ?1002 in case an older run left it set.
 		this.write(enabled ? MOUSE_TRACKING_ON : MOUSE_TRACKING_OFF);
-		if (enabled) {
-			this.armMouseExitGuard();
-		} else {
-			this.disarmMouseExitGuard();
-		}
 	}
 
-	// A process that dies without stop() (uncaught exception, process.exit) must not
-	// leave ?1003 on: the shell would print a report for every pointer move.
-	private armMouseExitGuard(): void {
-		if (this.mouseExitGuard) return;
-		this.mouseExitGuard = () => {
+	// A process that dies without stop() (uncaught exception, process.exit) must
+	// not leave the tty half-configured: raw mode stays on (the shell echoes
+	// nothing), the alt screen keeps the scrollback hostage, a kitty stack entry
+	// leaks (Ctrl+C stops raising SIGINT), and 2027/bracketed-paste/mouse keep
+	// reporting into the prompt. One guard restores whatever is outstanding at
+	// exit time, reading the module kitty marks and the live handoff state
+	// rather than instance flags a stop() may already have cleared.
+	private armExitGuard(): void {
+		this.disarmExitGuard();
+		// A preserved handoff's guard still belongs to the previous instance;
+		// this instance owns the tty now, so replace it rather than stack.
+		if (armedExitGuard) {
+			process.removeListener("exit", armedExitGuard);
+			armedExitGuard = undefined;
+		}
+		const guard = () => {
 			try {
-				process.stdout.write(MOUSE_TRACKING_OFF);
+				// Pop the kitty entry while its owning screen is still active:
+				// popped after ?1049l, an alt-screen entry would eat the main
+				// stack's entry instead.
+				const altLive = this._altScreenActive || pendingAltScreenHandoff !== undefined;
+				if (altLive && kittyAltScreenPushOutstanding) {
+					kittyAltScreenPushOutstanding = false;
+					process.stdout.write(KITTY_FLAGS_POP);
+				}
+				if (altLive) {
+					pendingAltScreenHandoff = undefined;
+					process.stdout.write("\x1b[?1049l");
+				}
+				if (kittyMainScreenPushOutstanding) {
+					kittyMainScreenPushOutstanding = false;
+					process.stdout.write(KITTY_FLAGS_POP);
+				}
+				if (this._modifyOtherKeysActive) {
+					process.stdout.write("\x1b[>4;0m");
+				}
+				if (this._mouseTrackingActive) {
+					process.stdout.write(MOUSE_TRACKING_OFF);
+				}
+				if (isGrapheme2027Active()) {
+					process.stdout.write("\x1b[?2027l");
+					setGrapheme2027Active(false);
+				}
+				// Bracketed paste is enabled unconditionally in start().
+				process.stdout.write("\x1b[?2004l");
+			} catch {
+				// The terminal is already gone; nothing left to restore.
+			}
+			try {
+				process.stdin.setRawMode?.(pendingInputHandoff?.wasRaw ?? this.wasRaw);
 			} catch {
 				// The terminal is already gone; nothing left to restore.
 			}
 		};
-		process.on("exit", this.mouseExitGuard);
+		this.ownExitGuard = guard;
+		armedExitGuard = guard;
+		process.on("exit", guard);
 	}
 
-	private disarmMouseExitGuard(): void {
-		if (!this.mouseExitGuard) return;
-		process.removeListener("exit", this.mouseExitGuard);
-		this.mouseExitGuard = undefined;
+	private disarmExitGuard(): void {
+		// Ownership check: another instance may have replaced this guard during a
+		// handoff; disarming must never strip a guard that is not this one's.
+		if (this.ownExitGuard && armedExitGuard === this.ownExitGuard) {
+			process.removeListener("exit", this.ownExitGuard);
+			armedExitGuard = undefined;
+		}
+		this.ownExitGuard = undefined;
 	}
 
 	get mouseTrackingActive(): boolean {

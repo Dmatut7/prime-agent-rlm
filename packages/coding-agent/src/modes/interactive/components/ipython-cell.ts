@@ -87,6 +87,10 @@ interface IpythonDetails {
 	backgroundOutput?: string;
 	diffs?: DiffDisplay[];
 	sentAgentMessages?: SentAgentMessageDisplay[];
+	/** The kernel was killed and restarted before this cell ran (ipython.ts details). */
+	kernelRestarted?: boolean;
+	/** The kernel process died on its own and a replacement ran this cell. */
+	kernelReset?: boolean;
 	error?: IpythonErrorDetails;
 }
 
@@ -171,6 +175,8 @@ function readDetails(details: unknown): IpythonDetails {
 		backgroundOutput: typeof record.backgroundOutput === "string" ? record.backgroundOutput : undefined,
 		diffs: readDiffDisplays(record.diffs),
 		sentAgentMessages: readSentAgentMessages(record.sentAgentMessages),
+		kernelRestarted: record.kernelRestarted === true ? true : undefined,
+		kernelReset: record.kernelReset === true ? true : undefined,
 		error,
 	};
 }
@@ -407,6 +413,7 @@ export class IPythonCellComponent implements Component {
 		// or indentation; expanding only attaches code and output below it.
 		// Cached by state version so unrelated repaints don't re-render (flicker).
 		const lines = [this.topLine(details, safeWidth)];
+		this.renderKernelResetNotice(lines, safeWidth, details);
 
 		// An expanded step shows what it produced; its code joins only in the full
 		// view, or when the label could not say what the cell does.
@@ -474,6 +481,25 @@ export class IPythonCellComponent implements Component {
 			return `${clipped}${" ".repeat(Math.max(0, width - visibleWidth(clipped) - rightWidth))}${right}`;
 		}
 		return `${left}${" ".repeat(width - visibleWidth(left) - rightWidth)}${right}`;
+	}
+
+	/**
+	 * R3-M10: a cell that ran on a replacement kernel looks identical to one that
+	 * did not, while every variable the session had built is gone - the model is
+	 * told (the tool result's notice), the owner never was. The notice line sits
+	 * directly under the top line, collapsed or expanded, so the loss is visible
+	 * without opening the cell.
+	 */
+	private renderKernelResetNotice(lines: string[], width: number, details: IpythonDetails): void {
+		const notice = details.kernelReset
+			? "内核已重置：原内核进程死亡后被替换，之前的变量与导入可能已丢失"
+			: details.kernelRestarted
+				? "内核已重启：中断后重建，之前的变量与任务可能已丢失"
+				: undefined;
+		if (!notice) {
+			return;
+		}
+		this.addWrapped(lines, OUTPUT_INDENT, theme.fg("warning", `⚠ ${notice}`), width);
 	}
 
 	private stepLabel(): string {

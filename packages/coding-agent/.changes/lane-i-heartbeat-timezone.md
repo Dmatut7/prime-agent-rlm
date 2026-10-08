@@ -1,0 +1,1 @@
+- Unified heartbeat/cron next-run times onto one local-timezone format across the management panel, status lines, and chat summary (was: UTC panel vs raw-ISO status vs local chat, three answers eight hours apart).
