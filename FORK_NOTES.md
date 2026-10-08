@@ -1,3 +1,11 @@
+## 2026-10-08 显示审计第五波·下：车道 B（时间线）+ 车道 I（终端底层+Python 内核）合入
+
+> 上节六车道之后，B、I 两条在途车道完成并合入，主树每合一条 `npm run check` EXIT 0。第二波（C 清洗残余 / K 编辑器深水区+replay 容错 / J 文档假话批）已基于 6148fd172 开三条独立 worktree 车道并行推进中。
+
+- **车道 B（时间线/块渲染 6 条 + 1 连带，commit 1d83d94b7，qwen3.8-max）**：块导航提示不再落框顶空行、首行 `N 步 ▸` 回来（isVisibleRow 与 turn-box 同一谓词口径，提示挤不进时行尾让位+省略号，窄终端宁可不画不越界）；块复制（Y 键）改复制卡片持有的源文——缩进与段间空行保全（skill/compaction/injected-prompt/refinement 四类卡片，renderedCopyText 兜底也不再逐行 trim）；steer 插话可展开（按 fail 事件同款 row 通道挂 fullText/detail，短插话形态不变）；replay 不再给有真实结果的中断工具盖编造「已中断」（fabricatedTools 侧表，真结果到达即覆盖）；心跳提示词不再被当主人提问（判定提前到 turnFlow.userMessage 之前，走 wake 通道：不 reset 子代理 lane、不清 settle 账本）；另一视图 Esc 后 live/replay 分组不再分裂（runCutMidTask 排除 owner-stop stub）。对账表同步改钉死测试 2 处（ui-block-render 长插话拆短/长两条、turn-box-live settle 分组改断言 replay 一致形态）。触及面 1618 测试绿，新增 4 测试文件均先红后绿。
+- **车道 I（终端底层+Python 内核 7 条，commit 6148fd172，GLM 5.3 开局 2 条+claude-fable-5-1 接手收尾）**：崩溃后 tty 全量恢复 guard（raw/alt/kitty 栈/2027/bracketed-paste/mouse/modifyOtherKeys，exit 监听器故障注入测试字节级断言恢复序列；alt-screen 交接期 guard 保持武装且下一实例替换不叠加）；kitty 复利泄漏收敛（probe-bus 解析 CSI ? flags u，非零 flags 判前进程泄漏、每次启动 pop 一条——修掉「崩溃若干次后 Ctrl+C 变 SIGINT」）；全屏会话 grapheme 2027 启用（leaveAltScreen 补发欠账 mode-set）；心跳 nextRunAt 三个界面统一本地时区；ipython cell 内核重启/重置上屏提示（不再等 NameError 才发现变量没了）；子代理 finished 记录带精确会话名（safe-label 只留给显示，时间线/turn box/交接台账按真名对账，不再卡 running+双行）；activity id 混启动 nonce（kernel 重启不再张冠李戴）；session-handoff 幽灵台账修复（入账与删除同口径，压缩不再复活早已结清的子代理）。tui 全量 1348/1348、Python 运行时全量套件、coding-agent 触及套件全绿；GLM 5.3 前手遗留的 4 个 TS2304 由接手方修掉（5680cb57b）。
+- **并行工艺记录**：八车道全部独立 worktree+lane 分支物理隔离；两条 GLM 车道均出现「静默停走不报告」（GLM 5.3 三次、GLM 5.3 Prime 两次），督促可恢复但其提交曾带类型错误（R3-M9 初版），故 GLM 车道交付一律主会话亲自复跑 check+测试后才合并；车道 I 后半由 fable 接手完成。批次 H 提前于「最后做」建议在隔离车道完成，未与其他车道冲突。
+
 ## 2026-10-08 显示审计第五波·上：六车道并行合入（A/E/G/H/F + D）
 
 > 交接文档 docs/audits/2026-10-08-fix-backlog.md 的批次 A/E/G/H/F/D 由六个独立 worktree 车道并行完成，主会话逐条 merge --squash 合入，每合一条主树 `npm run check` EXIT 0。车道 B（时间线）与 I（终端底层+Python 内核）在途，合入后另开节。D 车道详情见下一节（其自带 FORK_NOTES）。
