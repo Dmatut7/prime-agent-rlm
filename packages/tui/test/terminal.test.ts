@@ -977,6 +977,45 @@ describe("ProcessTerminal crash exit guard (R5-M5)", () => {
 			restore();
 		}
 	});
+
+	it("a crash after the successor is constructed but before start() still restores the alt screen", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		const rawCalls = recordRawMode();
+		let first: ProcessTerminal | undefined;
+		let second: ProcessTerminal | undefined;
+		try {
+			const baseline: ReadonlySet<unknown> = new Set(process.listeners("exit"));
+			first = new ProcessTerminal();
+			first.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?0u");
+			first.enterAltScreen();
+			first.stop({ preserveAltScreen: true });
+
+			// The successor's constructor consumes the alt-screen handoff token;
+			// session load and setup run before its start() arms the new guard. The
+			// predecessor's guard must still see the alt screen as live here.
+			second = new ProcessTerminal();
+
+			const guard = armedExitGuard(baseline);
+			writes.length = 0;
+			guard(); // the process dies in the constructor -> start() gap
+
+			assert.deepEqual(writes, [
+				"\x1b[?1049l", // the terminal is still in the alt screen: release it
+				"\x1b[<u", // the main-screen kitty entry (popped after the release)
+				"\x1b[?2004l", // bracketed paste off
+			]);
+			assert.equal(rawCalls[rawCalls.length - 1], false, "raw mode restored from the handoff record");
+		} finally {
+			second?.stop();
+			first?.stop();
+			restore();
+		}
+	});
 });
 
 describe("ProcessTerminal grapheme 2027 deferred mode-set (R5-M6)", () => {

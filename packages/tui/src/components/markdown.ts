@@ -824,6 +824,13 @@ export class Markdown implements Component {
 	private splitLexEpoch = 0;
 	// Set when this frame's token stream came from trySplitLex; see SplitLexFrame.
 	private splitLexEngaged?: SplitLexFrame;
+	// Append-only clean verdict of the split-lex backtick guard: the whole
+	// normalized text of the frame where the paragraph's mask was last verified
+	// clean, with its paraFrom. See splitBacktickClean.
+	private splitLexMaskClean?: { paraFrom: number; source: string };
+	// Append-only clean verdict of the paragraph-seal backtick guard: the
+	// paragraph text of the frame last verified clean. See sealBacktickClean.
+	private sealMaskClean?: string;
 	// Item-level split of the growing final list; see ListSplitLex. Same
 	// survival rules as the lex cache; every frame re-validates before reusing.
 	private listSplitLex?: ListSplitLex;
@@ -956,7 +963,10 @@ export class Markdown implements Component {
 		// later text, re-typing emphasis inside the verified prefix without any
 		// token crossing the cut (see emphasisMask); such frames fall back to a
 		// full lex, which also re-bootstraps this state from the corrected tokens.
-		if (hasUnmaskedBacktick(normalizedText.slice(split.paraFrom))) {
+		// The clean verdict is memoized append-only (see splitBacktickClean) so a
+		// growing paragraph of paired inline code pays one scan per new backtick,
+		// not a full-paragraph mask every frame.
+		if (!this.splitBacktickClean(split.paraFrom, normalizedText)) {
 			return undefined;
 		}
 		const tail = normalizedText.slice(split.cut);
@@ -1046,6 +1056,58 @@ export class Markdown implements Component {
 			}
 		}
 		return tokens;
+	}
+
+	/**
+	 * The split-lex backtick guard with an append-only memo. hasUnmaskedBacktick
+	 * walks the emphasis mask of the whole paragraph, so a growing paragraph of
+	 * paired inline code would pay a full-paragraph regex scan every frame (the
+	 * O(n)-per-frame shape the split lex exists to avoid). Once a paragraph's
+	 * mask is verified clean, frames that only append text without any backtick
+	 * keep it clean: the mask spans are decided by a left-to-right scan, and the
+	 * only way an already-matched span dissolves is a backtick arriving
+	 * immediately after a code-span closer (blockSkip's `(?!`)`), which requires
+	 * the appended region to hold a backtick. The memo keys on the whole
+	 * normalized text plus paraFrom (no per-frame paragraph slice), and the
+	 * append check is the same startsWith idiom the split prefix already uses.
+	 */
+	private splitBacktickClean(paraFrom: number, normalizedText: string): boolean {
+		const memo = process.env.PI_MARKDOWN_BACKTICK_GUARD_MEMO === "0" ? undefined : this.splitLexMaskClean;
+		if (
+			memo &&
+			memo.paraFrom === paraFrom &&
+			normalizedText.startsWith(memo.source) &&
+			!normalizedText.includes("`", memo.source.length)
+		) {
+			memo.source = normalizedText;
+			return true;
+		}
+		if (hasUnmaskedBacktick(normalizedText.slice(paraFrom))) {
+			this.splitLexMaskClean = undefined;
+			return false;
+		}
+		this.splitLexMaskClean = { paraFrom, source: normalizedText };
+		return true;
+	}
+
+	/**
+	 * The paragraph-seal backtick guard with the same append-only memo, keyed on
+	 * the seal's own paragraph text (a different string from the split guard's
+	 * source: marked strips one trailing newline). See splitBacktickClean for
+	 * why a clean verdict survives backtick-free appends.
+	 */
+	private sealBacktickClean(text: string): boolean {
+		const memo = process.env.PI_MARKDOWN_BACKTICK_GUARD_MEMO === "0" ? undefined : this.sealMaskClean;
+		if (memo && text.startsWith(memo) && !text.includes("`", memo.length)) {
+			this.sealMaskClean = text;
+			return true;
+		}
+		if (hasUnmaskedBacktick(text)) {
+			this.sealMaskClean = undefined;
+			return false;
+		}
+		this.sealMaskClean = text;
+		return true;
 	}
 
 	/**
@@ -1510,9 +1572,10 @@ export class Markdown implements Component {
 		// seal boundary (see emphasisMask), so the seal is served only while no
 		// such run exists; the seal rebuilds itself from the corrected tokens on
 		// the next clean frame. A split-lex frame already ran this check on the
-		// same paragraph text.
+		// same paragraph text. The clean verdict is memoized append-only (see
+		// sealBacktickClean).
 		const engaged = this.splitLexEngaged;
-		if (engaged === undefined && hasUnmaskedBacktick(text)) {
+		if (engaged === undefined && !this.sealBacktickClean(text)) {
 			this.finalBlockSeal = undefined;
 			return undefined;
 		}

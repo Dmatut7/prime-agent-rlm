@@ -38,6 +38,16 @@ let kittyAltScreenPushOutstanding = false;
 // A preserved alternate screen is adopted by the next ProcessTerminal during in-process handoff.
 let pendingAltScreenHandoff: symbol | undefined;
 
+// Whether the terminal is physically in the alternate screen, independent of
+// which ProcessTerminal instance (if any) currently owns that fact: true from
+// enterAltScreen until releaseAltScreen or the exit guard writes ?1049l, and
+// across a preserved handoff - including after the successor's constructor
+// has consumed the token but before its start() arms the successor's guard.
+// The exit guard reads this instead of only the handoff token: in that
+// constructor -> start() window the token is already consumed while the alt
+// screen is still live, and the predecessor's guard must still restore it.
+let altScreenLiveInTerminal = false;
+
 interface PendingInputHandoff {
 	token: symbol;
 	wasRaw: boolean;
@@ -95,7 +105,9 @@ function cancelInputHandoff(token: symbol): void {
 // The exit guard armed by the running ProcessTerminal (R5-M5). Module-level so
 // a preserved handoff keeps exactly one guard armed: the next instance's
 // start() replaces the predecessor's guard instead of stacking a second one,
-// and a crash in the handoff gap is still covered by the old one.
+// and a crash anywhere in the handoff gap - before or after the successor's
+// constructor consumed the token, up to its start() - is still covered by the
+// old one (see altScreenLiveInTerminal).
 let armedExitGuard: (() => void) | undefined;
 
 // Early raw mode: the interactive CLI engages raw mode as soon as it knows the
@@ -758,6 +770,7 @@ export class ProcessTerminal implements Terminal {
 		// transmits made on the main screen do not carry over.
 		invalidateKittyImageTransmits();
 		if (this._altScreenActive) return;
+		altScreenLiveInTerminal = true;
 		if (this.ownsPendingAltScreenHandoff()) {
 			pendingAltScreenHandoff = undefined;
 			this._altScreenActive = true;
@@ -781,6 +794,7 @@ export class ProcessTerminal implements Terminal {
 		const ownsPendingHandoff = this.ownsPendingAltScreenHandoff();
 		if (!this._altScreenActive && !ownsPendingHandoff) return;
 		this._altScreenActive = false;
+		altScreenLiveInTerminal = false;
 		// Back on the main screen, alt-screen placeholder transmits are gone.
 		invalidateKittyImageTransmits();
 		if (ownsPendingHandoff) {
@@ -861,14 +875,17 @@ export class ProcessTerminal implements Terminal {
 			try {
 				// Pop the kitty entry while its owning screen is still active:
 				// popped after ?1049l, an alt-screen entry would eat the main
-				// stack's entry instead.
-				const altLive = this._altScreenActive || pendingAltScreenHandoff !== undefined;
+				// stack's entry instead. The physical alt-screen flag covers the
+				// successor's constructor -> start() window, where the handoff
+				// token is consumed but the alt screen is still live.
+				const altLive = this._altScreenActive || pendingAltScreenHandoff !== undefined || altScreenLiveInTerminal;
 				if (altLive && kittyAltScreenPushOutstanding) {
 					kittyAltScreenPushOutstanding = false;
 					process.stdout.write(KITTY_FLAGS_POP);
 				}
 				if (altLive) {
 					pendingAltScreenHandoff = undefined;
+					altScreenLiveInTerminal = false;
 					process.stdout.write("\x1b[?1049l");
 				}
 				if (kittyMainScreenPushOutstanding) {

@@ -949,7 +949,12 @@ export class Editor implements Component, Focusable {
 		// Bulk text from StdinBuffer (a paste from a terminal without bracketed
 		// paste, a pipe) is inserted in one pass: one undo unit, one change
 		// notification, and line breaks split into lines as a paste would.
-		if (data.length >= BULK_TEXT_MIN_RUN) {
+		// StdinBuffer also emits short forced-bulk sequences (a bulk run cut by a
+		// control byte, or shrunk below the threshold by CR folding); any sequence
+		// carrying a newline is bulk-shaped - insertCharacter would embed the
+		// newlines into one line. A lone "\n" stays on the newline-key path, and
+		// escape sequences never reach the bulk branch.
+		if (data.length >= BULK_TEXT_MIN_RUN || (data.length > 1 && data.includes("\n") && !data.includes("\x1b"))) {
 			this.insertBulkText(data);
 			return;
 		}
