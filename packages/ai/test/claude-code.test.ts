@@ -341,6 +341,15 @@ async function run(turn) {
 		message("msg_wandered_" + turn, [{ type: "text", text: "I went on alone" }], "end_turn");
 		await new Promise(() => {});
 	}
+	if (scenario === "unknown-stop") {
+		message("msg_unknown_" + turn, [{ type: "text", text: "odd" }], "some_future_reason");
+		emit({ type: "result", subtype: "success", is_error: false, result: "odd" });
+		return;
+	}
+	if (scenario === "stderr-escape") {
+		process.stderr.write("progress \x1b[2J\x07 clearing\r\n");
+		process.exit(1);
+	}
 	if (scenario === "text") {
 		if (process.env.FAKE_CLAUDE_DELAY_MS) await new Promise((resolve) => setTimeout(resolve, Number(process.env.FAKE_CLAUDE_DELAY_MS)));
 		message("msg_text_" + turn, [{ type: "text", text: "plain answer " + turn }], "end_turn");
@@ -786,6 +795,36 @@ describe("claude-code provider against a fake CLI", () => {
 			| undefined;
 		expect(details?.kind).toBe("rate_limit");
 		expect(details?.retryAfterMs).toBeGreaterThan(3_500_000);
+	});
+
+	it("fails the turn on a stop reason the CLI made up, instead of reporting success", async () => {
+		setEnv("FAKE_CLAUDE_SCENARIO", "unknown-stop");
+		const reply = await streamSimple(
+			model,
+			{ systemPrompt: "s", messages: [{ role: "user", content: "hi", timestamp: 0 }], tools: [ipythonTool] },
+			{ sessionId: "session-unknown-stop", cwd },
+		).result();
+
+		expect(reply.stopReason).toBe("error");
+		expect(reply.errorMessage).toContain("some_future_reason");
+	});
+
+	it("washes control characters out of the stderr tail quoted in the failure message", async () => {
+		setEnv("FAKE_CLAUDE_SCENARIO", "stderr-escape");
+		const reply = await streamSimple(
+			model,
+			{ systemPrompt: "s", messages: [{ role: "user", content: "hi", timestamp: 0 }], tools: [ipythonTool] },
+			{ sessionId: "session-stderr-escape", cwd },
+		).result();
+
+		expect(reply.stopReason).toBe("error");
+		const text = reply.errorMessage ?? "";
+		expect(text).toContain("exited with code 1");
+		expect(text).toContain("clearing");
+		// The tail is persisted and rendered: an ESC in it would reach the terminal.
+		expect(text).not.toContain("\x1b");
+		expect(text).not.toContain("\x07");
+		expect(text).not.toContain("\r");
 	});
 	// Last in this block: it switches the flag off for the rest of the module.
 	it("drops the thinking-display flag once a CLI rejects it, and retries the same request", async () => {

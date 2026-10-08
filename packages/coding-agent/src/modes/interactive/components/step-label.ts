@@ -396,7 +396,9 @@ function handleWaitLabel(name: string | undefined, context: StepLabelContext): s
 		const firstLine = command.split("\n").find((line) => line.trim()) ?? command;
 		return `等待 ${commandLabel(firstLine)}`;
 	}
-	return name ? `等待 ${name} 的结果` : "等待命令结果";
+	// An unmapped handle name is the model's own variable ("h"): noise to the
+	// reader, so fall back to the generic wording.
+	return "等待命令结果";
 }
 
 /** Every `name = bash('…')` handle a cell starts, as [name, command] pairs in source order. */

@@ -32,3 +32,25 @@ export function sanitizeRowText(text: string): string {
 export function sanitizeBlockText(text: string): string {
 	return stripEscapesAndControls(text).replace(/\t/g, "    ");
 }
+
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/**
+ * First `maxGraphemes` graphemes of `text`, plus `ellipsis` when anything was cut.
+ * A code-unit slice (`text.slice(0, n)`) can leave half of a surrogate pair or a
+ * ZWJ sequence, which downstream encoding renders as U+FFFD litter.
+ */
+export function truncateGraphemes(text: string, maxGraphemes: number, ellipsis = "..."): string {
+	const budget = Math.max(0, maxGraphemes);
+	// Code units upper-bound graphemes, so a short-enough string needs no segmenting.
+	if (text.length <= budget) return text;
+	let end = 0;
+	let count = 0;
+	for (const { index, segment } of graphemeSegmenter.segment(text)) {
+		if (count === budget) break;
+		end = index + segment.length;
+		count++;
+	}
+	if (end >= text.length) return text;
+	return `${text.slice(0, end)}${ellipsis}`;
+}

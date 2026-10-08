@@ -142,6 +142,17 @@ describe("google stopReason guard", () => {
 				expect(message.content.some((b) => b.type === "toolCall")).toBe(true);
 			});
 
+			it("degrades a finish reason the pinned SDK does not know to error with the raw reason, not a throw", async () => {
+				mockState.chunks = textChunks("BRAND_NEW_REASON");
+				const message = await p.run();
+				expect(message.stopReason).toBe("error");
+				expect(message.stopReasonRaw).toBe("BRAND_NEW_REASON");
+				expect(message.errorMessage).toContain("BRAND_NEW_REASON");
+				expect(message.errorMessage).not.toContain("Unhandled stop reason");
+				// The completed answer survives the mapping failure.
+				expect(message.content).toEqual([{ type: "text", text: "partial answer" }]);
+			});
+
 			it("keeps stop for STOP with text only", async () => {
 				mockState.chunks = textChunks("STOP");
 				const message = await p.run();

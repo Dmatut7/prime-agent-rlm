@@ -27,6 +27,7 @@ import {
 	shouldEnsureInteractiveDaemonForStartup,
 	shouldOpenAgentsViewForDaemonInteractive,
 	shouldPrefireDaemonCreateForDaemonInteractive,
+	shouldRejectNonInteractiveAgentsView,
 	shouldRejectNonInteractiveAttach,
 	shouldRejectNonInteractiveBareResume,
 	shouldTreatLoneVerboseFlagAsVersion,
@@ -155,6 +156,10 @@ describe("interactive startup routing", () => {
 		expect(shouldRejectNonInteractiveBareResume(true, "rpc")).toBe(true);
 		expect(shouldRejectNonInteractiveBareResume("session-id", "print")).toBe(false);
 		expect(shouldRejectNonInteractiveBareResume(true, "interactive")).toBe(false);
+		expect(shouldRejectNonInteractiveAgentsView(true, "print")).toBe(true);
+		expect(shouldRejectNonInteractiveAgentsView(true, "rpc")).toBe(true);
+		expect(shouldRejectNonInteractiveAgentsView(true, "interactive")).toBe(false);
+		expect(shouldRejectNonInteractiveAgentsView(false, "print")).toBe(false);
 	});
 
 	test("does not start the daemon for attach", () => {

@@ -1,4 +1,4 @@
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { resetCapabilitiesCache, setCapabilities, visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { IPythonCellComponent } from "../src/modes/interactive/components/ipython-cell.js";
 import {
@@ -158,6 +158,30 @@ describe("IPythonCellComponent QA fixes", () => {
 		expect(code.length).toBeGreaterThan(2);
 		for (const line of code.slice(0, -1)) {
 			expect(line.trimStart().startsWith("│")).toBe(true);
+		}
+	});
+
+	it("says the images below are placeholders, not rendered pictures (生产全 fallbackOnly)", () => {
+		setCapabilities({ images: "kitty", imagePlaceholders: true, trueColor: true, hyperlinks: true });
+		try {
+			const rendered = stripAnsi(
+				new IPythonCellComponent({
+					code: "plot()",
+					content: [{ type: "image", data: "aGk=", mimeType: "image/png" }],
+					details: { status: "ok", durationMs: 5 },
+					executionStarted: true,
+					argsComplete: true,
+					expanded: true,
+					showImages: true,
+				})
+					.render(100)
+					.join("\n"),
+			);
+			expect(rendered).toContain("1 张图片");
+			// What follows the cell is a metadata line, not the picture: don't promise 见下方.
+			expect(rendered).not.toContain("见下方");
+		} finally {
+			resetCapabilitiesCache();
 		}
 	});
 });

@@ -257,6 +257,108 @@ describe("ACP mode end to end", () => {
 		harness.cleanup();
 	}, 30_000);
 
+	it("reports a failed transport through onTransportFailure instead of looking like a clean disconnect", async () => {
+		const harness = await createHarness();
+		harness.setResponses([fauxAssistantMessage("unreachable")]);
+		const connection = new InProcessAgentConnection(runtimeHostFor(harness.session));
+
+		const toAgent = new TransformStream<Uint8Array, Uint8Array>();
+		const toClient = new TransformStream<Uint8Array, Uint8Array>();
+		const baseAgentStream = acp.ndJsonStream(toClient.writable, toAgent.readable);
+		// The agent's outbound side is dead from the start: every frame it writes throws.
+		const failingWritable = new WritableStream<acp.AnyMessage>({
+			write() {
+				throw new Error("EPIPE: the client is gone");
+			},
+		});
+		const agentStream = { readable: baseAgentStream.readable, writable: failingWritable };
+		const clientStream = acp.ndJsonStream(toAgent.writable, toClient.readable);
+
+		const failures: string[] = [];
+		void runAcpModeWithConnection(connection, {
+			stream: agentStream,
+			onTransportFailure: (message) => failures.push(message),
+		});
+		const handle = acp
+			.client({ name: "test-client" })
+			.onNotification("session/update", () => {})
+			.connect(clientStream);
+
+		// initialize is the first thing the agent answers; the write fails there.
+		const client = handle.agent;
+		// Fire and forget: the client may hold the unanswered request until close.
+		void client.request("initialize", { protocolVersion: 1, clientCapabilities: {} }).catch(() => undefined);
+		await vi.waitFor(() => expect(failures.length).toBeGreaterThan(0));
+		expect(failures[0]).toContain("EPIPE");
+
+		handle.close();
+		harness.cleanup();
+	}, 30_000);
+
+	it("delivers an embedded resource blob as an image the model can see", async () => {
+		const harness = await createHarness();
+		harness.setResponses([fauxAssistantMessage("seen")]);
+		const connection = new InProcessAgentConnection(runtimeHostFor(harness.session));
+		const { client } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: harness.tempDir, mcpServers: [] });
+
+		// A 1x1 png arrives as an ACP embedded resource with a blob, not a text field.
+		const pngBase64 =
+			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+		const result = await client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [
+				{ type: "text", text: "what is in this image?" },
+				{ type: "resource", resource: { uri: "file:///pixel.png", mimeType: "image/png", blob: pngBase64 } },
+			],
+		});
+		expect(result.stopReason).toBe("end_turn");
+
+		const userMessage = harness.session.messages.find((message) => message.role === "user");
+		expect(userMessage).toBeDefined();
+		const content = userMessage && Array.isArray(userMessage.content) ? userMessage.content : [];
+		const image = content.find((block) => (block as { type?: string }).type === "image") as
+			| { type: "image"; data: string; mimeType: string }
+			| undefined;
+		expect(image?.data).toBe(pngBase64);
+		expect(image?.mimeType).toBe("image/png");
+		harness.cleanup();
+	}, 30_000);
+
+	it("names a non-image resource blob in the text instead of dropping it silently", async () => {
+		const harness = await createHarness();
+		harness.setResponses([fauxAssistantMessage("noted")]);
+		const connection = new InProcessAgentConnection(runtimeHostFor(harness.session));
+		const { client } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: harness.tempDir, mcpServers: [] });
+
+		const result = await client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [
+				{
+					type: "resource",
+					resource: { uri: "file:///report.pdf", mimeType: "application/pdf", blob: "JVBERi0xLjQ=" },
+				},
+			],
+		});
+		expect(result.stopReason).toBe("end_turn");
+
+		const userMessage = harness.session.messages.find((message) => message.role === "user");
+		const content = userMessage?.content;
+		const text =
+			typeof content === "string"
+				? content
+				: (content ?? [])
+						.filter((block) => (block as { type?: string }).type === "text")
+						.map((block) => (block as { text?: string }).text ?? "")
+						.join("\n");
+		expect(text).toContain("report.pdf");
+		expect(text).toContain("application/pdf");
+		harness.cleanup();
+	}, 30_000);
+
 	it("queues a follow-up prompt behind injected work instead of rejecting it", async () => {
 		const harness = await createHarness();
 		let releaseInjected!: () => void;

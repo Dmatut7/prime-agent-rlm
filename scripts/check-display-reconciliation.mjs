@@ -897,6 +897,13 @@ function reconcileSession(options) {
 
 // ---------- rendering ----------
 
+// Paths and labels come from session files and the command line; a control byte
+// in one would make the verification tool itself clear or rewrite the terminal.
+function safe(text) {
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping controls is the point
+	return String(text).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\x1b]/g, "");
+}
+
 function figure(added, removed) {
 	const parts = [];
 	if (added > 0) parts.push(`+${added}`);
@@ -906,8 +913,8 @@ function figure(added, removed) {
 
 function renderText(report) {
 	const lines = [];
-	lines.push(`对账 ${report.session}`);
-	lines.push(`基准 ${report.base} · 项目 ${report.cwd}`);
+	lines.push(`对账 ${safe(report.session)}`);
+	lines.push(`基准 ${safe(report.base)} · 项目 ${safe(report.cwd)}`);
 	lines.push(`显示：${report.displayed.headline}`);
 	lines.push(
 		`git 实测（会话声称的文件中）：${report.git.files} 个仍有净差 ${figure(report.git.added, report.git.removed)}` +
@@ -921,28 +928,28 @@ function renderText(report) {
 		const marks = { fail: "✗", warn: "!", info: "·" };
 		if (entry.verdicts.length === 0) {
 			const truth = entry.truth.added !== undefined ? `git ${figure(entry.truth.added, entry.truth.removed)}` : "git 无净差";
-			lines.push(`  ✓ ${entry.path}  显示 ${figure(entry.claimed.added, entry.claimed.removed)} · ${truth}`);
+			lines.push(`  ✓ ${safe(entry.path)}  显示 ${figure(entry.claimed.added, entry.claimed.removed)} · ${truth}`);
 			continue;
 		}
 		// Fail verdicts are listed in the 不符 section below, not duplicated here.
 		for (const verdict of entry.verdicts.filter((item) => item.level !== "fail")) {
-			lines.push(`  ${marks[verdict.level]} ${entry.path} [${verdict.code}] ${verdict.message}`);
+			lines.push(`  ${marks[verdict.level]} ${safe(entry.path)} [${verdict.code}] ${verdict.message}`);
 		}
 		if (entry.verdicts.some((item) => item.level === "fail")) {
-			lines.push(`  ✗ ${entry.path}（见下方不符）`);
+			lines.push(`  ✗ ${safe(entry.path)}（见下方不符）`);
 		}
 	}
 	const globalWarnings = report.warnings.filter((item) => item.global === true);
 	if (globalWarnings.length > 0) {
 		lines.push("警告：");
 		for (const warning of globalWarnings) {
-			lines.push(`  ! ${warning.path} [${warning.code}] ${warning.message}`);
+			lines.push(`  ! ${safe(warning.path)} [${warning.code}] ${warning.message}`);
 		}
 	}
 	for (const note of report.notes) lines.push(`提示：${note}`);
 	if (report.failures.length > 0) {
 		lines.push(`不符 ${report.failures.length} 处：`);
-		for (const failure of report.failures) lines.push(`  ✗ ${failure.path} [${failure.code}] ${failure.message}`);
+		for (const failure of report.failures) lines.push(`  ✗ ${safe(failure.path)} [${failure.code}] ${failure.message}`);
 	}
 	const warningCount = report.warnings.length;
 	lines.push(
@@ -1004,15 +1011,23 @@ function parseArgs(argv) {
 	const options = { base: "HEAD", strict: false, json: false, selfTest: false, help: false };
 	for (let index = 0; index < argv.length; index += 1) {
 		const arg = argv[index];
+		// A missing or flag-shaped value would otherwise reconcile the WRONG session
+		// (undefined falls through to --latest semantics) and still report 对平.
+		const takeValue = (flag) => {
+			const value = argv[index + 1];
+			if (value === undefined || value.startsWith("--")) throw new UsageError(`${flag} 缺参数值`);
+			index += 1;
+			return value;
+		};
 		if (arg === "--help" || arg === "-h") options.help = true;
 		else if (arg === "--self-test") options.selfTest = true;
 		else if (arg === "--strict") options.strict = true;
 		else if (arg === "--json") options.json = true;
 		else if (arg === "--latest") options.latest = true;
-		else if (arg === "--session") options.session = argv[++index];
-		else if (arg === "--cwd") options.cwd = argv[++index];
-		else if (arg === "--base") options.base = argv[++index];
-		else if (arg === "--sessions-dir") options.sessionsDir = argv[++index];
+		else if (arg === "--session") options.session = takeValue(arg);
+		else if (arg === "--cwd") options.cwd = takeValue(arg);
+		else if (arg === "--base") options.base = takeValue(arg);
+		else if (arg === "--sessions-dir") options.sessionsDir = takeValue(arg);
 		else throw new UsageError(`不认识的参数：${arg}`);
 	}
 	return options;
@@ -1091,6 +1106,27 @@ function stageA(failures) {
 	expectEqual(failures, "lineTotal terminated", lineTotal(Buffer.from("a\n")), 1);
 	expectEqual(failures, "lineTotal unterminated", lineTotal(Buffer.from("a\nb")), 2);
 	expectEqual(failures, "lineTotal single", lineTotal(Buffer.from("a")), 1);
+
+	// parseArgs: a value-taking flag at the end of argv (or in front of another
+	// flag) must be a usage error, never a silent fall-through to --latest.
+	let missingValueThrew = false;
+	try {
+		parseArgs(["--session"]);
+	} catch (error) {
+		missingValueThrew = error instanceof UsageError;
+	}
+	expectTrue(failures, "parseArgs --session without value errors", missingValueThrew);
+	let flagValueThrew = false;
+	try {
+		parseArgs(["--session", "--latest"]);
+	} catch (error) {
+		flagValueThrew = error instanceof UsageError;
+	}
+	expectTrue(failures, "parseArgs --session with a flag-shaped value errors", flagValueThrew);
+	expectEqual(failures, "parseArgs normal value", parseArgs(["--session", "s.jsonl"]).session, "s.jsonl");
+
+	// safe: control bytes from session content never reach the terminal.
+	expectEqual(failures, "safe strips ESC/CSI", safe("/tmp/\x1b[2Jevil\x07path"), "/tmp/[2Jevilpath");
 
 	// countNumberedDiff: the display's matcher, gap/context lines ignored.
 	const numbered = "+ 1 added line\n- 2 removed line\n  3 context\n   ...\nno-line-number +x\n";
@@ -1634,11 +1670,11 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === realpathOrSelf(process
 		process.exit(main(process.argv.slice(2)));
 	} catch (error) {
 		if (error instanceof UsageError) {
-			console.error(`${SCRIPT}: ${error.message}\n\n${USAGE}`);
+			console.error(`${SCRIPT}: ${safe(error.message)}\n\n${USAGE}`);
 			process.exit(2);
 		}
 		if (error instanceof ReconcileError) {
-			console.error(`${SCRIPT}: ${error.message}`);
+			console.error(`${SCRIPT}: ${safe(error.message)}`);
 			process.exit(2);
 		}
 		throw error;

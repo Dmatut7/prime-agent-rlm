@@ -5,10 +5,27 @@ import {
 	EventStream,
 	type Model,
 	parseStreamingJson,
+	redactSecrets,
 	type SimpleStreamOptions,
 	type StopReason,
+	stripControlCharacters,
 	type ToolCall,
 } from "@earendil-works/pi-ai";
+
+/** Upper bound on provider/proxy error text that ends up persisted in the transcript. */
+const MAX_PROXY_ERROR_CHARS = 2000;
+
+/**
+ * Error text that crosses the proxy boundary is server-controlled: it can carry
+ * credentials the server echoed and terminal control characters that replay on
+ * every render. Wash and bound it before it becomes the persisted errorMessage.
+ */
+function sanitizeProxyErrorText(text: string): string {
+	const washed = redactSecrets(stripControlCharacters(text)).trim();
+	// Code-point slice, so the cut never halves a surrogate pair.
+	const points = [...washed];
+	return points.length > MAX_PROXY_ERROR_CHARS ? `${points.slice(0, MAX_PROXY_ERROR_CHARS).join("")}…` : washed;
+}
 
 class ProxyMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
 	constructor() {
@@ -162,7 +179,7 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 				try {
 					const errorData = (await response.json()) as { error?: string };
 					if (errorData.error) {
-						errorMessage = `Proxy error: ${errorData.error}`;
+						errorMessage = `Proxy error: ${sanitizeProxyErrorText(errorData.error)}`;
 					}
 				} catch {
 					// Keep the status-text fallback when the error body is not JSON.
@@ -222,7 +239,7 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 
 			stream.end();
 		} catch (error) {
-			const errorMessage = error instanceof Error ? error.message : String(error);
+			const errorMessage = sanitizeProxyErrorText(error instanceof Error ? error.message : String(error));
 			const reason = options.signal?.aborted ? "aborted" : "error";
 			partial.stopReason = reason;
 			partial.errorMessage = errorMessage;

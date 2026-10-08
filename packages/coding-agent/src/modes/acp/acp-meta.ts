@@ -160,6 +160,24 @@ export interface PrimeAgentAgentMessageMeta {
 	deliveryStatus?: string;
 }
 
+/**
+ * The retry ladder's backoff window. ACP has no "waiting to retry" update, so a
+ * parked turn (up to the ladder's full backoff) would otherwise show nothing.
+ */
+export interface PrimeAgentAutoRetryMeta {
+	status: "waiting" | "finished";
+	attempt: number;
+	maxAttempts?: number;
+	delayMs?: number;
+	errorMessage?: string;
+	/** Why the ladder is retrying; "backup" means the turn moved to backupModel. */
+	reason?: "usage" | "unavailable" | "backup";
+	backupModel?: string;
+	/** Finished only: whether the retry recovered the turn. */
+	success?: boolean;
+	finalError?: string;
+}
+
 export interface PrimeAgentCwdMeta {
 	/** The cwd the client asked for. */
 	requested: string;
@@ -206,6 +224,8 @@ export interface PrimeAgentSessionMeta {
 	/** Present when an extension handler failed during the session. */
 	extensionError?: PrimeAgentExtensionErrorMeta;
 	stallWatchdog?: PrimeAgentStallWatchdogMeta;
+	/** The retry ladder is waiting out a backoff (or just finished one). */
+	autoRetry?: PrimeAgentAutoRetryMeta;
 	/** Undeliverable subagent terminal notices: how many were persisted vs abandoned. */
 	rlmTerminalNotices?: { abandoned: number; persistedToTranscript: number; deferredMs: number };
 	agentMessage?: PrimeAgentAgentMessageMeta;

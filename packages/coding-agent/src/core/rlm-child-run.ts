@@ -16,6 +16,7 @@ import {
 	type Model,
 	type Usage,
 } from "@earendil-works/pi-ai";
+import { truncateGraphemes } from "../utils/display-text.js";
 import {
 	AGENT_MESSAGE_CUSTOM_TYPE,
 	type AgentSessionMessage,
@@ -315,7 +316,9 @@ export function compactRlmText(text: string, maxLength = 160): string {
 	if (compact.length <= maxLength) {
 		return compact;
 	}
-	return `${compact.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+	// Grapheme-safe cut: a code-unit slice can leave half a surrogate pair in the
+	// preview, which agents-view rows then render as U+FFFD litter.
+	return truncateGraphemes(compact, Math.max(0, maxLength - 3));
 }
 
 // Child-agent label: collapse to one line but keep the full prompt — the TUI

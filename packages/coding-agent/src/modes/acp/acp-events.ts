@@ -154,6 +154,8 @@ function ipythonImageBlocks(
 /** Correlates streamed bash output and assistant chunks with their owning run or message. */
 export interface AcpEventMappingState {
 	activeBashRunId?: string;
+	/** Whether a bash run is open, tracked separately from the id: a run without a runId maps to the bare id. */
+	bashRunOpen?: boolean;
 	activeAssistantMessageId?: string;
 	nextAssistantMessageSequence?: number;
 }
@@ -330,6 +332,7 @@ export function acpUpdatesForSessionEvent(
 		// call keyed by run id to keep incremental output addressable.
 		case "bash_start":
 			state.activeBashRunId = event.runId;
+			state.bashRunOpen = true;
 			return [
 				{
 					sessionUpdate: "tool_call",
@@ -342,6 +345,10 @@ export function acpUpdatesForSessionEvent(
 			];
 
 		case "bash_output":
+			// A chunk for a run this client never saw open (resync mid-run) or one
+			// already ended has no tool call to update; the bare fallback id would
+			// invent one.
+			if (!state.bashRunOpen) return [];
 			return [
 				{
 					sessionUpdate: "tool_call_update",
@@ -352,7 +359,12 @@ export function acpUpdatesForSessionEvent(
 			];
 
 		case "bash_end":
-			if (state.activeBashRunId === event.runId) state.activeBashRunId = undefined;
+			// Only the open run's own end closes it: overlapping runs must not let an
+			// earlier end mute a later run's output.
+			if (state.activeBashRunId === event.runId) {
+				state.activeBashRunId = undefined;
+				state.bashRunOpen = false;
+			}
 			return [
 				{
 					sessionUpdate: "tool_call_update",
@@ -513,6 +525,41 @@ export function acpUpdatesForSessionEvent(
 					sessionUpdate: "session_info_update",
 					_meta: primeAgentMeta({
 						stallWatchdog: { status: "unsettled", message: event.message, silentMs: event.silentMs },
+					}),
+				},
+			];
+
+		// The retry ladder's backoff: a parked turn (up to the full ladder delay)
+		// would otherwise show the client nothing between the failure and the retry.
+		case "auto_retry_start":
+			return [
+				{
+					sessionUpdate: "session_info_update",
+					_meta: primeAgentMeta({
+						autoRetry: {
+							status: "waiting",
+							attempt: event.attempt,
+							maxAttempts: event.maxAttempts,
+							delayMs: event.delayMs,
+							errorMessage: event.errorMessage,
+							...(event.reason !== undefined ? { reason: event.reason } : {}),
+							...(event.backupModel !== undefined ? { backupModel: event.backupModel } : {}),
+						},
+					}),
+				},
+			];
+
+		case "auto_retry_end":
+			return [
+				{
+					sessionUpdate: "session_info_update",
+					_meta: primeAgentMeta({
+						autoRetry: {
+							status: "finished",
+							success: event.success,
+							attempt: event.attempt,
+							...(event.finalError !== undefined ? { finalError: event.finalError } : {}),
+						},
 					}),
 				},
 			];

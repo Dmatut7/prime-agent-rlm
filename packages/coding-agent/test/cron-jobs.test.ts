@@ -7,6 +7,7 @@ import {
 	type AgentCronJob,
 	AgentCronJobStore,
 	AgentCronScheduler,
+	formatAgentCronJob,
 	MAX_RETAINED_TERMINAL_JOBS,
 	migrateLegacyCronJobsToSessionArtifacts,
 	normalizeHeartbeatDeliveryMode,
@@ -2055,6 +2056,25 @@ describe("heartbeat delivery mode", () => {
 		expect(resolveHeartbeatStreamingBehavior(undefined)).toBe("steer");
 		expect(resolveHeartbeatStreamingBehavior("steer")).toBe("steer");
 		expect(resolveHeartbeatStreamingBehavior("follow_up")).toBe("followUp");
+	});
+});
+
+describe("formatAgentCronJob", () => {
+	it("cuts the prompt preview on a grapheme boundary", () => {
+		// 79 ascii + one emoji straddling the 80-code-unit cut.
+		const prompt = `${"a".repeat(79)}💥 tail`;
+		const line = formatAgentCronJob(jobFixture({ id: "j1", prompt }));
+		const preview = /prompt="([^"]*)"/.exec(line)?.[1] ?? "";
+		expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(preview)).toBe(false);
+	});
+
+	it("keeps quotes and control characters out of the label field", () => {
+		const line = formatAgentCronJob(jobFixture({ id: "j1", label: 'bad "quoted" \x1b[2J\x07label' }));
+		expect(line).not.toContain("\x1b");
+		expect(line).not.toContain("\x07");
+		expect(line).toContain("label=");
+		// A raw quote inside the label would break the field's quoting shape.
+		expect(line).not.toContain('label="bad "quoted"');
 	});
 });
 

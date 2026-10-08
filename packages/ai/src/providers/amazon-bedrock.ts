@@ -449,6 +449,14 @@ function handleContentBlockDelta(
 		}
 
 		if (thinkingBlock?.type === "thinking") {
+			if (delta.reasoningContent.redactedContent) {
+				// The provider encrypted this reasoning block for safety: no text ever
+				// arrives for it. Surface the placeholder instead of dropping the block,
+				// and keep the opaque payload so the next turn can hand it back.
+				thinkingBlock.thinking = "[Reasoning redacted]";
+				thinkingBlock.redacted = true;
+				thinkingBlock.thinkingSignature = Buffer.from(delta.reasoningContent.redactedContent).toString("base64");
+			}
 			if (delta.reasoningContent.text) {
 				thinkingBlock.thinking += delta.reasoningContent.text;
 				stream.push({
@@ -755,6 +763,14 @@ function convertMessages(
 							});
 							break;
 						case "thinking":
+							// A redacted block carries no replayable text: hand the encrypted
+							// payload back verbatim, like Anthropic's redacted_thinking round-trip.
+							if (c.redacted && c.thinkingSignature) {
+								contentBlocks.push({
+									reasoningContent: { redactedContent: Buffer.from(c.thinkingSignature, "base64") },
+								});
+								break;
+							}
 							if (c.thinking.trim().length === 0) continue;
 							// Only Anthropic models support the signature field in reasoningText.
 							// For other models, we omit the signature to avoid errors like:

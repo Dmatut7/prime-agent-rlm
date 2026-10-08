@@ -393,15 +393,27 @@ export function encodeKittyPlaceholderRows(options: KittyPlaceholderRowsOptions)
 }
 
 /**
- * Transmit once per (image id, grid geometry): the kitty virtual placement
+ * Transmit once per (image id, grid geometry, payload): the kitty virtual placement
  * (a=T,U=1) uploads the payload without displaying it, and the placeholder
  * cell rows reference it afterwards. ProcessTerminal.write flushes the queue
  * ahead of whatever frame carries the cells, so the redraw stream itself only
- * ever contains text.
+ * ever contains text. The payload hashes into the key: the placeholder grid reads
+ * the terminal's stored image by id, so a payload swap under a reused id must
+ * retransmit or the first frame shows forever (L24).
  */
 const placeholderTransmits = new Map<number, string>();
 let placeholderTransmitQueue: string[] = [];
 let placeholderTransmitsVersion = 0;
+
+/** Cheap non-cryptographic payload fingerprint for the dedup key (FNV-1a over the base64 text). */
+function payloadHash(base64Data: string): string {
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < base64Data.length; i++) {
+		hash ^= base64Data.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193) >>> 0;
+	}
+	return hash.toString(36);
+}
 
 export function getKittyImageTransmitsVersion(): number {
 	return placeholderTransmitsVersion;
@@ -445,8 +457,9 @@ export function renderKittyPlaceholderImage(
 	const imageId = options.imageId;
 
 	const geometry = `${columns}x${rows}`;
-	if (placeholderTransmits.get(imageId) !== geometry) {
-		placeholderTransmits.set(imageId, geometry);
+	const transmitKey = `${geometry}:${payloadHash(base64Data)}`;
+	if (placeholderTransmits.get(imageId) !== transmitKey) {
+		placeholderTransmits.set(imageId, transmitKey);
 		placeholderTransmitQueue.push(
 			encodeKittyChunks(base64Data, ["a=T", "U=1", "f=100", "q=2", `i=${imageId}`, `c=${columns}`, `r=${rows}`]),
 		);

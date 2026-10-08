@@ -23,6 +23,7 @@ import type {
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
+import { stripControlCharacters } from "../utils/sanitize-control.js";
 import {
 	classifyStreamFailure,
 	formatStreamFailureMessage,
@@ -174,6 +175,10 @@ function emptyUsage(): Usage {
 
 function mapStopReason(reason: string | null | undefined): StopReason {
 	switch (reason) {
+		case "end_turn":
+		case "stop_sequence":
+		case "pause_turn":
+			return "stop";
 		case "tool_use":
 			return "toolUse";
 		case "max_tokens":
@@ -182,8 +187,15 @@ function mapStopReason(reason: string | null | undefined): StopReason {
 		case "refusal":
 		case "sensitive":
 			return "error";
-		default:
+		case null:
+		case undefined:
+			// No stop reason on record (the CLI's result event settled the turn).
 			return "stop";
+		default:
+			// A stop reason this build does not know is not a success: fail visibly
+			// (the raw reason reaches the failure message) instead of reporting a
+			// clean stop for what may be a truncated or refused turn.
+			return "error";
 	}
 }
 
@@ -1166,7 +1178,9 @@ class ClaudeCodeSession {
 		if (this.state === "closed") return;
 		if (this.stream && this.retryWithoutThinkingDisplay()) return;
 		if (this.stream) {
-			const stderr = this.stderrTail.trim();
+			// The tail is CLI-controlled text quoted into a persisted, rendered
+			// failure: wash escape sequences and control characters out of it.
+			const stderr = stripControlCharacters(this.stderrTail).trim();
 			const how = signal ? `was stopped by ${signal}` : `exited with code ${code}`;
 			this.fail(claudeCodeFailure(`the CLI ${how} before the turn finished${stderr ? `: ${stderr}` : ""}`));
 			return;

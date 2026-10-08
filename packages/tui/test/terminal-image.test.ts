@@ -539,6 +539,12 @@ describe("kitty unicode placeholders", () => {
 			renderKittyPlaceholderImage("AAAA", { widthPx: 20, heightPx: 20 }, { maxWidthCells: 4, imageId });
 			assert.strictEqual(drainKittyImageTransmits(), "");
 
+			// Same id and geometry but a NEW payload: the placeholder grid reads the
+			// terminal's stored image by id, so a payload swap must retransmit or the
+			// first frame shows forever (L24).
+			renderKittyPlaceholderImage("QkJCQg==", { widthPx: 20, heightPx: 20 }, { maxWidthCells: 4, imageId });
+			assert.ok(drainKittyImageTransmits().includes(`i=${imageId},c=4,r=2;QkJCQg==`));
+
 			// Geometry change retransmits so the virtual placement tracks the grid.
 			renderKittyPlaceholderImage("AAAA", { widthPx: 40, heightPx: 40 }, { maxWidthCells: 8, imageId });
 			const geometryDrain = drainKittyImageTransmits();

@@ -31,6 +31,7 @@ import {
 	SessionSelectorError,
 	SessionSelectorNotFoundError,
 } from "./cli/session-resolver.js";
+import { stderrChalk } from "./cli/stderr-chalk.js";
 import { getStdoutWidth, wrapForStderr, wrapForStdout } from "./cli/stdout-wrap.js";
 import {
 	APP_NAME,
@@ -286,6 +287,11 @@ export function shouldRejectNonInteractiveAttach(attachAgent: string | undefined
 
 export function shouldRejectNonInteractiveBareResume(resume: true | string | undefined, appMode: AppMode): boolean {
 	return resume === true && appMode !== "interactive";
+}
+
+/** The agents view is an interactive surface; piped runs used to build a daemon session and print nothing. */
+export function shouldRejectNonInteractiveAgentsView(explicitAgentsView: boolean, appMode: AppMode): boolean {
+	return explicitAgentsView && appMode !== "interactive";
 }
 
 /**
@@ -624,14 +630,16 @@ async function takeOverStaleDaemonOrExit(socketPath: string): Promise<DaemonRead
 	if (!confirmed) {
 		// Non-TTY already printed the reason; at a TTY the user declined.
 		if (process.stdin.isTTY) {
-			console.error(wrapForStderr(chalk.dim("Cancelled.")));
+			console.error(wrapForStderr(stderrChalk.dim("Cancelled.")));
 		}
 		process.exit(1);
 	}
 	if (!(await shutdownDaemonAndWait(socketPath))) {
 		console.error(
 			wrapForStderr(
-				chalk.red(`Could not stop the background service on ${socketPath}. Run "prime-agent shutdown" and retry.`),
+				stderrChalk.red(
+					`Could not stop the background service on ${socketPath}. Run "prime-agent shutdown" and retry.`,
+				),
 			),
 		);
 		process.exit(1);
@@ -641,7 +649,7 @@ async function takeOverStaleDaemonOrExit(socketPath: string): Promise<DaemonRead
 		await ready;
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		console.error(wrapForStderr(chalk.red(`Could not start the background service: ${message}`)));
+		console.error(wrapForStderr(stderrChalk.red(`Could not start the background service: ${message}`)));
 		process.exit(1);
 	}
 	return { ready };
@@ -682,7 +690,9 @@ function validateForkFlags(parsed: Args): void {
 	].filter((flag): flag is string => flag !== undefined);
 
 	if (conflictingFlags.length > 0) {
-		console.error(wrapForStderr(chalk.red(`Error: --fork cannot be combined with ${conflictingFlags.join(", ")}`)));
+		console.error(
+			wrapForStderr(stderrChalk.red(`Error: --fork cannot be combined with ${conflictingFlags.join(", ")}`)),
+		);
 		process.exit(1);
 	}
 }
@@ -692,7 +702,7 @@ function forkSessionOrExit(sourcePath: string, cwd: string, sessionDir?: string)
 		return SessionManager.forkFrom(sourcePath, cwd, sessionDir);
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);
-		console.error(wrapForStderr(chalk.red(`Error: ${message}`)));
+		console.error(wrapForStderr(stderrChalk.red(`Error: ${message}`)));
 		process.exit(1);
 	}
 }
@@ -737,7 +747,7 @@ export async function createSessionManager(
 					// The fork confirm reads stdin; without a TTY it would hang boot forever.
 					console.error(
 						wrapForStderr(
-							chalk.red(
+							stderrChalk.red(
 								`Error: session ${resumeSelector} belongs to a different project (${resolved.cwd}). Pass --fork ${resumeSelector} to use it here, or run from that project's directory.`,
 							),
 						),
@@ -761,7 +771,7 @@ export async function createSessionManager(
 		// cannot tell a continued session from a new one.
 		const dir = sessionDir ?? getDefaultSessionDir(cwd);
 		if (!findMostRecentSessionForCwd(dir, cwd)) {
-			console.error(wrapForStderr(chalk.dim(`No previous session for ${cwd}; starting a new one.`)));
+			console.error(wrapForStderr(stderrChalk.dim(`No previous session for ${cwd}; starting a new one.`)));
 		}
 		return SessionManager.continueRecent(cwd, sessionDir);
 	}
@@ -1557,13 +1567,17 @@ export async function main(args: string[], options?: MainOptions) {
 	const appMode = resolveAppMode(parsed, process.stdin.isTTY);
 
 	if (shouldRejectNonInteractiveAttach(publicCommand.attachAgent, appMode)) {
-		console.error(wrapForStderr(chalk.red("Error: attach requires an interactive terminal")));
+		console.error(wrapForStderr(stderrChalk.red("Error: attach requires an interactive terminal")));
 		process.exit(1);
 	}
 	if (shouldRejectNonInteractiveBareResume(parsed.resume, appMode)) {
 		console.error(
-			wrapForStderr(chalk.red("Error: --resume without a session selector requires an interactive terminal")),
+			wrapForStderr(stderrChalk.red("Error: --resume without a session selector requires an interactive terminal")),
 		);
+		process.exit(1);
+	}
+	if (shouldRejectNonInteractiveAgentsView(explicitAgentsView, appMode)) {
+		console.error(wrapForStderr(stderrChalk.red("Error: the agents command requires an interactive terminal")));
 		process.exit(1);
 	}
 	setLogContext({ mode: appMode });
@@ -1609,7 +1623,9 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	if (shouldTreatLoneVerboseFlagAsVersion(args)) {
 		metaWrite(`${VERSION}\n`);
-		console.error(wrapForStderr(chalk.dim("-v is the verbose flag; use -V or --version to print the version.")));
+		console.error(
+			wrapForStderr(stderrChalk.dim("-v is the verbose flag; use -V or --version to print the version.")),
+		);
 		process.exit(0);
 	}
 	if (parsed.help) {
@@ -1637,7 +1653,7 @@ export async function main(args: string[], options?: MainOptions) {
 			result = await exportFromFile(parsed.export, { outputPath, themeName });
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : "Failed to export session";
-			console.error(wrapForStderr(chalk.red(`Error: ${message}`)));
+			console.error(wrapForStderr(stderrChalk.red(`Error: ${message}`)));
 			process.exit(1);
 		}
 		writeRawStdout(`Exported to: ${result}\n`);
@@ -1653,7 +1669,7 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	if ((parsed.mode === "rpc" || parsed.mode === "daemon") && parsed.fileArgs.length > 0) {
-		console.error(wrapForStderr(chalk.red("Error: @file arguments are not supported in RPC or daemon mode")));
+		console.error(wrapForStderr(stderrChalk.red("Error: @file arguments are not supported in RPC or daemon mode")));
 		process.exit(1);
 	}
 
@@ -1665,7 +1681,7 @@ export async function main(args: string[], options?: MainOptions) {
 			process.chdir(cwd);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			console.error(wrapForStderr(chalk.red(`Error: Cannot use cwd ${cwd}: ${message}`)));
+			console.error(wrapForStderr(stderrChalk.red(`Error: Cannot use cwd ${cwd}: ${message}`)));
 			process.exit(1);
 		}
 	}
@@ -1683,7 +1699,7 @@ export async function main(args: string[], options?: MainOptions) {
 	reportDiagnostics(collectSettingsDiagnostics(startupSettingsManager, "startup session lookup"));
 	const startupBenchmark = isTruthyEnvFlag(process.env.PI_STARTUP_BENCHMARK);
 	if (startupBenchmark && appMode !== "interactive") {
-		console.error(wrapForStderr(chalk.red("Error: PI_STARTUP_BENCHMARK only supports interactive mode")));
+		console.error(wrapForStderr(stderrChalk.red("Error: PI_STARTUP_BENCHMARK only supports interactive mode")));
 		process.exit(1);
 	}
 	// Programmatic factories are process-local functions and cannot be serialized to a daemon worker.
@@ -1738,13 +1754,15 @@ export async function main(args: string[], options?: MainOptions) {
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			console.error(
-				wrapForStderr(chalk.red(`Error: Could not look up active agent '${resumeSelector}': ${message}`)),
+				wrapForStderr(stderrChalk.red(`Error: Could not look up active agent '${resumeSelector}': ${message}`)),
 			);
 			process.exit(1);
 		}
 	}
 	if (publicCommand.attachAgent && !activeDaemonSessionSummary) {
-		console.error(wrapForStderr(chalk.red(`Error: No active agent found matching '${publicCommand.attachAgent}'`)));
+		console.error(
+			wrapForStderr(stderrChalk.red(`Error: No active agent found matching '${publicCommand.attachAgent}'`)),
+		);
 		process.exit(1);
 	}
 	// Daemon processes (supervisor and workers) never use the boot-time session
@@ -1778,8 +1796,8 @@ export async function main(args: string[], options?: MainOptions) {
 				error instanceof SessionSelectorNotFoundError && error.suggestion
 					? ` Did you mean '${error.suggestion}'?`
 					: "";
-			console.error(wrapForStderr(chalk.red(`Error: ${error.message}.${suggestion}`)));
-			console.error(wrapForStderr(chalk.dim(sessionSelectorRecoveryHint(appMode))));
+			console.error(wrapForStderr(stderrChalk.red(`Error: ${error.message}.${suggestion}`)));
+			console.error(wrapForStderr(stderrChalk.dim(sessionSelectorRecoveryHint(appMode))));
 			process.exit(1);
 		}
 	}
@@ -1794,7 +1812,7 @@ export async function main(args: string[], options?: MainOptions) {
 			}
 			sessionManager = SessionManager.open(missingSessionCwdIssue.sessionFile!, sessionDir, selectedCwd);
 		} else {
-			console.error(wrapForStderr(chalk.red(new MissingSessionCwdError(missingSessionCwdIssue).message)));
+			console.error(wrapForStderr(stderrChalk.red(new MissingSessionCwdError(missingSessionCwdIssue).message)));
 			process.exit(1);
 		}
 	}
@@ -2043,7 +2061,7 @@ export async function main(args: string[], options?: MainOptions) {
 		} catch (error) {
 			const startupError = describeSessionStartupError(error);
 			if (startupError) {
-				console.error(wrapForStderr(chalk.red(startupError)));
+				console.error(wrapForStderr(stderrChalk.red(startupError)));
 				process.exit(1);
 			}
 			throw error;
@@ -2172,7 +2190,7 @@ export async function main(args: string[], options?: MainOptions) {
 		} catch (error) {
 			const startupError = describeSessionStartupError(error);
 			if (startupError) {
-				console.error(wrapForStderr(chalk.red(startupError)));
+				console.error(wrapForStderr(stderrChalk.red(startupError)));
 				process.exit(1);
 			}
 			throw error;
@@ -2184,14 +2202,16 @@ export async function main(args: string[], options?: MainOptions) {
 			process.exit(1);
 		}
 		if (!summary.model) {
-			console.error(wrapForStderr(chalk.red(summary.modelFallbackMessage ?? formatNoModelsAvailableMessage())));
+			console.error(
+				wrapForStderr(stderrChalk.red(summary.modelFallbackMessage ?? formatNoModelsAvailableMessage())),
+			);
 			await connection.dispose();
 			process.exit(1);
 		}
 		// A restored default that silently moved to another model is a drift the
 		// owner must see in headless output too, not only in the TUI.
 		if (summary.modelFallbackMessage) {
-			console.error(wrapForStderr(chalk.yellow(`Warning: ${summary.modelFallbackMessage}`)));
+			console.error(wrapForStderr(stderrChalk.yellow(`Warning: ${summary.modelFallbackMessage}`)));
 		}
 
 		printTimings();
@@ -2245,7 +2265,7 @@ export async function main(args: string[], options?: MainOptions) {
 	} catch (error) {
 		const startupError = describeSessionStartupError(error);
 		if (startupError) {
-			console.error(wrapForStderr(chalk.red(startupError)));
+			console.error(wrapForStderr(stderrChalk.red(startupError)));
 			process.exit(1);
 		}
 		throw error;
@@ -2294,7 +2314,7 @@ export async function main(args: string[], options?: MainOptions) {
 	time("createAgentSession");
 
 	if (appMode !== "interactive" && appMode !== "daemon" && !session.model) {
-		console.error(wrapForStderr(chalk.red(formatNoModelsAvailableMessage())));
+		console.error(wrapForStderr(stderrChalk.red(formatNoModelsAvailableMessage())));
 		await exitAfterOrphanJournalFlush(1);
 	}
 
@@ -2309,7 +2329,9 @@ export async function main(args: string[], options?: MainOptions) {
 	} else if (appMode === "interactive") {
 		if (explicitAgentsView || parsed.resume === true) {
 			console.error(
-				wrapForStderr(chalk.yellow("Warning: the agents view needs the daemon; opening a normal chat instead")),
+				wrapForStderr(
+					stderrChalk.yellow("Warning: the agents view needs the daemon; opening a normal chat instead"),
+				),
 			);
 		}
 		if (scopedModels.length > 0 && (parsed.verbose || !settingsManager.getQuietStartup())) {
@@ -2384,7 +2406,7 @@ export async function main(args: string[], options?: MainOptions) {
 		// Headless has no TUI warning slot: a restored-then-fallen-back model is
 		// announced on stderr or the drift is invisible.
 		if (runtime.modelFallbackMessage) {
-			console.error(wrapForStderr(chalk.yellow(`Warning: ${runtime.modelFallbackMessage}`)));
+			console.error(wrapForStderr(stderrChalk.yellow(`Warning: ${runtime.modelFallbackMessage}`)));
 		}
 		const { runPrintMode } = await import("./modes/print-mode.js");
 		const exitCode = await runPrintMode(runtime, {

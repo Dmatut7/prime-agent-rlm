@@ -30,6 +30,7 @@ import {
 	launchDaemonUpdateRestartCoordinator,
 	waitForActiveDaemonUpdateRestartCoordinator,
 } from "./cli/daemon-update-restart.js";
+import { stderrChalk } from "./cli/stderr-chalk.js";
 import { wrapForStderr } from "./cli/stdout-wrap.js";
 import {
 	ALLOW_REGISTRY_UPDATE_ENV,
@@ -92,7 +93,10 @@ const UPDATE_RESTART_PREDECESSOR_FENCE_TIMEOUT_MS = 60_000;
 type UpdateTarget = { type: "all" } | { type: "self" } | { type: "extensions"; source?: string };
 
 export function isSelfUpdateSource(source: string): boolean {
-	return source === "self" || source === "pi" || source === APP_NAME;
+	// The interactive /update parser compares case-insensitively; keep the two in
+	// step or "/update Prime-Agent" means self-update there and a package here.
+	const normalized = source.toLowerCase();
+	return normalized === "self" || normalized === "pi" || normalized === APP_NAME.toLowerCase();
 }
 
 interface PackageCommandOptions {
@@ -117,9 +121,9 @@ interface PackageCommandOptions {
 function reportSettingsErrors(settingsManager: SettingsManager, context: string): void {
 	const errors = settingsManager.drainErrors();
 	for (const { scope, error } of errors) {
-		console.error(chalk.yellow(`Warning (${context}, ${scope} settings): ${error.message}`));
+		console.error(stderrChalk.yellow(`Warning (${context}, ${scope} settings): ${error.message}`));
 		if (error.stack) {
-			console.error(chalk.dim(error.stack));
+			console.error(stderrChalk.dim(error.stack));
 		}
 	}
 	// K3R2-3 (r31 F4a): ancestor parse failures and unknown-key reports are
@@ -128,7 +132,7 @@ function reportSettingsErrors(settingsManager: SettingsManager, context: string)
 	// while the interactive path printed them.
 	const warnings = settingsManager.drainWarnings();
 	for (const { scope, message } of warnings) {
-		console.error(chalk.yellow(`Warning (${context}, ${scope} settings): ${message}`));
+		console.error(stderrChalk.yellow(`Warning (${context}, ${scope} settings): ${message}`));
 	}
 }
 
@@ -440,7 +444,7 @@ function reportDaemonUpdateRestartStatus(status: DaemonUpdateRestartStatus): voi
 		console.log(chalk.green(message));
 	}
 	for (const warning of report.warnings) {
-		console.error(chalk.yellow(`Warning: ${warning}`));
+		console.error(stderrChalk.yellow(`Warning: ${warning}`));
 	}
 }
 
@@ -456,12 +460,12 @@ function printSelfUpdateUnavailable(
 	const entrypoint = process.argv[1];
 	if (entrypoint) {
 		console.error("");
-		console.error(`Location of pi executable: ${entrypoint}`);
+		console.error(`Location of ${APP_NAME} executable: ${entrypoint}`);
 	}
 }
 
 function printSelfUpdateFallback(command: SelfUpdateCommand): void {
-	console.error(chalk.dim(`If this keeps failing, run this command yourself: ${command.display}`));
+	console.error(stderrChalk.dim(`If this keeps failing, run this command yourself: ${command.display}`));
 }
 
 /**
@@ -979,7 +983,7 @@ function discardStalePreparedDaemonUpdateRestartManifest(manifestPath: string): 
 		// Best effort only; the manifest is also skipped as unusable below.
 	}
 	console.error(
-		chalk.yellow(
+		stderrChalk.yellow(
 			`Discarded a stale prepared daemon update restart manifest (older than ${Math.round(
 				UPDATE_RESTART_PREPARED_RESTORE_WINDOW_MS / 60_000,
 			)} minutes): ${manifestPath}`,
@@ -1166,7 +1170,9 @@ async function restoreNextTurnMessages(
 		30000,
 	);
 	if (!response.success) {
-		console.error(chalk.yellow(`Warning: could not restore pending context for ${sessionFile}: ${response.error}`));
+		console.error(
+			stderrChalk.yellow(`Warning: could not restore pending context for ${sessionFile}: ${response.error}`),
+		);
 		return false;
 	}
 	return true;
@@ -1222,7 +1228,7 @@ async function restoreDaemonUpdateRestartSession(
 		120000,
 	);
 	if (!createResponse.success) {
-		console.error(chalk.yellow(`Warning: could not restore ${session.sessionFile}: ${createResponse.error}`));
+		console.error(stderrChalk.yellow(`Warning: could not restore ${session.sessionFile}: ${createResponse.error}`));
 		return { restored: false, resumed: false, failureMessage: createResponse.error };
 	}
 	const activeSessionId = readCreatedActiveSessionId(createResponse.data);
@@ -1245,14 +1251,14 @@ async function restoreDaemonUpdateRestartSession(
 			);
 			if (!noticeResponse.success) {
 				console.error(
-					chalk.yellow(
+					stderrChalk.yellow(
 						`Warning: could not record update completion in ${session.sessionFile}: ${noticeResponse.error}`,
 					),
 				);
 			}
 		} catch (error: unknown) {
 			console.error(
-				chalk.yellow(
+				stderrChalk.yellow(
 					`Warning: could not record update completion in ${session.sessionFile}: ${formatUnknownError(error)}`,
 				),
 			);
@@ -1279,7 +1285,9 @@ async function restoreDaemonUpdateRestartSession(
 			restoredQueuedWork = true;
 		} else {
 			console.error(
-				chalk.yellow(`Warning: could not restore queued actions for ${session.sessionFile}: ${response.error}`),
+				stderrChalk.yellow(
+					`Warning: could not restore queued actions for ${session.sessionFile}: ${response.error}`,
+				),
 			);
 		}
 	}
@@ -1300,7 +1308,7 @@ async function restoreDaemonUpdateRestartSession(
 			120000,
 		);
 		if (!promptResponse.success) {
-			console.error(chalk.yellow(`Warning: could not resume ${session.sessionFile}: ${promptResponse.error}`));
+			console.error(stderrChalk.yellow(`Warning: could not resume ${session.sessionFile}: ${promptResponse.error}`));
 		} else {
 			resumedSession = true;
 		}
@@ -1311,7 +1319,7 @@ async function restoreDaemonUpdateRestartSession(
 			resumedSession = true;
 		} else {
 			console.error(
-				chalk.yellow(`Warning: could not resume queued work for ${session.sessionFile}: ${response.error}`),
+				stderrChalk.yellow(`Warning: could not resume queued work for ${session.sessionFile}: ${response.error}`),
 			);
 		}
 	}
@@ -1356,7 +1364,7 @@ async function restoreDaemonUpdateRestart(
 				}
 			} catch (error: unknown) {
 				const message = formatUnknownError(error);
-				console.error(chalk.yellow(`Warning: could not restore ${session.sessionFile}: ${message}`));
+				console.error(stderrChalk.yellow(`Warning: could not restore ${session.sessionFile}: ${message}`));
 				failures.push({ sessionFile: session.sessionFile, message });
 			}
 			onProgress?.({
@@ -1627,6 +1635,14 @@ export async function handleConfigCommand(args: string[]): Promise<boolean> {
 		return false;
 	}
 
+	if (!process.stdin.isTTY || !process.stdout.isTTY) {
+		// selectConfig paints a raw TUI; piped, that leaks escape frames and the
+		// selector's odd exit code. Answer plainly on stderr instead.
+		console.error("Error: the config command requires an interactive terminal");
+		process.exitCode = 1;
+		return true;
+	}
+
 	const cwd = process.cwd();
 	const agentDir = getAgentDir();
 	const settingsManager = SettingsManager.create(cwd, agentDir);
@@ -1666,35 +1682,37 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 
 	if (options.invalidOption) {
 		if (options.invalidOption === "-l" && (options.command === "install" || options.command === "remove")) {
-			console.error(wrapForStderr(chalk.red('Option -l was removed. Use "--local".')));
+			console.error(wrapForStderr(stderrChalk.red('Option -l was removed. Use "--local".')));
 			process.exitCode = 1;
 			return true;
 		}
-		console.error(wrapForStderr(chalk.red(`Unknown option ${options.invalidOption} for "${options.command}".`)));
 		console.error(
-			wrapForStderr(chalk.dim(`Use "${APP_NAME} --help" or "${getPackageCommandUsage(options.command)}".`)),
+			wrapForStderr(stderrChalk.red(`Unknown option ${options.invalidOption} for "${options.command}".`)),
+		);
+		console.error(
+			wrapForStderr(stderrChalk.dim(`Use "${APP_NAME} --help" or "${getPackageCommandUsage(options.command)}".`)),
 		);
 		process.exitCode = 1;
 		return true;
 	}
 
 	if (options.missingOptionValue) {
-		console.error(wrapForStderr(chalk.red(`Missing value for ${options.missingOptionValue}.`)));
-		console.error(wrapForStderr(chalk.dim(`Usage: ${getPackageCommandUsage(options.command)}`)));
+		console.error(wrapForStderr(stderrChalk.red(`Missing value for ${options.missingOptionValue}.`)));
+		console.error(wrapForStderr(stderrChalk.dim(`Usage: ${getPackageCommandUsage(options.command)}`)));
 		process.exitCode = 1;
 		return true;
 	}
 
 	if (options.invalidArgument) {
-		console.error(wrapForStderr(chalk.red(`Unexpected argument ${options.invalidArgument}.`)));
-		console.error(wrapForStderr(chalk.dim(`Usage: ${getPackageCommandUsage(options.command)}`)));
+		console.error(wrapForStderr(stderrChalk.red(`Unexpected argument ${options.invalidArgument}.`)));
+		console.error(wrapForStderr(stderrChalk.dim(`Usage: ${getPackageCommandUsage(options.command)}`)));
 		process.exitCode = 1;
 		return true;
 	}
 
 	if (options.conflictingOptions) {
-		console.error(wrapForStderr(chalk.red(options.conflictingOptions)));
-		console.error(wrapForStderr(chalk.dim(`Usage: ${getPackageCommandUsage(options.command)}`)));
+		console.error(wrapForStderr(stderrChalk.red(options.conflictingOptions)));
+		console.error(wrapForStderr(stderrChalk.dim(`Usage: ${getPackageCommandUsage(options.command)}`)));
 		process.exitCode = 1;
 		return true;
 	}
@@ -1705,7 +1723,7 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 		const daemonSocketPath = options.daemonSocketPath;
 		const restartDirectory = resolve(agentDir, "update-restarts");
 		if (!statusPath || !daemonSocketPath || !resolve(statusPath).startsWith(`${restartDirectory}${sep}`)) {
-			console.error(chalk.red("Invalid daemon update restart coordinator invocation."));
+			console.error(stderrChalk.red("Invalid daemon update restart coordinator invocation."));
 			process.exitCode = 1;
 			return true;
 		}
@@ -1722,15 +1740,15 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 	}
 
 	if (options.restartStatusPath || options.restartOriginActiveSessionId) {
-		console.error(chalk.red("Invalid daemon update restart coordinator invocation."));
+		console.error(stderrChalk.red("Invalid daemon update restart coordinator invocation."));
 		process.exitCode = 1;
 		return true;
 	}
 
 	const source = options.source;
 	if ((options.command === "install" || options.command === "remove") && !source) {
-		console.error(chalk.red(`Missing ${options.command} source.`));
-		console.error(chalk.dim(`Usage: ${getPackageCommandUsage(options.command)}`));
+		console.error(stderrChalk.red(`Missing ${options.command} source.`));
+		console.error(stderrChalk.dim(`Usage: ${getPackageCommandUsage(options.command)}`));
 		process.exitCode = 1;
 		return true;
 	}
@@ -1759,7 +1777,7 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 			case "remove": {
 				const removed = await packageManager.removeAndPersist(source!, { local: options.local });
 				if (!removed) {
-					console.error(chalk.red(`No matching package found for ${source}`));
+					console.error(stderrChalk.red(`No matching package found for ${source}`));
 					process.exitCode = 1;
 					return true;
 				}
@@ -1830,11 +1848,11 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 							process.exitCode = 1;
 							return true;
 						}
-						console.error(chalk.yellow(forkSelfUpdateOverrideLine(forkInstall)));
+						console.error(stderrChalk.yellow(forkSelfUpdateOverrideLine(forkInstall)));
 					}
 					const selfUpdatePlan = await getSelfUpdatePlan(options.force);
 					if (selfUpdatePlan.refusal) {
-						console.error(chalk.red(`Error: ${selfUpdatePlan.refusal}`));
+						console.error(stderrChalk.red(`Error: ${selfUpdatePlan.refusal}`));
 						process.exitCode = 1;
 						return true;
 					}
@@ -1885,7 +1903,7 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 						await runSelfUpdate(selfUpdateCommand);
 					} catch (error: unknown) {
 						const message = error instanceof Error ? error.message : "Unknown package command error";
-						console.error(chalk.red(`Error: ${message}`));
+						console.error(stderrChalk.red(`Error: ${message}`));
 						printSelfUpdateFallback(selfUpdateCommand);
 						await discardVerifiedArtifact();
 						process.exitCode = 1;
@@ -1897,14 +1915,14 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 					// the installed package's version back and report what actually landed.
 					const targetVersion = selfUpdatePlan.targetVersion;
 					const installedVersion = readInstalledSelfVersion();
-					if (
-						targetVersion !== undefined &&
-						installedVersion !== undefined &&
-						installedVersion !== targetVersion
-					) {
+					if (installedVersion === undefined) {
+						// The disk read-back failed, so nothing about the landed version is
+						// verified: say what ran, not a version nobody confirmed.
+						console.log(chalk.green(`Updated ${APP_NAME} (the installed version could not be verified)`));
+					} else if (targetVersion !== undefined && installedVersion !== targetVersion) {
 						console.log(chalk.green(`Updated ${APP_NAME} from v${VERSION}`));
 						console.error(
-							chalk.yellow(
+							stderrChalk.yellow(
 								`Warning: the update targeted v${targetVersion}, but the installed CLI reports v${installedVersion}.`,
 							),
 						);
@@ -1925,7 +1943,7 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 						reportDaemonUpdateRestartStatus(status);
 					} catch (error: unknown) {
 						console.error(
-							chalk.yellow(
+							stderrChalk.yellow(
 								`Warning: updated, but could not coordinate the daemon restart (${formatUnknownError(error)}).`,
 							),
 						);
@@ -1936,7 +1954,7 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 		}
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : "Unknown package command error";
-		console.error(chalk.red(`Error: ${message}`));
+		console.error(stderrChalk.red(`Error: ${message}`));
 		process.exitCode = 1;
 		return true;
 	}

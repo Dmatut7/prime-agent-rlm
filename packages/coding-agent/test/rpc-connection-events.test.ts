@@ -111,4 +111,42 @@ describe("RPC connection-level event forwarding", () => {
 			snapshot: { messages: [] },
 		});
 	});
+
+	it("forwards the daemon's fire-and-forget extension UI methods instead of dropping them", async () => {
+		const emit = await startRpcMode();
+
+		// The daemon face emits these four; the RPC whitelist used to know only the
+		// dialog methods plus notify/setStatus/setWidget/setTitle/set_editor_text.
+		emit({
+			type: "extension_ui_request",
+			request: { id: "r1", method: "setWorkingMessage", payload: { message: "working hard" } },
+		});
+		emit({
+			type: "extension_ui_request",
+			request: { id: "r2", method: "setWorkingVisible", payload: { visible: false } },
+		});
+		emit({
+			type: "extension_ui_request",
+			request: { id: "r3", method: "setWorkingIndicator", payload: { options: { frames: ["●"] } } },
+		});
+		emit({
+			type: "extension_ui_request",
+			request: { id: "r4", method: "setHiddenThinkingLabel", payload: { label: "cogitating" } },
+		});
+		// Control: a genuinely unknown method still goes nowhere.
+		emit({
+			type: "extension_ui_request",
+			request: { id: "r5", method: "madeUpMethod", payload: {} },
+		});
+
+		await vi.waitFor(() => expect(parseOutputLines()).toHaveLength(4));
+		expect(parseOutputLines().map((line) => [line.id, line.method])).toEqual([
+			["r1", "setWorkingMessage"],
+			["r2", "setWorkingVisible"],
+			["r3", "setWorkingIndicator"],
+			["r4", "setHiddenThinkingLabel"],
+		]);
+		expect(parseOutputLines()[0]).toMatchObject({ message: "working hard" });
+		expect(parseOutputLines()[2]).toMatchObject({ options: { frames: ["●"] } });
+	});
 });

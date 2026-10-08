@@ -3,6 +3,7 @@ import {
 	type ImageContent,
 	type Message,
 	type Model,
+	redactSecrets,
 	type ServiceTier,
 	type SimpleStreamOptions,
 	streamSimple,
@@ -636,7 +637,9 @@ export class Agent {
 			model: runModel.id,
 			usage: cloneEmptyUsage(),
 			stopReason: aborted ? "aborted" : "error",
-			errorMessage: error instanceof Error ? error.message : String(error),
+			// The diagnostics copy of this same error is redacted at creation; the
+			// user-facing copy is persisted and rendered, so it gets the same wash.
+			errorMessage: redactSecrets(error instanceof Error ? error.message : String(error)),
 			diagnostics: aborted
 				? undefined
 				: [createAssistantMessageDiagnostic("agent_lifecycle_failure", error, { source: "run_with_lifecycle" })],

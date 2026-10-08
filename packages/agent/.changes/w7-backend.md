@@ -1,0 +1,2 @@
+- Fixed the synthesized run-failure message keeping credential material that the diagnostics copy of the same failure already redacted.
+- Fixed proxied streams persisting the proxy server's error text verbatim; it is now redacted, washed of control characters, and bounded in length.

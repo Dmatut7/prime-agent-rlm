@@ -181,4 +181,32 @@ describe("openai responses incomplete handling and stream termination", () => {
 		expect(thrown).toBeInstanceOf(StreamFailureError);
 		expect((thrown as StreamFailureError).info.kind).toBe("malformed_response");
 	});
+
+	it("does not print 'Error Code null' when the error event carries no code", async () => {
+		let thrown: unknown;
+		try {
+			await driveResponsesStream([{ type: "error", sequence_number: 3, code: null, message: "boom" }]);
+		} catch (error) {
+			thrown = error;
+		}
+
+		expect(thrown).toBeInstanceOf(StreamFailureError);
+		expect((thrown as Error).message).toContain("boom");
+		expect((thrown as Error).message).not.toContain("null");
+	});
+
+	it("keeps the error code in the message when the error event carries one", async () => {
+		let thrown: unknown;
+		try {
+			await driveResponsesStream([
+				{ type: "error", sequence_number: 3, code: "rate_limit_exceeded", message: "boom" },
+			]);
+		} catch (error) {
+			thrown = error;
+		}
+
+		expect(thrown).toBeInstanceOf(StreamFailureError);
+		expect((thrown as Error).message).toContain("rate_limit_exceeded");
+		expect((thrown as StreamFailureError).info.kind).toBe("rate_limit");
+	});
 });

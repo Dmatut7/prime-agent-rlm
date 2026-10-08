@@ -5135,37 +5135,6 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(setThinkingExpanded).toHaveBeenCalledWith(false);
 	});
 
-	test("the thinking lane survives a chat rebuild (F2: addMessageToChat threads it)", () => {
-		const chatContainer = new Container();
-		const mode = Object.assign(Object.create(InteractiveMode.prototype), {
-			chatContainer,
-			thinkingExpanded: true,
-			toolOutputExpanded: false,
-			hideThinkingBlock: false,
-			hiddenThinkingLabel: "思考",
-			mermaidMarkdownTransform: undefined,
-			// TUI v4: addMessageToChat reads the process mode off the settings manager.
-			uiServices: { settingsManager: { getProcessMode: () => "quiet" } },
-			getMarkdownThemeWithSettings: () => undefined,
-			getCurrentCwd: () => "/tmp",
-		});
-		const addMessageToChat = (
-			InteractiveMode.prototype as unknown as {
-				addMessageToChat(this: unknown, message: unknown): void;
-			}
-		).addMessageToChat;
-		const assistant = assistantThinking("rebuild");
-		addMessageToChat.call(mode, assistant);
-		const child = chatContainer.children.find((c) => c instanceof AssistantMessageComponent);
-		expect(child).toBeInstanceOf(AssistantMessageComponent);
-		const rendered = ((child as AssistantMessageComponent).render(100).join("\n") as string).replace(
-			/\u001b\[[0-9;]*[A-Za-z]/g,
-			"",
-		);
-		// The global thinking lane held through the (re)build: the trace shows.
-		expect(rendered).toContain("thinking for rebuild");
-	});
-
 	test("quiet turns: Ctrl+T/O/P act on the latest box without closing each other (T5)", () => {
 		// A quiet turn (box face) built through the replay builder: Ctrl+O opens
 		// and closes the box, Ctrl+T opens its thinking rows (opening the box to

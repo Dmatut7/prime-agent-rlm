@@ -226,7 +226,8 @@ describe("shell and helper labels (QA M3)", () => {
 	});
 
 	it("names kernel helper calls", () => {
-		expect(cell("r = await h")).toBe("等待 h 的结果");
+		// An unmapped handle name is the model's own variable: the label stays generic.
+		expect(cell("r = await h")).toBe("等待命令结果");
 		expect(cell("print(tui[79900:81300])")).toBe("查看输出");
 		expect(cell("obs = await agent_observe.get_agent('tui-v5-reviewer')")).toBe("查看子代理 tui-v5-reviewer");
 		expect(cell("await agent_message.send('done', receiver_role='child', receiver_name='docs')")).toBe(

@@ -1,4 +1,4 @@
-import type { Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { streamProxy } from "../src/proxy.js";
 
@@ -116,5 +116,68 @@ describe("streamProxy request options", () => {
 		for (const hostOnly of ["signal", "apiKey", "timeoutMs", "maxRetries", "onPayload", "onResponse"]) {
 			expect(options).not.toHaveProperty(hostOnly);
 		}
+	});
+});
+
+describe("streamProxy error surface", () => {
+	async function runFailingProxy(response: Response): Promise<AssistantMessage> {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => response),
+		);
+		const stream = streamProxy(createModel(), createContext(), {
+			authToken: "proxy-token",
+			proxyUrl: "https://proxy.invalid",
+		});
+		return stream.result();
+	}
+
+	// The server's error text is attacker-influenced text that lands in the
+	// persisted transcript: it must not carry credentials or terminal controls.
+	it("redacts and washes the server's error body before it becomes the errorMessage", async () => {
+		const message = await runFailingProxy(
+			new Response(JSON.stringify({ error: "bad key sk-ant-" + "a1b2c3d4e5f6g7h8 \x1b[2J\x07 now" }), {
+				status: 400,
+				headers: { "Content-Type": "application/json" },
+			}),
+		);
+
+		expect(message.stopReason).toBe("error");
+		expect(message.errorMessage).toContain("Proxy error:");
+		expect(message.errorMessage).not.toContain("sk-ant-a1b2c3d4e5f6g7h8"); // secret-scan: allow
+		expect(message.errorMessage).not.toContain("\x1b");
+		expect(message.errorMessage).not.toContain("\x07");
+		expect(message.errorMessage).toContain("now");
+	});
+
+	it("bounds an unbounded server error body", async () => {
+		const message = await runFailingProxy(
+			new Response(JSON.stringify({ error: "x".repeat(100_000) }), {
+				status: 500,
+				headers: { "Content-Type": "application/json" },
+			}),
+		);
+
+		expect(message.stopReason).toBe("error");
+		expect(message.errorMessage?.length ?? 0).toBeLessThan(10_000);
+	});
+
+	// A fetch-layer failure (connection refused, DNS) becomes the errorMessage
+	// verbatim; the message can embed the request URL's credentials.
+	it("redacts the transport failure's message", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => {
+				throw new Error("connect failed for https://user:sk-live-secret-abcdef@proxy.invalid"); // secret-scan: allow
+			}),
+		);
+		const stream = streamProxy(createModel(), createContext(), {
+			authToken: "proxy-token",
+			proxyUrl: "https://proxy.invalid",
+		});
+		const message = await stream.result();
+
+		expect(message.stopReason).toBe("error");
+		expect(message.errorMessage).not.toContain("sk-live-secret-abcdef"); // secret-scan: allow
 	});
 });

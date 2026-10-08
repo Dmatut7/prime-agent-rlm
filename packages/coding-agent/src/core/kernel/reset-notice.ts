@@ -140,7 +140,12 @@ export function formatKernelResetNotice(facts: KernelResetNoticeFacts): string {
 	const budget =
 		facts.maxRestarts === undefined || facts.windowMinutes === undefined
 			? `Restart ${facts.restartCount}.`
-			: `Restart ${facts.restartCount} of at most ${facts.maxRestarts} allowed in ${facts.windowMinutes} minutes.`;
+			: // The budget-exhausting death's notice can be consumed by a revival that only
+				// happened after the window slid: "Restart 4 of at most 3" is that stale pair,
+				// so say what occurred instead of printing the contradiction.
+				facts.restartCount > facts.maxRestarts
+				? `Restart ${facts.restartCount} - it came after the budget of ${facts.maxRestarts} per ${facts.windowMinutes} minutes was spent, so the kernel stayed down until the window cleared.`
+				: `Restart ${facts.restartCount} of at most ${facts.maxRestarts} allowed in ${facts.windowMinutes} minutes.`;
 	const lines = [
 		KERNEL_RESET_NOTICE_TAG,
 		`The Python kernel process died unexpectedly (${formatCause(facts.cause)}) and a replacement kernel ran this cell. ${budget}`,

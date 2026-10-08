@@ -492,4 +492,15 @@ describe("RLM child streaming parent-side cost", () => {
 		// the first message's capped window; a frozen "aaa..." preview never does.
 		expect(previews.some((preview) => preview !== undefined && preview.includes("B"))).toBe(true);
 	});
+
+	it("cuts the preview on a grapheme boundary, never inside a surrogate pair", () => {
+		// 156 ascii + one emoji straddling the 157-code-unit cut: a code-unit slice
+		// would leave the emoji's lone high surrogate, rendered as U+FFFD downstream.
+		const text = `${"a".repeat(156)}💥 tail`;
+		const preview = compactRlmText(text);
+		expect(preview.endsWith("...")).toBe(true);
+		expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(preview)).toBe(false);
+		// The whole grapheme fits the budget, so it survives whole.
+		expect(preview).toContain("💥");
+	});
 });

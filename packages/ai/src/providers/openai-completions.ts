@@ -568,6 +568,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 					if (finishReasonResult.errorMessage) {
 						output.errorMessage = finishReasonResult.errorMessage;
 					}
+					// The raw reason is what downstream classification and the retry ladder read.
+					if (output.stopReason === "error") {
+						output.stopReasonRaw = choice.finish_reason;
+					}
 				}
 
 				if (choice.delta) {

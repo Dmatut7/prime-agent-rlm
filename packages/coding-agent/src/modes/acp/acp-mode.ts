@@ -98,6 +98,12 @@ export interface AcpModeOptions {
 	stream?: ReturnType<typeof acp.ndJsonStream>;
 	/** Skip claiming stdout when the caller supplies its own transport. */
 	ownStdout?: boolean;
+	/**
+	 * Called when the ACP transport itself fails (a write throws, or a stdio stream
+	 * errors). The stdio entrypoint exits non-zero when this fired; embedders get
+	 * the signal here because their process is not exited for them.
+	 */
+	onTransportFailure?: (message: string) => void;
 }
 
 interface AcpPendingTerminal {
@@ -333,16 +339,31 @@ function promptContent(blocks: readonly unknown[]): { text: string; images: Imag
 			data?: string;
 			mimeType?: string;
 			uri?: string;
-			resource?: { text?: string; uri?: string };
+			resource?: { text?: string; uri?: string; blob?: string; mimeType?: string };
 		};
 		if (typed.type === "text" && typeof typed.text === "string") {
 			texts.push(typed.text);
 		} else if (typed.type === "image" && typeof typed.data === "string" && typeof typed.mimeType === "string") {
 			images.push({ type: "image", data: typed.data, mimeType: typed.mimeType });
-		} else if (typed.type === "resource" && typeof typed.resource?.text === "string") {
-			// Embedded text resources become context the model can read.
-			const uri = typed.resource.uri ? `${typed.resource.uri}\n` : "";
-			texts.push(`${uri}${typed.resource.text}`);
+		} else if (typed.type === "resource") {
+			const resource = typed.resource;
+			if (typeof resource?.text === "string") {
+				// Embedded text resources become context the model can read.
+				const uri = resource.uri ? `${resource.uri}\n` : "";
+				texts.push(`${uri}${resource.text}`);
+			} else if (typeof resource?.blob === "string") {
+				// A blob with an image mime type is the screenshot the client pasted:
+				// hand it over like an image block. Any other binary cannot reach the
+				// model, so name it in the text instead of dropping it without a trace.
+				const blob = resource.blob;
+				if (typeof resource.mimeType === "string" && resource.mimeType.startsWith("image/")) {
+					images.push({ type: "image", data: blob, mimeType: resource.mimeType });
+				} else {
+					const name = resource.uri ?? "embedded resource";
+					const kind = resource.mimeType ?? "application/octet-stream";
+					texts.push(`[${name}: ${kind} binary content not shown to the model]`);
+				}
+			}
 		} else if (typed.type === "resource_link" && typeof typed.uri === "string") {
 			texts.push(typed.uri);
 		}
@@ -522,6 +543,20 @@ export async function runAcpModeWithConnection(
 
 	const baseStream =
 		options.stream ?? acp.ndJsonStream(rawStdoutSink(), Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>);
+	// A dead transport (client crashed, pipe broke) must not read as a clean exit.
+	// The SDK resolves `closed` without an error either way, so the failure is
+	// recorded where it actually surfaces: the write below, and the stdio streams'
+	// own error events for the real entrypoint.
+	let transportFailure: string | undefined;
+	const noteTransportFailure = (error: unknown): void => {
+		const message = error instanceof Error ? error.message : String(error);
+		if (transportFailure === undefined) transportFailure = message;
+		options.onTransportFailure?.(message);
+	};
+	if (!options.stream) {
+		process.stdin.once("error", noteTransportFailure);
+		process.stdout.once("error", noteTransportFailure);
+	}
 	// ACP's public request handler only returns a response; it has no response
 	// commit callback. Observe the outgoing response at the supplied stream
 	// boundary instead. The SDK serializes every write, so opening the producer
@@ -550,6 +585,7 @@ export async function runAcpModeWithConnection(
 					writer = baseStream.writable.getWriter();
 					await writer.write(message);
 				} catch (error) {
+					noteTransportFailure(error);
 					failPendingSessionNewResponse();
 					throw error;
 				} finally {
@@ -1140,5 +1176,11 @@ export async function runAcpModeWithConnection(
 	// Only the real stdio entrypoint owns the process; a caller-supplied transport
 	// (tests, embedding) must never have its host exited from under it.
 	if (options.stream) return undefined as never;
+	// A clean disconnect exits 0; a transport that failed mid-session reports the
+	// failure in the exit code so a harness does not read a dead client as success.
+	if (transportFailure !== undefined) {
+		console.error(`ACP transport failed: ${transportFailure}`);
+		return process.exit(1) as never;
+	}
 	return process.exit(0) as never;
 }

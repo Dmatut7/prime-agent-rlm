@@ -56,13 +56,18 @@ describe("self-update install receipt version check", () => {
 
 	async function runSelfUpdateWithInstalledVersion(
 		installedVersion: string,
+		options?: { corruptPackageJson?: boolean },
 	): Promise<{ stdout: string; stderr: string }> {
 		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
+		const writeInstalled = options?.corruptPackageJson
+			? // The install leaves a package.json no version read-back can parse.
+				`fs.writeFileSync(path.join(${JSON.stringify(selfPackageDir)},"package.json"),"not json {");`
+			: `fs.writeFileSync(path.join(${JSON.stringify(selfPackageDir)},"package.json"),JSON.stringify({name:"@earendil-works/pi-coding-agent",version:${JSON.stringify(installedVersion)}}));`;
 		writeFileSync(
 			fakeNpmPath,
 			`const fs=require("node:fs"),path=require("node:path"),args=process.argv.slice(2),prefix=args[args.indexOf("--prefix")+1];
 if(args.includes("root")) { console.log(path.join(prefix,"lib","node_modules")); process.exit(0); }
-fs.writeFileSync(path.join(${JSON.stringify(selfPackageDir)},"package.json"),JSON.stringify({name:"@earendil-works/pi-coding-agent",version:${JSON.stringify(installedVersion)}}));
+${writeInstalled}
 fs.writeFileSync(${JSON.stringify(join(tempDir, "install-args.json"))},JSON.stringify(args));
 `,
 		);
@@ -165,5 +170,13 @@ fs.writeFileSync(${JSON.stringify(join(tempDir, "install-args.json"))},JSON.stri
 
 		expect(stdout).toContain(`Updated ${APP_NAME} from v${VERSION} to v${TARGET_VERSION}`);
 		expect(stderr).not.toContain("Warning");
+	});
+
+	it("says the version could not be verified instead of quoting the manifest when the read-back fails", async () => {
+		const { stdout } = await runSelfUpdateWithInstalledVersion(TARGET_VERSION, { corruptPackageJson: true });
+
+		expect(stdout).toContain("could not be verified");
+		// The unverified receipt must not parrot the manifest's target version.
+		expect(stdout).not.toContain(`to v${TARGET_VERSION}`);
 	});
 });

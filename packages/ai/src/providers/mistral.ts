@@ -195,9 +195,20 @@ function formatMistralError(error: unknown): string {
 	return safeJsonStringify(error);
 }
 
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
 function truncateErrorText(text: string, maxChars: number): string {
 	if (text.length <= maxChars) return text;
-	return `${text.slice(0, maxChars)}... [truncated ${text.length - maxChars} chars]`;
+	// Cut on a grapheme boundary: a code-unit slice can leave half a surrogate
+	// pair, which every downstream encoding pass then renders as U+FFFD.
+	let cut = 0;
+	let count = 0;
+	for (const segment of graphemeSegmenter.segment(text)) {
+		if (count >= maxChars) break;
+		cut = segment.index + segment.segment.length;
+		count++;
+	}
+	return `${text.slice(0, cut)}... [truncated ${text.length - cut} chars]`;
 }
 
 function safeJsonStringify(value: unknown): string {
@@ -666,6 +677,9 @@ function mapChatStopReason(reason: string | null): StopReason {
 		case "error":
 			return "error";
 		default:
-			return "stop";
+			// An unknown reason is not a success: fail visibly with the raw reason
+			// recorded (the caller copies finishReason into stopReasonRaw) instead of
+			// reporting a clean stop and hiding the truncation from the retry ladder.
+			return "error";
 	}
 }

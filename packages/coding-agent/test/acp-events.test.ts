@@ -332,23 +332,36 @@ describe("ACP session event mapping", () => {
 	});
 
 	it("streams bash output incrementally and surfaces compaction over ACP", () => {
-		const start = acpUpdatesForSessionEvent({
-			type: "bash_start",
-			command: "echo hi",
-			excludeFromContext: false,
-			runId: "b1",
-		} as AgentConnectionSessionEvent);
-		const mid = acpUpdatesForSessionEvent({ type: "bash_output", chunk: "hi\n" } as AgentConnectionSessionEvent);
-		const end = acpUpdatesForSessionEvent({
-			type: "bash_end",
-			exitCode: 0,
-			cancelled: false,
-			truncated: false,
-			runId: "b1",
-		} as AgentConnectionSessionEvent);
+		// The mode layer threads one mapping state across a connection's events; the
+		// run's output can only be addressed to the call its bash_start opened.
+		const bashState: AcpEventMappingState = {};
+		const start = acpUpdatesForSessionEvent(
+			{
+				type: "bash_start",
+				command: "echo hi",
+				excludeFromContext: false,
+				runId: "b1",
+			} as AgentConnectionSessionEvent,
+			bashState,
+		);
+		const mid = acpUpdatesForSessionEvent(
+			{ type: "bash_output", chunk: "hi\n" } as AgentConnectionSessionEvent,
+			bashState,
+		);
+		const end = acpUpdatesForSessionEvent(
+			{
+				type: "bash_end",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				runId: "b1",
+			} as AgentConnectionSessionEvent,
+			bashState,
+		);
 
 		expect(start[0]).toMatchObject({ sessionUpdate: "tool_call", kind: "execute" });
 		expect(JSON.stringify(mid[0]?.content)).toContain("hi");
+		expect(mid[0]?.toolCallId).toBe(start[0]?.toolCallId);
 		expect(end[0]).toMatchObject({ status: "completed" });
 
 		const compaction = acpUpdatesForSessionEvent({
@@ -502,5 +515,64 @@ describe("ACP connection event mapping", () => {
 				event: { type: "agent_start" } as never,
 			}),
 		).toEqual([]);
+	});
+
+	it("maps the auto-retry backoff window instead of leaving the client silent", () => {
+		const start = acpUpdatesForSessionEvent({
+			type: "auto_retry_start",
+			attempt: 2,
+			maxAttempts: 5,
+			delayMs: 30_000,
+			errorMessage: "rate limit",
+			reason: "usage",
+		} as AgentConnectionSessionEvent);
+		expect(start).toHaveLength(1);
+		expect(start[0]?.sessionUpdate).toBe("session_info_update");
+		expect(start[0]?._meta).toEqual({
+			[PRIME_AGENT_META_NAMESPACE]: {
+				autoRetry: {
+					status: "waiting",
+					attempt: 2,
+					maxAttempts: 5,
+					delayMs: 30_000,
+					errorMessage: "rate limit",
+					reason: "usage",
+				},
+			},
+		});
+
+		const end = acpUpdatesForSessionEvent({
+			type: "auto_retry_end",
+			success: false,
+			attempt: 5,
+			finalError: "still limited",
+		} as AgentConnectionSessionEvent);
+		expect(end[0]?._meta).toEqual({
+			[PRIME_AGENT_META_NAMESPACE]: {
+				autoRetry: { status: "finished", success: false, attempt: 5, finalError: "still limited" },
+			},
+		});
+	});
+
+	it("drops a bash output chunk that belongs to no open run instead of inventing an orphan tool call", () => {
+		const state: AcpEventMappingState = {};
+		// No bash_start seen (resync mid-run): the bare shared id would address a
+		// tool call the client never saw created.
+		const orphan = acpUpdatesForSessionEvent({ type: "bash_output", chunk: "late bytes" }, state);
+		expect(orphan).toEqual([]);
+
+		// A run with a runId: output lands on its own call, and after bash_end the
+		// flush race's trailing chunk is dropped rather than sent to the bare id.
+		acpUpdatesForSessionEvent(
+			{ type: "bash_start", command: "sleep 1", excludeFromContext: false, runId: "run-1" },
+			state,
+		);
+		const mid = acpUpdatesForSessionEvent({ type: "bash_output", chunk: "tick" }, state);
+		expect(mid[0]?.toolCallId).toBe(bashToolCallId("run-1"));
+		acpUpdatesForSessionEvent(
+			{ type: "bash_end", exitCode: 0, cancelled: false, truncated: false, runId: "run-1" },
+			state,
+		);
+		expect(acpUpdatesForSessionEvent({ type: "bash_output", chunk: "late bytes" }, state)).toEqual([]);
 	});
 });

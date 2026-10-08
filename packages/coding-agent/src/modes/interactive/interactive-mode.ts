@@ -232,16 +232,11 @@ import {
 	isVisibleRow,
 } from "./components/block-focus.js";
 import { BorderedLoader } from "./components/bordered-loader.js";
-import { BranchSummaryMessageComponent } from "./components/branch-summary-message.js";
 import { type FullPaneOverlayOptions, showFullPaneOverlay } from "./components/centered-overlay.js";
 import {
 	CompactionOutcomeMessageComponent,
 	MalformedCompactionOutcomeMessageComponent,
 } from "./components/compaction-outcome-message.js";
-import {
-	CompactionSummaryMessageComponent,
-	QuietCompactionNoticeComponent,
-} from "./components/compaction-summary-message.js";
 import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "./components/configuration-menu.js";
 import { formatContextTree } from "./components/context-tree-format.js";
 import {
@@ -9163,28 +9158,8 @@ export class InteractiveMode {
 		);
 	}
 
-	private addMessageToChat(
-		message: AgentMessage,
-		options?: { populateHistory?: boolean; round?: TurnActivityState; inlineIn?: TurnSummaryComponent },
-	): void {
-		if (message.role === "assistant") this.lastAssistantStopReason = message.stopReason;
+	private addMessageToChat(message: Extract<AgentMessage, { role: "custom" | "user" }>): void {
 		switch (message.role) {
-			case "bashExecution": {
-				const component = new BashExecutionComponent(message.command, this.ui, message.excludeFromContext, {
-					suppressLeadingSpace: this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
-				});
-				if (message.output) {
-					component.appendOutput(message.output);
-				}
-				component.setComplete(
-					message.exitCode,
-					message.cancelled,
-					message.truncated ? ({ truncated: true } as TruncationResult) : undefined,
-					message.fullOutputPath,
-				);
-				this.chatContainer.addChild(component);
-				break;
-			}
 			case "custom": {
 				this.noteSubagentFailureSeen(message);
 				if (message.display) {
@@ -9199,7 +9174,7 @@ export class InteractiveMode {
 						this.chatContainer.addChild(new Spacer(1));
 					}
 					// A report that joined the running round is a row of that turn, not of the chat's end.
-					if (!this.turnFlow.placeRow(component, Number(message.timestamp) || Date.now(), options?.inlineIn)) {
+					if (!this.turnFlow.placeRow(component, Number(message.timestamp) || Date.now())) {
 						// A memory line after a finished request goes above its closing row, which stays the last line.
 						if (message.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE) {
 							this.turnFlow.addRowAboveClosingRow(component);
@@ -9208,27 +9183,6 @@ export class InteractiveMode {
 						}
 					}
 				}
-				break;
-			}
-			case "compactionSummary": {
-				// The quiet conversation says it in one faint line; the summary opens on a click.
-				if (quietConversation(this)) {
-					this.chatContainer.addChild(
-						new QuietCompactionNoticeComponent(message, this.getMarkdownThemeWithSettings()),
-					);
-					break;
-				}
-				this.chatContainer.addChild(new Spacer(1));
-				const component = new CompactionSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
-				component.setExpanded(this.toolOutputExpanded);
-				this.chatContainer.addChild(component);
-				break;
-			}
-			case "branchSummary": {
-				this.chatContainer.addChild(new Spacer(1));
-				const component = new BranchSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
-				component.setExpanded(this.toolOutputExpanded);
-				this.chatContainer.addChild(component);
 				break;
 			}
 			case "user": {
@@ -9279,43 +9233,8 @@ export class InteractiveMode {
 						});
 						this.chatContainer.addChild(userComponent);
 					}
-					if (options?.populateHistory) {
-						this.editor.addToHistory?.(textContent);
-					}
 				}
 				break;
-			}
-			case "assistant": {
-				const assistantComponent = new QuietAssistantMessage(
-					options?.round,
-					message,
-					this.hideThinkingBlock,
-					this.getMarkdownThemeWithSettings(),
-					this.hiddenThinkingLabel,
-					{
-						expanded: this.toolOutputExpanded,
-						// F2: the thinking lane must survive a rebuild too - without
-						// it, a compaction or chat-cap window rebuild silently collapses
-						// the traces the user had expanded.
-						thinkingExpanded: this.thinkingExpanded,
-						precededByToolActivity:
-							this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
-							this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
-						mermaidTransform: this.mermaidMarkdownTransform,
-						cwd: this.getCurrentCwd(),
-						// TUI v4: the replay path folds intermediate narration in quiet mode.
-						quiet: this.settingsManager.getProcessMode() === "quiet",
-					},
-				);
-				giveLane(assistantComponent, this.turnFlow.subagentLane.tracker.lane);
-				this.chatContainer.addChild(assistantComponent);
-				break;
-			}
-			case "toolResult": {
-				break;
-			}
-			default: {
-				const _exhaustive: never = message;
 			}
 		}
 	}

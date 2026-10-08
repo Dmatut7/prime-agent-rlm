@@ -402,8 +402,12 @@ export function mapStopReason(reason: FinishReason): StopReason {
 		case FinishReason.NO_IMAGE:
 			return "error";
 		default: {
+			// A finish reason the pinned SDK enum does not know yet (Google adds them
+			// between releases) must not throw away the completed answer: degrade to
+			// "error" and let the caller record the raw reason in stopReasonRaw.
 			const _exhaustive: never = reason;
-			throw new Error(`Unhandled stop reason: ${_exhaustive}`);
+			void _exhaustive;
+			return "error";
 		}
 	}
 }

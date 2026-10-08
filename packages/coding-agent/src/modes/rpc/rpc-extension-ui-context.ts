@@ -91,10 +91,13 @@ export function createRpcExtensionUiBridge(output: (request: RpcExtensionUIReque
 		notify: (message, notifyType) => fireAndForget({ method: "notify", message, notifyType }),
 		onTerminalInput: () => () => {},
 		setStatus: (statusKey, statusText) => fireAndForget({ method: "setStatus", statusKey, statusText }),
-		setWorkingMessage: (_message?: string) => {},
-		setWorkingVisible: (_visible: boolean) => {},
-		setWorkingIndicator: (_options?: WorkingIndicatorOptions) => {},
-		setHiddenThinkingLabel: (_label?: string) => {},
+		// The daemon face forwards these four over its wire; the RPC bridge used to
+		// sink them into no-ops. Emit them like the daemon does.
+		setWorkingMessage: (message?: string) => fireAndForget({ method: "setWorkingMessage", message }),
+		setWorkingVisible: (visible: boolean) => fireAndForget({ method: "setWorkingVisible", visible }),
+		setWorkingIndicator: (options?: WorkingIndicatorOptions) =>
+			fireAndForget({ method: "setWorkingIndicator", options }),
+		setHiddenThinkingLabel: (label?: string) => fireAndForget({ method: "setHiddenThinkingLabel", label }),
 		setWidget: (widgetKey: string, content: unknown, options?: ExtensionWidgetOptions) => {
 			if (content === undefined || Array.isArray(content)) {
 				fireAndForget({

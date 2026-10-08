@@ -131,7 +131,7 @@ describe("IPythonCellComponent diff rendering", () => {
 		const hiddenSummary = hidden.find((l) => l.includes("╰─ a.ts"));
 		expect(hiddenSummary).toBe("    ╰─ a.ts +1 −1");
 
-		const notLatest = renderCell({ ...state, editDiffsExpanded: false, showExpandHint: false }).split("\n");
+		const notLatest = renderCell({ ...state, editDiffsExpanded: false }).split("\n");
 		expect(notLatest.find((l) => l.includes("╰─ a.ts"))).toBe("    ╰─ a.ts +1 −1");
 		expect(hidden.some((l) => /1 - .*x/.test(l))).toBe(false);
 

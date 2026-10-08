@@ -478,6 +478,34 @@ describe("Agent", () => {
 		expect(agent.state.isStreaming).toBe(false);
 	});
 
+	it("redacts credential material from a synthesized run-failure errorMessage, like the diagnostics copy", async () => {
+		const agent = new Agent({
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("ok") });
+				});
+				return stream;
+			},
+		});
+		agent.subscribe((event) => {
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				throw new Error("Incorrect API key provided: sk-ant-a1b2c3d4e5f6g7h8"); // secret-scan: allow
+			}
+		});
+
+		await expect(agent.prompt("hello")).resolves.toBeUndefined();
+
+		const lastMessage = agent.state.messages.at(-1);
+		expect(lastMessage?.role).toBe("assistant");
+		if (lastMessage?.role !== "assistant") return;
+		expect(lastMessage.stopReason).toBe("error");
+		// The errorMessage is persisted and rendered; the key must not survive in it.
+		expect(lastMessage.errorMessage).not.toContain("sk-ant-a1b2c3d4e5f6g7h8"); // secret-scan: allow
+		expect(lastMessage.errorMessage).toContain("[REDACTED]");
+		expect(agent.state.errorMessage).not.toContain("sk-ant-a1b2c3d4e5f6g7h8"); // secret-scan: allow
+	});
+
 	it("should not drain steering messages when aborting before a queued poll", async () => {
 		const controller = new AbortController();
 		controller.abort();

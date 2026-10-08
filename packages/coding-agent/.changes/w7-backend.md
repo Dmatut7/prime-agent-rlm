@@ -1,0 +1,15 @@
+- Fixed the kernel reset notice printing "Restart 4 of at most 3" when a budget-exhausted death's notice was consumed by a later revival after the window slid.
+- Fixed the ipython cell claiming "N 张图片，见下方" when only placeholder metadata lines follow.
+- Fixed subagent preview text in agents-view being cut mid-emoji into a broken glyph.
+- Fixed ACP sessions silently dropping pasted resources sent as embedded blobs: image blobs now reach the model, other binaries are named in the prompt text.
+- Fixed ACP clients seeing nothing during the auto-retry backoff window; retry start/end now surface as namespaced metadata.
+- Fixed ACP emitting tool_call_update for a bash run the client never saw start.
+- Fixed RPC mode dropping the daemon's setWorkingMessage/setWorkingVisible/setWorkingIndicator/setHiddenThinkingLabel extension UI requests, and extensions running inside RPC mode now emit them too.
+- Fixed `prime-agent agents` and `prime-agent config` under a non-TTY silently doing nothing or leaking TUI escape frames; both now fail with a clear error.
+- Fixed `/update Prime-Agent` (capitalized) being read as a package name by the CLI while the TUI read it as a self-update.
+- Fixed the self-update receipt claiming "Updated to vY" when the installed version could not be read back; it now says the version could not be verified.
+- Fixed the self-update refusal text naming a "pi executable" instead of the current brand.
+- Fixed CLI error and warning text losing color when stdout is piped but stderr is a terminal.
+- Fixed cron job listings cutting the prompt preview mid-emoji and embedding labels with raw quotes or control characters.
+- Fixed a waiting-step label reading "等待 h 的结果" (the model's variable name) when the awaited handle is unknown; it now reads "等待命令结果".
+- Removed dead code: addMessageToChat's unreachable assistant/bashExecution/summary branches and dead options, the ipython cell's never-rendered showExpandHint field and dead aborted marker branch, and a redundant ternary in change merging.

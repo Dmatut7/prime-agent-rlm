@@ -20,7 +20,7 @@ need() {
         exit 1
     fi
 }
-need node "install Node.js 20+ first (https://nodejs.org)"
+need node "install Node.js 22.8+ first (https://nodejs.org)"
 need npm "comes with Node.js"
 need git "https://git-scm.com"
 

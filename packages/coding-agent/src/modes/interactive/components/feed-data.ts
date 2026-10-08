@@ -401,7 +401,7 @@ function displayPath(change: { path: string; relPath?: string }, cwd: string): s
 }
 
 function mergeKind(first: KernelFileChange["kind"], next: KernelFileChange["kind"]): KernelFileChange["kind"] {
-	if (next === "deleted") return first === "created" ? "deleted" : "deleted";
+	if (next === "deleted") return "deleted";
 	if (first === "created") return "created";
 	return next;
 }

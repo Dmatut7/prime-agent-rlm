@@ -288,6 +288,21 @@ describe("kernel reset notice freshness wording", () => {
 		expect(notice).toContain("must be rebuilt: unloadable");
 	});
 
+	it("reconciles the budget wording when the notice outlived the window it was recorded in", () => {
+		// The death that spends the budget (count 4 of 3) is terminal, but its pending
+		// notice survives in the ledger; when the window slides and a later revival
+		// consumes it, "Restart 4 of at most 3" must not be what the model reads.
+		const notice = formatKernelResetNotice({
+			...base,
+			restartCount: 4,
+			maxRestarts: 3,
+			windowMinutes: 10,
+		});
+		expect(notice).not.toContain("4 of at most 3");
+		expect(notice).toContain("Restart 4");
+		expect(notice).toContain("3 per 10 minutes");
+	});
+
 	it("omits the host bootstrap's internal names from the never-saved list", () => {
 		// Older payloads list the `_prime_agent_*` helpers and `_PrimeAgent*` wrapper
 		// classes as never-saved; the bootstrap re-binds them on every start, so a

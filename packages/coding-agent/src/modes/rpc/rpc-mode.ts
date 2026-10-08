@@ -156,7 +156,13 @@ async function runRpcModeWithConnectionInternal(
 				method === "setStatus" ||
 				method === "setWidget" ||
 				method === "setTitle" ||
-				method === "set_editor_text"
+				method === "set_editor_text" ||
+				// The daemon's fire-and-forget face; dropping them here left the RPC
+				// consumer four methods short of the daemon's own surface.
+				method === "setWorkingMessage" ||
+				method === "setWorkingVisible" ||
+				method === "setWorkingIndicator" ||
+				method === "setHiddenThinkingLabel"
 			) {
 				if (isDialogMethod(method)) {
 					pendingConnectionUiRequests.add(event.request.id);

@@ -1481,6 +1481,27 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(effects._command_summary(0, "\x1b[32mdone\x1b[0m\n"), "done")
         self.assertIsNone(effects._command_summary(0, ""))
 
+    def test_ansi_escape_strips_st_terminated_osc(self):
+        # An OSC terminated by ST (ESC \\) rather than BEL used to survive the
+        # wash, leaving its payload as visible litter in the step line.
+        self.assertEqual(effects._last_line("\x1b]0;window title\x1b\\done\n"), "done")
+        self.assertEqual(effects._command_summary(0, "\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\\n"), "link")
+        # The BEL-terminated shape keeps working (regression control).
+        self.assertEqual(effects._last_line("\x1b]0;t\x07done\n"), "done")
+
+    def test_command_step_tail_cut_never_splits_a_character(self):
+        # 中 is 3 bytes: pad so the rolling 2048-byte cap cuts it in half. The
+        # display used to decode the orphaned continuation bytes as U+FFFD.
+        chunk = b"a" + "中".encode() + b"b" * 2046
+        step = effects.CommandStep("true")
+        try:
+            step.output(chunk)
+            text = effects._decode_tail(step._tail)
+            self.assertNotIn("\ufffd", text)
+            self.assertTrue(text.endswith("b" * 100), text[-40:])
+        finally:
+            step._finished = True
+
 
     def test_sensitive_file_names(self):
         sensitive = [

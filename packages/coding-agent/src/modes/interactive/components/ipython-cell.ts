@@ -42,7 +42,6 @@ export interface IPythonCellState {
 	expanded?: boolean;
 	agentMessagesExpanded?: boolean;
 	editDiffsExpanded?: boolean;
-	showExpandHint?: boolean;
 	executionStarted?: boolean;
 	argsComplete?: boolean;
 	showImages?: boolean;
@@ -522,13 +521,14 @@ export class IPythonCellComponent implements Component {
 		switch (this.statusKind(details)) {
 			case "error":
 				return theme.fg("error", "✗");
-			case "aborted":
-				return theme.fg("warning", "✗");
 			case "done":
 				return theme.fg("success", "✓");
 			case "running":
 				return theme.fg("bashMode", workingIconFrame(getWorkingPulseFrame()));
-			default: // queued
+			default:
+				// "queued", and "aborted" — the interrupt gate above already returned for
+				// every aborted cell (the status only arrives with the settled result),
+				// so no case here can ever see one.
 				return theme.fg("muted", "◇");
 		}
 	}
@@ -736,8 +736,13 @@ export class IPythonCellComponent implements Component {
 
 		if (imageCount > 0) {
 			startOutput();
+			// The images below are always fallback placeholders (tool-execution mounts
+			// them fallbackOnly), so name what is actually there instead of promising
+			// a rendered picture.
 			const canRenderImages = this.state.showImages && !!getCapabilities().images;
-			const text = canRenderImages ? `${imageCount} 张图片，见下方` : `${imageCount} 张图片（这个终端无法显示）`;
+			const text = canRenderImages
+				? `${imageCount} 张图片（下方为占位信息）`
+				: `${imageCount} 张图片（这个终端无法显示）`;
 			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", text), width);
 		}
 		reportBudgetTruncatable(this, anyHeldBack);

@@ -13,6 +13,7 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { getLogger } from "@earendil-works/pi-ai";
 import { lockSync } from "proper-lockfile";
+import { sanitizeRowText, truncateGraphemes } from "../utils/display-text.js";
 import { StepCompensatedClock } from "./clock-step.js";
 import { isSessionInputRefusedBeforeDelivery } from "./prompt-admission.js";
 import {
@@ -1800,9 +1801,13 @@ export function nextRunAtForSchedule(schedule: AgentCronSchedule, after: Date): 
 export function formatAgentCronJob(job: AgentCronJob): string {
 	const next = job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : "-";
 	const last = job.lastRunAt ? new Date(job.lastRunAt).toLocaleString() : "-";
-	const preview = job.prompt.replace(/\s+/g, " ").slice(0, 80);
+	// The prompt preview is printed to a terminal: cut on a grapheme boundary so an
+	// astral character never leaves a U+FFFD half, and wash it like the label.
+	const preview = truncateGraphemes(sanitizeRowText(job.prompt), 80, "");
+	// The label sits inside double quotes: a raw quote or escape byte would break
+	// the field (and a terminal) — wash, then neutralize the quote.
+	const label = job.label ? ` label="${sanitizeRowText(job.label).replace(/"/g, "'")}"` : "";
 	const error = job.lastError ? ` error=${job.lastError}` : "";
-	const label = job.label ? ` label="${job.label}"` : "";
 	const skipped = job.lastSkippedAt ? ` skipped=${new Date(job.lastSkippedAt).toLocaleString()}` : "";
 	const deferred = job.lastDeferredAt
 		? ` deferred=${new Date(job.lastDeferredAt).toLocaleString()} defers=${job.deferCount ?? 0}`

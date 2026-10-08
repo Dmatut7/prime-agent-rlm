@@ -59,6 +59,8 @@ from collections import Counter, OrderedDict
 from collections.abc import Callable
 from typing import Any
 
+from ._utf8 import _utf8_leading_continuations
+
 FILE_CHANGE_MIME = "application/vnd.prime-agent.file-change+json"
 MEMORY_CHANGE_MIME = "application/vnd.prime-agent.memory-change+json"
 ACTIVITY_MIME = "application/vnd.prime-agent.activity+json"
@@ -160,7 +162,9 @@ _SKIP_SUFFIXES = (".pyc", ".pyo", ".swp", ".swx")
 _SKIP_FILE_NAMES = frozenset({".DS_Store"})
 # BSD `sed -i` (macOS) writes the new content to `.!<pid>!<name>` and renames it over the file.
 _SED_TEMP = re.compile(r"\.![0-9]+!.")
-_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+# CSI + OSC. The OSC content class excludes ESC as well as BEL: `[^\x07]*` would
+# swallow the ST terminator and everything after it. mcp.py's copy stays in sync.
+_ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?)")
 
 # Secrets are withheld from records: the host saves them with the session, so a diff or memory text
 # holding a credential would put it on disk. A withheld record keeps its path, kind and line counts.
@@ -955,6 +959,16 @@ def _last_line(text: str) -> str | None:
         if stripped:
             return _one_line(stripped, MAX_DETAIL)
     return None
+
+
+def _decode_tail(data: bytes) -> str:
+    """Decode a byte-capped rolling tail. The cap can cut a multi-byte character in
+    half; the orphaned continuation bytes at the cut decode as U+FFFD litter, so
+    drop them (the character's head bytes are already gone) before decoding."""
+    lead = _utf8_leading_continuations(data)
+    if lead:
+        data = data[lead:]
+    return data.decode("utf-8", "replace")
 
 
 def _command_summary(exit_code: int, output: str) -> str | None:
@@ -3085,7 +3099,7 @@ class CommandStep:
         """Send the newest output line; the caller holds the lock."""
         if self._background or self._finished:
             return  # a running update must never follow the outcome, or land in a later cell
-        line = _last_line(self._tail.decode("utf-8", "replace"))
+        line = _last_line(_decode_tail(self._tail))
         if line:
             self._step.update(line)
 

@@ -844,7 +844,9 @@ export async function processResponsesStream<TApi extends Api>(
 				}
 			}
 		} else if (event.type === "error") {
-			throw new StreamFailureError(`Error Code ${event.code}: ${event.message}`, {
+			// The code is nullable on the wire: "Error Code null: …" reads as a bug, not a failure.
+			const prefix = event.code ? `Error Code ${event.code}` : "Error";
+			throw new StreamFailureError(`${prefix}: ${event.message}`, {
 				kind: classifyStreamFailure(event.code ?? undefined),
 				providerErrorType: event.code ?? undefined,
 			});

@@ -580,7 +580,6 @@ export class ToolExecutionComponent extends Container implements FocusableBlock 
 					editDiffsExpanded: this.editDiffsExpanded,
 					executionStarted: this.executionStarted,
 					argsComplete: this.argsComplete,
-					showExpandHint: this.showExpandHint,
 					showImages: this.showImages,
 					cwd: this.cwd,
 				};

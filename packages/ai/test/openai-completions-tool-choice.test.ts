@@ -465,6 +465,45 @@ describe("openai-completions tool_choice", () => {
 		expect(response.errorMessage).toBe("Provider finish_reason: network_error");
 	});
 
+	it("records the raw finish_reason when it maps to an error stop", async () => {
+		mockState.chunks = [
+			{
+				id: "chatcmpl-test",
+				choices: [{ delta: { content: "partial" }, finish_reason: null }],
+			},
+			{
+				id: "chatcmpl-test",
+				choices: [{ delta: {}, finish_reason: "some_future_reason" }],
+				usage: {
+					prompt_tokens: 1,
+					completion_tokens: 1,
+					prompt_tokens_details: { cached_tokens: 0 },
+					completion_tokens_details: { reasoning_tokens: 0 },
+				},
+			},
+		];
+
+		const model = getZaiTestModel({ toolStream: true });
+		const response = await streamSimple(
+			model,
+			{
+				messages: [
+					{
+						role: "user",
+						content: "Hi",
+						timestamp: Date.now(),
+					},
+				],
+			},
+			{ apiKey: "test" },
+		).result();
+
+		expect(response.stopReason).toBe("error");
+		expect(response.errorMessage).toBe("Provider finish_reason: some_future_reason");
+		// The raw reason is what downstream classification and the retry ladder read.
+		expect(response.stopReasonRaw).toBe("some_future_reason");
+	});
+
 	it("ignores null stream chunks from openai-compatible providers", async () => {
 		mockState.chunks = [
 			null,
