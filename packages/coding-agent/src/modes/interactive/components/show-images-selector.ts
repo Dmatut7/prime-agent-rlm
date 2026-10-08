@@ -1,6 +1,7 @@
 import { Container, type SelectItem, SelectList, type SelectListLayoutOptions } from "@earendil-works/pi-tui";
 import { getSelectListTheme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
+import { shouldTreatAsBack } from "./modal-back.js";
 
 const SHOW_IMAGES_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 	minPrimaryColumnWidth: 12,
@@ -39,5 +40,14 @@ export class ShowImagesSelectorComponent extends Container {
 
 	getSelectList(): SelectList {
 		return this.selectList;
+	}
+
+	handleInput(data: string): void {
+		// No text field here: left is back, like every other selector.
+		if (shouldTreatAsBack(data)) {
+			this.selectList.onCancel?.();
+			return;
+		}
+		this.selectList.handleInput(data);
 	}
 }

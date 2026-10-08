@@ -12956,7 +12956,9 @@ export class InteractiveMode {
 					this.ui.requestRender();
 				},
 			);
-			return { component: selector, focus: selector.getSelectList() };
+			// The component (not the bare SelectList) takes focus so its back-key
+			// branch runs before the list's own key handling.
+			return { component: selector, focus: selector };
 		});
 	}
 

@@ -1,7 +1,11 @@
+import { setKeybindings } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
+import { KeybindingsManager } from "../src/core/keybindings.js";
 import { UserMessageSelectorComponent } from "../src/modes/interactive/components/user-message-selector.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
+
+const LEFT = "\x1b[D";
 
 describe("UserMessageSelectorComponent height budget", () => {
 	beforeAll(() => {
@@ -83,5 +87,33 @@ describe("UserMessageSelectorComponent height budget", () => {
 		const messageLines = selector.render(100).filter((line) => line.includes("第 ") && line.includes(" 条"));
 
 		expect(messageLines.length).toBe(1);
+	});
+});
+
+describe("UserMessageSelectorComponent back key", () => {
+	beforeAll(() => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+	});
+
+	it("closes on the back key like esc", () => {
+		const onCancel = vi.fn();
+		const selector = new UserMessageSelectorComponent(
+			[
+				{ id: "m-1", text: "fork me" },
+				{ id: "m-2", text: "or me" },
+			],
+			() => {},
+			onCancel,
+		);
+		const list = selector.getMessageList();
+
+		list.handleInput(LEFT);
+
+		expect(onCancel).toHaveBeenCalledOnce();
+
+		list.handleInput("\x1b");
+
+		expect(onCancel).toHaveBeenCalledTimes(2);
 	});
 });

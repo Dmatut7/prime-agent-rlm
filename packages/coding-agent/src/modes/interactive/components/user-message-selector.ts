@@ -2,6 +2,7 @@ import { type Component, Container, getKeybindings, Spacer, Text, truncateToWidt
 import { sanitizeRowText } from "../../../utils/display-text.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
+import { shouldTreatAsBack } from "./modal-back.js";
 
 interface UserMessageItem {
 	id: string;
@@ -94,7 +95,7 @@ class UserMessageList implements Component {
 			if (selected && this.onSelect) {
 				this.onSelect(selected.id);
 			}
-		} else if (kb.matches(keyData, "tui.select.cancel")) {
+		} else if (kb.matches(keyData, "tui.select.cancel") || shouldTreatAsBack(keyData)) {
 			if (this.onCancel) {
 				this.onCancel();
 			}

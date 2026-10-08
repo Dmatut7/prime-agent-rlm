@@ -1,7 +1,9 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model, ServiceTier } from "@earendil-works/pi-ai";
 import type { AutocompleteItem, Component } from "@earendil-works/pi-tui";
+import { setKeybindings } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import { KeybindingsManager } from "../src/core/keybindings.js";
 import { ThinkingSelectorComponent } from "../src/modes/interactive/components/thinking-selector.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
@@ -153,6 +155,7 @@ function makeContext(overrides: Partial<EffortCommandContext> = {}): EffortComma
 describe("InteractiveMode /effort", () => {
 	beforeAll(() => {
 		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
 	});
 
 	describe("argument autocomplete", () => {
@@ -227,6 +230,28 @@ describe("InteractiveMode /effort", () => {
 
 			expect(done).toHaveBeenCalledOnce();
 			expect(context.agentConnection.setThinkingLevel).toHaveBeenCalledWith("high");
+		});
+
+		it("focuses the selector component so the back key closes it like esc", () => {
+			let focus: Component | undefined;
+			let component: Component | undefined;
+			const done = vi.fn();
+			const context = makeContext({
+				showSelector: (create) => {
+					const result = create(done);
+					component = result.component;
+					focus = result.focus;
+				},
+			});
+
+			interactiveModePrototype.handleEffortCommand.call(context, "");
+
+			expect(component).toBeInstanceOf(ThinkingSelectorComponent);
+			expect(focus).toBe(component);
+
+			focus?.handleInput?.("\x1b[D");
+
+			expect(done).toHaveBeenCalledOnce();
 		});
 
 		it("reports when the model does not support thinking", () => {
