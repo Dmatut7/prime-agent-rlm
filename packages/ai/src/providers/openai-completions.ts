@@ -37,7 +37,12 @@ import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
-import { recordStreamFailure, StreamFailureError } from "../utils/stream-failure.js";
+import {
+	recordStreamFailure,
+	StreamFailureError,
+	streamFailureFromStopReason,
+	truncateRawPayload,
+} from "../utils/stream-failure.js";
 import { finalizeThrottledStreamingJson, updateThrottledStreamingJson } from "../utils/streaming-json-throttle.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
@@ -526,6 +531,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 
 			let accumulatedUsage: ChunkUsageFrame | undefined;
 			let sawFinishReason = false;
+			// OpenAI streams a refusal on its own delta channel (`delta.refusal`)
+			// while content stays empty; accumulate it so the refusal is classified
+			// instead of being misread as an empty response worth retrying.
+			let refusalText = "";
 			for await (const chunk of openaiStream) {
 				if (!chunk || typeof chunk !== "object") continue;
 
@@ -562,6 +571,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				}
 
 				if (choice.delta) {
+					const refusalDelta = (choice.delta as Record<string, unknown>).refusal;
+					if (typeof refusalDelta === "string" && refusalDelta.length > 0) {
+						refusalText += refusalDelta;
+					}
 					if (
 						choice.delta.content !== null &&
 						choice.delta.content !== undefined &&
@@ -710,6 +723,16 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 
 			if (output.stopReason === "aborted") {
 				throw new Error("Request was aborted");
+			}
+			// A refusal arrives on the delta.refusal channel with an empty content
+			// stream and (usually) finish_reason "stop": without this check the turn
+			// looks like a clean-but-empty completion and the retry ladder burns the
+			// whole policy on a deterministic "no". Surface it as a classified
+			// refusal instead (permanent, never retried).
+			if (refusalText) {
+				output.stopReason = "error";
+				output.stopReasonRaw = "refusal";
+				throw streamFailureFromStopReason("refusal", { detail: truncateRawPayload(refusalText) });
 			}
 			if (output.stopReason === "error") {
 				throw new Error(output.errorMessage || "Provider returned an error stop reason");

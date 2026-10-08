@@ -1,6 +1,8 @@
 import { COPILOT_CLIENT_HEADERS, COPILOT_CLIENT_USER_AGENT } from "../../copilot-client-version.js";
 import { getModels } from "../../models.js";
 import type { Api, Model } from "../../types.js";
+import { redactSecrets } from "../redact.js";
+import { truncateRawPayload } from "../stream-failure.js";
 import type { OAuthCredentials, OAuthLoginCallbacks, OAuthProviderInterface } from "./types.js";
 
 type CopilotCredentials = OAuthCredentials & {
@@ -84,7 +86,9 @@ async function fetchJson(url: string, init: RequestInit): Promise<unknown> {
 	const response = await fetch(url, init);
 	if (!response.ok) {
 		const text = await response.text();
-		throw new Error(`${response.status} ${response.statusText}: ${text}`);
+		// The body can echo the bearer token back; redact and cap it before it
+		// reaches the login overlay's error line.
+		throw new Error(`${response.status} ${response.statusText}: ${truncateRawPayload(redactSecrets(text))}`);
 	}
 	return response.json();
 }

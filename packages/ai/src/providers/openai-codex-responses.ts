@@ -415,9 +415,22 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						code: info.code,
 						status: response.status,
 						payload: { status: response.status },
+						// A usage-limit body carries resets_at; hand it to the classified
+						// diagnostic so the retry ladder waits for the reset instead of
+						// hammering the endpoint with exponential backoff.
+						...(info.retryAfterMs !== undefined ? { retryAfterMs: info.retryAfterMs } : {}),
 						// Attach the upstream text so the classified message keeps it
-						// as (redacted) detail, like the SDK-backed providers.
-						...(info.body ? { error: info.body } : info.message ? { error: { message: info.message } } : {}),
+						// as (redacted) detail, like the SDK-backed providers. When a
+						// friendly usage-limit message exists it is the detail: it names
+						// the plan and the reset time, the raw upstream message does not.
+						...(info.body || info.friendlyMessage || info.message
+							? {
+									error: {
+										...info.body,
+										message: info.friendlyMessage ?? info.body?.message ?? info.message ?? "",
+									},
+								}
+							: {}),
 					});
 				} catch (error) {
 					if (error instanceof RetryDelayCapError) {
@@ -655,6 +668,8 @@ class CodexApiError extends Error {
 	/** Usage carried by a response.failed frame; the failed attempt's tokens are still billed. */
 	readonly usage?: ResponsesUsageFrame;
 	readonly serviceTier?: ResponseCreateParamsStreaming["service_tier"];
+	/** Server-stated wait before retrying (from a usage-limit body's resets_at), in milliseconds. */
+	readonly retryAfterMs?: number;
 
 	constructor(
 		message: string,
@@ -665,6 +680,7 @@ class CodexApiError extends Error {
 			error?: { code?: string; type?: string; message?: string };
 			usage?: ResponsesUsageFrame;
 			serviceTier?: ResponseCreateParamsStreaming["service_tier"];
+			retryAfterMs?: number;
 			cause?: unknown;
 		},
 	) {
@@ -676,6 +692,7 @@ class CodexApiError extends Error {
 		this.error = options?.error;
 		this.usage = options?.usage;
 		this.serviceTier = options?.serviceTier;
+		this.retryAfterMs = options?.retryAfterMs;
 		this.cause = options?.cause;
 	}
 }
@@ -1509,12 +1526,14 @@ async function parseErrorResponse(response: Response): Promise<{
 	friendlyMessage?: string;
 	code?: string;
 	body?: { code?: string; type?: string; message?: string };
+	retryAfterMs?: number;
 }> {
 	const raw = await response.text();
 	let message = raw || response.statusText || "Request failed";
 	let friendlyMessage: string | undefined;
 	let code: string | undefined;
 	let body: { code?: string; type?: string; message?: string } | undefined;
+	let retryAfterMs: number | undefined;
 
 	try {
 		const parsed = JSON.parse(raw) as {
@@ -1534,6 +1553,11 @@ async function parseErrorResponse(response: Response): Promise<{
 				const when = mins !== undefined ? ` Try again in ~${mins} min.` : "";
 				friendlyMessage = `You have hit your ChatGPT usage limit${plan}.${when}`.trim();
 			}
+			// resets_at is epoch seconds; the retry ladder's consumer reads
+			// retryAfterMs off the classified diagnostic, so translate it here.
+			if (typeof err.resets_at === "number" && Number.isFinite(err.resets_at)) {
+				retryAfterMs = Math.max(0, err.resets_at * 1000 - Date.now());
+			}
 			message = err.message || friendlyMessage || message;
 			if (resolvedCode) code = resolvedCode;
 			if (err.message) body = { code: err.code, type: err.type, message: err.message };
@@ -1542,7 +1566,7 @@ async function parseErrorResponse(response: Response): Promise<{
 		// Unparseable error body: fall back to the raw message.
 	}
 
-	return { message, friendlyMessage, code, body };
+	return { message, friendlyMessage, code, body, retryAfterMs };
 }
 
 function extractAccountId(token: string): string {

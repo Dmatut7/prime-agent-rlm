@@ -17,6 +17,8 @@ if (typeof process !== "undefined" && (process.versions?.node || process.version
 	});
 }
 
+import { redactSecrets } from "../redact.js";
+import { truncateRawPayload } from "../stream-failure.js";
 import { oauthErrorHtml, oauthSuccessHtml } from "./oauth-page.js";
 import { generatePKCE } from "./pkce.js";
 import type { OAuthCredentials, OAuthLoginCallbacks, OAuthPrompt, OAuthProviderInterface } from "./types.js";
@@ -128,10 +130,13 @@ async function exchangeAuthorizationCode(
 
 	if (!response.ok) {
 		const text = await response.text().catch(() => "");
+		// The body can echo the authorization code or verifier back; redact and
+		// cap it before it reaches the login overlay's error line.
+		const safeText = truncateRawPayload(redactSecrets(text));
 		return {
 			type: "failed",
 			status: response.status,
-			message: `OpenAI Codex token exchange failed (${response.status}): ${text || response.statusText}`,
+			message: `OpenAI Codex token exchange failed (${response.status}): ${safeText || response.statusText}`,
 		};
 	}
 
@@ -173,10 +178,11 @@ async function refreshAccessToken(refreshToken: string): Promise<TokenResult> {
 
 		if (!response.ok) {
 			const text = await response.text().catch(() => "");
+			const safeText = truncateRawPayload(redactSecrets(text));
 			return {
 				type: "failed",
 				status: response.status,
-				message: `OpenAI Codex token refresh failed (${response.status}): ${text || response.statusText}`,
+				message: `OpenAI Codex token refresh failed (${response.status}): ${safeText || response.statusText}`,
 			};
 		}
 

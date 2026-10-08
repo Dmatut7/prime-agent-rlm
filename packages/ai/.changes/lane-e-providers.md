@@ -1,0 +1,4 @@
+- Fixed Anthropic SSE parse failures pasting the full raw frame (twice, unbounded) into the error message; the message now carries a truncated excerpt and the raw frame stays on the structured diagnostic.
+- Fixed Codex usage-limit errors dropping the friendly plan/reset message and never converting `resets_at` into `retryAfterMs`, so the retry ladder now waits for the stated reset and the error names the plan and reset time.
+- Fixed OAuth login errors (Anthropic, GitHub Copilot, OpenAI Codex) leaking full stack traces and unbounded, unredacted response bodies onto the login overlay; bodies are now redacted and capped, stacks dropped.
+- Fixed openai-completions providers ignoring the `delta.refusal` channel, which misdiagnosed model refusals as empty responses and burned the whole retry ladder; refusals now surface as a classified permanent refusal error with the refusal text.

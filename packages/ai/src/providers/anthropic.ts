@@ -519,9 +519,12 @@ async function* iterateAnthropicEvents(
 			yield event;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
+			// The message is user-facing (it becomes errorMessage), so it carries only
+			// the truncated data frame; the full raw frame stays on info.raw for the
+			// post-mortem diagnostic instead of being pasted twice, unbounded.
 			throw new StreamFailureError(
-				`Could not parse Anthropic SSE event ${sse.event}: ${message}; data=${sse.data}; raw=${sse.raw.join("\\n")}`,
-				{ kind: "malformed_response", requestId, raw: truncateRawPayload(sse.data) },
+				`Could not parse Anthropic SSE event ${sse.event}: ${message}; data=${truncateRawPayload(sse.data)}`,
+				{ kind: "malformed_response", requestId, raw: truncateRawPayload(sse.raw.join("\n")) },
 			);
 		}
 	}

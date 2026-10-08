@@ -6,6 +6,8 @@
  */
 
 import type { Server } from "node:http";
+import { redactSecrets } from "../redact.js";
+import { truncateRawPayload } from "../stream-failure.js";
 import { oauthErrorHtml, oauthSuccessHtml } from "./oauth-page.js";
 import { generatePKCE } from "./pkce.js";
 import type { OAuthCredentials, OAuthLoginCallbacks, OAuthPrompt, OAuthProviderInterface } from "./types.js";
@@ -80,6 +82,8 @@ function parseAuthorizationInput(input: string): { code?: string; state?: string
 
 function formatErrorDetails(error: unknown): string {
 	if (error instanceof Error) {
+		// No stack: this text lands on the login overlay's error line, where a
+		// multi-line stack trace drowns the actual cause.
 		const details: string[] = [`${error.name}: ${error.message}`];
 		const errorWithCode = error as Error & { code?: string; errno?: number | string; cause?: unknown };
 		if (errorWithCode.code) details.push(`code=${errorWithCode.code}`);
@@ -87,12 +91,14 @@ function formatErrorDetails(error: unknown): string {
 		if (typeof error.cause !== "undefined") {
 			details.push(`cause=${formatErrorDetails(error.cause)}`);
 		}
-		if (error.stack) {
-			details.push(`stack=${error.stack}`);
-		}
 		return details.join("; ");
 	}
 	return String(error);
+}
+
+/** A token endpoint's error body can echo the code/verifier back; redact and cap it before display. */
+function safeResponseBody(body: string): string {
+	return truncateRawPayload(redactSecrets(body));
 }
 
 async function startCallbackServer(expectedState: string): Promise<CallbackServerInfo> {
@@ -180,7 +186,9 @@ async function postJson(url: string, body: Record<string, string | number>): Pro
 	const responseBody = await response.text();
 
 	if (!response.ok) {
-		throw new Error(`HTTP request failed. status=${response.status}; url=${url}; body=${responseBody}`);
+		throw new Error(
+			`HTTP request failed. status=${response.status}; url=${url}; body=${safeResponseBody(responseBody)}`,
+		);
 	}
 
 	return responseBody;
@@ -213,7 +221,7 @@ async function exchangeAuthorizationCode(
 		tokenData = JSON.parse(responseBody) as { access_token: string; refresh_token: string; expires_in: number };
 	} catch (error) {
 		throw new Error(
-			`Token exchange returned invalid JSON. url=${TOKEN_URL}; body=${responseBody}; details=${formatErrorDetails(error)}`,
+			`Token exchange returned invalid JSON. url=${TOKEN_URL}; body=${safeResponseBody(responseBody)}; details=${formatErrorDetails(error)}`,
 		);
 	}
 
@@ -367,7 +375,7 @@ export async function refreshAnthropicToken(refreshToken: string): Promise<OAuth
 		};
 	} catch (error) {
 		throw new Error(
-			`Anthropic token refresh returned invalid JSON. url=${TOKEN_URL}; body=${responseBody}; details=${formatErrorDetails(error)}`,
+			`Anthropic token refresh returned invalid JSON. url=${TOKEN_URL}; body=${safeResponseBody(responseBody)}; details=${formatErrorDetails(error)}`,
 		);
 	}
 
