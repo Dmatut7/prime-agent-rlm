@@ -4604,9 +4604,25 @@ export class DaemonSupervisor {
 				throw error;
 			}
 			throwIfAdmissionCancelled(admission);
+			// rename/set_session_name/cron_add/cron_cancel forward the caller's selector
+			// verbatim: the worker resolver has matched sessionId/sessionName/suffix since
+			// the daemon session manager existed, and the resolved id only serves admission
+			// bookkeeping and kill targeting (neither applies to these types). Rewriting it
+			// replaced the user's words with an internal UUID in worker-facing errors, and
+			// for a passivated row pinned the forward to a session id the worker no longer
+			// holds resident. cron_add/cron_cancel currently never reach this path (their
+			// dedicated handlers already forward the command unmodified); they are listed
+			// so the invariant survives a future dispatch-table change.
+			const preservesSelector =
+				command.type === "rename" ||
+				command.type === "set_session_name" ||
+				command.type === "cron_add" ||
+				command.type === "cron_cancel";
 			const resolvedCommand = {
 				...command,
-				activeSessionId: match.summary.activeSessionId ?? match.summary.id,
+				activeSessionId: preservesSelector
+					? command.activeSessionId
+					: (match.summary.activeSessionId ?? match.summary.id),
 				...(admission ? { admissionId: admission.workerAdmissionId } : {}),
 			} as DaemonCommand;
 			if (admission) {

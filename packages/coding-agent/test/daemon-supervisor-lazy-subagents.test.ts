@@ -10,7 +10,7 @@ import {
 import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
-import { success } from "../src/modes/daemon/daemon-protocol.js";
+import { failure, success } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
@@ -845,5 +845,109 @@ describe("daemon supervisor passive subagent topology", () => {
 			supervisor.workers.clear();
 			await supervisor.cleanupSupervisorResources();
 		}
+	});
+
+	it("forwards the user's selector, not the resolved session id, when renaming a passive row", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-passive-rename-selector-"));
+		tempDirs.push(directory);
+		// The passivated roster shape: activeSessionId is stripped and id collapses to
+		// the session id, so a resolved-id rewrite forwards a UUID the user never typed.
+		const passive = summary({
+			id: "passive-session",
+			sessionId: "passive-session",
+			sessionFile: join(directory, "passive.jsonl"),
+			sessionName: "resting-worker",
+			runtimeKind: "subagent",
+			rlmChildId: "passive-child",
+			parentSessionPath: join(directory, "parent.jsonl"),
+			rlmDepth: 1,
+		});
+		const renamed = { ...passive, activeSessionId: "passive-session", sessionName: "woken-worker" };
+		const resident = worker("host", [passive]);
+		resident.client.request.mockResolvedValue(success(undefined, "rename", renamed));
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir: join(directory, "workers"),
+			// test-hygiene-allow: same frozen SupervisorInternals fixture as this file's baseline stock; no public seam seeds workers+roster
+		}) as unknown as SupervisorInternals;
+		supervisor.workers.set("host", resident);
+		seedSupervisorRoster(supervisor, resident);
+		Object.assign(supervisor, { catalog: { list: vi.fn(async () => []) } });
+		const client = { id: "client", attachedActiveSessionIds: new Set<string>() };
+
+		await expect(
+			supervisor.handleCommand(client, { type: "rename", activeSessionId: "resting-worker", name: "woken-worker" }),
+		).resolves.toMatchObject({ success: true });
+		expect(resident.client.request).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "rename", activeSessionId: "resting-worker", name: "woken-worker" }),
+			expect.any(Number),
+		);
+	});
+
+	it("reports a failed passive-row rename in the user's words, not the resolved session id", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-passive-rename-error-"));
+		tempDirs.push(directory);
+		const passive = summary({
+			id: "passive-session",
+			sessionId: "passive-session",
+			sessionFile: join(directory, "passive.jsonl"),
+			sessionName: "resting-worker",
+			runtimeKind: "subagent",
+			rlmChildId: "passive-child",
+			parentSessionPath: join(directory, "parent.jsonl"),
+			rlmDepth: 1,
+		});
+		const resident = worker("host", [passive]);
+		// The worker can only name what it was handed: echo the forwarded selector back
+		// the way getSessionState/resolveActiveSessionState reports an unknown target.
+		resident.client.request.mockImplementation(async (command: { type: string; activeSessionId?: string }) =>
+			failure(undefined, command.type, `Unknown active session: ${command.activeSessionId}`),
+		);
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir: join(directory, "workers"),
+			// test-hygiene-allow: same frozen SupervisorInternals fixture as this file's baseline stock; no public seam seeds workers+roster
+		}) as unknown as SupervisorInternals;
+		supervisor.workers.set("host", resident);
+		seedSupervisorRoster(supervisor, resident);
+		Object.assign(supervisor, { catalog: { list: vi.fn(async () => []) } });
+		const client = { id: "client", attachedActiveSessionIds: new Set<string>() };
+
+		await expect(
+			supervisor.handleCommand(client, { type: "rename", activeSessionId: "resting-worker", name: "woken-worker" }),
+		).resolves.toMatchObject({ success: false, error: "Unknown active session: resting-worker" });
+	});
+
+	it("forwards the user's name selector when renaming a resident row", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-resident-rename-selector-"));
+		tempDirs.push(directory);
+		const residentSummary = summary({
+			id: "resident-active",
+			activeSessionId: "resident-active",
+			sessionId: "resident-session",
+			sessionName: "live-worker",
+			rlmDepth: 0,
+		});
+		const resident = worker("host", [residentSummary]);
+		resident.client.request.mockResolvedValue(
+			success(undefined, "rename", { ...residentSummary, sessionName: "renamed-live" }),
+		);
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir: join(directory, "workers"),
+			// test-hygiene-allow: same frozen SupervisorInternals fixture as this file's baseline stock; no public seam seeds workers+roster
+		}) as unknown as SupervisorInternals;
+		supervisor.workers.set("host", resident);
+		seedSupervisorRoster(supervisor, resident);
+		Object.assign(supervisor, { catalog: { list: vi.fn(async () => []) } });
+		const client = { id: "client", attachedActiveSessionIds: new Set<string>() };
+
+		await expect(
+			supervisor.handleCommand(client, { type: "rename", activeSessionId: "live-worker", name: "renamed-live" }),
+		).resolves.toMatchObject({ success: true });
+		expect(resident.client.request).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "rename", activeSessionId: "live-worker", name: "renamed-live" }),
+			expect.any(Number),
+		);
 	});
 });

@@ -5340,7 +5340,9 @@ export class AgentDaemon {
 	private async handleRename(
 		command: Extract<DaemonCommand, { type: "rename" }>,
 	): Promise<DaemonResponse | undefined> {
-		const state = this.getSessionState(command.activeSessionId);
+		// A passivated child is still roster-addressable: hydrate it the way attach does
+		// instead of failing its selector as unknown.
+		const state = await this.getOrHydrateBoundSessionState(command.activeSessionId);
 		const name = sanitizeSessionName(command.name).trim();
 		if (!name) {
 			throw new Error("Session name cannot be empty");
@@ -6191,7 +6193,9 @@ export class AgentDaemon {
 	private async handleCronAdd(
 		command: Extract<DaemonCommand, { type: "cron_add" }>,
 	): Promise<DaemonResponse | undefined> {
-		const state = this.getSessionState(command.activeSessionId);
+		// Same hydration as rename: a passivated child takes scheduled jobs too, and the
+		// artifact store keeps them across the re-passivation the idle sweep applies later.
+		const state = await this.getOrHydrateBoundSessionState(command.activeSessionId);
 		const job = this.createCronJobForState(state, command.schedule, command.prompt);
 		this.scheduleRosterFlush();
 		return success(command.id, "cron_add", { job });

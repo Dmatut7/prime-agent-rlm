@@ -6013,6 +6013,77 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("renames a passivated child addressed by name through hydration", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passive-rename-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			expect(
+				[...internals.sessions.values()].some(
+					(state) => state.runtime.session.sessionFile === fixture.childSessionFile,
+				),
+			).toBe(false);
+
+			const response = (await internals.handleCommand(makeClient("client-1", parentState.activeSessionId), {
+				id: "rename-1",
+				type: "rename",
+				activeSessionId: "renamed-worker",
+				name: "awakened-worker",
+			})) as { success: boolean; data?: { sessionName?: string } };
+
+			expect(response.success).toBe(true);
+			expect(response.data?.sessionName).toBe("awakened-worker");
+			expect((await readSessionInfo(fixture.childSessionFile))?.name).toBe("awakened-worker");
+			const hydratedChildren = [...internals.sessions.values()].filter(
+				(state) => state.runtime.session.sessionFile === fixture.childSessionFile,
+			);
+			expect(hydratedChildren).toHaveLength(1);
+			expect(fixture.createRuntime).toHaveBeenCalledTimes(2);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("adds a cron job for a passivated child addressed by name through hydration", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passive-cron-add-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				cronStore: AgentCronJobStore;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const childInfo = await readSessionInfo(fixture.childSessionFile);
+			if (!childInfo) throw new Error("Missing child session info");
+
+			const response = (await internals.handleCommand(makeClient("client-1", parentState.activeSessionId), {
+				id: "cron-1",
+				type: "cron_add",
+				activeSessionId: "renamed-worker",
+				schedule: "every 1h",
+				prompt: "check in",
+			})) as { success: boolean; data?: { job: AgentCronJob } };
+
+			expect(response.success).toBe(true);
+			const job = response.data?.job;
+			expect(job).toMatchObject({
+				sessionId: childInfo.id,
+				sessionFile: fixture.childSessionFile,
+				cwd: tempDir,
+				runtimeKind: "subagent",
+			});
+			expect(internals.cronStore.list().map((candidate) => candidate.id)).toContain(job?.id);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("leaves passive hydration resident when its runtime-open guard is cancelled", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-guarded-hydration-"));
 		let releaseHydration!: () => void;
