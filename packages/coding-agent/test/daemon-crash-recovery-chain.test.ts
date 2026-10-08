@@ -233,7 +233,12 @@ describe("daemon crash recovery chain", () => {
 			},
 		]);
 		// The journal is resolved, so the corpse is not kept for its unconsumed records.
-		for (const record of WorkerRecoveryJournal.readLatest(journalPath)) {
+		// The records are the recovery code's own output, not a fixture: guard the
+		// collection first, so a resolve that drops the journal (readLatest -> [])
+		// cannot pass this vacuously.
+		const settled = WorkerRecoveryJournal.readLatest(journalPath);
+		expect(settled.length).toBeGreaterThan(0);
+		for (const record of settled) {
 			expect(record.busy).toBe(false);
 			expect(record.operation).toBe("recovery_hold");
 		}
@@ -394,7 +399,12 @@ describe("daemon crash recovery chain", () => {
 			},
 		]);
 		// The journal is resolved, so the corpse is not kept for its unconsumed records.
-		for (const record of WorkerRecoveryJournal.readLatest(journalPath)) {
+		// The records are the recovery code's own output, not a fixture: guard the
+		// collection first, so a resolve that drops the journal (readLatest -> [])
+		// cannot pass this vacuously.
+		const settled = WorkerRecoveryJournal.readLatest(journalPath);
+		expect(settled.length).toBeGreaterThan(0);
+		for (const record of settled) {
 			expect(record.busy).toBe(false);
 			expect(record.operation).toBe("recovery_hold");
 		}

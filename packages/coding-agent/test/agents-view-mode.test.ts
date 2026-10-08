@@ -111,6 +111,22 @@ function invoke(method: string, self: object, ...args: unknown[]): unknown {
 	return member.call(self, ...args);
 }
 
+// Seeding row/selection state reaches members the public surface (run/handleInput/
+// render/invalidate) only touches through the daemon roster machinery, which these
+// unit tests deliberately bypass. The guard refuses a member the class no longer
+// declares, so a rename fails loudly here instead of silently seeding a ghost state
+// the production code never reads.
+// test-hygiene-allow:AgentsViewMode exposes no public seam for seeding rows/selection; this presence-checked probe stands in for one and throws on rename.
+function seedRowState(view: AgentsViewMode, rows: AgentsViewRow[], selectedIndex = 0): void {
+	for (const key of ["rows", "selectedIndex"] as const) {
+		if (!(key in view)) {
+			throw new Error(`AgentsViewMode no longer declares "${key}"; update the row-seeding probe`);
+		}
+	}
+	Reflect.set(view, "rows", rows);
+	Reflect.set(view, "selectedIndex", selectedIndex);
+}
+
 const settingsManager = {
 	getTheme: () => "dark",
 	getShowHardwareCursor: () => false,
@@ -1067,7 +1083,7 @@ describe("AgentsViewMode", () => {
 			}),
 		]);
 		const view = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, {});
-		Reflect.set(view, "rows", rows);
+		seedRowState(view, rows);
 
 		try {
 			expect(invoke("renderRow", view, rows[0], 160)).toContain("recovering");
@@ -1452,40 +1468,48 @@ describe("agents view reply draft guard and delete confirmation cleanup", () => 
 			sessionFile: "/tmp/sessions/saved-1.jsonl",
 			rosterStatus: "inactive",
 		});
-		Reflect.set(view, "rows", buildAgentsViewRows([saved]));
-		Reflect.set(view, "selectedIndex", 0);
+		seedRowState(view, buildAgentsViewRows([saved]));
 		return view;
 	}
 
-	function editorText(view: AgentsViewMode): string {
-		return (Reflect.get(view, "editor") as { getText(): string }).getText();
+	function rendered(view: AgentsViewMode): string {
+		return stripAnsi(view.render(160).join("\n")).replace(/\x1b_[^\x07]*\x07/g, "");
 	}
 
-	it("keeps a non-empty reply draft when Left is pressed and disarms only an empty draft", async () => {
+	// The composer header line is the observable reply state: the search placeholder
+	// while no target is armed, the reply prompt once one is.
+	function composerHeader(view: AgentsViewMode): string {
+		return (
+			rendered(view)
+				.split("\n")
+				.find((line) => line.includes("›")) ?? ""
+		);
+	}
+
+	it("keeps a non-empty reply draft when Left is pressed and disarms only an empty draft", () => {
 		const view = savedRowView();
 		try {
-			await invoke("toggleReplyTarget", view);
-			expect(Reflect.get(view, "replyTarget")).toBeDefined();
+			view.handleInput(REPLY);
+			expect(composerHeader(view)).toContain("写点什么继续这个会话");
 
 			for (const ch of "draft") view.handleInput(ch);
-			expect(editorText(view)).toBe("draft");
+			expect(composerHeader(view)).toContain("draft");
 			view.handleInput(LEFT);
 			// The draft is the user's typed work: Left moves the cursor, it must not
 			// throw the draft away with the reply target.
-			expect(Reflect.get(view, "replyTarget")).toBeDefined();
-			expect(editorText(view)).toBe("draft");
-			const rendered = stripAnsi(view.render(160).join("\n")).replace(/\x1b_[^\x07]*\x07/g, "");
-			expect(rendered).toContain("draft");
+			expect(composerHeader(view)).toContain("draft");
+			expect(rendered(view)).toContain("draft");
 		} finally {
 			stopThemeWatcher();
 		}
 
 		const fresh = savedRowView();
 		try {
-			await invoke("toggleReplyTarget", fresh);
-			expect(Reflect.get(fresh, "replyTarget")).toBeDefined();
+			fresh.handleInput(REPLY);
+			expect(composerHeader(fresh)).toContain("写点什么继续这个会话");
+			// An empty draft: Left disarms the composer and returns it to search.
 			fresh.handleInput(LEFT);
-			expect(Reflect.get(fresh, "replyTarget")).toBeUndefined();
+			expect(composerHeader(fresh)).toContain("搜索会话");
 		} finally {
 			stopThemeWatcher();
 		}
@@ -1495,15 +1519,18 @@ describe("agents view reply draft guard and delete confirmation cleanup", () => 
 		const view = savedRowView();
 		try {
 			view.handleInput(DELETE);
-			expect(Reflect.get(view, "pendingDeleteAgent")).toBeDefined();
+			expect(rendered(view)).toContain("再按一次");
 
 			// Left is any other key here: it cancels the confirmation without typing
 			// into the composer, and must release the pending-delete marker with it.
+			// The row itself stays rendered (the "needs input" recap), so the missing
+			// confirm line is the disarm, not a vanished list.
 			view.handleInput(LEFT);
-			expect(Reflect.get(view, "pendingDeleteAgent")).toBeUndefined();
+			expect(rendered(view)).not.toContain("再按一次");
+			expect(rendered(view)).toContain("needs input");
 
 			view.handleInput(REPLY);
-			expect(Reflect.get(view, "replyTarget")).toBeDefined();
+			expect(composerHeader(view)).toContain("写点什么继续这个会话");
 		} finally {
 			stopThemeWatcher();
 		}
@@ -1538,12 +1565,13 @@ describe("agents view reply draft guard and delete confirmation cleanup", () => 
 		try {
 			const view = savedRowView();
 			view.handleInput(DELETE);
-			expect(Reflect.get(view, "pendingDeleteAgent")).toBeDefined();
+			expect(rendered(view)).toContain("再按一次");
 			// State barrier: run the confirmation window's timer instead of sleeping.
 			await vi.advanceTimersByTimeAsync(2_001);
-			expect(Reflect.get(view, "pendingDeleteAgent")).toBeUndefined();
+			expect(rendered(view)).not.toContain("再按一次");
+			expect(rendered(view)).toContain("needs input");
 			view.handleInput(REPLY);
-			expect(Reflect.get(view, "replyTarget")).toBeDefined();
+			expect(composerHeader(view)).toContain("写点什么继续这个会话");
 		} finally {
 			vi.useRealTimers();
 			stopThemeWatcher();

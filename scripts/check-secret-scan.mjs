@@ -157,6 +157,21 @@ const cases = [
 		const sha = commitFile(repo, "test/git.test.ts", `const remote = "https://token@github.com/o/r.git";\n`, "add test");
 		return [runHook(repo, create(sha)), 0];
 	}],
+	["a markdown-link URL userinfo in a diff passes", () => {
+		const repo = mkrepo();
+		const sha = commitFile(repo, "docs/clone.md", "clone via [token](https://token@github.com/o/r.git)\n", "docs");
+		return [runHook(repo, create(sha)), 0];
+	}],
+	["an email that only shares a line with a URL is refused (not URL userinfo)", () => {
+		const repo = mkrepo();
+		const sha = commitFile(
+			repo,
+			"docs/setup.md",
+			`docs at https://internal.corp.io/guide, contact ${POISON_EMAIL}\n`,
+			"docs contact",
+		);
+		return [runHook(repo, create(sha)), 1, ["Email address", "docs/setup.md:1"], [POISON_EMAIL]];
+	}],
 	["an account email in an added diff line is refused", () => {
 		const repo = mkrepo();
 		const sha = commitFile(repo, "src/contact.ts", `export const admin = "${POISON_EMAIL}";\n`, "add contact");

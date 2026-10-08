@@ -23,9 +23,11 @@
  *
  *   - Email addresses, the fd1dd4e4c leak class. Exempted: attribution trailer lines
  *     (Co-Authored-By: and friends - this history carries hundreds), scp-style git URLs
- *     (git@host:org/repo), URL userinfo (https://user@host/...), the git@ local part, and
- *     placeholder domains (example.com/org/net, the reserved TLDs .example/.test/.invalid/
- *     .internal/.localhost/.localdomain, users.noreply.github.com).
+ *     (git@host:org/repo - the colon must open a path, not prose), URL userinfo
+ *     (https://user@host/... - only when the email is the URL's user, not merely a line
+ *     that also contains a URL), the git@ local part, and placeholder domains
+ *     (example.com/org/net, the reserved TLDs .example/.test/.invalid/.internal/.localhost/
+ *     .localdomain, users.noreply.github.com).
  *   - UUIDs with an account-context word (org, account, tenant, workspace, subscription,
  *     customer, member, profile, owner, user) glued to a `:`/`=` in front of them - the
  *     "orgId": "<uuid>" shape. Bare UUIDs pass: 791ce355f cites a session id in its
@@ -109,6 +111,13 @@ const SECRET_PATTERNS = [
 const EMAIL_PATTERN = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 const EMAIL_ALLOW_DOMAIN = /^(?:example\.(?:com|org|net)|users\.noreply\.github\.com)$/i;
 const EMAIL_ALLOW_TLD = /\.(?:example|test|invalid|internal|localhost|localdomain)$/i;
+// The email sits in a URL's userinfo only when everything between the scheme's `://`
+// and the match is userinfo-shaped (letters, digits, `.-_~%+:@` - no separators), so
+// "docs at https://host/guide, contact ops@corp.io" is still scanned: the email merely // secret-scan: allow
+// shares the line with a URL, it is not the URL's user.
+const URL_USERINFO_BEFORE = /(?:^|[^A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*:\/\/[A-Za-z0-9._%~+:@-]*$/;
+// scp-style user@host:path - the colon must open a path, not prose ("ops@corp.io: note"). // secret-scan: allow
+const SCP_PATH_START = /^[A-Za-z0-9.~/_-]/;
 // Attribution trailers are how this history records authorship; they are exempt from the
 // email rule in commit messages (and only there).
 const TRAILER_LINE = /^\s*(?:co-authored-by|signed-off-by|authored-by|reviewed-by|acked-by|reported-by|helped-by|suggested-by|cc)\s*:/i;
@@ -167,8 +176,10 @@ function scanLine(line, { message = false } = {}) {
 		const local = value.slice(0, at).toLowerCase();
 		const domain = value.slice(at + 1);
 		if (local === "git") continue; // scp/ssh git user, never a mailbox
-		if (line.slice(0, match.index).includes("://")) continue; // URL userinfo
-		if (line[match.index + value.length] === ":") continue; // scp-style git@host:path
+		if (URL_USERINFO_BEFORE.test(line.slice(0, match.index))) continue; // URL userinfo
+		if (line[match.index + value.length] === ":" && SCP_PATH_START.test(line.slice(match.index + value.length + 1))) {
+			continue; // scp-style git@host:path
+		}
 		if (EMAIL_ALLOW_DOMAIN.test(domain) || EMAIL_ALLOW_TLD.test(domain)) continue;
 		if (message && TRAILER_LINE.test(line)) continue;
 		findings.push({ type: EMAIL_TYPE, masked: maskEmail(value) });
@@ -367,6 +378,8 @@ function selfTest() {
 		["scp-style git URL", "git@github.com:PrimeIntellect-ai/prime-agent.git"],
 		["URL userinfo", "https://token@github.com/o/r.git"],
 		["URL userinfo with user:password", "https://user:p@ssw0rd@github.com/o/r.git"],
+		["URL userinfo after prose", "git clone https://token@github.com/o/r.git"],
+		["URL userinfo inside markdown link syntax", "[clone](https://token@github.com/o/r.git)"],
 		["placeholder email domains", "user@example.com and dev@example.org"],
 		["github noreply email", "12345+someone@users.noreply.github.com"],
 		["reserved-TLD email", "preflight@example.test"],
@@ -409,6 +422,25 @@ function selfTest() {
 	// Floor lock-in: the table shares the share preflight's 8-character floor, so a
 	// placeholder-shaped stand-in that clears the floor is a tripwire by design.
 	check("flags a stand-in that clears the sk- floor", scanLine("getApiKey=sk-ant-live-key"), ["API key (sk-)"]); // secret-scan: allow
+
+	// Mixed-line judgments: the exemptions are positional, so an email that merely
+	// shares a line with a URL, or whose colon opens prose instead of an scp path,
+	// is still a finding.
+	check(
+		"flags an email that only shares a line with a URL",
+		scanLine("docs at https://internal.corp.io/guide, contact ops@corp.io"), // secret-scan: allow
+		["Email address"],
+	); // secret-scan: allow
+	check(
+		"flags a trailing email after an unrelated http URL",
+		scanLine("see http://x for the setup, contact ops@corp.io"), // secret-scan: allow
+		["Email address"],
+	); // secret-scan: allow
+	check(
+		"flags an email whose colon opens prose, not an scp path",
+		scanLine("contact ops@corp.io: the rotation schedule changed"), // secret-scan: allow
+		["Email address"],
+	); // secret-scan: allow
 
 	// Redaction: the serialized findings must carry the mask, never the raw value.
 	const redaction = JSON.stringify(scanLine(`key: ${SK_POISON}`));
