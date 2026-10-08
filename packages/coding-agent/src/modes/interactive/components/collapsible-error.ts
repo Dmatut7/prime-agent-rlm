@@ -1,6 +1,7 @@
 import {
 	type ClickRegion,
 	type Component,
+	sanitizeRenderText,
 	truncateToWidth,
 	visibleWidth,
 	wrapTextWithAnsi,
@@ -17,7 +18,10 @@ export interface CollapsibleErrorOptions {
 }
 
 export function normalizeErrorDetails(text: string): string {
-	return stripAnsi(text).replace(/\r\n/g, "\n").replace(/\r/g, "\n").trimEnd();
+	// The consuming faces build their own rows, so no escape sequence and no
+	// control character may survive; \n and \t stay (the stack parser reads the
+	// tab indentation), and \r still folds to \n before the C0 strip eats it.
+	return stripAnsi(sanitizeRenderText(text.replace(/\r\n/g, "\n").replace(/\r/g, "\n"))).trimEnd();
 }
 
 interface ErrorDetailLine {

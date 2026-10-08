@@ -55,6 +55,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { theme } from "../modes/interactive/theme/theme.js";
 import { untilAborted, type WaitTimeoutFacts } from "../utils/bounded-wait.js";
+import { sanitizeRowText } from "../utils/display-text.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { ensurePrivateDirectory, writePrivateFileAtomic } from "../utils/private-files.js";
 import { sleep } from "../utils/sleep.js";
@@ -16758,7 +16759,9 @@ export class AgentSession {
 			to,
 			errorMessage: message.errorMessage,
 		});
-		const detail = message.errorMessage?.replace(/\s+/g, " ").trim().slice(0, 200);
+		// The notice is persisted: an escape surviving the detail slice replays
+		// on every attach/resync/replay, so wash before capping to 200 chars.
+		const detail = message.errorMessage ? sanitizeRowText(message.errorMessage).slice(0, 200) : undefined;
 		this._emitFallbackNotice(
 			`所选模型 ${current.id} 被 ${current.provider} 拒绝（${detail ?? "无详情"}），本会话改由 ${candidate.id} 服役；会话记录和默认模型已同步，重启后也从 ${candidate.id} 恢复。`,
 			{ kind: "rejected", from, to },

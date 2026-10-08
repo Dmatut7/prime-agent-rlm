@@ -366,6 +366,26 @@ describe("summarizeDutyLog", () => {
 		expect(summarizeDutyLog({ entries, now: T0 + HOUR })?.lastDoing).toBe("在改 footer 的上下文数字");
 	});
 
+	it("flattens a replayed multi-line status summary and strips its escapes (R3-M24)", () => {
+		// Old journals can carry a recap model's multi-line or escape-laden
+		// summary; the duty block pins one physical row above the input.
+		const entries = [
+			user(0),
+			assistant(60_000, { text: "第一步好了。" }),
+			{
+				type: "agent_status",
+				id: "s",
+				parentId: null,
+				timestamp: at(70_000),
+				status: {
+					summary: `在改 footer${String.fromCharCode(0x1b)}[2J\n第二行${String.fromCharCode(0x07)}`,
+					basedOnMessageCount: 3,
+				},
+			},
+		];
+		expect(summarizeDutyLog({ entries, now: T0 + HOUR })?.lastDoing).toBe("在改 footer 第二行");
+	});
+
 	it("ignores unknown and malformed duty entries", () => {
 		expect(parseDutyEvent({ kind: "nope" })).toBeUndefined();
 		expect(parseDutyEvent({ kind: "model_fallback" })).toBeUndefined();

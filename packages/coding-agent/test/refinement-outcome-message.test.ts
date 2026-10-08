@@ -203,6 +203,29 @@ describe("RefinementOutcomeMessageComponent", () => {
 		expect(line).not.toContain("记住了");
 	});
 
+	test("truncates a rejected edit's reason at its first line (R3-M23)", () => {
+		// The failure row is one accounted timeline row; a reason with a bare \n
+		// used to make it two physical ones. The :94 sibling (`missedNoteText`)
+		// already takes the first line only.
+		const partial = result();
+		partial.appliedEdits = [
+			{
+				...partial.appliedEdits[0]!,
+				id: "second",
+				title: "Second",
+				applied: false,
+				error: "first line\nsecond line",
+			},
+		];
+		const component = new RefinementOutcomeMessageComponent(createRefinementOutcomeMessage(partial));
+		component.setExpanded(true);
+		const rows = component.render(160);
+		expect(rows.every((row) => !row.includes("\n"))).toBe(true);
+		const row = stripAnsi(rows.find((line) => stripAnsi(line).includes("没写进去：")) ?? "");
+		expect(row).toContain("没写进去：first line");
+		expect(row).not.toContain("second line");
+	});
+
 	test("never draws a row wider than the screen, collapsed or open", () => {
 		const long = result();
 		const title =

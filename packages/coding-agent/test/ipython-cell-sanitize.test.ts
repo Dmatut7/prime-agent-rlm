@@ -63,6 +63,24 @@ describe("IPythonCellComponent sanitize", () => {
 		expect(stripAnsi(rows[0] ?? "").trim()).toBe("✓ 运行 printf done");
 	});
 
+	it("keeps bare control bytes out of the cell's stdout rows", () => {
+		// The output paths wash through normalizeErrorDetails; a bash BEL used to
+		// reach the screen and ring on every repaint.
+		setToolOutputFull(true);
+		const rows = render({
+			code: "print(1)",
+			executionStarted: true,
+			argsComplete: true,
+			expanded: true,
+			details: { status: "ok", stdout: `line one${BEL}${CLEAR}\nline two${CR}overwritten` },
+		});
+		expectNoInjection(rows);
+		const visible = rows.map((row) => stripAnsi(row)).join("\n");
+		expect(visible).toContain("line one");
+		expect(visible).toContain("line two");
+		expect(visible).toContain("overwritten");
+	});
+
 	it("keeps an injected kernel error name off the top row", () => {
 		const rows = render({
 			code: "print(1)",

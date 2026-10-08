@@ -256,7 +256,9 @@ export class RefinementOutcomeMessageComponent implements Component, FocusableBl
 			const change = refinementEditAsMemoryChange(edit, scope, this.message.timestamp);
 			if (index > 0 || why) lines.push(row({ main: "rail" }, ""));
 			if (!edit.applied) {
-				const reason = edit.error ? `：${sanitizeDisplayText(edit.error)}` : "";
+				// One accounted timeline row: the reason takes its first line only,
+				// the same cut `missedNoteText` makes above.
+				const reason = edit.error ? `：${sanitizeDisplayText(edit.error).split("\n")[0]}` : "";
 				const title = theme.fg("text", shortMemoryTitle(change.title, Math.max(4, room - 20)));
 				lines.push(
 					row(

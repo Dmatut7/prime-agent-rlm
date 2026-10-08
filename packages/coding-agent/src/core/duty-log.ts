@@ -1,4 +1,5 @@
 import { open, stat } from "node:fs/promises";
+import { sanitizeRowText } from "../utils/display-text.js";
 import { DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT } from "./autonomous.js";
 import { textAnnouncesNextStep } from "./self-recovery.js";
 
@@ -539,7 +540,10 @@ export function summarizeDutyLog(input: DutyLogInput): DutyLogSummary | undefine
 
 		if (entry.type === "agent_status") {
 			const status = asRecord(entry.status);
-			if (typeof status?.summary === "string" && status.summary.trim()) lastStatus = status.summary.trim();
+			// The summary is replayed into a one-row block pinned above the input;
+			// a recap model's multi-line or escape-laden text must flatten here.
+			const washed = typeof status?.summary === "string" ? sanitizeRowText(status.summary) : "";
+			if (washed) lastStatus = washed;
 		}
 	}
 

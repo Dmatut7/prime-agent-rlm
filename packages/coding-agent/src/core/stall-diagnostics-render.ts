@@ -1,3 +1,4 @@
+import { sanitizeRowText } from "../utils/display-text.js";
 import type { StallDiagnostics } from "./stall-diagnostics.js";
 import { resolveStallDiagnosticsPointer } from "./stall-evidence.js";
 
@@ -80,8 +81,11 @@ export function formatStallDiagnosticsLines(diagnostics: StallDiagnostics | unde
 	if (Array.isArray(inFlightCalls)) {
 		const inFlight = inFlightCalls.map((call) => {
 			if (!isSegment(call)) return "unknown (malformed tool call)";
-			const toolName = typeof call.toolName === "string" ? call.toolName : "unknown";
-			const toolCallId = typeof call.toolCallId === "string" ? call.toolCallId : "unknown";
+			// The name (and id) come from the model's own tool call: wash the
+			// escapes a hostile or glitched name would paint onto the bar.
+			const toolName = typeof call.toolName === "string" ? sanitizeRowText(call.toolName) || "unknown" : "unknown";
+			const toolCallId =
+				typeof call.toolCallId === "string" ? sanitizeRowText(call.toolCallId) || "unknown" : "unknown";
 			const elapsed = typeof call.elapsedMs === "number" ? seconds(call.elapsedMs) : "unknown";
 			return `${toolName} (id=${toolCallId}, ${elapsed})`;
 		});
@@ -195,7 +199,7 @@ export function formatStallSummary(event: StallEventView, sinceEventMs = 0): str
 	const handles = typeof kernel?.liveBashHandles === "number" ? kernel.liveBashHandles : 0;
 	const background = handles > 0 ? `，后台还有 ${handles} 个命令在跑` : "";
 	if (first) {
-		const tool = typeof first.toolName === "string" ? first.toolName : "工具";
+		const tool = typeof first.toolName === "string" ? sanitizeRowText(first.toolName) || "工具" : "工具";
 		const elapsed = typeof first.elapsedMs === "number" ? `（已 ${durationText(first.elapsedMs + extraMs)}）` : "";
 		const more = calls.length > 1 ? `等 ${calls.length} 步` : "这一步";
 		return `\u26a0 已经 ${quiet}没有动静：正在等 ${tool} ${more}${elapsed}${background}`;
@@ -244,7 +248,7 @@ export function formatStallExplanation(
 	} else if (event.type === "stall_unsettled") {
 		happened = "这一轮已经被中断，但还有工作没有停下来。";
 	} else if (first) {
-		const tool = typeof first.toolName === "string" ? first.toolName : "工具";
+		const tool = typeof first.toolName === "string" ? sanitizeRowText(first.toolName) || "工具" : "工具";
 		const ran =
 			typeof first.elapsedMs === "number" ? `（这一步已经跑了 ${durationText(first.elapsedMs + extraMs)}）` : "";
 		happened = `这一轮已经 ${quiet}没有任何动静，一直在等「${tool}」这一步${ran}。`;

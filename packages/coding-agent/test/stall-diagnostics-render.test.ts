@@ -4,6 +4,7 @@ import {
 	formatStallDiagnosticsLines,
 	formatStallEventLines,
 	formatStallExplanation,
+	formatStallSummary,
 } from "../src/core/stall-diagnostics-render.js";
 
 function diagnostics(overrides?: Partial<StallDiagnostics>): StallDiagnostics {
@@ -194,5 +195,54 @@ describe("stall explanation for the owner", () => {
 		const lines = formatStallExplanation(warn(), { sinceEventMs: 3 * 3_600_000 });
 		expect(lines[0]).toContain("已经 3 小时 5 分没有任何动静");
 		expect(lines[2]).toContain("发一句话告诉它换个办法");
+	});
+});
+
+describe("model-controlled tool names in the stall faces (R4-M12)", () => {
+	const ESC = String.fromCharCode(0x1b);
+	const BEL = String.fromCharCode(0x07);
+	const hostile = () =>
+		diagnostics({
+			inFlightToolCalls: [
+				{
+					toolCallId: `toolu_1${ESC}[2J`,
+					toolName: `ba${BEL}sh${ESC}[2J\nevil`,
+					startedAt: 1_700_000_000_000,
+					elapsedMs: 300_000,
+				},
+			],
+		});
+	const NO_CONTROLS = /[\x00-\x1f\x7f-\x9f]/;
+
+	it("washes the one-line stall bar summary", () => {
+		const line = formatStallSummary({
+			type: "stall_warning",
+			message: "m",
+			silentMs: 312_000,
+			thresholdMs: 300_000,
+			diagnostics: hostile(),
+		});
+		expect(line).not.toMatch(NO_CONTROLS);
+		// The newline collapses to a space: one accounted row stays one row.
+		expect(line).toContain("正在等 bash evil 这一步");
+	});
+
+	it("washes the explanation's happened line", () => {
+		const lines = formatStallExplanation({
+			type: "stall_warning",
+			message: "m",
+			silentMs: 312_000,
+			thresholdMs: 300_000,
+			diagnostics: hostile(),
+		});
+		expect(lines[0]).not.toMatch(NO_CONTROLS);
+		expect(lines[0]).toContain("「bash evil」");
+	});
+
+	it("washes the forensic in-flight line's name and id", () => {
+		const line = formatStallDiagnosticsLines(hostile()).find((l) => l.startsWith("in-flight tools:")) ?? "";
+		expect(line).not.toMatch(NO_CONTROLS);
+		expect(line).toContain("bash");
+		expect(line).toContain("toolu_1");
 	});
 });

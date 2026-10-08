@@ -1,0 +1,5 @@
+- Fixed error details and cell output keeping bare BEL/NUL/DEL/C1 bytes (a bash `\x07` rang on every repaint); the shared error-text normalizer now strips them while keeping newlines and tabs.
+- Fixed a replayed multi-line or escape-laden agent status summary breaking the duty log's one-row "last doing" block above the input.
+- Fixed provider-rejection notices persisting escape sequences from the provider's error message and replaying them on every attach/resync/replay.
+- Fixed the stall bar and stall diagnostics rendering a glitched tool name's escape sequences on every per-second redraw.
+- Fixed a refused memory edit's multi-line reason spilling out of its single timeline row and shifting every row below it.

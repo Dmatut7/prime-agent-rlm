@@ -158,4 +158,29 @@ describe("model rejected by the provider does not stay persisted", () => {
 		expect(harness.settingsManager.getDefaultModel()).toBe("faux-bad");
 		expect(rejectionNotices(harness)).toEqual([]);
 	});
+
+	it("washes a hostile rejection message before persisting the fallback notice (R4-M16)", async () => {
+		// The notice is a persisted custom message: attach/resync/replay re-render
+		// it every time, so an ESC surviving the 200-char detail slice replays
+		// forever.
+		const harness = await harnessWith({ persistSession: true });
+		harness.sessionManager.materializeSessionFile();
+		await harness.session.setModel(harness.getModel("faux-bad")!);
+		const calls: Call[] = [];
+		const hostile = () =>
+			failure(
+				`Provider denied access to the requested resource (403): ${String.fromCharCode(0x1b)}[2J${String.fromCharCode(0x07)}you do not have access to model faux-bad\nsecond line`,
+				{ kind: "permission", status: 403 },
+			);
+		harness.setResponses([perModel({ "faux-bad": [hostile] }, calls)]);
+		await harness.session.prompt("one");
+
+		expect(harness.session.model?.id).toBe("faux-1");
+		const rejected = rejectionNotices(harness).find((notice) => notice.kind === "rejected");
+		expect(rejected).toBeDefined();
+		expect(rejected!.text).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+		// The readable words survive, flattened onto the one line the old
+		// `\s+ → " "` collapse already produced.
+		expect(rejected!.text).toContain("you do not have access to model faux-bad second line");
+	});
 });
