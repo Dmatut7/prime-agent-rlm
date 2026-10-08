@@ -1,3 +1,17 @@
+## 2026-10-08 显示审计第六波：七车道清欠 36 条（R4-H2 收口 + 剩余 Medium/Low 主体）
+
+> 对账探员全量核账后开波：147 条 ID'd 中 104 已修、42 仍开放（另 ~221 条 Low 未认领）。本波七车道并行（独立 worktree lane/w6-*），42 条中的 36 条全部落地（含头号半修项），主席逐条 squash 合入。剩余：协议簇 7 条（R3-M1..M4、R6-M2/M4、R2-M11，需 capability/双向兼容设计，留下波）+ ~215 条 Low 观察层。
+
+- **车道 md（R4-H2 收口，commit 15b9a97d2 → 主线 a24ea5ee7）**：头号发现是第四批只把中央门接了 Text.render，Markdown 组件（主回答通道）零清洗——主席探针实锤 OSC52/CSI-2J/BEL 穿透。九个洗涤点把模型文本（inline token、代码块行、数学、表格 fallback、链接目的地）过 sanitizeRenderText，与 Text 同契约（主题 SGR 与已终止 OSC8 存活）；洗在 token 渲染层而非全缓冲，流式保持 O(tail)/帧、lexCache/fence 密封结构零改动。88 条新测试对旧实现 85 红；markdown 全家族零回归。thinking/branch/compaction/skill/side-question/injected-prompt/custom-message 全部消费方随组件自动覆盖。
+- **车道 wash（清洗残余五条）**：normalizeErrorDetails 补剥 BEL/NUL/DEL/C1（CollapsibleError 行与 ipython 输出面不过 Text 门）；duty-log「最后在做」洗旧 journal 多行 summary（R3-M24）；被拒模型的持久公告落盘前洗（R4-M16，attach 不再重放转义）；stall 操作条/取证行洗工具名（R4-M12）；被拒 refinement 原因对齐首行口径（R3-M23）。
+- **车道 stdin（输入层四条+一并）**：CSI-u 大码点加 0x10FFFF 上界（R5-M1 崩溃）；粘贴值过洗+多行空格分隔+窄宽渲染（R6-M12 及两个同点 Low）；legacy meta 与 SS3/DCS/OSC/APC 前缀消歧（R5-M2）；bulk 粘贴 CR 不再凭空 Enter（R5-M3）；M3 行为级修复——meta-sends-escape 终端 Option+方向键的双 ESC 头序列合并成一个和弦（不再打断+清草稿），删除不可达死分支与假钉。28 条新测试 16 先红。
+- **车道 imode（生命周期七条，全 interactive-mode.ts）**：quiet 模式 feature hint 链接线（R4-M9）；append 公告不再被 transient 状态吞（R4-M10）；流式中 rebuild 推迟到 settle 点不再拆在途工具卡（R4-M11，requestChatRebuild/drainPendingChatRebuild）；slim 回填页 replay 补 hooks（R4-M13，心跳/页内 strip/扩展渲染器到位）；resetExtensionUI 只下扩展自己的 overlay 不再误弹登录框（R5-M28）；/settings 切内置技能的 reload 移到面板关闭（R5-M29）；replay 历史回填贴图 marker id 上界，attach 后不再发错图给模型（R2-M16）。17 条新测试全先红。
+- **车道 av（agents-view/表格七条 + R6-M1）**：状态标签渲染门放宽到状态层产出（R2-M12，stall/quiet/workerState 标签可见）；← 不再清非空回复草稿（R2-M13）；删除确认取消后回复键复活（R2-M14）；status/list 表格宽度预算（R2-M7，新共享 formatTable，240+ 列不再溢出）；选中背景穿透自带背景块（R2-M19）；recap 过滤 ambient 改动（R2-M20）；subtitle 死字段删除（审计第二轮 Low，lane C 曾洗了个从不渲染的面）；Bedrock 从 $metadata.httpStatusCode 取状态码，4xx 不再当 transient 重试 15 分钟（R6-M1，packages/ai）。
+- **车道 timeline（六条 + 死代码）**：压缩 outcome 先于 compaction_end 落盘时结清 live 幻行（R3-M16）；bash Elapsed interval 经 dispose 契约在所有丢弃路径清除（R3-M20，进程余生不再每秒全帧重绘）；压缩/分支摘要卡片展示层过 stripMachineBlocks（R6-M7）；/model tab 门限按真实 header 行数（R3-M8，窄终端列表不再消失）；BoxRow.sub/.window 死字段与 steady 系删除（R5-M16）；running-card.ts/turn-footnote.ts 零生产引用删除（连带 scripts/check-display-reconciliation.mjs 注释、4 个测试文件清理）。
+- **车道 fs（fullscreen/tui 四条）**：拖选扫过空白填充区不再丢选区（R2-M15）；含 tab 行的选择/复制按上屏列对齐（M2）；浮层合成 kitty 占位图片行，对话框不再被图片条纹打穿、点击层级正确（M4，含浮层全覆盖期间图片 id 存活豁免）；autocomplete 裁剪保选中项可见（R3-M7，Component.getFocusLine 可选增量）。600+ 邻居测试零回归。
+- **主席合并与冲突处置**：七车道 squash 逐条入主线（共享文件 interactive-mode.ts 三车道、live-turn-flow.ts 两车道，均区域隔离自动合并）；唯一语义冲突是 lane J 的 D7 钉——它把「双 ESC 拆成 Escape+序列」当 M3 现实钉在源码注释上，M3 修复反转现实，主席同步改钉+改 terminal-setup.md 口径（箭头和弦已识别、Option+字母仍建议避开 Option-as-Meta）。reftable footer 测试一次全量红、隔离复跑即绿，按 flake 记档。
+- **门禁**：npm run check EXIT 0；test-hygiene OK；每车道 pristine 树 tsgo EXIT 0 + 触及测试全绿；合并后 tui 全量 1396/1396、coding-agent 全量与 ai 全量见推送后 CI；每条修复先红后绿（车道报告带红证据）。零 wire 形状改动（唯一接口增量 Component.getFocusLine 为可选、ToolRenderContext.state dispose 约定为文档注释）。需要重新 build 生效（本波已 build 见下）。
+
 ## 2026-10-08 显示审计第五波·收口：车道 C（清洗残余）合入 + 八路复审集群修复批
 
 > 车道 C 以 cherry-pick 落主线（b6068f41d..10c6492b0，7 提交，range-diff 与 lane/c-sanitize 逐条 `=`），R4-M1..M7、R4-M14、R5-M30/M31、R3-M21 全部闭环，对应 docs/audits/2026-10-08-fix-backlog.md「批次 C」。合入后八路只读复审蜂群审出 0 P0 / 5 P1 / ~13 P2，修复批随本节同批落地后推送。

@@ -153,14 +153,17 @@ describe("D7: terminal-setup.md does not promise the legacy Option-as-Meta form"
 	const stdinBufferSource = readDoc("../../tui/src/stdin-buffer.ts");
 	const terminalSetupDoc = readDoc("../docs/terminal-setup.md");
 
-	it("stdin-buffer still splits a doubled ESC into Escape + sequence (the M3 reality)", () => {
-		// While this split exists, Option-as-Meta terminals deliver Escape + arrow.
-		expect(stdinBufferSource).toContain("Two ESC bytes in a row are two Escape keys");
+	it("stdin-buffer merges a doubled ESC that heads a key sequence into one chord (the M3 fix)", () => {
+		// A meta-sends-escape terminal prefixes Alt+arrows with ESC; splitting
+		// the pair fired the interrupt key on every Option+arrow. The merge is
+		// what the terminal-setup doc now describes; a bare doubled Escape
+		// (two presses) still reads as two Escape keys.
+		expect(stdinBufferSource).toContain("Merge when the second ESC heads a key");
 	});
 
-	it("doc warns about Meta-sends-Escape instead of claiming support", () => {
+	it("doc warns about Meta-sends-Escape printables instead of claiming arrow support gaps", () => {
 		expect(terminalSetupDoc).not.toContain("legacy Option-as-Meta wrapped Control+Arrow sequences");
-		expect(terminalSetupDoc).toMatch(/does \*\*not\*\* support the legacy Option-as-Meta form/);
+		expect(terminalSetupDoc).toMatch(/does \*\*not\*\* support the legacy Option-as-Meta form for printable keys/);
 		expect(terminalSetupDoc).toContain("metaSendsEscape");
 	});
 });
