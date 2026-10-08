@@ -1,0 +1,1 @@
+- Fixed a Python state snapshot notice hiding a name the model lost when its drop reason matched the routine host-wrapper reason; routine skips are now classified by name only.

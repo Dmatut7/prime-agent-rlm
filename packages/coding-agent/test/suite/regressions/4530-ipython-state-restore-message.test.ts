@@ -252,6 +252,37 @@ describe("ENG-4530 IPython state restore message", () => {
 		expect(expanded).not.toContain("<ipython_state_restored>");
 	});
 
+	it("warns when every revived name is degraded, even with nothing lost", () => {
+		// The kernel's own severity call for degraded names is "identity mismatch,
+		// can silently misbehave, redefine before use" (state-snapshot.ts): a
+		// degraded-only restore is not the routine recovered case, and the owner
+		// who only reads the collapsed row must still see the warning tone.
+		const message: CustomMessage<IpythonStateRestoredDetails> = {
+			role: "custom",
+			customType: IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
+			content: "restore details",
+			display: true,
+			details: {
+				restored: true,
+				degraded: [
+					{ name: "helper", reason: "by-value function" },
+					{ name: "bash", reason: "cannot pickle '_PrimeAgentCallableSkillModule' object" },
+				],
+			},
+			timestamp: Date.now(),
+		};
+		const component = new InjectedPromptMessageComponent(message);
+
+		const collapsed = render(component);
+		expect(collapsed.trim()).toContain("◆ Python 环境已恢复（2 个名字行为可能不准）");
+		expect(renderRaw(component)).toContain(colorPrefix("warning"));
+		component.setExpanded(true);
+		const expanded = render(component);
+		expect(expanded).toContain("helper");
+		expect(expanded).toContain("bash");
+		expect(expanded).toContain("回来了但行为可能不准");
+	});
+
 	it("keeps the boolean labels for messages written before the roster details existed", () => {
 		const legacy: CustomMessage<IpythonStateRestoredDetails> = {
 			role: "custom",

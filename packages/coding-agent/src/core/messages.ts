@@ -1040,7 +1040,8 @@ export interface IpythonStateRestoredDetails {
 	degraded?: { name: string; reason: string }[];
 	/**
 	 * Names live at snapshot time that never entered the payload, routine skips
-	 * (leading-underscore internals, host skill wrappers) already filtered out.
+	 * (leading-underscore internals, the re-injected skill import names) already
+	 * filtered out.
 	 */
 	notSaved?: { name: string; reason: string }[];
 	/** Whole-attempt failure text, from `RestoreResult.error`. */

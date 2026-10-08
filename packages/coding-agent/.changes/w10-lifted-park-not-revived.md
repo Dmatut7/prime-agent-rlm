@@ -1,0 +1,1 @@
+- Fixed a lifted quota park reappearing as an expired countdown after a session rebind on the daemon connection.

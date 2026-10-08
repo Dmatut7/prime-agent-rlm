@@ -2259,6 +2259,13 @@ export class AgentSession {
 	_ipythonKernelProvisioner?: IpythonKernelProvisioner;
 	/** Artifact dir backing the current provisioner's kernel snapshot, if any. */
 	private _ipythonKernelSnapshotDir?: string;
+	/**
+	 * Public skill import names the current kernel build's bootstrap re-injects on every
+	 * start. Snapshot drops under them are routine (the bootstrap recreates them); a drop
+	 * under any other name - including a user alias of one of them - is a real loss the
+	 * notices must report. Rebound per _buildRuntime alongside the provisioner.
+	 */
+	private _ipythonReboundSkillNames: ReadonlySet<string> = new Set();
 	/** True once the runtime has been built once; later builds are in-process rebuilds (/reload). */
 	private _ipythonRuntimeBuilt = false;
 	private readonly _prewarmIpythonKernel: boolean;
@@ -11838,7 +11845,12 @@ export class AgentSession {
 		if (names === null && !provisioner.hasRunningKernel) return;
 		const content = [
 			"<ipython_state>",
-			...compactionKernelStateLines({ snapshot, names, hasSnapshotConfig }),
+			...compactionKernelStateLines({
+				snapshot,
+				names,
+				hasSnapshotConfig,
+				reboundNames: this._ipythonReboundSkillNames,
+			}),
 			"</ipython_state>",
 		].join("\n");
 		const message = {
@@ -11963,12 +11975,18 @@ export class AgentSession {
 				snapshotPolicy: result.snapshotPolicy,
 			});
 		}
-		const lines = ["<ipython_state_restored>", ...restoreNoticeLines(result), "</ipython_state_restored>"];
+		const lines = [
+			"<ipython_state_restored>",
+			...restoreNoticeLines(result, this._ipythonReboundSkillNames),
+			"</ipython_state_restored>",
+		];
 		// The owner-facing card reads its roster from details (the content stays the
 		// model-facing machine block), so the partial-restore facts travel with the
 		// message. Routine write-side skips are filtered here, like the notice lines
 		// do for the model: they fire on every healthy snapshot and are not actionable.
-		const notSaved = (result.notSaved ?? []).filter((entry) => !isExpectedSnapshotSkip(entry));
+		const notSaved = (result.notSaved ?? []).filter(
+			(entry) => !isExpectedSnapshotSkip(entry, this._ipythonReboundSkillNames),
+		);
 		const degraded = result.degraded ?? [];
 		void this.sendCustomMessage(
 			{
@@ -14081,6 +14099,7 @@ export class AgentSession {
 		includeAllExtensionTools?: boolean;
 	}): void {
 		const pythonSkills = getPythonSkillRuntimeInfo(this._modelVisibleSkills());
+		this._ipythonReboundSkillNames = new Set(pythonSkills.map((skill) => skill.importName));
 		let configuredBaseToolDefinitions: Record<string, ToolDefinition>;
 		if (this._baseToolsOverride) {
 			configuredBaseToolDefinitions = Object.fromEntries(
@@ -16338,7 +16357,12 @@ export class AgentSession {
 			const attempt = this._retryAttempt;
 			this._markProviderAuthStaleForRetryFailure(message, options);
 			this._retryAttempt = 0;
-			this._terminalFailureAttemptCount = attempt;
+			// The chain was cancelled by the owner, not spent: clear, don't carry -
+			// the same ruling as the compaction handoff (074f9a9f0). A carried count
+			// here would credit a later non-retryable terminal error with this
+			// cancelled chain's attempts. The auto_retry_end event below carries the
+			// count for anyone who needs it.
+			this._terminalFailureAttemptCount = 0;
 			this._retryAbortController = undefined;
 			this._providerWait = undefined;
 			const restoredModel = this._restorePrimaryModelAfterBackup();

@@ -3808,6 +3808,52 @@ describe("DaemonAgentConnection", () => {
 		await connection.dispose();
 	});
 
+	it("does not revive a lifted park through a field-less session_replaced", async () => {
+		// The lift (parked:false) is broadcast once; after it, the cached snapshot's
+		// quotaPark is stale. A field-less session_replaced (a live worker rebind
+		// broadcast never carries the fields) preserves the cached park into the
+		// snapshot the replacement re-render reads, re-seeding an expired countdown.
+		const quotaPark = {
+			parked: true as const,
+			resumeAt: "2026-01-01T00:00:00.000Z",
+			remainingMs: 60_000,
+			parkCount: 2,
+			provider: "anthropic",
+		};
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("quota_park_status");
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12);
+			return { ...result, snapshot: { ...result.snapshot, quotaPark } };
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		expect((await connection.getInitialSnapshot()).quotaPark).toEqual(quotaPark);
+
+		const events: AgentConnectionEvent[] = [];
+		const unsubscribe = connection.subscribe(async (event) => {
+			events.push(event);
+		});
+		fakeClient.emitMessage({ type: "quota_park_status", activeSessionId: "active-1", parked: false });
+		await vi.waitFor(() =>
+			expect(events.some((event) => event.type === "quota_park_status" && event.parked === false)).toBe(true),
+		);
+
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-1",
+			state: createConnectionState("active-1", "session-current"),
+			messages: [],
+		});
+		await vi.waitFor(() => expect(events.some((event) => event.type === "session_replaced")).toBe(true));
+
+		const snapshot = await connection.getInitialSnapshot();
+		expect(snapshot.quotaPark).toBeUndefined();
+		expect("quotaPark" in snapshot).toBe(false);
+		unsubscribe();
+		await connection.dispose();
+	});
+
 	it("declares slim_attach_transcript on reattach after a session switch conflict", async () => {
 		const fakeClient = new FakeDaemonClient();
 		fakeClient.switchSessionAlreadyActive = { sessionPath: "/tmp/other.jsonl", activeSessionId: "active-target" };

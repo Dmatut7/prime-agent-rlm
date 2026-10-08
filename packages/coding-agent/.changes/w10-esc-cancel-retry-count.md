@@ -1,0 +1,1 @@
+- Fixed the parent-facing failure notice crediting a later, never-retried terminal error with the attempt count of an Esc-cancelled retry chain.

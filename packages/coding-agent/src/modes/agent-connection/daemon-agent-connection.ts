@@ -2477,9 +2477,18 @@ export class DaemonAgentConnection implements AgentConnection {
 			// the hello advertised quota_park_status; anything else is dropped like
 			// every other unknown outbound type. The event is unsequenced and
 			// self-healing (each tick carries the absolute resumeAt), so there is no
-			// snapshot bookkeeping here - forward it and let the UI hold the latest.
+			// snapshot bookkeeping for the live ticks - forward them and let the UI
+			// hold the latest. The lift is the one exception: a terminal parked:false
+			// must also drop the cached snapshot's quotaPark, because the
+			// session_replaced branch below preserves that cache across a field-less
+			// frame, and a stale park there would re-seed an expired countdown into
+			// the UI on the next replacement re-render.
 			if (!this.client.supportsServerCapability("quota_park_status")) {
 				return;
+			}
+			if (!message.parked && this.latestSnapshot?.quotaPark !== undefined) {
+				const { quotaPark: _lifted, ...snapshot } = this.latestSnapshot;
+				this.latestSnapshot = snapshot;
 			}
 			await this.emit({
 				type: "quota_park_status",

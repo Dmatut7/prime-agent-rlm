@@ -42,6 +42,49 @@ describe("snapshot notices filter routine internal names", () => {
 		expect(restoreLines.join("\n")).toContain("_cache");
 	});
 
+	it("a user alias of a host wrapper is reported, not filtered as routine", () => {
+		// Section-9 item 12 / backlog 79: the model binds `helper = websearch` in a
+		// cell; the snapshot cannot pickle either binding, so both drops carry the
+		// same "cannot pickle '_PrimeAgentCallableSkillModule'" reason. The
+		// bootstrap re-injects only the skill import names, so `helper` is a real
+		// loss the notice must report - classifying by the drop reason hid it.
+		const wrapperReason = "TypeError: cannot pickle '_PrimeAgentCallableSkillModule' object";
+		const lines = compactionKernelStateLines({
+			snapshot: {
+				saved: ["df"],
+				skipped: [
+					{ name: "websearch", reason: wrapperReason },
+					{ name: "helper", reason: wrapperReason },
+				],
+				bytes: 10,
+				path: "/tmp/kernel-state.dill",
+			},
+			names: ["df"],
+			reboundNames: new Set(["websearch"]),
+		});
+		const text = lines.join("\n");
+		expect(text).toContain("helper");
+		expect(text).toContain(wrapperReason);
+		expect(text).not.toContain("websearch (");
+
+		const restoreLines = restoreNoticeLines(
+			{
+				restored: ["kept"],
+				failed: [],
+				notSaved: [
+					{ name: "websearch", reason: wrapperReason },
+					{ name: "helper", reason: wrapperReason },
+				],
+				path: "/tmp/kernel-state.dill",
+			},
+			new Set(["websearch"]),
+		);
+		const restoreText = restoreLines.join("\n");
+		expect(restoreText).toContain("helper");
+		expect(restoreText).toContain(wrapperReason);
+		expect(restoreText).not.toMatch(/websearch \(/);
+	});
+
 	it("compaction notice omits internal skips but keeps real losses", () => {
 		const lines = compactionKernelStateLines({
 			snapshot: {
@@ -55,6 +98,7 @@ describe("snapshot notices filter routine internal names", () => {
 				path: "/tmp/kernel-state.dill",
 			},
 			names: ["df"],
+			reboundNames: new Set(["websearch"]),
 		});
 		const text = lines.join("\n");
 		expect(text).toContain("gen (TypeError: cannot pickle 'generator' object)");
@@ -74,6 +118,7 @@ describe("snapshot notices filter routine internal names", () => {
 				path: "/tmp/kernel-state.dill",
 			},
 			names: ["df"],
+			reboundNames: new Set(["websearch"]),
 		});
 		expect(lines.join("\n")).not.toContain("could not be saved into the snapshot");
 	});

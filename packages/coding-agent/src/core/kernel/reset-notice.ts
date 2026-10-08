@@ -52,6 +52,12 @@ export interface KernelResetNoticeFacts {
 	 * on the age of the payload, and the model reasons from this number about what it still has.
 	 */
 	snapshotWrittenBeforeDeathMs?: number;
+	/**
+	 * Public names this kernel's bootstrap re-injects on every start (the skill import
+	 * names), used to classify never-saved drops as routine. Absent when the caller
+	 * cannot tell, in which case only the internal prefixes are routine.
+	 */
+	reboundNames?: ReadonlySet<string>;
 }
 
 /** Seconds with enough precision to matter, and no false precision beyond that. */
@@ -110,9 +116,11 @@ function rollbackLine(facts: KernelResetNoticeFacts): string {
 			: "";
 	// A name the snapshot never saved cannot fail to restore, so it would otherwise be absent from
 	// both this line and "must be rebuilt" - the exact silence this notice exists to break. Routine
-	// skips (leading-underscore internals, host skill wrappers) are filtered like the other
-	// notices: the bootstrap re-binds them on every start, so there is nothing to rebuild.
-	const notSavedEntries = restore.notSaved?.filter((entry) => !isExpectedSnapshotSkip(entry));
+	// skips (leading-underscore internals, the re-injected skill bindings in reboundNames) are
+	// filtered like the other notices: the bootstrap re-binds them on every start, so there is
+	// nothing to rebuild. Any other name - including a user alias of a re-injected binding - is a
+	// real loss and stays listed.
+	const notSavedEntries = restore.notSaved?.filter((entry) => !isExpectedSnapshotSkip(entry, facts.reboundNames));
 	const notSaved =
 		notSavedEntries && notSavedEntries.length > 0
 			? ` These were live when that snapshot was written but were never saved into it, so they are gone and must be rebuilt: ${notSavedEntries.map((entry) => `${entry.name} (${entry.reason})`).join("; ")}.`

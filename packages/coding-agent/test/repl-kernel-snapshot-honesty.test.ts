@@ -307,6 +307,8 @@ describe("kernel reset notice freshness wording", () => {
 		// Older payloads list the `_prime_agent_*` helpers and `_PrimeAgent*` wrapper
 		// classes as never-saved; the bootstrap re-binds them on every start, so a
 		// "must be rebuilt" notice for them is noise about names the model never owned.
+		// `websearch` is filtered because this kernel's bootstrap re-injects it (it is
+		// in reboundNames, the skill import names), not because of its drop reason.
 		const notice = formatKernelResetNotice({
 			...base,
 			restore: {
@@ -322,10 +324,33 @@ describe("kernel reset notice freshness wording", () => {
 				],
 				path: "/tmp/kernel-state.dill",
 			},
+			reboundNames: new Set(["websearch"]),
 			snapshotWrittenBeforeDeathMs: 1_000,
 		});
 		expect(notice).toContain("gen (TypeError: cannot pickle 'generator' object)");
 		expect(notice).not.toContain("_prime_agent_sys");
 		expect(notice).not.toContain("websearch");
+	});
+
+	it("reports a user alias of a re-injected binding as a real loss", () => {
+		// Section-9 item 12 / backlog 79: `helper = websearch` in a cell carries the
+		// same cannot-pickle reason as the wrapper, but only the import name is
+		// re-injected - the alias is gone after a restart and must be named.
+		const notice = formatKernelResetNotice({
+			...base,
+			restore: {
+				restored: ["kept"],
+				failed: [],
+				notSaved: [
+					{ name: "websearch", reason: "TypeError: cannot pickle '_PrimeAgentCallableSkillModule' object" },
+					{ name: "helper", reason: "TypeError: cannot pickle '_PrimeAgentCallableSkillModule' object" },
+				],
+				path: "/tmp/kernel-state.dill",
+			},
+			reboundNames: new Set(["websearch"]),
+			snapshotWrittenBeforeDeathMs: 1_000,
+		});
+		expect(notice).toContain("helper (TypeError: cannot pickle '_PrimeAgentCallableSkillModule' object)");
+		expect(notice).not.toContain("websearch (");
 	});
 });

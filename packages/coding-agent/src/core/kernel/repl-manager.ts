@@ -672,6 +672,13 @@ export class ReplKernelManager {
 	 * from an older payload). Recorded because the write-side report had no consumer at all, and
 	 * used as the fallback when the manifest next to the payload cannot be read. */
 	private lastSnapshotNotSaved: SnapshotDroppedName[] = [];
+	/**
+	 * Public names this kernel's bootstrap re-injects on every start (the skill import
+	 * names), for the routine-skip classification: a snapshot drop under one of them is
+	 * noise, a drop under any other name - including a user alias of one of them - is a
+	 * real loss. Frozen at construction because the skill set is fixed per kernel build.
+	 */
+	private readonly reboundSkillNames: ReadonlySet<string>;
 	private rebootstrapPromise?: Promise<boolean>;
 	private teardownInFlight = 0;
 
@@ -693,6 +700,7 @@ export class ReplKernelManager {
 			readOnlyHostRequestTimeoutMs: options.readOnlyHostRequestTimeoutMs,
 			onLateHostReply: options.onLateHostReply,
 		};
+		this.reboundSkillNames = new Set((options.pythonSkills ?? []).map((skill) => skill.importName));
 		this.restartLedger = options.restartLedger ?? new KernelRestartLedger();
 	}
 
@@ -794,6 +802,7 @@ export class ReplKernelManager {
 			restoreTimedOut: this.lastRestoreTimedOut,
 			restoreRetriedAfterTimeout: this.lastRestoreRetried,
 			repeatedCell: forCode !== undefined && repeatedCellCode !== undefined && forCode === repeatedCellCode,
+			reboundNames: this.reboundSkillNames,
 		});
 	}
 
@@ -3280,10 +3289,11 @@ export class ReplKernelManager {
 						.map((entry) => `${entry.name} (${entry.reason})`)
 						.join("; ")}`,
 				);
-				// By-convention skips (private names, host skill wrappers) fire on every
-				// healthy snapshot, so they are debug noise; warn only when a name outside
-				// the convention failed to save (wave-36 walkthrough F4).
-				if (this.lastSnapshotNotSaved.some((entry) => !isExpectedSnapshotSkip(entry))) {
+				// By-convention skips (private names, the re-injected skill bindings)
+				// fire on every healthy snapshot, so they are debug noise; warn only
+				// when a name outside the convention failed to save (wave-36
+				// walkthrough F4).
+				if (this.lastSnapshotNotSaved.some((entry) => !isExpectedSnapshotSkip(entry, this.reboundSkillNames))) {
 					kernelLog.warn("kernel state snapshot could not save names", {
 						names,
 						sessionId: this.options.sessionId,

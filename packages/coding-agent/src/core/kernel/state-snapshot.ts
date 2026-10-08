@@ -41,14 +41,18 @@ export interface SnapshotDroppedName {
 /**
  * Skip classes a healthy snapshot produces every time: the bootstrap re-binds the
  * `_prime_agent_*` internals and `_PrimeAgent*` wrapper classes on every start (and
- * re-injects the public wrapper bindings over a restore anyway), and module-dunder
+ * re-injects the public skill bindings over a restore anyway), and module-dunder
  * names are bookkeeping present in every namespace. A write whose dropped names are
  * all these is routine, not warning-worthy.
  *
  * The classification is by name, never by the drop reason: the runtime reports a
  * user-bound leading-underscore name (`_cache = …`) with the same "private-name
- * convention" reason the internals used to carry, and a reason-string match would
- * hide a genuinely lost user name from every notice.
+ * convention" reason the internals used to carry, and a user alias of a host wrapper
+ * (`helper = websearch`) with the same "cannot pickle '_PrimeAgent…'" reason the
+ * wrapper itself gets - a reason-string match would hide a genuinely lost user name
+ * from every notice. The public skill bindings the bootstrap re-injects are exactly
+ * the skill import names, so callers that know them pass them as `reboundNames`;
+ * a drop under any other name is a real loss, whatever its reason.
  */
 const SNAPSHOT_INTERNAL_NAME_PREFIXES = ["_prime_agent_", "_PrimeAgent", "_PRIME_AGENT_"];
 
@@ -59,8 +63,14 @@ function isInternalSnapshotName(name: string): boolean {
 	);
 }
 
-export function isExpectedSnapshotSkip(entry: SnapshotDroppedName): boolean {
-	return isInternalSnapshotName(entry.name) || entry.reason.includes("cannot pickle '_PrimeAgent");
+/**
+ * Whether a dropped name is routine (the kernel re-creates it on every start) rather
+ * than a loss. By name only: the internal prefixes here, plus the public names the
+ * caller knows the bootstrap re-injects (`reboundNames`, the kernel's skill import
+ * names). The drop reason is never consulted.
+ */
+export function isExpectedSnapshotSkip(entry: SnapshotDroppedName, reboundNames?: ReadonlySet<string>): boolean {
+	return isInternalSnapshotName(entry.name) || (reboundNames?.has(entry.name) ?? false);
 }
 
 /** One revived name whose semantics are reduced, and the runtime's reason. */
@@ -179,6 +189,12 @@ export function compactionKernelStateLines(input: {
 	hasSnapshotConfig?: boolean;
 	/** Namespace listing result, or null when the kernel could not be listed. */
 	names: string[] | null;
+	/**
+	 * Public names this kernel's bootstrap re-injects on every start (the skill import
+	 * names). Drops under them are routine; a drop under any other name - including a
+	 * user alias of a re-injected binding - is a real loss and stays listed.
+	 */
+	reboundNames?: ReadonlySet<string>;
 }): string[] {
 	const lines: string[] = [];
 	if (input.snapshot === null) {
@@ -203,11 +219,12 @@ export function compactionKernelStateLines(input: {
 		);
 		const skipped = input.snapshot.skipped ?? [];
 		// Routine skips (leading-underscore internals the bootstrap re-binds on every
-		// start, host skill wrappers that cannot pickle) fire on every healthy write, so
-		// listing them is noise about names the model never defined and cannot act on.
-		// Older runtimes still report them in the payload, so the filter lives here at
-		// render time. A genuinely lost user name is still listed.
-		const unexpectedSkipped = skipped.filter((entry) => !isExpectedSnapshotSkip(entry));
+		// start, and the public skill bindings it re-injects, given by reboundNames)
+		// fire on every healthy write, so listing them is noise about names the model
+		// never defined and cannot act on. Older runtimes still report them in the
+		// payload, so the filter lives here at render time. A genuinely lost user
+		// name is still listed.
+		const unexpectedSkipped = skipped.filter((entry) => !isExpectedSnapshotSkip(entry, input.reboundNames));
 		if (unexpectedSkipped.length > 0) {
 			lines.push(
 				`These were live but could not be saved into the snapshot, so they will not survive a restart: ${unexpectedSkipped
@@ -248,9 +265,11 @@ export function snapshotFailureNoticeLines(detail: string): string[] {
 /**
  * The `<ipython_state_restored>` body for one restore result. Kept next to the result shape
  * so the wording is assertable without building a session; the session glue that renders it
- * lives in agent-session.ts.
+ * lives in agent-session.ts. `reboundNames` carries the public skill import names the
+ * bootstrap re-injects on every start; drops under them are routine, any other name is a
+ * real loss (see isExpectedSnapshotSkip).
  */
-export function restoreNoticeLines(result: RestoreResult): string[] {
+export function restoreNoticeLines(result: RestoreResult, reboundNames?: ReadonlySet<string>): string[] {
 	const lines: string[] = [];
 	if (result.restored.length > 0) {
 		lines.push(
@@ -283,10 +302,11 @@ export function restoreNoticeLines(result: RestoreResult): string[] {
 	}
 	// The other half of "these came back": a name that never entered the payload cannot fail to
 	// restore, so without this line the model hears nothing at all about it. Routine skips
-	// (leading-underscore internals, host skill wrappers) are filtered like the write-side
-	// notice: every manifest carries them, and the model can neither rebuild nor avoid them.
+	// (leading-underscore internals, the re-injected skill bindings in reboundNames) are
+	// filtered like the write-side notice: every manifest carries them, and the model can
+	// neither rebuild nor avoid them.
 	if (result.notSaved && result.notSaved.length > 0) {
-		const notSaved = result.notSaved.filter((entry) => !isExpectedSnapshotSkip(entry));
+		const notSaved = result.notSaved.filter((entry) => !isExpectedSnapshotSkip(entry, reboundNames));
 		if (notSaved.length > 0) {
 			lines.push(
 				`These were live when that snapshot was written but were never saved into it, so they are gone and must be recreated: ${notSaved

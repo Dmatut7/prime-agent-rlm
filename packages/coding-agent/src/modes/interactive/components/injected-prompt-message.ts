@@ -367,19 +367,26 @@ export class InjectedPromptMessageComponent extends Container implements Focusab
 	}
 
 	/**
-	 * The restore card's label: recovered, partial (names lost, warning tone), or a fresh
-	 * kernel. Messages written before the roster details existed carry only the boolean,
-	 * so they keep the two boolean labels.
+	 * The restore card's label: recovered, partial (names lost, warning tone), degraded
+	 * (names back but unsafe to use, warning tone), or a fresh kernel. Messages written
+	 * before the roster details existed carry only the boolean, so they keep the two
+	 * boolean labels. Degraded names count as trouble even with nothing lost: the
+	 * kernel's own severity call for them is "can silently misbehave, redefine before
+	 * use", which the routine recovered color would hide.
 	 */
 	private restoreLabel(): { text: string; trouble: boolean } {
 		const details = this.message.details as IpythonStateRestoredDetails | undefined;
 		const lost = (details?.failed?.length ?? 0) + (details?.notSaved?.length ?? 0);
+		const degraded = details?.degraded?.length ?? 0;
 		if (lost > 0) {
 			const base = details?.restored === false ? "新开了 Python 环境" : "Python 环境部分恢复";
 			return { text: `${base}（${lost} 个名字没回来）`, trouble: true };
 		}
 		if (details?.restoreError) {
 			return { text: "新开了 Python 环境（恢复失败）", trouble: true };
+		}
+		if (degraded > 0) {
+			return { text: `Python 环境已恢复（${degraded} 个名字行为可能不准）`, trouble: true };
 		}
 		return { text: details?.restored === false ? "新开了 Python 环境" : "Python 环境已恢复", trouble: false };
 	}

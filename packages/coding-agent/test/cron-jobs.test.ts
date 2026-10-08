@@ -808,6 +808,56 @@ describe("AgentCronJobStore", () => {
 		});
 	});
 
+	it("heartbeat resume clears a pause reason parked on lastError", () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		const job = store.createHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 30s",
+			prompt: "check on me",
+			now: start,
+		});
+		const reason = "the session working directory no longer exists: /tmp/project";
+		store.pauseJob(job.id, { reason, now: new Date("2026-01-01T12:35:00.000Z") });
+		expect(store.getHeartbeat("active-1")).toMatchObject({ status: "paused", lastError: reason });
+
+		// The documented recovery for the missing-cwd brake: restore the directory
+		// and resume. A resume that keeps lastError leaves the /crons list showing
+		// an Error row for a job that is running again.
+		const resumed = store.resumeHeartbeat("active-1", new Date("2026-01-01T12:36:00.000Z"));
+
+		expect(resumed).toMatchObject({ id: job.id, status: "active" });
+		expect(resumed).not.toHaveProperty("lastError");
+		expect(store.getHeartbeat("active-1")).not.toHaveProperty("lastError");
+	});
+
+	it("rlm heartbeat resume clears a pause reason parked on lastError", () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		const heartbeat = store.createRlmHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 5m",
+			prompt: "wake me up",
+			now: start,
+		});
+		const reason = "the session working directory no longer exists: /tmp/project";
+		store.pauseJob(heartbeat.id, { reason, now: new Date("2026-01-01T12:35:00.000Z") });
+		expect(store.listRlmHeartbeats("active-1")[0]).toMatchObject({ status: "paused", lastError: reason });
+
+		const resumed = store.updateRlmHeartbeat("active-1", heartbeat.id, {
+			status: "resume",
+			now: new Date("2026-01-01T12:36:00.000Z"),
+		});
+
+		expect(resumed).toMatchObject({ id: heartbeat.id, status: "active" });
+		expect(resumed).not.toHaveProperty("lastError");
+		expect(store.listRlmHeartbeats("active-1")[0]).not.toHaveProperty("lastError");
+	});
+
 	it("pauseJob leaves terminal jobs and unknown ids alone", () => {
 		const store = new AgentCronJobStore(makeStorePath(tempDirs));
 		const cancelled = store.create({

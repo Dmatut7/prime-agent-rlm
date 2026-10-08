@@ -672,7 +672,15 @@ export class AgentCronJobStore {
 				if (!nextRunAt) {
 					throw new Error("RLM heartbeat schedule must be recurring");
 				}
-				nextJob = { ...nextJob, status: "active", nextRunAt: nextRunAt.toISOString() };
+				// A resume is the documented recovery from a paused-with-reason park
+				// (missing cwd): the reason is resolved, so it must not linger on
+				// lastError and keep the job listing showing an Error row.
+				nextJob = {
+					...nextJob,
+					status: "active",
+					nextRunAt: nextRunAt.toISOString(),
+					lastError: undefined,
+				};
 			}
 			updated = { ...nextJob, updatedAt: updatedAtForMutation(now, job) };
 			return updated;
@@ -786,6 +794,10 @@ export class AgentCronJobStore {
 				...job,
 				status: "active",
 				nextRunAt: nextRunAt.toISOString(),
+				// Same as the rlm_heartbeat resume: a resumed job has recovered from
+				// whatever parked it, so the pause reason must not keep rendering as
+				// an Error row in the job listing.
+				lastError: undefined,
 				updatedAt: updatedAtForMutation(now, job),
 			};
 			return resumed;

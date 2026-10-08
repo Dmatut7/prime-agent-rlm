@@ -11,6 +11,7 @@ import {
 	type SnapshotWritePolicyInput,
 	snapshotWritePolicy,
 } from "../src/core/kernel/state-snapshot.js";
+import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
 
 let tempDir = "";
 let entries: LogEntry[] = [];
@@ -110,12 +111,13 @@ function snapshotRequests(): Record<string, unknown>[] {
 function newManager(
 	fakeKernel: string,
 	env: Record<string, string>,
-	options: { snapshot?: boolean } = {},
+	options: { snapshot?: boolean; pythonSkills?: PythonSkillRuntimeInfo[] } = {},
 ): ReplKernelManager {
 	return new ReplKernelManager({
 		python: fakeKernel,
 		cwd: tempDir,
 		sessionId: "session-policy",
+		pythonSkills: options.pythonSkills,
 		env: {
 			FAKE_SNAPSHOT_PATH: snapshotPath,
 			FAKE_MANIFEST_PATH: manifestPath,
@@ -317,12 +319,27 @@ describe("snapshot writes after a partial restore", () => {
 describe("snapshot skip log level", () => {
 	it("logs by-convention skips at debug, not warn", async () => {
 		const fakeKernel = writeFakeKernel();
-		const manager = newManager(fakeKernel, {
-			FAKE_SKIPPED_JSON: JSON.stringify([
-				{ name: "_prime_agent_sys", reason: "private-name convention: leading-underscore names are not persisted" },
-				{ name: "websearch", reason: "TypeError: cannot pickle '_PrimeAgentCallableSkillModule' object" },
-			]),
-		});
+		// `websearch` is one of this kernel's pre-imported skills, so its drop is
+		// routine by name (reboundSkillNames), not by its cannot-pickle reason.
+		const websearchSkill: PythonSkillRuntimeInfo = {
+			name: "websearch",
+			importName: "websearch",
+			packagePath: "/tmp/websearch",
+			pyprojectPath: "/tmp/websearch/pyproject.toml",
+		};
+		const manager = newManager(
+			fakeKernel,
+			{
+				FAKE_SKIPPED_JSON: JSON.stringify([
+					{
+						name: "_prime_agent_sys",
+						reason: "private-name convention: leading-underscore names are not persisted",
+					},
+					{ name: "websearch", reason: "TypeError: cannot pickle '_PrimeAgentCallableSkillModule' object" },
+				]),
+			},
+			{ pythonSkills: [websearchSkill] },
+		);
 
 		try {
 			await manager.start();
