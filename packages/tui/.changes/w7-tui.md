@@ -1,0 +1,25 @@
+- Fixed truncated lines keeping an open OSC 8 hyperlink: the ellipsis and padding no longer stay clickable or leak the link into the next row.
+- Fixed width accounting for lone surrogates (they print as U+FFFD): lines containing them no longer misalign by one column each.
+- Fixed `wrapTextWithAnsi` emitting spurious empty lines when a wide character cannot fit a narrow width.
+- Fixed `COLUMNS`/`LINES` env vars overriding the default terminal size when stdout is not a TTY.
+- Fixed `COLORFGBG` background detection: bg=7 (white) is now light and bg=8 (bright black) dark, matching the reference heuristic.
+- Capped the OSC 52 clipboard fallback at 100KB encoded; larger selections no longer write a payload terminals choke on.
+- Fixed the `setClearOnShrink` docstring, which described the default backwards (it is off by default).
+- Fixed a DEL byte inside a bulk input run being inserted as invisible text instead of acting as Backspace.
+- Fixed the fullscreen "back to bottom" hint row staying selectable/copyable while it hides a transcript line.
+- Fixed drag-selection highlights landing on rows that changed mid-drag (e.g. a ticking dock).
+- Fixed drag auto-scroll not starting when the anchor is on the first transcript row and the pointer reaches the header row.
+- Fixed the mouse wheel dying over dock regions (e.g. the subagent strip) while an overlay has focus.
+- Fixed drag-selection highlight blanking kitty placeholder image cells.
+- Fixed drag-copying an inline (kitty/iTerm2) image row producing blank lines; it now copies one `[image]` marker per image.
+- Fixed a pending click-hold anchoring to the wrong row when a history page prepends above it mid-frame.
+- Fixed the editor's bottom scroll indicator not truncating at narrow widths (it now mirrors the top indicator).
+- Fixed `Loader.setIndicator` dropping the theme color on the default spinner frames when called with options that carry no frames.
+- Fixed `Image` emitting degenerate `c=0`/`width=-1` geometry at render width <= 2, and not re-rendering when terminal capabilities change at runtime.
+- Removed the dead `maxHeightCells` image option (declared and documented, never consumed).
+- Fixed editor undo leaving stale snap bookkeeping that sent the next vertical move to a wrong column.
+- Fixed deleted paste markers leaving their content behind: a hand-typed `[paste #N]` literal no longer expands to stale pasted text at submit.
+- Fixed vertical cursor movement measuring visual columns in code units, drifting the caret on CJK lines.
+- Fixed the hardware cursor disappearing while autocomplete is open (IME candidate window lost its anchor); it now rides the popup anchor.
+- Fixed pastes over the 8MB part budget creating one `[paste #N]` marker per part; parts are joined back into a single marker, and an aborted split paste is discarded whole.
+- Fixed `Spacer` and empty `Box` returning a fresh array every render, defeating the line aggregator's identity memoization.

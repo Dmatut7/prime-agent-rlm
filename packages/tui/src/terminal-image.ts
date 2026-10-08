@@ -24,7 +24,6 @@ export interface ImageDimensions {
 
 export interface ImageRenderOptions {
 	maxWidthCells?: number;
-	maxHeightCells?: number;
 	preserveAspectRatio?: boolean;
 	/** Kitty image ID. If provided, reuses/replaces existing image with this ID. */
 	imageId?: number;

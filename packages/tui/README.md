@@ -523,7 +523,6 @@ interface ImageTheme {
 
 interface ImageOptions {
   maxWidthCells?: number;
-  maxHeightCells?: number;
   filename?: string;
   fallbackOnly?: boolean;
 }

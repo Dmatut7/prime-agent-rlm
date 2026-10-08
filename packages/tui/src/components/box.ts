@@ -11,6 +11,9 @@ type RenderCache = {
 	selectionRegions: TableCellSelectionRegion[];
 };
 
+/** Shared empty render result: a fresh array per frame defeats output-identity memoization. */
+const EMPTY_RENDER: string[] = [];
+
 type ClickCache = {
 	clickRegions: ClickRegion[];
 };
@@ -83,7 +86,7 @@ export class Box implements Component {
 		if (this.children.length === 0) {
 			this.cache = undefined;
 			this.clickCache = { clickRegions: [] };
-			return [];
+			return EMPTY_RENDER;
 		}
 
 		const contentWidth = Math.max(1, width - this.paddingX * 2);
@@ -121,7 +124,7 @@ export class Box implements Component {
 		if (childLines.length === 0) {
 			this.cache = undefined;
 			this.clickCache = { clickRegions: [] };
-			return [];
+			return EMPTY_RENDER;
 		}
 		this.clickCache = { clickRegions };
 

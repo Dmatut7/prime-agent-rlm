@@ -5,6 +5,9 @@ import type { Component } from "../tui.js";
  */
 export class Spacer implements Component {
 	private lines: number;
+	// Stable identity: a fresh array per render defeats the line aggregator's
+	// unchanged-output check and rebuilds the whole transcript line list.
+	private cached: string[] = [];
 
 	constructor(lines: number = 1) {
 		this.lines = lines;
@@ -17,10 +20,9 @@ export class Spacer implements Component {
 	invalidate(): void {}
 
 	render(_width: number): string[] {
-		const result: string[] = [];
-		for (let i = 0; i < this.lines; i++) {
-			result.push("");
+		if (this.cached.length !== this.lines) {
+			this.cached = Array.from({ length: this.lines }, () => "");
 		}
-		return result;
+		return this.cached;
 	}
 }

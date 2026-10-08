@@ -390,4 +390,13 @@ describe("wrapTextWithAnsi with CJK prose", () => {
 		assert.ok(lines.length > 1);
 		for (const line of lines.slice(1)) assert.ok(line.startsWith("\x1b[31m"), JSON.stringify(line));
 	});
+
+	it("does not emit empty lines when a wide grapheme cannot fit the width", () => {
+		// A wide char can never fit width 1: it lands on its own (overwide) line,
+		// but no empty line may precede it.
+		assert.deepStrictEqual(wrapTextWithAnsi("你好", 1), ["你", "好"]);
+		for (const line of wrapTextWithAnsi("a你b好c", 1)) {
+			assert.ok(line.length > 0, JSON.stringify(wrapTextWithAnsi("a你b好c", 1)));
+		}
+	});
 });

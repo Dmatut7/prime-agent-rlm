@@ -4,7 +4,8 @@ import { stripVTControlCharacters } from "node:util";
 import { type AutocompleteProvider, CombinedAutocompleteProvider } from "../src/autocomplete.js";
 import { Editor, wordWrapLine } from "../src/components/editor.js";
 import { StdinBuffer } from "../src/stdin-buffer.js";
-import { TUI } from "../src/tui.js";
+import { createPastePartJoiner } from "../src/terminal.js";
+import { CURSOR_MARKER, TUI } from "../src/tui.js";
 import { visibleWidth } from "../src/utils.js";
 import { defaultEditorTheme } from "./test-themes.js";
 import { VirtualTerminal } from "./virtual-terminal.js";
@@ -4100,5 +4101,145 @@ describe("Editor component", () => {
 			assert.ok(changes <= 8, `expected bulk insertion, saw ${changes} onChange calls`);
 			assert.ok(elapsed < 3_000, `200k characters took ${elapsed.toFixed(0)}ms`);
 		});
+	});
+});
+
+describe("Editor scroll indicator truncation", () => {
+	it("truncates the bottom scroll indicator to the render width", () => {
+		const editor = new Editor(createTestTUI(), defaultEditorTheme);
+		editor.setText(Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n"));
+		for (let i = 0; i < 20; i++) editor.handleInput("\x1b[A");
+
+		// The bottom indicator ("─── ↓ 还有 13 行") is wider than 12 columns; the
+		// top indicator already truncates in this situation.
+		for (const line of editor.render(12)) {
+			assert.ok(visibleWidth(line) <= 12, `overwide line: ${JSON.stringify(line)}`);
+		}
+	});
+});
+
+describe("Editor vertical movement display columns", () => {
+	it("keeps the visual column when moving between CJK and ASCII lines", () => {
+		const editor = new Editor(createTestTUI(), defaultEditorTheme);
+		editor.setText("你好ab\nxyzwz");
+		// Cursor starts at the end of "xyzwz" (display column 5). Moving up must
+		// land at display column 5 of the CJK line - after "a" (code unit 3), not
+		// at code unit 5 (the line end, display column 6).
+		editor.handleInput("\x1b[A");
+		assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 3 });
+	});
+});
+
+describe("Editor undo snap bookkeeping", () => {
+	it("clears the atomic-snap bookkeeping on undo", () => {
+		const editor = new Editor(createTestTUI(20, 24), defaultEditorTheme);
+		for (const ch of "abcdefgh") editor.handleInput(ch);
+		editor.handleInput(`\x1b[200~${"x".repeat(2000)}\x1b[201~`);
+		editor.handleInput("\n");
+		for (const ch of "1234567890") editor.handleInput(ch);
+		for (let i = 0; i < 5; i++) editor.handleInput("\x1b[D");
+		editor.render(20);
+
+		// Up onto the wrapped paste marker: the cursor snaps to the marker start.
+		editor.handleInput("\x1b[A");
+		assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 8 });
+
+		// Undo the typing: the restored cursor is (1, 0). The next vertical move
+		// must resolve from that restored position, not from the stale pre-snap
+		// column of the snapped move.
+		editor.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
+		assert.deepStrictEqual(editor.getCursor(), { line: 1, col: 0 });
+		editor.handleInput("\x1b[A");
+		assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 8 });
+	});
+});
+
+describe("Editor stale paste entries", () => {
+	it("does not expand a hand-typed paste marker after the original marker was deleted", () => {
+		const editor = new Editor(createTestTUI(), defaultEditorTheme);
+		editor.handleInput(`\x1b[200~${"x".repeat(2000)}\x1b[201~`);
+		assert.ok(editor.getText().includes("[paste #1"));
+
+		editor.setText("");
+		editor.setText("[paste #1 2000 chars]");
+
+		let submitted = "";
+		editor.onSubmit = (text) => {
+			submitted = text;
+		};
+		editor.handleInput("\r");
+		assert.strictEqual(submitted, "[paste #1 2000 chars]");
+	});
+});
+
+describe("Editor autocomplete hardware cursor", () => {
+	it("keeps the cursor marker on the autocomplete anchor line while the popup is open", async () => {
+		const tui = createTestTUI(60, 24);
+		const editor = new Editor(tui, defaultEditorTheme);
+		tui.setFocus(editor);
+		editor.setAutocompleteProvider({
+			getSuggestions: async () => ({
+				items: [
+					{ value: "/model", label: "model", description: "Change model" },
+					{ value: "/help", label: "help", description: "Show help" },
+				],
+				prefix: "/",
+			}),
+			applyCompletion,
+		});
+
+		editor.handleInput("/");
+		await flushAutocomplete();
+
+		const rendered = editor.render(60);
+		const anchorLine = rendered.find((line) => line.includes("\x1b_pi:autocomplete:"));
+		assert.ok(anchorLine !== undefined, "autocomplete anchor line rendered");
+		// The IME candidate window follows the hardware cursor; with the popup
+		// open the cursor marker moves to the popup's anchor instead of vanishing.
+		assert.ok(anchorLine.includes(CURSOR_MARKER), "cursor marker rides the autocomplete anchor line");
+		assert.strictEqual(
+			rendered.filter((line) => line.includes(CURSOR_MARKER)).length,
+			1,
+			"exactly one cursor marker",
+		);
+	});
+
+	it("keeps the cursor marker at the text cursor when no autocomplete is open", () => {
+		const tui = createTestTUI(60, 24);
+		const editor = new Editor(tui, defaultEditorTheme);
+		tui.setFocus(editor);
+		editor.setText("ab");
+		const rendered = editor.render(60);
+		const markerLines = rendered.filter((line) => line.includes(CURSOR_MARKER));
+		assert.strictEqual(markerLines.length, 1);
+		assert.ok(markerLines[0]!.includes("ab"), "marker stays on the cursor line");
+	});
+});
+
+describe("Editor split paste parts", () => {
+	it("merges byte-cap paste parts into a single marker", async () => {
+		const editor = new Editor(createTestTUI(), defaultEditorTheme);
+		const stdin = new StdinBuffer({ timeout: 10, pasteSettleMs: 1, pasteMaxBytes: 1024 });
+		const joiner = createPastePartJoiner();
+		stdin.on("paste", (content, moreParts) => {
+			const wrapped = joiner.wrap(content, moreParts);
+			if (wrapped !== null) editor.handleInput(wrapped);
+		});
+		stdin.on("pasteabort", () => joiner.reset());
+
+		const text = "x".repeat(3000);
+		// Two chunks, each over the 1024-byte part budget: the paste goes out in
+		// two parts and must still become a single marker.
+		stdin.process(`\x1b[200~${"x".repeat(1500)}`);
+		stdin.process(`${"x".repeat(1500)}\x1b[201~`);
+		await new Promise((resolve) => setTimeout(resolve, 30));
+
+		assert.strictEqual(editor.getText(), "[paste #1 3000 chars]");
+		let submitted = "";
+		editor.onSubmit = (value) => {
+			submitted = value;
+		};
+		editor.handleInput("\r");
+		assert.strictEqual(submitted, text);
 	});
 });

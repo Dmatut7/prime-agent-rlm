@@ -15,6 +15,7 @@ import {
 	setCellDimensions,
 } from "../src/terminal-image.js";
 import { type Component, Container, TUI } from "../src/tui.js";
+import { stripAnsi, visibleWidth } from "../src/utils.js";
 import { defaultMarkdownTheme } from "./test-themes.js";
 import { VirtualTerminal } from "./virtual-terminal.js";
 
@@ -1512,9 +1513,11 @@ describe("TUI fullscreen mode", () => {
 		const { linesAbove } = scrollInfo;
 		terminal.sendInput("\x1b[<0;8;8m");
 		await terminal.waitForRender();
+		// The follow hint covers the bottom window row while the window is
+		// paused, so the selection ends one row above it.
 		assert.deepStrictEqual(copies, [
 			lines(30)
-				.slice(3, linesAbove + 8)
+				.slice(3, linesAbove + 7)
 				.join("\n"),
 		]);
 
@@ -1536,6 +1539,107 @@ describe("TUI fullscreen mode", () => {
 		terminal.sendInput("\x1b[<0;8;1m");
 		await terminal.waitForRender();
 		assert.deepStrictEqual(copies, ["Line 22"]);
+
+		tui.stop();
+	});
+
+	it("excludes the follow-hint row from drag selections", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(30));
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		// Pause following: the hint paints over the bottom transcript window row.
+		terminal.sendInput(VIEWPORT_TOP);
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes("回到底部"), "follow hint painted");
+
+		// Drag from the first window row down onto the hint row. The hint hides
+		// transcript line 7, so the copy must stop at line 6.
+		terminal.sendInput("\x1b[<0;1;1M");
+		terminal.sendInput("\x1b[<32;39;8M");
+		terminal.sendInput("\x1b[<0;39;8m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, [lines(7).join("\n")]);
+
+		tui.stop();
+	});
+
+	it("auto-scrolls up when a drag from the first transcript row reaches the header row", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui = new TUI(terminal);
+		const chat = new TestComponent();
+		chat.lines = lines(30);
+		const header = new TestComponent();
+		header.lines = ["HEADER"];
+		const dock = new TestComponent();
+		dock.lines = ["> prompt", "footer"];
+		tui.addChild(chat);
+		tui.addChild(dock);
+		tui.start();
+		tui.enterFullscreen({ scroll: [chat], dock, pin: header });
+		await terminal.waitForRender();
+
+		// Anchor on the first transcript row (1-based row 2, under the header),
+		// then drag into the header row: the pointer above the selectable zone is
+		// unambiguous upward intent even though the head clamps to the anchor line.
+		terminal.sendInput("\x1b[<0;5;2M");
+		terminal.sendInput("\x1b[<32;5;1M");
+		await waitFor(() => (tui.getScrollInfo()?.linesAbove ?? 23) < 23);
+
+		terminal.sendInput("\x1b[<0;5;1m");
+		await terminal.waitForRender();
+
+		tui.stop();
+	});
+
+	it("delivers wheel events to dock regions while an overlay is focused", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui = new TUI(terminal);
+		const chat = new TestComponent();
+		chat.lines = lines(30);
+		const wheelDirections: number[] = [];
+		class WheelDock extends TestComponent {
+			getClickRegions() {
+				return [
+					{
+						line: 0,
+						col: 0,
+						width: 40,
+						height: 1,
+						onClick: () => {},
+						onWheel: (direction: -1 | 1) => {
+							wheelDirections.push(direction);
+							return true;
+						},
+					},
+				];
+			}
+		}
+		const dock = new WheelDock();
+		dock.lines = ["> prompt", "footer"];
+		tui.addChild(chat);
+		tui.addChild(dock);
+		tui.start();
+		tui.enterFullscreen({ scroll: [chat], dock });
+
+		const overlay = new InputComponent();
+		overlay.lines = ["overlay"];
+		tui.showOverlay(overlay, { anchor: "center", width: 20 });
+		await terminal.waitForRender();
+
+		// Wheel over the dock region (1-based row 9): the region scrolls...
+		terminal.sendInput("\x1b[<65;5;9M");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(wheelDirections, [1]);
+
+		// ...while the wheel over plain transcript rows stays swallowed by the
+		// focused overlay (no background scroll).
+		const before = tui.getScrollInfo()?.linesAbove;
+		terminal.sendInput("\x1b[<65;5;3M");
+		await terminal.waitForRender();
+		assert.strictEqual(tui.getScrollInfo()?.linesAbove, before);
 
 		tui.stop();
 	});
@@ -1572,6 +1676,28 @@ describe("TUI fullscreen mode", () => {
 
 		const expected = Buffer.from("Line 12", "utf8").toString("base64");
 		assert.ok(terminal.getWrites().includes(`\x1b]52;c;${expected}\x07`));
+
+		tui.stop();
+	});
+
+	it("skips the OSC 52 fallback when the copied text exceeds the encoded cap", async () => {
+		// ~44 cols x 2000 lines ≈ 88KB raw, ~117KB base64: over the 100KB cap.
+		const wide = Array.from({ length: 2000 }, (_, i) => `L${i} ${"x".repeat(40)}`);
+		const { terminal, tui, chat, dock } = setup(wide);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		// Anchor at the first transcript row, then wheel to the bottom and
+		// extend: the selection spans the whole transcript without a slow drag.
+		terminal.sendInput(VIEWPORT_TOP);
+		await terminal.waitForRender();
+		terminal.sendInput("\x1b[<0;1;1M");
+		for (let i = 0; i < 2000; i++) terminal.sendInput(WHEEL_DOWN);
+		terminal.sendInput("\x1b[<32;39;8M");
+		terminal.sendInput("\x1b[<0;39;8m");
+		await terminal.waitForRender();
+
+		assert.ok(!terminal.getWrites().includes("\x1b]52;"), "no OSC 52 write over the cap");
 
 		tui.stop();
 	});
@@ -2077,5 +2203,88 @@ describe("FullscreenViewport scroll commands vs a pending click hold", () => {
 		const frame = viewport.composeFrame(transcript, ["dock"], 10);
 		assert.strictEqual(viewport.scrollInfo().linesAbove, 0);
 		assert.strictEqual(frame[0], "row 0");
+	});
+});
+
+describe("FullscreenViewport selection painting", () => {
+	it("does not paint a frame selection highlight onto rows that changed mid-drag", () => {
+		const viewport = new FullscreenViewport();
+		const regions = [
+			{ line: 1, col: 0, width: 40 },
+			{ line: 4, col: 0, width: 40 },
+		];
+
+		const frame1 = viewport.composeFrame(["alpha", "beta"], ["> 12:00:01"], 5);
+		viewport.applyFrameSelection([...frame1], 5, regions);
+		viewport.beginFrameSelection(1, 1);
+		viewport.extendActiveSelection(4, 8);
+
+		// The dock row ticks while the drag is open: the highlight must not land
+		// on the new content at the snapshot's coordinates.
+		const frame2 = viewport.composeFrame(["alpha", "beta"], ["> 12:00:02"], 5);
+		viewport.applyFrameSelection(frame2, 5, regions);
+		assert.ok(!frame2[4]!.includes("\x1b[7m"), "changed row keeps no stale highlight");
+		// Rows that did not change keep their highlight.
+		assert.ok(frame2[1]!.includes("\x1b[7m"), "unchanged row stays highlighted");
+	});
+
+	it("does not paint selection highlight over kitty placeholder image rows", () => {
+		const viewport = new FullscreenViewport();
+		const placeholderRows = encodeKittyPlaceholderRows({ imageId: 7, columns: 4, rows: 2 });
+		const transcript = ["before", ...placeholderRows, "after"];
+		viewport.composeFrame(transcript, [], 6);
+		viewport.beginSelection(0, 0);
+		viewport.extendActiveSelection(5, 9);
+		const frame = viewport.composeFrame(transcript, [], 6);
+
+		// Text rows highlight; placeholder rows pass through untouched - their
+		// cells encode the image id in the foreground color and the highlight's
+		// strip/reset would blank the image.
+		assert.ok(frame[0]!.includes("\x1b[7m"), "text row highlighted");
+		assert.strictEqual(frame[1], placeholderRows[0]);
+		assert.strictEqual(frame[2], placeholderRows[1]);
+	});
+
+	it("keeps a selection row at its width when both boundaries split wide chars", () => {
+		const viewport = new FullscreenViewport();
+		const transcript = ["ab你de你fg"];
+		viewport.composeFrame(transcript, [], 3);
+		// 你 spans columns 2-3 and 6-7; the selection starts and ends in the
+		// middle of one each. The highlight must snap to grapheme boundaries,
+		// not build an 11-column row out of a 10-column line.
+		viewport.beginSelection(0, 3);
+		viewport.extendActiveSelection(0, 7);
+		const frame = viewport.composeFrame(transcript, [], 3);
+		assert.strictEqual(visibleWidth(frame[0]!), 10);
+		assert.strictEqual(stripAnsi(frame[0]!), "ab你de你fg");
+	});
+
+	it("copies inline image sequence rows as one [image] marker per image", () => {
+		const viewport = new FullscreenViewport();
+		const apc = "\x1b_Ga=T,f=100;AAAA\x1b\\";
+		const transcript = ["Line 0", apc, "Line 2"];
+		viewport.composeFrame(transcript, [], 5);
+		viewport.beginSelection(0, 0);
+		viewport.extendActiveSelection(2, 6);
+		const text = viewport.endSelection();
+		assert.strictEqual(text, "Line 0\n[image]\nLine 2");
+	});
+});
+
+describe("FullscreenViewport click hold across a transcript prepend", () => {
+	it("shifts a pending click hold with the prepended rows", () => {
+		const viewport = new FullscreenViewport();
+		const transcript = Array.from({ length: 100 }, (_, index) => `row ${index}`);
+		viewport.composeFrame(transcript, [], 10);
+		// Click row 3 of the bottom-pinned window (transcript row 93), opening two
+		// rows below it.
+		viewport.holdForClick(3, 2);
+		// A history page lands above before the next frame is composed.
+		transcript.unshift("old 4", "old 3", "old 2", "old 1", "old 0");
+		viewport.noteTranscriptPrepend(5);
+		viewport.composeFrame(transcript, [], 10);
+		// The clicked row moved to 98; the window must keep showing it, not jump
+		// up to whatever now sits at row 93.
+		assert.strictEqual(viewport.scrollInfo().linesAbove, 95);
 	});
 });

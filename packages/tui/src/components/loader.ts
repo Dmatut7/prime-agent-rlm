@@ -54,7 +54,10 @@ export class Loader extends Text {
 	}
 
 	setIndicator(indicator?: LoaderIndicatorOptions): void {
-		this.renderIndicatorVerbatim = indicator !== undefined;
+		// Caller-provided frames render verbatim (they may carry their own
+		// styling); the default braille frames are unstyled and keep the theme
+		// color, even when options without frames were passed.
+		this.renderIndicatorVerbatim = indicator?.frames !== undefined;
 		this.frames = indicator?.frames !== undefined ? [...indicator.frames] : [...DEFAULT_FRAMES];
 		this.intervalMs = indicator?.intervalMs && indicator.intervalMs > 0 ? indicator.intervalMs : DEFAULT_INTERVAL_MS;
 		this.currentFrame = 0;

@@ -174,7 +174,9 @@ export function detectBackgroundFromColorFgBg(
 	if (Number.isNaN(bg)) {
 		return undefined;
 	}
-	return bg < 8 ? "dark" : "light";
+	// 0-6 are the dark ANSI colors and 8 is bright black (a dark gray); 7 is
+	// white and 9-15 the bright light variants.
+	return (bg >= 0 && bg <= 6) || bg === 8 ? "dark" : "light";
 }
 
 export function getDefaultTerminalColors(): DefaultTerminalColors | undefined {

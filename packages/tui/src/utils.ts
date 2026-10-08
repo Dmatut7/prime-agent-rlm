@@ -142,6 +142,26 @@ function truncateFragmentToWidth(text: string, maxWidth: number): { text: string
 	return { text: result, width };
 }
 
+/** Whether `text` ends with an OSC 8 hyperlink still open (no close sequence after it). */
+function hasOpenOsc8Hyperlink(text: string): boolean {
+	let open = false;
+	let i = 0;
+	const extractAnsi = createAnsiCodeExtractor(text);
+	while (i < text.length) {
+		const ansi = extractAnsi(i);
+		if (ansi) {
+			const hyperlink = parseOsc8Hyperlink(ansi.code);
+			if (hyperlink !== undefined) {
+				open = hyperlink !== null;
+			}
+			i += ansi.length;
+		} else {
+			i++;
+		}
+	}
+	return open;
+}
+
 function finalizeTruncatedResult(
 	prefix: string,
 	prefixWidth: number,
@@ -154,13 +174,22 @@ function finalizeTruncatedResult(
 	const visibleWidth = prefixWidth + ellipsisWidth;
 	const prefixHasAnsi = prefix.includes("\x1b");
 	const ellipsisHasAnsi = ellipsis.includes("\x1b");
+	// A cut landing inside an open OSC 8 hyperlink must close it, or the
+	// ellipsis and the padding stay clickable and the link leaks into the row.
+	const osc8Close = prefixHasAnsi && hasOpenOsc8Hyperlink(prefix) ? "\x1b]8;;\x07" : "";
 	const beforeEllipsis = prefixHasAnsi ? reset : "";
 	const afterEllipsis = prefixHasAnsi || ellipsisHasAnsi ? reset : "";
 	const result =
-		ellipsis.length > 0 ? `${prefix}${beforeEllipsis}${ellipsis}${afterEllipsis}` : `${prefix}${beforeEllipsis}`;
+		ellipsis.length > 0
+			? `${prefix}${osc8Close}${beforeEllipsis}${ellipsis}${afterEllipsis}`
+			: `${prefix}${osc8Close}${beforeEllipsis}`;
 
 	return pad ? result + " ".repeat(Math.max(0, maxWidth - visibleWidth)) : result;
 }
+
+// Matches only unpaired surrogates: a proper pair decodes to its astral code
+// point before the property is consulted.
+const loneSurrogateRegex = /\p{Surrogate}/v;
 
 /**
  * Calculate the terminal width of a single grapheme cluster.
@@ -175,35 +204,55 @@ function graphemeWidth(segment: string): number {
 		return 1;
 	}
 
+	// Lone surrogates encode as U+FFFD on write - one column each on screen.
+	// Strip them before the class tests: \p{Surrogate} would count them
+	// zero-width and the line would misalign by one cell per surrogate.
+	let loneSurrogates = 0;
+	let rest = segment;
+	if (loneSurrogateRegex.test(segment)) {
+		rest = "";
+		for (const char of segment) {
+			const cp = char.codePointAt(0)!;
+			if (cp >= 0xd800 && cp <= 0xdfff) {
+				loneSurrogates++;
+			} else {
+				rest += char;
+			}
+		}
+		if (rest === "") {
+			return loneSurrogates;
+		}
+	}
+
 	// Zero-width clusters
-	if (zeroWidthRegex.test(segment)) {
-		return 0;
+	if (zeroWidthRegex.test(rest)) {
+		return loneSurrogates;
 	}
 
 	// Emoji check with pre-filter
-	if (couldBeEmoji(segment) && rgiEmojiRegex.test(segment)) {
-		return 2;
+	if (couldBeEmoji(rest) && rgiEmojiRegex.test(rest)) {
+		return 2 + loneSurrogates;
 	}
 
 	// Get base visible codepoint
-	const base = segment.replace(leadingNonPrintingRegex, "");
+	const base = rest.replace(leadingNonPrintingRegex, "");
 	const cp = base.codePointAt(0);
 	if (cp === undefined) {
-		return 0;
+		return loneSurrogates;
 	}
 
 	// Regional indicator symbols (U+1F1E6..U+1F1FF) are often rendered as
 	// full-width emoji in terminals, even when isolated during streaming.
 	// Keep width conservative (2) to avoid terminal auto-wrap drift artifacts.
 	if (cp >= 0x1f1e6 && cp <= 0x1f1ff) {
-		return 2;
+		return 2 + loneSurrogates;
 	}
 
 	let width = eastAsianWidth(cp);
 
 	// Trailing halfwidth/fullwidth forms and AM vowels that segment with a base.
-	if (segment.length > 1) {
-		for (const char of segment.slice(1)) {
+	if (rest.length > 1) {
+		for (const char of rest.slice(1)) {
 			const c = char.codePointAt(0)!;
 			if (c >= 0xff00 && c <= 0xffef) {
 				width += eastAsianWidth(c);
@@ -213,7 +262,7 @@ function graphemeWidth(segment: string): number {
 		}
 	}
 
-	return width;
+	return width + loneSurrogates;
 }
 
 /**
@@ -1074,7 +1123,7 @@ function breakLongWord(word: string, width: number, tracker: AnsiCodeTracker): s
 
 		const graphemeWidth = visibleWidth(grapheme);
 
-		if (currentWidth + graphemeWidth > width) {
+		if (currentWidth + graphemeWidth > width && currentWidth > 0) {
 			// Add specific reset for underline only (preserves background)
 			const lineEndReset = tracker.getLineEndReset();
 			if (lineEndReset) {
@@ -1084,6 +1133,8 @@ function breakLongWord(word: string, width: number, tracker: AnsiCodeTracker): s
 			currentLine = tracker.getActiveCodes();
 			currentWidth = 0;
 		}
+		// A grapheme too wide for an empty line (wide char at width 1) goes on the
+		// line anyway: overwide is unavoidable, an empty line before it is not.
 
 		currentLine += grapheme;
 		currentWidth += graphemeWidth;

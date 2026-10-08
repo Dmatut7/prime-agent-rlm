@@ -387,11 +387,13 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 			}
 			// Control bytes carry key semantics, so they stay one sequence each
 			// (newlines are handled inside `pushTextRun`: part of text in a long
-			// run, their own sequence in a short one).
+			// run, their own sequence in a short one). DEL (0x7f) is a control
+			// byte too: it is the Backspace key, and inside a bulk run it would
+			// otherwise be inserted as an invisible 0-width character.
 			let textStart = 0;
 			for (let i = 0; i < run.length; i++) {
 				const code = run.charCodeAt(i);
-				if (code >= 32 || code === 10) {
+				if ((code >= 32 && code !== 0x7f) || code === 10) {
 					continue;
 				}
 				if (i > textStart) {
@@ -455,7 +457,14 @@ export type StdinBufferOptions = {
 
 export type StdinBufferEventMap = {
 	data: [string];
-	paste: [string];
+	/**
+	 * Paste text; `moreParts` is true when the byte cap split the paste and
+	 * further parts (or the closing part) follow. Joining all parts in order
+	 * rebuilds the full paste.
+	 */
+	paste: [string, boolean];
+	/** A paste that emitted parts was aborted (Ctrl+C, abortPendingInput): drop joined partial content. */
+	pasteabort: [];
 };
 
 /**
@@ -559,6 +568,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private pastePending: string = "";
 	/** An end marker was seen; the paste closes once the stream goes quiet. */
 	private pasteTerminated: boolean = false;
+	/** At least one part of this paste was emitted; the close must emit a (possibly empty) final part. */
+	private pastePartEmitted: boolean = false;
 	/** Start of a mouse report at the end of what arrived behind the last end marker. */
 	private pasteMouseHold: string = "";
 	/** Tail of the last paste chunk that can still grow into a terminal response. */
@@ -852,7 +863,9 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.pasteChunks = keep.length > 0 ? [keep] : [];
 		this.pasteBufferBytes = keep.length > 0 ? Buffer.byteLength(keep, "utf8") : 0;
 		if (emit.length > 0) {
-			this.emit("paste", emit);
+			// Non-final part: the paste stays open and more parts follow.
+			this.pastePartEmitted = true;
+			this.emit("paste", emit, true);
 		}
 		this.armPasteCloseTimer();
 	}
@@ -884,7 +897,13 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 		if (text.length === 0) {
 			// Nothing but the terminator: close the paste without an empty event.
-			this.discardPasteMode();
+			// Unless parts already went out - the joiner downstream holds them and
+			// still needs the closing part.
+			if (this.pastePartEmitted) {
+				this.emitPasteAndContinue("");
+			} else {
+				this.discardPasteMode();
+			}
 		} else {
 			this.emitPasteAndContinue(text);
 		}
@@ -913,6 +932,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.pasteBufferBytes = 0;
 		this.pastePending = "";
 		this.pasteTerminated = false;
+		this.pastePartEmitted = false;
 		this.pasteMouseHold = "";
 		this.pasteResponseHold = "";
 	}
@@ -931,12 +951,17 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.pasteMode = false;
 		this.resetPasteState();
 		this.pendingKittyPrintableCodepoint = undefined;
-		this.emit("paste", pastedContent);
+		this.emit("paste", pastedContent, false);
 	}
 
 	private discardPasteMode(): void {
 		this.clearPasteTimers();
 		this.pasteMode = false;
+		// Parts of this paste already went out: the joiner downstream is holding
+		// them and must drop them rather than wait for a closing part.
+		if (this.pastePartEmitted) {
+			this.emit("pasteabort");
+		}
 		this.resetPasteState();
 		this.pendingKittyPrintableCodepoint = undefined;
 	}
@@ -1019,6 +1044,11 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.clearPasteTimers();
 		this.buffer = "";
 		this.pasteMode = false;
+		// Parts of an aborted paste already went out: the joiner downstream is
+		// holding them and must drop them rather than wait for a closing part.
+		if (this.pastePartEmitted) {
+			this.emit("pasteabort");
+		}
 		this.resetPasteState();
 		this.pendingKittyPrintableCodepoint = undefined;
 	}

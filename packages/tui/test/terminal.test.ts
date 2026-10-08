@@ -13,22 +13,20 @@ import {
 import { isGrapheme2027Active } from "../src/utils.js";
 
 describe("ProcessTerminal dimensions", () => {
-	it("falls back to COLUMNS and LINES before default dimensions", () => {
+	const withMockedDimensions = (isTTY: boolean, fn: () => void): void => {
 		const previousColumnsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "columns");
 		const previousRowsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+		const previousIsTTYDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
 		const previousColumns = process.env.COLUMNS;
 		const previousLines = process.env.LINES;
 
 		try {
 			Object.defineProperty(process.stdout, "columns", { value: undefined, configurable: true });
 			Object.defineProperty(process.stdout, "rows", { value: undefined, configurable: true });
+			Object.defineProperty(process.stdout, "isTTY", { value: isTTY, configurable: true });
 			process.env.COLUMNS = "123";
 			process.env.LINES = "45";
-
-			const terminal = new ProcessTerminal();
-
-			assert.equal(terminal.columns, 123);
-			assert.equal(terminal.rows, 45);
+			fn();
 		} finally {
 			if (previousColumnsDescriptor) {
 				Object.defineProperty(process.stdout, "columns", previousColumnsDescriptor);
@@ -39,6 +37,11 @@ describe("ProcessTerminal dimensions", () => {
 				Object.defineProperty(process.stdout, "rows", previousRowsDescriptor);
 			} else {
 				Reflect.deleteProperty(process.stdout, "rows");
+			}
+			if (previousIsTTYDescriptor) {
+				Object.defineProperty(process.stdout, "isTTY", previousIsTTYDescriptor);
+			} else {
+				Reflect.deleteProperty(process.stdout, "isTTY");
 			}
 			if (previousColumns === undefined) {
 				delete process.env.COLUMNS;
@@ -51,6 +54,25 @@ describe("ProcessTerminal dimensions", () => {
 				process.env.LINES = previousLines;
 			}
 		}
+	};
+
+	it("falls back to COLUMNS and LINES before default dimensions on a TTY", () => {
+		withMockedDimensions(true, () => {
+			const terminal = new ProcessTerminal();
+
+			assert.equal(terminal.columns, 123);
+			assert.equal(terminal.rows, 45);
+		});
+	});
+
+	it("ignores COLUMNS and LINES when stdout is not a TTY", () => {
+		// A stale exported COLUMNS must not override the default size behind a pipe.
+		withMockedDimensions(false, () => {
+			const terminal = new ProcessTerminal();
+
+			assert.equal(terminal.columns, 80);
+			assert.equal(terminal.rows, 24);
+		});
 	});
 });
 

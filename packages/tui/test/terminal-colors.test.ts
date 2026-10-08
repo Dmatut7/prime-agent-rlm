@@ -80,4 +80,14 @@ describe("terminal color utilities", () => {
 			}
 		}
 	});
+
+	it("reads COLORFGBG background 7 as light and 8 as dark", () => {
+		// 0-6 are the dark ANSI colors, 7 is white (light), 8 is bright black
+		// (a dark gray), 9-15 the bright light variants.
+		assert.strictEqual(detectBackgroundFromColorFgBg("15;0"), "dark");
+		assert.strictEqual(detectBackgroundFromColorFgBg("15;6"), "dark");
+		assert.strictEqual(detectBackgroundFromColorFgBg("0;7"), "light");
+		assert.strictEqual(detectBackgroundFromColorFgBg("0;8"), "dark");
+		assert.strictEqual(detectBackgroundFromColorFgBg("0;15"), "light");
+	});
 });

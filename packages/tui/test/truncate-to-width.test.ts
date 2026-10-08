@@ -60,6 +60,23 @@ describe("truncateToWidth", () => {
 		assert.strictEqual(truncated, "🙂\t… ");
 	});
 
+	it("closes an OSC 8 hyperlink cut by truncation so the ellipsis is not linked", () => {
+		const text = `\x1b]8;;https://example.com\x07${"x".repeat(100)}`;
+		const truncated = truncateToWidth(text, 10, "…", true);
+
+		const closeIndex = truncated.indexOf("\x1b]8;;\x07");
+		assert.ok(closeIndex !== -1, "truncation inside an open link must close it");
+		assert.ok(closeIndex < truncated.indexOf("…"), "the link closes before the ellipsis");
+	});
+
+	it("does not add an OSC 8 close when no link is open at the cut", () => {
+		const text = `\x1b]8;;https://example.com\x07link\x1b]8;;\x07${"x".repeat(100)}`;
+		const truncated = truncateToWidth(text, 10, "…");
+
+		// The link's own close survives inside the kept prefix; no second one is added.
+		assert.strictEqual(truncated.split("\x1b]8;;\x07").length - 1, 1);
+	});
+
 	it("pads to the exact visible width when ANSI codes split a grapheme cluster", () => {
 		// An SGR sequence inside a cluster makes fragment-wise width accumulation
 		// disagree with visibleWidth(): the tail after the escape is measured as a
@@ -87,6 +104,14 @@ describe("truncateToWidth", () => {
 describe("visibleWidth", () => {
 	it("counts tabs inline and skips ANSI inline", () => {
 		assert.strictEqual(visibleWidth("\t\x1b[31m界\x1b[0m"), 5);
+	});
+
+	it("counts a lone surrogate as one column (it writes out as U+FFFD)", () => {
+		assert.strictEqual(visibleWidth("\uD800"), 1);
+		assert.strictEqual(visibleWidth("\uDFFF"), 1);
+		assert.strictEqual(visibleWidth("a\uD800b"), 3);
+		// A proper pair is one astral code point, not two surrogates.
+		assert.strictEqual(visibleWidth("\uD83D\uDE00"), 2);
 	});
 
 	it("keeps Thai and Lao AM clusters at their normal cell width", () => {

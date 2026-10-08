@@ -536,6 +536,8 @@ export class TUI extends Container {
 		};
 	} | null = null;
 	private static readonly WHEEL_SCROLL_LINES = 1;
+	/** Encoded-length cap for the OSC 52 copy fallback; over it the write is skipped. */
+	private static readonly MAX_OSC52_ENCODED_LENGTH = 100_000;
 	private static readonly SELECTION_AUTO_SCROLL_DELAY_MS = 150;
 	private static readonly SELECTION_AUTO_SCROLL_INTERVAL_MS = 50;
 	private selectionAutoScrollTimer: NodeJS.Timeout | undefined;
@@ -586,8 +588,8 @@ export class TUI extends Container {
 
 	/**
 	 * Set whether to trigger full re-render when content shrinks.
-	 * When true (default), empty rows are cleared when content shrinks.
-	 * When false, empty rows remain (reduces redraws on slower terminals).
+	 * When true, empty rows are cleared when content shrinks.
+	 * When false (default), empty rows remain (reduces redraws on slower terminals).
 	 */
 	setClearOnShrink(enabled: boolean): void {
 		this.clearOnShrink = enabled;
@@ -1166,6 +1168,11 @@ export class TUI extends Container {
 		}
 		// fallback: OSC 52 works locally, over SSH, and through tmux (set-clipboard)
 		const base64 = Buffer.from(text, "utf8").toString("base64");
+		// Terminals choke on unbounded OSC 52 payloads; the coding-agent clipboard
+		// helper uses the same cap.
+		if (base64.length > TUI.MAX_OSC52_ENCODED_LENGTH) {
+			return;
+		}
 		this.terminal.write(`\x1b]52;c;${base64}\x07`);
 	}
 
@@ -1447,7 +1454,16 @@ export class TUI extends Container {
 			} else if (event && overlayFocused) {
 				this.stopSelectionAutoScroll();
 				const viewport = fullscreen.viewport;
-				if (event.button === MOUSE_BUTTON_LEFT && event.press && !event.motion) {
+				if (isWheelUp(event) || isWheelDown(event)) {
+					// The overlay swallows the wheel for itself and the background,
+					// but a region with its own wheel handler (a dock strip) still
+					// gets its events.
+					const direction = isWheelUp(event) ? -1 : 1;
+					const target = viewport.wheelTargetAt(event.y - 1, event.x - 1);
+					if (target?.region.onWheel?.(direction)) {
+						this.requestRender();
+					}
+				} else if (event.button === MOUSE_BUTTON_LEFT && event.press && !event.motion) {
 					if (!viewport.beginFrameSelection(event.y - 1, event.x - 1)) {
 						viewport.beginSelection(event.y - 1, event.x - 1);
 					}
@@ -2198,6 +2214,7 @@ export class TUI extends Container {
 			),
 		);
 		const scrollInfo = fullscreen.viewport.scrollInfo();
+		let followHintRow: number | null = null;
 		if (fullscreen.viewportControls && !scrollInfo.following) {
 			// Follow hint on the bottom row of the transcript window, just above
 			// the dock: dim text at the right edge, replacing the row instead of
@@ -2222,8 +2239,12 @@ export class TUI extends Container {
 					? `${" ".repeat(padWidth)}\x1b[7m${label}\x1b[27m `
 					: `${" ".repeat(padWidth)}\x1b[2m${label}\x1b[22m `;
 				fullscreen.viewport.subtractFrameClickCoverage(row, 0, width);
+				followHintRow = row;
 			}
 		}
+		// The hint hides the transcript line under it: that row stays out of the
+		// selectable bounds so a drag cannot copy text it cannot see.
+		fullscreen.viewport.setFollowHintRow(followHintRow);
 		if (this.overlayStack.length > 0) {
 			frame = withFullscreenImageFallback(() => this.compositeOverlays(frame, width, height));
 		}
@@ -2477,7 +2498,7 @@ export class TUI extends Container {
 
 		// Content shrunk below the working area and no overlays - re-render to clear empty rows
 		// (overlays need the padding, so only do this when no overlays are active)
-		// Configurable via setClearOnShrink() or PI_CLEAR_ON_SHRINK=0 env var
+		// Configurable via setClearOnShrink() or PI_CLEAR_ON_SHRINK=1 env var (default: off)
 		if (this.clearOnShrink && newLines.length < this.maxLinesRendered && this.overlayStack.length === 0) {
 			logRedraw(`clearOnShrink (maxLinesRendered=${this.maxLinesRendered})`);
 			fullRender(true, preserveViewport);

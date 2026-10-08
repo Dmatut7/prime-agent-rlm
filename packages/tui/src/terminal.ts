@@ -153,6 +153,36 @@ function consumeEarlyRawMode(): boolean | undefined {
 }
 
 /**
+ * Join StdinBuffer paste parts back into bracketed-paste input strings.
+ * The byte cap splits a large paste into parts; forwarding each part as its
+ * own bracketed paste makes the editor create one `[paste #N]` marker per part
+ * of the same paste. Non-final parts are buffered here, the closing part
+ * completes the bracket, and `reset` (a `pasteabort` event) drops a partial
+ * paste instead of delivering it.
+ */
+export function createPastePartJoiner(): {
+	/** Bracketed-paste input to forward, or null while buffering a non-final part. */
+	wrap: (content: string, moreParts: boolean) => string | null;
+	reset: () => void;
+} {
+	let pending = "";
+	return {
+		wrap(content: string, moreParts: boolean): string | null {
+			if (moreParts) {
+				pending += content;
+				return null;
+			}
+			const full = pending + content;
+			pending = "";
+			return `\x1b[200~${full}\x1b[201~`;
+		},
+		reset(): void {
+			pending = "";
+		},
+	};
+}
+
+/**
  * Minimal terminal interface for TUI
  */
 export interface Terminal {
@@ -347,11 +377,18 @@ export class ProcessTerminal implements Terminal {
 			}
 		});
 
-		// Re-wrap paste content with bracketed paste markers for existing editor handling
-		this.stdinBuffer.on("paste", (content) => {
-			if (this.inputHandler) {
-				this.inputHandler(`\x1b[200~${content}\x1b[201~`);
+		// Re-wrap paste content with bracketed paste markers for existing editor
+		// handling. A paste split into parts by the byte cap is joined back into
+		// one bracketed paste so the editor creates a single paste marker.
+		const pasteJoiner = createPastePartJoiner();
+		this.stdinBuffer.on("paste", (content, moreParts) => {
+			const wrapped = pasteJoiner.wrap(content, moreParts);
+			if (wrapped !== null && this.inputHandler) {
+				this.inputHandler(wrapped);
 			}
+		});
+		this.stdinBuffer.on("pasteabort", () => {
+			pasteJoiner.reset();
 		});
 
 		// Handler that pipes stdin data through the buffer
@@ -676,11 +713,13 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	get columns(): number {
-		return process.stdout.columns || Number(process.env.COLUMNS) || 80;
+		// COLUMNS/LINES only apply to a real terminal: behind a pipe they are a
+		// stale export from the parent shell and must not override the default.
+		return process.stdout.columns || (process.stdout.isTTY ? Number(process.env.COLUMNS) : 0) || 80;
 	}
 
 	get rows(): number {
-		return process.stdout.rows || Number(process.env.LINES) || 24;
+		return process.stdout.rows || (process.stdout.isTTY ? Number(process.env.LINES) : 0) || 24;
 	}
 
 	moveBy(lines: number): void {

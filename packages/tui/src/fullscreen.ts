@@ -149,6 +149,13 @@ export class FullscreenViewport {
 	 * only when the box no longer reaches that far.
 	 */
 	private clickHold: { line: number; revealBelow: number; boxEndLine?: number } | undefined;
+	/**
+	 * Frame row the "back to bottom" hint painted over in the last render, or
+	 * null. That row's transcript line is hidden by the hint, so it is excluded
+	 * from the selectable bounds - a selection must not copy text the user
+	 * cannot see.
+	 */
+	private followHintRow: number | null = null;
 	private prevFrame: string[] = [];
 	private prevWidth = 0;
 	private prevHeight = 0;
@@ -163,6 +170,13 @@ export class FullscreenViewport {
 	private lastPinned: PinnedHeader | null = null;
 	private frameClickTargets: FrameClickTarget[] = [];
 	private lastTranscript: string[] = [];
+	/**
+	 * The last frame before selection highlights and line resets were applied.
+	 * Drag snapshots must compare raw rows: lastFrame is mutated in place by
+	 * applyFrameSelection's own highlights and by the paint path's per-line
+	 * reset suffix, so a fresh composed frame never string-equals it.
+	 */
+	private lastRawFrame: string[] = [];
 	/**
 	 * Rows prepended above the window since the last composed frame (a backfilled
 	 * history page), announced through {@link noteTranscriptPrepend}. Consumed by
@@ -224,6 +238,13 @@ export class FullscreenViewport {
 			this.scrollTop = Math.max(0, Math.min(this.scrollTop + prepended, maxScroll));
 		}
 		const hold = this.clickHold;
+		if (hold && prepended > 0) {
+			// The hold's line indexes are pre-prepend coordinates: every
+			// screen-to-line mapping between the prepend and this frame used the
+			// stale transcript, so shift the hold with the page it belongs to.
+			hold.line += prepended;
+			if (hold.boxEndLine !== undefined) hold.boxEndLine += prepended;
+		}
 		if (hold) {
 			// The clicked row and everything above it are unchanged, so the same
 			// scroll offset keeps it on the same screen row. Only the rows the click
@@ -372,6 +393,11 @@ export class FullscreenViewport {
 		const pinned = this.lastPinned;
 		if (!pinned) return null;
 		return { firstRow: this.lastHeaderHeight, count: pinned.rows.length, regions: pinned.header.regions ?? [] };
+	}
+
+	/** Frame row the follow hint painted over in the last render, or null. */
+	setFollowHintRow(row: number | null): void {
+		this.followHintRow = row;
 	}
 
 	/** Whether frame row `screenRow` shows a pinned row of the last frame. */
@@ -612,7 +638,16 @@ export class FullscreenViewport {
 			return null;
 		const bounds = this.transcriptScreenBounds();
 		if (!bounds) return null;
-		if (this.selectionHead.line < this.selectionAnchor.line && screenRow <= bounds.firstRow && this.scrollTop > 0) {
+		// The head clamped to the window's first line equals an anchor placed on
+		// that same line, so the head/anchor comparison alone never starts an
+		// upward scroll from there. The pointer row above the selectable zone
+		// (header, pinned rows) is unambiguous upward intent instead.
+		const pushingUp = screenRow < bounds.firstRow;
+		if (
+			(this.selectionHead.line < this.selectionAnchor.line || pushingUp) &&
+			screenRow <= bounds.firstRow &&
+			this.scrollTop > 0
+		) {
 			return -1;
 		}
 		if (
@@ -675,15 +710,21 @@ export class FullscreenViewport {
 	/** Snapshot and highlight the final screen frame for overlay/dock selection. */
 	applyFrameSelection(frame: string[], height: number, selectableRegions: ReadonlyArray<FrameSelectionRegion>): void {
 		this.lastFrame = frame;
+		this.lastRawFrame = [...frame];
 		this.lastFrameVisibleHeight = Math.min(Math.max(0, height), frame.length);
 		this.lastFrameVisibleStart = Math.max(0, frame.length - this.lastFrameVisibleHeight);
 		this.frameSelectionRegions = selectableRegions;
 		if (this.selectionMode !== "frame") return;
 		const sel = this.orderedSelection();
 		if (!sel) return;
+		const snapshot = this.activeFrameSelection;
 		for (let lineIndex = sel.start.line; lineIndex <= sel.end.line; lineIndex++) {
 			let line = frame[lineIndex];
 			if (line === undefined) continue;
+			// The selection coordinates belong to the frame the drag started on.
+			// A row that changed since (a ticking dock) must not inherit the
+			// highlight at the stale coordinates.
+			if (snapshot && snapshot.frame[lineIndex] !== line) continue;
 			const spans = this.selectedFrameSpans(lineIndex, sel);
 			for (let i = spans.length - 1; i >= 0; i--) {
 				line = this.highlightLine(line, spans[i]);
@@ -699,7 +740,7 @@ export class FullscreenViewport {
 			return false;
 		}
 		this.activeFrameSelection = {
-			frame: [...this.lastFrame],
+			frame: [...this.lastRawFrame],
 			regions: this.frameSelectionRegions.map((region) => ({ ...region })),
 			visibleStart: this.lastFrameVisibleStart,
 			visibleHeight: this.lastFrameVisibleHeight,
@@ -734,6 +775,9 @@ export class FullscreenViewport {
 	}
 
 	private highlightLine(line: string, span: ColumnSpan): string {
+		// Kitty placeholder cells encode the image id in their foreground color;
+		// the highlight's strip/reset would blank the image. Skip those rows.
+		if (line.includes(KITTY_PLACEHOLDER_CHAR)) return line;
 		// Selection columns are painted columns: apply the same tab/AM
 		// normalization the paint pass applies before slicing, or a literal tab
 		// (0 columns here, 3 on screen) shifts every span after it.
@@ -785,10 +829,12 @@ export class FullscreenViewport {
 		// A transcript shorter than the window leaves blank fill rows below the
 		// content: those rows map to line indexes past the transcript end, which the
 		// stale-selection check then discards. Clamp the selectable range to the
-		// last content row instead.
+		// last content row instead. The follow hint's row is excluded the same way:
+		// the hint hides that transcript line, so selecting must not copy it.
 		const contentEnd = this.lastHeaderHeight + Math.max(0, this.lastTranscript.length - this.scrollTop) - 1;
+		const hintEnd = this.followHintRow !== null ? this.followHintRow - 1 : Number.MAX_SAFE_INTEGER;
 		const transcriptStart = Math.max(windowStart, visibleStart);
-		const transcriptEnd = Math.min(windowEnd, visibleEnd, contentEnd);
+		const transcriptEnd = Math.min(windowEnd, visibleEnd, contentEnd, hintEnd);
 		if (transcriptStart > transcriptEnd) return null;
 		return {
 			firstRow: transcriptStart - visibleStart,
@@ -1003,6 +1049,14 @@ export class FullscreenViewport {
 			const line = normalizeTerminalOutput(sourceLines[lineIndex] ?? "");
 			const span = this.selectionSpan(lineIndex, sel);
 			if (!span) continue;
+			if (isImageSequenceLine(line)) {
+				// An inline graphics payload strips to an empty line; copy one
+				// [image] marker per image instead. (One sequence line per image:
+				// multi-row images pad with empty rows, so no dedupe needed.)
+				lines.push(KITTY_PLACEHOLDER_COPY_MARKER);
+				lastImageMarker = null;
+				continue;
+			}
 			const width = visibleWidth(line);
 			const contentStart = contentStartColumn(line);
 			// A row that marks where its content starts copies only from there: the gutter is not text.

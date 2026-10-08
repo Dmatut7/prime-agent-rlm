@@ -75,6 +75,13 @@ describe("StdinBuffer", () => {
 			);
 		});
 
+		it("splits DEL out of a bulk run as its own sequence", () => {
+			// DEL is the Backspace key, not text: inside a bulk run it would be
+			// inserted as an invisible 0-width byte and the keystroke would be lost.
+			processInput(`${"a".repeat(40)}\x7f${"b".repeat(40)}`);
+			assert.deepStrictEqual(emittedSequences, ["a".repeat(40), "\x7f", "b".repeat(40)]);
+		});
+
 		it("keeps newlines inside a bulk run but not at its start", () => {
 			const text = `${"line of text\n".repeat(20)}end`;
 			processInput(text);
@@ -644,12 +651,57 @@ describe("StdinBuffer", () => {
 
 			processInput("\x1b[201~");
 			await waitForPasteSettle();
-			assert.deepStrictEqual(emittedPaste, ["abcdefghij", "xyz"]);
+			// The tail flushes as a second part ("xyz" + the 6-byte terminator is
+			// over the 8-byte budget), and an empty part closes the split paste.
+			assert.deepStrictEqual(emittedPaste, ["abcdefghij", "xyz", ""]);
 			assert.deepStrictEqual(emittedSequences, []);
 			assert.strictEqual(buffer.isPasteMode(), false);
 
 			processInput("q");
 			assert.deepStrictEqual(emittedSequences, ["q"]);
+		});
+
+		it("flags oversized paste parts so the receiver can join them back into one paste", async () => {
+			buffer = new StdinBuffer({ timeout: 10, pasteMaxBytes: 8 });
+			const parts: Array<{ text: string; moreParts: boolean }> = [];
+			buffer.on("paste", (text, moreParts) => {
+				parts.push({ text, moreParts });
+			});
+
+			processInput("\x1b[200~abcdefghij");
+			processInput("xyz");
+			processInput("\x1b[201~");
+			await waitForPasteSettle();
+
+			assert.deepStrictEqual(parts, [
+				{ text: "abcdefghij", moreParts: true },
+				{ text: "xyz", moreParts: true },
+				{ text: "", moreParts: false },
+			]);
+		});
+
+		it("emits pasteabort when a split paste is interrupted", () => {
+			buffer = new StdinBuffer({ timeout: 10, pasteMaxBytes: 8 });
+			const events: string[] = [];
+			buffer.on("paste", (_text, moreParts) => {
+				events.push(`paste:${moreParts}`);
+			});
+			buffer.on("pasteabort", () => {
+				events.push("abort");
+			});
+			const data: string[] = [];
+			buffer.on("data", (sequence) => {
+				data.push(sequence);
+			});
+
+			processInput("\x1b[200~abcdefghij");
+			assert.deepStrictEqual(events, ["paste:true"]);
+
+			// The interrupt drops the open paste; the already-emitted part must not
+			// be joined and delivered later.
+			processInput("\x03");
+			assert.deepStrictEqual(events, ["paste:true", "abort"]);
+			assert.deepStrictEqual(data, ["\x03"]);
 		});
 
 		it("delivers the tail of an oversized paste without per-character events", async () => {

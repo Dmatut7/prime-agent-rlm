@@ -74,4 +74,24 @@ describe("Loader animation timer", () => {
 			loader.stop();
 		}
 	});
+
+	it("colors the default frames with the theme even when setIndicator passes options without frames", () => {
+		const colored = (text: string): string => `<c>${text}</c>`;
+		const ui = { requestRender: () => {} } as unknown as TUI;
+		const loader = new Loader(ui, colored, identity, "Working");
+		try {
+			// No indicator options at all: themed spinner.
+			assert.ok(loader.render(20).join("").includes("<c>⠋</c>"), "default frames are themed");
+			// Options without frames fall back to the default frames; those are not
+			// caller-styled and must keep the theme color.
+			loader.setIndicator({});
+			assert.ok(loader.render(20).join("").includes("<c>⠋</c>"), "default frames stay themed");
+			// Caller-provided frames render verbatim.
+			loader.setIndicator({ frames: ["A"] });
+			assert.ok(loader.render(20).join("").includes("A Working"));
+			assert.ok(!loader.render(20).join("").includes("<c>A</c>"), "custom frames render verbatim");
+		} finally {
+			loader.stop();
+		}
+	});
 });

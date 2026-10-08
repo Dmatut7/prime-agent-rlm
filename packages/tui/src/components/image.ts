@@ -2,6 +2,7 @@ import {
 	allocateImageId,
 	allocatePlaceholderImageId,
 	getCapabilities,
+	getCapabilitiesVersion,
 	getCellDimensionsVersion,
 	getImageDimensions,
 	getKittyImageTransmitsVersion,
@@ -30,7 +31,6 @@ export interface ImageTheme {
 
 export interface ImageOptions {
 	maxWidthCells?: number;
-	maxHeightCells?: number;
 	filename?: string;
 	/** Renders textual image metadata instead of terminal graphics. */
 	fallbackOnly?: boolean;
@@ -53,6 +53,7 @@ export class Image implements Component {
 	private cachedFullscreenFallback?: boolean;
 	private cachedCellDimensionsVersion?: number;
 	private cachedKittyTransmitsVersion?: number;
+	private cachedCapabilitiesVersion?: number;
 
 	constructor(
 		base64Data: string,
@@ -87,22 +88,27 @@ export class Image implements Component {
 		this.cachedFullscreenFallback = undefined;
 		this.cachedCellDimensionsVersion = undefined;
 		this.cachedKittyTransmitsVersion = undefined;
+		this.cachedCapabilitiesVersion = undefined;
 	}
 
 	render(width: number): string[] {
 		const cellDimensionsVersion = getCellDimensionsVersion();
 		const kittyTransmitsVersion = getKittyImageTransmitsVersion();
+		const capabilitiesVersion = getCapabilitiesVersion();
 		if (
 			this.cachedLines &&
 			this.cachedWidth === width &&
 			this.cachedFullscreenFallback === fullscreenFallback &&
 			this.cachedCellDimensionsVersion === cellDimensionsVersion &&
-			this.cachedKittyTransmitsVersion === kittyTransmitsVersion
+			this.cachedKittyTransmitsVersion === kittyTransmitsVersion &&
+			this.cachedCapabilitiesVersion === capabilitiesVersion
 		) {
 			return this.cachedLines;
 		}
 
-		const maxWidth = Math.min(width - 2, this.options.maxWidthCells ?? 60);
+		// Never emit degenerate geometry (c=0, width=-1) on a tiny render width;
+		// an explicit maxWidthCells stays authoritative.
+		const maxWidth = Math.min(Math.max(3, width - 2), this.options.maxWidthCells ?? 60);
 
 		const caps = getCapabilities();
 		// Placeholder rows are text cells: they survive the fullscreen window's
@@ -171,6 +177,7 @@ export class Image implements Component {
 		this.cachedFullscreenFallback = fullscreenFallback;
 		this.cachedCellDimensionsVersion = cellDimensionsVersion;
 		this.cachedKittyTransmitsVersion = kittyTransmitsVersion;
+		this.cachedCapabilitiesVersion = capabilitiesVersion;
 
 		return lines;
 	}

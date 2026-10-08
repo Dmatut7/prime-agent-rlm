@@ -418,7 +418,34 @@ export class Editor implements Component, Focusable {
 
 	/** Set of currently valid paste IDs, for marker-aware segmentation. */
 	private validPasteIds(): Set<number> {
-		return new Set(this.pastes.keys());
+		return this.livePasteIds();
+	}
+
+	/**
+	 * Paste IDs whose markers are still in the buffer. Entries whose marker was
+	 * edited out are dropped here: a hand-typed `[paste #N]` literal must stay
+	 * text, not expand to stale content at submit. The map is replaced rather
+	 * than mutated so undo snapshots keep their map consistent with their lines.
+	 */
+	private livePasteIds(): Set<number> {
+		const ids = new Set<number>();
+		if (this.pastes.size === 0) return ids;
+		for (const line of this.state.lines) {
+			if (ids.size >= this.pastes.size) break;
+			if (!line.includes("[paste #")) continue;
+			for (const match of line.matchAll(PASTE_MARKER_REGEX)) {
+				const id = Number.parseInt(match[1]!, 10);
+				if (this.pastes.has(id)) ids.add(id);
+			}
+		}
+		if (ids.size < this.pastes.size) {
+			const kept = new Map<number, string>();
+			for (const [id, content] of this.pastes) {
+				if (ids.has(id)) kept.set(id, content);
+			}
+			this.pastes = kept;
+		}
+		return ids;
 	}
 
 	/** Segment text with paste-marker awareness, only merging markers with valid IDs. */
@@ -594,6 +621,8 @@ export class Editor implements Component, Focusable {
 		this.state.cursorLine = this.state.lines.length - 1;
 		this.setCursorCol(this.state.lines[this.state.cursorLine]?.length || 0);
 		this.scrollOffset = 0;
+		// A wholesale replace drops whatever paste markers the old text carried.
+		this.livePasteIds();
 
 		if (this.onChange) {
 			this.onChange(this.getText());
@@ -749,7 +778,14 @@ export class Editor implements Component, Focusable {
 
 			const contentLine = `${promptLeadingPadding}${linePromptPrefix}${promptTrailingPadding}${displayText}${padding}${lineRightPadding}`;
 			const anchorMarker = layoutLine.hasCursor ? this.getAutocompleteAnchorMarker() : "";
-			result.push(anchorMarker + (useBackgroundSurface ? renderSurfaceLine(contentLine) : contentLine));
+			// With the completion popup open the hardware cursor rides the popup's
+			// anchor instead of the text caret, so the IME candidate window keeps
+			// its anchor next to the candidates.
+			const cursorAtAnchor =
+				layoutLine.hasCursor && this.focused && this.autocompleteState && anchorMarker !== "" ? CURSOR_MARKER : "";
+			result.push(
+				anchorMarker + cursorAtAnchor + (useBackgroundSurface ? renderSurfaceLine(contentLine) : contentLine),
+			);
 		}
 
 		// Render bottom border (with scroll indicator if more content below)
@@ -758,7 +794,11 @@ export class Editor implements Component, Focusable {
 			if (linesBelow > 0) {
 				const indicator = `─── ↓ 还有 ${linesBelow} 行 `;
 				const remaining = width - visibleWidth(indicator);
-				result.push(this.borderColor(indicator + "─".repeat(Math.max(0, remaining))));
+				if (remaining >= 0) {
+					result.push(this.borderColor(indicator + "─".repeat(remaining)));
+				} else {
+					result.push(this.borderColor(truncateToWidth(indicator, width)));
+				}
 			} else {
 				result.push(horizontal.repeat(width));
 			}
@@ -1258,7 +1298,9 @@ export class Editor implements Component, Focusable {
 
 	private expandPasteMarkers(text: string): string {
 		let result = text;
-		for (const [pasteId, pasteContent] of this.pastes) {
+		for (const pasteId of this.livePasteIds()) {
+			const pasteContent = this.pastes.get(pasteId);
+			if (pasteContent === undefined) continue;
 			const markerRegex = new RegExp(`\\[paste #${pasteId}( (\\+\\d+ lines|\\d+ chars))?\\]`, "g");
 			result = result.replace(markerRegex, () => pasteContent);
 		}
@@ -1615,6 +1657,10 @@ export class Editor implements Component, Focusable {
 	/**
 	 * Move cursor to a target visual line, applying sticky column logic.
 	 * Shared by moveCursor() and pageScroll().
+	 *
+	 * All columns in here are display cells: the VL map's startCol/length are
+	 * code-unit offsets, so they are converted at the boundary. Measuring in
+	 * code units drifts the caret left on every wide (CJK) character.
 	 */
 	private moveToVisualLine(
 		visualLines: Array<{ logicalLine: number; startCol: number; length: number }>,
@@ -1625,39 +1671,49 @@ export class Editor implements Component, Focusable {
 		const targetVL = visualLines[targetVisualLine];
 		if (!(currentVL && targetVL)) return;
 
+		const currentLineText = this.state.lines[currentVL.logicalLine] || "";
+		const targetLineText = this.state.lines[targetVL.logicalLine] || "";
+
 		// When the cursor was snapped to a segment start, resolve the pre-snap
 		// position against the VL it belongs to. This gives the correct visual
 		// column even after a resize reshuffles VLs.
 		let currentVisualCol: number;
 		if (this.snappedFromCursorCol !== null) {
 			const vlIndex = this.findVisualLineAt(visualLines, currentVL.logicalLine, this.snappedFromCursorCol);
-			currentVisualCol = this.snappedFromCursorCol - visualLines[vlIndex].startCol;
+			const snappedVL = visualLines[vlIndex]!;
+			currentVisualCol = visibleWidth(currentLineText.slice(snappedVL.startCol, this.snappedFromCursorCol));
 		} else {
-			currentVisualCol = this.state.cursorCol - currentVL.startCol;
+			currentVisualCol = visibleWidth(currentLineText.slice(currentVL.startCol, this.state.cursorCol));
 		}
 
-		// For non-last segments, clamp to length-1 to stay within the segment
+		// For non-last segments, clamp left of the last grapheme to stay within
+		// the segment; its end boundary is the next segment's start.
+		const currentVLText = currentLineText.slice(currentVL.startCol, currentVL.startCol + currentVL.length);
+		const targetVLText = targetLineText.slice(targetVL.startCol, targetVL.startCol + targetVL.length);
 		const isLastSourceSegment =
 			currentVisualLine === visualLines.length - 1 ||
 			visualLines[currentVisualLine + 1]?.logicalLine !== currentVL.logicalLine;
-		const sourceMaxVisualCol = isLastSourceSegment ? currentVL.length : Math.max(0, currentVL.length - 1);
+		const sourceMaxVisualCol = isLastSourceSegment
+			? visibleWidth(currentVLText)
+			: Math.max(0, visibleWidth(currentVLText) - this.lastSegmentWidth(currentVLText));
 
 		const isLastTargetSegment =
 			targetVisualLine === visualLines.length - 1 ||
 			visualLines[targetVisualLine + 1]?.logicalLine !== targetVL.logicalLine;
-		const targetMaxVisualCol = isLastTargetSegment ? targetVL.length : Math.max(0, targetVL.length - 1);
+		const targetMaxVisualCol = isLastTargetSegment
+			? visibleWidth(targetVLText)
+			: Math.max(0, visibleWidth(targetVLText) - this.lastSegmentWidth(targetVLText));
 
 		const moveToVisualCol = this.computeVerticalMoveColumn(currentVisualCol, sourceMaxVisualCol, targetMaxVisualCol);
 
 		this.state.cursorLine = targetVL.logicalLine;
-		const targetCol = targetVL.startCol + moveToVisualCol;
-		const logicalLine = this.state.lines[targetVL.logicalLine] || "";
-		this.state.cursorCol = Math.min(targetCol, logicalLine.length);
+		const targetCol = targetVL.startCol + this.caretOffsetAtVisualColumn(targetVLText, moveToVisualCol);
+		this.state.cursorCol = Math.min(targetCol, targetLineText.length);
 
 		// Snap cursor to atomic segment boundary (e.g. paste markers)
 		// so the cursor never lands in the middle of a multi-grapheme unit.
 		// Single-grapheme segments don't need snapping.
-		const segments = [...this.segment(logicalLine)];
+		const segments = [...this.segment(targetLineText)];
 		for (const seg of segments) {
 			if (seg.index > this.state.cursorCol) break;
 			if (seg.segment.length <= 1) continue;
@@ -1705,6 +1761,34 @@ export class Editor implements Component, Focusable {
 
 		// No snap occurred – we moved out of the atomic segment.
 		this.snappedFromCursorCol = null;
+	}
+
+	/** Display width of the last grapheme of `text`. */
+	private lastSegmentWidth(text: string): number {
+		let width = 0;
+		for (const seg of baseSegmenter.segment(text)) {
+			width = visibleWidth(seg.segment);
+		}
+		return width;
+	}
+
+	/**
+	 * Code-unit offset within `text` whose caret sits nearest visible column
+	 * `column`, rounding mid-cell positions like the click placement does. Walks
+	 * plain graphemes, not atomic markers: landing inside a marker is the snap
+	 * loop's job (it records the pre-snap position for the next vertical move).
+	 */
+	private caretOffsetAtVisualColumn(text: string, column: number): number {
+		if (column <= 0) return 0;
+		let col = 0;
+		for (const seg of baseSegmenter.segment(text)) {
+			const width = visibleWidth(seg.segment);
+			if (col + width >= column) {
+				return 2 * (column - col) >= width ? seg.index + seg.segment.length : seg.index;
+			}
+			col += width;
+		}
+		return text.length;
 	}
 
 	/**
@@ -2070,7 +2154,8 @@ export class Editor implements Component, Focusable {
 				} else {
 					const currentVL = visualLines[currentVisualLine];
 					if (currentVL) {
-						this.preferredVisualCol = this.state.cursorCol - currentVL.startCol;
+						// preferredVisualCol is in display cells (see moveToVisualLine).
+						this.preferredVisualCol = visibleWidth(currentLine.slice(currentVL.startCol, this.state.cursorCol));
 					}
 				}
 			} else {
@@ -2298,6 +2383,7 @@ export class Editor implements Component, Focusable {
 		this.pasteCounter = snapshot.pasteCounter;
 		this.lastAction = null;
 		this.preferredVisualCol = null;
+		this.snappedFromCursorCol = null;
 		if (this.onChange) {
 			this.onChange(this.getText());
 		}
