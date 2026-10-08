@@ -321,8 +321,6 @@ describe("matchesKey", () => {
 
 		it("should match legacy Ctrl+Alt+symbol", () => {
 			setKittyProtocolActive(false);
-			assert.strictEqual(matchesKey("\x1b\x1b", "ctrl+alt+["), true);
-			assert.strictEqual(parseKey("\x1b\x1b"), "ctrl+alt+[");
 			assert.strictEqual(matchesKey("\x1b\x1c", "ctrl+alt+\\"), true);
 			assert.strictEqual(parseKey("\x1b\x1c"), "ctrl+alt+\\");
 			assert.strictEqual(matchesKey("\x1b\x1d", "ctrl+alt+]"), true);

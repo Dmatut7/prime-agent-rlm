@@ -1,0 +1,5 @@
+- Fixed a process crash when a terminal sent a Kitty CSI-u key event with a codepoint above U+10FFFF.
+- Fixed Option+arrow keys on meta-sends-escape terminals (xterm `metaSendsEscape`, Terminal.app "Option as Meta") firing Escape - interrupting the response and clearing the draft - instead of the Alt+arrow binding.
+- Fixed legacy meta chords that collide with SS3/DCS/OSC/APC introducers (Alt+Shift+O, Alt+Shift+P, Alt+], Alt+Shift+-) swallowing the text typed right after them.
+- Fixed a multi-line paste with CRLF/CR line endings on terminals without bracketed paste submitting the draft once per line instead of pasting.
+- Fixed `Input`-based fields (settings search, OAuth paste, menu search) storing pasted escape sequences and control bytes and re-emitting them to the terminal on every frame; pasted lines now join with a space instead of concatenating, and the field no longer renders overwide rows at widths <= 2.

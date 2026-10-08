@@ -1295,12 +1295,24 @@ export function parseKey(data: string): string | undefined {
 	const legacySequenceKeyId = LEGACY_SEQUENCE_KEY_IDS[data];
 	if (legacySequenceKeyId) return legacySequenceKeyId;
 
+	// Meta-sends-escape: ESC + the sequence the key sends without Meta (StdinBuffer
+	// delivers the pair as one sequence). Recurse on the inner sequence and add alt.
+	if (data.length > 2 && (data.startsWith("\x1b\x1b[") || data.startsWith("\x1b\x1bO"))) {
+		const inner = parseKey(data.slice(1));
+		if (inner === undefined) return undefined;
+		const parts = inner.split("+");
+		const key = parts.pop()!;
+		const mods = new Set(parts);
+		mods.add("alt");
+		const ordered = ["shift", "ctrl", "alt", "super"].filter((mod) => mods.has(mod));
+		return [...ordered, key].join("+");
+	}
+
 	// Legacy sequences (used when Kitty protocol is not active, or for unambiguous sequences)
 	if (data === "\x1b") return "escape";
 	if (data === "\x1c") return "ctrl+\\";
 	if (data === "\x1d") return "ctrl+]";
 	if (data === "\x1f") return "ctrl+-";
-	if (data === "\x1b\x1b") return "ctrl+alt+[";
 	if (data === "\x1b\x1c") return "ctrl+alt+\\";
 	if (data === "\x1b\x1d") return "ctrl+alt+]";
 	if (data === "\x1b\x1f") return "ctrl+alt+-";

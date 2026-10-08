@@ -605,10 +605,12 @@ describe("Input component", () => {
 			input.handleInput("ab");
 			input.handleInput("\x1b[200~abc\x1b[201~\x1b[1;5Ctail\x1b[201~");
 
-			// No truncation and no key handling: the escape byte inside the pasted
-			// content is passed through as text by this component.
-			assert.strictEqual(input.getValue(), "ababc\x1b[201~\x1b[1;5Ctail");
-			assert.strictEqual(input.getCursor(), "ababc\x1b[201~\x1b[1;5Ctail".length);
+			// No truncation and no key handling: the bytes after the marker that was
+			// content stay text. They are washed on the way in, though: the value is
+			// re-emitted to the terminal on every render, so the escape sequences
+			// come out and only their printable debris remains.
+			assert.strictEqual(input.getValue(), "ababctail");
+			assert.strictEqual(input.getCursor(), "ababctail".length);
 		});
 	});
 });

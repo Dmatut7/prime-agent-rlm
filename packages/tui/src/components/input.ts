@@ -4,7 +4,7 @@ import { KillRing } from "../kill-ring.js";
 import { BULK_TEXT_MIN_RUN } from "../stdin-buffer.js";
 import { type Component, CURSOR_MARKER, type Focusable } from "../tui.js";
 import { UndoStack } from "../undo-stack.js";
-import { getSegmenter, isPunctuationChar, isWhitespaceChar, sliceByColumn, visibleWidth } from "../utils.js";
+import { getSegmenter, isPunctuationChar, isWhitespaceChar, sliceByColumn, stripAnsi, visibleWidth } from "../utils.js";
 
 const segmenter = getSegmenter();
 
@@ -415,7 +415,18 @@ export class Input implements Component, Focusable {
 		this.lastAction = null;
 		this.pushUndo();
 
-		const cleanText = pastedText.replace(/\r\n/g, "").replace(/\r/g, "").replace(/\n/g, "").replace(/\t/g, "    ");
+		// The value is re-emitted to the terminal on every render, so the paste is
+		// washed before it is stored: escape sequences (an OSC 52 in pasted bytes
+		// would replay into the user's clipboard every frame) and control bytes
+		// (BEL rings, DEL is invisible) come out. Newlines become a space each -
+		// this is a single-line input, and joining lines without a separator
+		// silently rewrites the pasted content - and tabs keep their spacing.
+		const cleanText = stripAnsi(pastedText)
+			.replace(/\r\n/g, "\n")
+			.replace(/\r/g, "\n")
+			.replace(/\t/g, "    ")
+			.replace(/\n/g, " ")
+			.replace(/[\x00-\x1f\x7f\x80-\x9f]/g, "");
 
 		this.value = this.value.slice(0, this.cursor) + cleanText + this.value.slice(this.cursor);
 		this.cursor += cleanText.length;
@@ -428,7 +439,9 @@ export class Input implements Component, Focusable {
 		const availableWidth = width - prompt.length;
 
 		if (availableWidth <= 0) {
-			return [prompt];
+			// A line must never exceed the requested width, even when the prompt
+			// alone is wider than it.
+			return [prompt.slice(0, Math.max(0, width))];
 		}
 
 		let visibleText = "";

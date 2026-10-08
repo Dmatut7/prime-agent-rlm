@@ -173,8 +173,13 @@ function parseUnmodifiedKittyPrintableCodepoint(sequence: string): number | unde
 	const match = sequence.match(/^\x1b\[(\d+)(?::\d*)?(?::\d+)?u$/);
 	if (!match) return undefined;
 
-	const codepoint = parseInt(match[1]!, 10);
-	return codepoint >= 32 ? codepoint : undefined;
+	const digits = match[1]!;
+	if (digits.length > 7) return undefined;
+	const codepoint = parseInt(digits, 10);
+	// emitDataSequence replays the accepted codepoint through String.fromCodePoint
+	// to recognize a raw duplicate; an out-of-range value must never get there -
+	// String.fromCodePoint throws a RangeError that crashed the process.
+	return codepoint >= 32 && codepoint <= 0x10ffff ? codepoint : undefined;
 }
 
 /**
@@ -221,8 +226,8 @@ function bulkSliceEnd(run: string, start: number): number {
  * boundary is chosen so that no slice it creates breaks that rule - see
  * `bulkSliceEnd`.
  */
-function pushTextRun(sequences: string[], run: string): void {
-	if (run.length < BULK_TEXT_MIN_RUN) {
+function pushTextRun(sequences: string[], run: string, forceBulk: boolean = false): void {
+	if (!forceBulk && run.length < BULK_TEXT_MIN_RUN) {
 		for (let i = 0; i < run.length; i++) {
 			sequences.push(run[i]!);
 		}
@@ -240,16 +245,95 @@ function pushTextRun(sequences: string[], run: string): void {
 	}
 }
 
+/**
+ * Final bytes of the SS3 sequences keys.ts knows (arrows, home/end, clear,
+ * numpad enter, F1-F4, rxvt ctrl+arrows). `\x1bO` followed by any other byte is
+ * a legacy alt+shift+o chord with the next keystroke glued on, not an SS3.
+ */
+const KNOWN_SS3_FINALS = new Set([..."ABCDEFHMPQRSabcde"]);
+
+/**
+ * The sequence starting at `escIndex` (buffer[escIndex] === ESC) if it is a
+ * CSI/SS3 a meta-sends-escape terminal prefixes with ESC for Alt+key:
+ * `\x1b[` + params + a key final, or `\x1bO` + a known SS3 final. Mouse reports
+ * (`<` param, bare `M`/`m` finals), probe answers (`?` param) and every other
+ * escape shape are excluded - a terminal never meta-prefixes those, and merging
+ * them into a key would eat a click or an answer that merely landed behind an
+ * Escape. "incomplete" means the shape is right but the final byte is pending.
+ */
+function matchMetaPrefixedSequence(buffer: string, escIndex: number): string | "incomplete" | undefined {
+	const introducer = buffer[escIndex + 1];
+	if (introducer === "[") {
+		let end = escIndex + 2;
+		while (end < buffer.length && /[0-9;:]/.test(buffer[end]!)) end++;
+		if (end >= buffer.length) return "incomplete";
+		const final = buffer[end]!;
+		if (
+			(final >= "A" && final <= "Z" && final !== "M") ||
+			(final >= "a" && final <= "z" && final !== "m") ||
+			final === "~" ||
+			final === "$" ||
+			final === "^"
+		) {
+			return buffer.slice(escIndex, end + 1);
+		}
+		return undefined;
+	}
+	if (introducer === "O") {
+		if (escIndex + 2 >= buffer.length) return "incomplete";
+		const final = buffer[escIndex + 2]!;
+		return KNOWN_SS3_FINALS.has(final) ? buffer.slice(escIndex, escIndex + 3) : undefined;
+	}
+	return undefined;
+}
+
+/**
+ * Split a held buffer that outlived its completion window. A legacy meta chord
+ * shares its introducer with a string sequence (ESC P = alt+shift+p = DCS,
+ * ESC ] = alt+] = OSC, ESC _ = APC): the chord plus whatever was typed behind
+ * it used to flush as one undecodable blob, losing both. The chord is the
+ * everyday case on meta-sends-escape terminals, so it wins the ambiguity: emit
+ * the chord and reparse the rest as fresh input. A genuinely torn terminal
+ * string (it must straddle the completion window) degrades to the same bytes.
+ * The `\x1b\x1b` shape is a meta-prefixed key held by the merge path whose tail
+ * never completed.
+ */
+function splitFlushedInput(buffer: string): string[] {
+	let chordLength = 0;
+	if (buffer.startsWith(`${ESC}P`) || buffer.startsWith(`${ESC}]`) || buffer.startsWith(`${ESC}_`)) {
+		chordLength = 2;
+	} else if (buffer.length > 2 && buffer.startsWith(`${ESC}${ESC}`)) {
+		chordLength = 1;
+	}
+	if (chordLength === 0) return [buffer];
+	const reparsed = extractCompleteSequences(buffer.slice(chordLength));
+	const tail = reparsed.remainder.length > 0 ? [reparsed.remainder] : [];
+	return [buffer.slice(0, chordLength), ...reparsed.sequences, ...tail];
+}
+
 function extractCompleteSequences(buffer: string): { sequences: string[]; remainder: string } {
 	const sequences: string[] = [];
 	let pos = 0;
 
 	while (pos < buffer.length) {
 		if (buffer[pos] === ESC) {
-			// Two ESC bytes in a row are two Escape keys, not ctrl+alt+[.
-			// Consume only the first byte so the next loop can parse ESC[A as CSI.
-			// A lone second ESC stays incomplete and flushes as Escape after timeout.
 			if (buffer[pos + 1] === ESC) {
+				// A meta-sends-escape terminal prefixes the whole key sequence with
+				// ESC for Alt+key: `\x1b\x1b[A` is Alt+Up, not Escape followed by Up
+				// (Escape is the interrupt/draft-clear key - splitting fired it on
+				// every Option+arrow). Merge when the second ESC heads a key
+				// sequence; two bare Escape presses and ESC + mouse/probe bytes
+				// keep the split. A lone second ESC stays incomplete and flushes
+				// as Escape after timeout.
+				const merged = matchMetaPrefixedSequence(buffer, pos + 1);
+				if (merged === "incomplete") {
+					return { sequences, remainder: buffer.slice(pos) };
+				}
+				if (merged !== undefined) {
+					sequences.push(ESC + merged);
+					pos += 1 + merged.length;
+					continue;
+				}
 				sequences.push(ESC);
 				pos += 1;
 				continue;
@@ -263,6 +347,15 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 				if (status === "incomplete") {
 					seqEnd++;
 					continue;
+				}
+				// An SS3-shaped candidate whose final byte is not a known SS3 key
+				// is a legacy alt+shift+o chord with the next keystroke glued on:
+				// emit the chord and let the outer loop reparse the rest.
+				if (candidate.length === 3 && candidate[1] === "O" && !KNOWN_SS3_FINALS.has(candidate[2]!)) {
+					sequences.push(candidate.slice(0, 2));
+					pos += 2;
+					emitted = true;
+					break;
 				}
 				sequences.push(candidate);
 				pos = seqEnd;
@@ -281,7 +374,17 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 			if (runEnd === -1) {
 				runEnd = buffer.length;
 			}
-			const run = buffer.slice(pos, runEnd);
+			let run = buffer.slice(pos, runEnd);
+			// A bulk run is paste-like input (a paste from a terminal without
+			// bracketed paste, a pipe). A carriage return inside one is a line
+			// ending from the source text, not the Enter key: cut out on its own
+			// it reached the consumer as a submit per pasted line. Fold CRLF/CR
+			// into LF, which pushTextRun already carries inside a long run. A
+			// short run keeps its \r as its own sequence (the Enter key).
+			const bulkRun = run.length >= BULK_TEXT_MIN_RUN;
+			if (bulkRun && run.includes("\r")) {
+				run = run.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+			}
 			// Control bytes carry key semantics, so they stay one sequence each
 			// (newlines are handled inside `pushTextRun`: part of text in a long
 			// run, their own sequence in a short one).
@@ -292,13 +395,13 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 					continue;
 				}
 				if (i > textStart) {
-					pushTextRun(sequences, run.slice(textStart, i));
+					pushTextRun(sequences, run.slice(textStart, i), bulkRun);
 				}
 				sequences.push(run[i]!);
 				textStart = i + 1;
 			}
 			if (textStart < run.length) {
-				pushTextRun(sequences, run.slice(textStart));
+				pushTextRun(sequences, run.slice(textStart), bulkRun);
 			}
 			pos = runEnd;
 		}
@@ -902,7 +1005,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			return [];
 		}
 
-		const sequences = [this.buffer];
+		const sequences = splitFlushedInput(this.buffer);
 		this.buffer = "";
 		this.pendingKittyPrintableCodepoint = undefined;
 		return sequences;

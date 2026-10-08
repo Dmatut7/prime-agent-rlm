@@ -65,7 +65,10 @@ describe("StdinBuffer", () => {
 		});
 
 		it("keeps control bytes one sequence each inside a bulk run", () => {
-			processInput(`${"a".repeat(40)}\r${"b".repeat(40)}`);
+			// \x01 stands in for the control bytes that keep key semantics even in a
+			// bulk run; carriage returns are the one exception - they fold into LF
+			// (see the w6 stdin-lane tests).
+			processInput(`${"a".repeat(40)}\x01${"b".repeat(40)}`);
 			assert.deepStrictEqual(
 				emittedSequences.map((sequence) => sequence.length),
 				[40, 1, 40],
@@ -375,9 +378,13 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(buffer.flush(), ["\x1b"]);
 		});
 
-		it("keeps CSI after a double ESC in the same chunk as Escape then arrow", () => {
+		it("merges CSI after a double ESC in the same chunk into one meta-prefixed sequence", () => {
+			// A meta-sends-escape terminal sends Alt+Up as ESC + the Up sequence.
+			// Splitting the pair fired Escape (interrupt + draft-clear) on every
+			// Option+arrow, so the pair is delivered as one sequence that
+			// matchesKey reads as alt+up.
 			processInput("\x1b\x1b[A");
-			assert.deepStrictEqual(emittedSequences, ["\x1b", "\x1b[A"]);
+			assert.deepStrictEqual(emittedSequences, ["\x1b\x1b[A"]);
 		});
 
 		it("reassembles an Option chord whose letter arrives one window after its ESC", async () => {
