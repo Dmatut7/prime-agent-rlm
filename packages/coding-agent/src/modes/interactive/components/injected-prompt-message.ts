@@ -95,6 +95,19 @@ function collapseText(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
 }
 
+/**
+ * The restore notice's prose without its `<ipython_state_restored>` wrapper lines.
+ * The content is a machine block (MACHINE_BLOCK_TAGS in core/compaction/machine-blocks.ts),
+ * so the raw text is never rendered; dropping the wrapper lines keeps the human-readable
+ * notice the block carries.
+ */
+function unwrapRestoreNotice(content: string): string {
+	const lines = content.split("\n");
+	if (lines[0]?.trim() === "<ipython_state_restored>") lines.shift();
+	if (lines.at(-1)?.trim() === "</ipython_state_restored>") lines.pop();
+	return lines.join("\n").trim();
+}
+
 function goalLabel(details: GoalContextDetails | undefined): string {
 	switch (details?.kind) {
 		case "continuation":
@@ -176,10 +189,15 @@ export class InjectedPromptMessageComponent extends Container implements Focusab
 	/**
 	 * What `y` copies: the card's headline and the prompt text the message holds. The rendered rows
 	 * wrap both to the width, so a long prompt (a heartbeat's, a goal's) copied from them came back
-	 * as one line per row with its paragraphs gone.
+	 * as one line per row with its paragraphs gone. The restore card copies its owner-facing detail
+	 * instead of the raw machine block.
 	 */
 	getBlockCopyText(): string {
-		return copyFromSource(this.headline(), readCustomText(this.message));
+		const body =
+			this.message.customType === IPYTHON_STATE_RESTORED_CUSTOM_TYPE
+				? this.restoreDetailText()
+				: readCustomText(this.message);
+		return copyFromSource(this.headline(), body);
 	}
 
 	/** The card's own first line in plain words, whichever face it shows. */
@@ -196,23 +214,38 @@ export class InjectedPromptMessageComponent extends Container implements Focusab
 		// failure keeps its loud header: it is the parent's only sign a child died.
 		const notice = this.expanded ? undefined : this.noticeParts();
 		if (notice) {
-			this.content.addChild(new Clickable(new SystemNoticeLine(notice.label, notice.detail), toggle));
+			this.content.addChild(
+				new Clickable(new SystemNoticeLine(notice.label, notice.detail, "", notice.tone ?? "notice"), toggle),
+			);
 			return;
 		}
 		this.header.setText(this.headerText());
 		this.content.addChild(new Clickable(this.header, toggle));
-		if (this.expanded && this.message.customType !== IPYTHON_STATE_RESTORED_CUSTOM_TYPE) {
-			this.content.addChild(
-				new Markdown(readCustomText(this.message), 1, 0, this.markdownTheme, {
-					color: (text: string) => theme.fg("customMessageText", text),
-				}),
-			);
+		if (!this.expanded) {
 			return;
 		}
+		if (this.message.customType === IPYTHON_STATE_RESTORED_CUSTOM_TYPE) {
+			// The content is the model-facing machine block; the expanded card shows the
+			// roster composed from details (or the block's prose without its wrapper).
+			const detail = this.restoreDetailText();
+			if (detail) {
+				this.content.addChild(
+					new Markdown(detail, 1, 0, this.markdownTheme, {
+						color: (text: string) => theme.fg("customMessageText", text),
+					}),
+				);
+			}
+			return;
+		}
+		this.content.addChild(
+			new Markdown(readCustomText(this.message), 1, 0, this.markdownTheme, {
+				color: (text: string) => theme.fg("customMessageText", text),
+			}),
+		);
 	}
 
 	/** The collapsed one-liner of a routine notice; undefined for a failure (loud header). */
-	private noticeParts(): { label: string; detail: string } | undefined {
+	private noticeParts(): { label: string; detail: string; tone?: "warning" } | undefined {
 		switch (this.message.customType) {
 			case AUTO_CONTINUE_CUSTOM_TYPE: {
 				const details = this.message.details as AutoContinueMessageDetails | undefined;
@@ -243,11 +276,8 @@ export class InjectedPromptMessageComponent extends Container implements Focusab
 				return { label: "♥ 定时任务", detail: heartbeatPromptSchedule(details?.schedule) };
 			}
 			case IPYTHON_STATE_RESTORED_CUSTOM_TYPE: {
-				const details = this.message.details as IpythonStateRestoredDetails | undefined;
-				return {
-					label: details?.restored === false ? "◆ 新开了 Python 环境" : "◆ Python 环境已恢复",
-					detail: "",
-				};
+				const label = this.restoreLabel();
+				return { label: `◆ ${label.text}`, detail: "", tone: label.trouble ? "warning" : undefined };
 			}
 			case RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE:
 				return { label: "◇ 子代理还在跑", detail: "" };
@@ -296,9 +326,8 @@ export class InjectedPromptMessageComponent extends Container implements Focusab
 			return this.heartbeatHeaderText();
 		}
 		if (this.message.customType === IPYTHON_STATE_RESTORED_CUSTOM_TYPE) {
-			const details = this.message.details as IpythonStateRestoredDetails | undefined;
-			const label = details?.restored === false ? "新开了 Python 环境" : "Python 环境已恢复";
-			return `${theme.fg("accent", "◆")} ${theme.fg("muted", label)}`;
+			const label = this.restoreLabel();
+			return `${theme.fg("accent", "◆")} ${theme.fg(label.trouble ? "warning" : "muted", label.text)}`;
 		}
 		if (this.message.customType === RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE) {
 			// Not an error: the silence may be healthy long work. The label says what is
@@ -335,6 +364,55 @@ export class InjectedPromptMessageComponent extends Container implements Focusab
 		const pulse = theme.fg("error", "♥");
 		const schedule = theme.fg("muted", heartbeatPromptSchedule(details?.schedule));
 		return `${pulse} ${theme.fg("muted", "定时任务")}${theme.fg("dim", " · ")}${schedule}`;
+	}
+
+	/**
+	 * The restore card's label: recovered, partial (names lost, warning tone), or a fresh
+	 * kernel. Messages written before the roster details existed carry only the boolean,
+	 * so they keep the two boolean labels.
+	 */
+	private restoreLabel(): { text: string; trouble: boolean } {
+		const details = this.message.details as IpythonStateRestoredDetails | undefined;
+		const lost = (details?.failed?.length ?? 0) + (details?.notSaved?.length ?? 0);
+		if (lost > 0) {
+			const base = details?.restored === false ? "新开了 Python 环境" : "Python 环境部分恢复";
+			return { text: `${base}（${lost} 个名字没回来）`, trouble: true };
+		}
+		if (details?.restoreError) {
+			return { text: "新开了 Python 环境（恢复失败）", trouble: true };
+		}
+		return { text: details?.restored === false ? "新开了 Python 环境" : "Python 环境已恢复", trouble: false };
+	}
+
+	/**
+	 * The expanded body of the restore card: the owner-facing roster composed from details
+	 * (never the raw machine block). A message without the failure fields - a clean restore,
+	 * or one written before the details existed - falls back to the block's own prose with
+	 * its wrapper tags dropped.
+	 */
+	private restoreDetailText(): string {
+		const details = this.message.details as IpythonStateRestoredDetails | undefined;
+		const lines: string[] = [];
+		if (details?.restoreError) {
+			lines.push(`恢复失败：${details.restoreError}`);
+		}
+		if (details?.failed?.length) {
+			lines.push(`没回来（要用得重建）：${details.failed.join("、")}`);
+		}
+		if (details?.notSaved?.length) {
+			lines.push(
+				`当时就没存进快照：${details.notSaved.map((entry) => `${entry.name}（${entry.reason}）`).join("、")}`,
+			);
+		}
+		if (details?.degraded?.length) {
+			lines.push(
+				`回来了但行为可能不准（建议重新定义）：${details.degraded.map((entry) => `${entry.name}（${entry.reason}）`).join("、")}`,
+			);
+		}
+		if (lines.length > 0) {
+			return lines.join("\n");
+		}
+		return unwrapRestoreNotice(readCustomText(this.message));
 	}
 
 	private metaText(): string {

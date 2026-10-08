@@ -12,7 +12,7 @@ import {
 	InjectedPromptMessageComponent,
 	isInjectedPromptMessage,
 } from "../../../src/modes/interactive/components/injected-prompt-message.js";
-import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
+import { initTheme, theme } from "../../../src/modes/interactive/theme/theme.js";
 import { createHarness, getMessageText, getUserTexts, type Harness } from "../harness.js";
 
 type StateRestoreHost = {
@@ -25,6 +25,16 @@ function stripAnsi(text: string): string {
 
 function render(component: InjectedPromptMessageComponent): string {
 	return stripAnsi(component.render(120).join("\n"));
+}
+
+function renderRaw(component: InjectedPromptMessageComponent): string {
+	return component.render(120).join("\n");
+}
+
+/** The ANSI prefix `theme.fg` puts on a given color slot, probed instead of hardcoded. */
+function colorPrefix(slot: "warning" | "systemNotice"): string {
+	const probe = theme.fg(slot, "|");
+	return probe.slice(0, probe.indexOf("|"));
 }
 
 describe("ENG-4530 IPython state restore message", () => {
@@ -121,7 +131,137 @@ describe("ENG-4530 IPython state restore message", () => {
 		component.setExpanded(true);
 		expect(render(component)).toContain("◆ Python 环境已恢复");
 		expect(render(component)).not.toContain("ipython_state_restored");
-		expect(render(component)).not.toContain("alpha");
+		// The expanded card answers "what came back": the notice prose, wrapper tags dropped.
+		expect(render(component)).toContain("alpha, beta");
+	});
+
+	it("records the restore failure roster in the message details", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+		// test-hygiene-allow: same frozen StateRestoreHost alias as this file's baseline entry; the hook is the only production entry mapping a real RestoreResult into the message
+		(harness.session as unknown as StateRestoreHost)._onIpythonStateRestored({
+			restored: ["alpha"],
+			failed: [{ name: "big_df", reason: "payload exceeds per-variable limit" }],
+			degraded: [{ name: "helper", reason: "by-value function" }],
+			notSaved: [
+				{ name: "cache", reason: "cannot pickle 'module' object" },
+				{ name: "_scratch", reason: "private-name convention: leading-underscore names are not persisted" },
+			],
+			path: "/tmp/kernel-state.dill",
+			snapshotPolicy: "preserve-names",
+		});
+		await harness.session.prompt("go");
+
+		const message = harness.session.messages.find(
+			(entry): entry is CustomMessage =>
+				entry.role === "custom" && entry.customType === IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
+		);
+		if (!message) {
+			throw new Error("Expected an injected IPython restore message");
+		}
+		// The routine leading-underscore skip is filtered: it fires on every healthy write and
+		// the owner can neither rebuild nor avoid it.
+		expect(message.details).toEqual({
+			restored: true,
+			failed: ["big_df"],
+			degraded: [{ name: "helper", reason: "by-value function" }],
+			notSaved: [{ name: "cache", reason: "cannot pickle 'module' object" }],
+		});
+		// The model-facing content keeps its machine-block wrapper and prose unchanged.
+		const content = typeof message.content === "string" ? message.content : "";
+		expect(content).toContain("<ipython_state_restored>");
+		expect(content).toContain("available again: alpha");
+		expect(content).toContain("big_df");
+	});
+
+	it("warns on a partial restore and lists the lost names when expanded", () => {
+		const message: CustomMessage<IpythonStateRestoredDetails> = {
+			role: "custom",
+			customType: IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
+			content:
+				"<ipython_state_restored>\nYour Python kernel state was revived from your previous session. These names are available again: alpha.\n</ipython_state_restored>",
+			display: true,
+			details: {
+				restored: true,
+				failed: ["big_df", "model"],
+				degraded: [{ name: "helper", reason: "by-value function" }],
+				notSaved: [{ name: "cache", reason: "cannot pickle 'module' object" }],
+			},
+			timestamp: Date.now(),
+		};
+		const component = new InjectedPromptMessageComponent(message);
+
+		const collapsed = render(component);
+		expect(collapsed.trim()).toContain("◆ Python 环境部分恢复（3 个名字没回来）");
+		expect(collapsed).not.toContain("big_df");
+		// A partial restore must not wear the routine faint color: it is the only sign names were lost.
+		expect(renderRaw(component)).toContain(colorPrefix("warning"));
+		component.setExpanded(true);
+		const expanded = render(component);
+		expect(renderRaw(component)).toContain(colorPrefix("warning"));
+		expect(expanded).toContain("◆ Python 环境部分恢复（3 个名字没回来）");
+		expect(expanded).toContain("big_df、model");
+		expect(expanded).toContain("cache");
+		expect(expanded).toContain("helper");
+		expect(expanded).not.toContain("<ipython_state_restored>");
+		expect(expanded).not.toContain("available again");
+		expect(component.getBlockCopyText()).toContain("big_df");
+		expect(component.getBlockCopyText()).not.toContain("<ipython_state_restored>");
+	});
+
+	it("marks a restore that lost every name as a fresh kernel with the loss count", () => {
+		const message: CustomMessage<IpythonStateRestoredDetails> = {
+			role: "custom",
+			customType: IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
+			content: "restore details",
+			display: true,
+			details: { restored: false, failed: ["big_df", "model"] },
+			timestamp: Date.now(),
+		};
+		const component = new InjectedPromptMessageComponent(message);
+		expect(render(component)).toContain("◆ 新开了 Python 环境（2 个名字没回来）");
+		component.setExpanded(true);
+		expect(render(component)).toContain("big_df、model");
+	});
+
+	it("marks a wholesale restore failure without names", () => {
+		const message: CustomMessage<IpythonStateRestoredDetails> = {
+			role: "custom",
+			customType: IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
+			content:
+				"<ipython_state_restored>\nYour previous Python kernel state could not be revived; the kernel is starting fresh.\nRestore failure: payload is corrupt.\n</ipython_state_restored>",
+			display: true,
+			details: { restored: false, restoreError: "payload is corrupt" },
+			timestamp: Date.now(),
+		};
+		const component = new InjectedPromptMessageComponent(message);
+		expect(render(component)).toContain("◆ 新开了 Python 环境（恢复失败）");
+		component.setExpanded(true);
+		const expanded = render(component);
+		expect(expanded).toContain("恢复失败：payload is corrupt");
+		expect(expanded).not.toContain("<ipython_state_restored>");
+	});
+
+	it("keeps the boolean labels for messages written before the roster details existed", () => {
+		const legacy: CustomMessage<IpythonStateRestoredDetails> = {
+			role: "custom",
+			customType: IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
+			content:
+				"<ipython_state_restored>\nYour Python kernel state was revived from your previous session. These names are available again: alpha.\nThese could not be restored and must be recreated if needed: old_df.\n</ipython_state_restored>",
+			display: true,
+			details: { restored: true },
+			timestamp: Date.now(),
+		};
+		const component = new InjectedPromptMessageComponent(legacy);
+		expect(render(component).trim()).toBe("·  ◆ Python 环境已恢复  ·");
+		// The boolean fallback keeps the routine tone: no warning color without a roster.
+		expect(renderRaw(component)).not.toContain(colorPrefix("warning"));
+		component.setExpanded(true);
+		const expanded = render(component);
+		// No structured roster on an old message: the expanded card shows the notice prose.
+		expect(expanded).toContain("old_df");
+		expect(expanded).not.toContain("<ipython_state_restored>");
 	});
 
 	it("retries only undelivered input after partial scheduler delivery", async () => {
@@ -172,6 +312,7 @@ describe("ENG-4530 IPython state restore message", () => {
 
 		expect(render(component)).toContain("◆ 新开了 Python 环境");
 		component.setExpanded(true);
-		expect(render(component)).not.toContain("restore details");
+		// Expanding shows the notice body, wrapper tags dropped - it is no longer a no-op.
+		expect(render(component)).toContain("restore details");
 	});
 });

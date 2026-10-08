@@ -1,0 +1,1 @@
+- Fixed the kernel-restore card hiding partial restore failures: the collapsed line now warns with how many names did not come back ("部分恢复（N 个名字没回来）" / "新开了 Python 环境（N 个名字没回来）"), and expanding it lists the failed, never-saved and degraded names instead of doing nothing.

@@ -1034,6 +1034,17 @@ export interface HeartbeatPromptDetails {
 
 export interface IpythonStateRestoredDetails {
 	restored: boolean;
+	/** Snapshot names that failed to revive, from `RestoreResult.failed` (names only). */
+	failed?: string[];
+	/** Names revived with reduced semantics, from `RestoreResult.degraded`. */
+	degraded?: { name: string; reason: string }[];
+	/**
+	 * Names live at snapshot time that never entered the payload, routine skips
+	 * (leading-underscore internals, host skill wrappers) already filtered out.
+	 */
+	notSaved?: { name: string; reason: string }[];
+	/** Whole-attempt failure text, from `RestoreResult.error`. */
+	restoreError?: string;
 }
 
 /** Import names of the pre-imported Python skills that failed to import into the kernel. */

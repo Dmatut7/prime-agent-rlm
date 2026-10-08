@@ -275,6 +275,7 @@ import {
 } from "./kernel/index.js";
 import {
 	compactionKernelStateLines,
+	isExpectedSnapshotSkip,
 	type RestoreResult,
 	restoreNoticeLines,
 	snapshotFailureNoticeLines,
@@ -11950,12 +11951,24 @@ export class AgentSession {
 			});
 		}
 		const lines = ["<ipython_state_restored>", ...restoreNoticeLines(result), "</ipython_state_restored>"];
+		// The owner-facing card reads its roster from details (the content stays the
+		// model-facing machine block), so the partial-restore facts travel with the
+		// message. Routine write-side skips are filtered here, like the notice lines
+		// do for the model: they fire on every healthy snapshot and are not actionable.
+		const notSaved = (result.notSaved ?? []).filter((entry) => !isExpectedSnapshotSkip(entry));
+		const degraded = result.degraded ?? [];
 		void this.sendCustomMessage(
 			{
 				customType: IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 				content: lines.join("\n"),
 				display: true,
-				details: { restored: result.restored.length > 0 },
+				details: {
+					restored: result.restored.length > 0,
+					...(result.failed.length > 0 ? { failed: result.failed.map((failure) => failure.name) } : {}),
+					...(degraded.length > 0 ? { degraded } : {}),
+					...(notSaved.length > 0 ? { notSaved } : {}),
+					...(result.error ? { restoreError: result.error } : {}),
+				},
 			},
 			{ deliverAs: "nextTurn" },
 		).catch(() => {});

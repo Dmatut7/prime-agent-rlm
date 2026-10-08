@@ -41,7 +41,7 @@ export class SystemNoticeLine implements Component {
 		private readonly label: string,
 		private readonly detail = "",
 		private readonly hint = "",
-		private readonly tone: "notice" | "error" = "notice",
+		private readonly tone: "notice" | "error" | "warning" = "notice",
 	) {}
 
 	render(width: number): string[] {
@@ -61,7 +61,10 @@ export class SystemNoticeLine implements Component {
 		const detail = detailText && room >= 8 ? `  ${truncateToWidth(detailText, room, "…")}` : "";
 		const plain = truncateToWidth(`${frame}${label}${detail}${tail}`, safeWidth, "…");
 		const left = Math.max(0, Math.floor((safeWidth - visibleWidth(plain)) / 2));
-		const lines = [" ".repeat(left) + theme.fg(this.tone === "error" ? "error" : "systemNotice", plain)];
+		const lines = [
+			" ".repeat(left) +
+				theme.fg(this.tone === "error" ? "error" : this.tone === "warning" ? "warning" : "systemNotice", plain),
+		];
 		this.cachedWidth = width;
 		this.cachedLines = lines;
 		return lines;
