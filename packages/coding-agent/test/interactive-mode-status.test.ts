@@ -3788,10 +3788,17 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 	function createStartupRunHarness(
 		options: Record<string, unknown>,
 		overrides: Record<string, unknown> = {},
-	): Record<string, unknown> & { getUserInput: ReturnType<typeof vi.fn> } {
+	): Record<string, unknown> & {
+		getUserInput: ReturnType<typeof vi.fn>;
+		restoreHandoffPastedInput: ReturnType<typeof vi.fn>;
+	} {
 		return {
 			init: vi.fn(async () => {}),
 			restorePromptStashOnOpen: vi.fn(),
+			// w13-A added this run() collaborator (paste recovery from the switch
+			// window); the fake must stub it like every other run() collaborator,
+			// or run() rejects before the admission barrier arms.
+			restoreHandoffPastedInput: vi.fn(),
 			options: { agentsViewOwnsStartupNotices: true, ...options },
 			modelRegistry: { getError: vi.fn(() => undefined) },
 			runStartupOnboarding: vi.fn(async () => true),
@@ -4171,7 +4178,14 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			);
 
 			const run = InteractiveMode.prototype.run.call(fakeThis as never);
-			while (!fakeThis.admitPendingStartupPrompts) await Promise.resolve();
+			// Real-yield state barrier with a timeout: a bare `await Promise.resolve()`
+			// loop never reaches the event loop, so a run() failure here used to hang
+			// the whole worker at 100% CPU instead of failing the test.
+			await vi.waitFor(() => {
+				if (!fakeThis.admitPendingStartupPrompts) {
+					throw new Error("run() never armed the startup admission barrier");
+				}
+			});
 			fakeThis.latestEditorPromptStash = {
 				text: submittedText,
 				expandedText: "submitted expanded paste [image #7]",
@@ -4376,7 +4390,13 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		);
 
 		const run = InteractiveMode.prototype.run.call(fakeThis as never);
-		while (!fakeThis.admitPendingStartupPrompts) await Promise.resolve();
+		// Real-yield state barrier (see the sibling test above): a pure-microtask
+		// spin here hangs the worker on any run() failure instead of failing.
+		await vi.waitFor(() => {
+			if (!fakeThis.admitPendingStartupPrompts) {
+				throw new Error("run() never armed the startup admission barrier");
+			}
+		});
 		fakeThis.latestEditorPromptStash = { text: "first rich draft", expandedText: "first expanded" };
 		editorText = "";
 		const first = fakeThis.defaultEditor.onSubmit?.("first rich draft");
@@ -4409,6 +4429,9 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		await expect(InteractiveMode.prototype.run.call(fakeThis as never)).resolves.toEqual(startupRunResult);
 		expect(fakeThis.getUserInput).toHaveBeenCalledOnce();
 		expect(prompt).not.toHaveBeenCalled();
+		// run() must hand the switch-window paste to the recovery hook before
+		// user input starts; losing that wiring would silently drop pastes again.
+		expect(fakeThis.restoreHandoffPastedInput).toHaveBeenCalledOnce();
 	});
 
 	function createPrimeCliHarness(shown: boolean): OnboardingFake {

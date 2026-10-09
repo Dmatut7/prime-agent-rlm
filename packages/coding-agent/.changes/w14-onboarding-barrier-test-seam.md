@@ -1,0 +1,1 @@
+- Fixed the suite regression from the W13 merge: the startup-admission onboarding tests failed and the run then hung a worker at 100% CPU forever; the run() fake now stubs the new paste-recovery collaborator and the barrier waits yield with a timeout, so failures are fast reds.
