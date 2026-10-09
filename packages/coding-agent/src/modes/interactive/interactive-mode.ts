@@ -26,6 +26,7 @@ import type {
 	SlashCommand,
 } from "@earendil-works/pi-tui";
 import {
+	BULK_TEXT_MIN_RUN,
 	type ClickRegion,
 	CombinedAutocompleteProvider,
 	type Component,
@@ -45,6 +46,7 @@ import {
 	Text,
 	TruncatedText,
 	TUI,
+	takePendingHandoffInput,
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
@@ -1231,18 +1233,18 @@ export function formatDaemonReconnectBanner(
 	clientVersion: string,
 ): DaemonReconnectBanner {
 	if (!daemonVersion) {
-		return { message: "Daemon reconnected", tone: "dim" };
+		return { message: "已重新连上后台", tone: "dim" };
 	}
 	if (daemonVersion === clientVersion) {
-		return { message: `Daemon restarted (v${daemonVersion}) - reconnected`, tone: "dim" };
+		return { message: `后台已重启（v${daemonVersion}），连接已恢复`, tone: "dim" };
 	}
 	if (isDaemonVersionNewer(daemonVersion, clientVersion)) {
 		return {
-			message: `Daemon restarted (v${daemonVersion}), this window still runs v${clientVersion} - restart the window to pick up the update.`,
+			message: `后台已更新到 v${daemonVersion}，这个窗口还是 v${clientVersion}；重启窗口后才能用上新版。`,
 			tone: "warning",
 		};
 	}
-	return { message: `Daemon restarted (v${daemonVersion}), this window runs v${clientVersion}.`, tone: "dim" };
+	return { message: `后台版本是 v${daemonVersion}，这个窗口是 v${clientVersion}，连接已恢复。`, tone: "dim" };
 }
 
 /**
@@ -1864,6 +1866,14 @@ export class InteractiveMode {
 	private liveTurnFlowStore: LiveTurnFlow | undefined;
 	/** The connection to the background session closed and has not come back. */
 	private connectionLost = false;
+	/**
+	 * The daemon connection reported itself down (reconnecting/closed) and has
+	 * not reported a recovery since. The agents view needs the daemon to list
+	 * sessions, so the list-switch flow must not start in this state: it tears
+	 * the session UI down and hands the terminal to a view whose connect fails
+	 * with a raw stack (w13 QA finding 1).
+	 */
+	private daemonConnectionDown = false;
 	/** How live events become the quiet conversation's turn boxes (created on first use). */
 	private get turnFlow(): LiveTurnFlow {
 		this.liveTurnFlowStore ??= new LiveTurnFlow(this.createLiveTurnFlowHost());
@@ -2592,6 +2602,7 @@ export class InteractiveMode {
 	async run(): Promise<InteractiveModeRunResult> {
 		await this.init();
 		this.restorePromptStashOnOpen();
+		this.restoreHandoffPastedInput();
 
 		// Global, environment-scoped notices (app update, extension updates, tmux setup)
 		// belong on the agents view, not in a conversation. When the agents view already
@@ -3692,7 +3703,56 @@ export class InteractiveMode {
 		return refresh;
 	}
 
+	/**
+	 * A catalog refresh from the connection event stream. The recovering-worker
+	 * refusal ("Cannot list heartbeats while session worker is recovering") is
+	 * a transient recovery state, not a conversation error: it shows as a
+	 * diagnostic that leaves once a later refresh succeeds (w13 QA finding 3),
+	 * instead of an error block that lingers for the rest of the session.
+	 */
+	private async refreshHeartbeatCatalogWithDiagnostic(): Promise<void> {
+		try {
+			await this.refreshHeartbeatCatalog();
+		} catch (error) {
+			this.showHeartbeatCatalogDiagnostic(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	private heartbeatCatalogDiagnostic?: { spacer: Component; block: Component };
+
+	private showHeartbeatCatalogDiagnostic(message: string): void {
+		this.dismissHeartbeatCatalogDiagnostic({ render: false });
+		const text = `出错：${sanitizeDisplayLine(message)}`;
+		const spacer = new Spacer(this.chatContainer.children.length > 0 ? 1 : 0);
+		const block = new FocusableTextBlock(theme.fg("error", text), text);
+		this.chatContainer.addChild(spacer);
+		this.chatContainer.addChild(block);
+		this.heartbeatCatalogDiagnostic = { spacer, block };
+		this.ui.requestRender();
+	}
+
+	/** Remove the recovering-worker diagnostic; anything newer in the chat keeps it as history. */
+	private dismissHeartbeatCatalogDiagnostic(options: { render?: boolean } = {}): void {
+		const diagnostic = this.heartbeatCatalogDiagnostic;
+		if (!diagnostic) return;
+		this.heartbeatCatalogDiagnostic = undefined;
+		const children = this.chatContainer.children;
+		const index = children.lastIndexOf(diagnostic.block);
+		if (index !== -1) {
+			children.splice(index, 1);
+			if (index > 0 && children[index - 1] === diagnostic.spacer) {
+				children.splice(index - 1, 1);
+			}
+		}
+		if (options.render !== false) {
+			this.ui.requestRender();
+		}
+	}
+
 	private applyHeartbeatCatalog(heartbeats: AgentConnectionHeartbeat[]): void {
+		// A refresh that answers means the recovering-worker state ended: the
+		// diagnostic it raised (if any) leaves with it.
+		this.dismissHeartbeatCatalogDiagnostic({ render: false });
 		this.heartbeatCatalog = heartbeats;
 		this.scheduleHeartbeatManagerRefresh();
 		this.updateSubagentSummaryLine();
@@ -5797,6 +5857,54 @@ export class InteractiveMode {
 		this.restorePromptStashIfEditorEmpty();
 	}
 
+	/**
+	 * Recover a paste that arrived while this session's UI was handing the
+	 * terminal over to (or back from) the agents view (w13 QA finding 4): the
+	 * switch window's stdin used to discard it silently. The terminal layer now
+	 * buffers the window's input; pastes come back here — bracketed ones intact,
+	 * and unbracketed bulk runs (the handoff turns ?2004 off, so a real paste
+	 * arrives as plain text) judged by the same bulk-run rule the stdin buffer
+	 * uses. Raw keystrokes stay discarded — replaying them into a fresh view is
+	 * worse than losing them — so only paste payloads are restored, into the
+	 * editor when it is empty, otherwise into the prompt stash.
+	 */
+	private restoreHandoffPastedInput(): void {
+		const buffered = takePendingHandoffInput();
+		if (!buffered || buffered.text.length === 0) return;
+		const pastes: string[] = [];
+		const pastePattern = /\x1b\[200~([\s\S]*?)\x1b\[201~/g;
+		for (let match = pastePattern.exec(buffered.text); match; match = pastePattern.exec(buffered.text)) {
+			pastes.push(match[1].replace(/\r\n?/g, "\n"));
+		}
+		// Bulk runs: printable text between escape sequences. A run of 32+ chars
+		// with no ESC is paste-like input, exactly like StdinBuffer's rule — its
+		// line endings arrive as CR/CRLF and fold into LF first; short runs are
+		// keystrokes and stay discarded.
+		for (let start = 0; start < buffered.text.length; ) {
+			const rest = buffered.text.slice(start);
+			const nextEscape = rest.indexOf("\x1b");
+			const rawRun = nextEscape === -1 ? rest : rest.slice(0, nextEscape);
+			const run = rawRun.replace(/\r\n?/g, "\n");
+			if (run.length >= BULK_TEXT_MIN_RUN && !/[\u0000-\u0009\u000b-\u001f\u007f]/.test(run)) {
+				pastes.push(run);
+			}
+			if (nextEscape === -1) break;
+			start += nextEscape + 1;
+		}
+		if (pastes.length === 0) return;
+		const paste = pastes.join("\n");
+		const truncationNote = buffered.truncated ? "（开头一段可能不完整）" : "";
+		if (this.editor.getText().length === 0) {
+			this.editor.setText(paste);
+			this.showStatus(`切换窗口期间收到的粘贴已恢复到输入框${truncationNote}`);
+			return;
+		}
+		// The editor already holds text: keep both, the paste waits in the stash
+		// the user restores with the prompt-stash key.
+		this.promptStashState.queuedStashes = [...(this.promptStashState.queuedStashes ?? []), { text: paste }];
+		this.showStatus(`切换窗口期间收到一段粘贴${truncationNote}，已存入输入暂存`);
+	}
+
 	private stashDraftForAgentsView(): void {
 		const text = this.editor.getText();
 		if (!text.trim()) return;
@@ -6889,6 +6997,7 @@ export class InteractiveMode {
 					const run = this.sessionEventQueue.then(async () => {
 						if (generation !== this.sessionEventGeneration) return false;
 						this.connectionLost = false;
+						this.daemonConnectionDown = false;
 						// A park that lifted while the link was down sent its parked:false
 						// into the void; the resync snapshot's quotaPark field (rev 43) is
 						// authoritative for snapshot time, so seed from it instead of
@@ -6939,27 +7048,36 @@ export class InteractiveMode {
 				} else if (event.type === "connection_status") {
 					if (event.status === "connected") {
 						this.connectionLost = false;
+						this.daemonConnectionDown = false;
 						const banner = formatDaemonReconnectBanner(event.daemonVersion, VERSION);
 						this.showStatus(banner.message, banner.tone);
-					} else if (event.backgroundAttempt !== undefined) {
-						this.showStatus(
-							`Daemon connection lost; retrying in the background (attempt ${event.backgroundAttempt})`,
-							"warning",
-						);
 					} else {
-						this.showStatus("和后台的连接断开了，正在重连…", "warning");
+						this.daemonConnectionDown = true;
+						if (event.daemonStopped) {
+							// The tombstone path: recoverDaemon refuses to relaunch a
+							// deliberately stopped daemon, so "正在重连" alone would be a
+							// lie — the retry only pays off once someone starts it again.
+							this.showStatus(
+								"和后台的连接断了：后台服务被手动停止，不会再自动重启；重新启动后台后会自动重连。",
+								"warning",
+							);
+						} else if (event.backgroundAttempt !== undefined) {
+							this.showStatus(`和后台的连接断了，正在后台重试（第 ${event.backgroundAttempt} 次）`, "warning");
+						} else {
+							this.showStatus("和后台的连接断开了，正在重连…", "warning");
+						}
 					}
 					if (event.status === "connected") {
-						await this.refreshHeartbeatCatalog();
+						await this.refreshHeartbeatCatalogWithDiagnostic();
 					}
 				} else if (event.type === "heartbeats_changed") {
-					await this.refreshHeartbeatCatalog();
+					await this.refreshHeartbeatCatalogWithDiagnostic();
 				} else if (event.type === "closed") {
 					if (!this.returnToParentAfterSubagentClosed(event.sessionClosedReason)) {
 						this.noteConnectionClosed();
 						this.showError(
 							event.sessionClosedReason
-								? (event.error ?? "Agent connection closed")
+								? (event.error ?? "和后台的会话被关闭了")
 								: `和后台的连接断了${event.error ? `（${event.error}）` : ""}`,
 						);
 					}
@@ -6977,6 +7095,7 @@ export class InteractiveMode {
 	 */
 	private noteConnectionClosed(): void {
 		this.connectionLost = true;
+		this.daemonConnectionDown = true;
 		if (quietConversation(this)) this.turnFlow.connectionLost();
 		this.turnStartedAt = undefined;
 		this.patchConnectionState({ isStreaming: false, isCompacting: false, isBashRunning: false, retryAttempt: 0 });
@@ -10586,6 +10705,9 @@ export class InteractiveMode {
 		if (this.editor.getText().trim()) {
 			return false;
 		}
+		if (this.isDaemonConnectionDownForAgentsView()) {
+			return true;
+		}
 		if (!this.options.returnToAgentsView) {
 			void this.requestAgentsView();
 			return true;
@@ -10594,7 +10716,26 @@ export class InteractiveMode {
 		return true;
 	}
 
+	/**
+	 * The agents view lists sessions through the daemon, so a down connection
+	 * must not enter the list-switch flow: the session UI is already torn down
+	 * by then, and the successor view's connect failure used to surface as an
+	 * unhandled error that killed the process with a raw stack. Refuse with an
+	 * honest status line instead; the key stays consumed so the editor does not
+	 * reinterpret it.
+	 */
+	private isDaemonConnectionDownForAgentsView(): boolean {
+		if (!this.daemonConnectionDown) {
+			return false;
+		}
+		this.showStatus("和后台的连接断了，暂时打不开会话列表；恢复连接后再按一次返回。", "warning");
+		return true;
+	}
+
 	private async requestAgentsView(): Promise<void> {
+		if (this.isDaemonConnectionDownForAgentsView()) {
+			return;
+		}
 		if (!this.options.returnToAgentsView) {
 			this.showStatus("会话列表在 --no-session 启动的会话里不可用（会话不入库，后台服务没有可浏览的记录）");
 			return;

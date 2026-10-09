@@ -80,13 +80,15 @@ export {
 } from "./mouse.js";
 export { VersionedRenderCache } from "./render-cache.js";
 export { CONTENT_START_MARKER, type TableCellSelectionRegion } from "./selection-metadata.js";
-export { StdinBuffer, type StdinBufferEventMap, type StdinBufferOptions } from "./stdin-buffer.js";
+export { BULK_TEXT_MIN_RUN, StdinBuffer, type StdinBufferEventMap, type StdinBufferOptions } from "./stdin-buffer.js";
 export {
 	engageEarlyRawMode,
 	ProcessTerminal,
 	releaseEarlyRawMode,
+	setKernelInputDiscarderForTests,
 	type Terminal,
 	type TerminalStopOptions,
+	takePendingHandoffInput,
 } from "./terminal.js";
 export {
 	bestAnsiColor,

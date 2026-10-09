@@ -50,6 +50,7 @@ import {
 	DaemonRoutedClient,
 } from "../daemon/daemon-routed-client.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
+import { DaemonShutdownTombstonedRecoveryError } from "../daemon/daemon-supervisor-ownership.js";
 import { DAEMON_BACKGROUND_RECONNECT_RETRY_MS, daemonReconnectBudgetMs } from "../daemon/daemon-timeouts.js";
 import { listDaemonHeartbeats } from "../daemon/heartbeat-catalog.js";
 import {
@@ -426,6 +427,13 @@ export class DaemonAgentConnection implements AgentConnection {
 	private reconnectPromise?: Promise<void>;
 	private backgroundReconnectPromise?: Promise<void>;
 	private backgroundRetryWake?: () => void;
+	/**
+	 * The fast reconnect loop already announced a deliberate-stop refusal (the
+	 * tombstone error from recoverDaemon) for this episode. Emitted on state
+	 * change only: the loop retries every ~2s and the banner merges, but the
+	 * event stream must not repeat the announcement per attempt.
+	 */
+	private daemonStoppedAnnounced = false;
 	private initialAttachPending = false;
 	private initialControlPlaneClose?: Error;
 	private readonly definitiveRequestErrors = new WeakSet<Error>();
@@ -2036,6 +2044,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (this.reconnectPromise) {
 			return this.reconnectPromise;
 		}
+		this.daemonStoppedAnnounced = false;
 		this.reconnectPromise = (async () => {
 			void this.emit({ type: "connection_status", status: "reconnecting", error: cause.message });
 			const timeoutMs = this.options.reconnectTimeoutMs ?? DAEMON_RECONNECT_TIMEOUT_MS;
@@ -2098,6 +2107,20 @@ export class DaemonAgentConnection implements AgentConnection {
 					lastError = error instanceof Error ? error : new Error(String(error));
 					if (this.disposed) {
 						return;
+					}
+					// A tombstoned (deliberately stopped) daemon makes recoverDaemon
+					// refuse on every attempt: say so once instead of letting the UI
+					// show a bare "reconnecting" banner for the whole budget (w13 QA
+					// finding 2). A non-tombstone failure clears the announcement so a
+					// later refusal re-announces.
+					const daemonStopped = lastError instanceof DaemonShutdownTombstonedRecoveryError;
+					if (daemonStopped !== this.daemonStoppedAnnounced) {
+						this.daemonStoppedAnnounced = daemonStopped;
+						void this.emit({
+							type: "connection_status",
+							status: "reconnecting",
+							...(daemonStopped ? { daemonStopped: true, error: lastError.message } : {}),
+						});
 					}
 					// A direct-half failure must not tear down a control-plane socket with a completed handshake.
 					const shouldResetControlPlane =
@@ -2168,6 +2191,9 @@ export class DaemonAgentConnection implements AgentConnection {
 					status: "reconnecting",
 					error: lastError.message,
 					backgroundAttempt: attempt,
+					// The deliberate-stop refusal stays visible while the low-speed
+					// retry keeps polling a tombstoned socket.
+					...(lastError instanceof DaemonShutdownTombstonedRecoveryError ? { daemonStopped: true } : {}),
 				});
 				try {
 					await this.options.recoverDaemon?.();
@@ -2731,6 +2757,10 @@ export class DaemonAgentConnection implements AgentConnection {
 			type: "connection_status",
 			status: "reconnecting",
 			error: "The Prime Agent daemon shut down; waiting for it to come back.",
+			// This loop never relaunches the daemon (an explicit stop stays
+			// stopped): the banner must say so instead of a bare "reconnecting"
+			// that sits unchanged for the whole budget (w13 QA finding 2).
+			daemonStopped: true,
 		});
 		const reconnectPromise = Promise.resolve()
 			.then(() => {

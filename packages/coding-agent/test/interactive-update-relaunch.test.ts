@@ -301,21 +301,11 @@ describe("buildUpdateChildArgs", () => {
 
 describe("formatDaemonReconnectBanner", () => {
 	it.each([
-		[undefined, "1.2.3", "Daemon reconnected", "dim"],
-		["1.2.3", "1.2.3", "Daemon restarted (v1.2.3) - reconnected", "dim"],
-		[
-			"2.0.0",
-			"1.2.3",
-			"Daemon restarted (v2.0.0), this window still runs v1.2.3 - restart the window to pick up the update.",
-			"warning",
-		],
-		[
-			"1.2.3",
-			"1.2.3-beta.1",
-			"Daemon restarted (v1.2.3), this window still runs v1.2.3-beta.1 - restart the window to pick up the update.",
-			"warning",
-		],
-		["1.2.3-beta.1", "1.2.3", "Daemon restarted (v1.2.3-beta.1), this window runs v1.2.3.", "dim"],
+		[undefined, "1.2.3", "已重新连上后台", "dim"],
+		["1.2.3", "1.2.3", "后台已重启（v1.2.3），连接已恢复", "dim"],
+		["2.0.0", "1.2.3", "后台已更新到 v2.0.0，这个窗口还是 v1.2.3；重启窗口后才能用上新版。", "warning"],
+		["1.2.3", "1.2.3-beta.1", "后台已更新到 v1.2.3，这个窗口还是 v1.2.3-beta.1；重启窗口后才能用上新版。", "warning"],
+		["1.2.3-beta.1", "1.2.3", "后台版本是 v1.2.3-beta.1，这个窗口是 v1.2.3，连接已恢复。", "dim"],
 	])("maps daemon version %s vs client %s to banner", (daemonVersion, clientVersion, message, tone) => {
 		expect(formatDaemonReconnectBanner(daemonVersion, clientVersion)).toEqual({ message, tone });
 	});

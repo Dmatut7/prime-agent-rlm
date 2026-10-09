@@ -60,6 +60,87 @@ interface PendingInputHandoff {
 // sequences echo into the preserved frame.
 let pendingInputHandoff: PendingInputHandoff | undefined;
 
+// Input that arrived during a preserved handoff window, captured instead of
+// discarded (w13 QA finding 4: a paste in the switch window used to vanish,
+// and its unread tail could reach the shell). Bounded; overflow is dropped and
+// flagged so a caller can tell a partial capture from a complete one.
+const HANDOFF_INPUT_BUFFER_CAP = 64 * 1024;
+let handoffInputBuffer: { text: string; truncated: boolean } | undefined;
+
+/**
+ * Take the input buffered during the current (or most recent) preserved
+ * handoff window, clearing it. Raw keystrokes stay discarded for safety; the
+ * point is that pasted text is recoverable. Returns undefined when nothing
+ * was captured.
+ */
+export function takePendingHandoffInput(): { text: string; truncated: boolean } | undefined {
+	const buffered = handoffInputBuffer;
+	handoffInputBuffer = undefined;
+	return buffered;
+}
+
+function resetHandoffInputBuffer(): void {
+	handoffInputBuffer = undefined;
+}
+
+function appendHandoffInput(data: string): void {
+	const current = handoffInputBuffer ?? { text: "", truncated: false };
+	if (current.text.length >= HANDOFF_INPUT_BUFFER_CAP) {
+		current.truncated = true;
+	} else {
+		const room = HANDOFF_INPUT_BUFFER_CAP - current.text.length;
+		current.text += room >= data.length ? data : data.slice(0, room);
+		if (room < data.length) current.truncated = true;
+	}
+	handoffInputBuffer = current;
+}
+
+// Discard whatever still sits in the kernel's tty input queue, so a crash
+// during a handoff window cannot hand a half-delivered paste to the shell once
+// cooked mode returns (the observed worst case: pasted lines executing in
+// zsh). Only attempted with evidence input was in flight (the handoff buffer
+// is non-empty) and only on a tty whose fd libuv made non-blocking, so the
+// read cannot stall a healthy exit. Overridable for tests.
+type KernelInputDiscarder = () => void;
+let kernelInputDiscarder: KernelInputDiscarder = discardPendingKernelInput;
+
+/**
+ * Best-effort synchronous drain of the tty input queue: reads and discards
+ * until the non-blocking fd reports EAGAIN or a cap is hit. Never throws into
+ * the exit path.
+ */
+function discardPendingKernelInput(): void {
+	if (!process.stdin.isTTY) return;
+	const chunk = Buffer.alloc(4096);
+	for (let reads = 0; reads < 64; reads += 1) {
+		try {
+			const read = fs.readSync(0, chunk, 0, chunk.length, null);
+			if (read <= 0) return;
+		} catch {
+			// EAGAIN (queue empty) or a dead fd: nothing left to drain.
+			return;
+		}
+	}
+}
+
+/** Test seam for the exit-path kernel drain (see kernelInputDiscarder). */
+export function setKernelInputDiscarderForTests(discard: KernelInputDiscarder): () => void {
+	kernelInputDiscarder = discard;
+	return () => {
+		kernelInputDiscarder = discardPendingKernelInput;
+	};
+}
+
+/** Evidence-gated kernel drain: only when the handoff buffer shows input was arriving. */
+function drainKernelInputAfterHandoffActivity(): void {
+	if (handoffInputBuffer === undefined || handoffInputBuffer.text.length === 0) return;
+	try {
+		kernelInputDiscarder();
+	} catch {
+		// A failed drain must never break the exit restore around it.
+	}
+}
+
 function consumeAltScreenHandoff(): boolean {
 	if (!pendingAltScreenHandoff) {
 		return false;
@@ -73,7 +154,12 @@ function beginInputHandoff(token: symbol, wasRaw: boolean): void {
 	if (pendingInputHandoff) {
 		process.stdin.removeListener("data", pendingInputHandoff.discardHandler);
 	}
-	const discardHandler = (_data: string) => {};
+	// A new handoff window starts with a fresh capture: stale buffered input
+	// nobody took must not masquerade as this window's paste.
+	resetHandoffInputBuffer();
+	const discardHandler = (data: string) => {
+		appendHandoffInput(data);
+	};
 	pendingInputHandoff = { token, wasRaw: inheritedWasRaw, discardHandler };
 	process.stdin.on("data", discardHandler);
 	process.stdin.resume();
@@ -86,6 +172,8 @@ function consumeInputHandoff(): boolean | undefined {
 	}
 	process.stdin.removeListener("data", handoff.discardHandler);
 	pendingInputHandoff = undefined;
+	// The buffered input outlives the handler: the successor's start() has
+	// consumed the handoff, but the app still takes the capture right after.
 	return handoff.wasRaw;
 }
 
@@ -96,6 +184,10 @@ function cancelInputHandoff(token: symbol): void {
 	}
 	process.stdin.removeListener("data", handoff.discardHandler);
 	pendingInputHandoff = undefined;
+	// No successor will take the capture; anything still unread in the kernel
+	// queue must not survive into cooked mode.
+	drainKernelInputAfterHandoffActivity();
+	resetHandoffInputBuffer();
 	process.stdin.pause();
 	if (process.stdin.setRawMode) {
 		process.stdin.setRawMode(handoff.wasRaw);
@@ -908,6 +1000,11 @@ export class ProcessTerminal implements Terminal {
 				// The terminal is already gone; nothing left to restore.
 			}
 			try {
+				// A crash mid-handoff can leave the tail of a paste unread in the
+				// kernel's input queue; restoring cooked mode would hand those
+				// bytes to the shell line by line. Drain them first, gated on the
+				// handoff buffer proving input was in flight.
+				drainKernelInputAfterHandoffActivity();
 				process.stdin.setRawMode?.(pendingInputHandoff?.wasRaw ?? this.wasRaw);
 			} catch {
 				// The terminal is already gone; nothing left to restore.

@@ -998,6 +998,25 @@ export class DaemonShutdownTombstonedError extends Error {
 	}
 }
 
+/**
+ * An attached client window's recoverDaemon refused to relaunch the daemon:
+ * the socket is tombstoned by a deliberate stop. The reconnect loops keep
+ * retrying (a fresh deliberate start lifts the tombstone), but they surface
+ * this error so the UI can say the daemon will not come back by itself
+ * instead of showing a bare "reconnecting" banner for the whole budget.
+ */
+export class DaemonShutdownTombstonedRecoveryError extends Error {
+	readonly code = "daemon_shutdown_tombstoned" as const;
+
+	constructor(readonly socketPath: string) {
+		super(
+			`The Prime Agent daemon on ${socketPath} was shut down deliberately; ` +
+				"this window will reconnect once the daemon is started again",
+		);
+		this.name = "DaemonShutdownTombstonedRecoveryError";
+	}
+}
+
 export async function persistDaemonStartupFenceFromOwner(
 	socketPath: string,
 	hello: DaemonSupervisorHelloIdentity,

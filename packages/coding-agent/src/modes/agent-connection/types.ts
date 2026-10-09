@@ -934,6 +934,13 @@ export type AgentConnectionEvent =
 			 * recovery is still going instead of showing a dead connection.
 			 */
 			backgroundAttempt?: number;
+			/**
+			 * The reconnect loops' recoverDaemon refused to relaunch the daemon
+			 * because the socket carries a deliberate-shutdown tombstone: retrying
+			 * continues (a fresh start lifts it), but the UI must say the daemon
+			 * will not come back by itself instead of a bare "reconnecting" banner.
+			 */
+			daemonStopped?: boolean;
 			/** App version of the restarted daemon; set when recovery re-attached to it. */
 			daemonVersion?: string;
 	  }

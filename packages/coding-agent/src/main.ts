@@ -122,7 +122,10 @@ import {
 	collectDaemonLaunchEnv,
 	DAEMON_FIRST_PARTY_SESSION_CAPABILITIES,
 } from "./modes/daemon/daemon-protocol.js";
-import { readDaemonShutdownTombstone } from "./modes/daemon/daemon-supervisor-ownership.js";
+import {
+	DaemonShutdownTombstonedRecoveryError,
+	readDaemonShutdownTombstone,
+} from "./modes/daemon/daemon-supervisor-ownership.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	daemonWorkerInstanceId,
@@ -1405,10 +1408,7 @@ export async function recoverDaemonUnlessShutdownTombstoned(
 	ensure: (socketPath: string) => Promise<void> = ensureInteractiveDaemonRunning,
 ): Promise<void> {
 	if (readDaemonShutdownTombstone(socketPath)) {
-		throw new Error(
-			`The Prime Agent daemon on ${socketPath} was shut down deliberately; ` +
-				"this window will reconnect once the daemon is started again.",
-		);
+		throw new DaemonShutdownTombstonedRecoveryError(socketPath);
 	}
 	await ensure(socketPath);
 }

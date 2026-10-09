@@ -1,6 +1,7 @@
 import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { appendRotatingLog } from "../src/config.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import type { ModelRegistry } from "../src/core/model-registry.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
@@ -42,6 +43,10 @@ const modeMocks = vi.hoisted(() => ({
 	clientRequest: vi.fn<() => Promise<unknown>>(),
 	// vi.clearAllMocks() does not empty a plain array, so tests reset this themselves.
 	clientConstructions: [] as { socketPath: string; declaredCapabilities?: readonly unknown[] }[],
+	// Shared client state: per-test failures are driven through these so a
+	// mocked client the view constructs internally can be made unreachable.
+	clientConnected: true,
+	clientReconnect: vi.fn(async () => undefined),
 }));
 
 vi.mock("../src/config.js", async (importOriginal) => {
@@ -60,8 +65,10 @@ vi.mock("../src/modes/daemon/daemon-client.js", async (importOriginal) => {
 			connect = vi.fn(async () => undefined);
 			close = vi.fn();
 			request = modeMocks.clientRequest;
-			isConnected = true;
-			reconnect = vi.fn(async () => undefined);
+			get isConnected(): boolean {
+				return modeMocks.clientConnected;
+			}
+			reconnect = modeMocks.clientReconnect;
 			onMessage = vi.fn(() => () => {});
 			onClose = vi.fn(() => () => {});
 		},
@@ -403,6 +410,45 @@ describe("AgentsViewMode", () => {
 			expect.objectContaining({ telemetryDisabled: true }),
 		);
 		runView.mockRestore();
+	});
+
+	it("exits with a clean message instead of a raw stack when the daemon is unreachable at list startup", async () => {
+		// w13 lane, QA finding 1: daemon shut down while a session was open; the
+		// agents-back key hands the terminal over, and the list's daemon connect
+		// fails with an unhandled "Failed to connect..." that kills the process
+		// and dumps a raw Node stack into the terminal.
+		const recoverDaemon = vi.fn(async () => {
+			throw new Error("The Prime Agent daemon on /tmp/fake-daemon.sock was shut down deliberately");
+		});
+		modeMocks.clientConnected = false;
+		modeMocks.clientReconnect.mockRejectedValueOnce(
+			new Error("Failed to connect to the Prime Agent daemon: connect ENOENT /tmp/fake-daemon.sock"),
+		);
+		const errorLog = vi.mocked(appendRotatingLog);
+		const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+		try {
+			// Red before the fix: this rejects and the rejection carries the raw
+			// connect error out of the whole CLI.
+			await runAgentsViewMode({
+				socketPath: "/tmp/fake-daemon.sock",
+				config: { cwd: "/tmp" } as never,
+				recoverDaemon,
+				uiServices: {
+					settingsManager: settingsManager as never,
+					modelRegistry: {} as never,
+					getInitialCwd: () => "/tmp",
+					getInitialSessionName: () => undefined,
+					getThemes: () => [],
+				},
+			});
+
+			expect(recoverDaemon).toHaveBeenCalled();
+			expect(errorLog).toHaveBeenCalledWith(expect.any(String), expect.stringContaining("list startup"));
+		} finally {
+			modeMocks.clientConnected = true;
+			consoleError.mockRestore();
+		}
 	});
 
 	it("invalidates the persisted scope root after popping a scope frame", async () => {

@@ -125,6 +125,8 @@ export interface PrimeAgentConnectionStatusMeta {
 	error?: string;
 	/** 1-based attempt count while the low-speed background retry runs. */
 	backgroundAttempt?: number;
+	/** The daemon was stopped deliberately (tombstone): it will not restart itself. */
+	daemonStopped?: boolean;
 	/** App version of the restarted daemon once recovery re-attached. */
 	daemonVersion?: string;
 }

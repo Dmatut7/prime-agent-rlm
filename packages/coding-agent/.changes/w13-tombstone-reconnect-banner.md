@@ -1,0 +1,1 @@
+- Fixed the reconnect banner after a deliberate `prime-agent shutdown`: it now says the background service was stopped by hand and will not restart itself, covers both the crash-retry and orderly-shutdown-close paths, and background retries count their attempts in Chinese instead of a static English-free "正在重连…" line.

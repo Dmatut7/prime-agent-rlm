@@ -1,6 +1,12 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { engageEarlyRawMode, ProcessTerminal, releaseEarlyRawMode } from "../src/terminal.js";
+import {
+	engageEarlyRawMode,
+	ProcessTerminal,
+	releaseEarlyRawMode,
+	setKernelInputDiscarderForTests,
+	takePendingHandoffInput,
+} from "../src/terminal.js";
 import { clearDefaultTerminalColors, getDefaultTerminalColors } from "../src/terminal-colors.js";
 import {
 	allocatePlaceholderImageId,
@@ -1012,6 +1018,109 @@ describe("ProcessTerminal crash exit guard (R5-M5)", () => {
 			assert.equal(rawCalls[rawCalls.length - 1], false, "raw mode restored from the handoff record");
 		} finally {
 			second?.stop();
+			first?.stop();
+			restore();
+		}
+	});
+});
+
+describe("ProcessTerminal preserved-handoff input buffering (w13 paste recovery)", () => {
+	// The crash-guard helpers are scoped to the crash-exit-guard suite above; this
+	// suite locates the armed guard the same public-listener-diff way, locally.
+	function armedExitGuard(baseline: ReadonlySet<unknown>): () => void {
+		const guard = process.listeners("exit").find((listener) => !baseline.has(listener));
+		assert.ok(guard, "start() arms the exit guard");
+		return guard as () => void;
+	}
+
+	function recordRawMode(): boolean[] {
+		const rawCalls: boolean[] = [];
+		Object.defineProperty(process.stdin, "setRawMode", {
+			configurable: true,
+			value: (enabled: boolean) => {
+				rawCalls.push(enabled);
+				return process.stdin;
+			},
+		});
+		return rawCalls;
+	}
+
+	it("keeps input that arrives during a preserved handoff instead of discarding it", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		let first: ProcessTerminal | undefined;
+		try {
+			first = new ProcessTerminal();
+			first.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?0u");
+			first.enterAltScreen();
+			first.stop({ preserveAltScreen: true });
+
+			// A paste lands while the next TUI is still starting up: the switch
+			// window's stdin handler must buffer it, not swallow it.
+			process.stdin.emit("data", "\x1b[200~line 1\nline 2\x1b[201~");
+
+			const buffered = takePendingHandoffInput();
+			assert.ok(buffered, "the handoff input was buffered");
+			assert.equal(buffered.text, "\x1b[200~line 1\nline 2\x1b[201~");
+			assert.equal(buffered.truncated, false);
+			assert.equal(takePendingHandoffInput(), undefined, "taking the buffer clears it");
+		} finally {
+			const cleanup = new ProcessTerminal();
+			cleanup.start(
+				() => {},
+				() => {},
+			);
+			cleanup.stop();
+			first?.stop();
+			restore();
+		}
+	});
+
+	it("the exit guard discards pending kernel input after a paste was in flight, before cooked mode returns", () => {
+		const writes: string[] = [];
+		const restore = patchTerminalStdio(writes);
+		const rawCalls = recordRawMode();
+		const drains: number[] = [];
+		const restoreDrain = setKernelInputDiscarderForTests(() => {
+			drains.push(Date.now());
+		});
+		let first: ProcessTerminal | undefined;
+		try {
+			const baseline: ReadonlySet<unknown> = new Set(process.listeners("exit"));
+			first = new ProcessTerminal();
+			first.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?0u");
+			first.enterAltScreen();
+			first.stop({ preserveAltScreen: true });
+
+			// Without in-flight input there is no evidence anything is still
+			// arriving: the guard must not read the kernel queue.
+			const guard = armedExitGuard(baseline);
+			guard();
+			assert.equal(drains.length, 0, "no drain without evidence of in-flight input");
+
+			// A paste partially arrived during the window: the tail may still sit
+			// in the kernel queue, where cooked mode would hand it to the shell.
+			process.stdin.emit("data", "\x1b[200~partial paste");
+			guard();
+			assert.equal(drains.length, 1, "the guard drained before restoring cooked mode");
+			assert.equal(rawCalls[rawCalls.length - 1], false, "raw mode still restored");
+			takePendingHandoffInput();
+		} finally {
+			restoreDrain();
+			const cleanup = new ProcessTerminal();
+			cleanup.start(
+				() => {},
+				() => {},
+			);
+			cleanup.stop();
 			first?.stop();
 			restore();
 		}

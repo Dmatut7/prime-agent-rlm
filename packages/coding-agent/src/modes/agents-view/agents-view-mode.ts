@@ -705,7 +705,8 @@ async function runAgentsViewLoop(
 ): Promise<void> {
 	while (true) {
 		const view = new AgentsViewMode(options, persistentState);
-		const viewResult = await view.run();
+		const viewResult = await runAgentsViewModeView(view, options, persistentState);
+		if (viewResult === undefined) return;
 		if (viewResult.type === "exit") return;
 		let result: Extract<AgentsViewRunResult, { type: "open" }>;
 		if (viewResult.type === "scope_back") {
@@ -842,6 +843,71 @@ async function runAgentsViewLoop(
 			persistentState.statusMessage = formatError("Failed to open agent", error);
 		}
 	}
+}
+
+/**
+ * Run one view instance, containing a startup failure instead of letting it
+ * escape (w13 QA finding 1: a daemon that died while a session was open made
+ * view.run()'s daemon connect reject with "Failed to connect...", which
+ * propagated out of the whole CLI as a raw stack and killed the process).
+ *
+ * A connect failure at startup gets one recovery attempt (recoverDaemon
+ * relaunches a crashed daemon; a deliberate shutdown's tombstone makes it
+ * refuse, and that refusal is the honest reason to show). If the retry also
+ * fails — or recovery itself refused — the mode exits cleanly: the failure
+ * line prints from a process exit listener registered after the terminal's
+ * exit guard, so it lands on the main screen after the guard releases the
+ * preserved alt-screen frame, where a direct print would be wiped. Returns
+ * undefined when the loop should stop.
+ */
+async function runAgentsViewModeView(
+	view: AgentsViewMode,
+	options: AgentsViewModeOptions,
+	persistentState: AgentsViewPersistentState,
+): Promise<AgentsViewRunResult | undefined> {
+	try {
+		return await view.run();
+	} catch (startupError) {
+		logClientError("Agents view list startup failed", startupError);
+		let recoverRefusal: unknown;
+		if (options.recoverDaemon) {
+			try {
+				await options.recoverDaemon();
+			} catch (error) {
+				recoverRefusal = error;
+			}
+		}
+		if (recoverRefusal !== undefined) {
+			reportAgentsViewStartupFailure(recoverRefusal);
+			return undefined;
+		}
+		// A relaunch may have just brought the daemon back: reset the client the
+		// failed view created so the retry reconnects through a fresh one.
+		persistentState.rosterClient?.close();
+		persistentState.rosterClient = undefined;
+		await persistentState.rosterStore?.dispose().catch(() => undefined);
+		persistentState.rosterStore = undefined;
+		try {
+			return await new AgentsViewMode(options, persistentState).run();
+		} catch (retryError) {
+			logClientError("Agents view list startup failed", retryError);
+			reportAgentsViewStartupFailure(retryError);
+			return undefined;
+		}
+	}
+}
+
+/**
+ * The one-line user-facing verdict for a list that cannot start. The print is
+ * deferred to a process exit listener so it follows the terminal exit guard's
+ * alt-screen release; the full stack is already in the client error log.
+ */
+function reportAgentsViewStartupFailure(reason: unknown): void {
+	const detail = reason instanceof Error ? reason.message : String(reason);
+	const message = `会话列表打不开：和后台服务的连接断了（${detail}）。重新启动 prime-agent 后再试。`;
+	process.once("exit", () => {
+		console.error(message);
+	});
 }
 
 const AGENTS_VIEW_COMMAND_NAMES = ["name", "kill"] as const;
@@ -3096,7 +3162,7 @@ export class AgentsViewMode implements Component, Focusable {
 				const sessions = this.rosterStore.summaries();
 				this.daemonShutdownReceived = false;
 				this.reconnectTimedOut = false;
-				this.setStatusMessage("Daemon reconnected", { render: false });
+				this.setStatusMessage("已重新连上后台", { render: false });
 				this.applySessionList(sessions, true);
 				this.armSavedSearchFetch({ duringReconnect: true });
 				return;

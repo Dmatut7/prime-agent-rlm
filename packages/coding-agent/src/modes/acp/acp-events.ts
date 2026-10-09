@@ -203,6 +203,7 @@ export function acpUpdatesForConnectionEvent(event: AgentConnectionEvent): AcpSe
 							status: event.status,
 							...(event.error !== undefined ? { error: event.error } : {}),
 							...(event.backgroundAttempt !== undefined ? { backgroundAttempt: event.backgroundAttempt } : {}),
+							...(event.daemonStopped !== undefined ? { daemonStopped: event.daemonStopped } : {}),
 							...(event.daemonVersion !== undefined ? { daemonVersion: event.daemonVersion } : {}),
 						},
 					}),
