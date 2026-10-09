@@ -1,0 +1,1 @@
+- Added `rlm.rename(new_name, session_id=...)` so a session or a direct child subagent can be renamed: omit `session_id` to rename the calling session, or pass a spawn handle, a `list_subagents()` row, or a session id to rename a direct child (never by the child's session name), and the renamed session records a transcript notice.

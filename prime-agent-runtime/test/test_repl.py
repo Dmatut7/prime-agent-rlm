@@ -2328,6 +2328,83 @@ class OwnerWatchdogTest(unittest.TestCase):
         self.assertEqual(calls, [("OpenProcess", 0x00100000, False, 778)])
 
 
+def _read_snapshot_value(path: str, name: str):
+    import dill
+
+    with open(path, "rb") as fh:
+        payload = dill.load(fh)
+    return dill.loads(payload[name])
+
+
+class EofFinalSnapshotFlushTest(unittest.TestCase):
+    """W17-①: the kernel flushes its live namespace when the host dies.
+
+    A host that crashes (or is SIGKILLed) never sends its dispose `final`
+    snapshot, so its debounced snapshots stop at the last one. The kernel must
+    persist the namespace as of the death moment, or a resume loses everything
+    since the last debounce. Two death signals reach the kernel, and both must
+    flush: stdin EOF (the host's stdin pipe closed) and the owner watchdog
+    (the owner PID died while stdin stayed open).
+    """
+
+    def _seed_target(self, repl: ReplProcess, tmp: str) -> tuple[str, str]:
+        path = os.path.join(tmp, "kernel-state.dill")
+        manifest_path = os.path.join(tmp, "kernel-state.json")
+        repl.execute("e1", "marker = 'before'")
+        repl.send({"type": "snapshot", "id": "e2", "path": path, "manifest_path": manifest_path})
+        done = one(repl.until_done("e2"), "done")
+        self.assertEqual(done["status"], "ok")
+        return path, manifest_path
+
+    def test_eof_flushes_the_final_namespace_to_the_last_snapshot_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repl = ReplProcess()
+            self.addCleanup(repl.close)
+            repl.ready()
+            path, _ = self._seed_target(repl, tmp)
+            # A cell mutates state after the snapshot: the debounce write would
+            # never see it, so only the death-time flush can capture it.
+            repl.execute("e3", "marker = 'at-eof'")
+            assert repl.proc.stdin is not None
+            repl.proc.stdin.close()  # the host's stdin pipe closes: kernel sees EOF
+            self.assertEqual(repl.proc.wait(timeout=15), 0)
+            self.assertEqual(_read_snapshot_value(path, "marker"), "at-eof")
+
+    def test_owner_death_flushes_the_final_namespace(self):
+        owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                repl = ReplProcess(env={"PRIME_AGENT_KERNEL_OWNER_PID": str(owner.pid)})
+                self.addCleanup(repl.close)
+                repl.ready()
+                path, _ = self._seed_target(repl, tmp)
+                repl.execute("e4", "marker = 'at-owner-death'")
+                # stdin stays open (no EOF) and the loop is idle: only the owner
+                # watchdog can notice the death, and it owns the final flush.
+                owner.kill()
+                owner.wait(timeout=10)
+                self.assertEqual(repl.proc.wait(timeout=15), 1)
+                self.assertEqual(_read_snapshot_value(path, "marker"), "at-owner-death")
+        finally:
+            if owner.poll() is None:
+                owner.kill()
+                owner.wait(timeout=10)
+
+    def test_flush_is_a_noop_before_any_snapshot_target_is_known(self):
+        # An EOF before this process ever committed a snapshot must not fabricate
+        # one: there is no durable target the host ever acknowledged, so the
+        # kernel exits without writing anything.
+        with tempfile.TemporaryDirectory() as tmp:
+            repl = ReplProcess()
+            self.addCleanup(repl.close)
+            repl.ready()
+            repl.execute("n1", "marker = 'never-snapshotted'")
+            assert repl.proc.stdin is not None
+            repl.proc.stdin.close()
+            self.assertEqual(repl.proc.wait(timeout=15), 0)
+            self.assertEqual(os.listdir(tmp), [])
+
+
 class OwnerExitWaitTest(unittest.TestCase):
     """W12: the owner watchdog waits on the OS exit notification instead of polling."""
 
@@ -2617,6 +2694,68 @@ class ForkChildProtocolTest(unittest.TestCase):
         self.assertIn("stale-err", err)
         events = self.repl.execute("after", "'alive'")
         self.assertEqual(one(events, "result")["text"], "'alive'")
+
+
+class RestoreLiveGlobalsTest(unittest.TestCase):
+    """W17-2: a restored function must read the live namespace, not a frozen copy.
+
+    dill pickles `__main__` functions by value with a private copy of their
+    defining namespace, so a function revived from a snapshot closes over the
+    snapshot-time globals: after a restore the function kept reading its frozen
+    copy even when a later cell rebound the same name in the live `__main__`.
+    The revive rebinds restored `__main__` callables onto the live namespace.
+    """
+
+    def _snapshot_with_function(self, tmp: str) -> tuple[str, str]:
+        path = os.path.join(tmp, "kernel-state.dill")
+        manifest_path = os.path.join(tmp, "kernel-state.json")
+        repl = ReplProcess()
+        self.addCleanup(repl.close)
+        repl.ready()
+        setup = "\n".join(["counter = 1", "def read_counter():", "    return counter"])
+        self.assertEqual(one(repl.execute("a1", setup), "done")["status"], "ok")
+        repl.send({"type": "snapshot", "id": "a2", "path": path, "manifest_path": manifest_path})
+        done = one(repl.until_done("a2"), "done")
+        self.assertEqual(done["status"], "ok")
+        with open(manifest_path) as fh:
+            manifest = json.load(fh)
+        self.assertEqual(repl.shutdown(), 0)
+        return path, manifest["pythonVersion"]
+
+    def test_restored_function_reads_the_live_namespace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, python_version = self._snapshot_with_function(tmp)
+            fresh = ReplProcess()
+            self.addCleanup(fresh.close)
+            fresh.ready()
+            fresh.send({"type": "restore", "id": "r1", "path": path, "python_version": python_version})
+            self.assertEqual(one(fresh.until_done("r1"), "done")["status"], "ok")
+            # A later cell rebinds `counter` in the LIVE namespace. Without the
+            # revive the restored function keeps reading its frozen snapshot copy
+            # and returns 1.
+            events = fresh.execute("r2", "counter = 3\nread_counter()")
+            self.assertEqual(one(events, "result")["text"], "3")
+            self.assertEqual(fresh.shutdown(), 0)
+
+    def test_revive_rebinds_onto_the_live_namespace(self):
+        sys.path.insert(0, SRC)
+        self.addCleanup(sys.path.remove, SRC)
+        import rlm.repl as repl_module
+
+        # A `__main__` function revived by value carries its own frozen globals
+        # dict, distinct from the live ns.
+        frozen: dict = {"__name__": "__main__", "counter": {"value": 1}}
+        exec("def read_counter():\n    return counter['value']\n", frozen)
+        frozen_fn = frozen["read_counter"]
+        ns: dict = {"counter": {"value": 1}}
+        backfill: list = []
+        revived = repl_module._revive_with_live_globals(frozen_fn, ns, backfill)
+        self.assertIs(revived.__globals__, ns)
+        # Rebinding counter in the live ns must now be visible through the revived
+        # function; the frozen dict is untouched.
+        ns["counter"] = {"value": 99}
+        self.assertEqual(revived(), 99)
+        self.assertEqual(frozen["counter"], {"value": 1})
 
 
 class LinecacheHygieneTest(unittest.TestCase):

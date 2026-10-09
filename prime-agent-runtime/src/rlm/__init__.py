@@ -520,6 +520,27 @@ async def delete_subagent(target: str | RLMSubagent | RLMSpawnHandle) -> RLMSuba
     return _subagent_from_payload(payload.get("subagent"), "rlm.delete_subagent")
 
 
+async def rename(new_name: str, *, session_id: str | RLMSpawnHandle | RLMSubagent | None = None) -> str:
+    """Rename this session or one of its direct children.
+
+    Omitting ``session_id`` renames the current session. A spawn handle, a
+    ``list_subagents()`` row, or a session id string renames a direct child.
+    A child's session *name* is not accepted as a selector (it would resolve
+    ambiguously once names drift). Names follow the spawn rules, must be unique
+    among siblings, and the renamed session sees a transcript notice.
+    """
+    if not isinstance(new_name, str):
+        raise TypeError(f"new_name must be str, got {type(new_name).__name__}")
+    payload: dict[str, Any] = {"name": new_name}
+    if session_id is not None:
+        payload["session_id"] = _target_selector(session_id, "session_id")
+    reply = await host_request("rlm.rename", payload)
+    name = reply.get("name")
+    if not isinstance(name, str):
+        raise RuntimeError("rlm.rename returned an invalid name")
+    return name
+
+
 class _HarnessProxy:
     """Resolve the harness state against the current environment on every access.
 
@@ -603,6 +624,14 @@ class _RLMCallable:
     async def delete_subagent(self, target: str | RLMSubagent | RLMSpawnHandle) -> RLMSubagent:
         return await delete_subagent(target)
 
+    async def rename(
+        self,
+        new_name: str,
+        *,
+        session_id: str | RLMSpawnHandle | RLMSubagent | None = None,
+    ) -> str:
+        return await rename(new_name, session_id=session_id)
+
     async def __call__(self, prompt: str, **kwargs: Any) -> RLMSpawnHandle:
         return await run(prompt, **kwargs)
 
@@ -645,6 +674,7 @@ __all__ = [
     "messages_pending",
     "prune_subagents",
     "rlm",
+    "rename",
     "run",
     "wait_messages",
 ]

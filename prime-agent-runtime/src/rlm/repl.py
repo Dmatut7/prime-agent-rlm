@@ -152,6 +152,15 @@ _cell_linecache_names: deque[str] = deque()
 # Namespace-mutation epochs for snapshot dirty-tracking: any executed cell or applied
 # restore invalidates the replay shortcut (see _replayable_snapshot).
 _restore_counter = 0
+# The target of the last successful snapshot, remembered so a death-time flush
+# (the host process died without a graceful dispose) can persist the live
+# namespace to it. None until this process has committed a snapshot: an exit
+# before that must not overwrite an on-disk payload the host never considered
+# durable.
+_last_snapshot_target: dict[str, Any] | None = None
+# The live __main__ namespace, published by main() so the reader-EOF and owner
+# watchdog paths can flush it without threading it through those threads.
+_main_ns: dict[str, Any] | None = None
 _pending_host: dict[str, "asyncio.Future[dict[str, Any]]"] = {}
 # Set on the loop thread once stdin hits EOF or a shutdown request arrives; no
 # host reply can arrive after that, so waiting (and future) host_request calls fail.
@@ -1512,8 +1521,12 @@ def _snapshot_state(
         # A SIGINT-raised KeyboardInterrupt anywhere from the first commit through the
         # last cleanup removal would desync payload/manifest/namespace or misreport a
         # committed snapshot: park SIGINT until the end; it is consumed, see below.
-        previous = signal.signal(signal.SIGINT, lambda signum, frame: parked.append(signum))
-        handler_installed = True
+        # signal.signal works only on the main thread, so a death-time flush from the
+        # owner watchdog thread snapshots best-effort without parking a signal that
+        # thread cannot own anyway.
+        if threading.current_thread() is threading.main_thread():
+            previous = signal.signal(signal.SIGINT, lambda signum, frame: parked.append(signum))
+            handler_installed = True
         try:
             if os.path.lexists(path):
                 out_info = os.lstat(path)
@@ -1561,6 +1574,35 @@ def _snapshot_state(
                 # would misreport it as failed and risk the host discarding the only copy of
                 # the pruned variables. The interrupt targeted this now-complete request.
     return result
+
+
+def _flush_final_snapshot() -> None:
+    """Death-time best-effort final snapshot before the kernel exits.
+
+    The host died without a graceful dispose (crash, SIGKILL, a teardown path
+    that skipped `shutdown`), so its debounced snapshots stop at the last one.
+    Flush the live namespace to the last-known snapshot target so a resume
+    revives state up to the death moment instead of up to the last debounce.
+    Atomic staging (temp + rename) means an interrupted flush leaves the
+    previous payload intact, never a torn one. Best-effort: it never blocks or
+    crashes the shutdown path.
+    """
+    ns = _main_ns
+    target = _last_snapshot_target
+    if ns is None or target is None:
+        return
+    try:
+        _snapshot_state(
+            ns,
+            target["path"],
+            target["manifest_path"],
+            target["max_bytes"],
+            target["max_variable_bytes"],
+            False,
+            None,
+        )
+    except BaseException:  # noqa: BLE001 - never block or crash the shutdown path
+        pass
 
 
 class _FileReviveBlocked(ValueError):
@@ -1695,6 +1737,144 @@ def _revival_degraded_names(staged: dict[str, Any], ns: dict[str, Any]) -> list[
     return degraded
 
 
+def _revive_with_live_globals(
+    value: Any,
+    ns: dict[str, Any],
+    backfill: list[tuple[str, Any]] | None = None,
+    memo: dict[int, Any] | None = None,
+) -> Any:
+    """Rebind a restored __main__ callable onto the live namespace.
+
+    dill pickles ``__main__`` functions by value with a private copy of their
+    defining namespace, so a value revived from a snapshot keeps reading the
+    globals frozen at save time even after the restore applied fresh values to
+    the live namespace - a later cell's rebind of the same name would be
+    invisible to the function. This rebuilds each restored ``__main__`` callable
+    against ``ns`` (carrying defaults, closures and attributes over), and
+    collects names the saved globals carry but ``ns`` lacks as ``backfill`` for
+    the caller to apply at commit (a restored value always wins over backfill,
+    and a live value always wins over both).
+    """
+    if memo is None:
+        memo = {}
+    if id(value) in memo:
+        return memo[id(value)]
+
+    def revive(dep: Any) -> Any:
+        return _revive_with_live_globals(dep, ns, backfill, memo)
+
+    if isinstance(value, functools.partial):
+        # No placeholder memo entry: a partial is immutable, so it could never be patched;
+        # every cycle passes through a function, which is memoized before recursing.
+        rebuilt = revive(value.func)
+        changed = rebuilt is not value.func
+        args = []
+        keywords = {}
+        for arg in value.args:
+            revived = revive(arg)
+            changed = changed or revived is not arg
+            args.append(revived)
+        for key, arg in value.keywords.items():
+            revived = revive(arg)
+            changed = changed or revived is not arg
+            keywords[key] = revived
+        if not changed:
+            # An unchanged partial still carries its original attributes:
+            # __main__ callables there would keep frozen snapshot globals, so
+            # revive them in place. Memoize first - an attribute can cycle back.
+            memo[id(value)] = value
+            value.__dict__.update({key: revive(attr) for key, attr in value.__dict__.items()})
+            return value
+        rebuilt_partial = functools.partial(rebuilt, *args, **keywords)
+        memo[id(value)] = rebuilt_partial
+        rebuilt_partial.__dict__.update({key: revive(attr) for key, attr in value.__dict__.items()})
+        return rebuilt_partial
+    atoms = (int, float, str, bytes, bool, type(None))
+    # dill loads __main__.__dict__ by reference, so a saved globals() IS the live ns: never walk it.
+    if value is ns:
+        return value
+    if isinstance(value, (list, dict, set)):
+        # Memoized before recursing and revived in place: cycles and identity come for free.
+        # Skipping atoms keeps the walk over million-element containers near dill.loads cost.
+        memo[id(value)] = value
+        if isinstance(value, set):
+            # Iterate a snapshot: discard+add during iteration would skip members.
+            for item in list(value):
+                revived = item if type(item) in atoms else revive(item)
+                if revived is not item:
+                    value.discard(item)
+                    value.add(revived)
+        elif isinstance(value, list):
+            for key, item in enumerate(value):
+                revived = item if type(item) in atoms else revive(item)
+                if revived is not item:
+                    value[key] = revived
+        else:
+            # Keys can be __main__ callables too: revive them, or lookups through
+            # the dict keep observing frozen globals. The snapshot tolerates the
+            # delete+reinsert a rebuilt key needs.
+            for key, item in list(value.items()):
+                revived = item if type(item) in atoms else revive(item)
+                revived_key = key if type(key) in atoms else revive(key)
+                if revived_key is not key:
+                    del value[key]
+                    value[revived_key] = revived
+                elif revived is not item:
+                    value[key] = revived
+        return value
+    if type(value) is tuple:
+        items = tuple(item if type(item) in atoms else revive(item) for item in value)
+        if all(new is old for new, old in zip(items, value)):
+            items = value
+        return memo.setdefault(id(value), items)
+    if type(value) is frozenset:
+        # Immutable: rebuild when any member revived (identity equality makes the
+        # comparison exact - a rebuilt function never equals the original).
+        items = frozenset(item if type(item) in atoms else revive(item) for item in value)
+        if items == value:
+            items = value
+        return memo.setdefault(id(value), items)
+    if not isinstance(value, types.FunctionType) or value.__module__ != "__main__":
+        return value
+    # Defaults and cell contents are revived only after the rebound function is
+    # memoized, so a function reachable from its own defaults or closure resolves
+    # to it. Cells are revived in place: holders this walk never sees (attribute-
+    # held siblings) must keep sharing them.
+    rebound = types.FunctionType(value.__code__, ns, value.__name__, None, value.__closure__)
+    memo[id(value)] = rebound
+    if backfill is not None:
+        for name, dep in value.__globals__.items():
+            # Snapshots never save _-prefixed or skip-listed names; backfill must
+            # not smuggle them past that policy.
+            if name in ns or name.startswith("_") or name in _ALWAYS_SKIP or name in _RESTORE_SKIP:
+                continue
+            backfill.append((name, revive(dep)))
+    if value.__defaults__:
+        rebound.__defaults__ = tuple(revive(dep) for dep in value.__defaults__)
+    if value.__kwdefaults__:
+        rebound.__kwdefaults__ = {key: revive(dep) for key, dep in value.__kwdefaults__.items()}
+    for cell in value.__closure__ or ():
+        if id(cell) in memo:
+            continue
+        memo[id(cell)] = cell
+        try:
+            contents = cell.cell_contents
+        except ValueError:
+            continue
+        cell.cell_contents = revive(contents)
+    rebound.__doc__ = value.__doc__
+    rebound.__dict__.update({key: revive(attr) for key, attr in value.__dict__.items()})
+    rebound.__annotations__ = value.__annotations__
+    rebound.__qualname__ = value.__qualname__
+    rebound.__module__ = value.__module__
+    # PEP 695 generics carry their type params here on 3.12+; plain 3.11
+    # functions lack the attribute entirely, hence the getattr guard.
+    params = getattr(value, "__type_params__", None)
+    if params is not None:
+        rebound.__type_params__ = params
+    return rebound
+
+
 def _restore_state(
     ns: dict[str, Any],
     path: str,
@@ -1770,7 +1950,24 @@ def _restore_state(
     finally:
         if real_create_filehandle is not None:
             dill_dill._create_filehandle = real_create_filehandle  # type: ignore[union-attr]
-    degraded = _revival_degraded_names(staged, ns)
+    # Rebind restored __main__ callables onto the live namespace before the
+    # apply, so a restored function reads the live globals instead of the frozen
+    # snapshot copy dill revived it with. A name whose revival fails is reported
+    # and applied unchanged (best-effort: one broken revival must not abort the
+    # whole restore), and its saved-globals backfill is dropped with it.
+    prepared: dict[str, Any] = {}
+    backfill: list[tuple[str, Any]] = []
+    revive_failed: list[dict[str, str]] = []
+    for name, value in staged.items():
+        name_backfill: list[tuple[str, Any]] = []
+        try:
+            prepared[name] = _revive_with_live_globals(value, ns, name_backfill)
+        except Exception as err:  # noqa: BLE001 - one broken revival must not abort the restore
+            revive_failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
+            continue
+        backfill.extend(name_backfill)
+    failed = failed + revive_failed
+    degraded = _revival_degraded_names(prepared, ns)
     degraded_names = {entry["name"] for entry in degraded}
     # Degraded values are still applied below - they are usable, just not the live
     # objects an "available again" claim promises - but they leave `restored` so no
@@ -1778,15 +1975,20 @@ def _restore_state(
     # no place for it simply never hears about these names, which is the behaviour it
     # already had.
     result = {
-        "restored": sorted(name for name in staged if name not in degraded_names),
+        "restored": sorted(name for name in prepared if name not in degraded_names),
         "failed": failed,
         **({"degraded": degraded} if degraded else {}),
     }
     # Park SIGINT across the whole apply so it is all-or-nothing; the parked interrupt is consumed by the commit (as in snapshot).
     previous = signal.signal(signal.SIGINT, lambda signum, frame: None)
     try:
-        for name, value in staged.items():
+        for name, value in prepared.items():
             ns[name] = value
+        for name, value in backfill:
+            # prepared names already sit in ns here: a restored value always beats
+            # backfill, as does a name the live namespace already holds.
+            if name not in ns:
+                ns[name] = value
         # The namespace changed behind the snapshot cache's back: invalidate the replay
         # shortcut (the applied values are fresh objects, so identity would catch them
         # too, but a restore that applied nothing must not race a concurrent snapshot).
@@ -1838,7 +2040,7 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
             # realpath resolves symlinks, so aliased paths cannot silently clobber the payload.
             if os.path.realpath(req["path"]) == os.path.realpath(req["manifest_path"]):
                 return {"error": "path and manifest_path must differ"}
-            global _last_snapshot_record
+            global _last_snapshot_record, _last_snapshot_target
             max_bytes = req.get("max_bytes", DEFAULT_SNAPSHOT_MAX_BYTES)
             max_variable_bytes = req.get("max_variable_bytes", DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES)
             key = (
@@ -1881,6 +2083,15 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
                 seen_out=seen,
             )
             if "error" not in result:
+                # Remember the target a later death-time flush writes to. Set only
+                # after a committed snapshot: an EOF before this process ever
+                # snapshotted must not fabricate durable state.
+                _last_snapshot_target = {
+                    "path": req["path"],
+                    "manifest_path": req["manifest_path"],
+                    "max_bytes": max_bytes,
+                    "max_variable_bytes": max_variable_bytes,
+                }
                 # Epochs were read before serialization; a concurrent mutator can only
                 # make the record stale in the conservative direction (the next request
                 # redoes the full work instead of replaying a superseded result).
@@ -1989,6 +2200,11 @@ async def _serve(queue: asyncio.Queue[dict[str, Any]], ns: dict[str, Any]) -> No
         rtype = req.get("type")
         if rtype == "shutdown":
             rid = req.get("id")
+            if req.get("eof"):
+                # Host stdin closed without a shutdown request: the host process
+                # is gone, so this is the last chance to persist the live
+                # namespace before the kernel exits.
+                _flush_final_snapshot()
             # MCP children must close before the loop dies; close() is internally bounded under the host's 5s deadline.
             mcp_mod = sys.modules.get("rlm.mcp")
             if mcp_mod is not None:
@@ -2127,9 +2343,11 @@ def _read_requests(stdin_fd: int, queue: asyncio.Queue[dict[str, Any]]) -> None:
                 _handle_request_line(raw, queue)
             except BaseException as err:  # noqa: BLE001
                 _protocol_error(f"{type(err).__name__}: {_safe_str(err)}")
-    # Host closed stdin: shut the runtime down.
+    # Host closed stdin: shut the runtime down. The eof flag tells the serve
+    # loop this is the host's death signal, not a requested shutdown, so it
+    # flushes the live namespace before exiting.
     _loop.call_soon_threadsafe(_fail_pending_host_requests)
-    _loop.call_soon_threadsafe(queue.put_nowait, {"type": "shutdown"})
+    _loop.call_soon_threadsafe(queue.put_nowait, {"type": "shutdown", "eof": True})
 
 
 def _resolve_owner_pid() -> int:
@@ -2218,7 +2436,10 @@ def _owner_watchdog(owner: int, initial_ppid: int) -> None:
     else:
         _wait_owner_posix(owner, initial_ppid)
     # Event-loop-independent by design: a synchronous cell monopolizes the
-    # loop, so the queued EOF shutdown can never run; hard-exit from here.
+    # loop, so the queued EOF shutdown can never run; hard-exit from here. The
+    # owner is gone, so flush the live namespace best-effort before the exit or
+    # a resume loses everything since the last debounce.
+    _flush_final_snapshot()
     try:
         _kill_live_handles()
     except BaseException:  # noqa: BLE001
@@ -2435,7 +2656,7 @@ def _setup_fds() -> int:
 
 
 def main() -> None:
-    global _loop, _negotiated_protocol, _serve_task
+    global _loop, _negotiated_protocol, _serve_task, _main_ns
     _negotiated_protocol = resolve_protocol_version(os.environ.get(PROTOCOL_ENV_VAR))
     stdin_fd = _setup_fds()
     _stream_coalescer.start()
@@ -2453,6 +2674,9 @@ def main() -> None:
     user_module = types.ModuleType("__main__")
     user_module.__dict__["__builtins__"] = __builtins__
     sys.modules["__main__"] = user_module
+    # Publish the live namespace for the death-time flush paths (reader EOF and
+    # the owner watchdog), which run off the serve loop.
+    _main_ns = user_module.__dict__
 
     ready: dict[str, Any] = {
         "event": "ready",

@@ -451,6 +451,7 @@ import {
 	rlmSubtreeSessions,
 	waitForRlmQuiescence,
 } from "./rlm-child-quiescence.js";
+import { resolveRlmRenameChildId } from "./rlm-child-rename.js";
 import {
 	getRlmChildSnapshots,
 	hasRunningRlmChildren,
@@ -502,6 +503,7 @@ import {
 	createRlmDeleteSubagentHostHandler,
 	createRlmFindModelsHostHandler,
 	createRlmProgressNoteHostHandler,
+	createRlmRenameHostHandler,
 	createRlmRunHostHandler,
 	findRlmModelMatches,
 	findUniqueRlmShortFormModelMatch,
@@ -14413,6 +14415,7 @@ export class AgentSession {
 			),
 			"rlm.progress.note": createRlmProgressNoteHostHandler((message) => this.noteRlmProgress(message)),
 			"rlm.delete_subagent": createRlmDeleteSubagentHostHandler((target) => this.deleteRlmSubagent(target)),
+			"rlm.rename": createRlmRenameHostHandler((name, sessionId) => this.renameRlmSubagent(name, sessionId)),
 			"model.info": async () => {
 				// Report the model that will read what the cell submits, not the session
 				// model: a routed image turn serves on settings.imageModel, and on an
@@ -15146,6 +15149,88 @@ export class AgentSession {
 
 	async deleteRlmSubagent(target: string): Promise<RlmDeleteSubagentResult> {
 		return deleteRlmSubagent(this, target);
+	}
+
+	/**
+	 * `rlm.rename` (W17-3): rename this session or one of its direct children.
+	 *
+	 * Omitting `sessionId` renames the calling session; a string selects a direct
+	 * child by id (`rlm_child_id`, active session id, or session id) - never by the
+	 * child's session name, which a drifted name makes ambiguous. Names use the
+	 * spawn rules and must be unique among siblings; an unchanged name is a no-op,
+	 * and the renamed session records a transcript notice.
+	 */
+	async renameRlmSubagent(newName: string, sessionId?: string): Promise<{ name: string }> {
+		const name = normalizeRequestedRlmSubagentSessionName(newName, "rlm.rename");
+		if (name === undefined) {
+			// The kernel is a separate process; guard the wire value even though the
+			// kernel already type-checked it.
+			throw new Error("rlm.rename name must be a string");
+		}
+		if (sessionId === undefined) {
+			const previous = this.sessionName;
+			if (previous === name) return { name };
+			await this._renameCurrentSession(name);
+			this._appendSessionRenameNotice(this, previous, name, false);
+			return { name };
+		}
+		const childId = resolveRlmRenameChildId(sessionId, this._rlmRenameCandidates());
+		const child = this._residentRlmChildSession(childId);
+		if (!child) {
+			throw new Error(
+				`rlm.rename can only rename the current session or one of its direct children; child "${childId}" is not resident`,
+			);
+		}
+		const previous = child.sessionName;
+		if (previous === name) return { name };
+		await this._assertRlmSubagentSessionNameAvailable(name);
+		child.setSessionName(name);
+		const run = this._activeRlmChildRuns.get(childId);
+		if (run && run.sessionName !== name) run.sessionName = name;
+		this._appendSessionRenameNotice(child, previous, name, true);
+		return { name };
+	}
+
+	private async _renameCurrentSession(name: string): Promise<void> {
+		// A daemon-backed controller owns the rename (its own availability check and
+		// durable ledger); the in-process path uses the session's own setter.
+		const controller = this._agentMessageController;
+		if (controller?.setSessionName) {
+			await controller.setSessionName(name);
+			return;
+		}
+		this.setSessionName(name);
+	}
+
+	private _rlmRenameCandidates(): { rlm_child_id: string; session_id?: string | null }[] {
+		const candidates: { rlm_child_id: string; session_id?: string | null }[] = [];
+		const seen = new Set<string>();
+		for (const [childId, run] of this._activeRlmChildRuns) {
+			seen.add(childId);
+			candidates.push({ rlm_child_id: childId, session_id: run.session?.sessionId ?? null });
+		}
+		for (const [childId, retained] of this._rlmChildSessions) {
+			if (seen.has(childId)) continue;
+			candidates.push({ rlm_child_id: childId, session_id: retained.session.sessionId });
+		}
+		return candidates;
+	}
+
+	private _residentRlmChildSession(childId: string): AgentSession | undefined {
+		return this._rlmChildSessions.get(childId)?.session ?? this._activeRlmChildRuns.get(childId)?.session;
+	}
+
+	private _appendSessionRenameNotice(
+		session: AgentSession,
+		previous: string | undefined,
+		next: string,
+		byParent: boolean,
+	): void {
+		session.sessionManager.appendCustomEntry("session_renamed", {
+			from: previous ?? null,
+			to: next,
+			by: byParent ? "parent" : "self",
+		});
 	}
 
 	_ensureRlmRunDeletionCleanup(run: RlmChildRun, session: AgentSession): Promise<void> {

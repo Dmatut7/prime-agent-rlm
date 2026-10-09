@@ -276,6 +276,44 @@ class RlmSubagentRegistryTest(unittest.TestCase):
 
 
 
+class RlmRenameTest(unittest.TestCase):
+    """`rlm.rename` (W17-3): rename the current session or a direct child."""
+
+    def test_rename_dispatches_self_and_child_selectors(self) -> None:
+        handle = rlm_module.RLMSpawnHandle(
+            rlm_child_id="sub-a1b2c3d4",
+            name="api-reviewer",
+            session_dir=Path("/tmp/parent/sub-a1b2c3d4"),
+            model="deepseek/deepseek-v4-flash",
+        )
+        cases = ((None, None), (handle, handle.rlm_child_id), ("  session-child  ", "session-child"))
+        for target, expected_selector in cases:
+            host_request = AsyncMock(return_value={"name": "bench-runner"})
+            with patch.object(rlm_module, "host_request", host_request):
+                self.assertEqual(
+                    asyncio.run(rlm_module.rlm.rename("bench-runner", session_id=target)), "bench-runner"
+                )
+            expected = {"name": "bench-runner"}
+            if expected_selector is not None:
+                expected["session_id"] = expected_selector
+            host_request.assert_awaited_once_with("rlm.rename", expected)
+
+    def test_rename_rejects_invalid_input_and_reply(self) -> None:
+        with self.assertRaisesRegex(TypeError, "session_id"):
+            asyncio.run(rlm_module.rename("bench-runner", session_id=123))
+        with self.assertRaisesRegex(TypeError, "new_name must be str"):
+            asyncio.run(rlm_module.rename(5))
+        host_request = AsyncMock(return_value={"name": 7})
+        with patch.object(rlm_module, "host_request", host_request):
+            with self.assertRaisesRegex(RuntimeError, "rlm.rename returned an invalid name"):
+                asyncio.run(rlm_module.rename("bench-runner"))
+
+    def test_rename_is_exposed_on_the_namespace_and_module(self) -> None:
+        self.assertIn("rename", rlm_module.__all__)
+        self.assertTrue(callable(rlm_module.rename))
+        self.assertTrue(callable(rlm_module.rlm.rename))
+
+
 class RlmPruneSubagentsTest(unittest.TestCase):
     """`rlm.prune_subagents` (W23-A): retire terminal children from the roster views."""
 
