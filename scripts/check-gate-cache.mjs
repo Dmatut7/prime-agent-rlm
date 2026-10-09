@@ -52,7 +52,9 @@ const BYPASS_ENV = "PRIME_AGENT_GATE_CACHE";
 /**
  * Gate -> input patterns. A literal path is one file; `*` matches within one segment, `**`
  * across segments. Directories walked for glob patterns skip build output and vendored trees
- * (node_modules, dist, coverage, .venv, __pycache__), which no gate reads.
+ * (node_modules, dist, coverage, .venv, __pycache__). A gate that reads build output anyway
+ * (browser-smoke bundles packages/ai/dist) declares that directory as a LITERAL input: a
+ * literal directory hashes its whole tree, dist included.
  */
 const GATES = {
 	installer: ["scripts/check-installer.mjs", "install.sh"],
@@ -67,6 +69,7 @@ const GATES = {
 		"scripts/check-browser-smoke.mjs",
 		"scripts/browser-smoke-entry.ts",
 		"packages/ai/src/**",
+		"packages/ai/dist",
 		"tsconfig.json",
 		"package-lock.json",
 	],
@@ -142,6 +145,26 @@ function walkFiles(root, dirRel, out) {
 	}
 }
 
+/** Walk a directory WITHOUT the build-output skip: a literal directory input names the
+ * tree it reads (dist included), so nothing under it is filtered. */
+function walkAllFiles(root, dirRel, out) {
+	const abs = dirRel ? join(root, dirRel) : root;
+	let entries;
+	try {
+		entries = readdirSync(abs, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		const rel = dirRel ? `${dirRel}/${entry.name}` : entry.name;
+		if (entry.isDirectory()) {
+			walkAllFiles(root, rel, out);
+		} else if (entry.isFile()) {
+			out.push(rel);
+		}
+	}
+}
+
 /** Expand every pattern to the sorted set of matched working-tree files. Literals stay in the
  * list even when missing (hashed as MISSING) so their later appearance changes the fingerprint. */
 function expandInputs(root, patterns) {
@@ -177,6 +200,20 @@ function fingerprintInputs(root, patterns) {
 			const stats = statSync(join(root, rel));
 			if (stats.isFile()) {
 				hash.update(readFileSync(join(root, rel)));
+			} else if (stats.isDirectory()) {
+				// A literal directory input hashes its whole tree as one entry: the gate
+				// named the tree it reads (a build output), so nothing inside is filtered.
+				const tree = [];
+				walkAllFiles(root, rel, tree);
+				hash.update(`dir ${rel} (${tree.length} files)\0`);
+				for (const file of tree) {
+					hash.update(`file ${file}\0`);
+					try {
+						hash.update(readFileSync(join(root, file)));
+					} catch {
+						hash.update(`MISSING\n`);
+					}
+				}
 			} else {
 				hash.update(`not-a-file\n`);
 			}
@@ -382,6 +419,55 @@ function selfTest() {
 	delete process.env.FAKE_EXIT;
 	const sibling = readCache(cacheFile)?.gates?.sibling;
 	expect("a red gate does not clobber a sibling's green entry", sibling?.status === "green", `sibling=${JSON.stringify(sibling)}`);
+
+	// literal-directory inputs: the tree a gate explicitly names is hashed whole (dist
+	// class), so a byte inside it, a new file under it, and its later appearance each
+	// re-run the gate - while an unchanged tree still skips.
+	const dirCounter = join(dir, "dir-counter");
+	const dirRuns = () => {
+		try {
+			return (readFileSync(dirCounter, "utf8").match(/run/g) ?? []).length;
+		} catch {
+			return 0;
+		}
+	};
+	const dirGate = () =>
+		runGate({
+			gate: "dir-demo",
+			patterns: ["gate.sh", "out"],
+			command: `printf run >> ${dirCounter}; exit 0`,
+			root: dir,
+			cacheFile,
+			log: () => {},
+		});
+	mkdirSync(join(dir, "out"));
+	writeFileSync(join(dir, "out/x.js"), "one\n", "utf8");
+	let dirOutcome = dirGate();
+	expect("a-dir: a fresh literal-dir gate runs and records green", dirOutcome.status === 0 && !dirOutcome.skipped && dirRuns() === 1, `status=${dirOutcome.status} runs=${dirRuns()}`);
+	dirOutcome = dirGate();
+	expect("d-dir: an unchanged literal-dir tree is skipped", dirOutcome.skipped && dirRuns() === 1, `skipped=${dirOutcome.skipped} runs=${dirRuns()}`);
+	writeFileSync(join(dir, "out/x.js"), "two\n", "utf8");
+	dirOutcome = dirGate();
+	expect("a-dir: a byte inside the literal dir forces a re-run", !dirOutcome.skipped && dirRuns() === 2, `skipped=${dirOutcome.skipped} runs=${dirRuns()}`);
+	writeFileSync(join(dir, "out/y.js"), "new\n", "utf8");
+	dirOutcome = dirGate();
+	expect("a-dir: a new file inside the literal dir forces a re-run", !dirOutcome.skipped && dirRuns() === 3, `skipped=${dirOutcome.skipped} runs=${dirRuns()}`);
+	const absentGate = () =>
+		runGate({
+			gate: "absent-dir-demo",
+			patterns: ["gate.sh", "notyet"],
+			command: `printf run >> ${dirCounter}; exit 0`,
+			root: dir,
+			cacheFile,
+			log: () => {},
+		});
+	absentGate();
+	dirOutcome = absentGate();
+	expect("d-dir: a still-missing literal dir skips (the MISSING marker is stable)", dirOutcome.skipped, `skipped=${dirOutcome.skipped}`);
+	mkdirSync(join(dir, "notyet"));
+	writeFileSync(join(dir, "notyet/z.txt"), "appeared\n", "utf8");
+	dirOutcome = absentGate();
+	expect("a-dir: a missing literal dir appearing later forces a re-run", !dirOutcome.skipped, `skipped=${dirOutcome.skipped}`);
 
 	// the cache file stays parseable JSON after all those writes.
 	let parseable = true;

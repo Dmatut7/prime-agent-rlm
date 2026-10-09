@@ -224,7 +224,7 @@ export interface RefinementResult {
 
 /**
  * Sentinel the session's reported-entry map stores for an applied delete: entry
- * versions start at 1 and only climb, so -1 is unambenable with a real version.
+ * versions start at 1 and only climb, so -1 is unambiguous with a real version.
  * The post-delete fingerprint holds no version for the deleted key at all, so
  * "reported as deleted" must compare equal to "absent from the fingerprint" or a
  * session's own deletion receipt can never suppress the digest re-delivering

@@ -127,6 +127,7 @@ type DialogProto = {
 		factory: (tui: unknown, thm: unknown, keybindings: unknown, done: (result: unknown) => void) => Component,
 	): Promise<unknown>;
 	resetExtensionUI(this: ModeFake): void;
+	cancelActiveExtensionDialog(this: ModeFake): void;
 };
 
 const dialogProto = InteractiveMode.prototype as unknown as DialogProto;
@@ -262,6 +263,21 @@ describe("extension dialog mutual exclusion (R3-M4)", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+
+	it("a bare eviction disposes the evicted dialog and restores the editor container", async () => {
+		const mode = dialogFake();
+		const pending = dialogProto.showExtensionSelector.call(mode, "Pick", ["a"]);
+
+		// The reset path evicts without opening a replacement: the eviction itself must
+		// dispose the component and hand the editor container back, not leave the dialog
+		// mounted until a replacement or a full rebuild cleans up after it.
+		dialogProto.cancelActiveExtensionDialog.call(mode);
+		await flushMicrotasks();
+
+		expect(mode.extensionSelector).toBeUndefined();
+		expect(editorContainerChildren(mode)).toEqual([mode.editor]);
+		await expect(pending).resolves.toBeUndefined();
 	});
 
 	it("eviction works across dialog kinds (selector evicted by input, input by editor)", async () => {

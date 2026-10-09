@@ -5229,9 +5229,11 @@ export class InteractiveMode {
 	 * idempotent there (R3-M2).
 	 */
 	private cancelActiveExtensionDialog(): void {
-		const active = this.activeExtensionDialog;
-		this.activeExtensionDialog = undefined;
-		active?.cancel();
+		// No field-clearing here: cancel() synchronously routes through the dialog's
+		// hide path, whose stale guard needs the field to still name this handle so
+		// the eviction actually disposes the component and restores the editor
+		// container (clearing first turns the hide into a stale no-op).
+		this.activeExtensionDialog?.cancel();
 	}
 
 	private showExtensionSelector(
