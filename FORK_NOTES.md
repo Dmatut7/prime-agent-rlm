@@ -1,3 +1,14 @@
+## 2026-10-09 第五批：显示/交互动态 QA + W13 修复 13 条
+
+> 老板点名要的显示/交互动态审查：三路蜂群（信任门 UX 静态审 13 销账、渲染不变量审 10 销账、**tmux 真终端实测**三档尺寸 13 销账）对 W7~W12 新合入面审出 **1 must / 6 should / 3 low / 4 note**（账本第十节）。W13 三车道（A 连接/切换簇、B 信任门 UX、C 输入/设置）把 1 must + 6 should + 顺带 6 条 low/note 全部修完，每条先红后绿，A/B 车道真终端复验（隔离 socket、专用 tmux 会话、测后清理）。
+
+- **车道 A（连接与切换，4 条）**：断连态按 ← 打死 TUI 裸栈（QA 唯一 must）——断连门禁 + agents-view 启动失败降级为一次恢复 + 干净退出信息；tombstone 停机的重连横幅如实化（「后台服务被手动停止，不会再自动重启」，connection_status 新增可选 daemonStopped 字段——additive 客户端侧，消费方六处逐一打勾，协议版本不动；orderly shutdown 路径经真终端复验补上同款）；恢复后英文诊断滞留 6 分钟——heartbeat 目录诊断自清 + 混英文面中文化；**切换窗口粘贴静默丢/漏进 zsh 执行（安全级）**——tui 层 handoff 有界缓冲 + 退出守卫恢复 cooked 前同步吸干内核 tty 队列 + 新窗口恢复粘贴（括号与裸 bulk 两形态，CR 判定按实测修正），tmux 端到端验证粘贴恢复进输入框。
+- **车道 B（信任门 UX，6 条）**：Ctrl-C 区别于 Esc（干净退出 0、对齐 MissingSessionCwd 先例）+ 启动期退出看护重装 + footer 键位提示按 keybindings 派生；grandfather 证据匹配对齐 canonicalizePath（symlink 拼写混用不再静默扣住无人值守扩展）；PI_STARTUP_BENCHMARK 与 --no-extensions 跳过弹窗；**grandfather 证据目录钉死 agent-dir 作用域**（项目 settings 的 sessionDir 不能再伪造会话史——把 QA 的安全观察关死）；弹窗中文化 + 交互拒绝双黄字去重。
+- **车道 C（输入/设置，3 条）**：连发 30 ↓ 只走 3 项的真因是**列表回绕误诊**（不是丢键）——溢出改翻页对齐 /model；auxiliaryModel 回退警告从 console.warn 改 auxiliary_model_fallback 会话事件 + 可见状态行（daemon 用户可见、不再打穿 TUI 帧）；/settings 主列表 ← 关闭面板（对齐统一返回键约定）。
+- **门禁**：check EXIT 0 + test-hygiene OK；触及测试 A 128/40、B 53+106、C 18/11 全绿；三包全量真退出码见 /tmp/full-*7.txt；两条继承类 note（Esc 连清补全与草稿、Ctrl+C 不清删除确认）按上游继承记录不动。
+- **W14（W13 回归收口）**：W13-A 给 run() 加的粘贴恢复钩子未被启动测试桩补上 → run() 抛未处理 TypeError、准入栏从未武装（6 断言红：栏内输入直发模型）+ 两个裸微任务 while 自旋（99% CPU、全量挂死 100 分钟的元凶）。修的是测试接缝（补桩 + 新断言钉住 run() 确实把粘贴交给恢复钩子——保护 W13-A 接线；自旋换 vi.waitFor 状态屏障），两个产品语义（栏内保留、symlink 规范化）原样并在同一全量中验证。**全量从「挂死不出」恢复到 201 秒 / 1051 文件 / 12181 测试全绿**。教训入档：W13 类「run() 新协作对象」改动必须同步核对启动测试 harness 的桩清单；测试等状态绝不用裸 while+Promise.resolve。
+- **剩余**：Ghostty Shift+Enter 核对、#3389 thinking 回放核对（官方踩坑清单）排下轮；10-10 过龄补刷最后两个依赖；留老板两决策（factory.py、Windows）。
+
 ## 2026-10-09 第四批：信任门移植 + 上游摘取 5 件 + 官方 Rust 化普查
 
 > 老板授权自主拍板后收的口：dependabot 剩余项处置（6 条 dismissed、#1 修复、#29 等过龄自动消）+ 官方仓库两轮普查（战略层 /tmp/upstream-survey-20261009.md、Rust 深查 /tmp/rust-rewire-inspection-20261009.md，两档为临时产物、结论在本节留档）+ 三车道交付（信任门 + 上游摘取 TS/Python）。
