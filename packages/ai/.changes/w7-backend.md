@@ -1,7 +1,0 @@
-- Fixed Google/Gemini streams dying on a finish reason the SDK does not know yet; the turn now fails cleanly with the raw reason recorded instead of throwing "Unhandled stop reason".
-- Fixed Bedrock sessions silently dropping provider-encrypted reasoning blocks; they now surface as a marked redacted-thinking block and round-trip on the next turn.
-- Fixed Claude Code turns ending in an unrecognized stop reason being reported as success; they now fail visibly with the raw reason.
-- Fixed the Claude Code failure message quoting raw stderr (including terminal control sequences); the quoted tail is now washed.
-- Fixed Mistral turns with an unknown finish reason being reported as success, and oversized Mistral error bodies being cut mid-emoji into a broken glyph.
-- Fixed OpenAI Responses error events without an error code printing "Error Code null".
-- Fixed OpenAI-compatible providers losing the raw finish_reason on error stops (content_filter, network_error, unknown), so downstream retry classification can see it.

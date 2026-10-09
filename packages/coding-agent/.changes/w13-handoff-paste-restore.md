@@ -1,1 +1,0 @@
-- Fixed a paste during the session-list switch window vanishing: the session opened afterwards recovers it into the editor (or the prompt stash when the editor has text) with a status line saying so — including pastes the window delivers without bracketed-paste markers.

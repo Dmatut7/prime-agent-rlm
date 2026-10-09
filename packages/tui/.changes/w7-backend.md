@@ -1,1 +1,0 @@
-- Fixed kitty placeholder images never updating when a new image reused the same id at the same grid size; the transmit dedup now keys on the payload too.

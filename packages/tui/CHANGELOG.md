@@ -1,5 +1,77 @@
 # Changelog
 
+## [0.11.21] - 2026-10-09
+
+- Fixed overwide lines wrapping and corrupting the whole frame on full renders (first frame, resize, viewport-preserving redraw): they are now clamped and logged like the diff path always did, and every clamp re-attaches the trailing style/link reset so a clamped row can no longer bleed its background color or hyperlink into the row below.
+- Fixed nested markdown lists rendering with compounding indentation (4, 10, 22… columns per level) under production themes: nesting is now detected structurally instead of by a chalk-specific cyan escape code.
+- Fixed GFM tables, blockquotes, and headings inside list items vanishing or echoing raw markdown: they render as block content under the item.
+- Fixed `\quad`/`\qquad` LaTeX spacing collapsing to a single space, and environment layout arguments (`{cc}`, `{2}`, `[t]`, `\\[5pt]`) leaking as visible text.
+- Fixed the terminal title sequence accepting control characters: names carrying BEL/ESC can no longer splice escape sequences (including clipboard writes) into the terminal.
+- Fixed list-item block content (tables, blockquotes) tearing at the right edge: the render width now pays for the caller's indent, and the sealed path renders at the content width like the plain path.
+- Fixed LaTeX eating a bracket that follows `\begin{...}` as a position parameter (it is content for matrix-like environments), and starred environments (`alignat*`) now consume their column arguments like the base form.
+- Fixed `\begin{array}[t]{…}` and `tabularx` consuming their layout arguments in the wrong order, which leaked "t]cc" into the rendered math.
+- Fixed the editor's completion list staying open while the caret moves (accepting then spliced the completion at a stale prefix, corrupting the text), and added a render-side wash to Text: theme colors and hyperlinks survive, clipboard writes (OSC 52), cursor/screen control and bare control characters from model text do not.
+- Hardened `sanitizeRenderText` after the review cluster: an unterminated OSC 8 is dropped instead of kept half-open (the terminal would keep eating the rows after it), a `CSI > … m` keyboard-mode set no longer passes as an SGR, and CSI intermediate bytes and DCS/APC/SOS/PM sequences are dropped whole instead of leaving their parameter bytes on screen as visible debris.
+- Exported `sanitizeRenderText` from the package entry, so the faces that render their own rows can wash model-controlled text with the same contract `Text.render` applies.
+- Fixed a crash leaving the tty half-configured: the exit guard now restores raw mode, the alt screen, both kitty keyboard stack entries, grapheme 2027, bracketed paste and mouse reporting, not only mouse tracking (R5-M5).
+- Fixed the kitty keyboard stack leak compounding across processes: a startup probe answer reporting nonzero flags (a previous process crashed after pushing) now pops one leaked entry per launch, so Ctrl+C keeps raising SIGINT (R5-M5).
+- Fixed fullscreen sessions never enabling grapheme cluster mode (DECSET 2027): a supported probe verdict that arrives while the alt screen is active is now sent when the main screen returns, instead of being dropped (R5-M6).
+- Corrected the README contract for overwide `render(width)` lines: the TUI clamps them to `width` and logs to `~/.prime/agent/pi-crash.log` instead of erroring.
+- Fixed vertical cursor movement over a wrapped paste/image marker landing on a wrong line end with a corrupted sticky column, and stopped Ctrl+] from placing the cursor inside an atomic paste/image marker or a hidden prompt prefix, where an edit silently corrupted the marker and lost the pasted content on submit.
+- Fixed pastes landing during the session-list switch window being silently dropped: they are captured and restored into the next session's editor (or its prompt stash), and a crash mid-window no longer leaves unread paste lines for the shell to execute.
+- Fixed rapid arrow-key navigation in the settings list teleporting back to the top: a burst that outruns the item count now rests on the first/last item instead of wrapping around.
+- Fixed left arrow in the settings panel resetting the selection to the first row: left now closes the panel (the same back-key convention the submenus use), and editing a search query with the arrow keys keeps the selected row.
+- Fixed fullscreen drag-selection dying when the drag sweeps into the blank fill below a short transcript: the fill now extends the selection to the last content row, and a press started in the fill anchors to the nearest content row instead of being discarded.
+- Fixed drag-selecting or copying lines that contain literal tabs in fullscreen: the highlight and the copied text now follow the painted columns (tabs expand to three spaces) instead of shifting past each tab.
+- Fixed overlays (dialogs, popups) not compositing over kitty placeholder image rows, which let image stripes punch through the dialog while clicks still landed on it; a fully covered image now keeps its payload so it reappears intact when the overlay closes.
+- Fixed the autocomplete popup showing only its description tail (zero candidates) when the rows above the input are scarce: clipping now keeps the selected suggestion visible and drops description/scroll-info lines first.
+- Fixed Markdown-rendered assistant output passing model text to the terminal unwashed: escape sequences and control bytes (OSC 52 clipboard writes, screen clears, BEL) in answers, code blocks, links, and math are now stripped before display.
+- Fixed a process crash when a terminal sent a Kitty CSI-u key event with a codepoint above U+10FFFF.
+- Fixed Option+arrow keys on meta-sends-escape terminals (xterm `metaSendsEscape`, Terminal.app "Option as Meta") firing Escape - interrupting the response and clearing the draft - instead of the Alt+arrow binding.
+- Fixed legacy meta chords that collide with SS3/DCS/OSC/APC introducers (Alt+Shift+O, Alt+Shift+P, Alt+], Alt+Shift+-) swallowing the text typed right after them.
+- Fixed a multi-line paste with CRLF/CR line endings on terminals without bracketed paste submitting the draft once per line instead of pasting.
+- Fixed `Input`-based fields (settings search, OAuth paste, menu search) storing pasted escape sequences and control bytes and re-emitting them to the terminal on every frame; pasted lines now join with a space instead of concatenating, and the field no longer renders overwide rows at widths <= 2.
+- Fixed kitty placeholder images never updating when a new image reused the same id at the same grid size; the transmit dedup now keys on the payload too.
+- Fixed in-band `_pi:` APC reveal markers leaking to the terminal raw on the inline render path (fullscreen already consumed them).
+- Fixed the quote color dropping after inline code and syntax-highlight spans inside blockquotes: the quote style is now re-applied after `\x1b[39m` foreground resets, not only after full resets.
+- Changed Markdown tab expansion to the CommonMark 4-column width, so tab-indented code blocks render as code instead of plain paragraphs.
+- Fixed wrapped code-block continuation lines losing their indent and spilling out of the block; continuations now carry the code-block indent.
+- Fixed LaTeX rendering silently truncating a formula at a stray top-level `}`; the brace now renders literally and the rest of the formula is kept.
+- Fixed truncated lines keeping an open OSC 8 hyperlink: the ellipsis and padding no longer stay clickable or leak the link into the next row.
+- Fixed width accounting for lone surrogates (they print as U+FFFD): lines containing them no longer misalign by one column each.
+- Fixed `wrapTextWithAnsi` emitting spurious empty lines when a wide character cannot fit a narrow width.
+- Fixed `COLUMNS`/`LINES` env vars overriding the default terminal size when stdout is not a TTY.
+- Fixed `COLORFGBG` background detection: bg=7 (white) is now light and bg=8 (bright black) dark, matching the reference heuristic.
+- Capped the OSC 52 clipboard fallback at 100KB encoded; larger selections no longer write a payload terminals choke on.
+- Fixed the `setClearOnShrink` docstring, which described the default backwards (it is off by default).
+- Fixed a DEL byte inside a bulk input run being inserted as invisible text instead of acting as Backspace.
+- Fixed the fullscreen "back to bottom" hint row staying selectable/copyable while it hides a transcript line.
+- Fixed drag-selection highlights landing on rows that changed mid-drag (e.g. a ticking dock).
+- Fixed drag auto-scroll not starting when the anchor is on the first transcript row and the pointer reaches the header row.
+- Fixed the mouse wheel dying over dock regions (e.g. the subagent strip) while an overlay has focus.
+- Fixed drag-selection highlight blanking kitty placeholder image cells.
+- Fixed drag-copying an inline (kitty/iTerm2) image row producing blank lines; it now copies one `[image]` marker per image.
+- Fixed a pending click-hold anchoring to the wrong row when a history page prepends above it mid-frame.
+- Fixed the editor's bottom scroll indicator not truncating at narrow widths (it now mirrors the top indicator).
+- Fixed `Loader.setIndicator` dropping the theme color on the default spinner frames when called with options that carry no frames.
+- Fixed `Image` emitting degenerate `c=0`/`width=-1` geometry at render width <= 2, and not re-rendering when terminal capabilities change at runtime.
+- Removed the dead `maxHeightCells` image option (declared and documented, never consumed).
+- Fixed editor undo leaving stale snap bookkeeping that sent the next vertical move to a wrong column.
+- Fixed deleted paste markers leaving their content behind: a hand-typed `[paste #N]` literal no longer expands to stale pasted text at submit.
+- Fixed vertical cursor movement measuring visual columns in code units, drifting the caret on CJK lines.
+- Fixed the hardware cursor disappearing while autocomplete is open (IME candidate window lost its anchor); it now rides the popup anchor.
+- Fixed pastes over the 8MB part budget creating one `[paste #N]` marker per part; parts are joined back into a single marker, and an aborted split paste is discarded whole.
+- Fixed `Spacer` and empty `Box` returning a fresh array every render, defeating the line aggregator's identity memoization.
+- Fixed the settings list squeezing the value out on over-wide labels (the label now truncates) and capped the selected item's wrapped description so it cannot push the list past the dock's row budget.
+- Added placeholder support to the single-line `Input` (dim hint behind the cursor while empty); selector search fields now show their placeholder while focused instead of never.
+- Fixed slash-command completion context to split on the same whitespace class as the executor, so an NBSP between command and argument no longer kills completion.
+- Fixed file-name completions with control characters (a legal-but-hostile filename no longer lands in the popup or the draft).
+- Fixed `showOverlay` to re-evaluate function-valued options on every render, as the extension API documents.
+- Removed the dead `SettingsList.updateValue` API (no callers).
+- Fixed pastes from terminals without bracketed paste collapsing multiple lines into a single editor line (with broken cursor, backspace and wrapping) when a pasted segment was shorter than the bulk-text threshold, such as tab-indented code.
+- Fixed a crash in the window where agents-view hands the terminal to a session view leaving the shell on the alternate screen with the kitty keyboard protocol still enabled (Ctrl+C no longer raising SIGINT).
+- Sped up streaming markdown rendering on long code-heavy answers: the backtick emphasis-mask guard no longer rescans the whole paragraph on every frame while clean.
+
 ## [0.11.20] - 2026-10-04
 
 - Added `FullscreenViewport.noteTranscriptPrepend` (and `TUI.noteTranscriptPrepend`): rows inserted at the top of the transcript keep a paused window on the rows it shows and never count as new content below, fixing the snap-to-bottom and fake new-content indicator when a history page is prepended.

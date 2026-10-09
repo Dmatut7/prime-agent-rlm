@@ -1,1 +1,0 @@
-- Fixed a Python state restore whose revived names are all degraded still showing the routine "recovered" row without a warning tone.

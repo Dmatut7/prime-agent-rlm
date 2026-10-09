@@ -1,1 +1,0 @@
-- Fixed the harness digest re-injecting an entry this session's own refine deleted: the deletion receipt now suppresses the duplicate announcement the same way an applied edit does.

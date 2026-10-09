@@ -1,2 +1,0 @@
-- Fixed list-item block content (tables, blockquotes) tearing at the right edge: the render width now pays for the caller's indent, and the sealed path renders at the content width like the plain path.
-- Fixed LaTeX eating a bracket that follows `\begin{...}` as a position parameter (it is content for matrix-like environments), and starred environments (`alignat*`) now consume their column arguments like the base form.

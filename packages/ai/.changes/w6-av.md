@@ -1,1 +1,0 @@
-- Fixed Bedrock stream failures never reading the HTTP status from the SDK error, so permanent 4xx errors (invalid model, access denied) are no longer retried as transient.

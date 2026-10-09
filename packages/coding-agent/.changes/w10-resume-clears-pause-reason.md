@@ -1,1 +1,0 @@
-- Fixed /heartbeat and rlm_heartbeat resume leaving a missing-directory pause reason on the job, so a recovered job no longer shows an Error row in /crons.

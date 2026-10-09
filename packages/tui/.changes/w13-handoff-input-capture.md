@@ -1,1 +1,0 @@
-- Fixed pastes landing during the session-list switch window being silently dropped: they are captured and restored into the next session's editor (or its prompt stash), and a crash mid-window no longer leaves unread paste lines for the shell to execute.

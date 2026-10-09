@@ -1,8 +1,0 @@
-- Fixed the TUI components doc (`docs/tui.md`) which documented a non-existent `ctx.ui.custom()` handle API and a wrong custom-tool `execute` parameter order; it now shows the real `(tui, theme, keybindings, done)` factory signature and the daemon-session limitation.
-- Corrected the Escape key description in README and `docs/usage.md`: Escape interrupts active work, and only clears the (stashed, Ctrl+S-restorable) input when idle.
-- Updated the README footer description to the real U6 watermark line (`footer.telemetry`, on by default) instead of "empty by default".
-- Aligned `docs/settings.md` with the implemented compaction marker text `即将压缩`.
-- Fixed `examples/extensions/README.md` and five extension examples: real `execute(toolCallId, params, signal, onUpdate, ctx)` order and `~/.prime/agent/extensions/` install paths instead of legacy `~/.pi`.
-- Fixed the six `examples/sdk/` files that pointed at the legacy `~/.pi/agent` tree; all paths now read `~/.prime/agent` / `<cwd>/.prime/agent`.
-- Corrected `docs/themes.md`: the schema accepts 74 optional color tokens beyond the 55 required ones (they fall back to core colors); the "no optional colors" claim is gone and the optional tokens are listed by group.
-- Corrected `docs/terminal-setup.md`: the legacy Option-as-Meta (Meta-sends-Escape) form is documented as unsupported and harmful (its Escape prefix interrupts work or clears the draft) instead of being claimed as accepted.

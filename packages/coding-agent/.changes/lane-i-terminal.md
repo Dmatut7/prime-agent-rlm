@@ -1,3 +1,0 @@
-- Fixed in-flight subagent rows keyed by a display-rewritten label: the kernel's spawn-finished record now carries the child's exact session `name` beside the display label, so a name with collapsed blanks no longer leaves a row stuck running or listed twice (R5-M7).
-- Fixed kernel activity ids colliding across a kernel restart (a restarted kernel re-issued `subagent-1`/`command-1`, so a background command's outcome attached to a different command's id); ids now mix a per-boot nonce (R5-M8).
-- Fixed ghost "in-flight subagent" entries surviving every compaction: the handoff ledger keyed rows by the display-rewritten label but resolved lifecycle notices by the exact session name; the ledger now keys by the record's exact `name` when the kernel sends one (R6-M8).

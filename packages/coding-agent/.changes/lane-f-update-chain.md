@@ -1,3 +1,0 @@
-- Fixed `/update` on a fork build flashing its refusal in the alt-screen gap and relaunching the whole TUI; the refusal now shows in-session and the extensions half of a bare `/update` still runs.
-- Fixed `/update --help` restarting the daemon and relaunching the TUI: help is answered in-session, and the update child now exits with a distinct help exit code the parent never reads as "updated".
-- Fixed the self-update artifact channel never activating: the release manifest reader now finds the sha256 pinned in `tarballs[]` (the shape the pack script writes), and the pack script also pins it at the top level for older readers.

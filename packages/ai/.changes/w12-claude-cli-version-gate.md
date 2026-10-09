@@ -1,1 +1,0 @@
-- Fixed Anthropic OAuth sessions missing claude-opus-5.5 by bumping the impersonated Claude Code client version to 2.1.281; the API gates new models on the claimed client version (opus-5.5 requires 2.280+).

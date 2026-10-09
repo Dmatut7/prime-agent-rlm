@@ -1,1 +1,0 @@
-- Corrected the README contract for overwide `render(width)` lines: the TUI clamps them to `width` and logs to `~/.prime/agent/pi-crash.log` instead of erroring.

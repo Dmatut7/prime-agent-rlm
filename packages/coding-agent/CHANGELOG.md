@@ -1,5 +1,250 @@
 # Changelog
 
+## [0.11.21] - 2026-10-09
+
+- Fixed subagent status disagreeing across surfaces after attach/resync: timeline entries seeded as "running" are now reconciled from the authoritative snapshot, and a terminal status settles the "还在干活" lane tail instead of waiting for the queued report to render.
+- Fixed the agents view's usage columns drifting between sections (values read under the wrong header) by sharing one column set across all sections, truncating rows with an ellipsis instead of a bare cut, and switching money figures to the TUI-wide ¥ formatter (same for /context and the HTML export header).
+- Fixed `/context` overflowing the terminal by up to six columns on aligned rows: the label budget now accounts for the context bar's actual width.
+- Fixed `--version`/`--help`/`model list`/`session export` output landing on stderr when stdin is not a TTY (script capture got an empty string), and `--help <command>`/`--version <command>` being rejected as "Unknown command".
+- Fixed broken custom themes crashing the first render (and being written to settings after a failed load): the startup guard rejects themes missing required tokens up front, and fallbacks now pick the terminal-appropriate default instead of always dark.
+- Fixed error, status, and queued-message rows echoing raw control characters from provider/daemon failures (up to a full SSE frame) into the terminal.
+- Fixed the login dialog rendering two copies of the manual input after a failed paste falls back to re-prompting, and the placeholder row keeping its old left padding after a runtime `editorPaddingX` change.
+- Fixed the fork message picker and the session tree overflowing short terminals (selection scrolled out of view, header clipped); both now size to the live terminal height and follow resizes.
+- Fixed `--no-env`/`test.sh` leaving ten newer provider API keys set (the banner claimed no keys while they were still active), and the banner polluting stdout.
+- Fixed the workspace-changes strip line showing an ellipsis at narrow widths when the short form fits, and the display reconciliation gate counting other windows' (ambient) changes as this session's displayed totals.
+- Fixed attach/resync leaving subagents stuck as "还在干活" after a rebuild: the snapshot reconciliation now runs after the transcript replay (it ran before, against an empty chat), covers cancelled children, and an out-of-band settle keeps a ledger entry so the closing line and failure tally still render when the report arrives.
+- Fixed the display reconciliation gate mis-failing when another window also touched a file this session edited: per-path records now merge before the ambient split, and ambient-only paths no longer trigger unclaimed-change warnings.
+- Fixed tables and blockquotes inside list items tearing at the right edge on narrow terminals, and the sealed/unsealed render paths disagreeing about width.
+- Fixed LaTeX consuming a bracket right after `\begin{...}` as a layout parameter: intervals like `[0,1]` in matrix cells render again, and starred environments (`alignat*`) consume their arguments like the base form.
+- Fixed theme fallback retrying the theme that just failed (crashing when the default itself is broken): fallbacks now walk a candidate list.
+- Fixed chat error and status rows losing intentional line breaks to overzealous sanitization.
+- Fixed the HTML export header still showing costs in `$` while the TUI shows `¥`.
+- Fixed `prime-agent --cwd list status`-style invocations dropping a flag's value, and `-c/-r/--fork`-led prompts being routed as commands.
+- Fixed subagent round counts and the closing line disappearing after a chat rebuild (resync, compaction): the out-of-band settle ledger now travels with the lane snapshot.
+- Fixed cancelled subagents being tallied as "finished without a reply" on the closing line; they now count as cancelled, and an attach-side flip records the child's real end time (its snapshot duration) instead of the attach moment.
+- Fixed `--cwd <command> --flag <command>` invocations mangling the flag's value: a flag-leading command redirect now gives up when the command word is ambiguous.
+- Fixed `\begin{array}[t]{…}` / `tabularx` consuming their arguments in the wrong order (the position leaked as "t]cc").
+- Fixed the login dialog re-arming its confirm-hint rows after a failed manual submission, and the in-process rename path persisting unsanitized session names.
+- Version and help output now stays on stderr for explicitly requested machine modes (`--mode json/rpc/acp/daemon`, `-p`) so the protocol stream stays clean, while an implicit print mode (stdin not a TTY) still writes them to the real stdout.
+- Fixed the login dialog overflowing stock 24-row terminals and clipping its paste field (the overlay cuts from the bottom, exactly where the input lives): the brand logo block yields to the title pair below 30 rows.
+- Fixed an update relaunch crashing with a stack trace when the supervisor evicts the just-detached empty session between the list and the attach: that race now falls through to creating the session from the file.
+- Fixed model text reaching the terminal carrying injected escapes: the Text renderer now keeps theme colors and hyperlinks but drops clipboard writes (OSC 52), cursor/screen control, and bare control characters — the render-side door the per-call-site cleanups could never fully close.
+- Fixed Ipython cells expanded in legacy mode rendering the entire output body (one keystroke could re-lay thousands of rows and freeze the UI): every non-full face now renders a bounded window.
+- Fixed the footer keeping stale model/context/compaction figures after a resync, and quota-park waits losing their countdown below ~90 columns: the telemetry memo invalidates on every connection snapshot, and the park chip picks the widest form that fits.
+- Fixed diff rows carrying a raw carriage return from CRLF-edited files rewinding the row and garbling everything below it.
+- Fixed the completion list staying open while the caret moves: moving the caret now closes it, so accepting can no longer splice the replacement into a stale prefix position.
+- Fixed exported session HTML showing raw ANSI escape codes (e.g. `[31m`) in tool and bash output; escape sequences are now stripped during export rendering.
+- Fixed exported HTML dropping tool result images for every tool except `read`, so MCP screenshot tools no longer lose their images.
+- Fixed forked branches in exported HTML showing another branch's tool result when a toolCallId exists on multiple branches; results now resolve within the current conversation path.
+- Fixed Escape in exported HTML clearing the tree search without rebuilding the tree and silently jumping back to the initial branch; Escape now only clears the search filter.
+- Fixed the T/O thinking/tools toggles in exported HTML losing (and inverting) their state after switching branches; toggle state now lives on the messages container.
+- Fixed exported HTML with large collapsed tool outputs freezing on open; full output DOM and syntax highlighting now build lazily on first expand.
+- Fixed the full-width mobile sidebar staying open after tapping a tree node in exported HTML.
+- Fixed long URLs and tokens in exported HTML forcing page-wide horizontal scrolling; markdown content now wraps anywhere.
+- Fixed the block-navigation key hint landing on a turn box's empty top rail row while the first event row lost its `N 步 ▸`: the hint now sits on the row that made room for it, and a first row too full to fit the hint gives up its last columns instead of losing it.
+- Fixed `y` on an expanded card (a skill, a compaction summary, an injected prompt, a refinement memory) flattening what it copied - every row trimmed and the blank rows dropped - so a block copy now carries the card's own source text, indentation and paragraph breaks included.
+- Fixed a long interjection (`你插话`) being cut to its row with no way to read the rest of it: it now opens to the whole text, by click, by Enter and by the keyboard walk, like any other event row.
+- Fixed a replayed turn whose reply was interrupted stamping a made-up `已中断` over a step whose real result the transcript kept, dropping that output and an edit's diff.
+- Fixed a heartbeat prompt being taken for the owner's question in the live view, which reset the lane of the question still running (its `还在干活` row and the `──╯` that closes it disappeared) and stamped the round it woke as the owner's own.
+- Fixed a stop from another view pulling the next prompt into the stopped box live (as `你插话`) while a replay of the same transcript opened a turn of its own, so a rebuild re-grouped the chat.
+- Closed the review-cluster findings on the wash batch: the recap line renders through `TruncatedText`, a component the `Text` gate never sees, so the baseline recap a pre-wash journal wrote is washed at that line too; the agents view's status message and its subagent model label are washed where the view paints them; a sender that is only escape sequences falls through to its next identity instead of a blank name; the legacy process line's tool verbs and the `/tree` selector's unknown-role fallback are washed; and a journal whose status entry lost its summary seeds an empty recap instead of throwing.
+- Removed the dock strip's stall-marker channel outright: the markers were built from the same snapshots as the panel rows and spelled the same names, so a marker never described a child a row did not already draw, and the orphan-block branch that consumed them was production-unreachable, test-only code. A stalled child's own row says `⚠ 卡住`.
+- Washed the render faces that build their own rows instead of handing their text to `Text`: the turn box's header and step meta, a subagent's report row and its opened body, a timeline notice and its opened detail, and the centered system-notice line - a subagent name, report, error or file path can no longer write the clipboard (OSC 52), clear the screen, ring the bell or break a row in two.
+- Made the shared display washer drop whole escape sequences instead of only the `\x1b` that starts them, so an injected sequence no longer leaves its payload on screen as visible garbage.
+- Fixed `y` on a turn box dropping the blank rows between the paragraphs of an opened event, so the copy keeps the shape the block showed.
+- Washed the agents view's rows - the title, the subtitle, the status label (a queued task's own prompt included), the answer preview under a session and a spawn-code row's source - so a name or a model-controlled label on disk from before the write-side fix can no longer inject an escape sequence into a row the view paints itself.
+- Washed every text the `/tree` selector interpolates (a message, an error message, a tool name and its arguments, a bash command, a custom-message type, a branch summary, a model id, a thinking level, a service tier, a label and a session title), and cut its tool-call preview by the washed length instead of the raw one, so an escape sequence no longer eats the column budget and fakes an ellipsis.
+- Fixed a stalled subagent whose name contains `": "` showing as two red blocks in the dock strip: the stall marker's hand-written `name: text` microformat is now a structured `{ name, text }` pair, so no consumer parses a name back out of a string and invents a second, truncated child.
+- Washed the dock strip's chip names and task tags: a name carrying a newline can no longer turn the strip's one row into two physical lines, and an escape sequence in a name no longer rides the dock's every-second repaint.
+- Washed the bash call header (`$ <command>`) to one clean physical row: a command carrying a newline no longer splits the header, and the escape sequences a command could paint or link with are gone before the theme touches it.
+- Redacted the raw command a bash call header or a step label falls back to when no preview was worth naming, so a setup-only command (`export API_KEY=...`) no longer puts its secret on screen verbatim; the redaction runs before the cut, since half a secret still leaks.
+- Washed an ipython cell's top line (its label, and the error name the kernel reported) and the code its expanded view shows, so a cell can no longer put a clipboard write or a screen clear on a row it paints itself, and an error name carrying a newline can no longer turn one accounted row into two.
+- Washed a session recap before it is persisted - the classifier's recap body and a failed turn's error message alike - and washed the recap read back from a journal an older build wrote, so a restart, an attach or an agents-view redraw no longer replays an injected escape sequence for the life of the session.
+- Washed a tool preview where every preview face reads it (a bash call header, a step label, a dispatch row's opened code line, the /tree selector's tool line), so code carrying an escape sequence can no longer reach a row those faces paint themselves.
+- Washed the recap beside an agents-view row's title on the way out as well as on the way in, so a journal an older build wrote can no longer replay an injected sequence on every redraw, and washed the reply headline the view names a session by.
+- Fixed `ctx.ui.setStatus()` statuses never rendering: the footer shows them again on a dedicated line (sorted by key, sanitized, truncated), in both in-process and daemon sessions.
+- Fixed duplicate extension slash commands being silently renamed to `name:N`: the conflict now produces a warning diagnostic (visible in `/extensions`) and a one-time notification or console warning naming the colliding extensions and the `/name:1`, `/name:2` invocations.
+- Fixed `ctx.ui.custom()` in daemon sessions silently resolving `undefined` (extensions reported it as "user cancelled"): the first call per session now raises a warning notification explaining that daemon sessions cannot host custom components.
+- Removed the dead `prime-agent daemon <subcommand>` client surface (open/start/ps/create/attach/detach/prompt/agent-messages/steer/follow-up/state/messages/stats/commands/retry/restart/shutdown): the prefix has been rejected since upstream's command standardization, and the public `list`/`stop`/`rename`/`send`/`schedule` commands are the supported path. Docs no longer describe the removed surface.
+- Documented that extension custom renderers (`registerMessageRenderer`, tool `renderCall`/`renderResult`/`renderShell`) only apply in in-process interactive sessions, not in the default daemon-backed ones.
+- Fixed `/update` on a fork build flashing its refusal in the alt-screen gap and relaunching the whole TUI; the refusal now shows in-session and the extensions half of a bare `/update` still runs.
+- Fixed `/update --help` restarting the daemon and relaunching the TUI: help is answered in-session, and the update child now exits with a distinct help exit code the parent never reads as "updated".
+- Fixed the self-update artifact channel never activating: the release manifest reader now finds the sha256 pinned in `tarballs[]` (the shape the pack script writes), and the pack script also pins it at the top level for older readers.
+- Fixed `/settings` crashing on hand-edited non-string settings values (e.g. `theme: 42`): malformed values now read as unset/default instead of throwing in the panel render.
+- Added an in-session notice when settings.json is edited by hand while a session runs: the reload (or its parse error) is now drained and shown instead of applying in silence.
+- Added a hint on `/settings` rows whose value is pinned by the project settings.json, so toggling them no longer silently writes only the global file.
+- Fixed `prime-agent config` treating a typed space in the filter box as a toggle that silently rewrote settings.json on disk; Enter now toggles.
+- Fixed `prime-agent config` hiding write failures: a failed toggle now renders a save-failure line instead of silently flipping the checkbox.
+- Fixed ACP mode reporting a turn killed by the stall watchdog as a normal `end_turn`; the prompt request now fails with the abort reason, matching print and headless mode.
+- Fixed ACP compaction updates dropping the failure fields; an aborted or failed compaction now reports `aborted`, `willRetry`, `errorMessage`, and `errorSeverity` instead of an empty success payload.
+- Fixed ACP mode stripping the images a Python cell produced; they now ride along as standard image content blocks on the tool call update instead of being dropped.
+- Fixed RPC and ACP modes silently dropping all connection-level events; quota-park heartbeats, daemon reconnect status, and session replacement/resync markers now reach the consumer instead of leaving a hung prompt or stale state with no signal.
+- Fixed `prime-agent -p` silently printing an empty answer and exiting 0 when a subagent failure or other trailing notice sat at the end of the transcript; the answer behind the notice now prints, the failure goes to stderr, and the exit code is non-zero.
+- Unified heartbeat/cron next-run times onto one local-timezone format across the management panel, status lines, and chat summary (was: UTC panel vs raw-ISO status vs local chat, three answers eight hours apart).
+- Added a visible kernel-reset notice line to ipython cells that ran on a replacement kernel, shown even when collapsed, reading the previously-ignored kernelRestarted/kernelReset result fields.
+- Fixed in-flight subagent rows keyed by a display-rewritten label: the kernel's spawn-finished record now carries the child's exact session `name` beside the display label, so a name with collapsed blanks no longer leaves a row stuck running or listed twice (R5-M7).
+- Fixed kernel activity ids colliding across a kernel restart (a restarted kernel re-issued `subagent-1`/`command-1`, so a background command's outcome attached to a different command's id); ids now mix a per-boot nonce (R5-M8).
+- Fixed ghost "in-flight subagent" entries surviving every compaction: the handoff ledger keyed rows by the display-rewritten label but resolved lifecycle notices by the exact session name; the ledger now keys by the record's exact `name` when the kernel sends one (R6-M8).
+- Fixed the TUI components doc (`docs/tui.md`) which documented a non-existent `ctx.ui.custom()` handle API and a wrong custom-tool `execute` parameter order; it now shows the real `(tui, theme, keybindings, done)` factory signature and the daemon-session limitation.
+- Corrected the Escape key description in README and `docs/usage.md`: Escape interrupts active work, and only clears the (stashed, Ctrl+S-restorable) input when idle.
+- Updated the README footer description to the real U6 watermark line (`footer.telemetry`, on by default) instead of "empty by default".
+- Aligned `docs/settings.md` with the implemented compaction marker text `即将压缩`.
+- Fixed `examples/extensions/README.md` and five extension examples: real `execute(toolCallId, params, signal, onUpdate, ctx)` order and `~/.prime/agent/extensions/` install paths instead of legacy `~/.pi`.
+- Fixed the six `examples/sdk/` files that pointed at the legacy `~/.pi/agent` tree; all paths now read `~/.prime/agent` / `<cwd>/.prime/agent`.
+- Corrected `docs/themes.md`: the schema accepts 74 optional color tokens beyond the 55 required ones (they fall back to core colors); the "no optional colors" claim is gone and the optional tokens are listed by group.
+- Corrected `docs/terminal-setup.md`: the legacy Option-as-Meta (Meta-sends-Escape) form is documented as unsupported and harmful (its Escape prefix interrupts work or clears the draft) instead of being claimed as accepted.
+- Fixed quiet replay dropping the stored final answer of old subagent no-reply notices written before the `lastAssistantTextPreview` rename; the legacy field is read as a fallback.
+- Fixed one malformed stored message (e.g. a custom message without content) crashing every replay of its session with a bare TypeError, which made the session impossible to open or attach: replay now skips the bad message with a visible warning, renders the damaged custom message as a marked-malformed row, and the write side refuses to persist a malformed custom message.
+- Fixed the lost-connection turn drawing each failure's own sentence a second time as an opened detail when its box opened: a detail that only repeats the row (the row's facts, or a one-line error's own tail) no longer auto-opens.
+- Fixed an expansion key's screen reveal being lost when a backfill page loaded in between: the load's row measurement no longer spends the turn head's one-shot reveal marker on discarded output.
+- Added a content-fingerprint cache (`scripts/check-gate-cache.mjs`, `.gates-cache.json`) so the pre-commit `npm run check` skips the installer, push-guard, secret-scan, browser-smoke and ci-honesty self-test gates when their inputs are unchanged and last ran green; biome and tsgo still run on every commit, and any input change, missing cache, or red run forces the full gate again (`PRIME_AGENT_GATE_CACHE=0` or deleting the cache file recovers).
+- Fixed a Python state restore whose revived names are all degraded still showing the routine "recovered" row without a warning tone.
+- Fixed the parent-facing failure notice crediting a later, never-retried terminal error with the attempt count of an Esc-cancelled retry chain.
+- Fixed a lifted quota park reappearing as an expired countdown after a session rebind on the daemon connection.
+- Fixed rename and cron_add failing on a passivated subagent row picked by session-id suffix: the worker now resolves the suffix the roster matched, and reports an unambiguous error when the suffix names two rows.
+- Fixed the harness digest re-injecting an entry this session's own refine deleted: the deletion receipt now suppresses the duplicate announcement the same way an applied edit does.
+- Fixed the failed /refine receipt: a user-invoked refinement that failed no longer promises an automatic retry that never happens; it states the outcome and that a retry is available on demand.
+- Fixed /heartbeat and rlm_heartbeat resume leaving a missing-directory pause reason on the job, so a recovered job no longer shows an Error row in /crons.
+- Fixed the pre-push secret scan's patch walker: an added diff line whose content begins with `++ ` was misread as a file header, and a `++ /dev/null` content line silently disabled scanning for the rest of that file's added lines.
+- Extended the finish gate's shell-write detection to archive extraction and downloads: unzip, tar extract, gunzip, zip -d, 7z, curl -o and wget -O now void an earlier green test run the same way an edit does.
+- Fixed a Python state snapshot notice hiding a name the model lost when its drop reason matched the routine host-wrapper reason; routine skips are now classified by name only.
+- Fixed a mid-run reattach understating the "working" clock: the snapshot now carries the in-flight run's real start time, so a slim attach no longer counts from the oldest message the window shows.
+- Added a project extension trust gate: `.prime/agent/extensions` and project-settings extension sources load only after the directory is trusted, asked once interactively, refused with an explanation in non-interactive runs (never a blocking prompt), overridable with `--approve`/`--no-approve`, and auto-trusted once for directories already in use when the gate landed.
+- Raised the Codex client version reported on model discovery to 0.159.0, matching the current stable Codex CLI, so catalog-gated models (GPT-6 Sol and Luna) are no longer hidden from subagent delegation and `find_models()`.
+- Changed compaction and branch summarization to run on the configured auxiliary model when one is set, so the session model's prefix cache is no longer evicted (and re-read at full peak-context price) by every compaction; the session model remains the fallback.
+- Changed the kernel owner watchdog from a 1 Hz kill-0 poll to an OS exit wait (kqueue NOTE_EXIT on macOS/BSD, a pidfd on Linux), so the kernel thread sleeps until the owner actually exits instead of waking every second; where exit notification is unavailable (old Linux, seccomp, pidfd-less CPython) it falls back to a slower poll. Ported from upstream #3229.
+- Fixed the agents-view key (left arrow / session list) killing the TUI with a raw Node stack after the daemon was shut down: a down connection now refuses the list switch with a status line, and a list that cannot start exits with a clean message instead of an unhandled error.
+- Added a visible warning when the configured auxiliary model is unavailable and compaction/refinement falls back to the session model: previously the notice only went to the worker log, so daemon-attached users never saw it and direct mode printed it across the interface.
+- Fixed a paste during the session-list switch window vanishing: the session opened afterwards recovers it into the editor (or the prompt stash when the editor has text) with a status line saying so — including pastes the window delivers without bracketed-paste markers.
+- Fixed the stale "出错：Cannot list heartbeats while session worker is recovering" diagnostic after a crash auto-recovery: it now clears as soon as the heartbeat list answers again, and the reconnect/closed banner lines speak Chinese instead of mixing in English.
+- Fixed the reconnect banner after a deliberate `prime-agent shutdown`: it now says the background service was stopped by hand and will not restart itself, covers both the crash-retry and orderly-shutdown-close paths, and background retries count their attempts in Chinese instead of a static English-free "正在重连…" line.
+- Fixed PI_STARTUP_BENCHMARK hanging on the extension trust prompt in a gated directory: benchmark runs now take the machine-mode fail-closed path instead of waiting on a dialog nobody can answer.
+- Fixed Ctrl+C during the project-extension trust prompt: it now exits the run cleanly instead of silently answering "not trusted, continue", and the startup Ctrl+C guard is re-armed after the prompt until the main interface takes over.
+- Translated the project-extension trust dialog into Chinese to match the interface language, and stopped printing the startup refusal notice on top of the in-app not-trusted warning when the user answers "do not trust".
+- Hardened the extension trust gate's upgrade grandfathering: prior-session evidence is now read only from the agent directory's own sessions store, so a project's settings can no longer redirect the evidence to repository-controlled transcripts.
+- Fixed the trust prompt's footer hint after the Ctrl+C split: it now shows the dismiss key and a separate "Ctrl+C 退出" label instead of advertising Ctrl+C as cancel.
+- Fixed the extension trust gate's upgrade grandfathering for directories entered through a symlink: prior-session evidence now compares canonical (realpath) spellings, so a session recorded under one spelling of the directory still matches the other.
+- Fixed --no-extensions still showing the project-extension trust prompt: runs with extensions disabled skip the dialog, the refusal notice, and the in-app not-trusted warning, since the answer cannot change that run.
+- Fixed the suite regression from the W13 merge: the startup-admission onboarding tests failed and the run then hung a worker at 100% CPU forever; the run() fake now stubs the new paste-recovery collaborator and the barrier waits yield with a timeout, so failures are fast reds.
+- Fixed the agents view never showing locally computed status labels (stalled, no-activity, non-ready worker), so a wedged session now reads as stalled instead of looking healthy.
+- Fixed Left in an agents-view reply discarding a typed draft: with a non-empty draft it now moves the cursor, and only an empty draft disarms the reply.
+- Fixed the agents-view reply key staying dead on a row after its delete confirmation was cancelled or expired.
+- Fixed `status` and `list` overflowing the terminal (240+ columns): both tables now drop lower-priority columns and truncate to the terminal width.
+- Fixed the block-navigation selection highlight being invisible on blocks with their own background (tool panels, user bubbles).
+- Fixed the legacy recap's changed-files total counting edits made by other windows or processes as this session's.
+- Removed the agents view row subtitle, which was computed for every row but never rendered.
+- Fixed feature hints never appearing in the default quiet mode (the hint gate required the working loader in the status container, which quiet mode never mounts).
+- Fixed a "派出子代理 X" lifecycle line being silently overwritten by the next transient status update.
+- Fixed /settings face toggles and /reload tearing down in-flight tool cards mid-turn; the chat rebuild they need now waits for the turn to settle.
+- Fixed toggling "内置技能" in /settings silently closing the settings panel; the required reload now runs when the panel closes.
+- Fixed paged-up history (slim attach backfill) rendering without lane lines, change strips, heartbeat prompt notices, and extension message renderers.
+- Fixed extension UI teardown popping an unrelated top overlay (for example the login dialog) instead of only the extension's own overlay.
+- Fixed pasted images after attach/resume reusing `[image #N]` ids present in session history, which made a recalled old message silently attach the new image.
+- Fixed the "正在整理" line a skipped or failed auto-compaction left spinning forever: the outcome notice now settles the live row instead of shadowing it.
+- Fixed a leaked one-second "Elapsed" timer from a streaming bash block: replacing or rebuilding the session now stops it instead of repainting the screen every second until exit.
+- Fixed expanded compaction and branch summary cards showing the machine ledger tail (`<fact-appendix>`/`<user-requests>`/`<session-handoff>` JSON); they now show only the narrative summary.
+- Fixed the /model menu inside the config screen on short terminals: help and detail rows now spend the rows below the tab header, so the model list itself stays on screen.
+- Removed dead turn-box row fields (`sub`/`window`) and the dead `running-card`/`turn-footnote` components; no visible change.
+- Fixed error details and cell output keeping bare BEL/NUL/DEL/C1 bytes (a bash `\x07` rang on every repaint); the shared error-text normalizer now strips them while keeping newlines and tabs.
+- Fixed a replayed multi-line or escape-laden agent status summary breaking the duty log's one-row "last doing" block above the input.
+- Fixed provider-rejection notices persisting escape sequences from the provider's error message and replaying them on every attach/resync/replay.
+- Fixed the stall bar and stall diagnostics rendering a glitched tool name's escape sequences on every per-second redraw.
+- Fixed a refused memory edit's multi-line reason spilling out of its single timeline row and shifting every row below it.
+- Fixed the kernel reset notice printing "Restart 4 of at most 3" when a budget-exhausted death's notice was consumed by a later revival after the window slid.
+- Fixed the ipython cell claiming "N 张图片，见下方" when only placeholder metadata lines follow.
+- Fixed subagent preview text in agents-view being cut mid-emoji into a broken glyph.
+- Fixed ACP sessions silently dropping pasted resources sent as embedded blobs: image blobs now reach the model, other binaries are named in the prompt text.
+- Fixed ACP clients seeing nothing during the auto-retry backoff window; retry start/end now surface as namespaced metadata.
+- Fixed ACP emitting tool_call_update for a bash run the client never saw start.
+- Fixed RPC mode dropping the daemon's setWorkingMessage/setWorkingVisible/setWorkingIndicator/setHiddenThinkingLabel extension UI requests, and extensions running inside RPC mode now emit them too.
+- Fixed `prime-agent agents` and `prime-agent config` under a non-TTY silently doing nothing or leaking TUI escape frames; both now fail with a clear error.
+- Fixed `/update Prime-Agent` (capitalized) being read as a package name by the CLI while the TUI read it as a self-update.
+- Fixed the self-update receipt claiming "Updated to vY" when the installed version could not be read back; it now says the version could not be verified.
+- Fixed the self-update refusal text naming a "pi executable" instead of the current brand.
+- Fixed CLI error and warning text losing color when stdout is piped but stderr is a terminal.
+- Fixed cron job listings cutting the prompt preview mid-emoji and embedding labels with raw quotes or control characters.
+- Fixed a waiting-step label reading "等待 h 的结果" (the model's variable name) when the awaited handle is unknown; it now reads "等待命令结果".
+- Removed dead code: addMessageToChat's unreachable assistant/bashExecution/summary branches and dead options, the ipython cell's never-rendered showExpandHint field and dead aborted marker branch, and a redundant ternary in change merging.
+- Fixed daemon-hosted extension errors never appearing in the interactive chat; they now render as a chat error line like in print/ACP/RPC modes.
+- Fixed a ghost "Unknown extension UI request" error shown to a client whose dialog answer arrived after the dialog had already timed out or been closed.
+- Fixed a second extension dialog leaving the first one's promise hanging and the first one's expired countdown dismissing the replacement; opening a dialog now cancels the previous one cleanly.
+- Fixed an extension dialog staying open in the other attached clients after it timed out, was aborted, or was answered elsewhere; the daemon now broadcasts the dismissal to clients that declare the extension_ui_dismiss capability.
+- Fixed near-million token readouts printing "1000k" next to a "1M" window - they now promote to the M form everywhere.
+- Fixed Ctrl+O expand-all skipping failed events, whose detail is why the turn failed.
+- Fixed keyboard focus vanishing from the timeline when a fold took its row away.
+- Fixed the legacy ⚙ step line counting a re-sent tool call twice.
+- Fixed the right side of a timeline row losing the last word's styling in its short form.
+- Fixed the turn's output counter ticking down when entries drop out of the timeline.
+- Fixed a wake report that lands after its turn closed counting its comm into the wrong turn, live and replay alike.
+- Fixed heartbeat and background-bash wakes not resetting the turn's token counter.
+- Fixed one file's kernel record and edit diff showing as two entries in the changes table.
+- Fixed command shortening budgeting code units instead of display columns.
+- Fixed queued background-command completions showing as plain follow-ups - they are now labeled 后台命令：.
+- Fixed the pinned quota-park row hard-cutting its longest form on a narrow terminal; it now picks the widest form that fits.
+- Fixed subagent chips keeping stale activity wording after an update that carries none.
+- Fixed an invalid re: search silently filtering every session row; the agents view now shows the regex error in the hint line.
+- Fixed step rows' right margins sitting two columns left of the event rows'.
+- Fixed the pending lane showing a bare session id for an unnamed cross-turn child; it now says 子代理.
+- Fixed the key-steps fold row overrunning a narrow terminal.
+- Fixed the footer re-adding dropped segments (chip/badge, spend cell/session figure) as the terminal narrows.
+- Fixed the /speed line indent differing by one column between the status-bar and telemetry faces.
+- Fixed the subagent strip hiding blocks that fit behind a 还有 N 个 marker.
+- Removed unread run-time and activity fields from the subagent panel data, and the dead elapsed-time formatter with them.
+- Fixed timeline inline markup dropping `[text](url "title")` links wholesale; links with a CommonMark title now render their text like plain links.
+- Fixed bold/italic emphasis silently vanishing under piped stdout while theme colors still flowed; emphasis now uses self-contained SGR codes that honor NO_COLOR, TERM=dumb and FORCE_COLOR.
+- Fixed a failed `setTheme` leaving the UI on stale colors: the fallback theme now triggers the change notification too.
+- Fixed HTML export judging a theme's lightness by its name (`light`) instead of its actual brightness, so custom light themes no longer export near-white text on a white background.
+- Fixed surface background blends on mid-gray terminals never re-checking the minimum luminance delta after blending; the blend now steps up until the panel stays distinguishable.
+- Fixed `prime-agent session export` ignoring the configured theme (light-theme users got dark exports); a broken configured theme falls back to the default instead of failing the export.
+- Fixed the HTML export leaking OSC 8 links and other non-SGR escape sequences as visible garbage, and silently dropping inverse (SGR 7) and strikethrough (SGR 9) styles.
+- Fixed exported sessions auto-loading remote markdown images on open (a privacy leak, since session text is model-controlled); remote images now render as plain links.
+- Fixed the export viewer cutting emoji and other graphemes in half at preview truncation boundaries, running highlightAuto on language-less code blocks, rebuilding the tree on every search keystroke, and swallowing clicks on tree nodes that have no rendered content (a status hint is shown instead).
+- Removed the dead image-modal markup from the HTML export and fixed the viewer's broken `--hover` variable and unstyled `tree-custom` class.
+- Fixed the kernel-restore card hiding partial restore failures: the collapsed line now warns with how many names did not come back ("部分恢复（N 个名字没回来）" / "新开了 Python 环境（N 个名字没回来）"), and expanding it lists the failed, never-saved and degraded names instead of doing nothing.
+- Fixed `prime-agent rename <name>` failing for idle-passivated subagent sessions shown in `prime-agent list` with an opaque internal UUID error; the daemon now forwards the caller's own selector and hydrates the session to apply the rename.
+- Fixed `prime-agent schedule add <name> ...` failing for idle-passivated subagent sessions; the target session is hydrated so the job registers against it.
+- Fixed a session replacement dropping the subagent panel, the parent link and the quota-park countdown until the next heartbeat for slim clients: the supervisor's replacement catch-up now carries the snapshot's children/parent/quotaPark fields (daemon protocol rev 48), and a daemon that never sends them leaves the current view intact instead of clearing it.
+- Fixed selectors overflowing short terminals: extension/OAuth/team selectors now count the wrapped subtitle rows, and on critically short terminals the search/subtitle decoration collapses so at least one option stays visible.
+- Fixed the left arrow acting as back across the OAuth, team, extension, scoped-models, config and settings-submenu dialogs (it moves the cursor while a search field has text).
+- Fixed the extension selector rendering an option containing a newline as two physical rows, and the extension input dialog never showing its documented placeholder.
+- Fixed the config menu header hardcoding enter/esc instead of the configured keybindings.
+- Fixed the scoped-models selector jumping the highlight to a different model when reordering under an active filter, and clearing the (unsaved) marker before the settings write lands.
+- Fixed the /model menu's 推荐 line never appearing when the configuration menu opened on the providers tab, and MCP connections with `enabled: false` now show 已停用 instead of 已配置.
+- Fixed `/mcp login` fake-succeeding when settings.json declares a server with a builtin's name (the login can never take effect; it now says so), and `/mcp get` now shows operational detail (oauth, disabled, header/env counts) that `list` omits, within the existing secrecy boundary.
+- Fixed `/mcp add`/`remove` throwing an earlier unrelated settings write failure as if it were the command's own.
+- Fixed `/compact` and `/refine` bare-executing when picked from the autocomplete popup with Enter (they now insert for an argument first).
+- Fixed extension `overlayOptions` functions being evaluated only once instead of live.
+- Fixed a leaked nested selector overlay (and hijacked focus) when an OAuth login fails or is cancelled mid-select.
+- Fixed the OAuth nested-select flow leaving the login dialog hidden when the selector fails to open.
+- Fixed the settings panel hardcoding 10 visible rows regardless of terminal height, and submenus ignoring the back key.
+- Fixed skills with whitespace/control-character names loading unusable (they are now refused with an error diagnostic; charset deviations stay warnings).
+- Fixed extension-provided bash output (`user_bash` result) bypassing output sanitization before reaching panes and the transcript.
+- Fixed the kernel bootstrap failure box rendering its own `<ipython_bootstrap_failed>` wrapper tags.
+- Fixed daemon `pasteToEditor` replacing the whole draft; it now inserts at the cursor like a paste (the wire flag is additive; older clients keep the previous replace behavior).
+- Fixed external editor commands (`$VISUAL`/`$EDITOR`) splitting on raw spaces (quoted paths with spaces work now) and failing silently when the editor cannot start.
+- Fixed unsanitized text reaching the screen in the memory-deleted view, the /fork message picker, queued user bubbles, the turn-strip change paths, the splash's recent-session title (also no longer cut mid-emoji), and the Herdr pane error report (also length-capped).
+- Removed the dead `McpManager.listStatus()` API and the dead `ThemeSelectorComponent` module.
+- Fixed the duty log's "last doing", "possibly unfinished" and "needs your decision" lines replaying escape sequences the model's final answer carried; the model text is now washed at the source, for the pinned block and the resume briefing alike.
+- Fixed snapshot notices hiding a user's own underscore-prefixed variables (`_cache` and friends) from the compaction/restore "not saved" warnings, so a name that will silently vanish on restart is now reported.
+- Fixed json-mode print runs that ended on a subagent failure exiting 0: they now exit 1 and emit a structured `run_outcome` event with reason `rlm_child_failure`.
+- Fixed the tool-not-found breaker's terminal failure killing an active goal as an unrecoverable error: the goal is now parked with the breaker's explanation and `/goal resume` works after switching models.
+- Fixed the self-recovery finish gate losing its cell write-signal when the display-only changeTracking.enabled setting was off: a live finish gate now keeps the kernel change tracker installed regardless of the display setting.
+- Fixed a quota-parked task being silently dropped (no wake, no record) when branch navigation cancelled its wake and the wake time had already passed by the time the user returned: the park is now restored and its wake rebuilt.
+- Fixed an expanded ipython error cell replaying the raw escape sequences a traceback line carried (an OSC 52 could write the clipboard on every repaint); traceback rows now wash through the same normalizer as the cell's other output faces.
+- Tightened the pre-push secret scan's email exemptions to positional shapes: an email that merely shares a line with a URL, or whose colon opens prose instead of an scp path, is now refused instead of silently passing.
+- Fixed the /settings auto-compact toggle silently not sticking when the project's settings.json pinned the same compaction key: the row now carries the same "pinned by project settings.json" hint as every other project-pinned item.
+- Fixed a subagent whose session name has consecutive spaces (or was withheld as secret-shaped) leaving a forever-running ghost row beside the snapshot's real row: the timeline now keys the spawn row by the kernel-recorded session name, falling back to the display label as before.
+- Fixed an extension overlayOptions factory that throws no longer crashing the render loop: the overlay degrades to its last known options and the error is shown once.
+- Fixed a subagent report held between turns being counted into the next session's first-turn comm count after a session switch, keeping the live and replayed counts equal.
+- Fixed exported HTML loading remote images written as single-slash or colon-only scheme URLs, restoring the open-without-phoning-home guarantee.
+- Fixed long notes taxing every frame of a live turn: the grapheme-safe line cut now seeks its boundary directly instead of segmenting the whole prefix, so a turn with a hundred long notes draws a frame in well under a millisecond again instead of tens of milliseconds.
+- Fixed streaming child-answer previews cutting emoji and other multi-unit characters in half and diverging from the settled preview.
+- Added the ← back key to the remaining selectors: the /fork message picker, the thinking-level selector, and the show-images picker now close on ← like Esc.
+- Esc now cancels a pending agents-view delete confirmation instead of exiting the whole view behind it.
+- A daemon restart no longer flashes a named, empty session as live in the agents view while worker adoption settles.
+- Child-agent snapshots no longer attach a live session from a different parent that happened to mint the same child id.
+- Fixed the session-tree search backspace deleting half of an emoji query character, which left the U+FFFD glyph on the search line.
+
 ## [0.11.20] - 2026-10-04
 
 - Added a pre-push sensitive-info scan (stage 3 of `.husky/pre-push`, also wired into `npm run check`): a push is refused when a commit it would newly publish carries email addresses, account/org UUIDs, or key-shaped secrets (sk-\*, AKIA/ASIA, GitHub/GitLab tokens, JWT, PEM, …) in its message or added diff lines, with a `secret-scan: allow` inline marker for deliberate documentation and `PRIME_AGENT_ALLOW_SECRET_PUSH=1` as the one-push escape hatch.

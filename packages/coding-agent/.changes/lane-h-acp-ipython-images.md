@@ -1,1 +1,0 @@
-- Fixed ACP mode stripping the images a Python cell produced; they now ride along as standard image content blocks on the tool call update instead of being dropped.

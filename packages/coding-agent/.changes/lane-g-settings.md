@@ -1,5 +1,0 @@
-- Fixed `/settings` crashing on hand-edited non-string settings values (e.g. `theme: 42`): malformed values now read as unset/default instead of throwing in the panel render.
-- Added an in-session notice when settings.json is edited by hand while a session runs: the reload (or its parse error) is now drained and shown instead of applying in silence.
-- Added a hint on `/settings` rows whose value is pinned by the project settings.json, so toggling them no longer silently writes only the global file.
-- Fixed `prime-agent config` treating a typed space in the filter box as a toggle that silently rewrote settings.json on disk; Enter now toggles.
-- Fixed `prime-agent config` hiding write failures: a failed toggle now renders a save-failure line instead of silently flipping the checkbox.

@@ -1,1 +1,0 @@
-- Hardened the extension trust gate's upgrade grandfathering: prior-session evidence is now read only from the agent directory's own sessions store, so a project's settings can no longer redirect the evidence to repository-controlled transcripts.

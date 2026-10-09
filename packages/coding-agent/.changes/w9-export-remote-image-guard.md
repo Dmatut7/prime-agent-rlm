@@ -1,1 +1,0 @@
-- Fixed exported HTML loading remote images written as single-slash or colon-only scheme URLs, restoring the open-without-phoning-home guarantee.

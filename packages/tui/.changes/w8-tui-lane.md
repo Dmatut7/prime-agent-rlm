@@ -1,3 +1,0 @@
-- Fixed pastes from terminals without bracketed paste collapsing multiple lines into a single editor line (with broken cursor, backspace and wrapping) when a pasted segment was shorter than the bulk-text threshold, such as tab-indented code.
-- Fixed a crash in the window where agents-view hands the terminal to a session view leaving the shell on the alternate screen with the kitty keyboard protocol still enabled (Ctrl+C no longer raising SIGINT).
-- Sped up streaming markdown rendering on long code-heavy answers: the backtick emphasis-mask guard no longer rescans the whole paragraph on every frame while clean.

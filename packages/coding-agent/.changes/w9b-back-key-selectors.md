@@ -1,1 +1,0 @@
-- Added the ← back key to the remaining selectors: the /fork message picker, the thinking-level selector, and the show-images picker now close on ← like Esc.

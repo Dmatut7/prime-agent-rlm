@@ -1,1 +1,0 @@
-- Fixed an expanded ipython error cell replaying the raw escape sequences a traceback line carried (an OSC 52 could write the clipboard on every repaint); traceback rows now wash through the same normalizer as the cell's other output faces.

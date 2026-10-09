@@ -1,1 +1,0 @@
-- Changed the kernel owner watchdog from a 1 Hz kill-0 poll to an OS exit wait (kqueue NOTE_EXIT on macOS/BSD, a pidfd on Linux), so the kernel thread sleeps until the owner actually exits instead of waking every second; where exit notification is unavailable (old Linux, seccomp, pidfd-less CPython) it falls back to a slower poll. Ported from upstream #3229.

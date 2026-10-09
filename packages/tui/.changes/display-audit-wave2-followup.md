@@ -1,1 +1,0 @@
-- Fixed `\begin{array}[t]{…}` and `tabularx` consuming their layout arguments in the wrong order, which leaked "t]cc" into the rendered math.

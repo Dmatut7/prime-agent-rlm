@@ -1,1 +1,0 @@
-- Fixed an extension overlayOptions factory that throws no longer crashing the render loop: the overlay degrades to its last known options and the error is shown once.

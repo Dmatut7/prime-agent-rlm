@@ -1,1 +1,0 @@
-- Fixed the trust prompt's footer hint after the Ctrl+C split: it now shows the dismiss key and a separate "Ctrl+C 退出" label instead of advertising Ctrl+C as cancel.

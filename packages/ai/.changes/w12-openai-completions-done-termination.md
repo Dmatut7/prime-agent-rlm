@@ -1,1 +1,0 @@
-- Fixed openai-completions turns stalling forever when an endpoint (z.ai among them) sends the SSE `data: [DONE]` frame but holds the connection open: the terminal frame now ends the stream and cancels the connection.

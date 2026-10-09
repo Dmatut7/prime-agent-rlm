@@ -1,7 +1,0 @@
-- Fixed the login dialog overflowing stock 24-row terminals and clipping its paste field (the overlay cuts from the bottom, exactly where the input lives): the brand logo block yields to the title pair below 30 rows.
-- Fixed an update relaunch crashing with a stack trace when the supervisor evicts the just-detached empty session between the list and the attach: that race now falls through to creating the session from the file.
-- Fixed model text reaching the terminal carrying injected escapes: the Text renderer now keeps theme colors and hyperlinks but drops clipboard writes (OSC 52), cursor/screen control, and bare control characters — the render-side door the per-call-site cleanups could never fully close.
-- Fixed Ipython cells expanded in legacy mode rendering the entire output body (one keystroke could re-lay thousands of rows and freeze the UI): every non-full face now renders a bounded window.
-- Fixed the footer keeping stale model/context/compaction figures after a resync, and quota-park waits losing their countdown below ~90 columns: the telemetry memo invalidates on every connection snapshot, and the park chip picks the widest form that fits.
-- Fixed diff rows carrying a raw carriage return from CRLF-edited files rewinding the row and garbling everything below it.
-- Fixed the completion list staying open while the caret moves: moving the caret now closes it, so accepting can no longer splice the replacement into a stale prefix position.

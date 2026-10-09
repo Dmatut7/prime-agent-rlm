@@ -1,1 +1,0 @@
-- Fixed long notes taxing every frame of a live turn: the grapheme-safe line cut now seeks its boundary directly instead of segmenting the whole prefix, so a turn with a hundred long notes draws a frame in well under a millisecond again instead of tens of milliseconds.

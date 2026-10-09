@@ -1,1 +1,0 @@
-- Fixed the stale "出错：Cannot list heartbeats while session worker is recovering" diagnostic after a crash auto-recovery: it now clears as soon as the heartbeat list answers again, and the reconnect/closed banner lines speak Chinese instead of mixing in English.

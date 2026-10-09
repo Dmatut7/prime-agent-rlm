@@ -1,1 +1,0 @@
-- Fixed the pre-push secret scan's patch walker: an added diff line whose content begins with `++ ` was misread as a file header, and a `++ /dev/null` content line silently disabled scanning for the rest of that file's added lines.

@@ -1,5 +1,0 @@
-- Fixed the "正在整理" line a skipped or failed auto-compaction left spinning forever: the outcome notice now settles the live row instead of shadowing it.
-- Fixed a leaked one-second "Elapsed" timer from a streaming bash block: replacing or rebuilding the session now stops it instead of repainting the screen every second until exit.
-- Fixed expanded compaction and branch summary cards showing the machine ledger tail (`<fact-appendix>`/`<user-requests>`/`<session-handoff>` JSON); they now show only the narrative summary.
-- Fixed the /model menu inside the config screen on short terminals: help and detail rows now spend the rows below the tab header, so the model list itself stays on screen.
-- Removed dead turn-box row fields (`sub`/`window`) and the dead `running-card`/`turn-footnote` components; no visible change.

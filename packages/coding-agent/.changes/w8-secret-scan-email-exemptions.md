@@ -1,1 +1,0 @@
-- Tightened the pre-push secret scan's email exemptions to positional shapes: an email that merely shares a line with a URL, or whose colon opens prose instead of an scp path, is now refused instead of silently passing.

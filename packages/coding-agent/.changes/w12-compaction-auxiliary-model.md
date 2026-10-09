@@ -1,1 +1,0 @@
-- Changed compaction and branch summarization to run on the configured auxiliary model when one is set, so the session model's prefix cache is no longer evicted (and re-read at full peak-context price) by every compaction; the session model remains the fallback.

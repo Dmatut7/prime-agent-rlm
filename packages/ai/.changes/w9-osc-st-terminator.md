@@ -1,1 +1,0 @@
-- Fixed the persisted error wash deleting diagnostic text after a hyperlink escape in CLI stderr, matching the Python-side washer.

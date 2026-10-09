@@ -1,1 +1,0 @@
-- Fixed vertical cursor movement over a wrapped paste/image marker landing on a wrong line end with a corrupted sticky column, and stopped Ctrl+] from placing the cursor inside an atomic paste/image marker or a hidden prompt prefix, where an edit silently corrupted the marker and lost the pasted content on submit.

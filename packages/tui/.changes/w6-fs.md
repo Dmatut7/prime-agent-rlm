@@ -1,4 +1,0 @@
-- Fixed fullscreen drag-selection dying when the drag sweeps into the blank fill below a short transcript: the fill now extends the selection to the last content row, and a press started in the fill anchors to the nearest content row instead of being discarded.
-- Fixed drag-selecting or copying lines that contain literal tabs in fullscreen: the highlight and the copied text now follow the painted columns (tabs expand to three spaces) instead of shifting past each tab.
-- Fixed overlays (dialogs, popups) not compositing over kitty placeholder image rows, which let image stripes punch through the dialog while clicks still landed on it; a fully covered image now keeps its payload so it reappears intact when the overlay closes.
-- Fixed the autocomplete popup showing only its description tail (zero candidates) when the rows above the input are scarce: clipping now keeps the selected suggestion visible and drops description/scroll-info lines first.

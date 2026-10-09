@@ -1,1 +1,0 @@
-- Fixed a subagent report held between turns being counted into the next session's first-turn comm count after a session switch, keeping the live and replayed counts equal.

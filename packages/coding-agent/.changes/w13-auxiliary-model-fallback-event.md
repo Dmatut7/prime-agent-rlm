@@ -1,1 +1,0 @@
-- Added a visible warning when the configured auxiliary model is unavailable and compaction/refinement falls back to the session model: previously the notice only went to the worker log, so daemon-attached users never saw it and direct mode printed it across the interface.

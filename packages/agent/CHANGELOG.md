@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.11.21] - 2026-10-09
+
+- Fixed the synthesized run-failure message keeping credential material that the diagnostics copy of the same failure already redacted.
+- Fixed proxied streams persisting the proxy server's error text verbatim; it is now redacted, washed of control characters, and bounded in length.
+
 ## [0.11.20] - 2026-10-04
 
 - Changed the tool-not-found breaker: per-name miss counts now decay by one per resolved tool call (new `toolNotFoundBreaker.decayPerResolvedCall`, default 1), so an occasional wrong tool name in a long task no longer accumulates into a run-ending trip; hitting the limit now grants one recovery turn (new `toolNotFoundBreaker.recoveryTurns`, default 1) that a resolved call or clean stop closes with counts reset, and only a relapse inside that turn ends the run. `0` on either knob restores the previous behavior.

@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.11.21] - 2026-10-09
+
+- Fixed Anthropic SSE parse failures pasting the full raw frame (twice, unbounded) into the error message; the message now carries a truncated excerpt and the raw frame stays on the structured diagnostic.
+- Fixed Codex usage-limit errors dropping the friendly plan/reset message and never converting `resets_at` into `retryAfterMs`, so the retry ladder now waits for the stated reset and the error names the plan and reset time.
+- Fixed OAuth login errors (Anthropic, GitHub Copilot, OpenAI Codex) leaking full stack traces and unbounded, unredacted response bodies onto the login overlay; bodies are now redacted and capped, stacks dropped.
+- Fixed openai-completions providers ignoring the `delta.refusal` channel, which misdiagnosed model refusals as empty responses and burned the whole retry ladder; refusals now surface as a classified permanent refusal error with the refusal text.
+- Fixed Anthropic OAuth sessions missing claude-opus-5.5 by bumping the impersonated Claude Code client version to 2.1.281; the API gates new models on the claimed client version (opus-5.5 requires 2.280+).
+- Fixed openai-completions turns stalling forever when an endpoint (z.ai among them) sends the SSE `data: [DONE]` frame but holds the connection open: the terminal frame now ends the stream and cancels the connection.
+- Fixed Bedrock stream failures never reading the HTTP status from the SDK error, so permanent 4xx errors (invalid model, access denied) are no longer retried as transient.
+- Fixed Google/Gemini streams dying on a finish reason the SDK does not know yet; the turn now fails cleanly with the raw reason recorded instead of throwing "Unhandled stop reason".
+- Fixed Bedrock sessions silently dropping provider-encrypted reasoning blocks; they now surface as a marked redacted-thinking block and round-trip on the next turn.
+- Fixed Claude Code turns ending in an unrecognized stop reason being reported as success; they now fail visibly with the raw reason.
+- Fixed the Claude Code failure message quoting raw stderr (including terminal control sequences); the quoted tail is now washed.
+- Fixed Mistral turns with an unknown finish reason being reported as success, and oversized Mistral error bodies being cut mid-emoji into a broken glyph.
+- Fixed OpenAI Responses error events without an error code printing "Error Code null".
+- Fixed OpenAI-compatible providers losing the raw finish_reason on error stops (content_filter, network_error, unknown), so downstream retry classification can see it.
+- Fixed Anthropic SSE `error` frames with unparseable bodies pasting the full frame (up to the whole proxy error page) into the error message; the message now carries a truncated excerpt and the full frame stays on the structured diagnostic.
+- Fixed the persisted error wash deleting diagnostic text after a hyperlink escape in CLI stderr, matching the Python-side washer.
+
 ## [0.11.20] - 2026-10-04
 
 - Fixed cross-model replay after an aborted turn with a model switch: the last completed turn now keeps its full thinking, and the aborted turn's half-formed reasoning is dropped instead of being replayed as plain text.

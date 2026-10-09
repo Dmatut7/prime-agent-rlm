@@ -1,2 +1,0 @@
-- Fixed quiet replay dropping the stored final answer of old subagent no-reply notices written before the `lastAssistantTextPreview` rename; the legacy field is read as a fallback.
-- Fixed one malformed stored message (e.g. a custom message without content) crashing every replay of its session with a bare TypeError, which made the session impossible to open or attach: replay now skips the bad message with a visible warning, renders the damaged custom message as a marked-malformed row, and the write side refuses to persist a malformed custom message.

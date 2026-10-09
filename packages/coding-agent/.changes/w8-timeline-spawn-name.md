@@ -1,1 +1,0 @@
-- Fixed a subagent whose session name has consecutive spaces (or was withheld as secret-shaped) leaving a forever-running ghost row beside the snapshot's real row: the timeline now keys the spawn row by the kernel-recorded session name, falling back to the display label as before.

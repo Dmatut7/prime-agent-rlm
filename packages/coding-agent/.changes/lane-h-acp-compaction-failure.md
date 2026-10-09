@@ -1,1 +1,0 @@
-- Fixed ACP compaction updates dropping the failure fields; an aborted or failed compaction now reports `aborted`, `willRetry`, `errorMessage`, and `errorSeverity` instead of an empty success payload.

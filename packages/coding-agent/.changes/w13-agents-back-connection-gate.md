@@ -1,1 +1,0 @@
-- Fixed the agents-view key (left arrow / session list) killing the TUI with a raw Node stack after the daemon was shut down: a down connection now refuses the list switch with a status line, and a list that cannot start exits with a clean message instead of an unhandled error.

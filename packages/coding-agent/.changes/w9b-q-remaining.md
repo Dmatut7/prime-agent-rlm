@@ -1,3 +1,0 @@
-- Esc now cancels a pending agents-view delete confirmation instead of exiting the whole view behind it.
-- A daemon restart no longer flashes a named, empty session as live in the agents view while worker adoption settles.
-- Child-agent snapshots no longer attach a live session from a different parent that happened to mint the same child id.

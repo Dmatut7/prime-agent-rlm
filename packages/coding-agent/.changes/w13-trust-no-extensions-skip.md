@@ -1,1 +1,0 @@
-- Fixed --no-extensions still showing the project-extension trust prompt: runs with extensions disabled skip the dialog, the refusal notice, and the in-app not-trusted warning, since the answer cannot change that run.

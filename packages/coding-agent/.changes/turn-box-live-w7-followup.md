@@ -1,1 +1,0 @@
-- Fixed the lost-connection turn drawing each failure's own sentence a second time as an opened detail when its box opened: a detail that only repeats the row (the row's facts, or a one-line error's own tail) no longer auto-opens.

@@ -1,2 +1,0 @@
-- Fixed `prime-agent rename <name>` failing for idle-passivated subagent sessions shown in `prime-agent list` with an opaque internal UUID error; the daemon now forwards the caller's own selector and hydrates the session to apply the rename.
-- Fixed `prime-agent schedule add <name> ...` failing for idle-passivated subagent sessions; the target session is hydrated so the job registers against it.
