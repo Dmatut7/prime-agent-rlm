@@ -1,0 +1,1 @@
+- Changed the goal status surfaces to Chinese like the rest of the UI: the tray reads 目标进行中（1m 05s）, the pause notice 目标已暂停（/goal resume 恢复）, and the /goal reply 无活跃目标。

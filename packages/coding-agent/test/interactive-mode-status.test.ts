@@ -4815,7 +4815,7 @@ describe("InteractiveMode tray goal label", () => {
 			settingsManager: { getFooterTelemetry: () => "on" },
 		};
 
-		expect(getTrayStatusLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
+		expect(getTrayStatusLabel.call(fakeThis)).toBe("目标进行中（1m 05s）");
 	});
 
 	test("keeps context figures off the tray label while the footer watermark is on", () => {
@@ -4847,7 +4847,7 @@ describe("InteractiveMode tray goal label", () => {
 		};
 
 		// U6 single source: the watermark line carries the figures, not the tray.
-		expect(getTrayStatusLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
+		expect(getTrayStatusLabel.call(fakeThis)).toBe("目标进行中（1m 05s）");
 	});
 
 	test("combines goals, heartbeats, depth, and the snapshot fallback while the watermark is off", () => {
@@ -4881,7 +4881,7 @@ describe("InteractiveMode tray goal label", () => {
 			snapshot: { modelName: "bailian/glm-5.3-prime", contextTokens: 75_000, contextWindow: 100_000 },
 		};
 
-		expect(getTrayStatusLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 1 heartbeat · 深度 1 · 75k/100k (75%)");
+		expect(getTrayStatusLabel.call(fakeThis)).toBe("目标进行中（1m 05s） · 1 heartbeat · 深度 1 · 75k/100k (75%)");
 	});
 
 	test("omits the usage segment when token count is unknown", () => {
@@ -4907,7 +4907,7 @@ describe("InteractiveMode tray goal label", () => {
 			settingsManager: { getFooterTelemetry: () => "on" },
 		};
 
-		expect(getTrayStatusLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
+		expect(getTrayStatusLabel.call(fakeThis)).toBe("目标进行中（1m 05s）");
 	});
 });
 

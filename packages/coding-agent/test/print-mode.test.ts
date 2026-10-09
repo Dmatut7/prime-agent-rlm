@@ -187,7 +187,7 @@ describe("runPrintMode", () => {
 	});
 
 	it("prints successful session command results in text mode", async () => {
-		const result = createSessionSlashCommandResultMessage("No active goal.", {
+		const result = createSessionSlashCommandResultMessage("无活跃目标。", {
 			command: { name: "goal", args: "status", text: "/goal status" },
 			success: true,
 			severity: "info",
@@ -200,11 +200,11 @@ describe("runPrintMode", () => {
 		});
 
 		expect(exitCode).toBe(0);
-		expect(output.write).toHaveBeenCalledWith("No active goal.\n");
+		expect(output.write).toHaveBeenCalledWith("无活跃目标。\n");
 	});
 
 	it("prints a session command result before a trailing compaction outcome", async () => {
-		const result = createSessionSlashCommandResultMessage("No active goal.", {
+		const result = createSessionSlashCommandResultMessage("无活跃目标。", {
 			command: { name: "goal", args: "status", text: "/goal status" },
 			success: true,
 			severity: "info",
@@ -222,7 +222,7 @@ describe("runPrintMode", () => {
 		});
 
 		expect(exitCode).toBe(0);
-		expect(output.write).toHaveBeenCalledWith("No active goal.\n");
+		expect(output.write).toHaveBeenCalledWith("无活跃目标。\n");
 		expect(errorSpy).toHaveBeenCalledWith("Requested compaction skipped");
 	});
 

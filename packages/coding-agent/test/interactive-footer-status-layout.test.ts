@@ -263,12 +263,12 @@ describe("U6 status area layout", () => {
 
 		// ①'s left side carries goal/heartbeat while they run (K3 S3).
 		const withGoal = new TrayInfoLine(
-			() => "Pursuing goal (12m) · 2 heartbeats · 深度 0",
+			() => "目标进行中（12m） · 2 heartbeats · 深度 0",
 			() => ["Ctrl+O 过程"],
 			() => undefined,
 		);
 		const goalLine = stripAnsi(withGoal.render(110).join("\n"));
-		expect(goalLine.startsWith(" Pursuing goal (12m) · 2 heartbeats · 深度 0")).toBe(true);
+		expect(goalLine.startsWith(" 目标进行中（12m） · 2 heartbeats · 深度 0")).toBe(true);
 		expect(goalLine.endsWith("Ctrl+O 过程 ")).toBe(true);
 
 		// Nothing to say: the line renders nothing at all.

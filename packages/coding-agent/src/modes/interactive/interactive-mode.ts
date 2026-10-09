@@ -8111,32 +8111,32 @@ export class InteractiveMode {
 
 	private formatGoalStatus(goal: GoalState): string {
 		const usage = formatGoalUsage(goal);
-		const usageText = usage ? ` (${usage})` : "";
+		const usageText = usage ? `（${usage}）` : "";
 		switch (goal.status) {
 			case "idle":
-				return "No active goal";
+				return "无活跃目标";
 			case "active":
 				return goal.objective
-					? `Goal${this.formatGoalDetailSuffix(goal.objective, visibleWidth("Goal"))}`
-					: "Pursuing goal";
+					? `目标${this.formatGoalDetailSuffix(goal.objective, visibleWidth("目标"))}`
+					: "目标进行中";
 			case "paused":
 				return goal.lastReason
-					? `Goal paused${this.formatGoalDetailSuffix(goal.lastReason, visibleWidth("Goal paused"))}`
-					: "Goal paused (/goal resume)";
+					? `目标已暂停${this.formatGoalDetailSuffix(goal.lastReason, visibleWidth("目标已暂停"))}`
+					: "目标已暂停（/goal resume 恢复）";
 			case "budget_limited":
 				if (goal.lastReason) {
-					const prefix = `Goal budget limited${usageText}`;
+					const prefix = `目标预算受限${usageText}`;
 					return prefix + this.formatGoalDetailSuffix(goal.lastReason, visibleWidth(prefix));
 				}
-				return `Goal budget limited${usageText}`;
+				return `目标预算受限${usageText}`;
 			case "complete":
 				return goal.lastReason
-					? `Goal complete${this.formatGoalDetailSuffix(goal.lastReason, visibleWidth("Goal complete"))}`
-					: "Goal complete";
+					? `目标已完成${this.formatGoalDetailSuffix(goal.lastReason, visibleWidth("目标已完成"))}`
+					: "目标已完成";
 			case "error":
 				return goal.lastError
-					? `Goal error${this.formatGoalDetailSuffix(goal.lastError, visibleWidth("Goal error"))}`
-					: "Goal error";
+					? `目标出错${this.formatGoalDetailSuffix(goal.lastError, visibleWidth("目标出错"))}`
+					: "目标出错";
 			default: {
 				const _exhaustive: never = goal.status;
 				return _exhaustive;
@@ -8153,7 +8153,7 @@ export class InteractiveMode {
 		if (availableWidth < 8) {
 			return "";
 		}
-		return `: ${truncateToWidth(detail, availableWidth)}`;
+		return `：${truncateToWidth(detail, availableWidth)}`;
 	}
 
 	private seedSubagentSummary(children: readonly AgentConnectionRlmChildAgentSnapshot[] | undefined): void {
@@ -9132,11 +9132,11 @@ export class InteractiveMode {
 		const goal = this.getGoalState();
 		switch (goal.status) {
 			case "active":
-				return `Pursuing goal (${this.formatGoalElapsed(goal.timeUsedSeconds)})`;
+				return `目标进行中（${this.formatGoalElapsed(goal.timeUsedSeconds)}）`;
 			case "paused":
-				return `Goal paused (${this.formatGoalElapsed(goal.timeUsedSeconds)})`;
+				return `目标已暂停（${this.formatGoalElapsed(goal.timeUsedSeconds)}）`;
 			case "budget_limited":
-				return `Goal budget limited (${this.formatGoalElapsed(goal.timeUsedSeconds)})`;
+				return `目标预算受限（${this.formatGoalElapsed(goal.timeUsedSeconds)}）`;
 			case "idle":
 			case "complete":
 			case "error":

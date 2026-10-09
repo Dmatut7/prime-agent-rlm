@@ -222,6 +222,7 @@ import {
 	type GoalContextDetails,
 	type GoalHostResponse,
 	type GoalState,
+	type GoalStatus,
 	goalContinuationLimit,
 	goalHostResponse,
 	goalTokenDeltaForUsage,
@@ -10112,12 +10113,22 @@ export class AgentSession {
 					displayResult = false;
 					break;
 				}
-				case "goal":
+				case "goal": {
+					// Display-only status words for the /goal reply; the wire enum stays English.
+					const statusText: Record<GoalStatus, string> = {
+						active: "进行中",
+						paused: "已暂停",
+						budget_limited: "预算受限",
+						complete: "已完成",
+						error: "出错",
+						idle: "空",
+					};
 					await this._handleGoalSlashCommand(input.text, input.images);
 					resultText = this._goalState.objective
-						? `Goal ${this._goalState.status}: ${this._goalState.objective}`
-						: "No active goal.";
+						? `目标（${statusText[this._goalState.status]}）：${this._goalState.objective}`
+						: "无活跃目标。";
 					break;
+				}
 				case "autonomous":
 					await this._handleAutonomousSlashCommand(input.text);
 					break;
