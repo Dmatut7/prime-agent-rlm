@@ -1,0 +1,1 @@
+- Raised the Codex client version reported on model discovery to 0.159.0, matching the current stable Codex CLI, so catalog-gated models (GPT-6 Sol and Luna) are no longer hidden from subagent delegation and `find_models()`.

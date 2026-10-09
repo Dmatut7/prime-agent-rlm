@@ -82,7 +82,10 @@ function getCacheControl(
 }
 
 // Stealth mode: Mimic Claude Code's tool naming exactly
-const claudeCodeVersion = "2.1.261";
+// The API gates new models by the claimed client version (opus-5.5 requires >= 2.280;
+// upstream #2645 tracks each bump), so this must stay at least as high as the oldest
+// build the server still serves every current model to.
+const claudeCodeVersion = "2.1.281";
 
 // Claude Code 2.x tool names (canonical casing)
 // Source: https://cchistory.mariozechner.at/data/prompts-2.1.11.md

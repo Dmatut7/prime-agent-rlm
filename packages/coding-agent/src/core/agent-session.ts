@@ -382,12 +382,14 @@ import {
 import {
 	type AutoRefineReviewer,
 	type AutoRefineReviewRequest,
+	type AuxiliaryModelAuth,
 	applyRefine,
 	emitRefineFailed,
 	planRefine,
 	RefinePersistScopeError,
 	RefineSkippedError,
 	refine,
+	resolveAuxiliaryModel,
 	runAutoRefineReview,
 	waitForRefineIdle,
 } from "./refine-execution.js";
@@ -12244,9 +12246,9 @@ export class AgentSession {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			const { apiKey, headers, requestModel } = await this._getRequiredRequestAuth(this.model);
+			const { model, apiKey, headers } = await this._summarizerAuth("compaction");
 			const result = await this._performCompaction({
-				model: requestModel,
+				model,
 				apiKey,
 				headers,
 				customInstructions: effectiveCustomInstructions,
@@ -12387,6 +12389,25 @@ export class AgentSession {
 	 * skill. Throws CompactionSkippedError when there is nothing to compact and
 	 * Error("Compaction cancelled") on abort or extension cancel.
 	 */
+	/**
+	 * Wire credentials for a manual compaction or branch-summary call: the
+	 * configured auxiliary model when it is set and usable, else the session
+	 * model. These calls run with their own prompt shapes, so issuing them on
+	 * the session model evicts the provider's prefix-cache entry for the
+	 * session and forces a full context re-read on the next session request -
+	 * at the context peak for compaction. The auto-compaction path resolves
+	 * the same routing inline because it owns its session-auth failure
+	 * handling. Callers must guarantee a session model first.
+	 */
+	private async _summarizerAuth(purpose: string): Promise<AuxiliaryModelAuth> {
+		const auxiliary = await resolveAuxiliaryModel(this, purpose);
+		if (auxiliary) {
+			return auxiliary;
+		}
+		const { apiKey, headers, requestModel } = await this._getRequiredRequestAuth(this.model!);
+		return { model: requestModel, apiKey, headers };
+	}
+
 	private async _performCompaction(options: {
 		model: Model<any>;
 		apiKey: string;
@@ -13550,10 +13571,11 @@ export class AgentSession {
 				return false;
 			}
 
+			const auxiliary = await resolveAuxiliaryModel(this, "compaction");
 			const result = await this._performCompaction({
-				model: authResult.requestModel ?? this.model,
-				apiKey: authResult.apiKey,
-				headers: authResult.headers,
+				model: auxiliary?.model ?? authResult.requestModel ?? this.model,
+				apiKey: auxiliary?.apiKey ?? authResult.apiKey,
+				headers: auxiliary?.headers ?? authResult.headers,
 				customInstructions,
 				signal: autoCompactionAbort.signal,
 			});
@@ -18061,7 +18083,7 @@ export class AgentSession {
 			let summaryDetails: unknown;
 			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
-				const { apiKey, headers, requestModel: model } = await this._getRequiredRequestAuth(this.model!);
+				const { model, apiKey, headers } = await this._summarizerAuth("branch summarization");
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
 				const result = await generateBranchSummary(entriesToSummarize, {
 					model,

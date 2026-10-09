@@ -313,17 +313,33 @@ export function recordRefinementFailureReceipt(
  * request. Route them to the configured auxiliary model when it is set and
  * usable; fall back to the session model otherwise.
  */
-export async function resolveRefinementModel(
+
+/** The auxiliary model's wire credentials, when the selector resolves to a usable model. */
+export interface AuxiliaryModelAuth {
+	model: Model<Api>;
+	apiKey: string;
+	headers?: Record<string, string>;
+}
+
+/**
+ * Resolve the configured auxiliary model for an off-session wire call
+ * (refinement, compaction, branch summarization). Returns undefined when the
+ * session model should be used instead: no selector configured, the selector
+ * names the session model itself, or the selected model is unusable (only that
+ * case warns; error details from the auth stack can embed credential
+ * material, so only the selector is logged).
+ */
+export async function resolveAuxiliaryModel(
 	host: RefineExecutionHost,
-): Promise<{ model: Model<Api>; apiKey: string; headers?: Record<string, string> } | undefined> {
+	purpose: string,
+): Promise<AuxiliaryModelAuth | undefined> {
 	const sessionModel = host.model;
 	if (!sessionModel) {
 		return undefined;
 	}
 	const selector = host.settingsManager.getAuxiliaryModel()?.trim().toLowerCase();
 	if (!selector || `${sessionModel.provider}/${sessionModel.id}`.toLowerCase() === selector) {
-		const { apiKey, headers, requestModel } = await host._getRequiredRequestAuth(sessionModel);
-		return { model: requestModel, apiKey, headers };
+		return undefined;
 	}
 	try {
 		const model = (await host._authenticatedRlmModels()).find(
@@ -335,12 +351,24 @@ export async function resolveRefinementModel(
 		const { apiKey, headers, requestModel } = await host._getRequiredRequestAuth(model);
 		return { model: requestModel, apiKey, headers };
 	} catch {
-		// Error details from the auth stack can embed credential material, so only
-		// the selector is logged (CodeQL js/clear-text-logging).
-		console.warn(`Warning: auxiliaryModel "${selector}" unusable for refinement; using the session model.`);
-		const { apiKey, headers, requestModel } = await host._getRequiredRequestAuth(sessionModel);
-		return { model: requestModel, apiKey, headers };
+		console.warn(`Warning: auxiliaryModel "${selector}" unusable for ${purpose}; using the session model.`);
+		return undefined;
 	}
+}
+
+export async function resolveRefinementModel(
+	host: RefineExecutionHost,
+): Promise<{ model: Model<Api>; apiKey: string; headers?: Record<string, string> } | undefined> {
+	const sessionModel = host.model;
+	if (!sessionModel) {
+		return undefined;
+	}
+	const auxiliary = await resolveAuxiliaryModel(host, "refinement");
+	if (auxiliary) {
+		return auxiliary;
+	}
+	const { apiKey, headers, requestModel } = await host._getRequiredRequestAuth(sessionModel);
+	return { model: requestModel, apiKey, headers };
 }
 
 export async function runAutoRefineReview(

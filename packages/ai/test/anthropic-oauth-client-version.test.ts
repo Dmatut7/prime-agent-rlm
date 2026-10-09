@@ -4,7 +4,9 @@
  * Anthropic rejects OAuth traffic from client builds that fall too far behind,
  * and the version lives only as a literal in providers/anthropic.ts - there is
  * no runtime oracle for "current". Upstream 2.1.257 was stale here while
- * upstream moved to 2.1.261 (a062ed221 / #2069).
+ * upstream moved to 2.1.261 (a062ed221 / #2069); #2645 then raised it to
+ * 2.1.281 because the API gates new models by the claimed client version
+ * (claude-opus-5.5 requires >= 2.280), so an older pin hides the model.
  */
 import { describe, expect, it, vi } from "vitest";
 import { getModel } from "../src/models.js";
@@ -42,8 +44,8 @@ vi.mock("@anthropic-ai/sdk", () => {
 	return { default: FakeAnthropic };
 });
 
-/** Floor from upstream a062ed221; anything older is a regression, not a choice. */
-const MINIMUM_CLAUDE_CODE_VERSION = "2.1.261";
+/** Floor from upstream #2645: the API gates new models (opus-5.5 needs >= 2.280) by the claimed client version. */
+const MINIMUM_CLAUDE_CODE_VERSION = "2.1.280";
 
 function compareDottedVersions(left: string, right: string): number {
 	const a = left.split(".").map((part) => Number.parseInt(part, 10));

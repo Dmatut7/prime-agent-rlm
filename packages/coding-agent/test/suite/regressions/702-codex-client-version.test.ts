@@ -64,9 +64,11 @@ describe("issue #702 codex model discovery client version", () => {
 		// Prime Agent's own version is 0.x well below this floor, so this assertion fails on the
 		// unfixed source. Comparing against VERSION directly would pass today and break silently
 		// once the lockstep package version reaches the pinned constant.
+		// Floor from upstream #3146: ChatGPT gates model discovery by the claimed client
+		// version, and 0.153.x hides GPT-6 Sol/Luna from find_models() (official pins 0.159.0).
 		expect(clientVersion).toMatch(/^\d+\.\d+\.\d+$/);
 		const [major, minor] = (clientVersion ?? "0.0.0").split(".").map(Number);
-		expect((major ?? 0) > 0 || (minor ?? 0) >= 144).toBe(true);
+		expect((major ?? 0) > 0 || (minor ?? 0) >= 159).toBe(true);
 
 		expect(executable.some((model) => model.provider === "openai-codex")).toBe(true);
 	});

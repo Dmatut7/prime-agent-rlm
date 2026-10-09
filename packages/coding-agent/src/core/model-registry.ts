@@ -457,9 +457,11 @@ function readOpenAICodexAccountId(token: string): string | undefined {
  * through `getExecutableModels()` and lose the model, while `/model` reads the unfiltered `getAvailable()`
  * and keeps offering it.
  *
- * Catalog behaviour measured 2026-08-13; see #702.
+ * Catalog behaviour measured 2026-08-13 (#702: 0.153.x lists GPT-6 Astra) and 2026-09-24
+ * (#2544: 0.155.x and up also lists GPT-6 Sol and Luna); the constant tracks the current
+ * stable Codex CLI release (upstream #3146 pinned 0.159.0 in v0.9.8).
  */
-const OPENAI_CODEX_CLIENT_VERSION = "0.153.4";
+const OPENAI_CODEX_CLIENT_VERSION = "0.159.0";
 
 function openAICodexModelsUrl(baseUrl: string): string {
 	const normalized = baseUrl.replace(/\/+$/, "");

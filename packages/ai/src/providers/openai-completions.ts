@@ -506,12 +506,14 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				options?.headers,
 				cacheSessionId,
 				compat,
-				createRetryCapFetch({
-					maxRetryDelayMs: options?.maxRetryDelayMs,
-					onProviderRetry: options?.onProviderRetry,
-					requestBudget: options?.requestBudget,
-					onProviderRequestAttempt: options?.onProviderRequestAttempt,
-				}),
+				withSseDoneTermination(
+					createRetryCapFetch({
+						maxRetryDelayMs: options?.maxRetryDelayMs,
+						onProviderRetry: options?.onProviderRetry,
+						requestBudget: options?.requestBudget,
+						onProviderRequestAttempt: options?.onProviderRequestAttempt,
+					}),
+				),
 			);
 			let params = buildParams(model, context, options, compat, cacheRetention, cacheControl);
 			const nextParams = await options?.onPayload?.(params, model);
@@ -820,6 +822,77 @@ export const streamSimpleOpenAICompletions: StreamFunction<"openai-completions",
 		toolChoice,
 	} satisfies OpenAICompletionsOptions);
 };
+
+type SdkFetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+/**
+ * The SSE terminal frame (`data: [DONE]`) as it appears on the wire: a data line
+ * whose value is exactly `[DONE]`, at a line start, ended by a line break or the
+ * end of what has arrived so far. The same condition the OpenAI SDK itself uses
+ * (`sse.data.startsWith('[DONE]')`), tightened to a full line.
+ */
+const SSE_DONE_FRAME = /(?:^|\r?\n)data:[ \t]*\[DONE\](?=\r?\n|$)/;
+/** Rolling scan window; only the marker pattern can straddle a chunk boundary. */
+const SSE_DONE_SCAN_BYTES = 32;
+
+/**
+ * Wrap the streaming fetch so the terminal `data: [DONE]` frame ends the body.
+ *
+ * The OpenAI SDK's stream iterator swallows the frame and keeps reading until
+ * body EOF (core/streaming.js: `sse.data.startsWith('[DONE]')` sets its internal
+ * done flag and `continue`s), so a server that holds the connection open after
+ * the frame - z.ai does - parks the chunk loop forever with the completion
+ * already parsed on the wire. The wrapper passes every byte through unchanged;
+ * when the terminal frame is seen, the readable side is closed (the SDK sees a
+ * clean body end and the chunk loop exits) and the underlying connection is
+ * cancelled instead of lingering.
+ */
+function withSseDoneTermination(fetchImpl: SdkFetch): SdkFetch {
+	return async (input, init) => {
+		const response = await fetchImpl(input, init);
+		if (!response.body) return response;
+		const source = response.body.getReader();
+		const decoder = new TextDecoder();
+		let scan = "";
+		let terminal = false;
+		const monitored = new ReadableStream<Uint8Array>({
+			async pull(controller) {
+				if (terminal) {
+					controller.close();
+					return;
+				}
+				try {
+					const result = await source.read();
+					if (result.done) {
+						controller.close();
+						return;
+					}
+					controller.enqueue(result.value);
+					scan = (scan + decoder.decode(result.value, { stream: true })).slice(-SSE_DONE_SCAN_BYTES);
+					if (SSE_DONE_FRAME.test(scan)) {
+						terminal = true;
+						controller.close();
+						source.cancel().catch(() => {
+							// The provider's socket is already gone; the readable side is closed.
+						});
+					}
+				} catch (error) {
+					controller.error(error);
+				}
+			},
+			cancel(reason) {
+				source.cancel(reason).catch(() => {
+					// Cancellation races a connection the provider may have torn down first.
+				});
+			},
+		});
+		return new Response(monitored, {
+			status: response.status,
+			statusText: response.statusText,
+			headers: response.headers,
+		});
+	};
+}
 
 function createClient(
 	model: Model<"openai-completions">,
