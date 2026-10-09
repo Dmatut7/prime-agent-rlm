@@ -1,0 +1,1 @@
+- Fixed rapid arrow-key navigation in the settings list teleporting back to the top: a burst that outruns the item count now rests on the first/last item instead of wrapping around.

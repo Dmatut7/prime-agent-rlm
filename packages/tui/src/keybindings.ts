@@ -52,6 +52,13 @@ export interface Keybindings {
 	 * KeybindingsManager without importing the app package.
 	 */
 	"app.stall.diagnostics": true;
+	/**
+	 * App-level "left goes back" action. Declared here for the same reason as
+	 * app.stall.diagnostics: the tui-side SettingsList matches it through the
+	 * global KeybindingsManager so left closes the panel like every selector
+	 * submenu, without importing the app package.
+	 */
+	"app.modal.back": true;
 }
 
 export type Keybinding = keyof Keybindings;
@@ -269,6 +276,10 @@ export const TUI_KEYBINDINGS = {
 	"app.stall.diagnostics": {
 		defaultKeys: "ctrl+y",
 		description: "Show or close the stall diagnostics for the current turn",
+	},
+	"app.modal.back": {
+		defaultKeys: "left",
+		description: "Go back / close the current dialog",
 	},
 } as const satisfies KeybindingDefinitions;
 

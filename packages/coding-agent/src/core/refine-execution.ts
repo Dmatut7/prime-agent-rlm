@@ -326,8 +326,8 @@ export interface AuxiliaryModelAuth {
  * (refinement, compaction, branch summarization). Returns undefined when the
  * session model should be used instead: no selector configured, the selector
  * names the session model itself, or the selected model is unusable (only that
- * case warns; error details from the auth stack can embed credential
- * material, so only the selector is logged).
+ * case emits an auxiliary_model_fallback event; error details from the auth
+ * stack can embed credential material, so only the selector is reported).
  */
 export async function resolveAuxiliaryModel(
 	host: RefineExecutionHost,
@@ -351,7 +351,11 @@ export async function resolveAuxiliaryModel(
 		const { apiKey, headers, requestModel } = await host._getRequiredRequestAuth(model);
 		return { model: requestModel, apiKey, headers };
 	} catch {
-		console.warn(`Warning: auxiliaryModel "${selector}" unusable for ${purpose}; using the session model.`);
+		// UI-visible fallback disclosure (W13 item 12): a console.warn was invisible
+		// to an attached client in daemon mode and corrupted the TUI frame in direct
+		// mode. The event rides the same channel every other settings-class warning
+		// uses; the fallback itself still returns undefined (session model).
+		host._emit({ type: "auxiliary_model_fallback", purpose, selector });
 		return undefined;
 	}
 }

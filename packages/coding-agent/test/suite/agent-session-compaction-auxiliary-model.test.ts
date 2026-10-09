@@ -124,4 +124,25 @@ describe("AgentSession compaction auxiliary model", () => {
 		});
 		expect(result.summaryEntry?.summary).toContain("aux-generated summary");
 	});
+
+	it("warns on the UI-visible channel and still compacts when the auxiliary model is unusable", async () => {
+		// W13 item 12: the fallback used to be a console.warn only, invisible to
+		// an attached client in daemon mode and corrupting the TUI frame in
+		// direct mode. The fallback itself must keep its semantics: compaction
+		// continues on the session model.
+		const harness = await createCompactionHarness({ auxiliaryModel: "faux/missing-model" });
+		await promptTwoTurns(harness);
+
+		const result = await harness.session.compact();
+
+		const fallbackEvents = harness.eventsOfType("auxiliary_model_fallback");
+		expect(fallbackEvents).toHaveLength(1);
+		expect(fallbackEvents[0]).toMatchObject({ purpose: "compaction", selector: "faux/missing-model" });
+		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+		expect(completeSimpleMock.mock.calls[0][0]).toMatchObject({
+			provider: "faux",
+			id: "session-model",
+		});
+		expect(result.summary).toContain("aux-generated summary");
+	});
 });

@@ -1,5 +1,5 @@
 import { fuzzyFilter } from "../fuzzy.js";
-import { getKeybindings } from "../keybindings.js";
+import { getKeybindings, type KeybindingsManager } from "../keybindings.js";
 import type { Component } from "../tui.js";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../utils.js";
 import { Input } from "./input.js";
@@ -48,6 +48,8 @@ export class SettingsList implements Component {
 	private onCancel: () => void;
 	private searchInput?: Input;
 	private searchEnabled: boolean;
+	/** The query the current filteredItems/selectedIndex were computed for. */
+	private appliedQuery = "";
 	private formatValue: (value: string) => string;
 
 	private submenuComponent: Component | null = null;
@@ -180,10 +182,14 @@ export class SettingsList implements Component {
 		const displayItems = this.searchEnabled ? this.filteredItems : this.items;
 		if (kb.matches(data, "tui.select.up")) {
 			if (displayItems.length === 0) return;
-			this.selectedIndex = this.selectedIndex === 0 ? displayItems.length - 1 : this.selectedIndex - 1;
+			// Clamp instead of wrap: a burst or held arrow key must never teleport
+			// the selection to the far end of the list. A wrap on a short list
+			// reads as "the keys stopped working" once the burst outruns the item
+			// count (30 rapid downs on a 27-item panel land back near the top).
+			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
 		} else if (kb.matches(data, "tui.select.down")) {
 			if (displayItems.length === 0) return;
-			this.selectedIndex = this.selectedIndex === displayItems.length - 1 ? 0 : this.selectedIndex + 1;
+			this.selectedIndex = Math.min(displayItems.length - 1, this.selectedIndex + 1);
 		} else if (kb.matches(data, "tui.select.confirm")) {
 			this.activateItem();
 		} else if (kb.matches(data, "tui.select.toggle") && !this.searchEnabled) {
@@ -192,12 +198,24 @@ export class SettingsList implements Component {
 			// setting" - otherwise every typed space silently cycles whichever
 			// setting the filter happens to have selected. Enter still activates.
 			this.activateItem();
-		} else if (kb.matches(data, "tui.select.cancel")) {
+		} else if (kb.matches(data, "tui.select.cancel") || this.isBackKey(kb, data)) {
 			this.onCancel();
 		} else if (this.searchEnabled && this.searchInput) {
 			this.searchInput.handleInput(data);
 			this.applyFilter(this.searchInput.getValue());
 		}
+	}
+
+	/**
+	 * Left is back ("app.modal.back"), the convention every selector submenu
+	 * already follows. The search query keeps the key for cursor movement
+	 * while its cursor sits past column 0; with no text field (or the cursor
+	 * at column 0) left closes the panel instead of silently falling through
+	 * to the filter, which used to reset the selection to the first item.
+	 */
+	private isBackKey(kb: KeybindingsManager, data: string): boolean {
+		if (!kb.matches(data, "app.modal.back")) return false;
+		return this.searchInput === undefined || this.searchInput.getCursor() === 0;
 	}
 
 	private activateItem(): void {
@@ -231,6 +249,11 @@ export class SettingsList implements Component {
 	}
 
 	private applyFilter(query: string): void {
+		// A key that edits the query without changing it (left moving the
+		// cursor inside the text) must not reset the selection: the rows it
+		// filtered are the same rows. Only a changed query restarts at the top.
+		if (query === this.appliedQuery) return;
+		this.appliedQuery = query;
 		// The id keeps search working in English when labels are translated.
 		this.filteredItems = fuzzyFilter(this.items, query, (item) => `${item.label} ${item.id}`);
 		this.selectedIndex = 0;

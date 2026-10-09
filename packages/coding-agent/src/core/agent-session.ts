@@ -856,6 +856,22 @@ export type AgentSessionEvent =
 			recoveryContinuations: number;
 			provider?: string;
 			model?: string;
+	  }
+	| {
+			/**
+			 * The configured auxiliary model is unusable, so an off-session wire call
+			 * (refinement, compaction, branch summarization) fell back to the session
+			 * model. The fallback semantics are unchanged - the call continues - but it
+			 * evicts the session's prefix cache at the context peak, so the user must
+			 * see it on the UI-facing event channel instead of a console.warn that an
+			 * attached client never renders (W13 item 12). Only the selector is
+			 * reported: auth-stack errors can embed credential material.
+			 */
+			type: "auxiliary_model_fallback";
+			/** What the model was resolved for: "refinement", "compaction", "branch summarization". */
+			purpose: string;
+			/** The unusable auxiliaryModel selector as configured. */
+			selector: string;
 	  };
 
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;

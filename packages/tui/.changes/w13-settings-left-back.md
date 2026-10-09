@@ -1,0 +1,1 @@
+- Fixed left arrow in the settings panel resetting the selection to the first row: left now closes the panel (the same back-key convention the submenus use), and editing a search query with the arrow keys keeps the selected row.

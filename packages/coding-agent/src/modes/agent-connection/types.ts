@@ -885,6 +885,18 @@ export type AgentConnectionSessionEvent =
 			recoveryContinuations: number;
 			provider?: string;
 			model?: string;
+	  }
+	| {
+			/**
+			 * The configured auxiliary model is unusable and an off-session wire call
+			 * (refinement, compaction, branch summarization) fell back to the session
+			 * model. The call continues; the event is the user-facing disclosure of
+			 * the fallback (W13 item 12). Additive on the wire: older clients have no
+			 * case for it and ignore it, exactly like every other unknown event type.
+			 */
+			type: "auxiliary_model_fallback";
+			purpose: string;
+			selector: string;
 	  };
 
 export type AgentConnectionEvent =

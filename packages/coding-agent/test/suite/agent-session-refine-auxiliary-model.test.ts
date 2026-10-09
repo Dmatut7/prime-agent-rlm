@@ -97,11 +97,19 @@ describe("AgentSession refinement auxiliary model", () => {
 				provider: "faux",
 				id: "session-model",
 			});
-			expect(warnSpy).toHaveBeenCalledTimes(1);
-			const [message] = warnSpy.mock.calls[0];
-			expect(message).toContain('auxiliaryModel "faux/missing-model" unusable for refinement');
-			// Caught error details can embed credential material, so they must not be logged.
-			expect(message).not.toContain("unavailable, unauthenticated, or expired");
+			// W13 item 12: the fallback warning rides the session-event channel
+			// (rendered by an attached client) instead of console.warn, which an
+			// attached client never sees and which corrupts a direct-mode TUI frame.
+			const fallbackEvents = harness.eventsOfType("auxiliary_model_fallback");
+			expect(fallbackEvents).toHaveLength(1);
+			expect(fallbackEvents[0]).toMatchObject({
+				purpose: "refinement",
+				selector: "faux/missing-model",
+			});
+			expect(warnSpy).not.toHaveBeenCalled();
+			// Caught error details can embed credential material, so they must not
+			// ride the event either: only the selector is reported.
+			expect(JSON.stringify(fallbackEvents)).not.toContain("unavailable, unauthenticated, or expired");
 		} finally {
 			warnSpy.mockRestore();
 		}

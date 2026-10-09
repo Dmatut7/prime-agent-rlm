@@ -7902,6 +7902,25 @@ export class InteractiveMode {
 				this.showError(`经验沉淀失败：${event.error}`);
 				break;
 
+			case "auxiliary_model_fallback": {
+				// W13 item 12: the fallback itself is silent work-continuation, so it
+				// rides the warning channel (the same one the stall summary uses),
+				// not the error channel. Plain wording for the cost the user pays:
+				// the off-session call ran on the session model instead.
+				const purpose =
+					event.purpose === "compaction"
+						? "压缩"
+						: event.purpose === "refinement"
+							? "经验沉淀"
+							: event.purpose === "branch summarization"
+								? "分支总结"
+								: "后台任务";
+				this.showWarning(
+					`配置的辅助模型 ${event.selector} 现在用不了，${purpose}改用当前会话的模型完成。可以继续干活，但对话缓存被打断，接下来的请求会慢一些、贵一些。`,
+				);
+				break;
+			}
+
 			case "session_persist_failed":
 				this.showError(`会话保存失败：${event.error}`);
 				break;

@@ -228,4 +228,20 @@ describe("SettingsSelectorComponent", () => {
 
 		expect(stripAnsi(component.render(120).join("\n"))).not.toContain("选择配色");
 	});
+
+	test("left arrow closes the main settings panel (W13 13)", () => {
+		// Left used to fall through to the search field, whose filter pass reset
+		// the selection to the first item: the user who pressed left to go back
+		// saw the panel stay open with the cursor teleported to the top row.
+		setKeybindings(new KeybindingsManager());
+		const onCancel = vi.fn();
+		const component = new SettingsSelectorComponent(config, { ...callbacks, onCancel });
+		const list = component.getSettingsList();
+
+		for (let index = 0; index < 3; index++) list.handleInput("\x1b[B");
+
+		list.handleInput("\x1b[D");
+
+		expect(onCancel).toHaveBeenCalledTimes(1);
+	});
 });

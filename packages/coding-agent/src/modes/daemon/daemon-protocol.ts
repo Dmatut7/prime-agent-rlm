@@ -443,8 +443,17 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   untouched because its snapshotFollows transfer already carries the full
 //   snapshot. The digest recomputation covers the snapshot-wrapper and
 //   outbound-union growth.
+// The auxiliary_model_fallback session event (W13 item 12: the auxiliary-model
+//   fallback warning moved from a worker-log console.warn onto the session-event
+//   channel so an attached client can render it) rides this revision as a
+//   compatible addition in the rev-39 empty_response_exhausted class: a new
+//   member of the session_event payload union, old clients have no case for the
+//   type and already ignore unknown ones, and no command, capability, or
+//   response shape changes with it - no revision bump and no capability gate,
+//   only the digest recomputation that covers the union growth (the event lands
+//   in the agent-session union tail the stall-event slice hashes).
 export const DAEMON_SCHEMA_REVISION = 50;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-50-6e033641088e";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-50-33bb0931b0e9";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
