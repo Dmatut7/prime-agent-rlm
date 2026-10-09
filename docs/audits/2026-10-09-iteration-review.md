@@ -1079,3 +1079,37 @@ severity 维持 should：无安全或数据损坏后果，但这是可达的错�
 17. **[note]** /settings 里按 ← 不关闭而是把选中项重置回第 1 项，行为无提示（`packages/coding-agent/src/modes/interactive/components/settings-selector.ts:316`）——在 /settings 里按 ←，列表不关闭也不弹错误，而是选中项跳回第 1 项（13/27 → 1/27）；页脚提示只写了 Esc 取消，← 的这个行为没有任何提示，modal.back（「Go back / close the current dialog」）未接入设置弹窗。
 
 销账 36 条（三路 checkedFine 合计）见蜂群 journal；修复结果随 W13 合并记录。
+
+## 十一、发布后全范围审计（2026-10-09 晚，6 路 14 代理，0.11.20..HEAD 全审）
+
+> 老板点名要的全量复审：外部评审者一眼看到的（信任弹窗光标不安全默认），内部蜂群漏了。本波按外部评审者思维审 v0.11.21 全部内容。产出 1 must / 5 should / 13 低优先，108 条销账，证伪 2。
+
+### 确认（已交 W16 修复波）
+
+1. **[should]** Multi-file read row detail renders unwashed model-controlled file paths (escape injection reaches the terminal)（`packages/coding-agent/src/modes/interactive/components/timeline-rows.ts:1124`）——折叠行文本在渲染时经 stepWords→sanitizeRowText 洗过，但展开行的 detail 回调（files.length>1 时 `theme.fg("muted", truncateToWidth(file, width-2, "…"))`）对 `file` 不做任何洗涤；`files` 的来源是 timeline-rows.ts:506/
+2. **[should]** Home/End and word-jump caret moves skip the new close-autocomplete-on-caret-move fix（`packages/tui/src/components/editor.ts:1852`）——0.11.21 给 moveCursor/pageScroll/jumpToChar/placeCursorFromClick 都加了「光标一动就关补全弹层」（editor.ts:2132 的注释写的是 Close the list on any caret move），但同样移动光标的 moveToLineStart(Home/Ctrl+A)、moveTo
+3. **[should]** Handoff paste recovered into queuedStashes with an empty head stash is unreachable from the stash key（`packages/coding-agent/src/modes/interactive/interactive-mode.ts:5904`）——切换 agents 视图窗口期间收到的粘贴在有草稿时入 stash 的路径：restoreHandoffPastedInput 只把 {text: paste} 追加进 promptStashState.queuedStashes 尾部，head 槽位（state.stash）此时是 undefined（从 agents 视图返回时草稿刚被 restoreO
+4. **[should]** GitHub Release page advertises the trust-prompt safe-default cursor fix, but the v0.11.21 tag does not contain it（`FORK_NOTES.md:10`）——GitHub Release v0.11.21（13:57:58 发布）亮点列表写着『信任弹窗默认光标移到「不信任（仅本次会话）」——安全默认』，但该修复是 793341560（13:57:59 推送），晚于 tag 指向的 c1c264162；tag 里 extension-selector.ts 没有 initialSelectedIndex（grep 
+5. **[must]** Grandfather rule counts post-gate sessions as pre-gate evidence; an explicit refuse-without-remember is converted to persisted trust on the next run（`packages/coding-agent/src/core/project-trust.ts:329`）——grandfather 升级豁免的『目录在门落地前已在使用』证据是 findMostRecentSessionForCwd(sessionsDir, cwd) !== null（main.ts:2028-2029），只按 cwd 匹配会话、不比较会话时间与 trust store 的 createdAt（门在本机落地时刻）。门落地 14 天窗口内，任何目录只
+6. **[should]** Session-only trust does not survive a daemon worker restart once the grandfather window closes: extensions silently stripped mid-task in unattended runs（`packages/coding-agent/src/core/resource-loader.ts:244`）——「信任（仅本次会话）」的决定只活在客户端进程的 config.projectTrustDecision 里；daemon worker 重启后恢复 active session 用的是 worker 自己的 daemonDefaultSessionConfig（appMode==="daemon" 时 projectTrustDecision 恒为 unde
+
+### 证伪（2 条，对抗复核杀掉）
+
+- session_replaced carry-over leaks the previous session's roster, parent and quota park across a session switch
+- v0.11.21 lockfile drops resolved+integrity on all 349 non-platform registry entries (prior releases had 224 verified)
+
+### 低优先/观察（13 条，缓修）
+
+- **[low]** 9 darwin-arm64/fsevents lock entries lost resolved+integrity in the dependabot-wave re-resolution and were not restored（``）——0.11.20 的锁里只有 1 条平台条目缺 integrity（@typescript/native-preview-darwin-arm64）；本波内 91297399c 的 dependabot 锁刷新把本机平台的 9 条 optional 条目（@biomejs/cli-darwin-arm
+- **[low]** Trust-gate user-facing refusal notices are English while the dialog was translated to Chinese（`packages/coding-agent/src/core/project-trust.ts`）——w13-b 把信任弹窗本体翻成了中文，但两条面向用户的拒绝文案仍是英文：project-trust.ts:273 的 refusalNotice（'Project extensions were not loaded from ... Run prime-agent interactively ..
+- **[note]** Torn meta-prefixed chord now flushes a lone Escape where 0.11.20 dropped the blob silently（`packages/tui/src/stdin-buffer.ts`）——splitFlushedInput 对 `\x1b\x1b` 开头但尾没完成的缓冲取 chordLength=1：先发出一个裸 ESC 再重解析剩余。0.11.20 会把整个不可解码 blob 静默丢掉；现在被撕开的 Alt+功能键（ESC ESC [13… 尾巴跨过 10ms 完成窗口）会先触发一
+- **[low]** Tab column width is now inconsistent across render faces (3 vs 4)（`packages/coding-agent/src/modes/interactive/components/user-message.ts`）——0.11.21 把 tui markdown 的 tab 归一化（markdown.ts:1366）和 coding-agent 的 sanitizeBlockText（display-text.ts:33，ipython 代码/错误尾/diff 行都经它）统一改为 4 空格，但同一波没有同步用户消
+- **[note]** LaTeX spacing sentinel U+E000 collides with literal private-use input（`packages/tui/src/latex.ts`）——为让 \quad/\qquad 的多空格间距穿过 latexToUnicode 的源空白塌缩，修复引入了私用区 sentinel U+E000（SPACING_SENTINEL），在输出末尾用 `.replace(//g, " ")` 全量还原。还原是无差别的：公式源文本里本身含字面 U+E000
+- **[low]** ACP surfaces session_replaced as metadata only, never re-delivers the swapped transcript（`packages/coding-agent/src/modes/acp/acp-events.ts`）——R5-M22 把连接级事件映射进 ACP 时，session_replaced 只发一条 session_info_update（_meta.sessionSync 带 sessionId/messageCount），不重放新会话的 transcript；而 wire 契约明确 replacemen
+- **[note]** Terminal session-gone error is raw English inside the otherwise-Chinese UI（`packages/coding-agent/src/modes/agent-connection/daemon-agent-connection.ts`）——W27-A 新增的会话消失终局错误 formatDaemonSessionGoneError 是一整句英文（含 diagnostic context），经 closed 事件原样传到 interactive-mode showError（7078-7082）直接渲染。W13-B/C 批次刚把其他混杂
+- **[low]** HEAD 上的信任光标修复没有 changelog fragment，0.11.22 折叠时会被漏掉（`packages/coding-agent/src/modes/interactive/components/extension-selector.ts`）——793341560 是用户可感知的行为变更（信任弹窗默认光标/回车反射选择），按仓规应带 packages/coding-agent/.changes/ 碎片；HEAD 上该目录只剩 README.md，FORK_NOTES 记了处置但碎片机制里零记录。
+- **[low]** CI 'Verify CI results' step turns cancelled (superseded) runs into a red X — the 'remote error' the boss just saw（`.github/workflows/ci.yml`）——build-check-test 的汇总步在任一上游 job 结果为 cancelled 时 exit 1。快速连续推送（发版提交→光标修复→docs 三连推）会让前一两条推送的 CI 被新推送取消，GitHub 把 cancelled 显示成红 X——老板看到的『推到远程就报错了』就是这个，实际没
+- **[low]** Root digest claims 'all 329 entries in this section' but has 296 lines and provably misses one; release page says 13 categories, section has 14（`CHANGELOG.md`）——根 CHANGELOG 0.11.21 节引言称『完整 329 条用户可感知变化全在本节』，实际该节只有 296 条 bullet（多英文条被合并成一条），且至少 1 条可证实缺失：tui CHANGELOG 的 'Removed the dead `SettingsList.updateValue
+- **[low]** Compaction keep-tail is now planned against the auxiliary model's context window while the session model consumes the result（`packages/coding-agent/src/core/agent-session.ts`）——_performCompaction 的保留尾预算来自 this._registryContextWindow(model)（agent-session.ts:12442），而 0.11.21 起手动 /compact（12265 经 _summarizerAuth）与自动压缩（13590 经 re
+- **[low]** SHELL_WRITE_COMMAND write-detection misses bare gzip/bzip2/xz, curl -O, and default wget (all overwrite project files)（`packages/coding-agent/src/core/self-recovery.ts`）——新扩的 SHELL_WRITE_COMMAND 捕捉 unzip/gunzip/zip -d/7z/tar extract/curl -o/wget -O，但漏掉原位压缩家族（gzip/bzip2/xz 不带 -d 时直接把输入文件替换成 .gz/.bz2/.xz）与两个最常见的默认写盘形态：`cu
+- **[note]** Cron job resume clears lastError unconditionally, erasing genuine run-error history along with the park reason（`packages/coding-agent/src/core/cron-jobs.ts`）——本 wave 给 rlm_heartbeat resume 和通用 resume 两处加了 lastError: undefined，注释说『pause 原因已解决，不该继续渲染成 Error 行』；但 lastError 同时承载真实运行失败的错误史（runCronJob 失败会写它），resum
