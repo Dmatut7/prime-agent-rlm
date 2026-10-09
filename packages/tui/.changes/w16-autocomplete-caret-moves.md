@@ -1,1 +1,0 @@
-- Fixed the autocomplete list to close on Home, End and Ctrl+Left/Right word jumps, the same caret-move rule as the arrow keys, so accepting a completion can no longer splice it at a stale cursor position.

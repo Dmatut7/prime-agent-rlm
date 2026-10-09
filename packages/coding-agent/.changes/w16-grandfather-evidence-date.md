@@ -1,2 +1,0 @@
-- Fixed the extension trust gate's upgrade grandfather so only sessions that predate the gate landing count as prior-use evidence: a post-gate session (including a resumed one) can no longer auto-trust a directory, and a "not trusted, this session only" answer stays session-only on the next run.
-- Changed machine-mode grandfathering to trust the directory for the run without persisting a permanent decision, matching the resolution-order contract that a machine run never writes the trust store.
