@@ -141,23 +141,21 @@ class Rt5RestoreHonestyTest(unittest.TestCase):
         self.assertEqual(done["status"], "ok")
         degraded = done.get("degraded", [])
         degraded_names = [entry["name"] for entry in degraded]
-        # The alias/frozen-copy scenario from the round-35 audit: `helper` revives with
-        # a private copy of its defining namespace instead of the live one, so it must
-        # not ride in `restored` (which the host renders as "available again").
-        self.assertIn("helper", degraded_names)
-        self.assertNotIn("helper", done["restored"])
+        # W17 live-globals revival: `helper` is rebuilt on the live namespace, so
+        # it IS restored (reads live globals), not degraded. The frozen-copy
+        # caveat from the round-35 audit no longer applies to this scenario.
+        self.assertNotIn("helper", degraded_names)
+        self.assertIn("helper", done["restored"])
         self.assertIn("plain", done["restored"])
         self.assertIn("lst", done["restored"])
-        self.assertTrue(degraded[degraded_names.index("helper")]["reason"])
 
-        # The value is still applied and callable; the report is honest about the caveat,
-        # not a refusal. And the divergence the reason describes is real: rebinding the
-        # live name does not reach the frozen copy.
+        # The revived function reads the live namespace: rebinding the live name
+        # IS visible to the revived function (this is the W17 fix).
         events = reader.execute("c2", "helper()")
         self.assertEqual(reader.result_text(events), "3")
         reader.execute("c3", "lst = [1]")
         events = reader.execute("c4", "helper()")
-        self.assertEqual(reader.result_text(events), "3")
+        self.assertEqual(reader.result_text(events), "1")
 
     def test_rt5_imported_function_stays_fully_restored(self) -> None:
         # A function from a real module revives by reference with its module's live
