@@ -1,3 +1,14 @@
+## 2026-10-09 第六批：v0.11.21 发版记录 + 外部复审两条处置
+
+> 发版依据与过程（外部窗口问到的四个事实）：
+
+- **老板授权原话**：「肯定要搞啊 要发版本啊」（2026-10-09 ~20:30），这是唯一依据。仓库的发版闸门（scripts/lib/fork-gate.mjs）设计上禁推 v* 标签禁 npm publish（build-binaries 发布面未裁决），本次经 `PRIME_AGENT_ALLOW_RELEASE=1` 豁免通道放行（闸门打印警告后执行）。`v*` 标签推送另经 `PRIME_AGENT_ALLOW_VTAG=1` 豁免（.husky/pre-push 的独立刹车）。
+- **build-binaries 状态**：`disabled_manually`——tag 推上去没有触发二进制流水线（不自动建 Release 页）；Release 页手动建：gh release create v0.11.21（标题+中文摘要+安装渠道说明+npm 未发布声明）。
+- **npm 未发布**：@earendil-works scope 的 npm 线属于上游（latest=1.1.0）；本机 npm 无登录凭证（whoami E401）。fork 的发行渠道 = GitHub Release 页 + 源码构建（install-fork.sh / npm run build）。发版脚本内置的 `npm version -ws` 重装路径在 macOS 上会静默忽略 min-release-age 并洗掉锁里的跨平台条目——本次手工递增 8 包版本 + `npm@12 install --package-lock-only` 锁重建（98 条平台条目保持）+ `buildReleaseSection` 碎片折叠（107 条）。
+- **发版 CI 红过一次**：我改写 CHANGELOG 禁令行时删了「禁推」关键词——发版闸门 BAN_ANCHORS 靠它定位引用行号，钉测试 fork-release-gate 红了。修复：恢复禁令默认原文 + 裁决记录并列一行（不是替换）。
+
+- **外部复审两条处置**：①信任弹窗默认光标在「信任」上——属实、漏修（W13-b 只做了中文化）。修法：`ExtensionSelectorComponent` 新增 `initialSelectedIndex` 选项（默认 0，其它选择器不变），信任弹窗传 3（「不信任（仅本次会话）」——最保守：拒一次不留记忆）。选项排序不变（「信任」仍排第一），只改初始光标。回车反射现在选保守项；授予信任需要刻意移动。测试钉住反射回车=拒一次+选项排序不变+接线到位（793341560）。②三版无 Release 页——0.11.19/0.11.20 无 tag（另一窗口模式差异，不算漏）；0.11.21 有 tag 但 build-binaries disabled 不自动建页——**是漏**，本次手动补上（上面第三条）。CHANGELOG 里「见 FORK_NOTES」引用的本节即为此而写。
+
 ## 2026-10-09 第五批：显示/交互动态 QA + W13 修复 13 条
 
 > 老板点名要的显示/交互动态审查：三路蜂群（信任门 UX 静态审 13 销账、渲染不变量审 10 销账、**tmux 真终端实测**三档尺寸 13 销账）对 W7~W12 新合入面审出 **1 must / 6 should / 3 low / 4 note**（账本第十节）。W13 三车道（A 连接/切换簇、B 信任门 UX、C 输入/设置）把 1 must + 6 should + 顺带 6 条 low/note 全部修完，每条先红后绿，A/B 车道真终端复验（隔离 socket、专用 tmux 会话、测后清理）。
