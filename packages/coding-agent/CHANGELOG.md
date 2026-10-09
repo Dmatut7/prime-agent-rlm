@@ -1,6 +1,11 @@
 # Changelog
 
 ## [0.11.21] - 2026-10-09
+- Fixed the extension trust gate's upgrade grandfather so only sessions that predate the gate landing count as prior-use evidence: a post-gate session (including a resumed one) can no longer auto-trust a directory, and a "not trusted, this session only" answer stays session-only on the next run.
+- Changed machine-mode grandfathering to trust the directory for the run without persisting a permanent decision, matching the resolution-order contract that a machine run never writes the trust store.
+- Fixed the expanded multi-file read step to wash each file name before it reaches the screen, so a path a model chose can no longer carry terminal escape sequences (including clipboard-write OSC 52) into the row's detail.
+- Fixed session-only project trust so it survives a daemon worker crash recovery: the grant is recorded in the session transcript and restored when the worker re-creates the session from the config-less durable create command, instead of silently stripping the extensions of an unattended task.
+- Fixed the prompt stash to put a paste recovered during a window switch into the head slot when no stash exists yet, so the stash key can actually restore it instead of reporting nothing to restore.
 
 - Fixed subagent status disagreeing across surfaces after attach/resync: timeline entries seeded as "running" are now reconciled from the authoritative snapshot, and a terminal status settles the "还在干活" lane tail instead of waiting for the queued report to render.
 - Fixed the agents view's usage columns drifting between sections (values read under the wrong header) by sharing one column set across all sections, truncating rows with an ellipsis instead of a bare cut, and switching money figures to the TUI-wide ¥ formatter (same for /context and the HTML export header).

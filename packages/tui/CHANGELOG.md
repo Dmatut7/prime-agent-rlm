@@ -1,6 +1,7 @@
 # Changelog
 
 ## [0.11.21] - 2026-10-09
+- Fixed the autocomplete list to close on Home, End and Ctrl+Left/Right word jumps, the same caret-move rule as the arrow keys, so accepting a completion can no longer splice it at a stale cursor position.
 
 - Fixed overwide lines wrapping and corrupting the whole frame on full renders (first frame, resize, viewport-preserving redraw): they are now clamped and logged like the diff path always did, and every clamp re-attaches the trailing style/link reset so a clamped row can no longer bleed its background color or hyperlink into the row below.
 - Fixed nested markdown lists rendering with compounding indentation (4, 10, 22… columns per level) under production themes: nesting is now detected structurally instead of by a chalk-specific cyan escape code.
