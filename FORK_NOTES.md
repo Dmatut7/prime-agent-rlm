@@ -1,3 +1,13 @@
+## 2026-10-10 第一批：W17 上游机制摘取 5 件（提示词审计产出）
+
+> 提示词审计结论：我们提示词超前（TS 自有增强、RSI 循环同源、近重复合并独有），值得摘的全是**机制**。W17 双车道摘 5 件：
+
+- **①EOF 最终快照 flush**：宿主死亡（stdin EOF / owner 退出）时内核退出前把活 namespace flush 到最后一次快照目标。无人值守多日跑的宿主崩溃不再丢 Python 状态。
+- **②restore 后 live-globals 复活**：dill 按值 pickle 的 __main__ 函数重建到活 namespace（带 defaults/closure/attrs，memo 保环），后续 rebind 对恢复函数可见；saved-globals backfill、单名失败上报不中断。
+- **③rlm.rename**：模型可改当前会话或常驻子代理名（id-only 解析、兄弟唯一性断言、session_renamed 转录记录）。
+- **④载荷上限**：host_request 16 MiB frame cap（内核侧）、错误 traceback 聚合有界（双侧）、宿主侧拒收超限帧。
+- **⑤bash_activity 带外查询**：后台 bash 状态不经主 cell FIFO（reader 线程直答）、list/tail/kill、capability-gated protocol >= 5。
+
 ## 2026-10-09 第七批尾：目标状态中文化 + 审计修复补丁推送
 
 - **目标状态中文化（49ec74e84）**：老板看界面发现「Pursuing goal (33s)」是英文——产品整个 UI 中文，这条漏翻。goal 的全部用户可见状态串翻中文（目标进行中/无活跃目标/目标已暂停/目标预算受限/目标已完成/目标出错 + /goal 命令回复），细节后缀分隔符统一全角「：」（宽度 2 列不变），elapsed 时间格式保持原样；线上枚举与模型侧 goal prompt 保持英文不动。测试 14 处钉住断言同步更新。
