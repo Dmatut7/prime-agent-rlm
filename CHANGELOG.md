@@ -408,7 +408,7 @@
 
 - `session_recovering` 结构化错误需整批 #2028（105 文件）才有意义，只摘协议行会得到永不产生的错误码。
 - `createHarness` 不隔离 agent dir（测试会渲染开发机真库，700+ 测试面，另开一笔）。
-- `build-binaries.yml` 的发布面已于 2026-10-09 由仓库所有者裁决放行：自 0.11.21 起正常发版（禁令原文见 git 历史，本行随裁决改写）。
+- `build-binaries.yml` 的活体发布面未裁决，故仍**禁推 `v*` 标签**（默认策略不变；2026-10-09 所有者经 `PRIME_AGENT_ALLOW_RELEASE=1` 豁免通道裁决放行过一次 0.11.21 发版，见 FORK_NOTES）。
 - 升级那一次重启窗口内，#2334 之前写的快照没有 priority 字段，恢复时按记录的 source 与信封**重导出**（不是一律降档）：TUI 提交排队的输入（source=interactive，含 steer 与 follow-up 两条 lane）保持 user，不会被机器流量插队；记成 internal 的行（RPC/daemon `steer`/`follow_up` 命令走的 steer()/followUp() API，以及子代理回执/心跳等机器流量）落 background。已知、不改实现；针见 test/suite/regressions/2334-human-priority-lane-scoped.test.ts。
 
 
