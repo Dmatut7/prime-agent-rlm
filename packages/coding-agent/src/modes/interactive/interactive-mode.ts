@@ -5900,8 +5900,14 @@ export class InteractiveMode {
 			return;
 		}
 		// The editor already holds text: keep both, the paste waits in the stash
-		// the user restores with the prompt-stash key.
-		this.promptStashState.queuedStashes = [...(this.promptStashState.queuedStashes ?? []), { text: paste }];
+		// the user restores with the prompt-stash key. The restore path reads the
+		// head slot first, so a session with no head stash yet gets the paste
+		// there (a queue-only stash answers 没有可暂存的输入 and is unreachable).
+		if (this.promptStash === undefined) {
+			this.promptStash = { text: paste };
+		} else {
+			this.promptStashState.queuedStashes = [...(this.promptStashState.queuedStashes ?? []), { text: paste }];
+		}
 		this.showStatus(`切换窗口期间收到一段粘贴${truncationNote}，已存入输入暂存`);
 	}
 

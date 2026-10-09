@@ -1850,12 +1850,16 @@ export class Editor implements Component, Focusable {
 	}
 
 	private moveToLineStart(): void {
+		// Same caret-move rule as moveCursor: the list's accept math reads the
+		// cursor position, so any caret move closes it.
+		this.cancelAutocomplete();
 		this.lastAction = null;
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
 		this.setCursorCol(this.getLineHiddenTextPrefixLength(this.state.cursorLine, currentLine));
 	}
 
 	private moveToLineEnd(): void {
+		this.cancelAutocomplete();
 		this.lastAction = null;
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
 		this.setCursorCol(currentLine.length);
@@ -2198,6 +2202,7 @@ export class Editor implements Component, Focusable {
 	}
 
 	private moveWordBackwards(): void {
+		this.cancelAutocomplete();
 		this.lastAction = null;
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
 		const lineStartCol = this.getLineHiddenTextPrefixLength(this.state.cursorLine, currentLine);
@@ -2435,6 +2440,7 @@ export class Editor implements Component, Focusable {
 	}
 
 	private moveWordForwards(): void {
+		this.cancelAutocomplete();
 		this.lastAction = null;
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
 

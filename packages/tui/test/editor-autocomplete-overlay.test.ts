@@ -185,4 +185,24 @@ describe("editor autocomplete list and caret moves", () => {
 		const line = editor.render(40)[1] ?? "";
 		assert.ok(!stripAnsi(line).includes("@do@"), `no mid-word splice, got ${JSON.stringify(line)}`);
 	});
+
+	it("closes the list on Home, End and word jumps, the same caret-move rule", async () => {
+		const moves: Array<[string, string]> = [
+			["\x1b[H", "home"],
+			["\x1b[F", "end"],
+			["\x1b[1;5D", "ctrl+left (word left)"],
+			["\x1b[1;5C", "ctrl+right (word right)"],
+		];
+		assert.equal(moves.length, 4);
+		for (const [key, label] of moves) {
+			const editor = await createOpenAutocomplete();
+			editor.handleInput(key);
+			assert.equal(
+				editor.isShowingAutocomplete(),
+				false,
+				`the list must close on ${label} (${JSON.stringify(key)})`,
+			);
+			editor.render(40);
+		}
+	});
 });

@@ -7,9 +7,11 @@ import { initTheme } from "../src/modes/interactive/theme/theme.js";
 type ModeFake = Record<string, unknown>;
 
 type RestoreHandoffPastedInput = (this: ModeFake) => void;
+type HandlePromptStash = (this: ModeFake) => void;
 
 const proto = InteractiveMode.prototype as unknown as {
 	restoreHandoffPastedInput: RestoreHandoffPastedInput;
+	handlePromptStash: HandlePromptStash;
 };
 
 const handoffInput = vi.hoisted(() => ({ buffer: undefined as { text: string; truncated: boolean } | undefined }));
@@ -101,6 +103,33 @@ describe("handoff paste recovery (w13 QA finding 4)", () => {
 			stashState.stash?.text === "pasted during window" ||
 				stashState.queuedStashes?.some((entry) => entry.text === "pasted during window"),
 		).toBe(true);
+	});
+
+	it("a paste stashed behind a non-empty editor comes back with the stash key", () => {
+		// The stash key (Ctrl+S) reads the head slot; a paste that only ever sat in
+		// the queue with no head stash was unreachable - it answered 没有可暂存的输入.
+		handoffInput.buffer = { text: "\x1b[200~pasted during window\x1b[201~", truncated: false };
+		const editorState = { text: "already typed" };
+		const mode = pasteFake({
+			editor: {
+				getText: () => editorState.text,
+				setText: (text: string) => {
+					editorState.text = text;
+				},
+			},
+			pastedImages: new Map(),
+			showToast: vi.fn(),
+		});
+
+		proto.restoreHandoffPastedInput.call(mode);
+		expect(editorState.text).toBe("already typed"); // the draft stays
+
+		// The draft goes away (submitted or cleared); the stash key now restores.
+		editorState.text = "";
+		proto.handlePromptStash.call(mode);
+
+		expect(editorState.text).toBe("pasted during window");
+		expect(chatText(mode)).not.toContain("没有可暂存的输入");
 	});
 
 	it("raw keystrokes captured in the window are not replayed into the editor", () => {

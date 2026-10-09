@@ -1,0 +1,1 @@
+- Fixed the expanded multi-file read step to wash each file name before it reaches the screen, so a path a model chose can no longer carry terminal escape sequences (including clipboard-write OSC 52) into the row's detail.

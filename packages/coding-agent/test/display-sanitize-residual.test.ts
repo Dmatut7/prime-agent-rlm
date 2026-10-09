@@ -24,7 +24,7 @@ import {
 import type { BoxRow, TimelineFacts } from "../src/modes/interactive/components/timeline-rows.js";
 import { TurnActivityState } from "../src/modes/interactive/components/turn-activity.js";
 import { BOX_FOCUS_MARKER, computeBoxHeader } from "../src/modes/interactive/components/turn-box.js";
-import { addCommand, plain, quietTurn, text, useTruecolorTheme } from "./ui-blocks-helpers.js";
+import { addCommand, assistant, plain, quietTurn, text, useTruecolorTheme } from "./ui-blocks-helpers.js";
 
 /**
  * The render faces that build their own rows instead of handing their text to
@@ -167,6 +167,51 @@ describe("R4-M1: the turn box's header washes what its step rows already washed"
 		const shown = text(lines);
 		expect(shown).toContain("npm run check");
 		expect(shown).toContain("全绿");
+	});
+
+	it("opens a merged multi-file read without the escapes its file names carry", () => {
+		const turn = quietTurn({ live: false });
+		const at = Date.now() - 4_000;
+		// The dirty tail deliberately holds no `/`: the step label takes the path's
+		// last slash-separated segment as the file name, so a URL-shaped escape
+		// would move the "name" rather than test the detail's own wash.
+		const dirtyName = (name: string) => `${name}${OSC52}${CLEAR}\u0007\r${PAINT}`;
+		// Two read calls in one reply: the box merges them into one `读取了 2 个文件`
+		// row whose expanded detail lists each file path the model named.
+		const reads = [
+			{ id: "read-a", file: `src/${dirtyName("a.ts")}` },
+			{ id: "read-b", file: `docs/${dirtyName("b.md")}` },
+		];
+		turn.timeline.noteMessage(
+			assistant(
+				at,
+				reads.map(({ id, file }) => ({
+					type: "toolCall" as const,
+					id,
+					name: "read",
+					arguments: { file_path: file },
+				})),
+			),
+			true,
+		);
+		for (const { id, file } of reads) {
+			turn.state.addStep({ toolCallId: id, toolName: "read", args: { file_path: file }, status: "done" });
+		}
+		turn.state.markTurnEnded(Date.now());
+		turn.state.finishBox(Date.now());
+		turn.summary.render(120);
+		for (const key of turn.summary.getFocusOrder()) {
+			if (key.startsWith("ev:") && turn.summary.enterLabel(key) === "展开") turn.summary.activate(key);
+		}
+		const opened = plain(turn.summary.render(120));
+		expect(opened.join("\n")).toContain("读取了 2 个文件");
+		// Click the merged read row to expand its per-file detail.
+		const index = opened.findIndex((line) => line.includes("读取了 2 个文件"));
+		const region = turn.summary.getClickRegions().find((candidate) => candidate.line === index);
+		expect(region, "the merged read row").toBeDefined();
+		region?.onClick({ row: index, col: 0 });
+		const lines = turn.summary.render(120);
+		expectClean(lines, "the opened read detail", ["a.ts", "b.md"]);
 	});
 });
 

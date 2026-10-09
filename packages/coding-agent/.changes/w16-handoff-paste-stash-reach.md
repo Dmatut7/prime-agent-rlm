@@ -1,0 +1,1 @@
+- Fixed the prompt stash to put a paste recovered during a window switch into the head slot when no stash exists yet, so the stash key can actually restore it instead of reporting nothing to restore.

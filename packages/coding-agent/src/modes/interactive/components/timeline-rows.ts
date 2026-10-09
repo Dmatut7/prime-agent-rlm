@@ -1119,10 +1119,12 @@ function mergeReads(rows: BoxRow[]): BoxRow[] {
 				text: `读取了 ${files.length} 个文件`,
 				detail: (width: number) =>
 					clip(
-						files.map(
-							(file) =>
-								`${theme.fg("diffAddedText", "✓")} ${theme.fg("muted", truncateToWidth(file, width - 2, "…"))}`,
-						),
+						files.map((file) => {
+							// The path is model-chosen: wash it before the width cut, or the
+							// cut can split an escape sequence and leave its tail on screen.
+							const name = sanitizeDisplayText(file).replace(/\s+/g, " ").trim();
+							return `${theme.fg("diffAddedText", "✓")} ${theme.fg("muted", truncateToWidth(name, width - 2, "…"))}`;
+						}),
 						width,
 					),
 			};
