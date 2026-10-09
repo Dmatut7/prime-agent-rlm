@@ -68,6 +68,12 @@ export interface Args {
 	listModels?: string | true;
 	offline?: boolean;
 	verbose?: boolean;
+	/**
+	 * Run-wide project trust override from --approve (true) / --no-approve
+	 * (false): whether project-scoped extensions may load this run, bypassing
+	 * the stored trust decision.
+	 */
+	projectTrustOverride?: boolean;
 	messages: string[];
 	fileArgs: string[];
 	/** Unknown flags (potentially extension flags) - map of flag name to value */
@@ -446,6 +452,10 @@ export function parseArgs(rawArgs: string[]): Args {
 			});
 		} else if (arg === "--verbose" || arg === "-v") {
 			result.verbose = true;
+		} else if (arg === "--approve" || arg === "-a") {
+			result.projectTrustOverride = true;
+		} else if (arg === "--no-approve" || arg === "-na") {
+			result.projectTrustOverride = false;
 		} else if (arg === "--offline") {
 			result.offline = true;
 		} else if (arg.startsWith("@")) {

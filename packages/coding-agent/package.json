@@ -36,7 +36,7 @@
 		"test:ci": "tsx src/core/kernel/bootstrap-cli.ts && vitest --run --exclude test/daemon-supervisor-process.test.ts --exclude test/daemon-supervisor-crash-handlers-process.test.ts --exclude test/suite/regressions/4603-worker-recovery.test.ts --exclude test/repl-kernel-output-boundary.test.ts --exclude test/acp-cold-cli.test.ts --exclude test/acp-kernel-features.test.ts --exclude test/kernel-goal-skill.test.ts --exclude test/repl-kernel-bash-interrupt.test.ts --exclude test/repl-kernel-mcp-reconnect.test.ts --exclude test/repl-kernel-mcp-shutdown.test.ts --exclude test/repl-kernel-partial-restore-snapshot.test.ts",
 		"test:machine-wide": "tsx src/core/kernel/bootstrap-cli.ts && vitest --run --no-file-parallelism test/suite/regressions/4603-worker-recovery.test.ts",
 		"test:process": "vitest --run test/daemon-supervisor-process.test.ts test/daemon-supervisor-crash-handlers-process.test.ts",
-		"test:process-stress": "vitest --run --tagsFilter process-stress test/daemon-supervisor-process.test.ts test/daemon-supervisor-crash-handlers-process.test.ts",
+		"test:process-stress": "vitest --run --tagsFilter process-stress test/daemon-supervisor-process.test.ts test/daemon-supervisor-crash-handlers-process.test.ts test/project-trust-machine-mode.test.ts",
 		"postinstall": "node postinstall.cjs",
 		"prepublishOnly": "npm run clean && npm run build",
 		"bundle": "node scripts/bundle.mjs",

@@ -287,6 +287,11 @@ export async function createAgentSessionServices(
 	}
 	extensionsResult.runtime.pendingProviderRegistrations = [];
 	diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
+	// Extension trust gate: the refusal must reach every client surface (TUI
+	// startup, print/json stderr, rpc/acp summaries), not only the loader.
+	for (const trustDiagnostic of resourceLoader.getProjectTrustDiagnostics()) {
+		diagnostics.push({ type: "warning", message: trustDiagnostic.message });
+	}
 
 	return {
 		cwd,

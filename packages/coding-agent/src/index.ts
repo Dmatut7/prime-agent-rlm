@@ -151,6 +151,13 @@ export type {
 	ResolvedResource,
 } from "./core/package-manager.js";
 export { DefaultPackageManager } from "./core/package-manager.js";
+export {
+	hasProjectExtensionInputs,
+	PROJECT_TRUST_FILE_NAME,
+	type ProjectTrustPrompt,
+	ProjectTrustStore,
+	resolveProjectTrust,
+} from "./core/project-trust.js";
 export type {
 	HarnessState,
 	RefinementEdit,

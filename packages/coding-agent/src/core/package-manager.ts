@@ -139,6 +139,15 @@ interface PackageManagerOptions {
 	bundledSkillsDir?: string | null;
 	/** Extra force-exclude patterns for built-in skills (e.g. unauthenticated MCP integrations). */
 	extraBuiltinSkillOverrides?: () => string[];
+	/**
+	 * May project-scoped extension sources load for this resolution? The
+	 * extension trust gate (GHSA-mqxh-6gq7-558m): project extensions are
+	 * repository-controlled executable code, so an undecided or refused
+	 * directory must not load them. Undefined callers resolve it themselves
+	 * (DefaultResourceLoader reads the trust store); this field is the
+	 * explicit, cwd-resolved answer.
+	 */
+	projectTrusted?: boolean;
 }
 
 type SourceScope = "user" | "project" | "temporary";
@@ -623,7 +632,12 @@ function resolveExtensionEntries(dir: string): string[] | null {
 	return null;
 }
 
-function collectAutoExtensionEntries(dir: string): string[] {
+/**
+ * Extension entry points auto-discovered in one directory (one owner for this
+ * rule; the project trust gate reuses it to detect gate inputs without a
+ * second discovery implementation).
+ */
+export function collectAutoExtensionEntries(dir: string): string[] {
 	const entries: string[] = [];
 	if (!existsSync(dir)) return entries;
 	const rootEntries = resolveExtensionEntries(dir);
@@ -823,6 +837,9 @@ export class DefaultPackageManager implements PackageManager {
 	private progressCallback: ProgressCallback | undefined;
 	private temporaryCache: PrivateTempCache | undefined;
 	private temporaryCacheNotice: string | undefined;
+	private projectTrusted: boolean | undefined;
+	/** Project-scope extensions the last resolution held back (trust gate). */
+	private lastSkippedProjectExtensions: ResolvedResource[] = [];
 
 	constructor(options: PackageManagerOptions) {
 		this.cwd = options.cwd;
@@ -830,6 +847,12 @@ export class DefaultPackageManager implements PackageManager {
 		this.settingsManager = options.settingsManager;
 		this.bundledSkillsDir = options.bundledSkillsDir === undefined ? getBundledSkillsDir() : options.bundledSkillsDir;
 		this.extraBuiltinSkillOverrides = options.extraBuiltinSkillOverrides ?? (() => []);
+		this.projectTrusted = options.projectTrusted;
+	}
+
+	/** Project-scope extension sources the most recent resolve() skipped because the cwd is untrusted. */
+	getLastSkippedProjectExtensions(): ResolvedResource[] {
+		return [...this.lastSkippedProjectExtensions];
 	}
 
 	setProgressCallback(callback: ProgressCallback | undefined): void {
@@ -931,6 +954,9 @@ export class DefaultPackageManager implements PackageManager {
 
 	async resolve(onMissing?: (source: string) => Promise<MissingSourceAction>): Promise<ResolvedPaths> {
 		const accumulator = this.createAccumulator();
+		// Trust-gate skip list is owned by the full resolution; resolveExtensionSources
+		// (user/temporary CLI sources) must not clobber what resolve() recorded.
+		this.lastSkippedProjectExtensions = [];
 		const globalSettings = this.settingsManager.getGlobalSettings();
 		const projectSettings = this.settingsManager.getProjectSettings();
 		// Project resources win collisions with global resources.
@@ -2634,9 +2660,27 @@ export class DefaultPackageManager implements PackageManager {
 				metadata,
 			}));
 			resolved.sort((a, b) => resourcePrecedenceRank(a.metadata) - resourcePrecedenceRank(b.metadata));
+			return resolved;
+		};
 
+		// Extension trust gate: everything tagged project scope is repository-
+		// controlled executable code (auto-discovered .prime/agent/extensions
+		// entries, settings-declared paths, project-scope packages). Hold it back
+		// for an untrusted directory before the canonical-path dedup, so a user
+		// extension that also appears under a project alias still loads as the
+		// user's own choice. User and temporary scopes are untouched; only
+		// extensions are gated - skills, prompts and themes are inert data.
+		const sortedExtensions = mapToResolved(accumulator.extensions);
+		const gatedExtensions = sortedExtensions.filter((entry) => {
+			if (this.projectTrusted === false && entry.metadata.scope === "project") {
+				this.lastSkippedProjectExtensions.push(entry);
+				return false;
+			}
+			return true;
+		});
+		const dedupeByCanonicalPath = (entries: ResolvedResource[]): ResolvedResource[] => {
 			const seen = new Set<string>();
-			return resolved.filter((entry) => {
+			return entries.filter((entry) => {
 				const canonicalPath = canonicalizePath(entry.path);
 				if (seen.has(canonicalPath)) return false;
 				seen.add(canonicalPath);
@@ -2645,10 +2689,10 @@ export class DefaultPackageManager implements PackageManager {
 		};
 
 		return {
-			extensions: mapToResolved(accumulator.extensions),
-			skills: mapToResolved(accumulator.skills),
-			prompts: mapToResolved(accumulator.prompts),
-			themes: mapToResolved(accumulator.themes),
+			extensions: dedupeByCanonicalPath(gatedExtensions),
+			skills: dedupeByCanonicalPath(mapToResolved(accumulator.skills)),
+			prompts: dedupeByCanonicalPath(mapToResolved(accumulator.prompts)),
+			themes: dedupeByCanonicalPath(mapToResolved(accumulator.themes)),
 			diagnostics: accumulator.diagnostics,
 		};
 	}

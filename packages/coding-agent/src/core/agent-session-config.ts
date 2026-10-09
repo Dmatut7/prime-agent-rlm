@@ -25,7 +25,20 @@ export interface AgentSessionRuntimeConfig {
 	noPromptTemplates?: boolean;
 	themes?: string[];
 	noThemes?: boolean;
+	/** Disable AGENTS.md and CLAUDE.md discovery */
 	noContextFiles?: boolean;
+	/**
+	 * Run-wide project extension trust override from --approve (true) /
+	 * --no-approve (false). Honored for every cwd the runtime resolves.
+	 */
+	projectTrustOverride?: boolean;
+	/**
+	 * The interactive client's resolved trust decision for one specific cwd
+	 * (including session-only answers that were not persisted). Honored only
+	 * when the runtime's cwd matches this cwd; other cwds fall back to the
+	 * persisted trust store. See core/project-trust.ts.
+	 */
+	projectTrustDecision?: { cwd: string; trusted: boolean };
 	autonomous?: AgentAutonomousConfig;
 	extensionFlagValues?: Record<string, boolean | string>;
 	/**
@@ -90,6 +103,8 @@ export function mergeAgentSessionRuntimeConfig(
 		themes: cloneArray(override.themes ?? base.themes),
 		noThemes: override.noThemes ?? base.noThemes,
 		noContextFiles: override.noContextFiles ?? base.noContextFiles,
+		projectTrustOverride: override.projectTrustOverride ?? base.projectTrustOverride,
+		projectTrustDecision: override.projectTrustDecision ?? base.projectTrustDecision,
 		autonomous: mergeAutonomousConfig(base.autonomous, override.autonomous),
 		extensionFlagValues:
 			base.extensionFlagValues || override.extensionFlagValues
@@ -117,6 +132,8 @@ function cloneAgentSessionRuntimeConfig(config: AgentSessionRuntimeConfig): Agen
 		serializedRefine: config.serializedRefine,
 		executionMode: config.executionMode,
 		telemetryDisabled: config.telemetryDisabled,
+		projectTrustOverride: config.projectTrustOverride,
+		projectTrustDecision: config.projectTrustDecision ? { ...config.projectTrustDecision } : undefined,
 		initialGoal: config.initialGoal ? { ...config.initialGoal } : undefined,
 	};
 }

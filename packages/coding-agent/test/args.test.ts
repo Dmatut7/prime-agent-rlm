@@ -72,6 +72,39 @@ describe("parseArgs", () => {
 		});
 	});
 
+	describe("--approve / --no-approve flags", () => {
+		test("parses --approve as a trust override", () => {
+			const result = parseArgs(["--approve"]);
+			expect(result.projectTrustOverride).toBe(true);
+		});
+
+		test("parses -a shorthand", () => {
+			const result = parseArgs(["-a"]);
+			expect(result.projectTrustOverride).toBe(true);
+		});
+
+		test("parses --no-approve as an untrusted override", () => {
+			const result = parseArgs(["--no-approve"]);
+			expect(result.projectTrustOverride).toBe(false);
+		});
+
+		test("parses -na shorthand", () => {
+			const result = parseArgs(["-na"]);
+			expect(result.projectTrustOverride).toBe(false);
+		});
+
+		test("the last trust override wins when both are passed", () => {
+			const result = parseArgs(["--approve", "--no-approve"]);
+			expect(result.projectTrustOverride).toBe(false);
+		});
+
+		test("leaves the override unset by default", () => {
+			const result = parseArgs(["say hi"]);
+			expect(result.projectTrustOverride).toBeUndefined();
+			expect(result.unknownFlags.size).toBe(0);
+		});
+	});
+
 	describe("--resume flag", () => {
 		test("parses --resume flag", () => {
 			const result = parseArgs(["--resume"]);

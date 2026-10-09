@@ -173,6 +173,37 @@ describe("mergeAgentSessionRuntimeConfig", () => {
 		expect(mergeAgentSessionRuntimeConfig({}, {}).telemetryDisabled).toBeUndefined();
 	});
 
+	it("carries the project trust override and decision through config merges", () => {
+		const base: AgentSessionRuntimeConfig = {
+			cwd: "/repo",
+			projectTrustOverride: true,
+			projectTrustDecision: { cwd: "/repo", trusted: true },
+		};
+
+		// An unrelated override keeps both trust fields.
+		const kept = mergeAgentSessionRuntimeConfig(base, { model: "openai/gpt-4o" });
+		expect(kept.projectTrustOverride).toBe(true);
+		expect(kept.projectTrustDecision).toEqual({ cwd: "/repo", trusted: true });
+
+		// A later override replaces them (e.g. the worker's per-create config).
+		const replaced = mergeAgentSessionRuntimeConfig(base, {
+			projectTrustOverride: false,
+			projectTrustDecision: { cwd: "/other", trusted: false },
+		});
+		expect(replaced.projectTrustOverride).toBe(false);
+		expect(replaced.projectTrustDecision).toEqual({ cwd: "/other", trusted: false });
+	});
+
+	it("clones the project trust decision so the merged config owns its copy", () => {
+		const base: AgentSessionRuntimeConfig = {
+			cwd: "/repo",
+			projectTrustDecision: { cwd: "/repo", trusted: true },
+		};
+		const merged = mergeAgentSessionRuntimeConfig(base);
+		base.projectTrustDecision!.trusted = false;
+		expect(merged.projectTrustDecision?.trusted).toBe(true);
+	});
+
 	it("persists only typed daemon host settings", () => {
 		const durable = durableAgentSessionRuntimeConfig({
 			cwd: "/repo",

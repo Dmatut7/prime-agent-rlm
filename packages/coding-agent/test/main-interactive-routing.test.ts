@@ -21,6 +21,7 @@ import {
 	isClientOwnedDaemonSession,
 	parseAgentsViewCommand,
 	prefireDaemonInteractiveConnection,
+	resolveRuntimeProjectTrust,
 	resolveRuntimeSessionOptions,
 	sessionSelectorRecoveryHint,
 	shouldEnsureDaemonBeforeActiveSessionLookup,
@@ -409,6 +410,22 @@ describe("runtime session option resolution", () => {
 				initialGoal: headlessCreateConfig.initialGoal,
 			}),
 		).toMatchObject({ initialGoal: headlessCreateConfig.initialGoal });
+	});
+
+	test("resolves runtime project trust: override first, decision only for its own cwd", () => {
+		// The run-wide CLI override beats everything.
+		expect(resolveRuntimeProjectTrust({ projectTrustOverride: true }, "/anywhere")).toBe(true);
+		expect(resolveRuntimeProjectTrust({ projectTrustOverride: false }, "/repo")).toBe(false);
+
+		// The resolved decision applies only to the cwd it was resolved for.
+		expect(resolveRuntimeProjectTrust({ projectTrustDecision: { cwd: "/repo", trusted: true } }, "/repo")).toBe(true);
+		expect(
+			resolveRuntimeProjectTrust({ projectTrustDecision: { cwd: "/repo", trusted: true } }, "/other"),
+		).toBeUndefined();
+
+		// No override, no matching decision: undefined, so the loader falls back to
+		// the persisted trust store (fail closed for undecided directories).
+		expect(resolveRuntimeProjectTrust({}, "/repo")).toBeUndefined();
 	});
 
 	test("preserves daemon-provided RLM heartbeat controller when creating sessions", () => {

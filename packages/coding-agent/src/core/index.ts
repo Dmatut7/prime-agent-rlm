@@ -77,6 +77,13 @@ export {
 	type TurnStartEvent,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.js";
+export {
+	hasProjectExtensionInputs,
+	PROJECT_TRUST_FILE_NAME,
+	type ProjectTrustPrompt,
+	ProjectTrustStore,
+	resolveProjectTrust,
+} from "./project-trust.js";
 export type { RefinementResult } from "./refinement/index.js";
 export type { CreateRlmSubagentRuntimeOptions, RlmSubagentRuntime, SubagentRuntimeHost } from "./rlm-runtime.js";
 export { SessionImportFileNotFoundError } from "./session-import-errors.js";

@@ -8,11 +8,12 @@ import type { ResourceDiagnostic } from "./diagnostics.js";
 
 export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.js";
 
-import { canonicalizePath, isLocalPath } from "../utils/paths.js";
+import { canonicalizePath, formatPathRelativeToCwdOrAbsolute, isLocalPath } from "../utils/paths.js";
 import { createEventBus, type EventBus } from "./event-bus.js";
 import { createExtensionRuntime, loadExtensionFromFactory, loadExtensions } from "./extensions/loader.js";
 import type { Extension, ExtensionFactory, ExtensionRuntime, LoadExtensionsResult } from "./extensions/types.js";
 import { DefaultPackageManager, type MissingSourceAction, type PathMetadata } from "./package-manager.js";
+import { ProjectTrustStore } from "./project-trust.js";
 import type { PromptTemplate } from "./prompt-templates.js";
 import { loadPromptTemplates } from "./prompt-templates.js";
 import { SettingsManager } from "./settings-manager.js";
@@ -123,6 +124,13 @@ export interface DefaultResourceLoaderOptions {
 	additionalPromptTemplatePaths?: string[];
 	additionalThemePaths?: string[];
 	extensionFactories?: ExtensionFactory[];
+	/**
+	 * May project-scoped extensions load? Explicit, cwd-resolved answer from the
+	 * caller (the CLI's trust resolution); when omitted, the saved decision in
+	 * the agent dir's trust store decides, and an undecided directory fails
+	 * closed. See core/project-trust.ts.
+	 */
+	projectTrusted?: boolean;
 	noExtensions?: boolean;
 	noSkills?: boolean;
 	noPromptTemplates?: boolean;
@@ -202,6 +210,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	private extensionsResult: LoadExtensionsResult;
 	private loadedExtensionPaths: string[] = [];
+	/** Trust-gate notices from the last reload (project extensions held back). */
+	private projectTrustDiagnostics: ResourceDiagnostic[] = [];
+	private projectTrusted: boolean;
+	private trustStorePath: string;
 	private skills: Skill[];
 	private skillDiagnostics: ResourceDiagnostic[];
 	private prompts: PromptTemplate[];
@@ -224,12 +236,19 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.settingsManager = options.settingsManager ?? SettingsManager.create(this.cwd, this.agentDir);
 		this.eventBus = options.eventBus ?? createEventBus();
 		this.bundledSkillsDir = options.bundledSkillsDir === undefined ? getBundledSkillsDir() : options.bundledSkillsDir;
+		// Trust resolution for this loader's cwd: an explicit answer wins; without
+		// one the persisted decision decides, and an undecided cwd fails closed
+		// (the interactive CLI is the only writer of new decisions).
+		const trustStore = new ProjectTrustStore(this.agentDir);
+		this.trustStorePath = trustStore.filePath();
+		this.projectTrusted = options.projectTrusted ?? trustStore.get(this.cwd) === true;
 		this.packageManager = new DefaultPackageManager({
 			cwd: this.cwd,
 			agentDir: this.agentDir,
 			settingsManager: this.settingsManager,
 			bundledSkillsDir: this.bundledSkillsDir,
 			extraBuiltinSkillOverrides: options.extraBuiltinSkillOverrides,
+			projectTrusted: this.projectTrusted,
 		});
 		this.additionalExtensionPaths = options.additionalExtensionPaths ?? [];
 		this.additionalSkillPaths = options.additionalSkillPaths ?? [];
@@ -276,6 +295,16 @@ export class DefaultResourceLoader implements ResourceLoader {
 	/** Extension file paths the last reload actually loaded (after settings overrides). */
 	getLoadedExtensionPaths(): string[] {
 		return this.loadedExtensionPaths;
+	}
+
+	/**
+	 * Notices from the extension trust gate: non-empty when the last reload held
+	 * project-scoped extensions back because the cwd is not trusted. Callers that
+	 * surface diagnostics to a user (or a machine stream) must show these so the
+	 * refusal is never silent.
+	 */
+	getProjectTrustDiagnostics(): ResourceDiagnostic[] {
+		return [...this.projectTrustDiagnostics];
 	}
 
 	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] } {
@@ -373,6 +402,18 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const enabledSkillResources = getEnabledResources(resolvedPaths.skills);
 		const enabledPrompts = getEnabledPaths(resolvedPaths.prompts);
 		const enabledThemes = getEnabledPaths(resolvedPaths.themes);
+
+		// The trust gate's refusal is never silent: one warning naming what was
+		// held back and how to change the decision, refreshed every reload.
+		const skippedProjectExtensions = this.packageManager.getLastSkippedProjectExtensions();
+		this.projectTrustDiagnostics = skippedProjectExtensions.map((entry) => ({
+			type: "warning" as const,
+			path: entry.path,
+			message:
+				`Project extension "${formatPathRelativeToCwdOrAbsolute(entry.path, this.cwd)}" was not loaded: ` +
+				`${this.cwd} is not trusted. Trust the directory by running prime-agent interactively here ` +
+				`(your answer is saved) or pass --approve for one run; saved decisions live in ${this.trustStorePath}.`,
+		}));
 
 		const mapSkillPath = (resource: { path: string; metadata: PathMetadata }): string => {
 			if (resource.metadata.source !== "auto" && resource.metadata.origin !== "package") {

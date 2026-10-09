@@ -39,6 +39,7 @@ import {
 	expandTildePath,
 	getAgentDir,
 	getSessionDirEnvOverride,
+	getSessionsDir,
 	VERSION,
 } from "./config.js";
 import {
@@ -74,6 +75,12 @@ import {
 } from "./core/model-resolver.js";
 import { flushOrphanProcessJournal } from "./core/orphan-process-journal.js";
 import { restoreStdout, takeOverStdout, writeRawStdout } from "./core/output-guard.js";
+import {
+	hasProjectExtensionInputs,
+	ProjectTrustStore,
+	projectTrustKey,
+	resolveProjectTrust,
+} from "./core/project-trust.js";
 import type { CreateAgentSessionOptions } from "./core/sdk.js";
 import {
 	formatMissingSessionCwdPrompt,
@@ -126,7 +133,7 @@ import {
 import type { AgentConnection, AgentsViewModeOptions, AgentsViewScopeKey, SessionSummary } from "./modes/index.js";
 import { handleConfigCommand } from "./package-manager-cli.js";
 import { normalizeSocketPath } from "./utils/daemon-socket-path.js";
-import { isLocalPath } from "./utils/paths.js";
+import { formatPathRelativeToCwdOrAbsolute, isLocalPath } from "./utils/paths.js";
 import { readPipedStdin } from "./utils/piped-stdin.js";
 
 function collectSettingsDiagnostics(
@@ -923,6 +930,7 @@ function runtimeConfigFromArgs(
 	sessionDir: string | undefined,
 	appMode: AppMode,
 	telemetryDisabled?: true,
+	projectTrustDecision?: { cwd: string; trusted: boolean },
 ): AgentSessionRuntimeConfig {
 	return {
 		cwd,
@@ -947,6 +955,12 @@ function runtimeConfigFromArgs(
 		themes: resolveCliPaths(cwd, parsed.themes),
 		noThemes: parsed.noThemes,
 		noContextFiles: parsed.noContextFiles,
+		// Trust gate: the CLI override is run-wide; the resolved decision is
+		// bound to this session's cwd and honored only there (see
+		// prepareRuntimeServices), so an attached session from another directory
+		// falls back to that directory's own stored decision.
+		projectTrustOverride: parsed.projectTrustOverride,
+		projectTrustDecision,
 		autonomous: runtimeAutonomousConfigFromArgs(parsed),
 		extensionFlagValues: parsed.unknownFlags.size > 0 ? Object.fromEntries(parsed.unknownFlags.entries()) : undefined,
 		executionMode: appMode === "daemon" ? undefined : appMode,
@@ -1061,6 +1075,23 @@ export function createDefaultRuntimeFactory(
 	};
 }
 
+/**
+ * Effective project-extension trust for one runtime cwd from the session
+ * config: the run-wide CLI override wins, then the client-resolved decision
+ * for exactly this cwd, then undefined (the loader consults the persisted
+ * trust store and fails closed for undecided directories).
+ */
+export function resolveRuntimeProjectTrust(config: AgentSessionRuntimeConfig, cwd: string): boolean | undefined {
+	if (config.projectTrustOverride !== undefined) {
+		return config.projectTrustOverride;
+	}
+	const decision = config.projectTrustDecision;
+	if (decision && projectTrustKey(decision.cwd) === projectTrustKey(cwd)) {
+		return decision.trusted;
+	}
+	return undefined;
+}
+
 async function prepareRuntimeServices(options: {
 	config: AgentSessionRuntimeConfig;
 	cwd: string;
@@ -1095,6 +1126,12 @@ async function prepareRuntimeServices(options: {
 			noContextFiles: config.noContextFiles,
 			systemPrompt: config.systemPrompt,
 			appendSystemPrompt: config.appendSystemPrompt,
+			// Extension trust gate: the CLI override is run-wide; the client's
+			// resolved decision applies only to the cwd it was resolved for (an
+			// attached or restored session in another directory must not inherit
+			// it); anything else falls back to the persisted trust store in the
+			// loader itself, which fails closed for undecided directories.
+			projectTrusted: resolveRuntimeProjectTrust(config, options.cwd),
 			extensionFactories: options.extensionFactories,
 		},
 	});
@@ -1222,6 +1259,67 @@ async function promptForMissingSessionCwd(
 			formatMissingSessionCwdPrompt(issue),
 			["Continue", "Cancel"],
 			(option) => finish(option === "Continue" ? issue.fallbackCwd : undefined),
+			() => finish(undefined),
+			{ tui: ui },
+		);
+		ui.addChild(selector);
+		ui.setFocus(selector);
+		ui.start();
+	});
+}
+
+/**
+ * The interactive half of the extension trust gate: ask once whether this
+ * directory's project extensions may run. Mirrors the startup selector above
+ * (own TUI before the main interface starts, so nothing gated has loaded yet).
+ */
+async function promptForProjectTrust(
+	settingsManager: SettingsManager,
+	cwd: string,
+	extensionsDir: string,
+): Promise<{ trusted: boolean; remember: boolean } | undefined> {
+	releaseStartupCtrlC();
+	const [{ initTheme }, { ExtensionSelectorComponent }] = await Promise.all([
+		import("./modes/interactive/theme/theme.js"),
+		import("./modes/interactive/components/extension-selector.js"),
+	]);
+	initTheme(settingsManager.getTheme());
+	setKeybindings(KeybindingsManager.create());
+
+	const title = [
+		"Trust this project's extensions?",
+		`${cwd}`,
+		"",
+		`Extensions in ${formatPathRelativeToCwdOrAbsolute(extensionsDir, cwd)} run with your permissions when trusted.`,
+		"Only trust repositories you have reviewed.",
+	].join("\n");
+
+	const options = [
+		["Trust", { trusted: true, remember: true }],
+		["Trust (this session only)", { trusted: true, remember: false }],
+		["Do not trust", { trusted: false, remember: true }],
+		["Do not trust (this session only)", { trusted: false, remember: false }],
+	] as const;
+
+	return new Promise<{ trusted: boolean; remember: boolean } | undefined>((resolve) => {
+		const ui = new TUI(new ProcessTerminal(), settingsManager.getShowHardwareCursor());
+		ui.setClearOnShrink(settingsManager.getClearOnShrink());
+
+		let settled = false;
+		const finish = (result: { trusted: boolean; remember: boolean } | undefined) => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			ui.stop();
+			resolve(result);
+		};
+
+		const selector = new ExtensionSelectorComponent(
+			title,
+			options.map(([label]) => label),
+			(option) => finish(options.find(([label]) => label === option)?.[1]),
+			// A dismissed prompt (Esc / Ctrl+C) decides nothing for the future.
 			() => finish(undefined),
 			{ tui: ui },
 		);
@@ -1822,6 +1920,35 @@ export async function main(args: string[], options?: MainOptions) {
 	const telemetrySettingsManager =
 		sessionCwd === cwd ? startupSettingsManager : SettingsManager.create(sessionCwd, agentDir);
 	const telemetryDisabled = isTelemetryEnabled(telemetrySettingsManager) ? undefined : true;
+
+	// Extension trust gate (GHSA-mqxh-6gq7-558m port): project-scoped extensions
+	// load only for a directory the user has trusted. Resolved once here, before
+	// any runtime services are prepared or the daemon create is prefired, so the
+	// interactive prompt happens before anything could have loaded the gated code.
+	// Machine modes never prompt - they fail closed and say why, because an
+	// unattended run must not hang on a question nobody can answer.
+	const trustStore = new ProjectTrustStore(agentDir);
+	trustStore.ensureCreated();
+	const trustPromptEligible = appMode === "interactive" && parsed.listModels === undefined;
+	const sessionTrustSettingsManager = sessionCwd === cwd ? startupSettingsManager : telemetrySettingsManager;
+	const projectTrust = await resolveProjectTrust({
+		cwd: sessionCwd,
+		projectSettings: sessionTrustSettingsManager.getProjectSettings(),
+		store: trustStore,
+		override: parsed.projectTrustOverride,
+		interactive: trustPromptEligible,
+		hasPriorSession: () => findMostRecentSessionForCwd(sessionDir ?? getSessionsDir(agentDir), sessionCwd) !== null,
+		prompt: trustPromptEligible
+			? (promptCwd, extensionsDir) => promptForProjectTrust(sessionTrustSettingsManager, promptCwd, extensionsDir)
+			: undefined,
+		// Every refusal and every grandfathered trust gets a stderr line: this
+		// point is before the TUI starts (safe to print) and before any machine
+		// stream matters, so interactive and unattended users both see why.
+		notify: (message) => console.error(wrapForStderr(stderrChalk.yellow(message))),
+	});
+	const sessionTrustInputs = hasProjectExtensionInputs(sessionCwd, sessionTrustSettingsManager.getProjectSettings());
+	const projectTrustDecision =
+		appMode === "daemon" || !sessionTrustInputs ? undefined : { cwd: sessionCwd, trusted: projectTrust.trusted };
 	const defaultSessionConfig = runtimeConfigFromArgs(
 		parsed,
 		sessionCwd,
@@ -1829,6 +1956,7 @@ export async function main(args: string[], options?: MainOptions) {
 		sessionDir,
 		appMode,
 		telemetryDisabled,
+		projectTrustDecision,
 	);
 	// Verifier/headless clients pass initialGoal in each create request. The long-lived
 	// daemon fallback must not seed that goal into unrelated future sessions.

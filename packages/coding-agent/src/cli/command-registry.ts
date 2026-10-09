@@ -266,6 +266,8 @@ const TOP_LEVEL_OPTION_GROUPS: ReadonlyArray<{ heading: string; options: readonl
 			["-nbt, --no-builtin-tools", "Disable built-in tools by default"],
 			["-e, --extension <source>", "Load an extension (repeatable)"],
 			["-ne, --no-extensions", "Disable extension discovery"],
+			["-a, --approve", "Trust project-local extensions for this run"],
+			["-na, --no-approve", "Ignore project-local extensions for this run"],
 			["--skill <path>", "Load a skill (repeatable)"],
 			["-ns, --no-skills", "Disable skill discovery"],
 			["--prompt-template <path>", "Load a prompt template (repeatable)"],

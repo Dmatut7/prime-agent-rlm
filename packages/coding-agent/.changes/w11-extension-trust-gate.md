@@ -1,0 +1,1 @@
+- Added a project extension trust gate: `.prime/agent/extensions` and project-settings extension sources load only after the directory is trusted, asked once interactively, refused with an explanation in non-interactive runs (never a blocking prompt), overridable with `--approve`/`--no-approve`, and auto-trusted once for directories already in use when the gate landed.

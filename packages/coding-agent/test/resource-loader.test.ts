@@ -182,7 +182,9 @@ Project skill`,
 			symlinkSync(sharedExtDir, join(agentDir, "extensions"), "dir");
 			symlinkSync(sharedExtDir, join(cwd, ".prime", "agent", "extensions"), "dir");
 
-			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			// Project-scope extensions are trust-gated; this test pins the
+			// dedup/precedence behavior, so the project side must be trusted.
+			const loader = new DefaultResourceLoader({ cwd, agentDir, projectTrusted: true });
 			await loader.reload();
 
 			const extensionsResult = loader.getExtensions();
@@ -228,7 +230,7 @@ Project skill`,
 }`,
 			);
 
-			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			const loader = new DefaultResourceLoader({ cwd, agentDir, projectTrusted: true });
 			await loader.reload();
 
 			const extensionsResult = loader.getExtensions();
