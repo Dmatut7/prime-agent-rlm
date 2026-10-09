@@ -190,7 +190,8 @@ describeIfKernel("kernel snapshot honesty (real runtime)", { tags: ["kernel-heav
 			// reads live globals (the frozen-copy semantics the notice warned about are
 			// gone), so it IS available again — and it must not be listed as degraded.
 			expect(restore?.restored).toContain("helper");
-			expect(restore?.degraded?.map((entry) => entry.name)).not.toContain("helper");
+			const degradedNames = (restore?.degraded ?? []).map((entry: { name: string }) => entry.name);
+			expect(degradedNames).not.toContain("helper");
 			expect(restore?.restored).toContain("plain");
 			// A function that genuinely cannot be revived (a lambda over a closed-over
 			// object the snapshot does not carry) still lands in degraded, not restored.
