@@ -1,0 +1,1 @@
+- Fixed PI_STARTUP_BENCHMARK hanging on the extension trust prompt in a gated directory: benchmark runs now take the machine-mode fail-closed path instead of waiting on a dialog nobody can answer.

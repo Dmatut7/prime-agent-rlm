@@ -21,6 +21,10 @@ export interface ExtensionSelectorOptions {
 	tui?: TUI;
 	timeout?: number;
 	getRows?: () => number;
+	/** Pre-formatted replacement for the footer's cancel hint segment. */
+	cancelHint?: string;
+	/** Extra pre-formatted hint segment appended after the cancel segment. */
+	extraHint?: string;
 }
 
 const PREFERRED_VISIBLE_OPTIONS = 8;
@@ -98,15 +102,13 @@ export class ExtensionSelectorComponent extends Container {
 		this.listContainer = new MenuList({ compact: true });
 		this.panel.addChild(this.listContainer);
 		this.panel.addChild(new Spacer(1));
+		const cancelHint = opts?.cancelHint ?? keyHint("tui.select.cancel", "取消");
+		const extraHint = opts?.extraHint ? `  ${opts.extraHint}` : "";
 		this.panel.addChild(
 			// Truncated, never wrapped: the hints stay one row so the row budget
 			// holds at narrow widths (a wrapping footer used to break it).
 			new TruncatedText(
-				rawKeyHint("↑↓", "移动") +
-					"  " +
-					keyHint("tui.select.confirm", "选择") +
-					"  " +
-					keyHint("tui.select.cancel", "取消"),
+				`${rawKeyHint("↑↓", "移动")}  ${keyHint("tui.select.confirm", "选择")}  ${cancelHint}${extraHint}`,
 				1,
 				0,
 			),

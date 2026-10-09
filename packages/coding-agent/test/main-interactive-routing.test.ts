@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { StaleDaemonError } from "../src/cli/daemon-launch.js";
-import { APP_NAME } from "../src/config.js";
+import { APP_NAME, getSessionsDir } from "../src/config.js";
 import { mergeAgentSessionRuntimeConfig } from "../src/core/agent-session-config.js";
 import type { CreateAgentSessionOptions } from "../src/core/sdk.js";
 import { SessionAlreadyActiveError } from "../src/core/session-lease.js";
@@ -19,8 +19,10 @@ import {
 	findActiveDaemonSessionSummaryForSessionFile,
 	type InteractiveDaemonStartupDecision,
 	isClientOwnedDaemonSession,
+	isProjectTrustPromptEligible,
 	parseAgentsViewCommand,
 	prefireDaemonInteractiveConnection,
+	projectTrustEvidenceDir,
 	resolveRuntimeProjectTrust,
 	resolveRuntimeSessionOptions,
 	sessionSelectorRecoveryHint,
@@ -426,6 +428,44 @@ describe("runtime session option resolution", () => {
 		// No override, no matching decision: undefined, so the loader falls back to
 		// the persisted trust store (fail closed for undecided directories).
 		expect(resolveRuntimeProjectTrust({}, "/repo")).toBeUndefined();
+	});
+
+	test("project trust prompt eligibility: only plain interactive runs may prompt", () => {
+		expect(
+			isProjectTrustPromptEligible({ appMode: "interactive", listModels: undefined, startupBenchmark: false }),
+		).toBe(true);
+
+		// Machine modes never prompt - they fail closed.
+		for (const appMode of ["print", "json", "rpc", "acp", "daemon"] as const) {
+			expect(isProjectTrustPromptEligible({ appMode, listModels: undefined, startupBenchmark: false })).toBe(false);
+		}
+
+		// --list-models answers and exits; it must not sit on a trust dialog.
+		expect(
+			isProjectTrustPromptEligible({ appMode: "interactive", listModels: "provider", startupBenchmark: false }),
+		).toBe(false);
+		expect(isProjectTrustPromptEligible({ appMode: "interactive", listModels: true, startupBenchmark: false })).toBe(
+			false,
+		);
+
+		// PI_STARTUP_BENCHMARK has no human at the keyboard: a gated input
+		// directory must take the machine-mode fail-closed path, not hang.
+		expect(
+			isProjectTrustPromptEligible({ appMode: "interactive", listModels: undefined, startupBenchmark: true }),
+		).toBe(false);
+	});
+
+	test("grandfather evidence stays in the agent-dir sessions scope when settings redirect sessionDir", () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "pi-trust-evidence-"));
+		try {
+			// A sessionDir that project-scope settings could have pointed at a
+			// repository-controlled directory must not become the evidence dir.
+			expect(projectTrustEvidenceDir(agentDir, "/repo/controlled/sessions")).toBe(getSessionsDir(agentDir));
+			// The agent-dir default is used when nothing redirects it.
+			expect(projectTrustEvidenceDir(agentDir, undefined)).toBe(getSessionsDir(agentDir));
+		} finally {
+			rmSync(agentDir, { recursive: true, force: true });
+		}
 	});
 
 	test("preserves daemon-provided RLM heartbeat controller when creating sessions", () => {

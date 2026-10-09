@@ -338,6 +338,27 @@ describe("resolveProjectTrust", () => {
 		expect(store.get(projectDir)).toBe(false);
 	});
 
+	it("does not announce an explicit interactive refusal: the in-app warning already covers it", async () => {
+		store.ensureCreated();
+		const prompt: ProjectTrustPrompt = async () => ({ trusted: false, remember: true });
+		const notify = vi.fn();
+
+		const resolution = await resolveProjectTrust({
+			cwd: projectDir,
+			projectSettings: {},
+			store,
+			interactive: true,
+			prompt,
+			notify,
+		});
+
+		// The user just answered the question; the resource loader's refreshed
+		// in-app warning is the one announcement of the held-back extensions.
+		expect(resolution).toEqual({ trusted: false, reason: "prompt" });
+		expect(store.get(projectDir)).toBe(false);
+		expect(notify).not.toHaveBeenCalled();
+	});
+
 	it("honors a session-only trust answer without persisting it", async () => {
 		store.ensureCreated();
 		const prompt: ProjectTrustPrompt = async () => ({ trusted: true, remember: false });
@@ -370,6 +391,54 @@ describe("resolveProjectTrust", () => {
 
 		expect(resolution).toEqual({ trusted: false, reason: "prompt-cancelled" });
 		expect(store.get(projectDir)).toBeNull();
+		expect(notify).toHaveBeenCalledTimes(1);
+	});
+
+	it("skips the prompt and the refusal notice when extensions are disabled for the run", async () => {
+		store.ensureCreated();
+		const { prompt, calls } = promptRecording();
+		const notify = vi.fn();
+
+		const resolution = await resolveProjectTrust({
+			cwd: projectDir,
+			projectSettings: {},
+			store,
+			interactive: true,
+			prompt,
+			notify,
+			// --no-extensions: the answer cannot change this run, so there is
+			// nothing a human could usefully decide and nothing to announce.
+			extensionsDisabled: true,
+		});
+
+		expect(resolution).toEqual({ trusted: false, reason: "machine-default" });
+		expect(calls).toEqual([]);
+		expect(notify).not.toHaveBeenCalled();
+		expect(store.get(projectDir)).toBeNull();
+	});
+
+	it("still grandfathers a prior-use directory when extensions are disabled for the run", async () => {
+		store.ensureCreated();
+		const { prompt, calls } = promptRecording();
+		const notify = vi.fn();
+
+		const resolution = await resolveProjectTrust({
+			cwd: projectDir,
+			projectSettings: {},
+			store,
+			interactive: true,
+			prompt,
+			notify,
+			extensionsDisabled: true,
+			hasPriorSession: () => true,
+		});
+
+		// Grandfathering persists a decision for future (extension-enabled)
+		// runs, so it still applies - and its notice still explains what was
+		// persisted and where to change it.
+		expect(resolution).toEqual({ trusted: true, reason: "grandfathered" });
+		expect(calls).toEqual([]);
+		expect(store.get(projectDir)).toBe(true);
 		expect(notify).toHaveBeenCalledTimes(1);
 	});
 

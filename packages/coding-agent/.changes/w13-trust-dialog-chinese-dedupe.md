@@ -1,0 +1,1 @@
+- Translated the project-extension trust dialog into Chinese to match the interface language, and stopped printing the startup refusal notice on top of the in-app not-trusted warning when the user answers "do not trust".

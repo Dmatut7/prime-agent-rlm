@@ -1,0 +1,1 @@
+- Fixed the extension trust gate's upgrade grandfathering for directories entered through a symlink: prior-session evidence now compares canonical (realpath) spellings, so a session recorded under one spelling of the directory still matches the other.

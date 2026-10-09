@@ -1,0 +1,1 @@
+- Fixed Ctrl+C during the project-extension trust prompt: it now exits the run cleanly instead of silently answering "not trusted, continue", and the startup Ctrl+C guard is re-armed after the prompt until the main interface takes over.

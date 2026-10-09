@@ -712,4 +712,34 @@ export default function(pi: ExtensionAPI) {
 			expect(runner.getToolDefinition("duplicate-tool")?.description).toBe("explicit tool");
 		});
 	});
+
+	describe("project trust diagnostics", () => {
+		function writeProjectExtension(): void {
+			const extDir = join(cwd, ".prime/agent/extensions");
+			mkdirSync(extDir, { recursive: true });
+			writeFileSync(join(extDir, "project.ts"), "export default () => {}");
+		}
+
+		it("warns when project extensions are held back by an untrusted directory", async () => {
+			writeProjectExtension();
+
+			const loader = new DefaultResourceLoader({ cwd, agentDir, projectTrusted: false });
+			await loader.reload();
+
+			const diagnostics = loader.getProjectTrustDiagnostics();
+			expect(diagnostics.length).toBeGreaterThan(0);
+			expect(diagnostics[0]?.message).toContain("not trusted");
+		});
+
+		it("emits no not-trusted warnings when extensions are disabled for the run", async () => {
+			writeProjectExtension();
+
+			const loader = new DefaultResourceLoader({ cwd, agentDir, projectTrusted: false, noExtensions: true });
+			await loader.reload();
+
+			// --no-extensions already explains why nothing loads; a trust warning
+			// on top of it would be a second, misleading announcement of the same.
+			expect(loader.getProjectTrustDiagnostics()).toEqual([]);
+		});
+	});
 });

@@ -43,6 +43,7 @@ import {
 } from "../utils/file-lines.js";
 import { captureGitContext, type GitContext, gitContextsEqual } from "../utils/git.js";
 import { DEFAULT_MAP_CONCURRENCY_LIMIT, mapConcurrent } from "../utils/map-concurrent.js";
+import { canonicalizePath } from "../utils/paths.js";
 import {
 	appendPrivateFile,
 	assertRegularFileNoSymlink,
@@ -2235,7 +2236,12 @@ export function findMostRecentSession(sessionDir: string): string | null {
 }
 
 function normalizeCwd(cwd: string): string {
-	return resolve(cwd);
+	// The trust store keys by realpath, so header/cwd comparison must too: a
+	// directory entered through a symlink (or recorded before the physical
+	// spelling changed) is still the same directory. realpathSync fails for a
+	// path that no longer exists; the resolved spelling is the fallback and
+	// still matches headers recorded with that same spelling.
+	return canonicalizePath(resolve(cwd));
 }
 
 function sessionInfoMatchesCwd(session: SessionInfo, cwd: string): boolean {

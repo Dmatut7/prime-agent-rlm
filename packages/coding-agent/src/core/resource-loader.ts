@@ -405,15 +405,19 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 		// The trust gate's refusal is never silent: one warning naming what was
 		// held back and how to change the decision, refreshed every reload.
+		// --no-extensions is its own, user-chosen reason nothing loads, so the
+		// trust warning would be a second, misleading announcement of the same.
 		const skippedProjectExtensions = this.packageManager.getLastSkippedProjectExtensions();
-		this.projectTrustDiagnostics = skippedProjectExtensions.map((entry) => ({
-			type: "warning" as const,
-			path: entry.path,
-			message:
-				`Project extension "${formatPathRelativeToCwdOrAbsolute(entry.path, this.cwd)}" was not loaded: ` +
-				`${this.cwd} is not trusted. Trust the directory by running prime-agent interactively here ` +
-				`(your answer is saved) or pass --approve for one run; saved decisions live in ${this.trustStorePath}.`,
-		}));
+		this.projectTrustDiagnostics = this.noExtensions
+			? []
+			: skippedProjectExtensions.map((entry) => ({
+					type: "warning" as const,
+					path: entry.path,
+					message:
+						`Project extension "${formatPathRelativeToCwdOrAbsolute(entry.path, this.cwd)}" was not loaded: ` +
+						`${this.cwd} is not trusted. Trust the directory by running prime-agent interactively here ` +
+						`(your answer is saved) or pass --approve for one run; saved decisions live in ${this.trustStorePath}.`,
+				}));
 
 		const mapSkillPath = (resource: { path: string; metadata: PathMetadata }): string => {
 			if (resource.metadata.source !== "auto" && resource.metadata.origin !== "package") {

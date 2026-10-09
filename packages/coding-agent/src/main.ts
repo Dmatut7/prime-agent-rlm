@@ -10,7 +10,14 @@ import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { type Api, type ImageContent, type Model, modelsAreEqual } from "@earendil-works/pi-ai";
 import { registerBuiltinMcpOAuthProviders } from "@earendil-works/pi-ai/mcp";
-import { engageEarlyRawMode, ProcessTerminal, releaseEarlyRawMode, setKeybindings, TUI } from "@earendil-works/pi-tui";
+import {
+	engageEarlyRawMode,
+	ProcessTerminal,
+	releaseEarlyRawMode,
+	setKeybindings,
+	type Terminal,
+	TUI,
+} from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { type Args, type Mode, parseArgs } from "./cli/args.js";
 import { formatTopLevelHelp } from "./cli/command-registry.js";
@@ -1095,6 +1102,35 @@ export function resolveRuntimeProjectTrust(config: AgentSessionRuntimeConfig, cw
 	return undefined;
 }
 
+/**
+ * Whether the trust gate may show its interactive prompt for this run. Machine
+ * modes never prompt (they fail closed), and neither do the special interactive
+ * runs that answer no human: a startup benchmark must not hang on a dialog, so
+ * it takes the machine-mode fail-closed path.
+ */
+export function isProjectTrustPromptEligible(options: {
+	appMode: AppMode;
+	listModels: string | true | undefined;
+	startupBenchmark: boolean;
+}): boolean {
+	return options.appMode === "interactive" && options.listModels === undefined && !options.startupBenchmark;
+}
+
+/**
+ * Directory the grandfather rule reads prior-session evidence from. Pinned to
+ * the agent-dir sessions scope: a project's own settings may redirect where
+ * sessions are stored, but repository-controlled files must never be able to
+ * fabricate the prior-use evidence that auto-trusts the directory.
+ */
+export function projectTrustEvidenceDir(agentDir: string, _sessionDir: string | undefined): string {
+	// The _sessionDir parameter is deliberately ignored: settings (including the
+	// project scope a repository controls) may redirect where sessions are
+	// stored, but must never be able to point the grandfather evidence at
+	// repository-controlled transcripts. getSessionsDir still honors the
+	// agent-scope env override, which the user's own environment controls.
+	return getSessionsDir(agentDir);
+}
+
 async function prepareRuntimeServices(options: {
 	config: AgentSessionRuntimeConfig;
 	cwd: string;
@@ -1271,60 +1307,102 @@ async function promptForMissingSessionCwd(
 	});
 }
 
+/** Copy shown by the interactive trust prompt, split out for tests. */
+export interface ProjectTrustPromptCopy {
+	title: string;
+	options: ReadonlyArray<{ label: string; choice: { trusted: boolean; remember: boolean } }>;
+}
+
+export function projectTrustPromptCopy(cwd: string, extensionsDir: string): ProjectTrustPromptCopy {
+	const title = [
+		"信任此项目的扩展？",
+		`${cwd}`,
+		"",
+		`信任后，${formatPathRelativeToCwdOrAbsolute(extensionsDir, cwd)} 中的扩展将以你的权限运行。`,
+		"仅信任你已审查过的仓库。",
+	].join("\n");
+
+	const options = [
+		["信任", { trusted: true, remember: true }],
+		["信任（仅本次会话）", { trusted: true, remember: false }],
+		["不信任", { trusted: false, remember: true }],
+		["不信任（仅本次会话）", { trusted: false, remember: false }],
+	] as const;
+
+	return {
+		title,
+		options: options.map(([label, choice]) => ({ label, choice })),
+	};
+}
+
+/** Injectable seams so the trust prompt's exit and stdin handoff are testable. */
+export interface ProjectTrustPromptDependencies {
+	terminal?: Terminal;
+	exit?: (code: number) => void;
+	keybindings?: KeybindingsManager;
+	installExitWatcher?: () => () => void;
+}
+
 /**
  * The interactive half of the extension trust gate: ask once whether this
  * directory's project extensions may run. Mirrors the startup selector above
  * (own TUI before the main interface starts, so nothing gated has loaded yet).
  */
-async function promptForProjectTrust(
+export async function promptForProjectTrust(
 	settingsManager: SettingsManager,
 	cwd: string,
 	extensionsDir: string,
+	deps: ProjectTrustPromptDependencies = {},
 ): Promise<{ trusted: boolean; remember: boolean } | undefined> {
 	releaseStartupCtrlC();
-	const [{ initTheme }, { ExtensionSelectorComponent }] = await Promise.all([
+	const [{ initTheme }, { ProjectTrustSelectorComponent }] = await Promise.all([
 		import("./modes/interactive/theme/theme.js"),
-		import("./modes/interactive/components/extension-selector.js"),
+		import("./modes/interactive/components/project-trust-selector.js"),
 	]);
 	initTheme(settingsManager.getTheme());
-	setKeybindings(KeybindingsManager.create());
+	setKeybindings(deps.keybindings ?? KeybindingsManager.create());
 
-	const title = [
-		"Trust this project's extensions?",
-		`${cwd}`,
-		"",
-		`Extensions in ${formatPathRelativeToCwdOrAbsolute(extensionsDir, cwd)} run with your permissions when trusted.`,
-		"Only trust repositories you have reviewed.",
-	].join("\n");
-
-	const options = [
-		["Trust", { trusted: true, remember: true }],
-		["Trust (this session only)", { trusted: true, remember: false }],
-		["Do not trust", { trusted: false, remember: true }],
-		["Do not trust (this session only)", { trusted: false, remember: false }],
-	] as const;
+	const copy = projectTrustPromptCopy(cwd, extensionsDir);
+	const exit = deps.exit ?? ((code: number) => process.exit(code));
+	const installExitWatcher = deps.installExitWatcher ?? installStartupCtrlCExit;
 
 	return new Promise<{ trusted: boolean; remember: boolean } | undefined>((resolve) => {
-		const ui = new TUI(new ProcessTerminal(), settingsManager.getShowHardwareCursor());
+		const ui = new TUI(deps.terminal ?? new ProcessTerminal(), settingsManager.getShowHardwareCursor());
 		ui.setClearOnShrink(settingsManager.getClearOnShrink());
 
 		let settled = false;
+		// The prompt took over stdin (and Ctrl+C handling) from the startup
+		// watcher when it started; when it finishes, put the exit guard back so
+		// the window before the next stdin owner (the deprecation gate or the
+		// TUI) still has an exit path.
 		const finish = (result: { trusted: boolean; remember: boolean } | undefined) => {
 			if (settled) {
 				return;
 			}
 			settled = true;
 			ui.stop();
+			releaseStartupCtrlCWatcher = installExitWatcher();
 			resolve(result);
 		};
+		// Ctrl+C must not land in the shared cancel binding next to Escape: a
+		// dismissed prompt means "untrusted, keep running". Exit cleanly instead,
+		// mirroring the missing-cwd prompt's Cancel.
+		const interrupt = () => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			ui.stop();
+			exit(0);
+		};
 
-		const selector = new ExtensionSelectorComponent(
-			title,
-			options.map(([label]) => label),
-			(option) => finish(options.find(([label]) => label === option)?.[1]),
-			// A dismissed prompt (Esc / Ctrl+C) decides nothing for the future.
+		const selector = new ProjectTrustSelectorComponent(
+			copy.title,
+			copy.options.map((option) => option.label),
+			(option) => finish(copy.options.find((candidate) => candidate.label === option)?.choice),
+			// A dismissed prompt (Esc) decides nothing for the future.
 			() => finish(undefined),
-			{ tui: ui },
+			{ tui: ui, onInterrupt: interrupt },
 		);
 		ui.addChild(selector);
 		ui.setFocus(selector);
@@ -1929,7 +2007,11 @@ export async function main(args: string[], options?: MainOptions) {
 	// unattended run must not hang on a question nobody can answer.
 	const trustStore = new ProjectTrustStore(agentDir);
 	trustStore.ensureCreated();
-	const trustPromptEligible = appMode === "interactive" && parsed.listModels === undefined;
+	const trustPromptEligible = isProjectTrustPromptEligible({
+		appMode,
+		listModels: parsed.listModels,
+		startupBenchmark,
+	});
 	const sessionTrustSettingsManager = sessionCwd === cwd ? startupSettingsManager : telemetrySettingsManager;
 	const projectTrust = await resolveProjectTrust({
 		cwd: sessionCwd,
@@ -1937,7 +2019,11 @@ export async function main(args: string[], options?: MainOptions) {
 		store: trustStore,
 		override: parsed.projectTrustOverride,
 		interactive: trustPromptEligible,
-		hasPriorSession: () => findMostRecentSessionForCwd(sessionDir ?? getSessionsDir(agentDir), sessionCwd) !== null,
+		// --no-extensions: nothing gated can load this run, so the prompt and
+		// the refusal notices are skipped (the answer would be meaningless).
+		extensionsDisabled: parsed.noExtensions === true,
+		hasPriorSession: () =>
+			findMostRecentSessionForCwd(projectTrustEvidenceDir(agentDir, sessionDir), sessionCwd) !== null,
 		prompt: trustPromptEligible
 			? (promptCwd, extensionsDir) => promptForProjectTrust(sessionTrustSettingsManager, promptCwd, extensionsDir)
 			: undefined,

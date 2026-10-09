@@ -251,6 +251,13 @@ export interface ResolveProjectTrustOptions {
 	/** Project-scope settings for the cwd; used only to detect gate inputs. */
 	projectSettings: ProjectTrustSettingsInputs;
 	/**
+	 * The run loads no extensions at all (--no-extensions): the answer cannot
+	 * change this run, so no prompt is shown and refusals are not announced.
+	 * Grandfathering still applies (it persists a decision for later runs) and
+	 * keeps its one-time notice.
+	 */
+	extensionsDisabled?: boolean;
+	/**
 	 * Evidence this cwd was already in use before the gate existed (a prior
 	 * session transcript). Drives the one-time upgrade grandfathering.
 	 */
@@ -271,6 +278,14 @@ function refusalNotice(cwd: string, cause: string): string {
 	);
 }
 
+/** Whether a refusal deserves a stderr line in this configuration. */
+function shouldAnnounceRefusal(options: ResolveProjectTrustOptions): boolean {
+	// With extensions fully disabled the gate holds nothing back that the flag
+	// itself did not already hold back; announcing a refusal would blame trust
+	// for a decision the user made with --no-extensions.
+	return !options.extensionsDisabled;
+}
+
 /**
  * Resolve whether project-scoped extensions may load for this run. Resolution
  * order: CLI override, no gate inputs, saved decision, upgrade grandfather,
@@ -283,7 +298,9 @@ export async function resolveProjectTrust(options: ResolveProjectTrustOptions): 
 
 	if (options.override !== undefined) {
 		if (options.override === false && hasProjectExtensionInputs(cwd, projectSettings)) {
-			options.notify?.(refusalNotice(cwd, "this run passed --no-approve"));
+			if (shouldAnnounceRefusal(options)) {
+				options.notify?.(refusalNotice(cwd, "this run passed --no-approve"));
+			}
 		}
 		return { trusted: options.override, reason: "override" };
 	}
@@ -295,7 +312,7 @@ export async function resolveProjectTrust(options: ResolveProjectTrustOptions): 
 
 	const saved = store.get(cwd);
 	if (saved !== null) {
-		if (!saved) {
+		if (!saved && shouldAnnounceRefusal(options)) {
 			options.notify?.(refusalNotice(cwd, "this directory is marked not trusted"));
 		}
 		return { trusted: saved, reason: "saved" };
@@ -319,7 +336,7 @@ export async function resolveProjectTrust(options: ResolveProjectTrustOptions): 
 		return { trusted: true, reason: "grandfathered" };
 	}
 
-	if (options.interactive && options.prompt) {
+	if (!options.extensionsDisabled && options.interactive && options.prompt) {
 		const choice = await options.prompt(cwd, projectExtensionsDir(cwd));
 		if (choice === undefined) {
 			// A dismissed prompt decides nothing: untrusted for this run, ask again next time.
@@ -329,12 +346,14 @@ export async function resolveProjectTrust(options: ResolveProjectTrustOptions): 
 		if (choice.remember) {
 			store.set(cwd, choice.trusted);
 		}
-		if (!choice.trusted) {
-			options.notify?.(refusalNotice(cwd, "this directory is marked not trusted"));
-		}
+		// An explicit interactive refusal is announced once, by the resource
+		// loader's in-app warning (refreshed every reload, naming what was held
+		// back); a stderr notice here would overlap it with the same yellow text.
 		return { trusted: choice.trusted, reason: "prompt" };
 	}
 
-	options.notify?.(refusalNotice(cwd, "no trust decision is saved for this directory and this run cannot prompt"));
+	if (shouldAnnounceRefusal(options)) {
+		options.notify?.(refusalNotice(cwd, "no trust decision is saved for this directory and this run cannot prompt"));
+	}
 	return { trusted: false, reason: "machine-default" };
 }
