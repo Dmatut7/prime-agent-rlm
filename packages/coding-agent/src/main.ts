@@ -1131,6 +1131,29 @@ export function projectTrustEvidenceDir(agentDir: string, _sessionDir: string | 
 	return getSessionsDir(agentDir);
 }
 
+/**
+ * The prior-use session the grandfather rule may auto-trust a directory from:
+ * newest session for the cwd whose header timestamp predates the moment the
+ * gate landed on this machine (the trust store's pinned createdAt). Evidence
+ * must carry its own date - a session created after the gate landed (including
+ * the one this --resume run is itself reopening, or the transcript left behind
+ * by a run that answered "not trusted, this session only") proves nothing about
+ * pre-gate use, yet counting it flipped session-only refusals into permanent
+ * trust. Null when the gate never landed (no timestamp to date evidence by).
+ */
+export function findGrandfatherEvidenceSession(
+	agentDir: string,
+	cwd: string,
+	gateLandedAt: number | null,
+): string | null {
+	if (gateLandedAt === null) {
+		return null;
+	}
+	return findMostRecentSessionForCwd(projectTrustEvidenceDir(agentDir, undefined), cwd, {
+		startedBefore: gateLandedAt,
+	});
+}
+
 async function prepareRuntimeServices(options: {
 	config: AgentSessionRuntimeConfig;
 	cwd: string;
@@ -2025,8 +2048,7 @@ export async function main(args: string[], options?: MainOptions) {
 		// --no-extensions: nothing gated can load this run, so the prompt and
 		// the refusal notices are skipped (the answer would be meaningless).
 		extensionsDisabled: parsed.noExtensions === true,
-		hasPriorSession: () =>
-			findMostRecentSessionForCwd(projectTrustEvidenceDir(agentDir, sessionDir), sessionCwd) !== null,
+		hasPriorSession: () => findGrandfatherEvidenceSession(agentDir, sessionCwd, trustStore.createdAt()) !== null,
 		prompt: trustPromptEligible
 			? (promptCwd, extensionsDir) => promptForProjectTrust(sessionTrustSettingsManager, promptCwd, extensionsDir)
 			: undefined,

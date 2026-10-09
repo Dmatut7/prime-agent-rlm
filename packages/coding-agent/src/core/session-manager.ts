@@ -61,6 +61,7 @@ import {
 	createCustomMessage,
 	createModelChangeMessage,
 } from "./messages.js";
+import { PROJECT_TRUST_SESSION_CUSTOM_TYPE } from "./project-trust.js";
 import {
 	artifactDirectoryWriteMs,
 	clearSessionArtifactTombstone,
@@ -2258,7 +2259,29 @@ function sessionHeaderMatchesCwd(header: Partial<SessionHeader> | undefined, cwd
 	);
 }
 
-export function findMostRecentSessionForCwd(sessionDir: string, cwd: string): string | null {
+export interface MostRecentSessionForCwdOptions {
+	/**
+	 * Only sessions whose header timestamp is strictly earlier than this epoch
+	 * count. Used by the trust gate's grandfather evidence: a session that
+	 * started after the gate landed proves nothing about pre-gate use. A header
+	 * without a parsable timestamp is excluded, not excused.
+	 */
+	startedBefore?: number;
+}
+
+function sessionHeaderStartedBefore(header: Partial<SessionHeader> | undefined, startedBefore: number): boolean {
+	if (typeof header?.timestamp !== "string") {
+		return false;
+	}
+	const startedAt = Date.parse(header.timestamp);
+	return Number.isFinite(startedAt) && startedAt < startedBefore;
+}
+
+export function findMostRecentSessionForCwd(
+	sessionDir: string,
+	cwd: string,
+	options?: MostRecentSessionForCwdOptions,
+): string | null {
 	try {
 		const files = readdirSync(sessionDir)
 			.filter((f) => f.endsWith(".jsonl"))
@@ -2267,6 +2290,9 @@ export function findMostRecentSessionForCwd(sessionDir: string, cwd: string): st
 				try {
 					const header = readSessionHeader(path);
 					if (!sessionHeaderMatchesCwd(header, cwd)) {
+						return undefined;
+					}
+					if (options?.startedBefore !== undefined && !sessionHeaderStartedBefore(header, options.startedBefore)) {
 						return undefined;
 					}
 					return { path, mtime: statSync(path).mtime };
@@ -3459,7 +3485,14 @@ export class SessionManager {
 		// has no assistant message yet, otherwise a rewind before the first answer
 		// is exactly the position that a restart loses.
 		const shouldPersistWithoutAssistant =
-			entry.type === "session_state" || entry.type === "session_info" || entry.type === "leaf_position";
+			entry.type === "session_state" ||
+			entry.type === "session_info" ||
+			entry.type === "leaf_position" ||
+			// The trust gate's session-scoped grant is written at session creation,
+			// before any model turn: it must be durable immediately or a worker that
+			// crashes before the first assistant message loses the grant it exists to
+			// carry across recovery.
+			(entry.type === "custom" && entry.customType === PROJECT_TRUST_SESSION_CUSTOM_TYPE);
 		if (!hasAssistant && !shouldPersistWithoutAssistant) {
 			this.flushed = false;
 			return;

@@ -122,6 +122,12 @@ import {
 	type RlmChildReDispatchFacts,
 } from "../../core/messages.js";
 import { flushOrphanProcessJournal, ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
+import {
+	ProjectTrustStore,
+	projectTrustKey,
+	readSessionProjectTrustDecision,
+	recordSessionProjectTrustDecision,
+} from "../../core/project-trust.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import { providerRetryPolicy } from "../../core/provider-retry.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
@@ -806,6 +812,76 @@ type AgentDaemonCommandHandler<K extends DaemonCommand["type"] = DaemonCommand["
 type AgentDaemonCommandHandlers = {
 	[K in DaemonCommand["type"]]?: AgentDaemonCommandHandler<K>;
 };
+
+/**
+ * The session config a runtime creation uses for project trust: the merged
+ * create config, patched with the session-scoped trust decision recorded in
+ * the transcript when the config itself carries none. That is the recovery
+ * case: durableDaemonCreateCommand strips config before the worker replays a
+ * create after a crash, so without this patch the re-created runtime finds no
+ * decision for an undecided directory, fails closed, and silently strips the
+ * extensions of an unattended task whose only answer was "trust this session".
+ * The recorded entry is honored only for the session's own cwd and only while
+ * the persisted store has no decision for it; the store stays the authority a
+ * human can edit to override a stale grant.
+ */
+function recoverSessionProjectTrustConfig(
+	config: AgentSessionRuntimeConfig,
+	sessionManager: SessionManager,
+	agentDir: string,
+): AgentSessionRuntimeConfig {
+	if (config.projectTrustOverride !== undefined) {
+		// A run-wide --approve/--no-approve answers this run alone.
+		return config;
+	}
+	const sessionCwd = sessionManager.getCwd();
+	const decision = config.projectTrustDecision;
+	if (decision && projectTrustKey(decision.cwd) === projectTrustKey(sessionCwd)) {
+		// The client resolved this cwd for this create; nothing to recover.
+		return config;
+	}
+	const store = new ProjectTrustStore(agentDir);
+	if (store.get(sessionCwd) !== null) {
+		// A persisted decision in either direction outranks the session entry.
+		return config;
+	}
+	const recorded = readSessionProjectTrustDecision(sessionManager, sessionCwd);
+	if (recorded === undefined) {
+		return config;
+	}
+	return { ...config, projectTrustDecision: { cwd: sessionCwd, trusted: recorded } };
+}
+
+/**
+ * Record a session-only trust grant a create carried, so this worker's crash
+ * recovery (which re-creates the session from the config-less durable command)
+ * can restore it via recoverSessionProjectTrustConfig. Only trusted=true grants
+ * are worth recording (an undecided directory already fails closed), a
+ * run-wide override is never recorded (it must not escalate into a durable
+ * grant), and a store decision for the cwd makes the entry redundant.
+ */
+function recordSessionScopedProjectTrust(
+	config: AgentSessionRuntimeConfig,
+	sessionManager: SessionManager,
+	agentDir: string,
+): void {
+	if (config.projectTrustOverride !== undefined) {
+		return;
+	}
+	const decision = config.projectTrustDecision;
+	if (!decision || decision.trusted !== true) {
+		return;
+	}
+	const sessionCwd = sessionManager.getCwd();
+	if (projectTrustKey(decision.cwd) !== projectTrustKey(sessionCwd)) {
+		return;
+	}
+	const store = new ProjectTrustStore(agentDir);
+	if (store.get(sessionCwd) !== null) {
+		return;
+	}
+	recordSessionProjectTrustDecision(sessionManager, sessionCwd, true);
+}
 
 export class AgentDaemon {
 	private server?: Server;
@@ -2609,6 +2685,10 @@ export class AgentDaemon {
 			releaseOpenReservation();
 			throw error;
 		}
+		// Session-scoped trust recovery (see recoverSessionProjectTrustConfig): a
+		// config-less re-create (the durable create command a worker replays after
+		// a crash) restores a session-only trust grant recorded in the transcript.
+		const runtimeSessionConfig = recoverSessionProjectTrustConfig(config, sessionManager, agentDir);
 		const createState = async (): Promise<ActiveSessionState> => {
 			if (runtimeOpenGuard && !(await runtimeOpenGuard())) {
 				sessionLease?.release();
@@ -2640,7 +2720,7 @@ export class AgentDaemon {
 					cwd: sessionManager.getCwd(),
 					agentDir,
 					sessionManager,
-					sessionConfig: config,
+					sessionConfig: runtimeSessionConfig,
 					runtimeMetadata: command.runtimeMetadata,
 					sessionLease,
 					sessionOptions: {
@@ -2679,6 +2759,10 @@ export class AgentDaemon {
 				await runtime.dispose().catch(() => undefined);
 				throw new RuntimeOpenCancelledError();
 			}
+			// After runtime creation (goal seeding treats any custom entry as
+			// "session already in use"), record a session-only trust grant this
+			// create carried, so this worker's own crash recovery can restore it.
+			recordSessionScopedProjectTrust(runtimeSessionConfig, sessionManager, agentDir);
 			const state = await this.addRuntime(
 				runtime,
 				command.name,

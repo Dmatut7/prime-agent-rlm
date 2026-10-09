@@ -466,7 +466,7 @@ describe("resolveProjectTrust", () => {
 		expect(grandfatherNotice).toContain(store.filePath());
 	});
 
-	it("auto-trusts in machine mode too when prior sessions exist (unattended self-recovery)", async () => {
+	it("auto-trusts in machine mode for the run but never persists the decision", async () => {
 		store.ensureCreated();
 
 		const resolution = await resolveProjectTrust({
@@ -477,8 +477,12 @@ describe("resolveProjectTrust", () => {
 			hasPriorSession: () => true,
 		});
 
+		// The unattended run still works, but a machine run never persists
+		// anything (the resolution-order comment's contract): a later
+		// interactive run can still ask, and a per-run trust never outlives
+		// the upgrade window as a saved decision nobody answered for.
 		expect(resolution).toEqual({ trusted: true, reason: "grandfathered" });
-		expect(store.get(projectDir)).toBe(true);
+		expect(store.get(projectDir)).toBeNull();
 	});
 
 	it("does not grandfather a directory with no prior sessions", async () => {

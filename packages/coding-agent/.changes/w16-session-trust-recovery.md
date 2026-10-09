@@ -1,0 +1,1 @@
+- Fixed session-only project trust so it survives a daemon worker crash recovery: the grant is recorded in the session transcript and restored when the worker re-creates the session from the config-less durable create command, instead of silently stripping the extensions of an unattended task.

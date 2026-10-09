@@ -3,6 +3,7 @@ import { dirname, join, resolve } from "node:path";
 import lockfile from "proper-lockfile";
 import { canonicalizePath } from "../utils/paths.js";
 import { collectAutoExtensionEntries } from "./package-manager.js";
+import type { SessionManager } from "./session-manager.js";
 
 /**
  * Project extension trust gate (port of the official trust gating added for
@@ -241,6 +242,75 @@ export function projectExtensionsDir(cwd: string): string {
 	return join(resolve(cwd), ".prime/agent", "extensions");
 }
 
+/**
+ * Custom entry type the daemon worker records in a session transcript when a
+ * client-resolved session-only trust grant ("trust this session, do not
+ * remember") creates the runtime. The durable create a worker replays after a
+ * crash strips the create command's config (durableDaemonCreateCommand), so the
+ * session transcript is the only session-scoped place the grant can survive;
+ * the worker reads the entry back on a config-less re-create. Bookkeeping only:
+ * a `custom` entry contributes no model context, and the reader yields to any
+ * later persisted store decision.
+ */
+export const PROJECT_TRUST_SESSION_CUSTOM_TYPE = "project_trust_decision";
+
+function sessionProjectTrustRecordFromData(data: unknown): { cwd: string; trusted: boolean } | undefined {
+	if (typeof data !== "object" || data === null) {
+		return undefined;
+	}
+	const record = data as Record<string, unknown>;
+	if (typeof record.cwd !== "string" || typeof record.trusted !== "boolean") {
+		return undefined;
+	}
+	return { cwd: record.cwd, trusted: record.trusted };
+}
+
+/**
+ * The newest recorded session-scoped trust decision matching this cwd, or
+ * undefined. Malformed entries are ignored (the safe direction: no grant).
+ */
+export function readSessionProjectTrustDecision(sessionManager: SessionManager, cwd: string): boolean | undefined {
+	const key = projectTrustKey(cwd);
+	const entries = sessionManager.getEntries();
+	for (let index = entries.length - 1; index >= 0; index -= 1) {
+		const entry = entries[index];
+		if (entry.type !== "custom" || entry.customType !== PROJECT_TRUST_SESSION_CUSTOM_TYPE) {
+			continue;
+		}
+		const record = sessionProjectTrustRecordFromData(entry.data);
+		if (record && record.cwd === key) {
+			return record.trusted;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Record a session-scoped trust decision in the session transcript, so a worker
+ * that re-creates this session after a crash (config-less durable create) still
+ * resolves the same trust. Callers must run this only after the runtime has been
+ * created (goal seeding treats any custom entry as "session already in use"),
+ * only when the runtime that owns the session is the writer, and never for a
+ * run-wide override, which must not escalate into a durable grant. Idempotent:
+ * an identical newest entry is not re-appended.
+ */
+export function recordSessionProjectTrustDecision(sessionManager: SessionManager, cwd: string, trusted: boolean): void {
+	if (sessionManager.getSessionFile() === null) {
+		// A sessionless (in-memory) runtime has no transcript to survive into.
+		return;
+	}
+	const key = projectTrustKey(cwd);
+	if (readSessionProjectTrustDecision(sessionManager, cwd) === trusted) {
+		return;
+	}
+	try {
+		sessionManager.appendCustomEntry(PROJECT_TRUST_SESSION_CUSTOM_TYPE, { cwd: key, trusted });
+	} catch {
+		// Bookkeeping must never break session creation: without the entry the
+		// next recovery just fails closed, which is the pre-fix behavior.
+	}
+}
+
 export interface ResolveProjectTrustOptions {
 	cwd: string;
 	store: ProjectTrustStore;
@@ -259,7 +329,9 @@ export interface ResolveProjectTrustOptions {
 	extensionsDisabled?: boolean;
 	/**
 	 * Evidence this cwd was already in use before the gate existed (a prior
-	 * session transcript). Drives the one-time upgrade grandfathering.
+	 * session transcript that itself predates the gate landing). Drives the
+	 * one-time upgrade grandfathering; evidence without a date condition would
+	 * let post-gate sessions auto-trust the directory.
 	 */
 	hasPriorSession?: () => boolean;
 	/** Terminal-backed interactive prompt; absent in machine modes. */
@@ -289,8 +361,8 @@ function shouldAnnounceRefusal(options: ResolveProjectTrustOptions): boolean {
 /**
  * Resolve whether project-scoped extensions may load for this run. Resolution
  * order: CLI override, no gate inputs, saved decision, upgrade grandfather,
- * interactive prompt, machine-mode refusal. Only the prompt and the grandfather
- * write to the store; a machine run never persists anything.
+ * interactive prompt, machine-mode refusal. Only the prompt and an interactive
+ * grandfather write to the store; a machine run never persists anything.
  */
 export async function resolveProjectTrust(options: ResolveProjectTrustOptions): Promise<ProjectTrustResolution> {
 	const { cwd, store, projectSettings } = options;
@@ -322,16 +394,26 @@ export async function resolveProjectTrust(options: ResolveProjectTrustOptions): 
 	// working (including for unattended runs that cannot answer a prompt), but
 	// only while the upgrade window is still open and only once per directory.
 	// A clock reading before the store was created (skew, manual fiddling) is
-	// outside the window, not before it.
+	// outside the window, not before it. The caller's hasPriorSession evidence
+	// must itself be dated (sessions that predate the gate landing); a machine
+	// run grandfathers for the run only and never persists the decision, so a
+	// later interactive run can still ask.
 	const createdAt = store.createdAt();
 	const elapsed = createdAt === null ? Number.POSITIVE_INFINITY : now() - createdAt;
 	const windowOpen = elapsed >= 0 && elapsed <= PROJECT_TRUST_GRANDFATHER_WINDOW_MS;
 	if (windowOpen && options.hasPriorSession?.()) {
-		store.set(cwd, true);
+		if (options.interactive) {
+			store.set(cwd, true);
+		}
 		options.notify?.(
-			`Project extensions in ${cwd} were trusted automatically once for this upgrade: the directory was ` +
-				`already in use before the extension trust gate existed, so it is treated as if you had answered the ` +
-				`trust prompt once. Review ${projectExtensionsDir(cwd)} and edit ${store.filePath()} to change the decision.`,
+			options.interactive
+				? `Project extensions in ${cwd} were trusted automatically once for this upgrade: the directory was ` +
+						`already in use before the extension trust gate existed, so it is treated as if you had answered the ` +
+						`trust prompt once. Review ${projectExtensionsDir(cwd)} and edit ${store.filePath()} to change the decision.`
+				: `Project extensions in ${cwd} were trusted automatically for this run: the directory was ` +
+						`already in use before the extension trust gate existed. This per-run trust repeats while the ` +
+						`upgrade window stays open; run prime-agent interactively in this directory once to record a ` +
+						`permanent decision, or pass --approve for a single run.`,
 		);
 		return { trusted: true, reason: "grandfathered" };
 	}
