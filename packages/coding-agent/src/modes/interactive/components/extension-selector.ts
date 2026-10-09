@@ -21,6 +21,9 @@ export interface ExtensionSelectorOptions {
 	tui?: TUI;
 	timeout?: number;
 	getRows?: () => number;
+	/** Index the cursor starts on. Defaults to 0; a safety gate can start on the
+	 * conservative option instead of the first. */
+	initialSelectedIndex?: number;
 	/** Pre-formatted replacement for the footer's cancel hint segment. */
 	cancelHint?: string;
 	/** Extra pre-formatted hint segment appended after the cancel segment. */
@@ -76,6 +79,7 @@ export class ExtensionSelectorComponent extends Container {
 		super();
 
 		this.options = options;
+		this.selectedIndex = opts?.initialSelectedIndex ?? 0;
 		this.onSelectCallback = onSelect;
 		this.onCancelCallback = onCancel;
 		const header = splitTitleAndDescription(title);

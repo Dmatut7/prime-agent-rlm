@@ -1402,7 +1402,10 @@ export async function promptForProjectTrust(
 			(option) => finish(copy.options.find((candidate) => candidate.label === option)?.choice),
 			// A dismissed prompt (Esc) decides nothing for the future.
 			() => finish(undefined),
-			{ tui: ui, onInterrupt: interrupt },
+			// The cursor starts on the most conservative option: "untrusted, this
+			// session only" (index 3). A reflexive Enter denies trust once without
+			// remembering; granting trust requires deliberate movement.
+			{ tui: ui, onInterrupt: interrupt, initialSelectedIndex: 3 },
 		);
 		ui.addChild(selector);
 		ui.setFocus(selector);

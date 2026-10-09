@@ -181,7 +181,11 @@ describe("project trust prompt Ctrl+C", () => {
 		await waitForRender();
 		terminal.type("\r");
 
-		await expect(promptPromise).resolves.toEqual({ trusted: true, remember: true });
+		// The cursor starts on 不信任（仅本次会话）(the conservative default);
+		// a bare Enter denies trust for this session. Selecting 信任 (option 0)
+		// now takes two ups (or three downs) - the old reflexive Enter granting
+		// remembered trust is exactly what the conservative default removes.
+		await expect(promptPromise).resolves.toEqual({ trusted: false, remember: false });
 	});
 });
 

@@ -100,7 +100,7 @@ describe("D5: compaction marker text matches the implementation", () => {
 		const m = /imminent \? " \u00b7 ([^"]+)" : ""/.exec(footerSource);
 		expect(m, "footer.ts still appends an imminent-compaction marker").not.toBeNull();
 		const marker = m![1]!;
-		expect(settingsDoc).toContain("`" + marker + "`");
+		expect(settingsDoc).toContain(`\`${marker}\``);
 		expect(settingsDoc).not.toContain("`压缩在即`");
 	});
 });
@@ -144,7 +144,7 @@ describe("D6: themes.md tells the truth about optional color tokens", () => {
 	it("every optional token the schema accepts is named in the doc", () => {
 		expect(optionalTokens.length).toBeGreaterThan(0);
 		for (const token of optionalTokens) {
-			expect(themesDoc, `optional token ${token}`).toContain("`" + token + "`");
+			expect(themesDoc, `optional token ${token}`).toContain(`\`${token}\``);
 		}
 	});
 });

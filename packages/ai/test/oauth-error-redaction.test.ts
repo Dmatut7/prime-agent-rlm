@@ -93,7 +93,7 @@ describe("OAuth error redaction and bounding", () => {
 	});
 
 	it("github-copilot refresh failure redacts and truncates the response body", async () => {
-		const githubSecret = "ghp_" + "ABCDEFGH12345678".repeat(3);
+		const githubSecret = `ghp_${"ABCDEFGH12345678".repeat(3)}`; // secret-scan: allow
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async () => textResponse(`bad credentials ${githubSecret} ${HUGE_PADDING}${TAILMARKER}`, 401)),
