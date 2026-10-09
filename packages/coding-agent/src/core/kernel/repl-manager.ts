@@ -133,6 +133,13 @@ const KERNEL_PROTOCOL_V5 = 5;
  * frame; the kernel side names it CAPABILITY_MESSAGE_NOTIFY.
  */
 const KERNEL_CAPABILITY_MESSAGE_NOTIFY = "message_notify";
+/**
+ * Capability token a kernel announces when it answers out-of-band `bash_activity` requests:
+ * `list`/`tail`/`kill` on the background handles it created, without waiting behind the cell
+ * FIFO. Gated on the kernel's own token, never the version alone. The kernel side names it
+ * CAPABILITY_BASH_ACTIVITY (repl.py).
+ */
+const KERNEL_CAPABILITY_BASH_ACTIVITY = "bash_activity";
 /** The arrival notify kind; a kind the runtime does not wait on is ignored. */
 const KERNEL_NOTIFY_KIND_AGENT_MESSAGE = "agent_message";
 /**
@@ -190,6 +197,8 @@ const KERNEL_BASH_RESIDENCY_WARN_GAP_MS = 60 * 60 * 1000;
 const KERNEL_CALLBACK_FAILURE_LOG_EVERY = 25;
 const READY_TIMEOUT_MS = 30_000;
 const REPAIR_STEP_TIMEOUT_MS = 30_000;
+/** Bound on one out-of-band bash_activity query; the kernel answers on its reader thread. */
+const BASH_ACTIVITY_QUERY_TIMEOUT_MS = 10_000;
 /**
  * A restore that timed out is retried with this multiple of its budget (B5): a large snapshot
  * read cold from disk can legitimately outlast the repair budget, and the alternative - renaming
@@ -205,6 +214,14 @@ const MAX_BACKGROUND_OUTPUT_CHARS = 64 * 1024;
 // MAX_ATTACHMENT_DATA_CHARS; a line that cannot complete within this ceiling is
 // corruption the protocol repair owns, not output worth buffering until OOM.
 const MAX_PROTOCOL_LINE_CHARS = 32 * 1024 * 1024;
+// Inbound error frames: the kernel caps its own traceback aggregate at 1 MiB (repl.py
+// `_cap_traceback_lines`), but a kernel that predates that cap - or a corrupt frame - must not
+// be able to pin host memory with an unbounded chain either.
+const MAX_ERROR_TRACEBACK_CHARS = 1_048_576;
+// Mirror of the kernel's per-frame payload cap (repl.py `_PAYLOAD_CAP`). A conforming kernel
+// fails the cell before sending an oversized `host_request`; this bound is the host's own guard
+// against a runtime that does not, so the payload is refused instead of copied into a handler.
+const MAX_HOST_REQUEST_PAYLOAD_CHARS = 16 * 1024 * 1024;
 
 const MAX_KERNEL_STDERR_CHARS = 8 * 1024;
 const MAX_KERNEL_STDERR_LOG_BYTES = 5 * 1024 * 1024;
@@ -238,6 +255,59 @@ interface InFlightHostRequest {
 	label?: string;
 }
 
+/** One background bash handle as reported by an out-of-band `bash_activity` `list`. */
+export interface BashActivityRow {
+	id: string;
+	command: string;
+	pid: number;
+	startedAt: number;
+	durationMs: number;
+	status: "running" | "finished";
+	exitCode: number | null;
+}
+
+/** One out-of-band bash activity query; mirrors the kernel's `bash_activity` request kinds. */
+export type BashActivityQuery =
+	| { action: "list" }
+	| { action: "tail"; activityId: string; lines?: number }
+	| { action: "kill"; activityId: string };
+
+/** The kernel's reply to one {@link BashActivityQuery}. */
+export interface BashActivityResult {
+	status: "ok" | "error";
+	activities?: BashActivityRow[];
+	activityId?: string;
+	tail?: string;
+	killed?: boolean;
+	reason?: string;
+}
+
+/** Parse one kernel `done` frame into a typed activity result; unknown fields are dropped. */
+function parseBashActivityFrame(frame: Record<string, unknown>): BashActivityResult {
+	const result: BashActivityResult = { status: frame.status === "ok" ? "ok" : "error" };
+	if (typeof frame.reason === "string") result.reason = frame.reason;
+	if (Array.isArray(frame.activities)) {
+		result.activities = frame.activities.flatMap((row): BashActivityRow[] => {
+			if (!isRecord(row) || typeof row.id !== "string") return [];
+			return [
+				{
+					id: row.id,
+					command: typeof row.command === "string" ? row.command : "",
+					pid: typeof row.pid === "number" ? row.pid : 0,
+					startedAt: typeof row.startedAt === "number" ? row.startedAt : 0,
+					durationMs: typeof row.durationMs === "number" ? row.durationMs : 0,
+					status: row.status === "finished" ? "finished" : "running",
+					exitCode: typeof row.exitCode === "number" ? row.exitCode : null,
+				},
+			];
+		});
+	}
+	if (typeof frame.activityId === "string") result.activityId = frame.activityId;
+	if (typeof frame.tail === "string") result.tail = frame.tail;
+	if (typeof frame.killed === "boolean") result.killed = frame.killed;
+	return result;
+}
+
 /**
  * Whether the host declared one request type read-only, i.e. cancellable by the cell that
  * triggered it. An entry ending in `*` is a prefix pattern, which is how a whole read-only family
@@ -263,6 +333,15 @@ function describeHostRequest(data: unknown): { type: string; label?: string } {
 	const type = data.type;
 	const label = hostRequestLabel(type, data);
 	return label === undefined ? { type } : { type, label };
+}
+
+/** Serialized length of one host-request payload, or 0 when it cannot be serialized at all. */
+function hostRequestPayloadChars(data: unknown): number {
+	try {
+		return JSON.stringify(data)?.length ?? 0;
+	} catch {
+		return 0;
+	}
 }
 
 /** Best-effort target for the notice, so the model can tell two lost requests apart. */
@@ -300,6 +379,34 @@ function capStreamOutput(current: string, text: string, maxChars: number): { tex
 		return { text: appended.slice(0, maxChars), truncated: true };
 	}
 	return { text: appended, truncated: false };
+}
+
+/**
+ * Bound an inbound error traceback's aggregate, keeping the newest entries - the outermost
+ * exception carries the actionable failure - and leading with a truncation marker. Mirrors the
+ * kernel's `_cap_traceback_lines` so a runtime without that cap cannot hand the host an
+ * unbounded chain.
+ */
+function capTracebackLines(lines: string[]): string[] {
+	const total = lines.reduce((sum, line) => sum + line.length, 0);
+	if (total <= MAX_ERROR_TRACEBACK_CHARS) return lines;
+	const kept: string[] = [];
+	let remaining = MAX_ERROR_TRACEBACK_CHARS;
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const line = lines[i];
+		if (line.length > remaining) {
+			// Never drop the newest entry: it names the raised exception.
+			if (kept.length === 0) kept.push(line);
+			break;
+		}
+		kept.push(line);
+		remaining -= line.length;
+	}
+	kept.reverse();
+	kept.unshift(
+		`[... traceback truncated: kept the newest ${kept.length} of ${lines.length} entries to fit ${MAX_ERROR_TRACEBACK_CHARS} characters ...]\n`,
+	);
+	return kept;
 }
 
 /** ExecuteResult plus the raw fields of the request's `done` event (state ops). */
@@ -522,6 +629,12 @@ export class ReplKernelManager {
 	 */
 	private messageNotifySupported = false;
 	/**
+	 * The out-of-band bash-activity bit of the same handshake: negotiated protocol 5 AND the
+	 * kernel's own `bash_activity` token. Gates every `bash_activity` request, so a runtime that
+	 * does not answer one is never sent a frame it would report as a ProtocolError.
+	 */
+	private bashActivitySupported = false;
+	/**
 	 * Protocol the current child announced in its `ready` frame, captured synchronously by the
 	 * frame loop. `negotiatedCapabilities` is only assigned once `waitForReady` has resolved, so a
 	 * gated frame that shares the ready frame's stdout chunk would otherwise be judged against
@@ -545,6 +658,15 @@ export class ReplKernelManager {
 	private readonly lateSentAgentMessageHandlers = new Map<string, (message: KernelSentAgentMessage) => void>();
 	/** Resolvers for done events outside the active execution (the shutdown reply). */
 	private readonly pendingDoneWaiters = new Map<string, () => void>();
+	/**
+	 * In-flight out-of-band bash-activity queries, keyed by the id the kernel echoes back. Kept
+	 * apart from pendingDoneWaiters because a query needs the frame's payload, not just "a done
+	 * arrived", and the kernel's reply is written straight to stdin (never queued behind a cell).
+	 */
+	private readonly pendingBashActivity = new Map<
+		string,
+		{ resolve: (result: BashActivityResult | undefined) => void; timer: ReturnType<typeof globalThis.setTimeout> }
+	>();
 	// Source of the most recently started cell, retained after it finishes so
 	// rlm.run spawns from detached asyncio tasks (cell already idle) can still
 	// attribute their spawning program.
@@ -720,6 +842,15 @@ export class ReplKernelManager {
 	 */
 	get supportsMessageNotify(): boolean {
 		return this.messageNotifySupported;
+	}
+
+	/**
+	 * True while the running kernel announced protocol-5 out-of-band bash activity
+	 * (`bash_activity`). Gates every activity query: a runtime that predates the request kind
+	 * would answer it with a ProtocolError, so the version number alone never authorizes one.
+	 */
+	get supportsBashActivity(): boolean {
+		return this.bashActivitySupported;
 	}
 
 	/** Protocol version the running kernel announced; undefined until ready. */
@@ -1275,6 +1406,9 @@ export class ReplKernelManager {
 			this.messageNotifySupported =
 				protocol >= KERNEL_PROTOCOL_V5 &&
 				this.announcedKernelCapabilities.includes(KERNEL_CAPABILITY_MESSAGE_NOTIFY);
+			this.bashActivitySupported =
+				protocol >= KERNEL_PROTOCOL_V5 &&
+				this.announcedKernelCapabilities.includes(KERNEL_CAPABILITY_BASH_ACTIVITY);
 		} catch (e) {
 			// Both exits report through `startupFailureError`: a kernel that dies before it is ready
 			// tears itself down first (which makes this start stale), so the budget fact would
@@ -2117,6 +2251,14 @@ export class ReplKernelManager {
 				// the active cell's streams; buffer it as background output instead.
 				this.appendBackgroundOutput(typeof event.text === "string" ? event.text : "");
 			} else if (type === "done" && id) {
+				const activity = this.pendingBashActivity.get(id);
+				if (activity) {
+					// An out-of-band bash_activity reply: hand the frame to the waiting query.
+					this.pendingBashActivity.delete(id);
+					globalThis.clearTimeout(activity.timer);
+					activity.resolve(parseBashActivityFrame(event));
+					return;
+				}
 				const waiter = this.pendingDoneWaiters.get(id);
 				this.pendingDoneWaiters.delete(id);
 				waiter?.();
@@ -2173,7 +2315,7 @@ export class ReplKernelManager {
 			execution.error = {
 				ename: typeof event.ename === "string" ? event.ename : "Error",
 				evalue: typeof event.evalue === "string" ? event.evalue : "",
-				traceback: asStringArray(event.traceback),
+				traceback: capTracebackLines(asStringArray(event.traceback)),
 			};
 			execution.status = "error";
 		} else if (type === "done") {
@@ -2602,6 +2744,27 @@ export class ReplKernelManager {
 			this.handledHostRequestIds.delete(oldest);
 		}
 
+		// Fail closed on an oversized payload: a conforming kernel caps its own host_request
+		// (repl.py `_PAYLOAD_CAP`) and never sends one this big, so this is the host's guard
+		// against a runtime that does not - refuse it instead of copying it into a handler.
+		const payloadChars = hostRequestPayloadChars(data);
+		if (payloadChars > MAX_HOST_REQUEST_PAYLOAD_CHARS) {
+			this.appendKernelDiagnostic(
+				`host request ${requestId} rejected: payload exceeds ${MAX_HOST_REQUEST_PAYLOAD_CHARS} characters`,
+			);
+			void this.sendHostReply(
+				requestId,
+				describeHostRequest(data),
+				this.startGeneration,
+				{
+					status: "error",
+					error: `host_request payload exceeds the ${MAX_HOST_REQUEST_PAYLOAD_CHARS}-character frame cap`,
+				},
+				false,
+			);
+			return;
+		}
+
 		const startedAt = Date.now();
 		const described = describeHostRequest(data);
 		const signal = this.hostRequestSignal(described.type);
@@ -2850,6 +3013,54 @@ export class ReplKernelManager {
 		}
 	}
 
+	/**
+	 * Inspect or stop the background bash handles the kernel created, out-of-band.
+	 *
+	 * The frame is written straight to stdin (never `enqueueRequest`), so a query answers while
+	 * a long or stuck cell holds the execution FIFO - which is the point: a stalled turn must
+	 * still be able to list and kill what it spawned. Gated on the kernel's `bash_activity`
+	 * token; a kernel without it (or one whose stdin is gone, or one that never replies within
+	 * the bound) yields `undefined`, so a caller treats "no answer" as unavailable, never as an
+	 * empty list. Never throws into the calling path.
+	 */
+	async queryBashActivity(
+		query: BashActivityQuery,
+		opts: { timeoutMs?: number } = {},
+	): Promise<BashActivityResult | undefined> {
+		if (!this.bashActivitySupported) return undefined;
+		const requestId = uuid();
+		const request: Record<string, unknown> = { type: "bash_activity", id: requestId, action: query.action };
+		if (query.action !== "list") {
+			request.activityId = query.activityId;
+			if (query.action === "tail" && query.lines !== undefined) request.lines = query.lines;
+		}
+		const timeoutMs = opts.timeoutMs ?? BASH_ACTIVITY_QUERY_TIMEOUT_MS;
+		return await new Promise<BashActivityResult | undefined>((resolve) => {
+			const timer = globalThis.setTimeout(() => {
+				this.pendingBashActivity.delete(requestId);
+				kernelLog.warn("kernel bash activity query timed out", {
+					requestId,
+					action: query.action,
+					sessionId: this.options.sessionId,
+				});
+				resolve(undefined);
+			}, timeoutMs);
+			timer.unref?.();
+			this.pendingBashActivity.set(requestId, { resolve, timer });
+			this.writeLine(request).catch((error) => {
+				const entry = this.pendingBashActivity.get(requestId);
+				if (!entry) return;
+				this.pendingBashActivity.delete(requestId);
+				globalThis.clearTimeout(entry.timer);
+				kernelLog.debug("kernel bash activity frame was not delivered", {
+					error: errorMessage(error),
+					sessionId: this.options.sessionId,
+				});
+				resolve(undefined);
+			});
+		});
+	}
+
 	private cleanupResources(
 		killSignal: NodeJS.Signals = "SIGTERM",
 		options: { keepHostRequests?: boolean; keepBackgroundOutput?: boolean; activeExecutionError?: Error } = {},
@@ -2863,6 +3074,13 @@ export class ReplKernelManager {
 		this.clearSnapshotTimer();
 		this.lateSentAgentMessageHandlers.clear();
 		this.pendingDoneWaiters.clear();
+		// Resolve rather than just drop: a query whose kernel is gone must not hold its caller
+		// for the whole timeout. The reply is undefined ("no answer"), exactly like a lost frame.
+		for (const entry of this.pendingBashActivity.values()) {
+			globalThis.clearTimeout(entry.timer);
+			entry.resolve(undefined);
+		}
+		this.pendingBashActivity.clear();
 		if (!options.keepBackgroundOutput) {
 			// Stale pre-teardown background output must not surface after a restart. A revival
 			// keeps it: an orphan thread's last words are evidence about the death, not noise.
@@ -2885,6 +3103,7 @@ export class ReplKernelManager {
 		// never be able to combine a new negotiation with a previous child's announcement.
 		this.announcedKernelCapabilities = [];
 		this.messageNotifySupported = false;
+		this.bashActivitySupported = false;
 		this.readyAnnouncedProtocol = undefined;
 		// Liveness facts belong to the child that reported them: a replacement kernel must earn
 		// its own first frame before anything vouches for it again, and a rejection streak from a

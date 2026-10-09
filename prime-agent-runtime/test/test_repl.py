@@ -858,6 +858,43 @@ class ReplTest(unittest.TestCase):
         self.assertEqual(one(events, "error")["ename"], "ValueError")
         self.assertEqual(one(events, "done")["status"], "error")
 
+    def test_oversized_host_request_payload_fails_the_cell_before_any_frame(self):
+        # The host buffers whole protocol lines, so an oversized host_request must fail
+        # the cell (before a frame is written), not wedge host memory.
+        code = "import rlm\nawait rlm.host_request('test.big', {'d': 'x' * 17_000_000})"
+        events = self.repl.execute("host-big", code)
+        self.assertEqual(one(events, "error")["ename"], "ValueError")
+        self.assertEqual(one(events, "done")["status"], "error")
+        self.assertIsNone(one(events, "host_request"))
+        # Framing is intact: the next cell round-trips normally.
+        follow = self.repl.execute("after-host-big", "1+1")
+        self.assertEqual(one(follow, "result")["text"], "2")
+
+    def test_oversized_exception_message_is_truncated_in_the_error_event(self):
+        events = self.repl.execute("big-evalue", "raise ValueError('x' * 2_000_000)")
+        err = one(events, "error")
+        self.assertEqual(err["ename"], "ValueError")
+        self.assertLessEqual(len(err["evalue"]), 1_048_576 + len("\n[... result truncated at 1048576 characters ...]"))
+        self.assertTrue(err["evalue"].endswith("[... result truncated at 1048576 characters ...]"))
+
+    def test_traceback_lines_are_aggregate_capped_keeping_newest(self):
+        # An exception chain can carry thousands of entries; the aggregate, not just each
+        # entry, must be bounded - keeping the newest entries (the actionable failure).
+        code = (
+            "import rlm.repl as r\n"
+            "lines = [('frame %d ' % i) + 'y' * 400 for i in range(4000)]\n"
+            "capped = r._cap_traceback_lines(lines)\n"
+            "kept = capped[1:]\n"
+            "(\n"
+            "    sum(len(x) for x in kept) <= r._RESULT_TEXT_CAP,\n"
+            "    capped[0].startswith('[... traceback truncated: kept the newest '),\n"
+            "    kept[-1] == lines[-1],\n"
+            "    lines[0] in capped,\n"
+            ")\n"
+        )
+        events = self.repl.execute("tb-cap", code)
+        self.assertEqual(one(events, "result")["text"], "(True, True, True, False)")
+
     def test_bash_integration(self):
         events = self.repl.execute(
             "sh1", "from rlm import bash\nresult = await bash('echo repl-bash')\nresult.output.strip()"

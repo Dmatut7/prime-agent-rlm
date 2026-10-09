@@ -1,0 +1,1 @@
+- Added out-of-band kernel `bash_activity` queries (`list`/`tail`/`kill`) so a stalled turn can inspect and stop the background commands it spawned without waiting behind the cell execution queue.

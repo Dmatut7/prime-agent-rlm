@@ -1,0 +1,1 @@
+- Bounded oversized kernel protocol payloads: an inbound error traceback is truncated (newest entries kept) and an oversized `host_request` is refused with an error reply instead of being held unbounded.

@@ -33,6 +33,7 @@ from typing import Any
 
 from . import effects
 from .bash import (
+    _ACTIVITY_FRAME_CAP,
     _forget_cell,
     _kernel_threads,
     _kill_cell_handles,
@@ -40,6 +41,7 @@ from .bash import (
     _register_kernel_thread,
     _reset_current_cell,
     _set_current_cell,
+    activity_request,
     live_handle_facts,
 )
 
@@ -95,6 +97,13 @@ NOTIFY_KIND_AGENT_MESSAGE = "agent_message"
 # An old runtime ignores the kind (see _handle_notify), a new one never errors.
 NOTIFY_KIND_AGENT_MESSAGE_DELIVERED = "agent_message_delivered"
 
+# Out-of-band bash activity query (protocol 5): a host that sees the `bash_activity` capability
+# may send `{"type":"bash_activity","action":"list|tail|kill",...}` at any time, and the kernel
+# answers it on the reader thread without waiting behind the cell FIFO. A runtime predating the
+# feature does not announce the token, so the host never sends a frame it cannot answer.
+BASH_ACTIVITY_MIN_PROTOCOL = 5
+CAPABILITY_BASH_ACTIVITY = "bash_activity"
+
 
 def kernel_capabilities() -> list[str]:
     """Capability tokens announced in the ready frame.
@@ -110,6 +119,8 @@ def kernel_capabilities() -> list[str]:
         capabilities.append(CAPABILITY_PRESERVE_NAMES)
     if negotiated_protocol() >= MESSAGE_NOTIFY_MIN_PROTOCOL:
         capabilities.append(CAPABILITY_MESSAGE_NOTIFY)
+    if negotiated_protocol() >= BASH_ACTIVITY_MIN_PROTOCOL:
+        capabilities.append(CAPABILITY_BASH_ACTIVITY)
     return capabilities
 
 DEFAULT_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
@@ -121,8 +132,10 @@ DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES = 16 * 1024 * 1024
 # bounds a pathological repr in transit.
 _RESULT_TEXT_CAP = 1_048_576
 _RESULT_TRUNCATION_MARKER = f"\n[... result truncated at {_RESULT_TEXT_CAP} characters ...]"
-# Oversized display payloads fail the cell instead of wedging host memory.
-_DISPLAY_PAYLOAD_CAP = 16 * 1024 * 1024
+# Oversized display and host_request payloads fail the cell before any bytes are written,
+# instead of wedging host memory with a frame the host cannot parse. One cap covers both:
+# the host buffers whole lines, so a payload that big is a bug either way.
+_PAYLOAD_CAP = 16 * 1024 * 1024
 
 # Names the session bootstrap re-creates on every start; never snapshotted.
 _ALWAYS_SKIP = {"rlm", "mcp", "bash", "asyncio", "In", "Out", "get_ipython", "exit", "quit", "open"}
@@ -229,6 +242,18 @@ def _send(event: dict[str, Any]) -> None:
             pass
 
 
+def _check_payload(event: str, data: dict[str, Any]) -> None:
+    """Fail the calling cell when a `data` payload would not fit one protocol frame.
+
+    Strict-dumps validation: default allow_nan=True would let NaN/Infinity serialize as
+    non-JSON text and tear the host's framing (a non-serializable value raises TypeError
+    before any bytes are written, so NaN is the only corruption vector). The encoded length
+    enforces the frame cap; callers re-serialize when they actually send.
+    """
+    if len(json.dumps(data, allow_nan=False)) > _PAYLOAD_CAP:
+        raise ValueError(f"{event} payload exceeds the {_PAYLOAD_CAP}-character frame cap")
+
+
 # Stream-frame coalescing. One print() is several write() calls and a tight loop is one
 # write per line; a JSON frame plus a write syscall per call is what makes output-heavy
 # cells slow. Tagged stream text is therefore batched per (stream, cell id) and shipped
@@ -330,14 +355,7 @@ def emit(data: dict[str, Any]) -> None:
     """
     if not isinstance(data, dict) or not data or not all(isinstance(k, str) for k in data):
         raise TypeError("emit() requires a non-empty dict keyed by MIME type strings")
-    # Strict-dumps validation: default allow_nan=True would let NaN/Infinity
-    # serialize as non-JSON text and tear the host's protocol framing (a
-    # non-serializable value already raises in _send before any bytes are
-    # written, so NaN is the only corruption vector). The encoded length
-    # enforces the display frame cap; _send re-serializes.
-    encoded = json.dumps(data, allow_nan=False)
-    if len(encoded) > _DISPLAY_PAYLOAD_CAP:
-        raise ValueError(f"display payload exceeds the {_DISPLAY_PAYLOAD_CAP}-character frame cap")
+    _check_payload("display", data)
     # Same-context causality: text this cell printed before the emit precedes the frame.
     _stream_coalescer.flush()
     _send({"event": "display", "id": _current_cell.get(), "data": data})
@@ -365,6 +383,7 @@ async def host_request(data: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("repl runtime is not serving")
     if _host_closed:
         raise RuntimeError("host connection closed; host_request cannot be answered")
+    _check_payload("host_request", data)
     rid = uuid.uuid4().hex
     future: asyncio.Future[dict[str, Any]] = _loop.create_future()
     _pending_host[rid] = future
@@ -848,6 +867,39 @@ def _safe_str(exc: BaseException) -> str:
         return "<exception str() failed>"
 
 
+def _cap_text(text: str) -> str:
+    if len(text) > _RESULT_TEXT_CAP:
+        return text[:_RESULT_TEXT_CAP] + _RESULT_TRUNCATION_MARKER
+    return text
+
+
+def _cap_traceback_lines(lines: list[str]) -> list[str]:
+    """Bound the aggregate, not just each entry: an exception chain can carry thousands of
+    entries, and per-entry caps alone would still let one error event exceed the host's
+    protocol line limit. Keep the newest entries - the outermost exception carries the
+    actionable failure - and lead with a truncation marker."""
+    total = sum(len(line) for line in lines)
+    if total <= _RESULT_TEXT_CAP:
+        return lines
+    kept: list[str] = []
+    remaining = _RESULT_TEXT_CAP
+    for line in reversed(lines):
+        if len(line) > remaining:
+            if not kept:
+                # Never drop the newest entry: it names the raised exception.
+                kept.append(line)
+            break
+        kept.append(line)
+        remaining -= len(line)
+    kept.reverse()
+    kept.insert(
+        0,
+        f"[... traceback truncated: kept the newest {len(kept)} of {len(lines)} entries "
+        f"to fit {_RESULT_TEXT_CAP} characters ...]\n",
+    )
+    return kept
+
+
 def _error_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
     # No cell frame (e.g. SyntaxError): exception-only keeps filename, source, and caret.
     te = traceback.TracebackException.from_exception(exc)
@@ -861,8 +913,8 @@ def _error_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
         "event": "error",
         "id": cell_id,
         "ename": type(exc).__name__,
-        "evalue": _safe_str(exc),
-        "traceback": lines,
+        "evalue": _cap_text(_safe_str(exc)),
+        "traceback": _cap_traceback_lines([_cap_text(line) for line in lines]),
     }
 
 
@@ -2237,6 +2289,7 @@ _REQUIRED_FIELDS = {
     "snapshot": ("id", "path", "manifest_path"),
     "restore": ("id", "path"),
     "list_names": ("id",),
+    "bash_activity": ("id", "action"),
     "shutdown": (),
 }
 
@@ -2274,6 +2327,48 @@ def _handle_notify(req: dict[str, Any]) -> None:
         return
 
 
+def _handle_bash_activity(req: dict[str, Any]) -> None:
+    """Out-of-band: a running cell must not block inspection or cancellation.
+
+    Runs on the reader thread (see _handle_request_line), so it answers while the cell FIFO
+    is busy. Only kernel-minted ids resolve; the frame is capped before it is written.
+    """
+    rid = req["id"]
+    try:
+        response = activity_request(req["action"], req.get("activityId"), req.get("lines", 50))
+        frame = {"event": "done", "id": rid, "status": "ok", **response}
+        _cap_bash_activity_frame(frame)
+        _send(frame)
+    except (KeyError, ValueError) as exc:
+        _send({"event": "done", "id": rid, "status": "error", "reason": str(exc)})
+
+
+def _cap_bash_activity_frame(frame: dict[str, Any]) -> None:
+    """Keep the serialized response under the 16 KiB wire cap.
+
+    json escaping can expand one character to six bytes (uXXXX-style), so the byte slices in
+    `activity_request` cannot bound the frame alone. Trim from the oldest end: a tail keeps its
+    newest lines, a list keeps its newest (running) rows.
+    """
+    tail = frame.get("tail")
+    if isinstance(tail, str):
+        while len(json.dumps(frame)) > _ACTIVITY_FRAME_CAP:
+            excess = len(json.dumps(frame)) - _ACTIVITY_FRAME_CAP
+            keep = max(0, len(tail) - excess // 6 - 1)
+            if keep >= len(tail):
+                # The frame cannot fit however the payload shrinks (oversized request
+                # metadata): emit the smallest frame instead of looping forever.
+                frame["tail"] = ""
+                break
+            tail = tail[-keep:] if keep else ""
+            frame["tail"] = tail
+        return
+    rows = frame.get("activities")
+    while len(json.dumps(frame)) > _ACTIVITY_FRAME_CAP and isinstance(rows, list) and len(rows) > 1:
+        victim = next((index for index, row in enumerate(rows) if row.get("status") != "running"), 0)
+        rows.pop(victim)
+
+
 def _handle_request_line(raw: bytes, queue: asyncio.Queue[dict[str, Any]]) -> None:
     assert _loop is not None
     req = json.loads(raw)
@@ -2305,6 +2400,22 @@ def _handle_request_line(raw: bytes, queue: asyncio.Queue[dict[str, Any]]) -> No
     missing = [f for f in _REQUIRED_FIELDS[rtype] if not isinstance(req.get(f), str)]
     if missing:
         _protocol_error(f"{rtype} request needs string fields: {', '.join(missing)}")
+        return
+    if rtype == "bash_activity":
+        if req["action"] not in ("list", "tail", "kill"):
+            _protocol_error("unknown bash activity action")
+            return
+        if req["action"] != "list" and not isinstance(req.get("activityId"), str):
+            _protocol_error("bash activity tail/kill requires string activityId")
+            return
+        if len(req["id"]) > 256 or len(req.get("activityId") or "") > 256:
+            # Frame metadata rides every response: an unbounded id would leave no room for
+            # the capped payload.
+            _protocol_error("bash activity ids must stay under 256 characters")
+            return
+        # Like host_reply, this bypasses the cell FIFO. Handles remain owned by the runtime,
+        # never by an arbitrary PID supplied by the client.
+        _handle_bash_activity(req)
         return
     if rtype in ("execute", "snapshot", "restore"):
         with _interrupt_lock:

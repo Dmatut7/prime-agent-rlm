@@ -56,7 +56,9 @@ class MessageWakeHandshakeTest(unittest.TestCase):
         ready, _ = proc.ready()
         self.assertEqual(ready["event"], "ready")
         self.assertEqual(ready["protocol"], 5)
-        self.assertEqual(ready.get("capabilities"), ["preserve_names", "message_notify"])
+        # Protocol 5 announces every token introduced up to it: message wake and the
+        # out-of-band bash activity query.
+        self.assertEqual(ready.get("capabilities"), ["preserve_names", "message_notify", "bash_activity"])
         self.assertEqual(proc.shutdown(), 0)
 
     def test_ready_protocol_4_keeps_only_preserve_names(self):

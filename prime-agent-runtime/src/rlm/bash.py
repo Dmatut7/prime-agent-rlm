@@ -46,6 +46,16 @@ _CANCEL_TERM_GRACE = 0.5
 _CANCEL_KILL_WAIT = 2.0
 
 _live_handles: set["BashHandle"] = set()
+# Kernel-owned opaque IDs for out-of-band activity queries (bash_activity): the host asks
+# about a handle by id, never by PID, so it can only ever act on handles this kernel created.
+# A finished handle stays resolvable until the bounded history evicts it, so a tail/kill that
+# raced the reap still gets an answer.
+_activity_handles: dict[str, "BashHandle"] = {}
+_activity_order: deque[str] = deque()
+_ACTIVITY_HISTORY_CAP = 64
+# Wire cap for one bash_activity response frame: the host's activity view must stay small,
+# and json escaping can expand a character to six bytes, so trimming is byte-aware.
+_ACTIVITY_FRAME_CAP = 16 * 1024
 _live_lock = threading.Lock()
 _hook_installed = False
 _hook_lock = threading.Lock()
@@ -232,6 +242,12 @@ class BashHandle:
         # Serializes kill/reap so a pid fallback can never outlive the process handle.
         self._kill_lock = threading.Lock()
         self._started = time.monotonic()
+        self._started_at = time.time()
+        # Opaque id for out-of-band activity queries; minted before spawn so every
+        # handle (including a failed one) is addressable the same way.
+        import secrets
+
+        self._activity_id = secrets.token_hex(16)
         # POSIX: own process group so kill() signals the whole pipeline; Windows
         # contains the tree in a kill-on-close job object.
         self._status_read = -1
@@ -311,6 +327,7 @@ class BashHandle:
         self._cell_id: str | None = _current_cell.get()
         with _live_lock:
             _live_handles.add(self)
+            _activity_handles[self._activity_id] = self
             if self._cell_id in _forgotten_cells:
                 # Spawned from a detached task after its cell finished: attribute to
                 # nobody instead of resurrecting the dead cell's bookkeeping.
@@ -544,6 +561,11 @@ class BashHandle:
         with _live_lock:
             _live_handles.discard(self)
             self._untrack_cell_handle()
+            # Keep the id resolvable for a short history so a tail/kill that raced the reap
+            # still answers; the oldest evicted entry is the only thing that stops being visible.
+            _activity_order.append(self._activity_id)
+            while len(_activity_order) > _ACTIVITY_HISTORY_CAP:
+                _activity_handles.pop(_activity_order.popleft(), None)
 
     def _untrack_cell_handle(self) -> None:
         """The caller must hold _live_lock."""
@@ -788,6 +810,7 @@ class BashHandle:
                 cast("_winjob.JobProcess", self._proc).close()
         with _live_lock:
             _live_handles.discard(self)
+            _activity_handles.pop(self._activity_id, None)
             self._untrack_cell_handle()
         if delivered:
             _record_journal(self._pid, active=False)
@@ -1766,3 +1789,62 @@ def live_handle_facts(cell_id: str | None) -> dict[str, int]:
         "buffered_bytes": buffered_bytes,
         "pipe_pending": pipe_pending,
     }
+
+
+def activity_request(action: str, activity_id: str | None = None, lines: int = 50) -> dict[str, Any]:
+    """Inspect or stop handles this kernel created; called off the cell execution queue.
+
+    The host drives this out-of-band (repl.py answers it on the reader thread), so a stuck or
+    long-running cell cannot hide - or protect - the background commands it spawned. Only
+    kernel-minted ids resolve; a PID supplied by the host is never honored.
+    """
+    with _live_lock:
+        if action == "list":
+            handles = list(_activity_handles.items())
+        else:
+            handle = _activity_handles.get(activity_id or "")
+            if handle is None:
+                raise KeyError("unknown kernel bash activity")
+    if action == "list":
+        rows = [
+            {
+                "id": key,
+                "command": handle.command[:512],
+                "pid": handle._pid,
+                "startedAt": int(handle._started_at * 1000),
+                "durationMs": int(
+                    (handle._result.duration if handle._result else time.monotonic() - handle._started) * 1000
+                ),
+                "status": "finished" if handle._reaped else "running",
+                "exitCode": handle._result.exit_code if handle._result else None,
+            }
+            for key, handle in handles
+        ]
+        # Trim rows until the serialized frame fits; finished rows drop before running ones, so
+        # live commands - the ones the user can still act on - never fall off the list.
+        while len(json.dumps({"activities": rows})) > _ACTIVITY_FRAME_CAP and len(rows) > 1:
+            victim = next(
+                (index for index, row in enumerate(rows) if row["status"] != "running"),
+                0,
+            )
+            rows.pop(victim)
+        return {"activities": rows}
+    if action == "tail":
+        if isinstance(lines, bool) or not isinstance(lines, int) or not 1 <= lines <= 200:
+            raise ValueError("lines must be an integer between 1 and 200")
+        tail = "\n".join(handle._buffer.text().splitlines()[-lines:])
+        payload = tail.encode("utf-8")[-_ACTIVITY_FRAME_CAP:].decode("utf-8", errors="replace")
+        # json escaping can expand one character to six bytes, so a byte-slice of the decoded
+        # text cannot bound the serialized size alone; trim from the oldest end (a tail keeps
+        # its newest lines).
+        while len(json.dumps({"tail": payload})) > _ACTIVITY_FRAME_CAP:
+            excess = len(json.dumps({"tail": payload})) - _ACTIVITY_FRAME_CAP
+            keep = max(1, len(payload) - excess // 6 - 1)
+            payload = payload[-keep:]
+        return {"activityId": activity_id, "tail": payload}
+    if action == "kill":
+        if handle._reaped:
+            return {"activityId": activity_id, "killed": False}
+        handle.kill()
+        return {"activityId": activity_id, "killed": True}
+    raise ValueError("unknown kernel bash action")
