@@ -984,6 +984,7 @@ export interface Settings {
 	editorPaddingX?: number; // Horizontal padding for input editor (default: 0)
 	autocompleteMaxVisible?: number; // Max visible items in autocomplete dropdown (default: 5)
 	showHardwareCursor?: boolean; // Show terminal cursor while still positioning it for IME
+	fullscreenWheelScrollLines?: number | "auto"; // Lines per wheel event, 1-100; "auto" accelerates with wheel velocity. Default: "auto"
 	markdown?: MarkdownSettings;
 	warnings?: WarningSettings;
 	ui?: UiSettings;
@@ -1306,6 +1307,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	editorPaddingX: null,
 	autocompleteMaxVisible: null,
 	showHardwareCursor: null,
+	fullscreenWheelScrollLines: null,
 	markdown: ["codeBlockIndent", "mermaid"],
 	warnings: ["anthropicExtraUsage"],
 	ui: [
@@ -3841,6 +3843,21 @@ export class SettingsManager {
 	setShowHardwareCursor(enabled: boolean): void {
 		this.globalSettings.showHardwareCursor = enabled;
 		this.markModified("showHardwareCursor");
+		this.save();
+	}
+
+	/** Lines per wheel event: clamped 1-100, or "auto" for velocity-based acceleration. */
+	getFullscreenWheelScrollLines(): number | "auto" {
+		const lines = this.settings.fullscreenWheelScrollLines;
+		return typeof lines === "number" && Number.isFinite(lines)
+			? Math.max(1, Math.min(100, Math.floor(lines)))
+			: "auto";
+	}
+
+	setFullscreenWheelScrollLines(lines: number | "auto"): void {
+		this.globalSettings.fullscreenWheelScrollLines =
+			lines === "auto" ? lines : Math.max(1, Math.min(100, Math.floor(lines)));
+		this.markModified("fullscreenWheelScrollLines");
 		this.save();
 	}
 

@@ -169,3 +169,4 @@ export {
 	type TuiStopOptions,
 } from "./tui.js";
 export { sanitizeRenderText, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "./utils.js";
+export { WheelScrollAccelerator, type WheelScrollLines } from "./wheel-scroll.js";

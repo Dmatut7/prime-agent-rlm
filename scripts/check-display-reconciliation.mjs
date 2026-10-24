@@ -504,8 +504,17 @@ function headlineText(files, totals) {
 
 // ---------- git truth ----------
 
+/** Spawn env with git hook exports stripped: a hook's GIT_DIR/GIT_INDEX_FILE/GIT_WORK_TREE would otherwise redirect commands at the host repository instead of the one at `cwd`. */
+const CLEAN_GIT_ENV = (() => {
+	const env = { ...process.env };
+	delete env.GIT_DIR;
+	delete env.GIT_INDEX_FILE;
+	delete env.GIT_WORK_TREE;
+	return env;
+})();
+
 function git(args, cwd) {
-	const result = spawnSync("git", args, { cwd, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+	const result = spawnSync("git", args, { cwd, env: CLEAN_GIT_ENV, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
 	if (result.error) throw new ReconcileError(`git 跑不起来：${result.error.message}`);
 	if (result.status !== 0) {
 		throw new ReconcileError(`git ${args.join(" ")} 失败：${(result.stderr ?? "").trim() || `exit ${result.status}`}`);
@@ -515,7 +524,7 @@ function git(args, cwd) {
 
 /** Boolean git probe (existence questions): true when git exits 0. */
 function gitOk(args, cwd) {
-	const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+	const result = spawnSync("git", args, { cwd, env: CLEAN_GIT_ENV, encoding: "utf8" });
 	return result.status === 0;
 }
 
@@ -573,7 +582,7 @@ function baseLines(repoRoot, base, rel) {
 	try {
 		const size = Number(git(["cat-file", "-s", `${base}:${rel}`], repoRoot).trim());
 		if (!Number.isInteger(size) || size > MAX_READ_BYTES) return undefined;
-		const data = execFileSync("git", ["show", `${base}:${rel}`], { cwd: repoRoot, maxBuffer: MAX_READ_BYTES + 1024 });
+		const data = execFileSync("git", ["show", `${base}:${rel}`], { cwd: repoRoot, env: CLEAN_GIT_ENV, maxBuffer: MAX_READ_BYTES + 1024 });
 		if (data.subarray(0, BINARY_SNIFF_BYTES).includes(0)) return undefined;
 		return lineTotal(data);
 	} catch {
@@ -1319,8 +1328,11 @@ function stageA(failures) {
 function makeFixture(failures, name, build) {
 	const root = mkdtempSync(join(tmpdir(), `display-reconcile-${name}-`));
 	try {
+		// A git hook exports GIT_DIR/GIT_INDEX_FILE/GIT_WORK_TREE into this process; spawnSync
+		// inherits them by default, which would redirect every fixture command at the host
+		// repository instead of the throwaway one. Strip them so the fixture owns its own git.
 		const gitq = (args) => {
-			const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
+			const result = spawnSync("git", args, { cwd: root, env: CLEAN_GIT_ENV, encoding: "utf8" });
 			if (result.status !== 0) throw new Error(`fixture git ${args.join(" ")}: ${result.stderr}`);
 			return result.stdout;
 		};

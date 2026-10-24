@@ -34,6 +34,7 @@ export interface Keybindings {
 	"tui.viewport.pageUp": true;
 	"tui.viewport.pageDown": true;
 	"tui.viewport.top": true;
+	"tui.viewport.bottom": true;
 	"tui.viewport.follow": true;
 	"tui.select.up": true;
 	"tui.select.down": true;
@@ -248,6 +249,11 @@ export const TUI_KEYBINDINGS = {
 	"tui.viewport.follow": {
 		defaultKeys: "ctrl+shift+down",
 		description: "Scroll to bottom and follow output (fullscreen)",
+		repeatable: true,
+	},
+	"tui.viewport.bottom": {
+		defaultKeys: "ctrl+end",
+		description: "Scroll to bottom (fullscreen)",
 		repeatable: true,
 	},
 	"tui.select.up": { defaultKeys: "up", description: "Move selection up", repeatable: true },

@@ -221,6 +221,31 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("fullscreenWheelScrollLines", () => {
+		it("defaults to auto and clamps numeric values into 1-100", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ fullscreenWheelScrollLines: 5 }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getFullscreenWheelScrollLines()).toBe(5);
+
+			manager.setFullscreenWheelScrollLines(0);
+			expect(manager.getFullscreenWheelScrollLines()).toBe(1);
+
+			manager.setFullscreenWheelScrollLines(999);
+			expect(manager.getFullscreenWheelScrollLines()).toBe(100);
+
+			manager.setFullscreenWheelScrollLines("auto");
+			expect(manager.getFullscreenWheelScrollLines()).toBe("auto");
+		});
+
+		it("falls back to auto on invalid values", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ fullscreenWheelScrollLines: "nope" }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getFullscreenWheelScrollLines()).toBe("auto");
+		});
+	});
+
 	describe("mermaid rendering mode", () => {
 		it("survives a non-object markdown settings value when saving the mode", async () => {
 			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ markdown: "custom" }));
