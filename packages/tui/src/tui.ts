@@ -2270,6 +2270,21 @@ export class TUI extends Container {
 					? `${" ".repeat(padWidth)}\x1b[7m${label}\x1b[27m `
 					: `${" ".repeat(padWidth)}\x1b[2m${label}\x1b[22m `;
 				fullscreen.viewport.subtractFrameClickCoverage(row, 0, width);
+				// Clicking the hint returns to the bottom, same as the follow key: register
+				// the label (plus its trailing pad cell) as a click target after subtracting
+				// whatever the transcript painted under it.
+				fullscreen.viewport.addFrameClickEntry({
+					region: {
+						line: row,
+						col: padWidth,
+						width: labelWidth + 1,
+						height: 1,
+						onClick: () => this.scrollToBottom(),
+					},
+					anchor: row,
+					from: row,
+					count: 1,
+				});
 				followHintRow = row;
 			}
 		}
