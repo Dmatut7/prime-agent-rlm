@@ -1,3 +1,7 @@
+## 2026-10-26 第一批：合并外部 PR #55（全屏滚轮加速、ctrl+end 回底、可点击的回底提示）
+
+> 外部贡献者 [@andirtew](https://github.com/andirtew) 的 PR #55（合并预备分支 pr-55-adjust）：全屏滚轮速度可配置（`fullscreenWheelScrollLines` 取 1-100，默认 `"auto"` 在非本地 macOS 终端按滚动速度自动加速到每格最多 6 行）；`ctrl+end` 一键回底并恢复跟随（`tui.viewport.follow` 的同行为别名）；暂停跟随时「回到底部」提示可直接点击；另修复 pre-commit 环境下 check-display-reconciliation 继承 GIT_DIR/GIT_INDEX_FILE/GIT_WORK_TREE 污染宿主仓的泄漏。用户可感：长对话全屏翻滚更快、回底一步到位、离开输出后回来少按一次键。合并前补齐 keybindings.md 文档行、bottom 键位描述对齐（与 follow 同义）与两包 CHANGELOG 的 #55 归属署名。
+
 ## 2026-10-10 第二批：shell-quote 1.12.0 过龄补刷（最后一条 dependabot 告警消）
 
 > shell-quote 1.12.0（10-02T14:58Z 发布）于 10-10 过 7 天龄门。删旧锁条目重解析 → 1.12.0 落锁（98 条平台条目保持、ip-address 因 npm 12 optional 解析不再单列——socks 的可选依赖，socks 仍在）。npm ci 实装过、check EXIT 0、ai 冒烟 5/5 绿。#29 告警应自动消。

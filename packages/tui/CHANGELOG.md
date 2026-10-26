@@ -1,9 +1,9 @@
 # Changelog
 
 ## [Unreleased]
-- Added the `fullscreenWheelScrollLines` setting ("auto" or 1-100) for fullscreen mouse-wheel scrolling. The default `"auto"` accelerates fast wheel spins outside local macOS terminals. (Ported from upstream [earendil-works/pi f1927c2d5](https://github.com/earendil-works/pi/commit/f1927c2d56bbc8a58f2d6a6a4957f52c77507557).)
-- Added the `tui.viewport.bottom` binding (default `ctrl+end`) to scroll the fullscreen transcript to the bottom.
-- Made the fullscreen follow hint ("回到底部") clickable: clicking it scrolls to the bottom and resumes following, like the follow key.
+- Added the `fullscreenWheelScrollLines` setting ("auto" or 1-100) for fullscreen mouse-wheel scrolling. The default `"auto"` accelerates fast wheel spins outside local macOS terminals. (Ported from upstream [earendil-works/pi f1927c2d5](https://github.com/earendil-works/pi/commit/f1927c2d56bbc8a58f2d6a6a4957f52c77507557).) ([#55](https://github.com/Dmatut7/prime-agent-rlm/pull/55) by [@andirtew](https://github.com/andirtew))
+- Added the `tui.viewport.bottom` binding (default `ctrl+end`) to scroll the fullscreen transcript to the bottom; it is the `ctrl+end` alias of `tui.viewport.follow` and behaves identically ([#55](https://github.com/Dmatut7/prime-agent-rlm/pull/55) by [@andirtew](https://github.com/andirtew)).
+- Made the fullscreen follow hint ("回到底部") clickable: clicking it scrolls to the bottom and resumes following, like the follow key ([#55](https://github.com/Dmatut7/prime-agent-rlm/pull/55) by [@andirtew](https://github.com/andirtew)).
 
 ## [0.11.21] - 2026-10-09
 - Fixed the autocomplete list to close on Home, End and Ctrl+Left/Right word jumps, the same caret-move rule as the arrow keys, so accepting a completion can no longer splice it at a stale cursor position.

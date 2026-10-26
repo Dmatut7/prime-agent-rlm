@@ -253,7 +253,7 @@ export const TUI_KEYBINDINGS = {
 	},
 	"tui.viewport.bottom": {
 		defaultKeys: "ctrl+end",
-		description: "Scroll to bottom (fullscreen)",
+		description: "Scroll to bottom and follow output (fullscreen)",
 		repeatable: true,
 	},
 	"tui.select.up": { defaultKeys: "up", description: "Move selection up", repeatable: true },

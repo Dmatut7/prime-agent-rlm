@@ -1,7 +1,7 @@
 # Changelog
 
 ## [Unreleased]
-- Added the `fullscreenWheelScrollLines` setting ("auto" or 1-100): "auto" keeps one line per wheel event in local macOS terminals and scales with wheel velocity elsewhere, capped at six lines per event. (Ported from upstream earendil-works/pi f1927c2d5.)
+- Added the `fullscreenWheelScrollLines` setting ("auto" or 1-100): "auto" keeps one line per wheel event in local macOS terminals and scales with wheel velocity elsewhere, capped at six lines per event. (Ported from upstream earendil-works/pi f1927c2d5.) ([#55](https://github.com/Dmatut7/prime-agent-rlm/pull/55) by [@andirtew](https://github.com/andirtew))
 
 ## [0.11.21] - 2026-10-09
 - Fixed the extension trust gate's upgrade grandfather so only sessions that predate the gate landing count as prior-use evidence: a post-gate session (including a resumed one) can no longer auto-trust a directory, and a "not trusted, this session only" answer stays session-only on the next run.
