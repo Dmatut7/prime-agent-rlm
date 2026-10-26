@@ -320,6 +320,55 @@ describe("TUI fullscreen mode", () => {
 		tui.stop();
 	});
 
+	it("clicking the follow hint returns to the bottom", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput(WHEEL_UP);
+		await terminal.waitForRender();
+		assert.strictEqual(tui.getScrollInfo()?.following, false);
+
+		// The hint sits on the last transcript row; click right on its label.
+		const viewport = terminal.getViewport();
+		const hintRow = viewport.findIndex((line) => stripAnsi(line).includes("回到底部"));
+		assert.ok(hintRow >= 0, "follow hint visible after scrolling up");
+		const hintCol = stripAnsi(viewport[hintRow]!).indexOf("回到底部");
+		// SGR mouse coordinates are 1-based: press then release without motion.
+		terminal.sendInput(`\x1b[<0;${hintCol + 1};${hintRow + 1}M`);
+		terminal.sendInput(`\x1b[<0;${hintCol + 1};${hintRow + 1}m`);
+		await terminal.waitForRender();
+
+		assert.strictEqual(
+			tui.getScrollInfo()?.following,
+			true,
+			"click on the hint scrolls to bottom and resumes following",
+		);
+		assert.ok(!terminal.getViewport().join("\n").includes("回到底部"), "hint hides once following");
+		tui.stop();
+	});
+
+	it("clicking beside the follow hint label does not scroll", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput(WHEEL_UP);
+		await terminal.waitForRender();
+		assert.strictEqual(tui.getScrollInfo()?.following, false);
+
+		// The label is right-aligned; column 2 of the hint row is padding, not the label.
+		const viewport = terminal.getViewport();
+		const hintRow = viewport.findIndex((line) => stripAnsi(line).includes("回到底部"));
+		assert.ok(hintRow >= 0, "follow hint visible after scrolling up");
+		terminal.sendInput(`\x1b[<0;2;${hintRow + 1}M`);
+		terminal.sendInput(`\x1b[<0;2;${hintRow + 1}m`);
+		await terminal.waitForRender();
+
+		assert.strictEqual(tui.getScrollInfo()?.following, false, "a click outside the label leaves the window paused");
+		tui.stop();
+	});
+
 	it("hides the follow hint while following", async () => {
 		const { terminal, tui, chat, dock } = setup(lines(20));
 		tui.enterFullscreen({ scroll: [chat], dock });

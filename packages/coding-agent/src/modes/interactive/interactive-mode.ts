@@ -2063,6 +2063,7 @@ export class InteractiveMode {
 		this.version = VERSION;
 		this.ui = new TUI(new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
+		this.ui.setWheelScrollLines(this.settingsManager.getFullscreenWheelScrollLines());
 		this.ui.onCopy = (text) => {
 			void this.copyFullscreenSelection(text);
 		};

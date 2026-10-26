@@ -87,6 +87,7 @@ These are the persisted defaults for the same limits as the `--autonomous-*` CLI
 | `editorPaddingX` | number | `0` | Horizontal padding for input editor (0-3) |
 | `autocompleteMaxVisible` | number | `5` | Max visible items in autocomplete dropdown (3-20) |
 | `showHardwareCursor` | boolean | `false` | Show terminal cursor. `PI_HARDWARE_CURSOR` (`1`/`true`/`yes`, `0`/`false`/`no`) overrides it, and a conflict between the two is reported as a warning |
+| `fullscreenWheelScrollLines` | `"auto"` \| number | `"auto"` | Lines per mouse-wheel event in fullscreen mode, from 1 to 100. `"auto"` moves one line per event in local macOS terminals, which already accelerate wheel and trackpad input; elsewhere, and over SSH, it speeds up fast wheel spins to at most 6 lines per event. |
 | `ui.processMode` | string | `"quiet"` | How a turn's steps and thinking render: `"quiet"` folds them into one box per turn (Ctrl+O opens/closes it, Ctrl+T its thinking). `"legacy"` shows each tool call, thought and edit as its own line in the chat, with no box. Any other value falls back to `"quiet"` |
 | `ui.timelineOpenWhileWorking` | boolean | `true` | Keep a turn's box open while the AI works, so each step shows as it happens. `false` keeps the box to its one-line header until you open it |
 | `ui.timelineAutoFold` | boolean | `true` | Fold a turn's box back to its header card when the turn ends, also one you opened while the turn ran. A box you closed stays closed and one you opened after the turn ended stays open. `false` never folds a box on its own |

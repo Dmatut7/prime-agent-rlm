@@ -51,6 +51,7 @@ import {
 	visibleContentSpan,
 	visibleWidth,
 } from "./utils.js";
+import { WheelScrollAccelerator } from "./wheel-scroll.js";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
 
@@ -543,7 +544,8 @@ export class TUI extends Container {
 			previousViewportTop: number;
 		};
 	} | null = null;
-	private static readonly WHEEL_SCROLL_LINES = 1;
+	/** Lines per wheel event: fixed count or "auto" velocity acceleration; injected by the host after construction. */
+	private readonly wheelScroll = new WheelScrollAccelerator("auto");
 	/** Encoded-length cap for the OSC 52 copy fallback; over it the write is skipped. */
 	private static readonly MAX_OSC52_ENCODED_LENGTH = 100_000;
 	private static readonly SELECTION_AUTO_SCROLL_DELAY_MS = 150;
@@ -588,6 +590,11 @@ export class TUI extends Container {
 			this.terminal.hideCursor();
 		}
 		this.requestRender();
+	}
+
+	/** Lines per wheel event: a fixed positive count, or "auto" for velocity-based acceleration. */
+	setWheelScrollLines(lines: number | "auto"): void {
+		this.wheelScroll.setLines(lines);
 	}
 
 	getClearOnShrink(): boolean {
@@ -1441,7 +1448,7 @@ export class TUI extends Container {
 					if (target?.region.onWheel?.(direction)) {
 						this.requestRender();
 					} else {
-						this.scrollBy(direction * TUI.WHEEL_SCROLL_LINES);
+						this.scrollBy(direction * this.wheelScroll.next(direction, performance.now()));
 					}
 				} else if (event.button === MOUSE_BUTTON_LEFT && event.press && !event.motion) {
 					this.stopSelectionAutoScroll();
@@ -1539,6 +1546,10 @@ export class TUI extends Container {
 			return true;
 		}
 		if (keybindings.matches(data, "tui.viewport.follow")) {
+			this.scrollToBottom();
+			return true;
+		}
+		if (keybindings.matches(data, "tui.viewport.bottom")) {
 			this.scrollToBottom();
 			return true;
 		}
@@ -2259,6 +2270,21 @@ export class TUI extends Container {
 					? `${" ".repeat(padWidth)}\x1b[7m${label}\x1b[27m `
 					: `${" ".repeat(padWidth)}\x1b[2m${label}\x1b[22m `;
 				fullscreen.viewport.subtractFrameClickCoverage(row, 0, width);
+				// Clicking the hint returns to the bottom, same as the follow key: register
+				// the label (plus its trailing pad cell) as a click target after subtracting
+				// whatever the transcript painted under it.
+				fullscreen.viewport.addFrameClickEntry({
+					region: {
+						line: row,
+						col: padWidth,
+						width: labelWidth + 1,
+						height: 1,
+						onClick: () => this.scrollToBottom(),
+					},
+					anchor: row,
+					from: row,
+					count: 1,
+				});
 				followHintRow = row;
 			}
 		}
